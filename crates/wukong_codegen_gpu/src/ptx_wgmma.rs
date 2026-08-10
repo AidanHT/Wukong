@@ -41,6 +41,42 @@
 //!    its own header ([`crate::ptx_target::HDR_SM90A_V80`]) and its own capability gate
 //!    ([`require_sm90a`]), never a retag of an existing family.
 //!
+//! # The fifth fact, learned the hard way on 2026-08-10: CORE MATRICES ARE PACKED
+//!
+//! The first H100 round (`bench/gpu/h100/2026-08-10-h100-s2a-bringup.log`) proved TMA writes the tile
+//! **plain row-major within the box** and then found that *neither* reading of the descriptor's two
+//! offset fields computed the right product. The reason is not the axis naming. An SS-form `wgmma`
+//! operand is not a monolithic strided tile at all: it is a grid of **core matrices**, and for a
+//! 16-bit type one core matrix is `8 rows x 16 bytes` stored as **128 CONTIGUOUS bytes**. The
+//! hardware's address for element `(r, c)` of core matrix `(i, j)` is
+//!
+//! ```text
+//! start + i * SBO + j * LBO + r * 16 + c * elem      (SWIZZLE_NONE)
+//! ```
+//!
+//! -- the within-core-matrix row stride is the fixed **16**, not the tile's row pitch. LBO is the
+//! distance between K-adjacent core matrices and SBO the distance between MN-adjacent ones. So a
+//! row-major tile whose rows are wider than one core matrix (any `BK > 8` for 16-bit) is
+//! **unrepresentable by any (LBO, SBO) pair**, and the wrong-by-`r*(row_bytes-16)` reading is exactly
+//! why the shipped arm scored 64 of 4096 output lanes exact: only rows with `m % 8 == 0` (and columns
+//! with `n % 8 == 0`) have `r == 0`. `the_row_major_reading_is_unrepresentable_and_predicts_the_log`
+//! re-derives that 64 device-free, from the log.
+//!
+//! Two layouts a descriptor *can* describe are therefore on the table, and [`SmemLayout`] is the one
+//! authority that spells both:
+//!
+//! * [`SmemLayout::CanonicalNone`] -- the ISA's own packing, core matrices at 128 contiguous bytes.
+//!   TMA cannot write it with one tiled copy, so it is a **probe-only** arm: it names the fix.
+//! * [`SmemLayout::Swizzle128`] -- **what production ships.** At `BK = 64` for a 16-bit type the SMEM
+//!   row is exactly 128 B, which is the 128-B swizzle atom, and the ISA's canonical 128-B-swizzle
+//!   K-major layout is *precisely* plain row-major plus the XOR chunk permutation -- which is
+//!   precisely what a `CU_TENSOR_MAP_SWIZZLE_128B` TMA copy writes. Row stride 128 B, k-group stride
+//!   16 B, `SBO = 8 * 128 = 1024`, no repack and no extra copies. It is also the configuration
+//!   CUTLASS ships for every SM90 16-bit mainloop, which is not a coincidence.
+//!
+//! **Both are still unconfirmed on silicon**, which is what `wgmma_hopper_bringup` stage D -- the
+//! one-visit descriptor sweep over [`desc_sweep_candidates`] -- exists to settle.
+//!
 //! # The capability gate is a TYPE, not a convention
 //!
 //! The fp8 families are gated by a textual law (`every_fp8_module_load_is_capability_gated`): every
@@ -61,10 +97,11 @@
 //!   the CTA mask has to be derived from `%cluster_ctarank`. That is real machinery with a deadlock
 //!   as its failure mode, and none of it can be executed here. [`Multicast::ClusterA`] therefore
 //!   returns an [`UNSUPPORTED`] decline instead of plausible PTX.
-//! * **The 128-B SMEM swizzle.** TMA can write the swizzled layout and the descriptor has a field for
-//!   it, but the leading/stride byte offsets a swizzled operand needs are *not* the plain
-//!   core-matrix distances, and this module will not guess them. [`SmemSwizzle::B128`] is fully
-//!   supported by the *packer* (and tested) and declined by the *generator*.
+//! * **A layout TMA cannot write.** [`SmemLayout::CanonicalNone`] needs the 8 rows of every core
+//!   matrix packed into 128 contiguous bytes, which one tiled TMA copy of a row-major operand does
+//!   not produce (it would take `BK / 8` copies per operand per stage, or an SMEM repack). The
+//!   *generator* therefore declines it and the sweep probe stages it by hand -- the arm exists to
+//!   name the fix, not to ship.
 //! * **The pingpong schedule** (D1's W3 as specified). [`WGMMA_W3C`] is the same 128x128x64 tile at 6
 //!   stages under the cooperative schedule, which is legal (CTA-M 128 is a multiple of 128) but is
 //!   not the two-consumer alternating schedule CUTLASS calls pingpong.
@@ -370,9 +407,10 @@ impl SmemSwizzle {
 pub struct SmemDesc {
     /// Byte address of the operand's first core matrix, in the **shared** window.
     pub start_addr: u64,
-    /// Leading-dimension byte offset -- see [`DescOrder`].
+    /// Leading-dimension byte offset -- the distance between K-adjacent core matrices. See
+    /// [`SmemLayout`] and [`desc_fields`], which are the only things that decide it.
     pub lbo: u64,
-    /// Stride-dimension byte offset -- see [`DescOrder`].
+    /// Stride-dimension byte offset -- the distance between MN-adjacent core matrices.
     pub sbo: u64,
     /// 3-bit base offset; the swizzle pattern's phase. Zero for every unswizzled layout.
     pub base_offset: u8,
@@ -388,78 +426,187 @@ pub const fn encode_desc_field(x: u64) -> u64 {
     (x & 0x3FFFF) >> 4
 }
 
-/// Which geometric distance goes in the descriptor's **leading** field.
+/// **How a `wgmma` SS operand is laid out in shared memory** -- and therefore what its descriptor's
+/// two offset fields have to say. THE single authority: [`desc_fields`] turns one of these into the
+/// (LBO, SBO, base offset, swizzle mode, per-K-step base advance) tuple, and both the production
+/// generator and every sweep candidate read it from there. A new reading is a new variant here, not
+/// a fourth place that computes distances.
 ///
-/// A K-major 16-bit operand in shared memory is a grid of `8 row x 16 byte` core matrices, and the
-/// hardware reconstructs core matrix `(i, j)` -- row group `i`, k group `j` -- as
-/// `start + i * <one offset> + j * <the other offset>`. The two distances for a tile whose rows are
-/// `row_bytes` apart are therefore `16` (k-adjacent) and `8 * row_bytes` (row-group-adjacent), and
-/// the only open question is which of them the ISA calls "leading".
-///
-/// **This is UNCONFIRMED on silicon and it is the first thing an H100 must settle.** The reading
-/// this module ships, [`DescOrder::KLeading`], follows the ISA's own no-swizzle figure, in which a
-/// densely packed 64x16 A tile has leading offset 128 B (one core matrix, i.e. k-adjacent) and stride
-/// offset 256 B (two core matrices, i.e. row-adjacent). If that reading is wrong the two fields are
-/// simply swapped, and the failure mode is **silently wrong results, not a JIT error** -- so it is a
-/// config field rather than a constant, and flipping it is a one-token A/B on the first Hopper run
-/// rather than a code change. See `WGMMA_DEVICE_VALIDATION` item 1.
+/// The geometry every variant is stated over is fixed by the ISA: a 16-bit core matrix is
+/// `8 rows x 16 bytes`, `row_bytes` is the tile's row pitch in shared memory, `rows_per_desc` is how
+/// many rows one descriptor covers (64 for A -- each consumer warpgroup owns its own `m64` slab --
+/// and the full CTA width for B).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DescOrder {
-    /// Leading = the K direction (16 B between k-adjacent core matrices). The shipped reading.
-    KLeading,
-    /// Leading = the M/N direction (`8 * row_bytes` between row-group-adjacent core matrices).
-    MnLeading,
+pub enum SmemLayout {
+    /// **Plain row-major within the box** -- what a `SWIZZLE_NONE` TMA tiled copy writes, and what
+    /// this family shipped until 2026-08-10.
+    ///
+    /// It is **not describable**: the hardware's within-core-matrix row stride is the fixed 16 bytes,
+    /// so any `row_bytes > 16` (i.e. any `BK > 8` for a 16-bit type) is off by `r * (row_bytes - 16)`
+    /// on 7 of every 8 rows no matter what the two fields hold. Kept because the H100 has already
+    /// scored both of its readings -- 64/4096 and 0/4096 -- and reproducing those two numbers is how
+    /// the sweep validates itself.
+    RowMajorNone {
+        /// `true` puts the k-adjacent distance (16) in the leading field, `false` the row-group one.
+        k_leading: bool,
+    },
+    /// **The ISA's canonical no-swizzle layout**: every `8 x 16 B` core matrix stored as 128
+    /// contiguous bytes, the core-matrix grid traversed K-fastest (`k_fast`) or MN-fastest.
+    ///
+    /// Describable, and the leading hypothesis -- but **one tiled TMA copy cannot write it**, so
+    /// [`wgmma_module`] declines it and only the sweep probe (which repacks by hand) stages it. If
+    /// this is the arm that goes exact, the production fix is a layout change, not a field change.
+    CanonicalNone {
+        k_fast: bool,
+        /// The axis-naming coin flip, kept as a candidate rather than as an argument.
+        swapped: bool,
+    },
+    /// **The 128-B XOR swizzle -- what production ships.**
+    ///
+    /// At `row_bytes == 128` the canonical 128-B-swizzle K-major layout is plain row-major (row
+    /// stride 128 B, k-group stride 16 B, `SBO = 8 * 128`) composed with `Swizzle<3,4,3>`, which is
+    /// exactly what a `CU_TENSOR_MAP_SWIZZLE_128B` TMA copy writes. No repack, no extra copies, and
+    /// the descriptor's own swizzle field tells the hardware to undo the permutation.
+    ///
+    /// LBO does not appear in that layout at all (the k-group stride is the fixed 16 B), so
+    /// `lbo_bytes` is the value the field is *spelled* with; the sweep carries three spellings and
+    /// will say whether the hardware reads it.
+    ///
+    /// `swapped` is the axis-naming flip **again**, and it is here rather than assumed away because
+    /// the two independent readings of the ISA disagree exactly at this point: the CUTLASS
+    /// descriptor builder assigns the two fields one way for its no-swizzle ("interleave") layout
+    /// and the other way for the swizzled ones, while the published tutorial derivation keeps SBO on
+    /// the MN axis in both. One candidate settles it; an argument does not.
+    Swizzle128 { lbo_bytes: u64, swapped: bool },
 }
 
-impl DescOrder {
-    /// Both readings, in the order the bring-up gate reports them. Exactly one of the two is what
-    /// the silicon does; there is no third possibility and no partial credit.
-    pub const BOTH: [DescOrder; 2] = [DescOrder::KLeading, DescOrder::MnLeading];
+/// The descriptor fields one [`SmemLayout`] implies, plus the byte distance the descriptor's start
+/// address moves per `wgmma` K step (16 elements). Everything a generator needs and nothing it may
+/// re-derive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescFields {
+    pub lbo: u64,
+    pub sbo: u64,
+    pub base_offset: u8,
+    pub swizzle: SmemSwizzle,
+    /// How far the descriptor's start address advances per `wgmma` K step. 32 B for any layout whose
+    /// K direction is contiguous in 16-bit elements; a whole pair of core matrices otherwise.
+    pub k_step_bytes: u64,
+}
 
-    /// The other reading — the one-token A/B `WGMMA_DEVICE_VALIDATION` item 1 is about.
-    pub const fn flipped(self) -> Self {
+/// **THE authority.** One layout in, one field tuple out -- used by [`SmemDesc::for_layout`], by
+/// the generator's own descriptor constants and by every row of [`desc_sweep_candidates`], so the
+/// reading the H100 crowns reaches production by changing [`SHIPPED_LAYOUT`] and nothing else.
+pub fn desc_fields(layout: SmemLayout, row_bytes: u64, rows_per_desc: u64) -> DescFields {
+    /// One 16-bit core matrix: 8 rows of 16 bytes, packed.
+    const CORE: u64 = 128;
+    // Core matrices along K in one tile row, and along MN in one descriptor's slab.
+    let ncm_k = row_bytes / 16;
+    let ncm_m = rows_per_desc / 8;
+    match layout {
+        SmemLayout::RowMajorNone { k_leading } => {
+            let (a, b) = (16, 8 * row_bytes);
+            let (lbo, sbo) = if k_leading { (a, b) } else { (b, a) };
+            DescFields {
+                lbo,
+                sbo,
+                base_offset: 0,
+                swizzle: SmemSwizzle::None,
+                k_step_bytes: 32,
+            }
+        }
+        SmemLayout::CanonicalNone { k_fast, swapped } => {
+            // K-fastest: k-adjacent core matrices are 128 B apart, MN-adjacent ones a whole row of
+            // core matrices. MN-fastest is the transpose of that packing.
+            let (lbo, sbo) = if k_fast {
+                (CORE, CORE * ncm_k)
+            } else {
+                (CORE * ncm_m, CORE)
+            };
+            let (lbo, sbo) = if swapped { (sbo, lbo) } else { (lbo, sbo) };
+            // One wgmma K step is 16 elements = two core matrices along K.
+            let step = if k_fast { 2 * CORE } else { 2 * CORE * ncm_m };
+            DescFields {
+                lbo,
+                sbo,
+                base_offset: 0,
+                swizzle: SmemSwizzle::None,
+                k_step_bytes: step,
+            }
+        }
+        SmemLayout::Swizzle128 { lbo_bytes, swapped } => {
+            let (lbo, sbo) = if swapped {
+                (8 * row_bytes, lbo_bytes)
+            } else {
+                (lbo_bytes, 8 * row_bytes)
+            };
+            DescFields {
+                lbo,
+                sbo,
+                base_offset: 0,
+                swizzle: SmemSwizzle::B128,
+                k_step_bytes: 32,
+            }
+        }
+    }
+}
+
+impl SmemLayout {
+    /// A stable ASCII spelling for logs and candidate labels.
+    pub fn label(self) -> String {
         match self {
-            DescOrder::KLeading => DescOrder::MnLeading,
-            DescOrder::MnLeading => DescOrder::KLeading,
+            SmemLayout::RowMajorNone { k_leading: true } => {
+                "SmemLayout::RowMajorNone { k_leading: true }".into()
+            }
+            SmemLayout::RowMajorNone { k_leading: false } => {
+                "SmemLayout::RowMajorNone { k_leading: false }".into()
+            }
+            SmemLayout::CanonicalNone { k_fast, swapped } => {
+                format!("SmemLayout::CanonicalNone {{ k_fast: {k_fast}, swapped: {swapped} }}")
+            }
+            SmemLayout::Swizzle128 { lbo_bytes, swapped } => {
+                format!("SmemLayout::Swizzle128 {{ lbo_bytes: {lbo_bytes}, swapped: {swapped} }}")
+            }
         }
     }
 
-    /// The spelling a bring-up log prints. ASCII, stable, and the same token a human would type
-    /// into `desc_order:` if the round says this one won.
-    pub const fn label(self) -> &'static str {
+    /// The TMA swizzle the copy that writes this layout must carry. The descriptor's own swizzle
+    /// field is the reversed encoding of the same choice ([`SmemSwizzle::from_tma`]).
+    pub const fn tma_swizzle(self) -> TmaSwizzle {
         match self {
-            DescOrder::KLeading => "DescOrder::KLeading",
-            DescOrder::MnLeading => "DescOrder::MnLeading",
+            SmemLayout::Swizzle128 { .. } => TmaSwizzle::B128,
+            _ => TmaSwizzle::None,
         }
+    }
+
+    /// **Can one tiled TMA copy leave the operand in this layout?** `false` means the layout needs a
+    /// shared-memory repack (or `BK / 8` copies per operand per stage), which the production
+    /// generator declines rather than pretending to express.
+    pub const fn tma_writable(self) -> bool {
+        !matches!(self, SmemLayout::CanonicalNone { .. })
     }
 }
 
 impl SmemDesc {
-    /// The descriptor for a **K-major tile of 16-bit elements** whose rows are `row_bytes` apart --
-    /// i.e. exactly what a TMA tiled copy of a row-major `rows x bk` operand leaves in shared memory.
+    /// The descriptor for an operand stored in `layout`, at `start_addr`.
     ///
-    /// Both GEMM operands of an NT product have this form: A is `M x K` with K contiguous, and B is
-    /// `N x K` with K contiguous, which is `B(K x N)` in column-major -- and column-major B is what
-    /// `wgmma` expects at `imm-trans-b = 0`. So the NT layout this backend already stores needs no
-    /// transpose flag on either operand, and both descriptors are built by this one constructor.
-    pub fn k_major(
+    /// Both GEMM operands of an NT product take the same constructor: A is `M x K` with K
+    /// contiguous, and B is `N x K` with K contiguous, which is `B(K x N)` in column-major -- and
+    /// column-major B is what `wgmma` expects at `imm-trans-b = 0`. So the NT layout this backend
+    /// already stores needs no transpose flag on either operand.
+    pub fn for_layout(
         start_addr: u64,
+        layout: SmemLayout,
         row_bytes: u64,
-        order: DescOrder,
-        swizzle: SmemSwizzle,
+        rows_per_desc: u64,
     ) -> Self {
-        let k_adjacent = 16;
-        let row_group_adjacent = 8 * row_bytes;
-        let (lbo, sbo) = match order {
-            DescOrder::KLeading => (k_adjacent, row_group_adjacent),
-            DescOrder::MnLeading => (row_group_adjacent, k_adjacent),
-        };
+        let f = desc_fields(layout, row_bytes, rows_per_desc);
         Self {
             start_addr,
-            lbo,
-            sbo,
-            base_offset: 0,
-            swizzle,
+            lbo: f.lbo,
+            sbo: f.sbo,
+            base_offset: f.base_offset,
+            swizzle: f.swizzle,
         }
     }
 
@@ -517,21 +664,20 @@ impl SmemDesc {
             | ((self.swizzle as u64) << 62))
     }
 
-    /// **Where the hardware fetches core matrix `(row_group, k_group)` from**, in bytes, given this
-    /// descriptor's two offset fields.
+    /// **Where the hardware fetches element `(r, c)` of core matrix `(i, j)` from**, in bytes, under
+    /// the unswizzled canonical model.
     ///
-    /// One formula covers both readings, deliberately. The hardware's reconstruction is fixed --
-    /// it multiplies one field by the row-group index and the other by the k-group index -- and
-    /// [`DescOrder`] decides which of the two geometric distances [`SmemDesc::k_major`] *put* in
-    /// each field. So swapping the order swaps the result of this function, which is precisely the
-    /// statement "the two readings address different elements", and precisely why the wrong one is
-    /// silently wrong data rather than a fault: both land inside the same tile.
+    /// `i` is the MN-direction core-matrix index (rows `8i .. 8i+7`), `j` the K-direction one
+    /// (columns `8j .. 8j+7` for a 16-bit type), `r` the row **within** the core matrix and `c` the
+    /// element within that row. The `r * 16` is the whole point: the within-core-matrix row stride is
+    /// a constant the descriptor cannot change, which is what makes a wide row-major tile
+    /// unrepresentable.
     ///
-    /// This is a **model**, used only to prove the bring-up probe is sensitive enough to tell the
-    /// two apart (`the_two_desc_orders_address_different_elements`). The device verdict does not
-    /// consult it: that is an f64 reference against the launched kernel, and nothing else.
-    pub const fn core_matrix_offset(&self, row_group: u64, k_group: u64) -> u64 {
-        self.start_addr + row_group * self.sbo + k_group * self.lbo
+    /// This is a **model**. No device verdict consults it -- those are f64 references against a
+    /// launched kernel. It exists so the sweep's claims (which candidate should win, and why the
+    /// 2026-08-10 log reads 64/4096) are checkable with no Hopper part in the room.
+    pub const fn canonical_offset(&self, i: u64, j: u64, r: u64, c: u64, elem: u64) -> u64 {
+        self.start_addr + i * self.sbo + j * self.lbo + r * 16 + c * elem
     }
 
     /// The descriptor with its start-address field zeroed -- the part the host can fold into an
@@ -546,6 +692,53 @@ impl SmemDesc {
         z.start_addr = 0;
         z.pack()
     }
+
+    /// [`SmemDesc::const_part`] under a **stated field encoding**, for the two sweep candidates that
+    /// exist to close the encoding question in both directions.
+    ///
+    /// The ISA says every address/offset field is `(x & 0x3FFFF) >> 4`, and the 2026-08-10 log is
+    /// already consistent with that for the start address. [`FieldEncoding::Raw`] and
+    /// [`FieldEncoding::Twice`] are the two ways a reader could get the *offset* fields wrong while
+    /// the address stays right; one launch each retires both.
+    pub fn const_part_as(&self, enc: FieldEncoding) -> Result<u64, String> {
+        let f = |v: u64| -> Result<u64, String> {
+            let e = match enc {
+                FieldEncoding::Standard => encode_desc_field(v),
+                FieldEncoding::Raw => v,
+                FieldEncoding::Twice => encode_desc_field(encode_desc_field(v)),
+            };
+            if e >= 1 << 14 {
+                return Err(format!(
+                    "{UNSUPPORTED}: offset {v} does not fit the 14-bit field under {enc:?}"
+                ));
+            }
+            Ok(e)
+        };
+        if self.base_offset > 7 {
+            return Err(format!(
+                "{UNSUPPORTED}: descriptor base offset {} does not fit 3 bits",
+                self.base_offset
+            ));
+        }
+        Ok((f(self.lbo)? << 16)
+            | (f(self.sbo)? << 32)
+            | ((self.base_offset as u64) << 49)
+            | ((self.swizzle as u64) << 62))
+    }
+}
+
+/// How a sweep candidate writes the two offset fields.
+///
+/// [`FieldEncoding::Standard`] is the ISA's `(x & 0x3FFFF) >> 4` and is what production uses; the
+/// other two exist only as sweep candidates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldEncoding {
+    /// `(x & 0x3FFFF) >> 4` -- the ISA's own encoding.
+    Standard,
+    /// Raw bytes, no shift: the reading in which `>> 4` applies to the start address alone.
+    Raw,
+    /// The shift applied twice -- the mirror mistake.
+    Twice,
 }
 
 // --- configuration --------------------------------------------------------------------------------
@@ -595,8 +788,10 @@ pub struct WgmmaCfg {
     /// `setmaxnreg.inc` target for each consumer warpgroup.
     pub consumer_regs: u32,
     pub dtype: WgmmaDtype,
-    pub swizzle: SmemSwizzle,
-    pub desc_order: DescOrder,
+    /// **The shared-memory layout both operands are staged in**, and therefore the descriptor
+    /// fields, the swizzle mode of both tensor maps, and the per-K-step base advance. One field, one
+    /// authority ([`desc_fields`]) -- so the reading the H100 crowns lands here and nowhere else.
+    pub layout: SmemLayout,
     pub schedule: Schedule,
     pub multicast: Multicast,
 }
@@ -604,6 +799,15 @@ pub struct WgmmaCfg {
 impl WgmmaCfg {
     pub const fn threads(&self) -> usize {
         (1 + self.consumer_wgs) * WARPGROUP_THREADS
+    }
+    /// The descriptor's swizzle mode, derived from the layout -- never a second field that could
+    /// disagree with it.
+    pub const fn swizzle(&self) -> SmemSwizzle {
+        SmemSwizzle::from_tma(self.layout.tma_swizzle())
+    }
+    /// The tile's row pitch in shared memory, bytes. A staged tile is `BK` elements wide.
+    pub const fn row_bytes(&self) -> u64 {
+        (self.bk * self.dtype.size()) as u64
     }
     /// Bytes of one A tile (one stage).
     pub const fn tile_a_bytes(&self) -> usize {
@@ -661,7 +865,7 @@ impl WgmmaCfg {
             k as u64,
             self.bm as u32,
             self.bk as u32,
-            self.swizzle.to_tma(),
+            self.layout.tma_swizzle(),
         )
     }
     /// The TMA descriptor geometry for the B operand of an `N x K` row-major matrix (NT GEMM).
@@ -673,7 +877,7 @@ impl WgmmaCfg {
             k as u64,
             self.bn as u32,
             self.bk as u32,
-            self.swizzle.to_tma(),
+            self.layout.tma_swizzle(),
         )
     }
 
@@ -740,7 +944,7 @@ impl WgmmaCfg {
         }
         // Every stage base must satisfy the descriptor's alignment, since the descriptor's start
         // address is a stage base plus a multiple of the row size.
-        let align = self.swizzle.required_alignment() as usize;
+        let align = self.swizzle().required_alignment() as usize;
         for (what, bytes) in [
             ("A tile", self.tile_a_bytes()),
             ("B tile", self.tile_b_bytes()),
@@ -749,7 +953,8 @@ impl WgmmaCfg {
                 return Err(format!(
                     "{UNSUPPORTED}: {}: one {what} is {bytes} B, not a multiple of the {align} B \
                      alignment {:?} requires, so stage bases would drift out of alignment",
-                    self.name, self.swizzle
+                    self.name,
+                    self.swizzle()
                 ));
             }
         }
@@ -813,13 +1018,27 @@ impl WgmmaCfg {
                 self.name, self.multicast
             ));
         }
-        if self.swizzle != SmemSwizzle::None {
+        if !self.layout.tma_writable() {
             return Err(format!(
-                "{UNSUPPORTED}: {}: {:?} shared-memory swizzle is not implemented. The packer \
-                 supports every mode, but a swizzled operand's leading/stride byte offsets are not \
-                 the plain core-matrix distances `SmemDesc::k_major` derives, and this generator \
-                 will not guess them.",
-                self.name, self.swizzle
+                "{UNSUPPORTED}: {}: {} needs every core matrix packed into 128 contiguous bytes, \
+                 which one tiled TMA copy of a row-major operand does not write (it would take \
+                 BK/8 = {} copies per operand per stage, or a shared-memory repack). The sweep \
+                 probe stages it by hand; this generator declines rather than emitting a mainloop \
+                 whose operands are in the wrong order.",
+                self.name,
+                self.layout.label(),
+                self.bk / 8
+            ));
+        }
+        if self.swizzle() == SmemSwizzle::B128 && self.row_bytes() != 128 {
+            return Err(format!(
+                "{UNSUPPORTED}: {}: the 128-B swizzle atom is 128 bytes and this tile's shared row \
+                 is {} B (BK={} x {} B). The swizzled canonical layout only coincides with what TMA \
+                 writes when the two are equal.",
+                self.name,
+                self.row_bytes(),
+                self.bk,
+                self.dtype.size()
             ));
         }
         // The TMA descriptors this config implies must themselves be legal, at a representative
@@ -917,6 +1136,16 @@ impl LaunchPlan {
 /// **This row is the full form minus cluster multicast** ([`Multicast::None`]), which is the right
 /// bring-up order anyway: multicast is a traffic optimisation whose failure mode is a deadlock, and
 /// the kernel is correct without it.
+///
+/// # The `layout` field is the 2026-08-10 correction, and is AWAITING CONFIRMATION
+///
+/// This row shipped `RowMajorNone { k_leading: true }` until the first H100 round scored it 64 of
+/// 4096 output lanes exact -- the signature of a descriptor whose within-core-matrix row stride is
+/// the fixed 16 bytes while the tile's rows are 128 apart. [`SmemLayout::Swizzle128`] is the reading
+/// this file now derives (module docs, fifth fact): TMA writes the 128-B-swizzled tile and the
+/// descriptor's own `Swizzle<3,4,3>` undoes it, with no repack. **Nothing has executed it.** The gate
+/// that will is `wgmma_hopper_bringup` stage D, whose sweep carries this reading, the canonical
+/// no-swizzle alternative and both of the readings the log already scored.
 pub const WGMMA_W1: WgmmaCfg = WgmmaCfg {
     name: "wgmma_nt_f16_128x256x64_s4",
     key: "wgmma_nt_f16_128x256x64_s4",
@@ -928,10 +1157,20 @@ pub const WGMMA_W1: WgmmaCfg = WgmmaCfg {
     producer_regs: 32,
     consumer_regs: 232,
     dtype: WgmmaDtype::F16,
-    swizzle: SmemSwizzle::None,
-    desc_order: DescOrder::KLeading,
+    layout: SHIPPED_LAYOUT,
     schedule: Schedule::Cooperative,
     multicast: Multicast::None,
+};
+
+/// **The descriptor reading every shipped row carries**, in one place so the sweep's "ACTION" line is
+/// a single-token edit.
+///
+/// `lbo_bytes: 16` spells the k-group stride the ISA's canonical 128-B-swizzle K-major layout fixes
+/// at one core-matrix row; the field does not appear in that layout's address formula at all, so the
+/// sweep carries two other spellings and will report whether the hardware reads it.
+pub const SHIPPED_LAYOUT: SmemLayout = SmemLayout::Swizzle128 {
+    lbo_bytes: 16,
+    swapped: false,
 };
 
 /// The bf16 twin of [`WGMMA_W1`]. `wgmma` is precision-generic across the 16-bit types -- only the
@@ -971,46 +1210,9 @@ pub const WGMMA_VARIANTS: &[WgmmaCfg] = &[WGMMA_W1, WGMMA_W1_BF16, WGMMA_W3C];
 pub fn wgmma_variant(name: &str) -> &'static WgmmaCfg {
     WGMMA_VARIANTS
         .iter()
-        .chain(WGMMA_BRINGUP_VARIANTS)
         .find(|v| v.name == name)
         .unwrap_or_else(|| panic!("unknown wgmma variant {name:?}"))
 }
-
-// --- bring-up: the DescOrder A/B ------------------------------------------------------------------
-
-/// **[`WGMMA_W1`] with the descriptor's two offset fields swapped** — the second arm of the one-visit
-/// `DescOrder` A/B, and the *only* reason this row exists.
-///
-/// `WGMMA_DEVICE_VALIDATION` item 1 as originally written was "run W1; if it is wrong, flip
-/// `desc_order` and rerun". On rented silicon that is two visits for a coin flip, and
-/// `GPU_RETARGET_PLAN.md` section 0 forbids interactive debugging on metered time. So both readings
-/// are *built* here, both are loaded and launched in the same round, and the hardware picks. The
-/// entry name and the module-cache key both carry the `_mn` suffix, because `Gpu::function` keys on
-/// the string alone and never re-examines the PTX — two descriptor constants under one key would
-/// silently be one kernel, run twice, agreeing perfectly, and the round would "settle" nothing.
-///
-/// This is a **bring-up row, not a shipped one**: it is deliberately outside [`WGMMA_VARIANTS`] so a
-/// launcher cannot pick it by iterating the shipped table. Once the round names a winner, the winner
-/// becomes `WGMMA_W1`'s `desc_order` and this row's job is done.
-pub const WGMMA_W1_MN: WgmmaCfg = WgmmaCfg {
-    name: "wgmma_nt_f16_128x256x64_s4_mn",
-    key: "wgmma_nt_f16_128x256x64_s4_mn",
-    desc_order: DescOrder::MnLeading,
-    ..WGMMA_W1
-};
-
-/// Every configuration that exists **only** to be run on the first Hopper part. Kept apart from
-/// [`WGMMA_VARIANTS`] so "what ships" and "what bring-up launches" cannot be confused, and joined to
-/// it wherever a law needs the union (the ASCII, `.target` and `.version` gates all scan both).
-pub const WGMMA_BRINGUP_VARIANTS: &[WgmmaCfg] = &[WGMMA_W1_MN];
-
-/// The two arms of the `DescOrder` A/B, in report order: the shipped reading first.
-///
-/// A launcher that runs both and compares each against an f64 reference settles item 1 in one visit.
-/// **Exactly one must match.** Two matching would mean the probe cannot tell the readings apart at
-/// that geometry (a ramp too symmetric — see [`bringup_operands`]); zero matching means the fault is
-/// somewhere else entirely and the round must say so rather than guess.
-pub const WGMMA_DESC_ORDER_AB: &[&WgmmaCfg] = &[&WGMMA_W1, &WGMMA_W1_MN];
 
 // --- bring-up: operands whose permutation is visible ----------------------------------------------
 
@@ -1084,41 +1286,47 @@ pub fn bringup_operands(m: usize, n: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
     (a, b)
 }
 
-/// **The operand the hardware would see**, element by element, when the descriptor's two offset
-/// fields are exchanged (`swapped = true`) or not (`swapped = false`).
+/// **The operand the hardware would see**, element by element, when an *unswizzled* descriptor with
+/// fields `f` is pointed at a tile that is physically stored **plain row-major**.
 ///
-/// This is the descriptor arithmetic run backwards on the host. For a K-major tile of 16-bit
-/// elements whose rows are `row_bytes = 2 * k` apart, a `wgmma` at K step `j0` builds its descriptor
-/// at `slab_base + 32 * j0` and the hardware reconstructs core matrix `(i, j)` — row group `i`, k
-/// group `j` — at `+ i * <one field> + j * <the other>`. Within a core matrix, element `(r, c)` is at
-/// `+ r * row_bytes + 2 * c`, which the two fields do not describe and a swap therefore cannot move.
-/// Substituting the two distances [`SmemDesc::k_major`] derives (`16` and `8 * row_bytes`) gives:
+/// The descriptor arithmetic, run backwards on the host. A `wgmma` at K step `j0` builds its
+/// descriptor at `slab_base + j0 * f.k_step_bytes`, and the hardware fetches element `(r, c)` of core
+/// matrix `(i, j)` from `+ i*SBO + j*LBO + r*16 + c*2` ([`SmemDesc::canonical_offset`]). Reading that
+/// byte offset back through a row-major tile gives the element the kernel actually multiplies:
 ///
 /// ```text
-/// unswapped: o = 32*j0 + i*8*row_bytes + j*16          + r*row_bytes + 2*c   (the identity)
-/// swapped:   o = 32*j0 + i*16          + j*8*row_bytes + r*row_bytes + 2*c
+/// o = j0*k_step + i*SBO + j*LBO + r*16 + c*2       (what the hardware fetches)
+/// truth: (8i+r)*row_bytes + (16*j0 + 8j + c)*2     (where the element really is)
 /// ```
 ///
-/// `rows_per_desc` is how many rows one descriptor covers: 64 for A, where each consumer warpgroup
-/// owns its own `m64` slab, and the full tile height for B, whose `N x 16` operand is described in
-/// one piece. Reads past the operand return **zero**, matching TMA's fill past the last real row.
+/// The `r*16` against the truth's `r*row_bytes` is the whole 2026-08-10 defect: it cancels only at
+/// `r == 0`, so exactly one row in eight is read correctly and the product is exact only where BOTH
+/// operands' rows are the eighth one -- 64 lanes of 4096, which is what the H100 measured.
 ///
-/// **This is a model, and it exists to prove the bring-up probe is sensitive — nothing else.** No
-/// device verdict consults it. Its own honesty check is that `swapped = false` must reproduce the
-/// input exactly (`the_two_desc_orders_address_different_elements`): a model that cannot express
-/// "correct" is not modelling the right thing.
-pub fn desc_read(
+/// `rows_per_desc` is how many rows one descriptor covers: 64 for A, where each consumer warpgroup
+/// owns its own `m64` slab, and the full tile height for B. Reads past the operand return **zero**,
+/// matching TMA's fill past the last real row.
+///
+/// **This is a model.** No device verdict consults it; it exists so the sweep's predictions and the
+/// logged 64/4096 can be checked with no Hopper part in the room
+/// (`the_row_major_reading_is_unrepresentable_and_predicts_the_log`).
+pub fn unswizzled_read(
     x: &[f32],
     rows: usize,
     k: usize,
     rows_per_desc: usize,
-    swapped: bool,
+    f: DescFields,
 ) -> Vec<f32> {
     assert_eq!(x.len(), rows * k, "operand is rows*k");
     assert!(
         rows_per_desc.is_multiple_of(8) && k.is_multiple_of(WgmmaShape::K),
         "the core-matrix grid needs 8 rows and the wgmma K step needs {} elements",
         WgmmaShape::K
+    );
+    assert_eq!(
+        f.swizzle,
+        SmemSwizzle::None,
+        "this model reads an UNSWIZZLED descriptor; a swizzled one permutes 16-byte chunks too"
     );
     let row_bytes = 2 * k;
     let mut out = vec![0f32; rows * k];
@@ -1128,12 +1336,11 @@ pub fn desc_read(
         for dst_col in 0..k {
             let (j0, rem) = (dst_col / WgmmaShape::K, dst_col % WgmmaShape::K);
             let (j, c) = (rem / 8, rem % 8);
-            let (fi, fj) = if swapped {
-                (16, 8 * row_bytes)
-            } else {
-                (8 * row_bytes, 16)
-            };
-            let o = 32 * j0 + i * fi + j * fj + r * row_bytes + 2 * c;
+            let o = j0 * f.k_step_bytes as usize
+                + i * f.sbo as usize
+                + j * f.lbo as usize
+                + r * 16
+                + c * 2;
             let (src_row, src_col) = (base_row + o / row_bytes, (o % row_bytes) / 2);
             out[dst_row * k + dst_col] = if src_row < rows && src_col < k {
                 x[src_row * k + src_col]
@@ -1282,6 +1489,665 @@ pub fn tma_stage_probe_module(license: &Sm90aLicense) -> Result<String, String> 
     Ok(s)
 }
 
+// --- bring-up: the ONE-VISIT descriptor sweep -----------------------------------------------------
+
+/// The sweep probe's square tile: `M = N = 64`, one warpgroup, one CTA. The smallest geometry in
+/// which a core-matrix permutation is visible in **both** operands (8 x 8 core matrices each).
+pub const DESC_SWEEP_M: usize = 64;
+/// See [`DESC_SWEEP_M`]. `N = 64` also makes the `wgmma` shape `m64n64k16`, whose 32 accumulators fit
+/// a plain 128-thread launch with no `setmaxnreg` anywhere in the kernel.
+pub const DESC_SWEEP_N: usize = 64;
+/// Staged K width in elements. 64 f16 elements = **128 bytes**, which is simultaneously the 128-B
+/// swizzle atom, TMA's maximum contiguous box extent under it, and the `BK` every shipped row uses --
+/// so the sweep is asking its question at the geometry production runs.
+pub const DESC_SWEEP_BK: usize = 64;
+/// Bytes of one staged tile: `64 x 64` f16.
+pub const DESC_SWEEP_TILE: usize = DESC_SWEEP_M * DESC_SWEEP_BK * 2;
+/// Byte offset of the A tile **as TMA wrote it**.
+pub const DESC_SWEEP_A_RAW: usize = 0;
+/// Byte offset of the B tile **as TMA wrote it**.
+pub const DESC_SWEEP_B_RAW: usize = DESC_SWEEP_TILE;
+/// Byte offset of the A tile **after the probe-only repack**.
+pub const DESC_SWEEP_A_ALT: usize = 2 * DESC_SWEEP_TILE;
+/// Byte offset of the B tile after the repack.
+pub const DESC_SWEEP_B_ALT: usize = 3 * DESC_SWEEP_TILE;
+/// Byte offset of the single mbarrier.
+pub const DESC_SWEEP_BAR: usize = 4 * DESC_SWEEP_TILE;
+/// **Total dynamic shared memory the probe requests -- deliberately far more than the four tiles and
+/// a barrier need.**
+///
+/// A sweep launches candidates that are *wrong on purpose*, and a wrong (LBO, SBO) does not read a
+/// wrong element of the tile -- it reads a wrong ADDRESS. The widest row in the set,
+/// `canon-kfast/raw-fields`, hands the hardware a stride field of 1024 *unshifted*, which the
+/// hardware then multiplies by 16: 16 KiB between row groups, so its last core matrix sits ~115 KiB
+/// past its matrix base. Inside the CTA's window that reads garbage and scores zero, which is the
+/// answer wanted. **Outside it, it is `CUDA_ERROR_MISALIGNED_ADDRESS`/`ILLEGAL_ADDRESS`, which makes
+/// the context sticky-errored** (crate landmine 6) and ends the round at whichever candidate
+/// happened to be first. So the window is sized to hold every candidate's furthest reach, and
+/// `every_sweep_candidate_reads_inside_the_window` proves it device-free, before any rental.
+///
+/// 144 KiB, against H100's 227 KiB opt-in carveout. One CTA, so occupancy is not a consideration.
+pub const DESC_SWEEP_SMEM: usize = 144 * 1024;
+/// One warpgroup. `wgmma` is warpgroup-wide and `.aligned`; 128 threads is the minimum that can
+/// issue one, and the probe deliberately has no producer/consumer split at all.
+pub const DESC_SWEEP_THREADS: u32 = 128;
+/// The probe's entry symbol. It **does** contain `wgmma` (that is the point), so unlike
+/// [`TMA_PROBE_ENTRY`] the name may say so.
+pub const DESC_SWEEP_ENTRY: &str = "wk_wgmma_desc_sweep";
+/// The probe's `Gpu::function` module-cache key. **One key is correct**: every candidate's descriptor
+/// template, staging mode, matrix offsets and K-step advance are run-time *parameters*, so all of
+/// them run the same compiled module. That is the entire design -- one load, then a host loop.
+pub const DESC_SWEEP_KEY: &str = "wk_wgmma_desc_sweep";
+/// The two K values every candidate is run at, in report order.
+///
+/// `16` issues exactly **one** `wgmma`, so the descriptor's start address never advances and the
+/// per-K-step base arithmetic is out of the picture; `64` issues four and puts it back. A candidate
+/// exact at 16 and wrong at 64 has a k-step problem and nothing else -- a diagnosis that would
+/// otherwise cost a second rental.
+pub const DESC_SWEEP_KS: &[usize] = &[16, 64];
+
+/// The transaction one launch of the probe declares: both tiles, one barrier.
+pub const fn desc_sweep_tx_bytes() -> usize {
+    2 * DESC_SWEEP_TILE
+}
+
+/// **How the probe stages the tile before the descriptor reads it.**
+///
+/// Modes 1-3 are a probe-only repack: plain `ld.shared`/`st.shared`, one element per thread per
+/// iteration, correctness over speed. They exist because [`SmemLayout::CanonicalNone`] is a layout no
+/// single tiled TMA copy writes, and a round that could not stage it would be unable to tell "the
+/// descriptor fields are wrong" from "the descriptor model is wrong".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SweepStaging {
+    /// The tile exactly as TMA left it, at the tensor map's own swizzle. No repack.
+    AsWritten = 0,
+    /// Repacked so each `8 x 16 B` core matrix is 128 contiguous bytes, core-matrix grid K-fastest.
+    CanonicalKFast = 1,
+    /// The same packing, core-matrix grid MN-fastest.
+    CanonicalMnFast = 2,
+    /// A **verbatim** element-by-element copy into the alternate region. Not a layout -- a control:
+    /// it proves the repack loop itself moves bytes faithfully, so a canonical arm's failure accuses
+    /// the layout and not the copier.
+    VerbatimCopy = 3,
+}
+
+impl SweepStaging {
+    /// Byte offsets of the A and B matrices the descriptors must point at under this mode.
+    pub const fn operand_offsets(self) -> (usize, usize) {
+        match self {
+            SweepStaging::AsWritten => (DESC_SWEEP_A_RAW, DESC_SWEEP_B_RAW),
+            _ => (DESC_SWEEP_A_ALT, DESC_SWEEP_B_ALT),
+        }
+    }
+    pub const fn label(self) -> &'static str {
+        match self {
+            SweepStaging::AsWritten => "as-written",
+            SweepStaging::CanonicalKFast => "canon-kfast",
+            SweepStaging::CanonicalMnFast => "canon-mnfast",
+            SweepStaging::VerbatimCopy => "verbatim",
+        }
+    }
+}
+
+/// **One row of the descriptor sweep**: a staging mode, a tensor-map swizzle, and the four descriptor
+/// fields, plus the reason it is in the set.
+///
+/// Every field here becomes a **run-time kernel argument**, never a second PTX module. One
+/// `cuModuleLoadData`, then a host loop that reads in seconds.
+#[derive(Clone, Copy, Debug)]
+pub struct DescCandidate {
+    /// Stable ASCII label, printed in the sweep table and quoted in the round log.
+    pub label: &'static str,
+    /// **Why this row is in the set** -- one line, printed beside it, so a reader never has to guess
+    /// what a candidate was testing.
+    pub why: &'static str,
+    pub staging: SweepStaging,
+    pub encoding: FieldEncoding,
+    pub lbo: u64,
+    pub sbo: u64,
+    pub base_offset: u8,
+    pub swizzle: SmemSwizzle,
+    /// Byte advance of the descriptor's start address per `wgmma` K step (16 elements).
+    pub k_step_bytes: u32,
+    /// The production [`SmemLayout`] this candidate **is**, when it is one. `None` for a row that
+    /// exists only to be ruled out (a bad encoding, a phase probe, the verbatim control).
+    pub layout: Option<SmemLayout>,
+}
+
+impl DescCandidate {
+    /// The descriptor this candidate packs, with the start address left at zero (the kernel ORs in
+    /// the run-time shared address).
+    pub fn desc(&self) -> SmemDesc {
+        SmemDesc {
+            start_addr: 0,
+            lbo: self.lbo,
+            sbo: self.sbo,
+            base_offset: self.base_offset,
+            swizzle: self.swizzle,
+        }
+    }
+    /// The 64-bit template the host passes to the kernel.
+    pub fn template(&self) -> Result<u64, String> {
+        self.desc().const_part_as(self.encoding)
+    }
+    /// The TMA swizzle the tensor maps for this candidate must be encoded with. It is the
+    /// *descriptor's* mode translated through the reversed encoding -- never a second choice.
+    pub const fn tma_swizzle(&self) -> TmaSwizzle {
+        self.swizzle.to_tma()
+    }
+    /// Byte offsets of the A and B matrices the descriptors point at.
+    pub const fn operand_offsets(&self) -> (usize, usize) {
+        self.staging.operand_offsets()
+    }
+    /// **The two offset distances the HARDWARE will use**, in bytes, decoded back out of the packed
+    /// template exactly as the hardware decodes them (`field * 16`).
+    ///
+    /// Not the same as `self.lbo` / `self.sbo` for the non-standard encodings, which is the point:
+    /// [`FieldEncoding::Raw`] writes 1024 into a field the hardware reads as 16384 bytes, and it is
+    /// the *decoded* value that decides whether a candidate reads outside the shared window.
+    pub fn hw_fields(&self) -> Result<(u64, u64), String> {
+        let t = self.template()?;
+        Ok((((t >> 16) & 0x3FFF) * 16, ((t >> 32) & 0x3FFF) * 16))
+    }
+    /// **The furthest byte past its matrix base this candidate can make the hardware read**, over
+    /// every `wgmma` K step, core matrix and element of the widest pass ([`DESC_SWEEP_KS`]'s last).
+    ///
+    /// The bound the shared-memory window must clear. See [`DESC_SWEEP_SMEM`] for why a candidate
+    /// that reads past it does not score zero -- it ends the round.
+    pub fn max_reach(&self) -> Result<u64, String> {
+        let (lbo, sbo) = self.hw_fields()?;
+        let steps = (*DESC_SWEEP_KS.last().expect("at least one K pass") / WgmmaShape::K) as u64;
+        // (i, j) run over the core-matrix grid ONE descriptor covers: 8 MN groups (64 rows) and 2 K
+        // groups (16 elements), plus row 7 and element 7 inside the last core matrix.
+        Ok((steps - 1) * self.k_step_bytes as u64 + 7 * sbo + lbo + 7 * 16 + 7 * 2)
+    }
+    /// **The arm this candidate belongs to** -- the (staging, swizzle) pair, i.e. *which bytes are in
+    /// shared memory*, as opposed to which field spelling reads them.
+    ///
+    /// The sweep's verdict is stated over arms rather than over rows because two rows of one arm can
+    /// legitimately both be exact (a field the winning mode ignores has more than one spelling),
+    /// while two *arms* being exact would mean two different shared-memory images both read
+    /// correctly, which is the "the probe settles nothing" failure.
+    pub fn arm(&self) -> String {
+        format!("{}/{:?}", self.staging.label(), self.swizzle)
+    }
+    /// Whether this candidate's reading is one production could ship: a layout one tiled TMA copy
+    /// writes, staged as TMA wrote it, at the ISA's own field encoding.
+    pub fn production_viable(&self) -> bool {
+        self.staging == SweepStaging::AsWritten
+            && self.encoding == FieldEncoding::Standard
+            && matches!(self.layout, Some(l) if l.tma_writable())
+    }
+}
+
+/// **The candidate set -- derived, not sprayed.**
+///
+/// Eighteen rows in five arms, every one of which either (a) reproduces a number the 2026-08-10 H100
+/// log already measured, (b) is a reading the PTX ISA text plausibly supports, or (c) isolates one
+/// mechanism the others share. Every row carries its own `why`, printed beside it.
+///
+/// The fields of every row that corresponds to a real [`SmemLayout`] come from [`desc_fields`], the
+/// single authority the production generator also reads -- so a winner reaches production by editing
+/// [`SHIPPED_LAYOUT`] and nothing else.
+pub fn desc_sweep_candidates() -> Vec<DescCandidate> {
+    let rb = (DESC_SWEEP_BK * 2) as u64; // 128 B of shared row
+    let rows = DESC_SWEEP_M as u64; // both operands: 64 rows per descriptor
+    let of = |label: &'static str, why: &'static str, layout: SmemLayout| {
+        let f = desc_fields(layout, rb, rows);
+        DescCandidate {
+            label,
+            why,
+            staging: match layout {
+                SmemLayout::CanonicalNone { k_fast: true, .. } => SweepStaging::CanonicalKFast,
+                SmemLayout::CanonicalNone { k_fast: false, .. } => SweepStaging::CanonicalMnFast,
+                _ => SweepStaging::AsWritten,
+            },
+            encoding: FieldEncoding::Standard,
+            lbo: f.lbo,
+            sbo: f.sbo,
+            base_offset: f.base_offset,
+            swizzle: f.swizzle,
+            k_step_bytes: f.k_step_bytes as u32,
+            layout: Some(layout),
+        }
+    };
+    let raw = |label: &'static str,
+               why: &'static str,
+               staging: SweepStaging,
+               encoding: FieldEncoding,
+               lbo: u64,
+               sbo: u64,
+               base_offset: u8,
+               swizzle: SmemSwizzle,
+               k_step_bytes: u32| DescCandidate {
+        label,
+        why,
+        staging,
+        encoding,
+        lbo,
+        sbo,
+        base_offset,
+        swizzle,
+        k_step_bytes,
+        layout: None,
+    };
+    let kf = SmemLayout::CanonicalNone {
+        k_fast: true,
+        swapped: false,
+    };
+    vec![
+        // --- arm 1: the tile exactly as TMA wrote it, unswizzled. The two CONTROLS come first. ---
+        of(
+            "ctl/rowmajor-k-leading",
+            "the reading this family shipped; the 2026-08-10 H100 log scored it 64/4096 exact, and \
+             the sweep reproducing that number is how the sweep validates ITSELF",
+            SmemLayout::RowMajorNone { k_leading: true },
+        ),
+        of(
+            "ctl/rowmajor-mn-leading",
+            "the other 2026-08-10 arm, logged at 0/4096 -- the axis-naming coin flip the round \
+             already spent",
+            SmemLayout::RowMajorNone { k_leading: false },
+        ),
+        raw(
+            "rowmajor/lbo128-sbo1024",
+            "the ISA figure's own numbers for a COMPACT 64x16 tile (LBO one core matrix, SBO one \
+             row group) applied unchanged to the row-major tile -- the misreading's nearest \
+             neighbour, and the only descriptor-only row whose LBO is a core matrix rather than a \
+             k-group",
+            SweepStaging::AsWritten,
+            FieldEncoding::Standard,
+            128,
+            1024,
+            0,
+            SmemSwizzle::None,
+            32,
+        ),
+        raw(
+            "rowmajor/lbo16-sbo128",
+            "SBO = ONE core matrix rather than one 8-row group: the reading in which the stride \
+             field counts core matrices",
+            SweepStaging::AsWritten,
+            FieldEncoding::Standard,
+            16,
+            128,
+            0,
+            SmemSwizzle::None,
+            32,
+        ),
+        raw(
+            "rowmajor/lbo1024-sbo128",
+            "the shape a CUTLASS make_gmma_desc printout carries (LBO 64 u128 = 1024 B, SBO 8 u128 \
+             = 128 B) read straight onto the row-major tile",
+            SweepStaging::AsWritten,
+            FieldEncoding::Standard,
+            1024,
+            128,
+            0,
+            SmemSwizzle::None,
+            32,
+        ),
+        // --- arm 2: the verbatim-copy control. ---
+        raw(
+            "copy/rowmajor-k-leading",
+            "control row 1's descriptor over a tile the probe's OWN repack loop copied element by \
+             element: if this disagrees with row 1 the repack loop is broken and every canonical \
+             arm below is uninterpretable",
+            SweepStaging::VerbatimCopy,
+            FieldEncoding::Standard,
+            16,
+            1024,
+            0,
+            SmemSwizzle::None,
+            32,
+        ),
+        // --- arm 3: the ISA's canonical no-swizzle core-matrix layout. THE HYPOTHESIS. ---
+        of(
+            "canon-kfast/lbo128-sbo1024",
+            "THE LEADING HYPOTHESIS: every 8x16 B core matrix packed into 128 CONTIGUOUS bytes, \
+             grid K-fastest; LBO = K-adjacent core matrix (128 B), SBO = MN-adjacent core-matrix \
+             row (BK/8 * 128 = 1024 B); the base advances two core matrices (256 B) per K step",
+            kf,
+        ),
+        of(
+            "canon-kfast/swapped",
+            "the axis-naming coin flip, asked over a layout a descriptor can actually describe",
+            SmemLayout::CanonicalNone {
+                k_fast: true,
+                swapped: true,
+            },
+        ),
+        of(
+            "canon-mnfast/lbo1024-sbo128",
+            "the MN-fastest canonical packing: core matrices along MN contiguous, so LBO \
+             (K-adjacent) = rows/8 * 128 and SBO (MN-adjacent) = 128; the base advances a whole \
+             column of core matrices per K step",
+            SmemLayout::CanonicalNone {
+                k_fast: false,
+                swapped: false,
+            },
+        ),
+        of(
+            "canon-mnfast/swapped",
+            "the coin flip over the MN-fastest packing",
+            SmemLayout::CanonicalNone {
+                k_fast: false,
+                swapped: true,
+            },
+        ),
+        raw(
+            "canon-kfast/raw-fields",
+            "the hypothesis with LBO/SBO written as RAW BYTES: rules out an encoding in which the \
+             `>> 4` applies to the start address alone",
+            SweepStaging::CanonicalKFast,
+            FieldEncoding::Raw,
+            128,
+            1024,
+            0,
+            SmemSwizzle::None,
+            256,
+        ),
+        raw(
+            "canon-kfast/double-encoded",
+            "the hypothesis with the `>> 4` applied TWICE (the mirror mistake); it degenerates to \
+             LBO 0 / SBO 4 and is here only so the encoding question is closed in both directions",
+            SweepStaging::CanonicalKFast,
+            FieldEncoding::Twice,
+            128,
+            1024,
+            0,
+            SmemSwizzle::None,
+            256,
+        ),
+        // --- arm 4: the 128-B swizzle. THE PRODUCTION CANDIDATE. ---
+        of(
+            "sw128/lbo16",
+            "THE PRODUCTION CANDIDATE: at BK=64 f16 the shared row is exactly the 128-B swizzle \
+             atom, and the ISA's canonical 128-B-swizzle K-major layout IS plain row-major (row \
+             stride 128, k-group stride 16, SBO = 8*128) composed with Swizzle<3,4,3> -- precisely \
+             what a SWIZZLE_128B TMA copy writes. No repack. LBO does not appear in that formula, \
+             so 16 spells the fixed k-group stride",
+            SmemLayout::Swizzle128 {
+                lbo_bytes: 16,
+                swapped: false,
+            },
+        ),
+        of(
+            "sw128/lbo128",
+            "the same arm with the second plausible spelling of the LBO the mode ignores (one core \
+             matrix)",
+            SmemLayout::Swizzle128 {
+                lbo_bytes: 128,
+                swapped: false,
+            },
+        ),
+        of(
+            "sw128/lbo1024",
+            "the same arm with LBO == SBO, the third spelling seen in the wild",
+            SmemLayout::Swizzle128 {
+                lbo_bytes: 1024,
+                swapped: false,
+            },
+        ),
+        of(
+            "sw128/swapped",
+            "the 128-B arm with the two fields exchanged (LBO = the 8-row atom, SBO = the k-group \
+             stride). CUTLASS's descriptor builder assigns the pair one way for the unswizzled \
+             canonical layout and the other way for the swizzled ones; the published derivation \
+             keeps SBO on the MN axis in both. One launch settles which",
+            SmemLayout::Swizzle128 {
+                lbo_bytes: 16,
+                swapped: true,
+            },
+        ),
+        raw(
+            "sw128/lbo16-bo1",
+            "base_offset 1: if the hardware anchors the swizzle pattern at the descriptor's START \
+             ADDRESS rather than at the enclosing 1024-B boundary, the 32-B-per-K-step base advance \
+             needs a phase and every bo=0 row of this arm fails at K=64 while passing at K=16",
+            SweepStaging::AsWritten,
+            FieldEncoding::Standard,
+            16,
+            1024,
+            1,
+            SmemSwizzle::B128,
+            32,
+        ),
+        raw(
+            "sw128/lbo16-bo2",
+            "the same phase probe at the value one whole 32-B K step would need",
+            SweepStaging::AsWritten,
+            FieldEncoding::Standard,
+            16,
+            1024,
+            2,
+            SmemSwizzle::B128,
+            32,
+        ),
+        raw(
+            "sw128/sbo128",
+            "SBO = one 128-B row rather than one 8-row atom, in case the swizzled mode counts rows \
+             where the unswizzled one counts row groups",
+            SweepStaging::AsWritten,
+            FieldEncoding::Standard,
+            16,
+            128,
+            0,
+            SmemSwizzle::B128,
+            32,
+        ),
+    ]
+}
+
+/// Everything a launcher needs for [`desc_sweep_probe_module`], as pure data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescSweepPlan {
+    pub entry: &'static str,
+    pub module_key: &'static str,
+    pub block: (u32, u32, u32),
+    pub dyn_smem_bytes: usize,
+    /// The `expect_tx` byte count the kernel declares: both `64 x 64` f16 tiles.
+    pub tx_bytes: usize,
+    /// Rows and columns of the square operand the host must upload (both operands are `64 x 64`,
+    /// zero-filled past the K under test, so one tensor-map geometry covers every K value).
+    pub operand: (usize, usize),
+}
+
+/// The sweep probe's launch plan. Pure data, so a launcher never re-derives a geometry.
+pub const fn desc_sweep_plan() -> DescSweepPlan {
+    DescSweepPlan {
+        entry: DESC_SWEEP_ENTRY,
+        module_key: DESC_SWEEP_KEY,
+        block: (DESC_SWEEP_THREADS, 1, 1),
+        dyn_smem_bytes: DESC_SWEEP_SMEM,
+        tx_bytes: desc_sweep_tx_bytes(),
+        operand: (DESC_SWEEP_M, DESC_SWEEP_BK),
+    }
+}
+
+/// **`WGMMA_DEVICE_VALIDATION` item 1, as ONE module: the descriptor sweep probe.**
+///
+/// A `64 x 64 x 64` `A * Bt` in the smallest shape that can issue a `wgmma` at all -- one warpgroup,
+/// one CTA, one stage, no warp specialisation, no `setmaxnreg`, no pipeline. Everything a candidate
+/// varies is a **run-time parameter**:
+///
+/// * `pDescA` / `pDescB` -- the 64-bit descriptor templates, host-computed. The kernel ORs in
+///   `((addr >> 4) & 0x3FFF)` exactly as the mainloop does.
+/// * `pAOff` / `pBOff` -- where in the window each descriptor's matrix starts, so a repacked arm and
+///   an as-written arm are the same module.
+/// * `pKStep` -- how far the descriptor base advances per `wgmma` K step.
+/// * `pStage` -- [`SweepStaging`]: 0 leaves the tile as TMA wrote it, 1 and 2 repack it into the
+///   canonical core-matrix layouts, 3 copies it verbatim as a control on the repack loop itself.
+/// * `pK` -- 16 issues one `wgmma` (no base advance at all), 64 issues four.
+///
+/// So the whole sweep is **one `cuModuleLoadData` and a host loop**. No per-candidate PTX, no
+/// rebuild, no second rental to try the next value -- which is the entire reason this file grew a
+/// second probe rather than a second variant table.
+///
+/// The staging path is the one stage B of the 2026-08-10 round proved byte-exact: the same
+/// `cuTensorMapEncodeTiled` geometry, the same `cp.async.bulk.tensor.2d`, the same mbarrier.
+///
+/// `fence.proxy.async.shared::cta` after the repack is **not decoration**: `wgmma` reads shared
+/// memory through the async proxy, the repack writes it with ordinary `st.shared`, and without the
+/// fence the generic-proxy writes are not guaranteed visible. TMA's own writes are already
+/// async-proxy and are published by the barrier, so the production mainloop needs no such fence --
+/// only this probe does, because only this probe writes SMEM by hand.
+pub fn desc_sweep_probe_module(license: &Sm90aLicense) -> Result<String, String> {
+    let name = DESC_SWEEP_ENTRY;
+    let nacc = DESC_SWEEP_N / 2;
+    let accs = (0..nacc)
+        .map(|i| format!("%acc{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let elems = DESC_SWEEP_TILE / 2;
+    let tx = desc_sweep_tx_bytes();
+
+    let mut s = String::from(sm90a_header(license));
+    s += WGMMA_DSMEM_DECL;
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pK,\n    .param .u64 pC,\n\
+         \x20   .param .u64 pDescA,\n    .param .u64 pDescB,\n    .param .u32 pAOff,\n\
+         \x20   .param .u32 pBOff,\n    .param .u32 pKStep,\n    .param .u32 pStage,\n\
+         \x20   {},\n    {}\n)\n.maxntid {DESC_SWEEP_THREADS}, 1, 1\n{{\n",
+        ptx_param_decl("tmapA"),
+        ptx_param_decl("tmapB")
+    );
+    s += "    .reg .pred %p0,%p1,%p2,%pfirst,%pst;\n";
+    s += "    .reg .b16 %h;\n";
+    s += "    .reg .b32 %K,%N,%lin,%lane,%wrp,%kt,%ksteps,%aoff,%boff,%kstep,%stg,%ph,%zero,\
+          %tmp,%tmp2,%i,%rw,%cl,%ri,%rr,%ci,%cc,%d1,%d2,%dst,%row0,%row1,%colb;\n";
+    s += "    .reg .b64 %rdC,%rdS,%rdT,%rdA,%rdB,%rdBar,%rdTmA,%rdTmB,%rdAddr,\
+          %descA,%descB,%tmplA,%tmplB,%rdSt;\n";
+    s += &format!("    .reg .f32 %acc<{nacc}>;\n\n");
+
+    // --- parameters ---------------------------------------------------------------------------
+    s += "    ld.param.u32 %K,[pK];\n";
+    s += "    ld.param.u64 %rdC,[pC];\n    cvta.to.global.u64 %rdC,%rdC;\n";
+    s += "    ld.param.u64 %tmplA,[pDescA];\n    ld.param.u64 %tmplB,[pDescB];\n";
+    s += "    ld.param.u32 %aoff,[pAOff];\n    ld.param.u32 %boff,[pBOff];\n";
+    s += "    ld.param.u32 %kstep,[pKStep];\n    ld.param.u32 %stg,[pStage];\n";
+    s += &ptx_param_address("%rdTmA", "tmapA");
+    s += &ptx_param_address("%rdTmB", "tmapB");
+    s += &format!("    mov.u64 %rdS,{WGMMA_DSMEM_SYM};\n");
+    s += "    mov.u32 %lin,%tid.x;\n    mov.u32 %lane,%laneid;\n";
+    // Both operand forms the 2026-08-10 ptxas census assembled: an immediate expect_tx and a
+    // register parity. Set before any branch, so a thread that skips the init does not read an
+    // undefined register.
+    s += "    mov.u32 %ph,0;\n    mov.u32 %zero,0;\n";
+    s += "    shr.u32 %ksteps,%K,4;\n";
+
+    // --- one barrier, two copies -----------------------------------------------------------------
+    s += &format!("    add.s64 %rdBar,%rdS,{DESC_SWEEP_BAR};\n");
+    s += "    setp.eq.u32 %p0,%lin,0;\n";
+    s += &format!("    @!%p0 bra SWP_INITED_{name};\n");
+    s += "    mbarrier.init.shared::cta.b64 [%rdBar],1;\n";
+    s += &format!("SWP_INITED_{name}:\n    bar.sync 0;\n");
+    s += &format!("    @!%p0 bra SWP_WAIT_{name};\n");
+    s += &format!("    mbarrier.arrive.expect_tx.shared::cta.b64 %rdSt,[%rdBar],{tx};\n");
+    s += &format!("    add.s64 %rdA,%rdS,{DESC_SWEEP_A_RAW};\n");
+    s += "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes \
+          [%rdA],[%rdTmA,{%zero,%zero}],[%rdBar];\n";
+    s += &format!("    add.s64 %rdB,%rdS,{DESC_SWEEP_B_RAW};\n");
+    s += "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes \
+          [%rdB],[%rdTmB,{%zero,%zero}],[%rdBar];\n";
+    s += &format!("SWP_WAIT_{name}:\n");
+    s += "    mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%ph;\n";
+    s += &format!("    @!%p1 bra SWP_WAIT_{name};\n");
+
+    // --- the probe-only repack --------------------------------------------------------------------
+    s += "    setp.eq.u32 %pst,%stg,0;\n";
+    s += &format!("    @%pst bra SWP_STAGED_{name};\n");
+    for (tag, src, dst) in [
+        ("A", DESC_SWEEP_A_RAW, DESC_SWEEP_A_ALT),
+        ("B", DESC_SWEEP_B_RAW, DESC_SWEEP_B_ALT),
+    ] {
+        s += "    mov.u32 %i,%lin;\n";
+        s += &format!("SWP_RP{tag}_{name}:\n");
+        s += &format!("    setp.ge.u32 %p0,%i,{elems};\n    @%p0 bra SWP_RPD{tag}_{name};\n");
+        // (rw, cl) = (i / 64, i % 64); the core-matrix grid indices and the position inside one.
+        s += "    shr.u32 %rw,%i,6;\n    and.b32 %cl,%i,63;\n";
+        s += "    shr.u32 %ri,%rw,3;\n    and.b32 %rr,%rw,7;\n";
+        s += "    shr.u32 %ci,%cl,3;\n    and.b32 %cc,%cl,7;\n";
+        s += "    shl.b32 %tmp,%rr,3;\n    add.u32 %tmp,%tmp,%cc;\n";
+        // K-fastest: (ri * ncm_k + ci) * 64 + within;  ncm_k = 64/8 = 8, so ri*512 + ci*64.
+        s += "    shl.b32 %d1,%ri,9;\n    shl.b32 %tmp2,%ci,6;\n    add.u32 %d1,%d1,%tmp2;\n\
+              \x20   add.u32 %d1,%d1,%tmp;\n";
+        // MN-fastest: (ci * ncm_m + ri) * 64 + within.
+        s += "    shl.b32 %d2,%ci,9;\n    shl.b32 %tmp2,%ri,6;\n    add.u32 %d2,%d2,%tmp2;\n\
+              \x20   add.u32 %d2,%d2,%tmp;\n";
+        // Mode 3 (and any other) copies verbatim, which is what makes it a control on this loop.
+        s += "    setp.eq.u32 %p1,%stg,1;\n    selp.b32 %dst,%d1,%i,%p1;\n";
+        s += "    setp.eq.u32 %p1,%stg,2;\n    selp.b32 %dst,%d2,%dst,%p1;\n";
+        s += &format!(
+            "    mul.wide.u32 %rdT,%i,2;\n    add.s64 %rdAddr,%rdS,%rdT;\n\
+             \x20   add.s64 %rdAddr,%rdAddr,{src};\n    ld.shared.b16 %h,[%rdAddr];\n"
+        );
+        s += &format!(
+            "    mul.wide.u32 %rdT,%dst,2;\n    add.s64 %rdAddr,%rdS,%rdT;\n\
+             \x20   add.s64 %rdAddr,%rdAddr,{dst};\n    st.shared.b16 [%rdAddr],%h;\n"
+        );
+        s += &format!("    add.u32 %i,%i,{DESC_SWEEP_THREADS};\n    bra SWP_RP{tag}_{name};\n");
+        s += &format!("SWP_RPD{tag}_{name}:\n");
+    }
+    s += &format!("SWP_STAGED_{name}:\n    bar.sync 0;\n");
+    // Generic-proxy stores must be published to the async proxy before wgmma reads them.
+    s += "    fence.proxy.async.shared::cta;\n";
+
+    // --- the mainloop -------------------------------------------------------------------------
+    s += "    cvt.u64.u32 %rdA,%aoff;\n    add.s64 %rdA,%rdS,%rdA;\n";
+    s += "    cvt.u64.u32 %rdB,%boff;\n    add.s64 %rdB,%rdS,%rdB;\n";
+    s += "    setp.eq.u32 %p2,%ksteps,0;\n";
+    s += &format!("    @%p2 bra SWP_EXIT_{name};\n");
+    s += "    mov.u32 %kt,0;\n";
+    s += "    wgmma.fence.sync.aligned;\n";
+    s += &format!("SWP_K_{name}:\n");
+    s += &format!("    setp.ge.u32 %p0,%kt,%ksteps;\n    @%p0 bra SWP_KEND_{name};\n");
+    s += "    mul.lo.s32 %tmp,%kt,%kstep;\n    cvt.u64.u32 %rdT,%tmp;\n";
+    s += "    add.s64 %rdAddr,%rdA,%rdT;\n";
+    s += "    shr.u64 %rdT,%rdAddr,4;\n    and.b64 %rdT,%rdT,16383;\n    or.b64 %descA,%rdT,%tmplA;\n";
+    s += "    mul.lo.s32 %tmp,%kt,%kstep;\n    cvt.u64.u32 %rdT,%tmp;\n";
+    s += "    add.s64 %rdAddr,%rdB,%rdT;\n";
+    s += "    shr.u64 %rdT,%rdAddr,4;\n    and.b64 %rdT,%rdT,16383;\n    or.b64 %descB,%rdT,%tmplB;\n";
+    // scale-d = 0 on the first step only: the ISA's own way to skip zeroing the accumulators.
+    s += "    setp.ne.u32 %pfirst,%kt,0;\n";
+    s += &format!(
+        "    wgmma.mma_async.sync.aligned.m64n{DESC_SWEEP_N}k16.f32.f16.f16 \
+         {{{accs}}}, %descA, %descB, %pfirst, 1, 1, 0, 0;\n"
+    );
+    s += "    add.u32 %kt,%kt,1;\n";
+    s += &format!("    bra SWP_K_{name};\n");
+    s += &format!("SWP_KEND_{name}:\n");
+    s += "    wgmma.commit_group.sync.aligned;\n    wgmma.wait_group.sync.aligned 0;\n";
+
+    // --- epilogue -------------------------------------------------------------------------------
+    // The m64nNk16 D fragment, identical to the mainloop's: warp `w` holds rows `16w + lane/4` and
+    // `16w + lane/4 + 8`; register group `j` covers columns `8j + 2*(lane%4)` and one past it.
+    s += "    shr.u32 %wrp,%lin,5;\n    shl.b32 %wrp,%wrp,4;\n";
+    s += "    shr.u32 %tmp2,%lane,2;\n    add.u32 %row0,%wrp,%tmp2;\n    add.u32 %row1,%row0,8;\n";
+    s += "    and.b32 %colb,%lane,3;\n    shl.b32 %colb,%colb,1;\n";
+    // N in a REGISTER, not an immediate operand of `mad`: the register form is the one the
+    // 2026-08-10 ptxas census already assembled in the mainloop's epilogue, and a probe that takes
+    // an operand class on faith can fail stage A and cost the visit.
+    s += &format!("    mov.u32 %N,{DESC_SWEEP_N};\n");
+    s += "    mad.lo.s32 %tmp,%row0,%N,%colb;\n    mul.wide.u32 %rdT,%tmp,4;\n\
+          \x20   add.s64 %rdA,%rdC,%rdT;\n";
+    s += "    mad.lo.s32 %tmp,%row1,%N,%colb;\n    mul.wide.u32 %rdT,%tmp,4;\n\
+          \x20   add.s64 %rdB,%rdC,%rdT;\n";
+    // No store predicate: the probe's output is exactly the 64x64 the tile covers, so every
+    // accumulator has a lane. (The mainloop's `row < M && col < N` guard exists for ragged shapes,
+    // which stage F asks about and this probe deliberately does not.)
+    for j in 0..DESC_SWEEP_N / 8 {
+        let byte = j * 32;
+        s += &format!("    st.global.f32 [%rdA+{byte}],%acc{};\n", 4 * j);
+        s += &format!("    st.global.f32 [%rdA+{}],%acc{};\n", byte + 4, 4 * j + 1);
+        s += &format!("    st.global.f32 [%rdB+{byte}],%acc{};\n", 4 * j + 2);
+        s += &format!("    st.global.f32 [%rdB+{}],%acc{};\n", byte + 4, 4 * j + 3);
+    }
+    s += &format!("SWP_EXIT_{name}:\n    ret;\n}}\n");
+    Ok(s)
+}
+
 // --- bring-up: the operator's invocation ----------------------------------------------------------
 
 /// **The exact command the first Hopper round runs.** Kept as data so the decline gate on a
@@ -1290,7 +2156,10 @@ pub fn tma_stage_probe_module(license: &Sm90aLicense) -> Result<String, String> 
 /// `--test-threads=1` is not optional: the bring-up gate is a *sequence* whose whole value is that a
 /// failure names which checklist item failed, and libtest interleaves output from concurrent tests.
 /// `--nocapture` is not optional either — libtest swallows a passing test's stderr, and every verdict
-/// this round produces is printed, not asserted.
+/// this round produces is printed, not asserted. **Since 2026-08-10 that is doubly true**: stage D is
+/// a sweep whose product is a TABLE ([`desc_sweep_candidates`] x [`DESC_SWEEP_KS`]) plus per-candidate
+/// 8x8 core-matrix lane maps. A run without `--nocapture` that happens to pass throws away everything
+/// the rented minutes were spent producing, and a run that fails prints only the panic.
 pub const WGMMA_BRINGUP_INVOCATION: &str =
     "WUKONG_GPU_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu \
      -- --nocapture --test-threads=1 wgmma_hopper_bringup";
@@ -1302,20 +2171,24 @@ pub const WGMMA_BRINGUP_INVOCATION: &str =
 /// this environment, so everything below is unproven text until it runs. Work down the list; each
 /// item's failure mode is stated because several of them are silent.
 pub const WGMMA_DEVICE_VALIDATION: &[&str] = &[
-    "1. DescOrder, settled in ONE visit. `wgmma_hopper_bringup` stage D launches BOTH readings -- \
-     W1 (KLeading) and WGMMA_W1_MN (MnLeading), separate entries under separate module keys -- at \
-     M=N=K=64 against an f64 reference over `bringup_operands`, whose three-digit positional ramps \
-     make a core-matrix permutation visible in A and in B. Exactly one must match, bit-exactly \
-     (the operands are exact in f16 and the dot product stays under 2^24, so the verdict is `==`, \
-     not a tolerance). Two matching means the probe cannot tell the readings apart; zero matching \
-     means the fault is elsewhere and the round says so. Nothing downstream means anything until \
-     this is settled, and the wrong choice is silently wrong data, not a JIT error: it is the one \
-     place the ISA's naming of the descriptor's two offset fields was read from a figure rather \
-     than confirmed.",
+    "1. The descriptor reading, settled in ONE visit by a SWEEP. The 2026-08-10 round already spent \
+     the two-arm A/B and both arms lost (64/4096 and 0/4096), because the ambiguity was never the \
+     axis naming: an SS operand is a grid of core matrices packed at 128 contiguous bytes, so the \
+     within-core-matrix row stride is a fixed 16 and a plain row-major tile is unrepresentable. \
+     `wgmma_hopper_bringup` stage D therefore loads ONE module -- `desc_sweep_probe_module`, whose \
+     descriptor template, matrix offsets, K-step advance and SMEM staging mode are all run-time \
+     PARAMETERS -- and a host loop runs every row of `desc_sweep_candidates` at K=16 and K=64 \
+     against an f64 reference over `bringup_operands`, whose three-digit positional ramps make a \
+     core-matrix permutation visible in A and in B. Exactly one ARM (one shared-memory image) must \
+     come out exact, bit-exactly: the operands are exact in f16 and the dot product stays under \
+     2^24, so the verdict is `==`, not a tolerance. Two arms means the probe settles nothing; zero \
+     means the round prints the per-core-matrix lane map and names the next diagnosis. The two \
+     already-scored readings are in the set as CONTROLS -- the sweep reproducing 64/4096 is how it \
+     validates itself.",
     "2. The module loads at all -- cuModuleLoadData on the generated text (`wgmma_hopper_bringup` \
-     stage A, which loads every shipped row AND both A/B arms AND the TMA probe before launching \
-     anything). First check of the `.target sm_90a` header, of `.version 8.0`, and of every \
-     instruction spelling in the family.",
+     stage A, which loads every shipped row AND the TMA probe AND the descriptor sweep probe before \
+     launching anything). First check of the `.target sm_90a` header, of `.version 8.0`, and of \
+     every instruction spelling in the family.",
     "3. setmaxnreg and the register split -- cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS) plus a \
      spill check (ptxas -v via WUKONG_PTXAS, or the JIT log). If ptxas cannot fit a consumer's 128 \
      accumulators plus addressing inside 232 registers, consumer_regs must rise and producer_regs \
@@ -1373,10 +2246,17 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     let bk_shift = bk.trailing_zeros();
 
     // The two descriptor constants: everything but the start address, which the kernel folds in at
-    // run time. A and B share a constructor because both operands of an NT product are K-major with
-    // the same row pitch.
-    let const_a = SmemDesc::k_major(0, row_bytes, cfg.desc_order, cfg.swizzle).const_part()?;
-    let const_b = const_a;
+    // run time. Both come from `desc_fields`, the single authority the sweep candidates read too,
+    // and they are computed separately because one layout (`CanonicalNone` MN-fastest) makes the
+    // fields depend on how many rows a descriptor covers -- 64 for A's per-consumer slab, `bn` for B.
+    let a_fields = desc_fields(cfg.layout, row_bytes, WgmmaShape::M as u64);
+    let b_fields = desc_fields(cfg.layout, row_bytes, bn as u64);
+    let const_a =
+        SmemDesc::for_layout(0, cfg.layout, row_bytes, WgmmaShape::M as u64).const_part()?;
+    let const_b = SmemDesc::for_layout(0, cfg.layout, row_bytes, bn as u64).const_part()?;
+    // How far each descriptor's start address moves per wgmma K step. Also from the authority: a
+    // layout whose K direction is not contiguous advances by whole core matrices, not by 32 bytes.
+    let (a_step, b_step) = (a_fields.k_step_bytes, b_fields.k_step_bytes);
 
     let accs = (0..nacc)
         .map(|i| format!("%acc{i}"))
@@ -1521,8 +2401,11 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     // `wgmma.fence` orders the accumulator registers against the async proxy before the group.
     s += "    wgmma.fence.sync.aligned;\n";
     for j in 0..cfg.wgmma_per_stage() {
-        let koff = j * WgmmaShape::K * cfg.dtype.size();
-        for (reg, base, cst) in [("%descA", "%rdA", const_a), ("%descB", "%rdB", const_b)] {
+        for (reg, base, cst, step) in [
+            ("%descA", "%rdA", const_a, a_step),
+            ("%descB", "%rdB", const_b, b_step),
+        ] {
+            let koff = j as u64 * step;
             s += &format!("    add.s64 %rdAddr,{base},{koff};\n");
             s += "    shr.u64 %rdT,%rdAddr,4;\n    and.b64 %rdT,%rdT,16383;\n";
             s += &format!("    or.b64 {reg},%rdT,{cst:#x};\n");
@@ -1599,10 +2482,10 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
 /// (`EXPECTED_MODULES`). `the_family_declares_no_floor_it_does_not_need` below applies the identical
 /// rule over the identical corpus.
 ///
-/// **The bring-up modules are in it too**, deliberately: the `MnLeading` A/B arm and the TMA stage
-/// probe are text this backend will hand to `cuModuleLoadData` on rented silicon, so the ASCII rule,
-/// the `sm_90a` floor and the `.version` law must reach them exactly as they reach a shipped row. A
-/// module that only bring-up loads is still a module that can be one stray `->` away from a
+/// **The two bring-up probes are in it too**, deliberately: the TMA stage probe and the descriptor
+/// sweep probe are text this backend will hand to `cuModuleLoadData` on rented silicon, so the ASCII
+/// rule, the `sm_90a` floor and the `.version` law must reach them exactly as they reach a shipped
+/// row. A module that only bring-up loads is still a module that can be one stray `->` away from a
 /// `ptxas fatal` at the worst possible moment.
 pub fn wgmma_device_free_modules() -> Vec<(String, String)> {
     let license = Sm90aLicense::for_probed_cc((9, 0)).expect("(9,0) is Hopper");
@@ -1614,14 +2497,13 @@ pub fn wgmma_device_free_modules() -> Vec<(String, String)> {
             (format!("wgmma::{}", c.name), ptx)
         })
         .collect();
-    for c in WGMMA_BRINGUP_VARIANTS {
-        let ptx = wgmma_module(c, &license)
-            .unwrap_or_else(|e| panic!("bring-up variant {} must generate: {e}", c.name));
-        v.push((format!("wgmma::bringup/{}", c.name), ptx));
-    }
     v.push((
         format!("wgmma::bringup/{TMA_PROBE_ENTRY}"),
         tma_stage_probe_module(&license).expect("the TMA stage probe must generate"),
+    ));
+    v.push((
+        format!("wgmma::bringup/{DESC_SWEEP_ENTRY}"),
+        desc_sweep_probe_module(&license).expect("the descriptor sweep probe must generate"),
     ));
     v
 }
@@ -1721,6 +2603,7 @@ mod tests {
         assert_eq!(
             emitters,
             vec![
+                "desc_sweep_probe_module".to_string(),
                 "tma_stage_probe_module".to_string(),
                 "wgmma_module".to_string()
             ],
@@ -1943,23 +2826,89 @@ mod tests {
         }
     }
 
-    /// The K-major constructor's two distances, and the one thing about them that is not yet known.
+    /// **[`desc_fields`] is the authority, and here is every reading it spells**, at the geometry
+    /// every shipped row uses (BK = 64 f16, so a 128-byte shared row, and 64 rows per descriptor).
     #[test]
-    fn k_major_derives_the_core_matrix_distances() {
-        // BK=64 f16 -> 128-byte rows. A core matrix is 8 rows x 16 bytes, so k-adjacent core matrices
-        // are 16 B apart and row-group-adjacent ones are 8 * 128 = 1024 B apart.
-        let k = SmemDesc::k_major(0, 128, DescOrder::KLeading, SmemSwizzle::None);
-        assert_eq!((k.lbo, k.sbo), (16, 1024));
-        let m = SmemDesc::k_major(0, 128, DescOrder::MnLeading, SmemSwizzle::None);
-        assert_eq!((m.lbo, m.sbo), (1024, 16));
-        assert_ne!(
-            k.pack().unwrap(),
-            m.pack().unwrap(),
-            "the two readings are distinguishable, which is why the H100 A/B is one token"
+    fn desc_fields_spells_every_reading_from_one_table() {
+        let (rb, rows) = (128u64, 64u64);
+        // The two readings the H100 already scored: k-adjacent 16 B, row-group-adjacent 8*128.
+        let k = desc_fields(SmemLayout::RowMajorNone { k_leading: true }, rb, rows);
+        assert_eq!((k.lbo, k.sbo, k.k_step_bytes), (16, 1024, 32));
+        let m = desc_fields(SmemLayout::RowMajorNone { k_leading: false }, rb, rows);
+        assert_eq!((m.lbo, m.sbo, m.k_step_bytes), (1024, 16, 32));
+        // The canonical no-swizzle packings. A core matrix is 128 B; K-fastest puts k-adjacent ones
+        // 128 B apart and a whole row of them (BK/8 = 8) between MN-adjacent ones.
+        let kf = desc_fields(
+            SmemLayout::CanonicalNone {
+                k_fast: true,
+                swapped: false,
+            },
+            rb,
+            rows,
         );
-        // The shipped constant, hand-computed: lbo 16 -> 1 at bit 16; sbo 1024 -> 64 at bit 32.
-        assert_eq!(k.const_part().unwrap(), (1u64 << 16) | (64u64 << 32));
-        assert_eq!(k.const_part().unwrap(), 0x40_0001_0000);
+        assert_eq!((kf.lbo, kf.sbo, kf.k_step_bytes), (128, 1024, 256));
+        let kfs = desc_fields(
+            SmemLayout::CanonicalNone {
+                k_fast: true,
+                swapped: true,
+            },
+            rb,
+            rows,
+        );
+        assert_eq!((kfs.lbo, kfs.sbo), (1024, 128));
+        let mf = desc_fields(
+            SmemLayout::CanonicalNone {
+                k_fast: false,
+                swapped: false,
+            },
+            rb,
+            rows,
+        );
+        assert_eq!((mf.lbo, mf.sbo, mf.k_step_bytes), (1024, 128, 2048));
+        // The shipped 128-B-swizzle reading: SBO = one 8-row atom, and the mode's own bits.
+        let sw = desc_fields(SHIPPED_LAYOUT, rb, rows);
+        assert_eq!((sw.lbo, sw.sbo, sw.k_step_bytes), (16, 1024, 32));
+        assert_eq!(sw.swizzle, SmemSwizzle::B128);
+        let swx = desc_fields(
+            SmemLayout::Swizzle128 {
+                lbo_bytes: 16,
+                swapped: true,
+            },
+            rb,
+            rows,
+        );
+        assert_eq!((swx.lbo, swx.sbo), (1024, 16), "the axis-naming flip");
+        assert_eq!(SHIPPED_LAYOUT.tma_swizzle(), TmaSwizzle::B128);
+        assert!(SHIPPED_LAYOUT.tma_writable());
+        assert!(!SmemLayout::CanonicalNone {
+            k_fast: true,
+            swapped: false
+        }
+        .tma_writable());
+        // Every reading packs, and the descriptor's swizzle bits are the reversed encoding of the
+        // TMA mode -- one choice, two tables, never cast between them.
+        for l in [
+            SmemLayout::RowMajorNone { k_leading: true },
+            SmemLayout::CanonicalNone {
+                k_fast: true,
+                swapped: false,
+            },
+            SHIPPED_LAYOUT,
+        ] {
+            let d = SmemDesc::for_layout(0, l, rb, rows);
+            d.const_part()
+                .unwrap_or_else(|e| panic!("{}: {e}", l.label()));
+            assert_eq!(d.swizzle, SmemSwizzle::from_tma(l.tma_swizzle()));
+            assert!(l.label().is_ascii());
+        }
+        // Hand-computed: the shipped template is lbo 16 -> 1 at bit 16, sbo 1024 -> 64 at bit 32,
+        // and the 128-B swizzle's own `1` at bit 62.
+        assert_eq!(
+            SmemDesc::for_layout(0, SHIPPED_LAYOUT, rb, rows)
+                .const_part()
+                .unwrap(),
+            (1u64 << 16) | (64u64 << 32) | (1u64 << 62)
+        );
     }
 
     /// The kernel folds the runtime stage address into the descriptor with
@@ -1967,20 +2916,53 @@ mod tests {
     /// the same address -- for every address a 227 KiB shared window can hold.
     #[test]
     fn the_runtime_address_fold_matches_the_host_encoder() {
-        let cst = SmemDesc::k_major(0, 128, DescOrder::KLeading, SmemSwizzle::None)
+        let layout = SmemLayout::RowMajorNone { k_leading: true };
+        let cst = SmemDesc::for_layout(0, layout, 128, 64)
             .const_part()
             .unwrap();
         let mut addr = 0u64;
         while addr < HOPPER_SMEM_PER_CTA as u64 {
-            let host = SmemDesc::k_major(addr, 128, DescOrder::KLeading, SmemSwizzle::None)
-                .pack()
-                .unwrap();
+            let host = SmemDesc::for_layout(addr, layout, 128, 64).pack().unwrap();
             let device = ((addr >> 4) & 0x3FFF) | cst;
             assert_eq!(host, device, "address {addr:#x}");
             addr += 16;
         }
         // And the 18-bit mask never fires below 256 KiB, which is why the device fold can skip it.
         const _: () = assert!(HOPPER_SMEM_PER_CTA < (1 << 18));
+    }
+
+    /// **The three field encodings, and why two of them are candidates rather than code paths.**
+    #[test]
+    fn the_field_encodings_are_three_distinguishable_templates() {
+        let d = SmemDesc {
+            start_addr: 0,
+            lbo: 128,
+            sbo: 1024,
+            base_offset: 0,
+            swizzle: SmemSwizzle::None,
+        };
+        assert_eq!(
+            d.const_part_as(FieldEncoding::Standard).unwrap(),
+            (8u64 << 16) | (64u64 << 32)
+        );
+        assert_eq!(
+            d.const_part_as(FieldEncoding::Raw).unwrap(),
+            (128u64 << 16) | (1024u64 << 32)
+        );
+        // Twice: 128 >> 8 == 0, 1024 >> 8 == 4. Degenerate, and deliberately in the set anyway.
+        assert_eq!(d.const_part_as(FieldEncoding::Twice).unwrap(), 4u64 << 32);
+        assert_eq!(
+            d.const_part_as(FieldEncoding::Standard).unwrap(),
+            d.const_part().unwrap()
+        );
+        // Raw is where a wide offset stops fitting the 14-bit field, and it says so rather than
+        // silently truncating into the neighbouring one.
+        let wide = SmemDesc { sbo: 1 << 17, ..d };
+        assert!(wide
+            .const_part_as(FieldEncoding::Raw)
+            .unwrap_err()
+            .contains("14-bit field"));
+        wide.const_part_as(FieldEncoding::Standard).unwrap();
     }
 
     // --- shape menu, warpgroups, budgets ----------------------------------------------------------
@@ -2067,7 +3049,7 @@ mod tests {
     #[test]
     fn every_stage_base_is_aligned_for_its_descriptor() {
         for c in WGMMA_VARIANTS {
-            let align = c.swizzle.required_alignment() as usize;
+            let align = c.swizzle().required_alignment() as usize;
             for s in 0..c.stages {
                 assert_eq!(c.a_off(s) % align, 0, "{} A stage {s}", c.name);
                 assert_eq!(c.b_off(s) % align, 0, "{} B stage {s}", c.name);
@@ -2179,8 +3161,8 @@ mod tests {
         let mods = wgmma_device_free_modules();
         assert_eq!(
             mods.len(),
-            WGMMA_VARIANTS.len() + WGMMA_BRINGUP_VARIANTS.len() + 1,
-            "W1 f16, W1 bf16, W3c, the MnLeading A/B arm, and the TMA stage probe"
+            WGMMA_VARIANTS.len() + 2,
+            "W1 f16, W1 bf16, W3c, the TMA stage probe, and the descriptor sweep probe"
         );
         assert_eq!(mods.len(), 5);
         for (what, ptx) in &mods {
@@ -2438,12 +3420,20 @@ mod tests {
                 "cluster multicast",
             ),
             (
-                "swizzled SMEM",
+                "a layout no tiled TMA copy writes",
                 WgmmaCfg {
-                    swizzle: SmemSwizzle::B128,
+                    layout: SmemLayout::CanonicalNone {
+                        k_fast: true,
+                        swapped: false,
+                    },
                     ..WGMMA_W1
                 },
-                "swizzle is not implemented",
+                "128 contiguous bytes",
+            ),
+            (
+                "the 128-B swizzle at a row that is not 128 B",
+                WgmmaCfg { bk: 32, ..WGMMA_W1 },
+                "swizzle atom is 128 bytes",
             ),
             (
                 "N off the menu",
@@ -2612,7 +3602,19 @@ mod tests {
     #[test]
     fn the_device_validation_list_is_intact() {
         assert_eq!(WGMMA_DEVICE_VALIDATION.len(), 8);
-        assert!(WGMMA_DEVICE_VALIDATION[0].contains("DescOrder"));
+        // Item 1 is the head item and must name the mechanism that discharges it -- the sweep, and
+        // the two controls that make the sweep self-validating.
+        for need in [
+            "desc_sweep_candidates",
+            "desc_sweep_probe_module",
+            "CONTROL",
+        ] {
+            assert!(
+                WGMMA_DEVICE_VALIDATION[0].contains(need),
+                "item 1 must name {need:?}: {}",
+                WGMMA_DEVICE_VALIDATION[0]
+            );
+        }
         for item in WGMMA_DEVICE_VALIDATION {
             assert!(item.is_ascii(), "{item}");
             assert!(item.len() > 40);
@@ -2668,92 +3670,177 @@ mod tests {
         c
     }
 
-    /// **The probe must be able to tell the two readings apart.** This is the device-free half of
-    /// `WGMMA_DEVICE_VALIDATION` item 1: if the two `DescOrder`s addressed the same elements, or if
-    /// the ramps were symmetric enough that the permutation cancelled, the H100 round would report
-    /// "both matched" and settle nothing while looking perfect.
+    /// **THE 2026-08-10 DEFECT, RE-DERIVED WITH NO HOPPER PART IN THE ROOM.**
     ///
-    /// Three clauses, increasingly concrete: the packed descriptors differ; the two readings fetch
-    /// core matrix `(i, j)` from different addresses whenever `i != j`; and applying the resulting
-    /// permutation to the actual bring-up operands changes almost every lane of the product.
+    /// The H100 log (`bench/gpu/h100/2026-08-10-h100-s2a-bringup.log`) reports two numbers for the
+    /// two readings this family shipped, at M=N=K=64: **64 of 4096 output lanes exact** for
+    /// `k_leading: true` and **0 of 4096** for `k_leading: false`. Those two integers are the whole
+    /// evidence, and a model that cannot reproduce them has no business choosing the next candidate.
+    ///
+    /// [`unswizzled_read`] is that model. Three clauses:
+    ///
+    /// 1. **No (LBO, SBO) pair describes a row-major tile** whose rows are wider than one core
+    ///    matrix. The hardware's within-core-matrix row stride is the fixed 16 bytes; the tile's is
+    ///    `row_bytes`. Nothing in the descriptor can close that gap, so this is a LAYOUT defect and
+    ///    every "try the other field order" is a wasted launch.
+    /// 2. The exact-lane count the model predicts for `k_leading: true` is **64**, and for
+    ///    `k_leading: false` is **0** -- the log, to the lane.
+    /// 3. The two readings still address different elements, so the 2026-08-10 A/B was a real A/B.
+    ///    It simply asked a question whose answer was "neither".
     #[test]
-    fn the_two_desc_orders_address_different_elements() {
-        // BK = 64 f16 -> 128-byte rows, the geometry every shipped row uses.
-        let row_bytes = 128u64;
-        let k = SmemDesc::k_major(0, row_bytes, DescOrder::KLeading, SmemSwizzle::None);
-        let m = SmemDesc::k_major(0, row_bytes, DescOrder::MnLeading, SmemSwizzle::None);
-        assert_ne!(k.pack().unwrap(), m.pack().unwrap());
-        assert_ne!(k.const_part().unwrap(), m.const_part().unwrap());
-        assert_eq!(DescOrder::KLeading.flipped(), DescOrder::MnLeading);
-        assert_eq!(DescOrder::MnLeading.flipped(), DescOrder::KLeading);
-        assert_eq!(DescOrder::BOTH, [DescOrder::KLeading, DescOrder::MnLeading]);
+    fn the_row_major_reading_is_unrepresentable_and_predicts_the_log() {
+        let (m64, n64, k64) = (64usize, 64usize, 64usize);
+        let row_bytes = (2 * k64) as u64; // 128 B, the geometry every shipped row uses
+        let rows = 64u64;
+        let kl = desc_fields(
+            SmemLayout::RowMajorNone { k_leading: true },
+            row_bytes,
+            rows,
+        );
+        let ml = desc_fields(
+            SmemLayout::RowMajorNone { k_leading: false },
+            row_bytes,
+            rows,
+        );
+        assert_ne!((kl.lbo, kl.sbo), (ml.lbo, ml.sbo));
+        assert_ne!(
+            SmemDesc::for_layout(
+                0,
+                SmemLayout::RowMajorNone { k_leading: true },
+                row_bytes,
+                rows
+            )
+            .const_part()
+            .unwrap(),
+            SmemDesc::for_layout(
+                0,
+                SmemLayout::RowMajorNone { k_leading: false },
+                row_bytes,
+                rows
+            )
+            .const_part()
+            .unwrap(),
+            "the 2026-08-10 A/B really did launch two different descriptors"
+        );
 
-        // Core matrix (i, j) of a 64-row A slice: 8 row groups x 8 k groups.
-        let mut same = 0usize;
-        for i in 0..8u64 {
-            for j in 0..8u64 {
-                let (ka, ma) = (k.core_matrix_offset(i, j), m.core_matrix_offset(i, j));
-                if i == j {
-                    assert_eq!(ka, ma, "the diagonal is fixed by any swap");
-                    same += 1;
-                } else {
-                    assert_ne!(
-                        ka, ma,
-                        "core matrix ({i},{j}) must move when the two offset fields swap"
-                    );
+        // 1. Exhaustive over every (LBO, SBO) pair a 14-bit field can hold at 16-byte granularity:
+        //    none of them turns the canonical model into the row-major truth, because the r term is
+        //    not a function of either field.
+        let elem = 2u64;
+        let truth = |i: u64, j: u64, r: u64, c: u64| (8 * i + r) * row_bytes + (8 * j + c) * elem;
+        let mut representable = false;
+        for lbo in (0..=4096u64).step_by(16) {
+            for sbo in (0..=4096u64).step_by(16) {
+                let d = SmemDesc {
+                    start_addr: 0,
+                    lbo,
+                    sbo,
+                    base_offset: 0,
+                    swizzle: SmemSwizzle::None,
+                };
+                // Only the FIRST wgmma K step (j0 = 0), which is the most generous case: if even
+                // that cannot be matched, no base advance saves the later ones.
+                let ok = (0..8u64).all(|i| {
+                    (0..2u64).all(|j| {
+                        (0..8u64).all(|r| {
+                            (0..8u64)
+                                .all(|c| d.canonical_offset(i, j, r, c, elem) == truth(i, j, r, c))
+                        })
+                    })
+                });
+                if ok {
+                    representable = true;
                 }
-                // Both stay inside the 64x64 f16 slice, which is exactly why the wrong reading is
-                // silently wrong data and not a fault.
-                assert!(ka < 64 * row_bytes && ma < 64 * row_bytes);
             }
         }
-        assert_eq!(same, 8);
+        assert!(
+            !representable,
+            "a row-major tile with {row_bytes}-byte rows must be describable by NO descriptor -- if \
+             this ever passes, the model is wrong, not the hardware"
+        );
+        // ...and the reason, isolated: only r == 0 agrees, whatever the two fields hold.
+        let d = SmemDesc::for_layout(
+            0,
+            SmemLayout::RowMajorNone { k_leading: true },
+            row_bytes,
+            rows,
+        );
+        for r in 0..8u64 {
+            let agrees = d.canonical_offset(0, 0, r, 0, elem) == truth(0, 0, r, 0);
+            assert_eq!(agrees, r == 0, "row {r} within the core matrix");
+        }
 
-        // ...and the ramps make that visible in the product. `desc_read` is the descriptor
-        // arithmetic run backwards on the host: the device verdict never consults it, but the
-        // probe's SENSITIVITY does, and an over-simple model would overstate that sensitivity.
-        //
-        // Per-descriptor row counts matter. A is described one consumer m64 slab at a time; B's
-        // `N x 16` operand is described in one piece over the CTA tile's full width.
-        let (m64, n64, k64) = (64usize, 64usize, 64usize);
-        let (a_rows_per_desc, b_rows_per_desc) = (WGMMA_W1.bm / WGMMA_W1.consumer_wgs, WGMMA_W1.bn);
-        assert_eq!(a_rows_per_desc, WgmmaShape::M);
+        // 2. The two logged numbers, recomputed.
         let (a, b) = bringup_operands(m64, n64, k64);
-
-        // The model's own honesty check: with the fields as written it must reproduce the operand
-        // exactly. A model that cannot express "correct" is not modelling the descriptor.
-        assert_eq!(
-            desc_read(&a, m64, k64, a_rows_per_desc, false),
-            a,
-            "A, fields as written"
-        );
-        assert_eq!(
-            desc_read(&b, n64, k64, b_rows_per_desc, false),
-            b,
-            "B, fields as written"
-        );
-
         let want = ref_nt(&a, &b, m64, k64, n64);
-        let a_sw = desc_read(&a, m64, k64, a_rows_per_desc, true);
-        let b_sw = desc_read(&b, n64, k64, b_rows_per_desc, true);
-        assert_ne!(a_sw, a, "the swap must move A");
-        assert_ne!(b_sw, b, "the swap must move B");
-        let got = ref_nt(&a_sw, &b_sw, m64, k64, n64);
-        let differing = want.iter().zip(&got).filter(|(x, y)| x != y).count();
-        assert_eq!(
-            differing,
-            want.len(),
-            "EVERY lane must move under the swap, else a device MATCH would prove nothing about the \
-             lanes that did not: {differing}/{} moved",
-            want.len()
-        );
-        // And each operand carries signal on its own, so neither is doing all the work.
-        for (label, at, bt) in [("A only", &a_sw, &b), ("B only", &a, &b_sw)] {
-            let one = ref_nt(at, bt, m64, k64, n64);
-            assert!(
-                one.iter().zip(&want).filter(|(x, y)| x != y).count() * 2 > want.len(),
-                "{label}: a permutation of one operand must be visible on its own"
+        for (label, f, expect) in [
+            ("k_leading: true", kl, 64usize),
+            ("k_leading: false", ml, 0),
+        ] {
+            let a_seen = unswizzled_read(&a, m64, k64, 64, f);
+            let b_seen = unswizzled_read(&b, n64, k64, 64, f);
+            let got = ref_nt(&a_seen, &b_seen, m64, k64, n64);
+            let exact = got.iter().zip(&want).filter(|(x, y)| x == y).count();
+            assert_eq!(
+                exact, expect,
+                "{label}: the model must reproduce the H100's own exact-lane count \
+                 (2026-08-10-h100-s2a-bringup.log stage D)"
             );
+        }
+        // The 64 is 8 x 8 and not a coincidence: a lane is exact exactly when BOTH operands' rows
+        // are the one row in eight the descriptor reads correctly.
+        assert_eq!((m64 / 8) * (n64 / 8), 64);
+
+        // 3. The ramps really do move under a wrong reading, so a MATCH would have meant something.
+        let a_kl = unswizzled_read(&a, m64, k64, 64, kl);
+        let a_ml = unswizzled_read(&a, m64, k64, 64, ml);
+        assert_ne!(a_kl, a_ml, "the two readings must fetch different elements");
+        assert_ne!(a_kl, a, "and neither of them is the identity");
+    }
+
+    /// **The canonical core-matrix layout IS describable** -- the positive half of the law above, and
+    /// the reason the sweep has a repack arm at all.
+    ///
+    /// Staged with every core matrix at 128 contiguous bytes, the ISA's own (LBO, SBO) reproduce the
+    /// operand exactly, for both packings and for every `wgmma` K step. If this ever fails, the
+    /// hypothesis the sweep is built on is wrong before a single dollar is spent.
+    #[test]
+    fn the_canonical_core_matrix_layout_is_describable() {
+        let (rows, bk, elem) = (64u64, 64u64, 2u64);
+        let row_bytes = bk * elem;
+        for (k_fast, swapped) in [(true, false), (false, false)] {
+            let layout = SmemLayout::CanonicalNone { k_fast, swapped };
+            let f = desc_fields(layout, row_bytes, rows);
+            let d = SmemDesc::for_layout(0, layout, row_bytes, rows);
+            // Where the probe's repack puts element (8i + r, 8j + c): core matrix index, then the
+            // 64 elements inside it. Written here from the layout's own definition, not from the
+            // descriptor -- if the two agree, the descriptor describes the repack.
+            let ncm_k = bk / 8;
+            let ncm_m = rows / 8;
+            let staged = |i: u64, j: u64, r: u64, c: u64| {
+                let cm = if k_fast { i * ncm_k + j } else { j * ncm_m + i };
+                (cm * 64 + r * 8 + c) * elem
+            };
+            for j0 in 0..(bk / 16) {
+                for i in 0..ncm_m {
+                    for j in 0..2u64 {
+                        for r in 0..8u64 {
+                            for c in 0..8u64 {
+                                let hw = j0 * f.k_step_bytes + d.canonical_offset(i, j, r, c, elem);
+                                assert_eq!(
+                                    hw,
+                                    staged(i, 2 * j0 + j, r, c),
+                                    "{} at k-step {j0}, core matrix ({i},{j}), element ({r},{c})",
+                                    layout.label()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // Four K steps of the advance must land exactly at the end of the tile's K extent, so
+            // the base arithmetic covers the staged tile once and does not run off it.
+            assert!(f.k_step_bytes * (bk / 16) <= rows * row_bytes);
         }
     }
 
@@ -2823,60 +3910,331 @@ mod tests {
         }
     }
 
-    /// **The A/B arms are two kernels, not one kernel run twice.**
-    ///
-    /// `Gpu::function` keys on the module-cache string alone and never re-examines the PTX, so two
-    /// descriptor readings sharing a key would be one compiled module launched twice -- agreeing
-    /// perfectly, matching or missing together, and "settling" item 1 with no information at all.
-    /// So: distinct entry names, distinct keys, and text that differs in *exactly* the descriptor
-    /// immediates once the entry name is accounted for.
-    #[test]
-    fn the_desc_order_ab_arms_are_two_kernels_not_one() {
-        assert_eq!(WGMMA_DESC_ORDER_AB.len(), 2);
-        let (kl, mn) = (WGMMA_DESC_ORDER_AB[0], WGMMA_DESC_ORDER_AB[1]);
-        assert_eq!(kl.desc_order, DescOrder::KLeading);
-        assert_eq!(mn.desc_order, DescOrder::MnLeading);
-        assert_ne!(kl.name, mn.name);
-        assert_ne!(kl.key, mn.key);
-        // Same tile, same schedule, same dtype -- only the descriptor reading differs.
-        assert_eq!(
-            (kl.bm, kl.bn, kl.bk, kl.stages),
-            (mn.bm, mn.bn, mn.bk, mn.stages)
-        );
-        assert_eq!(kl.dtype, mn.dtype);
-        assert_eq!(kl.smem_bytes(), mn.smem_bytes());
-        // The bring-up row is deliberately NOT in the shipped table, and no key collides with one.
-        assert!(!WGMMA_VARIANTS.iter().any(|v| v.name == mn.name));
-        assert!(!WGMMA_VARIANTS.iter().any(|v| v.key == mn.key));
-        assert_eq!(wgmma_variant(mn.name).name, mn.name);
+    // --- bring-up: the ONE-VISIT descriptor sweep -------------------------------------------------
 
-        let lic = license();
-        let a = wgmma_module(kl, &lic).unwrap();
-        let b = wgmma_module(mn, &lic).unwrap();
-        let a_renamed = a.replace(kl.name, mn.name);
-        assert_ne!(a_renamed, b, "the two arms must not be the same text");
-        let diffs: Vec<(&str, &str)> = a_renamed
-            .lines()
-            .zip(b.lines())
-            .filter(|(x, y)| x != y)
+    /// **The candidate set is derived, complete, and every row says why it is there.**
+    ///
+    /// The whole value of a sweep is that the next visit needs no third guess, so the set is checked
+    /// for the properties that make that true: the two already-scored controls are in it, every arm
+    /// that could win is represented, no two rows are the same launch, every label and rationale is
+    /// ASCII and non-trivial, and the set is small enough to read.
+    #[test]
+    fn the_sweep_candidate_set_is_derived_and_complete() {
+        let cands = desc_sweep_candidates();
+        assert!(
+            (8..=40).contains(&cands.len()),
+            "a few dozen at most, or the sweep is a spray: {}",
+            cands.len()
+        );
+        // Labels are unique, ASCII, and every row states its reason.
+        let mut labels: Vec<&str> = cands.iter().map(|c| c.label).collect();
+        let n = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), n, "duplicate candidate label");
+        for c in &cands {
+            assert!(c.label.is_ascii() && c.why.is_ascii(), "{}", c.label);
+            assert!(
+                c.why.len() > 40,
+                "{}: a candidate with no stated reason is a guess",
+                c.label
+            );
+            c.template()
+                .unwrap_or_else(|e| panic!("{} must pack: {e}", c.label));
+            // Every candidate's tensor-map swizzle is its descriptor's, translated once.
+            assert_eq!(SmemSwizzle::from_tma(c.tma_swizzle()), c.swizzle);
+            // The K step must be a multiple of 16, or the descriptor's own `>> 4` truncates the
+            // advance and every step after the first reads a different address than intended.
+            assert_eq!(c.k_step_bytes % 16, 0, "{}", c.label);
+        }
+        // No two rows are the same launch: (template, staging, k-step) is the whole input.
+        let mut keys: Vec<(u64, u32, u32)> = cands
+            .iter()
+            .map(|c| (c.template().unwrap(), c.staging as u32, c.k_step_bytes))
+            .collect();
+        let n = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), n, "two candidates are the same launch");
+
+        // The two CONTROLS: the readings the H100 already scored, so the sweep can validate itself.
+        for want in ["ctl/rowmajor-k-leading", "ctl/rowmajor-mn-leading"] {
+            let c = cands.iter().find(|c| c.label == want).expect(want);
+            assert_eq!(c.staging, SweepStaging::AsWritten);
+            assert_eq!(c.swizzle, SmemSwizzle::None);
+            assert_eq!(c.encoding, FieldEncoding::Standard);
+        }
+        assert_eq!(
+            cands
+                .iter()
+                .find(|c| c.label == "ctl/rowmajor-k-leading")
+                .unwrap()
+                .template()
+                .unwrap(),
+            (1u64 << 16) | (64u64 << 32),
+            "the shipped-until-2026-08-10 template, hand-computed"
+        );
+
+        // Every arm that could win is represented, and each staging mode points its descriptors at
+        // the region that mode actually writes.
+        let arms: std::collections::BTreeSet<String> = cands.iter().map(|c| c.arm()).collect();
+        assert!(arms.len() >= 4, "arms: {arms:?}");
+        for c in &cands {
+            let (a, b) = c.operand_offsets();
+            let repacked = c.staging != SweepStaging::AsWritten;
+            assert_eq!(repacked, a == DESC_SWEEP_A_ALT, "{}", c.label);
+            assert_eq!(repacked, b == DESC_SWEEP_B_ALT, "{}", c.label);
+            assert_ne!(a, b);
+        }
+
+        // Exactly one candidate carries the reading production ships, and it is production-viable.
+        let shipped: Vec<&DescCandidate> = cands
+            .iter()
+            .filter(|c| c.layout == Some(SHIPPED_LAYOUT))
             .collect();
         assert_eq!(
-            a_renamed.lines().count(),
-            b.lines().count(),
-            "the arms must differ only in immediates, not in structure"
+            shipped.len(),
+            1,
+            "the sweep must carry the shipped reading exactly once, so the round can say `no edit \
+             needed`: {:?}",
+            shipped.iter().map(|c| c.label).collect::<Vec<_>>()
         );
-        assert!(!diffs.is_empty());
-        for (x, y) in &diffs {
+        assert!(shipped[0].production_viable());
+        // A repack arm is never production-viable, whatever it scores: TMA cannot write it.
+        for c in cands
+            .iter()
+            .filter(|c| c.staging != SweepStaging::AsWritten)
+        {
+            assert!(!c.production_viable(), "{}", c.label);
+        }
+        // ...and every production-viable row names a layout `wgmma_module` will actually emit.
+        let lic = license();
+        for c in cands.iter().filter(|c| c.production_viable()) {
+            let cfg = WgmmaCfg {
+                layout: c.layout.unwrap(),
+                ..WGMMA_W1
+            };
+            wgmma_module(&cfg, &lic).unwrap_or_else(|e| {
+                panic!(
+                    "{}: a production-viable candidate must be generatable, or crowning it settles \
+                     nothing: {e}",
+                    c.label
+                )
+            });
+        }
+    }
+
+    /// **The sweep is ONE module and a host loop** -- the property that makes it a single visit.
+    ///
+    /// Everything a candidate varies must arrive as a run-time parameter, so the generated text is
+    /// identical for all of them. If a field ever leaks into the PTX as an immediate, this fails.
+    #[test]
+    fn the_sweep_probe_is_one_module_for_every_candidate() {
+        let ptx = desc_sweep_probe_module(&license()).unwrap();
+        assert!(ptx.is_ascii(), "PTX must be pure ASCII");
+        assert!(ptx.starts_with(HDR_SM90A_V80));
+        assert!(ptx.contains(WGMMA_DSMEM_DECL));
+        assert_eq!(
+            ptx.matches(&format!(".visible .entry {DESC_SWEEP_ENTRY}("))
+                .count(),
+            1
+        );
+        assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
+        // The ten parameters, in the order the launcher pushes them.
+        assert_eq!(
+            ptx.matches(".param ").count(),
+            10,
+            "(K, C, descA, descB, aOff, bOff, kStep, stage, tmapA, tmapB)"
+        );
+        for p in [
+            "pK", "pC", "pDescA", "pDescB", "pAOff", "pBOff", "pKStep", "pStage",
+        ] {
+            assert!(ptx.contains(&format!("[{p}]")), "{p} is never loaded");
+        }
+        // Not one descriptor immediate anywhere: both templates are OR'd in from a register.
+        assert_eq!(ptx.matches("or.b64 %descA,%rdT,%tmplA;").count(), 1);
+        assert_eq!(ptx.matches("or.b64 %descB,%rdT,%tmplB;").count(), 1);
+        assert!(
+            !ptx.contains("or.b64 %descA,%rdT,0x"),
+            "a baked descriptor constant would make the sweep one module per candidate"
+        );
+        // One wgmma, in a run-time K loop, so K=16 and K=64 are the same module.
+        assert_eq!(
+            ptx.matches("wgmma.mma_async.sync.aligned.").count(),
+            1,
+            "the K loop is a real loop; unrolling it would bake the k-step advance"
+        );
+        assert!(ptx.contains(&format!(
+            "wgmma.mma_async.sync.aligned.m64n{DESC_SWEEP_N}k16.f32.f16.f16"
+        )));
+        assert_eq!(ptx.matches("wgmma.fence.sync.aligned;").count(), 1);
+        assert_eq!(ptx.matches("wgmma.commit_group.sync.aligned;").count(), 1);
+        assert_eq!(ptx.matches("wgmma.wait_group.sync.aligned 0;").count(), 1);
+        // The staging path is stage B's, unchanged: one barrier, two tiled copies, one transaction.
+        assert_eq!(
+            ptx.matches(
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+            )
+            .count(),
+            2
+        );
+        assert!(ptx.contains(&format!(
+            "mbarrier.arrive.expect_tx.shared::cta.b64 %rdSt,[%rdBar],{};",
+            desc_sweep_tx_bytes()
+        )));
+        assert_eq!(
+            ptx.matches("mbarrier.init.shared::cta.b64 [%rdBar],1;")
+                .count(),
+            1
+        );
+        // The repack writes SMEM with the GENERIC proxy; wgmma reads it through the ASYNC proxy.
+        // Without this fence the canonical arms would be a race, not a measurement.
+        assert_eq!(ptx.matches("fence.proxy.async.shared::cta;").count(), 1);
+        // No warp specialisation anywhere: the probe is one warpgroup and nothing else.
+        for banned in ["setmaxnreg", "multicast", "cluster_ctarank"] {
             assert!(
-                x.contains("or.b64 %desc") && y.contains("or.b64 %desc"),
-                "the only difference may be the descriptor constant: {x:?} vs {y:?}"
+                !ptx.contains(banned),
+                "the sweep probe must not contain {banned}"
             );
         }
-        // The two immediates, hand-computed: BK=64 f16 gives 128-byte rows, so the k-adjacent
-        // distance is 16 (-> 1) and the row-group-adjacent one is 1024 (-> 64); the reading decides
-        // which lands in the leading field at bit 16 and which in the stride field at bit 32.
-        assert!(a.contains(&format!("{:#x}", (1u64 << 16) | (64u64 << 32))));
-        assert!(b.contains(&format!("{:#x}", (64u64 << 16) | (1u64 << 32))));
+        assert!(ptx.contains(&format!(".maxntid {DESC_SWEEP_THREADS}, 1, 1")));
+        assert_eq!(ptx.matches(".param .align 64 .b8 tmap").count(), 2);
+        assert_eq!(ptx.matches("cvta.param.u64").count(), 2);
+        // Every accumulator is stored exactly once.
+        let nacc = DESC_SWEEP_N / 2;
+        assert!(ptx.contains(&format!(".reg .f32 %acc<{nacc}>;")));
+        assert_eq!(ptx.matches("st.global.f32").count(), nacc);
+        for i in 0..nacc {
+            assert_eq!(ptx.matches(&format!("],%acc{i};")).count(), 1, "%acc{i}");
+        }
+        // Every branch target is defined, branched to, and entry-scoped (PTX labels are
+        // module-scoped, so an un-prefixed one collides the day two entries share a module).
+        let defined: Vec<&str> = ptx
+            .lines()
+            .filter(|l| !l.starts_with(' ') && l.ends_with(':'))
+            .map(|l| l.trim_end_matches(':'))
+            .collect();
+        let used: Vec<&str> = ptx
+            .lines()
+            .filter_map(|l| {
+                l.find("bra ")
+                    .map(|i| l[i + 4..].trim().trim_end_matches(';'))
+            })
+            .collect();
+        assert!(!used.is_empty());
+        for u in &used {
+            assert!(defined.contains(u), "branch to undefined `{u}`");
+            assert!(
+                u.ends_with(DESC_SWEEP_ENTRY),
+                "label `{u}` is not entry-scoped"
+            );
+        }
+        for d in &defined {
+            assert!(
+                used.contains(d),
+                "label `{d}` is defined but never branched to"
+            );
+        }
+    }
+
+    /// **No candidate may read outside the shared window** -- the law that keeps a deliberately
+    /// wrong descriptor from ending the round instead of scoring zero.
+    ///
+    /// A wrong (LBO, SBO) reads a wrong ADDRESS, not a wrong element, and an out-of-window shared
+    /// access is an illegal-address fault that makes the CUDA context sticky-errored (crate landmine
+    /// 6): every later candidate, and every later stage, would then fail identically and the round
+    /// would report a cascade with one real cause. So the reach of every row is bounded here, on a
+    /// CPU, before a dollar is spent.
+    #[test]
+    fn every_sweep_candidate_reads_inside_the_window() {
+        let mut worst = (0u64, "");
+        for c in desc_sweep_candidates() {
+            let reach = c.max_reach().unwrap_or_else(|e| panic!("{}: {e}", c.label));
+            let (a, b) = c.operand_offsets();
+            let far = a.max(b) as u64 + reach;
+            assert!(
+                far <= DESC_SWEEP_SMEM as u64,
+                "{}: reaches {far} B, past the {DESC_SWEEP_SMEM} B window -- that is an illegal \
+                 shared address, which wedges the context rather than scoring zero",
+                c.label
+            );
+            if reach > worst.0 {
+                worst = (reach, c.label);
+            }
+        }
+        // The widest row really is the raw-encoded one, and it really does reach far: if this ever
+        // stops being true the window may have been shrunk for the wrong reason.
+        assert_eq!(worst.1, "canon-kfast/raw-fields");
+        assert!(
+            worst.0 > 64 * 1024,
+            "the raw-field candidate is the reason the window is 144 KiB; it reached only {} B",
+            worst.0
+        );
+    }
+
+    /// The sweep's shared-memory map: four tiles and a barrier, every base aligned for the widest
+    /// swizzle any candidate asks for, and the whole window inside one CTA's budget.
+    #[test]
+    fn the_sweep_probe_shared_memory_map_is_aligned_and_bounded() {
+        assert_eq!(DESC_SWEEP_TILE, 64 * 64 * 2);
+        assert_eq!(
+            [
+                DESC_SWEEP_A_RAW,
+                DESC_SWEEP_B_RAW,
+                DESC_SWEEP_A_ALT,
+                DESC_SWEEP_B_ALT
+            ],
+            [0, 8192, 16384, 24576]
+        );
+        for base in [
+            DESC_SWEEP_A_RAW,
+            DESC_SWEEP_B_RAW,
+            DESC_SWEEP_A_ALT,
+            DESC_SWEEP_B_ALT,
+        ] {
+            assert_eq!(
+                base as u64 % SmemSwizzle::B128.required_alignment(),
+                0,
+                "every operand base must clear the 128-B swizzle's 1024-byte pattern boundary"
+            );
+        }
+        assert_eq!(DESC_SWEEP_BAR % 8, 0);
+        const _: () = assert!(DESC_SWEEP_BAR + 8 <= DESC_SWEEP_SMEM);
+        const _: () = assert!(DESC_SWEEP_SMEM <= HOPPER_SMEM_PER_CTA);
+        let p = desc_sweep_plan();
+        assert_eq!(p.entry, DESC_SWEEP_ENTRY);
+        assert_eq!(p.module_key, DESC_SWEEP_KEY);
+        assert_eq!(p.block, (128, 1, 1));
+        assert_eq!(p.dyn_smem_bytes, DESC_SWEEP_SMEM);
+        assert_eq!(p.tx_bytes, 2 * DESC_SWEEP_TILE);
+        assert_eq!(p.operand, (64, 64));
+        // The transaction the kernel declares equals what the two tensor maps move -- a mismatch
+        // here does not fail, it HANGS.
+        let map = crate::tma_host::TensorMapArgs::tiled_2d_row_major(
+            TmaDataType::F16,
+            DESC_SWEEP_M as u64,
+            DESC_SWEEP_BK as u64,
+            DESC_SWEEP_BK as u64,
+            DESC_SWEEP_M as u32,
+            DESC_SWEEP_BK as u32,
+            TmaSwizzle::None,
+        );
+        map.validate().unwrap();
+        assert_eq!(2 * map.transaction_bytes(), p.tx_bytes);
+        // ...and the same geometry is legal at the 128-B swizzle, which is the arm that matters.
+        let mut sw = map;
+        sw.swizzle = TmaSwizzle::B128;
+        sw.validate()
+            .expect("BK=64 f16 is exactly the 128-B atom, which is why the shipped BK is 64");
+        // Both K passes issue a whole number of wgmma steps, and K=16 issues exactly one -- the
+        // pass in which the descriptor's start address never moves.
+        assert_eq!(DESC_SWEEP_KS, &[16, 64]);
+        assert_eq!(DESC_SWEEP_KS[0] / WgmmaShape::K, 1);
+        assert_eq!(DESC_SWEEP_KS[1] / WgmmaShape::K, 4);
+        for k in DESC_SWEEP_KS {
+            assert_eq!(k % WgmmaShape::K, 0);
+            assert!(*k <= DESC_SWEEP_BK);
+        }
     }
 
     // --- bring-up: the single-stage TMA probe -----------------------------------------------------
@@ -3029,6 +4387,23 @@ mod tests {
         let name = std::env::var("WUKONG_WGMMA_VARIANT").unwrap_or_else(|_| WGMMA_W1.name.into());
         if name == TMA_PROBE_ENTRY {
             println!("{}", tma_stage_probe_module(&license()).unwrap());
+            return;
+        }
+        if name == DESC_SWEEP_ENTRY {
+            println!("{}", desc_sweep_probe_module(&license()).unwrap());
+            for c in desc_sweep_candidates() {
+                println!(
+                    "// candidate {:<28} arm {:<14} tmpl {:#018x} aOff {:>6} kStep {:>5} \
+                     stage {} reach {:>7}",
+                    c.label,
+                    c.arm(),
+                    c.template().unwrap(),
+                    c.operand_offsets().0,
+                    c.k_step_bytes,
+                    c.staging as u32,
+                    c.max_reach().unwrap()
+                );
+            }
             return;
         }
         let cfg = wgmma_variant(&name);
