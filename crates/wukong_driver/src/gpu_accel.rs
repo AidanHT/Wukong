@@ -115,7 +115,7 @@ impl Accelerator for GpuAccel<'_> {
         // and the `_sm_db` tiling's aligned shapes (M,N multiples of 64; K a multiple of 16). Anything
         // else declines to the CPU kernel. This is the fp16 tensor-core path, so it's tolerance-gated
         // against the f32 CPU oracle (the same `--backend=gpu` differential contract), not bit-exact.
-        if beta != 0 || m % 64 != 0 || n % 64 != 0 || k % 16 != 0 {
+        if beta != 0 || !m.is_multiple_of(64) || !n.is_multiple_of(64) || !k.is_multiple_of(16) {
             return None;
         }
         use wukong_codegen_gpu::gpu as g;

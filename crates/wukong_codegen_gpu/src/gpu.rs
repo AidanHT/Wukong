@@ -1046,7 +1046,7 @@ pub fn f16_regime_thresholds(l2_bytes: usize) -> (usize, usize) {
 fn wmma_pick(base: &str, m: usize, n: usize) -> (String, LaunchConfig) {
     use crate::ptx_wmma::{WARP_M, WARP_N};
     let block_dim = (32, 1, 1);
-    if m % WARP_M == 0 && n % WARP_N == 0 {
+    if m.is_multiple_of(WARP_M) && n.is_multiple_of(WARP_N) {
         (
             format!("{base}_mt"),
             LaunchConfig {
@@ -1083,7 +1083,7 @@ pub fn gemm_nt_f16(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
+        m.is_multiple_of(16) && n.is_multiple_of(16) && k.is_multiple_of(16),
         "WMMA requires 16-multiple dims"
     );
     // Regime-aware dispatch among the multi-stage `cp.async` pipeline kernels (all numerically identical;
@@ -1105,7 +1105,11 @@ pub fn gemm_nt_f16(
                                         // The band edges are multiples of the PROBED L2 (see `f16_regime_thresholds`), not the 16/48 MiB
                                         // literals they replace — on this 24 MiB-L2 card they evaluate to exactly those literals.
     let (l2_resident_max, hbm_bound_min) = f16_regime_thresholds(g.target().l2_bytes);
-    if ws_bytes >= hbm_bound_min && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+    if ws_bytes >= hbm_bound_min
+        && m.is_multiple_of(128)
+        && n.is_multiple_of(128)
+        && k.is_multiple_of(32)
+    {
         // **Largest regime (A+B ≥ 2·L2 = 48 MB here, ~4096³ up): the `_v2cs` epilogue variant** — the same swz
         // s2 body as the w24 workhorse below, with C written as paired-column `st.global.cs.v2.f32`
         // (half the store count + the evict-first streaming hint keeps the one-shot C out of the
@@ -1116,7 +1120,11 @@ pub fn gemm_nt_f16(
         // the [16, 48) MB band below keeps the plain swz w24.
         return gemm_nt_f16_cliff(g, a, b, m, k, n, "cliff_swz_s2_v2cs");
     }
-    if ws_bytes >= l2_resident_max && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+    if ws_bytes >= l2_resident_max
+        && m.is_multiple_of(128)
+        && n.is_multiple_of(128)
+        && k.is_multiple_of(32)
+    {
         let wh = pipe_variant("mma_nt_f16_128_bk32_s2_r16");
         // **Large regime (A+B ≥ ⅔·L2 = 16 MB here, ≥2048³):** the no-pad `ldmatrix`+XOR-swizzle **w24** workhorse is the
         // robust same-run winner — it beats the padded hand-placed base **1.23× @2048³ (87.4% vs 70.9% of
@@ -1135,13 +1143,13 @@ pub fn gemm_nt_f16(
         };
         return gemm_nt_f16_pipe(g, a, b, m, k, n, &swz_w24);
     }
-    if m <= 1024 && n <= 1024 && m % SM_BM == 0 && n % SM_BN == 0 {
+    if m <= 1024 && n <= 1024 && m.is_multiple_of(SM_BM) && n.is_multiple_of(SM_BN) {
         return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_64_s6"));
     }
-    if m % SM128_BM == 0 && n % SM128_BN == 0 {
+    if m.is_multiple_of(SM128_BM) && n.is_multiple_of(SM128_BN) {
         return gemm_nt_f16_pipe(g, a, b, m, k, n, pipe_variant("wmma_nt_f16_pipe_128_s4"));
     }
-    if m % SM_BM == 0 && n % SM_BN == 0 {
+    if m.is_multiple_of(SM_BM) && n.is_multiple_of(SM_BN) {
         return gemm_nt_f16_sm(g, a, b, m, k, n);
     }
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1191,7 +1199,7 @@ pub fn gemm_nt_f16_sm(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        m.is_multiple_of(SM_BM) && n.is_multiple_of(SM_BN) && k.is_multiple_of(16),
         "wmma_nt_f16_sm requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1234,15 +1242,16 @@ pub fn gemm_nt_f16_static(
     use half::f16;
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
-    assert!(k % 16 == 0, "gemm_nt_f16_static requires K%16==0");
-    let use_128 = m >= 4096 && n >= 4096 && m % SM128_BM == 0 && n % SM128_BN == 0;
+    assert!(k.is_multiple_of(16), "gemm_nt_f16_static requires K%16==0");
+    let use_128 =
+        m >= 4096 && n >= 4096 && m.is_multiple_of(SM128_BM) && n.is_multiple_of(SM128_BN);
     let (bm, bn, threads) = if use_128 {
         (SM128_BM, SM128_BN, SM128_THREADS)
     } else {
         (SM_BM, SM_BN, SM_THREADS)
     };
     assert!(
-        m % bm == 0 && n % bn == 0,
+        m.is_multiple_of(bm) && n.is_multiple_of(bn),
         "gemm_nt_f16_static requires M%{bm}==0, N%{bn}==0"
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1288,7 +1297,7 @@ pub fn gemm_nt_f16_sm128(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % SM128_BM == 0 && n % SM128_BN == 0 && k % 16 == 0,
+        m.is_multiple_of(SM128_BM) && n.is_multiple_of(SM128_BN) && k.is_multiple_of(16),
         "wmma_nt_f16_sm128 requires M%{SM128_BM}==0, N%{SM128_BN}==0, K%16==0"
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1342,7 +1351,7 @@ pub fn gemm_nt_f16_sm_db(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        m.is_multiple_of(SM_BM) && n.is_multiple_of(SM_BN) && k.is_multiple_of(16),
         "wmma_nt_f16_sm_db requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1386,7 +1395,7 @@ fn gemm_nt_f16_fused(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        m.is_multiple_of(SM_BM) && n.is_multiple_of(SM_BN) && k.is_multiple_of(16),
         "{entry} requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1464,7 +1473,7 @@ pub fn gemm_nt_f16_sm_db_residual(
     assert_eq!(b.len(), n * k);
     assert_eq!(residual.len(), m * n, "residual must be M×N");
     assert!(
-        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        m.is_multiple_of(SM_BM) && n.is_multiple_of(SM_BN) && k.is_multiple_of(16),
         "wmma_nt_f16_sm_db_residual requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1513,7 +1522,7 @@ fn gemm_nt_f16_fused_bias(
     assert_eq!(b.len(), n * k);
     assert_eq!(bias.len(), n, "bias must have length N");
     assert!(
-        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        m.is_multiple_of(SM_BM) && n.is_multiple_of(SM_BN) && k.is_multiple_of(16),
         "{entry} requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1605,7 +1614,7 @@ pub fn gemm_nt_f16_sm128_db(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % SM128_BM == 0 && n % SM128_BN == 0 && k % 16 == 0,
+        m.is_multiple_of(SM128_BM) && n.is_multiple_of(SM128_BN) && k.is_multiple_of(16),
         "wmma_nt_f16_sm128_db requires M%{SM128_BM}==0, N%{SM128_BN}==0, K%16==0"
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -1665,7 +1674,7 @@ pub fn gemm_nt_f16_pipe(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        m.is_multiple_of(v.bm) && n.is_multiple_of(v.bn) && k.is_multiple_of(v.bk),
         "{} requires M%{}==0, N%{}==0, K%{}==0",
         v.name,
         v.bm,
@@ -1718,7 +1727,7 @@ pub(crate) fn gemm_nt_f16_cliff(
     assert_eq!(a.len(), m * k, "A must be m×k");
     assert_eq!(b.len(), n * k, "B must be n×k (A·Bᵀ)");
     assert!(
-        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        m.is_multiple_of(v.bm) && n.is_multiple_of(v.bn) && k.is_multiple_of(v.bk),
         "{} requires M%{}==0, N%{}==0, K%{}==0",
         v.name,
         v.bm,
@@ -1772,7 +1781,7 @@ pub fn gemm_nt_f16_deep(
     assert_eq!(a.len(), m * k, "A must be m×k");
     assert_eq!(b.len(), n * k, "B must be n×k (A·Bᵀ)");
     assert!(
-        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        m.is_multiple_of(v.bm) && n.is_multiple_of(v.bn) && k.is_multiple_of(v.bk),
         "{} requires M%{}==0, N%{}==0, K%{}==0",
         v.name,
         v.bm,
@@ -1872,7 +1881,7 @@ fn gemm_nt_f16_pipe_fused_bias_v(
         "{entry}: pushed launch args must match the kernel's declared .param count"
     );
     assert!(
-        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        m.is_multiple_of(v.bm) && n.is_multiple_of(v.bn) && k.is_multiple_of(v.bk),
         "{entry} requires M%{}==0, N%{}==0, K%{}==0",
         v.bm,
         v.bn,
@@ -2017,7 +2026,7 @@ pub fn gemm_nt_f16_mma_bias_residual(
     assert_eq!(bias.len(), n, "bias must have length N");
     assert_eq!(residual.len(), m * n, "residual must have length M·N");
     assert!(
-        m % wh.bm == 0 && n % wh.bn == 0 && k % wh.bk == 0,
+        m.is_multiple_of(wh.bm) && n.is_multiple_of(wh.bn) && k.is_multiple_of(wh.bk),
         "mma_nt_f16_128_bk32_s2_r16_bias_residual requires M%{}==0, N%{}==0, K%{}==0",
         wh.bm,
         wh.bn,
@@ -2071,7 +2080,7 @@ pub fn gemm_nt_f16_pipe64_bias_residual(
     assert_eq!(bias.len(), n, "bias must have length N");
     assert_eq!(residual.len(), m * n, "residual must have length M·N");
     assert!(
-        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        m.is_multiple_of(v.bm) && n.is_multiple_of(v.bn) && k.is_multiple_of(v.bk),
         "wmma_nt_f16_pipe_64_s6_bias_residual requires M%{}==0, N%{}==0, K%{}==0",
         v.bm,
         v.bn,
@@ -2120,7 +2129,12 @@ fn gemm_nt_f16_linear_dispatch(
     pipe_entry: &'static str,
     mma: fn(&mut Gpu, &[f32], &[f32], &[f32], usize, usize, usize) -> Result<Vec<f32>, DriverError>,
 ) -> Result<Vec<f32>, DriverError> {
-    if m <= 1024 && n <= 1024 && m % 64 == 0 && n % 64 == 0 && k % 16 == 0 {
+    if m <= 1024
+        && n <= 1024
+        && m.is_multiple_of(64)
+        && n.is_multiple_of(64)
+        && k.is_multiple_of(16)
+    {
         gemm_nt_f16_pipe_fused_bias_v(g, a, b, bias, m, k, n, pipe64(), pipe_entry)
     } else {
         mma(g, a, b, bias, m, k, n)
@@ -2264,7 +2278,7 @@ fn gemm_nt_f16_gate(
         "{entry}: pushed launch args must match the kernel's declared .param count"
     );
     assert!(
-        m % 128 == 0 && n % 64 == 0 && k % 32 == 0,
+        m.is_multiple_of(128) && n.is_multiple_of(64) && k.is_multiple_of(32),
         "{entry} requires M%128==0, N%64==0, K%32==0"
     );
     let x16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
@@ -2323,7 +2337,7 @@ fn gemm_nt_bf16_gate(
         "{entry}: pushed launch args must match the kernel's declared .param count"
     );
     assert!(
-        m % 128 == 0 && n % 64 == 0 && k % 32 == 0,
+        m.is_multiple_of(128) && n.is_multiple_of(64) && k.is_multiple_of(32),
         "{entry} requires M%128==0, N%64==0, K%32==0"
     );
     let xb: Vec<bf16> = x.iter().map(|&v| bf16::from_f32(v)).collect();
@@ -2439,7 +2453,7 @@ pub fn gemm_nt_bf16_mma_bias_residual(
     assert_eq!(bias.len(), n, "bias must have length N");
     assert_eq!(residual.len(), m * n, "residual must have length M·N");
     assert!(
-        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        m.is_multiple_of(v.bm) && n.is_multiple_of(v.bn) && k.is_multiple_of(v.bk),
         "mma_nt_bf16_128_bk32_s2_r16_bias_residual requires M%{}==0, N%{}==0, K%{}==0",
         v.bm,
         v.bn,
@@ -2485,13 +2499,17 @@ pub fn gemm_nt_bf16(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
+        m.is_multiple_of(16) && n.is_multiple_of(16) && k.is_multiple_of(16),
         "WMMA requires 16-multiple dims"
     );
     // Large bf16 GEMM (A+B ≳ L2): the mma.sync workhorse, the bf16 twin of the f16 dispatch — the cliff
     // fix for the training precision, which otherwise fell through to the un-staged `_mt` path below.
     let ws_bytes = (m * k + n * k) * 2;
-    if ws_bytes >= 16 * 1024 * 1024 && m % 128 == 0 && n % 128 == 0 && k % 32 == 0 {
+    if ws_bytes >= 16 * 1024 * 1024
+        && m.is_multiple_of(128)
+        && n.is_multiple_of(128)
+        && k.is_multiple_of(32)
+    {
         // Large regime (A+B ≥ 16 MB, ≥2048³): the no-pad ldmatrix+XOR-swizzle **w24** twin is the robust
         // same-run winner over the padded base (1.23× @2048³, 1.13× @4096³ — measured on fp16; bf16 shares
         // the byte-identical `mma.sync` geometry). The w22 2×2 grid was only a noise-tie at 4096³ and lost
@@ -2550,7 +2568,7 @@ fn gemm_nt_bf16_pipe_entry(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        m.is_multiple_of(v.bm) && n.is_multiple_of(v.bn) && k.is_multiple_of(v.bk),
         "{} requires M%{}==0, N%{}==0, K%{}==0",
         v.name,
         v.bm,
@@ -2605,7 +2623,7 @@ fn gemm_nt_bf16_pipe_fused_bias(
     assert_eq!(b.len(), n * k);
     assert_eq!(bias.len(), n, "bias must have length N");
     assert!(
-        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        m.is_multiple_of(v.bm) && n.is_multiple_of(v.bn) && k.is_multiple_of(v.bk),
         "{entry} requires M%{}==0, N%{}==0, K%{}==0",
         v.bm,
         v.bn,
@@ -2733,7 +2751,7 @@ fn gemm_nt_bf16_fused(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        m.is_multiple_of(SM_BM) && n.is_multiple_of(SM_BN) && k.is_multiple_of(16),
         "{entry} requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
     );
     let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
@@ -2807,7 +2825,7 @@ fn gemm_nt_bf16_fused_bias(
     assert_eq!(b.len(), n * k);
     assert_eq!(bias.len(), n, "bias must have length N");
     assert!(
-        m % SM_BM == 0 && n % SM_BN == 0 && k % 16 == 0,
+        m.is_multiple_of(SM_BM) && n.is_multiple_of(SM_BN) && k.is_multiple_of(16),
         "{entry} requires M%{SM_BM}==0, N%{SM_BN}==0, K%16==0"
     );
     let a16: Vec<bf16> = a.iter().map(|&x| bf16::from_f32(x)).collect();
@@ -3012,6 +3030,22 @@ pub fn norm_supported(op: i64) -> bool {
 /// Returning name+config together guarantees the block dim always matches the chosen kernel's `W`. The
 /// two kernels are bit-identical, so the choice is purely performance. SMEM is static ⇒ `shared_mem_bytes`
 /// stays 0. Every flash launch site uses this (struct sites resolve it once at construction).
+///
+/// **The crossover test is vacuous TODAY, on purpose, and the attribute below is the tripwire.**
+/// [`ptx_flash::FLASH_TILE_MIN`] is 0 — a frozen same-process A/B verdict on the RTX 4050 (tiled wins
+/// or ties at every measured `S`), not an accident — so `seq >= 0` is always true on `usize` and
+/// `absurd_extreme_comparisons` (deny-by-default) fires. Deleting the comparison would delete the
+/// *seam*: this expression is the single place a future part with a high-`S` untiled regime turns the
+/// crossover back on, and the untiled kernel plus its whole derivation exist only to be re-selected
+/// here. So the comparison stays and the lint is expected, not allowed: `#[expect]` means the day
+/// someone sets `FLASH_TILE_MIN` nonzero the lint stops firing, `unfulfilled_lint_expectations` fires
+/// instead, and CI (`-D warnings`) forces them to come back and delete this attribute. An `#[allow]`
+/// would rot silently into a lie about a comparison that had become real.
+#[expect(
+    clippy::absurd_extreme_comparisons,
+    reason = "FLASH_TILE_MIN == 0 is a frozen 4050 A/B verdict; the comparison is the retarget seam, \
+              and the expectation un-fulfills the moment a future device makes the crossover real"
+)]
 pub(crate) fn flash_plan(d: usize, seq: usize) -> (String, LaunchConfig) {
     flash_plan_forced(d, seq, seq >= crate::ptx_flash::FLASH_TILE_MIN)
 }
@@ -3046,7 +3080,7 @@ pub(crate) fn flash_plan_forced(d: usize, seq: usize, tiled: bool) -> (String, L
 /// `ldmatrix` PV-feed variant (`flash_d128_mp_lm`, 16 KB SMEM/CTA), measured ~18–23% over the
 /// hand-packed feed and ahead of cutlass mem-efficient fMHA at `S <= 1024`.
 pub(crate) fn wmma_flash_applies(d: usize, s: usize) -> bool {
-    (d == 64 || d == 128) && s % 16 == 0 && s >= 512
+    (d == 64 || d == 128) && s.is_multiple_of(16) && s >= 512
 }
 
 /// Tensor-core flash entry name for head dim `d`: the **`cp.async`-pipelined register-resident
@@ -4113,7 +4147,7 @@ pub fn ffn_fused(
     assert_eq!(w1.len(), dff * d, "w1 must be Dff×D");
     assert_eq!(w2.len(), d * dff, "w2 must be D×Dff");
     assert!(
-        s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
+        s.is_multiple_of(64) && d.is_multiple_of(64) && dff.is_multiple_of(64),
         "ffn_fused needs S,D,Dff multiples of 64 (WMMA-staged tiles)"
     );
     // Preload every kernel once (the only &mut g use); afterwards device work runs through the cloned
@@ -4447,11 +4481,11 @@ impl ResidentLayerF16 {
             assert_eq!(wt.len(), len, "{name} wrong size");
         }
         assert!(
-            s % 64 == 0 && d % 64 == 0 && dff % 64 == 0,
+            s.is_multiple_of(64) && d.is_multiple_of(64) && dff.is_multiple_of(64),
             "ResidentLayerF16 needs S,D,Dff multiples of 64 (WMMA-staged tiles)"
         );
         assert!(
-            heads >= 1 && d % heads == 0,
+            heads >= 1 && d.is_multiple_of(heads),
             "d={d} must be divisible by heads={heads}"
         );
         let dh = d / heads;
@@ -4998,20 +5032,23 @@ pub fn gemm_nt_fp8(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % 16 == 0 && n % 8 == 0 && k % 32 == 0,
+        m.is_multiple_of(16) && n.is_multiple_of(8) && k.is_multiple_of(32),
         "fp8 GEMM needs M%16==0, N%8==0, K%32==0"
     );
     // Pipelined fp8 path (cp.async SMEM staging + padded conflict-free fragments + raster) — the cliff fix
     // carrying the f16/bf16 mma-pipeline recipe to E4M3; takes over once the tile divides the shape.
     use crate::ptx_fp8::{FP8_PIPE_BK, FP8_PIPE_BM, FP8_PIPE_BN};
-    if m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0 {
+    if m.is_multiple_of(FP8_PIPE_BM)
+        && n.is_multiple_of(FP8_PIPE_BN)
+        && k.is_multiple_of(FP8_PIPE_BK)
+    {
         return gemm_nt_fp8_pipe(g, a, b, m, k, n);
     }
     let a8: Vec<u8> = a.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
     let b8: Vec<u8> = b.iter().map(|&x| crate::ptx_fp8::f32_to_e4m3(x)).collect();
     // Fragment-reuse multi-tile kernel when the block divides evenly (the fast path), else single-tile.
     use crate::ptx_fp8::{FP8_TM, FP8_TN};
-    let (f, cfg) = if m % (16 * FP8_TM) == 0 && n % (8 * FP8_TN) == 0 {
+    let (f, cfg) = if m.is_multiple_of(16 * FP8_TM) && n.is_multiple_of(8 * FP8_TN) {
         (
             g.function(
                 "fp8_gemm_mt",
@@ -5071,7 +5108,7 @@ pub fn gemm_nt_w4a16(
     assert_eq!(qw.k, k, "weight K mismatch");
     assert_eq!(qw.group, GROUP_SIZE, "kernel bakes group={GROUP_SIZE}");
     assert!(
-        m % W4_BM == 0 && n % W4_BN == 0 && k % GROUP_SIZE == 0,
+        m.is_multiple_of(W4_BM) && n.is_multiple_of(W4_BN) && k.is_multiple_of(GROUP_SIZE),
         "gemm_nt_w4a16 requires M%{W4_BM}==0, N%{W4_BN}==0, K%{GROUP_SIZE}==0"
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -5144,7 +5181,7 @@ pub fn gemm_nt_w4a16_splitk(
     );
     assert!(sk >= 1, "split count must be >= 1");
     assert!(
-        m % W4_BM == 0 && n % W4_BN == 0 && k % (sk * GROUP_SIZE) == 0,
+        m.is_multiple_of(W4_BM) && n.is_multiple_of(W4_BN) && k.is_multiple_of(sk * GROUP_SIZE),
         "gemm_nt_w4a16_splitk requires M%{W4_BM}==0, N%{W4_BN}==0, K%(sk*{GROUP_SIZE})==0"
     );
     let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
@@ -5220,7 +5257,7 @@ pub fn gemm_nt_w4a16_static(
     assert_eq!(qw.k, k, "weight K mismatch");
     assert_eq!(qw.group, GROUP_SIZE, "kernel bakes group={GROUP_SIZE}");
     assert!(
-        m % W4_BM == 0 && n % W4_BN == 0 && k % GROUP_SIZE == 0,
+        m.is_multiple_of(W4_BM) && n.is_multiple_of(W4_BN) && k.is_multiple_of(GROUP_SIZE),
         "gemm_nt_w4a16_static requires M%{W4_BM}==0, N%{W4_BN}==0, K%{GROUP_SIZE}==0"
     );
     let zero_point = qw.zeros.is_some();
@@ -5523,7 +5560,7 @@ pub fn gemm_nt_fp8_pipe(
     // 4096³. When 128∤M (but 64∣M) the 128-row tile is illegal, so fall back to the 64×128 `_m64` entry.
     // All three share N%128==0, K%64==0 and an identical k=0,32,… accumulation order ⇒ bit-identical ⇒
     // the same E4M3 tolerance gate. (k≥96 keeps the 3-stage pipeline full; below that use the 2-stage.)
-    let w64ok = m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0;
+    let w64ok = m.is_multiple_of(FP8_PIPE_BM) && n.is_multiple_of(FP8_PIPE_BN);
     let (bm, threads, key, ptx, entry): (usize, usize, &str, &str, &str) =
         if w64ok && m <= 2048 && n <= 2048 && k >= 96 {
             (
@@ -5551,7 +5588,7 @@ pub fn gemm_nt_fp8_pipe(
             )
         };
     assert!(
-        m % bm == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0,
+        m.is_multiple_of(bm) && n.is_multiple_of(FP8_PIPE_BN) && k.is_multiple_of(FP8_PIPE_BK),
         "fp8_gemm_pipe requires M%{bm}==0, N%{FP8_PIPE_BN}==0, K%{FP8_PIPE_BK}==0"
     );
     let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
@@ -5608,7 +5645,7 @@ pub fn gemm_nt_fp8_deep(
     assert_eq!(a.len(), m * k, "A must be m×k");
     assert_eq!(b.len(), n * k, "B must be n×k (A·Bᵀ)");
     assert!(
-        m % v.bm == 0 && n % v.bn == 0 && k % v.bk == 0,
+        m.is_multiple_of(v.bm) && n.is_multiple_of(v.bn) && k.is_multiple_of(v.bk),
         "{} requires M%{}==0, N%{}==0, K%{}==0",
         v.name,
         v.bm,
@@ -5676,7 +5713,9 @@ fn gemm_nt_fp8_pipe_fused_bias(
     assert_eq!(b.len(), n * k);
     assert_eq!(bias.len(), n, "bias must have length N");
     assert!(
-        m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0,
+        m.is_multiple_of(FP8_PIPE_BM)
+            && n.is_multiple_of(FP8_PIPE_BN)
+            && k.is_multiple_of(FP8_PIPE_BK),
         "{entry} requires M%{FP8_PIPE_BM}==0, N%{FP8_PIPE_BN}==0, K%{FP8_PIPE_BK}==0"
     );
     let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
@@ -5774,7 +5813,7 @@ pub fn gemm_nt_fp8_mma_bias_residual(
     assert_eq!(bias.len(), n, "bias must have length N");
     assert_eq!(residual.len(), m * n, "residual must have length M·N");
     assert!(
-        m % FP8_PIPE_BM == 0 && n % FP8_PIPE_BN == 0 && k % FP8_PIPE_BK == 0,
+        m.is_multiple_of(FP8_PIPE_BM) && n.is_multiple_of(FP8_PIPE_BN) && k.is_multiple_of(FP8_PIPE_BK),
         "fp8_gemm_pipe_bias_residual requires M%{FP8_PIPE_BM}==0, N%{FP8_PIPE_BN}==0, K%{FP8_PIPE_BK}==0"
     );
     let a8: Vec<u8> = a.iter().map(|&x| f32_to_e4m3(x)).collect();
@@ -5832,7 +5871,7 @@ fn gemm_nt_fp8_gate(
     assert_eq!(wg.len(), n * k);
     assert_eq!(wu.len(), n * k);
     assert!(
-        m % 128 == 0 && n % 64 == 0 && k % 64 == 0,
+        m.is_multiple_of(128) && n.is_multiple_of(64) && k.is_multiple_of(64),
         "{entry} requires M%128==0, N%64==0, K%64==0"
     );
     let x8: Vec<u8> = x.iter().map(|&v| f32_to_e4m3(v)).collect();
@@ -5943,11 +5982,11 @@ pub fn gemm_nt_int8(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % 16 == 0 && n % 8 == 0 && k % 32 == 0,
+        m.is_multiple_of(16) && n.is_multiple_of(8) && k.is_multiple_of(32),
         "int8 GEMM needs M%16==0, N%8==0, K%32==0"
     );
     use crate::ptx_int8::{INT8_TM, INT8_TN};
-    let (f, cfg) = if m % (16 * INT8_TM) == 0 && n % (8 * INT8_TN) == 0 {
+    let (f, cfg) = if m.is_multiple_of(16 * INT8_TM) && n.is_multiple_of(8 * INT8_TN) {
         (
             g.function(
                 "int8_gemm_mt",
@@ -6023,7 +6062,7 @@ pub fn gemm_nt_int8_smdb(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        m % INT8_BM == 0 && n % INT8_BN == 0 && k % INT8_BK == 0,
+        m.is_multiple_of(INT8_BM) && n.is_multiple_of(INT8_BN) && k.is_multiple_of(INT8_BK),
         "int8 smdb GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%{INT8_BK}==0"
     );
     // The `ldmatrix` + XOR-swizzle (conflict-free SMEM, BK=64) path is the default whenever K%64==0; a K
@@ -6035,9 +6074,17 @@ pub fn gemm_nt_int8_smdb(
     //     small). Bigger CTA tiles (256×128) *lose* on the 20-SM 4050 (1 CTA/SM starves latency hiding).
     // (The fixed heuristic is refined per shape by the Phase-10 autotuner, which also searches w64+raster /
     // split-K.) Non-swz large shapes keep the hand-placed 128 tile; everything else the hand-placed 64.
-    let swz = k % 64 == 0;
-    let use_w64 = swz && m >= 2048 && n >= 2048 && m % INT8_W64_BM == 0 && n % INT8_W64_BN == 0;
-    let use_128_hand = !swz && m >= 4096 && n >= 4096 && m % INT8_BM128 == 0 && n % INT8_BN128 == 0;
+    let swz = k.is_multiple_of(64);
+    let use_w64 = swz
+        && m >= 2048
+        && n >= 2048
+        && m.is_multiple_of(INT8_W64_BM)
+        && n.is_multiple_of(INT8_W64_BN);
+    let use_128_hand = !swz
+        && m >= 4096
+        && n >= 4096
+        && m.is_multiple_of(INT8_BM128)
+        && n.is_multiple_of(INT8_BN128);
     let (ptx, entry, bm, bn, warps): (&'static str, &'static str, usize, usize, usize) = if use_w64
     {
         (
@@ -6111,18 +6158,19 @@ pub fn gemm_nt_int8_static(
     assert_eq!(a.len(), m * k);
     assert_eq!(b.len(), n * k);
     assert!(
-        k % 64 == 0,
+        k.is_multiple_of(64),
         "gemm_nt_int8_static requires K%64==0 (the swz BK)"
     );
     // Same regime rule as the dynamic swz dispatch: the 128×128 tile once reuse-bound (≥4096²), else 64×64.
-    let use_128 = m >= 4096 && n >= 4096 && m % INT8_BM128 == 0 && n % INT8_BN128 == 0;
+    let use_128 =
+        m >= 4096 && n >= 4096 && m.is_multiple_of(INT8_BM128) && n.is_multiple_of(INT8_BN128);
     let (bm, bn, warps) = if use_128 {
         (INT8_BM128, INT8_BN128, INT8_WARPS_M128 * INT8_WARPS_N128)
     } else {
         (INT8_BM, INT8_BN, INT8_WARPS_M * INT8_WARPS_N)
     };
     assert!(
-        m % bm == 0 && n % bn == 0,
+        m.is_multiple_of(bm) && n.is_multiple_of(bn),
         "gemm_nt_int8_static requires M%{bm}==0, N%{bn}==0"
     );
     let ptx = crate::ptx_int8::int8_gemm_smdb_swz_static_ptx(m, n, k, use_128);
@@ -6167,7 +6215,7 @@ pub fn gemm_nt_int8_splitk(
     assert_eq!(b.len(), n * k);
     assert!(sk >= 1, "split-K count must be >= 1");
     assert!(
-        m % INT8_BM == 0 && n % INT8_BN == 0 && k % (sk * 64) == 0,
+        m.is_multiple_of(INT8_BM) && n.is_multiple_of(INT8_BN) && k.is_multiple_of(sk * 64),
         "int8 split-K GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%(sk*64)==0"
     );
     let f = g.function(
@@ -6214,15 +6262,19 @@ pub fn gemm_nt_int8_smdb_dequant(
     assert_eq!(b.len(), n * k);
     assert_eq!(scale.len(), n, "per-channel scale must be length N");
     assert!(
-        m % INT8_BM == 0 && n % INT8_BN == 0 && k % INT8_BK == 0,
+        m.is_multiple_of(INT8_BM) && n.is_multiple_of(INT8_BN) && k.is_multiple_of(INT8_BK),
         "int8 smdb-dequant GEMM needs M%{INT8_BM}==0, N%{INT8_BN}==0, K%{INT8_BK}==0"
     );
     // Mirror the plain-GEMM dispatch (`gemm_nt_int8_smdb`), carrying the fused `f32(acc)·scale[j]` store
     // onto each tile: the **w64** tile (64×64 warp tile) for large M,N, the 64×64 swz tile below, the
     // hand-placed BK=32 deq when K isn't a 64-multiple. All fold the identical dequant ⇒ result unchanged,
     // purely throughput — so the fused inference output stage rides the fastest int8 base it can.
-    let swz = k % 64 == 0;
-    let use_w64 = swz && m >= 2048 && n >= 2048 && m % INT8_W64_BM == 0 && n % INT8_W64_BN == 0;
+    let swz = k.is_multiple_of(64);
+    let use_w64 = swz
+        && m >= 2048
+        && n >= 2048
+        && m.is_multiple_of(INT8_W64_BM)
+        && n.is_multiple_of(INT8_W64_BN);
     let (ptx, entry, bm, bn, warps): (&'static str, &'static str, usize, usize, usize) = if use_w64
     {
         (
@@ -6286,7 +6338,7 @@ pub fn gemm_nt_fp8_bwd(
     assert_eq!(dy.len(), m * k);
     assert_eq!(w.len(), n * k);
     assert!(
-        m % (16 * FP8_TM) == 0 && n % (8 * FP8_TN) == 0 && k % 32 == 0,
+        m.is_multiple_of(16 * FP8_TM) && n.is_multiple_of(8 * FP8_TN) && k.is_multiple_of(32),
         "fp8 backward GEMM needs M%{}==0, N%{}==0, K%32==0",
         16 * FP8_TM,
         8 * FP8_TN
@@ -6369,7 +6421,7 @@ pub fn quantize_scaled_fp8(
     g.require_fp8("quantize_scaled_fp8")?;
     let n = x.len();
     assert!(
-        n % 2 == 0,
+        n.is_multiple_of(2),
         "device fp8 quantize needs an even element count"
     );
     if n == 0 {
@@ -7631,9 +7683,11 @@ mod tests {
         const THREADS: u32 = 256;
         let slots = WANT / 4; // u32 slots in the window
                               // `.extern .shared` = the dynamic window; its size comes from the launch, not the declaration.
-        let body = format!(
-            ".extern .shared .align 16 .b8 dsmem[];\n\
-.visible .entry dyn_smem_probe(.param .u32 pn, .param .u64 pout)\n{{\n\
+                              // A plain `&str`, not a `format!`: there is nothing to interpolate, and the
+                              // literal braces below would then need `{{`/`}}` doubling, which is exactly
+                              // the kind of hand-escaping that puts a stray brace into emitted PTX.
+        let body = ".extern .shared .align 16 .b8 dsmem[];\n\
+.visible .entry dyn_smem_probe(.param .u32 pn, .param .u64 pout)\n{\n\
     .reg .pred %p0;\n\
     .reg .b32 %n,%tix,%nt,%i,%v,%sp,%ad;\n\
     .reg .b64 %out,%off,%gp;\n\
@@ -7651,8 +7705,7 @@ E_FILL:\n\
     sub.u32 %i,%n,1;\n    sub.u32 %i,%i,%tix;\n\
     shl.b32 %ad,%i,2;\n    add.u32 %ad,%ad,%sp;\n    ld.shared.u32 %v,[%ad];\n\
     mul.wide.u32 %off,%tix,4;\n    add.s64 %gp,%out,%off;\n    st.global.u32 [%gp],%v;\n\
-    ret;\n}}\n"
-        );
+    ret;\n}\n";
         let ptx = format!("{}{}", crate::ptx_target::HDR_SM80, body);
         assert!(
             ptx.is_ascii(),
@@ -15214,6 +15267,7 @@ E_FILL:\n\
     ///   * `K = (stages-1)*bk` — the prologue exactly fills the ring; the main loop never prefetches.
     ///   * `K = stages*bk` — the first ring **wrap** (the add+wrap cursor's first lap).
     ///   * `K = (stages+2)*bk` — several wraps, so a cursor drifting one tile per lap is caught.
+    ///
     /// Each K runs at a different rectangular CTA grid, so multi-CTA tile ownership is covered too.
     ///
     /// Occupancy is *printed*, not asserted: it is a device fact (`cuOccupancyMaxActiveBlocksPerMultiprocessor`)
@@ -16620,7 +16674,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         v.smem_bytes() / 1024,
                         v.threads() / 32,
                     );
-                    if best.map_or(true, |(_, p)| pct > p) {
+                    if best.is_none_or(|(_, p)| pct > p) {
                         best = Some((v.name, pct));
                     }
                 }
@@ -17259,7 +17313,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             for _ in 0..40 {
                 let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
             }
-            let mut rng = crate::diff::Rng::new(0xC11FF_AB);
+            let mut rng = crate::diff::Rng::new(0x0C11_FFAB);
             for sz in [2048usize, 4096] {
                 let (m, k, n) = (sz, sz, sz);
                 let flop = gemm_flop(m, n, k);
@@ -17466,7 +17520,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             for _ in 0..40 {
                 let _ = time_cublas_gemm_nt_f16(g, 2048, 2048, 2048, 20);
             }
-            let mut rng = crate::diff::Rng::new(0xC11FF_A5);
+            let mut rng = crate::diff::Rng::new(0x0C11_FFA5);
             for sz in [2048usize, 4096] {
                 let (m, k, n) = (sz, sz, sz);
                 let flop = gemm_flop(m, n, k);
@@ -17541,6 +17595,531 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 }
             }
         });
+    }
+
+    /// One entry's `ptxas -v` report: what the compiler actually allocated, not what we derived.
+    #[derive(Default, Clone)]
+    struct PtxasFacts {
+        regs: usize,
+        spill_st: usize,
+        spill_ld: usize,
+        stack: usize,
+        smem: usize,
+        barriers: usize,
+    }
+
+    /// Pull the integer out of a `ptxas -v` clause like `"168 registers"` / `"0 bytes spill stores"`.
+    fn ptxas_clause_int(clause: &str) -> Option<usize> {
+        clause
+            .split_whitespace()
+            .find_map(|w| w.trim_end_matches(',').parse::<usize>().ok())
+    }
+
+    /// Fold one comma-separated `ptxas -v` clause list into `facts`. Both info lines this parser cares
+    /// about have the same shape (`N unit, N unit, ..`), so one scanner covers the stack/spill line and
+    /// the `Used ..` line, and a ptxas that adds a clause is simply ignored rather than mis-parsed.
+    fn ptxas_absorb(facts: &mut PtxasFacts, line: &str) {
+        for clause in line.split(',') {
+            let c = clause.trim();
+            let Some(n) = ptxas_clause_int(c) else {
+                continue;
+            };
+            if c.contains("spill stores") {
+                facts.spill_st = n;
+            } else if c.contains("spill loads") {
+                facts.spill_ld = n;
+            } else if c.contains("stack frame") {
+                facts.stack = n;
+            } else if c.contains("registers") {
+                facts.regs = n;
+            } else if c.contains("barriers") {
+                facts.barriers = n;
+            } else if c.contains("bytes smem") {
+                facts.smem = n;
+            }
+        }
+    }
+
+    /// Parse a whole `ptxas -v` stderr into `(entry name, facts)`.
+    ///
+    /// The state machine is deliberately strict about attribution: stack/spill numbers are absorbed
+    /// only while the innermost `Function properties for X` block names the entry currently being
+    /// compiled, so a non-inlined `.func`'s frame can never be reported as an entry's. An entry is
+    /// finalized on its `Used .. registers` line, which ptxas always emits last for that entry.
+    fn parse_ptxas_verbose(stderr: &str) -> Vec<(String, PtxasFacts)> {
+        let mut out: Vec<(String, PtxasFacts)> = Vec::new();
+        let mut cur: Option<(String, PtxasFacts)> = None;
+        let mut props_for = String::new();
+        for line in stderr.lines() {
+            if let Some(i) = line.find("Compiling entry function '") {
+                let rest = &line[i + "Compiling entry function '".len()..];
+                if let Some(j) = rest.find('\'') {
+                    cur = Some((rest[..j].to_string(), PtxasFacts::default()));
+                    props_for.clear();
+                }
+                continue;
+            }
+            if let Some(i) = line.find("Function properties for ") {
+                props_for = line[i + "Function properties for ".len()..]
+                    .trim()
+                    .to_string();
+                continue;
+            }
+            let Some((name, facts)) = cur.as_mut() else {
+                continue;
+            };
+            if line.contains("spill stores") && props_for == *name {
+                ptxas_absorb(facts, line);
+            } else if line.contains("Used ") && line.contains("registers") {
+                ptxas_absorb(facts, line);
+                out.push(cur.take().unwrap());
+                props_for.clear();
+            }
+        }
+        out
+    }
+
+    /// **THE REGISTER BUDGET, MEASURED — the one number in this campaign nothing else can supply.**
+    ///
+    /// Every register figure the datacenter retarget reasons about is *derived*: counted off the
+    /// generators' `.reg` declarations and the accumulator arithmetic (`tm·tn·4` per thread,
+    /// `regs_after_split` for the warp-specialised rows). A derived register count is a prediction
+    /// about ptxas, and D1 §2.3 names the kill condition it predicts — **if ptxas spills at 128
+    /// accumulators per thread the widest CTA tile collapses and the whole Act-1 tile strategy
+    /// changes.** The risk is not hypothetical: building CUTLASS emitted, for *NVIDIA's own* kernels at
+    /// 256x128x64 and 256x256x64 warp-specialised pingpong, `ptxas info : (C7511) Potential
+    /// Performance Loss: wgmma.mma_async instructions are serialized due to insufficient register
+    /// resources for the wgmma pipeline`. If it happens to them it can happen here.
+    ///
+    /// So this compiles the whole tile lattice with a real `ptxas -v` and prints, per kernel, the
+    /// registers/thread, spill stores, spill loads, stack frame and static SMEM that were actually
+    /// allocated — then **fails** (never warns) on any spill or any C7511, with the numbers in the
+    /// message. The corpus is every row of `PIPE_DEEP_VARIANTS` and `PIPE_WIDE_VARIANTS` (one module,
+    /// many entries), every row of `FLASH_STAGE_VARIANTS` (one module each, hard rule 4), and every
+    /// `ptx_wgmma::WGMMA_VARIANTS` config. Coverage is asserted, not assumed: an expected entry that
+    /// ptxas never reported on is a failure, so a renamed row cannot silently drop out of the table.
+    ///
+    /// **No device is needed and none is used** — `ptxas` is a host cross-compiler, so the `sm_90a`
+    /// wgmma rows are checked here even though no Hopper part exists in this environment, and the
+    /// whole gate runs in a CPU-only container. It is deliberately *not* `#[ignore]`d: it is a gate,
+    /// and it skips cleanly (with a hint) when `WUKONG_PTXAS` is unset, which is the state of the
+    /// local box. `WUKONG_PTXAS_REQUIRED=1` (or the crate-wide `WUKONG_PEER_REQUIRED=1`) turns that
+    /// skip into a failure, so a runner that *should* have ptxas cannot report green having measured
+    /// nothing.
+    ///
+    /// Two readings of the table are traps. (1) For a warp-specialised entry ptxas reports the single
+    /// static allocation for the whole CTA; `setmaxnreg` redistributes it at run time between the
+    /// 32-register producer and the 232-register consumers, so `regs` there is not `consumer_regs` and
+    /// is not supposed to be. (2) `smem(ptxas)` counts only *static* `.shared`; a dynamic-window row
+    /// reports 0 and carries its bytes at launch, which is why `smem(gen)` — the generator's own
+    /// `smem_bytes()` — sits beside it.
+    ///
+    /// `WUKONG_PTXAS=/path/to/ptxas cargo test -p wukong_codegen_gpu --features gpu -- --nocapture
+    /// ptxas_reports_the_register_and_spill_budget`
+    #[test]
+    fn ptxas_reports_the_register_and_spill_budget() {
+        // The smallest opt-in SMEM carveout among the parts this project targets (Ada, 99 KiB). It
+        // chooses WHICH flash rows are legal to generate, never WHAT they say: `flash_stage_ptx`'s
+        // contract is that a larger budget yields byte-identical text.
+        const SMEM_BUDGET: usize = 101_376;
+        // 32-bit registers per SM. 65536 on sm_80, sm_89 and sm_90 alike, so one constant covers the
+        // whole corpus; the derived CTAs/SM below is a register-only upper bound, not a prediction.
+        const REGS_PER_SM: usize = 65_536;
+
+        // The corpus is built BEFORE the ptxas lookup, deliberately. Generation is pure host string
+        // work, so on a box with no ptxas (this one) the gate still proves the whole lattice generates
+        // and declares a `.target` -- the failure that would otherwise wait to surprise a metered
+        // cloud run. Only the measurement itself needs the tool.
+        // ---- the corpus: (family, module label, PTX, expected entries) ----------------------------
+        // `derived` is the config's own per-thread register budget where it has one (only the
+        // warp-specialised wgmma rows do); `-` elsewhere, because inventing one would be the exact
+        // derived-not-measured claim this gate exists to replace.
+        struct Row {
+            family: &'static str,
+            entry: String,
+            threads: usize,
+            smem_gen: usize,
+            derived: Option<String>,
+        }
+        struct Module {
+            label: String,
+            ptx: String,
+            rows: Vec<Row>,
+        }
+        let mut modules: Vec<Module> = Vec::new();
+
+        // 1. The f16 mma.sync depth x CTA-tile lattice. One module, one entry per row -- exactly what
+        //    `gemm_nt_f16_deep` loads, so what ptxas sees here is what the driver JIT sees there.
+        modules.push(Module {
+            label: "ptx_wmma::gemm_deep_ptx".to_string(),
+            ptx: crate::ptx_wmma::gemm_deep_ptx().to_string(),
+            rows: crate::ptx_wmma::PIPE_DEEP_VARIANTS
+                .iter()
+                .chain(crate::ptx_wmma::PIPE_WIDE_VARIANTS)
+                .map(|v| Row {
+                    family: "wmma-deep/wide",
+                    entry: v.name.to_string(),
+                    threads: v.threads(),
+                    smem_gen: v.smem_bytes(),
+                    derived: None,
+                })
+                .collect(),
+        });
+        // 2. The flash depth x staging-width grid -- one module per row (hard rule 4: one key, one
+        //    entry, one module), so each is compiled on its own exactly as it is loaded.
+        for v in crate::ptx_flash::FLASH_STAGE_VARIANTS {
+            let (ptx, _mode) = crate::ptx_flash::flash_stage_ptx(v, SMEM_BUDGET);
+            modules.push(Module {
+                label: format!("ptx_flash::{}", v.name),
+                ptx,
+                rows: vec![Row {
+                    family: "flash-stage",
+                    entry: v.name.to_string(),
+                    threads: v.threads() as usize,
+                    smem_gen: v.smem_bytes(),
+                    derived: None,
+                }],
+            });
+        }
+        // 3. The Hopper wgmma configs. `sm_90a` cannot be JITed, emulated or run anywhere in this
+        //    environment -- but ptxas is a cross-compiler, so this is the only pre-H100 measurement of
+        //    them that exists, and C7511 is precisely the answer it can give.
+        {
+            let license = crate::ptx_wgmma::Sm90aLicense::for_probed_cc((9, 0))
+                .expect("(9, 0) is Hopper, so the license is unconditional here");
+            for c in crate::ptx_wgmma::WGMMA_VARIANTS {
+                let ptx = crate::ptx_wgmma::wgmma_module(c, &license).unwrap_or_else(|e| {
+                    panic!("shipped wgmma variant {} must generate: {e}", c.name)
+                });
+                modules.push(Module {
+                    label: format!("ptx_wgmma::{}", c.name),
+                    ptx,
+                    rows: vec![Row {
+                        family: "wgmma",
+                        entry: c.name.to_string(),
+                        threads: c.threads(),
+                        smem_gen: c.smem_bytes(),
+                        derived: Some(format!("{}p/{}c", c.producer_regs, c.consumer_regs)),
+                    }],
+                });
+            }
+        }
+
+        // Device-free half of the gate, and the half that actually runs on this box. Two properties,
+        // both checkable with no tool at all:
+        //
+        //   1. every module names the floor it is legal at, because the measurement below compiles at
+        //      that floor and nothing else; and
+        //   2. every row this table claims to cover is REALLY an entry of the module it was filed
+        //      under.
+        //
+        // (2) is the one that earns its keep. The `ptxas never reported on entry X` failure below is
+        // the same defect — a renamed row, or a table row that quietly stopped being emitted into the
+        // module — but it can only fire where ptxas exists, which here is nowhere and in the cloud is
+        // a metered minute. Discovering a stale table by spending money to compile 17 modules and
+        // *then* being told the name is wrong is the expensive way to learn it. Matching the declared
+        // entry text is free and catches it in a plain `cargo test`.
+        for m in &modules {
+            assert!(
+                m.ptx
+                    .lines()
+                    .any(|l| l.trim().starts_with(".target ") && l.trim().len() > ".target ".len()),
+                "{}: module declares no `.target`, so there is no arch to measure it at",
+                m.label
+            );
+            for r in &m.rows {
+                // Anchored on the full `.visible .entry <name>(` prefix, not a substring search: a
+                // bare `contains(name)` would be satisfied by a longer entry that merely starts with
+                // this one's name (`deep_swz_128_s2` inside `deep_swz_128_s2_bias`), which is exactly
+                // the confusion a rename introduces.
+                let decl = format!(".visible .entry {}(", r.entry);
+                assert!(
+                    m.ptx.contains(&decl),
+                    "{}: this table files `{}` under that module, but the module declares no \
+                     `{decl}` -- the row was renamed, or it is no longer emitted here. ptxas would \
+                     have reported this too, and charged for the round trip.",
+                    m.label,
+                    r.entry
+                );
+            }
+        }
+
+        let ptxas = match std::env::var("WUKONG_PTXAS") {
+            Ok(p) if std::path::Path::new(&p).exists() => p,
+            _ => {
+                assert!(
+                    std::env::var_os("WUKONG_PTXAS_REQUIRED").is_none()
+                        && std::env::var_os("WUKONG_PEER_REQUIRED").is_none(),
+                    "ptxas_reports_the_register_and_spill_budget: WUKONG_PTXAS_REQUIRED (or \
+                     WUKONG_PEER_REQUIRED) is set, but WUKONG_PTXAS does not name an existing file. \
+                     This gate would have reported ok having measured NOTHING."
+                );
+                eprintln!(
+                    "[skip] ptxas_reports_the_register_and_spill_budget: {} modules generated and \
+                     floor-checked, 0 measured -- set WUKONG_PTXAS to a standalone ptxas \
+                     (`pip install nvidia-cuda-nvcc-cu12` -> nvidia/cuda_nvcc/bin/ptxas[.exe]); no \
+                     GPU is required. WUKONG_PTXAS_REQUIRED=1 turns this skip into a failure.",
+                    modules.len()
+                );
+                return;
+            }
+        };
+
+        // ---- compile each module and collect what ptxas allocated ---------------------------------
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        // Provenance: which ptxas produced these numbers. Folded to one line through `lines()` rather
+        // than a `\n` replace, so a CRLF host does not leave carriage returns mid-line in the log.
+        let ver = std::process::Command::new(&ptxas)
+            .arg("--version")
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .unwrap_or_else(|e| format!("<--version failed: {e}>"));
+        eprintln!("\nptxas register / spill / SMEM report\n  ptxas: {ptxas}\n  {ver}");
+
+        // Every failure is collected, printed in the table, and asserted at the end: an operator who
+        // ran this to learn the budget of 30 kernels must not lose 29 answers to the first bad one.
+        let mut failures: Vec<String> = Vec::new();
+        let mut table: Vec<String> = Vec::new();
+        let mut c7511: Vec<String> = Vec::new();
+        for (i, m) in modules.iter().enumerate() {
+            // The arch comes out of the module's OWN `.target` line, never from a literal or a probe:
+            // that line is the floor `ptx_target` chose for this instruction mix, and compiling at any
+            // other arch would measure a kernel nobody ships.
+            let arch = match m
+                .ptx
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(".target "))
+            {
+                Some(a) => a.trim().to_string(),
+                None => {
+                    failures.push(format!("{}: module declares no `.target`", m.label));
+                    continue;
+                }
+            };
+            let ptx_path = dir.join(format!("wukong_ptxas_{pid}_{i}.ptx"));
+            let cubin_path = dir.join(format!("wukong_ptxas_{pid}_{i}.cubin"));
+            std::fs::write(&ptx_path, &m.ptx).expect("write ptx");
+            let out = std::process::Command::new(&ptxas)
+                .arg(format!("-arch={arch}"))
+                .arg("-O3")
+                .arg("-v")
+                .arg("-o")
+                .arg(&cubin_path)
+                .arg(&ptx_path)
+                .output();
+            let out = match out {
+                Ok(o) => o,
+                Err(e) => {
+                    failures.push(format!("{}: could not spawn ptxas: {e}", m.label));
+                    continue;
+                }
+            };
+            let err = String::from_utf8_lossy(&out.stderr).to_string();
+            if !out.status.success() {
+                failures.push(format!(
+                    "{} ({arch}): ptxas exit {:?}\n{}",
+                    m.label,
+                    out.status.code(),
+                    err.trim()
+                ));
+                continue;
+            }
+            for l in err.lines() {
+                // The parentheses are load-bearing and NOT cosmetic. `"(C7511)"` is how ptxas
+                // actually spells it, and a bare `"C7511"` literal is indistinguishable from a
+                // Wukong `Cnnnn` diagnostic code to `wukong_diag`'s **textual** catalogue-coverage
+                // scan (`codes_in` matches a quote immediately followed by C + 4 digits + a quote),
+                // which then fails `every_emitted_code_is_catalogued` in a crate that has nothing to
+                // do with GPUs. This crate owns no diagnostic codes; C7511 is NVIDIA's.
+                if l.contains("(C7511)") || l.contains("instructions are serialized") {
+                    c7511.push(format!("{}: {}", m.label, l.trim()));
+                }
+            }
+            let measured = parse_ptxas_verbose(&err);
+            for r in &m.rows {
+                let Some((_, f)) = measured.iter().find(|(n, _)| *n == r.entry) else {
+                    failures.push(format!(
+                        "{} ({arch}): ptxas never reported on entry `{}` -- either the row was \
+                         renamed and this table is stale, or the `-v` output shape changed. Raw \
+                         ptxas output:\n{}",
+                        m.label,
+                        r.entry,
+                        err.trim()
+                    ));
+                    continue;
+                };
+                let per_cta = f.regs * r.threads;
+                // 0 only if ptxas reported 0 registers, which would mean the parse drifted rather
+                // than that the kernel is free; report it as 0 CTAs/SM instead of dividing by zero.
+                let ctas = REGS_PER_SM.checked_div(per_cta).unwrap_or(0);
+                table.push(format!(
+                    "  {:<15} {:<28} {:<8} {:>5} {:>9} {:>9} {:>6} {:>12} {:>10} {:>8} {:>13} {:>9}",
+                    r.family,
+                    r.entry,
+                    arch,
+                    f.regs,
+                    f.spill_st,
+                    f.spill_ld,
+                    f.stack,
+                    f.smem,
+                    r.smem_gen,
+                    r.threads,
+                    ctas,
+                    r.derived.as_deref().unwrap_or("-"),
+                ));
+                if f.spill_st > 0 || f.spill_ld > 0 || f.stack > 0 {
+                    failures.push(format!(
+                        "SPILL: {} `{}` at {arch} used {} regs/thread and spilled {} bytes of stores \
+                         / {} bytes of loads with a {}-byte stack frame ({} threads/CTA, {} regs/CTA, \
+                         {} CTAs/SM by registers alone). D1 2.3: a spill at this tile is the kill \
+                         condition for the tile strategy, not a slowdown to tune away.",
+                        r.family,
+                        r.entry,
+                        f.regs,
+                        f.spill_st,
+                        f.spill_ld,
+                        f.stack,
+                        r.threads,
+                        per_cta,
+                        ctas
+                    ));
+                }
+            }
+            let _ = std::fs::remove_file(&ptx_path);
+            let _ = std::fs::remove_file(&cubin_path);
+        }
+
+        eprintln!(
+            "  {:<15} {:<28} {:<8} {:>5} {:>9} {:>9} {:>6} {:>12} {:>10} {:>8} {:>13} {:>9}",
+            "family",
+            "entry",
+            "arch",
+            "regs",
+            "spill_st",
+            "spill_ld",
+            "stack",
+            "smem(ptxas)",
+            "smem(gen)",
+            "thr/CTA",
+            "CTAs/SM(reg)",
+            "derived"
+        );
+        for l in &table {
+            eprintln!("{l}");
+        }
+        eprintln!(
+            "  ({} kernels measured; smem(ptxas) counts STATIC .shared only -- a dynamic-window row \
+             reports 0 and carries smem(gen) at launch; for a warp-specialised entry `regs` is the \
+             whole-CTA static allocation that `setmaxnreg` then redistributes)",
+            table.len()
+        );
+        for w in &c7511 {
+            eprintln!("  !! {w}");
+        }
+
+        assert!(
+            c7511.is_empty(),
+            "ptxas reports the wgmma pipeline serializing for want of registers -- the exact \
+             (C7511) diagnostic CUTLASS's own 256x128x64 and 256x256x64 pingpong kernels emit. The \
+             tile is legal but the pipeline it was chosen for does not exist at this register \
+             budget:\n{}",
+            c7511.join("\n")
+        );
+        assert!(
+            failures.is_empty(),
+            "{} kernel(s) failed the ptxas register/spill budget:\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+        assert_eq!(
+            table.len(),
+            crate::ptx_wmma::PIPE_DEEP_VARIANTS.len()
+                + crate::ptx_wmma::PIPE_WIDE_VARIANTS.len()
+                + crate::ptx_flash::FLASH_STAGE_VARIANTS.len()
+                + crate::ptx_wgmma::WGMMA_VARIANTS.len(),
+            "every row of every table must appear in the report, or the gate is measuring a subset \
+             and calling it the lattice"
+        );
+    }
+
+    /// **The `ptxas -v` parser, gated with no `ptxas` in the room.**
+    ///
+    /// [`ptxas_reports_the_register_and_spill_budget`] can only measure where the tool exists, which
+    /// on this box is nowhere and in the cloud is a metered minute. A parser that silently reads every
+    /// spill as 0 would make that run report a clean lattice having understood nothing — a green
+    /// answer to a question never asked, which is the failure this crate's rule 3 is about. So the
+    /// state machine is pinned here, against captured real `ptxas -v` text, in a plain `cargo test`.
+    ///
+    /// The sample exercises exactly the four ways it can go wrong: a **non-inlined `.func`**'s
+    /// properties block printed *before* any entry (must not be attributed to one), a **second** func
+    /// properties block naming a helper *between* an entry's header and its own block (must not
+    /// overwrite the entry's frame), an entry that **does** spill (must be read, not zeroed), and the
+    /// two `Used ..` spellings — with and without the `used N barriers` clause that newer ptxas adds.
+    #[test]
+    fn the_ptxas_verbose_parser_reads_spills_and_registers() {
+        // Captured shape of `ptxas -O3 -v`: leading gmem line, an out-of-line device function, then
+        // two entries. Indentation and the `ptxas info    :` column are ptxas's own.
+        let sample = "\
+ptxas info    : 0 bytes gmem
+ptxas info    : Function properties for helper_noinline
+    64 bytes stack frame, 128 bytes spill stores, 96 bytes spill loads
+ptxas info    : Used 40 registers, 0 bytes cmem[0]
+ptxas info    : Compiling entry function 'deep_swz_128_s2' for 'sm_80'
+ptxas info    : Function properties for helper_noinline
+    64 bytes stack frame, 128 bytes spill stores, 96 bytes spill loads
+ptxas info    : Function properties for deep_swz_128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 0 barriers, 32768 bytes smem, 400 bytes cmem[0]
+ptxas info    : Compiling entry function 'wide_swz_256x128_s6_mc1' for 'sm_80'
+ptxas info    : Function properties for wide_swz_256x128_s6_mc1
+    24 bytes stack frame, 56 bytes spill stores, 48 bytes spill loads
+ptxas info    : Used 255 registers, 424 bytes cmem[0]
+";
+        let got = parse_ptxas_verbose(sample);
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["deep_swz_128_s2", "wide_swz_256x128_s6_mc1"],
+            "only `Compiling entry function` blocks are entries; a bare `.func` properties block is \
+             not one"
+        );
+
+        let (_, clean) = &got[0];
+        assert_eq!(
+            (clean.regs, clean.smem, clean.barriers),
+            (168, 32768, 0),
+            "the barriers clause must not shift the register or smem read"
+        );
+        assert_eq!(
+            (clean.spill_st, clean.spill_ld, clean.stack),
+            (0, 0, 0),
+            "the helper's 128/96-byte spill must NOT be attributed to the entry that follows it"
+        );
+
+        let (_, spilled) = &got[1];
+        assert_eq!(
+            (
+                spilled.regs,
+                spilled.spill_st,
+                spilled.spill_ld,
+                spilled.stack
+            ),
+            (255, 56, 48, 24),
+            "a real spill must be read verbatim -- reading it as 0 is how this gate would pass a \
+             kernel that collapsed"
+        );
+        assert_eq!(
+            spilled.smem, 0,
+            "an entry with no static .shared reports no smem clause, which is 0, not stale"
+        );
     }
 
     /// **M5/M6: register-resident flash vs two peers — Tier-A naive CUDA-C *and* the Tier-B cuBLAS
@@ -20861,7 +21440,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         pct,
                         g_cub / 1e9
                     );
-                    if best.map_or(true, |(_, p)| pct > p) {
+                    if best.is_none_or(|(_, p)| pct > p) {
                         best = Some((label, pct));
                     }
                 }
@@ -21071,7 +21650,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         gf / 1e9,
                         pct
                     );
-                    if best.map_or(true, |(_, p)| pct > p) {
+                    if best.is_none_or(|(_, p)| pct > p) {
                         best = Some((r, pct));
                     }
                 }
@@ -21249,7 +21828,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         pct,
                         gc / 1e9
                     );
-                    if best.as_ref().map_or(true, |(_, p)| pct > *p) {
+                    if best.as_ref().is_none_or(|(_, p)| pct > *p) {
                         best = Some((label.trim().to_string(), pct));
                     }
                 }
@@ -21385,7 +21964,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         pct,
                         gc / 1e9
                     );
-                    if best.as_ref().map_or(true, |(_, p)| pct > *p) {
+                    if best.as_ref().is_none_or(|(_, p)| pct > *p) {
                         best = Some((label.trim().to_string(), pct));
                     }
                 }
@@ -21490,6 +22069,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     ///   * `K = stages·64` — the first ring **wrap**. The 2-stage kernel toggles buffers by XOR, which
     ///     only cycles two; every deeper ring must use add+wrap, and mixing the two corrupts stage ≥ 3.
     ///   * `K = (stages+2)·64` — several wraps, so a cursor that drifts by one tile per lap is caught.
+    ///
     /// Each K is run at a different rectangular CTA grid so multi-CTA tile ownership is covered too.
     ///
     /// Occupancy is *printed*, not asserted: it is a device fact (`cuOccupancyMaxActiveBlocksPerMultiprocessor`)
@@ -21804,7 +22384,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         pct,
                         gc / 1e9
                     );
-                    if best.as_ref().map_or(true, |(_, p)| pct > *p) {
+                    if best.as_ref().is_none_or(|(_, p)| pct > *p) {
                         best = Some((label.trim().to_string(), pct));
                     }
                 }
@@ -22178,7 +22758,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         flop / s / 1e9,
                         pct
                     );
-                    if best.map_or(true, |(_, p)| pct > p) {
+                    if best.is_none_or(|(_, p)| pct > p) {
                         best = Some((key.trim(), pct));
                     }
                 }
@@ -24641,9 +25221,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
-    /// **Correctness gate (law #1) for the productionized D=128 flash dispatch.** [`wmma_flash_applies`]
-    /// + [`wmma_flash_entry`] + [`wmma_flash_cfg`] are the seam [`ResidentLayerF16`] uses to pick the
-    /// tensor-core flash; this asserts that at `D == 128` they select the `ldmatrix` kernel
+    /// **Correctness gate (law #1) for the productionized D=128 flash dispatch.** The seam
+    /// [`ResidentLayerF16`] uses to pick the tensor-core flash is [`wmma_flash_applies`] plus
+    /// [`wmma_flash_entry`] plus [`wmma_flash_cfg`]; this asserts that at `D == 128` they select the
+    /// `ldmatrix` kernel
     /// (`flash_d128_mp_lm`) with the grid `S/16` / one-warp-per-CTA / static-16 KB-SMEM config, and that
     /// launching exactly that `(name, cfg)` over f16 Q/K/V reproduces the f64 `ref_attn`. Also pins the
     /// D=64 dispatch to the unchanged `flash_d64_mp`. End-to-end gate for the dispatch wiring (the kernel
@@ -24659,7 +25240,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 "D=64 dispatch must not change"
             );
             let d = 128usize;
-            let mut rng = crate::diff::Rng::new(0x0D12_8A5);
+            let mut rng = crate::diff::Rng::new(0x00D1_28A5);
             let to16 = |x: &[f32]| -> Vec<f16> { x.iter().map(|&v| f16::from_f32(v)).collect() };
             let back = |x: &[f16]| -> Vec<f32> { x.iter().map(|&v| v.to_f32()).collect() };
             for &s in &[512usize, 1024] {

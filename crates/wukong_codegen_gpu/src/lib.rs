@@ -13,6 +13,39 @@
 //! runs kernels on the local device. **A plain `cargo test` therefore does not type-check most of this
 //! crate** — only a `--features gpu` build does, and `cargo check --features gpu --all-targets` is the
 //! cheap way to get that coverage without a device.
+//!
+//! # The three crate-level `allow`s below, and why each is a decision rather than a shrug
+//!
+//! CI lints this crate under `--features gpu` with `-D warnings` (`.github/workflows/ci.yml`, the
+//! `GPU clippy` step of the `gpu-check` job). Until that step existed the whole crate was invisible
+//! to clippy, and turning it on surfaced 363 warnings behind one deny-by-default *error*. Every one
+//! of them was either fixed or is covered by an entry here; nothing is silenced without an argument,
+//! because a blanket `allow` with no reason is how a lint surface goes dark a second time. Each of
+//! the three is a lint whose *suggested rewrite* is worse for this crate specifically — a PTX
+//! generator plus a set of f64 reference oracles, where the failure mode that matters is
+//! silently-wrong output, not a crash.
+
+// `for i in 0..n { .. s[i] .. }` -> `for x in s.iter().take(n)`. The rewrite is not equivalent when
+// `n` and `s.len()` are two independently derived facts, and in this crate they usually are: `n` comes
+// from a MIR vector width, a `KvConfig` slot count or a tile constant, while `s` was built somewhere
+// else. Indexing asserts the two agree and panics loudly when they do not; `.take(n)` silently
+// iterates `min(n, s.len())`. In `lower.rs`'s vectorized-op lowering that difference is one PTX kernel
+// that quietly computes fewer lanes than the MIR says — plausible-but-wrong PTX, the exact thing this
+// crate's `UNSUPPORTED:`-means-SKIP rule exists to prevent (`8a767e1`). In the f64 references it is an
+// oracle that checks a prefix and passes. A short loop has no gate anywhere; a panic has every gate.
+#![allow(clippy::needless_range_loop)]
+// Launch wrappers and PTX generators take 8-11 arguments because the kernel they front takes 8-11
+// `.param`s. Hard rule #2 of this crate is that the pushed argument list must match the kernel's
+// declared parameter count *derived from the same source* as the entry name — pushing short makes the
+// driver read adjacent host stack as a pointer (`ec16e23`, `45a379a`). A `struct` between the caller
+// and the `.param` list is one more place for the two to drift, and it hides the arity the reviewer
+// has to count. The flat list is the safety property, not an accident.
+#![allow(clippy::too_many_arguments)]
+// The flagged types are one-off local case tables in gates and benches -- `[(&'static str, &dyn
+// Fn(f32) -> f32, bool); 10]`, `HashMap<(usize, usize), (Vec<f32>, Vec<f32>, Vec<f32>)>` -- each used
+// exactly once, a few lines from its literal. A `type` alias for a table with one use moves the shape
+// away from the data and buys nothing.
+#![allow(clippy::type_complexity)]
 
 /// Whether this build has the GPU backend compiled in (`--features gpu`).
 pub const GPU_ENABLED: bool = cfg!(feature = "gpu");
@@ -172,5 +205,13 @@ pub mod paged_attention;
 /// the serving forward pass: projections + append-to-cache + paged attention + FFN, whole-stack
 /// GPU-resident, pooled/on-stream so a CUDA graph captures the whole decode step — plus the
 /// continuous-batching `Scheduler` (`Request` admission, eviction, `step_graphed`) that drives it.
+///
+/// It is also the **grouped-query (GQA)** surface every Llama-class model needs. The geometry itself
+/// is [`paged_kv::GqaConfig`] (defined there because it is cache geometry, not a serving policy);
+/// `DecodeLayer`/`DecodeModel` consume it through `new_gqa` / `new_gqa_with_dtype`, the grouped entry
+/// points, of which the four MHA constructors are the `q_heads == kv_heads` case. **The one shape a
+/// caller gets wrong**: under GQA the KV projections `Wk`/`Wv` are `[kv_dim, D]`, not `[D, D]`
+/// (`kv_dim = kv_heads · head_dim`), so a real grouped checkpoint's `Wk` is exactly `q_heads/kv_heads`
+/// times smaller than the query-headed `Wq` beside it.
 #[cfg(feature = "gpu")]
 pub mod serving;
