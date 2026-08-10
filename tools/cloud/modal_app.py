@@ -2978,7 +2978,7 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
         # The wgmma bring-up gate's exact invocation (ptx_wgmma::WGMMA_BRINGUP_INVOCATION)
         # is `--nocapture --test-threads=1 wgmma_hopper_bringup`: `--nocapture` is
         # mandatory because every verdict is PRINTED, not asserted — a passing run
-        # without it swallows the DescOrder answer the rented minutes exist to produce.
+        # without it swallows the descriptor-sweep table the rented minutes exist to produce.
         # A single bare test name still works exactly as before.
         extra = filter.split()
 
