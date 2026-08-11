@@ -180,3 +180,201 @@ Sources for section 1:
 [cuBLASLt notes (corsix)](https://www.corsix.org/content/cublaslt-notes),
 [CUTLASS epilogue fusion / EVT (Colfax)](https://research.colfax-intl.com/epilogue_visitor_tree/),
 [CUTLASS EVT reference](https://deepwiki.com/NVIDIA/cutlass/5.3-epilogue-fusion-and-activation-functions).
+
+---
+
+## 2. BREAK-EVEN ARITHMETIC
+
+### 2.0 The model, and the one identity everything follows from
+
+Write `T_p` for the peer's measured GEMM ms, `T_w` for ours, and `r = T_p / T_w` for our fraction of
+cuBLAS. The **unfused chain** the peer must run when it cannot fuse is: its GEMM (which already
+writes `C`), then a separate pointwise kernel that reads `C` and writes `D`. That kernel's traffic is
+
+```
+  read C (M*N*4) + write D (M*N*4)  =  8*M*N bytes        (f32 out, in place)
+```
+
+which is the plan's *"8*M*N bytes of chain traffic deleted"* (target #3). Call its time
+`E = 8*M*N / BW`. Then
+
+```
+  break-even fraction      r* = T_p / (T_p + E)
+  fused-vs-chain speedup   S  = (T_p + E) / T_w = r / r*
+```
+
+**`S = r / r*`.** The whole section is that ratio. It also means the *shape* of a fusion win is
+entirely determined by how memory-bound the output is relative to the GEMM's own FLOPs -- a short-K
+GEMM with a full-size C is the best fusion target and a big cube is the worst.
+
+**Two bandwidth columns, on purpose.** `3.35 TB/s` is the H100 SXM5 HBM3 spec peak: using it makes
+the peer's extra kernel as cheap as physically possible, so `r*@3.35` is a strict **upper bound** on
+what we must reach -- a conservative gate. `3.0 TB/s` (89.6% of peak) is what an achieved streaming
+kernel gets, and it is the denominator `ACT2_WAVE_PLAN.md:59` used: all five of its published
+break-evens (56.5 / 70.5 / 78.6 / 79.0 / 87.7) reproduce to the tenth of a point at 3.0 and at no
+other value, which is how this dossier confirms it is reading the plan's arithmetic and not a
+lookalike. **Neither number is measured on this H100** -- see section 4's sweep rows.
+
+### 2.1 The seven shapes
+
+`T_p` and `T_w` are the round-1 DIAGNOSTIC absolutes
+(`2026-08-10-h100-act2-wgmma-vs-cublas.log:261-267`); `r (r3)` is the best round-3 config for the
+three shapes round 3 covered (`...-r3-bmulticast.log`, published table). Round 3 never re-measured
+the four `gpt_*`/`sq1024` shapes, so their `r` is still round 1's un-clustered W1.
+
+| shape | M x N x K | M*N | 8*M*N | T_p ms | T_w ms | r today | E@3.35 us | E@3.0 us | **r\*@3.35** | **r\*@3.0** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sq1024 | 1024x1024x1024 | 1.049e6 | 8.39 MB | 0.0070 | 0.0215 | 32.3% | 2.50 | 2.80 | 73.7% | 71.5% |
+| sq2048 | 2048x2048x2048 | 4.194e6 | 33.55 MB | 0.0267 | 0.0391 | 68.2% | 10.02 | 11.19 | 72.7% | 70.5% |
+| sq4096 | 4096x4096x4096 | 16.78e6 | 134.22 MB | 0.1639 | 0.2429 | 73.5% (r3) | 40.07 | 44.74 | 80.4% | 78.6% |
+| sq8192 | 8192x8192x8192 | 67.11e6 | 536.87 MB | 1.2722 | 2.1627 | 82.2% (r3) | 160.26 | 178.96 | 88.8% | 87.7% |
+| **gpt_d1024_up** | 4096x4096x1024 | 16.78e6 | 134.22 MB | 0.0581 | 0.1060 | 54.8% | 40.07 | 44.74 | **59.2%** | **56.5%** |
+| gpt_d1024_down | 4096x1024x4096 | 4.194e6 | 33.55 MB | 0.0448 | 0.0575 | 78.0% | 10.02 | 11.19 | 81.7% | 80.0% |
+| gpt_d4096_up | 4096x16384x4096 | 67.11e6 | 536.87 MB | 0.6734 | 1.5722 | 42.8% | 160.26 | 178.96 | 80.8% | 79.0% |
+
+**`gpt_d1024_up` is the break-even champion by 14 points**, and the mechanism is visible in a second
+statistic -- the fraction of our own kernel that is the C store (`M*N*4 / BW` over `T_w`, at 3.0
+TB/s):
+
+| shape | C store | T_w | store share of our kernel |
+|---|---|---|---|
+| **gpt_d1024_up** | 22.4 us | 106.0 us | **21.1%** |
+| sq2048 | 5.6 us | 39.1 us | 14.3% |
+| sq4096 | 22.4 us | 222.7 us (r3) | 10.0% |
+| gpt_d1024_down | 5.6 us | 57.5 us | 9.7% |
+| sq1024 | 1.4 us | 21.5 us | 6.5% |
+| sq8192 | 89.5 us | 1546.5 us (r3) | 5.8% |
+| gpt_d4096_up | 89.5 us | 1572.2 us | 5.7% |
+
+A fifth of `gpt_d1024_up` is the store. `K = 1024` makes the GEMM short while `M*N` stays full-size,
+so both the fusion saving and the f16-narrowing saving are worth more there than anywhere else in
+the suite.
+
+### 2.2 The margin table: `S = r / r*` at 3.0 TB/s
+
+| shape | r\* | **today** | at r=0.75 | at r=0.82 | at r=0.90 | at r=1.00 |
+|---|---|---|---|---|---|---|
+| sq1024 | 71.5% | 0.452x | 1.050x | 1.147x | 1.259x | 1.399x |
+| sq2048 | 70.5% | **0.968x** | 1.064x | 1.163x | 1.277x | 1.419x |
+| sq4096 | 78.6% | 0.936x | 0.955x | 1.044x | 1.146x | 1.273x |
+| sq8192 | 87.7% | 0.938x | 0.855x | 0.935x | 1.027x | 1.141x |
+| **gpt_d1024_up** | **56.5%** | **0.970x** | **1.328x** | **1.451x** | **1.593x** | **1.770x** |
+| gpt_d1024_down | 80.0% | **0.975x** | 0.937x | 1.025x | 1.125x | 1.250x |
+| gpt_d4096_up | 79.0% | 0.542x | 0.949x | 1.038x | 1.139x | 1.266x |
+
+At 3.35 TB/s every entry shrinks by 2-4%; the ordering is unchanged and `gpt_d1024_up` still leads by
+13+ points. **The three shapes at 0.968 / 0.970 / 0.975 are exactly the plan's *"three shapes are
+already at 0.97x of the chain at today's un-improved GEMM speed"*** -- reproduced independently,
+which validates both this model and the plan's.
+
+**And that is also the sentence the wave must not misread: 0.97x is a LOSS.** At today's measured
+speeds **not one of the seven shapes clears 1.0x** on fused-vs-chain. Wave 4 cannot publish a fusion
+win on its own; it needs C1's or W3's gain to have landed *at the shape being published*, and C1's
++6.2 points are measured only at sq4096/sq8192 -- the four remaining shapes, including the champion,
+have not been re-measured since round 1. **Re-measuring `gpt_d1024_up` under `w1_s4_mcb2` is a
+prerequisite row of Wave 4's visit, not a nice-to-have.**
+
+### 2.3 Fused-vs-FUSED: where it is winnable, and by how much
+
+This is the comparison the refusal clause is about. Split the 16 by whether the peer's *best
+available implementation* is a fused kernel or a chain.
+
+**Group A -- the peer fuses it (DEFAULT, RELU, BIAS, RELU_BIAS, GELU, GELU_BIAS, and the AUX/BGRAD
+forms).** Both sides are register-resident, both write the same bytes, both pay the same store. The
+peer's own epilogue cost is directly measurable as `epilogue_sec / default_sec` from
+`time_cublaslt_gemm_nt_f16_epilogue` with `LtEpilogue::None` as the control (`baselines.rs:3276`
+exists for exactly this), and section 1.5 says our side of it is ~1.8% at sq4096. So
+
+```
+  S(group A)  =  r * (1 + eps_peer) / (1 + eps_us)   ~=  r
+```
+
+**No shape in the suite is winnable in group A**, at any measured `r` from 32.3% to 82.2%. Publish
+these as parity rows with the peak-fraction column beside them, never as fusion wins. That is the
+refusal clause, derived rather than asserted.
+
+**Group B -- the peer has no member (SiLU, residual+act, gated, and conditionally lowp-out+act).**
+The peer's floor is "fuse what it can, then run a kernel", which is `T_p + E`, so `S = r / r*` and
+section 2.2 is the answer. Three sub-derivations, because the traffic is not identical:
+
+*SiLU / SiLU+bias.* The peer fuses BIAS (free) and runs a SiLU kernel: `T_p + 8*M*N/BW`. Our side
+pays nothing extra. `S = r / r*` exactly as tabulated. **This is the cleanest publishable form in
+the wave** and its PTX is already shipped (`ptx_wmma.rs:1187-1192`).
+
+*Residual + act, `act(A*B^T + b) + R`.* The peer fuses `GELU_BIAS` and runs a residual-add kernel
+that reads D, reads R and writes D: `T_p + 12*M*N/BW`. We must read R: `T_w + 4*M*N/BW`. The
+break-even is **identical** (`T_p/r + 4MN/BW <= T_p + 12MN/BW` reduces to `r >= r*`), but the
+speedup is smaller because our numerator grows:
+
+```
+  S(residual)  =  (T_p + 12*M*N/BW) / (T_p/r + 4*M*N/BW)
+```
+
+At `gpt_d1024_up`, r=0.82: `(58.1 + 67.1) / (70.9 + 22.4)` = **1.343x**, against 1.451x for
+SiLU+bias at the same shape and speed. Residual costs 0.11x of margin *and* 4 registers *and* a
+kernel parameter. Rank it behind.
+
+*Gated FFN (SwiGLU/GeGLU).* Let `P = M * dff` be the **final** gated output; the GEMM's own output is
+`2P`. The peer has no epilogue at all and runs `T_p + (8P read + 4P write)/BW = T_p + 12P/BW`. We
+write `4P` instead of `8P`, so our kernel is *cheaper* than the plain GEMM by `4P/BW`. Break-even
+again reduces to the same `r*` (because `16P = 8*(2P) = 8*M*N`), and
+
+```
+  S(gated)  =  (T_p + 12P/BW) / (T_p/r - 4P/BW)
+```
+
+At `gpt_d4096_up` (N=16384 = 2 x 8192, so P = 33.55e6), r=0.82: `(673.4 + 134.2) / (821.2 - 44.7)` =
+**1.040x** -- within 0.2% of the plain-act 1.038x. **The gated form's value is not a bigger ratio;
+it is that no library peer exists on H100 at all**, so the row is a fusion claim rather than a parity
+claim, and it costs one multiply and one register (section 1.3).
+
+### 2.4 Low-precision output: the claim hinges on one cheap measurement
+
+Plan target #2 asserts *"cuBLASLt has no low-precision-output-plus-activation epilogue"*. Read
+carefully, the enum argument does **not** support that: `cublasLtEpilogue_t` is orthogonal to D's
+data type, which is a matrix-layout attribute (`FusedLtPlan::new` sets it via
+`create_matrix_layout(out.as_sys(), ...)` at `baselines.rs:3682`). The absence test at
+`baselines.rs:5297` bans the *strings* `F16`/`BF16`/`FP8` from member names, which is true and is not
+the same claim. `baselines.rs:3216-3219` already concedes the point -- *"'the enum has no such name'
+is an argument, not a measurement"* -- which is why `cublaslt_epilogue_support_matrix`
+(`baselines.rs:3918`) exists.
+
+Two scenarios, and the whole target lives or dies on which one the matrix reports:
+
+**Scenario A -- the f16 column DECLINES `GELU_BIAS`.** The peer must run `T_p` (f32 out, 4MN
+written) plus a cast/activate kernel (read 4MN + write 2MN = 6MN). We write 2MN instead of 4MN.
+Break-even reduces to the same `r*` once more, and
+
+```
+  S(f16-out)  =  (T_p + 6*M*N/BW) / (T_p/r - 2*M*N/BW)
+```
+
+At `gpt_d4096_up`: **0.529x today** (r=0.428), **1.040x at r=0.82**, **1.285x at GEMM parity**.
+
+> **Correction to carry forward.** The plan's headline for this target -- *"0.179 ms on
+> gpt_d4096_up = 27% of the peer's GEMM"* -- is `8*M*N/BW = 178.96 us` at 3.0 TB/s, i.e. the total
+> *pipeline traffic-time deleted*, expressed against `T_p = 673.4 us`. That is the **GEMM-parity**
+> figure (S = 1.285x, +28.5%). At the 82% the rest of the plan uses it is **+4.0%**. Publish it as
+> "at parity this fusion is worth 27% of the peer's GEMM; at today's 42.8% it is a 0.53x loss",
+> never as a present-tense 27%.
+
+**Scenario B -- the f16 column SUPPORTS it.** The peer writes 2MN directly, there is no cast pass,
+and the comparison collapses to pure GEMM parity: `S = r`, a loss. **Target #2 evaporates.** Prior
+evidence favours Scenario B: `CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE` is documented as *"Generally same
+as output matrix type"*, which presumes an f16 D with a bias is ordinary, and TransformerEngine
+drives cuBLASLt with fp16/bf16 D and GELU epilogues in production.
+
+`cublaslt_epilogue_support_matrix(g, m, k, n)` is a descriptor build plus a heuristic query -- no
+launch, no timing, **milliseconds for all twelve cells**. It is the highest value-per-dollar
+measurement in the wave and it must run *before* any engineering is spent on the f16-out arm.
+
+### 2.5 What section 2 concludes
+
+1. `S = r / r*`, and `r*` is a property of the shape alone. Publish `r*` beside every fused row.
+2. **Group A (the six cuBLASLt fuses) is unwinnable at any measured `r`.** Parity rows only.
+3. **Group B's highest-margin target is `gpt_d1024_up` at `r* = 56.5%`** -- 14 points below the next
+   shape, because 21.1% of that kernel is the C store.
+4. **Nothing publishes today.** Three shapes sit at 0.97x; the rest are worse. The champion has not
+   been re-measured since round 1 and must be, under `w1_s4_mcb2`, in Wave 4's visit.
+5. The f16-out target is **unproven**, gated on one millisecond-cost support probe, and its
+   headline number is a parity-case figure.
