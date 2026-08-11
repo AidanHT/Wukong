@@ -2324,7 +2324,11 @@ mod tests {
         assert_eq!(spread(&[9.0, 10.0, 11.0]), Some(0.2));
         assert_eq!(spread(&[]), None);
         assert_eq!(spread(&[1.0, f64::NAN]), None);
-        assert_eq!(spread(&[0.0, 0.0]), None, "a zero median is not a denominator");
+        assert_eq!(
+            spread(&[0.0, 0.0]),
+            None,
+            "a zero median is not a denominator"
+        );
         assert_eq!(spread(&[-1.0, -2.0]), None);
         // The threshold is the WORSE of the two, and either may be absent.
         assert_eq!(resolution_threshold(Some(0.01), Some(0.05)), Some(0.05));
@@ -2363,10 +2367,7 @@ mod tests {
             "the contender's own range is {d}, which must exceed the +/-5% bar"
         );
         assert!(
-            matches!(
-                v.blocked,
-                Some(Refusal::ContenderDispersion { .. })
-            ),
+            matches!(v.blocked, Some(Refusal::ContenderDispersion { .. })),
             "the round must refuse on OUR noise, not the peer's: {:?}",
             v.blocked
         );
@@ -2396,7 +2397,11 @@ mod tests {
         );
         let v = analyze(&s, 0.05);
         let f = v.field("ms").unwrap();
-        assert!(v.blocked.is_none(), "both noises clear the bar: {:?}", v.blocked);
+        assert!(
+            v.blocked.is_none(),
+            "both noises clear the bar: {:?}",
+            v.blocked
+        );
         assert!(f.effect.unwrap().abs() < f.b_spread.unwrap());
         assert_eq!(
             f.cell,
