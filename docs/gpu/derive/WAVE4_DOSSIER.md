@@ -507,3 +507,267 @@ for it as "two more epilogues".
 The support probe and the `gpt_d1024_up` re-measurement under `w1_s4_mcb2` are both **prerequisites of
 the round, not results of it**: the first decides whether R4 is built at all, the second decides
 whether any Wave-4 row can be published as a win rather than a 0.97x tie.
+
+---
+
+## 4. GUARD / LAW SET
+
+Eight laws. Three are extensions of existing guards (G3, G9, G10), two are new (G21, G22), and three
+are the correctness floor Wave 4 must add because no existing gate covers a fused epilogue. Law text
+is written to be pasted into a doc comment; the rationale under each is what a reader needs when the
+law fires.
+
+### L1 -- the ASCII gate, and the enumeration it rides on (crate rule 1, standing rule 3)
+
+> **L1.** Every epilogue variant this wave emits appears in `wgmma_device_free_modules()`. That one
+> enumeration is what `wgmma_ptx_is_pure_ascii`
+> (`ptx_wgmma.rs:4358`), `every_module_opens_at_the_architecture_locked_hopper_floor`, the crate-wide
+> `.version` law and the ptxas census all scan, so a module cannot be inside three of them and
+> outside the fourth. A variant reachable from a launcher but absent from the corpus is a law
+> violation in itself.
+
+*Rationale.* The ASCII gate is not theoretical here. The activation constants are emitted through
+`format!("0f{:08X}", x.to_bits())` and are ASCII by construction, but the prose that will accompany
+them is not: this dossier's own source for the GELU formula reads `0.5*x*(1 + tanh(sqrt(2/pi)*(x +
+0.044715*x^3)))` precisely because the natural spelling uses a square-root sign and a middle dot, and
+one of those copied into a `format!` is a `ptxas fatal` at `cuModuleLoadData`. `ptx_wgmma.rs:4354`
+already says this file's prose "is full of arrows and multiplication signs waiting to be copied into
+a `format!`" -- Wave 4 adds a family whose reference formulas are the worst offenders in the repo.
+
+### L2 -- G3 extended: the derived name must carry the epilogue
+
+> **G3-W4.** `WgmmaCfg::derived_name()` (`ptx_wgmma.rs:1230`) is a **total function of the emitting
+> geometry**, and Wave 4 adds three arguments to that geometry: the activation, the bias flag and the
+> output dtype. The name becomes
+>
+> ```
+>   wgmma_nt_{dtype}_{bm}x{bn}x{bk}_s{stages}{multicast_tag}{epilogue_tag}{out_tag}
+> ```
+>
+> with `epilogue_tag` empty for the plain GEMM and otherwise `_b`? + one of `relu|gelu|silu|gated`
+> + `_r`? for the residual, and `out_tag` empty for f32 and `_f16o` for the narrowing store.
+> `validate()` refuses to emit any config whose `name` **or** `key` differs from `derived_name()`.
+
+*Rationale, and why this is the wave's #1 hazard rather than a tidiness rule.* `Gpu::function` /
+`raw_function_dyn` cache on the key string **alone** and never re-examine the PTX on a hit
+(`ptx_wgmma.rs:1219`). A row written `WgmmaCfg { act: Silu, ..WGMMA_W1 }` that forgets `key` loads
+the **plain-GEMM** module, launches it a thousand times, and publishes its time under the `SILU`
+heading. Note carefully what does and does not catch that: the *correctness* arm builds its own
+reference and would fail, so the defect is loud **if the correctness arm runs on the same cached
+module** -- but the timing loop is a separate call, and a round that skipped or reordered the
+correctness arm would report a **fabricated fusion win with no symptom at all**. C1's sweep already
+carries this hazard on one axis; Wave 4 adds three more, and `epilogue_tag` is the axis whose
+mistaken value is *fastest* (the plain GEMM is always the quickest arm in the table), which is the
+worst possible failure direction.
+
+### L3 -- G21, NEW: the parameter list becomes a function of the variant
+
+> **G21.** `PARAM_ORDER` (`ptx_wgmma.rs:1517`) stops being a constant and becomes
+> `WgmmaCfg::param_order() -> &'static [ParamKind]`: the six existing entries, then `GlobalPtr` for a
+> bias, then `GlobalPtr` for a residual, then `GlobalPtr` for an aux output -- **in that order and no
+> other**. `LaunchPlan::params` carries the per-variant slice. The device-free law at
+> `gpu.rs:17896-17945` re-derives the expected list **per entry, from the config that emitted it**,
+> and still prints one gate line with the total count.
+
+*Rationale.* The launcher pushes a fixed-length argument array. Pushing short is **not an error the
+driver reports** -- `gpu.rs:7135` already spells this out -- it reads whatever follows on the host
+stack as the bias pointer, and the kernel dereferences it. Today the law holds because there is
+exactly one list and 13 entries declare it; the round log prints
+`[gate] 13 wgmma entries declare exactly PARAM_ORDER (6 params, kinds in order)`. The instant a bias
+pointer exists that sentence is false for part of the corpus, and the *easy* fix -- relaxing the
+assert to "at least six" -- deletes the property entirely. **Land G21 in the same commit as the
+parameter, never after.**
+
+### L4 -- G9 restated as a transport law over the store CLASS
+
+> **G9-W4.** For every emitted variant, collect every global-store instruction -- `st.global.f32`,
+> `st.global.v2.f32`, `st.global.v4.f32`, `st.global.b32/b64`, and any
+> `cp.async.bulk.tensor.*.global.shared::cta` descriptor store -- and assert:
+>
+> 1. the multiset of **accumulator registers appearing as store source operands**, after any
+>    in-place activation rewrite, is exactly `{%acc0 .. %acc{nacc-1}}`, each exactly once;
+> 2. every such store is predicated on a conjunction containing **both** a row bound and a column
+>    bound;
+> 3. the emitted store count equals `nacc / lanes_per_store` for the variant's declared vector width.
+>
+> Device gates at `N % 8 != 0` -- specifically `N = bn + 1` and `N = bn - 3` -- accompany it.
+
+*Rationale.* The law as it stands
+(`the_epilogue_stores_every_accumulator_exactly_once_and_bounded`, `ptx_wgmma.rs:4711`) asserts
+`ptx.matches("st.global.f32").count() == nacc` and `ptx.matches("],%acc{i};").count() == 1`. Both
+break **loudly** under every Wave-4 change: a v2 store spells the source `{%acc0,%acc1}`, an f16 store
+sources `%h`, and a TMA store emits zero `st.global.f32`. That is the good news. The hazard is the
+**repair**: the one-line fix is to relax `assert_eq!` to `assert!(count <= nacc)`, which passes
+vacuously at zero and deletes both real properties -- exactly what the plan means by "a TMA-store
+epilogue ... would otherwise delete the law along with both real properties". Restating it as a
+positive property over source operands makes the vacuous relaxation unavailable. The `N % 8 != 0`
+gates matter because a vector store cannot satisfy a ragged column edge and the predication must
+therefore fall back per-lane there; a variant that is only ever run at `N % 8 == 0` never exercises
+the fallback.
+
+### L5 -- G10 restated, with the row-blocked finding that removes the aliasing question
+
+> **G10-W4.** `smem_bytes()` is the **one** authority for `dyn_smem_bytes`; any epilogue region is
+> part of it or `dyn_smem_bytes` silently under-requests. `the_smem_map_is_disjoint` asserts every
+> region's `[off, off+len)` is pairwise disjoint and that the maximum end equals `smem_bytes()`.
+> **An epilogue region may not alias the mainloop ring.**
+
+*Rationale, and the derived alternative.* W1 leaves `232448 - 196672 = 35776` free bytes; a whole f32
+C tile is `128*256*4 = 131072` and does not fit, which is why the plan concludes a TMA-store epilogue
+"physically must alias the mainloop ring". **It does not have to.** A *row-blocked* stage fits with
+room to spare: `32 rows x 256 cols x 4 B = 32768 B`, or `2 x 16 rows` double-buffered for the same
+32768, leaving 3008 B; add the 1024 B f32 bias stage and it is 33792 of 35776, with 1984 B of margin
+(section 1.4). Under W3C the same arithmetic gives a 64-row block at 32768 of 35744 free. Taking the
+row-blocked region makes G10 a *statement about a map* rather than a *race to reason about*, and that
+matters most exactly when W3's persistence lands -- because then the producer refills stage 0 for
+tile `t+1` while a consumer would be staging C out of it, and an aliasing epilogue that is correct in
+a one-tile kernel becomes a live race with no compile-time symptom.
+
+### L6 -- G22, NEW: the register-budget law
+
+> **G22.** `regs_after_split() <= 65536` and every `setmaxnreg` target is a multiple of 8 in
+> `[24, 256]` (both already asserted). Wave 4 adds: **the epilogue's declared scratch registers are
+> part of the config**, and `validate()` rejects any variant whose
+> `accum_regs() + epilogue_scratch()` exceeds `consumer_regs`. The derived headroom at W1 is exactly
+> **+8 per consumer thread, once**: `128*32 + 256*232 = 63488` of 65536, so `consumer_regs` may rise
+> to 240 (`128*32 + 256*240 = 65536` exactly) and no further -- lowering `producer_regs` to the ISA
+> floor of 24 gives `(65536 - 3072)/256 = 244`, which rounds down to the same 240.
+
+*Rationale.* Section 1.4's itemization: relu 0, silu 1, gelu 2, bias 2 (+1 address), f16-out 1,
+residual 4. `bias + gelu = 5` fits; `bias + gelu + residual = 9` does not. The static count is
+conservative -- `%acc{4j..4j+3}` are dead after group `j` stores and ptxas may reuse them for every
+`j > 0` -- so **G22 is a design gate, not a verdict**, and the verdict is G14's ptxas census. Run the
+census on **every** new variant, not a sample, and grep for `C7511`: it is a *silent 2-4x*, not a
+failure, and a spilled epilogue that still produces correct numbers is exactly the shape of result
+that gets published as "fusion did not help".
+
+### L7 -- THE EXACTNESS LAW. Bit-exact at f32 out; a monotonicity law at f16 out
+
+This is the law the wave does not currently have, and it is stronger than the plan assumes.
+
+> **L7a (bit-exactness, f32 out).** For every `(activation, bias)` variant with `LtOut::F32`
+> semantics,
+>
+> ```
+>   wgmma_fused_epilogue(A, B, bias)  ==  vmath_act( gemm_nt_wgmma(A, B) + bias )
+> ```
+>
+> **element-wise `==`, not a tolerance**, where both sides are Wukong kernels on the same device.
+>
+> **L7b (f16 out).** Not bit-exact, and the law is a *monotonicity* statement instead: against an
+> independent f64 reference `R`,
+>
+> ```
+>   max_i | fused_f16[i] - R[i] |   <=   max_i | chain_f16[i] - R[i] |
+> ```
+>
+> i.e. **the fused arm is never worse than the chain it replaces**.
+>
+> **L7c (vs cuBLASLt).** A tolerance, `c * sqrt(K) * eps`, plus a separately derived absolute band
+> for the activation -- never bit-exactness, because the peer's reduction order is its own.
+
+*Why L7a is bit-exact and not a tolerance -- the derivation.* The accumulator is f32. In the unfused
+chain, the GEMM stores that f32 to HBM and a second kernel loads it back: **an f32 store followed by
+an f32 load is the identity**, no rounding occurs. The bias add is the same `add.f32` on the same two
+f32 values in both arms. The activation is the *same PTX instruction sequence with the same
+constants* in both arms -- `ptx_wmma.rs:1180` already states this contract for the wmma path ("the
+exact same formulas + constants as the standalone `ptx::vmath_ptx` kernels, so a fused `silu(A*B^T)`
+equals the unfused `silu(gemm)`"), and Wave 4 must preserve it while porting. `tanh.approx.f32`,
+`ex2.approx.f32` and `rcp.approx.f32` are approximate but **deterministic**: a fixed function of the
+input bit pattern on a given architecture. Therefore every intermediate is bit-identical and so is the
+result. Anything less than `==` here is hiding a real difference.
+
+Three edges L7a must be written to survive, all of which agree *because both arms use the same
+instruction* and would diverge under any "equivalent" rewrite:
+
+* **Signed zero.** `max.f32 x, 0f00000000` on `x = -0.0` is not `f32::max`'s answer. Both arms issue
+  the identical `max.f32`, so they agree; a scalar rewrite of one arm would not.
+* **NaN.** Same argument, same instruction, same tie-break.
+* **The bias-then-activate order.** `apply_f64` (`baselines.rs:3380`) pins bias-first; the fused
+  epilogue must too, and a fused arm that activated first would still pass a *tolerance* gate on
+  smooth data.
+
+*Why L7b is a monotonicity law and not a tolerance.* At f16 out the fused arm rounds **once**
+(activate in f32, then `cvt.rn.f16x2.f32`); the chain rounds **twice** (GEMM stores f16, reload,
+widen, activate, store f16). They cannot be bit-equal, and the fused arm is *structurally the more
+accurate one*. A plain "within tolerance of the chain" gate would therefore be satisfied by a fused
+arm that had silently become worse, which is the failure the wave most needs to see. Compare both to
+`R` and assert the inequality.
+
+### L8 -- the GELU convention, and the trap under it
+
+> **L8.** Two separate gates, never one. (i) The **convention** -- tanh vs erf -- is pinned
+> device-free by `the_two_gelu_conventions_are_distinguishable_and_pinned` (`baselines.rs:5397`) and
+> by the shipped constants. (ii) The **implementation** band for `tanh.approx.f32` is derived from a
+> measured `max |tanh.approx.f32(x) - tanh(x)|` over the exact ramp the correctness gate uses, and
+> that measurement is reported in the round log. If the derived band exceeds `1e-3`, say so in the
+> log, because the gate is then blind to the convention question and (i) is carrying it alone.
+
+*Rationale.* `baselines.rs:3416-3423` pins the tanh/erf gap at up to `~1e-3` around `|x| ~ 2`, three
+orders above the `c*sqrt(K)*eps` band an f16 GEMM gate uses, and warns that a fused-GELU gate written
+against the wrong convention "would fail on a perfectly good peer". Wave 4 adds a second source of
+GELU error on top: `tanh.approx.f32` is an approximate MUFU instruction, not a correctly-rounded
+tanh. **This dossier does not establish its bound and will not assert one** -- but the structural
+point holds whatever the number turns out to be: *any tolerance band widened to admit
+`tanh.approx`'s error may also be wide enough to admit the erf/tanh confusion the pinning test exists
+to catch.* Two questions, two gates, and the second one's band must be a measured number in the log
+rather than a constant someone chose to make a row pass.
+
+### 4.9 The sweep rows for the one H100 visit
+
+One container, one log, in this order. Standing rule 1 puts bring-up E/F/G before any perf row;
+standing rule 3 puts the $0.02 CPU ptxas census before the visit.
+
+**Preflight -- host-only, free, and it decides what gets built (run BEFORE the round, not in it).**
+
+| row | what | why it is first |
+|---|---|---|
+| P0 | `cublaslt_epilogue_support_matrix(g, m, k, n)`, both `LtOut`, all six `LtEpilogue::ALL`, at two shapes | 12 cells x 2, **milliseconds**, no launch. **Decides whether R4 exists at all** (section 2.4). A claim of absence must be something a round log shows |
+| P1 | ptxas census over `wgmma_device_free_modules()` including every new variant: spill count, `C7511`, `sm_90a`, ASCII | G14. `C7511` is a silent 2-4x, not a failure -- section 1.4's register cliff is settled here and nowhere else |
+
+**Correctness -- every row before any timing row.**
+
+| row | arm | law |
+|---|---|---|
+| C0 | bring-up E/F/G on W2's corrected guard shape | standing rule 1 |
+| C1 | exact-integer `==` per variant on the ragged set, **including `N = bn+1` and `N = bn-3`** | G9-W4's device gates |
+| C2 | **`fused(A,B,bias) == vmath_act(gemm_nt_wgmma(A,B) + bias)`, element-wise `==`**, per `(act, bias)` | **L7a -- the wave's new floor** |
+| C3 | pseudorandom f16 vs an independent f64 reference at `c*sqrt(K)*eps`, per variant | G2 |
+| C4 | f16-out: `max|fused - R| <= max|chain - R|` | L7b |
+| C5 | two-run bit-identity on the C3 arm | G8 |
+| C6 | `tanh.approx.f32` vs f64 `tanh` over the C3 ramp; report the max | L8(ii) |
+
+**Measurement.**
+
+| row | arm | why |
+|---|---|---|
+| **M0** | **`hbm_bandwidth`** -- currently `#[ignore]`d and never run on H100 | **every `r*` in section 2 divides by it.** Re-derive the whole break-even table in-round from the measured number and publish that table, not this one |
+| **M1** | **our own pointwise activation kernel over `M*N` f32, per shape** | converts `E` from a derivation into a **measurement**. This is the single highest-value row in the round: it turns every fused-vs-chain claim from "8*M*N/BW says" into "we timed it" |
+| M2 | per shape x per epilogue: **A** = `time_cublaslt_gemm_nt_f16_epilogue(.., None, F32)`, **B** = our fused variant, **C** = `time_cublaslt_gemm_nt_f16_epilogue(.., epi, F32)` | `C/A - 1` = `eps_peer`, the library's own epilogue cost; `C/B` = fused-vs-fused; `(A + M1)/B` = fused-vs-chain. A and C are **both cuBLASLt**, so `C/A - 1` doubles as the peer's dispersion floor (G16), exactly as rounds 1-3 used the twin |
+| **M3** | **`gpt_d1024_up` and `gpt_d4096_up` under `w1_s4_mcb2`** | section 2.2: C1's +6.2 points are measured only at sq4096/sq8192, and the champion shape has not been re-measured since round 1. **Without M3 no Wave-4 row can be published as a win rather than a 0.97x tie** |
+| M4 | the `LtOut::F16` column, for whatever P0 said is supported | R4's arm; skipped **honestly**, per `cublaslt_epilogue_available` |
+| M5 | an epilogue-elided arm at one shape | splits our own epilogue cost from the mainloop on ONE kernel instead of two shapes (W2's lever, reused) |
+| M6 | shapes at **real model dims** -- Llama-3-8B, GPT-2, Qwen -- never `d=64/dff=256` | the plan's own instruction for this wave |
+
+Shapes for M2: `gpt_d1024_up` (the champion), `gpt_d1024_down`, `sq2048`, `sq4096`, `sq8192`,
+`gpt_d4096_up`. `sq1024` may be dropped -- at `r = 32.3%` against `r* = 71.5%` it cannot clear
+break-even under any Wave-4 change, and its 32-CTA wave quantization is W3's problem, not this
+wave's.
+
+### 4.10 Refusals
+
+1. **Any bias / relu / gelu row published as a fusion win** -- the plan's own clause, now derived:
+   section 2.3 group A is unwinnable at any measured `r`.
+2. **Any fused row published without its `r*` and its peak-fraction beside it.** The ratio alone
+   misleads in both directions (standing rule 4), and `r*` is what tells a reader whether a 1.05x is
+   a triumph or a rounding error.
+3. **Any row whose apparent gain is inside the `C/A` dispersion** (G16).
+4. **Any low-precision-output claim without P0's f16 column in the same log.** Section 2.4: the
+   enum-absence argument does not support it and the likely answer is that the peer supports it.
+5. **Any break-even quoted from 3.35 or 3.0 TB/s once M0 has measured the real number.** This
+   dossier's tables are provisional by construction.
+6. **Any variant reachable from a launcher but absent from `wgmma_device_free_modules()`** -- it
+   would sit outside the ASCII, `.target`, `.version` and census laws simultaneously (L1).
+7. **Any fused row published from a round whose C2 arm did not run.** L7a is `==`; a round that
+   skipped it and reported a timing has no evidence the timed kernel computed the epilogue at all --
+   which is precisely the G3-W4 cache hazard's payload.
