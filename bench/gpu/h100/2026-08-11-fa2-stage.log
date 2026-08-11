@@ -1,0 +1,53 @@
+# FA2 wheel staging round — 2026-08-11 (detached)
+# Command: WK_GPU=H100 modal run --detach tools/cloud/modal_app.py::build_peers --fa2
+# App: ap-GUu3iPWk59oaXVy5Rtztx3   CPU-only container (8 cpu + 16 GiB, $0.506/hr)
+#
+# History: attempts 1-2 refused at the seams this round fixed (torch drifted cu129->cu130
+# inside flash-attn-4's second pip resolution -> pinned at 4b96e35; cpp_extension probed
+# default c++ as 'clang++ 0.0.0' and refused -> CC=gcc CXX=g++ at 887fef4). Attempt 3 built
+# healthy but the LOCAL stream died on DNS (getaddrinfo) and tore down the ephemeral app
+# before staging. This attempt ran --detach so a local drop cannot kill the container.
+#
+# Audit (peers.json on the wukong-build volume): flash_attn 2.8.3.post1, archs 90,
+# kvcache_api=true kvcache_symbol=true, so_bytes=208411504.
+# --- captured tail of the run stream ---
+    "so_bytes": 208411504,
+    "version": "2.8.3.post1",
+    "wheel": "/persist/wheels/flash_attn-2.8.3.post1-cp311-cp311-linux_x86_64.whl"
+  },
+  "image_cuda_tag": "12.9.2-cudnn-devel-ubuntu22.04",
+  "ptxas": {
+    "archs": [
+      "sm_80",
+      "sm_89",
+      "sm_90",
+      "sm_90a"
+    ],
+    "json": "/persist/rounds/ptxas-cluster-corpus-20260810-215321.json",
+    "log": "/persist/rounds/ptxas-cluster-corpus-20260810-215321.log",
+    "path": "/usr/local/cuda-12.9/bin/ptxas",
+    "ptx_archive": "/persist/ptx-archive/20260810-215321",
+    "version": "Cuda compilation tools, release 12.9, V12.9.86"
+  },
+  "torch_pin": "2.13.0+cu129",
+  "vllm": {
+    "attempts": [
+      {
+        "error": "",
+        "mode": "symlinks",
+        "ok": true
+      }
+    ],
+    "pkgs": "",
+    "python": "/persist/vllm-venv/bin/python",
+    "src": "/persist/vllm-src",
+    "venv": "/persist/vllm-venv",
+    "venv_mode": "symlinks",
+    "version": "0.26.0"
+  }
+}
+
+Staged to the 'wukong-build' Volume. Every later round reads these for free; nothing above ever runs on metered silicon again.
+[meter] build_peers: 1241.2s wall = $0.174 (record this in the round log)
+✓ App completed. View run at 
+https://modal.com/apps/aidanht/main/ap-GUu3iPWk59oaXVy5Rtztx3
