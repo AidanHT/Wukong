@@ -6,7 +6,54 @@
 
 ---
 
-## WAVE C1 — Cluster axis + config sweep (IN FLIGHT, GIVEN) — MUST
+## DOSSIER AMENDMENTS (2026-08-11) — read these before executing any wave below
+
+C1 LANDED (round 3: 1x2x1 B-multicast measured 73.5% / 82.2% of cuBLAS at sq4096/sq8192; the
+spine held). Wave 2B's peer bar is COMPLETE and staged (CUTLASS v4.6.1 sm90a profiler
+f16+fp8+int8 368/782/308 kernels; FA2 2.8.3.post1 with the kvcache API; vLLM 0.26.0; peers.json
+is the authority). Wave 2A is in flight. Waves 3/4/5 now each have an implementation-grade
+dossier in this directory, derived from the measured rounds — **where a dossier and a wave
+section below disagree, the dossier wins.** The corrections that change execution:
+
+- **WAVE 3** (`WAVE3_DOSSIER.md`): the lever ranking is now (1) persistence, (2) raster, (3)
+  per-shape dispatch — and the mainloop drain is budgeted at ZERO (Fit C prices its cost at one
+  ring-stage fill, 9.2%, against at most 8.9% of gain). The raster optimum is `GROUP_M = 16`,
+  a TALL group applied to the CLUSTER index (`sqrt(W·BN/BM)`), not the wide group implied
+  above. Wave 3's own section overstates: `128x128 @ 2 CTAs/SM` is REFUTED by the ptxas census
+  (occupancy binds on the static 168 regs/thread); static register headroom is 2 regs/thread,
+  not 8 (the 8 is the `setmaxnreg` view — reconcile both on the census before any epilogue
+  work); sq2048 gets exactly zero from this wave; sq1024's lever is a 128x64 tile (+56 pts).
+  192x256x64 is DEAD, not held out (CTA-M 192 is not a multiple of the 128-row wgmma M and 512
+  threads cap ptxas at 128 registers). Combined dossier projection: suite mean 61.5% → ~80.8%.
+- **WAVE 4** (`WAVE4_DOSSIER.md`): the break-even table above is priced at BW = 3.0 TB/s, and
+  **HBM bandwidth has never been measured on this campaign's H100** (`hbm_bandwidth` is
+  `#[ignore]`d in both device-suite logs) — every fusion break-even is provisional until it
+  runs. The "three shapes already at 0.97x" reads as a WIN above; it is a LOSS (no shape clears
+  1.0x pre-W3). `gemm_nt_wgmma` has no product call site — the wave must include the
+  recognizer→offload wiring or it ships a benchmark, not a product surface. The
+  `cublaslt_epilogue_support_matrix` probe (milliseconds, no launch) precedes any f16-out
+  engineering. Highest-margin target: `silu(x·Wᵀ+b)` at gpt_d1024_up — derived 1.451x over the
+  fused cuBLASLt chain at today's r = 0.82, for five PTX instructions and one register.
+- **WAVE 5** (`WAVE5_DOSSIER.md`): the CUTLASS fp8/int8 profiler rebuild listed under Wave 2B
+  is DONE — do not re-run it; only the measurements remain. The 16-bit descriptor transfers to
+  1-byte operands field-for-field IFF `bk·dtype.size() == 128` (BK 64 → 128); 8-bit wgmma is
+  K-major ONLY; the fp8 exact-integer bring-up arm exists only at K ≤ 256 (14-bit product
+  accumulation), int8 keeps `==` at every K on the s32 output; two-level fp8 accumulation does
+  not fit the 128x256 tile; wgmma has no int4 shape, so Wave 5 cannot produce an int4 headline.
+
+**NEXT H100 VISIT MANIFEST (one container, in this order):** (1) bring-up E/F/G on Wave 2A's
+new guard shape; (2) Wave 2A's arms — v2-store / evict-hint A/B/C, the K-sweep, the
+epilogue-elided arm; (3) `hbm_bandwidth` — the campaign's FIRST H100 HBM measurement, it prices
+every Wave-4 break-even; (4) `cublaslt_epilogue_support_matrix` (ms); (5) the seven-shape
+re-measure under the shipped ≥4096-class default (incl. gpt_d1024_up under `w1_s4_mcb2` — a
+Wave-4 prerequisite); (6) the ~$0.06 mma.sync fp8/int8/int4 baseline (Wave 5's Hopper
+denominator). **Setup demand (Wave 3's): lock the SM clock if the container permits it,
+otherwise record `clocks.sm` per arm — the round-3 provenance reads UNKNOWN and that unknown is
+the width of the cost model's uncertainty band.**
+
+---
+
+## WAVE C1 — Cluster axis + config sweep (LANDED 2026-08-10, r3 measured — see amendment) — MUST
 
 **Owner:** one agent, `ptx_wgmma.rs` + `gpu.rs`. No second agent in these files this wave.
 
