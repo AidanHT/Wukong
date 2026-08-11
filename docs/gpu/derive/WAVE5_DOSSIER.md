@@ -903,7 +903,7 @@ tile-loop entry count, exactly as G19 specifies.
 | The crowned 16-bit descriptor, 19 candidates x 2 K passes | `bench/gpu/h100/2026-08-10-h100-s2c-desc-sweep.log:93-182` |
 | The first round that found the row-major reading wrong (64/4096) | `bench/gpu/h100/2026-08-10-h100-s2a-bringup.log` |
 | ptxas census: `wgmma_nt_f16_128x256x64_s4` regs/smem/threads | `bench/gpu/h100/2026-08-10-ptxas-census.log:687-690` |
-| ptxas census harness landmine (exit 1, "no records parsed") | same log, `:842-869` |
+| ptxas census harness landmine (exit 1, "no records parsed") -- HISTORICAL: that was the FIRST census run; the 2026-08-10 contract rewrite (ptxas shim + per-arch sweep + crate-table parse, `tools/cloud/modal_app.py:1832-1874`) fixed it, and the per-arch-sweep artifacts parse clean | same log, `:842-869` |
 | CUTLASS profiler staged f16-only (OBSOLETE 2026-08-10: rebuilt f16+fp8+int8, see 4.1 CORRECTION) | `bench/gpu/h100/2026-08-09-preflight-build-peers.log:915`; `peers.json` on the Volume |
 | 112 C7511 warnings from NVIDIA's own SM90 f16 kernels | same log, `:1074-1185`; ledger entry 4 in this directory's README |
 | The wgmma model: core matrix, LBO/SBO, `SmemLayout`, `SHIPPED_LAYOUT`, `desc_fields`, `SmemDesc::pack` | `crates/wukong_codegen_gpu/src/ptx_wgmma.rs:44-78, 436-716, 1660-1663` |
