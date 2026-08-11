@@ -1,0 +1,776 @@
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-wEm7bpIbEx8WIfrOZJEPH1
+Building image im-pAZjhiSPK3665lEkUyOVvP
+
+=> Step 0: FROM base
+
+=> Step 1: ENV PATH=/root/.cargo/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+=> Step 2: ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
+
+=> Step 3: ENV WK_GPU='H100!'
+
+=> Step 4: ENV CARGO_TERM_COLOR=always
+
+=> Step 5: ENV RUST_BACKTRACE=1
+
+=> Step 6: ENV WUKONG_TORCH_PYTHON=/opt/torch-venv/bin/python
+
+=> Step 7: ENV WUKONG_FA2_PYTHON=/opt/torch-venv/bin/python
+
+=> Step 8: ENV WUKONG_FA2_PEER=/wukong/tools/fa2_sdpa_peer.py
+
+=> Step 9: ENV WUKONG_CUTLASS_PROFILER=/persist/bin/cutlass_profiler
+
+=> Step 10: ENV WUKONG_VLLM_PYTHON=/persist/vllm-venv/bin/python
+
+=> Step 11: ENV WUKONG_VLLM_BENCH_DIR=/persist/vllm-src/benchmarks/kernels
+
+=> Step 12: ENV TORCHINDUCTOR_CACHE_DIR=/persist/inductor-cache
+
+=> Step 13: ENV TRITON_CACHE_DIR=/persist/triton-cache
+Saving image...
+Image saved, took 2.16s
+
+Built image im-pAZjhiSPK3665lEkUyOVvP in 4.26s
+
+
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function build_peers.
+├── 🔨 Created function ptxas.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+├── 🔨 Created function peers.
+├── 🔨 Created function cutlass.
+├── 🔨 Created function marlin.
+├── 🔨 Created function framework.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[meter] test: H100! + 8.0 cpu + 16 GiB = $4.456/hr; timeout 7200s caps this call at $8.91
+[src] 807 files stamped; 0 new/changed since the last run (incremental)
+Device suite on H100! — GPU_REQUIRED=1, PEER_REQUIRED=0
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --release -- wgmma --nocapture --test-threads=1[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 2.01s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_gpu-53f0e4b228126785)
+
+running 59 tests
+[gate] 13 wgmma entries declare exactly PARAM_ORDER (6 params, kinds in order) ✓
+test gpu::tests::every_wgmma_entry_declares_exactly_the_parameters_the_launcher_pushes ... ok
+test gpu::tests::wgmma_bf16_vs_cublas ... ignored, Act-2 perf round; Hopper + cuBLAS; run explicitly (ptx_wgmma::WGMMA_BENCH_INVOCATION)
+
+[wgmma-cluster] wgmma_nt_f16_128x256x64_s4_mcb2 vs wgmma_nt_f16_128x256x64_s4 on NVIDIA H100 80GB HBM3: cluster 1x2x1 on grid y (M tiles), B slice 16384 B of 32768 B per CTA, ctaMask 0x3, empty[s] takes 4 arrivals
+        256 x 256   x 256   grid 1x2 (1 clusters, 0 pad CTA(s)): EXACT, == the un-clustered row, reproducible
+        512 x 256   x 512   grid 2x4 (4 clusters, 0 pad CTA(s)): EXACT, == the un-clustered row, reproducible
+        384 x 320   x 256   grid 1x4 (2 clusters, 1 pad CTA(s)): EXACT, == the un-clustered row, reproducible
+        263 x 112   x 251   grid 1x4 (2 clusters, 1 pad CTA(s)): EXACT, == the un-clustered row, reproducible
+[gate] wgmma_nt_f16_128x256x64_s4_mcb2 is exact on 4 cluster-spanning shapes and bit-identical to wgmma_nt_f16_128x256x64_s4 on every one ✓
+
+[wgmma-cluster] wgmma_nt_f16_128x256x64_s4_mc2 vs wgmma_nt_f16_128x256x64_s4 on NVIDIA H100 80GB HBM3: cluster 2x1x1 on grid x (N tiles), A slice 8192 B of 16384 B per CTA, ctaMask 0x3, empty[s] takes 4 arrivals
+        128 x 256   x 512   grid 2x1 (1 clusters, 0 pad CTA(s)): EXACT, == the un-clustered row, reproducible
+        256 x 256   x 1024  grid 4x2 (4 clusters, 0 pad CTA(s)): EXACT, == the un-clustered row, reproducible
+        128 x 320   x 768   grid 4x1 (2 clusters, 1 pad CTA(s)): EXACT, == the un-clustered row, reproducible
+        135 x 112   x 507   grid 2x2 (2 clusters, 0 pad CTA(s)): EXACT, == the un-clustered row, reproducible
+[gate] wgmma_nt_f16_128x256x64_s4_mc2 is exact on 4 cluster-spanning shapes and bit-identical to wgmma_nt_f16_128x256x64_s4 on every one ✓
+[gate] BOTH cluster axes are exact: 8 shapes over wgmma_nt_f16_128x256x64_s4_mcb2 and wgmma_nt_f16_128x256x64_s4_mc2, each spanning at least one full two-CTA cluster ON ITS OWN GRID AXIS, each `==` the f64 reference and bit-identical to wgmma_nt_f16_128x256x64_s4 ✓
+test gpu::tests::wgmma_cluster_multicast_is_exact ... ok
+test gpu::tests::wgmma_config_sweep ... ignored, Act-2 round-2 config sweep; Hopper + cuBLAS; run explicitly (ptx_wgmma::WGMMA_SWEEP_INVOCATION)
+[skip:capability] NVIDIA H100 80GB HBM3 is cc 9.0 — the sm_90a DECLINE cannot be exercised on a Hopper part. The gate that DOES run here is `wgmma_hopper_bringup`:
+    WUKONG_GPU_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu -- --nocapture --test-threads=1 wgmma_hopper_bringup
+The list it works, for reference:
+  1. The descriptor reading, settled in ONE visit by a SWEEP. The 2026-08-10 round already spent the two-arm A/B and both arms lost (64/4096 and 0/4096), because the ambiguity was never the axis naming: an SS operand is a grid of core matrices packed at 128 contiguous bytes, so the within-core-matrix row stride is a fixed 16 and a plain row-major tile is unrepresentable. `wgmma_hopper_bringup` stage D therefore loads ONE module -- `desc_sweep_probe_module`, whose descriptor template, matrix offsets, K-step advance and SMEM staging mode are all run-time PARAMETERS -- and a host loop runs every row of `desc_sweep_candidates` at K=16 and K=64 against an f64 reference over `bringup_operands`, whose three-digit positional ramps make a core-matrix permutation visible in A and in B. Exactly one ARM (one shared-memory image) must come out exact, bit-exactly: the operands are exact in f16 and the dot product stays under 2^24, so the verdict is `==`, not a tolerance. Two arms means the probe settles nothing; zero means the round prints the per-core-matrix lane map and names the next diagnosis. The two already-scored readings are in the set as CONTROLS -- the sweep reproducing 64/4096 is how it validates itself.
+  2. The module loads at all -- cuModuleLoadData on the generated text (`wgmma_hopper_bringup` stage A, which loads every shipped row AND the TMA probe AND the descriptor sweep probe before launching anything). First check of the `.target sm_90a` header, of `.version 8.0`, and of every instruction spelling in the family.
+  3. setmaxnreg and the register split -- cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS) plus a spill check (ptxas -v via WUKONG_PTXAS, or the JIT log). If ptxas cannot fit a consumer's 128 accumulators plus addressing inside 232 registers, consumer_regs must rise and producer_regs fall; the budget assert in WgmmaCfg::validate will keep the pair honest.
+  4. The TMA descriptors (`wgmma_hopper_bringup` stage B) -- cuTensorMapEncodeTiled succeeding for the A and B geometries at each benched shape, then `tma_stage_probe_module`: a single-stage load compared against a host copy of the same tile, on a kernel with no wgmma, no warp specialisation and no pipeline in it, so a mismatch accuses the descriptor and nothing else.
+  5. The pipeline does not hang (`wgmma_hopper_bringup` stage C, and the time-box that wraps every launch in this family). The expect_tx count is WgmmaCfg::stage_tx_bytes; if it disagrees with what the two copies actually move, the barrier never completes and every consumer waits forever. `gpu::sync_within` polls cuStreamQuery to a deadline and ENDS THE PROCESS with a diagnosis rather than billing rented silicon until the container timeout; WUKONG_GPU_LAUNCH_TIMEOUT_MS tunes it.
+  6. The producer warpgroup returns with copies possibly still in flight (CUTLASS's producer tail exists for barrier lifetime, which a CTA whose consumers are still running does not need). `wgmma_hopper_bringup` stage E sweeps K across the ring depth -- fewer K tiles than stages (the producer exits while consumers still wait), exactly as many, and several wraps -- confirming no hang and no early SMEM reclaim, against the reference each time.
+  7. Ragged shapes (`wgmma_hopper_bringup` stage F) -- M, N and K each not a multiple of the tile, against the f64 reference, to confirm TMA's zero fill and the predicated epilogue together cover the edges.
+  8. Only then, performance: same-run adjacent A/B against cuBLAS at 4096 and 8192 cubed, with bench_instrument's twin control passing. The gates are `wgmma_vs_cublas` (WGMMA_W1, f16) and `wgmma_bf16_vs_cublas` (WGMMA_W1_BF16), both `#[ignore]`d benches in gpu.rs, both sweeping `WGMMA_BENCH_GRID` -- D1 section 4.4's confirmation grid plus the skinny-N companion -- and both routing every arm through `bench_instrument`: a pre-registered TwinPlan, `run_rotated` with the cuBLAS peer as BOTH the A and the C arm (the cuBLAS-called-twice control plan section 6.2 asks for, so C/A is the peer's own noise floor and B/A is the claim), `analyze` for the per-shape floor, and `Round::publish` as the only way a number leaves the round. They PRINT a table and assert NOTHING about speed -- a slow result is a finding, not a test failure; the only asserts are the exact-integer correctness spot-check that gates the timing and the structural ones. Run them as WGMMA_BENCH_INVOCATION.
+  9. THE CLUSTER, AND THEN ITS AXIS. The 2026-08-10 Act-2 round measured 58.8-67.5% of cuBLAS where D1 4.5 predicts 95-108%, on a clean instrument, and its own provenance line named the reason it could not be the whole story: the measured kernel was W1 MINUS the 2x1x1 cluster with .multicast::cluster on A. WGMMA_W1_MC is that arm and round 2 measured it: real (+1.8 points at sq4096, +17.0 at sq8192) and NOT the gap. It cannot be, arithmetically -- at the measured BW_L2 of 7.00 TB/s an A-multicast 2x1x1 has I_cta 102.4 and an L2 roof of 717 TFLOP/s, below the peer's measured 838.7. WGMMA_W1_MCB is the answer: a 1x2x1 cluster multicasting B, the WIDER operand, for I_cta 128.0 and a ~896 TFLOP/s roof. Four mechanisms are unproven per arm and each fails silently or hangs rather than erroring: the ctaMask and the per-rank slice (a wrong one is stale shared memory on the M rows -- or, in the B arm, the N columns -- this CTA did not fetch itself); the per-destination transaction count (a wrong one hangs); the cluster-scoped empty-barrier arrivals through mapa (a missing one lets a producer overwrite a slice a peer is still reading); and the two barrier.cluster rendezvous, without which a peer signals an uninitialised mbarrier or writes the shared memory of a CTA that has exited. `wgmma_cluster_multicast_is_exact` in gpu.rs is the correctness gate -- BOTH arms, four shapes each, every one spanning at least one full two-CTA cluster ON THAT ARM'S OWN GRID AXIS, including one with an ODD tile count on that axis so the rounded grid's pad CTA is exercised, each verified `==` against the f64 reference AND bit-identical to the un-clustered row. `wgmma_config_sweep` is the performance round (WGMMA_SWEEP_INVOCATION): baseline vs B-multicast vs A-multicast at a fixed tile and depth, the depth axis at all three settings so they are not confounded, the square W3c tile as the control where both axes have identical I_cta, and the two over-budget depths kept as printed declines.
+test gpu::tests::wgmma_declines_on_every_part_that_is_not_hopper ... ok
+
+================ wgmma / TMA Hopper bring-up ================
+[wgmma-bringup] device: NVIDIA H100 80GB HBM3 (cc 9.0, 132 SMs, opt-in SMEM 232448 B, driver 13000)
+[wgmma-bringup] item 3 (registers / spills) is ALREADY ANSWERED, on a CPU, by the
+                2026-08-10 ptxas census at sm_90a, logged in
+                bench/gpu/h100/2026-08-10-ptxas-census.log: all three wgmma rows
+                report 168 regs whole-CTA, 0 spill stores, 0 spill loads, 0 stack
+                (setmaxnreg then redistributes: 32p/232c for the two 128x256 s4
+                rows, 32p/168c for the 128x128 s6 row). Not re-derived here.
+                item 8 (vs cuBLAS) is NOT in this gate: correctness first.
+
+[wgmma-bringup] A. item 2 -- cuModuleLoadData on the generated sm_90a text
+      wgmma_nt_f16_128x256x64_s4          LOADED   384 thr, 196672 B dyn smem, 4 stages, cluster 1x1x1 mc -, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_bf16_128x256x64_s4         LOADED   384 thr, 196672 B dyn smem, 4 stages, cluster 1x1x1 mc -, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x128x64_s6          LOADED   384 thr, 196704 B dyn smem, 6 stages, cluster 1x1x1 mc -, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x256x64_s4_mc2      LOADED   384 thr, 196672 B dyn smem, 4 stages, cluster 2x1x1 mc A, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x256x64_s4_mcb2     LOADED   384 thr, 196672 B dyn smem, 4 stages, cluster 1x2x1 mc B, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x256x64_s3          LOADED   384 thr, 147504 B dyn smem, 3 stages, cluster 1x1x1 mc -, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x256x64_s3_mcb2     LOADED   384 thr, 147504 B dyn smem, 3 stages, cluster 1x2x1 mc B, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x256x64_s3_mc2      LOADED   384 thr, 147504 B dyn smem, 3 stages, cluster 2x1x1 mc A, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x256x64_s2          LOADED   384 thr,  98336 B dyn smem, 2 stages, cluster 1x1x1 mc -, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x256x64_s2_mcb2     LOADED   384 thr,  98336 B dyn smem, 2 stages, cluster 1x2x1 mc B, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x256x64_s2_mc2      LOADED   384 thr,  98336 B dyn smem, 2 stages, cluster 2x1x1 mc A, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x128x64_s6_mcb2     LOADED   384 thr, 196704 B dyn smem, 6 stages, cluster 1x2x1 mc B, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wgmma_nt_f16_128x128x64_s6_mc2      LOADED   384 thr, 196704 B dyn smem, 6 stages, cluster 2x1x1 mc A, SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+      wk_tma_stage_probe                 LOADED   128 thr,  32776 B dyn smem (geometry-generic)
+      wk_wgmma_desc_sweep                LOADED   128 thr, 147456 B dyn smem (one module, every candidate)
+   -> item 2 PASS: 15 modules loaded
+
+[wgmma-bringup] B. item 4 -- cuTensorMapEncodeTiled, then ONE staged tile vs a host copy
+      wgmma_nt_f16_128x256x64_s4     A box 128x64 ( 16384 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_f16_128x256x64_s4     B box 256x64 ( 32768 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_bf16_128x256x64_s4    A box 128x64 ( 16384 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_bf16_128x256x64_s4    B box 256x64 ( 32768 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_f16_128x128x64_s6     A box 128x64 ( 16384 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_f16_128x128x64_s6     B box 128x64 ( 16384 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_f16_128x256x64_s4_mc2 A box 64x64 (  8192 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_f16_128x256x64_s4_mc2 B box 256x64 ( 32768 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_f16_128x256x64_s4_mcb2 A box 128x64 ( 16384 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+      wgmma_nt_f16_128x256x64_s4_mcb2 B box 128x64 ( 16384 B): encode OK, 4 tiles (incl. 3 ragged) MATCH the host copy
+   -> item 4 PASS: 40 staged tiles byte-identical to the host copy
+
+[wgmma-bringup] C. item 5 -- the mainloop completes (deadline 30 s)
+      wgmma_nt_f16_128x256x64_s4 128x256x256 (4 K tiles = 4 stages): returned in 0.49 ms, all 32768 lanes finite
+   -> item 5 PASS: the producer/consumer pipeline completes and does not deadlock.
+      (No correctness claim yet -- which descriptor reading is right is stage D.)
+
+[wgmma-bringup] D. item 1 -- the DESCRIPTOR SWEEP: 19 candidates x K in [16, 64], all through ONE module (wk_wgmma_desc_sweep)
+      candidate                    arm            exact@K16 exact@K64 max_abs@K64
+      ctl/rowmajor-k-leading       as-written/None        64        64     2.625e5
+      ctl/rowmajor-mn-leading      as-written/None         2         0     8.235e6
+      rowmajor/lbo128-sbo1024      as-written/None         0         0     1.319e6
+      rowmajor/lbo16-sbo128        as-written/None         1         1     8.523e6
+      rowmajor/lbo1024-sbo128      as-written/None         2         0     8.215e6
+      copy/rowmajor-k-leading      verbatim/None         64        64     2.625e5
+      canon-kfast/lbo128-sbo1024   canon-kfast/None      4096      4096     0.000e0
+      canon-kfast/swapped          canon-kfast/None       128         0     7.157e6
+      canon-mnfast/lbo1024-sbo128  canon-mnfast/None      4096      4096     0.000e0
+      canon-mnfast/swapped         canon-mnfast/None       128         0     8.206e6
+      canon-kfast/raw-fields       canon-kfast/None         0         0     8.873e6
+      canon-kfast/double-encoded   canon-kfast/None         0         0     8.342e6
+      sw128/lbo16                  as-written/B128      4096      4096     0.000e0
+      sw128/lbo128                 as-written/B128      4096      4096     0.000e0
+      sw128/lbo1024                as-written/B128      4096      4096     0.000e0
+      sw128/swapped                as-written/B128        64        64     8.274e6
+      sw128/lbo16-bo1              as-written/B128      1024      1536     3.277e5
+      sw128/lbo16-bo2              as-written/B128         0      2048     2.621e5
+      sw128/sbo128                 as-written/B128        64        64     8.274e6
+        why ctl/rowmajor-k-leading     the reading this family shipped; the 2026-08-10 H100 log scored it 64/4096 exact, and the sweep reproducing that number is how the sweep validates ITSELF
+        why ctl/rowmajor-mn-leading    the other 2026-08-10 arm, logged at 0/4096 -- the axis-naming coin flip the round already spent
+        why rowmajor/lbo128-sbo1024    the ISA figure's own numbers for a COMPACT 64x16 tile (LBO one core matrix, SBO one row group) applied unchanged to the row-major tile -- the misreading's nearest neighbour, and the only descriptor-only row whose LBO is a core matrix rather than a k-group
+        why rowmajor/lbo16-sbo128      SBO = ONE core matrix rather than one 8-row group: the reading in which the stride field counts core matrices
+        why rowmajor/lbo1024-sbo128    the shape a CUTLASS make_gmma_desc printout carries (LBO 64 u128 = 1024 B, SBO 8 u128 = 128 B) read straight onto the row-major tile
+        why copy/rowmajor-k-leading    control row 1's descriptor over a tile the probe's OWN repack loop copied element by element: if this disagrees with row 1 the repack loop is broken and every canonical arm below is uninterpretable
+        why canon-kfast/lbo128-sbo1024 THE LEADING HYPOTHESIS: every 8x16 B core matrix packed into 128 CONTIGUOUS bytes, grid K-fastest; LBO = K-adjacent core matrix (128 B), SBO = MN-adjacent core-matrix row (BK/8 * 128 = 1024 B); the base advances two core matrices (256 B) per K step
+        why canon-kfast/swapped        the axis-naming coin flip, asked over a layout a descriptor can actually describe
+        why canon-mnfast/lbo1024-sbo128 the MN-fastest canonical packing: core matrices along MN contiguous, so LBO (K-adjacent) = rows/8 * 128 and SBO (MN-adjacent) = 128; the base advances a whole column of core matrices per K step
+        why canon-mnfast/swapped       the coin flip over the MN-fastest packing
+        why canon-kfast/raw-fields     the hypothesis with LBO/SBO written as RAW BYTES: rules out an encoding in which the `>> 4` applies to the start address alone
+        why canon-kfast/double-encoded the hypothesis with the `>> 4` applied TWICE (the mirror mistake); it degenerates to LBO 0 / SBO 4 and is here only so the encoding question is closed in both directions
+        why sw128/lbo16                THE PRODUCTION CANDIDATE: at BK=64 f16 the shared row is exactly the 128-B swizzle atom, and the ISA's canonical 128-B-swizzle K-major layout IS plain row-major (row stride 128, k-group stride 16, SBO = 8*128) composed with Swizzle<3,4,3> -- precisely what a SWIZZLE_128B TMA copy writes. No repack. LBO does not appear in that formula, so 16 spells the fixed k-group stride
+        why sw128/lbo128               the same arm with the second plausible spelling of the LBO the mode ignores (one core matrix)
+        why sw128/lbo1024              the same arm with LBO == SBO, the third spelling seen in the wild
+        why sw128/swapped              the 128-B arm with the two fields exchanged (LBO = the 8-row atom, SBO = the k-group stride). CUTLASS's descriptor builder assigns the pair one way for the unswizzled canonical layout and the other way for the swizzled ones; the published derivation keeps SBO on the MN axis in both. One launch settles which
+        why sw128/lbo16-bo1            base_offset 1: if the hardware anchors the swizzle pattern at the descriptor's START ADDRESS rather than at the enclosing 1024-B boundary, the 32-B-per-K-step base advance needs a phase and every bo=0 row of this arm fails at K=64 while passing at K=16
+        why sw128/lbo16-bo2            the same phase probe at the value one whole 32-B K step would need
+        why sw128/sbo128               SBO = one 128-B row rather than one 8-row atom, in case the swizzled mode counts rows where the unswizzled one counts row groups
+
+      lane map for canon-kfast/lbo128-sbo1024 (canon-kfast/None) at K=64 -- per output core matrix, exact/64 and max_abs:
+         n/8       0            1            2            3            4            5            6            7
+        m/8=0   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=1   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=2   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=3   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=4   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=5   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=6   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=7   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+
+      lane map for canon-mnfast/lbo1024-sbo128 (canon-mnfast/None) at K=64 -- per output core matrix, exact/64 and max_abs:
+         n/8       0            1            2            3            4            5            6            7
+        m/8=0   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=1   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=2   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=3   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=4   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=5   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=6   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=7   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+
+      lane map for sw128/lbo16 (as-written/B128) at K=64 -- per output core matrix, exact/64 and max_abs:
+         n/8       0            1            2            3            4            5            6            7
+        m/8=0   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=1   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=2   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=3   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=4   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=5   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=6   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=7   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+
+      lane map for sw128/lbo128 (as-written/B128) at K=64 -- per output core matrix, exact/64 and max_abs:
+         n/8       0            1            2            3            4            5            6            7
+        m/8=0   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=1   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=2   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=3   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=4   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=5   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=6   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+        m/8=7   64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0  64/64    0e0
+
+      Also exact at both K passes, but NOT something production ships as generated: ["canon-kfast/lbo128-sbo1024 (canon-kfast/None)", "canon-mnfast/lbo1024-sbo128 (canon-mnfast/None)"]. A hand-staged arm says what the fix IS; a non-standard field encoding or a base-offset phase says which field the hardware actually reads.
+   -> item 1 SETTLED: the winning production arm is `as-written/B128`, rows ["sw128/lbo16", "sw128/lbo128", "sw128/lbo1024"].
+      (More than one field spelling is exact in that arm, which is itself a finding: the mode IGNORES the field they differ in.)
+      the production reading is `SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }` (candidate sw128/lbo16)
+      ACTION: none. SHIPPED_LAYOUT already carries that reading, so WGMMA_W1 / WGMMA_W1_BF16 / WGMMA_W3C are correct as generated and stages E-G below run them.
+   -> item 1 PASS: the descriptor reading is settled ON HARDWARE.
+
+[wgmma-bringup] E. item 6 -- K swept across the 4 -stage ring (producer tail + wrap), on the winning reading
+      K=64     ( 1 tiles < 4 stages):   0.77 ms  EXACT, and bit-identical on a second run
+      K=128    ( 2 tiles < 4 stages):   0.68 ms  EXACT, and bit-identical on a second run
+      K=256    ( 4 tiles == 4 stages):   1.73 ms  EXACT, and bit-identical on a second run
+      K=320    ( 5 tiles > 4 stages):   0.82 ms  EXACT, and bit-identical on a second run
+      K=1024   (16 tiles > 4 stages):   1.19 ms  EXACT, and bit-identical on a second run
+   -> item 6 PASS: producer tail, exact fill and repeated wraps all correct, reproducibly
+
+[wgmma-bringup] F. item 7 -- ragged M, N and K (TMA zero fill + predicated epilogue)
+          1 x 8     x 1     (M%BM=  1 N%BN=  1 K%BK=  8):   0.45 ms  EXACT
+         17 x 24    x 33    (M%BM= 17 N%BN= 33 K%BK= 24):   0.97 ms  EXACT
+         65 x 104   x 300   (M%BM= 65 N%BN= 44 K%BK= 40):   1.72 ms  EXACT
+        129 x 176   x 257   (M%BM=  1 N%BN=  1 K%BK= 48):   0.76 ms  EXACT
+        253 x 368   x 507   (M%BM=125 N%BN=251 K%BK= 48):   1.06 ms  EXACT
+      K=100 (row stride 200 B): DECLINED cleanly -- "tma: global_strides[0] = 200 B is not a multiple of 16"
+   -> item 7 PASS: every ragged edge covered by zero fill + predication, and an unencodable K declines instead of launching
+
+[wgmma-bringup] G. the other shipped rows, on the confirmed reading
+      wgmma_nt_bf16_128x256x64_s4        128x256x256 (Bf16, 4 stages):   0.61 ms  EXACT
+      wgmma_nt_f16_128x128x64_s6         128x384x128 (F16, 6 stages):   0.72 ms  EXACT
+
+[gate] wgmma Hopper bring-up on NVIDIA H100 80GB HBM3: items 2, 4, 5, 1, 6, 7 PASS in that order; the descriptor reading is SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false } ✓
+[wgmma-bringup] Item 9 (BOTH cluster arms: 2x1x1 + A-multicast on grid x, and 1x2x1 +
+                B-multicast on grid y) is NOT in this sequence: it is its own non-ignored gate,
+                because its failure mode -- stale shared memory on the M rows (A arm) or the N
+                columns (B arm) a CTA did not fetch itself -- needs shapes wide enough for the
+                multicast to cross CTAs on that arm's OWN grid axis, which the stage E/F/G shapes
+                deliberately are not. Run it as:
+                  WUKONG_GPU_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu -- --nocapture --test-threads=1 wgmma_cluster_multicast_is_exact
+=============================================================
+
+test gpu::tests::wgmma_hopper_bringup ... ok
+test gpu::tests::wgmma_vs_cublas ... ignored, Act-2 perf round; Hopper + cuBLAS; run explicitly (ptx_wgmma::WGMMA_BENCH_INVOCATION)
+test ptx_wgmma::tests::desc_fields_spells_every_reading_from_one_table ... ok
+test ptx_wgmma::tests::dump_wgmma_ptx ... ignored, inspection helper, not a gate
+test ptx_wgmma::tests::every_branch_target_is_a_defined_label ... ok
+test ptx_wgmma::tests::every_module_opens_at_the_architecture_locked_hopper_floor ... ok
+test ptx_wgmma::tests::every_sm90a_emitter_demands_the_license ... ok
+test ptx_wgmma::tests::every_stage_base_is_aligned_for_its_descriptor ... ok
+test ptx_wgmma::tests::every_sweep_candidate_reads_inside_the_window ... ok
+test ptx_wgmma::tests::pack_rejects_anything_the_shift_would_truncate ... ok
+test ptx_wgmma::tests::scale_d_replaces_the_accumulator_zeroing ... ok
+test ptx_wgmma::tests::smem_desc_packs_every_field_at_its_documented_bit_position ... ok
+test ptx_wgmma::tests::the_accumulator_vector_matches_the_shape ... ok
+test ptx_wgmma::tests::the_bench_grid_carries_d1s_points_and_both_rectangular_classes ... ok
+test ptx_wgmma::tests::the_bench_grid_is_launchable_by_every_shipped_row ... ok
+test ptx_wgmma::tests::the_bench_invocation_names_the_bench_and_the_flags_it_needs ... ok
+test ptx_wgmma::tests::the_bringup_invocation_names_the_gate_and_the_flags_it_needs ... ok
+test ptx_wgmma::tests::the_bringup_operands_are_exact_in_f16_and_f32 ... ok
+test ptx_wgmma::tests::the_canonical_core_matrix_layout_is_describable ... ok
+test ptx_wgmma::tests::the_cluster_axis_arithmetic_ranks_the_wider_operand_first ... ok
+test ptx_wgmma::tests::the_cluster_preconditions_reject_every_way_a_slice_can_be_wrong ... ok
+test ptx_wgmma::tests::the_declared_transaction_equals_what_the_copies_move_per_destination_cta ... ok
+test ptx_wgmma::tests::the_descriptor_swizzle_encoding_is_reversed_from_tmas ... ok
+test ptx_wgmma::tests::the_device_validation_list_is_intact ... ok
+test ptx_wgmma::tests::the_entry_name_is_derivable_from_the_geometry ... ok
+test ptx_wgmma::tests::the_epilogue_stores_every_accumulator_exactly_once_and_bounded ... ok
+test ptx_wgmma::tests::the_family_declares_no_floor_it_does_not_need ... ok
+test ptx_wgmma::tests::the_field_encoder_is_mask_then_shift ... ok
+test ptx_wgmma::tests::the_field_encodings_are_three_distinguishable_templates ... ok
+test ptx_wgmma::tests::the_grid_is_cluster_divisible_and_still_covers_the_output ... ok
+test ptx_wgmma::tests::the_iteration_count_is_a_clamped_monotone_function_of_the_shape ... ok
+test ptx_wgmma::tests::the_launch_plan_covers_the_output ... ok
+test ptx_wgmma::tests::the_license_is_hopper_only_in_both_directions ... ok
+test ptx_wgmma::tests::the_mainloop_is_structurally_what_the_design_says ... ok
+test ptx_wgmma::tests::the_multicast_mask_names_every_cta_of_the_cluster ... ok
+test ptx_wgmma::tests::the_register_split_fits_the_file ... ok
+test ptx_wgmma::tests::the_row_major_reading_is_unrepresentable_and_predicts_the_log ... ok
+test ptx_wgmma::tests::the_runtime_address_fold_matches_the_host_encoder ... ok
+test ptx_wgmma::tests::the_shape_menu_is_the_isa_menu ... ok
+test ptx_wgmma::tests::the_stage_lattice_matches_the_derivation ... ok
+test ptx_wgmma::tests::the_sweep_candidate_set_is_derived_and_complete ... ok
+test ptx_wgmma::tests::the_sweep_invocation_and_shapes_name_things_that_exist ... ok
+test ptx_wgmma::tests::the_sweep_probe_is_one_module_for_every_candidate ... ok
+test ptx_wgmma::tests::the_sweep_probe_shared_memory_map_is_aligned_and_bounded ... ok
+test ptx_wgmma::tests::the_swizzle_modes_constrain_the_start_address ... ok
+test ptx_wgmma::tests::the_tma_geometry_is_validated_with_the_kernel ... ok
+test ptx_wgmma::tests::the_tma_stage_probe_is_structurally_a_single_stage_load ... ok
+test ptx_wgmma::tests::the_window_declaration_agrees_with_the_host_side_constant ... ok
+test ptx_wgmma::tests::tma_probe_plan_matches_the_geometry_it_probes ... ok
+test ptx_wgmma::tests::unsupported_shapes_decline_rather_than_emit ... ok
+test ptx_wgmma::tests::variant_lookup_finds_every_shipped_row ... ok
+
+thread 'ptx_wgmma::tests::variant_lookup_panics_rather_than_mis_dispatching' (124) panicked at crates/wukong_codegen_gpu/src/ptx_wgmma.rs:1781:28:
+unknown wgmma variant "wgmma_nt_f16_nope"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: wukong_codegen_gpu::ptx_wgmma::tests::variant_lookup_panics_rather_than_mis_dispatching
+   3: <wukong_codegen_gpu::ptx_wgmma::tests::variant_lookup_panics_rather_than_mis_dispatching::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test ptx_wgmma::tests::variant_lookup_panics_rather_than_mis_dispatching - should panic ... ok
+test ptx_wgmma::tests::warpgroup_arithmetic_is_the_isa_definition ... ok
+test ptx_wgmma::tests::wgmma_ptx_is_pure_ascii ... ok
+
+test result: ok. 55 passed; 0 failed; 4 ignored; 0 measured; 479 filtered out; finished in 2.20s
+
+[1m[92m   Doc-tests[0m wukong_codegen_gpu
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m-> ok in 7.6s[0m
+
+codegen_gpu: PASS   driver: skipped
+[meter] test: 8.9s wall = $0.011 (record this in the round log)
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/aidanht/main/ap-wEm7bpIbEx8WIfrOZJEPH1
+=== EXACTNESS GREEN, STARTING ROUND 3 ===
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-Y01psBtEawdxv1ZU83839I
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function build_peers.
+├── 🔨 Created function ptxas.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+├── 🔨 Created function peers.
+├── 🔨 Created function cutlass.
+├── 🔨 Created function marlin.
+├── 🔨 Created function framework.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[meter] bench: H100! + 8.0 cpu + 16 GiB = $4.456/hr; timeout 7200s caps this call at $8.91
+[src] 807 files stamped; 0 new/changed since the last run (incremental)
+Sweep on H100! — PEER_REQUIRED=1, STRONG_PEERS=(none declared)
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --release -- wgmma_config_sweep --ignored --nocapture --test-threads=1[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.62s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_gpu-53f0e4b228126785)
+
+running 1 test
+
+================ wgmma_config_sweep ================
+# ---- wukong GPU round provenance (GPU_RETARGET_PLAN.md 6.1, emitted by the harness) ----
+round          : wgmma_config_sweep
+gpu            : NVIDIA H100 80GB HBM3
+compute cap    : 9.0
+SMs            : 132
+spec check     : VERIFIED against spec (132 SMs, cc 9.0; GH100 SXM5 / NVL, 16896 cores / 128)
+opt-in SMEM    : 232448 B
+L2             : 52428800 B
+VRAM           : 85017624576 B
+driver CUDA API: 13.0 (13000)
+CUDA runtime   : none linked (driver API only: PTX is JIT-loaded by the driver)
+kmd driver     : 580.95.05
+provider / SKU : n/a / n/a
+clock lock     : UNKNOWN (undeclared)
+clocks before  : sm 1980 MHz  mem 2619.0 MHz  temp 24.0 C  power 95.3 W
+peer (arms A,C): cuBLAS f16 (f32 out)
+*** CLOCKS ARE NOT LOCKED (or the lock is undeclared). Per GPU_RETARGET_PLAN.md 6.3 this round is ITERATION data, not publication data.
+plan           : 14 rows x 3 shapes, 5 recorded rounds + 1 warm-up, bar +/-5.00%, median across rounds
+wait depth     : NOT an axis. The mainloop's `wgmma.wait_group 0` sits immediately before the stage release,
+                 so its depth is pinned by the release (the buffer may not be published before its last read),
+                 not free. The lever round 1's PTX dump exposes is a RESTRUCTURING -- commit per K step and
+                 defer the release one stage, so the tensor cores are not drained to empty between stages --
+                 plus a vectorized epilogue (128 scalar predicated st.global.f32 today, pairs are adjacent).
+                 Both are follow-ups; neither is a knob this round could sweep.
+bench machine_floor: floor +1.25% (bar +/-5.00%), median of 5 rounds  [GATE SHUT: control-only round: the floor is measured, but there is no contender arm to publish]
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  probe_us                      11.433650      11.290450            n/a     -1.25%        n/a  no-contender
+
+---- wgmma_config_sweep: the configuration grid ----
+smem layout    : SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false } (every row; the reading the 2026-08-10 sweep settled on hardware)
+multicast rule : a .multicast::cluster copy of n bytes performs complete-tx of n on EVERY destination
+                 CTA's mbarrier -- it does not divide n among them -- so a c-way split multicast of the
+                 SHARED operand plus one own copy of the other is still tile_a + tile_b per CTA. All
+                 three settings therefore declare the SAME expect_tx, reached by different arithmetic.
+THE HYPOTHESIS : multicast the WIDER operand. With BW_L2 MEASURED at 7.00 TB/s (gpt_d1024_down ran
+                 597.6 TFLOP/s through I_cta 85.33), a cluster's L2 roof is BW_L2 * I_cta with
+                 I_cta = bm*bn/(bm/cm + bn/cn). At W1's 128x256 tile: no cluster 85.33 -> 597 TFLOP/s;
+                 2x1x1 multicasting A (the 128-row operand) 102.4 -> 717, which is BELOW cuBLAS's
+                 measured 838.7 at sq4096 and therefore cannot reach the peer; 1x2x1 multicasting B
+                 (the 256-wide operand) 128.0 -> 896, above the peer's whole column. Round 2 measured
+                 the A arm at +1.8 points at sq4096 and +17.0 at sq8192: real, and not the gap.
+                 The B arm is the arm under test; the A arm is the control for the axis.
+  w1_s4_off    wgmma_nt_f16_128x256x64_s4          128x256x64 s4 cluster 1x1x1 mc -, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      why THE BASELINE. Rounds 1 and 2's measured row, unchanged: 128x256x64 s4, cluster 1x1x1, I_cta 85.33, L2 roof 597 TFLOP/s at the measured 7.00 TB/s. It must land near round 2's 66.3% at sq4096 / 55.2% at sq8192, or the instrument moved and no other row is readable
+  w1_s4_mcb2   wgmma_nt_f16_128x256x64_s4_mcb2     128x256x64 s4 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      why THE PRIMARY. The same tile, depth, layout and register split with a 1x2x1 cluster and .multicast::cluster on B -- the WIDER operand. I_cta = 128*256/(128 + 256/2) = 128.0, L2 roof ~896 TFLOP/s, above the peer's whole column (838.7/864.3/816.4 need 6.55/6.75/6.38 TB/s of the measured 7.00). This is the arm the arithmetic says closes the gap the A arm could not
+  w1_s4_mc2    wgmma_nt_f16_128x256x64_s4_mc2      128x256x64 s4 cluster 2x1x1 mc A, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      why THE CONTROL for the axis. The same tile with the cluster on the OTHER axis (2x1x1, multicast A, the 128-row operand): I_cta 102.4, roof 717 TFLOP/s -- arithmetically BELOW cuBLAS's 838.7 at sq4096. Round 2 measured it at 68.1% vs the baseline's 66.3%. Keeping it in the table is what makes the primary's delta a statement about the AXIS rather than about clustering at all
+  w1_s3_off    wgmma_nt_f16_128x256x64_s3          128x256x64 s3 cluster 1x1x1 mc -, 384 thr, 32p/232c regs | 3 stages x 49152 B + 48 B barriers = 147504 B of 232448 B (63.5%)
+      why Depth 3 without the cluster: the control arm of the depth axis
+  w1_s3_mcb2   wgmma_nt_f16_128x256x64_s3_mcb2     128x256x64 s3 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 3 stages x 49152 B + 48 B barriers = 147504 B of 232448 B (63.5%)
+      why Depth 3 with the B cluster. Halving B's L2 traffic shortens the fill the ring is hiding, so the depth that was right at full traffic need not be right at half -- and round 2 already measured depth 3 BEATING depth 4 at sq8192 with no cluster at all (70.4% vs 55.2%), so this axis is not decorative
+  w1_s3_mc2    wgmma_nt_f16_128x256x64_s3_mc2      128x256x64 s3 cluster 2x1x1 mc A, 384 thr, 32p/232c regs | 3 stages x 49152 B + 48 B barriers = 147504 B of 232448 B (63.5%)
+      why Depth 3 with the A cluster: the third setting at the same depth, so 'deeper', 'clustered' and 'which operand' are three separable facts rather than one
+  w1_s2_off    wgmma_nt_f16_128x256x64_s2          128x256x64 s2 cluster 1x1x1 mc -, 384 thr, 32p/232c regs | 2 stages x 49152 B + 32 B barriers = 98336 B of 232448 B (42.3%)
+      why Depth 2 without the cluster -- the shallow end, and the row that says how much of the deficit is fill latency at all
+  w1_s2_mcb2   wgmma_nt_f16_128x256x64_s2_mcb2     128x256x64 s2 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 2 stages x 49152 B + 32 B barriers = 98336 B of 232448 B (42.3%)
+      why Depth 2 with the B cluster. Pairing every measurable depth at all three cluster settings is what keeps 'deeper is better' and 'this cluster is better' from being one measurement
+  w1_s2_mc2    wgmma_nt_f16_128x256x64_s2_mc2      128x256x64 s2 cluster 2x1x1 mc A, 384 thr, 32p/232c regs | 2 stages x 49152 B + 32 B barriers = 98336 B of 232448 B (42.3%)
+      why Depth 2 with the A cluster -- the shallow end of the control axis, and round 2's worst 128x256 row (57.7% at sq4096), which is the shape of a ring too short to hide the fill it still pays for
+  w1_s5_mc2    wgmma_nt_f16_128x256x64_s5_mc2      DECLINED | 5 stages x 49152 B + 80 B barriers = 245840 B of 232448 B (105.8%)
+      ptx_wgmma::UNSUPPORTED: wgmma_nt_f16_128x256x64_s5_mc2: 245840 B of shared memory (5 stages x 49152 B + 80 B of barriers) exceeds the 232448 B per-CTA ceiling
+      why Depth 5 at 128x256. EXPECTED TO DECLINE on shared memory -- and the decline is the point: no cluster changes the ring's size, whichever operand it multicasts, so the depth axis stops at 4 for this tile at ALL THREE cluster settings
+  w1_s6_mc2    wgmma_nt_f16_128x256x64_s6_mc2      DECLINED | 6 stages x 49152 B + 96 B barriers = 295008 B of 232448 B (126.9%)
+      ptx_wgmma::UNSUPPORTED: wgmma_nt_f16_128x256x64_s6_mc2: 295008 B of shared memory (6 stages x 49152 B + 96 B of barriers) exceeds the 232448 B per-CTA ceiling
+      why Depth 6 at 128x256. Expected to decline by a wider margin, which pins the ceiling rather than leaving it at one data point
+  w3c_s6_off   wgmma_nt_f16_128x128x64_s6          128x128x64 s6 cluster 1x1x1 mc -, 384 thr, 32p/168c regs | 6 stages x 32768 B + 96 B barriers = 196704 B of 232448 B (84.6%)
+      why D1's moderate-size arm (128x128x64 s6), which round 1 excluded because a second kernel in ITS contender arm would have been an A/B against two things at once. Here every row is scored against the same cuBLAS, so it is a row
+  w3c_s6_mcb2  wgmma_nt_f16_128x128x64_s6_mcb2     128x128x64 s6 cluster 1x2x1 mc B, 384 thr, 32p/168c regs | 6 stages x 32768 B + 96 B barriers = 196704 B of 232448 B (84.6%)
+      why The SQUARE tile with the B cluster. At bm == bn the two axes have IDENTICAL I_cta (85.33 either way), so this row and w3c_s6_mc2 are the round's control on the claim that the axis matters only through the traffic arithmetic: a difference between them is mechanism (raster locality, multicast issue cost), not roof
+  w3c_s6_mc2   wgmma_nt_f16_128x128x64_s6_mc2      128x128x64 s6 cluster 2x1x1 mc A, 384 thr, 32p/168c regs | 6 stages x 32768 B + 96 B barriers = 196704 B of 232448 B (84.6%)
+      why The square tile with the A cluster -- the other half of that control pair, and round 2's 56.9% at sq4096 against the un-clustered 57.5%
+  -> 12 of 14 rows are launchable on this part (232448 B carveout). A decline is a finding: clustering does
+     not change the ring's size, so the depth axis stops at the same place at BOTH cluster settings.
+
+---- wgmma_config_sweep: correctness, before a single timed launch ----
+Every row runs at M = 2 x its own BM AND N = 2 x its own BN -- two tiles on BOTH grid axes -- because the
+two clustered arms sit on DIFFERENT axes: a 2x1x1 cluster spans two CTAs along x and a 1x2x1 spans two
+along y, and a shape that is one tile wide on an arm's own axis makes its multicast a copy to self, which
+proves nothing. A multicast defect is silently wrong data on half the accumulator rows (A arm) or half
+its columns (B arm), so the verdict is `==` against an f64 reference over exact-integer operands, never a
+tolerance. A fast wrong kernel must not post a timing.
+  w1_s4_off    256x256x512 grid 2x2 (4 cluster(s) of 1): EXACT on all 131072 lanes
+  w1_s4_mcb2   256x256x512 grid 2x2 (2 cluster(s) of 2): EXACT on all 131072 lanes
+  w1_s4_mc2    256x256x512 grid 2x2 (2 cluster(s) of 2): EXACT on all 131072 lanes
+  w1_s3_off    256x192x512 grid 2x2 (4 cluster(s) of 1): EXACT on all 131072 lanes
+  w1_s3_mcb2   256x192x512 grid 2x2 (2 cluster(s) of 2): EXACT on all 131072 lanes
+  w1_s3_mc2    256x192x512 grid 2x2 (2 cluster(s) of 2): EXACT on all 131072 lanes
+  w1_s2_off    256x128x512 grid 2x2 (4 cluster(s) of 1): EXACT on all 131072 lanes
+  w1_s2_mcb2   256x128x512 grid 2x2 (2 cluster(s) of 2): EXACT on all 131072 lanes
+  w1_s2_mc2    256x128x512 grid 2x2 (2 cluster(s) of 2): EXACT on all 131072 lanes
+  w3c_s6_off   256x384x256 grid 2x2 (4 cluster(s) of 1): EXACT on all 65536 lanes
+  w3c_s6_mcb2  256x384x256 grid 2x2 (2 cluster(s) of 2): EXACT on all 65536 lanes
+  w3c_s6_mc2   256x384x256 grid 2x2 (2 cluster(s) of 2): EXACT on all 65536 lanes
+  peer         128x256x512: matches the same f64 reference (max_abs 0.00e0) ✓
+
+---- wgmma_config_sweep: sweeping 12 rows x 3 shapes; arms A and C are BOTH cuBLAS f16 (f32 out) (the peer twin), arm B is the row ----
+  sq2048              2048x2048x2048  1000 launches/region  [D1 5.3: 16 MiB, 0.32x L2 -- L2-resident. D1 4.5 puts W3 (128x128) here because a 256-wide tile quantizes below M*N = 4.3e6; W1 is measured here anyway, as the evidence for that claim]
+  sq4096              4096x4096x4096  146 launches/region  [D1 5.3: 64 MiB, 1.28x L2 -- the raster crossover, and the first of the two shapes D1 4.5 predicts W1 at 95-108% of cuBLAS on]
+  sq8192              8192x8192x8192  18 launches/region  [D1 5.3: 256 MiB, 5.12x L2 -- raster plus streaming C, and the second 95-108% point]
+test gpu::tests::wgmma_config_sweep ... 
+---- wgmma_config_sweep: round close ----
+# ---- wukong GPU round provenance (GPU_RETARGET_PLAN.md 6.1, emitted by the harness) ----
+round          : wgmma_config_sweep
+gpu            : NVIDIA H100 80GB HBM3
+compute cap    : 9.0
+SMs            : 132
+spec check     : VERIFIED against spec (132 SMs, cc 9.0; GH100 SXM5 / NVL, 16896 cores / 128)
+opt-in SMEM    : 232448 B
+L2             : 52428800 B
+VRAM           : 85017624576 B
+driver CUDA API: 13.0 (13000)
+CUDA runtime   : none linked (driver API only: PTX is JIT-loaded by the driver)
+kmd driver     : 580.95.05
+provider / SKU : n/a / n/a
+clock lock     : UNKNOWN (undeclared)
+clocks before  : sm 1980 MHz  mem 2619.0 MHz  temp 24.0 C  power 95.3 W
+clocks after   : sm 1980 MHz  mem 2619.0 MHz  temp 29.0 C  power 192.6 W
+sm clock drift : +0.00% (bar +/-5.00%)
+wall           : 63.3 s
+cost estimate  : n/a (set WUKONG_GPU_USD_PER_HR)
+publish gate   : OPEN (round level)
+
+---- wgmma_config_sweep: per-cell verdicts ----
+[w1_s4_off/sq2048]
+bench wgmma_config_sweep@w1_s4_off/sq2048: floor +3.29% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.026268       0.025404       0.039094     -3.29%    +48.82%  moved
+[w1_s4_off/sq4096]
+bench wgmma_config_sweep@w1_s4_off/sq4096: floor +0.06% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163866       0.163769       0.243435     -0.06%    +48.56%  moved
+[w1_s4_off/sq8192]
+bench wgmma_config_sweep@w1_s4_off/sq8192: floor +2.06% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.255071       1.280913       2.273481     +2.06%    +81.14%  moved
+[w1_s4_mcb2/sq2048]
+bench wgmma_config_sweep@w1_s4_mcb2/sq2048: floor +1.84% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025840       0.025364       0.041380     -1.84%    +60.14%  moved
+[w1_s4_mcb2/sq4096]
+bench wgmma_config_sweep@w1_s4_mcb2/sq4096: floor +0.04% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163815       0.163750       0.222735     -0.04%    +35.97%  moved
+[w1_s4_mcb2/sq8192]
+bench wgmma_config_sweep@w1_s4_mcb2/sq8192: floor +1.43% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.271811       1.289983       1.546454     +1.43%    +21.59%  moved
+[w1_s4_mc2/sq2048]
+bench wgmma_config_sweep@w1_s4_mc2/sq2048: floor +0.04% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025800       0.025809       0.041150     +0.04%    +59.50%  moved
+[w1_s4_mc2/sq4096]
+bench wgmma_config_sweep@w1_s4_mc2/sq4096: floor +0.06% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163968       0.163864       0.236996     -0.06%    +44.54%  moved
+[w1_s4_mc2/sq8192]
+bench wgmma_config_sweep@w1_s4_mc2/sq8192: floor +1.05% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.267077       1.280368       1.720171     +1.05%    +35.76%  moved
+[w1_s3_off/sq2048]
+bench wgmma_config_sweep@w1_s3_off/sq2048: floor +0.01% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025764       0.025760       0.038512     -0.01%    +49.48%  moved
+[w1_s3_off/sq4096]
+bench wgmma_config_sweep@w1_s3_off/sq4096: floor +0.05% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163846       0.163932       0.239936     +0.05%    +46.44%  moved
+[w1_s3_off/sq8192]
+bench wgmma_config_sweep@w1_s3_off/sq8192: floor +0.61% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.272421       1.280203       1.737987     +0.61%    +36.59%  moved
+[w1_s3_mcb2/sq2048]
+bench wgmma_config_sweep@w1_s3_mcb2/sq2048: floor +0.15% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.026041       0.026080       0.041598     +0.15%    +59.74%  moved
+[w1_s3_mcb2/sq4096]
+bench wgmma_config_sweep@w1_s3_mcb2/sq4096: floor +0.09% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163794       0.163945       0.230136     +0.09%    +40.50%  moved
+[w1_s3_mcb2/sq8192]
+bench wgmma_config_sweep@w1_s3_mcb2/sq8192: floor +0.40% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.267076       1.272151       1.637038     +0.40%    +29.20%  moved
+[w1_s3_mc2/sq2048]
+bench wgmma_config_sweep@w1_s3_mc2/sq2048: floor +0.39% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025893       0.025993       0.041724     +0.39%    +61.14%  moved
+[w1_s3_mc2/sq4096]
+bench wgmma_config_sweep@w1_s3_mc2/sq4096: floor +0.05% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163827       0.163908       0.242438     +0.05%    +47.98%  moved
+[w1_s3_mc2/sq8192]
+bench wgmma_config_sweep@w1_s3_mc2/sq8192: floor +1.40% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.263394       1.281096       1.715446     +1.40%    +35.78%  moved
+[w1_s2_off/sq2048]
+bench wgmma_config_sweep@w1_s2_off/sq2048: floor +0.08% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025890       0.025911       0.041643     +0.08%    +60.85%  moved
+[w1_s2_off/sq4096]
+bench wgmma_config_sweep@w1_s2_off/sq4096: floor +0.02% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163849       0.163885       0.266673     +0.02%    +62.76%  moved
+[w1_s2_off/sq8192]
+bench wgmma_config_sweep@w1_s2_off/sq8192: floor +0.77% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.263057       1.272806       1.887912     +0.77%    +49.47%  moved
+[w1_s2_mcb2/sq2048]
+bench wgmma_config_sweep@w1_s2_mcb2/sq2048: floor +0.18% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025733       0.025687       0.047513     -0.18%    +84.64%  moved
+[w1_s2_mcb2/sq4096]
+bench wgmma_config_sweep@w1_s2_mcb2/sq4096: floor +0.05% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163894       0.163973       0.279720     +0.05%    +70.67%  moved
+[w1_s2_mcb2/sq8192]
+bench wgmma_config_sweep@w1_s2_mcb2/sq8192: floor +0.72% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.271320       1.280431       1.941337     +0.72%    +52.70%  moved
+[w1_s2_mc2/sq2048]
+bench wgmma_config_sweep@w1_s2_mc2/sq2048: floor +0.11% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025712       0.025684       0.048136     -0.11%    +87.21%  moved
+[w1_s2_mc2/sq4096]
+bench wgmma_config_sweep@w1_s2_mc2/sq4096: floor +0.04% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163833       0.163901       0.284485     +0.04%    +73.64%  moved
+[w1_s2_mc2/sq8192]
+bench wgmma_config_sweep@w1_s2_mc2/sq8192: floor +0.26% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.271955       1.268649       1.979440     -0.26%    +55.62%  moved
+[w3c_s6_off/sq2048]
+bench wgmma_config_sweep@w3c_s6_off/sq2048: floor +1.14% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025753       0.025459       0.043757     -1.14%    +69.91%  moved
+[w3c_s6_off/sq4096]
+bench wgmma_config_sweep@w3c_s6_off/sq4096: floor +0.04% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163725       0.163784       0.280779     +0.04%    +71.49%  moved
+[w3c_s6_off/sq8192]
+bench wgmma_config_sweep@w3c_s6_off/sq8192: floor +0.72% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.267180       1.276294       2.867013     +0.72%   +126.25%  moved
+[w3c_s6_mcb2/sq2048]
+bench wgmma_config_sweep@w3c_s6_mcb2/sq2048: floor +1.89% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025705       0.025218       0.044609     -1.89%    +73.54%  moved
+[w3c_s6_mcb2/sq4096]
+bench wgmma_config_sweep@w3c_s6_mcb2/sq4096: floor +0.02% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163900       0.163930       0.254457     +0.02%    +55.25%  moved
+[w3c_s6_mcb2/sq8192]
+bench wgmma_config_sweep@w3c_s6_mcb2/sq8192: floor +0.00% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.271870       1.271879       1.842376     +0.00%    +44.86%  moved
+[w3c_s6_mc2/sq2048]
+bench wgmma_config_sweep@w3c_s6_mc2/sq2048: floor +2.65% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.025847       0.025160       0.047157     -2.65%    +82.45%  moved
+[w3c_s6_mc2/sq4096]
+bench wgmma_config_sweep@w3c_s6_mc2/sq4096: floor +0.03% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        0.163778       0.163822       0.285081     +0.03%    +74.07%  moved
+[w3c_s6_mc2/sq8192]
+bench wgmma_config_sweep@w3c_s6_mc2/sq8192: floor +0.02% (bar +/-5.00%), median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1  verdict
+  gemm_ms                        1.271961       1.271689       2.258404     -0.02%    +77.55%  moved
+
+---- wgmma_config_sweep: the published table (% of cuBLAS f16 (f32 out); higher is better) ----
+  row          kernel                                             sq2048                 sq4096                 sq8192
+  w1_s4_off    wgmma_nt_f16_128x256x64_s4         67.2% (moved, +/-3.29%) 67.3% (moved, +/-0.06%) 55.2% (moved, +/-2.06%)
+  w1_s4_mcb2   wgmma_nt_f16_128x256x64_s4_mcb2    62.4% (moved, +/-1.84%) 73.5% (moved, +/-0.04%) 82.2% (moved, +/-1.43%)
+  w1_s4_mc2    wgmma_nt_f16_128x256x64_s4_mc2     62.7% (moved, +/-0.04%) 69.2% (moved, +/-0.06%) 73.7% (moved, +/-1.05%)
+  w1_s3_off    wgmma_nt_f16_128x256x64_s3         66.9% (moved, +/-0.01%) 68.3% (moved, +/-0.05%) 73.2% (moved, +/-0.61%)
+  w1_s3_mcb2   wgmma_nt_f16_128x256x64_s3_mcb2    62.6% (moved, +/-0.15%) 71.2% (moved, +/-0.09%) 77.4% (moved, +/-0.40%)
+  w1_s3_mc2    wgmma_nt_f16_128x256x64_s3_mc2     62.1% (moved, +/-0.39%) 67.6% (moved, +/-0.05%) 73.6% (moved, +/-1.40%)
+  w1_s2_off    wgmma_nt_f16_128x256x64_s2         62.2% (moved, +/-0.08%) 61.4% (moved, +/-0.02%) 66.9% (moved, +/-0.77%)
+  w1_s2_mcb2   wgmma_nt_f16_128x256x64_s2_mcb2    54.2% (moved, +/-0.18%) 58.6% (moved, +/-0.05%) 65.5% (moved, +/-0.72%)
+  w1_s2_mc2    wgmma_nt_f16_128x256x64_s2_mc2     53.4% (moved, +/-0.11%) 57.6% (moved, +/-0.04%) 64.3% (moved, +/-0.26%)
+  w3c_s6_off   wgmma_nt_f16_128x128x64_s6         58.9% (moved, +/-1.14%) 58.3% (moved, +/-0.04%) 44.2% (moved, +/-0.72%)
+  w3c_s6_mcb2  wgmma_nt_f16_128x128x64_s6_mcb2    57.6% (moved, +/-1.89%) 64.4% (moved, +/-0.02%) 69.0% (moved, +/-0.00%)
+  w3c_s6_mc2   wgmma_nt_f16_128x128x64_s6_mc2     54.8% (moved, +/-2.65%) 57.4% (moved, +/-0.03%) 56.3% (moved, +/-0.02%)
+  w1_s5_mc2    wgmma_nt_f16_128x256x64_s5_mc2                   DECLINED
+      5 stages x 49152 B + 80 B barriers = 245840 B of 232448 B (105.8%)  |  ptx_wgmma::UNSUPPORTED: wgmma_nt_f16_128x256x64_s5_mc2: 245840 B of shared memory (5 stages x 49152 B + 80 B of barriers) exceeds the 232448 B per-CTA ceiling
+  w1_s6_mc2    wgmma_nt_f16_128x256x64_s6_mc2                   DECLINED
+      6 stages x 49152 B + 96 B barriers = 295008 B of 232448 B (126.9%)  |  ptx_wgmma::UNSUPPORTED: wgmma_nt_f16_128x256x64_s6_mc2: 295008 B of shared memory (6 stages x 49152 B + 96 B of barriers) exceeds the 232448 B per-CTA ceiling
+
+---- wgmma_config_sweep: RANKED at sq4096 (the first of D1 4.5's two prediction points) ----
+   1. w1_s4_mcb2     73.5%  BEST of this round
+   2. w1_s3_mcb2     71.2%  -3.2% vs the best row
+   3. w1_s4_mc2      69.2%  -5.9% vs the best row
+   4. w1_s3_off      68.3%  -7.2% vs the best row
+   5. w1_s3_mc2      67.6%  -8.1% vs the best row
+   6. w1_s4_off      67.3%  -8.5% vs the best row
+   7. w3c_s6_mcb2    64.4%  -12.4% vs the best row
+   8. w1_s2_off      61.4%  -16.5% vs the best row
+   9. w1_s2_mcb2     58.6%  -20.3% vs the best row
+  10. w3c_s6_off     58.3%  -20.7% vs the best row
+  11. w1_s2_mc2      57.6%  -21.7% vs the best row
+  12. w3c_s6_mc2     57.4%  -21.9% vs the best row
+
+  HEADLINE: the TESTED HYPOTHESIS is `multicast the wider operand`. At the measured BW_L2 of 7.00 TB/s,
+  a 1x2x1 cluster multicasting B gives I_cta = 128*256/(128 + 256/2) = 128.0 and an L2 roof of ~896
+  TFLOP/s, above the peer's measured 838.7 at sq4096; the 2x1x1 A-multicast control gives
+  I_cta 102.4 and 717 TFLOP/s, which is arithmetically below it. At sq4096, of cuBLAS f16 (f32 out):
+    baseline (no cluster)      67.3%
+    PRIMARY  (1x2x1, B)        73.5%   (+6.2 points vs baseline)
+    control  (2x1x1, A)        69.2%   (+1.9 points vs baseline)
+  The claim this round can make is the difference between the two clustered arms (+4.4 points),
+  because they differ in exactly one fact: which grid axis the cluster pairs and therefore which
+  operand is multicast.
+
+---- wgmma_config_sweep: DIAGNOSTIC absolutes (NOT publishable; clock-dependent) ----
+  row          shape           peer ms      ours ms peer TFLOP/s ours TFLOP/s
+  w1_s4_off    sq2048           0.0263       0.0391        654.0        439.5
+  w1_s4_off    sq4096           0.1639       0.2434        838.7        564.6
+  w1_s4_off    sq8192           1.2551       2.2735        876.1        483.6
+  w1_s4_mcb2   sq2048           0.0258       0.0414        664.8        415.2
+  w1_s4_mcb2   sq4096           0.1638       0.2227        839.0        617.1
+  w1_s4_mcb2   sq8192           1.2718       1.5465        864.5        711.0
+  w1_s4_mc2    sq2048           0.0258       0.0412        665.9        417.5
+  w1_s4_mc2    sq4096           0.1640       0.2370        838.2        579.9
+  w1_s4_mc2    sq8192           1.2671       1.7202        867.8        639.2
+  w1_s3_off    sq2048           0.0258       0.0385        666.8        446.1
+  w1_s3_off    sq4096           0.1638       0.2399        838.8        572.8
+  w1_s3_off    sq8192           1.2724       1.7380        864.1        632.6
+  w1_s3_mcb2   sq2048           0.0260       0.0416        659.7        413.0
+  w1_s3_mcb2   sq4096           0.1638       0.2301        839.1        597.2
+  w1_s3_mcb2   sq8192           1.2671       1.6370        867.8        671.6
+  w1_s3_mc2    sq2048           0.0259       0.0417        663.5        411.8
+  w1_s3_mc2    sq4096           0.1638       0.2424        838.9        566.9
+  w1_s3_mc2    sq8192         1.2634         870.3     640.9
+  w1_s2_off  sq2048         0.0259      0.0416          412.5
+  w1_s2_off  sq4096        0.1638           838.8    515.4
+  w1_s2_off  sq8192            1.8879     870.5       w1_s2_mcb2  sq2048                          361.6w1_s2_mcb2  sq4096           0.2797          491.3
+  w1_s2_mcb2  sq8192    1.2713   1.9413            
+  w1_s2_mc2  sq2048       0.0257    0.0481          356.9  w1_s2_mc2                 0.2845     838.9
+     sq8192      1.2720     1.9794     864.4      555.5  w3c_s6_off  sq2048               0.0438       667.1    392.6
+  w3c_s6_off   sq4096       0.1637      0.2808      839.4     
+  w3c_s6_off         1.2672    2.8670      867.7       383.5
+           0.0257     0.0446      668.4     385.1
+  w3c_s6_mcb2          0.1639    0.2545      838.6      
+  w3c_s6_mcb2           1.2719           864.5      
+  w3c_s6_mc2  sq2048              0.0472      664.7    364.3
+              0.1638    0.2851      839.2      482.1  w3c_s6_mc2         1.2720
+=============================================================
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 537 filtered out; finished in 64.02s
+
+[1m[92m   Doc-tests[0m wukong_codegen_gpu
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m-> ok in 70.5s[0m
+[meter] bench: 72.5s wall = $0.090 (record this in the round log)
+Stopping app - local entrypoint completed.
+✓ App completed. View run at 
+https://modal.com/apps/aidanht/main/ap-Y01psBtEawdxv1ZU83839I
+PIPELINE_DONE
