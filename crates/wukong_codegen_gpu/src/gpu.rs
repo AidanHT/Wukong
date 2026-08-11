@@ -8333,7 +8333,13 @@ mod tests {
         // with the B cluster, and the square W3c tile with it). Each is a distinct module because
         // each is a distinct `WgmmaCfg::derived_name` — the whole geometry INCLUDING the multicast
         // axis — and the census must assemble every one before an H100 is rented.
-        const EXPECTED_MODULES: usize = 109;
+        // 109 -> 114 with wave 2's five lever rows off the round-3 winner: the fused
+        // `st.global.v2.f32` epilogue, `.L2::evict_first` on the C stores, that plus
+        // `.L2::evict_last` on the TMA operand loads, the two composed, and the epilogue-elided
+        // diagnostic. `derived_name` now carries the transport and the cache policy as well as the
+        // multicast axis, so each is its own module and its own cache key — which is the whole
+        // point: two rows under one key would run one kernel under both headings.
+        const EXPECTED_MODULES: usize = 114;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -18617,7 +18623,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             {
                 let w1 = &WGMMA_W1;
                 let (m, n, k) = (w1.bm, w1.bn, w1.bk * w1.stages); // ring exactly filled
-                let (a, b) = bringup_operands(m, n, k);
+                let (a, b) = bringup_operands(m, n, k, w1.dtype);
                 let t0 = Instant::now();
                 let c = gemm_nt_wgmma(g, w1, &a, &b, m, k, n)
                     .unwrap_or_else(|e| panic!("item 5 FAIL: {} at {m}x{k}x{n}: {e}", w1.name));
@@ -18666,7 +18672,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // The operands are the full square, zeroed past the K under test, so ONE tensor-map
             // geometry covers both passes and no launch asks the driver for a box wider than the
             // tensor it describes.
-            let (a_full, b_full) = bringup_operands(sm, sn, sbk);
+            let (a_full, b_full) = bringup_operands(sm, sn, sbk, WGMMA_W1.dtype);
             let limit = WGMMA_W1.dtype.exact_integer_limit();
             assert!(
                 a_full.iter().chain(&b_full).all(|v| v.abs() <= limit),
@@ -18941,7 +18947,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let (m, n) = (win.bm, win.bn);
             for tiles_k in [1usize, 2, win.stages, win.stages + 1, 4 * win.stages] {
                 let k = tiles_k * win.bk;
-                let (a, b) = bringup_operands(m, n, k);
+                let (a, b) = bringup_operands(m, n, k, win.dtype);
                 assert!(
                     a.iter()
                         .chain(&b)
@@ -19008,7 +19014,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 (win.bm + 1, win.bn + 1, 3 * win.bk - 16),
                 (2 * win.bm - 3, 2 * win.bn - 5, 5 * win.bk + 48),
             ] {
-                let (a, b) = bringup_operands(m, n, k);
+                let (a, b) = bringup_operands(m, n, k, win.dtype);
                 assert!(a
                     .iter()
                     .chain(&b)
@@ -19045,7 +19051,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // shape is a clean capability decline is the crate's `UNSUPPORTED:`-means-SKIP rule.
             {
                 let (m, n, k) = (64usize, 64usize, 100usize);
-                let (a, b) = bringup_operands(m, n, k);
+                let (a, b) = bringup_operands(m, n, k, win.dtype);
                 let err = gemm_nt_wgmma(g, win, &a, &b, m, k, n).expect_err(
                     "K=100 makes the row stride 200 B, which is not a multiple of 16 — a tensor map \
                      for it cannot exist, so this must decline rather than launch",
@@ -19076,7 +19082,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     c.name
                 );
                 let (m, n) = (c.bm, c.bn);
-                let (a, b) = bringup_operands(m, n, k);
+                let (a, b) = bringup_operands(m, n, k, c.dtype);
                 let limit = c.dtype.exact_integer_limit();
                 assert!(
                     a.iter().chain(&b).all(|v| v.abs() <= limit),
@@ -19278,7 +19284,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     total += shapes.len();
                     for (m, n, k, why) in &shapes {
                         let (m, n, k, why) = (*m, *n, *k, why.as_str());
-                        let (a, b) = bringup_operands(m, n, k);
+                        let (a, b) = bringup_operands(m, n, k, mc.dtype);
                         let limit = mc.dtype.exact_integer_limit();
                         assert!(
                         a.iter().chain(&b).all(|v| v.abs() <= limit),
@@ -19610,7 +19616,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // --- 4. correctness gates the timing ------------------------------------------------
             {
                 let (cm, cn, ck) = (cfg.bm, cfg.bn, cfg.bk * cfg.stages);
-                let (a, b) = bringup_operands(cm, cn, ck);
+                let (a, b) = bringup_operands(cm, cn, ck, cfg.dtype);
                 let limit = cfg.dtype.exact_integer_limit();
                 assert!(
                     a.iter().chain(&b).all(|v| v.abs() <= limit),
@@ -19994,7 +20000,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             for r in &live {
                 let c = r.cfg;
                 let (m, n, k) = (2 * c.bm, 2 * c.bn, c.bk * c.stages);
-                let (a, b) = bringup_operands(m, n, k);
+                let (a, b) = bringup_operands(m, n, k, c.dtype);
                 let limit = c.dtype.exact_integer_limit();
                 assert!(
                     a.iter().chain(&b).all(|v| v.abs() <= limit),
@@ -20031,7 +20037,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // hand every row a win (or a loss) it did not earn.
             {
                 let (m, n, k) = (128usize, 512usize, 256usize);
-                let (a, b) = bringup_operands(m, n, k);
+                let (a, b) = bringup_operands(m, n, k, crate::ptx_wgmma::WGMMA_W1.dtype);
                 let want = ref_nt(&a, &b, m, k, n);
                 let pg = (peer.once)(g, &a, &b, m, k, n)
                     .unwrap_or_else(|e| panic!("{BENCH}: {} one-shot failed: {e}", peer.label));
