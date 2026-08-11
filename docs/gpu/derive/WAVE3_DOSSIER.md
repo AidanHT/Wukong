@@ -1244,3 +1244,255 @@ per-stage, and the ring-depth accounting of 4.3 is wrong. (ii) `mcb_fh` moves an
 ptxas was being conservative across the back-edge and 4a's address hoist is worth the census.
 (iii) `w3c_mcb_d1` wins where `mcb_d1` loses -> ring depth is the price, exactly as derived, and the
 lever belongs to whatever tile has a spare stage rather than to the depth itself.
+
+---
+
+## 5. HELD-OUT TRIGGER CHECK
+
+### 5.1 2x2x1 cluster -- DEFERRED, and its trigger is now computable
+
+`I_cta = 128*256/(128/2 + 256/2) = 32768/192 = 170.67`, L2 roof `7.00 * 170.67 = 1195 TFLOP/s`. A
+4-CTA cluster needs `gx` and `gy` both even (all seven shapes qualify) and `132 / 4 = 33` cluster
+slots exactly, so no SM is stranded.
+
+The plan's trigger is two-part: **"1x2x1 lands positive AND the round shows us still fill-bound."**
+
+* **Part 1 is MET.** +6.2 points at sq4096, +27.0 at sq8192 (round 3).
+* **Part 2 is NOT MET, and the reason is section 3.2's residual table.** With the B multicast, both
+  sq4096 and sq8192 sit at **1.008-1.009 of their own mainloop floor** -- they are floor-bound, not
+  fill-bound. sq8192's L2 term is 1227 us against a 1532 us floor; sq4096's is 153 us against 221 us.
+  A second halving of L2 traffic lands under a floor that is already binding.
+
+**Post-W3 it is still not met, and that is the useful part.** After persistence:
+
+| shape | post-W3 `T_floor` | post-W3 `T_L2` (mcb2) | `T_L2` at 2x2x1 | fill-bound? |
+|---|---|---|---|---|
+| sq4096 | 197.2 us | 153.4 us | 115.1 us | no |
+| sq8192 | 1414 us | 1227 us | 920 us | no |
+| gpt_d4096_up | 765 us | 613.6 us | 460.2 us | no |
+| gpt_d1024_down | 55.2 us | 38.4 us | 28.8 us | no |
+
+**No shape in the suite is fill-bound after Wave 3.** So the sharpened trigger is:
+
+> **2x2x1 fires only when some shape's `T_L2` (at 1x2x1) exceeds its `T_floor`** -- which requires
+> the *mainloop floor* to come down first, i.e. Wave 4's epilogue. Re-evaluate after W4, not after
+> W3.
+
+The two published counter-data points the plan cites (an H100 worklog measuring 2x2 slower than a
+2-tile cluster; an NVIDIA-staffed thread measuring multicast at ~2 TB/s against ~8 for independent
+loads) are corroborated from this repo's own data: section 3.2 measures the 2-CTA coupling at ~96
+ns/stage, and a 4-CTA cluster doubles both the `empty[s]` arrival count (8 instead of 4) and the
+`mapa`/`arrive` sequence per release. At sq8192's 128 stages per tile a doubled coupling is ~24 us of
+a ~89 us post-W3 tile -- **+27%, against a traffic gain of zero because the shape is floor-bound.**
+Do not spend a visit on it.
+
+### 5.2 192x256x64 tile -- DEAD, twice over, and the plan understates the gap by 7x
+
+`I_cta = 192*256/(192+256) = 109.71` (roof 768 TFLOP/s), or 153.6 with the B multicast (roof 1075).
+The arithmetic is attractive and the tile is not emittable.
+
+**Death 1 -- the schedule.** `Schedule::Cooperative` requires CTA-M to be a multiple of 128, and the
+emitter already declines with `"{UNSUPPORTED}: ... is cooperative but CTA-M {} is not a multiple of
+128 (cooperative is illegal below CTA-M 128; a 64-row tile needs the pingpong schedule)"`
+(`ptx_wgmma.rs:1249-1250`). 192 is not a multiple of 128. The tile requires 3 consumer warpgroups on
+a schedule that does not exist.
+
+**Death 2 -- the register file, and this is the one the plan gets wrong.** 192 rows means 3 consumer
+warpgroups: 384 consumer threads plus 128 producer threads = **512 threads**.
+
+```
+    ptxas static bound:   512 * regs <= 65 536   ->   regs <= 128 per thread
+    a consumer needs:     128 f32 accumulators (m64n256) BEFORE a single address register
+    the census reports:   168 for every shipped row
+    setmaxnreg bound:     128*32 + 384*C <= 65 536  ->  C <= 160, against W1's 232
+```
+
+The plan says it "needs W4's SMEM-staged epilogue to free ~10 registers first". **It needs 72 on the
+`setmaxnreg` view (232 -> 160) and it is impossible on the ptxas-static view, where the 128-register
+ceiling is already fully consumed by the accumulators alone.** The nearest emittable relative,
+192x128, has `I_cta = 76.8` -- *below* the 85.33 we already run -- so it is not a fallback.
+
+The plan's own trigger ("the cluster lands only as A-multicast; unnecessary if 1x2x1 or 2x2x1
+lands") explicitly does not fire: 1x2x1 landed. **DEAD, not deferred.** Delete the row.
+
+### 5.3 Stream-K -- DEFERRED for the suite, with a computable trigger
+
+The prize Stream-K exists to collect is wave quantization, and section 0.3 shows that on 132 SMs the
+prize is **exactly 3.03% for every power-of-two tile count in [128, 4096]** -- which is every shape in
+the suite except sq1024. Persistence does not change it (2.2). So the plan's held-out reasoning
+("wave quantization is only ~3% once W3's persistence lands") is confirmed rather than merely
+assumed.
+
+**sq1024 is the one place Stream-K would have had a real prize, and section 3.4 takes it first.**
+32 tiles on 132 SMs is 24.2% of the device; Stream-K would give all 132 CTAs a slice of the K
+dimension, a 4.1x parallelism increase. But narrowing the tile to 128x64 gives 128 tiles = 97.0%
+wave efficiency at **zero correctness cost**, and the predicted result (~88% of cuBLAS) is close
+enough to the L2 roof (`T_L2 = 7.19 us` against cuBLAS's 7.0 us) that Stream-K could not add much on
+top. Meanwhile Stream-K costs a device workspace, a fixup reduction, and a **changed summation
+order**: the exact-integer oracle survives any reassociation and would not notice, but the f64
+tolerance arm's `c*sqrt(K)*eps` bound becomes shape-dependent and must be re-derived, which is
+precisely the plan's stated precondition (G2 + G7 green first).
+
+**Sharpened trigger:**
+
+> Stream-K fires when the *best emittable tile*'s wave efficiency
+> `tiles / (132 * ceil(tiles/132))` is below 0.90 -- i.e. when `tiles mod 132` lands in the bad band
+> and `tiles < 264` -- with K large enough that splitting it amortises a fixup. No shape in the
+> current suite qualifies; sq1024 at 128x64 gives 128 tiles = 0.970.
+
+The decomposition and its published speedups are [Osama, Merrill, Cecka, Garland and Owens,
+*Stream-K*, PPoPP 2023](https://arxiv.org/abs/2301.03598); CUTLASS ships it as
+`PersistentTileSchedulerSm90StreamK`, layered on the same persistent scheduler section 2 builds
+([sm90_tile_scheduler_stream_k.hpp](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/kernel/sm90_tile_scheduler_stream_k.hpp)),
+so the order of work -- persistence first, Stream-K later on top -- matches upstream.
+
+### 5.4 Ping-pong -- DEAD for this suite, and now has a third claimant on its prize
+
+The plan's arithmetic is decisive before any measurement and this dossier reaches the same verdict
+by an independent route. Ping-pong gives each consumer warpgroup a whole CTA tile so the two
+alternate mainloop and epilogue; at 232 registers a consumer holds one `m64n256` accumulator set, so
+the CTA tile collapses from 128x256 to **64x256**:
+
+```
+    64x256, no cluster:      I_cta = 64*256/(64+256)  = 51.2   ->  L2 roof 358 TFLOP/s
+    64x256, with B multicast: I_cta = 64*256/(64+128) = 85.33  ->  L2 roof 597 TFLOP/s
+```
+
+against **617.1 TFLOP/s already measured** at sq4096 and **711.0** at sq8192 with the current
+128x256 + mcb2 arm. **A roof below the measured floor is a dead lever**, at both cluster settings.
+(The plan quotes `T_L2 420` for the same tile; the two readings bracket it and the conclusion is
+identical.)
+
+Note also that the tile and the schedule are one change, not two: `Cooperative` is illegal below
+CTA-M 128, so the emitter's own decline message names pingpong as the *requirement* for a 64-row
+tile, not as an option alongside it.
+
+**And a new observation:** ping-pong's real mechanism is overlapping the epilogue with the mainloop,
+i.e. it is a claimant on the same `X_epi = 5.99 us` that Wave 4's TMA-store epilogue attacks and that
+section 2.3 shows persistence does *not* recover. **If Wave 4 lands, ping-pong's prize is already
+spent.** Record that now so the lever is not re-opened later on the strength of the same 5.99 us.
+
+Trigger unchanged and still correct: **a decode / skinny-M row.** The suite's smallest M is 1024 =
+8 m-tiles, so nothing qualifies.
+
+### 5.5 Summary of the trigger check
+
+| lever | trigger status | why, in one line |
+|---|---|---|
+| 2x2x1 cluster | **DEFERRED**, re-evaluate after **W4** | part 1 met (+6.2/+27.0), part 2 not: every shape is floor-bound at 1.008-1.009 of its own floor, before AND after W3 |
+| 192x256x64 tile | **DEAD -- delete the row** | CTA-M 192 is not a multiple of 128 (the emitter declines), and 512 threads cap ptxas at 128 registers against 128 accumulators alone |
+| Stream-K | **DEFERRED**, trigger sharpened to a computable predicate | the prize is exactly 3.03% suite-wide, and sq1024's real prize is taken first by the 128x64 tile at zero correctness cost |
+| ping-pong | **DEAD for this suite**, trigger unchanged | 64x256 has an L2 roof of 358-597 TFLOP/s against 617-711 already measured; and W4 spends its `X_epi` prize |
+
+---
+
+## 6. RANKED SUMMARY, THE COMBINED PROJECTION, AND THE ONE-VISIT ROUND
+
+### 6.1 The four levers, ranked by derived effect size
+
+**1. PERSISTENCE -- the continuous ring across tile boundaries.** `X_fill = 7.85 us` recovered at
+`waves - 1` boundaries. Fires on **four of seven** shapes: gpt_d1024_up **+15.6 points**, gpt_d4096_up
+**+11.7**, sq4096 **+8.7**, sq8192 **+6.8**. One mechanism, one derivation, and it is also the
+prerequisite that makes the raster's gain at gpt_d4096_up bankable rather than theoretical. Its
+hazard is a deadlock (2.6) and its silent-corruption mode is G19 (2.7); both have one-line fixes that
+must be written before the first launch.
+
+**2. RASTER -- `GROUP_M = 16` applied to the cluster index.** gpt_d4096_up **+33.5 points**, the
+largest delta on a must-land shape, and the only lever in Wave 3 that removes an **arithmetic
+impossibility** rather than an inefficiency: matching that shape's peer with the linear order needs
+3.541 TB/s against a 3.35 TB/s HBM peak. Elsewhere it is ~1% (sq8192) or provably zero (five shapes).
+**Narrower than the plan implies, and decisive where it fires.**
+
+**3. PER-SHAPE TILE DISPATCH.** The largest absolute number in this dossier -- **+56 points at
+sq1024** via a 128x64 tile (24.2% -> 97.0% of the device) -- plus two things no other lever does: it
+keeps the cluster OFF at sq2048 where it costs 8%, and it turns the cluster ON at gpt_d4096_up, which
+only becomes correct *after* the raster. It also refutes two plan rows with measurement (128x128 at
+sq2048) and with the census (128x128 at 2 CTAs/SM).
+
+**4. THE MAINLOOP DRAIN.** Derived at **-7.7% to +0.5%** at the only tile the dispatcher selects,
+because 128x256 s5 declines on SMEM and `wait_depth = 1` therefore buys tensor-core overlap at the
+measured 9.2% price of a ring stage. **Emit it, measure it, budget nothing for it.** The one free
+component is hoisting `wgmma.fence` out of the k-loop.
+
+### 6.2 The combined per-shape projection
+
+| shape | today | tile | raster | cluster | persist | projected | delta |
+|---|---|---|---|---|---|---|---|
+| sq1024 | 32.3% | **128x64** | - | off | - | **~88%** | **+56** |
+| sq2048 | 67.2% | 128x256 | - | **off** | - | **67.2%** | **0** |
+| sq4096 | 73.5% | 128x256 | off | on | **yes** | **82.2%** | +8.7 |
+| sq8192 | 82.2% | 128x256 | **yes** | on | **yes** | **~89.5%** | +7.3 |
+| gpt_d1024_up | 54.8% | 128x256 | off | **off** | **yes** | **70.4%** | +15.6 |
+| gpt_d1024_down | 78.0% | 128x256 | - | **on** | - | **~80%** | +2.0 |
+| gpt_d4096_up | 42.8% | 128x256 | **yes** | **on** | **yes** | **~88%** | +45.2 |
+| **suite mean** | **61.5%** | | | | | **~80.8%** | **+19.3** |
+
+**sq2048 gets nothing from Wave 3, and that is a finding, not a gap.** It is already on its best
+configuration: one wave (no persistence, no raster), 97.0% wave efficiency at 128x256 (no better
+tile), and `f_L2 = 0.736` (no cluster). Its levers live in Wave 2's epilogue and Wave 4's fusion, and
+Wave 3 should say so in its round log rather than search for one.
+
+### 6.3 What this dossier changes in `ACT2_WAVE_PLAN.md`
+
+| plan claim | this dossier |
+|---|---|
+| raster `GROUP_M in {2,4,8}` (wave brief) | optimum is `sqrt(W*BN/BM) = 16`; `GROUP_M = 2` is worse than linear |
+| "sq8192 58.8% -> ~65-75%" from raster | that estimate predates the B multicast, which already collected it (55.2% -> 82.2%); the raster is worth ~1% there now |
+| "gpt_d4096_up 42.8% -> ~70%" | ~76% with the cluster, ~88% with persistence -- the raster *flips* the cluster decision at that shape |
+| "128x128 @ s3 for two CTAs/SM" | refuted by the census: occupancy is set by the static 168 regs/thread, and 2 CTAs/SM needs 85 |
+| "D1 4.5 puts W3 (128x128) at sq2048" | refuted by measurement: 11.9% slower, and 1.33x the L2 traffic (`I_cta` 64.0 vs 85.33) |
+| "sq1024: 128x128 raises the ceiling to 155%" | the *occupancy* ceiling, yes; the achievable number is ~62%. 128x64 gives ~88% |
+| wait-depth "bounded at ~2.5%" | between -7.7% and +0.5%: the ring stage it costs was measured at 9.2% (Fit C) |
+| 192x256 "needs W4 to free ~10 registers" | needs 72 on the `setmaxnreg` view and is impossible on the ptxas-static view; also declines on CTA-M |
+| "exactly 8 regs/consumer-thread" spare | true for `setmaxnreg`, but the binding budget is ptxas's static 168 -> 170, i.e. **2** regs/thread |
+| persistence "removes waves x (fill + exposed epilogue)" | it removes the **fill only**; the epilogue stays on the critical path because `scale-d = 0` overwrites unstored accumulators. W3 and W4 share one `X` and must not be stacked |
+
+### 6.4 The one-visit round
+
+Round 3 ran 12 rows x 3 shapes in 63.3 s of H100 wall time for $0.090. This round is 10 rows x 5
+shapes and will cost the same order.
+
+**Preceded by the $0.02 CPU census** over `wgmma_device_free_modules()` for every new entry, gating
+on `regs <= 170`, `spill_st == 0`, `spill_ld == 0`, no C7511, `.target sm_90a`, pure ASCII (E4.4).
+
+**Then, in one container, in this order:**
+
+1. `wgmma_hopper_bringup` stages E/F/G **on G1's corrected guard shape** -- grid >= 3x3,
+   `ktiles = stages+1`, one ragged M/N/K, and **`tiles > CTAs`**, without which G19's tile-loop
+   corruption is unreachable and would ship undetected.
+2. `wgmma_cluster_multicast_is_exact`, extended to the persistent and rastered modules.
+3. The performance rows:
+
+```
+  row              arm                                    shapes                     from
+  --- section 1 ---
+  mcb_g1_lin       control (= round 3's mcb2 row)         all five                   1.6
+  mcb_g8           GROUP_M 16                             gpt4096up, sq8192, sq4096, gpt1024up, sq2048
+  mcb_g16          GROUP_M 32 (the traffic bracket)       gpt4096up, sq8192
+  --- section 2 ---
+  g8_pstop         persistent, ring RESET per tile        gpt1024up, sq4096, sq8192, gpt4096up, sq2048
+  g8_persist       persistent, CONTINUOUS ring            same five                  2.9
+  --- section 3 ---
+  mcb_gd1024down   cluster on/off at f_L2 = 1.000         gpt_d1024_down             3.8
+  mcb_gd1024up     cluster on/off at f_L2 = 0.542         gpt_d1024_up               3.8
+  w3d_s4           128x64 s4 (new m64n64k16 family)       sq1024, sq2048             3.8
+  --- section 4 ---
+  mcb_fh           fence hoisted (free)                   sq8192, sq4096, gpt1024up  4.7
+  mcb_d1           wait_depth 1                           sq8192, sq4096, gpt1024up  4.7
+  w3c_mcb_d1       wait_depth 1 where the ring affords it sq8192                     4.7
+```
+
+**Round-level refusals.**
+
+* Publish nothing structural until G1's corrected shape, G2's random arm, G8's bit-identity, G7's
+  in-region memset and G16's dispersion verdict are green -- unchanged from the plan.
+* **Lock the SM clock and declare it.** The round-3 provenance reads `clock lock: UNKNOWN
+  (undeclared)`, and section 0.5 shows that the *entire* uncertainty in section 4 is the difference
+  between the reported 1980 MHz and the 1.8288 GHz the 989 TFLOP/s denominator implies. One line of
+  setup converts a 0-to-9% band into a number.
+* No raster row at a single-wave shape reported as an effect (1.6). No persistent arm without the
+  cluster-indexed loop (2.9). No dispatch rule published from a table lacking both `gpt_d1024`
+  shapes at both cluster settings (3.8). No depth arm without its bit-identity result against the
+  `D = 0` twin (4.7).
+* A gain inside the contender's own dispersion is not a result (G16). The round-3 floors were
+  +/-0.00% to +/-3.29%, and sq2048's are the wide ones -- quote the `s3` pairs there, not the `s4`.
