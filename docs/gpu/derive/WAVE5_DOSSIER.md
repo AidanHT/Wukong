@@ -889,3 +889,70 @@ tile-loop entry count, exactly as G19 specifies.
    an artifact of our own build.
 7. Name and key every new row from its own geometry, `bk` included, or `Gpu::function` hands back
    the f16 module and the round bills launches to a config that never ran.
+
+---
+
+## 8. SOURCES
+
+### In-tree (FACT(repo)) -- these outrank everything below
+
+| what | where |
+|---|---|
+| The crowned 16-bit descriptor, 19 candidates x 2 K passes | `bench/gpu/h100/2026-08-10-h100-s2c-desc-sweep.log:93-182` |
+| The first round that found the row-major reading wrong (64/4096) | `bench/gpu/h100/2026-08-10-h100-s2a-bringup.log` |
+| ptxas census: `wgmma_nt_f16_128x256x64_s4` regs/smem/threads | `bench/gpu/h100/2026-08-10-ptxas-census.log:687-690` |
+| ptxas census harness landmine (exit 1, "no records parsed") | same log, `:842-869` |
+| CUTLASS profiler staged **f16-only** on the Volume | `bench/gpu/h100/2026-08-09-preflight-build-peers.log:915` |
+| 112 C7511 warnings from NVIDIA's own SM90 f16 kernels | same log, `:1074-1185`; ledger entry 4 in this directory's README |
+| The wgmma model: core matrix, LBO/SBO, `SmemLayout`, `SHIPPED_LAYOUT`, `desc_fields`, `SmemDesc::pack` | `crates/wukong_codegen_gpu/src/ptx_wgmma.rs:44-78, 436-716, 1660-1663` |
+| Tile/stage/SMEM/register accessors and the shipped rows | same file, `:983-1160`, `:1612-1774` |
+| The emitted `wgmma` line and the epilogue | same file, `:3003-3007`, `:3657-3696` |
+| The module corpus the four laws scan | same file, `:2098-2106`, `:3728-3747`; `gpu.rs:8243`, `:8336` |
+| TMA data types, validation rules, OOB fill | `crates/wukong_codegen_gpu/src/tma_host.rs:54-153, 246-335` |
+| fp8 capability constant and `require_cap` | `crates/wukong_codegen_gpu/src/gpu.rs:147-150, 560-575` |
+| fp8 mixed-type `mma.sync` precedent and the `.version 8.4` split | `crates/wukong_codegen_gpu/src/ptx_fp8_train.rs:5-25, 190, 317-323` |
+| PTX ISA shape menu, extracted verbatim by the campaign | `docs/gpu/derive/D1_h100_gemm.md:154-173` |
+| H800 tensor-core instruction throughput table (Luo et al.) | `docs/gpu/derive/D1_h100_gemm.md:114-134` |
+| CUTLASS kernel filters, census guard, profiler dtype table, meter rates | `tools/cloud/modal_app.py:373-379, 819-1053, 2736-2768, 3830-3900, 3948-3957` |
+| Wave-5 levers, targets, refusals, standing rules | `docs/gpu/derive/ACT2_WAVE_PLAN.md:67-77, 102, 114, 122-128` |
+
+### External (FACT(ext)) -- used only where the tree is silent
+
+- PTX ISA, "Asynchronous Warpgroup Level Matrix Multiply-Accumulate Instructions"
+  (section 9.7.16 in the current doc, 9.7.14 in the PTX-8.4 archive):
+  <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-instructions-wgmma-mma>
+  (archive: <https://docs.nvidia.com/cuda/archive/12.4.1/parallel-thread-execution/contents.html>)
+- NVIDIA CUTLASS, Warpgroup MMA Programming Guide -- per-type instruction K (16 for f16/bf16, **32**
+  for `MmaF8Op` and `MmaI8Op`), `M = 64` and `8 <= N <= 256` in steps of 8, and "FP8 and INT8
+  variants are K-major only":
+  <https://docs.nvidia.com/cutlass/4.6.0/media/docs/pythonDSL/mma_docs/wgmma_programming.html>
+- Colfax Research, "CUTLASS Tutorial: Fast Matrix-Multiplication with WGMMA on NVIDIA Hopper GPUs"
+  -- core matrix "8 in the strided direction and 16 bytes in the contiguous direction", "K is fixed
+  to be 32 bytes", 128-byte swizzle `SBO = 128 x 8 = 1024`, and the transpose restriction to
+  f16/bf16: <https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/>
+- CUTLASS `include/cute/arch/mma_sm90_desc.hpp` -- the GMMA descriptor bitfields and the
+  `INTERLEAVE=0, B128=1, B64=2, B32=3` encoding, with `base_offset_` "valid only for B128 and B64":
+  <https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm90_desc.hpp>
+- DeepSeek-V3 on Hopper's fp8 accumulation -- 32 mantissa products right-shift-aligned to the
+  maximum exponent, only the top **14 bits** kept, and promotion to CUDA-core f32 every 128 elements
+  (4 wgmma): <https://github.com/deepseek-ai/DeepSeek-V3/issues/197>, and Colfax's write-up
+  <https://research.colfax-intl.com/deepseek-r1-and-fp8-mixed-precision-training/>
+- Luo et al., "Benchmarking and Dissecting the Nvidia Hopper GPU Architecture",
+  <https://arxiv.org/abs/2402.13499> -- the source of D1's instruction-throughput table and of the
+  "INT4 `mma` degenerates to IMAD on Hopper" fact. **The plan's `1417.2 / 490.7 = 2.89x` and
+  `1448.7 / 977.9 = 1.48x` are not yet transcribed into D1**; Wave 5 should copy those two rows into
+  D1 section 1.2 with their table numbers, so the wave's headline ratio has an in-tree provenance
+  line rather than a plan sentence.
+- cuBLASLt FP8 matmul -- TN-only on Hopper, leading dimensions a multiple of 16, the
+  `CUBLASLT_MATMUL_DESC_{A,B,C,D}_SCALE_POINTER` / `AMAX_D_POINTER` attributes returning
+  `CUBLAS_INVALID_VALUE` on an unsupported combination, and `CUBLASLT_MATMUL_DESC_FAST_ACCUM`:
+  <https://docs.nvidia.com/cuda/cublas/> and the reference sample
+  <https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtFp8Matmul/sample_cublasLt_LtFp8Matmul.cu>
+
+### Open, and deliberately left open
+
+* Whether `.satfinite` assembles on the integer `wgmma` form (section 1.3) -- a $0.02 ptxas
+  question, and the answer does not change the decision to decline it.
+* The exact N menu at `K = 32`, if it is narrower than the f16 menu (section 1.1) -- same $0.02
+  instrument. D1's verbatim ISA extraction says "same N menu"; ptxas is the cheap confirmation.
+* The 2.89x / 1.48x issue-rate rows' provenance line in D1 (above).

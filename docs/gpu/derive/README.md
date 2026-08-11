@@ -20,6 +20,16 @@ L4 round, a $0.258 CPU-container build, and dev-4050 rounds), and each one says 
 | [D5_peer_builds.md](D5_peer_builds.md) | Exact build recipes for the strong peers on cloud Linux (cuBLASLt, torch.compile, FA2/FA3/FA4, CUTLASS profiler, Marlin/machete) | CUDA 12.9.2 image + torch 2.13.0+cu129; cudarc 0.16.6 has no CUDA-13 bindings; FA4 is a pure-Python wheel; ~$0.50 of metered GPU for the whole smoke battery |
 | [D6_dynamic_smem.md](D6_dynamic_smem.md) † | Dynamic-SMEM mechanics **verified live on the 4050 through cudarc 0.16.6**, SMEM closed forms, the stage-depth decision model, the C2/C3 migration design | The extern window JITs under today's `.version 7.8`; `set_attribute` + `shared_mem_bytes` suffice; static >48 KiB is rejected by ptxas on every non-`a` target — dynamic SMEM is the only unlock |
 
+## Act-2 wave dossiers
+
+Same provenance rules, later campaign. These are written against a tree that has already been on an
+H100, so they cite round logs as well as sources, and their job is to make a wave's first
+implementation visit correct rather than exploratory.
+
+| Dossier | What it derives | Headline |
+|---|---|---|
+| [WAVE5_DOSSIER.md](WAVE5_DOSSIER.md) | 8-bit `wgmma` (e4m3/e5m2/s8/u8): the instruction surface, the 1-byte descriptor delta, the dequant/scale epilogue, the peer bar, the pre-implementation baseline round, and ten guards as law text | The hardware-settled 16-bit descriptor transfers to 1-byte operands **unchanged** -- LBO ignored, SBO 1024, base offset 0, B128, 32-byte K step -- because every field of it is a BYTE count; the whole transfer is conditional on `bk * dtype.size() == 128`, i.e. `BK` 64 -> 128. Two findings the plan does not state: the DeepSeek two-level accumulation does not fit on the 128x256 tile (256 accumulator registers against 232), and the fp8 exact-integer bring-up arm exists only at `K <= 256` |
+
 ## Predict-before-measure documents
 
 Same provenance rules, different job: these are written *before* a measurement and are its
