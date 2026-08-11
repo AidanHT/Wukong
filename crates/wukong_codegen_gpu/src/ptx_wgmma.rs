@@ -1019,7 +1019,9 @@ impl EpilogueStore {
         match self {
             EpilogueStore::Scalar => "scalar st.global.f32 (rounds 1-3)",
             EpilogueStore::V2 => "fused st.global.v2.f32 + odd-N scalar tail",
-            EpilogueStore::ElidedDiagnostic => "ELIDED (diagnostic: accumulators folded, C unwritten)",
+            EpilogueStore::ElidedDiagnostic => {
+                "ELIDED (diagnostic: accumulators folded, C unwritten)"
+            }
         }
     }
 }
@@ -2418,7 +2420,8 @@ pub const WGMMA_KSWEEP_GRID: &[GemmPoint] = &[
         m: 2048,
         n: 2048,
         k: 2048,
-        why: "K sweep, the anchor: this is sq2048 exactly, so the column is tied to the row rounds \
+        why:
+            "K sweep, the anchor: this is sq2048 exactly, so the column is tied to the row rounds \
               1-3 already measured",
     },
     GemmPoint {
@@ -2426,7 +2429,8 @@ pub const WGMMA_KSWEEP_GRID: &[GemmPoint] = &[
         m: 2048,
         n: 2048,
         k: 4096,
-        why: "K sweep, longest: 64 K tiles, where the mainloop dominates and the intercept is what \
+        why:
+            "K sweep, longest: 64 K tiles, where the mainloop dominates and the intercept is what \
               is left over",
     },
 ];
@@ -2446,7 +2450,9 @@ pub fn wgmma_ksweep_rows() -> Vec<&'static SweepRow> {
             WGMMA_SWEEP_GRID
                 .iter()
                 .find(|r| r.label == *l)
-                .unwrap_or_else(|| panic!("WGMMA_KSWEEP_ROWS names {l:?}, which is not a sweep row"))
+                .unwrap_or_else(|| {
+                    panic!("WGMMA_KSWEEP_ROWS names {l:?}, which is not a sweep row")
+                })
         })
         .collect()
 }
@@ -5654,12 +5660,20 @@ mod tests {
                 continue;
             }
             // Sources are what follows the closing bracket of the address operand.
-            let Some(close) = body.find(']') else { continue };
-            let tail = body[close + 1..].trim_start_matches(',').trim_end_matches(';');
+            let Some(close) = body.find(']') else {
+                continue;
+            };
+            let tail = body[close + 1..]
+                .trim_start_matches(',')
+                .trim_end_matches(';');
             let sources: Vec<String> = tail
                 .trim_matches(|ch| ch == '{' || ch == '}' || ch == ' ')
                 .split(',')
-                .map(|o| o.trim().trim_matches(|ch| ch == '{' || ch == '}').to_string())
+                .map(|o| {
+                    o.trim()
+                        .trim_matches(|ch| ch == '{' || ch == '}')
+                        .to_string()
+                })
                 .filter(|o| !o.is_empty() && !o.starts_with("%rdPol"))
                 .collect();
             out.push(StoreOp {
@@ -5687,7 +5701,11 @@ mod tests {
             let mut defined = false;
             for line in ptx.lines() {
                 let t = line.trim().trim_end_matches(';');
-                for (op, flips) in [("and.pred ", false), ("or.pred ", false), ("not.pred ", true)] {
+                for (op, flips) in [
+                    ("and.pred ", false),
+                    ("or.pred ", false),
+                    ("not.pred ", true),
+                ] {
                     if let Some(args) = t.strip_prefix(op) {
                         let mut it = args.split(',').map(str::trim);
                         if it.next() == Some(p.as_str()) {
@@ -7222,7 +7240,10 @@ mod tests {
             let mut signs = (0usize, 0usize);
             for (what, v) in [("A", &a), ("B", &b)] {
                 for &x in v.iter() {
-                    assert!(x.is_finite() && x != 0.0, "{what}: {x} is not a finite non-zero");
+                    assert!(
+                        x.is_finite() && x != 0.0,
+                        "{what}: {x} is not a finite non-zero"
+                    );
                     let mag = x.abs();
                     assert!(
                         (2f32).powi(-RANDOM_ARM_BINADES) <= mag && mag < 1.0,
@@ -7289,7 +7310,10 @@ mod tests {
             .iter()
             .map(|r| ((r >> 40) as f32) / ((1u64 << 24) as f32))
             .collect();
-        assert_eq!(mine_f, theirs, "the two SplitMix64 streams must be one stream");
+        assert_eq!(
+            mine_f, theirs,
+            "the two SplitMix64 streams must be one stream"
+        );
     }
 
     /// **The tolerance is DERIVED, and it is a per-lane magnitude bound rather than a relative one.**
@@ -7300,7 +7324,10 @@ mod tests {
         // Quadrupling K doubles the bound: sqrt(K), not K.
         for k in [16usize, 64, 256, 1024, 4096] {
             let r = random_tolerance(4 * k) / random_tolerance(k);
-            assert!((r - 2.0).abs() < 1e-9, "K -> 4K must double the bound, got {r}");
+            assert!(
+                (r - 2.0).abs() < 1e-9,
+                "K -> 4K must double the bound, got {r}"
+            );
         }
         // And it is small enough to be a real gate: at the widest K in the bench grid the bound is
         // still well under a part in a thousand of the magnitude sum.
@@ -7426,7 +7453,12 @@ mod tests {
         let efol = wgmma_module(&WGMMA_W1_MCB_EFOL, &lic).unwrap();
         let nacc = WGMMA_W1_MCB.shape().unwrap().accum_regs();
         // The baseline is byte-identical to rounds 1-3 in this respect: no policy anywhere.
-        for token in ["createpolicy", "L2::cache_hint", "evict_first", "evict_last"] {
+        for token in [
+            "createpolicy",
+            "L2::cache_hint",
+            "evict_first",
+            "evict_last",
+        ] {
             assert!(
                 !base.contains(token),
                 "the un-hinted row must carry no `{token}` -- it is the A/B's control"
@@ -7482,8 +7514,14 @@ mod tests {
     fn the_composed_lever_row_carries_both_facts() {
         let both = wgmma_module(&WGMMA_W1_MCB_V2_EF, &license()).unwrap();
         let nacc = WGMMA_W1_MCB.shape().unwrap().accum_regs();
-        assert_eq!(both.matches("st.global.L2::cache_hint.v2.f32").count(), nacc / 2);
-        assert_eq!(both.matches("st.global.L2::cache_hint.f32").count(), nacc / 2);
+        assert_eq!(
+            both.matches("st.global.L2::cache_hint.v2.f32").count(),
+            nacc / 2
+        );
+        assert_eq!(
+            both.matches("st.global.L2::cache_hint.f32").count(),
+            nacc / 2
+        );
         assert_eq!(
             WGMMA_W1_MCB_V2_EF.derived_name(),
             "wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef"
@@ -7530,7 +7568,11 @@ mod tests {
         assert_eq!(wgmma_w1_for(4096, 16384).name, WGMMA_W1_MCB.name);
         assert_eq!(wgmma_w1_for(4096, 4096).name, WGMMA_W1_MCB.name);
         assert_eq!(wgmma_w1_for(4096, 1024).name, WGMMA_W1.name);
-        assert_eq!(4096 * 1024, 2048 * 2048, "the two shapes really are the same M*N");
+        assert_eq!(
+            4096 * 1024,
+            2048 * 2048,
+            "the two shapes really are the same M*N"
+        );
         assert_eq!(wgmma_w1_for(1024, 1024).name, WGMMA_W1.name);
         // Both arms of the rule stay emittable and stay in the sweep, so the next round re-measures
         // the split instead of inheriting it.
@@ -7566,9 +7608,9 @@ mod tests {
         // The anchor: one point of the K sweep IS a shape rounds 1-3 already measured, so the column
         // is tied to the table rather than free-floating.
         assert!(
-            WGMMA_KSWEEP_GRID
+            WGMMA_KSWEEP_GRID.iter().any(|p| WGMMA_BENCH_GRID
                 .iter()
-                .any(|p| WGMMA_BENCH_GRID.iter().any(|q| (q.m, q.n, q.k) == (p.m, p.n, p.k))),
+                .any(|q| (q.m, q.n, q.k) == (p.m, p.n, p.k))),
             "the K sweep must share at least one point with the bench grid"
         );
         let rows = wgmma_ksweep_rows();
@@ -7596,13 +7638,7 @@ mod tests {
         ] {
             assert_eq!(
                 (c.bm, c.bn, c.bk, c.stages, c.consumer_wgs),
-                (
-                    base.bm,
-                    base.bn,
-                    base.bk,
-                    base.stages,
-                    base.consumer_wgs
-                ),
+                (base.bm, base.bn, base.bk, base.stages, base.consumer_wgs),
                 "{label}: the tile and ring must be the winner's"
             );
             assert_eq!(c.multicast, base.multicast, "{label}");
