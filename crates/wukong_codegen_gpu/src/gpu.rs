@@ -994,9 +994,89 @@ static GPU: OnceLock<Mutex<Option<Gpu>>> = OnceLock::new();
 /// also carries a failed [`GpuTarget`] probe, naming the driver call that would not answer.
 static GPU_INIT_ERR: OnceLock<String> = OnceLock::new();
 
+/// Set once the CUDA **library itself** could not be loaded — no `libcuda.so` / `nvcuda.dll` on the
+/// box at all, as opposed to a library that loaded and then reported no device.
+///
+/// The two are different failures and only one of them is survivable by catching an `Err`: see
+/// [`try_new_gpu`]. Cached in a plain atomic so any future code path that wants to touch `cudarc`
+/// directly can ask **before** it does, rather than discovering the answer as a panic.
+static CUDA_LIB_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True iff the first attempt to build a [`Gpu`] found no CUDA driver library on this machine.
+///
+/// `false` before anything has asked for a GPU, and `false` on a box whose library loads but whose
+/// device is unusable — [`init_error`] is the general "why is there no GPU" accessor; this one
+/// answers the narrower question a caller needs before reaching for `cudarc` outside of [`Gpu`].
+pub fn cuda_library_missing() -> bool {
+    CUDA_LIB_MISSING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn a caught panic payload into the message it carried. `Box<dyn Any>` is either a `&'static
+/// str` or a `String` for every panic `std`'s macros raise; anything else is reported by type rather
+/// than dropped, because "a panic with no message" is itself a diagnosis.
+fn panic_reason(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "a panic payload that is neither &str nor String".to_string()
+    }
+}
+
+/// **The one place `Gpu::new` is called, and the one place the first `cudarc` call is guarded.**
+///
+/// # Why an `Err` was not enough (the 2026-08-11 CPU census)
+///
+/// `cudarc` is built with `dynamic-loading`, so it `dlopen`s the driver lazily on the first call
+/// into `sys::`. When the library is **absent** — a CPU-only container, which is exactly what the
+/// `$0.02` ptxas census runs in — that lazy loader does not return an error. It **panics**:
+///
+/// ```text
+/// cudarc-0.16.6/src/lib.rs:108: Unable to dynamically load the "cuda" shared library -
+/// searched for library names: [libcuda.so, libcuda.so.1, ...]
+/// ```
+///
+/// `Gpu::new`'s `?` never sees it, so `with_gpu`'s skip path never ran and **seven device tests
+/// failed** on a machine whose correct answer was "skip". Worse, the loader's own `OnceLock`
+/// initializer is what panicked, so it is left **poisoned**: every later `cudarc` call re-panics
+/// with a completely different message ("Once instance has previously been poisoned"), which is how
+/// one missing library turns into seven unrelated-looking failures.
+///
+/// So the first touch is wrapped, the verdict is cached in [`CUDA_LIB_MISSING`] **and** in the
+/// `GPU` `OnceLock` (which stores `None` and is therefore never re-entered), and every caller gets
+/// the ordinary "no GPU, here is why" path it already knew how to handle.
+///
+/// # Two things this deliberately does NOT do
+///
+/// * It does not install a panic hook. The default hook's line is the `dlopen` error *verbatim*,
+///   with the library names it searched — precisely what an operator debugging a container needs —
+///   and libtest captures it into the (passing) test that first asked for a device. Swapping the
+///   process-global hook to silence one line would, for the width of that window, also swallow the
+///   message of any **real** panic on any other test thread. One honest line is worth more than
+///   that risk.
+/// * It does not retry. A missing library does not appear later in the same process, and retrying
+///   would re-enter cudarc's poisoned `OnceLock` and panic with the confusing second message.
+fn try_new_gpu() -> Result<Gpu, String> {
+    // `Gpu::new` is a plain fn item with no captured state, hence unwind-safe by construction.
+    match std::panic::catch_unwind(Gpu::new) {
+        Ok(r) => r,
+        Err(p) => {
+            CUDA_LIB_MISSING.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err(format!(
+                "the CUDA driver library could not be loaded at all, so cudarc panicked on its \
+                 first call instead of returning an error: {}. This box has no CUDA runtime -- a \
+                 CPU-only container, for instance -- and every device gate is CORRECT to skip. (The \
+                 `panicked at` line above is that probe, not a failure.)",
+                panic_reason(p.as_ref())
+            ))
+        }
+    }
+}
+
 /// Build the process-wide GPU, recording the driver's error if it fails.
 fn init_gpu() -> Option<Gpu> {
-    match Gpu::new() {
+    match try_new_gpu() {
         Ok(g) => Some(g),
         Err(e) => {
             let _ = GPU_INIT_ERR.set(e);
@@ -1076,8 +1156,9 @@ pub fn reset_gpu() -> bool {
             let _ = sys::cuDevicePrimaryCtxReset_v2(dev).result();
         }
     }
-    // Retain + bind a fresh primary context.
-    match Gpu::new() {
+    // Retain + bind a fresh primary context. Through the same guarded constructor as the initial
+    // build, so `Gpu::new` has exactly one call site and the law below can say so.
+    match try_new_gpu() {
         Ok(g) => {
             *guard = Some(g);
             DEVICE_LOST.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -20749,6 +20830,139 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
+    /// **WAVE 4's PREREQUISITE: what cuBLASLt will actually fuse, asked of the library.**
+    ///
+    /// # Why this is a round and not a comment
+    ///
+    /// Two of the Wave-4 dossier's targets are claims of **absence** — "cuBLASLt's fusable set has
+    /// no SiLU and no residual-plus-activation" (target #3) and "it has no member combining a
+    /// low-precision output with an activation" (target #2). Both are currently arguments from a
+    /// header file, and a header enumerates what the *enum* has, not what the *heuristic* will
+    /// dispatch on this device at this shape. `baselines::cublaslt_epilogue_support_matrix` asks the
+    /// library instead, per epilogue and per output dtype, and until this round existed it **had no
+    /// call site at all** — a measurement written and never taken.
+    ///
+    /// The f16-out column is the one that gates real engineering: Wave 4's headline is a fused
+    /// low-precision-output epilogue, whose whole value rests on cuBLASLt not having one. If the
+    /// f16 column comes back *supported* for an activation epilogue, that headline is retracted
+    /// before it is built rather than after.
+    ///
+    /// # What it costs, and what it deliberately does not do
+    ///
+    /// **No GEMM runs.** `FusedLtPlan::new` builds the descriptors and asks the heuristic for an
+    /// algorithm; that is the whole probe. Thirty-two plan constructions (16 epilogues x 2 output
+    /// dtypes) at one small shape is milliseconds, so this is `#[ignore]`d for tidiness rather than
+    /// for cost, and it asserts nothing about speed — a `NOT_SUPPORTED` is the *finding*.
+    ///
+    /// Two shapes, because a heuristic may decline a configuration for a reason that is about the
+    /// shape rather than the epilogue, and one row of `NOT_SUPPORTED` at one shape would be read as
+    /// a capability gap that does not exist.
+    ///
+    /// Run it as `modal run tools/cloud/modal_app.py::bench --name cublaslt_epilogue_support_probe
+    /// --peers`, or locally as
+    /// `cargo test -p wukong_codegen_gpu --features gpu -- --ignored --nocapture
+    /// cublaslt_epilogue_support_probe`.
+    #[test]
+    #[ignore = "device probe; needs the cuBLASLt redist DLL; run explicitly (Wave-4 prerequisite)"]
+    fn cublaslt_epilogue_support_probe() {
+        const BENCH: &str = "cublaslt_epilogue_support_probe";
+        with_gpu(BENCH, |g| {
+            if !crate::baselines::cublaslt_available() {
+                peer_gate(BENCH);
+                eprintln!(
+                    "[skip] {BENCH}: cuBLASLt is not loadable, so the library cannot be asked what \
+                     it fuses.\n{}",
+                    crate::baselines::peer_env_hint()
+                );
+                return;
+            }
+            eprintln!("\n================ {BENCH} ================");
+            eprintln!(
+                "device         : {} (cc {}.{})",
+                g.device_name(),
+                g.target().cc().0,
+                g.target().cc().1
+            );
+            eprintln!(
+                "what this is   : cuBLASLt's OWN answer, per epilogue x output dtype, to \"can you \
+                 fuse this\".\n\
+                 \x20                No GEMM is launched -- each cell is one FusedLtPlan::new, i.e. \
+                 descriptors plus\n\
+                 \x20                one heuristic query. A NOT_SUPPORTED is the FINDING, not a \
+                 failure.\n\
+                 why it matters : Wave-4 targets #2 and #3 are claims of ABSENCE (no SiLU, no \
+                 residual+act, no\n\
+                 \x20                low-precision-output-PLUS-activation member). A header \
+                 enumerates what the enum\n\
+                 \x20                has; only this says what the heuristic will dispatch on THIS \
+                 device."
+            );
+            for (m, k, n) in [(256usize, 256usize, 256usize), (4096, 4096, 4096)] {
+                let t0 = std::time::Instant::now();
+                let rows = crate::baselines::cublaslt_epilogue_support_matrix(g, m, k, n);
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                eprintln!(
+                    "\n---- {BENCH}: {m}x{k}x{n} ({} cells in {ms:.1} ms, no GEMM launched) ----",
+                    rows.len()
+                );
+                eprintln!("  {:<22} {:>5}  {:<9} detail", "epilogue", "out", "fusable");
+                for r in &rows {
+                    eprintln!(
+                        "  {:<22} {:>5}  {:<9} {}",
+                        r.epilogue,
+                        r.out,
+                        if r.supported { "YES" } else { "no" },
+                        if r.detail.is_empty() { "-" } else { &r.detail }
+                    );
+                }
+                // The two summaries a Wave-4 reader actually needs, stated rather than counted by
+                // hand out of 32 lines.
+                for out in ["f32", "f16"] {
+                    let of: Vec<&str> = rows
+                        .iter()
+                        .filter(|r| r.out == out && r.supported)
+                        .map(|r| r.epilogue)
+                        .collect();
+                    eprintln!("  fusable at {out} out ({}): {of:?}", of.len());
+                }
+                let act_at_f16: Vec<&str> = rows
+                    .iter()
+                    .filter(|r| {
+                        r.out == "f16"
+                            && r.supported
+                            && (r.epilogue.contains("RELU") || r.epilogue.contains("GELU"))
+                    })
+                    .map(|r| r.epilogue)
+                    .collect();
+                if act_at_f16.is_empty() {
+                    eprintln!(
+                        "  => at f16 out, NO activation epilogue dispatches: Wave-4 target #2 (fused \
+                         low-precision output WITH an activation) has no library peer at this shape."
+                    );
+                } else {
+                    eprintln!(
+                        "  => at f16 out, cuBLASLt DOES dispatch {act_at_f16:?}. Wave-4 target #2 \
+                         must be re-scoped BEFORE it is built: the claim of absence is false here."
+                    );
+                }
+                // SiLU and residual+activation are absent from the enum entirely, so their absence
+                // is a property of the fusable set rather than of the heuristic. Say which is which.
+                assert!(
+                    !crate::baselines::CUBLASLT_FUSABLE_EPILOGUES
+                        .iter()
+                        .any(|(n, _)| n.contains("SILU") || n.contains("SWISH")),
+                    "cublasLtEpilogue_t has gained a SiLU member; Wave-4 target #3 is retracted"
+                );
+                eprintln!(
+                    "  => SiLU/swish and residual+activation are absent from the 16-member ENUM \
+                     itself, not merely undispatched -- a different and stronger fact than the \
+                     rows above."
+                );
+            }
+            eprintln!("=============================================================\n");
+        });
+    }
+
     /// **ACT 2, WAVE 2: THE K SWEEP — prologue and epilogue, separated on ONE kernel.**
     ///
     /// # What the three-shape table cannot say
@@ -21078,6 +21292,93 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 "{name} must run through the shared Act-2 body, not a sweep of its own"
             );
         }
+    }
+
+    /// **The first `cudarc` call is guarded at exactly ONE choke point** — the law that keeps a
+    /// CPU-only box a skip rather than seven failures.
+    ///
+    /// Device-free, and it has to be: reproducing the defect needs a machine with no CUDA library,
+    /// which this one is not. What is checkable here is the structure that makes the panic
+    /// survivable — that `Gpu::new` has one call site, that the call site catches, that the verdict
+    /// is cached rather than retried, and that every device gate reaches the device through the one
+    /// helper whose skip path the catch feeds.
+    #[test]
+    fn the_first_cudarc_touch_is_caught_at_one_choke_point() {
+        let src = CRATE_SOURCES
+            .iter()
+            .find(|(n, _)| *n == "gpu.rs")
+            .expect("gpu.rs is in CRATE_SOURCES")
+            .1;
+        let code = scannable_source("gpu.rs", src);
+        // 1. `Gpu::new()` is called from exactly one function, and that function catches.
+        let callers: Vec<String> = scanned_fns(&code)
+            .into_iter()
+            .filter(|(n, b)| n != "try_new_gpu" && b.contains("Gpu::new()"))
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            callers.is_empty(),
+            "`Gpu::new()` must be reached only through `try_new_gpu`, which wraps the first cudarc \
+             call in catch_unwind; these call it directly and would panic on a box with no CUDA \
+             library: {callers:?}"
+        );
+        let (_, guarded) = scanned_fns(&code)
+            .into_iter()
+            .find(|(n, _)| n == "try_new_gpu")
+            .expect("the guarded constructor must exist");
+        assert!(
+            guarded.contains("catch_unwind"),
+            "try_new_gpu must catch: cudarc's dynamic loader PANICS when the library is absent, it \
+             does not return an error, so `?` never sees it"
+        );
+        assert!(
+            guarded.contains("CUDA_LIB_MISSING.store"),
+            "the no-library verdict must be CACHED -- cudarc's own OnceLock initializer is what \
+             panicked, so it is poisoned and a retry re-panics with a different message"
+        );
+        assert!(
+            !guarded.contains("set_hook"),
+            "try_new_gpu must not swap the process-global panic hook: for the width of that window \
+             it would swallow the message of a real panic on any other test thread"
+        );
+        // 2. Every device gate goes through `with_gpu`, whose `None` arm is what the catch feeds.
+        //    Read out of the RAW source: `scannable_source` cuts the `#[cfg(test)]` module, which is
+        //    where the harness helpers live.
+        let (_, with) = scanned_fns(src)
+            .into_iter()
+            .find(|(n, _)| n == "with_gpu")
+            .expect("with_gpu must exist");
+        assert!(with.contains("gpu()") && with.contains("init_error()"));
+        assert!(
+            with.contains("gpu_required()"),
+            "a skip must still escalate under WUKONG_GPU_REQUIRED=1 -- catching the panic must not \
+             turn a broken GPU box into a silent pass"
+        );
+        // 3. The verdict starts false and is a plain atomic, so asking is free and cannot itself
+        //    touch cudarc.
+        assert!(!cuda_library_missing() || crate::gpu::init_error().is_some());
+    }
+
+    /// The panic payload really does become the message a skip line prints. `catch_unwind` hands
+    /// back a `Box<dyn Any>`, and getting this wrong turns the one diagnostic an operator needs --
+    /// the `dlopen` error with the library names it searched -- into "Any { .. }".
+    #[test]
+    fn a_caught_panic_keeps_the_message_it_carried() {
+        let s = std::panic::catch_unwind(|| panic!("a &'static str payload")).unwrap_err();
+        assert_eq!(panic_reason(s.as_ref()), "a &'static str payload");
+        let owned = std::panic::catch_unwind(|| panic!("{}", String::from("a String payload")))
+            .unwrap_err();
+        assert_eq!(panic_reason(owned.as_ref()), "a String payload");
+        let odd = std::panic::catch_unwind(|| std::panic::panic_any(7u8)).unwrap_err();
+        assert!(
+            panic_reason(odd.as_ref()).contains("neither &str nor String"),
+            "a payload with no message must be reported as such, not dropped"
+        );
+        // And the shape of the real one: cudarc's message names the library it could not find.
+        let real = "Unable to dynamically load the \"cuda\" shared library - searched for library \
+                    names: [libcuda.so, libcuda.so.1]";
+        let caught = std::panic::catch_unwind(|| panic!("{real}")).unwrap_err();
+        assert!(panic_reason(caught.as_ref()).contains("libcuda.so"));
     }
 
     /// **Every Act-2 round gates its timing through the SAME two-arm guard** (G1/G2/G8), and no
