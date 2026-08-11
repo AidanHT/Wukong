@@ -7223,11 +7223,7 @@ pub fn time_gemm_nt_wgmma_in(
                 // scope; `c_bytes` is exactly `c_d`'s length in bytes (`c_d.len() == m*n` is
                 // asserted above); the stream is this `Gpu`'s own and is synchronized before `c_d`
                 // is read or dropped.
-                unsafe {
-                    sys::cuMemsetD8Async(c_ptr, 0, c_bytes, g.stream.cu_stream())
-                        .result()
-                        .map_err(DriverError::from)?
-                };
+                unsafe { sys::cuMemsetD8Async(c_ptr, 0, c_bytes, g.stream.cu_stream()).result()? };
             }
             // SAFETY: as in `gemm_nt_wgmma` — `args` is PARAM_ORDER, its length was checked against
             // the `.param` count of this very text, every pointee is a live local, and `c_d` is a

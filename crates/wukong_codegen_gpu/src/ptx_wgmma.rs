@@ -7582,7 +7582,7 @@ mod tests {
                     c.name
                 );
                 let create = ptx
-                    .match_indices(&format!("createpolicy.fractional.L2::"))
+                    .match_indices("createpolicy.fractional.L2::")
                     .map(|(i, _)| i)
                     .find(|i| ptx[*i..].lines().next().is_some_and(|l| l.contains(reg)))
                     .unwrap_or_else(|| {
@@ -7645,8 +7645,8 @@ mod tests {
     fn the_w1_regime_rule_follows_the_measured_sign_change() {
         // The threshold must sit strictly inside the interval the measurement brackets: the cluster
         // LOSES at sq2048 (4.19e6 output elements) and WINS at sq4096 (16.8e6).
-        assert!(W1_CLUSTER_MIN_OUTPUT_ELEMS > 2048 * 2048);
-        assert!(W1_CLUSTER_MIN_OUTPUT_ELEMS <= 4096 * 4096);
+        const _: () = assert!(W1_CLUSTER_MIN_OUTPUT_ELEMS > 2048 * 2048);
+        const _: () = assert!(W1_CLUSTER_MIN_OUTPUT_ELEMS <= 4096 * 4096);
         assert_eq!(wgmma_w1_for(2048, 2048).name, WGMMA_W1.name);
         assert_eq!(wgmma_w1_for(4096, 4096).name, WGMMA_W1_MCB.name);
         assert_eq!(wgmma_w1_for(8192, 8192).name, WGMMA_W1_MCB.name);
@@ -7677,6 +7677,71 @@ mod tests {
         }
         // Saturating, so a caller cannot overflow its way into the wrong arm.
         assert_eq!(wgmma_w1_for(usize::MAX, usize::MAX).name, WGMMA_W1_MCB.name);
+    }
+
+    /// **Wave 2's two invocations name real things, in the order the standing rules require.**
+    ///
+    /// They are data for the same reason every other invocation in this file is: an operator reads
+    /// them out of a skip message or a round log, and a command that has drifted from the test it
+    /// names costs a rented hour to discover.
+    #[test]
+    fn the_wave2_invocations_name_the_rounds_they_run() {
+        let census = WGMMA_CENSUS_INVOCATION;
+        assert!(census.is_ascii());
+        assert!(
+            census.contains("::ptxas"),
+            "the census entry point is the CPU-only ptxas one -- NO GPU is attached, which is the \
+             whole reason it costs ~$0.02: {census}"
+        );
+        assert!(
+            !census.contains("::bench") && !census.contains("gpu="),
+            "a census that rents a GPU is not a census: {census}"
+        );
+        assert!(census.contains("wgmma"), "it must filter to this family");
+
+        let visit = WGMMA_W2_H100_INVOCATION;
+        assert!(visit.is_ascii());
+        // Standing rule 1: bring-up runs BEFORE the perf round, in the same container, one log.
+        let bringup = visit
+            .find("wgmma_hopper_bringup")
+            .expect("the visit must run bring-up");
+        let sweep = visit
+            .find("wgmma_config_sweep")
+            .expect("the visit must run the sweep");
+        let ksweep = visit
+            .find("wgmma_k_sweep")
+            .expect("the visit must run the K sweep");
+        assert!(
+            bringup < sweep,
+            "bring-up must precede the perf round, or a visit can end having measured a kernel \
+             whose correctness floor it never re-established"
+        );
+        assert!(
+            sweep < ksweep,
+            "the K sweep runs last: it is the part whose value survives a truncated visit"
+        );
+        // The cluster gate is a correctness gate and must not be deferred behind --ignored.
+        assert!(
+            visit.contains("wgmma_cluster_multicast_is_exact"),
+            "both cluster axes must be re-proven exact before anything is timed"
+        );
+        // Every round name in the visit is a test that exists in gpu.rs. Checked textually, because
+        // the constant is in this module and the tests are in that one.
+        #[cfg(feature = "gpu")]
+        {
+            let src = include_str!("gpu.rs");
+            for name in [
+                "wgmma_cluster_multicast_is_exact",
+                "wgmma_hopper_bringup",
+                "wgmma_config_sweep",
+                "wgmma_k_sweep",
+            ] {
+                assert!(
+                    src.contains(&format!("fn {name}(")),
+                    "the wave-2 visit names `{name}`, which is not a test in gpu.rs"
+                );
+            }
+        }
     }
 
     /// **The K sweep is a K sweep**: one output shape, K the only axis, and both rows present.
