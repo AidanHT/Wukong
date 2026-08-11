@@ -600,3 +600,292 @@ it stays inside the refusal as long as no int4 **ratio against a peer** is publi
 `::marlin` also picks the right kernel by device (`modal_app.py:3948-3957`): Machete on `sm_90`,
 Marlin on Ampere, with a loud warning in each wrong direction. When the int4 trigger does fire, use
 that dispatcher rather than naming a kernel by hand.
+
+---
+
+## 5. BASELINE ROUND SPEC -- the Hopper denominator, before any Wave-5 code exists
+
+The plan asks for this round *before* implementation, and the reason is one sentence: **every
+Wave-5 projection is a ratio whose denominator is currently a 4050 memory.** `2.89x` and `1.48x`
+are instruction-issue ratios from a published H800 table; what they multiply is our own measured
+8-bit throughput, and we have never measured it on Hopper.
+
+### 5.1 What to run
+
+Existing families, existing kernels, no new code. All three groups run through the prebuilt Volume
+binary (`_require_prebuilt` refuses to compile on metered silicon, `modal_app.py:8-13`), in the
+same container, in this order:
+
+| group | filter | tests it selects (from the 2026-08-10 census test list) |
+|---|---|---|
+| fp8 | `fp8_` | `fp8_gemm_matches_reference_within_tol`, `fp8_pipe_matches_reference_within_tol`, `fp8_pipe_regime_matches_reference`, `fp8_pipe_vs_peers`, `fp8_vs_cublaslt_pct`, `fp8_tensorcore_tile_matches_reference`, `cublaslt_fp8_matches_reference_within_tol` |
+| int8 | `int8_` + `quant_int8_` | `int8_gemm_matches_reference`, `int8_gemm_vs_peers`, `int8_dequant_matches_reference`, `quant_int8_fused_dequant_vs_chain`, `quant_int8_w64_confirm`, `quant_int8_w64_s3_sweep`, `quant_int8_bigtile_sweep`, `quant_int8_raster_sweep` |
+| int4 | `int4_` | `int4_gemm_matches_reference`, `int4_gemm_vs_peers`, `int4_splitk_occupancy` |
+| denominator | `tensorcore_roofline_pct`, `gpu_target_is_probed_and_sane` | the peak-fraction column (standing rule 4) and the device identity |
+
+Invocation shape, copied from `WGMMA_SWEEP_INVOCATION` (`ptx_wgmma.rs:2086-2088`) because the same
+two hazards apply -- a run without `--nocapture` throws away everything the rented minutes produced,
+and `--test-threads=1` is what keeps the timings readable:
+
+```
+WUKONG_GPU_REQUIRED=1 WUKONG_PEER_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu \
+    --release -- --ignored --nocapture --test-threads=1 <filter>
+```
+
+### 5.2 What each number decides
+
+| number | decides |
+|---|---|
+| `int8_gemm_vs_peers` on H100 | **Whether Ada-tuned int8 is already competitive on Hopper without wgmma.** If it lands high against cuBLAS IMMA, the 1.48x issue headroom is the entire remaining story and W5-int8 is close to a pure retype. If it lands low, the Ada tuning (w64 warp tile, XOR swizzle, stage count) does not transfer and W5-int8 needs its own tile search -- which is exactly what the f16 Act-1 -> Act-2 transition taught, and it would move int8 from "cheap" to "a wave of its own". |
+| `fp8_pipe_vs_peers` and `fp8_vs_cublaslt_pct` on H100 | **Whether the 2.89x claim's denominator is real.** The plan asserts `ptx_fp8.rs` runs at fp16 issue rate on Hopper. Run the fp8 kernel and the f16 kernel of the *same* tile back to back in the same container: if the absolutes coincide, the assertion is confirmed on this device and 2.89x stands. If fp8 is measurably faster, the denominator (490.7) is wrong for this part and the projected headroom shrinks -- a finding worth more than the round costs. |
+| `int4_gemm_vs_peers` | **Whether D1's "INT4 `mma` on Hopper degenerates to `IMAD` on the CUDA cores" reproduces.** This is a $0-marginal sanity check on the whole Luo-et-al table that Wave 5's projections rest on. Expect a catastrophic Hopper number and publish it as a *baseline*, never as a ratio (section 4.4). |
+| `quant_int8_fused_dequant_vs_chain` | The **current** fused-dequant advantage, which is the thing vLLM's `cutlass_scaled_mm` will be measured against in the Wave-5 round proper. Measuring it now separates "wgmma helped" from "fusion helped". |
+| `tensorcore_roofline_pct` | The peak-fraction denominator for every ratio the wave later publishes. |
+
+### 5.3 The cost line, checked rather than repeated
+
+**DERIVED.** `modal_app.py:373-379` prices H100 at **$3.95/hr** = $0.001097/s, so the plan's
+**$0.06** buys **~55 seconds** of H100 wall time, plus the CPU/memory adder. That is achievable
+only with a warm Volume target dir and a tight filter; a full `--include-ignored` sweep of the
+three families will not fit in it. State the intended budget in the round preamble and let the
+meter (`_meter`, which prints the ceiling before the call and the actual after) settle it -- the
+honest options are "narrow the filter to fit $0.06" or "declare a $0.25 round", not "hope".
+
+### 5.4 The census rows to add to `wgmma_all_emittable`
+
+**FACT(repo).** `wgmma_all_emittable()` (`ptx_wgmma.rs:2098-2106`) is `WGMMA_VARIANTS` plus every
+generatable `WGMMA_SWEEP_GRID` row, deduplicated **by module key**;
+`wgmma_device_free_modules()` (`:3728-3747`) turns it into the corpus that the ASCII rule, the
+`.target` floor, the `.version` law and the CPU ptxas census all scan; and `gpu.rs:8336` asserts
+`EXPECTED_MODULES = 109` over the crate-wide union.
+
+**DERIVED.** Proposed Wave-5 rows, all at `BK = 128` so `bk * dtype.size() == 128` (section 2.4):
+
+| row | tile | why |
+|---|---|---|
+| `wgmma_nt_e4m3_128x256x128_s4` | W1 | the fp8 forward centerpiece |
+| `wgmma_nt_e5m2_128x256x128_s4` | W1 | the backward-gradient type; one token pair from the above |
+| `wgmma_nt_s8_128x256x128_s4` | W1 | the int8 centerpiece, s32 out |
+| `wgmma_nt_e4m3_128x128x128_s6` | W3c | **the two-level-accumulation arm** -- section 3.3(b) shows it does not fit on W1 |
+| `wgmma_nt_s8_128x128x128_s6` | W3c | the int8 moderate-size twin |
+
+Five rows takes `EXPECTED_MODULES` 109 -> 114, and the constant must move **in the same commit** or
+the crate-wide law fails -- which is the intended behaviour: it is what forces the count to be
+thought about. If the B-multicast arm has landed from Wave C1 by then, each `_mcb2` twin is a
+further distinct module because `WgmmaCfg::derived_name` encodes the whole geometry including the
+multicast axis.
+
+**The census answers four things for $0.02, and all four are otherwise H100 questions:**
+
+1. **The N menu at K=32.** ptxas rejects an off-menu shape token (section 1.1).
+2. **Whether `.satfinite` assembles on the integer form** (section 1.3) -- ask, then decline it
+   anyway, with the answer recorded.
+3. **Registers and spills.** The prediction is `regs 168, spill 0, smem(gen) 196672` on every 8-bit
+   row, identical to the f16 row at `bench/gpu/h100/2026-08-10-ptxas-census.log:687`.
+4. **C7511.** "wgmma instructions are serialized due to insufficient register resources" is a
+   **silent 2-4x, not a failure** (G14). The 2026-08-09 CUTLASS build produced 112 of them from
+   NVIDIA's own kernels; ours must produce zero, and a nonzero count is a finding that blocks the
+   H100 visit rather than a warning to scroll past.
+
+> **LANDMINE, from the census log itself.** The 2026-08-10 run exited **1** with "ptxas audit
+> incomplete: no ptxas records parsed" (`:842-869`) -- the audit test printed its own table and the
+> harness's `ptxas -v` parser read nothing out of it, so the per-arch coverage section reported
+> `MISSING: sm_80, sm_89, sm_90a` even though the table above it has the sm_90a rows. **The
+> register numbers in that log are real; the harness's verdict on them is not.** Wave 5 must not
+> read that exit code as "the census failed", and should fix the parse or narrow the claim before
+> relying on the census as a gate.
+
+---
+
+## 6. GUARDS -- law text
+
+Each item below is written so it can become a test name and an assertion message, not a paragraph
+someone has to re-derive.
+
+### G-W5-1. The byte-geometry law (the one that protects the paid answer)
+
+> **`WgmmaCfg::validate` must reject any configuration for which `bk * dtype.size() != 128`.**
+>
+> `SHIPPED_LAYOUT` is `Swizzle128 { lbo_bytes: 16, swapped: false }`, and every field of it --
+> `SBO = 8 * row_bytes = 1024`, `base_offset = 0`, `k_step_bytes = 32`, `TmaSwizzle::B128`, the
+> 1024-byte start alignment -- is correct **only** at `row_bytes == 128`. That reading was settled
+> on hardware for 16-bit at `BK = 64` (`2026-08-10-h100-s2c-desc-sweep.log:178-182`) and is
+> byte-invariant, not element-invariant. A 1-byte row at `BK = 64` needs `Swizzle64`, `SBO = 512`
+> and a 512-byte alignment -- a reading nothing has measured -- and `TensorMapArgs::validate` will
+> **not** catch it, because it only refuses a contiguous extent *greater* than the swizzle atom
+> (`tma_host.rs:326`).
+
+Device-free, total, one line of arithmetic. It is the highest-value assertion in the wave.
+
+### G-W5-2. Capability: `require_fp8` is necessary and NOT sufficient on sm_90a
+
+**FACT(repo).** `FP8_MIN_CC = (8, 9)` (`gpu.rs:150`) and `Gpu::supports_fp8` is
+`target.supports((8,9))` (`:560-563`). Hopper is cc `9.0`, so **`require_fp8` can never decline on
+an H100** -- it is satisfied by construction and therefore gates nothing about this family.
+
+The binding gate is the type: `wgmma_module` cannot be called without an `Sm90aLicense`
+(`ptx_wgmma.rs:135-139`), which only `require_sm90a` mints from a probed `9.x`. Law text:
+
+> **Every 8-bit `wgmma` launcher must call `require_sm90a` AND `require_fp8` (fp8 rows only).**
+> The license is the real gate; the `require_fp8` call exists to satisfy the textual scan
+> `every_fp8_module_load_is_capability_gated`, which is a source scan and cannot see a type. Do not
+> "simplify" it away: the scan's corpus is files, and dropping the call would make an fp8-naming
+> launcher invisible to it. Document at the call site that on `sm_90a` it is subsumed, so the next
+> reader does not conclude the gate is doing work it is not.
+
+The failure this prevents is precise and would otherwise be confusing: without the license the fp8
+textual law **passes** (the module names `require_fp8`) while `cuModuleLoadData` refuses the module
+on any non-Hopper part, because the header is `HDR_SM90A_V80` and `sm_90a` is
+architecture-*specific* in both directions.
+
+### G-W5-3. `.version`: do not let a quantizer drag the mainloop to the r550 floor
+
+**FACT(repo).** `gpu.rs`'s durable law: "a module may declare an r550+ driver floor only if it
+emits an instruction that needs one". The wgmma family is licensed at `.version 8.0` by `wgmma` +
+`cp.async.bulk` (`gpu.rs:8318-8319`). `ptx_fp8_train.rs` declares `HDR_SM89_V84` because it emits
+`cvt.rn.satfinite.e4m3x2.f32` (`:22`, `:317`, `:322`).
+
+> **The 8-bit `wgmma` mainloop module must contain no `cvt.rn.satfinite.e{4m3,5m2}x2.f32`.**
+> Quantization stays in its own module at its own floor. Folding a quantize prologue into the
+> mainloop would drag an `sm_90a`/`8.0` module to an `8.4` driver floor for no reason, and
+> `only_the_ada_floor_declares_the_r550_driver_version` plus
+> `the_family_declares_no_floor_it_does_not_need` would both have to be weakened to allow it.
+
+### G-W5-4. ASCII, and where an 8-bit generator will break it
+
+`wgmma_ptx_is_pure_ascii` scans `wgmma_device_free_modules()`, so a new 8-bit generator is covered
+**iff** its config reaches `wgmma_all_emittable()`. Law text:
+
+> **A new 8-bit row is added to `WGMMA_VARIANTS` or `WGMMA_SWEEP_GRID` in the same commit as its
+> generator, and `EXPECTED_MODULES` moves with it.** A module outside that enumeration is outside
+> four laws at once -- ASCII, `.target`, `.version` and the ptxas census (G14).
+
+The specific 8-bit hazard is prose: an emitted comment describing "e5m2 x e4m3" or "K = 32 -> 2
+core matrices" with a Unicode multiplication sign or arrow is a `ptxas fatal` at
+`cuModuleLoadData`, at the worst possible moment, from a comment.
+
+### G-W5-5. G3 naming: the dtype AND the `bk` must be in the derived name
+
+> **`WgmmaCfg::validate` must reject any row whose `name`/`key` is not derivable from its own
+> geometry, and for 8-bit that geometry now includes `bk`.**
+
+`wgmma_nt_e4m3_128x256x64_s4` and `wgmma_nt_e4m3_128x256x128_s4` are different modules with
+different descriptors. `Gpu::function` keys on the module key alone and never re-examines the text
+(`ptx_wgmma.rs:2094-2097`), so a `WgmmaCfg { dtype: E4M3, bk: 128, ..WGMMA_W1 }` that forgets to
+override `name` and `key` gets **W1's cached f16 module** back and bills its launches to a
+configuration that never ran. This is the plan's named "#1 sweep hazard", and the 8-bit retype adds
+two new fields it can hide in.
+
+### G-W5-6. G15 dtype-aware `ramp_radix` -- and the finding that the fp8 exact arm barely exists
+
+**FACT(repo).** `ramp_code(w, d0, d1, d2) = 1 + d0%w + w*(d1%w) + w^2*(d2%w)`
+(`ptx_wgmma.rs:2136-2138`), so the largest operand value is `1 + (w-1)(1 + w + w^2)`.
+`ramp_radix(k)` (`:2125-2130`) picks the largest `w` in `{8,4,2}` with `k * w^6 <= 2^24`, i.e. it
+bounds only the **accumulation**, against a hardcoded f32 limit.
+
+**DERIVED, both bounds, per dtype:**
+
+| dtype | significand bits | exact-integer limit | max `w` by **value** (`1+(w-1)(1+w+w^2) <= limit`) | accumulation limit |
+|---|---|---|---|---|
+| f16 | 11 | 2048 | 8 (gives 512) | 2^24 |
+| bf16 | 8 | 256 | 4 (gives 64; w=8 gives 512 -- **fails**) | 2^24 |
+| e4m3 | 4 | **16** | **2** (gives 8; w=4 gives 64 -- fails) | **2^14** |
+| e5m2 | 3 | **8** | **2** (gives 8, exactly at the limit) | **2^14** |
+| s8 | integer | 127 | **4** (gives 64; w=8 gives 512 -- fails) | 2^31, exact |
+
+The **2^14** accumulation limit for fp8 is not f32's 2^24: Hopper's fp8 tensor core right-shift-
+aligns the 32 mantissa products to the maximum exponent and keeps only the **top 14 bits** of each,
+truncating the rest (DeepSeek-V3 technical report; corroborated by Colfax's write-up,
+<https://research.colfax-intl.com/deepseek-r1-and-fp8-mixed-precision-training/>). So the fp8
+ramp must satisfy `k * w^6 <= 2^14` as well as `w <= 2`:
+
+```
+w = 2  =>  k * 64 <= 16384  =>  k <= 256
+```
+
+> **FINDING: the exact-integer bring-up arm is only available for fp8 at `K <= 256`, and only at
+> radix 2.** Above that, no radix in `{8,4,2}` satisfies the bound and the arm cannot be
+> constructed at all. This is not a tuning inconvenience -- it means **G2's pseudorandom f64-
+> reference arm is the primary correctness instrument for the fp8 family, not the secondary one**,
+> and it is the derivation behind the plan's "G2 is a hard prerequisite, not a nicety". The
+> int8 family keeps its `==` arm at every K (radix 4, accumulation exact in s32), which is precisely
+> why int8 is the wave's low-risk half and fp8 is not.
+
+Law text:
+
+> **`ramp_radix` takes the dtype.** It enforces `1 + (w-1)(1 + w + w^2) <= dtype.exact_integer_limit()`
+> **and** `k * w^6 <= dtype.exact_accumulation_limit()`, and it **returns an error rather than a
+> radix** when no `w` satisfies both -- so a caller that cannot have an exact arm is told, instead
+> of silently getting a ramp that rounds and an unexplained near-miss.
+
+### G-W5-7. Exactness gates: two arms for int8, a derived tolerance for fp8
+
+> **int8: `==` against an `i32` scalar model, on the s32 output, at every gate shape.** The bound
+> that makes it legitimate is `|a*b| <= 16384` and `16384 * K < 2^31`, i.e. **`K < 131072`**
+> (section 1.3), which every campaign shape clears by an order of magnitude. The dequantised f32
+> output gets a *separate* tolerance arm (section 3.2). A single fused test is a downgrade of the
+> claim.
+
+> **fp8: `c * sqrt(K) * eps` against an f64 reference, with `eps = 2^-14 = 6.104e-5` -- not f32's
+> `2^-24`.** The 14-bit figure is the hardware's product-alignment width, so the tolerance is
+> *derived from the mechanism*, which is the only kind that may be widened. Two further rules:
+>
+> * **The f64 reference is computed over the exactly-decoded fp8 operand values**, never over the
+>   pre-quantization f32. Otherwise the input rounding (half-ulp `2^-4` for e4m3, `2^-3` for e5m2)
+>   swamps everything and the gate measures the quantizer instead of the kernel.
+> * **Publish which accumulation mode produced the number.** With DeepSeek promotion every `K = 128`
+>   (== one `BK` stage), the tensor-core accumulator is reset per stage, so the alignment maximum is
+>   taken over 128 products rather than over the whole running sum and the dominant term loses its
+>   K-dependence. Un-promoted and promoted are two different tolerances and two different speeds;
+>   reporting one number from a mixed set is the section-4.3 fairness defect turned inward.
+>
+> **Never widen `c` to make a run pass.** If the measured error exceeds the derived bound, the
+> derivation is wrong or the kernel is -- and either is a finding.
+
+### G-W5-8. `TmaOobFill::Zero` still means zero at 8 bits (G20, re-checked rather than assumed)
+
+The out-of-bounds law works because a zeroed byte pattern is a zero *value*, so a ragged M/N/K edge
+contributes exactly nothing to the accumulator and only the epilogue needs a bounds check
+(`tma_host.rs:137-153`). **Re-derived for the new types:** `0x00` is `+0.0` in e4m3 and in e5m2
+(both use sign-magnitude with an all-zero exponent and mantissa), and `0` in s8 and u8. All four
+are true zeros, so the law transfers.
+
+It is worth one line because it is *not* automatic: it is a property of these four encodings, and a
+future 1-byte format whose `0x00` is not zero (a biased or offset encoding) would break the whole
+ragged-shape story silently.
+
+### G-W5-9. G19 `scale-d` is unchanged, and still the thing a tile loop breaks
+
+`scale-d = %pfirst = (kt != 0)` (`ptx_wgmma.rs:3003-3004`) has the same meaning in all three 8-bit
+forms -- it is the first positional operand of every tail in section 1.2. The Wave-3 hazard
+restated for Wave 5: **in a persistent/tile-loop kernel `kt != 0` has no meaning across tiles**, and
+tile 2 accumulating into tile 1 is an *exact integer* in the int8 arm, hence invisible to the `==`
+oracle that is otherwise the wave's strongest gate. Assert the `mov.u32 %kt,0` count equals the
+tile-loop entry count, exactly as G19 specifies.
+
+### G-W5-10. Round ordering (standing rules 1 and 3)
+
+> **The $0.02 CPU ptxas census runs before the H100 is rented, over
+> `wgmma_device_free_modules()`, and the 8-bit descriptor sweep and correctness arms run before the
+> peer round in the same container.** The plan states the order; section 5.4 states the four
+> questions the census answers for free, and section 2.5 states that an 8-bit *descriptor* sweep
+> should not be one of the arms at all -- the descriptor question is closed, and re-opening it as a
+> sweep would be re-buying an answer this dossier already derives.
+
+---
+
+## 7. THE SHORT LIST -- what an implementer must not get wrong
+
+1. **`bk * dtype.size() == 128`.** Everything in section 2 hangs off it. `BK` goes 64 -> 128 for
+   1-byte types, and the whole hardware-settled descriptor transfers unchanged. Leave `BK` at 64
+   and the family silently needs a `Swizzle64` reading nobody has measured. **This is the one.**
+2. Three different operand tails; the transpose immediates are *absent*, not zero; `imm-scale-a/b`
+   are sign flips, not quantization scales.
+3. The int8 `==` claim lives on the **s32** output. Dequant is a separate arm.
+4. Two-level fp8 accumulation does not fit on the 128x256 tile. Put it on 128x128.
+5. The fp8 tolerance is `2^-14`, derived from the hardware's 14-bit product alignment, and the f64
+   reference must be taken over the *decoded fp8* operands.
+6. The CUTLASS fp8/int8 profiler does not exist yet. Build it on CPU first, or the peer column is
+   an artifact of our own build.
+7. Name and key every new row from its own geometry, `bk` included, or `Gpu::function` hands back
+   the f16 module and the round bills launches to a config that never ran.
