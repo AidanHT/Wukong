@@ -704,3 +704,254 @@ one-tile-per-CTA guard and would ship undetected.
 mechanism. (ii) `g8_persist` moves `sq2048` -> the instrument. (iii) `g8_persist` gains less than
 half the predicted amount at `gpt_d1024_up` -> `X_fill` is not fully hidden, and the next question is
 the ring depth (a 3-stage ring has `X_fill = 5.89 us` and a *shorter* overlap requirement).
+
+---
+
+## 3. PER-SHAPE TILE DISPATCH
+
+### 3.1 The three levers act on three different roofs, and that is why a dispatcher is needed
+
+| lever | what it changes | which roof it lowers | zero when |
+|---|---|---|---|
+| **cluster (1x2x1, B multicast)** | `L2 -> SMEM` bytes: `(BM+BN)` becomes `(BM+BN/2)` per tile, a flat 1.5x at W1 | the **7.00 TB/s L2** roof (`I_cta` 85.33 -> 128.0, 597 -> 896 TFLOP/s) | the shape is not near the L2 roof |
+| **raster** | `DRAM -> L2` bytes, by changing the *wave footprint*; L2->SMEM bytes UNCHANGED | the **3.35 TB/s HBM** roof, and L2 residency | the grid is one wave, or the linear footprint already fits L2 |
+| **persistence** | nothing about traffic; removes `X_fill` at `waves-1` boundaries | the **mainloop fixed-cost** floor | the grid is one wave |
+
+They are orthogonal in the sense that matters: the cluster does not change the footprint and the
+raster does not change the per-tile L2 read. The dispatcher's job is to decide, per shape, which
+roofs are actually binding.
+
+### 3.2 THE CLUSTER PREDICATE, and the measured sq2048 preference it must explain
+
+Define the L2-roof fraction of the un-clustered arm:
+
+```
+    T_L2_off(M,N,K) = tiles * (BM + BN) * K * 2 / 7.00e12       [seconds]
+    f_L2            = T_L2_off / T_predicted_off                 [T_predicted_off from 0.4]
+```
+
+Measured, at the three shapes the round-3 sweep covered:
+
+| shape | `T_L2_off` | measured off | `f_L2` | measured cluster effect (s4) | (s3, tight floors) |
+|---|---|---|---|---|---|
+| sq2048 | 28.8 us | 39.09 us | **0.736** | 39.09 -> 41.38, **-5.9%** | 38.51 -> 41.60, **-8.0%** |
+| sq8192 | 1841 us | 2273.5 us | **0.810** | 2273.5 -> 1546.5, **+47.0%** | 1738.0 -> 1637.0, +6.2% |
+| sq4096 | 230.1 us | 243.4 us | **0.946** | 243.4 -> 222.7, **+9.3%** | 239.9 -> 230.1, +4.3% |
+
+**The sign of the cluster's effect flips between `f_L2 = 0.736` and `f_L2 = 0.810`.** The `s3` column
+is the decisive evidence at sq2048: floors of +/-0.01% (`w1_s3_off`) and +/-0.15% (`w1_s3_mcb2`)
+against an 8.0% effect. The `s4` pair (floors +/-3.29% and +/-1.84% against 5.9%) clears too, but
+only just; quote the `s3` pair.
+
+**Mechanism -- what the cluster costs when it is not needed.** Comparing each arm against its own
+`T_floor` (using `X = 14.61` from Fit B, and `S_mcb2 = 0.634` derived from sq4096-mcb2 alone so that
+sq8192-mcb2 is an *independent* prediction):
+
+| arm / shape | `T_floor` | measured | residual |
+|---|---|---|---|
+| off / sq2048 | 39.41 us | 39.09 us | **0.992** (at the floor) |
+| mcb2 / sq2048 | 36.90 us | 41.38 us | **1.121** (+4.5 us per tile) |
+| mcb2 / sq4096 | 220.7 us (x4) | 222.7 us | 1.009 (+0.5 us per tile) |
+| mcb2 / sq8192 | 1534.1 us (x16) | 1546.5 us | **1.008** (+0.9 us per tile) -- independent |
+
+The clustered arm carries a fixed per-tile cost that is **4.5 us at `n_k = 32` and 0.5-0.9 us at
+`n_k = 64/128`: it is progressively hidden as the mainloop lengthens.** Three mechanisms in the
+emitted text produce exactly that shape:
+
+1. `empty[s]` is initialised with `cluster_ctas * consumer_wgs = 4` arrivals instead of 2
+   (`WgmmaCfg::empty_arrivals`), so a producer may not refill stage `s` until **both** CTAs'
+   consumers have released it. The two CTAs' pipelines are lock-stepped at every stage and per-stage
+   jitter becomes the max of two SMs rather than one.
+2. every stage release now costs `cvta.to.shared` + `cvt.u32.u64` + two rounds of
+   `mov`/`mapa.shared::cluster`/`mbarrier.arrive.shared::cluster` instead of one
+   `mbarrier.arrive.shared::cta` (`ptx_wgmma.rs:3629-3648`) -- a cross-SM DSMEM barrier round trip,
+   ~96 ns/stage at sq2048 (`3.09 us / 32 stages`), which is ~176 clocks and the right order for that
+   network.
+3. two `barrier.cluster.arrive/wait` rendezvous per kernel (`ptx_wgmma.rs:3472, 3705`).
+
+**The predicate: cluster ON iff `f_L2 >= 0.78`.** The threshold sits inside the measured bracket
+`[0.736, 0.810]` and is placed at its low end deliberately: a wrong OFF at sq8192 costs 27 points, a
+wrong ON at sq2048 costs 5. Be eager.
+
+**Evaluate it, including two shapes the round-3 sweep never measured:**
+
+| shape | `f_L2` | predicate | status |
+|---|---|---|---|
+| sq1024 | 0.167 | OFF | untested |
+| sq2048 | 0.736 | **OFF** | MEASURED, -8.0% with the cluster |
+| gpt_d1024_up | 0.542 | OFF | **untested -- run it** |
+| gpt_d4096_up (today) | 0.585 | OFF | untested |
+| gpt_d4096_up (post-raster) | **0.955** | **ON** | untested -- the raster *flips* this decision |
+| sq8192 | 0.810 | **ON** | MEASURED, +47.0% |
+| sq4096 | 0.946 | **ON** | MEASURED, +9.3% |
+| gpt_d1024_down | **1.000** | **ON** | **untested -- the predicate's most informative point** |
+
+Two consequences the implementer must not miss:
+
+* **`gpt_d4096_up` flips.** The predicate must be evaluated on the *post-raster, post-persistence*
+  predicted time, not on today's measured time. Today that shape is memory-thrashing at 58.5% of the
+  L2 hit rate and the cluster is worth nothing; once the raster makes its wave footprint L2-resident
+  it lands at 0.955 and the cluster is worth 1.5x of a binding roof. **The dispatcher is a function
+  of the *final* configuration, not of a measurement of an earlier one.**
+* **`gpt_d1024_down` is the experiment that pins the threshold.** It is a single-wave shape
+  (raster = identity, persistence = zero), it sits exactly at the 7.00 TB/s roof by construction --
+  it *is* the `BW_L2` calibration -- and it is the only shape where the cluster is the sole variable.
+  Predicted: `T_L2_on = 38.35 us` and `T_floor_on = 55.19 us`, so the cluster's saving is capped at
+  `57.50 - 55.19 = 2.3 us` against a fixed cost of 0.5-0.9 us at `n_k = 64`: **a +2.5 to +3% win, and
+  the smallest ON in the table.** If it loses, the threshold is above 1.0 and the cluster only ever
+  pays when it also removes a *multi-wave* memory term.
+
+### 3.3 The emittable tile set, and what the register file actually allows
+
+Hard constraints from the source and the census:
+
+* `Schedule::Cooperative` requires **CTA-M a multiple of 128** (`ptx_wgmma.rs:1249-1250`:
+  "cooperative is illegal below CTA-M 128; a 64-row tile needs the pingpong schedule") and
+  `bm = 64 * consumer_wgs`. So `bm` is 128 or 256. **`bm = 192` is not emittable** -- see 5.2.
+* SMEM: `stages * (bm+bn) * bk * 2 + 16 * stages <= 232 448` for 1 CTA/SM, `<= 116 224` for 2.
+* Registers: accumulators per consumer thread are `bn/2` f32. Occupancy is decided by the **static**
+  per-thread allocation ptxas chooses, which the census reports as **168** for all three shipped
+  rows; 2 CTAs/SM needs `65536 / (2*384) = 85`.
+
+| tile | accs/thread | SMEM/stage | max stages @1 CTA/SM | 2 CTAs/SM? | `I_cta` | L2 roof (no cluster) |
+|---|---|---|---|---|---|---|
+| 128x256 | 128 | 49 152 B | 4 | no (needs 85 regs vs 128 accs alone) | 85.33 | 597 TFLOP/s |
+| 128x128 | 64 | 32 768 B | 6 | **no** -- 64 accs + ~30 addressing > 85, census says 168 | 64.00 | 448 TFLOP/s |
+| 128x64 | 32 | 24 576 B | 8 | **yes** at s4 (98 368 B, ~62 regs) | 42.67 | 299 TFLOP/s |
+
+**The plan's "128x128 @ s3 for two CTAs/SM" does not survive the census.** ptxas already allocates
+168 registers per thread for that entry with no cap; forcing 85 means fitting 64 live accumulators
+plus the descriptor pairs, the two 64-bit stage bases and the loop state into 21 registers. It will
+spill, and a mainloop spill is worth far more than the occupancy. **Verify on a CPU before spending a
+visit:** re-run the $0.02 census with `--maxrregcount 85` over the 128x128 s3 entry and read
+`spill_st`. If it is non-zero the row is dead and the high-occupancy tile is 128x64, not 128x128.
+
+### 3.4 sq1024: the one shape only tile dispatch can move, and 128x128 is not the answer
+
+sq1024 at 128x256 is 32 CTAs on 132 SMs: **24.2% of the device**, and no raster, cluster or
+persistence touches it (one wave, `f_L2 = 0.167`, footprint 8.4 MB). The plan's occupancy ceiling
+arithmetic, `(tiles/132) * 989 / peer_TFLOPs`, gives 78% for 128x256 and 155% for 128x128 -- correct,
+and it is the *occupancy* ceiling, not the achievable number. Working the full model:
+
+| tile | tiles | SM util | `X` (scaled to resident CTAs) | `n_k` | `S` | `T_floor` | `T_L2` | predicted | vs cuBLAS 7.0 us |
+|---|---|---|---|---|---|---|---|---|---|
+| 128x256 s4 | 32 | 24.2% | 8.65 us | 16 | 0.713 | 20.05 us | 3.6 us | 20.1 us | 32.3% (**measured 21.5 us**) |
+| 128x128 s6 | 64 | 48.5% | ~5.8 us | 16 | ~0.337 | 11.2 us | 4.8 us | 11.2 us | **~62%** |
+| **128x64 s4** | **128** | **97.0%** | ~5.3 us | 16 | ~0.165 | 7.94 us | 7.19 us | **7.94 us** | **~88%** |
+
+The 128x256 row reproduces the measured 21.5 us to 7%, which is what licenses the other two.
+**128x64 is the sq1024 tile: +56 points, the largest single-shape number in this dossier.** It is not
+in the plan, and it needs one new thing -- an `m64n64k16` module family (the shape is in the ISA
+menu, so `the_shape_menu_is_the_isa_menu` will accept it) -- plus the `f_L2` check, since its
+`I_cta = 42.67` puts its L2 roof at 299 TFLOP/s and it must never be dispatched to a large shape.
+
+### 3.5 sq2048: 128x128 is REFUTED there, by measurement
+
+`ACT2_WAVE_PLAN.md:15` and D1 4.5 put W3C (128x128) at sq2048 "because a 256-wide tile quantizes
+below `M*N = 4.3e6`". `sq2048` has `M*N = 4.194e6`, just under that literal. The round-3 sweep
+measured it anyway, and:
+
+```
+    w1_s4_off  (128x256)  39.094 us     w3c_s6_off  (128x128)  43.757 us    -> 128x128 is 11.9% SLOWER
+    w1_s3_off  (128x256)  38.512 us     w3c_s6_mcb2 (128x128)  44.609 us    -> 15.8% slower
+```
+
+Two mechanisms, both pointing the same way and neither of them quantization: (i) 128x256 at sq2048 is
+**128 tiles = one wave at 97.0% efficiency**, so there is no quantization to fix; (ii) 128x128 has
+`I_cta = 64.0` against 128x256's 85.33, i.e. **1.33x the L2 traffic** -- exactly the plan's own C1
+note. The `M*N >= 4.3e6` literal is the wrong predicate. The right one is **wave efficiency**:
+
+```
+    use the WIDEST tile whose wave efficiency  tiles / (132 * ceil(tiles/132))  is >= 0.90
+```
+
+which accepts 128x256 at sq2048 (0.970) and rejects it at sq1024 (0.242), reproducing both measured
+facts with one rule.
+
+### 3.6 THE DISPATCH TABLE
+
+Four classes, each defined by a predicate computable on the host from `(M, N, K)` alone.
+
+| # | class predicate | shapes | tile | cluster | raster | persistent | derivation |
+|---|---|---|---|---|---|---|---|
+| **1** | wave eff. of 128x256 `< 0.90` | sq1024 | **narrow until eff >= 0.90**: 128x64 | OFF (`f_L2` 0.167) | n/a (1 wave) | n/a (1 wave) | 3.4 -- occupancy is the only binding constraint; 24.2% -> 97.0% of the device |
+| **2** | `waves == 1`, eff `>= 0.90` | sq2048 | 128x256 | **OFF** (`f_L2` 0.736) | identity | zero | 3.5 (tile) + 3.2 (cluster). Both levers are provably zero; only the cluster decision exists here |
+| | | gpt_d1024_down | 128x256 | **ON** (`f_L2` 1.000) | identity | zero | 3.2 -- the only single-wave shape at the L2 roof. Predicted +2.5-3%, the table's smallest ON |
+| **3** | `waves > 1`, linear footprint `<= L2` | sq4096 | 128x256 | **ON** (0.946) | **OFF** (42.2 MB fits) | **ON** (3 boundaries) | 1.3 + 2.4. Raster provably worthless; persistence +8.7 pts |
+| | | gpt_d1024_up | 128x256 | **OFF** (0.542) | **OFF** (10.6 MB) | **ON** (3 boundaries) | 2.4. `n_k = 16` makes `X` 56% of the tile: persistence +15.6 pts, the wave's best per-shape number |
+| **4** | `waves > 1`, linear footprint `> L2` | sq8192 | 128x256 | **ON** (0.810) | **ON** (142.9 -> 68.2 MB) | **ON** (15 boundaries) | 1.4 + 2.4. Raster ~1% (the cluster already collected it), persistence +6.8 pts |
+| | | gpt_d4096_up | 128x256 | **ON post-raster** (0.585 -> 0.955) | **ON** (136.4 -> 34.1 MB, *fits*) | **ON** (15 boundaries) | 1.4 + 3.2 + 2.4. The only shape where all three fire: 42.8% -> ~76% -> ~88% |
+
+`L2 = 52 428 800 B`. Linear wave footprint `= f(132/min(gx,132)) * K * 2` from 1.2. `f_L2` from 3.2,
+**evaluated on the post-raster configuration**.
+
+### 3.7 The dispatch function, as the implementer writes it
+
+A pure function of the shape, device-free, unit-testable without a GPU:
+
+```
+    fn dispatch(m, n, k, sm_count = 132) -> &'static WgmmaCfg {
+        // 1. tile: widest tile whose wave efficiency clears 0.90
+        for (bm, bn) in [(128,256), (128,128), (128,64)] {
+            tiles = ceil(m/bm) * ceil(n/bn);
+            if tiles as f64 / (sm_count * ceil(tiles/sm_count)) as f64 >= 0.90 { break }
+        }
+        // 2. raster: only if the linear wave footprint blows L2 (implies waves > 1)
+        waves     = ceil(tiles / sm_count);
+        gx        = ceil(n/bn);
+        r_lin     = sm_count as f64 / min(gx, sm_count) as f64;
+        footprint = (r_lin*bm + (sm_count as f64/r_lin)*bn) * k * 2.0;
+        raster    = waves > 1 && footprint > L2_BYTES;
+        group_m   = round(sqrt(sm_count * bn / bm)) rounded to EVEN;     // 16 at 128x256, 12 at 128x128
+        // 3. persistence: any multi-wave grid
+        persistent = waves > 1;
+        // 4. cluster: the L2-roof fraction of the FINAL configuration
+        t_l2   = tiles * (bm+bn) * k * 2 / BW_L2;
+        t_fl   = waves * (X + ceil(k/64) * S);                 // X = 14.61 us, S = 0.7126 us at 128x256
+        t_dram = dram_bytes(raster, ...) / HBM;
+        cluster = t_l2 / max(t_fl, t_l2, t_dram) >= 0.78;
+        // 5. the table lookup must land on a REAL emitted module, or decline loudly
+        lookup(bm, bn, stages, cluster, raster, persistent, group_m)
+    }
+```
+
+**Two laws on the dispatcher itself.** (a) It must be a *pure function* with a Rust unit test that
+pins its verdict at all seven benched shapes and at the class boundaries (`M*N` just above and just
+below each wave-efficiency threshold, `footprint` just above and just below `L2`, `f_L2` just above
+and just below 0.78) -- because a dispatcher that silently picks a different module than the one the
+round measured is G3's hazard in a new place. (b) Every `(tile, cluster, raster, persistent)`
+combination the dispatcher can emit must exist as a shipped `WgmmaCfg` with a key derivable from its
+own geometry, or the dispatcher must **decline**, never fall back. A fallback here is how a
+publication ends up quoting a configuration that never ran.
+
+### 3.8 The one-visit A/B sweep row
+
+The dispatch decision needs exactly three rows that the previous rounds did not run:
+
+```
+  label            cfg                                  shape(s)              why
+  mcb_gd1024down   WGMMA_W1_MCB (unchanged)             gpt_d1024_down        THE predicate row: the
+                     vs WGMMA_W1 as the control                               only single-wave shape at
+                                                                              f_L2 = 1.000, and the only
+                                                                              one where the cluster is the
+                                                                              sole variable. Predicted
+                                                                              +2.5-3%; a loss moves the
+                                                                              threshold above 1.0
+  mcb_gd1024up     WGMMA_W1_MCB vs WGMMA_W1             gpt_d1024_up          the OFF prediction at
+                                                                              f_L2 = 0.542. Predicted a
+                                                                              LOSS of 3-8%; a win falsifies
+                                                                              the predicate from below
+  w3d_s4           128x64 s4 (NEW module family,        sq1024, sq2048        the tile row. Predicted
+                     m64n64k16)                                               ~88% at sq1024 (from 32.3%)
+                     vs WGMMA_W1 and WGMMA_W3C                                and a LOSS at sq2048, which is
+                                                                              what makes 3.5's rule a rule
+```
+
+**Refusal.** Publishing any dispatch rule from a table that lacks `gpt_d1024_down` and
+`gpt_d1024_up` with both cluster settings -- the threshold currently rests on a single sign flip
+between two shapes, and a rule fitted to one crossing is a curve fitted to two points.
+
+**Falsifiers.** (i) `gpt_d1024_down` prefers no cluster -> `f_L2 >= 0.78` is not the predicate and the
+real one involves `waves`. (ii) `gpt_d1024_up` prefers the cluster -> the predicate is not `f_L2` at
+all. (iii) 128x64 does not beat 128x256 at sq1024 -> occupancy is not sq1024's constraint and
+`X`'s CTA-count scaling in 0.4 is wrong.
