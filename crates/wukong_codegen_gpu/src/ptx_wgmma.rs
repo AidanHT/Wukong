@@ -2539,8 +2539,31 @@ pub const WGMMA_SWEEP_INVOCATION: &str =
 /// What it answers that no test on this machine can: register allocation per entry, spill
 /// stores/loads (a `C7511` "stack frame" note is a **silent 2-4x**, not a failure), and whether the
 /// text assembles at `sm_90a` at all.
-pub const WGMMA_CENSUS_INVOCATION: &str =
-    "modal run tools/cloud/modal_app.py::ptxas --filter wgmma --tag act2-w2";
+///
+/// # The filter names the AUDIT TEST, not the family (the 2026-08-11 refusal)
+///
+/// This constant used to read `--filter wgmma`, which looks like it selects this family and does
+/// the opposite of what the round needs. `--filter` is a **libtest substring over test names**, and
+/// [`WGMMA_CENSUS_AUDIT_TEST`] — the test that actually generates the corpus and runs `ptxas` over
+/// it — does not have `wgmma` in its name. So the census
+///
+/// * **filtered the audit test OUT**, capturing zero `ptxas` invocations, and refused with "no PTX
+///   captured, so no per-arch sweep ran"; and
+/// * **pulled six DEVICE tests IN** (`wgmma_hopper_bringup`, `wgmma_vs_cublas`, ...), which is how a
+///   CPU-only container ended up trying to open a GPU.
+///
+/// The audit test already iterates [`wgmma_all_emittable`], so naming it is both necessary and
+/// sufficient: it is the whole in-family corpus and nothing else.
+/// `the_wave2_invocations_name_the_rounds_they_run` now checks the filter against the audit test's
+/// real name, which is the exact mistake it previously could not see.
+pub const WGMMA_CENSUS_INVOCATION: &str = "modal run tools/cloud/modal_app.py::ptxas \
+     --filter ptxas_reports_the_register_and_spill_budget --tag act2-w2";
+
+/// **The test the census actually runs**, as data, so the invocation above and the law over it read
+/// one string. It lives in `gpu.rs` (it needs the `gpu` feature's module corpus) and is a plain
+/// `#[test]`, not an `#[ignore]`d bench: it generates the modules device-free and only *measuring*
+/// them needs a `ptxas` on `WUKONG_PTXAS`.
+pub const WGMMA_CENSUS_AUDIT_TEST: &str = "ptxas_reports_the_register_and_spill_budget";
 
 /// **The H100 visit wave 2 pays for**, in order, in one container, in one log (standing rule 1).
 ///
@@ -2548,11 +2571,18 @@ pub const WGMMA_CENSUS_INVOCATION: &str =
 /// having measured a kernel whose correctness floor it never re-established. The sweep then carries
 /// rounds 1-3's twelve rows unchanged (for column comparability) plus wave 2's five new ones, and
 /// the K sweep runs last because it is the only part whose value survives a truncated visit.
+///
+/// The trailing `cublaslt_epilogue_support_probe` is a **Wave-4 prerequisite riding along**: it
+/// launches no GEMM and costs milliseconds, so running it in a container that is already rented is
+/// free, and its answer (what cuBLASLt's heuristic will actually fuse, per epilogue x output dtype)
+/// can retract a Wave-4 headline before any of it is built. Last, because wave 2's own data is what
+/// this visit is for.
 pub const WGMMA_W2_H100_INVOCATION: &str = "\
     modal run tools/cloud/modal_app.py::test  --filter wgmma_cluster_multicast_is_exact --peers\n\
     modal run tools/cloud/modal_app.py::bench --name wgmma_hopper_bringup --peers\n\
     modal run tools/cloud/modal_app.py::bench --name wgmma_config_sweep --peers --release\n\
-    modal run tools/cloud/modal_app.py::bench --name wgmma_k_sweep --peers --release";
+    modal run tools/cloud/modal_app.py::bench --name wgmma_k_sweep --peers --release\n\
+    modal run tools/cloud/modal_app.py::bench --name cublaslt_epilogue_support_probe --peers";
 
 /// **Every distinct configuration this family can emit a module for**, shipped rows first, then the
 /// sweep-only rows that generate -- deduplicated by module key.
@@ -7711,7 +7741,67 @@ mod tests {
             !census.contains("::bench") && !census.contains("gpu="),
             "a census that rents a GPU is not a census: {census}"
         );
-        assert!(census.contains("wgmma"), "it must filter to this family");
+        // **THE CHECK THE 2026-08-11 REFUSAL NEEDED.** `--filter` is a libtest substring over TEST
+        // NAMES. A filter that reads like a family name (`--filter wgmma`) selects six device tests
+        // and excludes the audit test, so the round captures no PTX and refuses -- after paying for
+        // the container. Whatever the filter is, it must match the audit test's real name.
+        if let Some(rest) = census.split("--filter ").nth(1) {
+            let filt = rest.split_whitespace().next().unwrap_or("");
+            assert!(
+                !filt.is_empty(),
+                "`--filter` with no argument selects nothing: {census}"
+            );
+            assert!(
+                WGMMA_CENSUS_AUDIT_TEST.contains(filt),
+                "the census filter {filt:?} does not match the audit test \
+                 {WGMMA_CENSUS_AUDIT_TEST:?} -- libtest would run everything EXCEPT the test that \
+                 generates the corpus and invokes ptxas, and the round would refuse with `no PTX \
+                 captured` having already paid for the container"
+            );
+            // ...and it must NOT also drag in the device tests, which cannot run in a CPU-only
+            // container. Any wgmma round name is a device round.
+            for device_round in [
+                "wgmma_hopper_bringup",
+                "wgmma_vs_cublas",
+                "wgmma_config_sweep",
+                "wgmma_k_sweep",
+                "wgmma_cluster_multicast_is_exact",
+            ] {
+                assert!(
+                    !device_round.contains(filt),
+                    "the census filter {filt:?} also selects the device round {device_round:?}, \
+                     which has no GPU to run on in a ptxas container"
+                );
+            }
+        }
+        // The audit test exists, is a plain #[test] (not an #[ignore]d bench, or `--filter` alone
+        // would not run it), and builds its corpus from `wgmma_all_emittable` -- which is what makes
+        // naming ONE test sufficient to census the whole family.
+        #[cfg(feature = "gpu")]
+        {
+            let src = include_str!("gpu.rs");
+            let at = src
+                .find(&format!("fn {WGMMA_CENSUS_AUDIT_TEST}("))
+                .unwrap_or_else(|| {
+                    panic!("the census names {WGMMA_CENSUS_AUDIT_TEST:?}, which is not in gpu.rs")
+                });
+            let head = &src[at.saturating_sub(120)..at];
+            assert!(
+                head.contains("#[test]"),
+                "{WGMMA_CENSUS_AUDIT_TEST} must be a plain #[test]; `--filter` does not reach an \
+                 #[ignore]d one without --ignored"
+            );
+            assert!(
+                !head.contains("#[ignore"),
+                "{WGMMA_CENSUS_AUDIT_TEST} must not be #[ignore]d"
+            );
+            let body_end = src[at..].find("\n    }\n").map_or(src.len(), |e| at + e);
+            assert!(
+                src[at..body_end].contains("wgmma_all_emittable()"),
+                "{WGMMA_CENSUS_AUDIT_TEST} must build its corpus from `wgmma_all_emittable()`, or \
+                 naming one test is not enough to census the family"
+            );
+        }
 
         let visit = WGMMA_W2_H100_INVOCATION;
         assert!(visit.is_ascii());
@@ -7749,6 +7839,10 @@ mod tests {
                 "wgmma_hopper_bringup",
                 "wgmma_config_sweep",
                 "wgmma_k_sweep",
+                // The Wave-4 prerequisite riding along in the same rented container. It has no
+                // caller other than this round, which is exactly why it needs a law: a measurement
+                // with no call site is a measurement that never gets taken.
+                "cublaslt_epilogue_support_probe",
             ] {
                 assert!(
                     src.contains(&format!("fn {name}(")),
