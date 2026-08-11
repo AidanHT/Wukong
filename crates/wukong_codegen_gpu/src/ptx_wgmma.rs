@@ -4402,6 +4402,21 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     // will not invent a value it never computed.)
     s += &format!("    setp.eq.u32 %p0,%ktiles,0;\n    @%p0 bra EXIT_{name};\n");
     s += "    wgmma.wait_group.sync.aligned 0;\n";
+    if hint_stores {
+        // The epilogue's half of the hint, created once and BEFORE the transport splits: a C line is
+        // written and never read, so every one that stays resident evicts an operand line a
+        // neighbouring CTA is about to want.
+        //
+        // Hoisted above the `elided` branch deliberately. It used to sit inside the scalar/v2 arm,
+        // which meant a config carrying both `ElidedDiagnostic` and a store hint -- legal today,
+        // just not in the table -- would emit `@%pdead st.global.L2::cache_hint.f32 ...,%rdPolC`
+        // against a policy register nothing had created. That is a `ptxas` error on rented silicon
+        // and nothing at all on this machine, which is the exact class of defect the CPU census
+        // exists to catch and the exact class a generator should not produce in the first place.
+        s += &format!(
+            "    createpolicy.fractional.L2::evict_first.b64 %rdPolC,{L2_POLICY_FRACTION};\n"
+        );
+    }
     if elided {
         // **The diagnostic arm.** Fold every accumulator into `%acc0` and store it once under a
         // predicate no launch can satisfy: `K` is a `.u32` parameter and the launcher asserts
@@ -4423,14 +4438,6 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         s += "    setp.lt.u32 %pd0,%row0,%M;\n    setp.lt.u32 %pd1,%row1,%M;\n";
         s += "    mad.lo.s32 %tmp,%row0,%N,%colb;\n    mul.wide.u32 %rdT,%tmp,4;\n    add.s64 %rdA,%rdC,%rdT;\n";
         s += "    mad.lo.s32 %tmp,%row1,%N,%colb;\n    mul.wide.u32 %rdT,%tmp,4;\n    add.s64 %rdB,%rdC,%rdT;\n";
-        if hint_stores {
-            // The epilogue's half of the hint, created once outside the store loop: a C line is
-            // written and never read, so every one of them that stays resident evicts an operand
-            // line a neighbouring CTA is about to want.
-            s += &format!(
-                "    createpolicy.fractional.L2::evict_first.b64 %rdPolC,{L2_POLICY_FRACTION};\n"
-            );
-        }
         for j in 0..bn / 8 {
             let byte = j * 32;
             s += &format!("    add.u32 %col,%colb,{};\n", j * 8);
@@ -7507,6 +7514,90 @@ mod tests {
         // Declared registers exist exactly where they are used.
         assert!(ef.contains(".reg .b64 %rdPolC;") && !ef.contains("%rdPolAB"));
         assert!(efol.contains(".reg .b64 %rdPolC;") && efol.contains(".reg .b64 %rdPolAB;"));
+    }
+
+    /// **Every cache-policy register is declared, created, and created BEFORE it is used** — on
+    /// every emittable variant AND on every combination the menu can express, not just the ones in
+    /// the table.
+    ///
+    /// The defect this pins: `createpolicy` for the store policy used to be emitted inside the
+    /// scalar/v2 arm of the epilogue, so a config carrying both the elided transport and a store
+    /// hint — legal on the menu, absent from the table — emitted a `.L2::cache_hint` store against a
+    /// policy register nothing had created. That is a `ptxas` error on rented silicon and silence
+    /// here, which is exactly the class of defect a generator must not be able to produce.
+    #[test]
+    fn no_cache_policy_is_used_before_it_is_created() {
+        let lic = license();
+        // The shipped/sweep corpus, PLUS the full cross product of the two axes on one base row, so
+        // a combination nobody has put in the table yet is still covered.
+        let mut cfgs: Vec<WgmmaCfg> = wgmma_all_emittable().into_iter().copied().collect();
+        for eps in [
+            EpilogueStore::Scalar,
+            EpilogueStore::V2,
+            EpilogueStore::ElidedDiagnostic,
+        ] {
+            for hint in [
+                L2Hint::None,
+                L2Hint::StoresEvictFirst,
+                L2Hint::StoresEvictFirstOperandsEvictLast,
+            ] {
+                let mut c = WgmmaCfg {
+                    epilogue: eps,
+                    l2_hint: hint,
+                    ..WGMMA_W1_MCB
+                };
+                // The name is derived, so a cross-product row has to carry its own; leak it, since
+                // `WgmmaCfg` holds `&'static str` and this is a test that runs once.
+                let n: &'static str = Box::leak(c.derived_name().into_boxed_str());
+                c.name = n;
+                c.key = n;
+                cfgs.push(c);
+            }
+        }
+        for c in &cfgs {
+            let ptx =
+                wgmma_module(c, &lic).unwrap_or_else(|e| panic!("{} must generate: {e}", c.name));
+            for reg in ["%rdPolC", "%rdPolAB"] {
+                let used: Vec<usize> = ptx
+                    .match_indices(reg)
+                    .map(|(i, _)| i)
+                    .filter(|i| {
+                        let line = ptx[..*i].rfind('\n').map_or(0, |x| x + 1);
+                        !ptx[line..*i].contains(".reg ") && !ptx[line..*i].contains("createpolicy")
+                    })
+                    .collect();
+                if used.is_empty() {
+                    // Not used: then it must not be declared either, or the register file is being
+                    // charged for something nothing reads.
+                    assert!(
+                        !ptx.contains(&format!(".reg .b64 {reg};")),
+                        "{}: declares {reg} and never uses it",
+                        c.name
+                    );
+                    continue;
+                }
+                assert!(
+                    ptx.contains(&format!(".reg .b64 {reg};")),
+                    "{}: uses {reg} without declaring it",
+                    c.name
+                );
+                let create = ptx
+                    .match_indices(&format!("createpolicy.fractional.L2::"))
+                    .map(|(i, _)| i)
+                    .find(|i| ptx[*i..].lines().next().is_some_and(|l| l.contains(reg)))
+                    .unwrap_or_else(|| {
+                        panic!("{}: uses {reg} but never creates a policy into it", c.name)
+                    });
+                assert!(
+                    create < *used.iter().min().expect("non-empty"),
+                    "{}: {reg} is USED at byte {} before it is created at {create} -- on device \
+                     that is a ptxas error, and on this machine it is nothing",
+                    c.name,
+                    used.iter().min().expect("non-empty")
+                );
+            }
+            assert!(ptx.is_ascii(), "{}: PTX must be pure ASCII", c.name);
+        }
     }
 
     /// **The two levers compose into one module, not two half-modules.**
