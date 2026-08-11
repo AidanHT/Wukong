@@ -3012,6 +3012,12 @@ def build_peers(cutlass: bool = True, cutlass_arch: str = "", cutlass_kernels: s
                       f"export MAX_JOBS={jobs} NVCC_THREADS=4\n"
                       f"export FLASH_ATTENTION_FORCE_BUILD=TRUE\n"
                       f"export FLASH_ATTN_CUDA_ARCHS={archs}\n"
+                      # torch.utils.cpp_extension probes the DEFAULT `c++` for its CUDA
+                      # compatibility check; in this image that resolves to something it
+                      # parses as 'clang++ (0.0.0)' and it refuses nvcc outright (measured
+                      # 2026-08-10, 15.5s into the build). The toolchain that actually
+                      # compiles everything else here is gcc -- say so explicitly.
+                      f"export CC=gcc CXX=g++\n"
                       f"{TORCH_VENV}/bin/pip wheel --no-build-isolation --no-deps "
                       f"  flash-attn=={WK_FA2} -w {PERSIST}/wheels"], env, cwd="/tmp")
                 have = sorted(glob.glob(f"{PERSIST}/wheels/flash_attn-*.whl"))
