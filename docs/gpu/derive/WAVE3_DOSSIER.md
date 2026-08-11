@@ -428,3 +428,279 @@ grid, so a difference there is an instrument fault and invalidates the visit.
 L2-footprint-limited and section 0.4's 1.632 residual has another cause. (ii) `mcb_g16` matches
 `mcb_g8` -> the effect is not traffic (suspect launch-order coalescing instead). (iii) any arm moves
 `sq2048` -> the instrument, not the kernel.
+
+---
+
+## 2. PERSISTENT CTAs AND WAVE QUANTIZATION
+
+### 2.1 Occupancy is 1 CTA/SM, and it is not negotiable at this tile
+
+Confirmed twice over in 0.1, from the ptxas census rather than from arithmetic: SMEM 196 672 of
+232 448 B (a second CTA misses by 160 896 B) and registers 384 x 168 = 64 512 of 65 536 (a second
+CTA misses by 63 488). `setmaxnreg`'s 32p/232c split is a *within-CTA* redistribution and does not
+enter the occupancy calculation; the number that does is the 168 the census reports. **A wave is
+therefore exactly 132 CTAs**, and every wave figure below rests on that one census line.
+
+### 2.2 Wave arithmetic, including the clustered launch
+
+A 1x2x1 cluster occupies 2 SMs and both must be resident concurrently, so the scheduler allocates
+`132 / 2 = 66` cluster slots. Because `tiles / 132 = clusters / 66` identically,
+
+```
+    waves = ceil(clusters / 66) = ceil(tiles / 132)         for every shape in the suite
+```
+
+**the cluster costs no wave.** (0.3 gives the SM-to-TPC argument for why no SM is stranded, and names
+its falsifier.)
+
+| shape | tiles (128x256) | waves | tail wave CTAs | tail wave util. | quantization loss |
+|---|---|---|---|---|---|
+| sq1024 | 32 | 1 | 32 | 24.2% | 75.8% (see 3.4) |
+| sq2048 | 128 | 1 | 128 | 97.0% | 3.03% |
+| sq4096 | 512 | 4 | 116 | 87.9% | 3.03% |
+| sq8192 | 2048 | 16 | 68 | 51.5% | 3.03% |
+| gpt_d1024_up | 512 | 4 | 116 | 87.9% | 3.03% |
+| gpt_d1024_down | 128 | 1 | 128 | 97.0% | 3.03% |
+| gpt_d4096_up | 2048 | 16 | 68 | 51.5% | 3.03% |
+
+**The tail-wave utilisation column is a red herring and must not be quoted as a loss.** A tail wave
+that runs 68 of 132 CTAs wastes 64 SMs for the duration of *one* tile out of sixteen waves; the loss
+that matters is `1 - tiles/(132*waves) = 3.03%`, which is what the last column says. Both the 51.5%
+and the 87.9% shapes lose the same 3.03%, which is the point of the closed form in 0.3.
+
+**Persistence does NOT recover the 3.03%.** With `grid = 132` and a static schedule
+`tile = ctaid; tile < ntiles; tile += 132`, at sq4096 116 CTAs run 4 tiles and 16 run 3, so the
+critical path is still 4 tiles. The imbalance is *identical* to the wave picture; only the transition
+between tiles changes. Removing the 3.03% requires splitting a tile's K across CTAs, which is
+Stream-K (section 5.3), not persistence. **Anyone who attributes the persistence gain to wave
+quantization has mis-attributed it.**
+
+### 2.3 What persistence actually buys: the `X_fill` term, once per tile boundary
+
+From 0.4: `X = 13.84 us` per tile, of which `X_fill = 7.85 us` (four ring stages at 1.96 us each,
+running at 3.31 TB/s device-wide -- 98.7% of HBM peak) and `X_epi = 5.99 us`. At a **wave** boundary
+today, `X_fill` is unhidable: no CTA anywhere on the device has work to overlap it with, because the
+whole device just finished its previous tile.
+
+Under a persistent CTA whose ring is *continuous* across the tile boundary:
+
+* at the end of tile `t`'s k-loop the producer has nothing more to issue for `t`, and stages free as
+  the consumers release them, so it immediately begins issuing tile `t+1`'s stage 0..3 copies;
+* the consumers meanwhile execute `wgmma.wait_group 0` and the 128 predicated stores -- `X_epi`;
+* the overlap window is therefore the last `stages` releases of tile `t` plus `X_epi`:
+  `4 x 0.646 + 5.99 = 8.57 us`, against `X_fill = 7.85 us`.
+
+`8.57 >= 7.85`, so **the fill is fully hidden and the saving is the whole of `X_fill` -- 7.85 us per
+tile boundary.** The conservative half-overlap figure is 3.93 us; both are given per shape below.
+
+`X_epi` is *not* saved. The consumer cannot issue tile `t+1`'s first `wgmma` until tile `t`'s
+accumulators are stored, because `scale-d = 0` on that first instruction overwrites them
+(`ptx_wgmma.rs:3618-3621`). The epilogue stays on the critical path.
+
+**Cross-wave interaction, stated so the campaign does not double-count.** Wave 4's SMEM-staged /
+TMA-store epilogue attacks `X_epi`; Wave 3's persistence attacks `X_fill`. They are two halves of the
+same `X = 13.84 us`, so **their gains are not additive and the combined ceiling is 13.84 us per
+boundary, not 13.84 + 7.85.** Worse, a shorter epilogue shrinks the window that hides the fill: at
+`X_epi = 1 us` the window is `2.58 + 1.00 = 3.58 us` and only 46% of the fill is hidden. The two
+waves must be measured against each other, not stacked on paper.
+
+### 2.4 Per-shape effect
+
+`T_new = T_measured - (waves - 1) * X_fill`, using the arm the section-3 dispatcher selects and the
+peer time from the same run.
+
+| shape | arm | waves | boundaries | measured us | peer us | today | full overlap | half overlap |
+|---|---|---|---|---|---|---|---|---|
+| **gpt_d1024_up** | no cluster | 4 | 3 | 106.05 | 58.11 | 54.8% | 82.50 us -> **70.4%** | 94.3 -> 61.6% |
+| **sq4096** | mcb2 | 4 | 3 | 222.74 | 163.82 | 73.5% | 199.19 us -> **82.2%** | 210.9 -> 77.7% |
+| **sq8192** | mcb2 | 16 | 15 | 1546.45 | 1271.81 | 82.2% | 1428.7 us -> **89.0%** | 1487.6 -> 85.5% |
+| **gpt_d4096_up** | mcb2 + raster | 16 | 15 | 883 (predicted, 1.4) | 673.40 | 76.3% (post-raster) | 765.2 us -> **88.0%** | 824.1 -> 81.7% |
+| sq2048 | no cluster | 1 | 0 | 39.09 | 26.27 | 67.2% | **no change** | -- |
+| sq1024 | (see 3.4) | 1 | 0 | 21.5 | 7.0 | 32.3% | **no change** | -- |
+| gpt_d1024_down | no cluster | 1 | 0 | 57.50 | 44.85 | 78.0% | **no change** | -- |
+
+**`gpt_d1024_up` is the persistence shape.** It has `n_k = 16` k-stages against `X = 13.84 us`, so
+`X` is 56% of its per-tile time -- more than three times its share at sq8192. +15.6 points is the
+largest single-shape persistence gain in the wave, and it is available with no raster (that shape's
+wave footprint is 10.6 MB, deeply L2-resident) and no cluster (54.2% of the L2 roof; see 3.2).
+
+Three of seven shapes get **exactly zero** and must be benched as controls, not as rows.
+
+### 2.5 Static schedule, not an atomic queue -- and the derivation is decisive
+
+The brief offers "an atomic or static schedule". The atomic is wrong here, for a reason specific to
+this suite: **every tile costs the same.** All tiles of a launch share `M`, `N`, `K` and therefore
+`n_k`, so the only imbalance is the 3.03% quantization -- and a dynamic work queue does not fix
+quantization either (132 workers over 512 equal-cost tiles still take 4 rounds, whoever hands them
+out). A `red.global.add` per tile therefore buys nothing and costs two real things:
+
+1. a global atomic round-trip on the critical path between tiles, i.e. it eats into the very
+   `X_fill` overlap window persistence exists to open; and
+2. **a nondeterministic tile-to-CTA mapping, which destroys the raster.** Section 1's entire gain is
+   the *order* in which tiles are visited; a work queue that hands them out by arrival order makes
+   the wave footprint a race outcome. It also breaks G8's two-run bit-identity as a *diagnostic*
+   (the arithmetic stays bit-identical because each tile's reduction order is unchanged, but the
+   L2 behaviour and hence the timing stop being reproducible).
+
+**Verdict: static schedule, `cid += n_cluster_slots`. Do not implement the atomic.** Revisit only if
+a ragged-K or mixed-shape batched entry is added.
+
+### 2.6 THE DEADLOCK LAW: iterate over CLUSTERS, never over CTAs
+
+This is the hazard of Wave 3 and it fails by hanging rented silicon, not by returning a wrong number.
+
+Under `Multicast::ClusterB`, `empty[s]` is initialised with `cluster_ctas * consumer_wgs = 4`
+arrivals and every consumer warpgroup arrives at the barrier of **every** CTA of the cluster through
+`mapa` (`ptx_wgmma.rs:3629-3646`), while every producer multicasts into every peer's ring. Now take
+the naive persistent loop `tile = ctaid; tile < ntiles; tile += gridDim`: at sq4096 with 512 tiles and
+132 CTAs, **116 CTAs run 4 tiles and 16 run 3.** If the two ranks of a cluster land on opposite sides
+of that split, then during rank 0's fourth tile rank 1 has already retired:
+
+* rank 0's producer waits forever on `empty[s]` arrivals that rank 1 will never make -- a hang; and
+* rank 0's producer multicasts into the shared memory of a CTA that has exited -- undefined.
+
+**The law: the persistent loop is indexed by the CLUSTER, and its stride is the number of cluster
+slots.**
+
+```
+    n_cluster_slots  = 132 / cluster_ctas          // 66 under ClusterB, 132 with no cluster
+    n_cluster_tiles  = ceil(m_tiles / cluster_ctas) * n_tiles      // ClusterB pairs along M
+    for (cid = %ctaid.x; cid < n_cluster_tiles; cid += n_cluster_slots) { ... }
+```
+
+Both ranks of a cluster share `%ctaid.x` (the cluster varies along `y`), so they iterate the
+**identical** sequence and have **identical tile counts** by construction. This is not a check to be
+added; it is a shape of loop that makes the check unnecessary, which is the only kind of fix worth
+having for a deadlock.
+
+Two consequences worth naming:
+
+* the final `barrier.cluster.arrive.aligned / barrier.cluster.wait.aligned` at `EXIT`
+  (`ptx_wgmma.rs:3704-3707`) now executes once per kernel, after the tile loop -- which is correct
+  and still required, since a peer may touch this CTA's shared memory until the last tile drains;
+* **persistence removes section 1's ragged-group pad entirely.** `cid` enumerates only real
+  cluster-tiles, so `ceil(gcy/GC)*GC - gcy` never appears and the cluster-uniform early exit of 1.5
+  is not needed on the persistent path. See 2.8 for how the two constructions reconcile.
+
+### 2.7 The per-tile reset checklist, and G19
+
+| register / object | per tile | why |
+|---|---|---|
+| `%kt` (producer AND consumer, separately) | **RESET to 0** | drives `%pfirst`; see G19 below |
+| `%ctam`, `%ctan` | **RECOMPUTE** | the new tile origin |
+| `%row0`, `%row1`, `%colb`, `%rdA`, `%rdB` (epilogue) | **RECOMPUTE** | derived from `%ctam`/`%ctan` |
+| `%stg` (ring slot) | **CARRY** | resetting it forces a full ring drain per tile and throws away the entire lever |
+| `%phf`, `%phe` (phase parities) | **CARRY** | same; and a reset parity against a live barrier is a hang |
+| the mbarrier objects | **initialise once**, before the tile loop | re-initialising a barrier a peer may be signalling is the classic cluster race |
+| the accumulators `%acc0..127` | no explicit reset | `scale-d = 0` on the first `wgmma` of each tile overwrites them -- provided G19 holds |
+
+**G19, spelled out.** Today `%pfirst` is `setp.ne.u32 %pfirst,%kt,0` at `ptx_wgmma.rs:3605`, and the
+first `wgmma` of each stage takes `scale-d = %pfirst` (line 3620). `%kt` is a whole-kernel counter
+today because a kernel is one tile. **In a tile loop, a `%kt` that is not reset makes tile 2's first
+`wgmma` take `scale-d = 1` and accumulate into tile 1's result.** With the round's exact-integer
+operands the sum of two tiles is still an exact integer, so the corruption is a plausible-looking
+number rather than a NaN, and it is unreachable on any guard shape with one tile per CTA -- which is
+exactly why G1's corrected shape must have `tiles > CTAs`. The plan's law is the right one: **assert
+that the count of `mov.u32 %kt,0` in the emitted text equals the number of tile-loop entries** (2
+under persistence: one in the producer, one in the consumer).
+
+**A second textual law the tile loop needs.** The tile-index arithmetic is emitted twice -- once in
+the producer branch and once in the consumer branch -- and if the two copies ever disagree the
+consumer computes with the wrong tile's operands: silently wrong, no hang, and *not* caught by the
+epilogue's bounds predicates. Emit both from one `fn tile_index_ptx(&cfg) -> String` and assert
+`ptx.matches(&tile_index_ptx(cfg)).count() == 2`. This is the same discipline
+`Multicast::cluster_shape` already uses as "one function, so the launch attribute, the
+`.reqnctapercluster` directive and the grid's divisibility rounding cannot disagree".
+
+### 2.8 Reconciling the raster construction with the persistent loop
+
+Section 1.5 gave a division-free remap by putting the group structure in a 3-D grid. That trick works
+because the non-persistent kernel's tile index *is* `%ctaid`. Under persistence the tile index is a
+loop variable, so the swizzle must be computed in-kernel from a flat `cid`, and two runtime integer
+divisions come back. **Take them:** they cost ~26 instructions once per tile, against `n_k >= 16`
+stages of ~1200 clocks each, i.e. **under 0.06% of a tile**. The exact u32 divmod, no host params, no
+`PARAM_ORDER` change:
+
+```
+    // q = a / b, r = a % b, exact for a,b < 2^22 (f32 has a 24-bit significand and the
+    // two-sided correction closes rcp.approx's 1-ulp error). 13 instructions.
+    cvt.rn.f32.u32   %fa,%a;      cvt.rn.f32.u32 %fb,%b;
+    rcp.approx.ftz.f32 %fr,%fb;   mul.f32 %fq,%fa,%fr;
+    cvt.rzi.u32.f32  %q,%fq;
+    mul.lo.s32 %t,%q,%b;          sub.s32 %t,%a,%t;
+    setp.lt.s32 %pc,%t,0;         @%pc sub.u32 %q,%q,1;   @%pc add.s32 %t,%t,%b;
+    setp.ge.s32 %pc,%t,%b;        @%pc add.u32 %q,%q,1;   @%pc sub.s32 %t,%t,%b;
+```
+
+The `a,b < 2^22` precondition is a `WgmmaCfg::validate` obligation, and it is never binding: the
+largest `cid` in the suite is `gcy * n_tiles = 16 * 64 = 1024` (gpt_d4096_up), and the family already
+declines at `M*N` beyond `u32` for the epilogue's element index (`ptx_wgmma.rs:1537-1542`), which
+caps `cid` far below 2^22. **Assert it anyway** -- the bound is what makes the f32 route exact rather
+than approximately right.
+
+The grouped swizzle over the cluster index, with `GC = GROUP_M/2` a compile-time constant:
+
+```
+    grp   = cid / (GC * n_tiles)                   // divmod #1
+    i     = cid % (GC * n_tiles)
+    rows  = min(GC, gcy - grp*GC)                  // the last group may be short
+    cn    = i / rows                               // divmod #2
+    cm    = grp*GC + (i % rows)
+    m_tile = 2*cm + %crank        n_tile = cn
+```
+
+This is Triton's grouped-M form applied to the cluster index, and it is bijective over
+`[0, gcy*n_tiles)` including the short last group: for the last `grp`, `i` ranges over
+`[0, rows*n_tiles)` and `(i % rows, i / rows)` covers `[0,rows) x [0,n_tiles)` exactly once. It is
+also the shape CUTLASS uses -- swizzle the cluster index, then re-add the intra-cluster offset
+(`cta_m_in_cluster` / `cta_n_in_cluster`), see
+[sm90_tile_scheduler.hpp](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/kernel/sm90_tile_scheduler.hpp).
+
+**Recommendation:** land persistence and the raster together, on the flat-`cid` + divmod
+construction. Keep 1.5's 3-D-grid form documented as the fallback if persistence slips, since it is
+the only way to get the raster without any division at all.
+
+### 2.9 The one-visit A/B sweep row
+
+Three arms, because "persistence helps" and "the *continuous ring* helps" are different claims and
+only the second one is the derivation above.
+
+```rust
+/// The control: section 1's winner, one tile per CTA. Must reproduce its own row.
+pub const WGMMA_W1_MCB_G8: WgmmaCfg = /* section 1.6 */;
+/// Persistent, ring RESET at every tile boundary (full drain, %stg and parities reset).
+/// This arm isolates CTA dispatch from the fill overlap: if it ties the control, dispatch is
+/// worth nothing and the whole gain is the ring, which is what 2.3 predicts.
+pub const WGMMA_W1_MCB_G8_PSTOP: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_g8_pstop",
+    key:  "wgmma_nt_f16_128x256x64_s4_mcb2_g8_pstop",
+    schedule: Schedule::PersistentDrained, ..WGMMA_W1_MCB_G8 };
+/// Persistent with a CONTINUOUS ring across tile boundaries. THE ARM.
+pub const WGMMA_W1_MCB_G8_PERSIST: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_g8_p",
+    key:  "wgmma_nt_f16_128x256x64_s4_mcb2_g8_p",
+    schedule: Schedule::Persistent, ..WGMMA_W1_MCB_G8 };
+```
+
+```
+  label        cfg                        why
+  g8_1tile     WGMMA_W1_MCB_G8            control; one tile per CTA
+  g8_pstop     WGMMA_W1_MCB_G8_PSTOP      persistence WITHOUT the ring carry. Predicted: ties the
+                                          control to within dispersion. If it wins, the gain is CTA
+                                          dispatch and 2.3's derivation is wrong.
+  g8_persist   WGMMA_W1_MCB_G8_PERSIST    the arm. Predicted +15.6 pts at gpt_d1024_up, +8.7 at
+                                          sq4096, +6.8 at sq8192, +11.7 at gpt_d4096_up, 0 at sq2048
+
+  shapes: gpt_d1024_up (THE row -- largest predicted delta, and no raster or cluster confound),
+          sq4096, sq8192, gpt_d4096_up, sq2048 (single-wave control: ALL THREE arms must tie)
+```
+
+**Refusal.** Any persistent arm without the cluster-indexed loop of 2.6 -- a CTA-indexed persistent
+loop under a cluster is a hang, and a hang costs the whole visit. Any persistent arm run before G1's
+corrected guard shape (`tiles > CTAs`) is green, because G19's corruption is unreachable on a
+one-tile-per-CTA guard and would ship undetected.
+
+**Falsifiers.** (i) `g8_pstop` beats the control -> dispatch matters and `X_fill` is not the
+mechanism. (ii) `g8_persist` moves `sq2048` -> the instrument. (iii) `g8_persist` gains less than
+half the predicted amount at `gpt_d1024_up` -> `X_fill` is not fully hidden, and the next question is
+the ring depth (a 3-stage ring has `X_fill = 5.89 us` and a *shorter* overlap requirement).
