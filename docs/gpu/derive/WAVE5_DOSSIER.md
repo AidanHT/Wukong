@@ -500,24 +500,32 @@ squeeze; it does not create or relieve it.
 
 ## 4. PEER BAR
 
-### 4.1 The staged CUTLASS profiler is f16-only. The 8-bit artifacts DO NOT EXIST yet.
+### 4.1 The three-family CUTLASS profiler IS staged; the 8-bit MEASUREMENT artifacts do not exist yet.
 
-**FACT(repo)**, `bench/gpu/h100/2026-08-09-preflight-build-peers.log:915`. The binary now on the
-Volume was configured with
+**CORRECTION (orchestrator, 2026-08-11).** This section was first derived against
+`bench/gpu/h100/2026-08-09-preflight-build-peers.log:915`, where the staged binary was f16-only.
+That state is obsolete: Wave 2B's rebuild ran on 2026-08-10 (`--cutlass-max-kernels 1500`,
+$0.187 CPU-only), and `peers.json` fetched from the wukong-build Volume on 2026-08-11 records
 
 ```
--DCUTLASS_LIBRARY_KERNELS='cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16*,
-                           cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32*'
+"cutlass": { "arch": "90a", "tag": "v4.6.1",
+             "dtypes": ["f16", "fp8", "int8"],
+             "counts": { "_selected": 1458, "f16": 368, "fp8": 782, "int8": 308 },
+             "path": "/persist/bin/cutlass_profiler-sm90a-f16+fp8+int8" }
 ```
 
--- **no fp8 pattern, no int8 pattern**. There is no `cutlass-e4m3-*.csv` or `cutlass-s8-*.csv`
-anywhere under `bench/gpu/`. Wave 5's CUTLASS column has to be *built* before it can be run.
+So the CPU-only rebuild step this section originally prescribed is **already done** -- do NOT
+re-run `::build_peers --cutlass-dtypes ... --force`. The census denominators for "we beat the
+best of N" are 368 f16 / 782 fp8 / 308 int8 SM90 kernels. What still does not exist is any
+*measurement*: there is no `cutlass-e4m3-*.csv` or `cutlass-s8-*.csv` anywhere under
+`bench/gpu/` -- the Wave-5 peer sequence therefore starts directly at the H100 `::cutlass`
+profiler run (Section 4.2's configs), not at a build.
 
-**FACT(repo), the unlock is already coded** (this is Wave 2B's work, landed in the tool, not yet
-executed): `tools/cloud/modal_app.py:852-866` carries `_CUTLASS_KERNELS_3X` with
+**FACT(repo), the unlock machinery** (Wave 2B's work, now both coded and executed):
+`tools/cloud/modal_app.py:852-866` carries `_CUTLASS_KERNELS_3X` with
 `"fp8": ("cutlass3x_sm90_tensorop_gemm_e4m3_e4m3_f32_*",)` and
 `"int8": ("cutlass3x_sm90_tensorop_gemm_s8_s8_s32_*", "cutlass3x_sm90_tensorop_gemm_u8_u8_s32_*")`,
-and `build_peers`'s `cutlass_dtypes` now **defaults to `"f16,fp8,int8"`** (`:2739`). Two guards
+and `build_peers`'s `cutlass_dtypes` **defaults to `"f16,fp8,int8"`** (`:2739`). Two guards
 already stand behind it and should be trusted rather than re-implemented:
 
 * `_cutlass_census` (`:1005-1053`) counts selected kernels **per family before the compile** and
@@ -525,19 +533,13 @@ already stand behind it and should be trusted rather than re-implemented:
   the missing column would read as 'the library has no such kernel'".
 * `::cutlass` refuses at run time to profile a dtype the manifest says the staged binary was not
   built with (`:3873-3880`), and prints a loud "unrecorded, assume f16 only" warning when the
-  manifest predates 2026-08-10 (`:3870-3871`, `:3881-3884`) -- which is exactly the state of the
-  currently staged binary.
+  manifest predates 2026-08-10 (`:3870-3871`, `:3881-3884`) -- the currently staged binary's
+  manifest is from the 2026-08-10 rebuild, so neither refusal fires for f16/fp8/int8.
 
-**Therefore the Wave-5 peer sequence starts with a CPU-only call, not a GPU one:**
-
-```
-modal run tools/cloud/modal_app.py::build_peers --cutlass-arch 90a \
-        --cutlass-dtypes f16,fp8,int8 --force
-```
-
-at the `$1.01/hr` CPU rate (`:134-139`), and the census output in that log is itself a
-publishable artifact: it records how many fp8 and int8 SM90 kernels CUTLASS 4.6.1 generates, which
-is the denominator for "we beat the best of N".
+**Therefore the Wave-5 peer sequence starts directly at the H100 `::cutlass` profiler run** over
+Section 4.2's configs -- the CPU-only rebuild this dossier originally prescribed here already ran
+on 2026-08-10 (see the CORRECTION at the top of 4.1), and its census (368 f16 / 782 fp8 /
+308 int8 SM90 kernels in CUTLASS 4.6.1) is the denominator for "we beat the best of N".
 
 ### 4.2 Exactly which peer configs are the honest bar
 
@@ -902,7 +904,7 @@ tile-loop entry count, exactly as G19 specifies.
 | The first round that found the row-major reading wrong (64/4096) | `bench/gpu/h100/2026-08-10-h100-s2a-bringup.log` |
 | ptxas census: `wgmma_nt_f16_128x256x64_s4` regs/smem/threads | `bench/gpu/h100/2026-08-10-ptxas-census.log:687-690` |
 | ptxas census harness landmine (exit 1, "no records parsed") | same log, `:842-869` |
-| CUTLASS profiler staged **f16-only** on the Volume | `bench/gpu/h100/2026-08-09-preflight-build-peers.log:915` |
+| CUTLASS profiler staged f16-only (OBSOLETE 2026-08-10: rebuilt f16+fp8+int8, see 4.1 CORRECTION) | `bench/gpu/h100/2026-08-09-preflight-build-peers.log:915`; `peers.json` on the Volume |
 | 112 C7511 warnings from NVIDIA's own SM90 f16 kernels | same log, `:1074-1185`; ledger entry 4 in this directory's README |
 | The wgmma model: core matrix, LBO/SBO, `SmemLayout`, `SHIPPED_LAYOUT`, `desc_fields`, `SmemDesc::pack` | `crates/wukong_codegen_gpu/src/ptx_wgmma.rs:44-78, 436-716, 1660-1663` |
 | Tile/stage/SMEM/register accessors and the shipped rows | same file, `:983-1160`, `:1612-1774` |
