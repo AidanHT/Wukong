@@ -378,3 +378,132 @@ measurement in the wave and it must run *before* any engineering is spent on the
    been re-measured since round 1 and must be, under `w1_s4_mcb2`, in Wave 4's visit.
 5. The f16-out target is **unproven**, gated on one millisecond-cost support probe, and its
    headline number is a parity-case figure.
+
+---
+
+## 3. RANKED IMPLEMENTATION ORDER
+
+Scored as (product relevance for the ML surface) x (derived margin from section 2) x (1 / risk).
+"Margin" is `S` at `gpt_d1024_up` with `r = 0.82` unless the row names another shape, because that is
+the cell section 2 identified as the champion. "Group A/B" is section 2.3's split -- **a group-A row
+has margin zero by construction and can only ever be published as a parity row.**
+
+| # | epilogue | product surface | group | margin | risk | why here |
+|---|---|---|---|---|---|---|
+| **R1** | **bias (+ relu)** | every `Linear`, every projection | A (0) | **0** | **MED-LOW, structural** | the only item that adds a kernel PARAMETER |
+| **R2** | **SiLU + bias** | Llama / Qwen / Mistral FFN gate | **B** | **1.451x** | **LOW** | shipped PTX, 1 register, no new param beyond R1 |
+| **R3** | GELU + bias | GPT-2 / BERT FFN | A (0) | 0 | LOW | the control that makes R2 legible |
+| **R4** | f16 narrowing out (+ act) | every inference FFN | **B?** | **1.040x** (1.285x at parity) | LOW-MED | **conditional on the support probe** |
+| **R5** | gated SwiGLU / GeGLU | every modern FFN | **B** | 1.040x @ gpt_d4096_up | MED-HIGH | no library peer on H100 at all |
+| **R6** | residual + act | down-proj, attn out-proj | **B** | **1.343x** | MED | 9 registers > the 8 available |
+| R7 | GELU_AUX (pre-act tensor) | training forward | A (0) | 0 | LOW | build when a Wukong backward needs it |
+| R8 | DGELU / DRELU | training backward | A (0) | 0 | MED | ditto, and it needs R7's tensor first |
+| R9 | RELU_AUX bitmask | training forward | A (0) | 0 | **HIGH** | **do not build** -- see 3.4 |
+| R10 | BGRADA / BGRADB | training backward | A (0) | 0 | n/a | **not an epilogue task** -- see 3.4 |
+| R11 | RoPE in the QKV epilogue | prefill / decode | B | out of scope | HIGH | target #4, its own derivation |
+
+### 3.1 R1 first, and it is not because it is easy
+
+Bias is the only Wave-4 epilogue that changes the kernel's **signature**. `PARAM_ORDER`
+(`ptx_wgmma.rs:1517`) is a single `&[ParamKind]` of six entries, and `gpu.rs:17896-17945` asserts
+device-free that *every* wgmma entry declares exactly it -- the round log prints the result as a gate
+line (`[gate] 13 wgmma entries declare exactly PARAM_ORDER (6 params, kinds in order)`). Add a bias
+pointer and that law is false for half the corpus. `gpu.rs:7135` already names the failure mode:
+pushing a short argument array is not an error the driver reports; it reads whatever follows on the
+host stack as the bias pointer.
+
+So R1 is sequenced first because it is the **riskiest structural change and the cheapest numerical
+one**. Land the parameter, the derived name and both laws while the only thing that can be wrong is a
+bias -- whose correctness is checkable against a two-line host reference (`fused_epilogue_reference`,
+`baselines.rs:3495`, already written and already gated) -- and everything after it is purely
+additive. Relu rides along for free (one instruction, zero registers) and gives the epilogue-variant
+axis its first non-trivial member.
+
+**R1 publishes nothing.** `BIAS` and `RELU_BIAS` are cuBLASLt members; the row is a parity row.
+
+### 3.2 R2 is the wave's headline, and the arithmetic says so twice
+
+`SiLU + bias` on `gpt_d1024_up` is the highest (product x margin) / risk cell in the entire wave:
+
+* **Product**: it is the gate half of SwiGLU, i.e. the activation of essentially every model shipped
+  since Llama 2. `tests/run/linear_silu.wk` already spells the bias-free form and the recognizer
+  composes bias with any act code, so no language work is needed.
+* **Margin**: `r* = 56.5%` (3.0 TB/s) or `59.2%` (3.35). At W3's own predicted 59-69% for this shape
+  it publishes at **1.04x-1.22x**; at C1's already-measured 82.2% it is **1.45x**; at parity,
+  **1.77x**. cuBLASLt has no SiLU member -- `LtEpilogue::parse("silu")` is an explicit error
+  (`baselines.rs:3342`) and the absence is pinned by a device-free test -- so the peer's floor is
+  `BIAS` fused plus a separate SiLU kernel, and there is no strawman to accuse us of.
+* **Risk**: five PTX instructions and one scratch register, and the exact instruction sequence is
+  already shipped and already gated against the standalone `vmath` kernels
+  (`ptx_wmma.rs:1187-1192`). No new parameter beyond R1's. No SMEM beyond R1's 1 KB.
+
+### 3.3 R3-R6, and the ordering constraints between them
+
+**R3 (GELU + bias) is a control, not a product.** Build it because (a) it is the only arm that can be
+compared to `cublaslt_gemm_nt_f16_epilogue(GELU_BIAS)` **arm-for-arm** and therefore the only way to
+measure `eps_peer`, and (b) it differs from R2 by exactly one MUFU op and one register, so
+`S(R2) / S(R3)` isolates the activation's own cost on a single kernel instead of on two shapes.
+Publish it labelled parity.
+
+**R4 (f16 out) must not start before the support probe.** Section 2.4: if
+`cublaslt_epilogue_support_matrix`'s f16 column supports `GELU_BIAS`, the entire target collapses to
+GEMM parity and the engineering is wasted. If it declines, R4 is worth 1.04x now and 1.285x at
+parity, *and* it delivers W2A's rung-1 vectorization for free on the f16 path -- `cvt.rn.f16x2.f32`
+packs the adjacent column pair into one b32, so the pair of scalar `st.global.f32` at `+0/+4` becomes
+one `st.global.b32`, which is the same 2:1 sector consolidation the v2 change buys on the f32 path.
+Sequence R4 **after** W2A so the two are not confounded in one A/B.
+
+**R5 (gated) is the highest product relevance and the highest structural risk.** In the kernel it is
+one `mul.f32` and one register (section 1.3). Everything else about it is plumbing: the output N
+halves, so the grid, the epilogue's `mad.lo.s32 %tmp,%row,%N,%colb` index and the store addresses all
+change; the merged weight must be pre-shuffled host-side so gate column `c` and up column `c` land
+adjacent; and **there is no `.wk` spelling for a gated FFN today** (section 5). Its margin at
+`gpt_d4096_up` is only 1.040x at r=0.82 because that shape is already store-light (5.7%) -- the win
+is not the ratio, it is that no library peer exists, so it is a *fusion* claim rather than a *parity*
+claim. Do not sell R5 on a ratio.
+
+**R6 (residual + act) is the register cliff.** 4 scratch registers on top of bias's 2 and gelu's 2 is
+9 against the 8 available (section 1.4), and lowering `producer_regs` to the ISA floor of 24 does not
+buy a second `setmaxnreg` step. Two ways out, in order of preference: (a) rely on ptxas reusing the
+dead `%acc{4j..4j+3}` after each store -- true for every `j > 0` and settled only by the census, not
+by a static count; (b) drop the activation, since `residual + bias` with no activation is exactly the
+transformer down-projection and attention output-projection sublayer, and it is the form
+`ptx_wmma.rs:1922` already ships on the wmma path. Its margin (1.343x) is genuinely behind R2's
+(1.451x) *because* we must read `R` -- 4 bytes per output element that the fused kernel pays and the
+unfused GEMM does not.
+
+### 3.4 The two that should not be built, and why that is a finding
+
+**R9, the RELU_AUX bitmask: do not build it.** It is a group-A epilogue -- cuBLASLt fuses
+`RELU_AUX`, `RELU_AUX_BIAS`, `DRELU` and `DRELU_BGRAD` -- so the maximum publishable margin is zero,
+and the implementation is the hardest item in the table: cuBLASLt's own `AUX_LD` constraint is 128
+**bits**, our D-fragment's lane-to-column map is non-contiguous, and a warp ballot therefore
+interleaves eight rows into one 32-bit word (section 1.2). Zero margin at maximum risk is the
+definition of a row to skip. If a Wukong backward ever needs the forward mask, spend the
+`+2 bytes/element` on GELU_AUX's shape (a plain f16 pre-activation tensor) and keep the epilogue
+trivial.
+
+**R10, BGRADA/BGRADB: not an epilogue task at all.** *"Bias gradient based on the input matrix A.
+Reduction occurs over the GEMM's k dimension."* The wgmma epilogue holds the C tile; it never sees
+the A or B operand outside the mainloop's shared-memory ring, and the reduction axis is K, which is
+the axis the mainloop consumes and discards. Implementing these means a separate reduction kernel,
+which is a `wukong_sreduce` job, not a wgmma job. Recording this stops a future wave from budgeting
+for it as "two more epilogues".
+
+### 3.5 The dependency order, as a single line
+
+```
+  W2A (v2 store)  ->  R1 (bias param + PARAM_ORDER law + derived-name law)
+                          |
+                          +->  R2 (SiLU+bias)   [PUBLISHABLE, headline]
+                          +->  R3 (GELU+bias)   [control, parity]
+                          +->  R6 (residual)    [PUBLISHABLE, after the register census]
+                          |
+     support probe  ------+->  R4 (f16 out)     [PUBLISHABLE only under Scenario A]
+                          |
+     weight interleave ---+->  R5 (gated)       [PUBLISHABLE, no peer exists]
+```
+
+The support probe and the `gpt_d1024_up` re-measurement under `w1_s4_mcb2` are both **prerequisites of
+the round, not results of it**: the first decides whether R4 is built at all, the second decides
+whether any Wave-4 row can be published as a win rather than a 0.97x tie.
