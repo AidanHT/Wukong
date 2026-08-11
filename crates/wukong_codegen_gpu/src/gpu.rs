@@ -318,7 +318,9 @@ pub fn sync_within(stream: &CudaStream, what: &str) -> Result<std::time::Duratio
                  \x20            and every consumer warpgroup spins forever. Run the single-stage\n\
                  \x20            TMA probe first: one copy, one barrier, nothing else.\n\
                  \x20 suspect 2: a bar.sync that some threads of the CTA branch around.\n\
-                 \x20 suspect 3: CLUSTER ONLY (an entry whose name ends `_mc<N>`). Either an\n\
+                 \x20 suspect 3: CLUSTER ONLY (an entry whose name carries an `_mc<N>` or\n\
+                 \x20            `_mcb<N>` tag -- A-multicast on grid x, B-multicast on grid y).\n\
+                 \x20            Either an\n\
                  \x20            `empty[s]` initialised for fewer arrivals than the cluster's\n\
                  \x20            consumer warpgroups actually send (WgmmaCfg::empty_arrivals), a\n\
                  \x20            `mapa` remote arrival that never lands, or a peer signalling an\n\
@@ -414,6 +416,10 @@ pub struct Gpu {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     modules: HashMap<&'static str, Arc<CudaModule>>,
+    /// The PTX fingerprint each cached module was compiled from — guard G4's half of
+    /// [`Gpu::function`]. A parallel map rather than a field on the module because `CudaModule` is
+    /// cudarc's type and this is our bookkeeping.
+    module_fps: HashMap<&'static str, u64>,
     /// The largest **dynamic** shared-memory ceiling already opted into per `(module key, entry name)`.
     /// `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` is a property of the loaded `CUfunction`, so
     /// it survives every later `load_function` for that entry: it is set once at load and re-set only
@@ -439,6 +445,42 @@ struct RawEntry {
     #[allow(dead_code)] // held so the module cannot be reasoned about as unloadable
     module: sys::CUmodule,
     func: sys::CUfunction,
+    /// **The PTX fingerprint this entry was loaded from** — see [`ptx_fingerprint`].
+    ptx_fp: u64,
+}
+
+/// **A 64-bit fingerprint of a PTX text, for the module cache's key-collision guard (G4).**
+///
+/// Both module caches in this file key on a `&'static str` alone and, by design, never re-examine
+/// the text on a hit: that is what makes a warm launch free. The cost is the crate's oldest landmine
+/// — two *different* generated texts under one key silently share one compiled module, the second
+/// caller gets the first's kernel (the entry name matches, so there is no error), and every number
+/// the second caller publishes belongs to the first's kernel.
+///
+/// The fingerprint closes it without giving the property up: the hit path still does no work beyond
+/// hashing the text it was handed, and a mismatch is a **panic naming both keys**, because there is
+/// no correct way to continue — one of the two callers is about to measure or compute with a kernel
+/// it did not generate. `DefaultHasher` is the same SipHash the cubin cache keys with
+/// (`cubin::cache_path_for`), deterministic within and across runs of this build.
+fn ptx_fingerprint(ptx: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ptx.hash(&mut h);
+    h.finish()
+}
+
+/// The message both cache paths raise on a fingerprint mismatch. One wording, one place, so a test
+/// can pin it and both caches say the same thing.
+fn module_key_collision(key: &str, name: &str, had: u64, got: u64, len: usize) -> String {
+    format!(
+        "MODULE KEY COLLISION on {key:?} (entry {name:?}): this key already names a module compiled \
+         from DIFFERENT PTX (fingerprint {had:#018x}, now {got:#018x}, {len} B). The cache keys on \
+         the key string alone and never re-examines the text, so continuing would silently run the \
+         FIRST text's kernel under this caller's name -- and every number it publishes would belong \
+         to the other configuration. Give every generated variant its own key: for the wgmma family \
+         that is `WgmmaCfg::derived_name`, which spells the whole geometry INCLUDING the multicast \
+         axis, and `WgmmaCfg::validate` refuses to emit anything whose name is not it."
+    )
 }
 
 // SAFETY: `CUmodule`/`CUfunction` are opaque driver handles, not pointers into this process's
@@ -459,6 +501,7 @@ impl Gpu {
             ctx,
             stream,
             modules: HashMap::new(),
+            module_fps: HashMap::new(),
             dyn_smem: HashMap::new(),
             raw_fns: HashMap::new(),
             driver_tag: crate::cubin::driver_version(),
@@ -552,19 +595,36 @@ impl Gpu {
     /// precompiled SASS instead of re-JITing the PTX. The driver compiles PTX→SASS internally, so no
     /// external `ptxas` is required either way.
     ///
-    /// **LANDMINE — the cache keys on `key` alone and never re-examines `ptx` on a hit.** Two
-    /// *different* generated PTX texts sharing one `&'static str` key silently share one compiled
-    /// module: the second caller gets the first's kernel (the entry name matches, so there is no
-    /// error). Use a distinct key per generated variant/shape.
+    /// **LANDMINE — the cache keys on `key` alone and does not re-COMPILE `ptx` on a hit.** Two
+    /// *different* generated PTX texts sharing one `&'static str` key would silently share one
+    /// compiled module: the second caller gets the first's kernel (the entry name matches, so there
+    /// is no error). Use a distinct key per generated variant/shape.
+    ///
+    /// **Guard G4 (2026-08-10):** the hit path now *fingerprints* the text it was handed
+    /// ([`ptx_fingerprint`]) and panics on a mismatch. That keeps the property the cache exists for
+    /// — a hit still costs no JIT and no module load — while turning the landmine from silence into
+    /// a message naming both keys. It is a `panic!` rather than an error because there is no correct
+    /// way to continue: one of the two callers is about to compute or publish with a kernel it did
+    /// not generate.
     pub fn function(
         &mut self,
         key: &'static str,
         ptx: &str,
         name: &str,
     ) -> Result<CudaFunction, DriverError> {
-        if !self.modules.contains_key(key) {
-            let module = self.load_module_cached(ptx)?;
-            self.modules.insert(key, module);
+        let fp = ptx_fingerprint(ptx);
+        match self.module_fps.get(key) {
+            Some(&had) => assert_eq!(
+                had,
+                fp,
+                "{}",
+                module_key_collision(key, name, had, fp, ptx.len())
+            ),
+            None => {
+                let module = self.load_module_cached(ptx)?;
+                self.modules.insert(key, module);
+                self.module_fps.insert(key, fp);
+            }
         }
         self.modules[key].load_function(name)
     }
@@ -669,7 +729,18 @@ impl Gpu {
             self.target.name
         );
         let slot = (key, name.to_string());
+        let fp = ptx_fingerprint(ptx);
         if let Some(e) = self.raw_fns.get(&slot) {
+            // GUARD G4. The hit path deliberately does not re-load or re-examine the module — but it
+            // does check that the text it was handed is the text the module was built from. Without
+            // this a mis-keyed sweep row runs its neighbour's kernel a thousand times and the round
+            // publishes the neighbour's speed under this row's heading.
+            assert_eq!(
+                e.ptx_fp,
+                fp,
+                "{}",
+                module_key_collision(key, name, e.ptx_fp, fp, ptx.len())
+            );
             return Ok(e.func);
         }
         // Every raw driver call below needs the context current on THIS thread; libtest runs these
@@ -702,7 +773,14 @@ impl Gpu {
             }
             .result()?;
         }
-        self.raw_fns.insert(slot, RawEntry { module, func });
+        self.raw_fns.insert(
+            slot,
+            RawEntry {
+                module,
+                func,
+                ptx_fp: fp,
+            },
+        );
         Ok(func)
     }
 
@@ -8250,7 +8328,12 @@ mod tests {
         // five sweep-only rows of `WGMMA_SWEEP_GRID` that fit Hopper's carveout — nine instead of
         // three. Every one of them is text a rented H100 will be handed, which is exactly why they
         // are in the corpus the `.version`, ASCII and CPU `ptxas` laws scan.
-        const EXPECTED_MODULES: usize = 105;
+        // 105 -> 109 with the B-multicast axis: a fifth shipped row (W1 with a 1x2x1 cluster +
+        // B-multicast, the round-3 primary) and three more sweep-only rows (128x256 at s2 and s3
+        // with the B cluster, and the square W3c tile with it). Each is a distinct module because
+        // each is a distinct `WgmmaCfg::derived_name` — the whole geometry INCLUDING the multicast
+        // axis — and the census must assemble every one before an H100 is rented.
+        const EXPECTED_MODULES: usize = 109;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -18337,14 +18420,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             g.smem_budget()
                         )
                     });
+                let (cx, cy, cz) = plan.cluster;
                 eprintln!(
-                    "      {:<34} LOADED   {:>3} thr, {:>6} B dyn smem, {} stages, cluster {}x1x1, \
-                     {}",
+                    "      {:<35} LOADED   {:>3} thr, {:>6} B dyn smem, {} stages, cluster \
+                     {cx}x{cy}x{cz} mc {}, {}",
                     c.name,
                     plan.block.0,
                     plan.dyn_smem_bytes,
                     c.stages,
-                    c.cluster_ctas(),
+                    c.multicast.operand(),
                     c.layout.label()
                 );
             }
@@ -18395,7 +18479,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             );
             let mut tiles = 0usize;
             for c in WGMMA_VARIANTS {
-                for (what, box_rows, box_cols) in [("A", c.bm, c.bk), ("B", c.bn, c.bk)] {
+                // The box each row's descriptor actually declares, not the whole tile: a clustered
+                // row's SPLIT operand is fetched `extent / cluster_ctas` rows at a time
+                // (`a_box_rows` / `b_box_rows`), and that is the geometry `cuTensorMapEncodeTiled`
+                // will be handed. Probing the un-split tile would leave the one box the cluster
+                // introduced unexercised -- on both axes, since the two arms split different
+                // operands.
+                for (what, box_rows, box_cols) in
+                    [("A", c.a_box_rows(), c.bk), ("B", c.b_box_rows(), c.bk)]
+                {
                     // A matrix a little larger than one tile in each axis, so the second tile in
                     // each direction is ragged and TMA's zero fill is exercised on both edges.
                     // `+8` on the contiguous axis, not `+7`: the row stride in BYTES must be a
@@ -19019,13 +19111,17 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 win.layout.label()
             );
             eprintln!(
-                "[wgmma-bringup] Item 9 (the 2x1x1 cluster + A-multicast) is NOT in this sequence: \
-                 it is its own\n\
-                 \x20               non-ignored gate, because its failure mode -- stale shared \
-                 memory on the M rows a\n\
-                 \x20               CTA did not fetch itself -- needs shapes wide enough for the \
-                 multicast to cross CTAs,\n\
-                 \x20               which the stage E/F/G shapes deliberately are not. Run it as:\n\
+                "[wgmma-bringup] Item 9 (BOTH cluster arms: 2x1x1 + A-multicast on grid x, and \
+                 1x2x1 +\n\
+                 \x20               B-multicast on grid y) is NOT in this sequence: it is its own \
+                 non-ignored gate,\n\
+                 \x20               because its failure mode -- stale shared memory on the M rows \
+                 (A arm) or the N\n\
+                 \x20               columns (B arm) a CTA did not fetch itself -- needs shapes wide \
+                 enough for the\n\
+                 \x20               multicast to cross CTAs on that arm's OWN grid axis, which the \
+                 stage E/F/G shapes\n\
+                 \x20               deliberately are not. Run it as:\n\
                  \x20                 {}",
                 crate::ptx_wgmma::WGMMA_CLUSTER_GATE_INVOCATION
             );
@@ -19039,24 +19135,33 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
 
     use crate::bench_instrument as bi;
 
-    /// **The cluster + A-multicast path is EXACT, on shapes where the multicast actually crosses
-    /// CTAs.** A correctness gate, not a bench: nothing here is timed and nothing is `#[ignore]`d.
+    /// **Both cluster arms are EXACT, on shapes where the multicast actually crosses CTAs.** A
+    /// correctness gate, not a bench: nothing here is timed and nothing is `#[ignore]`d.
     ///
-    /// # Why the shapes are what they are
+    /// # Why the shapes are what they are, and why they are per-ARM
     ///
     /// A multicast defect is not a crash and not a NaN. Each CTA of the cluster fetches one slice of
-    /// A and multicasts it to the rest, so a wrong `ctaMask`, a wrong slice offset, a missing remote
-    /// `empty` arrival or a missing cluster rendezvous shows up as **stale shared memory on the M
-    /// rows this CTA did not fetch itself** — correct numbers on half the accumulator rows and last
-    /// iteration's numbers on the other half, at full speed, with no error anywhere. A shape whose
-    /// grid is one CTA wide cannot see any of it, because the multicast would be a copy to self.
+    /// the shared operand and multicasts it to the rest, so a wrong `ctaMask`, a wrong slice offset,
+    /// a missing remote `empty` arrival or a missing cluster rendezvous shows up as **stale shared
+    /// memory on the part this CTA did not fetch itself** — correct numbers on half the accumulator
+    /// rows (A arm) or half its columns (B arm) and last iteration's numbers on the other half, at
+    /// full speed, with no error anywhere.
     ///
-    /// So every shape below has **at least two N tiles**, i.e. at least one full cluster of two CTAs
-    /// holding *different* B halves of the *same* A rows, and `bringup_operands`' three-digit
-    /// positional ramps make every element distinguishable from every other. Two of them are ragged,
-    /// including one whose N tile count is **odd** — that is the grid-rounding path, where the
-    /// cluster's second CTA is wholly out of range and must contribute nothing while still taking
-    /// part in every barrier.
+    /// A shape whose grid is one CTA wide **on the cluster's own axis** cannot see any of it,
+    /// because the multicast would be a copy to self — and the two arms sit on *different* axes, so
+    /// one shape list cannot serve both. `shapes_for` therefore builds each arm's list around the
+    /// axis it clusters: the `2x1x1` arm needs two N tiles, the `1x2x1` arm two M tiles, and each
+    /// gets an **odd tile count on its own axis** for the grid-rounding path, where the cluster's
+    /// second CTA is wholly out of range and must contribute nothing to the output while still
+    /// multicasting a real slice and taking part in every barrier.
+    ///
+    /// # The operand halves must be DISTINGUISHABLE, or the gate proves nothing
+    ///
+    /// `bringup_operands`' three-digit positional ramps put the core-grid row index and the
+    /// core-grid k index at different digit weights, and at *opposite* weights in A and in B. So a
+    /// slice fetched at the wrong rank, a `ctaMask` naming one CTA, or a slice landed at the wrong
+    /// SMEM offset changes the product — in A and in B independently. A constant operand, or one
+    /// constant along either core-grid axis, would pass every arrangement of the same bytes.
     ///
     /// # Two independent verdicts, both `==`
     ///
@@ -19064,145 +19169,210 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     ///    encoder or generator. The operands are small integers whose dot product stays under 2^24,
     ///    so f32 holds every partial sum exactly and reassociation cannot move a bit: the verdict is
     ///    `==`, not a tolerance.
-    /// 2. Against the **un-clustered row at the same shape**, bit for bit. The two kernels issue the
+    /// 2. Against the **un-clustered row at the same shape**, bit for bit. The kernels issue the
     ///    same `wgmma` sequence over the same K order on the same tile and differ only in who copied
     ///    the bytes, so any difference at all is the cluster machinery and nothing else. This is the
     ///    sharper of the two: it compares against a kernel the 2026-08-10 round already proved exact.
     #[test]
     fn wgmma_cluster_multicast_is_exact() {
         use crate::ptx_wgmma::{
-            bringup_operands, WGMMA_CLUSTER_GATE_INVOCATION, WGMMA_W1, WGMMA_W1_MC,
+            bringup_operands, WgmmaCfg, WGMMA_CLUSTER_GATE_INVOCATION, WGMMA_W1, WGMMA_W1_MC,
+            WGMMA_W1_MCB,
         };
+        /// The four shapes one arm is gated on, built around **that arm's own cluster axis**.
+        ///
+        /// Returns `(M, N, K, why)`. `mn(on_axis, off_axis)` turns a pair of tile counts into a
+        /// shape: `on_axis` counts tiles along the axis this arm clusters (N for `2x1x1`, M for
+        /// `1x2x1`) and `off_axis` the other, which is varied independently so a defect that needs
+        /// both axes cannot hide behind a one-tile grid.
+        fn shapes_for(c: &WgmmaCfg) -> Vec<(usize, usize, usize, String)> {
+            let (bm, bn, ring) = (c.bm, c.bn, c.bk * c.stages);
+            let axis_is_m = c.multicast.multicasts_b();
+            // (tiles along the cluster axis, tiles along the other axis) -> (M, N). The A arm
+            // clusters N, so `on_axis` counts N tiles there and M tiles in the B arm; the off-axis
+            // count is varied independently so a defect that needs both axes cannot hide.
+            let mn = |on_axis: usize, off_axis: usize| -> (usize, usize) {
+                if axis_is_m {
+                    (on_axis * bm, off_axis * bn)
+                } else {
+                    (off_axis * bm, on_axis * bn)
+                }
+            };
+            let (m1, n1) = mn(2, 1);
+            let (m2, n2) = mn(4, 2);
+            let (m3, n3) = mn(3, 1);
+            let axis = if axis_is_m { "M" } else { "N" };
+            let other = if axis_is_m { "N" } else { "M" };
+            vec![
+                (
+                    m1,
+                    n1,
+                    ring,
+                    format!(
+                        "exactly ONE full cluster: both CTAs carry a real, different {other} \
+                         tile-half and each of the shared operand's halves arrives by multicast \
+                         from the other CTA"
+                    ),
+                ),
+                (
+                    m2,
+                    n2,
+                    ring,
+                    format!(
+                        "four clusters over two {other} tiles: the cluster-to-tile map on the {axis} \
+                         axis, not just one cluster"
+                    ),
+                ),
+                (
+                    m3,
+                    n3,
+                    c.bk * (c.stages + 1),
+                    format!(
+                        "an ODD number of {axis} tiles: the grid rounds 3 up to 4 on THIS arm's own \
+                         axis and the pad CTA must zero-fill, store nothing, and still multicast a \
+                         real slice into every cluster barrier. K wraps the ring once, so the pad \
+                         CTA is not merely a prologue artifact"
+                    ),
+                ),
+                (
+                    m1 + 7,
+                    n1 - 5,
+                    c.bk * 2 - 16,
+                    "ragged in M, N and K at once, inside a cluster: TMA's zero fill on the multicast \
+                     SLICE boundary as well as the tile boundary"
+                        .to_string(),
+                ),
+            ]
+        }
         with_hopper(
             "wgmma_cluster_multicast_is_exact",
             WGMMA_CLUSTER_GATE_INVOCATION,
             |g, _lic| {
-                let mc = &WGMMA_W1_MC;
                 let plain = &WGMMA_W1;
-                assert_eq!(
-                    mc.cluster_ctas(),
-                    2,
-                    "this gate is written for a 2-CTA cluster"
-                );
-                eprintln!(
-                    "\n[wgmma-cluster] {} vs {} on {}: cluster {}x1x1, A slice {} B of {} B per \
-                     CTA, ctaMask {:#x}, empty[s] takes {} arrivals",
+                let mut total = 0usize;
+                // The PRIMARY first: if the visit dies, it dies having answered round 3's question.
+                for mc in [&WGMMA_W1_MCB, &WGMMA_W1_MC] {
+                    assert_eq!(
+                        mc.cluster_ctas(),
+                        2,
+                        "this gate is written for a 2-CTA cluster"
+                    );
+                    let (cx, cy, cz) = mc.launch_plan().cluster;
+                    let (slice, whole) = if mc.multicast.multicasts_a() {
+                        (mc.a_slice_bytes(), mc.tile_a_bytes())
+                    } else {
+                        (mc.b_slice_bytes(), mc.tile_b_bytes())
+                    };
+                    eprintln!(
+                    "\n[wgmma-cluster] {} vs {} on {}: cluster {cx}x{cy}x{cz} on grid {}, {} slice \
+                     {slice} B of {whole} B per CTA, ctaMask {:#x}, empty[s] takes {} arrivals",
                     mc.name,
                     plain.name,
                     g.device_name(),
-                    mc.cluster_ctas(),
-                    mc.a_slice_bytes(),
-                    mc.tile_a_bytes(),
+                    mc.multicast.grid_axis(),
+                    mc.multicast.operand(),
                     crate::ptx_wgmma::multicast_cta_mask(mc.cluster_ctas()),
                     mc.empty_arrivals()
                 );
-                // (M, N, K, what this shape is for)
-                let shapes: &[(usize, usize, usize, &str)] = &[
-                    (
-                        mc.bm,
-                        2 * mc.bn,
-                        mc.bk * mc.stages,
-                        "exactly ONE full cluster: both CTAs carry a real, different N half of the \
-                         same M tile, and each A half arrives by multicast from the other CTA",
-                    ),
-                    (
-                        2 * mc.bm,
-                        4 * mc.bn,
-                        mc.bk * mc.stages,
-                        "four clusters over two M tiles: the cluster-to-tile map, not just one \
-                         cluster",
-                    ),
-                    (
-                        mc.bm,
-                        3 * mc.bn,
-                        mc.bk * (mc.stages + 1),
-                        "an ODD number of N tiles: the grid rounds 3 up to 4 and the pad CTA must \
-                         zero-fill, store nothing, and still take part in every cluster barrier. \
-                         K wraps the ring once, so the pad CTA is not merely a prologue artifact",
-                    ),
-                    (
-                        mc.bm + 7,
-                        2 * mc.bn - 5,
-                        mc.bk * 2 - 16,
-                        "ragged in M, N and K at once, inside a cluster: TMA's zero fill on the A \
-                         SLICE boundary as well as the tile boundary",
-                    ),
-                ];
-                for &(m, n, k, why) in shapes {
-                    let (a, b) = bringup_operands(m, n, k);
-                    let limit = mc.dtype.exact_integer_limit();
-                    assert!(
+                    let shapes = shapes_for(mc);
+                    total += shapes.len();
+                    for (m, n, k, why) in &shapes {
+                        let (m, n, k, why) = (*m, *n, *k, why.as_str());
+                        let (a, b) = bringup_operands(m, n, k);
+                        let limit = mc.dtype.exact_integer_limit();
+                        assert!(
                         a.iter().chain(&b).all(|v| v.abs() <= limit),
                         "the ramp at {m}x{k}x{n} is not exact in {:?} (limit {limit}) — the verdict \
                          would silently become a tolerance",
                         mc.dtype
                     );
-                    let want = ref_nt(&a, &b, m, k, n);
-                    let got = gemm_nt_wgmma(g, mc, &a, &b, m, k, n)
-                        .unwrap_or_else(|e| panic!("{} at {m}x{k}x{n}: {e}", mc.name));
-                    let bad: Vec<usize> = got
-                        .iter()
-                        .zip(&want)
-                        .enumerate()
-                        .filter(|(_, (x, y))| x != y)
-                        .map(|(i, _)| i)
-                        .collect();
-                    if !bad.is_empty() {
-                        // A multicast defect has a SHAPE. Report which halves are wrong, because
-                        // "rows >= BM/2 only" is the signature of a slice that never arrived and
-                        // "one N half only" is the signature of a mask that named one CTA.
-                        let rows_lo = bad.iter().filter(|&&i| (i / n) % mc.bm < mc.bm / 2).count();
-                        let cols_lo = bad.iter().filter(|&&i| (i % n) < n / 2).count();
-                        panic!(
+                        let want = ref_nt(&a, &b, m, k, n);
+                        let got = gemm_nt_wgmma(g, mc, &a, &b, m, k, n)
+                            .unwrap_or_else(|e| panic!("{} at {m}x{k}x{n}: {e}", mc.name));
+                        let bad: Vec<usize> = got
+                            .iter()
+                            .zip(&want)
+                            .enumerate()
+                            .filter(|(_, (x, y))| x != y)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if !bad.is_empty() {
+                            // A multicast defect has a SHAPE, and which shape depends on the arm. Under
+                            // `ClusterA` a slice that never arrived is confined to one half of each
+                            // CTA's M ROWS; under `ClusterB` it is one half of each CTA's N COLUMNS.
+                            // Both splits are reported either way, because reading the wrong one is how
+                            // a real defect gets filed as "some lanes are wrong".
+                            let rows_lo =
+                                bad.iter().filter(|&&i| (i / n) % mc.bm < mc.bm / 2).count();
+                            let cols_lo =
+                                bad.iter().filter(|&&i| (i % n) % mc.bn < mc.bn / 2).count();
+                            let (sliced, slice_bytes) = if mc.multicast.multicasts_a() {
+                                ("M rows (this arm multicasts A)", mc.a_slice_bytes())
+                            } else {
+                                ("N columns (this arm multicasts B)", mc.b_slice_bytes())
+                            };
+                            panic!(
                             "{} is WRONG at {m}x{k}x{n} ({} of {} lanes, max_abs {:.3e}).\n  \
-                             {} wrong lanes are in the TOP half of each CTA's M rows and {} in the \
-                             bottom: a split confined to one half is an A slice that never arrived \
-                             (check the ctaMask {:#x} and the {} B slice offset).\n  {} wrong lanes \
-                             are in the low N half and {} in the high: a split confined to one half \
-                             is a per-CTA fault, not a per-slice one.\n  Shape rationale: {why}",
+                             This arm slices {sliced}, so a split confined to one half THERE is a \
+                             slice that never arrived (check the ctaMask {:#x} and the \
+                             {slice_bytes} B slice offset); a split confined to one half of the \
+                             OTHER axis is a per-CTA fault, not a per-slice one.\n  \
+                             {} wrong lanes in the low half of each CTA's M rows, {} in the high.\n  \
+                             {} wrong lanes in the low half of each CTA's N columns, {} in the \
+                             high.\n  Shape rationale: {why}",
                             mc.name,
                             bad.len(),
                             want.len(),
                             crate::diff::err_stats(&got, &want).max_abs,
+                            crate::ptx_wgmma::multicast_cta_mask(mc.cluster_ctas()),
                             rows_lo,
                             bad.len() - rows_lo,
-                            crate::ptx_wgmma::multicast_cta_mask(mc.cluster_ctas()),
-                            mc.a_slice_bytes(),
                             cols_lo,
                             bad.len() - cols_lo
                         );
-                    }
-                    // The sharper verdict: bit-identical to the row that has no cluster in it.
-                    let base = gemm_nt_wgmma(g, plain, &a, &b, m, k, n)
-                        .unwrap_or_else(|e| panic!("{} at {m}x{k}x{n}: {e}", plain.name));
-                    assert_eq!(
-                        got, base,
-                        "{} and {} disagree at {m}x{k}x{n} although they issue the same wgmma \
+                        }
+                        // The sharper verdict: bit-identical to the row that has no cluster in it.
+                        let base = gemm_nt_wgmma(g, plain, &a, &b, m, k, n)
+                            .unwrap_or_else(|e| panic!("{} at {m}x{k}x{n}: {e}", plain.name));
+                        assert_eq!(
+                            got, base,
+                            "{} and {} disagree at {m}x{k}x{n} although they issue the same wgmma \
                          sequence over the same K order — the difference IS the cluster",
-                        mc.name, plain.name
-                    );
-                    // ...and twice, bit-identically: a barrier race the first launch got away with
-                    // shows up here, and the cluster adds two barriers and a remote arrival.
-                    let again = gemm_nt_wgmma(g, mc, &a, &b, m, k, n).unwrap();
-                    assert_eq!(
-                        got, again,
-                        "{} at {m}x{k}x{n} is not run-to-run reproducible — a cluster-scoped \
+                            mc.name, plain.name
+                        );
+                        // ...and twice, bit-identically: a barrier race the first launch got away with
+                        // shows up here, and the cluster adds two barriers and a remote arrival.
+                        let again = gemm_nt_wgmma(g, mc, &a, &b, m, k, n).unwrap();
+                        assert_eq!(
+                            got, again,
+                            "{} at {m}x{k}x{n} is not run-to-run reproducible — a cluster-scoped \
                          producer/consumer race, not a numerics question",
-                        mc.name
+                            mc.name
+                        );
+                        let p = mc.launch_plan();
+                        let (gx, gy, _) = p.grid(m, n);
+                        eprintln!(
+                        "      {m:>5} x {k:<5} x {n:<5} grid {gx}x{gy} ({} clusters, {} pad CTA(s)): \
+                         EXACT, == the un-clustered row, reproducible",
+                        gx * gy / p.cluster_ctas(),
+                        (gx as usize) * (gy as usize)
+                            - n.div_ceil(mc.bn) * m.div_ceil(mc.bm)
                     );
-                    let p = mc.launch_plan();
-                    let (gx, gy, _) = p.grid(m, n);
+                    }
                     eprintln!(
-                        "      {m:>5} x {k:<5} x {n:<5} grid {gx}x{gy} ({} clusters): EXACT, == the \
-                         un-clustered row, reproducible",
-                        gx / p.cluster.0 * gy
-                    );
-                }
-                eprintln!(
                     "[gate] {} is exact on {} cluster-spanning shapes and bit-identical to {} on \
                      every one \u{2713}",
                     mc.name,
                     shapes.len(),
+                    plain.name
+                );
+                }
+                eprintln!(
+                    "[gate] BOTH cluster axes are exact: {total} shapes over {} and {}, each \
+                     spanning at least one full two-CTA cluster ON ITS OWN GRID AXIS, each `==` the \
+                     f64 reference and bit-identical to {} \u{2713}",
+                    WGMMA_W1_MCB.name,
+                    WGMMA_W1_MC.name,
                     plain.name
                 );
             },
@@ -19301,24 +19471,35 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             cfg.threads()
         );
         let ctas = cfg.cluster_ctas();
+        let (cx, cy, cz) = plan.cluster;
+        let (slice, whole) = if cfg.multicast.multicasts_a() {
+            (cfg.a_slice_bytes(), cfg.tile_a_bytes())
+        } else {
+            (cfg.b_slice_bytes(), cfg.tile_b_bytes())
+        };
         s += &format!(
-            "schedule       : {:?}; cluster {}x1x1 ({:?}){}\n",
+            "schedule       : {:?}; cluster {cx}x{cy}x{cz} ({:?}){}\n",
             cfg.schedule,
-            ctas,
             cfg.multicast,
             if ctas > 1 {
                 format!(
-                    " - D1 4.5's W1 AS SPECIFIED: each CTA TMA-loads {} of the {} B A tile and \
-                     .multicast::cluster-s it to both, B stays per-CTA, expect_tx is still {} B per \
-                     destination, empty[s] takes {} arrivals",
-                    cfg.a_slice_bytes(),
-                    cfg.tile_a_bytes(),
+                    " on grid {} - each CTA TMA-loads {slice} B of the {whole}-byte {} tile and \
+                     .multicast::cluster-s it to all {ctas}, {} stays per-CTA, expect_tx is still \
+                     {} B per destination, empty[s] takes {} arrivals",
+                    cfg.multicast.grid_axis(),
+                    cfg.multicast.operand(),
+                    if cfg.multicast.multicasts_a() {
+                        "B"
+                    } else {
+                        "A"
+                    },
                     cfg.stage_tx_bytes(),
                     cfg.empty_arrivals()
                 )
             } else {
-                " - NO cluster: D1's W1 asks for a 2x1x1 cluster with .multicast::cluster on A and \
-                 this row does not carry it"
+                " - NO cluster: the baseline arm. D1 4.5 asks for a 2x1x1 cluster multicasting A; \
+                 the measured 7.00 TB/s L2 says the 1x2x1 multicast of B is the one that clears \
+                 the peer"
                     .to_string()
             }
         );
@@ -19594,24 +19775,34 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
-    /// **ACT 2, ROUND 2: the configuration SWEEP.** One visit, four axes, same-run, one denominator.
+    /// **ACT 2, ROUND 3: the configuration SWEEP, now asking about the cluster AXIS.** One visit,
+    /// four axes, same-run, one denominator.
     ///
-    /// # What round 1 left, and why a second single A/B would waste the visit
+    /// # What rounds 1 and 2 left
     ///
-    /// The 2026-08-10 round measured `WGMMA_W1` at 58.8-67.5% of cuBLAS at 4096-8192 cubed where
-    /// D1 section 4.5 predicts 95-108%. The instrument was clean — control floors +/-0.03-2.19%,
-    /// 0.00% clock drift, a peer at ~85-87% of the part's own spec ceiling — so the number is real.
-    /// Its own provenance line named the first suspect: the measured kernel was W1 **minus the
-    /// `2x1x1` cluster with `.multicast::cluster` on A** that the dossier specifies, so the
-    /// prediction had never actually been tested. That arm now exists ([`crate::ptx_wgmma::WGMMA_W1_MC`]).
+    /// Round 1 measured `WGMMA_W1` at 58.8-67.5% of cuBLAS at 4096-8192 cubed where D1 section 4.5
+    /// predicts 95-108%. The instrument was clean — control floors +/-0.03-2.19%, 0.00% clock drift,
+    /// a peer at ~85-87% of the part's own spec ceiling — so the number is real. Its own provenance
+    /// line named the first suspect: the measured kernel was W1 **minus the `2x1x1` cluster with
+    /// `.multicast::cluster` on A**. Round 2 built that arm
+    /// ([`crate::ptx_wgmma::WGMMA_W1_MC`]) and measured it: **+1.8 points at `sq4096`, +17.0 at
+    /// `sq8192`, -4.0 at `sq2048`** — real, and not the gap.
     ///
-    /// A second single A/B would answer one question per rented visit. This answers four:
+    /// It could not have been. With `BW_L2` measured at 7.00 TB/s, an A-multicast `2x1x1` has
+    /// `I_cta = 102.4` and an L2 roof of 717 TFLOP/s, *below* cuBLAS's measured 838.7 at `sq4096`.
+    /// Multicasting **B** — the 256-wide operand — over a `1x2x1` cluster gives `I_cta = 128.0` and
+    /// ~896 TFLOP/s, above the peer everywhere ([`crate::ptx_wgmma::WGMMA_W1_MCB`]). Round 3's
+    /// question is therefore not "does a cluster help" but "**which operand should it multicast**",
+    /// and the table answers four things at once:
     ///
-    /// 1. **cluster off vs cluster `2x1x1`**, same tile, same depth, same layout, same registers —
-    ///    the headline, and one fact different between the arms;
-    /// 2. **pipeline depth**, at BOTH cluster settings, because "deeper helps" and "the cluster
-    ///    helps" would otherwise be confounded;
-    /// 3. **W3c** (128x128x64 s6), which round 1 deliberately excluded;
+    /// 1. **the axis**: baseline vs `1x2x1`-on-B (primary) vs `2x1x1`-on-A (control), same tile,
+    ///    depth, layout and registers — the headline, and the two clustered arms differ from each
+    ///    other in exactly one fact;
+    /// 2. **pipeline depth**, at ALL THREE cluster settings, because "deeper helps" and "this
+    ///    cluster helps" would otherwise be confounded;
+    /// 3. **the square tile** (W3c 128x128x64 s6) in both clustered settings, where the two axes
+    ///    have *identical* `I_cta` by construction — the control on the claim that the axis matters
+    ///    only through the traffic arithmetic;
     /// 4. **the ceiling on depth** — the two rows that do not fit are kept, and the round prints the
     ///    byte arithmetic instead of silently omitting them.
     ///
@@ -19722,11 +19913,27 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                  multicast rule : a .multicast::cluster copy of n bytes performs complete-tx of n \
                  on EVERY destination\n\
                  \x20                CTA's mbarrier -- it does not divide n among them -- so a \
-                 c-way split multicast of A\n\
-                 \x20                plus one own B tile is still tile_a + tile_b per CTA. The \
-                 clustered and un-clustered\n\
-                 \x20                rows therefore declare the SAME expect_tx, reached by \
-                 different arithmetic.",
+                 c-way split multicast of the\n\
+                 \x20                SHARED operand plus one own copy of the other is still \
+                 tile_a + tile_b per CTA. All\n\
+                 \x20                three settings therefore declare the SAME expect_tx, reached \
+                 by different arithmetic.\n\
+                 THE HYPOTHESIS : multicast the WIDER operand. With BW_L2 MEASURED at 7.00 TB/s \
+                 (gpt_d1024_down ran\n\
+                 \x20                597.6 TFLOP/s through I_cta 85.33), a cluster's L2 roof is \
+                 BW_L2 * I_cta with\n\
+                 \x20                I_cta = bm*bn/(bm/cm + bn/cn). At W1's 128x256 tile: no \
+                 cluster 85.33 -> 597 TFLOP/s;\n\
+                 \x20                2x1x1 multicasting A (the 128-row operand) 102.4 -> 717, \
+                 which is BELOW cuBLAS's\n\
+                 \x20                measured 838.7 at sq4096 and therefore cannot reach the peer; \
+                 1x2x1 multicasting B\n\
+                 \x20                (the 256-wide operand) 128.0 -> 896, above the peer's whole \
+                 column. Round 2 measured\n\
+                 \x20                the A arm at +1.8 points at sq4096 and +17.0 at sq8192: real, \
+                 and not the gap.\n\
+                 \x20                The B arm is the arm under test; the A arm is the control for \
+                 the axis.",
                 crate::ptx_wgmma::SHIPPED_LAYOUT.label()
             );
             // ONE authority for which rows run: `wgmma_sweep_measurable` is the same filter the
@@ -19736,22 +19943,26 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             for r in WGMMA_SWEEP_GRID {
                 let c = r.cfg;
                 match r.generatable() {
-                    Ok(()) => eprintln!(
-                        "  {:<12} {:<34} {}x{}x{} s{} cluster {}x1x1, {} thr, {}p/{}c regs | {}",
-                        r.label,
-                        c.name,
-                        c.bm,
-                        c.bn,
-                        c.bk,
-                        c.stages,
-                        c.cluster_ctas(),
-                        c.threads(),
-                        c.producer_regs,
-                        c.consumer_regs,
-                        r.smem_line()
-                    ),
+                    Ok(()) => {
+                        let (cx, cy, cz) = c.launch_plan().cluster;
+                        eprintln!(
+                            "  {:<12} {:<35} {}x{}x{} s{} cluster {cx}x{cy}x{cz} mc {}, {} thr, \
+                             {}p/{}c regs | {}",
+                            r.label,
+                            c.name,
+                            c.bm,
+                            c.bn,
+                            c.bk,
+                            c.stages,
+                            c.multicast.operand(),
+                            c.threads(),
+                            c.producer_regs,
+                            c.consumer_regs,
+                            r.smem_line()
+                        )
+                    }
                     Err(why) => eprintln!(
-                        "  {:<12} {:<34} DECLINED | {}\n      {why}",
+                        "  {:<12} {:<35} DECLINED | {}\n      {why}",
                         r.label,
                         c.name,
                         r.smem_line()
@@ -19771,15 +19982,18 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // --- 3. correctness gates EVERY row, before ANY timing -------------------------------
             eprintln!(
                 "\n---- {BENCH}: correctness, before a single timed launch ----\n\
-                 Every row runs at N = 2 x its own BN, so a clustered row's two CTAs hold DIFFERENT \
-                 N halves of the same\nM tile and each of its A halves has to arrive by multicast \
-                 from its peer. A multicast defect is silently\nwrong data on half the accumulator \
-                 rows, so the verdict is `==` against an f64 reference over exact-integer\noperands, \
-                 never a tolerance. A fast wrong kernel must not post a timing."
+                 Every row runs at M = 2 x its own BM AND N = 2 x its own BN -- two tiles on BOTH \
+                 grid axes -- because the\ntwo clustered arms sit on DIFFERENT axes: a 2x1x1 \
+                 cluster spans two CTAs along x and a 1x2x1 spans two\nalong y, and a shape that is \
+                 one tile wide on an arm's own axis makes its multicast a copy to self, which\n\
+                 proves nothing. A multicast defect is silently wrong data on half the accumulator \
+                 rows (A arm) or half\nits columns (B arm), so the verdict is `==` against an f64 \
+                 reference over exact-integer operands, never a\ntolerance. A fast wrong kernel \
+                 must not post a timing."
             );
             for r in &live {
                 let c = r.cfg;
-                let (m, n, k) = (c.bm, 2 * c.bn, c.bk * c.stages);
+                let (m, n, k) = (2 * c.bm, 2 * c.bn, c.bk * c.stages);
                 let (a, b) = bringup_operands(m, n, k);
                 let limit = c.dtype.exact_integer_limit();
                 assert!(
@@ -19805,9 +20019,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let p = c.launch_plan();
                 let (gx, gy, _) = p.grid(m, n);
                 eprintln!(
-                    "  {:<12} {m}x{k}x{n} grid {gx}x{gy} ({} cluster(s)): EXACT on all {} lanes",
+                    "  {:<12} {m}x{k}x{n} grid {gx}x{gy} ({} cluster(s) of {}): EXACT on all {} \
+                     lanes",
                     r.label,
-                    gx / p.cluster.0 * gy,
+                    gx * gy / p.cluster_ctas(),
+                    p.cluster_ctas(),
                     want.len()
                 );
             }
@@ -19982,17 +20198,34 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     .find(|(r, _)| r.label == label)
                     .and_then(|(_, x)| *x)
             };
-            match (of("w1_s4_off"), of("w1_s4_mc2")) {
-                (Some(a), Some(b)) => eprintln!(
-                    "\n  HEADLINE: the 2x1x1 cluster with .multicast::cluster on A takes W1 from \
-                     {a:.1}% to {b:.1}% of {} at {WGMMA_SWEEP_HEADLINE} ({:+.1} points). D1 4.5 \
-                     predicts 95-108%.",
-                    peer.label,
-                    b - a
-                ),
+            match (of("w1_s4_off"), of("w1_s4_mcb2"), of("w1_s4_mc2")) {
+                (Some(base), Some(b), Some(a)) => {
+                    eprintln!(
+                        "\n  HEADLINE: the TESTED HYPOTHESIS is `multicast the wider operand`. At \
+                         the measured BW_L2 of 7.00 TB/s,\n  \
+                         a 1x2x1 cluster multicasting B gives I_cta = 128*256/(128 + 256/2) = \
+                         128.0 and an L2 roof of ~896\n  \
+                         TFLOP/s, above the peer's measured 838.7 at {WGMMA_SWEEP_HEADLINE}; the \
+                         2x1x1 A-multicast control gives\n  \
+                         I_cta 102.4 and 717 TFLOP/s, which is arithmetically below it. At \
+                         {WGMMA_SWEEP_HEADLINE}, of {}:\n  \
+                         \x20 baseline (no cluster)      {base:.1}%\n  \
+                         \x20 PRIMARY  (1x2x1, B)        {b:.1}%   ({:+.1} points vs baseline)\n  \
+                         \x20 control  (2x1x1, A)        {a:.1}%   ({:+.1} points vs baseline)\n  \
+                         The claim this round can make is the difference between the two clustered \
+                         arms ({:+.1} points),\n  \
+                         because they differ in exactly one fact: which grid axis the cluster pairs \
+                         and therefore which\n  operand is multicast.",
+                        peer.label,
+                        b - base,
+                        a - base,
+                        b - a
+                    );
+                }
                 _ => eprintln!(
-                    "\n  HEADLINE: UNRESOLVED -- one or both arms of the cluster A/B failed to \
-                     publish, so this round says nothing about the cluster."
+                    "\n  HEADLINE: UNRESOLVED -- at least one of the three arms (baseline, 1x2x1 B \
+                     multicast, 2x1x1 A multicast)\n  failed to publish, so this round says nothing \
+                     about the cluster axis."
                 ),
             }
 
