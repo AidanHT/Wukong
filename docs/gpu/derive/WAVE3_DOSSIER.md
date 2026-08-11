@@ -955,3 +955,292 @@ between two shapes, and a rule fitted to one crossing is a curve fitted to two p
 real one involves `waves`. (ii) `gpt_d1024_up` prefers the cluster -> the predicate is not `f_L2` at
 all. (iii) 128x64 does not beat 128x256 at sq1024 -> occupancy is not sq1024's constraint and
 `X`'s CTA-count scaling in 0.4 is wrong.
+
+---
+
+## 4. THE MAINLOOP DRAIN
+
+### 4.1 What the emitter does today, and why the `0` is not a knob
+
+The consumer's per-stage body (`crates/wukong_codegen_gpu/src/ptx_wgmma.rs:3593-3655`) is:
+
+```
+CLOOP_<name>:
+    setp.ge.u32 %p0,%kt,%ktiles;  @%p0 bra CEND_<name>;
+    <full[stg] barrier address, 3 instr>
+CWAIT_<name>:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%phf;   @!%p1 bra CWAIT_<name>;
+    <stage bases %rdA,%rdB, 6 instr>
+    setp.ne.u32 %pfirst,%kt,0;
+    wgmma.fence.sync.aligned;
+    x4 { <descA: add/shr/and/or>  <descB: add/shr/and/or>   wgmma.mma_async.sync.aligned.m64n256k16... }
+    wgmma.commit_group.sync.aligned;
+    wgmma.wait_group.sync.aligned 0;          <-- the full drain
+    <empty[stg] address, 4 instr>  <cvta/cvt + 2 x (mov, mapa, arrive), 8 instr when clustered>
+    add.u32 %kt,%kt,1;  add.u32 %stg,%stg,1;  <wrap>  bra CLOOP_<name>;
+```
+
+The round-3 log's own preamble (lines 432-436) states the constraint exactly right: **the `0` is not a
+tuning knob.** The release publishes the buffer to the producer, so it may not precede the last read
+of it; any depth above 0 *at that position* is a correctness bug, not a slower or faster kernel. The
+lever is a **restructuring**: keep the depth and the release paired, and move BOTH -- wait to depth
+`D` and release the stage that is `D` groups old.
+
+### 4.2 The measured bubble
+
+From 0.5: one 128x256x64 stage is 1024 tensor-clocks of ideal work and costs `S = 0.6460 us` in the
+B-multicast arm, i.e. **1181 clocks at the 989-TFLOP/s reference clock (1.8288 GHz) or 1279 clocks at
+the reported 1980 MHz**. The bubble is therefore **157 to 255 clocks per stage, 13.3% to 20.0%**.
+
+That bracket is consistent with counting the emitted text: ~42 instructions sit between the last
+`wgmma` of stage `s` retiring and the first `wgmma` of stage `s+1` issuing (12 of release, 3 of
+barrier address, the `try_wait`, 6 of stage bases, 24 of descriptors, the fence), and two consumer
+warpgroups share four sub-partitions, so those ~42 instructions are ~84 issue slots -- plus the
+`try_wait` latency. The bubble is real, it is where the derivation says it is, and its *size* is
+uncertain by exactly the factor the unlocked clock leaves uncertain.
+
+### 4.3 The pipelined alternative, and what it costs
+
+**Buffer lifetime.** `wgmma.wait_group.sync.aligned D` guarantees that all but the `D` most recent
+committed groups have completed. So after `wait_group D` at stage `s`, the group belonging to stage
+`s-D` has retired and **its** buffer is dead. The release therefore targets
+`(stg + stages - D) % stages`, not `stg`.
+
+**Accumulator lifetime.** All in-flight groups accumulate into the same `%acc0..127`. That is legal
+and is CUTLASS's standard practice -- `K_PIPE_MMAS` is precisely the number of `wgmma` groups CUTLASS
+keeps in flight against one accumulator set, and the ISA's requirement is only that the D registers
+are not *read by the warp* between issue and the matching `wait_group`
+([WGMMA ordering protocol](https://cudacourseh100.github.io/pages/lesson-7.html)). The epilogue's
+`wgmma.wait_group.sync.aligned 0` at `ptx_wgmma.rs:3669` is what makes the read legal and must stay.
+
+**Ring depth is the price, and it is measured.** With `D = 0` the consumer holds one buffer and the
+producer can be `stages - 1 = 3` ahead. With `D = 1` the consumer holds two (the one it is issuing
+against and the one whose group is still in flight) and the producer can be `stages - 2 = 2` ahead.
+**`D = 1` at 4 stages has exactly the prefetch depth of `D = 0` at 3 stages** -- and Fit C measured
+that configuration: `S(s3) = 0.7056` against `S(s4) = 0.6460`, a **9.2% penalty**.
+
+**Net, at the only tile the dispatcher selects:**
+
+```
+    S(s4, D=1)  ~  S(s3, D=0) * (1 - drain_gain)
+    at 1980 MHz:      0.7056 * (1 - 0.089) = 0.6428   vs 0.6460   ->  +0.5%
+    at 1.8288 GHz:    0.7056 * (1 - 0.014) = 0.6957   vs 0.6460   ->  -7.7%
+```
+
+**The wait-depth change is between a 0.5% gain and a 7.7% loss at 128x256 s4, and the clock reading
+decides which.** It cannot be rescued by adding a stage: `128x256 s5` needs 245 840 B against the
+232 448 B carveout and **declines**, measured and printed in the round-3 table (log line 697). This
+is a materially worse outlook than the plan's "bounded at ~2.5%" and it is why section 6 ranks the
+drain fourth.
+
+**Two components that are strictly positive and are not the wait depth:**
+
+* **4b -- hoist `wgmma.fence.sync.aligned` out of the k-loop.** CUTLASS fences around the mainloop,
+  not per k-tile. A per-iteration fence is legal but invites ptxas to treat the accumulators
+  conservatively across the loop back-edge. Zero registers, one instruction removed from the bubble,
+  and a possible second-order win in how ptxas schedules. **Free; do it regardless of the depth.**
+* **4a -- hoist the address stream out of the drain-to-issue path.** The 6 stage-base instructions,
+  the 3 full-barrier-address instructions and the 8 descriptor computations for stage `s+1` all
+  depend on `%stg` alone, never on data, and can be computed in the shadow of stage `s`'s `wgmma`
+  execution. That removes ~30 of the ~42 bubble instructions, i.e. **27-43% of the bubble = 1.5-3.7%
+  of the mainloop**, with no ring-depth cost at all. It is register-gated (see 4.4).
+
+### 4.4 Register pressure: the census is the gate, and the headroom is 2
+
+From `bench/gpu/h100/2026-08-10-ptxas-census.log:755-757`, all three shipped wgmma rows report
+
+```
+  wgmma  wgmma_nt_f16_128x256x64_s4   sm_90a  168  0  0  0  ...  384 thr  CTAs/SM(reg) 1  32p/232c
+  wgmma  wgmma_nt_bf16_128x256x64_s4  sm_90a  168  0  0  0  ...  384 thr  CTAs/SM(reg) 1  32p/232c
+  wgmma  wgmma_nt_f16_128x128x64_s6   sm_90a  168  0  0  0  ...  384 thr  CTAs/SM(reg) 1  32p/168c
+```
+
+There are **two** register budgets and they bind differently:
+
+| budget | arithmetic | headroom |
+|---|---|---|
+| ptxas static, whole CTA | `384 * regs <= 65 536` -> `regs <= 170`; census says **168** | **2 registers per thread** |
+| `setmaxnreg` runtime split | `128*32 + 256*232 = 63 488 <= 65 536` | 2 048 total = **8 per consumer thread** |
+
+The plan quotes the second ("exactly 8 regs/consumer-thread"). **The first is tighter and it is the
+one that decides whether the module launches at all**: at 171 registers per thread the driver rejects
+the launch with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`, and the family JITs from PTX so there is no
+`--maxrregcount` to lean on.
+
+| variant | extra registers | fits the 2-register headroom? |
+|---|---|---|
+| 4c, `wait_depth = 1` (one release-stage index) | 1-2 | **yes** |
+| 4b, fence hoist | 0 | **yes** |
+| 4a-bases, hoist `%rdA`/`%rdB` for stage `s+1` | 4 (two 64-bit) | **no** -- census required |
+| 4a-desc, hoist the first `j`'s descriptor pair | 4 | **no** -- census required |
+| 4a-full, hoist all eight descriptors | 16 | **no** |
+
+**Gate: run the $0.02 CPU census on every new module BEFORE the visit** (the plan's standing rule 3
+already requires it) and take only the variants that come back at `regs <= 170`, `spill_st == 0`,
+`spill_ld == 0`. A mainloop spill is worth far more than any of these gains, and C7511 is a silent
+2-4x, not a failure.
+
+### 4.5 The exact PTX shape
+
+```
+    // consumer prologue, before CLOOP:
+    mov.u32 %rel,<stages - D>;                   // the stage this iteration releases
+
+CLOOP_<name>:
+    setp.ge.u32 %p0,%kt,%ktiles;  @%p0 bra CDRAIN_<name>;
+    <full[stg] address>                           // 4a: hoisted one stage earlier, if the census allows
+CWAIT_<name>:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%phf;  @!%p1 bra CWAIT_<name>;
+    <stage bases %rdA,%rdB>                       // 4a: hoisted, if the census allows
+    setp.ne.u32 %pfirst,%kt,0;
+    wgmma.fence.sync.aligned;                     // 4b: hoisted above CLOOP
+    x4 { <descA> <descB> wgmma.mma_async ... }
+    wgmma.commit_group.sync.aligned;
+    wgmma.wait_group.sync.aligned <D>;            // 4c: D, paired with the release below
+    setp.ge.u32 %p3,%kt,<D>;                      // the first D iterations have no older group
+    @%p3 <empty[%rel] address; arrive (x cluster_ctas via mapa)>
+    add.u32 %kt,%kt,1;
+    add.u32 %stg,%stg,1;  setp.lt.u32 %p1,%stg,<stages>;  @!%p1 { mov %stg,0; xor %phf,%phf,1 }
+    add.u32 %rel,%rel,1;  setp.lt.u32 %p1,%rel,<stages>;  @!%p1 mov.u32 %rel,0;
+    bra CLOOP_<name>;
+
+CDRAIN_<name>:                                    // THE TAIL -- D groups are still in flight
+    wgmma.wait_group.sync.aligned 0;
+    repeat D times: <empty[%rel] arrive; ++%rel wrapped>     // release the last D stages
+CEND_<name>:
+    ... epilogue (its own wgmma.wait_group.sync.aligned 0 stays) ...
+```
+
+**`CDRAIN`'s release loop is the part that is invisible until persistence lands.** With `D = 1` the
+mainloop never releases the final stage. In a one-tile kernel that is harmless -- the CTA exits and
+nobody waits. **Under section 2's persistent loop it is a hang**: the producer, already running ahead
+into tile `t+1`, waits on an `empty[s]` arrival that the previous tile's consumer never made. Write
+the tail from the start, and sequence 4c *after* persistence so the hazard is exercised rather than
+latent.
+
+### 4.6 THE LAW TEXT
+
+These are the laws, in the words the implementer should put in the source. They are textual PTX laws
+(device-free, run in `cargo test`) plus the exactness gates that must be green before any timing.
+
+> **L4.1 -- the count law.** Per emitted entry, `wgmma.commit_group.sync.aligned;` occurs exactly
+> once (one group per k-stage, one k-stage body) and `wgmma.wait_group.sync.aligned` occurs exactly
+> three times: once in the mainloop at depth `cfg.wait_depth`, once in `CDRAIN` at depth 0, and once
+> in the epilogue at depth 0. The existing gate
+> `the_mainloop_is_structurally_what_the_design_says` asserts
+> `matches("wgmma.wait_group.sync.aligned 0;") == 2` today; it must be generalised, never deleted,
+> and the epilogue's `0` must stay spelled as a literal so a future `cfg.wait_depth` cannot leak into
+> it.
+
+> **L4.2 -- the depth/lag pairing law.** `cfg.wait_depth` and the released stage index come from ONE
+> function, `WgmmaCfg::release_lag() -> usize`, and the emitter reads it in both places. The
+> mainloop releases stage `(stg + stages - release_lag()) % stages` and waits to depth
+> `release_lag()`. A lag SMALLER than the depth is the silent corruption of this wave: the producer
+> refills a buffer whose `wgmma` has not retired, and the result is wrong operands with no error
+> anywhere. A lag LARGER than the depth is merely slow. One function is what makes the pair
+> unable to disagree -- the same discipline `Multicast::cluster_shape` already carries.
+
+> **L4.3 -- the ordering law (the plan's G18, restated as position rather than count).** In the
+> emitted text, every `mbarrier.arrive` that releases a stage buffer is textually preceded, within
+> the same k-stage body, by a `wgmma.wait_group.sync.aligned D`; and no `mbarrier.arrive` occurs
+> textually between a `wgmma.mma_async` and the `wgmma.commit_group.sync.aligned` that closes its
+> group. Checkable with two `find`s and an ordering comparison on the emitted string.
+
+> **L4.4 -- the ring law.** `WgmmaCfg::validate` rejects `stages < wait_depth + 2`, with a message
+> naming both numbers, in the same style as the SMEM decline (`"245840 B of shared memory ...
+> exceeds the 232448 B per-CTA ceiling"`). A consumer that holds more buffers than the ring has
+> is a deadlock, and a deadlock must be a printed decline on a CPU, not a time-box on rented
+> silicon.
+
+> **L4.5 -- the tail-release law.** The number of `mbarrier.arrive` releases in `CDRAIN` equals
+> `cfg.wait_depth`. Assert it by count. Its failure mode is a hang that only appears once the
+> persistent loop lands, which is exactly the kind of latent defect a textual law is for.
+
+> **L4.6 -- the epilogue drain law (extending G9's transport framing).** The last
+> `wgmma.wait_group.sync.aligned 0` of the entry occurs textually before the entry's first
+> **store-class instruction** -- `st.global.*`, `cp.async.bulk.tensor.*.global.shared::cta`, or
+> whatever Wave 4 introduces. State it over the store CLASS, not over `st.global.f32`, or Wave 4's
+> TMA-store epilogue deletes the law along with the instruction it names.
+
+> **L4.7 -- the fence law.** At least one `wgmma.fence.sync.aligned` precedes the first
+> `wgmma.mma_async` of the entry. If 4b hoists it, exactly one occurs and it is outside the k-loop
+> body. A fence deleted entirely is a register / async-proxy race that no exactness gate on a
+> quiescent kernel will catch.
+
+**The exactness gates, which must be green before a single timed launch:**
+
+> **E4.1 -- the K ladder at the ring boundaries.** `wgmma_hopper_bringup` stage E sweeps K across the
+> ring today. Extend it to `ktiles in {1, 2, wait_depth, wait_depth+1, stages-1, stages, stages+1,
+> 2*stages+1}` and verify `==` against the f64 reference at each. The lagged release changes
+> behaviour at exactly two places -- `ktiles <= wait_depth` (a stage is released before any
+> `wait_group` fired for it) and the ring wrap -- and both are invisible at the K values the current
+> ladder happens to use.
+
+> **E4.2 -- the bit-identity gate, which is the RIGHT gate here.** The restructuring does not
+> reassociate anything: the same four `wgmma` accumulate into the same registers in the same order.
+> Therefore assert that the `wait_depth = D` arm is **bit-identical to the `D = 0` arm**, not merely
+> within `c*sqrt(K)*eps`. A tolerance gate would pass a drain change that corrupted a stage; a
+> bit-identity gate against the D=0 twin cannot. Run it on G2's pseudorandom f16 operands as well as
+> the exact-integer ones -- the exact-integer arm is invariant under reassociation and is therefore
+> structurally weaker here, but bit-identity against a twin is strong on both.
+
+> **E4.3 -- the deadlock time-box.** Every launch of a new-depth module goes through
+> `gpu::sync_within`, which polls `cuStreamQuery` to a deadline and ends the process with a
+> diagnosis naming the config, rather than billing rented silicon to the container timeout. A wrong
+> lag hangs; the time-box is the backstop, and L4.4 is the design that makes the backstop
+> unnecessary.
+
+> **E4.4 -- the census gate (CPU, $0.02, before the visit).** For every emitted
+> `(tile, stages, wait_depth)` module: `regs <= 170`, `spill_st == 0`, `spill_ld == 0`, `stack == 0`,
+> no C7511, `.target sm_90a`, `.version 8.0`, pure ASCII. The 170 is `65536 / 384` and it is a
+> launch-failure threshold, not a performance one.
+
+### 4.7 The one-visit A/B sweep row
+
+```rust
+/// The control: today's full drain. Must reproduce its own row.
+pub const WGMMA_W1_MCB_D0: WgmmaCfg = WGMMA_W1_MCB;             // wait_depth: 0
+/// 4b alone: the fence hoisted out of the k-loop. Zero registers, zero ring cost.
+/// Predicted: small and positive, or zero. This is the free row.
+pub const WGMMA_W1_MCB_FH: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_fh",
+    key:  "wgmma_nt_f16_128x256x64_s4_mcb2_fh",
+    fence_hoisted: true, ..WGMMA_W1_MCB };
+/// 4c: wait to depth 1, release one stage back. Predicted -7.7% to +0.5% -- the SIGN is the
+/// question, and answering it also resolves which clock the device is actually running.
+pub const WGMMA_W1_MCB_D1: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_d1",
+    key:  "wgmma_nt_f16_128x256x64_s4_mcb2_d1",
+    wait_depth: 1, fence_hoisted: true, ..WGMMA_W1_MCB };
+/// The DIAGNOSTIC that makes the pair interpretable: depth 1 on the 6-stage 128x128 row, where
+/// the ring can afford it (prefetch 5 -> 4 instead of 3 -> 2). If d1 loses at s4 and WINS here,
+/// the mechanism is ring depth and the fix is a tile with a spare stage, not a smaller depth.
+pub const WGMMA_W3C_MCB_D1: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x128x64_s6_mcb2_d1",
+    key:  "wgmma_nt_f16_128x128x64_s6_mcb2_d1",
+    wait_depth: 1, fence_hoisted: true, ..WGMMA_W3C_MCB };
+```
+
+```
+  label        cfg                  why
+  mcb_d0       WGMMA_W1_MCB_D0      control; today's kernel
+  mcb_fh       WGMMA_W1_MCB_FH      4b alone. Free. Isolates the fence from the depth.
+  mcb_d1       WGMMA_W1_MCB_D1      4c. Predicted between -7.7% and +0.5%; the sign resolves the
+                                    clock ambiguity of 0.5 as a side effect
+  w3c_mcb_d1   WGMMA_W3C_MCB_D1     the diagnostic: depth 1 where the ring has a spare stage
+
+  shapes: sq8192 (longest mainloop -> the per-stage term dominates, X is only 15% of the tile),
+          sq4096, gpt_d1024_up (shortest mainloop -> the per-stage term is only 44% of the tile,
+          so a per-stage effect must SHRINK here or it is not a per-stage effect)
+```
+
+**Refusal.** Any depth arm published without its bit-identity result against the `D = 0` twin
+(E4.2). Any depth arm whose census row is not in the same round log. Any depth arm run before the
+persistent loop exists, if the tail-release of 4.5 has not been written -- the hazard is latent
+exactly until then.
+
+**Falsifiers.** (i) `mcb_d1` gains at sq8192 but loses at gpt_d1024_up -> the effect is not
+per-stage, and the ring-depth accounting of 4.3 is wrong. (ii) `mcb_fh` moves anything measurably ->
+ptxas was being conservative across the back-edge and 4a's address hoist is worth the census.
+(iii) `w3c_mcb_d1` wins where `mcb_d1` loses -> ring depth is the price, exactly as derived, and the
+lever belongs to whatever tile has a spare stage rather than to the depth itself.
