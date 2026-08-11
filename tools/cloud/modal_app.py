@@ -2602,6 +2602,61 @@ def _cross_check(raw_rows: list, crate_rows: list) -> list:
     return bad
 
 
+def _clock_snapshot(env, tag, smi="nvidia-smi"):
+    """One labelled line of the clocks an arm actually ran at.
+
+    The Wave-3 cost model's entire uncertainty band is the round-3 provenance line reading
+    `clocks: UNKNOWN` -- two arms whose SM clock differed by the ~1.4x boost range are two
+    different instruments, and nothing in the round log could say whether they did. This prints
+    the current SM/mem clock, temperature and power draw as a single `[clock] <tag>: ...` line
+    before and after every metered cargo run, so a clock shift between arms is IN the log, not
+    a guess after it. Never raises and never fails a round: a box without `nvidia-smi` (or a
+    query the driver rejects) reports itself in the same labelled line."""
+    q = "clocks.sm,clocks.mem,temperature.gpu,power.draw"
+    try:
+        out = subprocess.run([smi, f"--query-gpu={q}", "--format=csv,noheader"],
+                             capture_output=True, text=True, env=env, timeout=10)
+        line = (out.stdout or "").strip() or (out.stderr or "").strip() or "(no output)"
+    except (OSError, subprocess.SubprocessError) as e:
+        line = f"(unavailable: {e.__class__.__name__})"
+    line = f"[clock] {tag}: {line}"
+    print(line, flush=True)
+    return line
+
+
+def _clock_lock_attempt(env, smi="nvidia-smi"):
+    """Try to pin the SM clock for the container; report the verdict, never fail the round.
+
+    A pinned clock is the better instrument; a cloud container usually lacks the privilege to
+    pin it (`-lgc` needs admin rights on the device). Both outcomes are fine -- what is NOT
+    fine is not knowing which one happened. Locks at the queried max: under a power-limited
+    kernel the silicon may still downclock, which is exactly what the per-arm
+    `_clock_snapshot` lines then show. Returns True iff the lock took."""
+    try:
+        out = subprocess.run([smi, "--query-gpu=clocks.max.sm", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, env=env, timeout=10)
+        first = (out.stdout or "").strip().splitlines()
+        mx = first[0].strip() if out.returncode == 0 and first else ""
+    except (OSError, subprocess.SubprocessError):
+        mx = ""
+    if not mx.isdigit():
+        print("[clock] lock: max SM clock unqueryable; running unlocked", flush=True)
+        return False
+    try:
+        rc = subprocess.run([smi, "-lgc", f"{mx},{mx}"], capture_output=True, text=True,
+                            env=env, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        print("[clock] lock: nvidia-smi vanished mid-attempt; running unlocked", flush=True)
+        return False
+    if rc.returncode == 0:
+        print(f"[clock] lock: SM clock pinned at {mx} MHz for this container", flush=True)
+        return True
+    diag = (rc.stderr or rc.stdout or "").strip().splitlines()
+    print(f"[clock] lock: refused ({diag[0] if diag else 'no diagnostic'}); running unlocked "
+          f"-- read the per-arm [clock] lines instead", flush=True)
+    return False
+
+
 # --------------------------------------------------------------------------------------------
 # Functions
 # --------------------------------------------------------------------------------------------
@@ -3682,6 +3737,7 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
         extra = filter.split()
 
         print(f"Device suite on {WK_GPU} — GPU_REQUIRED=1, PEER_REQUIRED={'1' if peers else '0'}")
+        _clock_snapshot(env, "before device suite")
         rc1 = _run(["cargo", "test", "-p", "wukong_codegen_gpu", "--features", "gpu"] + profile
                    + ["--"] + extra, env, check=False)
         rc2 = 0
@@ -3689,6 +3745,7 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
             rc2 = _run(["cargo", "test", "-p", "wukong_driver", "--features", "gpu"] + profile
                        + ["--"] + extra, env, check=False)
 
+        _clock_snapshot(env, "after device suite")
         build_vol.commit()
         # Parenthesize: with `--no-driver`, rc2 is 0 by construction and the unparenthesized
         # conditional printed "driver: PASS" for a suite that never ran.
@@ -3723,11 +3780,14 @@ def bench(name: str = "", package: str = "wukong_codegen_gpu", peers: bool = Fal
             env["WUKONG_STRONG_PEERS"] = strong_peers
         print(f"Sweep on {WK_GPU} — PEER_REQUIRED={'1' if peers else '0'}, "
               f"STRONG_PEERS={strong_peers or '(none declared)'}")
+        _clock_lock_attempt(env)
+        _clock_snapshot(env, f"before {name or package}")
         args = ["cargo", "test", "-p", package, "--features", "gpu", "--release", "--"]
         if name:
             args.append(name)
         args += ["--ignored", "--nocapture", "--test-threads=1"]
         _run(args, env, check=False)
+        _clock_snapshot(env, f"after {name or package}")
         build_vol.commit()
 
 
