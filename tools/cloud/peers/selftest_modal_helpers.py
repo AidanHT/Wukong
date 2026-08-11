@@ -33,7 +33,7 @@ DEFAULT_APP = pathlib.Path(__file__).resolve().parent.parent / "modal_app.py"
 WANT_FN = {
     "_parse_cutlass_dtypes", "_cutlass_patterns", "_cutlass_filter_matches",
     "_cutlass_generated_kernels", "_cutlass_census", "_dir_stats", "_verify_fa_wheel",
-    "_build_jobs",
+    "_build_jobs", "_clock_snapshot", "_clock_lock_attempt",
 }
 WANT_CONST = {
     "_CUTLASS_DTYPES", "_CUTLASS_KERNELS_3X", "_CUTLASS_KERNELS_2X", "_CUTLASS_FAMILY_TOKENS",
@@ -241,6 +241,37 @@ def test_cache_stats(ns, tmp):
           files >= 3 and size > 0 and age >= 0, "%d files, %d B" % (files, size))
 
 
+def test_clock_provenance(ns, path):
+    """The clock lines are provenance, so their failure mode must be a labelled line, never an
+    exception that kills a metered round -- and the wiring must actually bracket the cargo run,
+    because a snapshot only before (or only after) cannot show a shift between arms."""
+    snap = ns["_clock_snapshot"]
+    lock = ns["_clock_lock_attempt"]
+    absent = "wk-selftest-no-such-nvidia-smi"
+
+    line = snap({}, "selftest", smi=absent)
+    check("clock: snapshot without nvidia-smi returns a labelled line, no raise",
+          isinstance(line, str) and line.startswith("[clock] selftest:")
+          and "unavailable" in line, line)
+    check("clock: lock attempt without nvidia-smi reports False, no raise",
+          lock({}, smi=absent) is False)
+
+    # Wiring: parse the real entry-point bodies and count the calls. `bench` is the timing path
+    # (lock attempt + before/after); `test` records before/after only.
+    calls = {"bench": [], "test": []}
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.FunctionDef) and node.name in calls:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+                    if sub.func.id in ("_clock_snapshot", "_clock_lock_attempt"):
+                        calls[node.name].append(sub.func.id)
+    check("clock: bench attempts the lock once and snapshots before AND after",
+          calls["bench"].count("_clock_lock_attempt") == 1
+          and calls["bench"].count("_clock_snapshot") >= 2, repr(calls["bench"]))
+    check("clock: test snapshots before AND after the device suite",
+          calls["test"].count("_clock_snapshot") >= 2, repr(calls["test"]))
+
+
 def main():
     path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_APP
     print("selftest target: %s" % path)
@@ -253,6 +284,7 @@ def main():
     test_profiler_dtypes(ns)
     test_flash_attention(ns, tmp)
     test_cache_stats(ns, tmp)
+    test_clock_provenance(ns, path)
     print("")
     print("FAILED: %s" % (", ".join(FAILS) if FAILS else "nothing"))
     return 1 if FAILS else 0
