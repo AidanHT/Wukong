@@ -938,6 +938,164 @@ impl Multicast {
     }
 }
 
+/// **How the epilogue transports an accumulator pair to global memory.** Wave-2 lever 1.
+///
+/// # The mechanism, from round 1's own PTX dump
+///
+/// The D fragment puts register group `j` at columns `8j + 2*tg` and `8j + 2*tg + 1` — **adjacent**
+/// f32 lanes of one row. The scalar epilogue therefore issues `nacc` predicated `st.global.f32`
+/// (128 of them at `BN = 256`), each of which requests one 4-byte word of a 32-byte sector: 8192
+/// half-empty sector requests per CTA where 4096 full ones would do. Fusing the pair at `+0/+4`
+/// into one `st.global.v2.f32` halves the request count and fills the sector.
+///
+/// # Why the scalar arm stays emittable, and why the store COUNT does not change
+///
+/// It is an A/B: [`EpilogueStore::Scalar`] is the byte-identical text rounds 1-3 measured, so the
+/// v2 row's delta is one fact. And v2 does not *delete* instructions — it re-shapes them. The two
+/// predicates of a pair are nested (`col+1 < N` implies `col < N`), so the three reachable cases are
+/// "neither lane", "the first lane only" and "both lanes". v2 spends one `st.global.v2.f32` on the
+/// last case and one scalar `st.global.f32` on the middle one: **two store instructions per pair,
+/// exactly as the scalar arm has**, of which only one ever retires and, at an even `N`, always the
+/// vector one. The win is transactions, not instruction count, and saying so here is what keeps a
+/// later reader from "simplifying" the odd-N fallback away.
+///
+/// # The alignment precondition is a RUNTIME one, and it is the sharp edge
+///
+/// `st.global.v2.f32` needs an 8-byte-aligned address. The address is
+/// `C + 4*(row*N + ctan + 2*(lane&3)) + 32j`, in which every term but `row*N` is even by
+/// construction — so the pair is 8-byte aligned **iff `N` is even** (and `C` itself is, which every
+/// driver allocation is by a wide margin). An odd `N` is not a wrong number, it is
+/// `CUDA_ERROR_MISALIGNED_ADDRESS` on the first store, and on this platform a misaligned access
+/// makes the context stickily errored (crate LANDMINE 6). The launcher asserts it; see
+/// [`EpilogueStore::requires_even_n`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpilogueStore {
+    /// One predicated `st.global.f32` per accumulator. Rounds 1-3's measured text.
+    Scalar,
+    /// One `st.global.v2.f32` per adjacent accumulator pair, plus the odd-`N` scalar tail.
+    V2,
+    /// **A DIAGNOSTIC ARM THAT STORES NOTHING.** Never shippable — see
+    /// [`EpilogueStore::is_diagnostic_only`].
+    ///
+    /// Wave 2's K-sweep needs the epilogue's cost separated from the prologue's on **one** kernel
+    /// rather than inferred from two shapes. This arm is that: the identical mainloop with the
+    /// stores removed, so `(elided at shape S) - (real at shape S)` is the epilogue's whole cost.
+    ///
+    /// **The accumulators must stay live or the measurement is a lie.** With no consumer, `ptxas`
+    /// would dead-code the `wgmma` issues, the operand descriptors and eventually the whole
+    /// mainloop, and the arm would time an empty kernel at 40x and look like a triumph. So the arm
+    /// folds every accumulator into one register with `add.f32` and emits **one** store of it under
+    /// a predicate that is false for every launch a `u32` `K` can express (`K > 0x7fffffff`) —
+    /// unknowable to the assembler, so nothing upstream may be eliminated, and unreachable on
+    /// hardware, so `C` is never written. The residual cost is `nacc - 1` FADDs against a mainloop
+    /// of thousands of `wgmma`.
+    ElidedDiagnostic,
+}
+
+impl EpilogueStore {
+    /// The entry-name / module-key suffix. Empty for [`EpilogueStore::Scalar`], so every row rounds
+    /// 1-3 measured keeps the exact name those logs carry.
+    pub const fn key_tag(self) -> &'static str {
+        match self {
+            EpilogueStore::Scalar => "",
+            EpilogueStore::V2 => "_v2",
+            EpilogueStore::ElidedDiagnostic => "_nostore",
+        }
+    }
+    /// Does this transport need an even `N` to stay aligned? Only the vector one.
+    pub const fn requires_even_n(self) -> bool {
+        matches!(self, EpilogueStore::V2)
+    }
+    /// **Is this arm a measurement instrument rather than a kernel?** `true` means it computes a
+    /// GEMM and then throws the answer away, so no correctness gate can pass over it and no shipped
+    /// row may carry it. [`WgmmaCfg::validate`] does not reject it — the sweep must be able to
+    /// generate it — but `the_elided_epilogue_can_never_be_shipped` refuses it in
+    /// [`WGMMA_VARIANTS`], and `gpu::gemm_nt_wgmma` refuses to launch it at all.
+    pub const fn is_diagnostic_only(self) -> bool {
+        matches!(self, EpilogueStore::ElidedDiagnostic)
+    }
+    /// One line for the round log.
+    pub const fn label(self) -> &'static str {
+        match self {
+            EpilogueStore::Scalar => "scalar st.global.f32 (rounds 1-3)",
+            EpilogueStore::V2 => "fused st.global.v2.f32 + odd-N scalar tail",
+            EpilogueStore::ElidedDiagnostic => "ELIDED (diagnostic: accumulators folded, C unwritten)",
+        }
+    }
+}
+
+/// **L2 cache-residency hints.** Wave-2 lever 2, and an explicitly *advisory* one: the hardware may
+/// ignore every bit of it, so **a null result here is a publishable result** (wave plan, standing
+/// rule 5). The bench prints the hint state on every row for exactly that reason.
+///
+/// # What each operand wants, and why they want opposite things
+///
+/// `C` is written once and never read by this kernel. Every byte of it that lands in L2 evicts a
+/// byte of `A`/`B` that a *neighbouring* CTA is about to read, which is why the gpt_d1024 pair —
+/// identical FLOP, identical 402.7 MB of L2 request, 3.80 vs 7.00 TB/s achieved — is the shape this
+/// lever was derived from. `.L2::evict_first` on the C stores says "this line is the first thing to
+/// throw away".
+///
+/// The operands want the opposite: `A` and `B` tiles are read by every CTA in a row/column of the
+/// grid, so they should be the LAST thing evicted.
+///
+/// # Yes, a TMA load can carry the hint (the ISA question this lever had to answer first)
+///
+/// `cp.async.bulk.tensor` takes an optional `.level::cache_hint` qualifier and a trailing 64-bit
+/// cache-policy operand, after `ctaMask` when a `.multicast::cluster` is present. So the operand
+/// half of this lever is expressible in the TMA path and does **not** have to be dropped — which is
+/// the finding [`L2Hint::StoresEvictFirstOperandsEvictLast`] exists to test. The policy value comes
+/// from `createpolicy.fractional`, whose fraction this family pins at `1.0` (the whole access
+/// stream, no second priority) because there is nothing here to tune it against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum L2Hint {
+    /// No `createpolicy`, no `.L2::cache_hint`. Rounds 1-3's byte-identical text.
+    None,
+    /// `.L2::evict_first` on the `C` stores only.
+    StoresEvictFirst,
+    /// `.L2::evict_first` on the `C` stores **and** `.L2::evict_last` on both TMA operand loads.
+    StoresEvictFirstOperandsEvictLast,
+}
+
+impl L2Hint {
+    /// The entry-name / module-key suffix. Empty for [`L2Hint::None`], and injective: `_ef` is not a
+    /// prefix-collision with `_efol` under an exact-name lookup, and
+    /// `the_entry_name_is_derivable_from_the_geometry` proves the whole name is injective anyway.
+    pub const fn key_tag(self) -> &'static str {
+        match self {
+            L2Hint::None => "",
+            L2Hint::StoresEvictFirst => "_ef",
+            L2Hint::StoresEvictFirstOperandsEvictLast => "_efol",
+        }
+    }
+    /// Does the epilogue carry a cache policy?
+    pub const fn hints_stores(self) -> bool {
+        matches!(
+            self,
+            L2Hint::StoresEvictFirst | L2Hint::StoresEvictFirstOperandsEvictLast
+        )
+    }
+    /// Do the producer's TMA copies carry a cache policy?
+    pub const fn hints_operands(self) -> bool {
+        matches!(self, L2Hint::StoresEvictFirstOperandsEvictLast)
+    }
+    /// One line for the round log.
+    pub const fn label(self) -> &'static str {
+        match self {
+            L2Hint::None => "none",
+            L2Hint::StoresEvictFirst => "C stores .L2::evict_first",
+            L2Hint::StoresEvictFirstOperandsEvictLast => {
+                "C stores .L2::evict_first + TMA operands .L2::evict_last"
+            }
+        }
+    }
+}
+
+/// The fraction [`L2Hint`] hands `createpolicy.fractional`: the whole access stream at the primary
+/// priority, with no secondary. A tunable fraction would be a third axis with no mechanism behind
+/// it, and this lever is advisory enough already.
+pub const L2_POLICY_FRACTION: &str = "1.0";
+
 /// **The portable ceiling on CTAs per cluster.** The CUDA programming guide guarantees a maximum
 /// cluster size of 8 on every part that supports clusters; anything larger is "non-portable" and
 /// needs `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED)` plus a device
@@ -1000,6 +1158,13 @@ pub struct WgmmaCfg {
     pub layout: SmemLayout,
     pub schedule: Schedule,
     pub multicast: Multicast,
+    /// **How the epilogue transports the accumulators** (wave-2 lever 1). Part of the geometry, so
+    /// it is part of [`WgmmaCfg::derived_name`] and therefore of the module-cache key.
+    pub epilogue: EpilogueStore,
+    /// **The L2 residency hints** (wave-2 lever 2). Also part of the derived name: two rows that
+    /// differ only in a cache policy are two different modules, and sharing a key would run one of
+    /// them twice under both headings.
+    pub l2_hint: L2Hint,
 }
 
 impl WgmmaCfg {
@@ -1229,14 +1394,34 @@ impl WgmmaCfg {
     /// table row device-free.
     pub fn derived_name(&self) -> String {
         format!(
-            "wgmma_nt_{}_{}x{}x{}_s{}{}",
+            "wgmma_nt_{}_{}x{}x{}_s{}{}{}{}",
             self.dtype.token(),
             self.bm,
             self.bn,
             self.bk,
             self.stages,
-            self.multicast.key_tag()
+            self.multicast.key_tag(),
+            self.epilogue.key_tag(),
+            self.l2_hint.key_tag()
         )
+    }
+
+    /// **Does this schedule need `C` zeroed before the kernel runs?** (guard G7.)
+    ///
+    /// Today: **no, for every row this family can express**, and the reason is structural rather
+    /// than incidental. The first `wgmma` of the K loop takes `scale-d = 0`, which *overwrites* the
+    /// accumulators instead of accumulating into them, and the epilogue stores every accumulator
+    /// unconditionally (subject only to the `row < M && col < N` bound). Nothing in the kernel ever
+    /// reads `C`. So a memset would be pure cost, and charging one to the timed region would make
+    /// this family look 4-8% slower than it is against a peer that does not need one either.
+    ///
+    /// It is a **function rather than a comment** because the moment a schedule *does* need it —
+    /// split-K, Stream-K, or a `beta*C` residual epilogue — the memset becomes part of what the
+    /// kernel costs, and the timed region must contain it or the round publishes a number no user
+    /// can reproduce. `gpu::TimedRegion::for_cfg` reads this and nothing else, so the day a row
+    /// answers `true` the bench charges it automatically instead of waiting for someone to notice.
+    pub const fn requires_zeroed_c(&self) -> bool {
+        false
     }
 
     /// Every structural precondition, in one place. `Ok` means [`wgmma_module`] will emit.
@@ -1396,6 +1581,21 @@ impl WgmmaCfg {
         // built.
         self.tensor_map_a(4096, 4096).validate()?;
         self.tensor_map_b(4096, 4096).validate()?;
+        // **The epilogue transport's own precondition (guard G9).** A vector store fuses the pair of
+        // accumulators the D fragment puts at columns `8j + 2*tg` and `+1`, so the shape must
+        // actually have that pair: an odd `accum_regs` (impossible on the ISA menu, which is every
+        // multiple of 8 from 8 to 256, so `N/2` is always a multiple of 4) would leave one register
+        // unpaired and the transport law would silently store `nacc - 1` of them. Stated as a check
+        // rather than assumed, because the menu is data and this is the one property the fusion
+        // depends on.
+        if self.epilogue.requires_even_n() && !shape.accum_regs().is_multiple_of(2) {
+            return Err(format!(
+                "{UNSUPPORTED}: {}: a v2 epilogue fuses adjacent accumulator PAIRS, but this shape \
+                 holds {} accumulator registers, which is odd",
+                self.name,
+                shape.accum_regs()
+            ));
+        }
         // **GUARD G3, and deliberately LAST**: every geometric decline above should name the
         // geometry that is wrong, not the name that follows from it, so a caller probing a shape
         // gets the shape's answer. A row that passes everything else and is still mis-named is the
@@ -1406,10 +1606,11 @@ impl WgmmaCfg {
             return Err(format!(
                 "{UNSUPPORTED}: this config's name/key ({:?} / {:?}) is not derivable from its own \
                  geometry, which spells {want:?} ({}x{}x{} s{} {:?}, multicast {:?} = cluster \
-                 {:?} along grid {}). Gpu::function and Gpu::raw_function_dyn cache on the key ALONE \
-                 and never re-examine the PTX on a hit, so a row that reuses another row's key \
-                 silently runs the OTHER kernel and bills the round for a configuration that never \
-                 launched -- with this row's stage count, SMEM line and label printed beside it.",
+                 {:?} along grid {}, epilogue {:?}, l2 hint {:?}). Gpu::function and \
+                 Gpu::raw_function_dyn cache on the key ALONE and never re-examine the PTX on a \
+                 hit, so a row that reuses another row's key silently runs the OTHER kernel and \
+                 bills the round for a configuration that never launched -- with this row's stage \
+                 count, SMEM line and label printed beside it.",
                 self.name,
                 self.key,
                 self.bm,
@@ -1419,7 +1620,9 @@ impl WgmmaCfg {
                 self.dtype,
                 self.multicast,
                 self.multicast.cluster_shape(),
-                self.multicast.grid_axis()
+                self.multicast.grid_axis(),
+                self.epilogue,
+                self.l2_hint
             ));
         }
         Ok(shape)
@@ -1649,6 +1852,8 @@ pub const WGMMA_W1: WgmmaCfg = WgmmaCfg {
     layout: SHIPPED_LAYOUT,
     schedule: Schedule::Cooperative,
     multicast: Multicast::None,
+    epilogue: EpilogueStore::Scalar,
+    l2_hint: L2Hint::None,
 };
 
 /// **The descriptor reading every shipped row carries**, in one place so the sweep's "ACTION" line is
@@ -1773,6 +1978,52 @@ pub const WGMMA_VARIANTS: &[WgmmaCfg] = &[
     WGMMA_W1_MCB,
 ];
 
+// --- what the W1 family SHIPS, after round 3 ------------------------------------------------------
+
+/// **The measured crossover between the clustered and un-clustered W1 rows**, in output elements
+/// (`M * N`), from `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log`.
+///
+/// Round 3's published table, `% of cuBLAS f16 (f32 out)`, at a fixed 128x256x64 s4 tile:
+///
+/// | shape | `M*N` | no cluster | 1x2x1 on B |
+/// |---|---|---|---|
+/// | `sq2048` | 4.19e6 | **67.2%** | 62.4% |
+/// | `sq4096` | 16.8e6 | 67.3% | **73.5%** |
+/// | `sq8192` | 67.1e6 | 55.2% | **82.2%** |
+///
+/// The sign flips between `sq2048` and `sq4096`, so the threshold is anywhere in `(4.19e6, 16.8e6)`.
+/// `8.0e6` is the round number inside that interval and is deliberately *not* derived from a model:
+/// three points cannot locate a crossover more finely than the interval that brackets it, and
+/// pretending otherwise would be the kind of precision this repo's own measurement rules forbid.
+pub const W1_CLUSTER_MIN_OUTPUT_ELEMS: usize = 8_000_000;
+
+/// **The W1 family's shipped configuration for an `M x N` output.**
+///
+/// [`WGMMA_W1_MCB`] -- the `1x2x1` cluster multicasting B, round 3's best row at both `sq4096`
+/// (73.5%, +6.2 points over the un-clustered baseline) and `sq8192` (82.2%, +27.0) -- for anything
+/// at or above [`W1_CLUSTER_MIN_OUTPUT_ELEMS`]; the un-clustered [`WGMMA_W1`] below it, because
+/// `sq2048` is the one measured shape where the cluster **loses** (62.4% against 67.2%).
+///
+/// # This is a REGIME RULE, not a dispatcher, and the distinction is deliberate
+///
+/// It is a static two-way split on one measured sign change, awaiting wave 3's real per-shape
+/// dispatcher (which will also choose the tile -- D1 puts 128x128 at the `sq2048` end, and this
+/// function cannot express that because it only ever returns a 128x256 row). Two properties keep it
+/// honest in the meantime: the threshold sits inside the interval the measurement actually brackets
+/// (see [`W1_CLUSTER_MIN_OUTPUT_ELEMS`]), and **both rows stay emittable and stay in the sweep**, so
+/// the next round re-measures the split rather than inheriting it.
+///
+/// `K` is deliberately not an input. Nothing in round 3 varied it independently, so a rule that read
+/// it would be a guess wearing a measurement's clothes; wave 2's K-sweep ([`WGMMA_KSWEEP_GRID`]) is
+/// what will give it one.
+pub fn wgmma_w1_for(m: usize, n: usize) -> &'static WgmmaCfg {
+    if m.saturating_mul(n) >= W1_CLUSTER_MIN_OUTPUT_ELEMS {
+        &WGMMA_W1_MCB
+    } else {
+        &WGMMA_W1
+    }
+}
+
 /// Look up a variant by entry name; panics loudly rather than mis-dispatching.
 pub fn wgmma_variant(name: &str) -> &'static WgmmaCfg {
     WGMMA_VARIANTS
@@ -1895,6 +2146,64 @@ pub const WGMMA_W3C_MCB: WgmmaCfg = WgmmaCfg {
     key: "wgmma_nt_f16_128x128x64_s6_mcb2",
     multicast: Multicast::ClusterB,
     ..WGMMA_W3C
+};
+
+// --- wave 2: the two free levers, as rows off the round-3 winner ----------------------------------
+//
+// Every one of these is `..WGMMA_W1_MCB` -- round 3's best row -- with EXACTLY ONE field changed, so
+// the A/B has one fact in it. The baseline of all four is `w1_s4_mcb2`, which is already in the
+// table above and is measured in the same round at the same shapes.
+
+/// The round-3 winner with the **fused `st.global.v2.f32` epilogue** (wave-2 lever 1).
+pub const WGMMA_W1_MCB_V2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2",
+    epilogue: EpilogueStore::V2,
+    ..WGMMA_W1_MCB
+};
+
+/// The round-3 winner with `.L2::evict_first` on the C stores (wave-2 lever 2, half of it).
+pub const WGMMA_W1_MCB_EF: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_ef",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_ef",
+    l2_hint: L2Hint::StoresEvictFirst,
+    ..WGMMA_W1_MCB
+};
+
+/// The round-3 winner with the hint on **both** ends: `evict_first` on C, `evict_last` on the TMA
+/// operand loads. The answer to "can a TMA load carry a cache hint at all" is yes, and this row is
+/// the arm that says whether it is worth anything.
+pub const WGMMA_W1_MCB_EFOL: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_efol",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_efol",
+    l2_hint: L2Hint::StoresEvictFirstOperandsEvictLast,
+    ..WGMMA_W1_MCB
+};
+
+/// **Both levers at once.** Not a substitute for the two single-fact rows -- it is the row that says
+/// whether they compose, which two separate deltas cannot answer.
+pub const WGMMA_W1_MCB_V2_EF: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef",
+    epilogue: EpilogueStore::V2,
+    l2_hint: L2Hint::StoresEvictFirst,
+    ..WGMMA_W1_MCB
+};
+
+/// **THE EPILOGUE-ELIDED DIAGNOSTIC.** Computes the GEMM and writes no `C`.
+///
+/// It exists so the K-sweep can split the kernel's cost into "everything before the epilogue" and
+/// "the epilogue" on ONE kernel at ONE shape, instead of inferring it from two shapes that differ in
+/// more than one thing. `(this row) - (w1_s4_mcb2)` at a fixed shape is the epilogue's whole cost.
+///
+/// It can never be mistaken for a real kernel, by three independent mechanisms: its name carries
+/// `_nostore`, [`EpilogueStore::is_diagnostic_only`] is `true` and every correctness gate reads it,
+/// and `gpu::gemm_nt_wgmma` -- the only host-in/host-out entry point -- refuses to launch it.
+pub const WGMMA_W1_MCB_NOSTORE: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_nostore",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_nostore",
+    epilogue: EpilogueStore::ElidedDiagnostic,
+    ..WGMMA_W1_MCB
 };
 
 /// **The Act-2 configuration sweep, as data -- round 3: THE CLUSTER AXIS.**
@@ -2028,7 +2337,119 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
         why: "The square tile with the A cluster -- the other half of that control pair, and round \
               2's 56.9% at sq4096 against the un-clustered 57.5%",
     },
+    // --- wave 2's two free levers, all four off the SAME baseline (w1_s4_mcb2) --------------------
+    SweepRow {
+        label: "w1_mcb_v2",
+        cfg: &WGMMA_W1_MCB_V2,
+        why: "LEVER 1 (v2 stores). Round 1's PTX dump shows 128 scalar predicated st.global.f32 per \
+              consumer thread whose pairs are ADJACENT f32 lanes of one row: 8192 half-empty \
+              32-byte sector requests per CTA where 4096 full ones would do. This row fuses each \
+              pair into st.global.v2.f32 and changes nothing else, so the delta against w1_s4_mcb2 \
+              is the transport",
+    },
+    SweepRow {
+        label: "w1_mcb_ef",
+        cfg: &WGMMA_W1_MCB_EF,
+        why: "LEVER 2a (C stores .L2::evict_first). C is written once and never read, so every C \
+              line resident in L2 evicts an operand line a neighbouring CTA is about to want. An \
+              ADVISORY hint: the hardware may ignore it, and a null result is a publishable result. \
+              The gpt_d1024 pair is the shape it was derived from (identical FLOP and identical \
+              402.7 MB of L2 request at 3.80 vs 7.00 TB/s achieved); this round measures it on the \
+              three square shapes for comparability with rounds 1-3",
+    },
+    SweepRow {
+        label: "w1_mcb_efol",
+        cfg: &WGMMA_W1_MCB_EFOL,
+        why: "LEVER 2b (C evict_first AND TMA operands evict_last). The ISA question this row had \
+              to answer first is whether a bulk-tensor copy can carry a cache policy at all: it \
+              can -- cp.async.bulk.tensor takes .L2::cache_hint plus a trailing policy operand, \
+              after ctaMask when a multicast is present. So the operand half of the lever is \
+              expressible and is measured rather than assumed away",
+    },
+    SweepRow {
+        label: "w1_mcb_v2ef",
+        cfg: &WGMMA_W1_MCB_V2_EF,
+        why: "BOTH levers. Two single-fact deltas cannot say whether the levers compose -- a v2 \
+              store that halves the request count changes what the eviction hint is even about -- \
+              so composition is its own row rather than an addition performed by a reader",
+    },
+    SweepRow {
+        label: "w1_mcb_nostore",
+        cfg: &WGMMA_W1_MCB_NOSTORE,
+        why: "THE EPILOGUE-ELIDED DIAGNOSTIC, not a kernel: it computes the GEMM and writes no C, \
+              so (this row) - (w1_s4_mcb2) at a fixed shape IS the epilogue's cost, measured on ONE \
+              kernel instead of inferred from two shapes. The accumulators are folded into one \
+              register and stored under a predicate no u32 K can satisfy, so nothing upstream can \
+              be dead-coded and the arm cannot be mistaken for a fast kernel",
+    },
 ];
+
+/// **The K sweep: one tile, one output shape, K as the only axis.** Wave 2's third measurement.
+///
+/// Every other grid in this file varies `M`, `N` and `K` together, so "the cost that does not scale
+/// with K" (the prologue: module load, grid launch, the ring's first fill) and "the cost that scales
+/// with `M*N` alone" (the epilogue) are folded into one number at every point. Fixing `M = N = 2048`
+/// and sweeping `K` separates them by construction: the epilogue's cost is **constant** down this
+/// column, the mainloop's is **linear** in `K`, and the intercept of a straight line through the
+/// points is prologue + epilogue. Running the elided row ([`WGMMA_W1_MCB_NOSTORE`]) down the same
+/// column then splits that intercept in two.
+///
+/// `M = N = 2048` rather than 4096 because the whole column has to fit in one visit's budget and
+/// because 2048-square is where the un-clustered row still wins -- so the K sweep is also the first
+/// evidence about **why** it wins there, which the three-shape table cannot give.
+pub const WGMMA_KSWEEP_GRID: &[GemmPoint] = &[
+    GemmPoint {
+        label: "k512_mn2048",
+        m: 2048,
+        n: 2048,
+        k: 512,
+        why: "K sweep, shortest: 4 K tiles at BK=64, one ring pass plus one. The prologue and the \
+              epilogue are almost the whole kernel here",
+    },
+    GemmPoint {
+        label: "k1024_mn2048",
+        m: 2048,
+        n: 2048,
+        k: 1024,
+        why: "K sweep: 16 K tiles. Twice the mainloop, the same epilogue, the same launch",
+    },
+    GemmPoint {
+        label: "k2048_mn2048",
+        m: 2048,
+        n: 2048,
+        k: 2048,
+        why: "K sweep, the anchor: this is sq2048 exactly, so the column is tied to the row rounds \
+              1-3 already measured",
+    },
+    GemmPoint {
+        label: "k4096_mn2048",
+        m: 2048,
+        n: 2048,
+        k: 4096,
+        why: "K sweep, longest: 64 K tiles, where the mainloop dominates and the intercept is what \
+              is left over",
+    },
+];
+
+/// The rows the K sweep runs down [`WGMMA_KSWEEP_GRID`]: the shipped winner and its elided twin.
+///
+/// Two, not fourteen. The K sweep's product is a *slope and an intercept per row*, and the only
+/// pair that decomposes the intercept is (real, elided) at an otherwise identical configuration.
+pub const WGMMA_KSWEEP_ROWS: &[&str] = &["w1_s4_mcb2", "w1_mcb_nostore"];
+
+/// [`WGMMA_KSWEEP_ROWS`], resolved against [`WGMMA_SWEEP_GRID`]. Panics loudly on a label no row
+/// carries -- a K sweep that silently ran one arm would produce a slope with no intercept.
+pub fn wgmma_ksweep_rows() -> Vec<&'static SweepRow> {
+    WGMMA_KSWEEP_ROWS
+        .iter()
+        .map(|l| {
+            WGMMA_SWEEP_GRID
+                .iter()
+                .find(|r| r.label == *l)
+                .unwrap_or_else(|| panic!("WGMMA_KSWEEP_ROWS names {l:?}, which is not a sweep row"))
+        })
+        .collect()
+}
 
 /// The sweep rows that generate, in table order -- what the round will actually launch.
 pub fn wgmma_sweep_measurable() -> Vec<&'static SweepRow> {
@@ -2087,6 +2508,32 @@ pub const WGMMA_SWEEP_INVOCATION: &str =
     "WUKONG_GPU_REQUIRED=1 WUKONG_PEER_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu \
      --release -- --ignored --nocapture --test-threads=1 wgmma_config_sweep";
 
+/// **The CPU-priced `ptxas` census that must precede every H100 visit** (wave plan, standing rule 3).
+///
+/// No GPU is attached — `ptxas` compiles *for* an architecture and does not need one — so this is
+/// the ~$0.02 half of a round, and its job is to make sure a rented H100 is never the first
+/// assembler to see a module. It enumerates [`wgmma_device_free_modules`], which is the SAME corpus
+/// the ASCII rule, the `.target` floor and the `.version` law scan, so a module cannot be inside
+/// three laws and outside the fourth (guard G14).
+///
+/// What it answers that no test on this machine can: register allocation per entry, spill
+/// stores/loads (a `C7511` "stack frame" note is a **silent 2-4x**, not a failure), and whether the
+/// text assembles at `sm_90a` at all.
+pub const WGMMA_CENSUS_INVOCATION: &str =
+    "modal run tools/cloud/modal_app.py::ptxas --filter wgmma --tag act2-w2";
+
+/// **The H100 visit wave 2 pays for**, in order, in one container, in one log (standing rule 1).
+///
+/// Bring-up E/F/G run on the **new** guard shape before the perf round, so the visit cannot end
+/// having measured a kernel whose correctness floor it never re-established. The sweep then carries
+/// rounds 1-3's twelve rows unchanged (for column comparability) plus wave 2's five new ones, and
+/// the K sweep runs last because it is the only part whose value survives a truncated visit.
+pub const WGMMA_W2_H100_INVOCATION: &str = "\
+    modal run tools/cloud/modal_app.py::test  --filter wgmma_cluster_multicast_is_exact --peers\n\
+    modal run tools/cloud/modal_app.py::bench --name wgmma_hopper_bringup --peers\n\
+    modal run tools/cloud/modal_app.py::bench --name wgmma_config_sweep --peers --release\n\
+    modal run tools/cloud/modal_app.py::bench --name wgmma_k_sweep --peers --release";
+
 /// **Every distinct configuration this family can emit a module for**, shipped rows first, then the
 /// sweep-only rows that generate -- deduplicated by module key.
 ///
@@ -2116,16 +2563,41 @@ pub fn wgmma_all_emittable() -> Vec<&'static WgmmaCfg> {
 /// whether 3e-3 is noise.
 pub const BRINGUP_EXACT_LIMIT: f64 = 16_777_216.0;
 
-/// The radix of the bring-up positional code at K = `k`: the largest power of two `w` in `2..=8` for
-/// which `k * w^6 <= 2^24`.
+/// **The largest value [`ramp_code`] can produce at radix `w`**: `1 + (w-1)(1 + w + w^2)`.
 ///
-/// Each operand value is at most `w^3` (three base-`w` digits), so the dot product of `k` terms is
-/// bounded by `k * w^6`. Wide K therefore gets a narrower code — the alternative is a reference that
-/// is only *approximately* right, which is the one thing a bring-up round cannot afford.
-pub fn ramp_radix(k: usize) -> usize {
+/// Each digit runs `0..w-1` at weights `1`, `w`, `w^2`, and the code is offset by one so no lane is
+/// zero. Stated as a function because it is the quantity **two different limits** are checked
+/// against — the input type's exact-integer ceiling (this is a `const fn` so a test can evaluate it
+/// at compile time) and, squared and multiplied by K, the accumulator's.
+pub const fn ramp_max_value(w: usize) -> usize {
+    1 + (w - 1) * (1 + w + w * w)
+}
+
+/// The radix of the bring-up positional code at K = `k` **for input type `dt`**: the largest power
+/// of two `w` in `2..=8` satisfying *both* exactness bounds.
+///
+/// # Two bounds, not one, and the second is the one that bites (guard G15)
+///
+/// 1. **The accumulator's.** Each operand value is at most `w^3`, so the dot product of `k` terms is
+///    bounded by `k * w^6`, which must stay under [`BRINGUP_EXACT_LIMIT`] (f32 holds every integer
+///    to `2^24`). This is the bound the function has always enforced.
+/// 2. **The INPUT type's**, which it did not. `1 + (w-1)(1 + w + w^2)` must be exactly
+///    representable in the operand type, and the two 16-bit types are eight bits apart:
+///    [`WgmmaDtype::exact_integer_limit`] is **2048** for f16 and **256** for bf16. At `w = 8` the
+///    ramp's largest value is `1 + 7*73 = 512` — fine in f16, and **silently rounded in bf16**,
+///    which turns an `==` verdict into an unexplained near-miss that looks like a descriptor bug.
+///    `w = 4` gives 64 and clears both.
+///
+/// Enforcing it *inside* the ladder rather than at the call site is the point: `bringup_operands`
+/// asserts the property afterwards, but an assert fires after a round has been paid for, and a
+/// ladder that never proposes an illegal radix cannot fire it at all.
+pub fn ramp_radix(k: usize, dt: WgmmaDtype) -> usize {
+    let limit = dt.exact_integer_limit() as usize;
     [8usize, 4, 2]
         .into_iter()
-        .find(|w| (k as f64) * (w.pow(6) as f64) <= BRINGUP_EXACT_LIMIT)
+        .find(|w| {
+            (k as f64) * (w.pow(6) as f64) <= BRINGUP_EXACT_LIMIT && ramp_max_value(*w) <= limit
+        })
         .unwrap_or(2)
 }
 
@@ -2160,8 +2632,8 @@ const fn ramp_code(w: usize, d0: usize, d1: usize, d2: usize) -> f32 {
 /// hence the tensor cores multiply exactly what the reference multiplies. [`ramp_radix`] keeps the
 /// accumulation inside [`BRINGUP_EXACT_LIMIT`], so the comparison is `==` rather than a tolerance —
 /// both properties are asserted device-free by `the_bringup_operands_are_exact_in_f16_and_f32`.
-pub fn bringup_operands(m: usize, n: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
-    let w = ramp_radix(k);
+pub fn bringup_operands(m: usize, n: usize, k: usize, dt: WgmmaDtype) -> (Vec<f32>, Vec<f32>) {
+    let w = ramp_radix(k, dt);
     let mut a = Vec::with_capacity(m * k);
     for row in 0..m {
         for col in 0..k {
@@ -2174,6 +2646,199 @@ pub fn bringup_operands(m: usize, n: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
             b.push(ramp_code(w, 3 * (row % 8) + (col % 8), col / 8, row / 8));
         }
     }
+    (a, b)
+}
+
+// --- the pre-timing guard shape (guard G1) --------------------------------------------------------
+
+/// **The shape every pre-timing correctness arm runs at**, derived from the configuration under
+/// test rather than written down.
+///
+/// # What the old guard could not see
+///
+/// Rounds 1-3 gated their timing at `(M, N, K) = (BM, BN, BK * stages)`: **one CTA**, a grid of
+/// `1x1`, exactly one pass through the ring with no wrap, and every dimension an exact multiple of
+/// the tile. That shape is blind by construction to a whole class of defect — anything about the
+/// CTA-to-tile map, the producer's ring wrap, the epilogue's `row < M && col < N` predicates, or
+/// TMA's zero fill — and every one of those is about to move: wave 2 rewrites the epilogue's
+/// transport, wave 3 rewrites the raster and adds a persistent tile loop.
+///
+/// # The four properties, and what each one makes reachable
+///
+/// | property | value | the defect it makes reachable |
+/// |---|---|---|
+/// | grid at least `3x3` CTAs | `ceil(M/BM) = ceil(N/BN) = 3` | a CTA-to-tile map that is right for one CTA, and a cluster's pad CTA on **either** axis (3 is odd, so both the `2x1x1` and the `1x2x1` arm round their own axis up to 4) |
+/// | `ktiles == stages + 1` | one producer wrap | the stage/parity reset at the ring's wrap, and the `empty`-barrier handshake that only exists after it |
+/// | ragged in M **and** N **and** K | none divides its tile | TMA's zero fill on all three axes at once, and both epilogue predicates |
+/// | an ODD tile count | `3 * 3 = 9` tiles | a persistent tile loop's partial last wave (G19): 9 is odd, so **no** grid divides it evenly and the remainder wave — where a per-tile accumulator/stage/parity reset is either done or forgotten — always exists |
+///
+/// # Cost, which is why it is derived and not just made big
+///
+/// The host f64 reference is `M*N*K` fused multiply-adds and it runs in a **debug** build, since the
+/// gates that use it are not `#[ignore]`d. At W1 (`128x256x64`, 4 stages) this shape is
+/// `320 x 640 x 288` = 59e6 MACs, comfortably under the ~0.3 s the wave plan budgeted for its
+/// suggested `384x768x320`, and it is *ragged*, which that suggestion is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardShape {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+}
+
+impl GuardShape {
+    /// M tiles x N tiles — the CTA grid before any cluster rounding.
+    pub fn tiles(&self, cfg: &WgmmaCfg) -> (usize, usize) {
+        (self.m.div_ceil(cfg.bm), self.n.div_ceil(cfg.bn))
+    }
+    /// Staged K tiles: `ceil(K / BK)`, which the kernel computes as a shift.
+    pub fn ktiles(&self, cfg: &WgmmaCfg) -> usize {
+        self.k.div_ceil(cfg.bk)
+    }
+    /// Host reference cost, in multiply-adds — printable, so a round log says what it paid.
+    pub fn macs(&self) -> usize {
+        self.m * self.n * self.k
+    }
+    /// `MxKxN`, in the order this crate's launchers take them.
+    pub fn dims(&self) -> String {
+        format!("{}x{}x{}", self.m, self.k, self.n)
+    }
+}
+
+/// Tiles along each of M and N in [`guard_shape`]. Three, because it is the smallest count that is
+/// both `>= 3` (so a middle tile exists, with a real neighbour on each side) and **odd** (so every
+/// cluster rounds its own axis up and produces a pad CTA, and no persistent grid divides the tile
+/// count evenly).
+pub const GUARD_TILES_PER_AXIS: usize = 3;
+
+/// **The pre-timing guard shape for one configuration** — see [`GuardShape`] for what each term is
+/// for.
+///
+/// * `M = 2*BM + BM/2` — three M tiles, the last one half full.
+/// * `N = 2*BN + BN/2` — three N tiles, the last one half full.
+/// * `K = BK*(stages+1) - BK/2` — `stages + 1` K tiles (one producer wrap), the last one half full.
+///
+/// The halves are `BM/2`, `BN/2`, `BK/2` rather than a literal `+7`/`-5` for one reason: they keep
+/// the ragged remainder a multiple of 8, which keeps `N` **even**, which is the alignment
+/// precondition of the v2 epilogue ([`EpilogueStore::requires_even_n`]). A guard shape that could
+/// not run the arm it is guarding would be worse than none. The tile-boundary rag is still fully
+/// exercised — TMA zero-fills and both epilogue predicates fire — because half a tile is as ragged
+/// as one element for every mechanism in this kernel.
+pub fn guard_shape(cfg: &WgmmaCfg) -> GuardShape {
+    GuardShape {
+        m: (GUARD_TILES_PER_AXIS - 1) * cfg.bm + cfg.bm / 2,
+        n: (GUARD_TILES_PER_AXIS - 1) * cfg.bn + cfg.bn / 2,
+        k: cfg.bk * (cfg.stages + 1) - cfg.bk / 2,
+    }
+}
+
+// --- the pseudorandom arm (guard G2) --------------------------------------------------------------
+
+/// **The seed the pseudorandom correctness arm uses**, fixed and printed by every round that runs it.
+///
+/// A round whose operands cannot be reconstructed from its own log is a round whose failure cannot
+/// be reproduced, and a *changing* seed would make a flaky arm indistinguishable from a real one.
+pub const RANDOM_ARM_SEED: u64 = 0x5745_5F41_5245_5F32; // "WE_ARE_2"
+
+/// **The tolerance constant in `c * sqrt(K) * eps`**, the crate's standard bound for a reassociated
+/// f32 dot product (crate hard rule 7).
+///
+/// The bound this multiplies is `sqrt(K) * eps * sum|a_i * b_i|` — a **derived** forward-error bound
+/// (the classic one is `gamma_K * sum|a_i b_i|` with `gamma_K ~ K*eps` for a sequential sum;
+/// `sqrt(K)` is the blocked/tree form the tensor cores actually realise), not a number widened until
+/// a measurement fitted inside it. `8.0` is the slack over that derivation, and it covers the one
+/// thing the derivation does not name: the ISA does not specify the width of the `wgmma` adder tree.
+pub const RANDOM_ARM_C: f64 = 8.0;
+
+/// The per-lane bound coefficient for a `K`-term reassociated f32 dot product: `c * sqrt(K) * eps`.
+///
+/// **Multiply it by that lane's own `sum|a_i * b_i|`**, which the caller's f64 reference computes
+/// alongside the reference itself. Using the lane's own magnitude sum rather than a global constant
+/// is what keeps the bound honest at a shape with cancellation, where `|reference|` can be orders of
+/// magnitude below the terms that produced it and a *relative* bound would be meaningless.
+pub fn random_tolerance(k: usize) -> f64 {
+    RANDOM_ARM_C * (k as f64).sqrt() * (f32::EPSILON as f64)
+}
+
+/// The exponent range [`random_operands`] draws from: magnitudes in `[2^-RANDOM_ARM_BINADES, 1)`.
+///
+/// Six binades, and the number is load-bearing rather than aesthetic. **A narrow range would make
+/// this arm a second exact-integer arm and defeat its entire purpose.** With every operand at one
+/// exponent the products are integer multiples of a single ulp, and a sum of `K` of them stays under
+/// `2^24` and is therefore *exact* — invariant under reassociation, which is precisely the blindness
+/// [`bringup_operands`] already has. Spreading the operands over six binades spreads the products
+/// over twelve, so the 22-bit product significands cannot all fit one f32 accumulator and the sum
+/// genuinely rounds. Then, and only then, does the summation order show up in the answer.
+pub const RANDOM_ARM_BINADES: i32 = 6;
+
+/// A SplitMix64 step. Deliberately a private four-line copy of `diff::Rng`'s (identical constants,
+/// checked by `the_random_arm_matches_the_crates_own_splitmix`) rather than a call into it: `diff`
+/// is behind the `gpu` feature and this module is not, and keeping the operand generator un-gated is
+/// what lets its exactness laws run in a plain, toolchain-free `cargo test`.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// **Pseudorandom operands for the second pre-timing arm — the one that can see a scheduler change.**
+///
+/// # Why the exact-integer arm is not enough, and never was (guard G2)
+///
+/// [`bringup_operands`] is a *permutation diagnostic*: small integers whose dot product stays under
+/// `2^24`, so f32 holds every partial sum exactly and the verdict is `==`. That is exactly what a
+/// descriptor bring-up needs — and it means the arm is **invariant under any reassociation of the
+/// sum**. Every scheduler change waves 3-5 will make (grouped raster, a persistent tile loop,
+/// split-K, DeepSeek two-level accumulation, an 8-bit datapath) changes the order and nothing else,
+/// so the exact arm is structurally blind to all of them: it passes, bit for bit, over a kernel
+/// whose K loop has been reordered, re-blocked or re-associated in any way at all, as long as the
+/// *set* of products is right.
+///
+/// This arm is the one that sees them, and it is a *tolerance* arm by construction — the whole point
+/// is that the answer depends on the order, so `==` is the wrong verdict and
+/// `c*sqrt(K)*eps*sum|a*b|` is the right one.
+///
+/// # Every value is exact in the input type BY CONSTRUCTION, not by rounding
+///
+/// The generator builds each value out of its own fields — a sign, an exponent in
+/// `[-RANDOM_ARM_BINADES, -1]`, and a significand of exactly the input type's explicit mantissa
+/// width — so `f32 -> f16 -> f32` is the identity on every element and the f64 reference is computed
+/// over precisely the numbers the tensor cores multiply. That is what makes the tolerance a bound on
+/// the *summation order alone*. Rounding an arbitrary f32 into the type would work too, and would
+/// drag `half` (a `gpu`-gated dependency) into an un-gated module for no gain.
+///
+/// No value is subnormal, infinite or NaN: the exponent range sits well inside both types' normal
+/// range, which matters because a denormal can change a tensor core's throughput and this arm runs
+/// immediately before a timed region.
+pub fn random_operands(
+    m: usize,
+    n: usize,
+    k: usize,
+    dt: WgmmaDtype,
+    seed: u64,
+) -> (Vec<f32>, Vec<f32>) {
+    // Explicit mantissa bits of the input type: f16 has 10, bf16 has 7. One authority, so a value
+    // this builds cannot need rounding to land in the type it was built for.
+    let mant_bits = match dt {
+        WgmmaDtype::F16 => 10u32,
+        WgmmaDtype::Bf16 => 7u32,
+    };
+    let scale = (1u32 << mant_bits) as f32;
+    let draw = |st: &mut u64| -> f32 {
+        let r = splitmix64(st);
+        let sign = if r & 1 == 0 { 1.0f32 } else { -1.0f32 };
+        let mant = ((r >> 8) as u32) & ((1u32 << mant_bits) - 1);
+        // Exponent in -1 ..= -RANDOM_ARM_BINADES, so the magnitude lands in [2^-binades, 1).
+        let e = -1 - ((r >> 40) as i32).rem_euclid(RANDOM_ARM_BINADES);
+        // Exact in f32: a (1 + mant/2^p) significand of at most 11 bits scaled by a power of two.
+        sign * (1.0 + (mant as f32) / scale) * (2.0f32).powi(e)
+    };
+    // Two independent streams, so A and B cannot accidentally share structure -- an operand pair
+    // that is the same sequence twice makes C symmetric and hides a transposed read.
+    let (mut sa, mut sb) = (seed, seed ^ 0xD1B5_4A32_D192_ED03);
+    let a = (0..m * k).map(|_| draw(&mut sa)).collect();
+    let b = (0..n * k).map(|_| draw(&mut sb)).collect();
     (a, b)
 }
 
@@ -3136,6 +3801,22 @@ pub const WGMMA_DEVICE_VALIDATION: &[&str] = &[
      B-multicast vs A-multicast at a fixed tile and depth, the depth axis at all three settings so \
      they are not confounded, the square W3c tile as the control where both axes have identical \
      I_cta, and the two over-budget depths kept as printed declines.",
+    "10. WAVE 2: THE CORRECTNESS FLOOR, THEN THE TWO FREE LEVERS. Rounds 1-3 gated their timing at \
+     ONE CTA, ONE ring pass and ZERO ragged edges -- structurally blind to the CTA-to-tile map, the \
+     ring wrap, both epilogue predicates and TMA's zero fill, all of which waves 2-5 are about to \
+     rewrite. `guard_shape` replaces it with a 3x3 grid, ktiles = stages+1, ragged M AND N AND K, \
+     and an ODD tile count so a future persistent tile loop's partial last wave is reachable. A \
+     SECOND arm (`random_operands`) runs pseudorandom f16 against an independent f64 reference at \
+     c*sqrt(K)*eps*sum|a*b|, because the exact-integer arm is invariant under ANY reassociation and \
+     is therefore blind to every scheduler change coming; it is run TWICE and demanded \
+     bit-identical, which only a random arm can test. Then the levers, each one fact off round 3's \
+     winner: `st.global.v2.f32` fusing the adjacent accumulator pair (8192 half-empty sector \
+     requests per CTA -> 4096 full ones), `.L2::evict_first` on the C stores, `.L2::evict_last` on \
+     the TMA operand loads (the ISA DOES allow a cache policy on cp.async.bulk.tensor), and the two \
+     composed. A null result on an advisory hint is a publishable result; a gain inside the \
+     CONTENDER's own dispersion is not, which is why bench_instrument now measures that spread as \
+     well as the peer's. The K sweep at fixed M=N=2048 plus the epilogue-elided diagnostic row \
+     splits prologue from epilogue on ONE kernel.",
 ];
 
 // --- Act 2: the performance grid --------------------------------------------------------------------
@@ -3333,6 +4014,21 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     let b_slice = cfg.b_slice_bytes();
     let b_box_rows = cfg.b_box_rows();
     let cmask = multicast_cta_mask(ctas);
+    // --- the two wave-2 levers ---------------------------------------------------------------------
+    // Both are conditional for the same reason the cluster is: at the defaults this generator must
+    // emit the byte-identical text rounds 1-3 measured, so those rows stay the A/B's control rather
+    // than becoming a second thing that also changed.
+    let v2 = matches!(cfg.epilogue, EpilogueStore::V2);
+    let elided = cfg.epilogue.is_diagnostic_only();
+    let hint_stores = cfg.l2_hint.hints_stores();
+    let hint_operands = cfg.l2_hint.hints_operands();
+    // The store's qualifier run, in the ISA's own order:
+    // `.ss` `.cop` `.level::eviction_priority` `.level::cache_hint` `.vec` `.type`. Built once so the
+    // scalar store, the vector store and the odd-N tail cannot spell it three ways.
+    let st_hint = if hint_stores { ".L2::cache_hint" } else { "" };
+    let st_pol = if hint_stores { ",%rdPolC" } else { "" };
+    let tma_hint = if hint_operands { ".L2::cache_hint" } else { "" };
+    let tma_pol = if hint_operands { ",%rdPolAB" } else { "" };
 
     // The two descriptor constants: everything but the start address, which the kernel folds in at
     // run time. Both come from `desc_fields`, the single authority the sweep candidates read too,
@@ -3411,6 +4107,23 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         // it offsets B is exactly the kind of thing a reader debugging a hang cannot afford. The A
         // arm's text is left byte-identical to the one the 2026-08-10 round proved on hardware.
         s += "    .reg .b64 %rdOffB;\n";
+    }
+    if v2 {
+        // The odd-`N` tail's predicates. `%q0`/`%q2` say "the first lane of this pair is in range",
+        // `%q1`/`%q3` say "both are"; the vector store takes the latter and these take
+        // `first && !both`, which is reachable only on the last pair of an odd `N`.
+        s += "    .reg .pred %ptail,%qs0,%qs1;\n";
+    }
+    if elided {
+        // The false-at-run-time predicate that keeps the accumulators live without ever retiring a
+        // store. See `EpilogueStore::ElidedDiagnostic`.
+        s += "    .reg .pred %pdead;\n";
+    }
+    if hint_stores {
+        s += "    .reg .b64 %rdPolC;\n";
+    }
+    if hint_operands {
+        s += "    .reg .b64 %rdPolAB;\n";
     }
     s += &format!("    .reg .f32 %acc<{nacc}>;\n\n");
 
@@ -3492,6 +4205,15 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         // which makes the mask rank-relative and therefore identical at both cluster orientations.
         s += &format!("    mov.u16 %cmask,{cmask};\n");
     }
+    if hint_operands {
+        // Loop-invariant, so it is created once outside the K loop. `.L2::evict_last` is the
+        // operands' half of the hint: an A/B tile is read by every CTA along one axis of the grid,
+        // so it is the last thing that should be thrown out of L2 -- the exact opposite of what the
+        // epilogue asks for its own C lines.
+        s += &format!(
+            "    createpolicy.fractional.L2::evict_last.b64 %rdPolAB,{L2_POLICY_FRACTION};\n"
+        );
+    }
     s += "    mov.u32 %kt,0;\n    mov.u32 %stg,0;\n";
     // The empty-phase parity starts at 1 so the first `stages` acquisitions pass immediately: a
     // freshly initialised barrier is in phase parity 0, and `try_wait.parity 1` completes at once
@@ -3541,19 +4263,23 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         // `a_box_rows` tall (WgmmaCfg::tensor_map_a), so the slices tile the CTA's M range exactly.
         s +=
             &format!("    mul.lo.s32 %tmp2,%crank,{a_box_rows};\n    add.u32 %tmp2,%tmp2,%ctam;\n");
-        // A, multicast to the whole cluster. `ctaMask` is the last operand; the hardware writes the
-        // slice into every destination CTA at the same CTA-relative offset as `%rdA` AND signals the
-        // barrier at the same CTA-relative offset as `%rdBarF` in each of them -- which is why every
-        // CTA declares the FULL `stage_tx_bytes` and none of them divides it.
-        s += "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes\
-              .multicast::cluster [%rdA],[%rdTmA,{%tmp,%tmp2}],[%rdBarF],%cmask;\n";
+        // A, multicast to the whole cluster. `ctaMask` is the last operand before the optional cache
+        // policy; the hardware writes the slice into every destination CTA at the same CTA-relative
+        // offset as `%rdA` AND signals the barrier at the same CTA-relative offset as `%rdBarF` in
+        // each of them -- which is why every CTA declares the FULL `stage_tx_bytes` and none of them
+        // divides it.
+        s += &format!(
+            "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes\
+             .multicast::cluster{tma_hint} [%rdA],[%rdTmA,{{%tmp,%tmp2}}],[%rdBarF],%cmask{tma_pol};\n"
+        );
     } else {
         // A is this CTA's own tile: under `ClusterB` the cluster's CTAs hold DIFFERENT M tiles, so
         // they share no A bytes, and under `Multicast::None` there is no cluster at all. Byte for
         // byte the copy the un-clustered row has always issued.
-        s +=
-            "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes \
-              [%rdA],[%rdTmA,{%tmp,%ctam}],[%rdBarF];\n";
+        s += &format!(
+            "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes\
+             {tma_hint} [%rdA],[%rdTmA,{{%tmp,%ctam}}],[%rdBarF]{tma_pol};\n"
+        );
     }
     if mc_b {
         // B's global row is its N coordinate, which every CTA of a `1x2x1` cluster SHARES (they
@@ -3563,13 +4289,16 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         // own accumulators are all out of range.
         s +=
             &format!("    mul.lo.s32 %tmp2,%crank,{b_box_rows};\n    add.u32 %tmp2,%tmp2,%ctan;\n");
-        s += "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes\
-              .multicast::cluster [%rdB],[%rdTmB,{%tmp,%tmp2}],[%rdBarF],%cmask;\n";
+        s += &format!(
+            "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes\
+             .multicast::cluster{tma_hint} [%rdB],[%rdTmB,{{%tmp,%tmp2}}],[%rdBarF],%cmask{tma_pol};\n"
+        );
     } else {
         // B is this CTA's own tile: under `ClusterA` the cluster's CTAs hold DIFFERENT N halves.
-        s +=
-            "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes \
-              [%rdB],[%rdTmB,{%tmp,%ctan}],[%rdBarF];\n";
+        s += &format!(
+            "    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes\
+             {tma_hint} [%rdB],[%rdTmB,{{%tmp,%ctan}}],[%rdBarF]{tma_pol};\n"
+        );
     }
     s += "    add.u32 %kt,%kt,1;\n    add.u32 %stg,%stg,1;\n";
     s += &format!(
@@ -3667,32 +4396,88 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     // will not invent a value it never computed.)
     s += &format!("    setp.eq.u32 %p0,%ktiles,0;\n    @%p0 bra EXIT_{name};\n");
     s += "    wgmma.wait_group.sync.aligned 0;\n";
-    s += "    and.b32 %tmp,%lin,127;\n    shr.u32 %wrp,%tmp,5;\n    shl.b32 %wrp,%wrp,4;\n";
-    s += "    shr.u32 %tmp2,%lane,2;\n    add.u32 %row0,%wrp,%tmp2;\n";
-    s += "    mul.lo.s32 %tmp,%cwg,64;\n    add.u32 %row0,%row0,%tmp;\n";
-    s += "    add.u32 %row0,%row0,%ctam;\n    add.u32 %row1,%row0,8;\n";
-    s += "    and.b32 %colb,%lane,3;\n    shl.b32 %colb,%colb,1;\n    add.u32 %colb,%colb,%ctan;\n";
-    s += "    setp.lt.u32 %pd0,%row0,%M;\n    setp.lt.u32 %pd1,%row1,%M;\n";
-    s += "    mad.lo.s32 %tmp,%row0,%N,%colb;\n    mul.wide.u32 %rdT,%tmp,4;\n    add.s64 %rdA,%rdC,%rdT;\n";
-    s += "    mad.lo.s32 %tmp,%row1,%N,%colb;\n    mul.wide.u32 %rdT,%tmp,4;\n    add.s64 %rdB,%rdC,%rdT;\n";
-    for j in 0..bn / 8 {
-        let byte = j * 32;
-        s += &format!("    add.u32 %col,%colb,{};\n", j * 8);
-        s += "    setp.lt.u32 %p0,%col,%N;\n    add.u32 %col1,%col,1;\n    setp.lt.u32 %p1,%col1,%N;\n";
-        s += "    and.pred %q0,%pd0,%p0;\n    and.pred %q1,%pd0,%p1;\n";
-        s += "    and.pred %q2,%pd1,%p0;\n    and.pred %q3,%pd1,%p1;\n";
-        s += &format!("    @%q0 st.global.f32 [%rdA+{byte}],%acc{};\n", 4 * j);
-        s += &format!(
-            "    @%q1 st.global.f32 [%rdA+{}],%acc{};\n",
-            byte + 4,
-            4 * j + 1
-        );
-        s += &format!("    @%q2 st.global.f32 [%rdB+{byte}],%acc{};\n", 4 * j + 2);
-        s += &format!(
-            "    @%q3 st.global.f32 [%rdB+{}],%acc{};\n",
-            byte + 4,
-            4 * j + 3
-        );
+    if elided {
+        // **The diagnostic arm.** Fold every accumulator into `%acc0` and store it once under a
+        // predicate no launch can satisfy: `K` is a `.u32` parameter and the launcher asserts
+        // `M*N <= u32::MAX` and a real `K`, so `K > 0x7fffffff` is false on hardware and unknowable
+        // to `ptxas`. Everything upstream -- the descriptors, the wgmma issues, the whole mainloop --
+        // therefore stays live, and `C` is never written. The kernel computes the GEMM and throws it
+        // away, which is exactly what "the epilogue's cost, on one kernel" means.
+        for i in 1..nacc {
+            s += &format!("    add.f32 %acc0,%acc0,%acc{i};\n");
+        }
+        s += "    setp.gt.u32 %pdead,%K,2147483647;\n";
+        s += &format!("    @%pdead st.global{st_hint}.f32 [%rdC],%acc0{st_pol};\n");
+    } else {
+        s += "    and.b32 %tmp,%lin,127;\n    shr.u32 %wrp,%tmp,5;\n    shl.b32 %wrp,%wrp,4;\n";
+        s += "    shr.u32 %tmp2,%lane,2;\n    add.u32 %row0,%wrp,%tmp2;\n";
+        s += "    mul.lo.s32 %tmp,%cwg,64;\n    add.u32 %row0,%row0,%tmp;\n";
+        s += "    add.u32 %row0,%row0,%ctam;\n    add.u32 %row1,%row0,8;\n";
+        s += "    and.b32 %colb,%lane,3;\n    shl.b32 %colb,%colb,1;\n    add.u32 %colb,%colb,%ctan;\n";
+        s += "    setp.lt.u32 %pd0,%row0,%M;\n    setp.lt.u32 %pd1,%row1,%M;\n";
+        s += "    mad.lo.s32 %tmp,%row0,%N,%colb;\n    mul.wide.u32 %rdT,%tmp,4;\n    add.s64 %rdA,%rdC,%rdT;\n";
+        s += "    mad.lo.s32 %tmp,%row1,%N,%colb;\n    mul.wide.u32 %rdT,%tmp,4;\n    add.s64 %rdB,%rdC,%rdT;\n";
+        if hint_stores {
+            // The epilogue's half of the hint, created once outside the store loop: a C line is
+            // written and never read, so every one of them that stays resident evicts an operand
+            // line a neighbouring CTA is about to want.
+            s += &format!(
+                "    createpolicy.fractional.L2::evict_first.b64 %rdPolC,{L2_POLICY_FRACTION};\n"
+            );
+        }
+        for j in 0..bn / 8 {
+            let byte = j * 32;
+            s += &format!("    add.u32 %col,%colb,{};\n", j * 8);
+            s += "    setp.lt.u32 %p0,%col,%N;\n    add.u32 %col1,%col,1;\n    setp.lt.u32 %p1,%col1,%N;\n";
+            s += "    and.pred %q0,%pd0,%p0;\n    and.pred %q1,%pd0,%p1;\n";
+            s += "    and.pred %q2,%pd1,%p0;\n    and.pred %q3,%pd1,%p1;\n";
+            if v2 {
+                // `%q1` (both lanes of row0 in range) drives the vector store; `%q0 && !%p1` is the
+                // one-lane tail, reachable only on the last pair of an ODD N. `%q1` implies `%q0`,
+                // so the two are mutually exclusive and every accumulator is still transported
+                // exactly once -- which is the property `the_epilogue_transports_every_accumulator_
+                // exactly_once_and_bounded` reads out of the text, whatever the store's spelling.
+                s += "    not.pred %ptail,%p1;\n";
+                s += "    and.pred %qs0,%q0,%ptail;\n    and.pred %qs1,%q2,%ptail;\n";
+                s += &format!(
+                    "    @%q1 st.global{st_hint}.v2.f32 [%rdA+{byte}],{{%acc{},%acc{}}}{st_pol};\n",
+                    4 * j,
+                    4 * j + 1
+                );
+                s += &format!(
+                    "    @%qs0 st.global{st_hint}.f32 [%rdA+{byte}],%acc{}{st_pol};\n",
+                    4 * j
+                );
+                s += &format!(
+                    "    @%q3 st.global{st_hint}.v2.f32 [%rdB+{byte}],{{%acc{},%acc{}}}{st_pol};\n",
+                    4 * j + 2,
+                    4 * j + 3
+                );
+                s += &format!(
+                    "    @%qs1 st.global{st_hint}.f32 [%rdB+{byte}],%acc{}{st_pol};\n",
+                    4 * j + 2
+                );
+            } else {
+                s += &format!(
+                    "    @%q0 st.global{st_hint}.f32 [%rdA+{byte}],%acc{}{st_pol};\n",
+                    4 * j
+                );
+                s += &format!(
+                    "    @%q1 st.global{st_hint}.f32 [%rdA+{}],%acc{}{st_pol};\n",
+                    byte + 4,
+                    4 * j + 1
+                );
+                s += &format!(
+                    "    @%q2 st.global{st_hint}.f32 [%rdB+{byte}],%acc{}{st_pol};\n",
+                    4 * j + 2
+                );
+                s += &format!(
+                    "    @%q3 st.global{st_hint}.f32 [%rdB+{}],%acc{}{st_pol};\n",
+                    byte + 4,
+                    4 * j + 3
+                );
+            }
+        }
     }
     if clustered {
         // **No CTA may retire while a peer can still touch its shared memory.** A peer's producer
@@ -4408,7 +5193,14 @@ mod tests {
         // rows at s5 and s6 are deliberately NOT here: they decline in `WgmmaCfg::validate` on the
         // carveout -- no cluster changes the ring's size, whichever operand it multicasts -- and the
         // sweep prints the arithmetic rather than emitting a module nothing can launch.
-        assert_eq!(mods.len(), 15);
+        //
+        // 15 -> 20 with wave 2's five lever rows, all five one fact off the round-3 winner: the v2
+        // epilogue, the C-store evict-first hint, that hint plus evict-last on the TMA operands, the
+        // two composed, and the epilogue-elided diagnostic. Every one is a distinct
+        // `WgmmaCfg::derived_name` -- the WHOLE geometry, now including the transport and the cache
+        // policy -- and every one is text a rented H100 will be handed, which is exactly why the
+        // CPU-priced census must assemble them first.
+        assert_eq!(mods.len(), 20);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -4513,19 +5305,30 @@ mod tests {
                 } else {
                     ("%rdB", "%rdTmB", "%rdA", "%rdTmA", "%ctam")
                 };
+                // The optional `.L2::cache_hint` qualifier sits between `.multicast::cluster` and
+                // the operand list, and its policy register follows the ctaMask. Both are spelled
+                // from the config so the law reads the same fact the generator wrote, rather than
+                // pinning one arm's text and going blind on the other.
+                let (hq, hp) = if c.l2_hint.hints_operands() {
+                    (".L2::cache_hint", ",%rdPolAB")
+                } else {
+                    ("", "")
+                };
                 assert_eq!(
                     ptx.matches(&format!(
-                        ".multicast::cluster [{mc_reg}],[{mc_map},{{%tmp,%tmp2}}],[%rdBarF],%cmask;"
+                        ".multicast::cluster{hq} [{mc_reg}],[{mc_map},{{%tmp,%tmp2}}],[%rdBarF],\
+                         %cmask{hp};"
                     ))
                     .count(),
                     1,
-                    "{}: {} must be the multicast copy, with the ctaMask as its last operand",
+                    "{}: {} must be the multicast copy, with the ctaMask as its last operand before \
+                     any cache policy",
                     c.name,
                     c.multicast.operand()
                 );
                 assert!(
                     ptx.contains(&format!(
-                        "bytes [{own_reg}],[{own_map},{{%tmp,{own_coord}}}],[%rdBarF];"
+                        "bytes{hq} [{own_reg}],[{own_map},{{%tmp,{own_coord}}}],[%rdBarF]{hp};"
                     )),
                     "{}: the per-CTA operand must NOT be multicast -- cluster peers hold different \
                      halves of it",
@@ -4705,25 +5508,109 @@ mod tests {
         }
     }
 
-    /// The epilogue writes every accumulator exactly once, at the address the ISA's D-fragment layout
-    /// puts it, with both a row and a column bound on each store.
+    /// **The epilogue is a TRANSPORT LAW over store-class source operands (guard G9).**
+    ///
+    /// # Why it is no longer a count of `st.global.f32`
+    ///
+    /// It used to assert `ptx.matches("st.global.f32").count() == nacc` and `],%acc{i};` once each.
+    /// Both spellings are properties of *one* transport, and wave 2 adds a second
+    /// ([`EpilogueStore::V2`], which fuses a pair into `st.global.v2.f32` and moves the accumulator
+    /// into a `{a,b}` vector operand) while wave 4 adds a third (an SMEM-staged
+    /// `cp.async.bulk.tensor` store, which emits **zero** `st.global` of any kind). A law written
+    /// over one spelling does not merely stop covering the others — it gets *deleted* along with
+    /// both real properties, by whoever adds the transport that fails it.
+    ///
+    /// So the law is restated over what actually matters, independent of spelling: parse every
+    /// **store-class instruction**, take its **source operand list**, and demand that
+    ///
+    /// 1. every accumulator is a source of **at least one** store-class instruction (nothing
+    ///    dropped), and where it is a source of more than one, those stores are **provably
+    ///    disjoint** — some predicate register appears positively in one chain and negated in the
+    ///    other, so at most one can retire (nothing published twice);
+    /// 2. every store-class instruction is predicated, and its predicate is a conjunction reaching
+    ///    both a row bound (`%pd0`/`%pd1` from `%M`) and a column bound (`%p0`/`%p1` from `%N`).
+    ///
+    /// Property 1 is stated as "at least once, and disjointly" rather than "exactly once" because
+    /// the v2 transport genuinely needs two *textual* stores per pair — the vector one and the
+    /// odd-`N` scalar tail — of which exactly one retires. "Exactly one textual store" would have
+    /// been a law about the scalar arm wearing the clothes of a law about transport, and it would
+    /// have been deleted by the first arm that needed a tail.
+    ///
+    /// Both survive a `v2`, a `v4`, a cache-hint qualifier and a TMA store, and neither survives an
+    /// accumulator that stopped being written.
     #[test]
-    fn the_epilogue_stores_every_accumulator_exactly_once_and_bounded() {
+    fn the_epilogue_transports_every_accumulator_exactly_once_and_bounded() {
         for c in WGMMA_VARIANTS {
             let ptx = wgmma_module(c, &license()).unwrap();
             let nacc = c.shape().unwrap().accum_regs();
-            assert_eq!(ptx.matches("st.global.f32").count(), nacc);
+            let stores = store_class_instructions(&ptx);
+            assert!(
+                !stores.is_empty(),
+                "{}: a shipped row must transport its accumulators somewhere",
+                c.name
+            );
             for i in 0..nacc {
-                assert_eq!(
-                    ptx.matches(&format!("],%acc{i};")).count(),
-                    1,
-                    "{}: %acc{i} must be stored exactly once",
+                let carriers: Vec<&StoreOp> = stores
+                    .iter()
+                    .filter(|s| s.sources.iter().any(|o| o == &format!("%acc{i}")))
+                    .collect();
+                assert!(
+                    !carriers.is_empty(),
+                    "{}: %acc{i} is computed and never transported -- it reaches no store-class \
+                     instruction under any spelling",
                     c.name
                 );
+                for (x, y) in carriers
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(a, s)| carriers[a + 1..].iter().map(move |t| (s, t)))
+                {
+                    assert!(
+                        predicates_are_disjoint(&ptx, &x.pred, &y.pred),
+                        "{}: %acc{i} reaches two store-class instructions whose predicates are not \
+                         provably disjoint, so it can be published twice:\n  {}\n  {}",
+                        c.name,
+                        x.text,
+                        y.text
+                    );
+                }
             }
-            // Every store is predicated, and every predicate is a row bound AND a column bound.
-            assert_eq!(ptx.matches("@%q0 st.global.f32").count(), nacc / 4);
-            assert_eq!(ptx.matches("and.pred %q0,%pd0,%p0;").count(), nacc / 4);
+            // No store-class instruction may name anything that is not an accumulator: a store of a
+            // scratch register is a store of whatever the last computation left there.
+            for s in &stores {
+                assert!(
+                    s.sources.iter().all(|o| o.starts_with("%acc")),
+                    "{}: store `{}` transports a non-accumulator operand {:?}",
+                    c.name,
+                    s.text,
+                    s.sources
+                );
+                assert!(
+                    !s.pred.is_empty(),
+                    "{}: store `{}` is unpredicated -- the ragged edge is not a special case here, \
+                     it is the predicate",
+                    c.name,
+                    s.text
+                );
+            }
+            // The predicate chain: each store's guard is a conjunction that reaches a row bound and
+            // a column bound. Followed through the `and.pred` definitions rather than pattern-matched
+            // on one register name, so a renamed intermediate cannot silently drop a bound.
+            for s in &stores {
+                let roots = predicate_roots(&ptx, &s.pred);
+                assert!(
+                    roots.iter().any(|r| r == "%pd0" || r == "%pd1"),
+                    "{}: store `{}` has no ROW bound in its predicate (roots {roots:?})",
+                    c.name,
+                    s.text
+                );
+                assert!(
+                    roots.iter().any(|r| r == "%p0" || r == "%p1"),
+                    "{}: store `{}` has no COLUMN bound in its predicate (roots {roots:?})",
+                    c.name,
+                    s.text
+                );
+            }
             assert!(ptx.contains("setp.lt.u32 %pd0,%row0,%M;"));
             assert!(ptx.contains("setp.lt.u32 %p0,%col,%N;"));
             // K == 0 issues no wgmma at all, so the accumulators are never written and the epilogue
@@ -4734,6 +5621,109 @@ mod tests {
                 c.name
             );
         }
+    }
+
+    /// One store-class instruction, parsed out of the emitted text.
+    struct StoreOp {
+        /// The guarding predicate register, without the `@` (empty if unpredicated).
+        pred: String,
+        /// The register source operands, in order.
+        sources: Vec<String>,
+        text: String,
+    }
+
+    /// **Every store-class instruction in a module**, whatever its spelling: `st.global.f32`,
+    /// `st.global.v2.f32`, a `.L2::cache_hint` variant, or (wave 4) a bulk-tensor store.
+    ///
+    /// The source list is everything after the address operand `[...]`, with `{}` vector braces
+    /// stripped and any trailing cache-policy register dropped — a policy is not a transported
+    /// value, and counting it as one would make the law reject the hint arms.
+    fn store_class_instructions(ptx: &str) -> Vec<StoreOp> {
+        let mut out = Vec::new();
+        for line in ptx.lines() {
+            let t = line.trim();
+            let (pred, body) = match t.strip_prefix('@') {
+                Some(rest) => match rest.split_once(' ') {
+                    Some((p, b)) => (p.to_string(), b.trim()),
+                    None => continue,
+                },
+                None => (String::new(), t),
+            };
+            let is_store = body.starts_with("st.") || body.contains(".shared::cluster.tile");
+            if !is_store {
+                continue;
+            }
+            // Sources are what follows the closing bracket of the address operand.
+            let Some(close) = body.find(']') else { continue };
+            let tail = body[close + 1..].trim_start_matches(',').trim_end_matches(';');
+            let sources: Vec<String> = tail
+                .trim_matches(|ch| ch == '{' || ch == '}' || ch == ' ')
+                .split(',')
+                .map(|o| o.trim().trim_matches(|ch| ch == '{' || ch == '}').to_string())
+                .filter(|o| !o.is_empty() && !o.starts_with("%rdPol"))
+                .collect();
+            out.push(StoreOp {
+                pred,
+                sources,
+                text: t.to_string(),
+            });
+        }
+        out
+    }
+
+    /// The `setp`-defined predicates a predicate register transitively depends on, **each with the
+    /// sign it enters under**, by following `and.pred` / `or.pred` / `not.pred` definitions backwards
+    /// through the text. `(root, true)` means the root is required *set*; `(root, false)` means it is
+    /// required *clear*.
+    fn predicate_literals(ptx: &str, pred: &str) -> Vec<(String, bool)> {
+        let mut roots = Vec::new();
+        let mut work = vec![(pred.to_string(), true)];
+        let mut seen: Vec<(String, bool)> = Vec::new();
+        while let Some((p, pos)) = work.pop() {
+            if seen.contains(&(p.clone(), pos)) {
+                continue;
+            }
+            seen.push((p.clone(), pos));
+            let mut defined = false;
+            for line in ptx.lines() {
+                let t = line.trim().trim_end_matches(';');
+                for (op, flips) in [("and.pred ", false), ("or.pred ", false), ("not.pred ", true)] {
+                    if let Some(args) = t.strip_prefix(op) {
+                        let mut it = args.split(',').map(str::trim);
+                        if it.next() == Some(p.as_str()) {
+                            defined = true;
+                            for src in it {
+                                work.push((src.to_string(), if flips { !pos } else { pos }));
+                            }
+                        }
+                    }
+                }
+            }
+            if !defined {
+                roots.push((p, pos));
+            }
+        }
+        roots
+    }
+
+    /// The root names a predicate depends on, sign discarded.
+    fn predicate_roots(ptx: &str, pred: &str) -> Vec<String> {
+        let mut v: Vec<String> = predicate_literals(ptx, pred)
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// **Are two predicates provably mutually exclusive?** True when some root literal is required
+    /// set by one and clear by the other — the only form of disjointness this generator produces, and
+    /// the only one worth proving textually.
+    fn predicates_are_disjoint(ptx: &str, a: &str, b: &str) -> bool {
+        let (la, lb) = (predicate_literals(ptx, a), predicate_literals(ptx, b));
+        la.iter()
+            .any(|(r, s)| lb.iter().any(|(r2, s2)| r == r2 && s != s2))
     }
 
     /// **Every branch target is a defined label, and every label is branched to.** Labels here are
@@ -5423,7 +6413,7 @@ mod tests {
     /// downstream of correctness. An item that names no gate is an item nobody will run.
     #[test]
     fn the_device_validation_list_is_intact() {
-        assert_eq!(WGMMA_DEVICE_VALIDATION.len(), 9);
+        assert_eq!(WGMMA_DEVICE_VALIDATION.len(), 10);
         // Item 1 is the head item and must name the mechanism that discharges it -- the sweep, and
         // the two controls that make the sweep self-validating.
         for need in [
@@ -5911,7 +6901,7 @@ mod tests {
         }
 
         // 2. The two logged numbers, recomputed.
-        let (a, b) = bringup_operands(m64, n64, k64);
+        let (a, b) = bringup_operands(m64, n64, k64, WgmmaDtype::F16);
         let want = ref_nt(&a, &b, m64, k64, n64);
         for (label, f, expect) in [
             ("k_leading: true", kl, 64usize),
@@ -5989,65 +6979,659 @@ mod tests {
     /// and [`ramp_radix`] keeps the whole dot product inside [`BRINGUP_EXACT_LIMIT`], where f32 holds
     /// every integer exactly. Tensor-core reassociation therefore cannot move a bit, and a mismatch
     /// on the device is a *fact*, not a tolerance argument.
+    ///
+    /// **Both input types, since 2026-08-11 (guard G15).** bf16's exact-integer ceiling is 256 --
+    /// eight times tighter than f16's 2048 -- so a ramp calibrated on f16 and run on the bf16 twin
+    /// rounds, and the `==` verdict becomes an unexplained near-miss that reads like a descriptor
+    /// bug. The ladder now enforces the input bound as well as the accumulator one; this law runs
+    /// every case at both dtypes so a regression cannot hide in the one that is not benched.
     #[test]
     fn the_bringup_operands_are_exact_in_f16_and_f32() {
-        for (m, n, k) in [
-            (64usize, 64usize, 64usize),
-            (128, 256, 64),
-            (128, 256, 256),
-            (128, 256, 1024),
-            (129, 257, 176),
-            (17, 33, 16),
-        ] {
-            let w = ramp_radix(k);
-            assert!(w.is_power_of_two() && (2..=8).contains(&w), "radix {w}");
-            let (a, b) = bringup_operands(m, n, k);
-            assert_eq!(a.len(), m * k);
-            assert_eq!(b.len(), n * k);
-            for (what, v) in [("A", &a), ("B", &b)] {
-                for &x in v.iter() {
-                    assert_eq!(x.fract(), 0.0, "{what}: {x} is not an integer");
-                    assert!(x >= 1.0, "{what}: {x} -- a zero lane distinguishes nothing");
-                    assert!(
-                        x <= 2048.0,
-                        "{what}: {x} is past the largest integer f16 holds exactly"
+        for dt in [WgmmaDtype::F16, WgmmaDtype::Bf16] {
+            let limit = dt.exact_integer_limit();
+            for (m, n, k) in [
+                (64usize, 64usize, 64usize),
+                (128, 256, 64),
+                (128, 256, 256),
+                (128, 256, 1024),
+                (129, 257, 176),
+                (17, 33, 16),
+            ] {
+                let w = ramp_radix(k, dt);
+                assert!(w.is_power_of_two() && (2..=8).contains(&w), "radix {w}");
+                assert!(
+                    ramp_max_value(w) as f32 <= limit,
+                    "{dt:?}: radix {w} can emit {} , past the {limit} this type holds exactly",
+                    ramp_max_value(w)
+                );
+                let (a, b) = bringup_operands(m, n, k, dt);
+                assert_eq!(a.len(), m * k);
+                assert_eq!(b.len(), n * k);
+                for (what, v) in [("A", &a), ("B", &b)] {
+                    for &x in v.iter() {
+                        assert_eq!(x.fract(), 0.0, "{what}: {x} is not an integer");
+                        assert!(x >= 1.0, "{what}: {x} -- a zero lane distinguishes nothing");
+                        assert!(
+                            x <= limit,
+                            "{what}: {x} is past the largest integer {dt:?} holds exactly ({limit})"
+                        );
+                    }
+                }
+                // The worst-case dot product, computed in f64 over the real operands.
+                let mut worst = 0f64;
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut acc = 0f64;
+                        for kk in 0..k {
+                            acc += a[i * k + kk] as f64 * b[j * k + kk] as f64;
+                        }
+                        worst = worst.max(acc);
+                    }
+                }
+                assert!(
+                    worst <= BRINGUP_EXACT_LIMIT,
+                    "{m}x{k}x{n} {dt:?}: worst dot product {worst} exceeds the exact-f32 integer \
+                     limit {BRINGUP_EXACT_LIMIT} -- the verdict would silently become a tolerance"
+                );
+                // And the reference really is exact: recomputing it in f32 order changes nothing.
+                let r = ref_nt(&a, &b, m, k, n);
+                for (i, &c) in r.iter().enumerate() {
+                    assert_eq!(
+                        c.fract(),
+                        0.0,
+                        "lane {i} of the reference is not an integer"
                     );
                 }
             }
-            // The worst-case dot product, computed in f64 over the real operands.
-            let mut worst = 0f64;
-            for i in 0..m {
-                for j in 0..n {
-                    let mut acc = 0f64;
-                    for kk in 0..k {
-                        acc += a[i * k + kk] as f64 * b[j * k + kk] as f64;
+            // The radix narrows monotonically as K grows, and never below 2.
+            let mut last = usize::MAX;
+            for k in [16usize, 64, 256, 1024, 4096, 65536, 1 << 20] {
+                let w = ramp_radix(k, dt);
+                assert!(w <= last, "radix must not widen with K");
+                assert!(w >= 2);
+                last = w;
+            }
+        }
+        // The one fact that makes this a guard rather than a formality: the two types disagree about
+        // the widest legal radix at a K where the accumulator bound alone would allow 8.
+        assert_eq!(ramp_radix(64, WgmmaDtype::F16), 8);
+        assert_eq!(
+            ramp_radix(64, WgmmaDtype::Bf16),
+            4,
+            "bf16 holds integers only to 256, and radix 8 emits up to {}",
+            ramp_max_value(8)
+        );
+        assert_eq!(ramp_max_value(8), 512);
+        assert_eq!(ramp_max_value(4), 64);
+    }
+
+    // --- wave 2: the correctness floor -------------------------------------------------------------
+
+    /// **GUARD G1: the pre-timing guard shape has all four properties, at every emittable row.**
+    ///
+    /// Each property is checked *and named with what it makes reachable*, because the failure this
+    /// guard exists to prevent is not a wrong assertion — it is a future edit that "simplifies" the
+    /// shape back to one tile because nothing said why it was three.
+    #[test]
+    fn the_guard_shape_reaches_every_mechanism_the_old_one_could_not() {
+        for c in wgmma_all_emittable() {
+            let g = guard_shape(c);
+            let (tm, tn) = g.tiles(c);
+            assert_eq!(
+                (tm, tn),
+                (GUARD_TILES_PER_AXIS, GUARD_TILES_PER_AXIS),
+                "{}: the grid must be {GUARD_TILES_PER_AXIS}x{GUARD_TILES_PER_AXIS} CTAs, so a \
+                 CTA-to-tile map that is right for one CTA is not enough",
+                c.name
+            );
+            assert_eq!(
+                g.ktiles(c),
+                c.stages + 1,
+                "{}: exactly one producer wrap -- the stage/parity reset only exists after it",
+                c.name
+            );
+            assert!(
+                !g.m.is_multiple_of(c.bm) && !g.n.is_multiple_of(c.bn) && !g.k.is_multiple_of(c.bk),
+                "{}: M, N and K must EACH be ragged ({}x{}x{} against tile {}x{}x{}) -- TMA's zero \
+                 fill and both epilogue predicates are what this reaches",
+                c.name,
+                g.m,
+                g.n,
+                g.k,
+                c.bm,
+                c.bn,
+                c.bk
+            );
+            assert!(
+                (tm * tn) % 2 == 1,
+                "{}: the tile count must be ODD, so no persistent grid divides it evenly and the \
+                 partial last wave -- where a per-tile accumulator/stage/parity reset is either \
+                 done or forgotten (G19) -- always exists",
+                c.name
+            );
+            assert!(
+                g.n.is_multiple_of(2),
+                "{}: N must stay EVEN or the v2 epilogue this guard is guarding cannot run at the \
+                 guard shape (st.global.v2.f32 needs an 8-byte-aligned pair)",
+                c.name
+            );
+            // The cluster arms round their own axis up, which is how the pad CTA gets exercised --
+            // on BOTH axes, because the tile count is odd on both.
+            let p = c.launch_plan();
+            let (gx, gy, _) = p.grid(g.m, g.n);
+            let ctas = (gx as usize) * (gy as usize);
+            assert!(
+                ctas >= tm * tn,
+                "{}: the launched grid may round up but never down",
+                c.name
+            );
+            if c.cluster_ctas() > 1 {
+                assert_eq!(
+                    ctas,
+                    tm * tn + GUARD_TILES_PER_AXIS,
+                    "{}: an odd tile count on the clustered axis must produce exactly one pad CTA \
+                     per row/column of the other axis",
+                    c.name
+                );
+            }
+            // Cost: the host f64 reference runs in a DEBUG build, so this is a real budget.
+            assert!(
+                g.macs() <= 80_000_000,
+                "{}: the guard reference is {} MACs, which is more than a debug-build host loop \
+                 should cost per gated row",
+                c.name,
+                g.macs()
+            );
+        }
+        // The concrete numbers for the shipped centerpiece, so a reader can check the table above.
+        let g = guard_shape(&WGMMA_W1);
+        assert_eq!((g.m, g.n, g.k), (320, 640, 288));
+        assert_eq!(g.ktiles(&WGMMA_W1), 5);
+        assert_eq!(g.macs(), 320 * 640 * 288);
+    }
+
+    /// **GUARD G2: the random arm is a tolerance arm, and the exact arm cannot replace it.**
+    ///
+    /// The load-bearing claim is the negative one: a reassociated sum of the exact-integer operands
+    /// is bit-identical, and a reassociated sum of the random ones is not. If that ever stops being
+    /// true the random arm has silently become a second copy of the exact arm and waves 3-5 have no
+    /// correctness coverage at all.
+    #[test]
+    fn the_random_arm_sees_a_reassociation_that_the_exact_arm_cannot() {
+        /// Sum a slice left-to-right in f32, and again in pairwise-tree order. Two orders, one set
+        /// of products -- exactly the difference a scheduler change makes.
+        fn sum_seq(v: &[f32]) -> f32 {
+            v.iter().fold(0f32, |a, x| a + x)
+        }
+        fn sum_tree(v: &[f32]) -> f32 {
+            if v.len() <= 1 {
+                return v.first().copied().unwrap_or(0.0);
+            }
+            let (l, r) = v.split_at(v.len() / 2);
+            sum_tree(l) + sum_tree(r)
+        }
+        let k = 2048usize;
+        for dt in [WgmmaDtype::F16, WgmmaDtype::Bf16] {
+            // The exact arm: every reassociation agrees, on every one of the rows checked.
+            let (ea, eb) = bringup_operands(8, 8, k, dt);
+            for i in 0..8 {
+                for j in 0..8 {
+                    let p: Vec<f32> = (0..k).map(|t| ea[i * k + t] * eb[j * k + t]).collect();
+                    assert_eq!(
+                        sum_seq(&p).to_bits(),
+                        sum_tree(&p).to_bits(),
+                        "{dt:?}: the exact arm must be reassociation-invariant -- that is what makes \
+                         it a permutation diagnostic and what makes it BLIND to a scheduler change"
+                    );
+                }
+            }
+            // The random arm: at least one row disagrees between the two orders.
+            let (ra, rb) = random_operands(8, 8, k, dt, RANDOM_ARM_SEED);
+            let mut moved = 0usize;
+            for i in 0..8 {
+                for j in 0..8 {
+                    let p: Vec<f32> = (0..k).map(|t| ra[i * k + t] * rb[j * k + t]).collect();
+                    if sum_seq(&p).to_bits() != sum_tree(&p).to_bits() {
+                        moved += 1;
                     }
-                    worst = worst.max(acc);
                 }
             }
             assert!(
-                worst <= BRINGUP_EXACT_LIMIT,
-                "{m}x{k}x{n}: worst dot product {worst} exceeds the exact-f32 integer limit \
-                 {BRINGUP_EXACT_LIMIT} -- the verdict would silently become a tolerance"
+                moved >= 32,
+                "{dt:?}: only {moved} of 64 lanes changed under reassociation -- the random arm has \
+                 collapsed into a second exact arm and sees nothing waves 3-5 will do. Check \
+                 RANDOM_ARM_BINADES."
             );
-            // And the reference really is exact: recomputing it in f32 order changes nothing.
-            let r = ref_nt(&a, &b, m, k, n);
-            for (i, &c) in r.iter().enumerate() {
-                assert_eq!(
-                    c.fract(),
-                    0.0,
-                    "lane {i} of the reference is not an integer"
+        }
+    }
+
+    /// **GUARD G2, the other half: every random operand is EXACT in its input type**, so the f64
+    /// reference is computed over precisely what the tensor cores multiply and the tolerance bounds
+    /// the summation order alone.
+    #[test]
+    fn every_random_operand_is_exact_in_its_input_type_and_finite() {
+        for dt in [WgmmaDtype::F16, WgmmaDtype::Bf16] {
+            let (a, b) = random_operands(37, 41, 53, dt, RANDOM_ARM_SEED);
+            assert_eq!(a.len(), 37 * 53);
+            assert_eq!(b.len(), 41 * 53);
+            let mant_bits = match dt {
+                WgmmaDtype::F16 => 10i32,
+                WgmmaDtype::Bf16 => 7,
+            };
+            let mut exps: Vec<i32> = Vec::new();
+            let mut signs = (0usize, 0usize);
+            for (what, v) in [("A", &a), ("B", &b)] {
+                for &x in v.iter() {
+                    assert!(x.is_finite() && x != 0.0, "{what}: {x} is not a finite non-zero");
+                    let mag = x.abs();
+                    assert!(
+                        (2f32).powi(-RANDOM_ARM_BINADES) <= mag && mag < 1.0,
+                        "{what}: {x} is outside the declared [2^-{RANDOM_ARM_BINADES}, 1) range"
+                    );
+                    // Exactness: the value must survive a round trip through its type's precision,
+                    // which for a value in [2^e, 2^(e+1)) means it is an integer multiple of
+                    // 2^(e - mant_bits).
+                    let e = mag.log2().floor() as i32;
+                    let ulp = (2f32).powi(e - mant_bits);
+                    let q = mag / ulp;
+                    assert_eq!(
+                        q.fract(),
+                        0.0,
+                        "{what}: {x} needs more than {mant_bits} explicit mantissa bits, so \
+                         {dt:?} would round it and the reference would not be over what the \
+                         hardware multiplies"
+                    );
+                    exps.push(e);
+                    if x > 0.0 {
+                        signs.0 += 1;
+                    } else {
+                        signs.1 += 1;
+                    }
+                }
+            }
+            exps.sort_unstable();
+            exps.dedup();
+            assert_eq!(
+                exps.len(),
+                RANDOM_ARM_BINADES as usize,
+                "{dt:?}: the draw must actually cover every declared binade, or the products do not \
+                 span enough range to round"
+            );
+            assert!(
+                signs.0 > 0 && signs.1 > 0,
+                "{dt:?}: an all-positive operand has no cancellation and is a weaker probe"
+            );
+        }
+        // Deterministic and seed-sensitive: the same seed reproduces, a different one does not.
+        let (a1, _) = random_operands(8, 8, 16, WgmmaDtype::F16, RANDOM_ARM_SEED);
+        let (a2, _) = random_operands(8, 8, 16, WgmmaDtype::F16, RANDOM_ARM_SEED);
+        let (a3, _) = random_operands(8, 8, 16, WgmmaDtype::F16, RANDOM_ARM_SEED ^ 1);
+        assert_eq!(a1, a2, "the seed must reproduce the operands exactly");
+        assert_ne!(a1, a3, "a different seed must produce different operands");
+        // A and B are independent streams: an operand pair that is the same sequence twice makes C
+        // symmetric and hides a transposed read.
+        let (a, b) = random_operands(16, 16, 16, WgmmaDtype::F16, RANDOM_ARM_SEED);
+        assert_ne!(a, b);
+    }
+
+    /// The private SplitMix64 in this module is the crate's own, constant for constant. A drift
+    /// would not break anything -- but it would mean two "SplitMix64"s in one crate that are not the
+    /// same generator, which is the sort of thing that costs an afternoon during a failure.
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn the_random_arm_matches_the_crates_own_splitmix() {
+        let mut st = 12345u64;
+        let mine: Vec<u64> = (0..8).map(|_| splitmix64(&mut st)).collect();
+        let mut theirs_rng = crate::diff::Rng::new(12345);
+        // `diff::Rng` exposes only f32 draws, so compare through the one transform both apply.
+        let theirs: Vec<f32> = (0..8).map(|_| theirs_rng.f32_range(0.0, 1.0)).collect();
+        let mine_f: Vec<f32> = mine
+            .iter()
+            .map(|r| ((r >> 40) as f32) / ((1u64 << 24) as f32))
+            .collect();
+        assert_eq!(mine_f, theirs, "the two SplitMix64 streams must be one stream");
+    }
+
+    /// **The tolerance is DERIVED, and it is a per-lane magnitude bound rather than a relative one.**
+    #[test]
+    fn the_random_tolerance_is_derived_and_scales_with_sqrt_k() {
+        let eps = f32::EPSILON as f64;
+        assert!((random_tolerance(1) - RANDOM_ARM_C * eps).abs() < 1e-18);
+        // Quadrupling K doubles the bound: sqrt(K), not K.
+        for k in [16usize, 64, 256, 1024, 4096] {
+            let r = random_tolerance(4 * k) / random_tolerance(k);
+            assert!((r - 2.0).abs() < 1e-9, "K -> 4K must double the bound, got {r}");
+        }
+        // And it is small enough to be a real gate: at the widest K in the bench grid the bound is
+        // still well under a part in a thousand of the magnitude sum.
+        assert!(
+            random_tolerance(8192) < 1e-3,
+            "a bound this loose would pass a wrong kernel"
+        );
+    }
+
+    /// **GUARD: the epilogue-elided diagnostic can never be mistaken for a kernel.**
+    ///
+    /// Three independent mechanisms, checked here as three independent assertions, because the whole
+    /// hazard is a row that computes a GEMM 40% faster by not producing one.
+    #[test]
+    fn the_elided_epilogue_can_never_be_shipped() {
+        for c in WGMMA_VARIANTS {
+            assert!(
+                !c.epilogue.is_diagnostic_only(),
+                "{}: a SHIPPED row may not carry the elided epilogue",
+                c.name
+            );
+        }
+        let elided: Vec<&SweepRow> = WGMMA_SWEEP_GRID
+            .iter()
+            .filter(|r| r.cfg.epilogue.is_diagnostic_only())
+            .collect();
+        assert_eq!(elided.len(), 1, "exactly one diagnostic row today");
+        for r in &elided {
+            assert!(
+                r.cfg.name.contains("nostore"),
+                "{}: the name must SAY it stores nothing",
+                r.cfg.name
+            );
+            assert!(
+                r.why.contains("DIAGNOSTIC") || r.why.contains("diagnostic"),
+                "{}: the row's own rationale must say what it is",
+                r.label
+            );
+            // The text: no accumulator reaches a store that can retire.
+            let ptx = wgmma_module(r.cfg, &license()).unwrap();
+            let stores = store_class_instructions(&ptx);
+            assert_eq!(
+                stores.len(),
+                1,
+                "{}: the elided arm keeps exactly ONE store, and only to keep the accumulators live",
+                r.cfg.name
+            );
+            assert_eq!(stores[0].pred, "%pdead");
+            assert!(
+                ptx.contains("setp.gt.u32 %pdead,%K,2147483647;"),
+                "{}: the store's predicate must be unsatisfiable for every u32 K a launch can pass",
+                r.cfg.name
+            );
+            // ...and the mainloop is still there, which is the other half of the trick.
+            assert!(ptx.contains("wgmma.mma_async"), "{}", r.cfg.name);
+            let nacc = r.cfg.shape().unwrap().accum_regs();
+            assert_eq!(
+                ptx.matches("add.f32 %acc0,%acc0,%acc").count(),
+                nacc - 1,
+                "{}: every accumulator must be folded into the live value, or ptxas dead-codes the \
+                 wgmma issues that produced it and the arm times an empty kernel",
+                r.cfg.name
+            );
+        }
+    }
+
+    /// **The v2 epilogue transports the same accumulators through a different instruction, and the
+    /// odd-N tail is not optional.**
+    #[test]
+    fn the_v2_epilogue_fuses_pairs_and_keeps_the_odd_n_tail() {
+        let scalar = wgmma_module(&WGMMA_W1_MCB, &license()).unwrap();
+        let v2 = wgmma_module(&WGMMA_W1_MCB_V2, &license()).unwrap();
+        let nacc = WGMMA_W1_MCB.shape().unwrap().accum_regs();
+        assert_eq!(scalar.matches("st.global.f32").count(), nacc);
+        // Half the transports are vector, and each carries two accumulators.
+        assert_eq!(v2.matches("st.global.v2.f32").count(), nacc / 2);
+        assert_eq!(
+            v2.matches("st.global.f32").count(),
+            nacc / 2,
+            "the odd-N tail is one scalar store per pair -- SAME instruction count as the scalar \
+             arm, because the win is transactions, not issue slots"
+        );
+        // The tail's predicate really is `first && !both`, so the two are mutually exclusive.
+        assert_eq!(v2.matches("not.pred %ptail,%p1;").count(), nacc / 4);
+        assert_eq!(v2.matches("and.pred %qs0,%q0,%ptail;").count(), nacc / 4);
+        // And the transport law itself holds over the fused text: the first accumulator of a pair is
+        // named by TWO stores (the vector one and the tail) whose predicates are disjoint, the second
+        // by exactly one.
+        let stores = store_class_instructions(&v2);
+        for i in 0..nacc {
+            let carriers: Vec<&StoreOp> = stores
+                .iter()
+                .filter(|s| s.sources.iter().any(|o| o == &format!("%acc{i}")))
+                .collect();
+            let want = if i % 2 == 0 { 2 } else { 1 };
+            assert_eq!(
+                carriers.len(),
+                want,
+                "%acc{i}: the first of a pair has the vector store and the tail, the second only \
+                 the vector store"
+            );
+            if carriers.len() == 2 {
+                assert!(
+                    predicates_are_disjoint(&v2, &carriers[0].pred, &carriers[1].pred),
+                    "%acc{i}: the tail and the vector store must be provably mutually exclusive, or \
+                     an odd N publishes the lane twice"
                 );
             }
         }
-        // The radix narrows monotonically as K grows, and never below 2.
-        let mut last = usize::MAX;
-        for k in [16usize, 64, 256, 1024, 4096, 65536, 1 << 20] {
-            let w = ramp_radix(k);
-            assert!(w <= last, "radix must not widen with K");
-            assert!(w >= 2);
-            last = w;
+        assert!(WGMMA_W1_MCB_V2.epilogue.requires_even_n());
+        assert!(!WGMMA_W1_MCB.epilogue.requires_even_n());
+    }
+
+    /// **The L2 hints are advisory text in exactly the places they claim to be, and nowhere else.**
+    ///
+    /// Including the one ISA fact the lever had to establish before it could exist: a bulk-tensor
+    /// copy CAN carry a cache policy, so the operand half is measured rather than dropped.
+    #[test]
+    fn the_l2_hints_reach_the_stores_and_the_tma_copies_they_name() {
+        let lic = license();
+        let base = wgmma_module(&WGMMA_W1_MCB, &lic).unwrap();
+        let ef = wgmma_module(&WGMMA_W1_MCB_EF, &lic).unwrap();
+        let efol = wgmma_module(&WGMMA_W1_MCB_EFOL, &lic).unwrap();
+        let nacc = WGMMA_W1_MCB.shape().unwrap().accum_regs();
+        // The baseline is byte-identical to rounds 1-3 in this respect: no policy anywhere.
+        for token in ["createpolicy", "L2::cache_hint", "evict_first", "evict_last"] {
+            assert!(
+                !base.contains(token),
+                "the un-hinted row must carry no `{token}` -- it is the A/B's control"
+            );
         }
+        // Stores only.
+        assert_eq!(
+            ef.matches("createpolicy.fractional.L2::evict_first.b64 %rdPolC,1.0;")
+                .count(),
+            1,
+            "one policy, created once outside the store loop"
+        );
+        assert_eq!(ef.matches("st.global.L2::cache_hint.f32").count(), nacc);
+        assert_eq!(ef.matches(",%rdPolC;").count(), nacc);
+        assert!(
+            !ef.contains("evict_last"),
+            "the stores-only arm must not hint the operands, or it is two facts"
+        );
+        // Stores AND operands.
+        assert_eq!(
+            efol.matches("createpolicy.fractional.L2::evict_last.b64 %rdPolAB,1.0;")
+                .count(),
+            1
+        );
+        let copies = efol
+            .matches("cp.async.bulk.tensor.2d.shared::cluster.global.tile")
+            .count();
+        assert_eq!(copies, 2, "one A copy and one B copy per stage iteration");
+        assert_eq!(
+            efol.matches(".L2::cache_hint [%rd").count(),
+            copies,
+            "EVERY TMA copy must carry the qualifier, or the arm measures half a lever"
+        );
+        assert_eq!(
+            efol.matches(",%rdPolAB;").count(),
+            copies,
+            "and every one must pass the policy operand -- the qualifier without the operand is a \
+             PTX parse error on a machine that is not this one"
+        );
+        // The multicast copy puts the policy AFTER ctaMask, which is the operand order the ISA
+        // fixes and the one thing about this lever that a reader cannot check by symmetry.
+        assert!(
+            efol.contains("[%rdBarF],%cmask,%rdPolAB;"),
+            "the cache policy follows ctaMask on a multicast copy"
+        );
+        // Declared registers exist exactly where they are used.
+        assert!(ef.contains(".reg .b64 %rdPolC;") && !ef.contains("%rdPolAB"));
+        assert!(efol.contains(".reg .b64 %rdPolC;") && efol.contains(".reg .b64 %rdPolAB;"));
+    }
+
+    /// **The two levers compose into one module, not two half-modules.**
+    #[test]
+    fn the_composed_lever_row_carries_both_facts() {
+        let both = wgmma_module(&WGMMA_W1_MCB_V2_EF, &license()).unwrap();
+        let nacc = WGMMA_W1_MCB.shape().unwrap().accum_regs();
+        assert_eq!(both.matches("st.global.L2::cache_hint.v2.f32").count(), nacc / 2);
+        assert_eq!(both.matches("st.global.L2::cache_hint.f32").count(), nacc / 2);
+        assert_eq!(
+            WGMMA_W1_MCB_V2_EF.derived_name(),
+            "wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef"
+        );
+    }
+
+    /// **No sm_90a module may name a Blackwell instruction (guard G13).**
+    ///
+    /// `tcgen05.*` and `clusterlaunchcontrol.*` are `sm_100`+ and would be a `ptxas` error at
+    /// `sm_90a` -- but they are also in the `.version` law's ABOVE_78 list, which means a module
+    /// containing one would be *licensed* for its high `.version` by exactly the instruction that
+    /// makes it unassemblable. Two laws agreeing to pass the same bad module is the failure this
+    /// closes.
+    #[test]
+    fn no_sm90a_module_names_a_blackwell_instruction() {
+        const BANNED: &[&str] = &["tcgen05", "clusterlaunchcontrol"];
+        for (what, ptx) in wgmma_device_free_modules() {
+            for b in BANNED {
+                assert!(
+                    !ptx.contains(b),
+                    "{what}: an sm_90a module names `{b}`, which does not exist below sm_100 -- \
+                     ptxas would reject it, and the .version law would have licensed it"
+                );
+            }
+        }
+    }
+
+    /// **The shipped regime rule says what the round-3 log measured, and nothing more.**
+    #[test]
+    fn the_w1_regime_rule_follows_the_measured_sign_change() {
+        // The threshold must sit strictly inside the interval the measurement brackets: the cluster
+        // LOSES at sq2048 (4.19e6 output elements) and WINS at sq4096 (16.8e6).
+        assert!(W1_CLUSTER_MIN_OUTPUT_ELEMS > 2048 * 2048);
+        assert!(W1_CLUSTER_MIN_OUTPUT_ELEMS <= 4096 * 4096);
+        assert_eq!(wgmma_w1_for(2048, 2048).name, WGMMA_W1.name);
+        assert_eq!(wgmma_w1_for(4096, 4096).name, WGMMA_W1_MCB.name);
+        assert_eq!(wgmma_w1_for(8192, 8192).name, WGMMA_W1_MCB.name);
+        // The GPT shapes the bench grid carries, so the rule is not only defined on squares. Note
+        // `gpt_d1024_down` (4096x1024) and `gpt_d1024_up` (4096x4096): the first has EXACTLY the
+        // output element count of sq2048, where the cluster was measured to LOSE, so the rule sends
+        // it to the un-clustered row. That is the rule declining to extrapolate, not an oversight --
+        // nothing in round 3 measured a rectangular shape at all, and wave 3's dispatcher is what
+        // will.
+        assert_eq!(wgmma_w1_for(4096, 16384).name, WGMMA_W1_MCB.name);
+        assert_eq!(wgmma_w1_for(4096, 4096).name, WGMMA_W1_MCB.name);
+        assert_eq!(wgmma_w1_for(4096, 1024).name, WGMMA_W1.name);
+        assert_eq!(4096 * 1024, 2048 * 2048, "the two shapes really are the same M*N");
+        assert_eq!(wgmma_w1_for(1024, 1024).name, WGMMA_W1.name);
+        // Both arms of the rule stay emittable and stay in the sweep, so the next round re-measures
+        // the split instead of inheriting it.
+        for c in [&WGMMA_W1, &WGMMA_W1_MCB] {
+            assert!(c.validate().is_ok(), "{}", c.name);
+            assert!(
+                WGMMA_SWEEP_GRID.iter().any(|r| r.cfg.key == c.key),
+                "{} must remain a sweep row",
+                c.name
+            );
+        }
+        // Saturating, so a caller cannot overflow its way into the wrong arm.
+        assert_eq!(wgmma_w1_for(usize::MAX, usize::MAX).name, WGMMA_W1_MCB.name);
+    }
+
+    /// **The K sweep is a K sweep**: one output shape, K the only axis, and both rows present.
+    #[test]
+    fn the_k_sweep_varies_only_k_and_carries_its_elided_twin() {
+        assert!(WGMMA_KSWEEP_GRID.len() >= 3, "a slope needs three points");
+        let (m0, n0) = (WGMMA_KSWEEP_GRID[0].m, WGMMA_KSWEEP_GRID[0].n);
+        let mut ks: Vec<usize> = Vec::new();
+        for p in WGMMA_KSWEEP_GRID {
+            assert_eq!((p.m, p.n), (m0, n0), "{}: M and N must be fixed", p.label);
+            assert!(p.k.is_multiple_of(64), "{}: K must tile at BK=64", p.label);
+            assert!(!p.why.is_empty() && p.why.is_ascii());
+            assert!(p.label.is_ascii() && !p.label.contains(' '));
+            ks.push(p.k);
+        }
+        let mut sorted = ks.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(ks, sorted, "the points must be distinct and ascending");
+        // The anchor: one point of the K sweep IS a shape rounds 1-3 already measured, so the column
+        // is tied to the table rather than free-floating.
+        assert!(
+            WGMMA_KSWEEP_GRID
+                .iter()
+                .any(|p| WGMMA_BENCH_GRID.iter().any(|q| (q.m, q.n, q.k) == (p.m, p.n, p.k))),
+            "the K sweep must share at least one point with the bench grid"
+        );
+        let rows = wgmma_ksweep_rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| !r.cfg.epilogue.is_diagnostic_only()));
+        assert!(rows.iter().any(|r| r.cfg.epilogue.is_diagnostic_only()));
+        // The pair must differ in ONE field, or the subtraction is not the epilogue's cost.
+        let (a, b) = (rows[0].cfg, rows[1].cfg);
+        assert_eq!((a.bm, a.bn, a.bk, a.stages), (b.bm, b.bn, b.bk, b.stages));
+        assert_eq!(a.multicast, b.multicast);
+        assert_eq!(a.l2_hint, b.l2_hint);
+        assert_ne!(a.epilogue, b.epilogue);
+    }
+
+    /// **The wave-2 rows are each ONE fact off the round-3 winner**, which is the only reason their
+    /// deltas mean anything.
+    #[test]
+    fn every_wave2_lever_row_differs_from_the_winner_in_one_field() {
+        let base = &WGMMA_W1_MCB;
+        for (label, c, want_eps, want_hint) in [
+            ("v2", &WGMMA_W1_MCB_V2, true, false),
+            ("ef", &WGMMA_W1_MCB_EF, false, true),
+            ("efol", &WGMMA_W1_MCB_EFOL, false, true),
+            ("nostore", &WGMMA_W1_MCB_NOSTORE, true, false),
+        ] {
+            assert_eq!(
+                (c.bm, c.bn, c.bk, c.stages, c.consumer_wgs),
+                (
+                    base.bm,
+                    base.bn,
+                    base.bk,
+                    base.stages,
+                    base.consumer_wgs
+                ),
+                "{label}: the tile and ring must be the winner's"
+            );
+            assert_eq!(c.multicast, base.multicast, "{label}");
+            assert_eq!(c.layout, base.layout, "{label}");
+            assert_eq!(
+                (c.producer_regs, c.consumer_regs),
+                (base.producer_regs, base.consumer_regs),
+                "{label}"
+            );
+            assert_eq!(
+                c.epilogue != base.epilogue,
+                want_eps,
+                "{label}: epilogue changed?"
+            );
+            assert_eq!(
+                c.l2_hint != base.l2_hint,
+                want_hint,
+                "{label}: hint changed?"
+            );
+            assert_eq!(c.smem_bytes(), base.smem_bytes(), "{label}: same ring");
+        }
+        // The composed row is the ONE that deliberately changes two, and it is labelled as such.
+        assert_ne!(WGMMA_W1_MCB_V2_EF.epilogue, base.epilogue);
+        assert_ne!(WGMMA_W1_MCB_V2_EF.l2_hint, base.l2_hint);
+        let row = WGMMA_SWEEP_GRID
+            .iter()
+            .find(|r| r.cfg.key == WGMMA_W1_MCB_V2_EF.key)
+            .expect("the composed row is in the table");
+        assert!(row.why.contains("BOTH levers"));
     }
 
     // --- bring-up: the ONE-VISIT descriptor sweep -------------------------------------------------
