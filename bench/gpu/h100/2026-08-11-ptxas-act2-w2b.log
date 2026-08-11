@@ -1,0 +1,2076 @@
+==============================================================================
+WUKONG ptxas AUDIT (CPU container, no GPU attached)
+==============================================================================
+utc            : 2026-08-11 23:11:46
+image          : nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
+ptxas          : /usr/local/cuda-12.9/bin/ptxas
+archs          : sm_80, sm_89, sm_90, sm_90a
+filter         : ptxas_reports_the_register_and_spill_budget
+skip           : gemm_cliff_ptxas_ab
+package        : wukong_codegen_gpu (debug)
+per-arch sweep : on
+hint passes    : off (the crate ignores the hint)
+note           : the source tree is mounted WITHOUT .git, so identify the tree by the
+                 local commit the operator ran this from.
+
+--- ptxas --version ---
+ptxas: NVIDIA (R) Ptx optimizing assembler
+Copyright (c) 2005-2025 NVIDIA Corporation
+Built on Tue_May_27_02:18:05_PDT_2025
+Cuda compilation tools, release 12.9, V12.9.86
+Build cuda_12.9.r12.9/compiler.36037853_0
+
+--- capture shim ---
+shim: /tmp/wukong-ptxas-shim/ptxas -> /usr/local/cuda-12.9/bin/ptxas
+self-test: transparent, and records
+
+--- self-test sm_80 (rc=0) ---
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry wk_ptxas_selftest(
+    .param .u64 wk_p
+)
+{
+    .reg .b32   %r<3>;
+    .reg .f32   %f<4>;
+    .reg .b64   %rd<4>;
+
+    ld.param.u64 %rd1, [wk_p];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd2];
+    mov.f32 %f2, 0f3F800000;
+    fma.rn.f32 %f3, %f1, %f2, %f2;
+    st.global.f32 [%rd2], %f3;
+    ret;
+}
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_ptxas_selftest' for 'sm_80'
+ptxas info    : Function properties for wk_ptxas_selftest
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers, 360 bytes cmem[0]
+ptxas info    : Compile time = 1.902 ms
+
+--- self-test sm_89 (rc=0) ---
+.version 7.8
+.target sm_89
+.address_size 64
+
+.visible .entry wk_ptxas_selftest(
+    .param .u64 wk_p
+)
+{
+    .reg .b32   %r<3>;
+    .reg .f32   %f<4>;
+    .reg .b64   %rd<4>;
+
+    ld.param.u64 %rd1, [wk_p];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd2];
+    mov.f32 %f2, 0f3F800000;
+    fma.rn.f32 %f3, %f1, %f2, %f2;
+    st.global.f32 [%rd2], %f3;
+    ret;
+}
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_ptxas_selftest' for 'sm_89'
+ptxas info    : Function properties for wk_ptxas_selftest
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers, 360 bytes cmem[0]
+ptxas info    : Compile time = 1.809 ms
+
+--- self-test sm_90 (rc=0) ---
+.version 8.0
+.target sm_90
+.address_size 64
+
+.visible .entry wk_ptxas_selftest(
+    .param .u64 wk_p
+)
+{
+    .reg .b32   %r<3>;
+    .reg .f32   %f<4>;
+    .reg .b64   %rd<4>;
+
+    ld.param.u64 %rd1, [wk_p];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd2];
+    mov.f32 %f2, 0f3F800000;
+    fma.rn.f32 %f3, %f1, %f2, %f2;
+    st.global.f32 [%rd2], %f3;
+    ret;
+}
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_ptxas_selftest' for 'sm_90'
+ptxas info    : Function properties for wk_ptxas_selftest
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 2.422 ms
+
+--- self-test sm_90a (rc=0) ---
+.version 8.0
+.target sm_90a
+.address_size 64
+
+.visible .entry wk_ptxas_selftest(
+    .param .u64 wk_p
+)
+{
+    .reg .b32   %r<3>;
+    .reg .f32   %f<4>;
+    .reg .b64   %rd<4>;
+
+    ld.param.u64 %rd1, [wk_p];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd2];
+    mov.f32 %f2, 0f3F800000;
+    fma.rn.f32 %f3, %f1, %f2, %f2;
+    st.global.f32 [%rd2], %f3;
+    ret;
+}
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_ptxas_selftest' for 'sm_90a'
+ptxas info    : Function properties for wk_ptxas_selftest
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 2.185 ms
+
+--- census pass: WUKONG_PTXAS_ARCH=sm_80 WUKONG_PTXAS_ARCHS=sm_80,sm_89,sm_90,sm_90a (rc=0) ---
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_runtime-1h1dgdclho9l2/s-hl7b5l4kb4-0ecdo03-working`[0m
+
+[1m[33mwarning[0m: `wukong_runtime` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_interp-3cliahzxsxav8/s-hl7b6ohmxz-13di61h-working`[0m
+
+[1m[92m   Compiling[0m wukong_codegen_gpu v0.1.0 (/wukong/crates/wukong_codegen_gpu)
+[1m[33mwarning[0m: `wukong_interp` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_codegen_gpu-26y6ft8l794cr/s-hl9a4txuvg-0ztx4g1-working`[0m
+
+[1m[33mwarning[0m: `wukong_codegen_gpu` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_codegen_gpu-04tzhcvmx7xy3/s-hl9a4txuvn-19fh9eg-working`[0m
+
+[1m[33mwarning[0m: `wukong_codegen_gpu` (lib test) generated 1 warning
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 38.62s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+
+running 1 test
+test gpu::tests::ptxas_reports_the_register_and_spill_budget ... 
+ptxas register / spill / SMEM report
+  ptxas: /tmp/wukong-ptxas-shim/ptxas
+  ptxas: NVIDIA (R) Ptx optimizing assembler | Copyright (c) 2005-2025 NVIDIA Corporation | Built on Tue_May_27_02:18:05_PDT_2025 | Cuda compilation tools, release 12.9, V12.9.86 | Build cuda_12.9.r12.9/compiler.36037853_0
+  family          entry                        arch      regs  spill_st  spill_ld  stack  smem(ptxas)  smem(gen)  thr/CTA  CTAs/SM(reg)   derived
+  wmma-deep/wide  deep_swz_128_s2              sm_80       96         0         0      0        32768      32768      256             2         -
+  wmma-deep/wide  deep_swz_128_s3              sm_80       96         0         0      0        49152      49152      256             2         -
+  wmma-deep/wide  deep_swz_128_s4              sm_80       96         0         0      0            0      65536      256             2         -
+  wmma-deep/wide  deep_swz_128_s5              sm_80       96         0         0      0            0      81920      256             2         -
+  wmma-deep/wide  deep_swz_128x256_s2          sm_80      168         0         0      0        49152      49152      256             1         -
+  wmma-deep/wide  deep_swz_128x256_s3          sm_80      168         0         0      0            0      73728      256             1         -
+  wmma-deep/wide  deep_swz_128x256_s4          sm_80      168         0         0      0            0      98304      256             1         -
+  wmma-deep/wide  deep_swz_128x256_s4_mc1      sm_80      254         0         0      0            0      98304      256             1         -
+  wmma-deep/wide  deep_swz_256x128_s2          sm_80      168         0         0      0        49152      49152      256             1         -
+  wmma-deep/wide  deep_swz_256x128_s3          sm_80      168         0         0      0            0      73728      256             1         -
+  wmma-deep/wide  deep_swz_256x128_s4          sm_80      168         0         0      0            0      98304      256             1         -
+  wmma-deep/wide  wide_swz_128_s7              sm_80       96         0         0      0            0     114688      256             2         -
+  wmma-deep/wide  wide_swz_128x256_s5_mc1      sm_80      254         0         0      0            0     122880      256             1         -
+  wmma-deep/wide  wide_swz_128x256_s6_mc1      sm_80      254         0         0      0            0     147456      256             1         -
+  wmma-deep/wide  wide_swz_256x128_s6_mc1      sm_80      254         0         0      0            0     147456      256             1         -
+  flash-stage     flash_d64_mp_s3              sm_80       80         0         0      0        12288      12288       32            25         -
+  flash-stage     flash_d64_mp_s4              sm_80       94         0         0      0        16384      16384       32            21         -
+  flash-stage     flash_d64_mpc_s4             sm_80       96         0         0      0        16384      16384       32            21         -
+  flash-stage     flash_d128_mp_lm_s4          sm_80      145         0         0      0        32768      32768       32            14         -
+  flash-stage     flash_d128_mp_lm_s6          sm_80      145         0         0      0        49152      49152       32            14         -
+  flash-stage     flash_d128_mp_lm_s8          sm_80      145         0         0      0            0      65536       32            14         -
+  flash-stage     flash_d128_mpc_lm_s8         sm_80      147         0         0      0            0      65536       32            13         -
+  flash-stage     flash_d64_mpw4_s3            sm_80      127         0         0      0        49152      49152       32            16         -
+  flash-stage     flash_d64_mpw4_s4            sm_80      127         0         0      0            0      65536       32            16         -
+  flash-stage     flash_d64_mpw4_s5            sm_80      127         0         0      0            0      81920       32            16         -
+  flash-stage     flash_d128_mpw2_lm_s3        sm_80      157         0         0      0        49152      49152       32            13         -
+  flash-stage     flash_d128_mpw2_lm_s4        sm_80      157         0         0      0            0      65536       32            13         -
+  flash-stage     flash_d128_mpw4_lm_s3        sm_80      171         0         0      0            0      98304       32            11         -
+  wgmma           wgmma_nt_f16_128x256x64_s4   sm_90a     168         0         0      0            0     196672      384             1  32p/232c
+  wgmma           wgmma_nt_bf16_128x256x64_s4  sm_90a     168         0         0      0            0     196672      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x128x64_s6   sm_90a     168         0         0      0            0     196704      384             1  32p/168c
+  wgmma           wgmma_nt_f16_128x256x64_s4_mc2 sm_90a     168         0         0      0            0     196672      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s4_mcb2 sm_90a     168         0         0      0            0     196672      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s3   sm_90a     168         0         0      0            0     147504      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s3_mcb2 sm_90a     168         0         0      0            0     147504      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s3_mc2 sm_90a     168         0         0      0            0     147504      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s2   sm_90a     168         0         0      0            0      98336      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s2_mcb2 sm_90a     168         0         0      0            0      98336      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s2_mc2 sm_90a     168         0         0      0            0      98336      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x128x64_s6_mcb2 sm_90a     168         0         0      0            0     196704      384             1  32p/168c
+  wgmma           wgmma_nt_f16_128x128x64_s6_mc2 sm_90a     168         0         0      0            0     196704      384             1  32p/168c
+  wgmma           wgmma_nt_f16_128x256x64_s4_mcb2_v2 sm_90a     168         0         0      0            0     196672      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s4_mcb2_ef sm_90a     168         0         0      0            0     196672      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s4_mcb2_efol sm_90a     168         0         0      0            0     196672      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef sm_90a     168         0         0      0            0     196672      384             1  32p/232c
+  wgmma           wgmma_nt_f16_128x256x64_s4_mcb2_nostore sm_90a     168         0         0      0            0     196672      384             1  32p/232c
+  wgmma-bringup   wk_wgmma_desc_sweep          sm_90a      58         0         0      0            0     147456      128             8         -
+  wgmma-bringup   wk_tma_stage_probe           sm_90a      12         0         0      0            0      32776      128            42         -
+  (48 kernels measured; smem(ptxas) counts STATIC .shared only -- a dynamic-window row reports 0 and carries smem(gen) at launch; for a warp-specialised entry `regs` is the whole-CTA static allocation that `setmaxnreg` then redistributes)
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 562 filtered out; finished in 7.20s
+
+[1m[92m   Doc-tests[0m wukong_codegen_gpu
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+
+
+--- RAW ptxas -v, as captured by the shim ---
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_0.cubin /tmp/wukong_ptxas_629_0.ptx ---
+declared .target sm_80 ; 15 entries ; ptx sha 8ade5369c16e2fd9
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wide_swz_256x128_s6_mc1' for 'sm_80'
+ptxas info    : Function properties for wide_swz_256x128_s6_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 50.372 ms
+ptxas info    : Compiling entry function 'wide_swz_128x256_s6_mc1' for 'sm_80'
+ptxas info    : Function properties for wide_swz_128x256_s6_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 49.285 ms
+ptxas info    : Compiling entry function 'wide_swz_128x256_s5_mc1' for 'sm_80'
+ptxas info    : Function properties for wide_swz_128x256_s5_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 47.108 ms
+ptxas info    : Compiling entry function 'wide_swz_128_s7' for 'sm_80'
+ptxas info    : Function properties for wide_swz_128_s7
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 23.198 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s4' for 'sm_80'
+ptxas info    : Function properties for deep_swz_256x128_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 40.034 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s3' for 'sm_80'
+ptxas info    : Function properties for deep_swz_256x128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 43.366 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s2' for 'sm_80'
+ptxas info    : Function properties for deep_swz_256x128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 41.072 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s4_mc1' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128x256_s4_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 46.324 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s4' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128x256_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 45.100 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s3' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128x256_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 40.322 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s2' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128x256_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 41.173 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s5' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128_s5
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 21.303 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s4' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 19.602 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s3' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 17.397 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s2' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 32768 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 16.947 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_1.cubin /tmp/wukong_ptxas_629_1.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha c0e20d1d2567bba8
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mp_s3' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mp_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 12288 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 47.336 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_2.cubin /tmp/wukong_ptxas_629_2.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha 65586c0eedd24bdf
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mp_s4' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mp_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 1 barriers, 16384 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 48.325 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_3.cubin /tmp/wukong_ptxas_629_3.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha 4bb5b0b1f7798683
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpc_s4' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mpc_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 16384 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 48.893 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_4.cubin /tmp/wukong_ptxas_629_4.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha bfc7ba457d406309
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s4' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mp_lm_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 145 registers, used 1 barriers, 32768 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 93.982 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_5.cubin /tmp/wukong_ptxas_629_5.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha 91a9a3fcbb370e89
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s6' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mp_lm_s6
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 145 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 104.584 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_6.cubin /tmp/wukong_ptxas_629_6.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha 7e67e1f3f25c5b2a
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s8' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mp_lm_s8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 145 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 105.315 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_7.cubin /tmp/wukong_ptxas_629_7.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha 276526c595af6dcc
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpc_lm_s8' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mpc_lm_s8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 147 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 107.291 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_8.cubin /tmp/wukong_ptxas_629_8.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha 0aa7fbf5fed0126a
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s3' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mpw4_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 93.669 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_9.cubin /tmp/wukong_ptxas_629_9.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha c1d8b732943faa05
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s4' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mpw4_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 98.421 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_10.cubin /tmp/wukong_ptxas_629_10.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha be073aec622da03d
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s5' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mpw4_s5
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 103.643 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_11.cubin /tmp/wukong_ptxas_629_11.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha 5edfce4762edabb4
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw2_lm_s3' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mpw2_lm_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 157 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 123.467 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_12.cubin /tmp/wukong_ptxas_629_12.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha d7f91d9934e94604
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw2_lm_s4' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mpw2_lm_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 157 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 121.092 ms
+
+--- ptxas invocation (rc=0) -arch=sm_80 -O3 -v -o /tmp/wukong_ptxas_629_13.cubin /tmp/wukong_ptxas_629_13.ptx ---
+declared .target sm_80 ; 1 entries ; ptx sha 9062979b7d1d9c8e
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw4_lm_s3' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mpw4_lm_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 171 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 200.069 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_14.cubin /tmp/wukong_ptxas_629_14.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 7a344f310e6ea304
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 81.873 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_15.cubin /tmp/wukong_ptxas_629_15.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 5fb6466ac42926be
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_bf16_128x256x64_s4' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_bf16_128x256x64_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 83.862 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_16.cubin /tmp/wukong_ptxas_629_16.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha c0765073f194efb1
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x128x64_s6' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x128x64_s6
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 34.938 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_17.cubin /tmp/wukong_ptxas_629_17.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 0423877eabca7cfe
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mc2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mc2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 80.729 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_18.cubin /tmp/wukong_ptxas_629_18.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 86292b28b348d49c
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 82.108 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_19.cubin /tmp/wukong_ptxas_629_19.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 1b1a6892bf02693a
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s3' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 82.365 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_20.cubin /tmp/wukong_ptxas_629_20.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 078c0fdc02207e03
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s3_mcb2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s3_mcb2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 80.111 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_21.cubin /tmp/wukong_ptxas_629_21.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 400b785f8d97db81
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s3_mc2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s3_mc2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 83.422 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_22.cubin /tmp/wukong_ptxas_629_22.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 20b3da6c66031af8
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 82.715 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_23.cubin /tmp/wukong_ptxas_629_23.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha cab53601c7f43ebd
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s2_mcb2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s2_mcb2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 83.234 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_24.cubin /tmp/wukong_ptxas_629_24.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha f53d6e134a5f8df2
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s2_mc2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s2_mc2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 79.623 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_25.cubin /tmp/wukong_ptxas_629_25.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 7d50517b8ee76855
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x128x64_s6_mcb2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x128x64_s6_mcb2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 34.643 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_26.cubin /tmp/wukong_ptxas_629_26.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 1100c77c247045d2
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x128x64_s6_mc2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x128x64_s6_mc2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 35.241 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_27.cubin /tmp/wukong_ptxas_629_27.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 76b1ec1c50e63603
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2_v2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2_v2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 84.909 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_28.cubin /tmp/wukong_ptxas_629_28.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 6514a1f673080858
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2_ef' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2_ef
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 83.163 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_29.cubin /tmp/wukong_ptxas_629_29.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha ae250f28561a7cde
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2_efol' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2_efol
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 83.922 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_30.cubin /tmp/wukong_ptxas_629_30.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 1d0f829ae94fa104
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 86.603 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_31.cubin /tmp/wukong_ptxas_629_31.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 325b17f519996d1c
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2_nostore' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2_nostore
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 62.645 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_32.cubin /tmp/wukong_ptxas_629_32.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha b96b71f4b8a625bb
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 158 by compiler to allow use of registers in GMMA in function 'wk_wgmma_desc_sweep'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 162 by compiler to allow use of registers in GMMA in function 'wk_wgmma_desc_sweep'
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_wgmma_desc_sweep' for 'sm_90a'
+ptxas info    : Function properties for wk_wgmma_desc_sweep
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 58 registers, used 1 barriers
+ptxas info    : Compile time = 11.557 ms
+
+--- ptxas invocation (rc=0) -arch=sm_90a -O3 -v -o /tmp/wukong_ptxas_629_33.cubin /tmp/wukong_ptxas_629_33.ptx ---
+declared .target sm_90a ; 1 entries ; ptx sha 4fa28e7eedee9021
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_tma_stage_probe' for 'sm_90a'
+ptxas info    : Function properties for wk_tma_stage_probe
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 12 registers, used 1 barriers
+ptxas info    : Compile time = 4.833 ms
+
+==============================================================================
+PER-ARCH SWEEP
+==============================================================================
+
+--- sweep 0423877eabca7cfe.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/0423877eabca7cfe.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/0423877eabca7cfe.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 0423877eabca7cfe.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/0423877eabca7cfe.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/0423877eabca7cfe.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 0423877eabca7cfe.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/0423877eabca7cfe.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/0423877eabca7cfe.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 0423877eabca7cfe.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/0423877eabca7cfe.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/0423877eabca7cfe.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mc2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mc2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 83.846 ms
+
+--- sweep 078c0fdc02207e03.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/078c0fdc02207e03.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/078c0fdc02207e03.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 078c0fdc02207e03.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/078c0fdc02207e03.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/078c0fdc02207e03.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 078c0fdc02207e03.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/078c0fdc02207e03.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/078c0fdc02207e03.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 078c0fdc02207e03.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/078c0fdc02207e03.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/078c0fdc02207e03.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s3_mcb2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s3_mcb2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 80.222 ms
+
+--- sweep 0aa7fbf5fed0126a.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/0aa7fbf5fed0126a.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/0aa7fbf5fed0126a.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s3' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mpw4_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 93.569 ms
+
+--- sweep 0aa7fbf5fed0126a.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/0aa7fbf5fed0126a.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/0aa7fbf5fed0126a.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s3' for 'sm_89'
+ptxas info    : Function properties for flash_d64_mpw4_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 95.893 ms
+
+--- sweep 0aa7fbf5fed0126a.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/0aa7fbf5fed0126a.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/0aa7fbf5fed0126a.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s3' for 'sm_90'
+ptxas info    : Function properties for flash_d64_mpw4_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 103.472 ms
+
+--- sweep 0aa7fbf5fed0126a.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/0aa7fbf5fed0126a.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/0aa7fbf5fed0126a.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s3' for 'sm_90a'
+ptxas info    : Function properties for flash_d64_mpw4_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 103.701 ms
+
+--- sweep 1100c77c247045d2.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/1100c77c247045d2.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/1100c77c247045d2.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 1100c77c247045d2.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/1100c77c247045d2.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/1100c77c247045d2.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 1100c77c247045d2.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/1100c77c247045d2.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/1100c77c247045d2.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 1100c77c247045d2.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/1100c77c247045d2.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/1100c77c247045d2.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x128x64_s6_mc2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x128x64_s6_mc2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 34.121 ms
+
+--- sweep 1b1a6892bf02693a.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/1b1a6892bf02693a.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/1b1a6892bf02693a.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 1b1a6892bf02693a.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/1b1a6892bf02693a.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/1b1a6892bf02693a.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 1b1a6892bf02693a.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/1b1a6892bf02693a.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/1b1a6892bf02693a.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 1b1a6892bf02693a.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/1b1a6892bf02693a.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/1b1a6892bf02693a.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s3' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 84.883 ms
+
+--- sweep 1d0f829ae94fa104.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/1d0f829ae94fa104.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/1d0f829ae94fa104.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 1d0f829ae94fa104.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/1d0f829ae94fa104.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/1d0f829ae94fa104.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 1d0f829ae94fa104.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/1d0f829ae94fa104.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/1d0f829ae94fa104.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 1d0f829ae94fa104.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/1d0f829ae94fa104.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/1d0f829ae94fa104.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 85.629 ms
+
+--- sweep 20b3da6c66031af8.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/20b3da6c66031af8.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/20b3da6c66031af8.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 20b3da6c66031af8.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/20b3da6c66031af8.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/20b3da6c66031af8.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 20b3da6c66031af8.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/20b3da6c66031af8.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/20b3da6c66031af8.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 20b3da6c66031af8.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/20b3da6c66031af8.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/20b3da6c66031af8.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 87.870 ms
+
+--- sweep 276526c595af6dcc.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/276526c595af6dcc.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/276526c595af6dcc.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpc_lm_s8' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mpc_lm_s8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 147 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 101.694 ms
+
+--- sweep 276526c595af6dcc.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/276526c595af6dcc.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/276526c595af6dcc.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpc_lm_s8' for 'sm_89'
+ptxas info    : Function properties for flash_d128_mpc_lm_s8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 146 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 103.743 ms
+
+--- sweep 276526c595af6dcc.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/276526c595af6dcc.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/276526c595af6dcc.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpc_lm_s8' for 'sm_90'
+ptxas info    : Function properties for flash_d128_mpc_lm_s8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 115.342 ms
+
+--- sweep 276526c595af6dcc.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/276526c595af6dcc.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/276526c595af6dcc.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpc_lm_s8' for 'sm_90a'
+ptxas info    : Function properties for flash_d128_mpc_lm_s8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 112.366 ms
+
+--- sweep 325b17f519996d1c.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/325b17f519996d1c.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/325b17f519996d1c.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 325b17f519996d1c.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/325b17f519996d1c.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/325b17f519996d1c.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 325b17f519996d1c.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/325b17f519996d1c.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/325b17f519996d1c.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 325b17f519996d1c.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/325b17f519996d1c.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/325b17f519996d1c.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2_nostore' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2_nostore
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 64.134 ms
+
+--- sweep 400b785f8d97db81.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/400b785f8d97db81.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/400b785f8d97db81.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 400b785f8d97db81.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/400b785f8d97db81.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/400b785f8d97db81.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 400b785f8d97db81.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/400b785f8d97db81.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/400b785f8d97db81.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 400b785f8d97db81.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/400b785f8d97db81.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/400b785f8d97db81.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s3_mc2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s3_mc2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 83.958 ms
+
+--- sweep 4bb5b0b1f7798683.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/4bb5b0b1f7798683.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/4bb5b0b1f7798683.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpc_s4' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mpc_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 16384 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 50.414 ms
+
+--- sweep 4bb5b0b1f7798683.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/4bb5b0b1f7798683.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/4bb5b0b1f7798683.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpc_s4' for 'sm_89'
+ptxas info    : Function properties for flash_d64_mpc_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 95 registers, used 1 barriers, 16384 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 51.410 ms
+
+--- sweep 4bb5b0b1f7798683.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/4bb5b0b1f7798683.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/4bb5b0b1f7798683.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpc_s4' for 'sm_90'
+ptxas info    : Function properties for flash_d64_mpc_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 16384 bytes smem
+ptxas info    : Compile time = 54.474 ms
+
+--- sweep 4bb5b0b1f7798683.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/4bb5b0b1f7798683.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/4bb5b0b1f7798683.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpc_s4' for 'sm_90a'
+ptxas info    : Function properties for flash_d64_mpc_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 16384 bytes smem
+ptxas info    : Compile time = 54.697 ms
+
+--- sweep 4fa28e7eedee9021.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/4fa28e7eedee9021.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/4fa28e7eedee9021.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 4fa28e7eedee9021.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/4fa28e7eedee9021.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/4fa28e7eedee9021.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 4fa28e7eedee9021.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/4fa28e7eedee9021.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/4fa28e7eedee9021.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 4fa28e7eedee9021.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/4fa28e7eedee9021.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/4fa28e7eedee9021.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_tma_stage_probe' for 'sm_90a'
+ptxas info    : Function properties for wk_tma_stage_probe
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 12 registers, used 1 barriers
+ptxas info    : Compile time = 4.316 ms
+
+--- sweep 5edfce4762edabb4.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/5edfce4762edabb4.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/5edfce4762edabb4.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw2_lm_s3' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mpw2_lm_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 157 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 122.167 ms
+
+--- sweep 5edfce4762edabb4.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/5edfce4762edabb4.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/5edfce4762edabb4.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw2_lm_s3' for 'sm_89'
+ptxas info    : Function properties for flash_d128_mpw2_lm_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 157 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 125.729 ms
+
+--- sweep 5edfce4762edabb4.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/5edfce4762edabb4.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/5edfce4762edabb4.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw2_lm_s3' for 'sm_90'
+ptxas info    : Function properties for flash_d128_mpw2_lm_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 159 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 129.379 ms
+
+--- sweep 5edfce4762edabb4.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/5edfce4762edabb4.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/5edfce4762edabb4.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw2_lm_s3' for 'sm_90a'
+ptxas info    : Function properties for flash_d128_mpw2_lm_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 159 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 124.081 ms
+
+--- sweep 5fb6466ac42926be.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/5fb6466ac42926be.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/5fb6466ac42926be.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 5fb6466ac42926be.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/5fb6466ac42926be.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/5fb6466ac42926be.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 5fb6466ac42926be.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/5fb6466ac42926be.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/5fb6466ac42926be.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 5fb6466ac42926be.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/5fb6466ac42926be.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/5fb6466ac42926be.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_bf16_128x256x64_s4' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_bf16_128x256x64_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 87.765 ms
+
+--- sweep 6514a1f673080858.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/6514a1f673080858.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/6514a1f673080858.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 6514a1f673080858.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/6514a1f673080858.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/6514a1f673080858.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 6514a1f673080858.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/6514a1f673080858.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/6514a1f673080858.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 6514a1f673080858.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/6514a1f673080858.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/6514a1f673080858.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2_ef' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2_ef
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 86.210 ms
+
+--- sweep 65586c0eedd24bdf.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/65586c0eedd24bdf.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/65586c0eedd24bdf.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mp_s4' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mp_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 1 barriers, 16384 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 48.210 ms
+
+--- sweep 65586c0eedd24bdf.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/65586c0eedd24bdf.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/65586c0eedd24bdf.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mp_s4' for 'sm_89'
+ptxas info    : Function properties for flash_d64_mp_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 16384 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 48.004 ms
+
+--- sweep 65586c0eedd24bdf.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/65586c0eedd24bdf.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/65586c0eedd24bdf.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mp_s4' for 'sm_90'
+ptxas info    : Function properties for flash_d64_mp_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 1 barriers, 16384 bytes smem
+ptxas info    : Compile time = 56.257 ms
+
+--- sweep 65586c0eedd24bdf.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/65586c0eedd24bdf.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/65586c0eedd24bdf.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mp_s4' for 'sm_90a'
+ptxas info    : Function properties for flash_d64_mp_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 1 barriers, 16384 bytes smem
+ptxas info    : Compile time = 56.462 ms
+
+--- sweep 76b1ec1c50e63603.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/76b1ec1c50e63603.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/76b1ec1c50e63603.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 76b1ec1c50e63603.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/76b1ec1c50e63603.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/76b1ec1c50e63603.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 76b1ec1c50e63603.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/76b1ec1c50e63603.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/76b1ec1c50e63603.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 76b1ec1c50e63603.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/76b1ec1c50e63603.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/76b1ec1c50e63603.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2_v2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2_v2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 86.177 ms
+
+--- sweep 7a344f310e6ea304.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/7a344f310e6ea304.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/7a344f310e6ea304.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 7a344f310e6ea304.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/7a344f310e6ea304.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/7a344f310e6ea304.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 7a344f310e6ea304.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/7a344f310e6ea304.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/7a344f310e6ea304.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 7a344f310e6ea304.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/7a344f310e6ea304.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/7a344f310e6ea304.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 85.079 ms
+
+--- sweep 7d50517b8ee76855.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/7d50517b8ee76855.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/7d50517b8ee76855.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 7d50517b8ee76855.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/7d50517b8ee76855.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/7d50517b8ee76855.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 7d50517b8ee76855.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/7d50517b8ee76855.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/7d50517b8ee76855.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 7d50517b8ee76855.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/7d50517b8ee76855.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/7d50517b8ee76855.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x128x64_s6_mcb2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x128x64_s6_mcb2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 33.781 ms
+
+--- sweep 7e67e1f3f25c5b2a.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/7e67e1f3f25c5b2a.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/7e67e1f3f25c5b2a.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s8' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mp_lm_s8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 145 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 94.592 ms
+
+--- sweep 7e67e1f3f25c5b2a.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/7e67e1f3f25c5b2a.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/7e67e1f3f25c5b2a.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s8' for 'sm_89'
+ptxas info    : Function properties for flash_d128_mp_lm_s8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 143 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 101.024 ms
+
+--- sweep 7e67e1f3f25c5b2a.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/7e67e1f3f25c5b2a.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/7e67e1f3f25c5b2a.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s8' for 'sm_90'
+ptxas info    : Function properties for flash_d128_mp_lm_s8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 110.885 ms
+
+--- sweep 7e67e1f3f25c5b2a.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/7e67e1f3f25c5b2a.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/7e67e1f3f25c5b2a.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s8' for 'sm_90a'
+ptxas info    : Function properties for flash_d128_mp_lm_s8
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 112.740 ms
+
+--- sweep 86292b28b348d49c.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/86292b28b348d49c.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/86292b28b348d49c.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 86292b28b348d49c.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/86292b28b348d49c.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/86292b28b348d49c.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep 86292b28b348d49c.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/86292b28b348d49c.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/86292b28b348d49c.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep 86292b28b348d49c.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/86292b28b348d49c.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/86292b28b348d49c.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 80.235 ms
+
+--- sweep 8ade5369c16e2fd9.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/8ade5369c16e2fd9.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/8ade5369c16e2fd9.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wide_swz_256x128_s6_mc1' for 'sm_80'
+ptxas info    : Function properties for wide_swz_256x128_s6_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 51.135 ms
+ptxas info    : Compiling entry function 'wide_swz_128x256_s6_mc1' for 'sm_80'
+ptxas info    : Function properties for wide_swz_128x256_s6_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 46.976 ms
+ptxas info    : Compiling entry function 'wide_swz_128x256_s5_mc1' for 'sm_80'
+ptxas info    : Function properties for wide_swz_128x256_s5_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 43.931 ms
+ptxas info    : Compiling entry function 'wide_swz_128_s7' for 'sm_80'
+ptxas info    : Function properties for wide_swz_128_s7
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 23.505 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s4' for 'sm_80'
+ptxas info    : Function properties for deep_swz_256x128_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 40.275 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s3' for 'sm_80'
+ptxas info    : Function properties for deep_swz_256x128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 41.048 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s2' for 'sm_80'
+ptxas info    : Function properties for deep_swz_256x128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 40.759 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s4_mc1' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128x256_s4_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 44.563 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s4' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128x256_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 43.691 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s3' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128x256_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 40.752 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s2' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128x256_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 40.115 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s5' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128_s5
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 20.744 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s4' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 19.225 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s3' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 18.559 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s2' for 'sm_80'
+ptxas info    : Function properties for deep_swz_128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 32768 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 17.599 ms
+
+--- sweep 8ade5369c16e2fd9.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/8ade5369c16e2fd9.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/8ade5369c16e2fd9.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wide_swz_256x128_s6_mc1' for 'sm_89'
+ptxas info    : Function properties for wide_swz_256x128_s6_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 51.201 ms
+ptxas info    : Compiling entry function 'wide_swz_128x256_s6_mc1' for 'sm_89'
+ptxas info    : Function properties for wide_swz_128x256_s6_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 49.081 ms
+ptxas info    : Compiling entry function 'wide_swz_128x256_s5_mc1' for 'sm_89'
+ptxas info    : Function properties for wide_swz_128x256_s5_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 45.907 ms
+ptxas info    : Compiling entry function 'wide_swz_128_s7' for 'sm_89'
+ptxas info    : Function properties for wide_swz_128_s7
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 24.519 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s4' for 'sm_89'
+ptxas info    : Function properties for deep_swz_256x128_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 41.522 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s3' for 'sm_89'
+ptxas info    : Function properties for deep_swz_256x128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 41.887 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s2' for 'sm_89'
+ptxas info    : Function properties for deep_swz_256x128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 40.229 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s4_mc1' for 'sm_89'
+ptxas info    : Function properties for deep_swz_128x256_s4_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 254 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 43.987 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s4' for 'sm_89'
+ptxas info    : Function properties for deep_swz_128x256_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 43.209 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s3' for 'sm_89'
+ptxas info    : Function properties for deep_swz_128x256_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 41.342 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s2' for 'sm_89'
+ptxas info    : Function properties for deep_swz_128x256_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 39.709 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s5' for 'sm_89'
+ptxas info    : Function properties for deep_swz_128_s5
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 20.006 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s4' for 'sm_89'
+ptxas info    : Function properties for deep_swz_128_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 19.145 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s3' for 'sm_89'
+ptxas info    : Function properties for deep_swz_128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 17.650 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s2' for 'sm_89'
+ptxas info    : Function properties for deep_swz_128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 32768 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 18.021 ms
+
+--- sweep 8ade5369c16e2fd9.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/8ade5369c16e2fd9.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/8ade5369c16e2fd9.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wide_swz_256x128_s6_mc1' for 'sm_90'
+ptxas info    : Function properties for wide_swz_256x128_s6_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 246 registers, used 1 barriers
+ptxas info    : Compile time = 59.358 ms
+ptxas info    : Compiling entry function 'wide_swz_128x256_s6_mc1' for 'sm_90'
+ptxas info    : Function properties for wide_swz_128x256_s6_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 250 registers, used 1 barriers
+ptxas info    : Compile time = 54.401 ms
+ptxas info    : Compiling entry function 'wide_swz_128x256_s5_mc1' for 'sm_90'
+ptxas info    : Function properties for wide_swz_128x256_s5_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 250 registers, used 1 barriers
+ptxas info    : Compile time = 52.352 ms
+ptxas info    : Compiling entry function 'wide_swz_128_s7' for 'sm_90'
+ptxas info    : Function properties for wide_swz_128_s7
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers
+ptxas info    : Compile time = 27.442 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s4' for 'sm_90'
+ptxas info    : Function properties for deep_swz_256x128_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 46.209 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s3' for 'sm_90'
+ptxas info    : Function properties for deep_swz_256x128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 46.757 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s2' for 'sm_90'
+ptxas info    : Function properties for deep_swz_256x128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 45.271 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s4_mc1' for 'sm_90'
+ptxas info    : Function properties for deep_swz_128x256_s4_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 250 registers, used 1 barriers
+ptxas info    : Compile time = 52.170 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s4' for 'sm_90'
+ptxas info    : Function properties for deep_swz_128x256_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 51.571 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s3' for 'sm_90'
+ptxas info    : Function properties for deep_swz_128x256_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 48.584 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s2' for 'sm_90'
+ptxas info    : Function properties for deep_swz_128x256_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 45.752 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s5' for 'sm_90'
+ptxas info    : Function properties for deep_swz_128_s5
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers
+ptxas info    : Compile time = 25.969 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s4' for 'sm_90'
+ptxas info    : Function properties for deep_swz_128_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers
+ptxas info    : Compile time = 22.521 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s3' for 'sm_90'
+ptxas info    : Function properties for deep_swz_128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 21.277 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s2' for 'sm_90'
+ptxas info    : Function properties for deep_swz_128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 32768 bytes smem
+ptxas info    : Compile time = 20.016 ms
+
+--- sweep 8ade5369c16e2fd9.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/8ade5369c16e2fd9.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/8ade5369c16e2fd9.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wide_swz_256x128_s6_mc1' for 'sm_90a'
+ptxas info    : Function properties for wide_swz_256x128_s6_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 246 registers, used 1 barriers
+ptxas info    : Compile time = 61.179 ms
+ptxas info    : Compiling entry function 'wide_swz_128x256_s6_mc1' for 'sm_90a'
+ptxas info    : Function properties for wide_swz_128x256_s6_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 250 registers, used 1 barriers
+ptxas info    : Compile time = 57.782 ms
+ptxas info    : Compiling entry function 'wide_swz_128x256_s5_mc1' for 'sm_90a'
+ptxas info    : Function properties for wide_swz_128x256_s5_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 250 registers, used 1 barriers
+ptxas info    : Compile time = 52.530 ms
+ptxas info    : Compiling entry function 'wide_swz_128_s7' for 'sm_90a'
+ptxas info    : Function properties for wide_swz_128_s7
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers
+ptxas info    : Compile time = 27.196 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s4' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_256x128_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 47.114 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s3' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_256x128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 48.800 ms
+ptxas info    : Compiling entry function 'deep_swz_256x128_s2' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_256x128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 45.603 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s4_mc1' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_128x256_s4_mc1
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 250 registers, used 1 barriers
+ptxas info    : Compile time = 50.993 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s4' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_128x256_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 51.451 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s3' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_128x256_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 48.127 ms
+ptxas info    : Compiling entry function 'deep_swz_128x256_s2' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_128x256_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 45.343 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s5' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_128_s5
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers
+ptxas info    : Compile time = 26.061 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s4' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_128_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers
+ptxas info    : Compile time = 22.760 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s3' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_128_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 21.676 ms
+ptxas info    : Compiling entry function 'deep_swz_128_s2' for 'sm_90a'
+ptxas info    : Function properties for deep_swz_128_s2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 32768 bytes smem
+ptxas info    : Compile time = 20.517 ms
+
+--- sweep 9062979b7d1d9c8e.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/9062979b7d1d9c8e.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/9062979b7d1d9c8e.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw4_lm_s3' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mpw4_lm_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 171 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 192.787 ms
+
+--- sweep 9062979b7d1d9c8e.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/9062979b7d1d9c8e.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/9062979b7d1d9c8e.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw4_lm_s3' for 'sm_89'
+ptxas info    : Function properties for flash_d128_mpw4_lm_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 171 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 187.855 ms
+
+--- sweep 9062979b7d1d9c8e.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/9062979b7d1d9c8e.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/9062979b7d1d9c8e.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw4_lm_s3' for 'sm_90'
+ptxas info    : Function properties for flash_d128_mpw4_lm_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 171 registers, used 1 barriers
+ptxas info    : Compile time = 199.694 ms
+
+--- sweep 9062979b7d1d9c8e.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/9062979b7d1d9c8e.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/9062979b7d1d9c8e.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw4_lm_s3' for 'sm_90a'
+ptxas info    : Function properties for flash_d128_mpw4_lm_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 171 registers, used 1 barriers
+ptxas info    : Compile time = 195.000 ms
+
+--- sweep 91a9a3fcbb370e89.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/91a9a3fcbb370e89.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/91a9a3fcbb370e89.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s6' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mp_lm_s6
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 145 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 104.232 ms
+
+--- sweep 91a9a3fcbb370e89.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/91a9a3fcbb370e89.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/91a9a3fcbb370e89.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s6' for 'sm_89'
+ptxas info    : Function properties for flash_d128_mp_lm_s6
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 143 registers, used 1 barriers, 49152 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 104.973 ms
+
+--- sweep 91a9a3fcbb370e89.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/91a9a3fcbb370e89.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/91a9a3fcbb370e89.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s6' for 'sm_90'
+ptxas info    : Function properties for flash_d128_mp_lm_s6
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 111.335 ms
+
+--- sweep 91a9a3fcbb370e89.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/91a9a3fcbb370e89.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/91a9a3fcbb370e89.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s6' for 'sm_90a'
+ptxas info    : Function properties for flash_d128_mp_lm_s6
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 49152 bytes smem
+ptxas info    : Compile time = 111.695 ms
+
+--- sweep ae250f28561a7cde.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/ae250f28561a7cde.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/ae250f28561a7cde.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep ae250f28561a7cde.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/ae250f28561a7cde.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/ae250f28561a7cde.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep ae250f28561a7cde.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/ae250f28561a7cde.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/ae250f28561a7cde.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep ae250f28561a7cde.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/ae250f28561a7cde.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/ae250f28561a7cde.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s4_mcb2_efol' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s4_mcb2_efol
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 84.905 ms
+
+--- sweep b96b71f4b8a625bb.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/b96b71f4b8a625bb.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/b96b71f4b8a625bb.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep b96b71f4b8a625bb.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/b96b71f4b8a625bb.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/b96b71f4b8a625bb.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep b96b71f4b8a625bb.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/b96b71f4b8a625bb.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/b96b71f4b8a625bb.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep b96b71f4b8a625bb.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/b96b71f4b8a625bb.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/b96b71f4b8a625bb.ptx
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 158 by compiler to allow use of registers in GMMA in function 'wk_wgmma_desc_sweep'
+ptxas info    : (C7519) warpgroup.arrive is injected in around line 162 by compiler to allow use of registers in GMMA in function 'wk_wgmma_desc_sweep'
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_wgmma_desc_sweep' for 'sm_90a'
+ptxas info    : Function properties for wk_wgmma_desc_sweep
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 58 registers, used 1 barriers
+ptxas info    : Compile time = 10.997 ms
+
+--- sweep be073aec622da03d.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/be073aec622da03d.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/be073aec622da03d.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s5' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mpw4_s5
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 102.798 ms
+
+--- sweep be073aec622da03d.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/be073aec622da03d.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/be073aec622da03d.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s5' for 'sm_89'
+ptxas info    : Function properties for flash_d64_mpw4_s5
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 102.576 ms
+
+--- sweep be073aec622da03d.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/be073aec622da03d.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/be073aec622da03d.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s5' for 'sm_90'
+ptxas info    : Function properties for flash_d64_mpw4_s5
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers
+ptxas info    : Compile time = 111.745 ms
+
+--- sweep be073aec622da03d.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/be073aec622da03d.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/be073aec622da03d.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s5' for 'sm_90a'
+ptxas info    : Function properties for flash_d64_mpw4_s5
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers
+ptxas info    : Compile time = 112.106 ms
+
+--- sweep bfc7ba457d406309.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/bfc7ba457d406309.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/bfc7ba457d406309.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s4' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mp_lm_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 145 registers, used 1 barriers, 32768 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 92.063 ms
+
+--- sweep bfc7ba457d406309.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/bfc7ba457d406309.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/bfc7ba457d406309.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s4' for 'sm_89'
+ptxas info    : Function properties for flash_d128_mp_lm_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 143 registers, used 1 barriers, 32768 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 93.778 ms
+
+--- sweep bfc7ba457d406309.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/bfc7ba457d406309.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/bfc7ba457d406309.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s4' for 'sm_90'
+ptxas info    : Function properties for flash_d128_mp_lm_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 32768 bytes smem
+ptxas info    : Compile time = 100.529 ms
+
+--- sweep bfc7ba457d406309.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/bfc7ba457d406309.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/bfc7ba457d406309.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mp_lm_s4' for 'sm_90a'
+ptxas info    : Function properties for flash_d128_mp_lm_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers, 32768 bytes smem
+ptxas info    : Compile time = 99.730 ms
+
+--- sweep c0765073f194efb1.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/c0765073f194efb1.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/c0765073f194efb1.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep c0765073f194efb1.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/c0765073f194efb1.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/c0765073f194efb1.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep c0765073f194efb1.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/c0765073f194efb1.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/c0765073f194efb1.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep c0765073f194efb1.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/c0765073f194efb1.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/c0765073f194efb1.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x128x64_s6' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x128x64_s6
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 35.514 ms
+
+--- sweep c0e20d1d2567bba8.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/c0e20d1d2567bba8.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/c0e20d1d2567bba8.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mp_s3' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mp_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, used 1 barriers, 12288 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 45.443 ms
+
+--- sweep c0e20d1d2567bba8.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/c0e20d1d2567bba8.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/c0e20d1d2567bba8.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mp_s3' for 'sm_89'
+ptxas info    : Function properties for flash_d64_mp_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 96 registers, used 1 barriers, 12288 bytes smem, 392 bytes cmem[0]
+ptxas info    : Compile time = 45.223 ms
+
+--- sweep c0e20d1d2567bba8.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/c0e20d1d2567bba8.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/c0e20d1d2567bba8.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mp_s3' for 'sm_90'
+ptxas info    : Function properties for flash_d64_mp_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 1 barriers, 12288 bytes smem
+ptxas info    : Compile time = 51.396 ms
+
+--- sweep c0e20d1d2567bba8.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/c0e20d1d2567bba8.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/c0e20d1d2567bba8.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mp_s3' for 'sm_90a'
+ptxas info    : Function properties for flash_d64_mp_s3
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 94 registers, used 1 barriers, 12288 bytes smem
+ptxas info    : Compile time = 51.906 ms
+
+--- sweep c1d8b732943faa05.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/c1d8b732943faa05.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/c1d8b732943faa05.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s4' for 'sm_80'
+ptxas info    : Function properties for flash_d64_mpw4_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 92.767 ms
+
+--- sweep c1d8b732943faa05.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/c1d8b732943faa05.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/c1d8b732943faa05.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s4' for 'sm_89'
+ptxas info    : Function properties for flash_d64_mpw4_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 127 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 97.591 ms
+
+--- sweep c1d8b732943faa05.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/c1d8b732943faa05.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/c1d8b732943faa05.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s4' for 'sm_90'
+ptxas info    : Function properties for flash_d64_mpw4_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers
+ptxas info    : Compile time = 104.613 ms
+
+--- sweep c1d8b732943faa05.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/c1d8b732943faa05.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/c1d8b732943faa05.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d64_mpw4_s4' for 'sm_90a'
+ptxas info    : Function properties for flash_d64_mpw4_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, used 1 barriers
+ptxas info    : Compile time = 104.951 ms
+
+--- sweep cab53601c7f43ebd.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/cab53601c7f43ebd.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/cab53601c7f43ebd.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep cab53601c7f43ebd.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/cab53601c7f43ebd.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/cab53601c7f43ebd.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep cab53601c7f43ebd.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/cab53601c7f43ebd.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/cab53601c7f43ebd.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep cab53601c7f43ebd.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/cab53601c7f43ebd.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/cab53601c7f43ebd.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s2_mcb2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s2_mcb2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 79.459 ms
+
+--- sweep d7f91d9934e94604.ptx (.target sm_80) -> --gpu-name=sm_80 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/d7f91d9934e94604.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/d7f91d9934e94604.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw2_lm_s4' for 'sm_80'
+ptxas info    : Function properties for flash_d128_mpw2_lm_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 157 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 118.979 ms
+
+--- sweep d7f91d9934e94604.ptx (.target sm_80) -> --gpu-name=sm_89 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/d7f91d9934e94604.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/d7f91d9934e94604.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw2_lm_s4' for 'sm_89'
+ptxas info    : Function properties for flash_d128_mpw2_lm_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 157 registers, used 1 barriers, 392 bytes cmem[0]
+ptxas info    : Compile time = 120.659 ms
+
+--- sweep d7f91d9934e94604.ptx (.target sm_80) -> --gpu-name=sm_90 (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/d7f91d9934e94604.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/d7f91d9934e94604.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw2_lm_s4' for 'sm_90'
+ptxas info    : Function properties for flash_d128_mpw2_lm_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 159 registers, used 1 barriers
+ptxas info    : Compile time = 130.285 ms
+
+--- sweep d7f91d9934e94604.ptx (.target sm_80) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/d7f91d9934e94604.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/d7f91d9934e94604.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'flash_d128_mpw2_lm_s4' for 'sm_90a'
+ptxas info    : Function properties for flash_d128_mpw2_lm_s4
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 159 registers, used 1 barriers
+ptxas info    : Compile time = 130.765 ms
+
+--- sweep f53d6e134a5f8df2.ptx (.target sm_90a) -> --gpu-name=sm_80 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_80 -o /tmp/wukong-ptxas-sweep/f53d6e134a5f8df2.ptx.sm_80.cubin /persist/ptx-archive/20260811-231146/f53d6e134a5f8df2.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep f53d6e134a5f8df2.ptx (.target sm_90a) -> --gpu-name=sm_89 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_89 -o /tmp/wukong-ptxas-sweep/f53d6e134a5f8df2.ptx.sm_89.cubin /persist/ptx-archive/20260811-231146/f53d6e134a5f8df2.ptx
+ptxas fatal   : SM version specified by .target is higher than default SM version assumed
+
+--- sweep f53d6e134a5f8df2.ptx (.target sm_90a) -> --gpu-name=sm_90 (rc=255; expected to decline) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90 -o /tmp/wukong-ptxas-sweep/f53d6e134a5f8df2.ptx.sm_90.cubin /persist/ptx-archive/20260811-231146/f53d6e134a5f8df2.ptx
+ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'
+
+--- sweep f53d6e134a5f8df2.ptx (.target sm_90a) -> --gpu-name=sm_90a (rc=0) ---
+/usr/local/cuda-12.9/bin/ptxas -O3 -v --gpu-name=sm_90a -o /tmp/wukong-ptxas-sweep/f53d6e134a5f8df2.ptx.sm_90a.cubin /persist/ptx-archive/20260811-231146/f53d6e134a5f8df2.ptx
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wgmma_nt_f16_128x256x64_s2_mc2' for 'sm_90a'
+ptxas info    : Function properties for wgmma_nt_f16_128x256x64_s2_mc2
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 1 barriers
+ptxas info    : Compile time = 79.156 ms
+
+
+--- parsed census (declared floor) ---
+{"arch": "sm_80", "barriers": 1, "entry": "wide_swz_256x128_s6_mc1", "regs": 254, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "wide_swz_128x256_s6_mc1", "regs": 254, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "wide_swz_128x256_s5_mc1", "regs": 254, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "wide_swz_128_s7", "regs": 96, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_256x128_s4", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_256x128_s3", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_256x128_s2", "regs": 168, "smem": 49152, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128x256_s4_mc1", "regs": 254, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128x256_s4", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128x256_s3", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128x256_s2", "regs": 168, "smem": 49152, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128_s5", "regs": 96, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128_s4", "regs": 96, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128_s3", "regs": 96, "smem": 49152, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128_s2", "regs": 96, "smem": 32768, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mp_s3", "regs": 80, "smem": 12288, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mp_s4", "regs": 94, "smem": 16384, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mpc_s4", "regs": 96, "smem": 16384, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mp_lm_s4", "regs": 145, "smem": 32768, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mp_lm_s6", "regs": 145, "smem": 49152, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mp_lm_s8", "regs": 145, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mpc_lm_s8", "regs": 147, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mpw4_s3", "regs": 127, "smem": 49152, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mpw4_s4", "regs": 127, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mpw4_s5", "regs": 127, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mpw2_lm_s3", "regs": 157, "smem": 49152, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mpw2_lm_s4", "regs": 157, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mpw4_lm_s3", "regs": 171, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_bf16_128x256x64_s4", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x128x64_s6", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mc2", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s3", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s3_mcb2", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s3_mc2", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s2", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s2_mcb2", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s2_mc2", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x128x64_s6_mcb2", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x128x64_s6_mc2", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2_v2", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2_ef", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2_efol", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2_nostore", "regs": 168, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wk_wgmma_desc_sweep", "regs": 58, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wk_tma_stage_probe", "regs": 12, "smem": 0, "source": "test-run", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+
+--- parsed census (per-arch sweep) ---
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mc2", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s3_mcb2", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mpw4_s3", "regs": 127, "smem": 49152, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d64_mpw4_s3", "regs": 127, "smem": 49152, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d64_mpw4_s3", "regs": 128, "smem": 49152, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d64_mpw4_s3", "regs": 128, "smem": 49152, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x128x64_s6_mc2", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s3", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s2", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mpc_lm_s8", "regs": 147, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d128_mpc_lm_s8", "regs": 146, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d128_mpc_lm_s8", "regs": 168, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d128_mpc_lm_s8", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2_nostore", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s3_mc2", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mpc_s4", "regs": 96, "smem": 16384, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d64_mpc_s4", "regs": 95, "smem": 16384, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d64_mpc_s4", "regs": 96, "smem": 16384, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d64_mpc_s4", "regs": 96, "smem": 16384, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wk_tma_stage_probe", "regs": 12, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mpw2_lm_s3", "regs": 157, "smem": 49152, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d128_mpw2_lm_s3", "regs": 157, "smem": 49152, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d128_mpw2_lm_s3", "regs": 159, "smem": 49152, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d128_mpw2_lm_s3", "regs": 159, "smem": 49152, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_bf16_128x256x64_s4", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2_ef", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mp_s4", "regs": 94, "smem": 16384, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d64_mp_s4", "regs": 96, "smem": 16384, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d64_mp_s4", "regs": 94, "smem": 16384, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d64_mp_s4", "regs": 94, "smem": 16384, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2_v2", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x128x64_s6_mcb2", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mp_lm_s8", "regs": 145, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d128_mp_lm_s8", "regs": 143, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d128_mp_lm_s8", "regs": 168, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d128_mp_lm_s8", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "wide_swz_256x128_s6_mc1", "regs": 254, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "wide_swz_128x256_s6_mc1", "regs": 254, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "wide_swz_128x256_s5_mc1", "regs": 254, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "wide_swz_128_s7", "regs": 96, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_256x128_s4", "regs": 168, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_256x128_s3", "regs": 168, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_256x128_s2", "regs": 168, "smem": 49152, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128x256_s4_mc1", "regs": 254, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128x256_s4", "regs": 168, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128x256_s3", "regs": 168, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128x256_s2", "regs": 168, "smem": 49152, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128_s5", "regs": 96, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128_s4", "regs": 96, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128_s3", "regs": 96, "smem": 49152, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "deep_swz_128_s2", "regs": 96, "smem": 32768, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "wide_swz_256x128_s6_mc1", "regs": 254, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "wide_swz_128x256_s6_mc1", "regs": 254, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "wide_swz_128x256_s5_mc1", "regs": 254, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "wide_swz_128_s7", "regs": 96, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_256x128_s4", "regs": 168, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_256x128_s3", "regs": 168, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_256x128_s2", "regs": 168, "smem": 49152, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_128x256_s4_mc1", "regs": 254, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_128x256_s4", "regs": 168, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_128x256_s3", "regs": 168, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_128x256_s2", "regs": 168, "smem": 49152, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_128_s5", "regs": 96, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_128_s4", "regs": 96, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_128_s3", "regs": 96, "smem": 49152, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "deep_swz_128_s2", "regs": 96, "smem": 32768, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "wide_swz_256x128_s6_mc1", "regs": 246, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "wide_swz_128x256_s6_mc1", "regs": 250, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "wide_swz_128x256_s5_mc1", "regs": 250, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "wide_swz_128_s7", "regs": 96, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_256x128_s4", "regs": 168, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_256x128_s3", "regs": 168, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_256x128_s2", "regs": 168, "smem": 49152, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_128x256_s4_mc1", "regs": 250, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_128x256_s4", "regs": 168, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_128x256_s3", "regs": 168, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_128x256_s2", "regs": 168, "smem": 49152, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_128_s5", "regs": 96, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_128_s4", "regs": 96, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_128_s3", "regs": 96, "smem": 49152, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "deep_swz_128_s2", "regs": 96, "smem": 32768, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wide_swz_256x128_s6_mc1", "regs": 246, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wide_swz_128x256_s6_mc1", "regs": 250, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wide_swz_128x256_s5_mc1", "regs": 250, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wide_swz_128_s7", "regs": 96, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_256x128_s4", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_256x128_s3", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_256x128_s2", "regs": 168, "smem": 49152, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_128x256_s4_mc1", "regs": 250, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_128x256_s4", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_128x256_s3", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_128x256_s2", "regs": 168, "smem": 49152, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_128_s5", "regs": 96, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_128_s4", "regs": 96, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_128_s3", "regs": 96, "smem": 49152, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "deep_swz_128_s2", "regs": 96, "smem": 32768, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mpw4_lm_s3", "regs": 171, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d128_mpw4_lm_s3", "regs": 171, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d128_mpw4_lm_s3", "regs": 171, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d128_mpw4_lm_s3", "regs": 171, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mp_lm_s6", "regs": 145, "smem": 49152, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d128_mp_lm_s6", "regs": 143, "smem": 49152, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d128_mp_lm_s6", "regs": 168, "smem": 49152, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d128_mp_lm_s6", "regs": 168, "smem": 49152, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s4_mcb2_efol", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wk_wgmma_desc_sweep", "regs": 58, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mpw4_s5", "regs": 127, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d64_mpw4_s5", "regs": 127, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d64_mpw4_s5", "regs": 128, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d64_mpw4_s5", "regs": 128, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mp_lm_s4", "regs": 145, "smem": 32768, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d128_mp_lm_s4", "regs": 143, "smem": 32768, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d128_mp_lm_s4", "regs": 168, "smem": 32768, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d128_mp_lm_s4", "regs": 168, "smem": 32768, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x128x64_s6", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mp_s3", "regs": 80, "smem": 12288, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d64_mp_s3", "regs": 96, "smem": 12288, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d64_mp_s3", "regs": 94, "smem": 12288, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d64_mp_s3", "regs": 94, "smem": 12288, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d64_mpw4_s4", "regs": 127, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d64_mpw4_s4", "regs": 127, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d64_mpw4_s4", "regs": 128, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d64_mpw4_s4", "regs": 128, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s2_mcb2", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_80", "barriers": 1, "entry": "flash_d128_mpw2_lm_s4", "regs": 157, "smem": 0, "source": "sweep:sm_80", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_89", "barriers": 1, "entry": "flash_d128_mpw2_lm_s4", "regs": 157, "smem": 0, "source": "sweep:sm_89", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90", "barriers": 1, "entry": "flash_d128_mpw2_lm_s4", "regs": 159, "smem": 0, "source": "sweep:sm_90", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "flash_d128_mpw2_lm_s4", "regs": 159, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+{"arch": "sm_90a", "barriers": 1, "entry": "wgmma_nt_f16_128x256x64_s2_mc2", "regs": 168, "smem": 0, "source": "sweep:sm_90a", "spill_any": 0, "spill_ld": 0, "spill_st": 0, "stack": 0}
+
+--- ptxas declined ---
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "0423877eabca7cfe.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "0423877eabca7cfe.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "0423877eabca7cfe.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s3_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "078c0fdc02207e03.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s3_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "078c0fdc02207e03.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s3_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "078c0fdc02207e03.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x128x64_s6_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "1100c77c247045d2.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x128x64_s6_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "1100c77c247045d2.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x128x64_s6_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "1100c77c247045d2.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s3"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "1b1a6892bf02693a.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s3"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "1b1a6892bf02693a.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s3"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "1b1a6892bf02693a.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "1d0f829ae94fa104.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "1d0f829ae94fa104.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "1d0f829ae94fa104.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "20b3da6c66031af8.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "20b3da6c66031af8.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "20b3da6c66031af8.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_nostore"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "325b17f519996d1c.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_nostore"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "325b17f519996d1c.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_nostore"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "325b17f519996d1c.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s3_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "400b785f8d97db81.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s3_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "400b785f8d97db81.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s3_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "400b785f8d97db81.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wk_tma_stage_probe"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "4fa28e7eedee9021.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wk_tma_stage_probe"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "4fa28e7eedee9021.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wk_tma_stage_probe"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "4fa28e7eedee9021.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_bf16_128x256x64_s4"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "5fb6466ac42926be.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_bf16_128x256x64_s4"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "5fb6466ac42926be.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_bf16_128x256x64_s4"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "5fb6466ac42926be.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_ef"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "6514a1f673080858.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_ef"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "6514a1f673080858.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_ef"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "6514a1f673080858.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_v2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "76b1ec1c50e63603.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_v2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "76b1ec1c50e63603.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_v2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "76b1ec1c50e63603.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "7a344f310e6ea304.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "7a344f310e6ea304.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "7a344f310e6ea304.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x128x64_s6_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "7d50517b8ee76855.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x128x64_s6_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "7d50517b8ee76855.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x128x64_s6_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "7d50517b8ee76855.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "86292b28b348d49c.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "86292b28b348d49c.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "86292b28b348d49c.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_efol"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "ae250f28561a7cde.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_efol"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "ae250f28561a7cde.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s4_mcb2_efol"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "ae250f28561a7cde.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wk_wgmma_desc_sweep"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "b96b71f4b8a625bb.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wk_wgmma_desc_sweep"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "b96b71f4b8a625bb.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wk_wgmma_desc_sweep"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "b96b71f4b8a625bb.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x128x64_s6"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "c0765073f194efb1.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x128x64_s6"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "c0765073f194efb1.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x128x64_s6"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "c0765073f194efb1.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s2_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "cab53601c7f43ebd.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s2_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "cab53601c7f43ebd.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s2_mcb2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "cab53601c7f43ebd.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}
+{"arch": "sm_80", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s2_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "f53d6e134a5f8df2.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_89", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s2_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "f53d6e134a5f8df2.ptx", "rc": 255, "why": "ptxas fatal   : SM version specified by .target is higher than default SM version assumed"}
+{"arch": "sm_90", "declared": "sm_90a", "entries": ["wgmma_nt_f16_128x256x64_s2_mc2"], "expected": "the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90", "ptx": "f53d6e134a5f8df2.ptx", "rc": 255, "why": "ptxas fatal   : PTX with .target 'sm_90a' cannot be compiled for architecture 'sm_90'"}

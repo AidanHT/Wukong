@@ -1,0 +1,1398 @@
+==============================================================================
+WUKONG ptxas AUDIT (CPU container, no GPU attached)
+==============================================================================
+utc            : 2026-08-11 22:41:24
+image          : nvidia/cuda:12.9.2-cudnn-devel-ubuntu22.04
+ptxas          : /usr/local/cuda-12.9/bin/ptxas
+archs          : sm_80, sm_89, sm_90, sm_90a
+filter         : wgmma
+skip           : gemm_cliff_ptxas_ab
+package        : wukong_codegen_gpu (debug)
+per-arch sweep : on
+hint passes    : off (the crate ignores the hint)
+note           : the source tree is mounted WITHOUT .git, so identify the tree by the
+                 local commit the operator ran this from.
+
+--- ptxas --version ---
+ptxas: NVIDIA (R) Ptx optimizing assembler
+Copyright (c) 2005-2025 NVIDIA Corporation
+Built on Tue_May_27_02:18:05_PDT_2025
+Cuda compilation tools, release 12.9, V12.9.86
+Build cuda_12.9.r12.9/compiler.36037853_0
+
+--- capture shim ---
+shim: /tmp/wukong-ptxas-shim/ptxas -> /usr/local/cuda-12.9/bin/ptxas
+self-test: transparent, and records
+
+--- self-test sm_80 (rc=0) ---
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry wk_ptxas_selftest(
+    .param .u64 wk_p
+)
+{
+    .reg .b32   %r<3>;
+    .reg .f32   %f<4>;
+    .reg .b64   %rd<4>;
+
+    ld.param.u64 %rd1, [wk_p];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd2];
+    mov.f32 %f2, 0f3F800000;
+    fma.rn.f32 %f3, %f1, %f2, %f2;
+    st.global.f32 [%rd2], %f3;
+    ret;
+}
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_ptxas_selftest' for 'sm_80'
+ptxas info    : Function properties for wk_ptxas_selftest
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers, 360 bytes cmem[0]
+ptxas info    : Compile time = 2.533 ms
+
+--- self-test sm_89 (rc=0) ---
+.version 7.8
+.target sm_89
+.address_size 64
+
+.visible .entry wk_ptxas_selftest(
+    .param .u64 wk_p
+)
+{
+    .reg .b32   %r<3>;
+    .reg .f32   %f<4>;
+    .reg .b64   %rd<4>;
+
+    ld.param.u64 %rd1, [wk_p];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd2];
+    mov.f32 %f2, 0f3F800000;
+    fma.rn.f32 %f3, %f1, %f2, %f2;
+    st.global.f32 [%rd2], %f3;
+    ret;
+}
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_ptxas_selftest' for 'sm_89'
+ptxas info    : Function properties for wk_ptxas_selftest
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers, 360 bytes cmem[0]
+ptxas info    : Compile time = 2.334 ms
+
+--- self-test sm_90 (rc=0) ---
+.version 8.0
+.target sm_90
+.address_size 64
+
+.visible .entry wk_ptxas_selftest(
+    .param .u64 wk_p
+)
+{
+    .reg .b32   %r<3>;
+    .reg .f32   %f<4>;
+    .reg .b64   %rd<4>;
+
+    ld.param.u64 %rd1, [wk_p];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd2];
+    mov.f32 %f2, 0f3F800000;
+    fma.rn.f32 %f3, %f1, %f2, %f2;
+    st.global.f32 [%rd2], %f3;
+    ret;
+}
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_ptxas_selftest' for 'sm_90'
+ptxas info    : Function properties for wk_ptxas_selftest
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 2.620 ms
+
+--- self-test sm_90a (rc=0) ---
+.version 8.0
+.target sm_90a
+.address_size 64
+
+.visible .entry wk_ptxas_selftest(
+    .param .u64 wk_p
+)
+{
+    .reg .b32   %r<3>;
+    .reg .f32   %f<4>;
+    .reg .b64   %rd<4>;
+
+    ld.param.u64 %rd1, [wk_p];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r1, %tid.x;
+    mul.wide.u32 %rd3, %r1, 4;
+    add.s64 %rd2, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd2];
+    mov.f32 %f2, 0f3F800000;
+    fma.rn.f32 %f3, %f1, %f2, %f2;
+    st.global.f32 [%rd2], %f3;
+    ret;
+}
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function 'wk_ptxas_selftest' for 'sm_90a'
+ptxas info    : Function properties for wk_ptxas_selftest
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 8 registers, used 0 barriers
+ptxas info    : Compile time = 3.125 ms
+
+--- census pass: WUKONG_PTXAS_ARCH=sm_80 WUKONG_PTXAS_ARCHS=sm_80,sm_89,sm_90,sm_90a (rc=101) ---
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_runtime-1h1dgdclho9l2/s-hl7b5l4kb4-0ecdo03-working`[0m
+
+[1m[33mwarning[0m: `wukong_runtime` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_interp-3cliahzxsxav8/s-hl7b6ohmxz-13di61h-working`[0m
+
+[1m[92m   Compiling[0m wukong_codegen_gpu v0.1.0 (/wukong/crates/wukong_codegen_gpu)
+[1m[33mwarning[0m: `wukong_interp` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_codegen_gpu-26y6ft8l794cr/s-hl99apim1l-1q4w5xc-working`[0m
+
+[1m[33mwarning[0m: `wukong_codegen_gpu` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_codegen_gpu-04tzhcvmx7xy3/s-hl99apil5f-1em4qr9-working`[0m
+
+[1m[33mwarning[0m: `wukong_codegen_gpu` (lib test) generated 1 warning
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 56.39s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+
+running 75 tests
+test gpu::tests::every_wgmma_entry_declares_exactly_the_parameters_the_launcher_pushes ... [gate] 18 wgmma entries declare exactly PARAM_ORDER (6 params, kinds in order) ✓
+ok
+test gpu::tests::wgmma_bf16_vs_cublas ... 
+thread 'gpu::tests::wgmma_bf16_vs_cublas' (639) panicked at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5:
+Unable to dynamically load the "cuda" shared library - searched for library names: ["libcuda.so", "libcuda64.so", "libcuda64_12.so", "libcuda64_126.so", "libcuda64_126_0.so", "libcuda64_120_6.so", "libcuda64_10.so", "libcuda64_120_0.so", "libcuda64_9.so", "libcuda.so.12", "libcuda.so.11", "libcuda.so.10", "libcuda.so.1", "libnvcuda.so", "libnvcuda64.so", "libnvcuda64_12.so", "libnvcuda64_126.so", "libnvcuda64_126_0.so", "libnvcuda64_120_6.so", "libnvcuda64_10.so", "libnvcuda64_120_0.so", "libnvcuda64_9.so", "libnvcuda.so.12", "libnvcuda.so.11", "libnvcuda.so.10", "libnvcuda.so.1"]. Ensure that `LD_LIBRARY_PATH` has the correct path to the installed library. If the shared library is present on the system under a different name than one of those listed above, please open a GitHub issue.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs:80:14
+   2: cudarc::panic_no_lib_found::<alloc::string::String>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5
+   3: cudarc::driver::sys::loaded::culib::{closure#0}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23553:13
+   4: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+   5: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+   6: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+   7: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+   8: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+   9: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  10: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_try_init::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  11: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  12: cudarc::driver::sys::loaded::culib
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23541:13
+  13: cudarc::driver::sys::loaded::cuInit
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:13694:10
+  14: cudarc::driver::result::init
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/result.rs:89:14
+  15: <cudarc::driver::safe::core::CudaContext>::new
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/safe/core.rs:62:9
+  16: <wukong_codegen_gpu::gpu::Gpu>::new
+             at ./src/gpu.rs:497:19
+  17: wukong_codegen_gpu::gpu::init_gpu
+             at ./src/gpu.rs:999:11
+  18: wukong_codegen_gpu::gpu::gpu::{closure#0}
+             at ./src/gpu.rs:1013:35
+  19: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+  20: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+  21: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+  22: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+  23: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+  24: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  25: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_try_init::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  26: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  27: wukong_codegen_gpu::gpu::gpu
+             at ./src/gpu.rs:1013:9
+  28: wukong_codegen_gpu::gpu::tests::with_gpu::<wukong_codegen_gpu::gpu::tests::with_hopper<wukong_codegen_gpu::gpu::tests::wgmma_peer_round::{closure#0}>::{closure#0}>
+             at ./src/gpu.rs:7719:25
+  29: wukong_codegen_gpu::gpu::tests::with_hopper::<wukong_codegen_gpu::gpu::tests::wgmma_peer_round::{closure#0}>
+             at ./src/gpu.rs:18401:9
+  30: wukong_codegen_gpu::gpu::tests::wgmma_peer_round
+             at ./src/gpu.rs:19913:9
+  31: wukong_codegen_gpu::gpu::tests::wgmma_bf16_vs_cublas
+             at ./src/gpu.rs:20998:9
+  32: wukong_codegen_gpu::gpu::tests::wgmma_bf16_vs_cublas::{closure#0}
+             at ./src/gpu.rs:20997:30
+  33: <wukong_codegen_gpu::gpu::tests::wgmma_bf16_vs_cublas::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+  34: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+test gpu::tests::wgmma_cluster_multicast_is_exact ... 
+thread 'gpu::tests::wgmma_cluster_multicast_is_exact' (640) panicked at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5:
+Unable to dynamically load the "cuda" shared library - searched for library names: ["libcuda.so", "libcuda64.so", "libcuda64_12.so", "libcuda64_126.so", "libcuda64_126_0.so", "libcuda64_120_6.so", "libcuda64_10.so", "libcuda64_120_0.so", "libcuda64_9.so", "libcuda.so.12", "libcuda.so.11", "libcuda.so.10", "libcuda.so.1", "libnvcuda.so", "libnvcuda64.so", "libnvcuda64_12.so", "libnvcuda64_126.so", "libnvcuda64_126_0.so", "libnvcuda64_120_6.so", "libnvcuda64_10.so", "libnvcuda64_120_0.so", "libnvcuda64_9.so", "libnvcuda.so.12", "libnvcuda.so.11", "libnvcuda.so.10", "libnvcuda.so.1"]. Ensure that `LD_LIBRARY_PATH` has the correct path to the installed library. If the shared library is present on the system under a different name than one of those listed above, please open a GitHub issue.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs:80:14
+   2: cudarc::panic_no_lib_found::<alloc::string::String>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5
+   3: cudarc::driver::sys::loaded::culib::{closure#0}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23553:13
+   4: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+   5: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+   6: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+   7: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+   8: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+   9: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  10: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_try_init::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  11: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  12: cudarc::driver::sys::loaded::culib
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23541:13
+  13: cudarc::driver::sys::loaded::cuInit
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:13694:10
+  14: cudarc::driver::result::init
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/result.rs:89:14
+  15: <cudarc::driver::safe::core::CudaContext>::new
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/safe/core.rs:62:9
+  16: <wukong_codegen_gpu::gpu::Gpu>::new
+             at ./src/gpu.rs:497:19
+  17: wukong_codegen_gpu::gpu::init_gpu
+             at ./src/gpu.rs:999:11
+  18: wukong_codegen_gpu::gpu::gpu::{closure#0}
+             at ./src/gpu.rs:1013:35
+  19: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+  20: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+  21: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+  22: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+  23: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+  24: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  25: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_try_init::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  26: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  27: wukong_codegen_gpu::gpu::gpu
+             at ./src/gpu.rs:1013:9
+  28: wukong_codegen_gpu::gpu::tests::with_gpu::<wukong_codegen_gpu::gpu::tests::with_hopper<wukong_codegen_gpu::gpu::tests::wgmma_cluster_multicast_is_exact::{closure#0}>::{closure#0}>
+             at ./src/gpu.rs:7719:25
+  29: wukong_codegen_gpu::gpu::tests::with_hopper::<wukong_codegen_gpu::gpu::tests::wgmma_cluster_multicast_is_exact::{closure#0}>
+             at ./src/gpu.rs:18401:9
+  30: wukong_codegen_gpu::gpu::tests::wgmma_cluster_multicast_is_exact
+             at ./src/gpu.rs:19454:9
+  31: wukong_codegen_gpu::gpu::tests::wgmma_cluster_multicast_is_exact::{closure#0}
+             at ./src/gpu.rs:19384:42
+  32: <wukong_codegen_gpu::gpu::tests::wgmma_cluster_multicast_is_exact::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+  33: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+test gpu::tests::wgmma_config_sweep ... 
+thread 'gpu::tests::wgmma_config_sweep' (641) panicked at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5:
+Unable to dynamically load the "cuda" shared library - searched for library names: ["libcuda.so", "libcuda64.so", "libcuda64_12.so", "libcuda64_126.so", "libcuda64_126_0.so", "libcuda64_120_6.so", "libcuda64_10.so", "libcuda64_120_0.so", "libcuda64_9.so", "libcuda.so.12", "libcuda.so.11", "libcuda.so.10", "libcuda.so.1", "libnvcuda.so", "libnvcuda64.so", "libnvcuda64_12.so", "libnvcuda64_126.so", "libnvcuda64_126_0.so", "libnvcuda64_120_6.so", "libnvcuda64_10.so", "libnvcuda64_120_0.so", "libnvcuda64_9.so", "libnvcuda.so.12", "libnvcuda.so.11", "libnvcuda.so.10", "libnvcuda.so.1"]. Ensure that `LD_LIBRARY_PATH` has the correct path to the installed library. If the shared library is present on the system under a different name than one of those listed above, please open a GitHub issue.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs:80:14
+   2: cudarc::panic_no_lib_found::<alloc::string::String>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5
+   3: cudarc::driver::sys::loaded::culib::{closure#0}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23553:13
+   4: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+   5: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+   6: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+   7: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+   8: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+   9: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  10: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_try_init::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  11: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  12: cudarc::driver::sys::loaded::culib
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23541:13
+  13: cudarc::driver::sys::loaded::cuInit
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:13694:10
+  14: cudarc::driver::result::init
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/result.rs:89:14
+  15: <cudarc::driver::safe::core::CudaContext>::new
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/safe/core.rs:62:9
+  16: <wukong_codegen_gpu::gpu::Gpu>::new
+             at ./src/gpu.rs:497:19
+  17: wukong_codegen_gpu::gpu::init_gpu
+             at ./src/gpu.rs:999:11
+  18: wukong_codegen_gpu::gpu::gpu::{closure#0}
+             at ./src/gpu.rs:1013:35
+  19: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+  20: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+  21: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+  22: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+  23: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+  24: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  25: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_try_init::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  26: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  27: wukong_codegen_gpu::gpu::gpu
+             at ./src/gpu.rs:1013:9
+  28: wukong_codegen_gpu::gpu::tests::with_gpu::<wukong_codegen_gpu::gpu::tests::with_hopper<wukong_codegen_gpu::gpu::tests::wgmma_config_sweep::{closure#0}>::{closure#0}>
+             at ./src/gpu.rs:7719:25
+  29: wukong_codegen_gpu::gpu::tests::with_hopper::<wukong_codegen_gpu::gpu::tests::wgmma_config_sweep::{closure#0}>
+             at ./src/gpu.rs:18401:9
+  30: wukong_codegen_gpu::gpu::tests::wgmma_config_sweep
+             at ./src/gpu.rs:20193:9
+  31: wukong_codegen_gpu::gpu::tests::wgmma_config_sweep::{closure#0}
+             at ./src/gpu.rs:20182:28
+  32: <wukong_codegen_gpu::gpu::tests::wgmma_config_sweep::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+  33: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+test gpu::tests::wgmma_declines_on_every_part_that_is_not_hopper ... 
+thread 'gpu::tests::wgmma_declines_on_every_part_that_is_not_hopper' (642) panicked at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5:
+Unable to dynamically load the "cuda" shared library - searched for library names: ["libcuda.so", "libcuda64.so", "libcuda64_12.so", "libcuda64_126.so", "libcuda64_126_0.so", "libcuda64_120_6.so", "libcuda64_10.so", "libcuda64_120_0.so", "libcuda64_9.so", "libcuda.so.12", "libcuda.so.11", "libcuda.so.10", "libcuda.so.1", "libnvcuda.so", "libnvcuda64.so", "libnvcuda64_12.so", "libnvcuda64_126.so", "libnvcuda64_126_0.so", "libnvcuda64_120_6.so", "libnvcuda64_10.so", "libnvcuda64_120_0.so", "libnvcuda64_9.so", "libnvcuda.so.12", "libnvcuda.so.11", "libnvcuda.so.10", "libnvcuda.so.1"]. Ensure that `LD_LIBRARY_PATH` has the correct path to the installed library. If the shared library is present on the system under a different name than one of those listed above, please open a GitHub issue.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs:80:14
+   2: cudarc::panic_no_lib_found::<alloc::string::String>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5
+   3: cudarc::driver::sys::loaded::culib::{closure#0}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23553:13
+   4: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+   5: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+   6: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+   7: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+   8: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+   9: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  10: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_try_init::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  11: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  12: cudarc::driver::sys::loaded::culib
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23541:13
+  13: cudarc::driver::sys::loaded::cuInit
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:13694:10
+  14: cudarc::driver::result::init
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/result.rs:89:14
+  15: <cudarc::driver::safe::core::CudaContext>::new
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/safe/core.rs:62:9
+  16: <wukong_codegen_gpu::gpu::Gpu>::new
+             at ./src/gpu.rs:497:19
+  17: wukong_codegen_gpu::gpu::init_gpu
+             at ./src/gpu.rs:999:11
+  18: wukong_codegen_gpu::gpu::gpu::{closure#0}
+             at ./src/gpu.rs:1013:35
+  19: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+  20: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+  21: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+  22: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+  23: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+  24: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  25: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_try_init::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  26: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  27: wukong_codegen_gpu::gpu::gpu
+             at ./src/gpu.rs:1013:9
+  28: wukong_codegen_gpu::gpu::tests::with_gpu::<wukong_codegen_gpu::gpu::tests::wgmma_declines_on_every_part_that_is_not_hopper::{closure#0}>
+             at ./src/gpu.rs:7719:25
+  29: wukong_codegen_gpu::gpu::tests::wgmma_declines_on_every_part_that_is_not_hopper
+             at ./src/gpu.rs:18168:9
+  30: wukong_codegen_gpu::gpu::tests::wgmma_declines_on_every_part_that_is_not_hopper::{closure#0}
+             at ./src/gpu.rs:18166:57
+  31: <wukong_codegen_gpu::gpu::tests::wgmma_declines_on_every_part_that_is_not_hopper::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+  32: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+test gpu::tests::wgmma_hopper_bringup ... 
+thread 'gpu::tests::wgmma_hopper_bringup' (643) panicked at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5:
+Unable to dynamically load the "cuda" shared library - searched for library names: ["libcuda.so", "libcuda64.so", "libcuda64_12.so", "libcuda64_126.so", "libcuda64_126_0.so", "libcuda64_120_6.so", "libcuda64_10.so", "libcuda64_120_0.so", "libcuda64_9.so", "libcuda.so.12", "libcuda.so.11", "libcuda.so.10", "libcuda.so.1", "libnvcuda.so", "libnvcuda64.so", "libnvcuda64_12.so", "libnvcuda64_126.so", "libnvcuda64_126_0.so", "libnvcuda64_120_6.so", "libnvcuda64_10.so", "libnvcuda64_120_0.so", "libnvcuda64_9.so", "libnvcuda.so.12", "libnvcuda.so.11", "libnvcuda.so.10", "libnvcuda.so.1"]. Ensure that `LD_LIBRARY_PATH` has the correct path to the installed library. If the shared library is present on the system under a different name than one of those listed above, please open a GitHub issue.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs:80:14
+   2: cudarc::panic_no_lib_found::<alloc::string::String>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5
+   3: cudarc::driver::sys::loaded::culib::{closure#0}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23553:13
+   4: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+   5: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+   6: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+   7: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+   8: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+   9: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  10: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_try_init::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  11: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  12: cudarc::driver::sys::loaded::culib
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23541:13
+  13: cudarc::driver::sys::loaded::cuInit
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:13694:10
+  14: cudarc::driver::result::init
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/result.rs:89:14
+  15: <cudarc::driver::safe::core::CudaContext>::new
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/safe/core.rs:62:9
+  16: <wukong_codegen_gpu::gpu::Gpu>::new
+             at ./src/gpu.rs:497:19
+  17: wukong_codegen_gpu::gpu::init_gpu
+             at ./src/gpu.rs:999:11
+  18: wukong_codegen_gpu::gpu::gpu::{closure#0}
+             at ./src/gpu.rs:1013:35
+  19: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+  20: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+  21: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+  22: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+  23: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+  24: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  25: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_try_init::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  26: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  27: wukong_codegen_gpu::gpu::gpu
+             at ./src/gpu.rs:1013:9
+  28: wukong_codegen_gpu::gpu::tests::with_gpu::<wukong_codegen_gpu::gpu::tests::with_hopper<wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup::{closure#0}>::{closure#0}>
+             at ./src/gpu.rs:7719:25
+  29: wukong_codegen_gpu::gpu::tests::with_hopper::<wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup::{closure#0}>
+             at ./src/gpu.rs:18401:9
+  30: wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup
+             at ./src/gpu.rs:18581:9
+  31: wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup::{closure#0}
+             at ./src/gpu.rs:18572:30
+  32: <wukong_codegen_gpu::gpu::tests::wgmma_hopper_bringup::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+  33: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+test gpu::tests::wgmma_k_sweep ... 
+thread 'gpu::tests::wgmma_k_sweep' (644) panicked at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5:
+Unable to dynamically load the "cuda" shared library - searched for library names: ["libcuda.so", "libcuda64.so", "libcuda64_12.so", "libcuda64_126.so", "libcuda64_126_0.so", "libcuda64_120_6.so", "libcuda64_10.so", "libcuda64_120_0.so", "libcuda64_9.so", "libcuda.so.12", "libcuda.so.11", "libcuda.so.10", "libcuda.so.1", "libnvcuda.so", "libnvcuda64.so", "libnvcuda64_12.so", "libnvcuda64_126.so", "libnvcuda64_126_0.so", "libnvcuda64_120_6.so", "libnvcuda64_10.so", "libnvcuda64_120_0.so", "libnvcuda64_9.so", "libnvcuda.so.12", "libnvcuda.so.11", "libnvcuda.so.10", "libnvcuda.so.1"]. Ensure that `LD_LIBRARY_PATH` has the correct path to the installed library. If the shared library is present on the system under a different name than one of those listed above, please open a GitHub issue.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs:80:14
+   2: cudarc::panic_no_lib_found::<alloc::string::String>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5
+   3: cudarc::driver::sys::loaded::culib::{closure#0}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23553:13
+   4: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+   5: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+   6: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+   7: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+   8: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+   9: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  10: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_try_init::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  11: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  12: cudarc::driver::sys::loaded::culib
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23541:13
+  13: cudarc::driver::sys::loaded::cuInit
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:13694:10
+  14: cudarc::driver::result::init
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/result.rs:89:14
+  15: <cudarc::driver::safe::core::CudaContext>::new
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/safe/core.rs:62:9
+  16: <wukong_codegen_gpu::gpu::Gpu>::new
+             at ./src/gpu.rs:497:19
+  17: wukong_codegen_gpu::gpu::init_gpu
+             at ./src/gpu.rs:999:11
+  18: wukong_codegen_gpu::gpu::gpu::{closure#0}
+             at ./src/gpu.rs:1013:35
+  19: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+  20: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+  21: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+  22: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+  23: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+  24: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  25: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_try_init::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  26: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  27: wukong_codegen_gpu::gpu::gpu
+             at ./src/gpu.rs:1013:9
+  28: wukong_codegen_gpu::gpu::tests::with_gpu::<wukong_codegen_gpu::gpu::tests::with_hopper<wukong_codegen_gpu::gpu::tests::wgmma_k_sweep::{closure#0}>::{closure#0}>
+             at ./src/gpu.rs:7719:25
+  29: wukong_codegen_gpu::gpu::tests::with_hopper::<wukong_codegen_gpu::gpu::tests::wgmma_k_sweep::{closure#0}>
+             at ./src/gpu.rs:18401:9
+  30: wukong_codegen_gpu::gpu::tests::wgmma_k_sweep
+             at ./src/gpu.rs:20787:9
+  31: wukong_codegen_gpu::gpu::tests::wgmma_k_sweep::{closure#0}
+             at ./src/gpu.rs:20777:23
+  32: <wukong_codegen_gpu::gpu::tests::wgmma_k_sweep::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+  33: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+test gpu::tests::wgmma_vs_cublas ... 
+thread 'gpu::tests::wgmma_vs_cublas' (645) panicked at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5:
+Unable to dynamically load the "cuda" shared library - searched for library names: ["libcuda.so", "libcuda64.so", "libcuda64_12.so", "libcuda64_126.so", "libcuda64_126_0.so", "libcuda64_120_6.so", "libcuda64_10.so", "libcuda64_120_0.so", "libcuda64_9.so", "libcuda.so.12", "libcuda.so.11", "libcuda.so.10", "libcuda.so.1", "libnvcuda.so", "libnvcuda64.so", "libnvcuda64_12.so", "libnvcuda64_126.so", "libnvcuda64_126_0.so", "libnvcuda64_120_6.so", "libnvcuda64_10.so", "libnvcuda64_120_0.so", "libnvcuda64_9.so", "libnvcuda.so.12", "libnvcuda.so.11", "libnvcuda.so.10", "libnvcuda.so.1"]. Ensure that `LD_LIBRARY_PATH` has the correct path to the installed library. If the shared library is present on the system under a different name than one of those listed above, please open a GitHub issue.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs:80:14
+   2: cudarc::panic_no_lib_found::<alloc::string::String>
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/lib.rs:108:5
+   3: cudarc::driver::sys::loaded::culib::{closure#0}
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23553:13
+   4: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+   5: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+   6: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+   7: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+   8: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+   9: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::initialize::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  10: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_try_init::<<std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init<cudarc::driver::sys::loaded::culib::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  11: <std::sync::once_lock::OnceLock<cudarc::driver::sys::loaded::Lib>>::get_or_init::<cudarc::driver::sys::loaded::culib::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  12: cudarc::driver::sys::loaded::culib
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:23541:13
+  13: cudarc::driver::sys::loaded::cuInit
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/sys/mod.rs:13694:10
+  14: cudarc::driver::result::init
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/result.rs:89:14
+  15: <cudarc::driver::safe::core::CudaContext>::new
+             at /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cudarc-0.16.6/src/driver/safe/core.rs:62:9
+  16: <wukong_codegen_gpu::gpu::Gpu>::new
+             at ./src/gpu.rs:497:19
+  17: wukong_codegen_gpu::gpu::init_gpu
+             at ./src/gpu.rs:999:11
+  18: wukong_codegen_gpu::gpu::gpu::{closure#0}
+             at ./src/gpu.rs:1013:35
+  19: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:50
+  20: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:543:19
+  21: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:40
+  22: <std::sys::sync::once::futex::Once>::call
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sys/sync/once/futex.rs:183:21
+  23: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once.rs:226:20
+  24: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::initialize::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:542:19
+  25: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_try_init::<<std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init<wukong_codegen_gpu::gpu::gpu::{closure#0}>::{closure#0}, !>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:410:14
+  26: <std::sync::once_lock::OnceLock<std::sync::poison::mutex::Mutex<core::option::Option<wukong_codegen_gpu::gpu::Gpu>>>>::get_or_init::<wukong_codegen_gpu::gpu::gpu::{closure#0}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/sync/once_lock.rs:321:20
+  27: wukong_codegen_gpu::gpu::gpu
+             at ./src/gpu.rs:1013:9
+  28: wukong_codegen_gpu::gpu::tests::with_gpu::<wukong_codegen_gpu::gpu::tests::with_hopper<wukong_codegen_gpu::gpu::tests::wgmma_peer_round::{closure#0}>::{closure#0}>
+             at ./src/gpu.rs:7719:25
+  29: wukong_codegen_gpu::gpu::tests::with_hopper::<wukong_codegen_gpu::gpu::tests::wgmma_peer_round::{closure#0}>
+             at ./src/gpu.rs:18401:9
+  30: wukong_codegen_gpu::gpu::tests::wgmma_peer_round
+             at ./src/gpu.rs:19913:9
+  31: wukong_codegen_gpu::gpu::tests::wgmma_vs_cublas
+             at ./src/gpu.rs:20974:9
+  32: wukong_codegen_gpu::gpu::tests::wgmma_vs_cublas::{closure#0}
+             at ./src/gpu.rs:20973:25
+  33: <wukong_codegen_gpu::gpu::tests::wgmma_vs_cublas::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+  34: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+test ptx_wgmma::tests::desc_fields_spells_every_reading_from_one_table ... ok
+test ptx_wgmma::tests::dump_wgmma_ptx ... .version 8.0
+.target sm_90a
+.address_size 64
+.extern .shared .align 1024 .b8 wk_dsmem[];
+.visible .entry wgmma_nt_f16_128x256x64_s4(
+    .param .u32 pM,
+    .param .u32 pN,
+    .param .u32 pK,
+    .param .u64 pC,
+    .param .align 64 .b8 tmapA[128],
+    .param .align 64 .b8 tmapB[128]
+)
+.maxntid 384, 1, 1
+{
+    .reg .pred %p0,%p1,%p2,%q0,%q1,%q2,%q3,%pd0,%pd1,%ptrue,%pfirst;
+    .reg .b32 %M,%N,%K,%lin,%wgi,%lane,%wrp,%kt,%ktiles,%stg,%phf,%phe,%tmp,%tmp2,%row0,%row1,%col,%col1,%colb,%ctam,%ctan,%cwg;
+    .reg .b64 %rdC,%rdS,%rdT,%rdA,%rdB,%rdBar,%rdBarF,%rdTmA,%rdTmB,%rdAddr,%rdOffA,%descA,%descB,%rdSt;
+    .reg .f32 %acc<128>;
+
+    ld.param.u32 %M,[pM];
+    ld.param.u32 %N,[pN];
+    ld.param.u32 %K,[pK];
+    ld.param.u64 %rdC,[pC];
+    cvta.to.global.u64 %rdC,%rdC;
+    mov.b64 %rdTmA,tmapA;
+    cvta.param.u64 %rdTmA,%rdTmA;
+    mov.b64 %rdTmB,tmapB;
+    cvta.param.u64 %rdTmB,%rdTmB;
+    mov.u64 %rdS,wk_dsmem;
+    mov.u32 %lin,%tid.x;
+    shr.u32 %wgi,%lin,7;
+    mov.u32 %lane,%laneid;
+    mov.u32 %tmp,%ctaid.x;
+    mul.lo.s32 %ctan,%tmp,256;
+    mov.u32 %tmp,%ctaid.y;
+    mul.lo.s32 %ctam,%tmp,128;
+    add.u32 %tmp,%K,63;
+    shr.u32 %ktiles,%tmp,6;
+    setp.eq.u32 %p0,%lin,0;
+    @!%p0 bra INIT_DONE_wgmma_nt_f16_128x256x64_s4;
+    add.s64 %rdBar,%rdS,196608;
+    mbarrier.init.shared::cta.b64 [%rdBar],1;
+    add.s64 %rdBar,%rdS,196640;
+    mbarrier.init.shared::cta.b64 [%rdBar],2;
+    add.s64 %rdBar,%rdS,196616;
+    mbarrier.init.shared::cta.b64 [%rdBar],1;
+    add.s64 %rdBar,%rdS,196648;
+    mbarrier.init.shared::cta.b64 [%rdBar],2;
+    add.s64 %rdBar,%rdS,196624;
+    mbarrier.init.shared::cta.b64 [%rdBar],1;
+    add.s64 %rdBar,%rdS,196656;
+    mbarrier.init.shared::cta.b64 [%rdBar],2;
+    add.s64 %rdBar,%rdS,196632;
+    mbarrier.init.shared::cta.b64 [%rdBar],1;
+    add.s64 %rdBar,%rdS,196664;
+    mbarrier.init.shared::cta.b64 [%rdBar],2;
+INIT_DONE_wgmma_nt_f16_128x256x64_s4:
+    bar.sync 0;
+    setp.eq.u32 %p0,%wgi,0;
+    @!%p0 bra CONSUMER_wgmma_nt_f16_128x256x64_s4;
+    setmaxnreg.dec.sync.aligned.u32 32;
+    setp.eq.u32 %p0,%lin,0;
+    @!%p0 bra EXIT_wgmma_nt_f16_128x256x64_s4;
+    mov.u32 %kt,0;
+    mov.u32 %stg,0;
+    mov.u32 %phe,1;
+PLOOP_wgmma_nt_f16_128x256x64_s4:
+    setp.ge.u32 %p0,%kt,%ktiles;
+    @%p0 bra EXIT_wgmma_nt_f16_128x256x64_s4;
+    mul.wide.u32 %rdT,%stg,8;
+    add.s64 %rdBar,%rdS,%rdT;
+    add.s64 %rdBar,%rdBar,196640;
+PWAIT_wgmma_nt_f16_128x256x64_s4:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%phe;
+    @!%p1 bra PWAIT_wgmma_nt_f16_128x256x64_s4;
+    mul.wide.u32 %rdT,%stg,8;
+    add.s64 %rdBarF,%rdS,%rdT;
+    add.s64 %rdBarF,%rdBarF,196608;
+    mbarrier.arrive.expect_tx.shared::cta.b64 %rdSt,[%rdBarF],49152;
+    mul.wide.u32 %rdT,%stg,16384;
+    add.s64 %rdA,%rdS,%rdT;
+    mul.wide.u32 %rdT,%stg,32768;
+    add.s64 %rdB,%rdS,%rdT;
+    add.s64 %rdB,%rdB,65536;
+    mul.lo.s32 %tmp,%kt,64;
+    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%rdA],[%rdTmA,{%tmp,%ctam}],[%rdBarF];
+    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%rdB],[%rdTmB,{%tmp,%ctan}],[%rdBarF];
+    add.u32 %kt,%kt,1;
+    add.u32 %stg,%stg,1;
+    setp.lt.u32 %p1,%stg,4;
+    @%p1 bra PLOOP_wgmma_nt_f16_128x256x64_s4;
+    mov.u32 %stg,0;
+    xor.b32 %phe,%phe,1;
+    bra PLOOP_wgmma_nt_f16_128x256x64_s4;
+CONSUMER_wgmma_nt_f16_128x256x64_s4:
+    setmaxnreg.inc.sync.aligned.u32 232;
+    sub.u32 %cwg,%wgi,1;
+    mul.lo.s32 %tmp,%cwg,8192;
+    cvt.u64.u32 %rdOffA,%tmp;
+    mov.u32 %kt,0;
+    mov.u32 %stg,0;
+    mov.u32 %phf,0;
+    setp.eq.u32 %ptrue,0,0;
+CLOOP_wgmma_nt_f16_128x256x64_s4:
+    setp.ge.u32 %p0,%kt,%ktiles;
+    @%p0 bra CEND_wgmma_nt_f16_128x256x64_s4;
+    mul.wide.u32 %rdT,%stg,8;
+    add.s64 %rdBar,%rdS,%rdT;
+    add.s64 %rdBar,%rdBar,196608;
+CWAIT_wgmma_nt_f16_128x256x64_s4:
+    mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%phf;
+    @!%p1 bra CWAIT_wgmma_nt_f16_128x256x64_s4;
+    mul.wide.u32 %rdT,%stg,16384;
+    add.s64 %rdA,%rdS,%rdT;
+    add.s64 %rdA,%rdA,%rdOffA;
+    mul.wide.u32 %rdT,%stg,32768;
+    add.s64 %rdB,%rdS,%rdT;
+    add.s64 %rdB,%rdB,65536;
+    setp.ne.u32 %pfirst,%kt,0;
+    wgmma.fence.sync.aligned;
+    add.s64 %rdAddr,%rdA,0;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descA,%rdT,0x4000004000010000;
+    add.s64 %rdAddr,%rdB,0;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descB,%rdT,0x4000004000010000;
+    wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 {%acc0,%acc1,%acc2,%acc3,%acc4,%acc5,%acc6,%acc7,%acc8,%acc9,%acc10,%acc11,%acc12,%acc13,%acc14,%acc15,%acc16,%acc17,%acc18,%acc19,%acc20,%acc21,%acc22,%acc23,%acc24,%acc25,%acc26,%acc27,%acc28,%acc29,%acc30,%acc31,%acc32,%acc33,%acc34,%acc35,%acc36,%acc37,%acc38,%acc39,%acc40,%acc41,%acc42,%acc43,%acc44,%acc45,%acc46,%acc47,%acc48,%acc49,%acc50,%acc51,%acc52,%acc53,%acc54,%acc55,%acc56,%acc57,%acc58,%acc59,%acc60,%acc61,%acc62,%acc63,%acc64,%acc65,%acc66,%acc67,%acc68,%acc69,%acc70,%acc71,%acc72,%acc73,%acc74,%acc75,%acc76,%acc77,%acc78,%acc79,%acc80,%acc81,%acc82,%acc83,%acc84,%acc85,%acc86,%acc87,%acc88,%acc89,%acc90,%acc91,%acc92,%acc93,%acc94,%acc95,%acc96,%acc97,%acc98,%acc99,%acc100,%acc101,%acc102,%acc103,%acc104,%acc105,%acc106,%acc107,%acc108,%acc109,%acc110,%acc111,%acc112,%acc113,%acc114,%acc115,%acc116,%acc117,%acc118,%acc119,%acc120,%acc121,%acc122,%acc123,%acc124,%acc125,%acc126,%acc127}, %descA, %descB, %pfirst, 1, 1, 0, 0;
+    add.s64 %rdAddr,%rdA,32;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descA,%rdT,0x4000004000010000;
+    add.s64 %rdAddr,%rdB,32;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descB,%rdT,0x4000004000010000;
+    wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 {%acc0,%acc1,%acc2,%acc3,%acc4,%acc5,%acc6,%acc7,%acc8,%acc9,%acc10,%acc11,%acc12,%acc13,%acc14,%acc15,%acc16,%acc17,%acc18,%acc19,%acc20,%acc21,%acc22,%acc23,%acc24,%acc25,%acc26,%acc27,%acc28,%acc29,%acc30,%acc31,%acc32,%acc33,%acc34,%acc35,%acc36,%acc37,%acc38,%acc39,%acc40,%acc41,%acc42,%acc43,%acc44,%acc45,%acc46,%acc47,%acc48,%acc49,%acc50,%acc51,%acc52,%acc53,%acc54,%acc55,%acc56,%acc57,%acc58,%acc59,%acc60,%acc61,%acc62,%acc63,%acc64,%acc65,%acc66,%acc67,%acc68,%acc69,%acc70,%acc71,%acc72,%acc73,%acc74,%acc75,%acc76,%acc77,%acc78,%acc79,%acc80,%acc81,%acc82,%acc83,%acc84,%acc85,%acc86,%acc87,%acc88,%acc89,%acc90,%acc91,%acc92,%acc93,%acc94,%acc95,%acc96,%acc97,%acc98,%acc99,%acc100,%acc101,%acc102,%acc103,%acc104,%acc105,%acc106,%acc107,%acc108,%acc109,%acc110,%acc111,%acc112,%acc113,%acc114,%acc115,%acc116,%acc117,%acc118,%acc119,%acc120,%acc121,%acc122,%acc123,%acc124,%acc125,%acc126,%acc127}, %descA, %descB, %ptrue, 1, 1, 0, 0;
+    add.s64 %rdAddr,%rdA,64;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descA,%rdT,0x4000004000010000;
+    add.s64 %rdAddr,%rdB,64;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descB,%rdT,0x4000004000010000;
+    wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 {%acc0,%acc1,%acc2,%acc3,%acc4,%acc5,%acc6,%acc7,%acc8,%acc9,%acc10,%acc11,%acc12,%acc13,%acc14,%acc15,%acc16,%acc17,%acc18,%acc19,%acc20,%acc21,%acc22,%acc23,%acc24,%acc25,%acc26,%acc27,%acc28,%acc29,%acc30,%acc31,%acc32,%acc33,%acc34,%acc35,%acc36,%acc37,%acc38,%acc39,%acc40,%acc41,%acc42,%acc43,%acc44,%acc45,%acc46,%acc47,%acc48,%acc49,%acc50,%acc51,%acc52,%acc53,%acc54,%acc55,%acc56,%acc57,%acc58,%acc59,%acc60,%acc61,%acc62,%acc63,%acc64,%acc65,%acc66,%acc67,%acc68,%acc69,%acc70,%acc71,%acc72,%acc73,%acc74,%acc75,%acc76,%acc77,%acc78,%acc79,%acc80,%acc81,%acc82,%acc83,%acc84,%acc85,%acc86,%acc87,%acc88,%acc89,%acc90,%acc91,%acc92,%acc93,%acc94,%acc95,%acc96,%acc97,%acc98,%acc99,%acc100,%acc101,%acc102,%acc103,%acc104,%acc105,%acc106,%acc107,%acc108,%acc109,%acc110,%acc111,%acc112,%acc113,%acc114,%acc115,%acc116,%acc117,%acc118,%acc119,%acc120,%acc121,%acc122,%acc123,%acc124,%acc125,%acc126,%acc127}, %descA, %descB, %ptrue, 1, 1, 0, 0;
+    add.s64 %rdAddr,%rdA,96;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descA,%rdT,0x4000004000010000;
+    add.s64 %rdAddr,%rdB,96;
+    shr.u64 %rdT,%rdAddr,4;
+    and.b64 %rdT,%rdT,16383;
+    or.b64 %descB,%rdT,0x4000004000010000;
+    wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 {%acc0,%acc1,%acc2,%acc3,%acc4,%acc5,%acc6,%acc7,%acc8,%acc9,%acc10,%acc11,%acc12,%acc13,%acc14,%acc15,%acc16,%acc17,%acc18,%acc19,%acc20,%acc21,%acc22,%acc23,%acc24,%acc25,%acc26,%acc27,%acc28,%acc29,%acc30,%acc31,%acc32,%acc33,%acc34,%acc35,%acc36,%acc37,%acc38,%acc39,%acc40,%acc41,%acc42,%acc43,%acc44,%acc45,%acc46,%acc47,%acc48,%acc49,%acc50,%acc51,%acc52,%acc53,%acc54,%acc55,%acc56,%acc57,%acc58,%acc59,%acc60,%acc61,%acc62,%acc63,%acc64,%acc65,%acc66,%acc67,%acc68,%acc69,%acc70,%acc71,%acc72,%acc73,%acc74,%acc75,%acc76,%acc77,%acc78,%acc79,%acc80,%acc81,%acc82,%acc83,%acc84,%acc85,%acc86,%acc87,%acc88,%acc89,%acc90,%acc91,%acc92,%acc93,%acc94,%acc95,%acc96,%acc97,%acc98,%acc99,%acc100,%acc101,%acc102,%acc103,%acc104,%acc105,%acc106,%acc107,%acc108,%acc109,%acc110,%acc111,%acc112,%acc113,%acc114,%acc115,%acc116,%acc117,%acc118,%acc119,%acc120,%acc121,%acc122,%acc123,%acc124,%acc125,%acc126,%acc127}, %descA, %descB, %ptrue, 1, 1, 0, 0;
+    wgmma.commit_group.sync.aligned;
+    wgmma.wait_group.sync.aligned 0;
+    mul.wide.u32 %rdT,%stg,8;
+    add.s64 %rdBar,%rdS,%rdT;
+    add.s64 %rdBar,%rdBar,196640;
+    and.b32 %tmp,%lin,127;
+    setp.eq.u32 %p2,%tmp,0;
+    @%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];
+    add.u32 %kt,%kt,1;
+    add.u32 %stg,%stg,1;
+    setp.lt.u32 %p1,%stg,4;
+    @%p1 bra CLOOP_wgmma_nt_f16_128x256x64_s4;
+    mov.u32 %stg,0;
+    xor.b32 %phf,%phf,1;
+    bra CLOOP_wgmma_nt_f16_128x256x64_s4;
+CEND_wgmma_nt_f16_128x256x64_s4:
+    setp.eq.u32 %p0,%ktiles,0;
+    @%p0 bra EXIT_wgmma_nt_f16_128x256x64_s4;
+    wgmma.wait_group.sync.aligned 0;
+    and.b32 %tmp,%lin,127;
+    shr.u32 %wrp,%tmp,5;
+    shl.b32 %wrp,%wrp,4;
+    shr.u32 %tmp2,%lane,2;
+    add.u32 %row0,%wrp,%tmp2;
+    mul.lo.s32 %tmp,%cwg,64;
+    add.u32 %row0,%row0,%tmp;
+    add.u32 %row0,%row0,%ctam;
+    add.u32 %row1,%row0,8;
+    and.b32 %colb,%lane,3;
+    shl.b32 %colb,%colb,1;
+    add.u32 %colb,%colb,%ctan;
+    setp.lt.u32 %pd0,%row0,%M;
+    setp.lt.u32 %pd1,%row1,%M;
+    mad.lo.s32 %tmp,%row0,%N,%colb;
+    mul.wide.u32 %rdT,%tmp,4;
+    add.s64 %rdA,%rdC,%rdT;
+    mad.lo.s32 %tmp,%row1,%N,%colb;
+    mul.wide.u32 %rdT,%tmp,4;
+    add.s64 %rdB,%rdC,%rdT;
+    add.u32 %col,%colb,0;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+0],%acc0;
+    @%q1 st.global.f32 [%rdA+4],%acc1;
+    @%q2 st.global.f32 [%rdB+0],%acc2;
+    @%q3 st.global.f32 [%rdB+4],%acc3;
+    add.u32 %col,%colb,8;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+32],%acc4;
+    @%q1 st.global.f32 [%rdA+36],%acc5;
+    @%q2 st.global.f32 [%rdB+32],%acc6;
+    @%q3 st.global.f32 [%rdB+36],%acc7;
+    add.u32 %col,%colb,16;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+64],%acc8;
+    @%q1 st.global.f32 [%rdA+68],%acc9;
+    @%q2 st.global.f32 [%rdB+64],%acc10;
+    @%q3 st.global.f32 [%rdB+68],%acc11;
+    add.u32 %col,%colb,24;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+96],%acc12;
+    @%q1 st.global.f32 [%rdA+100],%acc13;
+    @%q2 st.global.f32 [%rdB+96],%acc14;
+    @%q3 st.global.f32 [%rdB+100],%acc15;
+    add.u32 %col,%colb,32;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+128],%acc16;
+    @%q1 st.global.f32 [%rdA+132],%acc17;
+    @%q2 st.global.f32 [%rdB+128],%acc18;
+    @%q3 st.global.f32 [%rdB+132],%acc19;
+    add.u32 %col,%colb,40;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+160],%acc20;
+    @%q1 st.global.f32 [%rdA+164],%acc21;
+    @%q2 st.global.f32 [%rdB+160],%acc22;
+    @%q3 st.global.f32 [%rdB+164],%acc23;
+    add.u32 %col,%colb,48;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+192],%acc24;
+    @%q1 st.global.f32 [%rdA+196],%acc25;
+    @%q2 st.global.f32 [%rdB+192],%acc26;
+    @%q3 st.global.f32 [%rdB+196],%acc27;
+    add.u32 %col,%colb,56;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+224],%acc28;
+    @%q1 st.global.f32 [%rdA+228],%acc29;
+    @%q2 st.global.f32 [%rdB+224],%acc30;
+    @%q3 st.global.f32 [%rdB+228],%acc31;
+    add.u32 %col,%colb,64;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+256],%acc32;
+    @%q1 st.global.f32 [%rdA+260],%acc33;
+    @%q2 st.global.f32 [%rdB+256],%acc34;
+    @%q3 st.global.f32 [%rdB+260],%acc35;
+    add.u32 %col,%colb,72;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+288],%acc36;
+    @%q1 st.global.f32 [%rdA+292],%acc37;
+    @%q2 st.global.f32 [%rdB+288],%acc38;
+    @%q3 st.global.f32 [%rdB+292],%acc39;
+    add.u32 %col,%colb,80;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+320],%acc40;
+    @%q1 st.global.f32 [%rdA+324],%acc41;
+    @%q2 st.global.f32 [%rdB+320],%acc42;
+    @%q3 st.global.f32 [%rdB+324],%acc43;
+    add.u32 %col,%colb,88;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+352],%acc44;
+    @%q1 st.global.f32 [%rdA+356],%acc45;
+    @%q2 st.global.f32 [%rdB+352],%acc46;
+    @%q3 st.global.f32 [%rdB+356],%acc47;
+    add.u32 %col,%colb,96;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+384],%acc48;
+    @%q1 st.global.f32 [%rdA+388],%acc49;
+    @%q2 st.global.f32 [%rdB+384],%acc50;
+    @%q3 st.global.f32 [%rdB+388],%acc51;
+    add.u32 %col,%colb,104;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+416],%acc52;
+    @%q1 st.global.f32 [%rdA+420],%acc53;
+    @%q2 st.global.f32 [%rdB+416],%acc54;
+    @%q3 st.global.f32 [%rdB+420],%acc55;
+    add.u32 %col,%colb,112;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+448],%acc56;
+    @%q1 st.global.f32 [%rdA+452],%acc57;
+    @%q2 st.global.f32 [%rdB+448],%acc58;
+    @%q3 st.global.f32 [%rdB+452],%acc59;
+    add.u32 %col,%colb,120;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+480],%acc60;
+    @%q1 st.global.f32 [%rdA+484],%acc61;
+    @%q2 st.global.f32 [%rdB+480],%acc62;
+    @%q3 st.global.f32 [%rdB+484],%acc63;
+    add.u32 %col,%colb,128;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+512],%acc64;
+    @%q1 st.global.f32 [%rdA+516],%acc65;
+    @%q2 st.global.f32 [%rdB+512],%acc66;
+    @%q3 st.global.f32 [%rdB+516],%acc67;
+    add.u32 %col,%colb,136;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+544],%acc68;
+    @%q1 st.global.f32 [%rdA+548],%acc69;
+    @%q2 st.global.f32 [%rdB+544],%acc70;
+    @%q3 st.global.f32 [%rdB+548],%acc71;
+    add.u32 %col,%colb,144;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+576],%acc72;
+    @%q1 st.global.f32 [%rdA+580],%acc73;
+    @%q2 st.global.f32 [%rdB+576],%acc74;
+    @%q3 st.global.f32 [%rdB+580],%acc75;
+    add.u32 %col,%colb,152;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+608],%acc76;
+    @%q1 st.global.f32 [%rdA+612],%acc77;
+    @%q2 st.global.f32 [%rdB+608],%acc78;
+    @%q3 st.global.f32 [%rdB+612],%acc79;
+    add.u32 %col,%colb,160;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+640],%acc80;
+    @%q1 st.global.f32 [%rdA+644],%acc81;
+    @%q2 st.global.f32 [%rdB+640],%acc82;
+    @%q3 st.global.f32 [%rdB+644],%acc83;
+    add.u32 %col,%colb,168;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+672],%acc84;
+    @%q1 st.global.f32 [%rdA+676],%acc85;
+    @%q2 st.global.f32 [%rdB+672],%acc86;
+    @%q3 st.global.f32 [%rdB+676],%acc87;
+    add.u32 %col,%colb,176;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+704],%acc88;
+    @%q1 st.global.f32 [%rdA+708],%acc89;
+    @%q2 st.global.f32 [%rdB+704],%acc90;
+    @%q3 st.global.f32 [%rdB+708],%acc91;
+    add.u32 %col,%colb,184;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+736],%acc92;
+    @%q1 st.global.f32 [%rdA+740],%acc93;
+    @%q2 st.global.f32 [%rdB+736],%acc94;
+    @%q3 st.global.f32 [%rdB+740],%acc95;
+    add.u32 %col,%colb,192;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+768],%acc96;
+    @%q1 st.global.f32 [%rdA+772],%acc97;
+    @%q2 st.global.f32 [%rdB+768],%acc98;
+    @%q3 st.global.f32 [%rdB+772],%acc99;
+    add.u32 %col,%colb,200;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+800],%acc100;
+    @%q1 st.global.f32 [%rdA+804],%acc101;
+    @%q2 st.global.f32 [%rdB+800],%acc102;
+    @%q3 st.global.f32 [%rdB+804],%acc103;
+    add.u32 %col,%colb,208;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+832],%acc104;
+    @%q1 st.global.f32 [%rdA+836],%acc105;
+    @%q2 st.global.f32 [%rdB+832],%acc106;
+    @%q3 st.global.f32 [%rdB+836],%acc107;
+    add.u32 %col,%colb,216;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+864],%acc108;
+    @%q1 st.global.f32 [%rdA+868],%acc109;
+    @%q2 st.global.f32 [%rdB+864],%acc110;
+    @%q3 st.global.f32 [%rdB+868],%acc111;
+    add.u32 %col,%colb,224;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+896],%acc112;
+    @%q1 st.global.f32 [%rdA+900],%acc113;
+    @%q2 st.global.f32 [%rdB+896],%acc114;
+    @%q3 st.global.f32 [%rdB+900],%acc115;
+    add.u32 %col,%colb,232;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+928],%acc116;
+    @%q1 st.global.f32 [%rdA+932],%acc117;
+    @%q2 st.global.f32 [%rdB+928],%acc118;
+    @%q3 st.global.f32 [%rdB+932],%acc119;
+    add.u32 %col,%colb,240;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+960],%acc120;
+    @%q1 st.global.f32 [%rdA+964],%acc121;
+    @%q2 st.global.f32 [%rdB+960],%acc122;
+    @%q3 st.global.f32 [%rdB+964],%acc123;
+    add.u32 %col,%colb,248;
+    setp.lt.u32 %p0,%col,%N;
+    add.u32 %col1,%col,1;
+    setp.lt.u32 %p1,%col1,%N;
+    and.pred %q0,%pd0,%p0;
+    and.pred %q1,%pd0,%p1;
+    and.pred %q2,%pd1,%p0;
+    and.pred %q3,%pd1,%p1;
+    @%q0 st.global.f32 [%rdA+992],%acc124;
+    @%q1 st.global.f32 [%rdA+996],%acc125;
+    @%q2 st.global.f32 [%rdB+992],%acc126;
+    @%q3 st.global.f32 [%rdB+996],%acc127;
+EXIT_wgmma_nt_f16_128x256x64_s4:
+    ret;
+}
+
+ok
+test ptx_wgmma::tests::every_branch_target_is_a_defined_label ... ok
+test ptx_wgmma::tests::every_module_opens_at_the_architecture_locked_hopper_floor ... ok
+test ptx_wgmma::tests::every_random_operand_is_exact_in_its_input_type_and_finite ... ok
+test ptx_wgmma::tests::every_sm90a_emitter_demands_the_license ... ok
+test ptx_wgmma::tests::every_stage_base_is_aligned_for_its_descriptor ... ok
+test ptx_wgmma::tests::every_sweep_candidate_reads_inside_the_window ... ok
+test ptx_wgmma::tests::every_wave2_lever_row_differs_from_the_winner_in_one_field ... ok
+test ptx_wgmma::tests::no_cache_policy_is_used_before_it_is_created ... ok
+test ptx_wgmma::tests::no_sm90a_module_names_a_blackwell_instruction ... ok
+test ptx_wgmma::tests::pack_rejects_anything_the_shift_would_truncate ... ok
+test ptx_wgmma::tests::scale_d_replaces_the_accumulator_zeroing ... ok
+test ptx_wgmma::tests::smem_desc_packs_every_field_at_its_documented_bit_position ... ok
+test ptx_wgmma::tests::the_accumulator_vector_matches_the_shape ... ok
+test ptx_wgmma::tests::the_bench_grid_carries_d1s_points_and_both_rectangular_classes ... ok
+test ptx_wgmma::tests::the_bench_grid_is_launchable_by_every_shipped_row ... ok
+test ptx_wgmma::tests::the_bench_invocation_names_the_bench_and_the_flags_it_needs ... ok
+test ptx_wgmma::tests::the_bringup_invocation_names_the_gate_and_the_flags_it_needs ... ok
+test ptx_wgmma::tests::the_bringup_operands_are_exact_in_f16_and_f32 ... ok
+test ptx_wgmma::tests::the_canonical_core_matrix_layout_is_describable ... ok
+test ptx_wgmma::tests::the_cluster_axis_arithmetic_ranks_the_wider_operand_first ... ok
+test ptx_wgmma::tests::the_cluster_preconditions_reject_every_way_a_slice_can_be_wrong ... ok
+test ptx_wgmma::tests::the_composed_lever_row_carries_both_facts ... ok
+test ptx_wgmma::tests::the_declared_transaction_equals_what_the_copies_move_per_destination_cta ... ok
+test ptx_wgmma::tests::the_descriptor_swizzle_encoding_is_reversed_from_tmas ... ok
+test ptx_wgmma::tests::the_device_validation_list_is_intact ... ok
+test ptx_wgmma::tests::the_elided_epilogue_can_never_be_shipped ... ok
+test ptx_wgmma::tests::the_entry_name_is_derivable_from_the_geometry ... ok
+test ptx_wgmma::tests::the_epilogue_transports_every_accumulator_exactly_once_and_bounded ... ok
+test ptx_wgmma::tests::the_family_declares_no_floor_it_does_not_need ... ok
+test ptx_wgmma::tests::the_field_encoder_is_mask_then_shift ... ok
+test ptx_wgmma::tests::the_field_encodings_are_three_distinguishable_templates ... ok
+test ptx_wgmma::tests::the_grid_is_cluster_divisible_and_still_covers_the_output ... ok
+test ptx_wgmma::tests::the_guard_shape_reaches_every_mechanism_the_old_one_could_not ... ok
+test ptx_wgmma::tests::the_iteration_count_is_a_clamped_monotone_function_of_the_shape ... ok
+test ptx_wgmma::tests::the_k_sweep_varies_only_k_and_carries_its_elided_twin ... ok
+test ptx_wgmma::tests::the_l2_hints_reach_the_stores_and_the_tma_copies_they_name ... ok
+test ptx_wgmma::tests::the_launch_plan_covers_the_output ... ok
+test ptx_wgmma::tests::the_license_is_hopper_only_in_both_directions ... ok
+test ptx_wgmma::tests::the_mainloop_is_structurally_what_the_design_says ... ok
+test ptx_wgmma::tests::the_multicast_mask_names_every_cta_of_the_cluster ... ok
+test ptx_wgmma::tests::the_random_arm_matches_the_crates_own_splitmix ... ok
+test ptx_wgmma::tests::the_random_arm_sees_a_reassociation_that_the_exact_arm_cannot ... ok
+test ptx_wgmma::tests::the_random_tolerance_is_derived_and_scales_with_sqrt_k ... ok
+test ptx_wgmma::tests::the_register_split_fits_the_file ... ok
+test ptx_wgmma::tests::the_row_major_reading_is_unrepresentable_and_predicts_the_log ... ok
+test ptx_wgmma::tests::the_runtime_address_fold_matches_the_host_encoder ... ok
+test ptx_wgmma::tests::the_shape_menu_is_the_isa_menu ... ok
+test ptx_wgmma::tests::the_stage_lattice_matches_the_derivation ... ok
+test ptx_wgmma::tests::the_sweep_candidate_set_is_derived_and_complete ... ok
+test ptx_wgmma::tests::the_sweep_invocation_and_shapes_name_things_that_exist ... ok
+test ptx_wgmma::tests::the_sweep_probe_is_one_module_for_every_candidate ... ok
+test ptx_wgmma::tests::the_sweep_probe_shared_memory_map_is_aligned_and_bounded ... ok
+test ptx_wgmma::tests::the_swizzle_modes_constrain_the_start_address ... ok
+test ptx_wgmma::tests::the_tma_geometry_is_validated_with_the_kernel ... ok
+test ptx_wgmma::tests::the_tma_stage_probe_is_structurally_a_single_stage_load ... ok
+test ptx_wgmma::tests::the_v2_epilogue_fuses_pairs_and_keeps_the_odd_n_tail ... ok
+test ptx_wgmma::tests::the_w1_regime_rule_follows_the_measured_sign_change ... ok
+test ptx_wgmma::tests::the_wave2_invocations_name_the_rounds_they_run ... ok
+test ptx_wgmma::tests::the_window_declaration_agrees_with_the_host_side_constant ... ok
+test ptx_wgmma::tests::tma_probe_plan_matches_the_geometry_it_probes ... ok
+test ptx_wgmma::tests::unsupported_shapes_decline_rather_than_emit ... ok
+test ptx_wgmma::tests::variant_lookup_finds_every_shipped_row ... ok
+test ptx_wgmma::tests::variant_lookup_panics_rather_than_mis_dispatching - should panic ... 
+thread 'ptx_wgmma::tests::variant_lookup_panics_rather_than_mis_dispatching' (710) panicked at crates/wukong_codegen_gpu/src/ptx_wgmma.rs:2041:13:
+unknown wgmma variant "wgmma_nt_f16_nope"; emittable variants are ["wgmma_nt_f16_128x256x64_s4", "wgmma_nt_bf16_128x256x64_s4", "wgmma_nt_f16_128x128x64_s6", "wgmma_nt_f16_128x256x64_s4_mc2", "wgmma_nt_f16_128x256x64_s4_mcb2", "wgmma_nt_f16_128x256x64_s3", "wgmma_nt_f16_128x256x64_s3_mcb2", "wgmma_nt_f16_128x256x64_s3_mc2", "wgmma_nt_f16_128x256x64_s2", "wgmma_nt_f16_128x256x64_s2_mcb2", "wgmma_nt_f16_128x256x64_s2_mc2", "wgmma_nt_f16_128x128x64_s6_mcb2", "wgmma_nt_f16_128x128x64_s6_mc2", "wgmma_nt_f16_128x256x64_s4_mcb2_v2", "wgmma_nt_f16_128x256x64_s4_mcb2_ef", "wgmma_nt_f16_128x256x64_s4_mcb2_efol", "wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef", "wgmma_nt_f16_128x256x64_s4_mcb2_nostore"]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs:80:14
+   2: wukong_codegen_gpu::ptx_wgmma::wgmma_variant::{closure#1}
+             at ./src/ptx_wgmma.rs:2041:13
+   3: <core::option::Option<&wukong_codegen_gpu::ptx_wgmma::WgmmaCfg>>::unwrap_or_else::<wukong_codegen_gpu::ptx_wgmma::wgmma_variant::{closure#1}>
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/option.rs:1064:21
+   4: wukong_codegen_gpu::ptx_wgmma::wgmma_variant
+             at ./src/ptx_wgmma.rs:2040:10
+   5: wukong_codegen_gpu::ptx_wgmma::tests::variant_lookup_panics_rather_than_mis_dispatching
+             at ./src/ptx_wgmma.rs:8315:9
+   6: wukong_codegen_gpu::ptx_wgmma::tests::variant_lookup_panics_rather_than_mis_dispatching::{closure#0}
+             at ./src/ptx_wgmma.rs:8314:59
+   7: <wukong_codegen_gpu::ptx_wgmma::tests::variant_lookup_panics_rather_than_mis_dispatching::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+ok
+test ptx_wgmma::tests::warpgroup_arithmetic_is_the_isa_definition ... ok
+test ptx_wgmma::tests::wgmma_ptx_is_pure_ascii ... ok
+
+failures:
+
+failures:
+    gpu::tests::wgmma_bf16_vs_cublas
+    gpu::tests::wgmma_cluster_multicast_is_exact
+    gpu::tests::wgmma_config_sweep
+    gpu::tests::wgmma_declines_on_every_part_that_is_not_hopper
+    gpu::tests::wgmma_hopper_bringup
+    gpu::tests::wgmma_k_sweep
+    gpu::tests::wgmma_vs_cublas
+
+test result: FAILED. 68 passed; 7 failed; 0 ignored; 0 measured; 485 filtered out; finished in 4.23s
+
+[1m[91merror[0m: test failed, to rerun pass `-p wukong_codegen_gpu --lib`
+
+
+--- crate table note: the audit test printed no table this harness recognises (no `family entry arch regs ...` header), so the crate-side cross-check is unavailable ---
+
+--- RAW ptxas -v, as captured by the shim ---
+
+
+
+--- parsed census (declared floor) ---
+
+--- parsed census (per-arch sweep) ---
+
+--- ptxas declined ---
