@@ -771,3 +771,168 @@ wave's.
 7. **Any fused row published from a round whose C2 arm did not run.** L7a is `==`; a round that
    skipped it and reported a timing has no evidence the timed kernel computed the epilogue at all --
    which is precisely the G3-W4 cache hazard's payload.
+
+---
+
+## 5. RECOGNIZER SURFACE
+
+*This section names the seams an implementer must touch. This dossier touches none of them.*
+
+### 5.0 The fact to read first
+
+**`gemm_nt_wgmma` has no product call site.** A repo-wide search finds exactly two callers, both
+inside `gpu.rs`'s own test module: `gpu.rs:20006` (the correctness arm) and `gpu.rs:20086` (the
+bench's contender arm). Nothing in `wukong_driver`, `wukong_interp` or `wukong_mir_build` can reach
+it. The entire Act-2 kernel -- the thing every round of this campaign has measured -- **cannot be
+invoked by a `.wk` program.**
+
+That is not a criticism of the campaign; a benchmark kernel is a legitimate thing to build first. It
+is a scoping fact Wave 4 must state out loud, because the wave is called *"the epilogue becomes a
+product surface"* and, as scoped, it makes the epilogue a **benchmark** surface. Wiring the wgmma
+family into the offload path is a separate, nameable piece of work (5.3), and whether it is in Wave 4
+or after it is a decision, not an oversight to be discovered in the round log.
+
+### 5.1 Where the epilogue tag already lives -- and it is not an enum
+
+There are two independent GPU paths and only one of them carries an epilogue.
+
+**Path A -- interpreter offload (the live one).** The interpreter string-matches the recognized
+runtime symbol and calls a five-method `Accelerator` trait; `GpuAccel` implements it over
+`wukong_codegen_gpu::gpu`'s launchers.
+
+* `Accelerator::sgemm_nt_epi` -- `crates/wukong_interp/src/lib.rs:147`. The signature **is** the
+  epilogue tag:
+  `(a, b, c, m, k, n, beta: i64, bias: Option<&[f32]>, act: i64)`. The doc comment above it says the
+  positional form is deliberate ("the trait mirrors the kernel ABI, and a params struct here would
+  ripple through every `Accelerator` impl").
+* Activation codes: `EPI_ACT_{IDENTITY,RELU,GELU,SILU} = 0,1,2,3` --
+  `crates/wukong_mir_build/src/lib.rs:21899-21902`, mirrored verbatim in
+  `crates/wukong_runtime/src/gemm.rs:417-420`. **Four codes, and adding a fifth means editing both.**
+* `GpuAccel::sgemm_nt_epi` -- `crates/wukong_driver/src/gpu_accel.rs:99`. A positional
+  `match (bias, act)` at `:122-135` over eight arms, each reaching a **wmma** launcher
+  (`gemm_nt_f16_sm_db_{relu,gelu,silu}`, `gemm_nt_f16_sm_db_bias{,_relu,_gelu,_silu}`).
+* The decline gate -- `gpu_accel.rs:118`:
+  `if beta != 0 || !m.is_multiple_of(64) || !n.is_multiple_of(64) || !k.is_multiple_of(16)`.
+
+**So the answer to "can the offload path carry an epilogue tag today?" is YES -- it already does.**
+Wave 4 does not need a new tag. It needs the existing `(beta, bias, act)` triple routed to a wgmma
+launcher instead of a wmma one, and it needs two of the tag's values (`beta != 0`, and any lowp
+dtype) to stop being hard declines.
+
+**Path B -- whole-program lowering / megakernel.** `fusion.rs:92` `classify_call` maps
+`"wukong_sgemm_nt_epi" | "wukong_sgemm_nt_epi_parallel"` to `CoopKind::GemmNtEpi` (`fusion.rs:46`,
+`:110`), and `lower.rs:2521` routes it to the device helper `PTX_SGEMM_NT_EPI` (`lower.rs:3841`),
+whose `.func` signature is `(pa, pb, pc, pm, pk, pn, pbeta, pbias, pact)`. **This path honours
+`beta`**; path A does not. `megakernel.rs` has no `GemmNtEpi` reference -- it goes through `lower.rs`.
+Wave 4 does not need path B, but a later wave that fuses an epilogue into the megakernel will find
+the tag already plumbed here and missing over there.
+
+### 5.2 What `.wk` spelling maps to each fused form
+
+The recognizer accepts two spellings for every form: a **separate epilogue loop** after the matmul
+nest, and the activation **inside the matmul's store**. Both reach the same symbol.
+
+```wk
+// (a) separate epilogue loop -- tests/run/linear_bias_relu.wk
+for i in 0..M { for j in 0..N {
+    let mut s: f32 = 0.0;
+    for k in 0..K { s = s + x[i*K+k] * w[j*K+k]; }
+    out[i*N+j] = s;
+} }
+for i in 0..M { for j in 0..N { out[i*N+j] = fmax(out[i*N+j] + bias[j], 0.0); } }
+
+// (b) activation inside the store -- tests/run/linear_bias_relu_store.wk
+out[i*N+j] = fmax(bias[j] + s, 0.0);
+```
+
+| fused form | `.wk` spelling / fixture | recognizer | emitted symbol | reaches a GPU kernel? |
+|---|---|---|---|---|
+| `act(x*W^T)` | `tests/run/linear_silu.wk`, `linear_silu_store.wk` | `try_fuse_matmul_epilogue` (`mir_build:9387`) -> `match_bias_act_epilogue` (`:22089`) | `wukong_sgemm_nt_epi`, act=1..3, bias NULL | **yes** -> wmma `sm_db_{relu,gelu,silu}` |
+| `x*W^T + b` | `tests/run/gemm_fused_bias_slice.wk` | same | `nt_epi`, act=0, bias | **yes** -> `sm_db_bias` |
+| `act(x*W^T + b)` | `tests/run/linear_bias_relu.wk`, `linear_bias_gelu.wk`, `..._store.wk` | same | `nt_epi`, act, bias | **yes** -> `sm_db_bias_{relu,gelu,silu}` |
+| `@parallel` form of the above | `tests/run/linear_bias_relu_parallel.wk` | `emit_sgemm_epi` picks the `_parallel` symbol (`:9487-9491`) | `wukong_sgemm_nt_epi_parallel` | yes, same arm |
+| **`act(x*W^T + b) + R`** (residual, beta=1) | `tests/run/linear_residual.wk`, `linear_residual_relu.wk` | `match_matmul_residual` (`:23195`); whole-`@parallel`-fn interception at `:27188` | `nt_epi` with **beta=1** | **NO** -- `gpu_accel.rs:118` declines `beta != 0` |
+| residual from a *different* array | `tests/run/linear_residual_src.wk` | `match_matmul_residual_src` (`:23359`) | splits to `wukong_sgemm_nt` + `wukong_velem_f32` | n/a (two kernels) |
+| bf16 / f16 `act(x*W^T + b)` | `tests/run/linear_f16_ffn.wk`, `linear_bf16_ffn.wk` | `try_fuse_lowp_matmul_epilogue` -> `emit_lowp_gemm_epi` (`:9297`) | `wukong_sgemm_{bf16,f16}_nt_epi` | **NO** -- no `Accelerator` hook exists |
+| int8 + fused dequant | `tests/run/i8_linear_dequant.wk` | `try_fuse_i8matmul_dequant_epilogue` (`:9648`) | `wukong_i8gemm_nt_deq` | separate symbol, separate path |
+| **gated SwiGLU / GeGLU** | **no spelling** | **none** | **none** | R5 needs language work |
+| **f16 narrowing output of an f32 GEMM** | **no spelling** | **none** | **none** | R4 needs a form for "compute f32, store f16" |
+| **aux second output** (pre-activation) | **no spelling** | **none** | **none** | R7/R8 |
+
+Two decline guards worth knowing before writing a fixture, both in `mir_build`:
+
+* `:22927` -- an alpha scale and an activation are **mutually exclusive**, because the `nt_epi`
+  symbol has no alpha parameter (the runtime's `Epilogue` struct at `wukong_runtime/src/gemm.rs:438`
+  has an `alpha` field but `nt_epi` always passes 1.0).
+* `:9404-9409` -- a peeled alpha or a peeled *store* bias forces a decline, because `emit_sgemm_epi`
+  reads neither. `tests/run/matmul_epilogue_shapes.wk` is the fixture for those decline cases and
+  `epilogue_shadowed_activation.wk` for the shadowing one.
+
+**And a corpus fact the implementer will hit immediately: every `tests/run/linear_*` fixture is
+2x2**, so `m.is_multiple_of(64)` fails and **not one of them exercises the GPU arm**. Whatever the
+Wave-4 offload gate ends up being, it needs at least one aligned fixture or the corpus proves
+nothing about it.
+
+### 5.3 The plumbing an implementer must change -- named, and not touched here
+
+| # | file / function | change |
+|---|---|---|
+| 1 | `crates/wukong_codegen_gpu/src/ptx_wgmma.rs` -- `WgmmaCfg` (`:974`) | add the epilogue axis (act / bias / residual / out dtype); `derived_name()` (`:1230`) per L2; `validate()` per L2+G22; `smem_bytes()` (`:1145`) must learn the bias and C-block regions per L5; the emitter at `:3657-3712` |
+| 2 | same file -- `PARAM_ORDER` (`:1517`) | becomes `param_order()` per L3 |
+| 3 | `crates/wukong_codegen_gpu/src/gpu.rs` -- `gemm_nt_wgmma` (`:6907`), `time_gemm_nt_wgmma` (`:7096`), the shared arg builder (`:7032`, *"the wgmma family's argument list, built once, in `PARAM_ORDER`"*) | thread the bias/residual pointers; keep the two entry points' argument construction in **one** helper, which is what makes L3's law checkable |
+| 4 | same file -- the device-free param law (`:17896-17945`) | re-derive per entry per L3 |
+| 5 | `crates/wukong_driver/src/gpu_accel.rs:99-140` | add a wgmma arm to the `(bias, act)` match; make the `beta != 0` decline at `:118` **conditional** rather than absolute; the `m%64 / n%64 / k%16` alignment gate is a *wmma* constraint -- **wgmma predicates its own ragged edge** (`ptx_wgmma.rs:3677-3695`), so a wgmma arm needs no alignment gate at all, which is a real simplification and also a real hazard if the two arms share one gate |
+| 6 | `crates/wukong_interp/src/lib.rs:147` (`Accelerator`), `:1952`/`:1994` (the f32 `nt_epi` dispatch), `:3691-3757` (the lowp `nt_epi` block, which consults **no** accelerator) | only if the lowp seam is in scope |
+| 7 | `crates/wukong_mir_build/src/lib.rs:21899-21902` **and** `crates/wukong_runtime/src/gemm.rs:417-420` | only if a **new activation code** is needed (R5's gated form). Both, in one commit, or the codes desync |
+| 8 | `crates/wukong_autodiff/src/tape.rs` (`Syms` / `is_kernel` / `kernel_arity` / `diff_kernel_call`) and `wukong_interp::intrinsic` | **the standing landmine**: a new `_parallel` recognizer arm in `mir_build` that is not mirrored here breaks every `@parallel` function's backward. Applies to R5 only |
+| 9 | `crates/wukong_codegen_gpu/src/fusion.rs:46,110` and `lower.rs:2521,3841` | path B; not needed for Wave 4, but the place a later megakernel fusion lands |
+
+### 5.4 Four pre-existing gaps this survey found, independent of Wave 4
+
+Recording them because each one silently caps what a Wave-4 row can show.
+
+1. **`beta != 0` is hard-declined on the GPU** (`gpu_accel.rs:118`) even though
+   `gemm_nt_f16_sm_db_residual` (`gpu.rs:1858`) and `gemm_nt_f16_mma_bias_residual` (`gpu.rs:2409`)
+   both exist and both fuse it. The residual recognizer deliberately reuses the `nt_epi` symbol with
+   `beta=1` so that "no backend change" would be needed -- and the GPU backend is the one place the
+   change *was* needed. **R6's `.wk` spelling already exists and has never run on a GPU.**
+2. **The size-aware dispatchers are dead code.** `gemm_nt_f16_linear{,_relu,_silu,_gelu}`
+   (`gpu.rs:2542/2565/2588/2611`) pick between the `pipe_64_s6_bias*` and `mma_bias*` families by
+   shape; a repo-wide search finds **zero** call sites. `GpuAccel` calls the cruder fixed
+   `sm_db_bias*` family instead. Any Wave-4 "our fused kernel vs the old fused kernel" A/B is
+   comparing against the *worse* of two kernels we already have.
+3. **The bf16/f16 `nt_epi` symbols have no offload seam at all.** `wukong_interp/src/lib.rs:3691`
+   matches them and goes straight to the runtime at `:3756` with no `self.accel` consultation; the
+   `Accelerator` trait has no lowp hook. Meanwhile `gpu.rs:3249-3285` already ships four
+   `gemm_nt_bf16_sm_db_bias*` launchers. Since `WGMMA_W1_BF16` exists and bf16 is the dominant
+   *training* precision, this gap sits directly under any future training-side epilogue claim.
+4. **No `.wk` program can reach any wgmma kernel** (5.0).
+
+### 5.5 The minimal correct scope, if Wave 4 must stay small
+
+The cheapest path that produces a *publishable* row rather than a benchmark artifact:
+
+1. R1 + R2 in `ptx_wgmma.rs` with L1/L2/L3/L6/L7a green (kernel + laws, no driver change).
+2. One aligned `.wk` fixture (`M`, `N` multiples of 64, `K` of 16) for `silu(x*W^T + b)` so the
+   corpus can see the offload arm at all.
+3. A wgmma arm in `gpu_accel.rs:122`'s match, behind the existing `(bias, act)` tag -- **no new
+   tag, no new trait method, no `mir_build` change, no autodiff mirror**.
+
+Everything past that (residual, lowp, gated, aux) is additive and each piece has a named seam above.
+
+---
+
+## CLOSING: the single highest-margin target
+
+**`silu(x*W^T + b)` on `gpt_d1024_up` (M=4096, N=4096, K=1024).**
+
+* Break-even `r* = 56.5%` at 3.0 TB/s, `59.2%` at the 3.35 spec peak -- **14 points below the next
+  shape in the suite**, because 21.1% of that kernel is the C store.
+* cuBLASLt has **no SiLU member**; the absence is pinned by a device-free test
+  (`baselines.rs:5297`), so the peer's floor is `BIAS` fused plus a separate kernel and the
+  comparison is a fusion claim, not a strawman.
+* Five PTX instructions, one scratch register, **already shipped verbatim** at
+  `ptx_wmma.rs:1187-1192`, and the `.wk` spelling already exists (`tests/run/linear_silu.wk`).
+* **Derived margin: 1.328x at r=0.75, 1.451x at r=0.82, 1.770x at GEMM parity.** At today's
+  un-improved 54.8% it is **0.970x -- a loss**, which is why re-measuring this shape under
+  `w1_s4_mcb2` (row M3) is a prerequisite of the visit and not a result of it.
