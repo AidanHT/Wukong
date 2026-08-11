@@ -13,6 +13,7 @@ Layout:
 | `peers/verify_peers.py` | Resolves every strong peer and **exits non-zero** when a declared one is missing. |
 | `peers/smoke_inductor.py` | Proves Inductor really emitted a Triton kernel, and warms the autotune cache once. |
 | `peers/torch_compile_peer.py` | The `torch.compile` framework bar itself: eager / compiled / max-autotune, fairly configured. |
+| `peers/selftest_modal_helpers.py` | **Runs anywhere, needs no Modal.** Lifts `modal_app.py`'s pure staging logic out with `ast` and checks it: the CUTLASS filter port, the kernel census, the FA2 arch table, the FA3 presets, the wheel audit, the cache stats. `python tools/cloud/peers/selftest_modal_helpers.py` — a second, not a metered container. |
 
 The research behind every command here is [`docs/gpu/derive/D5_peer_builds.md`](../../docs/gpu/derive/D5_peer_builds.md)
 (45 KB, live-verified). **Read that before changing a pin**; nothing here was invented at the keyboard.
@@ -142,13 +143,13 @@ answers every "does this scale past 20 SMs" question on the same architecture fo
 |---|---|---|
 | `::device_info` | yes | §6.1 provenance block: CC, SM count, opt-in SMEM, L2, VRAM, driver, MIG state, a real `dlopen` of every peer library, the staged-peer manifest and the strong-peer resolution table. Checks the device against a spec table keyed on the **device's own name** and says plainly if it is a slice. |
 | `::build` | **no** | `cargo check --features gpu --all-targets`, then `cargo test --no-run` for `wukong_codegen_gpu` + `wukong_driver`, then the CPU workspace suite. Writes into the Volume. |
-| `::build_peers` | **no** | Stages the heavy strong peers onto the Volume: the CUTLASS profiler, the vLLM (Marlin/Machete) venv, optionally the FA2/FA3 wheels. Idempotent; `--force` rebuilds. |
+| `::build_peers` | **no** | Stages the heavy strong peers onto the Volume: the CUTLASS profiler (f16 **+ fp8 + int8**, `--cutlass-dtypes`), the vLLM (Marlin/Machete) venv, optionally the FA2/FA3 wheels. Idempotent on the **arch and the kernel-family set**; `--force` rebuilds. |
 | `::ptxas` | **no** | The register / SMEM / spill census, **at every arch**. Resolves `ptxas`, self-tests each target, runs the crate's audit test behind a capture shim, then **recompiles every captured module for each requested arch**, prints the per-arch matrix and writes the raw `ptxas -v` into `/persist/rounds/`. |
 | `::peers` | yes | **The strong-peer battery.** Installs any FlashAttention wheel `::build_peers` staged, resolves every peer, proves Inductor emits Triton, runs the in-tree cuBLAS/cuDNN gates with skips escalated, and runs the Rust strong-peer gate. Fails if a `--require`d peer is missing. |
 | `::test` | yes | The device gates with `WUKONG_GPU_REQUIRED=1`. `--peers` also requires NVRTC/cuBLAS/cuBLASLt/cuDNN. `--strong-peers <list>` declares the §0 bar. `--filter <name>` narrows — and it whitespace-splits, so it can carry libtest *flags* too: the wgmma bring-up gate needs `--filter "--nocapture --test-threads=1 wgmma_hopper_bringup"` because its verdicts are printed, not asserted. |
 | `::bench` | yes | The `#[ignore]`d perf sweeps, release, single-threaded. `--name gemm_pipe_sweep` selects one. `--peers` / `--strong-peers` escalate a missing peer to a failure. **Needs `::build --release` first.** `--name` is a libtest *substring* filter, so `--name wgmma` runs **both** Act-2 rounds (`wgmma_vs_cublas` + `wgmma_bf16_vs_cublas`) and nothing else — `wgmma_hopper_bringup` is not `#[ignore]`d, so `--ignored` never reaches it. |
-| `::framework` | yes | The `torch.compile` bar: eager / compiled / max-autotune over `gemm`, `linear_gelu` or `sdpa`, fastest wins. |
-| `::cutlass` | yes | The CUTLASS-profiler GEMM bar, with cuBLAS as a same-binary control column. **Needs `::build_peers`.** |
+| `::framework` | yes | The `torch.compile` bar: eager / compiled / max-autotune over `gemm`, `linear_gelu` or `sdpa`, fastest wins. Prints a **cache header** first: the installed torch/Triton/CUDA, both compile caches with size and age, and whether the cache **key** still matches. |
+| `::cutlass` | yes | The CUTLASS-profiler GEMM bar, with cuBLAS as a same-binary control column. `--dtype f16\|bf16\|e4m3\|s8` picks the operand type and, with it, the C type and accumulator. **Refuses a dtype the staged profiler was not built with.** **Needs `::build_peers`.** |
 | `::marlin` | yes | The int4 bar: vLLM's own Marlin (Ampere) / Machete (Hopper) kernel benchmarks. **Needs `::build_peers`.** |
 | `::interactive` | yes | Target for `modal shell tools/cloud/modal_app.py::interactive`. |
 
@@ -161,6 +162,8 @@ modal run tools/cloud/modal_app.py::bench --name flash_tiled_vs_untiled --peers
 modal run tools/cloud/modal_app.py::bench --name wgmma_vs_cublas --peers      # Act 2, item 8 (f16)
 modal run tools/cloud/modal_app.py::framework --op sdpa --causal --shapes 1x16x2048x128
 modal run tools/cloud/modal_app.py::ptxas --archs sm_80,sm_90,sm_90a
+modal run tools/cloud/modal_app.py::cutlass --dtype e4m3 --m 4096 --n 4096 --k 4096
+modal run tools/cloud/modal_app.py::build_peers --cutlass-dtypes f16,fp8,int8 --fa2
 modal shell tools/cloud/modal_app.py::interactive
 ```
 
@@ -306,12 +309,12 @@ pay GPU-minutes to discover.
 
 | Family | The bar | Where it comes from |
 |---|---|---|
-| GEMM | cuBLAS/cuBLASLt **with fused epilogues**, and the **CUTLASS profiler** | `::cutlass`, and the in-tree cuBLASLt peers |
-| Attention | cuDNN and a **real FlashAttention build** | FA4 in the image (sm_90+), FA2 via torch SDPA's FLASH backend, `::framework --op sdpa` |
+| GEMM | cuBLAS/cuBLASLt **with fused epilogues**, and the **CUTLASS profiler** | `::cutlass` (f16 + fp8 + int8), and `baselines.rs`'s `cublaslt_gemm_nt_f16_epilogue` / `time_cublaslt_gemm_nt_f16_epilogue` |
+| Attention | cuDNN and a **real FlashAttention build** | FA4 in the image (sm_90+), FA2 via torch SDPA's FLASH backend, FA2's own `flash_attn_with_kvcache` via `::build_peers --fa2`, `::framework --op sdpa` |
 | Framework | **`torch.compile` with Inductor+Triton** | `::framework` |
-| int4 / int8 | **Marlin / Machete-class** kernels | `::marlin` |
+| int4 / int8 | **Marlin / Machete-class** kernels | `::marlin`, plus the CUTLASS `s8`/`u8` profiler column |
 
-Two of those retire claims this repo currently makes:
+Three of those retire claims this repo currently makes:
 
 - **"Beats PyTorch at every S" is an eager-only number** (BENCHMARKS.md:2182,2230), justified by
   Triton not installing on Windows. On Linux Triton installs, so the excuse expires and the claim has
@@ -322,6 +325,78 @@ Two of those retire claims this repo currently makes:
   device: Machete is a Hopper kernel and is the H100 bar; Marlin is an Ampere kernel, documented as
   weak on H100, and is the A100 bar. Reporting either off its own architecture is a strawman, in one
   direction or the other, and `::marlin` says so out loud when you do it.
+- **"Our fused bias/ReLU/GELU epilogue is a fusion win"** is retired by the in-tree cuBLASLt
+  fused-epilogue peer (`baselines.rs`). cuBLASLt's fusable set is exactly the **sixteen** values of
+  `cublasLtEpilogue_t`, written out in `CUBLASLT_FUSABLE_EPILOGUES` and pinned to the real enum by a
+  device-free law — BIAS, RELU, GELU and the two `*_BIAS` pairs are all in it, so any of those rows is
+  a GEMM-parity fight, not a fusion win. What is *not* in it is SiLU/swish, residual-plus-activation,
+  and any low-precision-output-plus-activation member; `cublaslt_epilogue_support_matrix` asks the
+  library itself, per epilogue and per output dtype, so that absence is a measurement in the round log
+  rather than a claim in a comment.
+
+### The CUTLASS profiler now carries fp8 and int8, and that is checked before the compile
+
+The staging filter used to be f16-only, so an 8-bit round had no CUTLASS column at all — and a
+profiler with no fp8 kernels *runs*, prints nothing for `--dtype e4m3`, and reads as "the library has
+no fp8 kernel here". That is a bar weakened by our own build, which is worse than no bar.
+
+`--cutlass-dtypes` (default `f16,fp8,int8`) selects the kernel families, and three things make it
+safe to change:
+
+- **Idempotence keys on the family set as well as the arch.** A profiler staged for fewer families
+  than the call asks for is rebuilt, not reported as present. The artifact is
+  `cutlass_profiler-sm<arch>-<families>`, so switching between SKUs or family sets never re-pays a
+  build it already paid.
+- **A kernel census runs after `cmake` configures and before `make`.** CUTLASS's filter is
+  substring-in-order matching (`KernelFilter._filter_string_matches`), ported exactly, so the census
+  counts the set the build will compile. It refuses three ways: nothing generated (the layout moved —
+  `--no-cutlass-census` is the escape hatch), a requested family that selected **zero** kernels (the
+  pattern is wrong for this CUTLASS version, and the sample names it prints are how you fix it), or a
+  total over `--cutlass-max-kernels` (default 800). Configure is minutes; `make` is 20-45+; the audit
+  belongs in between.
+- **`::cutlass` refuses a dtype the staged binary lacks**, naming the `::build_peers` line that fixes
+  it, and `::peers` prints the staged family list into the round log.
+
+Only the f16 patterns are D5-live-verified. The fp8/int8 ones are derived from CUTLASS v4.6.1's own
+`gemm_operation.py` naming rule (`cutlass3x_sm90_tensorop_gemm_<eA>_<eB>_<eAcc>_<eC>_<eD>_...`), and
+the 2.x (sm_8x) spellings are explicitly unverified — which is exactly what the census is for.
+
+### FlashAttention: FA2 is the decode bar, and the staged FA3 was unusable
+
+Two separate defects, both fixed here:
+
+- **FA2's arch was derived by string surgery** on the SKU's compute capability, so an L4/L40S asked
+  for `FLASH_ATTN_CUDA_ARCHS=89` — a value FA2's `setup.py` does not know (it emits gencode for
+  80/90/100/120 only). The mapping is now a table, and Ada/Ampere-consumer take `80` because cubins
+  are minor-version compatible within a major version.
+- **The staged FA3 wheel was built with `DISABLE_{PAGEDKV,SPLIT,PACKGQA,VARLEN,FP8}=TRUE`**, i.e.
+  with exactly the features W5 and W6 need removed. That wheel imports and then cannot answer
+  `flash_attn_with_kvcache(block_table=)`, which *is* the decode bar. `--fa3-features` is now a named
+  preset — `decode` (the default) keeps paged KV, split-KV, packed GQA, varlen and fp8 and drops only
+  backward + sm_80 + the unused head dims; `full` disables nothing; `minimal` reproduces the old
+  artifact and says out loud that it cannot serve W6.
+
+Both wheels are **audited off-device** before they are recorded as staged: the archive must contain a
+multi-megabyte compiled extension (a `SKIP_CUDA_BUILD` or a swallowed nvcc failure produces a
+python-only wheel that imports and has no kernel), and for FA2 that extension must carry the
+`fwd_kvcache` pybind method name — the one static proof that the decode entry point was compiled in.
+A build that leaves no wheel is a hard failure, not a manifest entry with an empty path.
+
+Cost, stated honestly because these are the expensive ones: FA2 is *(est.)* 20-50 min on 16 cores for
+one arch; FA3 `decode` is *(est.)* 1-4 h and `full` *(est.)* 2-8 h. `--fa3-features full` therefore
+refuses to start unless `WK_PEER_TIMEOUT >= 28800` — Modal kills the container at the cap and bills
+every second already spent, so an under-capped multi-hour build is a guaranteed total loss rather than
+a slow success. `MAX_JOBS` is bounded by `WK_PEER_MEM` as well as by cores (2 GiB/job for FA2, 3 for
+FA3), because RAM exhaustion is the classic FlashAttention build failure and an OOM-killed 40-minute
+build is paid for twice.
+
+Note which venv the FA builds use: **the image's `/opt/torch-venv`**, not the Volume's vLLM venv. The
+`--copies`/`ensurepip` fallback chain below is about the latter and does not apply — the torch venv is
+created inside the image from the image's own interpreter with the default symlinked spelling, which
+is route 1 of that chain, the one it concluded was correct. What it *can* lack is a build backend
+(`pip wheel --no-build-isolation` and `setup.py bdist_wheel` both need setuptools + wheel already
+installed, and ensurepip stopped bundling setuptools at Python 3.12), so those are pinned into the
+image layer and re-verified — and repaired in seconds — before any hours-long compile starts.
 
 ### Everything is pinned, and the pins are the point
 
@@ -368,7 +443,16 @@ modal run tools/cloud/modal_app.py::build --release
 
 # 3. Stage the heavy peers on CPU. ~1-2 h of $1/hr CPU, ONCE, then never again.
 #    --cutlass-arch defaults from WK_GPU; 90a for Hopper, 80 for A100, 89 for L4/L40S.
+#    --cutlass-dtypes defaults to f16,fp8,int8 -- W5 needs the 8-bit columns and an f16-only
+#    profiler would print an empty one that reads as a missing library kernel.
 $env:WK_GPU="H100"; modal run tools/cloud/modal_app.py::build_peers
+
+# 3a. The FlashAttention peers, also CPU-only, also once. FA2 is W6's real decode bar
+#     (`flash_attn_with_kvcache`); FA3 `decode` keeps paged KV / GQA / varlen / fp8, which the
+#     previously staged wheel had all disabled. ~20-50 min and ~1-4 h respectively.
+$env:WK_GPU="H100"; modal run tools/cloud/modal_app.py::build_peers --no-cutlass --no-vllm --fa2
+$env:WK_PEER_TIMEOUT="28800"; $env:WK_GPU="H100"
+modal run tools/cloud/modal_app.py::build_peers --no-cutlass --no-vllm --fa3 --fa3-features decode
 
 # 3b. The register/SMEM/spill census, at sm_80/sm_89/sm_90/sm_90a. Also CPU, also cents, and it
 #     decides tile shape BEFORE anything is rented -- ptxas compiles for an arch, it does not
@@ -390,6 +474,34 @@ as much and produce a byte-identical artifact. Step 4 is the other half: `max-au
 minutes on the first call for each new shape, so pay it at $0.80/hr on an L4 and let
 `TORCHINDUCTOR_CACHE_DIR`/`TRITON_CACHE_DIR` on the Volume make every later round a cache hit.
 
+#### ⚠ The compile cache is keyed, and a pin bump orphans it **silently**
+
+Both caches fingerprint the torch and Triton versions (and, for the autotune results, the device).
+Bump either pin and every entry becomes unreachable: the directory still holds gigabytes, the round
+still runs, and it quietly re-pays the whole autotune on metered hardware while the log says nothing.
+There is no error to notice — only a wall time that is a few minutes longer than you expected, on a
+box where you have no baseline for "expected".
+
+So `::framework` and `::peers --warm` print a header before they start: the **installed** torch /
+CUDA / Triton versions and device (read from the venv, not from the pin block — the pin says what was
+asked for), both cache directories with their file count, size and age, and a verdict line comparing
+this round's key against the one recorded beside the cache in `.wukong-cache-key.json`:
+
+```
+  [cache] key UNCHANGED since the last round -- the entries above are reachable.
+  [cache] COLD: /persist/triton-cache is empty. This round PAYS the full max-autotune compile ...
+  [cache] KEY CHANGED -- torch: 2.13.0+cu129 -> 2.14.0+cu130; triton: 3.7.1 -> 3.8.0
+```
+
+A cold or invalidated cache is then a line in the round log rather than something to reconstruct
+afterwards from a suspicious duration. Paste it in with the `[meter]` line.
+
+**`CUDA_CACHE_PATH` is deliberately *not* persisted.** That is the driver's own PTX→SASS JIT cache,
+and Wukong's modules go through it too — putting it on the Volume would let an A/B's first arm pay a
+cold JIT its second arm does not. This repo has already published a phantom of exactly that shape
+once (a cold device-keyed cubin cache read as a 27× win). The *peer's* compile cache is persisted;
+the *instrument's* is not.
+
 The first command after this change **rebuilds the image** (the torch + FA4 venv is a new layer, so
 the pull and the ~9 GB install are paid once, on Modal's CPU builder, at $0). Later runs hit the
 layer cache; only a changed pin re-runs that one layer, because it is deliberately last.
@@ -397,7 +509,10 @@ layer cache; only a changed pin re-runs that one layer, because it is deliberate
 **The one trap worth checking by hand:** a `cutlass_profiler` built for the wrong arch still runs and
 still prints numbers. On Hopper a plain-`90` (or an sm_80) build silently omits the wgmma kernels —
 it *understates* the peer and hands Wukong a win it did not earn. `::build_peers` records the arch it
-built and `::peers` refuses to proceed when it does not match the device.
+built and `::peers` refuses to proceed when it does not match the device. The **kernel-family** twin
+of that trap (an f16-only binary answering an fp8 request with nothing) is closed the same way: the
+manifest records the families, `::cutlass` refuses a dtype they do not cover, and the pre-`make`
+census refuses a filter that selected zero kernels for a requested family.
 
 **Where the wheels land.** The torch/Triton/FA4 venv is in the *image*, so every container has it.
 The FA2/FA3 wheels are Volume artifacts, and a container's image filesystem is per-container — so
