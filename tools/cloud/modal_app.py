@@ -264,8 +264,17 @@ _TORCH_VENV_CMD = (
     # ensurepip stopped bundling setuptools at Python 3.12. Without `ninja` the FA2 build is
     # single-threaded and takes ~2 h (upstream's own number).
     f"{TORCH_VENV}/bin/pip install --no-cache-dir numpy ninja packaging setuptools wheel && "
-    f"{TORCH_VENV}/bin/pip install --no-cache-dir --pre flash-attn-4=={WK_FA4} && "
+    # torch is REPEATED in the flash-attn-4 resolution, with the cu129 index available. Without
+    # it, fa4's `torch` dependency re-resolves against PyPI alone and pip REPLACES the pinned
+    # +cu129 torch with the default cu130 build -- measured 2026-08-10: the swap is silent at
+    # image-build time and surfaces an hour later as torch.utils.cpp_extension refusing the
+    # image's nvcc 12.9 ('detected CUDA version (12.9) mismatches ... (13.0)') on the first FA2
+    # compile. The assert below makes the drift fail HERE, at $0, instead.
+    f"{TORCH_VENV}/bin/pip install --no-cache-dir --pre --extra-index-url {WK_TORCH_INDEX} "
+    f"flash-attn-4=={WK_FA4} torch=={WK_TORCH} && "
     f"{TORCH_VENV}/bin/python -c \"import torch,triton,importlib.metadata as m;"
+    f"assert torch.version.cuda.startswith('12.9'), "
+    f"'torch venv drifted to CUDA '+torch.version.cuda+' but the image toolkit is 12.9';"
     f"print('torch',torch.__version__,'cuda',torch.version.cuda,'triton',triton.__version__,"
     f"'fa4',m.version('flash-attn-4'))\""
 )
