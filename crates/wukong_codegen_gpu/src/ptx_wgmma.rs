@@ -2027,11 +2027,25 @@ pub fn wgmma_w1_for(m: usize, n: usize) -> &'static WgmmaCfg {
 }
 
 /// Look up a variant by entry name; panics loudly rather than mis-dispatching.
+/// Look up a configuration by entry name; panics loudly rather than mis-dispatching.
+///
+/// Searches **everything this family can emit** ([`wgmma_all_emittable`]), not just the shipped
+/// table: a sweep-only row is still a module a rented H100 will be handed, and the operator dumping
+/// its PTX before the visit is exactly the person who must not be told it does not exist. The panic
+/// lists what does, because "unknown variant" with no menu costs a round trip.
 pub fn wgmma_variant(name: &str) -> &'static WgmmaCfg {
-    WGMMA_VARIANTS
-        .iter()
+    wgmma_all_emittable()
+        .into_iter()
         .find(|v| v.name == name)
-        .unwrap_or_else(|| panic!("unknown wgmma variant {name:?}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "unknown wgmma variant {name:?}; emittable variants are {:?}",
+                wgmma_all_emittable()
+                    .iter()
+                    .map(|c| c.name)
+                    .collect::<Vec<_>>()
+            )
+        })
 }
 
 // --- Act 2 round 2: the CONFIG SWEEP table --------------------------------------------------------
@@ -8275,8 +8289,23 @@ mod tests {
 
     #[test]
     fn variant_lookup_finds_every_shipped_row() {
+        // Every EMITTABLE row, not just the shipped table: a sweep-only row is still text a rented
+        // H100 will be handed, and the operator dumping its PTX before the visit must be able to
+        // name it.
+        for c in wgmma_all_emittable() {
+            assert_eq!(wgmma_variant(c.name).name, c.name);
+        }
         for c in WGMMA_VARIANTS {
             assert_eq!(wgmma_variant(c.name).name, c.name);
+        }
+        // Including the wave-2 lever rows, by name, so a rename is loud.
+        for n in [
+            "wgmma_nt_f16_128x256x64_s4_mcb2_v2",
+            "wgmma_nt_f16_128x256x64_s4_mcb2_ef",
+            "wgmma_nt_f16_128x256x64_s4_mcb2_efol",
+            "wgmma_nt_f16_128x256x64_s4_mcb2_nostore",
+        ] {
+            assert_eq!(wgmma_variant(n).name, n);
         }
     }
 
