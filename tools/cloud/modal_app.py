@@ -258,7 +258,12 @@ _TORCH_VENV_CMD = (
     f'"$PY" -m venv {TORCH_VENV} && '
     f"{TORCH_VENV}/bin/pip install --no-cache-dir -U pip && "
     f"{TORCH_VENV}/bin/pip install --no-cache-dir --index-url {WK_TORCH_INDEX} torch=={WK_TORCH} && "
-    f"{TORCH_VENV}/bin/pip install --no-cache-dir numpy ninja packaging && "
+    # `setuptools` and `wheel` are NOT optional here even though pip usually supplies them: the
+    # FlashAttention wheels are source builds driven with `pip wheel --no-build-isolation` and
+    # `setup.py bdist_wheel`, both of which need the build backend already in the venv, and
+    # ensurepip stopped bundling setuptools at Python 3.12. Without `ninja` the FA2 build is
+    # single-threaded and takes ~2 h (upstream's own number).
+    f"{TORCH_VENV}/bin/pip install --no-cache-dir numpy ninja packaging setuptools wheel && "
     f"{TORCH_VENV}/bin/pip install --no-cache-dir --pre flash-attn-4=={WK_FA4} && "
     f"{TORCH_VENV}/bin/python -c \"import torch,triton,importlib.metadata as m;"
     f"print('torch',torch.__version__,'cuda',torch.version.cuda,'triton',triton.__version__,"
@@ -801,6 +806,255 @@ def _cc_for_sku(sku: str) -> str:
     return ""
 
 
+# --------------------------------------------------------------------------------------------
+# Which CUTLASS kernel FAMILIES the profiler is built with -- the fp8/int8 unlock (Act-2 wave 2)
+# --------------------------------------------------------------------------------------------
+#
+# THE DEFECT this block fixes. The staging filter was f16-only
+# (`cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_{f16,f32}*`), so W5's 8-bit round -- fp8 e4m3 and
+# s8/u8 IMMA -- had no CUTLASS column at all, and a `::cutlass --dtype e4m3` against that binary
+# would print "no kernels" (or nothing) and read as "CUTLASS has no fp8 kernel here". That is the
+# worst class of peer failure: a bar that looks absent because OUR build omitted it.
+#
+# THE NAMING, verified 2026-08-10 against CUTLASS v4.6.1's own generator rather than guessed.
+# `cutlass_library/gemm_operation.py`'s `_procedural_name` builds 3.x names as
+#
+#     cutlass3x_sm<arch>_<opclass>_<core>_<eA>_<eB>_<eAcc>_<eC>_<eD>_<tile>_<cluster>_<stages>
+#     _<layouts>_align<N>_<schedule>
+#
+# (`extended_name_3x()` is the `<eA>_<eB>_<eAcc>_<eC>_<eD>` run), which is exactly the shape D5's
+# live-verified f16 pattern has -- so the 8-bit twins are the same string with `e4m3`/`s8`/`u8` and
+# the matching accumulator (`f32` for fp8, `s32` for int8) substituted. The 2.x (sm_8x) names are a
+# different scheme entirely and are marked UNVERIFIED below; the census is what makes guessing there
+# safe rather than expensive.
+#
+# THE FILTER SEMANTICS, also read out of CUTLASS rather than assumed
+# (`cutlass_library/manifest.py::KernelFilter._filter_string_matches`): a pattern is split on `*` and
+# each piece must appear in the kernel name **in order**. It is substring-in-order matching, not
+# regex and not fnmatch -- `_cutlass_filter_matches` below is a line-for-line port, which is what
+# lets the census count exactly the set the build will compile.
+_CUTLASS_DTYPES = ("f16", "bf16", "fp8", "int8")
+
+# sm_90+ (CUTLASS 3.x). f16/bf16 pin `void` C (no source C operand, beta=0) because that is the
+# shape D5 verified and the shape the Wukong peer computes. fp8/int8 deliberately do NOT pin the
+# C/D tokens: the generator's 8-bit output-type set is not something this repo has verified, and a
+# pattern that is too narrow selects ZERO kernels -- which is the silent-weak-peer failure again.
+# The census + `--cutlass-max-kernels` are what bound the cost of being wide.
+_CUTLASS_KERNELS_3X = {
+    "f16": (
+        "cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16*",
+        "cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32*",
+    ),
+    "bf16": (
+        "cutlass3x_sm90_tensorop_gemm_bf16_bf16_f32_void_bf16*",
+        "cutlass3x_sm90_tensorop_gemm_bf16_bf16_f32_void_f32*",
+    ),
+    "fp8": ("cutlass3x_sm90_tensorop_gemm_e4m3_e4m3_f32_*",),
+    "int8": (
+        "cutlass3x_sm90_tensorop_gemm_s8_s8_s32_*",
+        "cutlass3x_sm90_tensorop_gemm_u8_u8_s32_*",
+    ),
+}
+
+# sm_75/80/86/89 (CUTLASS 2.x). Only the f16 row is D5-verified; the rest are UNVERIFIED best-effort
+# spellings whose failure mode is "the census reports 0 kernels and the build aborts before `make`",
+# i.e. a few CPU minutes rather than a weak peer. fp8 exists on Ada (sm_89) and on nothing older.
+_CUTLASS_KERNELS_2X = {
+    "f16": ("cutlass_tensorop_h*gemm*", "cutlass_tensorop_s*gemm_f16*"),
+    "bf16": ("cutlass_tensorop_*gemm_bf16*",),
+    "fp8": ("cutlass_tensorop_*e4m3*",),
+    "int8": ("cutlass_tensorop_*gemm_s8*", "cutlass_tensorop_s8_*gemm*"),
+}
+
+
+def _parse_cutlass_dtypes(raw: str) -> list:
+    """`f16,fp8,int8` -> a validated family list. An unknown name is an ERROR.
+
+    Same doctrine as `WUKONG_STRONG_PEERS`: a typo that quietly selected nothing would hand back a
+    profiler missing exactly the column the round was staged for.
+    """
+    out = []
+    for tok in raw.replace(";", ",").replace(" ", ",").split(","):
+        tok = tok.strip().lower()
+        if not tok:
+            continue
+        if tok in ("all", "*"):
+            out = list(_CUTLASS_DTYPES)
+            continue
+        alias = {"e4m3": "fp8", "f8": "fp8", "s8": "int8", "u8": "int8", "i8": "int8"}.get(tok, tok)
+        if alias not in _CUTLASS_DTYPES:
+            sys.exit(f"--cutlass-dtypes: unknown family {tok!r}. "
+                     f"Known: {', '.join(_CUTLASS_DTYPES)} (or `all`). Refusing to guess.")
+        if alias not in out:
+            out.append(alias)
+    if not out:
+        sys.exit("--cutlass-dtypes selected nothing. Pass at least one of "
+                 f"{', '.join(_CUTLASS_DTYPES)}.")
+    return out
+
+
+def _cutlass_patterns(arch: str, dtypes: list) -> list:
+    """`CUTLASS_LIBRARY_KERNELS` patterns for these families at this CUTLASS arch string."""
+    three_x = arch.startswith(("90", "100", "103", "120"))
+    table = _CUTLASS_KERNELS_3X if three_x else _CUTLASS_KERNELS_2X
+    pats: list = []
+    for fam in dtypes:
+        if fam == "fp8" and arch.startswith(("75", "80", "86")):
+            sys.exit(
+                f"--cutlass-dtypes asks for fp8 at sm{arch}. There is no fp8 tensor-core matmul "
+                f"below Ada (sm_89), so CUTLASS generates nothing and the build would produce a "
+                f"profiler with a silently empty fp8 column. Drop fp8, or build for 89/90a."
+            )
+        for p in table[fam]:
+            # The 3.x table is written for sm90; retarget the arch token for the Blackwell families
+            # so a `100a`/`120a` build does not silently select the (absent) sm90 kernels.
+            if three_x and not arch.startswith("90"):
+                p = p.replace("_sm90_", "_sm%s_" % arch.rstrip("a"))
+            if p not in pats:
+                pats.append(p)
+    return pats
+
+
+def _cutlass_filter_matches(pattern: str, name: str) -> bool:
+    """Line-for-line port of `cutlass_library.manifest.KernelFilter._filter_string_matches`.
+
+    CUTLASS splits the pattern on `*` and requires every piece to appear in the kernel name in
+    order. Re-implementing it (rather than reaching for `fnmatch`, which anchors differently and
+    treats `?`/`[]` as metacharacters) is what makes the census below count *the same set the build
+    will compile* instead of a lookalike.
+    """
+    for sub in pattern.split("*"):
+        idx = name.find(sub)
+        if idx < 0:
+            return False
+        name = name[idx + len(sub):]
+    return True
+
+
+_CUTLASS_NAME_RE = re.compile(r'"(cutlass[0-9]*x?_[A-Za-z0-9_]{10,})"')
+
+
+def _cutlass_generated_kernels(build_dir: str) -> list:
+    """Every kernel name CUTLASS's generator actually emitted under this build tree.
+
+    Read at **cmake-configure** time, before `make` -- which is the whole point. The generator runs
+    during configure (a few minutes), the compile is 20-45+ minutes, and a filter that selected
+    nothing is only cheap to discover in between.
+
+    Two independent sources, unioned, because neither is a contract this repo controls: the
+    procedural name appears as a quoted C++ string literal in the emitted sources (that is how the
+    manifest registers an operation), and it also appears in the generated file names. A layout
+    change on either side degrades to a smaller set rather than to a wrong answer -- and a total of
+    zero is treated as "the census could not read this tree", not as "no kernels".
+    """
+    root = os.path.join(build_dir, "tools", "library", "generated")
+    names: set = set()
+    if not os.path.isdir(root):
+        return []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            stem = os.path.splitext(fn)[0]
+            if stem.startswith("cutlass") and len(stem) > 16:
+                names.add(stem)
+            if not fn.endswith((".cu", ".cpp", ".h", ".hpp")):
+                continue
+            try:
+                with open(os.path.join(dirpath, fn), "r", errors="replace") as fh:
+                    body = fh.read()
+            except OSError:
+                continue
+            names.update(_CUTLASS_NAME_RE.findall(body))
+    return sorted(names)
+
+
+# `::cutlass --dtype <tok>` -> (kernel family the profiler must have been built with, the default
+# C token, the default accumulator). The accumulator is NOT cosmetic: an int8 GEMM accumulates in
+# s32 and asking the profiler for f32 there selects nothing, which would look like a missing library
+# kernel rather than a wrong flag.
+_CUTLASS_PROFILER_DTYPE = {
+    "f16": ("f16", "f16", "f32"),
+    "bf16": ("bf16", "bf16", "f32"),
+    "f32": ("", "f32", "f32"),
+    "tf32": ("", "f32", "f32"),
+    "e4m3": ("fp8", "f16", "f32"),
+    "e5m2": ("fp8", "f16", "f32"),
+    "s8": ("int8", "s32", "s32"),
+    "u8": ("int8", "s32", "s32"),
+}
+
+# The dtype run that identifies a family inside a generated kernel name. Used ONLY by the census,
+# and independently of the patterns, so an operator-supplied `--cutlass-kernels` still gets a
+# per-family verdict instead of a total nobody can attribute.
+_CUTLASS_FAMILY_TOKENS = {
+    "f16": ("_f16_f16_f32_", "gemm_f16", "h1688gemm", "h16816gemm"),
+    "bf16": ("_bf16_bf16_f32_", "gemm_bf16"),
+    "fp8": ("_e4m3_", "_e5m2_", "e4m3"),
+    "int8": ("_s8_s8_s32_", "_u8_u8_s32_", "gemm_s8", "s8_i16832gemm", "i8816gemm"),
+}
+
+
+def _cutlass_census(build_dir: str, dtypes: list, patterns: list, max_kernels: int) -> dict:
+    """Count what the configure step selected, per family, and refuse to compile a weak peer.
+
+    The count is `selected-by-the-filter AND carrying the family's dtype token`, so the verdict
+    survives an operator-supplied `--cutlass-kernels` (which the pattern list alone could not be
+    attributed to a family).
+
+    Three distinct refusals, because they are three different facts:
+
+    * **the census read nothing** -- the generated tree moved. Loud, with the escape hatch named,
+      because silently compiling an unaudited filter is how the f16-only profiler survived.
+    * **a requested family selected zero kernels** -- the pattern is wrong for this CUTLASS version.
+      This is the one that must never reach `make`: the build would succeed, the binary would run,
+      and the missing column would read as "the library has no such kernel".
+    * **the total is absurd** -- NVIDIA's own docs call an unfiltered SM90 set "millions of
+      kernels"; `--cutlass-max-kernels` is a cost ceiling on the way there.
+    """
+    found = _cutlass_generated_kernels(build_dir)
+    selected = [n for n in found if any(_cutlass_filter_matches(p, n) for p in patterns)]
+    counts = {}
+    samples = {}
+    for fam in dtypes:
+        hits = [n for n in selected if any(t in n for t in _CUTLASS_FAMILY_TOKENS[fam])]
+        counts[fam] = len(hits)
+        samples[fam] = hits[0] if hits else ""
+    print("\n--- CUTLASS kernel census (after configure, BEFORE the compile) ---")
+    print(f"  generated names discovered : {len(found)}")
+    print(f"  selected by the filter     : {len(selected)}")
+    for fam in dtypes:
+        print(f"  {fam:<6} {counts[fam]:>6} kernels   {samples[fam] or '(none)'}")
+    if not found:
+        sys.exit(
+            f"The kernel census found no generated kernel names under {build_dir}/tools/library/"
+            f"generated. Either the configure step failed or CUTLASS {WK_CUTLASS_TAG} moved its "
+            f"generated-source layout. Refusing to spend 20-45 minutes compiling a filter nobody "
+            f"audited -- pass --no-cutlass-census to build anyway, and fix the census after."
+        )
+    empty = [f for f in dtypes if counts[f] == 0]
+    if empty:
+        for name in selected[:8] or found[:8]:
+            print(f"    sample generated name: {name}")
+        sys.exit(
+            f"CUTLASS {WK_CUTLASS_TAG} generated ZERO kernels for: {', '.join(empty)}.\n"
+            f"The patterns matched nothing for those families, so the profiler would build fine, "
+            f"run fine, and print an empty column that reads as 'the library has no such kernel' "
+            f"-- a weakened peer, which is worse than no peer.\n"
+            f"Fix it with --cutlass-kernels '<comma list>' (the sample names above show this "
+            f"version's spelling), or drop the family from --cutlass-dtypes."
+        )
+    total = len(selected)
+    if max_kernels and total > max_kernels:
+        sys.exit(
+            f"{total} kernels selected, over the --cutlass-max-kernels ceiling of {max_kernels}. "
+            f"D5 measured the two-pattern f16 filter at 20-45 min on 16 cores, so this build would "
+            f"run far longer and may exceed WK_PEER_TIMEOUT={WK_PEER_TIMEOUT}s (a timeout kills the "
+            f"container and bills every second already spent). Narrow --cutlass-kernels, drop a "
+            f"family, or raise --cutlass-max-kernels deliberately."
+        )
+    counts["_selected"] = total
+    return counts
+
+
 def _read_manifest() -> dict:
     try:
         return json.loads(pathlib.Path(PEER_MANIFEST).read_text())
@@ -848,9 +1102,137 @@ def _torch_env(env: dict) -> dict:
     child = dict(env)
     child.setdefault("TORCHINDUCTOR_CACHE_DIR", f"{PERSIST}/inductor-cache")
     child.setdefault("TRITON_CACHE_DIR", f"{PERSIST}/triton-cache")
+    # The FX-graph cache is on by default in current torch, but it is the layer that turns a
+    # `max-autotune` re-entry into a lookup rather than a re-trace, and "on by default" is not a
+    # contract. Setting it explicitly costs nothing and makes the intent reviewable.
+    child.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
     os.makedirs(child["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
     os.makedirs(child["TRITON_CACHE_DIR"], exist_ok=True)
+    # Deliberately NOT set here: CUDA_CACHE_PATH. That is the *driver's* PTX->SASS JIT cache, and
+    # Wukong's own modules go through it too -- putting it on the Volume would make a Wukong A/B's
+    # first arm pay a cold JIT the second arm does not. This repo has already been bitten by exactly
+    # that shape once (a cold device-keyed cubin cache read as a 27x win). The peer's compile cache
+    # is persisted; the instrument's is not.
     return child
+
+
+# --------------------------------------------------------------------------------------------
+# The Inductor / Triton compile caches -- persisted, and their key made visible
+# --------------------------------------------------------------------------------------------
+#
+# `mode="max-autotune"` benchmarks Triton templates against ATen on the FIRST call for each new
+# shape, which is minutes, and on a rented box those minutes are metered (D5 section 2.2 / pitfall
+# 12). Pointing TORCHINDUCTOR_CACHE_DIR and TRITON_CACHE_DIR at the Volume is what makes that a
+# once-per-shape cost instead of a per-round one.
+#
+# THE HAZARD THAT MAKES THIS MORE THAN AN ENV VAR. Both caches are keyed on a fingerprint that
+# includes the torch and Triton versions (and, for the autotune results, the device). Bump either
+# pin and every entry becomes unreachable **silently** -- the directory still holds gigabytes, the
+# round still runs, and it quietly re-pays the whole autotune on metered hardware while the log
+# says nothing. So the key is written next to the cache and compared on every round: a cold or
+# invalidated cache is a printed line in the round header, not something to reconstruct afterwards
+# from a suspicious wall time.
+_CACHE_KEY_FILE = f"{PERSIST}/inductor-cache/.wukong-cache-key.json"
+
+
+def _dir_stats(path: str) -> tuple:
+    """(files, bytes, seconds-since-newest-write) for a cache directory. `(0, 0, -1)` if absent."""
+    if not os.path.isdir(path):
+        return (0, 0, -1.0)
+    files = 0
+    total = 0
+    newest = 0.0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            try:
+                st = os.stat(os.path.join(dirpath, fn))
+            except OSError:
+                continue
+            files += 1
+            total += st.st_size
+            newest = max(newest, st.st_mtime)
+    return (files, total, (time.time() - newest) if newest else -1.0)
+
+
+def _torch_stack_versions(env: dict) -> dict:
+    """torch / Triton / CUDA / device, read from the peer venv itself.
+
+    One bounded subprocess. Read from the interpreter rather than from the pin block because the pin
+    block says what was *asked for* and this says what is *installed* -- and the cache key is a
+    property of the second.
+    """
+    code = (
+        "import json\n"
+        "d={}\n"
+        "try:\n"
+        "    import torch\n"
+        "    d['torch']=torch.__version__\n"
+        "    d['torch_cuda']=torch.version.cuda or 'none'\n"
+        "    if torch.cuda.is_available():\n"
+        "        d['device']=torch.cuda.get_device_properties(0).name\n"
+        "except Exception as e:\n"
+        "    d['torch']='ERR: %r'%(e,)\n"
+        "try:\n"
+        "    import triton\n"
+        "    d['triton']=triton.__version__\n"
+        "except Exception as e:\n"
+        "    d['triton']='ERR: %r'%(e,)\n"
+        "print(json.dumps(d))\n"
+    )
+    try:
+        p = subprocess.run([f"{TORCH_VENV}/bin/python", "-c", code],
+                           capture_output=True, text=True, env=env, timeout=600)
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception as e:                                    # noqa: BLE001
+        return {"torch": f"unreadable: {e!r}"}
+
+
+def _print_cache_header(env: dict, label: str) -> dict:
+    """The round header for any function that drives torch.compile.
+
+    Prints the installed stack, both cache directories with their size and age, and -- the point of
+    the exercise -- whether this round's cache key matches the one the cache was written under. A
+    cold-cache round is then a line in the log rather than an unexplained extra two minutes.
+    """
+    ver = _torch_stack_versions(env)
+    key = {k: ver.get(k, "") for k in ("torch", "triton", "torch_cuda", "device")}
+    print(f"\n--- {label}: peer stack + compile caches ---")
+    print(f"  torch {ver.get('torch', '?')}  cuda {ver.get('torch_cuda', '?')}  "
+          f"triton {ver.get('triton', '?')}  device {ver.get('device', '(none)')}")
+    for var in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        path = env.get(var, "")
+        if not path:
+            print(f"  {var:<26} UNSET -- every max-autotune compile below will be paid again on "
+                  f"every future container, on metered hardware.")
+            continue
+        files, size, age = _dir_stats(path)
+        when = "never written" if age < 0 else f"newest {age / 3600.0:.1f} h ago"
+        print(f"  {var:<26} {path}  ({files} files, {size / 1e6:.1f} MB, {when})")
+        if files == 0:
+            print(f"  [cache] COLD: {path} is empty. This round PAYS the full max-autotune compile "
+                  f"(minutes per new shape) and later rounds will not.")
+    prev = {}
+    try:
+        prev = json.loads(pathlib.Path(_CACHE_KEY_FILE).read_text())
+    except (OSError, ValueError):
+        pass
+    if not prev:
+        print("  [cache] no previous key recorded; writing one now.")
+    elif prev == key:
+        print("  [cache] key UNCHANGED since the last round -- the entries above are reachable.")
+    else:
+        changed = [f"{k}: {prev.get(k, '(absent)')} -> {key.get(k, '(absent)')}"
+                   for k in sorted(set(prev) | set(key)) if prev.get(k) != key.get(k)]
+        print("  [cache] KEY CHANGED -- " + "; ".join(changed))
+        print("  [cache] torch/Triton/device are part of the cache fingerprint, so EVERY entry "
+              "above is now unreachable. This round re-pays the autotune; the old bytes are dead "
+              "weight on the Volume until something deletes them.")
+    try:
+        os.makedirs(os.path.dirname(_CACHE_KEY_FILE), exist_ok=True)
+        pathlib.Path(_CACHE_KEY_FILE).write_text(json.dumps(key, indent=2, sort_keys=True))
+    except OSError as e:
+        print(f"  !! could not record the cache key ({e}); a later invalidation will be invisible.")
+    return key
 
 
 def _peer_script(name: str) -> str:
@@ -900,6 +1282,161 @@ def _install_staged_wheels(env: dict) -> list:
                   f"this round declared it, the round will now fail. Rebuild with "
                   f"`::build_peers --fa2 --force`.")
     return installed
+
+
+# --------------------------------------------------------------------------------------------
+# FlashAttention staging: FA2 (the real decode bar) and FA3 (rebuilt with its features INTACT)
+# --------------------------------------------------------------------------------------------
+#
+# WHAT WAS BROKEN, and it is two separate things.
+#
+# 1. **FA2's arch was derived wrong.** `_cc_for_sku(WK_GPU).replace("sm_", "")` turns an L4/L40S
+#    into `FLASH_ATTN_CUDA_ARCHS=89`, and FA2's setup.py knows only {80, 90, 100, 120} -- there is
+#    no 89 in its gencode table. The right answer for every Ada/Ampere part is `80`: CUDA cubins are
+#    minor-version compatible, so an sm_80 cubin loads on sm_86/sm_89. The mapping is now explicit.
+#
+# 2. **FA3 was staged crippled.** The wheel was built with DISABLE_{PAGEDKV, SPLIT, PACKGQA, VARLEN,
+#    FP8} = TRUE, which removes precisely the features W6 needs: paged KV and packed-GQA ARE the
+#    decode bar, and `flash_attn_with_kvcache(block_table=)` cannot exist without PAGEDKV. A wheel
+#    that imports and then declines the only call the round makes is a peer that looks staged and is
+#    not. The disable set is now a named preset, `decode` is the default, and `minimal` (the old
+#    set) says out loud what it removes.
+#
+# COST, honestly. D5 measured the FA3 build with the full DISABLE set at *(est.)* 15-90 min and
+# noted that keeping only fp16-forward at hdim 64/128 is a *(est.)* 4-8x reduction in translation
+# units -- so removing those disables multiplies the work back. `full` (no disables at all: adds the
+# backward pass, sm_80 support, and hdim 96/192/256) is *(est.)* 2-8 h on 16 cores and is gated
+# behind a WK_PEER_TIMEOUT floor, because a build killed at the cap loses everything and still
+# bills. `decode` keeps every W5/W6 feature and drops only backward + sm_80 + the unused head dims.
+_FA3_DISABLE_PRESETS = {
+    # No disables. Everything FA3 can do, at the largest build cost.
+    "full": (),
+    # Everything W5 (fp8 attention) and W6 (paged decode, GQA, varlen, split-KV) need, minus the
+    # backward pass, the sm_80 fallback, and the head dims no model in the suite uses.
+    "decode": ("BACKWARD", "SM80", "HDIM96", "HDIM192", "HDIM256"),
+    # The 2026-08 staged set, kept ONLY so a round can reproduce that artifact. It cannot serve W6.
+    "minimal": ("BACKWARD", "SPLIT", "PAGEDKV", "APPENDKV", "LOCAL", "SOFTCAP",
+                "PACKGQA", "VARLEN", "FP8", "SM80", "HDIM96", "HDIM192", "HDIM256"),
+}
+
+# A cost ceiling that must be *raised deliberately* before the expensive presets are legal. Modal
+# kills the container at WK_TIMEOUT/WK_PEER_TIMEOUT and bills every second already spent, so a
+# 6-hour build under a 4-hour cap is a guaranteed total loss.
+_FA3_MIN_TIMEOUT = {"full": 28800, "decode": 14400, "minimal": 7200}
+
+# `sm_XX` -> the value FA2's `FLASH_ATTN_CUDA_ARCHS` accepts. FA2 emits gencode for {80, 90, 100,
+# 120} only; Ampere-consumer and Ada both take the sm_80 cubin (same major version).
+_FA2_ARCH = {
+    "sm_80": "80", "sm_86": "80", "sm_89": "80",
+    "sm_90": "90", "sm_100": "100", "sm_103": "100", "sm_120": "120",
+}
+
+
+def _build_jobs(gib_per_job: float) -> int:
+    """`MAX_JOBS` bounded by the container's MEMORY, not only by its cores.
+
+    RAM exhaustion is the classic FlashAttention build failure (D5 section 3.2: *(est.)* >= 32 GB at
+    MAX_JOBS ~ 16), and an OOM-killed 40-minute build is paid for twice. `WK_PEER_MEM` is the
+    reservation, which is the conservative number to divide -- bursting above it is not guaranteed.
+    """
+    cores = os.cpu_count() or 1
+    by_mem = int((WK_PEER_MEM_MIB / 1024.0) / gib_per_job)
+    return max(1, min(cores, by_mem))
+
+
+def _verify_fa_wheel(path: str, package: str, want_kvcache: bool) -> dict:
+    """Prove a staged FlashAttention wheel is the thing the round will need -- **without a device**.
+
+    Every check here is a `zipfile` read, so it runs on the CPU builder that produced the wheel. It
+    exists because the two ways an FA wheel goes wrong are both invisible to "the file is there":
+
+    * a python-only wheel (a `SKIP_CUDA_BUILD` or a failed nvcc that setuptools swallowed) -- caught
+      by requiring a multi-megabyte compiled extension inside the archive;
+    * a wheel built with the feature the round needs disabled -- caught, for FA2, by looking for the
+      `fwd_kvcache` pybind method name in the extension's own bytes. That string is only in the
+      binary if the kvcache entry point was compiled, which is exactly the W6 decode bar.
+
+    Returns the evidence for the manifest; exits loudly rather than recording a broken artifact.
+    """
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            iface = [n for n in names if n.endswith("flash_attn_interface.py")]
+            api_ok = False
+            for n in iface:
+                if b"def flash_attn_with_kvcache" in zf.read(n):
+                    api_ok = True
+                    break
+            sos = [(n, zf.getinfo(n).file_size) for n in names if n.endswith(".so")]
+            sos.sort(key=lambda t: -t[1])
+            token = False
+            if sos and want_kvcache:
+                token = b"fwd_kvcache" in zf.read(sos[0][0])
+    except (OSError, zipfile.BadZipFile) as e:
+        sys.exit(f"{path} is not a readable wheel ({e!r}). Rebuild with --force.")
+
+    biggest = sos[0] if sos else ("", 0)
+    print(f"[peers] {package} wheel audit: {os.path.basename(path)}")
+    print(f"        python api flash_attn_with_kvcache : {'yes' if api_ok else 'NO'}")
+    print(f"        compiled extension                 : {biggest[0] or '(none)'} "
+          f"({biggest[1] / 1e6:.1f} MB)")
+    if want_kvcache:
+        print(f"        `fwd_kvcache` in the extension     : {'yes' if token else 'NO'}")
+    if not iface:
+        sys.exit(f"{path} contains no flash_attn_interface.py -- this is not a FlashAttention "
+                 f"wheel. Rebuild with --force.")
+    if biggest[1] < 1_000_000:
+        sys.exit(
+            f"{path} has no compiled CUDA extension over 1 MB (largest: {biggest[0] or 'none'}, "
+            f"{biggest[1]} bytes). The CUDA build was skipped or silently failed, so this wheel "
+            f"would import and then have no kernel. Rebuild with --force and read the nvcc log."
+        )
+    if want_kvcache and not token:
+        sys.exit(
+            f"{path} was built WITHOUT the kvcache entry point (`fwd_kvcache` is not in "
+            f"{biggest[0]}). `flash_attn_with_kvcache(block_table=)` is the decode bar the round "
+            f"needs, so this wheel is the same trap as the crippled FA3 one: importable, and unable "
+            f"to answer the only call that matters. Rebuild without the disabling flags."
+        )
+    return {"wheel": path, "so": biggest[0], "so_bytes": biggest[1],
+            "kvcache_api": api_ok, "kvcache_symbol": bool(token)}
+
+
+def _ensure_fa_build_deps(env: dict) -> None:
+    """The FA source builds run out of the IMAGE's torch venv -- check it, here, before the build.
+
+    Worth being explicit about which venv this is: the vLLM staging chain (`_stage_vllm_venv`) fixed
+    a *Volume* venv whose relocated interpreter could not load its libpython. The FlashAttention
+    peers do not use that venv at all. They use `/opt/torch-venv`, which is created inside the image
+    from the image's own interpreter with the default (symlinked) spelling -- route 1 of that chain,
+    the one it concluded was correct -- and which therefore cannot hit the `$ORIGIN` defect. What it
+    CAN hit is a missing build backend: `pip wheel --no-build-isolation` and `setup.py bdist_wheel`
+    both need setuptools and wheel already installed, and ensurepip stopped bundling setuptools at
+    Python 3.12. So the interpreter is executed and the three build deps are verified (and repaired
+    in place, which is seconds on a CPU container) before an hours-long compile starts.
+    """
+    py = f"{TORCH_VENV}/bin/python"
+    if not _python_runs(py, env, "image torch venv (the FA build interpreter)"):
+        sys.exit(
+            f"{py} does not execute in this container, so no FlashAttention wheel can be built. "
+            f"That venv lives in the IMAGE, not on the Volume -- a failure here means the image "
+            f"layer that builds it (`_TORCH_VENV_CMD`) is broken, not the Volume."
+        )
+    probe = subprocess.run(
+        [py, "-c", "import setuptools, wheel, ninja, torch; print(torch.__version__)"],
+        capture_output=True, text=True, env=env)
+    if probe.returncode != 0:
+        print("[peers] the torch venv is missing a build dependency; repairing before the build:")
+        print("        " + _ascii(probe.stderr.strip())[-400:])
+        _run([f"{TORCH_VENV}/bin/pip", "install", "--no-cache-dir",
+              "setuptools", "wheel", "ninja", "packaging"], env, cwd="/tmp")
+        _run([py, "-c", "import setuptools, wheel, ninja, torch; "
+                        "print('build deps ok, torch', torch.__version__)"], env, cwd="/tmp")
+    else:
+        print(f"[peers] FA build deps ok (torch {probe.stdout.strip()}, "
+              f"setuptools + wheel + ninja present)")
 
 
 # --------------------------------------------------------------------------------------------
@@ -2190,8 +2727,11 @@ def build(release: bool = False, driver: bool = True):
 @app.function(image=image, cpu=WK_PEER_CPU, memory=WK_PEER_MEM_MIB, timeout=WK_PEER_TIMEOUT,
               volumes={PERSIST: build_vol})
 def build_peers(cutlass: bool = True, cutlass_arch: str = "", cutlass_kernels: str = "",
+                cutlass_dtypes: str = "f16,fp8,int8", cutlass_max_kernels: int = 800,
+                cutlass_census: bool = True,
                 cutlass_dir: str = "/tmp/cutlass", vllm: bool = True, vllm_mode: str = "",
-                fa2: bool = False, fa2_archs: str = "", fa3: bool = False, force: bool = False):
+                fa2: bool = False, fa2_archs: str = "", fa3: bool = False,
+                fa3_features: str = "decode", fa3_disable: str = "", force: bool = False):
     """Stage the multi-GB / multi-hour strong peers onto the Volume. **NO GPU is attached.**
 
     This is §0's "never pay twice for the same fact" applied to the peers, and here it is worth real
@@ -2203,29 +2743,91 @@ def build_peers(cutlass: bool = True, cutlass_arch: str = "", cutlass_kernels: s
     `--force`. The torch/FA4 venv is not here at all — it is baked into the image (§ the pin block).
 
         modal run tools/cloud/modal_app.py::build_peers                       # cutlass + vllm
+        WK_GPU=H100 modal run tools/cloud/modal_app.py::build_peers --fa2     # + the FA2 decode bar
         WK_GPU=H100 modal run tools/cloud/modal_app.py::build_peers --fa3     # + the Hopper FA3 wheel
         modal run tools/cloud/modal_app.py::build_peers --cutlass-arch 80 --no-vllm
+        modal run tools/cloud/modal_app.py::build_peers --cutlass-dtypes f16,bf16,fp8,int8
 
-    `--cutlass-arch` defaults to the arch implied by `WK_GPU`. It is the one setting worth checking
-    by hand: `90a` (not `90`) is what enables wgmma/TMA, and a plain-`90` profiler is a *weakened*
-    peer that would flatter Wukong at exactly the shapes the wgmma decision rests on.
+    **CUTLASS.** `--cutlass-arch` defaults to the arch implied by `WK_GPU`. It is the one setting
+    worth checking by hand: `90a` (not `90`) is what enables wgmma/TMA, and a plain-`90` profiler is
+    a *weakened* peer that would flatter Wukong at exactly the shapes the wgmma decision rests on.
+
+    `--cutlass-dtypes` selects the kernel FAMILIES compiled into the profiler, and it defaults to
+    `f16,fp8,int8` because a round that wants an 8-bit CUTLASS column and gets an f16-only binary
+    reads the empty column as "the library has no such kernel". Idempotence keys on the family set
+    as well as the arch: a profiler staged for fewer families than this call asks for is REBUILT,
+    not reported as present. `--cutlass-kernels` still overrides the patterns wholesale.
+
+    Cost control for that: after cmake configures (minutes) and **before** `make` (20-45+ minutes),
+    `_cutlass_census` counts what the filter actually selected, per family, and refuses three ways --
+    nothing generated, a family that selected zero kernels, or a total over
+    `--cutlass-max-kernels` (default 800; `0` disables the ceiling). `--no-cutlass-census` skips the
+    audit, which should only ever be needed if CUTLASS moves its generated-source layout.
 
     `--cutlass-dir` is the scratch tree for a build that is *(est.)* 8-15 GB. It defaults to `/tmp`
     (the container's local disk, which is fast); point it at `/persist/...` if a container turns out
     not to have the room. It is deleted either way — that much scratch must never be left on the
     Volume, which pays for what it stores.
 
+    **FlashAttention.** `--fa2` builds the `flash-attn` wheel from source (no prebuilt wheel exists
+    for torch 2.13) and audits it: a wheel whose extension does not carry `fwd_kvcache` is rejected,
+    because `flash_attn_with_kvcache(block_table=)` is W6's real decode bar. The arch comes from a
+    table, not from string surgery on the SKU's compute capability -- FA2 knows only {80, 90, 100,
+    120}, so an Ada/Ampere-consumer part takes `80` (cubins are minor-version compatible).
+    *(est.)* 20-50 min on 16 cores for one arch.
+
+    `--fa3-features <full|decode|minimal>` decides the FA3 build, and this is a **cost** decision:
+
+        decode   (default) everything W5/W6 needs -- paged KV, split-KV, packed GQA, varlen, fp8 --
+                 minus the backward pass, sm_80 and the unused head dims. *(est.)* 1-4 h, 16 cores.
+        full     no DISABLE flags at all. *(est.)* 2-8 h. Needs WK_PEER_TIMEOUT >= 28800.
+        minimal  the crippled set staged in 2026-08 (DISABLE_{PAGEDKV,SPLIT,PACKGQA,VARLEN,FP8,...}).
+                 *(est.)* 15-90 min, and it **cannot serve W6** -- kept only to reproduce that
+                 artifact. The function says so out loud when you pick it.
+
+    Those hours are real and they are why the preset is gated on `WK_PEER_TIMEOUT`: Modal kills the
+    container at the cap and bills every second already spent, so an under-capped build is a
+    guaranteed total loss rather than a slow success. `--fa3-disable "A,B"` overrides the preset.
+
     `--vllm-mode <symlinks|copies|system|prefix>` pins ONE staging spelling instead of walking the
     verified fallback chain. Use it only when a round log has already named the winner: the chain
     exists because none of this is testable off Modal, and skipping it to save a minute is how the
-    2026-08-09 `--copies` failure happened in the first place.
+    2026-08-09 `--copies` failure happened in the first place. Note that the FlashAttention peers do
+    **not** use that venv -- they build into the image's `/opt/torch-venv` (see `_ensure_fa_build_deps`).
     """
     with _meter("build_peers", gpu=False):
         env = dict(os.environ)
         _assert_no_stubs(env)
+        # Validate EVERY argument before any work: an operator who mistypes `--fa3-features` should
+        # find out in the first second, not after paying 45 minutes for the CUTLASS build first.
         if vllm_mode and vllm_mode not in _VLLM_VENV_MODES:
             sys.exit(f"--vllm-mode must be one of {', '.join(_VLLM_VENV_MODES)}, "
                      f"not {vllm_mode!r}")
+        dtypes = _parse_cutlass_dtypes(cutlass_dtypes) if cutlass else []
+        fa3_disables: tuple = ()
+        if fa3:
+            if fa3_disable:
+                fa3_features = "custom"
+                fa3_disables = tuple(t.strip().upper() for t in fa3_disable.split(",") if t.strip())
+            elif fa3_features in _FA3_DISABLE_PRESETS:
+                fa3_disables = _FA3_DISABLE_PRESETS[fa3_features]
+            else:
+                sys.exit(f"--fa3-features must be one of "
+                         f"{', '.join(sorted(_FA3_DISABLE_PRESETS))}, not {fa3_features!r} "
+                         f"(or pass --fa3-disable with an explicit comma list).")
+            need = _FA3_MIN_TIMEOUT.get(fa3_features, 14400)
+            if WK_PEER_TIMEOUT < need:
+                sys.exit(
+                    f"--fa3-features {fa3_features} is a *(est.)* multi-hour build and "
+                    f"WK_PEER_TIMEOUT is {WK_PEER_TIMEOUT}s. Modal kills the container at the cap "
+                    f"and bills every second already spent, so this run would be a guaranteed total "
+                    f"loss. Raise it deliberately:  WK_PEER_TIMEOUT={need} modal run ..."
+                )
+            if fa3_features == "minimal":
+                print("!! --fa3-features minimal disables PAGEDKV, SPLIT, PACKGQA, VARLEN and FP8. "
+                      "That wheel imports and then cannot answer `flash_attn_with_kvcache("
+                      "block_table=)`, which IS W6's decode bar, and has no fp8 attention for W5. "
+                      "It is only correct as a reproduction of the 2026-08 artifact.")
         os.makedirs(f"{PERSIST}/bin", exist_ok=True)
         os.makedirs(f"{PERSIST}/wheels", exist_ok=True)
         staged: dict = {}
@@ -2239,25 +2841,43 @@ def build_peers(cutlass: bool = True, cutlass_arch: str = "", cutlass_kernels: s
                     f"120a consumer Blackwell). Refusing to guess: a profiler built for the wrong "
                     f"arch is a weakened peer, which is worse than no peer."
                 )
-            out = f"{PERSIST}/bin/cutlass_profiler-sm{arch}"
-            if os.path.isfile(out) and not force:
-                print(f"[peers] cutlass_profiler sm{arch} already staged at {out} (--force rebuilds)")
+            patterns = ([p.strip() for p in cutlass_kernels.split(",") if p.strip()]
+                        if cutlass_kernels else _cutlass_patterns(arch, dtypes))
+            kernels = ",".join(patterns)
+            tag = "+".join(dtypes)
+            out = f"{PERSIST}/bin/cutlass_profiler-sm{arch}-{tag}"
+            # Idempotence keys on the arch AND the family set. A profiler staged for f16 only is a
+            # perfectly good f16 peer and a silently absent fp8 one, so "the file exists" is exactly
+            # the check that would let W5 run without the column it was staged for. `have` also
+            # accepts a superset built under a different family order or a wider earlier run.
+            prev = _read_manifest().get("cutlass") or {}
+            have_dtypes = set(prev.get("dtypes") or [])
+            legacy = f"{PERSIST}/bin/cutlass_profiler-sm{arch}"
+            reuse = ""
+            if os.path.isfile(out):
+                reuse = out
+            elif (os.path.isfile(legacy) and prev.get("arch") == arch
+                  and set(dtypes) <= have_dtypes):
+                reuse = legacy
+            if reuse and not force:
+                print(f"[peers] cutlass_profiler sm{arch} [{tag}] already staged at {reuse} "
+                      f"(--force rebuilds)")
+                out = reuse
             else:
-                kernels = cutlass_kernels or (
-                    # Hopper's 3.x kernels are named differently from the 2.x ones, and an unfiltered
-                    # SM90 build is a multi-hour, >100 GB mistake: NVIDIA's own docs say the full
-                    # SM90 instantiation set is "in the order of millions of kernels" and that
-                    # generating and filtering them "alone can take hours" (D5 §4 / §9 pitfall 8).
-                    "cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16*,"
-                    "cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32*"
-                    if arch.startswith("90")
-                    else "cutlass_tensorop_h*gemm*,cutlass_tensorop_s*gemm_f16*"
-                )
+                if os.path.isfile(legacy) and not reuse:
+                    print(f"[peers] {legacy} exists but was staged for families "
+                          f"{sorted(have_dtypes) or ['(unrecorded, treat as f16)']}, and this call "
+                          f"needs {dtypes}. Rebuilding rather than shipping a missing column.")
                 src, bld = cutlass_dir, f"{cutlass_dir}/build"
                 # D5's verified recipe, unchanged: the default `make` generator, not Ninja. Ninja is
                 # installed (the FlashAttention builds genuinely need it) but CUTLASS's quickstart is
                 # what was checked, and this is a build we get one paid attempt at getting right.
-                script = (
+                #
+                # Split in two on purpose. `configure` runs CUTLASS's Python generator, which is
+                # where the kernel filter is applied; `make` is the 20-45+ minute part. The census
+                # goes between them, so a filter that selected nothing costs CPU minutes instead of
+                # a whole build plus a weak peer nobody noticed.
+                configure = (
                     f"set -eux\n"
                     f"df -h {os.path.dirname(src) or '/'}\n"
                     f"rm -rf {src}\n"
@@ -2273,6 +2893,16 @@ def build_peers(cutlass: bool = True, cutlass_arch: str = "", cutlass_kernels: s
                     f" -DCUTLASS_LIBRARY_OPERATIONS=gemm"
                     f" -DCUTLASS_LIBRARY_KERNELS='{kernels}'"
                     f" -DCMAKE_BUILD_TYPE=Release\n"
+                )
+                print(f"[peers] CUTLASS {WK_CUTLASS_TAG} sm{arch}, families {dtypes}")
+                for p in patterns:
+                    print(f"        filter: {p}")
+                _run(["bash", "-c", configure], env, cwd="/tmp")
+                counts = (_cutlass_census(bld, dtypes, patterns, cutlass_max_kernels)
+                          if cutlass_census else {"_census": "skipped (--no-cutlass-census)"})
+                compile_ = (
+                    f"set -eux\n"
+                    f"cd {bld}\n"
                     f"make cutlass_profiler -j $(nproc)\n"
                     f"cp {bld}/tools/profiler/cutlass_profiler {out}\n"
                     f"chmod +x {out}\n"
@@ -2280,13 +2910,16 @@ def build_peers(cutlass: bool = True, cutlass_arch: str = "", cutlass_kernels: s
                     # on the Volume if the operator pointed --cutlass-dir there.
                     f"rm -rf {src}\n"
                 )
-                _run(["bash", "-c", script], env, cwd="/tmp")
+                _run(["bash", "-c", compile_], env, cwd="/tmp")
+                prev = {"counts": counts}
             # The env var points at one stable name; keep the per-arch copies so switching SKUs back
             # and forth never re-pays a build.
             shutil.copyfile(out, f"{PERSIST}/bin/cutlass_profiler")
             os.chmod(f"{PERSIST}/bin/cutlass_profiler", 0o755)
-            staged["cutlass"] = {"tag": WK_CUTLASS_TAG, "arch": arch, "path": out}
-            print(f"[peers] cutlass_profiler sm{arch} ({WK_CUTLASS_TAG}) -> {out}")
+            staged["cutlass"] = {"tag": WK_CUTLASS_TAG, "arch": arch, "path": out,
+                                 "dtypes": dtypes, "kernels": patterns,
+                                 "counts": prev.get("counts", {})}
+            print(f"[peers] cutlass_profiler sm{arch} [{tag}] ({WK_CUTLASS_TAG}) -> {out}")
             # Record it NOW rather than at the end. On 2026-08-09 the sm90a profiler compiled
             # successfully and then the vLLM venv aborted the function, so the manifest never
             # learned about a 45-minute artifact that was sitting on the Volume. The manifest is
@@ -2345,48 +2978,99 @@ def build_peers(cutlass: bool = True, cutlass_arch: str = "", cutlass_kernels: s
             # No prebuilt flash-attn wheel exists for torch 2.13 (assets stop at torch 2.8/cu12 and
             # 2.9/cu13), so this is a source compile. `ninja` is already in the venv: WITHOUT it the
             # build is single-threaded and takes ~2 h (upstream's own number). One arch, not the
-            # default four.
-            archs = fa2_archs or _cc_for_sku(WK_GPU).replace("sm_", "") or "80"
-            have = glob.glob(f"{PERSIST}/wheels/flash_attn-*.whl")
+            # default four -- and NO DISABLE flags, because `flash_attn_with_kvcache` is the whole
+            # reason this wheel exists (W6's decode bar; torch SDPA's FLASH backend cannot reach it).
+            cc = _cc_for_sku(WK_GPU)
+            archs = fa2_archs or _FA2_ARCH.get(cc, "")
+            if not archs:
+                sys.exit(
+                    f"WK_GPU={WK_GPU!r} probes as {cc or 'an unknown cc'}, which is not in FA2's "
+                    f"arch table {sorted(set(_FA2_ARCH.values()))}. FlashAttention-2 emits gencode "
+                    f"for 80/90/100/120 only (Ada and Ampere-consumer take 80: cubins are "
+                    f"minor-version compatible). Pass --fa2-archs explicitly; do not let setup.py "
+                    f"silently build nothing."
+                )
+            have = sorted(glob.glob(f"{PERSIST}/wheels/flash_attn-*.whl"))
             if have and not force:
-                print(f"[peers] flash-attn wheel already staged: {have[0]} (--force rebuilds)")
+                print(f"[peers] flash-attn wheel already staged: {have[-1]} (--force rebuilds)")
             else:
+                _ensure_fa_build_deps(env)
+                jobs = _build_jobs(2.0)
+                print(f"[peers] flash-attn {WK_FA2} source build, arch sm_{archs}, "
+                      f"MAX_JOBS={jobs} (*(est.)* 20-50 min on 16 cores)")
                 _run(["bash", "-c",
                       f"set -eux\n"
-                      f"export MAX_JOBS=$(nproc) NVCC_THREADS=4\n"
+                      f"export MAX_JOBS={jobs} NVCC_THREADS=4\n"
                       f"export FLASH_ATTENTION_FORCE_BUILD=TRUE\n"
                       f"export FLASH_ATTN_CUDA_ARCHS={archs}\n"
                       f"{TORCH_VENV}/bin/pip wheel --no-build-isolation --no-deps "
                       f"  flash-attn=={WK_FA2} -w {PERSIST}/wheels"], env, cwd="/tmp")
-                have = glob.glob(f"{PERSIST}/wheels/flash_attn-*.whl")
-            staged["flash_attn_2"] = {"version": WK_FA2, "archs": archs,
-                                      "wheel": have[0] if have else ""}
+                have = sorted(glob.glob(f"{PERSIST}/wheels/flash_attn-*.whl"))
+            if not have:
+                sys.exit(
+                    f"The flash-attn build reported success and left no wheel in {PERSIST}/wheels. "
+                    f"Recording it as staged would put an unreachable peer in the manifest, which "
+                    f"is the failure `_install_staged_wheels` exists to prevent one layer later."
+                )
+            audit = _verify_fa_wheel(have[-1], "flash-attn", want_kvcache=True)
+            staged["flash_attn_2"] = dict(audit, version=WK_FA2, archs=archs)
+            _write_manifest(staged)
+            build_vol.commit()
 
         if fa3:
-            # Hopper-only, and only worth it when the round needs fp8 attention or the backward pass;
-            # otherwise FA4 (already in the image) is both cheaper and the newer kernel. The
-            # DISABLE_* set is the whole build-time lever list from `hopper/setup.py` — keeping only
-            # fp16 forward at hdim 64/128 is what turns hours into tens of minutes.
-            have = glob.glob(f"{PERSIST}/wheels/flash_attn_3-*.whl")
-            if have and not force:
-                print(f"[peers] flash-attn-3 wheel already staged: {have[0]} (--force rebuilds)")
+            # Hopper-only. FA4 (already in the image) is the cheaper and newer *forward* kernel, so
+            # FA3 is worth building when the round needs what FA4 does not give it: fp8 attention,
+            # the backward pass, or -- the reason this path was rewritten -- paged KV / packed GQA /
+            # varlen decode. The 2026-08 staging disabled exactly those, which is why the plan calls
+            # that wheel unusable. The disable set is now a preset, validated above, and RECORDED,
+            # so a round log names which FA3 it raced instead of implying "FA3".
+            have = sorted(glob.glob(f"{PERSIST}/wheels/flash_attn_3-*.whl"))
+            prev3 = _read_manifest().get("flash_attn_3") or {}
+            same = set(prev3.get("disabled") or []) == set(fa3_disables)
+            if have and not force and same:
+                print(f"[peers] flash-attn-3 wheel already staged: {have[-1]} "
+                      f"(features {prev3.get('features', '?')}; --force rebuilds)")
             else:
-                disables = " ".join(
-                    f"FLASH_ATTENTION_DISABLE_{k}=TRUE"
-                    for k in ("BACKWARD", "SPLIT", "PAGEDKV", "APPENDKV", "LOCAL", "SOFTCAP",
-                              "PACKGQA", "VARLEN", "FP8", "SM80", "HDIM96", "HDIM192", "HDIM256")
-                )
+                if have and not same:
+                    print(f"[peers] the staged FA3 wheel was built with "
+                          f"DISABLE={sorted(prev3.get('disabled') or []) or 'none'} and this call "
+                          f"asks for {sorted(fa3_disables) or 'none'}. Rebuilding: a wheel missing "
+                          f"the feature the round calls is a peer that declines, not a peer.")
+                _ensure_fa_build_deps(env)
+                # 3 GiB/job: FA3's Hopper translation units are the biggest thing this container
+                # compiles, and RAM exhaustion is the classic FA build failure (D5 section 3.2).
+                jobs = _build_jobs(3.0)
+                disables = " ".join(f"FLASH_ATTENTION_DISABLE_{k}=TRUE" for k in fa3_disables)
+                print(f"[peers] flash-attn-3 (hopper) build, features={fa3_features}, "
+                      f"MAX_JOBS={jobs}, DISABLE={sorted(fa3_disables) or 'none'}")
                 _run(["bash", "-c",
                       f"set -eux\n"
                       f"rm -rf /tmp/fa3\n"
                       f"git clone --depth 1 https://github.com/Dao-AILab/flash-attention /tmp/fa3\n"
                       f"cd /tmp/fa3/hopper\n"
-                      f"export MAX_JOBS=$(nproc) NVCC_THREADS=4 {disables}\n"
+                      f"export MAX_JOBS={jobs} NVCC_THREADS=4 {disables}\n"
                       f"{TORCH_VENV}/bin/python setup.py bdist_wheel\n"
                       f"cp dist/flash_attn_3-*.whl {PERSIST}/wheels/\n"
                       f"rm -rf /tmp/fa3"], env, cwd="/tmp")
-                have = glob.glob(f"{PERSIST}/wheels/flash_attn_3-*.whl")
-            staged["flash_attn_3"] = {"wheel": have[0] if have else ""}
+                have = sorted(glob.glob(f"{PERSIST}/wheels/flash_attn_3-*.whl"))
+            if not have:
+                sys.exit(
+                    f"The flash-attn-3 build left no wheel in {PERSIST}/wheels. Not recording it: a "
+                    f"manifest entry with an empty path is a bar that looks staged and is not."
+                )
+            # FA3 reaches paged KV through `fwd(..., page_table=)` rather than a separate
+            # `fwd_kvcache` pybind method, so the symbol check that proves FA2's decode path cannot
+            # prove FA3's. What IS checkable off-device is the Python entry point plus the recorded
+            # disable set and the extension's size, which is what a later round needs to know which
+            # wheel it raced.
+            audit = _verify_fa_wheel(have[-1], "flash-attn-3", want_kvcache=False)
+            staged["flash_attn_3"] = dict(audit, features=fa3_features,
+                                          disabled=sorted(fa3_disables))
+            if not audit["kvcache_api"]:
+                print("!! this FA3 wheel exposes no `flash_attn_with_kvcache`; it cannot serve W6's "
+                      "decode bar. Rebuild with --fa3-features decode.")
+            _write_manifest(staged)
+            build_vol.commit()
 
         m = _write_manifest(staged)
         build_vol.commit()
@@ -3070,6 +3754,14 @@ def peers(require: str = "torch-compile,flash-attn", release: bool = True, warm:
                 f"%-of-CUTLASS from it would flatter Wukong. Rebuild:\n"
                 f"    modal run tools/cloud/modal_app.py::build_peers --cutlass-arch {device_arch}"
             )
+        # The arch is a pass/fail; the family set is a *scope*. A profiler with only f16 kernels is
+        # a perfectly good f16 bar, so this reports rather than refuses -- but the round log has to
+        # name it, because "CUTLASS printed nothing for fp8" and "our filter compiled no fp8" are
+        # indistinguishable at read time and only one of them is a finding.
+        if staged_arch:
+            fams = (m.get("cutlass") or {}).get("dtypes")
+            print(f"[peers] cutlass_profiler sm{staged_arch} carries kernel families: "
+                  f"{fams if fams is not None else '(unrecorded; re-stage to record them)'}")
 
         failures = []
         # Before probing anything: make the Volume's staged wheels reachable from the image's venv.
@@ -3086,9 +3778,12 @@ def peers(require: str = "torch-compile,flash-attn", release: bool = True, warm:
 
         if warm:
             # Proves Inductor+Triton really generated a kernel (not an ATen fallback) AND pays the
-            # max-autotune compile into the Volume-backed cache exactly once.
+            # max-autotune compile into the Volume-backed cache exactly once. The header first, so
+            # the log says whether this run was the one that paid it.
+            child = _torch_env(env)
+            _print_cache_header(child, "peers --warm")
             if _run([f"{TORCH_VENV}/bin/python", _peer_script("smoke_inductor.py")],
-                    _torch_env(env), check=False):
+                    child, check=False):
                 failures.append("smoke_inductor")
 
         # The in-tree library peers, with skips escalated (D5 §1.3). These are `#[ignore]`d benches.
@@ -3121,12 +3816,23 @@ def peers(require: str = "torch-compile,flash-attn", release: bool = True, warm:
 @app.function(image=image, gpu=WK_GPU, cpu=WK_CPU, memory=WK_MEM_MIB, timeout=WK_TIMEOUT,
               volumes={PERSIST: build_vol})
 def cutlass(m: str = "4096", n: str = "4096", k: str = "4096", dtype: str = "f16",
+            c_dtype: str = "", acc: str = "", providers: str = "cutlass,cublas",
             kernels: str = "", iters: int = 100, warmup: int = 20, tag: str = ""):
     """The CUTLASS-profiler GEMM bar, with cuBLAS as a same-binary control column.
 
     `--A=f16:row --B=f16:column` is not a style choice: that is the `A*B^T` (`nn.Linear`) contract
     Wukong's GEMM peers use (`baselines.rs`'s `cublas_gemm_nt_f16`), so the layouts match without a
     transpose fudge that would hand either side an advantage.
+
+    `--dtype` selects the operand type and, through `_CUTLASS_PROFILER_DTYPE`, the C type and the
+    accumulator that go with it -- `e4m3` accumulates in f32 and writes f16, `s8`/`u8` accumulate in
+    s32 and write s32. Both are overridable (`--c-dtype`, `--acc`) because a round may want the
+    fp8 kernel writing f32 to match Wukong's own store width.
+
+    **It refuses to run a dtype the staged profiler was not built with.** That check is the point of
+    the manifest's `dtypes` field: a binary compiled with an f16-only kernel filter answers an fp8
+    request with an empty result set, and an empty result set reads as "the library has no fp8
+    kernel here" -- a fabricated win. Rebuild with `::build_peers --cutlass-dtypes ...` instead.
 
     Honesty note for whoever writes this up: a profiler number is a **best-of-many-kernels** number
     chosen by exhaustive search, which makes it a *stronger* bar than cuBLAS at some shapes and a
@@ -3143,12 +3849,30 @@ def cutlass(m: str = "4096", n: str = "4096", k: str = "4096", dtype: str = "f16
                 f"20-45 minute compile and must never happen here:\n"
                 f"    modal run tools/cloud/modal_app.py::build_peers"
             )
+        fam, def_c, def_acc = _CUTLASS_PROFILER_DTYPE.get(dtype, ("", dtype, "f32"))
+        staged_cutlass = _read_manifest().get("cutlass") or {}
+        staged_dtypes = staged_cutlass.get("dtypes")
+        shown = staged_dtypes if staged_dtypes is not None else "(unrecorded: pre-2026-08-10 " \
+                                                               "staging, assume f16 only)"
+        print(f"[cutlass] staged: sm{staged_cutlass.get('arch', '?')} families {shown}")
+        if fam and staged_dtypes is not None and fam not in staged_dtypes:
+            sys.exit(
+                f"--dtype {dtype} needs the `{fam}` kernel family and the staged profiler was built "
+                f"with {staged_dtypes}. It would run, find no kernel, and print an empty column "
+                f"that reads as 'CUTLASS has no {fam} kernel' -- a peer weakened by our own build.\n"
+                f"    modal run tools/cloud/modal_app.py::build_peers --cutlass-dtypes "
+                f"{','.join(sorted(set(list(staged_dtypes) + [fam])))} --force"
+            )
+        if fam and staged_dtypes is None:
+            print(f"!! the manifest records no kernel families for this profiler, so whether it has "
+                  f"`{fam}` kernels is unknown. If the run below reports no kernels, that is this "
+                  f"build's filter, not the library. Re-stage with ::build_peers to fix the record.")
         os.makedirs(f"{PERSIST}/rounds", exist_ok=True)
         out = f"{PERSIST}/rounds/cutlass-{tag or dtype}-{m}x{n}x{k}.csv".replace(":", "_")
         args = [prof, "--operation=Gemm", "--op_class=tensorop",
                 f"--m={m}", f"--n={n}", f"--k={k}",
-                f"--A={dtype}:row", f"--B={dtype}:column", f"--C={dtype}:column",
-                "--accumulator-type=f32", "--providers=cutlass,cublas",
+                f"--A={dtype}:row", f"--B={dtype}:column", f"--C={c_dtype or def_c}:column",
+                f"--accumulator-type={acc or def_acc}", f"--providers={providers}",
                 f"--warmup-iterations={warmup}", f"--profiling-iterations={iters}",
                 "--verification-enabled=true", f"--output={out}"]
         if kernels:
@@ -3252,11 +3976,20 @@ def framework(op: str = "gemm", shapes: str = "4096x4096x4096", dtype: str = "fp
     Keep every A/B inside ONE invocation: a Modal container can land on a different physical host
     between calls, so a Wukong number from one call and a peer number from another are not comparable
     (plan section 8 risk 7).
+
+    The round header prints the installed torch/Triton/CUDA versions and both compile caches with
+    their size, age and **key**. `mode="max-autotune"` compiles for minutes per new shape and the
+    caches on the Volume are what stop a round paying for that twice -- but they are keyed on the
+    torch/Triton/device fingerprint, so bumping a pin silently orphans every entry. A cold or
+    invalidated cache is therefore a printed line, not something to infer afterwards from a
+    suspicious wall time.
     """
     with _meter("framework"):
         env = dict(os.environ)
         _assert_no_stubs(env)
         os.makedirs(f"{PERSIST}/rounds", exist_ok=True)
+        child = _torch_env(env)
+        _print_cache_header(child, "framework")
         out = f"{PERSIST}/rounds/torch-{tag or op}-{dtype}.json"
         args = [f"{TORCH_VENV}/bin/python", _peer_script("torch_compile_peer.py"),
                 "--op", op, "--shapes", shapes, "--dtype", dtype,
@@ -3265,7 +3998,7 @@ def framework(op: str = "gemm", shapes: str = "4096x4096x4096", dtype: str = "fp
             args.append("--causal")
         if fa4:
             args.append("--fa4")
-        rc = _run(args, _torch_env(env), check=False)
+        rc = _run(args, child, check=False)
         build_vol.commit()
         print(f"\nJSON -> {out}")
         if rc:
