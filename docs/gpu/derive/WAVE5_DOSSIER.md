@@ -358,3 +358,245 @@ narrower and belongs in the correctness arm, not the sweep arm:
   alternative that would explain a failure) in one launch.
 
 That is the whole 8-bit descriptor risk: one prediction, one named fallback, zero speculative arms.
+
+---
+
+## 3. DEQUANT / SCALE EPILOGUE
+
+### 3.1 Where a thread's outputs actually are
+
+**FACT(repo)**, `ptx_wgmma.rs:3658-3661` (the generator's own comment) and `:3670-3677` (the code
+that computes it). With `grp = lane/4` and `tg = lane%4`, warp `w` of a consumer warpgroup holds
+
+```
+row0 = ctam + cwg*64 + w*16 + grp      row1 = row0 + 8
+col(j) = ctan + 2*tg + 8*j             for j in 0 .. bn/8
+```
+
+and the four registers of group `j` are `(row0,col) (row0,col+1) (row1,col) (row1,col+1)`.
+
+**DERIVED.** At `bn = 256` a thread owns **2 rows x 64 columns = 128 outputs**, in 32 register
+quads. So a per-channel dequant needs, per thread, **2 row scales and 64 column scales**, and the
+64 column scales are drawn from a set of only 256 that the whole warpgroup shares. That asymmetry
+decides the implementation: row scales are 2 scalar `ld.global` (or `ld.global.nc`) per thread;
+column scales are staged **once per CTA tile** into shared memory and read back as
+`ld.shared.v2.f32`, because `col(j)` and `col(j)+1` are adjacent and `col(j)*4` is a multiple of 8
+(`2*tg` is even), so the pair is a legal aligned `v2`.
+
+### 3.2 int8: where the scales enter, and where the exactness gate must NOT
+
+**DERIVED.** The instruction produces an exact `s32`:
+
+```
+D_s32[m,n] = sum_k A_s8[m,k] * B_s8[n,k]          exact for K < 131072  (section 1.3)
+C_f32[m,n] = D_s32[m,n] * sa[m] * sb[n]           per-channel dequant
+C_f32[m,n] = D_s32[m,n] * (sa * sb)               per-tensor dequant
+```
+
+Per output that is `cvt.rn.f32.s32` + two `mul.f32` (or one `mul` if the per-tensor product is
+folded host-side), i.e. ~3 ALU ops against one 4-or-8-byte store. The epilogue stays store-bound.
+
+**The guard that matters more than the arithmetic:** the dequant multiply is `f32` and rounds. The
+`==` exactness claim belongs to `D_s32`, not to `C_f32`. So Wave 5 must ship **two arms, never
+one**:
+
+* an **s32-out arm** compared `==` against an `i32` scalar model -- this is the claim no library
+  makes, and it is the surviving differentiator named in the plan's target table row 5;
+* a **dequant arm** compared against an f64 reference at a tolerance.
+
+The repo already has exactly this split at `mma.sync` (`gpu::tests::int8_gemm_matches_reference`
+and `int8_dequant_matches_reference` are separate tests,
+`bench/gpu/h100/2026-08-10-ptxas-census.log:306-307`), and the wgmma family must inherit the split
+rather than collapse it. A single fused test would silently convert a bit-exactness claim into a
+tolerance claim.
+
+**Scale-vector SMEM cost.** `bn` f32 = **1024 B** at `bn = 256`. Free shared memory after the
+mainloop ring is `227*1024 - 196672 = 35,776 B` (`HOPPER_SMEM_PER_CTA`, `ptx_wgmma.rs:184`, minus
+the census-measured `smem(gen)`). 1 KiB fits with three orders of magnitude to spare -- but see
+3.5, because it is not the only claimant on those bytes.
+
+### 3.3 fp8: two different scaling regimes with two different costs
+
+**DERIVED.** `wgmma` itself needs no scale beyond the +-1 sign immediates (section 1.2), so all fp8
+scaling is ours to place, and *where* we place it decides what it costs:
+
+**(a) Per-tensor scaling -- an epilogue multiply, free.** `C = D_f32 * (sA * sB)` where `sA`, `sB`
+are the reciprocal-amax scalars the quantizer already produces (`ptx_fp8_train.rs`'s delayed-scaling
+path; `gpu::tests::amax_matches_reference`, `fp8_device_quantize_within_ulp`). One `mul.f32` per
+output, zero extra memory traffic, and it composes with the existing `alpha` fold.
+
+**(b) Block scaling (DeepSeek-V3 style) -- a MAINLOOP change, and it does not fit on W1.** With
+`1x128` activation blocks and `128x128` weight blocks, the scale varies along K, so it must be
+applied at the boundary where the tensor-core partial is promoted to a CUDA-core f32 accumulator.
+`BK = 128` makes that boundary **exactly one stage**, which is the good news. The bad news is
+registers:
+
+```
+wgmma accumulators at bn=256      = n/2 = 128 regs/thread
+promotion accumulators (f32)      = another 128 regs/thread
+                                    ------------------------
+                                    256 > consumer_regs = 232      DOES NOT FIT
+```
+
+At `bn = 128` (the `WGMMA_W3C` geometry, `ptx_wgmma.rs:1685-1692`) the same arithmetic reads
+`64 + 64 = 128` accumulator registers inside `consumer_regs: 168`, which fits with headroom.
+
+> **PREDICTION / design constraint the plan does not state: the two-level-accumulation arm belongs
+> on the 128x128 tile, not on W1's 128x256.** Putting it on W1 either spills (a `ptxas` C7511 and a
+> silent 2-4x) or forces `setmaxnreg` past the file. Emit it as its own row, at its own tile, and
+> A/B it against the un-promoted W1 for *accuracy*, not for speed.
+
+**Block-scale traffic, derived** (the plan's "+3.1% of operand bytes"): the activation side is one
+f32 per 128 bytes of A = `4/128` = **3.125%**; the weight side is one f32 per `128*128` bytes of
+B = `4/16384` = **0.024%**. The activation side is the whole cost, and the honest published number
+is the scaled one.
+
+### 3.4 Output dtype and store width
+
+**DERIVED**, over the current epilogue (`ptx_wgmma.rs:3678-3696`: four predicated `st.global.f32`
+per register quad, 128 scalar stores per thread at `bn = 256`):
+
+| out dtype | per-quad emission | bytes/thread at bn=256 | C write, 128x256 tile |
+|---|---|---|---|
+| f32 (today) | 4 x `st.global.f32` | 512 | 131,072 B |
+| f32 (W4 rung 1) | 2 x `st.global.v2.f32` | 512 | 131,072 B, half the sectors |
+| f16 | 2 x (`cvt.rn.f16x2.f32` + `st.global.b32`) | 256 | **65,536 B** |
+| s32 (int8 exact arm) | 2 x `st.global.v2.u32` | 512 | 131,072 B |
+| s8 (requantised out) | needs a cross-lane gather | -- | **not free, do not promise it** |
+
+The `f16` row is the one with a number attached: it halves the C write *and* deletes the separate
+`f32 -> f16` cast pass, which is the mechanism behind the plan's `0.179 ms = 27% of the peer's
+GEMM` at `gpt_d4096_up`. The `s8` row is called out because it looks symmetric and is not: a thread
+holds columns `c` and `c+1` on **two different rows**, so `cvt.pack.sat.s8.s32.b32` (which wants
+four column-adjacent values) cannot be fed from one thread's registers without a shuffle or an SMEM
+transpose. An int8-out epilogue is a separate piece of work with its own cost; Wave 5 should ship
+f32-out and f16-out and say so.
+
+### 3.5 Interaction with the Wave-4 fused epilogue surface
+
+Wave 4 turns the epilogue into a product surface (bias, relu/silu/gelu, `beta*C` residual,
+`cvt.rn.f16x2` low-precision store, RoPE) and its **G10** is the sharp guard: W1's SMEM map leaves
+**35,776 free bytes** against a **131,072-byte** f32 C tile, so a TMA-store epilogue physically
+must alias the mainloop ring. Three notes where Wave 5 touches that surface:
+
+1. **An f16-out epilogue does not rescue G10.** 65,536 B is still 1.8x the free budget. It halves
+   the aliasing pressure and no more; the disjoint-region requirement stands.
+2. **The dequant scale vectors are a second, much smaller claimant on the same 35,776 B** (1 KiB
+   for `sb` at `bn=256`). They fit trivially, but they must be *in* the SMEM map, not carved out
+   ad hoc, or `smem_bytes()` under-reports and `dyn_smem_bytes` under-requests -- the exact defect
+   G10 already names for the epilogue region.
+3. **Order matters and must be fixed once:** `dequant -> bias -> activation -> beta*C residual ->
+   cast -> store`. Applying bias before dequant, or activation before the residual, are both
+   plausible and both wrong, and neither is visible in a tolerance gate that only checks
+   magnitudes. Write the order into the generator's doc comment and into the reference.
+
+**Register budget, restated for Wave 5.** The plan's W4 note -- `128*32 + 256*232 = 63,488` of
+`65,536` leaves exactly 8 registers per consumer thread, and `setmaxnreg` moves in steps of 8, so
+"bias + act + residual together do not fit" -- is a **16-bit** statement, and section 1.4 shows the
+8-bit retype does not change a single term of it. It transfers verbatim. Wave 5 inherits the
+squeeze; it does not create or relieve it.
+
+---
+
+## 4. PEER BAR
+
+### 4.1 The staged CUTLASS profiler is f16-only. The 8-bit artifacts DO NOT EXIST yet.
+
+**FACT(repo)**, `bench/gpu/h100/2026-08-09-preflight-build-peers.log:915`. The binary now on the
+Volume was configured with
+
+```
+-DCUTLASS_LIBRARY_KERNELS='cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f16*,
+                           cutlass3x_sm90_tensorop_gemm_f16_f16_f32_void_f32*'
+```
+
+-- **no fp8 pattern, no int8 pattern**. There is no `cutlass-e4m3-*.csv` or `cutlass-s8-*.csv`
+anywhere under `bench/gpu/`. Wave 5's CUTLASS column has to be *built* before it can be run.
+
+**FACT(repo), the unlock is already coded** (this is Wave 2B's work, landed in the tool, not yet
+executed): `tools/cloud/modal_app.py:852-866` carries `_CUTLASS_KERNELS_3X` with
+`"fp8": ("cutlass3x_sm90_tensorop_gemm_e4m3_e4m3_f32_*",)` and
+`"int8": ("cutlass3x_sm90_tensorop_gemm_s8_s8_s32_*", "cutlass3x_sm90_tensorop_gemm_u8_u8_s32_*")`,
+and `build_peers`'s `cutlass_dtypes` now **defaults to `"f16,fp8,int8"`** (`:2739`). Two guards
+already stand behind it and should be trusted rather than re-implemented:
+
+* `_cutlass_census` (`:1005-1053`) counts selected kernels **per family before the compile** and
+  exits if a requested family selected zero -- "the build would succeed, the binary would run, and
+  the missing column would read as 'the library has no such kernel'".
+* `::cutlass` refuses at run time to profile a dtype the manifest says the staged binary was not
+  built with (`:3873-3880`), and prints a loud "unrecorded, assume f16 only" warning when the
+  manifest predates 2026-08-10 (`:3870-3871`, `:3881-3884`) -- which is exactly the state of the
+  currently staged binary.
+
+**Therefore the Wave-5 peer sequence starts with a CPU-only call, not a GPU one:**
+
+```
+modal run tools/cloud/modal_app.py::build_peers --cutlass-arch 90a \
+        --cutlass-dtypes f16,fp8,int8 --force
+```
+
+at the `$1.01/hr` CPU rate (`:134-139`), and the census output in that log is itself a
+publishable artifact: it records how many fp8 and int8 SM90 kernels CUTLASS 4.6.1 generates, which
+is the denominator for "we beat the best of N".
+
+### 4.2 Exactly which peer configs are the honest bar
+
+`_CUTLASS_PROFILER_DTYPE` (`modal_app.py:983-992`) fixes the C type and accumulator per dtype, and
+the accumulator is not cosmetic -- asking for `f32` on an `s8` kernel selects nothing and reads as
+a missing library kernel.
+
+| # | peer | invocation | why it is on the bar |
+|---|---|---|---|
+| 1 | CUTLASS fp8, f16 out | `::cutlass --dtype e4m3` (defaults `--c-dtype f16 --acc f32`) | the library's own best-of-N at the dtype we claim |
+| 2 | CUTLASS fp8, f32 out | `::cutlass --dtype e4m3 --c-dtype f32` | matches **our** store width; without it the C-traffic term differs and the ratio is not about the mainloop |
+| 3 | CUTLASS int8 | `::cutlass --dtype s8` (defaults `--c-dtype s32 --acc s32`) | the s32-out arm, same output type as our exactness arm |
+| 4 | cuBLAS control | the `--providers=cutlass,cublas` column of 1-3 | same binary, same shapes: this is the dispersion control (G16) |
+| 5 | cuBLASLt fp8 | `baselines.rs`'s existing raw-sys plan; `gpu::tests::cublaslt_fp8_matches_reference_within_tol`, `fp8_vs_cublaslt_pct` | already implemented; the vendor bar rather than the best-of-N bar |
+| 6 | cuBLAS IMMA | the s8 `cublasGemmEx` path | the vendor int8 bar |
+| 7 | vLLM `cutlass_scaled_mm` | `benchmark_int8_gemm.py`, already on the Volume | the **fused-dequant** int8 bar; the plan's target-table row 5 says the repo's "libraries do not offer fused dequant" framing is FALSE on Hopper and must be retired, and this is the kernel that retires it |
+
+**The published headline must carry both peer columns.** The plan's own reason: "a library fp8 bar
+at 58.7% of peak versus a cuBLAS f16 bar at 87.3% means the choice of peer, not the kernel, decides
+whether the headline reads 97% or 73%." Report the peak-fraction column beside every ratio
+(standing rule 4).
+
+### 4.3 cuBLASLt FP8 -- the API constraints that decide whether the comparison is honest
+
+**FACT(ext)**, cuBLAS documentation and the `CUDALibrarySamples/cuBLASLt/LtFp8Matmul` sample:
+
+* **TN only on Hopper.** The FP8 matmul path does not support non-TN layouts on Hopper -- A must be
+  transposed (row-major `K`-contiguous), B column-major. This is the *same* NT/K-major contract our
+  kernel already uses (section 1.2), so the layouts match without a transpose fudge that would
+  advantage either side. Note it explicitly in the round log, because "we and the peer are both TN"
+  is a fairness fact, not a coincidence.
+* **Leading dimensions must be a multiple of 16** for FP8 tensor scaling -- the same 16-byte rule
+  section 1.5 derives for our TMA global strides. Both sides refuse the same shapes.
+* **Scale pointers:** `CUBLASLT_MATMUL_DESC_{A,B,C,D}_SCALE_POINTER`, plus
+  `CUBLASLT_MATMUL_DESC_AMAX_D_POINTER`. Setting a scale pointer on an unsupported
+  data/scale/compute-type combination returns `CUBLAS_INVALID_VALUE` rather than falling back --
+  a hard error, which is the good kind.
+* **`CUBLASLT_MATMUL_DESC_FAST_ACCUM` is the fairness switch, and it is the same switch as section
+  3.3(b).** Fast-accum on is the un-promoted mode: the tensor core's 14-bit accumulation, straight
+  through. Fast-accum off is the peer's version of DeepSeek promotion.
+
+> **REFUSAL (Wave 5's own, added here): do not compare our promoted kernel against a
+> `FAST_ACCUM=true` peer, or our un-promoted kernel against a `FAST_ACCUM=false` peer.** Either
+> direction publishes an accuracy/speed trade as a speed result. Match the mode, say which mode, or
+> publish both columns. The plan's existing refusal -- "any fp8 headline against a per-tensor-scaled
+> peer" -- is the same defect on the scaling axis; this is its accumulation-axis twin.
+
+### 4.4 Machete / Marlin -- trigger status: NOT TRIGGERED by Wave 5, with one caveat
+
+**FACT(repo)**, `ACT2_WAVE_PLAN.md:102` holds "Beating Machete on W4A16" out of the plan
+(measure-only, a `::marlin` round at M=1/16/128), and `:77` states the Wave-5 refusal: "an int4
+headline without the Machete column".
+
+**DERIVED.** Wave 5's levers are `{E4M3, E5M2, S8, U8}`. There is no int4 `wgmma` -- the ISA's
+8-bit menu is where `wgmma` stops -- so **Wave 5 cannot produce an int4 headline and the Machete
+trigger does not fire.** The caveat is section 5: the baseline round *measures* the existing
+`ptx_int4.rs` family on Hopper to get a Hopper denominator. That is a baseline, not a headline, and
+it stays inside the refusal as long as no int4 **ratio against a peer** is published from it.
+
+`::marlin` also picks the right kernel by device (`modal_app.py:3948-3957`): Machete on `sm_90`,
+Marlin on Ampere, with a loud warning in each wrong direction. When the int4 trigger does fire, use
+that dispatcher rather than naming a kernel by hand.
