@@ -3191,6 +3191,769 @@ pub fn cublaslt_available() -> bool {
     .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Tier B — cuBLASLt **FUSED-EPILOGUE** GEMM (f16 in, f32/f16 out, bias + ReLU/GELU folded into the
+// matmul). Act-2 wave 2, owner B: *the B track buys no speed and deletes claims.*
+// ---------------------------------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. Wave 4 turns Wukong's wgmma epilogue into a product surface — bias, ReLU/SiLU/GELU,
+// `beta*C` residual, low-precision output, RoPE — and the wave plan's refusal clause is blunt about
+// what may then be published: *"any bias/relu/gelu row published as a fusion win now that cuBLASLt
+// fuses those 16 epilogues at zero extra traffic"* is refused. Until this peer existed the repo had
+// no way to *measure* that, so the honest bar for a fused bias+GELU GEMM was a cuBLAS GEMM plus a
+// separate pointwise kernel — a chain the fused kernel beats by construction. That comparison is a
+// strawman on Hopper and this module retires it.
+//
+// WHAT cuBLASLt CAN AND CANNOT FUSE, exactly. Its fusable set is not "activations": it is the
+// **sixteen** values of `cublasLtEpilogue_t`, enumerated in [`CUBLASLT_FUSABLE_EPILOGUES`] and pinned
+// against the sys enum by a device-free law. Three consequences that decide what Wave 4 may claim:
+//
+//   * BIAS, RELU, GELU and the RELU_BIAS / GELU_BIAS pairs ARE fused. A Wukong row for any of those
+//     is a GEMM-parity fight, not a fusion win.
+//   * **SiLU/swish is not in the set**, and neither is residual-plus-activation. Those genuinely have
+//     no fused library peer, and the honest floor for them is cuBLAS + a separate kernel.
+//   * The set has no low-precision-output-plus-activation member either — which is target #2 of the
+//     plan's list. But "the enum has no such name" is an argument, not a measurement, so
+//     [`cublaslt_epilogue_support_matrix`] asks the library itself, per epilogue and per output
+//     dtype, and reports what the heuristic says. A claim of absence should be something a round log
+//     shows, not something a comment asserts.
+//
+// THE LAYOUT MAPPING, AND THE ONE THING IT MAKES FREE. As with [`Fp8LtPlan`], Wukong's row-major
+// `C[M×N] = A[M×K]·B[N×K]ᵀ` becomes the column-major `Cᵀ[N×M] = B̌ᵀ·Ǎ` — first operand Wukong's B
+// transposed (`OP_T`), second Wukong's A (`OP_N`), output dims swapped. cuBLASLt's bias vector is
+// indexed along the **rows of D**, and the rows of D are Wukong's N. So a Wukong bias — one value per
+// output column, added to every row of `C[M×N]` — maps to cuBLASLt's per-row bias of length N with no
+// reshape, no transpose and no second buffer. The NT mapping and the bias contract coincide; the
+// device-free reference gate below exists because getting that backwards produces a *plausible*
+// matrix (bias of length M spread the wrong way) rather than an obvious error.
+//
+// DTYPE PARITY, which is the fairness keystone here exactly as it was for [`gemm_ex_nt_f16_f32out`]:
+// A/B are f16 (the bytes Wukong's kernel consumes) and C/D default to **f32**, because Wukong's wgmma
+// kernel accumulates in f32 and stores f32. [`LtOut::F16`] exists for the low-precision-output arm and
+// halves the C write, so a round can separate "we fused the cast" from "we fused the activation".
+// The bias buffer's dtype **follows D**, because cuBLASLt's default for
+// `CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE` is D's own type — handing it an f32 bias against an f16 D
+// would make the library decline for a reason that has nothing to do with the epilogue, and the
+// support matrix would then record a capability gap that does not exist.
+
+/// The **complete** fusable set of `cublasLtMatmul`, name and ABI value.
+///
+/// Sixteen entries, because `cublasLtEpilogue_t` has sixteen values — that is the whole of what
+/// cuBLASLt can fold into a matmul, and it is the fact the Wave-4 epilogue claims are scored
+/// against. Written out (rather than derived) so it can be *quoted* in a write-up; pinned to the
+/// real enum, value by value, by `the_cublaslt_fusable_set_is_exactly_these_sixteen`, so it cannot
+/// drift from the library the peer actually calls.
+///
+/// Read it for what is absent as much as for what is present: no SiLU/swish, no residual-plus-
+/// activation, and no member that combines a low-precision output with an activation. `AUX` variants
+/// write a second tensor (the pre-activation values, for a backward pass); `BGRAD*` are gradient
+/// reductions, not forward fusions.
+pub const CUBLASLT_FUSABLE_EPILOGUES: [(&str, u32); 16] = [
+    ("DEFAULT", 1),
+    ("RELU", 2),
+    ("BIAS", 4),
+    ("RELU_BIAS", 6),
+    ("GELU", 32),
+    ("GELU_BIAS", 36),
+    ("RELU_AUX", 130),
+    ("RELU_AUX_BIAS", 134),
+    ("DRELU", 136),
+    ("DRELU_BGRAD", 152),
+    ("GELU_AUX", 160),
+    ("GELU_AUX_BIAS", 164),
+    ("DGELU", 192),
+    ("DGELU_BGRAD", 208),
+    ("BGRADA", 256),
+    ("BGRADB", 512),
+];
+
+/// The forward epilogues this peer can actually run: the subset of [`CUBLASLT_FUSABLE_EPILOGUES`]
+/// that is a *forward* fusion over one output tensor, which is the only shape Wave 4's rows compare
+/// against. `AUX` (writes a second tensor) and `BGRAD*` (a gradient reduction) are deliberately not
+/// here — they are real cuBLASLt features and not this bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LtEpilogue {
+    /// `CUBLASLT_EPILOGUE_DEFAULT` — a plain GEMM. The control column: same plan, same algo search,
+    /// same workspace, so `epilogue_sec / default_sec` isolates what the epilogue itself cost.
+    None,
+    /// `max(x, 0)`.
+    Relu,
+    /// GELU. cuBLASLt's is the **tanh** approximation — see [`gelu_tanh_f64`].
+    Gelu,
+    /// `x + bias[n]`.
+    Bias,
+    /// `max(x + bias[n], 0)`.
+    ReluBias,
+    /// `gelu(x + bias[n])`.
+    GeluBias,
+}
+
+impl LtEpilogue {
+    /// Every variant, for a sweep or a support probe. Order is the order a round should report in:
+    /// the control first, then the two bare activations, then the three bias forms.
+    pub const ALL: [LtEpilogue; 6] = [
+        LtEpilogue::None,
+        LtEpilogue::Relu,
+        LtEpilogue::Gelu,
+        LtEpilogue::Bias,
+        LtEpilogue::ReluBias,
+        LtEpilogue::GeluBias,
+    ];
+
+    /// The `cublasLtEpilogue_t` this variant sets on the descriptor.
+    pub fn as_sys(self) -> cublaslt_sys::cublasLtEpilogue_t {
+        use cublaslt_sys::cublasLtEpilogue_t as E;
+        match self {
+            LtEpilogue::None => E::CUBLASLT_EPILOGUE_DEFAULT,
+            LtEpilogue::Relu => E::CUBLASLT_EPILOGUE_RELU,
+            LtEpilogue::Gelu => E::CUBLASLT_EPILOGUE_GELU,
+            LtEpilogue::Bias => E::CUBLASLT_EPILOGUE_BIAS,
+            LtEpilogue::ReluBias => E::CUBLASLT_EPILOGUE_RELU_BIAS,
+            LtEpilogue::GeluBias => E::CUBLASLT_EPILOGUE_GELU_BIAS,
+        }
+    }
+
+    /// The name a round log prints. Matches the CUDA spelling minus the `CUBLASLT_EPILOGUE_` prefix,
+    /// so a reader can grep the NVIDIA docs for it.
+    pub fn name(self) -> &'static str {
+        match self {
+            LtEpilogue::None => "DEFAULT",
+            LtEpilogue::Relu => "RELU",
+            LtEpilogue::Gelu => "GELU",
+            LtEpilogue::Bias => "BIAS",
+            LtEpilogue::ReluBias => "RELU_BIAS",
+            LtEpilogue::GeluBias => "GELU_BIAS",
+        }
+    }
+
+    /// Does this epilogue read the bias vector? A `BIAS_POINTER` set for an epilogue that ignores it
+    /// is harmless; one *missing* for an epilogue that reads it is a null dereference on the device.
+    pub fn needs_bias(self) -> bool {
+        matches!(
+            self,
+            LtEpilogue::Bias | LtEpilogue::ReluBias | LtEpilogue::GeluBias
+        )
+    }
+
+    /// Parse a round's `--epilogue` token. **An unknown name is an error**, never a silent fallback
+    /// to `DEFAULT`: a typo that quietly measured a plain GEMM and labelled it `GELU_BIAS` is the
+    /// same class of defect as a peer that skips politely.
+    pub fn parse(raw: &str) -> Result<LtEpilogue, String> {
+        let key = raw.trim().to_ascii_uppercase().replace('-', "_");
+        let key = key.strip_prefix("CUBLASLT_EPILOGUE_").unwrap_or(&key);
+        match key {
+            "DEFAULT" | "NONE" => Ok(LtEpilogue::None),
+            "RELU" => Ok(LtEpilogue::Relu),
+            "GELU" => Ok(LtEpilogue::Gelu),
+            "BIAS" => Ok(LtEpilogue::Bias),
+            "RELU_BIAS" => Ok(LtEpilogue::ReluBias),
+            "GELU_BIAS" => Ok(LtEpilogue::GeluBias),
+            other => Err(format!(
+                "unknown cuBLASLt epilogue {other:?}; this peer runs {}. cuBLASLt's full fusable \
+                 set is the 16 values of `cublasLtEpilogue_t` (see CUBLASLT_FUSABLE_EPILOGUES) — \
+                 and it contains no SiLU and no residual+activation, so those have no fused \
+                 library peer at all.",
+                LtEpilogue::ALL
+                    .iter()
+                    .map(|e| e.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// Apply this epilogue on the host, in f64. `gelu_tanh` picks the GELU formula — see
+    /// [`gelu_tanh_f64`] for why that is a real choice and not a detail.
+    pub fn apply_f64(self, x: f64, bias: f64, gelu_tanh: bool) -> f64 {
+        let g = |v: f64| {
+            if gelu_tanh {
+                gelu_tanh_f64(v)
+            } else {
+                gelu_erf_f64(v)
+            }
+        };
+        match self {
+            LtEpilogue::None => x,
+            LtEpilogue::Relu => x.max(0.0),
+            LtEpilogue::Gelu => g(x),
+            LtEpilogue::Bias => x + bias,
+            LtEpilogue::ReluBias => (x + bias).max(0.0),
+            LtEpilogue::GeluBias => g(x + bias),
+        }
+    }
+}
+
+/// The output (`C`/`D`) dtype of the fused peer.
+///
+/// `F32` is the parity setting: Wukong's wgmma GEMM accumulates in f32 and stores f32, so an f32-out
+/// peer pays the same epilogue write traffic. `F16` halves that write and is the arm the plan's
+/// target #2 ("low-precision-output + activation") is scored against — with the catch that cuBLASLt
+/// may or may not *have* a fused activation at that output width, which is what
+/// [`cublaslt_epilogue_support_matrix`] measures rather than assumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LtOut {
+    F32,
+    F16,
+}
+
+impl LtOut {
+    fn as_sys(self) -> cublaslt_sys::cudaDataType_t {
+        match self {
+            LtOut::F32 => cublaslt_sys::cudaDataType_t::CUDA_R_32F,
+            LtOut::F16 => cublaslt_sys::cudaDataType_t::CUDA_R_16F,
+        }
+    }
+
+    /// The name a round log prints.
+    pub fn name(self) -> &'static str {
+        match self {
+            LtOut::F32 => "f32",
+            LtOut::F16 => "f16",
+        }
+    }
+}
+
+/// GELU, **tanh approximation** — `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
+///
+/// This is the formula cuBLASLt's GELU epilogue implements, and it is not interchangeable with the
+/// exact erf form: the two differ by up to ~1e-3 in absolute terms around |x| ≈ 2, which is three
+/// orders above the `c·√K·ε` band an f16 GEMM gate uses. So a fused-GELU correctness gate that
+/// referenced the wrong one would fail on a perfectly good peer, and the first suspect for any such
+/// mismatch is this choice — not the kernel. [`gelu_erf_f64`] is here so the two can be told apart
+/// in one run instead of argued about.
+pub fn gelu_tanh_f64(x: f64) -> f64 {
+    const C: f64 = 0.797_884_560_802_865_4; // sqrt(2/pi)
+    0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh())
+}
+
+/// GELU, **exact (erf) form** — `0.5·x·(1 + erf(x/√2))`.
+///
+/// Rust's `std` has no `erf` and this crate takes no math dependency, so `erf` here is the
+/// Numerical-Recipes Chebyshev `erfc` fit: fractional error < 1.2e-7 everywhere. That is six orders
+/// below the ~1e-3 gap between this function and [`gelu_tanh_f64`], which is the only thing it is
+/// for — telling the two GELU conventions apart. Do not reach for it as a general-purpose `erf`.
+pub fn gelu_erf_f64(x: f64) -> f64 {
+    0.5 * x * (1.0 + erf_f64(x / std::f64::consts::SQRT_2))
+}
+
+/// `erf`, via the Numerical-Recipes `erfc` Chebyshev fit (fractional error < 1.2e-7).
+fn erf_f64(x: f64) -> f64 {
+    let z = x.abs();
+    let t = 2.0 / (2.0 + z);
+    let ty = 4.0 * t - 2.0;
+    // Chebyshev coefficients, highest order first (Clenshaw recurrence below).
+    const C: [f64; 28] = [
+        -1.3026537197817094,
+        6.419_697_923_564_902e-1,
+        1.9476473204185836e-2,
+        -9.561_514_786_808_63e-3,
+        -9.46595344482036e-4,
+        3.66839497852761e-4,
+        4.2523324806907e-5,
+        -2.0278578112534e-5,
+        -1.624290004647e-6,
+        1.303655835580e-6,
+        1.5626441722e-8,
+        -8.5238095915e-8,
+        6.529054439e-9,
+        5.059343495e-9,
+        -9.91364156e-10,
+        -2.27365122e-10,
+        9.6467911e-11,
+        2.394038e-12,
+        -6.886027e-12,
+        8.94487e-13,
+        3.13092e-13,
+        -1.12708e-13,
+        3.81e-16,
+        7.106e-15,
+        -1.523e-15,
+        -9.4e-17,
+        1.21e-16,
+        -2.8e-17,
+    ];
+    let (mut d, mut dd) = (0.0f64, 0.0f64);
+    for &c in C.iter().rev().take(C.len() - 1) {
+        let tmp = d;
+        d = ty * d - dd + c;
+        dd = tmp;
+    }
+    let erfc = t * (-z * z + 0.5 * (C[0] + ty * d) - dd).exp();
+    let erfc = if x >= 0.0 { erfc } else { 2.0 - erfc };
+    1.0 - erfc
+}
+
+/// The host reference for a fused-epilogue GEMM: apply `epi` to a **row-major** `C[M×N]`.
+///
+/// `bias` is indexed by the **column** (`n`), which is the whole point of having this as a named,
+/// gated function. cuBLASLt applies its bias along the rows of *its* D, and under the `Cᵀ = B̌ᵀ·Ǎ`
+/// mapping those rows are Wukong's columns — so the two conventions agree, and a reference that
+/// indexed by `m` instead would produce a plausible matrix that is wrong everywhere off the
+/// diagonal. `bias` must be `n` long when `epi.needs_bias()` and may be empty otherwise.
+///
+/// The arithmetic is f64 so this stays an independent oracle rather than a second f32 opinion.
+pub fn fused_epilogue_reference(
+    c: &[f32],
+    bias: &[f32],
+    m: usize,
+    n: usize,
+    epi: LtEpilogue,
+    gelu_tanh: bool,
+) -> Vec<f32> {
+    assert_eq!(c.len(), m * n, "C is row-major [M,N]");
+    if epi.needs_bias() {
+        assert_eq!(
+            bias.len(),
+            n,
+            "cuBLASLt's bias is one value per OUTPUT COLUMN (N)"
+        );
+    }
+    let mut out = Vec::with_capacity(m * n);
+    for i in 0..m {
+        for j in 0..n {
+            let b = if epi.needs_bias() {
+                bias[j] as f64
+            } else {
+                0.0
+            };
+            out.push(epi.apply_f64(c[i * n + j] as f64, b, gelu_tanh) as f32);
+        }
+    }
+    out
+}
+
+/// cuBLASLt fused-epilogue workspace. 32 MiB, matching [`FP8_LT_WORKSPACE`]: comfortably above any
+/// Hopper/Ada f16 algo's requirement, and constant across the arms so the control and the epilogue
+/// columns get the same heuristic search space.
+const EPILOGUE_LT_WORKSPACE: usize = 32 * 1024 * 1024;
+
+/// A built, reusable cuBLASLt **f16 in / f32-or-f16 out** matmul plan with a fused epilogue.
+///
+/// Built once — the heuristic search is host work and must never be inside a timing loop — and
+/// re-run per call on resident buffers. The bias lives in the plan because its **device address is
+/// baked into the descriptor**: `CUBLASLT_MATMUL_DESC_BIAS_POINTER` stores the pointer, not the
+/// bytes, so a bias buffer that outlived the descriptor's construction but not its use would be a
+/// use-after-free the device reports as garbage output rather than as a fault. It is `n` floats —
+/// 4 KB at N=1024 — so owning a copy costs nothing and removes the whole lifetime question.
+/// `Drop` tears the sys objects down so an early `?` cannot leak them.
+struct FusedLtPlan {
+    handle: cublaslt_sys::cublasLtHandle_t,
+    desc: cublaslt_sys::cublasLtMatmulDesc_t,
+    a_layout: cublaslt_sys::cublasLtMatrixLayout_t,
+    b_layout: cublaslt_sys::cublasLtMatrixLayout_t,
+    cd_layout: cublaslt_sys::cublasLtMatrixLayout_t,
+    pref: cublaslt_sys::cublasLtMatmulPreference_t,
+    algo: cublaslt_sys::cublasLtMatmulAlgo_t,
+    workspace: CudaSlice<u8>,
+    // Kept alive for the plan's life: their device addresses are inside `desc`. Exactly one is
+    // populated, and which one is decided by [`LtOut`] — cuBLASLt's default bias dtype is D's dtype.
+    _bias_f32: Option<CudaSlice<f32>>,
+    _bias_f16: Option<CudaSlice<f16>>,
+}
+
+impl Drop for FusedLtPlan {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cublaslt_result::destroy_matmul_pref(self.pref);
+            let _ = cublaslt_result::destroy_matrix_layout(self.cd_layout);
+            let _ = cublaslt_result::destroy_matrix_layout(self.b_layout);
+            let _ = cublaslt_result::destroy_matrix_layout(self.a_layout);
+            let _ = cublaslt_result::destroy_matmul_desc(self.desc);
+            let _ = cublaslt_result::destroy_handle(self.handle);
+        }
+    }
+}
+
+impl FusedLtPlan {
+    /// Build the plan for a row-major `D[M×N] = epi(A[M×K]·B[N×K]ᵀ + bias)` with f16 operands.
+    ///
+    /// Errors propagate as [`PeerError`]: a heuristic that finds no algo for this
+    /// (epilogue, output dtype, shape) combination returns `CUBLAS_STATUS_NOT_SUPPORTED`, and the
+    /// caller then reports "cuBLASLt does not fuse this" **as a measurement** instead of a
+    /// fabricated ratio. That is the whole mechanism behind
+    /// [`cublaslt_epilogue_support_matrix`].
+    fn new(
+        g: &mut Gpu,
+        m: usize,
+        k: usize,
+        n: usize,
+        epi: LtEpilogue,
+        out: LtOut,
+        bias: &[f32],
+    ) -> Result<Self, PeerError> {
+        // f16 leading dims are 2 bytes and cuBLASLt wants 16-byte-aligned lda/ldb => K%8; the C
+        // leading dim is N elements of 4 (f32) or 2 (f16) bytes => N%4 covers both.
+        assert!(k.is_multiple_of(8), "cuBLASLt f16 needs K%8==0 (got K={k})");
+        assert!(n.is_multiple_of(4), "cuBLASLt f16 needs N%4==0 (got N={n})");
+        if epi.needs_bias() {
+            assert_eq!(
+                bias.len(),
+                n,
+                "the bias is indexed along the rows of cuBLASLt's D, which are Wukong's N"
+            );
+        }
+        let stream = g.stream.clone();
+
+        let handle = cublaslt_result::create_handle()?;
+        let workspace = stream.alloc_zeros::<u8>(EPILOGUE_LT_WORKSPACE)?;
+        // f32 compute, f32 scale — the same accumulate width Wukong's wgmma kernel uses, so the
+        // peer is not being handed a cheaper accumulator.
+        let desc = cublaslt_result::create_matmul_desc(
+            cublaslt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cublaslt_sys::cudaDataType_t::CUDA_R_32F,
+        )?;
+
+        // The bias buffer's dtype follows D (cuBLASLt's own default rule). Allocated before the
+        // descriptor writes are done so its address is final.
+        let mut bias_f32 = None;
+        let mut bias_f16 = None;
+        if epi.needs_bias() {
+            match out {
+                LtOut::F32 => bias_f32 = Some(stream.memcpy_stod(bias)?),
+                LtOut::F16 => {
+                    let b16: Vec<f16> = bias.iter().map(|&x| f16::from_f32(x)).collect();
+                    bias_f16 = Some(stream.memcpy_stod(&b16)?);
+                }
+            }
+        }
+
+        unsafe {
+            // transa = T (Wukong's B, first operand), transb = N (Wukong's A). 1==T, 0==N as i32.
+            let op_t: i32 = 1;
+            let op_n: i32 = 0;
+            cublaslt_result::set_matmul_desc_attribute(
+                desc,
+                cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                (&op_t) as *const i32 as *const c_void,
+                core::mem::size_of::<i32>(),
+            )?;
+            cublaslt_result::set_matmul_desc_attribute(
+                desc,
+                cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                (&op_n) as *const i32 as *const c_void,
+                core::mem::size_of::<i32>(),
+            )?;
+            // The epilogue itself. `cublasLtEpilogue_t` is a u32 on the wire.
+            let epi_val = epi.as_sys() as u32;
+            cublaslt_result::set_matmul_desc_attribute(
+                desc,
+                cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+                (&epi_val) as *const u32 as *const c_void,
+                core::mem::size_of::<u32>(),
+            )?;
+            if epi.needs_bias() {
+                let (bp, _bias_guard) = match out {
+                    LtOut::F32 => bias_f32.as_ref().unwrap().device_ptr(&stream),
+                    LtOut::F16 => bias_f16.as_ref().unwrap().device_ptr(&stream),
+                };
+                cublaslt_result::set_matmul_desc_attribute(
+                    desc,
+                    cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                    (&bp) as *const _ as *const c_void,
+                    core::mem::size_of_val(&bp),
+                )?;
+                // Explicit rather than defaulted. The default IS D's dtype, so this is a no-op on a
+                // correct build — and a loud mismatch if someone later changes the buffer's type
+                // without changing this line.
+                let bias_dt = out.as_sys();
+                cublaslt_result::set_matmul_desc_attribute(
+                    desc,
+                    cublaslt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                    (&bias_dt) as *const _ as *const c_void,
+                    core::mem::size_of::<u32>(),
+                )?;
+            }
+        }
+
+        // Layouts (column-major, matrices as stored). cuBLAS A = Wukong B stored [K,N] ld=K f16;
+        // cuBLAS B = Wukong A stored [K,M] ld=K f16; C/D = Wukong C stored [N,M] ld=N at `out`.
+        let a_layout = cublaslt_result::create_matrix_layout(
+            cublaslt_sys::cudaDataType_t::CUDA_R_16F,
+            k as u64,
+            n as u64,
+            k as i64,
+        )?;
+        let b_layout = cublaslt_result::create_matrix_layout(
+            cublaslt_sys::cudaDataType_t::CUDA_R_16F,
+            k as u64,
+            m as u64,
+            k as i64,
+        )?;
+        let cd_layout =
+            cublaslt_result::create_matrix_layout(out.as_sys(), n as u64, m as u64, n as i64)?;
+
+        let pref = cublaslt_result::create_matmul_pref()?;
+        unsafe {
+            let ws = EPILOGUE_LT_WORKSPACE;
+            cublaslt_result::set_matmul_pref_attribute(
+                pref,
+                cublaslt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                (&ws) as *const usize as *const c_void,
+                core::mem::size_of::<usize>(),
+            )?;
+        }
+
+        let heuristic = unsafe {
+            cublaslt_result::get_matmul_algo_heuristic(
+                handle, desc, a_layout, b_layout, cd_layout, cd_layout, pref,
+            )?
+        };
+
+        Ok(Self {
+            handle,
+            desc,
+            a_layout,
+            b_layout,
+            cd_layout,
+            pref,
+            algo: heuristic.algo,
+            workspace,
+            _bias_f32: bias_f32,
+            _bias_f16: bias_f16,
+        })
+    }
+
+    /// One `cublasLtMatmul` on resident buffers. `b_d` is Wukong's **B** (cuBLAS operand A, `OP_T`),
+    /// `a_d` is Wukong's **A** (cuBLAS operand B, `OP_N`), `d_ptr` is Wukong's C/D. Nothing is
+    /// synced — the caller owns the warm-up/sync discipline.
+    ///
+    /// # Safety
+    /// `a_d`/`b_d` must be f16 buffers of length `m*k` and `n*k`; `d_ptr` must address `m*n`
+    /// elements of the plan's [`LtOut`] dtype and stay valid for the launch; the plan's sys objects
+    /// must be live.
+    unsafe fn run_raw(
+        &self,
+        stream: &Arc<CudaStream>,
+        b_d: &CudaSlice<f16>,
+        a_d: &CudaSlice<f16>,
+        d_ptr: u64,
+    ) -> Result<(), PeerError> {
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        let (bp, _rb) = b_d.device_ptr(stream); // cuBLAS operand A
+        let (ap, _ra) = a_d.device_ptr(stream); // cuBLAS operand B
+        let (wp, _rw) = self.workspace.device_ptr(stream);
+        cublaslt_result::matmul(
+            self.handle,
+            self.desc,
+            (&alpha) as *const f32 as *const c_void,
+            (&beta) as *const f32 as *const c_void,
+            bp as *const c_void,
+            self.a_layout,
+            ap as *const c_void,
+            self.b_layout,
+            d_ptr as *const c_void,
+            self.cd_layout,
+            d_ptr as *mut c_void,
+            self.cd_layout,
+            (&self.algo) as *const _,
+            wp as *mut c_void,
+            EPILOGUE_LT_WORKSPACE,
+            stream.cu_stream() as *mut _,
+        )?;
+        Ok(())
+    }
+}
+
+/// Run a fused-epilogue cuBLASLt GEMM once and return the result as f32 — the correctness-gate
+/// entry, and the peer column for Wave 4's bias/ReLU/GELU rows.
+///
+/// Host f32 `a`/`b` are rounded to f16 here (the price the fp16 path pays, and the same rounding
+/// [`cublas_gemm_nt_f16_f32out`] applies), so the peer multiplies the byte-identical operands Wukong
+/// does. `bias` is `n` long for the `*_BIAS` epilogues and may be empty otherwise. The result is
+/// widened to f32 when `out` is [`LtOut::F16`], so both arms are comparable against one f64
+/// reference: build it with [`fused_epilogue_reference`] over an independent GEMM, **never** by
+/// calling this function twice.
+pub fn cublaslt_gemm_nt_f16_epilogue(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    epi: LtEpilogue,
+    out: LtOut,
+) -> Result<Vec<f32>, PeerError> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    let a16: Vec<f16> = a.iter().map(|&x| f16::from_f32(x)).collect();
+    let b16: Vec<f16> = b.iter().map(|&x| f16::from_f32(x)).collect();
+    let a_d = g.stream.memcpy_stod(&a16)?;
+    let b_d = g.stream.memcpy_stod(&b16)?;
+    let plan = FusedLtPlan::new(g, m, k, n, epi, out, bias)?;
+    let stream = g.stream.clone();
+    match out {
+        LtOut::F32 => {
+            let mut d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+            {
+                // The `SyncOnDrop` guard borrows `d` mutably and must outlive the launch, so it gets
+                // its own scope: the read-back below needs the borrow released first.
+                let (dp, _rd) = d.device_ptr_mut(&stream);
+                unsafe { plan.run_raw(&stream, &b_d, &a_d, dp)? };
+            }
+            Ok(g.stream.memcpy_dtov(&d)?)
+        }
+        LtOut::F16 => {
+            let mut d = g.stream.memcpy_stod(&vec![f16::from_f32(0.0); m * n])?;
+            {
+                let (dp, _rd) = d.device_ptr_mut(&stream);
+                unsafe { plan.run_raw(&stream, &b_d, &a_d, dp)? };
+            }
+            let h: Vec<f16> = g.stream.memcpy_dtov(&d)?;
+            Ok(h.iter().map(|x| x.to_f32()).collect())
+        }
+    }
+}
+
+/// Time a fused-epilogue cuBLASLt GEMM: build the plan once (the heuristic search is host work),
+/// then `iters` resident `cublasLtMatmul` calls, one warm-up, one trailing sync. Seconds per call —
+/// the same timing shape as [`time_cublas_gemm_nt_f16_f32out`], so the two are directly comparable
+/// and `epilogue_sec - default_sec` is what the epilogue cost the library.
+///
+/// Buffers are allocated here (0.01-filled, matching [`time_cublas_gemm_nt_f16_f32out`] so
+/// denormals and NaNs cannot make one arm's clocks differ from the other's). Use
+/// [`time_cublaslt_gemm_nt_f16_epilogue_resident`] when the round needs the peer to chew the exact
+/// bytes Wukong was given.
+pub fn time_cublaslt_gemm_nt_f16_epilogue(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    epi: LtEpilogue,
+    out: LtOut,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    let a_d = g.stream.memcpy_stod(&vec![f16::from_f32(0.01); m * k])?;
+    let b_d = g.stream.memcpy_stod(&vec![f16::from_f32(0.01); n * k])?;
+    let bias = vec![0.01f32; n];
+    let plan = FusedLtPlan::new(g, m, k, n, epi, out, &bias)?;
+    let stream = g.stream.clone();
+    match out {
+        LtOut::F32 => {
+            let mut d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
+            let (dp, _rd) = d.device_ptr_mut(&stream);
+            time_lt_epilogue_loop(&plan, &stream, &b_d, &a_d, dp, iters)
+        }
+        LtOut::F16 => {
+            let mut d = g.stream.memcpy_stod(&vec![f16::from_f32(0.0); m * n])?;
+            let (dp, _rd) = d.device_ptr_mut(&stream);
+            time_lt_epilogue_loop(&plan, &stream, &b_d, &a_d, dp, iters)
+        }
+    }
+}
+
+/// [`time_cublaslt_gemm_nt_f16_epilogue`] over buffers the caller already has resident, so the peer
+/// multiplies the **identical bytes** the Wukong arm did. `d_ptr` must address `m*n` elements of
+/// `out`'s dtype.
+///
+/// # Safety
+/// `a_d`/`b_d` must hold `m*k` and `n*k` f16 elements, and `d_ptr` must address `m*n` elements of
+/// `out`'s dtype and remain valid for every launch.
+pub unsafe fn time_cublaslt_gemm_nt_f16_epilogue_resident(
+    g: &mut Gpu,
+    a_d: &CudaSlice<f16>,
+    b_d: &CudaSlice<f16>,
+    d_ptr: u64,
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    epi: LtEpilogue,
+    out: LtOut,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    assert_eq!(a_d.len(), m * k, "A is [M,K] f16");
+    assert_eq!(b_d.len(), n * k, "B is [N,K] f16");
+    let plan = FusedLtPlan::new(g, m, k, n, epi, out, bias)?;
+    let stream = g.stream.clone();
+    time_lt_epilogue_loop(&plan, &stream, b_d, a_d, d_ptr, iters)
+}
+
+/// The timing loop both fused-epilogue entries share, so the warm-up/sync discipline exists once.
+fn time_lt_epilogue_loop(
+    plan: &FusedLtPlan,
+    stream: &Arc<CudaStream>,
+    b_d: &CudaSlice<f16>,
+    a_d: &CudaSlice<f16>,
+    d_ptr: u64,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    unsafe { plan.run_raw(stream, b_d, a_d, d_ptr)? }; // warm up
+    stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe { plan.run_raw(stream, b_d, a_d, d_ptr)? };
+    }
+    stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() / iters as f64)
+}
+
+/// One cell of the fused-epilogue support matrix: can cuBLASLt run *this* epilogue at *this* output
+/// dtype on *this* device and shape?
+#[derive(Clone, Debug)]
+pub struct LtEpilogueSupport {
+    pub epilogue: &'static str,
+    pub out: &'static str,
+    pub supported: bool,
+    /// The library's own words when it declined — `CUBLAS_STATUS_NOT_SUPPORTED` is the interesting
+    /// one and means the heuristic found no algorithm for the configuration.
+    pub detail: String,
+}
+
+/// Ask cuBLASLt, per epilogue and per output dtype, whether it can fuse — and report what it said.
+///
+/// This is the measurement behind two claims Wave 4 wants to make, and it exists because both are
+/// otherwise arguments from a header file:
+///
+/// * *"cuBLASLt has no low-precision-output-plus-activation epilogue"* (plan target #2). If the
+///   `f16` column declines for `GELU_BIAS` while the `f32` column supports it, that is the claim,
+///   measured on the device the round runs on.
+/// * *"bias/relu/gelu is a GEMM-parity fight"* — the `f32` column supporting all six is what makes
+///   the refusal clause bite.
+///
+/// Cheap: the plan build is a descriptor and a heuristic query, no launch and no timing, so the
+/// whole matrix costs milliseconds. Run it in the same container as the round it annotates — a
+/// heuristic verdict is a property of the device and the library version, not a constant.
+pub fn cublaslt_epilogue_support_matrix(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Vec<LtEpilogueSupport> {
+    let bias = vec![0.0f32; n];
+    let mut rows = Vec::with_capacity(LtEpilogue::ALL.len() * 2);
+    for out in [LtOut::F32, LtOut::F16] {
+        for epi in LtEpilogue::ALL {
+            let (supported, detail) = match FusedLtPlan::new(g, m, k, n, epi, out, &bias) {
+                Ok(_) => (true, String::new()),
+                Err(e) => (false, e.to_string()),
+            };
+            rows.push(LtEpilogueSupport {
+                epilogue: epi.name(),
+                out: out.name(),
+                supported,
+                detail,
+            });
+        }
+    }
+    rows
+}
+
+/// Can cuBLASLt fuse this epilogue at this output dtype and shape? The one-cell form of
+/// [`cublaslt_epilogue_support_matrix`], for a gate that wants to skip honestly rather than fail.
+pub fn cublaslt_epilogue_available(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    epi: LtEpilogue,
+    out: LtOut,
+) -> bool {
+    let bias = vec![0.0f32; n];
+    FusedLtPlan::new(g, m, k, n, epi, out, &bias).is_ok()
+}
+
 // ===================================================================================================
 // Tier B — cuDNN conv2d (the gold-standard convolution peer). fp16 NHWC tensor-core fast path.
 // ===================================================================================================
@@ -4483,5 +5246,202 @@ mod tests {
                 "S=4096 D=64: plan and bare entry must differ (else this gate proves nothing)"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The cuBLASLt fused-epilogue peer. Every gate below is **device-free** -- descriptor
+    // arithmetic, the enum ABI and the host reference -- so they run wherever the crate compiles
+    // with `--features gpu`, with or without a card. The launch paths are exercised by the
+    // Wave-4 device gates.
+    // -----------------------------------------------------------------------------------------
+
+    /// **The claim-deleting law.** cuBLASLt's fusable set is exactly the sixteen values of
+    /// `cublasLtEpilogue_t`, and Wave 4 is refused any bias/relu/gelu "fusion win" precisely
+    /// because they are in it. The table is what a write-up quotes, so it is pinned to the real
+    /// enum value by value -- a cudarc binding bump that renumbered or dropped one would otherwise
+    /// leave the prose correct and the peer measuring something else.
+    #[test]
+    fn the_cublaslt_fusable_set_is_exactly_these_sixteen() {
+        use cudarc::cublaslt::sys::cublasLtEpilogue_t as E;
+        let real: [(&str, u32); 16] = [
+            ("DEFAULT", E::CUBLASLT_EPILOGUE_DEFAULT as u32),
+            ("RELU", E::CUBLASLT_EPILOGUE_RELU as u32),
+            ("BIAS", E::CUBLASLT_EPILOGUE_BIAS as u32),
+            ("RELU_BIAS", E::CUBLASLT_EPILOGUE_RELU_BIAS as u32),
+            ("GELU", E::CUBLASLT_EPILOGUE_GELU as u32),
+            ("GELU_BIAS", E::CUBLASLT_EPILOGUE_GELU_BIAS as u32),
+            ("RELU_AUX", E::CUBLASLT_EPILOGUE_RELU_AUX as u32),
+            ("RELU_AUX_BIAS", E::CUBLASLT_EPILOGUE_RELU_AUX_BIAS as u32),
+            ("DRELU", E::CUBLASLT_EPILOGUE_DRELU as u32),
+            ("DRELU_BGRAD", E::CUBLASLT_EPILOGUE_DRELU_BGRAD as u32),
+            ("GELU_AUX", E::CUBLASLT_EPILOGUE_GELU_AUX as u32),
+            ("GELU_AUX_BIAS", E::CUBLASLT_EPILOGUE_GELU_AUX_BIAS as u32),
+            ("DGELU", E::CUBLASLT_EPILOGUE_DGELU as u32),
+            ("DGELU_BGRAD", E::CUBLASLT_EPILOGUE_DGELU_BGRAD as u32),
+            ("BGRADA", E::CUBLASLT_EPILOGUE_BGRADA as u32),
+            ("BGRADB", E::CUBLASLT_EPILOGUE_BGRADB as u32),
+        ];
+        let mut doc = super::CUBLASLT_FUSABLE_EPILOGUES.to_vec();
+        let mut got = real.to_vec();
+        doc.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(
+            doc, got,
+            "CUBLASLT_FUSABLE_EPILOGUES has drifted from cudarc's cublasLtEpilogue_t. That table is \
+             the published statement of what the library can fuse; if it is wrong, so is every \
+             Wave-4 refusal that cites it."
+        );
+
+        // What is ABSENT is the other half of the claim, and it is the half Wave 4 publishes wins
+        // from: no SiLU/swish, and no member combining a low-precision output with an activation.
+        for banned in ["SILU", "SWISH", "RESIDUAL", "F16", "BF16", "FP8"] {
+            assert!(
+                !super::CUBLASLT_FUSABLE_EPILOGUES
+                    .iter()
+                    .any(|(n, _)| n.contains(banned)),
+                "{banned} appears in the fusable set -- if cuBLASLt really gained it, the plan's \
+                 'no library peer exists for this fusion' targets need re-deriving, not this test \
+                 relaxing."
+            );
+        }
+    }
+
+    /// Every epilogue this peer runs maps to the enum value CUDA documents, and `parse` is total in
+    /// both directions. A typo that silently meant `DEFAULT` would time a plain GEMM and label it
+    /// `GELU_BIAS` -- the peer-side twin of a silent skip.
+    #[test]
+    fn lt_epilogue_maps_to_the_documented_enum_and_round_trips() {
+        use super::LtEpilogue;
+        let want = [
+            (LtEpilogue::None, "DEFAULT", 1u32),
+            (LtEpilogue::Relu, "RELU", 2),
+            (LtEpilogue::Bias, "BIAS", 4),
+            (LtEpilogue::ReluBias, "RELU_BIAS", 6),
+            (LtEpilogue::Gelu, "GELU", 32),
+            (LtEpilogue::GeluBias, "GELU_BIAS", 36),
+        ];
+        for (epi, name, value) in want {
+            assert_eq!(epi.name(), name);
+            assert_eq!(epi.as_sys() as u32, value, "{name} has the wrong ABI value");
+            assert_eq!(LtEpilogue::parse(name), Ok(epi));
+            assert_eq!(
+                LtEpilogue::parse(&format!("cublaslt_epilogue_{}", name.to_ascii_lowercase())),
+                Ok(epi),
+                "the CUDA spelling must parse too -- that is what a doc reader will type"
+            );
+            // Every runnable epilogue must be a member of the published fusable set.
+            assert!(
+                super::CUBLASLT_FUSABLE_EPILOGUES
+                    .iter()
+                    .any(|(n, v)| *n == name && *v == value),
+                "{name} is not in CUBLASLT_FUSABLE_EPILOGUES"
+            );
+        }
+        assert_eq!(LtEpilogue::ALL.len(), want.len());
+        assert!(
+            LtEpilogue::parse("silu").is_err(),
+            "cuBLASLt has no SiLU epilogue"
+        );
+        let err = LtEpilogue::parse("gelu_biass").unwrap_err();
+        assert!(
+            err.contains("GELU_BIAS"),
+            "the error must name the accepted set: {err}"
+        );
+        for epi in LtEpilogue::ALL {
+            assert_eq!(
+                epi.needs_bias(),
+                epi.name().contains("BIAS"),
+                "{}: needs_bias must follow the enum name, or the BIAS_POINTER is either missing \
+                 (a device null dereference) or set for an epilogue that ignores it",
+                epi.name()
+            );
+        }
+    }
+
+    /// **The transposed-mapping trap.** cuBLASLt applies its bias along the rows of *its* D, and
+    /// under `C^T = B^T*A` those rows are Wukong's N -- so the reference must index the bias by the
+    /// output COLUMN. Indexing by the row instead produces a full, plausible matrix that is wrong
+    /// everywhere off the diagonal, which no tolerance gate reads as a transpose bug.
+    #[test]
+    fn the_fused_reference_adds_bias_along_n_not_m() {
+        use super::{fused_epilogue_reference, LtEpilogue};
+        // C is 2x3, all zeros, so the output IS the bias broadcast.
+        let c = vec![0.0f32; 6];
+        let bias = vec![1.0f32, 2.0, 3.0];
+        let got = fused_epilogue_reference(&c, &bias, 2, 3, LtEpilogue::Bias, true);
+        assert_eq!(got, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+
+        // ReLU clamps after the bias, not before.
+        let c = vec![-0.5f32, -0.5, -0.5, 10.0, 10.0, 10.0];
+        let bias = vec![1.0f32, 0.0, -20.0];
+        let got = fused_epilogue_reference(&c, &bias, 2, 3, LtEpilogue::ReluBias, true);
+        assert_eq!(got, vec![0.5, 0.0, 0.0, 11.0, 10.0, 0.0]);
+
+        // The control applies nothing at all, which is what makes it a control.
+        let c = vec![-1.0f32, 2.0, -3.0, 4.0];
+        assert_eq!(
+            fused_epilogue_reference(&c, &[], 2, 2, LtEpilogue::None, true),
+            c
+        );
+        assert_eq!(
+            fused_epilogue_reference(&c, &[], 2, 2, LtEpilogue::Relu, true),
+            vec![0.0, 2.0, 0.0, 4.0]
+        );
+    }
+
+    /// The two GELU conventions are **not** interchangeable, and the gap is three orders above an
+    /// f16 GEMM's tolerance band -- so a fused-GELU gate written against the wrong one fails on a
+    /// perfectly good peer. This pins both formulas and the size of the gap, so the next person to
+    /// see a near-miss has the answer in a test name instead of in a bisect.
+    #[test]
+    fn the_two_gelu_conventions_are_distinguishable_and_pinned() {
+        use super::{gelu_erf_f64, gelu_tanh_f64};
+        // Exact at 0, and asymptotic to x and 0 at the tails, for both forms.
+        for f in [
+            gelu_tanh_f64 as fn(f64) -> f64,
+            gelu_erf_f64 as fn(f64) -> f64,
+        ] {
+            assert!(f(0.0).abs() < 1e-12);
+            assert!((f(8.0) - 8.0).abs() < 1e-9, "gelu(8) ~ 8");
+            assert!(f(-8.0).abs() < 1e-9, "gelu(-8) ~ 0");
+            assert!(
+                (f(1.0) - 0.8413).abs() < 2e-3,
+                "gelu(1) ~ 0.8413, got {}",
+                f(1.0)
+            );
+        }
+        // The erf fit is only used to TELL THE TWO APART, so its own accuracy has to be well below
+        // their separation. Known value: 0.5*(-2)*(1+erf(-sqrt(2))) = -0.045500...
+        assert!(
+            (gelu_erf_f64(-2.0) - (-0.045_500_263_896_358_39)).abs() < 1e-9,
+            "the erf fit drifted: {}",
+            gelu_erf_f64(-2.0)
+        );
+        let gap = (0..=40)
+            .map(|i| {
+                let x = -2.0 + 0.1 * i as f64;
+                (gelu_tanh_f64(x) - gelu_erf_f64(x)).abs()
+            })
+            .fold(0.0f64, f64::max);
+        assert!(
+            gap > 1e-4,
+            "tanh- and erf-GELU differ by only {gap:e}; if they were this close the convention \
+             would not matter, and this test exists because it does"
+        );
+        assert!(gap < 1e-2, "the gap should be ~1e-3, not {gap:e}");
+    }
+
+    /// The output dtype is part of the peer's identity, not a formatting detail: the f16 arm halves
+    /// the epilogue write and is the arm plan target #2 is scored against.
+    #[test]
+    fn lt_out_names_and_types_are_the_cuda_ones() {
+        use super::LtOut;
+        assert_eq!(LtOut::F32.name(), "f32");
+        assert_eq!(LtOut::F16.name(), "f16");
+        assert_ne!(
+            LtOut::F32.name(),
+            LtOut::F16.name(),
+            "a round log must be able to tell the two output arms apart"
+        );
     }
 }
