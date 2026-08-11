@@ -453,9 +453,53 @@ pub struct FieldVerdict {
     pub control_gap: Option<f64>,
     /// `B/A - 1` — the effect.
     pub effect: Option<f64>,
+    /// **The CONTENDER's own run-to-run spread** (guard G16): `(max - min) / median` over arm `B`'s
+    /// recorded rounds.
+    ///
+    /// The floor above is `C/A`, and arms `A` and `C` are the *same peer called twice*, so the floor
+    /// is the **denominator's** noise and says nothing at all about ours. A contender that is itself
+    /// unstable — a work-stealing schedule, a cache-hint arm whose residency depends on what ran
+    /// before it, an autotuner that picks differently between rounds — can clear a 0.04% peer floor
+    /// while its own rounds disagree by 5%, and the round would publish the difference as a result.
+    ///
+    /// `(max - min) / median` rather than a standard deviation: with five rounds a range is the
+    /// honest statistic, it is what a reader can check against the printed samples, and it cannot be
+    /// made to look small by an outlier the way a mean can.
+    pub b_spread: Option<f64>,
     /// Did this field contribute to the floor?
     pub live: bool,
     pub cell: Cell,
+}
+
+/// **The threshold an effect must clear to be a `Moved`**: the worse of the denominator's noise
+/// (`floor`) and the contender's own (`b_spread`).
+///
+/// One function, so the cell decision, the publish gate and the printed table cannot disagree about
+/// what "resolved" means.
+pub fn resolution_threshold(floor: Option<f64>, b_spread: Option<f64>) -> Option<f64> {
+    match (floor, b_spread) {
+        (Some(f), Some(s)) => Some(f.max(s)),
+        (Some(f), None) => Some(f),
+        (None, s) => s,
+    }
+}
+
+/// `(max - min) / median` over a sample vector — the dispersion [`FieldVerdict::b_spread`] carries.
+/// `None` for an empty vector, a non-finite sample or a non-positive median.
+pub fn spread(xs: &[f64]) -> Option<f64> {
+    if xs.is_empty() || xs.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    let med = median(xs)?;
+    if med <= 0.0 {
+        return None;
+    }
+    let (lo, hi) = xs
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &x| {
+            (l.min(x), h.max(x))
+        });
+    Some((hi - lo) / med)
 }
 
 /// A whole bench's verdict: the measured floor, every field, and whether the gate is open.
@@ -475,7 +519,13 @@ pub struct BenchVerdict {
     pub rounds: usize,
     /// `max |C/A - 1|` over the live fields — **this round's own noise floor**. `None` when no field
     /// was live, which is itself a refusal: a round with no working control publishes nothing.
+    ///
+    /// It is the **denominator's** noise: arms `A` and `C` are the peer called twice. See
+    /// [`BenchVerdict::dispersion`] for ours.
     pub floor: Option<f64>,
+    /// `max` [`FieldVerdict::b_spread`] over the live fields — **the contender's own run-to-run
+    /// spread** (guard G16). `None` for a control-only round.
+    pub dispersion: Option<f64>,
     pub fields: Vec<FieldVerdict>,
     /// Arms `A` and `C` produced element-wise identical sample vectors on every live field. Two real
     /// timings are never bit-identical, so this means the arms are the same object — the GPU
@@ -538,6 +588,7 @@ pub fn analyze(samples: &BenchSamples, bar: f64) -> BenchVerdict {
             b,
             control_gap,
             effect,
+            b_spread: if bad_len { None } else { spread(bv) },
             live,
             cell: Cell::Degenerate, // provisional; decided below, once the floor is known
         });
@@ -560,6 +611,17 @@ pub fn analyze(samples: &BenchSamples, bar: f64) -> BenchVerdict {
             .all(|n| samples.samples(n, Arm::Baseline) == samples.samples(n, Arm::Control));
 
     let resolved = matches!(floor, Some(fl) if fl <= bar);
+    // **Guard G16.** The contender's own spread is a per-field fact, so the widest one over the live
+    // fields is what the round is judged on, exactly as the floor is.
+    let dispersion = fields
+        .iter()
+        .filter(|f| f.live)
+        .filter_map(|f| f.b_spread)
+        .fold(None::<f64>, |acc, g| Some(acc.map_or(g, |m: f64| m.max(g))));
+    let contender_resolved = match dispersion {
+        Some(d) => d <= bar,
+        None => true, // no contender arm at all; `has_contender` is what reports that
+    };
     for (fv, why) in fields.iter_mut().zip(flags) {
         let bv_len = samples.samples(&fv.field, Arm::Contender).len();
         fv.cell = if why.bad_len {
@@ -572,12 +634,14 @@ pub fn analyze(samples: &BenchSamples, bar: f64) -> BenchVerdict {
             Cell::Degenerate
         } else if bv_len == 0 || fv.effect.is_none() {
             Cell::NoContender
-        } else if !resolved {
+        } else if !resolved || !contender_resolved {
             Cell::Unresolved
         } else {
-            let fl = floor.expect("resolved implies Some");
+            // The effect must clear the WORSE of the two noises. Comparing it to the peer's spread
+            // alone is how a gain inside the contender's own run-to-run variation gets published.
+            let th = resolution_threshold(floor, fv.b_spread).expect("resolved implies Some");
             let e = fv.effect.expect("checked above");
-            if e.abs() <= fl {
+            if e.abs() <= th {
                 Cell::Tie
             } else {
                 Cell::Moved
@@ -617,6 +681,14 @@ pub fn analyze(samples: &BenchSamples, bar: f64) -> BenchVerdict {
             floor: floor.unwrap_or(f64::NAN),
             bar,
         })
+    } else if !contender_resolved {
+        // Deliberately AFTER `FloorAboveBar`: when both noises are too wide the denominator's is the
+        // one to fix first (it is shared by every row of the round), and reporting the contender's
+        // would send a reader to tune a kernel whose instrument is broken.
+        Some(Refusal::ContenderDispersion {
+            dispersion: dispersion.unwrap_or(f64::NAN),
+            bar,
+        })
     } else {
         None
     };
@@ -626,6 +698,7 @@ pub fn analyze(samples: &BenchSamples, bar: f64) -> BenchVerdict {
         bar,
         rounds,
         floor,
+        dispersion,
         fields,
         aliased,
         blocked,
@@ -646,11 +719,17 @@ impl BenchVerdict {
             Some(f) => format!("{:+.2}%", f * 100.0),
             None => "n/a".to_string(),
         };
+        let disp = match self.dispersion {
+            Some(d) => format!("{:+.2}%", d * 100.0),
+            None => "n/a".to_string(),
+        };
         let _ = writeln!(
             s,
-            "bench {}: floor {} (bar +/-{:.2}%), median of {} rounds{}",
+            "bench {}: floor {} (peer A-vs-C), contender spread {} (ours), bar +/-{:.2}%, median of \
+             {} rounds{}",
             self.bench,
             floor,
+            disp,
             self.bar * 100.0,
             self.rounds,
             match &self.blocked {
@@ -660,8 +739,8 @@ impl BenchVerdict {
         );
         let _ = writeln!(
             s,
-            "  {:<24} {:>14} {:>14} {:>14} {:>10} {:>10}  verdict",
-            "field", "A", "C", "B", "C/A-1", "B/A-1"
+            "  {:<24} {:>14} {:>14} {:>14} {:>10} {:>10} {:>10}  verdict",
+            "field", "A", "C", "B", "C/A-1", "B/A-1", "B spread"
         );
         for f in &self.fields {
             let num = |v: Option<f64>| match v {
@@ -674,13 +753,14 @@ impl BenchVerdict {
             };
             let _ = writeln!(
                 s,
-                "  {:<24} {:>14} {:>14} {:>14} {:>10} {:>10}  {}{}",
+                "  {:<24} {:>14} {:>14} {:>14} {:>10} {:>10} {:>10}  {}{}",
                 f.field,
                 num(f.a),
                 num(f.c),
                 num(f.b),
                 pct(f.control_gap),
                 pct(f.effect),
+                pct(f.b_spread),
                 f.cell,
                 if f.live { "" } else { " (not in floor)" }
             );
@@ -713,6 +793,9 @@ pub enum Refusal {
     NoControl,
     /// The measured floor exceeded the pre-registered bar.
     FloorAboveBar { floor: f64, bar: f64 },
+    /// **The CONTENDER's own run-to-run spread exceeded the bar** (guard G16). The peer's floor can
+    /// be immaculate and this still fire: they are different noises, and only one of them is ours.
+    ContenderDispersion { dispersion: f64, bar: f64 },
     /// A control-only round: there is no contender to publish.
     NoContenderArm,
     /// Asked to publish a field the bench never measured.
@@ -761,6 +844,16 @@ impl fmt::Display for Refusal {
                 "control floor +/-{:.2}% exceeds the pre-registered bar +/-{:.2}% — this round \
                  cannot resolve the effect; re-run rather than reporting a wide tie as a tie",
                 floor * 100.0,
+                bar * 100.0
+            ),
+            Refusal::ContenderDispersion { dispersion, bar } => write!(
+                f,
+                "the CONTENDER's own run-to-run spread is +/-{:.2}% (bar +/-{:.2}%) — arms A and C \
+                 are the same peer called twice, so the control floor measures the DENOMINATOR's \
+                 noise and says nothing about ours. A gain inside this spread is not a gain; \
+                 stabilise the contender (pin the config, warm the caches, check for an autotuner \
+                 re-deciding between rounds) and re-run",
+                dispersion * 100.0,
                 bar * 100.0
             ),
             Refusal::NoContenderArm => write!(
@@ -1340,6 +1433,7 @@ pub struct Published {
     contender: f64,
     ratio: f64,
     floor: f64,
+    dispersion: Option<f64>,
     rounds: usize,
     cell: Cell,
 }
@@ -1363,9 +1457,17 @@ impl Published {
     pub fn ratio(&self) -> f64 {
         self.ratio
     }
-    /// The round's measured floor, which this number cleared.
+    /// The round's measured floor — the **peer's** A-vs-C spread — which this number cleared.
     pub fn floor(&self) -> f64 {
         self.floor
+    }
+    /// The **contender's own** run-to-run spread (guard G16), which this number also cleared.
+    pub fn dispersion(&self) -> Option<f64> {
+        self.dispersion
+    }
+    /// The threshold this number actually had to beat: the worse of the two noises.
+    pub fn threshold(&self) -> f64 {
+        resolution_threshold(Some(self.floor), self.dispersion).unwrap_or(self.floor)
     }
     pub fn is_tie(&self) -> bool {
         self.cell == Cell::Tie
@@ -1376,13 +1478,17 @@ impl fmt::Display for Published {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} {:.6} -> {:.6}  ({:.4}x, {}, floor +/-{:.2}%, median of {})",
+            "{} {:.6} -> {:.6}  ({:.4}x, {}, floor +/-{:.2}%, ours +/-{}, median of {})",
             self.field,
             self.baseline,
             self.contender,
             self.ratio,
             self.cell,
             self.floor * 100.0,
+            match self.dispersion {
+                Some(d) => format!("{:.2}%", d * 100.0),
+                None => "n/a".to_string(),
+            },
             self.rounds
         )
     }
@@ -1500,6 +1606,7 @@ impl Round {
             contender: b,
             ratio: b / a,
             floor,
+            dispersion: fv.b_spread,
             rounds: v.rounds,
             cell: fv.cell,
         })
@@ -2207,6 +2314,131 @@ mod tests {
         assert_eq!(con_calls, 4);
         assert_eq!(s.samples("ms", Arm::Baseline), &[10.0, 10.0, 10.0]);
         assert_eq!(s.samples("ms", Arm::Contender), &[9.0, 9.0, 9.0]);
+    }
+
+    // --- guard G16: the contender's own dispersion ----------------------------------------------
+
+    #[test]
+    fn spread_is_the_range_over_the_median_and_refuses_the_unusable() {
+        assert_eq!(spread(&[10.0, 10.0, 10.0]), Some(0.0));
+        assert_eq!(spread(&[9.0, 10.0, 11.0]), Some(0.2));
+        assert_eq!(spread(&[]), None);
+        assert_eq!(spread(&[1.0, f64::NAN]), None);
+        assert_eq!(
+            spread(&[0.0, 0.0]),
+            None,
+            "a zero median is not a denominator"
+        );
+        assert_eq!(spread(&[-1.0, -2.0]), None);
+        // The threshold is the WORSE of the two, and either may be absent.
+        assert_eq!(resolution_threshold(Some(0.01), Some(0.05)), Some(0.05));
+        assert_eq!(resolution_threshold(Some(0.07), Some(0.05)), Some(0.07));
+        assert_eq!(resolution_threshold(Some(0.01), None), Some(0.01));
+        assert_eq!(resolution_threshold(None, Some(0.02)), Some(0.02));
+        assert_eq!(resolution_threshold(None, None), None);
+    }
+
+    /// **The failure G16 exists for**: a spotless peer floor, a contender whose own rounds disagree
+    /// by more than the effect, and — before this guard — a published "win".
+    #[test]
+    fn a_gain_inside_the_contenders_own_spread_publishes_nothing() {
+        // A and C are the peer twice: 0.1% apart, a beautiful floor. B's median is 3% better than A,
+        // but B's own five rounds range over 8%.
+        let s = samples_of(
+            "flaky-contender",
+            5,
+            &[(
+                "ms",
+                vec![10.00, 10.00, 10.00, 10.00, 10.00],
+                vec![10.01, 10.01, 10.01, 10.01, 10.01],
+                vec![9.30, 9.70, 9.70, 9.90, 10.06],
+            )],
+        );
+        let v = analyze(&s, 0.05);
+        let f = v.field("ms").unwrap();
+        assert!(
+            v.floor.unwrap() < 0.002,
+            "the DENOMINATOR's noise is tiny, which is exactly what makes this trap work: {:?}",
+            v.floor
+        );
+        let d = v.dispersion.expect("the contender has a spread");
+        assert!(
+            d > 0.05,
+            "the contender's own range is {d}, which must exceed the +/-5% bar"
+        );
+        assert!(
+            matches!(v.blocked, Some(Refusal::ContenderDispersion { .. })),
+            "the round must refuse on OUR noise, not the peer's: {:?}",
+            v.blocked
+        );
+        assert_eq!(f.cell, Cell::Unresolved);
+        let r = open_ok("flaky-contender");
+        assert!(r.publish(&v, "ms").is_err());
+        // ...and the refusal names the fix rather than just the number.
+        let msg = v.blocked.unwrap().to_string();
+        assert!(msg.contains("CONTENDER"), "{msg}");
+        assert!(msg.contains("stabilise"), "{msg}");
+    }
+
+    /// A contender that is stable but whose *effect* is smaller than its own spread is a `Tie`, not
+    /// a `Moved`: the round resolves, and the answer is "no difference we can see".
+    #[test]
+    fn an_effect_smaller_than_the_contenders_spread_is_a_tie_not_a_move() {
+        let s = samples_of(
+            "small-effect",
+            5,
+            &[(
+                "ms",
+                vec![10.00, 10.00, 10.00, 10.00, 10.00],
+                vec![10.01, 10.01, 10.01, 10.01, 10.01],
+                // median 9.90 (a 1.0% "gain") with a 3% own range: inside its own noise.
+                vec![9.75, 9.85, 9.90, 9.95, 10.05],
+            )],
+        );
+        let v = analyze(&s, 0.05);
+        let f = v.field("ms").unwrap();
+        assert!(
+            v.blocked.is_none(),
+            "both noises clear the bar: {:?}",
+            v.blocked
+        );
+        assert!(f.effect.unwrap().abs() < f.b_spread.unwrap());
+        assert_eq!(
+            f.cell,
+            Cell::Tie,
+            "a 1% effect inside a 3% contender spread is a tie, not a move"
+        );
+        let r = open_ok("small-effect");
+        let p = r.publish(&v, "ms").expect("a tie is publishable, as a tie");
+        assert!(p.is_tie());
+        assert!(p.dispersion().unwrap() > p.floor());
+        assert_eq!(p.threshold(), p.dispersion().unwrap());
+    }
+
+    /// The instrument's own history: with arms A and C both the peer, the floor is the denominator's
+    /// spread ONLY. This pins the distinction in numbers so the two can never be conflated again.
+    #[test]
+    fn the_floor_and_the_dispersion_measure_different_things() {
+        let s = samples_of(
+            "two-noises",
+            5,
+            &[(
+                "ms",
+                vec![10.0, 10.2, 10.4, 10.1, 10.3], // peer, ~4% range
+                vec![10.05, 10.25, 10.45, 10.15, 10.35],
+                vec![5.0, 5.0, 5.0, 5.0, 5.0], // contender, perfectly stable, 2x faster
+            )],
+        );
+        let v = analyze(&s, 0.05);
+        let f = v.field("ms").unwrap();
+        assert_eq!(f.b_spread, Some(0.0), "a stable contender has zero spread");
+        assert!(v.floor.unwrap() > 0.0, "the peer's own noise is not zero");
+        assert_eq!(f.cell, Cell::Moved);
+        // The table prints both, side by side, so a reader never has to ask which is which.
+        let t = v.table();
+        assert!(t.contains("contender spread"), "{t}");
+        assert!(t.contains("B spread"), "{t}");
+        assert!(t.is_ascii());
     }
 
     // --- the publish gate ---------------------------------------------------------------------
