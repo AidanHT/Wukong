@@ -51,6 +51,46 @@ denominator). **Setup demand (Wave 3's): lock the SM clock if the container perm
 otherwise record `clocks.sm` per arm — the round-3 provenance reads UNKNOWN and that unknown is
 the width of the cost model's uncertainty band.**
 
+### WAVE-2 VISIT RESULTS (2026-08-11, ~$1.0 total) — the manifest above RAN; these supersede its predictions
+
+Source: `bench/gpu/h100/2026-08-11-h100-w2-r1..r12*.log` (12 rounds, one container).
+
+**New measured baseline, shipped rule, % of cuBLAS.** f16 (f32 out): sq2048 **95.3** / sq4096
+**88.6** / sq8192 **92.3** / gpt_d1024_up **80.3** / gpt_d1024_down **97.3** / gpt_d4096_up
+**73.4**. sq1024 is REFUSED — the peer's own dispersion floor is +/-15.47%, wider than any effect
+we could claim. bf16 under the transferred rule: 49.5 / 94.0 / 89.0 / 91.9 / 80.0 / 95.4 / 73.2 —
+agrees with f16 within ~2 pts everywhere the shapes overlap, so the rule transfers across dtype.
+**Suite mean 61.5% → ~87.9%.**
+
+**Mechanism ledger (what moved it, and what did not):**
+- **v2 stores: +25.2 / +15.3 / +10.1 pts. SHIPPED, both dtypes** (`fd41ebf`, `a1e3cd8`). This is
+  the whole of the jump; the epilogue's issue cost was the binding term, as predicted.
+- **Evict hints: a publishable null.** Measured, no effect, recorded as such — do not re-run.
+- **nostore diagnostic: 114.0 / 101.1 / 101.8%.** The mainloop is at or ABOVE the peer already.
+  Everything still owed is epilogue + wave overhead, not the inner loop.
+- **K-sweep: the scalar epilogue is 17.7 us at M=N=2048** (intercepts 22.33 vs 4.68), which prices
+  the v2 win directly instead of inferring it from two shapes.
+- **`hbm_bandwidth`, the campaign's FIRST H100 run: copy 2922 GB/s = 87.2% of the 3352 GB/s spec
+  peak.** W4's provisional 3.0 TB/s denominator was within 3% — the break-even table stands, now
+  MEASURED rather than assumed.
+- **int8: the Ada tuning does NOT transfer** — 22-52% of IMMA on Hopper. int8 needs its own tile
+  search, which is a wave, not an arm.
+- **int4: no bindable library peer exists.** Documented as a lead, not a headline (consistent with
+  wgmma having no int4 shape).
+- **Fused dequant BEATS the cuBLAS chain 1.08-1.15x** — the fusion thesis survives contact.
+- **cuBLASLt fuses RELU/GELU/BIAS at BOTH f32 and f16 out** — W4's target #2 premise is REFUTED.
+  **SiLU is absent from the enum**, so W4's top target (`silu(x·Wᵀ+b)` at gpt_d1024_up) stands.
+- **Instrument:** clock lock was REFUSED in the container (recorded per Wave 3's demand); one bf16
+  round SELF-REFUSED on +6.82% SM-clock drift (`r11a`). The refusal machinery works.
+
+**Consequences per wave.**
+- **WAVE 3** now starts from **87.9%, not 61.5%**. Its dossier's projections were derived pre-v2 —
+  **re-derive every effect size against the new floor before executing.** The lever RANKING is
+  unchanged: persistence > raster > per-shape dispatch, mainloop drain still zero.
+- **WAVE 4**'s break-evens are now priced by a **measured 2.92 TB/s**, and its epilogue target list
+  shrinks to SiLU (+ the fused-dequant win, already 1.08-1.15x over the chain).
+- **WAVE 5** splits: **int8 on Hopper is a wave of its own**, not an arm of the 8-bit wave.
+
 ---
 
 ## WAVE C1 — Cluster axis + config sweep (LANDED 2026-08-10, r3 measured — see amendment) — MUST
