@@ -722,8 +722,17 @@ store is a *sticky* `CUDA_ERROR_MISALIGNED_ADDRESS` that fails every later call 
 rather than returning a wrong number. `gemm_nt_wgmma` asserts it only in its timing sibling, so the
 driver decides it before the call. The route changes arithmetic class (the wgmma family converts both
 operands to f16 on the host and accumulates in f32), which is inside the CPU↔GPU tolerance contract
-but is not invisible — the driver's device gate sizes its band from the route rather than the device.
-`WUKONG_GPU_NO_WGMMA=1` forces the pre-Hopper path in the same binary, for a one-build A/B.
+but is not invisible — the driver's device gate sizes its band from the route that **actually ran**.
+The distinction matters because a decline is silent by design: `gemm_route_for(cc, off)` never sees a
+shape, so on a Hopper part it answers `Wgmma` for every call including the declined ones, and
+`GpuAccel::calls` is bumped identically by both arms. So the seam keeps a witness — per-route
+counters `gemm_wgmma_calls` / `gemm_existing_calls`, read by `gemm_route_taken()` — the band is
+chosen from *that*, and the Hopper gate asserts every offload took the route it claims to measure.
+Without it, a run in which `gemm_nt_wgmma` declined at launch (an unencodable tensor map, a
+`wgmma_module` `UNSUPPORTED`) measures `gpu::gemm_nt` and reports it as wgmma, with the f32 result
+comfortably inside an f16 band. `WUKONG_GPU_NO_WGMMA=1` forces the pre-Hopper path in the same
+binary, for a one-build A/B; `WUKONG_GPU_ROUTE_LOG=1` prints the route and the decline reason for
+every dispatch.
 
 Everything on that path *up to* the launch — the route, the config the seam selects, every decline,
 and the `LaunchPlan` the config yields — is a pure function of the shape and the probed capability,
