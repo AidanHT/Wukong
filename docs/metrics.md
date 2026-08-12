@@ -124,7 +124,7 @@ Current standing (recorded):
   (**61.7%**, `2026-08-10-h100-act2-wgmma-vs-cublas.log`), so the f16 pair is **cross-visit**. Either
   suite-level move also carries the
   B-multicast cluster at four of the seven shapes, so it is not a single-axis number. A store-elided *diagnostic* arm (writes
-  no C, ungateable, read only as a difference against the **clustered** arm it was cut from) sits at
+  no C, ungateable, read only as a difference against the **clustered scalar** arm it was cut from) sits at
   **114.0 / 101.1 / 101.8%** **at the three square shapes it was run on — and nowhere else**, so the
   mainloop is at or above the peer *there* and what is still owed *there* is epilogue plus wave
   overhead. Where the gap sits on the three `gpt_*` FFN shapes, including the 73.4% worst row, is
@@ -324,8 +324,14 @@ Remaining, ranked:
 2. **The H100 GEMM epilogue and wave overhead** — the measured Hopper gap, and the only one whose
    location is *partly* isolated. **Scope the diagnostic to where it ran:** the store-elided arm
    exists at exactly three shapes — sq2048 / sq4096 / sq8192, at 114.0 / 101.1 / 101.8% of cuBLAS —
-   and it is the *clustered* `..._s4_mcb2_v2` arm, so it reads as a difference against that arm's own
-   87.4 / 88.7 / 92.0%. At sq4096 and sq8192 the clustered arm is what ships and the conclusion
+   and it is the *clustered* `..._s4_mcb2` arm with its stores elided, which is the reference both
+   `r3-config-sweep.log` and the generator name (`{ epilogue: ElidedDiagnostic, ..WGMMA_W1_MCB }`).
+   Against that scalar arm's 62.2 / 73.4 / 81.9% it prices the *scalar* epilogue at 51.8 / 27.7 / 19.9
+   points; `BENCHMARKS.md` additionally reads it against the shipped `_v2` arm's 87.4 / 88.7 / 92.0%
+   for 26.6 / 12.4 / 9.8 — a pairing no log prints, sound because `WGMMA_W1_MCB_V2` differs from
+   `WGMMA_W1_MCB` only in the `epilogue` field, and checkable because the two decompositions differ by
+   exactly the store's measured +25.2 / +15.3 / +10.1.
+   At sq4096 and sq8192 the clustered arm is what ships and the conclusion
    carries: the mainloop is at or above the peer, so the **11.4 and 7.7 points** still owed on those
    two published rows are epilogue plus wave overhead, not the inner loop. **The two FFN endpoints of
    the old "3–27 points" range —
