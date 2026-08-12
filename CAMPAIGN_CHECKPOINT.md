@@ -72,19 +72,23 @@ Suite mean went **61.5% → ~87.9%** in one wave; the single lever was the v2 st
 
 ## In flight at the checkpoint (resume these first)
 
-1. **Wave 3 implementation** — agent worktree under `.claude/worktrees/` on branch
-   `gpu/wave3-schedule` (check `git branch --list 'gpu/wave3*'` and `git worktree list`).
-   Scope per `docs/gpu/derive/WAVE3_DOSSIER.md`, ranked: (1) raster GROUP_M=16 TALL applied to
-   the CLUSTER index + bijection law G5, (2) persistent clusters (iterate CLUSTERS not CTAs;
-   per-tile `%kt` reset = G19), (3) 128x64 tile dispatch for sq1024. The drain is budgeted ZERO —
-   do not implement. If the branch has commits, continue from them; if the worktree holds
-   uncommitted work, inspect before discarding. Merge only behind the full five-part gate, then:
-   census → release refresh (`::build --release`, then `::build`) → one H100 visit
-   (`::bench --name wgmma_config_sweep --peers` with the new rows, then
-   `::bench --name wgmma_vs_cublas --peers`).
-2. **Docs agent** — branch `docs/w2-visit-results`: the visit-results block for
-   ACT2_WAVE_PLAN.md's amendment section. Merge if committed (docs-only).
-3. Task #21 (push + CI) remains pending on the user's request only. Before any push:
+1. **Wave 3 implementation — INTERRUPTED at 23:52, state frozen at commit `84e08f1` on branch
+   `gpu/wave3-schedule`** (worktree `.claude/worktrees/agent-a483e109bb3f39cdb`). That commit is
+   an explicitly UNGATED WIP checkpoint (642 lines of the raster generator axis in ptx_wgmma.rs;
+   it may not compile — its message says exactly what it is). The agent's last state: raster
+   axis (GROUP_M=16 TALL on the cluster index) mid-implementation; next steps were "the
+   guard-shape law and the module count". A resuming implementer reads
+   `docs/gpu/derive/WAVE3_DOSSIER.md` (the authority) and decides: continue from the diff or
+   restart clean. Full scope, ranked: (1) raster + bijection law G5 (asserted bijective over
+   [0, gx*gy) for every gx % group residue) + derived-name extension + sweep row
+   `w1_mcb_v2_r16`; (2) persistent clusters (iterate CLUSTERS not CTAs — a CTA-indexed loop
+   hangs; per-tile `%kt` reset = G19) + sweep row; (3) 128x64 tile class for sq1024. The drain
+   is budgeted ZERO — do not implement it. Expect: EXPECTED_MODULES (gpu.rs) and the in-family
+   count (ptx_wgmma.rs, currently 117/23) need deliberate bumps for any new module. Merge only
+   behind the full five-part gate, then: census → `::build --release` + `::build` → one H100
+   visit (`::bench --name wgmma_config_sweep --peers`, then `::bench --name wgmma_vs_cublas
+   --peers`, `WK_GPU=H100`, `--detach`, utf-8 export).
+2. Task #21 (push + CI) remains pending on the user's request only. Before any push:
    `rustup update stable` (CI's rustc is newer than local and runs clippy -D warnings).
 
 ## Next steps after Wave 3 (the plan's order)
