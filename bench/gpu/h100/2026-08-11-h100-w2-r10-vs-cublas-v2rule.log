@@ -1,0 +1,201 @@
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-bZLmlR0AnWfz1CRfKpAtJz
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function build_peers.
+├── 🔨 Created function ptxas.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+├── 🔨 Created function peers.
+├── 🔨 Created function cutlass.
+├── 🔨 Created function marlin.
+├── 🔨 Created function framework.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[meter] bench: H100 + 8.0 cpu + 16 GiB = $4.456/hr; timeout 7200s caps this call at $8.91
+[src] 810 files stamped; 0 new/changed since the last run (incremental)
+Sweep on H100 — PEER_REQUIRED=1, STRONG_PEERS=(none declared)
+[clock] lock: refused (The current user does not have permission to change clocks for GPU 00000000:91:00.0.); running unlocked -- read the per-arm [clock] lines instead
+[clock] before wgmma_vs_cublas: 345 MHz, 2619 MHz, 27, 71.14 W
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --release -- wgmma_vs_cublas --ignored --nocapture --test-threads=1[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 2.68s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_gpu-53f0e4b228126785)
+
+running 1 test
+
+================ wgmma_vs_cublas ================
+# ---- wukong GPU round provenance (GPU_RETARGET_PLAN.md 6.1, emitted by the harness) ----
+round          : wgmma_vs_cublas
+gpu            : NVIDIA H100 80GB HBM3
+compute cap    : 9.0
+SMs            : 132
+spec check     : VERIFIED against spec (132 SMs, cc 9.0; GH100 SXM5 / NVL, 16896 cores / 128)
+opt-in SMEM    : 232448 B
+L2             : 52428800 B
+VRAM           : 85017624576 B
+driver CUDA API: 13.0 (13000)
+CUDA runtime   : none linked (driver API only: PTX is JIT-loaded by the driver)
+kmd driver     : 580.95.05
+provider / SKU : n/a / n/a
+clock lock     : UNKNOWN (undeclared)
+clocks before  : sm 1980 MHz  mem 2619.0 MHz  temp 28.0 C  power 110.0 W
+kernel         : wgmma_nt_f16_128x256x64_s4_v2 (F16)
+tile / stages  : 128x256x64, 4 stages, 196672 B ring (dynamic .extern window)
+warp spec      : 1 producer wg @ 32 regs + 2 consumer wg @ 232 regs = 384 threads
+schedule       : Cooperative; cluster 1x1x1 (None) - NO cluster: the baseline arm. D1 4.5 asks for a 2x1x1 cluster multicasting A; the measured 7.00 TB/s L2 says the 1x2x1 multicast of B is the one that clears the peer
+smem layout    : SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+wgmma          : 4 per staged K tile, 128 accumulator regs/thread
+epilogue       : fused st.global.v2.f32 + odd-N scalar tail
+l2 hint        : none
+timed region   : fill 0.01 , memset-in-region no  (this row's schedule does not require a zeroed C)
+kernel         : wgmma_nt_f16_128x256x64_s4_mcb2_v2 (F16)
+tile / stages  : 128x256x64, 4 stages, 196672 B ring (dynamic .extern window)
+warp spec      : 1 producer wg @ 32 regs + 2 consumer wg @ 232 regs = 384 threads
+schedule       : Cooperative; cluster 1x2x1 (ClusterB) on grid y (M tiles) - each CTA TMA-loads 16384 B of the 32768-byte B tile and .multicast::cluster-s it to all 2, A stays per-CTA, expect_tx is still 49152 B per destination, empty[s] takes 4 arrivals
+smem layout    : SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false }
+wgmma          : 4 per staged K tile, 128 accumulator regs/thread
+epilogue       : fused st.global.v2.f32 + odd-N scalar tail
+l2 hint        : none
+timed region   : fill 0.01 , memset-in-region no  (this row's schedule does not require a zeroed C)
+peer (arms A,C): cuBLAS f16 (f32 out)
+*** CLOCKS ARE NOT LOCKED (or the lock is undeclared). A shared container cannot run `nvidia-smi -lgc`,
+*** so per GPU_RETARGET_PLAN.md 6.3 this round is ITERATION data, not publication data. Publication
+*** rounds need a root VM with the clocks pinned below throttle; set WUKONG_GPU_CLOCK_LOCK to declare it.
+plan           : 5 recorded rounds + 1 discarded warm-up, bar +/-5.00%, median across rounds
+bench machine_floor: floor +1.71% (peer A-vs-C), contender spread n/a (ours), bar +/-5.00%, median of 5 rounds  [GATE SHUT: control-only round: the floor is measured, but there is no contender arm to publish]
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  probe_us                      11.501250      11.304750            n/a     -1.71%        n/a        n/a  no-contender
+
+---- wgmma_vs_cublas: correctness, before a single timed launch ----
+The guard shape is derived from the config: 3x3 CTAs, ktiles = stages+1 (one producer wrap),
+ragged in M AND N AND K, and an ODD tile count so a future persistent tile loop's partial last
+wave is reachable. Two arms: exact integers at `==` (a permutation diagnostic, invariant under any
+reassociation and therefore blind to every scheduler change coming), and pseudorandom operands
+against an independent f64 reference at c*sqrt(K)*eps*sum|a*b| -- the arm that CAN see one -- run twice
+and demanded bit-identical.
+  wgmma_nt_f16_128x256x64_s4_v2 320x288x640 grid 3x3 (3x3 tiles, 5 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two runs; seed 0x57455f4152455f32
+[gate] wgmma_nt_f16_128x256x64_s4_v2 passed BOTH pre-timing arms on 204800 lanes ✓
+  wgmma_nt_f16_128x256x64_s4_mcb2_v2 320x288x640 grid 3x4 (3x3 tiles, 5 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two runs; seed 0x57455f4152455f32
+[gate] wgmma_nt_f16_128x256x64_s4_mcb2_v2 passed BOTH pre-timing arms on 204800 lanes ✓
+[gate] cuBLAS f16 (f32 out) matches the same f64 reference (max_abs 0.00e0) ✓
+
+[wgmma_vs_cublas] sweeping 7 shapes; arms A and C are BOTH cuBLAS f16 (f32 out) (the peer twin), arm B is the shipped rule, per shape (wgmma_nt_f16_128x256x64_s4_v2 | wgmma_nt_f16_128x256x64_s4_mcb2_v2).
+[wgmma_vs_cublas] READ THE FLOOR CORRECTLY: C/A is the PEER's own run-to-run spread through a second handle and
+[wgmma_vs_cublas] its own buffers, which is what plan 6.2 asks a peer round for. It is the noise floor of the
+[wgmma_vs_cublas] DENOMINATOR, not of our kernel; a contender whose own spread is wider than the peer's would
+[wgmma_vs_cublas] clear this bar while still being unresolved. Treat a barely-cleared effect as unresolved.
+  sq1024              1024x1024x1024  1000 launches/region, 8.0 MiB of device operands, arm B = wgmma_nt_f16_128x256x64_s4_v2  [D1 5.3: 4 MiB working set, 0.08x L2 -- deeply L2-resident, and only 32 CTAs of a 128x256 tile, so this row is about wave quantization, not bandwidth]
+  sq2048              2048x2048x2048  1000 launches/region, 32.0 MiB of device operands, arm B = wgmma_nt_f16_128x256x64_s4_v2  [D1 5.3: 16 MiB, 0.32x L2 -- L2-resident. D1 4.5 puts W3 (128x128) here because a 256-wide tile quantizes below M*N = 4.3e6; W1 is measured here anyway, as the evidence for that claim]
+  sq4096              4096x4096x4096  146 launches/region, 128.0 MiB of device operands, arm B = wgmma_nt_f16_128x256x64_s4_mcb2_v2  [D1 5.3: 64 MiB, 1.28x L2 -- the raster crossover, and the first of the two shapes D1 4.5 predicts W1 at 95-108% of cuBLAS on]
+  sq8192              8192x8192x8192  18 launches/region, 512.0 MiB of device operands, arm B = wgmma_nt_f16_128x256x64_s4_mcb2_v2  [D1 5.3: 256 MiB, 5.12x L2 -- raster plus streaming C, and the second 95-108% point]
+  gpt_d1024_up        4096x4096x1024  582 launches/region, 80.0 MiB of device operands, arm B = wgmma_nt_f16_128x256x64_s4_mcb2_v2  [SKINNY-K. GPT d=1024 FFN up-projection (M=4096, N=4d, K=d). D1 4.3.2: ws is exactly 16.0 MiB, which trips the Act-1 dispatcher's 16 MiB literal into the raster arm although 0.32x L2 is deeply L2-resident]
+  gpt_d1024_down      4096x1024x4096  582 launches/region, 56.0 MiB of device operands, arm B = wgmma_nt_f16_128x256x64_s4_v2  [SKINNY-N (derived, not in D1's table): the down-projection twin of the row above. D1 4.4's A4 asks whether widening N or widening M buys reuse; W1 is N-major, so the N << M shape is where that costs something]
+  gpt_d4096_up       4096x16384x4096  36 launches/region, 416.0 MiB of device operands, arm B = wgmma_nt_f16_128x256x64_s4_mcb2_v2  [GPT d=4096 FFN up-projection. D1 5.3: 160 MiB, 3.20x L2 -- raster, and the widest N the epilogue's u32 element index still holds (M*N = 67.1e6)]
+
+---- wgmma_vs_cublas: round close ----
+# ---- wukong GPU round provenance (GPU_RETARGET_PLAN.md 6.1, emitted by the harness) ----
+round          : wgmma_vs_cublas
+gpu            : NVIDIA H100 80GB HBM3
+compute cap    : 9.0
+SMs            : 132
+spec check     : VERIFIED against spec (132 SMs, cc 9.0; GH100 SXM5 / NVL, 16896 cores / 128)
+opt-in SMEM    : 232448 B
+L2             : 52428800 B
+VRAM           : 85017624576 B
+driver CUDA API: 13.0 (13000)
+CUDA runtime   : none linked (driver API only: PTX is JIT-loaded by the driver)
+kmd driver     : 580.95.05
+provider / SKU : n/a / n/a
+clock lock     : UNKNOWN (undeclared)
+clocks before  : sm 1980 MHz  mem 2619.0 MHz  temp 28.0 C  power 110.0 W
+clocks after   : sm 1980 MHz  mem 2619.0 MHz  temp 30.0 C  power 157.8 W
+sm clock drift : +0.00% (bar +/-5.00%)
+wall           : 14.7 s
+cost estimate  : n/a (set WUKONG_GPU_USD_PER_HR)
+publish gate   : OPEN (round level)
+
+---- wgmma_vs_cublas: per-shape verdicts ----
+bench wgmma_vs_cublas@sq1024: floor +15.47% (peer A-vs-C), contender spread +0.78% (ours), bar +/-5.00%, median of 5 rounds  [GATE SHUT: control floor +/-15.47% exceeds the pre-registered bar +/-5.00% — this round cannot resolve the effect; re-run rather than reporting a wide tie as a tie]
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.009870       0.008343       0.013951    -15.47%    +41.36%     +0.78%  unresolved
+bench wgmma_vs_cublas@sq2048: floor +0.19% (peer A-vs-C), contender spread +0.75% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025915       0.025866       0.027206     -0.19%     +4.98%     +0.75%  moved
+bench wgmma_vs_cublas@sq4096: floor +0.51% (peer A-vs-C), contender spread +0.58% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.164022       0.164865       0.185215     +0.51%    +12.92%     +0.58%  moved
+bench wgmma_vs_cublas@sq8192: floor +0.04% (peer A-vs-C), contender spread +0.72% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.273854       1.273404       1.380084     -0.04%     +8.34%     +0.72%  moved
+bench wgmma_vs_cublas@gpt_d1024_up: floor +0.07% (peer A-vs-C), contender spread +0.97% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.058251       0.058207       0.072564     -0.07%    +24.57%     +0.97%  moved
+bench wgmma_vs_cublas@gpt_d1024_down: floor +0.44% (peer A-vs-C), contender spread +2.38% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.045008       0.044808       0.046278     -0.44%     +2.82%     +2.38%  moved
+bench wgmma_vs_cublas@gpt_d4096_up: floor +0.20% (peer A-vs-C), contender spread +0.34% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.673223       0.674564       0.916991     +0.20%    +36.21%     +0.34%  moved
+
+---- wgmma_vs_cublas: the published table (the shipped rule, per shape (wgmma_nt_f16_128x256x64_s4_v2 | wgmma_nt_f16_128x256x64_s4_mcb2_v2) vs cuBLAS f16 (f32 out)) ----
+  shape                        MxNxK      iters  headline
+  sq1024              1024x1024x1024       1000  -- (control floor +/-15.47% exceeds the pre-registered bar +/-5.00% — this round cannot resolve the effect; re-run rather than reporting a wide tie as a tie)
+  sq2048              2048x2048x2048       1000  95.3% of cuBLAS f16 (f32 out) (1.0498x its ms, moved, floor +/-0.19%)
+  sq4096              4096x4096x4096        146  88.6% of cuBLAS f16 (f32 out) (1.1292x its ms, moved, floor +/-0.51%)
+  sq8192              8192x8192x8192         18  92.3% of cuBLAS f16 (f32 out) (1.0834x its ms, moved, floor +/-0.04%)
+  gpt_d1024_up        4096x4096x1024        582  80.3% of cuBLAS f16 (f32 out) (1.2457x its ms, moved, floor +/-0.07%)
+  gpt_d1024_down      4096x1024x4096        582  97.3% of cuBLAS f16 (f32 out) (1.0282x its ms, moved, floor +/-0.44%)
+  gpt_d4096_up       4096x16384x4096         36  73.4% of cuBLAS f16 (f32 out) (1.3621x its ms, moved, floor +/-0.20%)
+
+---- wgmma_vs_cublas: DIAGNOSTIC absolutes (NOT publishable; clock-dependent) ----
+  shape                peer ms      ours ms peer TFLOP/s ours TFLOP/s
+  sq1024                0.0099       0.0140        217.6        153.9
+  sq2048                0.0259       0.0272        662.9        631.5
+  sq4096                0.1640       0.1852        837.9        742.1
+  sq8192                1.2739       1.3801        863.1        796.7
+  gpt_d1024_up          0.0583       0.0726        589.9        473.5
+  gpt_d1024_down        0.0450       0.0463        763.4        742.5
+  gpt_d4096_up          0.6732       0.9170        816.6        599.5
+
+[wgmma_vs_cublas] W3C (128x128x64 s6, D1's moderate-size arm) is NOT in this round: the instrument has one contender arm, and a second kernel in arm B would be an A/B against two different things at once. `wgmma_config_sweep` is where it IS a row -- there every configuration is scored against the same cuBLAS, which is a different and legitimate experiment.
+=============================================================
+
+test gpu::tests::wgmma_vs_cublas ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 562 filtered out; finished in 15.66s
+
+[1m[92m   Doc-tests[0m wukong_codegen_gpu
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m-> ok in 21.9s[0m
+[clock] after wgmma_vs_cublas: 1980 MHz, 2619 MHz, 30, 130.69 W
+[meter] bench: 25.2s wall = $0.031 (record this in the round log)
+✓ App completed. View run at 
+https://modal.com/apps/aidanht/main/ap-bZLmlR0AnWfz1CRfKpAtJz
