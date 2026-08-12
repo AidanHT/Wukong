@@ -909,20 +909,64 @@ direction. **Unchanged: DEFERRED to after W4.** 192x256x64 is **DEAD** on the em
 CTA-M decline and the 512-thread register cap (`WAVE3_DOSSIER.md:1289-1316`); nothing about decode
 touches either. **Unchanged: DEAD.**
 
-### 10.4 Machete / W4A16 -- the trigger region is entered; publish the tie and the product win
+### 10.4 Machete / W4A16 -- both of the plan's bands are entered, and only one of them is a tie
 
-`ACT2_WAVE_PLAN.md:189` holds "Beating Machete on W4A16" out as measure-only, with the expectation
-stated in advance: *"At M<=32 the shape is 100% weight-bandwidth-bound ... two kernels at 90% of HBM
-differ by <10% ... Expect and publish a loss at M>=128 and a tie at M=1."*
+`ACT2_WAVE_PLAN.md:189` holds "Beating Machete on W4A16" out as measure-only, with a sweep at
+`M = 1 / 16 / 128` and the expectation pre-registered in **two** bands: *"At M<=32 the shape is 100%
+weight-bandwidth-bound (12.98 MB = 3.87 us caps a perfect M=16 kernel at 208 TFLOP/s; two kernels at
+90% of HBM differ by <10%). Beating it at M=128+ needs W5's plumbing plus a weight pre-shuffle.
+**Expect and publish a loss at M>=128 and a tie at M=1.**"*
 
-Wave 6's decode batches are `M in {64, 256}` -- squarely inside that region -- and section 3 prices
-int4 weights at **2.118x on the whole step** at B=16. Those two statements are not in tension and
-the round must publish both:
+Wave 6's decode batches are `M in {16, 64, 256}` (section 12.2: `B = 16` and `64` on the step rows,
+`Bcap = 256` on the goodput row), and they **straddle** those bands rather than sitting inside
+either. `M = 16` is inside the plan's tie band; `M = 256` is inside its pre-registered LOSS band;
+`M = 64` falls in the gap between 32 and 128, where the plan states no expectation at all. **This
+dossier does not overturn the pre-registered expectation -- section 4.2's roof re-derives it, and
+the loss at `M >= 128` stands.**
 
-* **vs Machete: expect a tie.** Both kernels are reading the same weight bytes at ~90% of the same
-  HBM. Section 4.2's roof does not care whose kernel it is.
+**DERIVED, where the both-sides-bandwidth-bound band actually ends.** Section 4.2's roof with 4-bit
+weights replaces the `2*N*K` weight term by `0.5*N*K` and leaves the f16 activations and f32 output
+alone:
+
+```
+    FLOP  = 2*M*N*K
+    bytes = 0.5*N*K (4-bit W) + 2*M*K (f16 act) + 4*M*N (f32 out)
+    I     ~ 4M   when M << K and M << N     ->   M* = 338.4 / 4 = 84.6
+```
+
+At the exact `wq` decode shape (`N = K = 4096`), where the activation and output terms are not
+negligible, `I(M) = 33,554,432*M / (8,388,608 + 24,576*M)` and the crossover is `M = 112.5`. Both
+brackets give the same verdict at every swept point:
+
+| M | I (FLOP/B) | roof at 2922.3 GB/s | vs the 989 TFLOP/s f16 tensor peak |
+|---|---|---|---|
+| 16 | 61.13 | 178.6 TFLOP/s | 18.1% -- **weight-bandwidth-bound** |
+| 64 | 215.6 | 630.0 TFLOP/s | 63.7% -- **weight-bandwidth-bound** |
+| 112.5 | 338.4 | 989 TFLOP/s | **100% -- the crossover** |
+| 128 | 372.4 | 1088 TFLOP/s | above peak -- **compute-bound** |
+| 256 | 585.1 | 1710 TFLOP/s | above peak -- **compute-bound** |
+
+So the round publishes three separate things, and conflating any two of them is a defect:
+
+* **`M <= 64`: expect a tie.** Both kernels read the same weight bytes under the same roof, and
+  section 4.2's roof does not care whose kernel it is. This *extends* the plan's band from `M <= 32`
+  to `M <= 64` on the arithmetic above; it does not reverse it.
+* **`M in {128, 256}`: expect a LOSS, exactly as pre-registered.** Above the crossover the weight
+  stream is no longer the binding term, so the winner is decided by tensor-core efficiency and by
+  the weight pre-shuffle the plan names as the precondition -- and **Wave 6 supplies neither.**
+  Section 3 records that int4 weights have no decode call site at all (`serving.rs:339` launches
+  `wmma_nt_f16_sm_db` unconditionally). Publish the loss; it is the pre-registered result, not a
+  surprise, and a dossier that quietly turned it into a tie would have destroyed the one thing a
+  pre-registration is for.
 * **vs our own f16 decode: 2.118x, and it is the wave's largest single number.** That is a *product*
-  ratio against an internal control, and it is legitimate precisely because it is labelled as one.
+  ratio against an internal control at `B = 16` (section 2.3), legitimate precisely because it is
+  labelled as one. It is not a Machete comparison and must never appear beside one without the
+  label.
+
+**AMENDMENT to a held-out item, named as one.** The plan's sweep is `M = 1 / 16 / 128`; row
+`p3_marlin` runs `M = 1 / 16 / 64 / 128 / 256`, a **superset**. Both plan anchors are kept so the
+pre-registered expectation stays falsifiable at the two points it was registered at, and the wave's
+own decode batches (64, 256) are added. Section 13 carries the amendment row.
 
 `modal_app.py:3948-3957`'s `::marlin` dispatcher picks Machete on `sm_90` automatically; use it
 rather than naming a kernel by hand.
@@ -936,7 +980,7 @@ rather than naming a kernel by hand.
 | **merged QKV** (new, this dossier) | n/a -- **build it, rank 3** | 3 launches -> 1, 96 CTAs instead of 64+16+16, and bit-exact by the same argument `tp_column_parallel_gemm_split_is_bit_exact` already proves |
 | 2x2x1 cluster | unchanged: **DEFERRED to after W4** | decode is HBM-bound, so `T_L2` is not binding and Wave 6 adds no evidence |
 | 192x256x64 | unchanged: **DEAD** | CTA-M 192 declines in the emitter; 512 threads cap ptxas at 128 regs |
-| Machete / W4A16 | **region entered -> measure, publish a tie** | both sides are ~90% weight-bandwidth-bound at `M <= 256`; the real number is the internal 2.118x |
+| Machete / W4A16 | **both bands entered: tie at `M <= 64`, the plan's pre-registered LOSS at `M >= 128`** | the W4A16 roof crosses the 989 TFLOP/s f16 peak at `M ~ 112`, so only `M <= 64` is both-sides-weight-bandwidth-bound; the 2.118x is a product ratio against our own f16 decode, never a peer ratio |
 | **megakernel** | **HELD, with a computable trigger** | fire only if the measured H100 launch overhead exceeds 10% of the measured decode step |
 
 ---
@@ -1119,7 +1163,10 @@ interpretable without them.
   p0_disp          FA2 vs FA2, two identical arms (G16)             the a1 shapes                       G-W6-6
   p1_fa2           flash_attn_with_kvcache(block_table=)            the a1 shapes                       9.2
   p2_vllm          benchmark_paged_attention  [LABELLED A FLOOR]    same                                9.3
-  p3_marlin        ::marlin at M = 1 / 64 / 256                     Llama-8B weights                    10.4
+  p3_marlin        ::marlin at M = 1/16/64/128/256                  Llama-8B weights                    10.4
+                   (the plan's 1/16/128 anchors KEPT so its
+                    pre-registered expectation stays falsifiable;
+                    64/256 added as the wave's own decode batches)
 ```
 
 ### 12.3 Round-level refusals
@@ -1136,6 +1183,10 @@ interpretable without them.
   (`ACT2_WAVE_PLAN.md:178`).
 * **No quantized-decode row without its accuracy column**, measured at the serving geometry rather
   than inherited from the unit gate (section 6).
+* **The Machete row publishes per `M`, against the band it was pre-registered in.** A tie at
+  `M >= 128` is not a result to celebrate, it is a result to *check*: the plan registered a loss
+  there and section 10.4 re-derives why. Reporting a single aggregate "tie" across the sweep, or
+  quoting the internal 2.118x anywhere near the peer column, is a refusal.
 * **No 4050 number anywhere in the output.** Not as a comparison, not as an expectation, not as a
   "consistent with". This dossier's device-scope rule is a round-level refusal too.
 * **Lock the SM clock and declare it.** The r3 provenance still reads `clock lock: UNKNOWN`
@@ -1181,6 +1232,7 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 | megakernel: "Published ceiling: 78% of BW ... ~1.56x on the bandwidth-bound term" | FACT(ext) sizing. The repo's derived prize is the **launch overhead**, 2.7-13.5% of the step, and its only constant is a WDDM one. **Budget ZERO**; trigger = the measured overhead exceeds 10% of the measured step |
 | ping-pong is HELD OUT with trigger "a decode row is added" (`:187`) | **the trigger fires and the lever loses.** At `M <= 338` the roof is `M x BW`, in which no tile appears; at Bcap=256 a 64x256 tile *lowers* the binding roof 630 -> 597 TFLOP/s. **RETIRE the trigger** |
 | Stream-K is HELD OUT: "wave quantization is only ~3% once W3's persistence lands" | true for the GEMM suite, false for decode: **6 of 6 decode GEMMs are below 0.90 wave efficiency, 5 below 0.50.** **PROMOTE to Wave 6 rank 2**, gated on one bandwidth measurement |
+| Machete W4A16 is HELD OUT at `:189` as measure-only, sweep `M = 1/16/128`, "**expect and publish a loss at M>=128 and a tie at M=1**" | **expectation UPHELD, sweep EXTENDED -- and this row is the amendment.** With 4-bit weights `I ~ 4M`, so the roof crosses the 989 TFLOP/s f16 peak at `M = 84.6` asymptotically and at `M = 112.5` at the exact `wq` shape: the both-sides-bandwidth-bound band ends near `M = 64`, not `M = 32`, and `M >= 128` stays the pre-registered LOSS. `p3_marlin` runs `M = 1/16/64/128/256` -- a **superset** keeping both plan anchors and adding the wave's own decode batches. The 2.118x of section 2.3 is an internal product ratio, not a Machete number |
 | target-table row 6: "1.6-2.0x from coalescing compounded with a 4x (8B) / 8x (70B) read-amplification removal" | both factors are re-derived above and neither survives as stated. The row's honest content is the **int8/fp8-KV prize** and the **capacity** result of 2.4 |
 | (absent from the plan) | **int8 KV is a feasibility lever on H100**: `Bcap=64 x 8192` is 77.00 GiB of a 79.18 GiB part at f16 and 46.00 GiB at int8 |
 | (absent from the plan) | **merged QKV**: 3 launches -> 1, bit-exact by construction, no numerical precondition |
