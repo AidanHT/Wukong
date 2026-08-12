@@ -2204,13 +2204,19 @@ mod gpu_e2e_tests {
     /// really is [`gpu_accel::GemmRoute::Wgmma`], that the offload fired at all, and only then that
     /// the numbers match the CPU oracle.
     ///
-    /// Three shapes, one per property. `256x1024x512` is a whole 128×256 tile grid. `130x1032x257` is
+    /// Three shapes, one per property. `256x1024x512` is a whole 128×256 tile grid. `130x1032x258` is
     /// ragged in M, N **and** K at once, which is what proves the driver seam did not quietly need an
     /// alignment gate (the `m%64/n%64/k%16` rule in `sgemm_nt_epi` is a *wmma* constraint — wgmma
     /// predicates its own edge). `4096x256x2048` has `M*N = 8_388_608` output elements, just past
     /// `ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS`, so it is the only one that makes the config seam
     /// return the **clustered** row and the launch carry a `1x2x1` cluster attribute — the arm a
     /// small-shape-only gate would leave entirely unexercised from the driver side.
+    ///
+    /// Every `N` here is EVEN on purpose, and it is not a raggedness choice: both shipped rows carry
+    /// the `st.global.v2.f32` epilogue, whose 8-byte pair is aligned only when `N` is, so an odd `N`
+    /// is a *sticky* `CUDA_ERROR_MISALIGNED_ADDRESS` rather than a wrong number. The driver declines
+    /// it (`wgmma_declines`) and a device-free unit test pins that; putting an odd `N` in this gate
+    /// would only prove the decline works by never reaching the kernel.
     #[test]
     #[ignore = "needs a Hopper (sm_90a) device; run it on H100 via ::bench --package wukong_driver"]
     fn gpu_backend_linear_routes_through_wgmma_on_hopper() {
@@ -2240,7 +2246,7 @@ mod gpu_e2e_tests {
         let mut rng = Rng::new(0x090A_C0DE);
         for &(m, k, n) in &[
             (256usize, 1024usize, 512usize),
-            (130, 1032, 257),
+            (130, 1032, 258),
             (4096, 256, 2048),
         ] {
             let (program, mut interner) = build(&linear_src(m, k, n));
@@ -2285,7 +2291,7 @@ mod gpu_e2e_tests {
                 rel_tol,
             );
             eprintln!(
-                "gpu --backend wgmma linear {m}x{k}x{n} (M%128={}, N%256={}, K%64={}): \
+                "gpu --backend wgmma linear {m}x{k}x{n} (M%128={} N%256={} K%64={}): \
                  {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
                 m % 128,
                 n % 256,
