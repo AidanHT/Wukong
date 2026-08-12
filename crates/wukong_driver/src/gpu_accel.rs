@@ -180,6 +180,26 @@ fn wgmma_cfg_for(dtype: WgmmaDtype, m: usize, n: usize) -> &'static WgmmaCfg {
     }
 }
 
+/// **The shapes the Hopper end-to-end gate runs, shared so it and the device-free law below cannot
+/// drift.**
+///
+/// `gpu_backend_linear_routes_through_wgmma_on_hopper` (driver `lib.rs`) can only run on rented
+/// silicon, and a claim in its doc comment — "this one crosses the cluster threshold, so it is the
+/// only shape that exercises the clustered launch" — is exactly the kind of statement that rots
+/// silently when the threshold moves. [`tests::the_hopper_gate_shapes_reach_both_regime_arms`] checks
+/// that claim **here**, on this laptop, against
+/// [`ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS`] itself rather than a copy of its value; both the gate
+/// and the law read this one list.
+#[cfg(test)]
+pub(crate) const HOPPER_GATE_SHAPES: [(usize, usize, usize); 3] = [
+    // A whole tile grid: 2 tiles of M x 2 of N, nothing ragged.
+    (256, 1024, 512),
+    // Ragged in M, N **and** K at once — the shape that proves the seam needs no alignment gate.
+    (130, 1032, 258),
+    // M*N = 8_388_608, just past the cluster threshold: the only one that returns the CLUSTERED row.
+    (4096, 256, 2048),
+];
+
 /// The 16-bit input type the **f32** seam feeds `wgmma`.
 ///
 /// f16 and bf16 are the same width and eight bits apart in precision; the recognized `sgemm_nt` call
@@ -414,6 +434,12 @@ impl Accelerator for GpuAccel<'_> {
 mod tests {
     use super::*;
 
+    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` as the H100 probes it — the number the
+    /// round logs print as `opt-in SMEM: 232448 B`.
+    const H100_SMEM: usize = 232_448;
+    /// The same attribute on this repo's RTX 4050, for the budget decline.
+    const ADA_4050_SMEM: usize = 101_376;
+
     /// The gate must cover exactly the three op codes `gpu::norm` has PTX entries for. The two the
     /// recognizer also emits (LOGSOFTMAX=3, L2NORM=4) reach `panic!` inside `gpu::norm`, so they
     /// must decline here; needs no CUDA device, unlike the end-to-end fallback test.
@@ -510,13 +536,103 @@ mod tests {
         assert_eq!(WGMMA_F32_SEAM_DTYPE, WgmmaDtype::F16);
     }
 
+    /// **The whole route, up to the launch, on a laptop that cannot launch it.**
+    ///
+    /// Everything between "a `.wk` matmul was recognized" and `cuLaunchKernelEx` is a pure function
+    /// of the shape and the probed device: the route, the config the seam selects, the declines, and
+    /// the [`ptx_wgmma::LaunchPlan`] that config yields. So the only part of this seam that needs
+    /// Hopper is the launch itself, and this asserts the rest at `cargo test` speed for the three
+    /// shapes `gpu_backend_linear_routes_through_wgmma_on_hopper` will run there.
+    ///
+    /// # What it is really guarding: the H100 gate covering only ONE regime arm and nobody noticing
+    ///
+    /// [`wgmma_cfg_for`] is a two-arm regime rule split at
+    /// [`ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS`], and the two arms are **not** interchangeable at the
+    /// launch: the clustered row compiles `.reqnctapercluster` into the entry, and a compiled cluster
+    /// requirement the launch does not match is a *launch failure*, not a wrong number. A device gate
+    /// whose shapes all sat below the threshold would therefore prove nothing about the arm that has
+    /// the extra launch mechanism, while looking complete. Asserting the coverage against the
+    /// generator's own constant — never a copy of `8_000_000` — means a re-measured threshold breaks
+    /// this test on this laptop instead of quietly narrowing a rented-silicon round.
+    #[test]
+    fn the_hopper_gate_shapes_reach_both_regime_arms() {
+        let mut clustered = 0usize;
+        for &(m, k, n) in &HOPPER_GATE_SHAPES {
+            // Both dtypes: the f32 seam asks for f16 today, and `wgmma_cfg_for` already routes bf16
+            // for the day the lowp `nt_epi` symbols get an `Accelerator` hook (dossier §5.4 gap 3).
+            for dtype in [WgmmaDtype::F16, WgmmaDtype::Bf16] {
+                let cfg = wgmma_cfg_for(dtype, m, n);
+                assert!(
+                    wgmma_declines(cfg, m, k, n, H100_SMEM).is_none(),
+                    "{dtype:?} {m}x{k}x{n}: the Hopper gate's own shape declines, so that gate would \
+                     silently measure the pre-Hopper launcher: {:?}",
+                    wgmma_declines(cfg, m, k, n, H100_SMEM)
+                );
+                let plan = cfg.launch_plan();
+                assert!(plan.dyn_smem_bytes <= H100_SMEM);
+                // No such thing as a partial cluster: every grid axis is a multiple of its cluster
+                // axis, including on the shape that is ragged in M, N and K at once.
+                let grid = plan.grid(m, n);
+                assert_eq!(
+                    (
+                        grid.0 % plan.cluster.0,
+                        grid.1 % plan.cluster.1,
+                        grid.2 % plan.cluster.2
+                    ),
+                    (0, 0, 0),
+                    "{}: grid {grid:?} is not a multiple of cluster {:?}",
+                    cfg.name,
+                    plan.cluster
+                );
+                assert!(grid.0 >= 1 && grid.1 >= 1 && grid.2 >= 1);
+                // The regime split, stated against the generator's constant rather than its value.
+                let want_cluster = m * n >= ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS;
+                assert_eq!(
+                    plan.cluster_ctas() > 1,
+                    want_cluster,
+                    "{}: M*N = {} against the shipped threshold {}",
+                    cfg.name,
+                    m * n,
+                    ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS
+                );
+                if dtype == WGMMA_F32_SEAM_DTYPE && want_cluster {
+                    clustered += 1;
+                }
+            }
+        }
+        assert_eq!(
+            clustered,
+            1,
+            "exactly one Hopper gate shape must cross {} output elements — zero leaves the \
+             `.reqnctapercluster` launch arm untested on the device, and all three would leave the \
+             un-clustered arm untested",
+            ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS
+        );
+    }
+
+    /// **A tripwire for wave 4's G21, aimed at the one caller that cannot see it fire.**
+    ///
+    /// The dossier's §5.3 row 2 turns `PARAM_ORDER` from a constant into `param_order()` the moment a
+    /// bias pointer exists, and `LaunchPlan::params` becomes per-variant. The driver does not build
+    /// the argument array — `gpu::gemm_nt_wgmma` does — so the driver would keep compiling and keep
+    /// dispatching while two configs it can return declared different signatures. Pinning "both arms
+    /// of the seam declare the same list, and it is the family's" makes that a failing test in this
+    /// file rather than a short argument array on rented silicon, which the driver does not report as
+    /// an error at all: it reads whatever follows on the host stack as the next pointer.
+    #[test]
+    fn both_seam_arms_declare_one_parameter_list() {
+        for dtype in [WgmmaDtype::F16, WgmmaDtype::Bf16] {
+            let small = wgmma_cfg_for(dtype, 64, 64).launch_plan();
+            let large = wgmma_cfg_for(dtype, 4096, 4096).launch_plan();
+            assert_eq!(small.params, ptx_wgmma::PARAM_ORDER, "{}", small.entry);
+            assert_eq!(large.params, ptx_wgmma::PARAM_ORDER, "{}", large.entry);
+        }
+    }
+
     /// Every `assert!` inside `gemm_nt_wgmma` must already be a `Some(..)` here, or the offload path
     /// aborts a user's program on a shape that had a working fallback.
     #[test]
     fn every_launcher_assert_is_a_driver_side_decline() {
-        // The H100's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`, and the 4050's, as probed.
-        const H100_SMEM: usize = 232_448;
-        const ADA_4050_SMEM: usize = 101_376;
         let cfg = wgmma_cfg_for(WgmmaDtype::F16, 4096, 4096);
 
         assert!(
