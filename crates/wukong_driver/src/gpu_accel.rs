@@ -189,8 +189,9 @@ fn wgmma_cfg_for(dtype: WgmmaDtype, m: usize, n: usize) -> &'static WgmmaCfg {
 /// (WAVE4_DOSSIER §5.4 gap 3); [`wgmma_cfg_for`] already routes it.
 const WGMMA_F32_SEAM_DTYPE: WgmmaDtype = WgmmaDtype::F16;
 
-/// **Every precondition `gpu::gemm_nt_wgmma` enforces with an `assert!`, restated as a decline.**
-/// `None` = the wgmma route may take this call; `Some(reason)` = fall back, with the reason.
+/// **Every precondition of `gpu::gemm_nt_wgmma`, restated as a decline** — the ones it asserts, and
+/// the one it does not. `None` = the wgmma route may take this call; `Some(reason)` = fall back,
+/// with the reason.
 ///
 /// This exists because the launcher's preconditions are **panics**, not errors: `k >= 1`,
 /// `m*n <= u32::MAX` (the epilogue forms its element index with `mad.lo.s32`) and
@@ -208,7 +209,8 @@ const WGMMA_F32_SEAM_DTYPE: WgmmaDtype = WgmmaDtype::F16;
 /// a ragged shape but an *unencodable* one. Ragged M, N and K (against the 128×256×64 tile) are all
 /// fine and deliberately not declined: TMA zero-fills out-of-range elements and the epilogue
 /// predicates every store on `row < M && col < N`, which `wgmma_hopper_bringup` item 7 proves exact
-/// down to a 1×1 output.
+/// down to a 1×1 output. **An odd `N` under the v2 store is the one exception**, and it is not a
+/// raggedness rule — see below.
 fn wgmma_declines(
     cfg: &WgmmaCfg,
     m: usize,
@@ -216,6 +218,33 @@ fn wgmma_declines(
     n: usize,
     smem_budget: usize,
 ) -> Option<String> {
+    // **The v2 epilogue's alignment precondition, and the sharpest decline in this function.**
+    // `st.global.v2.f32` writes an 8-byte pair at `C + 4*(row*N + ctan + 2*(lane&3)) + 32j`; every
+    // term but `row*N` is even by construction, so the pair is 8-byte aligned iff `N` is even. An
+    // odd `N` is NOT a wrong number and NOT a ragged edge: it is `CUDA_ERROR_MISALIGNED_ADDRESS` on
+    // the first store, and on this platform that leaves the context STICKILY errored, so every later
+    // GPU call in the process fails identically (the generator states this at `EpilogueStore::V2`).
+    //
+    // It is checked here and not merely inherited because `gemm_nt_wgmma` — unlike its timing
+    // sibling `time_gemm_nt_wgmma_in`, which asserts it — does NOT guard it, and both arms
+    // `wgmma_cfg_for` can return carry the v2 store. Without this line the first `.wk` matmul with
+    // an odd N on a Hopper part poisons the process.
+    if cfg.epilogue.requires_even_n() && !n.is_multiple_of(2) {
+        return Some(format!(
+            "{}'s v2 epilogue needs an EVEN N and N={n} is odd (st.global.v2.f32 would be \
+             misaligned on every row, a sticky context error rather than a wrong answer)",
+            cfg.name
+        ));
+    }
+    // The elided-store diagnostic arm computes a GEMM and throws the answer away, so it would return
+    // the zeros the launcher allocated and call them results. `wgmma_cfg_for` cannot return it today;
+    // this is here so that a later edit to the seam cannot make it reachable silently.
+    if cfg.epilogue.is_diagnostic_only() {
+        return Some(format!(
+            "{} is the elided-store DIAGNOSTIC arm: it writes no C and would return zeros",
+            cfg.name
+        ));
+    }
     // The epilogue's own index arithmetic, and the reason an 8192-square output is fine while a
     // 65536-square one is not.
     if (m as u64) * (n as u64) > u32::MAX as u64 {
@@ -495,12 +524,33 @@ mod tests {
             "sq4096 is the shape the campaign measures; it must not decline"
         );
         // Ragged against the 128x256x64 tile is NOT a decline — TMA zero-fills and the epilogue
-        // predicates, which bring-up item 7 proved exact down to 1x1.
-        for &(m, k, n) in &[(1usize, 8usize, 1usize), (17, 24, 33), (129, 176, 257)] {
+        // predicates, which bring-up item 7 proved exact down to 1x1. (Every N here is even; the odd
+        // ones are the next case, and they are an alignment rule rather than a raggedness one.)
+        for &(m, k, n) in &[(1usize, 8usize, 2usize), (17, 24, 34), (129, 176, 258)] {
             assert!(
                 wgmma_declines(cfg, m, k, n, H100_SMEM).is_none(),
                 "{m}x{k}x{n} is ragged, not unencodable"
             );
+        }
+
+        // **The one the launcher does not check.** `gemm_nt_wgmma` has no even-N assert (only its
+        // timing sibling does), and BOTH rows `wgmma_cfg_for` returns carry the v2 store, so an odd
+        // N reaching it is `CUDA_ERROR_MISALIGNED_ADDRESS` — which sticks to the context and fails
+        // every later GPU call in the process, not just this one.
+        // BOTH arms of the seam, because the small-shape row is the one a first real `.wk` matmul
+        // hits and it would be the one to poison the context.
+        let small = wgmma_cfg_for(WgmmaDtype::F16, 64, 64);
+        for c in [cfg, small] {
+            assert!(c.epilogue.requires_even_n(), "{} is a v2 row", c.name);
+            for &(m, k, n) in &[(1usize, 8usize, 1usize), (129, 176, 257), (256, 64, 4095)] {
+                let why = wgmma_declines(c, m, k, n, H100_SMEM).unwrap_or_else(|| {
+                    panic!(
+                        "{}: {m}x{k}x{n}: an odd N under a v2 store must decline",
+                        c.name
+                    )
+                });
+                assert!(why.contains("EVEN N"), "{why}");
+            }
         }
 
         // K % 8 != 0: the NT row stride is K*2 B and a tensor map needs a multiple of 16.
