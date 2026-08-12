@@ -158,18 +158,29 @@ of derived levers attached.
 
 **(a) H100 pure-read bandwidth at a grid-sized launch.** The only read-only H100 number the repo
 owns is `reduce (1N r): 682.1 GB/s` (`r5-hbm.log:53`), and it is **not a device bound** -- it is our
-kernel's, at a grid of `RED_GRID = 256` CTAs of `RED_BLOCK = 256` threads (`gpu.rs:1302-1303`), a
-constant chosen on a 20-SM part. 256 CTAs on 132 SMs is 1.94 CTAs/SM. Copy and saxpy in the same
-test size their grids from the element count (`gpu.rs:1219-1221`, `LaunchConfig::for_num_elems`) and
-land at 2922.3 and 2567.0 GB/s; the reduce is the one arm with a hardcoded grid, and it is the one
-arm at 20.3%.
+kernel's, at a grid of `RED_GRID = 256` CTAs of `RED_BLOCK = 256` threads (`gpu.rs:1302-1303`).
+Copy and saxpy in the same test size their grids from the element count (`gpu.rs:1219-1221`,
+`LaunchConfig::for_num_elems`) and land at 2922.3 and 2567.0 GB/s; the reduce is the one arm with a
+fixed grid, and it is the one arm at 20.3%. 256 CTAs on 132 SMs is 1.94 CTAs/SM.
+
+> **FACT(repo), and it changes what may be done about that.** `RED_GRID` is **not** a tuning
+> constant and nothing in this tree ties its value to any device's SM count. It is a *determinism
+> contract*, stated at its definition (`gpu.rs:1300-1301`) in the tree's own words: *"The grid is
+> independent of input size and occupancy, so the GPU result is identical run-to-run (determinism by
+> fixed decomposition, not associativity)."* The same constant sizes the **product** reduction under
+> `--backend=gpu` -- `gpu::reduce` allocates `RED_GRID` partials and launches that grid
+> (`gpu.rs:1361-1363`), reached from `wukong_driver::gpu_accel.rs:155` -- as well as the
+> `hbm_bandwidth` bench's reduce arm (`gpu.rs:23538-23544`). **Changing `RED_GRID` therefore changes
+> the offload path's reduction decomposition, not a bench knob**, and a size-dependent grid is
+> exactly what that comment forbids. The measurement in `d1_readbw` is a *bench-local* grid; the
+> constant, and the product reduce, stay as they are.
 
 > **DERIVED, and it is the single most important sentence in section 1: the campaign has never
 > measured H100 read bandwidth at a grid that covers the machine.** Decode is a pure-read workload.
 > Every floor in this dossier is quoted at the copy figure, 2922.3 GB/s, and the honest band on any
 > pure-read term is `[bytes/2922.3, bytes/682.1] GB/s` -- a factor of **4.28** -- until one launch
-> closes it. Section 12.4 makes that launch row 1 of the round, and it costs a two-line change to a
-> grid constant.
+> closes it. Section 12.4 makes that launch row 1 of the round, and it costs a bench-local grid in
+> `hbm_bandwidth`'s reduce arm -- **not** an edit to `RED_GRID`.
 
 **(b) H100/Linux per-launch overhead.** The repo's only launch-overhead constant is 250-280 us for
 168 launches (`serving.md:148`) = **1.49-1.67 us/launch on Windows/WDDM**. `BENCHMARKS.md:2464-2474`
@@ -1087,7 +1098,9 @@ interpretable without them.
   row              arm                                              shapes / config                    from
   --- denominators (run first; each is seconds) ---
   d1_readbw        hbm_bandwidth with a DEVICE-SIZED reduce grid    n = 64 Mi f32                      1.4(a)
-                   (RED_GRID 256 -> blocks_per_sm * sm_count)
+                   (a BENCH-LOCAL grid = blocks_per_sm * sm_count;
+                    RED_GRID stays 256 -- it is the product reduce's
+                    determinism contract, gpu.rs:1300-1301, :1361-1363)
   d2_launch        448 empty launches eager vs 1 graph replay       448                                7
   d3_gemmbw        achieved bandwidth of ONE decode GEMM launch     M=64,  N=1024, K=4096 (wk-shaped)  4.3
                    (and its 64-CTA sibling)                         M=64,  N=4096, K=4096 (wq-shaped)
@@ -1112,8 +1125,9 @@ interpretable without them.
 ### 12.3 Round-level refusals
 
 * **Publish nothing until `d1_readbw` has run.** Every floor in this dossier divides by 2922.3 GB/s,
-  a copy figure, on a pure-read workload whose only measured read number is a 4050-shaped grid at
-  682.1 GB/s. That is a 4.28x band and it sits under every claim.
+  a copy figure, on a pure-read workload whose only measured read number came off the reduce's fixed
+  256-CTA determinism grid at 682.1 GB/s -- 1.94 CTAs/SM on this part. That is a 4.28x band and it
+  sits under every claim.
 * **No serving ratio without its batch and its context.** Section 9.2: the same attention win is
   1.17x or 1.77x of the step depending on the batch. A ratio without its shape is not a result.
 * **No peer ratio before `p0_disp`.** A gain inside the contender's own dispersion is not a result
@@ -1135,7 +1149,7 @@ free-or-seconds and should all be in the same container.**
 
 | # | Cannot be derived | Why | The measurement |
 |---|---|---|---|
-| 1 | **H100 read-only bandwidth at a machine-sized grid** | the only read number is `reduce` at a hardcoded 256-CTA grid (`gpu.rs:1302`); copy carries a write stream | `d1_readbw`: size the reduce grid from `sm_count`. Two lines, one launch, seconds |
+| 1 | **H100 read-only bandwidth at a machine-sized grid** | the only read number is `reduce` at the fixed 256-CTA *determinism* grid (`gpu.rs:1300-1303`); copy carries a write stream | `d1_readbw`: give the **bench's** reduce arm (`gpu.rs:23538-23544`) its own `sm_count`-sized grid. `RED_GRID` and the product reduce (`gpu.rs:1361-1363`) are not touched. One launch, seconds |
 | 2 | **Whether the decode-attention kernel is LSU-bound or HBM-bound** | decides whether the `v4` rewrite is 1x or up to 8x; the plan's 1.6-2.0x is FACT(ext) sizing and is declined | `a1_v4` A/B against the scalar kernel, with an `==` gate |
 | 3 | **Whether the g-fold costs HBM bytes or only L1/L2 requests** | decides whether the tiled q-group is rank 1 or rank 5, and whether the plan's "4x that" stands | measure DRAM read bytes for one step; divide by `2*L*ctx*kv_heads*hd*2*B`. Ratio ~1 or ~g |
 | 4 | **Achieved bandwidth of a 16-CTA and a 64-CTA decode GEMM** | the entire size of lever 2 (split-K), 1.0x to 6.6x | `d3_gemmbw`, two launches |
@@ -1196,7 +1210,7 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 | Norm planner: `MIN_ELEMS_PER_LANE`, `MAX_WARPS_PER_ROW`, `FILL_CTAS_PER_SM`, `OCCUPANCY_WARPS`, `warps_per_row`, `norm_launch`, the 4050 sweep table | `crates/wukong_codegen_gpu/src/ptx_norm.rs:1-42`, `:56`, `:70`, `:75`, `:87`, `:570-629`, `:667` |
 | Megakernel launch layer: grid barrier, `max_resident_ctas`, `plan_grid`, and "still emits the block-scoped form today" | `crates/wukong_codegen_gpu/src/megakernel.rs:26-49`, `:62`, `:96-102`, `:294-358` |
 | CUDA graph mechanics and the pool prerequisite | `crates/wukong_codegen_gpu/src/graph.rs:1-30` |
-| `RED_GRID`/`RED_BLOCK`, `stream_cfg`, `hbm_bandwidth`, `best_bw`, `decode_stack_latency` | `crates/wukong_codegen_gpu/src/gpu.rs:1219-1221`, `:1302-1303`, `:23488-23595`, `:25087` |
+| `RED_GRID`/`RED_BLOCK` **and the determinism rationale for the fixed grid**, the product `gpu::reduce` that consumes it, `stream_cfg`, `hbm_bandwidth` (its reduce arm at `:23538-23544`), `best_bw`, `decode_stack_latency` | `crates/wukong_codegen_gpu/src/gpu.rs:1219-1221`, `:1300-1303`, `:1361-1363`, `:23488-23595`, `:25087`; the offload caller at `crates/wukong_driver/src/gpu_accel.rs:155` |
 | The device-free module set (117) and the ptxas census corpus (wmma+flash+wgmma only) | same file, `:8247`, `:8473-8488`, `:8624`; `:22217`, `:22250-22335` |
 | FA2 wheel audit and the `fwd_kvcache` requirement; the `::marlin` device dispatcher | `tools/cloud/modal_app.py:1297-1413`, `:3948-3957` |
 | The 4050 serving ledger, quarantined in 1.2 | `prompts/results/serving.md:100-107`, `:139-154`, `:191-233`, `:263-265`; `BENCHMARKS.md:51` (the standing-index scope note quoted in the device-scope block), `:366-377` (the results-table scope note, different words), `:395`, `:2466-2490` |
