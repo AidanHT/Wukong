@@ -388,16 +388,101 @@ pub(crate) const HOPPER_GATE_SHAPES: [(usize, usize, usize); 3] = [
 ///   `#[ignore]`d tests; `::test` never reaches one. Routing a name through the wrong one selects
 ///   zero tests, prints `0 passed` and exits 0 — the 2026-08-11 vacuous bring-up run, $0.006 of
 ///   H100, for which `ptx_wgmma`'s own visit constant grew the same law.
+/// - **the selected test must not be able to SKIP ITSELF.** Both of the above can hold and the run
+///   still assert nothing: the gate capability-skips off Hopper, so on any non-Hopper container —
+///   and `WK_GPU` defaults to `L40S`, one forgotten export away — it printed `[skip]`, returned,
+///   and libtest reported `ok`. Same green product as the vacuous run, reached a third way. So the
+///   invocation carries `WK_GPU=H100`, `::test` turns that into [`REQUIRED_CC_ENV`], and the gate
+///   escalates its capability skip to a FAILURE when the round declared a part this route takes
+///   ([`capability_skip_is_a_failure`]). `WUKONG_GPU_REQUIRED=1` cannot be that lever — `::test`
+///   sets it on every device run, including the routine `WK_GPU=L4 ::test`, where skipping a
+///   Hopper-only gate is the correct outcome.
 ///
 /// So the gate is a plain `#[test]` behind a capability skip and this is a `::test --filter` line.
 /// `--release` because `::test` then requires the release test binaries `::build --release` stages,
 /// which is what the campaign already builds; `--detach` because a local DNS flake has killed a
-/// healthy round before. [`tests::the_hopper_gate_invocation_reaches_a_gate_that_can_fail`] checks
-/// all of it textually, on a laptop, against both files.
+/// healthy round before. **No `--no-driver`**, which `::test` documents as producing a vacuously
+/// zero `rc2` (it gates the only invocation that can reach this test on that flag).
+/// [`tests::the_hopper_gate_invocation_reaches_a_gate_that_can_fail`] checks all of it textually, on
+/// a laptop, against both files.
 #[cfg(test)]
 pub(crate) const HOPPER_GATE_INVOCATION: &str = "WK_GPU=H100 modal run --detach \
      tools/cloud/modal_app.py::test \
      --filter gpu_backend_linear_routes_through_wgmma_on_hopper --release";
+
+/// **The compute capability the round DECLARED it was renting**, exported by `modal_app.py::test`
+/// from `WK_GPU` through that file's own `_cc_for_sku` device table (`sm_90` for an H100/H200,
+/// `sm_89` for an L4/L40S, …). Absent everywhere else, which is exactly right: a laptop or a
+/// device-free CI runner declares nothing and every capability gate skips as before.
+///
+/// # Why this and not `WUKONG_GPU_REQUIRED`
+///
+/// `WUKONG_GPU_REQUIRED=1` answers "is a device expected", and `::test` sets it on **every** device
+/// run — including the routine `WK_GPU=L4 ::test` this repo does most often. Escalating an
+/// *architecture* skip on it would turn every non-Hopper suite red for a gate that is correctly
+/// skipping, which is why `wukong_codegen_gpu`'s `with_hopper` does not escalate on it either. What
+/// was missing is the other question: **which part did this round pay for.** Nothing in the harness
+/// compared the probed device against the requested SKU — `::test` prints `Device suite on {WK_GPU}`,
+/// the REQUEST — so a pinned single-test H100 invocation landing on an sm_89 container printed a
+/// green PASS having exercised nothing at all.
+#[cfg(test)]
+pub(crate) const REQUIRED_CC_ENV: &str = "WUKONG_GPU_REQUIRE_CC";
+
+/// `sm_90` / `9.0` / `90` -> `(9, 0)`; anything unparseable (or empty) -> `None`, which reads as
+/// "this round declared nothing" and escalates no skip.
+///
+/// The `sm_XX` spelling is the one `modal_app.py`'s `_DEVICE_SPEC` uses and the one a device reports;
+/// the dotted form is what a human types. In the undotted form the **last digit is the minor**, which
+/// is what makes `sm_100` Blackwell `(10, 0)` and not `(100, 0)` — the same reading `ptx_target`
+/// applies to a module's `.target` line.
+#[cfg(test)]
+pub(crate) fn parse_required_cc(s: &str) -> Option<(i32, i32)> {
+    let t = s.trim().to_ascii_lowercase();
+    let t = t.strip_prefix("sm_").unwrap_or(&t);
+    if let Some((maj, min)) = t.split_once('.') {
+        return Some((maj.trim().parse().ok()?, min.trim().parse().ok()?));
+    }
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 2 {
+        return None;
+    }
+    let (maj, min) = digits.split_at(digits.len() - 1);
+    Some((maj.parse().ok()?, min.parse().ok()?))
+}
+
+/// [`REQUIRED_CC_ENV`], parsed. Read at each call rather than cached, for the reason
+/// [`wgmma_disabled_by_env`] gives.
+#[cfg(test)]
+pub(crate) fn required_cc() -> Option<(i32, i32)> {
+    std::env::var(REQUIRED_CC_ENV)
+        .ok()
+        .as_deref()
+        .and_then(parse_required_cc)
+}
+
+/// **Whether a capability skip on this device is the CORRECT outcome or a vacuous green run.**
+///
+/// The rule is the routing rule, asked twice, which is the point: a skip is a failure exactly when
+/// the capability the round *declared it rented* would have taken the wgmma route and the capability
+/// it actually *probed* does not. So a `WK_GPU=L4` round skips (sm_89 declines by design), a
+/// `WK_GPU=B200` round skips (`sm_90a` is an architecture LOCK, so Blackwell correctly declines),
+/// a laptop with no declaration skips — and only the case the campaign pays for, a declared Hopper
+/// part that turned out not to be one, fails.
+///
+/// `wgmma_off` is passed as `false` on purpose at both ends: the question is about the HARDWARE the
+/// round booked, not about the same-binary A/B switch. A round that sets `WUKONG_GPU_NO_WGMMA` and
+/// then selects this gate fails at the gate's own eligibility assertion, with a better message.
+#[cfg(test)]
+pub(crate) fn capability_skip_is_a_failure(
+    probed: (i32, i32),
+    required: Option<(i32, i32)>,
+) -> bool {
+    let Some(req) = required else {
+        return false;
+    };
+    gemm_route_for(req, false) == GemmRoute::Wgmma
+        && gemm_route_for(probed, false) != GemmRoute::Wgmma
+}
 
 /// The 16-bit input type the **f32** seam feeds `wgmma`.
 ///
@@ -1433,21 +1518,49 @@ mod tests {
         attrs
     }
 
-    /// **The Hopper gate is only a gate if the invocation reaches it AND the entrypoint can fail.**
+    /// Where a top-level `modal_app.py` function ends: at the next decorator.
+    const PY_FN_END: &str = "\n@app.function";
+    /// Where a four-space-indented Rust fn ends: at its own closing brace, alone on its line.
+    const RS_FN_END: &str = "\n    }\n";
+
+    /// The text from `decl` to the first `end` marker after it — one function's body, so a
+    /// `contains` check about one function cannot be satisfied by a neighbour's prose. Whole-file
+    /// `contains` is what let the counter check below drift onto any text in the file at all.
     ///
-    /// Both halves have burned rented time in this repo already. The *selector* half is the
-    /// 2026-08-11 vacuous bring-up (`::bench` appends `--ignored` and the gate was a plain `#[test]`,
-    /// so zero tests ran and the run exited 0 for $0.006); `ptx_wgmma`'s visit constant grew a law
-    /// against it, and this is that law for the driver's own gate. The *exit-status* half is
-    /// narrower and worse: `modal_app.py`'s `bench()` ran its child `check=False` and then returned
-    /// without a `sys.exit`, so even a selected, executed, **failing** assertion produced a green
-    /// `modal run --detach`. The witness assertion this gate exists for could therefore fail on H100
-    /// and be reported as a completed round.
+    /// `end` is the caller's ([`PY_FN_END`] or [`RS_FN_END`]) because the two languages scanned here
+    /// end a function differently, and it is a named constant rather than a literal at each call
+    /// site because an escaped newline written inline is one stray reformat away from becoming a
+    /// real line break inside the literal.
+    fn body_of<'a>(src: &'a str, decl: &str, end: &str) -> &'a str {
+        let at = src
+            .find(decl)
+            .unwrap_or_else(|| panic!("`{decl}` is not in the scanned source"));
+        let rest = &src[at..];
+        let e = rest.find(end).map(|x| x + end.len()).unwrap_or(rest.len());
+        &rest[..e]
+    }
+
+    /// **The Hopper gate is only a gate if the invocation reaches it, the gate cannot skip itself,
+    /// AND the entrypoint can fail.**
     ///
-    /// Textual and device-free, over the two files that carry the fact:
-    /// [`HOPPER_GATE_INVOCATION`] names a test that exists in `lib.rs`, is not `#[ignore]`d, and is
-    /// routed through the entrypoint whose selector reaches a plain `#[test]` — and that entrypoint,
-    /// in `modal_app.py`, still ends in a `sys.exit`.
+    /// All three have burned rented time in this repo or were one export away from it. The
+    /// *selector* half is the 2026-08-11 vacuous bring-up (`::bench` appends `--ignored` and the gate
+    /// was a plain `#[test]`, so zero tests ran and the run exited 0 for $0.006); `ptx_wgmma`'s visit
+    /// constant grew a law against it, and this is that law for the driver's own gate. The
+    /// *exit-status* half is narrower and worse: `modal_app.py`'s `bench()` ran its child
+    /// `check=False` and then returned without a `sys.exit`, so even a selected, executed,
+    /// **failing** assertion produced a green `modal run --detach`. The *self-skip* half is the
+    /// third: the gate capability-skips off Hopper, so the pinned single-test invocation printed
+    /// PASS on any non-Hopper container — and `WK_GPU` defaults to `L40S`.
+    ///
+    /// Textual and device-free, over the two files that carry the fact. Each assertion below pins
+    /// one link of that chain, and the two that used to be loose are now specific:
+    /// - the invocation must not carry `--no-driver`, which `::test` itself documents as producing a
+    ///   vacuously zero `rc2` — it gates the only cargo invocation that can reach this test on that
+    ///   flag, so `--no-driver` would select zero driver tests and keep this law green;
+    /// - the entrypoint's `sys.exit` must **carry the child's status**, not merely appear: every
+    ///   `rc… = _run(..)` in the body has to be named by the condition guarding an exit, or a fourth
+    ///   cargo invocation whose status is dropped — the exact 2026-08 defect — passes again.
     #[test]
     fn the_hopper_gate_invocation_reaches_a_gate_that_can_fail() {
         let inv = HOPPER_GATE_INVOCATION;
@@ -1463,6 +1576,27 @@ mod tests {
             !inv.contains("::bench") && !inv.contains("--name "),
             "`--name` is ::bench's selector and ::bench appends --ignored, which would select ZERO \
              tests here and exit 0: {inv}"
+        );
+        let modal = include_str!("../../../tools/cloud/modal_app.py");
+        let test_body = body_of(modal, "def test(", PY_FN_END);
+        // **`--no-driver` selects zero driver tests and exits 0.** `::test` runs `-p wukong_driver`
+        // only `if driver:`, and its own comment records the hazard ("with `--no-driver`, rc2 is 0
+        // by construction and the unparenthesized conditional printed 'driver: PASS' for a suite
+        // that never ran"). The default is the other half of the same fact.
+        assert!(
+            !inv.contains("--no-driver") && !inv.contains("--driver false"),
+            "`--no-driver` would skip the `-p wukong_driver` invocation entirely — zero tests \
+             selected, rc2 = 0 by construction, a green run that never reached this gate: {inv}"
+        );
+        assert!(
+            modal.contains("driver: bool = True"),
+            "`::test` no longer runs the driver suite by default, so an invocation that does not \
+             ASK for it (this one) selects zero driver tests"
+        );
+        assert!(
+            test_body.contains("if driver:"),
+            "`::test` no longer gates the driver cargo invocation on `driver`, so this law's \
+             `--no-driver` reasoning has gone stale and must be re-derived"
         );
 
         // The selector, and the test it must reach.
@@ -1488,29 +1622,164 @@ mod tests {
             "`{name}` is #[ignore]d, so `::test` — which never passes --ignored — would select zero \
              tests and exit 0 having proven nothing: {attrs:?}"
         );
-        // ...and it is the gate we think it is: the witness assertion, not just any test.
+        // ...and it is the gate we think it is: the witness assertion, not just any test. Scoped to
+        // the named function's own body, so no neighbour's prose can satisfy it.
+        let gate = body_of(lib, &format!("fn {name}("), RS_FN_END);
         assert!(
-            lib.contains("(accel.gemm_wgmma_calls, accel.gemm_existing_calls),"),
+            gate.contains("(accel.gemm_wgmma_calls, accel.gemm_existing_calls),"),
             "`{name}` no longer compares the per-route counters, so the invocation is pinned to a \
              gate that cannot tell a wgmma launch from a fallback"
         );
 
+        // **The self-skip half.** The invocation books a SKU; `::test` turns that into the declared
+        // capability; the gate escalates its capability skip against it. Every link is checked,
+        // because any one of them missing restores "PASS while exercising nothing".
+        let sku = inv
+            .split("WK_GPU=")
+            .nth(1)
+            .expect("the invocation must name the SKU it books")
+            .split_whitespace()
+            .next()
+            .expect("WK_GPU= carries no value");
+        // The harness's own device table decides what that SKU probes as — read, never assumed.
+        let row = modal
+            .split(&format!("(\"{sku}\", \""))
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{sku}` is not in modal_app.py's _DEVICE_SPEC table"));
+        let sku_cc = parse_required_cc(row.split('"').next().unwrap_or(""))
+            .unwrap_or_else(|| panic!("_DEVICE_SPEC's cc for `{sku}` is unparseable"));
+        assert_eq!(
+            gemm_route_for(sku_cc, false),
+            GemmRoute::Wgmma,
+            "the invocation books {sku} (cc {sku_cc:?} per _DEVICE_SPEC), which this route does NOT \
+             take — so the gate would capability-skip and the round would prove nothing"
+        );
+        // The EXPORT, not the name: `::test`'s docstring mentions the variable too, and a law that
+        // a doc paragraph can satisfy is the same class of defect as the one being fixed here.
+        assert!(
+            test_body.contains(&format!("env[\"{REQUIRED_CC_ENV}\"] = "))
+                && test_body.contains("_cc_for_sku(WK_GPU)"),
+            "`::test` no longer exports {REQUIRED_CC_ENV} from the requested SKU, so the gate has \
+             nothing to escalate against and a non-Hopper container prints PASS again"
+        );
+        assert!(
+            gate.contains("capability_skip_is_a_failure(cc, gpu_accel::required_cc())"),
+            "`{name}` no longer escalates its capability skip, so the pinned single-test invocation \
+             self-skips to a green PASS on any container that is not the SKU it paid for"
+        );
+
         // The entrypoint half: a Modal function that runs a gate must be able to fail. `bench` is
         // included because it is where this gate used to be routed and where every sweep still is.
-        let modal = include_str!("../../../tools/cloud/modal_app.py");
         for entry in ["def test(", "def bench("] {
-            let at = modal
-                .find(entry)
-                .unwrap_or_else(|| panic!("`{entry}` is not in modal_app.py"));
-            let body = &modal[at..];
-            let end = body.find("\n@app.function").unwrap_or(body.len());
+            let body = body_of(modal, entry, PY_FN_END);
+            // Every child status the function collects must be named by the condition guarding an
+            // exit. `contains("sys.exit")` alone was satisfied by ANY exit — a later unrelated
+            // bail-out would have kept this green with `rc` dropped again.
+            let collected: Vec<&str> = body
+                .lines()
+                .filter_map(|l| l.trim().split_once(" = _run(").map(|(v, _)| v.trim()))
+                .filter(|v| v.starts_with("rc"))
+                .collect();
             assert!(
-                body[..end].contains("sys.exit"),
-                "`{entry}` runs cargo test with check=False and never exits non-zero, so a FAILED \
-                 assertion inside it completes as a green `modal run` — the defect this law exists \
-                 for"
+                !collected.is_empty(),
+                "`{entry}()` no longer captures any `_run` status; this law cannot say whether it \
+                 propagates one"
+            );
+            let mut guard: Option<&str> = None;
+            let mut prev = "";
+            for line in body.lines() {
+                let t = line.trim();
+                if t.contains("sys.exit(") && prev.starts_with("if rc") && prev.ends_with(':') {
+                    guard = Some(prev);
+                    break;
+                }
+                if !t.is_empty() {
+                    prev = t;
+                }
+            }
+            let guard = guard.unwrap_or_else(|| {
+                panic!(
+                    "`{entry}()` has no `if rc..: sys.exit(..)` — it runs cargo test `check=False` \
+                     and then returns, so a FAILED assertion inside it completes as a green `modal \
+                     run`, the defect this law exists for"
+                )
+            });
+            let tokens: Vec<&str> = guard
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .collect();
+            for rc in collected {
+                assert!(
+                    tokens.contains(&rc),
+                    "`{entry}()` captures `{rc}` from a cargo invocation but `{guard}` does not \
+                     name it, so that suite's failure is dropped"
+                );
+            }
+        }
+    }
+
+    /// **The declared capability, parsed the way the harness spells it.**
+    ///
+    /// `modal_app.py`'s `_DEVICE_SPEC` writes `sm_90`; a human types `9.0`; a device reports `90`.
+    /// All three must land on the same pair, and the undotted form's **last digit is the minor** —
+    /// the reading that makes Blackwell's `sm_100` `(10, 0)` rather than `(100, 0)`, which would
+    /// silently declare a capability no rule in this file can match.
+    #[test]
+    fn the_declared_capability_parses_every_spelling_the_harness_uses() {
+        for s in ["sm_90", "SM_90", "9.0", "90", " sm_90 "] {
+            assert_eq!(parse_required_cc(s), Some((9, 0)), "{s}");
+        }
+        assert_eq!(parse_required_cc("sm_89"), Some((8, 9)));
+        assert_eq!(
+            parse_required_cc("sm_100"),
+            Some((10, 0)),
+            "Blackwell is 10.0, not 100.0"
+        );
+        assert_eq!(parse_required_cc("sm_120"), Some((12, 0)));
+        assert_eq!(
+            parse_required_cc("sm_90a"),
+            Some((9, 0)),
+            "the arch-locked spelling"
+        );
+        // Nothing declared is not a declaration of nothing: it must never escalate a skip.
+        for s in ["", "   ", "sm_", "9", "hopper", "sm_x0"] {
+            assert_eq!(parse_required_cc(s), None, "{s:?}");
+        }
+    }
+
+    /// **When a capability skip is the correct outcome, and when it is a vacuous green run.**
+    ///
+    /// The rule is the routing rule asked twice — of the part the round DECLARED and of the part it
+    /// PROBED — so it cannot drift from what the gate actually needs. The row that matters is the
+    /// one the finding named: a declared H100 landing on an sm_89 container, which printed PASS
+    /// having executed no wgmma instruction. Device-free, like every other rule here.
+    #[test]
+    fn a_declared_hopper_round_may_not_capability_skip_itself_green() {
+        assert!(
+            capability_skip_is_a_failure((8, 9), Some((9, 0))),
+            "the round paid for Hopper and got Ada: skipping here is a green run that asserted \
+             nothing, which is the whole defect"
+        );
+        assert!(
+            !capability_skip_is_a_failure((9, 0), Some((9, 0))),
+            "declared Hopper, probed Hopper — the gate RUNS, so there is no skip to escalate"
+        );
+        for declared in [(8, 9), (8, 0), (7, 5), (10, 0), (12, 0)] {
+            assert!(
+                !capability_skip_is_a_failure((8, 9), Some(declared)),
+                "a round that declared cc {declared:?} did not book a part this route takes, so \
+                 skipping is CORRECT — `sm_90a` is an architecture lock, which is why Blackwell is \
+                 in this list beside Ada"
             );
         }
+        assert!(
+            !capability_skip_is_a_failure((8, 9), None),
+            "a laptop or a device-free CI runner declares nothing and must skip exactly as before"
+        );
+        // And the env plumbing itself, end to end, on a value the harness really produces.
+        assert!(capability_skip_is_a_failure(
+            (8, 9),
+            parse_required_cc("sm_90")
+        ));
     }
 
     /// **A tripwire for wave 4's G21, aimed at the one caller that cannot see it fire.**
