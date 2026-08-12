@@ -118,8 +118,11 @@ Current standing (recorded):
   — the peer's own twin arms disagreed by ±15.47%, over the ±5% bar, so no number was minted (bf16
   resolved there and reads 49.5%, a 32-CTA problem on 132 SMs). The dominant lever was the fused
   `st.global.v2.f32` epilogue (**+25.2 / +15.3 / +10.1 points** at the three square shapes — the only
-  single-axis reading of it, and on the *clustered* arm), moving
-  the six resolvable shapes from ≈61% to **≈88%** of cuBLAS; that suite-level move also carries the
+  single-axis reading of it, and on the *clustered* arm). **The suite-level move behind it is a bf16
+  pair**, the only dtype measured both before and after in this visit: **60.8% → 87.3%** over the six
+  resolvable shapes. f16's after is **87.9%**; its scalar baseline is the *previous* visit's round
+  (**61.7%**, `2026-08-10-h100-act2-wgmma-vs-cublas.log`), so the f16 pair is **cross-visit**. Either
+  suite-level move also carries the
   B-multicast cluster at four of the seven shapes, so it is not a single-axis number. A store-elided *diagnostic* arm (writes
   no C, ungateable, read only as a difference against the **clustered** arm it was cut from) sits at
   **114.0 / 101.1 / 101.8%** **at the three square shapes it was run on — and nowhere else**, so the
