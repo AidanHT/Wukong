@@ -959,6 +959,7 @@ dependencies = [
 name = "wukong_driver"
 version = "0.1.0"
 dependencies = [
+ "half",
  "wukong_ast",
  "wukong_autodiff",
  "wukong_backend",
