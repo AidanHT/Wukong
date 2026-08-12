@@ -115,7 +115,8 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   down-projection, with **1024³ refused** because the peer's own twin arms disagreed by ±15.47%;
   HBM copy reaches **87.2% of the 3352 GB/s spec peak**; and the **fused int8 GEMM+dequant beats the
   cuBLAS GEMM+dequant chain 1.08–1.15× at 1024³/2048³** (the first outright peer win on Hopper — it
-  loses at 4096³, 0.79×).
+  loses at 4096³, 0.79×). The GEMM figures went through the twin-controlled instrument; **the HBM and
+  int8 figures did not** — those are single-shot rounds, labelled as such in `BENCHMARKS.md`.
 
   > **Device scope (2026-08-11) for the H100 paragraph:** those figures are **H100 80GB HBM3**
   > figures (Hopper, `sm_90a`, 132 SMs, 50 MiB L2, Linux container, cuBLAS with f32 output as the

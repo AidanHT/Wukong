@@ -116,12 +116,17 @@ Current standing (recorded):
   `st.global.v2.f32` epilogue (**+25.2 / +15.3 / +10.1 points** at the three square shapes), moving
   the six resolvable shapes from ≈61% to **≈88%** of cuBLAS; a store-elided *diagnostic* arm (writes
   no C, ungateable, read only as a difference) sits at **114.0 / 101.1 / 101.8%**, so the mainloop is
-  already at or above the peer and everything still owed is epilogue plus wave overhead. Memory-bound
+  already at or above the peer and everything still owed is epilogue plus wave overhead. **The GEMM
+  readings above went through the instrument; the ones that follow did not** — they are single-shot
+  rounds with no provenance header, no A/C peer twin, no measured floor, no median-of-5 and no
+  publish gate, and a repeat under the instrument is owed. Memory-bound
   on the same part: copy **2922 GB/s = 87.2% of the 3352 GB/s spec peak** (≥90% not met). Quantized:
   the **fused int8 GEMM+dequant beats the cuBLAS GEMM+dequant chain 1.08× at 1024³ and 1.15× at
   2048³** — the first outright peer win on Hopper — and **loses at 4096³ (0.79×)**, because the int8
   GEMM underneath it is itself only **22–52% of cuBLAS IMMA** here: the 4050's tile/occupancy tuning
-  does not transfer and Hopper int8 needs its own search. Peer-bar fact, not a Wukong number:
+  does not transfer and Hopper int8 needs its own search. (Both of those are still *same-run*, and
+  the int8 arms are bit-for-bit gated against the `i32` oracle before timing; what they lack is the
+  twin, the floor and the gate.) Peer-bar fact, not a Wukong number:
   cuBLASLt on this device fuses RELU/GELU/BIAS at **both** f32 and f16 output, so only **SiLU** (and
   residual+activation) is absent from its epilogue enum. Full section and per-round log citations in
   `BENCHMARKS.md`.
