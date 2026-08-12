@@ -544,9 +544,10 @@ The plain-GEMM hook carries **one extra dispatch axis, the device architecture**
 (`cc_major == 9`) a recognized `C = A·Bᵀ` goes to the warpgroup-MMA + TMA family (`gemm_nt_wgmma`),
 the kernel the Act-2 campaign measures and which until then had no caller outside its own test module;
 on every other capability it takes the pre-Hopper launcher, unchanged. It is `== 9` and not `>= (9,0)`
-because `sm_90a` is architecture-*locked*. Every reason the family cannot take a call — the
-architecture, an unencodable tensor map (`K % 8 != 0`), an odd `N` under the `v2` store, an output past
-the epilogue's `u32` index, a ring larger than the device's opt-in shared memory, or an operand
+because `sm_90a` is architecture-*locked*. Every reason the family cannot take a call **that is
+decidable before the launch** — the architecture, an unencodable tensor map (`K % 8 != 0`), an odd `N`
+under the `v2` store, an output past the epilogue's `u32` index, a CTA grid past CUDA's `gridDim.y`
+ceiling, a ring larger than the device's opt-in shared memory, or an operand
 outside f16's *range* at either end (the seam converts f32 operands to f16 on the host: past 65504 an
 element comes back `inf` rather than merely rounded, and a **row** whose whole magnitude range is
 under f16's smallest normal 6.104e-5 comes back as a whole row — or, in `B`, column — of zeros, since
@@ -554,7 +555,10 @@ under f16's smallest normal 6.104e-5 comes back as a whole row — or, in `B`, c
 point. Overflow declines per element, underflow per **row** on that row's maximum — the granularity
 an output lane is actually decided at, and the one at which a quiet row inside a loud operand is
 visible at all — so an ordinary `U(-1,1)` buffer never trips it) — is a **decline to
-that same existing path**, never an error, so results are unchanged wherever it declines. Where it does
+that same existing path**, never an error, so results are unchanged wherever it declines. Two
+outcomes are not declines and are named as such rather than implied away: a driver rejection *at* the
+launch that is not `UNSUPPORTED` stays a hard error (a GPU failure is never silently answered on the
+CPU), and a launch that never retires exits the process with code 70 from the launch wait. Where it does
 route, the tolerance band widens rather than the contract: the wgmma family converts both operands to
 f16 on the host, so the driver's device gate sizes its band from the route that **actually ran** —
 per-route offload counters, not the device's capability, because a Hopper part is eligible at every

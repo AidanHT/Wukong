@@ -710,13 +710,22 @@ The `sgemm_nt` hook carries a **second dispatch axis, the device architecture**.
 `ptx_wgmma`'s shipped regime rule); on every other capability it takes the pre-Hopper launcher,
 unchanged. The rule is `== 9` and not `>= (9,0)` for the same reason the module header is: `sm_90a`
 is architecture-*locked*, so a Blackwell part must take the other path rather than be handed a module
-it cannot load. Every other reason the family cannot take a call — a shape whose tensor map is
-unencodable (`K % 8 != 0` makes the NT row stride not a multiple of 16 bytes), an output past the
-epilogue's `u32` element index, a ring larger than the device's opt-in shared memory, or an
-`UNSUPPORTED` from the generator — is likewise a **decline to the existing path**, never an error,
-and the launcher's own `assert!`s are pre-decided in the driver so a user's program can never abort
-on one. Ragged M/N/K are *not* declines: TMA zero-fills and the epilogue predicates. An **odd `N`
-is**, and it is the one decline the launcher does not make for itself: both shipped rows carry the
+it cannot load. Every other reason the family cannot take a call *that is decidable before the
+launch* — a shape whose tensor map is unencodable (`K % 8 != 0` makes the NT row stride not a
+multiple of 16 bytes), an output past the epilogue's `u32` element index, a ring larger than the
+device's opt-in shared memory, a CTA grid past CUDA's `gridDim.y` ceiling of 65535 (`LaunchPlan::grid`
+puts the M tiles on y, so `M` above ~8.4M with a small `N` reaches the driver as
+`CUDA_ERROR_INVALID_VALUE`), or an `UNSUPPORTED` from the generator — is likewise a **decline to the
+existing path**, never an error, and the launcher's own `assert!`s are pre-decided in the driver so a
+user's program can never abort on one. Two outcomes are deliberately *not* declines, and the module
+names both rather than implying a total guarantee: a driver rejection **at** the launch that is not
+`Unsupported` (a `cuModuleLoadData` refusing an `sm_90a` module on a driver that predates that
+virtual architecture, say) stays a `Some(Err(..))` hard error, because a GPU failure under
+`--backend=gpu` is never silently answered on the CPU; and a launch that never retires ends the
+process with `exit(70)` from the launch wait in `wukong_codegen_gpu::gpu`, since a wedged context
+blocks every later driver call anyway. Ragged M/N/K are *not* declines: TMA zero-fills and the
+epilogue predicates. An **odd `N` is**, and it is one of the two declines the launcher does not make
+for itself (the grid ceiling is the other): both shipped rows carry the
 `st.global.v2.f32` epilogue, whose 8-byte pair is aligned only when `N` is even, and a misaligned
 store is a *sticky* `CUDA_ERROR_MISALIGNED_ADDRESS` that fails every later call in the process
 rather than returning a wrong number. `gemm_nt_wgmma` asserts it only in its timing sibling, so the

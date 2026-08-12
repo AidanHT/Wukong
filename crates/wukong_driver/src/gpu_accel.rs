@@ -8,7 +8,11 @@
 //! Behind the driver's `gpu` feature, so the default toolchain-free build never compiles `cudarc`.
 //! A GPU error is surfaced as `Some(Err(..))`, never `None`: declining (`None`) means "fall back to
 //! the CPU kernel", and silently running on the CPU when the user asked for `--backend=gpu` would be
-//! dishonest. `None` is reserved for shapes/ops the GPU wrappers structurally don't cover.
+//! dishonest. `None` is reserved for shapes/ops the GPU wrappers structurally don't cover. There is
+//! a third outcome that is neither, and it belongs in the same sentence: a launch that never retires
+//! ends the process from inside `wukong_codegen_gpu::gpu`'s launch wait (`std::process::exit(70)`
+//! after the hung-kernel diagnosis), because a wedged context blocks every later driver call. See
+//! [`GemmRoute`] for both non-decline outcomes stated against the route that can reach them.
 //!
 //! # The Hopper `wgmma` route (Act 2, wave 4)
 //!
@@ -235,9 +239,36 @@ fn norm_supported(op: i64) -> bool {
 /// **Which GEMM family a recognized `C = A·Bᵀ` offload is sent to.**
 ///
 /// A routing decision, never an error: [`GemmRoute::Existing`] is the launcher this file called
-/// before wave 4 and its results are unchanged, so *every* reason the wgmma family cannot take a call
-/// — the architecture, the shape, an unencodable tensor map, a shared-memory budget — resolves to the
-/// same working path rather than to a failure.
+/// before wave 4 and its results are unchanged, so every reason the wgmma family cannot take a call
+/// that is **decidable before the launch** — the architecture, the shape, an unencodable tensor map,
+/// a shared-memory budget, a grid past the driver's `gridDim.y` ceiling, an operand outside the seam
+/// dtype's range, and the generator's own `UNSUPPORTED` — resolves to the same working path rather
+/// than to a failure.
+///
+/// # The two outcomes that are NOT that, named rather than implied
+///
+/// The sentence above used to read "*every* reason", full stop, and that was wider than the code.
+/// Two things a wgmma dispatch can do are neither a decline nor a result, and a reader deciding
+/// whether to route a new caller here has to know both:
+///
+/// 1. **A driver rejection at the launch is `Some(Err(..))` — a hard error on a call that had a
+///    working fallback.** [`GpuAccel::try_gemm_nt_wgmma`] falls back only on
+///    `GpuError::unsupported()`, and `GpuError` has exactly two variants: everything else is
+///    `GpuError::Driver` and is surfaced. The concrete one is a module load —
+///    `gemm_nt_wgmma` -> `raw_function_dyn` -> `cuModuleLoadData` — refusing an `sm_90a` binary on a
+///    driver too old to have that virtual architecture, since [`ptx_wgmma::Sm90aLicense`] gates on
+///    the *device's* capability and not on the driver's. That is deliberate rather than an
+///    oversight: this module's older and wider contract is that a GPU **failure** under
+///    `--backend=gpu` is never silently answered on the CPU, and a driver that rejects a module the
+///    device is capable of is a broken installation, not a shape this family declines. What it is
+///    not is invisible — which is why it is written here.
+/// 2. **A launch that never retires ends the PROCESS with exit code 70.** `gpu::sync_with_deadline`
+///    (the wait every launcher in that crate goes through) prints the hung-kernel diagnosis and
+///    calls `std::process::exit(70)` when `cuStreamQuery` is still `NOT_READY` at the deadline,
+///    because a wedged context blocks every later driver call anyway. A `.wk` program that reaches
+///    this seam therefore has a third exit path that neither returns nor falls back. The mechanism
+///    is the mbarrier/cluster kind of bug, i.e. a defect in the family rather than a property of the
+///    caller's shape, and `WUKONG_GPU_LAUNCH_TIMEOUT_MS` sets or disables the deadline.
 ///
 /// `pub(crate)` because the driver's own device gates must size their tolerance band by *route*
 /// rather than by device — see [`GpuAccel::try_gemm_nt_wgmma`].
@@ -573,6 +604,12 @@ fn operand_range_declines(dtype: WgmmaDtype, which: &str, xs: &[f32], k: usize) 
 /// same facts are decided here, first, and the launcher's asserts become unreachable rather than
 /// redundant.
 ///
+/// Two rules here are **nobody's** precondition, and they are the two that would otherwise leave
+/// [`GemmRoute`]'s contract false: an odd `N` (below) and CUDA's grid ceiling. Neither the launcher
+/// nor the generator checks either, and both turn into a driver failure — a sticky
+/// `CUDA_ERROR_MISALIGNED_ADDRESS` and a `CUDA_ERROR_INVALID_VALUE` — on a call that had a working
+/// fallback.
+///
 /// The tensor-map rules are **not** restated — [`ptx_wgmma::WgmmaCfg::tensor_map_a`] is asked to build
 /// the very descriptor the launcher will build and
 /// [`wukong_codegen_gpu::tma_host::TensorMapArgs::validate`] is asked whether it is encodable. One
@@ -583,6 +620,15 @@ fn operand_range_declines(dtype: WgmmaDtype, which: &str, xs: &[f32], k: usize) 
 /// predicates every store on `row < M && col < N`, which `wgmma_hopper_bringup` item 7 proves exact
 /// down to a 1×1 output. **An odd `N` under the v2 store is the one exception**, and it is not a
 /// raggedness rule — see below.
+/// CUDA's `gridDim.x` ceiling — `CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X`, `2^31 - 1` on every
+/// architecture this backend supports, which is why it is a constant rather than a probe.
+const MAX_GRID_X: u32 = i32::MAX as u32;
+
+/// CUDA's `gridDim.y` / `gridDim.z` ceiling — 65535, four orders of magnitude under the x one and
+/// the half that is actually reachable here, because [`ptx_wgmma::LaunchPlan::grid`] puts the M
+/// tiles on y.
+const MAX_GRID_YZ: u32 = 65_535;
+
 fn wgmma_declines(
     cfg: &WgmmaCfg,
     m: usize,
@@ -629,6 +675,23 @@ fn wgmma_declines(
         return Some(format!(
             "{} needs {} B of dynamic shared memory, this device grants {smem_budget} B",
             cfg.name, plan.dyn_smem_bytes
+        ));
+    }
+    // **The driver's grid ceiling, which nothing upstream checks.** `LaunchPlan::grid` indexes N
+    // tiles on x and M tiles on y, and CUDA caps y and z at 65535 while x gets the full 2^31-1
+    // (`CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_{X,Y,Z}`, invariant across every architecture this backend
+    // supports). `cluster_launch` asserts only that the grid is a multiple of the cluster, so
+    // `M > 8_388_480` with an `N` small enough to keep `M*N` inside the `u32` index above reaches
+    // `cuLaunchKernelEx` as `gridDim.y > 65535` and comes back `CUDA_ERROR_INVALID_VALUE` — a
+    // `GpuError::Driver`, i.e. `Some(Err(..))` on a call the pre-Hopper launcher would have run.
+    // It is decidable here, so it is decided here, and [`GemmRoute`]'s contract stays true.
+    let grid = plan.grid(m, n);
+    if grid.0 > MAX_GRID_X || grid.1 > MAX_GRID_YZ || grid.2 > MAX_GRID_YZ {
+        return Some(format!(
+            "{}: a {m}x{n} output needs a CTA grid of {grid:?}, past CUDA's grid ceiling \
+             ({MAX_GRID_X}, {MAX_GRID_YZ}, {MAX_GRID_YZ}) — the launch would be rejected as \
+             CUDA_ERROR_INVALID_VALUE, which is an error rather than a fallback",
+            cfg.name
         ));
     }
     // Both descriptors, from the config that will build them, checked by the encoder's own predicate.
@@ -1521,6 +1584,47 @@ mod tests {
         }
         // M*N past the epilogue's u32 element index.
         assert!(wgmma_declines(cfg, 65536, 64, 65536, H100_SMEM).is_some());
+
+        // **The grid ceiling: nobody's assert, and an ERROR rather than a fallback without this.**
+        // `LaunchPlan::grid` puts M tiles on y, which CUDA caps at 65535 (x gets 2^31-1, so only y
+        // is reachable). `N` is small on purpose: `M*N` has to stay inside the u32 element index
+        // checked above, or that decline shadows this one and the test proves nothing.
+        //
+        // The boundary is found by asking the PLAN, never by arithmetic on a tile size or a cluster
+        // shape this test would then have to know — the clustered row rounds the y axis up to a
+        // multiple of 2, and hard-coding `128 * 65535` lands on the wrong side of that.
+        let gplan = cfg.launch_plan();
+        let n_small = 510usize;
+        let (mut lo, mut hi) = (1usize, 1usize << 30);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if gplan.grid(mid, n_small).1 <= MAX_GRID_YZ {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let (fits_m, over_m) = (lo, lo + 1);
+        assert!(
+            (over_m as u64) * (n_small as u64) <= u32::MAX as u64,
+            "M*N = {over_m}*{n_small} must pass the u32 index check, or the grid rule is shadowed"
+        );
+        assert!(
+            gplan.grid(over_m, n_small).1 > MAX_GRID_YZ
+                && gplan.grid(fits_m, n_small).1 <= MAX_GRID_YZ,
+            "the search must straddle gridDim.y, or this test is vacuous"
+        );
+        let why = wgmma_declines(cfg, over_m, 64, n_small, H100_SMEM)
+            .expect("a grid past CUDA's gridDim.y ceiling must decline, not reach the driver");
+        assert!(why.contains("grid ceiling"), "{why}");
+        // ...and the tallest output whose grid fits must NOT decline: this is a ceiling, not a size
+        // limit, and a rule that also refused the shapes CUDA accepts would be a silent narrowing.
+        assert!(
+            wgmma_declines(cfg, fits_m, 64, n_small, H100_SMEM).is_none(),
+            "the largest grid CUDA accepts must still take the wgmma route: {:?}",
+            wgmma_declines(cfg, fits_m, 64, n_small, H100_SMEM)
+        );
+
         // And the budget: the ring that fits Hopper's carveout does not fit Ada's, which is the
         // assert that would fire first if the capability gate above were ever relaxed.
         let why = wgmma_declines(cfg, 4096, 4096, 4096, ADA_4050_SMEM)
