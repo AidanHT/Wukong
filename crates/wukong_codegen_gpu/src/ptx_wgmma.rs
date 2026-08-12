@@ -1358,6 +1358,19 @@ pub struct WgmmaCfg {
     /// registers, one instruction out of the drain-to-issue bubble, and a possible second-order win
     /// in how ptxas schedules -- the free component of the drain lever, and the one worth taking
     /// whatever the depth measures at.
+    ///
+    /// # "Out of the k-loop" is the whole claim -- NOT out of the tile loop
+    ///
+    /// Under a [`TileSchedule`] with a tile loop the hoist stops at `CTILE_`: one fence per TILE,
+    /// against `n_k` k-stages, which is all of 4b's content. Hoisting it out of the tile loop too
+    /// would leave ZERO fences between tile `t`'s epilogue -- which reads every accumulator with
+    /// `st.global` -- and tile `t+1`'s first `wgmma.mma_async`, which writes them through the async
+    /// proxy. The ISA exempts accumulator accesses made by successive `wgmma` of the same shape, not
+    /// a warp access in between, so a fence is required there.
+    /// `the_hoisted_fence_still_separates_a_tiles_epilogue_from_the_next_tile` pins the position,
+    /// and it constructs the `fence_hoisted` + persistent combination itself because no shipped row
+    /// carries both yet -- WAVE3_DOSSIER 4.5 puts that combination on the campaign's path
+    /// ("sequence 4c AFTER persistence so the hazard is exercised rather than latent").
     pub fence_hoisted: bool,
 }
 
@@ -6213,18 +6226,27 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     if persistent {
         s += "    mov.u32 %stg,0;\n    mov.u32 %phf,0;\n";
         s += "    setp.eq.u32 %ptrue,0,0;\n";
-        if cfg.fence_hoisted {
-            // **L4.7, the hoisted form**: exactly one `wgmma.fence` in the entry, outside every
-            // loop. It orders the accumulator registers against the async proxy before the first
-            // group; nothing between tiles WRITES them (the epilogue only reads), so one is enough
-            // and CUTLASS fences the mainloop rather than the k-tile for the same reason.
-            s += "    wgmma.fence.sync.aligned;\n";
-        }
         s += &format!("CTILE_{name}:\n");
         s += &format!("    setp.ge.u32 %p0,%cid,%nct;\n    @%p0 bra EXIT_{name};\n");
         s += &wgmma_tile_index_ptx(cfg);
         // G19 again, in the role that actually holds the accumulators.
         s += "    mov.u32 %kt,0;\n";
+        if cfg.fence_hoisted {
+            // **L4.7, the hoisted form -- hoisted out of the K LOOP, not out of the TILE loop.**
+            //
+            // 4b's whole content is "one fence per mainloop instead of one per k-stage", and that is
+            // what this is: one fence per tile against `n_k` k-stages, so `n_k - 1` of them leave
+            // the drain-to-issue bubble and the register cost stays zero. Hoisting it further --
+            // above `CTILE_` -- would emit ZERO fences between tile `t`'s epilogue and tile `t+1`'s
+            // first `wgmma.mma_async`, and that is a real hazard rather than a pedantic one: the
+            // epilogue's `st.global [..],%accN` is a WARP read of the accumulators and tile `t+1`'s
+            // first `wgmma` writes them. The ISA's exemption covers accumulator accesses *by
+            // successive wgmma of the same shape*; it does not cover a non-`wgmma` access in
+            // between, which is exactly what the store block is. So the fence belongs inside the
+            // tile loop, and `the_hoisted_fence_still_separates_a_tiles_epilogue_from_the_next_tile`
+            // asserts the position rather than the count.
+            s += "    wgmma.fence.sync.aligned;\n";
+        }
         if lag > 0 {
             // `%rel` lags `%stg` by the wait depth, so the first advance lands it on the stage this
             // tile's `%kt = 0` used. `%stg` carries across tiles, so this is recomputed from it
@@ -9184,6 +9206,11 @@ mod tests {
     /// least one must precede the first `wgmma.mma_async`. And when [`WgmmaCfg::fence_hoisted`] is
     /// set it must be OUTSIDE the k-loop body -- a hoist that left the fence inside the loop would
     /// measure as "the free lever does nothing", which is a plausible result and a wrong one.
+    ///
+    /// **`fence_hoisted` means "out of the k-loop", never "out of the tile loop"**, and the
+    /// difference is a hazard rather than a nicety -- see
+    /// `the_hoisted_fence_still_separates_a_tiles_epilogue_from_the_next_tile`, which is the law
+    /// that pins the position under a [`TileSchedule`] that has a tile loop at all.
     #[test]
     fn the_epilogue_drains_before_its_first_store_and_one_fence_precedes_the_first_wgmma() {
         for c in wgmma_all_emittable() {
@@ -9240,6 +9267,84 @@ mod tests {
                 } else {
                     "inside"
                 }
+            );
+        }
+    }
+
+    /// **The hoisted fence still separates a tile's epilogue from the next tile's first `wgmma`.**
+    ///
+    /// # The hazard, in the ISA's own terms
+    ///
+    /// `wgmma.fence.sync.aligned` orders a warpgroup's own accesses to its registers against the
+    /// async proxy that a `wgmma.mma_async` writes them through. The ISA exempts *accumulator*
+    /// accesses made by successive `wgmma.mma_async` of the same shape -- which is why the k-loop
+    /// needs no per-stage fence and why hoisting it (lever 4b) is free. It does NOT exempt a
+    /// non-`wgmma` access in between, and the epilogue's `st.global [..],%accN` is exactly that: a
+    /// warp read of every accumulator, immediately before tile `t+1`'s first `wgmma` writes them.
+    ///
+    /// So `fence_hoisted` under a tile loop must land INSIDE the tile loop. Hoisted above `CTILE_`
+    /// it would emit zero fences across the tile boundary -- a race no exactness gate on a
+    /// quiescent, one-tile guard kernel could see, and one that only appears once a config carries
+    /// both fields. WAVE3_DOSSIER 4.5 asks for exactly that config ("sequence 4c AFTER persistence
+    /// so the hazard is exercised rather than latent") and every depth arm carries
+    /// `fence_hoisted: true`, so the combination is on the campaign's path.
+    ///
+    /// # Why the subject is built here instead of read from the table
+    ///
+    /// No SHIPPED row combines the two today (the `_fh`/`_d1` rows are `OneTilePerCta` and the
+    /// persistent rows are depth 0), so a law that only walked `wgmma_all_emittable` would pass by
+    /// having nothing to check -- the vacuous-test failure mode this repo has been bitten by before.
+    /// The combination is therefore CONSTRUCTED, at both `TileSchedule` arms that have a tile loop
+    /// and at a depth, and its name comes from `derived_name` so the config is one `validate` would
+    /// accept rather than a hand-spelled string.
+    #[test]
+    fn the_hoisted_fence_still_separates_a_tiles_epilogue_from_the_next_tile() {
+        let fence = "wgmma.fence.sync.aligned;";
+        for (tiles, wait_depth) in [
+            (TileSchedule::Persistent, 0usize),
+            (TileSchedule::Persistent, 1),
+            (TileSchedule::PersistentDrained, 0),
+        ] {
+            let mut c = WgmmaCfg {
+                tiles,
+                wait_depth,
+                fence_hoisted: true,
+                ..WGMMA_W1_MCB_V2
+            };
+            let name: &'static str = Box::leak(c.derived_name().into_boxed_str());
+            c.name = name;
+            c.key = name;
+            c.validate()
+                .unwrap_or_else(|e| panic!("{name}: the combination must be emittable: {e}"));
+            let ptx = wgmma_module(&c, &license()).unwrap();
+            assert_eq!(ptx.matches(fence).count(), 1, "{name}");
+            let fence_at = ptx.find(fence).expect("asserted above");
+            let ctile_at = ptx
+                .find(&format!("CTILE_{name}:"))
+                .expect("a persistent arm has a tile loop");
+            let cloop_at = ptx
+                .find(&format!("CLOOP_{name}:"))
+                .expect("every entry has a k-loop");
+            assert!(
+                ctile_at < fence_at && fence_at < cloop_at,
+                "{name}: the hoisted fence must sit INSIDE the tile loop and OUTSIDE the k-loop. \
+                 Above CTILE_ there is no fence at all between tile t's st.global of %accN and \
+                 tile t+1's first wgmma write of the same registers, which the wgmma ordering \
+                 protocol requires one for."
+            );
+            // ...and the epilogue that reads the accumulators is downstream of the k-loop, so the
+            // ONE fence really does sit between the read and the next tile's write.
+            let cend_at = ptx
+                .find(&format!("CEND_{name}:"))
+                .expect("every entry has an epilogue");
+            assert!(cloop_at < cend_at && cend_at < ptx.len(), "{name}");
+            let cnext_at = ptx
+                .find(&format!("CNEXT_{name}:"))
+                .expect("a persistent arm advances its tile");
+            assert!(
+                cend_at < cnext_at,
+                "{name}: the tile advance must follow the epilogue, or the fence inside the tile \
+                 loop is not on the path between them"
             );
         }
     }
