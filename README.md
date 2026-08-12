@@ -112,8 +112,12 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   On a **datacenter part** — an **NVIDIA H100 80GB HBM3** (`sm_90a`, 132 SMs), measured 2026-08-11,
   a *different device* from every figure above — the `wgmma` + TMA GEMM measures **95.3% / 88.6% /
   92.3% of cuBLAS f16 (f32 out) at 2048³ / 4096³ / 8192³** and **97.3%** on the GPT FFN
-  down-projection, with **1024³ refused** because the peer's own twin arms disagreed by ±15.47%;
-  HBM copy reaches **87.2% of the 3352 GB/s spec peak**; and the **fused int8 GEMM+dequant beats the
+  down-projection, **but only 80.3% and 73.4% on the two wide-N FFN up-projections** (`4096×4096×1024`
+  and `4096×16384×4096`) — that is the whole f16 suite, six resolved rows, mean ≈88%. **1024³ is
+  refused** because the peer's own twin arms disagreed by ±15.47%. bf16 tracks f16 within ~2 points
+  on every shape that resolved in both, **except 1024³, where it resolves and reads 49.5%** — a
+  32-CTA problem on 132 SMs. HBM copy reaches **87.2% of the 3352 GB/s spec peak** (the campaign's
+  ≥90% milestone is *not* met); and the **fused int8 GEMM+dequant beats the
   cuBLAS GEMM+dequant chain 1.08–1.15× at 1024³/2048³** (the first outright peer win on Hopper — it
   loses at 4096³, 0.79×). The GEMM figures went through the twin-controlled instrument; **the HBM and
   int8 figures did not** — those are single-shot rounds, labelled as such in `BENCHMARKS.md`.
