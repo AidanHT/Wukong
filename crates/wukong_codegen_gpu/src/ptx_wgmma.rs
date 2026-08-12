@@ -868,10 +868,17 @@ pub enum TileSchedule {
     /// parity is the parity of its completion count, stages complete an unequal number of times
     /// when `ktiles % stages != 0`, and the only way to force them equal is to re-initialise
     /// barriers a peer may be signalling -- the classic cluster race the same checklist forbids. So
-    /// the drain is a RENDEZVOUS (one extra mbarrier, `empty_arrivals()` arrivals, consumers arrive
-    /// after the k-loop, the producer waits before advancing) rather than a pointer reset. It
-    /// delivers the measurement the arm exists for -- no fill overlap across the boundary -- without
-    /// the hang.
+    /// the drain is a RENDEZVOUS (one extra mbarrier, `empty_arrivals()` arrivals) rather than a
+    /// pointer reset.
+    ///
+    /// **Where the rendezvous sits is the measurement.** The consumers arrive AFTER the epilogue's
+    /// last store and the producer waits before advancing `%cid`, so the whole overlap window
+    /// 2.3 prices -- the last `stages` releases of tile `t` (`4 x 0.646 us`) **plus** `X_epi`
+    /// (`5.99 us`), 8.57 us against 7.85 us of fill -- is closed. An arrival above the store block
+    /// would close only the 2.58 us mainloop-tail half and leave 76% of the fill hidden, so the arm
+    /// would collect most of the ring's gain and be read as dispatch, which is exactly the reading
+    /// the dossier's falsifier depends on being impossible.
+    /// `the_drained_arms_rendezvous_closes_the_whole_overlap_window` is the textual law.
     PersistentDrained,
     /// **THE ARM**: a persistent tile loop with a CONTINUOUS ring. `%stg` and both phase parities
     /// carry across the tile boundary, so the producer runs straight on into the next tile's fill
@@ -6336,16 +6343,6 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     // will not invent a value it never computed.)
     s += &format!("    setp.eq.u32 %p0,%ktiles,0;\n    @%p0 bra EXIT_{name};\n");
     s += "    wgmma.wait_group.sync.aligned 0;\n";
-    if drained {
-        // **The drained arm's consumer half**: this tile's k-loop is fully retired, so tell the
-        // whole cluster's producers. It is placed HERE -- after the last `wgmma` and before the
-        // epilogue's stores -- because what the arm must prevent is tile `t+1`'s FILL overlapping
-        // tile `t`'s tail; the epilogue is `X_epi`, a different term, and the arm that attacks it is
-        // wave 4's.
-        s += &format!("    add.s64 %rdBar,%rdS,{};\n", cfg.tile_bar_off());
-        s += "    and.b32 %tmp,%lin,127;\n    setp.eq.u32 %p2,%tmp,0;\n";
-        s += &barrier_arrive_ptx(cfg);
-    }
     if hint_stores {
         // The epilogue's half of the hint, created once and BEFORE the transport splits: a C line is
         // written and never read, so every one that stays resident evicts an operand line a
@@ -6435,6 +6432,31 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
                 );
             }
         }
+    }
+    if drained {
+        // **The drained arm's consumer half, and its POSITION is the whole measurement.**
+        //
+        // The arm exists to answer one question: is the persistence gain the continuous ring, or is
+        // it CTA dispatch? To answer it the arm must give up the ring's overlap **entirely**, so
+        // that whatever it still wins over the one-tile-per-CTA control is dispatch and nothing
+        // else. WAVE3_DOSSIER 2.3 prices the overlap window as the last `stages` stage-releases of
+        // tile `t` plus the epilogue: `4 x 0.646 + X_epi 5.99 = 8.57 us` against `X_fill = 7.85 us`.
+        // An arrival placed above the store block closes only the 2.58 us mainloop-tail half of
+        // that window and leaves 5.99 us of it open -- **76% of the fill still hidden** -- so the
+        // arm would collect most of the ring's gain and be read as dispatch. That is a plausible
+        // number and a wrong one, and it would make the dossier's own falsifier ("if `g8_pstop`
+        // beats the control, dispatch matters and `X_fill` is not the mechanism") unreadable.
+        //
+        // So the arrival goes HERE, after the epilogue's last store: every instruction of tile
+        // `t`'s `X_epi` is issued before the producer may touch the ring for tile `t+1`.
+        //
+        // It cannot deadlock. The consumers' path to this arrival needs only copies this cluster's
+        // producers have already issued for tile `t`, and the `K == 0` early-out that skips the
+        // epilogue was taken far above -- before `mbarrier.init`, uniformly over the whole grid --
+        // precisely so that no consumer can ever reach `EXIT` without arriving here.
+        s += &format!("    add.s64 %rdBar,%rdS,{};\n", cfg.tile_bar_off());
+        s += "    and.b32 %tmp,%lin,127;\n    setp.eq.u32 %p2,%tmp,0;\n";
+        s += &barrier_arrive_ptx(cfg);
     }
     if persistent {
         // **The consumer's tile advance.** `%cid += %slots` is the static schedule of
@@ -9220,6 +9242,84 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// **The drained arm's rendezvous closes the WHOLE overlap window, not half of it.**
+    ///
+    /// # Why this is a law and not a comment
+    ///
+    /// [`TileSchedule::PersistentDrained`] is a measurement instrument, and the thing it measures is
+    /// a *difference*: whatever it wins over the one-tile-per-CTA control is CTA dispatch, because
+    /// it has given up the continuous ring. That reading is only available if it has given the ring
+    /// up **completely**. WAVE3_DOSSIER 2.3 prices the window the continuous ring exploits as the
+    /// last `stages` releases of tile `t` plus the epilogue -- `4 x 0.646 + X_epi 5.99 = 8.57 us`
+    /// against `X_fill = 7.85 us` -- so a rendezvous placed above the store block closes only the
+    /// 2.58 us mainloop-tail half and leaves 5.99 us open, hiding **76% of the fill**. The arm would
+    /// then beat the control for the ring's reason while being reported as dispatch, and the
+    /// dossier's falsifier ("`g8_pstop` beats the control -> dispatch matters and `X_fill` is not
+    /// the mechanism") would be unreadable. Position is not a detail here; it IS the arm.
+    ///
+    /// So: the consumer's arrival is textually after the LAST store-class instruction, the
+    /// producer's matching wait is at `PNEXT` before `%cid` advances, and no shipped non-drained row
+    /// grows a tile rendezvous by accident.
+    #[test]
+    fn the_drained_arms_rendezvous_closes_the_whole_overlap_window() {
+        let mut drained_rows = 0usize;
+        for c in wgmma_all_emittable() {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            let arrive_at = ptx.find(&format!(
+                "add.s64 %rdBar,%rdS,{};\n    and.b32 %tmp,%lin,127;",
+                c.tile_bar_off()
+            ));
+            if !c.tiles.needs_tile_barrier() {
+                assert!(
+                    arrive_at.is_none() && !ptx.contains(&format!("PTWAIT_{}:", c.name)),
+                    "{}: only the drained arm has a tile rendezvous, and the extra mbarrier it \
+                     needs is in smem_bytes() only for that arm",
+                    c.name
+                );
+                continue;
+            }
+            drained_rows += 1;
+            let arrive_at = arrive_at.expect("the drained arm arrives at its tile rendezvous");
+            // The consumer's arrival is BELOW every store the epilogue issues.
+            let stores = store_class_instructions(&ptx);
+            let last_store = stores
+                .iter()
+                .filter_map(|s| ptx.rfind(&s.text))
+                .max()
+                .expect("the epilogue stores something");
+            assert!(
+                last_store < arrive_at,
+                "{}: the tile rendezvous must follow the epilogue's LAST store, or tile t+1's ring \
+                 fill overlaps X_epi and 76% of the fill this arm exists to expose stays hidden",
+                c.name
+            );
+            // ...and above the tile advance, so it is inside the tile loop rather than at EXIT.
+            let cnext = ptx
+                .find(&format!("CNEXT_{}:", c.name))
+                .expect("a persistent arm advances its tile");
+            assert!(arrive_at < cnext, "{}", c.name);
+            // The producer's half: it waits on the same barrier, and it waits BEFORE `%cid` moves.
+            let pwait = ptx
+                .find(&format!("PTWAIT_{}:", c.name))
+                .expect("the producer waits at the rendezvous");
+            let padvance = ptx[pwait..]
+                .find("add.u32 %cid,%cid,%slots;")
+                .expect("the producer advances its tile");
+            let tile_wait = "mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%pht;";
+            assert!(
+                ptx[pwait..pwait + padvance].contains(tile_wait),
+                "{}: the producer must wait on the tile rendezvous before advancing %cid -- that \
+                 wait is the half of the mechanism that stops the fill",
+                c.name
+            );
+        }
+        assert!(
+            drained_rows > 0,
+            "the drained diagnostic must be emittable, or this law is vacuous and the arm the \
+             round reads its persistence verdict against does not exist"
+        );
     }
 
     /// **The device-free half of E4.1 and E4.2: the ladder reaches the ring boundaries, and every
