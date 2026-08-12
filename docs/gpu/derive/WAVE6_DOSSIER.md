@@ -129,7 +129,7 @@ also, for a pure-read term, **conservative in the wrong direction and optimistic
 | exposed launch overhead, 168 launches | "roughly fixed ~250-280 us" | **RTX 4050 (WDDM)** | same file, `:148` |
 | 12-layer decode, eager -> graphed | ~6.5-6.9x | **RTX 4050 (WDDM)** | `BENCHMARKS.md:2490` |
 | int8-KV footprint | **3.88x vs f32, 1.94x vs f16** | **device-free geometry** | `paged_kv.rs:846-878`, comment `:865` |
-| int8 decode-attention vs f64 reference | max_abs 3.00e-3 (gate 1e-2) | 4050, **and green on H100** | `serving.md:233-236`; `s2d-full-suite.log:2501` |
+| int8 decode-attention vs f64 reference | max_abs 3.00e-3 at `head_dim = 64` (gate 1e-2) | 4050, **and green on H100** | `serving.md:233-236`; `s2d-full-suite.log:2501`. **Do not carry this cell's value into an H100 claim -- section 6 quotes the H100's own**, which runs both `GATED_HEAD_DIMS` arms and prints 3.27e-3 at `head_dim = 128` |
 
 **One row in that table is not device-scoped and it matters: the int8-KV footprint.** `3.88x` and
 `1.94x` come out of `int8_kv_footprint_shrink`, a pure-geometry unit test with no device in it
@@ -670,7 +670,7 @@ stronger gate than the one the module ships with, and free.
 | step-floor speedup at B=16, ctx=2048, f16 weights | **1.168x** | derived over H100 bytes and the measured 2922.3 GB/s |
 | step-floor speedup at B=64, ctx=2048, f16 weights | **1.437x** | same |
 | makes `Bcap=64 x 8192` fit 79.18 GiB | 77.00 -> 46.00 GiB | derived over two probed device facts |
-| accuracy | max_abs **3.00e-3** vs the f64 reference, gate 1e-2 | measured on 4050 (`serving.md:229`), **gate re-run green on H100** |
+| accuracy | max_abs **3.00e-3** at `head_dim = 64` and **3.27e-3** at `head_dim = 128` vs the f64 reference, gate 1e-2 | **measured ON H100**: `s2d-full-suite.log:2410` and `:2500`, the two `GATED_HEAD_DIMS` arms of one test (`paged_attention.rs:1327`, `:2463`). The 4050's own run of the same gate printed the identical 3.00e-3 at hd=64 (`serving.md:233-236`) |
 
 **The scale slab is the part that is easy to get wrong and is already right.** One f32 per
 `(token, kv_head)`, `head_dim` times smaller than the value slab (`paged_kv.rs:153-158`,
@@ -680,8 +680,11 @@ element.
 
 **REFUSAL.** The int8-KV row is published **with its accuracy column or not at all**, and the
 accuracy must be re-measured at the *serving* geometry (32 layers, real weights, ctx 2048+), not
-inherited from the 4-head / hd-64 / ctx-100 unit gate. A 3e-3 per-layer error compounded through 32
-layers is not a 3e-3 model error and nothing in this tree has measured what it is.
+inherited from the 4-head / ragged-ctx-`[37,0,16,100,5,64]` unit gate at either head dim. A 3e-3
+per-layer error compounded through 32 layers is not a 3e-3 model error and nothing in this tree has
+measured what it is. **And the accuracy column moves with `head_dim`**: 3.00e-3 at 64 against
+3.27e-3 at 128, on the same H100, in the same test -- 9% worse at the dim Llama-3-8B actually uses,
+which is the arm to quote.
 
 ---
 
