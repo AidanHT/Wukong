@@ -24,9 +24,13 @@ boundary.
 > **Every serving ratio this repository owns was measured on an RTX 4050 Laptop (sm_89, 20 SMs,
 > 6 GiB, Windows/WDDM).** That includes `39.1x` / `85.6x` continuous-batching goodput, `1.07-1.35x`
 > decode CUDA graph, `~6.5-6.9x` 12-layer graphed decode, `1.14-1.27x` continuous-vs-static
-> scheduling, and every microsecond in `prompts/results/serving.md`. `BENCHMARKS.md:365-377` already
-> scopes them, in its own words: those rounds *"predate grouped-query support, so their KV cache was
-> sized for `q_heads`"*, and the internal ratios *"are **not** a Llama-class geometry"*.
+> scheduling, and every microsecond in `prompts/results/serving.md`. **`BENCHMARKS.md:51`** -- the
+> standing index, not the results table -- already scopes them, and these are its words verbatim:
+> those rounds *"predate grouped-query support, so their KV cache was sized for `q_heads`"*, and the
+> internal ratios *"are **not** a Llama-class geometry"*. The results table carries a second scope
+> note on the same row at `BENCHMARKS.md:366-377`, in *different* words ("before that, the cache was
+> sized for `q_heads`, i.e. `g` times the real workload"); it scopes the Serving row to the 4050 but
+> it is not the source of the two quotations above.
 >
 > **None of them appears in this dossier as an H100 expectation.** Where a 4050 number is quoted it
 > is quoted as a *mechanism* -- "the step was launch-bound at depth 1 and compute-bound at depth 12"
@@ -1181,7 +1185,7 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 | `RED_GRID`/`RED_BLOCK`, `stream_cfg`, `hbm_bandwidth`, `best_bw`, `decode_stack_latency` | `crates/wukong_codegen_gpu/src/gpu.rs:1219-1221`, `:1302-1303`, `:23488-23595`, `:25087` |
 | The device-free module set (117) and the ptxas census corpus (wmma+flash+wgmma only) | same file, `:8247`, `:8473-8488`, `:8624`; `:22217`, `:22250-22335` |
 | FA2 wheel audit and the `fwd_kvcache` requirement; the `::marlin` device dispatcher | `tools/cloud/modal_app.py:1297-1413`, `:3948-3957` |
-| The 4050 serving ledger, quarantined in 1.2 | `prompts/results/serving.md:100-107`, `:139-154`, `:191-233`, `:263-265`; `BENCHMARKS.md:365-377`, `:395`, `:2466-2490` |
+| The 4050 serving ledger, quarantined in 1.2 | `prompts/results/serving.md:100-107`, `:139-154`, `:191-233`, `:263-265`; `BENCHMARKS.md:51` (the standing-index scope note quoted in the device-scope block), `:366-377` (the results-table scope note, different words), `:395`, `:2466-2490` |
 | Ping-pong's trigger, Stream-K's trigger, the 2x2x1 and 192x256 verdicts, the per-tile cost model | `docs/gpu/derive/WAVE3_DOSSIER.md:19-30`, `:1252-1386` |
 | The epilogue/fusion break-even model this wave inherits nothing from but must not contradict | `docs/gpu/derive/WAVE4_DOSSIER.md:188-277` |
 | The 8-bit `wgmma` transfer condition, the fp8 tolerance, the two-arm exactness split, `FAST_ACCUM` fairness | `docs/gpu/derive/WAVE5_DOSSIER.md:28-38`, `:388-411`, `:565-588`, `:823-845` |
