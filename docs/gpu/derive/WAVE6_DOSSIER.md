@@ -35,22 +35,27 @@ boundary.
 > **None of them appears in this dossier as an H100 expectation.** Where a 4050 number is quoted it
 > is quoted as a *mechanism* -- "the step was launch-bound at depth 1 and compute-bound at depth 12"
 > -- never as a size. Every H100 number below is derived from H100 facts only, and this is the
-> **whole** list of them -- eight, in three classes, because a list that says "only" has to be
+> **whole** list of them -- nine, in three classes, because a list that says "only" has to be
 > closed:
 >
 > * **Probed on the device**, by the instrument's own provenance block: 132 SMs, 232,448 B opt-in
 >   SMEM, 52,428,800 B L2, 85,017,624,576 B VRAM (section 1.1's first five rows).
-> * **Measured in a round log**: the three bandwidths of `2026-08-11-h100-w2-r5-hbm.log:50-53`, and
+> * **Measured in a round log**: the three bandwidths of `2026-08-11-h100-w2-r5-hbm.log:50-53`;
 >   `BW_L2 = 7.00 TB/s` -- which is measured rather than derived, but *indirectly*: it is what
 >   `gpt_d1024_down`'s 597.6 TFLOP/s implies through `I_cta = 85.33` (`ACT2_WAVE_PLAN.md:5`, carried
 >   as a fact by `WAVE3_DOSSIER.md:28`). It does exactly one job here -- 10.1's two ping-pong L2
->   roofs, restated in 10.5 and in section 13 -- and no byte budget divides by it.
+>   roofs, restated in 10.5 and in section 13 -- and no byte budget divides by it. And **cuBLAS's
+>   measured f16 rate, 838.7 TFLOP/s at sq4096** (`2026-08-10-h100-act2-r3-bmulticast.log:729`,
+>   carried by `ACT2_WAVE_PLAN.md:5`), which section 4.2 uses as the *lower* end of the `M*` band --
+>   under the log's own "NOT publishable; clock-dependent" stamp (`:726`), which is why it appears
+>   only as a band end and never as a rate.
 > * **Not measured anywhere in this campaign**, and therefore quoted with that stamp on it every
 >   time: the **989 TFLOP/s** dense-f16 tensor peak, which is a *spec-sheet* denominator
 >   (`WAVE3_DOSSIER.md:30` sources it as the number that "reproduces the plan's 57.2% / 84.8%
->   peak-fractions exactly", i.e. it is what those fractions were taken against). Section 4.2 states
->   the band the repo's own measured f16 figure gives instead, and every claim that turns on it
->   carries both ends. Likewise the **256 KB unified L1/SMEM per SM** used once, in 5.4's
+>   peak-fractions exactly", i.e. it is what those fractions were taken against). Section 4.2 pairs
+>   it with the measured 838.7 into the band `287 <= M* <= 338`, quotes the **lower** end in every
+>   claim that turns on it, and shows that no verdict in this dossier moves across the band.
+>   Likewise the **256 KB unified L1/SMEM per SM** used once, in 5.4's
 >   reuse-distance argument: **FACT(ext)**, the Hopper whitepaper's SM figure, of which the probed
 >   232,448 B opt-in SMEM is the shared-memory share. Nothing is sized by either one; 5.4's
 >   conclusion is a *distance* argument with a stated falsifier.
@@ -77,7 +82,9 @@ promotion this dossier exists to record. The coalescing rewrite the plan ranks f
 an **instruction/transaction** win of at most 8x on a term whose HBM bytes do not change, and
 whether it converts into time is the one thing nobody has measured. And **ping-pong -- whose trigger
 WAVE3 5.4 parked on exactly this row -- fires and still loses**, by a second independent route:
-below M = 338 the decode GEMM's roof is `M x BW`, in which no tile shape appears.
+below `M* = 287` the decode GEMM's roof is `M x BW`, in which no tile shape appears (`M*` is a band,
+`287 <= M* <= 338`, depending on whether the f16 peak is the measured one or the spec sheet's; 4.2
+quotes the conservative end and every batch here is under it).
 
 ---
 
@@ -86,12 +93,13 @@ below M = 338 the decode GEMM's roof is `M x BW`, in which no tile shape appears
 ### 1.1 H100 facts this wave may divide by
 
 **FACT(repo)**, and the `source` column is the authority per row rather than any blanket sentence
-over it -- **eight of these fifteen rows do not come from the instrument's provenance block.** The
+over it -- **nine of these sixteen rows do not come from the instrument's provenance block.** The
 first seven do: device through clock lock are the provenance lines the r3 round printed before it
 timed anything. The four bandwidth rows come out of `hbm_bandwidth`'s own test output, in a
-*different* log. And the last four are not device measurements at all: `BW_L2` is inferred from a
-TFLOP/s through an `I_cta`, 989 TFLOP/s is a spec-sheet denominator, 256 KB is FACT(ext), and the
-suite mean is a published table's summary. Read the row, not the lead-in:
+*different* log, and the measured-f16 row out of a config sweep's diagnostic-absolutes table in a
+third. And the last four are not device measurements at all: `BW_L2` is inferred from a TFLOP/s
+through an `I_cta`, 989 TFLOP/s is a spec-sheet denominator, 256 KB is FACT(ext), and the suite mean
+is a published table's summary. Read the row, not the lead-in:
 
 | fact | value | source |
 |---|---|---|
@@ -106,8 +114,9 @@ suite mean is a published table's summary. Read the row, not the lead-in:
 | **copy (2N r+w), measured** | **2922.3 GB/s = 87.2% of peak** | same log, `:51` |
 | saxpy (3N triad), measured | 2567.0 GB/s = 76.6% | same log, `:52` |
 | reduce (1N read-only), measured | **682.1 GB/s = 20.3%** | same log, `:53` |
+| **cuBLAS f16 rate, measured** (the `M*` band's lower end; **NOT a publishable rate** -- the log heads the column "DIAGNOSTIC absolutes (NOT publishable; clock-dependent)" at `:726`) | **838.7 TFLOP/s** @sq4096 (654.0 @sq2048, 876.1 @sq8192) | `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:726`, `:728-730`; carried by `ACT2_WAVE_PLAN.md:5` |
 | `BW_L2`, measured indirectly (597.6 TFLOP/s through `I_cta = 85.33`) | 7.00 TB/s | `ACT2_WAVE_PLAN.md:5`, carried as a fact by `WAVE3_DOSSIER.md:28` |
-| dense f16 tensor peak (campaign denominator) | 989 TFLOP/s | `WAVE3_DOSSIER.md:30` |
+| dense f16 tensor peak (**spec sheet**; the `M*` band's upper end) | 989 TFLOP/s | `WAVE3_DOSSIER.md:30` |
 | unified L1/SMEM per SM (**FACT(ext)**, used once, in 5.4) | 256 KB | Hopper whitepaper; the probed 232,448 B opt-in SMEM is its SMEM share |
 | suite mean vs cuBLAS, post-v2 | ~87.9% | `CAMPAIGN_CHECKPOINT.md:57` |
 
@@ -427,22 +436,57 @@ At `Bcap = 64`, **four of the six launches cover under half the machine and two 
     roof  = I * BW
 ```
 
-| M | I (FLOP/B) | roof at 2922.3 GB/s | % of 989 TFLOP/s peak |
-|---|---|---|---|
-| 64 | 61.13 | **178.6 TFLOP/s** | **18.1%** |
-| 256 | 215.6 | **630.0 TFLOP/s** | 63.7% |
-| 338.4 | 338.4 | 989 TFLOP/s | 100% |
+**The denominator this table divides into is a BAND, and it is stated as one because section 2.5(3)
+refuses the spec sheet on the bandwidth axis and the same refusal has to apply on the compute axis.**
+The campaign's f16 tensor peak, **989 TFLOP/s**, is a *spec-sheet* number and is stamped as such in
+the device-scope block: `WAVE3_DOSSIER.md:30` records it as the denominator that "reproduces the
+plan's 57.2% / 84.8% peak-fractions exactly" -- i.e. it is what those fractions were taken against --
+and `WAVE3_DOSSIER.md:173` notes it implies a **1.8288 GHz** reference clock where this device
+reports **1980 MHz**. The only *measured* H100 f16 tensor rate this repo owns is cuBLAS's **838.7
+TFLOP/s at sq4096** (`ACT2_WAVE_PLAN.md:5`), and `838.7 / 989 = 84.8%` is exactly the peak-fraction
+WAVE3 names -- the two ends are one fact seen from both sides. They bracket the crossover:
 
-> **DERIVED, and it is the load-bearing statement of section 4: below `M = 338` the decode
+* **838.7 TFLOP/s is an achieved rate**, so `M* = 838.7e12 / 2.9223e12 = 287.0` is a **lower** bound
+  on the crossover: a kernel better than cuBLAS pushes it up. Two stamps belong on it. First, the
+  round log that produced it heads that column *"DIAGNOSTIC absolutes (NOT publishable;
+  clock-dependent)"* (`bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:726`) -- the figure is
+  legitimate as the end of a band and illegitimate as a published rate, and this dossier uses it
+  only as the former. Second, it is one cell of a three-shape column: **654.0 / 838.7 / 876.1** at
+  sq2048 / sq4096 / sq8192 (same log, `:728-730`). The sq2048 cell is cuBLAS below its own peak on a
+  small shape rather than a peak estimate; the largest, **876.1**, gives `M* = 299.8`. So the
+  measured end of the band is itself 287-300 depending on which large shape you take cuBLAS's best
+  from, and the plan's anchor (sq4096) is the lower of the two.
+* **989 TFLOP/s is a spec ceiling**, so `M* = 989e12 / 2.9223e12 = 338.4` is an **upper** bound:
+  nothing pushes it past.
+
+> **`M*` is a band, `287 <= M* <= 338`, and this dossier quotes the LOWER end everywhere**, because
+> a claim of the form "below `M*` the roof is `M x BW`" written at 287 is true under both
+> denominators and one written at 338 is true under only one.
+
+| M | I (FLOP/B) | roof at 2922.3 GB/s | % of 838.7 (measured) | % of 989 (spec sheet) |
+|---|---|---|---|---|
+| 64 | 61.13 | **178.6 TFLOP/s** | **21.3%** | **18.1%** |
+| 256 | 215.6 | **630.0 TFLOP/s** | 75.1% | 63.7% |
+| **287.0** | 287.0 | 838.7 TFLOP/s | **100% -- crossover, measured end** | 84.8% |
+| 338.4 | 338.4 | 989 TFLOP/s | 117.9% | **100% -- crossover, spec end** |
+
+> **DERIVED, and it is the load-bearing statement of section 4: below `M = 287` the decode
 > projection GEMM's ceiling is `M x BW_HBM`, a function of the batch and the bandwidth alone. No
 > tile shape, schedule, raster, cluster or epilogue appears in it.** At `Bcap = 64` the ceiling is
-> 18.1% of the tensor peak; the tensor cores are idle five sixths of the time *by arithmetic*, and
-> that is correct behaviour, not a defect. The only two things that move it are fewer weight bytes
-> (section 3) and more rows per weight read (a bigger batch).
+> 21.3% of the rate cuBLAS actually reaches on this part (18.1% of the spec peak); the tensor cores
+> are idle four fifths of the time *by arithmetic*, and that is correct behaviour, not a defect. The
+> only two things that move it are fewer weight bytes (section 3) and more rows per weight read (a
+> bigger batch).
 
-The crossover `M* = 989e12 / 2.9223e12 = 338.4` is worth remembering as the campaign's decode
-constant: **a decode batch is "small" below 338 rows on this device and "large" above it**, and
-every H100 serving configuration this wave will run is small.
+**No verdict in this dossier moves with the band; one margin does.** Every batch this wave runs --
+`B = 16`, `B = 64`, `Bcap = 256` -- is below **287**, the conservative end, so "small-batch decode is
+bandwidth-bound" holds under either denominator, and so does every lever verdict that rests on it
+(10.1, 10.2, 10.4, 10.5). What narrows is the headroom at the top of the sweep: `Bcap = 256` sits
+**24.4%** below the spec-end crossover and only **10.8%** below the measured-end one. That is exactly
+the margin the round exists to test, so `d3_gemmbw` and `s3_goodput` are read against **287**.
+**`M* = 338.4` may be quoted as the campaign's decode constant only with the stamp on it**; the 51
+rows between 287 and 338 are the width of this campaign's own ignorance of its f16 peak, and closing
+them is a measurement (a peak-f16 arm), not an argument.
 
 ### 4.3 Reaching the roof: the memory-level-parallelism gap
 
@@ -861,9 +905,10 @@ arithmetic, not with a shrug.
 suite's smallest M is 1024 = 8 m-tiles, so nothing qualifies."* Wave 6 adds `M = Bcap` in
 `{64, 256}`. **The trigger fires.** And the lever loses three times over.
 
-**Loss 1 -- the roof has no tile in it.** Section 4.2: below `M = 338` the decode GEMM's ceiling is
-`M x BW_HBM`. Ping-pong changes the CTA tile from 128x256 to 64x256. Neither `128` nor `64` appears
-in `M x BW`. **A lever that changes a quantity absent from the binding constraint cannot move it.**
+**Loss 1 -- the roof has no tile in it.** Section 4.2: below `M* = 287` (the conservative end of the
+`[287, 338]` band) the decode GEMM's ceiling is `M x BW_HBM`. Ping-pong changes the CTA tile from
+128x256 to 64x256. Neither `128` nor `64` appears in `M x BW`. **A lever that changes a quantity
+absent from the binding constraint cannot move it.**
 
 **Loss 2 -- at Bcap=256 it lowers the ceiling that is not binding onto the one that is.** Using
 `WAVE3_DOSSIER.md:1356-1362`'s own `I_cta` arithmetic and the measured `BW_L2 = 7.00 TB/s`:
@@ -887,7 +932,7 @@ argument, not a time argument, at 12.1% device occupancy.
 (`ACT2_WAVE_PLAN.md:34`).
 
 > **VERDICT: DEAD, and the trigger is RETIRED rather than deferred.** `WAVE3_DOSSIER.md:1385` should
-> gain a second reason: the decode row that its trigger names was added, and at `M <= 338` the
+> gain a second reason: the decode row that its trigger names was added, and at `M <= 287` the
 > binding roof is `M x BW`, in which no tile shape appears. Ping-pong now has *three* independent
 > refutations -- WAVE3's L2 roof below the measured floor, WAVE4's claim on the same `X_epi`, and
 > this one. Do not re-open it.
@@ -972,20 +1017,28 @@ alone:
 ```
     FLOP  = 2*M*N*K
     bytes = 0.5*N*K (4-bit W) + 2*M*K (f16 act) + 4*M*N (f32 out)
-    I     ~ 4M   when M << K and M << N     ->   M* = 338.4 / 4 = 84.6
+    I     ~ 4M   when M << K and M << N     ->   M*/4 = 71.8 (measured end) .. 84.6 (spec end)
 ```
 
 At the exact `wq` decode shape (`N = K = 4096`), where the activation and output terms are not
-negligible, `I(M) = 33,554,432*M / (8,388,608 + 24,576*M)` and the crossover is `M = 112.5`. Both
-brackets give the same verdict at every swept point:
+negligible, `I(M) = 33,554,432*M / (8,388,608 + 24,576*M)`, and solving `I(M) = M*` over 4.2's band
+puts the crossover at **`M = 90.8`** against the measured 838.7 TFLOP/s and **`M = 112.5`** against
+the 989 spec sheet. Both brackets, at both ends of the band, give the same verdict at every swept
+point:
 
-| M | I (FLOP/B) | roof at 2922.3 GB/s | vs the 989 TFLOP/s f16 tensor peak |
-|---|---|---|---|
-| 16 | 61.13 | 178.6 TFLOP/s | 18.1% -- **weight-bandwidth-bound** |
-| 64 | 215.6 | 630.0 TFLOP/s | 63.7% -- **weight-bandwidth-bound** |
-| 112.5 | 338.4 | 989 TFLOP/s | **100% -- the crossover** |
-| 128 | 372.4 | 1088 TFLOP/s | above peak -- **compute-bound** |
-| 256 | 585.1 | 1710 TFLOP/s | above peak -- **compute-bound** |
+| M | I (FLOP/B) | roof at 2922.3 GB/s | vs 838.7 (measured) | vs 989 (spec sheet) |
+|---|---|---|---|---|
+| 16 | 61.13 | 178.6 TFLOP/s | 21.3% | 18.1% -- **weight-bandwidth-bound** |
+| 64 | 215.6 | 630.0 TFLOP/s | 75.1% | 63.7% -- **weight-bandwidth-bound** |
+| **90.8** | 287.0 | 838.7 TFLOP/s | **100% -- crossover, measured end** | 84.8% |
+| 112.5 | 338.4 | 989 TFLOP/s | 117.9% | **100% -- crossover, spec end** |
+| 128 | 372.4 | 1088 TFLOP/s | 129.7% | above peak -- **compute-bound** |
+| 256 | 585.1 | 1710 TFLOP/s | 203.9% | above peak -- **compute-bound** |
+
+**The band moves no verdict here either**: `M <= 64` is below the crossover at both ends and
+`M >= 128` is above it at both. What it moves is the tie band's own margin at `M = 64` -- **43.1%**
+below the spec-end crossover, **29.5%** below the measured-end one -- and that margin is what to
+re-check if the round ever measures an f16 peak above 838.7.
 
 So the round publishes three separate things, and conflating any two of them is a defect:
 
@@ -1017,12 +1070,12 @@ strawman guards at `:4012-4017`. Use that auto-pick rather than naming a kernel 
 
 | lever | trigger status in Wave 6 | why, in one line |
 |---|---|---|
-| **ping-pong** | **FIRES -> DEAD. Retire the trigger.** | at `M <= 338` the roof is `M x BW`; no tile shape appears in it, and at Bcap=256 the 64x256 tile *lowers* the binding roof 630 -> 597 TFLOP/s |
+| **ping-pong** | **FIRES -> DEAD. Retire the trigger.** | at `M <= 287` (4.2's conservative crossover) the roof is `M x BW`; no tile shape appears in it, and at Bcap=256 the 64x256 tile *lowers* the binding roof 630 -> 597 TFLOP/s |
 | **Stream-K / split-K** | **FIRES -> PROMOTE to rank 2** | 6 of 6 decode GEMMs are under 0.90 wave efficiency, 5 under 0.50; 4 of 5 bit-exactness gates survive it untouched |
 | **merged QKV** (new, this dossier) | n/a -- **build it, rank 3** | 3 launches -> 1, 96 CTAs instead of 64+16+16, and bit-exact by the same argument `tp_column_parallel_gemm_split_is_bit_exact` already proves |
 | 2x2x1 cluster | unchanged: **DEFERRED to after W4** | decode is HBM-bound, so `T_L2` is not binding and Wave 6 adds no evidence |
 | 192x256x64 | unchanged: **DEAD** | CTA-M 192 declines in the emitter; 512 threads cap ptxas at 128 regs |
-| Machete / W4A16 | **both bands entered: tie at `M <= 64`, the plan's pre-registered LOSS at `M >= 128`** | the W4A16 roof crosses the 989 TFLOP/s f16 peak at `M ~ 112`, so only `M <= 64` is both-sides-weight-bandwidth-bound; the 2.118x is a product ratio against our own f16 decode, never a peer ratio |
+| Machete / W4A16 | **both bands entered: tie at `M <= 64`, the plan's pre-registered LOSS at `M >= 128`** | the W4A16 roof crosses the f16 peak at `M ~ 91` (measured 838.7) to `M ~ 112` (spec 989), so only `M <= 64` is both-sides-weight-bandwidth-bound at BOTH ends of 4.2's band; the 2.118x is a product ratio against our own f16 decode, never a peer ratio |
 | **megakernel** | **HELD, with a computable trigger** | fire only if the measured H100 launch overhead exceeds 10% of the measured decode step |
 
 ---
@@ -1273,10 +1326,11 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 | "plus the `norm_vs_peers` bench that does not exist" | it still does not, QuACK is not staged, and norms are **1.39% of the decode step**. Build the three-line planner fix (`serving.rs:336` bypasses `norm_launch` entirely) and skip the peer bench |
 | the owner list includes "the bench wiring in `gpu.rs`" | **`gpu.rs` is single-owner per wave** (`CAMPAIGN_CHECKPOINT.md:25-26`), and every serving bench in the tree already lives in its own module (`serving.rs:2468`, `:3101`). Delete the `gpu.rs` clause and the ownership conflict with Wave 3 disappears |
 | megakernel: "Published ceiling: 78% of BW ... ~1.56x on the bandwidth-bound term" | FACT(ext) sizing. The repo's derived prize is the **launch overhead**, 2.7-13.5% of the step, and its only constant is a WDDM one. **Budget ZERO**; trigger = the measured overhead exceeds 10% of the measured step |
-| ping-pong is HELD OUT with trigger "a decode row is added" (`:187`) | **the trigger fires and the lever loses.** At `M <= 338` the roof is `M x BW`, in which no tile appears; at Bcap=256 a 64x256 tile *lowers* the binding roof 630 -> 597 TFLOP/s. **RETIRE the trigger** |
+| ping-pong is HELD OUT with trigger "a decode row is added" (`:187`) | **the trigger fires and the lever loses.** At `M <= 287` the roof is `M x BW`, in which no tile appears; at Bcap=256 a 64x256 tile *lowers* the binding roof 630 -> 597 TFLOP/s. **RETIRE the trigger** |
 | Stream-K is HELD OUT: "wave quantization is only ~3% once W3's persistence lands" | true for the GEMM suite, false for decode: **6 of 6 decode GEMMs are below 0.90 wave efficiency, 5 below 0.50.** **PROMOTE to Wave 6 rank 2**, gated on one bandwidth measurement |
-| Machete W4A16 is HELD OUT at `:189` as measure-only, sweep `M = 1/16/128`, "**expect and publish a loss at M>=128 and a tie at M=1**" | **expectation UPHELD, sweep EXTENDED -- and this row is the amendment.** With 4-bit weights `I ~ 4M`, so the roof crosses the 989 TFLOP/s f16 peak at `M = 84.6` asymptotically and at `M = 112.5` at the exact `wq` shape: the both-sides-bandwidth-bound band ends near `M = 64`, not `M = 32`, and `M >= 128` stays the pre-registered LOSS. `p3_marlin` runs `M = 1/16/64/128/256` -- a **superset** keeping both plan anchors and adding the wave's own decode batches. The 2.118x of section 2.3 is an internal product ratio, not a Machete number |
+| Machete W4A16 is HELD OUT at `:189` as measure-only, sweep `M = 1/16/128`, "**expect and publish a loss at M>=128 and a tie at M=1**" | **expectation UPHELD, sweep EXTENDED -- and this row is the amendment.** With 4-bit weights `I ~ 4M`, so the roof crosses the f16 peak asymptotically at `M = 71.8` (measured 838.7) to `84.6` (spec 989) and at the exact `wq` shape at `M = 90.8` to `112.5`: the both-sides-bandwidth-bound band ends near `M = 64`, not `M = 32`, at BOTH ends of 4.2's denominator band, and `M >= 128` stays the pre-registered LOSS. `p3_marlin` runs `M = 1/16/64/128/256` -- a **superset** keeping both plan anchors and adding the wave's own decode batches. The 2.118x of section 2.3 is an internal product ratio, not a Machete number |
 | target-table row 6: "1.6-2.0x from coalescing compounded with a 4x (8B) / 8x (70B) read-amplification removal" | both factors are re-derived above and neither survives as stated. The row's honest content is the **int8/fp8-KV prize** and the **capacity** result of 2.4 |
+| the plan and WAVE3 divide by a single f16 tensor peak, 989 TFLOP/s (`WAVE3_DOSSIER.md:30`) | that is a **spec-sheet** denominator, and 2.5(3) already refuses the spec sheet on the bandwidth axis. Paired with the repo's own measured 838.7 TFLOP/s at sq4096 it makes the decode crossover a **band, `287 <= M* <= 338`**, of which this dossier quotes the conservative end. **No verdict moves across the band** -- every batch here is <= 256 -- but the `Bcap = 256` headroom is 10.8%, not 24.4%, and the W4A16 crossover is `M = 90.8`, not 112.5. Closing the band is a peak-f16 measurement, not an argument |
 | (absent from the plan) | **int8 KV is a feasibility lever on H100**: `Bcap=64 x 8192` is 77.00 GiB of a 79.18 GiB part at f16 and 46.00 GiB at int8 |
 | (absent from the plan) | **merged QKV**: 3 launches -> 1, bit-exact by construction, no numerical precondition |
 | (absent from the plan) | **the decode path never touches `wgmma`** (`serving.rs:339`), so Waves 3/4/5 reach serving only through a wiring change nobody has scheduled -- the same defect the plan already records for `gemm_nt_wgmma` |
@@ -1291,6 +1345,7 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 |---|---|
 | H100 device identity: 132 SMs, 232,448 B SMEM, 50.0 MiB L2, 79.18 GiB VRAM, clock lock UNKNOWN | `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:517-531` |
 | H100 bandwidth: spec 3352.3, copy **2922.3**, saxpy 2567.0, reduce **682.1** GB/s | `bench/gpu/h100/2026-08-11-h100-w2-r5-hbm.log:50-53` |
+| cuBLAS's measured f16 rate (654.0 / **838.7** / 876.1 at sq2048 / sq4096 / sq8192) and the log's own "NOT publishable; clock-dependent" stamp on that column -- 4.2's `M*` band, lower end | `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:726`, `:728-730` |
 | The campaign's GEMM dispersion floors, quoted by G-W6-6: `+3.29%` (round 3, `w1_s4_off/sq2048`) and the `+/-15.47%` sq1024 refusal | `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:538`; `bench/gpu/h100/2026-08-11-h100-w2-r10-vs-cublas-v2rule.log:142`; range restated at `docs/gpu/derive/WAVE3_DOSSIER.md:1498`, refusal restated at `CAMPAIGN_CHECKPOINT.md:49` |
 | The whole serving correctness suite, **green on H100**; every serving perf bench `#[ignore]`d | `bench/gpu/h100/2026-08-10-h100-s2d-full-suite.log:171`, `:2274-2501`, `:2493-2497`, `:2707-2741` |
 | The Llama-3-8B decode geometry and the 64.00 GiB f16 KV cache, printed on H100 | same log, `:2495` |
@@ -1343,7 +1398,7 @@ Two more that are *not* cheap and should be named as such rather than quietly at
   Nothing above depends on it, and a docs-only commit must not touch it: it needs the full five-part
   gate, so it belongs to whichever Rust commit next opens that file -- section 5's `v4` rewrite is
   the obvious one.
-* Whether a `wgmma` decode GEMM is worth wiring at all, given that at `M <= 338` the roof is
+* Whether a `wgmma` decode GEMM is worth wiring at all, given that at `M <= 287` the roof is
   `M x BW` and the 64x64 WMMA tile already reaches it whenever the launch has enough CTAs. **That
   question is answered by `d3_gemmbw` and by nothing else**, and it is worth asking before Wave 4's
   recognizer-to-offload wiring is extended to the serving path.
