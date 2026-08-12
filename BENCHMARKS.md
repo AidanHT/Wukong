@@ -2183,15 +2183,16 @@ the **previous** visit's Act-2 round 1
 ([`2026-08-10-h100-act2-wgmma-vs-cublas.log`](bench/gpu/h100/2026-08-10-h100-act2-wgmma-vs-cublas.log)),
 which ran the structurally identical arm — `wgmma_nt_f16_128x256x64_s4`, `cluster 1x1x1 (None)`, and
 necessarily scalar because `fd41ebf` (the commit that introduced the v2 epilogue at all) landed
-2026-08-11 23:05, a day later. It reads 68.2 / 67.5 / 58.8 / 54.8 / 78.0 / 42.8% on the six shapes
-`r10` resolves, mean **61.7%**, through the same instrument (provenance header, A/C peer twin, median
-of 5, `publish gate: OPEN`, `sm clock drift +0.00%`). So **f16 reads 61.7 → 87.9 across two visits**,
+2026-08-11 23:05, a day later. Its published table (`:252-257`) reads 68.2 / 67.5 / 58.8 / 54.8 /
+78.0 / 42.8% on the six shapes `r10` resolves, mean **61.7%**, through the same instrument
+(provenance header `:160`, A/C peer twin `:191`, median of 5, `publish gate : OPEN` `:224`,
+`sm clock drift : +0.00%` `:221`). So **f16 reads 61.7 → 87.9 across two visits**,
 and the honest label is *cross-visit*: two container tenancies, two different physical H100s, one
 comparison. It survives because both terms are same-run *ratios* to a cuBLAS measured in their own
 process — and it is corroborated inside this visit, where `r3`'s un-clustered scalar row `w1_s4_off`
-reads **67.2 / 67.3 / 56.8%** at the three square shapes against the previous visit's 68.2 / 67.5 /
-58.8% (within ~2 points at each). What does **not** exist is an f16 scalar reading on the three
-`gpt_*` FFN shapes anywhere in this visit.
+(`r3-config-sweep.log:420`) reads **67.2 / 67.3 / 56.8%** at the three square shapes against the
+previous visit's 68.2 / 67.5 / 58.8% (within ~2 points at each). What does **not** exist is an f16
+scalar reading on the three `gpt_*` FFN shapes anywhere in this visit.
 
 Three further readings from the same sweep, recorded so they are not re-run:
 
@@ -2238,11 +2239,12 @@ what both artifacts say: the generator defines it as
 `WGMMA_W1_MCB_NOSTORE = { epilogue: ElidedDiagnostic, ..WGMMA_W1_MCB }`
 (`crates/wukong_codegen_gpu/src/ptx_wgmma.rs`, whose own doc comment reads
 "`(this row) - (w1_s4_mcb2)` at a fixed shape is the epilogue's whole cost"), and the log repeats it
-three times — the row's `why` line, the correctness block, and a footnote under the table:
+three times — the row's `why` line (`:149`), the correctness block (`:178`) and a footnote under the
+table (`:437`):
 `^ NOT A KERNEL. … must only ever be read as a DIFFERENCE against wgmma_nt_f16_128x256x64_s4_mcb2 at
 the same shape`. It writes no output, therefore **cannot be correctness-gated and is not a kernel**;
 its percentage is meaningless alone. It scores **114.0% / 101.1% / 101.8%** of cuBLAS at sq2048 /
-sq4096 / sq8192 (`...-r3-config-sweep.log`).
+sq4096 / sq8192 (`...-r3-config-sweep.log:436`).
 
 **Two pairings are available, and they answer different questions.** The elided kernel is physically
 the same object either way, because `WGMMA_W1_MCB_V2` differs from `WGMMA_W1_MCB` in the `epilogue`
@@ -2251,8 +2253,8 @@ legitimate store-elided twin of both:
 
 | paired against | reads | what the difference is |
 |---|---|---|
-| `..._s4_mcb2` (scalar) — **the log's and the generator's own rule** | 62.2 / 73.4 / 81.9% | **51.8 / 27.7 / 19.9 points** = the *scalar* epilogue's whole cost, which is what the arm was built to price |
-| `..._s4_mcb2_v2` (fused v2) — **this document's pairing, not the log's** | 87.4 / 88.7 / 92.0% | **26.6 / 12.4 / 9.8 points** = what the *shipped* epilogue still costs after the v2 store took its 25.2 / 15.3 / 10.1 |
+| `..._s4_mcb2` (scalar, `r3:421`) — **the log's and the generator's own rule** | 62.2 / 73.4 / 81.9% | **51.8 / 27.7 / 19.9 points** = the *scalar* epilogue's whole cost, which is what the arm was built to price |
+| `..._s4_mcb2_v2` (fused v2, `r3:432`) — **this document's pairing, not the log's** | 87.4 / 88.7 / 92.0% | **26.6 / 12.4 / 9.8 points** = what the *shipped* epilogue still costs after the v2 store took its 25.2 / 15.3 / 10.1 |
 
 The second row is the one that matters for the published table, and it is stated here as this
 document's own decomposition rather than as a quotation: **no committed artifact prints the v2
