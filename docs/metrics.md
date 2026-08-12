@@ -10,7 +10,9 @@ hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-ro
 > **Two GPUs now, and they do not mix (2026-08-11).** The **H100 (`sm_90a`)** figures — the
 > wgmma-vs-cuBLAS suite under M1, the H100 HBM figure, and the Hopper quantized standings — were
 > measured on an **NVIDIA H100 80GB HBM3** (Hopper, 132 SMs, 50 MiB L2, Linux container, cuBLAS with
-> **f32 output** as the peer), 2026-08-11, logs `bench/gpu/h100/2026-08-11-h100-w2-r*.log`, section
+> **f32 output** as the peer), 2026-08-11, logs `bench/gpu/h100/2026-08-11-h100-w2-r*.log` — plus
+> one previous-visit round on the same part, `2026-08-10-h100-act2-wgmma-vs-cublas.log`, which
+> supplies the single cross-visit figure below (f16's scalar baseline) — section
 > `BENCHMARKS.md` → *GPU backend (NVIDIA H100 80GB HBM3, `sm_90a`)*. **Every other GPU figure in this
 > document is an RTX 4050 figure** (scope note immediately below). Do not average the two, and do not
 > carry a conclusion across: this visit measured that transfer failing outright — the 4050's int8
@@ -18,10 +20,13 @@ hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-ro
 > H100. **Every H100 figure in this document is ITERATION-grade, not publication-grade, and is
 > recorded under that label:** the rounds ran in a Modal container whose user cannot call
 > `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 rules that "Container rounds are *iteration*
-> data; VM rounds are *publication* data" — every round behind these figures records the refusal
+> data; VM rounds are *publication* data" — each of the eleven 2026-08-11 rounds records the refusal
 > itself (`[clock] lock: refused (…); running unlocked`), and five of them also stamp themselves
 > `ITERATION data, not publication data` in an all-caps banner; `BENCHMARKS.md` names which five, and
-> why the K-sweep and the four non-GEMM rounds carry only the `[clock]` line. The label here is this
+> why the K-sweep and the four non-GEMM rounds carry only the `[clock]` line. The one previous-visit
+> round cited below — for f16's 61.7% scalar baseline — is older than that wrapper line and has no
+> `[clock]` record at all; it prints the all-caps banner instead, so it is ITERATION-labelled by the
+> stronger of the two records rather than the weaker. The label here is this
 > document's, applied uniformly because the premise every round records is uniform.
 > In place of the lock each round recorded its own before/after clocks and **two
 > rounds refused themselves** on +6.82% drift; one shape refused on a ±15.47% *peer* floor, and those

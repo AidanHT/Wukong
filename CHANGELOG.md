@@ -8,13 +8,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
 ### Documentation — the 2026-08-11 H100 results are folded into the measurement docs
 The measurement doc set predated the campaign's first published Hopper suite, and `BENCHMARKS.md`
 still asserted that *every* GPU number in it was an RTX 4050 number. Every figure added here cites
-the committed round log it came from (`bench/gpu/h100/2026-08-11-h100-w2-r*.log`); no absolute
+the committed round log it came from (`bench/gpu/h100/2026-08-11-h100-w2-r*.log`, plus
+`2026-08-10-h100-act2-wgmma-vs-cublas.log` for the one cross-visit figure, f16's scalar baseline); no
+absolute
 GFLOP/s is published, because the container could not lock clocks and the logs print their absolutes
 under an explicit not-publishable banner. **The whole H100 set is labelled ITERATION-grade**: those
 rounds ran in a Modal container that is refused `nvidia-smi -lgc`, which `GPU_RETARGET_PLAN.md` §6.3
-defines as *iteration* data rather than *publication* data (every round records `[clock] lock:
+defines as *iteration* data rather than *publication* data (each of the eleven 2026-08-11 rounds
+records `[clock] lock:
 refused (…); running unlocked`; five of them also stamp themselves `ITERATION data, not publication
-data` in a banner, and `BENCHMARKS.md` names which and why the rest do not), and the
+data` in a banner; the previous-visit round predates the wrapper line and carries the banner instead,
+and `BENCHMARKS.md` names which log carries what and why), and the
 before/after drift gate the rounds substitute is a weaker instrument than the lock — every H100
 percentage is provisional pending a locked-clock root-VM re-run.
 
