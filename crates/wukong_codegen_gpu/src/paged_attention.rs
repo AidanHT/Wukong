@@ -87,6 +87,63 @@ pub const PAGED_ATTN_WARPS: u32 = 4;
 /// PTX entry name for the paged decode-attention kernel.
 pub const PAGED_ATTN_ENTRY: &str = "paged_attn_decode";
 
+/// Where the K and V planes the append kernels read live inside their source buffer(s): `row_stride`
+/// f32 elements per slot row, K starting at column `k_off` and V at column `v_off`.
+///
+/// **Why this exists.** The shipped decode layer projects K and V into two packed `[Bcap, kv_dim]`
+/// buffers, and the append kernel's source index was exactly its own thread id. The merged-QKV
+/// projection ([`crate::serving::QkvArm::Merged`]) issues **one** GEMM into a single
+/// `[Bcap, D + 2*kv_dim]` buffer, whose C is row-major — so K's rows are `D` elements into a row
+/// that is `D + 2*kv_dim` long, not the start of a buffer. That is a **row stride plus a column
+/// offset**, and nothing else: the same bytes, in the same order, read from a different address.
+/// Both arms are expressible here, and [`packed`](Self::packed) reproduces the shipped indexing
+/// exactly (`row_stride == kv_dim`, both offsets 0), which is what makes the merge bit-identical
+/// rather than merely close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvSourceLayout {
+    /// f32 elements between one slot's row and the next, in **both** source buffers.
+    pub row_stride: usize,
+    /// Column at which the K plane starts.
+    pub k_off: usize,
+    /// Column at which the V plane starts.
+    pub v_off: usize,
+}
+
+impl KvSourceLayout {
+    /// Two separate packed `[Bcap, kv_dim]` buffers — the shipped layout, and the one every
+    /// pre-Wave-6 caller means.
+    pub fn packed(kv_dim: usize) -> Self {
+        Self {
+            row_stride: kv_dim,
+            k_off: 0,
+            v_off: 0,
+        }
+    }
+
+    /// One merged `[Bcap, q_dim + 2*kv_dim]` QKV projection, laid out **Q, then K, then V** along the
+    /// row (the order [`crate::serving::decode_weight_extents`] lists the weights in, and the order
+    /// the row-concatenated weight is built in). Both `knew`/`vnew` pointers are then the same
+    /// buffer.
+    pub fn merged_qkv(q_dim: usize, kv_dim: usize) -> Self {
+        Self {
+            row_stride: q_dim + 2 * kv_dim,
+            k_off: q_dim,
+            v_off: q_dim + kv_dim,
+        }
+    }
+
+    /// Both planes must fit inside a row, and a row must be at least `kv_dim` wide. Panics naming the
+    /// offender — a layout mistake here scatters a neighbouring plane's numbers into the cache with
+    /// no fault and no tolerance gate able to attribute it.
+    pub fn assert_fits(&self, kv_dim: usize) {
+        assert!(
+            self.k_off + kv_dim <= self.row_stride && self.v_off + kv_dim <= self.row_stride,
+            "KvSourceLayout {self:?}: a [.., kv_dim={kv_dim}] plane at k_off/v_off must fit inside \
+             a row of row_stride elements"
+        );
+    }
+}
+
 /// Generate the paged decode-attention PTX, **specialized to `head_dim`** (baked so the V accumulator
 /// unrolls into named registers `%acc0..` and the per-position dot unrolls). **Warp-cooperative**: one
 /// warp computes `out[slot,head,:] = softmax(scale · q · Kᵀ) · V` over the sequence's context — the 32
@@ -141,13 +198,14 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
         \x20   .param .u32 pBsz,\n\
         \x20   .param .u32 pNblk,\n\
         \x20   .param .u32 pMbps,\n\
-        \x20   .param .u32 pLayer\n)\n{{\n"
+        \x20   .param .u32 pLayer,\n\
+        \x20   .param .u32 pQStride\n)\n{{\n"
     );
     s += &format!("    .shared .f32 qsh[{}];\n", w * hd);
     s += &format!("    .reg .f32 %acc<{hd}>;\n");
     s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt;\n";
     s += "    .reg .b16 %h;\n";
-    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e,%dd,%kvheads,%kvhead,%grp;\n";
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%oidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%qstride,%e,%dd,%kvheads,%kvhead,%grp;\n";
     s += "    .reg .b64 %Q,%K,%V,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw;\n";
     s += "    .reg .pred %p0,%p1,%p2;\n";
     s += "    ld.param.u64 %Q,[pQ];   cvta.to.global.u64 %Q,%Q;\n";
@@ -159,6 +217,7 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     s += "    ld.param.f32 %scale,[pScale];\n";
     s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %kvheads,[pKvHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
     s += "    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    ld.param.u32 %qstride,[pQStride];\n";
     // tid = tid.x ; warp = tid/32 ; lane = tid%32 ; gid = ctaid.x*WARPS + warp.
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
@@ -170,9 +229,15 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     // which is what makes `grp` exact and non-zero; MHA gives grp = 1 and kvhead = head.
     s += "    div.u32 %grp,%heads,%kvheads;\n    div.u32 %kvhead,%head,%grp;\n";
     s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%CL,%offb;\n    ld.global.u32 %ctx,[%addr];\n";
-    // qidx = slot*D + head*hd ; qrow = Q + qidx*4 ; obase = O + qidx*4.
-    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %qidx,%slot,%D;\n    mul.lo.s32 %tmp,%head,{hd};\n    add.u32 %qidx,%qidx,%tmp;\n");
-    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n    add.s64 %obase,%O,%offb;\n";
+    // O row: oidx = slot*D + head*hd, D = q_heads*hd — the output is always the packed [bcap, D]
+    // activation the next GEMM consumes. Q row: qidx = slot*qstride + head*hd, because a merged QKV
+    // projection puts this slot's Q at column 0 of a WIDER row (pQStride = D + 2*kv_dim). The two
+    // strides are equal on the shipped split-projection path, where pQStride == D.
+    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %tmp,%head,{hd};\n");
+    s += "    mul.lo.s32 %oidx,%slot,%D;\n    add.u32 %oidx,%oidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%oidx,4;\n    add.s64 %obase,%O,%offb;\n";
+    s += "    mul.lo.s32 %qidx,%slot,%qstride;\n    add.u32 %qidx,%qidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n";
     // qshw = &qsh[warp*hd] (this warp's query staging in shared).
     s += &format!("    mov.u64 %qshw,qsh;\n    mul.wide.u32 %offb,%warp,{};\n    add.s64 %qshw,%qshw,%offb;\n", hd * 4);
     // Cooperatively stage q into shared: lane stores d = lane, lane+32, … ; warp-sync before the dot.
@@ -316,11 +381,61 @@ pub fn launch_paged_attn_decode_gqa(
     bcap: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
+    launch_paged_attn_decode_gqa_at(
+        stream,
+        func,
+        q_d,
+        gqa.q_dim(),
+        k_d,
+        v_d,
+        out_d,
+        bt_d,
+        cl_d,
+        gqa,
+        layer,
+        bcap,
+        scale,
+    )
+}
+
+/// [`launch_paged_attn_decode_gqa`] with an explicit **Q row stride** — the seam the merged-QKV
+/// projection needs and the only thing it needs.
+///
+/// `q_row_stride` is the number of f32 elements between one slot's query row and the next.
+/// `gqa.q_dim()` is the packed case (three separate projections, the shipped path);
+/// `q_dim + 2*kv_dim` is the merged case, where this slot's Q occupies the first `q_dim` columns of a
+/// wider row. **The output stays packed at `q_dim`** — it feeds the O-projection GEMM, which reads a
+/// dense `[Bcap, D]` activation — so the kernel carries the two strides separately.
+///
+/// Nothing else moves: same warp map, same lane partition, same K/V addresses, same butterfly. The
+/// values are bit-identical to the packed launch over the same numbers, which is what
+/// `serving::tests::merged_qkv_decode_step_is_bit_identical_to_three_launches` proves on device.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attn_decode_gqa_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    q_d: &CudaSlice<f32>,
+    q_row_stride: usize,
+    k_d: &CudaSlice<half::f16>,
+    v_d: &CudaSlice<half::f16>,
+    out_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    cl_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
     let cfg = gqa.kv();
-    debug_assert_eq!(
-        q_d.len(),
-        bcap * gqa.q_dim(),
-        "q must be [bcap, q_heads*head_dim] (query-headed, not KV-headed)"
+    assert!(
+        q_row_stride >= gqa.q_dim(),
+        "q_row_stride {q_row_stride} is narrower than the query row it must contain ({})",
+        gqa.q_dim()
+    );
+    debug_assert!(
+        q_d.len() >= bcap.saturating_sub(1) * q_row_stride + gqa.q_dim(),
+        "q must hold [bcap, q_heads*head_dim] at row stride {q_row_stride} (query-headed)"
     );
     debug_assert_eq!(
         out_d.len(),
@@ -359,6 +474,7 @@ pub fn launch_paged_attn_decode_gqa(
         layer as u32,
     );
     let bcap_u = bcap as u32;
+    let qstride_u = q_row_stride as u32;
     let mut b = stream.launch_builder(func);
     b.arg(q_d)
         .arg(k_d)
@@ -373,19 +489,24 @@ pub fn launch_paged_attn_decode_gqa(
         .arg(&bsz)
         .arg(&nblk)
         .arg(&mbps)
-        .arg(&layer_u);
+        .arg(&layer_u)
+        .arg(&qstride_u);
     // SAFETY: the pushed arguments match `PAGED_ATTN_ENTRY`'s parameter list in order and width (six
-    // .u64 pointers, one .f32, **seven** .u32 — `pKvHeads` sits between `pHeads` and `pBsz`; see
-    // `paged_attn_decode_ptx`, and `attention_entry_param_counts_match_the_launcher_push_lists` pins
-    // the counts textually against this list). `func` was loaded from PTX generated for
-    // `cfg.head_dim` (the entry is head_dim-specialized). Every buffer is at least as long as the
-    // largest index this kernel's address arithmetic can produce for `bcap` slots at `layer`: the
-    // `%e` chain reproduces `KvConfig::elem_offset` at the **KV** head axis, bounded by
-    // `slab_elems()`; `BT[slot*mbps+logical]` by `bcap * max_blocks_per_seq`; `CL[slot]` and the
-    // query-headed `Q`/`O` rows by the shapes asserted above — which the caller guarantees and the
-    // debug asserts check at the call site. The device `div.u32 %grp,%heads,%kvheads` is exact and
-    // non-zero because `GqaConfig`'s constructor rejects a non-divisible or zero pair, so `%kvhead`
-    // cannot exceed `kv_heads - 1` and the offset cannot leave the slab.
+    // .u64 pointers, one .f32, **eight** .u32 — `pKvHeads` sits between `pHeads` and `pBsz`, and
+    // `pQStride` is last; see `paged_attn_decode_ptx`, and
+    // `attention_entry_param_counts_match_the_launcher_push_lists` pins the counts textually against
+    // this list). `func` was loaded from PTX generated for `cfg.head_dim` (the entry is
+    // head_dim-specialized). Every buffer is at least as long as the largest index this kernel's
+    // address arithmetic can produce for `bcap` slots at `layer`: the `%e` chain reproduces
+    // `KvConfig::elem_offset` at the **KV** head axis, bounded by `slab_elems()`;
+    // `BT[slot*mbps+logical]` by `bcap * max_blocks_per_seq`; `CL[slot]` by `bcap`; the packed
+    // query-headed `O` row by `bcap*q_dim`; and the `Q` row by
+    // `(bcap-1)*q_row_stride + q_dim`, which is the bound the debug assert above checks at the call
+    // site (`q_row_stride >= q_dim` is checked unconditionally, since a too-narrow stride would read
+    // a *different slot's* query rather than run off the end). The device
+    // `div.u32 %grp,%heads,%kvheads` is exact and non-zero because `GqaConfig`'s constructor rejects
+    // a non-divisible or zero pair, so `%kvhead` cannot exceed `kv_heads - 1` and the offset cannot
+    // leave the slab.
     unsafe { b.launch(cfg_launch)? };
     Ok(())
 }
@@ -441,12 +562,13 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
         \x20   .param .u32 pBsz,\n\
         \x20   .param .u32 pNblk,\n\
         \x20   .param .u32 pMbps,\n\
-        \x20   .param .u32 pLayer\n)\n{{\n"
+        \x20   .param .u32 pLayer,\n\
+        \x20   .param .u32 pQStride\n)\n{{\n"
     );
     s += &format!("    .shared .f32 qsh[{}];\n", w * hd);
     s += &format!("    .reg .f32 %acc<{hd}>;\n");
     s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt,%scK,%scV,%pv;\n";
-    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e,%es,%ki,%dd,%kvheads,%kvhead,%grp;\n";
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%oidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%qstride,%e,%es,%ki,%dd,%kvheads,%kvhead,%grp;\n";
     s += "    .reg .b64 %Q,%K,%V,%Ksc,%Vsc,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw;\n";
     s += "    .reg .pred %p0,%p1,%p2;\n";
     s += "    ld.param.u64 %Q,[pQ];     cvta.to.global.u64 %Q,%Q;\n";
@@ -460,6 +582,7 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     s += "    ld.param.f32 %scale,[pScale];\n";
     s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %kvheads,[pKvHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
     s += "    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    ld.param.u32 %qstride,[pQStride];\n";
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
     s += "    mul.lo.s32 %nq,%bcap,%heads;\n    setp.ge.u32 %p0,%gid,%nq;\n    @%p0 bra DONE;\n";
@@ -467,8 +590,12 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     // GQA head mapping, exactly as in the f16 twin: kvhead = q_head / (q_heads / kv_heads).
     s += "    div.u32 %grp,%heads,%kvheads;\n    div.u32 %kvhead,%head,%grp;\n";
     s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%CL,%offb;\n    ld.global.u32 %ctx,[%addr];\n";
-    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %qidx,%slot,%D;\n    mul.lo.s32 %tmp,%head,{hd};\n    add.u32 %qidx,%qidx,%tmp;\n");
-    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n    add.s64 %obase,%O,%offb;\n";
+    // Q reads at pQStride, O writes at D — see the f16 twin for why the two strides are held apart.
+    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %tmp,%head,{hd};\n");
+    s += "    mul.lo.s32 %oidx,%slot,%D;\n    add.u32 %oidx,%oidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%oidx,4;\n    add.s64 %obase,%O,%offb;\n";
+    s += "    mul.lo.s32 %qidx,%slot,%qstride;\n    add.u32 %qidx,%qidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n";
     s += &format!("    mov.u64 %qshw,qsh;\n    mul.wide.u32 %offb,%warp,{};\n    add.s64 %qshw,%qshw,%offb;\n", hd * 4);
     s +=
         &format!("    mov.u32 %dd,%lane;\nQL:\n    setp.ge.u32 %p1,%dd,{hd};\n    @%p1 bra QLE;\n");
@@ -600,11 +727,57 @@ pub fn launch_paged_attn_decode_int8_gqa(
     bcap: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
+    launch_paged_attn_decode_int8_gqa_at(
+        stream,
+        func,
+        q_d,
+        gqa.q_dim(),
+        k_d,
+        v_d,
+        ksc_d,
+        vsc_d,
+        out_d,
+        bt_d,
+        cl_d,
+        gqa,
+        layer,
+        bcap,
+        scale,
+    )
+}
+
+/// [`launch_paged_attn_decode_int8_gqa`] with an explicit **Q row stride** — the int8 twin of
+/// [`launch_paged_attn_decode_gqa_at`], and it exists for the same one reason: a merged-QKV
+/// projection leaves this slot's query in the first `q_dim` columns of a `q_dim + 2*kv_dim` row. The
+/// output stays packed.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attn_decode_int8_gqa_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    q_d: &CudaSlice<f32>,
+    q_row_stride: usize,
+    k_d: &CudaSlice<i8>,
+    v_d: &CudaSlice<i8>,
+    ksc_d: &CudaSlice<f32>,
+    vsc_d: &CudaSlice<f32>,
+    out_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    cl_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
     let cfg = gqa.kv();
-    debug_assert_eq!(
-        q_d.len(),
-        bcap * gqa.q_dim(),
-        "q must be [bcap, q_heads*head_dim] (query-headed, not KV-headed)"
+    assert!(
+        q_row_stride >= gqa.q_dim(),
+        "q_row_stride {q_row_stride} is narrower than the query row it must contain ({})",
+        gqa.q_dim()
+    );
+    debug_assert!(
+        q_d.len() >= bcap.saturating_sub(1) * q_row_stride + gqa.q_dim(),
+        "q must hold [bcap, q_heads*head_dim] at row stride {q_row_stride} (query-headed)"
     );
     debug_assert_eq!(
         out_d.len(),
@@ -653,6 +826,7 @@ pub fn launch_paged_attn_decode_int8_gqa(
         layer as u32,
     );
     let bcap_u = bcap as u32;
+    let qstride_u = q_row_stride as u32;
     let mut b = stream.launch_builder(func);
     b.arg(q_d)
         .arg(k_d)
@@ -669,17 +843,19 @@ pub fn launch_paged_attn_decode_int8_gqa(
         .arg(&bsz)
         .arg(&nblk)
         .arg(&mbps)
-        .arg(&layer_u);
+        .arg(&layer_u)
+        .arg(&qstride_u);
     // SAFETY: the pushed arguments match `PAGED_ATTN_INT8_ENTRY`'s parameter list in order and width
-    // (eight .u64 pointers, one .f32, **seven** .u32 — `pKvHeads` between `pHeads` and `pBsz`; see
-    // `paged_attn_decode_int8_ptx`, textually pinned by
+    // (eight .u64 pointers, one .f32, **eight** .u32 — `pKvHeads` between `pHeads` and `pBsz`,
+    // `pQStride` last; see `paged_attn_decode_int8_ptx`, textually pinned by
     // `attention_entry_param_counts_match_the_launcher_push_lists`), and `func` was loaded from PTX
     // generated for `cfg.head_dim`. Every buffer is at least as long as the largest index the kernel
     // can produce for `bcap` slots at `layer`: `%e` reproduces `KvConfig::elem_offset` and `%es`
     // `KvConfig::scale_offset`, both at the **KV** head axis (bounded by `slab_elems()` /
-    // `scale_slab_elems()`); the table/lengths/query-headed rows are bounded by the shapes asserted
-    // above, which the caller guarantees and the debug asserts check at the call site. `GqaConfig`'s
-    // constructor is what makes the device `div.u32 %grp,%heads,%kvheads` exact and non-zero.
+    // `scale_slab_elems()`); the table/lengths/packed output rows are bounded by the shapes asserted
+    // above, and the query row by `(bcap-1)*q_row_stride + q_dim` — which the caller guarantees and
+    // the debug asserts check at the call site. `GqaConfig`'s constructor is what makes the device
+    // `div.u32 %grp,%heads,%kvheads` exact and non-zero.
     unsafe { b.launch(cfg_launch)? };
     Ok(())
 }
@@ -746,12 +922,15 @@ pub fn kv_append_ptx() -> String {
         \x20   .param .u32 pBsz,\n\
         \x20   .param .u32 pNblk,\n\
         \x20   .param .u32 pMbps,\n\
-        \x20   .param .u32 pLayer\n)\n{{\n"
+        \x20   .param .u32 pLayer,\n\
+        \x20   .param .u32 pSrcStride,\n\
+        \x20   .param .u32 pKOff,\n\
+        \x20   .param .u32 pVOff\n)\n{{\n"
     );
     s += "    .reg .pred %p0;\n";
     s += "    .reg .b16 %hk,%hv;\n";
     s += "    .reg .f32 %fk,%fv;\n";
-    s += "    .reg .b32 %gid,%b,%d,%hh,%dh,%D,%total,%pos,%logical,%off,%phys,%e,%tmp,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer;\n";
+    s += "    .reg .b32 %gid,%b,%d,%hh,%dh,%D,%total,%pos,%logical,%off,%phys,%e,%tmp,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer,%sstride,%koff,%voff,%src;\n";
     s += "    .reg .b64 %Knew,%Vnew,%K,%V,%BT,%WP,%ACT,%addr,%o64;\n";
     s += "    ld.param.u64 %Knew,[pKnew]; cvta.to.global.u64 %Knew,%Knew;\n";
     s += "    ld.param.u64 %Vnew,[pVnew]; cvta.to.global.u64 %Vnew,%Vnew;\n";
@@ -762,6 +941,7 @@ pub fn kv_append_ptx() -> String {
     s += "    ld.param.u64 %ACT,[pAct];   cvta.to.global.u64 %ACT,%ACT;\n";
     s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %hd,[pHd];\n";
     s += "    ld.param.u32 %bsz,[pBsz];\n    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    ld.param.u32 %sstride,[pSrcStride];\n    ld.param.u32 %koff,[pKOff];\n    ld.param.u32 %voff,[pVOff];\n";
     // gid = ctaid.x*ntid.x + tid.x ; D = heads*hd ; total = bcap*D ; bail if gid>=total.
     s += "    mov.u32 %tmp,%ctaid.x;\n    mov.u32 %gid,%ntid.x;\n    mov.u32 %b,%tid.x;\n    mad.lo.s32 %gid,%tmp,%gid,%b;\n";
     s += "    mul.lo.s32 %D,%heads,%hd;\n    mul.lo.s32 %total,%bcap,%D;\n";
@@ -780,8 +960,12 @@ pub fn kv_append_ptx() -> String {
     // e = ((((layer*nblk)+phys)*bsz+off)*heads+hh)*hd + dh.
     s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
     s += "    mul.lo.s32 %e,%e,%heads;\n    add.u32 %e,%e,%hh;\n    mul.lo.s32 %e,%e,%hd;\n    add.u32 %e,%e,%dh;\n";
-    // load Knew[gid]/Vnew[gid], narrow to f16, store at slab[e].
-    s += "    mul.wide.u32 %o64,%gid,4;\n    add.s64 %addr,%Knew,%o64;\n    ld.global.f32 %fk,[%addr];\n    add.s64 %addr,%Vnew,%o64;\n    ld.global.f32 %fv,[%addr];\n";
+    // Source index: src = b*srcStride + d, then + the plane's own column offset. At the shipped
+    // packed layout (srcStride == D, both offsets 0) that is `gid` exactly — the pre-merge index —
+    // which is what makes the merged-QKV projection bit-identical rather than merely equivalent.
+    s += "    mad.lo.s32 %src,%b,%sstride,%d;\n";
+    s += "    add.u32 %tmp,%src,%koff;\n    mul.wide.u32 %o64,%tmp,4;\n    add.s64 %addr,%Knew,%o64;\n    ld.global.f32 %fk,[%addr];\n";
+    s += "    add.u32 %tmp,%src,%voff;\n    mul.wide.u32 %o64,%tmp,4;\n    add.s64 %addr,%Vnew,%o64;\n    ld.global.f32 %fv,[%addr];\n";
     s += "    cvt.rn.f16.f32 %hk,%fk;\n    cvt.rn.f16.f32 %hv,%fv;\n";
     s += "    mul.wide.u32 %o64,%e,2;\n    add.s64 %addr,%K,%o64;\n    st.global.b16 [%addr],%hk;\n    add.s64 %addr,%V,%o64;\n    st.global.b16 [%addr],%hv;\n";
     s += "DONE:\n    ret;\n}\n";
@@ -816,15 +1000,53 @@ pub fn launch_kv_append(
     layer: usize,
     bcap: usize,
 ) -> Result<(), DriverError> {
-    debug_assert_eq!(
-        knew_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "knew must be [bcap, heads*head_dim]"
+    launch_kv_append_at(
+        stream,
+        func,
+        knew_d,
+        vnew_d,
+        KvSourceLayout::packed(cfg.heads * cfg.head_dim),
+        k_d,
+        v_d,
+        bt_d,
+        wpos_d,
+        active_d,
+        cfg,
+        layer,
+        bcap,
+    )
+}
+
+/// [`launch_kv_append`] over an explicit [`KvSourceLayout`] — the seam a merged-QKV projection needs.
+/// At [`KvSourceLayout::packed`] this *is* [`launch_kv_append`] (the device index reduces to the
+/// thread's own `gid`); at [`KvSourceLayout::merged_qkv`] `knew_d` and `vnew_d` are the **same**
+/// buffer and the two planes are found by column offset. The cached bytes are identical either way.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    src: KvSourceLayout,
+    k_d: &mut CudaSlice<half::f16>,
+    v_d: &mut CudaSlice<half::f16>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    cfg: &KvConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    let kvd = cfg.heads * cfg.head_dim;
+    src.assert_fits(kvd);
+    debug_assert!(
+        knew_d.len() >= bcap.saturating_sub(1) * src.row_stride + src.k_off + kvd,
+        "knew must hold [bcap, heads*head_dim] at {src:?}"
     );
-    debug_assert_eq!(
-        vnew_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "vnew must be [bcap, heads*head_dim]"
+    debug_assert!(
+        vnew_d.len() >= bcap.saturating_sub(1) * src.row_stride + src.v_off + kvd,
+        "vnew must hold [bcap, heads*head_dim] at {src:?}"
     );
     debug_assert_eq!(
         k_d.len(),
@@ -862,6 +1084,7 @@ pub fn launch_kv_append(
         cfg.max_blocks_per_seq as u32,
         layer as u32,
     );
+    let (sstride, koff, voff) = (src.row_stride as u32, src.k_off as u32, src.v_off as u32);
     let mut b = stream.launch_builder(func);
     b.arg(knew_d)
         .arg(vnew_d)
@@ -876,15 +1099,20 @@ pub fn launch_kv_append(
         .arg(&bsz)
         .arg(&nblk)
         .arg(&mbps)
-        .arg(&layer_u);
+        .arg(&layer_u)
+        .arg(&sstride)
+        .arg(&koff)
+        .arg(&voff);
     // SAFETY: the pushed arguments match `KV_APPEND_ENTRY`'s parameter list in order and width (seven
-    // .u64 pointers, seven .u32 — see `kv_append_ptx`). Every buffer is at least as long as the largest
-    // index the kernel can produce for `bcap` slots at `layer`: the store index `%e` reproduces
-    // `KvConfig::elem_offset` (bounded by `slab_elems()`), the load index is the thread's own `gid <
-    // bcap*heads*hd`, and `BT`/`WP`/`ACT` are bounded by `bcap * max_blocks_per_seq` and `bcap`. That,
-    // plus each active slot's write position already having a reserved block (the caller's contract,
-    // established by `BlockManager::append`), is what keeps the scatter inside the slabs. The debug
-    // asserts above check the lengths at the call site.
+    // .u64 pointers, **ten** .u32 — the three source-layout params are last; see `kv_append_ptx`).
+    // Every buffer is at least as long as the largest index the kernel can produce for `bcap` slots
+    // at `layer`: the store index `%e` reproduces `KvConfig::elem_offset` (bounded by
+    // `slab_elems()`), the load index is `b*row_stride + d + {k,v}_off` with `b < bcap` and
+    // `d < heads*hd` — bounded by the two debug asserts above, which is why the layout is validated
+    // (`assert_fits`) rather than trusted — and `BT`/`WP`/`ACT` are bounded by
+    // `bcap * max_blocks_per_seq` and `bcap`. That, plus each active slot's write position already
+    // having a reserved block (the caller's contract, established by `BlockManager::append`), is what
+    // keeps the scatter inside the slabs.
     unsafe { b.launch(launch)? };
     Ok(())
 }
@@ -921,11 +1149,51 @@ pub fn launch_kv_append_gqa(
         bcap * gqa.kv_dim(),
         "vnew must be [bcap, kv_heads*head_dim] — the K/V projection width, not the hidden size"
     );
-    launch_kv_append(
+    launch_kv_append_gqa_at(
         stream,
         func,
         knew_d,
         vnew_d,
+        KvSourceLayout::packed(gqa.kv_dim()),
+        k_d,
+        v_d,
+        bt_d,
+        wpos_d,
+        active_d,
+        gqa,
+        layer,
+        bcap,
+    )
+}
+
+/// [`launch_kv_append_gqa`] over an explicit [`KvSourceLayout`]. The grouped-query assertion the
+/// packed entry point carries — "the source row is the K/V **projection** width, never the hidden
+/// size" — becomes, under a stride, "the K and V planes are `kv_dim` wide wherever they sit in the
+/// row", which is exactly what [`KvSourceLayout::assert_fits`] checks.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_gqa_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    src: KvSourceLayout,
+    k_d: &mut CudaSlice<half::f16>,
+    v_d: &mut CudaSlice<half::f16>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    src.assert_fits(gqa.kv_dim());
+    launch_kv_append_at(
+        stream,
+        func,
+        knew_d,
+        vnew_d,
+        src,
         k_d,
         v_d,
         bt_d,
@@ -991,11 +1259,14 @@ pub fn kv_append_int8_ptx() -> String {
         \x20   .param .u32 pBsz,\n\
         \x20   .param .u32 pNblk,\n\
         \x20   .param .u32 pMbps,\n\
-        \x20   .param .u32 pLayer\n)\n{{\n"
+        \x20   .param .u32 pLayer,\n\
+        \x20   .param .u32 pSrcStride,\n\
+        \x20   .param .u32 pKOff,\n\
+        \x20   .param .u32 pVOff\n)\n{{\n"
     );
     s += "    .reg .pred %p0,%p1;\n";
     s += "    .reg .f32 %x,%q,%amk,%amv,%sck,%scv,%rt;\n";
-    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%pos,%logical,%off,%phys,%es,%e,%src,%dd,%tmp,%nq,%qi,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer;\n";
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%pos,%logical,%off,%phys,%es,%e,%src,%dd,%tmp,%nq,%qi,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer,%sstride,%koff,%voff;\n";
     s += "    .reg .b64 %Knew,%Vnew,%K,%V,%Ksc,%Vsc,%BT,%WP,%ACT,%addr,%offb,%kdst,%vdst,%ksrc,%vsrc;\n";
     s += "    ld.param.u64 %Knew,[pKnew]; cvta.to.global.u64 %Knew,%Knew;\n";
     s += "    ld.param.u64 %Vnew,[pVnew]; cvta.to.global.u64 %Vnew,%Vnew;\n";
@@ -1008,6 +1279,7 @@ pub fn kv_append_int8_ptx() -> String {
     s += "    ld.param.u64 %ACT,[pAct];   cvta.to.global.u64 %ACT,%ACT;\n";
     s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %hd,[pHd];\n";
     s += "    ld.param.u32 %bsz,[pBsz];\n    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    ld.param.u32 %sstride,[pSrcStride];\n    ld.param.u32 %koff,[pKOff];\n    ld.param.u32 %voff,[pVOff];\n";
     // gid = ctaid.x*WARPS + warp ; one warp per (slot, head) ⇒ every lane of a warp shares the gid,
     // so the early exits below are warp-uniform (shfl full-mask stays safe).
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
@@ -1023,8 +1295,12 @@ pub fn kv_append_int8_ptx() -> String {
     // es = (((layer*nblk + phys)*bsz + off)*heads + head)  (scale-slab index) ; e = es*hd ;
     // src = gid*hd  (the (slot, head) row base in the [bcap, D] f32 input).
     s += "    mul.lo.s32 %es,%layer,%nblk;\n    add.u32 %es,%es,%phys;\n    mul.lo.s32 %es,%es,%bsz;\n    add.u32 %es,%es,%off;\n";
-    s += "    mul.lo.s32 %es,%es,%heads;\n    add.u32 %es,%es,%head;\n    mul.lo.s32 %e,%es,%hd;\n    mul.lo.s32 %src,%gid,%hd;\n";
-    s += "    mul.wide.u32 %offb,%src,4;\n    add.s64 %ksrc,%Knew,%offb;\n    add.s64 %vsrc,%Vnew,%offb;\n";
+    s += "    mul.lo.s32 %es,%es,%heads;\n    add.u32 %es,%es,%head;\n    mul.lo.s32 %e,%es,%hd;\n";
+    // src = slot*srcStride + head*hd, then + the plane's column offset. At the shipped packed layout
+    // (srcStride == heads*hd, offsets 0) that is `gid*hd` exactly — the pre-merge row base.
+    s += "    mul.lo.s32 %src,%slot,%sstride;\n    mad.lo.s32 %src,%head,%hd,%src;\n";
+    s += "    add.u32 %tmp,%src,%koff;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %ksrc,%Knew,%offb;\n";
+    s += "    add.u32 %tmp,%src,%voff;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %vsrc,%Vnew,%offb;\n";
     s += "    mul.wide.u32 %offb,%e,1;\n    add.s64 %kdst,%K,%offb;\n    add.s64 %vdst,%V,%offb;\n";
     // Per-lane strided |x| maxima over the head_dim (fold starts at 0, as the host's does).
     s += "    mov.f32 %amk,0f00000000;\n    mov.f32 %amv,0f00000000;\n";
@@ -1075,15 +1351,56 @@ pub fn launch_kv_append_int8(
     layer: usize,
     bcap: usize,
 ) -> Result<(), DriverError> {
-    debug_assert_eq!(
-        knew_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "knew must be [bcap, heads*head_dim]"
+    launch_kv_append_int8_at(
+        stream,
+        func,
+        knew_d,
+        vnew_d,
+        KvSourceLayout::packed(cfg.heads * cfg.head_dim),
+        k_d,
+        v_d,
+        ksc_d,
+        vsc_d,
+        bt_d,
+        wpos_d,
+        active_d,
+        cfg,
+        layer,
+        bcap,
+    )
+}
+
+/// [`launch_kv_append_int8`] over an explicit [`KvSourceLayout`] — the int8 twin of
+/// [`launch_kv_append_at`]. The quantizer reads the same numbers through a stride, so the per-(token,
+/// head) amax, the scale and every stored byte are unchanged.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_int8_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    src: KvSourceLayout,
+    k_d: &mut CudaSlice<i8>,
+    v_d: &mut CudaSlice<i8>,
+    ksc_d: &mut CudaSlice<f32>,
+    vsc_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    cfg: &KvConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    let kvd = cfg.heads * cfg.head_dim;
+    src.assert_fits(kvd);
+    debug_assert!(
+        knew_d.len() >= bcap.saturating_sub(1) * src.row_stride + src.k_off + kvd,
+        "knew must hold [bcap, heads*head_dim] at {src:?}"
     );
-    debug_assert_eq!(
-        vnew_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "vnew must be [bcap, heads*head_dim]"
+    debug_assert!(
+        vnew_d.len() >= bcap.saturating_sub(1) * src.row_stride + src.v_off + kvd,
+        "vnew must hold [bcap, heads*head_dim] at {src:?}"
     );
     debug_assert_eq!(
         k_d.len(),
@@ -1141,21 +1458,26 @@ pub fn launch_kv_append_int8(
         .arg(bt_d)
         .arg(wpos_d)
         .arg(active_d);
+    let (sstride, koff, voff) = (src.row_stride as u32, src.k_off as u32, src.v_off as u32);
     b.arg(&bcap_u)
         .arg(&heads)
         .arg(&hd)
         .arg(&bsz)
         .arg(&nblk)
         .arg(&mbps)
-        .arg(&layer_u);
+        .arg(&layer_u)
+        .arg(&sstride)
+        .arg(&koff)
+        .arg(&voff);
     // SAFETY: the pushed arguments match `KV_APPEND_INT8_ENTRY`'s parameter list in order and width
-    // (nine .u64 pointers, seven .u32 — see `kv_append_int8_ptx`). Every buffer is at least as long as
-    // the largest index the kernel can produce for `bcap` slots at `layer`: `%e` reproduces
-    // `KvConfig::elem_offset` (bounded by `slab_elems()`), `%es` reproduces `KvConfig::scale_offset`
-    // (bounded by `scale_slab_elems()`), the source row base is `gid*hd < bcap*heads*hd`, and
-    // `BT`/`WP`/`ACT` are bounded by `bcap * max_blocks_per_seq` and `bcap`. As for the f16 append, the
-    // caller also guarantees every active slot's write position has a reserved block. The debug asserts
-    // above check the lengths at the call site.
+    // (nine .u64 pointers, **ten** .u32, the three source-layout params last — see
+    // `kv_append_int8_ptx`). Every buffer is at least as long as the largest index the kernel can
+    // produce for `bcap` slots at `layer`: `%e` reproduces `KvConfig::elem_offset` (bounded by
+    // `slab_elems()`), `%es` reproduces `KvConfig::scale_offset` (bounded by `scale_slab_elems()`),
+    // the source row base is `slot*row_stride + head*hd + {k,v}_off` with the two debug asserts above
+    // bounding it, and `BT`/`WP`/`ACT` are bounded by `bcap * max_blocks_per_seq` and `bcap`. As for
+    // the f16 append, the caller also guarantees every active slot's write position has a reserved
+    // block.
     unsafe { b.launch(launch)? };
     Ok(())
 }
@@ -1192,11 +1514,53 @@ pub fn launch_kv_append_int8_gqa(
         bcap * gqa.kv_dim(),
         "vnew must be [bcap, kv_heads*head_dim] — the K/V projection width, not the hidden size"
     );
-    launch_kv_append_int8(
+    launch_kv_append_int8_gqa_at(
         stream,
         func,
         knew_d,
         vnew_d,
+        KvSourceLayout::packed(gqa.kv_dim()),
+        k_d,
+        v_d,
+        ksc_d,
+        vsc_d,
+        bt_d,
+        wpos_d,
+        active_d,
+        gqa,
+        layer,
+        bcap,
+    )
+}
+
+/// [`launch_kv_append_int8_gqa`] over an explicit [`KvSourceLayout`] — the int8 twin of
+/// [`launch_kv_append_gqa_at`].
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_int8_gqa_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    src: KvSourceLayout,
+    k_d: &mut CudaSlice<i8>,
+    v_d: &mut CudaSlice<i8>,
+    ksc_d: &mut CudaSlice<f32>,
+    vsc_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    src.assert_fits(gqa.kv_dim());
+    launch_kv_append_int8_at(
+        stream,
+        func,
+        knew_d,
+        vnew_d,
+        src,
         k_d,
         v_d,
         ksc_d,
@@ -1431,6 +1795,104 @@ mod tests {
         );
     }
 
+    /// **The merged-QKV stride law.** The Q row is read at a caller-supplied `pQStride` and the O row
+    /// is written at the packed query-headed `D` — two different strides that are *equal* on the
+    /// shipped split-projection path, which is precisely why a regression that collapsed them back
+    /// into one would pass every existing gate and then write the merged path's output rows `2*kv_dim`
+    /// apart. Textual, device-free, and checked at both head dims and on both cache dtypes.
+    #[test]
+    fn the_query_row_stride_is_a_parameter_and_the_output_row_stride_is_not() {
+        for hd in GATED_HEAD_DIMS {
+            for (what, ptx) in [
+                ("paged_attn_decode", paged_attn_decode_ptx(hd)),
+                ("paged_attn_decode_int8", paged_attn_decode_int8_ptx(hd)),
+            ] {
+                assert!(
+                    ptx.contains(".param .u32 pQStride"),
+                    "{what}: the Q row stride must be a runtime .param — a merged QKV projection \
+                     leaves this slot's query in the first q_dim columns of a wider row"
+                );
+                assert!(
+                    ptx.contains("ld.param.u32 %qstride,[pQStride];"),
+                    "{what}: pQStride must actually be loaded"
+                );
+                assert!(
+                    ptx.contains("mul.lo.s32 %qidx,%slot,%qstride;"),
+                    "{what}: the Q row must be indexed by pQStride"
+                );
+                assert!(
+                    ptx.contains("mul.lo.s32 %oidx,%slot,%D;"),
+                    "{what}: the OUTPUT row must stay at the packed query-headed D — it feeds the \
+                     O-projection GEMM, which reads a dense [bcap, D] activation"
+                );
+                assert!(
+                    ptx.contains("add.s64 %qrow,%Q,%offb;")
+                        && ptx.contains("add.s64 %obase,%O,%offb;"),
+                    "{what}: both rows must still be formed"
+                );
+            }
+        }
+    }
+
+    /// **The append source-layout law.** Both append kernels read their K and V planes at
+    /// `slot_row*pSrcStride + <plane offset>`, so one merged `[Bcap, D + 2*kv_dim]` projection buffer
+    /// is addressable without a copy. At [`KvSourceLayout::packed`] the arithmetic reduces to the
+    /// pre-merge index exactly (`row_stride == kv_dim`, both offsets 0) — that reduction is what makes
+    /// the merge bit-identical, and this law is what keeps the reduction spelled out in the text.
+    #[test]
+    fn both_appends_read_their_source_through_a_row_stride_and_a_plane_offset() {
+        for (what, ptx) in [
+            ("kv_append", kv_append_ptx()),
+            ("kv_append_int8", kv_append_int8_ptx()),
+        ] {
+            for p in [
+                ".param .u32 pSrcStride",
+                ".param .u32 pKOff",
+                ".param .u32 pVOff",
+            ] {
+                assert!(ptx.contains(p), "{what}: missing `{p}`");
+            }
+            assert!(
+                ptx.contains("ld.param.u32 %sstride,[pSrcStride];")
+                    && ptx.contains("ld.param.u32 %koff,[pKOff];")
+                    && ptx.contains("ld.param.u32 %voff,[pVOff];"),
+                "{what}: all three source-layout params must be loaded"
+            );
+            assert!(
+                ptx.contains("add.u32 %tmp,%src,%koff;")
+                    && ptx.contains("add.u32 %tmp,%src,%voff;"),
+                "{what}: the K and V planes must each be reached by their own column offset"
+            );
+        }
+        // The packed layout is the identity, stated as arithmetic rather than as a comment.
+        let packed = KvSourceLayout::packed(96);
+        assert_eq!(
+            (packed.row_stride, packed.k_off, packed.v_off),
+            (96, 0, 0),
+            "packed: b*kv_dim + d + 0 is exactly the pre-merge `gid`"
+        );
+        let merged = KvSourceLayout::merged_qkv(512, 128);
+        assert_eq!(
+            (merged.row_stride, merged.k_off, merged.v_off),
+            (768, 512, 640),
+            "merged: [Q(512) | K(128) | V(128)] per row"
+        );
+        merged.assert_fits(128);
+    }
+
+    /// A layout whose planes do not fit its row is a panic, not a silent scatter into whatever the
+    /// neighbouring columns hold.
+    #[test]
+    #[should_panic(expected = "must fit inside")]
+    fn a_kv_source_layout_that_overruns_its_row_is_rejected() {
+        KvSourceLayout {
+            row_stride: 128,
+            k_off: 0,
+            v_off: 64,
+        }
+        .assert_fits(128);
+    }
+
     /// **Launch-seam law (crate rule 2).** The argument list each launcher pushes must match its
     /// entry's declared `.param` count, derived from the same text. `pKvHeads` moved every attention
     /// entry from six `.u32` params to seven; pushing the old six would make the driver read adjacent
@@ -1440,18 +1902,20 @@ mod tests {
     fn attention_entry_param_counts_match_the_launcher_push_lists() {
         let count = |ptx: &str, ty: &str| ptx.matches(&format!(".param .{ty} ")).count();
         for (what, ptx, u64s, f32s, u32s) in [
-            // (pointers, scale, [bcap, heads, kv_heads, bsz, nblk, mbps, layer])
-            ("paged_attn_decode", paged_attn_decode_ptx(64), 6, 1, 7),
+            // (pointers, scale, [bcap, heads, kv_heads, bsz, nblk, mbps, layer, q_stride])
+            ("paged_attn_decode", paged_attn_decode_ptx(64), 6, 1, 8),
             (
                 "paged_attn_decode_int8",
                 paged_attn_decode_int8_ptx(64),
                 8,
                 1,
-                7,
+                8,
             ),
-            // The appends are KV-headed and gained nothing: [bcap, heads, hd, bsz, nblk, mbps, layer].
-            ("kv_append", kv_append_ptx(), 7, 0, 7),
-            ("kv_append_int8", kv_append_int8_ptx(), 9, 0, 7),
+            // The appends are KV-headed and never see a query head; they gained the three
+            // source-layout params instead: [bcap, heads, hd, bsz, nblk, mbps, layer,
+            // src_stride, k_off, v_off].
+            ("kv_append", kv_append_ptx(), 7, 0, 10),
+            ("kv_append_int8", kv_append_int8_ptx(), 9, 0, 10),
         ] {
             assert_eq!(count(&ptx, "u64"), u64s, "{what}: .u64 param count");
             assert_eq!(count(&ptx, "f32"), f32s, "{what}: .f32 param count");

@@ -74,10 +74,10 @@ use half::f16;
 
 use crate::gpu::{Gpu, TransformerWeights};
 use crate::paged_attention::{
-    kv_append_int8_ptx, kv_append_ptx, launch_kv_append_gqa, launch_kv_append_int8_gqa,
-    launch_paged_attn_decode_gqa, launch_paged_attn_decode_int8_gqa, paged_attn_decode_int8_ptx,
-    paged_attn_decode_ptx, KV_APPEND_ENTRY, KV_APPEND_INT8_ENTRY, PAGED_ATTN_ENTRY,
-    PAGED_ATTN_INT8_ENTRY,
+    kv_append_int8_ptx, kv_append_ptx, launch_kv_append_gqa_at, launch_kv_append_int8_gqa_at,
+    launch_paged_attn_decode_gqa_at, launch_paged_attn_decode_int8_gqa_at,
+    paged_attn_decode_int8_ptx, paged_attn_decode_ptx, KvSourceLayout, KV_APPEND_ENTRY,
+    KV_APPEND_INT8_ENTRY, PAGED_ATTN_ENTRY, PAGED_ATTN_INT8_ENTRY,
 };
 use crate::paged_kv::{GqaConfig, KvConfig, KvDtype, KvStorage, PagedKvCache};
 use crate::pool::{DevicePool, PoolBuf};
@@ -209,6 +209,47 @@ pub fn check_decode_weight_lens(
     Ok(())
 }
 
+/// How a [`DecodeLayer`] issues its Q/K/V projections.
+///
+/// The three projections consume the **same** `[Bcap, D]` normalized activation and differ only in
+/// which weight rows they read, so they are one GEMM over the row-concatenated weight
+/// `[D + 2*kv_dim, D]` — and that is not an approximation. `C[m,n]` is the same `K`-reduction over
+/// the same operands in the same order whichever arm computes it; only the CTA that owns the output
+/// column changes, and both `D` and `kv_dim` are multiples of the 64-wide WMMA N tile
+/// ([`assert_decode_geometry`]) so no tile ever straddles two weights. It is the same argument
+/// `tp_column_parallel_gemm_split_is_bit_exact` proves in the other direction: splitting `N` is
+/// bit-identical to not splitting it, therefore so is concatenating.
+///
+/// At the Llama-3-8B geometry the two arms differ as **3 launches of 64 + 16 + 16 CTAs** against
+/// **1 launch of 96** — 64 fewer launches per 32-layer step. Whether that is worth anything is a
+/// measurement on a device this repo has not yet timed decode on; what is settled here is that it
+/// costs no accuracy, which is why [`Merged`](Self::Merged) is the default and [`Split`](Self::Split)
+/// is kept as the A/B control arm rather than deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum QkvArm {
+    /// Three GEMM launches — `Wq`, then `Wk`, then `Wv`, into three packed buffers. The shipped
+    /// pre-Wave-6 path, retained as the control the merged arm is A/B'd and `==`-gated against.
+    Split,
+    /// One GEMM launch over the row-concatenated `[D + 2*kv_dim, D]` weight, into one
+    /// `[Bcap, D + 2*kv_dim]` buffer laid out Q | K | V per row. The consumers reach their planes by
+    /// row stride + column offset ([`KvSourceLayout::merged_qkv`], and `pQStride` on the attention
+    /// kernel) — no copy, no repack, no new kernel.
+    #[default]
+    Merged,
+}
+
+/// The row-concatenated `[D + 2*kv_dim, D]` QKV weight [`QkvArm::Merged`] uploads: `Wq`'s rows, then
+/// `Wk`'s, then `Wv`'s. **Pure host geometry** — all three are `[.., D]` row-major, so the
+/// concatenation is the flat one and the merged GEMM's output column `n` reads exactly the weight row
+/// the split arm's `n`-th column read.
+pub fn concat_qkv_weight(wq: &[f16], wk: &[f16], wv: &[f16]) -> Vec<f16> {
+    let mut v = Vec::with_capacity(wq.len() + wk.len() + wv.len());
+    v.extend_from_slice(wq);
+    v.extend_from_slice(wk);
+    v.extend_from_slice(wv);
+    v
+}
+
 /// One pre-norm transformer **decode** layer: RMSNorm → Q/K/V proj → append-to-cache → paged attention
 /// → O-proj(+residual) → RMSNorm → SiLU FFN-up → FFN-down(+residual), all on a batch of `Bcap` rows.
 /// Weights upload (f16) and kernels load once at construction.
@@ -224,9 +265,10 @@ pub struct DecodeLayer {
     f_resid: CudaFunction,
     f_attn: CudaFunction,
     f_append: CudaFunction,
-    wq: CudaSlice<f16>,
-    wk: CudaSlice<f16>,
-    wv: CudaSlice<f16>,
+    /// The Q/K/V projection weights, in whichever shape this layer's [`QkvArm`] asks for. Exactly one
+    /// of the two forms is resident — the merged arm does not keep a second copy of 3/4 of the
+    /// layer's weight bytes.
+    qkv: QkvWeights,
     wo: CudaSlice<f16>,
     w1: CudaSlice<f16>,
     w2: CudaSlice<f16>,
@@ -238,6 +280,16 @@ pub struct DecodeLayer {
     /// Cache storage dtype this layer's append/attention kernels were loaded for — must match the
     /// [`KvStorage`] arm handed to [`forward_step_on`](Self::forward_step_on).
     dtype: KvDtype,
+}
+
+/// The resident form of a layer's Q/K/V projection weights — one arm of [`QkvArm`], never both.
+enum QkvWeights {
+    Split {
+        wq: CudaSlice<f16>,
+        wk: CudaSlice<f16>,
+        wv: CudaSlice<f16>,
+    },
+    Merged(CudaSlice<f16>),
 }
 
 impl DecodeLayer {
@@ -262,6 +314,15 @@ impl DecodeLayer {
     #[inline]
     pub fn bcap(&self) -> usize {
         self.gqa.kv().num_slots
+    }
+    /// Which Q/K/V projection this layer issues — read back from the resident weights, not from a
+    /// second copy of the decision.
+    #[inline]
+    pub fn qkv_arm(&self) -> QkvArm {
+        match self.qkv {
+            QkvWeights::Split { .. } => QkvArm::Split,
+            QkvWeights::Merged(_) => QkvArm::Merged,
+        }
     }
 
     /// Upload the weights (narrowed to f16) and load every kernel for **f16 cache storage** (the
@@ -305,14 +366,29 @@ impl DecodeLayer {
         Self::new_gqa_with_dtype(g, w, gqa, dff, KvDtype::F16)
     }
 
-    /// [`new_gqa`](Self::new_gqa) with an explicit cache storage dtype — the one real constructor;
-    /// the other three delegate here.
+    /// [`new_gqa`](Self::new_gqa) with an explicit cache storage dtype, at the default
+    /// [`QkvArm`] — see [`new_gqa_with_arms`](Self::new_gqa_with_arms) for the one real constructor.
     pub fn new_gqa_with_dtype(
         g: &mut Gpu,
         w: &TransformerWeights,
         gqa: &GqaConfig,
         dff: usize,
         dtype: KvDtype,
+    ) -> Result<Self, DriverError> {
+        Self::new_gqa_with_arms(g, w, gqa, dff, dtype, QkvArm::default())
+    }
+
+    /// [`new_gqa_with_dtype`](Self::new_gqa_with_dtype) with an explicit [`QkvArm`] — the one real
+    /// constructor; the other four delegate here. The arm decides whether the three projections
+    /// upload (and launch) separately or as one row-concatenated weight; it changes no numbers, and
+    /// `merged_qkv_decode_step_is_bit_identical_to_three_launches` is what holds that claim.
+    pub fn new_gqa_with_arms(
+        g: &mut Gpu,
+        w: &TransformerWeights,
+        gqa: &GqaConfig,
+        dff: usize,
+        dtype: KvDtype,
+        qkv_arm: QkvArm,
     ) -> Result<Self, DriverError> {
         let cfg = *gqa.kv();
         assert_decode_geometry(gqa, dff);
@@ -376,9 +452,18 @@ impl DecodeLayer {
             }
         };
         let to16 = |wt: &[f32]| -> Vec<f16> { wt.iter().map(|&v| f16::from_f32(v)).collect() };
-        let wq = g.stream.memcpy_stod(&to16(w.wq))?;
-        let wk = g.stream.memcpy_stod(&to16(w.wk))?;
-        let wv = g.stream.memcpy_stod(&to16(w.wv))?;
+        let qkv = match qkv_arm {
+            QkvArm::Split => QkvWeights::Split {
+                wq: g.stream.memcpy_stod(&to16(w.wq))?,
+                wk: g.stream.memcpy_stod(&to16(w.wk))?,
+                wv: g.stream.memcpy_stod(&to16(w.wv))?,
+            },
+            QkvArm::Merged => QkvWeights::Merged(g.stream.memcpy_stod(&concat_qkv_weight(
+                &to16(w.wq),
+                &to16(w.wk),
+                &to16(w.wv),
+            ))?),
+        };
         let wo = g.stream.memcpy_stod(&to16(w.wo))?;
         let w1 = g.stream.memcpy_stod(&to16(w.w1))?;
         let w2 = g.stream.memcpy_stod(&to16(w.w2))?;
@@ -390,9 +475,7 @@ impl DecodeLayer {
             f_resid,
             f_attn,
             f_append,
-            wq,
-            wk,
-            wv,
+            qkv,
             wo,
             w1,
             w2,
@@ -500,12 +583,48 @@ impl DecodeLayer {
         // --- attention: norm → fp16 Q/K/V projections → append new K/V → paged decode attention ---
         let h1 = norm(pool, x_d, bcap)?;
         let h1_16 = cast(pool, &h1, bcap * d)?;
-        let q = gemm16(pool, &self.f_gemm, &h1_16, &self.wq, bcap, d, d)?;
+        // One arm allocates one pooled buffer and one allocates three, so the pool's bump sequence is
+        // a function of the arm alone — which is what a captured graph (it bakes the pooled
+        // addresses) needs, and why the arm is fixed at construction rather than per step.
+        //
         // The K/V projections narrow to `kv_dim` — `g` times fewer output columns than Q under GQA,
         // and the only place the two head counts diverge inside the layer. `kv_dim == d` at MHA, so
-        // this is byte-identical to the pre-GQA code there.
-        let k = gemm16(pool, &self.f_gemm, &h1_16, &self.wk, bcap, d, kvd)?;
-        let v = gemm16(pool, &self.f_gemm, &h1_16, &self.wv, bcap, d, kvd)?;
+        // the split arm is byte-identical to the pre-GQA code there.
+        let (merged, split) = match &self.qkv {
+            QkvWeights::Merged(wqkv) => (
+                Some(gemm16(
+                    pool,
+                    &self.f_gemm,
+                    &h1_16,
+                    wqkv,
+                    bcap,
+                    d,
+                    d + 2 * kvd,
+                )?),
+                None,
+            ),
+            QkvWeights::Split { wq, wk, wv } => (
+                None,
+                Some((
+                    gemm16(pool, &self.f_gemm, &h1_16, wq, bcap, d, d)?,
+                    gemm16(pool, &self.f_gemm, &h1_16, wk, bcap, d, kvd)?,
+                    gemm16(pool, &self.f_gemm, &h1_16, wv, bcap, d, kvd)?,
+                )),
+            ),
+        };
+        // Q, K and V as (buffer, layout) pairs. Merged: one buffer, three planes of one row.
+        let (q, k, v, q_stride, kv_src) = match (&merged, &split) {
+            (Some(qkv), _) => (
+                &**qkv,
+                &**qkv,
+                &**qkv,
+                d + 2 * kvd,
+                KvSourceLayout::merged_qkv(d, kvd),
+            ),
+            (_, Some((q, k, v))) => (&**q, &**k, &**v, d, KvSourceLayout::packed(kvd)),
+            // Unreachable by construction: the match above sets exactly one of the two.
+            (None, None) => unreachable!("one QKV arm must have run"),
+        };
         // Append the new token's K/V into this layer's cache plane at each slot's write position,
         // then paged decode attention over the (now-updated) cache — the one dtype-dispatched pair.
         // `attn` is pooled *before* the match so the bump sequence is identical on both arms (a
@@ -513,11 +632,12 @@ impl DecodeLayer {
         let mut attn = pool.alloc::<f32>(bcap * d)?;
         match kv {
             KvStorage::F16 { k: kc, v: vc } => {
-                launch_kv_append_gqa(
+                launch_kv_append_gqa_at(
                     stream,
                     &self.f_append,
-                    &k,
-                    &v,
+                    k,
+                    v,
+                    kv_src,
                     kc,
                     vc,
                     bt_d,
@@ -527,10 +647,11 @@ impl DecodeLayer {
                     layer,
                     bcap,
                 )?;
-                launch_paged_attn_decode_gqa(
+                launch_paged_attn_decode_gqa_at(
                     stream,
                     &self.f_attn,
-                    &q,
+                    q,
+                    q_stride,
                     kc,
                     vc,
                     &mut attn,
@@ -548,11 +669,12 @@ impl DecodeLayer {
                 ksc,
                 vsc,
             } => {
-                launch_kv_append_int8_gqa(
+                launch_kv_append_int8_gqa_at(
                     stream,
                     &self.f_append,
-                    &k,
-                    &v,
+                    k,
+                    v,
+                    kv_src,
                     kc,
                     vc,
                     ksc,
@@ -564,10 +686,11 @@ impl DecodeLayer {
                     layer,
                     bcap,
                 )?;
-                launch_paged_attn_decode_int8_gqa(
+                launch_paged_attn_decode_int8_gqa_at(
                     stream,
                     &self.f_attn,
-                    &q,
+                    q,
+                    q_stride,
                     kc,
                     vc,
                     ksc,
@@ -710,7 +833,7 @@ impl DecodeModel {
         Self::new_gqa_with_dtype(g, weights, gqa, dff, pool_bytes, KvDtype::F16)
     }
 
-    /// [`new_gqa`](Self::new_gqa) with an explicit cache storage dtype — the one real constructor.
+    /// [`new_gqa`](Self::new_gqa) with an explicit cache storage dtype, at the default [`QkvArm`].
     pub fn new_gqa_with_dtype(
         g: &mut Gpu,
         weights: &[TransformerWeights],
@@ -718,6 +841,23 @@ impl DecodeModel {
         dff: usize,
         pool_bytes: usize,
         dtype: KvDtype,
+    ) -> Result<Self, DriverError> {
+        Self::new_gqa_with_arms(g, weights, gqa, dff, pool_bytes, dtype, QkvArm::default())
+    }
+
+    /// [`new_gqa_with_dtype`](Self::new_gqa_with_dtype) with an explicit [`QkvArm`], applied to every
+    /// layer — the one real constructor. The arm is a *launch-shape* choice with no numerical
+    /// content (see [`QkvArm`]), so a whole-model `==` gate across the two arms is the right test and
+    /// `merged_qkv_decode_step_is_bit_identical_to_three_launches` is it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_gqa_with_arms(
+        g: &mut Gpu,
+        weights: &[TransformerWeights],
+        gqa: &GqaConfig,
+        dff: usize,
+        pool_bytes: usize,
+        dtype: KvDtype,
+        qkv_arm: QkvArm,
     ) -> Result<Self, DriverError> {
         let cfg = *gqa.kv();
         assert!(!weights.is_empty(), "model needs at least one layer");
@@ -729,7 +869,9 @@ impl DecodeModel {
         let d = gqa.q_dim();
         let mut layers = Vec::with_capacity(weights.len());
         for w in weights {
-            layers.push(DecodeLayer::new_gqa_with_dtype(g, w, gqa, dff, dtype)?);
+            layers.push(DecodeLayer::new_gqa_with_arms(
+                g, w, gqa, dff, dtype, qkv_arm,
+            )?);
         }
         let cache = PagedKvCache::new_with_dtype(g.stream.clone(), cfg, dtype)?;
         let pool = DevicePool::new(g.stream.clone(), pool_bytes)?;
@@ -1527,6 +1669,37 @@ mod tests {
         );
     }
 
+    /// **The merged-QKV weight law, device-free.** The concatenation is the flat one (all three
+    /// weights are `[.., D]` row-major), the merged `N` is a multiple of the 64-wide WMMA tile at
+    /// every geometry [`assert_decode_geometry`] admits — so no output tile ever straddles two
+    /// weights, which is the whole bit-exactness argument — and the merged buffer holds exactly the
+    /// same elements in the same order.
+    #[test]
+    fn the_merged_qkv_weight_is_the_three_weights_end_to_end() {
+        let (d, kvd) = (512usize, 128usize);
+        let f = |x: f32| f16::from_f32(x);
+        let wq: Vec<f16> = (0..d * d).map(|i| f(i as f32)).collect();
+        let wk: Vec<f16> = (0..kvd * d).map(|i| f(-(i as f32))).collect();
+        let wv: Vec<f16> = (0..kvd * d).map(|i| f(i as f32 * 0.5)).collect();
+        let merged = concat_qkv_weight(&wq, &wk, &wv);
+        assert_eq!(merged.len(), (d + 2 * kvd) * d);
+        assert_eq!(&merged[..wq.len()], &wq[..]);
+        assert_eq!(&merged[wq.len()..wq.len() + wk.len()], &wk[..]);
+        assert_eq!(&merged[wq.len() + wk.len()..], &wv[..]);
+        // The tile-alignment premise, stated as arithmetic over the extents the layer accepts.
+        for (dd, kk) in [(512usize, 128usize), (4096, 1024), (64, 64), (256, 64)] {
+            assert_eq!(dd % 64, 0);
+            assert_eq!(kk % 64, 0);
+            assert_eq!(
+                (dd + 2 * kk) % crate::ptx_wmma::SM_BN,
+                0,
+                "merged N = D + 2*kv_dim must divide the WMMA N tile at D={dd} kv_dim={kk}"
+            );
+        }
+        // Merged is the default: the arm that ships is the one that cannot be wrong.
+        assert_eq!(QkvArm::default(), QkvArm::Merged);
+    }
+
     /// **KV-append scatter correctness.** Appending the new token's K/V via the kernel, then reading the
     /// cache back, must reproduce the f16-rounded inputs at exactly the block-table address the host
     /// allocator hands out — bit-for-bit (the scatter is a pure narrow + place, no arithmetic).
@@ -1844,6 +2017,108 @@ mod tests {
                 gqa.group_size()
             );
         });
+    }
+
+    /// **The merged-QKV `==` gate (Wave 6 lever 3).** One decode step of a `g = 4` grouped-query
+    /// layer computed by [`QkvArm::Merged`] must be **bit-for-bit** the step computed by
+    /// [`QkvArm::Split`] — not close, not within a tolerance: the same `f32` bits in every one of the
+    /// `Bcap*D` outputs.
+    ///
+    /// **Why `==` is the right gate and a tolerance would not be.** The merge changes *which CTA*
+    /// computes an output column and *what address* the consumers read it from; it changes no
+    /// operand, no order and no rounding. So the only honest gate is the strongest one, and a
+    /// tolerance gate here would pass a merge that quietly transposed a plane. The comparison runs
+    /// through the whole step — projection, KV append, paged attention, O-projection, FFN — because
+    /// the merge's real risk is not the GEMM at all: it is that K and V are now found by row stride
+    /// plus column offset ([`KvSourceLayout::merged_qkv`]) and Q by `pQStride`, and a wrong offset
+    /// caches a plausible tensor that no downstream tolerance can attribute.
+    ///
+    /// The two models are built from the same weights, populated from the same seed and stepped on
+    /// the same activation, so every input bit is shared and the arm is the only difference.
+    #[test]
+    fn merged_qkv_decode_step_is_bit_identical_to_three_launches() {
+        with_gpu(
+            "merged_qkv_decode_step_is_bit_identical_to_three_launches",
+            |g| {
+                // Llama-3-8B's grouping at a laptop width, so kv_dim != D and the merged row really is
+                // three unequal planes: [Q 512 | K 128 | V 128].
+                let (q_heads, kv_heads, hd, dff, bsz, bcap) =
+                    (8usize, 2usize, 64usize, 256usize, 16usize, 64usize);
+                let (d, kvd) = (q_heads * hd, kv_heads * hd);
+                let ctx0: Vec<usize> = (0..bcap).map(|b| (b * 13) % 81).collect(); // ragged incl. 0
+                let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+                let kv = KvConfig {
+                    layers: 1,
+                    heads: kv_heads,
+                    head_dim: hd,
+                    block_size: bsz,
+                    num_blocks: bcap * max_bps + 8,
+                    num_slots: bcap,
+                    max_blocks_per_seq: max_bps,
+                };
+                let gqa = GqaConfig::new(kv, q_heads);
+                let mut rng = crate::diff::Rng::new(0x9C41);
+                let wdata = layer_weights_gqa(&mut rng, 1, d, kvd, dff);
+                let weights = weights_view(&wdata);
+                let x = rng.vec(bcap * d, -1.0, 1.0);
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+
+                let mut run = |arm: QkvArm| -> Vec<f32> {
+                    let mut model = DecodeModel::new_gqa_with_arms(
+                        g,
+                        &weights,
+                        &gqa,
+                        dff,
+                        64 * 1024 * 1024,
+                        KvDtype::F16,
+                        arm,
+                    )
+                    .unwrap();
+                    assert_eq!(model.layers[0].qkv_arm(), arm);
+                    populate_one_layer(g, &mut model, &ctx0, kv_heads, hd, 0x1234);
+                    let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                    model.step_on(&g.stream.clone(), &x_d, &mut out_d).unwrap();
+                    g.stream.synchronize().unwrap();
+                    g.stream.memcpy_dtov(&out_d).unwrap()
+                };
+                let split = run(QkvArm::Split);
+                let merged = run(QkvArm::Merged);
+
+                assert_eq!(split.len(), merged.len());
+                let mut differing = 0usize;
+                let mut first = None;
+                for i in 0..split.len() {
+                    if split[i].to_bits() != merged[i].to_bits() {
+                        differing += 1;
+                        first.get_or_insert((i, split[i], merged[i]));
+                    }
+                }
+                assert_eq!(
+                differing,
+                0,
+                "merged QKV must be bit-identical to three launches; {differing} of {} elements \
+                 differ, first at {:?}",
+                split.len(),
+                first
+            );
+                // Not vacuous: the step has to have produced something.
+                assert!(
+                    split.iter().any(|&z| z != 0.0),
+                    "the control arm produced an all-zero step — the gate would pass on nothing"
+                );
+                eprintln!(
+                "merged QKV == 3 launches, bit-for-bit on {} f32 ({q_heads}q/{kv_heads}kv x {hd}, \
+                 D={d} kv_dim={kvd}, merged N={} = 1 launch of {} CTAs vs 3 of {}+{}+{}), \
+                 ragged ctx 0..80",
+                split.len(),
+                d + 2 * kvd,
+                (d + 2 * kvd) / 64,
+                d / 64,
+                kvd / 64,
+                kvd / 64,
+            );
+            },
+        );
     }
 
     /// **A grouped-query model drives the whole serving stack.** The geometry has to survive
