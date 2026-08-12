@@ -487,7 +487,11 @@ falling back to a different kernel, which is why the 4050 gates above stay green
 
 Measured standing on an **NVIDIA H100 80GB HBM3** (132 SMs, Linux container, cuBLAS with f32 output
 as the peer), full tables and a log citation per number in `BENCHMARKS.md` → *GPU backend (NVIDIA
-H100 80GB HBM3, `sm_90a`)*:
+H100 80GB HBM3, `sm_90a`)*. **All of it is iteration-grade**: the rounds ran in a container whose
+user is refused `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 classes container rounds as
+*iteration* data and only locked-clock root-VM rounds as *publication* data — each log stamps itself
+`ITERATION data, not publication data`. The rounds substitute a before/after drift gate for the lock;
+read every percentage below as provisional pending a locked-clock VM re-run.
 
 - **95.3% / 88.6% / 92.3% of cuBLAS f16 (f32 out)** at 2048³ / 4096³ / 8192³, **97.3%** on the GPT
   FFN down-projection, **73–80%** on the wide-N up-projections; bf16 within ~2 points everywhere the

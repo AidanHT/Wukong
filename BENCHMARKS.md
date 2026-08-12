@@ -51,7 +51,7 @@ box can build — is `GPU_RETARGET_PLAN.md`.
 
 | family | standing |
 |---|---|
-| **H100 (`sm_90a`): the wgmma-vs-cuBLAS suite (f16 + bf16, f32 out), the H100 HBM figure, the fused int8-dequant ratios, the Hopper int8-vs-IMMA standing, the cuBLASLt epilogue probe** | **STANDS *for the H100 80GB HBM3*, measured 2026-08-11** ([section](#gpu-backend-nvidia-h100-80gb-hbm3-sm_90a); logs `bench/gpu/h100/2026-08-11-h100-w2-r*.log`). Same-run, twin-controlled, ±5% publish bar, clocks recorded before and after every round — and **two rounds refused themselves** on +6.82% SM-clock drift, one shape refused on a ±15.47% peer floor, all reproduced in the section. This is a **different device** from every other row in this table: do not average it with the 4050 rows and do not carry a 4050 conclusion into it. The one place this visit tested that transfer directly — Hopper int8 — the 4050's tuning fell from 96–105% of cuBLAS IMMA to **22–52%**. Later waves of the campaign are unimplemented and unmeasured; they are roadmap material (`docs/roadmap.md`, `docs/gpu/derive/`), and no number for them appears in this document. |
+| **H100 (`sm_90a`): the wgmma-vs-cuBLAS suite (f16 + bf16, f32 out), the H100 HBM figure, the fused int8-dequant ratios, the Hopper int8-vs-IMMA standing, the cuBLASLt epilogue probe** | **STANDS *for the H100 80GB HBM3* — as ITERATION-GRADE data, by the campaign's own definition**, measured 2026-08-11 ([section](#gpu-backend-nvidia-h100-80gb-hbm3-sm_90a); logs `bench/gpu/h100/2026-08-11-h100-w2-r*.log`). **The clock policy was not met, and these numbers are published anyway — knowingly, and only under this label.** Every round ran in a Modal **container** whose user is refused `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 is explicit: canonical rounds run "on VMs with root, `nvidia-smi -lgc` locked below throttle … Container rounds are *iteration* data; VM rounds are *publication* data." Every GEMM log cited below prints that verdict on itself in an all-caps banner (`*** CLOCKS ARE NOT LOCKED (or the lock is undeclared) … this round is ITERATION data, not publication data`). What the rounds substitute is a *drift gate* — clocks read before and after, the round refusing itself past ±5% — which catches a clock that **moved** and cannot catch one parked at the wrong steady state for the whole round, so it is a weaker instrument than the lock, not an equivalent one. Treat every percentage here as provisional until a root VM with pinned clocks re-runs it; that re-run is owed and is not scheduled in this document. With that caveat named: same-run, twin-controlled, ±5% publish bar, clocks recorded before and after every round — and **two rounds refused themselves** on +6.82% SM-clock drift, one shape refused on a ±15.47% peer floor, all reproduced in the section. This is a **different device** from every other row in this table: do not average it with the 4050 rows and do not carry a 4050 conclusion into it. The one place this visit tested that transfer directly — Hopper int8 — the 4050's tuning fell from 96–105% of cuBLAS IMMA to **22–52%**. Later waves of the campaign are unimplemented and unmeasured; they are roadmap material (`docs/roadmap.md`, `docs/gpu/derive/`), and no number for them appears in this document. |
 | the fp16/bf16/fp8/int8/int4 GEMM standings, flash-attention, conv, the resident layer, HBM bandwidth, compile latency, the serving stack | **STANDS *for the RTX 4050*.** Same-run, clock-invariant, and gated against an oracle — but 20 SMs, this card's L2 and 192 GB/s decided every tile, stage depth, regime threshold and occupancy crossover in them. None of it predicts an A100 or an H100, in either direction. One extra scope note on **serving**: those rounds predate grouped-query support, so their KV cache was sized for `q_heads`. The internal ratios (goodput vs fill=1, graph-driven scheduler vs static batching, int8-KV footprint) are self-consistent at the MHA geometry they were taken at — but they are **not** a Llama-class geometry, and a future vLLM/TRT-LLM comparison must be run at the GQA shape those peers actually serve. |
 | **"Wukong beats PyTorch at every S"** | **NOT RE-EARNED AGAINST THE REAL BAR.** The peer is **eager** PyTorch, and the only justification ever given is that Triton does not install on Windows. On Linux the honest peer is `torch.compile` with Inductor+Triton, and the tooling to build it landed 2026-08-09 (`tools/cloud/peers/`, pinned in the Modal image, with `smoke_inductor.py` asserting a Triton kernel was actually generated so an ATen fallback cannot wear the framework bar's name, and `verify_peers.py` failing loudly rather than shrugging when a declared peer is missing). Until that round runs, treat this claim as **on notice**: eager is not a bar. |
 | **the CUDA-graph launch-overhead wins** | **EXPECT SHRINKAGE BEFORE THE GPU EVEN CHANGES.** They were measured under **Windows/WDDM**, whose kernel-launch cost is several times the Linux driver's. The multiple is a ratio of *overhead removed* to *overhead present*, so a cheaper launch shrinks the numerator directly. That is a re-scoping to expect, not a regression to explain. |
@@ -254,9 +254,11 @@ cargo run -p wukong_xbench --release      # CC=gcc by default; set CC to overrid
 - **Second machine, GPU only (added 2026-08-11).** The
   [H100 section](#gpu-backend-nvidia-h100-80gb-hbm3-sm_90a) was measured on an **NVIDIA H100 80GB
   HBM3** (Hopper, `sm_90a`, 132 SMs, 50 MiB L2, kmd driver 580.95.05, CUDA driver API 13.0) in a
-  Linux container, peers cuBLAS / cuBLASLt built against CUDA 12.9 in that image. Clock locking is
-  refused to the container's user, so each round records its clocks before and after and refuses
-  itself on drift instead. Every other GPU figure in this document is the laptop's RTX 4050.
+  Linux container, peers cuBLAS / cuBLASLt built against CUDA 12.9 in that image. **Clock locking is
+  refused to the container's user, so by `GPU_RETARGET_PLAN.md` §6.3 those rounds are *iteration*
+  data, not *publication* data** — each records its clocks before and after and refuses itself on
+  drift instead, which is a weaker substitute, and the section says so at its head. Every other GPU
+  figure in this document is the laptop's RTX 4050.
 - Elementwise/reduction kernels: f32 arrays of N = 2²⁰ (1,048,576). Matmul: 256/512/1024/**2048**
   square by default (4096 additionally under `XBENCH_HUGE`; `XBENCH_MATMUL_SIZES` narrows the sweep);
   `nn.Linear` and the fused FFN: 512/1024; TN weight-gradient: 256/512/1024.
@@ -367,7 +369,10 @@ Triton's 30–120 s** (~4×10⁴–1.6×10⁵×).
 **GPU backend on an H100 80GB HBM3** (`sm_90a`, 132 SMs, Linux — a *different device* from the
 paragraph above, and the two do not mix; full section
 [below](#gpu-backend-nvidia-h100-80gb-hbm3-sm_90a), every figure logged under
-`bench/gpu/h100/2026-08-11-h100-w2-r*.log`). The `wgmma` + TMA warp-specialized GEMM measures
+`bench/gpu/h100/2026-08-11-h100-w2-r*.log`). **Read all of it as iteration-grade:** these are
+*container* rounds with unlockable clocks, which `GPU_RETARGET_PLAN.md` §6.3 defines as *iteration*
+data rather than *publication* data, and which every cited log stamps itself with — the section head
+states the caveat in full and a locked-clock VM re-run is owed. The `wgmma` + TMA warp-specialized GEMM measures
 **95.3% / 88.6% / 92.3% of cuBLAS f16 (f32 out) at 2048³ / 4096³ / 8192³** and **97.3%** on the
 GPT FFN down-projection, weakening to **73–80%** on the wide-N up-projections; bf16 agrees within
 ~2 points everywhere the shapes overlap. **1024³ is REFUSED in f16** — the peer's own twin arms
@@ -1972,11 +1977,25 @@ column pairs with `C`, never with `C(fast)`.
 > section below is a Hopper claim, and this visit measured one case where the difference is the whole
 > story (Hopper int8, below).
 >
-> **The container cannot lock clocks.** `nvidia-smi -lgc` is refused to a non-root container user, so
-> instead every round records SM clock, memory clock, temperature and power **before and after
-> itself** and closes its own publish gate if the SM clock drifted past the ±5% bar. Two rounds in
-> this visit did exactly that and published nothing; both are listed under *Refusals* below rather
-> than dropped.
+> **⚠ ITERATION DATA, NOT PUBLICATION DATA — the campaign's own clock policy was not met.**
+> `GPU_RETARGET_PLAN.md` §6.3 sets it: canonical rounds run "on VMs with root, `nvidia-smi -lgc`
+> locked below throttle", and "**Container rounds are *iteration* data; VM rounds are *publication*
+> data**". Every round in this section is a Modal *container* round, `nvidia-smi -lgc` is refused to
+> its non-root user, and every GEMM log cited below says so itself in an all-caps banner:
+> `*** CLOCKS ARE NOT LOCKED (or the lock is undeclared). … so per GPU_RETARGET_PLAN.md 6.3 this round
+> is ITERATION data, not publication data. Publication rounds need a root VM with the clocks pinned
+> below throttle; set WUKONG_GPU_CLOCK_LOCK to declare it.` No amendment anywhere in the plan or the
+> dossiers lifts that rule; this section publishes under it rather than around it, and **every number
+> below is provisional pending a locked-clock VM re-run that is owed and unscheduled.**
+>
+> What the rounds substitute is a **drift gate, not a lock**: each records SM clock, memory clock,
+> temperature and power **before and after itself** and closes its own publish gate if the SM clock
+> moved past the ±5% bar. Two rounds in this visit did exactly that and published nothing; both are
+> listed under *Refusals* below rather than dropped. The substitution is weaker than the thing it
+> replaces in one specific way worth stating: it detects a clock that **changed across the round**,
+> and is blind to a clock parked at a boosted or throttled steady state for the whole of it — the
+> `+0.00% drift` on the published rounds is evidence of stability, not of the *right* frequency, and
+> the pair is a container's tenancy, not a pinned instrument.
 
 **What is being measured.** Wukong's Hopper GEMM is a `wgmma` + TMA warp-specialized kernel
 (`wgmma_nt_{f16,bf16}_128x256x64_s4[_mcb2]_v2`, generated by
