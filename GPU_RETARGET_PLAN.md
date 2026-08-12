@@ -236,7 +236,7 @@ when silicon is genuinely required:
 - **Phase 5/6** — the rented-GPU benchmark instrument (controls, provenance, MIG checks) and the
   honest re-scoping of every published claim.
 
-**Cost:** roughly **$54–108 out of pocket** (hard cap $150 excluding a separately-approved wgmma Act
+**Cost:** roughly **$54–108 out of pocket** (hard cap $25 excluding a separately-approved wgmma Act
 2), and plausibly near **$0–50** — Modal's verified **$30/month recurring credit** is ≈7.6 free
 H100-hours *per cycle*, so spreading Phase 3 across two months covers most of it, and §0's
 derive-before-you-rent rule removes most of the sweep time that would otherwise dominate. There is
@@ -735,7 +735,7 @@ code and compilation is $0** — only device gates and timed rounds appear here.
 | 5–6 Regression rounds + docs | mixed | 6–10 | $10–25 | |
 | **Total (excl. Act 2)** | | **~31–52 GPU-hrs** | **~$54–108** | **→ ~$0–50 net** across 2–3 Modal cycles |
 
-Hard cap proposal: **$150** excluding a separately-approved Act 2. Two levers keep the real number at
+Hard cap proposal: **$25** (reduced 2026-08-12 from the original $150) excluding a separately-approved Act 2. Two levers keep the real number at
 the bottom of that range: Modal's **$30/month recurring credit** (≈7.6 free H100-hours *per cycle*, so
 spreading Phase 3 across two months is close to free), and §0's derive-before-you-rent rule, which is
 what turns a 40-point blind sweep into a 6-point confirmation. The Prime Intellect grant, if it lands,
@@ -798,7 +798,7 @@ Status as of 2026-08-06, after the review pass:
 |---|---|---|
 | 1 | **Modal account connected** | ✅ **DONE** — workspace `aidanht`, token verified against the API |
 | 2 | **Workspace budget cap set** at [modal.com/settings/usage](https://modal.com/settings/usage) | ⛔ **OPEN — the only blocker for Phase 1.** $30 (or $25). Also check whether a payment method is on file; if none is, leave it that way |
-| 3 | **Spending approval**: ~$54–108, hard cap $150 (excl. a separately-approved wgmma Act 2) | ⛔ open |
+| 3 | **Spending approval**: ~$54–108 original estimate, hard cap $25 as of 2026-08-12 (excl. a separately-approved wgmma Act 2) | ⛔ open |
 | 4 | Second provider for cheap iteration (RunPod or Vast, ~$10 load) | ⏸ not needed until Phase 1 step 3 |
 | 5 | Root-VM provider for clock-locked publication rounds (Verda / Hyperstack / Lambda) | ⏸ not needed until Phase 3 step 3 |
 | 6 | **Prime Intellect grant pitch** — want me to draft the email? Free, real upside, individuals explicitly eligible | ⏸ optional, parallel |

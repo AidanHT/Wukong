@@ -24,7 +24,7 @@ measurement instrument. Hard rules that bind every commit:
   ASCII law.
 - `crates/wukong_codegen_gpu/src/{gpu.rs, ptx_wgmma.rs}` have ONE owner per wave — never two
   agents in them concurrently.
-- Metered cloud spend: ≈ **$6.1 of a $150 cap** so far. GPU rounds are Modal
+- Metered cloud spend: ≈ **$6.1 of a $25 cap** so far. GPU rounds are Modal
   (`tools/cloud/modal_app.py`); ALWAYS `export PYTHONIOENCODING=utf-8` first (cp1252 console
   kills the CLI while the container keeps billing) and ALWAYS `modal run --detach` (a local DNS
   flake once killed a healthy 20-minute build). `modal app list` checks for orphan billing.

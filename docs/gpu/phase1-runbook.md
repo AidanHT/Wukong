@@ -539,7 +539,7 @@ Modal free credit: **$30/month, recurring** (plan §4.1) ⇒ ≈37 free L4-hours
 Rules:
 - **The dashboard is authoritative** (<https://modal.com/settings/usage>). Record the estimate *and*
   the actual, and note any discrepancy rather than silently trusting the arithmetic.
-- Record the **running campaign total** against the plan's ~$54–108 envelope and the **$150 hard cap**
+- Record the **running campaign total** against the plan's ~$54–108 envelope (which PREDATES the cap reduction) and the **$25 hard cap**
   (plan §7) at the bottom of every session summary.
 - Phase-1 expected total: **≈$0.5–2.0** on L4 — comfortably inside one month's free credit.
   If a session's actual exceeds **$5**, stop and write down why before running anything else.
