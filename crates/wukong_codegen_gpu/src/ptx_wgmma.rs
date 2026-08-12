@@ -1167,6 +1167,48 @@ pub struct WgmmaCfg {
     /// differ only in a cache policy are two different modules, and sharing a key would run one of
     /// them twice under both headings.
     pub l2_hint: L2Hint,
+    /// **`GROUP_M`: the grouped threadblock raster, in M TILES** (wave-3 lever 1). `1` is the
+    /// linear order every row shipped before wave 3 and emits byte-identical PTX to it.
+    ///
+    /// # What it changes, and what it provably does not
+    ///
+    /// Nothing about the mainloop, the descriptor, the multicast slicing or the epilogue reads
+    /// `%ctaid`; the *only* place a tile origin is computed is the two instructions that scale
+    /// `%ctaid.x`/`%ctaid.y` by `BN`/`BM`. This field replaces exactly those, plus the host-side
+    /// grid reshape in [`LaunchPlan::grid`]. Every tile is still computed exactly once (the law is
+    /// `the_raster_is_a_bijection_over_the_padded_tile_domain`); only the ORDER in which the
+    /// hardware dispatches them changes, and with it the set of tiles resident together -- the
+    /// wave's DRAM footprint.
+    ///
+    /// # Why a TALL group, and why 16
+    ///
+    /// A wave of `W = 132` CTAs covering an `R x C` rectangle of tiles reads `R*BM + C*BN` operand
+    /// rows for `R*C = W` tiles, minimised at `R* = sqrt(W*BN/BM)`. For W1 (`BM=128`, `BN=256`)
+    /// that is `sqrt(264) = 16.25`: **the optimum is tall, because A rows are half the price of B
+    /// rows at a 256-wide tile.** `GROUP_M = 16` sits on the optimum (`f = 4160`), `GROUP_M = 32`
+    /// brackets it at +24% and `GROUP_M = 2` is 4.12x WORSE than the optimum -- worse than linear
+    /// on every shape in the suite (WAVE3_DOSSIER 1.1).
+    ///
+    /// # The criterion: this is an L2-RESIDENCY lever, not a bandwidth-percentage lever
+    ///
+    /// On a grid of at most one wave (`tiles <= 132`: sq1024, sq2048, gpt_d1024_down) the raster is
+    /// **provably the identity** -- every tile is resident simultaneously, so no permutation of the
+    /// launch order can change a single byte of traffic. A measured difference at those shapes is
+    /// an instrument fault, not a raster effect. The lever binds iff the linear order's wave
+    /// footprint `f(R_linear) * K * 2` exceeds L2: `gpt_d4096_up` (2.73x L2, and a HARD arithmetic
+    /// blocker today -- matching the peer with the linear order needs 3.54 TB/s against a 3.35 TB/s
+    /// HBM peak) and `sq8192` (2.86x L2).
+    ///
+    /// # The correctness law it must not break (WAVE3_DOSSIER 1.5)
+    ///
+    /// Under [`Multicast::ClusterB`] the producer's B copy is indexed by `%crank * b_box_rows +
+    /// %ctan`, so **the two CTAs of a cluster must compute the SAME `%ctan`**; only their `%ctam`
+    /// may differ. A raster applied to the raw `%ctaid` pair violates that silently -- each rank
+    /// fetches half of a B tile the other does not want and half the accumulator COLUMNS are wrong
+    /// with no error anywhere. So the swizzle is applied to the **cluster index** with the
+    /// intra-cluster rank re-added afterwards, which is what [`RasterGrid`] encodes and what
+    /// `the_raster_keeps_every_cluster_on_one_n_tile` asserts.
+    pub raster: u16,
 }
 
 impl WgmmaCfg {
@@ -1375,6 +1417,7 @@ impl WgmmaCfg {
             // again: CTAs that share an A tile differ in N (grid x), CTAs that share a B tile differ
             // in M (grid y). See `Multicast::cluster_shape`.
             cluster: self.multicast.cluster_shape(),
+            raster: self.raster,
         }
     }
 
@@ -1396,7 +1439,7 @@ impl WgmmaCfg {
     /// table row device-free.
     pub fn derived_name(&self) -> String {
         format!(
-            "wgmma_nt_{}_{}x{}x{}_s{}{}{}{}",
+            "wgmma_nt_{}_{}x{}x{}_s{}{}{}{}{}",
             self.dtype.token(),
             self.bm,
             self.bn,
@@ -1404,7 +1447,34 @@ impl WgmmaCfg {
             self.stages,
             self.multicast.key_tag(),
             self.epilogue.key_tag(),
-            self.l2_hint.key_tag()
+            self.l2_hint.key_tag(),
+            self.raster_tag()
+        )
+    }
+
+    /// The [`WgmmaCfg::raster`] half of the derived name. Empty at `GROUP_M = 1`, so every row that
+    /// shipped before wave 3 keeps its exact name, its exact key and therefore its exact module.
+    ///
+    /// This is not cosmetic. A raster row that reused the linear row's key would get the LINEAR
+    /// module back from `Gpu::function`'s cache -- which never re-examines the PTX on a hit -- and
+    /// the round would publish the control arm twice under two headings, one of them claiming a
+    /// grouped raster it never ran (guard G3).
+    pub fn raster_tag(&self) -> String {
+        if self.raster > 1 {
+            format!("_r{}", self.raster)
+        } else {
+            String::new()
+        }
+    }
+
+    /// **The raster's tile map for an `M x N` output**, as pure data -- the twin of the six PTX
+    /// instructions the prologue emits and the authority [`LaunchPlan::grid`] reshapes against.
+    pub fn raster_grid(&self, m: usize, n: usize) -> RasterGrid {
+        RasterGrid::new(
+            self.raster.max(1) as u32,
+            self.multicast.cluster_shape().1.max(1),
+            m.div_ceil(self.bm) as u32,
+            n.div_ceil(self.bn) as u32,
         )
     }
 
@@ -1598,6 +1668,55 @@ impl WgmmaCfg {
                 shape.accum_regs()
             ));
         }
+        // **The raster's own preconditions** (wave-3 lever 1). Each failure below is silent rather
+        // than loud, which is why they are checked here and not left to the emitter.
+        if self.raster == 0 {
+            return Err(format!(
+                "{UNSUPPORTED}: {}: raster (GROUP_M) 0 is not a group size; the linear order is \
+                 spelled 1",
+                self.name
+            ));
+        }
+        if self.raster > 1 {
+            let cm = self.multicast.cluster_shape().1.max(1) as usize;
+            if self.multicast == Multicast::ClusterA {
+                // ClusterA's cluster dimension is on grid X, which the 3-D raster grid uses for the
+                // cluster-ROW within a group. Two owners of one axis is how a CTA silently lands on
+                // a tile its cluster peer is also computing, so decline instead of interleaving
+                // them.
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: the grouped raster puts the group's cluster-row on grid X, \
+                     and Multicast::ClusterA's 2x1x1 cluster already owns that axis. The raster is \
+                     expressible under Multicast::None and Multicast::ClusterB (whose cluster is on \
+                     Y); a ClusterA raster needs a different grid decomposition, not a wider X.",
+                    self.name
+                ));
+            }
+            if !(self.raster as usize).is_multiple_of(cm) {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: GROUP_M {} is not a multiple of the cluster's {cm} CTAs \
+                     along M, so a group would end mid-cluster and the two ranks of that cluster \
+                     would compute different N tiles -- which is the ONE thing a B multicast \
+                     forbids",
+                    self.name, self.raster
+                ));
+            }
+            if !self.bm.is_power_of_two() {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: the raster's cluster-uniform early exit derives the m-tile \
+                     count on device as ceil(M/{}) with a SHIFT, which needs a power-of-two CTA-M",
+                    self.name, self.bm
+                ));
+            }
+            if self.raster as usize > 1024 {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: GROUP_M {} exceeds 1024; a group taller than any grid this \
+                     family launches makes grid.z 1 and the raster a no-op wearing a name that \
+                     claims otherwise",
+                    self.name, self.raster
+                ));
+            }
+        }
         // **GUARD G3, and deliberately LAST**: every geometric decline above should name the
         // geometry that is wrong, not the name that follows from it, so a caller probing a shape
         // gets the shape's answer. A row that passes everything else and is still mis-named is the
@@ -1766,6 +1885,172 @@ pub struct LaunchPlan {
     /// `cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION` set to exactly this, because
     /// a compiled cluster requirement the launch does not match is a launch failure.
     pub cluster: (u32, u32, u32),
+    /// **`GROUP_M`** -- see [`WgmmaCfg::raster`]. `1` is the linear order. The launcher never reads
+    /// this directly; it reaches the launch through [`LaunchPlan::grid`], because the raster's grid
+    /// and the raster's in-kernel decode are two halves of ONE decomposition and a second
+    /// derivation of either is how a CTA lands on a tile nobody meant it to have.
+    pub raster: u16,
+}
+
+/// **The grouped raster's decomposition, as a pure function of the numbers** -- the device-free
+/// twin of the prologue's six instructions (guard G5).
+///
+/// The generated kernel and this struct must agree exactly: the kernel *is* this map, spelled in
+/// PTX. `the_raster_is_a_bijection_over_the_padded_tile_domain` asserts the property the whole
+/// lever rests on, and it is not a formality. The classic raster defect makes the map
+/// **surjective but not injective**: two CTAs compute the same tile in bounds and some other tile
+/// is never computed at all, so `C` returns whatever the host pre-filled there. Against a
+/// zero-filled `C` and an exact-integer oracle that is a block of zeros in an otherwise-correct
+/// matrix -- loud. Against a `C` the harness reuses between arms it is the PREVIOUS arm's answer,
+/// which is a plausible number nobody will question.
+///
+/// # The decomposition
+///
+/// CTAs dispatch x-fastest, then y, then z. Putting the group's cluster-ROW on x and the n-tile on
+/// y therefore makes a wave of 132 CTAs cover `GROUP_M` m-tiles by `132/GROUP_M` n-tiles -- the
+/// `R x C` rectangle section 1.1 of the dossier optimises -- with **no division in the kernel at
+/// all** (the general grouped swizzle needs two runtime integer divisions by launch-dependent
+/// divisors, which on PTX costs either two host-passed magic-number pairs, breaking `PARAM_ORDER`,
+/// or ~18 instructions of `rcp.approx.f32` with a two-sided correction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RasterGrid {
+    /// Cluster-rows per group: `GROUP_M / cluster_m`. `1` under the linear order.
+    pub gc: u32,
+    /// CTAs per cluster along M -- `cluster.1`, so 2 under [`Multicast::ClusterB`] and 1 otherwise.
+    pub cluster_m: u32,
+    /// `ceil(M / BM)`, the real m-tile count.
+    pub m_tiles: u32,
+    /// `ceil(N / BN)`.
+    pub n_tiles: u32,
+    /// Whether the raster is on at all. At `false` this struct still describes the launch (so the
+    /// laws can range over both orders) but [`RasterGrid::dims`] returns the linear grid.
+    pub on: bool,
+}
+
+impl RasterGrid {
+    /// `group_m` is [`WgmmaCfg::raster`]; `cluster_m` is the cluster's M extent in CTAs.
+    pub fn new(group_m: u32, cluster_m: u32, m_tiles: u32, n_tiles: u32) -> Self {
+        let cluster_m = cluster_m.max(1);
+        let group_m = group_m.max(1);
+        Self {
+            gc: (group_m / cluster_m).max(1),
+            cluster_m,
+            m_tiles,
+            n_tiles,
+            on: group_m > 1,
+        }
+    }
+
+    /// m-CLUSTERS, i.e. `ceil(m_tiles / cluster_m)`. The raster groups these, never raw m-tiles:
+    /// a group boundary inside a cluster would split its two ranks onto different N tiles.
+    pub fn m_clusters(&self) -> u32 {
+        self.m_tiles.div_ceil(self.cluster_m)
+    }
+
+    /// The **padded** m-tile count the launch actually covers: `m_clusters * cluster_m`. Under an
+    /// odd m-tile count with a 1x2x1 cluster this is one more than `m_tiles`, and that extra CTA is
+    /// the existing pad CTA -- load-bearing, because it still issues its multicast slice and its
+    /// peer holds half a stale B tile without it.
+    pub fn padded_m_tiles(&self) -> u32 {
+        self.m_clusters() * self.cluster_m
+    }
+
+    /// The CTA grid `(x, y, z)`.
+    pub fn dims(&self) -> (u32, u32, u32) {
+        if !self.on {
+            return (self.n_tiles, self.padded_m_tiles(), 1);
+        }
+        (
+            self.gc,
+            self.cluster_m * self.n_tiles,
+            self.m_clusters().div_ceil(self.gc),
+        )
+    }
+
+    /// **The map itself**: which `(m_tile, n_tile)` the CTA at `(x, y, z)` owns, or `None` when it
+    /// is a surplus cluster-row of a ragged last group and must take the cluster-uniform early
+    /// exit.
+    ///
+    /// The exit is provably deadlock-free *because* the m-cluster is a function of `z` and `x`
+    /// only, and neither varies inside a `1x2x1` cluster -- so both ranks take the branch together
+    /// and no peer is left waiting on a multicast, an `empty[s]` arrival or a cluster barrier.
+    pub fn tile_of(&self, x: u32, y: u32, z: u32) -> Option<(u32, u32)> {
+        if !self.on {
+            return Some((y, x));
+        }
+        let m_cluster = z * self.gc + x;
+        if m_cluster >= self.m_clusters() {
+            return None;
+        }
+        // The cluster rank of a `1 x cluster_m x 1` cluster is its offset along y, by definition of
+        // `%cluster_ctarank` as the linear index inside the cluster.
+        let rank = y % self.cluster_m;
+        Some((m_cluster * self.cluster_m + rank, y / self.cluster_m))
+    }
+}
+
+/// **The tile origin, and the only place in the generated kernel that reads `%ctaid`.**
+///
+/// One function, emitted once, so the linear order and the grouped raster cannot end up as two
+/// spellings of an axis that disagree. Under `GROUP_M = 1` it emits the two instructions this
+/// family has emitted since round 1, byte for byte -- which is what
+/// `the_linear_order_emits_the_same_two_instructions_it_always_did` pins, so no pre-wave-3 row's
+/// PTX moves by a character when the field lands.
+///
+/// Under a grouped raster it emits the [`RasterGrid`] decode: six instructions and **no division**,
+/// plus the cluster-uniform early exit for a ragged last group.
+///
+/// # Why the exit must come HERE, before `mbarrier.init`
+///
+/// A surplus cluster-row that ran the full K loop over zero-filled tiles would be up to 41% of the
+/// device doing nothing (M = 4224 gives 17 m-clusters against a group of 8). Exiting is correct
+/// only *before* `mbarrier.init` and its `fence.mbarrier_init.release.cluster`: an exit after the
+/// first `barrier.cluster.arrive` is a hang, and re-initialising a barrier a peer may be signalling
+/// is the classic cluster race. Both ranks of a cluster take the branch together because the
+/// m-cluster is a function of `%ctaid.z` and `%ctaid.x` alone and neither varies inside a `1x2x1`
+/// cluster.
+fn wgmma_tile_origin_ptx(cfg: &WgmmaCfg) -> String {
+    let (bm, bn) = (cfg.bm, cfg.bn);
+    if cfg.raster <= 1 {
+        return format!(
+            "    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %ctan,%tmp,{bn};\n    mov.u32 \
+             %tmp,%ctaid.y;\n    mul.lo.s32 %ctam,%tmp,{bm};\n"
+        );
+    }
+    let cm = cfg.multicast.cluster_shape().1.max(1) as usize;
+    let gc = (cfg.raster as usize / cm).max(1);
+    let bm_shift = bm.trailing_zeros();
+    let cm_shift = cm.trailing_zeros();
+    let mut s = format!(
+        "    // grouped raster, GROUP_M = {} ({gc} cluster-rows x {cm} CTAs): x = cluster-row in \
+         group, z = group\n",
+        cfg.raster
+    );
+    s += "    mov.u32 %tmp,%ctaid.z;\n    mov.u32 %tmp2,%ctaid.x;\n";
+    s += &format!("    mad.lo.s32 %tmp,%tmp,{gc},%tmp2;\n");
+    // gcy = ceil(ceil(M/BM) / cluster_m), both divisors powers of two, so both divides are shifts.
+    s += &format!(
+        "    add.u32 %tmp2,%M,{};\n    shr.u32 %tmp2,%tmp2,{bm_shift};\n",
+        bm - 1
+    );
+    if cm > 1 {
+        s += &format!(
+            "    add.u32 %tmp2,%tmp2,{};\n    shr.u32 %tmp2,%tmp2,{cm_shift};\n",
+            cm - 1
+        );
+    }
+    // The cluster-uniform early exit for a surplus cluster-row of a ragged last group.
+    s += "    setp.ge.u32 %p0,%tmp,%tmp2;\n    @%p0 ret;\n";
+    if cm > 1 {
+        s += &format!("    shl.b32 %tmp,%tmp,{cm_shift};\n    add.u32 %tmp,%tmp,%crank;\n");
+    }
+    s += &format!("    mul.lo.s32 %ctam,%tmp,{bm};\n");
+    s += "    mov.u32 %tmp2,%ctaid.y;\n";
+    if cm > 1 {
+        s += &format!("    shr.u32 %tmp2,%tmp2,{cm_shift};\n");
+    }
+    s += &format!("    mul.lo.s32 %ctan,%tmp2,{bn};\n");
+    s
 }
 
 impl LaunchPlan {
@@ -1803,11 +2088,30 @@ impl LaunchPlan {
     /// CTA of that cluster with half a tile: correct numbers on the part it fetched itself and stale
     /// shared memory on the rest. Nothing in the generated producer is predicated on `ctan < N` or
     /// `ctam < M` for exactly this reason.
+    ///
+    /// # Under a grouped raster the grid is THREE-dimensional, and that is the whole trick
+    ///
+    /// `x` becomes the cluster-row within a group, `y` the n-tile with the cluster rank folded into
+    /// its low bit, and `z` the group index -- see [`RasterGrid`]. The cluster's own rounding is
+    /// then structural rather than applied: `y = cluster_m * n_tiles` is a multiple of `cluster_m`
+    /// by construction, and `x = gc` is a multiple of the cluster's X extent because the raster
+    /// declines under [`Multicast::ClusterA`] (`validate`). This function and
+    /// [`RasterGrid::tile_of`] are the two halves of one decomposition and are derived from the one
+    /// [`RasterGrid`], so a grid that disagrees with the kernel's decode is not expressible.
     pub fn grid(&self, m: usize, n: usize) -> (u32, u32, u32) {
+        let cy = self.cluster.1.max(1);
+        if self.raster > 1 {
+            return RasterGrid::new(
+                self.raster as u32,
+                cy,
+                m.div_ceil(self.bm) as u32,
+                n.div_ceil(self.bn) as u32,
+            )
+            .dims();
+        }
         let cx = self.cluster.0.max(1) as usize;
         let x = n.div_ceil(self.bn).div_ceil(cx) * cx;
-        let cy = self.cluster.1.max(1) as usize;
-        let y = m.div_ceil(self.bm).div_ceil(cy) * cy;
+        let y = m.div_ceil(self.bm).div_ceil(cy as usize) * cy as usize;
         (x as u32, y as u32, 1)
     }
 }
@@ -1856,6 +2160,7 @@ pub const WGMMA_W1: WgmmaCfg = WgmmaCfg {
     multicast: Multicast::None,
     epilogue: EpilogueStore::Scalar,
     l2_hint: L2Hint::None,
+    raster: 1,
 };
 
 /// **The descriptor reading every shipped row carries**, in one place so the sweep's "ACTION" line is
@@ -2231,6 +2536,43 @@ pub const WGMMA_W1_MCB_V2: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1_MCB
 };
 
+/// **The shipped >=4096-class default plus the grouped raster at the derived optimum**
+/// (`GROUP_M = 16`), and nothing else. One fact off [`WGMMA_W1_MCB_V2`].
+///
+/// # What it is predicted to do, per shape, stated before the round
+///
+/// `gpt_d4096_up` is a **hard arithmetic blocker** under the linear order: matching the peer's
+/// 0.6734 ms needs `2.3844 GB / 0.6734 ms = 3.541 TB/s` against a 3.35 TB/s HBM peak, so no
+/// mainloop change can reach it. The raster takes that shape's DRAM from 2.384 to 0.797 GB (2.99x)
+/// and the target to 1.184 TB/s -- 35% of peak. `sq8192` goes 2.485 -> 1.326 GB (1.87x) but its
+/// post-raster footprint is still 1.36x L2, so it is worth ~1 point and is published as insurance,
+/// not as a headline. `sq4096` and `gpt_d1024_up` already fit L2 in linear order (42.2 and 10.6 MB
+/// of 50.0 MiB) and are predicted FLAT.
+///
+/// # The controls, and the falsifiers
+///
+/// `sq2048`, `sq1024` and `gpt_d1024_down` are one wave, where the raster is provably the identity;
+/// any movement there is the instrument and invalidates the visit. A `GROUP_M = 32` bracket row
+/// (+24% traffic by the same formula) must land BETWEEN linear and this one -- if it ties, the
+/// mechanism under test is not traffic and the next suspect is launch-order coalescing.
+pub const WGMMA_W1_MCB_V2_R16: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16",
+    raster: 16,
+    ..WGMMA_W1_MCB_V2
+};
+
+/// The **bracket**: `GROUP_M = 32`, `f(32) = 5152` against the optimum's 4160, i.e. +24% operand
+/// traffic per wave. It exists so the round can tell "the raster works" from "traffic is the
+/// mechanism": a bracket that ties [`WGMMA_W1_MCB_V2_R16`] refutes the traffic model even if both
+/// beat the linear control.
+pub const WGMMA_W1_MCB_V2_R32: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r32",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r32",
+    raster: 32,
+    ..WGMMA_W1_MCB_V2
+};
+
 /// The **un-clustered** W1 with the fused v2 epilogue -- the fourth corner of the
 /// `{cluster off/on} x {scalar/v2}` square, and the row [`wgmma_w1_for`] ships below the cluster
 /// threshold.
@@ -2477,6 +2819,26 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
               measured v2 only on the clustered lineage (+25.2/+15.3/+10.1 points); this row \
               measures the un-clustered v2 the rule ships at sq2048-class shapes instead of \
               inheriting cluster-independence from the emitter's text",
+    },
+    // --- wave 3 lever 1: the grouped raster, both rows one fact off the shipped default ----------
+    SweepRow {
+        label: "w1_mcb_v2_r16",
+        cfg: &WGMMA_W1_MCB_V2_R16,
+        why: "WAVE 3 LEVER 1 (grouped raster, GROUP_M = 16 = the derived optimum sqrt(W*BN/BM) for \
+              a 128x256 tile on 132 SMs). ONE fact off the shipped w1_mcb_v2. gpt_d4096_up is the \
+              row: under the linear order matching the peer needs 3.541 TB/s against a 3.35 TB/s \
+              HBM peak, which is arithmetically impossible whatever the mainloop does; the raster \
+              takes its DRAM 2.384 -> 0.797 GB. sq4096 and gpt_d1024_up already fit L2 linearly \
+              and are predicted FLAT; sq2048 is one wave, where the raster is PROVABLY the \
+              identity, so a difference there is the instrument and voids the visit",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_r32",
+        cfg: &WGMMA_W1_MCB_V2_R32,
+        why: "THE BRACKET. f(32) = 5152 against f(16) = 4160: +24% operand traffic per wave by the \
+              same formula that predicts the win. It must land BETWEEN the linear control and r16. \
+              A bracket that TIES r16 refutes the traffic model even if both beat linear, and the \
+              next suspect is launch-order coalescing rather than footprint",
     },
 ];
 
@@ -4130,7 +4492,9 @@ pub fn wgmma_module(cfg: &WgmmaCfg, license: &Sm90aLicense) -> Result<String, St
 /// The `.visible .entry` for one configuration.
 fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     let name = cfg.name;
-    let (bm, bn, bk) = (cfg.bm, cfg.bn, cfg.bk);
+    // NB: CTA-M is deliberately absent -- the tile origin is emitted by one function
+    // (`wgmma_tile_origin_ptx`), so this body cannot grow a second spelling of it.
+    let (bn, bk) = (cfg.bn, cfg.bk);
     let threads = cfg.threads();
     let nacc = shape.accum_regs();
     let row_bytes = (bk * cfg.dtype.size()) as u64;
@@ -4285,8 +4649,7 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         // second spelling of the axis that could disagree with `Multicast::cluster_shape`.
         s += "    mov.u32 %crank,%cluster_ctarank;\n";
     }
-    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %ctan,%tmp,{bn};\n");
-    s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %ctam,%tmp,{bm};\n");
+    s += &wgmma_tile_origin_ptx(cfg);
     // ktiles = ceil(K / BK); BK is a power of two (validated), so the divide is a shift.
     s += &format!(
         "    add.u32 %tmp,%K,{};\n    shr.u32 %ktiles,%tmp,{bk_shift};\n",
@@ -5355,7 +5718,13 @@ mod tests {
         // at the squares -- f16's pre-lever numbers to within a point or two -- so
         // `wgmma_w1_bf16_for` ships the v2 and mcb2+v2 bf16 twins and the round re-measures the
         // dtype transfer instead of trusting it.
-        assert_eq!(mods.len(), 23);
+        // 23 -> 25 with WAVE 3 lever 1: the grouped raster at the derived optimum (`r16`) and its
+        // +24%-traffic bracket (`r32`), both one fact off the shipped `w1_mcb_v2`. They are
+        // separate modules because the raster is part of `derived_name` -- a raster row that
+        // reused the linear key would be handed the LINEAR kernel by the module cache and the
+        // round would publish its control arm twice, once under a heading claiming a raster that
+        // never ran.
+        assert_eq!(mods.len(), 25);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -6518,6 +6887,40 @@ mod tests {
                 (7 * c.bm - 3, 7 * c.bn - 3),
             ] {
                 let (gx, gy, gz) = p.grid(m, n);
+                // **A raster row's grid axes are not tile axes**, so the same coverage law is
+                // stated over its own decomposition: x is the cluster-row within a group, y the
+                // n-tile with the cluster rank in its low bits, z the group. What must hold is
+                // unchanged -- the launch covers every tile, the cluster is never split, and the
+                // slack is bounded -- but "one cluster of slack" becomes "one GROUP of slack",
+                // and that slack is CTAs that take the cluster-uniform early exit rather than
+                // tiles that run out of range.
+                if c.raster > 1 {
+                    let r = c.raster_grid(m, n);
+                    assert_eq!((gx, gy, gz), r.dims());
+                    assert_eq!(gy as usize % cy, 0, "{}: grid y splits a cluster", c.name);
+                    assert!(
+                        r.padded_m_tiles() as usize * p.bm >= m
+                            && r.n_tiles as usize * p.bn >= n,
+                        "{}: raster grid does not cover {m}x{n}",
+                        c.name
+                    );
+                    let owners = (0..gz)
+                        .flat_map(|z| (0..gy).flat_map(move |y| (0..gx).map(move |x| (x, y, z))))
+                        .filter(|(x, y, z)| r.tile_of(*x, *y, *z).is_some())
+                        .count();
+                    assert_eq!(
+                        owners,
+                        (r.padded_m_tiles() * r.n_tiles) as usize,
+                        "{}: the raster's owners are not the padded tile domain",
+                        c.name
+                    );
+                    assert!(
+                        ((gz * gx) - r.m_clusters()) < r.gc,
+                        "{}: more than one surplus GROUP of cluster-rows",
+                        c.name
+                    );
+                    continue;
+                }
                 assert_eq!(gz, 1);
                 assert_eq!(
                     gx as usize % cx,
@@ -6568,6 +6971,226 @@ mod tests {
         assert_eq!(WGMMA_W1_MCB.launch_plan().grid(128, 3 * 256), (3, 2, 1));
         assert_eq!(WGMMA_W1_MCB.launch_plan().grid(1, 1), (1, 2, 1));
         assert_eq!(WGMMA_W1_MC.launch_plan().grid(1, 1), (2, 1, 1));
+    }
+
+    /// **GUARD G5 -- the raster is a BIJECTION onto the padded tile domain.**
+    ///
+    /// The whole lever is a permutation of the launch order, so the one property that must survive
+    /// it is that every tile is still computed exactly once. The classic defect makes the map
+    /// surjective but not injective: two CTAs write one tile in bounds and some other tile is never
+    /// computed, which against a host-pre-zeroed `C` is a block of zeros and against a `C` the
+    /// harness reuses between arms is the PREVIOUS arm's answer -- a plausible number nobody
+    /// questions.
+    ///
+    /// Ranged over every `m_tiles % GROUP_M` residue and both cluster settings, because the ragged
+    /// last group is the arm the shipped suite never exercises (all seven benched shapes have
+    /// `m_clusters` a multiple of 8) and is therefore the arm that would ship broken.
+    #[test]
+    fn the_raster_is_a_bijection_over_the_padded_tile_domain() {
+        for cluster_m in [1u32, 2] {
+            for group_m in [2u32, 4, 8, 16, 32] {
+                if !group_m.is_multiple_of(cluster_m) {
+                    continue;
+                }
+                for m_tiles in 1u32..=40 {
+                    for n_tiles in [1u32, 3, 4, 7, 16] {
+                        let g = RasterGrid::new(group_m, cluster_m, m_tiles, n_tiles);
+                        let (gx, gy, gz) = g.dims();
+                        let mut seen = vec![false; (g.padded_m_tiles() * n_tiles) as usize];
+                        let mut exits = 0usize;
+                        for z in 0..gz {
+                            for y in 0..gy {
+                                for x in 0..gx {
+                                    match g.tile_of(x, y, z) {
+                                        None => exits += 1,
+                                        Some((mt, nt)) => {
+                                            assert!(
+                                                mt < g.padded_m_tiles() && nt < n_tiles,
+                                                "raster escaped the padded domain: \
+                                                 G{group_m}/c{cluster_m} m{m_tiles} n{n_tiles} \
+                                                 ({x},{y},{z}) -> ({mt},{nt})"
+                                            );
+                                            let i = (mt * n_tiles + nt) as usize;
+                                            assert!(
+                                                !seen[i],
+                                                "NOT INJECTIVE: two CTAs own tile ({mt},{nt}) at \
+                                                 G{group_m}/c{cluster_m} m{m_tiles} n{n_tiles}"
+                                            );
+                                            seen[i] = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        assert!(
+                            seen.iter().all(|b| *b),
+                            "NOT SURJECTIVE: some tile is computed by nobody at \
+                             G{group_m}/c{cluster_m} m{m_tiles} n{n_tiles}"
+                        );
+                        // Every CTA either owns a tile or exits; nothing is left over.
+                        assert_eq!(
+                            (gx * gy * gz) as usize,
+                            seen.len() + exits,
+                            "the grid does not account for itself at G{group_m}/c{cluster_m} \
+                             m{m_tiles} n{n_tiles}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The B-multicast's correctness law, over the raster.** The two CTAs of a `1x2x1` cluster
+    /// must compute the SAME `%ctan` -- the producer's multicast copy is indexed by
+    /// `%crank * b_box_rows + %ctan`, so peers that disagree there each fetch half of a B tile the
+    /// other does not want and half the accumulator COLUMNS come back stale, at full speed, with no
+    /// error anywhere. Their `%ctam` must differ, or the cluster computes one tile twice.
+    ///
+    /// The same sweep checks the early exit is **cluster-uniform**: a rank that returns while its
+    /// peer waits on an `empty[s]` arrival or a multicast is a hang, and a hang costs the visit.
+    #[test]
+    fn the_raster_keeps_every_cluster_on_one_n_tile() {
+        for group_m in [2u32, 4, 16, 32] {
+            for m_tiles in 1u32..=33 {
+                for n_tiles in [1u32, 5, 8] {
+                    let g = RasterGrid::new(group_m, 2, m_tiles, n_tiles);
+                    let (gx, gy, gz) = g.dims();
+                    assert!(gy.is_multiple_of(2), "grid.y must be a multiple of cluster.y");
+                    for z in 0..gz {
+                        for x in 0..gx {
+                            for pair in 0..gy / 2 {
+                                let (r0, r1) = (g.tile_of(x, 2 * pair, z), g.tile_of(x, 2 * pair + 1, z));
+                                match (r0, r1) {
+                                    (None, None) => {}
+                                    (Some((m0, n0)), Some((m1, n1))) => {
+                                        assert_eq!(n0, n1, "cluster peers disagree on the N tile");
+                                        assert_ne!(m0, m1, "cluster peers share the M tile");
+                                    }
+                                    _ => panic!(
+                                        "the early exit is NOT cluster-uniform at G{group_m} \
+                                         m{m_tiles} n{n_tiles} ({x},{pair},{z}) -- one rank \
+                                         returns while its peer waits on it"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The wave footprint the raster is *for*: `GROUP_M = 16` must actually be the minimum of
+    /// `f(R) = R*BM + (W/R)*BN` over the candidate set, and `GROUP_M = 2` -- the value the wave
+    /// brief originally implied -- must be WORSE than the linear order it replaces at a 256-wide
+    /// tile. Arithmetic, so it is a device-free law rather than a claim in a comment.
+    #[test]
+    fn sixteen_is_the_derived_raster_optimum_for_a_128x256_tile() {
+        let (bm, bn, w) = (128.0f64, 256.0f64, 132.0f64);
+        let f = |r: f64| r * bm + (w / r) * bn;
+        let best = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+            .into_iter()
+            .min_by(|a, b| f(*a).total_cmp(&f(*b)))
+            .unwrap();
+        assert_eq!(best, 16.0, "the raster optimum moved; re-derive the shipped GROUP_M");
+        assert!(f(32.0) > f(16.0) && f(8.0) > f(16.0), "16 must be a strict minimum");
+        // The bracket is +24%, which is what makes r32 a partial gain rather than a tie.
+        let ratio = f(32.0) / f(16.0);
+        assert!((1.20..1.28).contains(&ratio), "bracket ratio {ratio} left its derived band");
+        // And GROUP_M = 2 is 4.12x the optimum -- worse than every shape's linear order.
+        assert!(f(2.0) / f(16.0) > 4.0);
+    }
+
+    /// The linear order's PTX must not move by a character when the raster field lands: every row
+    /// that shipped before wave 3 keeps its exact two instructions, its exact derived name and
+    /// therefore its exact module-cache key.
+    #[test]
+    fn the_linear_order_emits_the_same_two_instructions_it_always_did() {
+        for cfg in [&WGMMA_W1, &WGMMA_W1_MCB, &WGMMA_W1_MCB_V2, &WGMMA_W3C] {
+            assert_eq!(cfg.raster, 1, "{} is not a linear row", cfg.name);
+            assert_eq!(cfg.raster_tag(), "");
+            let ptx = wgmma_module(cfg, &license()).unwrap();
+            assert!(ptx.contains(&format!(
+                "    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %ctan,%tmp,{};\n    mov.u32 \
+                 %tmp,%ctaid.y;\n    mul.lo.s32 %ctam,%tmp,{};\n",
+                cfg.bn, cfg.bm
+            )));
+            assert!(!ptx.contains("%ctaid.z"), "{} grew a z axis", cfg.name);
+        }
+    }
+
+    /// The raster rows' PTX: the decode is present, division-free, the early exit precedes
+    /// `mbarrier.init`, and the whole module is still pure ASCII (one non-ASCII character in a
+    /// generator's `format!` is a `ptxas fatal` at `cuModuleLoadData`, not a compile error).
+    #[test]
+    fn the_raster_prologue_is_division_free_and_exits_before_the_barriers() {
+        for cfg in [&WGMMA_W1_MCB_V2_R16, &WGMMA_W1_MCB_V2_R32] {
+            let ptx = wgmma_module(cfg, &license()).unwrap();
+            assert!(ptx.is_ascii(), "{} emitted non-ASCII PTX", cfg.name);
+            let gc = cfg.raster as usize / 2;
+            assert!(ptx.contains(&format!("mad.lo.s32 %tmp,%tmp,{gc},%tmp2;")));
+            assert!(ptx.contains("add.u32 %tmp,%tmp,%crank;"), "the intra-cluster rank is not re-added");
+            assert!(ptx.contains("@%p0 ret;"), "no cluster-uniform early exit");
+            for banned in ["div.", "rem.", "rcp."] {
+                assert!(!ptx.contains(banned), "{} emitted a {banned} in the prologue", cfg.name);
+            }
+            let exit = ptx.find("@%p0 ret;").unwrap();
+            let init = ptx.find("mbarrier.init").unwrap();
+            assert!(
+                exit < init,
+                "{}: the early exit must precede mbarrier.init -- an exit after the first \
+                 barrier.cluster.arrive is a hang",
+                cfg.name
+            );
+            // The tile origin is emitted ONCE. Two copies that could disagree is how a consumer
+            // computes with the producer's tile.
+            assert_eq!(ptx.matches("mul.lo.s32 %ctam,%tmp,").count(), 1);
+            assert_eq!(ptx.matches("mul.lo.s32 %ctan,%tmp2,").count(), 1);
+        }
+    }
+
+    /// The raster's grid is the [`RasterGrid`] decomposition and nothing else, and it declines the
+    /// two ways it can be wrong: a group that ends mid-cluster, and `Multicast::ClusterA`, whose
+    /// `2x1x1` cluster already owns the grid-X axis the raster needs for the group's cluster-row.
+    #[test]
+    fn the_raster_grid_and_its_refusals() {
+        // gpt_d4096_up: M=4096 (32 m-tiles, 16 m-clusters), N=16384 (64 n-tiles). GROUP_M=16 -> GC=8.
+        let p = WGMMA_W1_MCB_V2_R16.launch_plan();
+        assert_eq!(p.grid(4096, 16384), (8, 128, 2));
+        assert_eq!((8 * 128 * 2) as usize, 2048, "the CTA count must not change");
+        // The linear twin covers the same 2048 tiles as a flat 64x32 grid.
+        assert_eq!(WGMMA_W1_MCB_V2.launch_plan().grid(4096, 16384), (64, 32, 1));
+        // A ragged last group: 17 m-clusters over groups of 8 is 3 groups, the last one short.
+        let g = WGMMA_W1_MCB_V2_R16.raster_grid(4224, 256);
+        assert_eq!((g.m_clusters(), g.dims()), (17, (8, 2, 3)));
+
+        let mid_cluster = WgmmaCfg {
+            name: "x",
+            key: "x",
+            raster: 3,
+            ..WGMMA_W1_MCB
+        };
+        let e = mid_cluster.validate().unwrap_err();
+        assert!(e.contains("not a multiple of the cluster's 2 CTAs"), "{e}");
+        let on_a = WgmmaCfg {
+            name: "x",
+            key: "x",
+            raster: 16,
+            ..WGMMA_W1_MC
+        };
+        assert!(on_a.validate().unwrap_err().contains("already owns that axis"));
+        // And G3: a raster row that keeps the linear row's name is refused, because the module
+        // cache would hand it the LINEAR kernel and the round would publish the control twice.
+        let misnamed = WgmmaCfg {
+            raster: 16,
+            ..WGMMA_W1_MCB_V2
+        };
+        assert!(
+            misnamed
+                .validate()
+                .unwrap_err()
+                .contains("wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16")
+        );
     }
 
     /// The unproven-claims list is the honest half of this module and must not quietly empty out or
@@ -7285,16 +7908,24 @@ mod tests {
             // The cluster arms round their own axis up, which is how the pad CTA gets exercised --
             // on BOTH axes, because the tile count is odd on both.
             let p = c.launch_plan();
-            let (gx, gy, _) = p.grid(g.m, g.n);
-            let ctas = (gx as usize) * (gy as usize);
+            let (gx, gy, gz) = p.grid(g.m, g.n);
+            let ctas = (gx as usize) * (gy as usize) * (gz as usize);
             assert!(
                 ctas >= tm * tn,
                 "{}: the launched grid may round up but never down",
                 c.name
             );
+            // A raster row launches its surplus cluster-rows too -- they take the cluster-uniform
+            // early exit -- so the pad-CTA count is stated over the CTAs that OWN a tile, which is
+            // the same set the linear order's grid launches. Same law, counted where it is true.
+            let r = c.raster_grid(g.m, g.n);
+            let owners = (0..gz)
+                .flat_map(|z| (0..gy).flat_map(move |y| (0..gx).map(move |x| (x, y, z))))
+                .filter(|(x, y, z)| r.tile_of(*x, *y, *z).is_some())
+                .count();
             if c.cluster_ctas() > 1 {
                 assert_eq!(
-                    ctas,
+                    owners,
                     tm * tn + GUARD_TILES_PER_AXIS,
                     "{}: an odd tile count on the clustered axis must produce exactly one pad CTA \
                      per row/column of the other axis",
