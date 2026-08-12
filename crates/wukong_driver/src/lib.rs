@@ -2102,6 +2102,74 @@ mod gpu_e2e_tests {
         )
     }
 
+    /// **The tolerance band a plain-GEMM offload is held to, chosen by the route that RAN.**
+    ///
+    /// [`gpu_accel::GemmRoute::Existing`] is `gpu::gemm_nt`, an f32 kernel: both sides are f32 and
+    /// only the K-reduction order differs, so the band is `c·√K·ε` — the `sgemm_matches_naive` shape.
+    /// [`gpu_accel::GemmRoute::Wgmma`] converts both operands to f16 on the host before accumulating
+    /// in f32, so it carries an input rounding the CPU oracle does not and needs the fp16 band the
+    /// fused-epilogue gates below already use — some 30× looser at both bounds.
+    ///
+    /// # The argument must be the witness, never the eligibility
+    ///
+    /// Callers pass [`gpu_accel::GpuAccel::gemm_route_taken`], which reads the per-route offload
+    /// counters. `GpuAccel::gemm_route()` is **not** interchangeable with it: that one is
+    /// `gemm_route_for(cc, env)` and never sees a shape, so on a Hopper part it answers `Wgmma` for
+    /// every call — *including* the ones `gpu_accel::wgmma_declines` sends to the f32 launcher
+    /// (`K % 8 != 0`, an odd `N`, `M*N > u32::MAX`, a ring past the probed shared-memory budget) and
+    /// the ones `gemm_nt_wgmma` itself declines at launch. Sizing the band from it would hold an f32
+    /// result to an f16 band and let a real f32 regression through, which is precisely the failure
+    /// this doc comment used to name while the code keyed on the architecture anyway. The
+    /// `WUKONG_GPU_NO_WGMMA` half was honest — that switch lives inside `gemm_route_for` — and the
+    /// "unencodable K" half was not; the witness covers both.
+    fn gemm_tolerance(route: gpu_accel::GemmRoute, k: usize) -> (f64, f64) {
+        match route {
+            gpu_accel::GemmRoute::Existing => (
+                1e-4,
+                (16.0 * (k as f64).sqrt() * f32::EPSILON as f64).max(1e-5),
+            ),
+            gpu_accel::GemmRoute::Wgmma => (5e-2, 2e-2),
+        }
+    }
+
+    /// **The band must follow the route that ran, and this is the case that separates the two.**
+    ///
+    /// Needs no device: both inputs are pure functions. A Hopper part is eligible for the wgmma
+    /// family at *every* shape — `gemm_route_for` takes only a capability — while `wgmma_declines`
+    /// really does send a subset of shapes to `gpu::gemm_nt`. So on that device "eligible" and "ran"
+    /// disagree for those shapes, and only the second one may size a band: an f32 result judged
+    /// against `(5e-2, 2e-2)` instead of `(1e-4, 16√K·ε)` hides roughly two and a half decades of
+    /// regression.
+    #[test]
+    fn the_gemm_band_follows_the_route_that_ran_not_the_device() {
+        // The eligibility, on the device this campaign rents.
+        assert_eq!(
+            gpu_accel::gemm_route_for((9, 0), false),
+            gpu_accel::GemmRoute::Wgmma
+        );
+        // The witness, for a call on that same device that fell back.
+        let ran = gpu_accel::gemm_route_taken_from(0, 1).expect("one offload ran");
+        assert_eq!(ran, gpu_accel::GemmRoute::Existing);
+
+        let k = 4096;
+        let (fallback_abs, fallback_rel) = gemm_tolerance(ran, k);
+        let (wgmma_abs, wgmma_rel) = gemm_tolerance(gpu_accel::GemmRoute::Wgmma, k);
+        assert!(
+            fallback_abs < wgmma_abs && fallback_rel < wgmma_rel,
+            "the f32 band must be strictly tighter than the f16 one, or keying on the route buys \
+             nothing: ({fallback_abs:.1e}, {fallback_rel:.1e}) vs ({wgmma_abs:.1e}, {wgmma_rel:.1e})"
+        );
+        // And a run with even one wgmma call is judged by the wider band, because that call's f16
+        // input rounding is in the buffer being compared.
+        assert_eq!(
+            gemm_tolerance(
+                gpu_accel::gemm_route_taken_from(1, 3).expect("four offloads ran"),
+                k
+            ),
+            (wgmma_abs, wgmma_rel)
+        );
+    }
+
     #[test]
     fn gpu_backend_linear_matches_interp_within_tol() {
         let mut guard = wukong_codegen_gpu::gpu();
@@ -2112,6 +2180,7 @@ mod gpu_e2e_tests {
                 return;
             }
         };
+        let cc = g.target().cc();
         let mut rng = Rng::new(0x00C0FFEE);
         for &(m, k, n) in &[(8usize, 16usize, 8usize), (16, 32, 16), (32, 48, 24)] {
             let (program, mut interner) = build(&linear_src(m, k, n));
@@ -2120,15 +2189,16 @@ mod gpu_e2e_tests {
             let b = rng.vec(n * k, -1.0, 1.0);
 
             // CPU oracle (no accelerator).
-            let (mut ac, mut bc, mut cc) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            let (mut ac, mut bc, mut cc_buf) = (a.clone(), b.clone(), vec![0f32; m * n]);
             {
-                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cc];
+                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cc_buf];
                 wukong_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
             }
 
             // GPU offload over the identical MIR + inputs.
             let (mut ag, mut bg, mut cg) = (a.clone(), b.clone(), vec![0f32; m * n]);
             let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+            let route = accel.gemm_route();
             {
                 let mut bufs: [&mut [f32]; 3] = [&mut ag, &mut bg, &mut cg];
                 wukong_interp::run_kernel_f32_accel(
@@ -2141,13 +2211,468 @@ mod gpu_e2e_tests {
                 "{m}x{k}x{n}: GPU offload never fired — the nest did not lower to sgemm_nt, so this \
                  would silently test CPU-vs-CPU"
             );
+            // The routing law, on whatever device is actually present: `wgmma` is architecture-locked
+            // to `sm_90a`, so anything that is not Hopper must be on the pre-Hopper launcher. On this
+            // repo's RTX 4050 (cc 8.9) that is the assertion that keeps wave 4 from changing the
+            // arithmetic of a path it was never meant to touch.
+            assert!(
+                cc.0 == 9 || route == gpu_accel::GemmRoute::Existing,
+                "cc {cc:?} is not Hopper but took {route:?} — an sm_90a module cannot load here"
+            );
+            // And the same claim against the *witness* rather than the eligibility: on a non-Hopper
+            // part every offload must have actually run `gpu::gemm_nt`. This is the arm that runs on
+            // this repo's 4050, so it is the one that would catch the wgmma seam leaking onto a
+            // device whose module cannot even load.
+            if cc.0 != 9 {
+                assert_eq!(
+                    accel.gemm_wgmma_calls, 0,
+                    "cc {cc:?}: {} offload(s) took the wgmma route on a part that is not Hopper",
+                    accel.gemm_wgmma_calls
+                );
+            }
 
-            // tol = c·√K·ε (the sgemm_matches_naive shape): both sides are f32, K-reduction order differs.
-            let rel_tol = (16.0 * (k as f64).sqrt() * f32::EPSILON as f64).max(1e-5);
-            let s = assert_close(&format!("linear {m}x{k}x{n}"), &cg, &cc, 1e-4, rel_tol);
+            // The band follows the route that RAN, not the one this device is eligible for: on a
+            // Hopper part every shape is eligible and only some are taken.
+            let ran = accel
+                .gemm_route_taken()
+                .expect("no plain GEMM was offloaded, which the assert above should have caught");
+            let (abs_tol, rel_tol) = gemm_tolerance(ran, k);
+            let s = assert_close(
+                &format!("linear {m}x{k}x{n}"),
+                &cg,
+                &cc_buf,
+                abs_tol,
+                rel_tol,
+            );
             eprintln!(
-                "gpu --backend linear {m}x{k}x{n}: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
+                "gpu --backend linear {m}x{k}x{n} [eligible {route:?}, ran {ran:?}]: \
+                 {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
                 accel.calls, s.max_abs, s.max_rel
+            );
+        }
+    }
+
+    /// **The wgmma route's end-to-end gate: a `.wk` matmul reaching `gemm_nt_wgmma`.**
+    ///
+    /// A plain `#[test]`, and that is the load-bearing part: this is the only proof anywhere that
+    /// the family the whole campaign publishes actually *executed* on Hopper, so it has to run under
+    /// an entrypoint that can turn red. Its H100 invocation is pinned in
+    /// [`gpu_accel::HOPPER_GATE_INVOCATION`], where a device-free law checks that it reaches this
+    /// function *and* lands on an entrypoint that propagates a failure.
+    ///
+    /// It used to be `#[ignore]`d and routed through `::bench --name .. --package wukong_driver`,
+    /// which is the repo's own "reads as green" class one level up from the vacuous bring-up run:
+    /// `modal_app.py`'s `bench()` ran its child with `check=False` and then returned, so the
+    /// function exited 0 whatever the tests did, and the witness assertion below — the entire point
+    /// of the route counters — could fail on rented silicon while the detached app completed
+    /// successfully. `::test` is the entrypoint that ends `if rc1 or rc2: sys.exit(1)`.
+    ///
+    /// The `#[ignore]` bought nothing it needed: a non-Hopper device is a **capability** skip
+    /// handled in the body below, and no device at all is a `skip_no_device`. So on this repo's RTX
+    /// 4050 and on a device-free CI runner it prints `[skip]` and returns, while on Hopper it is a
+    /// hard gate.
+    ///
+    /// **Neither skip can survive the pinned invocation, and that took two different levers.** No
+    /// device is `skip_no_device` -> `diff::skip_or_fail`, a failure under `WUKONG_GPU_REQUIRED=1`,
+    /// which `::test` always sets. The capability skip cannot use that lever — `::test` sets it on
+    /// the routine `WK_GPU=L4` rounds too, where skipping this gate is correct — so it escalates on
+    /// `gpu_accel::REQUIRED_CC_ENV` instead: the capability the round *declared it rented*, exported
+    /// by `::test` from `WK_GPU`. Declared Hopper + probed non-Hopper is a mis-provisioned
+    /// container and fails; every other combination skips exactly as before. Without that, this
+    /// gate's own pinned single-test H100 invocation printed PASS on any non-Hopper container while
+    /// asserting nothing, which is the failure class the invocation constant exists to close.
+    ///
+    /// It asserts four separate things, and
+    /// the first three are the ones a green-but-vacuous run would skip: that the device is
+    /// *eligible* for [`gpu_accel::GemmRoute::Wgmma`], that the offload fired at all, that every
+    /// offload it fired **took that route** rather than falling back, and only then that the numbers
+    /// match the CPU oracle. The third is not implied by the first two — eligibility is `cc` plus an
+    /// env switch and never sees a shape, and `accel.calls` is bumped identically by both arms — so
+    /// without it a run where `gemm_nt_wgmma` declined at launch (an unencodable tensor map, a
+    /// `wgmma_module` `UNSUPPORTED`) passes every assertion while measuring `gpu::gemm_nt`.
+    ///
+    /// Three shapes, one per property, and they live in [`gpu_accel::HOPPER_GATE_SHAPES`] because
+    /// `gpu_accel::tests::the_hopper_gate_shapes_reach_both_regime_arms` checks *on this laptop* what
+    /// they are chosen for. `256x1024x512` is a whole 128×256 tile grid. `130x1032x258` is ragged in
+    /// M, N **and** K at once, which is what proves the driver seam did not quietly need an alignment
+    /// gate (the `m%64/n%64/k%16` rule in `sgemm_nt_epi` is a *wmma* constraint — wgmma predicates its
+    /// own edge). `4096x256x2048` has `M*N = 8_388_608` output elements, just past
+    /// `ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS`, so it is the only one that makes the config seam
+    /// return the **clustered** row and the launch carry a `1x2x1` cluster attribute — the arm a
+    /// small-shape-only gate would leave entirely unexercised from the driver side, and a *launch*
+    /// failure rather than a wrong number if it were ever mismatched.
+    ///
+    /// Every `N` here is EVEN on purpose, and it is not a raggedness choice: both shipped rows carry
+    /// the `st.global.v2.f32` epilogue, whose 8-byte pair is aligned only when `N` is, so an odd `N`
+    /// is a *sticky* `CUDA_ERROR_MISALIGNED_ADDRESS` rather than a wrong number. The driver declines
+    /// it (`wgmma_declines`) and a device-free unit test pins that; putting an odd `N` in this gate
+    /// would only prove the decline works by never reaching the kernel.
+    #[test]
+    fn gpu_backend_linear_routes_through_wgmma_on_hopper() {
+        const NAME: &str = "gpu_backend_linear_routes_through_wgmma_on_hopper";
+        let mut guard = wukong_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                skip_no_device(NAME);
+                return;
+            }
+        };
+        let cc = g.target().cc();
+        if cc.0 != 9 {
+            // **A capability skip that can still be a failure — the third way this gate could go
+            // green having exercised nothing.**
+            //
+            // It must NOT escalate under `WUKONG_GPU_REQUIRED=1`: `::test` sets that on every device
+            // run, and skipping a Hopper-only gate on the L4/L40S rounds this campaign does most
+            // often is the CORRECT outcome (the rule `gpu.rs`'s `with_hopper` states). But the
+            // pinned single-test invocation in `gpu_accel::HOPPER_GATE_INVOCATION` books an H100 and
+            // selects this one test, so on a non-Hopper container it printed `[skip]`, returned,
+            // and libtest reported `ok` — the same green product as the 2026-08-11 vacuous run,
+            // reached a third way, with nothing anywhere comparing the probed device against the
+            // requested SKU (and `WK_GPU` defaults to `L40S`). `::test` now exports the declared
+            // capability, and a declared part this route TAKES against a probed part it does not is
+            // a mis-provisioned container, not a correct skip.
+            assert!(
+                !gpu_accel::capability_skip_is_a_failure(cc, gpu_accel::required_cc()),
+                "{NAME}: this round declared {}={} — a part the wgmma route TAKES — but the \
+                 container probed cc {}.{} ({}). Skipping here would report a green PASS having \
+                 executed no wgmma instruction, which is exactly what the pinned H100 invocation \
+                 exists to make impossible; the container is not the SKU the round paid for.",
+                gpu_accel::REQUIRED_CC_ENV,
+                std::env::var(gpu_accel::REQUIRED_CC_ENV).unwrap_or_default(),
+                cc.0,
+                cc.1,
+                g.device_name()
+            );
+            eprintln!(
+                "[skip:capability] {NAME}: wgmma is architecture-locked to sm_90a and this device \
+                 is cc {}.{} ({}) — the route is correctly `Existing` here. The round this gate \
+                 exists for is:\n    {}",
+                cc.0,
+                cc.1,
+                g.device_name(),
+                gpu_accel::HOPPER_GATE_INVOCATION
+            );
+            return;
+        }
+        let mut rng = Rng::new(0x090A_C0DE);
+        for &(m, k, n) in &gpu_accel::HOPPER_GATE_SHAPES {
+            let (program, mut interner) = build(&linear_src(m, k, n));
+            let entry = interner.intern("lin");
+            let a = rng.vec(m * k, -1.0, 1.0);
+            let b = rng.vec(n * k, -1.0, 1.0);
+
+            let (mut ac, mut bc, mut cpu) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cpu];
+                wukong_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
+            }
+
+            let (mut ag, mut bg, mut got) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+            let route = accel.gemm_route();
+            assert_eq!(
+                route,
+                gpu_accel::GemmRoute::Wgmma,
+                "this device is Hopper (cc {cc:?}) but the plain-GEMM offload routed to {route:?} — \
+                 either the routing rule regressed or WUKONG_GPU_NO_WGMMA is set, and in both cases \
+                 the rest of this gate would measure the kernel it exists to bypass"
+            );
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ag, &mut bg, &mut got];
+                wukong_interp::run_kernel_f32_accel(
+                    &program, entry, &mut bufs, &interner, &mut accel,
+                )
+                .unwrap();
+            }
+            assert!(
+                accel.calls >= 1,
+                "{m}x{k}x{n}: nothing offloaded, so this would silently test CPU-vs-CPU"
+            );
+            // **The witness, and the assertion this gate was vacuous without.** `route` above is an
+            // eligibility — `cc` and the env switch — so it says `Wgmma` on this device for every
+            // shape, including the ones `wgmma_declines` sends to `gpu::gemm_nt`. `accel.calls >= 1`
+            // is route-blind for the same reason: `sgemm_nt` bumps it identically on both arms. So
+            // the two assertions above plus a tolerance band wide enough for f16 are all satisfied
+            // by a run in which the wgmma family never executed a single instruction — which is
+            // precisely the H100 round this gate exists to make impossible.
+            assert_eq!(
+                (accel.gemm_wgmma_calls, accel.gemm_existing_calls),
+                (accel.calls, 0),
+                "{m}x{k}x{n}: {} of {} plain-GEMM offloads fell back to `gpu::gemm_nt` — the wgmma \
+                 family declined this shape at run time (an unencodable tensor map or a \
+                 `wgmma_module` UNSUPPORTED are both silent fallbacks), so this round measured the \
+                 pre-Hopper launcher",
+                accel.gemm_existing_calls,
+                accel.calls
+            );
+            let taken = accel
+                .gemm_route_taken()
+                .expect("no plain GEMM was offloaded, which the assert above should have caught");
+            assert_eq!(taken, gpu_accel::GemmRoute::Wgmma);
+
+            // The band comes from the witness. It equals the f16 band here only *because* the
+            // assertion above proved every offload took the wgmma route; had one fallen back, this
+            // shape would be judged against the f32 kernel's own band, as it should be.
+            let (abs_tol, rel_tol) = gemm_tolerance(taken, k);
+            let s = assert_close(
+                &format!("wgmma linear {m}x{k}x{n}"),
+                &got,
+                &cpu,
+                abs_tol,
+                rel_tol,
+            );
+            eprintln!(
+                "gpu --backend wgmma linear {m}x{k}x{n} (M%128={} N%256={} K%64={}): \
+                 {} GPU call(s), {} wgmma / {} existing, max_abs={:.2e} max_rel={:.2e}",
+                m % 128,
+                n % 256,
+                k % 64,
+                accel.calls,
+                accel.gemm_wgmma_calls,
+                accel.gemm_existing_calls,
+                s.max_abs,
+                s.max_rel
+            );
+        }
+    }
+
+    /// **An operand past f16's range must not turn a finite GEMM into infinities.**
+    ///
+    /// The Hopper route converts both f32 operands with `half::f16::from_f32`, whose largest finite
+    /// value is 65504 — about four decades below f32's. That is not the "input rounding" the
+    /// tolerance band was widened for: an operand past it enters the GEMM as `inf` and comes back as
+    /// `inf`/`NaN`, where `gpu::gemm_nt` (f32 in, f32 out) returns exactly what the CPU oracle does.
+    /// A *different answer*, which no band covers — and which no other gate here can see, because
+    /// every one of them seeds `rng.vec(.., -1.0, 1.0)`. `gpu_accel::wgmma_declines_operand_range`
+    /// therefore declines it to the f32 launcher.
+    ///
+    /// A **paired control**: same shape, same `b`, one element of `a` apart, so on a Hopper part the
+    /// route must differ *because of that element* and nothing else. Runs on any device — on a
+    /// pre-Hopper part both arms are `Existing` and it still asserts the thing that actually matters
+    /// to a user, that neither run returns a non-finite lane where the oracle is finite.
+    #[test]
+    fn gpu_backend_declines_operands_past_the_f16_range() {
+        const NAME: &str = "gpu_backend_declines_operands_past_the_f16_range";
+        let mut guard = wukong_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                skip_no_device(NAME);
+                return;
+            }
+        };
+        let cc = g.target().cc();
+        let mut rng = Rng::new(0xF16_0BAD);
+        let (m, k, n) = (64usize, 64usize, 64usize);
+        let (program, mut interner) = build(&linear_src(m, k, n));
+        let entry = interner.intern("lin");
+        // `b` is kept strictly positive so the huge lane dominates its column sum outright: the
+        // comparison below is then about the route, not about a cancellation.
+        let b = rng.vec(n * k, 0.5, 1.0);
+        let base = rng.vec(m * k, -1.0, 1.0);
+
+        for (label, a0, hopper_route) in [
+            ("control", 1.0f32, gpu_accel::GemmRoute::Wgmma),
+            // 2^16: exactly representable in f32, and the first power of two past f16's ceiling.
+            ("overflow", 65_536.0f32, gpu_accel::GemmRoute::Existing),
+        ] {
+            // On anything but Hopper the wgmma family is not eligible at all, so both arms fall to
+            // the same launcher and the value assertions are the whole content of the case.
+            let want = if cc.0 == 9 {
+                hopper_route
+            } else {
+                gpu_accel::GemmRoute::Existing
+            };
+            let mut a = base.clone();
+            a[0] = a0;
+
+            let (mut ac, mut bc, mut cpu) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cpu];
+                wukong_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
+            }
+            assert!(
+                cpu.iter().all(|v| v.is_finite()),
+                "{label}: the CPU oracle itself is non-finite, so this case proves nothing"
+            );
+
+            let (mut ag, mut bg, mut got) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ag, &mut bg, &mut got];
+                wukong_interp::run_kernel_f32_accel(
+                    &program, entry, &mut bufs, &interner, &mut accel,
+                )
+                .unwrap();
+            }
+            let taken = accel
+                .gemm_route_taken()
+                .expect("the GEMM must have offloaded, or this tests CPU-vs-CPU");
+            assert_eq!(
+                taken, want,
+                "{label} (cc {cc:?}, a[0] = {a0:e}): on Hopper the route must be decided by this ONE \
+                 element — the shape is identical in both runs and declines in neither"
+            );
+            assert!(
+                got.iter().all(|v| v.is_finite()),
+                "{label}: the GPU returned a non-finite lane where the f32 oracle is finite — the \
+                 range decline did not fire and the f16 seam overflowed"
+            );
+            // The band follows the route, so a declined call is held to the f32 kernel's own bound.
+            // The decline buys back the tight band as well as the finite answer.
+            let (abs_tol, rel_tol) = gemm_tolerance(taken, k);
+            let s = assert_close(
+                &format!("range {label} {m}x{k}x{n}"),
+                &got,
+                &cpu,
+                abs_tol,
+                rel_tol,
+            );
+            eprintln!(
+                "gpu --backend range {label} {m}x{k}x{n} a[0]={a0:e} [{taken:?}]: \
+                 {} wgmma / {} existing, max_abs={:.2e} max_rel={:.2e}",
+                accel.gemm_wgmma_calls, accel.gemm_existing_calls, s.max_abs, s.max_rel
+            );
+        }
+    }
+
+    /// **A row wholly under f16's range must not turn a finite GEMM into a row of zeros.**
+    ///
+    /// The underflow twin of the test above, and the harder of the two to gate, because its failure
+    /// is *quiet*: an operand scaled to ~1e-8 is under f16's round-to-zero point (`2^-25` = 2.98e-8),
+    /// so every element enters the wgmma seam as an exact zero and `C` comes back identically zero
+    /// where `gpu::gemm_nt` returns what the CPU oracle returns. Unlike the overflow case there is
+    /// no `inf` to spot — and the tolerance band cannot spot it either, in *both* of the ways a band
+    /// can fail to: the true result is ~1e-13, comfortably under `gemm_tolerance(Wgmma, ..)`'s
+    /// `abs_tol = 5e-2`, and `diff::assert_close` passes a lane on `abs <= abs_tol || rel <=
+    /// rel_tol`. **So the value assertions in this test cannot fail on the defect; only the ROUTE
+    /// assertion can.** That is the point of writing it as a paired control rather than as a
+    /// tolerance check: same shape, same `b`, one scale factor apart, so on a Hopper part the route
+    /// must differ *because of the magnitudes* and nothing else.
+    ///
+    /// # The third arm, and why the granularity is the whole point
+    ///
+    /// `C[i][j] = sum_k A[i][k]*B[j][k]`, so row `i` of A feeds row `i` of `C` and nothing else. The
+    /// `quiet row` arm scales **one row** of A to 1e-8 and leaves the rest at O(1): the operand's
+    /// single largest magnitude is then ~1.0, which is why a per-operand rule passed it and the
+    /// route stayed `Wgmma` while that row of `C` came back exactly zero.
+    /// `gpu_accel::wgmma_declines_operand_range` folds its maximum **per row** for exactly this
+    /// case, and this arm is the device-side proof: unlike the whole-operand arm its *value*
+    /// assertion is load-bearing too, because `got` would hold a zero row where the oracle is
+    /// strictly positive.
+    ///
+    /// Runs on any device — on a pre-Hopper part both arms are `Existing` and it still asserts the
+    /// user-visible property, that the GPU does not return zeros where the oracle is non-zero.
+    #[test]
+    fn gpu_backend_declines_operands_wholly_under_the_f16_normal_range() {
+        const NAME: &str = "gpu_backend_declines_operands_wholly_under_the_f16_normal_range";
+        let mut guard = wukong_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                skip_no_device(NAME);
+                return;
+            }
+        };
+        let cc = g.target().cc();
+        let mut rng = Rng::new(0x5AB_0BAD);
+        let (m, k, n) = (64usize, 64usize, 64usize);
+        let (program, mut interner) = build(&linear_src(m, k, n));
+        let entry = interner.intern("lin");
+        // Both operands strictly positive so no lane of the true result can cancel to zero on its
+        // own — a zero in `got` is then the seam flushing, never the arithmetic.
+        let b = rng.vec(n * k, 0.5, 1.0);
+        let base = rng.vec(m * k, 0.5, 1.0);
+
+        // The per-ROW scale of A, so the third arm can be quiet in one row and loud in the rest.
+        // `fn(usize) -> f32` rather than a closure so the three arms live in one array.
+        for (label, scale_of_row, hopper_route) in [
+            (
+                "control",
+                (|_row| 1.0f32) as fn(usize) -> f32,
+                gpu_accel::GemmRoute::Wgmma,
+            ),
+            // Under 2^-25: every element of A converts to an exact f16 zero.
+            (
+                "underflow",
+                (|_row| 1e-8f32) as fn(usize) -> f32,
+                gpu_accel::GemmRoute::Existing,
+            ),
+            // ONE quiet row inside a loud operand: peak|A| is still ~1.0, so the per-operand rule
+            // this replaced saw nothing, and row 1 of C came back exactly zero.
+            (
+                "quiet row",
+                (|row| if row == 1 { 1e-8f32 } else { 1.0 }) as fn(usize) -> f32,
+                gpu_accel::GemmRoute::Existing,
+            ),
+        ] {
+            let want = if cc.0 == 9 {
+                hopper_route
+            } else {
+                gpu_accel::GemmRoute::Existing
+            };
+            let a: Vec<f32> = base
+                .iter()
+                .enumerate()
+                .map(|(idx, x)| x * scale_of_row(idx / k))
+                .collect();
+            // The number the replaced rule looked at. On the `quiet row` arm it is ~1.0, i.e. the
+            // per-operand maximum is *blind* to the row this arm exists for, which is why the arm
+            // is here at all.
+            let peak = a.iter().fold(0.0f32, |p, x| p.max(x.abs()));
+
+            let (mut ac, mut bc, mut cpu) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cpu];
+                wukong_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
+            }
+            assert!(
+                cpu.iter().all(|v| v.is_finite() && *v > 0.0),
+                "{label}: the CPU oracle must be finite and strictly positive everywhere, or a \
+                 zeroed GPU result would not be evidence of anything"
+            );
+
+            let (mut ag, mut bg, mut got) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ag, &mut bg, &mut got];
+                wukong_interp::run_kernel_f32_accel(
+                    &program, entry, &mut bufs, &interner, &mut accel,
+                )
+                .unwrap();
+            }
+            let taken = accel
+                .gemm_route_taken()
+                .expect("the GEMM must have offloaded, or this tests CPU-vs-CPU");
+            assert_eq!(
+                taken, want,
+                "{label} (cc {cc:?}, max|A| = {peak:e}, row scales {:e}/{:e}): on Hopper the route \
+                 must be decided by the MAGNITUDES OF A ROW — the shape is identical in all three \
+                 runs and declines in none. On the whole-operand arm this is the only assertion the \
+                 defect can fail, because the band cannot see a 1e-13 result zeroed.",
+                scale_of_row(0),
+                scale_of_row(1)
+            );
+            assert!(
+                got.iter().all(|v| *v > 0.0),
+                "{label}: the GPU returned a zero lane where the f32 oracle is strictly positive — \
+                 the underflow decline did not fire and the f16 seam flushed a whole row (max|A| = \
+                 {peak:e}, so a rule folded over the whole operand cannot see it)"
+            );
+            let (abs_tol, rel_tol) = gemm_tolerance(taken, k);
+            let s = assert_close(
+                &format!("underflow {label} {m}x{k}x{n}"),
+                &got,
+                &cpu,
+                abs_tol,
+                rel_tol,
+            );
+            eprintln!(
+                "gpu --backend underflow {label} {m}x{k}x{n} max|A|={peak:e} [{taken:?}]: \
+                 {} wgmma / {} existing, max_abs={:.2e} max_rel={:.2e}",
+                accel.gemm_wgmma_calls, accel.gemm_existing_calls, s.max_abs, s.max_rel
             );
         }
     }

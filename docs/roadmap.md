@@ -581,6 +581,35 @@ multiple of 16. A genuine *device* error is a different thing and is always surf
 within tolerance (GEMM tolerance-gated too, not bit-exact — the device reduces K in a different order;
 silu ~5e-7, dot ~7e-7, softmax ~3e-8 abs), asserting the offload actually fired.
 
+The plain-GEMM hook carries **one extra dispatch axis, the device architecture**: on a Hopper part
+(`cc_major == 9`) a recognized `C = A·Bᵀ` goes to the warpgroup-MMA + TMA family (`gemm_nt_wgmma`),
+the kernel the Act-2 campaign measures and which until then had no caller outside its own test module;
+on every other capability it takes the pre-Hopper launcher, unchanged. It is `== 9` and not `>= (9,0)`
+because `sm_90a` is architecture-*locked*. Every reason the family cannot take a call **that is
+decidable before the launch** — the architecture, an unencodable tensor map (`K % 8 != 0`), an odd `N`
+under the `v2` store, an output past the epilogue's `u32` index, a CTA grid past CUDA's `gridDim.y`
+ceiling, a ring larger than the device's opt-in shared memory, or an operand
+outside f16's *range* at either end (the seam converts f32 operands to f16 on the host: past 65504 an
+element comes back `inf` rather than merely rounded, and a **row** whose whole magnitude range is
+under f16's smallest normal 6.104e-5 comes back as a whole row — or, in `B`, column — of zeros, since
+`C[i][j] = Σ_k A[i][k]·B[j][k]` and at ~1e-8 every element of that row is under f16's round-to-zero
+point. Overflow declines per element, underflow per **row** on that row's maximum — the granularity
+an output lane is actually decided at, and the one at which a quiet row inside a loud operand is
+visible at all — so an ordinary `U(-1,1)` buffer never trips it) — is a **decline to
+that same existing path**, never an error, so results are unchanged wherever it declines. Two
+outcomes are not declines and are named as such rather than implied away: a driver rejection *at* the
+launch that is not `UNSUPPORTED` stays a hard error (a GPU failure is never silently answered on the
+CPU), and a launch that never retires exits the process with code 70 from the launch wait. Where it does
+route, the tolerance band widens rather than the contract: the wgmma family converts both operands to
+f16 on the host, so the driver's device gate sizes its band from the route that **actually ran** —
+per-route offload counters, not the device's capability, because a Hopper part is eligible at every
+shape while declining a real subset of them, and a fallback's f32 result must keep the f32 band
+(`WUKONG_GPU_NO_WGMMA=1` forces the pre-Hopper path in the same binary, for a one-build A/B;
+`WUKONG_GPU_ROUTE_LOG=1` prints the route and decline reason per dispatch). The
+**fused** epilogue hook is deliberately not routed there yet — no wgmma module computes
+`act(A·Bᵀ + bias)`, and composing the plain GEMM with a second pointwise launch would be exactly the
+unfused chain that fusion exists to delete.
+
 Run the kernel suite with `cargo test -p wukong_codegen_gpu --features gpu` (skips cleanly with no
 GPU).
 
