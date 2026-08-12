@@ -2997,6 +2997,59 @@ pub fn multicast_l2_share(bm: usize, bn: usize) -> f64 {
     (bn as f64 / 2.0) / (bm + bn) as f64
 }
 
+/// **The memory roof of one launch, seconds -- and the one term the RASTER moves.**
+///
+/// `resident` is `waves <= 1 || final_wave_footprint <= L2_BYTES`: does a wave's operand footprint
+/// survive in L2 long enough for the next wave's tiles to reuse it?
+///
+/// * **Resident.** The DRAM traffic is compulsory -- every operand byte is fetched once, ahead of
+///   the many L2 hits that reuse it -- so the two streams overlap and the roof is
+///   `max(T_L2, T_DRAM)`. This is WAVE3_DOSSIER 0.4's `T_pred = max(T_floor, T_L2, T_DRAM)`
+///   unchanged, which is what leaves all five of its well-explained rows where they were.
+/// * **Thrashing.** The lines a later tile wants were evicted before it got to them, so its read is
+///   a DEMAND miss standing in the critical path rather than a prefetch behind it: the hit stream
+///   and the refill stream stop overlapping and the roof is their **sum**.
+///
+/// # Why this is a repair of the dossier's model and not a decoration on it
+///
+/// 0.4's own accuracy table explains five of seven shapes to within 7% and then says: "the two that
+/// are not -- `sq8192` and `gpt_d4096_up` -- are **exactly** the two whose linear-order wave
+/// footprint exceeds L2." That residual is 1.235 and 1.632. This function is that sentence written
+/// as arithmetic, and it costs **no new fitted constant** -- only [`BW_L2`], [`BW_HBM`] and the
+/// [`L2_BYTES`] residency test section 1.3 already ships as the raster's own criterion. It moves
+/// those two rows to **1.003 and 1.182** and moves no other row at all, because it fires nowhere
+/// else. The law `the_serialised_memory_roof_is_right_exactly_where_the_footprint_is_not_resident`
+/// asserts both halves: applying it everywhere would push `sq4096` to 0.883 and `gpt_d1024_down` to
+/// 0.833, i.e. break two of the five rows that already work.
+///
+/// # What the cluster removes from it
+///
+/// A `1x2x1` B multicast changes the L2->SMEM read and **not the footprint** (WAVE3_DOSSIER 3.1:
+/// "the cluster does not change the footprint"), so the traffic it removes is the pair of CTAs'
+/// duplicate B request -- an L2 **hit**, priced at [`BW_L2`], in both branches above. Removing a
+/// share `s` of the L2 read therefore removes exactly `s * T_L2` from this roof in either branch,
+/// which is why [`DispatchPlan::l2_saving`] stays `f_L2 * share` with `f_L2 = T_L2 / binding` and
+/// `T_L2` at the full [`BW_L2`]. The model change is confined to the DENOMINATOR.
+///
+/// [`DispatchPlan::l2_saving`]: DispatchPlan::l2_saving
+pub fn dispatch_memory_roof_s(
+    l2_read_bytes: f64,
+    dram_bytes: f64,
+    c_bytes: f64,
+    resident: bool,
+) -> f64 {
+    let t_l2 = l2_read_bytes / BW_L2;
+    let t_dram = dram_bytes / BW_HBM;
+    if resident {
+        return t_l2.max(t_dram);
+    }
+    // `dram_bytes` carries the C write, which is not an L2 read; the operand misses are what is
+    // taken out of the hit stream.
+    let miss = (dram_bytes - c_bytes).max(0.0);
+    let hit = (l2_read_bytes - miss).max(0.0);
+    hit / BW_L2 + t_dram
+}
+
 /// The wave efficiency a tile must clear to be selected: `tiles / (sm_count * waves)`.
 ///
 /// 0.90 accepts 128x256 at `sq2048` (0.970) and rejects it at `sq1024` (0.242), reproducing BOTH
@@ -3005,13 +3058,57 @@ pub fn multicast_l2_share(bm: usize, bn: usize) -> f64 {
 pub const WAVE_EFFICIENCY_FLOOR: f64 = 0.90;
 /// The L2-roof fraction above which the cluster pays for itself **at [`FLOOR_REF_TILE`]**.
 ///
-/// The sign of the cluster's effect flips between a measured `f_L2` of 0.736 (`sq2048`, -8.0% with
-/// the cluster on the tight `s3` pair) and 0.810 (`sq8192`, +47.0%). The threshold sits inside that
-/// bracket and is placed at its LOW end deliberately: a wrong OFF at sq8192 costs 27 points, a wrong
-/// ON at sq2048 costs 5. Be eager.
+/// # Provenance: this is NOT the number WAVE3_DOSSIER 3.2 tabulates, and the difference is exact
 ///
-/// **Every one of those three measurements is a 128x256 measurement**, so this number carries that
-/// tile's scope with it and [`cluster_l2_saving_threshold`] is what carries it to another tile.
+/// 3.2 fits the threshold to a sign flip bracketed by an `f_L2` of **0.736** (`sq2048`, where the
+/// cluster measured -8.0% on the tight `s3` pair) and **0.810** (`sq8192`, +47.0%). Both of those
+/// are `T_L2 / T_measured`. What [`DispatchPlan::f_l2`] computes is `T_L2 / T_predicted` -- it has
+/// to be, because a device-free pure function of `(M, N, K, sm_count)` has no measurement to divide
+/// by. **The numerator is the same object; the whole divergence is the denominator**, so the two are
+/// related by one exact factor:
+///
+/// ```text
+///     f_L2(computed)  =  f_L2(measured)  x  (T_measured / T_predicted)
+/// ```
+///
+/// and `T_measured / T_predicted` is WAVE3_DOSSIER 0.4's own residual column. Every arm in both of
+/// those tables is the **linear, un-clustered** one -- 0.4 prices `T_DRAM` at the linear footprint
+/// and round 3 ran the cluster A/B without a raster -- so the bracket's two points are this
+/// function evaluated on THAT configuration:
+///
+/// | shape | 3.2's `f_L2` | 0.4's meas/pred, linear arm | **shipped `f_L2`, linear arm** | measured cluster effect |
+/// |---|---|---|---|---|
+/// | `sq2048` | 0.736 | 1.045 | **0.7687** | **-8.0%, the LOSS that sets the floor** |
+/// | `sq8192` | 0.810 | 1.003 | **0.8124** | **+47.0%, the WIN that sets the ceiling** |
+/// | `sq4096` | 0.946 | 1.011 | 0.9553 | +9.3% |
+///
+/// **So the measured bracket `[0.736, 0.810]` is the shipped bracket `[0.769, 0.812]`, and 0.78 is
+/// inside it** -- still at its LOW end, which is 3.2's stated instruction and its reason: a wrong
+/// OFF at sq8192 costs 27 points, a wrong ON at sq2048 costs 5, so be eager. What moves is the
+/// SAFETY MARGIN, and it must be stated rather than inherited: the bracket is **5.7% wide here
+/// against 10% in the dossier's units**, and 0.78 sits **1.4% above `sq2048`** (0.7687) and 4.0%
+/// below `sq8192` (0.8124), not the 5.7% and 3.7% 3.2's own units imply. That tightness is the
+/// honest state of a threshold fitted to one sign change, and it is what a round measuring
+/// `gpt_d1024_down` / `gpt_d1024_up` (WAVE3_DOSSIER 3.8's refusal) exists to widen.
+/// `the_shipped_f_l2_is_a_predicted_denominator_quantity` pins every number in that table, including
+/// the two the reconciliation would be vacuous without: `T_L2` itself, and 3.2's ratio against the
+/// measured time.
+///
+/// The 1.003 at `sq8192` is 0.4's 1.235 repaired by [`dispatch_memory_roof_s`]; before that repair
+/// this bracket read `[0.769, 1.000]`, i.e. the ceiling was pinned at the ratio's own maximum -- the
+/// value `f_L2` takes whenever `T_L2` alone binds -- and carried no information about the margin at
+/// all.
+///
+/// **The bracket point is not the pin.** `sq8192` SHIPS with the raster, where its `f_L2` is 0.8826,
+/// and that is what `the_dispatcher_verdict_is_pinned_at_every_benched_shape` pins: 3.2's standing
+/// instruction is to evaluate on the FINAL configuration, while a bracket fitted to a measurement
+/// must be evaluated on the configuration that was MEASURED. Both numbers are this function's, on
+/// two different arms, and each is used for the thing it is evidence about.
+///
+/// **Every one of those measurements is a 128x256 measurement**, so this number carries that tile's
+/// scope with it and [`cluster_l2_saving_threshold`] is what carries it to another tile.
+///
+/// [`DispatchPlan::f_l2`]: DispatchPlan::f_l2
 pub const CLUSTER_F_L2_THRESHOLD: f64 = 0.78;
 
 /// **What the cluster must actually SAVE to be worth its coupling cost**: the fraction of the binding
@@ -3074,13 +3171,45 @@ pub struct DispatchPlan {
     /// The LINEAR order's wave footprint in bytes, `f(R_linear) * K * 2`. The raster fires iff this
     /// exceeds [`L2_BYTES`] on a multi-wave grid, so the number and its threshold belong together.
     pub linear_footprint_bytes: f64,
-    /// The L2-roof fraction of the FINAL configuration, `T_L2 / max(T_floor, T_L2, T_DRAM)`,
-    /// reproducing WAVE3_DOSSIER 3.2's column to three digits at `gpt_d4096_up` (0.955) and
-    /// `gpt_d1024_up` (0.55).
+    /// The FINAL configuration's wave footprint in bytes -- `f(GROUP_M) * K * 2` under the raster,
+    /// [`linear_footprint_bytes`] without it. **This is the field the raster's mechanism enters the
+    /// cluster decision through**, via [`l2_resident`].
     ///
-    /// **It is the dossier's diagnostic, not the predicate's comparand** -- see [`l2_saving`], which
-    /// is this number times the share of the L2 term a multicast on THIS tile actually removes. The
-    /// two are equal up to the constant `1/3` at [`FLOOR_REF_TILE`] and nowhere else.
+    /// [`linear_footprint_bytes`]: DispatchPlan::linear_footprint_bytes
+    /// [`l2_resident`]: DispatchPlan::l2_resident
+    pub final_footprint_bytes: f64,
+    /// `waves <= 1 || final_footprint_bytes <= L2_BYTES`: does a wave's operand footprint survive
+    /// in L2 for the next wave to reuse? It selects which branch of [`dispatch_memory_roof_s`]
+    /// prices this configuration, and it is the ONLY input to the cluster decision the raster
+    /// moves.
+    pub l2_resident: bool,
+    /// `waves * (tile_fixed_s + ceil(K/64) * k_stage_s)` at the tile that was CHOSEN, seconds.
+    pub floor_s: f64,
+    /// [`dispatch_memory_roof_s`] at this configuration, seconds.
+    pub memory_roof_s: f64,
+    /// The whole launch's L2->SMEM operand read, `tiles * (bm+bn) * K * 2` bytes. `T_L2` is this
+    /// over [`BW_L2`], and it is `f_L2`'s numerator and the term a B multicast removes
+    /// [`multicast_l2_share`] of.
+    pub l2_read_bytes: f64,
+    /// The FINAL configuration's DRAM traffic in bytes: operands at the chosen order's footprint,
+    /// plus the `C` write. **This is the byte count the raster moves** (2.384 -> 0.797 GB at
+    /// `gpt_d4096_up`); it changes no L2 read at all.
+    pub dram_bytes: f64,
+    /// The L2-roof fraction of the FINAL configuration, `T_L2 / max(T_floor, T_memory)`.
+    ///
+    /// **It is a PREDICTED-denominator quantity and WAVE3_DOSSIER 3.2's column is a MEASURED one**
+    /// -- same numerator, and related by 0.4's residual exactly:
+    /// `f_L2(here) = f_L2(3.2) x (T_measured / T_predicted)`. That is why this reads 0.7687 where
+    /// 3.2 reads 0.736, and 0.8124 on the linear arm 3.2 measured at `sq8192` where 3.2 reads 0.810
+    /// (0.8826 on the RASTERED arm that shape actually ships, which is a different configuration and
+    /// the one 3.2's "evaluate on the final configuration" instruction asks for). See
+    /// [`CLUSTER_F_L2_THRESHOLD`] for the whole table and for what the difference does to the
+    /// threshold's safety margin, and `the_shipped_f_l2_is_a_predicted_denominator_quantity` for the
+    /// law that pins it.
+    ///
+    /// **It is also the dossier's diagnostic, not the predicate's comparand** -- see [`l2_saving`],
+    /// which is this number times the share of the L2 term a multicast on THIS tile actually
+    /// removes. The two are equal up to the constant `1/3` at [`FLOOR_REF_TILE`] and nowhere else.
     ///
     /// [`l2_saving`]: DispatchPlan::l2_saving
     pub f_l2: f64,
@@ -3102,7 +3231,7 @@ impl DispatchPlan {
         format!(
             "{}x{} tile, {} tiles / {} waves (eff {:.3} vs floor {:.2}) | cluster {} (saves {:.3} \
              = f_L2 {:.3} x share {:.3}, vs {:.2}) | raster {} (linear footprint {:.1} MB vs L2 \
-             {:.1} MB) | persistent {}",
+             {:.1} MB) | persistent {} | final footprint {:.1} MB, {}",
             self.bm,
             self.bn,
             self.tiles,
@@ -3121,8 +3250,19 @@ impl DispatchPlan {
             },
             self.linear_footprint_bytes / 1.0e6,
             L2_BYTES / 1.0e6,
-            self.persistent
+            self.persistent,
+            self.final_footprint_bytes / 1.0e6,
+            if self.l2_resident {
+                "L2-RESIDENT (roof = max(T_L2, T_DRAM))"
+            } else {
+                "THRASHING (roof = T_hit + T_DRAM)"
+            }
         )
+    }
+
+    /// The roof the cluster decision divides by: `max(T_floor, T_memory)`, seconds.
+    pub fn binding_s(&self) -> f64 {
+        self.floor_s.max(self.memory_roof_s)
     }
 }
 
@@ -3149,11 +3289,22 @@ impl DispatchPlan {
 /// cluster iff what a B multicast would SAVE off the **FINAL** configuration's binding roof clears
 /// [`cluster_l2_saving_threshold`].
 ///
-/// **That last word is load-bearing.** `gpt_d4096_up` FLIPS: today it is memory-thrashing at 58.5%
-/// of the L2 hit rate and the cluster is worth nothing (`f_L2` 0.585); once the raster makes its wave
-/// footprint L2-resident it lands at 0.955 and the cluster is worth 1.5x of a binding roof. The
-/// dispatcher is a function of the configuration it is about to emit, not of a measurement of an
-/// earlier one.
+/// **That last word is load-bearing, and it is a computation here rather than a story.**
+/// `gpt_d4096_up` FLIPS: with the raster forced OFF its wave footprint is 136.4 MB of a 50.0 MiB L2,
+/// [`dispatch_memory_roof_s`] prices it as thrashing (1329.8 us against a 963.5 us floor), and
+/// `f_L2` lands at **0.692** -- a saving of 0.231 against the 0.26 break-even, **cluster OFF**. Turn
+/// the raster on and the footprint is 34.1 MB, the roof drops back to the floor, `f_L2` is
+/// **0.955** and the cluster is worth a third of a binding roof: **ON**. Both verdicts are computed
+/// by this function from `(M, N, K)` alone, and
+/// `the_raster_flips_the_cluster_verdict_at_gpt_d4096_up` asserts they DIFFER by evaluating
+/// [`wgmma_dispatch_plan_with_raster`] twice.
+///
+/// **Where this diverges from the dossier, said out loud.** WAVE3_DOSSIER 3.2 puts the pre-raster
+/// number at 0.585, which is `T_L2 / T_measured` against the 1572.2 us the linear arm actually took;
+/// no device-free function has that denominator. 0.692 is the same flip priced by the model
+/// (`T_L2 / T_predicted`), and the model still under-predicts that arm by 18% -- so the direction,
+/// the mechanism and the verdict are the dossier's, and the magnitude is the model's. The dispatcher
+/// is a function of the configuration it is about to emit, not of a measurement of an earlier one.
 ///
 /// # The floor is the CHOSEN tile's floor, and that took a defect to learn
 ///
@@ -3168,6 +3319,26 @@ impl DispatchPlan {
 /// third. WAVE3_DOSSIER 3.7's pseudocode carries the same shortcut (its comment says "at 128x256"
 /// out loud); this is where it is repaired rather than transcribed.
 pub fn wgmma_dispatch_plan(m: usize, n: usize, k: usize, sm_count: usize) -> DispatchPlan {
+    wgmma_dispatch_plan_with_raster(m, n, k, sm_count, None)
+}
+
+/// [`wgmma_dispatch_plan`] with the raster forced, which is what makes its FLIP claim checkable.
+///
+/// `raster: None` is the shipped rule. `Some(false)` is the counterfactual the dossier's headline
+/// rests on -- "`gpt_d4096_up` flips" is a statement about two configurations, and a function that
+/// can only ever be asked about one of them cannot be said to decide it. Everything downstream of
+/// the raster is recomputed from the forced value: `GROUP_M`, the DRAM bytes, the final footprint,
+/// the residency and therefore the memory roof.
+///
+/// It is `pub` because the round log prints both arms at `gpt_d4096_up` (`wgmma_config_sweep`
+/// section 6d), which is the difference between a log that asserts a flip and a log that shows one.
+pub fn wgmma_dispatch_plan_with_raster(
+    m: usize,
+    n: usize,
+    k: usize,
+    sm_count: usize,
+    raster: Option<bool>,
+) -> DispatchPlan {
     let sm = sm_count.max(1);
     // 1. the widest tile whose wave efficiency clears the floor. The last candidate is taken
     //    unconditionally: something must run, and the narrowest tile is the one with the most tiles.
@@ -3192,7 +3363,7 @@ pub fn wgmma_dispatch_plan(m: usize, n: usize, k: usize, sm_count: usize) -> Dis
     let r_lin = sm as f64 / gx.min(sm) as f64;
     let f_lin = r_lin * bm as f64 + (sm as f64 / r_lin) * bn as f64;
     let linear_footprint_bytes = f_lin * k as f64 * 2.0;
-    let raster = waves > 1 && linear_footprint_bytes > L2_BYTES;
+    let raster = raster.unwrap_or(waves > 1 && linear_footprint_bytes > L2_BYTES);
     // `round(sqrt(W*BN/BM))` to the nearest EVEN value: 16 at 128x256, 12 at 128x128, 8 at 128x64.
     // Even because a group must be a whole number of 2-CTA clusters, or it ends mid-cluster and the
     // two ranks of that cluster compute different N tiles -- the one thing a B multicast forbids.
@@ -3209,11 +3380,22 @@ pub fn wgmma_dispatch_plan(m: usize, n: usize, k: usize, sm_count: usize) -> Dis
     //    THIS tile's floor (`tile_fixed_s`/`k_stage_s`, not the reference tile's constants applied to
     //    another geometry -- that inflated sq1024's by 2.9x), and the comparand must be the saving,
     //    because the multicast removes a third of the L2 term at 128x256 and a sixth at 128x64.
-    let t_l2 = tiles as f64 * (bm + bn) as f64 * k as f64 * 2.0 / BW_L2;
-    let t_floor =
+    //    ...and "FINAL" is where the RASTER enters: the footprint the memory roof is priced on is
+    //    the one the chosen order actually produces, so a lever that makes a thrashing shape
+    //    L2-resident changes the denominator the cluster is judged against. That is the dossier's
+    //    `gpt_d4096_up` flip, and here it is arithmetic rather than a comment.
+    let l2_read_bytes = tiles as f64 * (bm + bn) as f64 * k as f64 * 2.0;
+    let t_l2 = l2_read_bytes / BW_L2;
+    let floor_s =
         waves as f64 * (tile_fixed_s(bm, bn, stages) + k.div_ceil(64) as f64 * k_stage_s(bm, bn));
-    let t_dram = dispatch_dram_bytes(m, n, k, bm, bn, sm, tiles, waves, group_m) / BW_HBM;
-    let binding = t_floor.max(t_l2).max(t_dram);
+    let dram_bytes = dispatch_dram_bytes(m, n, k, bm, bn, sm, tiles, waves, group_m);
+    let r_fin = if group_m > 1 { group_m as f64 } else { r_lin };
+    let final_footprint_bytes =
+        (r_fin * bm as f64 + (sm as f64 / r_fin) * bn as f64) * k as f64 * 2.0;
+    let l2_resident = waves <= 1 || final_footprint_bytes <= L2_BYTES;
+    let memory_roof_s =
+        dispatch_memory_roof_s(l2_read_bytes, dram_bytes, (m * n * 4) as f64, l2_resident);
+    let binding = floor_s.max(memory_roof_s);
     let f_l2 = if binding > 0.0 { t_l2 / binding } else { 0.0 };
     let l2_saving = f_l2 * multicast_l2_share(bm, bn);
     let cluster = l2_saving >= cluster_l2_saving_threshold();
@@ -3228,6 +3410,12 @@ pub fn wgmma_dispatch_plan(m: usize, n: usize, k: usize, sm_count: usize) -> Dis
         persistent,
         wave_efficiency,
         linear_footprint_bytes,
+        final_footprint_bytes,
+        l2_resident,
+        floor_s,
+        memory_roof_s,
+        l2_read_bytes,
+        dram_bytes,
         f_l2,
         l2_saving,
     }
@@ -3307,6 +3495,53 @@ pub fn wgmma_dispatch(
                 p.summary()
             )
         })
+}
+
+/// **The rule [`wgmma_dispatch_plan`] ships, as one block of round-log text built FROM ITS OWN
+/// CONSTANTS.**
+///
+/// A round log that states the rule in prose beside a table computed by the code is two spellings of
+/// one thing, and the second one goes stale silently. It already had: the section-6d header
+/// described "the cluster iff the L2-roof fraction of the FINAL configuration clears 0.78" for a
+/// round after the predicate became `f_L2 * share >= 0.26`, and it printed that directly above a
+/// table whose `sq1024` row reads `f_L2 0.795 ... cluster off` -- the header contradicted the line
+/// beneath it at exactly the shape the tile lever exists for.
+///
+/// So there is one spelling and `wgmma_config_sweep` prints THIS, the way every clustered launch
+/// takes its grid from [`Multicast::cluster_shape`] rather than restating `1x2x1`. Every threshold
+/// below is interpolated from the constant the dispatcher compares against, so the two cannot
+/// disagree again; `the_round_log_header_states_the_rule_the_dispatcher_actually_ships` is the law
+/// that keeps it that way, and it is falsifiable at `sq1024`.
+pub fn wgmma_dispatch_rule_text() -> String {
+    let (rbm, rbn, _) = FLOOR_REF_TILE;
+    let menu = DISPATCH_TILES
+        .iter()
+        .map(|(bm, bn, s)| format!("{bm}x{bn} s{s}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "A PURE function of (M, N, K, sm_count), device-free and unit-tested without a GPU:\n  \
+         tile    the WIDEST of [{menu}] whose wave efficiency clears {:.2}\n  raster  iff the grid \
+         is multi-wave AND the LINEAR wave footprint blows L2 ({:.1} MB)\n  persist iff the grid \
+         is multi-wave\n  cluster iff what a 1x2x1 B multicast would SAVE off the FINAL \
+         configuration's binding roof,\n          f_L2 x (bn/2)/(bm+bn), clears {:.2} -- which is \
+         the {:.2} of WAVE3_DOSSIER 3.2 times the\n          {:.3} share it was fitted at \
+         ({rbm}x{rbn}). The share is 1/4 at 128x128 and 1/6 at 128x64, so a\n          narrow tile \
+         is NOT judged by the wide tile's bar: sq1024 clears {:.2} on f_L2 and is still OFF.\n  \
+         The raster enters the cluster decision through the FINAL footprint: it is what decides \
+         whether the\n  memory roof is max(T_L2, T_DRAM) (L2-resident) or T_hit + T_DRAM \
+         (thrashing), which is why gpt_d4096_up's\n  verdict differs between the two arms printed \
+         for it below. f_L2 here is T_L2 / T_PREDICTED, not 3.2's\n  T_L2 / T_measured; the two \
+         differ by 0.4's residual and the bracket carries across (see\n  CLUSTER_F_L2_THRESHOLD). \
+         It DECLINES rather than falling back: a fallback is how a round publishes a\n  \
+         configuration that never ran.",
+        WAVE_EFFICIENCY_FLOOR,
+        L2_BYTES / 1.0e6,
+        cluster_l2_saving_threshold(),
+        CLUSTER_F_L2_THRESHOLD,
+        multicast_l2_share(rbm, rbn),
+        CLUSTER_F_L2_THRESHOLD,
+    )
 }
 
 /// Look up a variant by entry name; panics loudly rather than mis-dispatching.
@@ -4311,8 +4546,16 @@ pub const WGMMA_DRAIN_SHAPES: &[&str] = &["sq8192", "sq4096", "gpt_d1024_up"];
 /// The cluster PREDICATE's shapes (WAVE3_DOSSIER 3.8): the two single-wave-or-L2-bound shapes where
 /// the cluster is the sole variable. `gpt_d1024_down` sits exactly at the 7.00 TB/s roof by
 /// construction (it IS the `BW_L2` calibration) and is predicted the table's smallest ON;
-/// `gpt_d1024_up` at `f_L2 = 0.54` is predicted a LOSS. A rule fitted to one crossing is a curve
+/// `gpt_d1024_up` at `f_L2 = 0.55` is predicted a LOSS. A rule fitted to one crossing is a curve
 /// fitted to two points, which is why both are here.
+///
+/// **Its reader is a law, not a row.** The two arms of this A/B are `w1_mcb_v2` (cluster ON) and
+/// `w1_v2` (OFF), and each measures a longer list than this one -- so the list cannot be spliced
+/// into a [`SweepRow::shapes`] the way [`WGMMA_RASTER_SHAPES`] is. What it can be, and now is, is
+/// the thing `the_sweep_invocation_and_shapes_name_things_that_exist` asserts BOTH of those rows
+/// cover, which is 3.8's refusal ("publishing any dispatch rule from a table that lacks
+/// `gpt_d1024_down` and `gpt_d1024_up` with both cluster settings") as a gate. Left unread it was a
+/// second spelling of two labels that already appear inline in both rows, free to drift from either.
 pub const WGMMA_CLUSTER_PREDICATE_SHAPES: &[&str] = &["gpt_d1024_down", "gpt_d1024_up"];
 
 /// The headline shape of the ranked table: the first of D1 4.5's two prediction points.
@@ -9736,6 +9979,20 @@ mod tests {
     ///   matrix of zeros and against a reused one is the previous arm's answer), and
     /// * the exit is taken by WHOLE clusters, never by one rank of a live pair, which is the
     ///   difference between a skipped CTA and a peer waiting forever on a multicast.
+    ///
+    /// # The PERSISTENT raster rows have no such exit, and this law must say so rather than measure
+    ///
+    /// [`RasterGrid::tile_of`] is the one-tile-per-CTA map, and a persistent module does not use it:
+    /// it emits [`wgmma_tile_bounds_ptx`] and walks `cid` by `%nctaid.x`, so the ragged-group pad
+    /// never exists (`RasterGrid::tile_of_cid`'s own doc: "persistence therefore removes the
+    /// ragged-group pad entirely ... no CTA needs the cluster-uniform early exit"). Ranging the
+    /// counting loop over those rows anyway evaluated the WRONG map against the FLAT persistent grid
+    /// and reported "128 of 132 guard CTAs exit" about a branch that is not in the emitted text. It
+    /// passed, for a reason unrelated to what those modules contain -- a green law about nothing.
+    ///
+    /// So the persistent rows get the assertion that is actually true of them -- **no `@%p0 ret;`
+    /// in the emitted PTX at all** -- and their tile coverage stays where it is proved,
+    /// `the_persistent_loop_covers_every_tile_once_from_every_cluster_slot`.
     #[test]
     fn the_guard_shape_executes_the_rasters_ragged_group_exit() {
         let rows: Vec<&WgmmaCfg> = wgmma_all_emittable()
@@ -9747,7 +10004,19 @@ mod tests {
             "wave 3 ships a raster; a table with none means the rows were dropped, not that the \
              law is vacuous"
         );
+        let mut counted = 0usize;
         for c in rows {
+            if c.tiles.is_persistent() {
+                let ptx = wgmma_module(c, &license()).unwrap();
+                assert!(
+                    !ptx.contains("@%p0 ret;"),
+                    "{}: a persistent module emits no ragged-group early exit -- if one appeared, \
+                     this law's counting arm would be the thing that has to run on it",
+                    c.name
+                );
+                continue;
+            }
+            counted += 1;
             let g = guard_shape(c);
             let r = c.raster_grid(g.m, g.n);
             let (gx, gy, gz) = c.launch_plan().grid(g.m, g.n);
@@ -9791,6 +10060,11 @@ mod tests {
                 owners + exits
             );
         }
+        assert!(
+            counted > 0,
+            "every rastered row is persistent, so the counting arm ran on nothing and the exit \
+             this law is about is untested"
+        );
     }
 
     /// The unproven-claims list is the honest half of this module and must not quietly empty out or
@@ -9959,6 +10233,35 @@ mod tests {
         assert_eq!(
             union, header,
             "WGMMA_SWEEP_SHAPES must be exactly the union of the rows' own shape lists"
+        );
+        // WAVE3_DOSSIER 3.8's REFUSAL, as a law rather than as a constant nobody reads.
+        // `WGMMA_CLUSTER_PREDICATE_SHAPES` names the on/off pair the cluster threshold rests on,
+        // and until now nothing consumed it: `w1_mcb_v2` (the ON arm) and `w1_v2` (the OFF arm)
+        // each spell those two labels inside a longer inline list, so the constant was a second
+        // spelling that could drift from both without a word. This is the reader. It is also the
+        // one gate on the refusal itself -- "publishing any dispatch rule from a table that lacks
+        // gpt_d1024_down and gpt_d1024_up with BOTH cluster settings" -- which matters more now
+        // that `the_shipped_f_l2_is_a_predicted_denominator_quantity` pins the threshold's margin
+        // at 1.4% above the only shape where the cluster was measured to lose.
+        for row in ["w1_mcb_v2", "w1_v2"] {
+            let r = WGMMA_SWEEP_GRID
+                .iter()
+                .find(|r| r.label == row)
+                .unwrap_or_else(|| {
+                    panic!("the cluster predicate's {row:?} arm is not in the grid")
+                });
+            for s in WGMMA_CLUSTER_PREDICATE_SHAPES {
+                assert!(
+                    r.runs_at(s),
+                    "{row} is one arm of the cluster predicate's A/B and must run at {s:?}: a \
+                     threshold fitted to one crossing is a curve fitted to two points \
+                     (WAVE3_DOSSIER 3.8, stated there as a refusal)"
+                );
+            }
+        }
+        assert!(
+            WGMMA_CLUSTER_PREDICATE_SHAPES.len() >= 2,
+            "the refusal is about a PAIR; one shape is the single crossing it exists to reject"
         );
         // The headline three-arm comparison exists, its arms are ONE fact apart, and all three are
         // in the table: baseline (no cluster), primary (B multicast, the wider operand), control
@@ -11296,11 +11599,16 @@ mod tests {
     /// device-free test that spells the whole verdict out, so a change to any threshold, constant or
     /// tile menu has to come here and be argued rather than merely compile.
     ///
-    /// Each row is the dossier's 3.6 dispatch table entry for that shape, and the `f_L2` column
-    /// reproduces its 3.2 column: 0.955 at `gpt_d4096_up` (the shape whose cluster decision the
-    /// raster FLIPS, evaluated on the post-raster configuration exactly as the dossier requires),
-    /// 0.55 at `gpt_d1024_up`, and 0.769 at `sq2048` -- the last of which is the tightest call in
-    /// the table at 1.4% below the 0.78 threshold, which is why it is asserted to four digits.
+    /// Each row is the dossier's 3.6 dispatch table entry for that shape. The `f_L2` column is the
+    /// PREDICTED-denominator quantity, which is 3.2's column times 0.4's residual and not 3.2's
+    /// column itself (see [`CLUSTER_F_L2_THRESHOLD`] for the exact relationship and
+    /// `the_shipped_f_l2_is_a_predicted_denominator_quantity` for the law that pins it): 0.769 at
+    /// `sq2048` against 3.2's 0.736, and 0.955 at `gpt_d4096_up` evaluated on the post-raster
+    /// configuration exactly as the dossier requires. Two of these rows are RASTERED, so their
+    /// `f_L2` is not the one the round-3 cluster A/B was measured at -- `sq8192` pins 0.883 here and
+    /// contributes 0.8124 to the threshold's bracket, which is the same function on the linear arm.
+    /// `sq2048` is the tightest call in the table at **1.4% below** the 0.78 threshold, which is why
+    /// it is asserted to four digits.
     ///
     /// Six of the seven rows are 128x256, where the predicate `saving >= 0.26` IS the dossier's
     /// `f_L2 >= 0.78` (the share is exactly 1/3), and the test asserts that identity rather than
@@ -11391,6 +11699,17 @@ mod tests {
                 &WGMMA_W1_MCB_V2_P,
             ),
             // sq8192: all three schedule levers, the raster as insurance (142.9 -> 68.2 MB).
+            //
+            // Its post-raster footprint is STILL 1.30x L2, so this is the one shipped row the
+            // thrashing branch of `dispatch_memory_roof_s` prices: roof 2085 us against a 1693 us
+            // floor, f_L2 0.883. Before that branch existed this pin read 1.0000 -- the ratio at
+            // its own maximum, which is the value it takes whenever T_L2 alone is the binding term
+            // and therefore the one value that carries no information about the margin.
+            //
+            // 0.883 is the RASTERED arm. The cluster A/B round 3 measured here was the LINEAR one,
+            // where the same function reads 0.8124 against 3.2's 0.810 -- that is the bracket point
+            // (see CLUSTER_F_L2_THRESHOLD), and this is the pin, and they are two arms of one shape
+            // rather than a disagreement.
             pin(
                 "sq8192",
                 128,
@@ -11400,7 +11719,7 @@ mod tests {
                 true,
                 16,
                 true,
-                1.0,
+                0.8826,
                 &WGMMA_W1_MCB_V2_R16_P,
             ),
             // gpt_d1024_up: persistence ALONE, and the cleanest test of it anywhere in the suite --
@@ -11433,7 +11752,12 @@ mod tests {
                 &WGMMA_W1_MCB_V2,
             ),
             // gpt_d4096_up: the only shape where all three fire, and the one whose cluster decision
-            // the RASTER flips (0.585 pre-raster -> 0.955 on the configuration actually emitted).
+            // the RASTER flips -- 0.692 with the raster forced off (136.4 MB of footprint, priced
+            // as thrashing) against 0.955 on the configuration actually emitted (34.1 MB,
+            // resident). `the_raster_flips_the_cluster_verdict_at_gpt_d4096_up` evaluates both and
+            // asserts the two VERDICTS differ, which is the only form of that claim a pinned
+            // post-raster number can never make. The dossier's pre-raster figure is 0.585, which is
+            // T_L2 / T_measured; 0.692 is the same flip priced by the model.
             pin(
                 "gpt_d4096_up",
                 128,
@@ -11536,6 +11860,342 @@ mod tests {
                 got / 1.0e6
             );
         }
+    }
+
+    /// **THE FLIP, AS A COMPARISON OF TWO VERDICTS.**
+    ///
+    /// The dispatcher's headline claim is that `gpt_d4096_up`'s cluster decision is the RASTER's to
+    /// make -- WAVE3_DOSSIER 3.2's "the dispatcher is a function of the *final* configuration, not
+    /// of a measurement of an earlier one", 3.6's "ON post-raster". For a round of this campaign,
+    /// that claim was **inert**: `f_L2` reached the raster through `T_DRAM` alone, `T_DRAM` was
+    /// below the floor in both arms, and the verdict was ON either way. Four sites asserted a flip
+    /// that the shipped rule did not perform, one of them printed into every round log.
+    ///
+    /// The repair is [`dispatch_memory_roof_s`], and this is the law that makes the claim
+    /// falsifiable: evaluate the SAME function twice, once with the raster forced off, and require
+    /// the two **verdicts** to differ. A pin on the post-raster number alone can never state it --
+    /// there is only one configuration in it.
+    ///
+    /// It also fixes the claim's SCOPE, which was never stated either: `sq8192` rasters too, and its
+    /// cluster is ON in both arms (0.8124 -> 0.8826, a margin change, not a sign change). Exactly
+    /// one shape in the suite flips, and this asserts that it is exactly one.
+    #[test]
+    fn the_raster_flips_the_cluster_verdict_at_gpt_d4096_up() {
+        let g = WGMMA_BENCH_GRID
+            .iter()
+            .find(|g| g.label == "gpt_d4096_up")
+            .expect("gpt_d4096_up is the raster's headline shape");
+        let on = wgmma_dispatch_plan(g.m, g.n, g.k, HOPPER_SM_COUNT);
+        let off = wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false));
+        assert!(on.raster && !off.raster, "the two arms are the raster");
+        // THE FLIP. This is the whole law: the verdicts DIFFER.
+        assert_ne!(
+            on.cluster, off.cluster,
+            "the raster does not move this shape's cluster verdict, so every claim that it FLIPS \
+             is inert: on {on:?} vs off {off:?}"
+        );
+        assert!(on.cluster && !off.cluster, "and the direction is OFF -> ON");
+        // ...and it flips for the stated MECHANISM. Everything else about the two arms is equal:
+        // the same tile, the same tiles, the same waves, the same floor -- so the L2 residency of
+        // the wave footprint is the only thing that moved, which is section 1.3's criterion doing
+        // the work section 3.2 says it does.
+        assert_eq!(
+            (on.bm, on.bn, on.tiles, on.waves, on.persistent),
+            (off.bm, off.bn, off.tiles, off.waves, off.persistent),
+            "the arms must differ in the RASTER alone or the flip is about something else"
+        );
+        assert!((on.floor_s - off.floor_s).abs() < 1e-15, "same floor");
+        assert!(
+            (on.l2_read_bytes - off.l2_read_bytes).abs() < 1e-6,
+            "the raster changes DRAM bytes and no L2 read at all (WAVE3_DOSSIER 3.1)"
+        );
+        assert!(
+            on.l2_resident && !off.l2_resident,
+            "the residency IS the flip"
+        );
+        assert!(
+            (off.final_footprint_bytes / 1.0e6 - 136.4).abs() < 0.1
+                && (on.final_footprint_bytes / 1.0e6 - 34.1).abs() < 0.1,
+            "the dossier's 1.2 footprints, 136.4 -> 34.1 MB: {:.1} -> {:.1}",
+            off.final_footprint_bytes / 1.0e6,
+            on.final_footprint_bytes / 1.0e6
+        );
+        // The two numbers, to four digits, on both sides of the break-even.
+        let bar = cluster_l2_saving_threshold();
+        assert!(
+            (off.f_l2 - 0.6921).abs() < 5e-4 && (on.f_l2 - 0.9553).abs() < 5e-4,
+            "f_L2 {:.4} -> {:.4}, pinned at 0.6921 -> 0.9553",
+            off.f_l2,
+            on.f_l2
+        );
+        assert!(
+            off.l2_saving < bar && on.l2_saving >= bar,
+            "saves {:.4} -> {:.4} against a {bar:.4} break-even",
+            off.l2_saving,
+            on.l2_saving
+        );
+        // WHERE THIS DIVERGES FROM THE DOSSIER, asserted rather than glossed. 3.2 puts the
+        // pre-raster figure at 0.585, which is T_L2 / T_MEASURED (920.35 / 1572.2) -- a denominator
+        // a device-free pure function does not have. The model's own denominator is 1329.8 us, so
+        // it still under-predicts that arm by 18%, and 0.692 rather than 0.585 is the honest number
+        // for what the code computes.
+        let measured_us = 1572.2;
+        assert!(
+            ((off.l2_read_bytes / BW_L2 * 1.0e6) / measured_us - 0.585).abs() < 5e-4,
+            "3.2's 0.585 is T_L2 over the MEASURED time"
+        );
+        assert!(
+            (measured_us / (off.binding_s() * 1.0e6) - 1.182).abs() < 5e-3,
+            "and the model under-predicts the linear arm by 18%: {:.3}",
+            measured_us / (off.binding_s() * 1.0e6)
+        );
+        // SCOPE: exactly one shape in the suite flips. `sq8192` rasters and does not.
+        let flippers: Vec<&str> = WGMMA_BENCH_GRID
+            .iter()
+            .filter(|p| {
+                let a = wgmma_dispatch_plan(p.m, p.n, p.k, HOPPER_SM_COUNT);
+                let b =
+                    wgmma_dispatch_plan_with_raster(p.m, p.n, p.k, HOPPER_SM_COUNT, Some(false));
+                a.cluster != b.cluster
+            })
+            .map(|p| p.label)
+            .collect();
+        assert_eq!(
+            flippers,
+            vec!["gpt_d4096_up"],
+            "the flip claim is about ONE shape and must not silently become a claim about others"
+        );
+    }
+
+    /// **THE `f_L2` PROVENANCE LAW: what the code computes, what the dossier tabulates, and the
+    /// exact factor between them.**
+    ///
+    /// [`CLUSTER_F_L2_THRESHOLD`] was fitted to WAVE3_DOSSIER 3.2's `f_L2` column, which is
+    /// `T_L2 / T_MEASURED`. [`DispatchPlan::f_l2`] is `T_L2 / T_PREDICTED`, because a device-free
+    /// pure function has no measurement. Those are two different numbers at every shape where the
+    /// model has a residual, and a source comment claiming the code "reproduces its 3.2 column" was
+    /// simply false at three of seven shapes.
+    ///
+    /// This law states the real relationship and pins every quantity in it:
+    ///
+    /// 1. **the numerator is the same object** -- `T_L2` reproduces 0.4's column, so the divergence
+    ///    is nowhere but the denominator;
+    /// 2. **`T_L2 / T_measured` reproduces 3.2's column**, so the dossier's number is recoverable
+    ///    from the code plus one measurement;
+    /// 3. **`f_L2(shipped) = f_L2(3.2) x meas/pred`**, the identity that carries the bracket;
+    /// 4. and therefore the bracket in the shipped quantity's own units is **`[0.7687, 0.8124]`**,
+    ///    which contains 0.78 -- at its low end, as 3.2 instructs -- with a **1.4%** margin at the
+    ///    measured LOSS and 4.0% at the measured WIN.
+    ///
+    /// Every row is evaluated on the **linear, un-clustered** arm, because that is the arm 0.4
+    /// priced and the arm round 3 ran the cluster A/B on. `sq1024` is excluded and the exclusion is
+    /// the point: its 21.5 us was measured at 128x256 and the rule selects 128x64, so there is no
+    /// residual to take -- comparing them would be the same category error this law exists to name.
+    #[test]
+    fn the_shipped_f_l2_is_a_predicted_denominator_quantity() {
+        // (label, measured us for the LINEAR un-clustered arm, 0.4's T_L2 us, 3.2's f_L2,
+        //  0.4's meas/pred under the SHIPPED roof, the shipped f_L2 on that same arm)
+        let rows = [
+            ("sq2048", 39.09, 28.8, 0.736, 1.045, 0.7687),
+            ("sq4096", 243.44, 230.1, 0.946, 1.011, 0.9553),
+            ("sq8192", 2273.5, 1841.0, 0.810, 1.003, 0.8124),
+            ("gpt_d1024_up", 106.05, 57.5, 0.542, 1.019, 0.5528),
+            ("gpt_d1024_down", 57.50, 57.5, 1.000, 0.955, 0.9553),
+            ("gpt_d4096_up", 1572.2, 920.0, 0.585, 1.182, 0.6921),
+        ];
+        for (label, meas_us, t_l2_doc, f_doc, resid, f_ship) in rows {
+            let g = WGMMA_BENCH_GRID.iter().find(|g| g.label == label).unwrap();
+            // The LINEAR arm: what 0.4 measured and what 3.2's cluster A/B ran.
+            let p = wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false));
+            let t_l2_us = p.l2_read_bytes / BW_L2 * 1.0e6;
+            // 1. the shared numerator.
+            assert!(
+                (t_l2_us - t_l2_doc).abs() < 0.55,
+                "{label}: T_L2 is {t_l2_us:.2} us, WAVE3_DOSSIER 0.4 says {t_l2_doc} -- if THIS \
+                 disagrees the two f_L2s are not two denominators of one quantity and nothing \
+                 below reconciles"
+            );
+            // 2. the dossier's own column, recovered.
+            assert!(
+                (t_l2_us / meas_us - f_doc).abs() < 1e-3,
+                "{label}: T_L2/T_measured is {:.4}, 3.2 says {f_doc}",
+                t_l2_us / meas_us
+            );
+            // 3. the residual, and the identity that carries the bracket across it.
+            let got_resid = meas_us / (p.binding_s() * 1.0e6);
+            assert!(
+                (got_resid - resid).abs() < 5e-3,
+                "{label}: meas/pred is {got_resid:.4}, pinned at {resid}"
+            );
+            assert!(
+                (p.f_l2 - f_ship).abs() < 5e-4,
+                "{label}: shipped f_L2 is {:.4}, pinned at {f_ship}",
+                p.f_l2
+            );
+            assert!(
+                (p.f_l2 - (t_l2_us / meas_us) * got_resid).abs() < 1e-9,
+                "{label}: f_L2(shipped) must be f_L2(3.2) x meas/pred EXACTLY -- it is one \
+                 quantity over two denominators, not two quantities"
+            );
+        }
+        // 4. THE BRACKET, in the units the threshold is actually compared in. sq2048 is the shape
+        //    where the cluster was measured to LOSE 8.0% and sq8192 where it was measured to WIN
+        //    47.0%; the threshold must separate them, and where it sits between them is the whole
+        //    of its safety margin.
+        let f = |label: &str| {
+            let g = WGMMA_BENCH_GRID.iter().find(|g| g.label == label).unwrap();
+            wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false)).f_l2
+        };
+        let (lose, win) = (f("sq2048"), f("sq8192"));
+        assert!(
+            lose < CLUSTER_F_L2_THRESHOLD && CLUSTER_F_L2_THRESHOLD <= win,
+            "the threshold must sit inside the MEASURED sign change: {lose:.4} (-8.0%) .. \
+             {win:.4} (+47.0%), threshold {CLUSTER_F_L2_THRESHOLD}"
+        );
+        assert!(
+            (CLUSTER_F_L2_THRESHOLD - lose) / lose < 0.02,
+            "state the margin as a margin: the threshold clears the measured LOSS by only {:.1}%, \
+             not the 5.7% the dossier's own units imply. It is 3.2's instruction to be eager, and \
+             it is thin -- WAVE3_DOSSIER 3.8's gpt_d1024 pair is the round that widens it",
+            100.0 * (CLUSTER_F_L2_THRESHOLD - lose) / lose
+        );
+        assert!(
+            (win - CLUSTER_F_L2_THRESHOLD) / win > 0.03,
+            "and it clears the measured WIN by {:.1}%",
+            100.0 * (win - CLUSTER_F_L2_THRESHOLD) / win
+        );
+        // ...and the tightness is not an artifact of the repaired roof being generous: BEFORE
+        // `dispatch_memory_roof_s`, sq8192's f_L2 was 1.0000 -- the ratio at its own maximum, the
+        // value it takes whenever T_L2 alone binds -- so the bracket's ceiling carried no
+        // information about the margin at all.
+        let g = WGMMA_BENCH_GRID
+            .iter()
+            .find(|g| g.label == "sq8192")
+            .unwrap();
+        let p = wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false));
+        let overlapped =
+            dispatch_memory_roof_s(p.l2_read_bytes, p.dram_bytes, (g.m * g.n * 4) as f64, true);
+        assert!(
+            (p.l2_read_bytes / BW_L2 / p.floor_s.max(overlapped) - 1.0).abs() < 1e-9,
+            "the superseded roof pinned sq8192 at exactly 1.0"
+        );
+    }
+
+    /// **The serialised memory roof is right EXACTLY where the wave footprint is not resident.**
+    ///
+    /// [`dispatch_memory_roof_s`] adds one branch to WAVE3_DOSSIER 0.4's `max(T_floor, T_L2,
+    /// T_DRAM)`, and a branch that fires on a residency test is a claim with two halves: it must
+    /// IMPROVE the rows whose footprint blows L2 and it must not be applied to the rows whose
+    /// footprint fits. 0.4 states the target itself -- five of seven shapes explained to within 7%,
+    /// "and the two that are not are exactly the two whose linear-order wave footprint exceeds L2",
+    /// at 1.235 and 1.632.
+    ///
+    /// So this law measures the model against 0.4's own measured column, on the linear arm 0.4
+    /// priced, both ways round. It is what stops the branch from being a knob: it costs no new
+    /// constant, and if a later edit widened its scope the two rows it would break say so by name.
+    #[test]
+    fn the_serialised_memory_roof_is_right_exactly_where_the_footprint_is_not_resident() {
+        // (label, 0.4's measured us, resident?, meas/pred SHIPPED, meas/pred under the OTHER roof)
+        let rows = [
+            ("sq2048", 39.09, true, 1.045, 1.045),
+            ("sq4096", 243.44, true, 1.011, 0.883),
+            ("sq8192", 2273.5, false, 1.003, 1.235),
+            ("gpt_d1024_up", 106.05, true, 1.019, 1.019),
+            ("gpt_d1024_down", 57.50, true, 0.955, 0.833),
+            ("gpt_d4096_up", 1572.2, false, 1.182, 1.632),
+        ];
+        for (label, meas_us, resident, shipped, other) in rows {
+            let g = WGMMA_BENCH_GRID.iter().find(|g| g.label == label).unwrap();
+            let p = wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false));
+            assert_eq!(
+                p.l2_resident,
+                resident,
+                "{label}: residency decides the branch, so it is pinned too ({:.1} MB vs {:.1} MB \
+                 of L2)",
+                p.final_footprint_bytes / 1.0e6,
+                L2_BYTES / 1.0e6
+            );
+            let c = (g.m * g.n * 4) as f64;
+            let flipped = dispatch_memory_roof_s(p.l2_read_bytes, p.dram_bytes, c, !p.l2_resident);
+            let r_ship = meas_us / (p.binding_s() * 1.0e6);
+            let r_other = meas_us / (p.floor_s.max(flipped) * 1.0e6);
+            assert!(
+                (r_ship - shipped).abs() < 5e-3 && (r_other - other).abs() < 5e-3,
+                "{label}: meas/pred is {r_ship:.3} shipped and {r_other:.3} under the other roof, \
+                 pinned at {shipped} and {other}"
+            );
+            // The directional claim, per row: where the two roofs differ at all, the SHIPPED one
+            // must be the better predictor. Three rows are floor-bound under both and tie; the
+            // three that are not are the whole evidence for the branch.
+            if (r_ship - r_other).abs() > 1e-6 {
+                assert!(
+                    (r_ship - 1.0).abs() < (r_other - 1.0).abs(),
+                    "{label}: the shipped roof predicts WORSE than the alternative ({r_ship:.3} \
+                     vs {r_other:.3}) -- the branch's residency test is on the wrong side"
+                );
+            }
+        }
+    }
+
+    /// **The round log's rule header is the rule the dispatcher ships, because it is the same
+    /// function.**
+    ///
+    /// `wgmma_config_sweep`'s section 6d used to state the rule in its own prose, and after the
+    /// predicate became `f_L2 * share >= 0.26` that prose still read "the cluster iff the L2-roof
+    /// fraction of the FINAL configuration clears 0.78" -- printed directly above a table whose
+    /// `sq1024` row reads `f_L2 0.795 ... cluster off`. The header contradicted the line beneath it
+    /// at the one shape the tile lever exists for.
+    ///
+    /// [`wgmma_dispatch_rule_text`] is the single spelling, the same discipline as
+    /// [`Multicast::cluster_shape`], and this law is what keeps it honest: every threshold in the
+    /// header is interpolated from the constant the dispatcher compares against, and the superseded
+    /// spelling is banned by name at the shape that falsifies it.
+    #[test]
+    fn the_round_log_header_states_the_rule_the_dispatcher_actually_ships() {
+        let t = wgmma_dispatch_rule_text();
+        assert!(t.is_ascii(), "the round log stays ASCII");
+        for needle in [
+            format!("{:.2}", WAVE_EFFICIENCY_FLOOR),
+            format!("{:.2}", cluster_l2_saving_threshold()),
+            format!("{:.2}", CLUSTER_F_L2_THRESHOLD),
+            format!("{:.1} MB", L2_BYTES / 1.0e6),
+            format!(
+                "{:.3}",
+                multicast_l2_share(FLOOR_REF_TILE.0, FLOOR_REF_TILE.1)
+            ),
+        ] {
+            assert!(
+                t.contains(&needle),
+                "the header must be BUILT from the dispatcher's constants, and {needle:?} is \
+                 missing -- a header carrying its own literals is how this went stale: {t}"
+            );
+        }
+        // Every tile the rule can choose is named, or a reader cannot tell which menu produced a
+        // verdict.
+        for (bm, bn, s) in DISPATCH_TILES {
+            assert!(
+                t.contains(&format!("{bm}x{bn} s{s}")),
+                "{bm}x{bn} s{s}: {t}"
+            );
+        }
+        // THE FALSIFIER. sq1024 clears 0.78 on f_L2 and its cluster is OFF, so a header that said
+        // the verdict is f_L2's would contradict the table printed underneath it.
+        let p = wgmma_dispatch_plan(1024, 1024, 1024, HOPPER_SM_COUNT);
+        assert!(
+            p.f_l2 >= CLUSTER_F_L2_THRESHOLD && !p.cluster,
+            "sq1024 is what makes the two spellings distinguishable: {p:?}"
+        );
+        assert!(
+            !t.contains("fraction of the FINAL configuration clears"),
+            "that is the SUPERSEDED spelling, and sq1024 falsifies it: {t}"
+        );
+        assert!(
+            t.contains("SAVE") && t.contains("(bn/2)/(bm+bn)"),
+            "the header must name the quantity actually compared: {t}"
+        );
+        // Printed under `--nocapture` so the text a round log will carry is readable from a plain
+        // `cargo test` rather than only from a rented hour.
+        eprintln!("[law] section-6d header, verbatim:\n  {t}");
     }
 
     /// **WAVE 3 lever 3, law (a) continued: the verdict is pinned at every CLASS BOUNDARY too.**
