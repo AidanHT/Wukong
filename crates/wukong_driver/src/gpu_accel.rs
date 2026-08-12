@@ -169,7 +169,7 @@ impl<'g> GpuAccel<'g> {
 /// wider band. It is deliberately not a third variant — a caller that needs "were they *all* wgmma"
 /// (the Hopper gate does) compares the counters directly and gets a better message for it.
 #[cfg(test)]
-fn gemm_route_taken_from(wgmma_calls: u32, existing_calls: u32) -> Option<GemmRoute> {
+pub(crate) fn gemm_route_taken_from(wgmma_calls: u32, existing_calls: u32) -> Option<GemmRoute> {
     match (wgmma_calls, existing_calls) {
         (0, 0) => None,
         (0, _) => Some(GemmRoute::Existing),
@@ -257,7 +257,7 @@ fn route_log(args: std::fmt::Arguments<'_>) {
 /// `GpuError::Unsupported` the caller must recover from. `the_route_never_outruns_the_sm90a_license`
 /// pins the two together over the whole capability grid, so widening the license without widening
 /// this fails a test instead of failing a launch.
-fn gemm_route_for(cc: (i32, i32), wgmma_off: bool) -> GemmRoute {
+pub(crate) fn gemm_route_for(cc: (i32, i32), wgmma_off: bool) -> GemmRoute {
     if wgmma_off || cc.0 != 9 {
         return GemmRoute::Existing;
     }

@@ -26,8 +26,12 @@ everywhere else.
   store leaves the CUDA context stickily errored for the rest of the process.
 - On Hopper the route converts both operands to f16 on the host, so the plain-GEMM offload changes
   arithmetic class there — inside the existing CPU↔GPU *tolerance* contract, and the driver's device
-  gate now sizes its band from the route rather than from the device. `WUKONG_GPU_NO_WGMMA=1` forces
-  the pre-Hopper path in the same binary.
+  gate sizes its band from the route that **actually ran**. That is the per-route offload counters
+  (`GpuAccel::gemm_wgmma_calls` / `gemm_existing_calls`, read by `gemm_route_taken`), not the
+  device's capability: a Hopper part is eligible for wgmma at every shape while declining a real
+  subset of them to the f32 launcher, and those results must keep the f32 band or a genuine
+  regression hides under a band ~30× looser. `WUKONG_GPU_NO_WGMMA=1` forces the pre-Hopper path in
+  the same binary, and `WUKONG_GPU_ROUTE_LOG=1` prints the route and decline reason per dispatch.
 - The fused-epilogue hook (`sgemm_nt_epi`) is deliberately unchanged: no wgmma module computes
   `act(A·Bᵀ + bias)` yet, and splicing a second pointwise launch onto the plain GEMM would be the
   unfused chain wave 4 exists to delete. The seam and the exact kernel-side gap are named in place.

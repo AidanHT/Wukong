@@ -549,8 +549,11 @@ architecture, an unencodable tensor map (`K % 8 != 0`), an odd `N` under the `v2
 the epilogue's `u32` index, a ring larger than the device's opt-in shared memory — is a **decline to
 that same existing path**, never an error, so results are unchanged wherever it declines. Where it does
 route, the tolerance band widens rather than the contract: the wgmma family converts both operands to
-f16 on the host, so the driver's device gate sizes its band from the *route* and not from the device
-(`WUKONG_GPU_NO_WGMMA=1` forces the pre-Hopper path in the same binary, for a one-build A/B). The
+f16 on the host, so the driver's device gate sizes its band from the route that **actually ran** —
+per-route offload counters, not the device's capability, because a Hopper part is eligible at every
+shape while declining a real subset of them, and a fallback's f32 result must keep the f32 band
+(`WUKONG_GPU_NO_WGMMA=1` forces the pre-Hopper path in the same binary, for a one-build A/B;
+`WUKONG_GPU_ROUTE_LOG=1` prints the route and decline reason per dispatch). The
 **fused** epilogue hook is deliberately not routed there yet — no wgmma module computes
 `act(A·Bᵀ + bias)`, and composing the plain GEMM with a second pointwise launch would be exactly the
 unfused chain that fusion exists to delete.

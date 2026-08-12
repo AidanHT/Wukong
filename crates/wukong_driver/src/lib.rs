@@ -2102,17 +2102,26 @@ mod gpu_e2e_tests {
         )
     }
 
-    /// **The tolerance band a plain-GEMM offload is held to, chosen by ROUTE and not by device.**
+    /// **The tolerance band a plain-GEMM offload is held to, chosen by the route that RAN.**
     ///
     /// [`gpu_accel::GemmRoute::Existing`] is `gpu::gemm_nt`, an f32 kernel: both sides are f32 and
     /// only the K-reduction order differs, so the band is `c·√K·ε` — the `sgemm_matches_naive` shape.
     /// [`gpu_accel::GemmRoute::Wgmma`] converts both operands to f16 on the host before accumulating
     /// in f32, so it carries an input rounding the CPU oracle does not and needs the fp16 band the
-    /// fused-epilogue gates below already use.
+    /// fused-epilogue gates below already use — some 30× looser at both bounds.
     ///
-    /// It is a function of the route because that is the fact that changed: sizing it by device would
-    /// silently widen the band on a Hopper part that had *declined* the wgmma route (an unencodable
-    /// K, or `WUKONG_GPU_NO_WGMMA=1`) and let a real f32 regression through.
+    /// # The argument must be the witness, never the eligibility
+    ///
+    /// Callers pass [`gpu_accel::GpuAccel::gemm_route_taken`], which reads the per-route offload
+    /// counters. `GpuAccel::gemm_route()` is **not** interchangeable with it: that one is
+    /// `gemm_route_for(cc, env)` and never sees a shape, so on a Hopper part it answers `Wgmma` for
+    /// every call — *including* the ones `gpu_accel::wgmma_declines` sends to the f32 launcher
+    /// (`K % 8 != 0`, an odd `N`, `M*N > u32::MAX`, a ring past the probed shared-memory budget) and
+    /// the ones `gemm_nt_wgmma` itself declines at launch. Sizing the band from it would hold an f32
+    /// result to an f16 band and let a real f32 regression through, which is precisely the failure
+    /// this doc comment used to name while the code keyed on the architecture anyway. The
+    /// `WUKONG_GPU_NO_WGMMA` half was honest — that switch lives inside `gemm_route_for` — and the
+    /// "unencodable K" half was not; the witness covers both.
     fn gemm_tolerance(route: gpu_accel::GemmRoute, k: usize) -> (f64, f64) {
         match route {
             gpu_accel::GemmRoute::Existing => (
@@ -2121,6 +2130,44 @@ mod gpu_e2e_tests {
             ),
             gpu_accel::GemmRoute::Wgmma => (5e-2, 2e-2),
         }
+    }
+
+    /// **The band must follow the route that ran, and this is the case that separates the two.**
+    ///
+    /// Needs no device: both inputs are pure functions. A Hopper part is eligible for the wgmma
+    /// family at *every* shape — `gemm_route_for` takes only a capability — while `wgmma_declines`
+    /// really does send a subset of shapes to `gpu::gemm_nt`. So on that device "eligible" and "ran"
+    /// disagree for those shapes, and only the second one may size a band: an f32 result judged
+    /// against `(5e-2, 2e-2)` instead of `(1e-4, 16√K·ε)` hides roughly two and a half decades of
+    /// regression.
+    #[test]
+    fn the_gemm_band_follows_the_route_that_ran_not_the_device() {
+        // The eligibility, on the device this campaign rents.
+        assert_eq!(
+            gpu_accel::gemm_route_for((9, 0), false),
+            gpu_accel::GemmRoute::Wgmma
+        );
+        // The witness, for a call on that same device that fell back.
+        let ran = gpu_accel::gemm_route_taken_from(0, 1).expect("one offload ran");
+        assert_eq!(ran, gpu_accel::GemmRoute::Existing);
+
+        let k = 4096;
+        let (fallback_abs, fallback_rel) = gemm_tolerance(ran, k);
+        let (wgmma_abs, wgmma_rel) = gemm_tolerance(gpu_accel::GemmRoute::Wgmma, k);
+        assert!(
+            fallback_abs < wgmma_abs && fallback_rel < wgmma_rel,
+            "the f32 band must be strictly tighter than the f16 one, or keying on the route buys \
+             nothing: ({fallback_abs:.1e}, {fallback_rel:.1e}) vs ({wgmma_abs:.1e}, {wgmma_rel:.1e})"
+        );
+        // And a run with even one wgmma call is judged by the wider band, because that call's f16
+        // input rounding is in the buffer being compared.
+        assert_eq!(
+            gemm_tolerance(
+                gpu_accel::gemm_route_taken_from(1, 3).expect("four offloads ran"),
+                k
+            ),
+            (wgmma_abs, wgmma_rel)
+        );
     }
 
     #[test]
@@ -2184,7 +2231,12 @@ mod gpu_e2e_tests {
                 );
             }
 
-            let (abs_tol, rel_tol) = gemm_tolerance(route, k);
+            // The band follows the route that RAN, not the one this device is eligible for: on a
+            // Hopper part every shape is eligible and only some are taken.
+            let ran = accel
+                .gemm_route_taken()
+                .expect("no plain GEMM was offloaded, which the assert above should have caught");
+            let (abs_tol, rel_tol) = gemm_tolerance(ran, k);
             let s = assert_close(
                 &format!("linear {m}x{k}x{n}"),
                 &cg,
@@ -2193,12 +2245,9 @@ mod gpu_e2e_tests {
                 rel_tol,
             );
             eprintln!(
-                "gpu --backend linear {m}x{k}x{n} [{route:?}, ran {:?}]: {} GPU call(s), \
-                 max_abs={:.2e} max_rel={:.2e}",
-                accel.gemm_route_taken(),
-                accel.calls,
-                s.max_abs,
-                s.max_rel
+                "gpu --backend linear {m}x{k}x{n} [eligible {route:?}, ran {ran:?}]: \
+                 {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
+                accel.calls, s.max_abs, s.max_rel
             );
         }
     }
@@ -2316,10 +2365,15 @@ mod gpu_e2e_tests {
                 accel.gemm_existing_calls,
                 accel.calls
             );
-            let taken = accel.gemm_route_taken();
-            assert_eq!(taken, Some(gpu_accel::GemmRoute::Wgmma));
+            let taken = accel
+                .gemm_route_taken()
+                .expect("no plain GEMM was offloaded, which the assert above should have caught");
+            assert_eq!(taken, gpu_accel::GemmRoute::Wgmma);
 
-            let (abs_tol, rel_tol) = gemm_tolerance(route, k);
+            // The band comes from the witness. It equals the f16 band here only *because* the
+            // assertion above proved every offload took the wgmma route; had one fallen back, this
+            // shape would be judged against the f32 kernel's own band, as it should be.
+            let (abs_tol, rel_tol) = gemm_tolerance(taken, k);
             let s = assert_close(
                 &format!("wgmma linear {m}x{k}x{n}"),
                 &got,
