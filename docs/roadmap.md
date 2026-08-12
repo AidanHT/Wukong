@@ -445,9 +445,10 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   Across the run suite and kernels it removes ~42% of IR ops
   (~48–54% on the heavy transformer/GEMM kernels) and runs ~1.5–2.5x faster than `-O0`.
 
-## GPU backend (NVIDIA RTX 4050, behind `--features gpu`)
+## GPU backend (NVIDIA, behind `--features gpu`) — RTX 4050 (`sm_89`) and H100 (`sm_90a`)
 
-> **Device scope (2026-08-06, extended 2026-08-09):** every figure in this section was measured on an
+> **Device scope (2026-08-06, extended 2026-08-09; H100 subsection added 2026-08-11):** every figure
+> in this section **except those in the Hopper subsection below** was measured on an
 > **NVIDIA RTX 4050 Laptop GPU** (Ada, `sm_89`, **20 SMs**, 6 GB, **~192 GB/s**, power-capped
 > ~30–50 W) under **Windows/WDDM**, with only the peers that box can host: cuBLAS / IMMA / cuBLASLt
 > and cuDNN through the redistributable DLLs, NVRTC-compiled CUDA-C, PyTorch in **eager** mode
@@ -475,6 +476,46 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 > before any module load, the cubin and autotune caches are device-keyed, and dynamic shared memory
 > is plumbed end to end. What that changes for *this* section is only scope, not numbers: the 4050
 > behaviour is pinned byte-identical, and every figure below is still a 4050 figure.
+
+### Hopper (`sm_90a`) — what runs, and what is measured (2026-08-11)
+
+A second GEMM family targets **H100** specifically: `wgmma` + TMA, warp-specialized (one producer
+warpgroup plus two consumers), 4-stage SMEM ring, optional 1×2×1 B-multicast cluster, fused
+`st.global.v2.f32` epilogue — `crates/wukong_codegen_gpu/src/ptx_wgmma.rs`, emitted at an `sm_90a`
+module target. It is **capability-gated**: on any non-Hopper device those rows skip rather than
+falling back to a different kernel, which is why the 4050 gates above stay green without it.
+
+Measured standing on an **NVIDIA H100 80GB HBM3** (132 SMs, Linux container, cuBLAS with f32 output
+as the peer), full tables and a log citation per number in `BENCHMARKS.md` → *GPU backend (NVIDIA
+H100 80GB HBM3, `sm_90a`)*. **All of it is iteration-grade**: the rounds ran in a container whose
+user is refused `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 classes container rounds as
+*iteration* data and only locked-clock root-VM rounds as *publication* data — every round records the
+refusal itself (`[clock] lock: refused (…); running unlocked`), and five of them also stamp
+themselves `ITERATION data, not publication data` in a banner (`BENCHMARKS.md` names which, and why
+the K-sweep and the four non-GEMM rounds carry only the `[clock]` line). The label is the docs',
+applied uniformly because the premise is. The rounds substitute a before/after drift gate for the lock;
+read every percentage below as provisional pending a locked-clock VM re-run.
+
+- **95.3% / 88.6% / 92.3% of cuBLAS f16 (f32 out)** at 2048³ / 4096³ / 8192³, **97.3%** on the GPT
+  FFN down-projection, **73–80%** on the wide-N up-projections; bf16 within ~2 points everywhere the
+  shapes overlap. **1024³ f16 is refused** — the *peer's* own run-to-run floor was ±15.47% against a
+  ±5% bar, so no number was minted for it.
+- Copy bandwidth **2922 GB/s = 87.2% of the 3352 GB/s spec peak**; the ≥90% milestone is not met.
+  *(Single-shot round, outside the instrument — no twin, no floor, no publish gate.)*
+- **Fused int8 GEMM+dequant beats the cuBLAS GEMM+dequant chain 1.08× at 1024³ / 1.15× at 2048³**
+  (the first outright peer win on this part) and **loses at 4096³, 0.79×**. *(Also single-shot and
+  outside the instrument, though same-run and oracle-gated; a repeat under it is owed.)*
+- **Sharp edge:** the 4050's int8 tile/occupancy tuning does **not** transfer — 22–52% of cuBLAS
+  IMMA on Hopper against 96–105% on the 4050. Treat every other Ada-tuned threshold in the section
+  below as unproven on Hopper until it is measured there.
+- As of this entry the kernel has **no `wukongc` flag or recognizer route**: `--backend=gpu` offloads
+  the five `Accelerator` families and none of them reach `gemm_nt_wgmma`, so the Hopper GEMM is
+  exercised through `wukong_codegen_gpu`'s own device benches, not yet from a `.wk` program.
+
+*Unmeasured, in progress:* the next wave of the campaign (scheduling work — CTA raster, persistent
+clusters, a per-shape tile class for the small square shape) is **implementation in flight, with no
+measurement behind it**. Its derivations are `docs/gpu/derive/`; nothing from it is in `BENCHMARKS.md`
+and nothing from it should be quoted as a result until a round publishes one.
 
 A GPU backend, `wukong_codegen_gpu`: being a compiler, it **emits PTX text** and **driver-JIT-loads
 it via `cudarc`** (`cuModuleLoadData` — the driver's built-in PTX→SASS JIT, so **no `nvcc`/`ptxas`/CUDA
