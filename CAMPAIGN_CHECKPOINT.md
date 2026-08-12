@@ -78,6 +78,33 @@ Suite mean went **61.5% → ~87.9%** in one wave; the single lever was the v2 st
 - Clock lock is REFUSED in Modal containers (recorded per run now); one bf16 round self-refused
   on +6.82% SM clock drift — the instrument and its `[clock]` provenance lines work.
 
+### The 2026-08-12 Wave-3 visit (logs `2026-08-12-h100-w3-r*.log`, commit f109847; ~$0.44 total)
+
+**SWEEP-ARM results, NOT yet the shipped rule** (the shipped `wgmma_w1_for` still selects the
+wave-2 arms; the 2026-08-11 table above remains the shipped-kernel table). Config sweep: 29 rows x
+7 shapes = 92 cells, every delta below outside both floors ("moved"), clock lock refused and
+declared, f16/f32out:
+
+| shape | control (w1_mcb_v2 / w1_v2) | best wave-3 arm | arm |
+|---|---|---|---|
+| sq8192 | 92.0 | **102.0 — ABOVE cuBLAS** | `_v2_r16_p` (raster+persistent) |
+| gpt_d4096_up | 73.3 | **101.6 — AT/ABOVE cuBLAS** | `_v2_r16_p` |
+| sq4096 | 88.3 | **94.3** | `_v2_p` (persistent) |
+| gpt_d1024_up | 80.6 | **91.8** (persistence alone 90.0) | `_v2_r16_p` |
+| sq1024 | 48.3 (w1_v2) | **79.6** | `w3d` 128x64 tile |
+| sq2048 | 94.1 (w1_v2) | single-wave control: flat (93.5 p) | — |
+
+Mechanism checks: the r32 bracket lands BETWEEN linear and r16 at gpt_d4096_up (90.9 vs 94.5) —
+the raster's gain is traffic, as derived; pstop captures part but not all of the persistent gain
+(99.9 vs 102.0 at sq8192) — the continuous ring is real on top of dispatch; drain arms (fh/d1)
+null within ~1 point everywhere — the dossier's zero budget, measured. Bring-up + cluster
+exactness green on the FIRST device execution of the persistent/rastered/drain PTX (no hang, G19
+reachable). **PRE-REGISTERED FALSIFIER FIRED: gpt_d1024_down prefers NO cluster (96.8 vs 91.4) at
+f_L2 = 1.000** — dossier 3.8 falsifier (i): the cluster predicate needs a `waves` term (every
+wrong ON was single-wave; every multi-wave ON won). `wgmma_vs_cublas` was deliberately NOT run —
+it measures the superseded rule; the promotion (winners + waves-term predicate + bf16 twins) then
+ONE rule re-measure round publishes the new suite table.
+
 ## In flight at the checkpoint (STATE REFRESHED 2026-08-12 after the Wave-3 merge)
 
 1. **Wave 3 is MERGED to main** (`9ef142b`, all four levers: cluster-index raster, persistent
