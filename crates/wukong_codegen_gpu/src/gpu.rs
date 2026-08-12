@@ -8618,7 +8618,10 @@ mod tests {
         // cuBLAS) made v2 the SHIPPED default on both regime arms: `w1_v2` is the un-clustered v2
         // row `wgmma_w1_for` now returns below the cluster threshold, and the fourth corner of
         // the {cluster} x {v2} square the next sweep measures instead of inheriting.
-        const EXPECTED_MODULES: usize = 115;
+        // 115 -> 117 when the levers went to bf16 (`wgmma_w1_bf16_for`): the scalar bf16 round
+        // sat at f16's pre-lever numbers, so the v2 and mcb2+v2 bf16 twins ship and the bf16
+        // bench re-measures the dtype transfer every round.
+        const EXPECTED_MODULES: usize = 117;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -21247,14 +21250,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore = "Act-2 perf round; Hopper + cuBLAS; run explicitly (ptx_wgmma::WGMMA_BENCH_INVOCATION)"]
     fn wgmma_bf16_vs_cublas() {
-        // bf16 has no regime rule yet -- one measured row, no measured sign change -- so its
-        // selector is a constant function rather than a borrowed pretence of one.
-        fn bf16_fixed(_m: usize, _n: usize) -> &'static crate::ptx_wgmma::WgmmaCfg {
-            &crate::ptx_wgmma::WGMMA_W1_BF16
-        }
+        // The bf16 shipped rule: the f16 split's threshold transferred on traffic arithmetic
+        // (equal 2-byte elements, identical tiles and I_cta), re-measured by this bench every
+        // round. The 2026-08-11 scalar-bf16 round (65.1/67.5/56.1% at the squares, within a point
+        // or two of f16's pre-lever numbers) is what licensed the transfer.
         wgmma_peer_round(
             "wgmma_bf16_vs_cublas",
-            bf16_fixed,
+            crate::ptx_wgmma::wgmma_w1_bf16_for,
             PeerBar {
                 label: "cuBLAS bf16 (f32 out)",
                 once: crate::baselines::cublas_gemm_nt_bf16_f32out,

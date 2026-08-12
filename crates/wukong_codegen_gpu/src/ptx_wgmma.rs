@@ -1879,6 +1879,32 @@ pub const WGMMA_W1_BF16: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1
 };
 
+/// The bf16 twin of [`WGMMA_W1_V2`]. The 2026-08-11 bf16 round measured the scalar bf16 row at
+/// 65.1/67.5/56.1% of cuBLAS bf16 at the square shapes -- within a point or two of where the f16
+/// row sat BEFORE its levers -- so the whole bf16 gap is the unshipped transport + cluster, both
+/// of which are dtype-generic at 2-byte elements (same tile, same I_cta, same store sequence; only
+/// the operand-type token differs). Shipped by [`wgmma_w1_bf16_for`]; the scalar row stays
+/// emittable as the control.
+pub const WGMMA_W1_BF16_V2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_bf16_128x256x64_s4_v2",
+    key: "wgmma_nt_bf16_128x256x64_s4_v2",
+    dtype: WgmmaDtype::Bf16,
+    epilogue: EpilogueStore::V2,
+    ..WGMMA_W1
+};
+
+/// The bf16 twin of [`WGMMA_W1_MCB_V2`]: the `1x2x1` B-multicast cluster plus the v2 epilogue, at
+/// bf16. Same byte-level SMEM image, descriptor and launch geometry as the f16 row -- the exactness
+/// gate's bf16 arms and the bring-up's bf16 sibling prove the operand token is the only delta.
+pub const WGMMA_W1_BF16_MCB_V2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_bf16_128x256x64_s4_mcb2_v2",
+    key: "wgmma_nt_bf16_128x256x64_s4_mcb2_v2",
+    dtype: WgmmaDtype::Bf16,
+    multicast: Multicast::ClusterB,
+    epilogue: EpilogueStore::V2,
+    ..WGMMA_W1
+};
+
 /// **W3c -- the moderate-size arm** (D1 section 4.5's W3, cooperative rather than pingpong).
 ///
 /// CTA 128x128x64, `m64n128k16`, 6 stages (32 768 B per stage, 192 KiB). D1 wants this shape for
@@ -1975,6 +2001,8 @@ pub const WGMMA_W1_MCB: WgmmaCfg = WgmmaCfg {
 pub const WGMMA_VARIANTS: &[WgmmaCfg] = &[
     WGMMA_W1,
     WGMMA_W1_BF16,
+    WGMMA_W1_BF16_V2,
+    WGMMA_W1_BF16_MCB_V2,
     WGMMA_W3C,
     WGMMA_W1_MC,
     WGMMA_W1_MCB,
@@ -2028,6 +2056,22 @@ pub fn wgmma_w1_for(m: usize, n: usize) -> &'static WgmmaCfg {
         &WGMMA_W1_MCB_V2
     } else {
         &WGMMA_W1_V2
+    }
+}
+
+/// The bf16 shipped rule: [`wgmma_w1_for`]'s split at the same threshold, on the bf16 twins.
+///
+/// The threshold was measured on f16, and transfers on traffic arithmetic alone: at equal 2-byte
+/// elements the tiles, `I_cta` and the wave geometry are identical, so the cluster's sign change
+/// has no dtype term to move it. The 2026-08-11 bf16 round measured the SCALAR bf16 row within a
+/// point or two of f16's pre-lever numbers at every square shape, which is the same statement made
+/// by the hardware. `wgmma_bf16_vs_cublas` runs THIS rule, so the transfer is re-measured every
+/// round rather than trusted.
+pub fn wgmma_w1_bf16_for(m: usize, n: usize) -> &'static WgmmaCfg {
+    if m.saturating_mul(n) >= W1_CLUSTER_MIN_OUTPUT_ELEMS {
+        &WGMMA_W1_BF16_MCB_V2
+    } else {
+        &WGMMA_W1_BF16_V2
     }
 }
 
@@ -5289,7 +5333,8 @@ mod tests {
             wgmma_all_emittable().len() + 2,
             "every emittable configuration, plus the TMA stage probe and the descriptor sweep probe"
         );
-        // 5 shipped rows (W1 f16, W1 bf16, W3c, W1 + 2x1x1 A-multicast, W1 + 1x2x1 B-multicast) +
+        // 7 shipped rows (W1 f16, W1 bf16, the two bf16 v2/cluster twins, W3c, W1 + 2x1x1
+        // A-multicast, W1 + 1x2x1 B-multicast) +
         // the 8 sweep-only rows that fit shared memory (128x256 at s2 and s3 in all three cluster
         // settings, and W3c in both clustered settings) + the two bring-up probes. The two 128x256
         // rows at s5 and s6 are deliberately NOT here: they decline in `WgmmaCfg::validate` on the
@@ -5306,7 +5351,11 @@ mod tests {
         // 20 -> 21 when the measured v2 win (+25.2/+15.3/+10.1 points, 2026-08-11) made v2 the
         // SHIPPED default on both regime arms: `w1_v2` is the un-clustered v2 row the rule ships
         // below the cluster threshold, and the fourth corner of the {cluster} x {v2} square.
-        assert_eq!(mods.len(), 21);
+        // 21 -> 23 when the levers went to bf16: the scalar bf16 round measured 65.1/67.5/56.1%
+        // at the squares -- f16's pre-lever numbers to within a point or two -- so
+        // `wgmma_w1_bf16_for` ships the v2 and mcb2+v2 bf16 twins and the round re-measures the
+        // dtype transfer instead of trusting it.
+        assert_eq!(mods.len(), 23);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
