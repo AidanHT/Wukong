@@ -21232,18 +21232,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             }
 
             // --- 6d. WAVE 3's per-shape dispatcher, and what it picks HERE -----------------------
+            //
+            // The rule is printed by `wgmma_dispatch_rule_text`, NOT restated here: this header
+            // once described the pre-`6a33b6d` predicate ("the L2-roof fraction ... clears 0.78")
+            // above a table whose sq1024 row read `f_L2 0.795 ... cluster off`, i.e. it
+            // contradicted the line beneath it at the one shape the tile lever exists for. One
+            // spelling, interpolated from the dispatcher's own constants.
             eprintln!(
                 "\n---- {BENCH}: WAVE 3's per-shape dispatcher (ptx_wgmma::wgmma_dispatch) ----\n  \
-                 A PURE function of (M, N, K, sm_count): the WIDEST tile whose wave efficiency \
-                 clears 0.90; the raster iff\n  the grid is multi-wave AND the LINEAR wave \
-                 footprint blows L2; persistence iff multi-wave; the cluster iff the\n  L2-roof \
-                 fraction of the FINAL configuration clears 0.78 -- which is why gpt_d4096_up \
-                 FLIPS to the cluster\n  once the raster makes its footprint L2-resident. Each \
-                 verdict below is measured by the row named beside it,\n  at this shape, with its \
-                 own control (the_dispatcher_verdict_is_pinned_at_every_benched_shape and\n  \
-                 every_shape_the_dispatcher_selects_is_measured_at_that_shape are the device-free \
-                 laws). It DECLINES\n  rather than falling back: a fallback is how a round \
-                 publishes a configuration that never ran."
+                 {}\n  Each verdict below is measured by the row named beside it, at this shape, \
+                 with its own control\n  (the_dispatcher_verdict_is_pinned_at_every_benched_shape \
+                 and every_shape_the_dispatcher_selects_is_measured_at_that_shape\n  are the \
+                 device-free laws).",
+                crate::ptx_wgmma::wgmma_dispatch_rule_text()
             );
             for p in &points {
                 let plan = crate::ptx_wgmma::wgmma_dispatch_plan(
@@ -21268,6 +21269,40 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         eprintln!("  {:<14}   -> {} (sweep row {row})", "", c.name);
                     }
                     Err(why) => eprintln!("  {:<14}   -> DECLINES: {why}", ""),
+                }
+                // THE FLIP, SHOWN RATHER THAN ASSERTED. Where the raster fires, print the same
+                // rule's verdict with it forced off: the claim "the raster flips this shape's
+                // cluster" is a claim about two configurations, and a log that prints one of them
+                // and narrates the other is how an inert claim survives a round.
+                if plan.raster {
+                    let off = crate::ptx_wgmma::wgmma_dispatch_plan_with_raster(
+                        p.m,
+                        p.n,
+                        p.k,
+                        crate::ptx_wgmma::HOPPER_SM_COUNT,
+                        Some(false),
+                    );
+                    eprintln!(
+                        "  {:<14}   -> counterfactual, raster OFF: cluster {} (saves {:.3} vs \
+                         {:.2}, f_L2 {:.3}, footprint {:.1} MB {}) -- so the raster {} this \
+                         shape's cluster verdict",
+                        "",
+                        if off.cluster { "ON " } else { "off" },
+                        off.l2_saving,
+                        crate::ptx_wgmma::cluster_l2_saving_threshold(),
+                        off.f_l2,
+                        off.final_footprint_bytes / 1.0e6,
+                        if off.l2_resident {
+                            "resident"
+                        } else {
+                            "THRASHING"
+                        },
+                        if off.cluster == plan.cluster {
+                            "does NOT change"
+                        } else {
+                            "FLIPS"
+                        }
+                    );
                 }
             }
 
