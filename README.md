@@ -109,7 +109,25 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   int8 GEMM **~180–237× naive CUDA-C**, **95.7% of the 192 GB/s HBM peak**, and **0.76 ms cold GPU
   compile vs Triton's 30–120 s**.
 
-  > **Device scope (2026-08-06, extended 2026-08-09):** every GPU figure in the bullet above was
+  On a **datacenter part** — an **NVIDIA H100 80GB HBM3** (`sm_90a`, 132 SMs), measured 2026-08-11,
+  a *different device* from every figure above — the `wgmma` + TMA GEMM measures **95.3% / 88.6% /
+  92.3% of cuBLAS f16 (f32 out) at 2048³ / 4096³ / 8192³** and **97.3%** on the GPT FFN
+  down-projection, with **1024³ refused** because the peer's own twin arms disagreed by ±15.47%;
+  HBM copy reaches **87.2% of the 3352 GB/s spec peak**; and the **fused int8 GEMM+dequant beats the
+  cuBLAS GEMM+dequant chain 1.08–1.15× at 1024³/2048³** (the first outright peer win on Hopper — it
+  loses at 4096³, 0.79×).
+
+  > **Device scope (2026-08-11) for the H100 paragraph:** those figures are **H100 80GB HBM3**
+  > figures (Hopper, `sm_90a`, 132 SMs, 50 MiB L2, Linux container, cuBLAS with f32 output as the
+  > peer) and the 4050 figures above are not — **do not average them or carry a conclusion between
+  > them.** This visit measured that transfer failing: the 4050's int8 tuning, 96–105% of cuBLAS IMMA
+  > at 2048³ there, reads 22–52% of IMMA on the H100. The container could not lock clocks, so each
+  > round recorded its own before/after clocks and refused itself on drift — **two rounds did**, and
+  > those refusals are published. Per-shape tables, the mechanism, and a log citation for every
+  > number are in `BENCHMARKS.md` → *GPU backend (NVIDIA H100 80GB HBM3, `sm_90a`)*; the raw rounds
+  > are `bench/gpu/h100/2026-08-11-h100-w2-r*.log`.
+
+  > **Device scope (2026-08-06, extended 2026-08-09):** every *other* GPU figure in the bullet above was
   > measured on an **NVIDIA RTX 4050 Laptop GPU** (Ada, `sm_89`, **20 SMs**, 6 GB, **~192 GB/s**,
   > power-capped ~30–50 W) under **Windows/WDDM**, with only the peers that box can host — cuBLAS /
   > IMMA / cuBLASLt and cuDNN via the redistributable DLLs, NVRTC-compiled CUDA-C, and PyTorch in
