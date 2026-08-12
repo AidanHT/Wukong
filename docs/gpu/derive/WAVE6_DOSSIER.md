@@ -389,8 +389,9 @@ Three things this table says that the plan does not:
    measurement, not an implementation. It should be the *first* row of the round, because it is the
    only lever in the wave whose engineering cost is zero.
 2. **8-bit and int4 weights are the largest levers and neither has a decode call site.** This is the
-   exact defect `ACT2_WAVE_PLAN.md:33-34` records for Wave 4 (`gemm_nt_wgmma` has no product call
-   site) reappearing one wave later on a different axis: the kernels exist, the serving path calls
+   exact defect `ACT2_WAVE_PLAN.md:32-33` records for Wave 4 (`gemm_nt_wgmma` has no product call
+   site -- "the wave must include the recognizer->offload wiring or it ships a benchmark, not a
+   product surface") reappearing one wave later on a different axis: the kernels exist, the serving path calls
    `wmma_nt_f16_sm_db` unconditionally (`serving.rs:339`), and no gate can see the gap.
 3. **Wave 5 is a prerequisite for Wave 6's headline, not a sibling.** `WAVE5_DOSSIER.md` derives
    that the 8-bit `wgmma` descriptor transfers byte-for-byte at `bk * dtype.size() == 128`; the
@@ -963,7 +964,7 @@ argument, not a time argument, at 12.1% device occupancy.
 
 **And it is not even reachable.** Ping-pong is a `wgmma` schedule; the decode path calls
 `wmma_nt_f16_sm_db` (`serving.rs:339`) and no `wgmma` kernel has a decode call site
-(`ACT2_WAVE_PLAN.md:34`).
+(`ACT2_WAVE_PLAN.md:32-33`, the Wave-4 amendment: "`gemm_nt_wgmma` has no product call site").
 
 > **VERDICT: DEAD, and the trigger is RETIRED rather than deferred.** `WAVE3_DOSSIER.md:1385` should
 > gain a second reason: the decode row that its trigger names was added, and at `M <= 287` the
