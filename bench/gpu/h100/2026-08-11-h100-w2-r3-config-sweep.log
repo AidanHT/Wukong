@@ -1,0 +1,540 @@
+✓ Initialized. View run at 
+https://modal.com/apps/aidanht/main/ap-5ewKWFFetYXQYBFNKfTFfK
+✓ Created objects.
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury\tools\cloud\
+│   modal_app.py
+├── 🔨 Created mount 
+│   C:\Users\Quant\Documents\Programming\Projects\Compiler\Mercury
+├── 🔨 Created function device_info.
+├── 🔨 Created function build.
+├── 🔨 Created function build_peers.
+├── 🔨 Created function ptxas.
+├── 🔨 Created function test.
+├── 🔨 Created function bench.
+├── 🔨 Created function peers.
+├── 🔨 Created function cutlass.
+├── 🔨 Created function marlin.
+├── 🔨 Created function framework.
+└── 🔨 Created function interactive.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[meter] bench: H100 + 8.0 cpu + 16 GiB = $4.456/hr; timeout 7200s caps this call at $8.91
+[src] 810 files stamped; 0 new/changed since the last run (incremental)
+Sweep on H100 — PEER_REQUIRED=1, STRONG_PEERS=(none declared)
+[clock] lock: refused (The current user does not have permission to change clocks for GPU 00000000:40:00.0.); running unlocked -- read the per-arm [clock] lines instead
+[clock] before wgmma_config_sweep: 345 MHz, 2619 MHz, 29, 72.16 W
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu --release -- wgmma_config_sweep --ignored --nocapture --test-threads=1[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.24s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/release/deps/wukong_codegen_gpu-53f0e4b228126785)
+
+running 1 test
+
+================ wgmma_config_sweep ================
+# ---- wukong GPU round provenance (GPU_RETARGET_PLAN.md 6.1, emitted by the harness) ----
+round          : wgmma_config_sweep
+gpu            : NVIDIA H100 80GB HBM3
+compute cap    : 9.0
+SMs            : 132
+spec check     : VERIFIED against spec (132 SMs, cc 9.0; GH100 SXM5 / NVL, 16896 cores / 128)
+opt-in SMEM    : 232448 B
+L2             : 52428800 B
+VRAM           : 85017624576 B
+driver CUDA API: 13.0 (13000)
+CUDA runtime   : none linked (driver API only: PTX is JIT-loaded by the driver)
+kmd driver     : 580.95.05
+provider / SKU : n/a / n/a
+clock lock     : UNKNOWN (undeclared)
+clocks before  : sm 1980 MHz  mem 2619.0 MHz  temp 30.0 C  power 116.3 W
+peer (arms A,C): cuBLAS f16 (f32 out)
+*** CLOCKS ARE NOT LOCKED (or the lock is undeclared). Per GPU_RETARGET_PLAN.md 6.3 this round is ITERATION data, not publication data.
+plan           : 19 rows x 3 shapes, 5 recorded rounds + 1 warm-up, bar +/-5.00%, median across rounds
+wait depth     : NOT an axis. The mainloop's `wgmma.wait_group 0` sits immediately before the stage release,
+                 so its depth is pinned by the release (the buffer may not be published before its last read),
+                 not free. The lever round 1's PTX dump exposes is a RESTRUCTURING -- commit per K step and
+                 defer the release one stage, so the tensor cores are not drained to empty between stages --
+                 plus a vectorized epilogue (128 scalar predicated st.global.f32 today, pairs are adjacent).
+                 Both are follow-ups; neither is a knob this round could sweep.
+bench machine_floor: floor +0.17% (peer A-vs-C), contender spread n/a (ours), bar +/-5.00%, median of 5 rounds  [GATE SHUT: control-only round: the floor is measured, but there is no contender arm to publish]
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  probe_us                      11.481050      11.500550            n/a     +0.17%        n/a        n/a  no-contender
+
+---- wgmma_config_sweep: the configuration grid ----
+smem layout    : SmemLayout::Swizzle128 { lbo_bytes: 16, swapped: false } (every row; the reading the 2026-08-10 sweep settled on hardware)
+multicast rule : a .multicast::cluster copy of n bytes performs complete-tx of n on EVERY destination
+                 CTA's mbarrier -- it does not divide n among them -- so a c-way split multicast of the
+                 SHARED operand plus one own copy of the other is still tile_a + tile_b per CTA. All
+                 three settings therefore declare the SAME expect_tx, reached by different arithmetic.
+THE HYPOTHESIS : multicast the WIDER operand. With BW_L2 MEASURED at 7.00 TB/s (gpt_d1024_down ran
+                 597.6 TFLOP/s through I_cta 85.33), a cluster's L2 roof is BW_L2 * I_cta with
+                 I_cta = bm*bn/(bm/cm + bn/cn). At W1's 128x256 tile: no cluster 85.33 -> 597 TFLOP/s;
+                 2x1x1 multicasting A (the 128-row operand) 102.4 -> 717, which is BELOW cuBLAS's
+                 measured 838.7 at sq4096 and therefore cannot reach the peer; 1x2x1 multicasting B
+                 (the 256-wide operand) 128.0 -> 896, above the peer's whole column. Round 2 measured
+                 the A arm at +1.8 points at sq4096 and +17.0 at sq8192: real, and not the gap.
+                 The B arm is the arm under test; the A arm is the control for the axis.
+  w1_s4_off      wgmma_nt_f16_128x256x64_s4               128x256x64 s4 cluster 1x1x1 mc -, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why THE BASELINE. Rounds 1 and 2's measured row, unchanged: 128x256x64 s4, cluster 1x1x1, I_cta 85.33, L2 roof 597 TFLOP/s at the measured 7.00 TB/s. It must land near round 2's 66.3% at sq4096 / 55.2% at sq8192, or the instrument moved and no other row is readable
+  w1_s4_mcb2     wgmma_nt_f16_128x256x64_s4_mcb2          128x256x64 s4 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why THE PRIMARY. The same tile, depth, layout and register split with a 1x2x1 cluster and .multicast::cluster on B -- the WIDER operand. I_cta = 128*256/(128 + 256/2) = 128.0, L2 roof ~896 TFLOP/s, above the peer's whole column (838.7/864.3/816.4 need 6.55/6.75/6.38 TB/s of the measured 7.00). This is the arm the arithmetic says closes the gap the A arm could not
+  w1_s4_mc2      wgmma_nt_f16_128x256x64_s4_mc2           128x256x64 s4 cluster 2x1x1 mc A, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why THE CONTROL for the axis. The same tile with the cluster on the OTHER axis (2x1x1, multicast A, the 128-row operand): I_cta 102.4, roof 717 TFLOP/s -- arithmetically BELOW cuBLAS's 838.7 at sq4096. Round 2 measured it at 68.1% vs the baseline's 66.3%. Keeping it in the table is what makes the primary's delta a statement about the AXIS rather than about clustering at all
+  w1_s3_off      wgmma_nt_f16_128x256x64_s3               128x256x64 s3 cluster 1x1x1 mc -, 384 thr, 32p/232c regs | 3 stages x 49152 B + 48 B barriers = 147504 B of 232448 B (63.5%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why Depth 3 without the cluster: the control arm of the depth axis
+  w1_s3_mcb2     wgmma_nt_f16_128x256x64_s3_mcb2          128x256x64 s3 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 3 stages x 49152 B + 48 B barriers = 147504 B of 232448 B (63.5%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why Depth 3 with the B cluster. Halving B's L2 traffic shortens the fill the ring is hiding, so the depth that was right at full traffic need not be right at half -- and round 2 already measured depth 3 BEATING depth 4 at sq8192 with no cluster at all (70.4% vs 55.2%), so this axis is not decorative
+  w1_s3_mc2      wgmma_nt_f16_128x256x64_s3_mc2           128x256x64 s3 cluster 2x1x1 mc A, 384 thr, 32p/232c regs | 3 stages x 49152 B + 48 B barriers = 147504 B of 232448 B (63.5%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why Depth 3 with the A cluster: the third setting at the same depth, so 'deeper', 'clustered' and 'which operand' are three separable facts rather than one
+  w1_s2_off      wgmma_nt_f16_128x256x64_s2               128x256x64 s2 cluster 1x1x1 mc -, 384 thr, 32p/232c regs | 2 stages x 49152 B + 32 B barriers = 98336 B of 232448 B (42.3%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why Depth 2 without the cluster -- the shallow end, and the row that says how much of the deficit is fill latency at all
+  w1_s2_mcb2     wgmma_nt_f16_128x256x64_s2_mcb2          128x256x64 s2 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 2 stages x 49152 B + 32 B barriers = 98336 B of 232448 B (42.3%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why Depth 2 with the B cluster. Pairing every measurable depth at all three cluster settings is what keeps 'deeper is better' and 'this cluster is better' from being one measurement
+  w1_s2_mc2      wgmma_nt_f16_128x256x64_s2_mc2           128x256x64 s2 cluster 2x1x1 mc A, 384 thr, 32p/232c regs | 2 stages x 49152 B + 32 B barriers = 98336 B of 232448 B (42.3%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why Depth 2 with the A cluster -- the shallow end of the control axis, and round 2's worst 128x256 row (57.7% at sq4096), which is the shape of a ring too short to hide the fill it still pays for
+  w1_s5_mc2    wgmma_nt_f16_128x256x64_s5_mc2      DECLINED | 5 stages x 49152 B + 80 B barriers = 245840 B of 232448 B (105.8%)
+      ptx_wgmma::UNSUPPORTED: wgmma_nt_f16_128x256x64_s5_mc2: 245840 B of shared memory (5 stages x 49152 B + 80 B of barriers) exceeds the 232448 B per-CTA ceiling
+      why Depth 5 at 128x256. EXPECTED TO DECLINE on shared memory -- and the decline is the point: no cluster changes the ring's size, whichever operand it multicasts, so the depth axis stops at 4 for this tile at ALL THREE cluster settings
+  w1_s6_mc2    wgmma_nt_f16_128x256x64_s6_mc2      DECLINED | 6 stages x 49152 B + 96 B barriers = 295008 B of 232448 B (126.9%)
+      ptx_wgmma::UNSUPPORTED: wgmma_nt_f16_128x256x64_s6_mc2: 295008 B of shared memory (6 stages x 49152 B + 96 B of barriers) exceeds the 232448 B per-CTA ceiling
+      why Depth 6 at 128x256. Expected to decline by a wider margin, which pins the ceiling rather than leaving it at one data point
+  w3c_s6_off     wgmma_nt_f16_128x128x64_s6               128x128x64 s6 cluster 1x1x1 mc -, 384 thr, 32p/168c regs | 6 stages x 32768 B + 96 B barriers = 196704 B of 232448 B (84.6%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why D1's moderate-size arm (128x128x64 s6), which round 1 excluded because a second kernel in ITS contender arm would have been an A/B against two things at once. Here every row is scored against the same cuBLAS, so it is a row
+  w3c_s6_mcb2    wgmma_nt_f16_128x128x64_s6_mcb2          128x128x64 s6 cluster 1x2x1 mc B, 384 thr, 32p/168c regs | 6 stages x 32768 B + 96 B barriers = 196704 B of 232448 B (84.6%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why The SQUARE tile with the B cluster. At bm == bn the two axes have IDENTICAL I_cta (85.33 either way), so this row and w3c_s6_mc2 are the round's control on the claim that the axis matters only through the traffic arithmetic: a difference between them is mechanism (raster locality, multicast issue cost), not roof
+  w3c_s6_mc2     wgmma_nt_f16_128x128x64_s6_mc2           128x128x64 s6 cluster 2x1x1 mc A, 384 thr, 32p/168c regs | 6 stages x 32768 B + 96 B barriers = 196704 B of 232448 B (84.6%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why The square tile with the A cluster -- the other half of that control pair, and round 2's 56.9% at sq4096 against the un-clustered 57.5%
+  w1_mcb_v2      wgmma_nt_f16_128x256x64_s4_mcb2_v2       128x256x64 s4 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      epilogue fused st.global.v2.f32 + odd-N scalar tail | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why LEVER 1 (v2 stores). Round 1's PTX dump shows 128 scalar predicated st.global.f32 per consumer thread whose pairs are ADJACENT f32 lanes of one row: 8192 half-empty 32-byte sector requests per CTA where 4096 full ones would do. This row fuses each pair into st.global.v2.f32 and changes nothing else, so the delta against w1_s4_mcb2 is the transport
+  w1_mcb_ef      wgmma_nt_f16_128x256x64_s4_mcb2_ef       128x256x64 s4 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint C stores .L2::evict_first | timed region fill 0.01 , memset-in-region no
+      why LEVER 2a (C stores .L2::evict_first). C is written once and never read, so every C line resident in L2 evicts an operand line a neighbouring CTA is about to want. An ADVISORY hint: the hardware may ignore it, and a null result is a publishable result. The gpt_d1024 pair is the shape it was derived from (identical FLOP and identical 402.7 MB of L2 request at 3.80 vs 7.00 TB/s achieved); this round measures it on the three square shapes for comparability with rounds 1-3
+  w1_mcb_efol    wgmma_nt_f16_128x256x64_s4_mcb2_efol     128x256x64 s4 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      epilogue scalar st.global.f32 (rounds 1-3) | l2 hint C stores .L2::evict_first + TMA operands .L2::evict_last | timed region fill 0.01 , memset-in-region no
+      why LEVER 2b (C evict_first AND TMA operands evict_last). The ISA question this row had to answer first is whether a bulk-tensor copy can carry a cache policy at all: it can -- cp.async.bulk.tensor takes .L2::cache_hint plus a trailing policy operand, after ctaMask when a multicast is present. So the operand half of the lever is expressible and is measured rather than assumed away
+  w1_mcb_v2ef    wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef    128x256x64 s4 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      epilogue fused st.global.v2.f32 + odd-N scalar tail | l2 hint C stores .L2::evict_first | timed region fill 0.01 , memset-in-region no
+      why BOTH levers. Two single-fact deltas cannot say whether the levers compose -- a v2 store that halves the request count changes what the eviction hint is even about -- so composition is its own row rather than an addition performed by a reader
+  w1_mcb_nostore wgmma_nt_f16_128x256x64_s4_mcb2_nostore  128x256x64 s4 cluster 1x2x1 mc B, 384 thr, 32p/232c regs | 4 stages x 49152 B + 64 B barriers = 196672 B of 232448 B (84.6%)
+      epilogue ELIDED (diagnostic: accumulators folded, C unwritten) | l2 hint none | timed region fill 0.01 , memset-in-region no
+      why THE EPILOGUE-ELIDED DIAGNOSTIC, not a kernel: it computes the GEMM and writes no C, so (this row) - (w1_s4_mcb2) at a fixed shape IS the epilogue's cost, measured on ONE kernel instead of inferred from two shapes. The accumulators are folded into one register and stored under a predicate no u32 K can satisfy, so nothing upstream can be dead-coded and the arm cannot be mistaken for a fast kernel
+  -> 17 of 19 rows are launchable on this part (232448 B carveout). A decline is a finding: clustering does
+     not change the ring's size, so the depth axis stops at the same place at BOTH cluster settings.
+
+---- wgmma_config_sweep: correctness, before a single timed launch ----
+Every row runs at its OWN `guard_shape`: 3x3 CTAs (so a cluster on EITHER axis spans real peers AND
+rounds an odd tile count up to a pad CTA -- a shape one tile wide on an arm's own axis makes its
+multicast a copy to self and proves nothing), ktiles = stages+1 for one producer wrap, and ragged M
+AND N AND K. TWO arms: exact integers at `==` (a multicast defect is silently wrong data on half the
+accumulator rows (A arm) or half its columns (B arm), and an exact verdict localises it to a lane),
+and pseudorandom operands against an independent f64 reference at c*sqrt(K)*eps*sum|a*b|, run twice
+and demanded bit-identical -- because the exact arm is invariant under ANY reassociation and is
+therefore blind to every scheduler change waves 3-5 will make. A fast wrong kernel must not post a timing.
+  w1_s4_off      320x288x640 grid 3x3 (3x3 tiles, 5 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_s4_mcb2     320x288x640 grid 3x4 (3x3 tiles, 5 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_s4_mc2      320x288x640 grid 4x3 (3x3 tiles, 5 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_s3_off      320x224x640 grid 3x3 (3x3 tiles, 4 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.43e-5 of the f64 reference (worst lane 17573: 4.77e-6 of 2.52e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_s3_mcb2     320x224x640 grid 3x4 (3x3 tiles, 4 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.43e-5 of the f64 reference (worst lane 17573: 4.77e-6 of 2.52e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_s3_mc2      320x224x640 grid 4x3 (3x3 tiles, 4 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.43e-5 of the f64 reference (worst lane 17573: 4.77e-6 of 2.52e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_s2_off      320x160x640 grid 3x3 (3x3 tiles, 3 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.21e-5 of the f64 reference (worst lane 72925: 3.81e-6 of 1.40e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_s2_mcb2     320x160x640 grid 3x4 (3x3 tiles, 3 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.21e-5 of the f64 reference (worst lane 72925: 3.81e-6 of 1.40e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_s2_mc2      320x160x640 grid 4x3 (3x3 tiles, 3 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.21e-5 of the f64 reference (worst lane 72925: 3.81e-6 of 1.40e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w3c_s6_off     320x416x320 grid 3x3 (3x3 tiles, 7 ktiles, ragged M/N/K): EXACT on all 102400 lanes; random arm within 1.95e-5 of the f64 reference (worst lane 48182: 9.54e-6 of 5.27e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w3c_s6_mcb2    320x416x320 grid 3x4 (3x3 tiles, 7 ktiles, ragged M/N/K): EXACT on all 102400 lanes; random arm within 1.95e-5 of the f64 reference (worst lane 48182: 9.54e-6 of 5.27e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w3c_s6_mc2     320x416x320 grid 4x3 (3x3 tiles, 7 ktiles, ragged M/N/K): EXACT on all 102400 lanes; random arm within 1.95e-5 of the f64 reference (worst lane 48182: 9.54e-6 of 5.27e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_mcb_v2      320x288x640 grid 3x4 (3x3 tiles, 5 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_mcb_ef      320x288x640 grid 3x4 (3x3 tiles, 5 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_mcb_efol    320x288x640 grid 3x4 (3x3 tiles, 5 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_mcb_v2ef    320x288x640 grid 3x4 (3x3 tiles, 5 ktiles, ragged M/N/K): EXACT on all 204800 lanes; random arm within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two runs; seed 0x57455f4152455f32
+  w1_mcb_nostore wgmma_nt_f16_128x256x64_s4_mcb2_nostore: NOT GATED, and cannot be -- this row writes no C. It is a DIAGNOSTIC arm (ELIDED (diagnostic: accumulators folded, C unwritten)), and its number is only ever read as a DIFFERENCE against wgmma_nt_f16_128x256x64_s4_mcb2.
+  peer         128x256x512: matches the same f64 reference (max_abs 0.00e0) ✓
+
+---- wgmma_config_sweep: the TIMED path writes C (guard G7) ----
+  wgmma_nt_f16_128x256x64_s4_mcb2 at 320x288x640 through the timing launcher, fill 0.0078125 , memset-in-region YES: every lane is exactly K*fill^2 = 1.7578125e-2, and none still holds the pre-launch sentinel (0.025 ms/launch, not a measurement) ✓
+  memset-in-region costs +10.5% at 320x288x640 (0.0178 vs 0.0161 ms). NO row this family can express needs one today (scale-d = 0 overwrites the accumulators and the epilogue stores every lane), so none is charged -- but the price is now measured rather than assumed, and TimedRegion::for_cfg will charge it automatically the day a schedule answers otherwise.
+
+---- wgmma_config_sweep: sweeping 17 rows x 3 shapes; arms A and C are BOTH cuBLAS f16 (f32 out) (the peer twin), arm B is the row ----
+  sq2048              2048x2048x2048  1000 launches/region  [D1 5.3: 16 MiB, 0.32x L2 -- L2-resident. D1 4.5 puts W3 (128x128) here because a 256-wide tile quantizes below M*N = 4.3e6; W1 is measured here anyway, as the evidence for that claim]
+  sq4096              4096x4096x4096  146 launches/region  [D1 5.3: 64 MiB, 1.28x L2 -- the raster crossover, and the first of the two shapes D1 4.5 predicts W1 at 95-108% of cuBLAS on]
+  sq8192              8192x8192x8192  18 launches/region  [D1 5.3: 256 MiB, 5.12x L2 -- raster plus streaming C, and the second 95-108% point]
+test gpu::tests::wgmma_config_sweep ... 
+---- wgmma_config_sweep: round close ----
+# ---- wukong GPU round provenance (GPU_RETARGET_PLAN.md 6.1, emitted by the harness) ----
+round          : wgmma_config_sweep
+gpu            : NVIDIA H100 80GB HBM3
+compute cap    : 9.0
+SMs            : 132
+spec check     : VERIFIED against spec (132 SMs, cc 9.0; GH100 SXM5 / NVL, 16896 cores / 128)
+opt-in SMEM    : 232448 B
+L2             : 52428800 B
+VRAM           : 85017624576 B
+driver CUDA API: 13.0 (13000)
+CUDA runtime   : none linked (driver API only: PTX is JIT-loaded by the driver)
+kmd driver     : 580.95.05
+provider / SKU : n/a / n/a
+clock lock     : UNKNOWN (undeclared)
+clocks before  : sm 1980 MHz  mem 2619.0 MHz  temp 30.0 C  power 116.3 W
+clocks after   : sm 1980 MHz  mem 2619.0 MHz  temp 34.0 C  power 181.4 W
+sm clock drift : +0.00% (bar +/-5.00%)
+wall           : 101.3 s
+cost estimate  : n/a (set WUKONG_GPU_USD_PER_HR)
+publish gate   : OPEN (round level)
+
+---- wgmma_config_sweep: per-cell verdicts ----
+[w1_s4_off/sq2048]
+bench wgmma_config_sweep@w1_s4_off/sq2048: floor +0.42% (peer A-vs-C), contender spread +0.49% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.026056       0.026164       0.038769     +0.42%    +48.79%     +0.49%  moved
+[w1_s4_off/sq4096]
+bench wgmma_config_sweep@w1_s4_off/sq4096: floor +0.01% (peer A-vs-C), contender spread +0.23% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163941       0.163964       0.243766     +0.01%    +48.69%     +0.23%  moved
+[w1_s4_off/sq8192]
+bench wgmma_config_sweep@w1_s4_off/sq8192: floor +0.00% (peer A-vs-C), contender spread +3.94% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.263059       1.263052       2.225612     -0.00%    +76.21%     +3.94%  moved
+[w1_s4_mcb2/sq2048]
+bench wgmma_config_sweep@w1_s4_mcb2/sq2048: floor +0.51% (peer A-vs-C), contender spread +0.38% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025810       0.025943       0.041522     +0.51%    +60.88%     +0.38%  moved
+[w1_s4_mcb2/sq4096]
+bench wgmma_config_sweep@w1_s4_mcb2/sq4096: floor +0.03% (peer A-vs-C), contender spread +0.59% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163865       0.163908       0.223371     +0.03%    +36.31%     +0.59%  moved
+[w1_s4_mcb2/sq8192]
+bench wgmma_config_sweep@w1_s4_mcb2/sq8192: floor +0.02% (peer A-vs-C), contender spread +0.55% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.263291       1.263563       1.541560     +0.02%    +22.03%     +0.55%  moved
+[w1_s4_mc2/sq2048]
+bench wgmma_config_sweep@w1_s4_mc2/sq2048: floor +0.19% (peer A-vs-C), contender spread +0.32% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.026117       0.026167       0.041402     +0.19%    +58.53%     +0.32%  moved
+[w1_s4_mc2/sq4096]
+bench wgmma_config_sweep@w1_s4_mc2/sq4096: floor +0.03% (peer A-vs-C), contender spread +0.17% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163855       0.163899       0.236860     +0.03%    +44.55%     +0.17%  moved
+[w1_s4_mc2/sq8192]
+bench wgmma_config_sweep@w1_s4_mc2/sq8192: floor +0.01% (peer A-vs-C), contender spread +0.37% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.263230       1.263386       1.714677     +0.01%    +35.74%     +0.37%  moved
+[w1_s3_off/sq2048]
+bench wgmma_config_sweep@w1_s3_off/sq2048: floor +0.30% (peer A-vs-C), contender spread +0.70% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025870       0.025947       0.038437     +0.30%    +48.58%     +0.70%  moved
+[w1_s3_off/sq4096]
+bench wgmma_config_sweep@w1_s3_off/sq4096: floor +0.03% (peer A-vs-C), contender spread +0.34% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163904       0.163859       0.240518     -0.03%    +46.74%     +0.34%  moved
+[w1_s3_off/sq8192]
+bench wgmma_config_sweep@w1_s3_off/sq8192: floor +0.04% (peer A-vs-C), contender spread +0.31% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.263273       1.262743       1.739644     -0.04%    +37.71%     +0.31%  moved
+[w1_s3_mcb2/sq2048]
+bench wgmma_config_sweep@w1_s3_mcb2/sq2048: floor +0.16% (peer A-vs-C), contender spread +0.51% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025938       0.025979       0.041686     +0.16%    +60.72%     +0.51%  moved
+[w1_s3_mcb2/sq4096]
+bench wgmma_config_sweep@w1_s3_mcb2/sq4096: floor +0.05% (peer A-vs-C), contender spread +0.62% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163863       0.163938       0.230714     +0.05%    +40.80%     +0.62%  moved
+[w1_s3_mcb2/sq8192]
+bench wgmma_config_sweep@w1_s3_mcb2/sq8192: floor +0.02% (peer A-vs-C), contender spread +0.46% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.263201       1.263481       1.631917     +0.02%    +29.19%     +0.46%  moved
+[w1_s3_mc2/sq2048]
+bench wgmma_config_sweep@w1_s3_mc2/sq2048: floor +0.13% (peer A-vs-C), contender spread +0.49% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.026117       0.026084       0.041815     -0.13%    +60.11%     +0.49%  moved
+[w1_s3_mc2/sq4096]
+bench wgmma_config_sweep@w1_s3_mc2/sq4096: floor +0.07% (peer A-vs-C), contender spread +0.19% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163888       0.164010       0.242828     +0.07%    +48.17%     +0.19%  moved
+[w1_s3_mc2/sq8192]
+bench wgmma_config_sweep@w1_s3_mc2/sq8192: floor +0.00% (peer A-vs-C), contender spread +0.78% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.262973       1.262993       1.715806     +0.00%    +35.85%     +0.78%  moved
+[w1_s2_off/sq2048]
+bench wgmma_config_sweep@w1_s2_off/sq2048: floor +0.54% (peer A-vs-C), contender spread +0.18% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025849       0.025987       0.041306     +0.54%    +59.80%     +0.18%  moved
+[w1_s2_off/sq4096]
+bench wgmma_config_sweep@w1_s2_off/sq4096: floor +0.03% (peer A-vs-C), contender spread +0.15% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163848       0.163891       0.266547     +0.03%    +62.68%     +0.15%  moved
+[w1_s2_off/sq8192]
+bench wgmma_config_sweep@w1_s2_off/sq8192: floor +0.59% (peer A-vs-C), contender spread +0.27% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.271198       1.263647       1.882377     -0.59%    +48.08%     +0.27%  moved
+[w1_s2_mcb2/sq2048]
+bench wgmma_config_sweep@w1_s2_mcb2/sq2048: floor +0.59% (peer A-vs-C), contender spread +0.68% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025810       0.025963       0.047652     +0.59%    +84.62%     +0.68%  moved
+[w1_s2_mcb2/sq4096]
+bench wgmma_config_sweep@w1_s2_mcb2/sq4096: floor +0.04% (peer A-vs-C), contender spread +0.36% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163841       0.163904       0.279736     +0.04%    +70.74%     +0.36%  moved
+[w1_s2_mcb2/sq8192]
+bench wgmma_config_sweep@w1_s2_mcb2/sq8192: floor +0.28% (peer A-vs-C), contender spread +0.08% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.263309       1.259773       1.941586     -0.28%    +53.69%     +0.08%  moved
+[w1_s2_mc2/sq2048]
+bench wgmma_config_sweep@w1_s2_mc2/sq2048: floor +0.52% (peer A-vs-C), contender spread +0.48% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025770       0.025905       0.048278     +0.52%    +87.34%     +0.48%  moved
+[w1_s2_mc2/sq4096]
+bench wgmma_config_sweep@w1_s2_mc2/sq4096: floor +0.01% (peer A-vs-C), contender spread +0.77% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163874       0.163883       0.284270     +0.01%    +73.47%     +0.77%  moved
+[w1_s2_mc2/sq8192]
+bench wgmma_config_sweep@w1_s2_mc2/sq8192: floor +0.03% (peer A-vs-C), contender spread +0.07% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.263424       1.263067       1.976591     -0.03%    +56.45%     +0.07%  moved
+[w3c_s6_off/sq2048]
+bench wgmma_config_sweep@w3c_s6_off/sq2048: floor +0.07% (peer A-vs-C), contender spread +0.11% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025683       0.025665       0.043938     -0.07%    +71.08%     +0.11%  moved
+[w3c_s6_off/sq4096]
+bench wgmma_config_sweep@w3c_s6_off/sq4096: floor +0.07% (peer A-vs-C), contender spread +0.24% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163817       0.163927       0.280766     +0.07%    +71.39%     +0.24%  moved
+[w3c_s6_off/sq8192]
+bench wgmma_config_sweep@w3c_s6_off/sq8192: floor +0.64% (peer A-vs-C), contender spread +0.32% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.263128       1.271197       2.871807     +0.64%   +127.36%     +0.32%  moved
+[w3c_s6_mcb2/sq2048]
+bench wgmma_config_sweep@w3c_s6_mcb2/sq2048: floor +0.57% (peer A-vs-C), contender spread +0.35% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025674       0.025819       0.044927     +0.57%    +74.99%     +0.35%  moved
+[w3c_s6_mcb2/sq4096]
+bench wgmma_config_sweep@w3c_s6_mcb2/sq4096: floor +0.03% (peer A-vs-C), contender spread +0.28% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163973       0.163930       0.254620     -0.03%    +55.28%     +0.28%  moved
+[w3c_s6_mcb2/sq8192]
+bench wgmma_config_sweep@w3c_s6_mcb2/sq8192: floor +0.01% (peer A-vs-C), contender spread +0.33% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.263618       1.263523       1.836588     -0.01%    +45.34%     +0.33%  moved
+[w3c_s6_mc2/sq2048]
+bench wgmma_config_sweep@w3c_s6_mc2/sq2048: floor +0.11% (peer A-vs-C), contender spread +0.23% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025879       0.025908       0.047405     +0.11%    +83.18%     +0.23%  moved
+[w3c_s6_mc2/sq4096]
+bench wgmma_config_sweep@w3c_s6_mc2/sq4096: floor +0.04% (peer A-vs-C), contender spread +0.32% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163921       0.163862       0.285484     -0.04%    +74.16%     +0.32%  moved
+[w3c_s6_mc2/sq8192]
+bench wgmma_config_sweep@w3c_s6_mc2/sq8192: floor +0.01% (peer A-vs-C), contender spread +3.64% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.254969       1.255122       2.248885     +0.01%    +79.20%     +3.64%  moved
+[w1_mcb_v2/sq2048]
+bench wgmma_config_sweep@w1_mcb_v2/sq2048: floor +0.23% (peer A-vs-C), contender spread +1.42% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025748       0.025689       0.029468     -0.23%    +14.45%     +1.42%  moved
+[w1_mcb_v2/sq4096]
+bench wgmma_config_sweep@w1_mcb_v2/sq4096: floor +0.01% (peer A-vs-C), contender spread +0.64% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163863       0.163848       0.184711     -0.01%    +12.72%     +0.64%  moved
+[w1_mcb_v2/sq8192]
+bench wgmma_config_sweep@w1_mcb_v2/sq8192: floor +0.01% (peer A-vs-C), contender spread +0.17% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.271679       1.271779       1.382221     +0.01%     +8.69%     +0.17%  moved
+[w1_mcb_ef/sq2048]
+bench wgmma_config_sweep@w1_mcb_ef/sq2048: floor +0.02% (peer A-vs-C), contender spread +0.50% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025964       0.025970       0.041118     +0.02%    +58.36%     +0.50%  moved
+[w1_mcb_ef/sq4096]
+bench wgmma_config_sweep@w1_mcb_ef/sq4096: floor +0.03% (peer A-vs-C), contender spread +0.52% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163881       0.163931       0.224239     +0.03%    +36.83%     +0.52%  moved
+[w1_mcb_ef/sq8192]
+bench wgmma_config_sweep@w1_mcb_ef/sq8192: floor +0.00% (peer A-vs-C), contender spread +0.41% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.271717       1.271751       1.548421     +0.00%    +21.76%     +0.41%  moved
+[w1_mcb_efol/sq2048]
+bench wgmma_config_sweep@w1_mcb_efol/sq2048: floor +0.65% (peer A-vs-C), contender spread +0.70% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025835       0.026002       0.040991     +0.65%    +58.67%     +0.70%  moved
+[w1_mcb_efol/sq4096]
+bench wgmma_config_sweep@w1_mcb_efol/sq4096: floor +0.03% (peer A-vs-C), contender spread +0.36% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163900       0.163954       0.223538     +0.03%    +36.39%     +0.36%  moved
+[w1_mcb_efol/sq8192]
+bench wgmma_config_sweep@w1_mcb_efol/sq8192: floor +0.04% (peer A-vs-C), contender spread +0.92% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.271873       1.271387       1.547718     -0.04%    +21.69%     +0.92%  moved
+[w1_mcb_v2ef/sq2048]
+bench wgmma_config_sweep@w1_mcb_v2ef/sq2048: floor +0.03% (peer A-vs-C), contender spread +1.16% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.025805       0.025798       0.029232     -0.03%    +13.28%     +1.16%  moved
+[w1_mcb_v2ef/sq4096]
+bench wgmma_config_sweep@w1_mcb_v2ef/sq4096: floor +0.34% (peer A-vs-C), contender spread +0.62% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.164009       0.164572       0.187269     +0.34%    +14.18%     +0.62%  moved
+[w1_mcb_v2ef/sq8192]
+bench wgmma_config_sweep@w1_mcb_v2ef/sq8192: floor +0.66% (peer A-vs-C), contender spread +0.14% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.271296       1.262908       1.396325     -0.66%     +9.83%     +0.14%  moved
+[w1_mcb_nostore/sq2048]
+bench wgmma_config_sweep@w1_mcb_nostore/sq2048: floor +0.49% (peer A-vs-C), contender spread +1.31% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.026191       0.026063       0.022977     -0.49%    -12.27%     +1.31%  moved
+[w1_mcb_nostore/sq4096]
+bench wgmma_config_sweep@w1_mcb_nostore/sq4096: floor +0.09% (peer A-vs-C), contender spread +1.28% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        0.163871       0.164013       0.162121     +0.09%     -1.07%     +1.28%  tie
+[w1_mcb_nostore/sq8192]
+bench wgmma_config_sweep@w1_mcb_nostore/sq8192: floor +0.92% (peer A-vs-C), contender spread +1.58% (ours), bar +/-5.00%, median of 5 rounds
+  field                                 A              C              B      C/A-1      B/A-1   B spread  verdict
+  gemm_ms                        1.260421       1.271978       1.238418     +0.92%     -1.75%     +1.58%  moved
+
+---- wgmma_config_sweep: the published table (% of cuBLAS f16 (f32 out); higher is better) ----
+  row            kernel                                                     sq2048                   sq4096                   sq8192
+  w1_s4_off      wgmma_nt_f16_128x256x64_s4               67.2% (moved, peer +/-0.42%, ours +/-0.49%) 67.3% (moved, peer +/-0.01%, ours +/-0.23%) 56.8% (moved, peer +/-0.00%, ours +/-3.94%)
+  w1_s4_mcb2     wgmma_nt_f16_128x256x64_s4_mcb2          62.2% (moved, peer +/-0.51%, ours +/-0.38%) 73.4% (moved, peer +/-0.03%, ours +/-0.59%) 81.9% (moved, peer +/-0.02%, ours +/-0.55%)
+  w1_s4_mc2      wgmma_nt_f16_128x256x64_s4_mc2           63.1% (moved, peer +/-0.19%, ours +/-0.32%) 69.2% (moved, peer +/-0.03%, ours +/-0.17%) 73.7% (moved, peer +/-0.01%, ours +/-0.37%)
+  w1_s3_off      wgmma_nt_f16_128x256x64_s3               67.3% (moved, peer +/-0.30%, ours +/-0.70%) 68.1% (moved, peer +/-0.03%, ours +/-0.34%) 72.6% (moved, peer +/-0.04%, ours +/-0.31%)
+  w1_s3_mcb2     wgmma_nt_f16_128x256x64_s3_mcb2          62.2% (moved, peer +/-0.16%, ours +/-0.51%) 71.0% (moved, peer +/-0.05%, ours +/-0.62%) 77.4% (moved, peer +/-0.02%, ours +/-0.46%)
+  w1_s3_mc2      wgmma_nt_f16_128x256x64_s3_mc2           62.5% (moved, peer +/-0.13%, ours +/-0.49%) 67.5% (moved, peer +/-0.07%, ours +/-0.19%) 73.6% (moved, peer +/-0.00%, ours +/-0.78%)
+  w1_s2_off      wgmma_nt_f16_128x256x64_s2               62.6% (moved, peer +/-0.54%, ours +/-0.18%) 61.5% (moved, peer +/-0.03%, ours +/-0.15%) 67.5% (moved, peer +/-0.59%, ours +/-0.27%)
+  w1_s2_mcb2     wgmma_nt_f16_128x256x64_s2_mcb2          54.2% (moved, peer +/-0.59%, ours +/-0.68%) 58.6% (moved, peer +/-0.04%, ours +/-0.36%) 65.1% (moved, peer +/-0.28%, ours +/-0.08%)
+  w1_s2_mc2      wgmma_nt_f16_128x256x64_s2_mc2           53.4% (moved, peer +/-0.52%, ours +/-0.48%) 57.6% (moved, peer +/-0.01%, ours +/-0.77%) 63.9% (moved, peer +/-0.03%, ours +/-0.07%)
+  w3c_s6_off     wgmma_nt_f16_128x128x64_s6               58.5% (moved, peer +/-0.07%, ours +/-0.11%) 58.3% (moved, peer +/-0.07%, ours +/-0.24%) 44.0% (moved, peer +/-0.64%, ours +/-0.32%)
+  w3c_s6_mcb2    wgmma_nt_f16_128x128x64_s6_mcb2          57.1% (moved, peer +/-0.57%, ours +/-0.35%) 64.4% (moved, peer +/-0.03%, ours +/-0.28%) 68.8% (moved, peer +/-0.01%, ours +/-0.33%)
+  w3c_s6_mc2     wgmma_nt_f16_128x128x64_s6_mc2           54.6% (moved, peer +/-0.11%, ours +/-0.23%) 57.4% (moved, peer +/-0.04%, ours +/-0.32%) 55.8% (moved, peer +/-0.01%, ours +/-3.64%)
+  w1_mcb_v2      wgmma_nt_f16_128x256x64_s4_mcb2_v2       87.4% (moved, peer +/-0.23%, ours +/-1.42%) 88.7% (moved, peer +/-0.01%, ours +/-0.64%) 92.0% (moved, peer +/-0.01%, ours +/-0.17%)
+  w1_mcb_ef      wgmma_nt_f16_128x256x64_s4_mcb2_ef       63.1% (moved, peer +/-0.02%, ours +/-0.50%) 73.1% (moved, peer +/-0.03%, ours +/-0.52%) 82.1% (moved, peer +/-0.00%, ours +/-0.41%)
+  w1_mcb_efol    wgmma_nt_f16_128x256x64_s4_mcb2_efol     63.0% (moved, peer +/-0.65%, ours +/-0.70%) 73.3% (moved, peer +/-0.03%, ours +/-0.36%) 82.2% (moved, peer +/-0.04%, ours +/-0.92%)
+  w1_mcb_v2ef    wgmma_nt_f16_128x256x64_s4_mcb2_v2_ef    88.3% (moved, peer +/-0.03%, ours +/-1.16%) 87.6% (moved, peer +/-0.34%, ours +/-0.62%) 91.0% (moved, peer +/-0.66%, ours +/-0.14%)
+  w1_mcb_nostore wgmma_nt_f16_128x256x64_s4_mcb2_nostore  114.0% (moved, peer +/-0.49%, ours +/-1.31%) 101.1% (tie, peer +/-0.09%, ours +/-1.28%) 101.8% (moved, peer +/-0.92%, ours +/-1.58%)
+      ^ NOT A KERNEL. This row writes no C; its percentage is meaningless on its own and must only ever be read as a DIFFERENCE against wgmma_nt_f16_128x256x64_s4_mcb2 at the same shape. See wgmma_k_sweep, which is what it exists for.
+  w1_s5_mc2    wgmma_nt_f16_128x256x64_s5_mc2                   DECLINED
+      5 stages x 49152 B + 80 B barriers = 245840 B of 232448 B (105.8%)  |  ptx_wgmma::UNSUPPORTED: wgmma_nt_f16_128x256x64_s5_mc2: 245840 B of shared memory (5 stages x 49152 B + 80 B of barriers) exceeds the 232448 B per-CTA ceiling
+  w1_s6_mc2    wgmma_nt_f16_128x256x64_s6_mc2                   DECLINED
+      6 stages x 49152 B + 96 B barriers = 295008 B of 232448 B (126.9%)  |  ptx_wgmma::UNSUPPORTED: wgmma_nt_f16_128x256x64_s6_mc2: 295008 B of shared memory (6 stages x 49152 B + 96 B of barriers) exceeds the 232448 B per-CTA ceiling
+
+---- wgmma_config_sweep: RANKED at sq4096 (the first of D1 4.5's two prediction points) ----
+   1. w1_mcb_v2      88.7%  BEST of this round
+   2. w1_mcb_v2ef    87.6%  -1.3% vs the best row
+   3. w1_s4_mcb2     73.4%  -17.3% vs the best row
+   4. w1_mcb_efol    73.3%  -17.4% vs the best row
+   5. w1_mcb_ef      73.1%  -17.6% vs the best row
+   6. w1_s3_mcb2     71.0%  -19.9% vs the best row
+   7. w1_s4_mc2      69.2%  -22.0% vs the best row
+   8. w1_s3_off      68.1%  -23.2% vs the best row
+   9. w1_s3_mc2      67.5%  -23.9% vs the best row
+  10. w1_s4_off      67.3%  -24.2% vs the best row
+  11. w3c_s6_mcb2    64.4%  -27.4% vs the best row
+  12. w1_s2_off      61.5%  -30.7% vs the best row
+  13. w1_s2_mcb2     58.6%  -34.0% vs the best row
+  14. w3c_s6_off     58.3%  -34.2% vs the best row
+  15. w1_s2_mc2      57.6%  -35.0% vs the best row
+16. w3c_s6_mc2     57.4%  -35.3% vs the best row
+  17.     --unresolved (the control floor did not clear the bar)
+  HEADLINE: the TESTED HYPOTHESIS is `multicast the wider operand`. At the measured BW_L2 of 7.00 TB/s,
+  a 1x2x1 cluster multicasting B gives I_cta = 128*256/(128 + 256/2) = 128.0 and an L2 roof of ~896
+  TFLOP/s, above the peer's measured 838.7 at ; the 2x1x1 A-multicast control gives
+  I_cta 102.4 and 717 TFLOP/s, which is arithmetically below it. At sq4096, of cuBLAS f16 (f32 out)67.73.%   (+1 points vs baseline)
+    control  (2x1x1, A)        2%   (+19+. points),
+  because they differ in exactly one fact: which grid axis the cluster pairs and therefore which
+  operand is multicast.
+
+---- wgmma_config_sweep: WAVE 2's levers, at sq4096 (each vs w1_s4_mcb2, the round-3 winner) ----
+  Both are ADVISORY in different senses. The v2 store is a transport change with an arithmetic
+  mechanism behind it (8192 half-empty 32-byte sector requests per CTA become 4096 full ones); the
+  cache hints are hardware SUGGESTIONS the L2 may ignore outright. Per the wave plan's standing rule
+  5, a NULL result on a hint is a publishable result -- and a gain inside the contender's own spread
+  is not a result at all (G16), which is why every cell above prints both noises.
+w1_mcb_v2                               88.+15.734w1_mcb_ef                    73%   (-0. points vs the winner's 73.4%)
+  w1_mcb_efol    C evict_first + operands evict_last   73.-073.4%)
+  w1_mcb_v2ef    both levers                       87.%   (14. points vs the winner's .%)
+
+---- wgmma_config_sweep: the shipped regime rule (ptx_wgmma::wgmma_w1_for) ----
+  A static two-way split on round 3's one measured sign change, AWAITING WAVE 3's real per-shape
+  dispatcher (which will also choose the TILE -- this rule only ever returns a 128x256 row). Both
+  arms stay in the table above, so the next round re-measures the split instead of inheriting it.
+           M*N =        ->  wgmma_nt_f16_128x256x64_s4
+       16777216  ->             67108864  ->  
+
+---- wgmma_config_sweep: DIAGNOSTIC absolutes (NOT publishable; clock-dependent) ----
+  row          shape          peer ms     peer TFLOP/s ours TFLOP/s
+         0.0261      0.0388    659.3    443.1
+     sq4096           0.1639       0.2438      838.3        w1_s4_off   sq8192 
+  w1_s4_mcb2   sq2048        0.0258   0.0415     665.6        413.8
+  w1_s4_mcb2   sq4096           0.1639             838.7        615.3
+  w1_s4_mcb2   sq8192      1.2633        870.4    713.2
+  w1_s4_mc2               0.0414      657.8    415.0
+  w1_s4_mc2    sq4096           0.1639       0.2369       838.8     
+            1.2632          870.4        641.2
+w1_s3_off    sq2048         0.0259       0.0384        664.1      447.0  w1_s3_off  sq4096      0.1639    0.2405        838.5      571.4                           632.0  w1_s3_mcb2  sq2048          0.0417        662.3        412.1
+  w1_s3_mcb2   sq4096       0.1639     0.2307          
+    sq8192          1.6319       870.4        673.8
+  w1_s3_mc2    sq2048           0.0261       0.0418              
+                 0.2428        838.6        566.0
+  w1_s3_mc2 sq8192       1.2630     1.7158        870.6        640.8
+  w1_s2_off    sq2048           0.0258       0.0413                415.9
+  w1_s2_off            0.2665      838.8        
+             1.2712    1.8824          
+    sq2048        0.0477       665.6    360.5w1_s2_mcb2         0.1638   0.2797     838.9     491.3  w1_s2_mcb2 sq8192       1.2633     1.9416      870.3        566.3
+  w1_s2_mc2    sq2048           0.0258       0.0483      666.7       w1_s2_mc2  sq4096           0.1639       0.2843       838.7     483.5                 1.9766   870.3    556.3  w3c_s6_off sq2048                    668.9      391.0  w3c_s6_off sq4096        0.1638    0.2808      839.0        489.5
+  w3c_s6_off   sq8192           1.2631     2.8718    870.5        382.9
+  w3c_s6_mcb2  sq2048           0.0257          669.2    382.4
+   sq4096          0.1640       0.2546        838.2     539.8  w3c_s6_mcb2 sq8192           1.8366    870.1     598.7  w3c_s6_mc2        0.0259     0.0474        663.9
+  w3c_s6_mc2        0.1639     0.2855        838.4        481.4
+  w3c_s6_mc2   sq8192               2.2489           
+  w1_mcb_v2    sq2048               0.0295        
+  w1_mcb_v2    sq4096           0.1639     0.1847    838.7      744.1
+w1_mcb_v2    sq8192           1.2717       1.3822             795.5
+   sq2048         0.0260       0.0411        661.7     417.8
+            0.1639         838.6       612.9  w1_mcb_ef    sq8192        1.2717   1.5484     864.6        710.1
+  w1_mcb_efol  sq2048           0.0258     0.0410         419.1    sq4096           0.1639
+          1.2719           864.5      710.4
+  w1_mcb_v2ef  sq2048        0.0258      0.0292        665.8        587.7
+  w1_mcb_v2ef  sq4096           0.1640       0.1873        838.0        733.9
+  w1_mcb_v2ef sq8192         1.2713       1.3963      864.9     
+   sq2048     0.0262      0.0230        655.9      747.7   sq4096    0.1639    0.1621      847.8
+  w1_mcb_nostore sq8192         1.2604      1.2384        872.3        887.8
+=============================================================
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 562 filtered out; finished in 102.21s
+
+[1m[92m   Doc-tests[0m wukong_codegen_gpu
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m-> ok in 104.2s[0m
+[clock] after wgmma_config_sweep: 1980 MHz, 2619 MHz, 31, 141.19 W
+[meter] bench: 106.5s wall = $0.132 (record this in the round log)
+✓ App completed. View run at 
+https://modal.com/apps/aidanht/main/ap-5ewKWFFetYXQYBFNKfTFfK
