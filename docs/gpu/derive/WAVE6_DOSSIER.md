@@ -445,6 +445,16 @@ At `Bcap = 64`, **four of the six launches cover under half the machine and two 
     roof  = I * BW
 ```
 
+**That `I` has two readings and this section uses both, each in the conservative direction.** The
+*exact* `I` at the `wq` decode shape (`N = K = 4096`) is
+`I(M) = 33,554,432*M / (33,554,432 + 24,576*M)` -- what the first two rows of the table below report.
+The *asymptotic* `I ~ M` is what turns an intensity threshold back into a **batch**, and because
+`I(M) < M` at every finite `M`, the batch it names is always the **lower** one: reading a crossover
+asymptotically understates how far the bandwidth-bound region reaches. So `M x BW` is an **upper
+bound** on the exact roof rather than an equality, every "below `M*` the roof is `M x BW`" statement
+below holds a fortiori, and the two are labelled wherever both appear (section 10.4 does the exact
+solve for the 4-bit case and this section states its f16 twin beside the asymptotic band).
+
 **The denominator this table divides into is a BAND, and it is stated as one because section 2.5(3)
 refuses the spec sheet on the bandwidth axis and the same refusal has to apply on the compute axis.**
 The campaign's f16 tensor peak, **989 TFLOP/s**, is a *spec-sheet* number and is stamped as such in
@@ -475,14 +485,24 @@ crossover:
 
 | M | I (FLOP/B) | roof at 2922.3 GB/s | % of 838.7 (measured) | % of 989 (spec sheet) |
 |---|---|---|---|---|
-| 64 | 61.13 | **178.6 TFLOP/s** | **21.3%** | **18.1%** |
-| 256 | 215.6 | **630.0 TFLOP/s** | 75.1% | 63.7% |
-| **287.0** | 287.0 | 838.7 TFLOP/s | **100% -- crossover, measured end** | 84.8% |
-| 338.4 | 338.4 | 989 TFLOP/s | 117.9% | **100% -- crossover, spec end** |
+| 64 (exact `I`) | 61.13 | **178.6 TFLOP/s** | **21.3%** | **18.1%** |
+| 256 (exact `I`) | 215.6 | **630.0 TFLOP/s** | 75.1% | 63.7% |
+| **287.0** (asymptotic; exact shape **363.4**) | 287.0 | 838.7 TFLOP/s | **100% -- crossover, measured end** | 84.8% |
+| 338.4 (asymptotic; exact shape **449.9**) | 338.4 | 989 TFLOP/s | 117.9% | **100% -- crossover, spec end** |
+
+The first two rows carry the exact `I`; the two crossover rows are the **asymptotic** reading -- they
+report the intensity threshold `I* = peak / BW` (287.0 and 338.4 FLOP/B) as a batch through `I ~ M`.
+Solving the exact `I(M) = I*` at the same shape puts the crossover at `M = 363.4` (measured end) and
+`M = 449.9` (spec end). That is section 10.4's solve in f16-batch units and not a second model:
+`I_int4(M) = I_f16(4M)` holds exactly at this shape, so 10.4's `90.8` and `112.5` are these two
+divided by four.
 
 > **DERIVED, and it is the load-bearing statement of section 4: below `M = 287` the decode
 > projection GEMM's ceiling is `M x BW_HBM`, a function of the batch and the bandwidth alone. No
-> tile shape, schedule, raster, cluster or epilogue appears in it.** At `Bcap = 64` the ceiling is
+> tile shape, schedule, raster, cluster or epilogue appears in it.** `M x BW_HBM` is the asymptotic
+> form and therefore an *upper* bound on the exact ceiling (`I(M) < M`), which only strengthens the
+> statement: the exact roof at `M = 287` is 693 TFLOP/s, still under the measured 838.7. At
+> `Bcap = 64` the ceiling is
 > 21.3% of the rate cuBLAS actually reaches on this part (18.1% of the spec peak); the tensor cores
 > are idle four fifths of the time *by arithmetic*, and that is correct behaviour, not a defect. The
 > only two things that move it are fewer weight bytes (section 3) and more rows per weight read (a
@@ -491,9 +511,13 @@ crossover:
 **No verdict in this dossier moves with the band; one margin does.** Every batch this wave runs --
 `B = 16`, `B = 64`, `Bcap = 256` -- is below **287**, the conservative end, so "small-batch decode is
 bandwidth-bound" holds under either denominator, and so does every lever verdict that rests on it
-(10.1, 10.2, 10.4, 10.5). What narrows is the headroom at the top of the sweep: `Bcap = 256` sits
-**24.4%** below the spec-end crossover and only **10.8%** below the measured-end one. That is exactly
-the margin the round exists to test, so `d3_gemmbw` and `s3_goodput` are read against **287**.
+(10.1, 10.2, 10.4, 10.5). What narrows is the headroom at the top of the sweep, and it is quoted at
+the **exact** shape so that it is the same number 10.4 gives for the same operating point:
+`Bcap = 256` sits **43.1%** below the spec-end crossover (449.9) and **29.5%** below the measured-end
+one (363.4) -- the identical pair 10.4 reports at `M = 64` against 112.5 and 90.8, since
+`I_int4(M) = I_f16(4M)`. (Read asymptotically the same two margins are 24.4% and 10.8%; the exact
+pair is the publishable one, and no verdict turns on which.) That is exactly the margin the round
+exists to test, so `d3_gemmbw` and `s3_goodput` are read against **287**.
 **`M* = 338.4` may be quoted as the campaign's decode constant only with the stamp on it**; the 51
 rows between 287 and 338 are the width of this campaign's own ignorance of its f16 peak, and closing
 them is a measurement (a peak-f16 arm), not an argument.
@@ -1426,7 +1450,7 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 | Stream-K is HELD OUT at `:186`: "wave quantization is only ~3% once W3's persistence lands ... and **G2+G7 must be green first**" | true for the GEMM suite, false for decode: **6 of 6 decode GEMMs are below 0.90 wave efficiency, 5 below 0.50.** The plan's precondition has two halves and BOTH are discharged, neither dropped: workspace/determinism by 10.2's five-gate table and G-W6-4, and `G2+G7` by the round logs (G2's random arm green at `r10:100-103`; G7 live per row at `r10:74` with its price measured at `r3-config-sweep:183`, +10.5%). **PROMOTE to Wave 6 rank 2**, gated on one bandwidth measurement, **with G7 charged inside `a4_splitk`'s timed region** -- split-K is the first schedule this campaign has that needs a zeroed buffer |
 | Machete W4A16 is HELD OUT at `:189` as measure-only, sweep `M = 1/16/128`, "**expect and publish a loss at M>=128 and a tie at M=1**" | **expectation UPHELD, sweep EXTENDED -- and this row is the amendment.** With 4-bit weights `I ~ 4M`, so the roof crosses the f16 peak asymptotically at `M = 71.8` (measured 838.7) to `84.6` (spec 989) and at the exact `wq` shape at `M = 90.8` to `112.5`: the both-sides-bandwidth-bound band ends near `M = 64`, not `M = 32`, at BOTH ends of 4.2's denominator band, and `M >= 128` stays the pre-registered LOSS. `p3_marlin` runs `M = 1/16/64/128/256` -- a **superset** keeping both plan anchors and adding the wave's own decode batches. The 2.118x of section 2.3 is an internal product ratio, not a Machete number |
 | target-table row 6: "1.6-2.0x from coalescing compounded with a 4x (8B) / 8x (70B) read-amplification removal" | both factors are re-derived above and neither survives as stated. The row's honest content is the **int8/fp8-KV prize** and the **capacity** result of 2.4 |
-| the plan and WAVE3 divide by a single f16 tensor peak, 989 TFLOP/s (`WAVE3_DOSSIER.md:30`) | that is a **spec-sheet** denominator, and 2.5(3) already refuses the spec sheet on the bandwidth axis. Paired with the repo's own measured 838.7 TFLOP/s at sq4096 it makes the decode crossover a **band, `287 <= M* <= 338`**, of which this dossier quotes the conservative end. **No verdict moves across the band** -- every batch here is <= 256 -- but the `Bcap = 256` headroom is 10.8%, not 24.4%, and the W4A16 crossover is `M = 90.8`, not 112.5. Closing the band is a peak-f16 measurement, not an argument |
+| the plan and WAVE3 divide by a single f16 tensor peak, 989 TFLOP/s (`WAVE3_DOSSIER.md:30`) | that is a **spec-sheet** denominator, and 2.5(3) already refuses the spec sheet on the bandwidth axis. Paired with the repo's own measured 838.7 TFLOP/s at sq4096 it makes the decode crossover a **band, `287 <= M* <= 338`**, of which this dossier quotes the conservative end. **No verdict moves across the band** -- every batch here is <= 256 -- but the `Bcap = 256` headroom is 29.5%, not 43.1% (4.2's exact-shape crossovers 363.4 / 449.9; 10.8% vs 24.4% if the crossover is read asymptotically, and 4.2 now labels which is which), and the W4A16 crossover is `M = 90.8`, not 112.5. Closing the band is a peak-f16 measurement, not an argument |
 | (absent from the plan) | **int8 KV is a feasibility lever on H100**: `Bcap=64 x 8192` is 77.00 GiB of a 79.18 GiB part at f16 and 46.00 GiB at int8 |
 | (absent from the plan) | **merged QKV**: 3 launches -> 1, bit-exact by construction, no numerical precondition |
 | (absent from the plan) | **the decode path never touches `wgmma`** (`serving.rs:339`), so Waves 3/4/5 reach serving only through a wiring change nobody has scheduled -- the same defect the plan already records for `gemm_nt_wgmma` |
