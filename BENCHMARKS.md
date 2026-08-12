@@ -2084,11 +2084,31 @@ in one round
 ([`...-r3-config-sweep.log`](bench/gpu/h100/2026-08-11-h100-w2-r3-config-sweep.log), gate OPEN, drift
 +0.00%). One axis moved, and it was the epilogue:
 
-| sweep row | sq2048 | sq4096 | sq8192 |
+**Every row in this sweep is the CLUSTERED `_mcb2` arm**, which is *not* the arm the shipped rule
+selects at `sq2048` — read the box under the table before carrying any cell of it across to the
+suite table above.
+
+| sweep row (all `1×2×1` B-multicast cluster) | sq2048 | sq4096 | sq8192 |
 |---|---|---|---|
 | `..._s4_mcb2` — scalar `st.global.f32` epilogue | 62.2% | 73.4% | 81.9% |
-| `..._s4_mcb2_v2` — fused `st.global.v2.f32` (**shipped**) | **87.4%** | **88.7%** | **92.0%** |
+| `..._s4_mcb2_v2` — fused `st.global.v2.f32` | **87.4%** | **88.7%** | **92.0%** |
 | delta | **+25.2 pts** | **+15.3 pts** | **+10.1 pts** |
+| *is this the shipped arm at this shape?* | **no** — the rule picks un-clustered `..._s4_v2` | **yes** | **yes** |
+
+> **⚠ Two different f16 `sq2048` percentages appear in this section, and they are two different
+> kernels.** `wgmma_w1_for(m, n)` (`crates/wukong_codegen_gpu/src/ptx_wgmma.rs`) returns the clustered
+> `WGMMA_W1_MCB_V2` only at or above `W1_CLUSTER_MIN_OUTPUT_ELEMS = 8_000_000` output elements;
+> `sq2048` is 2048·2048 = 4.19e6, so the shipped arm there is the **un-clustered**
+> `wgmma_nt_f16_128x256x64_s4_v2`. The crate's own test asserts exactly that
+> (`wgmma_w1_for(2048, 2048).name == WGMMA_W1_V2.name`), and `r10` names the arm per shape in its log
+> (`sq2048 … arm B = wgmma_nt_f16_128x256x64_s4_v2`). So the **95.3%** in the suite table is the
+> un-clustered arm and the **87.4%** in this table is the clustered one — same shape, same peer,
+> different kernels, different rounds. `r3` contains **no un-clustered `_v2` row at all**, so the
+> +25.2-point delta at `sq2048` is a clustered-vs-clustered measurement of an arm that does not ship
+> at that shape, and the store lever's effect on the arm that *does* ship there has never been
+> isolated. At `sq4096` and `sq8192` the clustered arm **is** the shipped one and the rows read
+> straight across (88.7 / 92.0 here against 88.6 / 92.3 in the suite — two rounds, inside their
+> floors).
 
 Same tile, same stage count, same cluster, same mainloop: the accumulator pair at `+0/+4` leaves as
 one 8-byte store instead of two 4-byte ones, which is the difference between issuing half-empty
@@ -2107,7 +2127,8 @@ Three further readings from the same sweep, recorded so they are not re-run:
 - **The L2 evict hints are a publishable null.** `_v2_ef` (`.L2::evict_first` on the C stores,
   evict-last on the TMA operand loads) reads 88.3% / 87.6% / 91.0% against plain `_v2`'s 87.4% /
   88.7% / 92.0% — inside the floor at every shape, in both directions. Measured, no effect, done.
-- **No non-epilogue axis in the sweep beat the shipped rule at any of the three shapes**: stage
+- **No non-epilogue axis in the sweep beat the winning row (`..._s4_mcb2_v2`) at any of the three
+  shapes**: stage
   depths 2 and 3, the A-multicast cluster variant, and the 128×128×64 s6 tile all score below it
   everywhere (the 128×128 tile's best row is 68.8% at sq8192 against 92.0%). Two 5- and 6-stage rows
   `DECLINED` outright rather than being launched, because 245,840 B and 295,008 B of ring exceed the
@@ -2115,15 +2136,25 @@ Three further readings from the same sweep, recorded so they are not re-run:
 
 ### Where the remaining gap is (a diagnostic, not a kernel)
 
-The same sweep carries a `_nostore` arm: the shipped kernel with the C stores removed. It writes no
-output, therefore **cannot be correctness-gated and is not a kernel**; its percentage is meaningless
-alone and is only ever read as a difference. It scores **114.0% / 101.1% / 101.8%** of cuBLAS at
-sq2048 / sq4096 / sq8192 (`...-r3-config-sweep.log`). Read as a difference, that says the mainloop by
-itself is at or above the peer at every measured shape, and the entire published gap is epilogue plus
-wave overhead rather than the inner loop. The round that would have priced that epilogue in
-microseconds — a K-sweep at fixed M=N=2048 against the same elided arm, which measures the split on
-*one* kernel instead of inferring it from two shapes — **refused itself on clock drift**, so no
-microsecond price is published here.
+The same sweep carries a `_nostore` arm: **the clustered `..._s4_mcb2_v2` arm with its C stores
+removed** — not "the shipped kernel", because at `sq2048` the shipped kernel is the un-clustered arm
+and no store-elided twin of *that* was ever built or run. It writes no output, therefore **cannot be
+correctness-gated and is not a kernel**; its percentage is meaningless alone and, per the rule the
+log itself prints, is only ever read as a difference **against the clustered arm at the same shape**.
+It scores **114.0% / 101.1% / 101.8%** of cuBLAS at sq2048 / sq4096 / sq8192
+(`...-r3-config-sweep.log`), against that arm's own **87.4% / 88.7% / 92.0%**.
+
+Read that way it says the mainloop by itself is at or above the peer at all three swept shapes, and
+that the store-and-wave tail costs the clustered arm **26.6 / 12.4 / 9.8 points** there. At `sq4096`
+and `sq8192` the clustered arm *is* the shipped one, so that carries straight to the published 88.6%
+/ 92.3% and locates the whole remaining gap in the epilogue plus wave overhead rather than the inner
+loop. **At `sq2048` it does not carry**: both the diagnostic and its reference are the clustered arm,
+while the published 95.3% is the un-clustered one, so the 114.0% reading explains the 87.4% clustered
+row and says nothing directly about the 4.7 points still owed by the arm that ships at that shape.
+The round that would have priced the epilogue in microseconds — a K-sweep at fixed M=N=2048 against
+the same elided arm, which measures the split on *one* kernel instead of inferring it from two shapes
+— **refused itself on clock drift**, so no microsecond price is published here, and no store-elided
+reading exists for the un-clustered arm or for any of the three `gpt_*` shapes.
 
 ### Refusals — the rows and rounds that published nothing
 
