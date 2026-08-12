@@ -8640,7 +8640,14 @@ mod tests {
         // `w3d_s4_v2`, the NEW m64n64k16 128x64 family that is the only lever in wave 3 which
         // moves sq1024. The dispatcher must land on a REAL emitted module or decline loudly, so
         // every verdict it can reach is a module the census assembles before an H100 is rented.
-        const EXPECTED_MODULES: usize = 124;
+        // 124 -> 128 on 2026-08-12 with WAVE 3 lever 4, the mainloop drain: the fence-hoist row
+        // (4b, free), the depth-1 arm at the shipped 128x256 s4 tile (4c, whose SIGN is the
+        // question and which is budgeted at ZERO), the square tile's v2 twin -- which exists only
+        // so that diagnostic is ONE fact from its control -- and depth 1 on that 6-stage ring,
+        // where the derivation says the depth can be afforded. `WgmmaCfg::drain_tag` carries both
+        // fields into `derived_name`, so no shipped row's key moves and each new arm is its own
+        // module.
+        const EXPECTED_MODULES: usize = 128;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -18479,8 +18486,31 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             "the hang diagnosis must not use `eprintln!` — libtest buffers it until a test that will \
              never finish finishes, so the watchdog would kill the process with no output at all"
         );
+        // **E4.3 -- the deadlock time-box, stated over the arms that can newly deadlock.** Wave 3
+        // lever 4's `wait_depth > 0` mainloop is the first configuration in this family whose
+        // *mis-lag* is a hang rather than a wrong number: the producer waits forever on an
+        // `empty[s]` arrival the consumer's tail never made. `WgmmaCfg::validate` rejecting
+        // `stages < wait_depth + 2` (law L4.4) is the DESIGN that makes the backstop unnecessary;
+        // this is the backstop. It is a scan, not a whitelist -- but a scan is only a law if the
+        // corpus it ranges over is non-empty, and both correctness launchers a depth arm reaches
+        // (`gemm_nt_wgmma`, and the warm-up of `time_gemm_nt_wgmma_in`) must be in it.
+        assert!(
+            crate::ptx_wgmma::wgmma_all_emittable()
+                .iter()
+                .any(|c| c.wait_depth > 0),
+            "no emittable row carries wait_depth > 0, so E4.3's clause below is about a corpus that \
+             does not exist and wave 3 lever 4 is not in the family at all"
+        );
+        assert!(
+            boxed_only.iter().any(|n| n == "gemm_nt_wgmma")
+                && warmup_boxed.iter().any(|n| n == "time_gemm_nt_wgmma_in"),
+            "every launch a wait_depth arm can take -- the correctness gates' `gemm_nt_wgmma` and \
+             the timing launcher's warm-up -- must be inside the watchdog: a wrong lag HANGS, and a \
+             hang on rented silicon bills to the container timeout with no log"
+        );
         eprintln!(
-            "[gate] {} sm_90a launchers drain through sync_within (default deadline {} ms) \u{2713}",
+            "[gate] {} sm_90a launchers drain through sync_within (default deadline {} ms), \
+             including every path a wait_depth arm can take \u{2713}",
             want.len(),
             DEFAULT_LAUNCH_TIMEOUT_MS
         );
@@ -19253,7 +19283,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 win.stages
             );
             let (m, n) = (win.bm, win.bn);
-            for tiles_k in [1usize, 2, win.stages, win.stages + 1, 4 * win.stages] {
+            // **E4.1.** The ladder is `ptx_wgmma::drain_k_ladder`, not a literal list, because wave
+            // 3's lagged release changes behaviour at two K values the old list reached neither of:
+            // `ktiles <= wait_depth`, where the mainloop releases no stage at all and `CDRAIN` is
+            // the only thing that frees the ring, and `stages - 1`, the iteration before the wrap,
+            // where `%rel` and `%stg` wrap on DIFFERENT iterations. Both rungs are the identity at
+            // the depth-0 row this stage runs -- which is the point: the ladder is a function of the
+            // configuration, so the depth arms' own gate (`wgmma_drain_depth_gate`) and this one
+            // cannot drift into two different ideas of where a ring boundary is.
+            for tiles_k in crate::ptx_wgmma::drain_k_ladder(win) {
                 let k = tiles_k * win.bk;
                 let (a, b) = bringup_operands(m, n, k, win.dtype);
                 assert!(
@@ -19787,6 +19825,115 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// * **arm 2, run twice, verdict bit-identical** (G8) — a nondeterministic reduction is still
     ///   bit-identical over exact integers, so only the random arm can catch one.
     ///
+    /// **E4.2, and E4.1 at a depth that can see it: a `wait_depth > 0` arm is BIT-IDENTICAL to its
+    /// full-drain twin, at every ring boundary, on both operand arms.**
+    ///
+    /// # Why bit-identity is the RIGHT verdict here, and a tolerance is the wrong one
+    ///
+    /// The drain restructuring reassociates nothing. The same `BK/16` `wgmma` accumulate into the
+    /// same registers in the same K order; all that moves is *when* the buffer they read is
+    /// published back to the producer. So the depth arm must agree with the depth-0 kernel bit for
+    /// bit, and `c*sqrt(K)*eps` would be the wrong gate twice over: it would pass a lag that let the
+    /// producer refill a stage whose `wgmma` had not retired -- a whole stage of *early* operands is
+    /// still a plausible float -- and the exact-integer arm alone is structurally weak here, because
+    /// an exact-integer sum is invariant under any reassociation and therefore cannot see a
+    /// scheduling change at all. Hence both arms, and `==` between kernels rather than against a
+    /// reference.
+    ///
+    /// # Why the K ladder, and why it costs no host reference
+    ///
+    /// [`crate::ptx_wgmma::drain_k_ladder`] brackets the two places the lag changes behaviour:
+    /// `ktiles <= wait_depth`, where the mainloop's `@%p3` is false on every iteration and `CDRAIN`
+    /// is the only thing that frees the ring, and `stages - 1`, where `%rel` and `%stg` wrap on
+    /// different iterations. Neither is reachable at the K values the pre-timing shape happens to
+    /// use. The verdict is device-against-device, so no `M*N*K` f64 loop is paid for any of it --
+    /// the f64 reference arm already ran, once, in [`wgmma_pretiming_guard`].
+    ///
+    /// Returns the number of launches, for the round log. Zero at `wait_depth == 0`, where the row
+    /// is its own twin and the comparison would pass by construction.
+    fn wgmma_drain_depth_gate(
+        g: &mut Gpu,
+        cfg: &'static crate::ptx_wgmma::WgmmaCfg,
+        label: &str,
+    ) -> usize {
+        use crate::ptx_wgmma::{
+            bringup_operands, drain_k_ladder, guard_shape, random_operands, wgmma_full_drain_twin,
+            RANDOM_ARM_SEED,
+        };
+        if cfg.wait_depth == 0 {
+            return 0;
+        }
+        let twin = wgmma_full_drain_twin(cfg).unwrap_or_else(|| {
+            panic!(
+                "{label}: {} waits to depth {} and the family ships no emittable full-drain twin \
+                 for it, so the one gate that can see a stage refilled early has nothing to compare \
+                 against. A depth arm must never post a timing without it (WAVE3_DOSSIER 4.7's \
+                 refusal).",
+                cfg.name, cfg.wait_depth
+            )
+        });
+        let gs = guard_shape(cfg);
+        let (m, n) = (gs.m, gs.n);
+        let ladder = drain_k_ladder(cfg);
+        let mut launches = 0usize;
+        for &tiles_k in &ladder {
+            let k = tiles_k * cfg.bk;
+            for (arm, (a, b)) in [
+                ("exact", bringup_operands(m, n, k, cfg.dtype)),
+                (
+                    "random",
+                    random_operands(m, n, k, cfg.dtype, RANDOM_ARM_SEED),
+                ),
+            ] {
+                let got = gemm_nt_wgmma(g, cfg, &a, &b, m, k, n).unwrap_or_else(|e| {
+                    panic!("{label}: {} at {m}x{k}x{n} ({arm} arm): {e}", cfg.name)
+                });
+                let base = gemm_nt_wgmma(g, twin, &a, &b, m, k, n).unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: the full-drain twin {} at {m}x{k}x{n} ({arm} arm): {e}",
+                        twin.name
+                    )
+                });
+                launches += 2;
+                if got != base {
+                    let bad = got.iter().zip(&base).filter(|(x, y)| x != y).count();
+                    panic!(
+                        "{label}: {} is NOT bit-identical to its full-drain twin {} at \
+                         {m}x{k}x{n} ({tiles_k} ktiles vs {} stages, depth {}, {arm} arm): {bad} of \
+                         {} lanes differ, max_abs {:.3e}.\n  The two kernels issue the same \
+                         wgmma over the same K order and differ only in WHEN a stage's `empty` \
+                         barrier is signalled, so any difference at all is the release lag. \
+                         {tiles_k} <= {} means the mainloop released NO stage inside the loop and \
+                         CDRAIN freed the whole ring; {tiles_k} > {} means the ring wrapped with \
+                         %rel and %stg on different iterations. A lag SMALLER than the depth is \
+                         this wave's silent corruption -- the producer refills a buffer whose \
+                         wgmma has not retired -- and it is exactly what this reads as.",
+                        cfg.name,
+                        twin.name,
+                        cfg.stages,
+                        cfg.wait_depth,
+                        got.len(),
+                        crate::diff::err_stats(&got, &base).max_abs,
+                        cfg.wait_depth,
+                        cfg.stages - 1
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "  {:<14} {} (depth {}, ring {}): BIT-IDENTICAL to {} on every ktiles in {ladder:?} at \
+             {}, on the exact-integer ramp AND the pseudorandom arm ({launches} launches, seed \
+             {RANDOM_ARM_SEED:#x})",
+            label,
+            cfg.name,
+            cfg.wait_depth,
+            cfg.stages,
+            twin.name,
+            gs.dims()
+        );
+        launches
+    }
+
     /// Returns the number of lanes checked, for the round log.
     fn wgmma_pretiming_guard(
         g: &mut Gpu,
@@ -19898,6 +20045,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             want.len(),
             coeff
         );
+        // --- arm 3: the drain's own gate (E4.2), on the rows that have a drain -------------------
+        //
+        // It lives HERE rather than in a test of its own because WAVE3_DOSSIER 4.7's refusal is
+        // about *publishing*: "any depth arm published without its bit-identity result against the
+        // D = 0 twin". A separate gate is one somebody can forget to run before a round; a clause
+        // of the pre-timing guard is one no round can reach a timing without. It is the identity on
+        // every row that shipped before wave 3 lever 4.
+        wgmma_drain_depth_gate(g, cfg, label);
         want.len()
     }
 
@@ -21620,6 +21775,38 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             guard.contains("guard_shape(cfg)"),
             "the guard's shape must come from the one authority"
         );
+        // **E4.2's refusal, as a law about the source.** A depth arm may not post a timing without
+        // its bit-identity result against the D = 0 twin, so the guard every round already goes
+        // through must be the thing that runs it -- a gate in a test of its own is a gate a round
+        // can be run without.
+        assert!(
+            guard.contains("wgmma_drain_depth_gate(g, cfg, label)"),
+            "the pre-timing guard must delegate to the drain gate: WAVE3_DOSSIER 4.7 refuses any \
+             depth arm published without its bit-identity result against the full-drain twin, and \
+             a separate gate is one a round can simply not run"
+        );
+        let (_, drain) = fns
+            .iter()
+            .find(|(n, _)| n == "wgmma_drain_depth_gate")
+            .expect("the drain gate exists");
+        for need in [
+            // The twin comes from the geometry, never from a name written twice.
+            "wgmma_full_drain_twin(cfg)",
+            // Both boundaries of the ring, from the one ladder the bring-up also uses.
+            "drain_k_ladder(cfg)",
+            // BOTH operand arms: the exact-integer sum is invariant under reassociation and is
+            // therefore the structurally weaker of the two here.
+            "bringup_operands(m, n, k, cfg.dtype)",
+            "random_operands(m, n, k, cfg.dtype, RANDOM_ARM_SEED)",
+            // ...and the verdict is `!=` between two kernels, not a tolerance against a reference.
+            "if got != base {",
+        ] {
+            assert!(
+                drain.contains(need),
+                "the drain gate must use `{need}` -- without it the verdict is about something \
+                 other than the release lag"
+            );
+        }
     }
 
     /// **The G7 knob is read from the config, not from a habit**, and the timed path checks that it

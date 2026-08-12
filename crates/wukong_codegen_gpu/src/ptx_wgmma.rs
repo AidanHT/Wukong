@@ -3469,6 +3469,85 @@ pub const WGMMA_W1_V2: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1
 };
 
+// --- wave 3 lever 4: the mainloop drain -----------------------------------------------------------
+//
+// **Budgeted at ZERO.** Fit C priced the ring stage `wait_depth = 1` costs at 9.2% (`S(s3) = 0.7056`
+// against `S(s4) = 0.6460`) against a drain-to-issue bubble worth 13.3-20.0% of a stage -- the
+// bracket being the width of the unlocked-clock ambiguity -- so the net is between +0.5% and -7.7%
+// and the SIGN is the question. 128x256 s5 declines on shared memory, so the stage cannot be bought
+// back. These rows are emitted and measured; nothing is budgeted for them.
+
+/// **4b alone: `wgmma.fence.sync.aligned` hoisted out of the k-loop. The free row.**
+///
+/// CUTLASS fences around the mainloop, not per k-tile, and the ISA only requires the fence to order
+/// the accumulator registers against the async proxy *before the first group*: nothing between
+/// k-stages writes them, and the epilogue only reads. So the hoist costs zero registers, zero ring
+/// depth and one instruction out of the drain-to-issue bubble, and it may buy a second-order win in
+/// how `ptxas` schedules across the loop back-edge (a per-iteration fence invites it to treat the
+/// accumulators conservatively there).
+///
+/// Predicted: small and positive, or zero. It is its own row rather than folded into the depth arm
+/// because "the fence moved" and "the depth moved" are two facts, and the depth arm carries both.
+pub const WGMMA_W1_MCB_V2_FH: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_fh",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_fh",
+    fence_hoisted: true,
+    ..WGMMA_W1_MCB_V2
+};
+
+/// **4c: wait to depth 1 and release the stage one group back.** The arm whose SIGN is the question.
+///
+/// The `0` in today's `wgmma.wait_group.sync.aligned 0` is not a tuning knob -- the release
+/// PUBLISHES the buffer to the producer, so it may not precede the last read of it, and any depth
+/// above 0 *at that position* is a correctness bug rather than a faster kernel. The lever is a
+/// RESTRUCTURING: wait to depth `D` and release the stage that is `D` groups old, both from
+/// [`WgmmaCfg::release_lag`] so they cannot disagree.
+///
+/// The price is ring depth, and it is measured rather than argued: at `D = 0` the consumer holds one
+/// buffer and the producer can be `stages - 1 = 3` ahead; at `D = 1` it holds two and the producer
+/// can be 2 ahead -- **exactly the prefetch depth of `D = 0` at 3 stages**, which Fit C measured at
+/// a 9.2% per-stage penalty. Against a bubble of 13.3-20.0% the net is +0.5% to -7.7%, and which
+/// end it lands on also resolves whether the device is running at the reported 1980 MHz or the
+/// 1.8288 GHz the 989 TFLOP/s denominator implies.
+///
+/// It carries the fence hoist, which is why `mcb_v2_fh` exists: without that row this one would be
+/// two facts off its control.
+pub const WGMMA_W1_MCB_V2_D1: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_d1",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_d1",
+    wait_depth: 1,
+    fence_hoisted: true,
+    ..WGMMA_W1_MCB_V2
+};
+
+/// The square tile's v2 twin -- **the control the depth diagnostic below needs**, and nothing else.
+///
+/// [`WGMMA_W3C_MCB`] carries the scalar store rounds 1-3 measured. Scoring the 128x128 depth arm
+/// against it would put two facts (the transport and the depth) in one difference, which is the
+/// error this whole table is arranged to avoid, so the v2 twin ships as its own row.
+pub const WGMMA_W3C_MCB_V2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x128x64_s6_mcb2_v2",
+    key: "wgmma_nt_f16_128x128x64_s6_mcb2_v2",
+    epilogue: EpilogueStore::V2,
+    ..WGMMA_W3C_MCB
+};
+
+/// **THE DIAGNOSTIC that makes the depth pair interpretable: depth 1 where the ring can AFFORD it.**
+///
+/// At 128x256 the ring is 4 stages, so `D = 1` takes the producer's run-ahead from 3 to 2. At
+/// 128x128 it is 6, so the same depth takes it from 5 to 4 -- a 20% cut instead of a 33% one, and
+/// well clear of the point where the fill stops being hidden. If `mcb_v2_d1` LOSES at s4 and this
+/// row WINS at s6, the mechanism is ring depth and the lever belongs to whatever tile has a spare
+/// stage, not to the depth itself. If both lose, the bubble is smaller than the clock ambiguity
+/// allows and the lever is dead at every tile this family can emit.
+pub const WGMMA_W3C_MCB_V2_D1: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x128x64_s6_mcb2_v2_d1",
+    key: "wgmma_nt_f16_128x128x64_s6_mcb2_v2_d1",
+    wait_depth: 1,
+    fence_hoisted: true,
+    ..WGMMA_W3C_MCB_V2
+};
+
 /// The round-3 winner with `.L2::evict_first` on the C stores (wave-2 lever 2, half of it).
 pub const WGMMA_W1_MCB_EF: WgmmaCfg = WgmmaCfg {
     name: "wgmma_nt_f16_128x256x64_s4_mcb2_ef",
@@ -3834,6 +3913,49 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
               tile. Whatever this row moves against w1_v2 is X_fill and nothing else. sq2048 is \
               its single-wave control, where it must tie w1_v2 exactly",
     },
+    // --- wave 3 lever 4: the mainloop drain, budgeted at ZERO --------------------------------------
+    SweepRow {
+        label: "w1_mcb_v2_fh",
+        cfg: &WGMMA_W1_MCB_V2_FH,
+        shapes: WGMMA_DRAIN_SHAPES,
+        why: "WAVE 3 LEVER 4b, THE FREE ROW (wgmma.fence hoisted out of the k-loop). CUTLASS fences \
+              around the mainloop, not per k-tile, and the ISA only asks that the fence order the \
+              accumulators against the async proxy BEFORE the first group -- nothing between \
+              k-stages writes them. Zero registers, zero ring depth, one instruction out of the \
+              drain-to-issue bubble. Predicted small-and-positive or zero; a MEASURABLE move means \
+              ptxas was being conservative across the loop back-edge, which is the evidence that \
+              would make 4a's address hoist worth a census",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_d1",
+        cfg: &WGMMA_W1_MCB_V2_D1,
+        shapes: WGMMA_DRAIN_SHAPES,
+        why: "WAVE 3 LEVER 4c (wait to depth 1, release one stage back). The SIGN is the question, \
+              and the derivation brackets it at -7.7% to +0.5%: the bubble between the last wgmma \
+              of a stage retiring and the first of the next issuing is 13.3-20.0% of a stage (the \
+              width of the unlocked-clock ambiguity), and the ring depth it costs was MEASURED at \
+              9.2% by Fit C, because D=1 at 4 stages has exactly the prefetch depth of D=0 at 3. \
+              128x256 s5 declines on shared memory, so the stage cannot be bought back. Its \
+              control is w1_mcb_v2_fh, one fact away; nothing is budgeted for it",
+    },
+    SweepRow {
+        label: "w3c_mcb_v2",
+        cfg: &WGMMA_W3C_MCB_V2,
+        shapes: &["sq8192"],
+        why: "The square tile's v2 twin, and the CONTROL the depth diagnostic below needs: \
+              w3c_s6_mcb2 carries the scalar store rounds 1-3 measured, so scoring the 128x128 \
+              depth arm against it would put the transport and the depth in one difference",
+    },
+    SweepRow {
+        label: "w3c_mcb_v2_d1",
+        cfg: &WGMMA_W3C_MCB_V2_D1,
+        shapes: &["sq8192"],
+        why: "WAVE 3 LEVER 4c, THE DIAGNOSTIC: depth 1 where the ring can AFFORD it. At 128x256 s4 \
+              the depth takes the producer's run-ahead from 3 to 2; at 128x128 s6 it takes it from \
+              5 to 4. If w1_mcb_v2_d1 loses and this row WINS, the mechanism is ring depth and the \
+              lever belongs to whatever tile has a spare stage rather than to the depth itself. \
+              sq8192 alone, where the mainloop is longest and a per-stage effect is largest",
+    },
 ];
 
 /// **The K sweep: one tile, one output shape, K as the only axis.** Wave 2's third measurement.
@@ -3983,6 +4105,12 @@ pub const WGMMA_PERSIST_SHAPES: &[&str] =
 /// 132 and a 128x64 one is 128, and `sq2048`, where the narrower tile must LOSE -- which is what
 /// makes the wave-efficiency rule a rule rather than a fit to one point.
 pub const WGMMA_TILE_DISPATCH_SHAPES: &[&str] = &["sq1024", "sq2048"];
+
+/// The mainloop drain's shapes (WAVE3_DOSSIER 4.7). `sq8192` has the longest mainloop, so the
+/// per-stage term dominates and `X` is only 15% of the tile; `gpt_d1024_up` has the shortest, where
+/// the per-stage term is 44% of the tile -- so a per-stage effect must SHRINK from the first to the
+/// last or it is not a per-stage effect. `sq4096` sits between them and turns two points into three.
+pub const WGMMA_DRAIN_SHAPES: &[&str] = &["sq8192", "sq4096", "gpt_d1024_up"];
 
 /// The cluster PREDICATE's shapes (WAVE3_DOSSIER 3.8): the two single-wave-or-L2-bound shapes where
 /// the cluster is the sole variable. `gpt_d1024_down` sits exactly at the 7.00 TB/s roof by
@@ -4317,6 +4445,87 @@ pub fn guard_n_tiles(cfg: &WgmmaCfg) -> usize {
     } else {
         need
     }
+}
+
+// --- the mainloop drain's exactness ladder and its full-drain twin (E4.1, E4.2) --------------------
+
+/// **E4.1: the `ktiles` ladder a drain arm must be exact at**, derived from the ring rather than
+/// written down.
+///
+/// # The two places a lagged release changes behaviour, and why neither is visible today
+///
+/// `wgmma.wait_group.sync.aligned D` retires all but the `D` most recent committed groups, so the
+/// depth arm differs from its full-drain twin at exactly two K values and the bring-up's old ladder
+/// (`1, 2, stages, stages+1, 4*stages`) reaches neither on purpose:
+///
+/// * **`ktiles <= wait_depth`.** The mainloop's `@%p3` guard is false on every iteration, so no
+///   stage is released *inside* the loop at all and `CDRAIN` is the only thing that frees the ring.
+///   At `ktiles < wait_depth` the tail even releases a stage the producer never refilled -- harmless
+///   exactly once, and a double release if the tail were written from `%stg` instead of `%rel`.
+/// * **`stages - 1`, the iteration before the ring wraps**, where `%rel` and `%stg` wrap on
+///   *different* iterations because they are `stages - D` apart. A ladder that only samples the wrap
+///   itself cannot see an off-by-one in which of the two wrapped first.
+///
+/// So the ladder is the dossier's `{1, 2, wait_depth, wait_depth+1, stages-1, stages, stages+1,
+/// 2*stages+1}` **plus `4*stages`**, which is what the bring-up already ran: E4.1 says *extend*, and
+/// a ladder that quietly dropped the several-wraps rung would be a narrowing wearing an extension's
+/// name. Deduplicated and sorted, with the degenerate `0` dropped -- at `K == 0` no `wgmma` issues,
+/// the accumulators are never written and [`gpu::gemm_nt_wgmma`](crate::gpu::gemm_nt_wgmma) rejects
+/// the call outright, so it is a different gate's question.
+pub fn drain_k_ladder(cfg: &WgmmaCfg) -> Vec<usize> {
+    // `validate` rejects `stages < wait_depth + 2`, so `stages >= 2` and `stages - 1` cannot wrap.
+    let mut v = vec![
+        1,
+        2,
+        cfg.wait_depth,
+        cfg.wait_depth + 1,
+        cfg.stages - 1,
+        cfg.stages,
+        cfg.stages + 1,
+        2 * cfg.stages + 1,
+        4 * cfg.stages,
+    ];
+    v.retain(|&t| t >= 1);
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// **E4.2's twin: the same kernel at `wait_depth = 0`**, found by GEOMETRY over
+/// [`wgmma_all_emittable`] and never from a hand-written name table.
+///
+/// # Why the twin, and not a tolerance against an f64 reference
+///
+/// The drain restructuring reassociates **nothing**: the same `wgmma_per_stage()` instructions
+/// accumulate into the same registers in the same K order, and only the point at which the buffer
+/// they read is published back to the producer moves. So the right verdict is `==` against the
+/// depth-0 kernel, bit for bit -- a `c*sqrt(K)*eps` arm would pass a drain change that corrupted a
+/// whole stage, because a stage of operands that arrived early is still a plausible float.
+///
+/// # Which twin, when the family ships two candidates
+///
+/// The preferred one carries the **same** [`WgmmaCfg::fence_hoisted`] setting, so the pair is ONE
+/// fact apart and its timing is readable as the depth alone. The opposite-fence row is the
+/// fallback, because the family does not ship an `_fh` row at every tile -- and it is an equally
+/// valid *bit-identity* twin, since `wgmma.fence.sync.aligned` is a memory-ordering directive that
+/// cannot move a bit. Returns `None` at `wait_depth == 0`, where the row IS its own twin.
+///
+/// Looking it up by the key [`WgmmaCfg::derived_name`] produces is the same discipline the
+/// dispatcher uses: a second spelling of a name is a second place for the table to drift.
+pub fn wgmma_full_drain_twin(cfg: &WgmmaCfg) -> Option<&'static WgmmaCfg> {
+    if cfg.wait_depth == 0 {
+        return None;
+    }
+    let mut want = *cfg;
+    want.wait_depth = 0;
+    want.fence_hoisted = cfg.fence_hoisted;
+    let same_fence = want.derived_name();
+    want.fence_hoisted = !cfg.fence_hoisted;
+    let other_fence = want.derived_name();
+    let all = wgmma_all_emittable();
+    [same_fence, other_fence]
+        .into_iter()
+        .find_map(|k| all.iter().copied().find(|c| c.key == k.as_str()))
 }
 
 // --- the pseudorandom arm (guard G2) --------------------------------------------------------------
@@ -6986,7 +7195,13 @@ mod tests {
         // family -- 32 accumulator registers per consumer thread instead of 128 and a 98 368 B
         // ring instead of 196 672 -- and it is the only thing in wave 3 that moves sq1024, where
         // a 128x256 tile is 32 CTAs of 132.
-        assert_eq!(mods.len(), 30);
+        // 30 -> 34 on 2026-08-12 with WAVE 3 lever 4, the mainloop drain: `w1_mcb_v2_fh` (4b, the
+        // free row -- the fence hoisted out of the k-loop), `w1_mcb_v2_d1` (4c at the shipped
+        // tile, whose SIGN is the question), `w3c_mcb_v2` (the square tile's v2 twin, which
+        // exists ONLY so the diagnostic below is one fact from its control rather than two) and
+        // `w3c_mcb_v2_d1` (depth 1 where the 6-stage ring can afford it). `drain_tag` puts both
+        // fields in `derived_name`, so each is its own module and its own cache key.
+        assert_eq!(mods.len(), 34);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -8821,6 +9036,310 @@ mod tests {
         }
     }
 
+    /// **Laws L4.2 and L4.3: the depth and the released stage come from ONE function, and the
+    /// release is textually AFTER the wait that licenses it.**
+    ///
+    /// # Why these two are one test
+    ///
+    /// They are the two halves of the same hazard, and it is the silent one of this wave. The
+    /// release PUBLISHES a buffer to the producer, so it may not precede the last read of it. A lag
+    /// SMALLER than the depth (or a release that drifted above the `wait_group`) lets the producer
+    /// refill a stage whose `wgmma` has not retired: wrong operands, at full speed, with no error
+    /// anywhere and nothing in a tolerance gate that could see it. A lag LARGER than the depth is
+    /// merely slow.
+    ///
+    /// The law is stated by GENERATING the release the config implies and demanding the emitted
+    /// text contain exactly that one -- not by pattern-matching a spelling, which is how the second
+    /// copy of a hand-written eight-instruction `cvta`/`mapa`/`arrive` sequence gets to disagree
+    /// with the first. It also demands the un-lagged spelling is ABSENT at depth > 0, because that
+    /// is precisely the corruption: the same instructions, on `%stg` instead of `%rel`.
+    #[test]
+    fn the_mainloop_release_is_paired_with_its_wait_and_ordered_after_it() {
+        for c in wgmma_all_emittable() {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            let lag = c.release_lag();
+            assert_eq!(
+                lag, c.wait_depth,
+                "{}: L4.2 -- one function, both sites",
+                c.name
+            );
+            // The k-stage body: from the loop label to whichever label the loop exits to.
+            let body_at = ptx
+                .find(&format!("CLOOP_{}:", c.name))
+                .expect("every entry has a k-loop");
+            let end_at = ptx
+                .find(&format!(
+                    "{}_{}:",
+                    if lag > 0 { "CDRAIN" } else { "CEND" },
+                    c.name
+                ))
+                .expect("the k-loop exits somewhere");
+            let body = &ptx[body_at..end_at];
+            // --- L4.2, the pairing ---------------------------------------------------------------
+            let want = if lag > 0 {
+                stage_release_ptx(c, "%rel", Some("%p3"))
+            } else {
+                stage_release_ptx(c, "%stg", None)
+            };
+            assert_eq!(
+                body.matches(&want).count(),
+                1,
+                "{}: the mainloop must release exactly the stage WgmmaCfg::release_lag names",
+                c.name
+            );
+            assert_eq!(
+                body.matches(&format!("wgmma.wait_group.sync.aligned {lag};"))
+                    .count(),
+                1,
+                "{}: ...and wait to exactly that depth, once",
+                c.name
+            );
+            if lag > 0 {
+                assert!(
+                    !body.contains(&stage_release_ptx(c, "%stg", None)),
+                    "{}: at depth {lag} the mainloop must NOT also release the stage it is issuing \
+                     against -- that is a producer refilling a buffer whose wgmma has not retired",
+                    c.name
+                );
+                assert!(
+                    body.contains(&format!("setp.ge.u32 %p3,%kt,{lag};")),
+                    "{}: the first {lag} iterations have no older group to retire",
+                    c.name
+                );
+                // `%rel` starts `stages - lag` behind `%stg`, so its first advance lands on the
+                // stage this tile's `%kt = 0` issued against. A one-tile kernel can spell that as
+                // a literal; a persistent one must derive it from the `%stg` it CARRIES across the
+                // tile boundary, or the tail of tile `t` and the head of tile `t+1` disagree about
+                // which buffer is free.
+                let back = c.stages - lag;
+                assert!(
+                    ptx.contains(&format!("mov.u32 %rel,{back};"))
+                        || ptx.contains(&format!("add.u32 %rel,%stg,{back};")),
+                    "{}: %rel must be initialised {back} stages behind %stg",
+                    c.name
+                );
+            }
+            // --- L4.3, the ordering --------------------------------------------------------------
+            let wait_at = body
+                .find(&format!("wgmma.wait_group.sync.aligned {lag};"))
+                .expect("asserted above");
+            let rel_at = body.find(&want).expect("asserted above");
+            assert!(
+                wait_at < rel_at,
+                "{}: the stage release must be textually AFTER the wait_group that retires the \
+                 group reading it",
+                c.name
+            );
+            // ...and nothing may arrive between the first `wgmma` of a group and the
+            // `commit_group` that closes it: the group is not yet a group until then, so a
+            // release there is licensed by a wait for a DIFFERENT group.
+            let mma_at = body
+                .find("wgmma.mma_async.sync.aligned.")
+                .expect("a k-stage body issues wgmma");
+            let commit_at = body
+                .find("wgmma.commit_group.sync.aligned;")
+                .expect("...and closes the group");
+            assert!(mma_at < commit_at, "{}", c.name);
+            assert!(
+                !body[mma_at..commit_at].contains("mbarrier.arrive"),
+                "{}: an mbarrier.arrive inside the open group",
+                c.name
+            );
+        }
+    }
+
+    /// **Laws L4.6 and L4.7: the epilogue drains before it stores, and exactly one fence precedes
+    /// the first `wgmma`.**
+    ///
+    /// L4.6 is stated over the store CLASS -- anything whose opcode starts `st.`, plus a
+    /// bulk-tensor store -- rather than over `st.global.f32`, because wave 4's TMA-store epilogue
+    /// would otherwise delete the law along with the instruction it named. What it protects is the
+    /// only thing that makes reading the accumulators legal at all: the ISA forbids the warp
+    /// reading a `wgmma` D register between the issue and its matching `wait_group`.
+    ///
+    /// L4.7 is positional, and its two halves are different claims. A fence deleted entirely is a
+    /// register / async-proxy race that no exactness gate on a quiescent kernel would catch, so at
+    /// least one must precede the first `wgmma.mma_async`. And when [`WgmmaCfg::fence_hoisted`] is
+    /// set it must be OUTSIDE the k-loop body -- a hoist that left the fence inside the loop would
+    /// measure as "the free lever does nothing", which is a plausible result and a wrong one.
+    #[test]
+    fn the_epilogue_drains_before_its_first_store_and_one_fence_precedes_the_first_wgmma() {
+        for c in wgmma_all_emittable() {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            // --- L4.6 ------------------------------------------------------------------------------
+            let stores = store_class_instructions(&ptx);
+            if c.epilogue.is_diagnostic_only() {
+                // The elided arm keeps ONE unreachable store to hold the accumulators live; it is
+                // still a store-class instruction and still sits after the drain.
+                assert_eq!(stores.len(), 1, "{}", c.name);
+            } else {
+                assert!(
+                    !stores.is_empty(),
+                    "{}: an epilogue that stores nothing",
+                    c.name
+                );
+            }
+            let first_store = ptx
+                .find(&stores[0].text)
+                .expect("the scan found it in this text");
+            let last_drain = ptx
+                .rfind("wgmma.wait_group.sync.aligned 0;")
+                .expect("the epilogue drains to 0");
+            assert!(
+                last_drain < first_store,
+                "{}: the last wgmma.wait_group 0 must precede the first store-class instruction -- \
+                 reading a D register before its group retires is what the ISA forbids",
+                c.name
+            );
+            // --- L4.7 ------------------------------------------------------------------------------
+            let fence = "wgmma.fence.sync.aligned;";
+            assert_eq!(ptx.matches(fence).count(), 1, "{}", c.name);
+            let fence_at = ptx.find(fence).expect("asserted above");
+            let first_mma = ptx
+                .find("wgmma.mma_async.sync.aligned.")
+                .expect("this family issues wgmma");
+            assert!(
+                fence_at < first_mma,
+                "{}: the fence orders the accumulator registers against the async proxy and must \
+                 precede the first issue",
+                c.name
+            );
+            let cloop_at = ptx
+                .find(&format!("CLOOP_{}:", c.name))
+                .expect("every entry has a k-loop");
+            assert_eq!(
+                fence_at < cloop_at,
+                c.fence_hoisted,
+                "{}: fence_hoisted = {} but the fence is {} the k-loop body",
+                c.name,
+                c.fence_hoisted,
+                if fence_at < cloop_at {
+                    "above"
+                } else {
+                    "inside"
+                }
+            );
+        }
+    }
+
+    /// **The device-free half of E4.1 and E4.2: the ladder reaches the ring boundaries, and every
+    /// depth arm has a full-drain twin that differs from it in NOTHING but the drain.**
+    ///
+    /// # Why this is a CPU law about two device gates
+    ///
+    /// Both exactness gates are launches, and a launch that is quietly gating nothing looks exactly
+    /// like a launch that is gating something. Two ways that happens here, and both are checked on
+    /// this side of the wire:
+    ///
+    /// * **A vacuous ladder.** [`drain_k_ladder`] is a function of the ring, so a future
+    ///   `wait_depth` that happened to equal `stages - 1` would collapse two rungs into one and the
+    ///   `ktiles <= wait_depth` boundary -- the whole reason E4.1 exists -- would stop being
+    ///   sampled. So the ladder is asserted to bracket the depth from BOTH sides and to bracket the
+    ///   wrap from both sides, per row.
+    /// * **A twin that is not a twin.** [`wgmma_full_drain_twin`] resolves by the key
+    ///   [`WgmmaCfg::derived_name`] produces, so a row whose geometry drifted would silently
+    ///   resolve to a different kernel and E4.2 would report "bit-identical" about a comparison it
+    ///   never made. The check is not a field-by-field list -- which a new field would escape --
+    ///   but the strongest statement available: **put the depth arm's drain fields back onto the
+    ///   twin and the emitted text must be the depth arm's, byte for byte.** Anything else that
+    ///   differed between them would survive that substitution and show up as a text mismatch.
+    #[test]
+    fn every_wait_depth_arm_has_a_ring_boundary_ladder_and_a_full_drain_twin() {
+        let mut depth_arms = 0usize;
+        for c in wgmma_all_emittable() {
+            let ladder = drain_k_ladder(c);
+            assert!(
+                ladder.windows(2).all(|w| w[0] < w[1]),
+                "{}: the ladder must be sorted and deduplicated -- a repeated rung is a launch that \
+                 pays for nothing",
+                c.name
+            );
+            assert!(
+                ladder.iter().all(|&t| t >= 1),
+                "{}: ktiles 0 issues no wgmma at all and the launcher rejects it",
+                c.name
+            );
+            for want in [1, 2, c.stages - 1, c.stages, c.stages + 1, 2 * c.stages + 1] {
+                assert!(
+                    ladder.contains(&want),
+                    "{}: the ladder must reach ktiles {want} (ring {} stages): {ladder:?}",
+                    c.name,
+                    c.stages
+                );
+            }
+            // Both sides of the ring wrap, and -- when there is a depth -- both sides of it.
+            assert!(ladder.iter().any(|&t| t < c.stages) && ladder.iter().any(|&t| t > c.stages));
+            if c.wait_depth == 0 {
+                assert!(
+                    wgmma_full_drain_twin(c).is_none(),
+                    "{}: a full-drain row IS its own twin, and handing E4.2 a self-comparison would \
+                     make it pass by construction",
+                    c.name
+                );
+                continue;
+            }
+            depth_arms += 1;
+            assert!(
+                ladder.iter().any(|&t| t <= c.wait_depth),
+                "{}: the ladder must reach ktiles <= wait_depth {}, where the mainloop releases NO \
+                 stage and CDRAIN is the only thing that frees the ring: {ladder:?}",
+                c.name,
+                c.wait_depth
+            );
+            assert!(
+                ladder.iter().any(|&t| t > c.wait_depth),
+                "{}: ...and past it, or the two sides of the boundary are never compared",
+                c.name
+            );
+            let twin = wgmma_full_drain_twin(c).unwrap_or_else(|| {
+                panic!(
+                    "{}: wait_depth {} has no emittable full-drain twin, so E4.2 -- the only gate \
+                     that can see a stage the producer refilled early -- has nothing to compare \
+                     against. Ship the depth-0 row before the depth row, never after.",
+                    c.name, c.wait_depth
+                )
+            });
+            assert_eq!(
+                twin.wait_depth, 0,
+                "{}: the twin must be the full drain",
+                c.name
+            );
+            assert_ne!(
+                twin.key, c.key,
+                "{}: the twin must be its OWN module -- `Gpu::function` caches on the key alone and \
+                 never re-examines the PTX on a hit",
+                c.name
+            );
+            // THE substitution: the twin with this row's drain fields put back must BE this row.
+            let mut probe = *twin;
+            probe.wait_depth = c.wait_depth;
+            probe.fence_hoisted = c.fence_hoisted;
+            probe.name = c.name;
+            probe.key = c.key;
+            let got = wgmma_module(&probe, &license()).unwrap_or_else(|e| {
+                panic!(
+                    "{}: the twin {} differs from it in more than the drain -- putting the drain \
+                     back does not even produce an emittable configuration: {e}",
+                    c.name, twin.name
+                )
+            });
+            assert_eq!(
+                got,
+                wgmma_module(c, &license()).unwrap(),
+                "{}: {} is not its full-drain twin -- the two kernels differ somewhere OTHER than \
+                 wait_depth/fence_hoisted, so a bit-identity verdict between them would be about \
+                 two changes and could not accuse either",
+                c.name,
+                twin.name
+            );
+        }
+        assert!(
+            depth_arms >= 1,
+            "no emittable row carries wait_depth > 0, so E4.1's boundary rungs and E4.2's \
+             bit-identity gate are both vacuous and wave 3 lever 4 is not in the corpus at all"
+        );
+    }
+
     /// **THE RASTER'S GUARD-SHAPE LAW: the device gate must actually EXECUTE the ragged group.**
     ///
     /// The bijection twin (G5) proves the map over every residue in Rust, but the thing that runs on
@@ -10509,23 +11028,34 @@ mod tests {
             on.f_l2
         );
         // --- 4. THE DECLINE, which is the law's whole point --------------------------------------
-        // 65 m-tiles by 2 n-tiles selects the 128x128 tile (0.985 wave efficiency), and a long
-        // enough K puts its f_L2 over 0.78 -- a (128x128, cluster ON, no raster, one tile per CTA)
-        // verdict that no shipped row spells, because the square tile's clustered arm carries the
-        // SCALAR epilogue. The rule must say so.
-        let p = plan(128 * 65, 256, 240 * 64);
+        // 140 m-tiles by one 256-wide n-tile fails the efficiency floor at ALL THREE tiles (0.530,
+        // 0.707, 0.848), so the narrowest is taken unconditionally -- and it is multi-wave, so the
+        // rule also asks for persistence. There is no persistent 128x64 twin: nothing in the suite
+        // reaches that corner (sq1024, the only shape the narrow tile serves, is one wave), and a
+        // module nothing needs is a module nothing has ever assembled. The rule must SAY so rather
+        // than hand back the one-tile-per-CTA row and let the round publish a persistence claim
+        // for a kernel with no tile loop in it.
+        let (dm, dn, dk) = (128 * 140, 256, 1024);
+        let p = plan(dm, dn, dk);
         assert_eq!(
-            (p.bm, p.bn, p.cluster, p.persistent),
-            (128, 128, true, false)
+            (p.bm, p.bn, p.cluster, p.persistent, p.raster),
+            (128, 64, false, true, false)
         );
-        let why = wgmma_dispatch(128 * 65, 256, 240 * 64, HOPPER_SM_COUNT)
+        let why = wgmma_dispatch(dm, dn, dk, HOPPER_SM_COUNT)
             .expect_err("this verdict has no emitted module and must DECLINE, never fall back");
         assert!(why.starts_with(UNSUPPORTED), "{why}");
         assert!(
-            why.contains("128x128 tile") && why.contains("cluster ON"),
+            why.contains("128x64 tile") && why.contains("persistent true"),
             "the decline must name the configuration it wanted, or an operator cannot tell \
              whether the rule or the menu is wrong: {why}"
         );
+        // ...and the square tile's clustered v2 row, which wave 3 lever 4 added as the depth
+        // diagnostic's control, CLOSED the decline this test used to exercise. That is worth
+        // asserting rather than deleting: a `(128x128, cluster ON, one tile per CTA)` verdict is
+        // reachable from a long-K skinny-N shape and now resolves.
+        let sq = wgmma_dispatch(128 * 65, 256, 240 * 64, HOPPER_SM_COUNT)
+            .expect("the 128x128 clustered v2 row makes this verdict emittable");
+        assert_eq!(sq.key, WGMMA_W3C_MCB_V2.key);
     }
 
     /// **WAVE 3 lever 3, law (b): every verdict the dispatcher can reach at a benched shape is a
