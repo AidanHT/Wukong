@@ -2102,6 +2102,27 @@ mod gpu_e2e_tests {
         )
     }
 
+    /// **The tolerance band a plain-GEMM offload is held to, chosen by ROUTE and not by device.**
+    ///
+    /// [`gpu_accel::GemmRoute::Existing`] is `gpu::gemm_nt`, an f32 kernel: both sides are f32 and
+    /// only the K-reduction order differs, so the band is `c·√K·ε` — the `sgemm_matches_naive` shape.
+    /// [`gpu_accel::GemmRoute::Wgmma`] converts both operands to f16 on the host before accumulating
+    /// in f32, so it carries an input rounding the CPU oracle does not and needs the fp16 band the
+    /// fused-epilogue gates below already use.
+    ///
+    /// It is a function of the route because that is the fact that changed: sizing it by device would
+    /// silently widen the band on a Hopper part that had *declined* the wgmma route (an unencodable
+    /// K, or `WUKONG_GPU_NO_WGMMA=1`) and let a real f32 regression through.
+    fn gemm_tolerance(route: gpu_accel::GemmRoute, k: usize) -> (f64, f64) {
+        match route {
+            gpu_accel::GemmRoute::Existing => (
+                1e-4,
+                (16.0 * (k as f64).sqrt() * f32::EPSILON as f64).max(1e-5),
+            ),
+            gpu_accel::GemmRoute::Wgmma => (5e-2, 2e-2),
+        }
+    }
+
     #[test]
     fn gpu_backend_linear_matches_interp_within_tol() {
         let mut guard = wukong_codegen_gpu::gpu();
@@ -2112,6 +2133,7 @@ mod gpu_e2e_tests {
                 return;
             }
         };
+        let cc = g.target().cc();
         let mut rng = Rng::new(0x00C0FFEE);
         for &(m, k, n) in &[(8usize, 16usize, 8usize), (16, 32, 16), (32, 48, 24)] {
             let (program, mut interner) = build(&linear_src(m, k, n));
@@ -2120,15 +2142,16 @@ mod gpu_e2e_tests {
             let b = rng.vec(n * k, -1.0, 1.0);
 
             // CPU oracle (no accelerator).
-            let (mut ac, mut bc, mut cc) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            let (mut ac, mut bc, mut cc_buf) = (a.clone(), b.clone(), vec![0f32; m * n]);
             {
-                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cc];
+                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cc_buf];
                 wukong_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
             }
 
             // GPU offload over the identical MIR + inputs.
             let (mut ag, mut bg, mut cg) = (a.clone(), b.clone(), vec![0f32; m * n]);
             let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+            let route = accel.gemm_route();
             {
                 let mut bufs: [&mut [f32]; 3] = [&mut ag, &mut bg, &mut cg];
                 wukong_interp::run_kernel_f32_accel(
@@ -2141,13 +2164,135 @@ mod gpu_e2e_tests {
                 "{m}x{k}x{n}: GPU offload never fired — the nest did not lower to sgemm_nt, so this \
                  would silently test CPU-vs-CPU"
             );
+            // The routing law, on whatever device is actually present: `wgmma` is architecture-locked
+            // to `sm_90a`, so anything that is not Hopper must be on the pre-Hopper launcher. On this
+            // repo's RTX 4050 (cc 8.9) that is the assertion that keeps wave 4 from changing the
+            // arithmetic of a path it was never meant to touch.
+            assert!(
+                cc.0 == 9 || route == gpu_accel::GemmRoute::Existing,
+                "cc {cc:?} is not Hopper but took {route:?} — an sm_90a module cannot load here"
+            );
 
-            // tol = c·√K·ε (the sgemm_matches_naive shape): both sides are f32, K-reduction order differs.
-            let rel_tol = (16.0 * (k as f64).sqrt() * f32::EPSILON as f64).max(1e-5);
-            let s = assert_close(&format!("linear {m}x{k}x{n}"), &cg, &cc, 1e-4, rel_tol);
+            let (abs_tol, rel_tol) = gemm_tolerance(route, k);
+            let s = assert_close(
+                &format!("linear {m}x{k}x{n}"),
+                &cg,
+                &cc_buf,
+                abs_tol,
+                rel_tol,
+            );
             eprintln!(
-                "gpu --backend linear {m}x{k}x{n}: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
+                "gpu --backend linear {m}x{k}x{n} [{route:?}]: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
                 accel.calls, s.max_abs, s.max_rel
+            );
+        }
+    }
+
+    /// **The wgmma route's end-to-end gate: a `.wk` matmul reaching `gemm_nt_wgmma`.**
+    ///
+    /// `#[ignore]`d because it can only pass on a Hopper part, and this repo develops on an RTX 4050.
+    /// The reachability law says `::bench --name X` runs ONLY `#[ignore]`d tests and `::test --filter
+    /// Y` runs only plain ones, so the H100 invocation is
+    ///
+    /// ```text
+    ///   WK_GPU=H100 modal run --detach tools/cloud/modal_app.py::bench \
+    ///       --name gpu_backend_linear_routes_through_wgmma_on_hopper --package wukong_driver
+    /// ```
+    ///
+    /// (after `::build --release`, which `::bench` requires). It asserts three separate things, and
+    /// the first two are the ones a green-but-vacuous run would skip: that the route on this device
+    /// really is [`gpu_accel::GemmRoute::Wgmma`], that the offload fired at all, and only then that
+    /// the numbers match the CPU oracle.
+    ///
+    /// Three shapes, one per property. `256x1024x512` is a whole 128×256 tile grid. `130x1032x257` is
+    /// ragged in M, N **and** K at once, which is what proves the driver seam did not quietly need an
+    /// alignment gate (the `m%64/n%64/k%16` rule in `sgemm_nt_epi` is a *wmma* constraint — wgmma
+    /// predicates its own edge). `4096x256x2048` has `M*N = 8_388_608` output elements, just past
+    /// `ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS`, so it is the only one that makes the config seam
+    /// return the **clustered** row and the launch carry a `1x2x1` cluster attribute — the arm a
+    /// small-shape-only gate would leave entirely unexercised from the driver side.
+    #[test]
+    #[ignore = "needs a Hopper (sm_90a) device; run it on H100 via ::bench --package wukong_driver"]
+    fn gpu_backend_linear_routes_through_wgmma_on_hopper() {
+        const NAME: &str = "gpu_backend_linear_routes_through_wgmma_on_hopper";
+        let mut guard = wukong_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                skip_no_device(NAME);
+                return;
+            }
+        };
+        let cc = g.target().cc();
+        if cc.0 != 9 {
+            // A CAPABILITY skip, not a device skip, so it must NOT escalate under
+            // `WUKONG_GPU_REQUIRED=1`: `sm_90a` is an architecture lock, and declining on a part that
+            // is not Hopper is the correct outcome (the rule `gpu.rs`'s `with_hopper` states).
+            eprintln!(
+                "[skip] {NAME}: wgmma is architecture-locked to sm_90a and this device is cc {}.{} \
+                 ({}) — the route is correctly `Existing` here",
+                cc.0,
+                cc.1,
+                g.device_name()
+            );
+            return;
+        }
+        let mut rng = Rng::new(0x090A_C0DE);
+        for &(m, k, n) in &[
+            (256usize, 1024usize, 512usize),
+            (130, 1032, 257),
+            (4096, 256, 2048),
+        ] {
+            let (program, mut interner) = build(&linear_src(m, k, n));
+            let entry = interner.intern("lin");
+            let a = rng.vec(m * k, -1.0, 1.0);
+            let b = rng.vec(n * k, -1.0, 1.0);
+
+            let (mut ac, mut bc, mut cpu) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cpu];
+                wukong_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
+            }
+
+            let (mut ag, mut bg, mut got) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+            let route = accel.gemm_route();
+            assert_eq!(
+                route,
+                gpu_accel::GemmRoute::Wgmma,
+                "this device is Hopper (cc {cc:?}) but the plain-GEMM offload routed to {route:?} — \
+                 either the routing rule regressed or WUKONG_GPU_NO_WGMMA is set, and in both cases \
+                 the rest of this gate would measure the kernel it exists to bypass"
+            );
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ag, &mut bg, &mut got];
+                wukong_interp::run_kernel_f32_accel(
+                    &program, entry, &mut bufs, &interner, &mut accel,
+                )
+                .unwrap();
+            }
+            assert!(
+                accel.calls >= 1,
+                "{m}x{k}x{n}: nothing offloaded, so this would silently test CPU-vs-CPU"
+            );
+
+            let (abs_tol, rel_tol) = gemm_tolerance(route, k);
+            let s = assert_close(
+                &format!("wgmma linear {m}x{k}x{n}"),
+                &got,
+                &cpu,
+                abs_tol,
+                rel_tol,
+            );
+            eprintln!(
+                "gpu --backend wgmma linear {m}x{k}x{n} (M%128={}, N%256={}, K%64={}): \
+                 {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
+                m % 128,
+                n % 256,
+                k % 64,
+                accel.calls,
+                s.max_abs,
+                s.max_rel
             );
         }
     }
