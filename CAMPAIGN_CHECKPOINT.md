@@ -1,4 +1,4 @@
-# CAMPAIGN CHECKPOINT — 2026-08-11 23:5x (written for a cold resume by ANY harness)
+# CAMPAIGN CHECKPOINT — 2026-08-11 23:5x, state refreshed 2026-08-12 (for a cold resume by ANY harness)
 
 This file is the single resume point for the **Wukong H100 SOTA campaign** (Act 2). It assumes the
 reader has NO prior session context. Read this, then `docs/gpu/derive/ACT2_WAVE_PLAN.md` (its
@@ -15,7 +15,8 @@ measurement instrument. Hard rules that bind every commit:
   2. `cargo check --features gpu --all-targets` (plain cargo test never builds the gpu feature)
   3. `RUSTFLAGS="-D warnings" cargo clippy --features gpu --all-targets`
   4. `WUKONG_GPU_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu`  (4050 device suite;
-     at this checkpoint: 468 passed / 0 failed / 95 ignored)
+     468 passed at the 2026-08-11 checkpoint, **496 passed / 0 failed / 95 ignored** after the
+     2026-08-12 Wave-3 merge)
   5. `WUKONG_GPU_REQUIRED=1 cargo test -p wukong_driver --features gpu --lib` (the driver-side
      dispatch laws: which route a recognized GEMM takes per capability, which shapes and operand
      *values* the wgmma seam declines, the route witness. **Part 4 does not reach them** — it is
@@ -77,37 +78,47 @@ Suite mean went **61.5% → ~87.9%** in one wave; the single lever was the v2 st
 - Clock lock is REFUSED in Modal containers (recorded per run now); one bf16 round self-refused
   on +6.82% SM clock drift — the instrument and its `[clock]` provenance lines work.
 
-## In flight at the checkpoint (resume these first)
+## In flight at the checkpoint (STATE REFRESHED 2026-08-12 after the Wave-3 merge)
 
-1. **Wave 3 implementation — INTERRUPTED at 23:52, state frozen at commit `84e08f1` on branch
-   `gpu/wave3-schedule`** (worktree `.claude/worktrees/agent-a483e109bb3f39cdb`). That commit is
-   an explicitly UNGATED WIP checkpoint (642 lines of the raster generator axis in ptx_wgmma.rs;
-   it may not compile — its message says exactly what it is). The agent's last state: raster
-   axis (GROUP_M=16 TALL on the cluster index) mid-implementation; next steps were "the
-   guard-shape law and the module count". A resuming implementer reads
-   `docs/gpu/derive/WAVE3_DOSSIER.md` (the authority) and decides: continue from the diff or
-   restart clean. Full scope, ranked: (1) raster + bijection law G5 (asserted bijective over
-   [0, gx*gy) for every gx % group residue) + derived-name extension + sweep row
-   `w1_mcb_v2_r16`; (2) persistent clusters (iterate CLUSTERS not CTAs — a CTA-indexed loop
-   hangs; per-tile `%kt` reset = G19) + sweep row; (3) 128x64 tile class for sq1024. The drain
-   is budgeted ZERO — do not implement it. Expect: EXPECTED_MODULES (gpu.rs) and the in-family
-   count (ptx_wgmma.rs, currently 117/23) need deliberate bumps for any new module. Merge only
-   behind the full five-part gate, then: census → `::build --release` + `::build` → one H100
-   visit (`::bench --name wgmma_config_sweep --peers`, then `::bench --name wgmma_vs_cublas
-   --peers`, `WK_GPU=H100`, `--detach`, utf-8 export).
-2. Task #21 (push + CI) remains pending on the user's request only. Before any push:
+1. **Wave 3 is MERGED to main** (`9ef142b`, all four levers: cluster-index raster, persistent
+   clusters + deadlock law + G19, per-shape dispatcher with the thrashing-aware cluster predicate,
+   drain arms). Implemented to `WAVE3_DOSSIER.md`, adversarially reviewed to an EMPTY findings
+   list, full gate green on main (48 suites / 1020 passed; device suite 496/0/95).
+   EXPECTED_MODULES = 128, wgmma in-family = 34; 11 new modules all census-enumerated. **It is
+   UNMEASURED** — the next metered step is: census (`::ptxas --filter
+   ptxas_reports_the_register_and_spill_budget --tag act2-w3`) → `::build --release` + `::build` →
+   one H100 visit (`::bench --name wgmma_config_sweep --peers`, then `::bench --name
+   wgmma_vs_cublas --peers`, `WK_GPU=H100`, `--detach`, utf-8 export, clock-lock attempt DECLARED).
+   Known divergence deliberately left for a docs pass: WAVE3_DOSSIER/ACT2_WAVE_PLAN state the
+   cluster bracket in `T_L2/T_measured` units; the shipped `f_L2` is a predicted-denominator
+   quantity with the bracket `[0.769, 0.812]` and the threshold in saving units (0.26) — every
+   code site that quotes them records the divergence.
+2. **The wgmma product call site is MERGED** (`6df8d91`, branch gpu/wave4-wiring): `--backend=gpu`
+   on cc==9 routes recognized f16/bf16 GEMMs to `gemm_nt_wgmma` behind a witnessed
+   decline-never-wrong seam; gate part 5 (driver-gpu suite, 47 tests) and the CI step exist
+   because of it. No H100 number has been measured through the route yet.
+3. **Two implementation lanes are RUNNING in worktrees** (Opus/xhigh, adversarial-review chains):
+   `gpu/wave4-epilogue` (`.claude/worktrees/w4-epilogue` — Wave 4 fused epilogues, OWNS
+   gpu.rs/ptx_wgmma.rs) and `gpu/wave6-serving-bitexact` (`.claude/worktrees/w6-serving` — Wave 6's
+   bit-exact levers: merged QKV, norm planner fix, v4 paged-attention coalescing, K-side GQA fold;
+   forbidden from the owned files). A cold-resuming harness: inspect those worktrees' `git log`
+   and continue per their dossiers.
+4. Task #21 (push + CI) remains pending on the user's request only. Before any push:
    `rustup update stable` (CI's rustc is newer than local and runs clippy -D warnings).
 
 ## Next steps after Wave 3 (the plan's order)
 
 - Wave 4: fused epilogues (bias/ReLU/GELU vs the cuBLASLt fused peer at BOTH out-dtypes; SiLU
-  unopposed). `gemm_nt_wgmma` has NO product call site yet — the recognizer→offload wiring is
-  part of the wave. Break-evens now priced by the measured 2.92 TB/s.
+  unopposed). The recognizer→offload wiring LANDED 2026-08-12 (`6df8d91`); the epilogue lane is
+  in flight on `gpu/wave4-epilogue`. Break-evens priced by the measured 2.92 TB/s.
 - Wave 5: 8-bit wgmma. The descriptor transfers from 16-bit IFF `bk*dtype.size()==128` (BK
   64→128); K-major only; fp8 exact arm only K≤256; int8 `==` on s32. The CUTLASS f16+fp8+int8
   profiler binary is ALREADY staged on the `wukong-build` volume (peers.json is the authority) —
   do NOT rebuild it; only the H100 profiler MEASUREMENT runs remain.
-- Wave 6: decode/serving (FA2 wheel with kvcache is staged on the volume).
+- Wave 6: decode/serving (FA2 wheel with kvcache is staged on the volume). Its dossier is MERGED
+  (`docs/gpu/derive/WAVE6_DOSSIER.md`, 2026-08-12): the decode step is WEIGHT-bound, not KV-bound —
+  dtype levers first (int4 W + int8 KV, derived 3.042x at B=16), Stream-K promoted, ping-pong
+  refuted a third time. The bit-exact lever subset is in flight on `gpu/wave6-serving-bitexact`.
 
 ## Where everything is
 
