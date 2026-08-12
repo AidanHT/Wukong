@@ -977,14 +977,62 @@ gates survive untouched:
 > "reassociation-exception class" (`serving.md:271`) that the Megatron row-parallel all-reduce
 > already lives in. That is a materially cheaper precondition than WAVE3's suite faced.
 
-**Size.** Bounded by section 4.3's MODEL: up to **6.6x** on the 16-CTA launches and **1.7x** on the
-64-CTA ones *if* the memory-parallelism model holds, and **1.0x** if it does not. **The one
-measurement that decides it is the achieved bandwidth of a single decode GEMM launch.**
+**The plan's SECOND precondition, named rather than dropped.** `ACT2_WAVE_PLAN.md:186` holds
+Stream-K on *two* things, not one: *"needs a device workspace and a deterministic reduction order or
+the tolerance gate becomes shape-dependent, **and G2+G7 must be green first**"* -- restated at
+`WAVE3_DOSSIER.md:1334` as "precisely the plan's stated precondition (G2 + G7 green first)". The
+paragraphs above discharge the workspace/determinism half (and G-W6-4 makes it a law). This half is
+the other one, and a promotion that quoted the predicate while omitting half its precondition would
+be exactly the silent amendment this directory forbids.
 
-> **PROMOTION, recorded here for `ACT2_WAVE_PLAN.md`'s held-out list: Stream-K's trigger has fired.
-> It moves from "HELD OUT" to "Wave 6, rank 2, gated on one bandwidth measurement."** Its cheap
-> cousin -- the merged-QKV concat of section 4.4(a) -- should be built first regardless, because it
-> is bit-exact by construction and needs no workspace, no fixup and no re-derived tolerance.
+**Both are GREEN on H100, and each has a decode analogue this wave must carry.**
+
+* **G2** (`ACT2_WAVE_PLAN.md:120`) -- "a second pre-timing arm on pseudorandom f16 against an
+  independent f64 reference at `c*sqrt(K)*eps`", because the exact-integer oracle "is invariant
+  under *any* reassociation and is therefore structurally blind to every scheduler change coming".
+  **Green:** `bench/gpu/h100/2026-08-11-h100-w2-r10-vs-cublas-v2rule.log:100-103` -- *"random arm
+  within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two
+  runs; seed 0x57455f4152455f32"*, then `[gate] ... passed BOTH pre-timing arms on 204800 lanes`,
+  for both shipped arms; the same two lines appear in r3 (`:162-172`), r11 and r12. The generator
+  side is `ptx_wgmma.rs:2873` ("the pseudorandom arm (guard G2)").
+  **Decode analogue: it already exists and is already green.**
+  `serving_decode_step_matches_reference` compares the whole layer against an f64 oracle
+  (`s2d-full-suite.log:2717`) -- the reassociation-sensitive arm G2 was invented to supply. G2's
+  *specific* failure mode cannot occur here, because the decode path has no exact-integer oracle to
+  be blind; G2's *requirement* -- a tolerance arm a changed summation order can actually break --
+  is met, and the gate table above is the proof that it is the only one that moves.
+* **G7** (same plan line) -- "memset C inside the timed region whenever the schedule requires a
+  zeroed C". **Green, and it is live in the instrument rather than merely asserted:** every round
+  row prints its own verdict, `timed region : fill 0.01 , memset-in-region no  (this row's schedule
+  does not require a zeroed C)` (`r10-vs-cublas-v2rule.log:74`, `:83`), emitted by
+  `TimedRegion::label` off `TimedRegion::for_cfg`'s `zero_c_in_region: cfg.requires_zeroed_c()`
+  (`gpu.rs:7451-7465`). Its price is **measured, not assumed**:
+
+      $ awk 'NR==183' bench/gpu/h100/2026-08-11-h100-w2-r3-config-sweep.log
+      memset-in-region costs +10.5% at 320x288x640 (0.0178 vs 0.0161 ms). NO row this family
+      can express needs one today ... TimedRegion::for_cfg will charge it automatically the day
+      a schedule answers otherwise.
+
+  **Decode analogue: split-K IS that day.** A split-K decode GEMM needs a zeroed partials workspace
+  per launch, so `requires_zeroed_c()` must answer YES for it and the round row must print
+  `memset-in-region YES`. **Law: `a4_splitk`'s timed region includes the workspace zeroing, and the
+  row is refused if its provenance line says `no`.** The +10.5% above is the guard shape's price and
+  is the right order of magnitude to expect, which means it comes straight off the top of whatever
+  split-K wins -- a lever measured at 1.15x with the memset outside the region is a lever that does
+  not exist.
+
+**Size.** Bounded by section 4.3's MODEL: up to **6.6x** on the 16-CTA launches and **1.7x** on the
+64-CTA ones *if* the memory-parallelism model holds, and **1.0x** if it does not, **less the
+in-region zeroing G7 now charges it.** **The one measurement that decides it is the achieved
+bandwidth of a single decode GEMM launch.**
+
+> **PROMOTION, recorded here for `ACT2_WAVE_PLAN.md`'s held-out list: Stream-K's trigger has fired,
+> and BOTH halves of the plan's precondition are discharged -- the workspace/determinism half by the
+> gate table above, the `G2+G7` half by the two round logs cited here. It moves from "HELD OUT" to
+> "Wave 6, rank 2, gated on one bandwidth measurement, with G7 charged in the timed region."** Its
+> cheap cousin -- the merged-QKV concat of section 4.4(a) -- should be built first regardless,
+> because it is bit-exact by construction and needs no workspace, no fixup and no re-derived
+> tolerance.
 
 ### 10.3 2x2x1 cluster and 192x256x64 -- unaffected
 
@@ -1071,7 +1119,7 @@ strawman guards at `:4012-4017`. Use that auto-pick rather than naming a kernel 
 | lever | trigger status in Wave 6 | why, in one line |
 |---|---|---|
 | **ping-pong** | **FIRES -> DEAD. Retire the trigger.** | at `M <= 287` (4.2's conservative crossover) the roof is `M x BW`; no tile shape appears in it, and at Bcap=256 the 64x256 tile *lowers* the binding roof 630 -> 597 TFLOP/s |
-| **Stream-K / split-K** | **FIRES -> PROMOTE to rank 2** | 6 of 6 decode GEMMs are under 0.90 wave efficiency, 5 under 0.50; 4 of 5 bit-exactness gates survive it untouched |
+| **Stream-K / split-K** | **FIRES -> PROMOTE to rank 2** | 6 of 6 decode GEMMs are under 0.90 wave efficiency, 5 under 0.50; 4 of 5 bit-exactness gates survive it untouched; and the plan's OTHER precondition, `G2+G7` green, is discharged out of the round logs (r10 `:100-103`, r3 `:183`) rather than dropped |
 | **merged QKV** (new, this dossier) | n/a -- **build it, rank 3** | 3 launches -> 1, 96 CTAs instead of 64+16+16, and bit-exact by the same argument `tp_column_parallel_gemm_split_is_bit_exact` already proves |
 | 2x2x1 cluster | unchanged: **DEFERRED to after W4** | decode is HBM-bound, so `T_L2` is not binding and Wave 6 adds no evidence |
 | 192x256x64 | unchanged: **DEAD** | CTA-M 192 declines in the emitter; 512 threads cap ptxas at 128 regs |
@@ -1203,7 +1251,10 @@ does not exist. This is Wave 5's output arriving in Wave 6's product.
 **2. SPLIT-K / STREAM-K ON THE DECODE GEMM -- 1.0x to 6.6x on five of six launches, gated on one
 number.** Six of six decode GEMMs fail WAVE3's own wave-efficiency predicate, two of them at 12.1%.
 The prize is whatever separates the achieved bandwidth of a 16-CTA launch from 2922.3 GB/s, and that
-separation has never been measured. Four of the five serving bit-exactness gates survive it.
+separation has never been measured. Four of the five serving bit-exactness gates survive it, and the
+plan's `G2+G7` precondition is already green -- but **G7 now costs**: split-K is the first schedule
+here that needs a zeroed workspace, so the zeroing is timed and comes off the prize (+10.5% on the
+guard shape).
 
 **3. MERGED QKV -- 3 launches to 1, bit-exact by construction, host-side concat only.** 96 CTAs in
 one wave instead of 64+16+16 in three, and 64 fewer launches per step. No workspace, no fixup, no
@@ -1254,6 +1305,8 @@ interpretable without them.
   a2_kfold         K-side GQA fold, == gate                         same                                5.5
   a3_qkv           merged-QKV concat, == gate vs unmerged           B=64                                4.4(a)
   a4_splitk        split-K on wk/wv, S in {4, 8}                    B=64                                10.2
+                   (G7: the workspace zeroing is INSIDE the timed
+                    region; the row must print memset-in-region YES)
   a5_normplan      norm through norm_launch                         B=64, D=4096                        8
   --- peers (last; every one needs its own dispersion control first) ---
   p0_disp          FA2 vs FA2, two identical arms (G16)             the a1 shapes                       G-W6-6
@@ -1275,6 +1328,11 @@ interpretable without them.
   1.17x or 1.77x of the step depending on the batch. A ratio without its shape is not a result.
 * **No peer ratio before `p0_disp`.** A gain inside the contender's own dispersion is not a result
   (G16), and the decode contender's dispersion is unmeasured.
+* **No split-K row whose provenance line reads `memset-in-region no`.** Split-K is the first
+  schedule this campaign has that *requires* a zeroed buffer, so G7 stops being free and starts
+  being charged: `requires_zeroed_c()` must answer YES and `TimedRegion::for_cfg` must charge it.
+  The guard shape's measured price is **+10.5%** (`r3-config-sweep.log:183`) and it comes off the
+  top of whatever split-K wins (section 10.2).
 * **No vLLM headline** -- it drives the deprecated v1/v2 op and is a labelled floor
   (`ACT2_WAVE_PLAN.md:178`).
 * **No quantized-decode row without its accuracy column**, measured at the serving geometry rather
@@ -1327,7 +1385,7 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 | the owner list includes "the bench wiring in `gpu.rs`" | **`gpu.rs` is single-owner per wave** (`CAMPAIGN_CHECKPOINT.md:25-26`), and every serving bench in the tree already lives in its own module (`serving.rs:2468`, `:3101`). Delete the `gpu.rs` clause and the ownership conflict with Wave 3 disappears |
 | megakernel: "Published ceiling: 78% of BW ... ~1.56x on the bandwidth-bound term" | FACT(ext) sizing. The repo's derived prize is the **launch overhead**, 2.7-13.5% of the step, and its only constant is a WDDM one. **Budget ZERO**; trigger = the measured overhead exceeds 10% of the measured step |
 | ping-pong is HELD OUT with trigger "a decode row is added" (`:187`) | **the trigger fires and the lever loses.** At `M <= 287` the roof is `M x BW`, in which no tile appears; at Bcap=256 a 64x256 tile *lowers* the binding roof 630 -> 597 TFLOP/s. **RETIRE the trigger** |
-| Stream-K is HELD OUT: "wave quantization is only ~3% once W3's persistence lands" | true for the GEMM suite, false for decode: **6 of 6 decode GEMMs are below 0.90 wave efficiency, 5 below 0.50.** **PROMOTE to Wave 6 rank 2**, gated on one bandwidth measurement |
+| Stream-K is HELD OUT at `:186`: "wave quantization is only ~3% once W3's persistence lands ... and **G2+G7 must be green first**" | true for the GEMM suite, false for decode: **6 of 6 decode GEMMs are below 0.90 wave efficiency, 5 below 0.50.** The plan's precondition has two halves and BOTH are discharged, neither dropped: workspace/determinism by 10.2's five-gate table and G-W6-4, and `G2+G7` by the round logs (G2's random arm green at `r10:100-103`; G7 live per row at `r10:74` with its price measured at `r3-config-sweep:183`, +10.5%). **PROMOTE to Wave 6 rank 2**, gated on one bandwidth measurement, **with G7 charged inside `a4_splitk`'s timed region** -- split-K is the first schedule this campaign has that needs a zeroed buffer |
 | Machete W4A16 is HELD OUT at `:189` as measure-only, sweep `M = 1/16/128`, "**expect and publish a loss at M>=128 and a tie at M=1**" | **expectation UPHELD, sweep EXTENDED -- and this row is the amendment.** With 4-bit weights `I ~ 4M`, so the roof crosses the f16 peak asymptotically at `M = 71.8` (measured 838.7) to `84.6` (spec 989) and at the exact `wq` shape at `M = 90.8` to `112.5`: the both-sides-bandwidth-bound band ends near `M = 64`, not `M = 32`, at BOTH ends of 4.2's denominator band, and `M >= 128` stays the pre-registered LOSS. `p3_marlin` runs `M = 1/16/64/128/256` -- a **superset** keeping both plan anchors and adding the wave's own decode batches. The 2.118x of section 2.3 is an internal product ratio, not a Machete number |
 | target-table row 6: "1.6-2.0x from coalescing compounded with a 4x (8B) / 8x (70B) read-amplification removal" | both factors are re-derived above and neither survives as stated. The row's honest content is the **int8/fp8-KV prize** and the **capacity** result of 2.4 |
 | the plan and WAVE3 divide by a single f16 tensor peak, 989 TFLOP/s (`WAVE3_DOSSIER.md:30`) | that is a **spec-sheet** denominator, and 2.5(3) already refuses the spec sheet on the bandwidth axis. Paired with the repo's own measured 838.7 TFLOP/s at sq4096 it makes the decode crossover a **band, `287 <= M* <= 338`**, of which this dossier quotes the conservative end. **No verdict moves across the band** -- every batch here is <= 256 -- but the `Bcap = 256` headroom is 10.8%, not 24.4%, and the W4A16 crossover is `M = 90.8`, not 112.5. Closing the band is a peak-f16 measurement, not an argument |
@@ -1346,6 +1404,8 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 | H100 device identity: 132 SMs, 232,448 B SMEM, 50.0 MiB L2, 79.18 GiB VRAM, clock lock UNKNOWN | `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:517-531` |
 | H100 bandwidth: spec 3352.3, copy **2922.3**, saxpy 2567.0, reduce **682.1** GB/s | `bench/gpu/h100/2026-08-11-h100-w2-r5-hbm.log:50-53` |
 | cuBLAS's measured f16 rate (654.0 / **838.7** / 876.1 at sq2048 / sq4096 / sq8192) and the log's own "NOT publishable; clock-dependent" stamp on that column -- 4.2's `M*` band, lower end | `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:726`, `:728-730` |
+| **G2 green on H100** (the pseudorandom-f16 arm vs an independent f64 reference, run twice and bit-identical, both shipped arms) | `bench/gpu/h100/2026-08-11-h100-w2-r10-vs-cublas-v2rule.log:100-103`; same arms in `2026-08-11-h100-w2-r3-config-sweep.log:162-172`, `-r11-bf16-scalar.log:91-92`, `-r12-bf16-v2rule.log:101-103`; generator at `crates/wukong_codegen_gpu/src/ptx_wgmma.rs:2873` |
+| **G7 green on H100**, live per round row rather than asserted, and its price measured (+10.5%) | `bench/gpu/h100/2026-08-11-h100-w2-r10-vs-cublas-v2rule.log:74`, `:83`; `bench/gpu/h100/2026-08-11-h100-w2-r3-config-sweep.log:183`; `TimedRegion::for_cfg`/`label` at `crates/wukong_codegen_gpu/src/gpu.rs:7451-7465`, the A/B at `:20555-20576` |
 | The campaign's GEMM dispersion floors, quoted by G-W6-6: `+3.29%` (round 3, `w1_s4_off/sq2048`) and the `+/-15.47%` sq1024 refusal | `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:538`; `bench/gpu/h100/2026-08-11-h100-w2-r10-vs-cublas-v2rule.log:142`; range restated at `docs/gpu/derive/WAVE3_DOSSIER.md:1498`, refusal restated at `CAMPAIGN_CHECKPOINT.md:49` |
 | The whole serving correctness suite, **green on H100**; every serving perf bench `#[ignore]`d | `bench/gpu/h100/2026-08-10-h100-s2d-full-suite.log:171`, `:2274-2501`, `:2493-2497`, `:2707-2741` |
 | The Llama-3-8B decode geometry and the 64.00 GiB f16 KV cache, printed on H100 | same log, `:2495` |
