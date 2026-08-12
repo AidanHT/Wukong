@@ -1,0 +1,89 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[meter] test: H100 + 8.0 cpu + 16 GiB = $4.456/hr; timeout 7200s caps this call at $8.91
+[src] 810 files stamped; 0 new/changed since the last run (incremental)
+Device suite on H100 — GPU_REQUIRED=1, PEER_REQUIRED=1
+[clock] before device suite: 345 MHz, 2619 MHz, 44, 74.66 W
+
+[1m$ cargo test -p wukong_codegen_gpu --features gpu -- wgmma_cluster_multicast_is_exact[0m
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading component clippy
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_runtime-1h1dgdclho9l2/s-hl7b5l4kb4-0ecdo03-working`[0m
+
+[1m[33mwarning[0m: `wukong_runtime` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_interp-3cliahzxsxav8/s-hl7b6ohmxz-13di61h-working`[0m
+
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_codegen_gpu-26y6ft8l794cr/s-hl9a4txuvg-0ztx4g1-working`[0m
+
+[1m[33mwarning[0m: `wukong_interp` (lib) generated 1 warning
+[1m[33mwarning[0m: `wukong_codegen_gpu` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_codegen_gpu-04tzhcvmx7xy3/s-hl9a4txuvn-19fh9eg-working`[0m
+
+[1m[33mwarning[0m: `wukong_codegen_gpu` (lib test) generated 1 warning
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 3.24s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_codegen_gpu-cc138b1c33ec7dd5)
+
+running 1 test
+test gpu::tests::wgmma_cluster_multicast_is_exact ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 562 filtered out; finished in 3.27s
+
+[1m[92m   Doc-tests[0m wukong_codegen_gpu
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[1m-> ok in 10.1s[0m
+
+[1m$ cargo test -p wukong_driver --features gpu -- wgmma_cluster_multicast_is_exact[0m
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_runtime-1h1dgdclho9l2/s-hl7b5l4kb4-0ecdo03-working`[0m
+
+[1m[33mwarning[0m: `wukong_runtime` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_interp-3cliahzxsxav8/s-hl7b6ohmxz-13di61h-working`[0m
+
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_codegen_cranelift-3pnkkez3qrkww/s-hl7bui1e17-03rex7a-working`[0m
+
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_codegen_gpu-26y6ft8l794cr/s-hl9a4txuvg-0ztx4g1-working`[0m
+
+[1m[33mwarning[0m: `wukong_interp` (lib) generated 1 warning
+[1m[33mwarning[0m: `wukong_codegen_cranelift` (lib) generated 1 warning
+[1m[33mwarning[0m: `wukong_codegen_gpu` (lib) generated 1 warning
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_driver-14br707bgzboc/s-hl9aefeb1i-16ryyr0-working`[0m
+
+[1m[33mwarning[0m[1m: hard linking files in the incremental compilation cache failed. copying files instead. consider moving the cache directory to a file system which supports hard linking in session dir `/__modal/volumes/vo-XSMraihAKwNFzx5u8Hk81M/target/debug/incremental/wukong_driver-05zkol0gy93k3/s-hl9aefe7hk-0v13nwy-working`[0m
+
+[1m[33mwarning[0m: `wukong_driver` (lib) generated 1 warning
+[1m[33mwarning[0m: `wukong_driver` (lib test) generated 1 warning
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 11.92s
+[1m[92m     Running[0m unittests src/lib.rs (/persist/target/debug/deps/wukong_driver-e981755790081cae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+[1m[92m   Doc-tests[0m wukong_driver
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m-> ok in 18.4s[0m
+[clock] after device suite: 345 MHz, 2619 MHz, 43, 74.29 W
+
+codegen_gpu: PASS   driver: PASS
+[meter] test: 29.1s wall = $0.036 (record this in the round log)
