@@ -8621,7 +8621,33 @@ mod tests {
         // 115 -> 117 when the levers went to bf16 (`wgmma_w1_bf16_for`): the scalar bf16 round
         // sat at f16's pre-lever numbers, so the v2 and mcb2+v2 bf16 twins ship and the bf16
         // bench re-measures the dtype transfer every round.
-        const EXPECTED_MODULES: usize = 117;
+        // 117 -> 119 on 2026-08-12 with WAVE 3 lever 1, the grouped raster: `w1_mcb_v2_r16` (the
+        // derived optimum GROUP_M = 16 = sqrt(W*BN/BM) for a 128x256 tile on 132 SMs) and
+        // `w1_mcb_v2_r32` (the +24%-traffic bracket that makes the mechanism falsifiable). Both are
+        // one field off the shipped `w1_mcb_v2`, and both are DISTINCT modules because the raster is
+        // part of `WgmmaCfg::derived_name` -- a raster row that reused the linear key would be handed
+        // the LINEAR kernel by `Gpu::function`'s cache, which never re-examines the PTX on a hit, and
+        // the round would publish its control arm twice under two headings (guard G3).
+        // 119 -> 121 on 2026-08-12 with WAVE 3 lever 2, persistence: `w1_mcb_v2_r16_p` (the
+        // continuous ring, the wave's ranked-#1 mechanism) and `w1_mcb_v2_r16_pstop` (the drained
+        // diagnostic that separates the ring from CTA dispatch). The drained arm carries one extra
+        // mbarrier -- the tile rendezvous -- so it differs from its twin in its SMEM carveout as
+        // well as its text, which is a second reason a shared module key would have been wrong.
+        // 121 -> 124 on 2026-08-12 with WAVE 3 lever 3, the per-shape dispatcher: the three
+        // configurations `ptx_wgmma::wgmma_dispatch` selects that no earlier row spells --
+        // `w1_mcb_v2_p` (sq4096's verdict: persistent + cluster, no raster, because that shape's
+        // linear wave footprint already fits L2), `w1_v2_p` (gpt_d1024_up's: persistent alone) and
+        // `w3d_s4_v2`, the NEW m64n64k16 128x64 family that is the only lever in wave 3 which
+        // moves sq1024. The dispatcher must land on a REAL emitted module or decline loudly, so
+        // every verdict it can reach is a module the census assembles before an H100 is rented.
+        // 124 -> 128 on 2026-08-12 with WAVE 3 lever 4, the mainloop drain: the fence-hoist row
+        // (4b, free), the depth-1 arm at the shipped 128x256 s4 tile (4c, whose SIGN is the
+        // question and which is budgeted at ZERO), the square tile's v2 twin -- which exists only
+        // so that diagnostic is ONE fact from its control -- and depth 1 on that 6-stage ring,
+        // where the derivation says the depth can be afforded. `WgmmaCfg::drain_tag` carries both
+        // fields into `derived_name`, so no shipped row's key moves and each new arm is its own
+        // module.
+        const EXPECTED_MODULES: usize = 128;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -18460,8 +18486,31 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             "the hang diagnosis must not use `eprintln!` — libtest buffers it until a test that will \
              never finish finishes, so the watchdog would kill the process with no output at all"
         );
+        // **E4.3 -- the deadlock time-box, stated over the arms that can newly deadlock.** Wave 3
+        // lever 4's `wait_depth > 0` mainloop is the first configuration in this family whose
+        // *mis-lag* is a hang rather than a wrong number: the producer waits forever on an
+        // `empty[s]` arrival the consumer's tail never made. `WgmmaCfg::validate` rejecting
+        // `stages < wait_depth + 2` (law L4.4) is the DESIGN that makes the backstop unnecessary;
+        // this is the backstop. It is a scan, not a whitelist -- but a scan is only a law if the
+        // corpus it ranges over is non-empty, and both correctness launchers a depth arm reaches
+        // (`gemm_nt_wgmma`, and the warm-up of `time_gemm_nt_wgmma_in`) must be in it.
+        assert!(
+            crate::ptx_wgmma::wgmma_all_emittable()
+                .iter()
+                .any(|c| c.wait_depth > 0),
+            "no emittable row carries wait_depth > 0, so E4.3's clause below is about a corpus that \
+             does not exist and wave 3 lever 4 is not in the family at all"
+        );
+        assert!(
+            boxed_only.iter().any(|n| n == "gemm_nt_wgmma")
+                && warmup_boxed.iter().any(|n| n == "time_gemm_nt_wgmma_in"),
+            "every launch a wait_depth arm can take -- the correctness gates' `gemm_nt_wgmma` and \
+             the timing launcher's warm-up -- must be inside the watchdog: a wrong lag HANGS, and a \
+             hang on rented silicon bills to the container timeout with no log"
+        );
         eprintln!(
-            "[gate] {} sm_90a launchers drain through sync_within (default deadline {} ms) \u{2713}",
+            "[gate] {} sm_90a launchers drain through sync_within (default deadline {} ms), \
+             including every path a wait_depth arm can take \u{2713}",
             want.len(),
             DEFAULT_LAUNCH_TIMEOUT_MS
         );
@@ -19234,7 +19283,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 win.stages
             );
             let (m, n) = (win.bm, win.bn);
-            for tiles_k in [1usize, 2, win.stages, win.stages + 1, 4 * win.stages] {
+            // **E4.1.** The ladder is `ptx_wgmma::drain_k_ladder`, not a literal list, because wave
+            // 3's lagged release changes behaviour at two K values the old list reached neither of:
+            // `ktiles <= wait_depth`, where the mainloop releases no stage at all and `CDRAIN` is
+            // the only thing that frees the ring, and `stages - 1`, the iteration before the wrap,
+            // where `%rel` and `%stg` wrap on DIFFERENT iterations. Both rungs are the identity at
+            // the depth-0 row this stage runs -- which is the point: the ladder is a function of the
+            // configuration, so the depth arms' own gate (`wgmma_drain_depth_gate`) and this one
+            // cannot drift into two different ideas of where a ring boundary is.
+            for tiles_k in crate::ptx_wgmma::drain_k_ladder(win) {
                 let k = tiles_k * win.bk;
                 let (a, b) = bringup_operands(m, n, k, win.dtype);
                 assert!(
@@ -19430,6 +19487,157 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
 
     use crate::bench_instrument as bi;
 
+    /// The shapes one clustered arm is gated on, built around **that arm's own cluster axis**.
+    ///
+    /// Returns `(M, N, K, why)`. `mn(on_axis, off_axis)` turns a pair of tile counts into a
+    /// shape: `on_axis` counts tiles along the axis this arm clusters (N for `2x1x1`, M for
+    /// `1x2x1`) and `off_axis` the other, which is varied independently so a defect that needs
+    /// both axes cannot hide behind a one-tile grid.
+    ///
+    /// # The fifth shape, and why the first four cannot stand in for it
+    ///
+    /// The four small shapes are sized in TILES, and under persistence the launch is sized in
+    /// **cluster slots** — `min(cluster_tiles, HOPPER_SM_COUNT / cluster_ctas)`. At every one of
+    /// them `cluster_tiles` is 1, 4, 2, 2 against a slot count of exactly the same 1, 4, 2, 2, so
+    /// `%cid += %slots` fails its guard on the first pass and **the tile loop body runs once**. A
+    /// gate built only from them gates the stale-column failure and nothing the tile loop added:
+    /// G19's per-tile `%kt` reset (whose corruption is a plausible integer, not a NaN), the ring
+    /// pointer and phase parities carried across the boundary, the drained arm's second rendezvous
+    /// phase, and [`crate::ptx_wgmma::RasterGrid::tile_of_cid`]'s multi-group path are all
+    /// unreachable at one tile per slot.
+    ///
+    /// [`guard_shape`] is exactly the shape that fixes that — [`guard_n_tiles`] exists to widen the
+    /// persistent guard until `cluster_tiles > slots` — so the fifth entry is *that* function's
+    /// answer rather than a second spelling of it. It is a bigger host reference (`M*N*K` in a
+    /// debug f64 loop, ~0.8 G MAC at the 128x256 rows) and it is the price of the gate: the
+    /// alternative is that the tile loop's only device execution stays inside `#[ignore]`d benches,
+    /// i.e. on the metered visit, where its failure mode is a hang that costs the visit.
+    ///
+    /// `the_cluster_gate_crosses_a_tile_boundary_on_every_persistent_row` is what keeps it here.
+    fn cluster_gate_shapes(c: &crate::ptx_wgmma::WgmmaCfg) -> Vec<(usize, usize, usize, String)> {
+        use crate::ptx_wgmma::guard_shape;
+        let (bm, bn, ring) = (c.bm, c.bn, c.bk * c.stages);
+        let axis_is_m = c.multicast.multicasts_b();
+        // (tiles along the cluster axis, tiles along the other axis) -> (M, N). The A arm
+        // clusters N, so `on_axis` counts N tiles there and M tiles in the B arm; the off-axis
+        // count is varied independently so a defect that needs both axes cannot hide.
+        let mn = |on_axis: usize, off_axis: usize| -> (usize, usize) {
+            if axis_is_m {
+                (on_axis * bm, off_axis * bn)
+            } else {
+                (off_axis * bm, on_axis * bn)
+            }
+        };
+        let (m1, n1) = mn(2, 1);
+        let (m2, n2) = mn(4, 2);
+        let (m3, n3) = mn(3, 1);
+        let axis = if axis_is_m { "M" } else { "N" };
+        let other = if axis_is_m { "N" } else { "M" };
+        let mut v = vec![
+            (
+                m1,
+                n1,
+                ring,
+                format!(
+                    "exactly ONE full cluster: both CTAs carry a real, different {other} \
+                     tile-half and each of the shared operand's halves arrives by multicast \
+                     from the other CTA"
+                ),
+            ),
+            (
+                m2,
+                n2,
+                ring,
+                format!(
+                    "four clusters over two {other} tiles: the cluster-to-tile map on the {axis} \
+                     axis, not just one cluster"
+                ),
+            ),
+            (
+                m3,
+                n3,
+                c.bk * (c.stages + 1),
+                format!(
+                    "an ODD number of {axis} tiles: the grid rounds 3 up to 4 on THIS arm's own \
+                     axis and the pad CTA must zero-fill, store nothing, and still multicast a \
+                     real slice into every cluster barrier. K wraps the ring once, so the pad \
+                     CTA is not merely a prologue artifact"
+                ),
+            ),
+            (
+                m1 + 7,
+                // Ragged, but EVEN when the row's transport needs it: `st.global.v2.f32` wants
+                // an 8-byte-aligned pair, and an odd `N` there is not a wrong number but
+                // `CUDA_ERROR_MISALIGNED_ADDRESS` on the first store -- which on this platform
+                // leaves the context stickily errored and takes the rest of the visit with it.
+                if c.epilogue.requires_even_n() {
+                    n1 - 6
+                } else {
+                    n1 - 5
+                },
+                c.bk * 2 - 16,
+                "ragged in M, N and K at once, inside a cluster: TMA's zero fill on the multicast \
+                 SLICE boundary as well as the tile boundary"
+                    .to_string(),
+            ),
+        ];
+        // THE TILE BOUNDARY. Every shape above is one tile per cluster slot, so none of them
+        // executes a second pass of the tile loop -- see this function's own doc. `guard_shape`
+        // is `guard_n_tiles`' answer to exactly that, and reusing it is what stops this list and
+        // the pre-timing guard from becoming two spellings of "wide enough".
+        if c.tiles.is_persistent() {
+            let g = guard_shape(c);
+            let r = c.raster_grid(g.m, g.n);
+            v.push((
+                g.m,
+                g.n,
+                g.k,
+                format!(
+                    "{} cluster-tiles over {} cluster slots, so at least one cluster runs a \
+                     SECOND tile: G19's per-tile `%kt` reset (whose failure is a plausible \
+                     integer, not a NaN), the ring pointer and phase parities CARRIED across the \
+                     boundary, and the tile map's multi-group path. K wraps the ring once and \
+                     leaves it mid-ring, so the parity carried into tile 2 is a flipped one",
+                    r.cluster_tiles(),
+                    c.launch_plan().grid(g.m, g.n).0
+                ),
+            ));
+        }
+        v
+    }
+
+    /// **The rows the free cluster gate covers.** One list, two readers — the gate itself and
+    /// `the_cluster_gate_crosses_a_tile_boundary_on_every_persistent_row` — because a law that
+    /// ranged over a second, hand-written copy would go green on rows the gate no longer runs.
+    ///
+    /// **Wave 3 adds its clustered schedule arms here** (dossier 6.4 item 2). They all keep the
+    /// 1x2x1 B multicast and change only WHICH `(m,n)` a cluster lands on and how many it lands
+    /// on, so the failure mode this gate was built for — stale shared memory on the N columns a CTA
+    /// did not fetch itself, at full speed, with no error — is exactly the failure mode they can
+    /// reintroduce. [`cluster_gate_shapes`] gives them an odd tile count on the clustered axis,
+    /// where a ragged group and a pad CTA meet, and a cluster-tile count above the slot count,
+    /// which is the only way to reach the tile loop's second pass.
+    fn wgmma_cluster_gate_rows() -> [&'static crate::ptx_wgmma::WgmmaCfg; 6] {
+        use crate::ptx_wgmma::{
+            WGMMA_W1_MC, WGMMA_W1_MCB, WGMMA_W1_MCB_V2_P, WGMMA_W1_MCB_V2_R16,
+            WGMMA_W1_MCB_V2_R16_P, WGMMA_W1_MCB_V2_R16_PSTOP,
+        };
+        [
+            // The PRIMARY first: if the visit dies, it dies having answered round 3's question.
+            &WGMMA_W1_MCB,
+            &WGMMA_W1_MC,
+            &WGMMA_W1_MCB_V2_R16,
+            &WGMMA_W1_MCB_V2_R16_P,
+            &WGMMA_W1_MCB_V2_R16_PSTOP,
+            // Wave 3 lever 3 adds one more clustered arm the dispatcher can SELECT: persistence
+            // WITHOUT the raster, which is sq4096's verdict. It is a tile loop over a B multicast
+            // exactly as `_r16_p` is, so it can reintroduce the same stale-column failure, and it
+            // reaches it by a DIFFERENT tile map (the linear one) -- which is precisely why it is
+            // its own row here rather than covered by its rastered twin.
+            &WGMMA_W1_MCB_V2_P,
+        ]
+    }
+
     /// **Both cluster arms are EXACT, on shapes where the multicast actually crosses CTAs.** A
     /// correctness gate, not a bench: nothing here is timed and nothing is `#[ignore]`d.
     ///
@@ -19444,11 +19652,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     ///
     /// A shape whose grid is one CTA wide **on the cluster's own axis** cannot see any of it,
     /// because the multicast would be a copy to self — and the two arms sit on *different* axes, so
-    /// one shape list cannot serve both. `shapes_for` therefore builds each arm's list around the
-    /// axis it clusters: the `2x1x1` arm needs two N tiles, the `1x2x1` arm two M tiles, and each
-    /// gets an **odd tile count on its own axis** for the grid-rounding path, where the cluster's
-    /// second CTA is wholly out of range and must contribute nothing to the output while still
-    /// multicasting a real slice and taking part in every barrier.
+    /// one shape list cannot serve both. [`cluster_gate_shapes`] therefore builds each arm's list
+    /// around the axis it clusters: the `2x1x1` arm needs two N tiles, the `1x2x1` arm two M
+    /// tiles, and each gets an **odd tile count on its own axis** for the grid-rounding path, where
+    /// the cluster's second CTA is wholly out of range and must contribute nothing to the output
+    /// while still multicasting a real slice and taking part in every barrier.
     ///
     /// # The operand halves must be DISTINGUISHABLE, or the gate proves nothing
     ///
@@ -19471,82 +19679,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     fn wgmma_cluster_multicast_is_exact() {
         use crate::ptx_wgmma::{
-            bringup_operands, WgmmaCfg, WGMMA_CLUSTER_GATE_INVOCATION, WGMMA_W1, WGMMA_W1_MC,
-            WGMMA_W1_MCB,
+            bringup_operands, WGMMA_CLUSTER_GATE_INVOCATION, WGMMA_W1, WGMMA_W1_MC, WGMMA_W1_MCB,
         };
-        /// The four shapes one arm is gated on, built around **that arm's own cluster axis**.
-        ///
-        /// Returns `(M, N, K, why)`. `mn(on_axis, off_axis)` turns a pair of tile counts into a
-        /// shape: `on_axis` counts tiles along the axis this arm clusters (N for `2x1x1`, M for
-        /// `1x2x1`) and `off_axis` the other, which is varied independently so a defect that needs
-        /// both axes cannot hide behind a one-tile grid.
-        fn shapes_for(c: &WgmmaCfg) -> Vec<(usize, usize, usize, String)> {
-            let (bm, bn, ring) = (c.bm, c.bn, c.bk * c.stages);
-            let axis_is_m = c.multicast.multicasts_b();
-            // (tiles along the cluster axis, tiles along the other axis) -> (M, N). The A arm
-            // clusters N, so `on_axis` counts N tiles there and M tiles in the B arm; the off-axis
-            // count is varied independently so a defect that needs both axes cannot hide.
-            let mn = |on_axis: usize, off_axis: usize| -> (usize, usize) {
-                if axis_is_m {
-                    (on_axis * bm, off_axis * bn)
-                } else {
-                    (off_axis * bm, on_axis * bn)
-                }
-            };
-            let (m1, n1) = mn(2, 1);
-            let (m2, n2) = mn(4, 2);
-            let (m3, n3) = mn(3, 1);
-            let axis = if axis_is_m { "M" } else { "N" };
-            let other = if axis_is_m { "N" } else { "M" };
-            vec![
-                (
-                    m1,
-                    n1,
-                    ring,
-                    format!(
-                        "exactly ONE full cluster: both CTAs carry a real, different {other} \
-                         tile-half and each of the shared operand's halves arrives by multicast \
-                         from the other CTA"
-                    ),
-                ),
-                (
-                    m2,
-                    n2,
-                    ring,
-                    format!(
-                        "four clusters over two {other} tiles: the cluster-to-tile map on the {axis} \
-                         axis, not just one cluster"
-                    ),
-                ),
-                (
-                    m3,
-                    n3,
-                    c.bk * (c.stages + 1),
-                    format!(
-                        "an ODD number of {axis} tiles: the grid rounds 3 up to 4 on THIS arm's own \
-                         axis and the pad CTA must zero-fill, store nothing, and still multicast a \
-                         real slice into every cluster barrier. K wraps the ring once, so the pad \
-                         CTA is not merely a prologue artifact"
-                    ),
-                ),
-                (
-                    m1 + 7,
-                    n1 - 5,
-                    c.bk * 2 - 16,
-                    "ragged in M, N and K at once, inside a cluster: TMA's zero fill on the multicast \
-                     SLICE boundary as well as the tile boundary"
-                        .to_string(),
-                ),
-            ]
-        }
         with_hopper(
             "wgmma_cluster_multicast_is_exact",
             WGMMA_CLUSTER_GATE_INVOCATION,
             |g, _lic| {
                 let plain = &WGMMA_W1;
                 let mut total = 0usize;
-                // The PRIMARY first: if the visit dies, it dies having answered round 3's question.
-                for mc in [&WGMMA_W1_MCB, &WGMMA_W1_MC] {
+                for mc in wgmma_cluster_gate_rows() {
                     assert_eq!(
                         mc.cluster_ctas(),
                         2,
@@ -19569,7 +19710,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     crate::ptx_wgmma::multicast_cta_mask(mc.cluster_ctas()),
                     mc.empty_arrivals()
                 );
-                    let shapes = shapes_for(mc);
+                    let shapes = cluster_gate_shapes(mc);
                     total += shapes.len();
                     for (m, n, k, why) in &shapes {
                         let (m, n, k, why) = (*m, *n, *k, why.as_str());
@@ -19645,14 +19786,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             mc.name
                         );
                         let p = mc.launch_plan();
-                        let (gx, gy, _) = p.grid(m, n);
+                        let (gx, gy, gz) = p.grid(m, n);
+                        let launched = (gx as usize) * (gy as usize) * (gz as usize);
+                        let real = n.div_ceil(mc.bn) * m.div_ceil(mc.bm);
                         eprintln!(
-                        "      {m:>5} x {k:<5} x {n:<5} grid {gx}x{gy} ({} clusters, {} pad CTA(s)): \
-                         EXACT, == the un-clustered row, reproducible",
-                        gx * gy / p.cluster_ctas(),
-                        (gx as usize) * (gy as usize)
-                            - n.div_ceil(mc.bn) * m.div_ceil(mc.bm)
-                    );
+                            "      {m:>5} x {k:<5} x {n:<5} grid {gx}x{gy}x{gz} ({} clusters, {} \
+                             tiles per cluster slot, {} CTA(s) beyond the real tiles): EXACT, == \
+                             the un-clustered row, reproducible",
+                            launched / p.cluster_ctas() as usize,
+                            if mc.tiles.is_persistent() {
+                                format!(
+                                    "{:.2}",
+                                    mc.raster_grid(m, n).cluster_tiles() as f64 / gx as f64
+                                )
+                            } else {
+                                "1".to_string()
+                            },
+                            launched.saturating_sub(real)
+                        );
                     }
                     eprintln!(
                     "[gate] {} is exact on {} cluster-spanning shapes and bit-identical to {} on \
@@ -19663,7 +19814,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 );
                 }
                 eprintln!(
-                    "[gate] BOTH cluster axes are exact: {total} shapes over {} and {}, each \
+                    "[gate] BOTH cluster axes AND both wave-3 schedule arms are exact: {total} \
+                     shapes over {}, {}, the grouped raster and its persistent/drained twins, each \
                      spanning at least one full two-CTA cluster ON ITS OWN GRID AXIS, each `==` the \
                      f64 reference and bit-identical to {} \u{2713}",
                     WGMMA_W1_MCB.name,
@@ -19672,6 +19824,91 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 );
             },
         );
+    }
+
+    /// **The free gate must EXECUTE a tile boundary, and this is what proves it does.**
+    ///
+    /// [`cluster_gate_shapes`] feeds the only device gate this wave extends that is not
+    /// `#[ignore]`d, so it is the only place the persistent tile loop runs without a metered visit.
+    /// Its first four shapes are sized in tiles and the persistent launch is sized in **cluster
+    /// slots**, and at all four the two numbers are equal — `cluster_tiles` 1/4/2/2 against
+    /// `slots = min(cluster_tiles, 132/cluster_ctas)` of 1/4/2/2 — so `%cid += %slots` fails its
+    /// guard on the first pass and the tile loop body runs exactly once. Everything the tile loop
+    /// added is then unreachable, and the sharpest of those is G19: an unreset `%kt` makes tile 2
+    /// accumulate into tile 1, which with exact-integer operands is a plausible number rather than
+    /// a NaN.
+    ///
+    /// This law is device-free on purpose. It is a claim about the SHAPE LIST, so it must fail in
+    /// `cargo test` on any box — a law that could only fail on an H100 is a law that discovers the
+    /// gap on the visit it exists to protect.
+    ///
+    /// The bound is stated as `cluster_tiles > slots` rather than as a shape, because that is the
+    /// actual precondition for a second pass and it survives a change to
+    /// [`crate::ptx_wgmma::HOPPER_SM_COUNT`], to the cluster shape or to the tile.
+    #[test]
+    fn the_cluster_gate_crosses_a_tile_boundary_on_every_persistent_row() {
+        let rows = wgmma_cluster_gate_rows();
+        assert!(
+            rows.iter().any(|c| c.tiles.is_persistent()),
+            "wave 3 puts persistent arms on this gate; a list with none means the rows were \
+             dropped, not that the law is vacuous"
+        );
+        for c in rows {
+            let shapes = cluster_gate_shapes(c);
+            if !c.tiles.is_persistent() {
+                // A one-tile-per-CTA row has no tile loop to cross, and paying for a 35-n-tile
+                // reference on it would buy nothing. Its `grid.x` is a TILE count, not a slot
+                // count, so the comparison below would not even be the same question there.
+                assert_eq!(
+                    shapes.len(),
+                    4,
+                    "{}: not persistent, so it has no tile loop and gets the four small shapes",
+                    c.name
+                );
+                continue;
+            }
+            // Under persistence `grid.x` IS the cluster-slot count -- `min(cluster_tiles,
+            // HOPPER_SM_COUNT / cluster_ctas)` -- and the loop is `cid += grid.x`, so a second
+            // pass happens exactly when there are more cluster-tiles than slots.
+            let (m, n, k) = *shapes
+                .iter()
+                .map(|(m, n, k, _)| (*m, *n, *k))
+                .collect::<Vec<_>>()
+                .iter()
+                .find(|&&(m, n, _)| {
+                    c.raster_grid(m, n).cluster_tiles() > c.launch_plan().grid(m, n).0
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: every gate shape runs at ONE tile per cluster slot, so the tile loop \
+                         body executes once and G19's `%kt` reset, the ring/parity carry across \
+                         the boundary and the tile map's multi-group path are all unreachable. \
+                         The only device execution of a second tile is `wgmma_pretiming_guard`, \
+                         whose call sites are all inside `#[ignore]`d benches -- i.e. on the \
+                         metered visit, where the failure mode is a hang that costs the visit.",
+                        c.name
+                    )
+                });
+            let g = c.raster_grid(m, n);
+            let slots = c.launch_plan().grid(m, n).0;
+            // ...and the second pass must be reached by a WHOLE cluster. `cid` is the cluster
+            // index and `%ctaid.x` is the slot both ranks share, so this holds by construction --
+            // assert it anyway, because the construction is the deadlock law of WAVE3_DOSSIER 2.6
+            // and a law worth having is a law worth checking at the shape that exercises it.
+            assert_eq!(
+                c.launch_plan().grid(m, n).1 as usize,
+                c.cluster_m(),
+                "{}: grid.y is the cluster rank, so both ranks share the slot index",
+                c.name
+            );
+            eprintln!(
+                "[law] {} crosses a tile boundary at {m}x{k}x{n}: {} cluster-tiles over {slots} \
+                 slots, so {} cluster(s) run a second tile",
+                c.name,
+                g.cluster_tiles(),
+                g.cluster_tiles() - slots
+            );
+        }
     }
 
     /// The one field each Act-2 shape records: **milliseconds per launch, lower is better**.
@@ -19728,6 +19965,115 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// * **arm 2, run twice, verdict bit-identical** (G8) — a nondeterministic reduction is still
     ///   bit-identical over exact integers, so only the random arm can catch one.
     ///
+    /// **E4.2, and E4.1 at a depth that can see it: a `wait_depth > 0` arm is BIT-IDENTICAL to its
+    /// full-drain twin, at every ring boundary, on both operand arms.**
+    ///
+    /// # Why bit-identity is the RIGHT verdict here, and a tolerance is the wrong one
+    ///
+    /// The drain restructuring reassociates nothing. The same `BK/16` `wgmma` accumulate into the
+    /// same registers in the same K order; all that moves is *when* the buffer they read is
+    /// published back to the producer. So the depth arm must agree with the depth-0 kernel bit for
+    /// bit, and `c*sqrt(K)*eps` would be the wrong gate twice over: it would pass a lag that let the
+    /// producer refill a stage whose `wgmma` had not retired -- a whole stage of *early* operands is
+    /// still a plausible float -- and the exact-integer arm alone is structurally weak here, because
+    /// an exact-integer sum is invariant under any reassociation and therefore cannot see a
+    /// scheduling change at all. Hence both arms, and `==` between kernels rather than against a
+    /// reference.
+    ///
+    /// # Why the K ladder, and why it costs no host reference
+    ///
+    /// [`crate::ptx_wgmma::drain_k_ladder`] brackets the two places the lag changes behaviour:
+    /// `ktiles <= wait_depth`, where the mainloop's `@%p3` is false on every iteration and `CDRAIN`
+    /// is the only thing that frees the ring, and `stages - 1`, where `%rel` and `%stg` wrap on
+    /// different iterations. Neither is reachable at the K values the pre-timing shape happens to
+    /// use. The verdict is device-against-device, so no `M*N*K` f64 loop is paid for any of it --
+    /// the f64 reference arm already ran, once, in [`wgmma_pretiming_guard`].
+    ///
+    /// Returns the number of launches, for the round log. Zero at `wait_depth == 0`, where the row
+    /// is its own twin and the comparison would pass by construction.
+    fn wgmma_drain_depth_gate(
+        g: &mut Gpu,
+        cfg: &'static crate::ptx_wgmma::WgmmaCfg,
+        label: &str,
+    ) -> usize {
+        use crate::ptx_wgmma::{
+            bringup_operands, drain_k_ladder, guard_shape, random_operands, wgmma_full_drain_twin,
+            RANDOM_ARM_SEED,
+        };
+        if cfg.wait_depth == 0 {
+            return 0;
+        }
+        let twin = wgmma_full_drain_twin(cfg).unwrap_or_else(|| {
+            panic!(
+                "{label}: {} waits to depth {} and the family ships no emittable full-drain twin \
+                 for it, so the one gate that can see a stage refilled early has nothing to compare \
+                 against. A depth arm must never post a timing without it (WAVE3_DOSSIER 4.7's \
+                 refusal).",
+                cfg.name, cfg.wait_depth
+            )
+        });
+        let gs = guard_shape(cfg);
+        let (m, n) = (gs.m, gs.n);
+        let ladder = drain_k_ladder(cfg);
+        let mut launches = 0usize;
+        for &tiles_k in &ladder {
+            let k = tiles_k * cfg.bk;
+            for (arm, (a, b)) in [
+                ("exact", bringup_operands(m, n, k, cfg.dtype)),
+                (
+                    "random",
+                    random_operands(m, n, k, cfg.dtype, RANDOM_ARM_SEED),
+                ),
+            ] {
+                let got = gemm_nt_wgmma(g, cfg, &a, &b, m, k, n).unwrap_or_else(|e| {
+                    panic!("{label}: {} at {m}x{k}x{n} ({arm} arm): {e}", cfg.name)
+                });
+                let base = gemm_nt_wgmma(g, twin, &a, &b, m, k, n).unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: the full-drain twin {} at {m}x{k}x{n} ({arm} arm): {e}",
+                        twin.name
+                    )
+                });
+                launches += 2;
+                if got != base {
+                    let bad = got.iter().zip(&base).filter(|(x, y)| x != y).count();
+                    panic!(
+                        "{label}: {} is NOT bit-identical to its full-drain twin {} at \
+                         {m}x{k}x{n} ({tiles_k} ktiles vs {} stages, depth {}, {arm} arm): {bad} of \
+                         {} lanes differ, max_abs {:.3e}.\n  The two kernels issue the same \
+                         wgmma over the same K order and differ only in WHEN a stage's `empty` \
+                         barrier is signalled, so any difference at all is the release lag. \
+                         {tiles_k} <= {} means the mainloop released NO stage inside the loop and \
+                         CDRAIN freed the whole ring; {tiles_k} > {} means the ring wrapped with \
+                         %rel and %stg on different iterations. A lag SMALLER than the depth is \
+                         this wave's silent corruption -- the producer refills a buffer whose \
+                         wgmma has not retired -- and it is exactly what this reads as.",
+                        cfg.name,
+                        twin.name,
+                        cfg.stages,
+                        cfg.wait_depth,
+                        got.len(),
+                        crate::diff::err_stats(&got, &base).max_abs,
+                        cfg.wait_depth,
+                        cfg.stages - 1
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "  {:<14} {} (depth {}, ring {}): BIT-IDENTICAL to {} on every ktiles in {ladder:?} at \
+             {}, on the exact-integer ramp AND the pseudorandom arm ({launches} launches, seed \
+             {RANDOM_ARM_SEED:#x})",
+            label,
+            cfg.name,
+            cfg.wait_depth,
+            cfg.stages,
+            twin.name,
+            gs.dims()
+        );
+        launches
+    }
+
     /// Returns the number of lanes checked, for the round log.
     fn wgmma_pretiming_guard(
         g: &mut Gpu,
@@ -19839,6 +20185,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             want.len(),
             coeff
         );
+        // --- arm 3: the drain's own gate (E4.2), on the rows that have a drain -------------------
+        //
+        // It lives HERE rather than in a test of its own because WAVE3_DOSSIER 4.7's refusal is
+        // about *publishing*: "any depth arm published without its bit-identity result against the
+        // D = 0 twin". A separate gate is one somebody can forget to run before a round; a clause
+        // of the pre-timing guard is one no round can reach a timing without. It is the identity on
+        // every row that shipped before wave 3 lever 4.
+        wgmma_drain_depth_gate(g, cfg, label);
         want.len()
     }
 
@@ -20348,9 +20702,17 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             };
             let plan = bi::TwinPlan::default();
             let points = wgmma_sweep_points();
+            // The cost is the UNION of the rows' own shape lists, not `rows x shapes`: see
+            // `SweepRow::shapes`. Printing both numbers is what keeps "10 rows and 7 shapes" from
+            // being read as 70 cells.
+            let planned_cells: usize = WGMMA_SWEEP_GRID
+                .iter()
+                .map(|r| points.iter().filter(|p| r.runs_at(p.label)).count())
+                .sum();
             eprintln!(
-                "plan           : {} rows x {} shapes, {} recorded rounds + {} warm-up, bar \
-                 +/-{:.2}%, median across rounds",
+                "plan           : {} rows over {} shapes = {planned_cells} cells (the UNION of \
+                 each row's own shape list, NOT the cross product), {} recorded rounds + {} \
+                 warm-up, bar +/-{:.2}%, median across rounds",
                 WGMMA_SWEEP_GRID.len(),
                 points.len(),
                 plan.rounds,
@@ -20438,6 +20800,20 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             c.l2_hint.label(),
                             TimedRegion::for_cfg(c).label()
                         );
+                        // The wave-3 axes, likewise: a schedule that is not printed per row is a
+                        // schedule a reader has to infer from a label, and a label is not evidence.
+                        eprintln!(
+                            "      raster GROUP_M {} | tiles {} | wait_depth {} | fence {}",
+                            c.raster,
+                            c.tiles.label(),
+                            c.wait_depth,
+                            if c.fence_hoisted {
+                                "hoisted out of the k-loop"
+                            } else {
+                                "per k-tile (rounds 1-3)"
+                            }
+                        );
+                        eprintln!("      measured at {:?}", r.shapes);
                     }
                     Err(why) => eprintln!(
                         "  {:<12} {:<35} DECLINED | {}\n      {why}",
@@ -20579,10 +20955,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
 
             // --- 4. the sweep --------------------------------------------------------------------
             eprintln!(
-                "\n---- {BENCH}: sweeping {} rows x {} shapes; arms A and C are BOTH {} (the peer \
-                 twin), arm B is the row ----",
+                "\n---- {BENCH}: sweeping {} live rows over {} shapes ({} cells); arms A and C are \
+                 BOTH {} (the peer twin), arm B is the row ----",
                 live.len(),
                 points.len(),
+                live.iter()
+                    .map(|r| points.iter().filter(|p| r.runs_at(p.label)).count())
+                    .sum::<usize>(),
                 peer.label
             );
             for p in &points {
@@ -20604,6 +20983,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let mut cells: Vec<Cell> = Vec::new();
             for r in &live {
                 for p in &points {
+                    // **The sweep is a UNION, not a cross product** (wave 3). Each row names the
+                    // shapes its mechanism can act on: the raster and persistence are PROVABLY the
+                    // identity on a single-wave grid, so a cell there can only report noise, and
+                    // the 128x64 tile row answers a question that only exists at sq1024. Skipping
+                    // is not an economy -- a cell a reader will over-read is worse than an absent
+                    // one, and `SweepRow::shapes` is where that judgement is written down.
+                    if !r.runs_at(p.label) {
+                        continue;
+                    }
                     let iters = bench_iters(p);
                     let label = format!("{BENCH}@{}/{}", r.label, p.label);
                     let cfg = r.cfg;
@@ -20675,6 +21063,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             ),
                             Err(_) => "-- unresolved".to_string(),
                         },
+                        // Two different absences, and conflating them would be the misreading this
+                        // column exists to prevent: `not measured` is a DELIBERATE omission from
+                        // `SweepRow::shapes` (the row's mechanism is provably zero at this shape),
+                        // `absent` would be a cell the round meant to run and did not.
+                        None if !r.runs_at(p.label) => "-- not measured".to_string(),
                         None => "-- absent".to_string(),
                     };
                     line += &format!(" {text:>24}");
@@ -20836,6 +21229,81 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     p.m * p.n,
                     crate::ptx_wgmma::wgmma_w1_for(p.m, p.n).name
                 );
+            }
+
+            // --- 6d. WAVE 3's per-shape dispatcher, and what it picks HERE -----------------------
+            //
+            // The rule is printed by `wgmma_dispatch_rule_text`, NOT restated here: this header
+            // once described the pre-`6a33b6d` predicate ("the L2-roof fraction ... clears 0.78")
+            // above a table whose sq1024 row read `f_L2 0.795 ... cluster off`, i.e. it
+            // contradicted the line beneath it at the one shape the tile lever exists for. One
+            // spelling, interpolated from the dispatcher's own constants.
+            eprintln!(
+                "\n---- {BENCH}: WAVE 3's per-shape dispatcher (ptx_wgmma::wgmma_dispatch) ----\n  \
+                 {}\n  Each verdict below is measured by the row named beside it, at this shape, \
+                 with its own control\n  (the_dispatcher_verdict_is_pinned_at_every_benched_shape \
+                 and every_shape_the_dispatcher_selects_is_measured_at_that_shape\n  are the \
+                 device-free laws).",
+                crate::ptx_wgmma::wgmma_dispatch_rule_text()
+            );
+            for p in &points {
+                let plan = crate::ptx_wgmma::wgmma_dispatch_plan(
+                    p.m,
+                    p.n,
+                    p.k,
+                    crate::ptx_wgmma::HOPPER_SM_COUNT,
+                );
+                eprintln!("  {:<14} {}", p.label, plan.summary());
+                match crate::ptx_wgmma::wgmma_dispatch(
+                    p.m,
+                    p.n,
+                    p.k,
+                    crate::ptx_wgmma::HOPPER_SM_COUNT,
+                ) {
+                    Ok(c) => {
+                        let row = WGMMA_SWEEP_GRID
+                            .iter()
+                            .find(|r| r.cfg.key == c.key)
+                            .map(|r| r.label)
+                            .unwrap_or("(not a sweep row)");
+                        eprintln!("  {:<14}   -> {} (sweep row {row})", "", c.name);
+                    }
+                    Err(why) => eprintln!("  {:<14}   -> DECLINES: {why}", ""),
+                }
+                // THE FLIP, SHOWN RATHER THAN ASSERTED. Where the raster fires, print the same
+                // rule's verdict with it forced off: the claim "the raster flips this shape's
+                // cluster" is a claim about two configurations, and a log that prints one of them
+                // and narrates the other is how an inert claim survives a round.
+                if plan.raster {
+                    let off = crate::ptx_wgmma::wgmma_dispatch_plan_with_raster(
+                        p.m,
+                        p.n,
+                        p.k,
+                        crate::ptx_wgmma::HOPPER_SM_COUNT,
+                        Some(false),
+                    );
+                    eprintln!(
+                        "  {:<14}   -> counterfactual, raster OFF: cluster {} (saves {:.3} vs \
+                         {:.2}, f_L2 {:.3}, footprint {:.1} MB {}) -- so the raster {} this \
+                         shape's cluster verdict",
+                        "",
+                        if off.cluster { "ON " } else { "off" },
+                        off.l2_saving,
+                        crate::ptx_wgmma::cluster_l2_saving_threshold(),
+                        off.f_l2,
+                        off.final_footprint_bytes / 1.0e6,
+                        if off.l2_resident {
+                            "resident"
+                        } else {
+                            "THRASHING"
+                        },
+                        if off.cluster == plan.cluster {
+                            "does NOT change"
+                        } else {
+                            "FLIPS"
+                        }
+                    );
+                }
             }
 
             // --- 7. DIAGNOSTIC absolutes ------------------------------------------------------------
@@ -21482,6 +21950,38 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             guard.contains("guard_shape(cfg)"),
             "the guard's shape must come from the one authority"
         );
+        // **E4.2's refusal, as a law about the source.** A depth arm may not post a timing without
+        // its bit-identity result against the D = 0 twin, so the guard every round already goes
+        // through must be the thing that runs it -- a gate in a test of its own is a gate a round
+        // can be run without.
+        assert!(
+            guard.contains("wgmma_drain_depth_gate(g, cfg, label)"),
+            "the pre-timing guard must delegate to the drain gate: WAVE3_DOSSIER 4.7 refuses any \
+             depth arm published without its bit-identity result against the full-drain twin, and \
+             a separate gate is one a round can simply not run"
+        );
+        let (_, drain) = fns
+            .iter()
+            .find(|(n, _)| n == "wgmma_drain_depth_gate")
+            .expect("the drain gate exists");
+        for need in [
+            // The twin comes from the geometry, never from a name written twice.
+            "wgmma_full_drain_twin(cfg)",
+            // Both boundaries of the ring, from the one ladder the bring-up also uses.
+            "drain_k_ladder(cfg)",
+            // BOTH operand arms: the exact-integer sum is invariant under reassociation and is
+            // therefore the structurally weaker of the two here.
+            "bringup_operands(m, n, k, cfg.dtype)",
+            "random_operands(m, n, k, cfg.dtype, RANDOM_ARM_SEED)",
+            // ...and the verdict is `!=` between two kernels, not a tolerance against a reference.
+            "if got != base {",
+        ] {
+            assert!(
+                drain.contains(need),
+                "the drain gate must use `{need}` -- without it the verdict is about something \
+                 other than the release lag"
+            );
+        }
     }
 
     /// **The G7 knob is read from the config, not from a habit**, and the timed path checks that it

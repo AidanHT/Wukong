@@ -803,6 +803,121 @@ pub enum Schedule {
     Cooperative,
 }
 
+/// **SMs on the H100 SXM5 this campaign rents.** Measured, not a datasheet headline:
+/// `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:519`.
+///
+/// It is the number of resident CTAs in one "wave" -- occupancy is 1 CTA/SM twice over at W1 (SMEM
+/// 196 672 of 232 448 B, registers 384 x 168 = 64 512 of 65 536, and `setmaxnreg` cannot relax
+/// either because occupancy is decided by the STATIC per-thread allocation ptxas chose) -- and it is
+/// what [`TileSchedule`] divides to get its cluster-slot count.
+pub const HOPPER_SM_COUNT: usize = 132;
+
+/// **The exactness bound of the f32-reciprocal divmod** the persistent tile remap uses:
+/// `q = a / b` is exact for `a, b < 2^22`.
+///
+/// f32 has a 24-bit significand, `rcp.approx.ftz.f32` is within 1 ulp, and the two-sided correction
+/// in [`divmod_u32_ptx`] closes exactly that 1 ulp -- so the quotient is right whenever the true
+/// quotient and both operands are integers f32 represents exactly. [`WgmmaCfg::validate`] asserts
+/// the bound is unreachable rather than trusting it.
+pub const DIVMOD_F32_EXACT_LIMIT: usize = 1 << 22;
+
+/// **How many output tiles one CTA computes, and whether the pipeline survives the boundary between
+/// them** (wave-3 lever 2, the wave's ranked-#1 mechanism).
+///
+/// # Why this is its own axis and not a `Schedule` variant
+///
+/// [`Schedule`] is the WARP-specialisation choice (who produces, who consumes, and the CTA-M law
+/// that follows from it). This is the TILE-scheduling choice. They are orthogonal -- a future
+/// pingpong schedule must be able to be persistent or not -- and folding them into one enum makes
+/// the CTA-M law something that has to be restated in every new variant, which is exactly how a law
+/// gets dropped. The dossier spells these as `Schedule::Persistent`; the split is the one deliberate
+/// deviation, and it is a spelling, not a semantic.
+///
+/// # What persistence buys, and what it provably does not
+///
+/// **Not wave quantization.** With `grid = 132` and a static schedule, at sq4096 116 CTAs run 4
+/// tiles and 16 run 3 -- the critical path is still 4 tiles and the imbalance is *identical* to the
+/// wave picture. Removing the 3.03% needs Stream-K, not persistence. Anyone who attributes the gain
+/// to quantization has mis-attributed it (WAVE3_DOSSIER 2.2).
+///
+/// What it buys is `X_fill`, the ring fill, at every tile boundary. Measured: `X = 13.84 us` of
+/// per-tile fixed cost, of which `X_fill = 7.85 us` is four ring stages at 1.96 us each, and those
+/// 1.96 us move `132 CTAs x 49 152 B = 6.488 MB` device-wide, i.e. **3.31 TB/s = 98.7% of HBM
+/// peak**. The fill is a BANDWIDTH event, and at a wave boundary no CTA anywhere on the device has
+/// anything to overlap it with. Under a continuous ring the producer starts tile `t+1`'s stage 0..3
+/// copies while the consumers are still draining tile `t` (`4 x 0.646 + X_epi 5.99 = 8.57 us` of
+/// window against 7.85 us of fill), so the fill is hidden. `X_epi` is NOT saved: the consumer cannot
+/// issue tile `t+1`'s first `wgmma` until tile `t`'s accumulators are stored, because `scale-d = 0`
+/// on that instruction overwrites them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileSchedule {
+    /// One tile per CTA, the grid IS the tile map. Every row that shipped before wave 3, and the
+    /// text those rounds measured byte for byte.
+    OneTilePerCta,
+    /// **The diagnostic arm**: a persistent tile loop whose ring is DRAINED at every tile boundary
+    /// -- the producer may not issue tile `t+1`'s first copy until every consumer in the cluster has
+    /// finished tile `t`'s k-loop.
+    ///
+    /// It isolates CTA dispatch from the fill overlap. If it ties [`TileSchedule::OneTilePerCta`],
+    /// dispatch is worth nothing and the whole gain is the ring, which is what the derivation
+    /// predicts; if it WINS, the derivation is wrong and the mechanism is dispatch.
+    ///
+    /// **The ring POINTERS still carry, and that is not the dossier's word but it is its own
+    /// rule.** WAVE3_DOSSIER 2.7's checklist says `%stg` and the phase parities must CARRY because
+    /// "a reset parity against a live barrier is a hang", and it is right: an mbarrier's phase
+    /// parity is the parity of its completion count, stages complete an unequal number of times
+    /// when `ktiles % stages != 0`, and the only way to force them equal is to re-initialise
+    /// barriers a peer may be signalling -- the classic cluster race the same checklist forbids. So
+    /// the drain is a RENDEZVOUS (one extra mbarrier, `empty_arrivals()` arrivals) rather than a
+    /// pointer reset.
+    ///
+    /// **Where the rendezvous sits is the measurement.** The consumers arrive AFTER the epilogue's
+    /// last store and the producer waits before advancing `%cid`, so the whole overlap window
+    /// 2.3 prices -- the last `stages` releases of tile `t` (`4 x 0.646 us`) **plus** `X_epi`
+    /// (`5.99 us`), 8.57 us against 7.85 us of fill -- is closed. An arrival above the store block
+    /// would close only the 2.58 us mainloop-tail half and leave 76% of the fill hidden, so the arm
+    /// would collect most of the ring's gain and be read as dispatch, which is exactly the reading
+    /// the dossier's falsifier depends on being impossible.
+    /// `the_drained_arms_rendezvous_closes_the_whole_overlap_window` is the textual law.
+    PersistentDrained,
+    /// **THE ARM**: a persistent tile loop with a CONTINUOUS ring. `%stg` and both phase parities
+    /// carry across the tile boundary, so the producer runs straight on into the next tile's fill
+    /// while the consumers drain and store the last one.
+    Persistent,
+}
+
+impl TileSchedule {
+    /// The entry-name / module-key suffix. Empty for [`TileSchedule::OneTilePerCta`], so every row
+    /// that shipped before wave 3 keeps its exact name, key and module.
+    pub const fn key_tag(self) -> &'static str {
+        match self {
+            TileSchedule::OneTilePerCta => "",
+            TileSchedule::PersistentDrained => "_pstop",
+            TileSchedule::Persistent => "_p",
+        }
+    }
+    /// Does the kernel carry a tile loop at all?
+    pub const fn is_persistent(self) -> bool {
+        !matches!(self, TileSchedule::OneTilePerCta)
+    }
+    /// Does the ring survive the tile boundary? Only the real arm.
+    pub const fn carries_ring(self) -> bool {
+        matches!(self, TileSchedule::Persistent)
+    }
+    /// Does the emitter need the extra tile-rendezvous mbarrier?
+    pub const fn needs_tile_barrier(self) -> bool {
+        matches!(self, TileSchedule::PersistentDrained)
+    }
+    /// One line for the round log.
+    pub const fn label(self) -> &'static str {
+        match self {
+            TileSchedule::OneTilePerCta => "one tile per CTA (rounds 1-3)",
+            TileSchedule::PersistentDrained => "persistent, ring DRAINED per tile (diagnostic)",
+            TileSchedule::Persistent => "persistent, CONTINUOUS ring across tiles",
+        }
+    }
+}
+
 /// Cluster multicast of an operand.
 ///
 /// # The axis is the whole lever, and the two arms point OPPOSITE ways
@@ -1167,6 +1282,96 @@ pub struct WgmmaCfg {
     /// differ only in a cache policy are two different modules, and sharing a key would run one of
     /// them twice under both headings.
     pub l2_hint: L2Hint,
+    /// **`GROUP_M`: the grouped threadblock raster, in M TILES** (wave-3 lever 1). `1` is the
+    /// linear order every row shipped before wave 3 and emits byte-identical PTX to it.
+    ///
+    /// # What it changes, and what it provably does not
+    ///
+    /// Nothing about the mainloop, the descriptor, the multicast slicing or the epilogue reads
+    /// `%ctaid`; the *only* place a tile origin is computed is the two instructions that scale
+    /// `%ctaid.x`/`%ctaid.y` by `BN`/`BM`. This field replaces exactly those, plus the host-side
+    /// grid reshape in [`LaunchPlan::grid`]. Every tile is still computed exactly once (the law is
+    /// `the_raster_is_a_bijection_over_the_padded_tile_domain`); only the ORDER in which the
+    /// hardware dispatches them changes, and with it the set of tiles resident together -- the
+    /// wave's DRAM footprint.
+    ///
+    /// # Why a TALL group, and why 16
+    ///
+    /// A wave of `W = 132` CTAs covering an `R x C` rectangle of tiles reads `R*BM + C*BN` operand
+    /// rows for `R*C = W` tiles, minimised at `R* = sqrt(W*BN/BM)`. For W1 (`BM=128`, `BN=256`)
+    /// that is `sqrt(264) = 16.25`: **the optimum is tall, because A rows are half the price of B
+    /// rows at a 256-wide tile.** `GROUP_M = 16` sits on the optimum (`f = 4160`), `GROUP_M = 32`
+    /// brackets it at +24% and `GROUP_M = 2` is 4.12x WORSE than the optimum -- worse than linear
+    /// on every shape in the suite (WAVE3_DOSSIER 1.1).
+    ///
+    /// # The criterion: this is an L2-RESIDENCY lever, not a bandwidth-percentage lever
+    ///
+    /// On a grid of at most one wave (`tiles <= 132`: sq1024, sq2048, gpt_d1024_down) the raster is
+    /// **provably the identity** -- every tile is resident simultaneously, so no permutation of the
+    /// launch order can change a single byte of traffic. A measured difference at those shapes is
+    /// an instrument fault, not a raster effect. The lever binds iff the linear order's wave
+    /// footprint `f(R_linear) * K * 2` exceeds L2: `gpt_d4096_up` (2.73x L2, and a HARD arithmetic
+    /// blocker today -- matching the peer with the linear order needs 3.54 TB/s against a 3.35 TB/s
+    /// HBM peak) and `sq8192` (2.86x L2).
+    ///
+    /// # The correctness law it must not break (WAVE3_DOSSIER 1.5)
+    ///
+    /// Under [`Multicast::ClusterB`] the producer's B copy is indexed by `%crank * b_box_rows +
+    /// %ctan`, so **the two CTAs of a cluster must compute the SAME `%ctan`**; only their `%ctam`
+    /// may differ. A raster applied to the raw `%ctaid` pair violates that silently -- each rank
+    /// fetches half of a B tile the other does not want and half the accumulator COLUMNS are wrong
+    /// with no error anywhere. So the swizzle is applied to the **cluster index** with the
+    /// intra-cluster rank re-added afterwards, which is what [`RasterGrid`] encodes and what
+    /// `the_raster_keeps_every_cluster_on_one_n_tile` asserts.
+    pub raster: u16,
+    /// **How many tiles one CTA computes** (wave-3 lever 2) -- see [`TileSchedule`]. Part of
+    /// [`WgmmaCfg::derived_name`], so a persistent row can never be handed the one-tile kernel by
+    /// the module cache.
+    pub tiles: TileSchedule,
+    /// **`wgmma.wait_group` depth in the mainloop** (wave-3 lever 4). `0` is the full drain every
+    /// row shipped before wave 3, and emits byte-identical text to it.
+    ///
+    /// # The `0` is not a tuning knob, and that is why this field is paired with a function
+    ///
+    /// Today the consumer issues its `BK/16` `wgmma` as one group, `commit_group`s, waits to depth
+    /// 0 and then releases the stage's `empty` barrier. The release PUBLISHES the buffer to the
+    /// producer, so it may not precede the last read of it: any depth above 0 *at that position* is
+    /// a correctness bug, not a slower or faster kernel. The lever is a RESTRUCTURING -- wait to
+    /// depth `D` and release the stage that is `D` groups old -- and the two halves come from one
+    /// function, [`WgmmaCfg::release_lag`], so they cannot disagree. A lag SMALLER than the depth is
+    /// this wave's silent corruption: the producer refills a buffer whose `wgmma` has not retired,
+    /// and the result is wrong operands with no error anywhere.
+    ///
+    /// # Budgeted at ZERO, deliberately
+    ///
+    /// `D = 1` at 4 stages has exactly the prefetch depth of `D = 0` at 3 stages, and Fit C measured
+    /// that configuration: `S(s3) = 0.7056 us` against `S(s4) = 0.6460`, a **9.2% penalty**. Against
+    /// a bubble worth 13.3-20.0% of a stage (the bracket is the width of the unlocked-clock
+    /// ambiguity), the net is between +0.5% and -7.7%, and 128x256 s5 declines on shared memory so
+    /// the stage cannot be bought back. It is emitted and measured; nothing is budgeted for it.
+    pub wait_depth: usize,
+    /// **Hoist `wgmma.fence.sync.aligned` out of the k-loop** (wave-3 lever 4b). `false` is the
+    /// per-iteration fence rounds 1-3 measured.
+    ///
+    /// CUTLASS fences around the mainloop, not per k-tile. A per-iteration fence is legal but
+    /// invites ptxas to treat the accumulators conservatively across the loop back-edge. Zero
+    /// registers, one instruction out of the drain-to-issue bubble, and a possible second-order win
+    /// in how ptxas schedules -- the free component of the drain lever, and the one worth taking
+    /// whatever the depth measures at.
+    ///
+    /// # "Out of the k-loop" is the whole claim -- NOT out of the tile loop
+    ///
+    /// Under a [`TileSchedule`] with a tile loop the hoist stops at `CTILE_`: one fence per TILE,
+    /// against `n_k` k-stages, which is all of 4b's content. Hoisting it out of the tile loop too
+    /// would leave ZERO fences between tile `t`'s epilogue -- which reads every accumulator with
+    /// `st.global` -- and tile `t+1`'s first `wgmma.mma_async`, which writes them through the async
+    /// proxy. The ISA exempts accumulator accesses made by successive `wgmma` of the same shape, not
+    /// a warp access in between, so a fence is required there.
+    /// `the_hoisted_fence_still_separates_a_tiles_epilogue_from_the_next_tile` pins the position,
+    /// and it constructs the `fence_hoisted` + persistent combination itself because no shipped row
+    /// carries both yet -- WAVE3_DOSSIER 4.5 puts that combination on the campaign's path
+    /// ("sequence 4c AFTER persistence so the hazard is exercised rather than latent").
+    pub fence_hoisted: bool,
 }
 
 impl WgmmaCfg {
@@ -1308,9 +1513,59 @@ impl WgmmaCfg {
     pub const fn empty_off(&self, s: usize) -> usize {
         self.full_off(self.stages) + s * 8
     }
+    /// Byte offset of the **tile rendezvous** mbarrier -- only present under
+    /// [`TileSchedule::PersistentDrained`], which is the one arm that needs the producer to stop at
+    /// the tile boundary. See [`TileSchedule::PersistentDrained`] for why the drain is a rendezvous
+    /// and not a pointer reset.
+    pub const fn tile_bar_off(&self) -> usize {
+        self.empty_off(self.stages)
+    }
     /// Total dynamic shared memory the entry needs.
     pub const fn smem_bytes(&self) -> usize {
-        self.empty_off(self.stages)
+        if self.tiles.needs_tile_barrier() {
+            self.tile_bar_off() + 8
+        } else {
+            self.empty_off(self.stages)
+        }
+    }
+    /// **CTAs per cluster along the M axis** -- `cluster_shape().1`, so 2 under
+    /// [`Multicast::ClusterB`] and 1 otherwise. The raster groups m-CLUSTERS and the persistent loop
+    /// iterates them, so both read this rather than re-deriving the axis.
+    pub const fn cluster_m(&self) -> usize {
+        let m = self.multicast.cluster_shape().1 as usize;
+        if m == 0 {
+            1
+        } else {
+            m
+        }
+    }
+    /// **Cluster slots one wave of this device holds**: `HOPPER_SM_COUNT / cluster_ctas`, so 66
+    /// under a 2-CTA cluster and 132 without one.
+    ///
+    /// This is the persistent loop's STRIDE, and the reason the loop is indexed by the cluster
+    /// rather than by the CTA (WAVE3_DOSSIER 2.6). The kernel reads it as `%nctaid.x` rather than as
+    /// a literal, so an under- or over-subscribed launch is still correct; the host reaches it
+    /// through [`LaunchPlan::grid`], which caps it at the tile count so a small shape does not
+    /// launch 66 clusters for 6 tiles.
+    pub const fn persist_cluster_slots(&self) -> usize {
+        let s = HOPPER_SM_COUNT / self.cluster_ctas();
+        if s == 0 {
+            1
+        } else {
+            s
+        }
+    }
+    /// **The stage the mainloop releases, counted back from the one it is issuing against** -- and
+    /// the depth it waits to. ONE function, read by BOTH sites (law L4.2).
+    ///
+    /// The mainloop waits to depth `release_lag()` and releases stage
+    /// `(stg + stages - release_lag()) % stages`. A lag smaller than the depth lets the producer
+    /// refill a buffer whose `wgmma` has not retired -- wrong operands, no error, at full speed. One
+    /// function is what makes the pair unable to disagree, the same discipline
+    /// [`Multicast::cluster_shape`] already carries for the launch attribute and the
+    /// `.reqnctapercluster` directive.
+    pub const fn release_lag(&self) -> usize {
+        self.wait_depth
     }
     /// Registers the warp-specialised split consumes once `setmaxnreg` has run.
     pub const fn regs_after_split(&self) -> u32 {
@@ -1375,6 +1630,8 @@ impl WgmmaCfg {
             // again: CTAs that share an A tile differ in N (grid x), CTAs that share a B tile differ
             // in M (grid y). See `Multicast::cluster_shape`.
             cluster: self.multicast.cluster_shape(),
+            raster: self.raster,
+            tiles: self.tiles,
         }
     }
 
@@ -1396,7 +1653,7 @@ impl WgmmaCfg {
     /// table row device-free.
     pub fn derived_name(&self) -> String {
         format!(
-            "wgmma_nt_{}_{}x{}x{}_s{}{}{}{}",
+            "wgmma_nt_{}_{}x{}x{}_s{}{}{}{}{}{}{}",
             self.dtype.token(),
             self.bm,
             self.bn,
@@ -1404,7 +1661,47 @@ impl WgmmaCfg {
             self.stages,
             self.multicast.key_tag(),
             self.epilogue.key_tag(),
-            self.l2_hint.key_tag()
+            self.l2_hint.key_tag(),
+            self.raster_tag(),
+            self.tiles.key_tag(),
+            self.drain_tag()
+        )
+    }
+
+    /// The drain half of the derived name: `_fh` for the hoisted fence alone, `_dN` for wait depth
+    /// `N` (which always carries the hoist, so the two never appear together). Empty at the
+    /// pre-wave-3 defaults, so no shipped row's key moves.
+    pub fn drain_tag(&self) -> String {
+        match (self.wait_depth, self.fence_hoisted) {
+            (0, false) => String::new(),
+            (0, true) => "_fh".to_string(),
+            (d, _) => format!("_d{d}"),
+        }
+    }
+
+    /// The [`WgmmaCfg::raster`] half of the derived name. Empty at `GROUP_M = 1`, so every row that
+    /// shipped before wave 3 keeps its exact name, its exact key and therefore its exact module.
+    ///
+    /// This is not cosmetic. A raster row that reused the linear row's key would get the LINEAR
+    /// module back from `Gpu::function`'s cache -- which never re-examines the PTX on a hit -- and
+    /// the round would publish the control arm twice under two headings, one of them claiming a
+    /// grouped raster it never ran (guard G3).
+    pub fn raster_tag(&self) -> String {
+        if self.raster > 1 {
+            format!("_r{}", self.raster)
+        } else {
+            String::new()
+        }
+    }
+
+    /// **The raster's tile map for an `M x N` output**, as pure data -- the twin of the six PTX
+    /// instructions the prologue emits and the authority [`LaunchPlan::grid`] reshapes against.
+    pub fn raster_grid(&self, m: usize, n: usize) -> RasterGrid {
+        RasterGrid::new(
+            self.raster.max(1) as u32,
+            self.multicast.cluster_shape().1.max(1),
+            m.div_ceil(self.bm) as u32,
+            n.div_ceil(self.bn) as u32,
         )
     }
 
@@ -1598,6 +1895,122 @@ impl WgmmaCfg {
                 shape.accum_regs()
             ));
         }
+        // **The raster's own preconditions** (wave-3 lever 1). Each failure below is silent rather
+        // than loud, which is why they are checked here and not left to the emitter.
+        if self.raster == 0 {
+            return Err(format!(
+                "{UNSUPPORTED}: {}: raster (GROUP_M) 0 is not a group size; the linear order is \
+                 spelled 1",
+                self.name
+            ));
+        }
+        if self.raster > 1 {
+            let cm = self.multicast.cluster_shape().1.max(1) as usize;
+            if self.multicast == Multicast::ClusterA {
+                // ClusterA's cluster dimension is on grid X, which the 3-D raster grid uses for the
+                // cluster-ROW within a group. Two owners of one axis is how a CTA silently lands on
+                // a tile its cluster peer is also computing, so decline instead of interleaving
+                // them.
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: the grouped raster puts the group's cluster-row on grid X, \
+                     and Multicast::ClusterA's 2x1x1 cluster already owns that axis. The raster is \
+                     expressible under Multicast::None and Multicast::ClusterB (whose cluster is on \
+                     Y); a ClusterA raster needs a different grid decomposition, not a wider X.",
+                    self.name
+                ));
+            }
+            if !(self.raster as usize).is_multiple_of(cm) {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: GROUP_M {} is not a multiple of the cluster's {cm} CTAs \
+                     along M, so a group would end mid-cluster and the two ranks of that cluster \
+                     would compute different N tiles -- which is the ONE thing a B multicast \
+                     forbids",
+                    self.name, self.raster
+                ));
+            }
+            if !self.bm.is_power_of_two() {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: the raster's cluster-uniform early exit derives the m-tile \
+                     count on device as ceil(M/{}) with a SHIFT, which needs a power-of-two CTA-M",
+                    self.name, self.bm
+                ));
+            }
+            if self.raster as usize > 1024 {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: GROUP_M {} exceeds 1024; a group taller than any grid this \
+                     family launches makes grid.z 1 and the raster a no-op wearing a name that \
+                     claims otherwise",
+                    self.name, self.raster
+                ));
+            }
+        }
+        // **The persistent tile loop's own preconditions** (wave-3 lever 2). Its failure mode is a
+        // HANG on rented silicon, which is the one class of defect that must never reach a device.
+        if self.tiles.is_persistent() {
+            if self.multicast == Multicast::ClusterA {
+                // The loop index is `%ctaid.x` precisely because both ranks of a `1x2x1` cluster
+                // share it. `ClusterA`'s `2x1x1` cluster varies the rank ALONG x, so the two ranks
+                // of a cluster would get different `cid` sequences, land on different tiles and --
+                // on any `cluster_tiles % slots` split -- retire at different times, leaving one
+                // rank's producer multicasting into the shared memory of a CTA that has exited.
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: the persistent loop is indexed by grid X so that both ranks \
+                     of a cluster share it, and Multicast::ClusterA's 2x1x1 cluster varies the rank \
+                     along X. A CTA-indexed persistent loop under a cluster HANGS on any \
+                     tiles-mod-slots split (WAVE3_DOSSIER 2.6). Persistence is expressible under \
+                     Multicast::None and Multicast::ClusterB.",
+                    self.name
+                ));
+            }
+            if !self.bn.is_power_of_two() {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: the persistent loop derives the n-tile count on device as \
+                     ceil(N/{}) with a SHIFT, which needs a power-of-two CTA-N",
+                    self.name, self.bn
+                ));
+            }
+            if !self.bm.is_power_of_two() {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: the persistent loop derives the m-tile count on device as \
+                     ceil(M/{}) with a SHIFT, which needs a power-of-two CTA-M",
+                    self.name, self.bm
+                ));
+            }
+            // **The divmod's exactness bound, asserted rather than trusted** (WAVE3_DOSSIER 2.8).
+            // The largest flat cluster index is `m_clusters * n_tiles <= M*N / (BM*BN*cluster_m)`,
+            // and the family already declines past `M*N > u32::MAX` for the epilogue's element
+            // index -- so this is a static statement about the geometry, not a runtime hope.
+            let cid_max = u32::MAX as usize / (self.bm * self.bn * self.cluster_m());
+            if cid_max >= DIVMOD_F32_EXACT_LIMIT {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: a {}x{} tile over a {}-CTA M cluster admits a flat cluster \
+                     index up to {cid_max}, at or past the {DIVMOD_F32_EXACT_LIMIT} bound that \
+                     makes the f32-reciprocal divmod EXACT. Past 2^22 the two-sided correction no \
+                     longer closes rcp.approx's error and the tile remap is off by one -- two CTAs \
+                     on one tile and another computed by nobody.",
+                    self.name,
+                    self.bm,
+                    self.bn,
+                    self.cluster_m()
+                ));
+            }
+        }
+        // **The ring law (L4.4).** A consumer that holds more buffers than the ring has is a
+        // deadlock, and a deadlock must be a printed decline on a CPU rather than a time-box on
+        // rented silicon. At depth `D` the consumer holds `D + 1` buffers (the one it is issuing
+        // against and the `D` whose groups are still in flight) and the producer must still be able
+        // to run one ahead, so the ring needs `D + 2`.
+        if self.stages < self.wait_depth + 2 {
+            return Err(format!(
+                "{UNSUPPORTED}: {}: wait_depth {} needs at least {} stages and this ring has {}. At \
+                 depth D the consumer holds D+1 buffers and the producer must be able to run one \
+                 ahead; a shorter ring is a deadlock, not a slower kernel.",
+                self.name,
+                self.wait_depth,
+                self.wait_depth + 2,
+                self.stages
+            ));
+        }
         // **GUARD G3, and deliberately LAST**: every geometric decline above should name the
         // geometry that is wrong, not the name that follows from it, so a caller probing a shape
         // gets the shape's answer. A row that passes everything else and is still mis-named is the
@@ -1766,6 +2179,373 @@ pub struct LaunchPlan {
     /// `cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION` set to exactly this, because
     /// a compiled cluster requirement the launch does not match is a launch failure.
     pub cluster: (u32, u32, u32),
+    /// **`GROUP_M`** -- see [`WgmmaCfg::raster`]. `1` is the linear order. The launcher never reads
+    /// this directly; it reaches the launch through [`LaunchPlan::grid`], because the raster's grid
+    /// and the raster's in-kernel decode are two halves of ONE decomposition and a second
+    /// derivation of either is how a CTA lands on a tile nobody meant it to have.
+    pub raster: u16,
+    /// **The tile schedule** -- see [`TileSchedule`]. Reached through [`LaunchPlan::grid`] for the
+    /// same reason `raster` is: the grid and the in-kernel loop are two halves of one decomposition.
+    pub tiles: TileSchedule,
+}
+
+/// **The grouped raster's decomposition, as a pure function of the numbers** -- the device-free
+/// twin of the prologue's six instructions (guard G5).
+///
+/// The generated kernel and this struct must agree exactly: the kernel *is* this map, spelled in
+/// PTX. `the_raster_is_a_bijection_over_the_padded_tile_domain` asserts the property the whole
+/// lever rests on, and it is not a formality. The classic raster defect makes the map
+/// **surjective but not injective**: two CTAs compute the same tile in bounds and some other tile
+/// is never computed at all, so `C` returns whatever the host pre-filled there. Against a
+/// zero-filled `C` and an exact-integer oracle that is a block of zeros in an otherwise-correct
+/// matrix -- loud. Against a `C` the harness reuses between arms it is the PREVIOUS arm's answer,
+/// which is a plausible number nobody will question.
+///
+/// # The decomposition
+///
+/// CTAs dispatch x-fastest, then y, then z. Putting the group's cluster-ROW on x and the n-tile on
+/// y therefore makes a wave of 132 CTAs cover `GROUP_M` m-tiles by `132/GROUP_M` n-tiles -- the
+/// `R x C` rectangle section 1.1 of the dossier optimises -- with **no division in the kernel at
+/// all** (the general grouped swizzle needs two runtime integer divisions by launch-dependent
+/// divisors, which on PTX costs either two host-passed magic-number pairs, breaking `PARAM_ORDER`,
+/// or ~18 instructions of `rcp.approx.f32` with a two-sided correction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RasterGrid {
+    /// Cluster-rows per group: `GROUP_M / cluster_m`. `1` under the linear order.
+    pub gc: u32,
+    /// CTAs per cluster along M -- `cluster.1`, so 2 under [`Multicast::ClusterB`] and 1 otherwise.
+    pub cluster_m: u32,
+    /// `ceil(M / BM)`, the real m-tile count.
+    pub m_tiles: u32,
+    /// `ceil(N / BN)`.
+    pub n_tiles: u32,
+    /// Whether the raster is on at all. At `false` this struct still describes the launch (so the
+    /// laws can range over both orders) but [`RasterGrid::dims`] returns the linear grid.
+    pub on: bool,
+}
+
+impl RasterGrid {
+    /// `group_m` is [`WgmmaCfg::raster`]; `cluster_m` is the cluster's M extent in CTAs.
+    pub fn new(group_m: u32, cluster_m: u32, m_tiles: u32, n_tiles: u32) -> Self {
+        let cluster_m = cluster_m.max(1);
+        let group_m = group_m.max(1);
+        Self {
+            gc: (group_m / cluster_m).max(1),
+            cluster_m,
+            m_tiles,
+            n_tiles,
+            on: group_m > 1,
+        }
+    }
+
+    /// m-CLUSTERS, i.e. `ceil(m_tiles / cluster_m)`. The raster groups these, never raw m-tiles:
+    /// a group boundary inside a cluster would split its two ranks onto different N tiles.
+    pub fn m_clusters(&self) -> u32 {
+        self.m_tiles.div_ceil(self.cluster_m)
+    }
+
+    /// The **padded** m-tile count the launch actually covers: `m_clusters * cluster_m`. Under an
+    /// odd m-tile count with a 1x2x1 cluster this is one more than `m_tiles`, and that extra CTA is
+    /// the existing pad CTA -- load-bearing, because it still issues its multicast slice and its
+    /// peer holds half a stale B tile without it.
+    pub fn padded_m_tiles(&self) -> u32 {
+        self.m_clusters() * self.cluster_m
+    }
+
+    /// The CTA grid `(x, y, z)`.
+    pub fn dims(&self) -> (u32, u32, u32) {
+        if !self.on {
+            return (self.n_tiles, self.padded_m_tiles(), 1);
+        }
+        (
+            self.gc,
+            self.cluster_m * self.n_tiles,
+            self.m_clusters().div_ceil(self.gc),
+        )
+    }
+
+    /// **The map itself**: which `(m_tile, n_tile)` the CTA at `(x, y, z)` owns, or `None` when it
+    /// is a surplus cluster-row of a ragged last group and must take the cluster-uniform early
+    /// exit.
+    ///
+    /// The exit is provably deadlock-free *because* the m-cluster is a function of `z` and `x`
+    /// only, and neither varies inside a `1x2x1` cluster -- so both ranks take the branch together
+    /// and no peer is left waiting on a multicast, an `empty[s]` arrival or a cluster barrier.
+    pub fn tile_of(&self, x: u32, y: u32, z: u32) -> Option<(u32, u32)> {
+        if !self.on {
+            return Some((y, x));
+        }
+        let m_cluster = z * self.gc + x;
+        if m_cluster >= self.m_clusters() {
+            return None;
+        }
+        // The cluster rank of a `1 x cluster_m x 1` cluster is its offset along y, by definition of
+        // `%cluster_ctarank` as the linear index inside the cluster.
+        let rank = y % self.cluster_m;
+        Some((m_cluster * self.cluster_m + rank, y / self.cluster_m))
+    }
+
+    /// **Cluster-tiles**: `m_clusters * n_tiles`, the extent the persistent loop's flat index runs
+    /// over. Note it counts CLUSTERS, not CTAs -- iterating CTAs is the deadlock of WAVE3_DOSSIER
+    /// 2.6.
+    pub fn cluster_tiles(&self) -> u32 {
+        self.m_clusters() * self.n_tiles
+    }
+
+    /// **The persistent path's map**: which `(m_tile, n_tile)` cluster-tile `cid` at intra-cluster
+    /// rank `rank` owns.
+    ///
+    /// # Why this is a second map and not the same one
+    ///
+    /// [`RasterGrid::tile_of`]'s division-free trick works because the non-persistent kernel's tile
+    /// index *is* `%ctaid`, so the group structure can live in the grid. Under persistence the tile
+    /// index is a LOOP VARIABLE, so the swizzle has to be computed in-kernel from a flat `cid` and
+    /// two runtime integer divisions come back. They are worth taking: ~26 instructions once per
+    /// tile against `n_k >= 16` stages of ~1200 clocks each is **under 0.06% of a tile**
+    /// (WAVE3_DOSSIER 2.8), and the alternative is host-passed magic numbers, which is a
+    /// `PARAM_ORDER` change.
+    ///
+    /// This is Triton's grouped-M form applied to the CLUSTER index, and it is bijective over
+    /// `[0, m_clusters * n_tiles)` **including the short last group**: for the last `grp`, `i`
+    /// ranges over `[0, rows*n_tiles)` and `(i % rows, i / rows)` covers `[0,rows) x [0,n_tiles)`
+    /// exactly once. Persistence therefore removes the ragged-group pad of
+    /// [`wgmma_tile_origin_ptx`] entirely -- `cid` enumerates only real cluster-tiles and no CTA
+    /// needs the cluster-uniform early exit.
+    pub fn tile_of_cid(&self, cid: u32, rank: u32) -> (u32, u32) {
+        let (cm, cn) = if !self.on {
+            // Linear: n-fastest, which is the order the non-persistent grid dispatches in
+            // (`x` = n tile is the fastest-varying axis), so the two arms differ in the GROUPING
+            // and in nothing else.
+            (cid / self.n_tiles, cid % self.n_tiles)
+        } else {
+            let gcols = self.gc * self.n_tiles;
+            let grp = cid / gcols;
+            let i = cid % gcols;
+            let rows = self.gc.min(self.m_clusters() - grp * self.gc);
+            (grp * self.gc + i % rows, i / rows)
+        };
+        (cm * self.cluster_m + rank, cn)
+    }
+}
+
+/// **The tile origin, and the only place in the generated kernel that reads `%ctaid`.**
+///
+/// One function, emitted once, so the linear order and the grouped raster cannot end up as two
+/// spellings of an axis that disagree. Under `GROUP_M = 1` it emits the two instructions this
+/// family has emitted since round 1, byte for byte -- which is what
+/// `the_linear_order_emits_the_same_two_instructions_it_always_did` pins, so no pre-wave-3 row's
+/// PTX moves by a character when the field lands.
+///
+/// Under a grouped raster it emits the [`RasterGrid`] decode: six instructions and **no division**,
+/// plus the cluster-uniform early exit for a ragged last group.
+///
+/// # Why the exit must come HERE, before `mbarrier.init`
+///
+/// A surplus cluster-row that ran the full K loop over zero-filled tiles would be up to 41% of the
+/// device doing nothing (M = 4224 gives 17 m-clusters against a group of 8). Exiting is correct
+/// only *before* `mbarrier.init` and its `fence.mbarrier_init.release.cluster`: an exit after the
+/// first `barrier.cluster.arrive` is a hang, and re-initialising a barrier a peer may be signalling
+/// is the classic cluster race. Both ranks of a cluster take the branch together because the
+/// m-cluster is a function of `%ctaid.z` and `%ctaid.x` alone and neither varies inside a `1x2x1`
+/// cluster.
+fn wgmma_tile_origin_ptx(cfg: &WgmmaCfg) -> String {
+    let (bm, bn) = (cfg.bm, cfg.bn);
+    if cfg.raster <= 1 {
+        return format!(
+            "    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %ctan,%tmp,{bn};\n    mov.u32 \
+             %tmp,%ctaid.y;\n    mul.lo.s32 %ctam,%tmp,{bm};\n"
+        );
+    }
+    let cm = cfg.multicast.cluster_shape().1.max(1) as usize;
+    let gc = (cfg.raster as usize / cm).max(1);
+    let bm_shift = bm.trailing_zeros();
+    let cm_shift = cm.trailing_zeros();
+    let mut s = format!(
+        "    // grouped raster, GROUP_M = {} ({gc} cluster-rows x {cm} CTAs): x = cluster-row in \
+         group, z = group\n",
+        cfg.raster
+    );
+    s += "    mov.u32 %tmp,%ctaid.z;\n    mov.u32 %tmp2,%ctaid.x;\n";
+    s += &format!("    mad.lo.s32 %tmp,%tmp,{gc},%tmp2;\n");
+    // gcy = ceil(ceil(M/BM) / cluster_m), both divisors powers of two, so both divides are shifts.
+    s += &format!(
+        "    add.u32 %tmp2,%M,{};\n    shr.u32 %tmp2,%tmp2,{bm_shift};\n",
+        bm - 1
+    );
+    if cm > 1 {
+        s += &format!(
+            "    add.u32 %tmp2,%tmp2,{};\n    shr.u32 %tmp2,%tmp2,{cm_shift};\n",
+            cm - 1
+        );
+    }
+    // The cluster-uniform early exit for a surplus cluster-row of a ragged last group.
+    s += "    setp.ge.u32 %p0,%tmp,%tmp2;\n    @%p0 ret;\n";
+    if cm > 1 {
+        s += &format!("    shl.b32 %tmp,%tmp,{cm_shift};\n    add.u32 %tmp,%tmp,%crank;\n");
+    }
+    s += &format!("    mul.lo.s32 %ctam,%tmp,{bm};\n");
+    s += "    mov.u32 %tmp2,%ctaid.y;\n";
+    if cm > 1 {
+        s += &format!("    shr.u32 %tmp2,%tmp2,{cm_shift};\n");
+    }
+    s += &format!("    mul.lo.s32 %ctan,%tmp2,{bn};\n");
+    s
+}
+
+/// **An exact `u32` divmod in 13 instructions, with no `div`, no `rem` and no host-passed magic
+/// number** (WAVE3_DOSSIER 2.8).
+///
+/// `rcp.approx.ftz.f32` is within 1 ulp and f32 has a 24-bit significand, so the truncated estimate
+/// is off by at most one in either direction; the two-sided correction closes exactly that. The
+/// result is therefore **exact for `a, b < 2^22`** -- a bound [`WgmmaCfg::validate`] proves
+/// unreachable from the geometry rather than assuming.
+///
+/// Why not `div.u32` / `rem.u32`: they exist, and on this hardware they are a ~20-instruction
+/// expansion each with a much longer dependent chain. Why not host-passed magic numbers: they are
+/// two more kernel parameters, and `PARAM_ORDER` is a six-entry law enforced by
+/// `every_wgmma_entry_declares_exactly_the_parameters_the_launcher_pushes`.
+///
+/// `q` and `r` must be distinct registers, and neither may alias `a` (the remainder is computed
+/// from `a` after `q` is written). `%fa`/`%fb`/`%fr`/`%fq`/`%pc` are the helper's own scratch.
+fn divmod_u32_ptx(q: &str, r: &str, a: &str, b: &str) -> String {
+    format!(
+        "    cvt.rn.f32.u32 %fa,{a};\n    cvt.rn.f32.u32 %fb,{b};\n    rcp.approx.ftz.f32 \
+         %fr,%fb;\n    mul.f32 %fq,%fa,%fr;\n    cvt.rzi.u32.f32 {q},%fq;\n    mul.lo.s32 \
+         {r},{q},{b};\n    sub.s32 {r},{a},{r};\n    setp.lt.s32 %pc,{r},0;\n    @%pc sub.u32 \
+         {q},{q},1;\n    @%pc add.s32 {r},{r},{b};\n    setp.ge.s32 %pc,{r},{b};\n    @%pc add.u32 \
+         {q},{q},1;\n    @%pc sub.s32 {r},{r},{b};\n"
+    )
+}
+
+/// **The persistent loop's bounds, computed once per kernel** -- the m-cluster count, the n-tile
+/// count, their product (the flat cluster-tile extent), this CTA's starting cluster slot and the
+/// stride.
+///
+/// Every divide here is a SHIFT: `BM`, `BN` and `cluster_m` are all powers of two, validated. The
+/// stride is read as `%nctaid.x` rather than baked in as `HOPPER_SM_COUNT / cluster_ctas`, so the
+/// kernel is correct at whatever grid the host launched -- under- or over-subscribed -- and
+/// [`LaunchPlan::grid`] cannot disagree with it.
+///
+/// **`%cid` is `%ctaid.x` and that is the deadlock law** (WAVE3_DOSSIER 2.6). Both ranks of a
+/// `1x2x1` cluster share `%ctaid.x`, so they iterate the identical sequence and have identical tile
+/// counts *by construction*. A CTA-indexed loop -- `tile = ctaid; tile += gridDim` -- puts the two
+/// ranks of a cluster on opposite sides of any `tiles mod slots` split, and then rank 0's producer
+/// waits forever on `empty[s]` arrivals rank 1 will never make and multicasts into the shared memory
+/// of a CTA that has exited. This is not a check to be added; it is a shape of loop that makes the
+/// check unnecessary, which is the only kind of fix worth having for a deadlock.
+fn wgmma_tile_bounds_ptx(cfg: &WgmmaCfg) -> String {
+    let (bm, bn) = (cfg.bm, cfg.bn);
+    let cm = cfg.cluster_m();
+    let mut s = format!(
+        "    // persistent tile loop -- {}; the loop index is the CLUSTER, never the CTA\n",
+        cfg.tiles.label()
+    );
+    s += &format!(
+        "    add.u32 %tmp,%M,{};\n    shr.u32 %mclus,%tmp,{};\n",
+        bm - 1,
+        bm.trailing_zeros()
+    );
+    if cm > 1 {
+        s += &format!(
+            "    add.u32 %mclus,%mclus,{};\n    shr.u32 %mclus,%mclus,{};\n",
+            cm - 1,
+            cm.trailing_zeros()
+        );
+    }
+    s += &format!(
+        "    add.u32 %tmp,%N,{};\n    shr.u32 %ntile,%tmp,{};\n",
+        bn - 1,
+        bn.trailing_zeros()
+    );
+    s += "    mul.lo.s32 %nct,%mclus,%ntile;\n";
+    s += "    mov.u32 %cid,%ctaid.x;\n    mov.u32 %slots,%nctaid.x;\n";
+    s
+}
+
+/// **The persistent tile map: flat cluster index -> `%ctam` / `%ctan`.**
+///
+/// Emitted from ONE function and asserted to appear **exactly twice** in the entry -- once in the
+/// producer branch, once in the consumer branch. If the two copies ever disagreed the consumer would
+/// compute with the producer's tile: silently wrong, no hang, and NOT caught by the epilogue's bounds
+/// predicates, which only know `row < M && col < N`. This is the same discipline
+/// [`Multicast::cluster_shape`] carries so the launch attribute, the `.reqnctapercluster` directive
+/// and the grid's rounding cannot disagree.
+///
+/// Under a raster it is the grouped-M swizzle of WAVE3_DOSSIER 2.8 applied to the CLUSTER index with
+/// `%crank` re-added -- so both ranks land on the same `%ctan`, which is the one thing a B multicast
+/// forbids breaking. Without one it is a single divmod in n-fastest order, which is the order the
+/// non-persistent grid dispatches in, so the two arms differ in the GROUPING and in nothing else.
+fn wgmma_tile_index_ptx(cfg: &WgmmaCfg) -> String {
+    let (bm, bn) = (cfg.bm, cfg.bn);
+    let cm = cfg.cluster_m();
+    let mut s = String::from("    // tile index <- flat cluster id (WAVE3_DOSSIER 2.8)\n");
+    if cfg.raster > 1 {
+        let gc = (cfg.raster as usize / cm).max(1);
+        s += &format!("    mul.lo.s32 %cgcols,%ntile,{gc};\n");
+        s += &divmod_u32_ptx("%cgrp", "%ci", "%cid", "%cgcols");
+        // rows = min(GC, m_clusters - grp*GC): the last group may be short, and its `i` then runs
+        // over `[0, rows*n_tiles)` so `(i % rows, i / rows)` still covers it exactly once.
+        s += &format!("    mul.lo.s32 %crows,%cgrp,{gc};\n");
+        s += "    sub.s32 %crows,%mclus,%crows;\n";
+        s += &format!("    min.u32 %crows,%crows,{gc};\n");
+        s += &divmod_u32_ptx("%ccn", "%cr", "%ci", "%crows");
+        s += &format!("    mad.lo.s32 %ccm,%cgrp,{gc},%cr;\n");
+    } else {
+        s += &divmod_u32_ptx("%ccm", "%ccn", "%cid", "%ntile");
+    }
+    if cm > 1 {
+        s += &format!(
+            "    shl.b32 %ccm,%ccm,{};\n    add.u32 %ccm,%ccm,%crank;\n",
+            cm.trailing_zeros()
+        );
+    }
+    s += &format!("    mul.lo.s32 %ctam,%ccm,{bm};\n");
+    s += &format!("    mul.lo.s32 %ctan,%ccn,{bn};\n");
+    s
+}
+
+/// **Release one ring stage's `empty` barrier**, from the slot index in `slot_reg`.
+///
+/// One function, three call sites (the mainloop's release, `CDRAIN`'s tail releases, and nothing
+/// else), because the clustered form is eight instructions of `cvta`/`mapa`/`arrive` per peer and
+/// three hand-written copies of it would be three chances to release the wrong CTA's barrier --
+/// which is a producer refilling a stage a peer is still reading, i.e. wrong operands with no error.
+///
+/// `pred` is an optional extra predicate ANDed with "this thread is lane 0 of its warpgroup": the
+/// mainloop's lagged release uses it for the first `wait_depth` iterations, which have no older
+/// group to retire.
+fn stage_release_ptx(cfg: &WgmmaCfg, slot_reg: &str, pred: Option<&str>) -> String {
+    let empty_base = cfg.empty_off(0);
+    let mut s = format!("    mul.wide.u32 %rdT,{slot_reg},8;\n    add.s64 %rdBar,%rdS,%rdT;\n");
+    s += &format!("    add.s64 %rdBar,%rdBar,{empty_base};\n");
+    s += "    and.b32 %tmp,%lin,127;\n    setp.eq.u32 %p2,%tmp,0;\n";
+    if let Some(p) = pred {
+        s += &format!("    and.pred %p2,%p2,{p};\n");
+    }
+    s += &barrier_arrive_ptx(cfg);
+    s
+}
+
+/// The `@%p2`-predicated arrival on the barrier whose GENERIC address is in `%rdBar`: CTA-local
+/// without a cluster, and one `mapa`-relative arrival per cluster CTA with one.
+///
+/// Under a cluster a stage's slice was multicast in by a peer's producer, so that producer may not
+/// overwrite it until every consumer IN THE CLUSTER is done -- which is why `empty[s]` is
+/// initialised with `cluster_ctas * consumer_wgs` arrivals and gets one from every consumer
+/// warpgroup of every CTA. `mapa` takes a 32-bit SHARED address, not the 64-bit generic one, and an
+/// mbarrier arrival at `.shared::cluster` scope cannot return a state token (hence the `_` sink):
+/// both are the CUTLASS idiom verbatim.
+fn barrier_arrive_ptx(cfg: &WgmmaCfg) -> String {
+    if cfg.cluster_ctas() <= 1 {
+        return "    @%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];\n".to_string();
+    }
+    let mut s = "    cvta.to.shared.u64 %rdT,%rdBar;\n    cvt.u32.u64 %sbar,%rdT;\n".to_string();
+    for r in 0..cfg.cluster_ctas() {
+        s += &format!("    mov.u32 %tmp2,{r};\n");
+        s += "    mapa.shared::cluster.u32 %rbar,%sbar,%tmp2;\n";
+        s += "    @%p2 mbarrier.arrive.shared::cluster.b64 _,[%rbar];\n";
+    }
+    s
 }
 
 impl LaunchPlan {
@@ -1803,11 +2583,50 @@ impl LaunchPlan {
     /// CTA of that cluster with half a tile: correct numbers on the part it fetched itself and stale
     /// shared memory on the rest. Nothing in the generated producer is predicated on `ctan < N` or
     /// `ctam < M` for exactly this reason.
+    ///
+    /// # Under a grouped raster the grid is THREE-dimensional, and that is the whole trick
+    ///
+    /// `x` becomes the cluster-row within a group, `y` the n-tile with the cluster rank folded into
+    /// its low bit, and `z` the group index -- see [`RasterGrid`]. The cluster's own rounding is
+    /// then structural rather than applied: `y = cluster_m * n_tiles` is a multiple of `cluster_m`
+    /// by construction, and `x = gc` is a multiple of the cluster's X extent because the raster
+    /// declines under [`Multicast::ClusterA`] (`validate`). This function and
+    /// [`RasterGrid::tile_of`] are the two halves of one decomposition and are derived from the one
+    /// [`RasterGrid`], so a grid that disagrees with the kernel's decode is not expressible.
     pub fn grid(&self, m: usize, n: usize) -> (u32, u32, u32) {
+        let cy = self.cluster.1.max(1);
+        // **Under persistence the grid is FLAT, and it is a grid of CLUSTER SLOTS.** `x` is the
+        // cluster slot -- which both ranks of a cluster share, by construction, because the cluster
+        // extends along `y` -- and `y` is the rank. The kernel's stride is `%nctaid.x`, i.e. exactly
+        // this `x`, so an under- or over-subscribed launch is still correct and the two derivations
+        // cannot disagree. The raster's group structure moves into the kernel
+        // ([`RasterGrid::tile_of_cid`]) because the tile index is now a loop variable, not `%ctaid`.
+        if self.tiles.is_persistent() {
+            let ctas = self.cluster_ctas().max(1);
+            let g = RasterGrid::new(
+                self.raster as u32,
+                cy,
+                m.div_ceil(self.bm) as u32,
+                n.div_ceil(self.bn) as u32,
+            );
+            let nct = g.cluster_tiles().max(1);
+            // Never more slots than there are cluster-tiles: a 6-cluster shape must not launch 66
+            // slots, 60 of which fall straight out of the loop guard.
+            let slots = ((HOPPER_SM_COUNT as u32) / ctas).max(1).min(nct);
+            return (slots, cy, 1);
+        }
+        if self.raster > 1 {
+            return RasterGrid::new(
+                self.raster as u32,
+                cy,
+                m.div_ceil(self.bm) as u32,
+                n.div_ceil(self.bn) as u32,
+            )
+            .dims();
+        }
         let cx = self.cluster.0.max(1) as usize;
         let x = n.div_ceil(self.bn).div_ceil(cx) * cx;
-        let cy = self.cluster.1.max(1) as usize;
-        let y = m.div_ceil(self.bm).div_ceil(cy) * cy;
+        let y = m.div_ceil(self.bm).div_ceil(cy as usize) * cy as usize;
         (x as u32, y as u32, 1)
     }
 }
@@ -1856,6 +2675,10 @@ pub const WGMMA_W1: WgmmaCfg = WgmmaCfg {
     multicast: Multicast::None,
     epilogue: EpilogueStore::Scalar,
     l2_hint: L2Hint::None,
+    raster: 1,
+    tiles: TileSchedule::OneTilePerCta,
+    wait_depth: 0,
+    fence_hoisted: false,
 };
 
 /// **The descriptor reading every shipped row carries**, in one place so the sweep's "ACTION" line is
@@ -2075,6 +2898,652 @@ pub fn wgmma_w1_bf16_for(m: usize, n: usize) -> &'static WgmmaCfg {
     }
 }
 
+// --- wave 3 lever 3: the per-shape dispatcher -----------------------------------------------------
+
+/// L2 on the H100 SXM5 this campaign rents, bytes (50.0 MiB). Measured, r3 log line 522.
+pub const L2_BYTES: f64 = 52_428_800.0;
+/// The measured L2 read bandwidth, B/s. `gpt_d1024_down` runs 597.6 TFLOP/s through `I_cta = 85.33`,
+/// which is exactly this -- the shape IS the calibration.
+pub const BW_L2: f64 = 7.00e12;
+/// HBM peak, B/s (the datasheet number; the measured copy rate on this fleet is 2.92 TB/s = 87.2%).
+pub const BW_HBM: f64 = 3.35e12;
+/// **The reference tile every cost constant below was MEASURED at**: W1's `128x256`, 4 ring stages.
+///
+/// Nothing in the campaign has timed a 128x128 or a 128x64 mainloop, so every other tile's cost is
+/// an extrapolation from this one -- and [`tile_fixed_s`] / [`k_stage_s`] are where that
+/// extrapolation is written down, once, instead of being smuggled in by applying this tile's numbers
+/// to another tile's geometry.
+pub const FLOOR_REF_TILE: (usize, usize, usize) = (128, 256, 4);
+/// The per-tile fixed cost at the reference tile, seconds: ring fill + the `wgmma.wait_group 0`
+/// drain + 128 predicated stores + prologue. Fit B, from `sq4096` and `gpt_d1024_up` at an IDENTICAL
+/// 512-tile / 4-wave grid differing only in K, so the fit has no wave term at all.
+///
+/// It is the SUM of the three terms below, and the law
+/// `the_per_tile_floor_decomposes_into_its_measured_halves` asserts that, so the decomposition can
+/// never drift away from the number Fit B measured.
+pub const TILE_FIXED_S: f64 = 14.61e-6;
+/// **One ring stage of FILL at the reference tile**, seconds (Fit C: `X4 - X3 = 13.84 - 11.88`).
+///
+/// It is a BANDWIDTH event, not a latency one: 1.96 us moves `132 CTAs x 49 152 B = 6.488 MB`
+/// device-wide, i.e. 3.31 TB/s = 98.7% of HBM peak. So it scales with the SMEM bytes a stage fills,
+/// `stages * (bm + bn) * bk * dtype`, and at a fixed `bk` that is `stages * (bm + bn)`.
+pub const X_FILL_PER_STAGE_S: f64 = 1.96e-6;
+/// **The epilogue's share of the reference tile's fixed cost**, seconds (`X - X_fill` on Fit A's
+/// `X = 13.84`: `13.84 - 4 x 1.96 = 5.99`).
+///
+/// It writes `bm * bn * 4` bytes -- 17.30 MB device-wide at the reference tile, against a pure
+/// HBM-write floor of 5.16 us, so it is within 16% of its own bandwidth roof. It therefore scales
+/// with `bm * bn`.
+pub const X_EPI_S: f64 = 5.99e-6;
+/// What is left of Fit B's `X` once the fill and the epilogue are accounted for: the prologue, the
+/// role split and the mbarrier init. Tile-INDEPENDENT -- it is per-CTA setup, not per-byte work.
+///
+/// It is also where the two fits' disagreement lives, and saying so is the honest framing: the fill
+/// and the epilogue are priced off Fit A's `X = 13.84` (the mcb2 arm, where Fit C's ring-depth A/B
+/// was run) while [`TILE_FIXED_S`] is Fit B's `X = 14.61` (the un-clustered arm), which the dossier
+/// calls "agree to within 5% from completely disjoint data". The 0.77 us of that disagreement is
+/// carried HERE, in the one term that does not scale with a tile dimension, so it can never distort
+/// the two terms that do.
+pub const X_PROLOGUE_S: f64 = 0.78e-6;
+/// The per-k-stage cost at the reference tile, seconds, from Fit B.
+pub const K_STAGE_S: f64 = 0.7126e-6;
+
+/// **The per-tile fixed cost `X` at an arbitrary tile**, seconds.
+///
+/// The fill scales with the SMEM bytes it moves (`stages * (bm+bn)`, at this family's fixed `bk`),
+/// the epilogue with the C bytes it writes (`bm*bn`), and the prologue not at all. At
+/// [`FLOOR_REF_TILE`] this returns [`TILE_FIXED_S`] exactly.
+///
+/// # Why this function has to exist
+///
+/// [`TILE_FIXED_S`] and [`K_STAGE_S`] are 128x256 numbers. Applying them at a 128x64 tile charges
+/// 14.61 us of fixed cost against a real 6.20 and 0.7126 us per k-stage against 0.178 -- at `sq1024`
+/// a **2.9x** floor, 26.01 us instead of 9.05. The floor is the DENOMINATOR of the cluster predicate,
+/// so an inflated one understates `f_L2` by the same factor and can only ever produce an accidental
+/// verdict. WAVE3_DOSSIER 3.7's pseudocode carries the same shortcut (its own comment says "at
+/// 128x256" out loud); this is where it is repaired rather than transcribed.
+///
+/// # What it deliberately does NOT model
+///
+/// The dossier scales the fill by the RESIDENT CTA count at `sq1024` alone (`7.85 * 32/132 = 1.90`,
+/// giving `X = 8.66` against its stated 8.65) and ignores the same 3% correction at every 128-tile
+/// shape. Adding it here would reproduce that one row and change no verdict in the suite, so it is
+/// left out: a model term that fires at one shape and is dropped at the next is not a model.
+pub fn tile_fixed_s(bm: usize, bn: usize, stages: usize) -> f64 {
+    let (rbm, rbn, _) = FLOOR_REF_TILE;
+    let fill = X_FILL_PER_STAGE_S * stages as f64 * (bm + bn) as f64 / (rbm + rbn) as f64;
+    let epi = X_EPI_S * (bm * bn) as f64 / (rbm * rbn) as f64;
+    fill + epi + X_PROLOGUE_S
+}
+
+/// **The per-k-stage cost `S` at an arbitrary tile**, seconds.
+///
+/// One k-stage is `bm * bn * bk` MAC, and the mainloop is tensor-core-issue-bound at every tile this
+/// family emits, so `S` scales with `bm * bn` at a fixed `bk`. That gives 0.356 us at 128x128 and
+/// 0.178 at 128x64 against the reference 0.7126 -- WAVE3_DOSSIER 3.4's own `~0.337` and `~0.165`, to
+/// within the 6-8% its tildes admit, and on the conservative (higher-floor) side of them.
+pub fn k_stage_s(bm: usize, bn: usize) -> f64 {
+    let (rbm, rbn, _) = FLOOR_REF_TILE;
+    K_STAGE_S * (bm * bn) as f64 / (rbm * rbn) as f64
+}
+
+/// **The share of a tile's L2 read that a `1x2x1` B multicast removes**: `(bn/2) / (bm + bn)`.
+///
+/// The cluster turns `(bm + bn)` bytes of L2 read per tile into `(bm + bn/2)`, so what it removes is
+/// `(bn/2)/(bm+bn)` of the L2 term -- **1/3 at 128x256, 1/4 at 128x128, 1/6 at 128x64.** The
+/// dossier's "a flat 1.5x at W1" carries its own scope in the phrase "at W1"; this is that phrase as
+/// arithmetic.
+pub fn multicast_l2_share(bm: usize, bn: usize) -> f64 {
+    (bn as f64 / 2.0) / (bm + bn) as f64
+}
+
+/// **The memory roof of one launch, seconds -- and the one term the RASTER moves.**
+///
+/// `resident` is `waves <= 1 || final_wave_footprint <= L2_BYTES`: does a wave's operand footprint
+/// survive in L2 long enough for the next wave's tiles to reuse it?
+///
+/// * **Resident.** The DRAM traffic is compulsory -- every operand byte is fetched once, ahead of
+///   the many L2 hits that reuse it -- so the two streams overlap and the roof is
+///   `max(T_L2, T_DRAM)`. This is WAVE3_DOSSIER 0.4's `T_pred = max(T_floor, T_L2, T_DRAM)`
+///   unchanged, which is what leaves all five of its well-explained rows where they were.
+/// * **Thrashing.** The lines a later tile wants were evicted before it got to them, so its read is
+///   a DEMAND miss standing in the critical path rather than a prefetch behind it: the hit stream
+///   and the refill stream stop overlapping and the roof is their **sum**.
+///
+/// # Why this is a repair of the dossier's model and not a decoration on it
+///
+/// 0.4's own accuracy table explains five of seven shapes to within 7% and then says: "the two that
+/// are not -- `sq8192` and `gpt_d4096_up` -- are **exactly** the two whose linear-order wave
+/// footprint exceeds L2." That residual is 1.235 and 1.632. This function is that sentence written
+/// as arithmetic, and it costs **no new fitted constant** -- only [`BW_L2`], [`BW_HBM`] and the
+/// [`L2_BYTES`] residency test section 1.3 already ships as the raster's own criterion. It moves
+/// those two rows to **1.003 and 1.182** and moves no other row at all, because it fires nowhere
+/// else. The law `the_serialised_memory_roof_is_right_exactly_where_the_footprint_is_not_resident`
+/// asserts both halves: applying it everywhere would push `sq4096` to 0.883 and `gpt_d1024_down` to
+/// 0.833, i.e. break two of the five rows that already work.
+///
+/// # What the cluster removes from it
+///
+/// A `1x2x1` B multicast changes the L2->SMEM read and **not the footprint** (WAVE3_DOSSIER 3.1:
+/// "the cluster does not change the footprint"), so the traffic it removes is the pair of CTAs'
+/// duplicate B request -- an L2 **hit**, priced at [`BW_L2`], in both branches above. Removing a
+/// share `s` of the L2 read therefore removes exactly `s * T_L2` from this roof in either branch,
+/// which is why [`DispatchPlan::l2_saving`] stays `f_L2 * share` with `f_L2 = T_L2 / binding` and
+/// `T_L2` at the full [`BW_L2`]. The model change is confined to the DENOMINATOR.
+///
+/// [`DispatchPlan::l2_saving`]: DispatchPlan::l2_saving
+pub fn dispatch_memory_roof_s(
+    l2_read_bytes: f64,
+    dram_bytes: f64,
+    c_bytes: f64,
+    resident: bool,
+) -> f64 {
+    let t_l2 = l2_read_bytes / BW_L2;
+    let t_dram = dram_bytes / BW_HBM;
+    if resident {
+        return t_l2.max(t_dram);
+    }
+    // `dram_bytes` carries the C write, which is not an L2 read; the operand misses are what is
+    // taken out of the hit stream.
+    let miss = (dram_bytes - c_bytes).max(0.0);
+    let hit = (l2_read_bytes - miss).max(0.0);
+    hit / BW_L2 + t_dram
+}
+
+/// The wave efficiency a tile must clear to be selected: `tiles / (sm_count * waves)`.
+///
+/// 0.90 accepts 128x256 at `sq2048` (0.970) and rejects it at `sq1024` (0.242), reproducing BOTH
+/// measured facts with one rule -- where D1's `M*N >= 4.3e6` literal put the narrow tile at sq2048,
+/// which round 3 then measured 11.9% SLOWER there.
+pub const WAVE_EFFICIENCY_FLOOR: f64 = 0.90;
+/// The L2-roof fraction above which the cluster pays for itself **at [`FLOOR_REF_TILE`]**.
+///
+/// # Provenance: this is NOT the number WAVE3_DOSSIER 3.2 tabulates, and the difference is exact
+///
+/// 3.2 fits the threshold to a sign flip bracketed by an `f_L2` of **0.736** (`sq2048`, where the
+/// cluster measured -8.0% on the tight `s3` pair) and **0.810** (`sq8192`, +47.0%). Both of those
+/// are `T_L2 / T_measured`. What [`DispatchPlan::f_l2`] computes is `T_L2 / T_predicted` -- it has
+/// to be, because a device-free pure function of `(M, N, K, sm_count)` has no measurement to divide
+/// by. **The numerator is the same object; the whole divergence is the denominator**, so the two are
+/// related by one exact factor:
+///
+/// ```text
+///     f_L2(computed)  =  f_L2(measured)  x  (T_measured / T_predicted)
+/// ```
+///
+/// and `T_measured / T_predicted` is WAVE3_DOSSIER 0.4's own residual column. Every arm in both of
+/// those tables is the **linear, un-clustered** one -- 0.4 prices `T_DRAM` at the linear footprint
+/// and round 3 ran the cluster A/B without a raster -- so the bracket's two points are this
+/// function evaluated on THAT configuration:
+///
+/// | shape | 3.2's `f_L2` | 0.4's meas/pred, linear arm | **shipped `f_L2`, linear arm** | measured cluster effect |
+/// |---|---|---|---|---|
+/// | `sq2048` | 0.736 | 1.045 | **0.7687** | **-8.0%, the LOSS that sets the floor** |
+/// | `sq8192` | 0.810 | 1.003 | **0.8124** | **+47.0%, the WIN that sets the ceiling** |
+/// | `sq4096` | 0.946 | 1.011 | 0.9553 | +9.3% |
+///
+/// **So the measured bracket `[0.736, 0.810]` is the shipped bracket `[0.769, 0.812]`, and 0.78 is
+/// inside it** -- still at its LOW end, which is 3.2's stated instruction and its reason: a wrong
+/// OFF at sq8192 costs 27 points, a wrong ON at sq2048 costs 5, so be eager. What moves is the
+/// SAFETY MARGIN, and it must be stated rather than inherited: the bracket is **5.7% wide here
+/// against 10% in the dossier's units**, and 0.78 sits **1.4% above `sq2048`** (0.7687) and 4.0%
+/// below `sq8192` (0.8124), not the 5.7% and 3.7% 3.2's own units imply. That tightness is the
+/// honest state of a threshold fitted to one sign change, and it is what a round measuring
+/// `gpt_d1024_down` / `gpt_d1024_up` (WAVE3_DOSSIER 3.8's refusal) exists to widen.
+/// `the_shipped_f_l2_is_a_predicted_denominator_quantity` pins every number in that table, including
+/// the two the reconciliation would be vacuous without: `T_L2` itself, and 3.2's ratio against the
+/// measured time.
+///
+/// The 1.003 at `sq8192` is 0.4's 1.235 repaired by [`dispatch_memory_roof_s`]; before that repair
+/// this bracket read `[0.769, 1.000]`, i.e. the ceiling was pinned at the ratio's own maximum -- the
+/// value `f_L2` takes whenever `T_L2` alone binds -- and carried no information about the margin at
+/// all.
+///
+/// **The bracket point is not the pin.** `sq8192` SHIPS with the raster, where its `f_L2` is 0.8826,
+/// and that is what `the_dispatcher_verdict_is_pinned_at_every_benched_shape` pins: 3.2's standing
+/// instruction is to evaluate on the FINAL configuration, while a bracket fitted to a measurement
+/// must be evaluated on the configuration that was MEASURED. Both numbers are this function's, on
+/// two different arms, and each is used for the thing it is evidence about.
+///
+/// **Every one of those measurements is a 128x256 measurement**, so this number carries that tile's
+/// scope with it and [`cluster_l2_saving_threshold`] is what carries it to another tile.
+///
+/// [`DispatchPlan::f_l2`]: DispatchPlan::f_l2
+pub const CLUSTER_F_L2_THRESHOLD: f64 = 0.78;
+
+/// **What the cluster must actually SAVE to be worth its coupling cost**: the fraction of the binding
+/// roof a `1x2x1` B multicast removes, `f_L2 * multicast_l2_share(bm, bn)`, at the break-even
+/// [`CLUSTER_F_L2_THRESHOLD`] was fitted at -- `0.78 * 1/3 = 0.26`.
+///
+/// # Why the predicate is the saving and not `f_L2` itself
+///
+/// `f_L2 >= 0.78` and `f_L2 * share >= 0.26` are **the same comparison at 128x256** and only there.
+/// The multicast removes `(bn/2)/(bm+bn)` of the L2 term -- 1/3 at 128x256, 1/4 at 128x128, 1/6 at
+/// 128x64 -- so the bare 0.78 asks a narrow tile to clear a bar that was priced for a lever three
+/// times its size, and would turn the cluster ON at `sq1024` (`f_L2` 0.79 at the 128x64 tile the rule
+/// selects) where WAVE3_DOSSIER 3.6 says OFF.
+///
+/// The mechanism is the campaign's own spine sentence, `ACT2_WAVE_PLAN.md:5`: **"Multicast the wider
+/// operand."** At 128x256, `B` is twice `A` and halving it removes a third of the read. At 128x128
+/// neither operand is wider. At 128x64 `B` is the NARROW one and the multicast is on the wrong
+/// operand entirely. The share is that sentence as arithmetic, and the consequence is worth stating
+/// plainly: **`0.25 < 0.26`, so even a perfectly L2-bound 128x128 shape declines the cluster** -- by
+/// 4%, which is inside nothing this campaign has measured. It is a REFUSAL, not a result: no shape in
+/// the suite reaches the square tile, and the rule declines rather than guessing. A round that ever
+/// measures the cluster at 128x128 is what would move it.
+pub fn cluster_l2_saving_threshold() -> f64 {
+    let (rbm, rbn, _) = FLOOR_REF_TILE;
+    CLUSTER_F_L2_THRESHOLD * multicast_l2_share(rbm, rbn)
+}
+
+/// The tiles [`wgmma_dispatch`] may choose from as `(bm, bn, stages)`, widest first. 128x256 /
+/// 128x128 / 128x64 are the three the register file and `Schedule::Cooperative` allow (CTA-M must be
+/// a multiple of 128, and `bm = 64 * consumer_wgs`); 192-row tiles are DEAD, not deferred -- 192 is
+/// not a multiple of 128 and 512 threads cap ptxas at 128 registers against 128 accumulators alone.
+///
+/// **The stage depth is here because the floor depends on it**: [`tile_fixed_s`]'s ring-fill term is
+/// `stages * (bm+bn)` of SMEM, so a menu that carried only the tile shape would price the 6-stage
+/// square tile at 4 stages of fill. It is not a free parameter: the law
+/// `the_dispatch_menu_is_a_menu_of_shipped_geometries` asserts every row is the `(bm, bn, stages)`
+/// of a module this family actually emits, so the rule cannot cost a depth nothing assembles.
+const DISPATCH_TILES: &[(usize, usize, usize)] = &[(128, 256, 4), (128, 128, 6), (128, 64, 4)];
+
+/// **What [`wgmma_dispatch`] decided, as data** -- so the round can print the rule's reasoning
+/// beside its result instead of a reader inferring it from a module name.
+/// **The three decisions are each a comparison against a threshold, and the two comparands are
+/// carried here too.** A verdict without its own numbers is a verdict a reader has to re-derive from
+/// a dossier to argue with, and the two thresholds ([`WAVE_EFFICIENCY_FLOOR`] and
+/// [`CLUSTER_F_L2_THRESHOLD`]) sit inside measured brackets that a later round can move.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DispatchPlan {
+    pub bm: usize,
+    pub bn: usize,
+    pub tiles: usize,
+    pub waves: usize,
+    pub cluster: bool,
+    pub raster: bool,
+    /// `GROUP_M` when `raster` is on; `1` otherwise.
+    pub group_m: usize,
+    pub persistent: bool,
+    /// `tiles / (sm_count * waves)` for the tile that was CHOSEN -- the quantity
+    /// [`WAVE_EFFICIENCY_FLOOR`] is compared against.
+    pub wave_efficiency: f64,
+    /// The LINEAR order's wave footprint in bytes, `f(R_linear) * K * 2`. The raster fires iff this
+    /// exceeds [`L2_BYTES`] on a multi-wave grid, so the number and its threshold belong together.
+    pub linear_footprint_bytes: f64,
+    /// The FINAL configuration's wave footprint in bytes -- `f(GROUP_M) * K * 2` under the raster,
+    /// [`linear_footprint_bytes`] without it. **This is the field the raster's mechanism enters the
+    /// cluster decision through**, via [`l2_resident`].
+    ///
+    /// [`linear_footprint_bytes`]: DispatchPlan::linear_footprint_bytes
+    /// [`l2_resident`]: DispatchPlan::l2_resident
+    pub final_footprint_bytes: f64,
+    /// `waves <= 1 || final_footprint_bytes <= L2_BYTES`: does a wave's operand footprint survive
+    /// in L2 for the next wave to reuse? It selects which branch of [`dispatch_memory_roof_s`]
+    /// prices this configuration, and it is the ONLY input to the cluster decision the raster
+    /// moves.
+    pub l2_resident: bool,
+    /// `waves * (tile_fixed_s + ceil(K/64) * k_stage_s)` at the tile that was CHOSEN, seconds.
+    pub floor_s: f64,
+    /// [`dispatch_memory_roof_s`] at this configuration, seconds.
+    pub memory_roof_s: f64,
+    /// The whole launch's L2->SMEM operand read, `tiles * (bm+bn) * K * 2` bytes. `T_L2` is this
+    /// over [`BW_L2`], and it is `f_L2`'s numerator and the term a B multicast removes
+    /// [`multicast_l2_share`] of.
+    pub l2_read_bytes: f64,
+    /// The FINAL configuration's DRAM traffic in bytes: operands at the chosen order's footprint,
+    /// plus the `C` write. **This is the byte count the raster moves** (2.384 -> 0.797 GB at
+    /// `gpt_d4096_up`); it changes no L2 read at all.
+    pub dram_bytes: f64,
+    /// The L2-roof fraction of the FINAL configuration, `T_L2 / max(T_floor, T_memory)`.
+    ///
+    /// **It is a PREDICTED-denominator quantity and WAVE3_DOSSIER 3.2's column is a MEASURED one**
+    /// -- same numerator, and related by 0.4's residual exactly:
+    /// `f_L2(here) = f_L2(3.2) x (T_measured / T_predicted)`. That is why this reads 0.7687 where
+    /// 3.2 reads 0.736, and 0.8124 on the linear arm 3.2 measured at `sq8192` where 3.2 reads 0.810
+    /// (0.8826 on the RASTERED arm that shape actually ships, which is a different configuration and
+    /// the one 3.2's "evaluate on the final configuration" instruction asks for). See
+    /// [`CLUSTER_F_L2_THRESHOLD`] for the whole table and for what the difference does to the
+    /// threshold's safety margin, and `the_shipped_f_l2_is_a_predicted_denominator_quantity` for the
+    /// law that pins it.
+    ///
+    /// **It is also the dossier's diagnostic, not the predicate's comparand** -- see [`l2_saving`],
+    /// which is this number times the share of the L2 term a multicast on THIS tile actually
+    /// removes. The two are equal up to the constant `1/3` at [`FLOOR_REF_TILE`] and nowhere else.
+    ///
+    /// [`l2_saving`]: DispatchPlan::l2_saving
+    pub f_l2: f64,
+    /// **The quantity [`cluster_l2_saving_threshold`] is compared against**: the fraction of the
+    /// binding roof a `1x2x1` B multicast would remove at the tile actually chosen,
+    /// `f_l2 * multicast_l2_share(bm, bn)`.
+    pub l2_saving: f64,
+}
+
+impl DispatchPlan {
+    /// **One line for a round log: the verdict AND both comparands.** A rule that prints only its
+    /// answer is a rule a reader has to take on trust; printing `wave eff 0.970 >= 0.90` and
+    /// `saves 0.184 < 0.26` beside it is what lets the round's own table falsify the thresholds
+    /// instead of inheriting them.
+    ///
+    /// The cluster column prints the SAVING and its factors (`f_L2 x share`) rather than `f_L2`
+    /// alone, because at any tile but [`FLOOR_REF_TILE`] `f_L2` is not what the rule compared.
+    pub fn summary(&self) -> String {
+        format!(
+            "{}x{} tile, {} tiles / {} waves (eff {:.3} vs floor {:.2}) | cluster {} (saves {:.3} \
+             = f_L2 {:.3} x share {:.3}, vs {:.2}) | raster {} (linear footprint {:.1} MB vs L2 \
+             {:.1} MB) | persistent {} | final footprint {:.1} MB, {}",
+            self.bm,
+            self.bn,
+            self.tiles,
+            self.waves,
+            self.wave_efficiency,
+            WAVE_EFFICIENCY_FLOOR,
+            if self.cluster { "ON " } else { "off" },
+            self.l2_saving,
+            self.f_l2,
+            multicast_l2_share(self.bm, self.bn),
+            cluster_l2_saving_threshold(),
+            if self.raster {
+                format!("ON GROUP_M {}", self.group_m)
+            } else {
+                "off".to_string()
+            },
+            self.linear_footprint_bytes / 1.0e6,
+            L2_BYTES / 1.0e6,
+            self.persistent,
+            self.final_footprint_bytes / 1.0e6,
+            if self.l2_resident {
+                "L2-RESIDENT (roof = max(T_L2, T_DRAM))"
+            } else {
+                "THRASHING (roof = T_hit + T_DRAM)"
+            }
+        )
+    }
+
+    /// The roof the cluster decision divides by: `max(T_floor, T_memory)`, seconds.
+    pub fn binding_s(&self) -> f64 {
+        self.floor_s.max(self.memory_roof_s)
+    }
+}
+
+/// **The per-shape dispatcher: a PURE function of `(M, N, K, sm_count)`** (WAVE3_DOSSIER 3.7).
+///
+/// Device-free and unit-testable without a GPU, which is the point: a dispatcher that silently
+/// picks a different module than the one the round measured is guard G3's hazard in a new place, and
+/// the only defence is a test that pins its verdict at every benched shape and at every class
+/// boundary (`the_dispatcher_verdict_is_pinned_at_every_benched_shape`).
+///
+/// # The four decisions, and the three different roofs they act on
+///
+/// The levers are not interchangeable and that is exactly why a dispatcher is needed:
+///
+/// | lever | what it changes | which roof it lowers | zero when |
+/// |---|---|---|---|
+/// | tile | `I_cta`, and how much of the device one wave fills | occupancy, and the L2 roof | never -- it is always a choice |
+/// | cluster (1x2x1 on B) | `L2 -> SMEM` bytes: `(BM+BN)` becomes `(BM+BN/2)` -- 1.5x at W1, 1.33x at 128x128, 1.2x at 128x64 | the **7.00 TB/s L2** roof | the shape is not near that roof, OR the tile is too narrow for `B` to be the wide operand |
+/// | raster | `DRAM -> L2` bytes, by changing the WAVE FOOTPRINT; L2->SMEM bytes unchanged | the **3.35 TB/s HBM** roof, and L2 residency | one wave, or the linear footprint already fits L2 |
+/// | persistence | nothing about traffic; removes `X_fill` at `waves-1` boundaries | the **mainloop fixed-cost** floor | one wave |
+///
+/// So: take the WIDEST tile whose wave efficiency clears [`WAVE_EFFICIENCY_FLOOR`]; raster iff the
+/// grid is multi-wave AND the linear wave footprint blows [`L2_BYTES`]; persist iff multi-wave;
+/// cluster iff what a B multicast would SAVE off the **FINAL** configuration's binding roof clears
+/// [`cluster_l2_saving_threshold`].
+///
+/// **That last word is load-bearing, and it is a computation here rather than a story.**
+/// `gpt_d4096_up` FLIPS: with the raster forced OFF its wave footprint is 136.4 MB of a 50.0 MiB L2,
+/// [`dispatch_memory_roof_s`] prices it as thrashing (1329.8 us against a 963.5 us floor), and
+/// `f_L2` lands at **0.692** -- a saving of 0.231 against the 0.26 break-even, **cluster OFF**. Turn
+/// the raster on and the footprint is 34.1 MB, the roof drops back to the floor, `f_L2` is
+/// **0.955** and the cluster is worth a third of a binding roof: **ON**. Both verdicts are computed
+/// by this function from `(M, N, K)` alone, and
+/// `the_raster_flips_the_cluster_verdict_at_gpt_d4096_up` asserts they DIFFER by evaluating
+/// [`wgmma_dispatch_plan_with_raster`] twice.
+///
+/// **Where this diverges from the dossier, said out loud.** WAVE3_DOSSIER 3.2 puts the pre-raster
+/// number at 0.585, which is `T_L2 / T_measured` against the 1572.2 us the linear arm actually took;
+/// no device-free function has that denominator. 0.692 is the same flip priced by the model
+/// (`T_L2 / T_predicted`), and the model still under-predicts that arm by 18% -- so the direction,
+/// the mechanism and the verdict are the dossier's, and the magnitude is the model's. The dispatcher
+/// is a function of the configuration it is about to emit, not of a measurement of an earlier one.
+///
+/// # The floor is the CHOSEN tile's floor, and that took a defect to learn
+///
+/// `T_floor` is the denominator of the cluster decision, and it was computed from
+/// [`TILE_FIXED_S`] / [`K_STAGE_S`] -- **128x256 constants** -- at every tile, including the two
+/// narrow ones the tile lever exists to reach. At `sq1024`, where the rule picks 128x64, that priced
+/// a 9.05 us floor at 26.01 us and pushed `f_L2` from 0.795 down to 0.276: the dossier's own OFF
+/// verdict, reached by a factor-of-2.9 error rather than by the physics. [`tile_fixed_s`] and
+/// [`k_stage_s`] price the tile that was chosen, and [`cluster_l2_saving_threshold`] carries the
+/// break-even to it, so the OFF at sq1024 now survives for the reason WAVE3_DOSSIER 3.6 gives:
+/// `B` is the NARROW operand at 128x64 and multicasting it removes a sixth of the L2 read, not a
+/// third. WAVE3_DOSSIER 3.7's pseudocode carries the same shortcut (its comment says "at 128x256"
+/// out loud); this is where it is repaired rather than transcribed.
+pub fn wgmma_dispatch_plan(m: usize, n: usize, k: usize, sm_count: usize) -> DispatchPlan {
+    wgmma_dispatch_plan_with_raster(m, n, k, sm_count, None)
+}
+
+/// [`wgmma_dispatch_plan`] with the raster forced, which is what makes its FLIP claim checkable.
+///
+/// `raster: None` is the shipped rule. `Some(false)` is the counterfactual the dossier's headline
+/// rests on -- "`gpt_d4096_up` flips" is a statement about two configurations, and a function that
+/// can only ever be asked about one of them cannot be said to decide it. Everything downstream of
+/// the raster is recomputed from the forced value: `GROUP_M`, the DRAM bytes, the final footprint,
+/// the residency and therefore the memory roof.
+///
+/// It is `pub` because the round log prints both arms at `gpt_d4096_up` (`wgmma_config_sweep`
+/// section 6d), which is the difference between a log that asserts a flip and a log that shows one.
+pub fn wgmma_dispatch_plan_with_raster(
+    m: usize,
+    n: usize,
+    k: usize,
+    sm_count: usize,
+    raster: Option<bool>,
+) -> DispatchPlan {
+    let sm = sm_count.max(1);
+    // 1. the widest tile whose wave efficiency clears the floor. The last candidate is taken
+    //    unconditionally: something must run, and the narrowest tile is the one with the most tiles.
+    let (mut bm, mut bn, mut stages) = *DISPATCH_TILES.last().expect("a non-empty tile menu");
+    let (mut tiles, mut waves) = (0usize, 0usize);
+    let mut wave_efficiency = 0.0f64;
+    for &(cbm, cbn, cstages) in DISPATCH_TILES {
+        let t = m.div_ceil(cbm) * n.div_ceil(cbn);
+        let w = t.div_ceil(sm).max(1);
+        bm = cbm;
+        bn = cbn;
+        stages = cstages;
+        tiles = t;
+        waves = w;
+        wave_efficiency = t as f64 / (sm * w) as f64;
+        if wave_efficiency >= WAVE_EFFICIENCY_FLOOR {
+            break;
+        }
+    }
+    // 2. the raster: only when the LINEAR order's wave footprint blows L2 (which implies waves > 1).
+    let gx = n.div_ceil(bn);
+    let r_lin = sm as f64 / gx.min(sm) as f64;
+    let f_lin = r_lin * bm as f64 + (sm as f64 / r_lin) * bn as f64;
+    let linear_footprint_bytes = f_lin * k as f64 * 2.0;
+    let raster = raster.unwrap_or(waves > 1 && linear_footprint_bytes > L2_BYTES);
+    // `round(sqrt(W*BN/BM))` to the nearest EVEN value: 16 at 128x256, 12 at 128x128, 8 at 128x64.
+    // Even because a group must be a whole number of 2-CTA clusters, or it ends mid-cluster and the
+    // two ranks of that cluster compute different N tiles -- the one thing a B multicast forbids.
+    let group_m = if raster {
+        let want = (sm as f64 * bn as f64 / bm as f64).sqrt().round() as usize;
+        (want.max(2) / 2) * 2
+    } else {
+        1
+    };
+    // 3. persistence: any multi-wave grid.
+    let persistent = waves > 1;
+    // 4. the cluster, on what a B multicast would SAVE off the FINAL configuration's binding roof.
+    //    Both halves of that sentence are load-bearing and each was a defect once: the floor must be
+    //    THIS tile's floor (`tile_fixed_s`/`k_stage_s`, not the reference tile's constants applied to
+    //    another geometry -- that inflated sq1024's by 2.9x), and the comparand must be the saving,
+    //    because the multicast removes a third of the L2 term at 128x256 and a sixth at 128x64.
+    //    ...and "FINAL" is where the RASTER enters: the footprint the memory roof is priced on is
+    //    the one the chosen order actually produces, so a lever that makes a thrashing shape
+    //    L2-resident changes the denominator the cluster is judged against. That is the dossier's
+    //    `gpt_d4096_up` flip, and here it is arithmetic rather than a comment.
+    let l2_read_bytes = tiles as f64 * (bm + bn) as f64 * k as f64 * 2.0;
+    let t_l2 = l2_read_bytes / BW_L2;
+    let floor_s =
+        waves as f64 * (tile_fixed_s(bm, bn, stages) + k.div_ceil(64) as f64 * k_stage_s(bm, bn));
+    let dram_bytes = dispatch_dram_bytes(m, n, k, bm, bn, sm, tiles, waves, group_m);
+    let r_fin = if group_m > 1 { group_m as f64 } else { r_lin };
+    let final_footprint_bytes =
+        (r_fin * bm as f64 + (sm as f64 / r_fin) * bn as f64) * k as f64 * 2.0;
+    let l2_resident = waves <= 1 || final_footprint_bytes <= L2_BYTES;
+    let memory_roof_s =
+        dispatch_memory_roof_s(l2_read_bytes, dram_bytes, (m * n * 4) as f64, l2_resident);
+    let binding = floor_s.max(memory_roof_s);
+    let f_l2 = if binding > 0.0 { t_l2 / binding } else { 0.0 };
+    let l2_saving = f_l2 * multicast_l2_share(bm, bn);
+    let cluster = l2_saving >= cluster_l2_saving_threshold();
+    DispatchPlan {
+        bm,
+        bn,
+        tiles,
+        waves,
+        cluster,
+        raster,
+        group_m,
+        persistent,
+        wave_efficiency,
+        linear_footprint_bytes,
+        final_footprint_bytes,
+        l2_resident,
+        floor_s,
+        memory_roof_s,
+        l2_read_bytes,
+        dram_bytes,
+        f_l2,
+        l2_saving,
+    }
+}
+
+/// DRAM traffic of one launch, bytes -- the operand term (which the raster changes) plus `C`.
+///
+/// A single-wave grid reads every operand byte exactly once, whatever the order. A multi-wave grid
+/// reads `f(R) * K * 2` bytes per wave for `W` tiles, where `R` is the m-tile extent of a wave's
+/// footprint: `132/min(gx,132)` in launch order, `GROUP_M` under the raster. This reproduces the
+/// wave plan's own 2.485 / 1.326 / 2.384 / 0.797 GB to the digit, which is the check that it is the
+/// campaign's formula and not a second one.
+fn dispatch_dram_bytes(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    sm: usize,
+    tiles: usize,
+    waves: usize,
+    group_m: usize,
+) -> f64 {
+    let c = (m * n * 4) as f64;
+    if waves <= 1 {
+        return ((m * k + n * k) * 2) as f64 + c;
+    }
+    let gx = n.div_ceil(bn);
+    let r = if group_m > 1 {
+        group_m as f64
+    } else {
+        sm as f64 / gx.min(sm) as f64
+    };
+    let f = r * bm as f64 + (sm as f64 / r) * bn as f64;
+    tiles as f64 * f * k as f64 * 2.0 / sm as f64 + c
+}
+
+/// **[`wgmma_dispatch_plan`] resolved to a REAL emitted module, or a loud decline.**
+///
+/// The second of the dossier's two laws on the dispatcher: every `(tile, cluster, raster,
+/// persistent)` combination it can produce must exist as a shipped [`WgmmaCfg`] with a key derivable
+/// from its own geometry, or the dispatcher must **decline** -- never fall back. A fallback here is
+/// how a publication ends up quoting a configuration that never ran.
+///
+/// The lookup is by GEOMETRY over [`wgmma_all_emittable`], not by a hand-written table of names: a
+/// name table is a second spelling of `derived_name` and could disagree with it. The diagnostic arms
+/// are excluded structurally -- an elided epilogue writes no `C` and `PersistentDrained` exists only
+/// to be compared against, so neither is dispatchable.
+pub fn wgmma_dispatch(
+    m: usize,
+    n: usize,
+    k: usize,
+    sm_count: usize,
+) -> Result<&'static WgmmaCfg, String> {
+    let p = wgmma_dispatch_plan(m, n, k, sm_count);
+    wgmma_all_emittable()
+        .into_iter()
+        .find(|c| {
+            c.bm == p.bm
+                && c.bn == p.bn
+                && c.dtype == WgmmaDtype::F16
+                && c.epilogue == EpilogueStore::V2
+                && c.l2_hint == L2Hint::None
+                && c.wait_depth == 0
+                && !c.fence_hoisted
+                && (c.multicast == Multicast::ClusterB) == p.cluster
+                && c.multicast != Multicast::ClusterA
+                && (c.raster as usize) == p.group_m.max(1)
+                && c.tiles.carries_ring() == p.persistent
+                && c.tiles != TileSchedule::PersistentDrained
+        })
+        .ok_or_else(|| {
+            format!(
+                "{UNSUPPORTED}: no emitted module for {m}x{n}x{k} on {sm_count} SMs -- the rule \
+                 wants {}. The dispatcher DECLINES rather than falling back, because a fallback is \
+                 how a round publishes a configuration that never ran.",
+                p.summary()
+            )
+        })
+}
+
+/// **The rule [`wgmma_dispatch_plan`] ships, as one block of round-log text built FROM ITS OWN
+/// CONSTANTS.**
+///
+/// A round log that states the rule in prose beside a table computed by the code is two spellings of
+/// one thing, and the second one goes stale silently. It already had: the section-6d header
+/// described "the cluster iff the L2-roof fraction of the FINAL configuration clears 0.78" for a
+/// round after the predicate became `f_L2 * share >= 0.26`, and it printed that directly above a
+/// table whose `sq1024` row reads `f_L2 0.795 ... cluster off` -- the header contradicted the line
+/// beneath it at exactly the shape the tile lever exists for.
+///
+/// So there is one spelling and `wgmma_config_sweep` prints THIS, the way every clustered launch
+/// takes its grid from [`Multicast::cluster_shape`] rather than restating `1x2x1`. Every threshold
+/// below is interpolated from the constant the dispatcher compares against, so the two cannot
+/// disagree again; `the_round_log_header_states_the_rule_the_dispatcher_actually_ships` is the law
+/// that keeps it that way, and it is falsifiable at `sq1024`.
+pub fn wgmma_dispatch_rule_text() -> String {
+    let (rbm, rbn, _) = FLOOR_REF_TILE;
+    let menu = DISPATCH_TILES
+        .iter()
+        .map(|(bm, bn, s)| format!("{bm}x{bn} s{s}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "A PURE function of (M, N, K, sm_count), device-free and unit-tested without a GPU:\n  \
+         tile    the WIDEST of [{menu}] whose wave efficiency clears {:.2}\n  raster  iff the grid \
+         is multi-wave AND the LINEAR wave footprint blows L2 ({:.1} MB)\n  persist iff the grid \
+         is multi-wave\n  cluster iff what a 1x2x1 B multicast would SAVE off the FINAL \
+         configuration's binding roof,\n          f_L2 x (bn/2)/(bm+bn), clears {:.2} -- which is \
+         the {:.2} of WAVE3_DOSSIER 3.2 times the\n          {:.3} share it was fitted at \
+         ({rbm}x{rbn}). The share is 1/4 at 128x128 and 1/6 at 128x64, so a\n          narrow tile \
+         is NOT judged by the wide tile's bar: sq1024 clears {:.2} on f_L2 and is still OFF.\n  \
+         The raster enters the cluster decision through the FINAL footprint: it is what decides \
+         whether the\n  memory roof is max(T_L2, T_DRAM) (L2-resident) or T_hit + T_DRAM \
+         (thrashing), which is why gpt_d4096_up's\n  verdict differs between the two arms printed \
+         for it below. f_L2 here is T_L2 / T_PREDICTED, not 3.2's\n  T_L2 / T_measured; the two \
+         differ by 0.4's residual and the bracket carries across (see\n  CLUSTER_F_L2_THRESHOLD). \
+         It DECLINES rather than falling back: a fallback is how a round publishes a\n  \
+         configuration that never ran.",
+        WAVE_EFFICIENCY_FLOOR,
+        L2_BYTES / 1.0e6,
+        cluster_l2_saving_threshold(),
+        CLUSTER_F_L2_THRESHOLD,
+        multicast_l2_share(rbm, rbn),
+        CLUSTER_F_L2_THRESHOLD,
+    )
+}
+
 /// Look up a variant by entry name; panics loudly rather than mis-dispatching.
 /// Look up a configuration by entry name; panics loudly rather than mis-dispatching.
 ///
@@ -2109,11 +3578,31 @@ pub struct SweepRow {
     /// Round-log row name and `bench_instrument` sample-label component. ASCII, no whitespace.
     pub label: &'static str,
     pub cfg: &'static WgmmaCfg,
+    /// **The shapes THIS row is measured at**, named out of [`WGMMA_BENCH_GRID`].
+    ///
+    /// # Why a per-row list and not the cross product
+    ///
+    /// A sweep's cost is `rows x shapes`, and the schedule levers of wave 3 made the cross product
+    /// both expensive and *misleading*. The raster and persistence are **provably the identity** on
+    /// a single-wave grid, so running them at sq2048 buys one control (worth having, once) and four
+    /// more cells that can only report noise; conversely the 128x64 tile row answers a question that
+    /// only exists at sq1024, which the square-shape set never contained. Every dossier sweep row is
+    /// specified with its own shape list for exactly this reason, and a row measured somewhere its
+    /// mechanism is zero is a cell a reader will over-read.
+    ///
+    /// Rows that shipped before wave 3 keep [`WGMMA_SWEEP_SQUARES`] -- the three shapes rounds 1-3
+    /// measured them at -- so their numbers stay comparable to those logs without an argument about
+    /// denominators.
+    pub shapes: &'static [&'static str],
     /// What this row is in the table to answer, in one line.
     pub why: &'static str,
 }
 
 impl SweepRow {
+    /// Is this row measured at the shape labelled `label`?
+    pub fn runs_at(&self, label: &str) -> bool {
+        self.shapes.contains(&label)
+    }
     /// `Ok(())` iff this row can be generated at all -- i.e. it will be measured rather than
     /// declined. The message is `WgmmaCfg::validate`'s own, so the reason a row is absent from the
     /// ranked table is the generator's reason and not a second opinion.
@@ -2231,6 +3720,163 @@ pub const WGMMA_W1_MCB_V2: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1_MCB
 };
 
+/// **The shipped >=4096-class default plus the grouped raster at the derived optimum**
+/// (`GROUP_M = 16`), and nothing else. One fact off [`WGMMA_W1_MCB_V2`].
+///
+/// # What it is predicted to do, per shape, stated before the round
+///
+/// `gpt_d4096_up` is a **hard arithmetic blocker** under the linear order: matching the peer's
+/// 0.6734 ms needs `2.3844 GB / 0.6734 ms = 3.541 TB/s` against a 3.35 TB/s HBM peak, so no
+/// mainloop change can reach it. The raster takes that shape's DRAM from 2.384 to 0.797 GB (2.99x)
+/// and the target to 1.184 TB/s -- 35% of peak. `sq8192` goes 2.485 -> 1.326 GB (1.87x) but its
+/// post-raster footprint is still 1.36x L2, so it is worth ~1 point and is published as insurance,
+/// not as a headline. `sq4096` and `gpt_d1024_up` already fit L2 in linear order (42.2 and 10.6 MB
+/// of 50.0 MiB) and are predicted FLAT.
+///
+/// # The controls, and the falsifiers
+///
+/// `sq2048`, `sq1024` and `gpt_d1024_down` are one wave, where the raster is provably the identity;
+/// any movement there is the instrument and invalidates the visit. A `GROUP_M = 32` bracket row
+/// (+24% traffic by the same formula) must land BETWEEN linear and this one -- if it ties, the
+/// mechanism under test is not traffic and the next suspect is launch-order coalescing.
+pub const WGMMA_W1_MCB_V2_R16: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16",
+    raster: 16,
+    ..WGMMA_W1_MCB_V2
+};
+
+/// The **bracket**: `GROUP_M = 32`, `f(32) = 5152` against the optimum's 4160, i.e. +24% operand
+/// traffic per wave. It exists so the round can tell "the raster works" from "traffic is the
+/// mechanism": a bracket that ties [`WGMMA_W1_MCB_V2_R16`] refutes the traffic model even if both
+/// beat the linear control.
+pub const WGMMA_W1_MCB_V2_R32: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r32",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r32",
+    raster: 32,
+    ..WGMMA_W1_MCB_V2
+};
+
+// --- wave 3 lever 2: persistence, both arms one fact off the raster winner ------------------------
+
+/// **The persistence DIAGNOSTIC**: [`WGMMA_W1_MCB_V2_R16`] with a tile loop whose ring is drained at
+/// every boundary.
+///
+/// It exists because "persistence helps" and "the CONTINUOUS RING helps" are different claims, and
+/// only the second one is the derivation. This arm keeps the tile loop -- so it collects whatever
+/// CTA dispatch is worth -- and gives up the fill overlap. **Predicted: ties the one-tile control to
+/// within dispersion.** If it WINS, the gain is dispatch and WAVE3_DOSSIER 2.3 is wrong.
+pub const WGMMA_W1_MCB_V2_R16_PSTOP: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16_pstop",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16_pstop",
+    tiles: TileSchedule::PersistentDrained,
+    ..WGMMA_W1_MCB_V2_R16
+};
+
+/// **THE ARM**: [`WGMMA_W1_MCB_V2_R16`] persistent with a continuous ring.
+///
+/// # What it is predicted to do, per shape, stated before the round
+///
+/// `T_new = T_measured - (waves - 1) * X_fill` with `X_fill = 7.85 us`: `gpt_d1024_up` **+15.6
+/// points** (3 boundaries against `n_k = 16`, so `X` is 56% of its tile -- more than three times its
+/// share at sq8192, and the largest single-shape number of the lever), `gpt_d4096_up` +11.7,
+/// `sq4096` +8.7, `sq8192` +6.8. **Exactly zero** at sq2048, sq1024 and gpt_d1024_down, which are
+/// one wave and are therefore controls, not rows.
+///
+/// # Its two hazards, and why neither is a check
+///
+/// The loop is indexed by the CLUSTER with stride `%nctaid.x`, so both ranks iterate the identical
+/// sequence *by construction* -- a CTA-indexed loop under a cluster hangs on any tiles-mod-slots
+/// split (WAVE3_DOSSIER 2.6). And `%kt` is reset inside the tile loop in BOTH roles, so tile 2's
+/// first `wgmma` takes `scale-d = 0` and overwrites rather than accumulating (G19). Both are shapes
+/// of code rather than assertions, which is the only kind of fix worth having for a hang and for a
+/// corruption that looks like a plausible integer.
+pub const WGMMA_W1_MCB_V2_R16_P: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16_p",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16_p",
+    tiles: TileSchedule::Persistent,
+    ..WGMMA_W1_MCB_V2_R16
+};
+
+/// Persistence WITHOUT the raster, clustered -- the configuration [`wgmma_dispatch`] selects at
+/// `sq4096`, whose linear wave footprint (42.2 MB) already fits L2 and whose `f_L2` of 0.955 puts
+/// the cluster firmly on. Predicted +8.7 points.
+pub const WGMMA_W1_MCB_V2_P: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_p",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_p",
+    tiles: TileSchedule::Persistent,
+    ..WGMMA_W1_MCB_V2
+};
+
+/// Persistence with NEITHER the raster nor the cluster -- the configuration [`wgmma_dispatch`]
+/// selects at `gpt_d1024_up`, and the wave's largest single-shape number (+15.6 points).
+///
+/// That shape is the cleanest possible test of the mechanism: its footprint is 10.6 MB of a 50.0 MiB
+/// L2 so the raster is worthless, its `f_L2` is 0.55 so the cluster costs more than it saves, and
+/// `n_k = 16` k-stages against `X = 13.84 us` makes the per-tile fixed cost **56% of the tile** --
+/// more than three times its share at sq8192. Whatever this row moves is `X_fill` and nothing else.
+pub const WGMMA_W1_V2_P: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_v2_p",
+    key: "wgmma_nt_f16_128x256x64_s4_v2_p",
+    tiles: TileSchedule::Persistent,
+    ..WGMMA_W1_V2
+};
+
+/// **W3d -- the 128x64 tile, and the largest single-shape number in the wave-3 dossier (+56 points
+/// at sq1024).**
+///
+/// # Why the narrow tile, and why only there
+///
+/// `sq1024` at 128x256 is `8 x 4 = 32` CTAs on 132 SMs: **24.2% of the device**, and no raster, no
+/// cluster and no persistence touches it -- one wave, an 8.4 MB footprint, and a `B` operand too
+/// narrow for the multicast to pay (see below). The only lever that exists is the tile. Narrowing to
+/// 128x64 gives `8 x 16 = 128` tiles, **97.0% of the device**, and working the full cost model (with
+/// `X` scaled to the resident CTA count, which is what makes the 128x256 row reproduce its measured
+/// 21.5 us to 7%) puts it at `T_floor = 7.94 us` against cuBLAS's 7.0 -- **~88% of the peer, from
+/// 32.3%**. 128x128 gets only halfway (~62%).
+///
+/// [`tile_fixed_s`] is a touch more conservative than the dossier's 3.4 row (9.05 us of floor rather
+/// than 7.94, so ~77% rather than ~88%): it carries Fit B's 0.78 us prologue residual and a `S` on
+/// the high side of 3.4's `~0.165`, and it drops 0.4's resident-CTA correction to the fill, which at
+/// 128 of 132 CTAs is worth almost nothing anyway. The bracket is the round's to close; neither end
+/// changes a single dispatch verdict, which is the only thing the constant is load-bearing for.
+///
+/// # Why the cluster stays OFF here, on the mechanism rather than on a number
+///
+/// A `1x2x1` B multicast removes `(bn/2)/(bm+bn)` of a tile's L2 read -- **a third at 128x256, a
+/// sixth here** -- and `ACT2_WAVE_PLAN.md:5` chose the axis with the words "multicast the WIDER
+/// operand". At 128x64 `B` is the narrower operand, so the axis is on the wrong side and
+/// [`cluster_l2_saving_threshold`] declines it (0.132 of the roof against a 0.26 break-even) even
+/// though this shape is 79% L2-bound. Before the floor was made tile-aware the same OFF fell out of
+/// a 2.9x-inflated denominator instead, which is an accident wearing a verdict's clothes.
+///
+/// It must NEVER be dispatched to a large shape: `I_cta = 128*64/(128+64) = 42.67` puts its L2 roof
+/// at 299 TFLOP/s, far below the 617-711 already measured at sq4096/sq8192. That is exactly what the
+/// wave-efficiency rule in [`wgmma_dispatch`] enforces -- take the WIDEST tile that clears 0.90 --
+/// and why the sweep runs this row at `sq2048` as well, where it must LOSE.
+///
+/// # What is new here, and what deliberately is not
+///
+/// New: an `m64n64k16` module family (the shape is on the ISA menu, so `WgmmaShape::new` accepts
+/// it), 32 accumulator registers per consumer thread instead of 128, and a 98 368 B ring instead of
+/// 196 672. Not new: the tile is still `64 * consumer_wgs` rows so `Schedule::Cooperative` stays
+/// legal, `BK` is still 64 so `bk * dtype.size() == 128` and the shipped 128-B swizzle reading
+/// carries over unchanged, and the epilogue is the shipped `st.global.v2.f32`.
+///
+/// `consumer_regs` stays at 168 rather than dropping to the ~85 that two CTAs/SM would need.
+/// Occupancy is decided by the STATIC per-thread allocation ptxas chooses, not by `setmaxnreg`, and
+/// `setmaxnreg.inc` to a target below what ptxas allocated is a JIT error rather than an
+/// optimisation. The census is what will say whether the second CTA is available; sq1024's +56
+/// points does not need it (128 tiles on 132 SMs is already 97.0%).
+pub const WGMMA_W3D_V2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x64x64_s4_v2",
+    key: "wgmma_nt_f16_128x64x64_s4_v2",
+    bn: 64,
+    consumer_regs: 168,
+    epilogue: EpilogueStore::V2,
+    ..WGMMA_W1
+};
+
 /// The **un-clustered** W1 with the fused v2 epilogue -- the fourth corner of the
 /// `{cluster off/on} x {scalar/v2}` square, and the row [`wgmma_w1_for`] ships below the cluster
 /// threshold.
@@ -2247,6 +3893,85 @@ pub const WGMMA_W1_V2: WgmmaCfg = WgmmaCfg {
     key: "wgmma_nt_f16_128x256x64_s4_v2",
     epilogue: EpilogueStore::V2,
     ..WGMMA_W1
+};
+
+// --- wave 3 lever 4: the mainloop drain -----------------------------------------------------------
+//
+// **Budgeted at ZERO.** Fit C priced the ring stage `wait_depth = 1` costs at 9.2% (`S(s3) = 0.7056`
+// against `S(s4) = 0.6460`) against a drain-to-issue bubble worth 13.3-20.0% of a stage -- the
+// bracket being the width of the unlocked-clock ambiguity -- so the net is between +0.5% and -7.7%
+// and the SIGN is the question. 128x256 s5 declines on shared memory, so the stage cannot be bought
+// back. These rows are emitted and measured; nothing is budgeted for them.
+
+/// **4b alone: `wgmma.fence.sync.aligned` hoisted out of the k-loop. The free row.**
+///
+/// CUTLASS fences around the mainloop, not per k-tile, and the ISA only requires the fence to order
+/// the accumulator registers against the async proxy *before the first group*: nothing between
+/// k-stages writes them, and the epilogue only reads. So the hoist costs zero registers, zero ring
+/// depth and one instruction out of the drain-to-issue bubble, and it may buy a second-order win in
+/// how `ptxas` schedules across the loop back-edge (a per-iteration fence invites it to treat the
+/// accumulators conservatively there).
+///
+/// Predicted: small and positive, or zero. It is its own row rather than folded into the depth arm
+/// because "the fence moved" and "the depth moved" are two facts, and the depth arm carries both.
+pub const WGMMA_W1_MCB_V2_FH: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_fh",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_fh",
+    fence_hoisted: true,
+    ..WGMMA_W1_MCB_V2
+};
+
+/// **4c: wait to depth 1 and release the stage one group back.** The arm whose SIGN is the question.
+///
+/// The `0` in today's `wgmma.wait_group.sync.aligned 0` is not a tuning knob -- the release
+/// PUBLISHES the buffer to the producer, so it may not precede the last read of it, and any depth
+/// above 0 *at that position* is a correctness bug rather than a faster kernel. The lever is a
+/// RESTRUCTURING: wait to depth `D` and release the stage that is `D` groups old, both from
+/// [`WgmmaCfg::release_lag`] so they cannot disagree.
+///
+/// The price is ring depth, and it is measured rather than argued: at `D = 0` the consumer holds one
+/// buffer and the producer can be `stages - 1 = 3` ahead; at `D = 1` it holds two and the producer
+/// can be 2 ahead -- **exactly the prefetch depth of `D = 0` at 3 stages**, which Fit C measured at
+/// a 9.2% per-stage penalty. Against a bubble of 13.3-20.0% the net is +0.5% to -7.7%, and which
+/// end it lands on also resolves whether the device is running at the reported 1980 MHz or the
+/// 1.8288 GHz the 989 TFLOP/s denominator implies.
+///
+/// It carries the fence hoist, which is why `mcb_v2_fh` exists: without that row this one would be
+/// two facts off its control.
+pub const WGMMA_W1_MCB_V2_D1: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_d1",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_d1",
+    wait_depth: 1,
+    fence_hoisted: true,
+    ..WGMMA_W1_MCB_V2
+};
+
+/// The square tile's v2 twin -- **the control the depth diagnostic below needs**, and nothing else.
+///
+/// [`WGMMA_W3C_MCB`] carries the scalar store rounds 1-3 measured. Scoring the 128x128 depth arm
+/// against it would put two facts (the transport and the depth) in one difference, which is the
+/// error this whole table is arranged to avoid, so the v2 twin ships as its own row.
+pub const WGMMA_W3C_MCB_V2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x128x64_s6_mcb2_v2",
+    key: "wgmma_nt_f16_128x128x64_s6_mcb2_v2",
+    epilogue: EpilogueStore::V2,
+    ..WGMMA_W3C_MCB
+};
+
+/// **THE DIAGNOSTIC that makes the depth pair interpretable: depth 1 where the ring can AFFORD it.**
+///
+/// At 128x256 the ring is 4 stages, so `D = 1` takes the producer's run-ahead from 3 to 2. At
+/// 128x128 it is 6, so the same depth takes it from 5 to 4 -- a 20% cut instead of a 33% one, and
+/// well clear of the point where the fill stops being hidden. If `mcb_v2_d1` LOSES at s4 and this
+/// row WINS at s6, the mechanism is ring depth and the lever belongs to whatever tile has a spare
+/// stage, not to the depth itself. If both lose, the bubble is smaller than the clock ambiguity
+/// allows and the lever is dead at every tile this family can emit.
+pub const WGMMA_W3C_MCB_V2_D1: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x128x64_s6_mcb2_v2_d1",
+    key: "wgmma_nt_f16_128x128x64_s6_mcb2_v2_d1",
+    wait_depth: 1,
+    fence_hoisted: true,
+    ..WGMMA_W3C_MCB_V2
 };
 
 /// The round-3 winner with `.L2::evict_first` on the C stores (wave-2 lever 2, half of it).
@@ -2328,6 +4053,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s4_off",
         cfg: &WGMMA_W1,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "THE BASELINE. Rounds 1 and 2's measured row, unchanged: 128x256x64 s4, cluster 1x1x1, \
               I_cta 85.33, L2 roof 597 TFLOP/s at the measured 7.00 TB/s. It must land near round \
               2's 66.3% at sq4096 / 55.2% at sq8192, or the instrument moved and no other row is \
@@ -2336,6 +4062,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s4_mcb2",
         cfg: &WGMMA_W1_MCB,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "THE PRIMARY. The same tile, depth, layout and register split with a 1x2x1 cluster and \
               .multicast::cluster on B -- the WIDER operand. I_cta = 128*256/(128 + 256/2) = 128.0, \
               L2 roof ~896 TFLOP/s, above the peer's whole column (838.7/864.3/816.4 need \
@@ -2345,6 +4072,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s4_mc2",
         cfg: &WGMMA_W1_MC,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "THE CONTROL for the axis. The same tile with the cluster on the OTHER axis \
               (2x1x1, multicast A, the 128-row operand): I_cta 102.4, roof 717 TFLOP/s -- \
               arithmetically BELOW cuBLAS's 838.7 at sq4096. Round 2 measured it at 68.1% vs the \
@@ -2354,11 +4082,13 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s3_off",
         cfg: &WGMMA_W1_S3,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 3 without the cluster: the control arm of the depth axis",
     },
     SweepRow {
         label: "w1_s3_mcb2",
         cfg: &WGMMA_W1_MCB_S3,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 3 with the B cluster. Halving B's L2 traffic shortens the fill the ring is \
               hiding, so the depth that was right at full traffic need not be right at half -- and \
               round 2 already measured depth 3 BEATING depth 4 at sq8192 with no cluster at all \
@@ -2367,18 +4097,21 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s3_mc2",
         cfg: &WGMMA_W1_MC_S3,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 3 with the A cluster: the third setting at the same depth, so 'deeper', \
               'clustered' and 'which operand' are three separable facts rather than one",
     },
     SweepRow {
         label: "w1_s2_off",
         cfg: &WGMMA_W1_S2,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 2 without the cluster -- the shallow end, and the row that says how much of the \
               deficit is fill latency at all",
     },
     SweepRow {
         label: "w1_s2_mcb2",
         cfg: &WGMMA_W1_MCB_S2,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 2 with the B cluster. Pairing every measurable depth at all three cluster \
               settings is what keeps 'deeper is better' and 'this cluster is better' from being one \
               measurement",
@@ -2386,6 +4119,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s2_mc2",
         cfg: &WGMMA_W1_MC_S2,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 2 with the A cluster -- the shallow end of the control axis, and round 2's \
               worst 128x256 row (57.7% at sq4096), which is the shape of a ring too short to hide \
               the fill it still pays for",
@@ -2393,6 +4127,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s5_mc2",
         cfg: &WGMMA_W1_MC_S5,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 5 at 128x256. EXPECTED TO DECLINE on shared memory -- and the decline is the \
               point: no cluster changes the ring's size, whichever operand it multicasts, so the \
               depth axis stops at 4 for this tile at ALL THREE cluster settings",
@@ -2400,12 +4135,17 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s6_mc2",
         cfg: &WGMMA_W1_MC_S6,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 6 at 128x256. Expected to decline by a wider margin, which pins the ceiling \
               rather than leaving it at one data point",
     },
     SweepRow {
         label: "w3c_s6_off",
         cfg: &WGMMA_W3C,
+        // Plus sq1024: D1 put the narrower tile there and the wave-3 dossier prices it at
+        // ~62% against the 128x64 row's ~88%, so the middle tile has to be ON the table or
+        // "128x64 is the sq1024 tile" is a two-point claim.
+        shapes: &["sq1024", "sq2048", "sq4096", "sq8192"],
         why: "D1's moderate-size arm (128x128x64 s6), which round 1 excluded because a second \
               kernel in ITS contender arm would have been an A/B against two things at once. Here \
               every row is scored against the same cuBLAS, so it is a row",
@@ -2413,6 +4153,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w3c_s6_mcb2",
         cfg: &WGMMA_W3C_MCB,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "The SQUARE tile with the B cluster. At bm == bn the two axes have IDENTICAL I_cta \
               (85.33 either way), so this row and w3c_s6_mc2 are the round's control on the claim \
               that the axis matters only through the traffic arithmetic: a difference between them \
@@ -2421,6 +4162,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w3c_s6_mc2",
         cfg: &WGMMA_W3C_MC,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "The square tile with the A cluster -- the other half of that control pair, and round \
               2's 56.9% at sq4096 against the un-clustered 57.5%",
     },
@@ -2428,6 +4170,26 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_v2",
         cfg: &WGMMA_W1_MCB_V2,
+        // Plus the two gpt_d1024 shapes: this row and `w1_v2` are the cluster PREDICATE's
+        // on/off pair, and a dispatch rule published from a table lacking either of them is a
+        // curve fitted to one crossing (WAVE3_DOSSIER 3.8, stated as a refusal).
+        //
+        // ...and `gpt_d4096_up`, because this row is ALSO the raster A/B's LINEAR CONTROL
+        // (`mcb_g1_lin` in the dossier's 1.6 table: `raster: 1` emits the two tile-origin
+        // instructions this family has emitted since round 1 byte for byte). gpt_d4096_up is the
+        // raster's headline shape -- the one where the linear order needs 3.541 TB/s against a
+        // 3.35 TB/s HBM peak -- and a headline measured without its own control at its own shape
+        // is a number with nothing to be a difference from. Every shape but `sq1024`, where the
+        // cluster is off (a multicast on the 128x64 tile's B saves 0.132 of the binding roof against
+        // a 0.26 break-even) and this row would answer a question nobody asked.
+        shapes: &[
+            "sq2048",
+            "sq4096",
+            "sq8192",
+            "gpt_d1024_down",
+            "gpt_d1024_up",
+            "gpt_d4096_up",
+        ],
         why: "LEVER 1 (v2 stores). Round 1's PTX dump shows 128 scalar predicated st.global.f32 per \
               consumer thread whose pairs are ADJACENT f32 lanes of one row: 8192 half-empty \
               32-byte sector requests per CTA where 4096 full ones would do. This row fuses each \
@@ -2437,6 +4199,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_ef",
         cfg: &WGMMA_W1_MCB_EF,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "LEVER 2a (C stores .L2::evict_first). C is written once and never read, so every C \
               line resident in L2 evicts an operand line a neighbouring CTA is about to want. An \
               ADVISORY hint: the hardware may ignore it, and a null result is a publishable result. \
@@ -2447,6 +4210,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_efol",
         cfg: &WGMMA_W1_MCB_EFOL,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "LEVER 2b (C evict_first AND TMA operands evict_last). The ISA question this row had \
               to answer first is whether a bulk-tensor copy can carry a cache policy at all: it \
               can -- cp.async.bulk.tensor takes .L2::cache_hint plus a trailing policy operand, \
@@ -2456,6 +4220,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_v2ef",
         cfg: &WGMMA_W1_MCB_V2_EF,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "BOTH levers. Two single-fact deltas cannot say whether the levers compose -- a v2 \
               store that halves the request count changes what the eviction hint is even about -- \
               so composition is its own row rather than an addition performed by a reader",
@@ -2463,6 +4228,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_nostore",
         cfg: &WGMMA_W1_MCB_NOSTORE,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "THE EPILOGUE-ELIDED DIAGNOSTIC, not a kernel: it computes the GEMM and writes no C, \
               so (this row) - (w1_s4_mcb2) at a fixed shape IS the epilogue's cost, measured on ONE \
               kernel instead of inferred from two shapes. The accumulators are folded into one \
@@ -2472,11 +4238,154 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_v2",
         cfg: &WGMMA_W1_V2,
+        // The cluster predicate's OFF arm at both gpt_d1024 shapes, and the 128x256 control
+        // the 128x64 tile row is scored against at sq1024.
+        shapes: &[
+            "sq1024",
+            "sq2048",
+            "sq4096",
+            "sq8192",
+            "gpt_d1024_down",
+            "gpt_d1024_up",
+        ],
         why: "The FOURTH CORNER of the {cluster} x {v2} square, and the small-shape half of the \
               shipped rule (wgmma_w1_for below the cluster threshold). The 2026-08-11 round \
               measured v2 only on the clustered lineage (+25.2/+15.3/+10.1 points); this row \
               measures the un-clustered v2 the rule ships at sq2048-class shapes instead of \
               inheriting cluster-independence from the emitter's text",
+    },
+    // --- wave 3 lever 1: the grouped raster, both rows one fact off the shipped default ----------
+    SweepRow {
+        label: "w1_mcb_v2_r16",
+        cfg: &WGMMA_W1_MCB_V2_R16,
+        shapes: WGMMA_RASTER_SHAPES,
+        why: "WAVE 3 LEVER 1 (grouped raster, GROUP_M = 16 = the derived optimum sqrt(W*BN/BM) for \
+              a 128x256 tile on 132 SMs). ONE fact off the shipped w1_mcb_v2, WHICH IS THIS ARM'S \
+              CONTROL: `raster: 1` emits the same two tile-origin instructions the family has \
+              emitted since round 1, byte for byte (the law is \
+              the_linear_order_emits_the_same_two_instructions_it_always_did), so the linear order \
+              needs no second row of its own -- one would share w1_mcb_v2's module key and publish \
+              one kernel under two headings. gpt_d4096_up is THE row: under the linear order \
+              matching the peer needs 3.541 TB/s against a 3.35 TB/s HBM peak, which is \
+              arithmetically impossible whatever the mainloop does; the raster takes its DRAM \
+              2.384 -> 0.797 GB. sq4096 and gpt_d1024_up already fit L2 linearly and are predicted \
+              FLAT; sq2048 is one wave, where the raster is PROVABLY the identity, so a difference \
+              there is the instrument and voids the visit",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_r32",
+        cfg: &WGMMA_W1_MCB_V2_R32,
+        shapes: WGMMA_RASTER_BRACKET_SHAPES,
+        why: "THE BRACKET. f(32) = 5152 against f(16) = 4160: +24% operand traffic per wave by the \
+              same formula that predicts the win. It must land BETWEEN the linear control and r16. \
+              A bracket that TIES r16 refutes the traffic model even if both beat linear, and the \
+              next suspect is launch-order coalescing rather than footprint",
+    },
+    // --- wave 3 lever 2: persistence, both arms one fact off w1_mcb_v2_r16 -----------------------
+    SweepRow {
+        label: "w1_mcb_v2_r16_pstop",
+        cfg: &WGMMA_W1_MCB_V2_R16_PSTOP,
+        shapes: WGMMA_PERSIST_SHAPES,
+        why: "WAVE 3 LEVER 2, THE DIAGNOSTIC. Persistent tile loop WITHOUT the ring carry: the \
+              producer waits for every consumer in the cluster to finish tile t before touching \
+              the ring again. It separates two claims the one number would confound -- 'persistence \
+              helps' and 'the CONTINUOUS RING helps' -- and only the second is the derivation. \
+              Predicted: ties w1_mcb_v2_r16 inside dispersion. If it WINS, the gain is CTA dispatch \
+              and X_fill is not the mechanism",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_r16_p",
+        cfg: &WGMMA_W1_MCB_V2_R16_P,
+        shapes: WGMMA_PERSIST_SHAPES,
+        why: "WAVE 3 LEVER 2, THE ARM (persistent, continuous ring). X_fill = 7.85 us per tile \
+              boundary is unhidable today -- at a wave boundary no CTA on the device has anything to \
+              overlap it with, and the fill runs at 3.31 TB/s = 98.7% of HBM peak, so it is a \
+              bandwidth event, not a latency one. Under a continuous ring the overlap window is \
+              4*0.646 + X_epi 5.99 = 8.57 us against 7.85 us of fill. Predicted +15.6 points at \
+              gpt_d1024_up (n_k = 16 makes X 56% of its tile), +11.7 at gpt_d4096_up, +8.7 at \
+              sq4096, +6.8 at sq8192, and EXACTLY ZERO at sq2048, which is one wave and is the \
+              control that must tie",
+    },
+    // --- wave 3 lever 3: per-shape tile dispatch -------------------------------------------------
+    SweepRow {
+        label: "w3d_s4_v2",
+        cfg: &WGMMA_W3D_V2,
+        shapes: WGMMA_TILE_DISPATCH_SHAPES,
+        why: "WAVE 3 LEVER 3, THE TILE ROW (128x64, a NEW m64n64k16 module family). sq1024 at \
+              128x256 is 32 CTAs of 132 -- 24.2% of the device -- and NOTHING else in wave 3 \
+              touches it: one wave, so no raster and no persistence, and B is the NARROW operand at \
+              128x64 so a multicast saves 0.13 of the roof against a 0.26 break-even -- no \
+              cluster. At 128x64 it is 128 tiles = 97.0% of the device: T_floor 7.94 us against \
+              cuBLAS's 7.0 on the dossier's 3.4 extrapolation and 9.05 us on the dispatcher's own \
+              (which carries Fit B's prologue residual, the conservative end), so predicted 77-88% \
+              from a measured 32.3% -- the largest single-shape number in the dossier, and the \
+              round is what closes that bracket. It is ALSO run at sq2048, where it must LOSE -- \
+              I_cta drops 85.33 -> \
+              42.67 and the L2 roof with it -- because that loss is what makes 'widest tile whose \
+              wave efficiency clears 0.90' a rule instead of a fit to one point",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_p",
+        cfg: &WGMMA_W1_MCB_V2_P,
+        shapes: &["sq4096", "sq8192"],
+        why: "The DISPATCHER's sq4096 configuration: persistent, clustered, NO raster (that \
+              shape's linear wave footprint is 42.2 MB of a 50.0 MiB L2, so the raster is provably \
+              worth nothing and including it would be a second fact in a one-fact A/B). Against \
+              w1_mcb_v2 it is persistence alone at a shape the raster cannot help; against \
+              w1_mcb_v2_r16_p at sq8192 it is the raster alone on top of persistence",
+    },
+    SweepRow {
+        label: "w1_v2_p",
+        cfg: &WGMMA_W1_V2_P,
+        shapes: &["gpt_d1024_up", "sq2048"],
+        why: "The DISPATCHER's gpt_d1024_up configuration, and the cleanest test of persistence \
+              anywhere in the suite: no raster (10.6 MB footprint), no cluster (f_L2 0.54), and \
+              n_k = 16 k-stages against X = 13.84 us, so the per-tile fixed cost is 56% of the \
+              tile. Whatever this row moves against w1_v2 is X_fill and nothing else. sq2048 is \
+              its single-wave control, where it must tie w1_v2 exactly",
+    },
+    // --- wave 3 lever 4: the mainloop drain, budgeted at ZERO --------------------------------------
+    SweepRow {
+        label: "w1_mcb_v2_fh",
+        cfg: &WGMMA_W1_MCB_V2_FH,
+        shapes: WGMMA_DRAIN_SHAPES,
+        why: "WAVE 3 LEVER 4b, THE FREE ROW (wgmma.fence hoisted out of the k-loop). CUTLASS fences \
+              around the mainloop, not per k-tile, and the ISA only asks that the fence order the \
+              accumulators against the async proxy BEFORE the first group -- nothing between \
+              k-stages writes them. Zero registers, zero ring depth, one instruction out of the \
+              drain-to-issue bubble. Predicted small-and-positive or zero; a MEASURABLE move means \
+              ptxas was being conservative across the loop back-edge, which is the evidence that \
+              would make 4a's address hoist worth a census",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_d1",
+        cfg: &WGMMA_W1_MCB_V2_D1,
+        shapes: WGMMA_DRAIN_SHAPES,
+        why: "WAVE 3 LEVER 4c (wait to depth 1, release one stage back). The SIGN is the question, \
+              and the derivation brackets it at -7.7% to +0.5%: the bubble between the last wgmma \
+              of a stage retiring and the first of the next issuing is 13.3-20.0% of a stage (the \
+              width of the unlocked-clock ambiguity), and the ring depth it costs was MEASURED at \
+              9.2% by Fit C, because D=1 at 4 stages has exactly the prefetch depth of D=0 at 3. \
+              128x256 s5 declines on shared memory, so the stage cannot be bought back. Its \
+              control is w1_mcb_v2_fh, one fact away; nothing is budgeted for it",
+    },
+    SweepRow {
+        label: "w3c_mcb_v2",
+        cfg: &WGMMA_W3C_MCB_V2,
+        shapes: &["sq8192"],
+        why: "The square tile's v2 twin, and the CONTROL the depth diagnostic below needs: \
+              w3c_s6_mcb2 carries the scalar store rounds 1-3 measured, so scoring the 128x128 \
+              depth arm against it would put the transport and the depth in one difference",
+    },
+    SweepRow {
+        label: "w3c_mcb_v2_d1",
+        cfg: &WGMMA_W3C_MCB_V2_D1,
+        shapes: &["sq8192"],
+        why: "WAVE 3 LEVER 4c, THE DIAGNOSTIC: depth 1 where the ring can AFFORD it. At 128x256 s4 \
+              the depth takes the producer's run-ahead from 3 to 2; at 128x128 s6 it takes it from \
+              5 to 4. If w1_mcb_v2_d1 loses and this row WINS, the mechanism is ring depth and the \
+              lever belongs to whatever tile has a spare stage rather than to the depth itself. \
+              sq8192 alone, where the mainloop is longest and a per-stage effect is largest",
     },
 ];
 
@@ -2565,12 +4474,89 @@ pub fn wgmma_sweep_measurable() -> Vec<&'static SweepRow> {
 /// objects, with the same [`bench_iters`], that `wgmma_vs_cublas` swept on 2026-08-10, so a row's
 /// number here and that round's number are comparable without an argument about denominators.
 ///
-/// Three, not seven. The sweep's cost is `rows x shapes`, and these three carry the whole question:
-/// `sq4096` and `sq8192` are the two points D1 section 4.5 predicts W1 at 95-108% on (and the two
-/// round 1 measured at 67.5% and 58.8%), and `sq2048` is the tile-quantization point D1 puts W3c at.
-/// The full seven-shape grid remains `wgmma_vs_cublas`'s job -- once this round says which
-/// configuration to run, that bench runs it everywhere.
-pub const WGMMA_SWEEP_SHAPES: &[&str] = &["sq2048", "sq4096", "sq8192"];
+/// Three, not seven, through wave 2: the sweep's cost is `rows x shapes`, and `sq4096` / `sq8192`
+/// are the two points D1 section 4.5 predicts W1 at 95-108% on (and the two round 1 measured at
+/// 67.5% and 58.8%), while `sq2048` is the tile-quantization point D1 puts W3c at. The full
+/// seven-shape grid remains `wgmma_vs_cublas`'s job -- once this round says which configuration to
+/// run, that bench runs it everywhere.
+///
+/// **Wave 3 adds two, and neither is decoration.** The schedule levers are *provably the identity*
+/// on a single-wave grid, and `sq2048` is exactly that -- so the three-shape set could not have
+/// measured either of wave 3's top two mechanisms:
+///
+/// * `gpt_d4096_up` is the RASTER's row and the only shape in the suite the linear order blocks
+///   *arithmetically*: matching the peer's 0.6734 ms needs `2.3844 GB / 0.6734 ms = 3.541 TB/s`
+///   against a 3.35 TB/s HBM peak, so no mainloop change can reach it. The raster takes its DRAM to
+///   0.797 GB (2.99x) and the target to 1.184 TB/s.
+/// * `gpt_d1024_up` is PERSISTENCE's row: `n_k = 16` k-stages against `X = 13.84 us` of per-tile
+///   fixed cost makes `X` 56% of its tile -- more than three times its share at sq8192 -- and it
+///   carries neither a raster nor a cluster confound (footprint 10.6 MB, `f_L2` 0.542).
+///
+/// `sq2048` stays as the single-wave CONTROL: every schedule arm must tie there, and a movement is
+/// the instrument rather than the kernel (WAVE3_DOSSIER 1.6, 2.9).
+///
+/// **This is the UNION, not the cross product.** Since wave 3 each [`SweepRow`] carries its own
+/// [`SweepRow::shapes`] and the round measures `sum over rows of |row.shapes|` cells, not
+/// `rows x shapes` -- see [`SweepRow::shapes`] for why a lever measured where it is provably zero is
+/// worse than not measured at all. Everything named here must appear in at least one row's list, or
+/// the shape is a column of "-- absent" (asserted by
+/// `the_sweep_invocation_and_shapes_name_things_that_exist`).
+pub const WGMMA_SWEEP_SHAPES: &[&str] = &[
+    "sq1024",
+    "sq2048",
+    "sq4096",
+    "sq8192",
+    "gpt_d1024_up",
+    "gpt_d1024_down",
+    "gpt_d4096_up",
+];
+
+/// The three square shapes rounds 1-3 measured every row at, and the default for every row that
+/// shipped before wave 3 -- so their numbers stay directly comparable to those logs.
+pub const WGMMA_SWEEP_SQUARES: &[&str] = &["sq2048", "sq4096", "sq8192"];
+
+/// The raster's shapes (WAVE3_DOSSIER 1.6): the two multi-wave shapes whose LINEAR footprint blows
+/// L2 (`gpt_d4096_up` at 2.73x, `sq8192` at 2.86x), the two multi-wave shapes whose footprint
+/// already fits and where the lever is therefore predicted FLAT, and one single-wave control where
+/// it is provably the identity.
+pub const WGMMA_RASTER_SHAPES: &[&str] =
+    &["gpt_d4096_up", "sq8192", "sq4096", "gpt_d1024_up", "sq2048"];
+
+/// The raster BRACKET's shapes: only the two where the lever fires at all. The bracket answers "is
+/// the mechanism traffic?", and that question has no content where the effect is zero.
+pub const WGMMA_RASTER_BRACKET_SHAPES: &[&str] = &["gpt_d4096_up", "sq8192"];
+
+/// Persistence's shapes (WAVE3_DOSSIER 2.9): the four multi-wave shapes, headed by `gpt_d1024_up`
+/// (largest predicted delta, and no raster or cluster confound), plus the single-wave control that
+/// all three arms must tie at.
+pub const WGMMA_PERSIST_SHAPES: &[&str] =
+    &["gpt_d1024_up", "sq4096", "sq8192", "gpt_d4096_up", "sq2048"];
+
+/// The tile-dispatch row's shapes (WAVE3_DOSSIER 3.8): `sq1024`, where a 128x256 tile is 32 CTAs of
+/// 132 and a 128x64 one is 128, and `sq2048`, where the narrower tile must LOSE -- which is what
+/// makes the wave-efficiency rule a rule rather than a fit to one point.
+pub const WGMMA_TILE_DISPATCH_SHAPES: &[&str] = &["sq1024", "sq2048"];
+
+/// The mainloop drain's shapes (WAVE3_DOSSIER 4.7). `sq8192` has the longest mainloop, so the
+/// per-stage term dominates and `X` is only 15% of the tile; `gpt_d1024_up` has the shortest, where
+/// the per-stage term is 44% of the tile -- so a per-stage effect must SHRINK from the first to the
+/// last or it is not a per-stage effect. `sq4096` sits between them and turns two points into three.
+pub const WGMMA_DRAIN_SHAPES: &[&str] = &["sq8192", "sq4096", "gpt_d1024_up"];
+
+/// The cluster PREDICATE's shapes (WAVE3_DOSSIER 3.8): the two single-wave-or-L2-bound shapes where
+/// the cluster is the sole variable. `gpt_d1024_down` sits exactly at the 7.00 TB/s roof by
+/// construction (it IS the `BW_L2` calibration) and is predicted the table's smallest ON;
+/// `gpt_d1024_up` at `f_L2 = 0.55` is predicted a LOSS. A rule fitted to one crossing is a curve
+/// fitted to two points, which is why both are here.
+///
+/// **Its reader is a law, not a row.** The two arms of this A/B are `w1_mcb_v2` (cluster ON) and
+/// `w1_v2` (OFF), and each measures a longer list than this one -- so the list cannot be spliced
+/// into a [`SweepRow::shapes`] the way [`WGMMA_RASTER_SHAPES`] is. What it can be, and now is, is
+/// the thing `the_sweep_invocation_and_shapes_name_things_that_exist` asserts BOTH of those rows
+/// cover, which is 3.8's refusal ("publishing any dispatch rule from a table that lacks
+/// `gpt_d1024_down` and `gpt_d1024_up` with both cluster settings") as a gate. Left unread it was a
+/// second spelling of two labels that already appear inline in both rows, free to drift from either.
+pub const WGMMA_CLUSTER_PREDICATE_SHAPES: &[&str] = &["gpt_d1024_down", "gpt_d1024_up"];
 
 /// The headline shape of the ranked table: the first of D1 4.5's two prediction points.
 pub const WGMMA_SWEEP_HEADLINE: &str = "sq4096";
@@ -2865,9 +4851,120 @@ pub const GUARD_TILES_PER_AXIS: usize = 3;
 pub fn guard_shape(cfg: &WgmmaCfg) -> GuardShape {
     GuardShape {
         m: (GUARD_TILES_PER_AXIS - 1) * cfg.bm + cfg.bm / 2,
-        n: (GUARD_TILES_PER_AXIS - 1) * cfg.bn + cfg.bn / 2,
+        n: (guard_n_tiles(cfg) - 1) * cfg.bn + cfg.bn / 2,
         k: cfg.bk * (cfg.stages + 1) - cfg.bk / 2,
     }
+}
+
+/// **N tiles in [`guard_shape`], and the one place G1's `tiles > CTAs` clause is enforced.**
+///
+/// [`GUARD_TILES_PER_AXIS`] for every one-tile-per-CTA row: three is already the smallest count that
+/// gives a middle tile, a pad CTA on either cluster axis and an odd tile count.
+///
+/// **A persistent row needs more, and the reason is that G19 is otherwise UNREACHABLE.** The
+/// persistent launch is `min(cluster_tiles, HOPPER_SM_COUNT / cluster_ctas)` cluster slots, so at 3x3
+/// tiles every CTA gets exactly one tile, the tile loop runs once, and a `%kt` that was never reset
+/// -- the corruption G19 exists to catch, and one that returns a plausible integer rather than a NaN
+/// -- would ship green. This returns the smallest ODD n-tile count that puts the cluster-tile count
+/// strictly above the slot count, so at least one cluster runs a SECOND tile and the reset is
+/// actually exercised.
+///
+/// It costs a bigger host reference (the debug-build f64 loop is `M*N*K`), and that cost is the
+/// price of the gate: `2 m-clusters x 35 n-tiles = 70 > 66` under a 1x2x1 cluster, `3 x 45 = 135 >
+/// 132` without one. `the_guard_shape_reaches_every_mechanism_the_old_one_could_not` budgets both.
+pub fn guard_n_tiles(cfg: &WgmmaCfg) -> usize {
+    if !cfg.tiles.is_persistent() {
+        return GUARD_TILES_PER_AXIS;
+    }
+    let m_clusters = GUARD_TILES_PER_AXIS.div_ceil(cfg.cluster_m());
+    let need = (cfg.persist_cluster_slots() / m_clusters + 1).max(GUARD_TILES_PER_AXIS);
+    // Odd, so the TILE count stays odd and no grid divides it evenly.
+    if need.is_multiple_of(2) {
+        need + 1
+    } else {
+        need
+    }
+}
+
+// --- the mainloop drain's exactness ladder and its full-drain twin (E4.1, E4.2) --------------------
+
+/// **E4.1: the `ktiles` ladder a drain arm must be exact at**, derived from the ring rather than
+/// written down.
+///
+/// # The two places a lagged release changes behaviour, and why neither is visible today
+///
+/// `wgmma.wait_group.sync.aligned D` retires all but the `D` most recent committed groups, so the
+/// depth arm differs from its full-drain twin at exactly two K values and the bring-up's old ladder
+/// (`1, 2, stages, stages+1, 4*stages`) reaches neither on purpose:
+///
+/// * **`ktiles <= wait_depth`.** The mainloop's `@%p3` guard is false on every iteration, so no
+///   stage is released *inside* the loop at all and `CDRAIN` is the only thing that frees the ring.
+///   At `ktiles < wait_depth` the tail even releases a stage the producer never refilled -- harmless
+///   exactly once, and a double release if the tail were written from `%stg` instead of `%rel`.
+/// * **`stages - 1`, the iteration before the ring wraps**, where `%rel` and `%stg` wrap on
+///   *different* iterations because they are `stages - D` apart. A ladder that only samples the wrap
+///   itself cannot see an off-by-one in which of the two wrapped first.
+///
+/// So the ladder is the dossier's `{1, 2, wait_depth, wait_depth+1, stages-1, stages, stages+1,
+/// 2*stages+1}` **plus `4*stages`**, which is what the bring-up already ran: E4.1 says *extend*, and
+/// a ladder that quietly dropped the several-wraps rung would be a narrowing wearing an extension's
+/// name. Deduplicated and sorted, with the degenerate `0` dropped -- at `K == 0` no `wgmma` issues,
+/// the accumulators are never written and [`gpu::gemm_nt_wgmma`](crate::gpu::gemm_nt_wgmma) rejects
+/// the call outright, so it is a different gate's question.
+pub fn drain_k_ladder(cfg: &WgmmaCfg) -> Vec<usize> {
+    // `validate` rejects `stages < wait_depth + 2`, so `stages >= 2` and `stages - 1` cannot wrap.
+    let mut v = vec![
+        1,
+        2,
+        cfg.wait_depth,
+        cfg.wait_depth + 1,
+        cfg.stages - 1,
+        cfg.stages,
+        cfg.stages + 1,
+        2 * cfg.stages + 1,
+        4 * cfg.stages,
+    ];
+    v.retain(|&t| t >= 1);
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// **E4.2's twin: the same kernel at `wait_depth = 0`**, found by GEOMETRY over
+/// [`wgmma_all_emittable`] and never from a hand-written name table.
+///
+/// # Why the twin, and not a tolerance against an f64 reference
+///
+/// The drain restructuring reassociates **nothing**: the same `wgmma_per_stage()` instructions
+/// accumulate into the same registers in the same K order, and only the point at which the buffer
+/// they read is published back to the producer moves. So the right verdict is `==` against the
+/// depth-0 kernel, bit for bit -- a `c*sqrt(K)*eps` arm would pass a drain change that corrupted a
+/// whole stage, because a stage of operands that arrived early is still a plausible float.
+///
+/// # Which twin, when the family ships two candidates
+///
+/// The preferred one carries the **same** [`WgmmaCfg::fence_hoisted`] setting, so the pair is ONE
+/// fact apart and its timing is readable as the depth alone. The opposite-fence row is the
+/// fallback, because the family does not ship an `_fh` row at every tile -- and it is an equally
+/// valid *bit-identity* twin, since `wgmma.fence.sync.aligned` is a memory-ordering directive that
+/// cannot move a bit. Returns `None` at `wait_depth == 0`, where the row IS its own twin.
+///
+/// Looking it up by the key [`WgmmaCfg::derived_name`] produces is the same discipline the
+/// dispatcher uses: a second spelling of a name is a second place for the table to drift.
+pub fn wgmma_full_drain_twin(cfg: &WgmmaCfg) -> Option<&'static WgmmaCfg> {
+    if cfg.wait_depth == 0 {
+        return None;
+    }
+    let mut want = *cfg;
+    want.wait_depth = 0;
+    want.fence_hoisted = cfg.fence_hoisted;
+    let same_fence = want.derived_name();
+    want.fence_hoisted = !cfg.fence_hoisted;
+    let other_fence = want.derived_name();
+    let all = wgmma_all_emittable();
+    [same_fence, other_fence]
+        .into_iter()
+        .find_map(|k| all.iter().copied().find(|c| c.key == k.as_str()))
 }
 
 // --- the pseudorandom arm (guard G2) --------------------------------------------------------------
@@ -4130,7 +6227,9 @@ pub fn wgmma_module(cfg: &WgmmaCfg, license: &Sm90aLicense) -> Result<String, St
 /// The `.visible .entry` for one configuration.
 fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     let name = cfg.name;
-    let (bm, bn, bk) = (cfg.bm, cfg.bn, cfg.bk);
+    // NB: CTA-M is deliberately absent -- the tile origin is emitted by one function
+    // (`wgmma_tile_origin_ptx`), so this body cannot grow a second spelling of it.
+    let (bn, bk) = (cfg.bn, cfg.bk);
     let threads = cfg.threads();
     let nacc = shape.accum_regs();
     let row_bytes = (bk * cfg.dtype.size()) as u64;
@@ -4159,6 +6258,12 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     // than becoming a second thing that also changed.
     let v2 = matches!(cfg.epilogue, EpilogueStore::V2);
     let elided = cfg.epilogue.is_diagnostic_only();
+    // --- the two wave-3 schedule levers ------------------------------------------------------------
+    // Same discipline again: at `OneTilePerCta` + `wait_depth 0` + no fence hoist this generator
+    // emits the byte-identical text rounds 1-3 measured, so those rows stay the control arm.
+    let persistent = cfg.tiles.is_persistent();
+    let drained = cfg.tiles.needs_tile_barrier();
+    let lag = cfg.release_lag();
     let hint_stores = cfg.l2_hint.hints_stores();
     let hint_operands = cfg.l2_hint.hints_operands();
     // The store's qualifier run, in the ISA's own order:
@@ -4264,6 +6369,26 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     if hint_operands {
         s += "    .reg .b64 %rdPolAB;\n";
     }
+    if persistent {
+        // The tile loop's own state. `%cid` is the flat CLUSTER index and `%slots` its stride --
+        // both ranks of a cluster hold the same value of each, by construction, which is the whole
+        // of the deadlock law. The rest is the remap's scratch: `%fa`/`%fb`/`%fr`/`%fq`/`%pc` belong
+        // to `divmod_u32_ptx` and appear nowhere else.
+        s += "    .reg .b32 %mclus,%ntile,%nct,%cid,%slots,%cgcols,%cgrp,%ci,%crows,%cr,%ccm,%ccn;\n";
+        s += "    .reg .f32 %fa,%fb,%fr,%fq;\n";
+        s += "    .reg .pred %pc;\n";
+    }
+    if drained {
+        // The tile rendezvous's phase parity, held by the producer's issuing thread alone. It flips
+        // once per tile, so it is the parity of the tile index -- which is why it can be a register
+        // rather than a second barrier.
+        s += "    .reg .b32 %pht;\n";
+    }
+    if lag > 0 {
+        // The stage the mainloop releases, `wait_depth` groups behind the one it is issuing against.
+        // See `WgmmaCfg::release_lag` -- the depth and this index come from that one function.
+        s += "    .reg .b32 %rel;\n    .reg .pred %p3;\n";
+    }
     s += &format!("    .reg .f32 %acc<{nacc}>;\n\n");
 
     // --- parameters -------------------------------------------------------------------------------
@@ -4285,13 +6410,23 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         // second spelling of the axis that could disagree with `Multicast::cluster_shape`.
         s += "    mov.u32 %crank,%cluster_ctarank;\n";
     }
-    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %ctan,%tmp,{bn};\n");
-    s += &format!("    mov.u32 %tmp,%ctaid.y;\n    mul.lo.s32 %ctam,%tmp,{bm};\n");
+    if persistent {
+        s += &wgmma_tile_bounds_ptx(cfg);
+    } else {
+        s += &wgmma_tile_origin_ptx(cfg);
+    }
     // ktiles = ceil(K / BK); BK is a power of two (validated), so the divide is a shift.
     s += &format!(
         "    add.u32 %tmp,%K,{};\n    shr.u32 %ktiles,%tmp,{bk_shift};\n",
         bk - 1
     );
+    if persistent {
+        // **`K == 0` must leave BEFORE the barriers exist, not at the epilogue.** `%ktiles` is a
+        // function of the `K` parameter alone, so this branch is uniform over the whole grid and no
+        // peer is left waiting. Taking it later would be a hang under the drained arm: the producer
+        // would reach its tile rendezvous while the consumers had already skipped their arrival.
+        s += &format!("    setp.eq.u32 %p0,%ktiles,0;\n    @%p0 bra EXIT_{name};\n");
+    }
 
     // --- mbarrier initialisation, then one CTA-wide rendezvous ------------------------------------
     // `full[s]` expects a single arrival: the TMA transaction itself, whose byte count the producer
@@ -4306,6 +6441,16 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         s += &format!(
             "    add.s64 %rdBar,%rdS,{};\n    mbarrier.init.shared::cta.b64 [%rdBar],{};\n",
             cfg.empty_off(st),
+            cfg.empty_arrivals()
+        );
+    }
+    if drained {
+        // The tile rendezvous, initialised ONCE with the whole cluster's consumer warpgroups --
+        // re-initialising a barrier a peer may be signalling is the classic cluster race, so it is
+        // created here beside the ring's and never touched again.
+        s += &format!(
+            "    add.s64 %rdBar,%rdS,{};\n    mbarrier.init.shared::cta.b64 [%rdBar],{};\n",
+            cfg.tile_bar_off(),
             cfg.empty_arrivals()
         );
     }
@@ -4353,14 +6498,39 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
             "    createpolicy.fractional.L2::evict_last.b64 %rdPolAB,{L2_POLICY_FRACTION};\n"
         );
     }
-    s += "    mov.u32 %kt,0;\n    mov.u32 %stg,0;\n";
     // The empty-phase parity starts at 1 so the first `stages` acquisitions pass immediately: a
     // freshly initialised barrier is in phase parity 0, and `try_wait.parity 1` completes at once
     // when the current parity is 0. Without this the producer would wait for a release that the
     // consumers cannot yet have made, and the pipeline would never start.
-    s += "    mov.u32 %phe,1;\n";
+    //
+    // Under persistence `%stg` and `%phe` are set here, OUTSIDE the tile loop, and carry across the
+    // tile boundary. That is not an optimisation, it is the only correct thing: the mbarrier phase
+    // parity is the parity of that barrier's completion count, stages complete an unequal number of
+    // times whenever `ktiles % stages != 0`, and there is no way to force them equal without
+    // re-initialising barriers a peer may be signalling.
+    if persistent {
+        s += "    mov.u32 %stg,0;\n    mov.u32 %phe,1;\n";
+        if drained {
+            s += "    mov.u32 %pht,0;\n";
+        }
+        s += &format!("PTILE_{name}:\n");
+        s += &format!("    setp.ge.u32 %p0,%cid,%nct;\n    @%p0 bra EXIT_{name};\n");
+        s += &wgmma_tile_index_ptx(cfg);
+        // **G19**: `%kt` drives `%pfirst`, which is the `scale-d` of each tile's first `wgmma`. A
+        // `%kt` that is not reset makes tile 2 accumulate into tile 1's result -- and with
+        // exact-integer operands the sum of two tiles is still a plausible integer, not a NaN.
+        s += "    mov.u32 %kt,0;\n";
+    } else {
+        s += "    mov.u32 %kt,0;\n    mov.u32 %stg,0;\n";
+        s += "    mov.u32 %phe,1;\n";
+    }
     s += &format!("PLOOP_{name}:\n");
-    s += &format!("    setp.ge.u32 %p0,%kt,%ktiles;\n    @%p0 bra EXIT_{name};\n");
+    let ploop_exit = if persistent {
+        format!("PNEXT_{name}")
+    } else {
+        format!("EXIT_{name}")
+    };
+    s += &format!("    setp.ge.u32 %p0,%kt,%ktiles;\n    @%p0 bra {ploop_exit};\n");
     // acquire: wait until stage `stg` is free
     s += "    mul.wide.u32 %rdT,%stg,8;\n    add.s64 %rdBar,%rdS,%rdT;\n";
     s += &format!("    add.s64 %rdBar,%rdBar,{empty_base};\n");
@@ -4445,6 +6615,24 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         cfg.stages
     );
     s += &format!("    mov.u32 %stg,0;\n    xor.b32 %phe,%phe,1;\n    bra PLOOP_{name};\n");
+    if persistent {
+        s += &format!("PNEXT_{name}:\n");
+        if drained {
+            // **The drained arm's whole mechanism, in six instructions.** The producer has issued
+            // every copy of tile `t`; it now waits until every consumer IN THE CLUSTER has finished
+            // tile `t`'s k-loop before touching the ring again, so tile `t+1`'s fill cannot overlap
+            // tile `t`'s tail. That is the measurement this arm exists for -- and it cannot
+            // deadlock, because the consumers' arrival depends only on copies this producer has
+            // already issued.
+            s += &format!("    add.s64 %rdBar,%rdS,{};\n", cfg.tile_bar_off());
+            s += &format!("PTWAIT_{name}:\n");
+            s += "    mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%pht;\n";
+            s += &format!("    @!%p1 bra PTWAIT_{name};\n");
+            s += "    xor.b32 %pht,%pht,1;\n";
+        }
+        s += "    add.u32 %cid,%cid,%slots;\n";
+        s += &format!("    bra PTILE_{name};\n");
+    }
 
     // ================================ consumer warpgroups =========================================
     s += &format!("CONSUMER_{name}:\n");
@@ -4454,12 +6642,59 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     );
     s += "    sub.u32 %cwg,%wgi,1;\n";
     s += &format!("    mul.lo.s32 %tmp,%cwg,{per_consumer_a};\n    cvt.u64.u32 %rdOffA,%tmp;\n");
-    s += "    mov.u32 %kt,0;\n    mov.u32 %stg,0;\n    mov.u32 %phf,0;\n";
-    s += "    setp.eq.u32 %ptrue,0,0;\n";
+    if persistent {
+        s += "    mov.u32 %stg,0;\n    mov.u32 %phf,0;\n";
+        s += "    setp.eq.u32 %ptrue,0,0;\n";
+        s += &format!("CTILE_{name}:\n");
+        s += &format!("    setp.ge.u32 %p0,%cid,%nct;\n    @%p0 bra EXIT_{name};\n");
+        s += &wgmma_tile_index_ptx(cfg);
+        // G19 again, in the role that actually holds the accumulators.
+        s += "    mov.u32 %kt,0;\n";
+        if cfg.fence_hoisted {
+            // **L4.7, the hoisted form -- hoisted out of the K LOOP, not out of the TILE loop.**
+            //
+            // 4b's whole content is "one fence per mainloop instead of one per k-stage", and that is
+            // what this is: one fence per tile against `n_k` k-stages, so `n_k - 1` of them leave
+            // the drain-to-issue bubble and the register cost stays zero. Hoisting it further --
+            // above `CTILE_` -- would emit ZERO fences between tile `t`'s epilogue and tile `t+1`'s
+            // first `wgmma.mma_async`, and that is a real hazard rather than a pedantic one: the
+            // epilogue's `st.global [..],%accN` is a WARP read of the accumulators and tile `t+1`'s
+            // first `wgmma` writes them. The ISA's exemption covers accumulator accesses *by
+            // successive wgmma of the same shape*; it does not cover a non-`wgmma` access in
+            // between, which is exactly what the store block is. So the fence belongs inside the
+            // tile loop, and `the_hoisted_fence_still_separates_a_tiles_epilogue_from_the_next_tile`
+            // asserts the position rather than the count.
+            s += "    wgmma.fence.sync.aligned;\n";
+        }
+        if lag > 0 {
+            // `%rel` lags `%stg` by the wait depth, so the first advance lands it on the stage this
+            // tile's `%kt = 0` used. `%stg` carries across tiles, so this is recomputed from it
+            // rather than reset to a literal.
+            s += &format!("    add.u32 %rel,%stg,{};\n", cfg.stages - lag);
+            s += &format!(
+                "    setp.lt.u32 %p1,%rel,{};\n    @!%p1 sub.u32 %rel,%rel,{};\n",
+                cfg.stages, cfg.stages
+            );
+        }
+    } else {
+        s += "    mov.u32 %kt,0;\n    mov.u32 %stg,0;\n    mov.u32 %phf,0;\n";
+        s += "    setp.eq.u32 %ptrue,0,0;\n";
+        if cfg.fence_hoisted {
+            s += "    wgmma.fence.sync.aligned;\n";
+        }
+        if lag > 0 {
+            s += &format!("    mov.u32 %rel,{};\n", cfg.stages - lag);
+        }
+    }
     // No accumulator zeroing: the first wgmma of the first K tile takes scale-d = 0, which overwrites
     // D instead of accumulating into it. That is the ISA's own way to skip the initialisation.
     s += &format!("CLOOP_{name}:\n");
-    s += &format!("    setp.ge.u32 %p0,%kt,%ktiles;\n    @%p0 bra CEND_{name};\n");
+    let cloop_exit = if lag > 0 {
+        format!("CDRAIN_{name}")
+    } else {
+        format!("CEND_{name}")
+    };
+    s += &format!("    setp.ge.u32 %p0,%kt,%ktiles;\n    @%p0 bra {cloop_exit};\n");
     s += "    mul.wide.u32 %rdT,%stg,8;\n    add.s64 %rdBar,%rdS,%rdT;\n";
     s += &format!("    add.s64 %rdBar,%rdBar,{full_base};\n");
     s += &format!("CWAIT_{name}:\n");
@@ -4471,8 +6706,10 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     s += &format!("    mul.wide.u32 %rdT,%stg,{tile_b};\n    add.s64 %rdB,%rdS,%rdT;\n");
     s += &format!("    add.s64 %rdB,%rdB,{};\n", cfg.b_off(0));
     s += "    setp.ne.u32 %pfirst,%kt,0;\n";
-    // `wgmma.fence` orders the accumulator registers against the async proxy before the group.
-    s += "    wgmma.fence.sync.aligned;\n";
+    if !cfg.fence_hoisted {
+        // `wgmma.fence` orders the accumulator registers against the async proxy before the group.
+        s += "    wgmma.fence.sync.aligned;\n";
+    }
     for j in 0..cfg.wgmma_per_stage() {
         for (reg, base, cst, step) in [
             ("%descA", "%rdA", const_a, a_step),
@@ -4488,39 +6725,51 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         let scale_d = if j == 0 { "%pfirst" } else { "%ptrue" };
         s += &format!("    {mma} {{{accs}}}, %descA, %descB, {scale_d}, 1, 1, 0, 0;\n");
     }
-    s += "    wgmma.commit_group.sync.aligned;\n    wgmma.wait_group.sync.aligned 0;\n";
-    // release the stage: one arrival per consumer warpgroup, from its first thread. `wait_group` is
+    s += "    wgmma.commit_group.sync.aligned;\n";
+    s += &format!("    wgmma.wait_group.sync.aligned {};\n", cfg.wait_depth);
+    // Release the stage: one arrival per consumer warpgroup, from its first thread. `wait_group` is
     // warpgroup-aligned, so every thread of this warpgroup is done with the buffer by now.
-    s += "    mul.wide.u32 %rdT,%stg,8;\n    add.s64 %rdBar,%rdS,%rdT;\n";
-    s += &format!("    add.s64 %rdBar,%rdBar,{empty_base};\n");
-    s += "    and.b32 %tmp,%lin,127;\n    setp.eq.u32 %p2,%tmp,0;\n";
-    if clustered {
-        // This warpgroup releases the stage in EVERY CTA of the cluster, not just its own: the slice
-        // of the shared operand it just finished reading (A under `ClusterA`, B under `ClusterB`)
-        // was multicast in by a peer's producer, and that producer may not overwrite it until every
-        // consumer in the cluster is done. `empty[s]` is therefore initialised with
-        // `cluster_ctas * consumer_wgs` arrivals (WgmmaCfg::empty_arrivals) and gets one from every
-        // consumer warpgroup in the cluster. The rule is the operand's, not the axis's, so this
-        // block is identical for both arms.
-        //
-        // `mapa` takes a 32-bit SHARED address, not the 64-bit generic one the rest of this mainloop
-        // computes, and an mbarrier arrival at `.shared::cluster` scope cannot return a state token
-        // (hence the `_` sink) -- both are the CUTLASS idiom verbatim.
-        s += "    cvta.to.shared.u64 %rdT,%rdBar;\n    cvt.u32.u64 %sbar,%rdT;\n";
-        for r in 0..ctas {
-            s += &format!("    mov.u32 %tmp2,{r};\n");
-            s += "    mapa.shared::cluster.u32 %rbar,%sbar,%tmp2;\n";
-            s += "    @%p2 mbarrier.arrive.shared::cluster.b64 _,[%rbar];\n";
-        }
+    //
+    // **Which stage** comes from `WgmmaCfg::release_lag`, the same function the depth above reads
+    // (law L4.2). At depth 0 that is the stage just issued against; at depth `D` it is the one `D`
+    // groups older, and the first `D` iterations have no older group to retire -- hence `%p3`. A lag
+    // smaller than the depth is this wave's silent corruption.
+    if lag > 0 {
+        s += &format!("    setp.ge.u32 %p3,%kt,{lag};\n");
+        s += &stage_release_ptx(cfg, "%rel", Some("%p3"));
     } else {
-        s += "    @%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];\n";
+        s += &stage_release_ptx(cfg, "%stg", None);
     }
     s += "    add.u32 %kt,%kt,1;\n    add.u32 %stg,%stg,1;\n";
+    if lag > 0 {
+        s += &format!(
+            "    add.u32 %rel,%rel,1;\n    setp.lt.u32 %p1,%rel,{};\n    @!%p1 mov.u32 %rel,0;\n",
+            cfg.stages
+        );
+    }
     s += &format!(
         "    setp.lt.u32 %p1,%stg,{};\n    @%p1 bra CLOOP_{name};\n",
         cfg.stages
     );
     s += &format!("    mov.u32 %stg,0;\n    xor.b32 %phf,%phf,1;\n    bra CLOOP_{name};\n");
+    if lag > 0 {
+        // **CDRAIN -- the tail, and the part that is invisible until persistence lands** (4.5).
+        // With `D > 0` the mainloop never releases the final `D` stages. In a one-tile kernel that
+        // is harmless: the CTA exits and nobody waits. Under a persistent loop it is a HANG -- the
+        // producer, already running ahead into tile `t+1`, waits on an `empty[s]` arrival the
+        // previous tile's consumer never made. So the tail is written from the start, and L4.5
+        // counts its releases against `wait_depth`.
+        s += &format!("CDRAIN_{name}:\n");
+        s += "    wgmma.wait_group.sync.aligned 0;\n";
+        for _ in 0..lag {
+            s += &stage_release_ptx(cfg, "%rel", None);
+            s += &format!(
+                "    add.u32 %rel,%rel,1;\n    setp.lt.u32 %p1,%rel,{};\n    @!%p1 mov.u32 \
+                 %rel,0;\n",
+                cfg.stages
+            );
+        }
+    }
 
     // --- epilogue ---------------------------------------------------------------------------------
     // Accumulator layout, per the ISA and identical to `mma.sync.m16n8k16`'s C fragment tiled over 4
@@ -4624,6 +6873,40 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
                 );
             }
         }
+    }
+    if drained {
+        // **The drained arm's consumer half, and its POSITION is the whole measurement.**
+        //
+        // The arm exists to answer one question: is the persistence gain the continuous ring, or is
+        // it CTA dispatch? To answer it the arm must give up the ring's overlap **entirely**, so
+        // that whatever it still wins over the one-tile-per-CTA control is dispatch and nothing
+        // else. WAVE3_DOSSIER 2.3 prices the overlap window as the last `stages` stage-releases of
+        // tile `t` plus the epilogue: `4 x 0.646 + X_epi 5.99 = 8.57 us` against `X_fill = 7.85 us`.
+        // An arrival placed above the store block closes only the 2.58 us mainloop-tail half of
+        // that window and leaves 5.99 us of it open -- **76% of the fill still hidden** -- so the
+        // arm would collect most of the ring's gain and be read as dispatch. That is a plausible
+        // number and a wrong one, and it would make the dossier's own falsifier ("if `g8_pstop`
+        // beats the control, dispatch matters and `X_fill` is not the mechanism") unreadable.
+        //
+        // So the arrival goes HERE, after the epilogue's last store: every instruction of tile
+        // `t`'s `X_epi` is issued before the producer may touch the ring for tile `t+1`.
+        //
+        // It cannot deadlock. The consumers' path to this arrival needs only copies this cluster's
+        // producers have already issued for tile `t`, and the `K == 0` early-out that skips the
+        // epilogue was taken far above -- before `mbarrier.init`, uniformly over the whole grid --
+        // precisely so that no consumer can ever reach `EXIT` without arriving here.
+        s += &format!("    add.s64 %rdBar,%rdS,{};\n", cfg.tile_bar_off());
+        s += "    and.b32 %tmp,%lin,127;\n    setp.eq.u32 %p2,%tmp,0;\n";
+        s += &barrier_arrive_ptx(cfg);
+    }
+    if persistent {
+        // **The consumer's tile advance.** `%cid += %slots` is the static schedule of
+        // WAVE3_DOSSIER 2.5, deliberately not an atomic work queue: every tile of a launch costs the
+        // same (they share `M`, `N`, `K` and therefore `n_k`), so a queue buys nothing, puts a
+        // global atomic round-trip on the critical path between tiles -- eating into the very
+        // `X_fill` window persistence exists to open -- and makes the tile-to-CTA mapping a race
+        // outcome, which destroys the raster's whole gain.
+        s += &format!("CNEXT_{name}:\n    add.u32 %cid,%cid,%slots;\n    bra CTILE_{name};\n");
     }
     if clustered {
         // **No CTA may retire while a peer can still touch its shared memory.** A peer's producer
@@ -5355,7 +7638,33 @@ mod tests {
         // at the squares -- f16's pre-lever numbers to within a point or two -- so
         // `wgmma_w1_bf16_for` ships the v2 and mcb2+v2 bf16 twins and the round re-measures the
         // dtype transfer instead of trusting it.
-        assert_eq!(mods.len(), 23);
+        // 23 -> 25 with WAVE 3 lever 1: the grouped raster at the derived optimum (`r16`) and its
+        // +24%-traffic bracket (`r32`), both one fact off the shipped `w1_mcb_v2`. They are
+        // separate modules because the raster is part of `derived_name` -- a raster row that
+        // reused the linear key would be handed the LINEAR kernel by the module cache and the
+        // round would publish its control arm twice, once under a heading claiming a raster that
+        // never ran.
+        // 25 -> 27 with WAVE 3 lever 2, persistence: the continuous-ring arm (`_r16_p`) and the
+        // drained diagnostic (`_r16_pstop`) that separates "persistence helps" from "the ring
+        // helps". Both are one field off `w1_mcb_v2_r16` and both are distinct modules -- the
+        // drained arm even has a different SMEM footprint (one extra mbarrier for the tile
+        // rendezvous), so a shared key would also have loaded the wrong carveout.
+        // 27 -> 30 on 2026-08-12 with WAVE 3 lever 3, the per-shape dispatcher: the three
+        // configurations `wgmma_dispatch` selects that no earlier row spells. `w1_mcb_v2_p`
+        // (persistent + cluster, NO raster) is sq4096's verdict -- that shape's linear wave
+        // footprint is 42.2 MB of a 50.0 MiB L2, so a raster there would be a second fact in a
+        // one-fact A/B. `w1_v2_p` (persistent, no cluster, no raster) is gpt_d1024_up's, the
+        // cleanest test of persistence in the suite. `w3d_s4_v2` is the NEW m64n64k16 128x64
+        // family -- 32 accumulator registers per consumer thread instead of 128 and a 98 368 B
+        // ring instead of 196 672 -- and it is the only thing in wave 3 that moves sq1024, where
+        // a 128x256 tile is 32 CTAs of 132.
+        // 30 -> 34 on 2026-08-12 with WAVE 3 lever 4, the mainloop drain: `w1_mcb_v2_fh` (4b, the
+        // free row -- the fence hoisted out of the k-loop), `w1_mcb_v2_d1` (4c at the shipped
+        // tile, whose SIGN is the question), `w3c_mcb_v2` (the square tile's v2 twin, which
+        // exists ONLY so the diagnostic below is one fact from its control rather than two) and
+        // `w3c_mcb_v2_d1` (depth 1 where the 6-stage ring can afford it). `drain_tag` puts both
+        // fields in `derived_name`, so each is its own module and its own cache key.
+        assert_eq!(mods.len(), 34);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -5401,14 +7710,36 @@ mod tests {
                 shape.token(),
                 c.dtype.mma_types()
             )));
-            // the async-proxy bracket
+            // **The async-proxy bracket -- law L4.1, the count law.** One `commit_group` (one group
+            // per k-stage, one k-stage body) and exactly one `wgmma.fence`, wherever the hoist put
+            // it. `wait_group` occurs once in the mainloop at `cfg.wait_depth`, once in the epilogue
+            // at a LITERAL 0, and once in `CDRAIN` at 0 -- the last only when there is a tail to
+            // drain, i.e. `wait_depth > 0`, because at depth 0 the mainloop has already retired
+            // every group and emitting a redundant one would move the shipped rows' measured text.
             assert_eq!(ptx.matches("wgmma.fence.sync.aligned;").count(), 1);
             assert_eq!(ptx.matches("wgmma.commit_group.sync.aligned;").count(), 1);
-            assert_eq!(ptx.matches("wgmma.wait_group.sync.aligned 0;").count(), 2);
-            // barriers: one full + one empty per stage, initialised once each
+            // Two literal-0 waits at every depth, and they are DIFFERENT two: at depth 0 they are
+            // the mainloop's and the epilogue's; at depth > 0 they are CDRAIN's and the epilogue's,
+            // and the mainloop's has moved to `cfg.wait_depth`. The epilogue's stays spelled as a
+            // literal so a future `cfg.wait_depth` cannot leak into it.
+            assert_eq!(
+                ptx.matches("wgmma.wait_group.sync.aligned 0;").count(),
+                2,
+                "{}: the epilogue's drain plus exactly one of (mainloop at depth 0 | CDRAIN)",
+                c.name
+            );
+            assert_eq!(
+                ptx.matches(&format!("wgmma.wait_group.sync.aligned {};", c.wait_depth))
+                    .count(),
+                if c.wait_depth == 0 { 2 } else { 1 },
+                "{}: the mainloop waits to cfg.wait_depth and nothing else does",
+                c.name
+            );
+            // barriers: one full + one empty per stage, initialised once each, plus the drained
+            // arm's single tile rendezvous.
             assert_eq!(
                 ptx.matches("mbarrier.init.shared::cta.b64").count(),
-                2 * c.stages
+                2 * c.stages + usize::from(c.tiles.needs_tile_barrier())
             );
             assert_eq!(
                 ptx.matches("mbarrier.init.shared::cta.b64 [%rdBar],1;")
@@ -5423,15 +7754,17 @@ mod tests {
                     c.empty_arrivals()
                 ))
                 .count(),
-                c.stages,
-                "{}: the empty barrier expects one arrival per consumer warpgroup IN THE CLUSTER",
+                c.stages + usize::from(c.tiles.needs_tile_barrier()),
+                "{}: the empty barrier expects one arrival per consumer warpgroup IN THE CLUSTER, \
+                 and the drained arm's tile rendezvous takes the same count for the same reason",
                 c.name
             );
             assert_eq!(
                 ptx.matches("mbarrier.try_wait.parity.shared::cta.b64")
                     .count(),
-                2,
-                "{}: one acquire in the producer, one in the consumer",
+                2 + usize::from(c.tiles.needs_tile_barrier()),
+                "{}: one acquire in the producer, one in the consumer, plus the drained arm's tile \
+                 rendezvous",
                 c.name
             );
             assert_eq!(
@@ -5561,18 +7894,23 @@ mod tests {
                     assert!(ptx.contains("    .reg .b64 %rdOffB;\n"), "{}", c.name);
                     assert!(ptx.contains("add.s64 %rdB,%rdB,%rdOffB;"), "{}", c.name);
                 }
-                // One remote-capable arrival per cluster CTA, per consumer warpgroup.
+                // One remote-capable arrival per cluster CTA, per RELEASE SITE: the mainloop's, one
+                // per `CDRAIN` tail release, and the drained arm's tile rendezvous. All of them
+                // come from `stage_release_ptx`/`barrier_arrive_ptx`, so the count is a statement
+                // about how many times that one function was called, not about three hand-written
+                // copies that could each name the wrong CTA.
+                let release_sites = 1 + c.release_lag() + usize::from(c.tiles.needs_tile_barrier());
                 assert_eq!(
                     ptx.matches("mbarrier.arrive.shared::cluster.b64 _,[%rbar];")
                         .count(),
-                    c.cluster_ctas(),
+                    c.cluster_ctas() * release_sites,
                     "{}: every CTA of the cluster must be released",
                     c.name
                 );
                 assert_eq!(
                     ptx.matches("mapa.shared::cluster.u32 %rbar,%sbar,%tmp2;")
                         .count(),
-                    c.cluster_ctas()
+                    c.cluster_ctas() * release_sites
                 );
                 assert!(
                     !ptx.contains("mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];"),
@@ -5607,7 +7945,14 @@ mod tests {
                     "{}: both operands are this CTA's own tiles at its own coordinates",
                     c.name
                 );
-                assert!(ptx.contains("@%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];"));
+                assert_eq!(
+                    ptx.matches("@%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];")
+                        .count(),
+                    1 + c.release_lag() + usize::from(c.tiles.needs_tile_barrier()),
+                    "{}: one release site per mainloop iteration, per CDRAIN tail stage, and one \
+                     for the drained arm's tile rendezvous",
+                    c.name
+                );
             }
             // the register split
             assert!(ptx.contains(&format!(
@@ -6518,6 +8863,68 @@ mod tests {
                 (7 * c.bm - 3, 7 * c.bn - 3),
             ] {
                 let (gx, gy, gz) = p.grid(m, n);
+                // **A persistent row's grid is not a tile map at all**: `x` is a cluster SLOT and
+                // `y` the rank, and the tile map is the loop. The coverage law is therefore stated
+                // over `RasterGrid::tile_of_cid`, in
+                // `the_persistent_loop_covers_every_tile_once_from_every_cluster_slot`; what this
+                // one still owns is the two properties the LAUNCH must have -- the cluster is whole,
+                // and no slot is launched that has no tile.
+                if c.tiles.is_persistent() {
+                    let r = c.raster_grid(m, n);
+                    assert_eq!(
+                        (gy as usize, gz),
+                        (cy, 1),
+                        "{}: the persistent grid is (slots, cluster rank, 1)",
+                        c.name
+                    );
+                    assert!(
+                        gx >= 1 && gx <= r.cluster_tiles().max(1),
+                        "{}: {gx} slots for {} cluster-tiles at {m}x{n}",
+                        c.name,
+                        r.cluster_tiles()
+                    );
+                    assert!(
+                        gx as usize <= c.persist_cluster_slots(),
+                        "{}: {gx} slots exceeds the device's {} -- a persistent launch that \
+                         oversubscribes buys nothing and pays the launch",
+                        c.name,
+                        c.persist_cluster_slots()
+                    );
+                    continue;
+                }
+                // **A raster row's grid axes are not tile axes**, so the same coverage law is
+                // stated over its own decomposition: x is the cluster-row within a group, y the
+                // n-tile with the cluster rank in its low bits, z the group. What must hold is
+                // unchanged -- the launch covers every tile, the cluster is never split, and the
+                // slack is bounded -- but "one cluster of slack" becomes "one GROUP of slack",
+                // and that slack is CTAs that take the cluster-uniform early exit rather than
+                // tiles that run out of range.
+                if c.raster > 1 {
+                    let r = c.raster_grid(m, n);
+                    assert_eq!((gx, gy, gz), r.dims());
+                    assert_eq!(gy as usize % cy, 0, "{}: grid y splits a cluster", c.name);
+                    assert!(
+                        r.padded_m_tiles() as usize * p.bm >= m && r.n_tiles as usize * p.bn >= n,
+                        "{}: raster grid does not cover {m}x{n}",
+                        c.name
+                    );
+                    let owners = (0..gz)
+                        .flat_map(|z| (0..gy).flat_map(move |y| (0..gx).map(move |x| (x, y, z))))
+                        .filter(|(x, y, z)| r.tile_of(*x, *y, *z).is_some())
+                        .count();
+                    assert_eq!(
+                        owners,
+                        (r.padded_m_tiles() * r.n_tiles) as usize,
+                        "{}: the raster's owners are not the padded tile domain",
+                        c.name
+                    );
+                    assert!(
+                        ((gz * gx) - r.m_clusters()) < r.gc,
+                        "{}: more than one surplus GROUP of cluster-rows",
+                        c.name
+                    );
+                    continue;
+                }
                 assert_eq!(gz, 1);
                 assert_eq!(
                     gx as usize % cx,
@@ -6568,6 +8975,1096 @@ mod tests {
         assert_eq!(WGMMA_W1_MCB.launch_plan().grid(128, 3 * 256), (3, 2, 1));
         assert_eq!(WGMMA_W1_MCB.launch_plan().grid(1, 1), (1, 2, 1));
         assert_eq!(WGMMA_W1_MC.launch_plan().grid(1, 1), (2, 1, 1));
+    }
+
+    /// **GUARD G5 -- the raster is a BIJECTION onto the padded tile domain.**
+    ///
+    /// The whole lever is a permutation of the launch order, so the one property that must survive
+    /// it is that every tile is still computed exactly once. The classic defect makes the map
+    /// surjective but not injective: two CTAs write one tile in bounds and some other tile is never
+    /// computed, which against a host-pre-zeroed `C` is a block of zeros and against a `C` the
+    /// harness reuses between arms is the PREVIOUS arm's answer -- a plausible number nobody
+    /// questions.
+    ///
+    /// Ranged over every `m_tiles % GROUP_M` residue and both cluster settings, because the ragged
+    /// last group is the arm the shipped suite never exercises (all seven benched shapes have
+    /// `m_clusters` a multiple of 8) and is therefore the arm that would ship broken.
+    #[test]
+    fn the_raster_is_a_bijection_over_the_padded_tile_domain() {
+        for cluster_m in [1u32, 2] {
+            for group_m in [2u32, 4, 8, 16, 32] {
+                if !group_m.is_multiple_of(cluster_m) {
+                    continue;
+                }
+                for m_tiles in 1u32..=40 {
+                    for n_tiles in [1u32, 3, 4, 7, 16] {
+                        let g = RasterGrid::new(group_m, cluster_m, m_tiles, n_tiles);
+                        let (gx, gy, gz) = g.dims();
+                        let mut seen = vec![false; (g.padded_m_tiles() * n_tiles) as usize];
+                        let mut exits = 0usize;
+                        for z in 0..gz {
+                            for y in 0..gy {
+                                for x in 0..gx {
+                                    match g.tile_of(x, y, z) {
+                                        None => exits += 1,
+                                        Some((mt, nt)) => {
+                                            assert!(
+                                                mt < g.padded_m_tiles() && nt < n_tiles,
+                                                "raster escaped the padded domain: \
+                                                 G{group_m}/c{cluster_m} m{m_tiles} n{n_tiles} \
+                                                 ({x},{y},{z}) -> ({mt},{nt})"
+                                            );
+                                            let i = (mt * n_tiles + nt) as usize;
+                                            assert!(
+                                                !seen[i],
+                                                "NOT INJECTIVE: two CTAs own tile ({mt},{nt}) at \
+                                                 G{group_m}/c{cluster_m} m{m_tiles} n{n_tiles}"
+                                            );
+                                            seen[i] = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        assert!(
+                            seen.iter().all(|b| *b),
+                            "NOT SURJECTIVE: some tile is computed by nobody at \
+                             G{group_m}/c{cluster_m} m{m_tiles} n{n_tiles}"
+                        );
+                        // Every CTA either owns a tile or exits; nothing is left over.
+                        assert_eq!(
+                            (gx * gy * gz) as usize,
+                            seen.len() + exits,
+                            "the grid does not account for itself at G{group_m}/c{cluster_m} \
+                             m{m_tiles} n{n_tiles}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The B-multicast's correctness law, over the raster.** The two CTAs of a `1x2x1` cluster
+    /// must compute the SAME `%ctan` -- the producer's multicast copy is indexed by
+    /// `%crank * b_box_rows + %ctan`, so peers that disagree there each fetch half of a B tile the
+    /// other does not want and half the accumulator COLUMNS come back stale, at full speed, with no
+    /// error anywhere. Their `%ctam` must differ, or the cluster computes one tile twice.
+    ///
+    /// The same sweep checks the early exit is **cluster-uniform**: a rank that returns while its
+    /// peer waits on an `empty[s]` arrival or a multicast is a hang, and a hang costs the visit.
+    #[test]
+    fn the_raster_keeps_every_cluster_on_one_n_tile() {
+        for group_m in [2u32, 4, 16, 32] {
+            for m_tiles in 1u32..=33 {
+                for n_tiles in [1u32, 5, 8] {
+                    let g = RasterGrid::new(group_m, 2, m_tiles, n_tiles);
+                    let (gx, gy, gz) = g.dims();
+                    assert!(
+                        gy.is_multiple_of(2),
+                        "grid.y must be a multiple of cluster.y"
+                    );
+                    for z in 0..gz {
+                        for x in 0..gx {
+                            for pair in 0..gy / 2 {
+                                let (r0, r1) =
+                                    (g.tile_of(x, 2 * pair, z), g.tile_of(x, 2 * pair + 1, z));
+                                match (r0, r1) {
+                                    (None, None) => {}
+                                    (Some((m0, n0)), Some((m1, n1))) => {
+                                        assert_eq!(n0, n1, "cluster peers disagree on the N tile");
+                                        assert_ne!(m0, m1, "cluster peers share the M tile");
+                                    }
+                                    _ => panic!(
+                                        "the early exit is NOT cluster-uniform at G{group_m} \
+                                         m{m_tiles} n{n_tiles} ({x},{pair},{z}) -- one rank \
+                                         returns while its peer waits on it"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The wave footprint the raster is *for*: `GROUP_M = 16` must actually be the minimum of
+    /// `f(R) = R*BM + (W/R)*BN` over the candidate set, and `GROUP_M = 2` -- the value the wave
+    /// brief originally implied -- must be WORSE than the linear order it replaces at a 256-wide
+    /// tile. Arithmetic, so it is a device-free law rather than a claim in a comment.
+    #[test]
+    fn sixteen_is_the_derived_raster_optimum_for_a_128x256_tile() {
+        let (bm, bn, w) = (128.0f64, 256.0f64, 132.0f64);
+        let f = |r: f64| r * bm + (w / r) * bn;
+        let best = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+            .into_iter()
+            .min_by(|a, b| f(*a).total_cmp(&f(*b)))
+            .unwrap();
+        assert_eq!(
+            best, 16.0,
+            "the raster optimum moved; re-derive the shipped GROUP_M"
+        );
+        assert!(
+            f(32.0) > f(16.0) && f(8.0) > f(16.0),
+            "16 must be a strict minimum"
+        );
+        // The bracket is +24%, which is what makes r32 a partial gain rather than a tie.
+        let ratio = f(32.0) / f(16.0);
+        assert!(
+            (1.20..1.28).contains(&ratio),
+            "bracket ratio {ratio} left its derived band"
+        );
+        // And GROUP_M = 2 is 4.12x the optimum -- worse than every shape's linear order.
+        assert!(f(2.0) / f(16.0) > 4.0);
+    }
+
+    /// The linear order's PTX must not move by a character when the raster field lands: every row
+    /// that shipped before wave 3 keeps its exact two instructions, its exact derived name and
+    /// therefore its exact module-cache key.
+    #[test]
+    fn the_linear_order_emits_the_same_two_instructions_it_always_did() {
+        for cfg in [&WGMMA_W1, &WGMMA_W1_MCB, &WGMMA_W1_MCB_V2, &WGMMA_W3C] {
+            assert_eq!(cfg.raster, 1, "{} is not a linear row", cfg.name);
+            assert_eq!(cfg.raster_tag(), "");
+            let ptx = wgmma_module(cfg, &license()).unwrap();
+            assert!(ptx.contains(&format!(
+                "    mov.u32 %tmp,%ctaid.x;\n    mul.lo.s32 %ctan,%tmp,{};\n    mov.u32 \
+                 %tmp,%ctaid.y;\n    mul.lo.s32 %ctam,%tmp,{};\n",
+                cfg.bn, cfg.bm
+            )));
+            assert!(!ptx.contains("%ctaid.z"), "{} grew a z axis", cfg.name);
+        }
+    }
+
+    /// The raster rows' PTX: the decode is present, division-free, the early exit precedes
+    /// `mbarrier.init`, and the whole module is still pure ASCII (one non-ASCII character in a
+    /// generator's `format!` is a `ptxas fatal` at `cuModuleLoadData`, not a compile error).
+    #[test]
+    fn the_raster_prologue_is_division_free_and_exits_before_the_barriers() {
+        for cfg in [&WGMMA_W1_MCB_V2_R16, &WGMMA_W1_MCB_V2_R32] {
+            let ptx = wgmma_module(cfg, &license()).unwrap();
+            assert!(ptx.is_ascii(), "{} emitted non-ASCII PTX", cfg.name);
+            let gc = cfg.raster as usize / 2;
+            assert!(ptx.contains(&format!("mad.lo.s32 %tmp,%tmp,{gc},%tmp2;")));
+            assert!(
+                ptx.contains("add.u32 %tmp,%tmp,%crank;"),
+                "the intra-cluster rank is not re-added"
+            );
+            assert!(ptx.contains("@%p0 ret;"), "no cluster-uniform early exit");
+            for banned in ["div.", "rem.", "rcp."] {
+                assert!(
+                    !ptx.contains(banned),
+                    "{} emitted a {banned} in the prologue",
+                    cfg.name
+                );
+            }
+            let exit = ptx.find("@%p0 ret;").unwrap();
+            let init = ptx.find("mbarrier.init").unwrap();
+            assert!(
+                exit < init,
+                "{}: the early exit must precede mbarrier.init -- an exit after the first \
+                 barrier.cluster.arrive is a hang",
+                cfg.name
+            );
+            // The tile origin is emitted ONCE. Two copies that could disagree is how a consumer
+            // computes with the producer's tile.
+            assert_eq!(ptx.matches("mul.lo.s32 %ctam,%tmp,").count(), 1);
+            assert_eq!(ptx.matches("mul.lo.s32 %ctan,%tmp2,").count(), 1);
+        }
+    }
+
+    /// The raster's grid is the [`RasterGrid`] decomposition and nothing else, and it declines the
+    /// two ways it can be wrong: a group that ends mid-cluster, and `Multicast::ClusterA`, whose
+    /// `2x1x1` cluster already owns the grid-X axis the raster needs for the group's cluster-row.
+    #[test]
+    fn the_raster_grid_and_its_refusals() {
+        // gpt_d4096_up: M=4096 (32 m-tiles, 16 m-clusters), N=16384 (64 n-tiles). GROUP_M=16 -> GC=8.
+        let p = WGMMA_W1_MCB_V2_R16.launch_plan();
+        assert_eq!(p.grid(4096, 16384), (8, 128, 2));
+        assert_eq!(
+            (8 * 128 * 2) as usize,
+            2048,
+            "the CTA count must not change"
+        );
+        // The linear twin covers the same 2048 tiles as a flat 64x32 grid.
+        assert_eq!(WGMMA_W1_MCB_V2.launch_plan().grid(4096, 16384), (64, 32, 1));
+        // A ragged last group: 17 m-clusters over groups of 8 is 3 groups, the last one short.
+        let g = WGMMA_W1_MCB_V2_R16.raster_grid(4224, 256);
+        assert_eq!((g.m_clusters(), g.dims()), (17, (8, 2, 3)));
+
+        let mid_cluster = WgmmaCfg {
+            name: "x",
+            key: "x",
+            raster: 3,
+            ..WGMMA_W1_MCB
+        };
+        let e = mid_cluster.validate().unwrap_err();
+        assert!(e.contains("not a multiple of the cluster's 2 CTAs"), "{e}");
+        let on_a = WgmmaCfg {
+            name: "x",
+            key: "x",
+            raster: 16,
+            ..WGMMA_W1_MC
+        };
+        assert!(on_a
+            .validate()
+            .unwrap_err()
+            .contains("already owns that axis"));
+        // And G3: a raster row that keeps the linear row's name is refused, because the module
+        // cache would hand it the LINEAR kernel and the round would publish the control twice.
+        let misnamed = WgmmaCfg {
+            raster: 16,
+            ..WGMMA_W1_MCB_V2
+        };
+        assert!(misnamed
+            .validate()
+            .unwrap_err()
+            .contains("wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16"));
+    }
+
+    /// **THE DEADLOCK LAW (WAVE3_DOSSIER 2.6): the persistent loop is indexed by the CLUSTER, and
+    /// its stride is the number of cluster slots.**
+    ///
+    /// This is wave 3's ranked-#1 hazard and it fails by **hanging rented silicon**, not by
+    /// returning a wrong number. Under `Multicast::ClusterB`, `empty[s]` takes
+    /// `cluster_ctas * consumer_wgs` arrivals and every consumer arrives at every CTA of the cluster
+    /// through `mapa`, while every producer multicasts into every peer's ring. Take the naive
+    /// `tile = ctaid; tile < ntiles; tile += gridDim`: at sq4096 that is 512 tiles over 132 CTAs, so
+    /// 116 CTAs run 4 tiles and 16 run 3 -- and if the two ranks of a cluster land on opposite sides
+    /// of that split, rank 0's producer waits forever on `empty[s]` arrivals rank 1 will never make
+    /// AND multicasts into the shared memory of a CTA that has exited.
+    ///
+    /// The fix is a SHAPE of loop, not a check: `%cid` is `%ctaid.x`, the cluster extends along `y`,
+    /// so both ranks hold the identical `%cid` and the identical count by construction. This law
+    /// pins that shape in the emitted text, in both roles, plus the two properties that make the
+    /// stride right: it is read from `%nctaid.x` (so an under- or over-subscribed launch is still
+    /// correct) and the host's grid puts the slots on the same axis.
+    #[test]
+    fn the_persistent_loop_is_indexed_by_the_cluster_never_by_the_cta() {
+        let rows: Vec<&WgmmaCfg> = wgmma_all_emittable()
+            .into_iter()
+            .filter(|c| c.tiles.is_persistent())
+            .collect();
+        assert!(!rows.is_empty(), "wave 3 ships a persistent arm");
+        for c in rows {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            assert!(ptx.is_ascii(), "{} emitted non-ASCII PTX", c.name);
+            assert_eq!(
+                ptx.matches("mov.u32 %cid,%ctaid.x;").count(),
+                1,
+                "{}: the loop index is `%ctaid.x` -- the axis BOTH ranks of a 1x2x1 cluster share \
+                 -- and it is set once, before the role split, so the two roles cannot disagree",
+                c.name
+            );
+            assert_eq!(
+                ptx.matches("mov.u32 %slots,%nctaid.x;").count(),
+                1,
+                "{}: the stride is the launched slot count, read from the grid rather than baked \
+                 in as HOPPER_SM_COUNT/cluster_ctas",
+                c.name
+            );
+            assert_eq!(
+                ptx.matches("add.u32 %cid,%cid,%slots;").count(),
+                2,
+                "{}: exactly one advance per role -- producer at PNEXT, consumer at CNEXT",
+                c.name
+            );
+            assert!(
+                !ptx.contains("%ctaid.y") && !ptx.contains("%ctaid.z"),
+                "{}: a persistent kernel reads NO other grid axis; `%ctaid.y` is the cluster rank \
+                 and reading it would be a second spelling of `%cluster_ctarank`",
+                c.name
+            );
+            // ...and the host agrees: grid.y IS the cluster's M extent, grid.z is 1, and grid.x --
+            // the slot count -- never exceeds the device's.
+            for (m, n) in [
+                (1024usize, 1024usize),
+                (4096, 16384),
+                (8192, 8192),
+                (320, 8832),
+            ] {
+                let (gx, gy, gz) = c.launch_plan().grid(m, n);
+                assert_eq!((gy as usize, gz), (c.cluster_m(), 1), "{}", c.name);
+                assert!(gx as usize <= c.persist_cluster_slots(), "{}", c.name);
+            }
+        }
+    }
+
+    /// **G19, and the second textual law the tile loop needs.**
+    ///
+    /// `%pfirst` is `setp.ne.u32 %pfirst,%kt,0`, and the first `wgmma` of each stage takes
+    /// `scale-d = %pfirst`. `%kt` was a whole-KERNEL counter because a kernel was one tile. **In a
+    /// tile loop a `%kt` that is not reset makes tile 2's first `wgmma` take `scale-d = 1` and
+    /// accumulate into tile 1's result** -- and with the round's exact-integer operands the sum of
+    /// two tiles is still an exact integer, so the corruption is a plausible-looking number rather
+    /// than a NaN. It is also unreachable on any guard shape with one tile per CTA, which is why
+    /// `guard_n_tiles` widens the persistent guard until `tiles > CTAs`.
+    ///
+    /// The second law: the tile-index arithmetic is emitted twice -- once per role -- and if the two
+    /// copies ever disagreed the consumer would compute with the wrong tile's operands. Silently
+    /// wrong, no hang, and NOT caught by the epilogue's bounds predicates. Both copies come from one
+    /// `wgmma_tile_index_ptx`, and this counts them.
+    #[test]
+    fn the_persistent_tile_loop_resets_kt_and_emits_one_tile_map() {
+        for c in wgmma_all_emittable() {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            assert_eq!(
+                ptx.matches("mov.u32 %kt,0;").count(),
+                2,
+                "{}: one `%kt` reset per role -- and under persistence it must be INSIDE the tile \
+                 loop, which the position check below states",
+                c.name
+            );
+            if !c.tiles.is_persistent() {
+                assert!(!ptx.contains("PTILE_"), "{}: no tile loop", c.name);
+                continue;
+            }
+            // Position, not just count: each role's reset is textually after that role's tile-loop
+            // label, so it runs once per TILE rather than once per kernel.
+            for label in [format!("PTILE_{}:", c.name), format!("CTILE_{}:", c.name)] {
+                let at = ptx
+                    .find(&label)
+                    .unwrap_or_else(|| panic!("{label} missing"));
+                let reset = ptx[at..]
+                    .find("mov.u32 %kt,0;")
+                    .unwrap_or_else(|| panic!("{}: no `%kt` reset after {label} -- G19", c.name));
+                let loop_head = ptx[at..]
+                    .find("LOOP_")
+                    .expect("the k-loop label follows the tile label");
+                assert!(
+                    reset < loop_head,
+                    "{}: the `%kt` reset after {label} is inside the k-loop, not the tile loop",
+                    c.name
+                );
+            }
+            let map = wgmma_tile_index_ptx(c);
+            assert_eq!(
+                ptx.matches(&map).count(),
+                2,
+                "{}: the tile map must appear exactly twice and be byte-identical in both roles",
+                c.name
+            );
+            // The epilogue's bases are derived from `%ctam`/`%ctan`, which the map recomputes, so
+            // they follow for free -- but the ring pointer and the phase parities must NOT be reset
+            // per tile (a reset parity against a live barrier is a hang), and that is a position
+            // claim about `%stg`.
+            let ctile = ptx.find(&format!("CTILE_{}:", c.name)).unwrap();
+            assert!(
+                !ptx[ctile..].contains("mov.u32 %stg,0;\n    mov.u32 %phf,0;"),
+                "{}: `%stg`/`%phf` are reset INSIDE the tile loop -- the mbarrier phase parity is \
+                 the parity of that barrier's completion count and stages complete an unequal \
+                 number of times whenever ktiles % stages != 0",
+                c.name
+            );
+        }
+    }
+
+    /// **The persistent map is a bijection onto the padded tile domain, from every slot count.**
+    ///
+    /// The non-persistent raster gets this from the grid decomposition (G5); the persistent one
+    /// computes it from a flat `cid` with two runtime divmods, and the arm the shipped shapes never
+    /// exercise is the SHORT LAST GROUP. So the law ranges over every `m_clusters % GC` residue, both
+    /// cluster settings, and -- because the loop is `cid += slots` -- every slot count from 1 to the
+    /// device's, so a "covers everything at 66 slots" that fails at 65 cannot hide.
+    #[test]
+    fn the_persistent_loop_covers_every_tile_once_from_every_cluster_slot() {
+        for cluster_m in [1u32, 2] {
+            for group_m in [1u32, 2, 16, 32] {
+                if !group_m.is_multiple_of(cluster_m) {
+                    continue;
+                }
+                for m_tiles in 1u32..=20 {
+                    for n_tiles in [1u32, 3, 7] {
+                        let g = RasterGrid::new(group_m, cluster_m, m_tiles, n_tiles);
+                        let nct = g.cluster_tiles();
+                        for slots in 1..=nct.min(9) {
+                            let mut seen = vec![0u32; (g.padded_m_tiles() * n_tiles) as usize];
+                            for slot in 0..slots {
+                                let mut cid = slot;
+                                while cid < nct {
+                                    for rank in 0..cluster_m {
+                                        let (mt, nt) = g.tile_of_cid(cid, rank);
+                                        assert!(
+                                            mt < g.padded_m_tiles() && nt < n_tiles,
+                                            "escaped: G{group_m}/c{cluster_m} m{m_tiles} \
+                                             n{n_tiles} cid {cid} rank {rank} -> ({mt},{nt})"
+                                        );
+                                        seen[(mt * n_tiles + nt) as usize] += 1;
+                                    }
+                                    cid += slots;
+                                }
+                            }
+                            assert!(
+                                seen.iter().all(|&v| v == 1),
+                                "the persistent loop is not a bijection at \
+                                 G{group_m}/c{cluster_m} m{m_tiles} n{n_tiles} slots {slots}: \
+                                 {seen:?}"
+                            );
+                        }
+                        // Both ranks of a cluster agree on the N tile at every cid -- the ONE thing
+                        // a B multicast forbids breaking -- and differ in M.
+                        if cluster_m == 2 {
+                            for cid in 0..nct {
+                                let (m0, n0) = g.tile_of_cid(cid, 0);
+                                let (m1, n1) = g.tile_of_cid(cid, 1);
+                                assert_eq!(n0, n1, "cluster peers disagree on the N tile");
+                                assert_ne!(m0, m1, "cluster peers share the M tile");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The persistent and drain axes decline the ways they can be wrong, and each decline NAMES the
+    /// mechanism rather than the field: a `ClusterA` persistent row (the cluster owns grid X, which
+    /// the loop needs), and a ring shorter than `wait_depth + 2` (law L4.4 -- a consumer holding
+    /// more buffers than the ring has is a deadlock, and a deadlock must be a printed decline on a
+    /// CPU rather than a time-box on rented silicon).
+    #[test]
+    fn the_persistent_and_drain_refusals() {
+        let on_a = WgmmaCfg {
+            name: "x",
+            key: "x",
+            tiles: TileSchedule::Persistent,
+            ..WGMMA_W1_MC
+        };
+        let e = on_a.validate().unwrap_err();
+        assert!(
+            e.contains("indexed by grid X") && e.contains("HANGS"),
+            "{e}"
+        );
+
+        for (depth, stages) in [(1usize, 2usize), (2, 3), (3, 4)] {
+            let short = WgmmaCfg {
+                name: "x",
+                key: "x",
+                wait_depth: depth,
+                stages,
+                ..WGMMA_W1_MCB
+            };
+            let e = short.validate().unwrap_err();
+            assert!(
+                e.contains(&format!("wait_depth {depth}"))
+                    && e.contains(&format!("{} stages", depth + 2)),
+                "the decline must name BOTH numbers: {e}"
+            );
+        }
+        // And the pairing is one function, not two constants that could drift.
+        for c in wgmma_all_emittable() {
+            assert_eq!(c.release_lag(), c.wait_depth, "{}", c.name);
+            assert!(c.stages >= c.wait_depth + 2, "{}", c.name);
+        }
+    }
+
+    /// **L4.5, the tail-release law.** The number of stage releases in `CDRAIN` equals
+    /// `cfg.wait_depth`. Its failure mode is a hang that only appears once the persistent loop
+    /// lands -- with `D > 0` the mainloop never releases the final `D` stages, and under persistence
+    /// the producer, already running ahead into tile `t+1`, waits on an `empty[s]` arrival the
+    /// previous tile's consumer never made -- which is exactly the kind of latent defect a textual
+    /// law is for.
+    #[test]
+    fn the_mainloop_drain_tail_releases_exactly_the_wait_depth() {
+        for c in wgmma_all_emittable() {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            let drain = format!("CDRAIN_{}:", c.name);
+            if c.wait_depth == 0 {
+                assert!(
+                    !ptx.contains(&drain),
+                    "{}: at depth 0 the mainloop has already retired every group, so a tail would \
+                     be a redundant instruction that also moved the measured rows' text",
+                    c.name
+                );
+                continue;
+            }
+            let at = ptx.find(&drain).expect("a depth > 0 arm must have a tail");
+            let tail = &ptx[at..ptx.find(&format!("CEND_{}:", c.name)).unwrap()];
+            let arrive = if c.cluster_ctas() > 1 {
+                "mbarrier.arrive.shared::cluster.b64 _,[%rbar];"
+            } else {
+                "mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];"
+            };
+            assert_eq!(
+                tail.matches(arrive).count(),
+                c.wait_depth * c.cluster_ctas().max(1),
+                "{}: CDRAIN must release exactly wait_depth stages, in every CTA of the cluster",
+                c.name
+            );
+            assert!(
+                tail.starts_with(&format!("{drain}\n    wgmma.wait_group.sync.aligned 0;")),
+                "{}: the tail drains to 0 BEFORE it releases anything",
+                c.name
+            );
+        }
+    }
+
+    /// **Laws L4.2 and L4.3: the depth and the released stage come from ONE function, and the
+    /// release is textually AFTER the wait that licenses it.**
+    ///
+    /// # Why these two are one test
+    ///
+    /// They are the two halves of the same hazard, and it is the silent one of this wave. The
+    /// release PUBLISHES a buffer to the producer, so it may not precede the last read of it. A lag
+    /// SMALLER than the depth (or a release that drifted above the `wait_group`) lets the producer
+    /// refill a stage whose `wgmma` has not retired: wrong operands, at full speed, with no error
+    /// anywhere and nothing in a tolerance gate that could see it. A lag LARGER than the depth is
+    /// merely slow.
+    ///
+    /// The law is stated by GENERATING the release the config implies and demanding the emitted
+    /// text contain exactly that one -- not by pattern-matching a spelling, which is how the second
+    /// copy of a hand-written eight-instruction `cvta`/`mapa`/`arrive` sequence gets to disagree
+    /// with the first. It also demands the un-lagged spelling is ABSENT at depth > 0, because that
+    /// is precisely the corruption: the same instructions, on `%stg` instead of `%rel`.
+    #[test]
+    fn the_mainloop_release_is_paired_with_its_wait_and_ordered_after_it() {
+        for c in wgmma_all_emittable() {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            let lag = c.release_lag();
+            assert_eq!(
+                lag, c.wait_depth,
+                "{}: L4.2 -- one function, both sites",
+                c.name
+            );
+            // The k-stage body: from the loop label to whichever label the loop exits to.
+            let body_at = ptx
+                .find(&format!("CLOOP_{}:", c.name))
+                .expect("every entry has a k-loop");
+            let end_at = ptx
+                .find(&format!(
+                    "{}_{}:",
+                    if lag > 0 { "CDRAIN" } else { "CEND" },
+                    c.name
+                ))
+                .expect("the k-loop exits somewhere");
+            let body = &ptx[body_at..end_at];
+            // --- L4.2, the pairing ---------------------------------------------------------------
+            let want = if lag > 0 {
+                stage_release_ptx(c, "%rel", Some("%p3"))
+            } else {
+                stage_release_ptx(c, "%stg", None)
+            };
+            assert_eq!(
+                body.matches(&want).count(),
+                1,
+                "{}: the mainloop must release exactly the stage WgmmaCfg::release_lag names",
+                c.name
+            );
+            assert_eq!(
+                body.matches(&format!("wgmma.wait_group.sync.aligned {lag};"))
+                    .count(),
+                1,
+                "{}: ...and wait to exactly that depth, once",
+                c.name
+            );
+            if lag > 0 {
+                assert!(
+                    !body.contains(&stage_release_ptx(c, "%stg", None)),
+                    "{}: at depth {lag} the mainloop must NOT also release the stage it is issuing \
+                     against -- that is a producer refilling a buffer whose wgmma has not retired",
+                    c.name
+                );
+                assert!(
+                    body.contains(&format!("setp.ge.u32 %p3,%kt,{lag};")),
+                    "{}: the first {lag} iterations have no older group to retire",
+                    c.name
+                );
+                // `%rel` starts `stages - lag` behind `%stg`, so its first advance lands on the
+                // stage this tile's `%kt = 0` issued against. A one-tile kernel can spell that as
+                // a literal; a persistent one must derive it from the `%stg` it CARRIES across the
+                // tile boundary, or the tail of tile `t` and the head of tile `t+1` disagree about
+                // which buffer is free.
+                let back = c.stages - lag;
+                assert!(
+                    ptx.contains(&format!("mov.u32 %rel,{back};"))
+                        || ptx.contains(&format!("add.u32 %rel,%stg,{back};")),
+                    "{}: %rel must be initialised {back} stages behind %stg",
+                    c.name
+                );
+            }
+            // --- L4.3, the ordering --------------------------------------------------------------
+            let wait_at = body
+                .find(&format!("wgmma.wait_group.sync.aligned {lag};"))
+                .expect("asserted above");
+            let rel_at = body.find(&want).expect("asserted above");
+            assert!(
+                wait_at < rel_at,
+                "{}: the stage release must be textually AFTER the wait_group that retires the \
+                 group reading it",
+                c.name
+            );
+            // ...and nothing may arrive between the first `wgmma` of a group and the
+            // `commit_group` that closes it: the group is not yet a group until then, so a
+            // release there is licensed by a wait for a DIFFERENT group.
+            let mma_at = body
+                .find("wgmma.mma_async.sync.aligned.")
+                .expect("a k-stage body issues wgmma");
+            let commit_at = body
+                .find("wgmma.commit_group.sync.aligned;")
+                .expect("...and closes the group");
+            assert!(mma_at < commit_at, "{}", c.name);
+            assert!(
+                !body[mma_at..commit_at].contains("mbarrier.arrive"),
+                "{}: an mbarrier.arrive inside the open group",
+                c.name
+            );
+        }
+    }
+
+    /// **Laws L4.6 and L4.7: the epilogue drains before it stores, and exactly one fence precedes
+    /// the first `wgmma`.**
+    ///
+    /// L4.6 is stated over the store CLASS -- anything whose opcode starts `st.`, plus a
+    /// bulk-tensor store -- rather than over `st.global.f32`, because wave 4's TMA-store epilogue
+    /// would otherwise delete the law along with the instruction it named. What it protects is the
+    /// only thing that makes reading the accumulators legal at all: the ISA forbids the warp
+    /// reading a `wgmma` D register between the issue and its matching `wait_group`.
+    ///
+    /// L4.7 is positional, and its two halves are different claims. A fence deleted entirely is a
+    /// register / async-proxy race that no exactness gate on a quiescent kernel would catch, so at
+    /// least one must precede the first `wgmma.mma_async`. And when [`WgmmaCfg::fence_hoisted`] is
+    /// set it must be OUTSIDE the k-loop body -- a hoist that left the fence inside the loop would
+    /// measure as "the free lever does nothing", which is a plausible result and a wrong one.
+    ///
+    /// **`fence_hoisted` means "out of the k-loop", never "out of the tile loop"**, and the
+    /// difference is a hazard rather than a nicety -- see
+    /// `the_hoisted_fence_still_separates_a_tiles_epilogue_from_the_next_tile`, which is the law
+    /// that pins the position under a [`TileSchedule`] that has a tile loop at all.
+    #[test]
+    fn the_epilogue_drains_before_its_first_store_and_one_fence_precedes_the_first_wgmma() {
+        for c in wgmma_all_emittable() {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            // --- L4.6 ------------------------------------------------------------------------------
+            let stores = store_class_instructions(&ptx);
+            if c.epilogue.is_diagnostic_only() {
+                // The elided arm keeps ONE unreachable store to hold the accumulators live; it is
+                // still a store-class instruction and still sits after the drain.
+                assert_eq!(stores.len(), 1, "{}", c.name);
+            } else {
+                assert!(
+                    !stores.is_empty(),
+                    "{}: an epilogue that stores nothing",
+                    c.name
+                );
+            }
+            let first_store = ptx
+                .find(&stores[0].text)
+                .expect("the scan found it in this text");
+            let last_drain = ptx
+                .rfind("wgmma.wait_group.sync.aligned 0;")
+                .expect("the epilogue drains to 0");
+            assert!(
+                last_drain < first_store,
+                "{}: the last wgmma.wait_group 0 must precede the first store-class instruction -- \
+                 reading a D register before its group retires is what the ISA forbids",
+                c.name
+            );
+            // --- L4.7 ------------------------------------------------------------------------------
+            let fence = "wgmma.fence.sync.aligned;";
+            assert_eq!(ptx.matches(fence).count(), 1, "{}", c.name);
+            let fence_at = ptx.find(fence).expect("asserted above");
+            let first_mma = ptx
+                .find("wgmma.mma_async.sync.aligned.")
+                .expect("this family issues wgmma");
+            assert!(
+                fence_at < first_mma,
+                "{}: the fence orders the accumulator registers against the async proxy and must \
+                 precede the first issue",
+                c.name
+            );
+            let cloop_at = ptx
+                .find(&format!("CLOOP_{}:", c.name))
+                .expect("every entry has a k-loop");
+            assert_eq!(
+                fence_at < cloop_at,
+                c.fence_hoisted,
+                "{}: fence_hoisted = {} but the fence is {} the k-loop body",
+                c.name,
+                c.fence_hoisted,
+                if fence_at < cloop_at {
+                    "above"
+                } else {
+                    "inside"
+                }
+            );
+        }
+    }
+
+    /// **The hoisted fence still separates a tile's epilogue from the next tile's first `wgmma`.**
+    ///
+    /// # The hazard, in the ISA's own terms
+    ///
+    /// `wgmma.fence.sync.aligned` orders a warpgroup's own accesses to its registers against the
+    /// async proxy that a `wgmma.mma_async` writes them through. The ISA exempts *accumulator*
+    /// accesses made by successive `wgmma.mma_async` of the same shape -- which is why the k-loop
+    /// needs no per-stage fence and why hoisting it (lever 4b) is free. It does NOT exempt a
+    /// non-`wgmma` access in between, and the epilogue's `st.global [..],%accN` is exactly that: a
+    /// warp read of every accumulator, immediately before tile `t+1`'s first `wgmma` writes them.
+    ///
+    /// So `fence_hoisted` under a tile loop must land INSIDE the tile loop. Hoisted above `CTILE_`
+    /// it would emit zero fences across the tile boundary -- a race no exactness gate on a
+    /// quiescent, one-tile guard kernel could see, and one that only appears once a config carries
+    /// both fields. WAVE3_DOSSIER 4.5 asks for exactly that config ("sequence 4c AFTER persistence
+    /// so the hazard is exercised rather than latent") and every depth arm carries
+    /// `fence_hoisted: true`, so the combination is on the campaign's path.
+    ///
+    /// # Why the subject is built here instead of read from the table
+    ///
+    /// No SHIPPED row combines the two today (the `_fh`/`_d1` rows are `OneTilePerCta` and the
+    /// persistent rows are depth 0), so a law that only walked `wgmma_all_emittable` would pass by
+    /// having nothing to check -- the vacuous-test failure mode this repo has been bitten by before.
+    /// The combination is therefore CONSTRUCTED, at both `TileSchedule` arms that have a tile loop
+    /// and at a depth, and its name comes from `derived_name` so the config is one `validate` would
+    /// accept rather than a hand-spelled string.
+    #[test]
+    fn the_hoisted_fence_still_separates_a_tiles_epilogue_from_the_next_tile() {
+        let fence = "wgmma.fence.sync.aligned;";
+        for (tiles, wait_depth) in [
+            (TileSchedule::Persistent, 0usize),
+            (TileSchedule::Persistent, 1),
+            (TileSchedule::PersistentDrained, 0),
+        ] {
+            let mut c = WgmmaCfg {
+                tiles,
+                wait_depth,
+                fence_hoisted: true,
+                ..WGMMA_W1_MCB_V2
+            };
+            let name: &'static str = Box::leak(c.derived_name().into_boxed_str());
+            c.name = name;
+            c.key = name;
+            c.validate()
+                .unwrap_or_else(|e| panic!("{name}: the combination must be emittable: {e}"));
+            let ptx = wgmma_module(&c, &license()).unwrap();
+            assert_eq!(ptx.matches(fence).count(), 1, "{name}");
+            let fence_at = ptx.find(fence).expect("asserted above");
+            let ctile_at = ptx
+                .find(&format!("CTILE_{name}:"))
+                .expect("a persistent arm has a tile loop");
+            let cloop_at = ptx
+                .find(&format!("CLOOP_{name}:"))
+                .expect("every entry has a k-loop");
+            assert!(
+                ctile_at < fence_at && fence_at < cloop_at,
+                "{name}: the hoisted fence must sit INSIDE the tile loop and OUTSIDE the k-loop. \
+                 Above CTILE_ there is no fence at all between tile t's st.global of %accN and \
+                 tile t+1's first wgmma write of the same registers, which the wgmma ordering \
+                 protocol requires one for."
+            );
+            // ...and the epilogue that reads the accumulators is downstream of the k-loop, so the
+            // ONE fence really does sit between the read and the next tile's write.
+            let cend_at = ptx
+                .find(&format!("CEND_{name}:"))
+                .expect("every entry has an epilogue");
+            assert!(cloop_at < cend_at && cend_at < ptx.len(), "{name}");
+            let cnext_at = ptx
+                .find(&format!("CNEXT_{name}:"))
+                .expect("a persistent arm advances its tile");
+            assert!(
+                cend_at < cnext_at,
+                "{name}: the tile advance must follow the epilogue, or the fence inside the tile \
+                 loop is not on the path between them"
+            );
+        }
+    }
+
+    /// **The drained arm's rendezvous closes the WHOLE overlap window, not half of it.**
+    ///
+    /// # Why this is a law and not a comment
+    ///
+    /// [`TileSchedule::PersistentDrained`] is a measurement instrument, and the thing it measures is
+    /// a *difference*: whatever it wins over the one-tile-per-CTA control is CTA dispatch, because
+    /// it has given up the continuous ring. That reading is only available if it has given the ring
+    /// up **completely**. WAVE3_DOSSIER 2.3 prices the window the continuous ring exploits as the
+    /// last `stages` releases of tile `t` plus the epilogue -- `4 x 0.646 + X_epi 5.99 = 8.57 us`
+    /// against `X_fill = 7.85 us` -- so a rendezvous placed above the store block closes only the
+    /// 2.58 us mainloop-tail half and leaves 5.99 us open, hiding **76% of the fill**. The arm would
+    /// then beat the control for the ring's reason while being reported as dispatch, and the
+    /// dossier's falsifier ("`g8_pstop` beats the control -> dispatch matters and `X_fill` is not
+    /// the mechanism") would be unreadable. Position is not a detail here; it IS the arm.
+    ///
+    /// So: the consumer's arrival is textually after the LAST store-class instruction, the
+    /// producer's matching wait is at `PNEXT` before `%cid` advances, and no shipped non-drained row
+    /// grows a tile rendezvous by accident.
+    #[test]
+    fn the_drained_arms_rendezvous_closes_the_whole_overlap_window() {
+        let mut drained_rows = 0usize;
+        for c in wgmma_all_emittable() {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            let arrive_at = ptx.find(&format!(
+                "add.s64 %rdBar,%rdS,{};\n    and.b32 %tmp,%lin,127;",
+                c.tile_bar_off()
+            ));
+            if !c.tiles.needs_tile_barrier() {
+                assert!(
+                    arrive_at.is_none() && !ptx.contains(&format!("PTWAIT_{}:", c.name)),
+                    "{}: only the drained arm has a tile rendezvous, and the extra mbarrier it \
+                     needs is in smem_bytes() only for that arm",
+                    c.name
+                );
+                continue;
+            }
+            drained_rows += 1;
+            let arrive_at = arrive_at.expect("the drained arm arrives at its tile rendezvous");
+            // The consumer's arrival is BELOW every store the epilogue issues.
+            let stores = store_class_instructions(&ptx);
+            let last_store = stores
+                .iter()
+                .filter_map(|s| ptx.rfind(&s.text))
+                .max()
+                .expect("the epilogue stores something");
+            assert!(
+                last_store < arrive_at,
+                "{}: the tile rendezvous must follow the epilogue's LAST store, or tile t+1's ring \
+                 fill overlaps X_epi and 76% of the fill this arm exists to expose stays hidden",
+                c.name
+            );
+            // ...and above the tile advance, so it is inside the tile loop rather than at EXIT.
+            let cnext = ptx
+                .find(&format!("CNEXT_{}:", c.name))
+                .expect("a persistent arm advances its tile");
+            assert!(arrive_at < cnext, "{}", c.name);
+            // The producer's half: it waits on the same barrier, and it waits BEFORE `%cid` moves.
+            let pwait = ptx
+                .find(&format!("PTWAIT_{}:", c.name))
+                .expect("the producer waits at the rendezvous");
+            let padvance = ptx[pwait..]
+                .find("add.u32 %cid,%cid,%slots;")
+                .expect("the producer advances its tile");
+            let tile_wait = "mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%pht;";
+            assert!(
+                ptx[pwait..pwait + padvance].contains(tile_wait),
+                "{}: the producer must wait on the tile rendezvous before advancing %cid -- that \
+                 wait is the half of the mechanism that stops the fill",
+                c.name
+            );
+        }
+        assert!(
+            drained_rows > 0,
+            "the drained diagnostic must be emittable, or this law is vacuous and the arm the \
+             round reads its persistence verdict against does not exist"
+        );
+    }
+
+    /// **The device-free half of E4.1 and E4.2: the ladder reaches the ring boundaries, and every
+    /// depth arm has a full-drain twin that differs from it in NOTHING but the drain.**
+    ///
+    /// # Why this is a CPU law about two device gates
+    ///
+    /// Both exactness gates are launches, and a launch that is quietly gating nothing looks exactly
+    /// like a launch that is gating something. Two ways that happens here, and both are checked on
+    /// this side of the wire:
+    ///
+    /// * **A vacuous ladder.** [`drain_k_ladder`] is a function of the ring, so a future
+    ///   `wait_depth` that happened to equal `stages - 1` would collapse two rungs into one and the
+    ///   `ktiles <= wait_depth` boundary -- the whole reason E4.1 exists -- would stop being
+    ///   sampled. So the ladder is asserted to bracket the depth from BOTH sides and to bracket the
+    ///   wrap from both sides, per row.
+    /// * **A twin that is not a twin.** [`wgmma_full_drain_twin`] resolves by the key
+    ///   [`WgmmaCfg::derived_name`] produces, so a row whose geometry drifted would silently
+    ///   resolve to a different kernel and E4.2 would report "bit-identical" about a comparison it
+    ///   never made. The check is not a field-by-field list -- which a new field would escape --
+    ///   but the strongest statement available: **put the depth arm's drain fields back onto the
+    ///   twin and the emitted text must be the depth arm's, byte for byte.** Anything else that
+    ///   differed between them would survive that substitution and show up as a text mismatch.
+    #[test]
+    fn every_wait_depth_arm_has_a_ring_boundary_ladder_and_a_full_drain_twin() {
+        let mut depth_arms = 0usize;
+        for c in wgmma_all_emittable() {
+            let ladder = drain_k_ladder(c);
+            assert!(
+                ladder.windows(2).all(|w| w[0] < w[1]),
+                "{}: the ladder must be sorted and deduplicated -- a repeated rung is a launch that \
+                 pays for nothing",
+                c.name
+            );
+            assert!(
+                ladder.iter().all(|&t| t >= 1),
+                "{}: ktiles 0 issues no wgmma at all and the launcher rejects it",
+                c.name
+            );
+            for want in [1, 2, c.stages - 1, c.stages, c.stages + 1, 2 * c.stages + 1] {
+                assert!(
+                    ladder.contains(&want),
+                    "{}: the ladder must reach ktiles {want} (ring {} stages): {ladder:?}",
+                    c.name,
+                    c.stages
+                );
+            }
+            // Both sides of the ring wrap, and -- when there is a depth -- both sides of it.
+            assert!(ladder.iter().any(|&t| t < c.stages) && ladder.iter().any(|&t| t > c.stages));
+            if c.wait_depth == 0 {
+                assert!(
+                    wgmma_full_drain_twin(c).is_none(),
+                    "{}: a full-drain row IS its own twin, and handing E4.2 a self-comparison would \
+                     make it pass by construction",
+                    c.name
+                );
+                continue;
+            }
+            depth_arms += 1;
+            assert!(
+                ladder.iter().any(|&t| t <= c.wait_depth),
+                "{}: the ladder must reach ktiles <= wait_depth {}, where the mainloop releases NO \
+                 stage and CDRAIN is the only thing that frees the ring: {ladder:?}",
+                c.name,
+                c.wait_depth
+            );
+            assert!(
+                ladder.iter().any(|&t| t > c.wait_depth),
+                "{}: ...and past it, or the two sides of the boundary are never compared",
+                c.name
+            );
+            let twin = wgmma_full_drain_twin(c).unwrap_or_else(|| {
+                panic!(
+                    "{}: wait_depth {} has no emittable full-drain twin, so E4.2 -- the only gate \
+                     that can see a stage the producer refilled early -- has nothing to compare \
+                     against. Ship the depth-0 row before the depth row, never after.",
+                    c.name, c.wait_depth
+                )
+            });
+            assert_eq!(
+                twin.wait_depth, 0,
+                "{}: the twin must be the full drain",
+                c.name
+            );
+            assert_ne!(
+                twin.key, c.key,
+                "{}: the twin must be its OWN module -- `Gpu::function` caches on the key alone and \
+                 never re-examines the PTX on a hit",
+                c.name
+            );
+            // THE substitution: the twin with this row's drain fields put back must BE this row.
+            let mut probe = *twin;
+            probe.wait_depth = c.wait_depth;
+            probe.fence_hoisted = c.fence_hoisted;
+            probe.name = c.name;
+            probe.key = c.key;
+            let got = wgmma_module(&probe, &license()).unwrap_or_else(|e| {
+                panic!(
+                    "{}: the twin {} differs from it in more than the drain -- putting the drain \
+                     back does not even produce an emittable configuration: {e}",
+                    c.name, twin.name
+                )
+            });
+            assert_eq!(
+                got,
+                wgmma_module(c, &license()).unwrap(),
+                "{}: {} is not its full-drain twin -- the two kernels differ somewhere OTHER than \
+                 wait_depth/fence_hoisted, so a bit-identity verdict between them would be about \
+                 two changes and could not accuse either",
+                c.name,
+                twin.name
+            );
+        }
+        assert!(
+            depth_arms >= 1,
+            "no emittable row carries wait_depth > 0, so E4.1's boundary rungs and E4.2's \
+             bit-identity gate are both vacuous and wave 3 lever 4 is not in the corpus at all"
+        );
+    }
+
+    /// **THE RASTER'S GUARD-SHAPE LAW: the device gate must actually EXECUTE the ragged group.**
+    ///
+    /// The bijection twin (G5) proves the map over every residue in Rust, but the thing that runs on
+    /// silicon is the six-instruction prologue and its `@%p0 ret;`. The one arm of that prologue that
+    /// is a *hang* if it is wrong -- the cluster-uniform early exit -- is only reached when the last
+    /// group is short, and **all seven benched shapes have `m_clusters` a multiple of 8**, so the
+    /// performance round can never reach it. This law therefore states the property over
+    /// [`guard_shape`], which is what `wgmma_pretiming_guard` and `wgmma_hopper_bringup` launch:
+    ///
+    /// * at least one CTA takes the exit (so the branch is executed, not merely emitted), and
+    /// * at least one CTA owns a tile (so the exit did not swallow the whole launch and return a
+    ///   `C` full of whatever the host pre-filled -- which against a zeroed buffer is a plausible
+    ///   matrix of zeros and against a reused one is the previous arm's answer), and
+    /// * the exit is taken by WHOLE clusters, never by one rank of a live pair, which is the
+    ///   difference between a skipped CTA and a peer waiting forever on a multicast.
+    ///
+    /// # The PERSISTENT raster rows have no such exit, and this law must say so rather than measure
+    ///
+    /// [`RasterGrid::tile_of`] is the one-tile-per-CTA map, and a persistent module does not use it:
+    /// it emits [`wgmma_tile_bounds_ptx`] and walks `cid` by `%nctaid.x`, so the ragged-group pad
+    /// never exists (`RasterGrid::tile_of_cid`'s own doc: "persistence therefore removes the
+    /// ragged-group pad entirely ... no CTA needs the cluster-uniform early exit"). Ranging the
+    /// counting loop over those rows anyway evaluated the WRONG map against the FLAT persistent grid
+    /// and reported "128 of 132 guard CTAs exit" about a branch that is not in the emitted text. It
+    /// passed, for a reason unrelated to what those modules contain -- a green law about nothing.
+    ///
+    /// So the persistent rows get the assertion that is actually true of them -- **no `@%p0 ret;`
+    /// in the emitted PTX at all** -- and their tile coverage stays where it is proved,
+    /// `the_persistent_loop_covers_every_tile_once_from_every_cluster_slot`.
+    #[test]
+    fn the_guard_shape_executes_the_rasters_ragged_group_exit() {
+        let rows: Vec<&WgmmaCfg> = wgmma_all_emittable()
+            .into_iter()
+            .filter(|c| c.raster > 1)
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "wave 3 ships a raster; a table with none means the rows were dropped, not that the \
+             law is vacuous"
+        );
+        let mut counted = 0usize;
+        for c in rows {
+            if c.tiles.is_persistent() {
+                let ptx = wgmma_module(c, &license()).unwrap();
+                assert!(
+                    !ptx.contains("@%p0 ret;"),
+                    "{}: a persistent module emits no ragged-group early exit -- if one appeared, \
+                     this law's counting arm would be the thing that has to run on it",
+                    c.name
+                );
+                continue;
+            }
+            counted += 1;
+            let g = guard_shape(c);
+            let r = c.raster_grid(g.m, g.n);
+            let (gx, gy, gz) = c.launch_plan().grid(g.m, g.n);
+            let cm = c.cluster_ctas().max(1) as u32;
+            let (mut owners, mut exits) = (0u32, 0u32);
+            for z in 0..gz {
+                for y in 0..gy {
+                    for x in 0..gx {
+                        match r.tile_of(x, y, z) {
+                            Some(_) => owners += 1,
+                            None => exits += 1,
+                        }
+                    }
+                }
+            }
+            assert!(
+                exits > 0,
+                "{}: the guard shape has {} m-clusters over groups of {} -- no cluster-row is \
+                 surplus, so the early exit is never executed and its hang would ship undetected",
+                c.name,
+                r.m_clusters(),
+                r.gc
+            );
+            assert!(
+                owners > 0,
+                "{}: the guard launch owns no tile at all",
+                c.name
+            );
+            assert!(
+                exits.is_multiple_of(cm) && owners.is_multiple_of(cm),
+                "{}: {owners} owners / {exits} exits do not split into whole {cm}-CTA clusters, so \
+                 some cluster takes the exit on ONE rank and hangs on the other",
+                c.name
+            );
+            // ...and the exit is a majority of the launch at the guard, which is what makes it a
+            // real test of the branch rather than a corner the scheduler might reorder away.
+            assert!(
+                exits >= owners,
+                "{}: only {exits} of {} guard CTAs exit; the ragged group is barely exercised",
+                c.name,
+                owners + exits
+            );
+        }
+        assert!(
+            counted > 0,
+            "every rastered row is persistent, so the counting arm ran on nothing and the exit \
+             this law is about is untested"
+        );
     }
 
     /// The unproven-claims list is the honest half of this module and must not quietly empty out or
@@ -6700,6 +10197,72 @@ mod tests {
             assert!(r.label.is_ascii() && !r.label.contains(char::is_whitespace));
             assert!(r.why.is_ascii() && r.why.len() > 40, "{}", r.label);
         }
+        // **Since wave 3 the sweep is a UNION, not a cross product**: each row names the shapes it
+        // is measured at, because a raster or persistence cell at a single-wave shape can only
+        // report noise and a reader will over-read it. Three properties keep that honest -- every
+        // named shape is a real grid row (a typo would be a rented minute spent on a panic), no row
+        // is measured nowhere, and `WGMMA_SWEEP_SHAPES` is EXACTLY the union, so a shape in the
+        // header that no row runs is a column of "-- not measured" and a shape a row runs that the
+        // header omits would never be resolved to a `GemmPoint` at all.
+        let mut union: Vec<&str> = Vec::new();
+        for r in WGMMA_SWEEP_GRID {
+            assert!(
+                !r.shapes.is_empty(),
+                "{}: a row measured at no shape is a row that is not measured",
+                r.label
+            );
+            let mut seen: Vec<&str> = r.shapes.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), r.shapes.len(), "{}: duplicate shape", r.label);
+            for s in r.shapes {
+                assert!(
+                    WGMMA_BENCH_GRID.iter().any(|g| g.label == *s),
+                    "{}: {s:?} is not a bench grid row",
+                    r.label
+                );
+                assert!(r.runs_at(s), "{}: runs_at disagrees with shapes", r.label);
+                if !union.contains(s) {
+                    union.push(s);
+                }
+            }
+        }
+        union.sort_unstable();
+        let mut header: Vec<&str> = WGMMA_SWEEP_SHAPES.to_vec();
+        header.sort_unstable();
+        assert_eq!(
+            union, header,
+            "WGMMA_SWEEP_SHAPES must be exactly the union of the rows' own shape lists"
+        );
+        // WAVE3_DOSSIER 3.8's REFUSAL, as a law rather than as a constant nobody reads.
+        // `WGMMA_CLUSTER_PREDICATE_SHAPES` names the on/off pair the cluster threshold rests on,
+        // and until now nothing consumed it: `w1_mcb_v2` (the ON arm) and `w1_v2` (the OFF arm)
+        // each spell those two labels inside a longer inline list, so the constant was a second
+        // spelling that could drift from both without a word. This is the reader. It is also the
+        // one gate on the refusal itself -- "publishing any dispatch rule from a table that lacks
+        // gpt_d1024_down and gpt_d1024_up with BOTH cluster settings" -- which matters more now
+        // that `the_shipped_f_l2_is_a_predicted_denominator_quantity` pins the threshold's margin
+        // at 1.4% above the only shape where the cluster was measured to lose.
+        for row in ["w1_mcb_v2", "w1_v2"] {
+            let r = WGMMA_SWEEP_GRID
+                .iter()
+                .find(|r| r.label == row)
+                .unwrap_or_else(|| {
+                    panic!("the cluster predicate's {row:?} arm is not in the grid")
+                });
+            for s in WGMMA_CLUSTER_PREDICATE_SHAPES {
+                assert!(
+                    r.runs_at(s),
+                    "{row} is one arm of the cluster predicate's A/B and must run at {s:?}: a \
+                     threshold fitted to one crossing is a curve fitted to two points \
+                     (WAVE3_DOSSIER 3.8, stated there as a refusal)"
+                );
+            }
+        }
+        assert!(
+            WGMMA_CLUSTER_PREDICATE_SHAPES.len() >= 2,
+            "the refusal is about a PAIR; one shape is the single crossing it exists to reject"
+        );
         // The headline three-arm comparison exists, its arms are ONE fact apart, and all three are
         // in the table: baseline (no cluster), primary (B multicast, the wider operand), control
         // (A multicast, the axis round 2 measured).
@@ -7246,9 +10809,9 @@ mod tests {
             let (tm, tn) = g.tiles(c);
             assert_eq!(
                 (tm, tn),
-                (GUARD_TILES_PER_AXIS, GUARD_TILES_PER_AXIS),
-                "{}: the grid must be {GUARD_TILES_PER_AXIS}x{GUARD_TILES_PER_AXIS} CTAs, so a \
-                 CTA-to-tile map that is right for one CTA is not enough",
+                (GUARD_TILES_PER_AXIS, guard_n_tiles(c)),
+                "{}: the grid must be at least {GUARD_TILES_PER_AXIS}x{GUARD_TILES_PER_AXIS} CTAs, \
+                 so a CTA-to-tile map that is right for one CTA is not enough",
                 c.name
             );
             assert_eq!(
@@ -7282,33 +10845,78 @@ mod tests {
                  guard shape (st.global.v2.f32 needs an 8-byte-aligned pair)",
                 c.name
             );
+            // Cost: the host f64 reference runs in a DEBUG build, so this is a real budget. A
+            // persistent row pays for G19's reachability -- its guard must have more cluster-tiles
+            // than the launch has slots (66 under a 1x2x1 cluster, 132 without one), and `M*N` is
+            // `tiles * BM * BN` however the tiles are arranged, so ~1e9 MACs is the floor for that
+            // property at a 128x256 tile rather than a shape that could be trimmed.
+            let budget = if c.tiles.is_persistent() {
+                1_200_000_000
+            } else {
+                80_000_000
+            };
+            assert!(
+                g.macs() <= budget,
+                "{}: the guard reference is {} MACs against a {budget} budget, which is more than a \
+                 debug-build host loop should cost per gated row",
+                c.name,
+                g.macs()
+            );
             // The cluster arms round their own axis up, which is how the pad CTA gets exercised --
             // on BOTH axes, because the tile count is odd on both.
             let p = c.launch_plan();
-            let (gx, gy, _) = p.grid(g.m, g.n);
-            let ctas = (gx as usize) * (gy as usize);
+            let (gx, gy, gz) = p.grid(g.m, g.n);
+            let ctas = (gx as usize) * (gy as usize) * (gz as usize);
+            if c.tiles.is_persistent() {
+                // **G1's fourth clause, and the one wave 3 added: `tiles > CTAs`.** Without it the
+                // tile loop runs exactly once per CTA, G19's un-reset `%kt` is unreachable, and a
+                // tile-2-accumulates-into-tile-1 corruption -- which over exact integers is a
+                // plausible number, not a NaN -- would ship green.
+                let r = c.raster_grid(g.m, g.n);
+                let padded = (r.padded_m_tiles() * r.n_tiles) as usize;
+                assert!(
+                    padded > ctas,
+                    "{}: the persistent guard launches {ctas} CTAs for {padded} tiles (padded to \
+                     whole clusters), so no CTA runs a SECOND tile and G19 is unreachable",
+                    c.name
+                );
+                assert!(
+                    r.cluster_tiles() > gx,
+                    "{}: {} cluster-tiles over {gx} slots -- every slot runs one tile",
+                    c.name,
+                    r.cluster_tiles()
+                );
+                assert_eq!(
+                    gy,
+                    c.cluster_m() as u32,
+                    "{}: the persistent grid's y axis IS the cluster rank",
+                    c.name
+                );
+                assert_eq!(gz, 1, "{}: the persistent grid is flat", c.name);
+                continue;
+            }
             assert!(
                 ctas >= tm * tn,
                 "{}: the launched grid may round up but never down",
                 c.name
             );
+            // A raster row launches its surplus cluster-rows too -- they take the cluster-uniform
+            // early exit -- so the pad-CTA count is stated over the CTAs that OWN a tile, which is
+            // the same set the linear order's grid launches. Same law, counted where it is true.
+            let r = c.raster_grid(g.m, g.n);
+            let owners = (0..gz)
+                .flat_map(|z| (0..gy).flat_map(move |y| (0..gx).map(move |x| (x, y, z))))
+                .filter(|(x, y, z)| r.tile_of(*x, *y, *z).is_some())
+                .count();
             if c.cluster_ctas() > 1 {
                 assert_eq!(
-                    ctas,
+                    owners,
                     tm * tn + GUARD_TILES_PER_AXIS,
                     "{}: an odd tile count on the clustered axis must produce exactly one pad CTA \
                      per row/column of the other axis",
                     c.name
                 );
             }
-            // Cost: the host f64 reference runs in a DEBUG build, so this is a real budget.
-            assert!(
-                g.macs() <= 80_000_000,
-                "{}: the guard reference is {} MACs, which is more than a debug-build host loop \
-                 should cost per gated row",
-                c.name,
-                g.macs()
-            );
         }
         // The concrete numbers for the shipped centerpiece, so a reader can check the table above.
         let g = guard_shape(&WGMMA_W1);
@@ -7832,6 +11440,940 @@ mod tests {
             wgmma_w1_for(usize::MAX, usize::MAX).name,
             WGMMA_W1_MCB_V2.name
         );
+    }
+
+    /// **The per-tile floor decomposes into the halves that were MEASURED, and prices the tile it is
+    /// asked about rather than the one the fits were run at.**
+    ///
+    /// `T_floor` is the denominator of the cluster decision, and it was computed from the 128x256
+    /// [`TILE_FIXED_S`] / [`K_STAGE_S`] at every tile the menu can select. At `sq1024`, where the
+    /// rule picks 128x64, that priced a 9.05 us floor at 26.01 us -- **2.9x** -- and pushed `f_L2`
+    /// from 0.795 to 0.276. The verdict happened to survive, which is worse than if it had not: a
+    /// four-digit pin then made the wrong number load-bearing.
+    ///
+    /// The law has four parts, and each catches a different way the repair could rot. (i) The
+    /// decomposition sums to Fit B's measured `X`, so the three terms cannot drift apart from the
+    /// number they decompose. (ii) The two functions are the IDENTITY at [`FLOOR_REF_TILE`], which
+    /// is what keeps all six 128x256 verdicts exactly where the dossier's 3.2 column put them.
+    /// (iii) The per-k-stage extrapolation lands inside WAVE3_DOSSIER 3.4's own `~0.337` / `~0.165`
+    /// and on the conservative side of them. (iv) Reassembling the dossier's `X(sq1024) = 8.65`
+    /// from these three terms works -- the check that this is the dossier's model and not a second
+    /// one that happens to agree on verdicts.
+    #[test]
+    fn the_per_tile_floor_decomposes_into_its_measured_halves() {
+        let (rbm, rbn, rst) = FLOOR_REF_TILE;
+        // (i) the decomposition IS Fit B's X: fill + epilogue + the prologue residual.
+        let sum = X_FILL_PER_STAGE_S * rst as f64 + X_EPI_S + X_PROLOGUE_S;
+        assert!(
+            (sum - TILE_FIXED_S).abs() < 1e-12,
+            "the three terms sum to {:.4} us, Fit B measured {:.4}",
+            sum * 1e6,
+            TILE_FIXED_S * 1e6
+        );
+        // (ii) identity at the reference tile -- this is what makes the fix verdict-neutral there.
+        assert!((tile_fixed_s(rbm, rbn, rst) - TILE_FIXED_S).abs() < 1e-12);
+        assert!((k_stage_s(rbm, rbn) - K_STAGE_S).abs() < 1e-12);
+        // (iii) the per-k-stage extrapolation, against WAVE3_DOSSIER 3.4's `~0.337` and `~0.165`.
+        //       Those two ARE this quantity, and the model must land inside their tildes -- on the
+        //       conservative (higher-floor) side, so no verdict is bought with an optimistic S.
+        for (bm, bn, s_dossier) in [(128usize, 128usize, 0.337e-6), (128, 64, 0.165e-6)] {
+            let s = k_stage_s(bm, bn);
+            assert!(
+                s >= s_dossier && (s - s_dossier) / s_dossier < 0.08,
+                "{bm}x{bn}: S is {:.4} us, the dossier's 3.4 row says ~{:.3}",
+                s * 1e6,
+                s_dossier * 1e6
+            );
+            // ...and strictly cheaper than the reference tile it is narrower than, which is the
+            // whole content of the defect: the old code charged every tile the widest tile's price.
+            let stages = DISPATCH_TILES
+                .iter()
+                .find(|t| (t.0, t.1) == (bm, bn))
+                .expect("a menu tile")
+                .2;
+            assert!(tile_fixed_s(bm, bn, stages) < TILE_FIXED_S, "{bm}x{bn}");
+        }
+        // (iv) the reconciliation that shows the decomposition is the DOSSIER'S and not a second
+        //      one. 0.4 corrects `X` at `sq1024` by scaling the FILL alone to the resident CTA
+        //      count -- `7.85 * 32/132 = 1.90`, `X = 8.65` -- because the fill is a device-bandwidth
+        //      event and the epilogue and prologue are not. Reassembling that from these three
+        //      terms lands on 8.67. (3.4's `~5.8` / `~5.3` column is the same correction applied at
+        //      the narrow tiles and is therefore NOT `tile_fixed_s`'s quantity; this model
+        //      deliberately drops the residency term, see the function's own doc.)
+        let sq1024_x = X_EPI_S + X_PROLOGUE_S + X_FILL_PER_STAGE_S * rst as f64 * 32.0 / 132.0;
+        assert!(
+            (sq1024_x - 8.65e-6).abs() < 0.05e-6,
+            "the dossier's own X(sq1024, 128x256) is 8.65 us; this decomposition gives {:.2}",
+            sq1024_x * 1e6
+        );
+    }
+
+    /// **The dispatch menu is a menu of SHIPPED geometries** -- `(bm, bn, stages)` triples this
+    /// family actually emits, not three shapes with a stage depth invented beside them.
+    ///
+    /// The depth is in the menu because [`tile_fixed_s`]'s ring-fill term is `stages * (bm+bn)` of
+    /// SMEM: a menu carrying only the tile shape would price the 6-stage square tile at 4 stages of
+    /// fill and under-charge its floor by a third. That makes the depth a number the cluster verdict
+    /// depends on, and a number the verdict depends on must not be free -- so every row is asserted
+    /// against a real emittable module's own `(bm, bn, stages)`.
+    #[test]
+    fn the_dispatch_menu_is_a_menu_of_shipped_geometries() {
+        for &(bm, bn, stages) in DISPATCH_TILES {
+            let hit = wgmma_all_emittable().into_iter().find(|c| {
+                c.bm == bm && c.bn == bn && c.stages == stages && c.dtype == WgmmaDtype::F16
+            });
+            assert!(
+                hit.is_some(),
+                "the dispatcher may select {bm}x{bn} at {stages} stages and nothing emits that \
+                 geometry, so its floor -- and through the floor its cluster verdict -- would be \
+                 priced at a depth no module has ever assembled"
+            );
+        }
+        // The menu is widest-first, which is what makes "take the first that clears the floor" mean
+        // "take the WIDEST that clears it".
+        for w in DISPATCH_TILES.windows(2) {
+            assert!(w[0].1 > w[1].1, "the menu must be widest-first: {w:?}");
+        }
+    }
+
+    /// **The cluster predicate compares what the multicast SAVES, not the L2-roof fraction** -- and
+    /// the two are one comparison only at the tile the 0.78 was fitted at.
+    ///
+    /// WAVE3_DOSSIER 3.2 fits its threshold to a sign flip measured at `sq2048` / `sq4096` / `sq8192`
+    /// -- **three 128x256 rows**, where halving the 256-wide `B` removes a third of the tile's L2
+    /// read. The tile lever then made narrower tiles reachable, where the same multicast removes a
+    /// quarter (128x128) or a sixth (128x64), and the campaign's own spine sentence is why:
+    /// `ACT2_WAVE_PLAN.md:5` chose this axis with the words "multicast the WIDER operand", and at
+    /// 128x64 `B` is the narrow one.
+    ///
+    /// So the predicate is `f_L2 * share >= 0.78 * 1/3`. This law pins the identity at the reference
+    /// tile (which is what leaves the dossier's six 128x256 verdicts untouched) and pins the
+    /// consequence at the two narrow ones: **even a perfectly L2-bound shape declines the cluster
+    /// there**, by 4% at 128x128 and 33% at 128x64. A revert to the bare `f_L2 >= 0.78` fails the
+    /// second half at `sq1024`.
+    #[test]
+    fn the_cluster_predicate_is_the_saving_and_not_the_roof_fraction() {
+        let (rbm, rbn, _) = FLOOR_REF_TILE;
+        assert!((multicast_l2_share(rbm, rbn) - 1.0 / 3.0).abs() < 1e-12);
+        assert!((multicast_l2_share(128, 128) - 0.25).abs() < 1e-12);
+        assert!((multicast_l2_share(128, 64) - 1.0 / 6.0).abs() < 1e-12);
+        // At the reference tile the two spellings are the same comparison, exactly.
+        let bar = cluster_l2_saving_threshold();
+        assert!((bar - CLUSTER_F_L2_THRESHOLD / 3.0).abs() < 1e-12);
+        for f_l2 in [0.0, 0.5, 0.7799, 0.78, 0.9, 1.0] {
+            assert_eq!(
+                f_l2 * multicast_l2_share(rbm, rbn) >= bar,
+                f_l2 >= CLUSTER_F_L2_THRESHOLD - 1e-12,
+                "f_L2 {f_l2}: the two spellings must agree at 128x256"
+            );
+        }
+        // ...and at every NARROWER tile the multicast cannot clear the bar even at `f_L2 = 1.0`,
+        // which is the ceiling of a ratio to its own denominator's max. That is the whole reason
+        // sq1024's OFF no longer depends on a mis-priced floor.
+        for (bm, bn) in [(128, 128), (128, 64)] {
+            assert!(
+                multicast_l2_share(bm, bn) < bar,
+                "{bm}x{bn}: a fully L2-bound shape saves {:.4} against a {:.4} break-even, so the \
+                 cluster must decline",
+                multicast_l2_share(bm, bn),
+                bar
+            );
+        }
+        // sq1024 is that statement as a verdict: 79% L2-bound at the tile the rule picks, cluster
+        // off. Under the bare `f_L2 >= 0.78` it would be ON, and there is no clustered 128x64 module
+        // for it to land on.
+        let p = wgmma_dispatch_plan(1024, 1024, 1024, HOPPER_SM_COUNT);
+        assert_eq!((p.bm, p.bn), (128, 64));
+        assert!(
+            p.f_l2 >= CLUSTER_F_L2_THRESHOLD && !p.cluster,
+            "the shape the generalisation exists for: {p:?}"
+        );
+    }
+
+    /// **WAVE 3 lever 3, law (a): the dispatcher's verdict is PINNED at every benched shape.**
+    ///
+    /// The dossier states this as a law on the dispatcher itself, and the reason is guard G3 in a
+    /// new place: `Gpu::function` caches on a module key alone, so a rule that silently selects a
+    /// different module than the one the round measured publishes a configuration that never ran --
+    /// and unlike a mis-keyed row, nothing in the emitted text would look wrong. The defence is a
+    /// device-free test that spells the whole verdict out, so a change to any threshold, constant or
+    /// tile menu has to come here and be argued rather than merely compile.
+    ///
+    /// Each row is the dossier's 3.6 dispatch table entry for that shape. The `f_L2` column is the
+    /// PREDICTED-denominator quantity, which is 3.2's column times 0.4's residual and not 3.2's
+    /// column itself (see [`CLUSTER_F_L2_THRESHOLD`] for the exact relationship and
+    /// `the_shipped_f_l2_is_a_predicted_denominator_quantity` for the law that pins it): 0.769 at
+    /// `sq2048` against 3.2's 0.736, and 0.955 at `gpt_d4096_up` evaluated on the post-raster
+    /// configuration exactly as the dossier requires. Two of these rows are RASTERED, so their
+    /// `f_L2` is not the one the round-3 cluster A/B was measured at -- `sq8192` pins 0.883 here and
+    /// contributes 0.8124 to the threshold's bracket, which is the same function on the linear arm.
+    /// `sq2048` is the tightest call in the table at **1.4% below** the 0.78 threshold, which is why
+    /// it is asserted to four digits.
+    ///
+    /// Six of the seven rows are 128x256, where the predicate `saving >= 0.26` IS the dossier's
+    /// `f_L2 >= 0.78` (the share is exactly 1/3), and the test asserts that identity rather than
+    /// leaving a reader to check it. `sq1024` is the seventh, and the one the tile-aware floor moved.
+    #[test]
+    fn the_dispatcher_verdict_is_pinned_at_every_benched_shape() {
+        struct Pin {
+            label: &'static str,
+            bm: usize,
+            bn: usize,
+            tiles: usize,
+            waves: usize,
+            cluster: bool,
+            group_m: usize,
+            persistent: bool,
+            f_l2: f64,
+            cfg: &'static WgmmaCfg,
+        }
+        let pin = |label, bm, bn, tiles, waves, cluster, group_m, persistent, f_l2, cfg| Pin {
+            label,
+            bm,
+            bn,
+            tiles,
+            waves,
+            cluster,
+            group_m,
+            persistent,
+            f_l2,
+            cfg,
+        };
+        let want = [
+            // sq1024: the ONLY shape the tile lever moves. 128x256 is 32 CTAs of 132 (24.2% of the
+            // device); 128x64 is 128 tiles = 97.0%, and no other lever fires -- one wave, so no
+            // raster and no persistence.
+            //
+            // Its f_L2 is 0.795, NOT the 0.276 this pin carried until the floor was made tile-aware:
+            // the old `t_floor` priced this 128x64 tile with 128x256 constants (26.01 us against a
+            // real 9.05) and the OFF verdict fell out of that 2.9x inflation. The cluster is still
+            // off, now for the mechanism -- at 128x64 `B` is the NARROW operand, so the multicast
+            // removes a sixth of the L2 read and saves 0.132 of the binding roof against a 0.26
+            // break-even. This row is the whole reason the predicate is the SAVING and not `f_L2`.
+            //
+            // It is not the dossier's 3.6 figure of 0.167 either, and should not be: that number is
+            // sq1024's f_L2 at **128x256**, the tile the dispatcher does not pick. 3.6 quotes it in
+            // a row whose own tile column reads 128x64 -- the dossier crossing its own wires -- and
+            // 3.2's standing instruction settles which one this is: evaluate on the FINAL
+            // configuration, never on a measurement of an earlier one.
+            pin(
+                "sq1024",
+                128,
+                64,
+                128,
+                1,
+                false,
+                1,
+                false,
+                0.7947,
+                &WGMMA_W3D_V2,
+            ),
+            // sq2048 gets NOTHING from wave 3, and that is a finding: one wave (raster and
+            // persistence are provably the identity), 97.0% wave efficiency at the widest tile, and
+            // f_L2 just under the cluster threshold -- where round 3 measured the cluster LOSING
+            // 8.0% on the tight s3 pair.
+            pin(
+                "sq2048",
+                128,
+                256,
+                128,
+                1,
+                false,
+                1,
+                false,
+                0.7687,
+                &WGMMA_W1_V2,
+            ),
+            // sq4096: persistence + cluster, NO raster -- its linear wave footprint is 42.2 MB of a
+            // 50.0 MiB L2, so the raster is provably worth nothing there.
+            pin(
+                "sq4096",
+                128,
+                256,
+                512,
+                4,
+                true,
+                1,
+                true,
+                0.9552,
+                &WGMMA_W1_MCB_V2_P,
+            ),
+            // sq8192: all three schedule levers, the raster as insurance (142.9 -> 68.2 MB).
+            //
+            // Its post-raster footprint is STILL 1.30x L2, so this is the one shipped row the
+            // thrashing branch of `dispatch_memory_roof_s` prices: roof 2085 us against a 1693 us
+            // floor, f_L2 0.883. Before that branch existed this pin read 1.0000 -- the ratio at
+            // its own maximum, which is the value it takes whenever T_L2 alone is the binding term
+            // and therefore the one value that carries no information about the margin.
+            //
+            // 0.883 is the RASTERED arm. The cluster A/B round 3 measured here was the LINEAR one,
+            // where the same function reads 0.8124 against 3.2's 0.810 -- that is the bracket point
+            // (see CLUSTER_F_L2_THRESHOLD), and this is the pin, and they are two arms of one shape
+            // rather than a disagreement.
+            pin(
+                "sq8192",
+                128,
+                256,
+                2048,
+                16,
+                true,
+                16,
+                true,
+                0.8826,
+                &WGMMA_W1_MCB_V2_R16_P,
+            ),
+            // gpt_d1024_up: persistence ALONE, and the cleanest test of it anywhere in the suite --
+            // 10.6 MB of footprint (no raster), f_L2 0.55 (no cluster), and n_k = 16 k-stages
+            // against X = 13.84 us, so the per-tile fixed cost is 56% of the tile.
+            pin(
+                "gpt_d1024_up",
+                128,
+                256,
+                512,
+                4,
+                false,
+                1,
+                true,
+                0.5528,
+                &WGMMA_W1_V2_P,
+            ),
+            // gpt_d1024_down: the predicate's most informative point -- a single-wave shape sitting
+            // exactly at the L2 roof, where the cluster is the SOLE variable.
+            pin(
+                "gpt_d1024_down",
+                128,
+                256,
+                128,
+                1,
+                true,
+                1,
+                false,
+                0.9552,
+                &WGMMA_W1_MCB_V2,
+            ),
+            // gpt_d4096_up: the only shape where all three fire, and the one whose cluster decision
+            // the RASTER flips -- 0.692 with the raster forced off (136.4 MB of footprint, priced
+            // as thrashing) against 0.955 on the configuration actually emitted (34.1 MB,
+            // resident). `the_raster_flips_the_cluster_verdict_at_gpt_d4096_up` evaluates both and
+            // asserts the two VERDICTS differ, which is the only form of that claim a pinned
+            // post-raster number can never make. The dossier's pre-raster figure is 0.585, which is
+            // T_L2 / T_measured; 0.692 is the same flip priced by the model.
+            pin(
+                "gpt_d4096_up",
+                128,
+                256,
+                2048,
+                16,
+                true,
+                16,
+                true,
+                0.9553,
+                &WGMMA_W1_MCB_V2_R16_P,
+            ),
+        ];
+        assert_eq!(
+            want.len(),
+            WGMMA_BENCH_GRID.len(),
+            "every benched shape must have a PINNED verdict -- a new grid row without one is a \
+             shape the round would measure under a rule nobody wrote down"
+        );
+        for w in &want {
+            let p = WGMMA_BENCH_GRID
+                .iter()
+                .find(|g| g.label == w.label)
+                .unwrap_or_else(|| panic!("{}: not a bench grid row", w.label));
+            let plan = wgmma_dispatch_plan(p.m, p.n, p.k, HOPPER_SM_COUNT);
+            assert_eq!((plan.bm, plan.bn), (w.bm, w.bn), "{}: tile", w.label);
+            assert_eq!((plan.tiles, plan.waves), (w.tiles, w.waves), "{}", w.label);
+            assert_eq!(plan.cluster, w.cluster, "{}: cluster", w.label);
+            assert_eq!(plan.raster, w.group_m > 1, "{}: raster", w.label);
+            assert_eq!(plan.group_m, w.group_m, "{}: GROUP_M", w.label);
+            assert_eq!(plan.persistent, w.persistent, "{}: persistence", w.label);
+            assert!(
+                (plan.f_l2 - w.f_l2).abs() < 5e-4,
+                "{}: f_L2 is {:.4}, pinned at {:.4}",
+                w.label,
+                plan.f_l2,
+                w.f_l2
+            );
+            // The predicate's comparand is the SAVING, and at the reference tile it is the
+            // dossier's own `f_L2 >= 0.78` -- assert the identity where it holds, and assert the
+            // verdict is the saving's everywhere. Without the first half a later edit could drift
+            // the six 128x256 rows away from the dossier's 3.2 column and nothing would notice;
+            // without the second, sq1024's OFF could go back to riding on a mis-priced floor.
+            assert!(
+                (plan.l2_saving - plan.f_l2 * multicast_l2_share(plan.bm, plan.bn)).abs() < 1e-12,
+                "{}: the saving must be f_L2 x the tile's multicast share",
+                w.label
+            );
+            assert_eq!(
+                plan.cluster,
+                plan.l2_saving >= cluster_l2_saving_threshold(),
+                "{}: the verdict is the saving's, not f_L2's",
+                w.label
+            );
+            let (rbm, rbn, _) = FLOOR_REF_TILE;
+            if (plan.bm, plan.bn) == (rbm, rbn) {
+                assert_eq!(
+                    plan.cluster,
+                    plan.f_l2 >= CLUSTER_F_L2_THRESHOLD,
+                    "{}: at the tile the threshold was FITTED at, the two spellings are one \
+                     comparison and the dossier's 3.2 column must decide it",
+                    w.label
+                );
+            }
+            // WAVE3_DOSSIER 0.3's closed form: for any power-of-two tile count in [128, 4096],
+            // `ceil(T/132)*132 = T*33/32` exactly, so EVERY shape in this suite lands on the same
+            // 32/33 wave efficiency and quantization is a flat 3.03% that no lever in wave 3
+            // touches. If a shape ever misses it, the tile menu moved under the dispatcher.
+            assert!(
+                (plan.wave_efficiency - 32.0 / 33.0).abs() < 1e-12,
+                "{}: wave efficiency {:.6}, not the suite's 32/33",
+                w.label,
+                plan.wave_efficiency
+            );
+            // ...and the verdict resolves to a REAL module, which is the second law.
+            let got = wgmma_dispatch(p.m, p.n, p.k, HOPPER_SM_COUNT)
+                .unwrap_or_else(|e| panic!("{}: {e}", w.label));
+            assert_eq!(got.key, w.cfg.key, "{}: module", w.label);
+            assert_eq!(got.name, got.derived_name(), "{}", w.label);
+            assert!(
+                wgmma_module(got, &license()).is_ok(),
+                "{}: the dispatched module must generate",
+                w.label
+            );
+        }
+        // The four wave footprints the dossier's 1.2 table states to the tenth of a megabyte, from
+        // the same formula the dispatcher uses -- the check that the rule's arithmetic IS the
+        // campaign's and not a second one that happens to agree on the verdicts.
+        for (label, mb) in [
+            ("sq4096", 42.2),
+            ("sq8192", 142.9),
+            ("gpt_d1024_up", 10.6),
+            ("gpt_d4096_up", 136.4),
+        ] {
+            let p = WGMMA_BENCH_GRID.iter().find(|g| g.label == label).unwrap();
+            let got = wgmma_dispatch_plan(p.m, p.n, p.k, HOPPER_SM_COUNT).linear_footprint_bytes;
+            assert!(
+                (got / 1.0e6 - mb).abs() < 0.05,
+                "{label}: linear wave footprint {:.1} MB, dossier says {mb} MB",
+                got / 1.0e6
+            );
+        }
+    }
+
+    /// **THE FLIP, AS A COMPARISON OF TWO VERDICTS.**
+    ///
+    /// The dispatcher's headline claim is that `gpt_d4096_up`'s cluster decision is the RASTER's to
+    /// make -- WAVE3_DOSSIER 3.2's "the dispatcher is a function of the *final* configuration, not
+    /// of a measurement of an earlier one", 3.6's "ON post-raster". For a round of this campaign,
+    /// that claim was **inert**: `f_L2` reached the raster through `T_DRAM` alone, `T_DRAM` was
+    /// below the floor in both arms, and the verdict was ON either way. Four sites asserted a flip
+    /// that the shipped rule did not perform, one of them printed into every round log.
+    ///
+    /// The repair is [`dispatch_memory_roof_s`], and this is the law that makes the claim
+    /// falsifiable: evaluate the SAME function twice, once with the raster forced off, and require
+    /// the two **verdicts** to differ. A pin on the post-raster number alone can never state it --
+    /// there is only one configuration in it.
+    ///
+    /// It also fixes the claim's SCOPE, which was never stated either: `sq8192` rasters too, and its
+    /// cluster is ON in both arms (0.8124 -> 0.8826, a margin change, not a sign change). Exactly
+    /// one shape in the suite flips, and this asserts that it is exactly one.
+    #[test]
+    fn the_raster_flips_the_cluster_verdict_at_gpt_d4096_up() {
+        let g = WGMMA_BENCH_GRID
+            .iter()
+            .find(|g| g.label == "gpt_d4096_up")
+            .expect("gpt_d4096_up is the raster's headline shape");
+        let on = wgmma_dispatch_plan(g.m, g.n, g.k, HOPPER_SM_COUNT);
+        let off = wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false));
+        assert!(on.raster && !off.raster, "the two arms are the raster");
+        // THE FLIP. This is the whole law: the verdicts DIFFER.
+        assert_ne!(
+            on.cluster, off.cluster,
+            "the raster does not move this shape's cluster verdict, so every claim that it FLIPS \
+             is inert: on {on:?} vs off {off:?}"
+        );
+        assert!(on.cluster && !off.cluster, "and the direction is OFF -> ON");
+        // ...and it flips for the stated MECHANISM. Everything else about the two arms is equal:
+        // the same tile, the same tiles, the same waves, the same floor -- so the L2 residency of
+        // the wave footprint is the only thing that moved, which is section 1.3's criterion doing
+        // the work section 3.2 says it does.
+        assert_eq!(
+            (on.bm, on.bn, on.tiles, on.waves, on.persistent),
+            (off.bm, off.bn, off.tiles, off.waves, off.persistent),
+            "the arms must differ in the RASTER alone or the flip is about something else"
+        );
+        assert!((on.floor_s - off.floor_s).abs() < 1e-15, "same floor");
+        assert!(
+            (on.l2_read_bytes - off.l2_read_bytes).abs() < 1e-6,
+            "the raster changes DRAM bytes and no L2 read at all (WAVE3_DOSSIER 3.1)"
+        );
+        assert!(
+            on.l2_resident && !off.l2_resident,
+            "the residency IS the flip"
+        );
+        assert!(
+            (off.final_footprint_bytes / 1.0e6 - 136.4).abs() < 0.1
+                && (on.final_footprint_bytes / 1.0e6 - 34.1).abs() < 0.1,
+            "the dossier's 1.2 footprints, 136.4 -> 34.1 MB: {:.1} -> {:.1}",
+            off.final_footprint_bytes / 1.0e6,
+            on.final_footprint_bytes / 1.0e6
+        );
+        // The two numbers, to four digits, on both sides of the break-even.
+        let bar = cluster_l2_saving_threshold();
+        assert!(
+            (off.f_l2 - 0.6921).abs() < 5e-4 && (on.f_l2 - 0.9553).abs() < 5e-4,
+            "f_L2 {:.4} -> {:.4}, pinned at 0.6921 -> 0.9553",
+            off.f_l2,
+            on.f_l2
+        );
+        assert!(
+            off.l2_saving < bar && on.l2_saving >= bar,
+            "saves {:.4} -> {:.4} against a {bar:.4} break-even",
+            off.l2_saving,
+            on.l2_saving
+        );
+        // WHERE THIS DIVERGES FROM THE DOSSIER, asserted rather than glossed. 3.2 puts the
+        // pre-raster figure at 0.585, which is T_L2 / T_MEASURED (920.35 / 1572.2) -- a denominator
+        // a device-free pure function does not have. The model's own denominator is 1329.8 us, so
+        // it still under-predicts that arm by 18%, and 0.692 rather than 0.585 is the honest number
+        // for what the code computes.
+        let measured_us = 1572.2;
+        assert!(
+            ((off.l2_read_bytes / BW_L2 * 1.0e6) / measured_us - 0.585).abs() < 5e-4,
+            "3.2's 0.585 is T_L2 over the MEASURED time"
+        );
+        assert!(
+            (measured_us / (off.binding_s() * 1.0e6) - 1.182).abs() < 5e-3,
+            "and the model under-predicts the linear arm by 18%: {:.3}",
+            measured_us / (off.binding_s() * 1.0e6)
+        );
+        // SCOPE: exactly one shape in the suite flips. `sq8192` rasters and does not.
+        let flippers: Vec<&str> = WGMMA_BENCH_GRID
+            .iter()
+            .filter(|p| {
+                let a = wgmma_dispatch_plan(p.m, p.n, p.k, HOPPER_SM_COUNT);
+                let b =
+                    wgmma_dispatch_plan_with_raster(p.m, p.n, p.k, HOPPER_SM_COUNT, Some(false));
+                a.cluster != b.cluster
+            })
+            .map(|p| p.label)
+            .collect();
+        assert_eq!(
+            flippers,
+            vec!["gpt_d4096_up"],
+            "the flip claim is about ONE shape and must not silently become a claim about others"
+        );
+    }
+
+    /// **THE `f_L2` PROVENANCE LAW: what the code computes, what the dossier tabulates, and the
+    /// exact factor between them.**
+    ///
+    /// [`CLUSTER_F_L2_THRESHOLD`] was fitted to WAVE3_DOSSIER 3.2's `f_L2` column, which is
+    /// `T_L2 / T_MEASURED`. [`DispatchPlan::f_l2`] is `T_L2 / T_PREDICTED`, because a device-free
+    /// pure function has no measurement. Those are two different numbers at every shape where the
+    /// model has a residual, and a source comment claiming the code "reproduces its 3.2 column" was
+    /// simply false at three of seven shapes.
+    ///
+    /// This law states the real relationship and pins every quantity in it:
+    ///
+    /// 1. **the numerator is the same object** -- `T_L2` reproduces 0.4's column, so the divergence
+    ///    is nowhere but the denominator;
+    /// 2. **`T_L2 / T_measured` reproduces 3.2's column**, so the dossier's number is recoverable
+    ///    from the code plus one measurement;
+    /// 3. **`f_L2(shipped) = f_L2(3.2) x meas/pred`**, the identity that carries the bracket;
+    /// 4. and therefore the bracket in the shipped quantity's own units is **`[0.7687, 0.8124]`**,
+    ///    which contains 0.78 -- at its low end, as 3.2 instructs -- with a **1.4%** margin at the
+    ///    measured LOSS and 4.0% at the measured WIN.
+    ///
+    /// Every row is evaluated on the **linear, un-clustered** arm, because that is the arm 0.4
+    /// priced and the arm round 3 ran the cluster A/B on. `sq1024` is excluded and the exclusion is
+    /// the point: its 21.5 us was measured at 128x256 and the rule selects 128x64, so there is no
+    /// residual to take -- comparing them would be the same category error this law exists to name.
+    #[test]
+    fn the_shipped_f_l2_is_a_predicted_denominator_quantity() {
+        // (label, measured us for the LINEAR un-clustered arm, 0.4's T_L2 us, 3.2's f_L2,
+        //  0.4's meas/pred under the SHIPPED roof, the shipped f_L2 on that same arm)
+        let rows = [
+            ("sq2048", 39.09, 28.8, 0.736, 1.045, 0.7687),
+            ("sq4096", 243.44, 230.1, 0.946, 1.011, 0.9553),
+            ("sq8192", 2273.5, 1841.0, 0.810, 1.003, 0.8124),
+            ("gpt_d1024_up", 106.05, 57.5, 0.542, 1.019, 0.5528),
+            ("gpt_d1024_down", 57.50, 57.5, 1.000, 0.955, 0.9553),
+            ("gpt_d4096_up", 1572.2, 920.0, 0.585, 1.182, 0.6921),
+        ];
+        for (label, meas_us, t_l2_doc, f_doc, resid, f_ship) in rows {
+            let g = WGMMA_BENCH_GRID.iter().find(|g| g.label == label).unwrap();
+            // The LINEAR arm: what 0.4 measured and what 3.2's cluster A/B ran.
+            let p = wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false));
+            let t_l2_us = p.l2_read_bytes / BW_L2 * 1.0e6;
+            // 1. the shared numerator.
+            assert!(
+                (t_l2_us - t_l2_doc).abs() < 0.55,
+                "{label}: T_L2 is {t_l2_us:.2} us, WAVE3_DOSSIER 0.4 says {t_l2_doc} -- if THIS \
+                 disagrees the two f_L2s are not two denominators of one quantity and nothing \
+                 below reconciles"
+            );
+            // 2. the dossier's own column, recovered.
+            assert!(
+                (t_l2_us / meas_us - f_doc).abs() < 1e-3,
+                "{label}: T_L2/T_measured is {:.4}, 3.2 says {f_doc}",
+                t_l2_us / meas_us
+            );
+            // 3. the residual, and the identity that carries the bracket across it.
+            let got_resid = meas_us / (p.binding_s() * 1.0e6);
+            assert!(
+                (got_resid - resid).abs() < 5e-3,
+                "{label}: meas/pred is {got_resid:.4}, pinned at {resid}"
+            );
+            assert!(
+                (p.f_l2 - f_ship).abs() < 5e-4,
+                "{label}: shipped f_L2 is {:.4}, pinned at {f_ship}",
+                p.f_l2
+            );
+            assert!(
+                (p.f_l2 - (t_l2_us / meas_us) * got_resid).abs() < 1e-9,
+                "{label}: f_L2(shipped) must be f_L2(3.2) x meas/pred EXACTLY -- it is one \
+                 quantity over two denominators, not two quantities"
+            );
+        }
+        // 4. THE BRACKET, in the units the threshold is actually compared in. sq2048 is the shape
+        //    where the cluster was measured to LOSE 8.0% and sq8192 where it was measured to WIN
+        //    47.0%; the threshold must separate them, and where it sits between them is the whole
+        //    of its safety margin.
+        let f = |label: &str| {
+            let g = WGMMA_BENCH_GRID.iter().find(|g| g.label == label).unwrap();
+            wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false)).f_l2
+        };
+        let (lose, win) = (f("sq2048"), f("sq8192"));
+        assert!(
+            lose < CLUSTER_F_L2_THRESHOLD && CLUSTER_F_L2_THRESHOLD <= win,
+            "the threshold must sit inside the MEASURED sign change: {lose:.4} (-8.0%) .. \
+             {win:.4} (+47.0%), threshold {CLUSTER_F_L2_THRESHOLD}"
+        );
+        assert!(
+            (CLUSTER_F_L2_THRESHOLD - lose) / lose < 0.02,
+            "state the margin as a margin: the threshold clears the measured LOSS by only {:.1}%, \
+             not the 5.7% the dossier's own units imply. It is 3.2's instruction to be eager, and \
+             it is thin -- WAVE3_DOSSIER 3.8's gpt_d1024 pair is the round that widens it",
+            100.0 * (CLUSTER_F_L2_THRESHOLD - lose) / lose
+        );
+        assert!(
+            (win - CLUSTER_F_L2_THRESHOLD) / win > 0.03,
+            "and it clears the measured WIN by {:.1}%",
+            100.0 * (win - CLUSTER_F_L2_THRESHOLD) / win
+        );
+        // ...and the tightness is not an artifact of the repaired roof being generous: BEFORE
+        // `dispatch_memory_roof_s`, sq8192's f_L2 was 1.0000 -- the ratio at its own maximum, the
+        // value it takes whenever T_L2 alone binds -- so the bracket's ceiling carried no
+        // information about the margin at all.
+        let g = WGMMA_BENCH_GRID
+            .iter()
+            .find(|g| g.label == "sq8192")
+            .unwrap();
+        let p = wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false));
+        let overlapped =
+            dispatch_memory_roof_s(p.l2_read_bytes, p.dram_bytes, (g.m * g.n * 4) as f64, true);
+        assert!(
+            (p.l2_read_bytes / BW_L2 / p.floor_s.max(overlapped) - 1.0).abs() < 1e-9,
+            "the superseded roof pinned sq8192 at exactly 1.0"
+        );
+    }
+
+    /// **The serialised memory roof is right EXACTLY where the wave footprint is not resident.**
+    ///
+    /// [`dispatch_memory_roof_s`] adds one branch to WAVE3_DOSSIER 0.4's `max(T_floor, T_L2,
+    /// T_DRAM)`, and a branch that fires on a residency test is a claim with two halves: it must
+    /// IMPROVE the rows whose footprint blows L2 and it must not be applied to the rows whose
+    /// footprint fits. 0.4 states the target itself -- five of seven shapes explained to within 7%,
+    /// "and the two that are not are exactly the two whose linear-order wave footprint exceeds L2",
+    /// at 1.235 and 1.632.
+    ///
+    /// So this law measures the model against 0.4's own measured column, on the linear arm 0.4
+    /// priced, both ways round. It is what stops the branch from being a knob: it costs no new
+    /// constant, and if a later edit widened its scope the two rows it would break say so by name.
+    #[test]
+    fn the_serialised_memory_roof_is_right_exactly_where_the_footprint_is_not_resident() {
+        // (label, 0.4's measured us, resident?, meas/pred SHIPPED, meas/pred under the OTHER roof)
+        let rows = [
+            ("sq2048", 39.09, true, 1.045, 1.045),
+            ("sq4096", 243.44, true, 1.011, 0.883),
+            ("sq8192", 2273.5, false, 1.003, 1.235),
+            ("gpt_d1024_up", 106.05, true, 1.019, 1.019),
+            ("gpt_d1024_down", 57.50, true, 0.955, 0.833),
+            ("gpt_d4096_up", 1572.2, false, 1.182, 1.632),
+        ];
+        for (label, meas_us, resident, shipped, other) in rows {
+            let g = WGMMA_BENCH_GRID.iter().find(|g| g.label == label).unwrap();
+            let p = wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false));
+            assert_eq!(
+                p.l2_resident,
+                resident,
+                "{label}: residency decides the branch, so it is pinned too ({:.1} MB vs {:.1} MB \
+                 of L2)",
+                p.final_footprint_bytes / 1.0e6,
+                L2_BYTES / 1.0e6
+            );
+            let c = (g.m * g.n * 4) as f64;
+            let flipped = dispatch_memory_roof_s(p.l2_read_bytes, p.dram_bytes, c, !p.l2_resident);
+            let r_ship = meas_us / (p.binding_s() * 1.0e6);
+            let r_other = meas_us / (p.floor_s.max(flipped) * 1.0e6);
+            assert!(
+                (r_ship - shipped).abs() < 5e-3 && (r_other - other).abs() < 5e-3,
+                "{label}: meas/pred is {r_ship:.3} shipped and {r_other:.3} under the other roof, \
+                 pinned at {shipped} and {other}"
+            );
+            // The directional claim, per row: where the two roofs differ at all, the SHIPPED one
+            // must be the better predictor. Three rows are floor-bound under both and tie; the
+            // three that are not are the whole evidence for the branch.
+            if (r_ship - r_other).abs() > 1e-6 {
+                assert!(
+                    (r_ship - 1.0).abs() < (r_other - 1.0).abs(),
+                    "{label}: the shipped roof predicts WORSE than the alternative ({r_ship:.3} \
+                     vs {r_other:.3}) -- the branch's residency test is on the wrong side"
+                );
+            }
+        }
+    }
+
+    /// **The round log's rule header is the rule the dispatcher ships, because it is the same
+    /// function.**
+    ///
+    /// `wgmma_config_sweep`'s section 6d used to state the rule in its own prose, and after the
+    /// predicate became `f_L2 * share >= 0.26` that prose still read "the cluster iff the L2-roof
+    /// fraction of the FINAL configuration clears 0.78" -- printed directly above a table whose
+    /// `sq1024` row reads `f_L2 0.795 ... cluster off`. The header contradicted the line beneath it
+    /// at the one shape the tile lever exists for.
+    ///
+    /// [`wgmma_dispatch_rule_text`] is the single spelling, the same discipline as
+    /// [`Multicast::cluster_shape`], and this law is what keeps it honest: every threshold in the
+    /// header is interpolated from the constant the dispatcher compares against, and the superseded
+    /// spelling is banned by name at the shape that falsifies it.
+    #[test]
+    fn the_round_log_header_states_the_rule_the_dispatcher_actually_ships() {
+        let t = wgmma_dispatch_rule_text();
+        assert!(t.is_ascii(), "the round log stays ASCII");
+        for needle in [
+            format!("{:.2}", WAVE_EFFICIENCY_FLOOR),
+            format!("{:.2}", cluster_l2_saving_threshold()),
+            format!("{:.2}", CLUSTER_F_L2_THRESHOLD),
+            format!("{:.1} MB", L2_BYTES / 1.0e6),
+            format!(
+                "{:.3}",
+                multicast_l2_share(FLOOR_REF_TILE.0, FLOOR_REF_TILE.1)
+            ),
+        ] {
+            assert!(
+                t.contains(&needle),
+                "the header must be BUILT from the dispatcher's constants, and {needle:?} is \
+                 missing -- a header carrying its own literals is how this went stale: {t}"
+            );
+        }
+        // Every tile the rule can choose is named, or a reader cannot tell which menu produced a
+        // verdict.
+        for (bm, bn, s) in DISPATCH_TILES {
+            assert!(
+                t.contains(&format!("{bm}x{bn} s{s}")),
+                "{bm}x{bn} s{s}: {t}"
+            );
+        }
+        // THE FALSIFIER. sq1024 clears 0.78 on f_L2 and its cluster is OFF, so a header that said
+        // the verdict is f_L2's would contradict the table printed underneath it.
+        let p = wgmma_dispatch_plan(1024, 1024, 1024, HOPPER_SM_COUNT);
+        assert!(
+            p.f_l2 >= CLUSTER_F_L2_THRESHOLD && !p.cluster,
+            "sq1024 is what makes the two spellings distinguishable: {p:?}"
+        );
+        assert!(
+            !t.contains("fraction of the FINAL configuration clears"),
+            "that is the SUPERSEDED spelling, and sq1024 falsifies it: {t}"
+        );
+        assert!(
+            t.contains("SAVE") && t.contains("(bn/2)/(bm+bn)"),
+            "the header must name the quantity actually compared: {t}"
+        );
+        // Printed under `--nocapture` so the text a round log will carry is readable from a plain
+        // `cargo test` rather than only from a rented hour.
+        eprintln!("[law] section-6d header, verbatim:\n  {t}");
+    }
+
+    /// **WAVE 3 lever 3, law (a) continued: the verdict is pinned at every CLASS BOUNDARY too.**
+    ///
+    /// Three thresholds decide four facts, and each is asserted from BOTH sides with the smallest
+    /// step the geometry admits -- because a dispatcher tested only at the seven benched shapes is a
+    /// lookup table with a proof obligation it never discharges. The fourth case is the decline: the
+    /// rule must land on a real emitted module or say so, never fall back.
+    #[test]
+    fn the_dispatcher_verdict_is_pinned_at_every_class_boundary() {
+        let plan = |m, n, k| wgmma_dispatch_plan(m, n, k, HOPPER_SM_COUNT);
+        // --- 1. the wave-efficiency floor, from both sides at one tile of resolution -------------
+        // 119 tiles of 132 is 0.9015 and clears; 118 is 0.8939 and does not.
+        assert_eq!(
+            plan(128 * 119, 256, 1024).bn,
+            256,
+            "119/132 = 0.9015 clears"
+        );
+        assert_eq!(
+            plan(128 * 118, 256, 1024).bn,
+            64,
+            "118/132 = 0.8939 fails at 128x256 -- and the ratio is IDENTICAL at 128x128 and \
+             128x64, because narrowing the tile multiplies tiles and waves together. The last \
+             candidate is therefore taken unconditionally: something must run, and the narrowest \
+             tile is the one with the most tiles."
+        );
+        // ...and the MIDDLE tile is reachable, or the menu has two entries wearing three names.
+        assert_eq!(
+            plan(128 * 65, 256, 1024).bn,
+            128,
+            "65 tiles at 128x256 is 0.49; 130 at 128x128 is 0.985"
+        );
+        // --- 2. the raster's L2 footprint, from both sides at one k-stage of resolution ----------
+        // At 4096x4096 the linear order's f(R) is 5152 rows, so the footprint crosses the 50.0 MiB
+        // L2 between K = 5056 (52 097 024 B) and K = 5120 (52 756 480 B) -- 0.6% apart.
+        assert!(
+            !plan(4096, 4096, 5056).raster,
+            "52.10 MB fits a 52.43 MB L2"
+        );
+        let over = plan(4096, 4096, 5120);
+        assert!(over.raster, "52.76 MB does not");
+        assert_eq!(
+            over.group_m, 16,
+            "GROUP_M = round(sqrt(W*BN/BM)) to the nearest EVEN value: sqrt(264) = 16.25"
+        );
+        // The raster is PROVABLY the identity on a single-wave grid, whatever the footprint.
+        assert!(
+            !plan(1024, 1024, 1 << 20).raster,
+            "one wave: every tile is resident simultaneously, so no permutation of the launch \
+             order can change a single byte of traffic"
+        );
+        // --- 3. the cluster's f_L2 threshold, from both sides at one k-stage of resolution -------
+        // At 2048x2048 (128 tiles, one wave) f_L2 crosses 0.78 between n_k = 33 and n_k = 34.
+        let off = plan(2048, 2048, 33 * 64);
+        let on = plan(2048, 2048, 34 * 64);
+        assert!(!off.cluster && off.f_l2 < CLUSTER_F_L2_THRESHOLD, "{off:?}");
+        assert!(on.cluster && on.f_l2 >= CLUSTER_F_L2_THRESHOLD, "{on:?}");
+        assert!(
+            on.f_l2 - off.f_l2 < 0.01,
+            "the bracket must be TIGHT or it is not a boundary test: {:.4} vs {:.4}",
+            off.f_l2,
+            on.f_l2
+        );
+        // --- 4. THE DECLINE, which is the law's whole point --------------------------------------
+        // 140 m-tiles by one 256-wide n-tile fails the efficiency floor at ALL THREE tiles (0.530,
+        // 0.707, 0.848), so the narrowest is taken unconditionally -- and it is multi-wave, so the
+        // rule also asks for persistence. There is no persistent 128x64 twin: nothing in the suite
+        // reaches that corner (sq1024, the only shape the narrow tile serves, is one wave), and a
+        // module nothing needs is a module nothing has ever assembled. The rule must SAY so rather
+        // than hand back the one-tile-per-CTA row and let the round publish a persistence claim
+        // for a kernel with no tile loop in it.
+        let (dm, dn, dk) = (128 * 140, 256, 1024);
+        let p = plan(dm, dn, dk);
+        assert_eq!(
+            (p.bm, p.bn, p.cluster, p.persistent, p.raster),
+            (128, 64, false, true, false)
+        );
+        let why = wgmma_dispatch(dm, dn, dk, HOPPER_SM_COUNT)
+            .expect_err("this verdict has no emitted module and must DECLINE, never fall back");
+        assert!(why.starts_with(UNSUPPORTED), "{why}");
+        assert!(
+            why.contains("128x64 tile") && why.contains("persistent true"),
+            "the decline must name the configuration it wanted, or an operator cannot tell \
+             whether the rule or the menu is wrong: {why}"
+        );
+        // --- 5. THE SQUARE TILE IS UNCLUSTERABLE, and by a margin worth printing ------------------
+        // A long-K skinny-N shape reaches 128x128 and is FULLY L2-bound there (t_l2 146.05 us
+        // against a 97.13 us floor, so f_L2 = 1.000). It still declines the cluster, because a B
+        // multicast at a square tile removes only `(bn/2)/(bm+bn)` = 1/4 of the L2 read against the
+        // 0.26 the 128x256 break-even was fitted at. 0.25 < 0.26: the margin is 4%, which is inside
+        // everything this campaign has measured, so this is a REFUSAL and not a result -- the rule
+        // declines rather than guessing, and a round that measures the cluster at 128x128 is what
+        // would move it.
+        //
+        // Before the floor was tile-aware this verdict read `f_L2 = 0.787` -- ON by 0.9% -- off a
+        // floor that priced a 6-stage 128x128 tile with 4-stage 128x256 constants (185.63 us against
+        // a real 97.13). Both numbers were wrong and they cancelled into a plausible verdict, which
+        // is the exact failure mode a boundary test exists to catch.
+        let sq = plan(128 * 65, 256, 240 * 64);
+        assert_eq!((sq.bm, sq.bn), (128, 128));
+        assert!(
+            (sq.f_l2 - 1.0).abs() < 1e-9 && !sq.cluster,
+            "fully L2-bound and still un-clustered: {sq:?}"
+        );
+        let margin = cluster_l2_saving_threshold() - sq.l2_saving;
+        assert!(
+            margin > 0.0 && margin < 0.011,
+            "state the margin as a margin -- it saves {:.4} against a {:.4} break-even, i.e. it \
+             misses by {:.4}",
+            sq.l2_saving,
+            cluster_l2_saving_threshold(),
+            margin
+        );
+        // ...so the verdict is `(128x128, cluster off, one tile per CTA, v2)`, and NOTHING emits it:
+        // every square-tile row this family ships carries the cluster (it exists as wave 3 lever 4's
+        // depth-diagnostic control) or the scalar store. The rule must SAY so. Closing it is one
+        // `WGMMA_W3C_V2` row plus a module-count bump, and it is deliberately not spent: no shape in
+        // the suite reaches the square tile, and a module nothing measures is a module nothing has
+        // ever assembled.
+        let why = wgmma_dispatch(128 * 65, 256, 240 * 64, HOPPER_SM_COUNT)
+            .expect_err("no un-clustered 128x128 v2 row exists, so the rule must DECLINE");
+        assert!(why.starts_with(UNSUPPORTED), "{why}");
+        assert!(
+            why.contains("128x128 tile") && why.contains("cluster off"),
+            "the decline must name the configuration it wanted: {why}"
+        );
+    }
+
+    /// **WAVE 3 lever 3, law (b): every verdict the dispatcher can reach at a benched shape is a
+    /// sweep row that is MEASURED at that shape, with a control beside it.**
+    ///
+    /// This is what makes the round measure THE RULE rather than a table of arms a reader has to
+    /// assemble a rule from. It is also the property that would silently rot first: `SweepRow`
+    /// carries its own shape list since wave 3 (the cross product is both expensive and misleading
+    /// -- a lever measured where it is provably zero is a cell a reader will over-read), so a row
+    /// whose list drifts away from the shapes the dispatcher sends it would leave the rule's own
+    /// choice unmeasured while every other cell still filled in.
+    #[test]
+    fn every_shape_the_dispatcher_selects_is_measured_at_that_shape() {
+        for p in WGMMA_BENCH_GRID {
+            let cfg = wgmma_dispatch(p.m, p.n, p.k, HOPPER_SM_COUNT)
+                .unwrap_or_else(|e| panic!("{}: {e}", p.label));
+            let row = WGMMA_SWEEP_GRID
+                .iter()
+                .find(|r| r.cfg.key == cfg.key)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: the dispatcher selects {} and no sweep row carries it, so the rule's \
+                         own choice would go unmeasured",
+                        p.label, cfg.name
+                    )
+                });
+            assert!(
+                row.generatable().is_ok(),
+                "{}: the dispatcher selects {}, which DECLINES",
+                p.label,
+                row.label
+            );
+            assert!(
+                row.runs_at(p.label),
+                "{}: the dispatcher selects row {} and that row is not measured at this shape \
+                 (its shapes are {:?})",
+                p.label,
+                row.label,
+                row.shapes
+            );
+            // A verdict with no other arm at the same shape is a number with nothing to be a
+            // difference from -- and every claim in this wave is a difference.
+            assert!(
+                WGMMA_SWEEP_GRID.iter().any(|r| r.cfg.key != cfg.key
+                    && r.runs_at(p.label)
+                    && !r.cfg.epilogue.is_diagnostic_only()
+                    && r.generatable().is_ok()),
+                "{}: {} is the only measured row at this shape",
+                p.label,
+                row.label
+            );
+        }
     }
 
     /// **Wave 2's two invocations name real things, in the order the standing rules require.**
