@@ -546,9 +546,12 @@ the kernel the Act-2 campaign measures and which until then had no caller outsid
 on every other capability it takes the pre-Hopper launcher, unchanged. It is `== 9` and not `>= (9,0)`
 because `sm_90a` is architecture-*locked*. Every reason the family cannot take a call — the
 architecture, an unencodable tensor map (`K % 8 != 0`), an odd `N` under the `v2` store, an output past
-the epilogue's `u32` index, a ring larger than the device's opt-in shared memory, or an operand past
-65504 (the seam converts f32 operands to f16 on the host, and past f16's finite range the answer would
-come back `inf` rather than merely rounded) — is a **decline to
+the epilogue's `u32` index, a ring larger than the device's opt-in shared memory, or an operand
+outside f16's *range* at either end (the seam converts f32 operands to f16 on the host: past 65504 an
+element comes back `inf` rather than merely rounded, and an operand whose whole magnitude range is
+under f16's smallest normal 6.104e-5 comes back a matrix of zeros — at ~1e-8 every element is under
+f16's round-to-zero point. Overflow declines per element, underflow per operand on its maximum, so an
+ordinary `U(-1,1)` buffer never trips it) — is a **decline to
 that same existing path**, never an error, so results are unchanged wherever it declines. Where it does
 route, the tolerance band widens rather than the contract: the wgmma family converts both operands to
 f16 on the host, so the driver's device gate sizes its band from the route that **actually ran** —
