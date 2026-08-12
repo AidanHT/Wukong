@@ -2001,10 +2001,14 @@ pub const W1_CLUSTER_MIN_OUTPUT_ELEMS: usize = 8_000_000;
 
 /// **The W1 family's shipped configuration for an `M x N` output.**
 ///
-/// [`WGMMA_W1_MCB`] -- the `1x2x1` cluster multicasting B, round 3's best row at both `sq4096`
-/// (73.5%, +6.2 points over the un-clustered baseline) and `sq8192` (82.2%, +27.0) -- for anything
-/// at or above [`W1_CLUSTER_MIN_OUTPUT_ELEMS`]; the un-clustered [`WGMMA_W1`] below it, because
-/// `sq2048` is the one measured shape where the cluster **loses** (62.4% against 67.2%).
+/// Both arms carry the **fused `st.global.v2.f32` epilogue** since the 2026-08-11 wave-2 round:
+/// `w1_mcb_v2` measured 87.4 / 88.7 / 92.0% of cuBLAS at sq2048/4096/8192 against the scalar
+/// baseline's 62.2 / 73.4 / 81.9, a pure win at every measured shape, so shipping the scalar store
+/// anywhere would ship the measurably worst configuration. [`WGMMA_W1_MCB_V2`] -- the `1x2x1`
+/// cluster multicasting B -- for anything at or above [`W1_CLUSTER_MIN_OUTPUT_ELEMS`]; the
+/// un-clustered [`WGMMA_W1_V2`] below it, because `sq2048` is the one measured shape where the
+/// cluster **loses** (scalar-vs-scalar 62.4% against 67.2%; the v2 twin of that comparison is the
+/// `w1_v2` sweep row's job).
 ///
 /// # This is a REGIME RULE, not a dispatcher, and the distinction is deliberate
 ///
@@ -2012,17 +2016,18 @@ pub const W1_CLUSTER_MIN_OUTPUT_ELEMS: usize = 8_000_000;
 /// dispatcher (which will also choose the tile -- D1 puts 128x128 at the `sq2048` end, and this
 /// function cannot express that because it only ever returns a 128x256 row). Two properties keep it
 /// honest in the meantime: the threshold sits inside the interval the measurement actually brackets
-/// (see [`W1_CLUSTER_MIN_OUTPUT_ELEMS`]), and **both rows stay emittable and stay in the sweep**, so
-/// the next round re-measures the split rather than inheriting it.
+/// (see [`W1_CLUSTER_MIN_OUTPUT_ELEMS`]), and **the scalar rows stay emittable and stay in the
+/// sweep** as controls, so the next round re-measures both the split and the store rather than
+/// inheriting them.
 ///
 /// `K` is deliberately not an input. Nothing in round 3 varied it independently, so a rule that read
 /// it would be a guess wearing a measurement's clothes; wave 2's K-sweep ([`WGMMA_KSWEEP_GRID`]) is
 /// what will give it one.
 pub fn wgmma_w1_for(m: usize, n: usize) -> &'static WgmmaCfg {
     if m.saturating_mul(n) >= W1_CLUSTER_MIN_OUTPUT_ELEMS {
-        &WGMMA_W1_MCB
+        &WGMMA_W1_MCB_V2
     } else {
-        &WGMMA_W1
+        &WGMMA_W1_V2
     }
 }
 
@@ -2171,11 +2176,33 @@ pub const WGMMA_W3C_MCB: WgmmaCfg = WgmmaCfg {
 // table above and is measured in the same round at the same shapes.
 
 /// The round-3 winner with the **fused `st.global.v2.f32` epilogue** (wave-2 lever 1).
+///
+/// The 2026-08-11 wave-2 round measured this row at **87.4 / 88.7 / 92.0%** of cuBLAS f16 (f32
+/// out) at sq2048/sq4096/sq8192 against the scalar baseline's 62.2 / 73.4 / 81.9 -- +25.2 / +15.3
+/// / +10.1 points from the one-field change, which is why [`wgmma_w1_for`] now ships it.
 pub const WGMMA_W1_MCB_V2: WgmmaCfg = WgmmaCfg {
     name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2",
     key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2",
     epilogue: EpilogueStore::V2,
     ..WGMMA_W1_MCB
+};
+
+/// The **un-clustered** W1 with the fused v2 epilogue -- the fourth corner of the
+/// `{cluster off/on} x {scalar/v2}` square, and the row [`wgmma_w1_for`] ships below the cluster
+/// threshold.
+///
+/// The 2026-08-11 round measured v2 only on the clustered lineage (`w1_mcb_v2`), so the small-shape
+/// half of the shipped rule rides on the mechanism being cluster-independent -- which it textually
+/// is (the epilogue never touches the multicast path; the emitted store sequence is identical
+/// modulo the cluster prologue). This row exists so the next sweep MEASURES that instead of
+/// inheriting it: at `sq2048`, where round 3 showed no-cluster beating the cluster 67.2% to 62.4%
+/// scalar-vs-scalar, this row against `w1_mcb_v2`'s measured 87.4% settles whether the same sign
+/// holds under v2.
+pub const WGMMA_W1_V2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_v2",
+    key: "wgmma_nt_f16_128x256x64_s4_v2",
+    epilogue: EpilogueStore::V2,
+    ..WGMMA_W1
 };
 
 /// The round-3 winner with `.L2::evict_first` on the C stores (wave-2 lever 2, half of it).
@@ -2398,6 +2425,15 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
               register and stored under a predicate no u32 K can satisfy, so nothing upstream can \
               be dead-coded and the arm cannot be mistaken for a fast kernel",
     },
+    SweepRow {
+        label: "w1_v2",
+        cfg: &WGMMA_W1_V2,
+        why: "The FOURTH CORNER of the {cluster} x {v2} square, and the small-shape half of the \
+              shipped rule (wgmma_w1_for below the cluster threshold). The 2026-08-11 round \
+              measured v2 only on the clustered lineage (+25.2/+15.3/+10.1 points); this row \
+              measures the un-clustered v2 the rule ships at sq2048-class shapes instead of \
+              inheriting cluster-independence from the emitter's text",
+    },
 ];
 
 /// **The K sweep: one tile, one output shape, K as the only axis.** Wave 2's third measurement.
@@ -2577,9 +2613,18 @@ pub const WGMMA_CENSUS_AUDIT_TEST: &str = "ptxas_reports_the_register_and_spill_
 /// free, and its answer (what cuBLASLt's heuristic will actually fuse, per epilogue x output dtype)
 /// can retract a Wave-4 headline before any of it is built. Last, because wave 2's own data is what
 /// this visit is for.
+/// # The bring-up line goes through `::test`, not `::bench` (the 2026-08-11 vacuous run)
+///
+/// This constant used to send bring-up through `::bench --name wgmma_hopper_bringup`. `::bench`
+/// appends `--ignored`, which runs ONLY `#[ignore]`d tests -- and the bring-up gate is a plain
+/// `#[test]`, so the run selected zero tests, printed `0 passed`, and exited 0 having proven
+/// nothing, for $0.006 of rented H100. The `::test --filter` form below is
+/// [`WGMMA_BRINGUP_INVOCATION`]'s own routing, and the law over this constant now checks
+/// entrypoint reachability (`::bench` names must be `#[ignore]`d; `::test` filters must not be),
+/// which is the exact mistake it previously could not see.
 pub const WGMMA_W2_H100_INVOCATION: &str = "\
     modal run tools/cloud/modal_app.py::test  --filter wgmma_cluster_multicast_is_exact --peers\n\
-    modal run tools/cloud/modal_app.py::bench --name wgmma_hopper_bringup --peers\n\
+    modal run tools/cloud/modal_app.py::test  --filter \"--nocapture --test-threads=1 wgmma_hopper_bringup\" --peers\n\
     modal run tools/cloud/modal_app.py::bench --name wgmma_config_sweep --peers --release\n\
     modal run tools/cloud/modal_app.py::bench --name wgmma_k_sweep --peers --release\n\
     modal run tools/cloud/modal_app.py::bench --name cublaslt_epilogue_support_probe --peers";
@@ -5257,7 +5302,11 @@ mod tests {
         // `WgmmaCfg::derived_name` -- the WHOLE geometry, now including the transport and the cache
         // policy -- and every one is text a rented H100 will be handed, which is exactly why the
         // CPU-priced census must assemble them first.
-        assert_eq!(mods.len(), 20);
+        //
+        // 20 -> 21 when the measured v2 win (+25.2/+15.3/+10.1 points, 2026-08-11) made v2 the
+        // SHIPPED default on both regime arms: `w1_v2` is the un-clustered v2 row the rule ships
+        // below the cluster threshold, and the fourth corner of the {cluster} x {v2} square.
+        assert_eq!(mods.len(), 21);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -7691,27 +7740,37 @@ mod tests {
         // LOSES at sq2048 (4.19e6 output elements) and WINS at sq4096 (16.8e6).
         const _: () = assert!(W1_CLUSTER_MIN_OUTPUT_ELEMS > 2048 * 2048);
         const _: () = assert!(W1_CLUSTER_MIN_OUTPUT_ELEMS <= 4096 * 4096);
-        assert_eq!(wgmma_w1_for(2048, 2048).name, WGMMA_W1.name);
-        assert_eq!(wgmma_w1_for(4096, 4096).name, WGMMA_W1_MCB.name);
-        assert_eq!(wgmma_w1_for(8192, 8192).name, WGMMA_W1_MCB.name);
+        assert_eq!(wgmma_w1_for(2048, 2048).name, WGMMA_W1_V2.name);
+        assert_eq!(wgmma_w1_for(4096, 4096).name, WGMMA_W1_MCB_V2.name);
+        assert_eq!(wgmma_w1_for(8192, 8192).name, WGMMA_W1_MCB_V2.name);
+        // Both arms ship the v2 epilogue since the 2026-08-11 round measured it at +25.2/+15.3/
+        // +10.1 points over the scalar store -- a rule that shipped the scalar anywhere would ship
+        // the measurably worst configuration.
+        for (m, n) in [(2048, 2048), (8192, 8192)] {
+            assert_eq!(
+                wgmma_w1_for(m, n).epilogue,
+                EpilogueStore::V2,
+                "the shipped rule must carry the measured v2 epilogue at {m}x{n}"
+            );
+        }
         // The GPT shapes the bench grid carries, so the rule is not only defined on squares. Note
         // `gpt_d1024_down` (4096x1024) and `gpt_d1024_up` (4096x4096): the first has EXACTLY the
         // output element count of sq2048, where the cluster was measured to LOSE, so the rule sends
         // it to the un-clustered row. That is the rule declining to extrapolate, not an oversight --
         // nothing in round 3 measured a rectangular shape at all, and wave 3's dispatcher is what
         // will.
-        assert_eq!(wgmma_w1_for(4096, 16384).name, WGMMA_W1_MCB.name);
-        assert_eq!(wgmma_w1_for(4096, 4096).name, WGMMA_W1_MCB.name);
-        assert_eq!(wgmma_w1_for(4096, 1024).name, WGMMA_W1.name);
+        assert_eq!(wgmma_w1_for(4096, 16384).name, WGMMA_W1_MCB_V2.name);
+        assert_eq!(wgmma_w1_for(4096, 4096).name, WGMMA_W1_MCB_V2.name);
+        assert_eq!(wgmma_w1_for(4096, 1024).name, WGMMA_W1_V2.name);
         assert_eq!(
             4096 * 1024,
             2048 * 2048,
             "the two shapes really are the same M*N"
         );
-        assert_eq!(wgmma_w1_for(1024, 1024).name, WGMMA_W1.name);
-        // Both arms of the rule stay emittable and stay in the sweep, so the next round re-measures
-        // the split instead of inheriting it.
-        for c in [&WGMMA_W1, &WGMMA_W1_MCB] {
+        assert_eq!(wgmma_w1_for(1024, 1024).name, WGMMA_W1_V2.name);
+        // Both shipped arms AND their scalar controls stay emittable and stay in the sweep, so the
+        // next round re-measures both the split and the store instead of inheriting them.
+        for c in [&WGMMA_W1, &WGMMA_W1_MCB, &WGMMA_W1_V2, &WGMMA_W1_MCB_V2] {
             assert!(c.validate().is_ok(), "{}", c.name);
             assert!(
                 WGMMA_SWEEP_GRID.iter().any(|r| r.cfg.key == c.key),
@@ -7720,7 +7779,10 @@ mod tests {
             );
         }
         // Saturating, so a caller cannot overflow its way into the wrong arm.
-        assert_eq!(wgmma_w1_for(usize::MAX, usize::MAX).name, WGMMA_W1_MCB.name);
+        assert_eq!(
+            wgmma_w1_for(usize::MAX, usize::MAX).name,
+            WGMMA_W1_MCB_V2.name
+        );
     }
 
     /// **Wave 2's two invocations name real things, in the order the standing rules require.**
@@ -7848,6 +7910,57 @@ mod tests {
                     src.contains(&format!("fn {name}(")),
                     "the wave-2 visit names `{name}`, which is not a test in gpu.rs"
                 );
+            }
+
+            // **THE CHECK THE 2026-08-11 VACUOUS RUN NEEDED: entrypoint REACHABILITY, per line.**
+            // A name existing as a test is not enough -- `::bench` appends `--ignored`, which runs
+            // ONLY `#[ignore]`d tests, and `::test` never reaches one. Route a plain #[test]
+            // through `::bench` (the bring-up gate, 2026-08-11) and the run selects zero tests,
+            // prints `0 passed` and exits 0: a paid no-op that reads as green. This is the third
+            // instance of the pinned-invocation-does-not-reach class (census filter, census
+            // device-round pull-in, bring-up entrypoint), so the law now checks the routing itself.
+            let attr_head = |name: &str| -> &str {
+                let at = src
+                    .find(&format!("fn {name}("))
+                    .unwrap_or_else(|| panic!("{name} vanished from gpu.rs mid-law"));
+                &src[at.saturating_sub(220)..at]
+            };
+            for line in visit.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.split("--name ").nth(1) {
+                    let name = rest.split_whitespace().next().unwrap_or("");
+                    assert!(
+                        line.contains("::bench"),
+                        "`--name` is ::bench's selector; this line routes it elsewhere: {line}"
+                    );
+                    assert!(
+                        attr_head(name).contains("#[ignore"),
+                        "the visit routes `{name}` through ::bench, which appends --ignored -- \
+                         but it is a plain #[test], so the run would select ZERO tests and exit 0 \
+                         having proven nothing (the 2026-08-11 vacuous bring-up, $0.006)"
+                    );
+                } else if let Some(rest) = line.split("--filter ").nth(1) {
+                    let rest = rest.trim_start();
+                    let filt: &str = if let Some(stripped) = rest.strip_prefix('"') {
+                        stripped.split('"').next().unwrap_or("")
+                    } else {
+                        rest.split_whitespace().next().unwrap_or("")
+                    };
+                    let name = filt
+                        .split_whitespace()
+                        .rev()
+                        .find(|t| !t.starts_with('-'))
+                        .unwrap_or("");
+                    assert!(
+                        !name.is_empty(),
+                        "the ::test filter carries no test name, only flags: {line}"
+                    );
+                    assert!(
+                        !attr_head(name).contains("#[ignore"),
+                        "the visit routes `{name}` through ::test, which does NOT pass --ignored \
+                         -- an #[ignore]d test is unreachable there and the run is a paid no-op"
+                    );
+                }
             }
         }
     }
