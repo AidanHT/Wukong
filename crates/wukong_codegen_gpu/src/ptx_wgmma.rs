@@ -2878,6 +2878,262 @@ pub fn wgmma_w1_bf16_for(m: usize, n: usize) -> &'static WgmmaCfg {
     }
 }
 
+// --- wave 3 lever 3: the per-shape dispatcher -----------------------------------------------------
+
+/// L2 on the H100 SXM5 this campaign rents, bytes (50.0 MiB). Measured, r3 log line 522.
+pub const L2_BYTES: f64 = 52_428_800.0;
+/// The measured L2 read bandwidth, B/s. `gpt_d1024_down` runs 597.6 TFLOP/s through `I_cta = 85.33`,
+/// which is exactly this -- the shape IS the calibration.
+pub const BW_L2: f64 = 7.00e12;
+/// HBM peak, B/s (the datasheet number; the measured copy rate on this fleet is 2.92 TB/s = 87.2%).
+pub const BW_HBM: f64 = 3.35e12;
+/// The per-tile fixed cost, seconds: ring fill + the `wgmma.wait_group 0` drain + 128 predicated
+/// stores + prologue. Fit B, from `sq4096` and `gpt_d1024_up` at an IDENTICAL 512-tile / 4-wave grid
+/// differing only in K, so the fit has no wave term at all.
+pub const TILE_FIXED_S: f64 = 14.61e-6;
+/// The per-k-stage cost at a 128x256 tile, seconds, from the same fit.
+pub const K_STAGE_S: f64 = 0.7126e-6;
+/// The wave efficiency a tile must clear to be selected: `tiles / (sm_count * waves)`.
+///
+/// 0.90 accepts 128x256 at `sq2048` (0.970) and rejects it at `sq1024` (0.242), reproducing BOTH
+/// measured facts with one rule -- where D1's `M*N >= 4.3e6` literal put the narrow tile at sq2048,
+/// which round 3 then measured 11.9% SLOWER there.
+pub const WAVE_EFFICIENCY_FLOOR: f64 = 0.90;
+/// The L2-roof fraction above which the cluster pays for itself.
+///
+/// The sign of the cluster's effect flips between a measured `f_L2` of 0.736 (`sq2048`, -8.0% with
+/// the cluster on the tight `s3` pair) and 0.810 (`sq8192`, +47.0%). The threshold sits inside that
+/// bracket and is placed at its LOW end deliberately: a wrong OFF at sq8192 costs 27 points, a wrong
+/// ON at sq2048 costs 5. Be eager.
+pub const CLUSTER_F_L2_THRESHOLD: f64 = 0.78;
+
+/// The tiles [`wgmma_dispatch`] may choose from, widest first. 128x256 / 128x128 / 128x64 are the
+/// three the register file and `Schedule::Cooperative` allow (CTA-M must be a multiple of 128, and
+/// `bm = 64 * consumer_wgs`); 192-row tiles are DEAD, not deferred -- 192 is not a multiple of 128
+/// and 512 threads cap ptxas at 128 registers against 128 accumulators alone.
+const DISPATCH_TILES: &[(usize, usize)] = &[(128, 256), (128, 128), (128, 64)];
+
+/// **What [`wgmma_dispatch`] decided, as data** -- so the round can print the rule's reasoning
+/// beside its result instead of a reader inferring it from a module name.
+/// **The three decisions are each a comparison against a threshold, and the two comparands are
+/// carried here too.** A verdict without its own numbers is a verdict a reader has to re-derive from
+/// a dossier to argue with, and the two thresholds ([`WAVE_EFFICIENCY_FLOOR`] and
+/// [`CLUSTER_F_L2_THRESHOLD`]) sit inside measured brackets that a later round can move.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DispatchPlan {
+    pub bm: usize,
+    pub bn: usize,
+    pub tiles: usize,
+    pub waves: usize,
+    pub cluster: bool,
+    pub raster: bool,
+    /// `GROUP_M` when `raster` is on; `1` otherwise.
+    pub group_m: usize,
+    pub persistent: bool,
+    /// `tiles / (sm_count * waves)` for the tile that was CHOSEN -- the quantity
+    /// [`WAVE_EFFICIENCY_FLOOR`] is compared against.
+    pub wave_efficiency: f64,
+    /// The LINEAR order's wave footprint in bytes, `f(R_linear) * K * 2`. The raster fires iff this
+    /// exceeds [`L2_BYTES`] on a multi-wave grid, so the number and its threshold belong together.
+    pub linear_footprint_bytes: f64,
+    /// The L2-roof fraction of the FINAL configuration, `T_L2 / max(T_floor, T_L2, T_DRAM)` -- the
+    /// quantity [`CLUSTER_F_L2_THRESHOLD`] is compared against. It reproduces WAVE3_DOSSIER 3.2's
+    /// column to three digits at `gpt_d4096_up` (0.955) and `gpt_d1024_up` (0.55).
+    pub f_l2: f64,
+}
+
+impl DispatchPlan {
+    /// **One line for a round log: the verdict AND both comparands.** A rule that prints only its
+    /// answer is a rule a reader has to take on trust; printing `wave eff 0.970 >= 0.90` and
+    /// `f_L2 0.55 < 0.78` beside it is what lets the round's own table falsify the thresholds
+    /// instead of inheriting them.
+    pub fn summary(&self) -> String {
+        format!(
+            "{}x{} tile, {} tiles / {} waves (eff {:.3} vs floor {:.2}) | cluster {} (f_L2 {:.3} \
+             vs {:.2}) | raster {} (linear footprint {:.1} MB vs L2 {:.1} MB) | persistent {}",
+            self.bm,
+            self.bn,
+            self.tiles,
+            self.waves,
+            self.wave_efficiency,
+            WAVE_EFFICIENCY_FLOOR,
+            if self.cluster { "ON " } else { "off" },
+            self.f_l2,
+            CLUSTER_F_L2_THRESHOLD,
+            if self.raster {
+                format!("ON GROUP_M {}", self.group_m)
+            } else {
+                "off".to_string()
+            },
+            self.linear_footprint_bytes / 1.0e6,
+            L2_BYTES / 1.0e6,
+            self.persistent
+        )
+    }
+}
+
+/// **The per-shape dispatcher: a PURE function of `(M, N, K, sm_count)`** (WAVE3_DOSSIER 3.7).
+///
+/// Device-free and unit-testable without a GPU, which is the point: a dispatcher that silently
+/// picks a different module than the one the round measured is guard G3's hazard in a new place, and
+/// the only defence is a test that pins its verdict at every benched shape and at every class
+/// boundary (`the_dispatcher_verdict_is_pinned_at_every_benched_shape`).
+///
+/// # The four decisions, and the three different roofs they act on
+///
+/// The levers are not interchangeable and that is exactly why a dispatcher is needed:
+///
+/// | lever | what it changes | which roof it lowers | zero when |
+/// |---|---|---|---|
+/// | tile | `I_cta`, and how much of the device one wave fills | occupancy, and the L2 roof | never -- it is always a choice |
+/// | cluster (1x2x1 on B) | `L2 -> SMEM` bytes: `(BM+BN)` becomes `(BM+BN/2)`, a flat 1.5x at W1 | the **7.00 TB/s L2** roof | the shape is not near that roof |
+/// | raster | `DRAM -> L2` bytes, by changing the WAVE FOOTPRINT; L2->SMEM bytes unchanged | the **3.35 TB/s HBM** roof, and L2 residency | one wave, or the linear footprint already fits L2 |
+/// | persistence | nothing about traffic; removes `X_fill` at `waves-1` boundaries | the **mainloop fixed-cost** floor | one wave |
+///
+/// So: take the WIDEST tile whose wave efficiency clears [`WAVE_EFFICIENCY_FLOOR`]; raster iff the
+/// grid is multi-wave AND the linear wave footprint blows [`L2_BYTES`]; persist iff multi-wave;
+/// cluster iff the L2-roof fraction of the **FINAL** configuration clears
+/// [`CLUSTER_F_L2_THRESHOLD`].
+///
+/// **That last word is load-bearing.** `gpt_d4096_up` FLIPS: today it is memory-thrashing at 58.5%
+/// of the L2 hit rate and the cluster is worth nothing (`f_L2` 0.585); once the raster makes its wave
+/// footprint L2-resident it lands at 0.955 and the cluster is worth 1.5x of a binding roof. The
+/// dispatcher is a function of the configuration it is about to emit, not of a measurement of an
+/// earlier one.
+pub fn wgmma_dispatch_plan(m: usize, n: usize, k: usize, sm_count: usize) -> DispatchPlan {
+    let sm = sm_count.max(1);
+    // 1. the widest tile whose wave efficiency clears the floor. The last candidate is taken
+    //    unconditionally: something must run, and the narrowest tile is the one with the most tiles.
+    let (mut bm, mut bn) = *DISPATCH_TILES.last().expect("a non-empty tile menu");
+    let (mut tiles, mut waves) = (0usize, 0usize);
+    let mut wave_efficiency = 0.0f64;
+    for &(cbm, cbn) in DISPATCH_TILES {
+        let t = m.div_ceil(cbm) * n.div_ceil(cbn);
+        let w = t.div_ceil(sm).max(1);
+        bm = cbm;
+        bn = cbn;
+        tiles = t;
+        waves = w;
+        wave_efficiency = t as f64 / (sm * w) as f64;
+        if wave_efficiency >= WAVE_EFFICIENCY_FLOOR {
+            break;
+        }
+    }
+    // 2. the raster: only when the LINEAR order's wave footprint blows L2 (which implies waves > 1).
+    let gx = n.div_ceil(bn);
+    let r_lin = sm as f64 / gx.min(sm) as f64;
+    let f_lin = r_lin * bm as f64 + (sm as f64 / r_lin) * bn as f64;
+    let linear_footprint_bytes = f_lin * k as f64 * 2.0;
+    let raster = waves > 1 && linear_footprint_bytes > L2_BYTES;
+    // `round(sqrt(W*BN/BM))` to the nearest EVEN value: 16 at 128x256, 12 at 128x128, 8 at 128x64.
+    // Even because a group must be a whole number of 2-CTA clusters, or it ends mid-cluster and the
+    // two ranks of that cluster compute different N tiles -- the one thing a B multicast forbids.
+    let group_m = if raster {
+        let want = (sm as f64 * bn as f64 / bm as f64).sqrt().round() as usize;
+        (want.max(2) / 2) * 2
+    } else {
+        1
+    };
+    // 3. persistence: any multi-wave grid.
+    let persistent = waves > 1;
+    // 4. the cluster, on the L2-roof fraction of the FINAL configuration.
+    let t_l2 = tiles as f64 * (bm + bn) as f64 * k as f64 * 2.0 / BW_L2;
+    let t_floor = waves as f64 * (TILE_FIXED_S + k.div_ceil(64) as f64 * K_STAGE_S);
+    let t_dram = dispatch_dram_bytes(m, n, k, bm, bn, sm, tiles, waves, group_m) / BW_HBM;
+    let binding = t_floor.max(t_l2).max(t_dram);
+    let f_l2 = if binding > 0.0 { t_l2 / binding } else { 0.0 };
+    let cluster = f_l2 >= CLUSTER_F_L2_THRESHOLD;
+    DispatchPlan {
+        bm,
+        bn,
+        tiles,
+        waves,
+        cluster,
+        raster,
+        group_m,
+        persistent,
+        wave_efficiency,
+        linear_footprint_bytes,
+        f_l2,
+    }
+}
+
+/// DRAM traffic of one launch, bytes -- the operand term (which the raster changes) plus `C`.
+///
+/// A single-wave grid reads every operand byte exactly once, whatever the order. A multi-wave grid
+/// reads `f(R) * K * 2` bytes per wave for `W` tiles, where `R` is the m-tile extent of a wave's
+/// footprint: `132/min(gx,132)` in launch order, `GROUP_M` under the raster. This reproduces the
+/// wave plan's own 2.485 / 1.326 / 2.384 / 0.797 GB to the digit, which is the check that it is the
+/// campaign's formula and not a second one.
+fn dispatch_dram_bytes(
+    m: usize,
+    n: usize,
+    k: usize,
+    bm: usize,
+    bn: usize,
+    sm: usize,
+    tiles: usize,
+    waves: usize,
+    group_m: usize,
+) -> f64 {
+    let c = (m * n * 4) as f64;
+    if waves <= 1 {
+        return ((m * k + n * k) * 2) as f64 + c;
+    }
+    let gx = n.div_ceil(bn);
+    let r = if group_m > 1 {
+        group_m as f64
+    } else {
+        sm as f64 / gx.min(sm) as f64
+    };
+    let f = r * bm as f64 + (sm as f64 / r) * bn as f64;
+    tiles as f64 * f * k as f64 * 2.0 / sm as f64 + c
+}
+
+/// **[`wgmma_dispatch_plan`] resolved to a REAL emitted module, or a loud decline.**
+///
+/// The second of the dossier's two laws on the dispatcher: every `(tile, cluster, raster,
+/// persistent)` combination it can produce must exist as a shipped [`WgmmaCfg`] with a key derivable
+/// from its own geometry, or the dispatcher must **decline** -- never fall back. A fallback here is
+/// how a publication ends up quoting a configuration that never ran.
+///
+/// The lookup is by GEOMETRY over [`wgmma_all_emittable`], not by a hand-written table of names: a
+/// name table is a second spelling of `derived_name` and could disagree with it. The diagnostic arms
+/// are excluded structurally -- an elided epilogue writes no `C` and `PersistentDrained` exists only
+/// to be compared against, so neither is dispatchable.
+pub fn wgmma_dispatch(
+    m: usize,
+    n: usize,
+    k: usize,
+    sm_count: usize,
+) -> Result<&'static WgmmaCfg, String> {
+    let p = wgmma_dispatch_plan(m, n, k, sm_count);
+    wgmma_all_emittable()
+        .into_iter()
+        .find(|c| {
+            c.bm == p.bm
+                && c.bn == p.bn
+                && c.dtype == WgmmaDtype::F16
+                && c.epilogue == EpilogueStore::V2
+                && c.l2_hint == L2Hint::None
+                && c.wait_depth == 0
+                && !c.fence_hoisted
+                && (c.multicast == Multicast::ClusterB) == p.cluster
+                && c.multicast != Multicast::ClusterA
+                && (c.raster as usize) == p.group_m.max(1)
+                && c.tiles.carries_ring() == p.persistent
+                && c.tiles != TileSchedule::PersistentDrained
+        })
+        .ok_or_else(|| {
+            format!(
+                "{UNSUPPORTED}: no emitted module for {m}x{n}x{k} on {sm_count} SMs -- the rule \
+                 wants {}. The dispatcher DECLINES rather than falling back, because a fallback is \
+                 how a round publishes a configuration that never ran.",
+                p.summary()
+            )
+        })
+}
+
 /// Look up a variant by entry name; panics loudly rather than mis-dispatching.
 /// Look up a configuration by entry name; panics loudly rather than mis-dispatching.
 ///
@@ -2912,11 +3168,31 @@ pub struct SweepRow {
     /// Round-log row name and `bench_instrument` sample-label component. ASCII, no whitespace.
     pub label: &'static str,
     pub cfg: &'static WgmmaCfg,
+    /// **The shapes THIS row is measured at**, named out of [`WGMMA_BENCH_GRID`].
+    ///
+    /// # Why a per-row list and not the cross product
+    ///
+    /// A sweep's cost is `rows x shapes`, and the schedule levers of wave 3 made the cross product
+    /// both expensive and *misleading*. The raster and persistence are **provably the identity** on
+    /// a single-wave grid, so running them at sq2048 buys one control (worth having, once) and four
+    /// more cells that can only report noise; conversely the 128x64 tile row answers a question that
+    /// only exists at sq1024, which the square-shape set never contained. Every dossier sweep row is
+    /// specified with its own shape list for exactly this reason, and a row measured somewhere its
+    /// mechanism is zero is a cell a reader will over-read.
+    ///
+    /// Rows that shipped before wave 3 keep [`WGMMA_SWEEP_SQUARES`] -- the three shapes rounds 1-3
+    /// measured them at -- so their numbers stay comparable to those logs without an argument about
+    /// denominators.
+    pub shapes: &'static [&'static str],
     /// What this row is in the table to answer, in one line.
     pub why: &'static str,
 }
 
 impl SweepRow {
+    /// Is this row measured at the shape labelled `label`?
+    pub fn runs_at(&self, label: &str) -> bool {
+        self.shapes.contains(&label)
+    }
     /// `Ok(())` iff this row can be generated at all -- i.e. it will be measured rather than
     /// declined. The message is `WgmmaCfg::validate`'s own, so the reason a row is absent from the
     /// ranked table is the generator's reason and not a second opinion.
@@ -3112,6 +3388,69 @@ pub const WGMMA_W1_MCB_V2_R16_P: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1_MCB_V2_R16
 };
 
+/// Persistence WITHOUT the raster, clustered -- the configuration [`wgmma_dispatch`] selects at
+/// `sq4096`, whose linear wave footprint (42.2 MB) already fits L2 and whose `f_L2` of 0.955 puts
+/// the cluster firmly on. Predicted +8.7 points.
+pub const WGMMA_W1_MCB_V2_P: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_p",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_p",
+    tiles: TileSchedule::Persistent,
+    ..WGMMA_W1_MCB_V2
+};
+
+/// Persistence with NEITHER the raster nor the cluster -- the configuration [`wgmma_dispatch`]
+/// selects at `gpt_d1024_up`, and the wave's largest single-shape number (+15.6 points).
+///
+/// That shape is the cleanest possible test of the mechanism: its footprint is 10.6 MB of a 50.0 MiB
+/// L2 so the raster is worthless, its `f_L2` is 0.55 so the cluster costs more than it saves, and
+/// `n_k = 16` k-stages against `X = 13.84 us` makes the per-tile fixed cost **56% of the tile** --
+/// more than three times its share at sq8192. Whatever this row moves is `X_fill` and nothing else.
+pub const WGMMA_W1_V2_P: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_v2_p",
+    key: "wgmma_nt_f16_128x256x64_s4_v2_p",
+    tiles: TileSchedule::Persistent,
+    ..WGMMA_W1_V2
+};
+
+/// **W3d -- the 128x64 tile, and the largest single-shape number in the wave-3 dossier (+56 points
+/// at sq1024).**
+///
+/// # Why the narrow tile, and why only there
+///
+/// `sq1024` at 128x256 is `8 x 4 = 32` CTAs on 132 SMs: **24.2% of the device**, and no raster, no
+/// cluster and no persistence touches it -- one wave, `f_L2 = 0.17`, an 8.4 MB footprint. The only
+/// lever that exists is the tile. Narrowing to 128x64 gives `8 x 16 = 128` tiles, **97.0% of the
+/// device**, and working the full cost model (with `X` scaled to the resident CTA count, which is
+/// what makes the 128x256 row reproduce its measured 21.5 us to 7%) puts it at `T_floor = 7.94 us`
+/// against cuBLAS's 7.0 -- **~88% of the peer, from 32.3%**. 128x128 gets only halfway (~62%).
+///
+/// It must NEVER be dispatched to a large shape: `I_cta = 128*64/(128+64) = 42.67` puts its L2 roof
+/// at 299 TFLOP/s, far below the 617-711 already measured at sq4096/sq8192. That is exactly what the
+/// wave-efficiency rule in [`wgmma_dispatch`] enforces -- take the WIDEST tile that clears 0.90 --
+/// and why the sweep runs this row at `sq2048` as well, where it must LOSE.
+///
+/// # What is new here, and what deliberately is not
+///
+/// New: an `m64n64k16` module family (the shape is on the ISA menu, so `WgmmaShape::new` accepts
+/// it), 32 accumulator registers per consumer thread instead of 128, and a 98 368 B ring instead of
+/// 196 672. Not new: the tile is still `64 * consumer_wgs` rows so `Schedule::Cooperative` stays
+/// legal, `BK` is still 64 so `bk * dtype.size() == 128` and the shipped 128-B swizzle reading
+/// carries over unchanged, and the epilogue is the shipped `st.global.v2.f32`.
+///
+/// `consumer_regs` stays at 168 rather than dropping to the ~85 that two CTAs/SM would need.
+/// Occupancy is decided by the STATIC per-thread allocation ptxas chooses, not by `setmaxnreg`, and
+/// `setmaxnreg.inc` to a target below what ptxas allocated is a JIT error rather than an
+/// optimisation. The census is what will say whether the second CTA is available; sq1024's +56
+/// points does not need it (128 tiles on 132 SMs is already 97.0%).
+pub const WGMMA_W3D_V2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x64x64_s4_v2",
+    key: "wgmma_nt_f16_128x64x64_s4_v2",
+    bn: 64,
+    consumer_regs: 168,
+    epilogue: EpilogueStore::V2,
+    ..WGMMA_W1
+};
+
 /// The **un-clustered** W1 with the fused v2 epilogue -- the fourth corner of the
 /// `{cluster off/on} x {scalar/v2}` square, and the row [`wgmma_w1_for`] ships below the cluster
 /// threshold.
@@ -3209,6 +3548,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s4_off",
         cfg: &WGMMA_W1,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "THE BASELINE. Rounds 1 and 2's measured row, unchanged: 128x256x64 s4, cluster 1x1x1, \
               I_cta 85.33, L2 roof 597 TFLOP/s at the measured 7.00 TB/s. It must land near round \
               2's 66.3% at sq4096 / 55.2% at sq8192, or the instrument moved and no other row is \
@@ -3217,6 +3557,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s4_mcb2",
         cfg: &WGMMA_W1_MCB,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "THE PRIMARY. The same tile, depth, layout and register split with a 1x2x1 cluster and \
               .multicast::cluster on B -- the WIDER operand. I_cta = 128*256/(128 + 256/2) = 128.0, \
               L2 roof ~896 TFLOP/s, above the peer's whole column (838.7/864.3/816.4 need \
@@ -3226,6 +3567,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s4_mc2",
         cfg: &WGMMA_W1_MC,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "THE CONTROL for the axis. The same tile with the cluster on the OTHER axis \
               (2x1x1, multicast A, the 128-row operand): I_cta 102.4, roof 717 TFLOP/s -- \
               arithmetically BELOW cuBLAS's 838.7 at sq4096. Round 2 measured it at 68.1% vs the \
@@ -3235,11 +3577,13 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s3_off",
         cfg: &WGMMA_W1_S3,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 3 without the cluster: the control arm of the depth axis",
     },
     SweepRow {
         label: "w1_s3_mcb2",
         cfg: &WGMMA_W1_MCB_S3,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 3 with the B cluster. Halving B's L2 traffic shortens the fill the ring is \
               hiding, so the depth that was right at full traffic need not be right at half -- and \
               round 2 already measured depth 3 BEATING depth 4 at sq8192 with no cluster at all \
@@ -3248,18 +3592,21 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s3_mc2",
         cfg: &WGMMA_W1_MC_S3,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 3 with the A cluster: the third setting at the same depth, so 'deeper', \
               'clustered' and 'which operand' are three separable facts rather than one",
     },
     SweepRow {
         label: "w1_s2_off",
         cfg: &WGMMA_W1_S2,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 2 without the cluster -- the shallow end, and the row that says how much of the \
               deficit is fill latency at all",
     },
     SweepRow {
         label: "w1_s2_mcb2",
         cfg: &WGMMA_W1_MCB_S2,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 2 with the B cluster. Pairing every measurable depth at all three cluster \
               settings is what keeps 'deeper is better' and 'this cluster is better' from being one \
               measurement",
@@ -3267,6 +3614,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s2_mc2",
         cfg: &WGMMA_W1_MC_S2,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 2 with the A cluster -- the shallow end of the control axis, and round 2's \
               worst 128x256 row (57.7% at sq4096), which is the shape of a ring too short to hide \
               the fill it still pays for",
@@ -3274,6 +3622,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s5_mc2",
         cfg: &WGMMA_W1_MC_S5,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 5 at 128x256. EXPECTED TO DECLINE on shared memory -- and the decline is the \
               point: no cluster changes the ring's size, whichever operand it multicasts, so the \
               depth axis stops at 4 for this tile at ALL THREE cluster settings",
@@ -3281,12 +3630,17 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_s6_mc2",
         cfg: &WGMMA_W1_MC_S6,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "Depth 6 at 128x256. Expected to decline by a wider margin, which pins the ceiling \
               rather than leaving it at one data point",
     },
     SweepRow {
         label: "w3c_s6_off",
         cfg: &WGMMA_W3C,
+        // Plus sq1024: D1 put the narrower tile there and the wave-3 dossier prices it at
+        // ~62% against the 128x64 row's ~88%, so the middle tile has to be ON the table or
+        // "128x64 is the sq1024 tile" is a two-point claim.
+        shapes: &["sq1024", "sq2048", "sq4096", "sq8192"],
         why: "D1's moderate-size arm (128x128x64 s6), which round 1 excluded because a second \
               kernel in ITS contender arm would have been an A/B against two things at once. Here \
               every row is scored against the same cuBLAS, so it is a row",
@@ -3294,6 +3648,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w3c_s6_mcb2",
         cfg: &WGMMA_W3C_MCB,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "The SQUARE tile with the B cluster. At bm == bn the two axes have IDENTICAL I_cta \
               (85.33 either way), so this row and w3c_s6_mc2 are the round's control on the claim \
               that the axis matters only through the traffic arithmetic: a difference between them \
@@ -3302,6 +3657,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w3c_s6_mc2",
         cfg: &WGMMA_W3C_MC,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "The square tile with the A cluster -- the other half of that control pair, and round \
               2's 56.9% at sq4096 against the un-clustered 57.5%",
     },
@@ -3309,6 +3665,25 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_v2",
         cfg: &WGMMA_W1_MCB_V2,
+        // Plus the two gpt_d1024 shapes: this row and `w1_v2` are the cluster PREDICATE's
+        // on/off pair, and a dispatch rule published from a table lacking either of them is a
+        // curve fitted to one crossing (WAVE3_DOSSIER 3.8, stated as a refusal).
+        //
+        // ...and `gpt_d4096_up`, because this row is ALSO the raster A/B's LINEAR CONTROL
+        // (`mcb_g1_lin` in the dossier's 1.6 table: `raster: 1` emits the two tile-origin
+        // instructions this family has emitted since round 1 byte for byte). gpt_d4096_up is the
+        // raster's headline shape -- the one where the linear order needs 3.541 TB/s against a
+        // 3.35 TB/s HBM peak -- and a headline measured without its own control at its own shape
+        // is a number with nothing to be a difference from. Every shape but `sq1024`, where the
+        // cluster is provably off (f_L2 0.28) and this row would answer a question nobody asked.
+        shapes: &[
+            "sq2048",
+            "sq4096",
+            "sq8192",
+            "gpt_d1024_down",
+            "gpt_d1024_up",
+            "gpt_d4096_up",
+        ],
         why: "LEVER 1 (v2 stores). Round 1's PTX dump shows 128 scalar predicated st.global.f32 per \
               consumer thread whose pairs are ADJACENT f32 lanes of one row: 8192 half-empty \
               32-byte sector requests per CTA where 4096 full ones would do. This row fuses each \
@@ -3318,6 +3693,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_ef",
         cfg: &WGMMA_W1_MCB_EF,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "LEVER 2a (C stores .L2::evict_first). C is written once and never read, so every C \
               line resident in L2 evicts an operand line a neighbouring CTA is about to want. An \
               ADVISORY hint: the hardware may ignore it, and a null result is a publishable result. \
@@ -3328,6 +3704,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_efol",
         cfg: &WGMMA_W1_MCB_EFOL,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "LEVER 2b (C evict_first AND TMA operands evict_last). The ISA question this row had \
               to answer first is whether a bulk-tensor copy can carry a cache policy at all: it \
               can -- cp.async.bulk.tensor takes .L2::cache_hint plus a trailing policy operand, \
@@ -3337,6 +3714,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_v2ef",
         cfg: &WGMMA_W1_MCB_V2_EF,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "BOTH levers. Two single-fact deltas cannot say whether the levers compose -- a v2 \
               store that halves the request count changes what the eviction hint is even about -- \
               so composition is its own row rather than an addition performed by a reader",
@@ -3344,6 +3722,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_nostore",
         cfg: &WGMMA_W1_MCB_NOSTORE,
+        shapes: WGMMA_SWEEP_SQUARES,
         why: "THE EPILOGUE-ELIDED DIAGNOSTIC, not a kernel: it computes the GEMM and writes no C, \
               so (this row) - (w1_s4_mcb2) at a fixed shape IS the epilogue's cost, measured on ONE \
               kernel instead of inferred from two shapes. The accumulators are folded into one \
@@ -3353,6 +3732,16 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_v2",
         cfg: &WGMMA_W1_V2,
+        // The cluster predicate's OFF arm at both gpt_d1024 shapes, and the 128x256 control
+        // the 128x64 tile row is scored against at sq1024.
+        shapes: &[
+            "sq1024",
+            "sq2048",
+            "sq4096",
+            "sq8192",
+            "gpt_d1024_down",
+            "gpt_d1024_up",
+        ],
         why: "The FOURTH CORNER of the {cluster} x {v2} square, and the small-shape half of the \
               shipped rule (wgmma_w1_for below the cluster threshold). The 2026-08-11 round \
               measured v2 only on the clustered lineage (+25.2/+15.3/+10.1 points); this row \
@@ -3363,6 +3752,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_v2_r16",
         cfg: &WGMMA_W1_MCB_V2_R16,
+        shapes: WGMMA_RASTER_SHAPES,
         why: "WAVE 3 LEVER 1 (grouped raster, GROUP_M = 16 = the derived optimum sqrt(W*BN/BM) for \
               a 128x256 tile on 132 SMs). ONE fact off the shipped w1_mcb_v2, WHICH IS THIS ARM'S \
               CONTROL: `raster: 1` emits the same two tile-origin instructions the family has \
@@ -3379,6 +3769,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_v2_r32",
         cfg: &WGMMA_W1_MCB_V2_R32,
+        shapes: WGMMA_RASTER_BRACKET_SHAPES,
         why: "THE BRACKET. f(32) = 5152 against f(16) = 4160: +24% operand traffic per wave by the \
               same formula that predicts the win. It must land BETWEEN the linear control and r16. \
               A bracket that TIES r16 refutes the traffic model even if both beat linear, and the \
@@ -3388,6 +3779,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_v2_r16_pstop",
         cfg: &WGMMA_W1_MCB_V2_R16_PSTOP,
+        shapes: WGMMA_PERSIST_SHAPES,
         why: "WAVE 3 LEVER 2, THE DIAGNOSTIC. Persistent tile loop WITHOUT the ring carry: the \
               producer waits for every consumer in the cluster to finish tile t before touching \
               the ring again. It separates two claims the one number would confound -- 'persistence \
@@ -3398,6 +3790,7 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_v2_r16_p",
         cfg: &WGMMA_W1_MCB_V2_R16_P,
+        shapes: WGMMA_PERSIST_SHAPES,
         why: "WAVE 3 LEVER 2, THE ARM (persistent, continuous ring). X_fill = 7.85 us per tile \
               boundary is unhidable today -- at a wave boundary no CTA on the device has anything to \
               overlap it with, and the fill runs at 3.31 TB/s = 98.7% of HBM peak, so it is a \
@@ -3406,6 +3799,40 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
               gpt_d1024_up (n_k = 16 makes X 56% of its tile), +11.7 at gpt_d4096_up, +8.7 at \
               sq4096, +6.8 at sq8192, and EXACTLY ZERO at sq2048, which is one wave and is the \
               control that must tie",
+    },
+    // --- wave 3 lever 3: per-shape tile dispatch -------------------------------------------------
+    SweepRow {
+        label: "w3d_s4_v2",
+        cfg: &WGMMA_W3D_V2,
+        shapes: WGMMA_TILE_DISPATCH_SHAPES,
+        why: "WAVE 3 LEVER 3, THE TILE ROW (128x64, a NEW m64n64k16 module family). sq1024 at \
+              128x256 is 32 CTAs of 132 -- 24.2% of the device -- and NOTHING else in wave 3 \
+              touches it: one wave, so no raster and no persistence, and f_L2 = 0.17, so no \
+              cluster. At 128x64 it is 128 tiles = 97.0% of the device, T_floor 7.94 us against \
+              cuBLAS's 7.0: predicted ~88%, from a measured 32.3%, the largest single-shape number \
+              in the dossier. It is ALSO run at sq2048, where it must LOSE -- I_cta drops 85.33 -> \
+              42.67 and the L2 roof with it -- because that loss is what makes 'widest tile whose \
+              wave efficiency clears 0.90' a rule instead of a fit to one point",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_p",
+        cfg: &WGMMA_W1_MCB_V2_P,
+        shapes: &["sq4096", "sq8192"],
+        why: "The DISPATCHER's sq4096 configuration: persistent, clustered, NO raster (that \
+              shape's linear wave footprint is 42.2 MB of a 50.0 MiB L2, so the raster is provably \
+              worth nothing and including it would be a second fact in a one-fact A/B). Against \
+              w1_mcb_v2 it is persistence alone at a shape the raster cannot help; against \
+              w1_mcb_v2_r16_p at sq8192 it is the raster alone on top of persistence",
+    },
+    SweepRow {
+        label: "w1_v2_p",
+        cfg: &WGMMA_W1_V2_P,
+        shapes: &["gpt_d1024_up", "sq2048"],
+        why: "The DISPATCHER's gpt_d1024_up configuration, and the cleanest test of persistence \
+              anywhere in the suite: no raster (10.6 MB footprint), no cluster (f_L2 0.54), and \
+              n_k = 16 k-stages against X = 13.84 us, so the per-tile fixed cost is 56% of the \
+              tile. Whatever this row moves against w1_v2 is X_fill and nothing else. sq2048 is \
+              its single-wave control, where it must tie w1_v2 exactly",
     },
 ];
 
@@ -3514,8 +3941,55 @@ pub fn wgmma_sweep_measurable() -> Vec<&'static SweepRow> {
 ///
 /// `sq2048` stays as the single-wave CONTROL: every schedule arm must tie there, and a movement is
 /// the instrument rather than the kernel (WAVE3_DOSSIER 1.6, 2.9).
-pub const WGMMA_SWEEP_SHAPES: &[&str] =
-    &["sq2048", "sq4096", "sq8192", "gpt_d1024_up", "gpt_d4096_up"];
+///
+/// **This is the UNION, not the cross product.** Since wave 3 each [`SweepRow`] carries its own
+/// [`SweepRow::shapes`] and the round measures `sum over rows of |row.shapes|` cells, not
+/// `rows x shapes` -- see [`SweepRow::shapes`] for why a lever measured where it is provably zero is
+/// worse than not measured at all. Everything named here must appear in at least one row's list, or
+/// the shape is a column of "-- absent" (asserted by
+/// `the_sweep_invocation_and_shapes_name_things_that_exist`).
+pub const WGMMA_SWEEP_SHAPES: &[&str] = &[
+    "sq1024",
+    "sq2048",
+    "sq4096",
+    "sq8192",
+    "gpt_d1024_up",
+    "gpt_d1024_down",
+    "gpt_d4096_up",
+];
+
+/// The three square shapes rounds 1-3 measured every row at, and the default for every row that
+/// shipped before wave 3 -- so their numbers stay directly comparable to those logs.
+pub const WGMMA_SWEEP_SQUARES: &[&str] = &["sq2048", "sq4096", "sq8192"];
+
+/// The raster's shapes (WAVE3_DOSSIER 1.6): the two multi-wave shapes whose LINEAR footprint blows
+/// L2 (`gpt_d4096_up` at 2.73x, `sq8192` at 2.86x), the two multi-wave shapes whose footprint
+/// already fits and where the lever is therefore predicted FLAT, and one single-wave control where
+/// it is provably the identity.
+pub const WGMMA_RASTER_SHAPES: &[&str] =
+    &["gpt_d4096_up", "sq8192", "sq4096", "gpt_d1024_up", "sq2048"];
+
+/// The raster BRACKET's shapes: only the two where the lever fires at all. The bracket answers "is
+/// the mechanism traffic?", and that question has no content where the effect is zero.
+pub const WGMMA_RASTER_BRACKET_SHAPES: &[&str] = &["gpt_d4096_up", "sq8192"];
+
+/// Persistence's shapes (WAVE3_DOSSIER 2.9): the four multi-wave shapes, headed by `gpt_d1024_up`
+/// (largest predicted delta, and no raster or cluster confound), plus the single-wave control that
+/// all three arms must tie at.
+pub const WGMMA_PERSIST_SHAPES: &[&str] =
+    &["gpt_d1024_up", "sq4096", "sq8192", "gpt_d4096_up", "sq2048"];
+
+/// The tile-dispatch row's shapes (WAVE3_DOSSIER 3.8): `sq1024`, where a 128x256 tile is 32 CTAs of
+/// 132 and a 128x64 one is 128, and `sq2048`, where the narrower tile must LOSE -- which is what
+/// makes the wave-efficiency rule a rule rather than a fit to one point.
+pub const WGMMA_TILE_DISPATCH_SHAPES: &[&str] = &["sq1024", "sq2048"];
+
+/// The cluster PREDICATE's shapes (WAVE3_DOSSIER 3.8): the two single-wave-or-L2-bound shapes where
+/// the cluster is the sole variable. `gpt_d1024_down` sits exactly at the 7.00 TB/s roof by
+/// construction (it IS the `BW_L2` calibration) and is predicted the table's smallest ON;
+/// `gpt_d1024_up` at `f_L2 = 0.54` is predicted a LOSS. A rule fitted to one crossing is a curve
+/// fitted to two points, which is why both are here.
+pub const WGMMA_CLUSTER_PREDICATE_SHAPES: &[&str] = &["gpt_d1024_down", "gpt_d1024_up"];
 
 /// The headline shape of the ranked table: the first of D1 4.5's two prediction points.
 pub const WGMMA_SWEEP_HEADLINE: &str = "sq4096";
@@ -6503,7 +6977,16 @@ mod tests {
         // helps". Both are one field off `w1_mcb_v2_r16` and both are distinct modules -- the
         // drained arm even has a different SMEM footprint (one extra mbarrier for the tile
         // rendezvous), so a shared key would also have loaded the wrong carveout.
-        assert_eq!(mods.len(), 27);
+        // 27 -> 30 on 2026-08-12 with WAVE 3 lever 3, the per-shape dispatcher: the three
+        // configurations `wgmma_dispatch` selects that no earlier row spells. `w1_mcb_v2_p`
+        // (persistent + cluster, NO raster) is sq4096's verdict -- that shape's linear wave
+        // footprint is 42.2 MB of a 50.0 MiB L2, so a raster there would be a second fact in a
+        // one-fact A/B. `w1_v2_p` (persistent, no cluster, no raster) is gpt_d1024_up's, the
+        // cleanest test of persistence in the suite. `w3d_s4_v2` is the NEW m64n64k16 128x64
+        // family -- 32 accumulator registers per consumer thread instead of 128 and a 98 368 B
+        // ring instead of 196 672 -- and it is the only thing in wave 3 that moves sq1024, where
+        // a 128x256 tile is 32 CTAs of 132.
+        assert_eq!(mods.len(), 30);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -8540,6 +9023,43 @@ mod tests {
             assert!(r.label.is_ascii() && !r.label.contains(char::is_whitespace));
             assert!(r.why.is_ascii() && r.why.len() > 40, "{}", r.label);
         }
+        // **Since wave 3 the sweep is a UNION, not a cross product**: each row names the shapes it
+        // is measured at, because a raster or persistence cell at a single-wave shape can only
+        // report noise and a reader will over-read it. Three properties keep that honest -- every
+        // named shape is a real grid row (a typo would be a rented minute spent on a panic), no row
+        // is measured nowhere, and `WGMMA_SWEEP_SHAPES` is EXACTLY the union, so a shape in the
+        // header that no row runs is a column of "-- not measured" and a shape a row runs that the
+        // header omits would never be resolved to a `GemmPoint` at all.
+        let mut union: Vec<&str> = Vec::new();
+        for r in WGMMA_SWEEP_GRID {
+            assert!(
+                !r.shapes.is_empty(),
+                "{}: a row measured at no shape is a row that is not measured",
+                r.label
+            );
+            let mut seen: Vec<&str> = r.shapes.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), r.shapes.len(), "{}: duplicate shape", r.label);
+            for s in r.shapes {
+                assert!(
+                    WGMMA_BENCH_GRID.iter().any(|g| g.label == *s),
+                    "{}: {s:?} is not a bench grid row",
+                    r.label
+                );
+                assert!(r.runs_at(s), "{}: runs_at disagrees with shapes", r.label);
+                if !union.contains(s) {
+                    union.push(s);
+                }
+            }
+        }
+        union.sort_unstable();
+        let mut header: Vec<&str> = WGMMA_SWEEP_SHAPES.to_vec();
+        header.sort_unstable();
+        assert_eq!(
+            union, header,
+            "WGMMA_SWEEP_SHAPES must be exactly the union of the rows' own shape lists"
+        );
         // The headline three-arm comparison exists, its arms are ONE fact apart, and all three are
         // in the table: baseline (no cluster), primary (B multicast, the wider operand), control
         // (A multicast, the axis round 2 measured).
@@ -9717,6 +10237,347 @@ mod tests {
             wgmma_w1_for(usize::MAX, usize::MAX).name,
             WGMMA_W1_MCB_V2.name
         );
+    }
+
+    /// **WAVE 3 lever 3, law (a): the dispatcher's verdict is PINNED at every benched shape.**
+    ///
+    /// The dossier states this as a law on the dispatcher itself, and the reason is guard G3 in a
+    /// new place: `Gpu::function` caches on a module key alone, so a rule that silently selects a
+    /// different module than the one the round measured publishes a configuration that never ran --
+    /// and unlike a mis-keyed row, nothing in the emitted text would look wrong. The defence is a
+    /// device-free test that spells the whole verdict out, so a change to any threshold, constant or
+    /// tile menu has to come here and be argued rather than merely compile.
+    ///
+    /// Each row is the dossier's 3.6 dispatch table entry for that shape, and the `f_L2` column
+    /// reproduces its 3.2 column: 0.955 at `gpt_d4096_up` (the shape whose cluster decision the
+    /// raster FLIPS, evaluated on the post-raster configuration exactly as the dossier requires),
+    /// 0.55 at `gpt_d1024_up`, and 0.769 at `sq2048` -- the last of which is the tightest call in
+    /// the table at 1.4% below the 0.78 threshold, which is why it is asserted to three digits.
+    #[test]
+    fn the_dispatcher_verdict_is_pinned_at_every_benched_shape() {
+        struct Pin {
+            label: &'static str,
+            bm: usize,
+            bn: usize,
+            tiles: usize,
+            waves: usize,
+            cluster: bool,
+            group_m: usize,
+            persistent: bool,
+            f_l2: f64,
+            cfg: &'static WgmmaCfg,
+        }
+        let pin = |label, bm, bn, tiles, waves, cluster, group_m, persistent, f_l2, cfg| Pin {
+            label,
+            bm,
+            bn,
+            tiles,
+            waves,
+            cluster,
+            group_m,
+            persistent,
+            f_l2,
+            cfg,
+        };
+        let want = [
+            // sq1024: the ONLY shape the tile lever moves. 128x256 is 32 CTAs of 132 (24.2% of the
+            // device); 128x64 is 128 tiles = 97.0%, and no other lever fires -- one wave, so no
+            // raster and no persistence, and f_L2 0.28, so no cluster.
+            pin(
+                "sq1024",
+                128,
+                64,
+                128,
+                1,
+                false,
+                1,
+                false,
+                0.2764,
+                &WGMMA_W3D_V2,
+            ),
+            // sq2048 gets NOTHING from wave 3, and that is a finding: one wave (raster and
+            // persistence are provably the identity), 97.0% wave efficiency at the widest tile, and
+            // f_L2 just under the cluster threshold -- where round 3 measured the cluster LOSING
+            // 8.0% on the tight s3 pair.
+            pin(
+                "sq2048",
+                128,
+                256,
+                128,
+                1,
+                false,
+                1,
+                false,
+                0.7687,
+                &WGMMA_W1_V2,
+            ),
+            // sq4096: persistence + cluster, NO raster -- its linear wave footprint is 42.2 MB of a
+            // 50.0 MiB L2, so the raster is provably worth nothing there.
+            pin(
+                "sq4096",
+                128,
+                256,
+                512,
+                4,
+                true,
+                1,
+                true,
+                0.9552,
+                &WGMMA_W1_MCB_V2_P,
+            ),
+            // sq8192: all three schedule levers, the raster as insurance (142.9 -> 68.2 MB).
+            pin(
+                "sq8192",
+                128,
+                256,
+                2048,
+                16,
+                true,
+                16,
+                true,
+                1.0,
+                &WGMMA_W1_MCB_V2_R16_P,
+            ),
+            // gpt_d1024_up: persistence ALONE, and the cleanest test of it anywhere in the suite --
+            // 10.6 MB of footprint (no raster), f_L2 0.55 (no cluster), and n_k = 16 k-stages
+            // against X = 13.84 us, so the per-tile fixed cost is 56% of the tile.
+            pin(
+                "gpt_d1024_up",
+                128,
+                256,
+                512,
+                4,
+                false,
+                1,
+                true,
+                0.5528,
+                &WGMMA_W1_V2_P,
+            ),
+            // gpt_d1024_down: the predicate's most informative point -- a single-wave shape sitting
+            // exactly at the L2 roof, where the cluster is the SOLE variable.
+            pin(
+                "gpt_d1024_down",
+                128,
+                256,
+                128,
+                1,
+                true,
+                1,
+                false,
+                0.9552,
+                &WGMMA_W1_MCB_V2,
+            ),
+            // gpt_d4096_up: the only shape where all three fire, and the one whose cluster decision
+            // the RASTER flips (0.585 pre-raster -> 0.955 on the configuration actually emitted).
+            pin(
+                "gpt_d4096_up",
+                128,
+                256,
+                2048,
+                16,
+                true,
+                16,
+                true,
+                0.9553,
+                &WGMMA_W1_MCB_V2_R16_P,
+            ),
+        ];
+        assert_eq!(
+            want.len(),
+            WGMMA_BENCH_GRID.len(),
+            "every benched shape must have a PINNED verdict -- a new grid row without one is a \
+             shape the round would measure under a rule nobody wrote down"
+        );
+        for w in &want {
+            let p = WGMMA_BENCH_GRID
+                .iter()
+                .find(|g| g.label == w.label)
+                .unwrap_or_else(|| panic!("{}: not a bench grid row", w.label));
+            let plan = wgmma_dispatch_plan(p.m, p.n, p.k, HOPPER_SM_COUNT);
+            assert_eq!((plan.bm, plan.bn), (w.bm, w.bn), "{}: tile", w.label);
+            assert_eq!((plan.tiles, plan.waves), (w.tiles, w.waves), "{}", w.label);
+            assert_eq!(plan.cluster, w.cluster, "{}: cluster", w.label);
+            assert_eq!(plan.raster, w.group_m > 1, "{}: raster", w.label);
+            assert_eq!(plan.group_m, w.group_m, "{}: GROUP_M", w.label);
+            assert_eq!(plan.persistent, w.persistent, "{}: persistence", w.label);
+            assert!(
+                (plan.f_l2 - w.f_l2).abs() < 5e-4,
+                "{}: f_L2 is {:.4}, pinned at {:.4}",
+                w.label,
+                plan.f_l2,
+                w.f_l2
+            );
+            // WAVE3_DOSSIER 0.3's closed form: for any power-of-two tile count in [128, 4096],
+            // `ceil(T/132)*132 = T*33/32` exactly, so EVERY shape in this suite lands on the same
+            // 32/33 wave efficiency and quantization is a flat 3.03% that no lever in wave 3
+            // touches. If a shape ever misses it, the tile menu moved under the dispatcher.
+            assert!(
+                (plan.wave_efficiency - 32.0 / 33.0).abs() < 1e-12,
+                "{}: wave efficiency {:.6}, not the suite's 32/33",
+                w.label,
+                plan.wave_efficiency
+            );
+            // ...and the verdict resolves to a REAL module, which is the second law.
+            let got = wgmma_dispatch(p.m, p.n, p.k, HOPPER_SM_COUNT)
+                .unwrap_or_else(|e| panic!("{}: {e}", w.label));
+            assert_eq!(got.key, w.cfg.key, "{}: module", w.label);
+            assert_eq!(got.name, got.derived_name(), "{}", w.label);
+            assert!(
+                wgmma_module(got, &license()).is_ok(),
+                "{}: the dispatched module must generate",
+                w.label
+            );
+        }
+        // The four wave footprints the dossier's 1.2 table states to the tenth of a megabyte, from
+        // the same formula the dispatcher uses -- the check that the rule's arithmetic IS the
+        // campaign's and not a second one that happens to agree on the verdicts.
+        for (label, mb) in [
+            ("sq4096", 42.2),
+            ("sq8192", 142.9),
+            ("gpt_d1024_up", 10.6),
+            ("gpt_d4096_up", 136.4),
+        ] {
+            let p = WGMMA_BENCH_GRID.iter().find(|g| g.label == label).unwrap();
+            let got = wgmma_dispatch_plan(p.m, p.n, p.k, HOPPER_SM_COUNT).linear_footprint_bytes;
+            assert!(
+                (got / 1.0e6 - mb).abs() < 0.05,
+                "{label}: linear wave footprint {:.1} MB, dossier says {mb} MB",
+                got / 1.0e6
+            );
+        }
+    }
+
+    /// **WAVE 3 lever 3, law (a) continued: the verdict is pinned at every CLASS BOUNDARY too.**
+    ///
+    /// Three thresholds decide four facts, and each is asserted from BOTH sides with the smallest
+    /// step the geometry admits -- because a dispatcher tested only at the seven benched shapes is a
+    /// lookup table with a proof obligation it never discharges. The fourth case is the decline: the
+    /// rule must land on a real emitted module or say so, never fall back.
+    #[test]
+    fn the_dispatcher_verdict_is_pinned_at_every_class_boundary() {
+        let plan = |m, n, k| wgmma_dispatch_plan(m, n, k, HOPPER_SM_COUNT);
+        // --- 1. the wave-efficiency floor, from both sides at one tile of resolution -------------
+        // 119 tiles of 132 is 0.9015 and clears; 118 is 0.8939 and does not.
+        assert_eq!(
+            plan(128 * 119, 256, 1024).bn,
+            256,
+            "119/132 = 0.9015 clears"
+        );
+        assert_eq!(
+            plan(128 * 118, 256, 1024).bn,
+            64,
+            "118/132 = 0.8939 fails at 128x256 -- and the ratio is IDENTICAL at 128x128 and \
+             128x64, because narrowing the tile multiplies tiles and waves together. The last \
+             candidate is therefore taken unconditionally: something must run, and the narrowest \
+             tile is the one with the most tiles."
+        );
+        // ...and the MIDDLE tile is reachable, or the menu has two entries wearing three names.
+        assert_eq!(
+            plan(128 * 65, 256, 1024).bn,
+            128,
+            "65 tiles at 128x256 is 0.49; 130 at 128x128 is 0.985"
+        );
+        // --- 2. the raster's L2 footprint, from both sides at one k-stage of resolution ----------
+        // At 4096x4096 the linear order's f(R) is 5152 rows, so the footprint crosses the 50.0 MiB
+        // L2 between K = 5056 (52 097 024 B) and K = 5120 (52 756 480 B) -- 0.6% apart.
+        assert!(
+            !plan(4096, 4096, 5056).raster,
+            "52.10 MB fits a 52.43 MB L2"
+        );
+        let over = plan(4096, 4096, 5120);
+        assert!(over.raster, "52.76 MB does not");
+        assert_eq!(
+            over.group_m, 16,
+            "GROUP_M = round(sqrt(W*BN/BM)) to the nearest EVEN value: sqrt(264) = 16.25"
+        );
+        // The raster is PROVABLY the identity on a single-wave grid, whatever the footprint.
+        assert!(
+            !plan(1024, 1024, 1 << 20).raster,
+            "one wave: every tile is resident simultaneously, so no permutation of the launch \
+             order can change a single byte of traffic"
+        );
+        // --- 3. the cluster's f_L2 threshold, from both sides at one k-stage of resolution -------
+        // At 2048x2048 (128 tiles, one wave) f_L2 crosses 0.78 between n_k = 33 and n_k = 34.
+        let off = plan(2048, 2048, 33 * 64);
+        let on = plan(2048, 2048, 34 * 64);
+        assert!(!off.cluster && off.f_l2 < CLUSTER_F_L2_THRESHOLD, "{off:?}");
+        assert!(on.cluster && on.f_l2 >= CLUSTER_F_L2_THRESHOLD, "{on:?}");
+        assert!(
+            on.f_l2 - off.f_l2 < 0.01,
+            "the bracket must be TIGHT or it is not a boundary test: {:.4} vs {:.4}",
+            off.f_l2,
+            on.f_l2
+        );
+        // --- 4. THE DECLINE, which is the law's whole point --------------------------------------
+        // 65 m-tiles by 2 n-tiles selects the 128x128 tile (0.985 wave efficiency), and a long
+        // enough K puts its f_L2 over 0.78 -- a (128x128, cluster ON, no raster, one tile per CTA)
+        // verdict that no shipped row spells, because the square tile's clustered arm carries the
+        // SCALAR epilogue. The rule must say so.
+        let p = plan(128 * 65, 256, 240 * 64);
+        assert_eq!(
+            (p.bm, p.bn, p.cluster, p.persistent),
+            (128, 128, true, false)
+        );
+        let why = wgmma_dispatch(128 * 65, 256, 240 * 64, HOPPER_SM_COUNT)
+            .expect_err("this verdict has no emitted module and must DECLINE, never fall back");
+        assert!(why.starts_with(UNSUPPORTED), "{why}");
+        assert!(
+            why.contains("128x128 tile") && why.contains("cluster ON"),
+            "the decline must name the configuration it wanted, or an operator cannot tell \
+             whether the rule or the menu is wrong: {why}"
+        );
+    }
+
+    /// **WAVE 3 lever 3, law (b): every verdict the dispatcher can reach at a benched shape is a
+    /// sweep row that is MEASURED at that shape, with a control beside it.**
+    ///
+    /// This is what makes the round measure THE RULE rather than a table of arms a reader has to
+    /// assemble a rule from. It is also the property that would silently rot first: `SweepRow`
+    /// carries its own shape list since wave 3 (the cross product is both expensive and misleading
+    /// -- a lever measured where it is provably zero is a cell a reader will over-read), so a row
+    /// whose list drifts away from the shapes the dispatcher sends it would leave the rule's own
+    /// choice unmeasured while every other cell still filled in.
+    #[test]
+    fn every_shape_the_dispatcher_selects_is_measured_at_that_shape() {
+        for p in WGMMA_BENCH_GRID {
+            let cfg = wgmma_dispatch(p.m, p.n, p.k, HOPPER_SM_COUNT)
+                .unwrap_or_else(|e| panic!("{}: {e}", p.label));
+            let row = WGMMA_SWEEP_GRID
+                .iter()
+                .find(|r| r.cfg.key == cfg.key)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: the dispatcher selects {} and no sweep row carries it, so the rule's \
+                         own choice would go unmeasured",
+                        p.label, cfg.name
+                    )
+                });
+            assert!(
+                row.generatable().is_ok(),
+                "{}: the dispatcher selects {}, which DECLINES",
+                p.label,
+                row.label
+            );
+            assert!(
+                row.runs_at(p.label),
+                "{}: the dispatcher selects row {} and that row is not measured at this shape \
+                 (its shapes are {:?})",
+                p.label,
+                row.label,
+                row.shapes
+            );
+            // A verdict with no other arm at the same shape is a number with nothing to be a
+            // difference from -- and every claim in this wave is a difference.
+            assert!(
+                WGMMA_SWEEP_GRID.iter().any(|r| r.cfg.key != cfg.key
+                    && r.runs_at(p.label)
+                    && !r.cfg.epilogue.is_diagnostic_only()
+                    && r.generatable().is_ok()),
+                "{}: {} is the only measured row at this shape",
+                p.label,
+                row.label
+            );
+        }
     }
 
     /// **Wave 2's two invocations name real things, in the order the standing rules require.**
