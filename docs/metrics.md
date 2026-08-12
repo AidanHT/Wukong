@@ -18,8 +18,12 @@ hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-ro
 > H100. **Every H100 figure in this document is ITERATION-grade, not publication-grade, and is
 > recorded under that label:** the rounds ran in a Modal container whose user cannot call
 > `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 rules that "Container rounds are *iteration*
-> data; VM rounds are *publication* data" — each cited log stamps itself `ITERATION data, not
-> publication data`. In place of the lock each round recorded its own before/after clocks and **two
+> data; VM rounds are *publication* data" — every round behind these figures records the refusal
+> itself (`[clock] lock: refused (…); running unlocked`), and five of them also stamp themselves
+> `ITERATION data, not publication data` in an all-caps banner; `BENCHMARKS.md` names which five, and
+> why the K-sweep and the four non-GEMM rounds carry only the `[clock]` line. The label here is this
+> document's, applied uniformly because the premise every round records is uniform.
+> In place of the lock each round recorded its own before/after clocks and **two
 > rounds refused themselves** on +6.82% drift; one shape refused on a ±15.47% *peer* floor, and those
 > refusals are printed in `BENCHMARKS.md` as results. A drift gate is the weaker instrument, though —
 > it sees a clock that *changed*, not one parked at the wrong steady state for the whole round — so
