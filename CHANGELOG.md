@@ -5,6 +5,41 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### GPU — the Hopper `wgmma` GEMM family gets a product call site
+Until now the warpgroup-MMA + TMA kernel that the whole Act-2 campaign measures had **no caller
+outside its own test module**: no `.wk` program could reach it, on any device. `--backend=gpu` now
+routes a recognized `C = A·Bᵀ` through it on a Hopper part, and through the pre-Hopper launcher
+everywhere else.
+
+- The decision is a pure function of the *probed* `GpuTarget` (`gpu_accel::gemm_route_for`), and it
+  is `cc_major == 9` rather than `>= (9,0)` because `sm_90a` is architecture-**locked** — a test pins
+  the rule to `ptx_wgmma::Sm90aLicense` over the whole capability grid, so the two cannot drift.
+- Config selection goes through **one** seam function that delegates to the generator's shipped
+  regime rule; wave 3's per-shape dispatcher replaces exactly that body.
+- **Decline, never wrong.** Architecture, shape, an unencodable tensor map (`K % 8 != 0`), an output
+  past the epilogue's `u32` index, a ring larger than the device's opt-in shared memory, or an
+  `UNSUPPORTED` from the generator all fall back to the existing path with unchanged results; only a
+  real driver failure is an error. Ragged M/N/K are not declines. The launcher's `assert!`
+  preconditions are pre-decided driver-side so an offload can never abort a user's program — and an
+  **odd `N`**, which the launcher does *not* check, is declined here: both shipped rows use the
+  `st.global.v2.f32` epilogue, whose pair is 8-byte aligned only when `N` is even, and a misaligned
+  store leaves the CUDA context stickily errored for the rest of the process.
+- On Hopper the route converts both operands to f16 on the host, so the plain-GEMM offload changes
+  arithmetic class there — inside the existing CPU↔GPU *tolerance* contract, and the driver's device
+  gate now sizes its band from the route rather than from the device. `WUKONG_GPU_NO_WGMMA=1` forces
+  the pre-Hopper path in the same binary.
+- The fused-epilogue hook (`sgemm_nt_epi`) is deliberately unchanged: no wgmma module computes
+  `act(A·Bᵀ + bias)` yet, and splicing a second pointwise launch onto the plain GEMM would be the
+  unfused chain wave 4 exists to delete. The seam and the exact kernel-side gap are named in place.
+- **Everything up to the launch is checked on a laptop that cannot launch it.** The route, the
+  selected config, every decline and the resulting `LaunchPlan` are pure functions of the shape and
+  the probed capability, so the end-to-end Hopper gate is `#[ignore]`d while its *shape list* is
+  asserted device-free: each shape must not decline under the H100 opt-in SMEM budget, its grid must
+  be a multiple of its cluster on every axis, and exactly one must cross the generator's own
+  `W1_CLUSTER_MIN_OUTPUT_ELEMS` — because the clustered row compiles `.reqnctapercluster` into the
+  entry, and a gate whose shapes all fell on one side of a re-measured threshold would silently stop
+  covering the arm with the extra launch mechanism while still passing.
+
 ### Documentation — every published claim is scoped to the device and the peer it was measured against
 `GPU_RETARGET_PLAN.md` §10 asks for "no published claim anywhere in the repo that silently
 generalizes a 4050 number to other hardware". This closes that for the doc set, and adds the CPU

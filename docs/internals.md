@@ -703,6 +703,40 @@ L2-norm have no PTX entry). A decline runs the identical `wukong_runtime` kernel
 *failure* is surfaced as an error, never silently downgraded — that distinction is the point of the
 seam.
 
+The `sgemm_nt` hook carries a **second dispatch axis, the device architecture**. `gpu_accel`'s
+`gemm_route_for(cc, off)` is a pure function of the probed `GpuTarget`: on a Hopper part
+(`cc_major == 9`) a recognized `C = A·Bᵀ` goes to the warpgroup-MMA + TMA family
+(`gpu::gemm_nt_wgmma` over a config from the one seam function `wgmma_cfg_for`, which delegates to
+`ptx_wgmma`'s shipped regime rule); on every other capability it takes the pre-Hopper launcher,
+unchanged. The rule is `== 9` and not `>= (9,0)` for the same reason the module header is: `sm_90a`
+is architecture-*locked*, so a Blackwell part must take the other path rather than be handed a module
+it cannot load. Every other reason the family cannot take a call — a shape whose tensor map is
+unencodable (`K % 8 != 0` makes the NT row stride not a multiple of 16 bytes), an output past the
+epilogue's `u32` element index, a ring larger than the device's opt-in shared memory, or an
+`UNSUPPORTED` from the generator — is likewise a **decline to the existing path**, never an error,
+and the launcher's own `assert!`s are pre-decided in the driver so a user's program can never abort
+on one. Ragged M/N/K are *not* declines: TMA zero-fills and the epilogue predicates. An **odd `N`
+is**, and it is the one decline the launcher does not make for itself: both shipped rows carry the
+`st.global.v2.f32` epilogue, whose 8-byte pair is aligned only when `N` is even, and a misaligned
+store is a *sticky* `CUDA_ERROR_MISALIGNED_ADDRESS` that fails every later call in the process
+rather than returning a wrong number. `gemm_nt_wgmma` asserts it only in its timing sibling, so the
+driver decides it before the call. The route changes arithmetic class (the wgmma family converts both
+operands to f16 on the host and accumulates in f32), which is inside the CPU↔GPU tolerance contract
+but is not invisible — the driver's device gate sizes its band from the route rather than the device.
+`WUKONG_GPU_NO_WGMMA=1` forces the pre-Hopper path in the same binary, for a one-build A/B.
+
+Everything on that path *up to* the launch — the route, the config the seam selects, every decline,
+and the `LaunchPlan` the config yields — is a pure function of the shape and the probed capability,
+so only the launch itself needs Hopper. The end-to-end gate
+(`gpu_backend_linear_routes_through_wgmma_on_hopper`) is therefore `#[ignore]`d, and its shape list
+lives in `gpu_accel::HOPPER_GATE_SHAPES` where a device-free law asserts what those shapes are chosen
+for: none declines under the H100 opt-in SMEM budget, each grid is a multiple of its cluster on every
+axis, and exactly one crosses `ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS` — read from the generator
+rather than copied — so the round covers the clustered arm as well as the un-clustered one. That last
+one is not tidiness: the clustered row compiles `.reqnctapercluster` into the entry and a launch that
+does not match a compiled cluster requirement *fails* rather than returning a wrong number, so it is
+the arm with a mechanism the other does not have.
+
 `--backend=gpu-native` (the `GpuLower` backend) instead lowers the MIR itself to PTX, so non-recognized
 code runs GPU-side too, with the recognized `wukong_*` symbols (serial and `_parallel` spellings alike)
 mapped by `rt_helper` onto `mrt_*` PTX helper kernels. Coverage is honest rather than total: a construct

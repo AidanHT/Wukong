@@ -540,6 +540,21 @@ multiple of 16. A genuine *device* error is a different thing and is always surf
 within tolerance (GEMM tolerance-gated too, not bit-exact — the device reduces K in a different order;
 silu ~5e-7, dot ~7e-7, softmax ~3e-8 abs), asserting the offload actually fired.
 
+The plain-GEMM hook carries **one extra dispatch axis, the device architecture**: on a Hopper part
+(`cc_major == 9`) a recognized `C = A·Bᵀ` goes to the warpgroup-MMA + TMA family (`gemm_nt_wgmma`),
+the kernel the Act-2 campaign measures and which until then had no caller outside its own test module;
+on every other capability it takes the pre-Hopper launcher, unchanged. It is `== 9` and not `>= (9,0)`
+because `sm_90a` is architecture-*locked*. Every reason the family cannot take a call — the
+architecture, an unencodable tensor map (`K % 8 != 0`), an odd `N` under the `v2` store, an output past
+the epilogue's `u32` index, a ring larger than the device's opt-in shared memory — is a **decline to
+that same existing path**, never an error, so results are unchanged wherever it declines. Where it does
+route, the tolerance band widens rather than the contract: the wgmma family converts both operands to
+f16 on the host, so the driver's device gate sizes its band from the *route* and not from the device
+(`WUKONG_GPU_NO_WGMMA=1` forces the pre-Hopper path in the same binary, for a one-build A/B). The
+**fused** epilogue hook is deliberately not routed there yet — no wgmma module computes
+`act(A·Bᵀ + bias)`, and composing the plain GEMM with a second pointwise launch would be exactly the
+unfused chain that fusion exists to delete.
+
 Run the kernel suite with `cargo test -p wukong_codegen_gpu --features gpu` (skips cleanly with no
 GPU).
 
