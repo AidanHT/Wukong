@@ -333,8 +333,8 @@ Remaining, ranked:
    exactly the store's measured +25.2 / +15.3 / +10.1.
    At sq4096 and sq8192 the clustered arm is what ships and the conclusion
    carries: the mainloop is at or above the peer, so the **11.4 and 7.7 points** still owed on those
-   two published rows are epilogue plus wave overhead, not the inner loop. **The two FFN endpoints of
-   the old "3–27 points" range —
+   two published rows are epilogue plus wave overhead, not the inner loop. **The diagnostic reaches no
+   further than those three square shapes: the two FFN endpoints —
    gpt_d1024_down at 97.3% and gpt_d4096_up at 73.4% — had no nostore arm run on them at all**
    (`r3-config-sweep.log` sweeps only the three square shapes; the gpt rows exist only in
    `r10-vs-cublas-v2rule.log`, a round with no elided arm), so where *their* gap sits is unmeasured

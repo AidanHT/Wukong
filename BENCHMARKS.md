@@ -2064,9 +2064,20 @@ drift exceeds the bar the round prints `--` plus the reason where the number wou
 > | `r8-fused-dequant.log` (86 lines) | the 1.08× / 1.15× / 0.79× dequant ratios | **partial** — same-run A/B in one process, otherwise as above |
 > | `r9-epilogue-matrix.log` (116 lines) | the cuBLASLt epilogue support matrix | **n/a for timing** — nothing is timed; each cell is one cuBLASLt plan plus a heuristic query, so the reading is a capability answer, not a measurement |
 >
-> All four are single invocations. What they *do* carry is the wrapper's clock pair, and read against
-> this section's own ±5% SM-clock rule it would refuse all of them: each shows `345 MHz` before and
-> `1980 MHz` after — the idle-to-boost ramp of a container that had just been handed the GPU. Their
+> All four are single invocations. What they *do* carry is the wrapper's clock pair — `345 MHz`
+> before, `1980 MHz` after, the idle-to-boost ramp of a container that had just been handed the GPU —
+> and **that pair is not what disqualifies them, because every round in this visit has it.**
+> `[clock] before` / `[clock] after` are written by `tools/cloud/modal_app.py` *outside* the test
+> process, so they straddle the ramp by construction: the same `345 → 1980` appears on `r3`
+> (`:39`/`:537`), `r10` (`:39`/`:198`), `r11` (`:39`/`:187`) and `r12` (`:39`/`:198`) — the four
+> rounds this section publishes. Read this section's ±5% SM-clock rule against *that* pair and it
+> would refuse the whole visit, published rows included, which is precisely why the rule is not
+> applied to it. **What the four lack is the harness's own in-round pair**, taken inside the test
+> around the timed region after the discarded warm-up, where the ramp is already over: `r10:134-136`
+> reads `clocks before sm 1980 MHz` → `clocks after sm 1980 MHz` → `sm clock drift +0.00% (bar
+> +/-5.00%)`, and *that* is the gate. `grep -c 'sm clock drift'` gives `1` on each of `r3`, `r10`,
+> `r11` and `r12` and **`0` on each of `r5`, `r6`, `r8` and `r9`** — so the four have no drift gate at
+> all, rather than a failed one. Their
 > numbers are kept because they are the only Hopper readings that exist for those questions and
 > because the *directions* are large (87.2% against a 90% milestone; a 2–5× int8 shortfall), but they
 > are **single-shot, un-twinned and outside the publish gate**, and every figure below repeats that
@@ -2111,10 +2122,13 @@ reproduced here: the container could not lock clocks, so only the same-run ratio
 
 ### What moved it: the fused `st.global.v2.f32` epilogue
 
-Fifteen kernel configurations were scored against the same cuBLAS f16 (f32 out) peer at three shapes
-in one round
-([`...-r3-config-sweep.log`](bench/gpu/h100/2026-08-11-h100-w2-r3-config-sweep.log), gate OPEN, drift
-+0.00%). One axis moved, and it was the epilogue:
+**Nineteen** configurations were planned and **seventeen** were launchable on this part — sixteen
+real kernels plus the one store-elided diagnostic below — each scored against the same cuBLAS f16
+(f32 out) peer at three shapes in one round
+([`...-r3-config-sweep.log`](bench/gpu/h100/2026-08-11-h100-w2-r3-config-sweep.log): `plan : 19 rows
+x 3 shapes`, `-> 17 of 19 rows are launchable on this part`, gate OPEN, drift +0.00%). The other two
+`DECLINED` on the SMEM ceiling before launch, which is a finding rather than a gap and is recorded as
+one at the end of this section. One axis moved, and it was the epilogue:
 
 **Every row in this sweep is the CLUSTERED `_mcb2` arm**, which is *not* the arm the shipped rule
 selects at `sq2048` — read the box under the table before carrying any cell of it across to the
@@ -2281,7 +2295,8 @@ reading exists for the un-clustered arm or for any of the three `gpt_*` shapes.
 [`...-r5-hbm.log`](bench/gpu/h100/2026-08-11-h100-w2-r5-hbm.log) is 71 lines: one invocation of
 `hbm_bandwidth`, with **no provenance header, no twin control, no measured floor, no median-of-5 and
 no publish gate** — the wrapper's clock pair alone (`345 MHz` before, `1980 MHz` after, i.e. the
-container's idle-to-boost ramp). Read the table below as a first reading of the right order of
+container's idle-to-boost ramp, which every round in this visit shows including the published ones;
+what is absent here is the harness's *in-round* `sm clock drift` gate). Read the table below as a first reading of the right order of
 magnitude, not as a gated result; a re-run under the instrument is owed. Against this part's
 **3352.3 GB/s** theoretical peak (132 SMs):
 
@@ -2302,7 +2317,8 @@ different parts and the percentages are not comparable as a trend.)
 > **Every reading in this subsection is single-shot and outside the instrument.** `r6`, `r8` and `r9`
 > carry no provenance header, no A/C peer twin, no measured floor, no median-of-5 and no publish
 > gate; each is one invocation, and each shows the same `345 MHz → 1980 MHz` container ramp in the
-> wrapper's clock pair. What `r6` and `r8` *do* have is the part that matters most for a quantized
+> wrapper's clock pair — as the published rounds do too, so the ramp is not the distinguishing fact;
+> the missing one is the in-round `sm clock drift` line, which none of the three prints. What `r6` and `r8` *do* have is the part that matters most for a quantized
 > claim — both are **same-run** (contender and peer in one process over one allocation set), and
 > `r6`'s arms are gated **bit-for-bit against the `i32` oracle** before any timing. `r9` times
 > nothing at all. Take the ratios below as directionally sound and numerically un-gated; a repeat
@@ -2357,7 +2373,10 @@ per-wave derivations and refusal rules are `GPU_RETARGET_PLAN.md` and `docs/gpu/
 
 > **One round in this visit is not an H100 figure.** The W4A16 int4 round
 > ([`...-r7-int4-baseline.log`](bench/gpu/h100/2026-08-11-h100-w2-r7-int4-baseline.log)) was scheduled
-> onto an **H200** — its own provenance header says `device: NVIDIA H200` — so it is deliberately not
+> onto an **H200** — the bench prints `device: NVIDIA H200` at line 49, and that bare print is the
+> whole of its device record: this round does not enter the instrument, so it has **no** provenance
+> header (`grep -c 'round provenance'` on it returns `0`), exactly as the instrument box above says.
+> The device fact is solid and the round is deliberately not
 > folded into this section. Its standing statement is unchanged and unrelated to the part: no robust
 > library int4-decode GEMM is bindable, so the only peer is naive CUDA-C and the result is a
 > documented lead, not a headline.
