@@ -968,8 +968,9 @@ So the round publishes three separate things, and conflating any two of them is 
 pre-registered expectation stays falsifiable at the two points it was registered at, and the wave's
 own decode batches (64, 256) are added. Section 13 carries the amendment row.
 
-`modal_app.py:3948-3957`'s `::marlin` dispatcher picks Machete on `sm_90` automatically; use it
-rather than naming a kernel by hand.
+`modal_app.py`'s `::marlin` entrypoint (`def marlin` at `:3964`) picks the kernel by device itself:
+`which = kernel or ("machete" if cc == "sm_90" else "marlin")` at `:4009`, with the two off-device
+strawman guards at `:4012-4017`. Use that auto-pick rather than naming a kernel by hand.
 
 ### 10.5 Summary of the trigger check
 
@@ -1264,7 +1265,7 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 | CUDA graph mechanics and the pool prerequisite | `crates/wukong_codegen_gpu/src/graph.rs:1-30` |
 | `RED_GRID`/`RED_BLOCK` **and the determinism rationale for the fixed grid**, the product `gpu::reduce` that consumes it, `stream_cfg`, `hbm_bandwidth` (its reduce arm at `:23538-23544`), `best_bw`, `decode_stack_latency` | `crates/wukong_codegen_gpu/src/gpu.rs:1219-1221`, `:1300-1303`, `:1361-1363`, `:23488-23595`, `:25087`; the offload caller at `crates/wukong_driver/src/gpu_accel.rs:155` |
 | The device-free module set (117) and the ptxas census corpus (wmma+flash+wgmma only) | same file, `:8247`, `:8473-8488`, `:8624`; `:22217`, `:22250-22335` |
-| FA2 wheel audit and the `fwd_kvcache` requirement; the `::marlin` device dispatcher | `tools/cloud/modal_app.py:1297-1413`, `:3948-3957` |
+| FA2 wheel audit and the `fwd_kvcache` requirement; the `::marlin` device dispatcher (its `def` line, the `sm_90` auto-pick, the strawman guards) | `tools/cloud/modal_app.py:1297-1413`, `:3964`, `:4009`, `:4012-4017` |
 | The 4050 serving ledger, quarantined in 1.2 | `prompts/results/serving.md:100-107`, `:139-154`, `:191-233`, `:263-265`; `BENCHMARKS.md:51` (the standing-index scope note quoted in the device-scope block), `:366-377` (the results-table scope note, different words), `:395`, `:2466-2490` |
 | Ping-pong's trigger, Stream-K's trigger, the 2x2x1 and 192x256 verdicts, the per-tile cost model | `docs/gpu/derive/WAVE3_DOSSIER.md:19-30`, `:1252-1386` |
 | The epilogue/fusion break-even model this wave inherits nothing from but must not contradict | `docs/gpu/derive/WAVE4_DOSSIER.md:188-277` |
