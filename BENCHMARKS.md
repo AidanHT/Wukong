@@ -2171,8 +2171,12 @@ suite table above.
 > +25.2-point delta at `sq2048` is a clustered-vs-clustered measurement of an arm that does not ship
 > at that shape, and the store lever's effect on the arm that *does* ship there has never been
 > isolated. At `sq4096` and `sq8192` the clustered arm **is** the shipped one and the rows read
-> straight across (88.7 / 92.0 here against 88.6 / 92.3 in the suite — two rounds, inside their
-> floors).
+> straight across: 88.7 / 92.0 here against 88.6 / 92.3 in the suite, agreement to 0.1 and 0.3
+> points across two rounds. The per-row floors do not license calling that agreement exact — they
+> bound *same-run* peer dispersion (±0.01% on both rows in `r3`; ±0.51% and ±0.04% in `r10`), not
+> cross-container reproducibility, and the `sq8192` pair differs by more than either round's floor.
+> Read the pair as cross-round consistency at the few-tenths-of-a-point level, which is what two
+> containers with uncontrolled clock state can deliver — not as a resolved re-measurement.
 
 Same tile, same stage count, same cluster, same mainloop: the accumulator pair at `+0/+4` leaves as
 one 8-byte store instead of two 4-byte ones, which is the difference between issuing half-empty
