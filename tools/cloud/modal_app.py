@@ -3769,6 +3769,14 @@ def bench(name: str = "", package: str = "wukong_codegen_gpu", peers: bool = Fal
     instead of printing `[skip]` and reporting green having measured nothing (`gpu.rs`'s `peer_gate`).
     Any sweep whose number is going to be published should be run with it. `--strong-peers` does the
     same for the §0 out-of-process bars; see `::test`.
+
+    **It exits non-zero when libtest does.** It used to not: the `_run(.., check=False)` below was
+    the last statement that could fail and nothing read its status, so a panicking sweep — or an
+    assertion inside one, which is how `wukong_driver`'s Hopper route witness was routed — completed
+    as a green `modal run --detach`. `check=False` is still right, because the clock snapshot and the
+    Volume commit must happen even on a failure (the log is the product of a sweep, and a truncated
+    round is still worth its cache); the status is simply carried past them, exactly as `::cutlass`,
+    `::marlin` and `::framework` already do.
     """
     with _meter("bench"):
         env = _prepare_cargo()
@@ -3786,9 +3794,12 @@ def bench(name: str = "", package: str = "wukong_codegen_gpu", peers: bool = Fal
         if name:
             args.append(name)
         args += ["--ignored", "--nocapture", "--test-threads=1"]
-        _run(args, env, check=False)
+        rc = _run(args, env, check=False)
         _clock_snapshot(env, f"after {name or package}")
         build_vol.commit()
+        print(f"\n{name or package}: {'PASS' if rc == 0 else 'FAIL'}")
+        if rc:
+            sys.exit(rc)
 
 
 @app.function(image=image, gpu=WK_GPU, cpu=WK_CPU, memory=WK_MEM_MIB, timeout=WK_TIMEOUT,

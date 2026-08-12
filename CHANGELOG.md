@@ -46,7 +46,8 @@ everywhere else.
   unfused chain wave 4 exists to delete. The seam and the exact kernel-side gap are named in place.
 - **Everything up to the launch is checked on a laptop that cannot launch it.** The route, the
   selected config, every decline and the resulting `LaunchPlan` are pure functions of the shape and
-  the probed capability, so the end-to-end Hopper gate is `#[ignore]`d while its *shape list* is
+  the probed capability, so the end-to-end Hopper gate capability-skips off Hopper while its *shape
+  list* is
   asserted device-free: each shape must not decline under the H100 opt-in SMEM budget, its grid must
   be a multiple of its cluster on every axis, and exactly one must cross the generator's own
   `W1_CLUSTER_MIN_OUTPUT_ELEMS` — because the clustered row compiles `.reqnctapercluster` into the
@@ -60,6 +61,18 @@ everywhere else.
   `cargo test -p wukong_driver --features gpu --lib` is now a step of `gpu-check` (device-free: the
   six end-to-end gates `[skip]`, and `WUKONG_GPU_REQUIRED=1` turns a skip into a failure where a
   device is expected) and a named part of the pre-commit gate in `CONTRIBUTING.md`.
+- **The Hopper route witness now runs somewhere a failure is visible.** The single end-to-end proof
+  that the wgmma family *executed* rather than declined was `#[ignore]`d and documented to run
+  through the Modal harness's `::bench`, which ran libtest with `check=False` and then returned
+  without a `sys.exit` — so the assertion the counters exist for could fail on rented silicon and the
+  detached app still completed successfully. It is now a plain `#[test]` (a non-Hopper device is a
+  capability `[skip]`, so it costs a device-free runner nothing) routed through `::test`, whose
+  `if rc1 or rc2: sys.exit(1)` is the point; `::bench` propagates its status too, after the clock
+  snapshot and the Volume commit, matching `::cutlass`/`::marlin`/`::framework`. The invocation is
+  pinned in `gpu_accel::HOPPER_GATE_INVOCATION` and a device-free law checks the whole chain — the
+  named test exists, is not `#[ignore]`d, still compares the per-route counters, and both Modal
+  entrypoints still contain a `sys.exit`. A pinned invocation that does not reach its test is this
+  repo's fourth instance of that class and its second on paid hardware.
 
 ### Documentation — every published claim is scoped to the device and the peer it was measured against
 `GPU_RETARGET_PLAN.md` §10 asks for "no published claim anywhere in the repo that silently

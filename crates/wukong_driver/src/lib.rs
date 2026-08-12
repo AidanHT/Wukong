@@ -2254,16 +2254,26 @@ mod gpu_e2e_tests {
 
     /// **The wgmma route's end-to-end gate: a `.wk` matmul reaching `gemm_nt_wgmma`.**
     ///
-    /// `#[ignore]`d because it can only pass on a Hopper part, and this repo develops on an RTX 4050.
-    /// The reachability law says `::bench --name X` runs ONLY `#[ignore]`d tests and `::test --filter
-    /// Y` runs only plain ones, so the H100 invocation is
+    /// A plain `#[test]`, and that is the load-bearing part: this is the only proof anywhere that
+    /// the family the whole campaign publishes actually *executed* on Hopper, so it has to run under
+    /// an entrypoint that can turn red. Its H100 invocation is pinned in
+    /// [`gpu_accel::HOPPER_GATE_INVOCATION`], where a device-free law checks that it reaches this
+    /// function *and* lands on an entrypoint that propagates a failure.
     ///
-    /// ```text
-    ///   WK_GPU=H100 modal run --detach tools/cloud/modal_app.py::bench \
-    ///       --name gpu_backend_linear_routes_through_wgmma_on_hopper --package wukong_driver
-    /// ```
+    /// It used to be `#[ignore]`d and routed through `::bench --name .. --package wukong_driver`,
+    /// which is the repo's own "reads as green" class one level up from the vacuous bring-up run:
+    /// `modal_app.py`'s `bench()` ran its child with `check=False` and then returned, so the
+    /// function exited 0 whatever the tests did, and the witness assertion below — the entire point
+    /// of the route counters — could fail on rented silicon while the detached app completed
+    /// successfully. `::test` is the entrypoint that ends `if rc1 or rc2: sys.exit(1)`.
     ///
-    /// (after `::build --release`, which `::bench` requires). It asserts four separate things, and
+    /// The `#[ignore]` bought nothing it needed: a non-Hopper device is a **capability** skip
+    /// handled in the body below (which deliberately does not escalate under
+    /// `WUKONG_GPU_REQUIRED=1`, exactly like `gpu_backend_declines_operands_past_the_f16_range`
+    /// beside it), and no device at all is a `skip_no_device`. So on this repo's RTX 4050 and on a
+    /// device-free CI runner it prints `[skip]` and returns, while on Hopper it is a hard gate.
+    ///
+    /// It asserts four separate things, and
     /// the first three are the ones a green-but-vacuous run would skip: that the device is
     /// *eligible* for [`gpu_accel::GemmRoute::Wgmma`], that the offload fired at all, that every
     /// offload it fired **took that route** rather than falling back, and only then that the numbers
@@ -2289,7 +2299,6 @@ mod gpu_e2e_tests {
     /// it (`wgmma_declines`) and a device-free unit test pins that; putting an odd `N` in this gate
     /// would only prove the decline works by never reaching the kernel.
     #[test]
-    #[ignore = "needs a Hopper (sm_90a) device; run it on H100 via ::bench --package wukong_driver"]
     fn gpu_backend_linear_routes_through_wgmma_on_hopper() {
         const NAME: &str = "gpu_backend_linear_routes_through_wgmma_on_hopper";
         let mut guard = wukong_codegen_gpu::gpu();
