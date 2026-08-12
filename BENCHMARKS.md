@@ -2159,12 +2159,34 @@ Three further readings from the same sweep, recorded so they are not re-run:
 - **The B-multicast cluster is size-keyed for a measured reason, not a guessed one.** At sq2048 the
   un-clustered arm beats the clustered one (67.2% vs 62.2%); at sq8192 the order reverses hard
   (56.8% vs 81.9%). That crossover is the 8e6-output-element threshold in the shipped rule.
-- **The L2 evict hints are a publishable null.** `_v2_ef` (`.L2::evict_first` on the C stores,
-  evict-last on the TMA operand loads) reads 88.3% / 87.6% / 91.0% against plain `_v2`'s 87.4% /
-  88.7% / 92.0% — inside the floor at every shape, in both directions. Measured, no effect, done.
-- **No non-epilogue axis in the sweep beat the winning row (`..._s4_mcb2_v2`) at any of the three
-  shapes**: stage
-  depths 2 and 3, the A-multicast cluster variant, and the 128×128×64 s6 tile all score below it
+- **The L2 evict hints are a publishable null — and the rows that measure it are the two
+  scalar-epilogue ones.** The sweep splits the lever in two and scores each half against the
+  same-epilogue, no-hint control `..._s4_mcb2` (**62.2 / 73.4 / 81.9%** at sq2048 / sq4096 / sq8192):
+
+  | sweep row | l2 hint (from the log's own config line) | sq2048 | sq4096 | sq8192 | vs the control |
+  |---|---|---|---|---|---|
+  | `..._s4_mcb2_ef` | C stores `.L2::evict_first` | 63.1% | 73.1% | 82.1% | +0.9 / −0.3 / +0.2 pts |
+  | `..._s4_mcb2_efol` | C stores `.L2::evict_first` **+ TMA operands `.L2::evict_last`** | 63.0% | 73.3% | 82.2% | +0.8 / −0.1 / +0.3 pts |
+
+  Sub-point, sign-changing, on **both** halves of the lever — including the operand half, which
+  `_efol` is the only row in the round to carry. That is the null, and it is publishable.
+
+  **`..._s4_mcb2_v2_ef` is a different row and does not answer the operand question.** Its config
+  line reads `epilogue fused st.global.v2.f32 … | l2 hint C stores .L2::evict_first` — **no operand
+  hint at all** — so it is the composition of the v2 store with the C-store half only. It reads
+  **88.3 / 87.6 / 91.0%** against plain `_v2`'s **87.4 / 88.7 / 92.0%**, i.e. **+1.03% / −1.24% /
+  −1.09%** relative. Those are **outside** the measured peer floor of every one of the six cells
+  involved (±0.23/±0.03 at sq2048, ±0.01/±0.34 at sq4096, ±0.01/±0.66 at sq8192), so by this
+  section's own floor rule they are **not** resolvable as "no difference"; the honest statement is
+  that they are small, sign-changing across the three shapes, and comfortably inside the ±5% publish
+  bar. (Only the sq2048 delta is also inside the two arms' own contender spreads, ±1.42% and ±1.16%;
+  at sq4096 and sq8192 it is outside those too.) One consequence is kept here rather than rounded
+  away: **88.3% is the highest reading any real kernel posts at sq2048 in this sweep** — the top of
+  that whole column, above `_v2`'s 87.4% — which is one shape, one sign, inside the bar, and not a
+  reason to ship a second kernel.
+- **No non-epilogue axis in the sweep beat either v2-store row (`..._s4_mcb2_v2`,
+  `..._s4_mcb2_v2_ef`) at any of the three shapes**: stage
+  depths 2 and 3, the A-multicast cluster variant, and the 128×128×64 s6 tile all score below both
   everywhere (the 128×128 tile's best row is 68.8% at sq8192 against 92.0%). Two 5- and 6-stage rows
   `DECLINED` outright rather than being launched, because 245,840 B and 295,008 B of ring exceed the
   232,448 B per-CTA ceiling — a decline is the generator refusing, not a failure.
