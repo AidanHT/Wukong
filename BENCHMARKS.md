@@ -379,8 +379,10 @@ GPT FFN down-projection, weakening to **73–80%** on the wide-N up-projections;
 disagreed by ±15.47%, so the instrument published nothing there. The lever was a single change, the
 fused `st.global.v2.f32` epilogue (**+25.2 / +15.3 / +10.1 points** at those three square shapes),
 taking the six resolvable shapes from ≈61% to **≈88%** of cuBLAS; a store-elided diagnostic arm reads
-**114.0 / 101.1 / 101.8%**, i.e. the mainloop is already at or above the peer and the whole remaining
-gap is the epilogue and wave overhead. Also on this part — and unlike the GEMM rows above, these came
+**114.0 / 101.1 / 101.8%** **at those same three square shapes**, i.e. the mainloop there is already
+at or above the peer and what remains *there* is epilogue and wave overhead — the arm was never run
+on the three `gpt_*` FFN shapes, so where their gap sits (including the 73.4% worst row) is
+unmeasured. Also on this part — and unlike the GEMM rows above, these came
 from **single-shot rounds that did not go through the instrument** (no twin, no floor, no median, no
 publish gate; the section labels each one): **2922 GB/s = 87.2% of the 3352 GB/s HBM spec peak** (the
 campaign's first H100 run), and the **fused int8 GEMM+dequant beats the cuBLAS GEMM+dequant chain
