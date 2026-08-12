@@ -112,11 +112,17 @@ throughput is not.** Every other row above stays on the 4050.
 
 **One number in the ledger is internally inconsistent and is flagged rather than used.**
 `prompts/results/serving.md:149` and `:159` describe the 4050 as having 40 SMs ("only 8-32 CTAs on
-40 SMs", "39/40 SMs idle"). The campaign's probed figure for this part is **20**
-(`bench/gpu/README.md:112`, "the 4050's 20 SMs"; `ptx_norm.rs:591` measures against "20 SMs"). The
+40 SMs", "39/40 SMs idle"). The device itself reports **20**, and the probe print is checked into
+the tree: `hbm_bandwidth` emits `theoretical peak HBM: 192.0 GB/s  (20 SMs)` straight out of
+`g.sm_count()` (`gpu.rs:23493`), captured at
+`bench/gpu/4050-identity/hbm_bandwidth.A.r1.txt:4` and in all seventeen sibling runs in that
+directory. Two code sites agree with the probe -- `ptx_norm.rs:591` stamps its 4050 norm sweep
+"20 SMs", `megakernel.rs:26` derives its idle fraction from "the 20-SM 4050" -- as does the L4
+bring-up note, *"the **58-SM** L4 ... (vs the 4050's 20 SMs)"*
+(`bench/gpu/l4/2026-08-09-session.md:112`). The
 *mechanism* those sentences describe -- a decode launch that covers a small fraction of the machine
--- is the one section 4 re-derives from scratch on 132 SMs, so nothing here depends on which of the
-two is right. It should still be corrected at its own site.
+-- is the one section 4 re-derives from scratch on 132 SMs, so nothing here rests on the ledger's SM
+count either way. The `serving.md` sentences should still be corrected at their own site.
 
 ### 1.3 The correctness floor is ALREADY GREEN on H100 -- the wave's best news, and it is free
 
