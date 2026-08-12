@@ -8633,7 +8633,14 @@ mod tests {
         // diagnostic that separates the ring from CTA dispatch). The drained arm carries one extra
         // mbarrier -- the tile rendezvous -- so it differs from its twin in its SMEM carveout as
         // well as its text, which is a second reason a shared module key would have been wrong.
-        const EXPECTED_MODULES: usize = 121;
+        // 121 -> 124 on 2026-08-12 with WAVE 3 lever 3, the per-shape dispatcher: the three
+        // configurations `ptx_wgmma::wgmma_dispatch` selects that no earlier row spells --
+        // `w1_mcb_v2_p` (sq4096's verdict: persistent + cluster, no raster, because that shape's
+        // linear wave footprint already fits L2), `w1_v2_p` (gpt_d1024_up's: persistent alone) and
+        // `w3d_s4_v2`, the NEW m64n64k16 128x64 family that is the only lever in wave 3 which
+        // moves sq1024. The dispatcher must land on a REAL emitted module or decline loudly, so
+        // every verdict it can reach is a module the census assembles before an H100 is rented.
+        const EXPECTED_MODULES: usize = 124;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -19580,6 +19587,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     &crate::ptx_wgmma::WGMMA_W1_MCB_V2_R16,
                     &crate::ptx_wgmma::WGMMA_W1_MCB_V2_R16_P,
                     &crate::ptx_wgmma::WGMMA_W1_MCB_V2_R16_PSTOP,
+                    // Wave 3 lever 3 adds one more clustered arm the dispatcher can SELECT:
+                    // persistence WITHOUT the raster, which is sq4096's verdict. It is a tile loop
+                    // over a B multicast exactly as `_r16_p` is, so it can reintroduce the same
+                    // stale-column failure, and it reaches it by a DIFFERENT tile map (the linear
+                    // one) -- which is precisely why it is its own row here rather than covered by
+                    // its rastered twin.
+                    &crate::ptx_wgmma::WGMMA_W1_MCB_V2_P,
                 ] {
                     assert_eq!(
                         mc.cluster_ctas(),
@@ -20393,9 +20407,17 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             };
             let plan = bi::TwinPlan::default();
             let points = wgmma_sweep_points();
+            // The cost is the UNION of the rows' own shape lists, not `rows x shapes`: see
+            // `SweepRow::shapes`. Printing both numbers is what keeps "10 rows and 7 shapes" from
+            // being read as 70 cells.
+            let planned_cells: usize = WGMMA_SWEEP_GRID
+                .iter()
+                .map(|r| points.iter().filter(|p| r.runs_at(p.label)).count())
+                .sum();
             eprintln!(
-                "plan           : {} rows x {} shapes, {} recorded rounds + {} warm-up, bar \
-                 +/-{:.2}%, median across rounds",
+                "plan           : {} rows over {} shapes = {planned_cells} cells (the UNION of \
+                 each row's own shape list, NOT the cross product), {} recorded rounds + {} \
+                 warm-up, bar +/-{:.2}%, median across rounds",
                 WGMMA_SWEEP_GRID.len(),
                 points.len(),
                 plan.rounds,
@@ -20496,6 +20518,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                                 "per k-tile (rounds 1-3)"
                             }
                         );
+                        eprintln!("      measured at {:?}", r.shapes);
                     }
                     Err(why) => eprintln!(
                         "  {:<12} {:<35} DECLINED | {}\n      {why}",
@@ -20637,10 +20660,13 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
 
             // --- 4. the sweep --------------------------------------------------------------------
             eprintln!(
-                "\n---- {BENCH}: sweeping {} rows x {} shapes; arms A and C are BOTH {} (the peer \
-                 twin), arm B is the row ----",
+                "\n---- {BENCH}: sweeping {} live rows over {} shapes ({} cells); arms A and C are \
+                 BOTH {} (the peer twin), arm B is the row ----",
                 live.len(),
                 points.len(),
+                live.iter()
+                    .map(|r| points.iter().filter(|p| r.runs_at(p.label)).count())
+                    .sum::<usize>(),
                 peer.label
             );
             for p in &points {
@@ -20662,6 +20688,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             let mut cells: Vec<Cell> = Vec::new();
             for r in &live {
                 for p in &points {
+                    // **The sweep is a UNION, not a cross product** (wave 3). Each row names the
+                    // shapes its mechanism can act on: the raster and persistence are PROVABLY the
+                    // identity on a single-wave grid, so a cell there can only report noise, and
+                    // the 128x64 tile row answers a question that only exists at sq1024. Skipping
+                    // is not an economy -- a cell a reader will over-read is worse than an absent
+                    // one, and `SweepRow::shapes` is where that judgement is written down.
+                    if !r.runs_at(p.label) {
+                        continue;
+                    }
                     let iters = bench_iters(p);
                     let label = format!("{BENCH}@{}/{}", r.label, p.label);
                     let cfg = r.cfg;
@@ -20733,6 +20768,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             ),
                             Err(_) => "-- unresolved".to_string(),
                         },
+                        // Two different absences, and conflating them would be the misreading this
+                        // column exists to prevent: `not measured` is a DELIBERATE omission from
+                        // `SweepRow::shapes` (the row's mechanism is provably zero at this shape),
+                        // `absent` would be a cell the round meant to run and did not.
+                        None if !r.runs_at(p.label) => "-- not measured".to_string(),
                         None => "-- absent".to_string(),
                     };
                     line += &format!(" {text:>24}");
@@ -20894,6 +20934,46 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     p.m * p.n,
                     crate::ptx_wgmma::wgmma_w1_for(p.m, p.n).name
                 );
+            }
+
+            // --- 6d. WAVE 3's per-shape dispatcher, and what it picks HERE -----------------------
+            eprintln!(
+                "\n---- {BENCH}: WAVE 3's per-shape dispatcher (ptx_wgmma::wgmma_dispatch) ----\n  \
+                 A PURE function of (M, N, K, sm_count): the WIDEST tile whose wave efficiency \
+                 clears 0.90; the raster iff\n  the grid is multi-wave AND the LINEAR wave \
+                 footprint blows L2; persistence iff multi-wave; the cluster iff the\n  L2-roof \
+                 fraction of the FINAL configuration clears 0.78 -- which is why gpt_d4096_up \
+                 FLIPS to the cluster\n  once the raster makes its footprint L2-resident. Each \
+                 verdict below is measured by the row named beside it,\n  at this shape, with its \
+                 own control (the_dispatcher_verdict_is_pinned_at_every_benched_shape and\n  \
+                 every_shape_the_dispatcher_selects_is_measured_at_that_shape are the device-free \
+                 laws). It DECLINES\n  rather than falling back: a fallback is how a round \
+                 publishes a configuration that never ran."
+            );
+            for p in &points {
+                let plan = crate::ptx_wgmma::wgmma_dispatch_plan(
+                    p.m,
+                    p.n,
+                    p.k,
+                    crate::ptx_wgmma::HOPPER_SM_COUNT,
+                );
+                eprintln!("  {:<14} {}", p.label, plan.summary());
+                match crate::ptx_wgmma::wgmma_dispatch(
+                    p.m,
+                    p.n,
+                    p.k,
+                    crate::ptx_wgmma::HOPPER_SM_COUNT,
+                ) {
+                    Ok(c) => {
+                        let row = WGMMA_SWEEP_GRID
+                            .iter()
+                            .find(|r| r.cfg.key == c.key)
+                            .map(|r| r.label)
+                            .unwrap_or("(not a sweep row)");
+                        eprintln!("  {:<14}   -> {} (sweep row {row})", "", c.name);
+                    }
+                    Err(why) => eprintln!("  {:<14}   -> DECLINES: {why}", ""),
+                }
             }
 
             // --- 7. DIAGNOSTIC absolutes ------------------------------------------------------------
