@@ -29,10 +29,23 @@ local clippy is strictly weaker than the gate.
 That last line is not optional. All GPU code is behind `--features gpu`, so `cargo test --workspace`
 compiles only the two deliberately un-gated modules of `wukong_codegen_gpu` (`paged_kv`,
 `paged_attention`), none of `wukong_driver::gpu_accel`, and neither of the two `Op` matches in
-`wukong_codegen_gpu/src/lower.rs` — and CI does not build the feature either, so it is your
-responsibility before pushing. If you touched the GPU backend, also run its own suite
-(`cargo test -p wukong_codegen_gpu --features gpu`): it skips rather than fails with no CUDA device,
-and `WUKONG_GPU_REQUIRED=1` turns those skips into failures on a machine that has one.
+`wukong_codegen_gpu/src/lower.rs` — so it is your responsibility before pushing. (CI's `gpu-check`
+job does build and lint the feature, but `cargo check`/`cargo clippy` compile a test without running
+it.) If you touched the GPU backend, also run **both** GPU suites:
+
+```sh
+cargo test -p wukong_codegen_gpu --features gpu   # PTX generators, launch wrappers, MIR->PTX
+cargo test -p wukong_driver --features gpu --lib  # the driver-side dispatch rules
+```
+
+Both skip rather than fail with no CUDA device, and `WUKONG_GPU_REQUIRED=1` turns those skips into
+failures on a machine that has one. The second line is not implied by the first: `-p
+wukong_codegen_gpu` does not build `wukong_driver`'s tests at all, and `wukong_driver` reports 20
+tests without the feature against 38 with it. The 18 in that delta are the driver's half of GPU
+dispatch — which route a recognized `C = A·Bᵀ` takes per compute capability, which shapes and which
+operand *values* the Hopper `wgmma` seam declines before launching, and the counter algebra that
+tells a wgmma launch from a fallback. They are pure functions of a capability and a shape, so they
+run anywhere; CI's `gpu-check` job runs exactly this command on a device-free runner.
 
 CI runs two more gates; run them too if you touched lowering, the optimizer, or a backend:
 
