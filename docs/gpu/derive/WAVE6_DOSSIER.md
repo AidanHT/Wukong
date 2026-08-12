@@ -96,13 +96,13 @@ also, for a pure-read term, **conservative in the wrong direction and optimistic
 
 | measured | value | device | source |
 |---|---|---|---|
-| continuous-batching goodput vs fill=1 | 39.1x @Bcap=64, 85.6x @Bcap=256 | **RTX 4050** | `prompts/results/serving.md:194-207`; `BENCHMARKS.md:395` |
+| continuous-batching goodput vs fill=1 | 39.1x @Bcap=64, 85.6x @Bcap=256 | **RTX 4050** | `prompts/results/serving.md:200-213`; `BENCHMARKS.md:395` |
 | graph-driven scheduler vs static batching | 1.14-1.27x | **RTX 4050** | `BENCHMARKS.md:395` |
 | decode CUDA graph, 1 / 6 / 12 layers | 1.34x / 1.35x / **1.07x** | **RTX 4050 (WDDM)** | `prompts/results/serving.md:139-143` |
 | exposed launch overhead, 168 launches | "roughly fixed ~250-280 us" | **RTX 4050 (WDDM)** | same file, `:148` |
 | 12-layer decode, eager -> graphed | ~6.5-6.9x | **RTX 4050 (WDDM)** | `BENCHMARKS.md:2490` |
 | int8-KV footprint | **3.88x vs f32, 1.94x vs f16** | **device-free geometry** | `paged_kv.rs:846-878`, comment `:865` |
-| int8 decode-attention vs f64 reference | max_abs 3.00e-3 (gate 1e-2) | 4050, **and green on H100** | `serving.md:227-230`; `s2d-full-suite.log:2501` |
+| int8 decode-attention vs f64 reference | max_abs 3.00e-3 (gate 1e-2) | 4050, **and green on H100** | `serving.md:233-236`; `s2d-full-suite.log:2501` |
 
 **One row in that table is not device-scoped and it matters: the int8-KV footprint.** `3.88x` and
 `1.94x` come out of `int8_kv_footprint_shrink`, a pure-geometry unit test with no device in it
@@ -110,19 +110,25 @@ also, for a pure-read term, **conservative in the wrong direction and optimistic
 transfers to H100 unchanged, and section 6 is where it does real work. **Footprint is arithmetic;
 throughput is not.** Every other row above stays on the 4050.
 
-**One number in the ledger is internally inconsistent and is flagged rather than used.**
-`prompts/results/serving.md:149` and `:159` describe the 4050 as having 40 SMs ("only 8-32 CTAs on
-40 SMs", "39/40 SMs idle"). The device itself reports **20**, and the probe print is checked into
+**One number in the ledger was internally inconsistent. It is now corrected at its own site, and
+one site still carries the error.** `prompts/results/serving.md` described the 4050 as a **40**-SM
+part in two places -- "only 8-32 CTAs on 40 SMs" and "39/40 SMs idle" -- where the device itself
+reports **20**, and the probe print is checked into
 the tree: `hbm_bandwidth` emits `theoretical peak HBM: 192.0 GB/s  (20 SMs)` straight out of
 `g.sm_count()` (`gpu.rs:23493`), captured at
 `bench/gpu/4050-identity/hbm_bandwidth.A.r1.txt:4` and in all seventeen sibling runs in that
 directory. Two code sites agree with the probe -- `ptx_norm.rs:591` stamps its 4050 norm sweep
 "20 SMs", `megakernel.rs:26` derives its idle fraction from "the 20-SM 4050" -- as does the L4
 bring-up note, *"the **58-SM** L4 ... (vs the 4050's 20 SMs)"*
-(`bench/gpu/l4/2026-08-09-session.md:112`). The
-*mechanism* those sentences describe -- a decode launch that covers a small fraction of the machine
--- is the one section 4 re-derives from scratch on 132 SMs, so nothing here rests on the ledger's SM
-count either way. The `serving.md` sentences should still be corrected at their own site.
+(`bench/gpu/l4/2026-08-09-session.md:112`). Both `serving.md` sentences now read the probed 20 and
+cite that probe (`serving.md:149-152`, `:161-164`); the second one's *numerator* was wrong too, and
+is re-derived there from the v1 launcher's own `PAGED_ATTN_BLOCK = 128` (4 CTAs, not 1).
+**A third site is a Rust file and still says 40:** `paged_attention.rs:84`, "which left 39/40 SMs
+idle" -- in the very file section 5 rewrites -- so it needs a commit that can carry the full
+five-part gate rather than the docs-only one, and section 14 keeps it open. The
+*mechanism* all three sentences describe -- a decode launch that covers a small fraction of the
+machine -- is the one section 4 re-derives from scratch on 132 SMs, so nothing here rests on the
+ledger's SM count either way.
 
 ### 1.3 The correctness floor is ALREADY GREEN on H100 -- the wave's best news, and it is free
 
@@ -888,7 +894,7 @@ gates survive untouched:
 > **Four of the five bit-exactness gates survive split-K untouched, because they all compare the
 > kernel against itself under a permutation of its inputs rather than against a fixed reduction
 > order.** Only the f64-reference tolerance moves, and it moves into the repo's standing
-> "reassociation-exception class" (`serving.md:265`) that the Megatron row-parallel all-reduce
+> "reassociation-exception class" (`serving.md:271`) that the Megatron row-parallel all-reduce
 > already lives in. That is a materially cheaper precondition than WAVE3's suite faced.
 
 **Size.** Bounded by section 4.3's MODEL: up to **6.6x** on the 16-CTA launches and **1.7x** on the
@@ -1040,12 +1046,12 @@ kernel**, so they get an `==` gate against it and not merely the layout gate.
 > **A split-K decode GEMM sums its `S` partials in a fixed shard order, on the device, with no
 > atomics.** Determinism is not optional here: `serving_scheduler_drains_and_conserves_blocks`
 > asserts that two identical request streams produce the identical per-step schedule
-> (`serving.md:188-189`), and a non-deterministic reduction turns that into a flaky gate rather than
+> (`serving.md:194-195`), and a non-deterministic reduction turns that into a flaky gate rather than
 > a wrong answer -- the worst failure mode.
 >
 > **And the f64-reference tolerance is re-derived, never widened to fit.** The new bound is a
 > reassociation of a `K`-reduction into `S` shards; it belongs in the same exception class as
-> `tp_row_parallel_gemm_allreduce_matches` (`serving.md:263-265`, max_abs 1.34e-5 at K=256).
+> `tp_row_parallel_gemm_allreduce_matches` (`serving.md:268-271`, max_abs 1.34e-5 at K=256).
 
 ### G-W6-5. `plan_grid` is the residency bound, and a cooperative grid that is not resident hangs
 
@@ -1054,7 +1060,8 @@ kernel**, so they get an `==` gate against it and not merely the layout gate.
 > precisely because "a clamped sweep reports a number for a grid nobody asked for"
 > (`megakernel.rs:346-348`). The barrier state is a **launch parameter**, never a module-scope
 > `.global`, because `Gpu::function` caches modules for the process's life and a faulted barrier
-> would hang the *next* program (`megakernel.rs:96-102`).
+> would hang the *next* program -- that is `GRID_BARRIER_BYTES`'s own doc comment, verbatim, at
+> `megakernel.rs:89-94` (the module header states the same rule at `:32-33`).
 
 ### G-W6-6. G16 applies, and the decode contender's dispersion is unknown
 
@@ -1261,12 +1268,12 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 | The serving bench and gate set (all in `serving.rs`'s own test module), incl. the TP splits | same file, `:1534-3450` |
 | WMMA 64x64 decode tile constants | `crates/wukong_codegen_gpu/src/ptx_wmma.rs:161-173` |
 | Norm planner: `MIN_ELEMS_PER_LANE`, `MAX_WARPS_PER_ROW`, `FILL_CTAS_PER_SM`, `OCCUPANCY_WARPS`, `warps_per_row`, `norm_launch`, the 4050 sweep table | `crates/wukong_codegen_gpu/src/ptx_norm.rs:1-42`, `:56`, `:70`, `:75`, `:87`, `:570-629`, `:667` |
-| Megakernel launch layer: grid barrier, `max_resident_ctas`, `plan_grid`, and "still emits the block-scoped form today" | `crates/wukong_codegen_gpu/src/megakernel.rs:26-49`, `:62`, `:96-102`, `:294-358` |
+| Megakernel launch layer: grid barrier (its state as a launch parameter at `:89-94`, its PTX at `:102-132`), `MEGA_BLOCK`, `max_resident_ctas`, `plan_grid`, and "still emits the block-scoped form today" | `crates/wukong_codegen_gpu/src/megakernel.rs:26-49`, `:61-65`, `:89-94`, `:102-132`, `:294-358` |
 | CUDA graph mechanics and the pool prerequisite | `crates/wukong_codegen_gpu/src/graph.rs:1-30` |
 | `RED_GRID`/`RED_BLOCK` **and the determinism rationale for the fixed grid**, the product `gpu::reduce` that consumes it, `stream_cfg`, `hbm_bandwidth` (its reduce arm at `:23538-23544`), `best_bw`, `decode_stack_latency` | `crates/wukong_codegen_gpu/src/gpu.rs:1219-1221`, `:1300-1303`, `:1361-1363`, `:23488-23595`, `:25087`; the offload caller at `crates/wukong_driver/src/gpu_accel.rs:155` |
 | The device-free module set (117) and the ptxas census corpus (wmma+flash+wgmma only) | same file, `:8247`, `:8473-8488`, `:8624`; `:22217`, `:22250-22335` |
 | FA2 wheel audit and the `fwd_kvcache` requirement; the `::marlin` device dispatcher (its `def` line, the `sm_90` auto-pick, the strawman guards) | `tools/cloud/modal_app.py:1297-1413`, `:3964`, `:4009`, `:4012-4017` |
-| The 4050 serving ledger, quarantined in 1.2 | `prompts/results/serving.md:100-107`, `:139-154`, `:191-233`, `:263-265`; `BENCHMARKS.md:51` (the standing-index scope note quoted in the device-scope block), `:366-377` (the results-table scope note, different words), `:395`, `:2466-2490` |
+| The 4050 serving ledger, quarantined in 1.2 | `prompts/results/serving.md:100-107`, `:139-157`, `:197-239`, `:268-271`; `BENCHMARKS.md:51` (the standing-index scope note quoted in the device-scope block), `:366-377` (the results-table scope note, different words), `:395`, `:2466-2490` |
 | Ping-pong's trigger, Stream-K's trigger, the 2x2x1 and 192x256 verdicts, the per-tile cost model | `docs/gpu/derive/WAVE3_DOSSIER.md:19-30`, `:1252-1386` |
 | The epilogue/fusion break-even model this wave inherits nothing from but must not contradict | `docs/gpu/derive/WAVE4_DOSSIER.md:188-277` |
 | The 8-bit `wgmma` transfer condition, the fp8 tolerance, the two-arm exactness split, `FAST_ACCUM` fairness | `docs/gpu/derive/WAVE5_DOSSIER.md:28-38`, `:388-411`, `:565-588`, `:823-845` |
@@ -1295,8 +1302,12 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 ### Open, and deliberately left open
 
 * Section 12.4's eight items, seven of which close inside one container.
-* Whether the 4050's SM count is 20 or 40 in `prompts/results/serving.md:149`, `:159` -- nothing
-  above depends on it, and it should be corrected at its own site.
+* The 4050's SM count in the two `prompts/results/serving.md` sentences is **closed** -- both now
+  read the probed 20 and cite the probe (`:149-152`, `:161-164`). **One site is still open and it is
+  a Rust file:** `crates/wukong_codegen_gpu/src/paged_attention.rs:84`, "which left 39/40 SMs idle".
+  Nothing above depends on it, and a docs-only commit must not touch it: it needs the full five-part
+  gate, so it belongs to whichever Rust commit next opens that file -- section 5's `v4` rewrite is
+  the obvious one.
 * Whether a `wgmma` decode GEMM is worth wiring at all, given that at `M <= 338` the roof is
   `M x BW` and the 64x64 WMMA tile already reaches it whenever the launch has enough CTAs. **That
   question is answered by `d3_gemmbw` and by nothing else**, and it is worth asking before Wave 4's
