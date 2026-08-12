@@ -498,8 +498,10 @@ read every percentage below as provisional pending a locked-clock VM re-run.
   shapes overlap. **1024³ f16 is refused** — the *peer's* own run-to-run floor was ±15.47% against a
   ±5% bar, so no number was minted for it.
 - Copy bandwidth **2922 GB/s = 87.2% of the 3352 GB/s spec peak**; the ≥90% milestone is not met.
+  *(Single-shot round, outside the instrument — no twin, no floor, no publish gate.)*
 - **Fused int8 GEMM+dequant beats the cuBLAS GEMM+dequant chain 1.08× at 1024³ / 1.15× at 2048³**
-  (the first outright peer win on this part) and **loses at 4096³, 0.79×**.
+  (the first outright peer win on this part) and **loses at 4096³, 0.79×**. *(Also single-shot and
+  outside the instrument, though same-run and oracle-gated; a repeat under it is owed.)*
 - **Sharp edge:** the 4050's int8 tile/occupancy tuning does **not** transfer — 22–52% of cuBLAS
   IMMA on Hopper against 96–105% on the 4050. Treat every other Ada-tuned threshold in the section
   below as unproven on Hopper until it is measured there.
