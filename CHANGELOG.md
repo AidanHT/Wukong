@@ -48,9 +48,11 @@ percentage is provisional pending a locked-clock root-VM re-run.
   fuses RELU/GELU/BIAS at **both** f32 and f16 output (so "we fuse what cuBLAS cannot" is refuted for
   those, leaving **SiLU** absent from its enum), and the visit's int4 round ran on an **H200**, so it
   is excluded from the H100 section by name.
-- `docs/roadmap.md` describes the Hopper GEMM family as what it is — capability-gated, and with **no
-  recognizer/CLI route to it yet** — and marks the in-flight scheduling work as *unmeasured*, with no
-  figure attached to it anywhere.
+- `docs/roadmap.md` describes the Hopper GEMM family as what it is — capability-gated, and (at that
+  entry's time) with **no recognizer/CLI route to it yet** — and marks the scheduling work as
+  *unmeasured*, with no figure attached to it anywhere. (Both facts moved later the same day: the
+  route landed with the entry below, and the scheduling wave merged; the roadmap text tracks that.)
+
 ### GPU — the Hopper `wgmma` GEMM family gets a product call site
 Until now the warpgroup-MMA + TMA kernel that the whole Act-2 campaign measures had **no caller
 outside its own test module**: no `.wk` program could reach it, on any device. `--backend=gpu` now
