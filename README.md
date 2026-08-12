@@ -129,8 +129,11 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   > at 2048³ there, reads 22–52% of IMMA on the H100. **They are also iteration-grade, not
   > publication-grade, and are published under that label:** the container could not lock clocks, and
   > `GPU_RETARGET_PLAN.md` §6.3 says container rounds are *iteration* data while VM rounds with
-  > `nvidia-smi -lgc` pinned are *publication* data — every cited log stamps itself `ITERATION data,
-  > not publication data`. Instead of a lock each round recorded its own before/after clocks and
+  > `nvidia-smi -lgc` pinned are *publication* data — every round behind these figures records the
+  > refusal itself (`[clock] lock: refused (…); running unlocked`), and five of them go further and
+  > stamp themselves `ITERATION data, not publication data` in an all-caps banner (`BENCHMARKS.md`
+  > names which five, and why the rest carry only the `[clock]` line). Instead of a lock each round
+  > recorded its own before/after clocks and
   > refused itself on drift — **two rounds did**, and those refusals are published — but a drift gate
   > catches a clock that *moved*, not one parked at the wrong steady state, so treat every percentage
   > above as provisional pending a locked-clock VM re-run. Per-shape tables, the mechanism, and a log
