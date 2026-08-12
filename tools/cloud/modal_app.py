@@ -3708,6 +3708,12 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
     `peers=True` additionally requires NVRTC/cuBLAS/cuBLASLt/cuDNN to load — leave it off on the
     first run so you learn what is missing instead of failing the whole suite.
 
+    `WUKONG_GPU_REQUIRE_CC` is its architecture-scoped sibling, set from `WK_GPU` through
+    `_cc_for_sku`: a gate that is locked to one architecture (`wukong_driver`'s Hopper wgmma route)
+    escalates its *capability* skip only when the round declared a part that gate would run on.
+    `WUKONG_GPU_REQUIRED` cannot serve there — it is set here on every run, so a Hopper-only gate
+    would fail every `WK_GPU=L4` suite for skipping correctly.
+
     `--strong-peers` is the §0 bar declaration: a comma list of `torch-compile,flash-attn,cutlass,
     marlin` (or `all`). It sets `WUKONG_STRONG_PEERS`, which `baselines::strong_peer_gate` turns into
     a hard failure when a declared peer is not actually on the box — so a round cannot publish
@@ -3722,6 +3728,18 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
         if driver:
             _require_prebuilt("wukong_driver", release)
         env["WUKONG_GPU_REQUIRED"] = "1"
+        # The capability this round DECLARED it was renting, so an architecture-specific gate can
+        # tell "this device correctly cannot run me" from "this container is not the part the round
+        # paid for". `WUKONG_GPU_REQUIRED` cannot answer that: it is set on every device run,
+        # including the routine `WK_GPU=L4` one, so escalating an architecture skip on it would turn
+        # every non-Hopper suite red. Derived from the request through this file's own device table
+        # rather than taken as a flag — a flag is one more thing to forget, and forgetting it is
+        # precisely the failure mode (a single-test `WK_GPU=H100` run that lands on an sm_89
+        # container and prints PASS having exercised nothing). Empty for a SKU the table does not
+        # know, which declares nothing and escalates nothing.
+        required_cc = _cc_for_sku(WK_GPU)
+        if required_cc:
+            env["WUKONG_GPU_REQUIRE_CC"] = required_cc
         if peers:
             env["WUKONG_PEER_REQUIRED"] = "1"
         if strong_peers:
@@ -3736,7 +3754,9 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
         # A single bare test name still works exactly as before.
         extra = filter.split()
 
-        print(f"Device suite on {WK_GPU} — GPU_REQUIRED=1, PEER_REQUIRED={'1' if peers else '0'}")
+        # `{WK_GPU}` is the REQUEST, not the device — the probed identity is what each gate prints.
+        print(f"Device suite on {WK_GPU} — GPU_REQUIRED=1, PEER_REQUIRED={'1' if peers else '0'}, "
+              f"REQUIRE_CC={required_cc or '(SKU not in the device table)'}")
         _clock_snapshot(env, "before device suite")
         rc1 = _run(["cargo", "test", "-p", "wukong_codegen_gpu", "--features", "gpu"] + profile
                    + ["--"] + extra, env, check=False)

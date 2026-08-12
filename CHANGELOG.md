@@ -96,8 +96,28 @@ everywhere else.
   snapshot and the Volume commit, matching `::cutlass`/`::marlin`/`::framework`. The invocation is
   pinned in `gpu_accel::HOPPER_GATE_INVOCATION` and a device-free law checks the whole chain — the
   named test exists, is not `#[ignore]`d, still compares the per-route counters, and both Modal
-  entrypoints still contain a `sys.exit`. A pinned invocation that does not reach its test is this
-  repo's fourth instance of that class and its second on paid hardware.
+  entrypoints still exit non-zero. A pinned invocation that does not reach its test is this repo's
+  fourth instance of that class and its second on paid hardware.
+- **…and the gate can no longer skip ITSELF green, which was the third way to the same product.**
+  Selecting the test and propagating its status still leaves it free to capability-skip: off Hopper
+  it printed `[skip]`, returned, and libtest reported `ok` — so the pinned single-test H100
+  invocation landing on a non-Hopper container was a green run that asserted nothing, and `WK_GPU`
+  defaults to `L40S`, one forgotten export away. Nothing in the harness compared the probed device
+  against the requested SKU (`::test` prints `Device suite on {WK_GPU}` — the *request*). `::test`
+  now exports **`WUKONG_GPU_REQUIRE_CC`**, the capability the round declared it rented, derived from
+  `WK_GPU` through modal_app.py's own device table; the gate escalates its capability skip to a
+  failure when that names a part the wgmma route takes and the device is not one. It deliberately
+  does **not** key on `WUKONG_GPU_REQUIRED=1`, which `::test` sets on every device run — a
+  Hopper-only gate escalating on that would fail every routine `WK_GPU=L4` suite for skipping
+  correctly. Proven by running the driver suite with `WUKONG_GPU_REQUIRE_CC=sm_90` on this repo's
+  sm_89 laptop: exactly that one gate turns red, with the probed device named.
+- **Both halves of that law got specific.** It now forbids the invocation acquiring `--no-driver` —
+  `::test` gates the only cargo invocation that can reach this gate on `driver`, and its own comment
+  already records that `rc2` is then "0 by construction" — and the entrypoint half asserts the exit
+  **carries the child's status**: every `rc… = _run(..)` a Modal entrypoint collects must be named by
+  the condition guarding its `sys.exit`, where before it was satisfied by the substring `sys.exit`
+  appearing anywhere in the function. The counter check is likewise scoped to the named gate's own
+  body rather than to the whole file.
 
 ### Documentation — every published claim is scoped to the device and the peer it was measured against
 `GPU_RETARGET_PLAN.md` §10 asks for "no published claim anywhere in the repo that silently

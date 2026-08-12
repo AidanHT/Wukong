@@ -778,7 +778,17 @@ Modal harness's `::bench`, which appends `--ignored`, and `::bench` used to disc
 status entirely — a failed witness assertion completed as a green `modal run`. The invocation is
 pinned in `gpu_accel::HOPPER_GATE_INVOCATION` (a `::test --filter` line, under that entrypoint's
 `sys.exit`), and a device-free law checks that it selects a test which exists, is not `#[ignore]`d,
-and still compares the route counters — plus that both Modal entrypoints can still exit non-zero.
+and still compares the route counters — plus that both Modal entrypoints can still exit non-zero,
+which means the guarding condition **names every `rc` they collect from a cargo run**, not merely
+that the string `sys.exit` occurs somewhere in the function. The third way that round could go green
+having exercised nothing is the gate **skipping itself**: it capability-skips off Hopper, so on any
+non-Hopper container it printed `[skip]` and libtest reported `ok`, with nothing comparing the probed
+device against the requested SKU (and `WK_GPU` defaults to `L40S`). `::test` therefore exports
+`WUKONG_GPU_REQUIRE_CC` — the capability the round *declared it rented*, from its own SKU table — and
+the gate escalates its capability skip to a failure when that declares a part the wgmma route takes
+while the device is not one. It cannot be `WUKONG_GPU_REQUIRED`: that is set on every device run,
+including the routine `WK_GPU=L4` suite, where skipping a Hopper-only gate is correct. The law also
+forbids the invocation acquiring `--no-driver`, which would select zero driver tests and exit 0.
 Its shape list
 lives in `gpu_accel::HOPPER_GATE_SHAPES` where a device-free law asserts what those shapes are chosen
 for: none declines under the H100 opt-in SMEM budget, each grid is a multiple of its cluster on every

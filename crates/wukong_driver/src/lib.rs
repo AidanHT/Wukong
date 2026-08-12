@@ -2268,10 +2268,19 @@ mod gpu_e2e_tests {
     /// successfully. `::test` is the entrypoint that ends `if rc1 or rc2: sys.exit(1)`.
     ///
     /// The `#[ignore]` bought nothing it needed: a non-Hopper device is a **capability** skip
-    /// handled in the body below (which deliberately does not escalate under
-    /// `WUKONG_GPU_REQUIRED=1`, exactly like `gpu_backend_declines_operands_past_the_f16_range`
-    /// beside it), and no device at all is a `skip_no_device`. So on this repo's RTX 4050 and on a
-    /// device-free CI runner it prints `[skip]` and returns, while on Hopper it is a hard gate.
+    /// handled in the body below, and no device at all is a `skip_no_device`. So on this repo's RTX
+    /// 4050 and on a device-free CI runner it prints `[skip]` and returns, while on Hopper it is a
+    /// hard gate.
+    ///
+    /// **Neither skip can survive the pinned invocation, and that took two different levers.** No
+    /// device is `skip_no_device` -> `diff::skip_or_fail`, a failure under `WUKONG_GPU_REQUIRED=1`,
+    /// which `::test` always sets. The capability skip cannot use that lever — `::test` sets it on
+    /// the routine `WK_GPU=L4` rounds too, where skipping this gate is correct — so it escalates on
+    /// `gpu_accel::REQUIRED_CC_ENV` instead: the capability the round *declared it rented*, exported
+    /// by `::test` from `WK_GPU`. Declared Hopper + probed non-Hopper is a mis-provisioned
+    /// container and fails; every other combination skips exactly as before. Without that, this
+    /// gate's own pinned single-test H100 invocation printed PASS on any non-Hopper container while
+    /// asserting nothing, which is the failure class the invocation constant exists to close.
     ///
     /// It asserts four separate things, and
     /// the first three are the ones a green-but-vacuous run would skip: that the device is
@@ -2311,15 +2320,39 @@ mod gpu_e2e_tests {
         };
         let cc = g.target().cc();
         if cc.0 != 9 {
-            // A CAPABILITY skip, not a device skip, so it must NOT escalate under
-            // `WUKONG_GPU_REQUIRED=1`: `sm_90a` is an architecture lock, and declining on a part that
-            // is not Hopper is the correct outcome (the rule `gpu.rs`'s `with_hopper` states).
-            eprintln!(
-                "[skip] {NAME}: wgmma is architecture-locked to sm_90a and this device is cc {}.{} \
-                 ({}) — the route is correctly `Existing` here",
+            // **A capability skip that can still be a failure — the third way this gate could go
+            // green having exercised nothing.**
+            //
+            // It must NOT escalate under `WUKONG_GPU_REQUIRED=1`: `::test` sets that on every device
+            // run, and skipping a Hopper-only gate on the L4/L40S rounds this campaign does most
+            // often is the CORRECT outcome (the rule `gpu.rs`'s `with_hopper` states). But the
+            // pinned single-test invocation in `gpu_accel::HOPPER_GATE_INVOCATION` books an H100 and
+            // selects this one test, so on a non-Hopper container it printed `[skip]`, returned,
+            // and libtest reported `ok` — the same green product as the 2026-08-11 vacuous run,
+            // reached a third way, with nothing anywhere comparing the probed device against the
+            // requested SKU (and `WK_GPU` defaults to `L40S`). `::test` now exports the declared
+            // capability, and a declared part this route TAKES against a probed part it does not is
+            // a mis-provisioned container, not a correct skip.
+            assert!(
+                !gpu_accel::capability_skip_is_a_failure(cc, gpu_accel::required_cc()),
+                "{NAME}: this round declared {}={} — a part the wgmma route TAKES — but the \
+                 container probed cc {}.{} ({}). Skipping here would report a green PASS having \
+                 executed no wgmma instruction, which is exactly what the pinned H100 invocation \
+                 exists to make impossible; the container is not the SKU the round paid for.",
+                gpu_accel::REQUIRED_CC_ENV,
+                std::env::var(gpu_accel::REQUIRED_CC_ENV).unwrap_or_default(),
                 cc.0,
                 cc.1,
                 g.device_name()
+            );
+            eprintln!(
+                "[skip:capability] {NAME}: wgmma is architecture-locked to sm_90a and this device \
+                 is cc {}.{} ({}) — the route is correctly `Existing` here. The round this gate \
+                 exists for is:\n    {}",
+                cc.0,
+                cc.1,
+                g.device_name(),
+                gpu_accel::HOPPER_GATE_INVOCATION
             );
             return;
         }
