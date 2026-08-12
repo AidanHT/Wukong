@@ -369,7 +369,9 @@ Triton's 30–120 s** (~4×10⁴–1.6×10⁵×).
 **GPU backend on an H100 80GB HBM3** (`sm_90a`, 132 SMs, Linux — a *different device* from the
 paragraph above, and the two do not mix; full section
 [below](#gpu-backend-nvidia-h100-80gb-hbm3-sm_90a), every figure logged under
-`bench/gpu/h100/2026-08-11-h100-w2-r*.log`). **Read all of it as iteration-grade:** these are
+`bench/gpu/h100/2026-08-11-h100-w2-r*.log`, plus one figure — the f16 scalar baseline — from the
+previous visit's `bench/gpu/h100/2026-08-10-h100-act2-wgmma-vs-cublas.log`).
+**Read all of it as iteration-grade:** these are
 *container* rounds with unlockable clocks, which `GPU_RETARGET_PLAN.md` §6.3 defines as *iteration*
 data rather than *publication* data. Every cited log records the refusal itself
 (`[clock] lock: refused (…); running unlocked`); five of the eleven also stamp themselves
@@ -378,8 +380,12 @@ why. The caveat is stated there in full and a locked-clock VM re-run is owed. Th
 **95.3% / 88.6% / 92.3% of cuBLAS f16 (f32 out) at 2048³ / 4096³ / 8192³** and **97.3%** on the
 GPT FFN down-projection, weakening to **73–80%** on the wide-N up-projections; bf16 agrees within
 ~2 points everywhere the shapes overlap. **1024³ is REFUSED in f16** — the peer's own twin arms
-disagreed by ±15.47%, so the instrument published nothing there. The six resolvable shapes moved from
-≈61% to **≈88%** of cuBLAS in one wave, and the dominant lever was the fused `st.global.v2.f32`
+disagreed by ±15.47%, so the instrument published nothing there. **The suite-level move is a bf16
+measurement**, because bf16 is the only dtype whose before *and* after were both taken in this visit:
+the six resolvable shapes went **60.8% → 87.3%** of cuBLAS. f16's after is **87.9%** on the same six
+shapes; its matching scalar baseline was taken in the *previous* visit (**61.7%**,
+`bench/gpu/h100/2026-08-10-h100-act2-wgmma-vs-cublas.log`), so the f16 pair is cross-visit and the
+section says so. The dominant lever was the fused `st.global.v2.f32`
 epilogue: the only single-axis reading of it is **+25.2 / +15.3 / +10.1 points** on the clustered arm
 at the three square shapes, while the suite-level move also carries the B-multicast cluster at four
 of the seven shapes — the section separates the two. A store-elided diagnostic arm reads
@@ -2142,17 +2148,36 @@ sectors and full ones. **Those three deltas are the only single-axis measurement
 they are the clustered arm's.
 
 The suite-level move is larger and is **not** a single-axis measurement, which is worth stating
-plainly rather than rounding off. bf16 had its before *and* after taken in this visit on the same
-seven shapes and reads **60.8% → 87.3%** (arithmetic mean of the six shapes that resolved in both;
+plainly rather than rounding off. **It is also a bf16 pair, and this document will not launder it
+into an f16 one.** bf16 had its before *and* after taken in this visit on the same seven shapes and
+reads **60.8% → 87.3%** (arithmetic mean of the six shapes that resolved in both;
 scalar in [`...-r11-bf16-scalar.log`](bench/gpu/h100/2026-08-11-h100-w2-r11-bf16-scalar.log), v2 in
-`...-r12-bf16-v2rule.log`), and f16 lands at **87.9%** on the same six shapes
-(`...-r10-vs-cublas-v2rule.log`). But `r11`'s arm was `wgmma_nt_bf16_128x256x64_s4` — **un-clustered
+`...-r12-bf16-v2rule.log`). But `r11`'s arm was `wgmma_nt_bf16_128x256x64_s4` — **un-clustered
 and scalar at all seven shapes** — while `r12` runs the shipped rule, which is clustered at four of
 them (`sq4096`, `sq8192`, `gpt_d1024_up`, `gpt_d4096_up`) and un-clustered at three. So the
 suite-level 60.8 → 87.3 is **the store plus the cluster** at four shapes and the store alone at
 three; only the three sweep rows above isolate the store by itself. Both the v2 store and the
 size-keyed cluster rule (`wgmma_w1_for`) landed together — `fd41ebf` for f16, `a1e3cd8` for bf16 —
 which is why no round separates them at the suite level.
+
+**f16's pair is cross-visit, not same-visit, and the difference is worth a paragraph.** `r10` gives
+f16's *after* — **87.9%**, the arithmetic mean of the same six shapes
+([`...-r10-vs-cublas-v2rule.log`](bench/gpu/h100/2026-08-11-h100-w2-r10-vs-cublas-v2rule.log)). No
+f16 *scalar-epilogue seven-shape suite ran in this visit at all*: `grep '% of cuBLAS'` over
+`...-r1-exact.log`, `...-r2-bringup.log` and `...-r4-ksweep.log` returns nothing. The f16 before is
+the **previous** visit's Act-2 round 1
+([`2026-08-10-h100-act2-wgmma-vs-cublas.log`](bench/gpu/h100/2026-08-10-h100-act2-wgmma-vs-cublas.log)),
+which ran the structurally identical arm — `wgmma_nt_f16_128x256x64_s4`, `cluster 1x1x1 (None)`, and
+necessarily scalar because `fd41ebf` (the commit that introduced the v2 epilogue at all) landed
+2026-08-11 23:05, a day later. It reads 68.2 / 67.5 / 58.8 / 54.8 / 78.0 / 42.8% on the six shapes
+`r10` resolves, mean **61.7%**, through the same instrument (provenance header, A/C peer twin, median
+of 5, `publish gate: OPEN`, `sm clock drift +0.00%`). So **f16 reads 61.7 → 87.9 across two visits**,
+and the honest label is *cross-visit*: two container tenancies, two different physical H100s, one
+comparison. It survives because both terms are same-run *ratios* to a cuBLAS measured in their own
+process — and it is corroborated inside this visit, where `r3`'s un-clustered scalar row `w1_s4_off`
+reads **67.2 / 67.3 / 56.8%** at the three square shapes against the previous visit's 68.2 / 67.5 /
+58.8% (within ~2 points at each). What does **not** exist is an f16 scalar reading on the three
+`gpt_*` FFN shapes anywhere in this visit.
 
 Three further readings from the same sweep, recorded so they are not re-run:
 
