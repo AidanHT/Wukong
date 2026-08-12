@@ -508,14 +508,16 @@ read every percentage below as provisional pending a locked-clock VM re-run.
 - **Sharp edge:** the 4050's int8 tile/occupancy tuning does **not** transfer — 22–52% of cuBLAS
   IMMA on Hopper against 96–105% on the 4050. Treat every other Ada-tuned threshold in the section
   below as unproven on Hopper until it is measured there.
-- As of this entry the kernel has **no `wukongc` flag or recognizer route**: `--backend=gpu` offloads
-  the five `Accelerator` families and none of them reach `gemm_nt_wgmma`, so the Hopper GEMM is
-  exercised through `wukong_codegen_gpu`'s own device benches, not yet from a `.wk` program.
+- At the time of those rounds the kernel had **no `wukongc` flag or recognizer route** — every
+  2026-08-11 number was measured through `wukong_codegen_gpu`'s own device benches, not from a `.wk`
+  program. The route has **since landed** (see the offload section below): on a Hopper part a
+  recognized `C = A·Bᵀ` now reaches `gemm_nt_wgmma`, with a decline-to-existing-path fallback. No
+  H100 number has yet been measured *through* that route.
 
-*Unmeasured, in progress:* the next wave of the campaign (scheduling work — CTA raster, persistent
-clusters, a per-shape tile class for the small square shape) is **implementation in flight, with no
-measurement behind it**. Its derivations are `docs/gpu/derive/`; nothing from it is in `BENCHMARKS.md`
-and nothing from it should be quoted as a result until a round publishes one.
+*Unmeasured, landed:* the campaign's scheduling wave (CTA raster on the cluster index, persistent
+clusters with a continuous ring, a per-shape tile dispatcher, wait-depth drain arms) is **merged but
+has no measurement behind it**. Its derivations are `docs/gpu/derive/`; nothing from it is in
+`BENCHMARKS.md` and nothing from it should be quoted as a result until a round publishes one.
 
 A GPU backend, `wukong_codegen_gpu`: being a compiler, it **emits PTX text** and **driver-JIT-loads
 it via `cudarc`** (`cuModuleLoadData` — the driver's built-in PTX→SASS JIT, so **no `nvcc`/`ptxas`/CUDA
