@@ -803,6 +803,114 @@ pub enum Schedule {
     Cooperative,
 }
 
+/// **SMs on the H100 SXM5 this campaign rents.** Measured, not a datasheet headline:
+/// `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:519`.
+///
+/// It is the number of resident CTAs in one "wave" -- occupancy is 1 CTA/SM twice over at W1 (SMEM
+/// 196 672 of 232 448 B, registers 384 x 168 = 64 512 of 65 536, and `setmaxnreg` cannot relax
+/// either because occupancy is decided by the STATIC per-thread allocation ptxas chose) -- and it is
+/// what [`TileSchedule`] divides to get its cluster-slot count.
+pub const HOPPER_SM_COUNT: usize = 132;
+
+/// **The exactness bound of the f32-reciprocal divmod** the persistent tile remap uses:
+/// `q = a / b` is exact for `a, b < 2^22`.
+///
+/// f32 has a 24-bit significand, `rcp.approx.ftz.f32` is within 1 ulp, and the two-sided correction
+/// in [`divmod_u32_ptx`] closes exactly that 1 ulp -- so the quotient is right whenever the true
+/// quotient and both operands are integers f32 represents exactly. [`WgmmaCfg::validate`] asserts
+/// the bound is unreachable rather than trusting it.
+pub const DIVMOD_F32_EXACT_LIMIT: usize = 1 << 22;
+
+/// **How many output tiles one CTA computes, and whether the pipeline survives the boundary between
+/// them** (wave-3 lever 2, the wave's ranked-#1 mechanism).
+///
+/// # Why this is its own axis and not a `Schedule` variant
+///
+/// [`Schedule`] is the WARP-specialisation choice (who produces, who consumes, and the CTA-M law
+/// that follows from it). This is the TILE-scheduling choice. They are orthogonal -- a future
+/// pingpong schedule must be able to be persistent or not -- and folding them into one enum makes
+/// the CTA-M law something that has to be restated in every new variant, which is exactly how a law
+/// gets dropped. The dossier spells these as `Schedule::Persistent`; the split is the one deliberate
+/// deviation, and it is a spelling, not a semantic.
+///
+/// # What persistence buys, and what it provably does not
+///
+/// **Not wave quantization.** With `grid = 132` and a static schedule, at sq4096 116 CTAs run 4
+/// tiles and 16 run 3 -- the critical path is still 4 tiles and the imbalance is *identical* to the
+/// wave picture. Removing the 3.03% needs Stream-K, not persistence. Anyone who attributes the gain
+/// to quantization has mis-attributed it (WAVE3_DOSSIER 2.2).
+///
+/// What it buys is `X_fill`, the ring fill, at every tile boundary. Measured: `X = 13.84 us` of
+/// per-tile fixed cost, of which `X_fill = 7.85 us` is four ring stages at 1.96 us each, and those
+/// 1.96 us move `132 CTAs x 49 152 B = 6.488 MB` device-wide, i.e. **3.31 TB/s = 98.7% of HBM
+/// peak**. The fill is a BANDWIDTH event, and at a wave boundary no CTA anywhere on the device has
+/// anything to overlap it with. Under a continuous ring the producer starts tile `t+1`'s stage 0..3
+/// copies while the consumers are still draining tile `t` (`4 x 0.646 + X_epi 5.99 = 8.57 us` of
+/// window against 7.85 us of fill), so the fill is hidden. `X_epi` is NOT saved: the consumer cannot
+/// issue tile `t+1`'s first `wgmma` until tile `t`'s accumulators are stored, because `scale-d = 0`
+/// on that instruction overwrites them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileSchedule {
+    /// One tile per CTA, the grid IS the tile map. Every row that shipped before wave 3, and the
+    /// text those rounds measured byte for byte.
+    OneTilePerCta,
+    /// **The diagnostic arm**: a persistent tile loop whose ring is DRAINED at every tile boundary
+    /// -- the producer may not issue tile `t+1`'s first copy until every consumer in the cluster has
+    /// finished tile `t`'s k-loop.
+    ///
+    /// It isolates CTA dispatch from the fill overlap. If it ties [`TileSchedule::OneTilePerCta`],
+    /// dispatch is worth nothing and the whole gain is the ring, which is what the derivation
+    /// predicts; if it WINS, the derivation is wrong and the mechanism is dispatch.
+    ///
+    /// **The ring POINTERS still carry, and that is not the dossier's word but it is its own
+    /// rule.** WAVE3_DOSSIER 2.7's checklist says `%stg` and the phase parities must CARRY because
+    /// "a reset parity against a live barrier is a hang", and it is right: an mbarrier's phase
+    /// parity is the parity of its completion count, stages complete an unequal number of times
+    /// when `ktiles % stages != 0`, and the only way to force them equal is to re-initialise
+    /// barriers a peer may be signalling -- the classic cluster race the same checklist forbids. So
+    /// the drain is a RENDEZVOUS (one extra mbarrier, `empty_arrivals()` arrivals, consumers arrive
+    /// after the k-loop, the producer waits before advancing) rather than a pointer reset. It
+    /// delivers the measurement the arm exists for -- no fill overlap across the boundary -- without
+    /// the hang.
+    PersistentDrained,
+    /// **THE ARM**: a persistent tile loop with a CONTINUOUS ring. `%stg` and both phase parities
+    /// carry across the tile boundary, so the producer runs straight on into the next tile's fill
+    /// while the consumers drain and store the last one.
+    Persistent,
+}
+
+impl TileSchedule {
+    /// The entry-name / module-key suffix. Empty for [`TileSchedule::OneTilePerCta`], so every row
+    /// that shipped before wave 3 keeps its exact name, key and module.
+    pub const fn key_tag(self) -> &'static str {
+        match self {
+            TileSchedule::OneTilePerCta => "",
+            TileSchedule::PersistentDrained => "_pstop",
+            TileSchedule::Persistent => "_p",
+        }
+    }
+    /// Does the kernel carry a tile loop at all?
+    pub const fn is_persistent(self) -> bool {
+        !matches!(self, TileSchedule::OneTilePerCta)
+    }
+    /// Does the ring survive the tile boundary? Only the real arm.
+    pub const fn carries_ring(self) -> bool {
+        matches!(self, TileSchedule::Persistent)
+    }
+    /// Does the emitter need the extra tile-rendezvous mbarrier?
+    pub const fn needs_tile_barrier(self) -> bool {
+        matches!(self, TileSchedule::PersistentDrained)
+    }
+    /// One line for the round log.
+    pub const fn label(self) -> &'static str {
+        match self {
+            TileSchedule::OneTilePerCta => "one tile per CTA (rounds 1-3)",
+            TileSchedule::PersistentDrained => "persistent, ring DRAINED per tile (diagnostic)",
+            TileSchedule::Persistent => "persistent, CONTINUOUS ring across tiles",
+        }
+    }
+}
+
 /// Cluster multicast of an operand.
 ///
 /// # The axis is the whole lever, and the two arms point OPPOSITE ways
@@ -1209,6 +1317,41 @@ pub struct WgmmaCfg {
     /// intra-cluster rank re-added afterwards, which is what [`RasterGrid`] encodes and what
     /// `the_raster_keeps_every_cluster_on_one_n_tile` asserts.
     pub raster: u16,
+    /// **How many tiles one CTA computes** (wave-3 lever 2) -- see [`TileSchedule`]. Part of
+    /// [`WgmmaCfg::derived_name`], so a persistent row can never be handed the one-tile kernel by
+    /// the module cache.
+    pub tiles: TileSchedule,
+    /// **`wgmma.wait_group` depth in the mainloop** (wave-3 lever 4). `0` is the full drain every
+    /// row shipped before wave 3, and emits byte-identical text to it.
+    ///
+    /// # The `0` is not a tuning knob, and that is why this field is paired with a function
+    ///
+    /// Today the consumer issues its `BK/16` `wgmma` as one group, `commit_group`s, waits to depth
+    /// 0 and then releases the stage's `empty` barrier. The release PUBLISHES the buffer to the
+    /// producer, so it may not precede the last read of it: any depth above 0 *at that position* is
+    /// a correctness bug, not a slower or faster kernel. The lever is a RESTRUCTURING -- wait to
+    /// depth `D` and release the stage that is `D` groups old -- and the two halves come from one
+    /// function, [`WgmmaCfg::release_lag`], so they cannot disagree. A lag SMALLER than the depth is
+    /// this wave's silent corruption: the producer refills a buffer whose `wgmma` has not retired,
+    /// and the result is wrong operands with no error anywhere.
+    ///
+    /// # Budgeted at ZERO, deliberately
+    ///
+    /// `D = 1` at 4 stages has exactly the prefetch depth of `D = 0` at 3 stages, and Fit C measured
+    /// that configuration: `S(s3) = 0.7056 us` against `S(s4) = 0.6460`, a **9.2% penalty**. Against
+    /// a bubble worth 13.3-20.0% of a stage (the bracket is the width of the unlocked-clock
+    /// ambiguity), the net is between +0.5% and -7.7%, and 128x256 s5 declines on shared memory so
+    /// the stage cannot be bought back. It is emitted and measured; nothing is budgeted for it.
+    pub wait_depth: usize,
+    /// **Hoist `wgmma.fence.sync.aligned` out of the k-loop** (wave-3 lever 4b). `false` is the
+    /// per-iteration fence rounds 1-3 measured.
+    ///
+    /// CUTLASS fences around the mainloop, not per k-tile. A per-iteration fence is legal but
+    /// invites ptxas to treat the accumulators conservatively across the loop back-edge. Zero
+    /// registers, one instruction out of the drain-to-issue bubble, and a possible second-order win
+    /// in how ptxas schedules -- the free component of the drain lever, and the one worth taking
+    /// whatever the depth measures at.
+    pub fence_hoisted: bool,
 }
 
 impl WgmmaCfg {
@@ -1350,9 +1493,59 @@ impl WgmmaCfg {
     pub const fn empty_off(&self, s: usize) -> usize {
         self.full_off(self.stages) + s * 8
     }
+    /// Byte offset of the **tile rendezvous** mbarrier -- only present under
+    /// [`TileSchedule::PersistentDrained`], which is the one arm that needs the producer to stop at
+    /// the tile boundary. See [`TileSchedule::PersistentDrained`] for why the drain is a rendezvous
+    /// and not a pointer reset.
+    pub const fn tile_bar_off(&self) -> usize {
+        self.empty_off(self.stages)
+    }
     /// Total dynamic shared memory the entry needs.
     pub const fn smem_bytes(&self) -> usize {
-        self.empty_off(self.stages)
+        if self.tiles.needs_tile_barrier() {
+            self.tile_bar_off() + 8
+        } else {
+            self.empty_off(self.stages)
+        }
+    }
+    /// **CTAs per cluster along the M axis** -- `cluster_shape().1`, so 2 under
+    /// [`Multicast::ClusterB`] and 1 otherwise. The raster groups m-CLUSTERS and the persistent loop
+    /// iterates them, so both read this rather than re-deriving the axis.
+    pub const fn cluster_m(&self) -> usize {
+        let m = self.multicast.cluster_shape().1 as usize;
+        if m == 0 {
+            1
+        } else {
+            m
+        }
+    }
+    /// **Cluster slots one wave of this device holds**: `HOPPER_SM_COUNT / cluster_ctas`, so 66
+    /// under a 2-CTA cluster and 132 without one.
+    ///
+    /// This is the persistent loop's STRIDE, and the reason the loop is indexed by the cluster
+    /// rather than by the CTA (WAVE3_DOSSIER 2.6). The kernel reads it as `%nctaid.x` rather than as
+    /// a literal, so an under- or over-subscribed launch is still correct; the host reaches it
+    /// through [`LaunchPlan::grid`], which caps it at the tile count so a small shape does not
+    /// launch 66 clusters for 6 tiles.
+    pub const fn persist_cluster_slots(&self) -> usize {
+        let s = HOPPER_SM_COUNT / self.cluster_ctas();
+        if s == 0 {
+            1
+        } else {
+            s
+        }
+    }
+    /// **The stage the mainloop releases, counted back from the one it is issuing against** -- and
+    /// the depth it waits to. ONE function, read by BOTH sites (law L4.2).
+    ///
+    /// The mainloop waits to depth `release_lag()` and releases stage
+    /// `(stg + stages - release_lag()) % stages`. A lag smaller than the depth lets the producer
+    /// refill a buffer whose `wgmma` has not retired -- wrong operands, no error, at full speed. One
+    /// function is what makes the pair unable to disagree, the same discipline
+    /// [`Multicast::cluster_shape`] already carries for the launch attribute and the
+    /// `.reqnctapercluster` directive.
+    pub const fn release_lag(&self) -> usize {
+        self.wait_depth
     }
     /// Registers the warp-specialised split consumes once `setmaxnreg` has run.
     pub const fn regs_after_split(&self) -> u32 {
@@ -1418,6 +1611,7 @@ impl WgmmaCfg {
             // in M (grid y). See `Multicast::cluster_shape`.
             cluster: self.multicast.cluster_shape(),
             raster: self.raster,
+            tiles: self.tiles,
         }
     }
 
@@ -1439,7 +1633,7 @@ impl WgmmaCfg {
     /// table row device-free.
     pub fn derived_name(&self) -> String {
         format!(
-            "wgmma_nt_{}_{}x{}x{}_s{}{}{}{}{}",
+            "wgmma_nt_{}_{}x{}x{}_s{}{}{}{}{}{}{}",
             self.dtype.token(),
             self.bm,
             self.bn,
@@ -1448,8 +1642,21 @@ impl WgmmaCfg {
             self.multicast.key_tag(),
             self.epilogue.key_tag(),
             self.l2_hint.key_tag(),
-            self.raster_tag()
+            self.raster_tag(),
+            self.tiles.key_tag(),
+            self.drain_tag()
         )
+    }
+
+    /// The drain half of the derived name: `_fh` for the hoisted fence alone, `_dN` for wait depth
+    /// `N` (which always carries the hoist, so the two never appear together). Empty at the
+    /// pre-wave-3 defaults, so no shipped row's key moves.
+    pub fn drain_tag(&self) -> String {
+        match (self.wait_depth, self.fence_hoisted) {
+            (0, false) => String::new(),
+            (0, true) => "_fh".to_string(),
+            (d, _) => format!("_d{d}"),
+        }
     }
 
     /// The [`WgmmaCfg::raster`] half of the derived name. Empty at `GROUP_M = 1`, so every row that
@@ -1717,6 +1924,73 @@ impl WgmmaCfg {
                 ));
             }
         }
+        // **The persistent tile loop's own preconditions** (wave-3 lever 2). Its failure mode is a
+        // HANG on rented silicon, which is the one class of defect that must never reach a device.
+        if self.tiles.is_persistent() {
+            if self.multicast == Multicast::ClusterA {
+                // The loop index is `%ctaid.x` precisely because both ranks of a `1x2x1` cluster
+                // share it. `ClusterA`'s `2x1x1` cluster varies the rank ALONG x, so the two ranks
+                // of a cluster would get different `cid` sequences, land on different tiles and --
+                // on any `cluster_tiles % slots` split -- retire at different times, leaving one
+                // rank's producer multicasting into the shared memory of a CTA that has exited.
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: the persistent loop is indexed by grid X so that both ranks \
+                     of a cluster share it, and Multicast::ClusterA's 2x1x1 cluster varies the rank \
+                     along X. A CTA-indexed persistent loop under a cluster HANGS on any \
+                     tiles-mod-slots split (WAVE3_DOSSIER 2.6). Persistence is expressible under \
+                     Multicast::None and Multicast::ClusterB.",
+                    self.name
+                ));
+            }
+            if !self.bn.is_power_of_two() {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: the persistent loop derives the n-tile count on device as \
+                     ceil(N/{}) with a SHIFT, which needs a power-of-two CTA-N",
+                    self.name, self.bn
+                ));
+            }
+            if !self.bm.is_power_of_two() {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: the persistent loop derives the m-tile count on device as \
+                     ceil(M/{}) with a SHIFT, which needs a power-of-two CTA-M",
+                    self.name, self.bm
+                ));
+            }
+            // **The divmod's exactness bound, asserted rather than trusted** (WAVE3_DOSSIER 2.8).
+            // The largest flat cluster index is `m_clusters * n_tiles <= M*N / (BM*BN*cluster_m)`,
+            // and the family already declines past `M*N > u32::MAX` for the epilogue's element
+            // index -- so this is a static statement about the geometry, not a runtime hope.
+            let cid_max = u32::MAX as usize / (self.bm * self.bn * self.cluster_m());
+            if cid_max >= DIVMOD_F32_EXACT_LIMIT {
+                return Err(format!(
+                    "{UNSUPPORTED}: {}: a {}x{} tile over a {}-CTA M cluster admits a flat cluster \
+                     index up to {cid_max}, at or past the {DIVMOD_F32_EXACT_LIMIT} bound that \
+                     makes the f32-reciprocal divmod EXACT. Past 2^22 the two-sided correction no \
+                     longer closes rcp.approx's error and the tile remap is off by one -- two CTAs \
+                     on one tile and another computed by nobody.",
+                    self.name,
+                    self.bm,
+                    self.bn,
+                    self.cluster_m()
+                ));
+            }
+        }
+        // **The ring law (L4.4).** A consumer that holds more buffers than the ring has is a
+        // deadlock, and a deadlock must be a printed decline on a CPU rather than a time-box on
+        // rented silicon. At depth `D` the consumer holds `D + 1` buffers (the one it is issuing
+        // against and the `D` whose groups are still in flight) and the producer must still be able
+        // to run one ahead, so the ring needs `D + 2`.
+        if self.stages < self.wait_depth + 2 {
+            return Err(format!(
+                "{UNSUPPORTED}: {}: wait_depth {} needs at least {} stages and this ring has {}. At \
+                 depth D the consumer holds D+1 buffers and the producer must be able to run one \
+                 ahead; a shorter ring is a deadlock, not a slower kernel.",
+                self.name,
+                self.wait_depth,
+                self.wait_depth + 2,
+                self.stages
+            ));
+        }
         // **GUARD G3, and deliberately LAST**: every geometric decline above should name the
         // geometry that is wrong, not the name that follows from it, so a caller probing a shape
         // gets the shape's answer. A row that passes everything else and is still mis-named is the
@@ -1890,6 +2164,9 @@ pub struct LaunchPlan {
     /// and the raster's in-kernel decode are two halves of ONE decomposition and a second
     /// derivation of either is how a CTA lands on a tile nobody meant it to have.
     pub raster: u16,
+    /// **The tile schedule** -- see [`TileSchedule`]. Reached through [`LaunchPlan::grid`] for the
+    /// same reason `raster` is: the grid and the in-kernel loop are two halves of one decomposition.
+    pub tiles: TileSchedule,
 }
 
 /// **The grouped raster's decomposition, as a pure function of the numbers** -- the device-free
@@ -1987,6 +2264,48 @@ impl RasterGrid {
         let rank = y % self.cluster_m;
         Some((m_cluster * self.cluster_m + rank, y / self.cluster_m))
     }
+
+    /// **Cluster-tiles**: `m_clusters * n_tiles`, the extent the persistent loop's flat index runs
+    /// over. Note it counts CLUSTERS, not CTAs -- iterating CTAs is the deadlock of WAVE3_DOSSIER
+    /// 2.6.
+    pub fn cluster_tiles(&self) -> u32 {
+        self.m_clusters() * self.n_tiles
+    }
+
+    /// **The persistent path's map**: which `(m_tile, n_tile)` cluster-tile `cid` at intra-cluster
+    /// rank `rank` owns.
+    ///
+    /// # Why this is a second map and not the same one
+    ///
+    /// [`RasterGrid::tile_of`]'s division-free trick works because the non-persistent kernel's tile
+    /// index *is* `%ctaid`, so the group structure can live in the grid. Under persistence the tile
+    /// index is a LOOP VARIABLE, so the swizzle has to be computed in-kernel from a flat `cid` and
+    /// two runtime integer divisions come back. They are worth taking: ~26 instructions once per
+    /// tile against `n_k >= 16` stages of ~1200 clocks each is **under 0.06% of a tile**
+    /// (WAVE3_DOSSIER 2.8), and the alternative is host-passed magic numbers, which is a
+    /// `PARAM_ORDER` change.
+    ///
+    /// This is Triton's grouped-M form applied to the CLUSTER index, and it is bijective over
+    /// `[0, m_clusters * n_tiles)` **including the short last group**: for the last `grp`, `i`
+    /// ranges over `[0, rows*n_tiles)` and `(i % rows, i / rows)` covers `[0,rows) x [0,n_tiles)`
+    /// exactly once. Persistence therefore removes the ragged-group pad of
+    /// [`wgmma_tile_origin_ptx`] entirely -- `cid` enumerates only real cluster-tiles and no CTA
+    /// needs the cluster-uniform early exit.
+    pub fn tile_of_cid(&self, cid: u32, rank: u32) -> (u32, u32) {
+        let (cm, cn) = if !self.on {
+            // Linear: n-fastest, which is the order the non-persistent grid dispatches in
+            // (`x` = n tile is the fastest-varying axis), so the two arms differ in the GROUPING
+            // and in nothing else.
+            (cid / self.n_tiles, cid % self.n_tiles)
+        } else {
+            let gcols = self.gc * self.n_tiles;
+            let grp = cid / gcols;
+            let i = cid % gcols;
+            let rows = self.gc.min(self.m_clusters() - grp * self.gc);
+            (grp * self.gc + i % rows, i / rows)
+        };
+        (cm * self.cluster_m + rank, cn)
+    }
 }
 
 /// **The tile origin, and the only place in the generated kernel that reads `%ctaid`.**
@@ -2053,6 +2372,162 @@ fn wgmma_tile_origin_ptx(cfg: &WgmmaCfg) -> String {
     s
 }
 
+/// **An exact `u32` divmod in 13 instructions, with no `div`, no `rem` and no host-passed magic
+/// number** (WAVE3_DOSSIER 2.8).
+///
+/// `rcp.approx.ftz.f32` is within 1 ulp and f32 has a 24-bit significand, so the truncated estimate
+/// is off by at most one in either direction; the two-sided correction closes exactly that. The
+/// result is therefore **exact for `a, b < 2^22`** -- a bound [`WgmmaCfg::validate`] proves
+/// unreachable from the geometry rather than assuming.
+///
+/// Why not `div.u32` / `rem.u32`: they exist, and on this hardware they are a ~20-instruction
+/// expansion each with a much longer dependent chain. Why not host-passed magic numbers: they are
+/// two more kernel parameters, and `PARAM_ORDER` is a six-entry law enforced by
+/// `every_wgmma_entry_declares_exactly_the_parameters_the_launcher_pushes`.
+///
+/// `q` and `r` must be distinct registers, and neither may alias `a` (the remainder is computed
+/// from `a` after `q` is written). `%fa`/`%fb`/`%fr`/`%fq`/`%pc` are the helper's own scratch.
+fn divmod_u32_ptx(q: &str, r: &str, a: &str, b: &str) -> String {
+    format!(
+        "    cvt.rn.f32.u32 %fa,{a};\n    cvt.rn.f32.u32 %fb,{b};\n    rcp.approx.ftz.f32 \
+         %fr,%fb;\n    mul.f32 %fq,%fa,%fr;\n    cvt.rzi.u32.f32 {q},%fq;\n    mul.lo.s32 \
+         {r},{q},{b};\n    sub.s32 {r},{a},{r};\n    setp.lt.s32 %pc,{r},0;\n    @%pc sub.u32 \
+         {q},{q},1;\n    @%pc add.s32 {r},{r},{b};\n    setp.ge.s32 %pc,{r},{b};\n    @%pc add.u32 \
+         {q},{q},1;\n    @%pc sub.s32 {r},{r},{b};\n"
+    )
+}
+
+/// **The persistent loop's bounds, computed once per kernel** -- the m-cluster count, the n-tile
+/// count, their product (the flat cluster-tile extent), this CTA's starting cluster slot and the
+/// stride.
+///
+/// Every divide here is a SHIFT: `BM`, `BN` and `cluster_m` are all powers of two, validated. The
+/// stride is read as `%nctaid.x` rather than baked in as `HOPPER_SM_COUNT / cluster_ctas`, so the
+/// kernel is correct at whatever grid the host launched -- under- or over-subscribed -- and
+/// [`LaunchPlan::grid`] cannot disagree with it.
+///
+/// **`%cid` is `%ctaid.x` and that is the deadlock law** (WAVE3_DOSSIER 2.6). Both ranks of a
+/// `1x2x1` cluster share `%ctaid.x`, so they iterate the identical sequence and have identical tile
+/// counts *by construction*. A CTA-indexed loop -- `tile = ctaid; tile += gridDim` -- puts the two
+/// ranks of a cluster on opposite sides of any `tiles mod slots` split, and then rank 0's producer
+/// waits forever on `empty[s]` arrivals rank 1 will never make and multicasts into the shared memory
+/// of a CTA that has exited. This is not a check to be added; it is a shape of loop that makes the
+/// check unnecessary, which is the only kind of fix worth having for a deadlock.
+fn wgmma_tile_bounds_ptx(cfg: &WgmmaCfg) -> String {
+    let (bm, bn) = (cfg.bm, cfg.bn);
+    let cm = cfg.cluster_m();
+    let mut s = format!(
+        "    // persistent tile loop -- {}; the loop index is the CLUSTER, never the CTA\n",
+        cfg.tiles.label()
+    );
+    s += &format!(
+        "    add.u32 %tmp,%M,{};\n    shr.u32 %mclus,%tmp,{};\n",
+        bm - 1,
+        bm.trailing_zeros()
+    );
+    if cm > 1 {
+        s += &format!(
+            "    add.u32 %mclus,%mclus,{};\n    shr.u32 %mclus,%mclus,{};\n",
+            cm - 1,
+            cm.trailing_zeros()
+        );
+    }
+    s += &format!(
+        "    add.u32 %tmp,%N,{};\n    shr.u32 %ntile,%tmp,{};\n",
+        bn - 1,
+        bn.trailing_zeros()
+    );
+    s += "    mul.lo.s32 %nct,%mclus,%ntile;\n";
+    s += "    mov.u32 %cid,%ctaid.x;\n    mov.u32 %slots,%nctaid.x;\n";
+    s
+}
+
+/// **The persistent tile map: flat cluster index -> `%ctam` / `%ctan`.**
+///
+/// Emitted from ONE function and asserted to appear **exactly twice** in the entry -- once in the
+/// producer branch, once in the consumer branch. If the two copies ever disagreed the consumer would
+/// compute with the producer's tile: silently wrong, no hang, and NOT caught by the epilogue's bounds
+/// predicates, which only know `row < M && col < N`. This is the same discipline
+/// [`Multicast::cluster_shape`] carries so the launch attribute, the `.reqnctapercluster` directive
+/// and the grid's rounding cannot disagree.
+///
+/// Under a raster it is the grouped-M swizzle of WAVE3_DOSSIER 2.8 applied to the CLUSTER index with
+/// `%crank` re-added -- so both ranks land on the same `%ctan`, which is the one thing a B multicast
+/// forbids breaking. Without one it is a single divmod in n-fastest order, which is the order the
+/// non-persistent grid dispatches in, so the two arms differ in the GROUPING and in nothing else.
+fn wgmma_tile_index_ptx(cfg: &WgmmaCfg) -> String {
+    let (bm, bn) = (cfg.bm, cfg.bn);
+    let cm = cfg.cluster_m();
+    let mut s = String::from("    // tile index <- flat cluster id (WAVE3_DOSSIER 2.8)\n");
+    if cfg.raster > 1 {
+        let gc = (cfg.raster as usize / cm).max(1);
+        s += &format!("    mul.lo.s32 %cgcols,%ntile,{gc};\n");
+        s += &divmod_u32_ptx("%cgrp", "%ci", "%cid", "%cgcols");
+        // rows = min(GC, m_clusters - grp*GC): the last group may be short, and its `i` then runs
+        // over `[0, rows*n_tiles)` so `(i % rows, i / rows)` still covers it exactly once.
+        s += &format!("    mul.lo.s32 %crows,%cgrp,{gc};\n");
+        s += "    sub.s32 %crows,%mclus,%crows;\n";
+        s += &format!("    min.u32 %crows,%crows,{gc};\n");
+        s += &divmod_u32_ptx("%ccn", "%cr", "%ci", "%crows");
+        s += &format!("    mad.lo.s32 %ccm,%cgrp,{gc},%cr;\n");
+    } else {
+        s += &divmod_u32_ptx("%ccm", "%ccn", "%cid", "%ntile");
+    }
+    if cm > 1 {
+        s += &format!(
+            "    shl.b32 %ccm,%ccm,{};\n    add.u32 %ccm,%ccm,%crank;\n",
+            cm.trailing_zeros()
+        );
+    }
+    s += &format!("    mul.lo.s32 %ctam,%ccm,{bm};\n");
+    s += &format!("    mul.lo.s32 %ctan,%ccn,{bn};\n");
+    s
+}
+
+/// **Release one ring stage's `empty` barrier**, from the slot index in `slot_reg`.
+///
+/// One function, three call sites (the mainloop's release, `CDRAIN`'s tail releases, and nothing
+/// else), because the clustered form is eight instructions of `cvta`/`mapa`/`arrive` per peer and
+/// three hand-written copies of it would be three chances to release the wrong CTA's barrier --
+/// which is a producer refilling a stage a peer is still reading, i.e. wrong operands with no error.
+///
+/// `pred` is an optional extra predicate ANDed with "this thread is lane 0 of its warpgroup": the
+/// mainloop's lagged release uses it for the first `wait_depth` iterations, which have no older
+/// group to retire.
+fn stage_release_ptx(cfg: &WgmmaCfg, slot_reg: &str, pred: Option<&str>) -> String {
+    let empty_base = cfg.empty_off(0);
+    let mut s = format!("    mul.wide.u32 %rdT,{slot_reg},8;\n    add.s64 %rdBar,%rdS,%rdT;\n");
+    s += &format!("    add.s64 %rdBar,%rdBar,{empty_base};\n");
+    s += "    and.b32 %tmp,%lin,127;\n    setp.eq.u32 %p2,%tmp,0;\n";
+    if let Some(p) = pred {
+        s += &format!("    and.pred %p2,%p2,{p};\n");
+    }
+    s += &barrier_arrive_ptx(cfg);
+    s
+}
+
+/// The `@%p2`-predicated arrival on the barrier whose GENERIC address is in `%rdBar`: CTA-local
+/// without a cluster, and one `mapa`-relative arrival per cluster CTA with one.
+///
+/// Under a cluster a stage's slice was multicast in by a peer's producer, so that producer may not
+/// overwrite it until every consumer IN THE CLUSTER is done -- which is why `empty[s]` is
+/// initialised with `cluster_ctas * consumer_wgs` arrivals and gets one from every consumer
+/// warpgroup of every CTA. `mapa` takes a 32-bit SHARED address, not the 64-bit generic one, and an
+/// mbarrier arrival at `.shared::cluster` scope cannot return a state token (hence the `_` sink):
+/// both are the CUTLASS idiom verbatim.
+fn barrier_arrive_ptx(cfg: &WgmmaCfg) -> String {
+    if cfg.cluster_ctas() <= 1 {
+        return "    @%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];\n".to_string();
+    }
+    let mut s = "    cvta.to.shared.u64 %rdT,%rdBar;\n    cvt.u32.u64 %sbar,%rdT;\n".to_string();
+    for r in 0..cfg.cluster_ctas() {
+        s += &format!("    mov.u32 %tmp2,{r};\n");
+        s += "    mapa.shared::cluster.u32 %rbar,%sbar,%tmp2;\n";
+        s += "    @%p2 mbarrier.arrive.shared::cluster.b64 _,[%rbar];\n";
+    }
+    s
+}
+
 impl LaunchPlan {
     /// CTAs per cluster -- the product of the cluster shape.
     pub fn cluster_ctas(&self) -> u32 {
@@ -2100,6 +2575,26 @@ impl LaunchPlan {
     /// [`RasterGrid`], so a grid that disagrees with the kernel's decode is not expressible.
     pub fn grid(&self, m: usize, n: usize) -> (u32, u32, u32) {
         let cy = self.cluster.1.max(1);
+        // **Under persistence the grid is FLAT, and it is a grid of CLUSTER SLOTS.** `x` is the
+        // cluster slot -- which both ranks of a cluster share, by construction, because the cluster
+        // extends along `y` -- and `y` is the rank. The kernel's stride is `%nctaid.x`, i.e. exactly
+        // this `x`, so an under- or over-subscribed launch is still correct and the two derivations
+        // cannot disagree. The raster's group structure moves into the kernel
+        // ([`RasterGrid::tile_of_cid`]) because the tile index is now a loop variable, not `%ctaid`.
+        if self.tiles.is_persistent() {
+            let ctas = self.cluster_ctas().max(1);
+            let g = RasterGrid::new(
+                self.raster as u32,
+                cy,
+                m.div_ceil(self.bm) as u32,
+                n.div_ceil(self.bn) as u32,
+            );
+            let nct = g.cluster_tiles().max(1);
+            // Never more slots than there are cluster-tiles: a 6-cluster shape must not launch 66
+            // slots, 60 of which fall straight out of the loop guard.
+            let slots = ((HOPPER_SM_COUNT as u32) / ctas).max(1).min(nct);
+            return (slots, cy, 1);
+        }
         if self.raster > 1 {
             return RasterGrid::new(
                 self.raster as u32,
@@ -2161,6 +2656,9 @@ pub const WGMMA_W1: WgmmaCfg = WgmmaCfg {
     epilogue: EpilogueStore::Scalar,
     l2_hint: L2Hint::None,
     raster: 1,
+    tiles: TileSchedule::OneTilePerCta,
+    wait_depth: 0,
+    fence_hoisted: false,
 };
 
 /// **The descriptor reading every shipped row carries**, in one place so the sweep's "ACTION" line is
@@ -2573,6 +3071,47 @@ pub const WGMMA_W1_MCB_V2_R32: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1_MCB_V2
 };
 
+// --- wave 3 lever 2: persistence, both arms one fact off the raster winner ------------------------
+
+/// **The persistence DIAGNOSTIC**: [`WGMMA_W1_MCB_V2_R16`] with a tile loop whose ring is drained at
+/// every boundary.
+///
+/// It exists because "persistence helps" and "the CONTINUOUS RING helps" are different claims, and
+/// only the second one is the derivation. This arm keeps the tile loop -- so it collects whatever
+/// CTA dispatch is worth -- and gives up the fill overlap. **Predicted: ties the one-tile control to
+/// within dispersion.** If it WINS, the gain is dispatch and WAVE3_DOSSIER 2.3 is wrong.
+pub const WGMMA_W1_MCB_V2_R16_PSTOP: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16_pstop",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16_pstop",
+    tiles: TileSchedule::PersistentDrained,
+    ..WGMMA_W1_MCB_V2_R16
+};
+
+/// **THE ARM**: [`WGMMA_W1_MCB_V2_R16`] persistent with a continuous ring.
+///
+/// # What it is predicted to do, per shape, stated before the round
+///
+/// `T_new = T_measured - (waves - 1) * X_fill` with `X_fill = 7.85 us`: `gpt_d1024_up` **+15.6
+/// points** (3 boundaries against `n_k = 16`, so `X` is 56% of its tile -- more than three times its
+/// share at sq8192, and the largest single-shape number of the lever), `gpt_d4096_up` +11.7,
+/// `sq4096` +8.7, `sq8192` +6.8. **Exactly zero** at sq2048, sq1024 and gpt_d1024_down, which are
+/// one wave and are therefore controls, not rows.
+///
+/// # Its two hazards, and why neither is a check
+///
+/// The loop is indexed by the CLUSTER with stride `%nctaid.x`, so both ranks iterate the identical
+/// sequence *by construction* -- a CTA-indexed loop under a cluster hangs on any tiles-mod-slots
+/// split (WAVE3_DOSSIER 2.6). And `%kt` is reset inside the tile loop in BOTH roles, so tile 2's
+/// first `wgmma` takes `scale-d = 0` and overwrites rather than accumulating (G19). Both are shapes
+/// of code rather than assertions, which is the only kind of fix worth having for a hang and for a
+/// corruption that looks like a plausible integer.
+pub const WGMMA_W1_MCB_V2_R16_P: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16_p",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16_p",
+    tiles: TileSchedule::Persistent,
+    ..WGMMA_W1_MCB_V2_R16
+};
+
 /// The **un-clustered** W1 with the fused v2 epilogue -- the fourth corner of the
 /// `{cluster off/on} x {scalar/v2}` square, and the row [`wgmma_w1_for`] ships below the cluster
 /// threshold.
@@ -2844,6 +3383,29 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
               same formula that predicts the win. It must land BETWEEN the linear control and r16. \
               A bracket that TIES r16 refutes the traffic model even if both beat linear, and the \
               next suspect is launch-order coalescing rather than footprint",
+    },
+    // --- wave 3 lever 2: persistence, both arms one fact off w1_mcb_v2_r16 -----------------------
+    SweepRow {
+        label: "w1_mcb_v2_r16_pstop",
+        cfg: &WGMMA_W1_MCB_V2_R16_PSTOP,
+        why: "WAVE 3 LEVER 2, THE DIAGNOSTIC. Persistent tile loop WITHOUT the ring carry: the \
+              producer waits for every consumer in the cluster to finish tile t before touching \
+              the ring again. It separates two claims the one number would confound -- 'persistence \
+              helps' and 'the CONTINUOUS RING helps' -- and only the second is the derivation. \
+              Predicted: ties w1_mcb_v2_r16 inside dispersion. If it WINS, the gain is CTA dispatch \
+              and X_fill is not the mechanism",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_r16_p",
+        cfg: &WGMMA_W1_MCB_V2_R16_P,
+        why: "WAVE 3 LEVER 2, THE ARM (persistent, continuous ring). X_fill = 7.85 us per tile \
+              boundary is unhidable today -- at a wave boundary no CTA on the device has anything to \
+              overlap it with, and the fill runs at 3.31 TB/s = 98.7% of HBM peak, so it is a \
+              bandwidth event, not a latency one. Under a continuous ring the overlap window is \
+              4*0.646 + X_epi 5.99 = 8.57 us against 7.85 us of fill. Predicted +15.6 points at \
+              gpt_d1024_up (n_k = 16 makes X 56% of its tile), +11.7 at gpt_d4096_up, +8.7 at \
+              sq4096, +6.8 at sq8192, and EXACTLY ZERO at sq2048, which is one wave and is the \
+              control that must tie",
     },
 ];
 
@@ -3248,8 +3810,38 @@ pub const GUARD_TILES_PER_AXIS: usize = 3;
 pub fn guard_shape(cfg: &WgmmaCfg) -> GuardShape {
     GuardShape {
         m: (GUARD_TILES_PER_AXIS - 1) * cfg.bm + cfg.bm / 2,
-        n: (GUARD_TILES_PER_AXIS - 1) * cfg.bn + cfg.bn / 2,
+        n: (guard_n_tiles(cfg) - 1) * cfg.bn + cfg.bn / 2,
         k: cfg.bk * (cfg.stages + 1) - cfg.bk / 2,
+    }
+}
+
+/// **N tiles in [`guard_shape`], and the one place G1's `tiles > CTAs` clause is enforced.**
+///
+/// [`GUARD_TILES_PER_AXIS`] for every one-tile-per-CTA row: three is already the smallest count that
+/// gives a middle tile, a pad CTA on either cluster axis and an odd tile count.
+///
+/// **A persistent row needs more, and the reason is that G19 is otherwise UNREACHABLE.** The
+/// persistent launch is `min(cluster_tiles, HOPPER_SM_COUNT / cluster_ctas)` cluster slots, so at 3x3
+/// tiles every CTA gets exactly one tile, the tile loop runs once, and a `%kt` that was never reset
+/// -- the corruption G19 exists to catch, and one that returns a plausible integer rather than a NaN
+/// -- would ship green. This returns the smallest ODD n-tile count that puts the cluster-tile count
+/// strictly above the slot count, so at least one cluster runs a SECOND tile and the reset is
+/// actually exercised.
+///
+/// It costs a bigger host reference (the debug-build f64 loop is `M*N*K`), and that cost is the
+/// price of the gate: `2 m-clusters x 35 n-tiles = 70 > 66` under a 1x2x1 cluster, `3 x 45 = 135 >
+/// 132` without one. `the_guard_shape_reaches_every_mechanism_the_old_one_could_not` budgets both.
+pub fn guard_n_tiles(cfg: &WgmmaCfg) -> usize {
+    if !cfg.tiles.is_persistent() {
+        return GUARD_TILES_PER_AXIS;
+    }
+    let m_clusters = GUARD_TILES_PER_AXIS.div_ceil(cfg.cluster_m());
+    let need = (cfg.persist_cluster_slots() / m_clusters + 1).max(GUARD_TILES_PER_AXIS);
+    // Odd, so the TILE count stays odd and no grid divides it evenly.
+    if need.is_multiple_of(2) {
+        need + 1
+    } else {
+        need
     }
 }
 
@@ -4544,6 +5136,12 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     // than becoming a second thing that also changed.
     let v2 = matches!(cfg.epilogue, EpilogueStore::V2);
     let elided = cfg.epilogue.is_diagnostic_only();
+    // --- the two wave-3 schedule levers ------------------------------------------------------------
+    // Same discipline again: at `OneTilePerCta` + `wait_depth 0` + no fence hoist this generator
+    // emits the byte-identical text rounds 1-3 measured, so those rows stay the control arm.
+    let persistent = cfg.tiles.is_persistent();
+    let drained = cfg.tiles.needs_tile_barrier();
+    let lag = cfg.release_lag();
     let hint_stores = cfg.l2_hint.hints_stores();
     let hint_operands = cfg.l2_hint.hints_operands();
     // The store's qualifier run, in the ISA's own order:
@@ -4649,6 +5247,26 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     if hint_operands {
         s += "    .reg .b64 %rdPolAB;\n";
     }
+    if persistent {
+        // The tile loop's own state. `%cid` is the flat CLUSTER index and `%slots` its stride --
+        // both ranks of a cluster hold the same value of each, by construction, which is the whole
+        // of the deadlock law. The rest is the remap's scratch: `%fa`/`%fb`/`%fr`/`%fq`/`%pc` belong
+        // to `divmod_u32_ptx` and appear nowhere else.
+        s += "    .reg .b32 %mclus,%ntile,%nct,%cid,%slots,%cgcols,%cgrp,%ci,%crows,%cr,%ccm,%ccn;\n";
+        s += "    .reg .f32 %fa,%fb,%fr,%fq;\n";
+        s += "    .reg .pred %pc;\n";
+    }
+    if drained {
+        // The tile rendezvous's phase parity, held by the producer's issuing thread alone. It flips
+        // once per tile, so it is the parity of the tile index -- which is why it can be a register
+        // rather than a second barrier.
+        s += "    .reg .b32 %pht;\n";
+    }
+    if lag > 0 {
+        // The stage the mainloop releases, `wait_depth` groups behind the one it is issuing against.
+        // See `WgmmaCfg::release_lag` -- the depth and this index come from that one function.
+        s += "    .reg .b32 %rel;\n    .reg .pred %p3;\n";
+    }
     s += &format!("    .reg .f32 %acc<{nacc}>;\n\n");
 
     // --- parameters -------------------------------------------------------------------------------
@@ -4670,12 +5288,23 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         // second spelling of the axis that could disagree with `Multicast::cluster_shape`.
         s += "    mov.u32 %crank,%cluster_ctarank;\n";
     }
-    s += &wgmma_tile_origin_ptx(cfg);
+    if persistent {
+        s += &wgmma_tile_bounds_ptx(cfg);
+    } else {
+        s += &wgmma_tile_origin_ptx(cfg);
+    }
     // ktiles = ceil(K / BK); BK is a power of two (validated), so the divide is a shift.
     s += &format!(
         "    add.u32 %tmp,%K,{};\n    shr.u32 %ktiles,%tmp,{bk_shift};\n",
         bk - 1
     );
+    if persistent {
+        // **`K == 0` must leave BEFORE the barriers exist, not at the epilogue.** `%ktiles` is a
+        // function of the `K` parameter alone, so this branch is uniform over the whole grid and no
+        // peer is left waiting. Taking it later would be a hang under the drained arm: the producer
+        // would reach its tile rendezvous while the consumers had already skipped their arrival.
+        s += &format!("    setp.eq.u32 %p0,%ktiles,0;\n    @%p0 bra EXIT_{name};\n");
+    }
 
     // --- mbarrier initialisation, then one CTA-wide rendezvous ------------------------------------
     // `full[s]` expects a single arrival: the TMA transaction itself, whose byte count the producer
@@ -4690,6 +5319,16 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         s += &format!(
             "    add.s64 %rdBar,%rdS,{};\n    mbarrier.init.shared::cta.b64 [%rdBar],{};\n",
             cfg.empty_off(st),
+            cfg.empty_arrivals()
+        );
+    }
+    if drained {
+        // The tile rendezvous, initialised ONCE with the whole cluster's consumer warpgroups --
+        // re-initialising a barrier a peer may be signalling is the classic cluster race, so it is
+        // created here beside the ring's and never touched again.
+        s += &format!(
+            "    add.s64 %rdBar,%rdS,{};\n    mbarrier.init.shared::cta.b64 [%rdBar],{};\n",
+            cfg.tile_bar_off(),
             cfg.empty_arrivals()
         );
     }
@@ -4737,14 +5376,39 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
             "    createpolicy.fractional.L2::evict_last.b64 %rdPolAB,{L2_POLICY_FRACTION};\n"
         );
     }
-    s += "    mov.u32 %kt,0;\n    mov.u32 %stg,0;\n";
     // The empty-phase parity starts at 1 so the first `stages` acquisitions pass immediately: a
     // freshly initialised barrier is in phase parity 0, and `try_wait.parity 1` completes at once
     // when the current parity is 0. Without this the producer would wait for a release that the
     // consumers cannot yet have made, and the pipeline would never start.
-    s += "    mov.u32 %phe,1;\n";
+    //
+    // Under persistence `%stg` and `%phe` are set here, OUTSIDE the tile loop, and carry across the
+    // tile boundary. That is not an optimisation, it is the only correct thing: the mbarrier phase
+    // parity is the parity of that barrier's completion count, stages complete an unequal number of
+    // times whenever `ktiles % stages != 0`, and there is no way to force them equal without
+    // re-initialising barriers a peer may be signalling.
+    if persistent {
+        s += "    mov.u32 %stg,0;\n    mov.u32 %phe,1;\n";
+        if drained {
+            s += "    mov.u32 %pht,0;\n";
+        }
+        s += &format!("PTILE_{name}:\n");
+        s += &format!("    setp.ge.u32 %p0,%cid,%nct;\n    @%p0 bra EXIT_{name};\n");
+        s += &wgmma_tile_index_ptx(cfg);
+        // **G19**: `%kt` drives `%pfirst`, which is the `scale-d` of each tile's first `wgmma`. A
+        // `%kt` that is not reset makes tile 2 accumulate into tile 1's result -- and with
+        // exact-integer operands the sum of two tiles is still a plausible integer, not a NaN.
+        s += "    mov.u32 %kt,0;\n";
+    } else {
+        s += "    mov.u32 %kt,0;\n    mov.u32 %stg,0;\n";
+        s += "    mov.u32 %phe,1;\n";
+    }
     s += &format!("PLOOP_{name}:\n");
-    s += &format!("    setp.ge.u32 %p0,%kt,%ktiles;\n    @%p0 bra EXIT_{name};\n");
+    let ploop_exit = if persistent {
+        format!("PNEXT_{name}")
+    } else {
+        format!("EXIT_{name}")
+    };
+    s += &format!("    setp.ge.u32 %p0,%kt,%ktiles;\n    @%p0 bra {ploop_exit};\n");
     // acquire: wait until stage `stg` is free
     s += "    mul.wide.u32 %rdT,%stg,8;\n    add.s64 %rdBar,%rdS,%rdT;\n";
     s += &format!("    add.s64 %rdBar,%rdBar,{empty_base};\n");
@@ -4829,6 +5493,24 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         cfg.stages
     );
     s += &format!("    mov.u32 %stg,0;\n    xor.b32 %phe,%phe,1;\n    bra PLOOP_{name};\n");
+    if persistent {
+        s += &format!("PNEXT_{name}:\n");
+        if drained {
+            // **The drained arm's whole mechanism, in six instructions.** The producer has issued
+            // every copy of tile `t`; it now waits until every consumer IN THE CLUSTER has finished
+            // tile `t`'s k-loop before touching the ring again, so tile `t+1`'s fill cannot overlap
+            // tile `t`'s tail. That is the measurement this arm exists for -- and it cannot
+            // deadlock, because the consumers' arrival depends only on copies this producer has
+            // already issued.
+            s += &format!("    add.s64 %rdBar,%rdS,{};\n", cfg.tile_bar_off());
+            s += &format!("PTWAIT_{name}:\n");
+            s += "    mbarrier.try_wait.parity.shared::cta.b64 %p1,[%rdBar],%pht;\n";
+            s += &format!("    @!%p1 bra PTWAIT_{name};\n");
+            s += "    xor.b32 %pht,%pht,1;\n";
+        }
+        s += "    add.u32 %cid,%cid,%slots;\n";
+        s += &format!("    bra PTILE_{name};\n");
+    }
 
     // ================================ consumer warpgroups =========================================
     s += &format!("CONSUMER_{name}:\n");
@@ -4838,12 +5520,50 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     );
     s += "    sub.u32 %cwg,%wgi,1;\n";
     s += &format!("    mul.lo.s32 %tmp,%cwg,{per_consumer_a};\n    cvt.u64.u32 %rdOffA,%tmp;\n");
-    s += "    mov.u32 %kt,0;\n    mov.u32 %stg,0;\n    mov.u32 %phf,0;\n";
-    s += "    setp.eq.u32 %ptrue,0,0;\n";
+    if persistent {
+        s += "    mov.u32 %stg,0;\n    mov.u32 %phf,0;\n";
+        s += "    setp.eq.u32 %ptrue,0,0;\n";
+        if cfg.fence_hoisted {
+            // **L4.7, the hoisted form**: exactly one `wgmma.fence` in the entry, outside every
+            // loop. It orders the accumulator registers against the async proxy before the first
+            // group; nothing between tiles WRITES them (the epilogue only reads), so one is enough
+            // and CUTLASS fences the mainloop rather than the k-tile for the same reason.
+            s += "    wgmma.fence.sync.aligned;\n";
+        }
+        s += &format!("CTILE_{name}:\n");
+        s += &format!("    setp.ge.u32 %p0,%cid,%nct;\n    @%p0 bra EXIT_{name};\n");
+        s += &wgmma_tile_index_ptx(cfg);
+        // G19 again, in the role that actually holds the accumulators.
+        s += "    mov.u32 %kt,0;\n";
+        if lag > 0 {
+            // `%rel` lags `%stg` by the wait depth, so the first advance lands it on the stage this
+            // tile's `%kt = 0` used. `%stg` carries across tiles, so this is recomputed from it
+            // rather than reset to a literal.
+            s += &format!("    add.u32 %rel,%stg,{};\n", cfg.stages - lag);
+            s += &format!(
+                "    setp.lt.u32 %p1,%rel,{};\n    @!%p1 sub.u32 %rel,%rel,{};\n",
+                cfg.stages, cfg.stages
+            );
+        }
+    } else {
+        s += "    mov.u32 %kt,0;\n    mov.u32 %stg,0;\n    mov.u32 %phf,0;\n";
+        s += "    setp.eq.u32 %ptrue,0,0;\n";
+        if cfg.fence_hoisted {
+            s += "    wgmma.fence.sync.aligned;\n";
+        }
+        if lag > 0 {
+            s += &format!("    mov.u32 %rel,{};\n", cfg.stages - lag);
+        }
+    }
     // No accumulator zeroing: the first wgmma of the first K tile takes scale-d = 0, which overwrites
     // D instead of accumulating into it. That is the ISA's own way to skip the initialisation.
     s += &format!("CLOOP_{name}:\n");
-    s += &format!("    setp.ge.u32 %p0,%kt,%ktiles;\n    @%p0 bra CEND_{name};\n");
+    let cloop_exit = if lag > 0 {
+        format!("CDRAIN_{name}")
+    } else {
+        format!("CEND_{name}")
+    };
+    s += &format!("    setp.ge.u32 %p0,%kt,%ktiles;\n    @%p0 bra {cloop_exit};\n");
     s += "    mul.wide.u32 %rdT,%stg,8;\n    add.s64 %rdBar,%rdS,%rdT;\n";
     s += &format!("    add.s64 %rdBar,%rdBar,{full_base};\n");
     s += &format!("CWAIT_{name}:\n");
@@ -4855,8 +5575,10 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     s += &format!("    mul.wide.u32 %rdT,%stg,{tile_b};\n    add.s64 %rdB,%rdS,%rdT;\n");
     s += &format!("    add.s64 %rdB,%rdB,{};\n", cfg.b_off(0));
     s += "    setp.ne.u32 %pfirst,%kt,0;\n";
-    // `wgmma.fence` orders the accumulator registers against the async proxy before the group.
-    s += "    wgmma.fence.sync.aligned;\n";
+    if !cfg.fence_hoisted {
+        // `wgmma.fence` orders the accumulator registers against the async proxy before the group.
+        s += "    wgmma.fence.sync.aligned;\n";
+    }
     for j in 0..cfg.wgmma_per_stage() {
         for (reg, base, cst, step) in [
             ("%descA", "%rdA", const_a, a_step),
@@ -4872,39 +5594,51 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         let scale_d = if j == 0 { "%pfirst" } else { "%ptrue" };
         s += &format!("    {mma} {{{accs}}}, %descA, %descB, {scale_d}, 1, 1, 0, 0;\n");
     }
-    s += "    wgmma.commit_group.sync.aligned;\n    wgmma.wait_group.sync.aligned 0;\n";
-    // release the stage: one arrival per consumer warpgroup, from its first thread. `wait_group` is
+    s += "    wgmma.commit_group.sync.aligned;\n";
+    s += &format!("    wgmma.wait_group.sync.aligned {};\n", cfg.wait_depth);
+    // Release the stage: one arrival per consumer warpgroup, from its first thread. `wait_group` is
     // warpgroup-aligned, so every thread of this warpgroup is done with the buffer by now.
-    s += "    mul.wide.u32 %rdT,%stg,8;\n    add.s64 %rdBar,%rdS,%rdT;\n";
-    s += &format!("    add.s64 %rdBar,%rdBar,{empty_base};\n");
-    s += "    and.b32 %tmp,%lin,127;\n    setp.eq.u32 %p2,%tmp,0;\n";
-    if clustered {
-        // This warpgroup releases the stage in EVERY CTA of the cluster, not just its own: the slice
-        // of the shared operand it just finished reading (A under `ClusterA`, B under `ClusterB`)
-        // was multicast in by a peer's producer, and that producer may not overwrite it until every
-        // consumer in the cluster is done. `empty[s]` is therefore initialised with
-        // `cluster_ctas * consumer_wgs` arrivals (WgmmaCfg::empty_arrivals) and gets one from every
-        // consumer warpgroup in the cluster. The rule is the operand's, not the axis's, so this
-        // block is identical for both arms.
-        //
-        // `mapa` takes a 32-bit SHARED address, not the 64-bit generic one the rest of this mainloop
-        // computes, and an mbarrier arrival at `.shared::cluster` scope cannot return a state token
-        // (hence the `_` sink) -- both are the CUTLASS idiom verbatim.
-        s += "    cvta.to.shared.u64 %rdT,%rdBar;\n    cvt.u32.u64 %sbar,%rdT;\n";
-        for r in 0..ctas {
-            s += &format!("    mov.u32 %tmp2,{r};\n");
-            s += "    mapa.shared::cluster.u32 %rbar,%sbar,%tmp2;\n";
-            s += "    @%p2 mbarrier.arrive.shared::cluster.b64 _,[%rbar];\n";
-        }
+    //
+    // **Which stage** comes from `WgmmaCfg::release_lag`, the same function the depth above reads
+    // (law L4.2). At depth 0 that is the stage just issued against; at depth `D` it is the one `D`
+    // groups older, and the first `D` iterations have no older group to retire -- hence `%p3`. A lag
+    // smaller than the depth is this wave's silent corruption.
+    if lag > 0 {
+        s += &format!("    setp.ge.u32 %p3,%kt,{lag};\n");
+        s += &stage_release_ptx(cfg, "%rel", Some("%p3"));
     } else {
-        s += "    @%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];\n";
+        s += &stage_release_ptx(cfg, "%stg", None);
     }
     s += "    add.u32 %kt,%kt,1;\n    add.u32 %stg,%stg,1;\n";
+    if lag > 0 {
+        s += &format!(
+            "    add.u32 %rel,%rel,1;\n    setp.lt.u32 %p1,%rel,{};\n    @!%p1 mov.u32 %rel,0;\n",
+            cfg.stages
+        );
+    }
     s += &format!(
         "    setp.lt.u32 %p1,%stg,{};\n    @%p1 bra CLOOP_{name};\n",
         cfg.stages
     );
     s += &format!("    mov.u32 %stg,0;\n    xor.b32 %phf,%phf,1;\n    bra CLOOP_{name};\n");
+    if lag > 0 {
+        // **CDRAIN -- the tail, and the part that is invisible until persistence lands** (4.5).
+        // With `D > 0` the mainloop never releases the final `D` stages. In a one-tile kernel that
+        // is harmless: the CTA exits and nobody waits. Under a persistent loop it is a HANG -- the
+        // producer, already running ahead into tile `t+1`, waits on an `empty[s]` arrival the
+        // previous tile's consumer never made. So the tail is written from the start, and L4.5
+        // counts its releases against `wait_depth`.
+        s += &format!("CDRAIN_{name}:\n");
+        s += "    wgmma.wait_group.sync.aligned 0;\n";
+        for _ in 0..lag {
+            s += &stage_release_ptx(cfg, "%rel", None);
+            s += &format!(
+                "    add.u32 %rel,%rel,1;\n    setp.lt.u32 %p1,%rel,{};\n    @!%p1 mov.u32 \
+                 %rel,0;\n",
+                cfg.stages
+            );
+        }
+    }
 
     // --- epilogue ---------------------------------------------------------------------------------
     // Accumulator layout, per the ISA and identical to `mma.sync.m16n8k16`'s C fragment tiled over 4
@@ -4919,6 +5653,16 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     // will not invent a value it never computed.)
     s += &format!("    setp.eq.u32 %p0,%ktiles,0;\n    @%p0 bra EXIT_{name};\n");
     s += "    wgmma.wait_group.sync.aligned 0;\n";
+    if drained {
+        // **The drained arm's consumer half**: this tile's k-loop is fully retired, so tell the
+        // whole cluster's producers. It is placed HERE -- after the last `wgmma` and before the
+        // epilogue's stores -- because what the arm must prevent is tile `t+1`'s FILL overlapping
+        // tile `t`'s tail; the epilogue is `X_epi`, a different term, and the arm that attacks it is
+        // wave 4's.
+        s += &format!("    add.s64 %rdBar,%rdS,{};\n", cfg.tile_bar_off());
+        s += "    and.b32 %tmp,%lin,127;\n    setp.eq.u32 %p2,%tmp,0;\n";
+        s += &barrier_arrive_ptx(cfg);
+    }
     if hint_stores {
         // The epilogue's half of the hint, created once and BEFORE the transport splits: a C line is
         // written and never read, so every one that stays resident evicts an operand line a
@@ -5008,6 +5752,15 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
                 );
             }
         }
+    }
+    if persistent {
+        // **The consumer's tile advance.** `%cid += %slots` is the static schedule of
+        // WAVE3_DOSSIER 2.5, deliberately not an atomic work queue: every tile of a launch costs the
+        // same (they share `M`, `N`, `K` and therefore `n_k`), so a queue buys nothing, puts a
+        // global atomic round-trip on the critical path between tiles -- eating into the very
+        // `X_fill` window persistence exists to open -- and makes the tile-to-CTA mapping a race
+        // outcome, which destroys the raster's whole gain.
+        s += &format!("CNEXT_{name}:\n    add.u32 %cid,%cid,%slots;\n    bra CTILE_{name};\n");
     }
     if clustered {
         // **No CTA may retire while a peer can still touch its shared memory.** A peer's producer
@@ -5745,7 +6498,12 @@ mod tests {
         // reused the linear key would be handed the LINEAR kernel by the module cache and the
         // round would publish its control arm twice, once under a heading claiming a raster that
         // never ran.
-        assert_eq!(mods.len(), 25);
+        // 25 -> 27 with WAVE 3 lever 2, persistence: the continuous-ring arm (`_r16_p`) and the
+        // drained diagnostic (`_r16_pstop`) that separates "persistence helps" from "the ring
+        // helps". Both are one field off `w1_mcb_v2_r16` and both are distinct modules -- the
+        // drained arm even has a different SMEM footprint (one extra mbarrier for the tile
+        // rendezvous), so a shared key would also have loaded the wrong carveout.
+        assert_eq!(mods.len(), 27);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -5791,14 +6549,36 @@ mod tests {
                 shape.token(),
                 c.dtype.mma_types()
             )));
-            // the async-proxy bracket
+            // **The async-proxy bracket -- law L4.1, the count law.** One `commit_group` (one group
+            // per k-stage, one k-stage body) and exactly one `wgmma.fence`, wherever the hoist put
+            // it. `wait_group` occurs once in the mainloop at `cfg.wait_depth`, once in the epilogue
+            // at a LITERAL 0, and once in `CDRAIN` at 0 -- the last only when there is a tail to
+            // drain, i.e. `wait_depth > 0`, because at depth 0 the mainloop has already retired
+            // every group and emitting a redundant one would move the shipped rows' measured text.
             assert_eq!(ptx.matches("wgmma.fence.sync.aligned;").count(), 1);
             assert_eq!(ptx.matches("wgmma.commit_group.sync.aligned;").count(), 1);
-            assert_eq!(ptx.matches("wgmma.wait_group.sync.aligned 0;").count(), 2);
-            // barriers: one full + one empty per stage, initialised once each
+            // Two literal-0 waits at every depth, and they are DIFFERENT two: at depth 0 they are
+            // the mainloop's and the epilogue's; at depth > 0 they are CDRAIN's and the epilogue's,
+            // and the mainloop's has moved to `cfg.wait_depth`. The epilogue's stays spelled as a
+            // literal so a future `cfg.wait_depth` cannot leak into it.
+            assert_eq!(
+                ptx.matches("wgmma.wait_group.sync.aligned 0;").count(),
+                2,
+                "{}: the epilogue's drain plus exactly one of (mainloop at depth 0 | CDRAIN)",
+                c.name
+            );
+            assert_eq!(
+                ptx.matches(&format!("wgmma.wait_group.sync.aligned {};", c.wait_depth))
+                    .count(),
+                if c.wait_depth == 0 { 2 } else { 1 },
+                "{}: the mainloop waits to cfg.wait_depth and nothing else does",
+                c.name
+            );
+            // barriers: one full + one empty per stage, initialised once each, plus the drained
+            // arm's single tile rendezvous.
             assert_eq!(
                 ptx.matches("mbarrier.init.shared::cta.b64").count(),
-                2 * c.stages
+                2 * c.stages + usize::from(c.tiles.needs_tile_barrier())
             );
             assert_eq!(
                 ptx.matches("mbarrier.init.shared::cta.b64 [%rdBar],1;")
@@ -5813,15 +6593,17 @@ mod tests {
                     c.empty_arrivals()
                 ))
                 .count(),
-                c.stages,
-                "{}: the empty barrier expects one arrival per consumer warpgroup IN THE CLUSTER",
+                c.stages + usize::from(c.tiles.needs_tile_barrier()),
+                "{}: the empty barrier expects one arrival per consumer warpgroup IN THE CLUSTER, \
+                 and the drained arm's tile rendezvous takes the same count for the same reason",
                 c.name
             );
             assert_eq!(
                 ptx.matches("mbarrier.try_wait.parity.shared::cta.b64")
                     .count(),
-                2,
-                "{}: one acquire in the producer, one in the consumer",
+                2 + usize::from(c.tiles.needs_tile_barrier()),
+                "{}: one acquire in the producer, one in the consumer, plus the drained arm's tile \
+                 rendezvous",
                 c.name
             );
             assert_eq!(
@@ -5951,18 +6733,23 @@ mod tests {
                     assert!(ptx.contains("    .reg .b64 %rdOffB;\n"), "{}", c.name);
                     assert!(ptx.contains("add.s64 %rdB,%rdB,%rdOffB;"), "{}", c.name);
                 }
-                // One remote-capable arrival per cluster CTA, per consumer warpgroup.
+                // One remote-capable arrival per cluster CTA, per RELEASE SITE: the mainloop's, one
+                // per `CDRAIN` tail release, and the drained arm's tile rendezvous. All of them
+                // come from `stage_release_ptx`/`barrier_arrive_ptx`, so the count is a statement
+                // about how many times that one function was called, not about three hand-written
+                // copies that could each name the wrong CTA.
+                let release_sites = 1 + c.release_lag() + usize::from(c.tiles.needs_tile_barrier());
                 assert_eq!(
                     ptx.matches("mbarrier.arrive.shared::cluster.b64 _,[%rbar];")
                         .count(),
-                    c.cluster_ctas(),
+                    c.cluster_ctas() * release_sites,
                     "{}: every CTA of the cluster must be released",
                     c.name
                 );
                 assert_eq!(
                     ptx.matches("mapa.shared::cluster.u32 %rbar,%sbar,%tmp2;")
                         .count(),
-                    c.cluster_ctas()
+                    c.cluster_ctas() * release_sites
                 );
                 assert!(
                     !ptx.contains("mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];"),
@@ -5997,7 +6784,14 @@ mod tests {
                     "{}: both operands are this CTA's own tiles at its own coordinates",
                     c.name
                 );
-                assert!(ptx.contains("@%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];"));
+                assert_eq!(
+                    ptx.matches("@%p2 mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];")
+                        .count(),
+                    1 + c.release_lag() + usize::from(c.tiles.needs_tile_barrier()),
+                    "{}: one release site per mainloop iteration, per CDRAIN tail stage, and one \
+                     for the drained arm's tile rendezvous",
+                    c.name
+                );
             }
             // the register split
             assert!(ptx.contains(&format!(
@@ -6908,6 +7702,35 @@ mod tests {
                 (7 * c.bm - 3, 7 * c.bn - 3),
             ] {
                 let (gx, gy, gz) = p.grid(m, n);
+                // **A persistent row's grid is not a tile map at all**: `x` is a cluster SLOT and
+                // `y` the rank, and the tile map is the loop. The coverage law is therefore stated
+                // over `RasterGrid::tile_of_cid`, in
+                // `the_persistent_loop_covers_every_tile_once_from_every_cluster_slot`; what this
+                // one still owns is the two properties the LAUNCH must have -- the cluster is whole,
+                // and no slot is launched that has no tile.
+                if c.tiles.is_persistent() {
+                    let r = c.raster_grid(m, n);
+                    assert_eq!(
+                        (gy as usize, gz),
+                        (cy, 1),
+                        "{}: the persistent grid is (slots, cluster rank, 1)",
+                        c.name
+                    );
+                    assert!(
+                        gx >= 1 && gx <= r.cluster_tiles().max(1),
+                        "{}: {gx} slots for {} cluster-tiles at {m}x{n}",
+                        c.name,
+                        r.cluster_tiles()
+                    );
+                    assert!(
+                        gx as usize <= c.persist_cluster_slots(),
+                        "{}: {gx} slots exceeds the device's {} -- a persistent launch that \
+                         oversubscribes buys nothing and pays the launch",
+                        c.name,
+                        c.persist_cluster_slots()
+                    );
+                    continue;
+                }
                 // **A raster row's grid axes are not tile axes**, so the same coverage law is
                 // stated over its own decomposition: x is the cluster-row within a group, y the
                 // n-tile with the cluster rank in its low bits, z the group. What must hold is
@@ -7236,6 +8059,283 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16"));
+    }
+
+    /// **THE DEADLOCK LAW (WAVE3_DOSSIER 2.6): the persistent loop is indexed by the CLUSTER, and
+    /// its stride is the number of cluster slots.**
+    ///
+    /// This is wave 3's ranked-#1 hazard and it fails by **hanging rented silicon**, not by
+    /// returning a wrong number. Under `Multicast::ClusterB`, `empty[s]` takes
+    /// `cluster_ctas * consumer_wgs` arrivals and every consumer arrives at every CTA of the cluster
+    /// through `mapa`, while every producer multicasts into every peer's ring. Take the naive
+    /// `tile = ctaid; tile < ntiles; tile += gridDim`: at sq4096 that is 512 tiles over 132 CTAs, so
+    /// 116 CTAs run 4 tiles and 16 run 3 -- and if the two ranks of a cluster land on opposite sides
+    /// of that split, rank 0's producer waits forever on `empty[s]` arrivals rank 1 will never make
+    /// AND multicasts into the shared memory of a CTA that has exited.
+    ///
+    /// The fix is a SHAPE of loop, not a check: `%cid` is `%ctaid.x`, the cluster extends along `y`,
+    /// so both ranks hold the identical `%cid` and the identical count by construction. This law
+    /// pins that shape in the emitted text, in both roles, plus the two properties that make the
+    /// stride right: it is read from `%nctaid.x` (so an under- or over-subscribed launch is still
+    /// correct) and the host's grid puts the slots on the same axis.
+    #[test]
+    fn the_persistent_loop_is_indexed_by_the_cluster_never_by_the_cta() {
+        let rows: Vec<&WgmmaCfg> = wgmma_all_emittable()
+            .into_iter()
+            .filter(|c| c.tiles.is_persistent())
+            .collect();
+        assert!(!rows.is_empty(), "wave 3 ships a persistent arm");
+        for c in rows {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            assert!(ptx.is_ascii(), "{} emitted non-ASCII PTX", c.name);
+            assert_eq!(
+                ptx.matches("mov.u32 %cid,%ctaid.x;").count(),
+                1,
+                "{}: the loop index is `%ctaid.x` -- the axis BOTH ranks of a 1x2x1 cluster share \
+                 -- and it is set once, before the role split, so the two roles cannot disagree",
+                c.name
+            );
+            assert_eq!(
+                ptx.matches("mov.u32 %slots,%nctaid.x;").count(),
+                1,
+                "{}: the stride is the launched slot count, read from the grid rather than baked \
+                 in as HOPPER_SM_COUNT/cluster_ctas",
+                c.name
+            );
+            assert_eq!(
+                ptx.matches("add.u32 %cid,%cid,%slots;").count(),
+                2,
+                "{}: exactly one advance per role -- producer at PNEXT, consumer at CNEXT",
+                c.name
+            );
+            assert!(
+                !ptx.contains("%ctaid.y") && !ptx.contains("%ctaid.z"),
+                "{}: a persistent kernel reads NO other grid axis; `%ctaid.y` is the cluster rank \
+                 and reading it would be a second spelling of `%cluster_ctarank`",
+                c.name
+            );
+            // ...and the host agrees: grid.y IS the cluster's M extent, grid.z is 1, and grid.x --
+            // the slot count -- never exceeds the device's.
+            for (m, n) in [
+                (1024usize, 1024usize),
+                (4096, 16384),
+                (8192, 8192),
+                (320, 8832),
+            ] {
+                let (gx, gy, gz) = c.launch_plan().grid(m, n);
+                assert_eq!((gy as usize, gz), (c.cluster_m(), 1), "{}", c.name);
+                assert!(gx as usize <= c.persist_cluster_slots(), "{}", c.name);
+            }
+        }
+    }
+
+    /// **G19, and the second textual law the tile loop needs.**
+    ///
+    /// `%pfirst` is `setp.ne.u32 %pfirst,%kt,0`, and the first `wgmma` of each stage takes
+    /// `scale-d = %pfirst`. `%kt` was a whole-KERNEL counter because a kernel was one tile. **In a
+    /// tile loop a `%kt` that is not reset makes tile 2's first `wgmma` take `scale-d = 1` and
+    /// accumulate into tile 1's result** -- and with the round's exact-integer operands the sum of
+    /// two tiles is still an exact integer, so the corruption is a plausible-looking number rather
+    /// than a NaN. It is also unreachable on any guard shape with one tile per CTA, which is why
+    /// `guard_n_tiles` widens the persistent guard until `tiles > CTAs`.
+    ///
+    /// The second law: the tile-index arithmetic is emitted twice -- once per role -- and if the two
+    /// copies ever disagreed the consumer would compute with the wrong tile's operands. Silently
+    /// wrong, no hang, and NOT caught by the epilogue's bounds predicates. Both copies come from one
+    /// `wgmma_tile_index_ptx`, and this counts them.
+    #[test]
+    fn the_persistent_tile_loop_resets_kt_and_emits_one_tile_map() {
+        for c in wgmma_all_emittable() {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            assert_eq!(
+                ptx.matches("mov.u32 %kt,0;").count(),
+                2,
+                "{}: one `%kt` reset per role -- and under persistence it must be INSIDE the tile \
+                 loop, which the position check below states",
+                c.name
+            );
+            if !c.tiles.is_persistent() {
+                assert!(!ptx.contains("PTILE_"), "{}: no tile loop", c.name);
+                continue;
+            }
+            // Position, not just count: each role's reset is textually after that role's tile-loop
+            // label, so it runs once per TILE rather than once per kernel.
+            for label in [format!("PTILE_{}:", c.name), format!("CTILE_{}:", c.name)] {
+                let at = ptx
+                    .find(&label)
+                    .unwrap_or_else(|| panic!("{label} missing"));
+                let reset = ptx[at..]
+                    .find("mov.u32 %kt,0;")
+                    .unwrap_or_else(|| panic!("{}: no `%kt` reset after {label} -- G19", c.name));
+                let loop_head = ptx[at..]
+                    .find("LOOP_")
+                    .expect("the k-loop label follows the tile label");
+                assert!(
+                    reset < loop_head,
+                    "{}: the `%kt` reset after {label} is inside the k-loop, not the tile loop",
+                    c.name
+                );
+            }
+            let map = wgmma_tile_index_ptx(c);
+            assert_eq!(
+                ptx.matches(&map).count(),
+                2,
+                "{}: the tile map must appear exactly twice and be byte-identical in both roles",
+                c.name
+            );
+            // The epilogue's bases are derived from `%ctam`/`%ctan`, which the map recomputes, so
+            // they follow for free -- but the ring pointer and the phase parities must NOT be reset
+            // per tile (a reset parity against a live barrier is a hang), and that is a position
+            // claim about `%stg`.
+            let ctile = ptx.find(&format!("CTILE_{}:", c.name)).unwrap();
+            assert!(
+                !ptx[ctile..].contains("mov.u32 %stg,0;\n    mov.u32 %phf,0;"),
+                "{}: `%stg`/`%phf` are reset INSIDE the tile loop -- the mbarrier phase parity is \
+                 the parity of that barrier's completion count and stages complete an unequal \
+                 number of times whenever ktiles % stages != 0",
+                c.name
+            );
+        }
+    }
+
+    /// **The persistent map is a bijection onto the padded tile domain, from every slot count.**
+    ///
+    /// The non-persistent raster gets this from the grid decomposition (G5); the persistent one
+    /// computes it from a flat `cid` with two runtime divmods, and the arm the shipped shapes never
+    /// exercise is the SHORT LAST GROUP. So the law ranges over every `m_clusters % GC` residue, both
+    /// cluster settings, and -- because the loop is `cid += slots` -- every slot count from 1 to the
+    /// device's, so a "covers everything at 66 slots" that fails at 65 cannot hide.
+    #[test]
+    fn the_persistent_loop_covers_every_tile_once_from_every_cluster_slot() {
+        for cluster_m in [1u32, 2] {
+            for group_m in [1u32, 2, 16, 32] {
+                if !group_m.is_multiple_of(cluster_m) {
+                    continue;
+                }
+                for m_tiles in 1u32..=20 {
+                    for n_tiles in [1u32, 3, 7] {
+                        let g = RasterGrid::new(group_m, cluster_m, m_tiles, n_tiles);
+                        let nct = g.cluster_tiles();
+                        for slots in 1..=nct.min(9) {
+                            let mut seen = vec![0u32; (g.padded_m_tiles() * n_tiles) as usize];
+                            for slot in 0..slots {
+                                let mut cid = slot;
+                                while cid < nct {
+                                    for rank in 0..cluster_m {
+                                        let (mt, nt) = g.tile_of_cid(cid, rank);
+                                        assert!(
+                                            mt < g.padded_m_tiles() && nt < n_tiles,
+                                            "escaped: G{group_m}/c{cluster_m} m{m_tiles} \
+                                             n{n_tiles} cid {cid} rank {rank} -> ({mt},{nt})"
+                                        );
+                                        seen[(mt * n_tiles + nt) as usize] += 1;
+                                    }
+                                    cid += slots;
+                                }
+                            }
+                            assert!(
+                                seen.iter().all(|&v| v == 1),
+                                "the persistent loop is not a bijection at \
+                                 G{group_m}/c{cluster_m} m{m_tiles} n{n_tiles} slots {slots}: \
+                                 {seen:?}"
+                            );
+                        }
+                        // Both ranks of a cluster agree on the N tile at every cid -- the ONE thing
+                        // a B multicast forbids breaking -- and differ in M.
+                        if cluster_m == 2 {
+                            for cid in 0..nct {
+                                let (m0, n0) = g.tile_of_cid(cid, 0);
+                                let (m1, n1) = g.tile_of_cid(cid, 1);
+                                assert_eq!(n0, n1, "cluster peers disagree on the N tile");
+                                assert_ne!(m0, m1, "cluster peers share the M tile");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The persistent and drain axes decline the ways they can be wrong, and each decline NAMES the
+    /// mechanism rather than the field: a `ClusterA` persistent row (the cluster owns grid X, which
+    /// the loop needs), and a ring shorter than `wait_depth + 2` (law L4.4 -- a consumer holding
+    /// more buffers than the ring has is a deadlock, and a deadlock must be a printed decline on a
+    /// CPU rather than a time-box on rented silicon).
+    #[test]
+    fn the_persistent_and_drain_refusals() {
+        let on_a = WgmmaCfg {
+            name: "x",
+            key: "x",
+            tiles: TileSchedule::Persistent,
+            ..WGMMA_W1_MC
+        };
+        let e = on_a.validate().unwrap_err();
+        assert!(
+            e.contains("indexed by grid X") && e.contains("HANGS"),
+            "{e}"
+        );
+
+        for (depth, stages) in [(1usize, 2usize), (2, 3), (3, 4)] {
+            let short = WgmmaCfg {
+                name: "x",
+                key: "x",
+                wait_depth: depth,
+                stages,
+                ..WGMMA_W1_MCB
+            };
+            let e = short.validate().unwrap_err();
+            assert!(
+                e.contains(&format!("wait_depth {depth}"))
+                    && e.contains(&format!("{} stages", depth + 2)),
+                "the decline must name BOTH numbers: {e}"
+            );
+        }
+        // And the pairing is one function, not two constants that could drift.
+        for c in wgmma_all_emittable() {
+            assert_eq!(c.release_lag(), c.wait_depth, "{}", c.name);
+            assert!(c.stages >= c.wait_depth + 2, "{}", c.name);
+        }
+    }
+
+    /// **L4.5, the tail-release law.** The number of stage releases in `CDRAIN` equals
+    /// `cfg.wait_depth`. Its failure mode is a hang that only appears once the persistent loop
+    /// lands -- with `D > 0` the mainloop never releases the final `D` stages, and under persistence
+    /// the producer, already running ahead into tile `t+1`, waits on an `empty[s]` arrival the
+    /// previous tile's consumer never made -- which is exactly the kind of latent defect a textual
+    /// law is for.
+    #[test]
+    fn the_mainloop_drain_tail_releases_exactly_the_wait_depth() {
+        for c in wgmma_all_emittable() {
+            let ptx = wgmma_module(c, &license()).unwrap();
+            let drain = format!("CDRAIN_{}:", c.name);
+            if c.wait_depth == 0 {
+                assert!(
+                    !ptx.contains(&drain),
+                    "{}: at depth 0 the mainloop has already retired every group, so a tail would \
+                     be a redundant instruction that also moved the measured rows' text",
+                    c.name
+                );
+                continue;
+            }
+            let at = ptx.find(&drain).expect("a depth > 0 arm must have a tail");
+            let tail = &ptx[at..ptx.find(&format!("CEND_{}:", c.name)).unwrap()];
+            let arrive = if c.cluster_ctas() > 1 {
+                "mbarrier.arrive.shared::cluster.b64 _,[%rbar];"
+            } else {
+                "mbarrier.arrive.shared::cta.b64 %rdSt,[%rdBar];"
+            };
+            assert_eq!(
+                tail.matches(arrive).count(),
+                c.wait_depth * c.cluster_ctas().max(1),
+                "{}: CDRAIN must release exactly wait_depth stages, in every CTA of the cluster",
+                c.name
+            );
+            assert!(
+                tail.starts_with(&format!("{drain}\n    wgmma.wait_group.sync.aligned 0;")),
+                "{}: the tail drains to 0 BEFORE it releases anything",
+                c.name
+            );
+        }
     }
 
     /// **THE RASTER'S GUARD-SHAPE LAW: the device gate must actually EXECUTE the ragged group.**
@@ -7986,9 +9086,9 @@ mod tests {
             let (tm, tn) = g.tiles(c);
             assert_eq!(
                 (tm, tn),
-                (GUARD_TILES_PER_AXIS, GUARD_TILES_PER_AXIS),
-                "{}: the grid must be {GUARD_TILES_PER_AXIS}x{GUARD_TILES_PER_AXIS} CTAs, so a \
-                 CTA-to-tile map that is right for one CTA is not enough",
+                (GUARD_TILES_PER_AXIS, guard_n_tiles(c)),
+                "{}: the grid must be at least {GUARD_TILES_PER_AXIS}x{GUARD_TILES_PER_AXIS} CTAs, \
+                 so a CTA-to-tile map that is right for one CTA is not enough",
                 c.name
             );
             assert_eq!(
@@ -8022,11 +9122,56 @@ mod tests {
                  guard shape (st.global.v2.f32 needs an 8-byte-aligned pair)",
                 c.name
             );
+            // Cost: the host f64 reference runs in a DEBUG build, so this is a real budget. A
+            // persistent row pays for G19's reachability -- its guard must have more cluster-tiles
+            // than the launch has slots (66 under a 1x2x1 cluster, 132 without one), and `M*N` is
+            // `tiles * BM * BN` however the tiles are arranged, so ~1e9 MACs is the floor for that
+            // property at a 128x256 tile rather than a shape that could be trimmed.
+            let budget = if c.tiles.is_persistent() {
+                1_200_000_000
+            } else {
+                80_000_000
+            };
+            assert!(
+                g.macs() <= budget,
+                "{}: the guard reference is {} MACs against a {budget} budget, which is more than a \
+                 debug-build host loop should cost per gated row",
+                c.name,
+                g.macs()
+            );
             // The cluster arms round their own axis up, which is how the pad CTA gets exercised --
             // on BOTH axes, because the tile count is odd on both.
             let p = c.launch_plan();
             let (gx, gy, gz) = p.grid(g.m, g.n);
             let ctas = (gx as usize) * (gy as usize) * (gz as usize);
+            if c.tiles.is_persistent() {
+                // **G1's fourth clause, and the one wave 3 added: `tiles > CTAs`.** Without it the
+                // tile loop runs exactly once per CTA, G19's un-reset `%kt` is unreachable, and a
+                // tile-2-accumulates-into-tile-1 corruption -- which over exact integers is a
+                // plausible number, not a NaN -- would ship green.
+                let r = c.raster_grid(g.m, g.n);
+                let padded = (r.padded_m_tiles() * r.n_tiles) as usize;
+                assert!(
+                    padded > ctas,
+                    "{}: the persistent guard launches {ctas} CTAs for {padded} tiles (padded to \
+                     whole clusters), so no CTA runs a SECOND tile and G19 is unreachable",
+                    c.name
+                );
+                assert!(
+                    r.cluster_tiles() > gx,
+                    "{}: {} cluster-tiles over {gx} slots -- every slot runs one tile",
+                    c.name,
+                    r.cluster_tiles()
+                );
+                assert_eq!(
+                    gy,
+                    c.cluster_m() as u32,
+                    "{}: the persistent grid's y axis IS the cluster rank",
+                    c.name
+                );
+                assert_eq!(gz, 1, "{}: the persistent grid is flat", c.name);
+                continue;
+            }
             assert!(
                 ctas >= tm * tn,
                 "{}: the launched grid may round up but never down",
@@ -8049,14 +9194,6 @@ mod tests {
                     c.name
                 );
             }
-            // Cost: the host f64 reference runs in a DEBUG build, so this is a real budget.
-            assert!(
-                g.macs() <= 80_000_000,
-                "{}: the guard reference is {} MACs, which is more than a debug-build host loop \
-                 should cost per gated row",
-                c.name,
-                g.macs()
-            );
         }
         // The concrete numbers for the shipped centerpiece, so a reader can check the table above.
         let g = guard_shape(&WGMMA_W1);

@@ -8628,7 +8628,12 @@ mod tests {
         // part of `WgmmaCfg::derived_name` -- a raster row that reused the linear key would be handed
         // the LINEAR kernel by `Gpu::function`'s cache, which never re-examines the PTX on a hit, and
         // the round would publish its control arm twice under two headings (guard G3).
-        const EXPECTED_MODULES: usize = 119;
+        // 119 -> 121 on 2026-08-12 with WAVE 3 lever 2, persistence: `w1_mcb_v2_r16_p` (the
+        // continuous ring, the wave's ranked-#1 mechanism) and `w1_mcb_v2_r16_pstop` (the drained
+        // diagnostic that separates the ring from CTA dispatch). The drained arm carries one extra
+        // mbarrier -- the tile rendezvous -- so it differs from its twin in its SMEM carveout as
+        // well as its text, which is a second reason a shared module key would have been wrong.
+        const EXPECTED_MODULES: usize = 121;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -19538,7 +19543,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 ),
                 (
                     m1 + 7,
-                    n1 - 5,
+                    // Ragged, but EVEN when the row's transport needs it: `st.global.v2.f32` wants
+                    // an 8-byte-aligned pair, and an odd `N` there is not a wrong number but
+                    // `CUDA_ERROR_MISALIGNED_ADDRESS` on the first store -- which on this platform
+                    // leaves the context stickily errored and takes the rest of the visit with it.
+                    if c.epilogue.requires_even_n() {
+                        n1 - 6
+                    } else {
+                        n1 - 5
+                    },
                     c.bk * 2 - 16,
                     "ragged in M, N and K at once, inside a cluster: TMA's zero fill on the multicast \
                      SLICE boundary as well as the tile boundary"
@@ -19553,7 +19566,21 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 let plain = &WGMMA_W1;
                 let mut total = 0usize;
                 // The PRIMARY first: if the visit dies, it dies having answered round 3's question.
-                for mc in [&WGMMA_W1_MCB, &WGMMA_W1_MC] {
+                //
+                // **Wave 3 adds its two clustered schedule arms to the same gate** (dossier 6.4
+                // item 2). Both keep the 1x2x1 B multicast and change only WHICH (m,n) a cluster
+                // lands on and how many it lands on, so the failure mode this gate was built for --
+                // stale shared memory on the N columns a CTA did not fetch itself, at full speed,
+                // with no error -- is exactly the failure mode they can reintroduce. `shapes_for`
+                // gives them an odd tile count on the clustered axis, which is where a ragged group
+                // and a pad CTA meet.
+                for mc in [
+                    &WGMMA_W1_MCB,
+                    &WGMMA_W1_MC,
+                    &crate::ptx_wgmma::WGMMA_W1_MCB_V2_R16,
+                    &crate::ptx_wgmma::WGMMA_W1_MCB_V2_R16_P,
+                    &crate::ptx_wgmma::WGMMA_W1_MCB_V2_R16_PSTOP,
+                ] {
                     assert_eq!(
                         mc.cluster_ctas(),
                         2,
@@ -19652,14 +19679,24 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             mc.name
                         );
                         let p = mc.launch_plan();
-                        let (gx, gy, _) = p.grid(m, n);
+                        let (gx, gy, gz) = p.grid(m, n);
+                        let launched = (gx as usize) * (gy as usize) * (gz as usize);
+                        let real = n.div_ceil(mc.bn) * m.div_ceil(mc.bm);
                         eprintln!(
-                        "      {m:>5} x {k:<5} x {n:<5} grid {gx}x{gy} ({} clusters, {} pad CTA(s)): \
-                         EXACT, == the un-clustered row, reproducible",
-                        gx * gy / p.cluster_ctas(),
-                        (gx as usize) * (gy as usize)
-                            - n.div_ceil(mc.bn) * m.div_ceil(mc.bm)
-                    );
+                            "      {m:>5} x {k:<5} x {n:<5} grid {gx}x{gy}x{gz} ({} clusters, {} \
+                             tiles per cluster slot, {} CTA(s) beyond the real tiles): EXACT, == \
+                             the un-clustered row, reproducible",
+                            launched / p.cluster_ctas() as usize,
+                            if mc.tiles.is_persistent() {
+                                format!(
+                                    "{:.2}",
+                                    mc.raster_grid(m, n).cluster_tiles() as f64 / gx as f64
+                                )
+                            } else {
+                                "1".to_string()
+                            },
+                            launched.saturating_sub(real)
+                        );
                     }
                     eprintln!(
                     "[gate] {} is exact on {} cluster-spanning shapes and bit-identical to {} on \
@@ -19670,7 +19707,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 );
                 }
                 eprintln!(
-                    "[gate] BOTH cluster axes are exact: {total} shapes over {} and {}, each \
+                    "[gate] BOTH cluster axes AND both wave-3 schedule arms are exact: {total} \
+                     shapes over {}, {}, the grouped raster and its persistent/drained twins, each \
                      spanning at least one full two-CTA cluster ON ITS OWN GRID AXIS, each `==` the \
                      f64 reference and bit-identical to {} \u{2713}",
                     WGMMA_W1_MCB.name,
@@ -20444,6 +20482,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                             c.epilogue.label(),
                             c.l2_hint.label(),
                             TimedRegion::for_cfg(c).label()
+                        );
+                        // The wave-3 axes, likewise: a schedule that is not printed per row is a
+                        // schedule a reader has to infer from a label, and a label is not evidence.
+                        eprintln!(
+                            "      raster GROUP_M {} | tiles {} | wait_depth {} | fence {}",
+                            c.raster,
+                            c.tiles.label(),
+                            c.wait_depth,
+                            if c.fence_hoisted {
+                                "hoisted out of the k-loop"
+                            } else {
+                                "per k-tile (rounds 1-3)"
+                            }
                         );
                     }
                     Err(why) => eprintln!(
