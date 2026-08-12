@@ -108,7 +108,14 @@ impl<'g> GpuAccel<'g> {
     /// agreement in this backend is a **tolerance** gate (`c·√K·ε`), and the fused-epilogue hook below
     /// has run f16 tensor cores against the f32 CPU oracle since Act 1. What it is *not* is invisible —
     /// a tolerance band sized for f32 would fail on this route, so the driver's device gate reads
-    /// [`GpuAccel::gemm_route`] and picks its band from the route rather than from the device.
+    /// [`GpuAccel::gemm_route_taken`], the per-route counters, and picks its band from the route that
+    /// actually ran (never from the device, which is eligible for shapes it then declines).
+    ///
+    /// The conversion is **not only** a rounding, and the part that is not is handled rather than
+    /// tolerated: f16 has about four decades less dynamic range than f32 at each end, so an operand
+    /// past 65504 would enter the GEMM as an infinity and leave as `inf`/`NaN` where the f32 arm
+    /// returns a number. [`wgmma_declines_operand_range`] makes that a decline, so the arithmetic the
+    /// tolerance band has to cover really is just the rounding.
     fn try_gemm_nt_wgmma(
         &mut self,
         a: &[f32],
@@ -138,6 +145,13 @@ impl<'g> GpuAccel<'g> {
                 a.len(),
                 b.len()
             ));
+            return None;
+        }
+        // The only decline that reads the DATA rather than the shape, and the only one that is about
+        // the arithmetic class rather than the launch: f16 carries four decades less dynamic range
+        // than f32 at the top end, so an operand past 65504 would enter this GEMM as an infinity.
+        if let Some(why) = wgmma_declines_operand_range(cfg.dtype, a, b) {
+            route_log(format_args!("{m}x{k}x{n}: Existing (declined: {why})"));
             return None;
         }
         match wukong_codegen_gpu::gpu::gemm_nt_wgmma(self.gpu, cfg, a, b, m, k, n) {
@@ -302,12 +316,87 @@ pub(crate) const HOPPER_GATE_SHAPES: [(usize, usize, usize); 3] = [
 
 /// The 16-bit input type the **f32** seam feeds `wgmma`.
 ///
-/// f16 and bf16 are the same width and eight bits apart in precision; the recognized `sgemm_nt` call
-/// carries f32 operands, so the choice is purely "which 16-bit type loses least", and f16's 11
-/// significand bits beat bf16's 8 at every magnitude an activation or a weight occupies. bf16 becomes
-/// reachable when the lowp `wukong_sgemm_{bf16,f16}_nt_epi` symbols get an `Accelerator` hook at all
-/// (WAVE4_DOSSIER §5.4 gap 3); [`wgmma_cfg_for`] already routes it.
+/// f16 and bf16 are the same width and trade eight bits of significand against eight of exponent, and
+/// the recognized `sgemm_nt` call carries f32 operands, so the seam is choosing which f32 fact to
+/// give up — *both* of them, not just precision:
+///
+/// - **Precision**, and the reason f16 wins: 11 significand bits against bf16's 8, three decimal
+///   digits more at every magnitude an activation or a weight occupies.
+/// - **Range**, and the reason that win is not free: bf16 carries f32's exponent field, so it holds
+///   everything up to 3.39e38, while f16 stops at 65504 and reaches zero below ~6e-8. Choosing f16
+///   gives up roughly four decades at each end — and the top end is not a wider error bar but a
+///   different **class** of answer: a finite f32 above 65504 enters the GEMM as `inf` and comes back
+///   as `inf`/`NaN` where the pre-Hopper f32 launcher returns a number.
+///
+/// The overflow end is therefore closed by [`wgmma_declines_operand_range`]: such a call takes the
+/// f32 launcher and its results are unchanged, so f16's range cost is paid only in precision.
+///
+/// The underflow end is left as what it is, and is stated rather than closed. It is the arithmetic
+/// class the whole f16 tensor-core path has carried since Act 1 — the fused `gemm_nt_f16_sm_db*`
+/// epilogue converts its operands exactly the same way — and declining it is not available: an
+/// operand under f16's smallest *normal* (6.104e-5) keeps only subnormal precision, and a few
+/// elements of any `U(-1,1)` buffer are below that, so the rule would decline nearly every real GEMM.
+/// It lives inside the tolerance contract, with one honest edge: a result *dominated* by lanes whose
+/// operands are subnormal in f16 is the shape this backend's GEMM band does not promise to cover.
+///
+/// bf16 becomes reachable when the lowp `wukong_sgemm_{bf16,f16}_nt_epi` symbols get an
+/// `Accelerator` hook at all (WAVE4_DOSSIER §5.4 gap 3); [`wgmma_cfg_for`] already routes it, and it
+/// is the arm that would need none of the range decline.
 const WGMMA_F32_SEAM_DTYPE: WgmmaDtype = WgmmaDtype::F16;
+
+/// **The largest magnitude the seam's 16-bit input type carries as a finite value**, asked of the
+/// crate `gpu::gemm_nt_wgmma` converts with rather than typed as a literal — so a `half` upgrade
+/// cannot move the conversion without moving the decline. f16 stops at 65504; bf16 has f32's
+/// exponent field and stops at 3.39e38, one mantissa band short of `f32::MAX`.
+///
+/// Deliberately the **conservative** edge of the true overflow point: round-to-nearest-even carries
+/// magnitudes just above this back *down* to it, so a thin band is declined that would in fact have
+/// survived. An unnecessary fallback costs a fallback; the error in the other direction costs an
+/// infinity.
+fn seam_dtype_max_finite(dtype: WgmmaDtype) -> f32 {
+    match dtype {
+        WgmmaDtype::F16 => half::f16::MAX.to_f32(),
+        WgmmaDtype::Bf16 => half::bf16::MAX.to_f32(),
+    }
+}
+
+/// **The dynamic-range decline: a finite operand the seam's 16-bit type cannot hold.**
+///
+/// `gemm_nt_wgmma` runs `half::f16::from_f32` over every element of both operands, and f16 tops out
+/// at 65504 ([`seam_dtype_max_finite`]). A finite f32 above that becomes `inf`, and an `inf` operand is a different
+/// **answer**, not a wider error bar: it propagates through the accumulation and returns `inf`/`NaN`
+/// where [`GemmRoute::Existing`] — `gpu::gemm_nt`, f32 in and f32 out — returns a finite number that
+/// matches the CPU oracle. No tolerance band covers that, and no gate would have caught it either:
+/// every band gate in this repo seeds its operands with `rng.vec(.., -1.0, 1.0)`. So it joins the
+/// other reasons this seam cannot take a call, with the same consequence — the pre-Hopper path,
+/// results unchanged.
+///
+/// **Cost, stated rather than hidden.** This is a read-only pass over both operands with an early
+/// exit, so it is `O(m·k + n·k)` — the same order as the launcher's very next act, which maps every
+/// one of those elements to `u16`, allocates the result and copies it to the device. A constant
+/// factor on an already-linear host stage, not a new order of work, and it disappears the day the
+/// seam takes operands that are already 16 bit (the lowp `nt_epi` hook, WAVE4_DOSSIER §5.4 gap 3).
+///
+/// **The bf16 arm effectively never declines**, which is the range half of
+/// [`WGMMA_F32_SEAM_DTYPE`]'s trade made operational: bf16 has f32's exponent field, so its ceiling
+/// is 3.39e38 and only the last mantissa band below `f32::MAX` fails it.
+fn wgmma_declines_operand_range(dtype: WgmmaDtype, a: &[f32], b: &[f32]) -> Option<String> {
+    // Hoisted out of the scan: one conversion for the whole call, then a plain f32 compare per
+    // element. `>` also settles the two non-finite cases correctly — an infinity declines (falling
+    // back reproduces the CPU oracle's own infinity exactly), a NaN does not (it is a NaN on both
+    // routes, so the route changes nothing about it).
+    let ceiling = seam_dtype_max_finite(dtype);
+    let (which, x) = a
+        .iter()
+        .map(|&x| ("A", x))
+        .chain(b.iter().map(|&x| ("B", x)))
+        .find(|&(_, x)| x.abs() > ceiling)?;
+    Some(format!(
+        "operand {which} holds {x:e}, which {dtype:?} cannot carry as a finite value (the seam \
+         converts both operands to {dtype:?} on the host, so this element would enter the GEMM as \
+         an infinity while the f32 launcher carries it unchanged)"
+    ))
+}
 
 /// **Every precondition of `gpu::gemm_nt_wgmma`, restated as a decline** — the ones it asserts, and
 /// the one it does not. `None` = the wgmma route may take this call; `Some(reason)` = fall back,
@@ -637,6 +726,87 @@ mod tests {
             "one wgmma call puts the f16 input rounding in the output, so a mixed run is judged by \
              the wider band"
         );
+    }
+
+    /// **The driver's threshold is the launcher's conversion, asked directly.**
+    ///
+    /// `gemm_nt_wgmma` converts with `half::f16::from_f32` / `half::bf16::from_f32`, so the decline
+    /// threshold must be that crate's own ceiling and not a literal someone typed — a `half` upgrade
+    /// must not be able to move one without the other. This also pins the two facts the seam's dtype
+    /// choice rests on, and the direction the threshold errs in.
+    #[test]
+    fn the_range_decline_matches_the_launcher_conversion() {
+        let f16_max = seam_dtype_max_finite(WgmmaDtype::F16);
+        assert_eq!(f16_max, 65_504.0, "f16 max finite is (2 - 2^-10)*2^15");
+        assert!(half::f16::from_f32(f16_max).is_finite());
+        assert!(
+            half::f16::from_f32(65_520.0).is_infinite(),
+            "round-to-nearest-even sends the midpoint up to 2^16, which f16 cannot hold"
+        );
+        assert!(
+            half::f16::from_f32(65_510.0).is_finite(),
+            "the threshold errs toward declining: this one is over it and would have survived"
+        );
+
+        // bf16 has f32's exponent field, so its ceiling is four decades of f32 range above f16's —
+        // it is `f32::MAX` less the mantissa bits bf16 does not have, not `f32::MAX` itself.
+        let bf16_max = seam_dtype_max_finite(WgmmaDtype::Bf16);
+        assert!(half::bf16::from_f32(bf16_max).is_finite());
+        assert!(bf16_max > 3.3e38 && bf16_max < f32::MAX);
+        assert!(
+            half::bf16::from_f32(f32::MAX).is_infinite(),
+            "even bf16 rounds the very top of the f32 range up to infinity — which is why the bf16 \
+             arm gets the same decline rather than a claim that it needs none"
+        );
+    }
+
+    /// **The class change the tolerance band cannot absorb, and the values every other gate misses.**
+    ///
+    /// Every band gate in the repo seeds `rng.vec(.., -1.0, 1.0)`, so an operand past f16's range is
+    /// never exercised by one — and it would not be a tolerance failure if it were, it would be
+    /// `inf` where the f32 launcher returns a number. This is the device-free proof that such a call
+    /// declines instead, that it declines on the DATA and not on the shape, and that the bf16 arm
+    /// (which has f32's exponent range) declines nothing finite.
+    #[test]
+    fn an_operand_past_f16s_range_declines_to_the_f32_launcher() {
+        let f16_max = seam_dtype_max_finite(WgmmaDtype::F16);
+        let ok = [1.0f32, -1.0, 0.0, f16_max, -f16_max, 1e-9];
+        assert!(
+            wgmma_declines_operand_range(WgmmaDtype::F16, &ok, &ok).is_none(),
+            "everything here is a finite f16, including the ceiling itself and a value that merely \
+             underflows (which is a precision loss the band covers, not a class change)"
+        );
+
+        for bad in [65_536.0f32, -65_536.0, 1e30, f32::MAX, f32::INFINITY] {
+            let why = wgmma_declines_operand_range(WgmmaDtype::F16, &[1.0, bad], &ok)
+                .unwrap_or_else(|| panic!("{bad:e} in A must decline"));
+            assert!(why.starts_with("operand A"), "{why}");
+            let why = wgmma_declines_operand_range(WgmmaDtype::F16, &ok, &[1.0, bad])
+                .unwrap_or_else(|| panic!("{bad:e} in B must decline"));
+            assert!(why.starts_with("operand B"), "{why}");
+        }
+
+        // A NaN is a NaN on both routes, so the route changes nothing and there is nothing to decline.
+        assert!(wgmma_declines_operand_range(WgmmaDtype::F16, &[f32::NAN], &ok).is_none());
+
+        // The bf16 arm: everything f16 refuses here is ordinary, because bf16 has f32's exponent
+        // field. Only the very top of the f32 range and an infinity fail it.
+        for x in [1e30f32, -1e30, 65_536.0, 1e38] {
+            assert!(
+                wgmma_declines_operand_range(WgmmaDtype::Bf16, &[x], &ok).is_none(),
+                "bf16 carries f32's exponent range, so {x:e} is finite there"
+            );
+        }
+        for x in [f32::MAX, -f32::MAX, f32::INFINITY] {
+            assert!(
+                wgmma_declines_operand_range(WgmmaDtype::Bf16, &[x], &ok).is_some(),
+                "{x:e} is past bf16's own ceiling"
+            );
+        }
+
+        // And it is a DATA decline, not a shape one: the shape these values ride on is fine.
+        let cfg = wgmma_cfg_for(WGMMA_F32_SEAM_DTYPE, 64, 64);
+        assert!(wgmma_declines(cfg, 64, 64, 64, H100_SMEM).is_none());
     }
 
     /// **The law that keeps this file honest against the generator.** `gemm_nt_wgmma`'s first

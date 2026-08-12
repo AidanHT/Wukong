@@ -24,6 +24,15 @@ everywhere else.
   **odd `N`**, which the launcher does *not* check, is declined here: both shipped rows use the
   `st.global.v2.f32` epilogue, whose pair is 8-byte aligned only when `N` is even, and a misaligned
   store leaves the CUDA context stickily errored for the rest of the process.
+- **f16 is four decades narrower than f32, not only three digits shorter.** The route converts both
+  operands with `half::f16::from_f32`, whose largest finite value is 65504, so a `.wk` GEMM over
+  values past that would return `inf` where the pre-Hopper f32 launcher returns a number — a
+  different *answer*, which no tolerance band covers and which no gate would have caught (every band
+  gate seeds `U(-1,1)`). An operand outside the seam dtype's finite range is therefore a **decline**
+  like every other, at the cost of one read-only pass over both operands, the same order as the
+  host-side conversion that follows it. The underflow end is documented rather than declined: it is
+  the arithmetic class every f16 tensor-core path here has carried since Act 1, and a rule strict
+  enough to catch it would refuse nearly every real GEMM.
 - On Hopper the route converts both operands to f16 on the host, so the plain-GEMM offload changes
   arithmetic class there — inside the existing CPU↔GPU *tolerance* contract, and the driver's device
   gate sizes its band from the route that **actually ran**. That is the per-route offload counters

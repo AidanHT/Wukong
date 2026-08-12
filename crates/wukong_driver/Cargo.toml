@@ -30,6 +30,10 @@ wukong_autodiff = { workspace = true }
 # build stays toolchain-free (no `cudarc`, no device needed). Enabling it turns on the offloading
 # interpreter path in `compile()`.
 wukong_codegen_gpu = { workspace = true, optional = true }
+# The Hopper `wgmma` seam feeds f32 operands to a 16-bit kernel, so the driver must decide — before
+# the launch — whether an operand survives the conversion `gpu::gemm_nt_wgmma` will perform. Same
+# crate, same `from_f32`, so the decline and the conversion cannot drift. GPU-only, like the seam.
+half = { version = "2", optional = true }
 
 [features]
-gpu = ["dep:wukong_codegen_gpu", "wukong_codegen_gpu/gpu"]
+gpu = ["dep:wukong_codegen_gpu", "wukong_codegen_gpu/gpu", "dep:half"]

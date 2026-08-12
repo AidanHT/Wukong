@@ -2396,6 +2396,106 @@ mod gpu_e2e_tests {
         }
     }
 
+    /// **An operand past f16's range must not turn a finite GEMM into infinities.**
+    ///
+    /// The Hopper route converts both f32 operands with `half::f16::from_f32`, whose largest finite
+    /// value is 65504 — about four decades below f32's. That is not the "input rounding" the
+    /// tolerance band was widened for: an operand past it enters the GEMM as `inf` and comes back as
+    /// `inf`/`NaN`, where `gpu::gemm_nt` (f32 in, f32 out) returns exactly what the CPU oracle does.
+    /// A *different answer*, which no band covers — and which no other gate here can see, because
+    /// every one of them seeds `rng.vec(.., -1.0, 1.0)`. `gpu_accel::wgmma_declines_operand_range`
+    /// therefore declines it to the f32 launcher.
+    ///
+    /// A **paired control**: same shape, same `b`, one element of `a` apart, so on a Hopper part the
+    /// route must differ *because of that element* and nothing else. Runs on any device — on a
+    /// pre-Hopper part both arms are `Existing` and it still asserts the thing that actually matters
+    /// to a user, that neither run returns a non-finite lane where the oracle is finite.
+    #[test]
+    fn gpu_backend_declines_operands_past_the_f16_range() {
+        const NAME: &str = "gpu_backend_declines_operands_past_the_f16_range";
+        let mut guard = wukong_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                skip_no_device(NAME);
+                return;
+            }
+        };
+        let cc = g.target().cc();
+        let mut rng = Rng::new(0xF16_0BAD);
+        let (m, k, n) = (64usize, 64usize, 64usize);
+        let (program, mut interner) = build(&linear_src(m, k, n));
+        let entry = interner.intern("lin");
+        // `b` is kept strictly positive so the huge lane dominates its column sum outright: the
+        // comparison below is then about the route, not about a cancellation.
+        let b = rng.vec(n * k, 0.5, 1.0);
+        let base = rng.vec(m * k, -1.0, 1.0);
+
+        for (label, a0, hopper_route) in [
+            ("control", 1.0f32, gpu_accel::GemmRoute::Wgmma),
+            // 2^16: exactly representable in f32, and the first power of two past f16's ceiling.
+            ("overflow", 65_536.0f32, gpu_accel::GemmRoute::Existing),
+        ] {
+            // On anything but Hopper the wgmma family is not eligible at all, so both arms fall to
+            // the same launcher and the value assertions are the whole content of the case.
+            let want = if cc.0 == 9 {
+                hopper_route
+            } else {
+                gpu_accel::GemmRoute::Existing
+            };
+            let mut a = base.clone();
+            a[0] = a0;
+
+            let (mut ac, mut bc, mut cpu) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cpu];
+                wukong_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
+            }
+            assert!(
+                cpu.iter().all(|v| v.is_finite()),
+                "{label}: the CPU oracle itself is non-finite, so this case proves nothing"
+            );
+
+            let (mut ag, mut bg, mut got) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ag, &mut bg, &mut got];
+                wukong_interp::run_kernel_f32_accel(
+                    &program, entry, &mut bufs, &interner, &mut accel,
+                )
+                .unwrap();
+            }
+            let taken = accel
+                .gemm_route_taken()
+                .expect("the GEMM must have offloaded, or this tests CPU-vs-CPU");
+            assert_eq!(
+                taken, want,
+                "{label} (cc {cc:?}, a[0] = {a0:e}): on Hopper the route must be decided by this ONE \
+                 element — the shape is identical in both runs and declines in neither"
+            );
+            assert!(
+                got.iter().all(|v| v.is_finite()),
+                "{label}: the GPU returned a non-finite lane where the f32 oracle is finite — the \
+                 range decline did not fire and the f16 seam overflowed"
+            );
+            // The band follows the route, so a declined call is held to the f32 kernel's own bound.
+            // The decline buys back the tight band as well as the finite answer.
+            let (abs_tol, rel_tol) = gemm_tolerance(taken, k);
+            let s = assert_close(
+                &format!("range {label} {m}x{k}x{n}"),
+                &got,
+                &cpu,
+                abs_tol,
+                rel_tol,
+            );
+            eprintln!(
+                "gpu --backend range {label} {m}x{k}x{n} a[0]={a0:e} [{taken:?}]: \
+                 {} wgmma / {} existing, max_abs={:.2e} max_rel={:.2e}",
+                accel.gemm_wgmma_calls, accel.gemm_existing_calls, s.max_abs, s.max_rel
+            );
+        }
+    }
+
     /// **`act(matmul(x,w))` from Wukong source runs the fused tensor-core kernel** (Phase-2 fusion
     /// engine). The recognizer folds the matmul + activation loop into `wukong_sgemm_nt_epi`; the GPU
     /// `Accelerator` routes that to the single fused WMMA kernel (`gemm_nt_f16_sm_db_{relu,silu,gelu}`,
