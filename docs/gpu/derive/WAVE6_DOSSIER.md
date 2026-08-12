@@ -1003,8 +1003,15 @@ kernel**, so they get an `==` gate against it and not merely the layout gate.
 ### G-W6-6. G16 applies, and the decode contender's dispersion is unknown
 
 > **No serving ratio is published until the peer's own dispersion has been measured at the decode
-> shape.** The campaign's dispersion floors are GEMM floors (`+/-0.00%` to `+/-3.29%` in round 3;
-> sq1024 was **refused** at `+/-15.47%`, `CAMPAIGN_CHECKPOINT.md:47-48`). A decode kernel at 12% SM
+> shape.** The campaign's dispersion floors are GEMM floors, and both ends of the range come out of
+> round logs rather than out of the checkpoint: round 3's per-cell control floors ran `+/-0.00%` to
+> `+/-3.29%` (the `+3.29%` cell is `w1_s4_off/sq2048` at
+> `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:538`; `WAVE3_DOSSIER.md:1498` records the
+> range and which pairs to quote), and sq1024 was **refused** when its peer A-vs-C floor came in at
+> `+/-15.47%` (`bench/gpu/h100/2026-08-11-h100-w2-r10-vs-cublas-v2rule.log:142`, "GATE SHUT ...
+> exceeds the pre-registered bar +/-5.00%"). `CAMPAIGN_CHECKPOINT.md:49` carries that one refusal
+> rounded to `+/-15.5%` and is the only dispersion figure in the checkpoint -- it does not carry the
+> `+/-3.29%`, so do not cite it for the range. A decode kernel at 12% SM
 > occupancy with a ragged per-sequence context is a far noisier contender than a square GEMM, and
 > **nothing in this repo has measured how noisy.** Run the two-identical-arms control (arms A and C
 > both FA2) before any ratio arm, exactly as Wave 2 did.
@@ -1175,6 +1182,7 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 |---|---|
 | H100 device identity: 132 SMs, 232,448 B SMEM, 50.0 MiB L2, 79.18 GiB VRAM, clock lock UNKNOWN | `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:517-531` |
 | H100 bandwidth: spec 3352.3, copy **2922.3**, saxpy 2567.0, reduce **682.1** GB/s | `bench/gpu/h100/2026-08-11-h100-w2-r5-hbm.log:50-53` |
+| The campaign's GEMM dispersion floors, quoted by G-W6-6: `+3.29%` (round 3, `w1_s4_off/sq2048`) and the `+/-15.47%` sq1024 refusal | `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log:538`; `bench/gpu/h100/2026-08-11-h100-w2-r10-vs-cublas-v2rule.log:142`; range restated at `docs/gpu/derive/WAVE3_DOSSIER.md:1498`, refusal restated at `CAMPAIGN_CHECKPOINT.md:49` |
 | The whole serving correctness suite, **green on H100**; every serving perf bench `#[ignore]`d | `bench/gpu/h100/2026-08-10-h100-s2d-full-suite.log:171`, `:2274-2501`, `:2493-2497`, `:2707-2741` |
 | The Llama-3-8B decode geometry and the 64.00 GiB f16 KV cache, printed on H100 | same log, `:2495` |
 | Staged peer bar: FA2 2.8.3.post1 (`kvcache_api`/`kvcache_symbol` true), vLLM 0.26.0, torch 2.13.0+cu129, ptxas 12.9.86 | `bench/gpu/h100/2026-08-11-fa2-stage.log` (the `peers.json` audit block) |
