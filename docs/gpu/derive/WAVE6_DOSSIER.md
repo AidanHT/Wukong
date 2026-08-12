@@ -796,15 +796,40 @@ inside the underfill regime the `_w{W}` family was built for.**
     at BW                                = 0.0689 ms of a 4.960 ms step
 ```
 
-So the norm is **1.39% of the step if it runs at bandwidth**, and up to ~11% if the underfilled
-launch runs 8x off it. The 4050 measured **1.6-3.5x** available from `W > 1` in exactly this regime
-(`ptx_norm.rs:600-607`) -- quoted here as the *existence* of the gap on a 20-SM part, not as its
-size on a 132-SM one, where `ptx_norm.rs:617-618` says out loud that "the covered regime is
-genuinely open there".
+So the norm is **1.39% of the step if it runs at bandwidth**. It does not run at bandwidth, and the
+upper end of the range is the only part of section 8 that is not derived:
+
+> **MODEL, and the constant is `W`.** The shipped launch puts `W = 1` warp on a row; the planner,
+> at this shape, returns `W = 8` -- `MAX_WARPS_PER_ROW`, the last of `MW_WIDTHS = [1, 2, 4, 8]`
+> (`ptx_norm.rs:53`, `:56`, `:619-629`). Take the per-row rate as proportional to the warps working
+> that row -- which is the `_w{W}` family's entire design premise, since it exists precisely to put
+> more warps on one row -- and the shipped launch is off bandwidth by **at most
+> `W_planner / W_shipped = 8`**. **The constant is that ratio and nothing else**, and it is an upper
+> bound rather than a measurement: it assumes per-row throughput scales linearly in warps all the
+> way to 8 and that nothing else binds first. **Nothing in this tree has observed 8.** The nearest
+> evidence is the 4050 sweep's **1.6-3.5x** from `W > 1` in exactly this regime
+> (`ptx_norm.rs:600-607`), quoted as the *existence* of the gap on a 20-SM part and never as its
+> size on a 132-SM one, where `ptx_norm.rs:617-618` says out loud that "the covered regime is
+> genuinely open there" (A100/H100 have 2x the warp slots per SM). Note also what `W` does *not*
+> fix: at `rows = 64 < 132` no `W` lights the idle SMs, because one row is one CTA
+> (`ptx_norm.rs:585-589`).
+>
+> **FALSIFIER: round row `a5_normplan`** (section 12.2; item 6 of 12.4). A/B the shipped hardcoded
+> launch against `norm_launch(g.sm_count(), rows, d)` at `B = 64, D = 4096` on H100, plus the
+> `WUKONG_NORM_WARPS` sweep over `MW_WIDTHS` (`ptx_norm.rs:631-636`, which panics on a width it did
+> not generate rather than silently measuring the default). **A ratio of 1.0x refutes the model and
+> the norm is worth nothing; 8x means the bound was tight.** Publish the measured ratio; never
+> publish the 8.
+
+So the norm's share of the decode step is **1.39% at bandwidth and at most ~11% at the model's
+bound** (1.39% x 8) -- a band whose upper end carries the MODEL stamp everywhere it is restated
+(12.1 lever 6, 12.4 row 6, section 13).
 
 > **The fix is three lines** -- route `DecodeLayer`'s norm through `norm_launch(g.sm_count(), rows,
-> d)` and use the entry and grid it returns. It is worth **0 to ~9 points of the decode step** and
-> it is the cheapest engineering in the wave. It is also the correct place to put the plan's
+> d)` and use the entry and grid it returns. It is worth **0 to ~9 points of the decode step**
+> (**MODEL**: the upper end is the `W = 1 -> 8` bound above, falsified or confirmed by `a5_normplan`;
+> the lower end is real and is 0) and it is the cheapest engineering in the wave. It is also the
+> correct place to put the plan's
 > "`MIN_ELEMS_PER_LANE` and `warps_per_row` re-derived on H100, never ported from the 20-SM 4050"
 > demand (`ACT2_WAVE_PLAN.md:176`): the knob for that round already exists as `WUKONG_NORM_WARPS`
 > (`ptx_norm.rs:631-636`), and it **panics** on a value outside `MW_WIDTHS` rather than silently
@@ -1269,7 +1294,8 @@ LSU-vs-HBM question nobody has answered.
 `g in {4, 8}`. Its V-side twin is a 512-register wall at `head_dim = 128` and should not be built
 until the section-5.4 falsifier says the g-fold costs HBM bytes.
 
-**6. THE NORM PLANNER FIX -- three lines, 0 to ~9 points of the step.** `DecodeLayer` hardcodes the
+**6. THE NORM PLANNER FIX -- three lines, 0 to ~9 points of the step (upper end is MODEL: the
+`W = 1 -> 8` warps-per-row ratio of section 8; falsifier `a5_normplan`).** `DecodeLayer` hardcodes the
 one-warp entry and a 64-CTA grid on a 132-SM part while the SM-filling family and its planner sit
 unused in the same crate.
 
@@ -1359,7 +1385,7 @@ free-or-seconds and should all be in the same container.**
 | 3 | **Whether the g-fold costs HBM bytes or only L1/L2 requests** | decides whether the tiled q-group is rank 1 or rank 5, and whether the plan's "4x that" stands | measure DRAM read bytes for one step; divide by `2*L*ctx*kv_heads*hd*2*B`. Ratio ~1 or ~g |
 | 4 | **Achieved bandwidth of a 16-CTA and a 64-CTA decode GEMM** | the entire size of lever 2 (split-K), 1.0x to 6.6x | `d3_gemmbw`, two launches |
 | 5 | **H100/Linux per-launch overhead** | decides levers 7 and the megakernel; the repo's 1.5 us is WDDM and non-transferable | `d2_launch`: 448 empty launches vs one graph replay, seconds |
-| 6 | **The norm's real share of the decode step on H100** | bounded 1.4% to ~11%; `MIN_ELEMS_PER_LANE`, `FILL_CTAS_PER_SM` and `OCCUPANCY_WARPS` were all calibrated on 20 SMs | `a5_normplan` A/B, plus a `WUKONG_NORM_WARPS` sweep at the decode shape |
+| 6 | **The norm's real share of the decode step on H100** | derived at 1.39%; bounded above at ~11% by a **MODEL** whose only constant is `W = 1 -> 8` warps per row (section 8), which nothing in this tree has observed -- the 4050's own sweep tops out at 3.5x. `MIN_ELEMS_PER_LANE`, `FILL_CTAS_PER_SM` and `OCCUPANCY_WARPS` were all calibrated on 20 SMs | `a5_normplan` A/B, plus a `WUKONG_NORM_WARPS` sweep at the decode shape. **This row is the model's falsifier**: 1.0x refutes it, 8x makes the bound tight |
 | 7 | **FA2's own dispersion at decode shapes** | without it no peer ratio is publishable (G16); the campaign's floors are GEMM floors | `p0_disp`: two identical FA2 arms |
 | 8 | **Register/spill for every decode module on any architecture** | the census corpus is wmma+flash+wgmma only; `%acc<128>` sits ~198 virtual registers deep and every Wave-6 rewrite adds more | the $0.02 CPU census, corpus extended per G-W6-1. **Runs before the GPU is rented** |
 
