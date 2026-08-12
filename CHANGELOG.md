@@ -17,13 +17,25 @@ everywhere else.
 - Config selection goes through **one** seam function that delegates to the generator's shipped
   regime rule; wave 3's per-shape dispatcher replaces exactly that body.
 - **Decline, never wrong.** Architecture, shape, an unencodable tensor map (`K % 8 != 0`), an output
-  past the epilogue's `u32` index, a ring larger than the device's opt-in shared memory, or an
-  `UNSUPPORTED` from the generator all fall back to the existing path with unchanged results; only a
-  real driver failure is an error. Ragged M/N/K are not declines. The launcher's `assert!`
-  preconditions are pre-decided driver-side so an offload can never abort a user's program — and an
-  **odd `N`**, which the launcher does *not* check, is declined here: both shipped rows use the
-  `st.global.v2.f32` epilogue, whose pair is 8-byte aligned only when `N` is even, and a misaligned
-  store leaves the CUDA context stickily errored for the rest of the process.
+  past the epilogue's `u32` index, a CTA grid past CUDA's `gridDim.y` ceiling, a ring larger than the
+  device's opt-in shared memory, or an `UNSUPPORTED` from the generator all fall back to the existing
+  path with unchanged results; only a real driver failure is an error. Ragged M/N/K are not declines.
+  The launcher's `assert!` preconditions are pre-decided driver-side so an offload can never abort a
+  user's program — and the two rules that are **nobody's** precondition are decided here too: an
+  **odd `N`** (both shipped rows use the `st.global.v2.f32` epilogue, whose pair is 8-byte aligned
+  only when `N` is even, and a misaligned store leaves the CUDA context stickily errored for the rest
+  of the process) and the **grid ceiling** (`LaunchPlan::grid` puts M tiles on `gridDim.y`, which CUDA
+  caps at 65535, so an `M` above ~8.4M with an `N` small enough to keep `M*N` inside the `u32` index
+  reached the driver as `CUDA_ERROR_INVALID_VALUE`). Both were hard errors on calls that had a
+  working fallback.
+- **The contract names its non-declines.** "*Every* reason the family cannot take a call resolves to
+  the working path" was wider than the code, so it now reads *decidable before the launch* and the
+  two other outcomes are stated where a caller meets them: a driver rejection **at** the launch that
+  is not `Unsupported` — `cuModuleLoadData` refusing an `sm_90a` module on a driver that predates
+  that virtual architecture, since the `Sm90aLicense` gates on the device's capability and not the
+  driver's — stays `Some(Err(..))`, on purpose, because a GPU *failure* under `--backend=gpu` is never
+  silently answered on the CPU; and a launch that never retires ends the process with `exit(70)` from
+  `gpu::sync_with_deadline`'s hung-kernel diagnosis, a wedged context being unrecoverable.
 - **f16 is four decades narrower than f32 at BOTH ends, not only three digits shorter.** The route
   converts both operands with `half::f16::from_f32`, which spans 6.104e-5 to 65504 against f32's
   1.18e-38 to 3.4e38. A `.wk` GEMM over values past the top returns `inf` where the pre-Hopper f32
