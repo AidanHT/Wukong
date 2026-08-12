@@ -20,8 +20,9 @@ percentage is provisional pending a locked-clock root-VM re-run.
   `wgmma`-vs-cuBLAS table at f16 and bf16 (f32 out) with each row's measured peer floor; the
   mechanism (the fused `st.global.v2.f32` epilogue, +25.2/+15.3/+10.1 points, taking the six
   resolvable shapes from ≈61% to ≈88% of cuBLAS) and the two levers that measured **nothing**; the
-  store-elided diagnostic arm at 114.0/101.1/101.8% that locates the whole remaining gap in the
-  epilogue; **copy 2922 GB/s = 87.2% of the 3352 GB/s HBM spec peak**; and the **fused int8
+  store-elided diagnostic arm at 114.0/101.1/101.8% that locates the remaining gap in the epilogue
+  **at the three square shapes it was run on**, the three FFN shapes having no elided arm at all;
+  **copy 2922 GB/s = 87.2% of the 3352 GB/s HBM spec peak**; and the **fused int8
   GEMM+dequant at 1.08×/1.15× the cuBLAS chain at 1024³/2048³** — the first outright peer win on
   Hopper — beside its **0.79× loss at 4096³**.
 - **The refusals are published as results**, which is the point of the instrument: `sq1024` in f16

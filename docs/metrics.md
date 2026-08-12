@@ -115,8 +115,11 @@ Current standing (recorded):
   resolved there and reads 49.5%, a 32-CTA problem on 132 SMs). The lever was one change, the fused
   `st.global.v2.f32` epilogue (**+25.2 / +15.3 / +10.1 points** at the three square shapes), moving
   the six resolvable shapes from ≈61% to **≈88%** of cuBLAS; a store-elided *diagnostic* arm (writes
-  no C, ungateable, read only as a difference) sits at **114.0 / 101.1 / 101.8%**, so the mainloop is
-  already at or above the peer and everything still owed is epilogue plus wave overhead. **The GEMM
+  no C, ungateable, read only as a difference against the **clustered** arm it was cut from) sits at
+  **114.0 / 101.1 / 101.8%** **at the three square shapes it was run on — and nowhere else**, so the
+  mainloop is at or above the peer *there* and what is still owed *there* is epilogue plus wave
+  overhead. Where the gap sits on the three `gpt_*` FFN shapes, including the 73.4% worst row, is
+  **unmeasured**: no elided arm was ever run on them. **The GEMM
   readings above went through the instrument; the ones that follow did not** — they are single-shot
   rounds with no provenance header, no A/C peer twin, no measured floor, no median-of-5 and no
   publish gate, and a repeat under the instrument is owed. Memory-bound
@@ -310,13 +313,20 @@ Remaining, ranked:
    Shared-pack, mid-pool, persistent-region, and fork-join alternatives are all measured/refuted
    in gemm.rs — a genuinely new decomposition idea is required for further mid-size gain.
 2. **The H100 GEMM epilogue and wave overhead** — the measured Hopper gap, and the only one whose
-   location is already isolated: the store-elided diagnostic arm is at 101–114% of cuBLAS while the
-   shipped kernel is at 73–97%, so none of the remaining 3–27 points is in the mainloop. Two
-   specific measured holes sit beside it: **1024³ is unresolvable in f16** against this peer at the
-   ±5% bar (the peer's own floor is ±15.47%, so that shape needs a different measurement, not a
-   different kernel), and **Hopper int8 is 22–52% of cuBLAS IMMA** because the 4050's tile search
-   does not transfer. Everything past that is planning, not measurement — `docs/roadmap.md` and
-   `docs/gpu/derive/`.
+   location is *partly* isolated. **Scope the diagnostic to where it ran:** the store-elided arm
+   exists at exactly three shapes — sq2048 / sq4096 / sq8192, at 114.0 / 101.1 / 101.8% of cuBLAS —
+   and it is the *clustered* `..._s4_mcb2_v2` arm, so it reads as a difference against that arm's own
+   87.4 / 88.7 / 92.0%. At sq4096 and sq8192 the clustered arm is what ships and the conclusion
+   carries: the mainloop is at or above the peer, and the ~11 points still owed there are epilogue
+   plus wave overhead, not the inner loop. **The two FFN endpoints of the "3–27 points" range —
+   gpt_d1024_down at 97.3% and gpt_d4096_up at 73.4% — had no nostore arm run on them at all**
+   (`r3-config-sweep.log` sweeps only the three square shapes; the gpt rows exist only in
+   `r10-vs-cublas-v2rule.log`, a round with no elided arm), so where *their* gap sits is unmeasured
+   and the 73.4% row in particular is the one worth measuring first. Two further measured holes sit
+   beside it: **1024³ is unresolvable in f16** against this peer at the ±5% bar (the peer's own floor
+   is ±15.47%, so that shape needs a different measurement, not a different kernel), and **Hopper
+   int8 is 22–52% of cuBLAS IMMA** because the 4050's tile search does not transfer. Everything past
+   that is planning, not measurement — `docs/roadmap.md` and `docs/gpu/derive/`.
 3. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
    tensors (M6; **file I/O now runs** — typed read/write blobs, interp == native).
 4. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).
