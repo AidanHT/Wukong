@@ -20,6 +20,13 @@
 //! (`docs/gpu/derive/WAVE4_DOSSIER.md` §5.0, §5.4 gap 4). Everything about the route is stated as a
 //! pure function of the *probed* [`wukong_codegen_gpu::gpu::GpuTarget`] plus the shape, so it is
 //! decidable device-free and is unit-tested that way below.
+//!
+//! Because a fallback is *silent by design* — the same answer, from the other kernel — the route also
+//! carries a **witness**: [`GpuAccel::gemm_wgmma_calls`] / [`GpuAccel::gemm_existing_calls`] split the
+//! offload count by route, [`GpuAccel::gemm_route_taken`] reads them, and [`ROUTE_LOG_ENV`] prints
+//! each dispatch with its decline reason. Without one, nothing anywhere distinguishes "the wgmma route
+//! ran" from "the wgmma route declined and the pre-Hopper launcher ran", and a round on rented silicon
+//! can measure one kernel while reporting the other's name.
 
 use wukong_codegen_gpu::ptx_wgmma::{self, WgmmaCfg, WgmmaDtype};
 use wukong_codegen_gpu::Gpu;
@@ -28,22 +35,61 @@ use wukong_interp::Accelerator;
 /// Wraps the process-wide [`Gpu`] context and routes recognized kernels to its launch wrappers.
 /// `calls` counts kernels that actually ran on the device — the tolerance test asserts it is `> 0`
 /// so a silent CPU fallback can never masquerade as a passing GPU run.
+///
+/// The two `gemm_*_calls` fields split that total by GEMM **route**, and they exist because `calls`
+/// alone cannot tell the two apart: [`Accelerator::sgemm_nt`] bumps it identically whether the wgmma
+/// family took the call or declined it to the pre-Hopper launcher. Without the split, an H100 round
+/// can time `gpu::gemm_nt` and report it as wgmma — see [`GpuAccel::gemm_route_taken`].
 pub struct GpuAccel<'g> {
     pub gpu: &'g mut Gpu,
     pub calls: u32,
+    /// Plain `C = A·Bᵀ` offloads the **wgmma** family took (a launch was issued, whether or not the
+    /// driver then failed it). Part of `calls`.
+    pub gemm_wgmma_calls: u32,
+    /// Plain `C = A·Bᵀ` offloads that ran on [`GemmRoute::Existing`] — `gpu::gemm_nt`. Part of
+    /// `calls`.
+    pub gemm_existing_calls: u32,
 }
 
 impl<'g> GpuAccel<'g> {
-    /// Construct over a bound GPU context with a zeroed offload counter.
+    /// Construct over a bound GPU context with zeroed offload counters.
     pub fn new(gpu: &'g mut Gpu) -> Self {
-        GpuAccel { gpu, calls: 0 }
+        GpuAccel {
+            gpu,
+            calls: 0,
+            gemm_wgmma_calls: 0,
+            gemm_existing_calls: 0,
+        }
     }
 
-    /// The route this context's device takes for a recognized `C = A·Bᵀ`, including the
+    /// The route this context's device is **eligible** for on a recognized `C = A·Bᵀ`, including the
     /// [`WGMMA_OFF_ENV`] switch. The one place the pure decision meets the probed device, and
     /// therefore the one a device gate must ask rather than re-deriving from `cc`.
+    ///
+    /// **This is an eligibility, not a witness.** It is `cc` and the env switch and nothing else, so
+    /// on a Hopper part it answers `Wgmma` for *every* shape — including the ones [`wgmma_declines`]
+    /// then sends to the other launcher. Anything that needs to know what actually ran must ask
+    /// [`GpuAccel::gemm_route_taken`], which reads the counters.
     pub(crate) fn gemm_route(&self) -> GemmRoute {
         gemm_route_for(self.gpu.target().cc(), wgmma_disabled_by_env())
+    }
+
+    /// **The route that actually RAN, or `None` if no plain GEMM was offloaded at all.**
+    ///
+    /// The witness [`GpuAccel::gemm_route`] cannot be. Every decline in [`wgmma_declines`] — an
+    /// unencodable `K`, an odd `N`, an output past the epilogue's `u32` index, a ring over the
+    /// device's shared-memory budget — and every `UNSUPPORTED` the generator itself returns leaves
+    /// the eligibility at `Wgmma` while `gpu::gemm_nt` does the work. A gate or a bench that asks
+    /// only the eligibility therefore cannot distinguish "the wgmma route ran" from "the wgmma route
+    /// declined and the pre-Hopper launcher ran", which on rented silicon means measuring one kernel
+    /// and publishing the other's name.
+    ///
+    /// `#[cfg(test)]` for the same reason [`HOPPER_GATE_SHAPES`] is: the gates are its only callers
+    /// today, and the counters it reads are `pub` fields any of them can also compare directly.
+    /// Promoting it to product API means making [`GemmRoute`] `pub` with it.
+    #[cfg(test)]
+    pub(crate) fn gemm_route_taken(&self) -> Option<GemmRoute> {
+        gemm_route_taken_from(self.gemm_wgmma_calls, self.gemm_existing_calls)
     }
 
     /// **`C = A·Bᵀ` through the Hopper wgmma family, or `None` to fall back.**
@@ -72,25 +118,62 @@ impl<'g> GpuAccel<'g> {
         n: usize,
     ) -> Option<Result<Vec<f32>, String>> {
         if self.gemm_route() != GemmRoute::Wgmma {
+            let cc = self.gpu.target().cc();
+            route_log(format_args!(
+                "{m}x{k}x{n}: Existing (cc {}.{} is not eligible for wgmma, or {WGMMA_OFF_ENV} is set)",
+                cc.0, cc.1
+            ));
             return None;
         }
         let cfg = wgmma_cfg_for(WGMMA_F32_SEAM_DTYPE, m, n);
         // The launcher's own preconditions are asserts; decide them here so a shape it would abort on
         // simply takes the other path.
-        if wgmma_declines(cfg, m, k, n, self.gpu.smem_budget()).is_some() {
+        if let Some(why) = wgmma_declines(cfg, m, k, n, self.gpu.smem_budget()) {
+            route_log(format_args!("{m}x{k}x{n}: Existing (declined: {why})"));
             return None;
         }
         if a.len() != m * k || b.len() != n * k {
+            route_log(format_args!(
+                "{m}x{k}x{n}: Existing (operand lengths {}/{} are not m*k / n*k)",
+                a.len(),
+                b.len()
+            ));
             return None;
         }
         match wukong_codegen_gpu::gpu::gemm_nt_wgmma(self.gpu, cfg, a, b, m, k, n) {
-            Ok(out) => Some(Ok(out)),
+            Ok(out) => {
+                route_log(format_args!("{m}x{k}x{n}: Wgmma ({})", cfg.name));
+                Some(Ok(out))
+            }
             // A capability or encodability decline is the generator saying "not this shape", which is
             // a routing fact, not a failure — `UNSUPPORTED` means SKIP everywhere else in this
             // backend and it means fall-back here.
-            Err(e) if e.unsupported().is_some() => None,
+            Err(e) if e.unsupported().is_some() => {
+                route_log(format_args!(
+                    "{m}x{k}x{n}: Existing ({} declined at launch: {e})",
+                    cfg.name
+                ));
+                None
+            }
             Err(e) => Some(Err(format!("GPU {} failed: {e}", cfg.name))),
         }
+    }
+}
+
+/// **The witness, as a pure function of the two counters** — so the algebra that decides "did the
+/// wgmma route run" is testable on a laptop with no device, which is where every other rule in this
+/// file is pinned.
+///
+/// A *mixed* run answers [`GemmRoute::Wgmma`]: one wgmma call is enough to put an f16 input rounding
+/// into the buffers the run is judged on, so anything sizing a tolerance from this must take the
+/// wider band. It is deliberately not a third variant — a caller that needs "were they *all* wgmma"
+/// (the Hopper gate does) compares the counters directly and gets a better message for it.
+#[cfg(test)]
+fn gemm_route_taken_from(wgmma_calls: u32, existing_calls: u32) -> Option<GemmRoute> {
+    match (wgmma_calls, existing_calls) {
+        (0, 0) => None,
+        (0, _) => Some(GemmRoute::Existing),
+        _ => Some(GemmRoute::Wgmma),
     }
 }
 
@@ -141,6 +224,23 @@ const WGMMA_OFF_ENV: &str = "WUKONG_GPU_NO_WGMMA";
 /// a shared process happened to run first.
 fn wgmma_disabled_by_env() -> bool {
     std::env::var_os(WGMMA_OFF_ENV).is_some()
+}
+
+/// Set this to anything to have every recognized `C = A·Bᵀ` offload print the route it took, and —
+/// when the wgmma family declined — the reason, on stderr.
+///
+/// The counters ([`GpuAccel::gemm_route_taken`]) are the machine-readable witness and a test asserts
+/// on them; this is the human one, for a round on rented silicon where the failure mode is "the
+/// numbers are fine and they came from the other kernel". Off by default so a `.wk` run's stderr
+/// stays diagnostics.
+const ROUTE_LOG_ENV: &str = "WUKONG_GPU_ROUTE_LOG";
+
+/// One `[wukong gpu route]` line per plain-GEMM offload when [`ROUTE_LOG_ENV`] is set.
+/// `format_args!` at the call sites, so a disabled log formats nothing.
+fn route_log(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os(ROUTE_LOG_ENV).is_some() {
+        eprintln!("[wukong gpu route] {args}");
+    }
 }
 
 /// **The routing decision, as a pure function of the probed compute capability.** No device, no
@@ -303,11 +403,18 @@ impl Accelerator for GpuAccel<'_> {
     ) -> Option<Result<(), String>> {
         // Hopper first: this is `gemm_nt_wgmma`'s product call site (WAVE4_DOSSIER §5.0). A decline
         // falls through to the launcher every pre-Hopper device has always used.
+        //
+        // The two arms bump `calls` identically, which is exactly why they must also bump a counter
+        // that names the route: a fallback here is invisible to `calls`, to the tolerance band and to
+        // any bench reading either, so without the split an H100 round can time `gpu::gemm_nt` and
+        // publish it under the wgmma family's name.
         if let Some(res) = self.try_gemm_nt_wgmma(a, b, m, k, n) {
             self.calls += 1;
+            self.gemm_wgmma_calls += 1;
             return Some(res.map(|out| c.copy_from_slice(&out)));
         }
         self.calls += 1;
+        self.gemm_existing_calls += 1;
         Some(
             wukong_codegen_gpu::gpu::gemm_nt(self.gpu, a, b, m, k, n)
                 .map(|out| c.copy_from_slice(&out))
@@ -489,6 +596,47 @@ mod tests {
     fn the_wgmma_kill_switch_beats_the_capability() {
         assert_eq!(gemm_route_for((9, 0), true), GemmRoute::Existing);
         assert_eq!(gemm_route_for((8, 9), true), GemmRoute::Existing);
+    }
+
+    /// **Eligibility is not a witness, and this is the test that says so.**
+    ///
+    /// `gemm_route_for` answers [`GemmRoute::Wgmma`] for *every* shape on a Hopper part — it never
+    /// sees one — while `wgmma_declines` sends a real subset of them to `gpu::gemm_nt`. So a gate or
+    /// a bench that reads the eligibility and concludes "the wgmma family ran" is reading a fact
+    /// about the device, not about the call: it cannot tell a wgmma launch from a fallback, and on
+    /// rented silicon that is measuring one kernel under the other's name. The counters can tell
+    /// them apart, and this pins their algebra device-free.
+    #[test]
+    fn the_route_that_ran_is_a_separate_fact_from_the_route_the_device_is_eligible_for() {
+        // Hopper is eligible at every shape...
+        assert_eq!(gemm_route_for((9, 0), false), GemmRoute::Wgmma);
+        // ...including ones the seam then declines, which is the whole gap.
+        let cfg = wgmma_cfg_for(WGMMA_F32_SEAM_DTYPE, 64, 64);
+        for &(m, k, n) in &[(64usize, 100usize, 64usize), (64, 64, 63)] {
+            assert!(
+                wgmma_declines(cfg, m, k, n, H100_SMEM).is_some(),
+                "{m}x{k}x{n} must decline, or this test proves nothing"
+            );
+        }
+
+        assert_eq!(
+            gemm_route_taken_from(0, 0),
+            None,
+            "no plain GEMM was offloaded at all — neither route is a witness to anything yet"
+        );
+        assert_eq!(gemm_route_taken_from(4, 0), Some(GemmRoute::Wgmma));
+        assert_eq!(
+            gemm_route_taken_from(0, 4),
+            Some(GemmRoute::Existing),
+            "four fallbacks on a Hopper part: the eligibility still says Wgmma and the witness must \
+             not"
+        );
+        assert_eq!(
+            gemm_route_taken_from(1, 3),
+            Some(GemmRoute::Wgmma),
+            "one wgmma call puts the f16 input rounding in the output, so a mixed run is judged by \
+             the wider band"
+        );
     }
 
     /// **The law that keeps this file honest against the generator.** `gemm_nt_wgmma`'s first

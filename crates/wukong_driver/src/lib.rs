@@ -2172,6 +2172,17 @@ mod gpu_e2e_tests {
                 cc.0 == 9 || route == gpu_accel::GemmRoute::Existing,
                 "cc {cc:?} is not Hopper but took {route:?} — an sm_90a module cannot load here"
             );
+            // And the same claim against the *witness* rather than the eligibility: on a non-Hopper
+            // part every offload must have actually run `gpu::gemm_nt`. This is the arm that runs on
+            // this repo's 4050, so it is the one that would catch the wgmma seam leaking onto a
+            // device whose module cannot even load.
+            if cc.0 != 9 {
+                assert_eq!(
+                    accel.gemm_wgmma_calls, 0,
+                    "cc {cc:?}: {} offload(s) took the wgmma route on a part that is not Hopper",
+                    accel.gemm_wgmma_calls
+                );
+            }
 
             let (abs_tol, rel_tol) = gemm_tolerance(route, k);
             let s = assert_close(
@@ -2182,8 +2193,12 @@ mod gpu_e2e_tests {
                 rel_tol,
             );
             eprintln!(
-                "gpu --backend linear {m}x{k}x{n} [{route:?}]: {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
-                accel.calls, s.max_abs, s.max_rel
+                "gpu --backend linear {m}x{k}x{n} [{route:?}, ran {:?}]: {} GPU call(s), \
+                 max_abs={:.2e} max_rel={:.2e}",
+                accel.gemm_route_taken(),
+                accel.calls,
+                s.max_abs,
+                s.max_rel
             );
         }
     }
@@ -2199,10 +2214,14 @@ mod gpu_e2e_tests {
     ///       --name gpu_backend_linear_routes_through_wgmma_on_hopper --package wukong_driver
     /// ```
     ///
-    /// (after `::build --release`, which `::bench` requires). It asserts three separate things, and
-    /// the first two are the ones a green-but-vacuous run would skip: that the route on this device
-    /// really is [`gpu_accel::GemmRoute::Wgmma`], that the offload fired at all, and only then that
-    /// the numbers match the CPU oracle.
+    /// (after `::build --release`, which `::bench` requires). It asserts four separate things, and
+    /// the first three are the ones a green-but-vacuous run would skip: that the device is
+    /// *eligible* for [`gpu_accel::GemmRoute::Wgmma`], that the offload fired at all, that every
+    /// offload it fired **took that route** rather than falling back, and only then that the numbers
+    /// match the CPU oracle. The third is not implied by the first two — eligibility is `cc` plus an
+    /// env switch and never sees a shape, and `accel.calls` is bumped identically by both arms — so
+    /// without it a run where `gemm_nt_wgmma` declined at launch (an unencodable tensor map, a
+    /// `wgmma_module` `UNSUPPORTED`) passes every assertion while measuring `gpu::gemm_nt`.
     ///
     /// Three shapes, one per property, and they live in [`gpu_accel::HOPPER_GATE_SHAPES`] because
     /// `gpu_accel::tests::the_hopper_gate_shapes_reach_both_regime_arms` checks *on this laptop* what
@@ -2280,6 +2299,25 @@ mod gpu_e2e_tests {
                 accel.calls >= 1,
                 "{m}x{k}x{n}: nothing offloaded, so this would silently test CPU-vs-CPU"
             );
+            // **The witness, and the assertion this gate was vacuous without.** `route` above is an
+            // eligibility — `cc` and the env switch — so it says `Wgmma` on this device for every
+            // shape, including the ones `wgmma_declines` sends to `gpu::gemm_nt`. `accel.calls >= 1`
+            // is route-blind for the same reason: `sgemm_nt` bumps it identically on both arms. So
+            // the two assertions above plus a tolerance band wide enough for f16 are all satisfied
+            // by a run in which the wgmma family never executed a single instruction — which is
+            // precisely the H100 round this gate exists to make impossible.
+            assert_eq!(
+                (accel.gemm_wgmma_calls, accel.gemm_existing_calls),
+                (accel.calls, 0),
+                "{m}x{k}x{n}: {} of {} plain-GEMM offloads fell back to `gpu::gemm_nt` — the wgmma \
+                 family declined this shape at run time (an unencodable tensor map or a \
+                 `wgmma_module` UNSUPPORTED are both silent fallbacks), so this round measured the \
+                 pre-Hopper launcher",
+                accel.gemm_existing_calls,
+                accel.calls
+            );
+            let taken = accel.gemm_route_taken();
+            assert_eq!(taken, Some(gpu_accel::GemmRoute::Wgmma));
 
             let (abs_tol, rel_tol) = gemm_tolerance(route, k);
             let s = assert_close(
@@ -2291,11 +2329,13 @@ mod gpu_e2e_tests {
             );
             eprintln!(
                 "gpu --backend wgmma linear {m}x{k}x{n} (M%128={} N%256={} K%64={}): \
-                 {} GPU call(s), max_abs={:.2e} max_rel={:.2e}",
+                 {} GPU call(s), {} wgmma / {} existing, max_abs={:.2e} max_rel={:.2e}",
                 m % 128,
                 n % 256,
                 k % 64,
                 accel.calls,
+                accel.gemm_wgmma_calls,
+                accel.gemm_existing_calls,
                 s.max_abs,
                 s.max_rel
             );
