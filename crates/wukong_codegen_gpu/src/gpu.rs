@@ -8614,7 +8614,11 @@ mod tests {
         // diagnostic. `derived_name` now carries the transport and the cache policy as well as the
         // multicast axis, so each is its own module and its own cache key — which is the whole
         // point: two rows under one key would run one kernel under both headings.
-        const EXPECTED_MODULES: usize = 114;
+        // 114 -> 115 when the 2026-08-11 round's measured v2 win (+25.2/+15.3/+10.1 points of
+        // cuBLAS) made v2 the SHIPPED default on both regime arms: `w1_v2` is the un-clustered v2
+        // row `wgmma_w1_for` now returns below the cluster threshold, and the fourth corner of
+        // the {cluster} x {v2} square the next sweep measures instead of inheriting.
+        const EXPECTED_MODULES: usize = 115;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -19985,11 +19989,32 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// round log says which it was, from `WUKONG_GPU_CLOCK_LOCK`, and warns when it is neither.
     fn wgmma_peer_round(
         bench: &'static str,
-        cfg: &'static crate::ptx_wgmma::WgmmaCfg,
+        select: fn(usize, usize) -> &'static crate::ptx_wgmma::WgmmaCfg,
         peer: PeerBar,
     ) {
         use crate::ptx_wgmma::{
             bench_iters, bringup_operands, WGMMA_BENCH_GRID, WGMMA_BENCH_INVOCATION,
+        };
+        // The round measures what the family SHIPS, per shape -- `select` is the regime rule
+        // (`wgmma_w1_for` for f16), so a rule change re-measures itself here instead of this bench
+        // quietly timing a fixed row the rule no longer returns (which is exactly what it did
+        // between the 2026-08-11 v2 default and this change: a "shipped default" table measured
+        // on the scalar store). Every DISTINCT config the grid selects gets the full pre-timing
+        // guard before anything is timed.
+        let mut cfgs: Vec<&'static crate::ptx_wgmma::WgmmaCfg> = Vec::new();
+        for p in WGMMA_BENCH_GRID {
+            let c = select(p.m, p.n);
+            if !cfgs.iter().any(|x| x.key == c.key) {
+                cfgs.push(c);
+            }
+        }
+        let arm_b_label: String = if cfgs.len() == 1 {
+            cfgs[0].name.to_string()
+        } else {
+            format!(
+                "the shipped rule, per shape ({})",
+                cfgs.iter().map(|c| c.name).collect::<Vec<_>>().join(" | ")
+            )
         };
         with_hopper(bench, WGMMA_BENCH_INVOCATION, |g, _lic| {
             // --- 0. the peer, before anything else that costs time -----------------------------
@@ -20011,7 +20036,9 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 bi::query_smi(),
             );
             eprint!("{}", prov.header());
-            eprint!("{}", wgmma_config_block(cfg));
+            for c in &cfgs {
+                eprint!("{}", wgmma_config_block(c));
+            }
             eprintln!("peer (arms A,C): {}", peer.label);
             if !matches!(prov.meta.clock_lock, bi::ClockLock::Locked(_)) {
                 eprintln!(
@@ -20063,11 +20090,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                      c*sqrt(K)*eps*sum|a*b| -- the arm that CAN see one -- run twice\nand demanded \
                      bit-identical."
                 );
-                let lanes = wgmma_pretiming_guard(g, cfg, cfg.name);
-                // The peer, through the SAME reference, at the same shape: a transpose slip in the
-                // bar would hand the contender a win (or a loss) it did not earn.
-                let gs = crate::ptx_wgmma::guard_shape(cfg);
-                let (a, b) = bringup_operands(gs.m, gs.n, gs.k, cfg.dtype);
+                // Every DISTINCT config the rule selects over this grid is guarded before any of
+                // them is timed -- a rule with two arms and one guarded arm is half a floor.
+                for c in &cfgs {
+                    let lanes = wgmma_pretiming_guard(g, c, c.name);
+                    eprintln!(
+                        "[gate] {} passed BOTH pre-timing arms on {lanes} lanes \u{2713}",
+                        c.name
+                    );
+                }
+                // The peer, through the SAME reference, once: a transpose slip in the bar would
+                // hand every shape a win (or a loss) it did not earn.
+                let gs = crate::ptx_wgmma::guard_shape(cfgs[0]);
+                let (a, b) = bringup_operands(gs.m, gs.n, gs.k, cfgs[0].dtype);
                 let want = ref_nt(&a, &b, gs.m, gs.k, gs.n);
                 let pg = (peer.once)(g, &a, &b, gs.m, gs.k, gs.n)
                     .unwrap_or_else(|e| panic!("{bench}: {} one-shot failed: {e}", peer.label));
@@ -20079,9 +20114,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     2e-2,
                 );
                 eprintln!(
-                    "[gate] {} passed BOTH pre-timing arms on {lanes} lanes; {} matches the same \
-                     f64 reference (max_abs {:.2e}) \u{2713}",
-                    cfg.name, peer.label, ps.max_abs
+                    "[gate] {} matches the same f64 reference (max_abs {:.2e}) \u{2713}",
+                    peer.label, ps.max_abs
                 );
             }
 
@@ -20099,18 +20133,21 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                  effect as unresolved.",
                 WGMMA_BENCH_GRID.len(),
                 peer.label,
-                cfg.name
+                arm_b_label
             );
             let mut rows: Vec<(&crate::ptx_wgmma::GemmPoint, bi::BenchVerdict, usize)> = Vec::new();
             for p in WGMMA_BENCH_GRID {
+                let cfg = select(p.m, p.n);
                 let iters = bench_iters(p);
                 let label = format!("{bench}@{}", p.label);
                 eprintln!(
-                    "  {:<15} {:>18}  {} launches/region, {:.1} MiB of device operands  [{}]",
+                    "  {:<15} {:>18}  {} launches/region, {:.1} MiB of device operands, arm B = \
+                     {}  [{}]",
                     p.label,
                     p.dims(),
                     iters,
                     p.device_bytes(cfg.dtype.size()) as f64 / (1024.0 * 1024.0),
+                    cfg.name,
                     p.why
                 );
                 let (samples, fail) = wgmma_shape_samples(&label, &plan, |arm| match arm {
@@ -20139,7 +20176,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
 
             eprintln!(
                 "\n---- {bench}: the published table ({} vs {}) ----",
-                cfg.name, peer.label
+                arm_b_label, peer.label
             );
             eprintln!(
                 "  {:<15} {:>18} {:>10}  headline",
@@ -21169,7 +21206,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
-    /// **Act 2, item 8 (f16): `WGMMA_W1` against cuBLAS on D1 §4.4's grid.**
+    /// **Act 2, item 8 (f16): the SHIPPED rule (`wgmma_w1_for`, per shape) against cuBLAS on D1
+    /// §4.4's grid.**
     ///
     /// D1 §4.5 predicts this row at **95–108% of cuBLAS at 4096³–8192³** — the single number the
     /// whole Act-2 business case rests on, and the one thing the bring-up round deliberately did not
@@ -21187,7 +21225,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn wgmma_vs_cublas() {
         wgmma_peer_round(
             "wgmma_vs_cublas",
-            &crate::ptx_wgmma::WGMMA_W1,
+            crate::ptx_wgmma::wgmma_w1_for,
             PeerBar {
                 label: "cuBLAS f16 (f32 out)",
                 once: crate::baselines::cublas_gemm_nt_f16_f32out,
@@ -21209,9 +21247,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore = "Act-2 perf round; Hopper + cuBLAS; run explicitly (ptx_wgmma::WGMMA_BENCH_INVOCATION)"]
     fn wgmma_bf16_vs_cublas() {
+        // bf16 has no regime rule yet -- one measured row, no measured sign change -- so its
+        // selector is a constant function rather than a borrowed pretence of one.
+        fn bf16_fixed(_m: usize, _n: usize) -> &'static crate::ptx_wgmma::WgmmaCfg {
+            &crate::ptx_wgmma::WGMMA_W1_BF16
+        }
         wgmma_peer_round(
             "wgmma_bf16_vs_cublas",
-            &crate::ptx_wgmma::WGMMA_W1_BF16,
+            bf16_fixed,
             PeerBar {
                 label: "cuBLAS bf16 (f32 out)",
                 once: crate::baselines::cublas_gemm_nt_bf16_f32out,
