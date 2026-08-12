@@ -76,12 +76,12 @@ jobs:
   # `cargo test --workspace` above NEVER builds the `gpu` feature, so every line of
   # `crates/wukong_codegen_gpu` (and the `gpu`-gated arms of `wukong_driver`/`wukongc`) was invisible
   # to CI: the whole crate could fail to compile and the `test` job would still be green. This job
-  # closes that hole. Analysis only — no GPU tests are run and no device is needed, because
-  # `cudarc` is built with `dynamic-loading` (it dlopens `nvcuda.dll`/`libcuda.so` at *run* time), so
-  # building the feature needs no CUDA toolkit on the runner. Mirrors the second half of the local
+  # closes that hole. No CUDA toolkit and no device are needed, because `cudarc` is built with
+  # `dynamic-loading` (it dlopens `nvcuda.dll`/`libcuda.so` at *run* time), so the feature builds —
+  # and its device-free laws RUN — on a plain runner. Mirrors the second half of the local
   # two-command gate documented in CLAUDE.md.
   gpu-check:
-    name: gpu type-check + clippy (no device)
+    name: gpu type-check + clippy + device-free laws (no device)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -130,3 +130,28 @@ jobs:
       # `cfg(windows)`/`cfg(unix)` code, so there is no per-OS arm for a second runner to reach.
       - name: GPU clippy
         run: cargo clippy --features gpu --all-targets
+
+      # THE LAWS ARE THE POINT OF THIS STEP, and until it existed nothing anywhere ran them.
+      # `wukong_driver`'s `gpu` feature carries the driver-side half of the GPU dispatch: which route a
+      # recognized `C = A·Bᵀ` takes per compute capability, which shapes and which operand *values* the
+      # Hopper `wgmma` seam declines before it launches, and the counter algebra that distinguishes "the
+      # wgmma family ran" from "it declined and the pre-Hopper launcher ran". Every one of those rules is
+      # a pure function of a capability and a shape, tested as such in `gpu_accel::tests` — and every one
+      # was dark: `cargo test --workspace` above does not pass `--features gpu` (the crate reports 20
+      # tests instead of 38), and the two steps above are `check`/`clippy`, which compile a test without
+      # running it. Deleting the odd-N decline, the f16 range decline or the route witness left all of CI
+      # green. The measured delta is the whole safety net, so it gets a runner.
+      #
+      # Device-free by construction, which is why it can live in this job: the `gpu_accel::tests` module
+      # never constructs a `Gpu`, and the six end-to-end gates in `gpu_e2e_tests` early-return through
+      # `wukong_codegen_gpu::diff::skip_or_fail` when `gpu::init_error()` reports no reachable device —
+      # printing `[skip]`, not passing silently. `WUKONG_GPU_REQUIRED=1` (which a rented-GPU run sets,
+      # and which this step deliberately does NOT) turns those skips into failures, so the same command
+      # is the device gate on real silicon and the law gate here.
+      #
+      # `-p wukong_driver`: `--features gpu --all-targets` over the whole workspace would additionally
+      # run `wukong_codegen_gpu`'s ~470-test suite, which the local five-part gate already runs against a
+      # real device (part 4); this step exists for the package that no gate part names. `--lib` keeps it
+      # to the unit tests, matching the release step above.
+      - name: GPU device-free laws (wukong_driver dispatch rules)
+        run: cargo test -p wukong_driver --features gpu --lib

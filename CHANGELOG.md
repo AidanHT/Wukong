@@ -52,6 +52,14 @@ everywhere else.
   `W1_CLUSTER_MIN_OUTPUT_ELEMS` — because the clustered row compiles `.reqnctapercluster` into the
   entry, and a gate whose shapes all fell on one side of a re-measured threshold would silently stop
   covering the arm with the extra launch mechanism while still passing.
+- **…and now something actually runs them.** Those device-free laws had no runner: the workspace
+  `cargo test` never passes `--features gpu` (`wukong_driver` reports 20 tests without it and 38
+  with), the device suite is scoped `-p wukong_codegen_gpu`, and CI's `gpu-check` job was
+  `cargo check`/`cargo clippy`, which compile a test without running it — so deleting the odd-`N`
+  decline, the f16 range decline or the route witness left every gate and every CI job green.
+  `cargo test -p wukong_driver --features gpu --lib` is now a step of `gpu-check` (device-free: the
+  six end-to-end gates `[skip]`, and `WUKONG_GPU_REQUIRED=1` turns a skip into a failure where a
+  device is expected) and a named part of the pre-commit gate in `CONTRIBUTING.md`.
 
 ### Documentation — every published claim is scoped to the device and the peer it was measured against
 `GPU_RETARGET_PLAN.md` §10 asks for "no published claim anywhere in the repo that silently

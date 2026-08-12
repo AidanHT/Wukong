@@ -901,3 +901,15 @@ cannot go dark; and the GPU suites need `--features gpu` plus a reachable device
 even type-check that backend, so `cargo check --features gpu --all-targets` is a required second half of
 the gate. `WUKONG_GPU_REQUIRED=1` and `WUKONG_PEER_REQUIRED=1` turn a device- or peer-absent skip into a
 failure on machines that are supposed to have them.
+
+Not all of the GPU surface needs the device, though, and the part that does not is gated separately
+because the feature flag alone was hiding it. `wukong_driver`'s `gpu` feature carries the driver-side
+dispatch rules — which route a recognized `C = A·Bᵀ` takes per compute capability, which shapes and
+which operand *values* the Hopper `wgmma` seam declines before launching, and the counters that
+distinguish a `wgmma` launch from a fallback (`crates/wukong_driver/src/gpu_accel.rs`).
+Those are pure functions of a capability and a shape, so `cargo test -p wukong_driver --features gpu
+--lib` runs them anywhere; the six end-to-end gates in the same crate `[skip]` without a device. That
+command is its own required gate step and a CI step in the `gpu-check` job, because nothing else
+reaches it: the workspace `cargo test` never passes `--features gpu` (the crate reports 20 tests
+instead of 38), the device suite is scoped `-p wukong_codegen_gpu`, and `check`/`clippy` compile a
+test without running it.

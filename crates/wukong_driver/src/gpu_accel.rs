@@ -27,6 +27,22 @@
 //! each dispatch with its decline reason. Without one, nothing anywhere distinguishes "the wgmma route
 //! ran" from "the wgmma route declined and the pre-Hopper launcher ran", and a round on rented silicon
 //! can measure one kernel while reporting the other's name.
+//!
+//! # The one command that runs the laws in this file
+//!
+//! ```text
+//! cargo test -p wukong_driver --features gpu --lib
+//! ```
+//!
+//! Nothing else reaches them, and for a while nothing did. The workspace `cargo test` never passes
+//! `--features gpu`, so this whole module is `cfg`'d out of it (the crate reports 20 tests without the
+//! feature and 38 with it); the device suite is scoped `-p wukong_codegen_gpu`; and CI's `gpu-check` job
+//! ran `cargo check`/`cargo clippy --features gpu`, which *compile* a test without running it. Deleting
+//! the odd-`N` decline, the operand-range decline or the route witness therefore left every gate part and
+//! every CI job green. That command is now a `gpu-check` step (it is device-free — the module below never
+//! constructs a [`Gpu`], and the end-to-end gates in `lib.rs` `[skip]` without a device) and a named part
+//! of the pre-commit gate in `CONTRIBUTING.md`. Under `WUKONG_GPU_REQUIRED=1` the skips become failures,
+//! so the same command is the device gate on real silicon.
 
 use wukong_codegen_gpu::ptx_wgmma::{self, WgmmaCfg, WgmmaDtype};
 use wukong_codegen_gpu::Gpu;
