@@ -10,7 +10,11 @@ The measurement doc set predated the campaign's first published Hopper suite, an
 still asserted that *every* GPU number in it was an RTX 4050 number. Every figure added here cites
 the committed round log it came from (`bench/gpu/h100/2026-08-11-h100-w2-r*.log`); no absolute
 GFLOP/s is published, because the container could not lock clocks and the logs print their absolutes
-under an explicit not-publishable banner.
+under an explicit not-publishable banner. **The whole H100 set is labelled ITERATION-grade**: those
+rounds ran in a Modal container that is refused `nvidia-smi -lgc`, which `GPU_RETARGET_PLAN.md` §6.3
+defines as *iteration* data rather than *publication* data (each log stamps itself so), and the
+before/after drift gate the rounds substitute is a weaker instrument than the lock — every H100
+percentage is provisional pending a locked-clock root-VM re-run.
 
 - `BENCHMARKS.md` gains a **GPU backend (NVIDIA H100 80GB HBM3, `sm_90a`)** section: the 7-shape
   `wgmma`-vs-cuBLAS table at f16 and bf16 (f32 out) with each row's measured peer floor; the

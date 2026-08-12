@@ -15,9 +15,16 @@ hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-ro
 > document is an RTX 4050 figure** (scope note immediately below). Do not average the two, and do not
 > carry a conclusion across: this visit measured that transfer failing outright — the 4050's int8
 > tuning, which reaches 96–105% of cuBLAS IMMA at 2048³ *there*, reads **22–52%** of IMMA on the
-> H100. The H100 rounds also ran on an instrument that could not lock clocks, so each recorded its
-> own before/after clocks and **two rounds refused themselves** on +6.82% drift; one shape refused on
-> a ±15.47% *peer* floor. Those refusals are printed in `BENCHMARKS.md` as results.
+> H100. **Every H100 figure in this document is ITERATION-grade, not publication-grade, and is
+> recorded under that label:** the rounds ran in a Modal container whose user cannot call
+> `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 rules that "Container rounds are *iteration*
+> data; VM rounds are *publication* data" — each cited log stamps itself `ITERATION data, not
+> publication data`. In place of the lock each round recorded its own before/after clocks and **two
+> rounds refused themselves** on +6.82% drift; one shape refused on a ±15.47% *peer* floor, and those
+> refusals are printed in `BENCHMARKS.md` as results. A drift gate is the weaker instrument, though —
+> it sees a clock that *changed*, not one parked at the wrong steady state for the whole round — so
+> **treat every H100 percentage below as provisional pending a locked-clock root-VM re-run**, which
+> is owed and unscheduled.
 >
 > **Device scope (2026-08-06, extended 2026-08-09):** every *other* GPU figure in this document (they
 > appear under M1, M2, M4, M7 and the improvement targets) was measured on an **NVIDIA RTX 4050 Laptop GPU**
@@ -99,7 +106,8 @@ Current standing (recorded):
   itself swings ~1.4–2× with power state, so only same-run ranges are quoted). Skinny transformer
   NT shapes **75–112% of MKL-all** (4/6 at or above parity; worst 128×768·768ᵀ 75–80%,
   overhead-bound at 151 MFLOP). int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
-- *Compute-bound, GPU (H100 80GB HBM3, `sm_90a`, 2026-08-11)*: the `wgmma` + TMA GEMM measures
+- *Compute-bound, GPU (H100 80GB HBM3, `sm_90a`, 2026-08-11 — **iteration-grade**: container round,
+  clocks unlockable, plan §6.3)*: the `wgmma` + TMA GEMM measures
   **95.3% / 88.6% / 92.3% of cuBLAS f16 (f32 out) at 2048³ / 4096³ / 8192³**, **97.3%** on the GPT
   FFN down-projection (4096×1024×4096) and **73–80%** on the wide-N up-projections; bf16 under the
   same rule agrees within ~2 points on every shape that resolved in both. **1024³ f16 is REFUSED**

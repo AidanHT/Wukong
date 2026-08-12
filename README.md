@@ -121,11 +121,16 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   > figures (Hopper, `sm_90a`, 132 SMs, 50 MiB L2, Linux container, cuBLAS with f32 output as the
   > peer) and the 4050 figures above are not — **do not average them or carry a conclusion between
   > them.** This visit measured that transfer failing: the 4050's int8 tuning, 96–105% of cuBLAS IMMA
-  > at 2048³ there, reads 22–52% of IMMA on the H100. The container could not lock clocks, so each
-  > round recorded its own before/after clocks and refused itself on drift — **two rounds did**, and
-  > those refusals are published. Per-shape tables, the mechanism, and a log citation for every
-  > number are in `BENCHMARKS.md` → *GPU backend (NVIDIA H100 80GB HBM3, `sm_90a`)*; the raw rounds
-  > are `bench/gpu/h100/2026-08-11-h100-w2-r*.log`.
+  > at 2048³ there, reads 22–52% of IMMA on the H100. **They are also iteration-grade, not
+  > publication-grade, and are published under that label:** the container could not lock clocks, and
+  > `GPU_RETARGET_PLAN.md` §6.3 says container rounds are *iteration* data while VM rounds with
+  > `nvidia-smi -lgc` pinned are *publication* data — every cited log stamps itself `ITERATION data,
+  > not publication data`. Instead of a lock each round recorded its own before/after clocks and
+  > refused itself on drift — **two rounds did**, and those refusals are published — but a drift gate
+  > catches a clock that *moved*, not one parked at the wrong steady state, so treat every percentage
+  > above as provisional pending a locked-clock VM re-run. Per-shape tables, the mechanism, and a log
+  > citation for every number are in `BENCHMARKS.md` → *GPU backend (NVIDIA H100 80GB HBM3,
+  > `sm_90a`)*; the raw rounds are `bench/gpu/h100/2026-08-11-h100-w2-r*.log`.
 
   > **Device scope (2026-08-06, extended 2026-08-09):** every *other* GPU figure in the bullet above was
   > measured on an **NVIDIA RTX 4050 Laptop GPU** (Ada, `sm_89`, **20 SMs**, 6 GB, **~192 GB/s**,
