@@ -1,0 +1,72 @@
+
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_89    .target sm_90a   wgmma_nt_f16_128x256x64_s4_mcb2_efol
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_90    .target sm_90a   wgmma_nt_f16_128x256x64_s4_mcb2_efol
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_80    .target sm_90a   wk_wgmma_desc_sweep
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_89    .target sm_90a   wk_wgmma_desc_sweep
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_90    .target sm_90a   wk_wgmma_desc_sweep
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_80    .target sm_90a   wgmma_nt_f16_128x256x64_s4_mcb2_v2_r32
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_89    .target sm_90a   wgmma_nt_f16_128x256x64_s4_mcb2_v2_r32
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_90    .target sm_90a   wgmma_nt_f16_128x256x64_s4_mcb2_v2_r32
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_80    .target sm_90a   wgmma_nt_f16_128x128x64_s6
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_89    .target sm_90a   wgmma_nt_f16_128x128x64_s6
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_90    .target sm_90a   wgmma_nt_f16_128x128x64_s6
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_80    .target sm_90a   wgmma_nt_f16_128x256x64_s4_mcb2_v2_p
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_89    .target sm_90a   wgmma_nt_f16_128x256x64_s4_mcb2_v2_p
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_90    .target sm_90a   wgmma_nt_f16_128x256x64_s4_mcb2_v2_p
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_80    .target sm_90a   wgmma_nt_f16_128x256x64_s2_mcb2
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_89    .target sm_90a   wgmma_nt_f16_128x256x64_s2_mcb2
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_90    .target sm_90a   wgmma_nt_f16_128x256x64_s2_mcb2
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_80    .target sm_90a   wgmma_nt_f16_128x128x64_s6_mcb2_v2
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_89    .target sm_90a   wgmma_nt_f16_128x128x64_s6_mcb2_v2
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_90    .target sm_90a   wgmma_nt_f16_128x128x64_s6_mcb2_v2
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_80    .target sm_90a   wgmma_nt_f16_128x256x64_s2_mc2
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_89    .target sm_90a   wgmma_nt_f16_128x256x64_s2_mc2
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+  expected   sm_90    .target sm_90a   wgmma_nt_f16_128x256x64_s2_mc2
+             the module declares the arch-specific target sm_90a; its instructions (wgmma / TMA) exist on no other target, including plain sm_90
+
+--- cross-check: raw `ptxas -v` vs the audit test's own table (62 rows) ---
+  agree on every field of the 62 row(s) both read.
+
+--- coverage ---
+  requested: sm_80, sm_89, sm_90, sm_90a
+  observed : sm_80, sm_89, sm_90, sm_90a
+    sm_80     28 kernel(s) measured,  34 declined
+    sm_89     28 kernel(s) measured,  34 declined
+    sm_90     28 kernel(s) measured,  34 declined
+    sm_90a    62 kernel(s) measured,   0 declined
+
+--- D1 section 7 item 3: does ptxas spill? ---
+  NO -- 0 of 146 (arch, entry) measurements spill. Highest pressure per arch:
+    sm_80    254 regs (8 warps/SM max) in wide_swz_256x128_s6_mc1
+    sm_89    254 regs (8 warps/SM max) in wide_swz_256x128_s6_mc1
+    sm_90    250 regs (8 warps/SM max) in wide_swz_128x256_s6_mc1
+    sm_90a   250 regs (8 warps/SM max) in wide_swz_128x256_s6_mc1
+  Scope: exactly the arches on the `observed` line, and no others.
+
+raw ptxas -v output -> /persist/rounds/ptxas-act2-w3-20260812-202401.log
+parsed census       -> /persist/rounds/ptxas-act2-w3-20260812-202401.json
+PTX archive         -> /persist/ptx-archive/20260812-202401 (48 modules; re-sweep with --sweep-from)
+[meter] ptxas: 59.9s wall = $0.008 (record this in the round log)
