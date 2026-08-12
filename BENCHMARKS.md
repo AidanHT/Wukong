@@ -376,9 +376,11 @@ states the caveat in full and a locked-clock VM re-run is owed. The `wgmma` + TM
 **95.3% / 88.6% / 92.3% of cuBLAS f16 (f32 out) at 2048³ / 4096³ / 8192³** and **97.3%** on the
 GPT FFN down-projection, weakening to **73–80%** on the wide-N up-projections; bf16 agrees within
 ~2 points everywhere the shapes overlap. **1024³ is REFUSED in f16** — the peer's own twin arms
-disagreed by ±15.47%, so the instrument published nothing there. The lever was a single change, the
-fused `st.global.v2.f32` epilogue (**+25.2 / +15.3 / +10.1 points** at those three square shapes),
-taking the six resolvable shapes from ≈61% to **≈88%** of cuBLAS; a store-elided diagnostic arm reads
+disagreed by ±15.47%, so the instrument published nothing there. The six resolvable shapes moved from
+≈61% to **≈88%** of cuBLAS in one wave, and the dominant lever was the fused `st.global.v2.f32`
+epilogue: the only single-axis reading of it is **+25.2 / +15.3 / +10.1 points** on the clustered arm
+at the three square shapes, while the suite-level move also carries the B-multicast cluster at four
+of the seven shapes — the section separates the two. A store-elided diagnostic arm reads
 **114.0 / 101.1 / 101.8%** **at those same three square shapes**, i.e. the mainloop there is already
 at or above the peer and what remains *there* is epilogue and wave overhead — the arm was never run
 on the three `gpt_*` FFN shapes, so where their gap sits (including the 73.4% worst row) is
@@ -2020,12 +2022,12 @@ capability; clocks, temperature and power before and after; the tile, stage coun
 epilogue of the kernel that actually ran), and **a refusal is a result** — when a floor or a clock
 drift exceeds the bar the round prints `--` plus the reason where the number would have been.
 
-> **⚠ Which rounds actually ran through it — four of the seven did not.** The paragraph above
+> **⚠ Which rounds actually ran through it — the four non-GEMM ones did not.** The paragraph above
 > describes the **GEMM-suite rounds only**: `r3` (config sweep), `r4` (K-sweep), `r10` (f16 suite),
-> `r11`/`r11a` (bf16 scalar / refused) and `r12` (bf16 suite). Those logs carry
+> `r11`/`r11a` (bf16 scalar / refused) and `r12` (bf16 suite). Those six logs carry
 > `# ---- wukong GPU round provenance`, a `publish gate` line, an `sm clock drift` line and A/C twin
-> columns on every row. The four remaining rounds do **not**, and no amount of section prose makes
-> them:
+> columns on every row. The four remaining rounds cited in this section do **not**, and no amount of
+> section prose makes them:
 >
 > | round | what it produced here | instrument |
 > |---|---|---|
@@ -2114,12 +2116,21 @@ suite table above.
 
 Same tile, same stage count, same cluster, same mainloop: the accumulator pair at `+0/+4` leaves as
 one 8-byte store instead of two 4-byte ones, which is the difference between issuing half-empty
-sectors and full ones. Over the six shapes the instrument could resolve, that one change is
-essentially the whole suite: bf16, whose before *and* after were both taken in this visit on the same
-seven shapes, reads **60.8% → 87.3%** (arithmetic mean of the six shapes that resolved in both;
-scalar epilogue in [`...-r11-bf16-scalar.log`](bench/gpu/h100/2026-08-11-h100-w2-r11-bf16-scalar.log),
-v2 in `...-r12-bf16-v2rule.log`), and the f16 suite lands at **87.9%** on the same six shapes
-(`...-r10-vs-cublas-v2rule.log`). Commits `fd41ebf` and `a1e3cd8`.
+sectors and full ones. **Those three deltas are the only single-axis measurement of the store**, and
+they are the clustered arm's.
+
+The suite-level move is larger and is **not** a single-axis measurement, which is worth stating
+plainly rather than rounding off. bf16 had its before *and* after taken in this visit on the same
+seven shapes and reads **60.8% → 87.3%** (arithmetic mean of the six shapes that resolved in both;
+scalar in [`...-r11-bf16-scalar.log`](bench/gpu/h100/2026-08-11-h100-w2-r11-bf16-scalar.log), v2 in
+`...-r12-bf16-v2rule.log`), and f16 lands at **87.9%** on the same six shapes
+(`...-r10-vs-cublas-v2rule.log`). But `r11`'s arm was `wgmma_nt_bf16_128x256x64_s4` — **un-clustered
+and scalar at all seven shapes** — while `r12` runs the shipped rule, which is clustered at four of
+them (`sq4096`, `sq8192`, `gpt_d1024_up`, `gpt_d4096_up`) and un-clustered at three. So the
+suite-level 60.8 → 87.3 is **the store plus the cluster** at four shapes and the store alone at
+three; only the three sweep rows above isolate the store by itself. Both the v2 store and the
+size-keyed cluster rule (`wgmma_w1_for`) landed together — `fd41ebf` for f16, `a1e3cd8` for bf16 —
+which is why no round separates them at the suite level.
 
 Three further readings from the same sweep, recorded so they are not re-run:
 

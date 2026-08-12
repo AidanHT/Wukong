@@ -18,8 +18,10 @@ percentage is provisional pending a locked-clock root-VM re-run.
 
 - `BENCHMARKS.md` gains a **GPU backend (NVIDIA H100 80GB HBM3, `sm_90a`)** section: the 7-shape
   `wgmma`-vs-cuBLAS table at f16 and bf16 (f32 out) with each row's measured peer floor; the
-  mechanism (the fused `st.global.v2.f32` epilogue, +25.2/+15.3/+10.1 points, taking the six
-  resolvable shapes from ≈61% to ≈88% of cuBLAS) and the two levers that measured **nothing**; the
+  mechanism (the fused `st.global.v2.f32` epilogue, +25.2/+15.3/+10.1 points on the *clustered* arm
+  at the three square shapes — the only single-axis reading of it — inside a suite-level ≈61% → ≈88%
+  that also carries the B-multicast cluster at four of seven shapes) and the two levers that measured
+  **nothing**; the
   store-elided diagnostic arm at 114.0/101.1/101.8% that locates the remaining gap in the epilogue
   **at the three square shapes it was run on**, the three FFN shapes having no elided arm at all;
   **copy 2922 GB/s = 87.2% of the 3352 GB/s HBM spec peak**; and the **fused int8
