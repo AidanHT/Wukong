@@ -442,9 +442,10 @@ The campaign's f16 tensor peak, **989 TFLOP/s**, is a *spec-sheet* number and is
 the device-scope block: `WAVE3_DOSSIER.md:30` records it as the denominator that "reproduces the
 plan's 57.2% / 84.8% peak-fractions exactly" -- i.e. it is what those fractions were taken against --
 and `WAVE3_DOSSIER.md:173` notes it implies a **1.8288 GHz** reference clock where this device
-reports **1980 MHz**. The only *measured* H100 f16 tensor rate this repo owns is cuBLAS's **838.7
-TFLOP/s at sq4096** (`ACT2_WAVE_PLAN.md:5`), and `838.7 / 989 = 84.8%` is exactly the peak-fraction
-WAVE3 names -- the two ends are one fact seen from both sides. They bracket the crossover:
+reports **1980 MHz**. The only *measured* H100 f16 tensor rates this repo owns are cuBLAS's, and the
+plan anchors on **838.7 TFLOP/s at sq4096** (`ACT2_WAVE_PLAN.md:5`); `838.7 / 989 = 84.8%` is exactly
+the peak-fraction WAVE3 names -- the two ends are one fact seen from both sides. They bracket the
+crossover:
 
 * **838.7 TFLOP/s is an achieved rate**, so `M* = 838.7e12 / 2.9223e12 = 287.0` is a **lower** bound
   on the crossover: a kernel better than cuBLAS pushes it up. Two stamps belong on it. First, the
@@ -822,8 +823,8 @@ upper end of the range is the only part of section 8 that is not derived:
 > publish the 8.
 
 So the norm's share of the decode step is **1.39% at bandwidth and at most ~11% at the model's
-bound** (1.39% x 8) -- a band whose upper end carries the MODEL stamp everywhere it is restated
-(12.1 lever 6, 12.4 row 6, section 13).
+bound** (1.39% x 8) -- a band whose upper end carries the MODEL stamp at both places it is restated
+(12.1 lever 6, 12.4 row 6). Section 13's row quotes only the derived 1.39%, which needs no stamp.
 
 > **The fix is three lines** -- route `DecodeLayer`'s norm through `norm_launch(g.sm_count(), rows,
 > d)` and use the entry and grid it returns. It is worth **0 to ~9 points of the decode step**
@@ -1018,8 +1019,10 @@ be exactly the silent amendment this directory forbids.
   **Green:** `bench/gpu/h100/2026-08-11-h100-w2-r10-vs-cublas-v2rule.log:100-103` -- *"random arm
   within 1.62e-5 of the f64 reference (worst lane 23937: 6.68e-6 of 2.91e-4); bit-identical over two
   runs; seed 0x57455f4152455f32"*, then `[gate] ... passed BOTH pre-timing arms on 204800 lanes`,
-  for both shipped arms; the same two lines appear in r3 (`:162-172`), r11 and r12. The generator
-  side is `ptx_wgmma.rs:2873` ("the pseudorandom arm (guard G2)").
+  for both shipped arms. The random-arm line appears for **every** row of r3's config sweep
+  (`2026-08-11-h100-w2-r3-config-sweep.log:162-172`, which prints the arm per row without the
+  `[gate]` summary), and the `[gate]` pair again in r11 (`:91-92`) and r12 (`:101-103`). The
+  generator side is `ptx_wgmma.rs:2873` ("the pseudorandom arm (guard G2)").
   **Decode analogue: it already exists and is already green.**
   `serving_decode_step_matches_reference` compares the whole layer against an f64 oracle
   (`s2d-full-suite.log:2717`) -- the reassociation-sensitive arm G2 was invented to supply. G2's
