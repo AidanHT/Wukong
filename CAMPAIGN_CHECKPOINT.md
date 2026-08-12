@@ -9,14 +9,21 @@ DOSSIER AMENDMENTS section first), then the three wave dossiers in the same dire
 Make Wukong's GPU backend heavily exceed SOTA on H100, with honest peers and a refusing
 measurement instrument. Hard rules that bind every commit:
 
-- **Gate before ANY commit, all five, unpiped, each its own step:**
+- **Gate before ANY commit, all six, unpiped, each its own step:**
   1. `cargo test` (48 suites; exit code is the verdict — NEVER pipe into grep, the pipe's exit
      status is grep's and `cargo test | grep X && git commit` commits on failure)
   2. `cargo check --features gpu --all-targets` (plain cargo test never builds the gpu feature)
   3. `RUSTFLAGS="-D warnings" cargo clippy --features gpu --all-targets`
   4. `WUKONG_GPU_REQUIRED=1 cargo test -p wukong_codegen_gpu --features gpu`  (4050 device suite;
      at this checkpoint: 468 passed / 0 failed / 95 ignored)
-  5. `cargo fmt --all -- --check`
+  5. `WUKONG_GPU_REQUIRED=1 cargo test -p wukong_driver --features gpu --lib` (the driver-side
+     dispatch laws: which route a recognized GEMM takes per capability, which shapes and operand
+     *values* the wgmma seam declines, the route witness. **Part 4 does not reach them** — it is
+     `-p wukong_codegen_gpu` — and neither does part 1, which never passes `--features gpu`: the
+     crate reports 20 tests without the feature and 47 with it. The 27 in the delta had no runner
+     at all until 2026-08-12. Device-free apart from six e2e gates that `[skip]` without a device,
+     so it is also the CI step `gpu-check` runs on a plain ubuntu runner.)
+  6. `cargo fmt --all -- --check`
 - Commits: conventional subject + prose body naming the DEFECT, the REPRODUCER, and a
   `Verified:`/`Gate:` line quoting unpiped output. **NO `Co-Authored-By` trailer, ever.**
   Never `git add -A` — stage files by name.

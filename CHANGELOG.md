@@ -51,6 +51,119 @@ percentage is provisional pending a locked-clock root-VM re-run.
 - `docs/roadmap.md` describes the Hopper GEMM family as what it is — capability-gated, and with **no
   recognizer/CLI route to it yet** — and marks the in-flight scheduling work as *unmeasured*, with no
   figure attached to it anywhere.
+### GPU — the Hopper `wgmma` GEMM family gets a product call site
+Until now the warpgroup-MMA + TMA kernel that the whole Act-2 campaign measures had **no caller
+outside its own test module**: no `.wk` program could reach it, on any device. `--backend=gpu` now
+routes a recognized `C = A·Bᵀ` through it on a Hopper part, and through the pre-Hopper launcher
+everywhere else.
+
+- The decision is a pure function of the *probed* `GpuTarget` (`gpu_accel::gemm_route_for`), and it
+  is `cc_major == 9` rather than `>= (9,0)` because `sm_90a` is architecture-**locked** — a test pins
+  the rule to `ptx_wgmma::Sm90aLicense` over the whole capability grid, so the two cannot drift.
+- Config selection goes through **one** seam function that delegates to the generator's shipped
+  regime rule; wave 3's per-shape dispatcher replaces exactly that body.
+- **Decline, never wrong.** Architecture, shape, an unencodable tensor map (`K % 8 != 0`), an output
+  past the epilogue's `u32` index, a CTA grid past CUDA's `gridDim.y` ceiling, a ring larger than the
+  device's opt-in shared memory, or an `UNSUPPORTED` from the generator all fall back to the existing
+  path with unchanged results; only a real driver failure is an error. Ragged M/N/K are not declines.
+  The launcher's `assert!` preconditions are pre-decided driver-side so an offload can never abort a
+  user's program — and the two rules that are **nobody's** precondition are decided here too: an
+  **odd `N`** (both shipped rows use the `st.global.v2.f32` epilogue, whose pair is 8-byte aligned
+  only when `N` is even, and a misaligned store leaves the CUDA context stickily errored for the rest
+  of the process) and the **grid ceiling** (`LaunchPlan::grid` puts M tiles on `gridDim.y`, which CUDA
+  caps at 65535, so an `M` above ~8.4M with an `N` small enough to keep `M*N` inside the `u32` index
+  reached the driver as `CUDA_ERROR_INVALID_VALUE`). Both were hard errors on calls that had a
+  working fallback.
+- **The contract names its non-declines.** "*Every* reason the family cannot take a call resolves to
+  the working path" was wider than the code, so it now reads *decidable before the launch* and the
+  two other outcomes are stated where a caller meets them: a driver rejection **at** the launch that
+  is not `Unsupported` — `cuModuleLoadData` refusing an `sm_90a` module on a driver that predates
+  that virtual architecture, since the `Sm90aLicense` gates on the device's capability and not the
+  driver's — stays `Some(Err(..))`, on purpose, because a GPU *failure* under `--backend=gpu` is never
+  silently answered on the CPU; and a launch that never retires ends the process with `exit(70)` from
+  `gpu::sync_with_deadline`'s hung-kernel diagnosis, a wedged context being unrecoverable.
+- **f16 is four decades narrower than f32 at BOTH ends, not only three digits shorter.** The route
+  converts both operands with `half::f16::from_f32`, which spans 6.104e-5 to 65504 against f32's
+  1.18e-38 to 3.4e38. A `.wk` GEMM over values past the top returns `inf` where the pre-Hopper f32
+  launcher returns a number; one whose operand **row** lies *wholly* beneath the bottom returns that
+  entire row (A) or column (B) of `C` as zeros (at ~1e-8 every element is under f16's round-to-zero
+  point `2^-25`; at ~1e-7 the surviving one or two bits carry 20–100% relative error). Both are
+  different *answers*, and neither is visible to any gate here: every band gate seeds `U(-1,1)`, and
+  `diff::assert_close` passes a lane on `abs <= abs_tol || rel <= rel_tol`, so under the wgmma band's
+  `abs_tol = 5e-2` a zeroed 1e-7-scale result passes at 100% relative error. So an operand outside
+  the seam dtype's range at either end is a **decline** like every other, at the cost of one
+  read-only pass over each operand — the same order as the host-side conversion that follows it. The
+  two rules are deliberately asymmetric: **overflow per element**, because one `inf` contaminates
+  every output lane its row or column touches; **underflow per ROW on that row's maximum**
+  (`0 < max|A[i][·]| < f16::MIN_POSITIVE` for any `i`), because `C[i][j] = Σ_k A[i][k]·B[j][k]` makes
+  a row the unit that feeds an output lane. The granularity is the rule: a maximum folded over the
+  whole operand is blind to a quiet row inside a loud one — A with one row of 1.0s and one of 1e-8s
+  has peak 1.0, passes such a rule, and returns half of `C` as exact zeros — while a per-*element*
+  rule really would fire by chance on an ordinary `U(-1,1)` buffer and decline nearly every real
+  GEMM, which a row of `K` uniforms cannot at `(6.1e-5)^K`. An exactly-zero row converts exactly and
+  is not declined. Residual, stated rather than hidden: in a row whose peak is normal, far smaller
+  lanes keep only f16 subnormal precision, so a result dominated by those lanes is outside what this
+  backend's GEMM band promises.
+- On Hopper the route converts both operands to f16 on the host, so the plain-GEMM offload changes
+  arithmetic class there — inside the existing CPU↔GPU *tolerance* contract, and the driver's device
+  gate sizes its band from the route that **actually ran**. That is the per-route offload counters
+  (`GpuAccel::gemm_wgmma_calls` / `gemm_existing_calls`, read by `gemm_route_taken`), not the
+  device's capability: a Hopper part is eligible for wgmma at every shape while declining a real
+  subset of them to the f32 launcher, and those results must keep the f32 band or a genuine
+  regression hides under a band ~30× looser. `WUKONG_GPU_NO_WGMMA=1` forces the pre-Hopper path in
+  the same binary, and `WUKONG_GPU_ROUTE_LOG=1` prints the route and decline reason per dispatch.
+- The fused-epilogue hook (`sgemm_nt_epi`) is deliberately unchanged: no wgmma module computes
+  `act(A·Bᵀ + bias)` yet, and splicing a second pointwise launch onto the plain GEMM would be the
+  unfused chain wave 4 exists to delete. The seam and the exact kernel-side gap are named in place.
+- **Everything up to the launch is checked on a laptop that cannot launch it.** The route, the
+  selected config, every decline and the resulting `LaunchPlan` are pure functions of the shape and
+  the probed capability, so the end-to-end Hopper gate capability-skips off Hopper while its *shape
+  list* is
+  asserted device-free: each shape must not decline under the H100 opt-in SMEM budget, its grid must
+  be a multiple of its cluster on every axis, and exactly one must cross the generator's own
+  `W1_CLUSTER_MIN_OUTPUT_ELEMS` — because the clustered row compiles `.reqnctapercluster` into the
+  entry, and a gate whose shapes all fell on one side of a re-measured threshold would silently stop
+  covering the arm with the extra launch mechanism while still passing.
+- **…and now something actually runs them.** Those device-free laws had no runner: the workspace
+  `cargo test` never passes `--features gpu` (`wukong_driver` reports 20 tests without it and 47
+  with), the device suite is scoped `-p wukong_codegen_gpu`, and CI's `gpu-check` job was
+  `cargo check`/`cargo clippy`, which compile a test without running it — so deleting the odd-`N`
+  decline, the f16 range decline or the route witness left every gate and every CI job green.
+  `cargo test -p wukong_driver --features gpu --lib` is now a step of `gpu-check` (device-free: the
+  six end-to-end gates `[skip]`, and `WUKONG_GPU_REQUIRED=1` turns a skip into a failure where a
+  device is expected) and a named part of the pre-commit gate in `CONTRIBUTING.md`.
+- **The Hopper route witness now runs somewhere a failure is visible.** The single end-to-end proof
+  that the wgmma family *executed* rather than declined was `#[ignore]`d and documented to run
+  through the Modal harness's `::bench`, which ran libtest with `check=False` and then returned
+  without a `sys.exit` — so the assertion the counters exist for could fail on rented silicon and the
+  detached app still completed successfully. It is now a plain `#[test]` (a non-Hopper device is a
+  capability `[skip]`, so it costs a device-free runner nothing) routed through `::test`, whose
+  `if rc1 or rc2: sys.exit(1)` is the point; `::bench` propagates its status too, after the clock
+  snapshot and the Volume commit, matching `::cutlass`/`::marlin`/`::framework`. The invocation is
+  pinned in `gpu_accel::HOPPER_GATE_INVOCATION` and a device-free law checks the whole chain — the
+  named test exists, is not `#[ignore]`d, still compares the per-route counters, and both Modal
+  entrypoints still exit non-zero. A pinned invocation that does not reach its test is this repo's
+  fourth instance of that class and its second on paid hardware.
+- **…and the gate can no longer skip ITSELF green, which was the third way to the same product.**
+  Selecting the test and propagating its status still leaves it free to capability-skip: off Hopper
+  it printed `[skip]`, returned, and libtest reported `ok` — so the pinned single-test H100
+  invocation landing on a non-Hopper container was a green run that asserted nothing, and `WK_GPU`
+  defaults to `L40S`, one forgotten export away. Nothing in the harness compared the probed device
+  against the requested SKU (`::test` prints `Device suite on {WK_GPU}` — the *request*). `::test`
+  now exports **`WUKONG_GPU_REQUIRE_CC`**, the capability the round declared it rented, derived from
+  `WK_GPU` through modal_app.py's own device table; the gate escalates its capability skip to a
+  failure when that names a part the wgmma route takes and the device is not one. It deliberately
+  does **not** key on `WUKONG_GPU_REQUIRED=1`, which `::test` sets on every device run — a
+  Hopper-only gate escalating on that would fail every routine `WK_GPU=L4` suite for skipping
+  correctly. Proven by running the driver suite with `WUKONG_GPU_REQUIRE_CC=sm_90` on this repo's
+  sm_89 laptop: exactly that one gate turns red, with the probed device named.
+- **Both halves of that law got specific.** It now forbids the invocation acquiring `--no-driver` —
+  `::test` gates the only cargo invocation that can reach this gate on `driver`, and its own comment
+  already records that `rc2` is then "0 by construction" — and the entrypoint half asserts the exit
+  **carries the child's status**: every `rc… = _run(..)` a Modal entrypoint collects must be named by
+  the condition guarding its `sys.exit`, where before it was satisfied by the substring `sys.exit`
+  appearing anywhere in the function. The counter check is likewise scoped to the named gate's own
+  body rather than to the whole file.
 
 ### Documentation — every published claim is scoped to the device and the peer it was measured against
 `GPU_RETARGET_PLAN.md` §10 asks for "no published claim anywhere in the repo that silently
