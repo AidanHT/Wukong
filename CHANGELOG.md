@@ -79,7 +79,7 @@ everywhere else.
   entry, and a gate whose shapes all fell on one side of a re-measured threshold would silently stop
   covering the arm with the extra launch mechanism while still passing.
 - **…and now something actually runs them.** Those device-free laws had no runner: the workspace
-  `cargo test` never passes `--features gpu` (`wukong_driver` reports 20 tests without it and 38
+  `cargo test` never passes `--features gpu` (`wukong_driver` reports 20 tests without it and 47
   with), the device suite is scoped `-p wukong_codegen_gpu`, and CI's `gpu-check` job was
   `cargo check`/`cargo clippy`, which compile a test without running it — so deleting the odd-`N`
   decline, the f16 range decline or the route witness left every gate and every CI job green.

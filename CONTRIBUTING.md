@@ -41,7 +41,7 @@ cargo test -p wukong_driver --features gpu --lib  # the driver-side dispatch rul
 Both skip rather than fail with no CUDA device, and `WUKONG_GPU_REQUIRED=1` turns those skips into
 failures on a machine that has one. The second line is not implied by the first: `-p
 wukong_codegen_gpu` does not build `wukong_driver`'s tests at all, and `wukong_driver` reports 20
-tests without the feature against 38 with it. The 18 in that delta are the driver's half of GPU
+tests without the feature against 47 with it. The 27 in that delta are the driver's half of GPU
 dispatch — which route a recognized `C = A·Bᵀ` takes per compute capability, which shapes and which
 operand *values* the Hopper `wgmma` seam declines before launching, and the counter algebra that
 tells a wgmma launch from a fallback. They are pure functions of a capability and a shape, so they

@@ -20,7 +20,7 @@ measurement instrument. Hard rules that bind every commit:
      dispatch laws: which route a recognized GEMM takes per capability, which shapes and operand
      *values* the wgmma seam declines, the route witness. **Part 4 does not reach them** — it is
      `-p wukong_codegen_gpu` — and neither does part 1, which never passes `--features gpu`: the
-     crate reports 20 tests without the feature and 38 with it. The 18 in the delta had no runner
+     crate reports 20 tests without the feature and 47 with it. The 27 in the delta had no runner
      at all until 2026-08-12. Device-free apart from six e2e gates that `[skip]` without a device,
      so it is also the CI step `gpu-check` runs on a plain ubuntu runner.)
   6. `cargo fmt --all -- --check`
