@@ -8621,7 +8621,14 @@ mod tests {
         // 115 -> 117 when the levers went to bf16 (`wgmma_w1_bf16_for`): the scalar bf16 round
         // sat at f16's pre-lever numbers, so the v2 and mcb2+v2 bf16 twins ship and the bf16
         // bench re-measures the dtype transfer every round.
-        const EXPECTED_MODULES: usize = 117;
+        // 117 -> 119 on 2026-08-12 with WAVE 3 lever 1, the grouped raster: `w1_mcb_v2_r16` (the
+        // derived optimum GROUP_M = 16 = sqrt(W*BN/BM) for a 128x256 tile on 132 SMs) and
+        // `w1_mcb_v2_r32` (the +24%-traffic bracket that makes the mechanism falsifiable). Both are
+        // one field off the shipped `w1_mcb_v2`, and both are DISTINCT modules because the raster is
+        // part of `WgmmaCfg::derived_name` -- a raster row that reused the linear key would be handed
+        // the LINEAR kernel by `Gpu::function`'s cache, which never re-examines the PTX on a hit, and
+        // the round would publish its control arm twice under two headings (guard G3).
+        const EXPECTED_MODULES: usize = 119;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
