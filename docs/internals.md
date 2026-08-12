@@ -723,23 +723,28 @@ rather than returning a wrong number. `gemm_nt_wgmma` asserts it only in its tim
 driver decides it before the call. One decline reads the **data** rather than the shape, and it cuts
 f16's range at *both* ends, because the seam converts both f32 operands with `half::f16::from_f32`
 and f16 spans only 6.104e-5 to 65504 against f32's 1.18e-38 to 3.4e38. Past the top, an operand
-enters the GEMM as an infinity and comes back `inf`/`NaN`; under the bottom, an operand whose *whole*
-magnitude range is beneath f16's smallest normal enters as subnormals or exact zeros and comes back
-as a matrix of zeros (at ~1e-8 every element is under f16's round-to-zero point `2^-25`, and at ~1e-7
-the one or two surviving bits carry 20–100% relative error) — where the f32 launcher returns the
-finite number the CPU oracle returns. Both are different *answers*, not wider error bars, and no
-tolerance band covers either; worse, `diff::assert_close` passes a lane on
-`abs <= abs_tol || rel <= rel_tol`, so under the wgmma band's `abs_tol = 5e-2` a zeroed small-scale
-output passes at 100% relative error. So both decline, at the cost of one read-only pass over each
-operand (the same order as the host-side conversion the launcher performs immediately afterwards).
-The two rules are deliberately **not symmetric**: overflow is per element, because one `inf`
-contaminates every output lane its row or column touches; underflow is per operand on the maximum
-(`0 < max|A| < f16::MIN_POSITIVE`), because one flushed element costs only its own magnitude — and
-because a per-element underflow rule would fire by chance on an ordinary `U(-1,1)` buffer and decline
-nearly every real GEMM. An exactly-zero operand converts exactly and is not declined. The residual,
-stated rather than hidden: inside an operand whose peak *is* normal, far smaller lanes keep only f16
-subnormal precision, so a result dominated by those lanes is the shape this backend's GEMM band does
-not promise to cover. The route
+enters the GEMM as an infinity and comes back `inf`/`NaN`; under the bottom, a **row** whose *whole*
+magnitude range is beneath f16's smallest normal enters as subnormals or exact zeros and returns that
+entire row (A) or column (B) of `C` as flushed lanes (at ~1e-8 every element is under f16's
+round-to-zero point `2^-25`, and at ~1e-7 the one or two surviving bits carry 20–100% relative error)
+— where the f32 launcher returns the finite number the CPU oracle returns. Both are different
+*answers*, not wider error bars, and no tolerance band covers either; worse, `diff::assert_close`
+passes a lane on `abs <= abs_tol || rel <= rel_tol`, so under the wgmma band's `abs_tol = 5e-2` a
+zeroed small-scale output passes at 100% relative error. So both decline, at the cost of one
+read-only pass over each operand (the same order as the host-side conversion the launcher performs
+immediately afterwards). The two rules are deliberately **not symmetric**: overflow is per element,
+because one `inf` contaminates every output lane its row or column touches; underflow is per **row**
+on that row's maximum (`0 < max|A[i][·]| < f16::MIN_POSITIVE` for any `i`), because
+`C[i][j] = Σ_k A[i][k]·B[j][k]` makes a row the unit that feeds an output lane — a flushed element
+costs only its own contribution to sums its own row's larger elements also feed, while a wholly
+flushed row costs the whole lane. The granularity is load-bearing: a single peak folded over the
+whole operand cannot see a quiet row inside a loud one (A with one row of 1.0s and one of 1e-8s has
+peak 1.0 and returns half of `C` as zeros), while a per-*element* rule would fire by chance on an
+ordinary `U(-1,1)` buffer and decline nearly every real GEMM — a row of one cannot, at
+`(6.1e-5)^K ≈ 1e-34` for `K = 8`. An exactly-zero row converts exactly and is not declined. The
+residual, stated rather than hidden: inside a row whose peak *is* normal, far smaller lanes keep only
+f16 subnormal precision, so a result dominated by those lanes is the shape this backend's GEMM band
+does not promise to cover. The route
 changes arithmetic class (the wgmma family converts both
 operands to f16 on the host and accumulates in f32), which is inside the CPU↔GPU tolerance contract
 but is not invisible — the driver's device gate sizes its band from the route that **actually ran**.
