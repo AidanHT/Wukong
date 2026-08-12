@@ -747,7 +747,15 @@ every dispatch.
 Everything on that path *up to* the launch — the route, the config the seam selects, every decline,
 and the `LaunchPlan` the config yields — is a pure function of the shape and the probed capability,
 so only the launch itself needs Hopper. The end-to-end gate
-(`gpu_backend_linear_routes_through_wgmma_on_hopper`) is therefore `#[ignore]`d, and its shape list
+(`gpu_backend_linear_routes_through_wgmma_on_hopper`) is a plain `#[test]` behind a capability skip
+rather than an `#[ignore]`, because it is the only proof anywhere that the family actually *executed*
+and so has to run under an entrypoint that can fail: `#[ignore]`d tests are reachable only from the
+Modal harness's `::bench`, which appends `--ignored`, and `::bench` used to discard libtest's exit
+status entirely — a failed witness assertion completed as a green `modal run`. The invocation is
+pinned in `gpu_accel::HOPPER_GATE_INVOCATION` (a `::test --filter` line, under that entrypoint's
+`sys.exit`), and a device-free law checks that it selects a test which exists, is not `#[ignore]`d,
+and still compares the route counters — plus that both Modal entrypoints can still exit non-zero.
+Its shape list
 lives in `gpu_accel::HOPPER_GATE_SHAPES` where a device-free law asserts what those shapes are chosen
 for: none declines under the H100 opt-in SMEM budget, each grid is a multiple of its cluster on every
 axis, and exactly one crosses `ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS` — read from the generator

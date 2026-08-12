@@ -313,8 +313,8 @@ fn wgmma_cfg_for(dtype: WgmmaDtype, m: usize, n: usize) -> &'static WgmmaCfg {
 /// **The shapes the Hopper end-to-end gate runs, shared so it and the device-free law below cannot
 /// drift.**
 ///
-/// `gpu_backend_linear_routes_through_wgmma_on_hopper` (driver `lib.rs`) can only run on rented
-/// silicon, and a claim in its doc comment — "this one crosses the cluster threshold, so it is the
+/// `gpu_backend_linear_routes_through_wgmma_on_hopper` (driver `lib.rs`) can only reach the launch
+/// on rented silicon — everywhere else it capability-`[skip]`s — and a claim in its doc comment — "this one crosses the cluster threshold, so it is the
 /// only shape that exercises the clustered launch" — is exactly the kind of statement that rots
 /// silently when the threshold moves. [`tests::the_hopper_gate_shapes_reach_both_regime_arms`] checks
 /// that claim **here**, on this laptop, against
@@ -329,6 +329,35 @@ pub(crate) const HOPPER_GATE_SHAPES: [(usize, usize, usize); 3] = [
     // M*N = 8_388_608, just past the cluster threshold: the only one that returns the CLUSTERED row.
     (4096, 256, 2048),
 ];
+
+/// **The one invocation that runs the Hopper end-to-end gate, pinned where a law can check it.**
+///
+/// `gpu_backend_linear_routes_through_wgmma_on_hopper` (driver `lib.rs`) is the only proof anywhere
+/// that the wgmma family *executed* rather than declined, and its witness assertion —
+/// `(gemm_wgmma_calls, gemm_existing_calls) == (calls, 0)` — is worth the rented minutes only if a
+/// failure can turn the run red. Two independent things had to be true for that, and neither was
+/// checked anywhere:
+///
+/// - **the entrypoint must propagate the failure.** `::bench` ended in
+///   `_run(args, env, check=False)` and then returned, with no `sys.exit` anywhere in the function,
+///   so it exited 0 whatever libtest did — a failed witness produced a green `modal run`. `::test`
+///   ends `if rc1 or rc2: sys.exit(1)`, which is where a correctness gate belongs. (`bench()` now
+///   propagates too, matching every other measurement entrypoint in that file, but a gate whose
+///   product is a verdict rather than a table does not belong on the sweep runner.)
+/// - **the entrypoint must SELECT the test.** `::bench` appends `--ignored`, which runs ONLY
+///   `#[ignore]`d tests; `::test` never reaches one. Routing a name through the wrong one selects
+///   zero tests, prints `0 passed` and exits 0 — the 2026-08-11 vacuous bring-up run, $0.006 of
+///   H100, for which `ptx_wgmma`'s own visit constant grew the same law.
+///
+/// So the gate is a plain `#[test]` behind a capability skip and this is a `::test --filter` line.
+/// `--release` because `::test` then requires the release test binaries `::build --release` stages,
+/// which is what the campaign already builds; `--detach` because a local DNS flake has killed a
+/// healthy round before. [`tests::the_hopper_gate_invocation_reaches_a_gate_that_can_fail`] checks
+/// all of it textually, on a laptop, against both files.
+#[cfg(test)]
+pub(crate) const HOPPER_GATE_INVOCATION: &str = "WK_GPU=H100 modal run --detach \
+     tools/cloud/modal_app.py::test \
+     --filter gpu_backend_linear_routes_through_wgmma_on_hopper --release";
 
 /// The 16-bit input type the **f32** seam feeds `wgmma`.
 ///
@@ -942,6 +971,111 @@ mod tests {
              un-clustered arm untested",
             ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS
         );
+    }
+
+    /// The `#[..]` attribute lines immediately above `fn {name}(` in `src`, innermost last.
+    ///
+    /// A backward walk over whole lines rather than a fixed-width window, because the window form
+    /// (`ptx_wgmma`'s, 220 bytes) reads the tail of the doc comment too: a gate whose prose explains
+    /// *why it is no longer* `#[ignore]`d would fail its own law.
+    fn attributes_above(src: &str, name: &str) -> Vec<String> {
+        let at = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("`fn {name}(` is not in the scanned source"));
+        let mut attrs: Vec<String> = Vec::new();
+        for line in src[..at].lines().rev() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t.starts_with("#[") {
+                attrs.push(t.to_string());
+            } else {
+                break;
+            }
+        }
+        attrs.reverse();
+        attrs
+    }
+
+    /// **The Hopper gate is only a gate if the invocation reaches it AND the entrypoint can fail.**
+    ///
+    /// Both halves have burned rented time in this repo already. The *selector* half is the
+    /// 2026-08-11 vacuous bring-up (`::bench` appends `--ignored` and the gate was a plain `#[test]`,
+    /// so zero tests ran and the run exited 0 for $0.006); `ptx_wgmma`'s visit constant grew a law
+    /// against it, and this is that law for the driver's own gate. The *exit-status* half is
+    /// narrower and worse: `modal_app.py`'s `bench()` ran its child `check=False` and then returned
+    /// without a `sys.exit`, so even a selected, executed, **failing** assertion produced a green
+    /// `modal run --detach`. The witness assertion this gate exists for could therefore fail on H100
+    /// and be reported as a completed round.
+    ///
+    /// Textual and device-free, over the two files that carry the fact:
+    /// [`HOPPER_GATE_INVOCATION`] names a test that exists in `lib.rs`, is not `#[ignore]`d, and is
+    /// routed through the entrypoint whose selector reaches a plain `#[test]` — and that entrypoint,
+    /// in `modal_app.py`, still ends in a `sys.exit`.
+    #[test]
+    fn the_hopper_gate_invocation_reaches_a_gate_that_can_fail() {
+        let inv = HOPPER_GATE_INVOCATION;
+        assert!(
+            inv.is_ascii() && inv.lines().count() == 1,
+            "the invocation is meant to be pasted into a shell: {inv}"
+        );
+        assert!(
+            inv.contains("modal_app.py::test"),
+            "a correctness gate belongs on ::test, the entrypoint that exits non-zero: {inv}"
+        );
+        assert!(
+            !inv.contains("::bench") && !inv.contains("--name "),
+            "`--name` is ::bench's selector and ::bench appends --ignored, which would select ZERO \
+             tests here and exit 0: {inv}"
+        );
+
+        // The selector, and the test it must reach.
+        let name = inv
+            .split("--filter ")
+            .nth(1)
+            .expect("::test selects with --filter")
+            .split_whitespace()
+            .next()
+            .expect("--filter carries no test name, only flags");
+        let lib = include_str!("lib.rs");
+        assert!(
+            lib.contains(&format!("fn {name}(")),
+            "the invocation names `{name}`, which is not a test in the driver's lib.rs"
+        );
+        let attrs = attributes_above(lib, name);
+        assert!(
+            attrs.iter().any(|a| a.starts_with("#[test]")),
+            "`{name}` is named by an invocation but is not a #[test]: {attrs:?}"
+        );
+        assert!(
+            !attrs.iter().any(|a| a.contains("ignore")),
+            "`{name}` is #[ignore]d, so `::test` — which never passes --ignored — would select zero \
+             tests and exit 0 having proven nothing: {attrs:?}"
+        );
+        // ...and it is the gate we think it is: the witness assertion, not just any test.
+        assert!(
+            lib.contains("(accel.gemm_wgmma_calls, accel.gemm_existing_calls),"),
+            "`{name}` no longer compares the per-route counters, so the invocation is pinned to a \
+             gate that cannot tell a wgmma launch from a fallback"
+        );
+
+        // The entrypoint half: a Modal function that runs a gate must be able to fail. `bench` is
+        // included because it is where this gate used to be routed and where every sweep still is.
+        let modal = include_str!("../../../tools/cloud/modal_app.py");
+        for entry in ["def test(", "def bench("] {
+            let at = modal
+                .find(entry)
+                .unwrap_or_else(|| panic!("`{entry}` is not in modal_app.py"));
+            let body = &modal[at..];
+            let end = body.find("\n@app.function").unwrap_or(body.len());
+            assert!(
+                body[..end].contains("sys.exit"),
+                "`{entry}` runs cargo test with check=False and never exits non-zero, so a FAILED \
+                 assertion inside it completes as a green `modal run` — the defect this law exists \
+                 for"
+            );
+        }
     }
 
     /// **A tripwire for wave 4's G21, aimed at the one caller that cannot see it fire.**
