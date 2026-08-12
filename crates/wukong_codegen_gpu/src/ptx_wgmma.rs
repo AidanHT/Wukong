@@ -2825,12 +2825,17 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
         label: "w1_mcb_v2_r16",
         cfg: &WGMMA_W1_MCB_V2_R16,
         why: "WAVE 3 LEVER 1 (grouped raster, GROUP_M = 16 = the derived optimum sqrt(W*BN/BM) for \
-              a 128x256 tile on 132 SMs). ONE fact off the shipped w1_mcb_v2. gpt_d4096_up is the \
-              row: under the linear order matching the peer needs 3.541 TB/s against a 3.35 TB/s \
-              HBM peak, which is arithmetically impossible whatever the mainloop does; the raster \
-              takes its DRAM 2.384 -> 0.797 GB. sq4096 and gpt_d1024_up already fit L2 linearly \
-              and are predicted FLAT; sq2048 is one wave, where the raster is PROVABLY the \
-              identity, so a difference there is the instrument and voids the visit",
+              a 128x256 tile on 132 SMs). ONE fact off the shipped w1_mcb_v2, WHICH IS THIS ARM'S \
+              CONTROL: `raster: 1` emits the same two tile-origin instructions the family has \
+              emitted since round 1, byte for byte (the law is \
+              the_linear_order_emits_the_same_two_instructions_it_always_did), so the linear order \
+              needs no second row of its own -- one would share w1_mcb_v2's module key and publish \
+              one kernel under two headings. gpt_d4096_up is THE row: under the linear order \
+              matching the peer needs 3.541 TB/s against a 3.35 TB/s HBM peak, which is \
+              arithmetically impossible whatever the mainloop does; the raster takes its DRAM \
+              2.384 -> 0.797 GB. sq4096 and gpt_d1024_up already fit L2 linearly and are predicted \
+              FLAT; sq2048 is one wave, where the raster is PROVABLY the identity, so a difference \
+              there is the instrument and voids the visit",
     },
     SweepRow {
         label: "w1_mcb_v2_r32",
@@ -2927,12 +2932,28 @@ pub fn wgmma_sweep_measurable() -> Vec<&'static SweepRow> {
 /// objects, with the same [`bench_iters`], that `wgmma_vs_cublas` swept on 2026-08-10, so a row's
 /// number here and that round's number are comparable without an argument about denominators.
 ///
-/// Three, not seven. The sweep's cost is `rows x shapes`, and these three carry the whole question:
-/// `sq4096` and `sq8192` are the two points D1 section 4.5 predicts W1 at 95-108% on (and the two
-/// round 1 measured at 67.5% and 58.8%), and `sq2048` is the tile-quantization point D1 puts W3c at.
-/// The full seven-shape grid remains `wgmma_vs_cublas`'s job -- once this round says which
-/// configuration to run, that bench runs it everywhere.
-pub const WGMMA_SWEEP_SHAPES: &[&str] = &["sq2048", "sq4096", "sq8192"];
+/// Three, not seven, through wave 2: the sweep's cost is `rows x shapes`, and `sq4096` / `sq8192`
+/// are the two points D1 section 4.5 predicts W1 at 95-108% on (and the two round 1 measured at
+/// 67.5% and 58.8%), while `sq2048` is the tile-quantization point D1 puts W3c at. The full
+/// seven-shape grid remains `wgmma_vs_cublas`'s job -- once this round says which configuration to
+/// run, that bench runs it everywhere.
+///
+/// **Wave 3 adds two, and neither is decoration.** The schedule levers are *provably the identity*
+/// on a single-wave grid, and `sq2048` is exactly that -- so the three-shape set could not have
+/// measured either of wave 3's top two mechanisms:
+///
+/// * `gpt_d4096_up` is the RASTER's row and the only shape in the suite the linear order blocks
+///   *arithmetically*: matching the peer's 0.6734 ms needs `2.3844 GB / 0.6734 ms = 3.541 TB/s`
+///   against a 3.35 TB/s HBM peak, so no mainloop change can reach it. The raster takes its DRAM to
+///   0.797 GB (2.99x) and the target to 1.184 TB/s.
+/// * `gpt_d1024_up` is PERSISTENCE's row: `n_k = 16` k-stages against `X = 13.84 us` of per-tile
+///   fixed cost makes `X` 56% of its tile -- more than three times its share at sq8192 -- and it
+///   carries neither a raster nor a cluster confound (footprint 10.6 MB, `f_L2` 0.542).
+///
+/// `sq2048` stays as the single-wave CONTROL: every schedule arm must tie there, and a movement is
+/// the instrument rather than the kernel (WAVE3_DOSSIER 1.6, 2.9).
+pub const WGMMA_SWEEP_SHAPES: &[&str] =
+    &["sq2048", "sq4096", "sq8192", "gpt_d1024_up", "gpt_d4096_up"];
 
 /// The headline shape of the ranked table: the first of D1 4.5's two prediction points.
 pub const WGMMA_SWEEP_HEADLINE: &str = "sq4096";
@@ -6899,8 +6920,7 @@ mod tests {
                     assert_eq!((gx, gy, gz), r.dims());
                     assert_eq!(gy as usize % cy, 0, "{}: grid y splits a cluster", c.name);
                     assert!(
-                        r.padded_m_tiles() as usize * p.bm >= m
-                            && r.n_tiles as usize * p.bn >= n,
+                        r.padded_m_tiles() as usize * p.bm >= m && r.n_tiles as usize * p.bn >= n,
                         "{}: raster grid does not cover {m}x{n}",
                         c.name
                     );
@@ -7055,11 +7075,15 @@ mod tests {
                 for n_tiles in [1u32, 5, 8] {
                     let g = RasterGrid::new(group_m, 2, m_tiles, n_tiles);
                     let (gx, gy, gz) = g.dims();
-                    assert!(gy.is_multiple_of(2), "grid.y must be a multiple of cluster.y");
+                    assert!(
+                        gy.is_multiple_of(2),
+                        "grid.y must be a multiple of cluster.y"
+                    );
                     for z in 0..gz {
                         for x in 0..gx {
                             for pair in 0..gy / 2 {
-                                let (r0, r1) = (g.tile_of(x, 2 * pair, z), g.tile_of(x, 2 * pair + 1, z));
+                                let (r0, r1) =
+                                    (g.tile_of(x, 2 * pair, z), g.tile_of(x, 2 * pair + 1, z));
                                 match (r0, r1) {
                                     (None, None) => {}
                                     (Some((m0, n0)), Some((m1, n1))) => {
@@ -7092,11 +7116,20 @@ mod tests {
             .into_iter()
             .min_by(|a, b| f(*a).total_cmp(&f(*b)))
             .unwrap();
-        assert_eq!(best, 16.0, "the raster optimum moved; re-derive the shipped GROUP_M");
-        assert!(f(32.0) > f(16.0) && f(8.0) > f(16.0), "16 must be a strict minimum");
+        assert_eq!(
+            best, 16.0,
+            "the raster optimum moved; re-derive the shipped GROUP_M"
+        );
+        assert!(
+            f(32.0) > f(16.0) && f(8.0) > f(16.0),
+            "16 must be a strict minimum"
+        );
         // The bracket is +24%, which is what makes r32 a partial gain rather than a tie.
         let ratio = f(32.0) / f(16.0);
-        assert!((1.20..1.28).contains(&ratio), "bracket ratio {ratio} left its derived band");
+        assert!(
+            (1.20..1.28).contains(&ratio),
+            "bracket ratio {ratio} left its derived band"
+        );
         // And GROUP_M = 2 is 4.12x the optimum -- worse than every shape's linear order.
         assert!(f(2.0) / f(16.0) > 4.0);
     }
@@ -7129,10 +7162,17 @@ mod tests {
             assert!(ptx.is_ascii(), "{} emitted non-ASCII PTX", cfg.name);
             let gc = cfg.raster as usize / 2;
             assert!(ptx.contains(&format!("mad.lo.s32 %tmp,%tmp,{gc},%tmp2;")));
-            assert!(ptx.contains("add.u32 %tmp,%tmp,%crank;"), "the intra-cluster rank is not re-added");
+            assert!(
+                ptx.contains("add.u32 %tmp,%tmp,%crank;"),
+                "the intra-cluster rank is not re-added"
+            );
             assert!(ptx.contains("@%p0 ret;"), "no cluster-uniform early exit");
             for banned in ["div.", "rem.", "rcp."] {
-                assert!(!ptx.contains(banned), "{} emitted a {banned} in the prologue", cfg.name);
+                assert!(
+                    !ptx.contains(banned),
+                    "{} emitted a {banned} in the prologue",
+                    cfg.name
+                );
             }
             let exit = ptx.find("@%p0 ret;").unwrap();
             let init = ptx.find("mbarrier.init").unwrap();
@@ -7157,7 +7197,11 @@ mod tests {
         // gpt_d4096_up: M=4096 (32 m-tiles, 16 m-clusters), N=16384 (64 n-tiles). GROUP_M=16 -> GC=8.
         let p = WGMMA_W1_MCB_V2_R16.launch_plan();
         assert_eq!(p.grid(4096, 16384), (8, 128, 2));
-        assert_eq!((8 * 128 * 2) as usize, 2048, "the CTA count must not change");
+        assert_eq!(
+            (8 * 128 * 2) as usize,
+            2048,
+            "the CTA count must not change"
+        );
         // The linear twin covers the same 2048 tiles as a flat 64x32 grid.
         assert_eq!(WGMMA_W1_MCB_V2.launch_plan().grid(4096, 16384), (64, 32, 1));
         // A ragged last group: 17 m-clusters over groups of 8 is 3 groups, the last one short.
@@ -7178,19 +7222,92 @@ mod tests {
             raster: 16,
             ..WGMMA_W1_MC
         };
-        assert!(on_a.validate().unwrap_err().contains("already owns that axis"));
+        assert!(on_a
+            .validate()
+            .unwrap_err()
+            .contains("already owns that axis"));
         // And G3: a raster row that keeps the linear row's name is refused, because the module
         // cache would hand it the LINEAR kernel and the round would publish the control twice.
         let misnamed = WgmmaCfg {
             raster: 16,
             ..WGMMA_W1_MCB_V2
         };
+        assert!(misnamed
+            .validate()
+            .unwrap_err()
+            .contains("wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16"));
+    }
+
+    /// **THE RASTER'S GUARD-SHAPE LAW: the device gate must actually EXECUTE the ragged group.**
+    ///
+    /// The bijection twin (G5) proves the map over every residue in Rust, but the thing that runs on
+    /// silicon is the six-instruction prologue and its `@%p0 ret;`. The one arm of that prologue that
+    /// is a *hang* if it is wrong -- the cluster-uniform early exit -- is only reached when the last
+    /// group is short, and **all seven benched shapes have `m_clusters` a multiple of 8**, so the
+    /// performance round can never reach it. This law therefore states the property over
+    /// [`guard_shape`], which is what `wgmma_pretiming_guard` and `wgmma_hopper_bringup` launch:
+    ///
+    /// * at least one CTA takes the exit (so the branch is executed, not merely emitted), and
+    /// * at least one CTA owns a tile (so the exit did not swallow the whole launch and return a
+    ///   `C` full of whatever the host pre-filled -- which against a zeroed buffer is a plausible
+    ///   matrix of zeros and against a reused one is the previous arm's answer), and
+    /// * the exit is taken by WHOLE clusters, never by one rank of a live pair, which is the
+    ///   difference between a skipped CTA and a peer waiting forever on a multicast.
+    #[test]
+    fn the_guard_shape_executes_the_rasters_ragged_group_exit() {
+        let rows: Vec<&WgmmaCfg> = wgmma_all_emittable()
+            .into_iter()
+            .filter(|c| c.raster > 1)
+            .collect();
         assert!(
-            misnamed
-                .validate()
-                .unwrap_err()
-                .contains("wgmma_nt_f16_128x256x64_s4_mcb2_v2_r16")
+            !rows.is_empty(),
+            "wave 3 ships a raster; a table with none means the rows were dropped, not that the \
+             law is vacuous"
         );
+        for c in rows {
+            let g = guard_shape(c);
+            let r = c.raster_grid(g.m, g.n);
+            let (gx, gy, gz) = c.launch_plan().grid(g.m, g.n);
+            let cm = c.cluster_ctas().max(1) as u32;
+            let (mut owners, mut exits) = (0u32, 0u32);
+            for z in 0..gz {
+                for y in 0..gy {
+                    for x in 0..gx {
+                        match r.tile_of(x, y, z) {
+                            Some(_) => owners += 1,
+                            None => exits += 1,
+                        }
+                    }
+                }
+            }
+            assert!(
+                exits > 0,
+                "{}: the guard shape has {} m-clusters over groups of {} -- no cluster-row is \
+                 surplus, so the early exit is never executed and its hang would ship undetected",
+                c.name,
+                r.m_clusters(),
+                r.gc
+            );
+            assert!(
+                owners > 0,
+                "{}: the guard launch owns no tile at all",
+                c.name
+            );
+            assert!(
+                exits.is_multiple_of(cm) && owners.is_multiple_of(cm),
+                "{}: {owners} owners / {exits} exits do not split into whole {cm}-CTA clusters, so \
+                 some cluster takes the exit on ONE rank and hangs on the other",
+                c.name
+            );
+            // ...and the exit is a majority of the launch at the guard, which is what makes it a
+            // real test of the branch rather than a corner the scheduler might reorder away.
+            assert!(
+                exits >= owners,
+                "{}: only {exits} of {} guard CTAs exit; the ragged group is barely exercised",
+                c.name,
+                owners + exits
+            );
+        }
     }
 
     /// The unproven-claims list is the honest half of this module and must not quietly empty out or
