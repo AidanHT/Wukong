@@ -2204,13 +2204,16 @@ mod gpu_e2e_tests {
     /// really is [`gpu_accel::GemmRoute::Wgmma`], that the offload fired at all, and only then that
     /// the numbers match the CPU oracle.
     ///
-    /// Three shapes, one per property. `256x1024x512` is a whole 128×256 tile grid. `130x1032x258` is
-    /// ragged in M, N **and** K at once, which is what proves the driver seam did not quietly need an
-    /// alignment gate (the `m%64/n%64/k%16` rule in `sgemm_nt_epi` is a *wmma* constraint — wgmma
-    /// predicates its own edge). `4096x256x2048` has `M*N = 8_388_608` output elements, just past
+    /// Three shapes, one per property, and they live in [`gpu_accel::HOPPER_GATE_SHAPES`] because
+    /// `gpu_accel::tests::the_hopper_gate_shapes_reach_both_regime_arms` checks *on this laptop* what
+    /// they are chosen for. `256x1024x512` is a whole 128×256 tile grid. `130x1032x258` is ragged in
+    /// M, N **and** K at once, which is what proves the driver seam did not quietly need an alignment
+    /// gate (the `m%64/n%64/k%16` rule in `sgemm_nt_epi` is a *wmma* constraint — wgmma predicates its
+    /// own edge). `4096x256x2048` has `M*N = 8_388_608` output elements, just past
     /// `ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS`, so it is the only one that makes the config seam
     /// return the **clustered** row and the launch carry a `1x2x1` cluster attribute — the arm a
-    /// small-shape-only gate would leave entirely unexercised from the driver side.
+    /// small-shape-only gate would leave entirely unexercised from the driver side, and a *launch*
+    /// failure rather than a wrong number if it were ever mismatched.
     ///
     /// Every `N` here is EVEN on purpose, and it is not a raggedness choice: both shipped rows carry
     /// the `st.global.v2.f32` epilogue, whose 8-byte pair is aligned only when `N` is, so an odd `N`
@@ -2244,11 +2247,7 @@ mod gpu_e2e_tests {
             return;
         }
         let mut rng = Rng::new(0x090A_C0DE);
-        for &(m, k, n) in &[
-            (256usize, 1024usize, 512usize),
-            (130, 1032, 258),
-            (4096, 256, 2048),
-        ] {
+        for &(m, k, n) in &gpu_accel::HOPPER_GATE_SHAPES {
             let (program, mut interner) = build(&linear_src(m, k, n));
             let entry = interner.intern("lin");
             let a = rng.vec(m * k, -1.0, 1.0);
