@@ -5,6 +5,38 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Documentation — the 2026-08-11 H100 results are folded into the measurement docs
+The measurement doc set predated the campaign's first published Hopper suite, and `BENCHMARKS.md`
+still asserted that *every* GPU number in it was an RTX 4050 number. Every figure added here cites
+the committed round log it came from (`bench/gpu/h100/2026-08-11-h100-w2-r*.log`); no absolute
+GFLOP/s is published, because the container could not lock clocks and the logs print their absolutes
+under an explicit not-publishable banner.
+
+- `BENCHMARKS.md` gains a **GPU backend (NVIDIA H100 80GB HBM3, `sm_90a`)** section: the 7-shape
+  `wgmma`-vs-cuBLAS table at f16 and bf16 (f32 out) with each row's measured peer floor; the
+  mechanism (the fused `st.global.v2.f32` epilogue, +25.2/+15.3/+10.1 points, taking the six
+  resolvable shapes from ≈61% to ≈88% of cuBLAS) and the two levers that measured **nothing**; the
+  store-elided diagnostic arm at 114.0/101.1/101.8% that locates the whole remaining gap in the
+  epilogue; **copy 2922 GB/s = 87.2% of the 3352 GB/s HBM spec peak**; and the **fused int8
+  GEMM+dequant at 1.08×/1.15× the cuBLAS chain at 1024³/2048³** — the first outright peer win on
+  Hopper — beside its **0.79× loss at 4096³**.
+- **The refusals are published as results**, which is the point of the instrument: `sq1024` in f16
+  produced no number at all because the *peer's* own twin arms disagreed by ±15.47% against a ±5%
+  bar, and two whole rounds closed their own publish gate on +6.82% SM-clock drift (one was re-run;
+  the other, the K-sweep, means the epilogue's cost in microseconds is **not** published anywhere).
+- **The two devices are fenced from each other** in the same style the 2026-08-06/09 sweep
+  established: a standing-index row that forbids averaging them, an amended GPU banner, a second
+  machine in *Test machine & toolchains*, and matching scope in `README.md`, `docs/metrics.md` and
+  `docs/roadmap.md`. The fence is not decorative — this visit measured the transfer failing, with
+  the 4050's int8 tuning falling from 96–105% of cuBLAS IMMA to **22–52%** on the H100.
+- Two peer-bar facts that *delete* future claims are recorded rather than buried: cuBLASLt on H100
+  fuses RELU/GELU/BIAS at **both** f32 and f16 output (so "we fuse what cuBLAS cannot" is refuted for
+  those, leaving **SiLU** absent from its enum), and the visit's int4 round ran on an **H200**, so it
+  is excluded from the H100 section by name.
+- `docs/roadmap.md` describes the Hopper GEMM family as what it is — capability-gated, and with **no
+  recognizer/CLI route to it yet** — and marks the in-flight scheduling work as *unmeasured*, with no
+  figure attached to it anywhere.
+
 ### Documentation — every published claim is scoped to the device and the peer it was measured against
 `GPU_RETARGET_PLAN.md` §10 asks for "no published claim anywhere in the repo that silently
 generalizes a 4050 number to other hardware". This closes that for the doc set, and adds the CPU
