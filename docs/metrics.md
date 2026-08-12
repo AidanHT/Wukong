@@ -112,9 +112,11 @@ Current standing (recorded):
   FFN down-projection (4096×1024×4096) and **73–80%** on the wide-N up-projections; bf16 under the
   same rule agrees within ~2 points on every shape that resolved in both. **1024³ f16 is REFUSED**
   — the peer's own twin arms disagreed by ±15.47%, over the ±5% bar, so no number was minted (bf16
-  resolved there and reads 49.5%, a 32-CTA problem on 132 SMs). The lever was one change, the fused
-  `st.global.v2.f32` epilogue (**+25.2 / +15.3 / +10.1 points** at the three square shapes), moving
-  the six resolvable shapes from ≈61% to **≈88%** of cuBLAS; a store-elided *diagnostic* arm (writes
+  resolved there and reads 49.5%, a 32-CTA problem on 132 SMs). The dominant lever was the fused
+  `st.global.v2.f32` epilogue (**+25.2 / +15.3 / +10.1 points** at the three square shapes — the only
+  single-axis reading of it, and on the *clustered* arm), moving
+  the six resolvable shapes from ≈61% to **≈88%** of cuBLAS; that suite-level move also carries the
+  B-multicast cluster at four of the seven shapes, so it is not a single-axis number. A store-elided *diagnostic* arm (writes
   no C, ungateable, read only as a difference against the **clustered** arm it was cut from) sits at
   **114.0 / 101.1 / 101.8%** **at the three square shapes it was run on — and nowhere else**, so the
   mainloop is at or above the peer *there* and what is still owed *there* is epilogue plus wave
@@ -317,8 +319,9 @@ Remaining, ranked:
    exists at exactly three shapes — sq2048 / sq4096 / sq8192, at 114.0 / 101.1 / 101.8% of cuBLAS —
    and it is the *clustered* `..._s4_mcb2_v2` arm, so it reads as a difference against that arm's own
    87.4 / 88.7 / 92.0%. At sq4096 and sq8192 the clustered arm is what ships and the conclusion
-   carries: the mainloop is at or above the peer, and the ~11 points still owed there are epilogue
-   plus wave overhead, not the inner loop. **The two FFN endpoints of the "3–27 points" range —
+   carries: the mainloop is at or above the peer, so the **11.4 and 7.7 points** still owed on those
+   two published rows are epilogue plus wave overhead, not the inner loop. **The two FFN endpoints of
+   the old "3–27 points" range —
    gpt_d1024_down at 97.3% and gpt_d4096_up at 73.4% — had no nostore arm run on them at all**
    (`r3-config-sweep.log` sweeps only the three square shapes; the gpt rows exist only in
    `r10-vs-cublas-v2rule.log`, a round with no elided arm), so where *their* gap sits is unmeasured
