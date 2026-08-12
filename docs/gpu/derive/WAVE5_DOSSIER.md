@@ -599,8 +599,9 @@ trigger does not fire.** The caveat is section 5: the baseline round *measures* 
 `ptx_int4.rs` family on Hopper to get a Hopper denominator. That is a baseline, not a headline, and
 it stays inside the refusal as long as no int4 **ratio against a peer** is published from it.
 
-`::marlin` also picks the right kernel by device (`modal_app.py:3948-3957`): Machete on `sm_90`,
-Marlin on Ampere, with a loud warning in each wrong direction. When the int4 trigger does fire, use
+`::marlin` also picks the right kernel by device (`modal_app.py:4009`, guards at `:4012-4017`,
+entrypoint at `:3964`): Machete on `sm_90`, Marlin on Ampere, with a loud warning in each wrong
+direction. When the int4 trigger does fire, use
 that dispatcher rather than naming a kernel by hand.
 
 ---
@@ -915,7 +916,7 @@ tile-loop entry count, exactly as G19 specifies.
 | fp8 mixed-type `mma.sync` precedent and the `.version 8.4` split | `crates/wukong_codegen_gpu/src/ptx_fp8_train.rs:5-25, 190, 317-323` |
 | PTX ISA shape menu, extracted verbatim by the campaign | `docs/gpu/derive/D1_h100_gemm.md:154-173` |
 | H800 tensor-core instruction throughput table (Luo et al.) | `docs/gpu/derive/D1_h100_gemm.md:114-134` |
-| CUTLASS kernel filters, census guard, profiler dtype table, meter rates | `tools/cloud/modal_app.py:373-379, 819-1053, 2736-2768, 3830-3900, 3948-3957` |
+| CUTLASS kernel filters, census guard, profiler dtype table, meter rates | `tools/cloud/modal_app.py:373-379, 819-1053, 2736-2768, 3830-3900, 3964, 4009-4017` |
 | Wave-5 levers, targets, refusals, standing rules | `docs/gpu/derive/ACT2_WAVE_PLAN.md:67-77, 102, 114, 122-128` |
 
 ### External (FACT(ext)) -- used only where the tree is silent
