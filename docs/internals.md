@@ -720,16 +720,26 @@ is**, and it is the one decline the launcher does not make for itself: both ship
 `st.global.v2.f32` epilogue, whose 8-byte pair is aligned only when `N` is even, and a misaligned
 store is a *sticky* `CUDA_ERROR_MISALIGNED_ADDRESS` that fails every later call in the process
 rather than returning a wrong number. `gemm_nt_wgmma` asserts it only in its timing sibling, so the
-driver decides it before the call. One decline reads the **data** rather than the shape: the seam
-converts both f32 operands with `half::f16::from_f32`, and f16's largest finite value is 65504, so an
-operand past that would enter the GEMM as an infinity and come back as `inf`/`NaN` where the f32
-launcher returns a number. That is a different *answer*, not a wider error bar, and no tolerance band
-covers one — so it declines too, at the cost of one read-only pass over both operands (the same order
-as the host-side conversion the launcher performs immediately afterwards). The *underflow* end of the
-same conversion is stated rather than declined: an operand below f16's smallest normal (6.1e-5) keeps
-only subnormal precision and one below ~6e-8 becomes zero, which is the arithmetic class every f16
-tensor-core path in this backend has carried since Act 1 — a few elements of any `U(-1,1)` buffer are
-below that, so a rule strict enough to catch it would decline nearly every real GEMM. The route
+driver decides it before the call. One decline reads the **data** rather than the shape, and it cuts
+f16's range at *both* ends, because the seam converts both f32 operands with `half::f16::from_f32`
+and f16 spans only 6.104e-5 to 65504 against f32's 1.18e-38 to 3.4e38. Past the top, an operand
+enters the GEMM as an infinity and comes back `inf`/`NaN`; under the bottom, an operand whose *whole*
+magnitude range is beneath f16's smallest normal enters as subnormals or exact zeros and comes back
+as a matrix of zeros (at ~1e-8 every element is under f16's round-to-zero point `2^-25`, and at ~1e-7
+the one or two surviving bits carry 20–100% relative error) — where the f32 launcher returns the
+finite number the CPU oracle returns. Both are different *answers*, not wider error bars, and no
+tolerance band covers either; worse, `diff::assert_close` passes a lane on
+`abs <= abs_tol || rel <= rel_tol`, so under the wgmma band's `abs_tol = 5e-2` a zeroed small-scale
+output passes at 100% relative error. So both decline, at the cost of one read-only pass over each
+operand (the same order as the host-side conversion the launcher performs immediately afterwards).
+The two rules are deliberately **not symmetric**: overflow is per element, because one `inf`
+contaminates every output lane its row or column touches; underflow is per operand on the maximum
+(`0 < max|A| < f16::MIN_POSITIVE`), because one flushed element costs only its own magnitude — and
+because a per-element underflow rule would fire by chance on an ordinary `U(-1,1)` buffer and decline
+nearly every real GEMM. An exactly-zero operand converts exactly and is not declined. The residual,
+stated rather than hidden: inside an operand whose peak *is* normal, far smaller lanes keep only f16
+subnormal precision, so a result dominated by those lanes is the shape this backend's GEMM band does
+not promise to cover. The route
 changes arithmetic class (the wgmma family converts both
 operands to f16 on the host and accumulates in f32), which is inside the CPU↔GPU tolerance contract
 but is not invisible — the driver's device gate sizes its band from the route that **actually ran**.

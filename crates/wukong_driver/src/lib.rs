@@ -2505,6 +2505,106 @@ mod gpu_e2e_tests {
         }
     }
 
+    /// **An operand wholly under f16's range must not turn a finite GEMM into a matrix of zeros.**
+    ///
+    /// The underflow twin of the test above, and the harder of the two to gate, because its failure
+    /// is *quiet*: an operand scaled to ~1e-8 is under f16's round-to-zero point (`2^-25` = 2.98e-8),
+    /// so every element enters the wgmma seam as an exact zero and `C` comes back identically zero
+    /// where `gpu::gemm_nt` returns what the CPU oracle returns. Unlike the overflow case there is
+    /// no `inf` to spot — and the tolerance band cannot spot it either, in *both* of the ways a band
+    /// can fail to: the true result is ~1e-13, comfortably under `gemm_tolerance(Wgmma, ..)`'s
+    /// `abs_tol = 5e-2`, and `diff::assert_close` passes a lane on `abs <= abs_tol || rel <=
+    /// rel_tol`. **So the value assertions in this test cannot fail on the defect; only the ROUTE
+    /// assertion can.** That is the point of writing it as a paired control rather than as a
+    /// tolerance check: same shape, same `b`, one scale factor apart, so on a Hopper part the route
+    /// must differ *because of the magnitudes* and nothing else.
+    ///
+    /// Runs on any device — on a pre-Hopper part both arms are `Existing` and it still asserts the
+    /// user-visible property, that the GPU does not return zeros where the oracle is non-zero.
+    #[test]
+    fn gpu_backend_declines_operands_wholly_under_the_f16_normal_range() {
+        const NAME: &str = "gpu_backend_declines_operands_wholly_under_the_f16_normal_range";
+        let mut guard = wukong_codegen_gpu::gpu();
+        let g = match guard.as_mut() {
+            Some(g) => g,
+            None => {
+                skip_no_device(NAME);
+                return;
+            }
+        };
+        let cc = g.target().cc();
+        let mut rng = Rng::new(0x5AB_0BAD);
+        let (m, k, n) = (64usize, 64usize, 64usize);
+        let (program, mut interner) = build(&linear_src(m, k, n));
+        let entry = interner.intern("lin");
+        // Both operands strictly positive so no lane of the true result can cancel to zero on its
+        // own — a zero in `got` is then the seam flushing, never the arithmetic.
+        let b = rng.vec(n * k, 0.5, 1.0);
+        let base = rng.vec(m * k, 0.5, 1.0);
+
+        for (label, scale, hopper_route) in [
+            ("control", 1.0f32, gpu_accel::GemmRoute::Wgmma),
+            // Under 2^-25: every element of A converts to an exact f16 zero.
+            ("underflow", 1e-8f32, gpu_accel::GemmRoute::Existing),
+        ] {
+            let want = if cc.0 == 9 {
+                hopper_route
+            } else {
+                gpu_accel::GemmRoute::Existing
+            };
+            let a: Vec<f32> = base.iter().map(|x| x * scale).collect();
+
+            let (mut ac, mut bc, mut cpu) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ac, &mut bc, &mut cpu];
+                wukong_interp::run_kernel_f32(&program, entry, &mut bufs, &interner).unwrap();
+            }
+            assert!(
+                cpu.iter().all(|v| v.is_finite() && *v > 0.0),
+                "{label}: the CPU oracle must be finite and strictly positive everywhere, or a \
+                 zeroed GPU result would not be evidence of anything"
+            );
+
+            let (mut ag, mut bg, mut got) = (a.clone(), b.clone(), vec![0f32; m * n]);
+            let mut accel = gpu_accel::GpuAccel::new(&mut *g);
+            {
+                let mut bufs: [&mut [f32]; 3] = [&mut ag, &mut bg, &mut got];
+                wukong_interp::run_kernel_f32_accel(
+                    &program, entry, &mut bufs, &interner, &mut accel,
+                )
+                .unwrap();
+            }
+            let taken = accel
+                .gemm_route_taken()
+                .expect("the GEMM must have offloaded, or this tests CPU-vs-CPU");
+            assert_eq!(
+                taken, want,
+                "{label} (cc {cc:?}, A scaled by {scale:e}): on Hopper the route must be decided by \
+                 the operand's MAGNITUDE — the shape is identical in both runs and declines in \
+                 neither. This is the only assertion in this test that the defect can fail: the \
+                 band cannot see a 1e-13 result zeroed."
+            );
+            assert!(
+                got.iter().all(|v| *v > 0.0),
+                "{label}: the GPU returned a zero lane where the f32 oracle is strictly positive — \
+                 the underflow decline did not fire and the f16 seam flushed the whole operand"
+            );
+            let (abs_tol, rel_tol) = gemm_tolerance(taken, k);
+            let s = assert_close(
+                &format!("underflow {label} {m}x{k}x{n}"),
+                &got,
+                &cpu,
+                abs_tol,
+                rel_tol,
+            );
+            eprintln!(
+                "gpu --backend underflow {label} {m}x{k}x{n} scale={scale:e} [{taken:?}]: \
+                 {} wgmma / {} existing, max_abs={:.2e} max_rel={:.2e}",
+                accel.gemm_wgmma_calls, accel.gemm_existing_calls, s.max_abs, s.max_rel
+            );
+        }
+    }
+
     /// **`act(matmul(x,w))` from Wukong source runs the fused tensor-core kernel** (Phase-2 fusion
     /// engine). The recognizer folds the matmul + activation loop into `wukong_sgemm_nt_epi`; the GPU
     /// `Accelerator` routes that to the single fused WMMA kernel (`gemm_nt_f16_sm_db_{relu,silu,gelu}`,
