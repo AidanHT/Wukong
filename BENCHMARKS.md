@@ -2218,21 +2218,40 @@ Three further readings from the same sweep, recorded so they are not re-run:
 
 ### Where the remaining gap is (a diagnostic, not a kernel)
 
-The same sweep carries a `_nostore` arm: **the clustered `..._s4_mcb2_v2` arm with its C stores
-removed** — not "the shipped kernel", because at `sq2048` the shipped kernel is the un-clustered arm
-and no store-elided twin of *that* was ever built or run. It writes no output, therefore **cannot be
-correctness-gated and is not a kernel**; its percentage is meaningless alone and, per the rule the
-log itself prints, is only ever read as a difference **against the clustered arm at the same shape**.
-It scores **114.0% / 101.1% / 101.8%** of cuBLAS at sq2048 / sq4096 / sq8192
-(`...-r3-config-sweep.log`), against that arm's own **87.4% / 88.7% / 92.0%**.
+The same sweep carries a `_nostore` arm — `wgmma_nt_f16_128x256x64_s4_mcb2_nostore`, which is
+**the clustered *scalar* `..._s4_mcb2` arm with its C stores removed**, not the `_v2` one. That is
+what both artifacts say: the generator defines it as
+`WGMMA_W1_MCB_NOSTORE = { epilogue: ElidedDiagnostic, ..WGMMA_W1_MCB }`
+(`crates/wukong_codegen_gpu/src/ptx_wgmma.rs`, whose own doc comment reads
+"`(this row) - (w1_s4_mcb2)` at a fixed shape is the epilogue's whole cost"), and the log repeats it
+three times — the row's `why` line, the correctness block, and a footnote under the table:
+`^ NOT A KERNEL. … must only ever be read as a DIFFERENCE against wgmma_nt_f16_128x256x64_s4_mcb2 at
+the same shape`. It writes no output, therefore **cannot be correctness-gated and is not a kernel**;
+its percentage is meaningless alone. It scores **114.0% / 101.1% / 101.8%** of cuBLAS at sq2048 /
+sq4096 / sq8192 (`...-r3-config-sweep.log`).
 
-Read that way it says the mainloop by itself is at or above the peer at all three swept shapes, and
-that the store-and-wave tail costs the clustered arm **26.6 / 12.4 / 9.8 points** there. At `sq4096`
-and `sq8192` the clustered arm *is* the shipped one, so that carries straight to the published 88.6%
-/ 92.3% and locates the whole remaining gap in the epilogue plus wave overhead rather than the inner
-loop. **At `sq2048` it does not carry**: both the diagnostic and its reference are the clustered arm,
-while the published 95.3% is the un-clustered one, so the 114.0% reading explains the 87.4% clustered
-row and says nothing directly about the 4.7 points still owed by the arm that ships at that shape.
+**Two pairings are available, and they answer different questions.** The elided kernel is physically
+the same object either way, because `WGMMA_W1_MCB_V2` differs from `WGMMA_W1_MCB` in the `epilogue`
+field and nothing else — same tile, same stage count, same cluster, same mainloop — so the arm is a
+legitimate store-elided twin of both:
+
+| paired against | reads | what the difference is |
+|---|---|---|
+| `..._s4_mcb2` (scalar) — **the log's and the generator's own rule** | 62.2 / 73.4 / 81.9% | **51.8 / 27.7 / 19.9 points** = the *scalar* epilogue's whole cost, which is what the arm was built to price |
+| `..._s4_mcb2_v2` (fused v2) — **this document's pairing, not the log's** | 87.4 / 88.7 / 92.0% | **26.6 / 12.4 / 9.8 points** = what the *shipped* epilogue still costs after the v2 store took its 25.2 / 15.3 / 10.1 |
+
+The second row is the one that matters for the published table, and it is stated here as this
+document's own decomposition rather than as a quotation: **no committed artifact prints the v2
+pairing.** The two rows are consistent — 51.8 − 26.6 = 25.2, 27.7 − 12.4 = 15.3, 19.9 − 9.8 = 10.1,
+exactly the store's measured deltas — which is the arithmetic check that the substitution is sound.
+
+Either way it says the mainloop by itself is at or above the peer at all three swept shapes. At
+`sq4096` and `sq8192` the clustered arm *is* the shipped one, so the v2 pairing carries straight to
+the published 88.6% / 92.3% and locates the whole remaining gap in the epilogue plus wave overhead
+rather than the inner loop. **At `sq2048` it does not carry**: both the diagnostic and both candidate
+references are the clustered arm, while the published 95.3% is the un-clustered one, so the 114.0%
+reading explains the 87.4% clustered row and says nothing directly about the 4.7 points still owed by
+the arm that ships at that shape.
 The round that would have priced the epilogue in microseconds — a K-sweep at fixed M=N=2048 against
 the same elided arm, which measures the split on *one* kernel instead of inferring it from two shapes
 — **refused itself on clock drift**, so no microsecond price is published here, and no store-elided
