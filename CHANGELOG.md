@@ -27,22 +27,25 @@ everywhere else.
 - **f16 is four decades narrower than f32 at BOTH ends, not only three digits shorter.** The route
   converts both operands with `half::f16::from_f32`, which spans 6.104e-5 to 65504 against f32's
   1.18e-38 to 3.4e38. A `.wk` GEMM over values past the top returns `inf` where the pre-Hopper f32
-  launcher returns a number; one whose operand lies *wholly* beneath the bottom returns a matrix of
-  zeros (at ~1e-8 every element is under f16's round-to-zero point `2^-25`; at ~1e-7 the surviving
-  one or two bits carry 20–100% relative error). Both are different *answers*, and neither is
-  visible to any gate here: every band gate seeds `U(-1,1)`, and `diff::assert_close` passes a lane
-  on `abs <= abs_tol || rel <= rel_tol`, so under the wgmma band's `abs_tol = 5e-2` a zeroed
-  1e-7-scale result passes at 100% relative error. So an operand outside the seam dtype's range at
-  either end is a **decline** like every other, at the cost of one read-only pass over each operand
-  — the same order as the host-side conversion that follows it. The two rules are deliberately
-  asymmetric: **overflow per element**, because one `inf` contaminates every output lane its row or
-  column touches; **underflow per operand on the maximum** (`0 < max|A| < f16::MIN_POSITIVE`),
-  because one flushed element costs only its own magnitude and because a per-element rule really
-  would fire by chance on an ordinary `U(-1,1)` buffer and decline nearly every real GEMM — the
-  reason first given for leaving this end open, which rules out only that form of the rule. An
-  exactly-zero operand converts exactly and is not declined. Residual, stated rather than hidden: in
-  an operand whose peak is normal, far smaller lanes keep only f16 subnormal precision, so a result
-  dominated by those lanes is outside what this backend's GEMM band promises.
+  launcher returns a number; one whose operand **row** lies *wholly* beneath the bottom returns that
+  entire row (A) or column (B) of `C` as zeros (at ~1e-8 every element is under f16's round-to-zero
+  point `2^-25`; at ~1e-7 the surviving one or two bits carry 20–100% relative error). Both are
+  different *answers*, and neither is visible to any gate here: every band gate seeds `U(-1,1)`, and
+  `diff::assert_close` passes a lane on `abs <= abs_tol || rel <= rel_tol`, so under the wgmma band's
+  `abs_tol = 5e-2` a zeroed 1e-7-scale result passes at 100% relative error. So an operand outside
+  the seam dtype's range at either end is a **decline** like every other, at the cost of one
+  read-only pass over each operand — the same order as the host-side conversion that follows it. The
+  two rules are deliberately asymmetric: **overflow per element**, because one `inf` contaminates
+  every output lane its row or column touches; **underflow per ROW on that row's maximum**
+  (`0 < max|A[i][·]| < f16::MIN_POSITIVE` for any `i`), because `C[i][j] = Σ_k A[i][k]·B[j][k]` makes
+  a row the unit that feeds an output lane. The granularity is the rule: a maximum folded over the
+  whole operand is blind to a quiet row inside a loud one — A with one row of 1.0s and one of 1e-8s
+  has peak 1.0, passes such a rule, and returns half of `C` as exact zeros — while a per-*element*
+  rule really would fire by chance on an ordinary `U(-1,1)` buffer and decline nearly every real
+  GEMM, which a row of `K` uniforms cannot at `(6.1e-5)^K`. An exactly-zero row converts exactly and
+  is not declined. Residual, stated rather than hidden: in a row whose peak is normal, far smaller
+  lanes keep only f16 subnormal precision, so a result dominated by those lanes is outside what this
+  backend's GEMM band promises.
 - On Hopper the route converts both operands to f16 on the host, so the plain-GEMM offload changes
   arithmetic class there — inside the existing CPU↔GPU *tolerance* contract, and the driver's device
   gate sizes its band from the route that **actually ran**. That is the per-route offload counters

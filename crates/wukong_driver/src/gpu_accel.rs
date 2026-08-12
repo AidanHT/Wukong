@@ -130,13 +130,14 @@ impl<'g> GpuAccel<'g> {
     /// The conversion is **not only** a rounding, and the part that is not is handled rather than
     /// tolerated. f16 has about four decades less dynamic range than f32 at *each* end, and both
     /// ends change the **answer** rather than widening the error bar: an operand past 65504 enters
-    /// the GEMM as an infinity and leaves as `inf`/`NaN`, and an operand whose whole magnitude range
-    /// is under f16's smallest normal (6.104e-5) enters as subnormals or exact zeros and leaves as
-    /// zeros — where the f32 arm returns the finite, non-zero matrix the CPU oracle returns.
-    /// [`wgmma_declines_operand_range`] cuts both, so what the tolerance band has to cover really is
-    /// the rounding, with the one residual edge stated at [`WGMMA_F32_SEAM_DTYPE`]: inside an
-    /// operand whose *peak* is normal, individual lanes far below that peak still flush, and their
-    /// error is bounded by their own magnitude.
+    /// the GEMM as an infinity and leaves as `inf`/`NaN`, and a **row** whose whole magnitude range
+    /// is under f16's smallest normal (6.104e-5) enters as subnormals or exact zeros and leaves an
+    /// entire row (A) or column (B) of `C` as zeros — where the f32 arm returns the finite, non-zero
+    /// matrix the CPU oracle returns. [`wgmma_declines_operand_range`] cuts both, so what the
+    /// tolerance band has to cover really is the rounding, with the one residual edge stated at
+    /// [`WGMMA_F32_SEAM_DTYPE`]: inside a *row* whose peak is normal, individual lanes far below
+    /// that peak still flush, and their error is bounded by their own magnitude against a sum that
+    /// holds something larger.
     fn try_gemm_nt_wgmma(
         &mut self,
         a: &[f32],
@@ -170,8 +171,11 @@ impl<'g> GpuAccel<'g> {
         }
         // The only decline that reads the DATA rather than the shape, and the only one that is about
         // the arithmetic class rather than the launch: f16 carries four decades less dynamic range
-        // than f32 at the top end, so an operand past 65504 would enter this GEMM as an infinity.
-        if let Some(why) = wgmma_declines_operand_range(cfg.dtype, a, b) {
+        // than f32 at *each* end, so an element past 65504 would enter this GEMM as an infinity and
+        // a ROW wholly under 6.104e-5 would enter it as zeros. `k` is the row length of both
+        // operands (A is `m x k` row-major, B is `n x k`), which the length check immediately above
+        // is what makes exact.
+        if let Some(why) = wgmma_declines_operand_range(cfg.dtype, a, b, k) {
             route_log(format_args!("{m}x{k}x{n}: Existing (declined: {why})"));
             return None;
         }
@@ -385,23 +389,34 @@ pub(crate) const HOPPER_GATE_INVOCATION: &str = "WK_GPU=H100 modal run --detach 
 /// - **Overflow is per element.** One `inf` contaminates without bound (`inf + finite = inf`,
 ///   `inf * 0 = NaN`), so a single element past 65504 poisons every output lane its row or column
 ///   touches. Any element over the ceiling declines.
-/// - **Underflow is per operand, on the maximum.** One flushed element removes only its own
-///   contribution, which is by construction no larger than what the operand's bigger elements
-///   contribute — and a per-element rule would be useless anyway: a `U(-1,1)` buffer of a few
-///   million elements very probably holds one below f16's round-to-zero point (`2^-25` = 2.98e-8)
-///   by pure chance, so it would decline nearly every real GEMM. What is *not* tolerable is an
-///   operand whose whole magnitude range is under f16's smallest normal: every element is then a
-///   subnormal or a zero, the result is dominated by flushed lanes, and by ~1e-8 it comes back all
-///   zeros where `gpu::gemm_nt` returns the finite matrix the CPU oracle returns. So the rule is
-///   `0 < max|A| < f16::MIN_POSITIVE` (and the same for `B`): it never fires on a buffer whose peak
-///   is O(1), it costs the single pass the overflow scan already makes, and an exactly-zero operand
-///   — which converts *exactly* and needs no fallback — is not declined.
+/// - **Underflow is per ROW, on that row's maximum**, because a row is the granularity at which a
+///   flush changes an output lane. `C[i][j] = Σ_k A[i][k]·B[j][k]`, so row `i` of A feeds row `i` of
+///   `C` and *nothing else*, and row `j` of B feeds column `j`. A flushed element therefore removes
+///   only its own contribution to sums that its **own row's** larger elements also feed — which is
+///   the bounded, tolerable case — while a row that is *wholly* under f16's smallest normal enters
+///   the GEMM as subnormals or zeros and returns that entire row (A) or column (B) of `C` as flushed
+///   lanes: by ~1e-8 exactly zero, where `gpu::gemm_nt` returns the finite matrix the CPU oracle
+///   returns. So the rule is `0 < max|A[i][·]| < f16::MIN_POSITIVE` for any row `i` (and the same
+///   for `B`), and the granularity is load-bearing rather than fussy: a single scalar peak over the
+///   whole operand **cannot see a quiet row inside a loud one** — A with one row of 1.0s and one row
+///   of 1e-8s has peak 1.0, passes a per-operand rule, and returns half of `C` as zeros.
 ///
-/// The residual edge, stated rather than hidden: inside an operand whose peak *is* normal, lanes far
+///   It is per row rather than per element for the reason a per-element rule is useless: a `U(-1,1)`
+///   buffer of a few million elements very probably holds one below f16's round-to-zero point
+///   (`2^-25` = 2.98e-8) by pure chance, so that rule would decline nearly every real GEMM. The row
+///   rule cannot fire on such data either — `P(max of K uniforms < 6.1e-5) = (6.1e-5)^K`, about
+///   1e-34 at `K = 8` — costs the same single pass the overflow scan already makes (the `max` fold
+///   simply restarts at each row boundary), and exempts an exactly-zero row, which converts
+///   *exactly* and needs no fallback. What it does newly decline is a genuinely tiny row inside a
+///   normal matrix, and that is the conservative direction: the cost is one fallback, the cost of
+///   the other direction is a row of zeros returned as a result.
+///
+/// The residual edge, stated rather than hidden: inside a *row* whose peak is normal, lanes far
 /// below that peak keep only f16's subnormal precision, so a result **dominated** by those lanes is
 /// the shape this backend's GEMM band does not promise to cover. That much is the arithmetic class
 /// the whole f16 tensor-core path has carried since Act 1 — the fused `gemm_nt_f16_sm_db*` epilogue
-/// converts its operands exactly the same way — and it is bounded, unlike a whole-operand flush.
+/// converts its operands exactly the same way — and it is bounded by lanes the same sum also holds,
+/// unlike a whole-row flush.
 ///
 /// bf16 becomes reachable when the lowp `wukong_sgemm_{bf16,f16}_nt_epi` symbols get an
 /// `Accelerator` hook at all (WAVE4_DOSSIER §5.4 gap 3); [`wgmma_cfg_for`] already routes it, and it
@@ -450,10 +465,10 @@ fn seam_dtype_min_positive_normal(dtype: WgmmaDtype) -> f32 {
 ///
 /// - past the ceiling, the element becomes `inf` and propagates through the accumulation as
 ///   `inf`/`NaN`;
-/// - beneath the floor, it becomes a subnormal or an exact zero, and an operand that is *wholly*
-///   beneath it comes back as a matrix of zeros — at ~1e-8 every element is under f16's
-///   round-to-zero point, so `C` is identically 0 where the oracle is finite and non-zero, and at
-///   ~1e-7 the surviving one or two bits carry 20-100% relative error.
+/// - beneath the floor, it becomes a subnormal or an exact zero, and a **row** that is *wholly*
+///   beneath it comes back as a row (A) or column (B) of zeros — at ~1e-8 every element of that row
+///   is under f16's round-to-zero point, so those lanes of `C` are identically 0 where the oracle is
+///   finite and non-zero, and at ~1e-7 the surviving one or two bits carry 20-100% relative error.
 ///
 /// No tolerance band covers either, and no gate here would catch either: every band gate in this
 /// repo seeds `rng.vec(.., -1.0, 1.0)`, and `diff::assert_close` passes a lane on
@@ -463,62 +478,85 @@ fn seam_dtype_min_positive_normal(dtype: WgmmaDtype) -> f32 {
 /// — the pre-Hopper path, results unchanged.
 ///
 /// The two rules are **not** symmetric, and [`WGMMA_F32_SEAM_DTYPE`] says why: overflow is per
-/// element because one `inf` contaminates without bound, underflow is per operand (on the maximum)
-/// because one flushed element removes only its own contribution — and because a per-element
-/// underflow rule would fire by chance on ordinary `U(-1,1)` buffers and decline nearly every real
-/// GEMM.
+/// element because one `inf` contaminates without bound; underflow is per **row**, on that row's
+/// maximum, because `C[i][j] = Σ_k A[i][k]·B[j][k]` makes a row the unit that feeds an output lane —
+/// a flushed element costs only its own contribution to sums its own row's larger elements also feed,
+/// while a wholly-flushed row costs the whole lane. A per-*operand* maximum cannot express that: it
+/// is blind to a quiet row inside a loud operand, which is a deterministically zeroed row of `C`
+/// rather than a bounded error. A per-*element* rule would fire by chance on ordinary `U(-1,1)`
+/// buffers and decline nearly every real GEMM.
 ///
 /// **Cost, stated rather than hidden.** One read-only pass over each operand — an overflow exits it
 /// early, nothing else can — so it is `O(m·k + n·k)`, the same order as the launcher's very next
 /// act, which maps every one of those elements to `u16`, allocates the result and copies it to the
-/// device. The underflow rule adds a `max` fold to a scan that was already full-length in the
-/// common (no-decline) case, not a second pass. A constant factor on an already-linear host stage,
+/// device. Row granularity does not change that: the underflow rule is still a `max` fold over a
+/// scan that was already full-length in the common (no-decline) case, with the fold restarting at
+/// each row boundary rather than a second pass. A constant factor on an already-linear host stage,
 /// not a new order of work, and it disappears the day the seam takes operands that are already 16
 /// bit (the lowp `nt_epi` hook, WAVE4_DOSSIER §5.4 gap 3).
 ///
 /// **The bf16 arm effectively never declines at either end**, which is the range half of
 /// [`WGMMA_F32_SEAM_DTYPE`]'s trade made operational: bf16 has f32's exponent field, so only the
 /// last mantissa band below `f32::MAX` and magnitudes under 1.18e-38 fail it.
-fn wgmma_declines_operand_range(dtype: WgmmaDtype, a: &[f32], b: &[f32]) -> Option<String> {
-    // A per operand, then B, so the message names the one that actually failed and an operand is
-    // judged against its OWN peak — the underflow rule is a statement about one matrix, not about
-    // the pair.
-    operand_range_declines(dtype, "A", a).or_else(|| operand_range_declines(dtype, "B", b))
+///
+/// `k` is the shared row length: `a` is `m x k` row-major and `b` is `n x k`, which is what the NT
+/// form means. [`GpuAccel::try_gemm_nt_wgmma`] checks `a.len() == m*k` and `b.len() == n*k` before
+/// calling, so the chunking below is exact rather than approximate.
+fn wgmma_declines_operand_range(
+    dtype: WgmmaDtype,
+    a: &[f32],
+    b: &[f32],
+    k: usize,
+) -> Option<String> {
+    // A per operand, then B, so the message names the one that actually failed and each ROW is
+    // judged against its OWN peak — the underflow rule is a statement about one row of one matrix,
+    // not about the pair and not about the matrix.
+    operand_range_declines(dtype, "A", a, k).or_else(|| operand_range_declines(dtype, "B", b, k))
 }
 
-/// One operand, one pass, both ends. See [`wgmma_declines_operand_range`].
-fn operand_range_declines(dtype: WgmmaDtype, which: &str, xs: &[f32]) -> Option<String> {
+/// One operand, one pass, both ends — the ceiling per element, the floor per row of `k`. See
+/// [`wgmma_declines_operand_range`].
+fn operand_range_declines(dtype: WgmmaDtype, which: &str, xs: &[f32], k: usize) -> Option<String> {
     // Hoisted out of the scan: two conversions for the whole operand, then plain f32 compares.
     let ceiling = seam_dtype_max_finite(dtype);
     let floor = seam_dtype_min_positive_normal(dtype);
-    // The largest FINITE magnitude in the operand. Both comparisons below are `>`, which settles the
-    // non-finite cases the way the routes actually differ: an infinity trips the ceiling and
-    // declines (falling back reproduces the CPU oracle's own infinity exactly), while a NaN trips
-    // neither — every comparison against it is false — so it never becomes the peak and never
-    // declines, because it is a NaN on both routes and the route changes nothing about it.
-    let mut peak = 0.0f32;
-    for &x in xs {
-        let mag = x.abs();
-        if mag > ceiling {
+    // `k == 0` cannot reach here from the seam — `wgmma_declines` rejects a zero extent through the
+    // tensor-map validator before this runs — but `chunks(0)` panics, so fold the whole operand as
+    // one row rather than aborting a user's program on a shape that had a working fallback.
+    let row_len = if k == 0 { xs.len().max(1) } else { k };
+    for (r, row) in xs.chunks(row_len).enumerate() {
+        // The largest FINITE magnitude in this row. Both comparisons below are `>`, which settles
+        // the non-finite cases the way the routes actually differ: an infinity trips the ceiling and
+        // declines (falling back reproduces the CPU oracle's own infinity exactly), while a NaN
+        // trips neither — every comparison against it is false — so it never becomes the peak and
+        // never declines, because it is a NaN on both routes and the route changes nothing about it.
+        let mut peak = 0.0f32;
+        for &x in row {
+            let mag = x.abs();
+            if mag > ceiling {
+                return Some(format!(
+                    "operand {which} holds {x:e}, which {dtype:?} cannot carry as a finite value \
+                     (the seam converts both operands to {dtype:?} on the host, so this element \
+                     would enter the GEMM as an infinity while the f32 launcher carries it \
+                     unchanged)"
+                ));
+            }
+            if mag > peak {
+                peak = mag;
+            }
+        }
+        // `peak > 0.0` exempts an all-zero (or all-NaN) row: it converts EXACTLY, so there is
+        // nothing to decline and a fallback would buy nothing.
+        if peak > 0.0 && peak < floor {
             return Some(format!(
-                "operand {which} holds {x:e}, which {dtype:?} cannot carry as a finite value (the \
-                 seam converts both operands to {dtype:?} on the host, so this element would enter \
-                 the GEMM as an infinity while the f32 launcher carries it unchanged)"
+                "operand {which} row {r}'s largest magnitude is {peak:e}, under {dtype:?}'s \
+                 smallest normal {floor:e} (the seam converts both operands to {dtype:?} on the \
+                 host, so EVERY element of this row enters the GEMM as a subnormal or as zero — and \
+                 since C[i][j] = sum_k A[i][k]*B[j][k], that row of A feeds one whole row of C and \
+                 that row of B one whole column, which come back as flushed lanes while the f32 \
+                 launcher carries them unchanged)"
             ));
         }
-        if mag > peak {
-            peak = mag;
-        }
-    }
-    // `peak > 0.0` exempts an all-zero (or all-NaN) operand: it converts EXACTLY, so there is
-    // nothing to decline and a fallback would buy nothing.
-    if peak > 0.0 && peak < floor {
-        return Some(format!(
-            "operand {which}'s largest magnitude is {peak:e}, under {dtype:?}'s smallest normal \
-             {floor:e} (the seam converts both operands to {dtype:?} on the host, so EVERY element \
-             of this one enters the GEMM as a subnormal or as zero and the result is dominated by \
-             flushed lanes, while the f32 launcher carries them unchanged)"
-        ));
     }
     None
 }
@@ -895,37 +933,40 @@ mod tests {
     #[test]
     fn an_operand_past_f16s_range_declines_to_the_f32_launcher() {
         let f16_max = seam_dtype_max_finite(WgmmaDtype::F16);
+        // One row of K = 6 in both operands, so every element below shares a row with the peak.
+        const K: usize = 6;
         let ok = [1.0f32, -1.0, 0.0, f16_max, -f16_max, 1e-9];
         assert!(
-            wgmma_declines_operand_range(WgmmaDtype::F16, &ok, &ok).is_none(),
+            wgmma_declines_operand_range(WgmmaDtype::F16, &ok, &ok, K).is_none(),
             "everything here is a finite f16, including the ceiling itself — and the lone 1e-9, \
-             because the underflow rule is on the operand's MAXIMUM and this one's is 65504: a \
-             single flushed lane costs its own magnitude, which the band does cover"
+             because the underflow rule is on the ROW's maximum and this row's is 65504: a single \
+             flushed lane costs its own contribution to a sum its own row's 65504 also feeds, which \
+             the band does cover"
         );
 
         for bad in [65_536.0f32, -65_536.0, 1e30, f32::MAX, f32::INFINITY] {
-            let why = wgmma_declines_operand_range(WgmmaDtype::F16, &[1.0, bad], &ok)
+            let why = wgmma_declines_operand_range(WgmmaDtype::F16, &[1.0, bad], &ok, K)
                 .unwrap_or_else(|| panic!("{bad:e} in A must decline"));
             assert!(why.starts_with("operand A"), "{why}");
-            let why = wgmma_declines_operand_range(WgmmaDtype::F16, &ok, &[1.0, bad])
+            let why = wgmma_declines_operand_range(WgmmaDtype::F16, &ok, &[1.0, bad], K)
                 .unwrap_or_else(|| panic!("{bad:e} in B must decline"));
             assert!(why.starts_with("operand B"), "{why}");
         }
 
         // A NaN is a NaN on both routes, so the route changes nothing and there is nothing to decline.
-        assert!(wgmma_declines_operand_range(WgmmaDtype::F16, &[f32::NAN], &ok).is_none());
+        assert!(wgmma_declines_operand_range(WgmmaDtype::F16, &[f32::NAN], &ok, K).is_none());
 
         // The bf16 arm: everything f16 refuses here is ordinary, because bf16 has f32's exponent
         // field. Only the very top of the f32 range and an infinity fail it.
         for x in [1e30f32, -1e30, 65_536.0, 1e38] {
             assert!(
-                wgmma_declines_operand_range(WgmmaDtype::Bf16, &[x], &ok).is_none(),
+                wgmma_declines_operand_range(WgmmaDtype::Bf16, &[x], &ok, K).is_none(),
                 "bf16 carries f32's exponent range, so {x:e} is finite there"
             );
         }
         for x in [f32::MAX, -f32::MAX, f32::INFINITY] {
             assert!(
-                wgmma_declines_operand_range(WgmmaDtype::Bf16, &[x], &ok).is_some(),
+                wgmma_declines_operand_range(WgmmaDtype::Bf16, &[x], &ok, K).is_some(),
                 "{x:e} is past bf16's own ceiling"
             );
         }
@@ -980,60 +1021,65 @@ mod tests {
 
     /// **The other class change the tolerance band cannot absorb — and the one no gate could see.**
     ///
-    /// Round 1 closed the overflow end; this is its twin. An operand whose whole magnitude range is
-    /// under f16's smallest normal converts to subnormals or to exact zeros, so `C` comes back
-    /// dominated by flushed lanes — at ~1e-8, identically zero — where `gpu::gemm_nt` returns the
-    /// finite matrix the CPU oracle returns. That is invisible to every gate in this repo twice
-    /// over: the band gates all seed `rng.vec(.., -1.0, 1.0)` so they never produce such an operand,
-    /// and `diff::assert_close` passes a lane on `abs <= abs_tol || rel <= rel_tol`, so under the
-    /// wgmma band's `abs_tol = 5e-2` a zeroed 1e-7-scale output passes at 100% relative error.
+    /// Round 1 closed the overflow end; this is its twin. A row whose whole magnitude range is
+    /// under f16's smallest normal converts to subnormals or to exact zeros, so the lanes of `C` it
+    /// feeds come back dominated by flushed lanes — at ~1e-8, identically zero — where
+    /// `gpu::gemm_nt` returns the finite matrix the CPU oracle returns. That is invisible to every
+    /// gate in this repo twice over: the band gates all seed `rng.vec(.., -1.0, 1.0)` so they never
+    /// produce such an operand, and `diff::assert_close` passes a lane on
+    /// `abs <= abs_tol || rel <= rel_tol`, so under the wgmma band's `abs_tol = 5e-2` a zeroed
+    /// 1e-7-scale output passes at 100% relative error.
     ///
     /// Device-free, on the same shape the overflow proof uses, so the decline is on the DATA.
     #[test]
     fn an_operand_wholly_under_f16s_normal_range_declines_to_the_f32_launcher() {
+        // One row of K = 4 per operand, so "the row" and "the operand" coincide here and this test
+        // stays about the THRESHOLD; the granularity is
+        // `a_quiet_row_inside_a_loud_operand_declines_although_the_operand_peak_is_normal`.
+        const K: usize = 4;
         let ok = [1.0f32, -1.0, 0.5, 0.25];
 
         // The concrete failure: every element flushes to zero, so C would be all zeros.
         for scale in [1e-8f32, -1e-8, 1e-7, 1e-9, 5e-5, f32::MIN_POSITIVE] {
-            let tiny = [scale, scale * 0.5, -scale];
-            let why = wgmma_declines_operand_range(WgmmaDtype::F16, &tiny, &ok)
+            let tiny = [scale, scale * 0.5, -scale, scale * 0.25];
+            let why = wgmma_declines_operand_range(WgmmaDtype::F16, &tiny, &ok, K)
                 .unwrap_or_else(|| panic!("an A whose peak is {scale:e} must decline"));
             assert!(why.starts_with("operand A"), "{why}");
             assert!(why.contains("smallest normal"), "{why}");
-            let why = wgmma_declines_operand_range(WgmmaDtype::F16, &ok, &tiny)
+            let why = wgmma_declines_operand_range(WgmmaDtype::F16, &ok, &tiny, K)
                 .unwrap_or_else(|| panic!("a B whose peak is {scale:e} must decline"));
             assert!(why.starts_with("operand B"), "{why}");
         }
 
-        // An operand whose peak IS normal is not declined, however small the peak is.
+        // A row whose peak IS normal is not declined, however small the peak is.
         let f16_min = seam_dtype_min_positive_normal(WgmmaDtype::F16);
         for peak in [f16_min, 1e-4f32, 1e-3] {
             assert!(
-                wgmma_declines_operand_range(WgmmaDtype::F16, &[peak, 1e-30], &ok).is_none(),
+                wgmma_declines_operand_range(WgmmaDtype::F16, &[peak, 1e-30], &ok, K).is_none(),
                 "peak {peak:e} is normal in f16; its small lanes cost their own magnitude"
             );
         }
 
-        // An exactly-zero operand converts EXACTLY. Declining it would buy a fallback and nothing
+        // An exactly-zero row converts EXACTLY. Declining it would buy a fallback and nothing
         // else, so it is not declined — and it is the one case a naive `max < floor` gets wrong.
         assert!(
-            wgmma_declines_operand_range(WgmmaDtype::F16, &[0.0, -0.0, 0.0], &ok).is_none(),
+            wgmma_declines_operand_range(WgmmaDtype::F16, &[0.0, -0.0, 0.0], &ok, K).is_none(),
             "0.0 -> f16 0.0 is exact on both routes"
         );
-        // An all-NaN operand likewise: a NaN is a NaN on both routes and never becomes the peak.
+        // An all-NaN row likewise: a NaN is a NaN on both routes and never becomes the peak.
         assert!(
-            wgmma_declines_operand_range(WgmmaDtype::F16, &[f32::NAN, f32::NAN], &ok).is_none()
+            wgmma_declines_operand_range(WgmmaDtype::F16, &[f32::NAN, f32::NAN], &ok, K).is_none()
         );
 
         // The bf16 arm needs none of this: its floor is 1.18e-38.
         for scale in [1e-8f32, 1e-20, 1e-30] {
             assert!(
-                wgmma_declines_operand_range(WgmmaDtype::Bf16, &[scale], &ok).is_none(),
+                wgmma_declines_operand_range(WgmmaDtype::Bf16, &[scale], &ok, K).is_none(),
                 "bf16 carries f32's exponent range, so {scale:e} is normal there"
             );
         }
         assert!(
-            wgmma_declines_operand_range(WgmmaDtype::Bf16, &[1e-40], &ok).is_some(),
+            wgmma_declines_operand_range(WgmmaDtype::Bf16, &[1e-40], &ok, K).is_some(),
             "1e-40 is under bf16's own smallest normal"
         );
 
@@ -1042,16 +1088,95 @@ mod tests {
         assert!(wgmma_declines(cfg, 64, 64, 64, H100_SMEM).is_none());
     }
 
-    /// **Why the underflow rule is on the maximum and the overflow rule is per element.**
+    /// **The granularity, and the case a per-operand maximum structurally cannot see.**
+    ///
+    /// `C[i][j] = sum_k A[i][k]*B[j][k]`, so row `i` of A feeds row `i` of `C` and nothing else, and
+    /// row `j` of B feeds column `j`. A single scalar peak folded over the whole operand therefore
+    /// answers a question about the *matrix* when the flush that changes an answer acts on a *row*:
+    /// an operand with one loud row and one quiet row has an O(1) peak, passes a per-operand rule
+    /// unchanged, and returns the quiet row's entire row of `C` as exact zeros where the f32
+    /// launcher — and the CPU oracle — return finite values.
+    ///
+    /// The reproducer is the finding's: `M=2, K=64, N=64` on Hopper, A row 0 all 1.0 and A row 1 all
+    /// 1e-8, B all 1.0. Every other decline accepts it (N even, `K % 8 == 0`, `M*N = 128`, the ring
+    /// fits the H100 carveout), so before this rule the route was `Wgmma` and `C[1][j]` came back 0
+    /// against the oracle's 6.4e-7 — which no band gate could see, since `abs_tol = 5e-2` passes a
+    /// zeroed 6.4e-7 lane at 100% relative error. Device-free, because the decline is the whole
+    /// difference between the two routes.
+    #[test]
+    fn a_quiet_row_inside_a_loud_operand_declines_although_the_operand_peak_is_normal() {
+        const M: usize = 2;
+        const K: usize = 64;
+        const N: usize = 64;
+        let f16_min = seam_dtype_min_positive_normal(WgmmaDtype::F16);
+
+        // The arithmetic the decline exists for: this row does not round, it VANISHES.
+        assert_eq!(
+            half::f16::from_f32(1e-8).to_f32(),
+            0.0,
+            "1e-8 is under f16's round-to-zero point, so the quiet row enters the GEMM as zeros"
+        );
+
+        let mut a = vec![1.0f32; M * K];
+        a[K..].fill(1e-8);
+        let b = vec![1.0f32; N * K];
+
+        // The old rule's own input, computed here so the test states what it is replacing: the
+        // operand's single peak is 1.0, comfortably normal, and blind to the row below it.
+        let operand_peak = a.iter().fold(0.0f32, |p, x| p.max(x.abs()));
+        assert!(
+            operand_peak > f16_min,
+            "the whole-operand maximum is {operand_peak:e}, which a per-operand rule passes — that \
+             is exactly why this case needs a per-row one"
+        );
+
+        let why = wgmma_declines_operand_range(WgmmaDtype::F16, &a, &b, K)
+            .expect("a quiet ROW inside a loud operand must decline to the f32 launcher");
+        assert!(why.starts_with("operand A row 1"), "{why}");
+        assert!(why.contains("smallest normal"), "{why}");
+
+        // The B twin: a quiet row of B zeroes a whole COLUMN of C.
+        let mut bq = vec![1.0f32; N * K];
+        bq[3 * K..4 * K].fill(1e-8);
+        let loud = vec![1.0f32; M * K];
+        let why = wgmma_declines_operand_range(WgmmaDtype::F16, &loud, &bq, K)
+            .expect("a quiet row of B must decline too");
+        assert!(why.starts_with("operand B row 3"), "{why}");
+
+        // The control, one row apart: the same shape with both rows loud is taken by the seam, so
+        // the decline above is caused by the DATA and by nothing else.
+        assert!(
+            wgmma_declines_operand_range(WgmmaDtype::F16, &loud, &b, K).is_none(),
+            "the control must not decline, or this test proves nothing about the quiet row"
+        );
+        let cfg = wgmma_cfg_for(WGMMA_F32_SEAM_DTYPE, M, N);
+        assert!(
+            wgmma_declines(cfg, M, K, N, H100_SMEM).is_none(),
+            "M={M} K={K} N={N} is accepted by every shape decline, so this reproducer really does \
+             reach the wgmma launcher on Hopper: {:?}",
+            wgmma_declines(cfg, M, K, N, H100_SMEM)
+        );
+
+        // And the row rule still exempts an exactly-zero row — a zero-padded operand is the common
+        // way to meet a tile, and it converts exactly on both routes.
+        let mut padded = vec![1.0f32; M * K];
+        padded[K..].fill(0.0);
+        assert!(
+            wgmma_declines_operand_range(WgmmaDtype::F16, &padded, &b, K).is_none(),
+            "a zero row converts EXACTLY; declining it would buy a fallback and nothing else"
+        );
+    }
+
+    /// **Why the underflow rule is on a row's maximum and the overflow rule is per element.**
     ///
     /// The asymmetry is the load-bearing design decision, and it is the reason the commit that
     /// closed the overflow end gave for leaving this one open ("a few elements of any `U(-1,1)`
     /// buffer are below 6.104e-5, so the rule would decline nearly every real GEMM"). That argument
     /// rules out a *per-element* underflow rule only. This pins both halves: a per-element rule
-    /// really would fire on an ordinary buffer, and the max-based one really does not — while still
-    /// catching the whole-operand flush a hair below the same threshold.
+    /// really would fire on an ordinary buffer, and the row-max one really does not — at any row
+    /// length — while still catching the wholly-flushed row a hair below the same threshold.
     #[test]
-    fn the_underflow_rule_is_per_operand_because_a_per_element_one_would_decline_everything() {
+    fn the_underflow_rule_is_per_row_because_a_per_element_one_would_decline_everything() {
         let f16_min = seam_dtype_min_positive_normal(WgmmaDtype::F16);
 
         // A plausible `U(-1,1)` buffer: peak near 1, and one element that a per-element rule (and
@@ -1068,23 +1193,37 @@ mod tests {
             buf.iter().any(|x| *x != 0.0 && x.abs() < f16_min),
             "a per-element rule would have something to fire on"
         );
-        assert!(
-            wgmma_declines_operand_range(WgmmaDtype::F16, &buf, &buf).is_none(),
-            "the max-based rule must NOT fire on an ordinary U(-1,1) buffer, or the wgmma route \
-             declines nearly every real GEMM and the whole wave measures the f32 launcher"
-        );
+        // At every row length that divides it, including the ones that put the two tiny elements in
+        // rows of their own company: an ordinary buffer has a normal peak in EVERY row, which is why
+        // narrowing the rule from the operand to the row costs no real GEMM. (`P(max of K uniforms
+        // < 6.1e-5) = (6.1e-5)^K`, about 1e-34 at K = 8.)
+        for k in [2usize, 4, 8, 16, 32, 64] {
+            assert!(
+                wgmma_declines_operand_range(WgmmaDtype::F16, &buf, &buf, k).is_none(),
+                "K={k}: the row-max rule must NOT fire on an ordinary U(-1,1) buffer, or the wgmma \
+                 route declines nearly every real GEMM and the whole wave measures the f32 launcher"
+            );
+        }
 
         // One `inf` in the same buffer still declines: overflow IS per element, because an infinity
         // propagates through the accumulation into every output lane its row or column touches.
         let mut over = buf.clone();
         over[3] = 70_000.0;
-        assert!(wgmma_declines_operand_range(WgmmaDtype::F16, &over, &buf).is_some());
+        assert!(wgmma_declines_operand_range(WgmmaDtype::F16, &over, &buf, 64).is_some());
 
-        // And the boundary of the max rule, from both sides, against the crate's own constant.
+        // And the boundary of the row-max rule, from both sides, against the crate's own constant.
         let just_under = [f16_min * 0.5, f16_min * 0.25];
         let just_over = [f16_min, f16_min * 0.25];
-        assert!(wgmma_declines_operand_range(WgmmaDtype::F16, &just_under, &just_over).is_some());
-        assert!(wgmma_declines_operand_range(WgmmaDtype::F16, &just_over, &just_over).is_none());
+        assert!(
+            wgmma_declines_operand_range(WgmmaDtype::F16, &just_under, &just_over, 2).is_some()
+        );
+        assert!(wgmma_declines_operand_range(WgmmaDtype::F16, &just_over, &just_over, 2).is_none());
+
+        // `k == 0` cannot reach the seam (a zero extent has no encodable tensor map), but the scan
+        // must not panic on it either — `chunks(0)` does. It degrades to the whole operand as one
+        // row, which is the conservative reading.
+        assert!(wgmma_declines_operand_range(WgmmaDtype::F16, &buf, &buf, 0).is_none());
+        assert!(wgmma_declines_operand_range(WgmmaDtype::F16, &[], &[], 0).is_none());
     }
 
     /// **The law that keeps this file honest against the generator.** `gemm_nt_wgmma`'s first

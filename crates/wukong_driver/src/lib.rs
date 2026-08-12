@@ -2505,7 +2505,7 @@ mod gpu_e2e_tests {
         }
     }
 
-    /// **An operand wholly under f16's range must not turn a finite GEMM into a matrix of zeros.**
+    /// **A row wholly under f16's range must not turn a finite GEMM into a row of zeros.**
     ///
     /// The underflow twin of the test above, and the harder of the two to gate, because its failure
     /// is *quiet*: an operand scaled to ~1e-8 is under f16's round-to-zero point (`2^-25` = 2.98e-8),
@@ -2518,6 +2518,17 @@ mod gpu_e2e_tests {
     /// assertion can.** That is the point of writing it as a paired control rather than as a
     /// tolerance check: same shape, same `b`, one scale factor apart, so on a Hopper part the route
     /// must differ *because of the magnitudes* and nothing else.
+    ///
+    /// # The third arm, and why the granularity is the whole point
+    ///
+    /// `C[i][j] = sum_k A[i][k]*B[j][k]`, so row `i` of A feeds row `i` of `C` and nothing else. The
+    /// `quiet row` arm scales **one row** of A to 1e-8 and leaves the rest at O(1): the operand's
+    /// single largest magnitude is then ~1.0, which is why a per-operand rule passed it and the
+    /// route stayed `Wgmma` while that row of `C` came back exactly zero.
+    /// `gpu_accel::wgmma_declines_operand_range` folds its maximum **per row** for exactly this
+    /// case, and this arm is the device-side proof: unlike the whole-operand arm its *value*
+    /// assertion is load-bearing too, because `got` would hold a zero row where the oracle is
+    /// strictly positive.
     ///
     /// Runs on any device — on a pre-Hopper part both arms are `Existing` and it still asserts the
     /// user-visible property, that the GPU does not return zeros where the oracle is non-zero.
@@ -2542,17 +2553,42 @@ mod gpu_e2e_tests {
         let b = rng.vec(n * k, 0.5, 1.0);
         let base = rng.vec(m * k, 0.5, 1.0);
 
-        for (label, scale, hopper_route) in [
-            ("control", 1.0f32, gpu_accel::GemmRoute::Wgmma),
+        // The per-ROW scale of A, so the third arm can be quiet in one row and loud in the rest.
+        // `fn(usize) -> f32` rather than a closure so the three arms live in one array.
+        for (label, scale_of_row, hopper_route) in [
+            (
+                "control",
+                (|_row| 1.0f32) as fn(usize) -> f32,
+                gpu_accel::GemmRoute::Wgmma,
+            ),
             // Under 2^-25: every element of A converts to an exact f16 zero.
-            ("underflow", 1e-8f32, gpu_accel::GemmRoute::Existing),
+            (
+                "underflow",
+                (|_row| 1e-8f32) as fn(usize) -> f32,
+                gpu_accel::GemmRoute::Existing,
+            ),
+            // ONE quiet row inside a loud operand: peak|A| is still ~1.0, so the per-operand rule
+            // this replaced saw nothing, and row 1 of C came back exactly zero.
+            (
+                "quiet row",
+                (|row| if row == 1 { 1e-8f32 } else { 1.0 }) as fn(usize) -> f32,
+                gpu_accel::GemmRoute::Existing,
+            ),
         ] {
             let want = if cc.0 == 9 {
                 hopper_route
             } else {
                 gpu_accel::GemmRoute::Existing
             };
-            let a: Vec<f32> = base.iter().map(|x| x * scale).collect();
+            let a: Vec<f32> = base
+                .iter()
+                .enumerate()
+                .map(|(idx, x)| x * scale_of_row(idx / k))
+                .collect();
+            // The number the replaced rule looked at. On the `quiet row` arm it is ~1.0, i.e. the
+            // per-operand maximum is *blind* to the row this arm exists for, which is why the arm
+            // is here at all.
+            let peak = a.iter().fold(0.0f32, |p, x| p.max(x.abs()));
 
             let (mut ac, mut bc, mut cpu) = (a.clone(), b.clone(), vec![0f32; m * n]);
             {
@@ -2579,15 +2615,18 @@ mod gpu_e2e_tests {
                 .expect("the GEMM must have offloaded, or this tests CPU-vs-CPU");
             assert_eq!(
                 taken, want,
-                "{label} (cc {cc:?}, A scaled by {scale:e}): on Hopper the route must be decided by \
-                 the operand's MAGNITUDE — the shape is identical in both runs and declines in \
-                 neither. This is the only assertion in this test that the defect can fail: the \
-                 band cannot see a 1e-13 result zeroed."
+                "{label} (cc {cc:?}, max|A| = {peak:e}, row scales {:e}/{:e}): on Hopper the route \
+                 must be decided by the MAGNITUDES OF A ROW — the shape is identical in all three \
+                 runs and declines in none. On the whole-operand arm this is the only assertion the \
+                 defect can fail, because the band cannot see a 1e-13 result zeroed.",
+                scale_of_row(0),
+                scale_of_row(1)
             );
             assert!(
                 got.iter().all(|v| *v > 0.0),
                 "{label}: the GPU returned a zero lane where the f32 oracle is strictly positive — \
-                 the underflow decline did not fire and the f16 seam flushed the whole operand"
+                 the underflow decline did not fire and the f16 seam flushed a whole row (max|A| = \
+                 {peak:e}, so a rule folded over the whole operand cannot see it)"
             );
             let (abs_tol, rel_tol) = gemm_tolerance(taken, k);
             let s = assert_close(
@@ -2598,7 +2637,7 @@ mod gpu_e2e_tests {
                 rel_tol,
             );
             eprintln!(
-                "gpu --backend underflow {label} {m}x{k}x{n} scale={scale:e} [{taken:?}]: \
+                "gpu --backend underflow {label} {m}x{k}x{n} max|A|={peak:e} [{taken:?}]: \
                  {} wgmma / {} existing, max_abs={:.2e} max_rel={:.2e}",
                 accel.gemm_wgmma_calls, accel.gemm_existing_calls, s.max_abs, s.max_rel
             );
