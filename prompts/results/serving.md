@@ -146,8 +146,11 @@ with an **int8 KV cache** cutting footprint **3.9×**; multi-GPU partition math 
   at Bcap=64 the decode step is **compute/execution-bound, not launch-bound** (eager's async launches
   already pipeline behind GPU compute; the graph only recovers the exposed launch overhead, a roughly
   fixed ~250–280 µs, which is a large fraction of one shallow layer but a small fraction of twelve). The
-  per-layer wall (~320 µs) is dominated by the six WMMA GEMMs running at M=64 — only 8–32 CTAs on 40 SMs,
-  a single under-occupied wave with a long K-reduction. **This underutilization is precisely the lever
+  per-layer wall (~320 µs) is dominated by the six WMMA GEMMs running at M=64 — only 8–32 CTAs on **20** SMs
+  (the *probed* count, printed by `hbm_bandwidth` straight out of `g.sm_count()`:
+  `theoretical peak HBM: 192.0 GB/s  (20 SMs)`, `bench/gpu/4050-identity/hbm_bandwidth.A.r1.txt:4`;
+  `ptx_norm.rs:591` stamps the same 20 on its norm sweep), i.e. **0.4–1.6 waves** — an under-occupied
+  launch with a long K-reduction. **This underutilization is precisely the lever
   P5 (continuous batching) converts into goodput**: the fixed-shape step costs ~the same whether 1 or 64
   rows are useful, so filling the batch multiplies useful tokens/s without adding latency. The graph's
   1.07–1.35× then stacks on top of the batching win. (The decode GEMM kernel itself is owned by the
@@ -155,7 +158,10 @@ with an **int8 KV cache** cutting footprint **3.9×**; multi-GPU partition math 
 
 ### P4 — paged decode-attention kernel: warp-cooperative rewrite (correctness preserved)
 - The v1 decode-attention kernel was **one thread per `(slot, head)`** — correct and trivially bit-exact,
-  but it launched only `num_slots*heads` *threads* (512 here), leaving 39/40 SMs idle. Rewritten
+  but it launched only `num_slots*heads` *threads* (512 here) — at the v1 launcher's
+  `PAGED_ATTN_BLOCK = 128` that is `ceil(512/128)` = **4 CTAs, i.e. 4 of the 20 SMs busy and 16 idle**
+  (commit `2fec88d`; the earlier "39/40 SMs idle" was wrong twice over — the part has 20 SMs, not 40,
+  and the launch was 4 CTAs, not 1). Rewritten
   **warp-cooperative**: one **warp** per `(slot, head)`, the 32 lanes split the context (`t = lane,
   lane+32, …`), each lane runs a partial online-softmax (FP32 accumulators), then a fixed
   `shfl.sync.bfly.b32` butterfly merges them (max → rescale → Σl → Σacc). The query is staged once per
