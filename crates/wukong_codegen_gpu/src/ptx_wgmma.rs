@@ -2907,31 +2907,149 @@ pub const L2_BYTES: f64 = 52_428_800.0;
 pub const BW_L2: f64 = 7.00e12;
 /// HBM peak, B/s (the datasheet number; the measured copy rate on this fleet is 2.92 TB/s = 87.2%).
 pub const BW_HBM: f64 = 3.35e12;
-/// The per-tile fixed cost, seconds: ring fill + the `wgmma.wait_group 0` drain + 128 predicated
-/// stores + prologue. Fit B, from `sq4096` and `gpt_d1024_up` at an IDENTICAL 512-tile / 4-wave grid
-/// differing only in K, so the fit has no wave term at all.
+/// **The reference tile every cost constant below was MEASURED at**: W1's `128x256`, 4 ring stages.
+///
+/// Nothing in the campaign has timed a 128x128 or a 128x64 mainloop, so every other tile's cost is
+/// an extrapolation from this one -- and [`tile_fixed_s`] / [`k_stage_s`] are where that
+/// extrapolation is written down, once, instead of being smuggled in by applying this tile's numbers
+/// to another tile's geometry.
+pub const FLOOR_REF_TILE: (usize, usize, usize) = (128, 256, 4);
+/// The per-tile fixed cost at the reference tile, seconds: ring fill + the `wgmma.wait_group 0`
+/// drain + 128 predicated stores + prologue. Fit B, from `sq4096` and `gpt_d1024_up` at an IDENTICAL
+/// 512-tile / 4-wave grid differing only in K, so the fit has no wave term at all.
+///
+/// It is the SUM of the three terms below, and the law
+/// `the_per_tile_floor_decomposes_into_its_measured_halves` asserts that, so the decomposition can
+/// never drift away from the number Fit B measured.
 pub const TILE_FIXED_S: f64 = 14.61e-6;
-/// The per-k-stage cost at a 128x256 tile, seconds, from the same fit.
+/// **One ring stage of FILL at the reference tile**, seconds (Fit C: `X4 - X3 = 13.84 - 11.88`).
+///
+/// It is a BANDWIDTH event, not a latency one: 1.96 us moves `132 CTAs x 49 152 B = 6.488 MB`
+/// device-wide, i.e. 3.31 TB/s = 98.7% of HBM peak. So it scales with the SMEM bytes a stage fills,
+/// `stages * (bm + bn) * bk * dtype`, and at a fixed `bk` that is `stages * (bm + bn)`.
+pub const X_FILL_PER_STAGE_S: f64 = 1.96e-6;
+/// **The epilogue's share of the reference tile's fixed cost**, seconds (`X - X_fill` on Fit A's
+/// `X = 13.84`: `13.84 - 4 x 1.96 = 5.99`).
+///
+/// It writes `bm * bn * 4` bytes -- 17.30 MB device-wide at the reference tile, against a pure
+/// HBM-write floor of 5.16 us, so it is within 16% of its own bandwidth roof. It therefore scales
+/// with `bm * bn`.
+pub const X_EPI_S: f64 = 5.99e-6;
+/// What is left of Fit B's `X` once the fill and the epilogue are accounted for: the prologue, the
+/// role split and the mbarrier init. Tile-INDEPENDENT -- it is per-CTA setup, not per-byte work.
+///
+/// It is also where the two fits' disagreement lives, and saying so is the honest framing: the fill
+/// and the epilogue are priced off Fit A's `X = 13.84` (the mcb2 arm, where Fit C's ring-depth A/B
+/// was run) while [`TILE_FIXED_S`] is Fit B's `X = 14.61` (the un-clustered arm), which the dossier
+/// calls "agree to within 5% from completely disjoint data". The 0.77 us of that disagreement is
+/// carried HERE, in the one term that does not scale with a tile dimension, so it can never distort
+/// the two terms that do.
+pub const X_PROLOGUE_S: f64 = 0.78e-6;
+/// The per-k-stage cost at the reference tile, seconds, from Fit B.
 pub const K_STAGE_S: f64 = 0.7126e-6;
+
+/// **The per-tile fixed cost `X` at an arbitrary tile**, seconds.
+///
+/// The fill scales with the SMEM bytes it moves (`stages * (bm+bn)`, at this family's fixed `bk`),
+/// the epilogue with the C bytes it writes (`bm*bn`), and the prologue not at all. At
+/// [`FLOOR_REF_TILE`] this returns [`TILE_FIXED_S`] exactly.
+///
+/// # Why this function has to exist
+///
+/// [`TILE_FIXED_S`] and [`K_STAGE_S`] are 128x256 numbers. Applying them at a 128x64 tile charges
+/// 14.61 us of fixed cost against a real 6.20 and 0.7126 us per k-stage against 0.178 -- at `sq1024`
+/// a **2.9x** floor, 26.01 us instead of 9.05. The floor is the DENOMINATOR of the cluster predicate,
+/// so an inflated one understates `f_L2` by the same factor and can only ever produce an accidental
+/// verdict. WAVE3_DOSSIER 3.7's pseudocode carries the same shortcut (its own comment says "at
+/// 128x256" out loud); this is where it is repaired rather than transcribed.
+///
+/// # What it deliberately does NOT model
+///
+/// The dossier scales the fill by the RESIDENT CTA count at `sq1024` alone (`7.85 * 32/132 = 1.90`,
+/// giving `X = 8.66` against its stated 8.65) and ignores the same 3% correction at every 128-tile
+/// shape. Adding it here would reproduce that one row and change no verdict in the suite, so it is
+/// left out: a model term that fires at one shape and is dropped at the next is not a model.
+pub fn tile_fixed_s(bm: usize, bn: usize, stages: usize) -> f64 {
+    let (rbm, rbn, _) = FLOOR_REF_TILE;
+    let fill = X_FILL_PER_STAGE_S * stages as f64 * (bm + bn) as f64 / (rbm + rbn) as f64;
+    let epi = X_EPI_S * (bm * bn) as f64 / (rbm * rbn) as f64;
+    fill + epi + X_PROLOGUE_S
+}
+
+/// **The per-k-stage cost `S` at an arbitrary tile**, seconds.
+///
+/// One k-stage is `bm * bn * bk` MAC, and the mainloop is tensor-core-issue-bound at every tile this
+/// family emits, so `S` scales with `bm * bn` at a fixed `bk`. That gives 0.356 us at 128x128 and
+/// 0.178 at 128x64 against the reference 0.7126 -- WAVE3_DOSSIER 3.4's own `~0.337` and `~0.165`, to
+/// within the 6-8% its tildes admit, and on the conservative (higher-floor) side of them.
+pub fn k_stage_s(bm: usize, bn: usize) -> f64 {
+    let (rbm, rbn, _) = FLOOR_REF_TILE;
+    K_STAGE_S * (bm * bn) as f64 / (rbm * rbn) as f64
+}
+
+/// **The share of a tile's L2 read that a `1x2x1` B multicast removes**: `(bn/2) / (bm + bn)`.
+///
+/// The cluster turns `(bm + bn)` bytes of L2 read per tile into `(bm + bn/2)`, so what it removes is
+/// `(bn/2)/(bm+bn)` of the L2 term -- **1/3 at 128x256, 1/4 at 128x128, 1/6 at 128x64.** The
+/// dossier's "a flat 1.5x at W1" carries its own scope in the phrase "at W1"; this is that phrase as
+/// arithmetic.
+pub fn multicast_l2_share(bm: usize, bn: usize) -> f64 {
+    (bn as f64 / 2.0) / (bm + bn) as f64
+}
+
 /// The wave efficiency a tile must clear to be selected: `tiles / (sm_count * waves)`.
 ///
 /// 0.90 accepts 128x256 at `sq2048` (0.970) and rejects it at `sq1024` (0.242), reproducing BOTH
 /// measured facts with one rule -- where D1's `M*N >= 4.3e6` literal put the narrow tile at sq2048,
 /// which round 3 then measured 11.9% SLOWER there.
 pub const WAVE_EFFICIENCY_FLOOR: f64 = 0.90;
-/// The L2-roof fraction above which the cluster pays for itself.
+/// The L2-roof fraction above which the cluster pays for itself **at [`FLOOR_REF_TILE`]**.
 ///
 /// The sign of the cluster's effect flips between a measured `f_L2` of 0.736 (`sq2048`, -8.0% with
 /// the cluster on the tight `s3` pair) and 0.810 (`sq8192`, +47.0%). The threshold sits inside that
 /// bracket and is placed at its LOW end deliberately: a wrong OFF at sq8192 costs 27 points, a wrong
 /// ON at sq2048 costs 5. Be eager.
+///
+/// **Every one of those three measurements is a 128x256 measurement**, so this number carries that
+/// tile's scope with it and [`cluster_l2_saving_threshold`] is what carries it to another tile.
 pub const CLUSTER_F_L2_THRESHOLD: f64 = 0.78;
 
-/// The tiles [`wgmma_dispatch`] may choose from, widest first. 128x256 / 128x128 / 128x64 are the
-/// three the register file and `Schedule::Cooperative` allow (CTA-M must be a multiple of 128, and
-/// `bm = 64 * consumer_wgs`); 192-row tiles are DEAD, not deferred -- 192 is not a multiple of 128
-/// and 512 threads cap ptxas at 128 registers against 128 accumulators alone.
-const DISPATCH_TILES: &[(usize, usize)] = &[(128, 256), (128, 128), (128, 64)];
+/// **What the cluster must actually SAVE to be worth its coupling cost**: the fraction of the binding
+/// roof a `1x2x1` B multicast removes, `f_L2 * multicast_l2_share(bm, bn)`, at the break-even
+/// [`CLUSTER_F_L2_THRESHOLD`] was fitted at -- `0.78 * 1/3 = 0.26`.
+///
+/// # Why the predicate is the saving and not `f_L2` itself
+///
+/// `f_L2 >= 0.78` and `f_L2 * share >= 0.26` are **the same comparison at 128x256** and only there.
+/// The multicast removes `(bn/2)/(bm+bn)` of the L2 term -- 1/3 at 128x256, 1/4 at 128x128, 1/6 at
+/// 128x64 -- so the bare 0.78 asks a narrow tile to clear a bar that was priced for a lever three
+/// times its size, and would turn the cluster ON at `sq1024` (`f_L2` 0.79 at the 128x64 tile the rule
+/// selects) where WAVE3_DOSSIER 3.6 says OFF.
+///
+/// The mechanism is the campaign's own spine sentence, `ACT2_WAVE_PLAN.md:5`: **"Multicast the wider
+/// operand."** At 128x256, `B` is twice `A` and halving it removes a third of the read. At 128x128
+/// neither operand is wider. At 128x64 `B` is the NARROW one and the multicast is on the wrong
+/// operand entirely. The share is that sentence as arithmetic, and the consequence is worth stating
+/// plainly: **`0.25 < 0.26`, so even a perfectly L2-bound 128x128 shape declines the cluster** -- by
+/// 4%, which is inside nothing this campaign has measured. It is a REFUSAL, not a result: no shape in
+/// the suite reaches the square tile, and the rule declines rather than guessing. A round that ever
+/// measures the cluster at 128x128 is what would move it.
+pub fn cluster_l2_saving_threshold() -> f64 {
+    let (rbm, rbn, _) = FLOOR_REF_TILE;
+    CLUSTER_F_L2_THRESHOLD * multicast_l2_share(rbm, rbn)
+}
+
+/// The tiles [`wgmma_dispatch`] may choose from as `(bm, bn, stages)`, widest first. 128x256 /
+/// 128x128 / 128x64 are the three the register file and `Schedule::Cooperative` allow (CTA-M must be
+/// a multiple of 128, and `bm = 64 * consumer_wgs`); 192-row tiles are DEAD, not deferred -- 192 is
+/// not a multiple of 128 and 512 threads cap ptxas at 128 registers against 128 accumulators alone.
+///
+/// **The stage depth is here because the floor depends on it**: [`tile_fixed_s`]'s ring-fill term is
+/// `stages * (bm+bn)` of SMEM, so a menu that carried only the tile shape would price the 6-stage
+/// square tile at 4 stages of fill. It is not a free parameter: the law
+/// `the_dispatch_menu_is_a_menu_of_shipped_geometries` asserts every row is the `(bm, bn, stages)`
+/// of a module this family actually emits, so the rule cannot cost a depth nothing assembles.
+const DISPATCH_TILES: &[(usize, usize, usize)] = &[(128, 256, 4), (128, 128, 6), (128, 64, 4)];
 
 /// **What [`wgmma_dispatch`] decided, as data** -- so the round can print the rule's reasoning
 /// beside its result instead of a reader inferring it from a module name.
@@ -2956,21 +3074,35 @@ pub struct DispatchPlan {
     /// The LINEAR order's wave footprint in bytes, `f(R_linear) * K * 2`. The raster fires iff this
     /// exceeds [`L2_BYTES`] on a multi-wave grid, so the number and its threshold belong together.
     pub linear_footprint_bytes: f64,
-    /// The L2-roof fraction of the FINAL configuration, `T_L2 / max(T_floor, T_L2, T_DRAM)` -- the
-    /// quantity [`CLUSTER_F_L2_THRESHOLD`] is compared against. It reproduces WAVE3_DOSSIER 3.2's
-    /// column to three digits at `gpt_d4096_up` (0.955) and `gpt_d1024_up` (0.55).
+    /// The L2-roof fraction of the FINAL configuration, `T_L2 / max(T_floor, T_L2, T_DRAM)`,
+    /// reproducing WAVE3_DOSSIER 3.2's column to three digits at `gpt_d4096_up` (0.955) and
+    /// `gpt_d1024_up` (0.55).
+    ///
+    /// **It is the dossier's diagnostic, not the predicate's comparand** -- see [`l2_saving`], which
+    /// is this number times the share of the L2 term a multicast on THIS tile actually removes. The
+    /// two are equal up to the constant `1/3` at [`FLOOR_REF_TILE`] and nowhere else.
+    ///
+    /// [`l2_saving`]: DispatchPlan::l2_saving
     pub f_l2: f64,
+    /// **The quantity [`cluster_l2_saving_threshold`] is compared against**: the fraction of the
+    /// binding roof a `1x2x1` B multicast would remove at the tile actually chosen,
+    /// `f_l2 * multicast_l2_share(bm, bn)`.
+    pub l2_saving: f64,
 }
 
 impl DispatchPlan {
     /// **One line for a round log: the verdict AND both comparands.** A rule that prints only its
     /// answer is a rule a reader has to take on trust; printing `wave eff 0.970 >= 0.90` and
-    /// `f_L2 0.55 < 0.78` beside it is what lets the round's own table falsify the thresholds
+    /// `saves 0.184 < 0.26` beside it is what lets the round's own table falsify the thresholds
     /// instead of inheriting them.
+    ///
+    /// The cluster column prints the SAVING and its factors (`f_L2 x share`) rather than `f_L2`
+    /// alone, because at any tile but [`FLOOR_REF_TILE`] `f_L2` is not what the rule compared.
     pub fn summary(&self) -> String {
         format!(
-            "{}x{} tile, {} tiles / {} waves (eff {:.3} vs floor {:.2}) | cluster {} (f_L2 {:.3} \
-             vs {:.2}) | raster {} (linear footprint {:.1} MB vs L2 {:.1} MB) | persistent {}",
+            "{}x{} tile, {} tiles / {} waves (eff {:.3} vs floor {:.2}) | cluster {} (saves {:.3} \
+             = f_L2 {:.3} x share {:.3}, vs {:.2}) | raster {} (linear footprint {:.1} MB vs L2 \
+             {:.1} MB) | persistent {}",
             self.bm,
             self.bn,
             self.tiles,
@@ -2978,8 +3110,10 @@ impl DispatchPlan {
             self.wave_efficiency,
             WAVE_EFFICIENCY_FLOOR,
             if self.cluster { "ON " } else { "off" },
+            self.l2_saving,
             self.f_l2,
-            CLUSTER_F_L2_THRESHOLD,
+            multicast_l2_share(self.bm, self.bn),
+            cluster_l2_saving_threshold(),
             if self.raster {
                 format!("ON GROUP_M {}", self.group_m)
             } else {
@@ -3006,32 +3140,46 @@ impl DispatchPlan {
 /// | lever | what it changes | which roof it lowers | zero when |
 /// |---|---|---|---|
 /// | tile | `I_cta`, and how much of the device one wave fills | occupancy, and the L2 roof | never -- it is always a choice |
-/// | cluster (1x2x1 on B) | `L2 -> SMEM` bytes: `(BM+BN)` becomes `(BM+BN/2)`, a flat 1.5x at W1 | the **7.00 TB/s L2** roof | the shape is not near that roof |
+/// | cluster (1x2x1 on B) | `L2 -> SMEM` bytes: `(BM+BN)` becomes `(BM+BN/2)` -- 1.5x at W1, 1.33x at 128x128, 1.2x at 128x64 | the **7.00 TB/s L2** roof | the shape is not near that roof, OR the tile is too narrow for `B` to be the wide operand |
 /// | raster | `DRAM -> L2` bytes, by changing the WAVE FOOTPRINT; L2->SMEM bytes unchanged | the **3.35 TB/s HBM** roof, and L2 residency | one wave, or the linear footprint already fits L2 |
 /// | persistence | nothing about traffic; removes `X_fill` at `waves-1` boundaries | the **mainloop fixed-cost** floor | one wave |
 ///
 /// So: take the WIDEST tile whose wave efficiency clears [`WAVE_EFFICIENCY_FLOOR`]; raster iff the
 /// grid is multi-wave AND the linear wave footprint blows [`L2_BYTES`]; persist iff multi-wave;
-/// cluster iff the L2-roof fraction of the **FINAL** configuration clears
-/// [`CLUSTER_F_L2_THRESHOLD`].
+/// cluster iff what a B multicast would SAVE off the **FINAL** configuration's binding roof clears
+/// [`cluster_l2_saving_threshold`].
 ///
 /// **That last word is load-bearing.** `gpt_d4096_up` FLIPS: today it is memory-thrashing at 58.5%
 /// of the L2 hit rate and the cluster is worth nothing (`f_L2` 0.585); once the raster makes its wave
 /// footprint L2-resident it lands at 0.955 and the cluster is worth 1.5x of a binding roof. The
 /// dispatcher is a function of the configuration it is about to emit, not of a measurement of an
 /// earlier one.
+///
+/// # The floor is the CHOSEN tile's floor, and that took a defect to learn
+///
+/// `T_floor` is the denominator of the cluster decision, and it was computed from
+/// [`TILE_FIXED_S`] / [`K_STAGE_S`] -- **128x256 constants** -- at every tile, including the two
+/// narrow ones the tile lever exists to reach. At `sq1024`, where the rule picks 128x64, that priced
+/// a 9.05 us floor at 26.01 us and pushed `f_L2` from 0.795 down to 0.276: the dossier's own OFF
+/// verdict, reached by a factor-of-2.9 error rather than by the physics. [`tile_fixed_s`] and
+/// [`k_stage_s`] price the tile that was chosen, and [`cluster_l2_saving_threshold`] carries the
+/// break-even to it, so the OFF at sq1024 now survives for the reason WAVE3_DOSSIER 3.6 gives:
+/// `B` is the NARROW operand at 128x64 and multicasting it removes a sixth of the L2 read, not a
+/// third. WAVE3_DOSSIER 3.7's pseudocode carries the same shortcut (its comment says "at 128x256"
+/// out loud); this is where it is repaired rather than transcribed.
 pub fn wgmma_dispatch_plan(m: usize, n: usize, k: usize, sm_count: usize) -> DispatchPlan {
     let sm = sm_count.max(1);
     // 1. the widest tile whose wave efficiency clears the floor. The last candidate is taken
     //    unconditionally: something must run, and the narrowest tile is the one with the most tiles.
-    let (mut bm, mut bn) = *DISPATCH_TILES.last().expect("a non-empty tile menu");
+    let (mut bm, mut bn, mut stages) = *DISPATCH_TILES.last().expect("a non-empty tile menu");
     let (mut tiles, mut waves) = (0usize, 0usize);
     let mut wave_efficiency = 0.0f64;
-    for &(cbm, cbn) in DISPATCH_TILES {
+    for &(cbm, cbn, cstages) in DISPATCH_TILES {
         let t = m.div_ceil(cbm) * n.div_ceil(cbn);
         let w = t.div_ceil(sm).max(1);
         bm = cbm;
         bn = cbn;
+        stages = cstages;
         tiles = t;
         waves = w;
         wave_efficiency = t as f64 / (sm * w) as f64;
@@ -3056,13 +3204,19 @@ pub fn wgmma_dispatch_plan(m: usize, n: usize, k: usize, sm_count: usize) -> Dis
     };
     // 3. persistence: any multi-wave grid.
     let persistent = waves > 1;
-    // 4. the cluster, on the L2-roof fraction of the FINAL configuration.
+    // 4. the cluster, on what a B multicast would SAVE off the FINAL configuration's binding roof.
+    //    Both halves of that sentence are load-bearing and each was a defect once: the floor must be
+    //    THIS tile's floor (`tile_fixed_s`/`k_stage_s`, not the reference tile's constants applied to
+    //    another geometry -- that inflated sq1024's by 2.9x), and the comparand must be the saving,
+    //    because the multicast removes a third of the L2 term at 128x256 and a sixth at 128x64.
     let t_l2 = tiles as f64 * (bm + bn) as f64 * k as f64 * 2.0 / BW_L2;
-    let t_floor = waves as f64 * (TILE_FIXED_S + k.div_ceil(64) as f64 * K_STAGE_S);
+    let t_floor =
+        waves as f64 * (tile_fixed_s(bm, bn, stages) + k.div_ceil(64) as f64 * k_stage_s(bm, bn));
     let t_dram = dispatch_dram_bytes(m, n, k, bm, bn, sm, tiles, waves, group_m) / BW_HBM;
     let binding = t_floor.max(t_l2).max(t_dram);
     let f_l2 = if binding > 0.0 { t_l2 / binding } else { 0.0 };
-    let cluster = f_l2 >= CLUSTER_F_L2_THRESHOLD;
+    let l2_saving = f_l2 * multicast_l2_share(bm, bn);
+    let cluster = l2_saving >= cluster_l2_saving_threshold();
     DispatchPlan {
         bm,
         bn,
@@ -3075,6 +3229,7 @@ pub fn wgmma_dispatch_plan(m: usize, n: usize, k: usize, sm_count: usize) -> Dis
         wave_efficiency,
         linear_footprint_bytes,
         f_l2,
+        l2_saving,
     }
 }
 
@@ -3438,11 +3593,27 @@ pub const WGMMA_W1_V2_P: WgmmaCfg = WgmmaCfg {
 /// # Why the narrow tile, and why only there
 ///
 /// `sq1024` at 128x256 is `8 x 4 = 32` CTAs on 132 SMs: **24.2% of the device**, and no raster, no
-/// cluster and no persistence touches it -- one wave, `f_L2 = 0.17`, an 8.4 MB footprint. The only
-/// lever that exists is the tile. Narrowing to 128x64 gives `8 x 16 = 128` tiles, **97.0% of the
-/// device**, and working the full cost model (with `X` scaled to the resident CTA count, which is
-/// what makes the 128x256 row reproduce its measured 21.5 us to 7%) puts it at `T_floor = 7.94 us`
-/// against cuBLAS's 7.0 -- **~88% of the peer, from 32.3%**. 128x128 gets only halfway (~62%).
+/// cluster and no persistence touches it -- one wave, an 8.4 MB footprint, and a `B` operand too
+/// narrow for the multicast to pay (see below). The only lever that exists is the tile. Narrowing to
+/// 128x64 gives `8 x 16 = 128` tiles, **97.0% of the device**, and working the full cost model (with
+/// `X` scaled to the resident CTA count, which is what makes the 128x256 row reproduce its measured
+/// 21.5 us to 7%) puts it at `T_floor = 7.94 us` against cuBLAS's 7.0 -- **~88% of the peer, from
+/// 32.3%**. 128x128 gets only halfway (~62%).
+///
+/// [`tile_fixed_s`] is a touch more conservative than the dossier's 3.4 row (9.05 us of floor rather
+/// than 7.94, so ~77% rather than ~88%): it carries Fit B's 0.78 us prologue residual and a `S` on
+/// the high side of 3.4's `~0.165`, and it drops 0.4's resident-CTA correction to the fill, which at
+/// 128 of 132 CTAs is worth almost nothing anyway. The bracket is the round's to close; neither end
+/// changes a single dispatch verdict, which is the only thing the constant is load-bearing for.
+///
+/// # Why the cluster stays OFF here, on the mechanism rather than on a number
+///
+/// A `1x2x1` B multicast removes `(bn/2)/(bm+bn)` of a tile's L2 read -- **a third at 128x256, a
+/// sixth here** -- and `ACT2_WAVE_PLAN.md:5` chose the axis with the words "multicast the WIDER
+/// operand". At 128x64 `B` is the narrower operand, so the axis is on the wrong side and
+/// [`cluster_l2_saving_threshold`] declines it (0.132 of the roof against a 0.26 break-even) even
+/// though this shape is 79% L2-bound. Before the floor was made tile-aware the same OFF fell out of
+/// a 2.9x-inflated denominator instead, which is an accident wearing a verdict's clothes.
 ///
 /// It must NEVER be dispatched to a large shape: `I_cta = 128*64/(128+64) = 42.67` puts its L2 roof
 /// at 299 TFLOP/s, far below the 617-711 already measured at sq4096/sq8192. That is exactly what the
@@ -3774,7 +3945,8 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
         // raster's headline shape -- the one where the linear order needs 3.541 TB/s against a
         // 3.35 TB/s HBM peak -- and a headline measured without its own control at its own shape
         // is a number with nothing to be a difference from. Every shape but `sq1024`, where the
-        // cluster is provably off (f_L2 0.28) and this row would answer a question nobody asked.
+        // cluster is off (a multicast on the 128x64 tile's B saves 0.132 of the binding roof against
+        // a 0.26 break-even) and this row would answer a question nobody asked.
         shapes: &[
             "sq2048",
             "sq4096",
@@ -3906,10 +4078,14 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
         shapes: WGMMA_TILE_DISPATCH_SHAPES,
         why: "WAVE 3 LEVER 3, THE TILE ROW (128x64, a NEW m64n64k16 module family). sq1024 at \
               128x256 is 32 CTAs of 132 -- 24.2% of the device -- and NOTHING else in wave 3 \
-              touches it: one wave, so no raster and no persistence, and f_L2 = 0.17, so no \
-              cluster. At 128x64 it is 128 tiles = 97.0% of the device, T_floor 7.94 us against \
-              cuBLAS's 7.0: predicted ~88%, from a measured 32.3%, the largest single-shape number \
-              in the dossier. It is ALSO run at sq2048, where it must LOSE -- I_cta drops 85.33 -> \
+              touches it: one wave, so no raster and no persistence, and B is the NARROW operand at \
+              128x64 so a multicast saves 0.13 of the roof against a 0.26 break-even -- no \
+              cluster. At 128x64 it is 128 tiles = 97.0% of the device: T_floor 7.94 us against \
+              cuBLAS's 7.0 on the dossier's 3.4 extrapolation and 9.05 us on the dispatcher's own \
+              (which carries Fit B's prologue residual, the conservative end), so predicted 77-88% \
+              from a measured 32.3% -- the largest single-shape number in the dossier, and the \
+              round is what closes that bracket. It is ALSO run at sq2048, where it must LOSE -- \
+              I_cta drops 85.33 -> \
               42.67 and the L2 roof with it -- because that loss is what makes 'widest tile whose \
               wave efficiency clears 0.90' a rule instead of a fit to one point",
     },
@@ -10963,6 +11139,154 @@ mod tests {
         );
     }
 
+    /// **The per-tile floor decomposes into the halves that were MEASURED, and prices the tile it is
+    /// asked about rather than the one the fits were run at.**
+    ///
+    /// `T_floor` is the denominator of the cluster decision, and it was computed from the 128x256
+    /// [`TILE_FIXED_S`] / [`K_STAGE_S`] at every tile the menu can select. At `sq1024`, where the
+    /// rule picks 128x64, that priced a 9.05 us floor at 26.01 us -- **2.9x** -- and pushed `f_L2`
+    /// from 0.795 to 0.276. The verdict happened to survive, which is worse than if it had not: a
+    /// four-digit pin then made the wrong number load-bearing.
+    ///
+    /// The law has four parts, and each catches a different way the repair could rot. (i) The
+    /// decomposition sums to Fit B's measured `X`, so the three terms cannot drift apart from the
+    /// number they decompose. (ii) The two functions are the IDENTITY at [`FLOOR_REF_TILE`], which
+    /// is what keeps all six 128x256 verdicts exactly where the dossier's 3.2 column put them.
+    /// (iii) The per-k-stage extrapolation lands inside WAVE3_DOSSIER 3.4's own `~0.337` / `~0.165`
+    /// and on the conservative side of them. (iv) Reassembling the dossier's `X(sq1024) = 8.65`
+    /// from these three terms works -- the check that this is the dossier's model and not a second
+    /// one that happens to agree on verdicts.
+    #[test]
+    fn the_per_tile_floor_decomposes_into_its_measured_halves() {
+        let (rbm, rbn, rst) = FLOOR_REF_TILE;
+        // (i) the decomposition IS Fit B's X: fill + epilogue + the prologue residual.
+        let sum = X_FILL_PER_STAGE_S * rst as f64 + X_EPI_S + X_PROLOGUE_S;
+        assert!(
+            (sum - TILE_FIXED_S).abs() < 1e-12,
+            "the three terms sum to {:.4} us, Fit B measured {:.4}",
+            sum * 1e6,
+            TILE_FIXED_S * 1e6
+        );
+        // (ii) identity at the reference tile -- this is what makes the fix verdict-neutral there.
+        assert!((tile_fixed_s(rbm, rbn, rst) - TILE_FIXED_S).abs() < 1e-12);
+        assert!((k_stage_s(rbm, rbn) - K_STAGE_S).abs() < 1e-12);
+        // (iii) the per-k-stage extrapolation, against WAVE3_DOSSIER 3.4's `~0.337` and `~0.165`.
+        //       Those two ARE this quantity, and the model must land inside their tildes -- on the
+        //       conservative (higher-floor) side, so no verdict is bought with an optimistic S.
+        for (bm, bn, s_dossier) in [(128usize, 128usize, 0.337e-6), (128, 64, 0.165e-6)] {
+            let s = k_stage_s(bm, bn);
+            assert!(
+                s >= s_dossier && (s - s_dossier) / s_dossier < 0.08,
+                "{bm}x{bn}: S is {:.4} us, the dossier's 3.4 row says ~{:.3}",
+                s * 1e6,
+                s_dossier * 1e6
+            );
+            // ...and strictly cheaper than the reference tile it is narrower than, which is the
+            // whole content of the defect: the old code charged every tile the widest tile's price.
+            let stages = DISPATCH_TILES
+                .iter()
+                .find(|t| (t.0, t.1) == (bm, bn))
+                .expect("a menu tile")
+                .2;
+            assert!(tile_fixed_s(bm, bn, stages) < TILE_FIXED_S, "{bm}x{bn}");
+        }
+        // (iv) the reconciliation that shows the decomposition is the DOSSIER'S and not a second
+        //      one. 0.4 corrects `X` at `sq1024` by scaling the FILL alone to the resident CTA
+        //      count -- `7.85 * 32/132 = 1.90`, `X = 8.65` -- because the fill is a device-bandwidth
+        //      event and the epilogue and prologue are not. Reassembling that from these three
+        //      terms lands on 8.67. (3.4's `~5.8` / `~5.3` column is the same correction applied at
+        //      the narrow tiles and is therefore NOT `tile_fixed_s`'s quantity; this model
+        //      deliberately drops the residency term, see the function's own doc.)
+        let sq1024_x = X_EPI_S + X_PROLOGUE_S + X_FILL_PER_STAGE_S * rst as f64 * 32.0 / 132.0;
+        assert!(
+            (sq1024_x - 8.65e-6).abs() < 0.05e-6,
+            "the dossier's own X(sq1024, 128x256) is 8.65 us; this decomposition gives {:.2}",
+            sq1024_x * 1e6
+        );
+    }
+
+    /// **The dispatch menu is a menu of SHIPPED geometries** -- `(bm, bn, stages)` triples this
+    /// family actually emits, not three shapes with a stage depth invented beside them.
+    ///
+    /// The depth is in the menu because [`tile_fixed_s`]'s ring-fill term is `stages * (bm+bn)` of
+    /// SMEM: a menu carrying only the tile shape would price the 6-stage square tile at 4 stages of
+    /// fill and under-charge its floor by a third. That makes the depth a number the cluster verdict
+    /// depends on, and a number the verdict depends on must not be free -- so every row is asserted
+    /// against a real emittable module's own `(bm, bn, stages)`.
+    #[test]
+    fn the_dispatch_menu_is_a_menu_of_shipped_geometries() {
+        for &(bm, bn, stages) in DISPATCH_TILES {
+            let hit = wgmma_all_emittable().into_iter().find(|c| {
+                c.bm == bm && c.bn == bn && c.stages == stages && c.dtype == WgmmaDtype::F16
+            });
+            assert!(
+                hit.is_some(),
+                "the dispatcher may select {bm}x{bn} at {stages} stages and nothing emits that \
+                 geometry, so its floor -- and through the floor its cluster verdict -- would be \
+                 priced at a depth no module has ever assembled"
+            );
+        }
+        // The menu is widest-first, which is what makes "take the first that clears the floor" mean
+        // "take the WIDEST that clears it".
+        for w in DISPATCH_TILES.windows(2) {
+            assert!(w[0].1 > w[1].1, "the menu must be widest-first: {w:?}");
+        }
+    }
+
+    /// **The cluster predicate compares what the multicast SAVES, not the L2-roof fraction** -- and
+    /// the two are one comparison only at the tile the 0.78 was fitted at.
+    ///
+    /// WAVE3_DOSSIER 3.2 fits its threshold to a sign flip measured at `sq2048` / `sq4096` / `sq8192`
+    /// -- **three 128x256 rows**, where halving the 256-wide `B` removes a third of the tile's L2
+    /// read. The tile lever then made narrower tiles reachable, where the same multicast removes a
+    /// quarter (128x128) or a sixth (128x64), and the campaign's own spine sentence is why:
+    /// `ACT2_WAVE_PLAN.md:5` chose this axis with the words "multicast the WIDER operand", and at
+    /// 128x64 `B` is the narrow one.
+    ///
+    /// So the predicate is `f_L2 * share >= 0.78 * 1/3`. This law pins the identity at the reference
+    /// tile (which is what leaves the dossier's six 128x256 verdicts untouched) and pins the
+    /// consequence at the two narrow ones: **even a perfectly L2-bound shape declines the cluster
+    /// there**, by 4% at 128x128 and 33% at 128x64. A revert to the bare `f_L2 >= 0.78` fails the
+    /// second half at `sq1024`.
+    #[test]
+    fn the_cluster_predicate_is_the_saving_and_not_the_roof_fraction() {
+        let (rbm, rbn, _) = FLOOR_REF_TILE;
+        assert!((multicast_l2_share(rbm, rbn) - 1.0 / 3.0).abs() < 1e-12);
+        assert!((multicast_l2_share(128, 128) - 0.25).abs() < 1e-12);
+        assert!((multicast_l2_share(128, 64) - 1.0 / 6.0).abs() < 1e-12);
+        // At the reference tile the two spellings are the same comparison, exactly.
+        let bar = cluster_l2_saving_threshold();
+        assert!((bar - CLUSTER_F_L2_THRESHOLD / 3.0).abs() < 1e-12);
+        for f_l2 in [0.0, 0.5, 0.7799, 0.78, 0.9, 1.0] {
+            assert_eq!(
+                f_l2 * multicast_l2_share(rbm, rbn) >= bar,
+                f_l2 >= CLUSTER_F_L2_THRESHOLD - 1e-12,
+                "f_L2 {f_l2}: the two spellings must agree at 128x256"
+            );
+        }
+        // ...and at every NARROWER tile the multicast cannot clear the bar even at `f_L2 = 1.0`,
+        // which is the ceiling of a ratio to its own denominator's max. That is the whole reason
+        // sq1024's OFF no longer depends on a mis-priced floor.
+        for (bm, bn) in [(128, 128), (128, 64)] {
+            assert!(
+                multicast_l2_share(bm, bn) < bar,
+                "{bm}x{bn}: a fully L2-bound shape saves {:.4} against a {:.4} break-even, so the \
+                 cluster must decline",
+                multicast_l2_share(bm, bn),
+                bar
+            );
+        }
+        // sq1024 is that statement as a verdict: 79% L2-bound at the tile the rule picks, cluster
+        // off. Under the bare `f_L2 >= 0.78` it would be ON, and there is no clustered 128x64 module
+        // for it to land on.
+        let p = wgmma_dispatch_plan(1024, 1024, 1024, HOPPER_SM_COUNT);
+        assert_eq!((p.bm, p.bn), (128, 64));
+        assert!(
+            p.f_l2 >= CLUSTER_F_L2_THRESHOLD && !p.cluster,
+            "the shape the generalisation exists for: {p:?}"
+        );
+    }
+
     /// **WAVE 3 lever 3, law (a): the dispatcher's verdict is PINNED at every benched shape.**
     ///
     /// The dossier states this as a law on the dispatcher itself, and the reason is guard G3 in a
@@ -10976,7 +11300,11 @@ mod tests {
     /// reproduces its 3.2 column: 0.955 at `gpt_d4096_up` (the shape whose cluster decision the
     /// raster FLIPS, evaluated on the post-raster configuration exactly as the dossier requires),
     /// 0.55 at `gpt_d1024_up`, and 0.769 at `sq2048` -- the last of which is the tightest call in
-    /// the table at 1.4% below the 0.78 threshold, which is why it is asserted to three digits.
+    /// the table at 1.4% below the 0.78 threshold, which is why it is asserted to four digits.
+    ///
+    /// Six of the seven rows are 128x256, where the predicate `saving >= 0.26` IS the dossier's
+    /// `f_L2 >= 0.78` (the share is exactly 1/3), and the test asserts that identity rather than
+    /// leaving a reader to check it. `sq1024` is the seventh, and the one the tile-aware floor moved.
     #[test]
     fn the_dispatcher_verdict_is_pinned_at_every_benched_shape() {
         struct Pin {
@@ -11006,7 +11334,20 @@ mod tests {
         let want = [
             // sq1024: the ONLY shape the tile lever moves. 128x256 is 32 CTAs of 132 (24.2% of the
             // device); 128x64 is 128 tiles = 97.0%, and no other lever fires -- one wave, so no
-            // raster and no persistence, and f_L2 0.28, so no cluster.
+            // raster and no persistence.
+            //
+            // Its f_L2 is 0.795, NOT the 0.276 this pin carried until the floor was made tile-aware:
+            // the old `t_floor` priced this 128x64 tile with 128x256 constants (26.01 us against a
+            // real 9.05) and the OFF verdict fell out of that 2.9x inflation. The cluster is still
+            // off, now for the mechanism -- at 128x64 `B` is the NARROW operand, so the multicast
+            // removes a sixth of the L2 read and saves 0.132 of the binding roof against a 0.26
+            // break-even. This row is the whole reason the predicate is the SAVING and not `f_L2`.
+            //
+            // It is not the dossier's 3.6 figure of 0.167 either, and should not be: that number is
+            // sq1024's f_L2 at **128x256**, the tile the dispatcher does not pick. 3.6 quotes it in
+            // a row whose own tile column reads 128x64 -- the dossier crossing its own wires -- and
+            // 3.2's standing instruction settles which one this is: evaluate on the FINAL
+            // configuration, never on a measurement of an earlier one.
             pin(
                 "sq1024",
                 128,
@@ -11016,7 +11357,7 @@ mod tests {
                 false,
                 1,
                 false,
-                0.2764,
+                0.7947,
                 &WGMMA_W3D_V2,
             ),
             // sq2048 gets NOTHING from wave 3, and that is a finding: one wave (raster and
@@ -11131,6 +11472,32 @@ mod tests {
                 plan.f_l2,
                 w.f_l2
             );
+            // The predicate's comparand is the SAVING, and at the reference tile it is the
+            // dossier's own `f_L2 >= 0.78` -- assert the identity where it holds, and assert the
+            // verdict is the saving's everywhere. Without the first half a later edit could drift
+            // the six 128x256 rows away from the dossier's 3.2 column and nothing would notice;
+            // without the second, sq1024's OFF could go back to riding on a mis-priced floor.
+            assert!(
+                (plan.l2_saving - plan.f_l2 * multicast_l2_share(plan.bm, plan.bn)).abs() < 1e-12,
+                "{}: the saving must be f_L2 x the tile's multicast share",
+                w.label
+            );
+            assert_eq!(
+                plan.cluster,
+                plan.l2_saving >= cluster_l2_saving_threshold(),
+                "{}: the verdict is the saving's, not f_L2's",
+                w.label
+            );
+            let (rbm, rbn, _) = FLOOR_REF_TILE;
+            if (plan.bm, plan.bn) == (rbm, rbn) {
+                assert_eq!(
+                    plan.cluster,
+                    plan.f_l2 >= CLUSTER_F_L2_THRESHOLD,
+                    "{}: at the tile the threshold was FITTED at, the two spellings are one \
+                     comparison and the dossier's 3.2 column must decide it",
+                    w.label
+                );
+            }
             // WAVE3_DOSSIER 0.3's closed form: for any power-of-two tile count in [128, 4096],
             // `ceil(T/132)*132 = T*33/32` exactly, so EVERY shape in this suite lands on the same
             // 32/33 wave efficiency and quantization is a flat 3.03% that no lever in wave 3
@@ -11254,13 +11621,47 @@ mod tests {
             "the decline must name the configuration it wanted, or an operator cannot tell \
              whether the rule or the menu is wrong: {why}"
         );
-        // ...and the square tile's clustered v2 row, which wave 3 lever 4 added as the depth
-        // diagnostic's control, CLOSED the decline this test used to exercise. That is worth
-        // asserting rather than deleting: a `(128x128, cluster ON, one tile per CTA)` verdict is
-        // reachable from a long-K skinny-N shape and now resolves.
-        let sq = wgmma_dispatch(128 * 65, 256, 240 * 64, HOPPER_SM_COUNT)
-            .expect("the 128x128 clustered v2 row makes this verdict emittable");
-        assert_eq!(sq.key, WGMMA_W3C_MCB_V2.key);
+        // --- 5. THE SQUARE TILE IS UNCLUSTERABLE, and by a margin worth printing ------------------
+        // A long-K skinny-N shape reaches 128x128 and is FULLY L2-bound there (t_l2 146.05 us
+        // against a 97.13 us floor, so f_L2 = 1.000). It still declines the cluster, because a B
+        // multicast at a square tile removes only `(bn/2)/(bm+bn)` = 1/4 of the L2 read against the
+        // 0.26 the 128x256 break-even was fitted at. 0.25 < 0.26: the margin is 4%, which is inside
+        // everything this campaign has measured, so this is a REFUSAL and not a result -- the rule
+        // declines rather than guessing, and a round that measures the cluster at 128x128 is what
+        // would move it.
+        //
+        // Before the floor was tile-aware this verdict read `f_L2 = 0.787` -- ON by 0.9% -- off a
+        // floor that priced a 6-stage 128x128 tile with 4-stage 128x256 constants (185.63 us against
+        // a real 97.13). Both numbers were wrong and they cancelled into a plausible verdict, which
+        // is the exact failure mode a boundary test exists to catch.
+        let sq = plan(128 * 65, 256, 240 * 64);
+        assert_eq!((sq.bm, sq.bn), (128, 128));
+        assert!(
+            (sq.f_l2 - 1.0).abs() < 1e-9 && !sq.cluster,
+            "fully L2-bound and still un-clustered: {sq:?}"
+        );
+        let margin = cluster_l2_saving_threshold() - sq.l2_saving;
+        assert!(
+            margin > 0.0 && margin < 0.011,
+            "state the margin as a margin -- it saves {:.4} against a {:.4} break-even, i.e. it \
+             misses by {:.4}",
+            sq.l2_saving,
+            cluster_l2_saving_threshold(),
+            margin
+        );
+        // ...so the verdict is `(128x128, cluster off, one tile per CTA, v2)`, and NOTHING emits it:
+        // every square-tile row this family ships carries the cluster (it exists as wave 3 lever 4's
+        // depth-diagnostic control) or the scalar store. The rule must SAY so. Closing it is one
+        // `WGMMA_W3C_V2` row plus a module-count bump, and it is deliberately not spent: no shape in
+        // the suite reaches the square tile, and a module nothing measures is a module nothing has
+        // ever assembled.
+        let why = wgmma_dispatch(128 * 65, 256, 240 * 64, HOPPER_SM_COUNT)
+            .expect_err("no un-clustered 128x128 v2 row exists, so the rule must DECLINE");
+        assert!(why.starts_with(UNSUPPORTED), "{why}");
+        assert!(
+            why.contains("128x128 tile") && why.contains("cluster off"),
+            "the decline must name the configuration it wanted: {why}"
+        );
     }
 
     /// **WAVE 3 lever 3, law (b): every verdict the dispatcher can reach at a benched shape is a
