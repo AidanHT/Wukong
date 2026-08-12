@@ -7,8 +7,36 @@ It is the north star for optimization work: a change that doesn't move one of th
 `BENCHMARKS.md` and `prompts/results/*`; absolute GFLOP/s are deliberately absent (this
 hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-roofline are stable).
 
-> **Device scope (2026-08-06, extended 2026-08-09):** every GPU figure in this document (they appear
-> under M1, M2, M4, M7 and the improvement targets) was measured on an **NVIDIA RTX 4050 Laptop GPU**
+> **Two GPUs now, and they do not mix (2026-08-11).** The **H100 (`sm_90a`)** figures — the
+> wgmma-vs-cuBLAS suite under M1, the H100 HBM figure, and the Hopper quantized standings — were
+> measured on an **NVIDIA H100 80GB HBM3** (Hopper, 132 SMs, 50 MiB L2, Linux container, cuBLAS with
+> **f32 output** as the peer), 2026-08-11, logs `bench/gpu/h100/2026-08-11-h100-w2-r*.log` — plus
+> one previous-visit round on the same part, `2026-08-10-h100-act2-wgmma-vs-cublas.log`, which
+> supplies the single cross-visit figure below (f16's scalar baseline) — section
+> `BENCHMARKS.md` → *GPU backend (NVIDIA H100 80GB HBM3, `sm_90a`)*. **Every other GPU figure in this
+> document is an RTX 4050 figure** (scope note immediately below). Do not average the two, and do not
+> carry a conclusion across: this visit measured that transfer failing outright — the 4050's int8
+> tuning, which reaches 96–105% of cuBLAS IMMA at 2048³ *there*, reads **22–52%** of IMMA on the
+> H100. **Every H100 figure in this document is ITERATION-grade, not publication-grade, and is
+> recorded under that label:** the rounds ran in a Modal container whose user cannot call
+> `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 rules that "Container rounds are *iteration*
+> data; VM rounds are *publication* data" — each of the eleven 2026-08-11 rounds records the refusal
+> itself (`[clock] lock: refused (…); running unlocked`), and five of them also stamp themselves
+> `ITERATION data, not publication data` in an all-caps banner; `BENCHMARKS.md` names which five, and
+> why the K-sweep and the four non-GEMM rounds carry only the `[clock]` line. The one previous-visit
+> round cited below — for f16's 61.7% scalar baseline — is older than that wrapper line and has no
+> `[clock]` record at all; it prints the all-caps banner instead, so it is ITERATION-labelled by the
+> stronger of the two records rather than the weaker. The label here is this
+> document's, applied uniformly because the premise every round records is uniform.
+> In place of the lock each round recorded its own before/after clocks and **two
+> rounds refused themselves** on +6.82% drift; one shape refused on a ±15.47% *peer* floor, and those
+> refusals are printed in `BENCHMARKS.md` as results. A drift gate is the weaker instrument, though —
+> it sees a clock that *changed*, not one parked at the wrong steady state for the whole round — so
+> **treat every H100 percentage below as provisional pending a locked-clock root-VM re-run**, which
+> is owed and unscheduled.
+>
+> **Device scope (2026-08-06, extended 2026-08-09):** every *other* GPU figure in this document (they
+> appear under M1, M2, M4, M7 and the improvement targets) was measured on an **NVIDIA RTX 4050 Laptop GPU**
 > (Ada, `sm_89`, **20 SMs**, 6 GB, **~192 GB/s**, power-capped ~30–50 W) under **Windows/WDDM**, with
 > only the peers that box can host: cuBLAS / IMMA / cuBLASLt and cuDNN via the redistributable DLLs,
 > NVRTC-compiled CUDA-C, PyTorch in **eager** mode (Triton does not install on Windows), and **no
@@ -87,6 +115,38 @@ Current standing (recorded):
   itself swings ~1.4–2× with power state, so only same-run ranges are quoted). Skinny transformer
   NT shapes **75–112% of MKL-all** (4/6 at or above parity; worst 128×768·768ᵀ 75–80%,
   overhead-bound at 151 MFLOP). int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
+- *Compute-bound, GPU (H100 80GB HBM3, `sm_90a`, 2026-08-11 — **iteration-grade**: container round,
+  clocks unlockable, plan §6.3)*: the `wgmma` + TMA GEMM measures
+  **95.3% / 88.6% / 92.3% of cuBLAS f16 (f32 out) at 2048³ / 4096³ / 8192³**, **97.3%** on the GPT
+  FFN down-projection (4096×1024×4096) and **73–80%** on the wide-N up-projections; bf16 under the
+  same rule agrees within ~2 points on every shape that resolved in both. **1024³ f16 is REFUSED**
+  — the peer's own twin arms disagreed by ±15.47%, over the ±5% bar, so no number was minted (bf16
+  resolved there and reads 49.5%, a 32-CTA problem on 132 SMs). The dominant lever was the fused
+  `st.global.v2.f32` epilogue (**+25.2 / +15.3 / +10.1 points** at the three square shapes — the only
+  single-axis reading of it, and on the *clustered* arm). **The suite-level move behind it is a bf16
+  pair**, the only dtype measured both before and after in this visit: **60.8% → 87.3%** over the six
+  resolvable shapes. f16's after is **87.9%**; its scalar baseline is the *previous* visit's round
+  (**61.7%**, `2026-08-10-h100-act2-wgmma-vs-cublas.log`), so the f16 pair is **cross-visit**. Either
+  suite-level move also carries the
+  B-multicast cluster at four of the seven shapes, so it is not a single-axis number. A store-elided *diagnostic* arm (writes
+  no C, ungateable, read only as a difference against the **clustered scalar** arm it was cut from) sits at
+  **114.0 / 101.1 / 101.8%** **at the three square shapes it was run on — and nowhere else**, so the
+  mainloop is at or above the peer *there* and what is still owed *there* is epilogue plus wave
+  overhead. Where the gap sits on the three `gpt_*` FFN shapes, including the 73.4% worst row, is
+  **unmeasured**: no elided arm was ever run on them. **The GEMM
+  readings above went through the instrument; the ones that follow did not** — they are single-shot
+  rounds with no provenance header, no A/C peer twin, no measured floor, no median-of-5 and no
+  publish gate, and a repeat under the instrument is owed. Memory-bound
+  on the same part: copy **2922 GB/s = 87.2% of the 3352 GB/s spec peak** (≥90% not met). Quantized:
+  the **fused int8 GEMM+dequant beats the cuBLAS GEMM+dequant chain 1.08× at 1024³ and 1.15× at
+  2048³** — the first outright peer win on Hopper — and **loses at 4096³ (0.79×)**, because the int8
+  GEMM underneath it is itself only **22–52% of cuBLAS IMMA** here: the 4050's tile/occupancy tuning
+  does not transfer and Hopper int8 needs its own search. (Both of those are still *same-run*, and
+  the int8 arms are bit-for-bit gated against the `i32` oracle before timing; what they lack is the
+  twin, the floor and the gate.) Peer-bar fact, not a Wukong number:
+  cuBLASLt on this device fuses RELU/GELU/BIAS at **both** f32 and f16 output, so only **SiLU** (and
+  residual+activation) is absent from its epilogue enum. Full section and per-round log citations in
+  `BENCHMARKS.md`.
 - *Compute-bound, GPU (RTX 4050, sm_89)*: fp16/bf16 GEMM ~101% cuBLAS ≤1024³, **~87–90% at
   2048³; the 4096³ GEMM ships the v2cs streaming epilogue at 76.8% of cuBLAS-f16 / 80.4% of the
   honest f32-out peer** (a SASS-level loss past the prior 77% PTX ceiling — see below); int8 GEMM
@@ -266,6 +326,28 @@ Remaining, ranked:
    75–80%) and a clean verified-AC full-cube table (the 2026-07-11 attempt hit battery mid-run).
    Shared-pack, mid-pool, persistent-region, and fork-join alternatives are all measured/refuted
    in gemm.rs — a genuinely new decomposition idea is required for further mid-size gain.
-2. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
+2. **The H100 GEMM epilogue and wave overhead** — the measured Hopper gap, and the only one whose
+   location is *partly* isolated. **Scope the diagnostic to where it ran:** the store-elided arm
+   exists at exactly three shapes — sq2048 / sq4096 / sq8192, at 114.0 / 101.1 / 101.8% of cuBLAS —
+   and it is the *clustered* `..._s4_mcb2` arm with its stores elided, which is the reference both
+   `r3-config-sweep.log` and the generator name (`{ epilogue: ElidedDiagnostic, ..WGMMA_W1_MCB }`).
+   Against that scalar arm's 62.2 / 73.4 / 81.9% it prices the *scalar* epilogue at 51.8 / 27.7 / 19.9
+   points; `BENCHMARKS.md` additionally reads it against the shipped `_v2` arm's 87.4 / 88.7 / 92.0%
+   for 26.6 / 12.4 / 9.8 — a pairing no log prints, sound because `WGMMA_W1_MCB_V2` differs from
+   `WGMMA_W1_MCB` only in the `epilogue` field, and checkable because the two decompositions differ by
+   exactly the store's measured +25.2 / +15.3 / +10.1.
+   At sq4096 and sq8192 the clustered arm is what ships and the conclusion
+   carries: the mainloop is at or above the peer, so the **11.4 and 7.7 points** still owed on those
+   two published rows are epilogue plus wave overhead, not the inner loop. **The diagnostic reaches no
+   further than those three square shapes: the two FFN endpoints —
+   gpt_d1024_down at 97.3% and gpt_d4096_up at 73.4% — had no nostore arm run on them at all**
+   (`r3-config-sweep.log` sweeps only the three square shapes; the gpt rows exist only in
+   `r10-vs-cublas-v2rule.log`, a round with no elided arm), so where *their* gap sits is unmeasured
+   and the 73.4% row in particular is the one worth measuring first. Two further measured holes sit
+   beside it: **1024³ is unresolvable in f16** against this peer at the ±5% bar (the peer's own floor
+   is ±15.47%, so that shape needs a different measurement, not a different kernel), and **Hopper
+   int8 is 22–52% of cuBLAS IMMA** because the 4050's tile search does not transfer. Everything past
+   that is planning, not measurement — `docs/roadmap.md` and `docs/gpu/derive/`.
+3. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
    tensors (M6; **file I/O now runs** — typed read/write blobs, interp == native).
-3. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).
+4. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).

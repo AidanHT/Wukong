@@ -109,7 +109,38 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   int8 GEMM **~180–237× naive CUDA-C**, **95.7% of the 192 GB/s HBM peak**, and **0.76 ms cold GPU
   compile vs Triton's 30–120 s**.
 
-  > **Device scope (2026-08-06, extended 2026-08-09):** every GPU figure in the bullet above was
+  On a **datacenter part** — an **NVIDIA H100 80GB HBM3** (`sm_90a`, 132 SMs), measured 2026-08-11,
+  a *different device* from every figure above — the `wgmma` + TMA GEMM measures **95.3% / 88.6% /
+  92.3% of cuBLAS f16 (f32 out) at 2048³ / 4096³ / 8192³** and **97.3%** on the GPT FFN
+  down-projection, **but only 80.3% and 73.4% on the two wide-N FFN up-projections** (`4096×4096×1024`
+  and `4096×16384×4096`) — that is the whole f16 suite, six resolved rows, mean ≈88%. **1024³ is
+  refused** because the peer's own twin arms disagreed by ±15.47%. bf16 tracks f16 within ~2 points
+  on every shape that resolved in both, **except 1024³, where it resolves and reads 49.5%** — a
+  32-CTA problem on 132 SMs. HBM copy reaches **87.2% of the 3352 GB/s spec peak** (the campaign's
+  ≥90% milestone is *not* met); and the **fused int8 GEMM+dequant beats the
+  cuBLAS GEMM+dequant chain 1.08–1.15× at 1024³/2048³** (the first outright peer win on Hopper — it
+  loses at 4096³, 0.79×). The GEMM figures went through the twin-controlled instrument; **the HBM and
+  int8 figures did not** — those are single-shot rounds, labelled as such in `BENCHMARKS.md`.
+
+  > **Device scope (2026-08-11) for the H100 paragraph:** those figures are **H100 80GB HBM3**
+  > figures (Hopper, `sm_90a`, 132 SMs, 50 MiB L2, Linux container, cuBLAS with f32 output as the
+  > peer) and the 4050 figures above are not — **do not average them or carry a conclusion between
+  > them.** This visit measured that transfer failing: the 4050's int8 tuning, 96–105% of cuBLAS IMMA
+  > at 2048³ there, reads 22–52% of IMMA on the H100. **They are also iteration-grade, not
+  > publication-grade, and are published under that label:** the container could not lock clocks, and
+  > `GPU_RETARGET_PLAN.md` §6.3 says container rounds are *iteration* data while VM rounds with
+  > `nvidia-smi -lgc` pinned are *publication* data — every round behind these figures records the
+  > refusal itself (`[clock] lock: refused (…); running unlocked`), and five of them go further and
+  > stamp themselves `ITERATION data, not publication data` in an all-caps banner (`BENCHMARKS.md`
+  > names which five, and why the rest carry only the `[clock]` line). Instead of a lock each round
+  > recorded its own before/after clocks and
+  > refused itself on drift — **two rounds did**, and those refusals are published — but a drift gate
+  > catches a clock that *moved*, not one parked at the wrong steady state, so treat every percentage
+  > above as provisional pending a locked-clock VM re-run. Per-shape tables, the mechanism, and a log
+  > citation for every number are in `BENCHMARKS.md` → *GPU backend (NVIDIA H100 80GB HBM3,
+  > `sm_90a`)*; the raw rounds are `bench/gpu/h100/2026-08-11-h100-w2-r*.log`.
+
+  > **Device scope (2026-08-06, extended 2026-08-09):** every *other* GPU figure in the bullet above was
   > measured on an **NVIDIA RTX 4050 Laptop GPU** (Ada, `sm_89`, **20 SMs**, 6 GB, **~192 GB/s**,
   > power-capped ~30–50 W) under **Windows/WDDM**, with only the peers that box can host — cuBLAS /
   > IMMA / cuBLASLt and cuDNN via the redistributable DLLs, NVRTC-compiled CUDA-C, and PyTorch in
