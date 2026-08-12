@@ -138,7 +138,7 @@ jobs:
       # wgmma family ran" from "it declined and the pre-Hopper launcher ran". Every one of those rules is
       # a pure function of a capability and a shape, tested as such in `gpu_accel::tests` — and every one
       # was dark: `cargo test --workspace` above does not pass `--features gpu` (the crate reports 20
-      # tests instead of 38), and the two steps above are `check`/`clippy`, which compile a test without
+      # tests instead of 47), and the two steps above are `check`/`clippy`, which compile a test without
       # running it. Deleting the odd-N decline, the f16 range decline or the route witness left all of CI
       # green. The measured delta is the whole safety net, so it gets a runner.
       #

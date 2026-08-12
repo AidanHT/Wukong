@@ -953,5 +953,5 @@ Those are pure functions of a capability and a shape, so `cargo test -p wukong_d
 --lib` runs them anywhere; the six end-to-end gates in the same crate `[skip]` without a device. That
 command is its own required gate step and a CI step in the `gpu-check` job, because nothing else
 reaches it: the workspace `cargo test` never passes `--features gpu` (the crate reports 20 tests
-instead of 38), the device suite is scoped `-p wukong_codegen_gpu`, and `check`/`clippy` compile a
+instead of 47), the device suite is scoped `-p wukong_codegen_gpu`, and `check`/`clippy` compile a
 test without running it.
