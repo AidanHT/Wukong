@@ -34,9 +34,28 @@ boundary.
 >
 > **None of them appears in this dossier as an H100 expectation.** Where a 4050 number is quoted it
 > is quoted as a *mechanism* -- "the step was launch-bound at depth 1 and compute-bound at depth 12"
-> -- never as a size. Every H100 number below is derived from H100 facts only: 132 SMs, 232,448 B
-> opt-in SMEM, 52,428,800 B L2, 85,017,624,576 B VRAM, and the three bandwidths of
-> `2026-08-11-h100-w2-r5-hbm.log:50-53`. Two H100 denominators this wave needs **do not exist yet**;
+> -- never as a size. Every H100 number below is derived from H100 facts only, and this is the
+> **whole** list of them -- eight, in three classes, because a list that says "only" has to be
+> closed:
+>
+> * **Probed on the device**, by the instrument's own provenance block: 132 SMs, 232,448 B opt-in
+>   SMEM, 52,428,800 B L2, 85,017,624,576 B VRAM (section 1.1's first five rows).
+> * **Measured in a round log**: the three bandwidths of `2026-08-11-h100-w2-r5-hbm.log:50-53`, and
+>   `BW_L2 = 7.00 TB/s` -- which is measured rather than derived, but *indirectly*: it is what
+>   `gpt_d1024_down`'s 597.6 TFLOP/s implies through `I_cta = 85.33` (`ACT2_WAVE_PLAN.md:5`, carried
+>   as a fact by `WAVE3_DOSSIER.md:28`). It does exactly one job here -- 10.1's two ping-pong L2
+>   roofs, restated in 10.5 and in section 13 -- and no byte budget divides by it.
+> * **Not measured anywhere in this campaign**, and therefore quoted with that stamp on it every
+>   time: the **989 TFLOP/s** dense-f16 tensor peak, which is a *spec-sheet* denominator
+>   (`WAVE3_DOSSIER.md:30` sources it as the number that "reproduces the plan's 57.2% / 84.8%
+>   peak-fractions exactly", i.e. it is what those fractions were taken against). Section 4.2 states
+>   the band the repo's own measured f16 figure gives instead, and every claim that turns on it
+>   carries both ends. Likewise the **256 KB unified L1/SMEM per SM** used once, in 5.4's
+>   reuse-distance argument: **FACT(ext)**, the Hopper whitepaper's SM figure, of which the probed
+>   232,448 B opt-in SMEM is the shared-memory share. Nothing is sized by either one; 5.4's
+>   conclusion is a *distance* argument with a stated falsifier.
+>
+> Two H100 denominators this wave needs **do not exist yet**;
 > section 1.4 names them and section 12.4 prices the measurement that creates them.
 
 ---
@@ -66,7 +85,13 @@ below M = 338 the decode GEMM's roof is `M x BW`, in which no tile shape appears
 
 ### 1.1 H100 facts this wave may divide by
 
-**FACT(repo)**, all of it printed by the instrument's own provenance block:
+**FACT(repo)**, and the `source` column is the authority per row rather than any blanket sentence
+over it -- **eight of these fifteen rows do not come from the instrument's provenance block.** The
+first seven do: device through clock lock are the provenance lines the r3 round printed before it
+timed anything. The four bandwidth rows come out of `hbm_bandwidth`'s own test output, in a
+*different* log. And the last four are not device measurements at all: `BW_L2` is inferred from a
+TFLOP/s through an `I_cta`, 989 TFLOP/s is a spec-sheet denominator, 256 KB is FACT(ext), and the
+suite mean is a published table's summary. Read the row, not the lead-in:
 
 | fact | value | source |
 |---|---|---|
@@ -81,7 +106,9 @@ below M = 338 the decode GEMM's roof is `M x BW`, in which no tile shape appears
 | **copy (2N r+w), measured** | **2922.3 GB/s = 87.2% of peak** | same log, `:51` |
 | saxpy (3N triad), measured | 2567.0 GB/s = 76.6% | same log, `:52` |
 | reduce (1N read-only), measured | **682.1 GB/s = 20.3%** | same log, `:53` |
+| `BW_L2`, measured indirectly (597.6 TFLOP/s through `I_cta = 85.33`) | 7.00 TB/s | `ACT2_WAVE_PLAN.md:5`, carried as a fact by `WAVE3_DOSSIER.md:28` |
 | dense f16 tensor peak (campaign denominator) | 989 TFLOP/s | `WAVE3_DOSSIER.md:30` |
+| unified L1/SMEM per SM (**FACT(ext)**, used once, in 5.4) | 256 KB | Hopper whitepaper; the probed 232,448 B opt-in SMEM is its SMEM share |
 | suite mean vs cuBLAS, post-v2 | ~87.9% | `CAMPAIGN_CHECKPOINT.md:57` |
 
 **`BW = 2922.3 GB/s` is the number every byte budget below divides by**, and the choice is
@@ -549,7 +576,12 @@ mis-addresses silently.** The law belongs in the generator, per dtype, in the sa
 
 The reuse *distance* is small in every row: the sharing warps run the same instruction stream over
 the same positions, so the bytes one re-reads are the bytes another read a few hundred cycles ago --
-256 B per position, 1 KB per CTA at `g = 4`, against a 256 KB L1.
+256 B per position, 1 KB per CTA at `g = 4`, against a 256 KB unified L1/SMEM per SM -- and that
+capacity is the one **FACT(ext)** in this section (the Hopper whitepaper's SM figure; the probed
+232,448 B opt-in SMEM is its shared-memory share, `r3-bmulticast.log:521`). It is used for a
+*distance*, not a size: 1 KB against 256 KB is two orders of margin, so the conclusion survives any
+plausible restatement of the capacity, and the falsifier below measures the traffic directly rather
+than trusting either number.
 
 > **DERIVED, and it is a correction to the plan.** `ACT2_WAVE_PLAN.md:174` says GQA "fixes a hard
 > g-fold read amplification (4x at Llama-3-8B, 8x at 70B) on the single dominant traffic term:
@@ -1277,7 +1309,7 @@ Two more that are *not* cheap and should be named as such rather than quietly at
 | Ping-pong's trigger, Stream-K's trigger, the 2x2x1 and 192x256 verdicts, the per-tile cost model | `docs/gpu/derive/WAVE3_DOSSIER.md:19-30`, `:1252-1386` |
 | The epilogue/fusion break-even model this wave inherits nothing from but must not contradict | `docs/gpu/derive/WAVE4_DOSSIER.md:188-277` |
 | The 8-bit `wgmma` transfer condition, the fp8 tolerance, the two-arm exactness split, `FAST_ACCUM` fairness | `docs/gpu/derive/WAVE5_DOSSIER.md:28-38`, `:388-411`, `:565-588`, `:823-845` |
-| Wave-6 brief, held-out list, target table, standing rules | `docs/gpu/derive/ACT2_WAVE_PLAN.md:168-178`, `:182-189`, `:195-205`, `:209-215` |
+| Wave-6 brief, held-out list, target table, standing rules; and the measured `BW_L2` + cuBLAS's measured 838.7 TFLOP/s at sq4096 | `docs/gpu/derive/ACT2_WAVE_PLAN.md:168-178`, `:182-189`, `:195-205`, `:209-215`, `:5` |
 | Gate rules, single-owner rule, staged peers, measured baseline | `CAMPAIGN_CHECKPOINT.md:12-30`, `:38-71`, `:107-117` |
 
 ### External (FACT(ext)) -- cited for the SHAPE of a construction, never for its size
