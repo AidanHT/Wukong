@@ -936,7 +936,7 @@ vLLM is the right bar rather than the available one.
 `grid_barrier_ptx` (`megakernel.rs:132`), `max_resident_ctas` via
 `cuOccupancyMaxActiveBlocksPerMultiprocessor x GpuTarget::sm_count` (`:294-308`), `plan_grid`
 declining rather than clamping (`:320-358`), and `launch_mega` through
-`cuLaunchCooperativeKernel`. **The kernel does not.** `megakernel.rs:47-49` states it plainly:
+`cuLaunchCooperativeKernel`. **The kernel does not.** `megakernel.rs:46-49` states it plainly:
 "`lower::emit_mega_ptx` still emits the block-scoped form today", and the grid-parallel arm is
 exercised by exactly one test.
 
