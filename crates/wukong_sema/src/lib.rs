@@ -4506,6 +4506,16 @@ mod tests {
     }
 
     #[test]
+    fn already_bound_dim_conflict_names_the_dim() {
+        // The one call-site path where a callee dim is still a VARIABLE when it is compared: a
+        // turbofish binds `N` to the caller's own generic of the same name, so the second argument
+        // meets `Var(N)` rather than a substituted constant.
+        let src = "fn takes<N>(a: Tensor[f32, N], b: Tensor[f32, N]) {} \
+                   fn fwd<N>(a: Tensor[f32, N], b: Tensor[f32, 4]) { takes::<N>(a, b); }";
+        assert_message_has(src, "E0502", &["`N` (axis 0)", "expected N, found 4"]);
+    }
+
+    #[test]
     fn tensor_index_rank_mismatch_errors() {
         let src = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0]; }";
         assert!(

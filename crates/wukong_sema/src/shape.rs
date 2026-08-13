@@ -851,14 +851,18 @@ impl Sema<'_> {
         }
         match pd {
             Dim::Var(v) => match dims.get(&v) {
+                // Reached when the binding for `v` is itself a dimension VARIABLE — a turbofish
+                // `f::<N>` from a caller whose own generic shares the callee's name — since
+                // `apply_subst` has already rewritten a binding to a constant before `unify` runs.
+                // Same wording as the constant arm: one dimension-mismatch shape for the family.
                 Some(bound) => {
                     if !dims_equal(*bound, ad) {
                         self.error(
                             span,
                             "E0502",
                             format!(
-                                "dimension `{}` was inferred as {} but is {} here",
-                                self.sym_str(v),
+                                "dimension mismatch on {}: expected {}, found {}",
+                                self.dim_site(site),
                                 self.dim_str(*bound),
                                 self.dim_str(ad)
                             ),
