@@ -5,6 +5,27 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Measurement — `WUKONG_NO_RECOGNIZE` builds the same program without the kernel recognizers
+Recognized kernels are **gate-blind**: a recognizer fires identically on interp and native at every
+`-O` level (both call the same `wukong_runtime` symbol), so no differential or invariance gate can see
+whether it fired — and until now the recognizer-free lowering of a program could not be built at all,
+which made every claim about the *language* unfalsifiable. Setting `WUKONG_NO_RECOGNIZE` skips both
+cascade heads in `wukong_mir_build` (`lower_program`'s whole-function interceptions and
+`lower_for`'s ordered `match_*` cascade); the autovectorizer, `@parallel` outlining, canonicalization
+and the optimizer all stay on, so the loop the user wrote is what runs.
+
+```
+cargo run -q -p wukongc -- --emit=mir -O2 tests/run/tensor_matmul.wk   # call wukong_sgemm(...)
+$env:WUKONG_NO_RECOGNIZE='1'                                          # ... and now: nothing
+```
+
+It is an **instrument, not a user feature** — an environment variable in the style of
+`WUKONG_GPU_NO_MEGA`, deliberately not a CLI flag (`USAGE` is unchanged); the supported per-function
+surface is `@generic`. `--train` / `--emit=grad` **refuse by name** when it is set, because the VJP
+rules are kernel-shaped (never a silently zero gradient). New `crates/wukongc/tests/recognize.rs`
+gates the pair of properties. All 361 `tests/run` fixtures print byte-identical output with
+recognition on and off, which is the evidence that the kernels agree with the loops they replace.
+
 ### Language — an unknown `@attribute` is an error (`E0306`), not silence
 An attribute the compiler does not implement was parsed and discarded, so `@bogus` compiled, and a
 **typo of a real attribute** (`@parellel`) compiled to a single-threaded program with nothing on

@@ -319,7 +319,14 @@ pub fn compile(opts: &Options) -> i32 {
     };
 
     // --- MIR construction ---
-    let (mut program, lower_diags) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    // `WUKONG_NO_RECOGNIZE` (the measurement instrument, see `NO_RECOGNIZE_ENV`) is read here and
+    // nowhere else: mir_build takes it as an option so the switch is a value in the pipeline rather
+    // than an environment read buried in a recognizer.
+    let lower_opts = wukong_mir_build::LowerOptions {
+        recognize: !no_recognize(),
+    };
+    let (mut program, lower_diags) =
+        wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lower_opts);
     for d in &lower_diags {
         emit_diag(d, opts.error_format, &renderer, &sm);
     }

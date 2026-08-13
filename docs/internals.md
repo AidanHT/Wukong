@@ -667,6 +667,43 @@ Crucially this stays inside the differential oracle: the interpreter, on a `wuko
 marshals the result back — so native and interpreter agree bit-for-bit despite the reassociated
 accumulation (the parallel kernel is bit-identical to the serial one by construction).
 
+### Turning recognition off: `WUKONG_NO_RECOGNIZE` (an instrument, not a feature)
+
+That bit-for-bit agreement is also why recognizers are **gate-blind**. A recognizer fires identically
+on the interpreter and on native at every `-O` level — both call the same `wukong_runtime` symbol — so
+`native_matches_interpreter` and the opt-invariance suites pass whether the kernel fired or not, and
+whether it was right or not. Nothing observable distinguishes "the compiler lowered this loop well"
+from "a pattern matcher swapped in a hand-written kernel."
+
+Setting `WUKONG_NO_RECOGNIZE` (to any value) builds the program with the recognizers off:
+`wukong_driver::compile` turns it into `wukong_mir_build::LowerOptions { recognize: false }`, which
+skips both cascade heads — `lower_program`'s whole-function kernel interceptions and
+`FnLowerer::lower_for`'s ordered `match_*` cascade — so every loop nest lowers as written. What stays
+on is everything that compiles the loop the user actually wrote: the autovectorizer, `@parallel`
+outlining (`wukong_parallel_for` is the user asking for threads, not a guess at intent), `tindex` and
+`canon` normalization, and the whole optimizer.
+
+The witness, and the shape of any claim about the language:
+
+```sh
+cargo run -q -p wukongc -- --emit=mir -O2 tests/run/tensor_matmul.wk       # call wukong_sgemm(...)
+$env:WUKONG_NO_RECOGNIZE='1'
+cargo run -q -p wukongc -- --emit=mir -O2 tests/run/tensor_matmul.wk       # no kernel call at all
+```
+
+Two rules about it:
+
+- **It is an instrument, not a user feature**, which is why it is an environment variable in the
+  style of `WUKONG_GPU_NO_MEGA` and not a CLI flag (nothing in `USAGE` mentions it). The supported,
+  per-function surface for "lower the loop I wrote" is the `@generic` attribute.
+- **Autodiff refuses to run under it**, by name: `--train` and `--emit=grad` exit 1 as soon as the
+  variable is set, because `wukong_autodiff`'s VJP rules are keyed on the recognized kernel calls. A
+  named refusal, never a silently zero gradient.
+
+`crates/wukongc/tests/recognize.rs` gates all of this: the kernel is dispatched by default, no
+`call wukong_` survives with the variable set, the program still prints the same bytes on both
+backends at `-O0` and `-O2`, and autodiff is refused.
+
 ## GPU backend
 
 > **This section describes structure, not performance — and structure is now device-parameterized.**
