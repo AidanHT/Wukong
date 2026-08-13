@@ -1144,6 +1144,18 @@ pub fn lower_program_with(
         funcs: Vec::new(),
     };
     let no_subst: HashMap<Symbol, Ty> = HashMap::default();
+    // Functions carrying `@generic`. Collected once by name — names are unique at module scope
+    // (a duplicate is E0300), and the monomorphization loop further down has only the original
+    // function's symbol to key on, so a `@generic` *type-generic* template opts its instances out too.
+    let generic_fns: HashSet<Symbol> = module
+        .items
+        .iter()
+        .filter(|item| has_generic_attr(item, interner))
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::Fn(f) => Some(f.name.sym),
+            _ => None,
+        })
+        .collect();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
@@ -1153,6 +1165,12 @@ pub fn lower_program_with(
                 if !mono.tg(f.name.sym).is_empty() {
                     continue;
                 }
+                // `@generic` on this function is the user saying "I meant this loop": clear the
+                // recognition switch for this function alone, which is the same skip
+                // `WUKONG_NO_RECOGNIZE` performs globally. Shadowing the local `gemm` is all it
+                // takes, because the switch rides on that struct and it is copied down into every
+                // recognizer and probe from here.
+                let gemm = generic_gemm(gemm, generic_fns.contains(&f.name.sym));
                 // ---- The whole-function kernel interceptions ------------------------------------
                 //
                 // Every arm in this block replaces the function's ordinary lowering with a
@@ -1844,6 +1862,8 @@ pub fn lower_program_with(
         .collect();
     for (mangled, orig, subst) in &mono.instances {
         if let Some((f, body)) = fn_decls.get(orig) {
+            // A `@generic` template's instances inherit the opt-out (keyed on the ORIGINAL name).
+            let gemm = generic_gemm(gemm, generic_fns.contains(orig));
             let func = lower_fn(
                 f, body, sema, interner, gemm, false, subst, *mangled, &mono, &mut diags, None,
             );
@@ -1861,6 +1881,28 @@ fn has_parallel_attr(item: &ast::Item, interner: &Interner) -> bool {
     item.attrs
         .iter()
         .any(|a| interner.resolve(a.name.sym) == "parallel")
+}
+
+/// Does this item carry a `@generic` attribute — "lower the loops I wrote, do not recognize them"?
+/// `wukong_sema::attrs` has already rejected the attribute anywhere but a `fn` item, so this only
+/// ever fires where it means something.
+fn has_generic_attr(item: &ast::Item, interner: &Interner) -> bool {
+    item.attrs
+        .iter()
+        .any(|a| interner.resolve(a.name.sym) == "generic")
+}
+
+/// `gemm` with recognition cleared when the function being lowered is `@generic`. Per-function
+/// twin of `LowerOptions::recognize`: same switch, same struct, one function's scope.
+fn generic_gemm(gemm: GemmSyms, is_generic: bool) -> GemmSyms {
+    if is_generic {
+        GemmSyms {
+            recognize: false,
+            ..gemm
+        }
+    } else {
+        gemm
+    }
 }
 
 /// Does this `@parallel` loop body contain control flow that only makes sense under SERIAL

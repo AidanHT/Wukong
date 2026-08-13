@@ -1,0 +1,60 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+module tests.run.lang_generic_saxpy
+
+// `@generic` on a function suppresses the kernel recognizers for that function alone: the streaming
+// affine map below is the canonical `wukong_velem_f32` shape, and with the attribute it lowers as the
+// loop it was written as. `saxpy_recognized` is the negative control -- byte-identical body, no
+// attribute -- so the pair proves the opt-out is PER FUNCTION and not a module-wide switch:
+//
+//   cargo run -q -p wukongc -- --emit=mir -O2 tests/run/lang_generic_saxpy.wk
+//     -> exactly ONE `call wukong_velem_f32`, in `saxpy_recognized`
+//
+// which is what `crates/wukongc/tests/recognize.rs` asserts (recognizers are gate-blind: no
+// differential or opt-invariance gate can see whether one fired).
+//
+// Expected values are the scalar semantics of the loop, not recorded compiler output: a = 2, every
+// x[i] = 1 and y[i] = 1, so out[i] = 2*1 + 1 = 3 for all four lanes. Every lane is printed -- a sum
+// would let a buffer that is right in one lane and wrong in another pass.
+
+@generic
+fn saxpy_generic(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
+    for i in 0..4 {
+        out[i] = a * x[i] + y[i];
+    }
+}
+
+fn saxpy_recognized(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
+    for i in 0..4 {
+        out[i] = a * x[i] + y[i];
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    let y: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+    let mut g: [f32; 4] = [0.0; 4];
+    saxpy_generic(2.0, x, y, g);
+    print(g[0] as i32); // 3
+    print(g[1] as i32); // 3
+    print(g[2] as i32); // 3
+    print(g[3] as i32); // 3
+
+    // The same arithmetic through the recognized kernel: both spellings must agree, lane by lane.
+    let mut r: [f32; 4] = [0.0; 4];
+    saxpy_recognized(2.0, x, y, r);
+    print(r[0] as i32); // 3
+    print(r[1] as i32); // 3
+    print(r[2] as i32); // 3
+    print(r[3] as i32); // 3
+    return 0;
+}

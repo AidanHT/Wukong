@@ -419,6 +419,7 @@ runtime size is outside the defined contract, like any runtime index
 ## Attributes 🟡
 
 ```wukong
+@generic
 @inline
 @simd
 @tile(64, 64)
@@ -432,13 +433,43 @@ Attribute *syntax* is parsed on functions, parameters and statements (a missing 
 `E0207`), and the attribute **name is validated against a closed set** (✅): `@parallel`, `@generic`,
 `@tile`, `@extern`, `@inline`, `@simd`, `@align`, `@export`. Anything else — `@bogus(1, 2)`, and far
 more usefully a typo of a real one such as `@parellel` — is **`E0306`**, where it used to be accepted
-and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Exactly one
-attribute has a consumer today: **`@parallel` on a function** (✅), which makes its loop execute
-across CPU cores. Everything else in the list above — `@inline`, `@simd`, `@tile`, `@align`,
-`@extern`, `@export`, and `@parallel`'s own `grain = …` argument — is parsed and discarded (🔵), and
-stays legal wherever it parses. An attribute on a *statement or loop* is likewise dropped:
-`@parallel` must sit on the function, and the mid-function parallel region is derived from the
-enclosing function's attribute, not from one written on the loop.
+and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Two attributes have
+a consumer today, both on a **function**: **`@parallel`** (✅), which makes its loop execute across CPU
+cores, and **`@generic`** (✅), which opts the function out of the kernel recognizers (below).
+Everything else in the list above — `@inline`, `@simd`, `@tile`, `@align`, `@extern`, `@export`, and
+`@parallel`'s own `grain = …` argument — is parsed and discarded (🔵), and stays legal wherever it
+parses. A *discarded* attribute on a statement or loop is dropped there too: `@parallel` must sit on
+the function, and the mid-function parallel region is derived from the enclosing function's
+attribute, not from one written on the loop. `@generic` in that position is an error, not a silent
+drop.
+
+### `@generic` — “I meant this loop” ✅
+
+```wukong
+@generic
+fn saxpy(a: f32, x: [f32; 4], y: [f32; 4], mut out: [f32; 4]) {
+    for i in 0..4 { out[i] = a * x[i] + y[i]; }   // stays a loop; no wukong_velem_f32
+}
+```
+
+`@generic` on a **function** suppresses the kernel recognizers for that function alone: none of the
+`match_*` recognizers, whole-function interceptions, statement-window matchers or elementwise kernel
+probes fire inside it, so its loops are compiled as written (auto-vectorized, but not replaced by a
+tuned `wukong_*` kernel). Everything that is *not* a recognizer still applies — auto-vectorization,
+loop fusion, FMA contraction, `@parallel` outlining, and the whole optimizer — and the builtins you
+call by name (`alloc_f32`, `read_f32`, `sdpa`, …) still lower to their runtime entry points.
+
+Two reasons to reach for it. First, honesty: a recognized kernel is invisible to every behavioral
+gate, so `@generic` is how you write the loop you want measured (`tests/run/lang_generic_saxpy.wk`,
+`lang_generic_naive_gemm.wk` are the same body with and without the attribute — the MIR then holds
+exactly one kernel call). Second, control: it is the escape hatch when a nest merely *looks* like a
+GEMM and you want your own arithmetic order.
+
+It must sit on the `fn`. `@generic` on a statement or a loop is **`E0306`** — the attribute is read
+from the function item, so accepting it there would promise a per-loop opt-out that does not exist
+(`tests/fail/generic_on_stmt.wk`). For a whole-program opt-out during measurement there is the
+`WUKONG_NO_RECOGNIZE` environment instrument, documented in `docs/internals.md`; it is not a CLI flag
+and not a user feature.
 
 `@parallel` **declines and lowers serially, with no diagnostic**, when the loop cannot be split into
 independent chunks: a labelled loop, a plain `break` out of the parallelized loop, a `return` out of

@@ -5,6 +5,21 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Language — `@generic` on a function suppresses the kernel recognizers ✅
+`@generic fn f(…)` opts one function out of kernel recognition: no `match_*` recognizer,
+whole-function interception, statement-window matcher or elementwise kernel probe fires inside it, so
+its loops are compiled as written. Everything that is not a recognizer still applies —
+auto-vectorization, loop fusion, FMA contraction, `@parallel` outlining, the optimizer, and the
+builtins you call by name. Per **function**, not per module: `tests/run/lang_generic_saxpy.wk` and
+`tests/run/lang_generic_naive_gemm.wk` each carry the identical body twice, once with the attribute
+and once without, and the MIR holds exactly one kernel call. `@generic` on a statement or loop is
+`E0306` (`tests/fail/generic_on_stmt.wk`) rather than a silently dropped promise — the attribute is
+read from the `fn` item.
+
+This is the user-facing half of the recognition switch below (that one is an instrument, this is the
+supported surface), and it is what a `.wk` should carry when the loop itself is the thing being
+measured or reviewed.
+
 ### Measurement — `WUKONG_NO_RECOGNIZE` builds the same program without the kernel recognizers
 Recognized kernels are **gate-blind**: a recognizer fires identically on interp and native at every
 `-O` level (both call the same `wukong_runtime` symbol), so no differential or invariance gate can see
