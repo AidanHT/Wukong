@@ -864,6 +864,30 @@ fn collect_field_bases_expr(e: &Expr, out: &mut Vec<(Symbol, Symbol)>) {
     }
 }
 
+/// How to build the MIR. One knob today; a struct so adding the next one is not another positional
+/// parameter on a function with 20 call sites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LowerOptions {
+    /// Run the kernel recognizers (`true`, the default and the shipped behavior). When `false`,
+    /// every `match_*` / whole-function kernel interception is skipped and the loop nest lowers as
+    /// the user wrote it: scalar, or vectorized by the ordinary autovectorizer, with no
+    /// `wukong_*` runtime call. `@parallel` outlining is *not* a recognizer and still happens.
+    ///
+    /// This exists because recognized kernels are **gate-blind** — a recognizer fires identically
+    /// on interp and native at every `-O` level, so no differential or invariance gate can see
+    /// whether it fired at all. Turning it off is how a claim about the *language* ("this loop is
+    /// fast because of how it was compiled, not because a pattern matcher swapped in a hand-written
+    /// kernel") becomes measurable. `wukong_driver` sets it from `WUKONG_NO_RECOGNIZE`, and
+    /// `@generic` on a function turns it off for that function alone.
+    pub recognize: bool,
+}
+
+impl Default for LowerOptions {
+    fn default() -> LowerOptions {
+        LowerOptions { recognize: true }
+    }
+}
+
 /// Lower a whole module to a MIR [`Program`]. Only functions with bodies are lowered, and a
 /// type-generic template is skipped in favour of its monomorphized instances.
 ///
@@ -881,6 +905,18 @@ pub fn lower_program(
     module: &Module,
     sema: &SemaResult,
     interner: &mut Interner,
+) -> (Program, Vec<Diagnostic>) {
+    lower_program_with(module, sema, interner, LowerOptions::default())
+}
+
+/// [`lower_program`] with the construction knobs spelled out. Separate entry point rather than a
+/// fourth parameter on `lower_program`, because ~20 call sites across the workspace (the optimizer's
+/// examples, both benches, every backend's tests) want the defaults and should not have to say so.
+pub fn lower_program_with(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    opts: LowerOptions,
 ) -> (Program, Vec<Diagnostic>) {
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
@@ -913,6 +949,7 @@ pub fn lower_program(
     let mut program = Program::new();
     // Runtime symbols the matmul recognizer lowers a GEMM nest to (interned once, threaded down).
     let gemm = GemmSyms {
+        recognize: opts.recognize,
         mm: interner.intern("wukong_sgemm"),
         mm_par: interner.intern("wukong_sgemm_parallel"),
         print_str: interner.intern("print_str"),
@@ -1116,612 +1153,645 @@ pub fn lower_program(
                 if !mono.tg(f.name.sym).is_empty() {
                     continue;
                 }
-                // Whole-function matmul: lower the entire nest to a single (optionally parallel)
-                // `wukong_sgemm` call — the tuned 256-bit AVX2/FMA microkernel. `emit_sgemm` declines
-                // shapes it has no kernel for (a fused bias or an α on a non-NT store, `Aᵀ·Bᵀ`), so the
-                // wrapper reports that and we fall through to the ordinary `lower_fn` path, exactly as
-                // the sibling interceptions below do. Discarding the decline built a function body of
-                // dead constants and a bare `ret`: `fn lin(a,b,bias,c) { … c[i*2+j] = bias[j] + s; }`
-                // printed `0 0 0 0` on both backends at every opt level where `11 22 15 26` is correct.
-                if let Some(nest) = matmul_fn(body, sema, interner) {
-                    let parallel = has_parallel_attr(item, interner);
-                    if let Some(func) =
-                        lower_matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags)
+                // ---- The whole-function kernel interceptions ------------------------------------
+                //
+                // Every arm in this block replaces the function's ordinary lowering with a
+                // recognized kernel dispatch (directly, or by lowering with `parallel = true` so
+                // that `lower_for`'s embedded recognizer emits the multicore twin). They are
+                // therefore exactly what `LowerOptions::recognize` turns off: with recognition
+                // disabled, control falls through to the `@parallel` outliner and the plain
+                // `lower_fn` below, and the nest runs as written. `@parallel` outlining itself is
+                // NOT a recognizer — it is the user asking for threads — so it stays outside.
+                if gemm.recognize {
+                    // Whole-function matmul: lower the entire nest to a single (optionally parallel)
+                    // `wukong_sgemm` call — the tuned 256-bit AVX2/FMA microkernel. `emit_sgemm` declines
+                    // shapes it has no kernel for (a fused bias or an α on a non-NT store, `Aᵀ·Bᵀ`), so the
+                    // wrapper reports that and we fall through to the ordinary `lower_fn` path, exactly as
+                    // the sibling interceptions below do. Discarding the decline built a function body of
+                    // dead constants and a bare `ret`: `fn lin(a,b,bias,c) { … c[i*2+j] = bias[j] + s; }`
+                    // printed `0 0 0 0` on both backends at every opt level where `11 22 15 26` is correct.
+                    if let Some(nest) = matmul_fn(body, sema, interner) {
+                        let parallel = has_parallel_attr(item, interner);
+                        if let Some(func) =
+                            lower_matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags)
+                        {
+                            program.funcs.push(func);
+                            continue;
+                        }
+                    }
+                    // Whole-function int8 quantized matmul (`u8×i8→i32` `C = A·Bᵀ`) → the int8 GEMM
+                    // microkernel. Checked *before* the `@parallel` outliner below so a `@parallel` int8
+                    // kernel dispatches to the multicore `wukong_i8gemm_nt_parallel` instead of being
+                    // outlined to a scalar loop (rows are independent, so it stays deterministic).
+                    // Integer math, so the kernel equals the scalar nest bit-for-bit (no reassoc).
+                    if let Some(nest) = i8matmul_fn(body, sema, interner) {
+                        let parallel = has_parallel_attr(item, interner);
+                        if let Some(func) =
+                            lower_i8matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags)
+                        {
+                            program.funcs.push(func);
+                            continue;
+                        }
+                    }
+                    // A `@parallel` whole-function bf16/f16 matmul: intercept before the elementwise
+                    // outliner below (which would outline the outer row loop into per-row scalar loops and
+                    // lose the kernel dispatch). Lower it normally with `parallel = true`; the embedded
+                    // matmul recognizer in `lower_for` then emits the multicore half GEMM. A non-`@parallel`
+                    // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
+                    if has_parallel_attr(item, interner)
+                        && lowp_matmul_fn(body, sema, interner).is_some()
                     {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
                         program.funcs.push(func);
                         continue;
                     }
-                }
-                // Whole-function int8 quantized matmul (`u8×i8→i32` `C = A·Bᵀ`) → the int8 GEMM
-                // microkernel. Checked *before* the `@parallel` outliner below so a `@parallel` int8
-                // kernel dispatches to the multicore `wukong_i8gemm_nt_parallel` instead of being
-                // outlined to a scalar loop (rows are independent, so it stays deterministic).
-                // Integer math, so the kernel equals the scalar nest bit-for-bit (no reassoc).
-                if let Some(nest) = i8matmul_fn(body, sema, interner) {
-                    let parallel = has_parallel_attr(item, interner);
-                    if let Some(func) =
-                        lower_i8matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags)
+                    // A `@parallel` whole-function GEMV (`for i { s=0; for j { s+=a[i*N+j]*x[j] }; y[i]=s }`)
+                    // or vector·matrix GEVM (`for j { s=0; for i { s+=w[i]*a[i*N+j] }; out[j]=s }`, either
+                    // with an optional α-scaled store): intercept before the elementwise outliner (which
+                    // would outline the outer loop into per-chunk scalar loops and lose the kernel). Lower
+                    // it normally with `parallel = true`; the embedded `match_gemv`/`match_gevm` in
+                    // `lower_for` then emits the `_parallel` kernel (GEMV: rows independent; GEVM: disjoint
+                    // output-column stripes each folding ascending i — both bit-equal to the serial kernel
+                    // the interpreter marshals). A non-`@parallel` one reaches the serial kernel via the
+                    // ordinary `lower_fn` path at the end.
+                    if has_parallel_attr(item, interner)
+                        && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                            match_gemv(pat, it, lb, p.sema, p.interner).is_some()
+                                || match_gevm(pat, it, lb, p.sema, p.interner).is_some()
+                        })
                     {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
                         program.funcs.push(func);
                         continue;
                     }
-                }
-                // A `@parallel` whole-function bf16/f16 matmul: intercept before the elementwise
-                // outliner below (which would outline the outer row loop into per-row scalar loops and
-                // lose the kernel dispatch). Lower it normally with `parallel = true`; the embedded
-                // matmul recognizer in `lower_for` then emits the multicore half GEMM. A non-`@parallel`
-                // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
-                if has_parallel_attr(item, interner)
-                    && lowp_matmul_fn(body, sema, interner).is_some()
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function GEMV (`for i { s=0; for j { s+=a[i*N+j]*x[j] }; y[i]=s }`)
-                // or vector·matrix GEVM (`for j { s=0; for i { s+=w[i]*a[i*N+j] }; out[j]=s }`, either
-                // with an optional α-scaled store): intercept before the elementwise outliner (which
-                // would outline the outer loop into per-chunk scalar loops and lose the kernel). Lower
-                // it normally with `parallel = true`; the embedded `match_gemv`/`match_gevm` in
-                // `lower_for` then emits the `_parallel` kernel (GEMV: rows independent; GEVM: disjoint
-                // output-column stripes each folding ascending i — both bit-equal to the serial kernel
-                // the interpreter marshals). A non-`@parallel` one reaches the serial kernel via the
-                // ordinary `lower_fn` path at the end.
-                if has_parallel_attr(item, interner)
-                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        match_gemv(pat, it, lb, p.sema, p.interner).is_some()
-                            || match_gevm(pat, it, lb, p.sema, p.interner).is_some()
-                    })
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function matrix transpose: intercept before the elementwise
-                // outliner (which would outline it into per-row scalar loops and lose the blocked
-                // kernel). Lower it normally with `parallel = true`; the embedded `match_transpose` in
-                // `lower_for` then emits the multicore `wukong_transpose_f32_parallel`. A non-`@parallel`
-                // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
-                if has_parallel_attr(item, interner) && transpose_fn(body, sema, interner).is_some()
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function 2D pooling nest: intercept before the elementwise outliner
-                // (which would split the channel loop into per-chunk scalar loops and lose the AVX2
-                // kernel). Lower it normally with `parallel = true`; the embedded `match_pool2d` in
-                // `lower_for` then emits the multicore `wukong_{max,avg}pool2d_f32_parallel` (channels
-                // across cores, bit-equal to serial — channels independent, no cross-channel combine).
-                if has_parallel_attr(item, interner) && pool2d_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function column reduction: intercept before the outliner (which
-                // would split it into per-column-chunk scalar loops and lose the SIMD kernel). Lower it
-                // normally with `parallel = true`; the embedded `match_colsum` then emits the multicore
-                // `wukong_colsum_f32_parallel` (disjoint column stripes, bit-equal to serial).
-                if has_parallel_attr(item, interner) && colsum_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function per-column argmax/argmin: intercept before the outliner,
-                // like the column reduction above. Rows are scanned per disjoint column stripe → the
-                // multicore `wukong_colarg*_i32_parallel` is bit-equal to serial.
-                if has_parallel_attr(item, interner) && colarg_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function batched softmax-backward: intercept before the outliner
-                // (which would split the rows into scalar loops and lose the fused dot+apply kernel).
-                // The embedded `match_softmax_bwd` then emits the multicore `wukong_softmax_bwd_f32_parallel`
-                // (rows across cores, bit-equal to serial — rows independent).
-                if has_parallel_attr(item, interner)
-                    && softmax_bwd_fn(body, sema, interner).is_some()
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function batched RMSNorm-backward: intercept before the outliner
-                // (which would split the rows into scalar loops and lose the fused two-reduction+apply
-                // kernel). The embedded `match_rmsnorm_bwd` then emits the multicore
-                // `wukong_rmsnorm_bwd_f32_parallel` (rows across cores, bit-equal to serial — rows
-                // independent, each row reduces over its own `C` columns).
-                if has_parallel_attr(item, interner)
-                    && rmsnorm_bwd_fn(body, sema, interner).is_some()
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function batched LayerNorm-backward: intercept before the outliner.
-                if has_parallel_attr(item, interner)
-                    && layernorm_bwd_fn(body, sema, interner).is_some()
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function batched cross-entropy loss: intercept before the outliner
-                // (which would split the rows into scalar loops and lose the fused max+Σexp+gather
-                // kernel). The embedded `match_xent` then emits the multicore `wukong_xent_fwd_f32_parallel`
-                // (rows across cores, bit-equal to serial — rows independent).
-                if has_parallel_attr(item, interner) && xent_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function cross-entropy backward: intercept before the outliner.
-                if has_parallel_attr(item, interner) && xent_bwd_fn(f, body, sema, interner, gemm) {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function RoPE: intercept before the outliner (which would split
-                // the rows into scalar loops and lose the inline-sincos kernel). The embedded
-                // `match_rope` then emits the multicore `wukong_rope_f32_parallel` (rows independent).
-                if has_parallel_attr(item, interner) && rope_fn(body, sema, interner).is_some() {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function batched log-sum-exp: intercept before the outliner.
-                if has_parallel_attr(item, interner) && logsumexp_fn(f, body, sema, interner, gemm)
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // `@parallel` whole-function per-row loss reductions (KL / entropy / soft-label xent):
-                // intercept before the outliner, like the other per-row loss interceptors.
-                if has_parallel_attr(item, interner)
-                    && (probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_kldiv(pat, it, lb).is_some()
-                    }) || probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_entropy(pat, it, lb).is_some()
-                    }) || probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_kd_loss(pat, it, lb).is_some()
-                    }))
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // `@parallel` whole-function per-channel dequant: intercept before the outliner (which
-                // would split the rows into per-row scalar loops and lose the kernel). Rows independent →
-                // serial == parallel, so the multicore `wukong_dequant_perchan_f32_parallel` is bit-equal.
-                if has_parallel_attr(item, interner)
-                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_dequant_perchan(pat, it, lb).is_some()
-                    })
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // `@parallel` whole-function per-row argmax/argmin: intercept before the outliner (which
-                // would split the rows into per-row scalar loops and lose the kernel). Rows independent →
-                // serial == parallel, so the multicore `wukong_rowarg*_i32_parallel` stays deterministic.
-                if has_parallel_attr(item, interner)
-                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_rowarg(pat, it, lb).is_some()
-                    })
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // `@parallel` whole-function per-row cumsum: intercept before the outliner (rows
-                // independent → the multicore `wukong_cumsum_f32_parallel` is bit-equal to serial).
-                if has_parallel_attr(item, interner)
-                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_cumsum(pat, it, lb).is_some()
-                    })
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // `@parallel` whole-function per-row prefix product (cumprod): same interceptor — rows
-                // independent → the multicore kernel is bit-equal to serial.
-                if has_parallel_attr(item, interner)
-                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_cumprod(pat, it, lb).is_some()
-                    })
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // `@parallel` whole-function per-row linear-recurrence scan (SSM/Mamba): same
-                // interceptor — the independent rows map across cores (bit-equal to serial).
-                if has_parallel_attr(item, interner)
-                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_lrscan(pat, it, lb).is_some()
-                    })
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // `@parallel` whole-function per-row cumulative max/min: same interceptor pattern.
-                if has_parallel_attr(item, interner)
-                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_cumminmax(pat, it, lb).is_some()
-                    })
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // `@parallel` whole-function embedding lookup: intercept before the outliner (which would
-                // split the token rows into per-row scalar loops and lose the gather kernel). The embedded
-                // `match_embedding` then emits the multicore `wukong_embedding_f32_parallel` (output rows
-                // independent → bit-equal to serial).
-                if has_parallel_attr(item, interner)
-                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_embedding(pat, it, lb).is_some()
-                    })
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // `@parallel` whole-function scatter-add (embedding-gradient backward): intercept before
-                // the outliner; `match_scatter` then emits `wukong_scatter_add_f32_parallel`, which splits
-                // the V output rows across cores (disjoint writes → race-free, deterministic == serial).
-                if has_parallel_attr(item, interner)
-                    && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
-                        p.match_scatter(pat, it, lb).is_some()
-                    })
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` whole-function residual projection (`x = x + act(x·Wᵀ + bias)`):
-                // intercept before the outliner (which would split it into per-row scalar loops and
-                // lose the fused-epilogue kernel). Lower it normally with `parallel = true`; the
-                // embedded `match_matmul_residual` in `lower_for` then emits the multicore nt_epi.
-                if has_parallel_attr(item, interner) && matmul_residual_fn(body, sema, interner) {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` *batched norm* (`fn f(x){ for r in 0..R { <norm row r over x[r*C+i]> } }`)
-                // dispatches to the multicore `wukong_norm_f32_parallel`: rows are independent (so it
-                // is deterministic and bit-equal to the serial kernel the interpreter calls) and each
-                // row is one fused pass. Checked *before* the generic `@parallel` outliner below — which
-                // would instead split the rows into chunks of per-row *vectorized* loops and lose the
-                // single-pass fusion — mirroring the sgemm/int8 whole-function interceptions above.
-                if has_parallel_attr(item, interner)
-                    && is_batched_norm_fn(f, body, sema, interner, gemm)
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // A `@parallel` *broadcast-bias* nest (`fn f(x,b,out){ for i { for j { out[i*C+j] =
-                // act(x[i*C+j] + b[j]) } } }`) dispatches to the multicore `wukong_bias_bcast_f32_parallel`:
-                // rows are independent (deterministic, bit-equal to the serial kernel the interpreter
-                // calls). Intercepted *before* the generic outliner below — which would split the rows
-                // into per-row 1-D loops and lose the whole-nest recognizer — mirroring the batched-norm
-                // interception above.
-                if has_parallel_attr(item, interner)
-                    && is_bias_bcast_fn(f, body, sema, interner, gemm)
-                {
-                    let func = lower_fn(
-                        f,
-                        body,
-                        sema,
-                        interner,
-                        gemm,
-                        true,
-                        &no_subst,
-                        f.name.sym,
-                        &mono,
-                        &mut diags,
-                        Some(&mut par_regions),
-                    );
-                    program.funcs.push(func);
-                    continue;
-                }
-                // `@parallel` on a function whose whole body is `for i in 0..n { … }` over array
-                // (pointer) parameters is lowered to a multi-threaded runtime dispatch: the loop
-                // body becomes a separate ranged function, and the original becomes a thin wrapper
-                // that hands chunks to `wukong_parallel_for`.
+                    // A `@parallel` whole-function matrix transpose: intercept before the elementwise
+                    // outliner (which would outline it into per-row scalar loops and lose the blocked
+                    // kernel). Lower it normally with `parallel = true`; the embedded `match_transpose` in
+                    // `lower_for` then emits the multicore `wukong_transpose_f32_parallel`. A non-`@parallel`
+                    // one reaches the serial kernel via the ordinary `lower_fn` path at the end.
+                    if has_parallel_attr(item, interner)
+                        && transpose_fn(body, sema, interner).is_some()
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function 2D pooling nest: intercept before the elementwise outliner
+                    // (which would split the channel loop into per-chunk scalar loops and lose the AVX2
+                    // kernel). Lower it normally with `parallel = true`; the embedded `match_pool2d` in
+                    // `lower_for` then emits the multicore `wukong_{max,avg}pool2d_f32_parallel` (channels
+                    // across cores, bit-equal to serial — channels independent, no cross-channel combine).
+                    if has_parallel_attr(item, interner)
+                        && pool2d_fn(body, sema, interner).is_some()
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function column reduction: intercept before the outliner (which
+                    // would split it into per-column-chunk scalar loops and lose the SIMD kernel). Lower it
+                    // normally with `parallel = true`; the embedded `match_colsum` then emits the multicore
+                    // `wukong_colsum_f32_parallel` (disjoint column stripes, bit-equal to serial).
+                    if has_parallel_attr(item, interner)
+                        && colsum_fn(body, sema, interner).is_some()
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function per-column argmax/argmin: intercept before the outliner,
+                    // like the column reduction above. Rows are scanned per disjoint column stripe → the
+                    // multicore `wukong_colarg*_i32_parallel` is bit-equal to serial.
+                    if has_parallel_attr(item, interner)
+                        && colarg_fn(body, sema, interner).is_some()
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function batched softmax-backward: intercept before the outliner
+                    // (which would split the rows into scalar loops and lose the fused dot+apply kernel).
+                    // The embedded `match_softmax_bwd` then emits the multicore `wukong_softmax_bwd_f32_parallel`
+                    // (rows across cores, bit-equal to serial — rows independent).
+                    if has_parallel_attr(item, interner)
+                        && softmax_bwd_fn(body, sema, interner).is_some()
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function batched RMSNorm-backward: intercept before the outliner
+                    // (which would split the rows into scalar loops and lose the fused two-reduction+apply
+                    // kernel). The embedded `match_rmsnorm_bwd` then emits the multicore
+                    // `wukong_rmsnorm_bwd_f32_parallel` (rows across cores, bit-equal to serial — rows
+                    // independent, each row reduces over its own `C` columns).
+                    if has_parallel_attr(item, interner)
+                        && rmsnorm_bwd_fn(body, sema, interner).is_some()
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function batched LayerNorm-backward: intercept before the outliner.
+                    if has_parallel_attr(item, interner)
+                        && layernorm_bwd_fn(body, sema, interner).is_some()
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function batched cross-entropy loss: intercept before the outliner
+                    // (which would split the rows into scalar loops and lose the fused max+Σexp+gather
+                    // kernel). The embedded `match_xent` then emits the multicore `wukong_xent_fwd_f32_parallel`
+                    // (rows across cores, bit-equal to serial — rows independent).
+                    if has_parallel_attr(item, interner) && xent_fn(f, body, sema, interner, gemm) {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function cross-entropy backward: intercept before the outliner.
+                    if has_parallel_attr(item, interner)
+                        && xent_bwd_fn(f, body, sema, interner, gemm)
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function RoPE: intercept before the outliner (which would split
+                    // the rows into scalar loops and lose the inline-sincos kernel). The embedded
+                    // `match_rope` then emits the multicore `wukong_rope_f32_parallel` (rows independent).
+                    if has_parallel_attr(item, interner) && rope_fn(body, sema, interner).is_some()
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function batched log-sum-exp: intercept before the outliner.
+                    if has_parallel_attr(item, interner)
+                        && logsumexp_fn(f, body, sema, interner, gemm)
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // `@parallel` whole-function per-row loss reductions (KL / entropy / soft-label xent):
+                    // intercept before the outliner, like the other per-row loss interceptors.
+                    if has_parallel_attr(item, interner)
+                        && (probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                            p.match_kldiv(pat, it, lb).is_some()
+                        }) || probe_single_for(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            |p, pat, it, lb| p.match_entropy(pat, it, lb).is_some(),
+                        ) || probe_single_for(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            |p, pat, it, lb| p.match_kd_loss(pat, it, lb).is_some(),
+                        ))
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // `@parallel` whole-function per-channel dequant: intercept before the outliner (which
+                    // would split the rows into per-row scalar loops and lose the kernel). Rows independent →
+                    // serial == parallel, so the multicore `wukong_dequant_perchan_f32_parallel` is bit-equal.
+                    if has_parallel_attr(item, interner)
+                        && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                            p.match_dequant_perchan(pat, it, lb).is_some()
+                        })
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // `@parallel` whole-function per-row argmax/argmin: intercept before the outliner (which
+                    // would split the rows into per-row scalar loops and lose the kernel). Rows independent →
+                    // serial == parallel, so the multicore `wukong_rowarg*_i32_parallel` stays deterministic.
+                    if has_parallel_attr(item, interner)
+                        && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                            p.match_rowarg(pat, it, lb).is_some()
+                        })
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // `@parallel` whole-function per-row cumsum: intercept before the outliner (rows
+                    // independent → the multicore `wukong_cumsum_f32_parallel` is bit-equal to serial).
+                    if has_parallel_attr(item, interner)
+                        && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                            p.match_cumsum(pat, it, lb).is_some()
+                        })
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // `@parallel` whole-function per-row prefix product (cumprod): same interceptor — rows
+                    // independent → the multicore kernel is bit-equal to serial.
+                    if has_parallel_attr(item, interner)
+                        && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                            p.match_cumprod(pat, it, lb).is_some()
+                        })
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // `@parallel` whole-function per-row linear-recurrence scan (SSM/Mamba): same
+                    // interceptor — the independent rows map across cores (bit-equal to serial).
+                    if has_parallel_attr(item, interner)
+                        && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                            p.match_lrscan(pat, it, lb).is_some()
+                        })
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // `@parallel` whole-function per-row cumulative max/min: same interceptor pattern.
+                    if has_parallel_attr(item, interner)
+                        && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                            p.match_cumminmax(pat, it, lb).is_some()
+                        })
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // `@parallel` whole-function embedding lookup: intercept before the outliner (which would
+                    // split the token rows into per-row scalar loops and lose the gather kernel). The embedded
+                    // `match_embedding` then emits the multicore `wukong_embedding_f32_parallel` (output rows
+                    // independent → bit-equal to serial).
+                    if has_parallel_attr(item, interner)
+                        && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                            p.match_embedding(pat, it, lb).is_some()
+                        })
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // `@parallel` whole-function scatter-add (embedding-gradient backward): intercept before
+                    // the outliner; `match_scatter` then emits `wukong_scatter_add_f32_parallel`, which splits
+                    // the V output rows across cores (disjoint writes → race-free, deterministic == serial).
+                    if has_parallel_attr(item, interner)
+                        && probe_single_for(f, body, sema, interner, gemm, |p, pat, it, lb| {
+                            p.match_scatter(pat, it, lb).is_some()
+                        })
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` whole-function residual projection (`x = x + act(x·Wᵀ + bias)`):
+                    // intercept before the outliner (which would split it into per-row scalar loops and
+                    // lose the fused-epilogue kernel). Lower it normally with `parallel = true`; the
+                    // embedded `match_matmul_residual` in `lower_for` then emits the multicore nt_epi.
+                    if has_parallel_attr(item, interner) && matmul_residual_fn(body, sema, interner)
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` *batched norm* (`fn f(x){ for r in 0..R { <norm row r over x[r*C+i]> } }`)
+                    // dispatches to the multicore `wukong_norm_f32_parallel`: rows are independent (so it
+                    // is deterministic and bit-equal to the serial kernel the interpreter calls) and each
+                    // row is one fused pass. Checked *before* the generic `@parallel` outliner below — which
+                    // would instead split the rows into chunks of per-row *vectorized* loops and lose the
+                    // single-pass fusion — mirroring the sgemm/int8 whole-function interceptions above.
+                    if has_parallel_attr(item, interner)
+                        && is_batched_norm_fn(f, body, sema, interner, gemm)
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                    // A `@parallel` *broadcast-bias* nest (`fn f(x,b,out){ for i { for j { out[i*C+j] =
+                    // act(x[i*C+j] + b[j]) } } }`) dispatches to the multicore `wukong_bias_bcast_f32_parallel`:
+                    // rows are independent (deterministic, bit-equal to the serial kernel the interpreter
+                    // calls). Intercepted *before* the generic outliner below — which would split the rows
+                    // into per-row 1-D loops and lose the whole-nest recognizer — mirroring the batched-norm
+                    // interception above.
+                    if has_parallel_attr(item, interner)
+                        && is_bias_bcast_fn(f, body, sema, interner, gemm)
+                    {
+                        let func = lower_fn(
+                            f,
+                            body,
+                            sema,
+                            interner,
+                            gemm,
+                            true,
+                            &no_subst,
+                            f.name.sym,
+                            &mono,
+                            &mut diags,
+                            Some(&mut par_regions),
+                        );
+                        program.funcs.push(func);
+                        continue;
+                    }
+                } // ---- end of the recognizer-gated whole-function interceptions ----------------
+                  // `@parallel` on a function whose whole body is `for i in 0..n { … }` over array
+                  // (pointer) parameters is lowered to a multi-threaded runtime dispatch: the loop
+                  // body becomes a separate ranged function, and the original becomes a thin wrapper
+                  // that hands chunks to `wukong_parallel_for`.
                 if has_parallel_attr(item, interner) {
                     if let Some((idx, hi, loop_body)) = parallel_spec(f, body, sema, interner) {
                         let base = interner.resolve(f.name.sym).to_string();
@@ -2475,6 +2545,13 @@ struct ParRegions {
 /// vectorized elementwise-math kernel.
 #[derive(Clone, Copy)]
 struct GemmSyms {
+    /// Recognition master switch (`LowerOptions::recognize`, cleared per function by `@generic`).
+    /// It rides on this struct, not on `FnLowerer`, precisely *because* this struct is already
+    /// threaded to every recognizer and every recognizer probe — the same reach the switch needs,
+    /// with one construction site to set it. `false` means: emit no `wukong_*` kernel call, lower
+    /// the loop the user wrote. Read at the two cascade heads (`lower_program`'s whole-function
+    /// interceptions and `FnLowerer::lower_for`), so a recognizer body never has to check it.
+    recognize: bool,
     mm: Symbol,
     mm_par: Symbol,
     /// Runtime print of a null-terminated string buffer (a `*u8` argument to `print`/`println`),
