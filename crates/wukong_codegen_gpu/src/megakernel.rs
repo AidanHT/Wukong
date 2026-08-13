@@ -1173,6 +1173,118 @@ fn main() -> i32 {{
         );
     }
 
+    /// Same-run A/B for the **generic `@parallel` grid-stride** path against the sequential chunk the
+    /// single-thread lowering still runs — i.e. the two lowerings of the *same* `wukong_parallel_for`,
+    /// over a body no recognizer claims.
+    ///
+    /// This is the only comparison that isolates the grid-stride work, and it is deliberately not a
+    /// speed *claim*: it reports the same-run best-of-N ratio and no absolute time (this laptop has
+    /// three power states and a ~7x clock swing, so an absolute figure is not a measurement). It is
+    /// also not the Phase 1 language question — "is a `.wk` elementwise kernel on gpu-native fast
+    /// compared to the native CPU backend, or to the recognized GPU kernel it avoids" needs a peer,
+    /// and this has none. It answers only: did giving the iterations to 256 threads instead of one
+    /// actually do anything.
+    ///
+    /// The work per element is an inner `K`-trip recurrence rather than a repeat loop around the whole
+    /// nest: a single elementwise pass is launch-bound, and a `for` nested inside a `while` is not
+    /// outlined into a region at all (`mir_build` walks the function body's statements), so wrapping
+    /// the loop would silently benchmark a serial nest. Output is cross-checked
+    /// mega == single == oracle before any timing counts, and the bench skips loudly if the loop stops
+    /// outlining or a recognizer starts claiming the body.
+    ///
+    /// Read the ratio with two facts in hand. It **grows with `K`** — 1.54x at `K = 64`, 4.15x at
+    /// `K = 512` on this 4050 — so what is left over at small `K` is the per-run fixed cost both arms
+    /// pay (context-buffer alloc, launch, readback), not a limit of the parallelism. And it is far
+    /// from 256x by construction: this is one CTA, i.e. one SM of the part's 20, and each thread walks
+    /// its iterations through a serial `.func` call. Spreading the same loop across the device needs
+    /// the multi-CTA grid-parallel mega ABI, which `emit_mega_ptx` does not emit yet.
+    #[test]
+    #[ignore = "perf bench; run with --ignored --nocapture"]
+    fn mega_vs_single_generic_parallel() {
+        use std::time::Instant;
+        if crate::gpu::gpu().is_none() {
+            crate::diff::skip_or_fail(
+                "mega_vs_single_generic_parallel",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
+            return;
+        }
+        // N stays modest because the SINGLE-THREAD arm homes both arrays in one thread's `.local`
+        // frame; K supplies the work per element.
+        const N: usize = 4096;
+        const K: usize = 512;
+        let src = format!(
+            r#"module bench_gp
+@parallel
+fn main() -> i32 {{
+    let mut x: [f32; {N}] = [0.5; {N}];
+    let mut y: [f32; {N}] = [0.0; {N}];
+    for i in 0..{N} {{
+        let v = x[i];
+        let mut acc: f32 = v;
+        for k in 0..{K} {{
+            acc = acc * 0.5 + v * 0.25;
+        }}
+        y[i] = acc;
+    }}
+    print((y[1] * 1000.0) as i32);
+    return 0;
+}}
+"#
+        );
+        let (program, mut interner) = build(&src, 2).expect("frontend ok");
+        let entry = interner.intern("main");
+        let plan = crate::fusion::analyze(&program, entry, &interner);
+        if !plan.eligible
+            || !plan
+                .coop_ops
+                .iter()
+                .any(|c| c.kind == crate::fusion::CoopKind::ParallelFor)
+        {
+            crate::diff::skip_or_fail(
+                "mega_vs_single_generic_parallel",
+                "the bench loop no longer outlines into a cooperative wukong_parallel_for",
+            );
+            return;
+        }
+        let mega0 = try_run(&program, entry, &interner)
+            .expect("mega")
+            .expect("eligible");
+        let single0 = lower::jit_run_single(&program, entry, &interner).expect("single");
+        let oracle = wukong_interp::run_with_output(&program, entry, &interner).expect("interp");
+        assert!(outputs_match(&mega0.1, &single0.1), "mega vs single differ");
+        assert!(outputs_match(&mega0.1, &oracle.1), "mega vs oracle differ");
+        eprintln!(
+            "checksum (mega==single==oracle): {}",
+            String::from_utf8_lossy(&mega0.1).trim()
+        );
+
+        let _ = try_run(&program, entry, &interner);
+        let _ = lower::jit_run_single(&program, entry, &interner);
+        let best = |f: &dyn Fn()| {
+            let mut b = f64::INFINITY;
+            for _ in 0..10 {
+                let t = Instant::now();
+                f();
+                b = b.min(t.elapsed().as_secs_f64());
+            }
+            b
+        };
+        let mega_t = best(&|| {
+            let _ = try_run(&program, entry, &interner).unwrap().unwrap();
+        });
+        let single_t = best(&|| {
+            let _ = lower::jit_run_single(&program, entry, &interner).unwrap();
+        });
+        eprintln!(
+            "\n=== mega_vs_single_generic_parallel  N={N} K={K} ({} flops-ish) ===\n\
+             grid-stride({MEGA_BLOCK}t) vs sequential chunk(1t): {:.2}x (same-run best-of-10 ratio, \
+             no absolute time by the honesty law)",
+            N * K * 3,
+            single_t / mega_t,
+        );
+    }
+
     /// Same-run A/B for the **row-chunked-cooperative GEMM** path: `C[M,N] = A[M,K]·Bᵀ` reduced
     /// `REPEAT` times. The megakernel partitions the M output rows across the block (each thread runs
     /// the serial `mrt_sgemm_nt` over its rows); the single-thread path does all M rows in one lane.
