@@ -46,6 +46,9 @@ interchangeable ways to run the same program; they are not the product on their 
    shape its body does not actually produce. Static dims unify by equality; `?` (`Dim::Dynamic`) is
    the lenient escape hatch in both modes and defers to runtime. A tensor's `layout` is part of the
    type too, so a `.col_major` value cannot be routed through a `Contiguous`-typed callee (E0502).
+   Because a call-site parameter is *substituted* before it is unified, the diagnostic path carries
+   the pre-substitution declared type alongside it (`unify_decl`) purely so the message can name the
+   dimension the signature wrote — ``dimension mismatch on `K` (axis 0): expected 512, found 513``.
 
 ## Crate layering
 
