@@ -51,7 +51,7 @@ box can build — is `GPU_RETARGET_PLAN.md`.
 
 | family | standing |
 |---|---|
-| **H100 (`sm_90a`): the wgmma-vs-cuBLAS suite (f16 + bf16, f32 out), the H100 HBM figure, the fused int8-dequant ratios, the Hopper int8-vs-IMMA standing, the cuBLASLt epilogue probe** | **STANDS *for the H100 80GB HBM3* — as ITERATION-GRADE data, by the campaign's own definition**, measured 2026-08-11 ([section](#gpu-backend-nvidia-h100-80gb-hbm3-sm_90a); logs `bench/gpu/h100/2026-08-11-h100-w2-r*.log`). **The clock policy was not met, and these numbers are published anyway — knowingly, and only under this label.** Every round ran in a Modal **container** whose user is refused `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 is explicit: canonical rounds run "on VMs with root, `nvidia-smi -lgc` locked below throttle … Container rounds are *iteration* data; VM rounds are *publication* data." **Every one of the eleven 2026-08-11 round logs** behind this row carries the wrapper's own record of the refusal — `[clock] lock: refused (The current user does not have permission to change clocks for GPU …); running unlocked` (`tools/cloud/modal_app.py`) — and every instrumented one also opens its provenance header with `clock lock : UNKNOWN (undeclared)`. (The section also cites three older logs that predate or bypass that wrapper line — r1, r2 and one previous-visit round; it says so there, and no figure in this row comes from them.) **Five of those eleven** (r3, r10, r11, r11a, r12) go further and print the verdict as an all-caps banner (`*** CLOCKS ARE NOT LOCKED (or the lock is undeclared) … this round is ITERATION data, not publication data`); the other six — r4, the four non-GEMM rounds r5/r6/r8/r9, and the H200-scheduled r7 — do **not**, because that banner is written per bench function (`wgmma_peer_round`, `wgmma_config_sweep` in `crates/wukong_codegen_gpu/src/gpu.rs`) rather than by the shared provenance header. So the ITERATION-GRADE label on this row is *this document's*, applied uniformly because the premise for it — an unlocked clock, recorded by the harness in every round — is uniform; do not expect to find the banner itself in more than those five logs. What the rounds substitute is a *drift gate* — clocks read before and after, the round refusing itself past ±5% — which catches a clock that **moved** and cannot catch one parked at the wrong steady state for the whole round, so it is a weaker instrument than the lock, not an equivalent one. Treat every percentage here as provisional until a root VM with pinned clocks re-runs it; that re-run is owed and is not scheduled in this document. **Second caveat, and it splits this row in two:** only the **GEMM-suite rounds** (r3, r4, r10, r11, r11a, r12 — the wgmma-vs-cuBLAS table, the config sweep and the K-sweep) went through the instrument. Those are same-run, twin-controlled, median-of-5 against a ±5% publish bar, with a harness-written provenance header opening and closing each round — and **two of them refused themselves** on +6.82% SM-clock drift, one shape refused on a ±15.47% peer floor, all reproduced in the section. The **H100 HBM figure (r5), the Hopper int8-vs-IMMA standing (r6), the fused int8-dequant ratios (r8) and the cuBLASLt epilogue probe (r9) did NOT**: those four logs carry no provenance header, no A/C peer twin, no measured floor, no median-of-5 and no publish gate — they are **single-shot readings**, and the section labels each one at the figure. This is a **different device** from every other row in this table: do not average it with the 4050 rows and do not carry a 4050 conclusion into it. The one place this visit tested that transfer directly — Hopper int8 — the 4050's tuning fell from 96–105% of cuBLAS IMMA to **22–52%**. Later waves of the campaign are unimplemented and unmeasured; they are roadmap material (`docs/roadmap.md`, `docs/gpu/derive/`), and no number for them appears in this document. |
+| **H100 (`sm_90a`): the wgmma-vs-cuBLAS suite (f16 + bf16, f32 out), the H100 HBM figure, the fused int8-dequant ratios, the Hopper int8-vs-IMMA standing, the cuBLASLt epilogue probe** | **STANDS *for the H100 80GB HBM3* — as ITERATION-GRADE data, by the campaign's own definition**, measured 2026-08-11 ([section](#gpu-backend-nvidia-h100-80gb-hbm3-sm_90a); logs `bench/gpu/h100/2026-08-11-h100-w2-r*.log`). **The clock policy was not met, and these numbers are published anyway — knowingly, and only under this label.** Every round ran in a Modal **container** whose user is refused `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 is explicit: canonical rounds run "on VMs with root, `nvidia-smi -lgc` locked below throttle … Container rounds are *iteration* data; VM rounds are *publication* data." **Every one of the eleven 2026-08-11 round logs** behind this row carries the wrapper's own record of the refusal — `[clock] lock: refused (The current user does not have permission to change clocks for GPU …); running unlocked` (`tools/cloud/modal_app.py`) — and every instrumented one also opens its provenance header with `clock lock : UNKNOWN (undeclared)`. (The section also cites three older logs that predate or bypass that wrapper line — r1, r2 and one previous-visit round; it says so there, and no figure in this row comes from them.) **Five of those eleven** (r3, r10, r11, r11a, r12) go further and print the verdict as an all-caps banner (`*** CLOCKS ARE NOT LOCKED (or the lock is undeclared) … this round is ITERATION data, not publication data`); the other six — r4, the four non-GEMM rounds r5/r6/r8/r9, and the H200-scheduled r7 — do **not**, because that banner is written per bench function (`wgmma_peer_round`, `wgmma_config_sweep` in `crates/wukong_codegen_gpu/src/gpu.rs`) rather than by the shared provenance header. So the ITERATION-GRADE label on this row is *this document's*, applied uniformly because the premise for it — an unlocked clock, recorded by the harness in every round — is uniform; do not expect to find the banner itself in more than those five logs. What the rounds substitute is a *drift gate* — clocks read before and after, the round refusing itself past ±5% — which catches a clock that **moved** and cannot catch one parked at the wrong steady state for the whole round, so it is a weaker instrument than the lock, not an equivalent one. Treat every percentage here as provisional until a root VM with pinned clocks re-runs it; that re-run is owed and is not scheduled in this document. **Second caveat, and it splits this row in two:** only the **GEMM-suite rounds** (r3, r4, r10, r11, r11a, r12 — the wgmma-vs-cuBLAS table, the config sweep and the K-sweep) went through the instrument. Those are same-run, twin-controlled, median-of-5 against a ±5% publish bar, with a harness-written provenance header opening and closing each round — and **two of them refused themselves** on +6.82% SM-clock drift, one shape refused on a ±15.47% peer floor, all reproduced in the section. The **H100 HBM figure (r5), the Hopper int8-vs-IMMA standing (r6), the fused int8-dequant ratios (r8) and the cuBLASLt epilogue probe (r9) did NOT**: those four logs carry no provenance header, no A/C peer twin, no measured floor, no median-of-5 and no publish gate — they are **single-shot readings**, and the section labels each one at the figure. This is a **different device** from every other row in this table: do not average it with the 4050 rows and do not carry a 4050 conclusion into it. The one place this visit tested that transfer — Hopper int8 — the shipped dispatcher fell from 86–88% / 96–105% / ~70% of cuBLAS int8 GEMM on the 4050 to a conservative **67.7% / 71.4% / 47.9%** here. **The sharper "fell to 22–52% of IMMA" reading that this row carried until 2026-08-13 is RETRACTED**: `int8_gemm_vs_peers` times a hand-placed `_smdb` entry that is *retired* on the 4050 (~44–53% of IMMA there, not 96–105%) and is dispatched on neither part, so the contrast compared two different kernels; the subsection carries the full retraction and the honest numbers. Later waves of the campaign are unimplemented and unmeasured; they are roadmap material (`docs/roadmap.md`, `docs/gpu/derive/`), and no number for them appears in this document. |
 | the fp16/bf16/fp8/int8/int4 GEMM standings, flash-attention, conv, the resident layer, HBM bandwidth, compile latency, the serving stack | **STANDS *for the RTX 4050*.** Same-run, clock-invariant, and gated against an oracle — but 20 SMs, this card's L2 and 192 GB/s decided every tile, stage depth, regime threshold and occupancy crossover in them. None of it predicts an A100 or an H100, in either direction. One extra scope note on **serving**: those rounds predate grouped-query support, so their KV cache was sized for `q_heads`. The internal ratios (goodput vs fill=1, graph-driven scheduler vs static batching, int8-KV footprint) are self-consistent at the MHA geometry they were taken at — but they are **not** a Llama-class geometry, and a future vLLM/TRT-LLM comparison must be run at the GQA shape those peers actually serve. |
 | **"Wukong beats PyTorch at every S"** | **NOT RE-EARNED AGAINST THE REAL BAR.** The peer is **eager** PyTorch, and the only justification ever given is that Triton does not install on Windows. On Linux the honest peer is `torch.compile` with Inductor+Triton, and the tooling to build it landed 2026-08-09 (`tools/cloud/peers/`, pinned in the Modal image, with `smoke_inductor.py` asserting a Triton kernel was actually generated so an ATen fallback cannot wear the framework bar's name, and `verify_peers.py` failing loudly rather than shrugging when a declared peer is missing). Until that round runs, treat this claim as **on notice**: eager is not a bar. |
 | **the CUDA-graph launch-overhead wins** | **EXPECT SHRINKAGE BEFORE THE GPU EVEN CHANGES.** They were measured under **Windows/WDDM**, whose kernel-launch cost is several times the Linux driver's. The multiple is a ratio of *overhead removed* to *overhead present*, so a cheaper launch shrinks the numerator directly. That is a re-scoping to expect, not a regression to explain. |
@@ -399,8 +399,12 @@ from **single-shot rounds that did not go through the instrument** (no twin, no 
 publish gate; the section labels each one): **2922 GB/s = 87.2% of the 3352 GB/s HBM spec peak** (the
 campaign's first H100 run), and the **fused int8 GEMM+dequant beats the cuBLAS GEMM+dequant chain
 1.08× at 1024³ and 1.15× at 2048³** — the first outright peer win on Hopper — while **losing at 4096³
-(0.79×)**, where the underlying int8 GEMM is the problem: the 4050's int8 tuning does **not**
-transfer, reading 22–52% of cuBLAS IMMA here against 96–105% there.
+(0.79×)**, where the underlying int8 GEMM is the problem: that shipped kernel holds only **67.7% /
+71.4% / 47.9%** of cuBLAS int8 GEMM throughput here (a conservative floor — it carries the dequant),
+against 86–88% / 96–105% / ~70% for the same dispatcher on the 4050, so the Ada int8 tuning **loses
+ground on Hopper** and needs its own tile search. *(The sharper "22–52% of IMMA against 96–105%"
+reading previously carried here is **RETRACTED** — it timed a `_smdb` entry that is retired on the
+4050 and dispatched on neither part; see the Hopper quantized subsection.)*
 
 Every number is gated bit-for-bit (CPU) or to a `c·√K·ε` tolerance (GPU) against the interpreter
 oracle — the wins are correct, not miscompiles.
@@ -2074,7 +2078,7 @@ drift exceeds the bar the round prints `--` plus the reason where the number wou
 > | round | what it produced here | instrument |
 > |---|---|---|
 > | `r5-hbm.log` (71 lines) | the 87.2% HBM figure | **none** — one invocation of `hbm_bandwidth`; no header, no twin, no floor, no median, no gate |
-> | `r6-int8-baseline.log` (95 lines) | int8 at 22–52% of cuBLAS IMMA | **partial** — same-run against cuBLAS IMMA in one process, and every arm gated **bit-for-bit against the `i32` oracle** before timing; but no header, twin, floor, median or gate |
+> | `r6-int8-baseline.log` (95 lines) | the retired hand-placed `_smdb` int8 arm at 22–52% of cuBLAS IMMA (*not* the dispatched entry — see the retraction in the quantized subsection) | **partial** — same-run against cuBLAS IMMA in one process, and every arm gated **bit-for-bit against the `i32` oracle** before timing; but no header, twin, floor, median or gate |
 > | `r8-fused-dequant.log` (86 lines) | the 1.08× / 1.15× / 0.79× dequant ratios | **partial** — same-run A/B in one process, otherwise as above |
 > | `r9-epilogue-matrix.log` (116 lines) | the cuBLASLt epilogue support matrix | **n/a for timing** — nothing is timed; each cell is one cuBLASLt plan plus a heuristic query, so the reading is a capability answer, not a measurement |
 >
@@ -2330,6 +2334,16 @@ magnitude, not as a gated result; a re-run under the instrument is owed. Against
 | saxpy (3N transfer) | 2567.0 GB/s | 76.6% |
 | reduce (1N read) | 682.1 GB/s | 20.3% |
 
+> **The reduce row is not a read-bandwidth measurement and its 20.3% must not be read as one.**
+> `reduce` launches at Wukong's product-fixed `RED_GRID × RED_BLOCK = 256 × 256`
+> (`crates/wukong_codegen_gpu/src/gpu.rs:1302`), a grid deliberately independent of input size so the
+> reduction order is deterministic. On 132 SMs that is **1.94 CTAs/SM**, so the row measures an
+> occupancy-limited kernel, not the part. `copy` and `saxpy` size their grids from the element count
+> and are the bandwidth readings. Nothing in this campaign should divide by 682.1 GB/s; the honest
+> statement is that **this campaign has no pure-read bandwidth number for the H100 at a
+> machine-sized grid**, so any byte budget for a read-dominated kernel priced at 2922.3 GB/s is
+> using the *copy* floor and is optimistic by an unmeasured amount.
+
 The best streaming kernel therefore reaches **87.2% of the 3352 GB/s spec peak**, and the campaign's
 ≥90% milestone is **not** met on this device. This figure is the denominator every Hopper roofline
 and fusion break-even in the wave plan is now priced against — measured, where it had previously been
@@ -2356,20 +2370,47 @@ writes `M×N` f32. Wukong folds the per-channel dequant into the GEMM's C store.
 cuBLAS GEMM + dequant chain: **1.08× at 1024³** and **1.15× at 2048³** — and **0.79× at 4096³, which
 is a loss.** The chain pays +59.4% / +60.8% / +65.0% over its own GEMM for the round-trip at the three
 sizes, so the *fusion* thesis holds at all three; what fails at 4096³ is the underlying int8 GEMM it
-is fused into, which is the next row.
+is fused into. That GEMM is `int8_gemm_nt_smdb_swz_deq` at 1024³ and `int8_gemm_nt_w64_swz_deq` at
+2048³ and 4096³ — in both cases the **swizzled** entry the dispatcher selects, and in neither case the
+unswizzled hand-placed `_smdb` entry the next row times, so the next row does not measure it (see the
+retraction there). What r8 itself says about it: divide
+each `Wukong FUSED gemm+dequant` rate by that round's own same-run `cuBLAS GEMM only (no dequant)`
+column and the shipped kernel sustains **67.7% / 71.4% / 47.9%** of cuBLAS int8 GEMM throughput at
+1024³ / 2048³ / 4096³ *while also producing dequantized f32 where cuBLAS produces raw `i32`* — a
+conservative floor rather than a like-for-like GEMM ratio, and single-shot like the rest of this
+subsection.
 
 > The round's own summary line prints the word "BEATS" on the 4096³ row as well. The ratio printed
 > beside it, **0.79×**, is the measurement, and it is a loss — the harness's prose template does not
 > branch on the sign. Recorded here rather than quietly inheriting the template's adjective.
 
-**The Ada int8 tuning does not transfer.** The same `_smdb` int8 W8A8 kernels that reach 96–105% of
-cuBLAS int8 IMMA at 2048³ *on the 4050* read **52.5% / 36.8% / 22.1%** of cuBLAS IMMA at 1024³ /
-2048³ / 4096³ on the H100
+**Hopper int8 needs its own tile search — and the "22–52% against 96–105%" contrast that used to head
+this row is RETRACTED (2026-08-13), because it compared two different kernels.** The sentence that
+stood here read "the same `_smdb` int8 W8A8 kernels that reach 96–105% of cuBLAS int8 IMMA at 2048³
+*on the 4050*", and the 4050 table further down this page contradicts it: `int8_gemm_vs_peers` times
+the hand-placed `int8_gemm_nt_smdb64` / `_smdb128` entries and publishes the better of the two, and on
+the 4050 that is **the retired path at ~44–53% of IMMA** — the **96–105% belongs to the shipped `w64`
+64×64 warp-tile with `ldmatrix` + XOR-swizzled SMEM**. Worse, the shipped dispatcher
+(`gemm_nt_int8_smdb` in `crates/wukong_codegen_gpu/src/gpu.rs`) selects `int8_gemm_nt_smdb_swz` at
+1024³ and `int8_gemm_nt_w64_swz` at 2048³ and 4096³, so **none of the three shipped entries is what r6
+timed** on either device. The range was real; its attribution was not.
+
+What r6 measured, stated as what it is
 ([`...-r6-int8-baseline.log`](bench/gpu/h100/2026-08-11-h100-w2-r6-int8-baseline.log); all arms first
-gated bit-for-bit against the `i32` oracle, since integer accumulate is exact mod 2³²). Hopper int8
-needs its own tile search. This is the clearest single measurement in the campaign that a
-laptop-tuned occupancy crossover is a property of the laptop — the risk `GPU_RETARGET_PLAN.md` §8
-named in advance, now observed.
+gated bit-for-bit against the `i32` oracle, since integer accumulate is exact mod 2³²): the **retired
+hand-placed `_smdb` path** reads **52.5% / 36.8% / 22.1%** of cuBLAS IMMA at 1024³ / 2048³ / 4096³ on
+the H100, against **~44–53%** for the same path on the 4050. For that kernel the Ada reading therefore
+*holds* at 1024³ and falls only at the two larger shapes — a narrower fact than "the tuning does not
+transfer".
+
+The shipped Hopper int8 kernel has **never been timed against IMMA directly**. Its only H100 reading is
+the indirect one in the row above: **67.7% / 71.4% / 47.9%** of cuBLAS int8 GEMM at the three sizes,
+conservative (it carries the dequant) and single-shot. Against the 4050's shipped 86–88% / 96–105% /
+~70% that is still a real loss of ground at 2048³ and 4096³, so the conclusion — Hopper int8 needs its
+own tile search, and a laptop-tuned occupancy crossover is a property of the laptop
+(`GPU_RETARGET_PLAN.md` §8's named risk) — survives; the size of the effect does not. An
+`int8_gemm_vs_peers` that times the *dispatched* entries is owed, and is the cheapest round in the
+campaign's queue.
 
 **The fused-epilogue peer bar went up, not down.** A capability probe
 ([`...-r9-epilogue-matrix.log`](bench/gpu/h100/2026-08-11-h100-w2-r9-epilogue-matrix.log) — no GEMM is
@@ -2486,7 +2527,7 @@ is **bit-exact** — the GPU output must *equal* a wrapping-`i32` CPU reference 
 not a tolerance), a stronger correctness bar than the float kernels. Gated green across single-tile,
 `_mt`, and SMEM-staged paths.
 
-Honest same-run scoreboard (`int8_gemm_vs_peers`, RTX 4050, `2·M·N·K` MAC-FLOP, checksum-cross-checked;
+Honest same-run scoreboard (RTX 4050, `2·M·N·K` MAC-FLOP, checksum-cross-checked;
 peers: **naive** int8 CUDA-C, a strong **`dp4a.u32.s32`** hand-written CUDA-C, and **cuBLAS int8 IMMA**
 `cublasGemmEx`; all four first gated to *equal* the `i32` oracle — classic GemmEx int8 is `s8×s8`, so
 the peer cross-check uses `[0,127]` activations where `u8≡s8`, the full-range `[0,255]` gate is separate):
@@ -2500,6 +2541,18 @@ the peer cross-check uses `[0,127]` activations where `u8≡s8`, the full-range 
 (The retired hand-placed single-tile `_smdb` path measured only ~44–53% of IMMA at these sizes —
 22.8 / 39.8 / 39.0 TFLOP/s @1024³/2048³/4096³; the shipped 64×64 warp-tile with `ldmatrix` + XOR-swizzled
 SMEM is the standing above. Absolute TFLOP/s are clock-bound — only the same-run ratios are stable.)
+
+> **Reproducer correction (2026-08-13).** This table was captioned and cross-referenced to
+> `int8_gemm_vs_peers`, and that bench **cannot produce it**: it loads only the hand-placed
+> `int8_gemm_nt_smdb` / `_smdb128` entries (`crates/wukong_codegen_gpu/src/gpu.rs`, the
+> `int8_gemm_smdb`/`int8_gemm_smdb128` module keys) alongside `_mt` and the single-tile fallback, and
+> has **no `w64` kernel arm on any device** — nothing in it loads `int8_gemm_w64_swz_ptx`. (The `w64`
+> identifiers that appear in neighbouring int8 tests are *warp counts*,
+> `INT8_WARPS_M * INT8_WARPS_N`, not the `w64` tile; do not read them as a w64 arm.)
+> The bench that prints `% of cuBLAS` for the dispatched `w64` labels is **`quant_int8_w64_confirm`**.
+> The numbers in the table are left as measured; only the attribution is corrected, and the row is
+> flagged for a re-run that records which entry produced each cell. This is the same defect class as
+> the retracted Hopper `22–52%` contrast above, caught in the other direction.
 
 **M6 is a decisive, sustained win — ~180–237× the naive hand-written int8 CUDA-C and ~34–58× the dp4a
 SIMD-int8 kernel** across re-runs (the literal "beat C on the GPU" for the quantized path). The SMEM
@@ -2519,8 +2572,9 @@ the shared single f32 rounding), and measured same-run (`int8_dequant_fusion`) t
 kernel costs **~0 over the plain `i32` kernel** (−5%, within noise) — i.e. Wukong gets the dequant free,
 exactly the HBM round-trip + launch cuBLAS structurally must pay — so against the cuBLAS int8 GEMM +
 separate dequant chain, the fused kernel runs **1.1–2.2× same-run** (the competitive GEMM plus the
-eliminated HBM round-trip). Reproduce: `int8_gemm_vs_peers` /
-`int8_dequant_fusion` in `wukong_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH.
+eliminated HBM round-trip). Reproduce: `quant_int8_w64_confirm` (the dispatched-kernel scoreboard) /
+`int8_dequant_fusion` in `wukong_codegen_gpu` with the CUDA 12.9 redist DLLs on PATH. `int8_gemm_vs_peers`
+reproduces only the retired `_smdb` rows — see the reproducer correction above.
 
 **Honest peer scoreboard — vs cuBLAS and naive CUDA-C.** A GPU kernel's only meaningful rivals run on
 the *same GPU*. Both are now measured here (Phase 0 of the GPU plan): the redistributable **NVRTC** +

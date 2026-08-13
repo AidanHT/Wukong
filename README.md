@@ -125,8 +125,13 @@ language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
   > **Device scope (2026-08-11) for the H100 paragraph:** those figures are **H100 80GB HBM3**
   > figures (Hopper, `sm_90a`, 132 SMs, 50 MiB L2, Linux container, cuBLAS with f32 output as the
   > peer) and the 4050 figures above are not — **do not average them or carry a conclusion between
-  > them.** This visit measured that transfer failing: the 4050's int8 tuning, 96–105% of cuBLAS IMMA
-  > at 2048³ there, reads 22–52% of IMMA on the H100. **They are also iteration-grade, not
+  > them.** This visit measured that transfer losing ground: the 4050's int8 dispatcher, 86–88% /
+  > 96–105% / ~70% of cuBLAS int8 GEMM at 1024³/2048³/4096³ there, holds a conservative 67.7% / 71.4%
+  > / 47.9% on the H100. **The sharper "96–105% falls to 22–52% of IMMA" reading published here until
+  > 2026-08-13 is RETRACTED** — it compared two different kernels, because the bench behind the
+  > H100 number times a hand-placed `_smdb` entry that is retired on the 4050 (~44–53% of IMMA there,
+  > not 96–105%) and is dispatched on neither part; `BENCHMARKS.md` carries the full retraction.
+  > **They are also iteration-grade, not
   > publication-grade, and are published under that label:** the container could not lock clocks, and
   > `GPU_RETARGET_PLAN.md` §6.3 says container rounds are *iteration* data while VM rounds with
   > `nvidia-smi -lgc` pinned are *publication* data — every round behind these figures records the

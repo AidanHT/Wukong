@@ -505,9 +505,15 @@ read every percentage below as provisional pending a locked-clock VM re-run.
 - **Fused int8 GEMM+dequant beats the cuBLAS GEMM+dequant chain 1.08× at 1024³ / 1.15× at 2048³**
   (the first outright peer win on this part) and **loses at 4096³, 0.79×**. *(Also single-shot and
   outside the instrument, though same-run and oracle-gated; a repeat under it is owed.)*
-- **Sharp edge:** the 4050's int8 tile/occupancy tuning does **not** transfer — 22–52% of cuBLAS
-  IMMA on Hopper against 96–105% on the 4050. Treat every other Ada-tuned threshold in the section
-  below as unproven on Hopper until it is measured there.
+- **Sharp edge:** the 4050's int8 tile/occupancy tuning **loses ground** on Hopper — the shipped
+  dispatcher holds a conservative **67.7% / 71.4% / 47.9%** of cuBLAS int8 GEMM at 1024³/2048³/4096³
+  there against 86–88% / 96–105% / ~70% on the 4050. **RETRACTED (2026-08-13):** the sharper "22–52%
+  of cuBLAS IMMA against 96–105%" contrast published here compared two different kernels — the H100
+  figure came from a hand-placed `_smdb` entry that is retired on the 4050 (~44–53% of IMMA there) and
+  is dispatched on neither part, so it was never a reading of the shipped Hopper int8 kernel, which
+  has still not been timed against IMMA. `BENCHMARKS.md` carries the retraction. Treat every other
+  Ada-tuned threshold in the section below as unproven on Hopper until it is measured there — and
+  check, before quoting any of them, that the bench behind it times the *dispatched* entry.
 - At the time of those rounds the kernel had **no `wukongc` flag or recognizer route** — every
   2026-08-11 number was measured through `wukong_codegen_gpu`'s own device benches, not from a `.wk`
   program. The route has **since landed** (see the offload section below): on a Hopper part a

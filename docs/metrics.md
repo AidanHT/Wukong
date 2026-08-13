@@ -15,9 +15,13 @@ hardware's clock swings ~3× CPU / ~7× GPU — only same-run ratios and %-of-ro
 > supplies the single cross-visit figure below (f16's scalar baseline) — section
 > `BENCHMARKS.md` → *GPU backend (NVIDIA H100 80GB HBM3, `sm_90a`)*. **Every other GPU figure in this
 > document is an RTX 4050 figure** (scope note immediately below). Do not average the two, and do not
-> carry a conclusion across: this visit measured that transfer failing outright — the 4050's int8
-> tuning, which reaches 96–105% of cuBLAS IMMA at 2048³ *there*, reads **22–52%** of IMMA on the
-> H100. **Every H100 figure in this document is ITERATION-grade, not publication-grade, and is
+> carry a conclusion across: this visit measured that transfer losing ground — the 4050's int8
+> dispatcher, which reaches 86–88% / 96–105% / ~70% of cuBLAS int8 GEMM at 1024³/2048³/4096³ *there*,
+> holds a conservative **67.7% / 71.4% / 47.9%** on the H100. **The stronger "reads 22–52% of IMMA"
+> reading carried here until 2026-08-13 is RETRACTED**: the bench behind it times a hand-placed
+> `_smdb` entry that is *retired* on the 4050 (~44–53% of IMMA there, not 96–105%) and is dispatched
+> on neither part, so it compared two different kernels — `BENCHMARKS.md` has the full retraction.
+> **Every H100 figure in this document is ITERATION-grade, not publication-grade, and is
 > recorded under that label:** the rounds ran in a Modal container whose user cannot call
 > `nvidia-smi -lgc`, and `GPU_RETARGET_PLAN.md` §6.3 rules that "Container rounds are *iteration*
 > data; VM rounds are *publication* data" — each of the eleven 2026-08-11 rounds records the refusal
@@ -140,8 +144,15 @@ Current standing (recorded):
   on the same part: copy **2922 GB/s = 87.2% of the 3352 GB/s spec peak** (≥90% not met). Quantized:
   the **fused int8 GEMM+dequant beats the cuBLAS GEMM+dequant chain 1.08× at 1024³ and 1.15× at
   2048³** — the first outright peer win on Hopper — and **loses at 4096³ (0.79×)**, because the int8
-  GEMM underneath it is itself only **22–52% of cuBLAS IMMA** here: the 4050's tile/occupancy tuning
-  does not transfer and Hopper int8 needs its own search. (Both of those are still *same-run*, and
+  GEMM underneath it (`int8_gemm_nt_smdb_swz_deq` at 1024³, `int8_gemm_nt_w64_swz_deq` at 2048³ and
+  4096³ — the swizzled entries the dispatcher selects) holds only **67.7% / 71.4% / 47.9%** of cuBLAS int8
+  GEMM throughput here — that ratio is conservative, since Wukong's arm also produces the dequantized
+  f32 the cuBLAS column does not — against 86–88% / 96–105% / ~70% for the same dispatcher on the
+  4050, so the 4050's tile/occupancy tuning loses ground and Hopper int8 needs its own search.
+  **RETRACTED (2026-08-13):** this sentence previously read "only 22–52% of cuBLAS IMMA here", which
+  was a reading of a *different* kernel — the retired hand-placed `_smdb` path, which the
+  fused-dequant arm does not use and which the dispatcher selects at none of the three sizes. The
+  shipped Hopper int8 GEMM has never been timed against IMMA directly. (Both of those are still *same-run*, and
   the int8 arms are bit-for-bit gated against the `i32` oracle before timing; what they lack is the
   twin, the floor and the gate.) Peer-bar fact, not a Wukong number:
   cuBLASLt on this device fuses RELU/GELU/BIAS at **both** f32 and f16 output, so only **SiLU** (and
@@ -345,9 +356,12 @@ Remaining, ranked:
    `r10-vs-cublas-v2rule.log`, a round with no elided arm), so where *their* gap sits is unmeasured
    and the 73.4% row in particular is the one worth measuring first. Two further measured holes sit
    beside it: **1024³ is unresolvable in f16** against this peer at the ±5% bar (the peer's own floor
-   is ±15.47%, so that shape needs a different measurement, not a different kernel), and **Hopper
-   int8 is 22–52% of cuBLAS IMMA** because the 4050's tile search does not transfer. Everything past
-   that is planning, not measurement — `docs/roadmap.md` and `docs/gpu/derive/`.
+   is ±15.47%, so that shape needs a different measurement, not a different kernel), and **the shipped
+   Hopper int8 GEMM has never been timed against IMMA at all** — the "22–52% of cuBLAS IMMA" figure
+   that stood here is RETRACTED (2026-08-13): it measured the retired hand-placed `_smdb` entry, which
+   the dispatcher selects at none of the three sizes. What is measured is the fused kernel's
+   **67.7% / 71.4% / 47.9%** of cuBLAS int8 GEMM, so a direct dispatched-entry-vs-IMMA round is owed.
+   Everything past that is planning, not measurement — `docs/roadmap.md` and `docs/gpu/derive/`.
 3. Language blockers that gate real programs: runtime `?` dims, heap tensors, dtype-generic
    tensors (M6; **file I/O now runs** — typed read/write blobs, interp == native).
 4. Decode-path primitives: KV-cache append/decode, top-k/top-p sampling, argsort (CPU).
