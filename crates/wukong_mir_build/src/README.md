@@ -8,6 +8,15 @@
 
 No `tests/` directory — tests are `#[cfg(test)] mod tests` at the bottom of `lib.rs`.
 
+**Recognition is switchable, and every recognizer arm must live inside one of the four gated blocks.**
+`LowerOptions { recognize }` (from `WUKONG_NO_RECOGNIZE`, or cleared per function by `@generic`) rides
+on `GemmSyms` — the struct already threaded to every recognizer and probe — and is read at exactly four
+places: `lower_program`'s whole-function interceptions, `FnLowerer::lower_for`'s cascade,
+`lower_block`'s statement windows, and the elementwise probes opening
+`try_vectorize_for` / `try_vectorize_ranged`. An arm added outside them is a kernel nothing can turn
+off. The autovectorizer, `try_fuse_run`, `@parallel` outlining and the explicit builtins
+(`alloc_*`, `read_*`, `sdpa`, `now_ns`) are deliberately never gated.
+
 Rough `lib.rs` regions (line numbers drift — grep the symbol):
 
 | lines (approx) | region |
