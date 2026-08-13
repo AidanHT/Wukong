@@ -25,6 +25,18 @@
 //!
 //! `Dim::Dynamic` (`?`) is the documented lenient escape hatch in both modes, and `Unknown`/`Error`
 //! on either side short-circuits `unify` — the crate-wide leniency rule.
+//!
+//! **Every shape diagnostic names what disagrees** (master plan §8 task 0.6). A dimension mismatch
+//! names the dim and both values — "dimension mismatch on `K` (axis 0): expected 512, found 513" —
+//! taking the name from the callee's *declared* signature, which is why `unify_decl` carries the
+//! pre-substitution parameter next to the substituted one (`apply_subst` has already erased `K` by
+//! the time the mismatch is found). Where there is no single dim to name the message stays honest
+//! about that instead of inventing one: a rank mismatch names rank against rank plus both shapes,
+//! an index-count mismatch names the count against the rank, an array-decay length error names the
+//! shape and the element count, and an element-type or layout mismatch names the type or the
+//! layout. The codes are unchanged and permanently stable — this is message text, not a protocol.
+//! `crates/wukongc/tests/fail.rs::shape_diagnostics_name_the_dim_in_json` pins the headlines
+//! end-to-end through `--error-format=json`.
 
 use wukong_span::FxHashMap as HashMap;
 
