@@ -56,6 +56,8 @@
 //!  * `flash_d64_ws{,c}`, `flash_d128_ws{,c}_lm` and the 3-stage `flash_d64_ws3` /
 //!    `flash_d128_ws3_lm` — FA2/FA3-style **warp-specialized ping-pong** over disjoint query tiles
 //!    sharing one staged K/V stream; dispatched only under `WUKONG_FLASH_WS=1`.
+//!  * On-demand SOTA variants in this file, **not** in [`flash_ptx`]: GQA seq-pack `_g{g}`,
+//!    GQA group-pack `gqa{g}`, D=256 `mp_lm`/`hs`, D=128 `mp4`. See [`FLASH_SOTA_VARIANTS`].
 //!
 //! `every_dispatchable_flash_entry_is_defined` pins each routing decision to a defined entry.
 //!
@@ -76,7 +78,10 @@
 
 use std::sync::OnceLock;
 
-use crate::gpu::{smem_mode_for, SmemMode, DSMEM_DECL, DSMEM_SYM, STATIC_SMEM_CAP};
+use crate::gpu::{
+    dyn_launch_cfg, smem_mode_for, Gpu, GpuError, SmemMode, DSMEM_DECL, DSMEM_SYM, STATIC_SMEM_CAP,
+};
+use cudarc::driver::PushKernelArg;
 
 /// **(max warps per SM, max thread blocks per SM)** for a compute capability — the two hardware
 /// occupancy limits every "how many warps per CTA?" packing decision in this file derives from.
@@ -148,6 +153,49 @@ pub const FLASH_WARPS: u32 = flash_untiled_warps(8, 9);
 /// count it implies (`warps_cap/8` = 6 on Ada, 8 on A100/H100) is under every part's blocks-per-SM cap
 /// with room to spare. `flash_twarps_is_legal_on_every_target` pins that.
 pub const FLASH_TWARPS: u32 = 8;
+
+/// Documented SMEM-per-SM carveouts the occupancy model divides by (bytes). These are architecture
+/// facts, not probes: the generator must stay device-free, so a test that wants "H100 occupancy"
+/// passes the H100 number rather than asking the driver. Ada is 100 KiB; Hopper's unified L1/SMEM
+/// share that the campaign H100 actually advertised as opt-in is 227 KiB (`232448` B/block) and the
+/// SM pool D2 uses is `228 KiB = 233472` B.
+pub const ADA_SMEM_PER_SM: u32 = 102_400;
+/// A100 164 KiB/SM (Ampere tuning guide).
+pub const A100_SMEM_PER_SM: u32 = 167_936;
+/// H100 228 KiB/SM (Hopper tuning guide). Distinct from the per-block opt-in `232448` B.
+pub const H100_SMEM_PER_SM: u32 = 233_472;
+
+/// Resident warps/SM for a flash CTA, **register-unaware**:
+/// `min(floor(SMEM_sm / smem_cta), blocks_cap, floor(warps_cap / warps_cta)) * warps_cta`.
+///
+/// D2 finding A: a **1-warp** CTA can never exceed `blocks_cap` warps/SM, which on H100 is **32 = 50%**
+/// even with infinite SMEM. `warps_cta >= 2` is the only existing knob that converts H100's extra
+/// warp slots into occupancy. Registers (unchanged 64K/SM on Ada and Hopper) can bind below this
+/// number; this helper does not model them.
+pub const fn flash_resident_warps(
+    cc_major: i32,
+    cc_minor: i32,
+    smem_per_sm: u32,
+    smem_cta: u32,
+    warps_cta: u32,
+) -> u32 {
+    let (warps_cap, blocks_cap) = occupancy_limits(cc_major, cc_minor);
+    // `checked_div` is the occupancy-model form of "infinite SMEM": a zero footprint does not bind.
+    // `unwrap_or` / `Ord::min` are not const-stable on this toolchain, so the None / min arms stay
+    // `match` / `<` -- same arithmetic, const-legal.
+    let by_smem = match smem_per_sm.checked_div(smem_cta) {
+        Some(n) => n,
+        None => blocks_cap,
+    };
+    let by_warp = warps_cap / warps_cta;
+    let ctas = if by_smem < blocks_cap {
+        by_smem
+    } else {
+        blocks_cap
+    };
+    let ctas = if ctas < by_warp { ctas } else { by_warp };
+    ctas * warps_cta
+}
 
 /// Sequence-length crossover: `S >= FLASH_TILE_MIN` dispatches the tiled kernel, else the untiled one.
 /// The same-process A/B bench `flash_tiled_vs_untiled` (the only honest flash comparison — a cross-*run*
@@ -1018,12 +1066,36 @@ fn entry_mma_reg_pipe(
     stages: usize,
     smem_budget: usize,
 ) -> String {
+    // g = 1 is MHA: K/V share the Q/O `ctaid.y` offset. The six-argument twin is the GQA path;
+    // this wrapper is what `flash_ptx()` and the depth grid call, so a GQA edit cannot silently
+    // retouch the shipped 32-entry module (pinned by `flash_ptx_shipped_generators_are_byte_identical`).
+    entry_mma_reg_pipe_gqa(d, causal, pv_ldmatrix, stages, smem_budget, 1)
+}
+
+/// Tensor-core `mp` family with a compile-time GQA group size `gqa_g`.
+///
+/// `gqa_g == 1` is byte-identical to [`entry_mma_reg_pipe`]: Q, K, V and O all add `ctaid.y * S * D`.
+/// `gqa_g > 1` is grouped-query: Q/O keep `ctaid.y` (a **query** head), K/V use `ctaid.y / gqa_g`
+/// (the KV head). Layout is Q/O `[q_heads, S, D]`, K/V `[kv_heads, S, D]` with
+/// `q_heads = gqa_g * kv_heads`. The extra integer ops run once per CTA, not per key.
+///
+/// Name: the historical `flash_d{d}_mp{c}{_lm}{_sN}` spelling at `gqa_g == 1`, plus `_g{g}` otherwise.
+/// On-demand modules (not in [`flash_ptx`]) so a GQA launch does not JIT this onto every MHA call.
+pub(crate) fn entry_mma_reg_pipe_gqa(
+    d: usize,
+    causal: bool,
+    pv_ldmatrix: bool,
+    stages: usize,
+    smem_budget: usize,
+    gqa_g: usize,
+) -> String {
     assert!(d.is_multiple_of(16), "mma flash needs D % 16 == 0");
+    assert!(gqa_g >= 1, "GQA group size must be >= 1 (1 = MHA)");
     assert!(stages >= 1, "flash pipeline needs >= 1 buffer");
     let single_buf = stages == 1;
     assert!(
-        !single_buf || (!causal && !pv_ldmatrix),
-        "single_buf flash is defined only for the non-causal hand-packed kernel (flash_d{d}_m1)"
+        !single_buf || (!causal && !pv_ldmatrix && gqa_g == 1),
+        "single_buf flash is defined only for the non-causal hand-packed MHA kernel (flash_d{d}_m1)"
     );
     let ktq = d / 16; // Q.Kt contraction tiles (over hdim)
     let nto = d / 8; // P.V output n-tiles (over hdim)
@@ -1052,6 +1124,11 @@ fn entry_mma_reg_pipe(
         } else {
             format!("{base}_s{stages}")
         }
+    };
+    let name = if gqa_g == 1 {
+        name
+    } else {
+        format!("{name}_g{gqa_g}")
     };
     assert!(
         smem_total <= smem_budget,
@@ -1098,7 +1175,12 @@ fn entry_mma_reg_pipe(
     // pipeline scratch: bufc/bufp = current/prefetch buffer byte-offsets; next = kb+16; sbase/sk/chunk/
     // lkey/bswap = SMEM address arithmetic.
     s += &format!(
-        "    .reg .b32 {br}%S,%lane,%grp,%tg,%tg2,%row,%qr0,%qr1,%kb,%gkey,%idx,%tmp,%hoff,%bufc,%bufp,%next,%sbase,%sk,%chunk,%lkey,%bswap;\n"
+        "    .reg .b32 {br}%S,%lane,%grp,%tg,%tg2,%row,%qr0,%qr1,%kb,%gkey,%idx,%tmp,%hoff,%bufc,%bufp,%next,%sbase,%sk,%chunk,%lkey,%bswap{};\n",
+        if gqa_g == 1 {
+            String::new()
+        } else {
+            String::from(",%qhead,%kvhead,%khoff")
+        }
     );
     s += "    .reg .b64 %Q,%K,%V,%O,%base,%off;\n";
     // Double-buffered: two K+V slabs to ping-pong (prefetch vs compute). Single-buffered probe: one
@@ -1112,10 +1194,22 @@ fn entry_mma_reg_pipe(
     s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
     s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
     s += "    cvta.to.global.u64 %Q,%Q;\n    cvta.to.global.u64 %K,%K;\n    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %O,%O;\n";
-    // multi-head head base offset (ctaid.y), identical to entry_mma_reg.
-    s += &format!("    mov.u32 %hoff,%ctaid.y;\n    mul.lo.u32 %hoff,%hoff,%S;\n    mul.lo.u32 %hoff,%hoff,{d};\n");
-    s += "    mul.wide.u32 %off,%hoff,2;\n    add.s64 %Q,%Q,%off;\n    add.s64 %K,%K,%off;\n    add.s64 %V,%V,%off;\n";
-    s += "    mul.wide.u32 %off,%hoff,4;\n    add.s64 %O,%O,%off;\n";
+    if gqa_g == 1 {
+        // multi-head head base offset (ctaid.y), identical to entry_mma_reg. Historical spelling —
+        // `flash_ptx_shipped_generators_are_byte_identical` pins every byte of this block.
+        s += &format!("    mov.u32 %hoff,%ctaid.y;\n    mul.lo.u32 %hoff,%hoff,%S;\n    mul.lo.u32 %hoff,%hoff,{d};\n");
+        s += "    mul.wide.u32 %off,%hoff,2;\n    add.s64 %Q,%Q,%off;\n    add.s64 %K,%K,%off;\n    add.s64 %V,%V,%off;\n";
+        s += "    mul.wide.u32 %off,%hoff,4;\n    add.s64 %O,%O,%off;\n";
+    } else {
+        // GQA: Q/O at query head `ctaid.y`; K/V at KV head `ctaid.y / g`. Two integer divides once
+        // per CTA (loop-invariant). Matches paged_attention's `kvhead = q_head / (q_heads / kv_heads)`
+        // with `g` baked in so the production MHA `.param` list stays six arguments.
+        s += &format!("    mov.u32 %qhead,%ctaid.y;\n    mul.lo.u32 %hoff,%qhead,%S;\n    mul.lo.u32 %hoff,%hoff,{d};\n");
+        s += "    mul.wide.u32 %off,%hoff,2;\n    add.s64 %Q,%Q,%off;\n";
+        s += "    mul.wide.u32 %off,%hoff,4;\n    add.s64 %O,%O,%off;\n";
+        s += &format!("    div.u32 %kvhead,%qhead,{gqa_g};\n    mul.lo.u32 %khoff,%kvhead,%S;\n    mul.lo.u32 %khoff,%khoff,{d};\n");
+        s += "    mul.wide.u32 %off,%khoff,2;\n    add.s64 %K,%K,%off;\n    add.s64 %V,%V,%off;\n";
+    }
     s += "    mov.u32 %lane,%tid.x;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
     s += "    mov.u32 %row,%ctaid.x;\n    shl.b32 %row,%row,4;\n    add.u32 %qr0,%row,%grp;\n    add.u32 %qr1,%qr0,8;\n";
 
@@ -1638,7 +1732,7 @@ fn entry_mma_reg_pipe_sp(d: usize) -> String {
 /// `mp4`/`mpw`/`msp` as a measured occupancy/overlap negative; the contraction-split (no redundant QKᵀ,
 /// but a cross-warp partial-score exchange) is not pursued given this evidence. The banked D=128 win
 /// stays the `ldmatrix` SMEM-feed (`flash_d128_mp_lm`), which beats cutlass-efficient ≤1024.
-fn entry_mma_reg_pipe_hs(d: usize) -> String {
+pub(crate) fn entry_mma_reg_pipe_hs(d: usize) -> String {
     assert!(d.is_multiple_of(32), "head-split needs (d/2) % 16 == 0");
     let ktq = d / 16; // full QKᵀ contraction tiles (both warps compute these, redundantly)
     let hh = d / 2; // head-dim half each warp owns
@@ -1829,7 +1923,7 @@ fn entry_mma_reg_pipe_hs(d: usize) -> String {
 /// QKᵀ/softmax/PV and the final store are predicated on `active = row < S`, so a ragged final CTA (when
 /// `warps ∤ S/16`) still stages and still hits the barrier. Non-causal only (a causal CTA would need its
 /// warps to diverge on the key range, breaking the shared barrier); causal stays on `flash_d64_mpc`.
-fn entry_mma_reg_pipe_mw(d: usize, warps: usize) -> String {
+pub(crate) fn entry_mma_reg_pipe_mw(d: usize, warps: usize) -> String {
     assert!(d.is_multiple_of(16), "mma flash needs D % 16 == 0");
     assert!(warps >= 1, "warps must be >= 1");
     let ktq = d / 16;
@@ -2000,6 +2094,189 @@ fn entry_mma_reg_pipe_mw(d: usize, warps: usize) -> String {
     s += &format!("    mov.u32 %kb,%next;\n    bra KB_{name};\n");
 
     // store O[row][c] = o / l_row (active warps only).
+    s += &format!("DONE_{name}:\n    @!%active bra RET_{name};\n");
+    for nt in 0..nto {
+        s += &format!("    div.rn.f32 %o{nt}_0,%o{nt}_0,%l0;\n    div.rn.f32 %o{nt}_1,%o{nt}_1,%l0;\n    div.rn.f32 %o{nt}_2,%o{nt}_2,%l1;\n    div.rn.f32 %o{nt}_3,%o{nt}_3,%l1;\n");
+        s += &format!("    mul.lo.s32 %tmp,%qr0,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %base,%O,%off;\n    st.global.f32 [%base],%o{nt}_0;\n    st.global.f32 [%base+4],%o{nt}_1;\n", nt * 8);
+        s += &format!("    mul.lo.s32 %tmp,%qr1,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,4;\n    add.s64 %base,%O,%off;\n    st.global.f32 [%base],%o{nt}_2;\n    st.global.f32 [%base+4],%o{nt}_3;\n", nt * 8);
+    }
+    s += &format!("RET_{name}:\n    ret;\n}}\n");
+    s
+}
+
+/// **GQA group-packed CTA** (`flash_d{d}_gqa{g}`, non-causal): `g` warps share one staged K/V stream
+/// and each warp owns one query head of the group. `ctaid.y` is the **KV** head; `q_head =
+/// kv_head * g + warpid`. Grid is `(S/16, kv_heads)`, block `32*g`.
+///
+/// This is the Triton `BLOCK_M = q_heads/kv_heads` idiom D2 §5 names, and independently the occupancy
+/// lever D2 finding A names (a 1-warp CTA is block-capped at 32 warps/SM on H100; `g=4` is one Hopper
+/// warpgroup). Distinct from [`entry_mma_reg_pipe_mw`], which packs **query rows** not query heads.
+/// Non-causal only: a causal group would need the warps to share one key range while owning different
+/// heads (legal) — left as a follow-up so the first gate is the offset mapping, not the mask.
+pub(crate) fn entry_mma_reg_pipe_gqa_group(d: usize, g: usize) -> String {
+    assert!(d.is_multiple_of(16), "mma flash needs D % 16 == 0");
+    assert!(
+        g >= 2,
+        "GQA group pack needs g >= 2 (g = 1 is the 1-warp mp kernel)"
+    );
+    let ktq = d / 16;
+    let nto = d / 8;
+    let ksz = 16 * d * 2;
+    let bufsz = 2 * ksz;
+    let nthreads = 32 * g;
+    let nchunk = 16 * d / 8;
+    let stage_iters = nchunk.div_ceil(nthreads);
+    let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    let name = format!("flash_d{d}_gqa{g}");
+
+    let mut s = String::new();
+    s += &format!(
+        ".visible .entry {name}(\n    .param .u32 pS,\n    .param .f32 pScale,\n    .param .u64 pQ,\n    .param .u64 pK,\n    .param .u64 pV,\n    .param .u64 pO\n)\n{{\n"
+    );
+    s += "    .reg .pred %p0,%pnext,%active,%pc;\n";
+    let mut fr = String::from(
+        "%scale,%m0,%m1,%mnew0,%mnew1,%corr0,%corr1,%l0,%l1,%lmax0,%lmax1,%rt,%psum0,%psum1,%pp,%tp0,%tp1,%tp2,%tp3",
+    );
+    for nk in 0..2 {
+        for r in 0..4 {
+            fr += &format!(",%s{nk}_{r}");
+        }
+    }
+    for nt in 0..nto {
+        for r in 0..4 {
+            fr += &format!(",%o{nt}_{r}");
+        }
+    }
+    s += &format!("    .reg .f32 {fr};\n");
+    let mut br = String::new();
+    for kt in 0..ktq {
+        for r in 0..4 {
+            br += &format!("%qa{kt}_{r},");
+        }
+    }
+    br += "%a0,%a1,%a2,%a3,%b0,%b1,%h0,%h1,";
+    s += &format!(
+        "    .reg .b32 {br}%S,%tix,%lane,%warpid,%grp,%tg,%tg2,%qhead,%kvhead,%row,%qr0,%qr1,%kb,%gkey,%idx,%tmp,%hoff,%khoff,%bufc,%bufp,%next,%sbase,%sk,%chunk,%lkey,%bswap;\n"
+    );
+    s += "    .reg .b64 %Q,%K,%V,%O,%base,%off;\n";
+    s += &format!("    .shared .align 16 .b8 smem_{name}[{}];\n", 2 * bufsz);
+
+    s += "    ld.param.u32 %S,[pS];\n    ld.param.f32 %scale,[pScale];\n";
+    s += "    ld.param.u64 %Q,[pQ];\n    ld.param.u64 %K,[pK];\n    ld.param.u64 %V,[pV];\n    ld.param.u64 %O,[pO];\n";
+    s += "    cvta.to.global.u64 %Q,%Q;\n    cvta.to.global.u64 %K,%K;\n    cvta.to.global.u64 %V,%V;\n    cvta.to.global.u64 %O,%O;\n";
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warpid,%tix,5;\n    and.b32 %lane,%tix,31;\n    shr.u32 %grp,%lane,2;\n    and.b32 %tg,%lane,3;\n    shl.b32 %tg2,%tg,1;\n";
+    // kv_head = ctaid.y; q_head = kv_head * g + warpid. K/V offset from kv_head; Q/O from q_head.
+    s += &format!("    mov.u32 %kvhead,%ctaid.y;\n    mul.lo.u32 %khoff,%kvhead,%S;\n    mul.lo.u32 %khoff,%khoff,{d};\n");
+    s += "    mul.wide.u32 %off,%khoff,2;\n    add.s64 %K,%K,%off;\n    add.s64 %V,%V,%off;\n";
+    s += &format!("    mul.lo.u32 %qhead,%kvhead,{g};\n    add.u32 %qhead,%qhead,%warpid;\n");
+    s += &format!("    mul.lo.u32 %hoff,%qhead,%S;\n    mul.lo.u32 %hoff,%hoff,{d};\n");
+    s += "    mul.wide.u32 %off,%hoff,2;\n    add.s64 %Q,%Q,%off;\n";
+    s += "    mul.wide.u32 %off,%hoff,4;\n    add.s64 %O,%O,%off;\n";
+    // Same 16 query rows for every warp of the group (heads, not rows, are what the warps split).
+    s += "    mov.u32 %row,%ctaid.x;\n    shl.b32 %row,%row,4;\n    add.u32 %qr0,%row,%grp;\n    add.u32 %qr1,%qr0,8;\n    setp.lt.u32 %active,%row,%S;\n";
+
+    s += &format!("    @!%active bra SKIPQ_{name};\n");
+    for kt in 0..ktq {
+        s += &format!("    mul.lo.s32 %tmp,%qr0,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_0,[%base];\n", kt * 16);
+        s += &format!("    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_2,[%base];\n");
+        s += &format!("    mul.lo.s32 %tmp,%qr1,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_1,[%base];\n", kt * 16);
+        s += &format!("    add.u32 %tmp,%tmp,8;\n    mul.wide.u32 %off,%tmp,2;\n    add.s64 %base,%Q,%off;\n    ld.global.b32 %qa{kt}_3,[%base];\n");
+    }
+    s += &format!("SKIPQ_{name}:\n");
+    for nt in 0..nto {
+        for r in 0..4 {
+            s += &format!("    mov.f32 %o{nt}_{r},0f00000000;\n");
+        }
+    }
+    s += "    mov.f32 %m0,0fFF800000;\n    mov.f32 %m1,0fFF800000;\n    mov.f32 %l0,0f00000000;\n    mov.f32 %l1,0f00000000;\n";
+
+    let stage = |kbreg: &str, bufreg: &str| -> String {
+        let mut t = String::new();
+        for ci in 0..stage_iters {
+            t += &format!("    add.u32 %chunk,%tix,{};\n", ci * nthreads);
+            t += &format!("    setp.lt.u32 %pc,%chunk,{nchunk};\n");
+            t += &format!("    mul.lo.u32 %tmp,{kbreg},{d};\n    shl.b32 %sk,%chunk,3;\n    add.u32 %tmp,%tmp,%sk;\n    mul.wide.u32 %off,%tmp,2;\n");
+            t += &format!("    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,{bufreg};\n    shl.b32 %sk,%chunk,4;\n    add.u32 %sbase,%sbase,%sk;\n");
+            t += "    add.s64 %base,%K,%off;\n    @%pc cp.async.cg.shared.global [%sbase],[%base],16;\n";
+            t += &format!("    add.u32 %sbase,%sbase,{ksz};\n    add.s64 %base,%V,%off;\n    @%pc cp.async.cg.shared.global [%sbase],[%base],16;\n");
+        }
+        t
+    };
+
+    s += &format!("    mov.u32 %bufc,0;\n    mov.u32 %bufp,{bufsz};\n    mov.u32 %kb,0;\n");
+    s += &stage("%kb", "%bufc");
+    s += "    cp.async.commit_group;\n";
+
+    s += &format!("KB_{name}:\n    setp.ge.u32 %p0,%kb,%S;\n    @%p0 bra DONE_{name};\n");
+    s += "    add.u32 %next,%kb,16;\n    setp.ge.u32 %pnext,%next,%S;\n";
+    s += &format!("    @%pnext bra NOPF_{name};\n");
+    s += &stage("%next", "%bufp");
+    s += &format!(
+        "    cp.async.commit_group;\n    cp.async.wait_group 1;\n    bra PFDONE_{name};\n"
+    );
+    s += &format!("NOPF_{name}:\n    cp.async.wait_group 0;\n");
+    s += &format!("PFDONE_{name}:\n    bar.sync 0;\n");
+    s += &format!("    @!%active bra SKIPC_{name};\n");
+
+    for nk in 0..2 {
+        for r in 0..4 {
+            s += &format!("    mov.f32 %s{nk}_{r},0f00000000;\n");
+        }
+        s += &format!("    add.u32 %lkey,%grp,{};\n", nk * 8);
+        for kt in 0..ktq {
+            s += &format!("    mul.lo.u32 %tmp,%lkey,{d};\n    add.u32 %tmp,%tmp,{};\n    add.u32 %tmp,%tmp,%tg2;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,%tmp;\n", kt * 16);
+            s += "    ld.shared.b32 %b0,[%sbase];\n    ld.shared.b32 %b1,[%sbase+16];\n";
+            s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}},{{%qa{kt}_0,%qa{kt}_1,%qa{kt}_2,%qa{kt}_3}},{{%b0,%b1}},{{%s{nk}_0,%s{nk}_1,%s{nk}_2,%s{nk}_3}};\n");
+        }
+    }
+    s += "    max.f32 %lmax0,%s0_0,%s0_1;\n    max.f32 %lmax0,%lmax0,%s1_0;\n    max.f32 %lmax0,%lmax0,%s1_1;\n    mul.f32 %lmax0,%lmax0,%scale;\n";
+    s += "    max.f32 %lmax1,%s0_2,%s0_3;\n    max.f32 %lmax1,%lmax1,%s1_2;\n    max.f32 %lmax1,%lmax1,%s1_3;\n    mul.f32 %lmax1,%lmax1,%scale;\n";
+    for off in [1, 2] {
+        s += &format!("    shfl.sync.bfly.b32 %rt,%lmax0,{off},0x1f,0xffffffff;\n    max.f32 %lmax0,%lmax0,%rt;\n");
+        s += &format!("    shfl.sync.bfly.b32 %rt,%lmax1,{off},0x1f,0xffffffff;\n    max.f32 %lmax1,%lmax1,%rt;\n");
+    }
+    s += &format!("    max.f32 %mnew0,%m0,%lmax0;\n    sub.f32 %corr0,%m0,%mnew0;\n    mul.f32 %corr0,%corr0,{log2e};\n    ex2.approx.f32 %corr0,%corr0;\n");
+    s += &format!("    max.f32 %mnew1,%m1,%lmax1;\n    sub.f32 %corr1,%m1,%mnew1;\n    mul.f32 %corr1,%corr1,{log2e};\n    ex2.approx.f32 %corr1,%corr1;\n");
+    for nt in 0..nto {
+        s += &format!("    mul.f32 %o{nt}_0,%o{nt}_0,%corr0;\n    mul.f32 %o{nt}_1,%o{nt}_1,%corr0;\n    mul.f32 %o{nt}_2,%o{nt}_2,%corr1;\n    mul.f32 %o{nt}_3,%o{nt}_3,%corr1;\n");
+    }
+    let prob = |dst: &str, sreg: &str, mnew: &str| -> String {
+        format!("    mul.f32 %pp,{sreg},%scale;\n    sub.f32 %pp,%pp,{mnew};\n    mul.f32 %pp,%pp,{log2e};\n    ex2.approx.f32 {dst},%pp;\n")
+    };
+    let pack = |dst: &str, lo: &str, hi: &str| -> String {
+        format!("    cvt.rn.f16.f32 %h0,{lo};\n    and.b32 %h0,%h0,65535;\n    cvt.rn.f16.f32 %h1,{hi};\n    shl.b32 %h1,%h1,16;\n    or.b32 {dst},%h0,%h1;\n")
+    };
+    s += &prob("%tp0", "%s0_0", "%mnew0");
+    s += &prob("%tp1", "%s0_1", "%mnew0");
+    s += &prob("%tp2", "%s1_0", "%mnew0");
+    s += &prob("%tp3", "%s1_1", "%mnew0");
+    s += "    add.f32 %psum0,%tp0,%tp1;\n    add.f32 %psum0,%psum0,%tp2;\n    add.f32 %psum0,%psum0,%tp3;\n";
+    s += &pack("%a0", "%tp0", "%tp1");
+    s += &pack("%a2", "%tp2", "%tp3");
+    s += &prob("%tp0", "%s0_2", "%mnew1");
+    s += &prob("%tp1", "%s0_3", "%mnew1");
+    s += &prob("%tp2", "%s1_2", "%mnew1");
+    s += &prob("%tp3", "%s1_3", "%mnew1");
+    s += "    add.f32 %psum1,%tp0,%tp1;\n    add.f32 %psum1,%psum1,%tp2;\n    add.f32 %psum1,%psum1,%tp3;\n";
+    s += &pack("%a1", "%tp0", "%tp1");
+    s += &pack("%a3", "%tp2", "%tp3");
+    for off in [1, 2] {
+        s += &format!("    shfl.sync.bfly.b32 %rt,%psum0,{off},0x1f,0xffffffff;\n    add.f32 %psum0,%psum0,%rt;\n");
+        s += &format!("    shfl.sync.bfly.b32 %rt,%psum1,{off},0x1f,0xffffffff;\n    add.f32 %psum1,%psum1,%rt;\n");
+    }
+    s += "    fma.rn.f32 %l0,%l0,%corr0,%psum0;\n    fma.rn.f32 %l1,%l1,%corr1,%psum1;\n";
+    s += "    mov.f32 %m0,%mnew0;\n    mov.f32 %m1,%mnew1;\n";
+    for nt in 0..nto {
+        s += &format!("    add.u32 %idx,%grp,{};\n", nt * 8);
+        s += &format!("    mul.lo.u32 %tmp,%tg2,{d};\n    add.u32 %tmp,%tmp,%idx;\n    shl.b32 %tmp,%tmp,1;\n    mov.u32 %sbase,smem_{name};\n    add.u32 %sbase,%sbase,%bufc;\n    add.u32 %sbase,%sbase,{ksz};\n    add.u32 %sbase,%sbase,%tmp;\n");
+        s += &format!("    ld.shared.u16 %h0,[%sbase];\n    ld.shared.u16 %h1,[%sbase+{}];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b0,%h0,%h1;\n", 2 * d);
+        s += &format!("    ld.shared.u16 %h0,[%sbase+{}];\n    ld.shared.u16 %h1,[%sbase+{}];\n    shl.b32 %h1,%h1,16;\n    or.b32 %b1,%h0,%h1;\n", 16 * d, 18 * d);
+        s += &format!("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}},{{%a0,%a1,%a2,%a3}},{{%b0,%b1}},{{%o{nt}_0,%o{nt}_1,%o{nt}_2,%o{nt}_3}};\n");
+    }
+    s += &format!("SKIPC_{name}:\n    bar.sync 0;\n");
+    s += "    mov.u32 %bswap,%bufc;\n    mov.u32 %bufc,%bufp;\n    mov.u32 %bufp,%bswap;\n";
+    s += &format!("    mov.u32 %kb,%next;\n    bra KB_{name};\n");
+
     s += &format!("DONE_{name}:\n    @!%active bra RET_{name};\n");
     for nt in 0..nto {
         s += &format!("    div.rn.f32 %o{nt}_0,%o{nt}_0,%l0;\n    div.rn.f32 %o{nt}_1,%o{nt}_1,%l0;\n    div.rn.f32 %o{nt}_2,%o{nt}_2,%l1;\n    div.rn.f32 %o{nt}_3,%o{nt}_3,%l1;\n");
@@ -3227,6 +3504,11 @@ pub const WMMA_FLASH_NKB: usize = 4;
 /// Head dims with a generated kernel (the common transformer values).
 pub const SUPPORTED_D: [usize; 3] = [32, 64, 128];
 
+/// Tensor-core flash head dims. `64`/`128` ship in [`flash_ptx`]; `256` is generated on demand
+/// ([`flash_sota_ptx`]) because `nto = D/8 = 32` PV tiles is a 128-accumulator register
+/// problem, not an SMEM one (D2 finding D: Bc=16/2-stage is 32 KiB, under the 48 KiB static cap).
+pub const TENSOR_CORE_D: [usize; 3] = [64, 128, 256];
+
 /// One row of the **flash depth × staging-width grid** — the `(D, BK, ring depth, causal, feed)`
 /// point, its stable module-cache key **and** its PTX entry name in one `&'static str`.
 ///
@@ -3481,6 +3763,397 @@ pub fn flash_stage_ptx(v: &FlashStageCfg, smem_budget: usize) -> (String, SmemMo
     (m, mode)
 }
 
+/// How an on-demand SOTA flash entry is generated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlashSotaKind {
+    /// [`entry_mma_reg_pipe_gqa`]: 1 warp/CTA. `gqa_g == 1` is MHA (D=256); `gqa_g > 1` is seq-pack
+    /// GQA (`ctaid.y` = query head, K/V at `ctaid.y / g`).
+    Pipe {
+        d: usize,
+        causal: bool,
+        pv_ldmatrix: bool,
+        gqa_g: usize,
+    },
+    /// [`entry_mma_reg_pipe_hs`]: 2 warps split the output head dim. D=256 unlock (D2 finding D).
+    Hs { d: usize },
+    /// [`entry_mma_reg_pipe_mw`]: `warps` warps pack consecutive 16-row query tiles, shared K/V.
+    Mw { d: usize, warps: usize },
+    /// [`entry_mma_reg_pipe_gqa_group`]: `g` warps share K/V; `ctaid.y` = KV head;
+    /// `q_head = kv_head * g + warpid`.
+    Group { d: usize, g: usize },
+}
+
+/// One on-demand SOTA flash module. Name is the PTX entry **and** the `Gpu::function` cache key.
+#[derive(Clone, Copy, Debug)]
+pub struct FlashSotaCfg {
+    pub name: &'static str,
+    pub kind: FlashSotaKind,
+}
+
+impl FlashSotaCfg {
+    pub const fn d(self) -> usize {
+        match self.kind {
+            FlashSotaKind::Pipe { d, .. }
+            | FlashSotaKind::Hs { d }
+            | FlashSotaKind::Mw { d, .. }
+            | FlashSotaKind::Group { d, .. } => d,
+        }
+    }
+
+    /// GQA group size. `1` for MHA (D=256 / mp4 / hs).
+    pub const fn gqa_g(self) -> usize {
+        match self.kind {
+            FlashSotaKind::Pipe { gqa_g, .. } => gqa_g,
+            FlashSotaKind::Group { g, .. } => g,
+            FlashSotaKind::Hs { .. } | FlashSotaKind::Mw { .. } => 1,
+        }
+    }
+
+    pub const fn causal(self) -> bool {
+        match self.kind {
+            FlashSotaKind::Pipe { causal, .. } => causal,
+            _ => false,
+        }
+    }
+
+    /// Threads per CTA.
+    pub const fn threads(self) -> u32 {
+        match self.kind {
+            FlashSotaKind::Pipe { .. } => 32,
+            FlashSotaKind::Hs { .. } => 64,
+            FlashSotaKind::Mw { warps, .. } => 32 * warps as u32,
+            FlashSotaKind::Group { g, .. } => 32 * g as u32,
+        }
+    }
+
+    /// 2-stage K+V slab: `2 * 2 * 16 * D * 2` = `128 * D` bytes. All current rows sit under the
+    /// 48 KiB static ISA cap (D=256 is 32 KiB -- D2 finding D: never SMEM-blocked).
+    pub const fn smem_bytes(self) -> usize {
+        128 * self.d()
+    }
+
+    pub const fn smem_mode(self) -> SmemMode {
+        smem_mode_for(self.smem_bytes())
+    }
+
+    /// `grid.y`: query heads for seq-pack / MHA; KV heads for group-pack.
+    pub const fn grid_y(self, q_heads: u32, kv_heads: u32) -> u32 {
+        match self.kind {
+            FlashSotaKind::Group { .. } => kv_heads,
+            _ => q_heads,
+        }
+    }
+}
+
+/// # HANDOFF (`gpu.rs` -- do not apply in this commit)
+///
+/// Concurrent lane owns `gpu.rs`. Precise seams:
+///
+/// 1. **`EXPECTED_MODULES` (`gpu.rs` ~8650, currently 128).** These rows are **not** in
+///    `device_free_modules()`. If the gpu.rs owner adds them, push
+///    `(v.name.to_string(), crate::ptx_flash::flash_sota_ptx(v).0)` for each
+///    [`FLASH_SOTA_VARIANTS`] row and bump 128 -> 128+[`FLASH_SOTA_VARIANTS`].len() (12). Do not add them to `flash_ptx()`.
+///    SOTA lives in `ptx_flash.rs` so `CRATE_SOURCES` (~7961) does not move.
+/// 2. **`wmma_flash_applies` (~3560).** Today `(d == 64 || d == 128)`. D=256 is generated here
+///    (`flash_d256_mp_lm` / `flash_d256_hs`). Do **not** add 256 to `SUPPORTED_D` without also
+///    changing `wmma_flash_entry` -- `flash_attn` would assert-pass then panic.
+///    Route D=256 through [`flash_attn_sota`], not `flash_ptx()`.
+/// 3. **`wmma_flash_entry` (~3591).** No `256` arm. A `256 => "flash_d256_mp_lm"` arm is only
+///    correct if the caller loads [`flash_sota_ptx`] under that name, never `"flash"`.
+/// 4. **`wmma_flash_cfg` / `wmma_flash_plan` (~3605 / ~3673).** 1 warp/CTA, `grid.y = heads` as
+///    **query** heads. Seq-pack GQA (`_g{g}`) wants that geometry with K/V sized for `kv_heads`.
+///    Group-pack (`gqa{g}`) wants `grid.y = kv_heads` and `block_dim = 32*g`. `mp4` wants
+///    `block_dim = 128`. Do not reuse [`crate::gpu::flash_f16_launch`] for GQA: it asserts
+///    `q/k/v.len() == seq*d`.
+/// 5. **Hopper occupancy.** `FLASH_WARPS=2` is the undispatched f32 packing. The real cap is the
+///    implicit 1-warp CTA in `wmma_flash_cfg` (D2 finding A: 32 warps/SM = 50%). Dispatch
+///    `flash_d64_mp4` / `flash_d128_mp4` / `gqa4` when the 1-warp grid cannot fill 64 warps/SM.
+///
+/// On-demand SOTA flash rows. Not in [`flash_ptx`].
+pub const FLASH_SOTA_VARIANTS: &[FlashSotaCfg] = &[
+    FlashSotaCfg {
+        name: "flash_d64_mp_g4",
+        kind: FlashSotaKind::Pipe {
+            d: 64,
+            causal: false,
+            pv_ldmatrix: false,
+            gqa_g: 4,
+        },
+    },
+    FlashSotaCfg {
+        name: "flash_d64_mpc_g4",
+        kind: FlashSotaKind::Pipe {
+            d: 64,
+            causal: true,
+            pv_ldmatrix: false,
+            gqa_g: 4,
+        },
+    },
+    FlashSotaCfg {
+        name: "flash_d128_mp_lm_g4",
+        kind: FlashSotaKind::Pipe {
+            d: 128,
+            causal: false,
+            pv_ldmatrix: true,
+            gqa_g: 4,
+        },
+    },
+    FlashSotaCfg {
+        name: "flash_d128_mpc_lm_g4",
+        kind: FlashSotaKind::Pipe {
+            d: 128,
+            causal: true,
+            pv_ldmatrix: true,
+            gqa_g: 4,
+        },
+    },
+    FlashSotaCfg {
+        name: "flash_d128_mp_lm_g8",
+        kind: FlashSotaKind::Pipe {
+            d: 128,
+            causal: false,
+            pv_ldmatrix: true,
+            gqa_g: 8,
+        },
+    },
+    FlashSotaCfg {
+        name: "flash_d128_mpc_lm_g8",
+        kind: FlashSotaKind::Pipe {
+            d: 128,
+            causal: true,
+            pv_ldmatrix: true,
+            gqa_g: 8,
+        },
+    },
+    FlashSotaCfg {
+        name: "flash_d256_mp_lm",
+        kind: FlashSotaKind::Pipe {
+            d: 256,
+            causal: false,
+            pv_ldmatrix: true,
+            gqa_g: 1,
+        },
+    },
+    FlashSotaCfg {
+        name: "flash_d256_mpc_lm",
+        kind: FlashSotaKind::Pipe {
+            d: 256,
+            causal: true,
+            pv_ldmatrix: true,
+            gqa_g: 1,
+        },
+    },
+    FlashSotaCfg {
+        name: "flash_d256_hs",
+        kind: FlashSotaKind::Hs { d: 256 },
+    },
+    FlashSotaCfg {
+        name: "flash_d128_mp4",
+        kind: FlashSotaKind::Mw { d: 128, warps: 4 },
+    },
+    FlashSotaCfg {
+        name: "flash_d64_gqa4",
+        kind: FlashSotaKind::Group { d: 64, g: 4 },
+    },
+    FlashSotaCfg {
+        name: "flash_d128_gqa4",
+        kind: FlashSotaKind::Group { d: 128, g: 4 },
+    },
+];
+
+/// Generate one [`FLASH_SOTA_VARIANTS`] row as a single-entry `sm_80` module.
+pub fn flash_sota_ptx(v: &FlashSotaCfg) -> (String, SmemMode) {
+    let entry = match v.kind {
+        FlashSotaKind::Pipe {
+            d,
+            causal,
+            pv_ldmatrix,
+            gqa_g,
+        } => entry_mma_reg_pipe_gqa(d, causal, pv_ldmatrix, 2, STATIC_SMEM_CAP, gqa_g),
+        FlashSotaKind::Hs { d } => entry_mma_reg_pipe_hs(d),
+        FlashSotaKind::Mw { d, warps } => entry_mma_reg_pipe_mw(d, warps),
+        FlashSotaKind::Group { d, g } => entry_mma_reg_pipe_gqa_group(d, g),
+    };
+    assert!(
+        entry.contains(&format!(".visible .entry {}(", v.name)),
+        "{}: generator derived a different entry name",
+        v.name
+    );
+    let mode = v.smem_mode();
+    let mut m = String::from(crate::ptx_target::HDR_SM80);
+    if mode.is_dynamic() {
+        m += DSMEM_DECL;
+    }
+    m += &entry;
+    (m, mode)
+}
+
+/// Single-head f64 full-softmax attention. Prints **every** output lane (never a reduction).
+/// Expected values come from scalar semantics, not from compiler output.
+pub fn ref_attn(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    d: usize,
+    scale: f32,
+    causal: bool,
+) -> Vec<f32> {
+    assert_eq!(q.len(), seq * d);
+    assert_eq!(k.len(), seq * d);
+    assert_eq!(v.len(), seq * d);
+    let mut o = vec![0f32; seq * d];
+    let scale = scale as f64;
+    for i in 0..seq {
+        let mut scores = vec![0f64; seq];
+        let mut m = f64::NEG_INFINITY;
+        for j in 0..seq {
+            if causal && j > i {
+                scores[j] = f64::NEG_INFINITY;
+                continue;
+            }
+            let mut dot = 0.0f64;
+            for t in 0..d {
+                dot += q[i * d + t] as f64 * k[j * d + t] as f64;
+            }
+            scores[j] = scale * dot;
+            m = m.max(scores[j]);
+        }
+        let mut den = 0.0f64;
+        for score in scores.iter_mut() {
+            if score.is_finite() {
+                *score = (*score - m).exp();
+                den += *score;
+            } else {
+                *score = 0.0;
+            }
+        }
+        for t in 0..d {
+            let mut acc = 0.0f64;
+            for j in 0..seq {
+                acc += (scores[j] / den) * v[j * d + t] as f64;
+            }
+            o[i * d + t] = acc as f32;
+        }
+    }
+    o
+}
+
+/// Grouped-query attention: Q/O are `[q_heads, S, D]`, K/V are `[kv_heads, S, D]`,
+/// `q_heads = g * kv_heads`, KV head = `q_head / g`. Every O lane is produced.
+pub fn ref_attn_gqa(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    d: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    scale: f32,
+    causal: bool,
+) -> Vec<f32> {
+    assert!(
+        q_heads.is_multiple_of(kv_heads) && kv_heads >= 1,
+        "q_heads={q_heads} must be a positive multiple of kv_heads={kv_heads}"
+    );
+    let g = q_heads / kv_heads;
+    assert_eq!(q.len(), q_heads * seq * d);
+    assert_eq!(k.len(), kv_heads * seq * d);
+    assert_eq!(v.len(), kv_heads * seq * d);
+    let mut o = vec![0f32; q_heads * seq * d];
+    let head = seq * d;
+    for qh in 0..q_heads {
+        let kvh = qh / g;
+        let oh = ref_attn(
+            &q[qh * head..(qh + 1) * head],
+            &k[kvh * head..(kvh + 1) * head],
+            &v[kvh * head..(kvh + 1) * head],
+            seq,
+            d,
+            scale,
+            causal,
+        );
+        o[qh * head..(qh + 1) * head].copy_from_slice(&oh);
+    }
+    o
+}
+
+/// Launch one [`FLASH_SOTA_VARIANTS`] row. Q is `[q_heads, S, D]`; K/V are `[kv_heads, S, D]`.
+/// Does **not** go through `flash_f16_launch` (that seam asserts MHA buffer lengths).
+pub fn flash_attn_sota(
+    g: &mut Gpu,
+    row: &FlashSotaCfg,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    scale: f32,
+) -> Result<Vec<f32>, GpuError> {
+    use half::f16;
+    let d = row.d();
+    let gg = row.gqa_g();
+    assert_eq!(
+        q_heads,
+        kv_heads * gg,
+        "{}: q_heads must equal kv_heads*{gg}",
+        row.name
+    );
+    assert_eq!(
+        q.len(),
+        q_heads * seq * d,
+        "{}: Q must be q_heads*S*D",
+        row.name
+    );
+    assert_eq!(
+        k.len(),
+        kv_heads * seq * d,
+        "{}: K must be kv_heads*S*D",
+        row.name
+    );
+    assert_eq!(
+        v.len(),
+        kv_heads * seq * d,
+        "{}: V must be kv_heads*S*D",
+        row.name
+    );
+    assert!(
+        seq >= 16 && seq.is_multiple_of(16),
+        "{}: S={seq} must be a non-zero multiple of the 16-query-row block",
+        row.name
+    );
+    let (ptx, mode) = flash_sota_ptx(row);
+    let (f, dyn_bytes) = g.function_smem(row.name, &ptx, row.name, mode)?;
+    let to16 = |x: &[f32]| -> Vec<u16> { x.iter().map(|&t| f16::from_f32(t).to_bits()).collect() };
+    let q16 = to16(q);
+    let k16 = to16(k);
+    let v16 = to16(v);
+    let q_d = g.stream.memcpy_stod(&q16)?;
+    let k_d = g.stream.memcpy_stod(&k16)?;
+    let v_d = g.stream.memcpy_stod(&v16)?;
+    let mut o_d = g.stream.alloc_zeros::<f32>(q_heads * seq * d)?;
+    let s32 = seq as u32;
+    let mut bld = g.stream.launch_builder(&f);
+    bld.arg(&s32)
+        .arg(&scale)
+        .arg(&q_d)
+        .arg(&k_d)
+        .arg(&v_d)
+        .arg(&mut o_d);
+    let cfg = dyn_launch_cfg(
+        (
+            (seq / 16) as u32,
+            row.grid_y(q_heads as u32, kv_heads as u32),
+            1,
+        ),
+        (row.threads(), 1, 1),
+        dyn_bytes,
+    );
+    unsafe { bld.launch(cfg)? };
+    Ok(g.stream.memcpy_dtov(&o_d)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3516,6 +4189,14 @@ mod tests {
             .collect()
     }
 
+    fn param_count(ptx: &str, name: &str) -> usize {
+        let tag = format!(".visible .entry {name}(");
+        let start = ptx.find(&tag).expect(name) + tag.len();
+        let body = &ptx[start..];
+        let end = body.find('{').expect("entry body");
+        body[..end].matches(".param ").count()
+    }
+
     /// B1: a single non-ASCII byte anywhere in the module is a `ptxas fatal` at `cuModuleLoadData`,
     /// and this file's prose is written with `.`/`x`-style math characters right next to the
     /// `format!`s that build the kernels. Nothing but this test keeps the emitted text ASCII, and a
@@ -3530,6 +4211,9 @@ mod tests {
         // `x`/`.`-heavy prose, and a GPU-less `cargo test` never loads a module.
         for v in FLASH_STAGE_VARIANTS {
             modules.push((v.name.to_string(), flash_stage_ptx(v, ADA_OPTIN_BUDGET).0));
+        }
+        for v in FLASH_SOTA_VARIANTS {
+            modules.push((v.name.to_string(), flash_sota_ptx(v).0));
         }
         for (label, ptx) in modules {
             if let Some((i, line)) = ptx.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
@@ -3827,6 +4511,41 @@ mod tests {
         }
     }
 
+    /// **D2 finding A, device-free.** A 1-warp CTA is block-capped at `blocks_cap` warps/SM, which on
+    /// H100 is **32 = 50%** of the 64-warp pool even with infinite SMEM. The production `flash_d64_mp`
+    /// (8 KiB, 1 warp) is SMEM-bound below that cap (28 on H100, 12 on Ada). `mp4` (same 8 KiB, 4
+    /// warps) is the existing knob that converts H100's extra warp slots: Ada 48, H100 64 (warp-capped).
+    /// `FLASH_WARPS=2` does not govern this family (it is the undispatched f32 untiled packing).
+    #[test]
+    fn flash_one_warp_cta_is_block_capped_on_h100() {
+        const MP_SMEM: u32 = 8 * 1024; // D=64, 2-stage K+V, closed form 64*stages*D
+        assert_eq!(
+            flash_resident_warps(8, 9, ADA_SMEM_PER_SM, MP_SMEM, 1),
+            12,
+            "Ada d64-mp: floor(100KiB/8KiB)=12 binds before 24 blocks"
+        );
+        assert_eq!(
+            flash_resident_warps(9, 0, H100_SMEM_PER_SM, MP_SMEM, 1),
+            28,
+            "H100 d64-mp: floor(228KiB/8KiB)=28 binds before 32 blocks"
+        );
+        assert_eq!(
+            flash_resident_warps(9, 0, H100_SMEM_PER_SM, 1, 1),
+            32,
+            "H100 1-warp CTA with negligible SMEM still cannot exceed the 32-block cap (50%)"
+        );
+        assert_eq!(
+            flash_resident_warps(8, 9, ADA_SMEM_PER_SM, MP_SMEM, 4),
+            48,
+            "Ada mp4: warp-capped at 48"
+        );
+        assert_eq!(
+            flash_resident_warps(9, 0, H100_SMEM_PER_SM, MP_SMEM, 4),
+            64,
+            "H100 mp4: warp-capped at 64 -- the only existing CTA shape that fills the Hopper warp pool"
+        );
+    }
+
     /// **The grid's SMEM arithmetic, emission form and window discipline (no GPU).** Four things a
     /// wrong dynamic-SMEM kernel gets wrong silently, each checked from the text:
     ///   * the closed form `stages·2·BK·D·2` and the 48 KiB boundary that splits static from dynamic;
@@ -4114,6 +4833,265 @@ mod tests {
             .expect("grid row");
         assert!(!v.fits(64 * 1024), "the decline test must reject it first");
         let _ = flash_stage_ptx(v, 64 * 1024);
+    }
+
+    /// Structural sanity for every on-demand SOTA row: unique name, sm_80 floor, six params,
+    /// static SMEM closed form, one entry per module.
+    #[test]
+    fn flash_sota_ptx_is_structurally_well_formed() {
+        let mut names: Vec<&str> = FLASH_SOTA_VARIANTS.iter().map(|v| v.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            FLASH_SOTA_VARIANTS.len(),
+            "duplicate SOTA name is a duplicate module-cache key"
+        );
+        assert_eq!(
+            FLASH_SOTA_VARIANTS.len(),
+            12,
+            "HANDOFF EXPECTED_MODULES bump is 128+this"
+        );
+        for v in FLASH_SOTA_VARIANTS {
+            let (ptx, mode) = flash_sota_ptx(v);
+            assert!(
+                ptx.starts_with(crate::ptx_target::HDR_SM80),
+                "{}: sm_80 floor (mma.sync is Ampere-legal; Hopper skip is not required)",
+                v.name
+            );
+            assert_eq!(
+                ptx.matches('{').count(),
+                ptx.matches('}').count(),
+                "{}",
+                v.name
+            );
+            let got = entry_names(&ptx);
+            assert_eq!(got, [v.name], "{}: one entry per module", v.name);
+            assert_eq!(
+                param_count(&ptx, v.name),
+                6,
+                "{}: six .param (S, scale, Q, K, V, O)",
+                v.name
+            );
+            assert_eq!(mode, v.smem_mode());
+            assert!(
+                !mode.is_dynamic(),
+                "{}: SOTA rows are under the 48 KiB static cap ({} B)",
+                v.name,
+                v.smem_bytes()
+            );
+            assert!(
+                ptx.contains(&format!(
+                    ".shared .align 16 .b8 smem_{}[{}]",
+                    v.name,
+                    v.smem_bytes()
+                )),
+                "{}: static SMEM declaration must match closed form {} B",
+                v.name,
+                v.smem_bytes()
+            );
+        }
+    }
+
+    /// g=1 keeps the historical four-line `ctaid.y` offset so the shipped FNV digest cannot move.
+    /// g>1 is the only path that emits `div.u32 %kvhead`.
+    #[test]
+    fn gqa_seq_pack_offsets_q_from_kv() {
+        let g1 = entry_mma_reg_pipe_gqa(64, false, false, 2, STATIC_SMEM_CAP, 1);
+        let g4 = entry_mma_reg_pipe_gqa(64, false, false, 2, STATIC_SMEM_CAP, 4);
+        assert!(
+            flash_ptx().contains(&g1),
+            "gqa_g=1 must stay byte-identical to the shipped flash_d64_mp"
+        );
+        assert!(
+            g1.contains("mov.u32 %hoff,%ctaid.y;")
+                && g1.contains("add.s64 %Q,%Q,%off;")
+                && g1.contains("add.s64 %K,%K,%off;")
+                && g1.contains("add.s64 %V,%V,%off;"),
+            "g=1 historical spelling: Q,K,V share ctaid.y"
+        );
+        assert!(
+            !g1.contains("div.u32 %kvhead"),
+            "g=1 must not emit the GQA divide (that would move the FNV digest)"
+        );
+        assert!(g4.contains(".visible .entry flash_d64_mp_g4("));
+        assert!(
+            g4.contains("div.u32 %kvhead,%qhead,4;"),
+            "seq-pack GQA: kv_head = q_head / g, g baked in so the .param list stays six args"
+        );
+        assert!(
+            g4.contains("mov.u32 %qhead,%ctaid.y;"),
+            "seq-pack: ctaid.y is the query head"
+        );
+        assert!(
+            !g4.contains("add.s64 %K,%K,%off;\n    add.s64 %V,%V,%off;")
+                || g4.contains("mul.wide.u32 %off,%khoff,2;"),
+            "K/V must be offset from %khoff, not the Q %hoff"
+        );
+    }
+
+    /// Group-pack: `ctaid.y` is the KV head; `q_head = kv_head * g + warpid`.
+    #[test]
+    fn gqa_group_pack_maps_qhead_from_kvhead_and_warpid() {
+        let ptx = entry_mma_reg_pipe_gqa_group(64, 4);
+        assert!(ptx.contains(".visible .entry flash_d64_gqa4("));
+        assert!(ptx.contains("mov.u32 %kvhead,%ctaid.y;"));
+        assert!(ptx.contains("mul.lo.u32 %qhead,%kvhead,4;"));
+        assert!(ptx.contains("add.u32 %qhead,%qhead,%warpid;"));
+        assert!(
+            !ptx.contains("div.u32 %kvhead"),
+            "group-pack starts from the KV head; it must not divide a query head"
+        );
+    }
+
+    /// D=256 was never SMEM-blocked (D2 finding D): Bc=16 / 2-stage is 32 KiB, under the 48 KiB
+    /// static cap. `nto = D/8 = 32` is the register problem (`hs` halves it).
+    #[test]
+    fn d256_is_static_32kib_and_not_in_supported_d() {
+        assert!(TENSOR_CORE_D.contains(&256));
+        assert!(
+            !SUPPORTED_D.contains(&256),
+            "do not add 256 to SUPPORTED_D without a wmma_flash_entry arm (HANDOFF)"
+        );
+        let mp = flash_sota_ptx(
+            FLASH_SOTA_VARIANTS
+                .iter()
+                .find(|v| v.name == "flash_d256_mp_lm")
+                .unwrap(),
+        )
+        .0;
+        assert!(mp.contains(".shared .align 16 .b8 smem_flash_d256_mp_lm[32768];"));
+        assert!(
+            mp.contains("%o31_0"),
+            "D=256 mp_lm: nto=32 PV tiles (128 O-accumulators) -- the register wall, not SMEM"
+        );
+        let hs = flash_sota_ptx(
+            FLASH_SOTA_VARIANTS
+                .iter()
+                .find(|v| v.name == "flash_d256_hs")
+                .unwrap(),
+        )
+        .0;
+        assert!(hs.contains(".shared .align 16 .b8 smem_flash_d256_hs[32768];"));
+        assert!(
+            hs.contains("%o15_0") && !hs.contains("%o16_0"),
+            "D=256 hs: nto=16 per warp (half the O-accumulators)"
+        );
+    }
+
+    /// Host oracle: GQA on repeated KV equals concatenating per-head MHA. Every lane, not a sum.
+    #[test]
+    fn ref_attn_gqa_matches_per_head_mha_on_repeated_kv() {
+        let (seq, d, g) = (4usize, 8usize, 4usize);
+        let kv_heads = 1usize;
+        let q_heads = g * kv_heads;
+        let mut rng = crate::diff::Rng::new(0xA77E_0001);
+        let q = rng.vec(q_heads * seq * d, -1.0, 1.0);
+        let k = rng.vec(kv_heads * seq * d, -1.0, 1.0);
+        let v = rng.vec(kv_heads * seq * d, -1.0, 1.0);
+        let scale = 1.0 / (d as f32).sqrt();
+        for causal in [false, true] {
+            let gqa = ref_attn_gqa(&q, &k, &v, seq, d, q_heads, kv_heads, scale, causal);
+            let head = seq * d;
+            for qh in 0..q_heads {
+                let mha = ref_attn(
+                    &q[qh * head..(qh + 1) * head],
+                    &k,
+                    &v,
+                    seq,
+                    d,
+                    scale,
+                    causal,
+                );
+                assert_eq!(
+                    &gqa[qh * head..(qh + 1) * head],
+                    mha.as_slice(),
+                    "qh={qh} causal={causal}: GQA oracle must equal per-head MHA on shared KV"
+                );
+            }
+        }
+    }
+
+    fn with_gpu(name: &str, body: impl FnOnce(&mut Gpu)) {
+        let mut guard = crate::gpu::gpu();
+        match guard.as_mut() {
+            Some(g) => body(g),
+            None => {
+                let why = crate::gpu::init_error().unwrap_or("no CUDA device reachable");
+                crate::diff::skip_or_fail(name, why);
+            }
+        }
+    }
+
+    fn round16(x: Vec<f32>) -> Vec<f32> {
+        use half::f16;
+        x.into_iter().map(|v| f16::from_f32(v).to_f32()).collect()
+    }
+
+    fn run_row(g: &mut Gpu, name: &str, seq: usize, q_heads: usize, kv_heads: usize) {
+        let row = FLASH_SOTA_VARIANTS
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("unknown SOTA row {name}"));
+        let d = row.d();
+        let mut rng = crate::diff::Rng::new(0xF1A5_50A0 ^ (name.len() as u64) << 8 ^ seq as u64);
+        let q = round16(rng.vec(q_heads * seq * d, -1.0, 1.0));
+        let k = round16(rng.vec(kv_heads * seq * d, -1.0, 1.0));
+        let v = round16(rng.vec(kv_heads * seq * d, -1.0, 1.0));
+        let scale = 1.0 / (d as f32).sqrt();
+        let oracle = ref_attn_gqa(&q, &k, &v, seq, d, q_heads, kv_heads, scale, row.causal());
+        let got = flash_attn_sota(g, row, &q, &k, &v, seq, q_heads, kv_heads, scale)
+            .unwrap_or_else(|e| panic!("{name}: launch failed: {e}"));
+        assert_eq!(
+            got.len(),
+            oracle.len(),
+            "{name}: O is q_heads*S*D, every lane"
+        );
+        let s = crate::diff::assert_close(name, &got, &oracle, 2e-3, 2e-2);
+        eprintln!(
+            "  {name} S={seq} qH={q_heads} kvH={kv_heads} D={d} lanes={} max_abs={:.2e} max_rel={:.2e}",
+            got.len(),
+            s.max_abs,
+            s.max_rel
+        );
+    }
+
+    /// Seq-pack GQA on the production mp pipe. sm_80 `mma.sync` -- runs on the 4050; no Hopper skip.
+    #[test]
+    fn flash_sota_gqa_seq_pack_matches_f64_every_lane() {
+        with_gpu("flash_sota_gqa_seq", |g| {
+            eprintln!("flash SOTA GQA seq-pack on {}", g.device_name());
+            run_row(g, "flash_d64_mp_g4", 16, 4, 1);
+            run_row(g, "flash_d64_mpc_g4", 16, 4, 1);
+        });
+    }
+
+    /// Group-pack: 4 warps share K/V, one query head each. Occupancy lever + GQA idiom.
+    #[test]
+    fn flash_sota_gqa_group_pack_matches_f64_every_lane() {
+        with_gpu("flash_sota_gqa_group", |g| {
+            eprintln!("flash SOTA GQA group-pack on {}", g.device_name());
+            run_row(g, "flash_d64_gqa4", 16, 4, 1);
+        });
+    }
+
+    /// D=128 mp4: 4-warp CTA, the H100 occupancy escape (D2 finding A). Already shipped at D=64.
+    #[test]
+    fn flash_sota_d128_mp4_matches_f64_every_lane() {
+        with_gpu("flash_sota_d128_mp4", |g| {
+            eprintln!("flash SOTA D=128 mp4 on {}", g.device_name());
+            run_row(g, "flash_d128_mp4", 16, 1, 1);
+        });
+    }
+
+    /// D=256 head-split: the register-halving unlock. mp_lm D=256 is generated (device-free law)
+    /// but not launched here -- 128 O-accumulators is a ptxas-time bomb, not a correctness gap.
+    #[test]
+    fn flash_sota_d256_hs_matches_f64_every_lane() {
+        with_gpu("flash_sota_d256_hs", |g| {
+            eprintln!("flash SOTA D=256 hs on {}", g.device_name());
+            run_row(g, "flash_d256_hs", 16, 1, 1);
+        });
     }
 
     /// **A causal wide row is rejected, not silently emitted unmasked.** The wide generator scores a
