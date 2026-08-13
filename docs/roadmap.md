@@ -1,6 +1,12 @@
 # Wukong Roadmap & Known Limitations
 
-Wukong is built openly and incrementally. This page is an honest snapshot of what works, what is
+Wukong is a **programming language**: users write `.wk` source, `wukongc` checks types and tensor
+shapes, and backends execute the result. This page is an honest snapshot of that language and
+compiler — what parses, what shape-checks, what runs on interpreter/native/GPU — not a catalog of
+hand-tuned GPU microbenchmarks. Silent recognizers and hand-written PTX are current implementation;
+the product is the `.wk` surface and the programs that go through it.
+
+Wukong is built openly and incrementally. The sections below record what works, what is
 checked-but-not-executed, and what is planned — so expectations match reality.
 
 > **Scope of every performance figure quoted on this page.** CPU numbers are one Windows 11 laptop's

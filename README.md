@@ -1,188 +1,61 @@
 # Wukong
 
-**A low-level, low-abstraction systems language built for ML/DL compilers and high-performance tensor kernels.**
+**A programming language for ML/DL tensor kernels with compile-time shape safety.**
 
-Wukong is the language you reach for *instead of* C, C++, or Rust when you are writing the
-performance-critical core of a machine-learning stack: fused elementwise kernels, tiled matmuls,
-attention microkernels, custom ops, and the compiler passes that generate them.
+Wukong (`.wk`) is for writing performance-critical tensor code — fused elementwise loops, tiled
+matmuls, reductions, norms, custom ops — in a small explicit language rather than hand-rolling
+CUDA/CUTLASS or stitching intrinsics in C/C++/Rust. Tensor dimensions live in the type system: a
+`Tensor[f32, M, K]` at a call site must match the callee's contract, so shape mistakes are compile
+errors (`E0501`/`E0502`), not silent wrong results at runtime.
+
+The product is a **user-written `.wk` program through `wukongc`**. Backends — interpreter,
+native [Cranelift](https://cranelift.dev) JIT/AOT, and optional GPU paths — are how that program
+runs. Silent pattern recognizers that swap loop nests for tuned microkernels, and hand-written PTX in
+the GPU stack, are current implementation, not the thesis.
 
 It is **not** a high-level framework. There is no garbage collector, no hidden allocation, and no
-hidden control flow. Every byte of memory comes from an allocator you named, every SIMD lane is one
-you asked for, and every parallel loop has a schedule you chose.
+hidden control flow. Every parallel loop has a schedule you chose (`@parallel` today; `@tile` parses
+and is discarded).
+
+## What you write
+
+Ordinary loops over `Tensor[f32, M, K, …]` with shape-generic parameters (`M`, `N`, `?`), plus
+`@parallel` for multicore execution. There is no whole-tensor `*` operator — matmul is an indexed
+loop nest the compiler may recognize and lower. On CPU that means tuned `wukong_runtime`
+microkernels behind the scenes; on GPU, `--backend=gpu` offloads five recognized kernel hooks
+(`sgemm_nt`, `vmath`, `norm`, `sreduce`, `sgemm_nt_epi` on `wukong_interp::Accelerator` /
+`GpuAccel` in `wukong_driver`), while `--backend=gpu-native` lowers MIR→PTX for a growing subset of
+programs (~235/357 `tests/run` fixtures today — naive helpers, no tensor cores). Flash attention,
+conv, and serving benchmarks in the tree are Rust launchers, not `.wk` programs.
+
+```sh
+wukongc --run examples/saxpy_array.wk              # interpreter (default)
+wukongc --run --backend=native tests/run/tensor_matmul.wk
+wukongc --emit=mir -O2 tests/run/transcendental_kernel.wk   # inspect lowered MIR
+```
+
+`--run` defaults to the interpreter; add `--backend=native` for the Cranelift JIT. GPU backends
+require building with `--features gpu` and a CUDA device. See `wukongc --help` for `--emit`,
+`-O0`…`-O3`, `--grad-of` / `--train`, and the rest of the CLI.
 
 ## Why Wukong
 
-Wukong compiles to native code through a **from-scratch [Cranelift](https://cranelift.dev) backend —
-no LLVM, no external toolchain**. In a head-to-head cross-language benchmark (same kernel in each
-language, one timing harness; see **[BENCHMARKS.md](BENCHMARKS.md)**), Wukong:
+Wukong compiles through a **from-scratch Cranelift backend — no LLVM, no external toolchain** on the
+default path. Cross-language CPU measurements and honest GPU notes live in
+**[BENCHMARKS.md](BENCHMARKS.md)** — read that file before quoting any number; this README does
+not duplicate them. In summary, Wukong:
 
-- **compiles fast** — the metric that dominates real ML edit-run iteration. Apples-to-apples
-  *compiler-to-object* (`wukongc --emit=obj -O2` vs `gcc/g++/rustc -O2 -c`, same artifact, same
-  machine): **~7–12× faster** (`wukong_bench compile-vs`; ~7–9× measured this run). The larger **~100–680× (geomean ~306×)**
-  figure is *time-to-running-code*: Wukong JIT-compiles in-process while C/Rust must spawn a full
-  toolchain **and link a shared object** (`-O3 -march=native`) — a real advantage for the JIT/embedding
-  workflow, but not a compiler-vs-compiler number, so it is disclosed as such, never as the headline;
-- **wins matmul/GEMM**, the flagship ML kernel: the compiler recognizes a matmul nest (incl. the
-  `nn.Linear` `A·Bᵀ` form) and dispatches it to a tuned register-blocked, cache-tiled, packed
-  **AVX2/FMA** microkernel — **~3–3.6× faster single-thread** at **~110–120 GFLOP/s ≈ 90% of one
-  P-core's AVX2-FMA roofline** (and **~1.1–1.3× over the tuned `matrixmultiply` Rust crate**, at
-  **~80–104% of oneMKL single-core**), and **up to ~18× parallel** on plain `C = A·B`, **up to ~104× on `nn.Linear`**
-  (where naive C leaves the reduction latency-bound), the lead *growing with matrix size*. Against
-  the honest SOTA bar — **multi-threaded oneMKL** — Wukong's `@parallel` GEMM runs a
-  **size-keyed BLIS/MKL-style 2D block-parallel decomposition** (per-thread L2-resident C blocks;
-  per-worker packing — measured the right locality trade in both ABBA orderings — with dynamic
-  block-claiming the 2026-07-11 default) and stands, same-run MKL-anchored, at **~98–99% at 512³,
-  ~104% at 1024³, 91% at 2048³, 93% at 4096³, and ~94–110% at 256³** (the dynamic-claiming default
-  closed the old mid-size gap; against MKL's own power-degraded rounds the ratios read far higher,
-  which is why only same-run figures are quoted). On the skinny transformer shapes it holds
-  **75–112% of MKL-all**, four of six at or above parity — the sole laggard the 151-MFLOP
-  128×768·768ᵀ, overhead-bound where MKL itself scales only ~2.1×. Single-core it is **~80–104% of
-  MKL-1c across sizes, at or above parity at 2048³/4096³**. (Disclosure: threaded MKL itself swings
-  ~1.4–2× with this laptop's power state, so ratios are same-run only and reported as ranges; the
-  residual mid-size gap is parallel-grain scaling, honestly open);
-- **dispatches the whole transformer/training kernel surface** to tuned microkernels: the
-  **weight-gradient GEMM** `dW=Aᵀ·B` (training backward) **~2.6–9.2× single / ~3.1–13.9× parallel**,
-  the **fused FFN** `silu(A·Bᵀ)` **~24–26×**, **RoPE** rotary embedding **~29–54×** (up to **~156×
-  parallel**), and the training-backward kernels (activation/softmax/LayerNorm-RMSNorm backward,
-  cross-entropy) **~3–13×**. *(Corrected 2026-08-04. The weight-gradient figure previously read "up
-  to ~128× single / ~445× parallel"; that was measured against a C peer written `ijk` with **both**
-  operands read column-strided, not the natural `kij` nest. **Strided column reductions**, previously
-  listed here at ~29–50×, are now measured as **a tie at best and a 1.8× loss** against a peer written row-outer,
-  and have been removed from this list. See the [peer-strength
-  correction](BENCHMARKS.md#-peer-strength-correction--2026-08-04).)*;
-- **wins the transcendental/activation family ~4.7–11.5× vs C** (**~28× under `@parallel`**) — the
-  cleanest compute-bound win. Against **Intel oneMKL VML**, the hand-tuned vector-math SOTA, the
-  honest standing is narrower than this file claimed on 2026-08-06 and the "caught VML" line is
-  **retracted**: at *matched accuracy* (VML's `VML_LA` mode, which measures 2 ULP for exp and 4 ULP
-  for log on the timed band — exactly where Wukong measures 2 and 4) **exp and log are a tie**, exp
-  reading 1.09–1.20× *slower* and log between 1.09× slower and 1.07× faster at n = 2¹⁶ and 2²⁰,
-  over five same-run best-of-40 ABBA rounds. Only at n = 2²³, where Wukong's non-temporal store
-  regime engages, does either come near this machine's ~1.4× noise floor — and there only log
-  clears it (1.48–1.66×), exp straddling it at 1.37–1.54×. **tanh is the real win at
-  2.85–3.24× vs VML's fastest mode** — with the disclosure that Wukong's tanh is 44 ULP against
-  VML's ≤1 ULP, so it trades accuracy for speed. Comparisons against VML's *default* HA mode
-  (~0.5 ULP) flatter Wukong and are not quoted as wins.
-  What **is** solid is the same-binary engineering: the exp/log gap once recorded as algorithmic was
-  the dispatch calling its 8-lane kernel through a function pointer, which without crate-wide AVX
-  means the `__m256` crosses the call through memory. Inlining it is worth **1.20–1.78×** with a
-  `WUKONG_VMATH_FNPTR=1` kill-switch and is **bit-identical on all 2³² f32** — accuracy stays exp
-  ≤2 ULP (1.625e-7 rel) and log ≤12 ULP (6.924e-7 rel), both re-verified exhaustively rather than
-  sampled. Wukong
-  dispatches a pure
-  `out[i]=f(x[i])` loop for **35** functions
-  (`exp`/`log`/`exp2`/`log2`/`exp10`/`log10`/`cbrt`/`expm1`/`log1p`/`tanh`/`sigmoid`/`gelu`/`silu`/
-  `softplus`/`softsign`/`logsigmoid`/`mish`/`sin`/`cos`/`tan`/`atan`/`asin`/`acos`/`erf` plus the
-  hyperbolic family `sinh`/`cosh`/`asinh`/`acosh`/`atanh` — the transformer activations plus **RoPE**'s
-  `sin`/`cos`, the inverse trig, the exact-GELU `erf`, the stable `expm1`/`log1p`/`logsigmoid`, and the
-  hyperbolic/Poincaré-embedding inverse trio) to a **256-bit AVX2 ≈1-ULP poly kernel**, where gcc/rustc
-  call scalar `libm` and **cannot vectorize a loop containing the call**;
-- **wins fused row-norms** (`softmax`/`LayerNorm`/`RMSNorm`, incl. the learned-γ/β affine form)
-  **~1.9–6.6×**; **convolution** (im2col + GEMM) is **~1.55×**, and a slight loss (1.12×) against the
-  same direct-convolution C at `-ffast-math` *(corrected 2026-08-04: the previous ~6–7× was measured
-  against a peer whose buffers were not `restrict`-qualified, which cost gcc 4.3× on that kernel)*;
-- **runs a full 12-layer GPT-2-class transformer end-to-end** (d=768, 12 heads, causal attention,
-  GELU MLP — ordinary Wukong source through the real pipeline, gated bit-exact against the
-  interpreter and cross-checked <2e-6 against C and PyTorch outputs): **~19–21× idiomatic C** and
-  **3.6–4.9× `-ffast-math` C single-core**. Against the honest PyTorch bar — **`torch.compile`
-  (TorchInductor max-autotune, fullgraph, warmed; beating eager does *not* count)** — Wukong is
-  **faster at both batch sizes**: single-thread it beats compiled-torch-1T at S=128 and S=512, and
-  multicore (since the `@parallel` head-loop region shipped, 2026-07-10 — independent-iteration
-  loops with body-local scratch outline to a parallel region, bit-exact by construction) it runs
-  **1.39–1.81× faster than all-threads compiled torch at S=512 and 1.07–1.43× faster at S=128**
-  (three independent same-day rounds, isolated per-side probes with torch measured at its best; it
-  also beats torch's strongest *eager* config, 1.07–1.37× at S=512). Model `@parallel` scaling
-  reaches **4.7× on 16 cores** (default 4.44×, best 5.22×) — tracking this hybrid part's ~5–5.4×
-  same-run MKL ceiling, with T=1 at serial parity;
-- **wins int8 `nn.Linear`** (`vpdpbusd`) **~1.5–2.5× single / ~4.6–14.7× parallel**, and runs a full
-  **bf16 *and* f16 mixed-precision CPU suite** — `dot` (**~3×**) / `sum` (**~6–8×**), `max`/`min`/`absmax`
-  (the symmetric-quant scale), streaming `axpby`, the `nn.Linear` GEMM (**~24–25×**), and the 36-op
-  activation set — all half-in/f32-out, where C/Rust can vectorize neither `libm` nor the half→f32
-  widen (f16 via the F16C `vcvtph2ps`);
-- **wins reductions ~2.6–2.9×** (`dot`, L2 loss) by reassociating the f32 sum across vector lanes,
-  which gcc/rustc leave serial — and **~7.9–8.6× under `@parallel`** (up to ~25× for `max`/`absmax`);
-- and ships a **GPU backend** (`--features gpu`, NVIDIA RTX 4050; PTX + cudarc driver-JIT, no CUDA
-  toolkit): fp16 tensor-core GEMM at **cuBLAS parity (~101%) ≤1024³**, a fused **flash-attention**
-  that **beats the genuinely-fused cuDNN + cutlass fMHA in the causal-S≤512 and fused-RoPE regimes**
-  (and is 3.6–5× the unfused cuBLAS chain), trailing cuDNN only at long context (S≥2048) — with the
-  **D=128 `ldmatrix` kernel (the Llama-class head dim, 1.11–1.20× cutlass mem-efficient at S≤1024)
-  now the production D=128 dispatch**,
-  int8 GEMM **~180–237× naive CUDA-C**, **95.7% of the 192 GB/s HBM peak**, and **0.76 ms cold GPU
-  compile vs Triton's 30–120 s**.
+- **checks tensor shapes at compile time** (`wukong_sema`) — real semantic analysis, not a kernel
+  compiler pretending to be a language;
+- **lowers loop nests you write** to MIR, then optionally recognizes matmul, elementwise, reduction,
+  and norm patterns for tuned CPU microkernels (`wukong_runtime`) or the five GPU offload hooks;
+- **compiles fast** and runs competitive CPU kernels on recognized patterns — see
+  [BENCHMARKS.md](BENCHMARKS.md) for methodology, standing index, and per-family numbers;
+- **offers optional GPU backends** (`--features gpu`): recognizer offload (`--backend=gpu`) and
+  whole-program MIR→PTX (`--backend=gpu-native`). Rust-side flash/conv/serving benches are launchers,
+  not `.wk` programs.
 
-  On a **datacenter part** — an **NVIDIA H100 80GB HBM3** (`sm_90a`, 132 SMs), measured 2026-08-11,
-  a *different device* from every figure above — the `wgmma` + TMA GEMM measures **95.3% / 88.6% /
-  92.3% of cuBLAS f16 (f32 out) at 2048³ / 4096³ / 8192³** and **97.3%** on the GPT FFN
-  down-projection, **but only 80.3% and 73.4% on the two wide-N FFN up-projections** (`4096×4096×1024`
-  and `4096×16384×4096`) — that is the whole f16 suite, six resolved rows, mean ≈88%. **1024³ is
-  refused** because the peer's own twin arms disagreed by ±15.47%. bf16 tracks f16 within ~2 points
-  on every shape that resolved in both, **except 1024³, where it resolves and reads 49.5%** — a
-  32-CTA problem on 132 SMs. HBM copy reaches **87.2% of the 3352 GB/s spec peak** (the campaign's
-  ≥90% milestone is *not* met); and the **fused int8 GEMM+dequant beats the
-  cuBLAS GEMM+dequant chain 1.08–1.15× at 1024³/2048³** (the first outright peer win on Hopper — it
-  loses at 4096³, 0.79×). The GEMM figures went through the twin-controlled instrument; **the HBM and
-  int8 figures did not** — those are single-shot rounds, labelled as such in `BENCHMARKS.md`.
-
-  > **Device scope (2026-08-11) for the H100 paragraph:** those figures are **H100 80GB HBM3**
-  > figures (Hopper, `sm_90a`, 132 SMs, 50 MiB L2, Linux container, cuBLAS with f32 output as the
-  > peer) and the 4050 figures above are not — **do not average them or carry a conclusion between
-  > them.** This visit measured that transfer losing ground: the 4050's int8 dispatcher, 86–88% /
-  > 96–105% / ~70% of cuBLAS int8 GEMM at 1024³/2048³/4096³ there, holds a conservative 67.7% / 71.4%
-  > / 47.9% on the H100. **The sharper "96–105% falls to 22–52% of IMMA" reading published here until
-  > 2026-08-13 is RETRACTED** — it compared two different kernels, because the bench behind the
-  > H100 number times a hand-placed `_smdb` entry that is retired on the 4050 (~44–53% of IMMA there,
-  > not 96–105%) and is dispatched on neither part; `BENCHMARKS.md` carries the full retraction.
-  > **They are also iteration-grade, not
-  > publication-grade, and are published under that label:** the container could not lock clocks, and
-  > `GPU_RETARGET_PLAN.md` §6.3 says container rounds are *iteration* data while VM rounds with
-  > `nvidia-smi -lgc` pinned are *publication* data — every round behind these figures records the
-  > refusal itself (`[clock] lock: refused (…); running unlocked`), and five of them go further and
-  > stamp themselves `ITERATION data, not publication data` in an all-caps banner (`BENCHMARKS.md`
-  > names which five, and why the rest carry only the `[clock]` line). Instead of a lock each round
-  > recorded its own before/after clocks and
-  > refused itself on drift — **two rounds did**, and those refusals are published — but a drift gate
-  > catches a clock that *moved*, not one parked at the wrong steady state, so treat every percentage
-  > above as provisional pending a locked-clock VM re-run. Per-shape tables, the mechanism, and a log
-  > citation for every number are in `BENCHMARKS.md` → *GPU backend (NVIDIA H100 80GB HBM3,
-  > `sm_90a`)*; the raw rounds are `bench/gpu/h100/2026-08-11-h100-w2-r*.log`.
-
-  > **Device scope (2026-08-06, extended 2026-08-09):** every *other* GPU figure in the bullet above was
-  > measured on an **NVIDIA RTX 4050 Laptop GPU** (Ada, `sm_89`, **20 SMs**, 6 GB, **~192 GB/s**,
-  > power-capped ~30–50 W) under **Windows/WDDM**, with only the peers that box can host — cuBLAS /
-  > IMMA / cuBLASLt and cuDNN via the redistributable DLLs, NVRTC-compiled CUDA-C, and PyTorch in
-  > **eager** mode (Triton does not install on Windows); **no CUDA toolkit**, so no CUTLASS,
-  > FlashAttention, Marlin or vLLM build was possible. Every tile, stage depth and occupancy
-  > crossover behind those figures was swept against those twenty SMs. These are properties of that
-  > instrument; **do not extrapolate them to datacenter parts.** The datacenter retarget, including
-  > re-measurement against the peers a Linux cloud box can build, is `GPU_RETARGET_PLAN.md`.
-  >
-  > Three of the claims above need more than a scope note, and `BENCHMARKS.md`'s standing index
-  > carries them in full: the **PyTorch** comparison is against **eager** and is *not re-earned*
-  > against `torch.compile`, which is the real framework bar and is native on Linux; the **flash
-  > standings** — the long-context loss *and* the short-context wins — are occupancy verdicts on
-  > 20 SMs and may move in **either** direction elsewhere; and the **CUDA-graph** launch-overhead
-  > multiples are Windows/WDDM numbers that should be expected to shrink on Linux before the GPU
-  > changes at all. "No CUDA toolkit" describes what *Wukong* needs to build and run — it is never a
-  > claim that no stronger peer exists.
-  >
-  > **The CPU figures on this page carry their own open debts** — an end-to-end model ratio that is
-  > an upper bound pending re-measurement, ~40 rows whose Rust column needs re-measuring after a
-  > `noalias` fix, a C++ column that only ever existed in three sections, and a general-code suite
-  > whose tables are superseded with no replacement. `BENCHMARKS.md` opens with a per-family standing
-  > index; read it before quoting any number from this README.
-
-The domain-aware paths (GEMM, the `vmath` transcendentals, the `velem` streaming elementwise, the
-fused norms) emit **true 256-bit AVX2/FMA** via hand-written runtime microkernels — and the
-**general** loop vectorizer reaches the same width by a second route: a vectorizable f32 loop body is
-captured as a flat `VecKernel` recipe and assembled into raw 256-bit AVX2 machine code
-([`crates/wukong_codegen_cranelift/src/avx2.rs`](crates/wukong_codegen_cranelift/src/avx2.rs)),
-sidestepping the 128-bit `f32x4` cap on Cranelift's vector SSA that the CLIF path is stuck behind
-(`WUKONG_P4_NO_256=1` forces the 128-bit path — a result-identical A/B knob and kill-switch). So
-even the
-memory-bandwidth-bound elementwise kernels are now small **wins** (saxpy ~1.25–1.45×, poly ~1.1–1.2×,
-widening to ~1.3–1.6× at realistic >L3 tensor sizes via non-temporal stores); the one honest **tie** left is
-`relu` at an L3-resident size, where both languages are pinned to the same cache bandwidth.
-
-Where Wukong is built to win for the ML/DL niche:
+## Language features
 
 - **Compile-time shape safety.** Tensor shapes live in the type system: a `Tensor[f32, M, K]`
   parameter carries its dims — and its layout — into the callee contract, so handing a
@@ -202,19 +75,16 @@ Where Wukong is built to win for the ML/DL niche:
   multi-dimensional index, and arena/scratch/pool allocator selection is not implemented (the
   language's only runtime-sized memory today is `alloc_<T>`/`free`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
-- **Domain-aware optimization that runs today.** The compiler **recognizes a matmul nest** (the
-  `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and lowers it to a tuned
-  **register-blocked, cache-tiled, packed AVX2/FMA GEMM microkernel** — the way XLA/TVM/oneDNN lower a
-  matmul op. It also **auto-vectorizes** elementwise loops (incl. branchy ones via if-conversion) and
-  **reductions** to SIMD, contracts `x + y*z` to a **fused multiply-add**, **fuses** adjacent
-  elementwise loops, and **auto-parallelizes** `@parallel` loops across cores — things a
-  general-purpose C compiler won't do to naively-written source. Underneath, an SSA optimizer
-  (inlining, mem2reg, const-fold, CSE, DSE, DCE, LICM, loop unrolling) removes ~42% of IR ops on the
-  benchmark kernels
-  (~48–54% on the heavy transformer/GEMM kernels). Op-graph fusion across tensor ops is still planned
-  **as a CPU MIR pass**; on the GPU it exists today — `wukong_codegen_gpu`'s fusion planner classifies
-  the recognized op graph and `--backend=gpu-native` compiles an eligible whole program into a single
-  cooperative megakernel.
+- **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
+  `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and may lower it to a tuned
+  **register-blocked, cache-tiled, packed AVX2/FMA GEMM microkernel**. It also **auto-vectorizes**
+  elementwise loops (incl. branchy ones via if-conversion) and **reductions** to SIMD, contracts
+  `x + y*z` to a **fused multiply-add**, **fuses** adjacent elementwise loops, and
+  **auto-parallelizes** `@parallel` loops across cores. Underneath, an SSA optimizer (inlining, mem2reg,
+  const-fold, CSE, DSE, DCE, LICM, loop unrolling) runs at `-O1` and above. Op-graph fusion across
+  tensor ops is still planned **as a CPU MIR pass**; on GPU, `wukong_codegen_gpu`'s fusion planner and
+  `--backend=gpu-native` can compile an eligible whole program into a cooperative megakernel. These
+  recognizers are invisible to the user — you still write the loop nest in `.wk`.
 - **Interop (planned).** A clean C ABI (`@extern("C")` / `@export`) is designed to call into
   BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. The attributes parse today but are
   neither validated nor consumed (an unknown attribute name is accepted silently); symbol
@@ -342,9 +212,10 @@ behind `--features gpu`, and LLVM is an optional *textual-IR* emitter exposed vi
 Early development — built incrementally and openly. The full front-end, optimizer, interpreter, and
 **native Cranelift backend** work today, including **matmul → tuned AVX2/FMA GEMM dispatch** (serial
 and `@parallel`, incl. `nn.Linear` `A·Bᵀ`), SIMD auto-vectorization (elementwise + reductions), FMA
-contraction, loop fusion, and `@parallel` multicore execution over fixed-size-array kernels. A
-**GPU backend** (`--features gpu`; NVIDIA, PTX via cudarc driver-JIT) adds tensor-core GEMM, fused
-flash-attention, norms, and a GPU-resident transformer layer, and **reverse-mode autodiff**
+contraction, loop fusion, and `@parallel` multicore execution over fixed-size-array kernels. An
+**optional GPU backend** (`--features gpu`; recognizer offload via `--backend=gpu`, MIR→PTX via
+`--backend=gpu-native`) runs a growing subset of `.wk` programs on NVIDIA hardware. **Reverse-mode
+autodiff**
 (`wukong_autodiff`, driven from the CLI via `--emit=grad` / `--train`) emits the training backward
 pass and runs a fwd→bwd→optimizer (SGD/AdamW) loop — both gated against the interpreter oracle.
 Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via

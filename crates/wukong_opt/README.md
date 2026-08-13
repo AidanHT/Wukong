@@ -1,0 +1,108 @@
+# wukong_opt
+
+MIR optimizer for Wukong (`.wk`) programs. Wukong is the language; this crate transforms MIR
+between `wukong_mir_build` and every execution or emission backend. It must be **observationally
+transparent** — the same program at `-O0` and `-O3` produces identical stdout and exit code on every
+backend.
+
+Depends only on `wukong_mir` and `wukong_span`. Dev-dependencies (`wukong_parser`, `wukong_sema`,
+`wukong_mir_build`, `wukong_interp`) exist solely for source→run integration tests in `lib.rs`.
+
+## Entry points
+
+- `optimize(&mut Program, opt_level: u8)` — the production path. `-O0` is a no-op.
+- `optimize_timed(&mut Program, u8) -> Timings` — identical mutations with per-pass timing; for
+  `wukong_bench` only. Must stay byte-identical to `optimize`.
+- `PassManager::standard(opt_level)` — builds the per-function pass list.
+
+## Optimization levels
+
+The only level tests are `>= 1` and `>= 2`, so **`-O3` is byte-identical to `-O2`**. Do not add
+`-O3`-only passes without revisiting the differential gates.
+
+| Level | What runs |
+| --- | --- |
+| `-O0` | nothing |
+| `-O1` | per-function fixpoint pipeline (below) |
+| `-O2` | `inline_program` first, then the pipeline, then `unroll_program` with a reduced cleanup sweep |
+| `-O3` | same as `-O2` |
+
+At `-O2`+, `wukong_driver` also forces `opt_level.max(1)` for `--emit=grad` and `--train` because
+autodiff consumes SSA MIR.
+
+## Per-function pass order (`PassManager::standard`)
+
+The list runs to a fixpoint (capped at 100 iterations) with per-pass clean-tracking. Order is
+load-bearing.
+
+**`-O1`:** mem2reg → simplify → simplify-cfg → simplify-phis → dce
+
+**`-O2` appends:** cse → dse → loop-canon → licm → vectorize
+
+- **mem2reg** — scalar `alloca`/`load`/`store` → block-parameter SSA (Cytron). First because every
+  value-based pass is far more effective on SSA than on memory traffic.
+- **simplify** — constant folding and algebraic identities.
+- **simplify-cfg** — constant-branch folding, straight-line merge, prune unreachable blocks. The
+  only pass that restructures the CFG; must invalidate the analysis cache when it changes anything.
+- **simplify-phis** — drop dead or trivial block parameters mem2reg introduced.
+- **dce** — remove pure instructions whose results are unused, and unused allocas.
+- **cse** — dominator-tree value numbering plus intra-block load forwarding.
+- **dse** — intra-block dead-store elimination.
+- **loop-canon** — one shape per loop: preheader, single latch, one exit-test polarity. LICM hoists
+  only into an existing preheader.
+- **licm** — hoist loop-invariant non-trapping ops into that preheader.
+- **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting conditionals to lane
+  masks), keeping the original loop as scalar epilogue.
+
+**Whole-program stages at `-O2`+ (not `Pass` traits):**
+
+- `inline_program` — runs *before* the per-function pipeline (needs callee bodies). Leaf-only,
+  size-capped; no cycle detection.
+- `unroll_program` — runs *after* the pipeline; changed functions get a reduced cleanup pass
+  (`cse` → `dce`).
+
+`cse`, `dse`, and `licm` consult `alias` — provenance analysis answering whether a store through `q`
+can be seen by a load through `p`. The Cranelift backend uses it too.
+
+## Analysis cache (`CfgAnalyses`)
+
+`preds`, `rpo`, `idom`, `df`, `children` depend only on the block set and terminator successor
+edges. One cache per function is threaded through every pass and fixpoint iteration. **If a pass
+changes the block set or any successor edge, it must call `cache.invalidate()`** — stale dominators
+silently produce wrong CSE/LICM/mem2reg results the verifier will not catch.
+
+Under `debug_assertions`, `wukong_mir::verify::verify_function` runs after every pass that executed
+and panics naming the culprit.
+
+## FxHash (`src/fxhash.rs`)
+
+The optimizer is HashMap-bound. Keys are small integers drawn from the program (`ValueId`,
+`BlockId`, `Symbol`) — SipHash's collision resistance buys nothing. `fxhash.rs` is a dependency-free
+rotate-xor-multiply hasher with a **fixed seed** (`0x517cc1b727220a95`), so iteration order is
+reproducible run-to-run.
+
+**Do not casually unify this with `wukong_span::fxhash`.** Never let `FxHash*` iteration order reach
+emitted IR; where order matters, sort explicitly (LICM sorts loops by header id).
+
+## Testing
+
+```sh
+cargo test -p wukong_opt --lib
+```
+
+18 integration tests: source → parse → sema → mir_build → optimize → interp, asserting clean
+`verify_function` and comparing levels 0/1/2/3.
+
+The real gate for any change here:
+
+```sh
+cargo test -p wukongc --test run
+```
+
+`optimization_is_observationally_invariant`, `native_matches_interpreter`, and
+`native_optimization_is_observationally_invariant` over all `tests/run` fixtures.
+
+## Layout
+
+See [`src/README.md`](src/README.md) for the module map. Development tools in
+[`examples/`](examples/README.md) dump or census loop shapes.

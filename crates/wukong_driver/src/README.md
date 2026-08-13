@@ -1,0 +1,8 @@
+# `wukong_driver` modules
+
+| file | exports / role |
+|---|---|
+| `lib.rs` | `Options`, `EmitStage`, `BackendKind`, `GradOptions`, `TrainOpt`, `compile()`, `verify_or_ice`, `emit_native`, `explain` re-exports |
+| `loader.rs` | `load_imports` — resolve `import a.b.c` → `<root-dir>/a/b/c.wk`, depth-first, cycle-safe |
+| `gpu_accel.rs` | `GpuAccel` — `--backend=gpu` recognizer offload (`#[cfg(feature = "gpu")]`) |
+| `gpu_e2e_bench.rs` | Test-only end-to-end GPU measurement round (`#[cfg(all(test, feature = "gpu"))]`) |
