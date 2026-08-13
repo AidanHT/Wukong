@@ -918,9 +918,15 @@ impl<'a> FnEmit<'a> {
                 let d = self.reg(r);
                 self.round_into(&d, *mode, &x, &rty);
             }
+            // A `Splat` or `Iota` whose result is NOT a vector never reaches here from verified MIR
+            // (`wukong_mir::verify` requires a vector result for both), and the vector case went to
+            // `lower_vec_inst` above. Keep them as declines rather than `unreachable!`, but say what
+            // they mean: the old text was "SIMD not yet lowered to PTX", which now reads as a claim
+            // about the SIMD path in general to anyone debugging a decline.
             Op::Splat(_) => {
                 return Err(format!(
-                    "{UNSUPPORTED} SIMD `Splat` (vectorized MIR) not yet lowered to PTX"
+                    "{UNSUPPORTED} `Splat` with a non-vector result type {} (malformed MIR)",
+                    rty.display()
                 ))
             }
             // Read lane `k` of a SIMD value back as a scalar — the shape the loop vectorizer's
@@ -942,7 +948,8 @@ impl<'a> FnEmit<'a> {
             }
             Op::Iota(..) => {
                 return Err(format!(
-                    "{UNSUPPORTED} SIMD `Iota` (vectorized MIR) not yet lowered to PTX"
+                    "{UNSUPPORTED} `Iota` with a non-vector result type {} (malformed MIR)",
+                    rty.display()
                 ))
             }
             Op::FuncAddr(sym) => {
