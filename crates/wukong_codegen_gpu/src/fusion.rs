@@ -297,12 +297,93 @@ fn has_data_dependent_control_flow(func: &Function, tainted: &HashSet<u32>) -> b
     })
 }
 
+/// Can this `wukong_parallel_for(n, func_addr F, ctx)` call site run as cooperative work?
+///
+/// **What the op already guarantees.** `wukong_mir_build` only emits it after proving the loop's
+/// iterations independent — a cross-iteration dependence, a captured scalar (i.e. a reduction) or
+/// overlapping per-iteration write slices all keep the loop serial, and `tests/run/parallel_*.wk`
+/// are the fixtures for each decline. So *any* partition of `[0, n)` computes the same result; that
+/// is already load-bearing on CPU, where `wukong_runtime::parallel_for` hands out chunks whose
+/// boundaries depend on the core count. The GPU's per-thread partition is one more partition.
+///
+/// **What it does not guarantee, and this checks.** The outlined body is lowered as an ordinary
+/// single-thread `.func` and called by *every* thread, so a side effect inside it happens once per
+/// thread instead of once. `print`/`println` append to the record buffer through an unguarded
+/// `atom.global.add`, which would duplicate and interleave stdout — decline. `assert` is a single
+/// idempotent flag store, so a per-thread repeat is the same observable outcome and stays allowed.
+///
+/// A nested `wukong_parallel_for` inside the body is allowed: within a `.func` it lowers to the
+/// sequential chunk `F(0, n)`, which is correct (just not itself parallel).
+fn parallel_for_is_cooperative(
+    program: &Program,
+    interner: &Interner,
+    entry: &Function,
+    args: &[ValueId],
+) -> Result<(), String> {
+    if args.len() != 3 {
+        return Err(format!(
+            "wukong_parallel_for takes 3 args, this call site has {}",
+            args.len()
+        ));
+    }
+    // PTX has no portable function pointers, so the target must be a compile-time `func_addr` — the
+    // same requirement `lower.rs` has, checked here so eligibility and lowering agree.
+    let mut target: Option<Symbol> = None;
+    for b in &entry.blocks {
+        for inst in &b.insts {
+            if let (Some(r), Op::FuncAddr(sym)) = (inst.result, &inst.op) {
+                if r == args[1] {
+                    target = Some(*sym);
+                }
+            }
+        }
+    }
+    let Some(sym) = target else {
+        return Err("wukong_parallel_for target is not a func_addr".to_string());
+    };
+    let Some(body) = program.function(sym) else {
+        return Err(format!(
+            "wukong_parallel_for target `{}` is not a known function",
+            interner.resolve(sym)
+        ));
+    };
+
+    // Walk the body's reachability closure for per-thread-unsafe side effects.
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut work = vec![body];
+    while let Some(f) = work.pop() {
+        if !seen.insert(f.name.0) {
+            continue;
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Op::Call { func: callee, .. } = &inst.op {
+                    let nm = interner.resolve(*callee);
+                    if matches!(nm, "print" | "println") {
+                        return Err(format!(
+                            "outlined @parallel body `{}` prints (one record per thread, not per \
+                             iteration)",
+                            interner.resolve(sym)
+                        ));
+                    }
+                    if let Some(next) = program.function(*callee) {
+                        work.push(next);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Analyze `entry` for cooperative-megakernel eligibility and inventory its recognized ops.
 ///
 /// Eligible iff (in this first increment):
 ///  - the entry's only calls are recognized cooperative ops or deterministic side effects
-///    (`print`/`assert`) — no other user functions, no unrecognized runtime symbols, no
-///    `wukong_parallel_for` yet (its outlined body is a separate function — a later increment);
+///    (`print`/`assert`) — no other user functions and no unrecognized runtime symbols. A
+///    `wukong_parallel_for` is admitted when [`parallel_for_is_cooperative`] holds, even though its
+///    outlined body is a separate function: the body is reached through `Op::FuncAddr`, not called
+///    from the entry, and `lower.rs` emits it as one more `.func` in the module;
 ///  - control flow is data-independent (the safety gate above);
 ///  - cooperative-op arguments are themselves data-independent (so every thread computes the same
 ///    pointers/sizes — otherwise threads would disagree on what to cooperate on);
@@ -332,9 +413,11 @@ pub fn analyze(program: &Program, entry: Symbol, interner: &Interner) -> MegaPla
                 match classify_call(&name) {
                     CallClass::Coop(kind) => {
                         if kind == CoopKind::ParallelFor {
-                            return MegaPlan::ineligible(
-                                "generic @parallel (wukong_parallel_for) not yet cooperative",
-                            );
+                            if let Err(why) =
+                                parallel_for_is_cooperative(program, interner, func, args)
+                            {
+                                return MegaPlan::ineligible(why);
+                            }
                         }
                         // Cooperative-op args must be data-independent so all threads agree.
                         if args.iter().any(|a| tainted.contains(&a.0)) {
@@ -569,6 +652,120 @@ fn main() -> i32 {
             );
             assert!(p.reason.contains("data-dependent"), "reason: {}", p.reason);
         }
+    }
+
+    /// A mid-function `@parallel` region over a body no recognizer claims — the generic elementwise
+    /// shape Phase 1 exists for. The `wukong_parallel_for` in `main` used to make the whole program
+    /// ineligible ("not yet cooperative"), so the one construct that *says* "these iterations are
+    /// independent" was the one construct the cooperative megakernel refused.
+    const SRC_GENERIC_PARALLEL: &str = r#"module t
+@parallel
+fn main() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    let mut y: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = (i as f32) * 0.5; }
+    for i in 0..64 {
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }
+    print(y[63] as i32);
+    return 0;
+}
+"#;
+
+    /// `-O1` and up only, and that is not this op's doing: at `-O0` the entry's own loop counters
+    /// still live in allocas, so `i < 64` branches on a `Load` and the pre-existing
+    /// data-independent-control-flow gate rejects the program before `wukong_parallel_for` is even
+    /// looked at. `jit_run` then runs it on the (correct) single-thread path, which is why the
+    /// corpus's `-O0 == -O3` comparison is unaffected.
+    #[test]
+    fn generic_parallel_region_is_eligible() {
+        for opt in [2u8, 3u8] {
+            let (p, _prog, _i) = plan(SRC_GENERIC_PARALLEL, opt);
+            assert!(
+                p.eligible,
+                "generic @parallel -O{opt} expected eligible, got: {}",
+                p.reason
+            );
+            assert!(
+                p.coop_ops.iter().any(|c| c.kind == CoopKind::ParallelFor),
+                "expected a ParallelFor coop op at -O{opt}, got {:?}",
+                p.coop_ops.iter().map(|c| c.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A hand-built `wukong_parallel_for(64, func_addr body, env)` in `main`, with or without a
+    /// `print` in the outlined body.
+    ///
+    /// Hand-built because the front end will not produce the printing case: `mir_build`'s region
+    /// prover already refuses to outline a loop containing a side effect (checked — `--emit=mir -O2`
+    /// of such a loop has no `wukong_parallel_for`). That makes the check below a *defensive* one,
+    /// and defending it here is the point: this eligibility gate is the only thing standing between
+    /// a future outliner that does allow side effects and stdout gaining one line per thread.
+    fn parallel_for_program(body_prints: bool) -> (Program, Interner) {
+        use wukong_mir::{Builder, MirType};
+
+        let mut interner = Interner::new();
+        let body_sym = interner.intern("wukong$par$0");
+        let print_sym = interner.intern("print");
+        let pfor_sym = interner.intern("wukong_parallel_for");
+
+        let mut fb = Builder::new(body_sym, MirType::Void);
+        let lo = fb.add_param(MirType::I64);
+        let _hi = fb.add_param(MirType::I64);
+        let _env = fb.add_param(MirType::Ptr);
+        if body_prints {
+            fb.build_void(Op::Call {
+                func: print_sym,
+                args: vec![lo],
+            });
+        }
+        fb.ret(None);
+
+        let mut mb = Builder::new(interner.intern("main"), MirType::I32);
+        let env = mb.alloca(MirType::Array(Box::new(MirType::Ptr), 1));
+        let n = mb.build(MirType::I64, Op::ConstInt(64, MirType::I64));
+        let f = mb.build(MirType::Ptr, Op::FuncAddr(body_sym));
+        mb.build_void(Op::Call {
+            func: pfor_sym,
+            args: vec![n, f, env],
+        });
+        let z = mb.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        mb.ret(Some(z));
+
+        let mut program = Program::new();
+        program.funcs.push(mb.finish());
+        program.funcs.push(fb.finish());
+        (program, interner)
+    }
+
+    /// A `print` inside the outlined body must keep the program off the cooperative path. The body is
+    /// lowered as an ordinary `.func` and called by every thread, and `print` appends to the record
+    /// buffer through an unguarded `atom.global.add` — so stdout would gain one line per *thread*
+    /// instead of one per iteration. This is the one thing the `@parallel` independence proof does not
+    /// cover, because duplicating a side effect is not a data race.
+    #[test]
+    fn a_printing_parallel_body_is_not_cooperative() {
+        let (quiet, mut qi) = parallel_for_program(false);
+        let entry = qi.intern("main");
+        let p = analyze(&quiet, entry, &qi);
+        assert!(
+            p.eligible,
+            "a side-effect-free @parallel outline is cooperative work: {}",
+            p.reason
+        );
+        assert!(p.coop_ops.iter().any(|c| c.kind == CoopKind::ParallelFor));
+
+        let (loud, mut li) = parallel_for_program(true);
+        let entry = li.intern("main");
+        let p = analyze(&loud, entry, &li);
+        assert!(!p.eligible, "a printing @parallel body must decline");
+        assert!(
+            p.reason.contains("prints"),
+            "the reason should name the print: {}",
+            p.reason
+        );
     }
 
     /// A pure-scalar program with no recognized op is (correctly) ineligible: the single-thread path
