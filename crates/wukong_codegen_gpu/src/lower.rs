@@ -259,18 +259,28 @@ pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result
 /// `.visible .entry wukong_mega` (run by a block of threads — see [`crate::megakernel`]). The entry
 /// is lowered SPMD with its frame in a shared `.global` buffer; recognized ops emit a block-wide-tree
 /// (`mrt_sreduce_coop`), chunked-cooperative (the serial `mrt_*` over per-thread sub-ranges) or
-/// `tid==0`-serial (`mrt_*`) call bracketed by `bar.sync`. Eligibility
-/// (`crate::fusion::analyze`) guarantees the entry calls no other user function, so no `mfn_*`
-/// bodies are emitted — only the helpers it uses + the kernel. Public so `megakernel.rs` and tooling
-/// can JIT / inspect it.
+/// `tid==0`-serial (`mrt_*`) call bracketed by `bar.sync`. Public so `megakernel.rs` and tooling can
+/// JIT / inspect it.
+///
+/// Eligibility (`crate::fusion::analyze`) bars the entry from *calling* another user function, but an
+/// `@parallel` outline reaches one anyway — through `Op::FuncAddr` plus `wukong_parallel_for`, whose
+/// grid-stride lowering calls the outlined body per iteration. So the module carries the
+/// **reachability closure** of the entry as ordinary single-thread `mfn_*` bodies (each with its own
+/// per-thread `.local` frame and unguarded stores, which is what makes a per-thread call of one
+/// correct), and the helper scan covers those bodies too — a body calling `mrt_sgemm` needs the
+/// serial definition emitted even though the entry never mentions it. The closure, not every
+/// function: an unreachable body that declines would shrink mega coverage for no reason.
 pub fn emit_mega_ptx(
     program: &Program,
     entry: Symbol,
     interner: &Interner,
 ) -> Result<String, String> {
-    let entry_fn = program
-        .function(entry)
+    let entry_idx = program
+        .funcs
+        .iter()
+        .position(|f| f.name == entry)
         .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    let entry_fn = &program.funcs[entry_idx];
     if !entry_fn.params.is_empty() {
         return Err(format!(
             "{UNSUPPORTED} mega entry `{}` must take no parameters",
@@ -282,34 +292,41 @@ pub fn emit_mega_ptx(
     for (i, f) in program.funcs.iter().enumerate() {
         func_idx.insert(f.name, i);
     }
+    let reachable = reachable_funcs(program, entry_idx, &func_idx);
 
     let mut out = String::new();
     out.push_str(crate::ptx_target::HDR_SM80);
     out.push('\n');
 
-    // Scan the entry for the helpers it needs: cooperative reduce (+ its shared scratch), the serial
+    // Scan for the helpers the module needs: cooperative reduce (+ its shared scratch), the serial
     // `mrt_*` defs for not-yet-cooperative recognized ops, and the device fmod for float `%`.
     let mut needs_reduce_coop = false;
     let mut needs_fmod = false;
     let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
     let mut serial_defs = String::new();
-    for b in &entry_fn.blocks {
-        for inst in &b.insts {
-            match &inst.op {
-                Op::Call { func, .. } => {
-                    let nm = interner.resolve(*func);
-                    use crate::fusion::{classify_call, CallClass, CoopKind};
-                    if matches!(classify_call(nm), CallClass::Coop(CoopKind::Reduce)) {
-                        needs_reduce_coop = true;
-                    } else if let Some(h) = rt_helper(nm) {
-                        if seen.insert(h.ptx_name) {
-                            serial_defs.push_str(&h.def);
-                            serial_defs.push('\n');
+    for &fi in &reachable {
+        for b in &program.funcs[fi].blocks {
+            for inst in &b.insts {
+                match &inst.op {
+                    Op::Call { func, .. } => {
+                        let nm = interner.resolve(*func);
+                        use crate::fusion::{classify_call, CallClass, CoopKind};
+                        // Only the ENTRY runs a reduction cooperatively; inside a called body the
+                        // same op is the serial helper, so both definitions can be needed at once.
+                        if fi == entry_idx
+                            && matches!(classify_call(nm), CallClass::Coop(CoopKind::Reduce))
+                        {
+                            needs_reduce_coop = true;
+                        } else if let Some(h) = rt_helper(nm) {
+                            if seen.insert(h.ptx_name) {
+                                serial_defs.push_str(&h.def);
+                                serial_defs.push('\n');
+                            }
                         }
                     }
+                    Op::Bin(BinOp::FRem, _, _) => needs_fmod = true,
+                    _ => {}
                 }
-                Op::Bin(BinOp::FRem, _, _) => needs_fmod = true,
-                _ => {}
             }
         }
     }
@@ -324,9 +341,57 @@ pub fn emit_mega_ptx(
     }
     out.push_str(&serial_defs);
 
+    // Forward-declare every reachable callee (so mutual recursion and definition order are moot),
+    // then define them, then the entry.
+    let callees: Vec<usize> = reachable.iter().copied().filter(|&i| i != entry_idx).collect();
+    for &fi in &callees {
+        out.push_str(&fn_signature(&program.funcs[fi], fi));
+        out.push_str(";\n");
+    }
+    if !callees.is_empty() {
+        out.push('\n');
+    }
+    for &fi in &callees {
+        let body = FnEmit::lower(&program.funcs[fi], fi, &func_idx, program, interner)?;
+        out.push_str(&body);
+        out.push('\n');
+    }
+
     let body = FnEmit::lower_mega(entry_fn, &func_idx, program, interner)?;
     out.push_str(&body);
     Ok(out)
+}
+
+/// The reachability closure of `root`: every function it can reach through a direct `Op::Call` or
+/// through an `Op::FuncAddr` (the `@parallel` outliner's handle on its outlined body), plus `root`
+/// itself, in index order.
+fn reachable_funcs(
+    program: &Program,
+    root: usize,
+    func_idx: &HashMap<Symbol, usize>,
+) -> Vec<usize> {
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut work = vec![root];
+    while let Some(fi) = work.pop() {
+        if !seen.insert(fi) {
+            continue;
+        }
+        for b in &program.funcs[fi].blocks {
+            for inst in &b.insts {
+                let target = match &inst.op {
+                    Op::Call { func, .. } => func_idx.get(func).copied(),
+                    Op::FuncAddr(sym) => func_idx.get(sym).copied(),
+                    _ => None,
+                };
+                if let Some(t) = target {
+                    if !seen.contains(&t) {
+                        work.push(t);
+                    }
+                }
+            }
+        }
+    }
+    seen.into_iter().collect()
 }
 
 // ============================================================================================
@@ -1868,9 +1933,10 @@ impl<'a> FnEmit<'a> {
                     ));
                 }
             }
-            CoopKind::ParallelFor => {
+            CoopKind::ParallelFor if args.len() != 3 => {
                 return Err(format!(
-                    "{UNSUPPORTED} wukong_parallel_for not cooperative in mega"
+                    "{UNSUPPORTED} wukong_parallel_for takes 3 args, got {}",
+                    args.len()
                 ));
             }
             _ => {}
@@ -2002,6 +2068,8 @@ impl<'a> FnEmit<'a> {
                     &[(0, Stride::Arg(5, 4)), (1, Stride::Arg(5, 4))],
                 );
             }
+            // The generic `@parallel` outline: a grid-stride loop over the independent domain.
+            CoopKind::ParallelFor => self.emit_parallel_for_gridstride(args)?,
             // Serial on `tid==0` over the shared frame (correct; cooperative bodies land later for
             // the remaining ops — e.g. axpby).
             _ => {
@@ -2012,6 +2080,106 @@ impl<'a> FnEmit<'a> {
             }
         }
         self.emit("bar.sync 0;");
+        Ok(())
+    }
+
+    /// **Grid-stride lowering of `wukong_parallel_for(n, func_addr F, ctx)`** (mega mode) — the
+    /// `@parallel` half of Phase 1.
+    ///
+    /// Iteration `i` runs on the thread with flat id `i mod stride`, where
+    /// `stride = blockDim.x * gridDim.x`, as the one-iteration chunk `F(i, i+1, ctx)`:
+    ///
+    /// ```text
+    /// for (i = threadIdx.x + blockIdx.x*blockDim.x; i < n; i += blockDim.x*gridDim.x)
+    ///     F(i, i+1, ctx);
+    /// ```
+    ///
+    /// **Why per-iteration chunks and not one contiguous range per thread.** Both partitions are
+    /// legal (see `fusion::parallel_for_is_cooperative` for what makes any partition legal), and a
+    /// contiguous range would be one call per thread instead of one per iteration. But neighbouring
+    /// *threads* would then touch addresses `chunk` elements apart, which is the uncoalesced access
+    /// pattern; with the grid-stride interleave, lane `t` and lane `t+1` of a warp read adjacent
+    /// elements, which is what a hand-written CUDA elementwise kernel does and the only shape that
+    /// can approach memory throughput. The cost is a `.func` call per iteration, and buying
+    /// coalescing with it is the right trade on a memory-bound loop; a compute-bound body would
+    /// prefer the other partition, which is a scheduling decision this phase does not have a place
+    /// to record yet.
+    ///
+    /// **Why the trip count is uniform.** The loop runs `ceil(n/stride)` times on *every* thread and
+    /// the tail is absorbed by passing an empty range (`hi = min(i+1, n)`, so `hi <= lo` once
+    /// `i >= n`, and the callee's `lo..hi` loop body never executes) rather than by exiting early.
+    /// A `call.uni` inside a region some threads have left is undefined, and every other call this
+    /// file emits is `call.uni`; keeping the loop convergent keeps that one convention instead of
+    /// introducing a divergent-call rule for one op. `n <= 0` skips the loop outright — computing
+    /// `ceil(n/stride)` unsigned on a negative `n` would spin ~2^64 times over empty ranges.
+    ///
+    /// The caller (`lower_call_mega`) brackets this with `bar.sync`, which is what makes the ctx
+    /// struct written by `tid==0` visible to every thread before the first call, and the results
+    /// visible to whatever `tid==0` reads next.
+    fn emit_parallel_for_gridstride(&mut self, args: &[ValueId]) -> Result<(), String> {
+        let sym = self.func_addr_of.get(&args[1].0).copied().ok_or_else(|| {
+            format!("{UNSUPPORTED} wukong_parallel_for target is not a func_addr")
+        })?;
+        let idx = *self.func_idx.get(&sym).ok_or_else(|| {
+            format!(
+                "{UNSUPPORTED} wukong_parallel_for target `{}` is not a known function",
+                self.interner.resolve(sym)
+            )
+        })?;
+        let n = self.reg(args[0]);
+        let ctx = self.reg(args[2]);
+
+        // stride = ntid.x * nctaid.x ; i = tid.x + ctaid.x*ntid.x   (both 64-bit)
+        let tid32 = self.fresh_r32();
+        let ntid32 = self.fresh_r32();
+        let ctaid32 = self.fresh_r32();
+        let nctaid32 = self.fresh_r32();
+        self.emit(&format!("mov.u32 {tid32}, %tid.x;"));
+        self.emit(&format!("mov.u32 {ntid32}, %ntid.x;"));
+        self.emit(&format!("mov.u32 {ctaid32}, %ctaid.x;"));
+        self.emit(&format!("mov.u32 {nctaid32}, %nctaid.x;"));
+        let i = self.fresh(RC::Rd);
+        let stride = self.fresh(RC::Rd);
+        let t = self.fresh(RC::Rd);
+        self.emit(&format!("cvt.u64.u32 {i}, {tid32};"));
+        self.emit(&format!("cvt.u64.u32 {stride}, {ntid32};"));
+        self.emit(&format!("cvt.u64.u32 {t}, {ctaid32};"));
+        self.emit(&format!("mul.lo.s64 {t}, {t}, {stride};"));
+        self.emit(&format!("add.s64 {i}, {i}, {t};"));
+        let ncta = self.fresh(RC::Rd);
+        self.emit(&format!("cvt.u64.u32 {ncta}, {nctaid32};"));
+        self.emit(&format!("mul.lo.s64 {stride}, {stride}, {ncta};"));
+
+        let lbl = self.n_lbl;
+        self.n_lbl += 1;
+
+        // Empty domain: nothing to do (and `ceil(n/stride)` unsigned on n<=0 is a ~2^64 trip count).
+        let pempty = self.fresh_pred();
+        self.emit(&format!("setp.le.s64 {pempty}, {n}, 0;"));
+        self.emit(&format!("@{pempty} bra PFOR_END{lbl};"));
+
+        // trip = ceil(n / stride), the same value on every thread.
+        let trip = self.fresh(RC::Rd);
+        self.emit(&format!("add.s64 {trip}, {n}, {stride};"));
+        self.emit(&format!("sub.s64 {trip}, {trip}, 1;"));
+        self.emit(&format!("div.u64 {trip}, {trip}, {stride};"));
+        let c = self.fresh(RC::Rd);
+        self.emit(&format!("mov.b64 {c}, 0;"));
+
+        self.body.push_str(&format!("PFOR{lbl}:\n"));
+        let pdone = self.fresh_pred();
+        self.emit(&format!("setp.ge.s64 {pdone}, {c}, {trip};"));
+        self.emit(&format!("@{pdone} bra PFOR_END{lbl};"));
+        // hi = min(i+1, n): the real one-iteration range, or an empty one on the tail threads.
+        let hi = self.fresh(RC::Rd);
+        self.emit(&format!("add.s64 {hi}, {i}, 1;"));
+        self.emit(&format!("min.s64 {hi}, {hi}, {n};"));
+        let arg_regs = vec![(i.clone(), "b64"), (hi, "b64"), (ctx.clone(), "b64")];
+        self.emit_call_to(idx, &arg_regs, None);
+        self.emit(&format!("add.s64 {i}, {i}, {stride};"));
+        self.emit(&format!("add.s64 {c}, {c}, 1;"));
+        self.emit(&format!("bra PFOR{lbl};"));
+        self.body.push_str(&format!("PFOR_END{lbl}:\n"));
         Ok(())
     }
 
