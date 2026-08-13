@@ -715,26 +715,41 @@ it cannot load.
 **The shipped rule is `ptx_wgmma::wgmma_dispatch_dtype`, a pure function of `(M, N, K)` and the
 probed SM count**, and it chooses four things: the CTA tile (the widest of 128×256 / 128×128 / 128×64
 whose wave fill clears 0.90 against the probed SM count), the grouped raster (only when a multi-wave
-grid's linear wave footprint blows the probed L2), persistence (any multi-wave grid), and the 1×2×1
+grid's linear wave footprint blows L2), persistence (any multi-wave grid), and the 1×2×1
 B-multicast cluster (only when what the multicast would save off the *final* configuration's binding
-roof clears its break-even **and** the grid is at least two waves deep, so the cluster's cross-SM
-coupling has more than one tile to amortize over). Until 2026-08-12 the seam instead delegated to a
+roof clears its break-even **and** the grid is at least `CLUSTER_MIN_WAVES = 2` waves deep, so the
+cluster's cross-SM coupling has more than one device pass to amortize over — at the shipped value of
+2 that second term coincides exactly with the persistence lever, and it becomes independent only at 3
+or more). **Only the SM count is probed**: `L2_BYTES`, `BW_L2` and `BW_HBM` are constants pinned to
+the H100 SXM5 this campaign rents, and that asymmetry is recorded beside `L2_BYTES` rather than
+papered over. Until 2026-08-12 the seam instead delegated to a
 static two-way split on `M × N` at 8e6 output elements, which could only ever return a 128×256 row;
 the H100 visit of that day measured the four schedule levers as sweep arms and found the split
 shipping the losing configuration on four of seven benched shapes, which is what promoted the
 dispatcher into the product path. `M × N` is retired rather than kept as a fallback because it is not
 a physical quantity for any of the four levers — two shapes with identical `M × N` take opposite
-cluster verdicts in both directions. The rule can also **decline**: it names a module or says it
-cannot, never substitutes a nearby one, and here a decline is a routing fact that takes the
-pre-Hopper path with the reason logged.
+cluster verdicts in both directions.
+
+The rule can also **decline**: it names a module or says it cannot, never substitutes a nearby one,
+and here a decline is a routing fact that takes the pre-Hopper path with the reason logged. **That
+narrows the Hopper fast path, and the narrowing is the promotion's one honest cost.** The retired rule
+could not decline — it returned a 128×256 row for every shape — while the tile lever makes
+`(tile, schedule)` combinations reachable that no module carries: a schedule lever at a tile whose
+table holds only the one-tile-per-CTA row, plus the un-clustered rastered widest tile. Six such
+signatures exist, they are contiguous bands of ordinary tall-skinny shapes rather than pathologies,
+and shapes inside them now run the pre-Hopper f32 launcher — correct, and much slower.
+`ptx_wgmma::tests::the_rules_reachable_configurations_are_enumerated_and_the_decline_set_is_pinned`
+sweeps the shape space, buckets every verdict by its `(tile, cluster, raster, persist)` signature, and
+pins **both** sets exactly, so the band cannot grow silently and closing it is an argued edit rather
+than a drift. It is not closed here because the missing modules would be **unmeasured PTX shipped on
+the strength of arithmetic**, which is the opposite of what a promotion is for;
+`docs/gpu/derive/WAVE3_PROMOTION_HANDOFF.md` carries the list a later lane needs.
 
 Every other reason the family cannot take a call *that is decidable before the
 launch* — a shape whose tensor map is unencodable (`K % 8 != 0` makes the NT row stride not a
 multiple of 16 bytes), an output past the epilogue's `u32` element index, a ring larger than the
-device's opt-in shared memory, a CTA grid past CUDA's `gridDim.y` ceiling of 65535 (`LaunchPlan::grid`
-puts the M tiles on y for a one-tile-per-CTA schedule, so `M` above ~8.4M with a small `N` reaches the
-driver as `CUDA_ERROR_INVALID_VALUE`; a *persistent* schedule's grid is bounded by the device instead,
-so that ceiling is unreachable there), or an `UNSUPPORTED` from the generator — is likewise a
+device's opt-in shared memory, a CTA grid past CUDA's `gridDim.y` ceiling of 65535 (see below), or an
+`UNSUPPORTED` from the generator — is likewise a
 **decline to the existing path**, never an error, and the launcher's own `assert!`s are pre-decided in
 the driver so a user's program can never abort on one. Two outcomes are deliberately *not* declines, and the module
 names both rather than implying a total guarantee: a driver rejection **at** the launch that is not
@@ -743,8 +758,19 @@ virtual architecture, say) stays a `Some(Err(..))` hard error, because a GPU fai
 `--backend=gpu` is never silently answered on the CPU; and a launch that never retires ends the
 process with `exit(70)` from the launch wait in `wukong_codegen_gpu::gpu`, since a wedged context
 blocks every later driver call anyway. Ragged M/N/K are *not* declines: TMA zero-fills and the
-epilogue predicates. An **odd `N` is**, and it is one of the two declines the launcher does not make
-for itself (the grid ceiling is the other): every arm the shipped rule can select carries the
+epilogue predicates.
+
+**The `gridDim.y` ceiling is now unreachable through the shipped rule, and is retained as defence in
+depth rather than as a live routing path.** `LaunchPlan::grid` puts the M tiles on `y` for a
+one-tile-per-CTA schedule, and that schedule is selected iff the grid is one wave, i.e. iff
+`tiles <= sm_count` — so `gridDim.y = ceil(M/bm) <= sm_count`, about 132. A persistent schedule's grid
+is `(cluster slots, cluster.y, 1)`, bounded by the device. No shape the rule can serve, at either
+dtype, can therefore present `gridDim.y > 65535`. The decline stays because `LaunchPlan::grid` is
+`pub`, because the tile menu and the schedule set are both things later waves widen, and because what
+it prevents is a `CUDA_ERROR_INVALID_VALUE` on a call that had a working fallback; its unit probe
+accordingly feeds the launch *plan* an `M` the rule would never route to it.
+
+An **odd `N`** is the one decline that is both live and not the launcher's own: every arm the shipped rule can select carries the
 `st.global.v2.f32` epilogue, whose 8-byte pair is aligned only when `N` is even, and a misaligned
 store is a *sticky* `CUDA_ERROR_MISALIGNED_ADDRESS` that fails every later call in the process
 rather than returning a wrong number. `gemm_nt_wgmma` asserts it only in its timing sibling, so the

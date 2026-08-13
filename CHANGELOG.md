@@ -50,6 +50,29 @@ at four of the seven benched shapes. That is the defect this change fixes.
 - **The promoted rule is UNMEASURED as a rule.** Its arms were measured individually on 2026-08-12;
   nothing has run the rule end-to-end. `wgmma_vs_cublas` and `wgmma_bf16_vs_cublas` now run THE RULE,
   so the next H100 visit re-measures it instead of timing a fixed row.
+- **REGRESSION, stated because it is real: the promotion narrows the Hopper fast path.** The retired
+  rule could not decline — it returned a 128×256 row for every shape — while the tile lever makes
+  `(tile, schedule)` combinations reachable that no module carries. Six such signatures exist (a
+  schedule lever at a tile whose table holds only the one-tile-per-CTA row, plus the un-clustered
+  rastered widest tile), and they are contiguous bands of ordinary tall-skinny shapes, not corners: a
+  shape inside one now takes the pre-Hopper f32 launcher, which is correct and much slower. It is
+  **not** closed here, because the twelve modules that would close it (six plus bf16 twins) would be
+  unmeasured PTX shipped on arithmetic alone. Instead
+  `the_rules_reachable_configurations_are_enumerated_and_the_decline_set_is_pinned` sweeps the shape
+  space and pins both the servable and the unserved signature sets exactly, so the band cannot grow
+  silently, and §4 of the handoff carries the module list plus a cheaper seam-side alternative.
+- Two properties of the new predicate are stated rather than left to be noticed: at the shipped
+  `CLUSTER_MIN_WAVES = 2` the amortization term **coincides exactly** with the persistence lever
+  (`waves >= 2` is `waves > 1`), becoming independent only at 3 or more — so the rule can never select
+  a clustered non-persistent module and `WGMMA_W1_MCB_V2` survives only as a control; and every arm of
+  the A/B that justifies the term is one-tile-per-CTA, so what the coupling cost is amortized over is
+  the number of **device passes**, which is what the code computes. The stronger "tiles one CTA runs"
+  reading is a claim about the persistent arm the A/B did not measure, and the added sweep cell is what
+  settles it.
+- Only the **SM count** is probed. `L2_BYTES`, `BW_L2` and `BW_HBM` stay pinned to the H100 SXM5,
+  deliberately: `sm_count` enters the rule as pure geometry that is correct on any device, while the L2
+  is one term of a cost model whose other constants were fitted on this part, so probing it alone would
+  make the residency test device-aware inside a floor that is not.
 - Two documents this change makes stale **about the code** — `CAMPAIGN_CHECKPOINT.md`, which names
   three now-deleted symbols as the shipped default, and `BENCHMARKS.md`, whose `sq2048` warning box
   cites a deleted constant and a deleted test — belong to concurrent lanes and are deliberately **not**

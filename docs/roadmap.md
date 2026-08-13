@@ -514,10 +514,29 @@ read every percentage below as provisional pending a locked-clock VM re-run.
   recognized `C = A·Bᵀ` now reaches `gemm_nt_wgmma`, with a decline-to-existing-path fallback. No
   H100 number has yet been measured *through* that route.
 
-*Unmeasured, landed:* the campaign's scheduling wave (CTA raster on the cluster index, persistent
-clusters with a continuous ring, a per-shape tile dispatcher, wait-depth drain arms) is **merged but
-has no measurement behind it**. Its derivations are `docs/gpu/derive/`; nothing from it is in
-`BENCHMARKS.md` and nothing from it should be quoted as a result until a round publishes one.
+*Measured and promoted, not yet re-measured as a rule:* the campaign's scheduling wave (CTA raster on
+the cluster index, persistent clusters with a continuous ring, a per-shape tile dispatcher, wait-depth
+drain arms) was measured as sweep **arms** on 2026-08-12, and three of the four are now the **shipped**
+dispatch rule (`ptx_wgmma::wgmma_dispatch_dtype`, both 16-bit dtypes). As arms they moved the suite
+mean from 81.9% to 94.1% of cuBLAS f16, with 8192³ at 102.0% and the wide-N up-projection at 101.6% —
+the campaign's first shapes at or above the peer. **Two levers were deliberately NOT promoted, on the
+measurement:** the wait-depth drain arms moved nothing beyond ~1 point anywhere, and the `GROUP_M = 32`
+raster landed strictly worse than 16.
+
+Three scope notes, because the promotion changes what the numbers above describe:
+
+- **The percentages in this section predate the promoted rule** and were measured under the retired
+  `M × N ≥ 8e6` split, which the 2026-08-12 round showed shipping the losing arm at four of the seven
+  benched shapes. They stand as what that configuration did; they are not the shipped configuration's
+  numbers any more.
+- **The rule itself is unmeasured.** Its arms were measured individually; nothing has yet run the rule
+  end-to-end. `wgmma_vs_cublas` and `wgmma_bf16_vs_cublas` now run the rule rather than a fixed row, so
+  the next H100 visit re-measures it.
+- **Sharp edge:** the promotion *narrows* the Hopper fast path. The retired rule always returned a
+  128×256 row; the new one can decline, and six reachable `(tile, schedule)` signatures have no module,
+  so contiguous bands of tall-skinny shapes now take the pre-Hopper f32 launcher — correct, and much
+  slower. The set is swept, enumerated and pinned by a device-free law so it cannot grow silently;
+  `docs/gpu/derive/WAVE3_PROMOTION_HANDOFF.md` lists the modules that would close it.
 
 A GPU backend, `wukong_codegen_gpu`: being a compiler, it **emits PTX text** and **driver-JIT-loads
 it via `cudarc`** (`cuModuleLoadData` — the driver's built-in PTX→SASS JIT, so **no `nvcc`/`ptxas`/CUDA
