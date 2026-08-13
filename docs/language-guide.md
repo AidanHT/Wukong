@@ -429,13 +429,16 @@ runtime size is outside the defined contract, like any runtime index
 ```
 
 Attribute *syntax* is parsed on functions, parameters and statements (a missing argument value is
-`E0207`), but the attribute **name is not validated** — an unknown attribute such as `@bogus(1, 2)` is
-silently accepted. Exactly one attribute has a consumer today: **`@parallel` on a function** (✅),
-which makes its loop execute across CPU cores. Everything else in the list above — `@inline`, `@simd`,
-`@tile`, `@align`, `@extern`, `@export`, and `@parallel`'s own `grain = …` argument — is parsed and
-discarded (🔵). An attribute on a *statement or loop* is likewise dropped: `@parallel` must sit on the
-function, and the mid-function parallel region is derived from the enclosing function's attribute, not
-from one written on the loop.
+`E0207`), and the attribute **name is validated against a closed set** (✅): `@parallel`, `@generic`,
+`@tile`, `@extern`, `@inline`, `@simd`, `@align`, `@export`. Anything else — `@bogus(1, 2)`, and far
+more usefully a typo of a real one such as `@parellel` — is **`E0306`**, where it used to be accepted
+and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Exactly one
+attribute has a consumer today: **`@parallel` on a function** (✅), which makes its loop execute
+across CPU cores. Everything else in the list above — `@inline`, `@simd`, `@tile`, `@align`,
+`@extern`, `@export`, and `@parallel`'s own `grain = …` argument — is parsed and discarded (🔵), and
+stays legal wherever it parses. An attribute on a *statement or loop* is likewise dropped:
+`@parallel` must sit on the function, and the mid-function parallel region is derived from the
+enclosing function's attribute, not from one written on the loop.
 
 `@parallel` **declines and lowers serially, with no diagnostic**, when the loop cannot be split into
 independent chunks: a labelled loop, a plain `break` out of the parallelized loop, a `return` out of

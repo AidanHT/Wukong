@@ -22,6 +22,7 @@
 //! Several diagnostics are gated on the `checking_bodies` flag so they fire only once every generic
 //! and `const` is registered.
 
+mod attrs;
 mod shape;
 
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -329,6 +330,10 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         consts: HashMap::default(),
         checking_bodies: false,
     };
+    // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
+    // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
+    // module whose bodies do not resolve.
+    attrs::check(module, interner, &mut s.diags);
     s.collect(module);
     s.check_recursive_types(module);
     s.check_recursive_consts(module);

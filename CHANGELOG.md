@@ -5,6 +5,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Language — an unknown `@attribute` is an error (`E0306`), not silence
+An attribute the compiler does not implement was parsed and discarded, so `@bogus` compiled, and a
+**typo of a real attribute** (`@parellel`) compiled to a single-threaded program with nothing on
+stderr — the attribute's entire purpose defeated, silently. The `@attribute` name is now checked
+against a closed v1 set (`@parallel`, `@generic`, `@tile`, `@extern`, `@inline`, `@simd`, `@align`,
+`@export`); anything else is **`E0306`** (`wukongc --explain E0306`). The four parsed-but-discarded
+attributes stay legal wherever they parse — this is a typo gate, not a language change. `@generic` is
+in the set from the start and is rejected off a `fn` item, because it is read from the function.
+New: `crates/wukong_sema/src/attrs.rs`, `tests/fail/unknown_attr.wk`,
+`tests/fail/unknown_attr_typo.wk`.
+
 ### GPU (Hopper `wgmma`) — the shipped dispatch rule is now wave 3's per-shape dispatcher
 Wave 3's four schedule levers (grouped raster, persistent CTAs, per-shape tile dispatch, mainloop
 drain) landed on 2026-08-12 and the H100 visit of the same day measured them as sweep **arms**. They

@@ -176,6 +176,18 @@ static CATALOG: &[Explanation] = &[
          resolution and need not match the import path."
     ),
     entry!(
+        "E0306",
+        "unknown or misplaced attribute",
+        "An `@attribute` is not one Wukong knows, or is not legal where it was written. The known \
+         set is closed: `@parallel`, `@generic`, `@tile`, `@extern`, `@inline`, `@simd`, `@align`, \
+         `@export`. Anything else — most importantly a typo of a real one, `@parellel` — used to be \
+         accepted and discarded, so the program compiled with none of the requested behavior and no \
+         diagnostic. Placement: `@generic` (opt this function out of kernel recognition) is read \
+         from the `fn` item, so it is rejected on a statement, a parameter, or a non-`fn` item \
+         rather than silently promising a per-loop opt-out. The parsed-but-discarded attributes \
+         (`@inline`, `@simd`, `@align`, `@export`) stay legal wherever they parse."
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type required by its context — for example a `let` with \
