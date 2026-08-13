@@ -1,0 +1,70 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 168
+// EXPECT-OUT: 132
+// EXPECT-OUT: 96
+// EXPECT-OUT: 60
+// EXPECT-OUT: 24
+// EXPECT-OUT: -12
+// EXPECT-OUT: 392
+// EXPECT-OUT: 292
+// EXPECT-OUT: 192
+// EXPECT-OUT: 92
+// EXPECT-OUT: -8
+// EXPECT-OUT: -108
+// EXPECT-OUT: 616
+// EXPECT-OUT: 452
+// EXPECT-OUT: 288
+// EXPECT-OUT: 124
+// EXPECT-OUT: -40
+// EXPECT-OUT: -204
+module tests.run.linear_nt_while_k_every_lane
+
+// Idiomatic `Y = X·Wᵀ` whose contraction is a counting `while k < K { …; k += 1 }` instead of
+// `for k in 0..K`. Same trip count, same ascending-k add chain, same `wukong_sgemm_nt`.
+//
+// PROOF THE RECOGNIZER FIRES:
+//     cargo run -q -p wukongc -- --emit=mir -O2 tests/run/linear_nt_while_k_every_lane.wk
+// prints `call wukong_sgemm_nt(...)`.
+//
+// Expected values are the scalar semantics of the nest, never a compiler run. Fills
+// `x[i,k] = i*8+k+1`, `w[j,k] = k-j`, A = 8i+1:
+//     y[i,j] = Σ_{k=0..7} (A+k)(k-j) = A·(28-8j) + 140 - 28j
+// Corners: y[0,0] = 168, y[2,5] = -204. All 18 lanes are distinct.
+fn linear(x: Tensor[f32, 3, 8], w: Tensor[f32, 6, 8], mut y: Tensor[f32, 3, 6]) {
+    for i in 0..3 {
+        for j in 0..6 {
+            let mut s: f32 = 0.0;
+            let mut k: i64 = 0;
+            while k < 8 {
+                s = s + x[i, k] * w[j, k];
+                k = k + 1;
+            }
+            y[i, j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 24] = [0.0; 24];
+    let mut w: [f32; 48] = [0.0; 48];
+    let mut y: [f32; 18] = [0.0; 18];
+
+    for i in 0..3 {
+        for k in 0..8 {
+            x[i * 8 + k] = ((i * 8 + k + 1) as f32);
+        }
+    }
+    for j in 0..6 {
+        for k in 0..8 {
+            w[j * 8 + k] = (k as f32) - (j as f32);
+        }
+    }
+
+    linear(x, w, y);
+
+    for t in 0..18 {
+        print(y[t] as i32);
+    }
+    return 0;
+}
