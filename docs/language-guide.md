@@ -7,6 +7,8 @@ GPU backends. The goal is to be easier and more productive than hand-written CUD
 keeping costs visible — not to hide kernels behind a framework runtime. A win is a `.wk` program
 through the compiler, not a Rust-launched kernel zoo.
 
+The living thesis is [LANGUAGE_DIRECTION.md](LANGUAGE_DIRECTION.md); the sequenced mission (including AI-editor / vibe-coding) is [WUKONG_MASTER_PLAN.md](WUKONG_MASTER_PLAN.md). Neither file claims those surfaces run today.
+
 This guide describes the Wukong language as it exists today. Wukong is built incrementally; where
 a feature parses and type-checks but does not yet execute end-to-end, that is called out explicitly.
 

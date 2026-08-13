@@ -6,7 +6,7 @@ key design bets. It is aimed at contributors.
 The compiler exists so programmers write `.wk` kernels and pass them through a real front end,
 semantic analyzer (`wukong_sema` — including compile-time shape checking), and MIR pipeline. Execution
 backends (interpreter, Cranelift native codegen, optional GPU recognizer offload and MIR→PTX) are
-interchangeable ways to run the same program; they are not the product on their own.
+interchangeable ways to run the same program; they are not the product on their own. Mission and lowering thesis live in [WUKONG_MASTER_PLAN.md](WUKONG_MASTER_PLAN.md) and [LANGUAGE_DIRECTION.md](LANGUAGE_DIRECTION.md).
 
 ## Design bets
 

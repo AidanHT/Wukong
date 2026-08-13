@@ -242,6 +242,9 @@ hidden runtime dim params (`tests/run/generic_shape.wk`). See the docs:
 - [Compiler internals](docs/internals.md) — architecture, MIR, optimizer, the native backend, and testing.
 - [Roadmap & limitations](docs/roadmap.md) — what runs, what's checked-only, what's planned.
 - [LLVM setup](docs/llvm-setup.md) — optional textual-IR backend (the native path uses Cranelift, no LLVM).
+- [Language direction](docs/LANGUAGE_DIRECTION.md) — thesis for generic kernel lowering, not more silent PTX families.
+- [Master plan](docs/WUKONG_MASTER_PLAN.md) — north star for the language (including AI editors); GPU SOTA is a chapter, not the product.
+- [Docs index](docs/README.md) and [crate READMEs](crates/README.md) — per-folder orientation.
 
 ## Building
 

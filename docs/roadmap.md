@@ -747,7 +747,9 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   itself a strong ML/DL kernel language — generic gpu-native lowering, consuming
   `@tile` / `@generic` / `shared`, explicit vendor kernels rather than silent
   rewrites — lives in [`docs/LANGUAGE_DIRECTION.md`](LANGUAGE_DIRECTION.md). It is
-  a design for review, not a claim that those features run today.
+  a design for review, not a claim that those features run today. The sequenced
+  language mission (including AI-editor / vibe-coding) lives in
+  [`docs/WUKONG_MASTER_PLAN.md`](WUKONG_MASTER_PLAN.md).
 - Fusing arbitrary elementwise chains *under* `@parallel`. (The **parallel fused-epilogue GEMM** that
   was the remaining item here has since shipped — a `@parallel` `act(A·Bᵀ [+ bias])` nest dispatches
   to the multicore `wukong_sgemm_nt_epi_parallel`; see "Works end to end" above.)
