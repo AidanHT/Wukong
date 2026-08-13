@@ -434,6 +434,21 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   one more decline: a modelled body-local that is reassigned inside an inner loop, whose snapshot is
   not flow-sensitive. Verify with `wukongc --emit=mir -O2 f.wk` and look for a `_parallel` symbol or a
   `wukong$par$` region.
+- **`@generic`** on a function turns the kernel recognizers **off for that function**: none of the
+  four probe sites (whole-function interception, the per-loop `match_*` cascade, `lower_block`'s
+  statement windows, the vectorizer's elementwise probes) fire inside it, so its loops compile as
+  written — while auto-vectorization, loop fusion, FMA contraction, `@parallel` outlining and the
+  optimizer all still apply, as do the builtins you call by name. It is per function, not per module
+  (`tests/run/lang_generic_saxpy.wk`, `lang_generic_naive_gemm.wk` each hold the same body twice and
+  the MIR then holds exactly one kernel call), and it is `E0306` anywhere but a `fn` item. The
+  whole-program equivalent, `WUKONG_NO_RECOGNIZE`, is a **measurement instrument** rather than a user
+  feature (see `docs/internals.md`): recognizers are otherwise gate-blind, so this is the only way to
+  compile and time the honest generic lowering of the same program. Autodiff refuses to run under the
+  instrument, by name.
+- Unknown or misplaced `@attributes` are **`E0306`**, not silence: the name is checked against the
+  closed v1 set (`@parallel`, `@generic`, `@tile`, `@extern`, `@inline`, `@simd`, `@align`,
+  `@export`), so a typo like `@parellel` no longer compiles to a program with none of the requested
+  behavior. The four discarded attributes stay discarded wherever they parse.
 - Intrinsics `print`/`println`/`assert`.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
