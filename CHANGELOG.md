@@ -5,6 +5,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+- Added the Phase 0 comparison corpus and `@generic` few-shot loops as a reproducible language ruler, without recording a performance result.
+
 ### GPU (Hopper `wgmma`) — the shipped dispatch rule is now wave 3's per-shape dispatcher
 Wave 3's four schedule levers (grouped raster, persistent CTAs, per-shape tile dispatch, mainloop
 drain) landed on 2026-08-12 and the H100 visit of the same day measured them as sweep **arms**. They
