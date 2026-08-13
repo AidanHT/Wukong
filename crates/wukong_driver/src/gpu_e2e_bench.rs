@@ -34,11 +34,12 @@
 //! shorter, and named that way.
 //!
 //! `launch_ms` and `e2e_ms` both also contain something `kernel_ms` does not: `gemm_nt_wgmma`
-//! **regenerates the PTX text on every call** and hands it to a module lookup that is a cache hit
-//! (the cache keys on the module key and never re-examines the PTX), while `time_gemm_nt_wgmma`
-//! resolves once outside its timed region. Both host-to-host arms pay it identically — they are the
-//! same function — so it cannot bias `pipeline cost`; it is part of what retention measures,
-//! alongside the copies.
+//! **regenerates the PTX text on every call** and hands it to a module lookup that is a cache hit —
+//! it does not re-load the module, though it does re-hash the whole text as a key-collision guard
+//! (`ptx_fingerprint`, GUARD G4), so the per-call cost is `O(|PTX|)` and not free — while
+//! `time_gemm_nt_wgmma` resolves once outside its timed region. Both host-to-host arms pay it
+//! identically, being the same function, so it cannot bias `pipeline cost`; it is part of what
+//! retention measures, alongside the copies.
 //!
 //! **One asymmetry does bias `pipeline cost`, upward, against Wukong, and is measured rather than
 //! argued.** `wukong_interp::run_kernel_f32_accel` wraps every call in `with_big_stack`, which spawns
@@ -56,7 +57,9 @@
 //!   hoisted out of the timed region, i.e. the published table's own comparison re-measured in this
 //!   same round so the two share a denominator, a clock and a container.
 //! - **`kernel_ms / e2e_ms` — the RETENTION**: what fraction of the kernel-only number survives the
-//!   trip through the compiler and the offload seam. `launch_ms` splits it in two:
+//!   trip through the interpreter and the offload seam. The compile is in NEITHER quantity — it runs
+//!   once per shape outside both twins — so retention is about execution only. `launch_ms` splits it
+//!   in two:
 //!   `kernel_ms / launch_ms` is the copy-and-conversion tax the resident-buffer bench does not pay,
 //!   and `launch_ms / e2e_ms` is the pipeline's own share.
 //!
@@ -630,7 +633,10 @@ mod tests {
                 m * n
             );
 
-            // **The TIMED launcher must also write C, and this is the last check before ANY timing.**
+            // **The TIMED launcher must also write C, and this is the last check before either TWIN.**
+            // (Two timed quantities do precede it — the compile at 4a and the peer one-shot just
+            // above — but neither comes from `time_gemm_nt_wgmma` and neither is published; both land
+            // in the DIAGNOSTIC block. What this probe guards is the resident twin.)
             // `time_gemm_nt_wgmma` never reads C back. Its own doc says why that matters: "a kernel
             // that stored nothing -- a mispredicated epilogue, a truncated grid, a transport that lost
             // its operands -- would post the fastest number in the table and pass every gate in the
@@ -829,7 +835,8 @@ mod tests {
         eprintln!(
             "\n---- {E2E_BENCH_NAME}: RETENTION ----\n\
              `retention` = kernel ms / e2e ms: the fraction of the KERNEL-ONLY number that survives\n\
-             the trip through the compiler and the offload seam. It is below 1 by the host f32->f16\n\
+             the trip through the INTERPRETER and the OFFLOAD SEAM -- the compile is in neither\n\
+             quantity, it runs once per shape outside both twins. It is below 1 by the host f32->f16\n\
              conversion and the two PCIe crossings that the RESIDENT-buffer bench does not pay --\n\
              which is why `launch ms` sits beside it: kernel/launch is that tax alone, and\n\
              launch/e2e is the pipeline's own share.\n\
@@ -1103,6 +1110,41 @@ mod tests {
         }
     }
 
+    /// **The published table prints ONE timed-region label for all seven rows, so all seven must
+    /// agree.**
+    ///
+    /// The header derives it from the first grid row's config
+    /// (`TimedRegion::for_cfg(wgmma_cfg_for(.., GRID[0].m, GRID[0].n))`), and `wgmma_cfg_for` selects
+    /// on output size — the clustered row at or above `W1_CLUSTER_MIN_OUTPUT_ELEMS`, the un-clustered
+    /// one below — so the grid really does select more than one config. Today every config agrees
+    /// because `WgmmaCfg::requires_zeroed_c()` is `const fn ... { false }` for all of them, which makes
+    /// the header's claim TRUE BY ACCIDENT rather than by construction.
+    ///
+    /// That is the kind of fact that rots silently: a future row that needs a zeroed C would make the
+    /// header say `memset-in-region no` over rows that had one, and `TimedRegion::label` exists
+    /// precisely because "the timed region contained a memset" is not recoverable from a number. If
+    /// this fails, do not widen it — move the label into the per-shape row.
+    #[test]
+    fn every_grid_shape_shares_the_published_timed_region() {
+        let header = wukong_codegen_gpu::gpu::TimedRegion::for_cfg(gpu_accel::wgmma_cfg_for(
+            gpu_accel::WGMMA_F32_SEAM_DTYPE,
+            WGMMA_BENCH_GRID[0].m,
+            WGMMA_BENCH_GRID[0].n,
+        ))
+        .label();
+        for p in WGMMA_BENCH_GRID {
+            let cfg = gpu_accel::wgmma_cfg_for(gpu_accel::WGMMA_F32_SEAM_DTYPE, p.m, p.n);
+            let mine = wukong_codegen_gpu::gpu::TimedRegion::for_cfg(cfg).label();
+            assert_eq!(
+                mine, header,
+                "{} selects `{}`, whose timed region is `{mine}` — the published table's header \
+                 announces `{header}` for every row. Move the label into the per-shape row rather \
+                 than relaxing this.",
+                p.label, cfg.name
+            );
+        }
+    }
+
     /// **The fill really does make correctness an `==` check at every grid shape.**
     ///
     /// [`assert_every_lane`] rests on arithmetic that is shape-dependent, so it is checked per shape
@@ -1155,9 +1197,11 @@ mod tests {
     /// Three independent ways this round could bill an H100 and prove nothing, each of which has
     /// happened in this repo or was one flag away from it:
     ///
-    /// - **the wrong entrypoint.** `::bench` appends `--ignored`, so it reaches ONLY `#[ignore]`d
-    ///   tests; `::test` reaches only plain ones. A name routed through the wrong one selects zero
-    ///   tests, prints `0 passed` and exits 0 — the 2026-08-11 vacuous round, $0.006.
+    /// - **the wrong entrypoint.** `::bench` appends `--ignored` on its own, so it reaches
+    ///   `#[ignore]`d tests; `::test` does not pass that flag, so a bare `--filter <name>` there
+    ///   selects zero tests, prints `0 passed` and exits 0 — the 2026-08-11 vacuous round, $0.006.
+    ///   (`::test` splits its filter, so `--filter "--ignored <name>"` *could* reach one; that is a
+    ///   correctness entrypoint, not a measurement one.)
     /// - **the wrong package.** `bench()`'s `package` defaults to `wukong_codegen_gpu`, and this
     ///   bench is in `wukong_driver`. Without `--package wukong_driver` the harness selects zero
     ///   tests in a crate that does not contain it.
@@ -1176,8 +1220,10 @@ mod tests {
         );
         assert!(
             !inv.contains("::test") && !inv.contains("--filter "),
-            "`--filter` is ::test's selector and ::test never passes --ignored, so it would select \
-             ZERO tests here and exit 0: {inv}"
+            "`--filter` is ::test's selector and ::test does not pass --ignored itself, so a bare \
+             `--filter <name>` selects ZERO tests here and exits 0. (`::test` splits its filter, so \
+             `--filter \"--ignored <name>\"` could reach an ignored test; a sweep runner is still the \
+             right home for a measurement.): {inv}"
         );
         assert!(
             inv.contains("--package wukong_driver"),
@@ -1292,6 +1338,15 @@ mod tests {
             "`{name}` no longer counts its publications, so a round where every cell refused would \
              print dashes and still exit 0"
         );
+        // **The counter is not the property; the ESCALATION is.** `if published == 0 { eprintln!(..) }`
+        // satisfies the check above while restoring the exact rc-0 defect, and so does hoisting the
+        // increment out of the `Ok(..)` arms to count attempts instead of publications. Pin the
+        // `skip_or_fail` argument, which only the escalating form can carry.
+        assert!(
+            round.contains("the round completed but every cell refused"),
+            "`{name}` counts publications but no longer ESCALATES when there are none, so a \
+             clock-drift refusal would print fourteen dashes and hand `bench()` rc 0"
+        );
         // **The capability escalation, and the reason it needs a second lever on `::bench`.** The
         // round escalates on `WUKONG_GPU_REQUIRED` *as well as* the declared capability, because
         // `bench()` exports only the former. If the harness ever grows the `_cc_for_sku` export that
@@ -1355,6 +1410,14 @@ mod tests {
             build_body.contains("\"-p\", \"wukong_driver\"") && build_body.contains("--no-run"),
             "`::build` no longer builds the wukong_driver test binary, so `_require_prebuilt` will \
              refuse this round: {E2E_BENCH_INVOCATION}"
+        );
+        // That cargo line is guarded by `if driver:`, so the DEFAULT is load-bearing: flip it and the
+        // documented `::build --release` stops staging this package while the assertion above stays
+        // green, and every round then aborts inside `_require_prebuilt`.
+        assert!(
+            modal.contains("def build(release: bool = False, driver: bool = True)"),
+            "`::build` no longer builds the driver package by default, so `{E2E_BENCH_INVOCATION}` \
+             needs a `--driver` flag the documented prerequisite does not pass"
         );
     }
 }
