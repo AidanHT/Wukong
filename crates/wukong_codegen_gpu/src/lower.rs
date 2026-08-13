@@ -680,6 +680,16 @@ impl<'a> FnEmit<'a> {
 
         let params: Vec<ValueId> = self.func.params.clone();
         for (i, p) in params.iter().enumerate() {
+            // A *block* param may be a vector (lane registers, see `assign_vector_block_params`); a
+            // FUNCTION param may not, because `fn_signature` gives it one scalar `.param` slot and
+            // there is no ABI here to pass N lanes through. MIR signatures are scalars and pointers
+            // today, so this is a decline against a future op, not a live limitation.
+            if self.func.value_type(*p).is_vector() {
+                return Err(format!(
+                    "{UNSUPPORTED} SIMD function parameter v{} (no vector `.param` ABI)",
+                    p.0
+                ));
+            }
             let r = self.reg(*p);
             let abi = abi_ty(self.func.value_type(*p));
             self.emit(&format!("ld.param.{abi} {r}, [p{i}];"));
@@ -719,6 +729,7 @@ impl<'a> FnEmit<'a> {
 
     /// The shared block-emitting loop used by both the single-thread `.func` path and the mega entry.
     fn emit_blocks(&mut self) -> Result<(), String> {
+        self.assign_vector_block_params();
         // Branch to the entry block, then emit blocks in id order.
         self.emit(&format!("bra BB{};", self.func.entry.0));
         let blocks = self.func.blocks.clone();
@@ -1494,14 +1505,42 @@ impl<'a> FnEmit<'a> {
 
     // --- SIMD (vector) lowering: scalarize each `<N x T>` op into N lane ops ---
 
-    /// The N lane registers of a SIMD value (materialized by the op that produced it).
+    /// The N lane registers of a SIMD value (materialized by the op that produced it, or
+    /// pre-assigned by [`assign_vector_block_params`](Self::assign_vector_block_params) when the
+    /// value is a block param).
     fn lanes(&mut self, v: ValueId) -> Result<Vec<String>, String> {
-        self.vlanes.get(&v.0).cloned().ok_or_else(|| {
-            format!(
-                "{UNSUPPORTED} SIMD value v{} used before definition (vector block params not lowered)",
-                v.0
-            )
-        })
+        self.vlanes
+            .get(&v.0)
+            .cloned()
+            .ok_or_else(|| format!("{UNSUPPORTED} SIMD value v{} used before definition", v.0))
+    }
+
+    /// Give every **vector-typed block param** its own register per lane, before any block is
+    /// emitted.
+    ///
+    /// A vector block param is how a loop carries a SIMD value across iterations — the vectorized
+    /// reduction accumulator is exactly this shape — and it has to be pre-assigned rather than
+    /// materialized on first use, because the *edge* that writes it (`emit_edge`, in a predecessor
+    /// block) runs before the block that reads it. Everything else here scalarizes a vector as N
+    /// registers produced by one op, so the only new obligation is that the two sides agree on which
+    /// N registers; a fixed pre-assignment is that agreement.
+    fn assign_vector_block_params(&mut self) {
+        let params: Vec<ValueId> = self
+            .func
+            .blocks
+            .iter()
+            .flat_map(|b| b.params.iter().copied())
+            .collect();
+        for p in params {
+            if let MirType::Vec(lane, n) = self.ty(p) {
+                let rc = rc_of(&lane);
+                let mut lanes = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    lanes.push(self.fresh(rc));
+                }
+                self.vlanes.insert(p.0, lanes);
+            }
+        }
     }
 
     /// Address of lane `i` given a base address register and the lane byte size.
@@ -2297,7 +2336,7 @@ impl<'a> FnEmit<'a> {
                 self.emit("ret;");
             }
             Terminator::Br { target, args } => {
-                self.emit_edge(target.0, args);
+                self.emit_edge(target.0, args)?;
                 self.emit(&format!("bra BB{};", target.0));
             }
             Terminator::CondBr {
@@ -2313,10 +2352,10 @@ impl<'a> FnEmit<'a> {
                 self.n_lbl += 1;
                 self.emit(&format!("setp.ne.s64 {p}, {c}, 0;"));
                 self.emit(&format!("@!{p} bra ELSE{lbl};"));
-                self.emit_edge(then_blk.0, then_args);
+                self.emit_edge(then_blk.0, then_args)?;
                 self.emit(&format!("bra BB{};", then_blk.0));
                 self.body.push_str(&format!("ELSE{lbl}:\n"));
-                self.emit_edge(else_blk.0, else_args);
+                self.emit_edge(else_blk.0, else_args)?;
                 self.emit(&format!("bra BB{};", else_blk.0));
             }
             Terminator::Unreachable => self.emit("trap;"),
@@ -2349,23 +2388,58 @@ impl<'a> FnEmit<'a> {
 
     /// Realize the block-param convention for one edge: copy each arg into a temp, then each temp into
     /// the target block's param register. The temp hop makes permuted / self-referential edges safe.
-    fn emit_edge(&mut self, target: u32, args: &[ValueId]) {
+    ///
+    /// A vector arg travels **lane by lane** into the target param's pre-assigned lane registers
+    /// (see [`assign_vector_block_params`](Self::assign_vector_block_params)) — one `mov` per lane,
+    /// through per-lane temps for the same permutation safety.
+    fn emit_edge(&mut self, target: u32, args: &[ValueId]) -> Result<(), String> {
         if args.is_empty() {
-            return;
+            return Ok(());
         }
         let params: Vec<ValueId> = self.func.blocks[target as usize].params.clone();
-        let mut temps = Vec::with_capacity(args.len());
+        let mut temps: Vec<Vec<(String, RC)>> = Vec::with_capacity(args.len());
         for a in args {
-            let rc = rc_of(self.func.value_type(*a));
-            let t = self.fresh(rc);
-            let src = self.reg(*a);
-            self.emit(&format!("mov.{} {t}, {src};", mov_ty(rc)));
-            temps.push((t, rc));
+            let ty = self.ty(*a);
+            if ty.is_vector() {
+                let rc = rc_of(ty.lane_type());
+                let lanes = self.lanes(*a)?;
+                let mut ts = Vec::with_capacity(lanes.len());
+                for l in lanes {
+                    let t = self.fresh(rc);
+                    self.emit(&format!("mov.{} {t}, {l};", mov_ty(rc)));
+                    ts.push((t, rc));
+                }
+                temps.push(ts);
+            } else {
+                let rc = rc_of(&ty);
+                let t = self.fresh(rc);
+                let src = self.reg(*a);
+                self.emit(&format!("mov.{} {t}, {src};", mov_ty(rc)));
+                temps.push(vec![(t, rc)]);
+            }
         }
-        for (p, (t, rc)) in params.iter().zip(temps) {
-            let pr = self.reg(*p);
-            self.emit(&format!("mov.{} {pr}, {t};", mov_ty(rc)));
+        for (p, ts) in params.iter().zip(temps) {
+            if self.ty(*p).is_vector() {
+                let dst = self.lanes(*p)?;
+                if dst.len() != ts.len() {
+                    return Err(format!(
+                        "{UNSUPPORTED} vector edge into BB{target} param v{} carries {} lane(s) \
+                         for a {}-lane param",
+                        p.0,
+                        ts.len(),
+                        dst.len()
+                    ));
+                }
+                for (d, (t, rc)) in dst.iter().zip(ts) {
+                    self.emit(&format!("mov.{} {d}, {t};", mov_ty(rc)));
+                }
+            } else {
+                let (t, rc) = ts[0].clone();
+                let pr = self.reg(*p);
+                self.emit(&format!("mov.{} {pr}, {t};", mov_ty(rc)));
+            }
         }
+        Ok(())
     }
 
     fn coerce_float(&mut self, v: ValueId, want: RC) -> String {
@@ -4426,6 +4500,85 @@ fn main() -> i32 {
         assert!(
             ptx.contains("mov.f32"),
             "ExtractLane must copy the lane register into the scalar result in:\n{ptx}"
+        );
+    }
+
+    /// **A SIMD value can cross a block edge** (Task 1.1): a loop whose accumulator is a
+    /// `<4 x f32>` block param — the shape a vectorized reduction has — lowers to one `mov` per lane
+    /// per edge, and the epilogue reads the lanes back with `ExtractLane`.
+    ///
+    /// This was the second half of the SIMD hole and it failed *differently* from a missing op arm:
+    /// `lanes()` declined with "used before definition" because the register set of a vector param
+    /// had no owner. Hand-built for the same reason as `simd_probe`.
+    #[test]
+    fn simd_accumulator_crosses_a_block_edge() {
+        use wukong_mir::Builder;
+
+        let mut interner = Interner::new();
+        let vt = MirType::Vec(Box::new(MirType::F32), 4);
+        let mut b = Builder::new(interner.intern("main"), MirType::I32);
+
+        // entry: acc = splat 0.0 ; i = 0 ; br loop(acc, i)
+        let zerof = b.build(MirType::F32, Op::ConstFloat(0.0, MirType::F32));
+        let acc0 = b.build(vt.clone(), Op::Splat(zerof));
+        let i0 = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let four = b.build(MirType::I64, Op::ConstInt(4, MirType::I64));
+        let step = b.build(MirType::F32, Op::ConstFloat(1.5, MirType::F32));
+        let vstep = b.build(vt.clone(), Op::Splat(step));
+
+        let loop_blk = b.new_block();
+        let exit_blk = b.new_block();
+        let acc = b.block_param(loop_blk, vt.clone());
+        let iv = b.block_param(loop_blk, MirType::I64);
+        let acc_out = b.block_param(exit_blk, vt.clone());
+        b.br(loop_blk, vec![acc0, i0]);
+
+        // loop(acc, i): acc' = acc + vstep ; i' = i + 1 ; if i' < 4 -> loop else exit(acc')
+        b.switch_to(loop_blk);
+        let acc1 = b.build(vt.clone(), Op::Bin(BinOp::FAdd, acc, vstep));
+        let i1 = b.build(MirType::I64, Op::Bin(BinOp::Add, iv, one));
+        let more = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i1, four));
+        b.set_term(Terminator::CondBr {
+            cond: more,
+            then_blk: loop_blk,
+            then_args: vec![acc1, i1],
+            else_blk: exit_blk,
+            else_args: vec![acc1],
+        });
+
+        // exit(acc'): print(lane0 + lane3) ; return 0
+        b.switch_to(exit_blk);
+        let l0 = b.build(MirType::F32, Op::ExtractLane(acc_out, 0));
+        let l3 = b.build(MirType::F32, Op::ExtractLane(acc_out, 3));
+        let s = b.build(MirType::F32, Op::Bin(BinOp::FAdd, l0, l3));
+        b.build_void(Op::Call {
+            func: interner.intern("print"),
+            args: vec![s],
+        });
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        b.ret(Some(zero));
+
+        let mut program = Program::new();
+        program.funcs.push(b.finish());
+        let errs = wukong_mir::verify::verify_program(&program);
+        assert!(errs.is_empty(), "the SIMD-edge probe MIR must verify: {errs:?}");
+
+        let entry = interner.intern("main");
+        let ptx = emit_ptx(&program, entry, &interner)
+            .expect("a vector block param must lower, not decline");
+        assert!(ptx.is_ascii(), "PTX must stay ASCII");
+        // Two vector edges (loop back-edge and exit edge) x 4 lanes x (temp + param copy) = 16
+        // lane copies, plus the two `ExtractLane` reads.
+        assert!(
+            ptx.matches("mov.f32").count() >= 18,
+            "expected per-lane edge copies, found {} `mov.f32` in:\n{ptx}",
+            ptx.matches("mov.f32").count()
+        );
+        assert_eq!(
+            ptx.matches("add.rn.f32").count(),
+            5,
+            "expected 4 lane adds in the loop body + 1 scalar add in the epilogue in:\n{ptx}"
         );
     }
 
