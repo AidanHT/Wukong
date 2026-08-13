@@ -12,9 +12,9 @@ harnesses that consume them live in `crates/wukongc/tests/` and reach this direc
 
 | Path | Count | Role |
 |------|-------|------|
-| `run/` | **361** top-level `*.wk` | Must compile **and** execute. Checked against in-file directives, then re-run across backends and opt levels by the differential gates. |
+| `run/` | **363** top-level `*.wk` | Must compile **and** execute. Checked against in-file directives, then re-run across backends and opt levels by the differential gates. |
 | `run/lib/` | 2 (`mathlib.wk`, `deep.wk`) | Support modules for `run/import_multi.wk`. **Not fixtures** — harnesses use non-recursive `read_dir`. |
-| `fail/` | **110** top-level `*.wk` | Must be **rejected at compile time** with a specific stable diagnostic code. Directory is `tests/fail`, **not** `tests/compile-fail`. |
+| `fail/` | **113** top-level `*.wk` | Must be **rejected at compile time** with a specific stable diagnostic code. Directory is `tests/fail`, **not** `tests/compile-fail`. |
 | `fail/lib/` | 2 (`badlib.wk`, `dup.wk`) | Support for import fixtures. **Not fixtures.** |
 | `imports/` | 6 | Flat import-graph fixtures consumed **only** by `crates/wukong_driver/src/loader.rs` unit tests. E2e harnesses ignore this directory. |
 
@@ -66,6 +66,11 @@ emission.
 `crates/wukongc/tests/exe.rs` — AOT linked exe matches `--run` on four curated fixtures.
 
 `crates/wukongc/tests/emit.rs` — frontend and lowering stages succeed over `examples/` + `run/`.
+
+`crates/wukongc/tests/recognize.rs` — the **only** gate that can see a recognizer at all: one witness
+fixture per cascade head loses its kernel under `WUKONG_NO_RECOGNIZE`, the `lang_generic_*` pairs keep
+exactly one kernel call each (`@generic` is per function), the programs still print the same bytes on
+both backends, and autodiff refuses to run under the instrument.
 
 ## Corpus-authoring rules (non-negotiable)
 
