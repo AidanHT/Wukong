@@ -227,6 +227,13 @@ const NAMED_DIM_MESSAGES: &[(&str, &str, &[&str])] = &[
         "E0501",
         &["tensor rank mismatch: expected rank 2 [M, N], found rank 3 [4, 4, 4]"],
     ),
+    // `a[5, 5]` on a square tensor raises one diagnostic per axis; only the axis tells them apart.
+    // The `find` below takes the first, which is axis 0.
+    (
+        "tensor_index_oob.wk",
+        "E0501",
+        &["index 5 is out of bounds for axis 0 of length 2"],
+    ),
 ];
 
 /// The dimension a shape error is about must reach a tool through the JSON stream: the stable
