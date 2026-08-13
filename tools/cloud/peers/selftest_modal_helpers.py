@@ -33,12 +33,13 @@ DEFAULT_APP = pathlib.Path(__file__).resolve().parent.parent / "modal_app.py"
 WANT_FN = {
     "_parse_cutlass_dtypes", "_cutlass_patterns", "_cutlass_filter_matches",
     "_cutlass_generated_kernels", "_cutlass_census", "_dir_stats", "_verify_fa_wheel",
-    "_build_jobs", "_clock_snapshot", "_clock_lock_attempt",
+    "_build_jobs", "_clock_snapshot", "_clock_lock_attempt", "_clock_lock_declaration",
+    "_round_provenance_env",
 }
 WANT_CONST = {
     "_CUTLASS_DTYPES", "_CUTLASS_KERNELS_3X", "_CUTLASS_KERNELS_2X", "_CUTLASS_FAMILY_TOKENS",
     "_CUTLASS_NAME_RE", "_CUTLASS_PROFILER_DTYPE", "_FA3_DISABLE_PRESETS", "_FA3_MIN_TIMEOUT",
-    "_FA2_ARCH",
+    "_FA2_ARCH", "_CLOCK_LOCK_ENV", "_ITERATION_DATA_ENV",
 }
 
 FAILS = []
@@ -66,6 +67,10 @@ def load(path):
         # Stubs for the module constants the lifted code closes over. Values chosen to match the
         # defaults so the printed messages read the way they will in a real round.
         "WK_CUTLASS_TAG": "v4.6.1", "WK_PEER_TIMEOUT": 14400, "WK_PEER_MEM_MIB": 32768,
+        # `_round_provenance_env` closes over the SKU and the billing rate. Stubbed rather than
+        # lifted so the check stays about the WIRING (which variables reach the round) instead of
+        # dragging in the whole pricing table.
+        "WK_GPU": "H100", "_usd_per_hr": lambda gpu: 3.9538,
     }
     exec(compile(ast.Module(body=picked, type_ignores=[]), "<modal_app subset>", "exec"), ns)
     missing = sorted((WANT_FN | WANT_CONST) - set(ns))
@@ -272,6 +277,78 @@ def test_clock_provenance(ns, path):
           calls["test"].count("_clock_snapshot") >= 2, repr(calls["test"]))
 
 
+def test_round_provenance_reaches_the_round(ns, path):
+    """The harness knows the clock verdict, the provider, the SKU and the bill. Before this it told
+    only its own stdout, and every committed H100 round log reads `clock lock : UNKNOWN
+    (undeclared)` and `provider / SKU : n/a / n/a`. These checks pin that each fact reaches the
+    round's OWN provenance block, in the spelling `bench_instrument::parse_clock_lock` reads."""
+    decl = ns["_clock_lock_declaration"]
+    lock = ns["_clock_lock_attempt"]
+    prov = ns["_round_provenance_env"]
+    lock_env, iter_env = ns["_CLOCK_LOCK_ENV"], ns["_ITERATION_DATA_ENV"]
+
+    check("provenance: the env names are the ones RoundMeta::from_env reads",
+          lock_env == "WUKONG_GPU_CLOCK_LOCK" and iter_env == "WUKONG_GPU_ITERATION_DATA",
+          "%s / %s" % (lock_env, iter_env))
+
+    # The four spellings `parse_clock_lock` understands.
+    check("provenance: a taken lock declares its frequency", decl(True, mhz="1980") == "locked:1980")
+    check("provenance: a lock with no frequency is still 'locked'", decl(True) == "locked")
+    real = ("The current user does not have permission to change clocks for GPU 00000001:1B:00.0.")
+    check("provenance: a refusal keeps the platform's own words",
+          decl(False, reason=real) == "refused:" + real, decl(False, reason=real))
+    check("provenance: a refusal is NEVER the undeclared state",
+          decl(False, reason=real).startswith("refused:") and "unknown" not in decl(False).lower())
+    check("provenance: a multi-line diagnostic collapses to one provenance line",
+          "\n" not in decl(False, reason="line one\nline two") and
+          decl(False, reason="line one\nline two") == "refused:line one line two")
+    check("provenance: an empty reason still declares that we LOOKED",
+          decl(False) == "refused:no diagnostic")
+    long_reason = decl(False, reason="x" * 900)
+    check("provenance: a giant diagnostic is truncated, not wrapped",
+          len(long_reason) <= 210 and long_reason.startswith("refused:x"), str(len(long_reason)))
+
+    # Every exit path of the attempt must declare. `nvidia-smi` is absent here, so this is the
+    # unqueryable branch -- the one most likely to be forgotten, because it never reaches the lock.
+    env = {}
+    check("provenance: an attempt with no nvidia-smi still declares a refusal, not silence",
+          lock(env, smi="wk-selftest-no-such-nvidia-smi") is False
+          and env.get(lock_env, "").startswith("refused:"), repr(env.get(lock_env)))
+
+    env = {iter_env: "1"}
+    prov(env, iteration_data=False)
+    check("provenance: provider, SKU and the billing rate reach the round",
+          env.get("WUKONG_GPU_PROVIDER") == "modal" and env.get("WUKONG_GPU_SKU") == "H100"
+          and float(env.get("WUKONG_GPU_USD_PER_HR", "0")) > 0.0, repr(sorted(env)))
+    check("provenance: an undeclared round CLEARS a stale iteration-data flag",
+          iter_env not in env, repr(env))
+    prov(env, iteration_data=True)
+    check("provenance: an explicitly declared round sets it", env.get(iter_env) == "1")
+
+    # The wiring, and the one thing that must NOT be wired: `bench` may not declare iteration data
+    # on its own. A container round is always unlocked, so an inferred declaration would make the
+    # §6.3 gate self-satisfying -- which is exactly how `102.0% -- ABOVE cuBLAS` got published.
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    bench = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "bench"),
+                 None)
+    check("provenance: bench() exists and takes an --iteration-data flag",
+          bench is not None and any(a.arg == "iteration_data" for a in bench.args.args))
+    if bench is not None:
+        defaults = dict(zip([a.arg for a in bench.args.args][-len(bench.args.defaults):],
+                            bench.args.defaults))
+        d = defaults.get("iteration_data")
+        check("provenance: --iteration-data defaults to OFF",
+              isinstance(d, ast.Constant) and d.value is False, ast.dump(d) if d else "missing")
+        calls = [s.func.id for s in ast.walk(bench)
+                 if isinstance(s, ast.Call) and isinstance(s.func, ast.Name)]
+        check("provenance: bench exports the round metadata exactly once",
+              calls.count("_round_provenance_env") == 1, repr(calls))
+        lits = [s.value for s in ast.walk(bench) if isinstance(s, ast.Constant)
+                and isinstance(s.value, str)]
+        check("provenance: bench never sets the iteration-data variable itself",
+              iter_env not in lits, repr([l for l in lits if "ITERATION" in l]))
+
+
 def main():
     path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_APP
     print("selftest target: %s" % path)
@@ -285,6 +362,7 @@ def main():
     test_flash_attention(ns, tmp)
     test_cache_stats(ns, tmp)
     test_clock_provenance(ns, path)
+    test_round_provenance_reaches_the_round(ns, path)
     print("")
     print("FAILED: %s" % (", ".join(FAILS) if FAILS else "nothing"))
     return 1 if FAILS else 0

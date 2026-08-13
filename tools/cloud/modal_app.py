@@ -2624,6 +2624,29 @@ def _clock_snapshot(env, tag, smi="nvidia-smi"):
     return line
 
 
+_CLOCK_LOCK_ENV = "WUKONG_GPU_CLOCK_LOCK"
+_ITERATION_DATA_ENV = "WUKONG_GPU_ITERATION_DATA"
+
+
+def _clock_lock_declaration(locked, mhz="", reason=""):
+    """The `WUKONG_GPU_CLOCK_LOCK` value describing a lock attempt's outcome.
+
+    `bench_instrument::parse_clock_lock` reads exactly `locked[:MHz]` / `unlocked` /
+    `refused:<reason>`, and the LAST of those is why this helper exists. Before it, the container
+    discovered the refusal, printed it to its own stdout, and the round's machine-readable
+    provenance line went on reading `clock lock : UNKNOWN (undeclared)`. Those are two different
+    facts -- "we tried and were told no" versus "nobody looked" -- and a reader of a committed round
+    log a year from now can only tell them apart if the round itself records which happened.
+
+    The reason is the platform's own words, whitespace-collapsed to one line (the value crosses an
+    environment variable and lands in a single provenance line) and truncated, since a driver
+    diagnostic is a sentence and a provenance line is a column."""
+    if locked:
+        return f"locked:{mhz}" if mhz else "locked"
+    flat = " ".join((reason or "").split()) or "no diagnostic"
+    return "refused:" + (flat[:197] + "..." if len(flat) > 200 else flat)
+
+
 def _clock_lock_attempt(env, smi="nvidia-smi"):
     """Try to pin the SM clock for the container; report the verdict, never fail the round.
 
@@ -2631,7 +2654,17 @@ def _clock_lock_attempt(env, smi="nvidia-smi"):
     pin it (`-lgc` needs admin rights on the device). Both outcomes are fine -- what is NOT
     fine is not knowing which one happened. Locks at the queried max: under a power-limited
     kernel the silicon may still downclock, which is exactly what the per-arm
-    `_clock_snapshot` lines then show. Returns True iff the lock took."""
+    `_clock_snapshot` lines then show. Returns True iff the lock took.
+
+    **Also writes the verdict into `env` as `WUKONG_GPU_CLOCK_LOCK`**, which is what carries it into
+    the round's own provenance block -- and, since `Round::gate` now refuses an unlocked round that
+    was not declared iteration data, into whether the round mints numbers at all. Every exit path
+    below sets it: a branch that returned without declaring would leave the round reading
+    `UNKNOWN (undeclared)` on a container where we had in fact just been refused."""
+    def declare(locked, mhz="", reason=""):
+        env[_CLOCK_LOCK_ENV] = _clock_lock_declaration(locked, mhz, reason)
+        return locked
+
     try:
         out = subprocess.run([smi, "--query-gpu=clocks.max.sm", "--format=csv,noheader,nounits"],
                              capture_output=True, text=True, env=env, timeout=10)
@@ -2641,20 +2674,48 @@ def _clock_lock_attempt(env, smi="nvidia-smi"):
         mx = ""
     if not mx.isdigit():
         print("[clock] lock: max SM clock unqueryable; running unlocked", flush=True)
-        return False
+        return declare(False, reason="max SM clock unqueryable (nvidia-smi absent, or the driver "
+                                     "refused the query)")
     try:
         rc = subprocess.run([smi, "-lgc", f"{mx},{mx}"], capture_output=True, text=True,
                             env=env, timeout=10)
     except (OSError, subprocess.SubprocessError):
         print("[clock] lock: nvidia-smi vanished mid-attempt; running unlocked", flush=True)
-        return False
+        return declare(False, reason="nvidia-smi vanished mid-attempt")
     if rc.returncode == 0:
         print(f"[clock] lock: SM clock pinned at {mx} MHz for this container", flush=True)
-        return True
+        return declare(True, mhz=mx)
     diag = (rc.stderr or rc.stdout or "").strip().splitlines()
-    print(f"[clock] lock: refused ({diag[0] if diag else 'no diagnostic'}); running unlocked "
+    why = diag[0] if diag else "no diagnostic"
+    print(f"[clock] lock: refused ({why}); running unlocked "
           f"-- read the per-arm [clock] lines instead", flush=True)
-    return False
+    return declare(False, reason=why)
+
+
+def _round_provenance_env(env, iteration_data=False):
+    """Export GPU_RETARGET_PLAN.md 6.1's operator metadata so the ROUND can print it.
+
+    `bench_instrument::RoundMeta::from_env` reads `WUKONG_GPU_PROVIDER`, `WUKONG_GPU_SKU` and
+    `WUKONG_GPU_USD_PER_HR`, and this harness -- which knows all three exactly -- was exporting none
+    of them, so every committed H100 round log reads `provider / SKU : n/a / n/a` and
+    `cost estimate  : n/a` beside a real bill. Same defect class as the clock lock above: the
+    harness knew and did not tell the round.
+
+    `iteration_data` is the operator's explicit §6.3 declaration that an unlocked round may still
+    mint numbers, as leads. It is **off by default and never inferred**: a container round is
+    unlocked, so inferring it here would make the gate self-satisfying and put us straight back
+    where `102.0% -- ABOVE cuBLAS` came from. It is a `::bench --iteration-data` flag instead, so
+    the declaration is part of the command that produced the log. The `pop` matters as much as the
+    set -- a value left over from the image env or an earlier call would declare a round the
+    operator did not."""
+    env["WUKONG_GPU_PROVIDER"] = "modal"
+    env["WUKONG_GPU_SKU"] = WK_GPU
+    env["WUKONG_GPU_USD_PER_HR"] = f"{_usd_per_hr(True):.4f}"
+    if iteration_data:
+        env[_ITERATION_DATA_ENV] = "1"
+    else:
+        env.pop(_ITERATION_DATA_ENV, None)
+    return env
 
 
 # --------------------------------------------------------------------------------------------
@@ -3778,7 +3839,7 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
 @app.function(image=image, gpu=WK_GPU, cpu=WK_CPU, memory=WK_MEM_MIB, timeout=WK_TIMEOUT,
               volumes={PERSIST: build_vol})
 def bench(name: str = "", package: str = "wukong_codegen_gpu", peers: bool = False,
-          strong_peers: str = ""):
+          strong_peers: str = "", iteration_data: bool = False):
     """Run the `#[ignore]`d perf sweeps/benches (release, one at a time).
 
     These are the sweeps that re-tune tiles per architecture (Phase 1 §3 / Phase 3 §2). They need
@@ -3797,6 +3858,13 @@ def bench(name: str = "", package: str = "wukong_codegen_gpu", peers: bool = Fal
     Volume commit must happen even on a failure (the log is the product of a sweep, and a truncated
     round is still worth its cache); the status is simply carried past them, exactly as `::cutlass`,
     `::marlin` and `::framework` already do.
+
+    `--iteration-data` is GPU_RETARGET_PLAN.md §6.3's declaration, and without it **a round in this
+    container publishes nothing**: `bench_instrument::Round::gate` refuses an unlocked round, and
+    Modal refuses `nvidia-smi -lgc`. That is deliberate — a container round IS iteration data, and
+    `102.0% — ABOVE cuBLAS` reached the campaign checkpoint from one. Pass the flag to get the
+    tables anyway, knowing every number in them is a lead; the round log's `round class` line
+    records that you did, so a later reader is never guessing.
     """
     with _meter("bench"):
         env = _prepare_cargo()
@@ -3807,7 +3875,9 @@ def bench(name: str = "", package: str = "wukong_codegen_gpu", peers: bool = Fal
         if strong_peers:
             env["WUKONG_STRONG_PEERS"] = strong_peers
         print(f"Sweep on {WK_GPU} — PEER_REQUIRED={'1' if peers else '0'}, "
-              f"STRONG_PEERS={strong_peers or '(none declared)'}")
+              f"STRONG_PEERS={strong_peers or '(none declared)'}, "
+              f"ROUND={'ITERATION (declared)' if iteration_data else 'publication-gated'}")
+        _round_provenance_env(env, iteration_data=iteration_data)
         _clock_lock_attempt(env)
         _clock_snapshot(env, f"before {name or package}")
         args = ["cargo", "test", "-p", package, "--features", "gpu", "--release", "--"]
