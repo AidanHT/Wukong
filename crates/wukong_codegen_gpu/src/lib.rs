@@ -82,6 +82,15 @@ pub mod tma_host;
 /// type, so ungated `sm_90a` PTX does not compile rather than merely failing a textual law.
 pub mod ptx_wgmma;
 
+/// The crate's **one** fused-activation PTX text (`relu`/`silu`/`gelu`), shared by every generator
+/// that fuses one into an epilogue.
+///
+/// Ungated for the same reason [`ptx_wgmma`] is: the wgmma epilogue's activation must be readable
+/// by that family's device-free laws, and a text that only existed under the `gpu` feature would
+/// force a second copy of it — which is exactly what makes the fused-vs-unfused `==` law a property
+/// of the program rather than a claim about two texts staying equal.
+pub mod ptx_act;
+
 #[cfg(feature = "gpu")]
 pub mod baselines;
 

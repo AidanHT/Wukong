@@ -1157,53 +1157,16 @@ fn entry_smem(
     s
 }
 
-/// Fused activation epilogue applied to the f32 accumulator **before** the C store — the thing cuBLAS
-/// structurally cannot do (it only computes `A·Bᵀ`; an activation needs a second kernel that
-/// round-trips C through HBM). The activation is elementwise on each accumulator register, so it needs
-/// no knowledge of the WMMA fragment's row/col layout.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Act {
-    None,
-    Relu,
-    Silu,
-    Gelu,
-}
-
-impl Act {
-    /// PTX applying the activation in place to one f32 accumulator register `reg`. Transcendental
-    /// activations use the Ada SFU fast paths (`ex2.approx`/`tanh.approx`/`rcp.approx`) and the **exact
-    /// same formulas + constants** as the standalone `ptx::vmath_ptx` kernels, so a fused `silu(A·Bᵀ)`
-    /// equals the unfused `silu(gemm)` and inherits its tolerance gate. Scratch lives in `%act0`/`%act1`
-    /// (declared by `entry_smem_db`); each accumulator is processed sequentially so the scratch reuses.
-    /// `pub(crate)` so the fp8 mma generator (`ptx_fp8::fp8_pipe_entry`) reuses the identical epilogue.
-    pub(crate) fn epilogue(self, reg: &str) -> String {
-        let hexf = |x: f32| format!("0f{:08X}", x.to_bits());
-        match self {
-            Act::None => String::new(),
-            Act::Relu => format!("    max.f32 {reg},{reg},0f00000000;\n"),
-            // silu(x) = x·sigmoid(x) = x / (1 + exp(-x)), exp via 2^(x·log2e).
-            Act::Silu => {
-                let (nlog2e, one) = (hexf(-std::f32::consts::LOG2_E), hexf(1.0));
-                format!(
-                    "    mul.f32 %act0,{reg},{nlog2e};\n    ex2.approx.f32 %act0,%act0;\n    \
-                     add.f32 %act0,%act0,{one};\n    rcp.approx.f32 %act0,%act0;\n    \
-                     mul.f32 {reg},{reg},%act0;\n"
-                )
-            }
-            // gelu(x) = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³))).
-            Act::Gelu => {
-                let c0 = hexf((2.0f32 / std::f32::consts::PI).sqrt());
-                let (c1, one, half) = (hexf(0.044715), hexf(1.0), hexf(0.5));
-                format!(
-                    "    mul.f32 %act0,{reg},{reg};\n    mul.f32 %act0,%act0,{reg};\n    \
-                     fma.rn.f32 %act0,%act0,{c1},{reg};\n    mul.f32 %act0,%act0,{c0};\n    \
-                     tanh.approx.f32 %act0,%act0;\n    add.f32 %act0,%act0,{one};\n    \
-                     mul.f32 %act1,{reg},{half};\n    mul.f32 {reg},%act0,%act1;\n"
-                )
-            }
-        }
-    }
-}
+/// The fused activation epilogue -- **one text for the whole crate**, defined in [`crate::ptx_act`]
+/// and re-exported here so every existing call site (`entry_smem_db`, the conv epilogue,
+/// `ptx_fp8::fp8_pipe_entry`) keeps its spelling.
+///
+/// It moved out of this file in wave 4 because the Hopper `wgmma` epilogue needs the identical
+/// instruction sequence and `ptx_wgmma` is **not** behind the `gpu` feature (its arithmetic is that
+/// family's only device-free proof). A second copy of five instructions would have turned the
+/// fused-vs-unfused exactness law -- `fused_act(A*B^T + b) == vmath_act(gemm + b)`, element-wise
+/// `==` -- from a property of the program into a property of two texts staying equal.
+pub use crate::ptx_act::Act;
 
 /// Generate a **`cp.async` double-buffered** SMEM-staged WMMA GEMM (`_sm_db`). Same CTA tiling as
 /// [`entry_smem`], but the K-loop is software-pipelined: each step issues `cp.async` copies that

@@ -7441,12 +7441,29 @@ pub fn time_gemm_nt_wgmma_in(
     };
 
     if region.verify_closed_form {
-        // **The closed form.** Every operand is exactly `2^-7`, so every in-range lane of C is
-        // exactly `K * 2^-14` — and every partial sum on the way there is an exact integer multiple
-        // of one ulp, so the verdict is `==` at any K under any accumulation order. A lane still
-        // holding the sentinel is a lane the timed path never wrote.
-        let want = k as f32 * (region.fill * region.fill);
+        // **The closed form.** Every operand is exactly `2^-7`, so every in-range lane of the GEMM
+        // is exactly `K * 2^-14` -- and every partial sum on the way there is an exact integer
+        // multiple of one ulp. A fused ReLU of that positive value is the identity (`max.f32`
+        // against +0). A fused SiLU/GELU is not: the expected value is the standalone `vmath`
+        // kernel of that closed form, which is the same MUFU text the epilogue emits, so the
+        // verdict stays `==`. A lane still holding the sentinel is a lane the timed path never
+        // wrote -- that half of G7 is independent of the activation.
+        let gemm_want = k as f32 * (region.fill * region.fill);
         let got = g.stream.memcpy_dtov(&c_d)?;
+        let want = match cfg.act {
+            crate::ptx_act::Act::None | crate::ptx_act::Act::Relu => gemm_want,
+            crate::ptx_act::Act::Silu | crate::ptx_act::Act::Gelu => {
+                use wukong_runtime::{VM_GELU, VM_SILU};
+                let op = if cfg.act == crate::ptx_act::Act::Silu {
+                    VM_SILU
+                } else {
+                    VM_GELU
+                };
+                vmath(g, op, &[gemm_want]).unwrap_or_else(|e| {
+                    panic!("{}: vmath closed-form reference failed: {e}", cfg.name)
+                })[0]
+            }
+        };
         let mut unwritten = 0usize;
         let mut wrong = 0usize;
         let mut first: Option<(usize, f32)> = None;
@@ -7472,12 +7489,12 @@ pub fn time_gemm_nt_wgmma_in(
         assert_eq!(
             wrong,
             0,
-            "{}: {wrong} of {} lanes miss the closed form K*fill^2 = {want:e} at {m}x{k}x{n} \
-             (first: lane {:?}). Every operand is 2^-7, whose square is exactly 2^-14, so every \
-             partial sum is an exact multiple of one ulp and this verdict is `==` under ANY \
-             accumulation order -- a miss is a real fault, not a reassociation.",
+            "{}: {wrong} of {} lanes miss the closed form (GEMM K*fill^2 = {gemm_want:e}, after \
+             {:?} = {want:e}) at {m}x{k}x{n} (first: lane {:?}). A miss is a real fault -- the \
+             timed path wrote something other than the epilogue of the exact integer.",
             cfg.name,
             got.len(),
+            cfg.act,
             first
         );
     }
@@ -8094,6 +8111,7 @@ mod tests {
         ("paged_kv.rs", include_str!("paged_kv.rs")),
         ("pool.rs", include_str!("pool.rs")),
         ("ptx.rs", include_str!("ptx.rs")),
+        ("ptx_act.rs", include_str!("ptx_act.rs")),
         ("ptx_autodiff_bwd.rs", include_str!("ptx_autodiff_bwd.rs")),
         ("ptx_conv.rs", include_str!("ptx_conv.rs")),
         ("ptx_flash.rs", include_str!("ptx_flash.rs")),
@@ -8781,7 +8799,12 @@ mod tests {
         // commit that turned `PARAM_ORDER` into `WgmmaCfg::param_order()` -- the device-free
         // parameter law now re-derives the expected list per entry instead of asserting one
         // constant for all of them, and the census assembles both before an H100 is rented.
-        const EXPECTED_MODULES: usize = 134;
+        // 134 -> 142 on 2026-08-12 with WAVE 4 R2/R3, the fused activation: {relu, gelu, silu} x
+        // both regime arms at f16, plus the bf16 twins of the SiLU headline at both arms. Only the
+        // SiLU rows can ever be published as a fusion win -- cuBLASLt has no SiLU member, while it
+        // fuses RELU_BIAS and GELU_BIAS at both output dtypes, which makes those two parity rows
+        // and makes gelu the control that measures the peer's own epilogue cost.
+        const EXPECTED_MODULES: usize = 142;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -20329,6 +20352,26 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     *x += bias[i % n];
                 }
             }
+            // The standalone activation kernel -- the SAME `ptx::vmath_ptx` text `Act::epilogue`
+            // emits -- so L7a is `==` even for SiLU/GELU, whose MUFU ops have no host twin.
+            // Host `f32::max` / `f32::tanh` would lie on signed zero, NaN, and the approx.
+            if cfg.act != crate::ptx_act::Act::None {
+                use wukong_runtime::{VM_GELU, VM_RELU, VM_SILU};
+                let op = match cfg.act {
+                    crate::ptx_act::Act::Relu => VM_RELU,
+                    crate::ptx_act::Act::Silu => VM_SILU,
+                    crate::ptx_act::Act::Gelu => VM_GELU,
+                    crate::ptx_act::Act::None => {
+                        panic!("{label}: vmath branch reached for Act::None ({arm} arm)")
+                    }
+                };
+                chain = vmath(g, op, &chain).unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: vmath({:?}) of the chain ({arm} arm): {e}",
+                        cfg.act
+                    )
+                });
+            }
             let got = gemm_nt_wgmma_epi(g, cfg, &a, &b, bias_arg, m, k, n).unwrap_or_else(|e| {
                 panic!("{label}: {} at {} ({arm} arm): {e}", cfg.name, gs.dims())
             });
@@ -20357,11 +20400,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             lanes += got.len();
         }
         eprintln!(
-            "  {:<14} {} at {}: BIT-IDENTICAL (==) to {} + bias{} on both the exact-integer and \
-             the pseudorandom arm, and bit-identical over two runs; {lanes} lanes",
+            "  {:<14} {} at {}: BIT-IDENTICAL (==) to vmath({:?})({} + bias{}) on both the \
+             exact-integer and the pseudorandom arm, and bit-identical over two runs; {lanes} lanes",
             label,
             cfg.name,
             gs.dims(),
+            cfg.act,
             plain.name,
             if cfg.bias { "" } else { " (none)" }
         );
@@ -21243,23 +21287,38 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // TIMING launcher, at the guard shape, with a fill whose answer is a closed form that is
             // exact at every K, and reads C back.
             {
+                let region = TimedRegion::closed_form_probe();
+                // Plain GEMM, then the cheapest fused arm (ReLU is identity on the positive closed
+                // form), then the headline (SiLU, whose closed form is the vmath of K*fill^2).
+                // Three probes, one G7: the timed path wrote C, and the fused path wrote the
+                // EPILOGUE of C, not the plain GEMM under a fused heading.
+                for (tag, cfg) in [
+                    (
+                        "plain",
+                        &crate::ptx_wgmma::WGMMA_W1_MCB as &crate::ptx_wgmma::WgmmaCfg,
+                    ),
+                    ("relu+bias", &crate::ptx_wgmma::WGMMA_W1_MCB_V2_B_RELU),
+                    ("silu+bias", &crate::ptx_wgmma::WGMMA_W1_MCB_V2_B_SILU),
+                ] {
+                    let gs = crate::ptx_wgmma::guard_shape(cfg);
+                    match time_gemm_nt_wgmma_in(g, cfg, gs.m, gs.k, gs.n, 4, region) {
+                        Ok(secs) => eprintln!(
+                            "\n---- {BENCH}: the TIMED path writes C (guard G7, {tag}) ----\n  \
+                             {} at {} through the timing launcher, {}: no sentinel remains \
+                             ({:.3} ms/launch, not a measurement) \u{2713}",
+                            cfg.name,
+                            gs.dims(),
+                            region.label(),
+                            secs * 1e3
+                        ),
+                        Err(e) => panic!(
+                            "{BENCH}: the timed path's closed-form probe failed on {tag} {}: {e}",
+                            cfg.name
+                        ),
+                    }
+                }
                 let cfg = &crate::ptx_wgmma::WGMMA_W1_MCB;
                 let gs = crate::ptx_wgmma::guard_shape(cfg);
-                let region = TimedRegion::closed_form_probe();
-                match time_gemm_nt_wgmma_in(g, cfg, gs.m, gs.k, gs.n, 4, region) {
-                    Ok(secs) => eprintln!(
-                        "\n---- {BENCH}: the TIMED path writes C (guard G7) ----\n  \
-                         {} at {} through the timing launcher, {}: every lane is exactly \
-                         K*fill^2 = {:e}, and none still holds the pre-launch sentinel \
-                         ({:.3} ms/launch, not a measurement) \u{2713}",
-                        cfg.name,
-                        gs.dims(),
-                        region.label(),
-                        gs.k as f32 * region.fill * region.fill,
-                        secs * 1e3
-                    ),
-                    Err(e) => panic!("{BENCH}: the timed path's closed-form probe failed: {e}"),
-                }
                 // ...and what the memset itself costs, measured rather than asserted, so the day a
                 // schedule needs one the round already knows the price. Same shape, same launcher,
                 // one fact apart.
@@ -22429,6 +22488,25 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             probe < first_timed,
             "the closed-form probe must precede the timed rows -- afterwards it is a post-mortem"
         );
+        // G7 on fused arms: a probe that only ever ran the plain GEMM would not see a fused
+        // epilogue that stored nothing (or stored the GEMM and claimed SiLU).
+        assert!(
+            sweep.contains("WGMMA_W1_MCB_V2_B_RELU") && sweep.contains("WGMMA_W1_MCB_V2_B_SILU"),
+            "the closed-form probe must cover a fused ReLU arm and the SiLU headline, not only \
+             the plain GEMM"
+        );
+        // L7a is `fused == vmath_act(gemm + bias)`. A guard that added the bias and stopped
+        // would pass ReLU-of-positive by accident and fail SiLU/GELU only on Hopper.
+        let (_, fused) = fns
+            .iter()
+            .find(|(n, _)| n == "wgmma_fused_pretiming_guard")
+            .expect("the fused exactness guard exists");
+        for need in ["vmath(g,", "VM_RELU", "VM_SILU", "VM_GELU"] {
+            assert!(
+                fused.contains(need),
+                "L7a's fused guard must apply the standalone vmath kernel; missing `{need}`"
+            );
+        }
     }
 
     /// **The instrument wiring, exercised with synthetic samples and no device.**

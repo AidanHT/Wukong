@@ -171,6 +171,8 @@ use crate::tma_host::{ptx_param_address, ptx_param_decl, TensorMapArgs, TmaDataT
 pub const UNSUPPORTED: &str = "ptx_wgmma::UNSUPPORTED";
 
 /// The compute capability `wgmma` needs. Hopper, and only Hopper -- see [`Sm90aLicense`].
+use crate::ptx_act::Act;
+
 pub const WGMMA_MIN_CC: (i32, i32) = (9, 0);
 
 /// Shared memory per CTA on an H100, bytes (`MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` = 227 KiB).
@@ -1333,6 +1335,43 @@ pub struct WgmmaCfg {
     /// consumer threads, i.e. one L1 line set, against the 128 KiB of `C` the same epilogue writes.
     /// Nothing is staged, `smem_bytes()` does not move, and G10's map stays a statement about a map.
     pub bias: bool,
+    /// **The fused activation**, applied to the f32 accumulator AFTER the bias and BEFORE the store
+    /// (wave-4 R2/R3).
+    ///
+    /// # The text is the crate's, reused rather than re-derived -- and that IS the exactness law
+    ///
+    /// The instructions come from [`crate::ptx_act::Act::epilogue`], the same generator the Act-1
+    /// `wmma` epilogue, the conv epilogue and `ptx_fp8` call, whose formulas and constants are
+    /// identical to the standalone `ptx::vmath_ptx` kernels. WAVE4_DOSSIER L7a is
+    ///
+    /// ```text
+    ///   fused(A, B, bias)  ==  vmath_act( gemm_plain(A, B) + bias )
+    /// ```
+    ///
+    /// element-wise **`==`, not a tolerance**, and it holds only because both arms issue the
+    /// identical instruction sequence: an f32 store followed by an f32 load is the identity, the
+    /// bias add is the same `add.f32` on the same two f32 values, and `tanh.approx.f32` /
+    /// `ex2.approx.f32` / `rcp.approx.f32` are approximate but **deterministic** -- a fixed function
+    /// of the input bit pattern on a given architecture. Copying the sequence into this file would
+    /// have made the law a claim about two texts staying equal; calling one generator makes it a
+    /// property of the program.
+    ///
+    /// # Cost, and why no row carries an activation asterisk
+    ///
+    /// MUFU throughput on cc 9.0 is 16 results/SM/clock against 128 for f32 FMA -- at 132 SMs and
+    /// the round log's 1.98 GHz that is 4.18e12 elements/s, **5.0x faster than HBM can store the
+    /// result it produces** (8.4e11 f32 stores/s at the spec peak). At `sq4096` a fused GELU adds
+    /// 4.0 us of MUFU issue to a 222.7 us kernel -- 1.8%, overlapped with the store rather than
+    /// serialised with it. The activation is not the cost; the store is (WAVE4_DOSSIER 1.5).
+    ///
+    /// # What may be PUBLISHED, which is not what may be built
+    ///
+    /// cuBLASLt fuses RELU and GELU (with or without BIAS) at both output dtypes -- measured on
+    /// H100, 2026-08-11 -- so those rows are **parity rows**: `S(group A) ~= r`, zero margin by
+    /// construction. SiLU has no member in `cublasLtEpilogue_t` at all, so `silu(x*W^T + b)` is the
+    /// wave's one group-B row and the peer's floor for it is BIAS fused plus a separate kernel.
+    /// [`crate::ptx_act::Act::peer_fuses_it`] carries that split as data rather than as prose.
+    pub act: crate::ptx_act::Act,
     /// **`GROUP_M`: the grouped threadblock raster, in M TILES** (wave-3 lever 1). `1` is the
     /// linear order every row shipped before wave 3 and emits byte-identical PTX to it.
     ///
@@ -1747,6 +1786,7 @@ impl WgmmaCfg {
         if self.bias {
             t += "_b";
         }
+        t += self.act.key_tag();
         t
     }
 
@@ -1780,6 +1820,12 @@ impl WgmmaCfg {
     /// |---|---|---|
     /// | none | 0 | |
     /// | bias | 6 | `%bi0`, `%bi1`, the `.b64` base `%rdBias` and the `.b64` per-group address `%rdBi` |
+    /// | relu | 0 | `max.f32` is in place |
+    /// | silu | 1 | `%act0` |
+    /// | gelu | 2 | `%act0`, `%act1` |
+    ///
+    /// The activation half comes from [`crate::ptx_act::Act::scratch_regs`], so the budget and the
+    /// text that spends it cannot disagree.
     ///
     /// # This is a DESIGN gate, not a verdict
     ///
@@ -1790,7 +1836,7 @@ impl WgmmaCfg {
     /// [`WGMMA_CENSUS_INVOCATION`]), and the thing to grep for there is `C7511`, which is a silent
     /// 2-4x rather than a failure.
     pub const fn epilogue_scratch(&self) -> u32 {
-        let mut r = 0;
+        let mut r = self.act.scratch_regs();
         if self.bias {
             r += 6;
         }
@@ -1985,11 +2031,11 @@ impl WgmmaCfg {
         // bias added on the way in would be measured, never checked, and never stored -- a fused
         // row that cannot have a correctness gate. The arm's whole job is to price the STORE of the
         // plain kernel; composing it with an epilogue would price something else and call it that.
-        if self.epilogue.is_diagnostic_only() && self.bias {
+        if self.epilogue.is_diagnostic_only() && !self.epilogue_tag().is_empty() {
             return Err(format!(
-                "{UNSUPPORTED}: {}: the epilogue-elided diagnostic writes no C, so a fused bias on \
-                 it is unmeasurable and ungateable. Measure the fused row against its own plain \
-                 twin instead.",
+                "{UNSUPPORTED}: {}: the epilogue-elided diagnostic writes no C, so a fused \
+                 epilogue on it is unmeasurable and ungateable. Measure the fused row against its \
+                 own plain twin instead.",
                 self.name
             ));
         }
@@ -2852,6 +2898,7 @@ pub const WGMMA_W1: WgmmaCfg = WgmmaCfg {
     epilogue: EpilogueStore::Scalar,
     l2_hint: L2Hint::None,
     bias: false,
+    act: Act::None,
     raster: 1,
     tiles: TileSchedule::OneTilePerCta,
     wait_depth: 0,
@@ -4473,6 +4520,165 @@ pub const WGMMA_W1_V2_B: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1_V2
 };
 
+/// **R2 -- THE WAVE'S HEADLINE: `silu(x*W^T + b)` at the clustered regime.**
+///
+/// The highest (product x margin) / risk cell in wave 4, and the arithmetic says so twice.
+///
+/// * **Product**: SiLU is the gate half of SwiGLU, i.e. the activation of essentially every model
+///   shipped since Llama 2. `tests/run/linear_silu.wk` already spells the bias-free form and the
+///   recognizer composes bias with any activation code, so no language work is needed.
+/// * **Margin**: cuBLASLt has **no SiLU member** -- `LtEpilogue::parse("silu")` is an explicit
+///   error and the absence is pinned device-free by
+///   `baselines::the_cublaslt_fusable_set_is_exactly_these_sixteen` -- so the peer's floor is BIAS
+///   fused plus a separate SiLU kernel, which reads `C` and writes `D`: `8*M*N` bytes of chain
+///   traffic this kernel does not move. There is no strawman to accuse us of. The break-even is
+///   `r* = T_p / (T_p + 8*M*N/BW)`, which at `gpt_d1024_up` and the MEASURED 2.92 TB/s is ~56.5% --
+///   **14 points below the next shape in the suite**, because 21.1% of that kernel is the C store.
+/// * **Risk**: five PTX instructions and one scratch register, and the sequence is the one already
+///   shipped and already gated against the standalone `vmath` kernels.
+///
+/// **Nothing here is measured.** The derived margins (1.328x at r=0.75, 1.451x at r=0.82, 1.770x at
+/// GEMM parity) are `S = r/r*` at a shape whose `r` has not been re-measured since round 1; at
+/// round 1's 54.8% the same arithmetic gives **0.970x, a LOSS**. Re-measuring `gpt_d1024_up` under
+/// the shipped rule is a PREREQUISITE of the visit that publishes this row, not a result of it.
+pub const WGMMA_W1_MCB_V2_B_SILU: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_b_silu",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_b_silu",
+    act: Act::Silu,
+    ..WGMMA_W1_MCB_V2_B
+};
+
+/// R2 at the un-clustered regime -- the arm `sq2048` and `gpt_d1024_down` run on.
+pub const WGMMA_W1_V2_B_SILU: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_v2_b_silu",
+    key: "wgmma_nt_f16_128x256x64_s4_v2_b_silu",
+    act: Act::Silu,
+    ..WGMMA_W1_V2_B
+};
+
+/// **R3 -- GELU + bias, and it is a CONTROL rather than a product row.**
+///
+/// Two reasons it is built, neither of which is "GPT-2 uses it":
+///
+/// 1. It is the only arm that can be compared to `cublaslt_gemm_nt_f16_epilogue(GELU_BIAS)`
+///    **arm-for-arm**, and therefore the only way to measure `eps_peer` -- the library's own
+///    epilogue cost -- instead of assuming it.
+/// 2. It differs from the SiLU row by exactly **one MUFU op and one register**, so `S(R2)/S(R3)`
+///    isolates the activation's own cost on a single kernel instead of on two shapes.
+///
+/// cuBLASLt fuses `GELU_BIAS`, so this row is published labelled **parity** and never as a fusion
+/// win (WAVE4_DOSSIER 2.3 group A: `S ~= r`, zero margin by construction).
+pub const WGMMA_W1_MCB_V2_B_GELU: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_b_gelu",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_b_gelu",
+    act: Act::Gelu,
+    ..WGMMA_W1_MCB_V2_B
+};
+
+/// R3 at the un-clustered regime.
+pub const WGMMA_W1_V2_B_GELU: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_v2_b_gelu",
+    key: "wgmma_nt_f16_128x256x64_s4_v2_b_gelu",
+    act: Act::Gelu,
+    ..WGMMA_W1_V2_B
+};
+
+/// **R1's activation half: ReLU + bias.** One instruction, zero registers, `RELU_BIAS` in
+/// cuBLASLt's enum -- so it is a parity row too, and it is here because it gives the activation
+/// axis its cheapest member: if `b_relu` is not free against `b`, the cost is not the activation.
+pub const WGMMA_W1_MCB_V2_B_RELU: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_b_relu",
+    key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2_b_relu",
+    act: Act::Relu,
+    ..WGMMA_W1_MCB_V2_B
+};
+
+/// ReLU + bias at the un-clustered regime.
+pub const WGMMA_W1_V2_B_RELU: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_f16_128x256x64_s4_v2_b_relu",
+    key: "wgmma_nt_f16_128x256x64_s4_v2_b_relu",
+    act: Act::Relu,
+    ..WGMMA_W1_V2_B
+};
+
+/// **The bf16 twin of the headline.** bf16 is the dominant *training* precision, the 2026-08-11
+/// round measured the shipped rule transferring across dtype to within ~2 points at every
+/// overlapping shape, and the epilogue is dtype-generic by construction -- the accumulator is f32
+/// in both, so the fused text is byte-identical and only the operand token differs. Carried at both
+/// regimes for the same reason the f16 rows are.
+pub const WGMMA_W1_BF16_MCB_V2_B_SILU: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_bf16_128x256x64_s4_mcb2_v2_b_silu",
+    key: "wgmma_nt_bf16_128x256x64_s4_mcb2_v2_b_silu",
+    bias: true,
+    act: Act::Silu,
+    ..WGMMA_W1_BF16_MCB_V2
+};
+
+/// The bf16 headline at the un-clustered regime.
+pub const WGMMA_W1_BF16_V2_B_SILU: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_bf16_128x256x64_s4_v2_b_silu",
+    key: "wgmma_nt_bf16_128x256x64_s4_v2_b_silu",
+    bias: true,
+    act: Act::Silu,
+    ..WGMMA_W1_BF16_V2
+};
+
+/// **The fused-epilogue selector: a W1 v2 regime arm carrying `(act, bias)`, or a DECLINE.**
+///
+/// This is the seam an offload path calls for a **fused** epilogue. It is a pure function of the
+/// output geometry and the requested epilogue, it never falls back, and every configuration it can
+/// return is a module the census has already assembled -- because the answer is looked up **in the
+/// emittable corpus by derived name** rather than constructed on the spot.
+///
+/// The PLAIN product path is [`wgmma_dispatch_dtype`]. Fused twins exist only on the two W1 v2
+/// regime arms (`WGMMA_W1_V2` / `WGMMA_W1_MCB_V2` and their bf16 twins), so this selector picks
+/// among those arms -- it does not re-ship the size-keyed rule the dispatcher replaced, and it
+/// does not invent a third dispatcher.
+///
+/// # Why `None` rather than "the closest thing we have"
+///
+/// A fallback here would be a kernel that computes something else. If the requested epilogue is not
+/// in the corpus, the caller must run the unfused chain (which is correct, merely slower) or
+/// decline; returning a plain-GEMM module for a `silu` request would publish a GEMM's time under a
+/// fusion heading and, worse, hand a caller the wrong numbers. That is WAVE4_DOSSIER refusal 6
+/// ("any variant reachable from a launcher but absent from `wgmma_device_free_modules()`") turned
+/// into the only reachable code path.
+///
+/// # What it does NOT decide
+///
+/// It does not choose the tile, the cluster or the schedule the product ships -- [`wgmma_dispatch_dtype`]
+/// does. A fused row is the matching W1 v2 arm plus one epilogue fact, which is exactly the
+/// property `every_fused_row_differs_from_its_plain_twin_only_in_the_epilogue` asserts of the text.
+pub fn wgmma_epi_for(
+    m: usize,
+    n: usize,
+    dtype: WgmmaDtype,
+    act: Act,
+    bias: bool,
+) -> Option<&'static WgmmaCfg> {
+    // Fused twins are built off the two W1 v2 arms. Clustered at M*N >= 8e6, un-clustered
+    // below -- the split the fused corpus was built against, not the product path.
+    let clustered = m.saturating_mul(n) >= 8_000_000;
+    let base = match (dtype, clustered) {
+        (WgmmaDtype::F16, true) => &WGMMA_W1_MCB_V2,
+        (WgmmaDtype::F16, false) => &WGMMA_W1_V2,
+        (WgmmaDtype::Bf16, true) => &WGMMA_W1_BF16_MCB_V2,
+        (WgmmaDtype::Bf16, false) => &WGMMA_W1_BF16_V2,
+    };
+    if act == Act::None && !bias {
+        return Some(base);
+    }
+    // ONE spelling of the tag: the same method the emitter and `validate` read, applied to the
+    // regime arm with the requested epilogue on it. A `format!("{}_b_silu", ..)` here would be a
+    // second spelling of `derived_name` free to drift from the first.
+    let want = format!(
+        "{}{}",
+        base.name,
+        WgmmaCfg { act, bias, ..*base }.epilogue_tag()
+    );
+    wgmma_all_emittable().into_iter().find(|c| c.name == want)
+}
+
 /// **The shapes every fused-epilogue row is measured at** (WAVE4_DOSSIER 4.9, row M2).
 ///
 /// `sq1024` is deliberately absent: at `r = 32.3%` against a break-even `r* = 71.5%` it cannot clear
@@ -4890,6 +5096,72 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
         why: "WAVE 4 R1 at the un-clustered regime -- the arm sq2048 and gpt_d1024_down run on. \
               Both regimes carry every fused row because the epilogue's cost is a property of the \
               STORE and the regime rule decides which store a shape performs",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_b_silu",
+        cfg: &WGMMA_W1_MCB_V2_B_SILU,
+        shapes: WGMMA_EPILOGUE_SHAPES,
+        why: "WAVE 4 R2, THE HEADLINE, clustered regime. cuBLASLt has NO SiLU member (pinned \
+              device-free), so the peer's floor for silu(x*W^T+b) is BIAS fused plus a separate \
+              kernel that reads C and writes D -- 8*M*N bytes this kernel does not move. It is the \
+              wave's only group-B row and the ONLY one that may be published as a fusion win, and \
+              only against the measured chain (row M1), never against 8*M*N/BW as a derivation",
+    },
+    SweepRow {
+        label: "w1_v2_b_silu",
+        cfg: &WGMMA_W1_V2_B_SILU,
+        shapes: WGMMA_EPILOGUE_SHAPES,
+        why: "WAVE 4 R2 at the un-clustered regime. gpt_d1024_down is the suite's closest shape to \
+              GEMM parity (97.3% at the last round), so it is where a fusion margin is likeliest to \
+              clear 1.0x first",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_b_gelu",
+        cfg: &WGMMA_W1_MCB_V2_B_GELU,
+        shapes: WGMMA_EPILOGUE_SHAPES,
+        why: "WAVE 4 R3, THE CONTROL. cuBLASLt fuses GELU_BIAS, so this is a PARITY row -- and it \
+              is the only arm comparable to the peer arm-for-arm, which is what turns eps_peer \
+              (the library's own epilogue cost) from an assumption into a measurement. It differs \
+              from the SiLU row by one MUFU op and one register, so S(R2)/S(R3) isolates the \
+              activation's cost on ONE kernel instead of on two shapes",
+    },
+    SweepRow {
+        label: "w1_v2_b_gelu",
+        cfg: &WGMMA_W1_V2_B_GELU,
+        shapes: WGMMA_EPILOGUE_SHAPES,
+        why: "WAVE 4 R3 at the un-clustered regime -- the parity control for the shapes the \
+              cluster rule leaves un-clustered",
+    },
+    SweepRow {
+        label: "w1_mcb_v2_b_relu",
+        cfg: &WGMMA_W1_MCB_V2_B_RELU,
+        shapes: WGMMA_SWEEP_SQUARES,
+        why: "The cheapest member of the activation axis: one instruction, zero registers, and \
+              RELU_BIAS is in cuBLASLt's enum so it is a parity row. If it is not free against \
+              w1_mcb_v2_b then the cost is not the activation -- which is section 1.5's claim, \
+              measured rather than argued. Three shapes are enough for a free/not-free verdict",
+    },
+    SweepRow {
+        label: "w1_v2_b_relu",
+        cfg: &WGMMA_W1_V2_B_RELU,
+        shapes: WGMMA_SWEEP_SQUARES,
+        why: "The un-clustered twin of the free/not-free verdict",
+    },
+    SweepRow {
+        label: "bf16_mcb_v2_b_silu",
+        cfg: &WGMMA_W1_BF16_MCB_V2_B_SILU,
+        shapes: WGMMA_EPILOGUE_SHAPES,
+        why: "The headline at bf16 -- the dominant TRAINING precision. The epilogue is \
+              dtype-generic by construction (the accumulator is f32 either way, so the fused text \
+              is byte-identical and only the operand token differs), and the 2026-08-11 round \
+              measured the shipped rule transferring across dtype to within ~2 points. This row \
+              re-measures that transfer for the epilogue instead of inheriting it",
+    },
+    SweepRow {
+        label: "bf16_v2_b_silu",
+        cfg: &WGMMA_W1_BF16_V2_B_SILU,
+        shapes: WGMMA_EPILOGUE_SHAPES,
+        why: "The bf16 headline at the un-clustered regime",
     },
 ];
 
@@ -6767,6 +7039,7 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
     // byte-identical text rounds 1-3 measured, so the shipped rows stay the fused rows' control arm
     // rather than becoming a second thing that also changed.
     let bias = cfg.bias;
+    let act = cfg.act;
     // --- the two wave-3 schedule levers ------------------------------------------------------------
     // Same discipline again: at `OneTilePerCta` + `wait_depth 0` + no fence hoist this generator
     // emits the byte-identical text rounds 1-3 measured, so those rows stay the control arm.
@@ -6881,6 +7154,14 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
         // column is in range and the next is not" -- which the SCALAR transport needs too, so it is
         // declared here rather than inside the v2 arm's `%ptail`.
         s += "    .reg .b64 %rdBias,%rdBi;\n    .reg .f32 %bi0,%bi1;\n    .reg .pred %pbt;\n";
+    }
+    if act != Act::None {
+        // The activation's scratch, named by `ptx_act::Act::epilogue` and declared here because a
+        // `.reg` is an entry-scope declaration. Both are declared whenever an activation is present
+        // even though only GELU spends `%act1`: an unused declared register costs nothing, and a
+        // per-activation declaration list would be a second place the register set is spelled --
+        // which is the kind of second spelling this file's whole discipline is against.
+        s += "    .reg .f32 %act0,%act1;\n";
     }
     if hint_stores {
         s += "    .reg .b64 %rdPolC;\n";
@@ -7393,6 +7674,21 @@ fn entry(cfg: &WgmmaCfg, shape: WgmmaShape) -> Result<String, String> {
                     (4 * j + 3, "%bi1"),
                 ] {
                     s += &format!("    add.f32 %acc{r},%acc{r},{b};\n");
+                }
+            }
+            if act != Act::None {
+                // **BIAS FIRST, THEN THE ACTIVATION**, and the order is a correctness property
+                // rather than a convention: `baselines::apply_f64` -- the host reference the fused
+                // cuBLASLt peer is scored against -- applies the bias before the epilogue's
+                // postprocessing, and cuBLASLt's own doxygen says the bias "is added before
+                // applying final postprocessing". An arm that activated first would still pass a
+                // TOLERANCE gate on smooth data, which is why L7a is `==` and why
+                // `the_bias_is_added_before_the_activation` reads the order out of the text.
+                //
+                // The text is `ptx_act::Act::epilogue`'s, the one the standalone `vmath` kernels
+                // and the Act-1 wmma epilogue emit -- see `WgmmaCfg::act`.
+                for r in 4 * j..4 * j + 4 {
+                    s += &act.epilogue(&format!("%acc{r}"));
                 }
             }
             if v2 {
@@ -8245,7 +8541,14 @@ mod tests {
         // [`WgmmaCfg::epilogue_tag`] puts the `_b` in `derived_name` so the module cache cannot hand
         // a fused row the plain kernel -- the wave's #1 hazard, because the epilogue axis is the one
         // whose mistaken value is FASTEST.
-        assert_eq!(mods.len(), 40);
+        // 40 -> 48 on 2026-08-12 with WAVE 4 R2/R3, the fused activation: silu, gelu and relu on
+        // top of the bias at BOTH regime arms (6 f16 rows), plus the bf16 twins of the headline at
+        // both arms (2). The activation text is `ptx_act::Act::epilogue`'s -- the same generator the
+        // Act-1 wmma epilogue and the standalone `vmath` kernels use -- so these eight modules add
+        // no new PTX vocabulary, only new module KEYS, which is exactly what they must add: a fused
+        // row that shared its plain twin's key would be handed the plain kernel by the module cache
+        // and its time published under a fusion heading.
+        assert_eq!(mods.len(), 48);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -8563,7 +8866,7 @@ mod tests {
     /// correct if exactly one issue site takes the `kt != 0` predicate and every other takes true.
     #[test]
     fn scale_d_replaces_the_accumulator_zeroing() {
-        for c in WGMMA_VARIANTS {
+        for c in wgmma_all_emittable() {
             let ptx = wgmma_module(c, &license()).unwrap();
             assert_eq!(
                 ptx.matches(", %pfirst, 1, 1, 0, 0;").count(),
@@ -8737,10 +9040,23 @@ mod tests {
     fn every_fused_row_differs_from_its_plain_twin_only_in_the_epilogue() {
         // Every register and parameter the fused epilogue introduces. A line the epilogue emits
         // that mentions NONE of these is a line it had no business emitting.
-        const EPI_TOKENS: &[&str] = &["pBias", "%rdBias", "%rdBi", "%bi0", "%bi1", "%pbt"];
-        let strip = |ptx: &str| -> String {
+        const EPI_TOKENS: &[&str] = &[
+            "pBias", "%rdBias", "%rdBi", "%bi0", "%bi1", "%pbt", "%act0", "%act1",
+        ];
+        let strip = |ptx: &str, c: &WgmmaCfg| -> String {
+            // The activation's own lines are identified by GENERATING them, not by pattern: ReLU's
+            // `max.f32 %accX,%accX,0f00000000;` mentions no scratch register at all, so a
+            // token filter alone would leave it behind and the diff would fail for the wrong
+            // reason. `Act::epilogue` is the authority on what the activation emitted.
+            let mut act_lines: Vec<String> = Vec::new();
+            for i in 0..c.shape().map(|s| s.accum_regs()).unwrap_or(0) {
+                for l in c.act.epilogue(&format!("%acc{i}")).lines() {
+                    act_lines.push(l.trim().to_string());
+                }
+            }
             ptx.lines()
                 .filter(|l| !EPI_TOKENS.iter().any(|t| l.contains(t)))
+                .filter(|l| !act_lines.iter().any(|a| a == l.trim()))
                 // The parameter list's trailing comma is the one character an appended parameter
                 // legitimately changes on a line it does not otherwise touch.
                 .map(|l| l.trim_end().trim_end_matches(','))
@@ -8778,8 +9094,8 @@ mod tests {
             let fused = wgmma_module(c, &license()).unwrap();
             let plain = wgmma_module(twin, &license()).unwrap();
             assert_eq!(
-                strip(&fused).replace(c.name, twin.name),
-                strip(&plain),
+                strip(&fused, c).replace(c.name, twin.name),
+                strip(&plain, twin),
                 "{} is not one epilogue fact away from {plain_name}: something outside the fused \
                  epilogue moved, and the A/B between them would measure two things",
                 c.name
@@ -8907,6 +9223,166 @@ mod tests {
         );
     }
 
+    /// **The fused activation IS the shipped `vmath` text, per accumulator** -- the structural half
+    /// of L7a, and the half that runs off-device.
+    ///
+    /// The numerical half (`fused == vmath_act(gemm + bias)`, element-wise `==`) needs a Hopper and
+    /// lives in `gpu::wgmma_fused_pretiming_guard`. This half needs nothing: if the emitted text is
+    /// literally [`crate::ptx_act::Act::epilogue`]'s output for each accumulator, then the fused arm
+    /// and the standalone `ptx::vmath_ptx` kernel issue the same instructions with the same
+    /// constants, and the only remaining question is whether the hardware is deterministic -- which
+    /// it is, `tanh.approx.f32` and friends being fixed functions of the input bit pattern.
+    ///
+    /// It also pins the CONSTANTS by value, so a "cleanup" that replaced `0f3F800000` with a
+    /// recomputed literal, or the tanh-form GELU with the erf form, fails here rather than in a
+    /// tolerance band three orders of magnitude wider than the difference
+    /// (`baselines::the_two_gelu_conventions_are_distinguishable_and_pinned` is the peer-side twin
+    /// of that hazard).
+    #[test]
+    fn the_fused_activation_is_the_shipped_vmath_text() {
+        let mut checked = 0usize;
+        for c in wgmma_all_emittable() {
+            if c.act == Act::None {
+                continue;
+            }
+            let ptx = wgmma_module(c, &license()).unwrap();
+            let nacc = c.shape().unwrap().accum_regs();
+            for i in 0..nacc {
+                let want = c.act.epilogue(&format!("%acc{i}"));
+                assert!(
+                    ptx.contains(&want),
+                    "{}: %acc{i}'s activation is not the shipped text. Expected exactly:\n{want}",
+                    c.name
+                );
+            }
+            // ...and the whole activation, once per accumulator and no more: a doubled application
+            // would be `silu(silu(x))`, which is smooth, plausible and wrong.
+            let head = c
+                .act
+                .epilogue("%acc0")
+                .lines()
+                .next()
+                .unwrap()
+                .trim()
+                .to_string();
+            assert_eq!(
+                ptx.lines().filter(|l| l.trim() == head).count(),
+                1,
+                "{}: the activation's first instruction for %acc0 appears more than once",
+                c.name
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 4,
+            "no activation row in the corpus -- law vacuous"
+        );
+        eprintln!(
+            "[gate] {checked} fused-activation rows emit ptx_act::Act::epilogue's exact text, once \
+             per accumulator \u{2713}"
+        );
+    }
+
+    /// **Bias first, then the activation** -- textually, per accumulator (WAVE4_DOSSIER L7a's third
+    /// edge).
+    ///
+    /// `baselines::apply_f64`, the host reference the fused cuBLASLt peer is scored against, applies
+    /// the bias before the epilogue's postprocessing, and cuBLASLt's own doxygen says the bias "is
+    /// added before applying final postprocessing". An arm that activated first computes
+    /// `silu(x) + b` instead of `silu(x + b)` -- a **smooth, plausible, wrong** function that a
+    /// tolerance gate on smooth data would not fail. So the order is read out of the emitted text
+    /// rather than trusted to the emitter's control flow.
+    #[test]
+    fn the_bias_is_added_before_the_activation() {
+        let mut checked = 0usize;
+        for c in wgmma_all_emittable() {
+            if !c.bias || c.act == Act::None {
+                continue;
+            }
+            let ptx = wgmma_module(c, &license()).unwrap();
+            for i in 0..c.shape().unwrap().accum_regs() {
+                let bias_line = format!(
+                    "    add.f32 %acc{i},%acc{i},%bi{};\n",
+                    if i % 2 == 0 { 0 } else { 1 }
+                );
+                let act_first = c.act.epilogue(&format!("%acc{i}"));
+                let act_first = act_first.lines().next().unwrap();
+                let b = ptx
+                    .find(&bias_line)
+                    .unwrap_or_else(|| panic!("{}: %acc{i} has no bias add at all", c.name));
+                let a = ptx[b..].find(act_first).map(|x| x + b).unwrap_or_else(|| {
+                    panic!("{}: %acc{i} has no activation after its bias add", c.name)
+                });
+                assert!(
+                    b < a,
+                    "{}: %acc{i} is activated before its bias is added -- that is silu(x)+b, not \
+                     silu(x+b), and it is smooth enough to pass a tolerance gate",
+                    c.name
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 4, "no bias+activation row -- law vacuous");
+        eprintln!(
+            "[gate] {checked} rows add the bias BEFORE the activation, per accumulator \u{2713}"
+        );
+    }
+
+    /// **Every epilogue the selector can hand a launcher is a module in the corpus** (WAVE4_DOSSIER
+    /// refusal 6), and the selector DECLINES rather than substituting a kernel that computes
+    /// something else.
+    #[test]
+    fn the_epilogue_selector_only_returns_modules_the_census_assembles() {
+        let corpus: Vec<&str> = wgmma_device_free_modules()
+            .into_iter()
+            .map(|(what, _)| what.trim_start_matches("wgmma::").to_string())
+            .collect::<Vec<_>>()
+            .leak()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let mut found = 0usize;
+        for (m, n) in [(1024, 1024), (2048, 2048), (4096, 4096), (4096, 1024)] {
+            for dt in [WgmmaDtype::F16, WgmmaDtype::Bf16] {
+                for act in [Act::None, Act::Relu, Act::Gelu, Act::Silu] {
+                    for bias in [false, true] {
+                        let Some(c) = wgmma_epi_for(m, n, dt, act, bias) else {
+                            continue;
+                        };
+                        assert_eq!((c.act, c.bias, c.dtype), (act, bias, dt), "{}", c.name);
+                        assert!(
+                            corpus.contains(&c.name),
+                            "{} is reachable from the selector and absent from the device-free \
+                             corpus -- it would sit outside the ASCII, .target, .version and \
+                             census laws simultaneously",
+                            c.name
+                        );
+                        found += 1;
+                    }
+                }
+            }
+        }
+        // The product forms the wave exists for must resolve at BOTH regimes and BOTH dtypes, or
+        // the corpus quietly lost a row and the selector quietly started declining.
+        for (m, n) in [(4096, 4096), (2048, 2048)] {
+            for dt in [WgmmaDtype::F16, WgmmaDtype::Bf16] {
+                assert!(
+                    wgmma_epi_for(m, n, dt, Act::Silu, true).is_some(),
+                    "silu+bias must resolve at {m}x{n} {dt:?} -- it is the wave's headline"
+                );
+            }
+        }
+        // ...and a form nothing emits must DECLINE rather than fall back to the plain GEMM.
+        assert!(
+            wgmma_epi_for(4096, 4096, WgmmaDtype::Bf16, Act::Gelu, true).is_none(),
+            "an unemitted epilogue must decline, never substitute a kernel that computes \
+             something else"
+        );
+        eprintln!(
+            "[gate] {found} selector answers, every one a module the census assembles \u{2713}"
+        );
+    }
+
     /// **A fused epilogue's scratch is part of the consumer's register budget** (guard G22), and a
     /// config that does not fit declines on a CPU rather than spilling on rented silicon.
     ///
@@ -8940,6 +9416,9 @@ mod tests {
         .expect("128 + 32 fits 160 with no fused epilogue");
         assert_eq!(WGMMA_W1_MCB_V2_B.epilogue_scratch(), 6);
         assert_eq!(WGMMA_W1_MCB_V2.epilogue_scratch(), 0);
+        assert_eq!(WGMMA_W1_MCB_V2_B_RELU.epilogue_scratch(), 6);
+        assert_eq!(WGMMA_W1_MCB_V2_B_SILU.epilogue_scratch(), 7);
+        assert_eq!(WGMMA_W1_MCB_V2_B_GELU.epilogue_scratch(), 8);
         eprintln!(
             "[gate] G22: a fused epilogue over the consumer budget declines on the CPU \u{2713}"
         );
@@ -8958,6 +9437,15 @@ mod tests {
         assert!(
             msg.contains("writes no C"),
             "the decline must say why: {msg}"
+        );
+        let bad_act = WgmmaCfg {
+            act: Act::Silu,
+            ..WGMMA_W1_MCB_NOSTORE
+        };
+        let msg = bad_act.validate().expect_err("nostore + silu must decline");
+        assert!(
+            msg.contains("writes no C"),
+            "a fused activation on the elided arm is the same unmeasurable row: {msg}"
         );
     }
 
