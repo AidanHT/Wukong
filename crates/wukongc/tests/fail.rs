@@ -210,11 +210,18 @@ fn every_catalogued_code_is_exercised() {
 /// disagreeing dimension is the whole contract of Phase 0.6 — a message that regresses to a bare
 /// "expected 512, found 513" still carries `E0502`, so `compile_fail_suite` would stay green.
 /// The channel asserted here is `--error-format=json`, the one an editor actually reads.
-const NAMED_DIM_MESSAGES: &[(&str, &str, &[&str])] = &[(
-    "wrong_k.wk",
-    "E0502",
-    &["dimension mismatch on `K` (axis 0): expected 512, found 513"],
-)];
+const NAMED_DIM_MESSAGES: &[(&str, &str, &[&str])] = &[
+    (
+        "wrong_k.wk",
+        "E0502",
+        &["dimension mismatch on `K` (axis 0): expected 512, found 513"],
+    ),
+    (
+        "wrong_m.wk",
+        "E0502",
+        &["dimension mismatch on `M` (axis 0): expected 512, found 513"],
+    ),
+];
 
 /// The dimension a shape error is about must reach a tool through the JSON stream: the stable
 /// `code` field (unchanged, and still the exact `"code":"Ennnn"` substring the suite greps) plus a

@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0502
+module tests.fail.wrong_m
+
+/// The sibling of `wrong_k.wk` on the OUTER dimension, and without a turbofish: `a` binds
+/// `M := 512` and `K := 512`, `b` binds `N := 256`, and then `c`'s first axis is 513. The dim is
+/// inferred from an earlier argument rather than pinned by `::<…>`, which is the other way a
+/// mismatch reaches the checker — and the message must still name it:
+///
+///     error[E0502]: dimension mismatch on `M` (axis 0): expected 512, found 513
+///
+/// Two mutants of the same kernel, one per binding path, so a regression in either cannot hide
+/// behind the other.
+fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], c: Tensor[f32, M, N]) {}
+
+fn main() -> i32 {
+    let a: Tensor[f32, 512, 512];
+    let b: Tensor[f32, 512, 256];
+    let c: Tensor[f32, 513, 256];
+    matmul(a, b, c);
+    return 0;
+}
