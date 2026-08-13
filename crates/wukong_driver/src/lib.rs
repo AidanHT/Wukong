@@ -180,9 +180,45 @@ pub mod exit {
     pub const IO_ERROR: i32 = 3;
 }
 
+/// Environment variable that builds a program with **kernel recognition off**: every `match_*`
+/// recognizer and every whole-function kernel interception in `wukong_mir_build` is skipped, so the
+/// loop nest lowers as written (scalar, or autovectorized) instead of becoming a `wukong_*` runtime
+/// call. Set to any value to enable, in the style of `WUKONG_GPU_NO_MEGA`.
+///
+/// **This is an instrument, not a user feature**, and deliberately not a CLI flag: it exists so that
+/// a claim about the *language* can be measured against the recognizer-free lowering of the same
+/// program, since recognized kernels are otherwise gate-blind (they fire identically on interp and
+/// native at every `-O` level). A user who wants one function lowered as written writes `@generic` on
+/// it — that is the supported, per-function surface. See `docs/internals.md`.
+pub const NO_RECOGNIZE_ENV: &str = "WUKONG_NO_RECOGNIZE";
+
+/// Is [`NO_RECOGNIZE_ENV`] set in this process's environment?
+fn no_recognize() -> bool {
+    std::env::var_os(NO_RECOGNIZE_ENV).is_some()
+}
+
 /// Run the pipeline for `opts`, printing artifacts to stdout and diagnostics to stderr.
 /// Returns a process exit code.
 pub fn compile(opts: &Options) -> i32 {
+    // Autodiff over a recognition-free program is refused, loudly, before anything else runs: the
+    // VJP rules in `wukong_autodiff` are keyed on the recognized kernel calls (`wukong_sgemm` &c),
+    // so a taped program built without them meets buffer-writing loops it has no rule for. The
+    // failure mode this prevents is the repo's standing rule for autodiff holes — a named refusal,
+    // never a silently zero gradient.
+    if no_recognize() && (opts.grad.train || opts.emit == EmitStage::Grad) {
+        let what = if opts.grad.train {
+            "--train"
+        } else {
+            "--emit=grad"
+        };
+        eprintln!(
+            "error: {what}: {NO_RECOGNIZE_ENV} is set, and autodiff is not supported with kernel \
+             recognition off (the VJP rules are kernel-shaped). Unset {NO_RECOGNIZE_ENV}, or drop \
+             {what}."
+        );
+        return exit::COMPILE_ERROR;
+    }
+
     let src = match std::fs::read_to_string(&opts.input) {
         Ok(s) => s,
         Err(e) => {
