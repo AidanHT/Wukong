@@ -707,17 +707,36 @@ The `sgemm_nt` hook carries a **second dispatch axis, the device architecture**.
 `gemm_route_for(cc, off)` is a pure function of the probed `GpuTarget`: on a Hopper part
 (`cc_major == 9`) a recognized `C = A·Bᵀ` goes to the warpgroup-MMA + TMA family
 (`gpu::gemm_nt_wgmma` over a config from the one seam function `wgmma_cfg_for`, which delegates to
-`ptx_wgmma`'s shipped regime rule); on every other capability it takes the pre-Hopper launcher,
+`ptx_wgmma`'s shipped rule); on every other capability it takes the pre-Hopper launcher,
 unchanged. The rule is `== 9` and not `>= (9,0)` for the same reason the module header is: `sm_90a`
 is architecture-*locked*, so a Blackwell part must take the other path rather than be handed a module
-it cannot load. Every other reason the family cannot take a call *that is decidable before the
+it cannot load.
+
+**The shipped rule is `ptx_wgmma::wgmma_dispatch_dtype`, a pure function of `(M, N, K)` and the
+probed SM count**, and it chooses four things: the CTA tile (the widest of 128×256 / 128×128 / 128×64
+whose wave fill clears 0.90 against the probed SM count), the grouped raster (only when a multi-wave
+grid's linear wave footprint blows the probed L2), persistence (any multi-wave grid), and the 1×2×1
+B-multicast cluster (only when what the multicast would save off the *final* configuration's binding
+roof clears its break-even **and** the grid is at least two waves deep, so the cluster's cross-SM
+coupling has more than one tile to amortize over). Until 2026-08-12 the seam instead delegated to a
+static two-way split on `M × N` at 8e6 output elements, which could only ever return a 128×256 row;
+the H100 visit of that day measured the four schedule levers as sweep arms and found the split
+shipping the losing configuration on four of seven benched shapes, which is what promoted the
+dispatcher into the product path. `M × N` is retired rather than kept as a fallback because it is not
+a physical quantity for any of the four levers — two shapes with identical `M × N` take opposite
+cluster verdicts in both directions. The rule can also **decline**: it names a module or says it
+cannot, never substitutes a nearby one, and here a decline is a routing fact that takes the
+pre-Hopper path with the reason logged.
+
+Every other reason the family cannot take a call *that is decidable before the
 launch* — a shape whose tensor map is unencodable (`K % 8 != 0` makes the NT row stride not a
 multiple of 16 bytes), an output past the epilogue's `u32` element index, a ring larger than the
 device's opt-in shared memory, a CTA grid past CUDA's `gridDim.y` ceiling of 65535 (`LaunchPlan::grid`
-puts the M tiles on y, so `M` above ~8.4M with a small `N` reaches the driver as
-`CUDA_ERROR_INVALID_VALUE`), or an `UNSUPPORTED` from the generator — is likewise a **decline to the
-existing path**, never an error, and the launcher's own `assert!`s are pre-decided in the driver so a
-user's program can never abort on one. Two outcomes are deliberately *not* declines, and the module
+puts the M tiles on y for a one-tile-per-CTA schedule, so `M` above ~8.4M with a small `N` reaches the
+driver as `CUDA_ERROR_INVALID_VALUE`; a *persistent* schedule's grid is bounded by the device instead,
+so that ceiling is unreachable there), or an `UNSUPPORTED` from the generator — is likewise a
+**decline to the existing path**, never an error, and the launcher's own `assert!`s are pre-decided in
+the driver so a user's program can never abort on one. Two outcomes are deliberately *not* declines, and the module
 names both rather than implying a total guarantee: a driver rejection **at** the launch that is not
 `Unsupported` (a `cuModuleLoadData` refusing an `sm_90a` module on a driver that predates that
 virtual architecture, say) stays a `Some(Err(..))` hard error, because a GPU failure under
@@ -725,7 +744,7 @@ virtual architecture, say) stays a `Some(Err(..))` hard error, because a GPU fai
 process with `exit(70)` from the launch wait in `wukong_codegen_gpu::gpu`, since a wedged context
 blocks every later driver call anyway. Ragged M/N/K are *not* declines: TMA zero-fills and the
 epilogue predicates. An **odd `N` is**, and it is one of the two declines the launcher does not make
-for itself (the grid ceiling is the other): both shipped rows carry the
+for itself (the grid ceiling is the other): every arm the shipped rule can select carries the
 `st.global.v2.f32` epilogue, whose 8-byte pair is aligned only when `N` is even, and a misaligned
 store is a *sticky* `CUDA_ERROR_MISALIGNED_ADDRESS` that fails every later call in the process
 rather than returning a wrong number. `gemm_nt_wgmma` asserts it only in its timing sibling, so the
@@ -792,11 +811,19 @@ forbids the invocation acquiring `--no-driver`, which would select zero driver t
 Its shape list
 lives in `gpu_accel::HOPPER_GATE_SHAPES` where a device-free law asserts what those shapes are chosen
 for: none declines under the H100 opt-in SMEM budget, each grid is a multiple of its cluster on every
-axis, and exactly one crosses `ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS` — read from the generator
-rather than copied — so the round covers the clustered arm as well as the un-clustered one. That last
-one is not tidiness: the clustered row compiles `.reqnctapercluster` into the entry and a launch that
-does not match a compiled cluster requirement *fails* rather than returning a wrong number, so it is
-the arm with a mechanism the other does not have.
+axis, and the four of them between them reach **every launch mechanism the shipped rule can select** —
+the narrow 128×64 tile with its own `m64n64k16` mainloop, the one-tile-per-CTA schedule, the persistent
+tile loop, and the clustered launch (with one shape carrying the clustered *and* persistent
+combination, which is the one that can hang). The coverage is asserted against the rule itself rather
+than against any threshold, and that is not tidiness — it is the repair of a claim that had already
+rotted. The list previously justified its clustered shape by `M * N` crossing a size threshold, and
+when the 2026-08-12 promotion replaced that threshold with the per-shape dispatcher the same shape
+started taking the un-clustered persistent arm, leaving the `.reqnctapercluster` launch untested from
+the driver side while the doc comment still claimed otherwise. Each mechanism matters for a different
+reason: the clustered row compiles `.reqnctapercluster` into the entry and a launch that does not
+match a compiled cluster requirement *fails* rather than returning a wrong number; the persistent row
+resets `%kt` per tile, and a missed reset makes tile 2 accumulate into tile 1 as a plausible exact
+integer.
 
 `--backend=gpu-native` (the `GpuLower` backend) instead lowers the MIR itself to PTX, so non-recognized
 code runs GPU-side too, with the recognized `wukong_*` symbols (serial and `_parallel` spellings alike)
