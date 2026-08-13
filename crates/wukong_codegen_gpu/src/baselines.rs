@@ -3843,6 +3843,127 @@ pub fn time_cublaslt_gemm_nt_f16_epilogue(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The PLAIN cuBLASLt GEMM peer -- the second half of the GEMM bar
+// ---------------------------------------------------------------------------------------------
+//
+// `cublasGemmEx` (see `time_cublas_gemm_nt_f16_f32out`) and `cublasLtMatmul` are two different
+// dispatchers over the same library, and they do NOT always pick the same kernel: `Lt` runs
+// `cublasLtMatmulAlgoGetHeuristic` against an explicit 32 MiB workspace and a fully-described
+// problem, where `GemmEx` takes the legacy handle's implicit choice. Which one is faster at a given
+// shape is a measurement, not a fact -- and the campaign has only ever measured one of them.
+//
+// GPU_RETARGET_PLAN.md 0: "The GEMM bar is cuBLAS/cuBLASLt with fused epilogues, not a naive CUDA-C
+// nest", and "if you find an existing benchmark that flatters this project unfairly, fix it and
+// re-measure". A denominator that is the WEAKER of two dispatchers the same library offers is
+// exactly that kind of flattery, and the margins under audit (+2.0% at sq8192, +1.6% at
+// gpt_d4096_up) sit inside the range a dispatcher change can move. The two entries below give the
+// peer its other surface so a round can time both and take the faster as the standing bar.
+//
+// `LtEpilogue::None` is deliberate and load-bearing: it sets `CUBLASLT_EPILOGUE_DEFAULT`, which is
+// a plain GEMM. This is NOT the fused-epilogue peer (that is `cublaslt_gemm_nt_f16_epilogue`); it
+// is the same arithmetic `gemm_ex_nt_f16_f32out` performs, through the other door.
+
+/// One-shot plain cuBLASLt GEMM, `C[M,N] = A[M,K] * B[N,K]^T` at f32 out — the correctness
+/// spot-check half of the Lt peer, shaped to match [`cublas_gemm_nt_f16_f32out`] so the two can sit
+/// in the same peer record.
+///
+/// Host f32 `a`/`b` are rounded to f16 here, the same rounding the GemmEx peer applies, so both
+/// dispatchers multiply byte-identical operands.
+pub fn cublaslt_gemm_nt_f16_f32out(
+    g: &mut Gpu,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, PeerError> {
+    cublaslt_gemm_nt_f16_epilogue(g, a, b, &[], m, k, n, LtEpilogue::None, LtOut::F32)
+}
+
+/// **Time the plain cuBLASLt GEMM at f32 out** — the `cublasLtMatmul` half of the GEMM bar, with
+/// the timing shape of [`time_cublas_gemm_nt_f16_f32out`] so the two are directly comparable and
+/// whichever is faster can be taken as the denominator.
+///
+/// The plan is built ONCE, before anything is timed: `cublasLtMatmulAlgoGetHeuristic` is host work
+/// and a per-iteration heuristic query would be timing cuBLASLt's planner rather than its kernel.
+/// The timed region itself is [`time_lt_epilogue_loop`] — the *same* function the fused-epilogue
+/// entries use — rather than a second copy of the warm-up/sync/`Instant`/loop/sync skeleton, and
+/// `the_lt_f32_out_peer_owns_no_timed_region_of_its_own` is the law that keeps it that way. Two
+/// copies of a timing loop is how one arm quietly acquires an extra `synchronize` and reads 3%
+/// slow.
+///
+/// # The two arms are the same SKELETON, not the same bytes — the residual differences, named
+///
+/// An adversarial pass found three, and they are recorded here rather than papered over, because a
+/// peer comparison whose asymmetries are undocumented is the thing this whole lane exists against:
+///
+/// 1. **A 32 MiB zero-filled workspace** exists on the Lt arm and not on the GemmEx arm
+///    ([`EPILOGUE_LT_WORKSPACE`]). It is allocated in `FusedLtPlan::new`, i.e. **outside** the
+///    timed region, so it costs the timed loop nothing; what it buys is a wider algorithm choice
+///    for the peer, which moves the bar in the *conservative* direction (a stronger denominator).
+/// 2. **The output pointer's guard is hoisted.** The GemmEx arm takes `device_ptr_mut(&mut c_d)`
+///    per iteration because `gemm_ex_nt_f16_f32out` wants `&mut`; the Lt arm resolves `d_ptr` once
+///    and passes it as a raw `u64`. On this backend's single default stream that is a guard
+///    construct/drop per iteration and no stream operation, so it is not a launch-affecting
+///    difference — but it IS a difference, and a multi-stream `Gpu` would make it one.
+/// 3. **Four device allocations against three** (the workspace and `d` versus `c_d`), again all
+///    before the clock starts.
+///
+/// None of the three is inside the timed region except (2). If a round ever needs the two arms to
+/// be bit-identical rather than skeleton-identical, the fix is to give the GemmEx handle the same
+/// workspace via `cublasSetWorkspace` and to hoist or un-hoist both guards together — not to
+/// silently prefer whichever arm reads faster.
+///
+/// # Declines are LOUD
+///
+/// A shape whose heuristic finds no algorithm returns `Err(PeerError)` carrying cuBLASLt's own
+/// status. **A caller must not swallow that and fall back to the GemmEx number** — silently
+/// reverting to the weaker of two peers is the defect this entry exists to remove, not a graceful
+/// degradation. Use [`cublaslt_plain_gemm_decline`] to ask the question up front and print the
+/// answer.
+///
+/// Returns seconds per call.
+pub fn time_cublaslt_gemm_nt_f16_f32out(
+    g: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    iters: u32,
+) -> Result<f64, PeerError> {
+    time_cublaslt_gemm_nt_f16_epilogue(g, m, k, n, LtEpilogue::None, LtOut::F32, iters)
+}
+
+/// **Can cuBLASLt run a plain GEMM at this shape, and if not, what did it say?**
+///
+/// `None` means the Lt arm is available and must be timed. `Some(why)` carries the library's own
+/// words, for a round to PRINT — the whole point being that a peer arm which vanishes from a table
+/// without a reason is indistinguishable from a peer arm that was never wired up. The sibling
+/// [`cublaslt_epilogue_available`] answers the same question as a bare `bool`, which is what a
+/// caller wants only when it has nowhere to put the reason.
+///
+/// Cheap: a descriptor plus a heuristic query, no launch (the same mechanism as
+/// [`cublaslt_epilogue_support_matrix`]).
+pub fn cublaslt_plain_gemm_decline(g: &mut Gpu, m: usize, k: usize, n: usize) -> Option<String> {
+    // The alignment rules are checked HERE rather than left to `FusedLtPlan::new`, whose first two
+    // statements are `assert!`s. A safety probe that panics on exactly the shapes it exists to
+    // screen is not a probe; the caller gets a sentence it can print instead of a stack trace.
+    if !k.is_multiple_of(8) {
+        return Some(format!(
+            "cuBLASLt f16 needs K%8==0 for a 16-byte-aligned lda/ldb (got K={k})"
+        ));
+    }
+    if !n.is_multiple_of(4) {
+        return Some(format!(
+            "cuBLASLt f16 needs N%4==0 for the C/D leading dimension (got N={n})"
+        ));
+    }
+    match FusedLtPlan::new(g, m, k, n, LtEpilogue::None, LtOut::F32, &[]) {
+        Ok(_) => None,
+        Err(e) => Some(e.to_string()),
+    }
+}
+
 /// [`time_cublaslt_gemm_nt_f16_epilogue`] over buffers the caller already has resident, so the peer
 /// multiplies the **identical bytes** the Wukong arm did. `d_ptr` must address `m*n` elements of
 /// `out`'s dtype.
@@ -5386,6 +5507,273 @@ mod tests {
         assert_eq!(
             fused_epilogue_reference(&c, &[], 2, 2, LtEpilogue::Relu, true),
             vec![0.0, 2.0, 0.0, 4.0]
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The PLAIN cuBLASLt GEMM peer -- the second dispatcher over the same library, so a round can
+    // time both and take the FASTER as the denominator. All device-free.
+    // -----------------------------------------------------------------------------------------
+
+    /// The top-level body of `name`, sliced out of this file's own source. Anchored on a
+    /// column-zero `fn` and terminated by a column-zero `}`, so a mention in a doc comment cannot
+    /// be mistaken for the definition.
+    fn fn_body(src: &str, header: &str) -> String {
+        let at = src.find(header).unwrap_or_else(|| {
+            panic!("{header:?} is not in baselines.rs — the law lost its subject")
+        });
+        let tail = &src[at..];
+        let end = tail
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{header:?} has no column-zero close"));
+        tail[..end].to_string()
+    }
+
+    /// **Both cuBLAS dispatchers fit ONE peer record.** This is a compile-time law, not an
+    /// assertion: the two arrays only type-check if `time_cublaslt_gemm_nt_f16_f32out` and
+    /// `cublaslt_gemm_nt_f16_f32out` have exactly the signatures `gpu.rs`'s `PeerBar { once, time }`
+    /// declares, which is what makes swapping the denominator a one-line change there instead of a
+    /// second bench body.
+    #[test]
+    fn both_gemm_dispatchers_fit_one_peer_record() {
+        use super::{Gpu, PeerError};
+        type PeerTime = fn(&mut Gpu, usize, usize, usize, u32) -> Result<f64, PeerError>;
+        type PeerOnce =
+            fn(&mut Gpu, &[f32], &[f32], usize, usize, usize) -> Result<Vec<f32>, PeerError>;
+        let time: [(&str, PeerTime); 2] = [
+            ("GemmEx", super::time_cublas_gemm_nt_f16_f32out),
+            ("Lt", super::time_cublaslt_gemm_nt_f16_f32out),
+        ];
+        let once: [(&str, PeerOnce); 2] = [
+            ("GemmEx", super::cublas_gemm_nt_f16_f32out),
+            ("Lt", super::cublaslt_gemm_nt_f16_f32out),
+        ];
+        assert_eq!(time.len(), 2);
+        assert_eq!(once.len(), 2);
+        // Two DISTINCT dispatchers. Pointing both arms of a peer sweep at one function is the
+        // `PtxTwin` equal-keys mistake in another costume: the round would compare nothing and
+        // report a perfect tie.
+        assert!(
+            time[0].1 as usize != time[1].1 as usize,
+            "the two peer timing entries are the same function"
+        );
+        assert!(once[0].1 as usize != once[1].1 as usize);
+    }
+
+    /// **The Lt f32-out peer is a PLAIN GEMM**, not a fused-epilogue one. `CUBLASLT_EPILOGUE_DEFAULT`
+    /// applies nothing and reads no bias, so the two dispatchers are performing the same arithmetic
+    /// and the faster one is a fair denominator. If this ever drifted to a fusing epilogue the peer
+    /// would be doing MORE work than Wukong's kernel and every ratio would flatter us.
+    #[test]
+    fn the_lt_f32_out_peer_is_a_plain_gemm() {
+        use super::LtEpilogue;
+        use cudarc::cublaslt::sys::cublasLtEpilogue_t as E;
+        assert_eq!(
+            LtEpilogue::None.as_sys() as u32,
+            E::CUBLASLT_EPILOGUE_DEFAULT as u32
+        );
+        assert!(!LtEpilogue::None.needs_bias(), "a plain GEMM reads no bias");
+        assert_eq!(LtEpilogue::None.apply_f64(-3.5, 99.0, true), -3.5);
+        assert_eq!(LtEpilogue::None.name(), "DEFAULT");
+        // ...and the entry point really does ask for that epilogue at f32 out, and hands the empty
+        // bias slice the "no bias" path requires.
+        let body = fn_body(
+            include_str!("baselines.rs"),
+            "\npub fn time_cublaslt_gemm_nt_f16_f32out(",
+        );
+        assert!(body.contains("LtEpilogue::None"), "{body}");
+        assert!(body.contains("LtOut::F32"), "{body}");
+        let once = fn_body(
+            include_str!("baselines.rs"),
+            "\npub fn cublaslt_gemm_nt_f16_f32out(",
+        );
+        assert!(
+            once.contains("LtEpilogue::None") && once.contains("LtOut::F32"),
+            "{once}"
+        );
+        assert!(
+            once.contains("&[]"),
+            "the one-shot must pass an empty bias: {once}"
+        );
+    }
+
+    /// **The Lt peer owns no timed region of its own.** It delegates to `time_lt_epilogue_loop`,
+    /// which is the same loop the fused-epilogue entries use. A second hand-written
+    /// warm-up/sync/`Instant`/loop/sync skeleton is how one arm quietly acquires an extra
+    /// `synchronize` — or loses the warm-up — and reads a few percent off, which at the margins
+    /// this campaign is arguing over (+2.0%) is the entire claim.
+    #[test]
+    fn the_lt_f32_out_peer_owns_no_timed_region_of_its_own() {
+        let body = fn_body(
+            include_str!("baselines.rs"),
+            "\npub fn time_cublaslt_gemm_nt_f16_f32out(",
+        );
+        for forbidden in [
+            "Instant::now",
+            "synchronize",
+            "for _ in 0..iters",
+            "elapsed()",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "time_cublaslt_gemm_nt_f16_f32out grew its own timed region ({forbidden:?}); it \
+                 must delegate so there is exactly one timing skeleton to keep honest:\n{body}"
+            );
+        }
+        assert!(
+            body.contains("time_cublaslt_gemm_nt_f16_epilogue("),
+            "{body}"
+        );
+    }
+
+    /// **The two timing skeletons are the same skeleton.** `gemm_ex` and `cublasLtMatmul` are
+    /// launched by different code, so the only way their seconds-per-call are comparable is that
+    /// the region around the launch is identical: one warm-up, one sync, `Instant`, `iters`
+    /// launches, one trailing sync, `elapsed / iters`. Checked as an ordered marker sequence AND as
+    /// counts, because "contains a sync" would pass a body with three of them.
+    #[test]
+    fn both_gemm_peer_timing_loops_have_the_identical_skeleton() {
+        let src = include_str!("baselines.rs");
+        let loops = [
+            (
+                "GemmEx",
+                fn_body(src, "\npub fn time_cublas_gemm_nt_f16_f32out("),
+            ),
+            ("Lt", fn_body(src, "\nfn time_lt_epilogue_loop(")),
+        ];
+        for (who, body) in &loops {
+            // The defect the counts below cannot see on their own: moving the plan build INSIDE
+            // the loop adds none of the markers and changes none of the counts, and would time
+            // cuBLASLt's heuristic search instead of its kernel.
+            assert_eq!(
+                body.matches("FusedLtPlan::new").count(),
+                0,
+                "{who}: the plan must be built OUTSIDE the timed region\n{body}"
+            );
+            assert_eq!(
+                body.matches("// warm up").count(),
+                1,
+                "{who}: exactly one discarded warm-up launch\n{body}"
+            );
+            assert_eq!(
+                body.matches("synchronize()?;").count(),
+                2,
+                "{who}: exactly two syncs — one closing the warm-up, one closing the timed region. \
+                 A third inside the loop would time a serialized stream; a missing trailing one \
+                 would time the launch queue, not the work.\n{body}"
+            );
+            assert_eq!(body.matches("Instant::now()").count(), 1, "{who}\n{body}");
+            assert_eq!(
+                body.matches("for _ in 0..iters").count(),
+                1,
+                "{who}\n{body}"
+            );
+            assert!(
+                body.trim_end()
+                    .ends_with("Ok(t0.elapsed().as_secs_f64() / iters as f64)"),
+                "{who} must return SECONDS PER CALL:\n{body}"
+            );
+            // The order, not just the presence.
+            let order = |m: &str| body.find(m).unwrap_or_else(|| panic!("{who}: no {m:?}"));
+            let warm = order("// warm up");
+            let sync1 = order("synchronize()?;");
+            let inst = order("Instant::now()");
+            let lop = order("for _ in 0..iters");
+            assert!(
+                warm < sync1 && sync1 < inst && inst < lop,
+                "{who}: the warm-up must be launched, then synced, then the clock started, then \
+                 the loop run — got {warm}/{sync1}/{inst}/{lop}\n{body}"
+            );
+        }
+        // ...and the Lt ENTRY POINT, which is where the plan and the buffers live, owns no timing
+        // of its own either. Without this clause the skeleton law compares the GemmEx function
+        // (allocations AND loop) against `time_lt_epilogue_loop` (loop only), and every asymmetry
+        // that matters sits in the function neither side reads.
+        let entry = fn_body(src, "\npub fn time_cublaslt_gemm_nt_f16_epilogue(");
+        for forbidden in [
+            "Instant::now",
+            "synchronize",
+            "for _ in 0..iters",
+            "elapsed()",
+        ] {
+            assert!(
+                !entry.contains(forbidden),
+                "time_cublaslt_gemm_nt_f16_epilogue grew a timed region ({forbidden:?}); the loop \
+                 must stay in time_lt_epilogue_loop where one law can see it:\n{entry}"
+            );
+        }
+        assert_eq!(
+            entry.matches("FusedLtPlan::new").count(),
+            1,
+            "the plan is built exactly once, before the timing:\n{entry}"
+        );
+    }
+
+    /// **Every shape the wgmma sweep measures must be one the Lt peer can take.**
+    ///
+    /// `FusedLtPlan::new` ASSERTS `K%8` and `N%4` (16-byte-aligned f16 leading dims), so a bench
+    /// shape that violated them would not decline politely — it would panic in the middle of a
+    /// metered H100 round. This is that check, run for free on any box, over the sweep's own grid
+    /// rather than a copy of it.
+    #[test]
+    fn every_wgmma_bench_shape_can_be_measured_by_the_lt_peer() {
+        let grid = crate::ptx_wgmma::WGMMA_BENCH_GRID;
+        assert!(grid.len() >= 7, "the grid shrank; the law lost its corpus");
+        for p in grid {
+            assert!(
+                p.k.is_multiple_of(8),
+                "{}: K={} is not a multiple of 8, so FusedLtPlan::new would PANIC mid-round rather \
+                 than decline",
+                p.label,
+                p.k
+            );
+            assert!(
+                p.n.is_multiple_of(4),
+                "{}: N={} is not a multiple of 4 (see FusedLtPlan::new)",
+                p.label,
+                p.n
+            );
+            // The GemmEx peer's own buffer-length preconditions, restated over the same grid: both
+            // arms must be able to take every shape or the "faster of the two" rule has a hole.
+            assert!(p.m > 0 && p.k > 0 && p.n > 0, "{}", p.label);
+        }
+    }
+
+    /// **A decline is a REPORT, not a fallback.** `cublaslt_plain_gemm_decline` returns the
+    /// library's own words so a round can print them; the alternative — a silent revert to the
+    /// GemmEx number — is precisely the defect the second dispatcher was added to remove, because
+    /// the table would then read as "cuBLAS" while measuring whichever dispatcher happened to
+    /// survive.
+    #[test]
+    fn the_lt_peers_decline_carries_a_reason_rather_than_a_bool() {
+        let src = include_str!("baselines.rs");
+        let body = fn_body(src, "\npub fn cublaslt_plain_gemm_decline(");
+        assert!(
+            body.contains("Some(e.to_string())"),
+            "the decline must carry the library's words:\n{body}"
+        );
+        assert!(
+            body.contains("Ok(_) => None"),
+            "available must be the None case:\n{body}"
+        );
+        // The probe must not panic on the shapes it exists to screen: `FusedLtPlan::new` opens with
+        // two `assert!`s, so a decline that delegates straight to it dies on a bad K or N.
+        assert!(
+            body.contains("is_multiple_of(8)") && body.contains("is_multiple_of(4)"),
+            "the decline must answer the alignment question itself rather than assert it:\n{body}"
+        );
+        // The doc must tell the caller what NOT to do with it, since the compiler cannot. Sliced
+        // by LINES, not by a byte offset: this file's prose carries em dashes, so a fixed
+        // `at - 1400` lands mid-character and panics as soon as anything above it shifts.
+        let doc: String = src[..src.find("pub fn cublaslt_plain_gemm_decline(").unwrap()]
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            doc.contains("without a reason") || doc.contains("never wired up"),
+            "the decline's doc must say why a silent one is a defect:\n{doc}"
         );
     }
 

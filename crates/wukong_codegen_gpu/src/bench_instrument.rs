@@ -19,7 +19,7 @@
 //! So: **the noise floor is a property of the run, never a constant.** It is measured, every round,
 //! by arms that are known to be identical, and nothing publishes below it.
 //!
-//! # The contract, in five rules
+//! # The contract, in seven rules
 //!
 //! 1. **Three arms.** `A` = [`Arm::Baseline`], `C` = [`Arm::Control`] (the twin — *known* identical
 //!    to `A`, carries no content), `B` = [`Arm::Contender`]. The arms alternate inside one round and
@@ -39,6 +39,22 @@
 //! 5. **A round whose device does not match the spec table publishes NOTHING.** Not a warning: the
 //!    object that mints numbers ([`Round`]) cannot be constructed at all ([`Round::open`] returns
 //!    `Err`). Marketplaces have sold MIG slices and vGPU profiles as whole A100s.
+//! 6. **An effect must clear the threshold by [`RESOLUTION_MARGIN_FACTOR`], not merely clear it.**
+//!    The floor and the contender spread are *within-round* statistics; measured over 195
+//!    cross-round comparisons in `bench/gpu/h100/*.log`, the same cell's *between*-round drift
+//!    exceeds one such threshold **43.6%** of the time, with an upper quartile of `1.9x`. A cell in
+//!    the band is [`Cell::Marginal`] and publishes nothing — it is a lead to re-measure, and the
+//!    round log prints its `margin` so the reader can see how far short it fell.
+//!    `tools/perf/derive_margin_factor.py` re-derives all of it from the committed logs.
+//! 7. **A measured round whose clocks are not locked publishes NOTHING unless the operator declares
+//!    it iteration data** ([`ITERATION_DATA_ENV`]). `GPU_RETARGET_PLAN.md` §6.3 has said "container
+//!    rounds are iteration data, VM rounds are publication data" in prose since it was written;
+//!    [`Round::gate`] is where that stopped being advice. The declaration buys a weaker claim, not
+//!    silence: it cannot mask a missing reading, an unclosed round or clock drift, all of which are
+//!    checked first. A [`RoundClass::Synthetic`] round — a hand-built [`RoundMeta`] in a unit test,
+//!    whose timings are invented — is exempt, and the source law
+//!    `only_a_device_free_unit_test_may_hand_build_a_round` is what keeps a metered bench from
+//!    reaching that exemption.
 //!
 //! # The GPU twin, and the cache subtlety that would fake it
 //!
@@ -128,6 +144,54 @@ pub const DEFAULT_CONTROL_BAR: f64 = 0.05;
 /// nothing. The laptop precedent is power state (three different machines); the datacenter
 /// equivalents are thermal throttle, a power cap and a noisy multi-tenant host.
 pub const DEFAULT_CLOCK_DRIFT_BAR: f64 = 0.05;
+
+/// **The replication margin.** An effect must clear the round's [`resolution_threshold`] by this
+/// factor to be [`Cell::Moved`]; between `1x` and `2x` it is [`Cell::Marginal`] and publishes
+/// nothing.
+///
+/// # Why a band at all, and why this number
+///
+/// [`resolution_threshold`] is a **within-round** statistic: the peer's A-vs-C spread and the
+/// contender's own range, both taken over the five rounds of ONE invocation. It says whether the
+/// effect is bigger than the noise this container saw in the last thirty seconds. It does **not**
+/// say whether the number will still be there next round, which is the only question a published
+/// claim actually answers — and the two are not the same, by a factor this repo has now measured.
+///
+/// **The measurement** is `tools/perf/derive_margin_factor.py`, which reads the committed round
+/// logs and prints everything below. Run it; do not trust this table. Four `wgmma_config_sweep`
+/// rounds (`bench/gpu/h100/2026-08-1{0,0,1,2}-*.log`) share **51 `(row, shape)` keys measured in
+/// two or more of them** — 15 keys in 2 rounds, 12 in 3, 24 in 4 — giving `15·1 + 12·3 + 24·6` =
+/// **195 unordered round-pairs**. Expressing each pair's change in the published ratio `A/B` in
+/// units of that round's own `T = resolution_threshold`:
+///
+/// | statistic | ALL PAIRS (n=195) | TIGHT CUT (n=51) |
+/// |---|---|---|
+/// | median drift / T | 0.78 | 0.36 |
+/// | 75th pct | **1.92** | 0.86 |
+/// | 90th pct | 5.54 | 1.42 |
+/// | fraction exceeding 1×T | 43.6% | 23.5% |
+/// | fraction exceeding 2×T | 23.1% | **3.9%** |
+///
+/// ALL PAIRS is the pessimistic bound — it spans four rounds across three waves, so some of that
+/// drift is code changing rather than the machine. The TIGHT CUT is the optimistic one: the two
+/// consecutive same-format rounds, one day apart. **The two cuts justify `2.0` from opposite
+/// sides.** On the wide cut it is the measured 75th percentile (1.92) rounded to the nearest
+/// integer; on the tight cut it is the smallest integer factor that puts the round-to-round
+/// false-positive rate under the conventional 5% (3.9%, against 23.5% at `1×T`). It is not a
+/// conservative round number, and `1×T` — the rule before this constant existed — is between a
+/// coin flip and a one-in-four bet depending on which cut you believe.
+///
+/// **Do not gloss this as "the scatter is twice the threshold".** The *median* drift is 0.78×T on
+/// the wide cut and 0.36×T on the tight one; it is the upper quartile that reaches 1.9×, and the
+/// band is sized for the tail because that is where a false publication comes from.
+///
+/// **What this is NOT.** It is not a certificate. 23.1% of the wide cut still drifts past `2×T`,
+/// and the only thing that establishes a marginal effect is **measuring it again in a second
+/// round**. The band refuses; it does not bless. [`Cell::Marginal`] therefore publishes nothing
+/// rather than publishing with a caveat, because a caveat next to a number is read as a number.
+///
+/// Re-derive it — do not adjust it — when more replicated rounds land, by re-running that script.
+pub const RESOLUTION_MARGIN_FACTOR: f64 = 2.0;
 
 // ---------------------------------------------------------------------------------------------
 // Arms
@@ -396,10 +460,20 @@ where
 /// What one field of one bench is allowed to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cell {
-    /// `|B/A - 1| <= floor` at a floor that cleared the bar: an honest, publishable tie.
+    /// `|B/A - 1| <= threshold` at a floor that cleared the bar: an honest, publishable tie.
     Tie,
-    /// The effect cleared this round's own floor: publishable as a direction.
+    /// The effect cleared this round's own threshold by at least [`RESOLUTION_MARGIN_FACTOR`]:
+    /// publishable as a direction.
     Moved,
+    /// The effect cleared this round's threshold but by less than [`RESOLUTION_MARGIN_FACTOR`].
+    ///
+    /// **Publishes nothing.** Not because the effect is absent — it is bigger than the noise this
+    /// round measured — but because that noise is a *within-round* statistic, and the same cell's
+    /// measured round-to-round drift exceeds one such threshold 43.6% of the time (see
+    /// [`RESOLUTION_MARGIN_FACTOR`] for the 195-comparison derivation and the script that re-runs
+    /// it). A cell landing here is a **lead**: re-run it in a second round, and if it survives, it
+    /// publishes.
+    Marginal,
     /// The floor did not clear the pre-registered bar. Publishes nothing — reporting a wide tie as
     /// a tie is exactly the failure this module exists to prevent.
     Unresolved,
@@ -416,6 +490,12 @@ pub enum Cell {
 
 impl Cell {
     /// May a number be published for this cell?
+    ///
+    /// [`Cell::Marginal`] is deliberately **not** publishable. It is the one variant here that
+    /// carries a real, resolved effect, and letting it through with a label was the design that got
+    /// rejected: a caller who formats `if is_tie() {"tie"} else {"moved"}` — which is exactly what
+    /// `gpu.rs`'s published table does — would print a 1.2x-margin cell as a win, identically to a
+    /// 50x one. Refusing at the source is the only version that cannot be lost in a format string.
     pub fn publishable(self) -> bool {
         matches!(self, Cell::Tie | Cell::Moved)
     }
@@ -424,6 +504,7 @@ impl Cell {
         match self {
             Cell::Tie => "tie",
             Cell::Moved => "moved",
+            Cell::Marginal => "marginal",
             Cell::Unresolved => "unresolved",
             Cell::Degenerate => "degenerate",
             Cell::Constant => "constant",
@@ -466,13 +547,35 @@ pub struct FieldVerdict {
     /// honest statistic, it is what a reader can check against the printed samples, and it cannot be
     /// made to look small by an outlier the way a mean can.
     pub b_spread: Option<f64>,
+    /// [`resolution_threshold`] for this field: the worse of the round's floor and this field's own
+    /// [`FieldVerdict::b_spread`]. Recorded rather than re-derived so the printed table, the cell
+    /// decision and [`FieldVerdict::margin`] cannot disagree about what the effect was judged
+    /// against.
+    pub threshold: Option<f64>,
     /// Did this field contribute to the floor?
     pub live: bool,
     pub cell: Cell,
 }
 
-/// **The threshold an effect must clear to be a `Moved`**: the worse of the denominator's noise
-/// (`floor`) and the contender's own (`b_spread`).
+impl FieldVerdict {
+    /// `|effect| / threshold` — see [`margin`].
+    ///
+    /// `None` unless the cell is one of the three verdicts the margin is *about*
+    /// ([`Cell::Tie`] / [`Cell::Marginal`] / [`Cell::Moved`]). A `Constant` field would otherwise
+    /// report `0.00x` and an `Unresolved` one some large number, either of which a reader would
+    /// then measure against the band's rule — a rule that does not apply to them, because they
+    /// publish nothing whatever their margin is.
+    pub fn margin(&self) -> Option<f64> {
+        if !matches!(self.cell, Cell::Tie | Cell::Marginal | Cell::Moved) {
+            return None;
+        }
+        Some(margin(self.effect?, self.threshold?))
+    }
+}
+
+/// **The threshold an effect is judged against**: the worse of the denominator's noise (`floor`)
+/// and the contender's own (`b_spread`). Clearing it makes a cell [`Cell::Marginal`]; clearing it
+/// by [`RESOLUTION_MARGIN_FACTOR`] makes it [`Cell::Moved`] — see [`classify_effect`].
 ///
 /// One function, so the cell decision, the publish gate and the printed table cannot disagree about
 /// what "resolved" means.
@@ -481,6 +584,58 @@ pub fn resolution_threshold(floor: Option<f64>, b_spread: Option<f64>) -> Option
         (Some(f), Some(s)) => Some(f.max(s)),
         (Some(f), None) => Some(f),
         (None, s) => s,
+    }
+}
+
+/// **How many times the round's own resolution threshold the effect cleared**: `|effect| / th`.
+///
+/// A dimensionless number the log prints on every cell, because `1.2x` and `50x` were previously
+/// rendered by the identical word `moved` and a reader had to do this division by hand from two
+/// other columns to tell them apart.
+///
+/// A zero threshold means the round measured no noise at all, which is a degenerate instrument
+/// rather than an infinitely sensitive one: a nonzero effect against it is reported as
+/// [`f64::INFINITY`] (and a zero effect as `0.0`) so the value stays orderable and the caller's
+/// comparisons are the same ones [`classify_effect`] makes.
+pub fn margin(effect: f64, threshold: f64) -> f64 {
+    if threshold > 0.0 {
+        effect.abs() / threshold
+    } else if effect == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// **The three-way verdict on one resolved cell**, and the only place the boundaries are written.
+///
+/// * a non-finite effect, or a threshold that is not strictly positive — [`Cell::Degenerate`].
+/// * `|effect| <= th` — [`Cell::Tie`]: no difference this round could see.
+/// * `th < |effect| <= RESOLUTION_MARGIN_FACTOR * th` — [`Cell::Marginal`]: a real effect against
+///   *this round's* noise, inside the scatter the same cell shows *between* rounds. Publishes
+///   nothing; see [`RESOLUTION_MARGIN_FACTOR`].
+/// * otherwise — [`Cell::Moved`].
+///
+/// **Both degenerate guards fail CLOSED, and both were fail-open in the first draft.** A `NaN`
+/// compared with `<=` is false in both directions, so a `NaN` effect fell through to `Moved` — the
+/// most permissive verdict — and printed a margin of `inf`. And a zero threshold means the round
+/// measured no noise at all, which is a broken instrument rather than an infinitely sensitive one;
+/// treating it as sensitive published every blip. `Round::publish` refuses `Degenerate`, so both
+/// now land where a measurement that did not happen belongs.
+///
+/// The two live comparisons are against `th` and `th * FACTOR` rather than against `margin(..)`
+/// because the division reintroduces exactly the `NaN` the guard above removes.
+pub fn classify_effect(effect: f64, threshold: f64) -> Cell {
+    if !effect.is_finite() || !threshold.is_finite() || threshold <= 0.0 {
+        return Cell::Degenerate;
+    }
+    let e = effect.abs();
+    if e <= threshold {
+        Cell::Tie
+    } else if e <= threshold * RESOLUTION_MARGIN_FACTOR {
+        Cell::Marginal
+    } else {
+        Cell::Moved
     }
 }
 
@@ -589,6 +744,7 @@ pub fn analyze(samples: &BenchSamples, bar: f64) -> BenchVerdict {
             control_gap,
             effect,
             b_spread: if bad_len { None } else { spread(bv) },
+            threshold: None, // provisional; the floor is a whole-round fact, computed below
             live,
             cell: Cell::Degenerate, // provisional; decided below, once the floor is known
         });
@@ -624,6 +780,7 @@ pub fn analyze(samples: &BenchSamples, bar: f64) -> BenchVerdict {
     };
     for (fv, why) in fields.iter_mut().zip(flags) {
         let bv_len = samples.samples(&fv.field, Arm::Contender).len();
+        fv.threshold = resolution_threshold(floor, fv.b_spread);
         fv.cell = if why.bad_len {
             Cell::Malformed
         } else if why.constant {
@@ -639,13 +796,11 @@ pub fn analyze(samples: &BenchSamples, bar: f64) -> BenchVerdict {
         } else {
             // The effect must clear the WORSE of the two noises. Comparing it to the peer's spread
             // alone is how a gain inside the contender's own run-to-run variation gets published.
-            let th = resolution_threshold(floor, fv.b_spread).expect("resolved implies Some");
-            let e = fv.effect.expect("checked above");
-            if e.abs() <= th {
-                Cell::Tie
-            } else {
-                Cell::Moved
-            }
+            // And it must clear it by `RESOLUTION_MARGIN_FACTOR`, because that threshold is a
+            // WITHIN-round statistic and this instrument's measured BETWEEN-round drift exceeds it
+            // for 43.6% of replicated cells.
+            let th = fv.threshold.expect("resolved implies Some");
+            classify_effect(fv.effect.expect("checked above"), th)
         };
     }
 
@@ -739,8 +894,8 @@ impl BenchVerdict {
         );
         let _ = writeln!(
             s,
-            "  {:<24} {:>14} {:>14} {:>14} {:>10} {:>10} {:>10}  verdict",
-            "field", "A", "C", "B", "C/A-1", "B/A-1", "B spread"
+            "  {:<24} {:>14} {:>14} {:>14} {:>10} {:>10} {:>10} {:>8}  verdict",
+            "field", "A", "C", "B", "C/A-1", "B/A-1", "B spread", "margin"
         );
         for f in &self.fields {
             let num = |v: Option<f64>| match v {
@@ -751,9 +906,16 @@ impl BenchVerdict {
                 Some(v) => format!("{:+.2}%", v * 100.0),
                 None => "n/a".to_string(),
             };
+            // The margin is the column that separates a 1.2x "moved" from a 50x one. It was
+            // computable from `B/A-1` and `B spread` by hand before this, and nobody did.
+            let margin = match f.margin() {
+                Some(m) if m.is_finite() => format!("{m:.2}x"),
+                Some(_) => "inf".to_string(),
+                None => "n/a".to_string(),
+            };
             let _ = writeln!(
                 s,
-                "  {:<24} {:>14} {:>14} {:>14} {:>10} {:>10} {:>10}  {}{}",
+                "  {:<24} {:>14} {:>14} {:>14} {:>10} {:>10} {:>10} {:>8}  {}{}",
                 f.field,
                 num(f.a),
                 num(f.c),
@@ -761,10 +923,19 @@ impl BenchVerdict {
                 pct(f.control_gap),
                 pct(f.effect),
                 pct(f.b_spread),
+                margin,
                 f.cell,
                 if f.live { "" } else { " (not in floor)" }
             );
         }
+        let _ = writeln!(
+            s,
+            "  margin = |B/A-1| / max(floor, B spread), and ONLY for a resolved cell: >{:.0}x \
+             publishes as a direction, (1x,{:.0}x] is MARGINAL and publishes nothing, <=1x is a \
+             tie (see RESOLUTION_MARGIN_FACTOR). A row with no margin publishes nothing whatever \
+             its numbers look like.",
+            RESOLUTION_MARGIN_FACTOR, RESOLUTION_MARGIN_FACTOR
+        );
         s
     }
 }
@@ -785,6 +956,9 @@ pub enum Refusal {
     NoClockEvidence(&'static str),
     /// The SM clock moved between the two readings: not the same machine throughout.
     ClockDrift { drift: f64, bar: f64 },
+    /// **The round's clocks were not locked and nobody declared it iteration data** — §6.3's
+    /// container-vs-VM split, enforced instead of advised.
+    ClocksNotLocked(ClockLock),
     /// Arms `A` and `C` are the same object; the control compared nothing.
     AliasedArms,
     /// An arm did not report every round for this field.
@@ -825,6 +999,14 @@ impl fmt::Display for Refusal {
                 drift * 100.0,
                 bar * 100.0
             ),
+            Refusal::ClocksNotLocked(lock) => write!(
+                f,
+                "clock lock is '{lock}', not locked — GPU_RETARGET_PLAN.md 6.3 makes an unlocked \
+                 round ITERATION data, not publication data, so it mints no numbers. Either run on \
+                 a root VM with `nvidia-smi -lgc` and declare WUKONG_GPU_CLOCK_LOCK=locked:<MHz>, \
+                 or declare the weaker claim explicitly with {ITERATION_DATA_ENV}=1 and read every \
+                 number this round prints as a lead"
+            ),
             Refusal::AliasedArms => write!(
                 f,
                 "arms A and C produced identical sample vectors — they are the same handle/closure, \
@@ -861,6 +1043,23 @@ impl fmt::Display for Refusal {
                 "control-only round: the floor is measured, but there is no contender arm to publish"
             ),
             Refusal::UnknownField(name) => write!(f, "field '{name}' was never measured"),
+            // `Marginal` gets its own sentence: it is the one non-publishable cell that holds a
+            // real, resolved effect, so "publishes nothing" without the reason reads as a bug in
+            // the instrument rather than as the finding it is — and the fix (measure it again) is
+            // cheap and specific, not "stabilise something".
+            Refusal::Cell {
+                field,
+                cell: Cell::Marginal,
+            } => write!(
+                f,
+                "field '{field}' is MARGINAL: the effect cleared this round's resolution threshold \
+                 but by less than {:.0}x, and 43.6% of the replicated cells in \
+                 bench/gpu/h100/*.log drifted further BETWEEN rounds than one round's own \
+                 threshold (upper quartile 1.9x; see tools/perf/derive_margin_factor.py). It is a \
+                 LEAD, not a result: re-measure this cell in a second round and publish it if it \
+                 survives",
+                RESOLUTION_MARGIN_FACTOR
+            ),
             Refusal::Cell { field, cell } => {
                 write!(f, "field '{field}' is {cell}, which publishes nothing")
             }
@@ -1246,10 +1445,29 @@ pub fn query_smi() -> Option<SmiSample> {
 pub enum ClockLock {
     /// `nvidia-smi -lgc` applied (root VM). Canonical publication rounds live here.
     Locked(Option<i32>),
+    /// **The lock was attempted and the platform said no**, carrying the driver's own words.
+    ///
+    /// Distinct from [`ClockLock::Unknown`] on purpose, and the distinction is the whole point of
+    /// the variant: `Unknown` means *nobody looked*, `Refused` means *we looked and were told no*.
+    /// A future reader of a round log cannot tell those apart from a blank, and the Modal harness
+    /// was discovering the refusal, printing it to its own stdout, and then letting the round's
+    /// machine-readable provenance line read `UNKNOWN (undeclared)`.
+    Refused(String),
     /// A container (Modal / RunPod / Vast): clocks cannot be locked, so the round is iteration data.
     Unlocked,
     #[default]
     Unknown,
+}
+
+impl ClockLock {
+    /// Is this a clock-locked round — the only class §6.3 calls **publication** data?
+    ///
+    /// One predicate, so the gate, the header and the callers in `gpu.rs` cannot drift apart on
+    /// which variants count. Every non-`Locked` variant answers `false`, including `Refused`: an
+    /// honest account of why the clocks are loose is still loose clocks.
+    pub fn is_locked(&self) -> bool {
+        matches!(self, ClockLock::Locked(_))
+    }
 }
 
 impl fmt::Display for ClockLock {
@@ -1257,29 +1475,111 @@ impl fmt::Display for ClockLock {
         match self {
             ClockLock::Locked(Some(mhz)) => write!(f, "locked at {mhz} MHz (declared)"),
             ClockLock::Locked(None) => write!(f, "locked (declared, no frequency given)"),
+            ClockLock::Refused(why) => write!(
+                f,
+                "REFUSED by the platform ({why}) - attempted, denied; container round, iteration \
+                 data"
+            ),
             ClockLock::Unlocked => {
                 write!(f, "UNLOCKED (declared) - container round, iteration data")
             }
-            ClockLock::Unknown => write!(f, "UNKNOWN (undeclared)"),
+            ClockLock::Unknown => write!(f, "UNKNOWN (undeclared) - NOBODY LOOKED"),
         }
     }
 }
 
-/// Parse `WUKONG_GPU_CLOCK_LOCK`: `locked:1410`, `locked`, `unlocked`, or anything else -> unknown.
+/// Parse `WUKONG_GPU_CLOCK_LOCK`: `locked:1410`, `locked`, `unlocked`, `refused:<reason>`, or
+/// anything else -> unknown.
+///
+/// The reason after `refused` is kept verbatim (only trimmed), because it is the platform's own
+/// diagnostic and paraphrasing it is how "the current user does not have permission to change
+/// clocks" becomes "clocks unavailable" becomes "we did not lock the clocks" becomes nothing.
+///
+/// **`locked` is matched exactly, or with a `:`/`=` and digits — never as a bare prefix.** It used
+/// to be `strip_prefix("locked")`, so `lockedX`, `locked-ish` and `locked? Modal said no` all
+/// parsed as `Locked(None)`: the frequency parse failed and `.ok()` swallowed it. That was harmless
+/// while the value was decoration. Now that [`Round::gate`] refuses an unlocked round, a lax parse
+/// IS a publication decision, and it failed in the flattering direction. A malformed declaration
+/// must read as `Unknown` — nobody looked.
 pub fn parse_clock_lock(v: &str) -> ClockLock {
-    let v = v.trim().to_ascii_lowercase();
-    if let Some(rest) = v.strip_prefix("locked") {
-        let mhz = rest
-            .trim_start_matches([':', '='])
-            .trim()
-            .parse::<i32>()
-            .ok();
-        return ClockLock::Locked(mhz);
+    let raw = v.trim();
+    let lower = raw.to_ascii_lowercase();
+    if lower == "locked" {
+        return ClockLock::Locked(None);
     }
-    if v == "unlocked" {
+    if let Some(rest) = lower
+        .strip_prefix("locked:")
+        .or(lower.strip_prefix("locked="))
+    {
+        // A frequency that does not parse is a malformed declaration, not a lock without a number.
+        return match rest.trim().parse::<i32>() {
+            Ok(mhz) => ClockLock::Locked(Some(mhz)),
+            Err(_) => ClockLock::Unknown,
+        };
+    }
+    if lower == "unlocked" {
         return ClockLock::Unlocked;
     }
+    // Case-folded prefix test, but the reason is sliced out of the ORIGINAL so the driver's
+    // capitalisation survives. `to_ascii_lowercase` is length-preserving, so the index transfers.
+    if lower.starts_with("refused") {
+        let why = raw["refused".len()..]
+            .trim_start_matches([':', '='])
+            .trim()
+            .to_string();
+        return ClockLock::Refused(if why.is_empty() {
+            "no reason given".to_string()
+        } else {
+            why
+        });
+    }
     ClockLock::Unknown
+}
+
+/// `WUKONG_GPU_ITERATION_DATA` — the operator's explicit declaration that this round is
+/// **iteration data, not publication data** (`GPU_RETARGET_PLAN.md` §6.3).
+///
+/// Set it and a round whose clocks are not locked will still mint numbers; leave it unset and that
+/// round publishes nothing at all. It is deliberately an *opt-in to a weaker claim* rather than an
+/// opt-out of a check, and it is deliberately not set by `tools/cloud/modal_app.py` by default: the
+/// operator declares it on the invocation (`::bench --iteration-data`), so the declaration is part
+/// of the command that produced the log rather than a default nobody re-reads.
+pub const ITERATION_DATA_ENV: &str = "WUKONG_GPU_ITERATION_DATA";
+
+/// **What kind of claim this round's numbers are**, and therefore which gates apply to them.
+///
+/// The distinction the `Measured`/`Synthetic` split exists for: a fixture in a unit test invents
+/// its timings, so "were the clocks locked" is not a question about it and refusing it would only
+/// teach the next author to route around the gate. A round built from the operator's environment
+/// *is* a measurement, and §6.3 binds it.
+///
+/// `Synthetic` is the `Default` so a hand-built [`RoundMeta`] cannot forget to say what it is; the
+/// law that stops a real bench from reaching it is
+/// `only_a_device_free_unit_test_may_hand_build_a_round`, which requires every metered (`#[ignore]`d)
+/// round in `gpu.rs` to take its class from [`RoundMeta::from_env`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RoundClass {
+    /// A real, attributed round: [`RoundMeta::from_env`] read the operator's environment and found
+    /// no iteration-data declaration. **The clock-lock gate applies**, so an unlocked round
+    /// publishes nothing.
+    Measured,
+    /// A real round the operator explicitly declared iteration data via [`ITERATION_DATA_ENV`].
+    /// It mints numbers, and its header says in one greppable word that they are leads.
+    Iteration,
+    /// A synthetic fixture: a hand-built [`RoundMeta`] with no operator environment behind it and
+    /// no real clocks to lock.
+    #[default]
+    Synthetic,
+}
+
+impl fmt::Display for RoundClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RoundClass::Measured => write!(f, "measured"),
+            RoundClass::Iteration => write!(f, "iteration"),
+            RoundClass::Synthetic => write!(f, "synthetic"),
+        }
+    }
 }
 
 /// Operator-supplied round metadata: who is renting what, at what price, with what clock policy.
@@ -1289,11 +1589,25 @@ pub struct RoundMeta {
     pub sku: Option<String>,
     pub usd_per_hour: Option<f64>,
     pub clock_lock: ClockLock,
+    /// What kind of claim this round makes — see [`RoundClass`]. Only [`RoundClass::Measured`] is
+    /// subject to the §6.3 clock-lock gate.
+    ///
+    /// **PRIVATE, and that is the gate.** Every other field here is `pub`, and this one was too
+    /// until an adversarial pass pointed out what that costs: a metered bench one module away could
+    /// write `RoundMeta { class: Synthetic, ..RoundMeta::from_env() }`, or assign
+    /// `prov.meta.class` after construction, and skip the clock-lock refusal entirely — while a
+    /// textual law looking for `from_env()` stayed green, because `from_env()` is right there in
+    /// the expression. A grep cannot defend a public field. Outside this module the only producers
+    /// are [`RoundMeta::from_env`] (which reads the operator's environment) and
+    /// [`RoundMeta::default`] (which yields [`RoundClass::Synthetic`], the fixture class), so the
+    /// bypass is now a compile error rather than a law to keep passing.
+    class: RoundClass,
 }
 
 impl RoundMeta {
     /// From `WUKONG_GPU_PROVIDER`, `WUKONG_GPU_SKU`, `WUKONG_GPU_USD_PER_HR`,
-    /// `WUKONG_GPU_CLOCK_LOCK`. All optional; an absent one is printed as `n/a` rather than guessed.
+    /// `WUKONG_GPU_CLOCK_LOCK` and [`ITERATION_DATA_ENV`]. All optional; an absent one is printed
+    /// as `n/a` rather than guessed.
     pub fn from_env() -> Self {
         let s = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Self {
@@ -1303,8 +1617,40 @@ impl RoundMeta {
             clock_lock: s("WUKONG_GPU_CLOCK_LOCK")
                 .map(|v| parse_clock_lock(&v))
                 .unwrap_or_default(),
+            // Reading the environment at all is what makes this round `Measured` rather than
+            // `Synthetic` — the gate binds every round a bench takes, and only fixtures escape it.
+            // This is the ONLY producer of `Measured`/`Iteration`, which is why the field is
+            // private: see `RoundMeta::class`.
+            class: if s(ITERATION_DATA_ENV)
+                .map(|v| declares_iteration_data(&v))
+                .unwrap_or(false)
+            {
+                RoundClass::Iteration
+            } else {
+                RoundClass::Measured
+            },
         }
     }
+
+    /// What class of claim this round makes. The field is private (see [`RoundMeta::class`]); this
+    /// is the read side, which needs no defending.
+    pub fn class(&self) -> RoundClass {
+        self.class
+    }
+}
+
+/// Does this [`ITERATION_DATA_ENV`] value declare the round iteration data?
+///
+/// **An allow-list, not a deny-list.** The first draft here refused `""`/`0`/`false`/`no` and
+/// accepted everything else, which meant `WUKONG_GPU_ITERATION_DATA=off` — and `n`, `disabled`,
+/// `none` — turned the declaration ON. A gate whose escape hatch fires on the value the operator
+/// used to close it is worse than no gate, so the recognised spellings are enumerated and anything
+/// else is not a declaration.
+pub fn declares_iteration_data(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "iteration"
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1328,6 +1674,23 @@ pub struct Provenance {
 }
 
 impl Provenance {
+    /// The operator metadata this round was opened with.
+    ///
+    /// **Read this instead of the field.** `meta` is still `pub`, which leaves two bypasses of the
+    /// §6.3 gate that [`RoundMeta::class`]'s privacy does not reach: `prov.meta = RoundMeta::default()`
+    /// (class -> `Synthetic`, gate skipped) and `prov.meta.clock_lock = ClockLock::Locked(..)`
+    /// (forged publication class for a container round). Both are one line, both compile, and both
+    /// are invisible to `only_a_device_free_unit_test_may_hand_build_a_round`, whose window sees the
+    /// `from_env()` that is still right there in the constructor call.
+    ///
+    /// Closing them means making `meta` private, and the one call site that reads it through the
+    /// field is in `gpu.rs` (`prov.meta.clock_lock`) — owned by another lane this wave. This
+    /// accessor exists so that change is a one-line call-site edit there and a `pub` removal here.
+    /// **HANDOFF.**
+    pub fn meta(&self) -> &RoundMeta {
+        &self.meta
+    }
+
     /// Build the block and run the device check.
     pub fn new(
         round: &str,
@@ -1394,6 +1757,33 @@ impl Provenance {
             self.meta.sku.as_deref().unwrap_or("n/a")
         );
         let _ = writeln!(s, "clock lock     : {}", self.meta.clock_lock);
+        // **§6.3 as one machine-greppable word.** The clock-lock line above is the evidence; this
+        // is the consequence, spelled out so a reader copying a number out of this log cannot miss
+        // which of the two classes it belongs to. `ITERATION` names the env var that produced it,
+        // because a declaration whose origin is invisible is indistinguishable from a default.
+        let _ = writeln!(
+            s,
+            "round class    : {}",
+            match self.meta.class {
+                RoundClass::Synthetic =>
+                    "SYNTHETIC (hand-built RoundMeta, no operator environment) - a fixture, not a \
+                     measurement"
+                        .to_string(),
+                RoundClass::Iteration => format!(
+                    "ITERATION (declared via {ITERATION_DATA_ENV}) - every number below is a LEAD, \
+                     not a published result"
+                ),
+                RoundClass::Measured if self.meta.clock_lock.is_locked() =>
+                    "PUBLICATION (clocks locked)".to_string(),
+                // Not "is unset": after the allow-list narrowing the variable can be SET to
+                // something unrecognised (`y`, `enabled`, `2`) and still refuse, and an operator
+                // told "unset" would go looking in the wrong place.
+                RoundClass::Measured => format!(
+                    "REFUSED (clocks not locked, and {ITERATION_DATA_ENV} is not set to a \
+                     recognised declaration: 1/true/yes/on/iteration) - this round mints no numbers"
+                ),
+            }
+        );
         let _ = writeln!(s, "clocks before  : {}", fmt_smi(self.before.as_ref()));
         s
     }
@@ -1469,6 +1859,15 @@ impl Published {
     pub fn threshold(&self) -> f64 {
         resolution_threshold(Some(self.floor), self.dispersion).unwrap_or(self.floor)
     }
+    /// **How many times [`Published::threshold`] the effect cleared** — see [`margin`].
+    ///
+    /// By construction of [`classify_effect`] this is `<= 1` for a [`Cell::Tie`] and
+    /// `> RESOLUTION_MARGIN_FACTOR` for a [`Cell::Moved`]; the band between them refuses. It is
+    /// printed on every published cell anyway, because "how far clear was it" is the first thing a
+    /// reader of a `%-of-peer` table needs and the last thing the old format told them.
+    pub fn margin(&self) -> f64 {
+        margin(self.ratio - 1.0, self.threshold())
+    }
     pub fn is_tie(&self) -> bool {
         self.cell == Cell::Tie
     }
@@ -1478,12 +1877,17 @@ impl fmt::Display for Published {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} {:.6} -> {:.6}  ({:.4}x, {}, floor +/-{:.2}%, ours +/-{}, median of {})",
+            "{} {:.6} -> {:.6}  ({:.4}x, {}, margin {}, floor +/-{:.2}%, ours +/-{}, median of {})",
             self.field,
             self.baseline,
             self.contender,
             self.ratio,
             self.cell,
+            if self.margin().is_finite() {
+                format!("{:.2}x", self.margin())
+            } else {
+                "inf".to_string()
+            },
             self.floor * 100.0,
             match self.dispersion {
                 Some(d) => format!("{:.2}%", d * 100.0),
@@ -1556,7 +1960,14 @@ impl Round {
     }
 
     /// The round-level half of the gate: device (already enforced at `open`), closure, clock
-    /// evidence at both ends, and drift. Bench-level reasons are checked by [`Round::publish`].
+    /// evidence at both ends, drift, and the §6.3 clock-lock class. Bench-level reasons are checked
+    /// by [`Round::publish`].
+    ///
+    /// **Order is load-bearing.** The clock-*lock* check runs LAST, after every evidence-based
+    /// refusal, because it is the only one an environment variable can switch off: putting it
+    /// first would let `WUKONG_GPU_ITERATION_DATA=1` mask a round that never closed, carried no
+    /// `nvidia-smi` readings, or drifted 22% mid-round. The opt-in buys exactly one thing — a
+    /// weaker claim about the clock policy — and cannot buy silence about a broken measurement.
     pub fn gate(&self) -> Result<(), Refusal> {
         let Some(closed) = self.closed.as_ref() else {
             return Err(Refusal::RoundNotClosed);
@@ -1568,13 +1979,24 @@ impl Round {
             return Err(Refusal::NoClockEvidence("after-the-round"));
         }
         match self.clock_drift() {
-            Some(d) if d > self.prov.drift_bar => Err(Refusal::ClockDrift {
-                drift: d,
-                bar: self.prov.drift_bar,
-            }),
-            Some(_) => Ok(()),
-            None => Err(Refusal::NoClockEvidence("comparable SM")),
+            Some(d) if d > self.prov.drift_bar => {
+                return Err(Refusal::ClockDrift {
+                    drift: d,
+                    bar: self.prov.drift_bar,
+                })
+            }
+            Some(_) => {}
+            None => return Err(Refusal::NoClockEvidence("comparable SM")),
         }
+        // §6.3, enforced. The plan has said "container rounds are iteration data, VM rounds are
+        // publication data" in prose since it was written, and `wgmma_config_sweep` printed a
+        // three-line warning saying so — and then published a table anyway, from which
+        // `102.0% - ABOVE cuBLAS` was copied into CAMPAIGN_CHECKPOINT.md. A sentence a reader may
+        // skip is not a gate.
+        if self.prov.meta.class == RoundClass::Measured && !self.prov.meta.clock_lock.is_locked() {
+            return Err(Refusal::ClocksNotLocked(self.prov.meta.clock_lock.clone()));
+        }
+        Ok(())
     }
 
     /// **The publish gate.** Returns a number only when the round *and* the bench *and* the cell all
@@ -2159,6 +2581,10 @@ mod tests {
     }
 
     /// A verified 4050 round, closed with no drift — the fixture every gate-shape test starts from.
+    ///
+    /// Its `RoundMeta::default()` makes it a [`RoundClass::Synthetic`] round, which is what it is:
+    /// every timing below is invented by the test, so rule 7's clock-lock gate has no clocks to
+    /// judge and does not apply. Rule 7 has its own fixtures further down.
     fn open_ok(name: &str) -> Round {
         let prov = Provenance::new(
             name,
@@ -2413,6 +2839,213 @@ mod tests {
         assert!(p.is_tie());
         assert!(p.dispersion().unwrap() > p.floor());
         assert_eq!(p.threshold(), p.dispersion().unwrap());
+        assert!(
+            p.margin() <= 1.0,
+            "a tie clears no more than 1x by construction: {}",
+            p.margin()
+        );
+    }
+
+    // --- the replication margin -----------------------------------------------------------------
+
+    /// **The band's boundaries, and the arithmetic hole that would have moved one of them.**
+    #[test]
+    fn the_margin_band_runs_from_one_to_the_factor_times_the_threshold() {
+        let th = 0.02;
+        // At and below 1x: a tie. Exactly on the boundary is a tie, matching the pre-existing
+        // `<=` and keeping the change a pure narrowing of `Moved`.
+        assert_eq!(classify_effect(0.0, th), Cell::Tie);
+        assert_eq!(classify_effect(0.02, th), Cell::Tie);
+        assert_eq!(classify_effect(-0.02, th), Cell::Tie);
+        // Just past 1x, and exactly on 2x: marginal. Sign is irrelevant — a regression that only
+        // just clears the noise is no more publishable than a win that only just clears it.
+        assert_eq!(classify_effect(0.0201, th), Cell::Marginal);
+        assert_eq!(classify_effect(-0.0201, th), Cell::Marginal);
+        assert_eq!(classify_effect(0.04, th), Cell::Marginal);
+        assert_eq!(classify_effect(-0.04, th), Cell::Marginal);
+        // Past 2x: a direction.
+        assert_eq!(classify_effect(0.0401, th), Cell::Moved);
+        assert_eq!(classify_effect(-0.5, th), Cell::Moved);
+        // **Both degenerate inputs fail CLOSED, and both were fail-OPEN in the first draft.**
+        // A round that measured no noise has not measured anything, so a nonzero effect against a
+        // zero threshold is not an infinitely resolved move; and a NaN effect compared with `<=`
+        // is false in both directions, so it used to fall through to `Moved` — the most permissive
+        // verdict — and print a margin of `inf`. `Degenerate` is not publishable.
+        for (e, th) in [
+            (0.0, 0.0),
+            (1e-12, 0.0),
+            (0.5, 0.0),
+            (0.03, -0.01),
+            (f64::NAN, 0.02),
+            (f64::INFINITY, 0.02),
+            (0.03, f64::INFINITY),
+            (0.03, f64::NAN),
+        ] {
+            assert_eq!(
+                classify_effect(e, th),
+                Cell::Degenerate,
+                "effect {e} against threshold {th} must not resolve"
+            );
+        }
+        assert!(!Cell::Degenerate.publishable());
+        assert_eq!(margin(0.0, 0.0), 0.0);
+        assert!(margin(1e-12, 0.0).is_infinite());
+        assert!((margin(-0.03, 0.02) - 1.5).abs() < 1e-12);
+    }
+
+    /// A factor of `1.0` or less makes the band empty and silently restores the pre-margin rule
+    /// with every test still green. The constant is derived (see its doc comment); this pins that
+    /// it can never be "tuned" back to a no-op without a failure.
+    #[test]
+    fn the_margin_factor_is_a_real_band() {
+        assert!(
+            RESOLUTION_MARGIN_FACTOR > 1.0 && RESOLUTION_MARGIN_FACTOR.is_finite(),
+            "RESOLUTION_MARGIN_FACTOR = {RESOLUTION_MARGIN_FACTOR} leaves no band, so `Marginal` \
+             is unreachable and the gate is a no-op"
+        );
+        assert_eq!(
+            classify_effect(0.011, 0.01),
+            Cell::Marginal,
+            "the band must be reachable at the factor as configured"
+        );
+    }
+
+    /// **The cell this whole rule was written for**, rebuilt from the medians in
+    /// `bench/gpu/h100/2026-08-12-h100-w3-r2-config-sweep.log:1478` — the
+    /// `w1_mcb_v2_r16_p / sq8192` row that the campaign was about to publish as
+    /// "102.0% — ABOVE cuBLAS". Its effect is -1.99% against a 1.65% threshold: it clears, by
+    /// 0.34 percentage points. Under the old binary rule it printed the word `moved`, identically
+    /// to a cell that cleared by 50x.
+    #[test]
+    fn the_hundred_and_two_percent_cell_is_marginal_and_publishes_nothing() {
+        // A and C are the cuBLAS peer twice; B is ours. Constant A/C vectors are legal here
+        // (`constant` needs A *and* C to agree, and they do not).
+        let s = samples_of(
+            "w1_mcb_v2_r16_p/sq8192",
+            5,
+            &[(
+                "gemm_ms",
+                vec![1.272022; 5],
+                vec![1.264329; 5],
+                // median 1.246756, range 0.020572 -> spread 1.650%, matching the logged cell.
+                vec![1.236470, 1.246700, 1.246756, 1.246800, 1.257042],
+            )],
+        );
+        let v = analyze(&s, DEFAULT_CONTROL_BAR);
+        let f = v.field("gemm_ms").unwrap();
+        assert!(
+            v.blocked.is_none(),
+            "both noises clear the bar: {:?}",
+            v.blocked
+        );
+        assert!(
+            (f.effect.unwrap() + 0.0199).abs() < 5e-5,
+            "effect {:?} must reproduce the logged -1.99%",
+            f.effect
+        );
+        assert!(
+            (f.b_spread.unwrap() - 0.0165).abs() < 5e-5,
+            "spread {:?} must reproduce the logged +1.65%",
+            f.b_spread
+        );
+        // The old rule: it clears the threshold, so it was a `Moved`.
+        assert!(f.effect.unwrap().abs() > f.threshold.unwrap());
+        // The new rule: it clears by 1.21x, inside the band.
+        let m = f.margin().unwrap();
+        assert!((m - 1.204).abs() < 0.01, "margin was {m}");
+        assert_eq!(f.cell, Cell::Marginal);
+        assert!(!f.cell.publishable());
+
+        let round = open_ok("w1_mcb_v2_r16_p/sq8192");
+        let err = round.publish(&v, "gemm_ms").unwrap_err();
+        assert_eq!(
+            err,
+            Refusal::Cell {
+                field: "gemm_ms".to_string(),
+                cell: Cell::Marginal
+            }
+        );
+        // The refusal must name the fix, not just the verdict.
+        let msg = err.to_string();
+        assert!(msg.contains("MARGINAL"), "{msg}");
+        assert!(msg.contains("re-measure"), "{msg}");
+        // ...and the printed cell says so rather than going blank.
+        let cell = round.cell(&v, "gemm_ms");
+        assert!(cell.starts_with("-- ("), "{cell}");
+        assert!(cell.contains("MARGINAL"), "{cell}");
+    }
+
+    /// The sibling cell in the same logged row: `gpt_d4096_up` at -1.60% against 1.67%. It was
+    /// **already** a tie (margin 0.96) and the log said so verbatim, yet
+    /// `CAMPAIGN_CHECKPOINT.md` bolded it as "101.6 - AT/ABOVE cuBLAS". Nothing here changes its
+    /// verdict; it is pinned so the two neighbouring cells' different fates stay visible.
+    #[test]
+    fn the_hundred_and_one_point_six_percent_cell_was_always_a_tie() {
+        let s = samples_of(
+            "w1_mcb_v2_r16_p/gpt_d4096_up",
+            5,
+            &[(
+                "gemm_ms",
+                vec![0.675694; 5],
+                vec![0.673717; 5],
+                // median 0.664859, range 0.011103 -> spread 1.670%.
+                vec![0.659308, 0.664800, 0.664859, 0.664900, 0.670411],
+            )],
+        );
+        let v = analyze(&s, DEFAULT_CONTROL_BAR);
+        let f = v.field("gemm_ms").unwrap();
+        assert!((f.effect.unwrap() + 0.0160).abs() < 5e-5, "{:?}", f.effect);
+        assert_eq!(f.cell, Cell::Tie);
+        let m = f.margin().unwrap();
+        assert!(m < 1.0, "a tie's margin is below 1x: {m}");
+        // A tie IS publishable — as a tie. `100.0 / ratio` on it is 101.6%, and reporting that
+        // number without the word "tie" is the checkpoint defect, not an instrument defect.
+        let round = open_ok("w1_mcb_v2_r16_p/gpt_d4096_up");
+        let p = round
+            .publish(&v, "gemm_ms")
+            .expect("a tie publishes, as a tie");
+        assert!(p.is_tie());
+        assert!((100.0 / p.ratio() - 101.6).abs() < 0.1);
+    }
+
+    /// The margin must reach the reader on every surface that prints a verdict, and the two
+    /// surfaces must agree: a number visible in one place and not the other is how the old
+    /// `B/A-1`-and-`B spread`-but-compute-it-yourself table failed.
+    #[test]
+    fn every_verdict_surface_prints_the_margin_and_they_agree() {
+        let s = samples_of(
+            "surfaces",
+            5,
+            &[
+                ("moved_ms", vec![10.0; 5], vec![10.01; 5], vec![5.0; 5]),
+                ("tie_ms", vec![10.0; 5], vec![10.01; 5], vec![10.005; 5]),
+            ],
+        );
+        let v = analyze(&s, DEFAULT_CONTROL_BAR);
+        let t = v.table();
+        assert!(t.is_ascii(), "{t}");
+        assert!(
+            t.contains("margin"),
+            "the table needs a margin column:\n{t}"
+        );
+        assert!(
+            t.contains("RESOLUTION_MARGIN_FACTOR"),
+            "the table must say what the column means:\n{t}"
+        );
+        let round = open_ok("surfaces");
+        for field in ["moved_ms", "tie_ms"] {
+            let fv = v.field(field).unwrap();
+            let p = round.publish(&v, field).expect("both cells publish");
+            assert!(
+                (p.margin() - fv.margin().unwrap()).abs() < 1e-9,
+                "{field}: Published::margin {} disagrees with FieldVerdict::margin {}",
+                p.margin(),
+                fv.margin().unwrap()
+            );
+            assert!(p.to_string().contains("margin "), "{field}: {p}");
+        }
+        assert!(v.field("moved_ms").unwrap().margin().unwrap() > RESOLUTION_MARGIN_FACTOR);
+        assert!(v.field("tie_ms").unwrap().margin().unwrap() <= 1.0);
     }
 
     /// The instrument's own history: with arms A and C both the peer, the floor is the denominator's
@@ -2997,9 +3630,279 @@ mod tests {
             ClockLock::Locked(Some(1410))
         );
         assert_eq!(parse_clock_lock("LOCKED"), ClockLock::Locked(None));
+        assert_eq!(
+            parse_clock_lock("locked=1980"),
+            ClockLock::Locked(Some(1980))
+        );
         assert_eq!(parse_clock_lock("unlocked"), ClockLock::Unlocked);
         assert_eq!(parse_clock_lock("who knows"), ClockLock::Unknown);
+        // A LAX prefix match used to make all of these `Locked(None)`, which `Round::gate` now
+        // reads as publication data. A malformed declaration must mean nobody looked.
+        for bad in [
+            "lockedX",
+            "locked-ish",
+            "locked? Modal said no",
+            "locked:1980 MHz",
+            "locked:",
+            "unlockedX",
+        ] {
+            assert_eq!(
+                parse_clock_lock(bad),
+                ClockLock::Unknown,
+                "{bad:?} must not parse as a lock"
+            );
+            assert!(!parse_clock_lock(bad).is_locked());
+        }
         assert_eq!(ClockLock::default(), ClockLock::Unknown);
+        assert!(ClockLock::Locked(None).is_locked());
+        assert!(ClockLock::Locked(Some(1410)).is_locked());
+        assert!(!ClockLock::Unlocked.is_locked());
+        assert!(!ClockLock::Unknown.is_locked());
+    }
+
+    /// **"We tried and were refused" is not "nobody looked".** The Modal harness discovers the
+    /// refusal (`nvidia-smi -lgc` -> "The current user does not have permission to change clocks
+    /// for GPU ...") and used to print it only to its own stdout, leaving the round's own
+    /// provenance line reading `UNKNOWN (undeclared)`. This is the parse that closes it, and it
+    /// keeps the platform's wording verbatim rather than paraphrasing it away.
+    #[test]
+    fn a_refused_clock_lock_is_recorded_with_the_platforms_own_words() {
+        let real = "The current user does not have permission to change clocks for GPU \
+                    00000001:1B:00.0.";
+        let got = parse_clock_lock(&format!("refused:{real}"));
+        assert_eq!(got, ClockLock::Refused(real.to_string()));
+        assert!(!got.is_locked());
+        // Case-folding must not eat the reason's own capitalisation.
+        let shown = got.to_string();
+        assert!(shown.contains("REFUSED by the platform"), "{shown}");
+        assert!(shown.contains("The current user"), "{shown}");
+        assert!(shown.contains("iteration data"), "{shown}");
+        // Both separators, and a bare `refused` with nothing after it.
+        assert_eq!(
+            parse_clock_lock("refused=no permission"),
+            ClockLock::Refused("no permission".to_string())
+        );
+        assert_eq!(
+            parse_clock_lock("REFUSED"),
+            ClockLock::Refused("no reason given".to_string())
+        );
+        // ...and it is a DIFFERENT verdict from the undeclared one, which is the entire point.
+        assert_ne!(parse_clock_lock("refused:x"), ClockLock::Unknown);
+        assert!(ClockLock::Unknown.to_string().contains("NOBODY LOOKED"));
+    }
+
+    /// **Rule 7.** An unlocked round publishes nothing, and the escape hatch is an explicit
+    /// declaration of the weaker claim rather than a way to keep the old behaviour.
+    #[test]
+    fn an_unlocked_round_publishes_nothing_unless_it_is_declared_iteration_data() {
+        let s = samples_of(
+            "unlocked",
+            5,
+            &[("ms", vec![10.0; 5], vec![10.01; 5], vec![5.0; 5])],
+        );
+        let v = analyze(&s, DEFAULT_CONTROL_BAR);
+        assert_eq!(
+            v.field("ms").unwrap().cell,
+            Cell::Moved,
+            "the CELL resolves"
+        );
+
+        let round = |lock: ClockLock, class: RoundClass| {
+            let mut r = Round::open(Provenance::new(
+                "unlocked",
+                facts("NVIDIA H100 80GB HBM3", (9, 0), 132),
+                RoundMeta {
+                    clock_lock: lock,
+                    class,
+                    ..RoundMeta::default()
+                },
+                Some(smi(1755.0)),
+            ))
+            .unwrap();
+            r.close(Some(smi(1755.0)));
+            r
+        };
+
+        // Every non-locked variant refuses when nothing is declared -- including `Refused`, which
+        // is an honest account of loose clocks and still loose clocks.
+        for lock in [
+            ClockLock::Unknown,
+            ClockLock::Unlocked,
+            ClockLock::Refused("no permission".into()),
+        ] {
+            let r = round(lock.clone(), RoundClass::Measured);
+            assert_eq!(
+                r.publish(&v, "ms").unwrap_err(),
+                Refusal::ClocksNotLocked(lock.clone()),
+                "{lock} minted a number"
+            );
+            let h = r.header();
+            assert!(h.contains("round class    : REFUSED"), "{h}");
+            assert!(h.contains("THIS ROUND PUBLISHES NOTHING"), "{h}");
+            // The refusal must name BOTH ways out, or it becomes a wall rather than a gate.
+            let msg = Refusal::ClocksNotLocked(lock).to_string();
+            assert!(msg.contains("nvidia-smi -lgc"), "{msg}");
+            assert!(msg.contains(ITERATION_DATA_ENV), "{msg}");
+        }
+
+        // Declared iteration data: the number exists, and the header says what class it is.
+        let declared = round(ClockLock::Unlocked, RoundClass::Iteration);
+        assert!(declared.publish(&v, "ms").is_ok());
+        let h = declared.header();
+        assert!(h.contains("round class    : ITERATION"), "{h}");
+        assert!(h.contains(ITERATION_DATA_ENV), "{h}");
+        assert!(h.contains("is a LEAD, not a published result"), "{h}");
+        assert!(h.contains("publish gate   : OPEN"), "{h}");
+
+        // A locked round is publication data and says so without any declaration.
+        let locked = round(ClockLock::Locked(Some(1755)), RoundClass::Measured);
+        assert!(locked.publish(&v, "ms").is_ok());
+        assert!(locked.header().contains("round class    : PUBLICATION"));
+
+        // A synthetic fixture is not subject to a gate about clocks it never had, and says so.
+        let synthetic = round(ClockLock::Unknown, RoundClass::Synthetic);
+        assert!(synthetic.publish(&v, "ms").is_ok());
+        let h = synthetic.header();
+        assert!(h.contains("round class    : SYNTHETIC"), "{h}");
+        assert!(h.contains("a fixture, not a measurement"), "{h}");
+    }
+
+    /// **The escape hatch buys exactly one thing.** `WUKONG_GPU_ITERATION_DATA=1` weakens the claim
+    /// about clock policy; it must not also silence a round that never closed, carried no
+    /// `nvidia-smi` reading, or drifted. That is why the lock check is last in [`Round::gate`].
+    #[test]
+    fn declaring_iteration_data_cannot_mask_a_broken_measurement() {
+        let s = samples_of(
+            "masked",
+            5,
+            &[("ms", vec![10.0; 5], vec![10.01; 5], vec![5.0; 5])],
+        );
+        let v = analyze(&s, DEFAULT_CONTROL_BAR);
+        let prov = |before: Option<SmiSample>| {
+            Provenance::new(
+                "masked",
+                facts("NVIDIA H100 80GB HBM3", (9, 0), 132),
+                RoundMeta {
+                    clock_lock: ClockLock::Unlocked,
+                    class: RoundClass::Iteration,
+                    ..RoundMeta::default()
+                },
+                before,
+            )
+        };
+
+        let never_closed = Round::open(prov(Some(smi(1755.0)))).unwrap();
+        assert_eq!(
+            never_closed.publish(&v, "ms").unwrap_err(),
+            Refusal::RoundNotClosed
+        );
+
+        let mut no_readings = Round::open(prov(None)).unwrap();
+        no_readings.close(Some(smi(1755.0)));
+        assert!(matches!(
+            no_readings.publish(&v, "ms").unwrap_err(),
+            Refusal::NoClockEvidence(_)
+        ));
+
+        let mut drifted = Round::open(prov(Some(smi(1755.0)))).unwrap();
+        drifted.close(Some(smi(1200.0))); // -32%
+        assert!(matches!(
+            drifted.publish(&v, "ms").unwrap_err(),
+            Refusal::ClockDrift { .. }
+        ));
+    }
+
+    /// The opt-in is parsed from the environment as an opt-in, not as a presence test: a gate whose
+    /// escape hatch fires on `=0` is worse than no gate, because the operator believes it is on.
+    #[test]
+    fn the_iteration_data_declaration_is_off_for_the_values_that_mean_off() {
+        // The allow-list is the point. The first draft was a DENY-list of ""/0/false/no, under
+        // which `=off` -- the most natural way to write "no" -- turned the declaration ON.
+        for off in [
+            "", "0", "false", "FALSE", "no", " no ", "off", "OFF", "n", "disabled", "none",
+            "unset", "nope",
+        ] {
+            assert!(
+                !declares_iteration_data(off),
+                "{off:?} must NOT declare iteration data"
+            );
+        }
+        for on in ["1", "true", "yes", "on", "iteration", " TRUE "] {
+            assert!(
+                declares_iteration_data(on),
+                "{on:?} must declare iteration data"
+            );
+        }
+        assert_eq!(ITERATION_DATA_ENV, "WUKONG_GPU_ITERATION_DATA");
+        // A hand-built RoundMeta is a fixture until something says otherwise; only `from_env`
+        // promotes a round to `Measured`, which is what the source law below relies on.
+        assert_eq!(RoundMeta::default().class, RoundClass::Synthetic);
+    }
+
+    /// **Defence in depth over [`RoundClass::Synthetic`], which is `Default` and skips the gate.**
+    ///
+    /// The real defence is the type: `RoundMeta::class` is a private field, so outside this module
+    /// the only producers are `from_env()` (the operator's environment) and `default()` (the
+    /// fixture class), and the two bypasses an adversarial pass found —
+    /// `RoundMeta { class: Synthetic, ..RoundMeta::from_env() }` and a post-construction
+    /// `prov.meta.class = ..` — are now compile errors rather than laws to keep passing.
+    ///
+    /// This scan is the second line: **every round-opening site in `gpu.rs` must take its metadata
+    /// from `RoundMeta::from_env()`, unless its enclosing function is a plain `#[test]`** — i.e. a
+    /// device-free unit test rather than one of the `#[ignore]`d benches that mint the campaign's
+    /// numbers. It still catches a new bench reaching for `RoundMeta::default()`, which compiles
+    /// fine and would skip the gate. The `#[test]`-vs-`#[ignore]` cut is this crate's own
+    /// convention (`CLAUDE.md`: "sweeps and benches are `#[ignore]`d; correctness gates are not"),
+    /// which is what makes it a property rather than a name list.
+    #[test]
+    fn only_a_device_free_unit_test_may_hand_build_a_round() {
+        let src = include_str!("gpu.rs");
+        let mut sites = 0usize;
+        let mut exempt = 0usize;
+        // `open_round` is the documented adoption path and takes `from_env()` itself, so it counts
+        // toward the corpus floor. Otherwise migrating the three benches onto it -- the change this
+        // module recommends -- would empty the corpus and fail the law for doing the right thing.
+        for (at, _) in src
+            .match_indices("Provenance::new(")
+            .chain(src.match_indices("open_round("))
+        {
+            sites += 1;
+            let window: String = src[at..].lines().take(10).collect::<Vec<_>>().join("\n");
+            if window.contains("RoundMeta::from_env()") || window.contains("open_round(") {
+                continue;
+            }
+            // Not from the environment: the enclosing function must be a plain `#[test]`. The
+            // anchor is indent-agnostic (`rfind("    fn ")` walked PAST a bench nested one module
+            // deeper, landing on some earlier 4-space `#[test]` and exempting it).
+            let fn_at = src[..at]
+                .rfind("fn ")
+                .and_then(|i| src[..i].rfind('\n'))
+                .expect("a round opened outside any function");
+            let attrs: String = src[..fn_at]
+                .lines()
+                .rev()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                attrs.contains("#[test]") && !attrs.contains("#[ignore"),
+                "gpu.rs: the round opened at byte {at} does not take RoundMeta::from_env(), and \
+                 its enclosing function is not a plain #[test]. A metered round must take its \
+                 class from the operator's environment or it skips the clock-lock gate entirely \
+                 (RoundClass::Synthetic is Default). Attributes seen:\n{attrs}"
+            );
+            exempt += 1;
+        }
+        assert!(
+            sites >= 4,
+            "only {sites} round-opening sites found in gpu.rs — the scan lost its corpus, and a \
+             law with no corpus passes vacuously"
+        );
+        assert!(
+            exempt <= 1,
+            "{exempt} hand-built rounds in gpu.rs; the synthetic-wiring unit test is the only one \
+             that should exist"
+        );
     }
 
     /// The header carries every §6.1 item, is emitted by the harness rather than a shell wrapper,
@@ -3015,6 +3918,7 @@ mod tests {
                 sku: Some("H100".into()),
                 usd_per_hour: Some(3.95),
                 clock_lock: ClockLock::Unlocked,
+                class: RoundClass::Iteration,
             },
             Some(smi(1755.0)),
         ))
