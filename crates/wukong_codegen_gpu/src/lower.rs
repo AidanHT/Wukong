@@ -4565,7 +4565,7 @@ mod tests {
 
         // A parameterless `main` (the megakernel entry requires no params) with a loop, integer
         // arithmetic and a print — enough MIR that both emitters walk their real emission tables.
-        const SRC: &str = r#"module gate
+        const SCALAR: &str = r#"module gate
 
 fn main() -> i32 {
     let mut s: i32 = 0;
@@ -4579,35 +4579,66 @@ fn main() -> i32 {
 }
 "#;
 
-        for opt in [0u8, 3u8] {
-            let (program, mut interner) =
-                build(SRC, opt).expect("the floor probe program must compile");
-            let entry = interner.intern("main");
-            let modules = [
-                ("emit_ptx", emit_ptx(&program, entry, &interner)),
-                ("emit_mega_ptx", emit_mega_ptx(&program, entry, &interner)),
-            ];
-            for (what, res) in modules {
-                let ptx = res.unwrap_or_else(|e| panic!("{what}@O{opt}: lowering failed: {e}"));
-                assert!(
-                    ptx.starts_with(HDR_SM80),
-                    "{what}@O{opt}: must open with HDR_SM80 (`.version 7.8` / `.target sm_80`), got: {:?}",
-                    ptx.lines().take(3).collect::<Vec<_>>()
-                );
-                assert!(
-                    ptx.contains(TARGET_SM80),
-                    "{what}@O{opt}: lost the sm_80 floor"
-                );
-                assert!(
-                    !ptx.contains(TARGET_SM89),
-                    "{what}@O{opt}: `{TARGET_SM89}` loads on zero A100s and nothing here needs Ada"
-                );
-                assert!(
-                    !ptx.contains(".version 8.4"),
-                    "{what}@O{opt}: `.version 8.4` demands driver r550+; this instruction mix \
-                     (generic scalar PTX, `bar.sync`, `red.f32`, one `atom.global.add`) needs \
-                     nothing above ISA 7.0"
-                );
+        // And a `@parallel` elementwise nest, which is what walks the two emission paths added in
+        // Phase 1: the lane-wise SIMD emitters (`mir_build` vectorizes this loop) and the grid-stride
+        // `wukong_parallel_for` arm, whose `%nctaid.x` read, `min.s64` and `div.u64` are all
+        // pre-Ampere — asserted here rather than assumed, because this gate's whole reason for
+        // existing is that an over-declared floor JITs perfectly on the Ada card the corpus runs on
+        // and loads on zero A100s.
+        const PARALLEL: &str = r#"module gate_par
+@parallel
+fn main() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    let mut y: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = (i as f32) * 2.0; }
+    for i in 0..64 {
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }
+    print(y[63] as i32);
+    return 0;
+}
+"#;
+
+        for (probe, src) in [("scalar", SCALAR), ("parallel", PARALLEL)] {
+            for opt in [0u8, 3u8] {
+                let (program, mut interner) =
+                    build(src, opt).expect("the floor probe program must compile");
+                let entry = interner.intern("main");
+                let modules = [
+                    ("emit_ptx", emit_ptx(&program, entry, &interner)),
+                    ("emit_mega_ptx", emit_mega_ptx(&program, entry, &interner)),
+                ];
+                for (what, res) in modules {
+                    // A decline is not this gate's business (the corpus floors own coverage), but a
+                    // module that IS emitted must open at the floor.
+                    let ptx = match res {
+                        Ok(p) => p,
+                        Err(e) if e.starts_with(UNSUPPORTED) => continue,
+                        Err(e) => panic!("{probe}/{what}@O{opt}: lowering failed: {e}"),
+                    };
+                    assert!(
+                        ptx.starts_with(HDR_SM80),
+                        "{probe}/{what}@O{opt}: must open with HDR_SM80 (`.version 7.8` / \
+                         `.target sm_80`), got: {:?}",
+                        ptx.lines().take(3).collect::<Vec<_>>()
+                    );
+                    assert!(
+                        ptx.contains(TARGET_SM80),
+                        "{probe}/{what}@O{opt}: lost the sm_80 floor"
+                    );
+                    assert!(
+                        !ptx.contains(TARGET_SM89),
+                        "{probe}/{what}@O{opt}: `{TARGET_SM89}` loads on zero A100s and nothing \
+                         here needs Ada"
+                    );
+                    assert!(
+                        !ptx.contains(".version 8.4"),
+                        "{probe}/{what}@O{opt}: `.version 8.4` demands driver r550+; this \
+                         instruction mix (generic scalar PTX, `bar.sync`, `red.f32`, one \
+                         `atom.global.add`) needs nothing above ISA 7.0"
+                    );
+                }
             }
         }
     }
