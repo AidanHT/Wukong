@@ -359,6 +359,21 @@ faults:
 - `E0504` — a tensor type named a dimension that is not a declared generic parameter, an integer
   literal, `?`, or a `const` (reported with a did-you-mean hint against the nearest declared generic).
 
+**A shape error names what disagrees.** The primary message carries the dimension and both values,
+so the fix is readable without opening the callee:
+
+```
+error[E0502]: dimension mismatch on `K` (axis 0): expected 512, found 513
+error[E0501]: tensor rank mismatch: expected rank 2 [M, N], found rank 3 [4, 4, 4]
+error[E0501]: index 5 is out of bounds for axis 1 of length 2
+```
+
+The name is the one the *declared* signature wrote (`K`), and the axis is 0-based; a dimension with
+no declared name is reported as `axis 1`. Where there is no single dimension to name — a rank
+mismatch, an index-count mismatch, an array-to-tensor decay, an element-type or layout mismatch —
+the message names the ranks, the shapes, or the layout instead. The same text reaches tooling
+verbatim as the `message` field of `--error-format=json`, alongside the unchanged `code`.
+
 Run `wukongc --explain E0502` for a worked example. Dimensions may be integer literals, a declared
 symbolic generic name, the name of a top-level `const`, or `?` for a runtime dimension. A `const` dim
 resolves to its integer **value**, so it is a fixed dimension like a literal — `const D: usize = 3;
