@@ -30,11 +30,19 @@
 //!
 //! Recognized ops (matmul / vmath / norm / reduce / `@parallel`) *are* lowered here: `rt_helper` maps
 //! each recognized `wukong_*` runtime symbol — and its `_parallel` twin — to an `mrt_*` PTX `.func`
-//! reproducing the CPU microkernel's numeric contract as a naive single-thread device loop, and
-//! `wukong_parallel_for(n, func_addr F, ctx)` lowers to the single sequential chunk `F(0, n, ctx)`
-//! (correct because the outlined body is chunk-decomposable; grid-stride parallelism is a later
-//! performance increment, and the *cooperative* forms of these ops are emitted by `lower_call_mega`
-//! in mega mode, which [`crate::megakernel`] drives).
+//! reproducing the CPU microkernel's numeric contract as a naive single-thread device loop. The
+//! *cooperative* forms are emitted by `lower_call_mega` in mega mode, which [`crate::megakernel`]
+//! drives — including `wukong_parallel_for(n, func_addr F, ctx)`, which lowers there as a
+//! **grid-stride loop** over the outlined body
+//! ([`emit_parallel_for_gridstride`](FnEmit::emit_parallel_for_gridstride)). On the single-thread
+//! path the same op stays the one sequential chunk `F(0, n, ctx)`: that kernel is launched with one
+//! thread, so there is no other thread to give the iterations to, and it remains the correctness
+//! reference every mega run is compared against.
+//!
+//! Vectorized (`<N x T>`) MIR is lowered by scalarizing each value into one register per lane
+//! (`lower_vec_inst`, plus lane-wise block-param edges), so the portable SIMD the CPU loop vectorizer
+//! emits reaches the device. `Op::VecKernelCall` — the *other* vectorizer output, a raw-AVX2 Win64
+//! microkernel recipe — has no PTX analogue and stays a decline.
 //! A symbol with no helper — and an op code the helper does not implement — returns a classifiable
 //! `UNSUPPORTED:` error so the coverage gate reports it honestly as not-yet-covered. The headline for
 //! this phase is **coverage measured against the interpreter oracle**, never an asserted speed.
@@ -1852,8 +1860,13 @@ impl<'a> FnEmit<'a> {
             // `wukong_parallel_for(n, func_addr F, ctx)`: the @parallel outliner splits `[0,n)` into
             // per-core chunks and runs `F(lo, hi, ctx)` on each. The chunking is deterministic and the
             // outlined body is chunk-decomposable, so a single sequential chunk `F(0, n, ctx)` gives
-            // the same result as the interpreter (serial == parallel). (Grid-stride parallelism is a
-            // later performance increment; this is the correct, general lowering.)
+            // the same result as the interpreter (serial == parallel).
+            //
+            // This path is the ONE-THREAD kernel (`run_on_device` launches 1x1), so the sequential
+            // chunk is not a missing optimization here — there is no second thread to give iterations
+            // to. The parallel form is `emit_parallel_for_gridstride` in mega mode, where the launch
+            // really is a block of threads; a program mega declines falls back here, and this
+            // lowering is what that fallback (and the differential gate) rests on.
             "wukong_parallel_for" if args.len() == 3 => {
                 let sym = self.func_addr_of.get(&args[1].0).copied().ok_or_else(|| {
                     format!("{UNSUPPORTED} wukong_parallel_for target is not a func_addr")
@@ -4921,7 +4934,17 @@ fn main() -> i32 {
     /// two cards now agree on one constant. The remaining 122 declines are honest `UNSUPPORTED`,
     /// dominated by not-yet-lowered `wukong_*` runtime kernel calls. Raise this whenever coverage
     /// grows; lower it ONLY in the same commit as the intentional decline, and say why here.
-    const RUN_CORPUS_COVERAGE_FLOOR: usize = 235;
+    ///
+    /// **2026-08-13, raised 235 -> 256** (RTX 4050 / Windows, same box and the same
+    /// three-way agreement: this device gate reads 256, the device-free sweep above reads 256
+    /// lowerable, and the host-native re-sweep still attributes its whole delta to the host CPU
+    /// vectorizer). +17 over the 239 the branch point measured on a 361-program corpus, from Phase 1
+    /// SIMD lowering: `Op::ExtractLane` and vector block params were the last two portable-SIMD
+    /// holes, and a vectorized function that hit either skipped the device entirely. One of the +17
+    /// is `lang_parallel_saxpy`, added in the same series. The remaining 106 declines are honest
+    /// `UNSUPPORTED` — still dominated by not-yet-lowered `wukong_*` kernels, plus `GlobalAddr`
+    /// (string data), `wukong_rt_alloc` (heap) and `print_u`.
+    const RUN_CORPUS_COVERAGE_FLOOR: usize = 256;
 
     /// The corpus directory both coverage gates and the invariance gate below sweep.
     fn corpus_files() -> Vec<PathBuf> {

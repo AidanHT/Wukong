@@ -19,7 +19,8 @@
 //! `WUKONG_GPU_DUMP_PTX` to have [`decline`] print *which* of the three reasons it was), and the existing
 //! offload `--backend=gpu` path and plain `cargo test` are untouched. The megakernel is the spine the
 //! op-graph fusion ([`crate::fusion`]) and the resident-chain comparison ([M13]) build on; GEMM, vmath
-//! and norm now have chunked-cooperative bodies (see `lower::lower_call_mega`), so what remains for
+//! and norm have chunked-cooperative bodies and the generic `@parallel` outline
+//! (`wukong_parallel_for`) has a grid-stride one (see `lower::lower_call_mega`), so what remains for
 //! later increments is cooperative bodies for the leftover ops (axpby, the bf16/f16 reductions).
 //!
 //! ## The multi-CTA increment (this module's launch layer)
@@ -631,7 +632,16 @@ pub(crate) mod tests {
     /// configs normalized against 87 host-native on this Win64 box, which is what attributes the +3
     /// to the host CPU vectorizer rather than to the megakernel. Raise it whenever coverage grows;
     /// lower it ONLY in the same commit as the intentional decline, with the reason.
-    pub(crate) const MEGA_CORPUS_COVERAGE_FLOOR: usize = 90;
+    ///
+    /// **2026-08-13, raised 90 -> 104** (RTX 4050 / Windows): this gate reads **104 ran / 110
+    /// eligible**, and the device-free sweep counts 104 mega-lowerable normalized against 100
+    /// host-native, so the +4 there is still the host CPU vectorizer and nothing here. +10 over the
+    /// 94 the branch point measured, from two Phase 1 changes: portable-SIMD lowering
+    /// (`Op::ExtractLane`, vector block params) stopped declining vectorized entries, and
+    /// `fusion::analyze` now admits a `wukong_parallel_for` outline as cooperative work. Eligible
+    /// grew only 107 -> 110, so most of the +10 is configs that were already eligible and declining
+    /// at emission: the gap between `eligible` and `ran` closed from 13 to 6.
+    pub(crate) const MEGA_CORPUS_COVERAGE_FLOOR: usize = 104;
 
     /// Every **megakernel-eligible** `tests/run` program, run through the cooperative megakernel,
     /// matches the interpreter oracle (tolerance for floats, exact otherwise) at both -O0 and -O3.
