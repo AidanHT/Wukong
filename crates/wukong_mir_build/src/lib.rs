@@ -8343,21 +8343,7 @@ impl FnLowerer<'_> {
 
     /// Is `stmt` exactly `i += 1` / `i = i + 1` / `i = 1 + i` (a unit increment of `i`)?
     fn is_unit_incr(&self, stmt: &Stmt, i: Symbol) -> bool {
-        let StmtKind::Assign { target, op, value } = &stmt.kind else {
-            return false;
-        };
-        if single_path(target) != Some(i) {
-            return false;
-        }
-        let is_one = |e: &Expr| matches!(&e.kind, ExprKind::Int(t) if parse_int(self.interner.resolve(*t)) == 1);
-        match op {
-            ast::AssignOp::Add => is_one(value),
-            ast::AssignOp::Assign => matches!(&value.kind,
-                ExprKind::Binary { op: ast::BinOp::Add, lhs, rhs }
-                    if (single_path(lhs) == Some(i) && is_one(rhs))
-                        || (single_path(rhs) == Some(i) && is_one(lhs))),
-            _ => false,
-        }
+        stmt_is_unit_incr(stmt, i, self.interner)
     }
 
     fn lower_while(&mut self, label: Option<Symbol>, cond: &Expr, body: &Block) {
@@ -21879,9 +21865,315 @@ fn offset_invariant(off: &[&Expr], vars: &[Symbol]) -> bool {
         .all(|t| vars.iter().all(|&v| !expr_mentions(t, v)))
 }
 
+/// Is `stmt` exactly `i += 1` / `i = i + 1` / `i = 1 + i` (a unit increment of `i`)?
+fn stmt_is_unit_incr(stmt: &Stmt, i: Symbol, interner: &Interner) -> bool {
+    let StmtKind::Assign { target, op, value } = &stmt.kind else {
+        return false;
+    };
+    if single_path(target) != Some(i) {
+        return false;
+    }
+    let is_one =
+        |e: &Expr| matches!(&e.kind, ExprKind::Int(t) if parse_int(interner.resolve(*t)) == 1);
+    match op {
+        ast::AssignOp::Add => is_one(value),
+        ast::AssignOp::Assign => matches!(&value.kind,
+            ExprKind::Binary { op: ast::BinOp::Add, lhs, rhs }
+                if (single_path(lhs) == Some(i) && is_one(rhs))
+                    || (single_path(rhs) == Some(i) && is_one(lhs))),
+        _ => false,
+    }
+}
+
+fn match_let_int_zero(s: &Stmt, interner: &Interner) -> Option<Symbol> {
+    let StmtKind::Let {
+        pat,
+        init: Some(init),
+        ..
+    } = &s.kind
+    else {
+        return None;
+    };
+    let ast::PatKind::Ident(sym) = &pat.kind else {
+        return None;
+    };
+    (as_int_lit(init, interner)? == 0).then_some(*sym)
+}
+
+fn match_let_float_zero(s: &Stmt, interner: &Interner) -> Option<Symbol> {
+    let StmtKind::Let {
+        pat,
+        init: Some(init),
+        ..
+    } = &s.kind
+    else {
+        return None;
+    };
+    let ast::PatKind::Ident(sym) = &pat.kind else {
+        return None;
+    };
+    is_float_zero(init, interner).then_some(*sym)
+}
+
+/// The two independent spatial loops of an `ijk` nest: `for v1 in 0..B1 { for v2 in 0..B2 { … } }`.
+/// Either `(v1, v2) = (i, j)` or `(j, i)` — [`ijk_either_order`] decides which is the output row.
+fn match_two_spatial_fors<'a>(
+    pat: &Pattern,
+    iter: &ForIter,
+    body: &'a Block,
+    interner: &Interner,
+) -> Option<(Symbol, Dim, Symbol, Dim, &'a Block)> {
+    let v1 = match &pat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (start, end) = range_bounds(iter)?;
+    if as_int_lit(start, interner)? != 0 {
+        return None;
+    }
+    let b1 = as_dim(end, interner)?;
+    if body.tail.is_some() || body.stmts.len() != 1 {
+        return None;
+    }
+    let (ipat, iiter, ibody) = fusable_for(&body.stmts[0])?;
+    let v2 = match &ipat.kind {
+        ast::PatKind::Ident(s) => *s,
+        _ => return None,
+    };
+    let (js, je) = range_bounds(iiter)?;
+    if as_int_lit(js, interner)? != 0 {
+        return None;
+    }
+    let b2 = as_dim(je, interner)?;
+    Some((v1, b1, v2, b2, ibody))
+}
+
+/// The contraction loop of an `ijk` nest: `for k in 0..K { body }`, or the equivalent counting
+/// `let mut k = 0; while k < K { body; k += 1 }`. Returns `(kvar, kdim, body_stmts)` — the body
+/// without the unit increment. A labelled while, a non-unit step, or a start other than 0 declines.
+fn match_k_loop<'a>(stmts: &'a [Stmt], interner: &Interner) -> Option<(Symbol, Dim, &'a [Stmt])> {
+    match stmts {
+        [s] => {
+            let (kpat, kiter, kbody) = fusable_for(s)?;
+            let kvar = match &kpat.kind {
+                ast::PatKind::Ident(s) => *s,
+                _ => return None,
+            };
+            let (ks, ke) = range_bounds(kiter)?;
+            if as_int_lit(ks, interner)? != 0 {
+                return None;
+            }
+            let kdim = as_dim(ke, interner)?;
+            if kbody.tail.is_some() {
+                return None;
+            }
+            Some((kvar, kdim, kbody.stmts.as_slice()))
+        }
+        [let_s, while_s] => {
+            let kvar = match_let_int_zero(let_s, interner)?;
+            let StmtKind::While { label, cond, body } = &while_s.kind else {
+                return None;
+            };
+            if label.is_some() {
+                return None;
+            }
+            let ExprKind::Binary {
+                op: ast::BinOp::Lt,
+                lhs,
+                rhs,
+            } = &cond.kind
+            else {
+                return None;
+            };
+            if single_path(lhs) != Some(kvar) || expr_mentions(rhs, kvar) {
+                return None;
+            }
+            let kdim = as_dim(rhs, interner)?;
+            if body.tail.is_some() || body.stmts.is_empty() {
+                return None;
+            }
+            if !stmt_is_unit_incr(body.stmts.last().unwrap(), kvar, interner) {
+                return None;
+            }
+            Some((kvar, kdim, &body.stmts[..body.stmts.len() - 1]))
+        }
+        _ => None,
+    }
+}
+
+/// Peel `c[…] = c[…] + prod` / `c[…] += prod`. When `ct0` is `Some`, the accumulate target must
+/// be that same element (the zero-init). Returns `(target, prod)`.
+fn memacc_prod<'a>(stmt: &'a Stmt, ct0: Option<&Expr>) -> Option<(&'a Expr, &'a Expr)> {
+    let StmtKind::Assign { target, op, value } = &stmt.kind else {
+        return None;
+    };
+    if let Some(ct0) = ct0 {
+        if !exprs_struct_eq(target, ct0) {
+            return None;
+        }
+    }
+    let prod = match op {
+        ast::AssignOp::Add => value,
+        ast::AssignOp::Assign => {
+            let ExprKind::Binary {
+                op: ast::BinOp::Add,
+                lhs,
+                rhs,
+            } = &value.kind
+            else {
+                return None;
+            };
+            if exprs_struct_eq(lhs, target) {
+                rhs
+            } else if exprs_struct_eq(rhs, target) {
+                lhs
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some((target, prod))
+}
+
+/// Build a nest for one assignment of `(row, col) = (i, j)` given the product and the C element.
+#[allow(clippy::too_many_arguments)]
+fn ijk_try_order<'a>(
+    row: Symbol,
+    jvar: Symbol,
+    kvar: Symbol,
+    m: Dim,
+    n: Dim,
+    kdim: Dim,
+    prod: &'a Expr,
+    ct: &'a Expr,
+    beta: i64,
+    alpha: Option<AlphaScale>,
+    bias: Option<(Symbol, Vec<&'a Expr>)>,
+    act: u32,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<MatmulNest<'a>> {
+    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
+        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
+    let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
+    let sa_ok = if transposed_a { sa == m } else { sa == kdim };
+    let sb_ok = if transposed { sb == kdim } else { sb == n };
+    if !sa_ok || !sb_ok || sc != n {
+        return None;
+    }
+    let bound = [row, jvar, kvar];
+    if !offset_invariant(&a_off, &bound)
+        || !offset_invariant(&b_off, &bound)
+        || !offset_invariant(&c_off, &bound)
+    {
+        return None;
+    }
+    if a_sym == cbase || b_sym == cbase {
+        return None;
+    }
+    Some(MatmulNest {
+        a: a_sym,
+        b: b_sym,
+        c: cbase,
+        m,
+        k: kdim,
+        n,
+        beta,
+        transposed,
+        transposed_a,
+        a_off,
+        b_off,
+        c_off,
+        alpha,
+        bias,
+        act,
+    })
+}
+
+/// Try `(outer, inner) = (i, j)` then `(j, i)`. The product `A[i,k]*B[j,k]` and store `C[i,j]`
+/// uniquely pick the output row, so a j-outer nest is the same NT GEMM as i-outer.
+#[allow(clippy::too_many_arguments)]
+fn ijk_either_order<'a>(
+    v1: Symbol,
+    v2: Symbol,
+    kvar: Symbol,
+    b1: Dim,
+    b2: Dim,
+    kdim: Dim,
+    prod: &'a Expr,
+    ct: &'a Expr,
+    beta: i64,
+    alpha: Option<AlphaScale>,
+    bias: Option<(Symbol, Vec<&'a Expr>)>,
+    act: u32,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<MatmulNest<'a>> {
+    ijk_try_order(
+        v1,
+        v2,
+        kvar,
+        b1,
+        b2,
+        kdim,
+        prod,
+        ct,
+        beta,
+        alpha,
+        bias.clone(),
+        act,
+        sema,
+        interner,
+    )
+    .or_else(|| {
+        ijk_try_order(
+            v2, v1, kvar, b2, b1, kdim, prod, ct, beta, alpha, bias, act, sema, interner,
+        )
+    })
+}
+
+/// Scalar-temp `ijk` store peel + either loop order. `cv` is the store value (`s`, `alpha·s`,
+/// `bias[j]+s`, or an activation wrapping those).
+#[allow(clippy::too_many_arguments)]
+fn ijk_scalar_either_order<'a>(
+    v1: Symbol,
+    v2: Symbol,
+    kvar: Symbol,
+    b1: Dim,
+    b2: Dim,
+    kdim: Dim,
+    prod: &'a Expr,
+    ct: &'a Expr,
+    cv: &'a Expr,
+    s_sym: Symbol,
+    sema: &SemaResult,
+    interner: &Interner,
+) -> Option<MatmulNest<'a>> {
+    let (cv, act) = peel_epi_act(cv, interner, sema);
+    let try_one = |row: Symbol, jvar: Symbol, m: Dim, n: Dim| {
+        let bound = [row, jvar, kvar];
+        let (alpha, bias) = match match_store_scale(cv, s_sym, &bound, sema, interner) {
+            Some(a) => (a, None),
+            None => (
+                None,
+                Some(match_bias_dot_store(cv, s_sym, jvar, &bound, interner)?),
+            ),
+        };
+        if act != EPI_ACT_IDENTITY && alpha.is_some() {
+            return None;
+        }
+        ijk_try_order(
+            row, jvar, kvar, m, n, kdim, prod, ct, 0, alpha, bias, act, sema, interner,
+        )
+    };
+    try_one(v1, v2, b1, b2).or_else(|| try_one(v2, v1, b2, b1))
+}
+
 /// Try every recognized matmul spelling, in order: the `ikj` accumulate form
 /// ([`match_matmul`]), the `ijk` dot-product form with a scalar accumulator ([`match_matmul_ijk`]),
 /// and the `ijk` form that accumulates straight into `c[i*N+j]` ([`match_matmul_ijk_memacc`]).
+/// `ijk` accepts j-outer/i-inner (independent loop interchange) and a counting `while` k-loop.
 fn recognize_matmul<'a>(
     pat: &Pattern,
     iter: &ForIter,
@@ -22794,63 +23086,19 @@ fn match_matmul_ijk<'a>(
     sema: &SemaResult,
     interner: &Interner,
 ) -> Option<MatmulNest<'a>> {
-    let row = match &pat.kind {
-        ast::PatKind::Ident(s) => *s,
-        _ => return None,
-    };
-    let (start, end) = range_bounds(iter)?;
-    if as_int_lit(start, interner)? != 0 {
+    let (v1, b1, v2, b2, jbody) = match_two_spatial_fors(pat, iter, body, interner)?;
+    // Inner body: [ let s = 0.0; <k-loop>; c[i,j] = s ], where <k-loop> is `for k in 0..K`
+    // or `let mut k = 0; while k < K { …; k += 1 }`.
+    if jbody.tail.is_some() || jbody.stmts.len() < 3 {
         return None;
     }
-    let m = as_dim(end, interner)?;
-    // Outer body is a single `for j` loop.
-    if body.tail.is_some() || body.stmts.len() != 1 {
+    let s_sym = match_let_float_zero(&jbody.stmts[0], interner)?;
+    let store = jbody.stmts.last()?;
+    let (kvar, kdim, kbody) = match_k_loop(&jbody.stmts[1..jbody.stmts.len() - 1], interner)?;
+    if kbody.len() != 1 {
         return None;
     }
-    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
-    let jvar = match &jpat.kind {
-        ast::PatKind::Ident(s) => *s,
-        _ => return None,
-    };
-    let (js, je) = range_bounds(jiter)?;
-    if as_int_lit(js, interner)? != 0 {
-        return None;
-    }
-    let n = as_dim(je, interner)?;
-    // j body: [ let s = 0.0; for k {...}; c[i*N+j] = s ].
-    if jbody.tail.is_some() || jbody.stmts.len() != 3 {
-        return None;
-    }
-    let StmtKind::Let {
-        pat: sp,
-        init: Some(s0),
-        ..
-    } = &jbody.stmts[0].kind
-    else {
-        return None;
-    };
-    let s_sym = match &sp.kind {
-        ast::PatKind::Ident(s) => *s,
-        _ => return None,
-    };
-    if !is_float_zero(s0, interner) {
-        return None;
-    }
-    // The K loop: `for k in 0..K { s = s + A*B; }`.
-    let (kpat, kiter, kbody) = fusable_for(&jbody.stmts[1])?;
-    let kvar = match &kpat.kind {
-        ast::PatKind::Ident(s) => *s,
-        _ => return None,
-    };
-    let (ks, ke) = range_bounds(kiter)?;
-    if as_int_lit(ks, interner)? != 0 {
-        return None;
-    }
-    let kdim = as_dim(ke, interner)?;
-    if kbody.tail.is_some() || kbody.stmts.len() != 1 {
-        return None;
-    }
-    let StmtKind::Assign { target, op, value } = &kbody.stmts[0].kind else {
+    let StmtKind::Assign { target, op, value } = &kbody[0].kind else {
         return None;
     };
     if single_path(target) != Some(s_sym) {
@@ -22859,7 +23107,6 @@ fn match_matmul_ijk<'a>(
     let prod = match op {
         ast::AssignOp::Add => value,
         ast::AssignOp::Assign => {
-            // s = s + A*B
             let ExprKind::Binary {
                 op: ast::BinOp::Add,
                 lhs,
@@ -22878,98 +23125,17 @@ fn match_matmul_ijk<'a>(
     if !is_f32_expr(prod, sema) {
         return None;
     }
-    // The inline `ijk` form tolerates a per-operand base offset (a batch/head index): A, B and C may
-    // each be indexed `… + h*S*D`, the hallmark of a batched matmul (multi-head attention is one
-    // matmul per head). The offsets are peeled off here and applied as pointer GEPs in `emit_sgemm`.
-    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
-        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
-    // Final store: c[i*N + j (+ off)] = s   OR   = alpha·s (a loop-invariant scalar scale, the
-    // attention `QKᵀ/√d` and every scaled projection). The α is peeled off here and folded into the
-    // GEMM writeback by `emit_sgemm` (routing to `wukong_sgemm_nt_alpha`).
     let StmtKind::Assign {
         target: ct,
         op: ast::AssignOp::Assign,
         value: cv,
-    } = &jbody.stmts[2].kind
+    } = &store.kind
     else {
         return None;
     };
-    // The store value is `s` (α = 1), a loop-invariant `alpha·s` (folded into the GEMM writeback), or
-    // the fused-bias form `bias[<invariant offset> + j] + s` (the GPT-2 projection `q = x·Wᵀ + b`, its
-    // bias a runtime-offset slice of a shared weight blob). Bias and α are disjoint store shapes; a
-    // fused bias routes to `wukong_sgemm_nt_epi` in `emit_sgemm`.
-    //
-    // An activation written **into the store** — `c[i,j] = silu(bias[j] + s)`, or the bias-free
-    // `c[i,j] = silu(s)` — is peeled off first and rides the same epilogue kernel. That spelling is
-    // the natural one (a real FFN is written with the activation in the store, not as a separate
-    // follow-up loop) and used to decline the whole nest: `silu(..)` is a `Call`, which is neither the
-    // `Mul` `match_store_scale` wants nor the `Add` `match_bias_dot_store` wants, so BOTH failed and
-    // the entire GEMM fell to a scalar nest. Peeling is strictly additive — a `Call` never matched
-    // either shape before.
-    let (cv, act) = peel_epi_act(cv, interner, sema);
-    let (alpha, bias) = match match_store_scale(cv, s_sym, &[row, jvar, kvar], sema, interner) {
-        Some(a) => (a, None),
-        None => (
-            None,
-            Some(match_bias_dot_store(
-                cv,
-                s_sym,
-                jvar,
-                &[row, jvar, kvar],
-                interner,
-            )?),
-        ),
-    };
-    // DECLINE: `wukong_sgemm_nt_epi` has no α parameter (its `Epilogue::alpha` is pinned to 1.0), so
-    // `c[i,j] = silu(alpha·s)` cannot be fused — accepting it would silently drop the scale. Decline
-    // here rather than in the emitter so the nest can still fall through to a sibling recognizer, and
-    // ultimately to the scalar loop, which computes the scale correctly.
-    if act != EPI_ACT_IDENTITY && alpha.is_some() {
-        return None;
-    }
-    // The output store `c[i*N + j (+ off)] = …` or the shape-typed `c[i, j] = …` (sema-aware).
-    let (cbase, sc, c_off) = match_operand_row_col_off(ct, row, jvar, sema, interner)?;
-    // Normal A's contraction stride is K (`A[i*K+k]`); transposed A's is the output-row count M
-    // (`A[k*M+i]`). Normal B's is N; transposed B's is K.
-    let sa_ok = if transposed_a { sa == m } else { sa == kdim };
-    let sb_ok = if transposed { sb == kdim } else { sb == n };
-    if !sa_ok || !sb_ok || sc != n {
-        return None;
-    }
-    // Every base offset must be invariant in the matmul's own `(i,j,k)` — otherwise it is not a
-    // constant per-call pointer shift and the nest is not a batched matmul. (A plain 2-D matmul has
-    // empty offsets and trivially passes.)
-    let bound = [row, jvar, kvar];
-    if !offset_invariant(&a_off, &bound)
-        || !offset_invariant(&b_off, &bound)
-        || !offset_invariant(&c_off, &bound)
-    {
-        return None;
-    }
-    // A and B may be the *same* array (a Gram matrix `A·Aᵀ`, or self-attention `Q·Kᵀ` with a shared
-    // operand): both sides are read-only, which the kernel packs into separate scratch panels, so it
-    // is safe. Only an input aliasing the output C is a hazard (the blocked kernel writes C in a
-    // different order than the scalar nest reads it).
-    if a_sym == cbase || b_sym == cbase {
-        return None;
-    }
-    Some(MatmulNest {
-        a: a_sym,
-        b: b_sym,
-        c: cbase,
-        m,
-        k: kdim,
-        n,
-        beta: 0,
-        transposed,
-        transposed_a,
-        a_off,
-        b_off,
-        c_off,
-        alpha,
-        bias,
-        act,
-    })
+    ijk_scalar_either_order(
+        v1, v2, kvar, b1, b2, kdim, prod, ct, cv, s_sym, sema, interner,
+    )
 }
 
 /// The **memory-accumulator** `ijk` form — the first matmul anyone writes, accumulating straight
@@ -22987,9 +23153,10 @@ fn match_matmul_ijk<'a>(
 /// this the nest fell through BOTH the GEMM recognizer AND the vectorizer (the loop-carried memory
 /// accumulate defeats it) to fully scalar code — a silent ~2-order-of-magnitude cliff on the most
 /// natural spelling. Strictness mirrors `match_matmul_ijk` exactly: the same product/stride/offset
-/// checks, plus the accumulate target must be structurally the SAME element the zero-init wrote
-/// (`exprs_struct_eq`), pinned to `c[i*N+j]` by `match_operand_row_col_off`. The zero-init is
-/// required (`beta = 0`); no α (the naive form has no scale).
+/// checks, plus — when a zero-init is present — the accumulate target must be structurally the SAME
+/// element it wrote (`exprs_struct_eq`). The zero-init is optional: present => beta = 0, absent =>
+/// beta = 1 (`C += A·Bᵀ`). No α (the naive form has no scale). j-outer/i-inner and a counting
+/// `while` k-loop are the same nest.
 fn match_matmul_ijk_memacc<'a>(
     pat: &Pattern,
     iter: &ForIter,
@@ -22997,131 +23164,55 @@ fn match_matmul_ijk_memacc<'a>(
     sema: &SemaResult,
     interner: &Interner,
 ) -> Option<MatmulNest<'a>> {
-    let row = match &pat.kind {
-        ast::PatKind::Ident(s) => *s,
-        _ => return None,
-    };
-    let (start, end) = range_bounds(iter)?;
-    if as_int_lit(start, interner)? != 0 {
+    let (v1, b1, v2, b2, jbody) = match_two_spatial_fors(pat, iter, body, interner)?;
+    if jbody.tail.is_some() || jbody.stmts.is_empty() {
         return None;
     }
-    let m = as_dim(end, interner)?;
-    // Outer body is a single `for j` loop.
-    if body.tail.is_some() || body.stmts.len() != 1 {
-        return None;
-    }
-    let (jpat, jiter, jbody) = fusable_for(&body.stmts[0])?;
-    let jvar = match &jpat.kind {
-        ast::PatKind::Ident(s) => *s,
-        _ => return None,
-    };
-    let (js, je) = range_bounds(jiter)?;
-    if as_int_lit(js, interner)? != 0 {
-        return None;
-    }
-    let n = as_dim(je, interner)?;
-    // j body: [ c[i*N+j] = 0.0; for k { c[i*N+j] (+)= A*B } ].
-    if jbody.tail.is_some() || jbody.stmts.len() != 2 {
-        return None;
-    }
-    let StmtKind::Assign {
-        target: ct0,
-        op: ast::AssignOp::Assign,
-        value: zv,
-    } = &jbody.stmts[0].kind
-    else {
-        return None;
-    };
-    if !is_float_zero(zv, interner) {
-        return None;
-    }
-    // The K loop: `for k in 0..K { c[i*N+j] = c[i*N+j] + A*B; }` (or `+=`).
-    let (kpat, kiter, kbody) = fusable_for(&jbody.stmts[1])?;
-    let kvar = match &kpat.kind {
-        ast::PatKind::Ident(s) => *s,
-        _ => return None,
-    };
-    let (ks, ke) = range_bounds(kiter)?;
-    if as_int_lit(ks, interner)? != 0 {
-        return None;
-    }
-    let kdim = as_dim(ke, interner)?;
-    if kbody.tail.is_some() || kbody.stmts.len() != 1 {
-        return None;
-    }
-    let StmtKind::Assign { target, op, value } = &kbody.stmts[0].kind else {
-        return None;
-    };
-    // The accumulate target must be the very element the zero-init wrote.
-    if !exprs_struct_eq(target, ct0) {
-        return None;
-    }
-    let prod = match op {
-        ast::AssignOp::Add => value,
-        ast::AssignOp::Assign => {
-            // c[…] = c[…] + A*B (either addend order).
-            let ExprKind::Binary {
-                op: ast::BinOp::Add,
-                lhs,
-                rhs,
-            } = &value.kind
-            else {
-                return None;
-            };
-            if exprs_struct_eq(lhs, ct0) {
-                rhs
-            } else if exprs_struct_eq(rhs, ct0) {
-                lhs
+    // Optional `c[i,j] = 0.0` (beta = 0). Absent, the nest accumulates into whatever C already
+    // holds (beta = 1) — `y[i,j] += a*b` with a caller-zeroed buffer is the usual spelling.
+    let (beta, ct0, k_stmts) = match jbody.stmts.as_slice() {
+        [z, rest @ ..] => {
+            if let StmtKind::Assign {
+                target: ct0,
+                op: ast::AssignOp::Assign,
+                value: zv,
+            } = &z.kind
+            {
+                if is_float_zero(zv, interner) {
+                    (0i64, Some(ct0), rest)
+                } else {
+                    (1i64, None, jbody.stmts.as_slice())
+                }
             } else {
-                return None;
+                (1i64, None, jbody.stmts.as_slice())
             }
         }
         _ => return None,
     };
+    let (kvar, kdim, kbody) = match_k_loop(k_stmts, interner)?;
+    if kbody.len() != 1 {
+        return None;
+    }
+    let (target, prod) = memacc_prod(&kbody[0], ct0)?;
     if !is_f32_expr(prod, sema) {
         return None;
     }
-    let (a_sym, sa, a_off, b_sym, sb, b_off, transposed, transposed_a) =
-        match_product_ab_off(prod, row, kvar, jvar, sema, interner)?;
-    // The output element `c[i*N + j (+ off)]` (or the shape-typed `c[i, j]`).
-    let (cbase, sc, c_off) = match_operand_row_col_off(ct0, row, jvar, sema, interner)?;
-    // Same stride discipline as the `let s` form.
-    let sa_ok = if transposed_a { sa == m } else { sa == kdim };
-    let sb_ok = if transposed { sb == kdim } else { sb == n };
-    if !sa_ok || !sb_ok || sc != n {
-        return None;
-    }
-    let bound = [row, jvar, kvar];
-    if !offset_invariant(&a_off, &bound)
-        || !offset_invariant(&b_off, &bound)
-        || !offset_invariant(&c_off, &bound)
-    {
-        return None;
-    }
-    // An input aliasing the output is doubly disqualifying here: the accumulate WRITES `c` during
-    // the k sweep, so reading a `c`-aliased operand mid-sweep is not a matmul at all.
-    if a_sym == cbase || b_sym == cbase {
-        return None;
-    }
-    Some(MatmulNest {
-        a: a_sym,
-        b: b_sym,
-        c: cbase,
-        m,
-        k: kdim,
-        n,
-        beta: 0,
-        transposed,
-        transposed_a,
-        a_off,
-        b_off,
-        c_off,
-        alpha: None,
-        // The memory-accumulator store is the bare `c[i,j] = c[i,j] + a·b`; there is nothing wrapping
-        // it to peel, so this form never carries a fused activation.
-        act: EPI_ACT_IDENTITY,
-        bias: None,
-    })
+    ijk_either_order(
+        v1,
+        v2,
+        kvar,
+        b1,
+        b2,
+        kdim,
+        prod,
+        target,
+        beta,
+        None,
+        None,
+        EPI_ACT_IDENTITY,
+        sema,
+        interner,
+    )
 }
 
 /// Match the **residual** store value of a fused residual projection:
@@ -28830,5 +28921,304 @@ fn main() -> i32 { return 0; }
         for f in &prog.funcs {
             assert!(verify_function(f).is_empty(), "verify failed");
         }
+    }
+
+    /// The idiomatic 2-D `Y = X·Wᵀ` nest the e2e route already recognizes. The three reach
+    /// spellings below must emit this same symbol (and the same M/K/N) or they are not the
+    /// same kernel.
+    fn linear_nt_src(body: &str) -> String {
+        format!(
+            "module m
+fn linear(x: Tensor[f32, 3, 8], w: Tensor[f32, 6, 8], mut y: Tensor[f32, 3, 6]) {{
+{body}
+}}
+fn main() -> i32 {{ return 0; }}
+"
+        )
+    }
+
+    fn sgemm_nt_args<'a>(
+        prog: &'a Program,
+        interner: &Interner,
+    ) -> Option<(&'a Function, &'a [ValueId])> {
+        for f in &prog.funcs {
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Op::Call { func, args } = &i.op {
+                        if interner.resolve(*func) == "wukong_sgemm_nt" {
+                            return Some((f, args));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn const_i64_of(f: &Function, v: ValueId) -> Option<i128> {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if i.result == Some(v) {
+                    if let Op::ConstInt(n, _) = i.op {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Pin that a recognized NT nest is `wukong_sgemm_nt(a, b, c, 3, 8, 6, beta)`.
+    fn assert_linear_nt(prog: &Program, interner: &Interner, beta: i128, why: &str) {
+        let (f, args) =
+            sgemm_nt_args(prog, interner).unwrap_or_else(|| panic!("{why}: no wukong_sgemm_nt"));
+        assert_eq!(args.len(), 7, "{why}: sgemm_nt arity");
+        assert_eq!(const_i64_of(f, args[3]), Some(3), "{why}: M");
+        assert_eq!(const_i64_of(f, args[4]), Some(8), "{why}: K");
+        assert_eq!(const_i64_of(f, args[5]), Some(6), "{why}: N");
+        assert_eq!(const_i64_of(f, args[6]), Some(beta), "{why}: beta");
+        for func in &prog.funcs {
+            assert!(verify_function(func).is_empty(), "verify failed");
+        }
+    }
+
+    #[test]
+    fn gemm_reach_tensor_ijk_scalar_temp_is_sgemm_nt() {
+        let src = linear_nt_src(
+            "    for i in 0..3 {
+        for j in 0..6 {
+            let mut s: f32 = 0.0;
+            for k in 0..8 {
+                s = s + x[i, k] * w[j, k];
+            }
+            y[i, j] = s;
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_linear_nt(&prog, &interner, 0, "scalar-temp ijk");
+    }
+
+    /// Accumulating straight into `y[i,j]` with no scalar temp and no in-nest zero-init.
+    /// That is `C += A·Bᵀ` (beta = 1). The zero-init spelling already fires; this one did not.
+    #[test]
+    fn gemm_reach_memacc_without_zero_init_is_sgemm_nt() {
+        let src = linear_nt_src(
+            "    for i in 0..3 {
+        for j in 0..6 {
+            for k in 0..8 {
+                y[i, j] = y[i, j] + x[i, k] * w[j, k];
+            }
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_linear_nt(&prog, &interner, 1, "memacc += without zero-init");
+    }
+
+    #[test]
+    fn gemm_reach_memacc_plus_eq_without_zero_init_is_sgemm_nt() {
+        let src = linear_nt_src(
+            "    for i in 0..3 {
+        for j in 0..6 {
+            for k in 0..8 {
+                y[i, j] += x[i, k] * w[j, k];
+            }
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_linear_nt(&prog, &interner, 1, "memacc += op without zero-init");
+    }
+
+    /// A counting `while k < K { s += a*b; k += 1 }` is the same contraction as `for k in 0..K`.
+    #[test]
+    fn gemm_reach_while_k_is_sgemm_nt() {
+        let src = linear_nt_src(
+            "    for i in 0..3 {
+        for j in 0..6 {
+            let mut s: f32 = 0.0;
+            let mut k: i64 = 0;
+            while k < 8 {
+                s = s + x[i, k] * w[j, k];
+                k = k + 1;
+            }
+            y[i, j] = s;
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_linear_nt(&prog, &interner, 0, "while k-loop");
+    }
+
+    /// j-outer / i-inner is a loop interchange of independent `(i,j)` iterations — the same NT GEMM.
+    #[test]
+    fn gemm_reach_j_outer_i_inner_is_sgemm_nt() {
+        let src = linear_nt_src(
+            "    for j in 0..6 {
+        for i in 0..3 {
+            let mut s: f32 = 0.0;
+            for k in 0..8 {
+                s = s + x[i, k] * w[j, k];
+            }
+            y[i, j] = s;
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_linear_nt(&prog, &interner, 0, "j-outer i-inner");
+    }
+
+    #[test]
+    fn gemm_reach_memacc_with_zero_init_still_beta_zero() {
+        let src = linear_nt_src(
+            "    for i in 0..3 {
+        for j in 0..6 {
+            y[i, j] = 0.0;
+            for k in 0..8 {
+                y[i, j] += x[i, k] * w[j, k];
+            }
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_linear_nt(&prog, &interner, 0, "memacc with zero-init");
+    }
+
+    #[test]
+    fn gemm_reach_j_outer_while_k_is_sgemm_nt() {
+        let src = linear_nt_src(
+            "    for j in 0..6 {
+        for i in 0..3 {
+            let mut s: f32 = 0.0;
+            let mut k: i64 = 0;
+            while k < 8 {
+                s = s + x[i, k] * w[j, k];
+                k = k + 1;
+            }
+            y[i, j] = s;
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_linear_nt(&prog, &interner, 0, "j-outer + while k");
+    }
+
+    #[test]
+    fn gemm_reach_j_outer_memacc_add_is_sgemm_nt() {
+        let src = linear_nt_src(
+            "    for j in 0..6 {
+        for i in 0..3 {
+            for k in 0..8 {
+                y[i, j] += x[i, k] * w[j, k];
+            }
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_linear_nt(&prog, &interner, 1, "j-outer + memacc +=");
+    }
+
+    #[test]
+    fn gemm_reach_declines_a_reduction_that_is_not_a_product() {
+        let src = linear_nt_src(
+            "    for i in 0..3 {
+        for j in 0..6 {
+            for k in 0..8 {
+                y[i, j] = y[i, j] + x[i, k];
+            }
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a per-element reduction is not a matmul"
+        );
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a per-element reduction is not a matmul"
+        );
+    }
+
+    #[test]
+    fn gemm_reach_declines_while_k_with_stride() {
+        let src = linear_nt_src(
+            "    for i in 0..3 {
+        for j in 0..6 {
+            let mut s: f32 = 0.0;
+            let mut k: i64 = 0;
+            while k < 8 {
+                s = s + x[i, k] * w[j, k];
+                k = k + 2;
+            }
+            y[i, j] = s;
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a strided while is not for k in 0..K"
+        );
+    }
+
+    #[test]
+    fn gemm_reach_declines_while_k_not_from_zero() {
+        let src = linear_nt_src(
+            "    for i in 0..3 {
+        for j in 0..6 {
+            let mut s: f32 = 0.0;
+            let mut k: i64 = 1;
+            while k < 8 {
+                s = s + x[i, k] * w[j, k];
+                k = k + 1;
+            }
+            y[i, j] = s;
+        }
+    }",
+        );
+        let (prog, diags, interner) = lower(&src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "a while that does not start at 0 is not for k in 0..K"
+        );
+    }
+
+    #[test]
+    fn gemm_reach_declines_input_aliasing_output() {
+        // Square so A and C can be the same buffer; the blocked kernel writes C in a
+        // different order than the scalar nest would re-read it.
+        let src = "module m
+fn linear(w: Tensor[f32, 4, 4], mut y: Tensor[f32, 4, 4]) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + y[i, k] * w[j, k];
+            }
+            y[i, j] = s;
+        }
+    }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
+            "an input aliasing C is not a matmul the blocked kernel can run"
+        );
     }
 }
