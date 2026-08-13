@@ -4246,108 +4246,125 @@ impl FnLowerer<'_> {
             if self.terminated {
                 break;
             }
-            // Epilogue fusion: a `nn.Linear` matmul immediately followed by its bias-add / ReLU loop
-            // folds into one GEMM call with the epilogue applied in the C writeback (no separate pass
-            // over C). Checked before the elementwise fusion below — they match disjoint shapes.
-            if let Some(n) = self.try_fuse_matmul_epilogue(&b.stmts[i..]) {
-                i += n;
-                continue;
-            }
-            // The bf16/f16 twin: a half-precision `nn.Linear` matmul immediately followed by its
-            // bias-add / activation loop folds to one `wukong_sgemm_{bf16,f16}_nt_epi` call — the
-            // mixed-precision transformer FFN. Disjoint from the f32 epilogue above (half inputs, an
-            // `as f32` widen on each factor) and the int8 dequant below (a float matmul, not `u8×i8→i32`).
-            if let Some(n) = self.try_fuse_lowp_matmul_epilogue(&b.stmts[i..]) {
-                i += n;
-                continue;
-            }
-            // int8 GEMM + per-channel dequant epilogue → one fused `wukong_i8gemm_nt_deq` call (the
-            // i32 accumulator is dequanted in registers, never materialized). Structurally disjoint
-            // from the f32 epilogue above (an int8 `u8×i8→i32` nest, not a float matmul).
-            if let Some(n) = self.try_fuse_i8matmul_dequant_epilogue(b, i) {
-                i += n;
-                continue;
-            }
-            // Fused normalization: an idiomatic multi-pass softmax / LayerNorm / RMSNorm over a flat
-            // f32 array folds into one `wukong_norm_f32` call (each row loaded once + 256-bit AVX2).
-            // Checked before the elementwise-fusion run so it sees the raw loop sequence, not a
-            // pre-fused one. The three windows are structurally disjoint (max+exp vs mean+var+shift vs
-            // sum-of-squares+scale), so probe order is immaterial.
-            // log-softmax (6 stmts) is probed before softmax (7 stmts): they share the leading max
-            // pass but diverge at stmt[2] — softmax's is the `exp` rewrite loop, log-softmax's is
-            // `let s = 0` — so the two matchers are disjoint (each declines the other's window).
-            // softmax / log-softmax stay in-place only (`dst == arr`): their exp / shift pass rewrites
-            // the data buffer in place, so an out-of-place final write would be an unsound hybrid.
-            if let Some((n, arr, n_expr)) = self.match_logsoftmax(b, i, None) {
-                if self.emit_norm(arr, arr, None, &n_expr, 0, NORM_LOGSOFTMAX, None, None) {
+            // ---- Statement-WINDOW kernel recognizers ---------------------------------------
+            //
+            // The third cascade head, alongside `lower_program`'s whole-function interceptions and
+            // `lower_for`'s per-loop cascade: these match a *run of consecutive statements* (a GEMM
+            // followed by its epilogue loop; the multi-pass softmax / LayerNorm / RMSNorm / L2-norm
+            // idiom; a flat 1-D scan's `let acc` + `for`) and replace the whole window with one
+            // kernel call. They answer to the same recognition switch — a norm written as four loops
+            // stays four loops with it off.
+            //
+            // `try_fuse_run` below is deliberately NOT in here: fusing adjacent same-range loops is
+            // an optimization of the loops the user wrote (it emits vector MIR, not a `wukong_*`
+            // call), which is exactly what the recognition-off baseline is supposed to include.
+            if self.gemm.recognize {
+                // Epilogue fusion: a `nn.Linear` matmul immediately followed by its bias-add / ReLU loop
+                // folds into one GEMM call with the epilogue applied in the C writeback (no separate pass
+                // over C). Checked before the elementwise fusion below — they match disjoint shapes.
+                if let Some(n) = self.try_fuse_matmul_epilogue(&b.stmts[i..]) {
                     i += n;
                     continue;
                 }
-            }
-            // Both the un-fused 7-statement form and the fused 6-statement form (`exp` store and `sum`
-            // share one loop — every efficient hand-written softmax) fold to the same NORM_SOFTMAX call.
-            if let Some((n, arr, n_expr)) = self
-                .match_softmax(b, i, None)
-                .or_else(|| self.match_softmax_fused(b, i, None))
-            {
-                if self.emit_norm(arr, arr, None, &n_expr, 0, NORM_SOFTMAX, None, None) {
+                // The bf16/f16 twin: a half-precision `nn.Linear` matmul immediately followed by its
+                // bias-add / activation loop folds to one `wukong_sgemm_{bf16,f16}_nt_epi` call — the
+                // mixed-precision transformer FFN. Disjoint from the f32 epilogue above (half inputs, an
+                // `as f32` widen on each factor) and the int8 dequant below (a float matmul, not `u8×i8→i32`).
+                if let Some(n) = self.try_fuse_lowp_matmul_epilogue(&b.stmts[i..]) {
                     i += n;
                     continue;
                 }
-            }
-            // LayerNorm / RMSNorm / L2-norm accept the out-of-place form `out = norm(x)` (`dst != arr`),
-            // the residual-stream transformer pattern, as well as the in-place form (`dst == arr`).
-            if let Some((n, arr, dst, n_expr, eps, gamma, beta)) = self.match_layernorm(b, i, None)
-            {
-                if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
+                // int8 GEMM + per-channel dequant epilogue → one fused `wukong_i8gemm_nt_deq` call (the
+                // i32 accumulator is dequanted in registers, never materialized). Structurally disjoint
+                // from the f32 epilogue above (an int8 `u8×i8→i32` nest, not a float matmul).
+                if let Some(n) = self.try_fuse_i8matmul_dequant_epilogue(b, i) {
                     i += n;
                     continue;
                 }
-            }
-            if let Some((n, arr, dst, n_expr, eps, gamma, beta)) = self.match_rmsnorm(b, i, None) {
-                if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
-                    i += n;
-                    continue;
+                // Fused normalization: an idiomatic multi-pass softmax / LayerNorm / RMSNorm over a flat
+                // f32 array folds into one `wukong_norm_f32` call (each row loaded once + 256-bit AVX2).
+                // Checked before the elementwise-fusion run so it sees the raw loop sequence, not a
+                // pre-fused one. The three windows are structurally disjoint (max+exp vs mean+var+shift vs
+                // sum-of-squares+scale), so probe order is immaterial.
+                // log-softmax (6 stmts) is probed before softmax (7 stmts): they share the leading max
+                // pass but diverge at stmt[2] — softmax's is the `exp` rewrite loop, log-softmax's is
+                // `let s = 0` — so the two matchers are disjoint (each declines the other's window).
+                // softmax / log-softmax stay in-place only (`dst == arr`): their exp / shift pass rewrites
+                // the data buffer in place, so an out-of-place final write would be an unsound hybrid.
+                if let Some((n, arr, n_expr)) = self.match_logsoftmax(b, i, None) {
+                    if self.emit_norm(arr, arr, None, &n_expr, 0, NORM_LOGSOFTMAX, None, None) {
+                        i += n;
+                        continue;
+                    }
                 }
-            }
-            // L2-normalize (4 stmts, same shape as RMSNorm but `1/sqrt(Σx² + eps)` — no mean divisor).
-            // Probed after RMSNorm; the two are disjoint on the reciprocal (`/N` present xor absent),
-            // so neither steals the other's window.
-            if let Some((n, arr, dst, n_expr, eps, _g, _b)) = self.match_l2norm(b, i, None) {
-                if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_L2NORM, None, None) {
-                    i += n;
-                    continue;
+                // Both the un-fused 7-statement form and the fused 6-statement form (`exp` store and `sum`
+                // share one loop — every efficient hand-written softmax) fold to the same NORM_SOFTMAX call.
+                if let Some((n, arr, n_expr)) = self
+                    .match_softmax(b, i, None)
+                    .or_else(|| self.match_softmax_fused(b, i, None))
+                {
+                    if self.emit_norm(arr, arr, None, &n_expr, 0, NORM_SOFTMAX, None, None) {
+                        i += n;
+                        continue;
+                    }
                 }
-            }
-            // Single-row / flat 1-D scans (inclusive prefix sum / product, first-order linear
-            // recurrence). The batched `for r`-wrapped forms dispatch via the for-statement path; the
-            // flat form (`let acc = 0; for i in 0..N { acc = acc (op) x[i]; out[i] = acc }`) is not an
-            // outer loop, so it fell to fully-scalar code — the loop-carried recurrence also defeats
-            // the generic vectorizer. Fold to the serial scan kernel (1 row = no parallelism). Each
-            // window is 2 statements (`let acc` + `for`). Disjoint from the norm windows above (a
-            // norm's opening reduction loop has a 1-statement inner body, never the scan's
-            // `out[i] = acc` writeback), so probe order among them is immaterial.
-            if let Some(nest) = self.match_cumsum_1d(b, i) {
-                if self.emit_cumsum(&nest, false) {
-                    i += 2;
-                    continue;
+                // LayerNorm / RMSNorm / L2-norm accept the out-of-place form `out = norm(x)` (`dst != arr`),
+                // the residual-stream transformer pattern, as well as the in-place form (`dst == arr`).
+                if let Some((n, arr, dst, n_expr, eps, gamma, beta)) =
+                    self.match_layernorm(b, i, None)
+                {
+                    if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_LAYERNORM, gamma, beta) {
+                        i += n;
+                        continue;
+                    }
                 }
-            }
-            if let Some(nest) = self.match_cumprod_1d(b, i) {
-                if self.emit_cumprod(&nest, false) {
-                    i += 2;
-                    continue;
+                if let Some((n, arr, dst, n_expr, eps, gamma, beta)) =
+                    self.match_rmsnorm(b, i, None)
+                {
+                    if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_RMSNORM, gamma, beta) {
+                        i += n;
+                        continue;
+                    }
                 }
-            }
-            if let Some(nest) = self.match_lrscan_1d(b, i) {
-                if self.emit_lrscan(&nest, false) {
-                    i += 2;
-                    continue;
+                // L2-normalize (4 stmts, same shape as RMSNorm but `1/sqrt(Σx² + eps)` — no mean divisor).
+                // Probed after RMSNorm; the two are disjoint on the reciprocal (`/N` present xor absent),
+                // so neither steals the other's window.
+                if let Some((n, arr, dst, n_expr, eps, _g, _b)) = self.match_l2norm(b, i, None) {
+                    if self.emit_norm(arr, dst, None, &n_expr, eps, NORM_L2NORM, None, None) {
+                        i += n;
+                        continue;
+                    }
                 }
-            }
-            // Operator fusion: a run of adjacent same-range elementwise `for` loops whose *fused*
-            // body the vectorizer accepts is lowered as one loop (CSE/DSE then forward any
-            // intermediate array through registers, cutting its memory traffic).
+                // Single-row / flat 1-D scans (inclusive prefix sum / product, first-order linear
+                // recurrence). The batched `for r`-wrapped forms dispatch via the for-statement path; the
+                // flat form (`let acc = 0; for i in 0..N { acc = acc (op) x[i]; out[i] = acc }`) is not an
+                // outer loop, so it fell to fully-scalar code — the loop-carried recurrence also defeats
+                // the generic vectorizer. Fold to the serial scan kernel (1 row = no parallelism). Each
+                // window is 2 statements (`let acc` + `for`). Disjoint from the norm windows above (a
+                // norm's opening reduction loop has a 1-statement inner body, never the scan's
+                // `out[i] = acc` writeback), so probe order among them is immaterial.
+                if let Some(nest) = self.match_cumsum_1d(b, i) {
+                    if self.emit_cumsum(&nest, false) {
+                        i += 2;
+                        continue;
+                    }
+                }
+                if let Some(nest) = self.match_cumprod_1d(b, i) {
+                    if self.emit_cumprod(&nest, false) {
+                        i += 2;
+                        continue;
+                    }
+                }
+                if let Some(nest) = self.match_lrscan_1d(b, i) {
+                    if self.emit_lrscan(&nest, false) {
+                        i += 2;
+                        continue;
+                    }
+                }
+            } // ---- end of the recognizer-gated statement-window matchers ----------------------
+              // Operator fusion: a run of adjacent same-range elementwise `for` loops whose *fused*
+              // body the vectorizer accepts is lowered as one loop (CSE/DSE then forward any
+              // intermediate array through registers, cutting its memory traffic).
             match self.try_fuse_run(&b.stmts[i..]) {
                 Some(n) => i += n,
                 None => {
@@ -14140,41 +14157,48 @@ impl FnLowerer<'_> {
         if !ity.is_int() {
             return false;
         }
-        // A pure elementwise transcendental `out[j] = f(x[j])` (exp/log/tanh/sigmoid) lowers to the
-        // 256-bit AVX2 runtime kernel — the width Cranelift's 128-bit vectorizer can't reach. Tried
-        // before the generic (Cranelift-emitted) vectorizer, which would otherwise inline the poly.
-        if self.try_vmath_for(j, start, end, body) {
-            return true;
-        }
-        // A two-input transcendental map `out[j] = pow/atan2/hypot(x[j], y[j])` dispatches to the
-        // 256-bit `wukong_vmath2_f32` kernel (vs the generic vectorizer's inlined 128-bit poly).
-        if self.try_vmath2_for(j, start, end, body) {
-            return true;
-        }
-        // A streaming affine map `out[j] = a·x[j] (+ b·y[j]) + c` (saxpy/scale/add/bias) dispatches to
-        // the 256-bit AVX2 + non-temporal-store kernel — both wider than and store-cheaper than the
-        // generic 128-bit vectorizer. Tried before it (which would otherwise emit cacheable stores).
-        if self.try_velem_for(j, start, end, body) {
-            return true;
-        }
-        // A per-element Horner polynomial `let v=x[j]; let mut r=c0; r=r*v+c1; …; out[j]=r` dispatches
-        // to the 256-bit AVX2 + non-temporal-store Horner kernel (the generic vectorizer would inline
-        // it at 128-bit with cacheable stores).
-        if self.try_vhorner_for(j, start, end, body) {
-            return true;
-        }
-        // An int-input dequant `out[j] = act((q[j] as f32)·scale)` over an `[i8]`/`[u8]`/`[i32]` array
-        // dispatches to the 256-bit widen+scale kernel — the widening `cvt` chain gcc/rustc leave
-        // scalar. Disjoint from velem (which reads f32 arrays directly and declines the `as f32` cast),
-        // so probe order among them is immaterial; placed before the generic vectorizer, which would
-        // otherwise lower the widen at 128-bit with cacheable stores.
-        if self.try_dequant_for(j, start, end, body) {
-            return true;
-        }
-        // Pure analyses first (emit no MIR). A reduction (`s += elementwise`) has a body shape
-        // disjoint from the elementwise *store* loops, so try it first. Reductions are vectorized
-        // only on this (sequential) path — not the `@parallel` per-thread path, where folding into
-        // a shared accumulator across threads would race.
+        // The five arms below are kernel *recognizers* that happen to be probed from here (they all
+        // beat the generic vectorizer on width or store path), so they answer to the recognition
+        // switch exactly like the `lower_for` cascade: with recognition off, an elementwise loop is
+        // vectorized by the generic path further down instead of becoming a `wukong_*` call.
+        if self.gemm.recognize {
+            // A pure elementwise transcendental `out[j] = f(x[j])` (exp/log/tanh/sigmoid) lowers to
+            // the 256-bit AVX2 runtime kernel — the width Cranelift's 128-bit vectorizer can't
+            // reach. Tried before the generic (Cranelift-emitted) vectorizer, which would otherwise
+            // inline the poly.
+            if self.try_vmath_for(j, start, end, body) {
+                return true;
+            }
+            // A two-input transcendental map `out[j] = pow/atan2/hypot(x[j], y[j])` dispatches to the
+            // 256-bit `wukong_vmath2_f32` kernel (vs the generic vectorizer's inlined 128-bit poly).
+            if self.try_vmath2_for(j, start, end, body) {
+                return true;
+            }
+            // A streaming affine map `out[j] = a·x[j] (+ b·y[j]) + c` (saxpy/scale/add/bias) dispatches to
+            // the 256-bit AVX2 + non-temporal-store kernel — both wider than and store-cheaper than the
+            // generic 128-bit vectorizer. Tried before it (which would otherwise emit cacheable stores).
+            if self.try_velem_for(j, start, end, body) {
+                return true;
+            }
+            // A per-element Horner polynomial `let v=x[j]; let mut r=c0; r=r*v+c1; …; out[j]=r` dispatches
+            // to the 256-bit AVX2 + non-temporal-store Horner kernel (the generic vectorizer would inline
+            // it at 128-bit with cacheable stores).
+            if self.try_vhorner_for(j, start, end, body) {
+                return true;
+            }
+            // An int-input dequant `out[j] = act((q[j] as f32)·scale)` over an `[i8]`/`[u8]`/`[i32]` array
+            // dispatches to the 256-bit widen+scale kernel — the widening `cvt` chain gcc/rustc leave
+            // scalar. Disjoint from velem (which reads f32 arrays directly and declines the `as f32` cast),
+            // so probe order among them is immaterial; placed before the generic vectorizer, which would
+            // otherwise lower the widen at 128-bit with cacheable stores.
+            if self.try_dequant_for(j, start, end, body) {
+                return true;
+            }
+        } // ---- end of the recognizer-gated elementwise kernel probes ----------------------------
+          // Pure analyses first (emit no MIR). A reduction (`s += elementwise`) has a body shape
+          // disjoint from the elementwise *store* loops, so try it first. Reductions are vectorized
+          // only on this (sequential) path — not the `@parallel` per-thread path, where folding into
+          // a shared accumulator across threads would race.
         let reduction = self.reduction_of(body, j);
         if reduction.is_none() && self.vectorizable(body, j).is_none() {
             return false;
@@ -14294,89 +14318,94 @@ impl FnLowerer<'_> {
         ity: &MirType,
         body: &Block,
     ) -> bool {
-        // A transcendental-activation chunk dispatches to the 256-bit AVX2 kernel here too, so an
-        // `@parallel` activation runs multicore × 256-bit (each thread's chunk is one kernel call).
-        // Elementwise, so the interpreter's whole-range pass and the native per-chunk passes agree.
-        if let Some(calls) = self.match_vmath_body(j, body, None) {
-            let s = self.coerce_to(start_val, ity, &MirType::I64, true);
-            let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-            self.emit_vmath_calls(s, e, calls);
-            return true;
-        }
-        // A streaming affine map per `@parallel` chunk → the same 256-bit + non-temporal-store kernel,
-        // so an `@parallel` saxpy/scale/add runs multicore × 256-bit with RFO-free stores. Elementwise,
-        // so each thread's per-chunk pass agrees with the interpreter's whole-range pass.
-        if let Some(plan) = self.match_velem_body(j, body) {
-            let s = self.coerce_to(start_val, ity, &MirType::I64, true);
-            let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-            self.emit_velem_call(s, e, &plan);
-            return true;
-        }
-        // An int-input dequant per `@parallel` chunk → the same 256-bit `wukong_dequant_f32` over
-        // `[s, e)`, so a `@parallel` dequant runs multicore × 256-bit (each thread's chunk is one serial
-        // call). Elementwise, so each per-chunk pass agrees with the interpreter's whole-range marshal.
-        if let Some(plan) = self.match_dequant_body(j, body) {
-            let s = self.coerce_to(start_val, ity, &MirType::I64, true);
-            let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-            if self.emit_dequant_call(s, e, &plan) {
-                return true;
-            }
-        }
-        // A bf16/f16→f32 axpby per `@parallel` chunk → `wukong_axpby_{bf16,f16}` over `[s, e)`, so a
-        // mixed-precision residual-add / saxpy runs multicore (the bandwidth payoff is largest here,
-        // ≫ L3). Each chunk GEPs the half-width inputs and f32 output by `s`; elementwise, so the
-        // per-chunk passes agree with the interpreter's whole-range marshal of the same kernel.
-        if let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, j) {
-            if let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) {
+        // Same rule as `try_vectorize_for`: the arms in this block are kernel recognizers (this is
+        // the `@parallel`-chunk twin of that probe list), so recognition off skips straight to the
+        // generic vectorizer at the bottom and each chunk runs as the loop it was written as.
+        if self.gemm.recognize {
+            // A transcendental-activation chunk dispatches to the 256-bit AVX2 kernel here too, so an
+            // `@parallel` activation runs multicore × 256-bit (each thread's chunk is one kernel call).
+            // Elementwise, so the interpreter's whole-range pass and the native per-chunk passes agree.
+            if let Some(calls) = self.match_vmath_body(j, body, None) {
                 let s = self.coerce_to(start_val, ity, &MirType::I64, true);
                 let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-                let av = self.lower_coeff(a_expr, 1.0);
-                let bv = self.lower_coeff(b_expr, 1.0);
-                let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
-                let in_elem = if is_f16 { MirType::F16 } else { MirType::BF16 };
-                let xp = self.builder.build(
-                    MirType::Ptr,
-                    Op::Gep {
-                        ptr: xv,
-                        index: s,
-                        elem: in_elem.clone(),
-                    },
-                );
-                let yp = self.builder.build(
-                    MirType::Ptr,
-                    Op::Gep {
-                        ptr: yv,
-                        index: s,
-                        elem: in_elem,
-                    },
-                );
-                let outp = self.builder.build(
-                    MirType::Ptr,
-                    Op::Gep {
-                        ptr: outv,
-                        index: s,
-                        elem: MirType::F32,
-                    },
-                );
-                self.builder.build_void(Op::Call {
-                    func: if is_f16 {
-                        self.gemm.axpby_f16
-                    } else {
-                        self.gemm.axpby_bf16
-                    },
-                    args: vec![xp, yp, outp, n, av, bv],
-                });
+                self.emit_vmath_calls(s, e, calls);
                 return true;
             }
-        }
-        // A Horner polynomial per `@parallel` chunk → the same 256-bit AVX2 + NT-store Horner kernel.
-        if let Some((out_base, x_base, coeffs)) = self.match_vhorner_body(j, body) {
-            let s = self.coerce_to(start_val, ity, &MirType::I64, true);
-            let e = self.coerce_to(end_val, ity, &MirType::I64, true);
-            if self.emit_vhorner(s, e, out_base, x_base, &coeffs) {
+            // A streaming affine map per `@parallel` chunk → the same 256-bit + non-temporal-store kernel,
+            // so an `@parallel` saxpy/scale/add runs multicore × 256-bit with RFO-free stores. Elementwise,
+            // so each thread's per-chunk pass agrees with the interpreter's whole-range pass.
+            if let Some(plan) = self.match_velem_body(j, body) {
+                let s = self.coerce_to(start_val, ity, &MirType::I64, true);
+                let e = self.coerce_to(end_val, ity, &MirType::I64, true);
+                self.emit_velem_call(s, e, &plan);
                 return true;
             }
-        }
+            // An int-input dequant per `@parallel` chunk → the same 256-bit `wukong_dequant_f32` over
+            // `[s, e)`, so a `@parallel` dequant runs multicore × 256-bit (each thread's chunk is one serial
+            // call). Elementwise, so each per-chunk pass agrees with the interpreter's whole-range marshal.
+            if let Some(plan) = self.match_dequant_body(j, body) {
+                let s = self.coerce_to(start_val, ity, &MirType::I64, true);
+                let e = self.coerce_to(end_val, ity, &MirType::I64, true);
+                if self.emit_dequant_call(s, e, &plan) {
+                    return true;
+                }
+            }
+            // A bf16/f16→f32 axpby per `@parallel` chunk → `wukong_axpby_{bf16,f16}` over `[s, e)`, so a
+            // mixed-precision residual-add / saxpy runs multicore (the bandwidth payoff is largest here,
+            // ≫ L3). Each chunk GEPs the half-width inputs and f32 output by `s`; elementwise, so the
+            // per-chunk passes agree with the interpreter's whole-range marshal of the same kernel.
+            if let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, j) {
+                if let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) {
+                    let s = self.coerce_to(start_val, ity, &MirType::I64, true);
+                    let e = self.coerce_to(end_val, ity, &MirType::I64, true);
+                    let av = self.lower_coeff(a_expr, 1.0);
+                    let bv = self.lower_coeff(b_expr, 1.0);
+                    let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
+                    let in_elem = if is_f16 { MirType::F16 } else { MirType::BF16 };
+                    let xp = self.builder.build(
+                        MirType::Ptr,
+                        Op::Gep {
+                            ptr: xv,
+                            index: s,
+                            elem: in_elem.clone(),
+                        },
+                    );
+                    let yp = self.builder.build(
+                        MirType::Ptr,
+                        Op::Gep {
+                            ptr: yv,
+                            index: s,
+                            elem: in_elem,
+                        },
+                    );
+                    let outp = self.builder.build(
+                        MirType::Ptr,
+                        Op::Gep {
+                            ptr: outv,
+                            index: s,
+                            elem: MirType::F32,
+                        },
+                    );
+                    self.builder.build_void(Op::Call {
+                        func: if is_f16 {
+                            self.gemm.axpby_f16
+                        } else {
+                            self.gemm.axpby_bf16
+                        },
+                        args: vec![xp, yp, outp, n, av, bv],
+                    });
+                    return true;
+                }
+            }
+            // A Horner polynomial per `@parallel` chunk → the same 256-bit AVX2 + NT-store Horner kernel.
+            if let Some((out_base, x_base, coeffs)) = self.match_vhorner_body(j, body) {
+                let s = self.coerce_to(start_val, ity, &MirType::I64, true);
+                let e = self.coerce_to(end_val, ity, &MirType::I64, true);
+                if self.emit_vhorner(s, e, out_base, x_base, &coeffs) {
+                    return true;
+                }
+            }
+        } // ---- end of the recognizer-gated per-chunk kernel probes ------------------------------
         let Some((lane, w)) = self.vectorizable(body, j) else {
             return false;
         };
@@ -28179,6 +28208,95 @@ mod tests {
 
     fn prog_calls(prog: &Program, interner: &Interner, callee: &str) -> bool {
         prog.funcs.iter().any(|f| fn_calls(f, interner, callee))
+    }
+
+    /// [`lower`] with explicit [`LowerOptions`].
+    fn lower_with(src: &str, opts: LowerOptions) -> (Program, Vec<Diagnostic>, Interner) {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse: {pdiags:?}");
+        let (sema, sdiags) = wukong_sema::check(&module, &interner);
+        assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
+        let (prog, diags) = lower_program_with(&module, &sema, &mut interner, opts);
+        (prog, diags, interner)
+    }
+
+    /// Every recognized-kernel callee in the program. `wukong_parallel_for` is excluded on purpose:
+    /// it is the `@parallel` outliner's runtime entry point — the user asking for threads — and is
+    /// not part of the recognizer cascade the switch turns off.
+    fn kernel_calls(prog: &Program, interner: &Interner) -> Vec<String> {
+        let mut out = Vec::new();
+        for f in &prog.funcs {
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Op::Call { func, .. } = &i.op {
+                        let name = interner.resolve(*func);
+                        if name.starts_with("wukong_") && name != "wukong_parallel_for" {
+                            out.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    const MATMUL_SRC: &str = "module m
+fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
+    for i in 0..4 { for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + a[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = s;
+    } }
+}
+";
+
+    /// `LowerOptions::recognize` is the measurement instrument (`WUKONG_NO_RECOGNIZE`, `@generic`):
+    /// with it cleared, a nest every recognizer claims must lower to no kernel call at all, and the
+    /// MIR must still be valid — a "generic" lowering that fails the verifier would be a broken
+    /// baseline, which is worse than no baseline.
+    #[test]
+    fn recognize_off_emits_no_kernel_call() {
+        let (on, diags, interner) = lower_with(MATMUL_SRC, LowerOptions::default());
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&on, &interner, "wukong_sgemm"),
+            "the default must still dispatch the kernel, or the test below is vacuous"
+        );
+
+        let (off, diags, interner) = lower_with(MATMUL_SRC, LowerOptions { recognize: false });
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let calls = kernel_calls(&off, &interner);
+        assert!(
+            calls.is_empty(),
+            "recognize: false still emitted kernel call(s): {calls:?}"
+        );
+        for f in &off.funcs {
+            let errs = verify_function(f);
+            assert!(
+                errs.is_empty(),
+                "recognition-off MIR fails the verifier: {errs:?}"
+            );
+        }
+    }
+
+    /// `@parallel` outlining is NOT a recognizer: it is an explicit request for threads, so it must
+    /// survive with recognition off. (Inside the outlined body the kernels are gone, like everywhere
+    /// else.)
+    #[test]
+    fn recognize_off_keeps_parallel_outlining() {
+        let src = head_loop_src("@parallel\n");
+        let (prog, diags, interner) = lower_with(&src, LowerOptions { recognize: false });
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_parallel_for"),
+            "the head loop must still outline with recognition off"
+        );
+        let calls = kernel_calls(&prog, &interner);
+        assert!(
+            calls.is_empty(),
+            "recognize: false still emitted kernel call(s): {calls:?}"
+        );
     }
 
     /// The canonical mid-function `@parallel` head loop (body-local scratch, disjoint `hh`-sliced
