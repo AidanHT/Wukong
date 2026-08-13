@@ -15,8 +15,9 @@ shared `DiagnosticSink`. After compilation, the driver picks `Renderer` or `to_j
 |---|---|
 | `src/lib.rs:1-20` | crate overview; `Severity`, `Diagnostic` builder, `DiagnosticSink` |
 | `src/catalog.rs:7-18` | code ranges; **`E0001` retired**, never reuse |
-| `src/catalog.rs:48-277` | `CATALOG` table (29 entries at HEAD) |
-| `src/catalog.rs:178-213` | E04xx entries — note **no `E0404`** (intentional gap) |
+| `src/catalog.rs:48-267` | `CATALOG` table (30 entries at HEAD) |
+| `src/catalog.rs:178-190` | `E0306` — unknown / misplaced `@attribute`, the closed known set |
+| `src/catalog.rs:190-225` | E04xx entries — note **no `E0404`** (intentional gap) |
 | `src/render.rs` | terminal renderer; tab expansion / caret alignment |
 | `src/json.rs` | `to_json` — one JSON object per line |
 | `tests/catalog_coverage.rs` | U6 two-direction catalogue gate |

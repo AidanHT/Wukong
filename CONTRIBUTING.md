@@ -232,6 +232,12 @@ showcase program.
 
 Update `docs/language-guide.md` and its maturity legend.
 
+**A new attribute is four edits, not one.** `@name` parses today whatever it means, so the name must
+join the closed set in `crates/wukong_sema/src/attrs.rs` (`KNOWN_ATTRS`) or it is `E0306` — and if it
+is only legal in one position, `FN_ITEM_ONLY` is where that is said, with a `tests/fail/` fixture for
+the misplacement. Then give it a consumer, and a `tests/run/` fixture that *witnesses* the consumer:
+an attribute whose effect no gate can see is how `@tile` did nothing for months.
+
 ## Adding a MIR `Op`
 
 Prefer *not* to: `abs`, `exp`, `silu` and friends are built from existing primitives in
@@ -308,3 +314,19 @@ LANDMINE: kernel dispatch is **gate-blind**. The interpreter calls the same func
 bug is identical on both backends and the differential gate stays green — the in-crate
 scalar-twin/naive tests are the only real oracle. To confirm a program actually dispatches, grep the
 output of `wukongc --emit=mir -O2 prog.wk` for `wukong_`.
+
+A new recognizer must also stay **switchable**, because that is what makes a claim about the language
+falsifiable. Recognizers are probed from four places in `wukong_mir_build`, and each one is already
+gated on `self.gemm.recognize` / `gemm.recognize`: `lower_program`'s whole-function interceptions,
+`FnLowerer::lower_for`'s cascade, `lower_block`'s statement windows, and the elementwise probes that
+open `try_vectorize_for` / `try_vectorize_ranged`. Put a new arm **inside** one of those blocks — an
+arm added outside is a kernel that `@generic` and `WUKONG_NO_RECOGNIZE` cannot turn off, which
+silently invalidates every recognition-off measurement. Check it with:
+
+```sh
+$env:WUKONG_NO_RECOGNIZE='1'; cargo run -q -p wukongc -- --emit=mir -O2 tests/run/<name>.wk
+# no `call wukong_` for your kernel; then `cargo test -p wukongc --test recognize`
+```
+
+The exception is an **explicit builtin** the user calls by name (`alloc_f32`, `read_f32`, `sdpa`,
+`now_ns`): those are not guesses about intent and keep their runtime call in every mode.

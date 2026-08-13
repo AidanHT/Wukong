@@ -139,7 +139,7 @@ to nothing and malformed types report `E0203`/`E0204`. `E0404` is likewise an un
 alone.
 
 The catalog in `wukong_diag::catalog` gives each code a title and an extended explanation surfaced by
-`wukongc --explain <CODE>`. It holds 29 entries at HEAD and is gated in both directions by
+`wukongc --explain <CODE>`. It holds 30 entries at HEAD and is gated in both directions by
 `wukong_diag/tests/catalog_coverage.rs`: every code a crate emits must have an entry, and every entry
 must have an emitter (its `RESERVED` exception list is empty, which is the healthy state). A third
 gate, `every_catalogued_code_is_exercised` in `crates/wukongc/tests/fail.rs`, requires every
