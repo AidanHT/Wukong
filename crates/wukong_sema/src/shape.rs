@@ -1054,7 +1054,7 @@ impl Sema<'_> {
                     // silently accepted, then traps in the interpreter but reads out of bounds in
                     // native codegen — the backends disagree, violating the one hard invariant. A
                     // symbolic/dynamic dim or a non-constant index is left unconstrained.
-                    for (ix, dim) in indices.iter().zip(shape.0.iter()) {
+                    for (axis, (ix, dim)) in indices.iter().zip(shape.0.iter()).enumerate() {
                         if let Dim::Const(n) = dim {
                             if let Some(v) = self.eval_index_const(ix) {
                                 if v < 0 || v as u64 >= *n {
@@ -1062,7 +1062,8 @@ impl Sema<'_> {
                                         ix.span,
                                         "E0501",
                                         format!(
-                                            "index {v} is out of bounds for a dimension of length {n}"
+                                            "index {v} is out of bounds for axis {axis} of \
+                                             length {n}"
                                         ),
                                     );
                                 }

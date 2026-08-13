@@ -4539,6 +4539,14 @@ mod tests {
     }
 
     #[test]
+    fn out_of_bounds_tensor_index_names_the_axis() {
+        // With one message per axis, `a[0, 5]` on a `Tensor[f32, 2, 2]` has to say WHICH index is
+        // the offending one — both are spelled `0`/`5` in source but only axis 1 is out of range.
+        let src = "fn f(a: Tensor[f32, 2, 2]) { let x = a[0, 5]; }";
+        assert_message_has(src, "E0501", &["index 5", "axis 1", "length 2"]);
+    }
+
+    #[test]
     fn rank_mismatch_names_both_shapes() {
         // A rank mismatch has no single disagreeing dim to name, so it names rank against rank —
         // and now the two shapes as well, so the reader sees which signature is rank-2.
