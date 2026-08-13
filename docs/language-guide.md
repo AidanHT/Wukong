@@ -1,5 +1,12 @@
 # The Wukong Language Guide
 
+Wukong is a language for writing ML/DL tensor kernels. You express kernels as explicit loops over
+`Tensor[...]` values with shape-generic parameters and `@parallel` schedules; `wukongc` checks shapes
+at compile time (`wukong_sema`) and lowers your program to MIR for execution on CPU or (optionally)
+GPU backends. The goal is to be easier and more productive than hand-written CUDA/CUTLASS while
+keeping costs visible — not to hide kernels behind a framework runtime. A win is a `.wk` program
+through the compiler, not a Rust-launched kernel zoo.
+
 This guide describes the Wukong language as it exists today. Wukong is built incrementally; where
 a feature parses and type-checks but does not yet execute end-to-end, that is called out explicitly.
 

@@ -3,6 +3,11 @@
 This document describes how `wukongc` is built: the crate layering, the pipeline, the MIR, and the
 key design bets. It is aimed at contributors.
 
+The compiler exists so programmers write `.wk` kernels and pass them through a real front end,
+semantic analyzer (`wukong_sema` — including compile-time shape checking), and MIR pipeline. Execution
+backends (interpreter, Cranelift native codegen, optional GPU recognizer offload and MIR→PTX) are
+interchangeable ways to run the same program; they are not the product on their own.
+
 ## Design bets
 
 1. **Interpreter-first, native code without LLVM.** The entire front-end, optimizer, and a

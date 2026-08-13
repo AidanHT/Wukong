@@ -1,6 +1,13 @@
 # Contributing to Wukong
 
-Thanks for your interest! Wukong is built incrementally, one small, tested change at a time.
+Thanks for your interest! Wukong is a **programming language** (`.wk`) for writing ML/DL tensor
+kernels with compile-time shape safety. The compiler (`wukongc`) exists so users express kernels as
+ordinary source — loops over `Tensor[...]`, shape generics, `@parallel` — and run them through a real
+front end, semantic analyzer, and MIR pipeline. Backends (interpreter, native Cranelift, optional GPU)
+are how those programs execute; Rust-side GPU launchers and benchmark harnesses are supporting
+infrastructure, not the definition of the project.
+
+Wukong is built incrementally, one small, tested change at a time.
 
 ## Ground rules
 
