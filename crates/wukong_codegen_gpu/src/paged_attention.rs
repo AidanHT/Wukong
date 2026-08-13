@@ -81,11 +81,20 @@ use crate::ptx_target::HDR_SM80;
 
 /// `(slot, head)` pairs per CTA — one **warp** each (block_dim = `32 * PAGED_ATTN_WARPS`). The warp's
 /// 32 lanes cooperatively stream the context, so the launch fills the GPU (`num_slots*heads` warps)
-/// instead of the one-thread-per-pair version's `num_slots*heads` *threads* (which left 39/40 SMs idle).
+/// instead of the one-thread-per-pair version's `num_slots*heads` *threads* (which left 19/20 SMs idle
+/// on the 4050 — the probe prints 20, not 40; see WAVE6_DOSSIER.md §1.2).
 pub const PAGED_ATTN_WARPS: u32 = 4;
+
+/// Largest GQA group size the K-side fold bakes a shared-acc tile for. Llama-3-8B is `g = 4`,
+/// Llama-3-70B / MQA-8 is `g = 8`. A `g > 8` geometry stays on the one-head-per-warp kernel.
+pub const KFOLD_G_MAX: usize = 8;
 
 /// PTX entry name for the paged decode-attention kernel.
 pub const PAGED_ATTN_ENTRY: &str = "paged_attn_decode";
+
+/// PTX entry name for the K-side GQA-fold decode-attention kernel (WAVE6 lever 5). Same params and
+/// query-headed warp map as [`PAGED_ATTN_ENTRY`]; warp 0 of each CTA stages K into shared.
+pub const PAGED_ATTN_KFOLD_ENTRY: &str = "paged_attn_decode_kfold";
 
 /// Where the K and V planes the append kernels read live inside their source buffer(s): `row_stride`
 /// f32 elements per slot row, K starting at column `k_off` and V at column `v_off`.
@@ -144,6 +153,213 @@ impl KvSourceLayout {
     }
 }
 
+/// How the inner K/V loops issue global loads. **Values and FMA order are identical**; only the
+/// instruction width changes. `V4` is the shipped default (WAVE6 lever 4). `Scalar` is the pre-Wave-6
+/// kernel, retained so the `==` gate has a twin to compare against rather than a tolerance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnVec {
+    /// One `ld.global.u16` / `ld.global.s8` per element — the kernel the layout-invariance gates
+    /// were written against.
+    Scalar,
+    /// `ld.global.v4.b32` (16 B) per eight f16s / sixteen int8s, then unpack in element order.
+    /// Ampere-legal, keeps the `sm_80` floor (G-W6-7). Needs `head_dim % 8 == 0` (f16) or
+    /// `head_dim % 16 == 0` (int8) because `elem_offset` puts a vector at byte
+    /// `es * head_dim * sizeof(elem)` (G-W6-2).
+    V4,
+}
+
+/// Whether the K-side GQA fold applies. The fold is a **CTA-cooperative K load**: the four warps
+/// of a CTA share one K vector per lane (same `t`, same `kv_head`) via a 32-row shared tile, while
+/// each warp still owns one `(slot, q_head)` and keeps its own `%acc<hd>` — so the V-side register
+/// wall never appears. That sharing holds iff `g >= PAGED_ATTN_WARPS` (four consecutive query heads
+/// lie in one KV group) and `q_heads` is a multiple of the warp count (no partial CTA, so `bar.sync`
+/// cannot hang). Llama-3-8B (`32q/8kv`, g=4) and 70B (`64q/8kv`, g=8) both qualify; MHA does not.
+pub fn kfold_applies(q_heads: usize, kv_heads: usize) -> bool {
+    kv_heads > 0
+        && q_heads.is_multiple_of(kv_heads)
+        && q_heads.is_multiple_of(PAGED_ATTN_WARPS as usize)
+        && {
+            let g = q_heads / kv_heads;
+            g >= PAGED_ATTN_WARPS as usize && g <= KFOLD_G_MAX && g.is_power_of_two()
+        }
+}
+
+fn assert_f16_vec_align(head_dim: usize, vec: AttnVec) {
+    assert!(
+        head_dim > 0 && head_dim.is_multiple_of(2),
+        "head_dim must be a positive even number"
+    );
+    if vec == AttnVec::V4 {
+        assert!(
+            head_dim.is_multiple_of(8),
+            "paged_attn_decode_ptx: ld.global.v4.b32 needs 16-byte alignment; elem_offset puts a \
+             vector at byte es*head_dim*sizeof(f16)=es*{head_dim}*2, so head_dim % 8 == 0 (got \
+             {head_dim})"
+        );
+    }
+}
+
+fn assert_int8_vec_align(head_dim: usize, vec: AttnVec) {
+    assert!(
+        head_dim > 0 && head_dim.is_multiple_of(2),
+        "head_dim must be a positive even number"
+    );
+    if vec == AttnVec::V4 {
+        assert!(
+            head_dim.is_multiple_of(16),
+            "paged_attn_decode_int8_ptx: ld.global.v4.b32 needs 16-byte alignment; elem_offset \
+             puts a vector at byte es*head_dim*sizeof(i8)=es*{head_dim}, so head_dim % 16 == 0 \
+             (got {head_dim})"
+        );
+    }
+}
+
+fn emit_f16_k_dot(hd: usize, vec: AttnVec) -> String {
+    let mut s = String::from("    mov.f32 %score,0f00000000;\n");
+    match vec {
+        AttnVec::Scalar => {
+            for d in 0..hd {
+                s += &format!(
+                    "    ld.shared.f32 %qv,[%qshw+{}];\n    ld.global.u16 %h,[%kbase+{}];\n    cvt.f32.f16 %kf,%h;\n    fma.rn.f32 %score,%qv,%kf,%score;\n",
+                    d * 4,
+                    d * 2
+                );
+            }
+        }
+        AttnVec::V4 => {
+            for c in 0..hd / 8 {
+                let off = c * 16;
+                s += &format!("    ld.global.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%kbase+{off}];\n");
+                for i in 0..4 {
+                    let d0 = c * 8 + i * 2;
+                    let d1 = d0 + 1;
+                    s += &format!(
+                        "    mov.b32 {{%h0,%h1}},%pk{i};\n    ld.shared.f32 %qv,[%qshw+{}];\n    cvt.f32.f16 %kf,%h0;\n    fma.rn.f32 %score,%qv,%kf,%score;\n    ld.shared.f32 %qv,[%qshw+{}];\n    cvt.f32.f16 %kf,%h1;\n    fma.rn.f32 %score,%qv,%kf,%score;\n",
+                        d0 * 4,
+                        d1 * 4
+                    );
+                }
+            }
+        }
+    }
+    s
+}
+
+fn emit_f16_v_acc(hd: usize, vec: AttnVec) -> String {
+    let mut s = String::new();
+    match vec {
+        AttnVec::Scalar => {
+            for d in 0..hd {
+                s += &format!(
+                    "    ld.global.u16 %h,[%vbase+{}];\n    cvt.f32.f16 %vf,%h;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%p,%vf,%acc{d};\n",
+                    d * 2
+                );
+            }
+        }
+        AttnVec::V4 => {
+            for c in 0..hd / 8 {
+                let off = c * 16;
+                s += &format!("    ld.global.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%vbase+{off}];\n");
+                for i in 0..4 {
+                    let d0 = c * 8 + i * 2;
+                    let d1 = d0 + 1;
+                    s += &format!(
+                        "    mov.b32 {{%h0,%h1}},%pk{i};\n    cvt.f32.f16 %vf,%h0;\n    mul.f32 %acc{d0},%acc{d0},%corr;\n    fma.rn.f32 %acc{d0},%p,%vf,%acc{d0};\n    cvt.f32.f16 %vf,%h1;\n    mul.f32 %acc{d1},%acc{d1},%corr;\n    fma.rn.f32 %acc{d1},%p,%vf,%acc{d1};\n"
+                    );
+                }
+            }
+        }
+    }
+    s
+}
+
+/// K-dot against a per-lane f16 vector already staged at `%kshw` (CTA-shared K tile, WAVE6 lever 5).
+/// Unpack order is the same `d = 0,1,2,...` as [`emit_f16_k_dot`].
+fn emit_f16_k_dot_from_ksh(hd: usize) -> String {
+    let mut s = String::from("    mov.f32 %score,0f00000000;\n");
+    for c in 0..hd / 8 {
+        let off = c * 16;
+        s += &format!("    ld.shared.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%kshw+{off}];\n");
+        for i in 0..4 {
+            let d0 = c * 8 + i * 2;
+            let d1 = d0 + 1;
+            s += &format!(
+                "    mov.b32 {{%h0,%h1}},%pk{i};\n    ld.shared.f32 %qv,[%qshw+{}];\n    cvt.f32.f16 %kf,%h0;\n    fma.rn.f32 %score,%qv,%kf,%score;\n    ld.shared.f32 %qv,[%qshw+{}];\n    cvt.f32.f16 %kf,%h1;\n    fma.rn.f32 %score,%qv,%kf,%score;\n",
+                d0 * 4,
+                d1 * 4
+            );
+        }
+    }
+    s
+}
+
+fn emit_int8_k_dot(hd: usize, vec: AttnVec) -> String {
+    let mut s = String::from("    mov.f32 %score,0f00000000;\n");
+    match vec {
+        AttnVec::Scalar => {
+            for d in 0..hd {
+                s += &format!(
+                    "    ld.shared.f32 %qv,[%qshw+{}];\n    ld.global.s8 %ki,[%kbase+{}];\n    cvt.rn.f32.s32 %kf,%ki;\n    fma.rn.f32 %score,%qv,%kf,%score;\n",
+                    d * 4, d
+                );
+            }
+        }
+        AttnVec::V4 => {
+            for c in 0..hd / 16 {
+                let off = c * 16;
+                s += &format!("    ld.global.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%kbase+{off}];\n");
+                for i in 0..4 {
+                    for b in 0..4 {
+                        let d = c * 16 + i * 4 + b;
+                        let bit = b * 8;
+                        s += &format!(
+                            "    bfe.s32 %ki,%pk{i},{bit},8;\n    ld.shared.f32 %qv,[%qshw+{}];\n    cvt.rn.f32.s32 %kf,%ki;\n    fma.rn.f32 %score,%qv,%kf,%score;\n",
+                            d * 4
+                        );
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
+fn emit_int8_v_acc(hd: usize, vec: AttnVec) -> String {
+    let mut s = String::new();
+    match vec {
+        AttnVec::Scalar => {
+            for d in 0..hd {
+                s += &format!(
+                    "    ld.global.s8 %ki,[%vbase+{d}];\n    cvt.rn.f32.s32 %vf,%ki;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%pv,%vf,%acc{d};\n"
+                );
+            }
+        }
+        AttnVec::V4 => {
+            for c in 0..hd / 16 {
+                let off = c * 16;
+                s += &format!("    ld.global.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%vbase+{off}];\n");
+                for i in 0..4 {
+                    for b in 0..4 {
+                        let d = c * 16 + i * 4 + b;
+                        let bit = b * 8;
+                        s += &format!(
+                            "    bfe.s32 %ki,%pk{i},{bit},8;\n    cvt.rn.f32.s32 %vf,%ki;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%pv,%vf,%acc{d};\n"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
+fn vec_regs(vec: AttnVec) -> &'static str {
+    match vec {
+        AttnVec::Scalar => "",
+        AttnVec::V4 => "    .reg .b16 %h0,%h1;\n    .reg .b32 %pk0,%pk1,%pk2,%pk3;\n",
+    }
+}
+
 /// Generate the paged decode-attention PTX, **specialized to `head_dim`** (baked so the V accumulator
 /// unrolls into named registers `%acc0..` and the per-position dot unrolls). **Warp-cooperative**: one
 /// warp computes `out[slot,head,:] = softmax(scale · q · Kᵀ) · V` over the sequence's context — the 32
@@ -161,11 +377,23 @@ impl KvSourceLayout {
 /// per-`g` variant would need a per-`g` module-cache key, and [`crate::Gpu::function`] caches on the
 /// key alone and never re-examines the PTX on a hit. `q_heads == kv_heads` makes the group size 1 and
 /// the mapping the identity, i.e. exactly the pre-GQA kernel.
+///
+/// **Wave-6 v4 coalescing.** The shipped generator emits [`AttnVec::V4`]. The scalar twin
+/// [`paged_attn_decode_scalar_ptx`] is the `==` control: same lane partition, same FMA order, 8x
+/// fewer load instructions. Alignment is G-W6-2 (`head_dim % 8 == 0`).
 pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
-    assert!(
-        head_dim > 0 && head_dim.is_multiple_of(2),
-        "head_dim must be a positive even number"
-    );
+    paged_attn_decode_ptx_with(head_dim, AttnVec::V4)
+}
+
+/// Pre-Wave-6 scalar `ld.global.u16` twin of [`paged_attn_decode_ptx`]. Same entry name, same
+/// params, same values — only the load instruction width differs. The device `==` gate loads this
+/// under a **different** module-cache key so the two modules cannot collide.
+pub fn paged_attn_decode_scalar_ptx(head_dim: usize) -> String {
+    paged_attn_decode_ptx_with(head_dim, AttnVec::Scalar)
+}
+
+fn paged_attn_decode_ptx_with(head_dim: usize, vec: AttnVec) -> String {
+    assert_f16_vec_align(head_dim, vec);
     let hd = head_dim;
     let w = PAGED_ATTN_WARPS as usize;
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
@@ -205,6 +433,7 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     s += &format!("    .reg .f32 %acc<{hd}>;\n");
     s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt;\n";
     s += "    .reg .b16 %h;\n";
+    s += vec_regs(vec);
     s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%oidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%qstride,%e,%dd,%kvheads,%kvhead,%grp;\n";
     s += "    .reg .b64 %Q,%K,%V,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw;\n";
     s += "    .reg .pred %p0,%p1,%p2;\n";
@@ -264,10 +493,7 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     );
     s += "    mul.wide.u32 %offb,%e,2;\n    add.s64 %kbase,%K,%offb;\n    add.s64 %vbase,%V,%offb;\n";
     // score = scale * dot(q, K[t])  (q from shared, K widened from f16).
-    s += "    mov.f32 %score,0f00000000;\n";
-    for d in 0..hd {
-        s += &format!("    ld.shared.f32 %qv,[%qshw+{}];\n    ld.global.u16 %h,[%kbase+{}];\n    cvt.f32.f16 %kf,%h;\n    fma.rn.f32 %score,%qv,%kf,%score;\n", d * 4, d * 2);
-    }
+    s += &emit_f16_k_dot(hd, vec);
     s += "    mul.f32 %score,%score,%scale;\n";
     s += "    max.f32 %newm,%m,%score;\n";
     s += &format!(
@@ -277,9 +503,7 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
         "    sub.f32 %t0,%score,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %p,%t0;\n"
     );
     s += "    mul.f32 %l,%l,%corr;\n    add.f32 %l,%l,%p;\n";
-    for d in 0..hd {
-        s += &format!("    ld.global.u16 %h,[%vbase+{}];\n    cvt.f32.f16 %vf,%h;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%p,%vf,%acc{d};\n", d * 2);
-    }
+    s += &emit_f16_v_acc(hd, vec);
     s += "    mov.f32 %m,%newm;\n    add.u32 %t,%t,32;\n    bra LOOP;\nENDLOOP:\n";
     // Cross-lane merge (fixed butterfly order): M = max(m) ; rescale by exp(m−M) ; L = Σl ; ACC = Σacc.
     s += "    mov.f32 %M,%m;\n";
@@ -511,6 +735,50 @@ pub fn launch_paged_attn_decode_gqa_at(
     Ok(())
 }
 
+/// Launch the K-side GQA-fold decode-attention kernel. Same buffers, params, and **query-headed**
+/// grid as [`launch_paged_attn_decode_gqa_at`]; [`kfold_applies`] is asserted so the CTA-shared K
+/// tile is a legal `bar.sync` (full CTAs, `g >= WARPS`). A `g = 1` or `g = 2` geometry is a
+/// programming error here, not a silent fall-back to the one-head kernel.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attn_decode_kfold_gqa_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    q_d: &CudaSlice<f32>,
+    q_row_stride: usize,
+    k_d: &CudaSlice<half::f16>,
+    v_d: &CudaSlice<half::f16>,
+    out_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    cl_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    assert!(
+        kfold_applies(gqa.q_heads(), gqa.kv_heads()),
+        "launch_paged_attn_decode_kfold_gqa_at: kfold does not apply at {}q/{}kv",
+        gqa.q_heads(),
+        gqa.kv_heads()
+    );
+    launch_paged_attn_decode_gqa_at(
+        stream,
+        func,
+        q_d,
+        q_row_stride,
+        k_d,
+        v_d,
+        out_d,
+        bt_d,
+        cl_d,
+        gqa,
+        layer,
+        bcap,
+        scale,
+    )
+}
+
 /// PTX entry name for the **int8** paged decode-attention kernel.
 pub const PAGED_ATTN_INT8_ENTRY: &str = "paged_attn_decode_int8";
 
@@ -526,11 +794,20 @@ pub const PAGED_ATTN_INT8_ENTRY: &str = "paged_attn_decode_int8";
 /// one, and query head `h` reads KV head `h / (q_heads / kv_heads)`. Both the int8 value index and the
 /// per-(token, head) *scale* index are KV-headed, since the scale slab has one entry per cached
 /// `(token, kv_head)`.
+///
+/// **Wave-6 v4 coalescing** on the int8 twin: [`AttnVec::V4`] is the default (`head_dim % 16 == 0`,
+/// G-W6-2). The scalar twin is [`paged_attn_decode_int8_scalar_ptx`].
 pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
-    assert!(
-        head_dim > 0 && head_dim.is_multiple_of(2),
-        "head_dim must be a positive even number"
-    );
+    paged_attn_decode_int8_ptx_with(head_dim, AttnVec::V4)
+}
+
+/// Pre-Wave-6 scalar `ld.global.s8` twin of [`paged_attn_decode_int8_ptx`].
+pub fn paged_attn_decode_int8_scalar_ptx(head_dim: usize) -> String {
+    paged_attn_decode_int8_ptx_with(head_dim, AttnVec::Scalar)
+}
+
+fn paged_attn_decode_int8_ptx_with(head_dim: usize, vec: AttnVec) -> String {
+    assert_int8_vec_align(head_dim, vec);
     let hd = head_dim;
     let w = PAGED_ATTN_WARPS as usize;
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
@@ -568,6 +845,7 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     s += &format!("    .shared .f32 qsh[{}];\n", w * hd);
     s += &format!("    .reg .f32 %acc<{hd}>;\n");
     s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt,%scK,%scV,%pv;\n";
+    s += vec_regs(vec);
     s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%oidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%qstride,%e,%es,%ki,%dd,%kvheads,%kvhead,%grp;\n";
     s += "    .reg .b64 %Q,%K,%V,%Ksc,%Vsc,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw;\n";
     s += "    .reg .pred %p0,%p1,%p2;\n";
@@ -619,10 +897,7 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     // int8 K/V bases (1 byte/elem).
     s += "    mul.wide.u32 %offb,%e,1;\n    add.s64 %kbase,%K,%offb;\n    add.s64 %vbase,%V,%offb;\n";
     // raw int dot, then scale by scaleK and the attention scale.
-    s += "    mov.f32 %score,0f00000000;\n";
-    for d in 0..hd {
-        s += &format!("    ld.shared.f32 %qv,[%qshw+{}];\n    ld.global.s8 %ki,[%kbase+{}];\n    cvt.rn.f32.s32 %kf,%ki;\n    fma.rn.f32 %score,%qv,%kf,%score;\n", d * 4, d);
-    }
+    s += &emit_int8_k_dot(hd, vec);
     s += "    mul.f32 %score,%score,%scK;\n    mul.f32 %score,%score,%scale;\n";
     s += "    max.f32 %newm,%m,%score;\n";
     s += &format!(
@@ -633,10 +908,172 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     );
     s += "    mul.f32 %l,%l,%corr;\n    add.f32 %l,%l,%p;\n";
     s += "    mul.f32 %pv,%p,%scV;\n";
-    for d in 0..hd {
-        s += &format!("    ld.global.s8 %ki,[%vbase+{}];\n    cvt.rn.f32.s32 %vf,%ki;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%pv,%vf,%acc{d};\n", d);
-    }
+    s += &emit_int8_v_acc(hd, vec);
     s += "    mov.f32 %m,%newm;\n    add.u32 %t,%t,32;\n    bra LOOP;\nENDLOOP:\n";
+    s += "    mov.f32 %M,%m;\n";
+    s += &bfly("%M", "max");
+    s += &format!(
+        "    sub.f32 %t0,%m,%M;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %factor,%t0;\n"
+    );
+    s += "    mul.f32 %l,%l,%factor;\n";
+    for d in 0..hd {
+        s += &format!("    mul.f32 %acc{d},%acc{d},%factor;\n");
+    }
+    s += "    mov.f32 %L,%l;\n";
+    s += &bfly("%L", "add");
+    for d in 0..hd {
+        s += &bfly(&format!("%acc{d}"), "add");
+    }
+    s += "    rcp.rn.f32 %invl,%L;\n    setp.gt.f32 %p2,%L,0f00000000;\n    selp.f32 %invl,%invl,0f00000000,%p2;\n";
+    s += "    setp.ne.u32 %p0,%lane,0;\n    @%p0 bra DONE;\n";
+    for d in 0..hd {
+        s += &format!(
+            "    mul.f32 %t0,%acc{d},%invl;\n    st.global.f32 [%obase+{}],%t0;\n",
+            d * 4
+        );
+    }
+    s += "DONE:\n    ret;\n}\n";
+    s
+}
+
+/// Generate the **K-side GQA-fold** paged decode-attention PTX (WAVE6 lever 5).
+///
+/// The warp map is the same query-headed one as [`paged_attn_decode_ptx`]: warp `gid` owns
+/// `(slot, q_head)` and keeps `%acc<hd>` in registers. The four warps of a CTA share `(slot, kv_head)`
+/// when `g >= PAGED_ATTN_WARPS`, so they score against the same K vector. Warp 0 stages that vector
+/// once into a 32-row CTA-shared tile (`ksh[32 * hd]` f16); the other three warps score from shared
+/// instead of re-reading HBM. V is still loaded per-warp (G-W6-3: folding V would put `g * hd`
+/// accumulators in the register file and hit the 512-reg wall at Llama-class `g = 4, hd = 128`).
+///
+/// The `t`-loop is over a **uniform** `tbase` so `bar.sync` is legal even when some lanes have
+/// `t >= ctx`. FMA order stays `d = 0,1,2,...`. Bit-identical to the one-head kernel — proved by
+/// `kfold_decode_is_bit_identical_to_one_head_per_warp`. `g` is not baked: the tile is 32 rows
+/// regardless of `g`. [`kfold_applies`] is the predicate the launcher asserts.
+pub fn paged_attn_decode_kfold_ptx(head_dim: usize) -> String {
+    assert_f16_vec_align(head_dim, AttnVec::V4);
+    let hd = head_dim;
+    let w = PAGED_ATTN_WARPS as usize;
+    let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    let neg_big = format!("0f{:08X}", (-1.0e30f32).to_bits());
+    let bfly = |reg: &str, op: &str| -> String {
+        let mut t = String::new();
+        for off in [16, 8, 4, 2, 1] {
+            t += &format!("    shfl.sync.bfly.b32 %rt,{reg},{off},0x1f,0xffffffff;\n    {op}.f32 {reg},{reg},%rt;\n");
+        }
+        t
+    };
+    let mut s = String::new();
+    s += HDR_SM80;
+    s += "\n";
+    s += &format!(
+        ".visible .entry {PAGED_ATTN_KFOLD_ENTRY}(\n\
+        \x20   .param .u64 pQ,\n\
+        \x20   .param .u64 pK,\n\
+        \x20   .param .u64 pV,\n\
+        \x20   .param .u64 pO,\n\
+        \x20   .param .u64 pBT,\n\
+        \x20   .param .u64 pCL,\n\
+        \x20   .param .f32 pScale,\n\
+        \x20   .param .u32 pBcap,\n\
+        \x20   .param .u32 pHeads,\n\
+        \x20   .param .u32 pKvHeads,\n\
+        \x20   .param .u32 pBsz,\n\
+        \x20   .param .u32 pNblk,\n\
+        \x20   .param .u32 pMbps,\n\
+        \x20   .param .u32 pLayer,\n\
+        \x20   .param .u32 pQStride\n)\n{{\n"
+    );
+    // One query row per warp (f32) plus a 32-row K tile (packed f16). At hd=128: 2 KiB + 8 KiB.
+    s += &format!("    .shared .f32 qsh[{}];\n", w * hd);
+    s += &format!("    .shared .b16 ksh[{}];\n", 32 * hd);
+    s += &format!("    .reg .f32 %acc<{hd}>;\n");
+    s += "    .reg .f32 %m,%l,%score,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt;\n";
+    s += vec_regs(AttnVec::V4);
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%kvhead,%ctx,%t,%tbase,%logical,%off,%phys,%D,%qidx,%oidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%qstride,%e,%dd,%kvheads,%grp;\n";
+    s += "    .reg .b64 %Q,%K,%V,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw,%kshw;\n";
+    s += "    .reg .pred %p0,%p1,%p2,%p_act;\n";
+    s += "    ld.param.u64 %Q,[pQ];   cvta.to.global.u64 %Q,%Q;\n";
+    s += "    ld.param.u64 %K,[pK];   cvta.to.global.u64 %K,%K;\n";
+    s += "    ld.param.u64 %V,[pV];   cvta.to.global.u64 %V,%V;\n";
+    s += "    ld.param.u64 %O,[pO];   cvta.to.global.u64 %O,%O;\n";
+    s += "    ld.param.u64 %BT,[pBT]; cvta.to.global.u64 %BT,%BT;\n";
+    s += "    ld.param.u64 %CL,[pCL]; cvta.to.global.u64 %CL,%CL;\n";
+    s += "    ld.param.f32 %scale,[pScale];\n";
+    s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %kvheads,[pKvHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
+    s += "    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    ld.param.u32 %qstride,[pQStride];\n";
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
+    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
+    // Query-headed warp map — identical to paged_attn_decode_ptx.
+    s += "    mul.lo.s32 %nq,%bcap,%heads;\n    setp.ge.u32 %p0,%gid,%nq;\n    @%p0 bra DONE;\n";
+    s += "    div.u32 %slot,%gid,%heads;\n    mul.lo.s32 %tmp,%slot,%heads;\n    sub.u32 %head,%gid,%tmp;\n";
+    s += "    div.u32 %grp,%heads,%kvheads;\n    div.u32 %kvhead,%head,%grp;\n";
+    s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%CL,%offb;\n    ld.global.u32 %ctx,[%addr];\n";
+    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %tmp,%head,{hd};\n");
+    s += "    mul.lo.s32 %oidx,%slot,%D;\n    add.u32 %oidx,%oidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%oidx,4;\n    add.s64 %obase,%O,%offb;\n";
+    s += "    mul.lo.s32 %qidx,%slot,%qstride;\n    add.u32 %qidx,%qidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n";
+    s += &format!(
+        "    mov.u64 %qshw,qsh;\n    mul.wide.u32 %offb,%warp,{};\n    add.s64 %qshw,%qshw,%offb;\n",
+        hd * 4
+    );
+    // kshw = &ksh[lane * hd] — this lane's row of the CTA-shared K tile (packed f16).
+    s += &format!(
+        "    mov.u64 %kshw,ksh;\n    mul.lo.s32 %tmp,%lane,{hd};\n    mul.wide.u32 %offb,%tmp,2;\n    add.s64 %kshw,%kshw,%offb;\n"
+    );
+    s += &format!(
+        "    mov.u32 %dd,%lane;\nQLOOP:\n    setp.ge.u32 %p1,%dd,{hd};\n    @%p1 bra QDONE;\n"
+    );
+    s += "    mul.wide.u32 %offb,%dd,4;\n    add.s64 %addr,%qrow,%offb;\n    ld.global.f32 %qv,[%addr];\n";
+    s += "    add.s64 %addr,%qshw,%offb;\n    st.shared.f32 [%addr],%qv;\n    add.u32 %dd,%dd,32;\n    bra QLOOP;\nQDONE:\n";
+    s += "    bar.warp.sync 0xffffffff;\n";
+    for d in 0..hd {
+        s += &format!("    mov.f32 %acc{d},0f00000000;\n");
+    }
+    s += &format!("    mov.f32 %m,{neg_big};\n    mov.f32 %l,0f00000000;\n");
+    // Uniform tbase so bar.sync is legal when some lanes have t >= ctx. ctx==0 skips the loop
+    // (every lane of every warp in the CTA takes the same branch — kfold_applies forbids partial CTAs).
+    s += "    mov.u32 %tbase,0;\nLOOP:\n    setp.ge.u32 %p1,%tbase,%ctx;\n    @%p1 bra ENDLOOP;\n";
+    s += "    add.u32 %t,%tbase,%lane;\n    setp.lt.u32 %p_act,%t,%ctx;\n";
+    s += "    bar.sync 0;\n";
+    // Warp 0, active lanes: stage K into ksh[lane]. Inactive lanes skip the store (no barrier inside).
+    s += "    setp.eq.u32 %p0,%warp,0;\n    @!%p0 bra KSTAGED;\n    @!%p_act bra KSTAGED;\n";
+    s += "    div.u32 %logical,%t,%bsz;\n    mul.lo.s32 %off,%logical,%bsz;\n    sub.u32 %off,%t,%off;\n";
+    s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %addr,%BT,%offb;\n    ld.global.u32 %phys,[%addr];\n";
+    s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
+    s += &format!(
+        "    mul.lo.s32 %e,%e,%kvheads;\n    add.u32 %e,%e,%kvhead;\n    mul.lo.s32 %e,%e,{hd};\n"
+    );
+    s += "    mul.wide.u32 %offb,%e,2;\n    add.s64 %kbase,%K,%offb;\n";
+    for c in 0..hd / 8 {
+        let off = c * 16;
+        s += &format!("    ld.global.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%kbase+{off}];\n");
+        s += &format!("    st.shared.v4.b32 [%kshw+{off}],{{%pk0,%pk1,%pk2,%pk3}};\n");
+    }
+    s += "KSTAGED:\n    bar.sync 0;\n";
+    s += "    @!%p_act bra SKIPPOS;\n";
+    // Page-table walk for V (and for warps 1-3, which did not compute kbase). Same t as warp 0.
+    s += "    div.u32 %logical,%t,%bsz;\n    mul.lo.s32 %off,%logical,%bsz;\n    sub.u32 %off,%t,%off;\n";
+    s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %addr,%BT,%offb;\n    ld.global.u32 %phys,[%addr];\n";
+    s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
+    s += &format!(
+        "    mul.lo.s32 %e,%e,%kvheads;\n    add.u32 %e,%e,%kvhead;\n    mul.lo.s32 %e,%e,{hd};\n"
+    );
+    s += "    mul.wide.u32 %offb,%e,2;\n    add.s64 %vbase,%V,%offb;\n";
+    s += &emit_f16_k_dot_from_ksh(hd);
+    s += "    mul.f32 %score,%score,%scale;\n";
+    s += "    max.f32 %newm,%m,%score;\n";
+    s += &format!(
+        "    sub.f32 %t0,%m,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %corr,%t0;\n"
+    );
+    s += &format!(
+        "    sub.f32 %t0,%score,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %p,%t0;\n"
+    );
+    s += "    mul.f32 %l,%l,%corr;\n    add.f32 %l,%l,%p;\n";
+    s += &emit_f16_v_acc(hd, AttnVec::V4);
+    s += "    mov.f32 %m,%newm;\n";
+    s += "SKIPPOS:\n    add.u32 %tbase,%tbase,32;\n    bra LOOP;\nENDLOOP:\n";
     s += "    mov.f32 %M,%m;\n";
     s += &bfly("%M", "max");
     s += &format!(
@@ -1742,6 +2179,14 @@ mod tests {
             assert!(ptx.contains("bar.warp.sync"), "warp sync after staging q");
             assert!(ptx.contains("ex2.approx.f32"), "online softmax exp");
             assert!(ptx.contains("cvt.f32.f16"), "f16 cache widened to f32");
+            assert!(
+                ptx.contains("ld.global.v4.b32"),
+                "head dim {hd}: shipped decode kernel must issue ld.global.v4.b32 (WAVE6 lever 4)"
+            );
+            assert!(
+                !ptx.contains("ld.global.u16"),
+                "head dim {hd}: shipped decode kernel must not fall back to scalar u16 loads"
+            );
             // The output uses rcp + select (the empty-sequence NaN guard).
             assert!(ptx.contains("rcp.rn.f32") && ptx.contains("selp.f32"));
             assert_gqa_shape(&ptx, "paged_attn_decode");
@@ -1834,7 +2279,104 @@ mod tests {
         }
     }
 
-    /// **The append source-layout law.** Both append kernels read their K and V planes at
+    /// **WAVE6 lever 4, device-free.** The shipped generators issue `ld.global.v4.b32`; the scalar
+    /// twins still issue the pre-Wave-6 element load. Same FMA order is pinned by the unpack walking
+    /// `d = 0,1,2,...` after each vector load (the `==` gate on device is what proves the values).
+    #[test]
+    fn v4_loads_are_the_shipped_default_and_the_scalar_twin_still_exists() {
+        for hd in GATED_HEAD_DIMS {
+            let v4 = paged_attn_decode_ptx(hd);
+            let sc = paged_attn_decode_scalar_ptx(hd);
+            assert_floor(&v4, "paged_attn_decode v4");
+            assert_floor(&sc, "paged_attn_decode scalar");
+            assert!(v4.contains("ld.global.v4.b32") && !v4.contains("ld.global.u16"));
+            assert!(sc.contains("ld.global.u16") && !sc.contains("ld.global.v4.b32"));
+            assert!(v4.is_ascii() && sc.is_ascii());
+            let v4i = paged_attn_decode_int8_ptx(hd);
+            let sci = paged_attn_decode_int8_scalar_ptx(hd);
+            assert!(v4i.contains("ld.global.v4.b32") && v4i.contains("bfe.s32"));
+            assert!(sci.contains("ld.global.s8") && !sci.contains("ld.global.v4.b32"));
+            assert!(v4i.is_ascii() && sci.is_ascii());
+            assert_eq!(v4.matches('{').count(), v4.matches('}').count());
+            assert_eq!(sc.matches('{').count(), sc.matches('}').count());
+        }
+    }
+
+    /// **G-W6-2.** A `head_dim` that is even but not 8-aligned must not emit a 16-byte load — the
+    /// corpus's 64/128 would never catch it.
+    #[test]
+    #[should_panic(expected = "head_dim % 8 == 0")]
+    fn v4_f16_rejects_a_misaligned_head_dim() {
+        let _ = paged_attn_decode_ptx(4);
+    }
+
+    #[test]
+    #[should_panic(expected = "head_dim % 16 == 0")]
+    fn v4_int8_rejects_a_misaligned_head_dim() {
+        let _ = paged_attn_decode_int8_ptx(8);
+    }
+
+    /// **WAVE6 lever 5, device-free.** The K-fold kernel keeps the query-headed warp map (one warp
+    /// per `(slot, q_head)`), stages K into a 32-row CTA-shared tile (`ksh[32 * hd]`), issues
+    /// `ld.global.v4.b32` from warp 0 and `ld.shared.v4.b32` from every warp, keeps the `sm_80`
+    /// floor, and is pure ASCII. Accumulators stay per-lane registers — folding V is the 512-reg
+    /// wall this kernel exists to avoid.
+    #[test]
+    fn kfold_ptx_is_cta_shared_k_v4_and_pure_ascii() {
+        for hd in GATED_HEAD_DIMS {
+            let ptx = paged_attn_decode_kfold_ptx(hd);
+            assert_floor(&ptx, "paged_attn_decode_kfold");
+            assert!(ptx.contains(&format!(".visible .entry {PAGED_ATTN_KFOLD_ENTRY}(")));
+            assert!(
+                ptx.contains("mul.lo.s32 %nq,%bcap,%heads;"),
+                "hd={hd}: the warp grid must stay query-headed"
+            );
+            assert!(
+                !ptx.contains("mul.lo.s32 %nq,%bcap,%kvheads;"),
+                "hd={hd}: a KV-headed grid would change the warp map and the values"
+            );
+            assert!(
+                ptx.contains("div.u32 %grp,%heads,%kvheads;")
+                    && ptx.contains("div.u32 %kvhead,%head,%grp;"),
+                "hd={hd}: GQA mapping must be grp = q_heads/kv_heads, kvhead = head/grp"
+            );
+            assert!(ptx.contains("ld.global.v4.b32"), "kfold composes with v4");
+            assert!(
+                ptx.contains("ld.shared.v4.b32"),
+                "hd={hd}: non-staging warps must score from the CTA-shared K tile"
+            );
+            assert!(
+                ptx.contains(&format!("ksh[{}]", 32 * hd)),
+                "hd={hd}: one packed-f16 K vector per lane"
+            );
+            assert!(
+                ptx.contains(&format!("qsh[{}]", PAGED_ATTN_WARPS as usize * hd)),
+                "hd={hd}: one query row per warp, not g rows"
+            );
+            assert!(
+                !ptx.contains("accsh["),
+                "hd={hd}: accs stay in registers; a shared-acc tile is the refuted per-warp g-fold"
+            );
+            assert!(
+                ptx.contains("bar.sync 0;"),
+                "hd={hd}: CTA barrier around the K tile"
+            );
+            assert!(ptx.is_ascii(), "PTX must be pure ASCII (hd={hd})");
+            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
+            assert!(!ptx.contains(crate::ptx_target::TARGET_SM89));
+        }
+        assert!(kfold_applies(32, 8)); // Llama-3-8B, g=4
+        assert!(kfold_applies(64, 8)); // Llama-3-70B, g=8
+        assert!(kfold_applies(8, 1)); // g=8, full CTAs
+        assert!(kfold_applies(8, 2)); // g=4 — the laptop-width Llama grouping
+        assert!(kfold_applies(16, 4)); // g=4
+        assert!(!kfold_applies(12, 12)); // MHA
+        assert!(!kfold_applies(8, 4)); // g=2 splits a CTA across two kv_heads
+        assert!(!kfold_applies(32, 1)); // MQA-32, g=32 > KFOLD_G_MAX
+        assert!(!kfold_applies(6, 2)); // q_heads not a multiple of WARPS
+    }
+
+    /// The append source-layout law. Both append kernels read their K and V planes at
     /// `slot_row*pSrcStride + <plane offset>`, so one merged `[Bcap, D + 2*kv_dim]` projection buffer
     /// is addressable without a copy. At [`KvSourceLayout::packed`] the arithmetic reduces to the
     /// pre-merge index exactly (`row_stride == kv_dim`, both offsets 0) — that reduction is what makes
@@ -1911,6 +2453,13 @@ mod tests {
                 1,
                 8,
             ),
+            (
+                "paged_attn_decode_kfold",
+                paged_attn_decode_kfold_ptx(64),
+                6,
+                1,
+                8,
+            ),
             // The appends are KV-headed and never see a query head; they gained the three
             // source-layout params instead: [bcap, heads, hd, bsz, nblk, mbps, layer,
             // src_stride, k_off, v_off].
@@ -1942,7 +2491,18 @@ mod tests {
             let ptx = paged_attn_decode_int8_ptx(hd);
             assert!(ptx.contains(".visible .entry paged_attn_decode_int8("));
             assert_floor(&ptx, "paged_attn_decode_int8");
-            assert!(ptx.contains("ld.global.s8"), "int8 cache read");
+            assert!(
+                ptx.contains("ld.global.v4.b32"),
+                "int8 cache read is a 16-byte vector (WAVE6 lever 4)"
+            );
+            assert!(
+                ptx.contains("bfe.s32"),
+                "int8 v4 unpack must sign-extend each byte (same as ld.global.s8)"
+            );
+            assert!(
+                !ptx.contains("ld.global.s8"),
+                "shipped int8 kernel must not fall back to scalar s8 loads"
+            );
             assert!(
                 !ptx.contains("cvt.f32.f16"),
                 "the int8 kernel stores no f16 — nothing to widen"
@@ -2332,6 +2892,117 @@ mod tests {
         g.stream.memcpy_dtov(&out_d).unwrap()
     }
 
+    #[cfg(feature = "gpu")]
+    #[derive(Clone, Copy, Debug)]
+    enum AttnKernel {
+        Scalar,
+        V4,
+        KFold,
+    }
+
+    /// [`run_paged_attn_gqa`] with an explicit kernel. Keys are distinct so [`crate::Gpu::function`]
+    /// cannot hand the v4 module to a scalar launch (crate rule 4).
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_attn_gqa_kind(
+        g: &mut crate::Gpu,
+        mgr: &BlockManager,
+        gqa: &GqaConfig,
+        layer: usize,
+        q: &[f32],
+        k_slots: &[Vec<f32>],
+        v_slots: &[Vec<f32>],
+        scale: f32,
+        kind: AttnKernel,
+    ) -> Vec<f32> {
+        use half::f16;
+        let cfg = gqa.kv();
+        let bcap = cfg.num_slots;
+        let (kvh_n, hd) = (gqa.kv_heads(), cfg.head_dim);
+        let mut kh = vec![f16::from_f32(0.0); cfg.slab_elems()];
+        let mut vh = vec![f16::from_f32(0.0); cfg.slab_elems()];
+        for b in 0..bcap {
+            for t in 0..mgr.context_len(b) {
+                let (phys, off) = mgr.locate(b, t);
+                for h in 0..kvh_n {
+                    for dh in 0..hd {
+                        let idx = cfg.elem_offset(layer, phys, off, h, dh);
+                        let src = (t * kvh_n + h) * hd + dh;
+                        kh[idx] = f16::from_f32(k_slots[b][src]);
+                        vh[idx] = f16::from_f32(v_slots[b][src]);
+                    }
+                }
+            }
+        }
+        let q_d = g.stream.memcpy_stod(q).unwrap();
+        let k_d = g.stream.memcpy_stod(&kh).unwrap();
+        let v_d = g.stream.memcpy_stod(&vh).unwrap();
+        let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
+        let cl_d = g.stream.memcpy_stod(&mgr.ctx_lens()).unwrap();
+        let mut out_d = g.stream.alloc_zeros::<f32>(bcap * gqa.q_dim()).unwrap();
+        let (key, ptx, entry): (&'static str, String, &str) = match (kind, hd) {
+            (AttnKernel::V4, 64) => (
+                "paged_attn_d64",
+                paged_attn_decode_ptx(hd),
+                PAGED_ATTN_ENTRY,
+            ),
+            (AttnKernel::V4, 128) => (
+                "paged_attn_d128",
+                paged_attn_decode_ptx(hd),
+                PAGED_ATTN_ENTRY,
+            ),
+            (AttnKernel::Scalar, 64) => (
+                "paged_attn_scalar_d64",
+                paged_attn_decode_scalar_ptx(hd),
+                PAGED_ATTN_ENTRY,
+            ),
+            (AttnKernel::Scalar, 128) => (
+                "paged_attn_scalar_d128",
+                paged_attn_decode_scalar_ptx(hd),
+                PAGED_ATTN_ENTRY,
+            ),
+            (AttnKernel::KFold, 64) => (
+                "paged_attn_kfold_d64",
+                paged_attn_decode_kfold_ptx(hd),
+                PAGED_ATTN_KFOLD_ENTRY,
+            ),
+            (AttnKernel::KFold, 128) => (
+                "paged_attn_kfold_d128",
+                paged_attn_decode_kfold_ptx(hd),
+                PAGED_ATTN_KFOLD_ENTRY,
+            ),
+            (kind, hd) => {
+                panic!("paged-attn test harness: no module-cache key for {kind:?} hd={hd}")
+            }
+        };
+        let func = g.function(key, &ptx, entry).unwrap();
+        match kind {
+            AttnKernel::KFold => launch_paged_attn_decode_kfold_gqa_at(
+                &g.stream,
+                &func,
+                &q_d,
+                gqa.q_dim(),
+                &k_d,
+                &v_d,
+                &mut out_d,
+                &bt_d,
+                &cl_d,
+                gqa,
+                layer,
+                bcap,
+                scale,
+            )
+            .unwrap(),
+            AttnKernel::Scalar | AttnKernel::V4 => launch_paged_attn_decode_gqa(
+                &g.stream, &func, &q_d, &k_d, &v_d, &mut out_d, &bt_d, &cl_d, gqa, layer, bcap,
+                scale,
+            )
+            .unwrap(),
+        }
+        g.stream.synchronize().unwrap();
+        g.stream.memcpy_dtov(&out_d).unwrap()
+    }
+
     /// Build a fixture: ragged context lengths (incl. an inactive 0 and non-block-multiple lengths),
     /// f16-rounded per-slot K/V, a query, and the `KvConfig`. Returns `(cfg, ctx, q, k, v, scale)`.
     #[cfg(feature = "gpu")]
@@ -2717,6 +3388,130 @@ mod tests {
                 a.table(first_active),
                 bm.table(first_active)
             );
+        });
+    }
+
+    /// **WAVE6 lever 4, on device.** `ld.global.v4.b32` must be bit-identical to the scalar
+    /// `ld.global.u16` kernel: same values, same FMA order, same lane partition. `==` on bits, never
+    /// a tolerance — a tolerance would pass a transpose of the unpack.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn v4_decode_is_bit_identical_to_the_scalar_kernel() {
+        with_gpu("v4_decode_is_bit_identical_to_the_scalar_kernel", |g| {
+            for (q_heads, kv_heads, hd) in [(8usize, 2, 64), (8, 8, 64), (8, 2, 128)] {
+                let block_size = 16usize;
+                let (gqa, ctx, q, k, v, scale) = fixture_gqa(
+                    0x5400,
+                    q_heads,
+                    kv_heads,
+                    hd,
+                    block_size,
+                    vec![37, 0, 16, 100, 5, 64],
+                );
+                let cfg = *gqa.kv();
+                let mut mgr = BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                );
+                for (b, &c) in ctx.iter().enumerate() {
+                    if c > 0 {
+                        mgr.reserve(b, c).unwrap();
+                    }
+                }
+                let scalar = run_paged_attn_gqa_kind(
+                    g,
+                    &mgr,
+                    &gqa,
+                    0,
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    AttnKernel::Scalar,
+                );
+                let v4 =
+                    run_paged_attn_gqa_kind(g, &mgr, &gqa, 0, &q, &k, &v, scale, AttnKernel::V4);
+                let differing = scalar
+                    .iter()
+                    .zip(&v4)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "{q_heads}q/{kv_heads}kv x {hd}: v4 differs from scalar in {differing} of {} lanes",
+                    scalar.len()
+                );
+                assert!(
+                    scalar.iter().any(|&z| z != 0.0),
+                    "control arm produced an all-zero output"
+                );
+                eprintln!(
+                    "v4 == scalar bit-for-bit on {} f32 ({q_heads}q/{kv_heads}kv x {hd})",
+                    scalar.len()
+                );
+            }
+        });
+    }
+
+    /// **WAVE6 lever 5, on device.** The K-side GQA fold must be bit-identical to the one-warp-per
+    /// query-head kernel (which is itself v4). Same lane partition, same butterfly, g scores from
+    /// one K load.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn kfold_decode_is_bit_identical_to_one_head_per_warp() {
+        with_gpu("kfold_decode_is_bit_identical_to_one_head_per_warp", |g| {
+            for (q_heads, kv_heads, hd) in [(8usize, 2, 64), (8, 1, 64), (16, 4, 64), (8, 2, 128)] {
+                assert!(
+                    kfold_applies(q_heads, kv_heads),
+                    "{q_heads}q/{kv_heads}kv must be a kfold geometry"
+                );
+                let block_size = 16usize;
+                let (gqa, ctx, q, k, v, scale) = fixture_gqa(
+                    0x6F0D,
+                    q_heads,
+                    kv_heads,
+                    hd,
+                    block_size,
+                    vec![37, 0, 16, 100, 5, 64],
+                );
+                let cfg = *gqa.kv();
+                let mut mgr = BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                );
+                for (b, &c) in ctx.iter().enumerate() {
+                    if c > 0 {
+                        mgr.reserve(b, c).unwrap();
+                    }
+                }
+                let v4 =
+                    run_paged_attn_gqa_kind(g, &mgr, &gqa, 0, &q, &k, &v, scale, AttnKernel::V4);
+                let fold =
+                    run_paged_attn_gqa_kind(g, &mgr, &gqa, 0, &q, &k, &v, scale, AttnKernel::KFold);
+                let differing = v4
+                    .iter()
+                    .zip(&fold)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "{q_heads}q/{kv_heads}kv x {hd}: kfold differs from v4 in {differing} of {} lanes",
+                    v4.len()
+                );
+                assert!(
+                    v4.iter().any(|&z| z != 0.0),
+                    "control arm produced all zeros"
+                );
+                eprintln!(
+                    "kfold == v4 bit-for-bit on {} f32 ({q_heads}q/{kv_heads}kv x {hd}, g={})",
+                    v4.len(),
+                    gqa.group_size()
+                );
+            }
         });
     }
 
