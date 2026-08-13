@@ -892,13 +892,14 @@ impl Sema<'_> {
                 // stays the documented `?` escape hatch.
                 Dim::Var(v) => {
                     let name = self.sym_str(v).to_string();
+                    let at = self.dim_site(site);
                     self.error(
                         span,
                         "E0502",
                         format!(
-                            "dimension mismatch: expected {pc}, found the generic dimension `{name}` \
-                             (a universally-quantified dimension cannot be assumed equal to {pc}; \
-                             declare the parameter `?` if the size is a runtime value)"
+                            "dimension mismatch on {at}: expected {pc}, found the generic dimension \
+                             `{name}` (a universally-quantified dimension cannot be assumed equal \
+                             to {pc}; declare the parameter `?` if the size is a runtime value)"
                         ),
                     );
                 }

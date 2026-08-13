@@ -4492,6 +4492,20 @@ mod tests {
     }
 
     #[test]
+    fn generic_dim_against_a_fixed_size_names_the_axis() {
+        // Forwarding a caller's own universally-quantified dim into a fixed-size parameter: the
+        // message now says which axis carries the unprovable claim, alongside the size and the
+        // generic's name.
+        let src = "fn takes64(a: Tensor[f32, 64]) -> f32 { return a[63]; } \
+                   fn fwd<N>(a: Tensor[f32, N]) -> f32 { return takes64(a); }";
+        assert_message_has(
+            src,
+            "E0502",
+            &["axis 0", "expected 64", "the generic dimension `N`"],
+        );
+    }
+
+    #[test]
     fn tensor_index_rank_mismatch_errors() {
         let src = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0]; }";
         assert!(
