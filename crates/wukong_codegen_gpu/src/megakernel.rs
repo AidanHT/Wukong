@@ -899,12 +899,14 @@ fn main() -> i32 {{
     /// comparison is against the single-thread GPU lowering (same helper, so byte-identical is
     /// required) and against the interpreter oracle (an independent CPU evaluator).
     ///
-    /// N is 512 — more than one CTA's 256 threads, so at least one thread must take a *second* trip
-    /// of the grid-stride loop, and the tail threads must take an empty range. A gate with N <= 256
-    /// would pass on a lowering whose stride was wrong in every way except the first iteration.
+    /// N is 600 against a 256-thread CTA, which is three things at once: more than one trip (a gate
+    /// with N <= 256 passes on a lowering whose stride is wrong in every way except the first
+    /// iteration), *not* a multiple of the stride (so the third trip is ragged and 168 threads must
+    /// take the empty range `hi = min(i+1, n) <= lo` instead of writing past `n`), and enough lanes
+    /// that a mis-strided loop cannot coincidentally cover the domain.
     #[test]
     fn mega_generic_parallel_matches_single_and_oracle() {
-        const N: usize = 512;
+        const N: usize = 600;
         let src = format!(
             r#"module mega_generic_par
 @parallel
@@ -983,8 +985,10 @@ fn main() -> i32 {{
             String::from_utf8_lossy(&oracle.1).trim()
         );
         eprintln!(
-            "[gate] generic @parallel grid-stride == single == oracle over {N} lanes ({} threads/CTA)",
-            MEGA_BLOCK
+            "[gate] generic @parallel grid-stride == single == oracle over {N} lanes \
+             ({MEGA_BLOCK} threads/CTA, {} trips, ragged tail of {})",
+            N.div_ceil(MEGA_BLOCK as usize),
+            N % MEGA_BLOCK as usize,
         );
     }
 
