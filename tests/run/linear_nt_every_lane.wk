@@ -1,0 +1,91 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 168
+// EXPECT-OUT: 132
+// EXPECT-OUT: 96
+// EXPECT-OUT: 60
+// EXPECT-OUT: 24
+// EXPECT-OUT: -12
+// EXPECT-OUT: 392
+// EXPECT-OUT: 292
+// EXPECT-OUT: 192
+// EXPECT-OUT: 92
+// EXPECT-OUT: -8
+// EXPECT-OUT: -108
+// EXPECT-OUT: 616
+// EXPECT-OUT: 452
+// EXPECT-OUT: 288
+// EXPECT-OUT: 124
+// EXPECT-OUT: -40
+// EXPECT-OUT: -204
+module tests.run.linear_nt_every_lane
+
+// The `nn.Linear` forward `Y = X·Wᵀ` written the way this language asks you to write it: shape-typed
+// `Tensor` parameters and multi-index reads, `for i in 0..N` loops, and a scalar accumulator for the
+// inner dot product. It is the program the GPU offload seam routes to Hopper's `gemm_nt_wgmma`
+// (`wukong_driver::gpu_accel::GpuAccel::try_gemm_nt_wgmma`), and the corpus had no fixture that
+// printed a recognized `A·Bᵀ` **lane by lane**.
+//
+// WHY EVERY LANE. `linear_f32.wk` covers the same recognizer but prints only `c[0]` and `c[3]` — two
+// of its four outputs — so a kernel that got the other half wrong would pass it. Recognized kernels
+// are GATE-BLIND: `native_matches_interpreter` and both invariance gates cannot see the defect
+// because interp and native call the *same* `wukong_sgemm_nt` symbol at every `-O` level. The
+// EXPECT-OUT block below is therefore the whole proof, and it is the whole output buffer.
+//
+// PROOF THE RECOGNIZER FIRES (do this by hand after touching the recognizer; no gate can):
+//     cargo run -q -p wukongc -- --emit=mir -O2 tests/run/linear_nt_every_lane.wk | grep wukong_
+// prints `call wukong_sgemm_nt(...)`. The flat-index spelling `x[i*8+k] * w[j*8+k]` lowers to
+// byte-identical MIR, so this fixture is the idiomatic surface over the same kernel, not a dialect.
+//
+// WHERE THE EXPECTED VALUES COME FROM — the scalar semantics of the nest, never a compiler run.
+// The fills are `x[i,k] = i*8 + k + 1` (so 1..24) and `w[j,k] = k - j` (so -5..7), and with
+// A = 8i+1, x[i,k] = A + k, so
+//     y[i,j] = Σ_{k=0..7} (A + k)(k - j)
+//            = A·Σk − 8A·j + Σk² − j·Σk        where Σ_{k=0..7} k = 28 and Σk² = 140
+//            = A·(28 − 8j) + 140 − 28j.
+// Check two corners by hand: y[0,0] = 1·28 + 140 = 168, and y[2,5] = 17·(28−40) + 140 − 140 = −204.
+// All 18 lanes are DISTINCT and the signs are mixed, so a swapped index, a dropped sign, a
+// non-transposed B, a zeroed lane or a K-loop that loses its last term each change the printed
+// vector rather than cancelling inside it.
+//
+// The shape is deliberately ragged against every tile constant in the backend (M=3, N=6, K=8 against
+// wgmma's 128×256×64) while still being a shape the Hopper seam accepts rather than declines: N is
+// even (the `st.global.v2.f32` epilogue needs that), K is a multiple of 8 (a K-major NT operand's
+// row stride is `K*2` bytes and `cuTensorMapEncodeTiled` needs a multiple of 16), and every operand
+// row's peak magnitude sits inside f16's normal range so the seam's operand-range decline stays
+// quiet. Values are small integers, so both backends render them identically.
+fn linear(x: Tensor[f32, 3, 8], w: Tensor[f32, 6, 8], mut y: Tensor[f32, 3, 6]) {
+    for i in 0..3 {
+        for j in 0..6 {
+            let mut s: f32 = 0.0;
+            for k in 0..8 {
+                s = s + x[i, k] * w[j, k];
+            }
+            y[i, j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 24] = [0.0; 24];
+    let mut w: [f32; 48] = [0.0; 48];
+    let mut y: [f32; 18] = [0.0; 18];
+
+    for i in 0..3 {
+        for k in 0..8 {
+            x[i * 8 + k] = ((i * 8 + k + 1) as f32);
+        }
+    }
+    for j in 0..6 {
+        for k in 0..8 {
+            w[j * 8 + k] = (k as f32) - (j as f32);
+        }
+    }
+
+    linear(x, w, y);
+
+    for t in 0..18 {
+        print(y[t] as i32);
+    }
+    return 0;
+}

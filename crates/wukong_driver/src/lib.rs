@@ -21,6 +21,14 @@ pub use wukong_diag::{all_explanations, explain, Explanation};
 #[cfg(feature = "gpu")]
 mod gpu_accel;
 
+/// **The end-to-end measurement round**: a real `.wk` program through the real pipeline, timed
+/// against cuBLAS, with compile time and execution time reported as separate quantities. Test-only —
+/// it adds nothing to the shipped library — but the device-free laws in it run in the ordinary
+/// `cargo test -p wukong_driver --features gpu --lib` step, which is where they belong: each one pins
+/// a way the metered round could bill an H100 and prove nothing.
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_e2e_bench;
+
 /// The multi-file front end: resolves `import`s to files, loads each once (depth-first,
 /// cycle-safe), and splices their items into the root module — one merged flat namespace.
 mod loader;

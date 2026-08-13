@@ -343,7 +343,10 @@ pub(crate) fn gemm_route_for(cc: (i32, i32), wgmma_off: bool) -> GemmRoute {
 /// re-measured. When wave 3 lands the per-shape dispatcher — which also chooses the *tile*, something
 /// this rule structurally cannot express because both arms are 128×256 — the body of this function is
 /// the one place that changes.
-fn wgmma_cfg_for(dtype: WgmmaDtype, m: usize, n: usize) -> &'static WgmmaCfg {
+/// `pub(crate)` for `gpu_e2e_bench`: the end-to-end round's direct-launch arm must launch the config
+/// **this seam would have chosen**, not one it re-derives, or the arm it calls "the kernel the route
+/// runs" is a different kernel and the retention ratio is measuring two variables at once.
+pub(crate) fn wgmma_cfg_for(dtype: WgmmaDtype, m: usize, n: usize) -> &'static WgmmaCfg {
     match dtype {
         WgmmaDtype::F16 => ptx_wgmma::wgmma_w1_for(m, n),
         WgmmaDtype::Bf16 => ptx_wgmma::wgmma_w1_bf16_for(m, n),
@@ -537,7 +540,7 @@ pub(crate) fn capability_skip_is_a_failure(
 /// bf16 becomes reachable when the lowp `wukong_sgemm_{bf16,f16}_nt_epi` symbols get an
 /// `Accelerator` hook at all (WAVE4_DOSSIER §5.4 gap 3); [`wgmma_cfg_for`] already routes it, and it
 /// is the arm that would need none of the range decline.
-const WGMMA_F32_SEAM_DTYPE: WgmmaDtype = WgmmaDtype::F16;
+pub(crate) const WGMMA_F32_SEAM_DTYPE: WgmmaDtype = WgmmaDtype::F16;
 
 /// **The largest magnitude the seam's 16-bit input type carries as a finite value**, asked of the
 /// crate `gpu::gemm_nt_wgmma` converts with rather than typed as a literal — so a `half` upgrade
@@ -714,7 +717,11 @@ const MAX_GRID_X: u32 = i32::MAX as u32;
 /// tiles on y.
 const MAX_GRID_YZ: u32 = 65_535;
 
-fn wgmma_declines(
+/// `pub(crate)` for `gpu_e2e_bench`, which asserts on this laptop — before any hour is rented — that
+/// every shape in the campaign's published grid is one this seam ACCEPTS. A grid row the seam
+/// declines would be timed with `gpu::gemm_nt` in the offload arm and the wgmma kernel in the
+/// direct-launch arm, i.e. two different kernels under one ratio.
+pub(crate) fn wgmma_declines(
     cfg: &WgmmaCfg,
     m: usize,
     k: usize,
