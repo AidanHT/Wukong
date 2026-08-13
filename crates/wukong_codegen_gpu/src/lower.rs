@@ -4750,6 +4750,70 @@ fn main() -> i32 {
         );
     }
 
+    /// **The grid-stride loop takes its geometry from the launch, not from a literal** (Task 1.3).
+    ///
+    /// The occupancy discipline in this crate is that a device fact is probed or the process fails:
+    /// `Gpu::new` aborts on an unqueryable SM count (it used to fall back to a silent `20`, this
+    /// laptop's number, which is wrong-but-plausible on every other card) and `megakernel::plan_grid`
+    /// derives the grid from `cuOccupancyMaxActiveBlocksPerMultiprocessor x sm_count`. A lowering
+    /// that hardcoded `256` threads would sit *underneath* all of that and silently visit a fraction
+    /// of the domain the moment the launch geometry changed — including the existing
+    /// `WUKONG_MEGA_GRID` sweep and the grid-parallel ABI this module already emits for the barrier
+    /// probe.
+    ///
+    /// So the index and stride must be read out of `%tid.x`/`%ctaid.x` and `%ntid.x`/`%nctaid.x`, and
+    /// the emitted preamble is checked to carry no thread- or SM-count immediate. Device-free: it
+    /// reads the text.
+    #[test]
+    fn grid_stride_geometry_comes_from_the_launch() {
+        const SRC: &str = r#"module gate_par
+@parallel
+fn main() -> i32 {
+    let mut x: [f32; 512] = [0.0; 512];
+    let mut y: [f32; 512] = [0.0; 512];
+    for i in 0..512 { x[i] = (i as f32) * 2.0; }
+    for i in 0..512 {
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }
+    print(y[511] as i32);
+    return 0;
+}
+"#;
+        let (program, mut interner) = build(SRC, 2).expect("the @parallel probe must compile");
+        let entry = interner.intern("main");
+        let ptx = emit_mega_ptx(&program, entry, &interner)
+            .expect("a generic @parallel region must lower in mega mode");
+        assert!(ptx.is_ascii(), "PTX must stay ASCII");
+
+        for reg in ["%tid.x", "%ntid.x", "%ctaid.x", "%nctaid.x"] {
+            assert!(
+                ptx.contains(reg),
+                "the grid-stride index/stride must be derived from {reg} in:\n{ptx}"
+            );
+        }
+        // The stride preamble: the grid-stride emitter's own geometry reads, i.e. from the LAST
+        // `%tid.x` before the loop label (the mega preamble reads one too, for the `tid==0` guard).
+        let to = ptx.find("PFOR").expect("the grid-stride loop label");
+        let from = ptx[..to].rfind("%tid.x").expect("a geometry read");
+        let pre = &ptx[from..to];
+        assert!(
+            pre.contains("%nctaid.x"),
+            "the stride must span the whole GRID (blockDim x gridDim), not one CTA:\n{pre}"
+        );
+        for lit in [
+            format!(", {};", crate::megakernel::MEGA_BLOCK),
+            ", 20;".to_string(),
+        ] {
+            assert!(
+                !pre.contains(&lit),
+                "the grid-stride preamble carries the immediate `{lit}`, i.e. a launch-geometry \
+                 literal. Read it from the launch (%ntid.x / %nctaid.x) — a baked-in thread or SM \
+                 count visits a fraction of the domain as soon as the launch changes:\n{pre}"
+            );
+        }
+    }
+
     /// The comparator the corpus gate is built on, pinned against the real divergence it used to
     /// wave through. The four "before" lines are the actual gpu-native -O3 output of
     /// `tests/run/bf16_literal_grid.wk` when bf16/f16 constants were not grid-rounded; the oracle
