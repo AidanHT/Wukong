@@ -25,6 +25,12 @@
 //! | `launch_ms` | the same conversion, copies and kernel **without** the pipeline: `gpu::gemm_nt_wgmma` called directly, host slices in, host `Vec` out | the direct-launch peer of `e2e_ms` |
 //! | `kernel_ms` | the kernel alone, device-resident buffers, no copies — **the campaign's published quantity** | `gpu::time_gemm_nt_wgmma` |
 //!
+//! `launch_ms` and `e2e_ms` both also contain something `kernel_ms` does not, and it is worth naming
+//! rather than discovering later: `gemm_nt_wgmma` **regenerates the PTX text and re-resolves the
+//! module on every call**, while `time_gemm_nt_wgmma` does that once outside its timed region. The two
+//! host-to-host arms pay it identically — they are the same function — so it cannot bias `pipeline
+//! cost vs launcher`; it is simply part of what "retention" is measuring, alongside the copies.
+//!
 //! From those, two ratios and one attribution:
 //!
 //! - **`e2e_ms` vs `peer_h2h_ms`** — the honest end-to-end comparison, because
@@ -109,8 +115,19 @@ pub(crate) const E2E_BENCH_INVOCATION: &str = "WK_GPU=H100 modal run --detach \
 const E2E_ENTRY: &str = "linear";
 
 /// How many times [`compile_through_pipeline`] is repeated for the compile-time reading. The compile
-/// is device-free and takes single-digit milliseconds, so the reps are nearly free, and the minimum
-/// across them is the quantity `docs/compile-floor.md` calls the floor.
+/// is device-free and takes single-digit milliseconds, so the reps are nearly free.
+///
+/// **The reported statistic is the MINIMUM across them, and that is `docs/compile-floor.md`'s regime,
+/// not a shortcut**: that document measures warm steady-state best-of-N per stage and says in its own
+/// section 2 that a debug binary "makes the backend look ~7x slower and the measurement is
+/// worthless". Both conditions hold here only because the harness runs this round `--release`; a
+/// `compile ms` column read off a debug build is not comparable to anything in that document.
+///
+/// One difference from it is deliberate and must be stated wherever these numbers are quoted: this
+/// round times `lex..optimize` and **no backend**, because `--backend=gpu` has no codegen stage at
+/// all. `docs/compile-floor.md`'s headline (0.35-1.00 ms warm, in-process) is `lex..emit_object`, in
+/// which `codegen+obj` is 73.4% of the time — so the quantity here is the *front* subtotal, and
+/// comparing it to that headline would understate Wukong's compile cost by roughly 4x.
 pub(crate) const COMPILE_REPS: usize = 9;
 
 /// The `wukong_*` runtime symbol the plain `A.B^T` recognizer emits — the grep target for the manual
