@@ -1,7 +1,13 @@
 // EXPECT-CODE: E0501
 module tests.fail.rank
 
-/// Passing a rank-3 tensor where a rank-2 tensor is expected is a rank mismatch.
+/// Passing a rank-3 tensor where a rank-2 tensor is expected is a rank mismatch. There is no single
+/// disagreeing dim to name here, so the message names rank against rank and prints both shapes —
+/// the declared one keeps its dimension variables, so the reader can find the signature:
+///
+///     error[E0501]: tensor rank mismatch: expected rank 2 [M, N], found rank 3 [4, 4, 4]
+///
+/// Pinned by `shape_diagnostics_name_the_dim_in_json` in `crates/wukongc/tests/fail.rs`.
 fn use2d<M, N>(a: Tensor[f32, M, N]) {}
 
 fn main() -> i32 {

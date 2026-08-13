@@ -221,6 +221,12 @@ const NAMED_DIM_MESSAGES: &[(&str, &str, &[&str])] = &[
         "E0502",
         &["dimension mismatch on `M` (axis 0): expected 512, found 513"],
     ),
+    // A rank mismatch has no single dim to name, so it names rank against rank plus both shapes.
+    (
+        "rank.wk",
+        "E0501",
+        &["tensor rank mismatch: expected rank 2 [M, N], found rank 3 [4, 4, 4]"],
+    ),
 ];
 
 /// The dimension a shape error is about must reach a tool through the JSON stream: the stable
