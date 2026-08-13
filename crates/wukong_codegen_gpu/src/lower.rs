@@ -4631,7 +4631,18 @@ fn main() -> i32 {
             ptr: p,
             value: sum,
         });
-        let lane3 = b.build(MirType::F32, Op::ExtractLane(sum, 3));
+        // Read the vector back and run the rest of the lane-wise menu over it, so one probe covers
+        // every vector op `wukong_opt::vectorize` can emit rather than just the three that were
+        // declining.
+        let back = b.build(vt.clone(), Op::Load(p, vt.clone()));
+        let fma = b.build(vt.clone(), Op::Fma(back, splat, sum));
+        let root = b.build(vt.clone(), Op::Sqrt(fma));
+        let mask = b.build(
+            MirType::Vec(Box::new(MirType::I1), 4),
+            Op::Cmp(CmpOp::Fogt, root, splat),
+        );
+        let pick = b.build(vt.clone(), Op::Select(mask, root, splat));
+        let lane3 = b.build(MirType::F32, Op::ExtractLane(pick, 3));
         b.build_void(Op::Call {
             func: interner.intern("print"),
             args: vec![lane3],
@@ -4660,17 +4671,24 @@ fn main() -> i32 {
             ptx.starts_with(crate::ptx_target::HDR_SM80),
             "the SIMD lowering must not introduce a header of its own"
         );
-        // Scalarized: one lane-wise add and one lane store per lane, not one vector op.
-        assert_eq!(
-            ptx.matches("add.rn.f32").count(),
-            4,
-            "expected one add per lane in:\n{ptx}"
-        );
-        assert_eq!(
-            ptx.matches("st.f32").count(),
-            4,
-            "expected one store per lane in:\n{ptx}"
-        );
+        // Scalarized: one lane's worth of instructions per lane, not one vector op. Every emitter the
+        // probe exercises must show up four times.
+        for (op, what) in [
+            ("add.rn.f32", "vector Bin"),
+            ("st.f32", "vector Store"),
+            ("ld.f32", "vector Load"),
+            ("fma.rn.f32", "vector Fma"),
+            ("sqrt.rn.f32", "vector Sqrt"),
+            ("setp.gt.f32", "vector Cmp"),
+            ("selp.f32", "vector Select"),
+        ] {
+            assert_eq!(
+                ptx.matches(op).count(),
+                4,
+                "expected one `{op}` per lane for {what}, found {} in:\n{ptx}",
+                ptx.matches(op).count()
+            );
+        }
         // `Iota` materializes lane k as the constant k; `ExtractLane` is a register copy.
         for k in 0..4 {
             assert!(
