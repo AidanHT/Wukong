@@ -876,6 +876,108 @@ fn main() -> i32 {{
         );
     }
 
+    /// **The generic `@parallel` region runs grid-stride and is correct, lane by lane.**
+    ///
+    /// The body here (`v*v*0.25 + 3.0` over one array) is deliberately a shape no recognizer claims,
+    /// so the program's only device work is the `wukong_parallel_for` outline — which until Phase 1
+    /// was declined by `fusion::analyze` ("not yet cooperative") and, on the single-thread path, run
+    /// as the one sequential chunk `F(0, n)`.
+    ///
+    /// It prints **every** element rather than a checksum, because the failure mode of a wrong
+    /// grid-stride loop is a *partially* correct buffer: an off-by-one in the stride visits some
+    /// indices twice and never visits others, and a sum over 512 elements can absorb that. The
+    /// comparison is against the single-thread GPU lowering (same helper, so byte-identical is
+    /// required) and against the interpreter oracle (an independent CPU evaluator).
+    ///
+    /// N is 512 — more than one CTA's 256 threads, so at least one thread must take a *second* trip
+    /// of the grid-stride loop, and the tail threads must take an empty range. A gate with N <= 256
+    /// would pass on a lowering whose stride was wrong in every way except the first iteration.
+    #[test]
+    fn mega_generic_parallel_matches_single_and_oracle() {
+        const N: usize = 512;
+        let src = format!(
+            r#"module mega_generic_par
+@parallel
+fn main() -> i32 {{
+    let mut x: [f32; {N}] = [0.0; {N}];
+    let mut y: [f32; {N}] = [0.0; {N}];
+    for i in 0..{N} {{ x[i] = (i as f32) * 2.0; }}
+    for i in 0..{N} {{
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }}
+    for i in 0..{N} {{ print(y[i] as i32); }}
+    return 0;
+}}
+"#
+        );
+        let (program, mut interner) = build(&src, 2).expect("frontend ok");
+        let entry = interner.intern("main");
+        let plan = crate::fusion::analyze(&program, entry, &interner);
+        assert!(
+            plan.eligible,
+            "a generic @parallel region must be megakernel-eligible, got: {}",
+            plan.reason
+        );
+        assert!(
+            plan.coop_ops
+                .iter()
+                .any(|c| c.kind == crate::fusion::CoopKind::ParallelFor),
+            "expected a ParallelFor coop op, got {:?}",
+            plan.coop_ops.iter().map(|c| c.kind).collect::<Vec<_>>()
+        );
+        // No recognizer may claim this body, or the gate would be measuring a kernel call instead of
+        // the generic lowering.
+        assert!(
+            !program.funcs.iter().any(|f| {
+                f.blocks.iter().any(|b| {
+                    b.insts.iter().any(|i| match &i.op {
+                        wukong_mir::Op::Call { func, .. } => {
+                            let n = interner.resolve(*func);
+                            n.starts_with("wukong_") && n != "wukong_parallel_for"
+                        }
+                        _ => false,
+                    })
+                })
+            }),
+            "the probe body must stay unrecognized (no wukong_* kernel call in its MIR)"
+        );
+
+        let oracle = wukong_interp::run_with_output(&program, entry, &interner).expect("interp");
+        assert_eq!(
+            String::from_utf8_lossy(&oracle.1).lines().count(),
+            N,
+            "the oracle must print every one of the {N} lanes"
+        );
+        if crate::gpu::gpu().is_none() {
+            crate::diff::skip_or_fail(
+                "mega_generic_parallel_matches_single_and_oracle",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
+            return;
+        }
+        let mega = try_run(&program, entry, &interner)
+            .expect("mega run")
+            .expect("a generic @parallel region must run cooperatively");
+        let single = lower::jit_run_single(&program, entry, &interner).expect("single run");
+        assert_eq!(mega.0, single.0, "exit codes differ");
+        assert_eq!(
+            String::from_utf8_lossy(&mega.1),
+            String::from_utf8_lossy(&single.1),
+            "grid-stride and single-chunk output differ"
+        );
+        assert!(
+            outputs_match(&mega.1, &oracle.1),
+            "grid-stride vs interpreter oracle differ:\nmega:   {}\noracle: {}",
+            String::from_utf8_lossy(&mega.1).trim(),
+            String::from_utf8_lossy(&oracle.1).trim()
+        );
+        eprintln!(
+            "[gate] generic @parallel grid-stride == single == oracle over {N} lanes ({} threads/CTA)",
+            MEGA_BLOCK
+        );
+    }
+
     /// Same-run latency A/B: the cooperative megakernel vs the single-thread lowering on a
     /// reduction-heavy program (a `[N]` dot reduced `REPEAT` times). Both produce byte-identical
     /// output (checksum cross-check) before any timing counts; we then report the clock-invariant
