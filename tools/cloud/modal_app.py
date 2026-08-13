@@ -3802,6 +3802,12 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
     a hard failure when a declared peer is not actually on the box — so a round cannot publish
     against a weaker bar than it claims. Unset (the default) declares nothing and changes nothing.
 
+    `--iteration-data` is GPU_RETARGET_PLAN.md §6.3's declaration, and it is here for the same
+    reason it is on `::bench`: `--filter` is whitespace-split into libtest flags, so
+    `--filter "--ignored wgmma_config_sweep"` reaches a metered ROUND from this entry point. Such a
+    round is subject to `Round::gate`'s clock-lock refusal exactly like a `::bench` one, and
+    without the flag it publishes nothing. Correctness gates open no rounds and are unaffected.
+
     Two of these gates (`run_corpus_matches_interp_oracle`, `mega_corpus_matches_oracle`) compile
     357 `.wk` programs at two opt levels on the CPU, which is why the container reserves cores.
     """
