@@ -1,0 +1,71 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 19
+// EXPECT-OUT: 22
+// EXPECT-OUT: 43
+// EXPECT-OUT: 50
+// EXPECT-OUT: 19
+// EXPECT-OUT: 22
+// EXPECT-OUT: 43
+// EXPECT-OUT: 50
+module tests.run.lang_generic_naive_gemm
+
+// The `@generic` counterpart of `tests/run/tensor_matmul.wk`: the same 2x2 `ikj` nest, which the
+// whole-function matmul interception normally replaces with one `wukong_sgemm` call, written under
+// `@generic` so it lowers as the three loops it is. `mm_recognized` is the negative control, so:
+//
+//   cargo run -q -p wukongc -- --emit=mir -O0 tests/run/lang_generic_naive_gemm.wk
+//     -> exactly ONE `call wukong_sgemm`, in `mm_recognized`
+//
+// This is the fixture a reader should look at to see what Wukong compiles a matmul *nest* to when
+// nothing pattern-matches it -- the honest baseline the language's own lowering has to beat.
+//
+// Expected values are the arithmetic, not compiler output: A = [[1,2],[3,4]], B = [[5,6],[7,8]], so
+// C = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19,22],[43,50]]. Every element of C is printed --
+// a checksum would hide a single wrong lane, which is exactly how a mis-strided nest passes.
+
+@generic
+fn mm_generic(a: [f32; 4], b: [f32; 4], mut c: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..2 {
+                s = s + a[i * 2 + k] * b[k * 2 + j];
+            }
+            c[i * 2 + j] = s;
+        }
+    }
+}
+
+fn mm_recognized(a: [f32; 4], b: [f32; 4], mut c: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..2 {
+                s = s + a[i * 2 + k] * b[k * 2 + j];
+            }
+            c[i * 2 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let b: [f32; 4] = [5.0, 6.0, 7.0, 8.0];
+
+    let mut g: [f32; 4] = [0.0; 4];
+    mm_generic(a, b, g);
+    print(g[0] as i32); // 19
+    print(g[1] as i32); // 22
+    print(g[2] as i32); // 43
+    print(g[3] as i32); // 50
+
+    // The tuned kernel must agree with the nest element for element.
+    let mut r: [f32; 4] = [0.0; 4];
+    mm_recognized(a, b, r);
+    print(r[0] as i32); // 19
+    print(r[1] as i32); // 22
+    print(r[2] as i32); // 43
+    print(r[3] as i32); // 50
+    return 0;
+}
