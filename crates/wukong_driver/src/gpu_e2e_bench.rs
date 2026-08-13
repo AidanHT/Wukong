@@ -789,11 +789,16 @@ mod tests {
              `kernel/cuBLAS` is the resident-buffer pair: the campaign's own comparison, re-measured\n\
              here in the same round, same clock, same container, same iteration counts, and its\n\
              contender's timed region is `{}`.\n",
-            wukong_codegen_gpu::gpu::TimedRegion::for_cfg(gpu_accel::wgmma_cfg_for(
-                gpu_accel::WGMMA_F32_SEAM_DTYPE,
-                WGMMA_BENCH_GRID[0].m,
-                WGMMA_BENCH_GRID[0].n
-            ))
+            wukong_codegen_gpu::gpu::TimedRegion::for_cfg(
+                gpu_accel::wgmma_cfg_for(
+                    gpu_accel::WGMMA_F32_SEAM_DTYPE,
+                    WGMMA_BENCH_GRID[0].m,
+                    WGMMA_BENCH_GRID[0].k,
+                    WGMMA_BENCH_GRID[0].n,
+                    HOPPER_SM_COUNT,
+                )
+                .expect("first grid row must be accepted by the shipped rule"),
+            )
             .label()
         );
         eprintln!(
@@ -1146,14 +1151,26 @@ mod tests {
     /// this fails, do not widen it — move the label into the per-shape row.
     #[test]
     fn every_grid_shape_shares_the_published_timed_region() {
-        let header = wukong_codegen_gpu::gpu::TimedRegion::for_cfg(gpu_accel::wgmma_cfg_for(
-            gpu_accel::WGMMA_F32_SEAM_DTYPE,
-            WGMMA_BENCH_GRID[0].m,
-            WGMMA_BENCH_GRID[0].n,
-        ))
+        let header = wukong_codegen_gpu::gpu::TimedRegion::for_cfg(
+            gpu_accel::wgmma_cfg_for(
+                gpu_accel::WGMMA_F32_SEAM_DTYPE,
+                WGMMA_BENCH_GRID[0].m,
+                WGMMA_BENCH_GRID[0].k,
+                WGMMA_BENCH_GRID[0].n,
+                HOPPER_SM_COUNT,
+            )
+            .expect("first grid row must be accepted by the shipped rule"),
+        )
         .label();
         for p in WGMMA_BENCH_GRID {
-            let cfg = gpu_accel::wgmma_cfg_for(gpu_accel::WGMMA_F32_SEAM_DTYPE, p.m, p.n);
+            let cfg = gpu_accel::wgmma_cfg_for(
+                gpu_accel::WGMMA_F32_SEAM_DTYPE,
+                p.m,
+                p.k,
+                p.n,
+                HOPPER_SM_COUNT,
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", p.label));
             let mine = wukong_codegen_gpu::gpu::TimedRegion::for_cfg(cfg).label();
             assert_eq!(
                 mine, header,
