@@ -4559,6 +4559,9 @@ mod tests {
             "expected a rank mismatch: {:?}",
             errors(src)
         );
+        // An index-count mismatch names how many indices were written against the tensor's rank —
+        // and the shape, so the reader knows what the missing index should range over.
+        assert_message_has(src, "E0501", &["rank 2 [4, 4]", "indexed with 1 index"]);
     }
 
     #[test]

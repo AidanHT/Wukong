@@ -1032,11 +1032,12 @@ impl Sema<'_> {
         match base_ty {
             Ty::Tensor { elem, shape, .. } => {
                 if indices.len() != shape.rank() {
+                    let dims = self.shape_str(&shape);
                     self.error(
                         span,
                         "E0501",
                         format!(
-                            "this tensor has rank {} but is indexed with {} {}",
+                            "this tensor has rank {} {dims} but is indexed with {} {}",
                             shape.rank(),
                             indices.len(),
                             if indices.len() == 1 {
