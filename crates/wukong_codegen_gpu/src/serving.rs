@@ -74,10 +74,12 @@ use half::f16;
 
 use crate::gpu::{Gpu, TransformerWeights};
 use crate::paged_attention::{
-    kv_append_int8_ptx, kv_append_ptx, launch_kv_append_gqa_at, launch_kv_append_int8_gqa_at,
-    launch_paged_attn_decode_gqa_at, launch_paged_attn_decode_int8_gqa_at,
-    paged_attn_decode_int8_ptx, paged_attn_decode_ptx, KvSourceLayout, KV_APPEND_ENTRY,
-    KV_APPEND_INT8_ENTRY, PAGED_ATTN_ENTRY, PAGED_ATTN_INT8_ENTRY,
+    kfold_applies, kv_append_int8_ptx, kv_append_ptx, launch_kv_append_gqa_at,
+    launch_kv_append_int8_gqa_at, launch_paged_attn_decode_gqa_at,
+    launch_paged_attn_decode_int8_gqa_at, launch_paged_attn_decode_kfold_gqa_at,
+    paged_attn_decode_int8_ptx, paged_attn_decode_kfold_ptx, paged_attn_decode_ptx,
+    paged_attn_decode_scalar_ptx, KvSourceLayout, KV_APPEND_ENTRY, KV_APPEND_INT8_ENTRY,
+    PAGED_ATTN_ENTRY, PAGED_ATTN_INT8_ENTRY, PAGED_ATTN_KFOLD_ENTRY,
 };
 use crate::paged_kv::{GqaConfig, KvConfig, KvDtype, KvStorage, PagedKvCache};
 use crate::pool::{DevicePool, PoolBuf};
@@ -238,6 +240,54 @@ pub enum QkvArm {
     Merged,
 }
 
+/// How a [`DecodeLayer`] launches its two RMSNorms.
+///
+/// **This is a defect fix wearing a lever's clothes.** `ptx_norm` ships an SM-filling entry family
+/// `{softmax,layernorm,rmsnorm}_w{W}` with a grid-stride row loop and a planner,
+/// [`crate::ptx_norm::norm_launch`], that sizes `W` and the grid from the **probed** SM count —
+/// and `gpu::norm`, the offload path, has routed through it since the family landed. `DecodeLayer`
+/// did not: it named the shipped one-warp entry and hardcoded `grid = (Bcap, 1, 1)`, `block = 32`.
+/// At `Bcap = 64` that is 64 warps — one warp on each of 48.5% of a 132-SM part and nothing on the
+/// rest — while `rows = 64` sits far below `FILL_CTAS_PER_SM * sm_count = 528`, i.e. deep inside
+/// the underfill regime the `_w{W}` family exists for.
+///
+/// **`W == 1` is byte-for-byte the hardcoded launch** — [`crate::ptx_norm::norm_launch`] returns the
+/// shipped entry, `grid = rows`, `block = 32`, deliberately uncapped — so routing through the
+/// planner is provably a no-op at every shape whose plan comes out at `W == 1`, which is every shape
+/// this box can gate (`D = 512` at `MIN_ELEMS_PER_LANE = 16` yields `W = 1`). It is *not* a no-op at
+/// the Llama-3-8B decode shape, where `rows = 64, cols = 4096, sm = 132` plans `W = 8`; what that is
+/// worth is a measurement (round row `a5_normplan`) and nothing here claims it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum NormArm {
+    /// The pre-Wave-6 launch: the shipped one-warp `rmsnorm` entry at `grid = (Bcap,1,1)`,
+    /// `block = (32,1,1)`, whatever the device is. Retained **because the round needs it** — it is
+    /// the control arm of `a5_normplan` — and because it is what the `==` gate compares against.
+    Hardcoded,
+    /// The entry **and** the geometry come from [`crate::ptx_norm::norm_launch`] at the probed
+    /// [`crate::Gpu::sm_count`], exactly as `gpu::norm` does.
+    #[default]
+    Planned,
+}
+
+/// How a [`DecodeLayer`] launches paged decode attention.
+///
+/// [`V4`](Self::V4) and [`KFold`](Self::KFold) are bit-identical to [`Scalar`](Self::Scalar) (WAVE6
+/// levers 4 and 5); [`Auto`](Self::Auto) picks K-fold when [`kfold_applies`] and V4 otherwise.
+/// Int8 cache storage has no K-fold generator (lossy path, V4 only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AttnArm {
+    /// Pre-Wave-6 scalar `ld.global.u16` kernel. The `==` control.
+    Scalar,
+    /// `ld.global.v4.b32` on K and V, one warp per `(slot, q_head)`.
+    V4,
+    /// V4 plus the K-side GQA fold: CTA-cooperative K load, still one warp per `(slot, q_head)`.
+    /// Construction panics if [`kfold_applies`] is false or the cache is int8.
+    KFold,
+    /// KFold when it applies on f16, else V4. The shipped default.
+    #[default]
+    Auto,
+}
+
 /// The row-concatenated `[D + 2*kv_dim, D]` QKV weight [`QkvArm::Merged`] uploads: `Wq`'s rows, then
 /// `Wk`'s, then `Wv`'s. **Pure host geometry** — all three are `[.., D]` row-major, so the
 /// concatenation is the flat one and the merged GEMM's output column `n` reads exactly the weight row
@@ -248,6 +298,35 @@ pub fn concat_qkv_weight(wq: &[f16], wk: &[f16], wv: &[f16]) -> Vec<f16> {
     v.extend_from_slice(wk);
     v.extend_from_slice(wv);
     v
+}
+
+/// Which launch shape a [`DecodeLayer`] is built with, on each axis this wave made a choice on.
+///
+/// One struct rather than one constructor argument per arm, because every arm here has the same
+/// character: it changes **which CTAs run**, never which numbers come out, and each ships with an
+/// `==` gate against its own control. Adding an axis therefore must not force a signature churn
+/// through five delegating constructors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct DecodeArms {
+    /// One QKV GEMM or three. See [`QkvArm`].
+    pub qkv: QkvArm,
+    /// The planner or the hardcoded one-warp launch. See [`NormArm`].
+    pub norm: NormArm,
+    /// Scalar / v4 / K-fold attention. See [`AttnArm`].
+    pub attn: AttnArm,
+}
+
+impl DecodeArms {
+    /// Everything as it shipped before Wave 6: three projection launches, the hardcoded one-warp
+    /// norm, scalar paged attention. **The control arm**, and the thing every `==` gate in this
+    /// module compares against.
+    pub fn shipped_pre_wave6() -> Self {
+        Self {
+            qkv: QkvArm::Split,
+            norm: NormArm::Hardcoded,
+            attn: AttnArm::Scalar,
+        }
+    }
 }
 
 /// One pre-norm transformer **decode** layer: RMSNorm → Q/K/V proj → append-to-cache → paged attention
@@ -269,6 +348,10 @@ pub struct DecodeLayer {
     /// of the two forms is resident — the merged arm does not keep a second copy of 3/4 of the
     /// layer's weight bytes.
     qkv: QkvWeights,
+    /// The entry name + `(grid, block)` this layer's two `[Bcap, D]` RMSNorms launch at, fixed at
+    /// construction because both norms have the same shape and `f_norm` was loaded from this plan's
+    /// own entry name. Under [`NormArm::Hardcoded`] it is the pre-Wave-6 geometry spelled as a plan.
+    norm_plan: crate::ptx_norm::NormLaunch,
     wo: CudaSlice<f16>,
     w1: CudaSlice<f16>,
     w2: CudaSlice<f16>,
@@ -280,6 +363,9 @@ pub struct DecodeLayer {
     /// Cache storage dtype this layer's append/attention kernels were loaded for — must match the
     /// [`KvStorage`] arm handed to [`forward_step_on`](Self::forward_step_on).
     dtype: KvDtype,
+    /// True when `f_attn` is the K-fold entry (KV-headed grid). False for the one-head-per-warp
+    /// kernels (scalar and v4).
+    attn_kfold: bool,
 }
 
 /// The resident form of a layer's Q/K/V projection weights — one arm of [`QkvArm`], never both.
@@ -323,6 +409,12 @@ impl DecodeLayer {
             QkvWeights::Split { .. } => QkvArm::Split,
             QkvWeights::Merged(_) => QkvArm::Merged,
         }
+    }
+    /// The RMSNorm entry and geometry this layer launches — read back from the plan it was built
+    /// with, which is also the plan `f_norm` was loaded from. `a5_normplan` reports this line.
+    #[inline]
+    pub fn norm_plan(&self) -> &crate::ptx_norm::NormLaunch {
+        &self.norm_plan
     }
 
     /// Upload the weights (narrowed to f16) and load every kernel for **f16 cache storage** (the
@@ -375,21 +467,27 @@ impl DecodeLayer {
         dff: usize,
         dtype: KvDtype,
     ) -> Result<Self, DriverError> {
-        Self::new_gqa_with_arms(g, w, gqa, dff, dtype, QkvArm::default())
+        Self::new_gqa_with_arms(g, w, gqa, dff, dtype, DecodeArms::default())
     }
 
-    /// [`new_gqa_with_dtype`](Self::new_gqa_with_dtype) with an explicit [`QkvArm`] — the one real
-    /// constructor; the other four delegate here. The arm decides whether the three projections
-    /// upload (and launch) separately or as one row-concatenated weight; it changes no numbers, and
-    /// `merged_qkv_decode_step_is_bit_identical_to_three_launches` is what holds that claim.
+    /// [`new_gqa_with_dtype`](Self::new_gqa_with_dtype) with explicit [`DecodeArms`] — the one real
+    /// constructor; the other four delegate here. Every arm is a launch-shape choice with no
+    /// numerical content, and each has an `==` gate holding that claim:
+    /// `merged_qkv_decode_step_is_bit_identical_to_three_launches` for [`QkvArm`],
+    /// `planned_norm_decode_step_is_bit_identical_to_the_hardcoded_launch` for [`NormArm`].
     pub fn new_gqa_with_arms(
         g: &mut Gpu,
         w: &TransformerWeights,
         gqa: &GqaConfig,
         dff: usize,
         dtype: KvDtype,
-        qkv_arm: QkvArm,
+        arms: DecodeArms,
     ) -> Result<Self, DriverError> {
+        let DecodeArms {
+            qkv: qkv_arm,
+            norm: norm_arm,
+            attn: attn_arm,
+        } = arms;
         let cfg = *gqa.kv();
         assert_decode_geometry(gqa, dff);
         // A weight-extent mismatch is a caller logic bug, not a driver failure — and for `wk`/`wv`
@@ -409,29 +507,115 @@ impl DecodeLayer {
         ) {
             panic!("DecodeLayer weights: {e}");
         }
-        let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), "rmsnorm")?;
+        // The norm plan — both of this layer's RMSNorms are `[Bcap, D]`, so one plan serves both and
+        // is fixed here rather than per step. `Hardcoded` spells the pre-Wave-6 launch as a plan so
+        // the two arms differ in exactly one place (the three lines below) and in nothing else.
+        let norm_plan = match norm_arm {
+            NormArm::Planned => crate::ptx_norm::norm_launch(
+                "rmsnorm",
+                g.sm_count(),
+                gqa.kv().num_slots,
+                gqa.q_dim(),
+            ),
+            NormArm::Hardcoded => crate::ptx_norm::NormLaunch {
+                entry: "rmsnorm".to_string(),
+                grid: gqa.kv().num_slots as u32,
+                block: 32,
+                warps_per_row: 1,
+            },
+        };
+        // Launch-seam precondition, read back out of the entry NAME the module load uses rather than
+        // from a second parameter — the same assertion `gpu::norm` makes for the same reason. A
+        // `_w{W}` entry stages one f32 per warp in a `4*W`-byte shared slate and every warp executes
+        // `shfl.sync.bfly ... 0xffffffff`: a CTA wider than `32*W` folds a slot no warp wrote, a
+        // narrower one leaves a slot stale, and both are silent.
+        assert_eq!(
+            norm_plan.block,
+            32 * crate::ptx_norm::entry_width(&norm_plan.entry).unwrap_or(1),
+            "{}: the CTA must be exactly the width its own entry name encodes",
+            norm_plan.entry
+        );
+        assert!(norm_plan.grid >= 1, "{}: empty grid", norm_plan.entry);
+        let f_norm = g.function("norm", crate::ptx_norm::norm_ptx(), &norm_plan.entry)?;
         let f_cast = g.function("cast", crate::ptx::CAST_F32_F16, "cast_f32_f16")?;
         let wmma = crate::ptx_wmma::wmma_f16_ptx();
         let f_gemm = g.function("wmma_f16", wmma, "wmma_nt_f16_sm_db")?;
         let f_silu = g.function("wmma_f16", wmma, "wmma_nt_f16_sm_db_silu")?;
         let f_resid = g.function("wmma_f16", wmma, "wmma_nt_f16_sm_db_residual")?;
-        let (f_attn, f_append) = match dtype {
+        let (f_attn, f_append, attn_kfold) = match dtype {
             KvDtype::F16 => {
-                let attn_key: &'static str = match cfg.head_dim {
-                    64 => "paged_attn_d64",
-                    128 => "paged_attn_d128",
-                    _ => unreachable!(),
+                let resolved = match attn_arm {
+                    AttnArm::Auto => {
+                        if kfold_applies(gqa.q_heads(), gqa.kv_heads()) {
+                            AttnArm::KFold
+                        } else {
+                            AttnArm::V4
+                        }
+                    }
+                    other => other,
                 };
+                let (attn_key, ptx, entry, kfold): (&'static str, String, &str, bool) =
+                    match (resolved, cfg.head_dim) {
+                        (AttnArm::Scalar, 64) => (
+                            "paged_attn_scalar_d64",
+                            paged_attn_decode_scalar_ptx(cfg.head_dim),
+                            PAGED_ATTN_ENTRY,
+                            false,
+                        ),
+                        (AttnArm::Scalar, 128) => (
+                            "paged_attn_scalar_d128",
+                            paged_attn_decode_scalar_ptx(cfg.head_dim),
+                            PAGED_ATTN_ENTRY,
+                            false,
+                        ),
+                        (AttnArm::V4, 64) => (
+                            "paged_attn_d64",
+                            paged_attn_decode_ptx(cfg.head_dim),
+                            PAGED_ATTN_ENTRY,
+                            false,
+                        ),
+                        (AttnArm::V4, 128) => (
+                            "paged_attn_d128",
+                            paged_attn_decode_ptx(cfg.head_dim),
+                            PAGED_ATTN_ENTRY,
+                            false,
+                        ),
+                        (AttnArm::KFold, 64) => (
+                            "paged_attn_kfold_d64",
+                            paged_attn_decode_kfold_ptx(cfg.head_dim),
+                            PAGED_ATTN_KFOLD_ENTRY,
+                            true,
+                        ),
+                        (AttnArm::KFold, 128) => (
+                            "paged_attn_kfold_d128",
+                            paged_attn_decode_kfold_ptx(cfg.head_dim),
+                            PAGED_ATTN_KFOLD_ENTRY,
+                            true,
+                        ),
+                        (AttnArm::Auto, _) => unreachable!("Auto was resolved above"),
+                        (arm, hd) => {
+                            panic!("DecodeLayer: no paged-attn module key for {arm:?} hd={hd}")
+                        }
+                    };
+                if kfold {
+                    assert!(
+                        kfold_applies(gqa.q_heads(), gqa.kv_heads()),
+                        "DecodeLayer: KFold requested at {}q/{}kv which kfold_applies rejects",
+                        gqa.q_heads(),
+                        gqa.kv_heads()
+                    );
+                }
                 (
-                    g.function(
-                        attn_key,
-                        &paged_attn_decode_ptx(cfg.head_dim),
-                        PAGED_ATTN_ENTRY,
-                    )?,
+                    g.function(attn_key, &ptx, entry)?,
                     g.function("kv_append", &kv_append_ptx(), KV_APPEND_ENTRY)?,
+                    kfold,
                 )
             }
             KvDtype::Int8 => {
+                assert!(
+                    !matches!(attn_arm, AttnArm::KFold),
+                    "DecodeLayer: K-fold is f16-only; int8 stays on the v4 one-head-per-warp kernel"
+                );
                 let attn_key: &'static str = match cfg.head_dim {
                     64 => "paged_attn_int8_d64",
                     128 => "paged_attn_int8_d128",
@@ -448,6 +632,7 @@ impl DecodeLayer {
                         &kv_append_int8_ptx(),
                         KV_APPEND_INT8_ENTRY,
                     )?,
+                    false,
                 )
             }
         };
@@ -476,6 +661,7 @@ impl DecodeLayer {
             f_attn,
             f_append,
             qkv,
+            norm_plan,
             wo,
             w1,
             w2,
@@ -484,6 +670,7 @@ impl DecodeLayer {
             eps: 1e-5,
             scale: 1.0 / (cfg.head_dim as f32).sqrt(),
             dtype,
+            attn_kfold,
         })
     }
 
@@ -515,9 +702,12 @@ impl DecodeLayer {
         let (bcap, d, kvd, dff, eps) = (self.bcap(), self.d(), self.kv_dim(), self.dff, self.eps);
         debug_assert_eq!(x_d.len(), bcap * d);
         debug_assert_eq!(out.len(), bcap * d);
+        // The planner's geometry, chosen at construction from the probed SM count (see [`NormArm`]).
+        // The `_w{W}` cross-warp slate is a static `.shared` inside the entry, so the launch adds no
+        // dynamic bytes.
         let norm_cfg = LaunchConfig {
-            grid_dim: (bcap as u32, 1, 1),
-            block_dim: (32, 1, 1),
+            grid_dim: (self.norm_plan.grid, 1, 1),
+            block_dim: (self.norm_plan.block, 1, 1),
             shared_mem_bytes: 0,
         };
 
@@ -647,21 +837,39 @@ impl DecodeLayer {
                     layer,
                     bcap,
                 )?;
-                launch_paged_attn_decode_gqa_at(
-                    stream,
-                    &self.f_attn,
-                    q,
-                    q_stride,
-                    kc,
-                    vc,
-                    &mut attn,
-                    bt_d,
-                    cl_d,
-                    &self.gqa,
-                    layer,
-                    bcap,
-                    self.scale,
-                )?;
+                if self.attn_kfold {
+                    launch_paged_attn_decode_kfold_gqa_at(
+                        stream,
+                        &self.f_attn,
+                        q,
+                        q_stride,
+                        kc,
+                        vc,
+                        &mut attn,
+                        bt_d,
+                        cl_d,
+                        &self.gqa,
+                        layer,
+                        bcap,
+                        self.scale,
+                    )?;
+                } else {
+                    launch_paged_attn_decode_gqa_at(
+                        stream,
+                        &self.f_attn,
+                        q,
+                        q_stride,
+                        kc,
+                        vc,
+                        &mut attn,
+                        bt_d,
+                        cl_d,
+                        &self.gqa,
+                        layer,
+                        bcap,
+                        self.scale,
+                    )?;
+                }
             }
             KvStorage::Int8 {
                 k: kc,
@@ -833,7 +1041,8 @@ impl DecodeModel {
         Self::new_gqa_with_dtype(g, weights, gqa, dff, pool_bytes, KvDtype::F16)
     }
 
-    /// [`new_gqa`](Self::new_gqa) with an explicit cache storage dtype, at the default [`QkvArm`].
+    /// [`new_gqa`](Self::new_gqa) with an explicit cache storage dtype, at the default
+    /// [`DecodeArms`].
     pub fn new_gqa_with_dtype(
         g: &mut Gpu,
         weights: &[TransformerWeights],
@@ -842,13 +1051,22 @@ impl DecodeModel {
         pool_bytes: usize,
         dtype: KvDtype,
     ) -> Result<Self, DriverError> {
-        Self::new_gqa_with_arms(g, weights, gqa, dff, pool_bytes, dtype, QkvArm::default())
+        Self::new_gqa_with_arms(
+            g,
+            weights,
+            gqa,
+            dff,
+            pool_bytes,
+            dtype,
+            DecodeArms::default(),
+        )
     }
 
-    /// [`new_gqa_with_dtype`](Self::new_gqa_with_dtype) with an explicit [`QkvArm`], applied to every
-    /// layer — the one real constructor. The arm is a *launch-shape* choice with no numerical
-    /// content (see [`QkvArm`]), so a whole-model `==` gate across the two arms is the right test and
-    /// `merged_qkv_decode_step_is_bit_identical_to_three_launches` is it.
+    /// [`new_gqa_with_dtype`](Self::new_gqa_with_dtype) with explicit [`DecodeArms`], applied to
+    /// every layer — the one real constructor. Every arm is a *launch-shape* choice with no
+    /// numerical content, so a whole-model `==` gate across the two settings is the right test for
+    /// each: `merged_qkv_decode_step_is_bit_identical_to_three_launches` and
+    /// `planned_norm_decode_step_is_bit_identical_to_the_hardcoded_launch`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_gqa_with_arms(
         g: &mut Gpu,
@@ -857,7 +1075,7 @@ impl DecodeModel {
         dff: usize,
         pool_bytes: usize,
         dtype: KvDtype,
-        qkv_arm: QkvArm,
+        arms: DecodeArms,
     ) -> Result<Self, DriverError> {
         let cfg = *gqa.kv();
         assert!(!weights.is_empty(), "model needs at least one layer");
@@ -869,9 +1087,7 @@ impl DecodeModel {
         let d = gqa.q_dim();
         let mut layers = Vec::with_capacity(weights.len());
         for w in weights {
-            layers.push(DecodeLayer::new_gqa_with_arms(
-                g, w, gqa, dff, dtype, qkv_arm,
-            )?);
+            layers.push(DecodeLayer::new_gqa_with_arms(g, w, gqa, dff, dtype, arms)?);
         }
         let cache = PagedKvCache::new_with_dtype(g.stream.clone(), cfg, dtype)?;
         let pool = DevicePool::new(g.stream.clone(), pool_bytes)?;
@@ -1700,6 +1916,68 @@ mod tests {
         assert_eq!(QkvArm::default(), QkvArm::Merged);
     }
 
+    /// **What the norm planner actually does at the two decode shapes this campaign runs — device-free,
+    /// so it is checkable on any box and is the text `a5_normplan` is read against.**
+    ///
+    /// The wiring commit's whole risk is that it is a no-op *everywhere*, in which case it fixed
+    /// nothing, or a change *somewhere it was not meant to be*, in which case a bit-exactness gate
+    /// that only ever runs at `W = 1` would never see it. Both halves are pinned here as arithmetic
+    /// over [`crate::ptx_norm::norm_launch`]:
+    ///
+    /// * **on this box (20 SMs, `D = 512`) the plan is `W = 1` and is byte-for-byte the hardcoded
+    ///   launch** — which is why `planned_norm_decode_step_is_bit_identical_to_the_hardcoded_launch`
+    ///   may claim `==`, and why the wiring cannot regress anything here;
+    /// * **at the Llama-3-8B decode shape on a 132-SM part (`rows = 64`, `cols = 4096`) the plan is
+    ///   `rmsnorm_w8`, a 256-thread CTA** — 8x the warps on each busy SM, and the exact launch
+    ///   `a5_normplan` A/Bs. Whether that is worth anything is a measurement; that it is a
+    ///   *different launch* is arithmetic, and it is this line.
+    ///
+    /// `rows = 64` is far below `FILL_CTAS_PER_SM * 132 = 528`, so both devices are in the underfill
+    /// regime and the plan is the full useful width; no `W` lights the `132 - 64` SMs that have no
+    /// row at all (one row is one CTA), which is why the ceiling on this lever is warps-per-row and
+    /// not the device.
+    #[test]
+    fn the_decode_norm_plan_is_a_no_op_on_this_box_and_the_w8_entry_on_a_132_sm_part() {
+        use crate::ptx_norm::norm_launch;
+        // This box's gated decode geometry: the planner returns the shipped launch, unchanged.
+        let here = norm_launch("rmsnorm", 20, 64, 512);
+        assert_eq!(
+            (
+                here.entry.as_str(),
+                here.grid,
+                here.block,
+                here.warps_per_row
+            ),
+            ("rmsnorm", 64, 32, 1),
+            "at rows=64 cols=512 the plan must BE the hardcoded launch"
+        );
+        // Llama-3-8B decode on 132 SMs: a different entry and a 256-thread CTA.
+        let h100 = norm_launch("rmsnorm", 132, 64, 4096);
+        assert_eq!(
+            (
+                h100.entry.as_str(),
+                h100.grid,
+                h100.block,
+                h100.warps_per_row
+            ),
+            ("rmsnorm_w8", 64, 256, 8),
+            "at rows=64 cols=4096 on 132 SMs the plan must reach the 8-warp entry"
+        );
+        assert!(h100.is_sm_filling() && !here.is_sm_filling());
+        // The intermediate rung the device gate `planned_norm_at_a_wide_row_...` rides on.
+        assert_eq!(norm_launch("rmsnorm", 20, 64, 2048).entry, "rmsnorm_w4");
+        // Planned is the default: the bypass was the defect, not the fallback.
+        assert_eq!(NormArm::default(), NormArm::Planned);
+        assert_eq!(
+            DecodeArms::shipped_pre_wave6(),
+            DecodeArms {
+                qkv: QkvArm::Split,
+                norm: NormArm::Hardcoded,
+                attn: AttnArm::Scalar,
+            }
+        );
+    }
+
     /// **KV-append scatter correctness.** Appending the new token's K/V via the kernel, then reading the
     /// cache back, must reproduce the f16-rounded inputs at exactly the block-table address the host
     /// allocator hands out — bit-for-bit (the scatter is a pure narrow + place, no arithmetic).
@@ -2071,7 +2349,10 @@ mod tests {
                         dff,
                         64 * 1024 * 1024,
                         KvDtype::F16,
-                        arm,
+                        DecodeArms {
+                            qkv: arm,
+                            ..DecodeArms::default()
+                        },
                     )
                     .unwrap();
                     assert_eq!(model.layers[0].qkv_arm(), arm);
@@ -2116,6 +2397,210 @@ mod tests {
                 d / 64,
                 kvd / 64,
                 kvd / 64,
+            );
+            },
+        );
+    }
+
+    /// **The norm-planner `==` gate (Wave 6 lever 6), and the precondition it is claimed under.**
+    /// A decode step whose RMSNorms are routed through [`crate::ptx_norm::norm_launch`] must be
+    /// **bit-for-bit** the step that used the hardcoded `grid = (Bcap,1,1)`, `block = 32` launch —
+    /// at every shape whose plan comes out at `W == 1`, which the planner defines to be *exactly*
+    /// the shipped entry at the shipped geometry.
+    ///
+    /// **The gate asserts that precondition rather than relying on it.** Across different `W` the
+    /// cross-warp fold reassociates the row reduction, so values differ by a few ulps
+    /// (`ptx_norm`'s module header says so); `==` is therefore the right gate at `W == 1` and the
+    /// *wrong* one above it. This test pins `warps_per_row == 1` on both arms and then demands
+    /// bit-identity, so a future planner change that quietly widened this shape would fail here
+    /// with the reason named instead of failing as an unexplained numeric drift. The `W > 1` wiring
+    /// is gated separately by `planned_norm_at_a_wide_row_runs_the_w4_entry_and_agrees`.
+    #[test]
+    fn planned_norm_decode_step_is_bit_identical_to_the_hardcoded_launch() {
+        with_gpu(
+            "planned_norm_decode_step_is_bit_identical_to_the_hardcoded_launch",
+            |g| {
+                let (q_heads, kv_heads, hd, dff, bsz, bcap) =
+                    (8usize, 2usize, 64usize, 256usize, 16usize, 64usize);
+                let (d, kvd) = (q_heads * hd, kv_heads * hd);
+                let ctx0: Vec<usize> = (0..bcap).map(|b| (b * 7) % 73).collect();
+                let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+                let kv = KvConfig {
+                    layers: 1,
+                    heads: kv_heads,
+                    head_dim: hd,
+                    block_size: bsz,
+                    num_blocks: bcap * max_bps + 8,
+                    num_slots: bcap,
+                    max_blocks_per_seq: max_bps,
+                };
+                let gqa = GqaConfig::new(kv, q_heads);
+                let mut rng = crate::diff::Rng::new(0x6E01);
+                let wdata = layer_weights_gqa(&mut rng, 1, d, kvd, dff);
+                let weights = weights_view(&wdata);
+                let x = rng.vec(bcap * d, -1.0, 1.0);
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+
+                let mut run = |arm: NormArm| -> (Vec<f32>, crate::ptx_norm::NormLaunch) {
+                    let mut model = DecodeModel::new_gqa_with_arms(
+                        g,
+                        &weights,
+                        &gqa,
+                        dff,
+                        64 * 1024 * 1024,
+                        KvDtype::F16,
+                        DecodeArms {
+                            norm: arm,
+                            ..DecodeArms::default()
+                        },
+                    )
+                    .unwrap();
+                    let plan = model.layers[0].norm_plan().clone();
+                    populate_one_layer(g, &mut model, &ctx0, kv_heads, hd, 0x4321);
+                    let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                    model.step_on(&g.stream.clone(), &x_d, &mut out_d).unwrap();
+                    g.stream.synchronize().unwrap();
+                    (g.stream.memcpy_dtov(&out_d).unwrap(), plan)
+                };
+                let (hard, hard_plan) = run(NormArm::Hardcoded);
+                let (planned, plan) = run(NormArm::Planned);
+
+                assert_eq!(
+                    plan.warps_per_row,
+                    1,
+                    "this gate claims `==`, which is only legitimate while the plan is W = 1; the \
+                     planner returned {plan:?} at rows={bcap} cols={d} on a {}-SM device",
+                    g.sm_count()
+                );
+                assert_eq!(
+                    (plan.entry.as_str(), plan.grid, plan.block),
+                    (hard_plan.entry.as_str(), hard_plan.grid, hard_plan.block),
+                    "at W = 1 the planner must return the hardcoded launch exactly"
+                );
+                let differing = hard
+                    .iter()
+                    .zip(&planned)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing,
+                    0,
+                    "the planner-routed norm must be bit-identical to the hardcoded launch at \
+                     W = 1; {differing} of {} elements differ",
+                    hard.len()
+                );
+                assert!(
+                    hard.iter().any(|&z| z != 0.0),
+                    "the control arm produced an all-zero step — the gate would pass on nothing"
+                );
+                eprintln!(
+                    "norm planner == hardcoded, bit-for-bit on {} f32 (rows={bcap} cols={d}, \
+                     {} SMs -> {} grid={} block={})",
+                    hard.len(),
+                    g.sm_count(),
+                    plan.entry,
+                    plan.grid,
+                    plan.block
+                );
+            },
+        );
+    }
+
+    /// **The `W > 1` wiring gate — the non-vacuous half of lever 6.** At `W == 1` the planner
+    /// returns today's launch, so the `==` gate above cannot see whether the SM-filling family works
+    /// at all from inside a [`DecodeLayer`]. This one picks a row wide enough that the planner
+    /// reaches `rmsnorm_w4` (`cols / (32 * MIN_ELEMS_PER_LANE) = 4`), asserts the wide entry really
+    /// was chosen, and then compares the whole step against the hardcoded arm.
+    ///
+    /// **The bound catches a wiring error and admits the documented reassociation, and it is not a
+    /// fitted tolerance.** A `_w{W}` entry launched at the wrong CTA width folds a shared slot no
+    /// warp wrote — garbage, order-1 relative, not ulps. What is legitimate is the cross-warp fold's
+    /// reassociation of the sum of squares, which moves the normalizer by ~1 ulp and then almost
+    /// always vanishes into the `f16` cast the projections take; `1e-3` relative sits four orders
+    /// above that and four orders below a mis-launch. The measured deviation is printed, not
+    /// asserted at, precisely so it can never be quietly widened to fit.
+    #[test]
+    fn planned_norm_at_a_wide_row_runs_the_w4_entry_and_agrees() {
+        with_gpu(
+            "planned_norm_at_a_wide_row_runs_the_w4_entry_and_agrees",
+            |g| {
+                // cols = D = 2048 -> useful = prev_pow2(2048/(32*16)) = 4; rows = 64 < 4*sm on any
+                // device this campaign runs, so the underfill arm takes the full useful width.
+                let (q_heads, kv_heads, hd, dff, bsz, bcap) =
+                    (32usize, 8usize, 64usize, 256usize, 16usize, 64usize);
+                let (d, kvd) = (q_heads * hd, kv_heads * hd);
+                let ctx0: Vec<usize> = (0..bcap).map(|b| (b * 5) % 41).collect();
+                let max_bps = ctx0.iter().copied().max().unwrap().div_ceil(bsz) + 2;
+                let kv = KvConfig {
+                    layers: 1,
+                    heads: kv_heads,
+                    head_dim: hd,
+                    block_size: bsz,
+                    num_blocks: bcap * max_bps + 8,
+                    num_slots: bcap,
+                    max_blocks_per_seq: max_bps,
+                };
+                let gqa = GqaConfig::new(kv, q_heads);
+                let mut rng = crate::diff::Rng::new(0x6E04);
+                let wdata = layer_weights_gqa(&mut rng, 1, d, kvd, dff);
+                let weights = weights_view(&wdata);
+                let x = rng.vec(bcap * d, -1.0, 1.0);
+                let x_d = g.stream.memcpy_stod(&x).unwrap();
+
+                let mut run = |arm: NormArm| -> (Vec<f32>, crate::ptx_norm::NormLaunch) {
+                    let mut model = DecodeModel::new_gqa_with_arms(
+                        g,
+                        &weights,
+                        &gqa,
+                        dff,
+                        128 * 1024 * 1024,
+                        KvDtype::F16,
+                        DecodeArms {
+                            norm: arm,
+                            ..DecodeArms::default()
+                        },
+                    )
+                    .unwrap();
+                    let plan = model.layers[0].norm_plan().clone();
+                    populate_one_layer(g, &mut model, &ctx0, kv_heads, hd, 0x5678);
+                    let mut out_d = g.stream.alloc_zeros::<f32>(bcap * d).unwrap();
+                    model.step_on(&g.stream.clone(), &x_d, &mut out_d).unwrap();
+                    g.stream.synchronize().unwrap();
+                    (g.stream.memcpy_dtov(&out_d).unwrap(), plan)
+                };
+                let (hard, _) = run(NormArm::Hardcoded);
+                let (planned, plan) = run(NormArm::Planned);
+
+                assert_eq!(
+                    (plan.entry.as_str(), plan.block, plan.warps_per_row),
+                    ("rmsnorm_w4", 128, 4),
+                    "at rows={bcap} cols={d} the planner must reach the 4-warp entry; got {plan:?}"
+                );
+                let scale = hard.iter().fold(0f32, |a, &z| a.max(z.abs()));
+                assert!(scale > 0.0, "the control arm produced an all-zero step");
+                let (max_abs, differing) =
+                    hard.iter()
+                        .zip(&planned)
+                        .fold((0f32, 0usize), |(m, n), (a, b)| {
+                            (
+                                m.max((a - b).abs()),
+                                n + usize::from(a.to_bits() != b.to_bits()),
+                            )
+                        });
+                assert!(
+                    max_abs <= 1e-3 * scale,
+                    "rmsnorm_w4 inside the decode layer deviates {max_abs:e} against a {scale:e} \
+                 output scale — that is a mis-launch, not the cross-warp fold's reassociation"
+                );
+                eprintln!(
+                "norm planner reached {} (grid={} block={}) at rows={bcap} cols={d} on {} SMs; \
+                 whole-step max|Δ| {max_abs:e} of scale {scale:e}, {differing} of {} lanes differ \
+                 in bits",
+                plan.entry,
+                plan.grid,
+                plan.block,
+                g.sm_count(),
+                hard.len()
             );
             },
         );
