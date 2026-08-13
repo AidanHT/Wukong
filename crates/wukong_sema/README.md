@@ -38,9 +38,10 @@ Load-bearing stage order: `collect` → `check_recursive_types` → `check_recur
 | array length gate | `src/lib.rs:956` | `array_len` |
 | reserved kernel prefix | `src/lib.rs:759` | `wukong_` → `E0300` |
 | scope stacks | `src/lib.rs:1524` | `push_scope` / `pop_scope` |
-| shape continuation | `src/shape.rs:99` | `type_call` |
-| call unification | `src/shape.rs:403` | `check_fn_call` |
-| dim binding | `src/shape.rs:554` | `unify_dim` |
+| shape continuation | `src/shape.rs:147` | `type_call` |
+| call unification | `src/shape.rs:451` | `check_fn_call` |
+| unify + declared names | `src/shape.rs:557` | `unify_decl` |
+| dim binding | `src/shape.rs:878` | `unify_dim` |
 | shared const fold | `wukong_ast::expr.rs:196` | `BinOp::fold_const_len` |
 
 ## Diagnostic codes owned
@@ -54,6 +55,13 @@ Sema emits every `E03xx` / `E04xx` / `E05xx` except `E0305` (unresolved import �
 | `E05xx` shapes | `E0501`–`E0504` | rank/index mismatch, dim/layout mismatch, arity, unknown dim |
 
 Prose lives in `wukong_diag/src/catalog.rs` — codes are stable; never renumber.
+
+The `E05xx` primary messages **name what disagrees**: a dimension mismatch names the dim and both
+values (`` dimension mismatch on `K` (axis 0): expected 512, found 513 ``), taking the name from the
+callee's declared signature — which is why `unify_decl` carries the pre-substitution parameter type
+next to the substituted one. Four headlines are asserted verbatim by
+`crates/wukongc/tests/fail.rs::shape_diagnostics_name_the_dim_in_json`, so a reword there is a gate
+failure, not a silent regression.
 
 ## `eval_usize_depth` vs `mir_build::const_usize_depth`
 
