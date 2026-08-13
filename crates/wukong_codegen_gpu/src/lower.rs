@@ -5000,7 +5000,11 @@ fn main() -> i32 {
     /// is `lang_parallel_saxpy`, added in the same series. The remaining 106 declines are honest
     /// `UNSUPPORTED` — still dominated by not-yet-lowered `wukong_*` kernels, plus `GlobalAddr`
     /// (string data), `wukong_rt_alloc` (heap) and `print_u`.
-    const RUN_CORPUS_COVERAGE_FLOOR: usize = 256;
+    ///
+    /// **256 -> 257** in the same series, when `lang_parallel_int_regions` was added: an i64
+    /// `@parallel` fixture, which lowers on Win64 in the default host mode because the 256-bit
+    /// raw-AVX2 recipe is f32-only. 257 of 363 on the device gate and 257 lowerable device-free.
+    const RUN_CORPUS_COVERAGE_FLOOR: usize = 257;
 
     /// The corpus directory both coverage gates and the invariance gate below sweep.
     fn corpus_files() -> Vec<PathBuf> {

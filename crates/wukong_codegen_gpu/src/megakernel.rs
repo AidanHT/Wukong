@@ -641,7 +641,10 @@ pub(crate) mod tests {
     /// `fusion::analyze` now admits a `wukong_parallel_for` outline as cooperative work. Eligible
     /// grew only 107 -> 110, so most of the +10 is configs that were already eligible and declining
     /// at emission: the gap between `eligible` and `ran` closed from 13 to 6.
-    pub(crate) const MEGA_CORPUS_COVERAGE_FLOOR: usize = 104;
+    ///
+    /// **104 -> 105** in the same series, when `lang_parallel_int_regions` was added: **105 ran / 111
+    /// eligible**, 101 mega-lowerable host-native, so the attribution is unchanged.
+    pub(crate) const MEGA_CORPUS_COVERAGE_FLOOR: usize = 105;
 
     /// Every **megakernel-eligible** `tests/run` program, run through the cooperative megakernel,
     /// matches the interpreter oracle (tolerance for floats, exact otherwise) at both -O0 and -O3.
