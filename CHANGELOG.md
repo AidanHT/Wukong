@@ -25,9 +25,11 @@ either, and `--emit=mir` of the fixtures shows no `wukong_*` kernel call.
   thread and a `print` there would produce one line per thread instead of one per iteration. The
   single-thread path deliberately keeps its sequential `F(0, n)` chunk: that kernel is launched with
   one thread, and it stays the correctness reference.
-- **Corpus coverage 239 → 256 of 362 programs** matching the interpreter oracle, and the megakernel
-  104 ran / 110 eligible configs (was 94 / 107), both floors ratcheted in the same commit. Zero
-  mismatches, zero faults.
+- **Corpus coverage 239 → 257 of 363 programs** matching the interpreter oracle, and the megakernel
+  105 ran / 111 eligible configs (was 94 / 107), both floors ratcheted in the same commits. Zero
+  mismatches, zero faults. Two new fixtures carry the generic path: `lang_parallel_saxpy` (f32, every
+  lane printed) and `lang_parallel_int_regions` (i64, two regions in one entry, one of them writing a
+  strided slice — and the one that reaches gpu-native on Win64 without `WUKONG_P4_NO_256`).
 - **No speed claim, and none is in `BENCHMARKS.md`.** Nothing here was timed: a `.wk` elementwise
   kernel through this path may well still be slower than the same program on the native CPU backend,
   and it is certainly slower than the recognized `wukong_velem` GPU kernel it deliberately avoids.
