@@ -839,10 +839,22 @@ impl<'a> FnEmit<'a> {
                     "{UNSUPPORTED} SIMD `Splat` (vectorized MIR) not yet lowered to PTX"
                 ))
             }
-            Op::ExtractLane(..) => {
-                return Err(format!(
-                    "{UNSUPPORTED} SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX"
-                ))
+            // Read lane `k` of a SIMD value back as a scalar — the shape the loop vectorizer's
+            // reduction epilogue folds in index order, and how a vector guard reaches a `CondBr`.
+            // `lower_vec_inst` already scalarizes every vector into one register per lane, so this is
+            // a register copy: the "one shuffle, lane 0 is free" cost model in
+            // `wukong_mir::Op::ExtractLane`'s doc is a CPU-SIMD statement, not a PTX one.
+            Op::ExtractLane(v, k) => {
+                let lanes = self.lanes(*v)?;
+                let src = lanes.get(*k as usize).cloned().ok_or_else(|| {
+                    format!(
+                        "{UNSUPPORTED} SIMD `ExtractLane` lane {k} is past the {} lane(s) of v{}",
+                        lanes.len(),
+                        v.0
+                    )
+                })?;
+                let d = self.reg(r);
+                self.emit(&format!("mov.{} {d}, {src};", mov_ty(rc_of(&rty))));
             }
             Op::Iota(..) => {
                 return Err(format!(
@@ -4336,6 +4348,85 @@ fn main() -> i32 {
                 );
             }
         }
+    }
+
+    /// A hand-built MIR function carrying the **portable SIMD** shape the CPU loop vectorizer emits:
+    /// `Splat`, `Iota`, a lane-wise `Bin`, a vector `Store`, and `ExtractLane` reading one lane back
+    /// out as a scalar. Device-free: it asserts the emitted text, not a run.
+    ///
+    /// Built here rather than through the frontend because the shape is a *lowering* contract, not a
+    /// source pattern — which loop `wukong_opt::vectorize` chooses to vectorize (and whether a
+    /// recognizer claims it first) can change without this obligation changing. `verify_program`
+    /// runs on it first so a test that stopped exercising legal MIR fails as a bad test rather than
+    /// as a lowering bug.
+    fn simd_probe(interner: &mut Interner) -> Program {
+        use wukong_mir::Builder;
+        let vt = MirType::Vec(Box::new(MirType::F32), 4);
+        let mut b = Builder::new(interner.intern("main"), MirType::I32);
+        let p = b.alloca(MirType::Array(Box::new(MirType::F32), 4));
+        let c = b.build(MirType::F32, Op::ConstFloat(2.5, MirType::F32));
+        let splat = b.build(vt.clone(), Op::Splat(c));
+        let ramp = b.build(
+            MirType::Vec(Box::new(MirType::I32), 4),
+            Op::Iota(MirType::Vec(Box::new(MirType::I32), 4)),
+        );
+        let ramp_f = b.build(vt.clone(), Op::Cast(CastKind::SiToFp, ramp, vt.clone()));
+        let sum = b.build(vt.clone(), Op::Bin(BinOp::FAdd, splat, ramp_f));
+        b.build_void(Op::Store {
+            ptr: p,
+            value: sum,
+        });
+        let lane3 = b.build(MirType::F32, Op::ExtractLane(sum, 3));
+        b.build_void(Op::Call {
+            func: interner.intern("print"),
+            args: vec![lane3],
+        });
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        b.ret(Some(zero));
+        let mut program = Program::new();
+        program.funcs.push(b.finish());
+        let errs = wukong_mir::verify::verify_program(&program);
+        assert!(errs.is_empty(), "the SIMD probe MIR must verify: {errs:?}");
+        program
+    }
+
+    /// **Portable SIMD MIR lowers to PTX** (Task 1.1) — one lane's worth of instructions per lane,
+    /// ASCII only, at the `sm_80` floor. Before this, `Splat`/`ExtractLane`/`Iota` were three
+    /// `UNSUPPORTED:` declines and any vectorized function skipped the device entirely.
+    #[test]
+    fn portable_simd_mir_lowers_to_ascii_ptx() {
+        let mut interner = Interner::new();
+        let program = simd_probe(&mut interner);
+        let entry = interner.intern("main");
+        let ptx = emit_ptx(&program, entry, &interner).expect("portable SIMD must lower");
+
+        assert!(ptx.is_ascii(), "PTX must stay ASCII (ptxas rejects non-ASCII)");
+        assert!(
+            ptx.starts_with(crate::ptx_target::HDR_SM80),
+            "the SIMD lowering must not introduce a header of its own"
+        );
+        // Scalarized: one lane-wise add and one lane store per lane, not one vector op.
+        assert_eq!(
+            ptx.matches("add.rn.f32").count(),
+            4,
+            "expected one add per lane in:\n{ptx}"
+        );
+        assert_eq!(
+            ptx.matches("st.f32").count(),
+            4,
+            "expected one store per lane in:\n{ptx}"
+        );
+        // `Iota` materializes lane k as the constant k; `ExtractLane` is a register copy.
+        for k in 0..4 {
+            assert!(
+                ptx.contains(&format!(", {k};")),
+                "lane constant {k} missing from the iota ramp in:\n{ptx}"
+            );
+        }
+        assert!(
+            ptx.contains("mov.f32"),
+            "ExtractLane must copy the lane register into the scalar result in:\n{ptx}"
+        );
     }
 
     /// The comparator the corpus gate is built on, pinned against the real divergence it used to
