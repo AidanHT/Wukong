@@ -4483,6 +4483,15 @@ mod tests {
     }
 
     #[test]
+    fn constant_dim_mismatch_at_a_call_names_the_axis() {
+        // A fully concrete call: the callee's axis 1 is 8, the argument's is 9. Both numbers were
+        // already in the message; the axis was not.
+        let src = "fn takes(a: Tensor[f32, 4, 8]) {} \
+                   fn f(a: Tensor[f32, 4, 9]) { takes(a); }";
+        assert_message_has(src, "E0502", &["axis 1", "expected 8, found 9"]);
+    }
+
+    #[test]
     fn tensor_index_rank_mismatch_errors() {
         let src = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0]; }";
         assert!(

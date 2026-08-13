@@ -876,11 +876,14 @@ impl Sema<'_> {
                 }
             },
             Dim::Const(pc) => match ad {
-                Dim::Const(ac) if pc != ac => self.error(
-                    span,
-                    "E0502",
-                    format!("dimension mismatch: expected {pc}, found {ac}"),
-                ),
+                Dim::Const(ac) if pc != ac => {
+                    let at = self.dim_site(site);
+                    self.error(
+                        span,
+                        "E0502",
+                        format!("dimension mismatch on {at}: expected {pc}, found {ac}"),
+                    )
+                }
                 // A caller's own universally-quantified dim cannot be ASSUMED equal to the callee's
                 // fixed size — that is a claim the checker cannot prove, and the very hole `rigid`
                 // mode closes on the return path was left open here on the call path: `fn fwd<N>(a:
