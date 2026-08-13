@@ -7008,6 +7008,30 @@ pub fn gemm_nt_wgmma(
     k: usize,
     n: usize,
 ) -> Result<Vec<f32>, GpuError> {
+    gemm_nt_wgmma_epi(g, cfg, a, b, None, m, k, n)
+}
+
+/// [`gemm_nt_wgmma`] with the **fused epilogue's** extra operands (wave 4).
+///
+/// `bias` is a per-output-COLUMN vector of length `n` — cuBLASLt's `CUBLASLT_EPILOGUE_BIAS` axis
+/// under this backend's `C = A*B^T` mapping, where cuBLASLt's D is `C^T` and its "rows" are our N
+/// (`ptx_wgmma::WgmmaCfg::bias`). It must be `Some` exactly when `cfg.bias` is set; the pair is
+/// asserted rather than coerced, because a `None` at a bias kernel is a driver reading adjacent host
+/// stack as a pointer and a `Some` at a plain one is a silently ignored argument.
+///
+/// Everything else — the capability gate first, the extent asserts, `k >= 1`, `m*n <= u32::MAX`, the
+/// SMEM budget, and the `.param`-count check read out of the very text about to be loaded — is
+/// [`gemm_nt_wgmma`]'s, unchanged.
+pub fn gemm_nt_wgmma_epi(
+    g: &mut Gpu,
+    cfg: &crate::ptx_wgmma::WgmmaCfg,
+    a: &[f32],
+    b: &[f32],
+    bias: Option<&[f32]>,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, GpuError> {
     use crate::ptx_wgmma::WgmmaDtype;
     use crate::tma_host::TensorMap;
     use cudarc::driver::{DevicePtr, DevicePtrMut};
@@ -7016,6 +7040,22 @@ pub fn gemm_nt_wgmma(
     let lic = crate::ptx_wgmma::require_sm90a(g, cfg.name)?;
     assert_eq!(a.len(), m * k, "{}: A must be m*k", cfg.name);
     assert_eq!(b.len(), n * k, "{}: B must be n*k (A*Bt)", cfg.name);
+    assert_eq!(
+        cfg.bias,
+        bias.is_some(),
+        "{}: this config declares bias={} and was handed bias={}",
+        cfg.name,
+        cfg.bias,
+        bias.is_some()
+    );
+    if let Some(v) = bias {
+        assert_eq!(
+            v.len(),
+            n,
+            "{}: the fused bias is per output COLUMN, so it is N long, not M",
+            cfg.name
+        );
+    }
     assert!(
         k >= 1,
         "{}: K must be >= 1 — at K == 0 the kernel issues no wgmma, never writes the accumulators, \
@@ -7073,6 +7113,12 @@ pub fn gemm_nt_wgmma(
     };
     let a_d = g.stream.memcpy_stod(&a16)?;
     let b_d = g.stream.memcpy_stod(&b16)?;
+    // The bias stays f32 on the device: the epilogue adds it to the f32 accumulator, so narrowing it
+    // would round a value the unfused chain does not round and break L7a's `==` before anything ran.
+    let bias_d = match bias {
+        Some(v) => Some(g.stream.memcpy_stod(v)?),
+        None => None,
+    };
     let mut c_d = g.stream.memcpy_stod(&vec![0f32; m * n])?;
     assert_eq!(a_d.len(), m * k, "{}: A device buffer", cfg.name);
     assert_eq!(b_d.len(), n * k, "{}: B device buffer", cfg.name);
@@ -7106,8 +7152,18 @@ pub fn gemm_nt_wgmma(
     let (mm, nn, kk) = (m as u32, n as u32, k as u32);
     let launch = dyn_launch_cfg(plan.grid(m, n), plan.block, plan.dyn_smem_bytes);
     {
+        let bias_ptr = bias_d.as_ref().map(|d| d.device_ptr(&g.stream).0);
         let (c_ptr, _gc) = c_d.device_ptr_mut(&g.stream);
-        let mut args = wgmma_arg_list(&mm, &nn, &kk, &c_ptr, &map_a, &map_b);
+        let mut args = wgmma_arg_list(
+            cfg,
+            &mm,
+            &nn,
+            &kk,
+            &c_ptr,
+            &map_a,
+            &map_b,
+            bias_ptr.as_ref(),
+        );
         // SAFETY: `args` is built by the one helper both wgmma launchers use, in PARAM_ORDER, and
         // its length was checked against the `.param` count of *this* text above. Every pointed-to
         // value (`mm`/`nn`/`kk`, the `CUdeviceptr`, the two 128-byte maps) is a live local that
@@ -7135,25 +7191,55 @@ pub fn gemm_nt_wgmma(
 /// list is derived from one place: two hand-written copies of a six-entry list can drift, and a short
 /// push makes the driver read adjacent host stack as a pointer.
 ///
+/// # The fused-epilogue pointers are appended here and nowhere else (guard G21)
+///
+/// A variant's parameter list is [`crate::ptx_wgmma::WgmmaCfg::param_order`], and this function is
+/// the one place it is turned into pushed arguments. `bias` must be `Some` exactly when the config
+/// declares one: a `None` against a bias entry would push five arguments at a seven-parameter kernel
+/// and the driver would read adjacent host stack as the bias pointer, which is the failure crate
+/// hard rule 2 exists for. The assertion below is not defensive — it is the only thing standing
+/// between a mismatched pair of call sites and a wild dereference on rented silicon.
+///
 /// # Safety
 ///
-/// Every reference must outlive the launch. The returned array borrows all six.
+/// Every reference must outlive the launch. The returned vector borrows all of them.
 fn wgmma_arg_list(
+    cfg: &crate::ptx_wgmma::WgmmaCfg,
     m: &u32,
     n: &u32,
     k: &u32,
     c: &sys::CUdeviceptr,
     map_a: &crate::tma_host::TensorMap,
     map_b: &crate::tma_host::TensorMap,
-) -> [*mut std::ffi::c_void; 6] {
-    [
+    bias: Option<&sys::CUdeviceptr>,
+) -> Vec<*mut std::ffi::c_void> {
+    assert_eq!(
+        cfg.bias,
+        bias.is_some(),
+        "{}: the config declares bias={} and the launcher was handed bias={} — a short push makes \
+         the driver read adjacent host stack as the bias pointer",
+        cfg.name,
+        cfg.bias,
+        bias.is_some()
+    );
+    let mut v: Vec<*mut std::ffi::c_void> = vec![
         m as *const u32 as *mut std::ffi::c_void,
         n as *const u32 as *mut std::ffi::c_void,
         k as *const u32 as *mut std::ffi::c_void,
         c as *const sys::CUdeviceptr as *mut std::ffi::c_void,
         map_a as *const crate::tma_host::TensorMap as *mut std::ffi::c_void,
         map_b as *const crate::tma_host::TensorMap as *mut std::ffi::c_void,
-    ]
+    ];
+    if let Some(b) = bias {
+        v.push(b as *const sys::CUdeviceptr as *mut std::ffi::c_void);
+    }
+    assert_eq!(
+        v.len(),
+        cfg.param_order().len(),
+        "{}: the argument list and the config's own param_order disagree",
+        cfg.name
+    );
+    v
 }
 
 /// **Time [`gemm_nt_wgmma`]'s steady state**: `iters` resident launches over buffers uploaded once,
@@ -7277,6 +7363,16 @@ pub fn time_gemm_nt_wgmma_in(
     };
     let a_d = g.stream.memcpy_stod(&vec![fill; m * k])?;
     let b_d = g.stream.memcpy_stod(&vec![fill; n * k])?;
+    // **A ZERO bias, and the zero is the point.** Timing reads no value, and the closed-form
+    // readback below (`every in-range lane is exactly K*fill^2`) is the only thing standing between
+    // a kernel that stores nothing and the fastest row in the table — so the fused arm must land on
+    // the SAME closed form as the plain one. A zero bias is exact under `add.f32`, keeps the readback
+    // valid across the fused/plain A/B, and moves exactly the bytes the real kernel moves.
+    let bias_d = if cfg.bias {
+        Some(g.stream.memcpy_stod(&vec![0f32; n])?)
+    } else {
+        None
+    };
     // **A SENTINEL, not zero.** A lane the epilogue never wrote must be distinguishable from a lane
     // it wrote a zero into, and the closed-form readback below is the only thing standing between a
     // kernel that stores nothing and the fastest row in the table.
@@ -7303,8 +7399,18 @@ pub fn time_gemm_nt_wgmma_in(
     // ONE argument list for the warm-up and for the timed region: hard rule 2's whole point is that
     // the pushed list is derived from the entry it is pushed at, and two copies of it can drift.
     let secs = {
+        let bias_ptr = bias_d.as_ref().map(|d| d.device_ptr(&g.stream).0);
         let (c_ptr, _gc) = c_d.device_ptr_mut(&g.stream);
-        let mut args = wgmma_arg_list(&mm, &nn, &kk, &c_ptr, &map_a, &map_b);
+        let mut args = wgmma_arg_list(
+            cfg,
+            &mm,
+            &nn,
+            &kk,
+            &c_ptr,
+            &map_a,
+            &map_b,
+            bias_ptr.as_ref(),
+        );
         let c_bytes = m * n * std::mem::size_of::<f32>();
         let mut t0 = std::time::Instant::now();
         for i in 0..=iters {
@@ -7335,12 +7441,29 @@ pub fn time_gemm_nt_wgmma_in(
     };
 
     if region.verify_closed_form {
-        // **The closed form.** Every operand is exactly `2^-7`, so every in-range lane of C is
-        // exactly `K * 2^-14` — and every partial sum on the way there is an exact integer multiple
-        // of one ulp, so the verdict is `==` at any K under any accumulation order. A lane still
-        // holding the sentinel is a lane the timed path never wrote.
-        let want = k as f32 * (region.fill * region.fill);
+        // **The closed form.** Every operand is exactly `2^-7`, so every in-range lane of the GEMM
+        // is exactly `K * 2^-14` -- and every partial sum on the way there is an exact integer
+        // multiple of one ulp. A fused ReLU of that positive value is the identity (`max.f32`
+        // against +0). A fused SiLU/GELU is not: the expected value is the standalone `vmath`
+        // kernel of that closed form, which is the same MUFU text the epilogue emits, so the
+        // verdict stays `==`. A lane still holding the sentinel is a lane the timed path never
+        // wrote -- that half of G7 is independent of the activation.
+        let gemm_want = k as f32 * (region.fill * region.fill);
         let got = g.stream.memcpy_dtov(&c_d)?;
+        let want = match cfg.act {
+            crate::ptx_act::Act::None | crate::ptx_act::Act::Relu => gemm_want,
+            crate::ptx_act::Act::Silu | crate::ptx_act::Act::Gelu => {
+                use wukong_runtime::{VM_GELU, VM_SILU};
+                let op = if cfg.act == crate::ptx_act::Act::Silu {
+                    VM_SILU
+                } else {
+                    VM_GELU
+                };
+                vmath(g, op, &[gemm_want]).unwrap_or_else(|e| {
+                    panic!("{}: vmath closed-form reference failed: {e}", cfg.name)
+                })[0]
+            }
+        };
         let mut unwritten = 0usize;
         let mut wrong = 0usize;
         let mut first: Option<(usize, f32)> = None;
@@ -7366,12 +7489,12 @@ pub fn time_gemm_nt_wgmma_in(
         assert_eq!(
             wrong,
             0,
-            "{}: {wrong} of {} lanes miss the closed form K*fill^2 = {want:e} at {m}x{k}x{n} \
-             (first: lane {:?}). Every operand is 2^-7, whose square is exactly 2^-14, so every \
-             partial sum is an exact multiple of one ulp and this verdict is `==` under ANY \
-             accumulation order -- a miss is a real fault, not a reassociation.",
+            "{}: {wrong} of {} lanes miss the closed form (GEMM K*fill^2 = {gemm_want:e}, after \
+             {:?} = {want:e}) at {m}x{k}x{n} (first: lane {:?}). A miss is a real fault -- the \
+             timed path wrote something other than the epilogue of the exact integer.",
             cfg.name,
             got.len(),
+            cfg.act,
             first
         );
     }
@@ -7988,6 +8111,7 @@ mod tests {
         ("paged_kv.rs", include_str!("paged_kv.rs")),
         ("pool.rs", include_str!("pool.rs")),
         ("ptx.rs", include_str!("ptx.rs")),
+        ("ptx_act.rs", include_str!("ptx_act.rs")),
         ("ptx_autodiff_bwd.rs", include_str!("ptx_autodiff_bwd.rs")),
         ("ptx_conv.rs", include_str!("ptx_conv.rs")),
         ("ptx_flash.rs", include_str!("ptx_flash.rs")),
@@ -8669,7 +8793,18 @@ mod tests {
         // them on a CPU before an H100 is rented. A missing twin is a silent defect: the bf16 rule
         // declines, `gpu_accel` routes the offload to the pre-Hopper f32 launcher, and the program
         // returns correct numbers at the old speed.
-        const EXPECTED_MODULES: usize = 132;
+        // 132 -> 134 on 2026-08-12 with WAVE 4 R1, the fused per-column bias: `w1_mcb_v2_b` and
+        // `w1_v2_b`, one epilogue fact off each of the two W1 v2 regime arms. They are
+        // the first entries in this family with a SEVENTH parameter, which is why they are also the
+        // commit that turned `PARAM_ORDER` into `WgmmaCfg::param_order()` -- the device-free
+        // parameter law now re-derives the expected list per entry instead of asserting one
+        // constant for all of them, and the census assembles both before an H100 is rented.
+        // 134 -> 142 on 2026-08-12 with WAVE 4 R2/R3, the fused activation: {relu, gelu, silu} x
+        // both regime arms at f16, plus the bf16 twins of the SiLU headline at both arms. Only the
+        // SiLU rows can ever be published as a fusion win -- cuBLASLt has no SiLU member, while it
+        // fuses RELU_BIAS and GELU_BIAS at both output dtypes, which makes those two parity rows
+        // and makes gelu the control that measures the peer's own epilogue cost.
+        const EXPECTED_MODULES: usize = 142;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -18231,22 +18366,38 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// is unreachable — `require_sm90a` declines first and forever. So the same equality is checked
     /// here, device-free, out of the generated text: an entry that grew a parameter, or a `PARAM_ORDER`
     /// that lost one, is a driver reading adjacent host stack as a pointer on the first H100 launch.
+    /// # It is re-derived PER ENTRY, from the config that emitted it (guard G21)
+    ///
+    /// Until wave 4 there was one list and this law asserted every entry declared exactly it. A
+    /// fused-epilogue variant appends a pointer, which makes that sentence false for part of the
+    /// corpus — and the *easy* repair, relaxing the count to "at least six", deletes the property
+    /// outright. So the expected list comes from `WgmmaCfg::param_order()`, the same function the
+    /// launch argument builder reads, and the gate line prints the histogram rather than one number
+    /// so a corpus that silently stopped emitting bias entries is visible in the log.
     #[test]
     fn every_wgmma_entry_declares_exactly_the_parameters_the_launcher_pushes() {
-        use crate::ptx_wgmma::{wgmma_all_emittable, ParamKind, Sm90aLicense, PARAM_ORDER};
+        use crate::ptx_wgmma::{wgmma_all_emittable, ParamKind, Sm90aLicense};
         // A literal `(9, 0)` only ever asserts "this capability is a Hopper one", which is true; the
         // license carries no claim about the machine running the test.
         let lic = Sm90aLicense::for_probed_cc((9, 0)).expect("(9,0) is Hopper");
         let rows = wgmma_all_emittable();
+        let mut widths: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
         for v in &rows {
             let plan = v.launch_plan();
+            let want_params = v.param_order();
+            assert_eq!(
+                plan.params, want_params,
+                "{}: the launch plan's parameter list is not the config's own param_order()",
+                v.name
+            );
             let ptx = crate::ptx_wgmma::wgmma_module(v, &lic)
                 .unwrap_or_else(|e| panic!("emittable row {} must generate: {e}", v.name));
             assert_eq!(
                 entry_param_count(&ptx, plan.entry),
-                PARAM_ORDER.len(),
-                "{}: declared params vs PARAM_ORDER — the launch argument list is built from the \
-                 latter, so a mismatch is a short push",
+                want_params.len(),
+                "{}: declared params vs its own param_order() — the launch argument list is built \
+                 from the latter, so a mismatch is a short push",
                 plan.entry
             );
             let decl = ptx
@@ -18257,7 +18408,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 .expect("an entry declaration closes its parameter list")
                 .0;
             // …and each declaration's *kind*, in order, so a u32/pointer swap is caught too.
-            for (i, (kind, decl)) in PARAM_ORDER
+            for (i, (kind, decl)) in want_params
                 .iter()
                 .zip(decl.split(".param ").skip(1))
                 .enumerate()
@@ -18269,16 +18420,39 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 };
                 assert!(
                     decl.trim_start().starts_with(want),
-                    "{}: param {i} is {kind:?} in PARAM_ORDER but the entry declares `{}`",
+                    "{}: param {i} is {kind:?} in param_order() but the entry declares `{}`",
                     plan.entry,
                     decl.trim().trim_end_matches(',')
                 );
             }
+            // The extra pointer is the fused epilogue's, and it is LAST: appending is the only edit
+            // that cannot renumber an existing parameter, and a renumbered parameter is the driver
+            // reading a `CUtensorMap` as a pointer with no diagnostic anywhere.
+            assert_eq!(
+                want_params.len(),
+                6 + usize::from(v.bias),
+                "{}: the parameter count must be the base six plus one per fused-epilogue tensor",
+                v.name
+            );
+            if v.bias {
+                assert_eq!(
+                    want_params.last(),
+                    Some(&ParamKind::GlobalPtr),
+                    "{}: the bias pointer is appended, never inserted",
+                    v.name
+                );
+                assert!(
+                    ptx.contains("ld.param.u64 %rdBias,[pBias];"),
+                    "{}: declares a bias parameter and never loads it",
+                    v.name
+                );
+            }
+            *widths.entry(want_params.len()).or_default() += 1;
         }
         eprintln!(
-            "[gate] {} wgmma entries declare exactly PARAM_ORDER ({} params, kinds in order) \u{2713}",
-            rows.len(),
-            PARAM_ORDER.len()
+            "[gate] {} wgmma entries declare exactly their own param_order (kinds in order); \
+             param-count histogram {widths:?} \u{2713}",
+            rows.len()
         );
     }
 
@@ -18464,7 +18638,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             "exactly one TIMING launcher is expected to hold a blocking synchronize; found \
              {warmup_boxed:?}"
         );
-        for known in ["gemm_nt_wgmma", "tma_stage_probe", "wgmma_desc_sweep"] {
+        // `gemm_nt_wgmma` itself is now a one-line delegator to `gemm_nt_wgmma_epi` — it establishes
+        // no capability and launches nothing, so the SCAN correctly stops naming it and names the
+        // body instead. That is the property working, not a hole: the whitelist below is only a
+        // vacuity check on the scan, and updating it to follow a split body is exactly what the
+        // comment above says happened to `time_gemm_nt_wgmma`.
+        for known in ["gemm_nt_wgmma_epi", "tma_stage_probe", "wgmma_desc_sweep"] {
             assert!(
                 boxed_only.iter().any(|n| n == known),
                 "{known} is no longer being found by the launcher scan (found {boxed_only:?})"
@@ -18515,7 +18694,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         // `stages < wait_depth + 2` (law L4.4) is the DESIGN that makes the backstop unnecessary;
         // this is the backstop. It is a scan, not a whitelist -- but a scan is only a law if the
         // corpus it ranges over is non-empty, and both correctness launchers a depth arm reaches
-        // (`gemm_nt_wgmma`, and the warm-up of `time_gemm_nt_wgmma_in`) must be in it.
+        // (`gemm_nt_wgmma_epi`, which is what `gemm_nt_wgmma` became when wave 4 gave the epilogue
+        // its own operands, and the warm-up of `time_gemm_nt_wgmma_in`) must be in it.
         assert!(
             crate::ptx_wgmma::wgmma_all_emittable()
                 .iter()
@@ -18524,11 +18704,11 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
              does not exist and wave 3 lever 4 is not in the family at all"
         );
         assert!(
-            boxed_only.iter().any(|n| n == "gemm_nt_wgmma")
+            boxed_only.iter().any(|n| n == "gemm_nt_wgmma_epi")
                 && warmup_boxed.iter().any(|n| n == "time_gemm_nt_wgmma_in"),
-            "every launch a wait_depth arm can take -- the correctness gates' `gemm_nt_wgmma` and \
-             the timing launcher's warm-up -- must be inside the watchdog: a wrong lag HANGS, and a \
-             hang on rented silicon bills to the container timeout with no log"
+            "every launch a wait_depth arm can take -- the correctness gates' `gemm_nt_wgmma_epi` \
+             and the timing launcher's warm-up -- must be inside the watchdog: a wrong lag HANGS, \
+             and a hang on rented silicon bills to the container timeout with no log"
         );
         eprintln!(
             "[gate] {} sm_90a launchers drain through sync_within (default deadline {} ms), \
@@ -20096,6 +20276,142 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         launches
     }
 
+    /// **The fused epilogue's bias, as data**: exact small integers, so the exact-integer arm stays
+    /// exact and the `==` verdict stays a verdict.
+    ///
+    /// A bias of zeros would pass every law in this file while proving nothing — it is the identity,
+    /// so a kernel that dropped the bias add entirely would be indistinguishable from one that
+    /// performed it. The values are `1..=7` by column, which are exact in f32 and stay exact under
+    /// the accumulator's own magnitudes at the guard shape.
+    fn wgmma_guard_bias(n: usize) -> Vec<f32> {
+        (0..n).map(|j| (j % 7 + 1) as f32).collect()
+    }
+
+    /// **L7a — the fused epilogue's exactness law, and it is `==` rather than a tolerance.**
+    ///
+    /// For a fused row the reference cannot be a host formula: `ex2.approx.f32`, `rcp.approx.f32`
+    /// and `tanh.approx.f32` are approximate but **deterministic** — a fixed function of the input
+    /// bit pattern on a given architecture — so the only faithful reference is the same instruction
+    /// sequence on the same device. That reference is exactly the unfused CHAIN this epilogue
+    /// exists to delete:
+    ///
+    /// ```text
+    ///   fused(A, B, bias)  ==  vmath_act( gemm_nt_wgmma_plain(A, B) + bias )
+    /// ```
+    ///
+    /// element-wise `==`, and it holds because every intermediate is bit-identical: an f32 store
+    /// followed by an f32 load is the identity, the bias add is the same `add.f32` on the same two
+    /// f32 values in both arms, and the activation is the same PTX text in both arms
+    /// (`ptx_wmma::Act::epilogue`, which the standalone `ptx::vmath_ptx` kernels share instruction
+    /// for instruction and constant for constant).
+    ///
+    /// **Anything less than `==` here hides a real difference**, and the three edges that make that
+    /// concrete all agree only because both arms issue the identical instruction:
+    ///
+    /// * **signed zero** — `max.f32 x, 0f00000000` on `x = -0.0` is not `f32::max`'s answer;
+    /// * **NaN** — same argument, same tie-break;
+    /// * **the bias-then-activate ORDER** — pinned by `baselines::apply_f64`; an arm that activated
+    ///   first would still pass a *tolerance* gate on smooth data.
+    ///
+    /// The plain twin's own numerical gates (exact integers against `ref_nt`, pseudorandom against
+    /// the f64 reference at `c*sqrt(K)*eps`) are the twin's, and the twin is in the same table — so
+    /// the fused row inherits a checked GEMM and adds a checked epilogue, rather than re-deriving a
+    /// reference for the product of the two.
+    fn wgmma_fused_pretiming_guard(
+        g: &mut Gpu,
+        cfg: &'static crate::ptx_wgmma::WgmmaCfg,
+        label: &str,
+    ) -> usize {
+        use crate::ptx_wgmma::{
+            bringup_operands, guard_shape, random_operands, wgmma_variant, RANDOM_ARM_SEED,
+        };
+        let tag = cfg.epilogue_tag();
+        let plain = wgmma_variant(cfg.name.strip_suffix(&tag).unwrap_or_else(|| {
+            panic!("{label}: {} does not end in its own epilogue tag", cfg.name)
+        }));
+        let gs = guard_shape(cfg);
+        let (m, n, k) = (gs.m, gs.n, gs.k);
+        let bias = wgmma_guard_bias(n);
+        let bias_arg = cfg.bias.then_some(bias.as_slice());
+        let mut lanes = 0usize;
+        for (arm, (a, b)) in [
+            ("exact", bringup_operands(m, n, k, cfg.dtype)),
+            (
+                "random",
+                random_operands(m, n, k, cfg.dtype, RANDOM_ARM_SEED),
+            ),
+        ] {
+            // The chain, arm by arm: the plain GEMM, the host bias add (an exact f32 add, and the
+            // same one the kernel issues), then the standalone activation kernel.
+            let base = gemm_nt_wgmma(g, plain, &a, &b, m, k, n).unwrap_or_else(|e| {
+                panic!("{label}: the plain twin {} ({arm} arm): {e}", plain.name)
+            });
+            let mut chain = base.clone();
+            if cfg.bias {
+                for (i, x) in chain.iter_mut().enumerate() {
+                    *x += bias[i % n];
+                }
+            }
+            // The standalone activation kernel -- the SAME `ptx::vmath_ptx` text `Act::epilogue`
+            // emits -- so L7a is `==` even for SiLU/GELU, whose MUFU ops have no host twin.
+            // Host `f32::max` / `f32::tanh` would lie on signed zero, NaN, and the approx.
+            if cfg.act != crate::ptx_act::Act::None {
+                use wukong_runtime::{VM_GELU, VM_RELU, VM_SILU};
+                let op = match cfg.act {
+                    crate::ptx_act::Act::Relu => VM_RELU,
+                    crate::ptx_act::Act::Silu => VM_SILU,
+                    crate::ptx_act::Act::Gelu => VM_GELU,
+                    crate::ptx_act::Act::None => {
+                        panic!("{label}: vmath branch reached for Act::None ({arm} arm)")
+                    }
+                };
+                chain = vmath(g, op, &chain).unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: vmath({:?}) of the chain ({arm} arm): {e}",
+                        cfg.act
+                    )
+                });
+            }
+            let got = gemm_nt_wgmma_epi(g, cfg, &a, &b, bias_arg, m, k, n).unwrap_or_else(|e| {
+                panic!("{label}: {} at {} ({arm} arm): {e}", cfg.name, gs.dims())
+            });
+            let bad = got.iter().zip(&chain).filter(|(x, y)| x != y).count();
+            assert_eq!(
+                bad,
+                0,
+                "{label}: {} is not BIT-IDENTICAL to the chain it replaces at {} ({bad} of {} \
+                 lanes, {arm} arm). L7a is `==`, not a tolerance: both arms store and reload the \
+                 same f32, add the same bias with the same `add.f32`, and run the same activation \
+                 text, so any difference at all is a real one -- a dropped predicate, a crossed \
+                 bias pair, or an activation applied before the bias instead of after.",
+                cfg.name,
+                gs.dims(),
+                chain.len()
+            );
+            // G8, on the arm that can see a reassociation: a kernel whose answer moves between
+            // launches cannot post a timing.
+            let again = gemm_nt_wgmma_epi(g, cfg, &a, &b, bias_arg, m, k, n)
+                .unwrap_or_else(|e| panic!("{label}: {} second run ({arm} arm): {e}", cfg.name));
+            assert_eq!(
+                got, again,
+                "{label}: {} is not run-to-run bit-identical on the {arm} arm",
+                cfg.name
+            );
+            lanes += got.len();
+        }
+        eprintln!(
+            "  {:<14} {} at {}: BIT-IDENTICAL (==) to vmath({:?})({} + bias{}) on both the \
+             exact-integer and the pseudorandom arm, and bit-identical over two runs; {lanes} lanes",
+            label,
+            cfg.name,
+            gs.dims(),
+            cfg.act,
+            plain.name,
+            if cfg.bias { "" } else { " (none)" }
+        );
+        lanes
+    }
+
     /// Returns the number of lanes checked, for the round log.
     fn wgmma_pretiming_guard(
         g: &mut Gpu,
@@ -20111,6 +20427,14 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
              handed to one",
             cfg.name
         );
+        // **A fused row is gated against the CHAIN, not against a host reference** (L7a). Its
+        // reference is a device kernel because the activation's MUFU instructions have no host
+        // twin, and its GEMM's own numerical gates belong to the plain twin in the same table.
+        if !cfg.epilogue_tag().is_empty() {
+            let lanes = wgmma_fused_pretiming_guard(g, cfg, label);
+            wgmma_drain_depth_gate(g, cfg, label);
+            return lanes;
+        }
         let gs = guard_shape(cfg);
         let (m, n, k) = (gs.m, gs.n, gs.k);
         let plan = cfg.launch_plan();
@@ -20963,23 +21287,38 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // TIMING launcher, at the guard shape, with a fill whose answer is a closed form that is
             // exact at every K, and reads C back.
             {
+                let region = TimedRegion::closed_form_probe();
+                // Plain GEMM, then the cheapest fused arm (ReLU is identity on the positive closed
+                // form), then the headline (SiLU, whose closed form is the vmath of K*fill^2).
+                // Three probes, one G7: the timed path wrote C, and the fused path wrote the
+                // EPILOGUE of C, not the plain GEMM under a fused heading.
+                for (tag, cfg) in [
+                    (
+                        "plain",
+                        &crate::ptx_wgmma::WGMMA_W1_MCB as &crate::ptx_wgmma::WgmmaCfg,
+                    ),
+                    ("relu+bias", &crate::ptx_wgmma::WGMMA_W1_MCB_V2_B_RELU),
+                    ("silu+bias", &crate::ptx_wgmma::WGMMA_W1_MCB_V2_B_SILU),
+                ] {
+                    let gs = crate::ptx_wgmma::guard_shape(cfg);
+                    match time_gemm_nt_wgmma_in(g, cfg, gs.m, gs.k, gs.n, 4, region) {
+                        Ok(secs) => eprintln!(
+                            "\n---- {BENCH}: the TIMED path writes C (guard G7, {tag}) ----\n  \
+                             {} at {} through the timing launcher, {}: no sentinel remains \
+                             ({:.3} ms/launch, not a measurement) \u{2713}",
+                            cfg.name,
+                            gs.dims(),
+                            region.label(),
+                            secs * 1e3
+                        ),
+                        Err(e) => panic!(
+                            "{BENCH}: the timed path's closed-form probe failed on {tag} {}: {e}",
+                            cfg.name
+                        ),
+                    }
+                }
                 let cfg = &crate::ptx_wgmma::WGMMA_W1_MCB;
                 let gs = crate::ptx_wgmma::guard_shape(cfg);
-                let region = TimedRegion::closed_form_probe();
-                match time_gemm_nt_wgmma_in(g, cfg, gs.m, gs.k, gs.n, 4, region) {
-                    Ok(secs) => eprintln!(
-                        "\n---- {BENCH}: the TIMED path writes C (guard G7) ----\n  \
-                         {} at {} through the timing launcher, {}: every lane is exactly \
-                         K*fill^2 = {:e}, and none still holds the pre-launch sentinel \
-                         ({:.3} ms/launch, not a measurement) \u{2713}",
-                        cfg.name,
-                        gs.dims(),
-                        region.label(),
-                        gs.k as f32 * region.fill * region.fill,
-                        secs * 1e3
-                    ),
-                    Err(e) => panic!("{BENCH}: the timed path's closed-form probe failed: {e}"),
-                }
                 // ...and what the memset itself costs, measured rather than asserted, so the day a
                 // schedule needs one the round already knows the price. Same shape, same launcher,
                 // one fact apart.
@@ -22149,6 +22488,25 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             probe < first_timed,
             "the closed-form probe must precede the timed rows -- afterwards it is a post-mortem"
         );
+        // G7 on fused arms: a probe that only ever ran the plain GEMM would not see a fused
+        // epilogue that stored nothing (or stored the GEMM and claimed SiLU).
+        assert!(
+            sweep.contains("WGMMA_W1_MCB_V2_B_RELU") && sweep.contains("WGMMA_W1_MCB_V2_B_SILU"),
+            "the closed-form probe must cover a fused ReLU arm and the SiLU headline, not only \
+             the plain GEMM"
+        );
+        // L7a is `fused == vmath_act(gemm + bias)`. A guard that added the bias and stopped
+        // would pass ReLU-of-positive by accident and fail SiLU/GELU only on Hopper.
+        let (_, fused) = fns
+            .iter()
+            .find(|(n, _)| n == "wgmma_fused_pretiming_guard")
+            .expect("the fused exactness guard exists");
+        for need in ["vmath(g,", "VM_RELU", "VM_SILU", "VM_GELU"] {
+            assert!(
+                fused.contains(need),
+                "L7a's fused guard must apply the standalone vmath kernel; missing `{need}`"
+            );
+        }
     }
 
     /// **The instrument wiring, exercised with synthetic samples and no device.**
