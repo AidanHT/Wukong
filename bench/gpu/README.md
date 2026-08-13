@@ -1,8 +1,12 @@
 # `bench/gpu/` — raw round logs from rented GPUs
 
+**Measurement evidence, not the language.** These files are append-only logs from rented-GPU campaigns
+(`tools/cloud/modal_app.py`, strong-peer bars for flash/conv/serving/GEMM). The language product
+surface is user-written `.wk` in [`examples/`](../../examples/) and [`tests/run/`](../../tests/run/).
+
 Required by `GPU_RETARGET_PLAN.md` §6.5: *"Tune caches and raw round logs committed under
-`bench/gpu/<device>/` as artifacts."* This directory is the evidence trail — every number that ever
-appears in a doc must be traceable to a file here.
+`bench/gpu/<device>/` as artifacts."* Every number that appears in a doc must be traceable to a file
+here.
 
 The operational checklist that produces these files is
 [`docs/gpu/phase1-runbook.md`](../../docs/gpu/phase1-runbook.md).

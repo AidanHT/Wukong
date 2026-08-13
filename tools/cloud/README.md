@@ -1,5 +1,9 @@
 # Running Wukong's GPU backend on rented datacenter GPUs (Modal)
 
+**Not the language thesis.** This directory drives Rust/cargo on rented GPUs — device gates, CUTLASS
+profiler bars, `torch.compile` peers, flash/conv/serving measurement. Authors write `.wk` in
+[`examples/`](../../examples/) and [`tests/run/`](../../tests/run/).
+
 Phase 0/1 of [`GPU_RETARGET_PLAN.md`](../../GPU_RETARGET_PLAN.md). Nothing here changes compiler
 code — it gets the existing tree onto a real GPU so the ~130 device-executing correctness gates can
 run somewhere other than the dev laptop, **and it builds the strong peers** so that "better than

@@ -1,5 +1,9 @@
 # Wukong examples
 
+**17** user-written `.wk` programs — the language product surface alongside [`tests/run/`](../tests/run/).
+These are programs authors write and run with `wukongc`, not Rust measurement launchers (`bench/gpu/`,
+`tools/cloud/`) or harness scripts.
+
 Run any example through the interpreter (no LLVM required):
 
 ```sh
