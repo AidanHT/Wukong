@@ -35,7 +35,9 @@ module tests.run.linear_nt_every_lane
 // PROOF THE RECOGNIZER FIRES (do this by hand after touching the recognizer; no gate can):
 //     cargo run -q -p wukongc -- --emit=mir -O2 tests/run/linear_nt_every_lane.wk | grep wukong_
 // prints `call wukong_sgemm_nt(...)`. The same nest written against *flat* parameters — `[f32; 24]`
-// and `[f32; 48]` with `x[i*8+k] * w[j*8+k]`, the spelling the driver's own e2e tests generate —
+// and `[f32; 48]` with `x[i*8+k] * w[j*8+k]`, the spelling `gpu_e2e_tests::linear_src` generates
+// (note the e2e *bench*'s generator produces THIS file's spelling instead, and a law pins them
+// equal) —
 // lowers to byte-identical MIR (checked: same call, same vreg numbers), so this fixture is the
 // idiomatic surface over one kernel rather than a dialect. Note the flat *index* is not
 // interchangeable with the multi-index against THESE parameters: `x[i*8+k]` on a `Tensor[f32,3,8]`

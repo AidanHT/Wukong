@@ -95,7 +95,14 @@
 //!    fill cannot see a layout bug**: with `X = W = 1` the answer is `K` in every lane under `A.B^T`,
 //!    `A.B`, an i/j swap, or any permutation of the output buffer, and five of the seven grid rows
 //!    have `M == N`, so even a whole-matrix transpose would be invisible. With these fills a
-//!    transposed operand, an i/j swap or a shifted row lands on a different integer.
+//!    transposed operand, a transposed output, an i/j swap and a row or column shift each land on a
+//!    different integer somewhere in the buffer — verified numerically at all seven shapes.
+//!
+//!    Two limits, stated because a periodic fill has them by construction: a row shift by a multiple
+//!    of 3 (or a column shift by a multiple of 5) is exactly invisible, which matters for a tile-swap
+//!    bug at a stride that happens to be such a multiple — a 128-row M-tile is visible (`128 % 3 =
+//!    2`) but swapping M-tiles three apart is not. And on a square shape the whole-matrix transpose
+//!    is first distinguished at `j = 3`, since `x(0)*w(1) == x(1)*w(0)`.
 //!
 //!    What this check still cannot see, stated rather than glossed: the fills are constant along `K`,
 //!    so a bug that permutes or drops terms *within* the K-reduction produces the same sum. Making
@@ -137,10 +144,20 @@ pub(crate) const E2E_BENCH_NAME: &str = "gpu_e2e_route_vs_cublas";
 ///
 /// `::bench` (not `::test`) because the round is `#[ignore]`d — `::bench` appends `--ignored`, which
 /// is the only way to select it, and `::test` never passes that flag. `--package wukong_driver`
-/// because this bench does not live in `bench()`'s default package. `--peers` so a container that
-/// cannot load cuBLAS **fails** instead of printing `[skip]` over a round with no bar. `WK_GPU=H100`
-/// because `wgmma` is architecture-locked to `sm_90a`, and the harness exports the declared SKU so
-/// the capability skip below can escalate rather than report a green PASS on the wrong container.
+/// because this bench does not live in `bench()`'s default package.
+///
+/// `--peers` sets `WUKONG_PEER_REQUIRED`, which the peers *inside* `wukong_codegen_gpu` read; it is
+/// carried so this round's provisioning matches every other published GEMM round. It is **not** what
+/// makes a missing cuBLAS fail here — that comes from `WUKONG_GPU_REQUIRED` through
+/// `diff::skip_or_fail`, and `bench()` sets that unconditionally.
+///
+/// `WK_GPU=H100` books the part, because `wgmma` is architecture-locked to `sm_90a` and `WK_GPU`
+/// defaults to `L40S`. It does **not** feed the capability escalation: `bench()` exports no
+/// capability variable at all (only `::test` does), which is why the escalation in the round rides on
+/// `WUKONG_GPU_REQUIRED` instead. That was a live defect — the escalation was inert under this very
+/// line — and the two halves are pinned by
+/// `the_e2e_invocation_reaches_a_bench_that_can_fail`.
+///
 /// `--detach` because a local DNS flake has killed a healthy round on this project before.
 pub(crate) const E2E_BENCH_INVOCATION: &str = "WK_GPU=H100 modal run --detach \
      tools/cloud/modal_app.py::bench --name gpu_e2e_route_vs_cublas --package wukong_driver --peers";
@@ -329,24 +346,35 @@ mod tests {
 
     /// **The cost `with_big_stack` adds to arm B and not to arm A**, measured rather than argued:
     /// `wukong_interp::run_kernel_f32_accel` spawns and joins a fresh 512 MiB-stack thread per call
-    /// (`wukong_interp`'s `with_big_stack`), so this is the same shape with an empty body. Returned in
-    /// microseconds and printed in the round header so a reader can subtract it from `pipeline cost`.
+    /// (`wukong_interp`'s `with_big_stack`), so this is the same shape with an empty body — same
+    /// `thread::scope`, same `stack_size`, same `spawn_scoped`/`join`.
+    ///
+    /// Returns the **minimum** across reps in microseconds, not the mean: the root `CLAUDE.md` allows
+    /// "best-of-N minima" and not averages, and the first spawn is cold, so a mean carries it into
+    /// every later reading. Never panics — a failed reservation yields `NAN`, which the caller prints
+    /// as `n/a`, because this is a diagnostic and must not redden a round that already completed.
     fn interp_thread_overhead_us() -> f64 {
         const STACK: usize = 512 * 1024 * 1024;
         const REPS: usize = 32;
-        let t0 = Instant::now();
+        let mut best = f64::INFINITY;
         for _ in 0..REPS {
-            std::thread::scope(|s| {
-                std::thread::Builder::new()
+            let t0 = Instant::now();
+            let ok = std::thread::scope(|s| {
+                match std::thread::Builder::new()
                     .name("wukong-interp-probe".into())
                     .stack_size(STACK)
                     .spawn_scoped(s, || {})
-                    .expect("spawn probe thread")
-                    .join()
-                    .expect("probe thread panicked");
+                {
+                    Ok(h) => h.join().is_ok(),
+                    Err(_) => false,
+                }
             });
+            if !ok {
+                return f64::NAN;
+            }
+            best = best.min(t0.elapsed().as_secs_f64() * 1e6);
         }
-        t0.elapsed().as_secs_f64() * 1e6 / REPS as f64
+        best
     }
 
     /// **THE END-TO-END ROUND.** See the module documentation for what each column means and why
@@ -369,9 +397,9 @@ mod tests {
         // --- 0. capability, before a peer probe or any allocation ------------------------------
         // `sm_90a` is an architecture LOCK, so on this repo's own 4050 — and on a Blackwell part —
         // the correct outcome is a capability skip and nothing else. On a container that was SUPPOSED
-        // to be Hopper it is a mis-provisioned round, and skipping quietly there is the third way a
-        // metered round reports green having executed no wgmma instruction (`gpu_accel` names the
-        // other two).
+        // to be Hopper it is a mis-provisioned round, and skipping quietly there is one of the ways a
+        // metered round reports green having executed no wgmma instruction (`gpu_accel` names two
+        // more; the provenance refusal below is a fourth, and is escalated for the same reason).
         //
         // **The escalation needs TWO levers here, and the second one is why this is not a copy of the
         // Hopper gate's single check.** That gate is a `::test --filter` line, and `::test` exports
@@ -385,9 +413,12 @@ mod tests {
         // for a correctness gate — `::test` sets it on every device run, including the routine
         // `WK_GPU=L4` rounds where skipping a Hopper-only gate is correct — but the reasoning that
         // makes it wrong there does not hold for THIS test: it is `#[ignore]`d, so it executes only
-        // when someone passed `--ignored`, i.e. only when it was deliberately selected. A deliberately
-        // selected Hopper-only measurement on a non-Hopper device is a mis-provisioned round whichever
-        // way it was launched.
+        // when `--ignored` was passed, and this crate has exactly one `#[ignore]`d test (the suite
+        // reports `1 ignored`), so `--ignored` selects this round and nothing else. A Hopper-only
+        // measurement running on a non-Hopper device is a mis-provisioned round whichever way it was
+        // launched. The cost of the blunter lever is stated rather than hidden: a developer who
+        // exports `WUKONG_GPU_REQUIRED=1` and sweeps `--ignored` on this repo's own 4050 gets a red
+        // naming a container they never provisioned, and should drop the export or name a shape.
         //
         // `the_e2e_invocation_reaches_a_bench_that_can_fail` asserts that `bench()` still does not
         // export the capability, so if the harness ever grows that export this comment fails a test
@@ -459,6 +490,17 @@ mod tests {
         let mut round = match bi::Round::open(prov) {
             Ok(r) => r,
             Err(why) => {
+                // **Escalated, not merely printed.** `Round::open` refuses when the device does not
+                // verify against `DEVICE_SPECS` — a MIG slice, a vGPU profile, an SM count off spec,
+                // a part the table does not know. On a container that IS Hopper but does not verify,
+                // a bare `return` here reports `ok`, hands `bench()` rc 0, and the detached round is
+                // green having measured nothing: the same class as the capability skip above, past
+                // the capability check, on metered silicon. `skip_or_fail` turns it into a failure
+                // under `WUKONG_GPU_REQUIRED`, which `::bench` always sets.
+                wukong_codegen_gpu::diff::skip_or_fail(
+                    E2E_BENCH_NAME,
+                    &format!("the round's provenance does not verify: {why}"),
+                );
                 eprintln!("[skip:provenance] {E2E_BENCH_NAME}: {why}");
                 eprintln!("*** THIS ROUND PUBLISHES NOTHING ***");
                 return;
@@ -480,6 +522,9 @@ mod tests {
         }
 
         // --- 4. per shape: witness, correctness, then timing -----------------------------------
+        // Measured before the device work, so a failed 512 MiB reservation cannot redden a round that
+        // has already completed and take the diagnostic table down with it.
+        let thread_us = interp_thread_overhead_us();
         let mut rows: Vec<(&GemmPoint, ShapeCosts, bi::BenchVerdict, bi::BenchVerdict)> =
             Vec::new();
         for p in WGMMA_BENCH_GRID {
@@ -605,6 +650,35 @@ mod tests {
                 },
             );
 
+            // --- 4c-bis. the TIMED path must write C, at this shape ---------------------------
+            // **`time_gemm_nt_wgmma` never reads C back.** Its own doc says so and says why it
+            // matters: "a kernel that stored nothing -- a mispredicated epilogue, a truncated grid, a
+            // transport that lost its operands -- would post the fastest number in the table and pass
+            // every gate in the round, because the pre-timing arms run through a *different* entry
+            // point (`gemm_nt_wgmma`) with its own buffers." Every lane check above goes through
+            // exactly that different entry point, so promoting the resident ratio into the published
+            // table (which this round does) reopens the seam unless the TIMING launcher is itself
+            // made to read C back. `wukong_codegen_gpu`'s own sweep is required by a device-free law
+            // to run this probe before it times anything; this is that requirement, honoured at the
+            // shape being published rather than at a guard shape.
+            let region = wukong_codegen_gpu::gpu::TimedRegion::closed_form_probe();
+            match wukong_codegen_gpu::gpu::time_gemm_nt_wgmma_in(g, cfg, m, k, n, 4, region) {
+                Ok(secs) => eprintln!(
+                    "  [gate] the TIMED path writes C at {}: every lane is exactly K*fill^2 = {:e} \
+                     and none holds the pre-launch sentinel ({:.3} ms/launch, NOT a measurement) \
+                     \u{2713}",
+                    p.dims(),
+                    k as f32 * region.fill * region.fill,
+                    secs * 1e3
+                ),
+                Err(e) => panic!(
+                    "{}: the timed path's closed-form probe failed: {e}. The resident column is \
+                     published from this launcher, so without the readback a kernel that stored \
+                     nothing would post the fastest number in the table.",
+                    p.label
+                ),
+            }
+
             // --- 4d. twin 2: the RESIDENT pair — the published table's own comparison --------
             // Both arms are `iters` device-resident launches with their handles and modules resolved
             // outside the timed region, which is what makes them comparable to each other and to the
@@ -673,8 +747,8 @@ mod tests {
              Both columns come out of `Round::publish`, so a shape whose control floor did not clear\n\
              the bar prints its refusal instead of a number.\n\
              `pipeline cost` is what the compiler and interpreter add over calling the launcher\n\
-             directly -- same function in both arms. A tie means the route is free. Subtract\n\
-             `interp thread us` below before reading it as the seam's own cost.\n\
+             directly -- same function in both arms. A tie means the route is free. Part of it is the\n\
+             interpreter's per-call thread; the RETENTION table below says how to net it out in ms.\n\
              `kernel/cuBLAS` is the resident-buffer pair: the campaign's own comparison, re-measured\n\
              here in the same round, same clock, same container, same iteration counts.\n"
         );
@@ -685,10 +759,17 @@ mod tests {
         for (p, _, ov, res) in &rows {
             let cost = match round.publish(ov, H2H_FIELD) {
                 Ok(pd) => format!(
-                    "{:+.1}% ({}, floor +/-{:.2}%)",
+                    "{:+.1}% ({}, floor +/-{:.2}%, ours {})",
                     (pd.ratio() - 1.0) * 100.0,
                     if pd.is_tie() { "tie" } else { "moved" },
-                    pd.floor() * 100.0
+                    pd.floor() * 100.0,
+                    // The CONTENDER's own spread (guard G16). Arm B here is the interpreter, the least
+                    // stable arm in this file, so dropping it would hide the one dispersion a reader
+                    // most needs — `analyze` already refuses above the bar, but the value is evidence.
+                    match pd.dispersion() {
+                        Some(d) => format!("+/-{:.2}%", d * 100.0),
+                        None => "n/a".to_string(),
+                    }
                 ),
                 Err(why) => format!("-- ({why})"),
             };
@@ -715,9 +796,14 @@ mod tests {
              conversion and the two PCIe crossings that the RESIDENT-buffer bench does not pay --\n\
              which is why `launch ms` sits beside it: kernel/launch is that tax alone, and\n\
              launch/e2e is the pipeline's own share.\n\
-             **Every quantity in this table is taken from a PUBLISHED twin** (`Published::baseline`\n\
-             and `Published::contender`), never from a raw verdict field, so a row whose twin refused\n\
-             shows the refusal rather than a number that the gate would not have allowed.\n"
+             **The four ms COLUMNS are taken from PUBLISHED twins** (`Published::baseline` and\n\
+             `Published::contender`), never from a raw verdict field, so a row whose twin refused\n\
+             shows the refusal rather than a number the gate would not have allowed. `retention`\n\
+             itself is their QUOTIENT ACROSS TWO TWINS and therefore carries no floor of its own --\n\
+             its two operands were each gated, against different denominators.\n\
+             `e2e ms` includes one 512 MiB-stack thread spawn per call that a real program pays once\n\
+             per run and `launch ms` never pays: subtract `interp thread us`/1000 from `e2e ms` for\n\
+             the seam's own cost.\n"
         );
         eprintln!(
             "  {:<15} {:>11} {:>11} {:>11} {:>11} {:>11}",
@@ -742,26 +828,6 @@ mod tests {
             }
         }
 
-        eprintln!(
-            "\n---- {E2E_BENCH_NAME}: DIAGNOSTIC (NOT publishable) ----\n\
-             `compile ms` is a ONE-TIME host cost, is not part of any ratio above, and is the\n\
-             `lex..optimize` front subtotal with no backend -- see COMPILE_REPS on why it is not\n\
-             comparable to docs/compile-floor.md's `lex..emit_object` headline.\n\
-             `peer h2h once` is a LONE TIMING of one `cublas_gemm_nt_f16_f32out` call, and it\n\
-             INCLUDES a `CudaBlas` construction (a workspace allocation) that the crate's own timing\n\
-             entry hoists out of its loop. It is here because the honest end-to-end peer does not yet\n\
-             exist; it is not an arm and must not be quoted as a ratio.\n\
-             `interp thread us` is the 512 MiB-stack thread `run_kernel_f32_accel` spawns per call,\n\
-             which arm B pays every iteration and a real program pays once per run.\n"
-        );
-        eprintln!(
-            "  interp thread us : {:.1} (subtract from `pipeline cost` to get the seam's own cost)",
-            interp_thread_overhead_us()
-        );
-        eprintln!(
-            "  {:<15} {:>12} {:>16}",
-            "shape", "compile ms", "peer h2h once ms"
-        );
         let ms = |v: f64| {
             if v.is_finite() && v > 0.0 {
                 format!("{v:.4}")
@@ -769,6 +835,28 @@ mod tests {
                 "n/a".to_string()
             }
         };
+        eprintln!(
+            "\n---- {E2E_BENCH_NAME}: DIAGNOSTIC (NOT publishable) ----\n\
+             `compile ms` is a ONE-TIME host cost, is not part of any ratio above, and is the\n\
+             `lex..optimize` front subtotal with no backend -- see COMPILE_REPS on why it is not\n\
+             comparable to docs/compile-floor.md's `lex..emit_object` headline.\n\
+             `peer h2h once` is a LONE TIMING of one `cublas_gemm_nt_f16_f32out` call. It INCLUDES a\n\
+             `CudaBlas` construction (a workspace allocation) that the crate's own timing entry hoists\n\
+             out of its loop, AND it is the first cublasGemmEx at this shape in the process -- the peer\n\
+             probe only ever built a handle -- so it also pays cuBLAS's lazy kernel load and heuristic\n\
+             selection. It is here because the honest end-to-end peer does not yet exist; it is not an\n\
+             arm and must not be quoted as a ratio.\n\
+             `interp thread us` is the 512 MiB-stack thread `run_kernel_f32_accel` spawns per call,\n\
+             which arm B pays every iteration and a real program pays once per run.\n"
+        );
+        eprintln!(
+            "  interp thread us : {} (best of many; arm B pays it per call, a real run pays it once)",
+            ms(thread_us)
+        );
+        eprintln!(
+            "  {:<15} {:>12} {:>16}",
+            "shape", "compile ms", "peer h2h once ms"
+        );
         for (p, c, _, _) in &rows {
             eprintln!(
                 "  {:<15} {:>12} {:>16}",
@@ -946,38 +1034,48 @@ mod tests {
         }
     }
 
-    /// **The all-ones fill really does make correctness an `==` check at every grid shape.**
+    /// **The fill really does make correctness an `==` check at every grid shape.**
     ///
-    /// The round's strongest guard rests on two arithmetic facts, both shape-dependent, so they are
-    /// checked per shape rather than asserted in prose: `1.0` survives the seam's host `f32 -> f16`
-    /// conversion exactly, and a sum of `K` ones is exact in f32 (which needs `K < 2^24`). If a future
-    /// grid row broke either, `assert_every_lane_is_k` would start failing on a *correct* kernel, and
-    /// the natural repair — loosening it to a tolerance — would delete the only thing standing
-    /// between this round and publishing a fast wrong answer.
+    /// [`assert_every_lane`] rests on arithmetic that is shape-dependent, so it is checked per shape
+    /// rather than asserted in prose: every operand value `1..=max(X_PERIOD, W_PERIOD)` survives the
+    /// seam's host `f32 -> f16` conversion exactly and stays NORMAL there (a subnormal would trip
+    /// `wgmma_declines_operand_range` and send every shape to `gpu::gemm_nt`), and the largest product
+    /// `K * X_PERIOD * W_PERIOD` is inside f32's exact-integer range.
+    ///
+    /// **The bound is the PRODUCT, not `K`.** An earlier version of this law checked `K < 2^24`, which
+    /// was the right bound for the all-ones fill it was written for and is 15x too loose for this one:
+    /// it would admit a grid row with `K` up to 16_777_215 while `assert_every_lane` needs
+    /// `K * 15 < 2^24`, i.e. `K <= 1_118_481`. A row in that gap makes the lane check fail on a
+    /// *correct* kernel, and the natural repair — loosening it to a tolerance — would delete the only
+    /// thing standing between this round and publishing a fast wrong answer.
     #[test]
-    fn the_ones_fill_is_exact_at_every_grid_shape() {
-        assert_eq!(
-            half::f16::from_f32(1.0).to_f32(),
-            1.0,
-            "1.0 must survive the seam's f16 conversion exactly"
-        );
-        assert!(
-            half::f16::from_f32(1.0).is_normal(),
-            "the ones fill must be a NORMAL f16, or `wgmma_declines_operand_range` declines it and \
-             every shape falls back to `gpu::gemm_nt`"
-        );
-        for p in WGMMA_BENCH_GRID {
+    fn the_fill_is_exact_at_every_grid_shape() {
+        for v in 1..=X_PERIOD.max(W_PERIOD) {
+            let h = half::f16::from_f32(v as f32);
+            assert_eq!(
+                h.to_f32(),
+                v as f32,
+                "operand value {v} does not survive the seam's f16 conversion exactly"
+            );
             assert!(
-                (p.k as u64) < (1u64 << 24),
-                "{}: K={} is past f32's exact-integer range, so a sum of K ones is no longer an \
-                 `==` check",
-                p.label,
-                p.k
+                h.is_normal(),
+                "operand value {v} is not a NORMAL f16, so `wgmma_declines_operand_range` would \
+                 decline the bench data and every shape would fall back to `gpu::gemm_nt`"
+            );
+        }
+        let span = (X_PERIOD as u64) * (W_PERIOD as u64);
+        for p in WGMMA_BENCH_GRID {
+            let want_max = (p.k as u64) * span;
+            assert!(
+                want_max < (1u64 << 24),
+                "{}: the largest expected lane is K*{X_PERIOD}*{W_PERIOD} = {want_max}, past f32's \
+                 exact-integer range, so `assert_every_lane` would stop being an `==` check",
+                p.label
             );
             assert_eq!(
-                (p.k as f32) as f64,
-                p.k as f64,
-                "{}: K is not exactly representable in f32",
+                (want_max as f32) as u64,
+                want_max,
+                "{}: the largest expected lane is not exactly representable in f32",
                 p.label
             );
         }
@@ -1059,6 +1157,20 @@ mod tests {
             attrs.iter().any(|a| a.starts_with("#[ignore")),
             "`{name}` must be #[ignore]d: ::bench appends --ignored and would otherwise select zero \
              tests and exit 0: {attrs:?}"
+        );
+        // **The set must be EXACTLY those two, because an ADDED attribute is the dangerous one.**
+        // Two mutations pass both `any` checks above while destroying the property outright:
+        // `#[cfg(any())]` compiles the round out entirely, so `::bench --name ...` selects zero tests
+        // and exits 0 — the 2026-08-11 vacuous round reached a fourth way — and `#[should_panic]`
+        // inverts every assertion in it, turning the route witness, the lane check and the capability
+        // escalation from guards into pass conditions. Neither is visible to an existential check.
+        assert!(
+            attrs
+                .iter()
+                .all(|a| a.starts_with("#[test]") || a.starts_with("#[ignore")),
+            "`{name}` carries an attribute beyond #[test] and #[ignore]. `#[cfg(..)]` can compile the \
+             round out (zero tests selected, exit 0) and `#[should_panic]` inverts every assertion in \
+             it; both pass an existential check. Saw: {attrs:?}"
         );
         // The round must be able to fail on the things the instrument cannot see. Scoped to the
         // round's own body, which ends at its own closing brace alone on a 4-space-indented line —
