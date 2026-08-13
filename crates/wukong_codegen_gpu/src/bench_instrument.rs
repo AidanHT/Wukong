@@ -40,11 +40,12 @@
 //!    object that mints numbers ([`Round`]) cannot be constructed at all ([`Round::open`] returns
 //!    `Err`). Marketplaces have sold MIG slices and vGPU profiles as whole A100s.
 //! 6. **An effect must clear the threshold by [`RESOLUTION_MARGIN_FACTOR`], not merely clear it.**
-//!    The floor and the contender spread are *within-round* statistics; the same cell's *between*-
-//!    round scatter, measured over 195 cross-round comparisons in `bench/gpu/h100/*.log`, is about
-//!    twice them. A cell in the band is [`Cell::Marginal`] and publishes nothing — it is a lead to
-//!    re-measure, and the round log prints its `margin` so the reader can see how far short it
-//!    fell.
+//!    The floor and the contender spread are *within-round* statistics; measured over 195
+//!    cross-round comparisons in `bench/gpu/h100/*.log`, the same cell's *between*-round drift
+//!    exceeds one such threshold **43.6%** of the time, with an upper quartile of `1.9x`. A cell in
+//!    the band is [`Cell::Marginal`] and publishes nothing — it is a lead to re-measure, and the
+//!    round log prints its `margin` so the reader can see how far short it fell.
+//!    `tools/perf/derive_margin_factor.py` re-derives all of it from the committed logs.
 //! 7. **A measured round whose clocks are not locked publishes NOTHING unless the operator declares
 //!    it iteration data** ([`ITERATION_DATA_ENV`]). `GPU_RETARGET_PLAN.md` §6.3 has said "container
 //!    rounds are iteration data, VM rounds are publication data" in prose since it was written;
@@ -156,35 +157,40 @@ pub const DEFAULT_CLOCK_DRIFT_BAR: f64 = 0.05;
 /// say whether the number will still be there next round, which is the only question a published
 /// claim actually answers — and the two are not the same, by a factor this repo has now measured.
 ///
-/// **The measurement.** Four committed `wgmma_config_sweep` rounds
-/// (`bench/gpu/h100/2026-08-1{0,0,1,2}-*.log`) share 51 `(row, shape)` cells, giving 195
-/// cross-round comparisons of the published ratio `A/B`. Expressing each round-to-round change in
+/// **The measurement** is `tools/perf/derive_margin_factor.py`, which reads the committed round
+/// logs and prints everything below. Run it; do not trust this table. Four `wgmma_config_sweep`
+/// rounds (`bench/gpu/h100/2026-08-1{0,0,1,2}-*.log`) share **51 `(row, shape)` keys measured in
+/// two or more of them** — 15 keys in 2 rounds, 12 in 3, 24 in 4 — giving `15·1 + 12·3 + 24·6` =
+/// **195 unordered round-pairs**. Expressing each pair's change in the published ratio `A/B` in
 /// units of that round's own `T = resolution_threshold`:
 ///
-/// | statistic | drift / T |
-/// |---|---|
-/// | median | 0.78 |
-/// | 75th pct | **1.92** |
-/// | 90th pct | 5.54 |
-/// | max | 35.0 |
+/// | statistic | ALL PAIRS (n=195) | TIGHT CUT (n=51) |
+/// |---|---|---|
+/// | median drift / T | 0.78 | 0.36 |
+/// | 75th pct | **1.92** | 0.86 |
+/// | 90th pct | 5.54 | 1.42 |
+/// | fraction exceeding 1×T | 43.6% | 23.5% |
+/// | fraction exceeding 2×T | 23.1% | **3.9%** |
 ///
-/// **43.6% of replicated cells moved further between rounds than a single round's own threshold.**
-/// So `|effect| > 1xT` — the rule before this constant existed — is close to a coin flip on
-/// replication, and `2.0` is not a conservative round number: it is that measured 75th percentile,
-/// 1.92, rounded to the nearest integer. On the tightest available cut (the 51 cells present in
-/// both consecutive same-format rounds, one day apart) the same statistic reads: drift exceeds
-/// `1xT` for 23.5% of cells, `1.5xT` for 9.8%, and `2xT` for **3.9%** — so `2.0` is also the
-/// smallest integer factor that puts the round-to-round false-positive rate under the conventional
-/// 5%. Two independent cuts of the same logs land on the same constant.
+/// ALL PAIRS is the pessimistic bound — it spans four rounds across three waves, so some of that
+/// drift is code changing rather than the machine. The TIGHT CUT is the optimistic one: the two
+/// consecutive same-format rounds, one day apart. **The two cuts justify `2.0` from opposite
+/// sides.** On the wide cut it is the measured 75th percentile (1.92) rounded to the nearest
+/// integer; on the tight cut it is the smallest integer factor that puts the round-to-round
+/// false-positive rate under the conventional 5% (3.9%, against 23.5% at `1×T`). It is not a
+/// conservative round number, and `1×T` — the rule before this constant existed — is between a
+/// coin flip and a one-in-four bet depending on which cut you believe.
 ///
-/// **What this is NOT.** It is not a certificate. 23.1% of the full replicated set still drifts
-/// past `2xT`, and the only thing that establishes a marginal effect is **measuring it again in a
-/// second round**. The band refuses; it does not bless. `Cell::Marginal` therefore publishes
-/// nothing rather than publishing with a caveat, because a caveat next to a number is read as a
-/// number.
+/// **Do not gloss this as "the scatter is twice the threshold".** The *median* drift is 0.78×T on
+/// the wide cut and 0.36×T on the tight one; it is the upper quartile that reaches 1.9×, and the
+/// band is sized for the tail because that is where a false publication comes from.
 ///
-/// Re-derive it — do not adjust it — when more replicated rounds land: the script is the one in
-/// this doc comment's table, and the input is the committed round logs.
+/// **What this is NOT.** It is not a certificate. 23.1% of the wide cut still drifts past `2×T`,
+/// and the only thing that establishes a marginal effect is **measuring it again in a second
+/// round**. The band refuses; it does not bless. [`Cell::Marginal`] therefore publishes nothing
+/// rather than publishing with a caveat, because a caveat next to a number is read as a number.
+///
+/// Re-derive it — do not adjust it — when more replicated rounds land, by re-running that script.
 pub const RESOLUTION_MARGIN_FACTOR: f64 = 2.0;
 
 // ---------------------------------------------------------------------------------------------
@@ -454,7 +460,7 @@ where
 /// What one field of one bench is allowed to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cell {
-    /// `|B/A - 1| <= floor` at a floor that cleared the bar: an honest, publishable tie.
+    /// `|B/A - 1| <= threshold` at a floor that cleared the bar: an honest, publishable tie.
     Tie,
     /// The effect cleared this round's own threshold by at least [`RESOLUTION_MARGIN_FACTOR`]:
     /// publishable as a direction.
@@ -462,10 +468,11 @@ pub enum Cell {
     /// The effect cleared this round's threshold but by less than [`RESOLUTION_MARGIN_FACTOR`].
     ///
     /// **Publishes nothing.** Not because the effect is absent — it is bigger than the noise this
-    /// round measured — but because that noise is a *within-round* statistic and the measured
-    /// round-to-round scatter of this instrument is roughly twice it (see
-    /// [`RESOLUTION_MARGIN_FACTOR`] for the 195-comparison derivation). A cell landing here is a
-    /// **lead**: re-run it in a second round, and if it survives, it publishes.
+    /// round measured — but because that noise is a *within-round* statistic, and the same cell's
+    /// measured round-to-round drift exceeds one such threshold 43.6% of the time (see
+    /// [`RESOLUTION_MARGIN_FACTOR`] for the 195-comparison derivation and the script that re-runs
+    /// it). A cell landing here is a **lead**: re-run it in a second round, and if it survives, it
+    /// publishes.
     Marginal,
     /// The floor did not clear the pre-registered bar. Publishes nothing — reporting a wide tie as
     /// a tie is exactly the failure this module exists to prevent.
@@ -551,15 +558,24 @@ pub struct FieldVerdict {
 }
 
 impl FieldVerdict {
-    /// `|effect| / threshold` — see [`margin`]. `None` when either half is missing, which is the
-    /// same condition under which the cell is not a resolved verdict at all.
+    /// `|effect| / threshold` — see [`margin`].
+    ///
+    /// `None` unless the cell is one of the three verdicts the margin is *about*
+    /// ([`Cell::Tie`] / [`Cell::Marginal`] / [`Cell::Moved`]). A `Constant` field would otherwise
+    /// report `0.00x` and an `Unresolved` one some large number, either of which a reader would
+    /// then measure against the band's rule — a rule that does not apply to them, because they
+    /// publish nothing whatever their margin is.
     pub fn margin(&self) -> Option<f64> {
+        if !matches!(self.cell, Cell::Tie | Cell::Marginal | Cell::Moved) {
+            return None;
+        }
         Some(margin(self.effect?, self.threshold?))
     }
 }
 
-/// **The threshold an effect must clear to be a `Moved`**: the worse of the denominator's noise
-/// (`floor`) and the contender's own (`b_spread`).
+/// **The threshold an effect is judged against**: the worse of the denominator's noise (`floor`)
+/// and the contender's own (`b_spread`). Clearing it makes a cell [`Cell::Marginal`]; clearing it
+/// by [`RESOLUTION_MARGIN_FACTOR`] makes it [`Cell::Moved`] — see [`classify_effect`].
 ///
 /// One function, so the cell decision, the publish gate and the printed table cannot disagree about
 /// what "resolved" means.
@@ -593,17 +609,26 @@ pub fn margin(effect: f64, threshold: f64) -> f64 {
 
 /// **The three-way verdict on one resolved cell**, and the only place the boundaries are written.
 ///
+/// * a non-finite effect, or a threshold that is not strictly positive — [`Cell::Degenerate`].
 /// * `|effect| <= th` — [`Cell::Tie`]: no difference this round could see.
 /// * `th < |effect| <= RESOLUTION_MARGIN_FACTOR * th` — [`Cell::Marginal`]: a real effect against
 ///   *this round's* noise, inside the scatter the same cell shows *between* rounds. Publishes
 ///   nothing; see [`RESOLUTION_MARGIN_FACTOR`].
 /// * otherwise — [`Cell::Moved`].
 ///
-/// Deliberately written as two comparisons against `th` rather than one against `margin(..)`: with
-/// `th == 0` the division is `0/0` or `x/0`, and a `NaN` compared with `<=` is false in both
-/// directions, which would have promoted a zero effect against a zero threshold from a tie to a
-/// move. The multiplication has no such hole.
+/// **Both degenerate guards fail CLOSED, and both were fail-open in the first draft.** A `NaN`
+/// compared with `<=` is false in both directions, so a `NaN` effect fell through to `Moved` — the
+/// most permissive verdict — and printed a margin of `inf`. And a zero threshold means the round
+/// measured no noise at all, which is a broken instrument rather than an infinitely sensitive one;
+/// treating it as sensitive published every blip. `Round::publish` refuses `Degenerate`, so both
+/// now land where a measurement that did not happen belongs.
+///
+/// The two live comparisons are against `th` and `th * FACTOR` rather than against `margin(..)`
+/// because the division reintroduces exactly the `NaN` the guard above removes.
 pub fn classify_effect(effect: f64, threshold: f64) -> Cell {
+    if !effect.is_finite() || !threshold.is_finite() || threshold <= 0.0 {
+        return Cell::Degenerate;
+    }
     let e = effect.abs();
     if e <= threshold {
         Cell::Tie
@@ -772,8 +797,8 @@ pub fn analyze(samples: &BenchSamples, bar: f64) -> BenchVerdict {
             // The effect must clear the WORSE of the two noises. Comparing it to the peer's spread
             // alone is how a gain inside the contender's own run-to-run variation gets published.
             // And it must clear it by `RESOLUTION_MARGIN_FACTOR`, because that threshold is a
-            // WITHIN-round statistic and this instrument's measured BETWEEN-round scatter is about
-            // twice it.
+            // WITHIN-round statistic and this instrument's measured BETWEEN-round drift exceeds it
+            // for 43.6% of replicated cells.
             let th = fv.threshold.expect("resolved implies Some");
             classify_effect(fv.effect.expect("checked above"), th)
         };
@@ -905,8 +930,10 @@ impl BenchVerdict {
         }
         let _ = writeln!(
             s,
-            "  margin = |B/A-1| / max(floor, B spread); >{:.0}x publishes as a direction, \
-             (1x,{:.0}x] is MARGINAL and publishes nothing (see RESOLUTION_MARGIN_FACTOR)",
+            "  margin = |B/A-1| / max(floor, B spread), and ONLY for a resolved cell: >{:.0}x \
+             publishes as a direction, (1x,{:.0}x] is MARGINAL and publishes nothing, <=1x is a \
+             tie (see RESOLUTION_MARGIN_FACTOR). A row with no margin publishes nothing whatever \
+             its numbers look like.",
             RESOLUTION_MARGIN_FACTOR, RESOLUTION_MARGIN_FACTOR
         );
         s
@@ -1025,12 +1052,12 @@ impl fmt::Display for Refusal {
                 cell: Cell::Marginal,
             } => write!(
                 f,
-                "field '{field}' is MARGINAL: the effect cleared this round's resolution threshold \
-                 but by less than {:.0}x, and the measured round-to-round scatter of this \
-                 instrument is ~2x that threshold (43.6% of replicated cells in \
-                 bench/gpu/h100/*.log moved further between rounds than one round's own \
-                 threshold). It is a LEAD, not a result: re-measure this cell in a second round \
-                 and publish it if it survives",
+                "                 field '{field}' is MARGINAL: the effect cleared this round's resolution threshold \
+                 but by less than {:.0}x, and 43.6% of the replicated cells in \
+                 bench/gpu/h100/*.log drifted further BETWEEN rounds than one round's own \
+                 threshold (upper quartile 1.9x; see tools/perf/derive_margin_factor.py). It is a \
+                 LEAD, not a result: re-measure this cell in a second round and publish it if it \
+                 survives",
                 RESOLUTION_MARGIN_FACTOR
             ),
             Refusal::Cell { field, cell } => {
@@ -1467,16 +1494,28 @@ impl fmt::Display for ClockLock {
 /// The reason after `refused` is kept verbatim (only trimmed), because it is the platform's own
 /// diagnostic and paraphrasing it is how "the current user does not have permission to change
 /// clocks" becomes "clocks unavailable" becomes "we did not lock the clocks" becomes nothing.
+///
+/// **`locked` is matched exactly, or with a `:`/`=` and digits — never as a bare prefix.** It used
+/// to be `strip_prefix("locked")`, so `lockedX`, `locked-ish` and `locked? Modal said no` all
+/// parsed as `Locked(None)`: the frequency parse failed and `.ok()` swallowed it. That was harmless
+/// while the value was decoration. Now that [`Round::gate`] refuses an unlocked round, a lax parse
+/// IS a publication decision, and it failed in the flattering direction. A malformed declaration
+/// must read as `Unknown` — nobody looked.
 pub fn parse_clock_lock(v: &str) -> ClockLock {
     let raw = v.trim();
     let lower = raw.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix("locked") {
-        let mhz = rest
-            .trim_start_matches([':', '='])
-            .trim()
-            .parse::<i32>()
-            .ok();
-        return ClockLock::Locked(mhz);
+    if lower == "locked" {
+        return ClockLock::Locked(None);
+    }
+    if let Some(rest) = lower
+        .strip_prefix("locked:")
+        .or(lower.strip_prefix("locked="))
+    {
+        // A frequency that does not parse is a malformed declaration, not a lock without a number.
+        return match rest.trim().parse::<i32>() {
+            Ok(mhz) => ClockLock::Locked(Some(mhz)),
+            Err(_) => ClockLock::Unknown,
+        };
     }
     if lower == "unlocked" {
         return ClockLock::Unlocked;
@@ -1552,7 +1591,17 @@ pub struct RoundMeta {
     pub clock_lock: ClockLock,
     /// What kind of claim this round makes — see [`RoundClass`]. Only [`RoundClass::Measured`] is
     /// subject to the §6.3 clock-lock gate.
-    pub class: RoundClass,
+    ///
+    /// **PRIVATE, and that is the gate.** Every other field here is `pub`, and this one was too
+    /// until an adversarial pass pointed out what that costs: a metered bench one module away could
+    /// write `RoundMeta { class: Synthetic, ..RoundMeta::from_env() }`, or assign
+    /// `prov.meta.class` after construction, and skip the clock-lock refusal entirely — while a
+    /// textual law looking for `from_env()` stayed green, because `from_env()` is right there in
+    /// the expression. A grep cannot defend a public field. Outside this module the only producers
+    /// are [`RoundMeta::from_env`] (which reads the operator's environment) and
+    /// [`RoundMeta::default`] (which yields [`RoundClass::Synthetic`], the fixture class), so the
+    /// bypass is now a compile error rather than a law to keep passing.
+    class: RoundClass,
 }
 
 impl RoundMeta {
@@ -1570,9 +1619,8 @@ impl RoundMeta {
                 .unwrap_or_default(),
             // Reading the environment at all is what makes this round `Measured` rather than
             // `Synthetic` — the gate binds every round a bench takes, and only fixtures escape it.
-            //
-            // `=0` and `=false` mean OFF rather than "present, therefore on". A gate whose escape
-            // hatch fires on the value the operator used to turn it *off* is worse than no gate.
+            // This is the ONLY producer of `Measured`/`Iteration`, which is why the field is
+            // private: see `RoundMeta::class`.
             class: if s(ITERATION_DATA_ENV)
                 .map(|v| declares_iteration_data(&v))
                 .unwrap_or(false)
@@ -1583,14 +1631,25 @@ impl RoundMeta {
             },
         }
     }
+
+    /// What class of claim this round makes. The field is private (see [`RoundMeta::class`]); this
+    /// is the read side, which needs no defending.
+    pub fn class(&self) -> RoundClass {
+        self.class
+    }
 }
 
-/// Does this [`ITERATION_DATA_ENV`] value declare the round iteration data? `0`/`false`/`no` do
-/// not — an operator who writes `=0` to turn the declaration *off* must not thereby turn it on.
+/// Does this [`ITERATION_DATA_ENV`] value declare the round iteration data?
+///
+/// **An allow-list, not a deny-list.** The first draft here refused `""`/`0`/`false`/`no` and
+/// accepted everything else, which meant `WUKONG_GPU_ITERATION_DATA=off` — and `n`, `disabled`,
+/// `none` — turned the declaration ON. A gate whose escape hatch fires on the value the operator
+/// used to close it is worse than no gate, so the recognised spellings are enumerated and anything
+/// else is not a declaration.
 pub fn declares_iteration_data(v: &str) -> bool {
-    !matches!(
+    matches!(
         v.trim().to_ascii_lowercase().as_str(),
-        "" | "0" | "false" | "no"
+        "1" | "true" | "yes" | "on" | "iteration"
     )
 }
 
@@ -2787,11 +2846,28 @@ mod tests {
         // Past 2x: a direction.
         assert_eq!(classify_effect(0.0401, th), Cell::Moved);
         assert_eq!(classify_effect(-0.5, th), Cell::Moved);
-        // **The hole.** With a zero threshold, `|e| / th` is `0/0 = NaN` for a zero effect, and
-        // `NaN <= x` is false in BOTH directions — a margin-based classifier would have promoted
-        // "no effect against no noise" from a tie to a move. The multiplication has no such hole.
-        assert_eq!(classify_effect(0.0, 0.0), Cell::Tie);
-        assert_eq!(classify_effect(1e-12, 0.0), Cell::Moved);
+        // **Both degenerate inputs fail CLOSED, and both were fail-OPEN in the first draft.**
+        // A round that measured no noise has not measured anything, so a nonzero effect against a
+        // zero threshold is not an infinitely resolved move; and a NaN effect compared with `<=`
+        // is false in both directions, so it used to fall through to `Moved` — the most permissive
+        // verdict — and print a margin of `inf`. `Degenerate` is not publishable.
+        for (e, th) in [
+            (0.0, 0.0),
+            (1e-12, 0.0),
+            (0.5, 0.0),
+            (0.03, -0.01),
+            (f64::NAN, 0.02),
+            (f64::INFINITY, 0.02),
+            (0.03, f64::INFINITY),
+            (0.03, f64::NAN),
+        ] {
+            assert_eq!(
+                classify_effect(e, th),
+                Cell::Degenerate,
+                "effect {e} against threshold {th} must not resolve"
+            );
+        }
+        assert!(!Cell::Degenerate.publishable());
         assert_eq!(margin(0.0, 0.0), 0.0);
         assert!(margin(1e-12, 0.0).is_infinite());
         assert!((margin(-0.03, 0.02) - 1.5).abs() < 1e-12);
@@ -3534,8 +3610,29 @@ mod tests {
             ClockLock::Locked(Some(1410))
         );
         assert_eq!(parse_clock_lock("LOCKED"), ClockLock::Locked(None));
+        assert_eq!(
+            parse_clock_lock("locked=1980"),
+            ClockLock::Locked(Some(1980))
+        );
         assert_eq!(parse_clock_lock("unlocked"), ClockLock::Unlocked);
         assert_eq!(parse_clock_lock("who knows"), ClockLock::Unknown);
+        // A LAX prefix match used to make all of these `Locked(None)`, which `Round::gate` now
+        // reads as publication data. A malformed declaration must mean nobody looked.
+        for bad in [
+            "lockedX",
+            "locked-ish",
+            "locked? Modal said no",
+            "locked:1980 MHz",
+            "locked:",
+            "unlockedX",
+        ] {
+            assert_eq!(
+                parse_clock_lock(bad),
+                ClockLock::Unknown,
+                "{bad:?} must not parse as a lock"
+            );
+            assert!(!parse_clock_lock(bad).is_locked());
+        }
         assert_eq!(ClockLock::default(), ClockLock::Unknown);
         assert!(ClockLock::Locked(None).is_locked());
         assert!(ClockLock::Locked(Some(1410)).is_locked());
@@ -3699,13 +3796,18 @@ mod tests {
     /// escape hatch fires on `=0` is worse than no gate, because the operator believes it is on.
     #[test]
     fn the_iteration_data_declaration_is_off_for_the_values_that_mean_off() {
-        for off in ["", "0", "false", "FALSE", "no", " no "] {
+        // The allow-list is the point. The first draft was a DENY-list of ""/0/false/no, under
+        // which `=off` -- the most natural way to write "no" -- turned the declaration ON.
+        for off in [
+            "", "0", "false", "FALSE", "no", " no ", "off", "OFF", "n", "disabled", "none",
+            "unset", "nope",
+        ] {
             assert!(
                 !declares_iteration_data(off),
                 "{off:?} must NOT declare iteration data"
             );
         }
-        for on in ["1", "true", "yes", "iteration"] {
+        for on in ["1", "true", "yes", "on", "iteration", " TRUE "] {
             assert!(
                 declares_iteration_data(on),
                 "{on:?} must declare iteration data"
@@ -3717,34 +3819,45 @@ mod tests {
         assert_eq!(RoundMeta::default().class, RoundClass::Synthetic);
     }
 
-    /// **The law that keeps [`RoundClass::Synthetic`] out of a metered round.**
+    /// **Defence in depth over [`RoundClass::Synthetic`], which is `Default` and skips the gate.**
     ///
-    /// `Synthetic` is `Default`, and `Default` is permissive — it skips the §6.3 clock-lock gate,
-    /// because a fixture's invented timings have no clocks to lock. That is exactly the shape of a
-    /// bypass, so it is pinned here: **every `Provenance::new` in `gpu.rs` must be handed
-    /// `RoundMeta::from_env()`, unless its enclosing function is a plain `#[test]`** — i.e. a
+    /// The real defence is the type: `RoundMeta::class` is a private field, so outside this module
+    /// the only producers are `from_env()` (the operator's environment) and `default()` (the
+    /// fixture class), and the two bypasses an adversarial pass found —
+    /// `RoundMeta { class: Synthetic, ..RoundMeta::from_env() }` and a post-construction
+    /// `prov.meta.class = ..` — are now compile errors rather than laws to keep passing.
+    ///
+    /// This scan is the second line: **every round-opening site in `gpu.rs` must take its metadata
+    /// from `RoundMeta::from_env()`, unless its enclosing function is a plain `#[test]`** — i.e. a
     /// device-free unit test rather than one of the `#[ignore]`d benches that mint the campaign's
-    /// numbers. A new bench that hand-builds a `RoundMeta` fails here, before it can publish a
-    /// number the clock gate never saw.
-    ///
-    /// The `#[test]`-vs-`#[ignore]` cut is this crate's own convention (`CLAUDE.md`: "sweeps and
-    /// benches are `#[ignore]`d; correctness gates are not"), which is what makes it a property
-    /// rather than a name list.
+    /// numbers. It still catches a new bench reaching for `RoundMeta::default()`, which compiles
+    /// fine and would skip the gate. The `#[test]`-vs-`#[ignore]` cut is this crate's own
+    /// convention (`CLAUDE.md`: "sweeps and benches are `#[ignore]`d; correctness gates are not"),
+    /// which is what makes it a property rather than a name list.
     #[test]
     fn only_a_device_free_unit_test_may_hand_build_a_round() {
         let src = include_str!("gpu.rs");
         let mut sites = 0usize;
         let mut exempt = 0usize;
-        for (at, _) in src.match_indices("Provenance::new(") {
+        // `open_round` is the documented adoption path and takes `from_env()` itself, so it counts
+        // toward the corpus floor. Otherwise migrating the three benches onto it -- the change this
+        // module recommends -- would empty the corpus and fail the law for doing the right thing.
+        for (at, _) in src
+            .match_indices("Provenance::new(")
+            .chain(src.match_indices("open_round("))
+        {
             sites += 1;
             let window: String = src[at..].lines().take(10).collect::<Vec<_>>().join("\n");
-            if window.contains("RoundMeta::from_env()") {
+            if window.contains("RoundMeta::from_env()") || window.contains("open_round(") {
                 continue;
             }
-            // Not from the environment: the enclosing function must be a plain `#[test]`.
+            // Not from the environment: the enclosing function must be a plain `#[test]`. The
+            // anchor is indent-agnostic (`rfind("    fn ")` walked PAST a bench nested one module
+            // deeper, landing on some earlier 4-space `#[test]` and exempting it).
             let fn_at = src[..at]
-                .rfind("\n    fn ")
-                .expect("a Provenance::new outside any function");
+                .rfind("fn ")
+                .and_then(|i| src[..i].rfind('\n'))
+                .expect("a round opened outside any function");
             let attrs: String = src[..fn_at]
                 .lines()
                 .rev()
@@ -3753,7 +3866,7 @@ mod tests {
                 .join("\n");
             assert!(
                 attrs.contains("#[test]") && !attrs.contains("#[ignore"),
-                "gpu.rs: the Provenance::new at byte {at} does not take RoundMeta::from_env(), and \
+                "gpu.rs: the round opened at byte {at} does not take RoundMeta::from_env(), and \
                  its enclosing function is not a plain #[test]. A metered round must take its \
                  class from the operator's environment or it skips the clock-lock gate entirely \
                  (RoundClass::Synthetic is Default). Attributes seen:\n{attrs}"
@@ -3762,7 +3875,7 @@ mod tests {
         }
         assert!(
             sites >= 4,
-            "only {sites} Provenance::new sites found in gpu.rs — the scan lost its corpus, and a \
+            "only {sites} round-opening sites found in gpu.rs — the scan lost its corpus, and a \
              law with no corpus passes vacuously"
         );
         assert!(

@@ -34,12 +34,12 @@ WANT_FN = {
     "_parse_cutlass_dtypes", "_cutlass_patterns", "_cutlass_filter_matches",
     "_cutlass_generated_kernels", "_cutlass_census", "_dir_stats", "_verify_fa_wheel",
     "_build_jobs", "_clock_snapshot", "_clock_lock_attempt", "_clock_lock_declaration",
-    "_round_provenance_env",
+    "_round_provenance_env", "_sku_rate",
 }
 WANT_CONST = {
     "_CUTLASS_DTYPES", "_CUTLASS_KERNELS_3X", "_CUTLASS_KERNELS_2X", "_CUTLASS_FAMILY_TOKENS",
     "_CUTLASS_NAME_RE", "_CUTLASS_PROFILER_DTYPE", "_FA3_DISABLE_PRESETS", "_FA3_MIN_TIMEOUT",
-    "_FA2_ARCH", "_CLOCK_LOCK_ENV", "_ITERATION_DATA_ENV",
+    "_FA2_ARCH", "_CLOCK_LOCK_ENV", "_ITERATION_DATA_ENV", "_GPU_USD_PER_HR",
 }
 
 FAILS = []
@@ -67,9 +67,11 @@ def load(path):
         # Stubs for the module constants the lifted code closes over. Values chosen to match the
         # defaults so the printed messages read the way they will in a real round.
         "WK_CUTLASS_TAG": "v4.6.1", "WK_PEER_TIMEOUT": 14400, "WK_PEER_MEM_MIB": 32768,
-        # `_round_provenance_env` closes over the SKU and the billing rate. Stubbed rather than
-        # lifted so the check stays about the WIRING (which variables reach the round) instead of
-        # dragging in the whole pricing table.
+        # `_round_provenance_env` closes over the SKU, the price table and the billing rate. The
+        # PRICE TABLE is lifted for real (`_sku_rate` + `_GPU_USD_PER_HR`), because the unpriced-SKU
+        # branch is a correctness question about that table and stubbing it would hide exactly the
+        # defect the branch exists for. Only `WK_GPU` (whose real value is read from the operator's
+        # environment) and the CPU/RAM arithmetic are stubbed.
         "WK_GPU": "H100", "_usd_per_hr": lambda gpu: 3.9538,
     }
     exec(compile(ast.Module(body=picked, type_ignores=[]), "<modal_app subset>", "exec"), ns)
@@ -294,6 +296,12 @@ def test_round_provenance_reaches_the_round(ns, path):
     # The four spellings `parse_clock_lock` understands.
     check("provenance: a taken lock declares its frequency", decl(True, mhz="1980") == "locked:1980")
     check("provenance: a lock with no frequency is still 'locked'", decl(True) == "locked")
+    # `parse_clock_lock` reads `locked:<int>` and nothing else; `locked:1980 MHz` is a MALFORMED
+    # declaration, which the Rust side maps to Unknown -- i.e. it would silently downgrade a
+    # genuinely locked round to "nobody looked".
+    check("provenance: a non-numeric frequency falls back to a parseable 'locked'",
+          decl(True, mhz="1980 MHz") == "locked:1980" and decl(True, mhz="boost") == "locked",
+          "%r / %r" % (decl(True, mhz="1980 MHz"), decl(True, mhz="boost")))
     real = ("The current user does not have permission to change clocks for GPU 00000001:1B:00.0.")
     check("provenance: a refusal keeps the platform's own words",
           decl(False, reason=real) == "refused:" + real, decl(False, reason=real))
@@ -343,10 +351,44 @@ def test_round_provenance_reaches_the_round(ns, path):
                  if isinstance(s, ast.Call) and isinstance(s.func, ast.Name)]
         check("provenance: bench exports the round metadata exactly once",
               calls.count("_round_provenance_env") == 1, repr(calls))
+        # Both spellings. Scanning only string LITERALS was vacuous: the module has
+        # `_ITERATION_DATA_ENV`, so `env[_ITERATION_DATA_ENV] = "1"` -- the natural way to
+        # reintroduce the defect -- passed a literals-only check untouched, and the one spelling it
+        # did catch is the one nobody would write.
         lits = [s.value for s in ast.walk(bench) if isinstance(s, ast.Constant)
                 and isinstance(s.value, str)]
-        check("provenance: bench never sets the iteration-data variable itself",
-              iter_env not in lits, repr([l for l in lits if "ITERATION" in l]))
+        names = [s.id for s in ast.walk(bench) if isinstance(s, ast.Name)]
+        check("provenance: bench never names the iteration-data variable itself, by either spelling",
+              iter_env not in lits and "_ITERATION_DATA_ENV" not in names,
+              repr([l for l in lits if "ITERATION" in l] + [n for n in names if "ITERATION" in n]))
+
+    # `::test` splits `--filter` into libtest flags, so `--filter "--ignored <round>"` reaches a
+    # metered round from there too. It must carry the same provenance or the fix has a second door.
+    tst = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "test"), None)
+    check("provenance: ::test exists and also takes --iteration-data",
+          tst is not None and any(a.arg == "iteration_data" for a in tst.args.args))
+    if tst is not None:
+        tcalls = [s.func.id for s in ast.walk(tst)
+                  if isinstance(s, ast.Call) and isinstance(s.func, ast.Name)]
+        check("provenance: ::test exports the round metadata and declares the clock verdict",
+              tcalls.count("_round_provenance_env") == 1
+              and tcalls.count("_clock_lock_attempt") == 1, repr(tcalls))
+
+    # An unpriced SKU must leave the cost estimate at `n/a`, not bill the round at CPU+RAM rates --
+    # an ~8x understatement, i.e. an error in the flattering direction. Exercised against the REAL
+    # price table (`_sku_rate` and `_GPU_USD_PER_HR` are lifted, not stubbed) by pointing the
+    # module's `WK_GPU` at an SKU the table does not carry.
+    rate = ns["_sku_rate"]
+    check("provenance: the price table knows H100 and does not know every SKU",
+          rate("H100") > 0.0 and rate("wk-selftest-unpriced-sku") == 0.0,
+          "H100=%.3f" % rate("H100"))
+    priced, ns["WK_GPU"] = ns["WK_GPU"], "wk-selftest-unpriced-sku"
+    env = {"WUKONG_GPU_USD_PER_HR": "stale"}
+    prov(env, iteration_data=False)
+    ns["WK_GPU"] = priced
+    check("provenance: an unpriced SKU leaves the cost estimate at n/a rather than billing "
+          "CPU+RAM as the GPU",
+          "WUKONG_GPU_USD_PER_HR" not in env, repr(env))
 
 
 def main():

@@ -2642,7 +2642,12 @@ def _clock_lock_declaration(locked, mhz="", reason=""):
     environment variable and lands in a single provenance line) and truncated, since a driver
     diagnostic is a sentence and a provenance line is a column."""
     if locked:
-        return f"locked:{mhz}" if mhz else "locked"
+        # DIGITS ONLY. `parse_clock_lock` reads `locked:<int>`; anything else is a malformed
+        # declaration, and on the Rust side a malformed declaration is `Unknown` -- so emitting
+        # `locked:1980 MHz` here would silently downgrade a genuinely locked round to "nobody
+        # looked". Fail to the frequency-less `locked`, which is true and parses.
+        digits = "".join(ch for ch in str(mhz) if ch.isdigit())
+        return f"locked:{digits}" if digits else "locked"
     flat = " ".join((reason or "").split()) or "no diagnostic"
     return "refused:" + (flat[:197] + "..." if len(flat) > 200 else flat)
 
@@ -2673,9 +2678,16 @@ def _clock_lock_attempt(env, smi="nvidia-smi"):
     except (OSError, subprocess.SubprocessError):
         mx = ""
     if not mx.isdigit():
+        # The driver's own words when it has any -- the helper's whole premise is not paraphrasing
+        # them, and this was the one branch that did.
+        said = ""
+        try:
+            said = " ".join(((out.stderr or "") + " " + (out.stdout or "")).split())
+        except NameError:  # the query itself raised, so there is no `out`
+            said = ""
         print("[clock] lock: max SM clock unqueryable; running unlocked", flush=True)
         return declare(False, reason="max SM clock unqueryable (nvidia-smi absent, or the driver "
-                                     "refused the query)")
+                                     "refused the query)" + (f": {said}" if said else ""))
     try:
         rc = subprocess.run([smi, "-lgc", f"{mx},{mx}"], capture_output=True, text=True,
                             env=env, timeout=10)
@@ -2710,7 +2722,17 @@ def _round_provenance_env(env, iteration_data=False):
     operator did not."""
     env["WUKONG_GPU_PROVIDER"] = "modal"
     env["WUKONG_GPU_SKU"] = WK_GPU
-    env["WUKONG_GPU_USD_PER_HR"] = f"{_usd_per_hr(True):.4f}"
+    # ONLY when the SKU is actually priced. `_sku_rate` returns 0.0 for an SKU missing from
+    # `_GPU_USD_PER_HR` (A10G, H100-80GB, L40, ...), and `_usd_per_hr(True)` then reports CPU+RAM
+    # alone -- roughly $0.51/hr against an H100's $4.46. That is a confidently wrong bill
+    # UNDERSTATING spend by ~8x, i.e. an error in the flattering direction, and it would replace
+    # an honest `cost estimate  : n/a (set WUKONG_GPU_USD_PER_HR)` with it.
+    if _sku_rate(WK_GPU) > 0.0:
+        env["WUKONG_GPU_USD_PER_HR"] = f"{_usd_per_hr(True):.4f}"
+    else:
+        env.pop("WUKONG_GPU_USD_PER_HR", None)
+        print(f"[round] {WK_GPU} is not in the price table; leaving the round's cost estimate "
+              f"as n/a rather than billing it at CPU+RAM rates", flush=True)
     if iteration_data:
         env[_ITERATION_DATA_ENV] = "1"
     else:
@@ -3761,7 +3783,7 @@ def ptxas(archs: str = _PTXAS_ARCHS_DEFAULT, filter: str = "", skip: str = "gemm
 @app.function(image=image, gpu=WK_GPU, cpu=WK_CPU, memory=WK_MEM_MIB, timeout=WK_TIMEOUT,
               volumes={PERSIST: build_vol})
 def test(peers: bool = False, release: bool = False, driver: bool = True, filter: str = "",
-         strong_peers: str = ""):
+         strong_peers: str = "", iteration_data: bool = False):
     """Run the ~130 device-executing correctness gates with skips escalated to failures.
 
     `WUKONG_GPU_REQUIRED=1` is the whole point: without it a device-less run prints `[skip]` and
@@ -3806,6 +3828,14 @@ def test(peers: bool = False, release: bool = False, driver: bool = True, filter
         if strong_peers:
             env["WUKONG_STRONG_PEERS"] = strong_peers
             print(f"Strong-peer bar declared: {strong_peers}")
+        # `--filter` is whitespace-split into libtest flags (see below), so `--filter "--ignored
+        # wgmma_config_sweep"` reaches a metered round from HERE. Give this entry point the same
+        # provenance and the same clock declaration as `::bench`, or such a round prints
+        # `provider / SKU : n/a / n/a`, `clock lock : UNKNOWN (undeclared)` and
+        # `round class : REFUSED` -- the exact defect the exports exist to close, reachable through
+        # a door that had not been fixed.
+        _round_provenance_env(env, iteration_data=iteration_data)
+        _clock_lock_attempt(env)
         profile = ["--release"] if release else []
         # Whitespace-split so `--filter` can carry libtest FLAGS, not just one name.
         # The wgmma bring-up gate's exact invocation (ptx_wgmma::WGMMA_BRINGUP_INVOCATION)
@@ -3878,7 +3908,15 @@ def bench(name: str = "", package: str = "wukong_codegen_gpu", peers: bool = Fal
               f"STRONG_PEERS={strong_peers or '(none declared)'}, "
               f"ROUND={'ITERATION (declared)' if iteration_data else 'publication-gated'}")
         _round_provenance_env(env, iteration_data=iteration_data)
-        _clock_lock_attempt(env)
+        # The verdict is worth acting on, not just recording: in a Modal container the lock is
+        # always refused, so without `--iteration-data` the answer is already known and the
+        # operator would otherwise pay H100 rates for a round that mints nothing and only find out
+        # from the header at the end.
+        if not _clock_lock_attempt(env) and not iteration_data:
+            print("[round] clocks are NOT locked and --iteration-data was not passed: per "
+                  "GPU_RETARGET_PLAN.md 6.3 this round will publish NOTHING. The per-cell "
+                  "diagnostics (medians, effects, spreads, margins) still print in full. Re-run "
+                  "with --iteration-data to get the tables as declared leads.", flush=True)
         _clock_snapshot(env, f"before {name or package}")
         args = ["cargo", "test", "-p", package, "--features", "gpu", "--release", "--"]
         if name:

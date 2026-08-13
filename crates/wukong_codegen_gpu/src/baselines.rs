@@ -3893,6 +3893,28 @@ pub fn cublaslt_gemm_nt_f16_f32out(
 /// copies of a timing loop is how one arm quietly acquires an extra `synchronize` and reads 3%
 /// slow.
 ///
+/// # The two arms are the same SKELETON, not the same bytes — the residual differences, named
+///
+/// An adversarial pass found three, and they are recorded here rather than papered over, because a
+/// peer comparison whose asymmetries are undocumented is the thing this whole lane exists against:
+///
+/// 1. **A 32 MiB zero-filled workspace** exists on the Lt arm and not on the GemmEx arm
+///    ([`EPILOGUE_LT_WORKSPACE`]). It is allocated in `FusedLtPlan::new`, i.e. **outside** the
+///    timed region, so it costs the timed loop nothing; what it buys is a wider algorithm choice
+///    for the peer, which moves the bar in the *conservative* direction (a stronger denominator).
+/// 2. **The output pointer's guard is hoisted.** The GemmEx arm takes `device_ptr_mut(&mut c_d)`
+///    per iteration because `gemm_ex_nt_f16_f32out` wants `&mut`; the Lt arm resolves `d_ptr` once
+///    and passes it as a raw `u64`. On this backend's single default stream that is a guard
+///    construct/drop per iteration and no stream operation, so it is not a launch-affecting
+///    difference — but it IS a difference, and a multi-stream `Gpu` would make it one.
+/// 3. **Four device allocations against three** (the workspace and `d` versus `c_d`), again all
+///    before the clock starts.
+///
+/// None of the three is inside the timed region except (2). If a round ever needs the two arms to
+/// be bit-identical rather than skeleton-identical, the fix is to give the GemmEx handle the same
+/// workspace via `cublasSetWorkspace` and to hoist or un-hoist both guards together — not to
+/// silently prefer whichever arm reads faster.
+///
 /// # Declines are LOUD
 ///
 /// A shape whose heuristic finds no algorithm returns `Err(PeerError)` carrying cuBLASLt's own
@@ -3923,6 +3945,19 @@ pub fn time_cublaslt_gemm_nt_f16_f32out(
 /// Cheap: a descriptor plus a heuristic query, no launch (the same mechanism as
 /// [`cublaslt_epilogue_support_matrix`]).
 pub fn cublaslt_plain_gemm_decline(g: &mut Gpu, m: usize, k: usize, n: usize) -> Option<String> {
+    // The alignment rules are checked HERE rather than left to `FusedLtPlan::new`, whose first two
+    // statements are `assert!`s. A safety probe that panics on exactly the shapes it exists to
+    // screen is not a probe; the caller gets a sentence it can print instead of a stack trace.
+    if !k.is_multiple_of(8) {
+        return Some(format!(
+            "cuBLASLt f16 needs K%8==0 for a 16-byte-aligned lda/ldb (got K={k})"
+        ));
+    }
+    if !n.is_multiple_of(4) {
+        return Some(format!(
+            "cuBLASLt f16 needs N%4==0 for the C/D leading dimension (got N={n})"
+        ));
+    }
     match FusedLtPlan::new(g, m, k, n, LtEpilogue::None, LtOut::F32, &[]) {
         Ok(_) => None,
         Err(e) => Some(e.to_string()),
@@ -5607,6 +5642,14 @@ mod tests {
             ("Lt", fn_body(src, "\nfn time_lt_epilogue_loop(")),
         ];
         for (who, body) in &loops {
+            // The defect the counts below cannot see on their own: moving the plan build INSIDE
+            // the loop adds none of the markers and changes none of the counts, and would time
+            // cuBLASLt's heuristic search instead of its kernel.
+            assert_eq!(
+                body.matches("FusedLtPlan::new").count(),
+                0,
+                "{who}: the plan must be built OUTSIDE the timed region\n{body}"
+            );
             assert_eq!(
                 body.matches("// warm up").count(),
                 1,
@@ -5642,6 +5685,28 @@ mod tests {
                  the loop run — got {warm}/{sync1}/{inst}/{lop}\n{body}"
             );
         }
+        // ...and the Lt ENTRY POINT, which is where the plan and the buffers live, owns no timing
+        // of its own either. Without this clause the skeleton law compares the GemmEx function
+        // (allocations AND loop) against `time_lt_epilogue_loop` (loop only), and every asymmetry
+        // that matters sits in the function neither side reads.
+        let entry = fn_body(src, "\npub fn time_cublaslt_gemm_nt_f16_epilogue(");
+        for forbidden in [
+            "Instant::now",
+            "synchronize",
+            "for _ in 0..iters",
+            "elapsed()",
+        ] {
+            assert!(
+                !entry.contains(forbidden),
+                "time_cublaslt_gemm_nt_f16_epilogue grew a timed region ({forbidden:?}); the loop \
+                 must stay in time_lt_epilogue_loop where one law can see it:\n{entry}"
+            );
+        }
+        assert_eq!(
+            entry.matches("FusedLtPlan::new").count(),
+            1,
+            "the plan is built exactly once, before the timing:\n{entry}"
+        );
     }
 
     /// **Every shape the wgmma sweep measures must be one the Lt peer can take.**
@@ -5691,9 +5756,21 @@ mod tests {
             body.contains("Ok(_) => None"),
             "available must be the None case:\n{body}"
         );
-        // The doc must tell the caller what NOT to do with it, since the compiler cannot.
-        let at = src.find("pub fn cublaslt_plain_gemm_decline(").unwrap();
-        let doc = &src[at.saturating_sub(1400)..at];
+        // The probe must not panic on the shapes it exists to screen: `FusedLtPlan::new` opens with
+        // two `assert!`s, so a decline that delegates straight to it dies on a bad K or N.
+        assert!(
+            body.contains("is_multiple_of(8)") && body.contains("is_multiple_of(4)"),
+            "the decline must answer the alignment question itself rather than assert it:\n{body}"
+        );
+        // The doc must tell the caller what NOT to do with it, since the compiler cannot. Sliced
+        // by LINES, not by a byte offset: this file's prose carries em dashes, so a fixed
+        // `at - 1400` lands mid-character and panics as soon as anything above it shifts.
+        let doc: String = src[..src.find("pub fn cublaslt_plain_gemm_decline(").unwrap()]
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             doc.contains("without a reason") || doc.contains("never wired up"),
             "the decline's doc must say why a silent one is a defect:\n{doc}"
