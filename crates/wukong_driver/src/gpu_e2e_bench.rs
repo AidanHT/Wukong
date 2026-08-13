@@ -34,17 +34,18 @@
 //! shorter, and named that way.
 //!
 //! `launch_ms` and `e2e_ms` both also contain something `kernel_ms` does not: `gemm_nt_wgmma`
-//! **regenerates the PTX text and re-resolves the module on every call**, while
-//! `time_gemm_nt_wgmma` does that once outside its timed region. Both host-to-host arms pay it
-//! identically — they are the same function — so it cannot bias `pipeline cost`; it is part of what
-//! retention measures, alongside the copies.
+//! **regenerates the PTX text on every call** and hands it to a module lookup that is a cache hit
+//! (the cache keys on the module key and never re-examines the PTX), while `time_gemm_nt_wgmma`
+//! resolves once outside its timed region. Both host-to-host arms pay it identically — they are the
+//! same function — so it cannot bias `pipeline cost`; it is part of what retention measures,
+//! alongside the copies.
 //!
 //! **One asymmetry does bias `pipeline cost`, upward, against Wukong, and is measured rather than
 //! argued.** `wukong_interp::run_kernel_f32_accel` wraps every call in `with_big_stack`, which spawns
 //! and joins a fresh 512 MiB-stack thread; a real program pays that once per run, but arm B pays it
 //! once per measured iteration and arm A never does. The round times an empty thread of the same
-//! shape and prints it as `interp thread us`, so a reader can subtract it instead of taking the
-//! pipeline cost at face value.
+//! shape and prints it as `interp thread us`; since `pipeline cost` is a ratio, the subtraction is
+//! done in the RETENTION table's milliseconds rather than on the percentage.
 //!
 //! From those, two published ratios and one attribution:
 //!
@@ -142,9 +143,16 @@ pub(crate) const E2E_BENCH_NAME: &str = "gpu_e2e_route_vs_cublas";
 
 /// **The one invocation that runs this round.**
 ///
-/// `::bench` (not `::test`) because the round is `#[ignore]`d — `::bench` appends `--ignored`, which
-/// is the only way to select it, and `::test` never passes that flag. `--package wukong_driver`
-/// because this bench does not live in `bench()`'s default package.
+/// **Run `modal run tools/cloud/modal_app.py::build --release` first.** `bench()` calls
+/// `_require_prebuilt(package, release=True)` while `build()`'s `release` defaults to `False`, so this
+/// line on its own aborts before it measures anything — deliberately, since the alternative is
+/// compiling the workspace in release mode on metered GPU time.
+///
+/// `::bench` (not `::test`) because the round is `#[ignore]`d: `::bench` is the only entrypoint that
+/// passes `--ignored` on its own, and `::test` never passes it (though `::test --filter` splits its
+/// argument, so `--filter "--ignored <name>"` could also reach an ignored test — this constant does
+/// not use that route, because a sweep runner is the right home for a measurement).
+/// `--package wukong_driver` because this bench does not live in `bench()`'s default package.
 ///
 /// `--peers` sets `WUKONG_PEER_REQUIRED`, which the peers *inside* `wukong_codegen_gpu` read; it is
 /// carried so this round's provisioning matches every other published GEMM round. It is **not** what
@@ -522,8 +530,9 @@ mod tests {
         }
 
         // --- 4. per shape: witness, correctness, then timing -----------------------------------
-        // Measured before the device work, so a failed 512 MiB reservation cannot redden a round that
-        // has already completed and take the diagnostic table down with it.
+        // Measured before the device work, which makes it a LOWER BOUND on what arm B pays mid-round:
+        // the per-shape host buffers (768 MiB at sq8192) do not exist yet, so the reservation is
+        // cheaper here than it will be later. The RETENTION block says so where the number is used.
         let thread_us = interp_thread_overhead_us();
         let mut rows: Vec<(&GemmPoint, ShapeCosts, bi::BenchVerdict, bi::BenchVerdict)> =
             Vec::new();
@@ -621,6 +630,43 @@ mod tests {
                 m * n
             );
 
+            // **The TIMED launcher must also write C, and this is the last check before ANY timing.**
+            // `time_gemm_nt_wgmma` never reads C back. Its own doc says why that matters: "a kernel
+            // that stored nothing -- a mispredicated epilogue, a truncated grid, a transport that lost
+            // its operands -- would post the fastest number in the table and pass every gate in the
+            // round, because the pre-timing arms run through a *different* entry point
+            // (`gemm_nt_wgmma`) with its own buffers." Every lane check above goes through exactly
+            // that different entry point, so publishing the resident ratio (which this round does)
+            // reopens the seam unless the TIMING launcher is itself made to read C back.
+            // `wukong_codegen_gpu`'s own sweep is required by a device-free law to run this probe
+            // before it times anything; this is that requirement, honoured at the shape being
+            // published rather than at a guard shape, and placed here so it precedes BOTH twins rather
+            // than landing as an unshared burst between them.
+            let region = wukong_codegen_gpu::gpu::TimedRegion::closed_form_probe();
+            const PROBE_ITERS: usize = 4;
+            match wukong_codegen_gpu::gpu::time_gemm_nt_wgmma_in(g, cfg, m, k, n, PROBE_ITERS, region)
+            {
+                // The sentinel half of the launcher's readback is deliberately NOT claimed here:
+                // `closed_form_probe()` sets `zero_c_in_region`, so the memset destroys
+                // `WGMMA_C_SENTINEL` before the first launch and the launcher's `unwritten` count is
+                // structurally zero. What survives is the arm that matters — `K*fill^2` is never 0,
+                // so a lane the kernel never wrote reads 0.0 after the memset and is caught.
+                Ok(secs) => eprintln!(
+                    "  [gate] the TIMED launcher writes C at {} ({}, {PROBE_ITERS} launches): every \
+                     lane is exactly K*fill^2 = {:e} ({:.3} ms/launch, NOT a measurement) \u{2713}",
+                    p.dims(),
+                    region.label(),
+                    k as f32 * region.fill * region.fill,
+                    secs * 1e3
+                ),
+                Err(e) => panic!(
+                    "{}: the timed path's closed-form probe failed: {e}. The resident column is \
+                     published from this launcher, so without the readback a kernel that stored \
+                     nothing would post the fastest number in the table.",
+                    p.label
+                ),
+            }
+
             // --- 4c. twin 1: the pipeline against the DIRECT LAUNCHER ------------------------
             // A and C are the same host-to-host launcher call, so C/A is this shape's own floor and
             // B/A is exactly what the pipeline adds: one interpreter call, the seam's dispatch, and
@@ -649,35 +695,6 @@ mod tests {
                     }
                 },
             );
-
-            // --- 4c-bis. the TIMED path must write C, at this shape ---------------------------
-            // **`time_gemm_nt_wgmma` never reads C back.** Its own doc says so and says why it
-            // matters: "a kernel that stored nothing -- a mispredicated epilogue, a truncated grid, a
-            // transport that lost its operands -- would post the fastest number in the table and pass
-            // every gate in the round, because the pre-timing arms run through a *different* entry
-            // point (`gemm_nt_wgmma`) with its own buffers." Every lane check above goes through
-            // exactly that different entry point, so promoting the resident ratio into the published
-            // table (which this round does) reopens the seam unless the TIMING launcher is itself
-            // made to read C back. `wukong_codegen_gpu`'s own sweep is required by a device-free law
-            // to run this probe before it times anything; this is that requirement, honoured at the
-            // shape being published rather than at a guard shape.
-            let region = wukong_codegen_gpu::gpu::TimedRegion::closed_form_probe();
-            match wukong_codegen_gpu::gpu::time_gemm_nt_wgmma_in(g, cfg, m, k, n, 4, region) {
-                Ok(secs) => eprintln!(
-                    "  [gate] the TIMED path writes C at {}: every lane is exactly K*fill^2 = {:e} \
-                     and none holds the pre-launch sentinel ({:.3} ms/launch, NOT a measurement) \
-                     \u{2713}",
-                    p.dims(),
-                    k as f32 * region.fill * region.fill,
-                    secs * 1e3
-                ),
-                Err(e) => panic!(
-                    "{}: the timed path's closed-form probe failed: {e}. The resident column is \
-                     published from this launcher, so without the readback a kernel that stored \
-                     nothing would post the fastest number in the table.",
-                    p.label
-                ),
-            }
 
             // --- 4d. twin 2: the RESIDENT pair — the published table's own comparison --------
             // Both arms are `iters` device-resident launches with their handles and modules resolved
@@ -746,44 +763,64 @@ mod tests {
             "\n---- {E2E_BENCH_NAME}: THE PUBLISHED TABLE ----\n\
              Both columns come out of `Round::publish`, so a shape whose control floor did not clear\n\
              the bar prints its refusal instead of a number.\n\
-             `pipeline cost` is what the compiler and interpreter add over calling the launcher\n\
-             directly -- same function in both arms. A tie means the route is free. Part of it is the\n\
-             interpreter's per-call thread; the RETENTION table below says how to net it out in ms.\n\
+             `pipeline cost` is what the INTERPRETER and the OFFLOAD SEAM add over calling the\n\
+             launcher directly -- same function in both arms, and the compile is NOT in either of\n\
+             them (it runs once per shape outside the twin; see the DIAGNOSTIC block). A tie means the\n\
+             route is free. Part of it is the interpreter's per-call thread; the RETENTION table below\n\
+             says how to net that out in ms.\n\
              `kernel/cuBLAS` is the resident-buffer pair: the campaign's own comparison, re-measured\n\
-             here in the same round, same clock, same container, same iteration counts.\n"
+             here in the same round, same clock, same container, same iteration counts, and its\n\
+             contender's timed region is `{}`.\n",
+            wukong_codegen_gpu::gpu::TimedRegion::for_cfg(gpu_accel::wgmma_cfg_for(
+                gpu_accel::WGMMA_F32_SEAM_DTYPE,
+                WGMMA_BENCH_GRID[0].m,
+                WGMMA_BENCH_GRID[0].n
+            ))
+            .label()
         );
         eprintln!(
             "  {:<15} {:>18} {:>30}  kernel/cuBLAS, resident",
             "shape", "MxNxK", "pipeline cost vs launcher"
         );
+        // **A round that completes and publishes NOTHING must not exit 0.** Every refusal below
+        // formats as `-- (reason)` text, so a clock-drift refusal, an unresolved control floor or a
+        // `Malformed` field from a launcher error would print fourteen dashes, hand `bench()` rc 0 and
+        // produce a green detached round — the same defect as the provenance skip, one layer later.
+        let mut published = 0usize;
         for (p, _, ov, res) in &rows {
             let cost = match round.publish(ov, H2H_FIELD) {
-                Ok(pd) => format!(
-                    "{:+.1}% ({}, floor +/-{:.2}%, ours {})",
-                    (pd.ratio() - 1.0) * 100.0,
-                    if pd.is_tie() { "tie" } else { "moved" },
-                    pd.floor() * 100.0,
-                    // The CONTENDER's own spread (guard G16). Arm B here is the interpreter, the least
-                    // stable arm in this file, so dropping it would hide the one dispersion a reader
-                    // most needs — `analyze` already refuses above the bar, but the value is evidence.
-                    match pd.dispersion() {
-                        Some(d) => format!("+/-{:.2}%", d * 100.0),
-                        None => "n/a".to_string(),
-                    }
-                ),
+                Ok(pd) => {
+                    published += 1;
+                    format!(
+                        "{:+.1}% ({}, floor +/-{:.2}%, ours {})",
+                        (pd.ratio() - 1.0) * 100.0,
+                        if pd.is_tie() { "tie" } else { "moved" },
+                        pd.floor() * 100.0,
+                        // The CONTENDER's own spread (guard G16). Arm B here is the interpreter, the least
+                        // stable arm in this file, so dropping it would hide the one dispersion a reader
+                        // most needs — `analyze` already refuses above the bar, but the value is evidence.
+                        match pd.dispersion() {
+                            Some(d) => format!("+/-{:.2}%", d * 100.0),
+                            None => "n/a".to_string(),
+                        }
+                    )
+                }
                 Err(why) => format!("-- ({why})"),
             };
             let head = match round.publish(res, RESIDENT_FIELD) {
                 // `ratio` is B/A on a MILLISECOND field: below 1.0 means we are faster, and the
                 // throughput percentage is its reciprocal. `bench_instrument` is unit-agnostic and
                 // cannot catch a ratio quoted the wrong way round, so polarity is owned here.
-                Ok(pd) => format!(
-                    "{:.1}% of cuBLAS ({:.4}x its ms, {}, floor +/-{:.2}%)",
-                    100.0 / pd.ratio(),
-                    pd.ratio(),
-                    if pd.is_tie() { "tie" } else { "moved" },
-                    pd.floor() * 100.0
-                ),
+                Ok(pd) => {
+                    published += 1;
+                    format!(
+                        "{:.1}% of cuBLAS ({:.4}x its ms, {}, floor +/-{:.2}%)",
+                        100.0 / pd.ratio(),
+                        pd.ratio(),
+                        if pd.is_tie() { "tie" } else { "moved" },
+                        pd.floor() * 100.0
+                    )
+                }
                 Err(why) => format!("-- ({why})"),
             };
             eprintln!("  {:<15} {:>18} {:>30}  {head}", p.label, p.dims(), cost);
@@ -802,8 +839,10 @@ mod tests {
              itself is their QUOTIENT ACROSS TWO TWINS and therefore carries no floor of its own --\n\
              its two operands were each gated, against different denominators.\n\
              `e2e ms` includes one 512 MiB-stack thread spawn per call that a real program pays once\n\
-             per run and `launch ms` never pays: subtract `interp thread us`/1000 from `e2e ms` for\n\
-             the seam's own cost.\n"
+             per run and `launch ms` never pays. So the thread-free end-to-end cost is\n\
+             `e2e ms - interp thread us/1000`, and the SEAM's own addition is that minus `launch ms`.\n\
+             `interp thread us` is measured before the per-shape host buffers exist, so it is a lower\n\
+             bound on what arm B pays mid-round.\n"
         );
         eprintln!(
             "  {:<15} {:>11} {:>11} {:>11} {:>11} {:>11}",
@@ -865,6 +904,26 @@ mod tests {
                 ms(c.peer_h2h_once_ms)
             );
         }
+        // **The round's product is numbers, so producing none is a failure, not a result.** Both
+        // tables above turn every refusal into `-- (reason)` text and keep going, which is right for a
+        // per-shape refusal — a wide floor at one shape is a finding, and the log is worth its rented
+        // minutes. But if NOTHING cleared, the round measured nothing publishable: a clock-drift
+        // refusal, an unverified device, or a launcher error that poisoned every field would each
+        // print dashes across all fourteen cells and still hand `bench()` rc 0. Escalated through the
+        // same helper as every other skip, so it is loud locally and RED under `WUKONG_GPU_REQUIRED`,
+        // which `::bench` always sets.
+        eprintln!(
+            "\n  published cells: {published} of {} (2 per shape)",
+            2 * rows.len()
+        );
+        if published == 0 {
+            wukong_codegen_gpu::diff::skip_or_fail(
+                E2E_BENCH_NAME,
+                "the round completed but every cell refused, so it published NOTHING — see the \
+                 per-shape verdicts above for which gate shut",
+            );
+            eprintln!("*** THIS ROUND PUBLISHED NOTHING ***");
+        }
         eprintln!("=============================================================\n");
     }
 
@@ -912,7 +971,17 @@ mod tests {
                 continue;
             }
             if t.starts_with("#[") {
-                attrs.push(t.to_string());
+                // **Split the line, do not push it whole.** One line pushed as one element makes
+                // `#[test] #[should_panic]` a single string that `starts_with("#[test]")` accepts, so
+                // the exhaustiveness check below would pass an added attribute on the same line.
+                // `rustfmt` would split that line and `cargo fmt --check` would catch it, but a law
+                // whose message claims to reject extra attributes should not be relying on a
+                // different gate to do it.
+                attrs.extend(
+                    t.split_whitespace()
+                        .filter(|s| s.starts_with("#["))
+                        .map(str::to_string),
+                );
                 continue;
             }
             break;
@@ -1175,8 +1244,19 @@ mod tests {
         // The round must be able to fail on the things the instrument cannot see. Scoped to the
         // round's own body, which ends at its own closing brace alone on a 4-space-indented line —
         // not at the next `#[test]`, which overshot by the whole `body_of` helper and let a
-        // neighbour's prose satisfy these three checks.
-        let round = body_of(me, &decl, "\n    }\n");
+        // neighbour's prose satisfy these checks. **Comments are stripped**, because the round's own
+        // prose names most of these symbols while explaining why they matter: without the strip,
+        // deleting `assert_every_lane(..)` and leaving the comment above it green-lights the law, which
+        // is precisely the class of defect the byte-window version of `attributes_above` had.
+        let round_src = body_of(me, &decl, "\n    }\n");
+        let round: String = round_src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(at) => &l[..at],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             round.contains("(accel.gemm_wgmma_calls, accel.gemm_existing_calls),"),
             "`{name}` no longer compares the per-route counters, so it cannot tell a wgmma launch \
@@ -1190,6 +1270,27 @@ mod tests {
             round.contains("round.publish("),
             "`{name}` no longer publishes through the instrument's gate, so a round whose control \
              floor never cleared the bar would print a number anyway"
+        );
+        // **The closed-form probe must precede BOTH twins.** `gpu.rs` pins exactly this ordering for
+        // its own sweep ("afterwards it is a post-mortem") but its law scans only that crate's
+        // sources, so nothing reached this file: deleting the probe, or sliding it below the resident
+        // twin, would leave every gate in the tree green while the published `kernel/cuBLAS` column
+        // came from a launcher that never reads C back.
+        let probe = round
+            .find("TimedRegion::closed_form_probe()")
+            .expect("the round must probe the TIMED launcher's writeback");
+        let first_timed = round
+            .find("bi::run_rotated(")
+            .expect("the round must time something");
+        assert!(
+            probe < first_timed,
+            "`{name}` runs the closed-form probe AFTER its first timed region — afterwards it is a \
+             post-mortem, and the resident column it guards is published"
+        );
+        assert!(
+            round.contains("published == 0"),
+            "`{name}` no longer counts its publications, so a round where every cell refused would \
+             print dashes and still exit 0"
         );
         // **The capability escalation, and the reason it needs a second lever on `::bench`.** The
         // round escalates on `WUKONG_GPU_REQUIRED` *as well as* the declared capability, because
