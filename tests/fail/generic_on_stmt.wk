@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0306
+module tests.fail.generic_on_stmt
+
+// `@generic` is read from the FUNCTION item (`wukong_mir_build::lower_program` clears the recognition
+// switch per function), so an attribute on the loop itself would be a promise nothing keeps: the
+// parser accepts statement attributes and discards them, so this nest would have been recognized as a
+// `wukong_velem_f32` call while its author believed they had opted out. Placement is E0306, with the
+// fix in the help text -- move it to the `fn`.
+fn scale(x: [f32; 4], mut out: [f32; 4]) {
+    @generic
+    for i in 0..4 {
+        out[i] = x[i] * 2.0;
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut out: [f32; 4] = [0.0; 4];
+    scale(x, out);
+    return 0;
+}
