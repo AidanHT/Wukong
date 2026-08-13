@@ -2930,9 +2930,13 @@ pub const WGMMA_W1_BF16: WgmmaCfg = WgmmaCfg {
 /// 65.1/67.5/56.1% of cuBLAS bf16 at the square shapes -- within a point or two of where the f16
 /// row sat BEFORE its levers -- so the whole bf16 gap is the unshipped transport + cluster, both
 /// of which are dtype-generic at 2-byte elements (same tile, same I_cta, same store sequence; only
-/// the operand-type token differs). Shipped by [`wgmma_dispatch_dtype`] at every single-wave grid
-/// whose `f_L2` is under the cluster's benefit bar -- `sq2048` and `gpt_d1024_down`; the scalar row
-/// stays emittable as the control.
+/// the operand-type token differs). Shipped by [`wgmma_dispatch_dtype`] at every single-wave grid the
+/// widest tile fills -- `sq2048` and `gpt_d1024_down`; the scalar row stays emittable as the control.
+///
+/// Those two shapes are declined the cluster by DIFFERENT terms, and that distinction is the whole
+/// point of the 2026-08-12 amendment: `sq2048` fails the BENEFIT term (`f_L2` 0.769, saving 0.256
+/// against a 0.26 bar) while `gpt_d1024_down` CLEARS it (`f_L2` 0.955, saving 0.318) and fails the
+/// AMORTIZATION term at one wave. See [`WGMMA_W1_V2`], the f16 twin, for the same statement.
 pub const WGMMA_W1_BF16_V2: WgmmaCfg = WgmmaCfg {
     name: "wgmma_nt_bf16_128x256x64_s4_v2",
     key: "wgmma_nt_bf16_128x256x64_s4_v2",
@@ -2955,7 +2959,7 @@ pub const WGMMA_W1_BF16_MCB_V2: WgmmaCfg = WgmmaCfg {
 
 // --- the bf16 MIRROR of every arm the shipped rule can select -------------------------------------
 //
-// **The rule is dtype-generic and the module table must be too.** `wgmma_shipped_for` runs ONE
+// **The rule is dtype-generic and the module table must be too.** `wgmma_dispatch_dtype` runs ONE
 // dispatcher for both 16-bit types (`wgmma_dispatch_plan` reads only `(M, N, K, sm_count)`, none of
 // which carries a dtype) and then resolves the verdict to a module of the caller's dtype. So every
 // configuration the rule can reach needs a twin here, or the bf16 half of the product surface
@@ -3111,8 +3115,20 @@ pub const WGMMA_W1_MCB: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1
 };
 
-/// Every shipped configuration. The generator, the gates and the device-free module enumeration all
-/// iterate this table.
+/// **The module-enumeration SEED, not the set of arms the rule ships.** The generator, the census,
+/// the ASCII law and the `.version` law all start from this table.
+///
+/// Since the 2026-08-12 promotion the two are deliberately different, and the asymmetry is worth
+/// naming because fourteen laws in this file still iterate only this table. It carries the four bf16
+/// arms the rule ships (they reach a device through the RULE alone -- there is no bf16 config sweep --
+/// so this enumeration is their only pre-flight) and it does NOT carry the five f16 arms the rule
+/// ships, because those are `WGMMA_SWEEP_GRID` rows and reach the census through
+/// [`wgmma_all_emittable`] instead. Nothing is missing from the corpus the laws that matter scan
+/// (ASCII, `.version`, `.target`, ptxas census, and the label-reachability law all read
+/// `wgmma_all_emittable`); what is asymmetric is the older per-`WGMMA_VARIANTS` laws, which now cover
+/// a bf16 row and not its f16 twin. `every_bf16_twin_is_its_f16_twin_modulo_the_operand_token` is what
+/// makes that harmless: the two texts are equal under the operand token, so a property proved on
+/// either holds on both.
 pub const WGMMA_VARIANTS: &[WgmmaCfg] = &[
     WGMMA_W1,
     WGMMA_W1_BF16,
@@ -3189,6 +3205,23 @@ pub const WGMMA_VARIANTS: &[WgmmaCfg] = &[
 // --- wave 3 lever 3: the per-shape dispatcher, which is now the shipped rule ----------------------
 
 /// L2 on the H100 SXM5 this campaign rents, bytes (50.0 MiB). Measured, r3 log line 522.
+///
+/// # A PINNED constant, and the dispatcher's `sm_count` is PROBED -- the asymmetry is deliberate
+///
+/// Since the 2026-08-12 promotion the shipped rule reads `GpuTarget::sm_count` at every call site, so
+/// the tile, persistence and the cluster's amortization term all follow the device. This constant,
+/// [`BW_L2`] and [`BW_HBM`] do NOT: they are the SXM5's values, and `GpuTarget` carries a probed
+/// `l2_bytes` that the rule does not consult. That is not an oversight and it is not symmetric with
+/// the SM count, for one reason worth stating: `sm_count` enters the rule as a *pure geometry* divisor
+/// (`waves = ceil(tiles / sm_count)`) that is correct on any device, while `L2_BYTES` is one term of a
+/// **fitted cost model** whose other constants ([`TILE_FIXED_S`], [`K_STAGE_S`], [`X_FILL_PER_STAGE_S`])
+/// were measured on this part and transfer nowhere. Probing the L2 alone would make the residency test
+/// device-aware inside a floor that is not, which is a worse kind of wrong than a stated pin: the
+/// verdict would move with the device while the roof it is compared against did not.
+///
+/// So the honest scope is: **this rule is derived for, and pinned to, H100 SXM5-class parts**, and a
+/// non-SXM5 Hopper part gets SXM5 roofs with a correct wave count. Re-deriving the cost model per
+/// device is what would license probing this, and it is a wave of its own.
 pub const L2_BYTES: f64 = 52_428_800.0;
 /// The measured L2 read bandwidth, B/s. `gpt_d1024_down` runs 597.6 TFLOP/s through `I_cta = 85.33`,
 /// which is exactly this -- the shape IS the calibration.
@@ -3482,6 +3515,38 @@ pub const CLUSTER_F_L2_THRESHOLD: f64 = 0.78;
 /// `GpuTarget::sm_count` at the call site (this module's [`HOPPER_SM_COUNT`] is the H100 SXM5 value
 /// the derivation was done at, used only by the device-free laws), and the tile comes from the tile
 /// lever. No benchmark shape appears anywhere in it.
+///
+/// # AT THE SHIPPED VALUE OF 2 THIS TERM COINCIDES EXACTLY WITH THE PERSISTENCE LEVER
+///
+/// `waves` is clamped at 1, so `waves >= 2` is `waves > 1`, which is *literally* the persistence
+/// predicate. Say it plainly rather than let a reader infer two independent decisions from two
+/// fields: **the shipped predicate is `benefit AND persistent`**, and it becomes independent of
+/// persistence only at a value of 3 or more. `the_amortization_term_coincides_with_persistence_at_two`
+/// asserts the coincidence so that a later value cannot silently make two laws mean different things,
+/// and [`DispatchPlan::summary`] prints both because the round log must show WHICH term declined a
+/// shape -- at `gpt_d1024_down` the benefit term passes and this one does not.
+///
+/// Two consequences worth naming. The rule can therefore **never** select a clustered
+/// non-persistent module, so the `ClusterB x OneTilePerCta` corner ([`WGMMA_W1_MCB_V2`] and its bf16
+/// twin) is unreachable from the rule and survives only as the control the promotion's deltas are
+/// measured against. And the coincidence is not evidence *for* the term: the term is justified by the
+/// 2x2 above, in which `gpt_d1024_up` is multi-wave and persistent-eligible and still loses the
+/// cluster, so "multi-wave" alone is not what the cluster needs.
+///
+/// # What the coupling cost is amortized over, stated as what was MEASURED
+///
+/// Every arm of the A/B above is [`TileSchedule::OneTilePerCta`] -- `w1_v2` and `w1_mcb_v2` both
+/// inherit it from [`WGMMA_W1`] -- so in all five cells each CTA runs exactly ONE tile, at 1, 4 and
+/// 16 waves. The quantity the table divides the total delta by is therefore the number of **device
+/// passes**, not the number of tiles one CTA runs: the fixed cross-SM coupling is paid once per pass
+/// (a cluster's ranks must rendezvous and ramp their rings together at every pass boundary) and the
+/// launch's cost is dominated by it only when the grid fits in one pass. That is the claim the code
+/// computes, and it is the claim the measurement supports.
+///
+/// The stronger reading -- "amortized over the tiles one CTA runs" -- is a claim about the
+/// **persistent** arm, which is what the rule now ships and which the A/B did **not** measure. It is
+/// plausible for the same mechanism and it is unproven; `w1_mcb_v2_p` at `gpt_d1024_up` was added to
+/// `WGMMA_SWEEP_GRID` to settle exactly that, as cluster-under-persistence with one fact changed.
 pub const CLUSTER_MIN_WAVES: usize = 2;
 
 /// **What the cluster must actually SAVE to be worth its coupling cost**: the fraction of the binding
@@ -4260,8 +4325,13 @@ pub const WGMMA_W1_MCB_V2_P: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1_MCB_V2
 };
 
-/// Persistence with NEITHER the raster nor the cluster -- the configuration [`wgmma_dispatch`]
-/// selects at `gpt_d1024_up`, and the wave's largest single-shape number (+15.6 points).
+/// Persistence with NEITHER the raster nor the cluster -- the configuration the shipped rule selects
+/// at `gpt_d1024_up`, and what the dossier predicted would be the wave's largest single-shape
+/// persistence number (+15.6 points).
+///
+/// **MEASURED 2026-08-12: 90.0% of cuBLAS against `w1_v2`'s 85.9%, i.e. +4.1 points of persistence
+/// at that shape, and +9.4 against the 80.6 the retired rule shipped there.** The +15.6 was a
+/// pre-round prediction and is kept only as the prediction it was.
 ///
 /// That shape is the cleanest possible test of the mechanism: its footprint is 10.6 MB of a 50.0 MiB
 /// L2 so the raster is worthless, its `f_L2` is 0.55 so the cluster costs more than it saves, and
@@ -4274,8 +4344,12 @@ pub const WGMMA_W1_V2_P: WgmmaCfg = WgmmaCfg {
     ..WGMMA_W1_V2
 };
 
-/// **W3d -- the 128x64 tile, and the largest single-shape number in the wave-3 dossier (+56 points
-/// at sq1024).**
+/// **W3d -- the 128x64 tile, and the largest single-shape delta the 2026-08-12 round measured:
+/// 48.3% -> 79.6% of cuBLAS at `sq1024`, +31.3 points.**
+///
+/// The dossier predicted +56 (32.3% -> ~88%) and the round closed the bracket at the conservative
+/// end, which is where `tile_fixed_s` said it would land (see below). The prediction is kept as a
+/// prediction; the measurement is the number.
 ///
 /// # Why the narrow tile, and why only there
 ///
@@ -9643,10 +9717,21 @@ mod tests {
             }
             checked += 1;
         }
-        // A floor, so a future emittable-corpus change cannot shrink this law to nothing.
+        // Anti-vacuity, and it has to be a HARD floor rather than a relative one. `checked >=
+        // WGMMA_VARIANTS.len()` was true by construction -- `wgmma_all_emittable` starts from that
+        // table and only pushes -- so making all 25 sweep rows non-generatable would have shrunk this
+        // law from 36 modules to 11 and it would still have passed.
+        assert_eq!(
+            checked,
+            wgmma_all_emittable().len(),
+            "every emittable configuration must be scanned"
+        );
         assert!(
-            checked >= WGMMA_VARIANTS.len(),
-            "the law must cover the WHOLE emittable corpus, not just the shipped rows: {checked}"
+            checked >= 36,
+            "the corpus this law covers has shrunk to {checked} modules; it is the WHOLE emittable \
+             set (11 shipped rows + the 25 generatable sweep rows at the 2026-08-12 promotion), and a \
+             law that silently stops covering the sweep-only rows is how the persistent, rastered and \
+             drain arms went uncovered by it in the first place"
         );
     }
 
@@ -12880,7 +12965,22 @@ mod tests {
                     "{label}: the ranking must be sorted: {rows:?}"
                 );
             }
-            let (best, best_pct) = rows[rows.len() - 1];
+            // **A TIE MUST NOT BE BROKEN BY LISTING ORDER.** At `sq4096` the round measured
+            // `w1_mcb_v2_r16_p` and `w1_mcb_v2_p` at the same 94.3%. Taking `rows[len-1]` as "best"
+            // full stop would make this law's verdict depend on which of two equal numbers was typed
+            // last: swap them and `off_the_top` gains sq4096, and the `facts >= 2` assert below fails
+            // too, because that pair differs in the raster ALONE. So the comparison is against the
+            // maximum with a tolerance, and any row inside it counts as on top. The round's own
+            // RANKED section (log line 1582) breaks the sq4096 tie on sub-percent milliseconds and
+            // puts `w1_mcb_v2_p` first, which is what the rule selects.
+            const TIE_PTS: f64 = 0.05;
+            let best_pct = rows.iter().map(|(_, p)| *p).fold(f64::MIN, f64::max);
+            let on_top: Vec<&'static str> = rows
+                .iter()
+                .filter(|(_, p)| best_pct - *p <= TIE_PTS)
+                .map(|(c, _)| c.key)
+                .collect();
+            let (best, _) = rows[rows.len() - 1];
             let got = wgmma_dispatch_dtype(WgmmaDtype::F16, g.m, g.n, g.k, HOPPER_SM_COUNT)
                 .unwrap_or_else(|e| panic!("{label}: the shipped rule must resolve: {e}"));
             let got_pct = rows
@@ -12894,7 +12994,7 @@ mod tests {
                         got.name
                     )
                 });
-            if got.key != best.key {
+            if !on_top.contains(&got.key) {
                 off_the_top.push(label);
                 let gap = best_pct - got_pct;
                 assert!(
@@ -12949,6 +13049,198 @@ mod tests {
                 "{} must remain a sweep row",
                 c.name
             );
+        }
+    }
+
+    /// **THE AMORTIZATION TERM COINCIDES WITH THE PERSISTENCE LEVER AT THE SHIPPED VALUE OF 2, AND
+    /// THAT IS STATED RATHER THAN LEFT TO BE NOTICED.**
+    ///
+    /// `waves` is clamped at 1, so `waves >= 2` is `waves > 1` is the persistence predicate, at every
+    /// shape and every `sm_count`. [`DispatchPlan`] therefore carries two `pub bool` fields that are
+    /// provably equal and [`DispatchPlan::summary`] prints them as two verdicts -- which is right (the
+    /// round log must say which of the cluster's two terms declined a shape) and would be misleading
+    /// if nothing said they coincide.
+    ///
+    /// The law pins three things a reader would otherwise have to derive: the coincidence itself over
+    /// a wide sweep; that it is a property of the VALUE 2 and not of the code, by evaluating the
+    /// predicate at 3 where the two come apart; and the consequence -- that the rule can never select
+    /// a clustered non-persistent module, so [`WGMMA_W1_MCB_V2`] and [`WGMMA_W1_BF16_MCB_V2`] are
+    /// unreachable from the rule and exist only as the control the promotion's deltas are measured
+    /// against.
+    #[test]
+    fn the_amortization_term_coincides_with_persistence_at_two() {
+        const _: () = assert!(CLUSTER_MIN_WAVES == 2);
+        let mut clustered_non_persistent = 0usize;
+        let mut both_seen = (false, false);
+        for mt in 1..=140usize {
+            for n in [256usize, 1024, 4096, 16384] {
+                for nk in [1usize, 16, 64, 240] {
+                    let p = wgmma_dispatch_plan(128 * mt, n, 64 * nk, HOPPER_SM_COUNT);
+                    assert_eq!(
+                        p.cluster_amortized, p.persistent,
+                        "at CLUSTER_MIN_WAVES = 2 these are one predicate: {p:?}"
+                    );
+                    if p.persistent {
+                        both_seen.1 = true;
+                    } else {
+                        both_seen.0 = true;
+                    }
+                    if p.cluster && !p.persistent {
+                        clustered_non_persistent += 1;
+                    }
+                    // ...and it is the VALUE that makes them coincide, not the code: at 3 they differ
+                    // wherever the grid is exactly two waves deep.
+                    if p.waves == 2 {
+                        assert!(
+                            p.persistent && !(p.waves >= 3),
+                            "a 2-wave grid is where a threshold of 3 would come apart from \
+                             persistence -- if this stops holding the coincidence claim is about \
+                             something else: {p:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            both_seen.0 && both_seen.1,
+            "the sweep must reach both single-wave and multi-wave grids or the coincidence is \
+             asserted over one branch"
+        );
+        assert_eq!(
+            clustered_non_persistent, 0,
+            "the rule must never select a clustered NON-persistent module -- WGMMA_W1_MCB_V2 and its \
+             bf16 twin are unreachable from the rule by construction, and are kept as the control \
+             the promotion's deltas are measured against"
+        );
+    }
+
+    /// **THE DECLINE SET IS ENUMERATED AND BOUNDED -- the promotion's one honest cost to the product
+    /// path.**
+    ///
+    /// The retired `wgmma_w1_for` could not decline: it returned a 128x256 row for every shape. The
+    /// promoted rule CAN, because the tile lever made `(tile, schedule)` combinations reachable that
+    /// no module carries -- and at the driver seam a decline is answered by the pre-Hopper f32
+    /// launcher, which is correct but much slower. So the promotion **narrows the Hopper fast path**,
+    /// and that is a real cost, not an edge case: it is a contiguous band of ordinary tall-skinny
+    /// shapes, not a pathology.
+    ///
+    /// This law is what stops the band from growing silently. It sweeps a wide shape space, buckets
+    /// every verdict by its `(tile, cluster, raster, persist)` signature, and pins BOTH sets exactly.
+    /// Adding a module moves a signature from `DECLINES` to `RESOLVES` and must be argued here;
+    /// widening the rule so that it can reach a new signature fails here until a module exists or the
+    /// signature is added to the pinned decline list on purpose.
+    ///
+    /// # What the decline classes are, physically
+    ///
+    /// Every one of them is a schedule lever the rule wants at a tile whose module table has only the
+    /// one-tile-per-CTA row. The tile menu exists for UNDERFILLED grids (`sq1024` is 32 CTAs of 132 at
+    /// 128x256), and the shapes that reach a narrow tile *and* have more tiles than SMs are the ones
+    /// that want persistence on a narrow tile -- a combination nothing in the seven-shape suite
+    /// reaches, so nothing has ever assembled it. Closing them is `n` more `WgmmaCfg` rows plus their
+    /// bf16 twins plus a census bump, and it is deliberately NOT spent inside a promotion: they would
+    /// be **unmeasured modules shipped on the strength of arithmetic**, which is the opposite of what
+    /// this lane is for. The residual is recorded in `CHANGELOG.md` and
+    /// `docs/gpu/derive/WAVE3_PROMOTION_HANDOFF.md` with the module list a later lane needs.
+    #[test]
+    fn the_rules_reachable_configurations_are_enumerated_and_the_decline_set_is_pinned() {
+        use std::collections::BTreeSet;
+        let sig = |p: &DispatchPlan| {
+            format!(
+                "{}x{} cluster {} raster {} persist {}",
+                p.bm,
+                p.bn,
+                if p.cluster { "on " } else { "off" },
+                p.group_m,
+                if p.persistent { "on " } else { "off" }
+            )
+        };
+        let mut resolves: BTreeSet<String> = BTreeSet::new();
+        let mut declines: BTreeSet<String> = BTreeSet::new();
+        // A wide sweep: every M tile count up to a little over one wave at the widest tile, every N
+        // from one narrow tile to 132 wide tiles, and K from one k-stage to 240.
+        for mt in 1..=140usize {
+            for n in [64usize, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 33792] {
+                for nk in [1usize, 2, 4, 8, 16, 32, 64, 128, 240] {
+                    let (m, k) = (128 * mt, 64 * nk);
+                    let p = wgmma_dispatch_plan(m, n, k, HOPPER_SM_COUNT);
+                    let s = sig(&p);
+                    // The two dtypes must agree here too, or the mirror law is incomplete somewhere
+                    // this sweep reaches and its own point list does not.
+                    let f = wgmma_dispatch_dtype(WgmmaDtype::F16, m, n, k, HOPPER_SM_COUNT);
+                    let b = wgmma_dispatch_dtype(WgmmaDtype::Bf16, m, n, k, HOPPER_SM_COUNT);
+                    assert_eq!(
+                        f.is_ok(),
+                        b.is_ok(),
+                        "{m}x{k}x{n}: the two dtypes disagree about whether {s} can be served"
+                    );
+                    if f.is_ok() {
+                        resolves.insert(s);
+                    } else {
+                        declines.insert(s);
+                    }
+                }
+            }
+        }
+        // Printed so a reader of a `--nocapture` run sees the whole reachable space rather than
+        // trusting two sorted lists in a source file.
+        eprintln!("[law] reachable configurations that RESOLVE:");
+        for s in &resolves {
+            eprintln!("[law]   {s}");
+        }
+        eprintln!("[law] reachable configurations that DECLINE (the narrowed band):");
+        for s in &declines {
+            eprintln!("[law]   {s}");
+        }
+        let want_resolves: BTreeSet<String> = [
+            "128x256 cluster off raster 1 persist off",
+            "128x256 cluster off raster 1 persist on ",
+            "128x256 cluster on  raster 1 persist on ",
+            "128x256 cluster on  raster 16 persist on ",
+            "128x64 cluster off raster 1 persist off",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let want_declines: BTreeSet<String> = [
+            // The square tile has NO un-clustered v2 row: it ships only as wave 3 lever 4's
+            // depth-diagnostic control, which carries the cluster. Reached by a grid that fails the
+            // wave-fill floor at 128x256 and clears it at 128x128.
+            "128x128 cluster off raster 1 persist off",
+            "128x128 cluster off raster 1 persist on ",
+            "128x128 cluster off raster 10 persist on ",
+            // The narrow tile has only its one-tile-per-CTA row. Reached by a grid underfilled at
+            // both wider tiles that nonetheless has more tiles than SMs.
+            "128x64 cluster off raster 1 persist on ",
+            "128x64 cluster off raster 8 persist on ",
+            // Un-clustered, rastered and persistent at the widest tile: a thrashing footprint whose
+            // floor still dominates, so the cluster's benefit term fails while the raster fires.
+            "128x256 cluster off raster 16 persist on ",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            resolves, want_resolves,
+            "the set of configurations the rule can SERVE changed; update it deliberately"
+        );
+        assert_eq!(
+            declines, want_declines,
+            "the set of configurations the rule DECLINES changed -- this is the narrowed Hopper fast \
+             path, and it must never grow by accident. Adding a module shrinks it (good, argue it \
+             here); a rule change that reaches a new unserved signature grows it (say so in \
+             CHANGELOG.md and in the handoff, or emit the module)"
+        );
+        // Non-vacuity in both directions: the sweep must actually reach both sets, and every
+        // resolving signature must name a real module.
+        assert!(resolves.len() >= 5 && declines.len() >= 6);
+        // ...and the CLUSTER is reachable ONLY at the widest tile, because `(bn/2)/(bm+bn)` is 1/4 at
+        // 128x128 and 1/6 at 128x64 against a 0.26 break-even. That is not an accident of this sweep;
+        // it is `the_cluster_predicate_is_the_saving_and_not_the_roof_fraction` seen from the other
+        // side, and it is why no clustered narrow-tile module is missing from the table.
+        for s in resolves.iter().chain(declines.iter()) {
+            if s.contains("cluster on") {
+                assert!(s.starts_with("128x256"), "cluster at a narrow tile: {s}");
+            }
         }
     }
 
@@ -13644,10 +13936,14 @@ mod tests {
             // The verdict is the CONJUNCTION of the benefit term and the amortization term, and the
             // test spells both out. gpt_d1024_down is the row that makes the conjunction visible:
             // its benefit term passes and its amortization term does not.
+            //
+            // Asserted against `persistent` and NOT against `waves >= CLUSTER_MIN_WAVES`, which
+            // would restate the assignment that computes the field -- a circular oracle that cannot
+            // fail. At the shipped value of 2 the two levers coincide exactly (see
+            // CLUSTER_MIN_WAVES), and that coincidence is the non-trivial fact worth pinning.
             assert_eq!(
-                plan.cluster_amortized,
-                plan.waves >= CLUSTER_MIN_WAVES,
-                "{}: the amortization term is `waves >= CLUSTER_MIN_WAVES` and nothing else",
+                plan.cluster_amortized, plan.persistent,
+                "{}: at CLUSTER_MIN_WAVES = 2 the amortization term IS the persistence predicate",
                 w.label
             );
             assert_eq!(
