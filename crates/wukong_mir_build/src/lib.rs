@@ -11099,328 +11099,338 @@ impl FnLowerer<'_> {
     }
 
     fn lower_for(&mut self, label: Option<Symbol>, pat: &Pattern, iter: &ForIter, body: &Block) {
-        // A matmul nest lowers to the tuned microkernel. Inside a `@parallel` fn the multicore
-        // kernel is selected like every sibling recognizer on this statement path (i8gemm, lowp,
-        // norms) — this was hardcoded `false`, so a multi-statement `@parallel` transformer block
-        // ran its six plain GEMMs serial while the norms went multicore (measured ≈serial to ~2x
-        // SLOWER via the package-clock penalty of the partial bursts). The parallel GEMM is
-        // bit-identical to serial (fixed chunking), so the differential gate is unaffected. The
-        // whole-function single-statement form is still intercepted earlier in `lower_program`.
-        if let Some(nest) = recognize_matmul(pat, iter, body, self.sema, self.interner) {
-            if self.emit_sgemm(&nest, self.parallel_fn) {
+        // ---- The ordered kernel-recognizer cascade -------------------------------------------
+        //
+        // Order is load-bearing (each comment below says why its arm is tried where it is), and the
+        // whole block is what `LowerOptions::recognize` / `@generic` turn off: with recognition
+        // disabled no `match_*` runs, so the nest reaches the autovectorizer and the ordinary CFG
+        // lowering below and runs exactly as written. The autovectorizer, the `@parallel` region
+        // outliner and the plain loop lowering are NOT in here — they are how the loop the user
+        // wrote is compiled, not a kernel substituted for it.
+        if self.gemm.recognize {
+            // A matmul nest lowers to the tuned microkernel. Inside a `@parallel` fn the multicore
+            // kernel is selected like every sibling recognizer on this statement path (i8gemm, lowp,
+            // norms) — this was hardcoded `false`, so a multi-statement `@parallel` transformer block
+            // ran its six plain GEMMs serial while the norms went multicore (measured ≈serial to ~2x
+            // SLOWER via the package-clock penalty of the partial bursts). The parallel GEMM is
+            // bit-identical to serial (fixed chunking), so the differential gate is unaffected. The
+            // whole-function single-statement form is still intercepted earlier in `lower_program`.
+            if let Some(nest) = recognize_matmul(pat, iter, body, self.sema, self.interner) {
+                if self.emit_sgemm(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // A fused residual projection `c[i*N+j] = act(c[i*N+j] + dot [+ bias[j]])` — the transformer
+            // skip connection `x = x + act(x·Wᵀ + bias)`, whose accumulate store blocks the bare matmul
+            // recognizer above (so without this the whole nest falls to a scalar loop). It dispatches to
+            // `wukong_sgemm_nt_epi` with beta=1 (the kernel accumulates the matmul into the residual
+            // already in C), reusing the fused-epilogue kernel with no backend change. Tried after the
+            // bare matmul (the two store forms — `c = s` vs `c = act(c + s + …)` — are disjoint).
+            if let Some((nest, bias, act)) =
+                match_matmul_residual(pat, iter, body, self.sema, self.interner)
+            {
+                if self.emit_sgemm_epi(&nest, bias, act) {
+                    return;
+                }
+            }
+            // The CROSS-buffer residual projection `c[i*N+j] = x[i*N+j] + dot` with `x != c` — the
+            // out-of-place skip connection `h = x + attn·Woᵀ` written with the residual folded into the
+            // store. There is no single kernel for it (nt_epi's beta reads the OUTPUT back), so it lowers
+            // to the same two kernels the factored spelling dispatches: `wukong_sgemm_nt` then a flat
+            // `wukong_velem_f32` residual sweep. Tried after the in-place form, which is strictly better
+            // (one kernel) and which this arm declines by requiring `x != c`.
+            if let Some((nest, x)) =
+                match_matmul_residual_src(pat, iter, body, self.sema, self.interner)
+            {
+                if self.emit_sgemm_residual_src(&nest, x) {
+                    return;
+                }
+            }
+            // The DUAL-STORE projection `c[i*N+j] = s; d[i*N+j] = d[i*N+j] op s` — the SwiGLU
+            // up-projection computed and multiplied into the gate in one pass. The extra store makes the
+            // inner body four statements where every matmul matcher wants three, so without this the
+            // whole GEMM is scalar. Lowers to `wukong_sgemm_nt` + `wukong_velem_f32`, the same pair the
+            // factored spelling dispatches. Structurally disjoint from every arm above (they all require
+            // a three-statement inner body).
+            if let Some((nest, d, op)) =
+                match_matmul_dual_store(pat, iter, body, self.sema, self.interner)
+            {
+                if self.emit_sgemm_dual_store(&nest, d, op) {
+                    return;
+                }
+            }
+            // int8 quantized `nn.Linear` (`u8×i8→i32` `C = A·Bᵀ`) → the int8 GEMM microkernel. Integer
+            // arithmetic, so the kernel equals the scalar nest bit-for-bit; in a `@parallel` function the
+            // multicore kernel is used (rows independent → deterministic, so the gate stays exact).
+            if let Some(nest) = match_matmul_i8_nt(pat, iter, body, self.sema, self.interner) {
+                if self.emit_i8gemm(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // bf16/f16 mixed-precision `C = A·Bᵀ` (NT, nn.Linear forward) or `C = Aᵀ·B` (TN, the
+            // `dW = dYᵀ·X` weight gradient) — half inputs widened to f32, f32 accumulate → the half GEMM
+            // microkernel. The widen is lossless, so the kernel equals the scalar nest under the matmul
+            // reassociation; in a `@parallel` function the multicore kernel runs (rows independent).
+            if let Some(nest) = match_matmul_lowp(pat, iter, body, self.sema, self.interner) {
+                if self.emit_lowp_gemm(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // GEMV `for i { let s=0; for j { s += a[i*N+j]*x[j] }; y[i]=s }` → `wukong_sgemv` (the
+            // `_parallel` one in a `@parallel` fn). The 2-deep nest the 3-loop matmul matcher declines; the
+            // memory-bound row dot gcc keeps a latency-bound scalar chain, folded 8-wide across four
+            // accumulators. Tried *after* the matmul recognizers so a batched 3-loop matmul isn't mis-matched
+            // (structurally disjoint anyway — matmul's outer body is another `for`, GEMV's is the reduction).
+            // Rows independent → serial == parallel bit-for-bit (the interpreter marshals the serial form).
+            if let Some(nest) = match_gemv(pat, iter, body, self.sema, self.interner) {
+                if self.emit_gemv(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Vector·matrix `for j { let s=0; for i { s += w[i]*a[i*N+j] }; out[j] = s [* c] }` →
+            // `wukong_sgevm_f32` (the `_parallel` one in a `@parallel` fn) — the KV-decode attention
+            // read-out `out = scoresᵀ·V`. The j-outer source reads `a` column-strided (gcc/rustc leave it
+            // scalar); the kernel restructures to i-outer streaming `a` row-major while keeping the
+            // identical per-element ascending-i FMA chain — bit-exact, no reassociation (runtime gevm.rs).
+            // Structurally disjoint from GEMV above (`a`'s index is `inner*N + outer`, not `outer*N +
+            // inner`) and from the column reductions (the fold addend is a product, not a bare element).
+            if let Some(nest) = match_gevm(pat, iter, body, self.sema, self.interner) {
+                if self.emit_gevm(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Matrix transpose `for i { for j { dst[j*R+i] = src[i*C+j] } }` → the cache-blocked
+            // `wukong_transpose_f32` (the `_parallel` one in a `@parallel` function). Pure data movement,
+            // bit-identical to the scalar nest; the block tiling is the win `-O3` won't do for a transpose.
+            if let Some(nest) = match_transpose(pat, iter, body, self.sema, self.interner) {
+                if self.emit_transpose(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // 2D max/avg pooling `for c { for oy { for ox { seed; for dy { for dx { fold window } }; store } } }`
+            // → the AVX2 `wukong_{max,avg}pool2d_f32` (the `_parallel` one in a `@parallel` function). The
+            // strided window gcc/rustc leave scalar; the kernel folds 8 output columns at once. Max is
+            // idempotent and the avg sum order is fixed → bit-identical to the scalar nest.
+            if let Some(nest) = match_pool2d(pat, iter, body, self.sema, self.interner) {
+                if self.emit_pool2d(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Column reduction `for j { let s=0; for i { s += x[i*N+j] }; out[j] = s }` (the bias gradient
+            // / batch sum, a reduce along axis 0) → the SIMD `wukong_colsum_f32` (the `_parallel` one in a
+            // `@parallel` function). The strided naive form gcc leaves scalar; the kernel streams row-major
+            // + 8-wide. Bit-exact (i-ascending per column, same order as the scalar nest).
+            if let Some(nest) = match_colsum(pat, iter, body, self.sema, self.interner) {
+                if self.emit_colsum(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Per-column argmax/argmin `for j { let bv=x[j]; let bi=0; for i in 1..R { if x[i*C+j] >|< bv {
+            // bv=x[i*C+j]; bi=i } }; out[j]=bi }` (axis-0 top-1) → the i32-index `wukong_colarg{max,min}_i32`
+            // (the `_parallel` one in a `@parallel` fn). The strided column-outer (value,index) scan gcc/rustc
+            // keep scalar; the kernel streams row-major tracking 8 column lanes via blend.
+            if let Some(nest) = match_colarg(pat, iter, body, self.sema, self.interner) {
+                if self.emit_colarg(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Batched softmax-backward `for r { let s=0; for j { s += y·dy }; for i { dx = y·(dy−s) } }`
+            // → the fused `wukong_softmax_bwd_f32` (the `_parallel` one in a `@parallel` function). The
+            // per-row dot gcc keeps scalar; the kernel reuses the bit-exact sreduce dot + an 8-wide apply.
+            if let Some(nest) = match_softmax_bwd(pat, iter, body, self.sema, self.interner) {
+                if self.emit_softmax_bwd(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // A batched RMSNorm backward `for r { <dx = r·(g − x·r²·Σg·x/C) over x/dy/gamma[r*C+i]> }` →
+            // `wukong_rmsnorm_bwd_f32` (the `_parallel` one in a `@parallel` function). The two per-row
+            // reductions gcc keeps scalar; the kernel folds them 8-wide then applies the gradient.
+            if let Some(nest) = match_rmsnorm_bwd(pat, iter, body, self.sema, self.interner) {
+                if self.emit_rmsnorm_bwd(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Batched LayerNorm backward `for r { mean; var; rstd; Σg; Σg·xhat; apply }` →
+            // `wukong_layernorm_bwd_f32` (the `_parallel` one in a `@parallel` function). Four per-row
+            // reductions gcc keeps scalar; the kernel folds them 8-wide.
+            if let Some(nest) = match_layernorm_bwd(pat, iter, body, self.sema, self.interner) {
+                if self.emit_layernorm_bwd(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // A batched softmax cross-entropy loss `for r { max; Σexp; loss[r] = lse − x[r,target[r]] }`
+            // → `wukong_xent_fwd_f32` (the `_parallel` one in a `@parallel` function). The expf/logf
+            // reduction gcc keeps scalar; the kernel folds it 8-wide and gathers the target logit.
+            if let Some(nest) = self.match_xent(pat, iter, body) {
+                if self.emit_xent(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Batched cross-entropy backward `for r { softmax(x) into dx; dx[target[r]] -= 1 }`
+            // → `wukong_xent_bwd_f32` (the `_parallel` one in a `@parallel` function).
+            if let Some(nest) = self.match_xent_bwd(pat, iter, body) {
+                if self.emit_xent_bwd(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // A RoPE nest `for r { for j { rotate x[r,j]/x[r,j+H] by inline cos/sin(r·inv_freq[j]) } }`
+            // → `wukong_rope_f32` (the `_parallel` one in a `@parallel` function). The inline sinf/cosf
+            // gcc keeps scalar; the kernel computes them 8-wide. Bit-identical (a rotation, no reassoc).
+            if let Some(nest) = match_rope(pat, iter, body, false, self.sema, self.interner)
+                .or_else(|| match_rope(pat, iter, body, true, self.sema, self.interner))
+            {
+                if self.emit_rope(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // A batched log-sum-exp `for r { max; Σexp; out[r] = m + log(s) }` → `wukong_logsumexp_f32`
+            // (the `_parallel` one in a `@parallel` function). The expf reduction gcc keeps scalar.
+            if let Some(nest) = self.match_logsumexp(pat, iter, body) {
+                if self.emit_logsumexp(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Per-row loss reductions (KL divergence / Shannon entropy / soft-label cross-entropy) → the
+            // fused log/exp-bound kernels (the `_parallel` ones in a `@parallel` function). C keeps the
+            // logf/expf reductions scalar.
+            if let Some(nest) = self.match_kldiv(pat, iter, body) {
+                if self.emit_kldiv(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            if let Some(nest) = self.match_entropy(pat, iter, body) {
+                if self.emit_entropy(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            if let Some(nest) = self.match_kd_loss(pat, iter, body) {
+                if self.emit_kd_loss(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Per-channel dequant nest `out[i*C+j] = act((q[i*C+j] as f32)·scale[j])` over a `[R,C]` matrix
+            // → one `wukong_dequant_perchan_f32` call (`_parallel` in a `@parallel` fn; rows independent →
+            // bit-equal to serial). The per-column scale broadcast + the int widen keep gcc/rustc scalar;
+            // the AVX2 kernel folds widen+per-column-scale into one 256-bit pass. Checked in this batched
+            // phase (the body is a nested loop, which the elementwise recognizers below never match).
+            if let Some(nest) = self.match_dequant_perchan(pat, iter, body) {
+                if self.emit_dequant_perchan(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Batched per-row argmax/argmin (classification top-1 / greedy decode) → the index-returning
+            // `wukong_rowarg{max,min}_i32` (`_parallel` in a `@parallel` fn). The (value,index) bookkeeping
+            // keeps gcc/rustc scalar; the AVX2 kernel tracks 8 lanes of (value,index) via blend.
+            if let Some(nest) = self.match_rowarg(pat, iter, body) {
+                if self.emit_rowarg(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Batched per-row inclusive prefix sum (cumsum) → `wukong_cumsum_f32` (the `_parallel` one in a
+            // `@parallel` fn). gcc/rustc keep the loop-carried scan scalar; the SIMD Hillis-Steele + carry
+            // vectorizes it. The in-lane tree reassociates (the documented exception — both backends run it).
+            if let Some(nest) = self.match_cumsum(pat, iter, body) {
+                if self.emit_cumsum(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Batched per-row inclusive prefix product (cumprod) → `wukong_cumprod_f32` (the `_parallel` one
+            // in a `@parallel` fn). Loop-carried like cumsum; the kernel's lever is 4-row-interleaved ILP.
+            // Bit-exact (a bare product is not fused → strict left-to-right, no reassociation).
+            if let Some(nest) = self.match_cumprod(pat, iter, body) {
+                if self.emit_cumprod(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Batched per-row first-order linear recurrence (SSM/Mamba/EMA selective scan) →
+            // `wukong_lrscan_f32` (the `_parallel` one in a `@parallel` fn). The carry defeats gcc/rustc
+            // auto-vectorization (scalar, like cumsum); rows independent → multicore over rows. Bit-exact
+            // (the recurrence is inherently sequential within a row — no reassociation).
+            if let Some(nest) = self.match_lrscan(pat, iter, body) {
+                if self.emit_lrscan(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Batched per-row cumulative max / min (running extreme scan) → wukong_cum{max,min}_f32. Same
+            // loop-carried scan gcc/rustc keep scalar; bit-exact (max/min select a value, no reassociation).
+            if let Some(nest) = self.match_cumminmax(pat, iter, body) {
+                if self.emit_cumminmax(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Embedding lookup `for t { for d { out[t*H+d] = weight[ids[t]*H+d] } }` (the first layer of every
+            // LLM — token ids gather rows of the embedding table) → `wukong_embedding_f32` (the `_parallel`
+            // one in a `@parallel` fn). The data-dependent row gather is pure data movement, bit-identical to
+            // the scalar nest (no reassociation, like the transpose); rows independent → parallel == serial.
+            if let Some(nest) = self.match_embedding(pat, iter, body) {
+                if self.emit_embedding(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Scatter-add / embedding-gradient backward `for t { for d { grad_w[ids[t]*H+d] += grad_out[t*H+d] } }`
+            // → `wukong_scatter_add_f32` (the `_parallel` one in a `@parallel` fn). The dual of the embedding
+            // gather; bit-identical to the scalar nest (collisions sum in token order, no reassociation). It is
+            // probed AFTER embedding — disjoint store ops (`+=` indirect-write vs `=` indirect-read), so neither
+            // steals the other's nest.
+            if let Some(nest) = self.match_scatter(pat, iter, body) {
+                if self.emit_scatter(&nest, self.parallel_fn) {
+                    return;
+                }
+            }
+            // Inside a `@parallel` function, a recognized reduction loop (`s += x[k]*y[k]`, etc.) lowers
+            // to one multicore `wukong_sreduce_f32_parallel` call instead of the sequential vectorizer.
+            if self.parallel_fn && self.try_emit_parallel_reduction(pat, iter, body) {
                 return;
             }
-        }
-        // A fused residual projection `c[i*N+j] = act(c[i*N+j] + dot [+ bias[j]])` — the transformer
-        // skip connection `x = x + act(x·Wᵀ + bias)`, whose accumulate store blocks the bare matmul
-        // recognizer above (so without this the whole nest falls to a scalar loop). It dispatches to
-        // `wukong_sgemm_nt_epi` with beta=1 (the kernel accumulates the matmul into the residual
-        // already in C), reusing the fused-epilogue kernel with no backend change. Tried after the
-        // bare matmul (the two store forms — `c = s` vs `c = act(c + s + …)` — are disjoint).
-        if let Some((nest, bias, act)) =
-            match_matmul_residual(pat, iter, body, self.sema, self.interner)
-        {
-            if self.emit_sgemm_epi(&nest, bias, act) {
+            // A bf16 mixed-precision reduction `for k in 0..n { s += (x[k] as f32) [* (y[k] as f32)] }`
+            // over `[bf16; _]` arrays with an f32 accumulator dispatches to the bf16 dot/sum kernel (f32
+            // accumulate). bf16 storage is bit-exact across interp/native and both call the identical
+            // kernel, so the differential gate stays exact (a reassociation exception, like the f32 path).
+            if self.try_emit_lowp_reduction(pat, iter, body) {
                 return;
             }
-        }
-        // The CROSS-buffer residual projection `c[i*N+j] = x[i*N+j] + dot` with `x != c` — the
-        // out-of-place skip connection `h = x + attn·Woᵀ` written with the residual folded into the
-        // store. There is no single kernel for it (nt_epi's beta reads the OUTPUT back), so it lowers
-        // to the same two kernels the factored spelling dispatches: `wukong_sgemm_nt` then a flat
-        // `wukong_velem_f32` residual sweep. Tried after the in-place form, which is strictly better
-        // (one kernel) and which this arm declines by requiring `x != c`.
-        if let Some((nest, x)) =
-            match_matmul_residual_src(pat, iter, body, self.sema, self.interner)
-        {
-            if self.emit_sgemm_residual_src(&nest, x) {
+            // A bf16 mixed-precision elementwise `for k in 0..n { out[k] = a*(x[k] as f32) + b*(y[k] as
+            // f32) }` (bf16 inputs, f32 output) dispatches to the streaming axpby kernel — half-width
+            // inputs, so ~1.5× the bytes saved on this memory-bound shape. Same exact-gate rationale.
+            if self.try_emit_bf16_axpby(pat, iter, body) {
                 return;
             }
-        }
-        // The DUAL-STORE projection `c[i*N+j] = s; d[i*N+j] = d[i*N+j] op s` — the SwiGLU
-        // up-projection computed and multiplied into the gate in one pass. The extra store makes the
-        // inner body four statements where every matmul matcher wants three, so without this the
-        // whole GEMM is scalar. Lowers to `wukong_sgemm_nt` + `wukong_velem_f32`, the same pair the
-        // factored spelling dispatches. Structurally disjoint from every arm above (they all require
-        // a three-statement inner body).
-        if let Some((nest, d, op)) =
-            match_matmul_dual_store(pat, iter, body, self.sema, self.interner)
-        {
-            if self.emit_sgemm_dual_store(&nest, d, op) {
+            // A half-**output** axpby `for k { out[k] = (a*(x[k] as f32) + b*(y[k] as f32)) as bf16 }`
+            // (bf16/f16 in AND out) dispatches to the narrowing streaming kernel — 6 bytes/elem vs an
+            // all-f32 axpby's 12 (the narrowing store halves the write traffic). Tried after the f32-output
+            // axpby (disjoint target shapes: `out:[f32]` vs `out:[bf16]` with an `as bf16` cast).
+            if self.try_emit_lowp_axpby_narrow(pat, iter, body) {
                 return;
             }
-        }
-        // int8 quantized `nn.Linear` (`u8×i8→i32` `C = A·Bᵀ`) → the int8 GEMM microkernel. Integer
-        // arithmetic, so the kernel equals the scalar nest bit-for-bit; in a `@parallel` function the
-        // multicore kernel is used (rows independent → deterministic, so the gate stays exact).
-        if let Some(nest) = match_matmul_i8_nt(pat, iter, body, self.sema, self.interner) {
-            if self.emit_i8gemm(&nest, self.parallel_fn) {
+            // A half-**output** activation `for k { out[k] = (f((x[k] as f32))) as bf16 }` (bf16/f16 in AND
+            // out) dispatches to the narrowing activation kernel — 4 bytes/elem vs the half-in/f32-out
+            // activation's 6 (the KV-cache / activation-store path). Tried after the f32-output vmath
+            // recognizer (disjoint target shapes: `out:[f32]` vs `out:[bf16]` with an `as bf16` cast).
+            if self.try_emit_lowp_vmath_narrow(pat, iter, body) {
                 return;
             }
-        }
-        // bf16/f16 mixed-precision `C = A·Bᵀ` (NT, nn.Linear forward) or `C = Aᵀ·B` (TN, the
-        // `dW = dYᵀ·X` weight gradient) — half inputs widened to f32, f32 accumulate → the half GEMM
-        // microkernel. The widen is lossless, so the kernel equals the scalar nest under the matmul
-        // reassociation; in a `@parallel` function the multicore kernel runs (rows independent).
-        if let Some(nest) = match_matmul_lowp(pat, iter, body, self.sema, self.interner) {
-            if self.emit_lowp_gemm(&nest, self.parallel_fn) {
+            // A `for i in 0..R { for j in 0..C { out[i*C+j] = act(x[i*C+j] + b[j]) } }` broadcast-bias nest
+            // (the pre-activation `+ bias` add every FFN/attention projection ends with) dispatches to the
+            // 256-bit `wukong_bias_bcast_f32` (the `_parallel` one in a `@parallel` fn). The row-broadcast
+            // operand `b[j]` is what the affine velem recognizer declines and the 128-bit generic
+            // vectorizer under-widens; the kernel folds it into one 256-bit pass with the fused activation.
+            if self.try_emit_bias_bcast(pat, iter, body) {
                 return;
             }
-        }
-        // GEMV `for i { let s=0; for j { s += a[i*N+j]*x[j] }; y[i]=s }` → `wukong_sgemv` (the
-        // `_parallel` one in a `@parallel` fn). The 2-deep nest the 3-loop matmul matcher declines; the
-        // memory-bound row dot gcc keeps a latency-bound scalar chain, folded 8-wide across four
-        // accumulators. Tried *after* the matmul recognizers so a batched 3-loop matmul isn't mis-matched
-        // (structurally disjoint anyway — matmul's outer body is another `for`, GEMV's is the reduction).
-        // Rows independent → serial == parallel bit-for-bit (the interpreter marshals the serial form).
-        if let Some(nest) = match_gemv(pat, iter, body, self.sema, self.interner) {
-            if self.emit_gemv(&nest, self.parallel_fn) {
+            // A `for r in 0..R { <per-row norm over x[r*C + i]> }` batched normalization dispatches to the
+            // fused single-pass norm kernel with `rows = R` (in a `@parallel` fn, the multicore variant
+            // that maps rows across cores). The real transformer shape: norm over `[batch*seq, hidden]`.
+            if self.try_emit_batched_norm(pat, iter, body) {
                 return;
             }
-        }
-        // Vector·matrix `for j { let s=0; for i { s += w[i]*a[i*N+j] }; out[j] = s [* c] }` →
-        // `wukong_sgevm_f32` (the `_parallel` one in a `@parallel` fn) — the KV-decode attention
-        // read-out `out = scoresᵀ·V`. The j-outer source reads `a` column-strided (gcc/rustc leave it
-        // scalar); the kernel restructures to i-outer streaming `a` row-major while keeping the
-        // identical per-element ascending-i FMA chain — bit-exact, no reassociation (runtime gevm.rs).
-        // Structurally disjoint from GEMV above (`a`'s index is `inner*N + outer`, not `outer*N +
-        // inner`) and from the column reductions (the fold addend is a product, not a bare element).
-        if let Some(nest) = match_gevm(pat, iter, body, self.sema, self.interner) {
-            if self.emit_gevm(&nest, self.parallel_fn) {
+            // A `for r in 0..R { for j in 0..C { out[r*C + j] = f(x[r*C + j]) } }` batched activation nest
+            // (the `[tokens, hidden]` FFN/attention shape) dispatches to one flat 256-bit `wukong_vmath_f32`
+            // over the whole `[0, R*C)` buffer — restoring the full kernel width the offset-indexed inner
+            // loop would otherwise lose to the 128-bit generic vectorizer.
+            if self.try_emit_batched_vmath(pat, iter, body) {
                 return;
             }
-        }
-        // Matrix transpose `for i { for j { dst[j*R+i] = src[i*C+j] } }` → the cache-blocked
-        // `wukong_transpose_f32` (the `_parallel` one in a `@parallel` function). Pure data movement,
-        // bit-identical to the scalar nest; the block tiling is the win `-O3` won't do for a transpose.
-        if let Some(nest) = match_transpose(pat, iter, body, self.sema, self.interner) {
-            if self.emit_transpose(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // 2D max/avg pooling `for c { for oy { for ox { seed; for dy { for dx { fold window } }; store } } }`
-        // → the AVX2 `wukong_{max,avg}pool2d_f32` (the `_parallel` one in a `@parallel` function). The
-        // strided window gcc/rustc leave scalar; the kernel folds 8 output columns at once. Max is
-        // idempotent and the avg sum order is fixed → bit-identical to the scalar nest.
-        if let Some(nest) = match_pool2d(pat, iter, body, self.sema, self.interner) {
-            if self.emit_pool2d(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Column reduction `for j { let s=0; for i { s += x[i*N+j] }; out[j] = s }` (the bias gradient
-        // / batch sum, a reduce along axis 0) → the SIMD `wukong_colsum_f32` (the `_parallel` one in a
-        // `@parallel` function). The strided naive form gcc leaves scalar; the kernel streams row-major
-        // + 8-wide. Bit-exact (i-ascending per column, same order as the scalar nest).
-        if let Some(nest) = match_colsum(pat, iter, body, self.sema, self.interner) {
-            if self.emit_colsum(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Per-column argmax/argmin `for j { let bv=x[j]; let bi=0; for i in 1..R { if x[i*C+j] >|< bv {
-        // bv=x[i*C+j]; bi=i } }; out[j]=bi }` (axis-0 top-1) → the i32-index `wukong_colarg{max,min}_i32`
-        // (the `_parallel` one in a `@parallel` fn). The strided column-outer (value,index) scan gcc/rustc
-        // keep scalar; the kernel streams row-major tracking 8 column lanes via blend.
-        if let Some(nest) = match_colarg(pat, iter, body, self.sema, self.interner) {
-            if self.emit_colarg(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Batched softmax-backward `for r { let s=0; for j { s += y·dy }; for i { dx = y·(dy−s) } }`
-        // → the fused `wukong_softmax_bwd_f32` (the `_parallel` one in a `@parallel` function). The
-        // per-row dot gcc keeps scalar; the kernel reuses the bit-exact sreduce dot + an 8-wide apply.
-        if let Some(nest) = match_softmax_bwd(pat, iter, body, self.sema, self.interner) {
-            if self.emit_softmax_bwd(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // A batched RMSNorm backward `for r { <dx = r·(g − x·r²·Σg·x/C) over x/dy/gamma[r*C+i]> }` →
-        // `wukong_rmsnorm_bwd_f32` (the `_parallel` one in a `@parallel` function). The two per-row
-        // reductions gcc keeps scalar; the kernel folds them 8-wide then applies the gradient.
-        if let Some(nest) = match_rmsnorm_bwd(pat, iter, body, self.sema, self.interner) {
-            if self.emit_rmsnorm_bwd(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Batched LayerNorm backward `for r { mean; var; rstd; Σg; Σg·xhat; apply }` →
-        // `wukong_layernorm_bwd_f32` (the `_parallel` one in a `@parallel` function). Four per-row
-        // reductions gcc keeps scalar; the kernel folds them 8-wide.
-        if let Some(nest) = match_layernorm_bwd(pat, iter, body, self.sema, self.interner) {
-            if self.emit_layernorm_bwd(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // A batched softmax cross-entropy loss `for r { max; Σexp; loss[r] = lse − x[r,target[r]] }`
-        // → `wukong_xent_fwd_f32` (the `_parallel` one in a `@parallel` function). The expf/logf
-        // reduction gcc keeps scalar; the kernel folds it 8-wide and gathers the target logit.
-        if let Some(nest) = self.match_xent(pat, iter, body) {
-            if self.emit_xent(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Batched cross-entropy backward `for r { softmax(x) into dx; dx[target[r]] -= 1 }`
-        // → `wukong_xent_bwd_f32` (the `_parallel` one in a `@parallel` function).
-        if let Some(nest) = self.match_xent_bwd(pat, iter, body) {
-            if self.emit_xent_bwd(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // A RoPE nest `for r { for j { rotate x[r,j]/x[r,j+H] by inline cos/sin(r·inv_freq[j]) } }`
-        // → `wukong_rope_f32` (the `_parallel` one in a `@parallel` function). The inline sinf/cosf
-        // gcc keeps scalar; the kernel computes them 8-wide. Bit-identical (a rotation, no reassoc).
-        if let Some(nest) = match_rope(pat, iter, body, false, self.sema, self.interner)
-            .or_else(|| match_rope(pat, iter, body, true, self.sema, self.interner))
-        {
-            if self.emit_rope(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // A batched log-sum-exp `for r { max; Σexp; out[r] = m + log(s) }` → `wukong_logsumexp_f32`
-        // (the `_parallel` one in a `@parallel` function). The expf reduction gcc keeps scalar.
-        if let Some(nest) = self.match_logsumexp(pat, iter, body) {
-            if self.emit_logsumexp(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Per-row loss reductions (KL divergence / Shannon entropy / soft-label cross-entropy) → the
-        // fused log/exp-bound kernels (the `_parallel` ones in a `@parallel` function). C keeps the
-        // logf/expf reductions scalar.
-        if let Some(nest) = self.match_kldiv(pat, iter, body) {
-            if self.emit_kldiv(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        if let Some(nest) = self.match_entropy(pat, iter, body) {
-            if self.emit_entropy(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        if let Some(nest) = self.match_kd_loss(pat, iter, body) {
-            if self.emit_kd_loss(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Per-channel dequant nest `out[i*C+j] = act((q[i*C+j] as f32)·scale[j])` over a `[R,C]` matrix
-        // → one `wukong_dequant_perchan_f32` call (`_parallel` in a `@parallel` fn; rows independent →
-        // bit-equal to serial). The per-column scale broadcast + the int widen keep gcc/rustc scalar;
-        // the AVX2 kernel folds widen+per-column-scale into one 256-bit pass. Checked in this batched
-        // phase (the body is a nested loop, which the elementwise recognizers below never match).
-        if let Some(nest) = self.match_dequant_perchan(pat, iter, body) {
-            if self.emit_dequant_perchan(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Batched per-row argmax/argmin (classification top-1 / greedy decode) → the index-returning
-        // `wukong_rowarg{max,min}_i32` (`_parallel` in a `@parallel` fn). The (value,index) bookkeeping
-        // keeps gcc/rustc scalar; the AVX2 kernel tracks 8 lanes of (value,index) via blend.
-        if let Some(nest) = self.match_rowarg(pat, iter, body) {
-            if self.emit_rowarg(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Batched per-row inclusive prefix sum (cumsum) → `wukong_cumsum_f32` (the `_parallel` one in a
-        // `@parallel` fn). gcc/rustc keep the loop-carried scan scalar; the SIMD Hillis-Steele + carry
-        // vectorizes it. The in-lane tree reassociates (the documented exception — both backends run it).
-        if let Some(nest) = self.match_cumsum(pat, iter, body) {
-            if self.emit_cumsum(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Batched per-row inclusive prefix product (cumprod) → `wukong_cumprod_f32` (the `_parallel` one
-        // in a `@parallel` fn). Loop-carried like cumsum; the kernel's lever is 4-row-interleaved ILP.
-        // Bit-exact (a bare product is not fused → strict left-to-right, no reassociation).
-        if let Some(nest) = self.match_cumprod(pat, iter, body) {
-            if self.emit_cumprod(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Batched per-row first-order linear recurrence (SSM/Mamba/EMA selective scan) →
-        // `wukong_lrscan_f32` (the `_parallel` one in a `@parallel` fn). The carry defeats gcc/rustc
-        // auto-vectorization (scalar, like cumsum); rows independent → multicore over rows. Bit-exact
-        // (the recurrence is inherently sequential within a row — no reassociation).
-        if let Some(nest) = self.match_lrscan(pat, iter, body) {
-            if self.emit_lrscan(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Batched per-row cumulative max / min (running extreme scan) → wukong_cum{max,min}_f32. Same
-        // loop-carried scan gcc/rustc keep scalar; bit-exact (max/min select a value, no reassociation).
-        if let Some(nest) = self.match_cumminmax(pat, iter, body) {
-            if self.emit_cumminmax(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Embedding lookup `for t { for d { out[t*H+d] = weight[ids[t]*H+d] } }` (the first layer of every
-        // LLM — token ids gather rows of the embedding table) → `wukong_embedding_f32` (the `_parallel`
-        // one in a `@parallel` fn). The data-dependent row gather is pure data movement, bit-identical to
-        // the scalar nest (no reassociation, like the transpose); rows independent → parallel == serial.
-        if let Some(nest) = self.match_embedding(pat, iter, body) {
-            if self.emit_embedding(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Scatter-add / embedding-gradient backward `for t { for d { grad_w[ids[t]*H+d] += grad_out[t*H+d] } }`
-        // → `wukong_scatter_add_f32` (the `_parallel` one in a `@parallel` fn). The dual of the embedding
-        // gather; bit-identical to the scalar nest (collisions sum in token order, no reassociation). It is
-        // probed AFTER embedding — disjoint store ops (`+=` indirect-write vs `=` indirect-read), so neither
-        // steals the other's nest.
-        if let Some(nest) = self.match_scatter(pat, iter, body) {
-            if self.emit_scatter(&nest, self.parallel_fn) {
-                return;
-            }
-        }
-        // Inside a `@parallel` function, a recognized reduction loop (`s += x[k]*y[k]`, etc.) lowers
-        // to one multicore `wukong_sreduce_f32_parallel` call instead of the sequential vectorizer.
-        if self.parallel_fn && self.try_emit_parallel_reduction(pat, iter, body) {
-            return;
-        }
-        // A bf16 mixed-precision reduction `for k in 0..n { s += (x[k] as f32) [* (y[k] as f32)] }`
-        // over `[bf16; _]` arrays with an f32 accumulator dispatches to the bf16 dot/sum kernel (f32
-        // accumulate). bf16 storage is bit-exact across interp/native and both call the identical
-        // kernel, so the differential gate stays exact (a reassociation exception, like the f32 path).
-        if self.try_emit_lowp_reduction(pat, iter, body) {
-            return;
-        }
-        // A bf16 mixed-precision elementwise `for k in 0..n { out[k] = a*(x[k] as f32) + b*(y[k] as
-        // f32) }` (bf16 inputs, f32 output) dispatches to the streaming axpby kernel — half-width
-        // inputs, so ~1.5× the bytes saved on this memory-bound shape. Same exact-gate rationale.
-        if self.try_emit_bf16_axpby(pat, iter, body) {
-            return;
-        }
-        // A half-**output** axpby `for k { out[k] = (a*(x[k] as f32) + b*(y[k] as f32)) as bf16 }`
-        // (bf16/f16 in AND out) dispatches to the narrowing streaming kernel — 6 bytes/elem vs an
-        // all-f32 axpby's 12 (the narrowing store halves the write traffic). Tried after the f32-output
-        // axpby (disjoint target shapes: `out:[f32]` vs `out:[bf16]` with an `as bf16` cast).
-        if self.try_emit_lowp_axpby_narrow(pat, iter, body) {
-            return;
-        }
-        // A half-**output** activation `for k { out[k] = (f((x[k] as f32))) as bf16 }` (bf16/f16 in AND
-        // out) dispatches to the narrowing activation kernel — 4 bytes/elem vs the half-in/f32-out
-        // activation's 6 (the KV-cache / activation-store path). Tried after the f32-output vmath
-        // recognizer (disjoint target shapes: `out:[f32]` vs `out:[bf16]` with an `as bf16` cast).
-        if self.try_emit_lowp_vmath_narrow(pat, iter, body) {
-            return;
-        }
-        // A `for i in 0..R { for j in 0..C { out[i*C+j] = act(x[i*C+j] + b[j]) } }` broadcast-bias nest
-        // (the pre-activation `+ bias` add every FFN/attention projection ends with) dispatches to the
-        // 256-bit `wukong_bias_bcast_f32` (the `_parallel` one in a `@parallel` fn). The row-broadcast
-        // operand `b[j]` is what the affine velem recognizer declines and the 128-bit generic
-        // vectorizer under-widens; the kernel folds it into one 256-bit pass with the fused activation.
-        if self.try_emit_bias_bcast(pat, iter, body) {
-            return;
-        }
-        // A `for r in 0..R { <per-row norm over x[r*C + i]> }` batched normalization dispatches to the
-        // fused single-pass norm kernel with `rows = R` (in a `@parallel` fn, the multicore variant
-        // that maps rows across cores). The real transformer shape: norm over `[batch*seq, hidden]`.
-        if self.try_emit_batched_norm(pat, iter, body) {
-            return;
-        }
-        // A `for r in 0..R { for j in 0..C { out[r*C + j] = f(x[r*C + j]) } }` batched activation nest
-        // (the `[tokens, hidden]` FFN/attention shape) dispatches to one flat 256-bit `wukong_vmath_f32`
-        // over the whole `[0, R*C)` buffer — restoring the full kernel width the offset-indexed inner
-        // loop would otherwise lose to the 128-bit generic vectorizer.
-        if self.try_emit_batched_vmath(pat, iter, body) {
-            return;
-        }
+        } // ---- end of the recognizer cascade ---------------------------------------------------
         let (start, end, inclusive, step) = match iter {
             ForIter::Range {
                 start,
@@ -11469,7 +11479,13 @@ impl FnLowerer<'_> {
         // argmax/argmin: `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }` → one deterministic
         // `wukong_argreduce_f32` call + a branchless reconcile. Tried before the vectorizer (which
         // would otherwise if-convert the branch into a scalar lane loop). The greedy-decode hot path.
-        if !inclusive && step.is_none() && self.try_emit_argreduce(pat, start, end, body) {
+        // Part of the recognizer cascade above (it emits a `wukong_*` call), but it needs the
+        // destructured bounds, so it carries the `recognize` test itself.
+        if self.gemm.recognize
+            && !inclusive
+            && step.is_none()
+            && self.try_emit_argreduce(pat, start, end, body)
+        {
             return;
         }
 
