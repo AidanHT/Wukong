@@ -5,6 +5,58 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### GPU (Hopper `wgmma`) — the shipped dispatch rule is now wave 3's per-shape dispatcher
+Wave 3's four schedule levers (grouped raster, persistent CTAs, per-shape tile dispatch, mainloop
+drain) landed on 2026-08-12 and the H100 visit of the same day measured them as sweep **arms**. They
+won: `sq8192` 92.0 → 102.0% of cuBLAS, `gpt_d4096_up` 73.3 → 101.6%, `sq1024` 48.3 → 79.6%,
+`sq4096` 88.3 → 94.3%, `gpt_d1024_up` 80.6 → 90.0%. The **shipped** rule went on selecting the
+wave-2 arms, so the compiler shipped a configuration the tree's own measurement had already beaten
+at four of the seven benched shapes. That is the defect this change fixes.
+
+- **`ptx_wgmma::wgmma_dispatch_dtype` is the shipped rule**, at f16 and bf16, and the driver's config
+  seam (`wukong_driver::gpu_accel::wgmma_cfg_for`) plus both peer benches call it — so a rule change
+  re-measures itself instead of a bench timing a row the rule no longer returns. It chooses the CTA
+  tile, the raster, persistence and the cluster from `(M, N, K)` and the **probed** SM count.
+- **`W1_CLUSTER_MIN_OUTPUT_ELEMS` (the `M × N ≥ 8e6` split) is RETIRED, not kept as a fallback.**
+  `M × N` is not a physical quantity for any of the four levers, and it mis-ranks in both directions:
+  `sq2048` and `gpt_d1024_down` have identical `M × N` and different lever sets, while
+  `gpt_d1024_up` and `sq4096` have identical `M × N` and opposite cluster verdicts.
+- **A pre-registered falsifier fired, and the cluster predicate gained a second term.**
+  `WAVE3_DOSSIER.md` §3.8 registered in advance that "`gpt_d1024_down` prefers no cluster → the real
+  predicate involves `waves`". It does: at that shape's `f_L2` of 0.955 — the suite's highest — the
+  clustered arm measured 91.4% of cuBLAS against the un-clustered arm's 96.8%. The cluster now
+  requires **both** that the multicast's saving off the final configuration's binding roof clears its
+  break-even *and* that the grid is at least `CLUSTER_MIN_WAVES = 2` waves deep, because the 1×2×1
+  cluster couples two SMs at every ring stage and that cost is amortized over the tiles one CTA runs.
+  The one-fact cluster A/B measured the coupling at **+2.41 µs (sq2048) and +2.74 µs
+  (gpt_d1024_down) per tile at one wave against +1.13 µs at four**, and `gpt_d1024_down` is what
+  de-confounds `waves` from `n_k` — it has `sq4096`'s `n_k` of 64 and `sq2048`'s single wave, and it
+  behaves like `sq2048`. Each term is now solely responsible for exactly one measured loss.
+- **The bf16 mirror is complete**: four new modules (`bf16` twins of the 128×64 tile and of the
+  persistent, clustered-persistent and rastered-persistent arms), and a device-free law asserts each
+  twin's PTX is its f16 twin's PTX with the operand token substituted and nothing else — which is
+  what carries the f16 rows' device exactness gate to them without renting time.
+  `EXPECTED_MODULES` 128 → 132, the `wgmma` in-family census 34 → 38.
+- Two existing laws were widened rather than adjusted: `every_branch_target_is_a_defined_label` now
+  scans the whole emittable corpus instead of only the seven shipped rows (which is what surfaced
+  that its "every label is branched to" half was the wrong spelling — `CNEXT`/`PNEXT` are
+  fall-through join labels, so the property is *reachability*), and the Hopper end-to-end gate's
+  shape list is now justified against the rule rather than against a threshold, with a fourth shape
+  added because the promoted rule no longer sends any of the old three to the clustered launch.
+- **Not promoted, on the measurement**: the drain arms (`fh`, `d1`) moved nothing beyond ~1 point
+  anywhere, which is the dossier's own zero budget confirmed; and the `r32` raster bracket landed
+  strictly between linear and `r16` (90.9 vs 94.5 at `gpt_d4096_up`), confirming the raster's gain is
+  traffic and that `r16` is the right width.
+- **The promoted rule is UNMEASURED as a rule.** Its arms were measured individually on 2026-08-12;
+  nothing has run the rule end-to-end. `wgmma_vs_cublas` and `wgmma_bf16_vs_cublas` now run THE RULE,
+  so the next H100 visit re-measures it instead of timing a fixed row.
+- Two documents this change makes stale **about the code** — `CAMPAIGN_CHECKPOINT.md`, which names
+  three now-deleted symbols as the shipped default, and `BENCHMARKS.md`, whose `sq2048` warning box
+  cites a deleted constant and a deleted test — belong to concurrent lanes and are deliberately **not**
+  edited here. The exact replacement text for each is specified in
+  [`docs/gpu/derive/WAVE3_PROMOTION_HANDOFF.md`](docs/gpu/derive/WAVE3_PROMOTION_HANDOFF.md); no
+  measured number changes in either.
+
 ### Documentation — the 2026-08-11 H100 results are folded into the measurement docs
 The measurement doc set predated the campaign's first published Hopper suite, and `BENCHMARKS.md`
 still asserted that *every* GPU number in it was an RTX 4050 number. Every figure added here cites
@@ -63,14 +115,14 @@ everywhere else.
   is `cc_major == 9` rather than `>= (9,0)` because `sm_90a` is architecture-**locked** — a test pins
   the rule to `ptx_wgmma::Sm90aLicense` over the whole capability grid, so the two cannot drift.
 - Config selection goes through **one** seam function that delegates to the generator's shipped
-  regime rule; wave 3's per-shape dispatcher replaces exactly that body.
+  rule; wave 3's per-shape dispatcher replaced exactly that body on 2026-08-12 (see the entry above).
 - **Decline, never wrong.** Architecture, shape, an unencodable tensor map (`K % 8 != 0`), an output
   past the epilogue's `u32` index, a CTA grid past CUDA's `gridDim.y` ceiling, a ring larger than the
   device's opt-in shared memory, or an `UNSUPPORTED` from the generator all fall back to the existing
   path with unchanged results; only a real driver failure is an error. Ragged M/N/K are not declines.
   The launcher's `assert!` preconditions are pre-decided driver-side so an offload can never abort a
   user's program — and the two rules that are **nobody's** precondition are decided here too: an
-  **odd `N`** (both shipped rows use the `st.global.v2.f32` epilogue, whose pair is 8-byte aligned
+  **odd `N`** (every arm the rule can select uses the `st.global.v2.f32` epilogue, whose pair is 8-byte aligned
   only when `N` is even, and a misaligned store leaves the CUDA context stickily errored for the rest
   of the process) and the **grid ceiling** (`LaunchPlan::grid` puts M tiles on `gridDim.y`, which CUDA
   caps at 65535, so an `M` above ~8.4M with an `N` small enough to keep `M*N` inside the `u32` index

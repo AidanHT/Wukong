@@ -91,7 +91,7 @@
 use crate::gpu_accel::{self, GemmRoute, GpuAccel};
 use std::time::{Duration, Instant};
 use wukong_codegen_gpu::bench_instrument as bi;
-use wukong_codegen_gpu::ptx_wgmma::{bench_iters, GemmPoint, WGMMA_BENCH_GRID};
+use wukong_codegen_gpu::ptx_wgmma::{bench_iters, GemmPoint, HOPPER_SM_COUNT, WGMMA_BENCH_GRID};
 use wukong_span::{Interner, SourceMap};
 
 /// The bench's test-function name, so the reachability law selects on the same string the invocation
@@ -359,7 +359,19 @@ mod tests {
         for p in WGMMA_BENCH_GRID {
             // `GemmPoint` names its dims `m`/`n`/`k`; every launcher below takes `(m, k, n)`.
             let (m, k, n) = (p.m, p.k, p.n);
-            let cfg = gpu_accel::wgmma_cfg_for(gpu_accel::WGMMA_F32_SEAM_DTYPE, m, n);
+            let cfg = gpu_accel::wgmma_cfg_for(
+                gpu_accel::WGMMA_F32_SEAM_DTYPE,
+                m,
+                k,
+                n,
+                g.target().sm_count_usize(),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{}: the shipped rule DECLINES this grid shape ({e}), so arm B would run                      `gpu::gemm_nt` while arm A has no kernel. The grid and the rule have diverged.",
+                    p.label
+                )
+            });
             let iters = bench_iters(p);
             eprintln!(
                 "\n  ---- {} {} ----  arm B kernel = {}, {iters} launches/resident region",
@@ -744,7 +756,15 @@ mod tests {
         );
         for p in WGMMA_BENCH_GRID {
             let (m, k, n) = (p.m, p.k, p.n);
-            let cfg = gpu_accel::wgmma_cfg_for(gpu_accel::WGMMA_F32_SEAM_DTYPE, m, n);
+            let cfg =
+                gpu_accel::wgmma_cfg_for(gpu_accel::WGMMA_F32_SEAM_DTYPE, m, k, n, HOPPER_SM_COUNT)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{} {} would be DECLINED by the shipped rule on an H100: {e}",
+                            p.label,
+                            p.dims()
+                        )
+                    });
             let why = gpu_accel::wgmma_declines(cfg, m, k, n, H100_SMEM);
             assert!(
                 why.is_none(),

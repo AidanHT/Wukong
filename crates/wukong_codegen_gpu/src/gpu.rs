@@ -63,6 +63,20 @@ impl GpuTarget {
         self.cc() >= min
     }
 
+    /// **[`GpuTarget::sm_count`] as the `usize` every scheduling rule needs, clamped at 1.**
+    ///
+    /// The field is the `i32` the driver returns and [`GpuTarget::probe`] already refuses a
+    /// non-positive one, but the struct is `pub` with `pub` fields so a hand-built descriptor (every
+    /// device-free law builds one) can carry anything. This is the one conversion, in one place,
+    /// because `sm_count` stopped being a diagnostic on 2026-08-12 and became an INPUT TO THE SHIPPED
+    /// DISPATCH RULE: `ptx_wgmma::wgmma_dispatch_plan` divides the tile count by it to get `waves`,
+    /// and `waves` decides the tile, persistence and the cluster's amortization term. A negative
+    /// `i32` cast straight to `usize` would become ~1.8e19 SMs, every grid would be one wave, and the
+    /// rule would ship the un-clustered non-persistent arm everywhere -- silently, at the old speed.
+    pub fn sm_count_usize(&self) -> usize {
+        usize::try_from(self.sm_count).unwrap_or(1).max(1)
+    }
+
     /// Probe device `ordinal`'s identity. **Every failure is loud and names the driver call**, so an
     /// unqueryable attribute can never degrade into a plausible-looking constant.
     ///
@@ -8616,9 +8630,9 @@ mod tests {
         // point: two rows under one key would run one kernel under both headings.
         // 114 -> 115 when the 2026-08-11 round's measured v2 win (+25.2/+15.3/+10.1 points of
         // cuBLAS) made v2 the SHIPPED default on both regime arms: `w1_v2` is the un-clustered v2
-        // row `wgmma_w1_for` now returns below the cluster threshold, and the fourth corner of
-        // the {cluster} x {v2} square the next sweep measures instead of inheriting.
-        // 115 -> 117 when the levers went to bf16 (`wgmma_w1_bf16_for`): the scalar bf16 round
+        // row the then size-keyed rule returned below the cluster threshold, and the fourth corner
+        // of the {cluster} x {v2} square the next sweep measures instead of inheriting.
+        // 115 -> 117 when the levers went to bf16: the scalar bf16 round
         // sat at f16's pre-lever numbers, so the v2 and mcb2+v2 bf16 twins ship and the bf16
         // bench re-measures the dtype transfer every round.
         // 117 -> 119 on 2026-08-12 with WAVE 3 lever 1, the grouped raster: `w1_mcb_v2_r16` (the
@@ -8647,7 +8661,15 @@ mod tests {
         // where the derivation says the depth can be afforded. `WgmmaCfg::drain_tag` carries both
         // fields into `derived_name`, so no shipped row's key moves and each new arm is its own
         // module.
-        const EXPECTED_MODULES: usize = 128;
+        // 128 -> 132 on 2026-08-12 when the wave-3 dispatcher became the SHIPPED rule at both
+        // dtypes: the bf16 mirror of the four arms it can select that no bf16 row spelled --
+        // `bf16 w3d_s4_v2` (the 128x64 tile), `bf16 w1_v2_p`, `bf16 w1_mcb_v2_p` and
+        // `bf16 w1_mcb_v2_r16_p`. There is no bf16 config SWEEP, so `wgmma_bf16_vs_cublas` reaches
+        // these rows through the rule alone and this enumeration is the only thing that assembles
+        // them on a CPU before an H100 is rented. A missing twin is a silent defect: the bf16 rule
+        // declines, `gpu_accel` routes the offload to the pre-Hopper f32 launcher, and the program
+        // returns correct numbers at the old speed.
+        const EXPECTED_MODULES: usize = 132;
         assert_eq!(
             mods.len(),
             EXPECTED_MODULES,
@@ -20344,35 +20366,27 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     /// `GPU_RETARGET_PLAN.md` §6.3: clocks cannot be locked inside Modal/RunPod/Vast, so a container
     /// round is iteration data and a root-VM round with `nvidia-smi -lgc` is publication data. The
     /// round log says which it was, from `WUKONG_GPU_CLOCK_LOCK`, and warns when it is neither.
-    fn wgmma_peer_round(
-        bench: &'static str,
-        select: fn(usize, usize) -> &'static crate::ptx_wgmma::WgmmaCfg,
-        peer: PeerBar,
-    ) {
+    fn wgmma_peer_round(bench: &'static str, dtype: crate::ptx_wgmma::WgmmaDtype, peer: PeerBar) {
         use crate::ptx_wgmma::{
             bench_iters, bringup_operands, WGMMA_BENCH_GRID, WGMMA_BENCH_INVOCATION,
         };
-        // The round measures what the family SHIPS, per shape -- `select` is the regime rule
-        // (`wgmma_w1_for` for f16), so a rule change re-measures itself here instead of this bench
-        // quietly timing a fixed row the rule no longer returns (which is exactly what it did
-        // between the 2026-08-11 v2 default and this change: a "shipped default" table measured
-        // on the scalar store). Every DISTINCT config the grid selects gets the full pre-timing
-        // guard before anything is timed.
-        let mut cfgs: Vec<&'static crate::ptx_wgmma::WgmmaCfg> = Vec::new();
-        for p in WGMMA_BENCH_GRID {
-            let c = select(p.m, p.n);
-            if !cfgs.iter().any(|x| x.key == c.key) {
-                cfgs.push(c);
-            }
-        }
-        let arm_b_label: String = if cfgs.len() == 1 {
-            cfgs[0].name.to_string()
-        } else {
-            format!(
-                "the shipped rule, per shape ({})",
-                cfgs.iter().map(|c| c.name).collect::<Vec<_>>().join(" | ")
-            )
-        };
+        // The round measures what the family SHIPS, per shape -- `wgmma_dispatch_dtype` IS the
+        // shipped rule, so a rule change re-measures itself here instead of this bench quietly
+        // timing a fixed row the rule no longer returns (which is exactly what it did between the
+        // 2026-08-11 v2 default and its wiring: a "shipped default" table measured on the scalar
+        // store). Every DISTINCT config the grid selects gets the full pre-timing guard before
+        // anything is timed.
+        //
+        // The rule can DECLINE, and a decline is a row this round publishes nothing for rather than
+        // a fallback -- so it is collected, printed with the plan that wanted it, and the shape is
+        // skipped. A bench that silently substituted a nearby module would publish a configuration
+        // the rule does not ship.
+        //
+        // **The rule is evaluated at the PROBED SM count**, which is why this happens inside the
+        // `with_hopper` closure rather than above it: `waves` -- and through `waves` the tile choice,
+        // persistence and the cluster's amortization term -- is a function of `sm_count`, so a bench
+        // that asked at a hardcoded 132 would measure the H100 SXM5's verdicts on an H100 PCIe's 114
+        // SMs. `HOPPER_SM_COUNT` remains what the device-free laws pin, and nothing else.
         with_hopper(bench, WGMMA_BENCH_INVOCATION, |g, _lic| {
             // --- 0. the peer, before anything else that costs time -----------------------------
             if !crate::baselines::peers_available(g) {
@@ -20382,6 +20396,41 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                     crate::baselines::peer_env_hint()
                 );
                 return;
+            }
+            let sm_count = g.target().sm_count_usize();
+            let select = |m: usize, n: usize, k: usize| {
+                crate::ptx_wgmma::wgmma_dispatch_dtype(dtype, m, n, k, sm_count)
+            };
+            let mut cfgs: Vec<&'static crate::ptx_wgmma::WgmmaCfg> = Vec::new();
+            let mut declined: Vec<(&'static str, String)> = Vec::new();
+            for p in WGMMA_BENCH_GRID {
+                match select(p.m, p.n, p.k) {
+                    Ok(c) => {
+                        if !cfgs.iter().any(|x| x.key == c.key) {
+                            cfgs.push(c);
+                        }
+                    }
+                    Err(why) => declined.push((p.label, why)),
+                }
+            }
+            assert!(
+                !cfgs.is_empty(),
+                "{bench}: the shipped rule declines EVERY benched shape at {dtype:?} on \
+                 {sm_count} SMs, so this round would time nothing and report `ok`: {declined:?}"
+            );
+            let arm_b_label: String = if cfgs.len() == 1 {
+                cfgs[0].name.to_string()
+            } else {
+                format!(
+                    "the shipped rule, per shape ({})",
+                    cfgs.iter().map(|c| c.name).collect::<Vec<_>>().join(" | ")
+                )
+            };
+            for (label, why) in &declined {
+                eprintln!(
+                    "*** {bench}: the shipped rule DECLINES at {label} on {sm_count} SMs, so this \
+                     shape publishes nothing (it is NOT measured on a fallback):\n***   {why}"
+                );
             }
 
             // --- 1. provenance, emitted by the harness (plan 6.1) -------------------------------
@@ -20448,7 +20497,10 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                      bit-identical."
                 );
                 // Every DISTINCT config the rule selects over this grid is guarded before any of
-                // them is timed -- a rule with two arms and one guarded arm is half a floor.
+                // them is timed -- a rule with five arms and one guarded arm is a fifth of a floor.
+                // The promoted per-shape rule returns FIVE distinct configurations over this grid
+                // (the narrow tile, the un-clustered one-tile row, persistence alone, persistence +
+                // cluster, and all three levers), where the retired size-keyed rule returned two.
                 for c in &cfgs {
                     let lanes = wgmma_pretiming_guard(g, c, c.name);
                     eprintln!(
@@ -20458,8 +20510,18 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 }
                 // The peer, through the SAME reference, once: a transpose slip in the bar would
                 // hand every shape a win (or a loss) it did not earn.
-                let gs = crate::ptx_wgmma::guard_shape(cfgs[0]);
-                let (a, b) = bringup_operands(gs.m, gs.n, gs.k, cfgs[0].dtype);
+                //
+                // On the WIDEST selected tile's guard shape, not on `cfgs[0]`'s. The guard shape is
+                // derived from the config (3x3 CTAs of that tile), so `cfgs[0]` is whatever the FIRST
+                // grid row selects -- which under the promoted rule is `sq1024`'s 128x64 arm, i.e.
+                // the smallest guard shape of the five. Checking the bar on the largest one keeps the
+                // check as strong as it was before the rule could pick a narrow tile.
+                let widest = cfgs
+                    .iter()
+                    .max_by_key(|c| c.bm * c.bn)
+                    .expect("cfgs is non-empty");
+                let gs = crate::ptx_wgmma::guard_shape(widest);
+                let (a, b) = bringup_operands(gs.m, gs.n, gs.k, widest.dtype);
                 let want = ref_nt(&a, &b, gs.m, gs.k, gs.n);
                 let pg = (peer.once)(g, &a, &b, gs.m, gs.k, gs.n)
                     .unwrap_or_else(|e| panic!("{bench}: {} one-shot failed: {e}", peer.label));
@@ -20494,7 +20556,12 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             );
             let mut rows: Vec<(&crate::ptx_wgmma::GemmPoint, bi::BenchVerdict, usize)> = Vec::new();
             for p in WGMMA_BENCH_GRID {
-                let cfg = select(p.m, p.n);
+                let cfg = match select(p.m, p.n, p.k) {
+                    Ok(c) => c,
+                    // Already printed above, with the plan that wanted it. Skipping keeps the shape
+                    // out of the published table entirely, which is the honest product of a decline.
+                    Err(_) => continue,
+                };
                 let iters = bench_iters(p);
                 let label = format!("{bench}@{}", p.label);
                 eprintln!(
@@ -21214,24 +21281,43 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                 ),
             }
 
-            // --- 6c. what the family SHIPS, per shape --------------------------------------------
+            // --- 6c. what the family SHIPS, per shape, at BOTH dtypes ----------------------------
+            //
+            // The rule became the dispatcher on 2026-08-12, so this section is no longer a second
+            // rule printed beside it -- it is the SAME function, resolved to each dtype's module
+            // table, which is the only thing that differs between them. Printing both columns is
+            // what makes an f16/bf16 desync visible in the round log rather than only in a law: a
+            // missing bf16 twin reads as a DECLINE here, and a decline routes a real offload to the
+            // pre-Hopper launcher at the old speed.
+            //
+            // **At the PROBED SM count, not at `HOPPER_SM_COUNT`.** `waves` -- and through it the
+            // tile choice, persistence and the cluster's amortization term -- is a function of
+            // `sm_count`, so a log that printed the rule's verdicts at a hardcoded 132 would be
+            // describing an H100 SXM5 while the container might be a 114-SM PCIe part. The
+            // device-free laws pin 132 because that is the part the derivation was done on; a round
+            // asks the device.
+            let sm_count = g.target().sm_count_usize();
             eprintln!(
-                "\n---- {BENCH}: the shipped regime rule (ptx_wgmma::wgmma_w1_for) ----\n  \
-                 A static two-way split on round 3's one measured sign change, AWAITING WAVE 3's \
-                 real per-shape\n  dispatcher (which will also choose the TILE -- this rule only \
-                 ever returns a 128x256 row). Both\n  arms stay in the table above, so the next \
-                 round re-measures the split instead of inheriting it."
+                "\n---- {BENCH}: what the family SHIPS, per shape and dtype \
+                 (ptx_wgmma::wgmma_dispatch_dtype at the PROBED {sm_count} SMs) ----"
             );
             for p in &points {
+                let name = |dt| match crate::ptx_wgmma::wgmma_dispatch_dtype(
+                    dt, p.m, p.n, p.k, sm_count,
+                ) {
+                    Ok(c) => c.name.to_string(),
+                    Err(why) => format!("DECLINES: {why}"),
+                };
                 eprintln!(
-                    "  {:<14} M*N = {:>12}  ->  {}",
+                    "  {:<14} f16  {}\n  {:<14} bf16 {}",
                     p.label,
-                    p.m * p.n,
-                    crate::ptx_wgmma::wgmma_w1_for(p.m, p.n).name
+                    name(crate::ptx_wgmma::WgmmaDtype::F16),
+                    "",
+                    name(crate::ptx_wgmma::WgmmaDtype::Bf16)
                 );
             }
 
-            // --- 6d. WAVE 3's per-shape dispatcher, and what it picks HERE -----------------------
+            // --- 6d. the rule itself, and what it picks HERE -------------------------------------
             //
             // The rule is printed by `wgmma_dispatch_rule_text`, NOT restated here: this header
             // once described the pre-`6a33b6d` predicate ("the L2-roof fraction ... clears 0.78")
@@ -21239,27 +21325,19 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
             // contradicted the line beneath it at the one shape the tile lever exists for. One
             // spelling, interpolated from the dispatcher's own constants.
             eprintln!(
-                "\n---- {BENCH}: WAVE 3's per-shape dispatcher (ptx_wgmma::wgmma_dispatch) ----\n  \
-                 {}\n  Each verdict below is measured by the row named beside it, at this shape, \
-                 with its own control\n  (the_dispatcher_verdict_is_pinned_at_every_benched_shape \
-                 and every_shape_the_dispatcher_selects_is_measured_at_that_shape\n  are the \
-                 device-free laws).",
+                "\n---- {BENCH}: THE SHIPPED RULE (ptx_wgmma::wgmma_dispatch_dtype), and its \
+                 reasoning ----\n  {}\n  Each verdict below is measured by the row named beside it, \
+                 at this shape, with its own control\n  \
+                 (the_dispatcher_verdict_is_pinned_at_every_benched_shape and \
+                 every_shape_the_dispatcher_selects_is_measured_at_that_shape\n  are the device-free \
+                 laws; the_shipped_rule_selects_the_arm_the_round_measured_best scores it against \
+                 the\n  2026-08-12 round's own ranking).",
                 crate::ptx_wgmma::wgmma_dispatch_rule_text()
             );
             for p in &points {
-                let plan = crate::ptx_wgmma::wgmma_dispatch_plan(
-                    p.m,
-                    p.n,
-                    p.k,
-                    crate::ptx_wgmma::HOPPER_SM_COUNT,
-                );
+                let plan = crate::ptx_wgmma::wgmma_dispatch_plan(p.m, p.n, p.k, sm_count);
                 eprintln!("  {:<14} {}", p.label, plan.summary());
-                match crate::ptx_wgmma::wgmma_dispatch(
-                    p.m,
-                    p.n,
-                    p.k,
-                    crate::ptx_wgmma::HOPPER_SM_COUNT,
-                ) {
+                match crate::ptx_wgmma::wgmma_dispatch(p.m, p.n, p.k, sm_count) {
                     Ok(c) => {
                         let row = WGMMA_SWEEP_GRID
                             .iter()
@@ -21279,7 +21357,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
                         p.m,
                         p.n,
                         p.k,
-                        crate::ptx_wgmma::HOPPER_SM_COUNT,
+                        sm_count,
                         Some(false),
                     );
                     eprintln!(
@@ -21677,8 +21755,8 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
         });
     }
 
-    /// **Act 2, item 8 (f16): the SHIPPED rule (`wgmma_w1_for`, per shape) against cuBLAS on D1
-    /// §4.4's grid.**
+    /// **Act 2, item 8 (f16): the SHIPPED rule (`ptx_wgmma::wgmma_dispatch_dtype`, per shape) against
+    /// cuBLAS on D1 §4.4's grid.**
     ///
     /// D1 §4.5 predicts this row at **95–108% of cuBLAS at 4096³–8192³** — the single number the
     /// whole Act-2 business case rests on, and the one thing the bring-up round deliberately did not
@@ -21696,7 +21774,7 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     fn wgmma_vs_cublas() {
         wgmma_peer_round(
             "wgmma_vs_cublas",
-            crate::ptx_wgmma::wgmma_w1_for,
+            crate::ptx_wgmma::WgmmaDtype::F16,
             PeerBar {
                 label: "cuBLAS f16 (f32 out)",
                 once: crate::baselines::cublas_gemm_nt_f16_f32out,
@@ -21718,13 +21796,15 @@ extern "C" __global__ void wmma_probe(const __half* a, const __half* b, float* c
     #[test]
     #[ignore = "Act-2 perf round; Hopper + cuBLAS; run explicitly (ptx_wgmma::WGMMA_BENCH_INVOCATION)"]
     fn wgmma_bf16_vs_cublas() {
-        // The bf16 shipped rule: the f16 split's threshold transferred on traffic arithmetic
-        // (equal 2-byte elements, identical tiles and I_cta), re-measured by this bench every
-        // round. The 2026-08-11 scalar-bf16 round (65.1/67.5/56.1% at the squares, within a point
-        // or two of f16's pre-lever numbers) is what licensed the transfer.
+        // The bf16 shipped rule is the SAME rule: one dispatcher, whose every comparand is a tile
+        // count or a byte count at a fixed 2-byte element, resolved to the bf16 module table
+        // (`ptx_wgmma::the_f16_and_bf16_rules_select_structurally_corresponding_arms` is the law).
+        // This bench re-measures the transfer every round rather than trusting it; the 2026-08-11
+        // scalar-bf16 round (65.1/67.5/56.1% at the squares, within a point or two of f16's
+        // pre-lever numbers) is what licensed it in the first place.
         wgmma_peer_round(
             "wgmma_bf16_vs_cublas",
-            crate::ptx_wgmma::wgmma_w1_bf16_for,
+            crate::ptx_wgmma::WgmmaDtype::Bf16,
             PeerBar {
                 label: "cuBLAS bf16 (f32 out)",
                 once: crate::baselines::cublas_gemm_nt_bf16_f32out,

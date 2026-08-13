@@ -2299,22 +2299,30 @@ mod gpu_e2e_tests {
     /// without it a run where `gemm_nt_wgmma` declined at launch (an unencodable tensor map, a
     /// `wgmma_module` `UNSUPPORTED`) passes every assertion while measuring `gpu::gemm_nt`.
     ///
-    /// Three shapes, one per property, and they live in [`gpu_accel::HOPPER_GATE_SHAPES`] because
-    /// `gpu_accel::tests::the_hopper_gate_shapes_reach_both_regime_arms` checks *on this laptop* what
-    /// they are chosen for. `256x1024x512` is a whole 128×256 tile grid. `130x1032x258` is ragged in
-    /// M, N **and** K at once, which is what proves the driver seam did not quietly need an alignment
-    /// gate (the `m%64/n%64/k%16` rule in `sgemm_nt_epi` is a *wmma* constraint — wgmma predicates its
-    /// own edge). `4096x256x2048` has `M*N = 8_388_608` output elements, just past
-    /// `ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS`, so it is the only one that makes the config seam
-    /// return the **clustered** row and the launch carry a `1x2x1` cluster attribute — the arm a
-    /// small-shape-only gate would leave entirely unexercised from the driver side, and a *launch*
-    /// failure rather than a wrong number if it were ever mismatched.
+    /// Four shapes, and they live in [`gpu_accel::HOPPER_GATE_SHAPES`] because
+    /// `gpu_accel::tests::the_hopper_gate_shapes_reach_every_launch_mechanism_the_rule_can_select`
+    /// checks *on this laptop* what they are chosen for — **against the rule itself, never against a
+    /// threshold**, which is what let the previous list rot: its clustered shape was chosen because
+    /// `M * N` crossed the retired 8e6 split, and the 2026-08-12 promotion sends that shape to the
+    /// un-clustered persistent arm instead.
     ///
-    /// Every `N` here is EVEN on purpose, and it is not a raggedness choice: both shipped rows carry
-    /// the `st.global.v2.f32` epilogue, whose 8-byte pair is aligned only when `N` is, so an odd `N`
-    /// is a *sticky* `CUDA_ERROR_MISALIGNED_ADDRESS` rather than a wrong number. The driver declines
-    /// it (`wgmma_declines`) and a device-free unit test pins that; putting an odd `N` in this gate
-    /// would only prove the decline works by never reaching the kernel.
+    /// `256x1024x512` is a whole tile grid (and, under the promoted rule, the NARROW 128×64 tile,
+    /// whose `m64n64k16` mainloop is its own). `130x1032x258` is ragged in M, N **and** K at once,
+    /// which is what proves the driver seam did not quietly need an alignment gate (the
+    /// `m%64/n%64/k%16` rule in `sgemm_nt_epi` is a *wmma* constraint — wgmma predicates its own
+    /// edge). `4096x256x2048` is 2 waves at 0.970 wave efficiency with the floor dominating, so it
+    /// reaches the PERSISTENT tile loop, where a `%kt` that is not reset per tile makes tile 2
+    /// accumulate into tile 1 — an exact integer, and invisible to any one-tile-per-CTA gate.
+    /// `2048x4096x4096` is 2 waves at `f_L2 = 0.955`, so both cluster terms pass and it is the only
+    /// shape that makes the seam return a **clustered** row: the launch then carries a `1x2x1` cluster
+    /// attribute, and a compiled cluster requirement the launch does not match is a *launch failure*
+    /// rather than a wrong number.
+    ///
+    /// Every `N` here is EVEN on purpose, and it is not a raggedness choice: every arm the rule can
+    /// select carries the `st.global.v2.f32` epilogue, whose 8-byte pair is aligned only when `N` is,
+    /// so an odd `N` is a *sticky* `CUDA_ERROR_MISALIGNED_ADDRESS` rather than a wrong number. The
+    /// driver declines it (`wgmma_declines`) and a device-free unit test pins that; putting an odd `N`
+    /// in this gate would only prove the decline works by never reaching the kernel.
     #[test]
     fn gpu_backend_linear_routes_through_wgmma_on_hopper() {
         const NAME: &str = "gpu_backend_linear_routes_through_wgmma_on_hopper";

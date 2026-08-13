@@ -158,7 +158,24 @@ impl<'g> GpuAccel<'g> {
             ));
             return None;
         }
-        let cfg = wgmma_cfg_for(WGMMA_F32_SEAM_DTYPE, m, n);
+        // The shipped rule, at the PROBED SM count. A decline is a routing fact, not an error: the
+        // rule refuses to name a module it does not have rather than substituting a nearby one, and
+        // this seam's answer to a refusal is the launcher every pre-Hopper device has always used.
+        let cfg = match wgmma_cfg_for(
+            WGMMA_F32_SEAM_DTYPE,
+            m,
+            k,
+            n,
+            self.gpu.target().sm_count_usize(),
+        ) {
+            Ok(c) => c,
+            Err(why) => {
+                route_log(format_args!(
+                    "{m}x{k}x{n}: Existing (the rule declines: {why})"
+                ));
+                return None;
+            }
+        };
         // The launcher's own preconditions are asserts; decide them here so a shape it would abort on
         // simply takes the other path.
         if let Some(why) = wgmma_declines(cfg, m, k, n, self.gpu.smem_budget()) {
@@ -334,43 +351,86 @@ pub(crate) fn gemm_route_for(cc: (i32, i32), wgmma_off: bool) -> GemmRoute {
     GemmRoute::Wgmma
 }
 
-/// **THE CONFIG SEAM. One function, and wave 3's per-shape dispatcher replaces exactly it.**
+/// **THE CONFIG SEAM. One function, and it delegates to the shipped rule rather than re-deriving.**
 ///
-/// Today it is a delegation to the shipped regime rule in the generator crate
-/// ([`ptx_wgmma::wgmma_w1_for`] / [`ptx_wgmma::wgmma_w1_bf16_for`]: the 1×2×1 B-multicast `v2`-store
-/// row at or above 8e6 output elements, the un-clustered `v2` row below it), and it delegates rather
-/// than re-deriving so the driver can never dispatch on a threshold the generator has since
-/// re-measured. When wave 3 lands the per-shape dispatcher — which also chooses the *tile*, something
-/// this rule structurally cannot express because both arms are 128×256 — the body of this function is
-/// the one place that changes.
+/// Since 2026-08-12 the shipped rule IS wave 3's per-shape dispatcher
+/// ([`ptx_wgmma::wgmma_dispatch_dtype`]), which chooses the CTA tile, the cluster, the raster and the
+/// schedule from `(M, N, K)` and the **probed** SM count. It replaced a static two-way split on
+/// `M * N` (`wgmma_w1_for`, threshold 8e6) that could only ever return a 128x256 row, and that the
+/// 2026-08-12 H100 visit measured as the losing configuration on 4 of 7 shapes.
+///
+/// # Three things changed about this seam's contract, and each is load-bearing
+///
+/// - **It reads `K`.** The cluster's benefit term is an L2-traffic fraction and `T_L2` is linear in
+///   `K`, so a rule that could not see `K` was guessing. Two shapes with identical `M * N` take
+///   opposite verdicts (`gpt_d1024_up` and `sq4096`, both 16.8e6 output elements, cluster off and on).
+/// - **It reads the probed `sm_count`.** `waves = ceil(tiles / sm_count)` decides the tile (wave
+///   fill), persistence, and the cluster's amortization term. An H100 PCIe part has 114 SMs against
+///   the SXM5's 132, and a hardcoded 132 would ship the SXM5's verdicts on it.
+/// - **It can DECLINE.** [`ptx_wgmma::wgmma_dispatch_dtype`] returns `Err` when the verdict names a
+///   configuration no module carries, because a dispatcher that fell back to a nearby one is how a
+///   round publishes a configuration that never ran. Here that `Err` is a **routing** fact:
+///   [`GpuAccel::try_gemm_nt_wgmma`] logs it and takes [`GemmRoute::Existing`], which is the same
+///   answer every other decline in this file gives and is counted by the same witness.
+///
+/// The argument order is this file's `(m, k, n)`, the generator's is `(m, n, k)`, and
+/// [`tests::the_config_seam_delegates_to_the_shipped_rule`] pins the mapping at shapes where all
+/// three extents differ - a silent transposition here would dispatch the whole product surface on
+/// the wrong shape.
 /// `pub(crate)` for `gpu_e2e_bench`: the end-to-end round's direct-launch arm must launch the config
 /// **this seam would have chosen**, not one it re-derives, or the arm it calls "the kernel the route
 /// runs" is a different kernel and the retention ratio is measuring two variables at once.
-pub(crate) fn wgmma_cfg_for(dtype: WgmmaDtype, m: usize, n: usize) -> &'static WgmmaCfg {
-    match dtype {
-        WgmmaDtype::F16 => ptx_wgmma::wgmma_w1_for(m, n),
-        WgmmaDtype::Bf16 => ptx_wgmma::wgmma_w1_bf16_for(m, n),
-    }
+pub(crate) fn wgmma_cfg_for(
+    dtype: WgmmaDtype,
+    m: usize,
+    k: usize,
+    n: usize,
+    sm_count: usize,
+) -> Result<&'static WgmmaCfg, String> {
+    ptx_wgmma::wgmma_dispatch_dtype(dtype, m, n, k, sm_count)
 }
 
 /// **The shapes the Hopper end-to-end gate runs, shared so it and the device-free law below cannot
 /// drift.**
 ///
 /// `gpu_backend_linear_routes_through_wgmma_on_hopper` (driver `lib.rs`) can only reach the launch
-/// on rented silicon — everywhere else it capability-`[skip]`s — and a claim in its doc comment — "this one crosses the cluster threshold, so it is the
-/// only shape that exercises the clustered launch" — is exactly the kind of statement that rots
-/// silently when the threshold moves. [`tests::the_hopper_gate_shapes_reach_both_regime_arms`] checks
-/// that claim **here**, on this laptop, against
-/// [`ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS`] itself rather than a copy of its value; both the gate
-/// and the law read this one list.
+/// on rented silicon — everywhere else it capability-`[skip]`s — and a claim like "this one crosses
+/// the cluster threshold, so it is the only shape that exercises the clustered launch" is exactly the
+/// kind of statement that rots silently when the rule moves. It DID rot: the 2026-08-12 promotion
+/// replaced the `M * N` split with the per-shape dispatcher, and under the new rule the shape that
+/// used to be the clustered one (`4096x256x2048`) is un-clustered and persistent instead.
+/// [`tests::the_hopper_gate_shapes_reach_every_launch_mechanism_the_rule_can_select`] checks the
+/// coverage claim **here**, on this laptop, against the rule itself rather than against any copy of a
+/// threshold; both the gate and the law read this one list.
+///
+/// Shapes are `(m, k, n)`, this file's order.
 #[cfg(test)]
-pub(crate) const HOPPER_GATE_SHAPES: [(usize, usize, usize); 3] = [
-    // A whole tile grid: 2 tiles of M x 2 of N, nothing ragged.
+pub(crate) const HOPPER_GATE_SHAPES: [(usize, usize, usize); 4] = [
+    // A whole tile grid: nothing ragged. Under the promoted rule its wave fill is far under the 0.90
+    // floor, so it reaches the NARROW 128x64 tile — the arm with a different `m64n64k16` mainloop.
     (256, 1024, 512),
     // Ragged in M, N **and** K at once — the shape that proves the seam needs no alignment gate.
+    // Also narrow-tile, and also one wave.
     (130, 1032, 258),
-    // M*N = 8_388_608, just past the cluster threshold: the only one that returns the CLUSTERED row.
+    // 256 tiles on 132 SMs = 2 waves at 0.970 wave efficiency, and `f_L2 = 0.206` (K is only 256, so
+    // the floor dominates): the PERSISTENT, un-clustered arm. This is the shape that used to be the
+    // clustered one under the retired `M * N >= 8e6` rule, and it now covers the tile-loop launch
+    // mechanism instead — `%nctaid.x`-strided grid, one `mov.u32 %kt,0` per role, the `CTILE`/`CNEXT`
+    // loop.
     (4096, 256, 2048),
+    // 256 tiles = 2 waves, `f_L2 = 0.955`, so BOTH cluster terms pass: the CLUSTERED **and**
+    // persistent arm, which is the only combination that compiles `.reqnctapercluster` into the entry
+    // AND runs a cluster-indexed tile loop. A launch whose grid does not match a compiled cluster
+    // requirement is a launch FAILURE, not a wrong number, so this arm has a mechanism the other
+    // three do not and the gate would look complete without it.
+    //
+    // It is the cheapest shape that reaches it: 2 waves needs > 132 tiles at 128x256 and 0.90 wave
+    // efficiency needs >= 238, while `f_L2 >= 0.78` needs `K >= ~2200` at that tile count. 42.9 GFLOP
+    // of CPU reference is the price of covering the arm. The multicast's own exactness (including the
+    // odd-M-tile pad CTA, at both the linear and rastered tile maps) is gated in the generator crate
+    // by `gpu::tests::wgmma_cluster_multicast_is_exact`, whose rows already include both persistent
+    // clustered arms — so this shape's job is the ROUTE and the launch, not the slicing.
+    (2048, 4096, 4096),
 ];
 
 /// **The one invocation that runs the Hopper end-to-end gate, pinned where a law can check it.**
@@ -736,7 +796,7 @@ pub(crate) fn wgmma_declines(
     // GPU call in the process fails identically (the generator states this at `EpilogueStore::V2`).
     //
     // It is checked here and not merely inherited because `gemm_nt_wgmma` — unlike its timing
-    // sibling `time_gemm_nt_wgmma_in`, which asserts it — does NOT guard it, and both arms
+    // sibling `time_gemm_nt_wgmma_in`, which asserts it — does NOT guard it, and every arm
     // `wgmma_cfg_for` can return carry the v2 store. Without this line the first `.wk` matmul with
     // an odd N on a Hopper part poisons the process.
     if cfg.epilogue.requires_even_n() && !n.is_multiple_of(2) {
@@ -953,6 +1013,17 @@ mod tests {
     const H100_SMEM: usize = 232_448;
     /// The same attribute on this repo's RTX 4050, for the budget decline.
     const ADA_4050_SMEM: usize = 101_376;
+    /// `MULTIPROCESSOR_COUNT` on the H100 SXM5 this campaign rents — the value the *device-free* laws
+    /// evaluate the shipped rule at, and the one every wave-3 verdict was derived on. The product
+    /// path never uses it: [`GpuAccel::try_gemm_nt_wgmma`] passes `target().sm_count_usize()`.
+    const H100_SMS: usize = ptx_wgmma::HOPPER_SM_COUNT;
+
+    /// The seam's config for a shape, or a panic naming the decline — for the probes below, whose
+    /// subject is [`wgmma_declines`] rather than the rule.
+    fn seam_cfg(dtype: WgmmaDtype, m: usize, k: usize, n: usize) -> &'static WgmmaCfg {
+        wgmma_cfg_for(dtype, m, k, n, H100_SMS)
+            .unwrap_or_else(|e| panic!("the seam must resolve {m}x{k}x{n} at {dtype:?}: {e}"))
+    }
 
     /// The gate must cover exactly the three op codes `gpu::norm` has PTX entries for. The two the
     /// recognizer also emits (LOGSOFTMAX=3, L2NORM=4) reach `panic!` inside `gpu::norm`, so they
@@ -1018,7 +1089,7 @@ mod tests {
         // Hopper is eligible at every shape...
         assert_eq!(gemm_route_for((9, 0), false), GemmRoute::Wgmma);
         // ...including ones the seam then declines, which is the whole gap.
-        let cfg = wgmma_cfg_for(WGMMA_F32_SEAM_DTYPE, 64, 64);
+        let cfg = seam_cfg(WGMMA_F32_SEAM_DTYPE, 64, 64, 64);
         for &(m, k, n) in &[(64usize, 100usize, 64usize), (64, 64, 63)] {
             assert!(
                 wgmma_declines(cfg, m, k, n, H100_SMEM).is_some(),
@@ -1127,7 +1198,7 @@ mod tests {
         }
 
         // And it is a DATA decline, not a shape one: the shape these values ride on is fine.
-        let cfg = wgmma_cfg_for(WGMMA_F32_SEAM_DTYPE, 64, 64);
+        let cfg = seam_cfg(WGMMA_F32_SEAM_DTYPE, 64, 64, 64);
         assert!(wgmma_declines(cfg, 64, 64, 64, H100_SMEM).is_none());
     }
 
@@ -1239,7 +1310,7 @@ mod tests {
         );
 
         // And a DATA decline, not a shape one: this shape is fine.
-        let cfg = wgmma_cfg_for(WGMMA_F32_SEAM_DTYPE, 64, 64);
+        let cfg = seam_cfg(WGMMA_F32_SEAM_DTYPE, 64, 64, 64);
         assert!(wgmma_declines(cfg, 64, 64, 64, H100_SMEM).is_none());
     }
 
@@ -1304,7 +1375,7 @@ mod tests {
             wgmma_declines_operand_range(WgmmaDtype::F16, &loud, &b, K).is_none(),
             "the control must not decline, or this test proves nothing about the quiet row"
         );
-        let cfg = wgmma_cfg_for(WGMMA_F32_SEAM_DTYPE, M, N);
+        let cfg = seam_cfg(WGMMA_F32_SEAM_DTYPE, M, K, N);
         assert!(
             wgmma_declines(cfg, M, K, N, H100_SMEM).is_none(),
             "M={M} K={K} N={N} is accepted by every shape decline, so this reproducer really does \
@@ -1401,29 +1472,64 @@ mod tests {
         }
     }
 
-    /// The seam **delegates**; it does not re-derive. Pointer identity, because the regime rule
-    /// returns `&'static` rows: a driver-side copy of the 8e6-element threshold would keep dispatching
-    /// on it after the generator re-measured it.
+    /// The seam **delegates**; it does not re-derive. Pointer identity, because the rule returns
+    /// `&'static` rows: a driver-side copy of any threshold would keep dispatching on it after the
+    /// generator re-measured it — which is exactly what happened between the wave-3 merge and the
+    /// 2026-08-12 promotion, one level up.
+    ///
+    /// **The argument order is the test's real subject.** This file spells shapes `(m, k, n)` and the
+    /// generator spells them `(m, n, k)`, so the shapes below have three DISTINCT extents and one is
+    /// deliberately a shape whose verdict changes under transposition: `4096x1024x4096` (`m,k,n`) is
+    /// `gpt_d1024_down` and takes the un-clustered one-tile row, while feeding the same numbers in
+    /// the wrong order asks about `4096x4096x1024` = `gpt_d1024_up`, which is persistent. A silent
+    /// swap here would mis-dispatch the entire product surface and no other test in the tree would
+    /// see it.
     #[test]
-    fn the_config_seam_delegates_to_the_shipped_regime_rule() {
-        for &(m, n) in &[(1usize, 1usize), (2048, 2048), (4096, 4096), (8192, 8192)] {
-            assert!(
-                std::ptr::eq(
-                    wgmma_cfg_for(WgmmaDtype::F16, m, n),
-                    ptx_wgmma::wgmma_w1_for(m, n)
-                ),
-                "f16 {m}x{n}"
-            );
-            assert!(
-                std::ptr::eq(
-                    wgmma_cfg_for(WgmmaDtype::Bf16, m, n),
-                    ptx_wgmma::wgmma_w1_bf16_for(m, n)
-                ),
-                "bf16 {m}x{n}"
-            );
+    fn the_config_seam_delegates_to_the_shipped_rule() {
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (2048, 2048, 2048),
+            (4096, 4096, 4096),
+            (8192, 8192, 8192),
+            // The transposition probes: all three extents differ, and the two orders disagree.
+            (4096, 4096, 1024),
+            (4096, 1024, 4096),
+            (1024, 2048, 4096),
+        ] {
+            for dtype in [WgmmaDtype::F16, WgmmaDtype::Bf16] {
+                let seam = wgmma_cfg_for(dtype, m, k, n, H100_SMS);
+                let rule = ptx_wgmma::wgmma_dispatch_dtype(dtype, m, n, k, H100_SMS);
+                match (seam, rule) {
+                    (Ok(s), Ok(r)) => assert!(
+                        std::ptr::eq(s, r),
+                        "{dtype:?} {m}x{k}x{n}: the seam selects {} and the rule selects {}",
+                        s.name,
+                        r.name
+                    ),
+                    (Err(a), Err(b)) => assert_eq!(a, b, "{dtype:?} {m}x{k}x{n}"),
+                    (a, b) => panic!("{dtype:?} {m}x{k}x{n}: seam {a:?} vs rule {b:?}"),
+                }
+            }
         }
+        // The transposition really is observable at that pair, or the probe above is decoration.
+        let down = wgmma_cfg_for(WgmmaDtype::F16, 4096, 4096, 1024, H100_SMS).unwrap();
+        let up = wgmma_cfg_for(WgmmaDtype::F16, 4096, 1024, 4096, H100_SMS).unwrap();
+        assert_ne!(
+            down.key, up.key,
+            "gpt_d1024_down and gpt_d1024_up must take different arms, or the (m,k,n)/(m,n,k) probe \
+             cannot see a swap"
+        );
         // And the seam's f16 arm is what the f32 offload actually asks for.
         assert_eq!(WGMMA_F32_SEAM_DTYPE, WgmmaDtype::F16);
+        // The seam reads the PROBED SM count, and it is load-bearing: the same shape on a 132-SM
+        // SXM5 and a 20-SM laptop-class part takes different arms, because `waves` decides the tile,
+        // persistence and the cluster's amortization term.
+        let sxm5 = wgmma_cfg_for(WgmmaDtype::F16, 4096, 4096, 4096, 132).unwrap();
+        let small = wgmma_cfg_for(WgmmaDtype::F16, 4096, 4096, 4096, 20).unwrap();
+        assert_ne!(
+            sxm5.key, small.key,
+            "a hardcoded SM count would be invisible unless some shape's verdict depends on it"
+        );
     }
 
     /// **The whole route, up to the launch, on a laptop that cannot launch it.**
@@ -1434,24 +1540,33 @@ mod tests {
     /// Hopper is the launch itself, and this asserts the rest at `cargo test` speed for the three
     /// shapes `gpu_backend_linear_routes_through_wgmma_on_hopper` will run there.
     ///
-    /// # What it is really guarding: the H100 gate covering only ONE regime arm and nobody noticing
+    /// # What it is really guarding: the H100 gate covering only ONE launch mechanism and nobody noticing
     ///
-    /// [`wgmma_cfg_for`] is a two-arm regime rule split at
-    /// [`ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS`], and the two arms are **not** interchangeable at the
-    /// launch: the clustered row compiles `.reqnctapercluster` into the entry, and a compiled cluster
-    /// requirement the launch does not match is a *launch failure*, not a wrong number. A device gate
-    /// whose shapes all sat below the threshold would therefore prove nothing about the arm that has
-    /// the extra launch mechanism, while looking complete. Asserting the coverage against the
-    /// generator's own constant — never a copy of `8_000_000` — means a re-measured threshold breaks
-    /// this test on this laptop instead of quietly narrowing a rented-silicon round.
+    /// The rule's arms are **not** interchangeable at the launch. The clustered row compiles
+    /// `.reqnctapercluster` into the entry, and a compiled cluster requirement the launch does not
+    /// match is a *launch failure*, not a wrong number. The persistent row runs a `%nctaid.x`-strided
+    /// tile loop whose `%kt` reset is the difference between tile 2 accumulating into tile 1 and not.
+    /// The narrow row has its own `m64n64k16` mainloop. A device gate whose shapes all landed on one
+    /// of them would prove nothing about the others while looking complete — which is what happened:
+    /// this list's third shape was chosen because `M * N` crossed the retired 8e6 threshold, and the
+    /// promoted rule sends it to the un-clustered persistent arm instead.
+    ///
+    /// So the coverage claim is stated against the RULE rather than against any threshold: the four
+    /// shapes must between them reach the narrow tile, the persistent tile loop and the clustered
+    /// launch, and the claim is checked here, on a laptop, at `cargo test` speed.
     #[test]
-    fn the_hopper_gate_shapes_reach_both_regime_arms() {
-        let mut clustered = 0usize;
+    fn the_hopper_gate_shapes_reach_every_launch_mechanism_the_rule_can_select() {
+        let (mut narrow, mut persistent, mut clustered, mut one_tile) = (0, 0, 0, 0);
         for &(m, k, n) in &HOPPER_GATE_SHAPES {
             // Both dtypes: the f32 seam asks for f16 today, and `wgmma_cfg_for` already routes bf16
             // for the day the lowp `nt_epi` symbols get an `Accelerator` hook (dossier §5.4 gap 3).
             for dtype in [WgmmaDtype::F16, WgmmaDtype::Bf16] {
-                let cfg = wgmma_cfg_for(dtype, m, n);
+                let cfg = wgmma_cfg_for(dtype, m, k, n, H100_SMS).unwrap_or_else(|e| {
+                    panic!(
+                        "{dtype:?} {m}x{k}x{n}: the Hopper gate's own shape makes the shipped rule \
+                         DECLINE, so that gate would silently measure the pre-Hopper launcher: {e}"
+                    )
+                });
                 assert!(
                     wgmma_declines(cfg, m, k, n, H100_SMEM).is_none(),
                     "{dtype:?} {m}x{k}x{n}: the Hopper gate's own shape declines, so that gate would \
@@ -1475,28 +1590,64 @@ mod tests {
                     plan.cluster
                 );
                 assert!(grid.0 >= 1 && grid.1 >= 1 && grid.2 >= 1);
-                // The regime split, stated against the generator's constant rather than its value.
-                let want_cluster = m * n >= ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS;
-                assert_eq!(
-                    plan.cluster_ctas() > 1,
-                    want_cluster,
-                    "{}: M*N = {} against the shipped threshold {}",
-                    cfg.name,
-                    m * n,
-                    ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS
-                );
-                if dtype == WGMMA_F32_SEAM_DTYPE && want_cluster {
-                    clustered += 1;
+                // The f16 column is the one the gate actually launches (the f32 seam's dtype); the
+                // bf16 column is asserted structurally identical by the generator's own mirror law,
+                // so counting one of them is counting the mechanism.
+                if dtype == WGMMA_F32_SEAM_DTYPE {
+                    if cfg.bn < 256 {
+                        narrow += 1;
+                    }
+                    if cfg.tiles.carries_ring() {
+                        persistent += 1;
+                    } else {
+                        one_tile += 1;
+                    }
+                    if plan.cluster_ctas() > 1 {
+                        clustered += 1;
+                    }
                 }
             }
         }
-        assert_eq!(
-            clustered,
-            1,
-            "exactly one Hopper gate shape must cross {} output elements — zero leaves the \
-             `.reqnctapercluster` launch arm untested on the device, and all three would leave the \
-             un-clustered arm untested",
-            ptx_wgmma::W1_CLUSTER_MIN_OUTPUT_ELEMS
+        for (what, n, why) in [
+            (
+                "the narrow 128x64 tile",
+                narrow,
+                "its m64n64k16 mainloop and 32-accumulator register budget are its own",
+            ),
+            (
+                "the persistent tile loop",
+                persistent,
+                "a %kt that is not reset per tile makes tile 2 accumulate into tile 1 -- an exact \
+                 integer, and invisible to a one-tile-per-CTA gate",
+            ),
+            (
+                "the clustered launch",
+                clustered,
+                "`.reqnctapercluster` is compiled into the entry, so a grid the launch does not match \
+                 is a launch FAILURE",
+            ),
+            (
+                "the one-tile-per-CTA schedule",
+                one_tile,
+                "the arm every pre-wave-3 round measured, and still the rule's answer at any \
+                 single-wave grid",
+            ),
+        ] {
+            assert!(
+                n >= 1,
+                "no Hopper gate shape reaches {what}, and it has a launch mechanism the others do \
+                 not: {why}"
+            );
+        }
+        // ...and the clustered shape is ALSO persistent, which is the combination that can hang:
+        // a CTA-indexed persistent loop under a cluster deadlocks on any tiles-mod-slots split
+        // (WAVE3_DOSSIER 2.6). One shape covering both is the point, not an accident.
+        let (m, k, n) = HOPPER_GATE_SHAPES[HOPPER_GATE_SHAPES.len() - 1];
+        let cfg = wgmma_cfg_for(WGMMA_F32_SEAM_DTYPE, m, k, n, H100_SMS).unwrap();
+        assert!(
+            cfg.launch_plan().cluster_ctas() > 1 && cfg.tiles.carries_ring(),
+            "the last gate shape must be clustered AND persistent: {}",
+            cfg.name
         );
     }
 
@@ -1794,25 +1945,49 @@ mod tests {
     /// The dossier's §5.3 row 2 turns `PARAM_ORDER` from a constant into `param_order()` the moment a
     /// bias pointer exists, and `LaunchPlan::params` becomes per-variant. The driver does not build
     /// the argument array — `gpu::gemm_nt_wgmma` does — so the driver would keep compiling and keep
-    /// dispatching while two configs it can return declared different signatures. Pinning "both arms
-    /// of the seam declare the same list, and it is the family's" makes that a failing test in this
-    /// file rather than a short argument array on rented silicon, which the driver does not report as
-    /// an error at all: it reads whatever follows on the host stack as the next pointer.
+    /// dispatching while two configs it can return declared different signatures. Pinning "**every**
+    /// arm of the seam declares the same list, and it is the family's" makes that a failing test in
+    /// this file rather than a short argument array on rented silicon, which the driver does not
+    /// report as an error at all: it reads whatever follows on the host stack as the next pointer.
+    ///
+    /// It says EVERY arm and not "both" because the 2026-08-12 promotion made the seam a per-shape
+    /// dispatcher: it can return three tile widths crossed with the cluster, the raster and the tile
+    /// loop, so a two-shape probe would leave most of the surface unchecked. The shape list below
+    /// spans all of it and the test asserts it did — a vacuous version of this law is one where the
+    /// distinct-config count silently falls to one.
     #[test]
-    fn both_seam_arms_declare_one_parameter_list() {
+    fn every_seam_arm_declares_one_parameter_list() {
+        let mut seen: Vec<&'static str> = Vec::new();
         for dtype in [WgmmaDtype::F16, WgmmaDtype::Bf16] {
-            let small = wgmma_cfg_for(dtype, 64, 64).launch_plan();
-            let large = wgmma_cfg_for(dtype, 4096, 4096).launch_plan();
-            assert_eq!(small.params, ptx_wgmma::PARAM_ORDER, "{}", small.entry);
-            assert_eq!(large.params, ptx_wgmma::PARAM_ORDER, "{}", large.entry);
+            for &(m, k, n) in &[
+                (64usize, 64usize, 64usize), // narrow tile, one wave
+                (1024, 1024, 1024),          // narrow tile, one wave, sq1024's geometry
+                (2048, 2048, 2048),          // widest tile, one wave, un-clustered
+                (4096, 4096, 1024),          // widest tile, one wave, un-clustered (the falsifier)
+                (4096, 1024, 4096),          // widest tile, multi-wave, persistent
+                (4096, 4096, 4096),          // widest tile, multi-wave, persistent + clustered
+                (4096, 4096, 16384),         // + the raster
+            ] {
+                let cfg = seam_cfg(dtype, m, k, n);
+                let plan = cfg.launch_plan();
+                assert_eq!(plan.params, ptx_wgmma::PARAM_ORDER, "{}", plan.entry);
+                if !seen.contains(&cfg.name) {
+                    seen.push(cfg.name);
+                }
+            }
         }
+        assert!(
+            seen.len() >= 8,
+            "the probe must span the arms the rule can actually return (two dtypes x at least four \
+             distinct configurations), or it checks one signature and calls it a law: {seen:?}"
+        );
     }
 
     /// Every `assert!` inside `gemm_nt_wgmma` must already be a `Some(..)` here, or the offload path
     /// aborts a user's program on a shape that had a working fallback.
     #[test]
     fn every_launcher_assert_is_a_driver_side_decline() {
-        let cfg = wgmma_cfg_for(WgmmaDtype::F16, 4096, 4096);
+        let cfg = seam_cfg(WgmmaDtype::F16, 4096, 4096, 4096);
 
         assert!(
             wgmma_declines(cfg, 4096, 4096, 4096, H100_SMEM).is_none(),
@@ -1829,12 +2004,12 @@ mod tests {
         }
 
         // **The one the launcher does not check.** `gemm_nt_wgmma` has no even-N assert (only its
-        // timing sibling does), and BOTH rows `wgmma_cfg_for` returns carry the v2 store, so an odd
+        // timing sibling does), and EVERY row `wgmma_cfg_for` can return carries the v2 store, so an odd
         // N reaching it is `CUDA_ERROR_MISALIGNED_ADDRESS` — which sticks to the context and fails
         // every later GPU call in the process, not just this one.
-        // BOTH arms of the seam, because the small-shape row is the one a first real `.wk` matmul
-        // hits and it would be the one to poison the context.
-        let small = wgmma_cfg_for(WgmmaDtype::F16, 64, 64);
+        // The widest-tile arm AND the narrow one, because the narrow row is what a first real `.wk`
+        // matmul at a small shape hits and it would be the one to poison the context.
+        let small = seam_cfg(WgmmaDtype::F16, 64, 64, 64);
         for c in [cfg, small] {
             assert!(c.epilogue.requires_even_n(), "{} is a v2 row", c.name);
             for &(m, k, n) in &[(1usize, 8usize, 1usize), (129, 176, 257), (256, 64, 4095)] {
@@ -1869,7 +2044,25 @@ mod tests {
         // The boundary is found by asking the PLAN, never by arithmetic on a tile size or a cluster
         // shape this test would then have to know — the clustered row rounds the y axis up to a
         // multiple of 2, and hard-coding `128 * 65535` lands on the wrong side of that.
-        let gplan = cfg.launch_plan();
+        //
+        // **It must be a ONE-TILE-PER-CTA plan, and that is a fact about the promoted rule.** A
+        // persistent plan's grid is `(cluster slots, cluster.y, 1)` — bounded by the DEVICE, not by
+        // the output — so `gridDim.y` can no longer be exceeded and the ceiling is structurally
+        // unreachable there. `cfg` above is the rule's answer at 4096-cubed, which is now persistent,
+        // and searching its grid for the ceiling runs to `usize` (the assertion below caught exactly
+        // that). `small` is the rule's answer at a tiny shape: one tile per CTA, so its `gridDim.y`
+        // still tracks `ceil(M / bm)` and the decline is reachable. The decline itself is NOT dead
+        // code — every single-wave shape the rule serves takes a one-tile-per-CTA row.
+        let gplan = small.launch_plan();
+        assert!(
+            !small.tiles.carries_ring(),
+            "the grid-ceiling probe needs a one-tile-per-CTA plan: a persistent grid is device-bounded"
+        );
+        assert!(
+            cfg.tiles.carries_ring()
+                && cfg.launch_plan().grid(1 << 24, 510).1 <= MAX_GRID_YZ,
+            "...and the persistent plan really is device-bounded, which is why it cannot be used here"
+        );
         let n_small = 510usize;
         let (mut lo, mut hi) = (1usize, 1usize << 30);
         while lo < hi {
@@ -1890,15 +2083,15 @@ mod tests {
                 && gplan.grid(fits_m, n_small).1 <= MAX_GRID_YZ,
             "the search must straddle gridDim.y, or this test is vacuous"
         );
-        let why = wgmma_declines(cfg, over_m, 64, n_small, H100_SMEM)
+        let why = wgmma_declines(small, over_m, 64, n_small, H100_SMEM)
             .expect("a grid past CUDA's gridDim.y ceiling must decline, not reach the driver");
         assert!(why.contains("grid ceiling"), "{why}");
         // ...and the tallest output whose grid fits must NOT decline: this is a ceiling, not a size
         // limit, and a rule that also refused the shapes CUDA accepts would be a silent narrowing.
         assert!(
-            wgmma_declines(cfg, fits_m, 64, n_small, H100_SMEM).is_none(),
+            wgmma_declines(small, fits_m, 64, n_small, H100_SMEM).is_none(),
             "the largest grid CUDA accepts must still take the wgmma route: {:?}",
-            wgmma_declines(cfg, fits_m, 64, n_small, H100_SMEM)
+            wgmma_declines(small, fits_m, 64, n_small, H100_SMEM)
         );
 
         // And the budget: the ring that fits Hopper's carveout does not fit Ada's, which is the
