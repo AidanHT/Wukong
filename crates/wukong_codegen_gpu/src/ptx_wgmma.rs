@@ -2706,8 +2706,9 @@ pub const WGMMA_W1_BF16: WgmmaCfg = WgmmaCfg {
 /// 65.1/67.5/56.1% of cuBLAS bf16 at the square shapes -- within a point or two of where the f16
 /// row sat BEFORE its levers -- so the whole bf16 gap is the unshipped transport + cluster, both
 /// of which are dtype-generic at 2-byte elements (same tile, same I_cta, same store sequence; only
-/// the operand-type token differs). Shipped by [`wgmma_w1_bf16_for`]; the scalar row stays
-/// emittable as the control.
+/// the operand-type token differs). Shipped by [`wgmma_dispatch_dtype`] at every single-wave grid
+/// whose `f_L2` is under the cluster's benefit bar -- `sq2048` and `gpt_d1024_down`; the scalar row
+/// stays emittable as the control.
 pub const WGMMA_W1_BF16_V2: WgmmaCfg = WgmmaCfg {
     name: "wgmma_nt_bf16_128x256x64_s4_v2",
     key: "wgmma_nt_bf16_128x256x64_s4_v2",
@@ -2726,6 +2727,73 @@ pub const WGMMA_W1_BF16_MCB_V2: WgmmaCfg = WgmmaCfg {
     multicast: Multicast::ClusterB,
     epilogue: EpilogueStore::V2,
     ..WGMMA_W1
+};
+
+// --- the bf16 MIRROR of every arm the shipped rule can select -------------------------------------
+//
+// **The rule is dtype-generic and the module table must be too.** `wgmma_shipped_for` runs ONE
+// dispatcher for both 16-bit types (`wgmma_dispatch_plan` reads only `(M, N, K, sm_count)`, none of
+// which carries a dtype) and then resolves the verdict to a module of the caller's dtype. So every
+// configuration the rule can reach needs a twin here, or the bf16 half of the product surface
+// DECLINES exactly where the f16 half ships -- silently, since a decline routes a `.wk` matmul to
+// the pre-Hopper launcher and returns correct numbers.
+//
+// `the_f16_and_bf16_rules_select_structurally_corresponding_arms` is the law: it walks the whole
+// bench grid plus the class boundaries and requires the two dtypes to agree on the tile, the
+// multicast, the raster and the schedule at every shape -- and to DECLINE at the same shapes, which
+// is the half a "both must resolve" law would miss.
+//
+// **Why the transfer is licensed rather than assumed.** `wgmma` is precision-generic across the
+// 16-bit types: one operand-type token differs and nothing else does. Every quantity the dispatcher
+// compares is a byte count or a tile count at a fixed 2-byte element (`I_cta`, the wave geometry,
+// `T_L2`, the wave footprint, the SMEM ring), so there is no dtype term anywhere in the rule to move
+// a verdict. The 2026-08-11 bf16 round measured the bf16 rows within ~1-2 points of their f16 twins
+// at every overlapping shape (49.5 / 94.0 / 89.0 / 91.9 / 80.0 / 95.4 / 73.2 against f16's 48.3 /
+// 95.3 / 88.6 / 92.3 / 80.3 / 97.3 / 73.4), which is the same statement made by the hardware.
+// `wgmma_bf16_vs_cublas` runs THIS rule, so the transfer is re-measured every round rather than
+// inherited.
+
+/// The bf16 twin of [`WGMMA_W3D_V2`] -- the 128x64 tile the rule selects for an UNDERFILLED grid.
+///
+/// The regime is occupancy, not dtype: at `sq1024` a 128x256 tile is 32 CTAs of the probed 132 SMs
+/// (24.2% of the device) and 128x64 is 128 (97.0%). Both statements are tile counts, so they hold
+/// identically at bf16, and the f16 arm measured **79.6% of cuBLAS against 48.3%** for exactly that
+/// reason. Without this row the bf16 rule would decline every small GEMM the f16 rule serves.
+pub const WGMMA_W3D_BF16_V2: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_bf16_128x64x64_s4_v2",
+    key: "wgmma_nt_bf16_128x64x64_s4_v2",
+    dtype: WgmmaDtype::Bf16,
+    ..WGMMA_W3D_V2
+};
+
+/// The bf16 twin of [`WGMMA_W1_V2_P`] -- persistence alone, the verdict at any multi-wave grid whose
+/// footprint fits L2 and whose `f_L2` is below the cluster's benefit bar (`gpt_d1024_up`, where the
+/// f16 arm measured 90.0% of cuBLAS against the shipped 80.6%).
+pub const WGMMA_W1_BF16_V2_P: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_bf16_128x256x64_s4_v2_p",
+    key: "wgmma_nt_bf16_128x256x64_s4_v2_p",
+    dtype: WgmmaDtype::Bf16,
+    ..WGMMA_W1_V2_P
+};
+
+/// The bf16 twin of [`WGMMA_W1_MCB_V2_P`] -- persistence plus the cluster, no raster: the verdict at
+/// a multi-wave, L2-resident, L2-bound grid (`sq4096`, where the f16 arm measured 94.3% against the
+/// shipped 88.3%).
+pub const WGMMA_W1_BF16_MCB_V2_P: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_bf16_128x256x64_s4_mcb2_v2_p",
+    key: "wgmma_nt_bf16_128x256x64_s4_mcb2_v2_p",
+    dtype: WgmmaDtype::Bf16,
+    ..WGMMA_W1_MCB_V2_P
+};
+
+/// The bf16 twin of [`WGMMA_W1_MCB_V2_R16_P`] -- all three schedule levers, the verdict wherever the
+/// linear wave footprint blows L2 (`sq8192` and `gpt_d4096_up`, where the f16 arm measured **102.0%
+/// and 101.6% of cuBLAS** against the shipped 92.0 and 73.3).
+pub const WGMMA_W1_BF16_MCB_V2_R16_P: WgmmaCfg = WgmmaCfg {
+    name: "wgmma_nt_bf16_128x256x64_s4_mcb2_v2_r16_p",
+    key: "wgmma_nt_bf16_128x256x64_s4_mcb2_v2_r16_p",
+    dtype: WgmmaDtype::Bf16,
+    ..WGMMA_W1_MCB_V2_R16_P
 };
 
 /// **W3c -- the moderate-size arm** (D1 section 4.5's W3, cooperative rather than pingpong).
@@ -2826,79 +2894,75 @@ pub const WGMMA_VARIANTS: &[WgmmaCfg] = &[
     WGMMA_W1_BF16,
     WGMMA_W1_BF16_V2,
     WGMMA_W1_BF16_MCB_V2,
+    // The bf16 mirror of the wave-3 arms the shipped rule promotes. They are here rather than in
+    // `WGMMA_SWEEP_GRID` because `wgmma_bf16_vs_cublas` reaches them through the RULE (there is no
+    // bf16 config sweep), so `wgmma_all_emittable` -- and through it the ASCII law, the `.version`
+    // law and the CPU ptxas census -- is the only thing that assembles them before an H100 is rented.
+    WGMMA_W3D_BF16_V2,
+    WGMMA_W1_BF16_V2_P,
+    WGMMA_W1_BF16_MCB_V2_P,
+    WGMMA_W1_BF16_MCB_V2_R16_P,
     WGMMA_W3C,
     WGMMA_W1_MC,
     WGMMA_W1_MCB,
 ];
 
-// --- what the W1 family SHIPS, after round 3 ------------------------------------------------------
-
-/// **The measured crossover between the clustered and un-clustered W1 rows**, in output elements
-/// (`M * N`), from `bench/gpu/h100/2026-08-10-h100-act2-r3-bmulticast.log`.
-///
-/// Round 3's published table, `% of cuBLAS f16 (f32 out)`, at a fixed 128x256x64 s4 tile:
-///
-/// | shape | `M*N` | no cluster | 1x2x1 on B |
-/// |---|---|---|---|
-/// | `sq2048` | 4.19e6 | **67.2%** | 62.4% |
-/// | `sq4096` | 16.8e6 | 67.3% | **73.5%** |
-/// | `sq8192` | 67.1e6 | 55.2% | **82.2%** |
-///
-/// The sign flips between `sq2048` and `sq4096`, so the threshold is anywhere in `(4.19e6, 16.8e6)`.
-/// `8.0e6` is the round number inside that interval and is deliberately *not* derived from a model:
-/// three points cannot locate a crossover more finely than the interval that brackets it, and
-/// pretending otherwise would be the kind of precision this repo's own measurement rules forbid.
-pub const W1_CLUSTER_MIN_OUTPUT_ELEMS: usize = 8_000_000;
-
-/// **The W1 family's shipped configuration for an `M x N` output.**
-///
-/// Both arms carry the **fused `st.global.v2.f32` epilogue** since the 2026-08-11 wave-2 round:
-/// `w1_mcb_v2` measured 87.4 / 88.7 / 92.0% of cuBLAS at sq2048/4096/8192 against the scalar
-/// baseline's 62.2 / 73.4 / 81.9, a pure win at every measured shape, so shipping the scalar store
-/// anywhere would ship the measurably worst configuration. [`WGMMA_W1_MCB_V2`] -- the `1x2x1`
-/// cluster multicasting B -- for anything at or above [`W1_CLUSTER_MIN_OUTPUT_ELEMS`]; the
-/// un-clustered [`WGMMA_W1_V2`] below it, because `sq2048` is the one measured shape where the
-/// cluster **loses** (scalar-vs-scalar 62.4% against 67.2%; the v2 twin of that comparison is the
-/// `w1_v2` sweep row's job).
-///
-/// # This is a REGIME RULE, not a dispatcher, and the distinction is deliberate
-///
-/// It is a static two-way split on one measured sign change, awaiting wave 3's real per-shape
-/// dispatcher (which will also choose the tile -- D1 puts 128x128 at the `sq2048` end, and this
-/// function cannot express that because it only ever returns a 128x256 row). Two properties keep it
-/// honest in the meantime: the threshold sits inside the interval the measurement actually brackets
-/// (see [`W1_CLUSTER_MIN_OUTPUT_ELEMS`]), and **the scalar rows stay emittable and stay in the
-/// sweep** as controls, so the next round re-measures both the split and the store rather than
-/// inheriting them.
-///
-/// `K` is deliberately not an input. Nothing in round 3 varied it independently, so a rule that read
-/// it would be a guess wearing a measurement's clothes; wave 2's K-sweep ([`WGMMA_KSWEEP_GRID`]) is
-/// what will give it one.
-pub fn wgmma_w1_for(m: usize, n: usize) -> &'static WgmmaCfg {
-    if m.saturating_mul(n) >= W1_CLUSTER_MIN_OUTPUT_ELEMS {
-        &WGMMA_W1_MCB_V2
-    } else {
-        &WGMMA_W1_V2
-    }
-}
-
-/// The bf16 shipped rule: [`wgmma_w1_for`]'s split at the same threshold, on the bf16 twins.
-///
-/// The threshold was measured on f16, and transfers on traffic arithmetic alone: at equal 2-byte
-/// elements the tiles, `I_cta` and the wave geometry are identical, so the cluster's sign change
-/// has no dtype term to move it. The 2026-08-11 bf16 round measured the SCALAR bf16 row within a
-/// point or two of f16's pre-lever numbers at every square shape, which is the same statement made
-/// by the hardware. `wgmma_bf16_vs_cublas` runs THIS rule, so the transfer is re-measured every
-/// round rather than trusted.
-pub fn wgmma_w1_bf16_for(m: usize, n: usize) -> &'static WgmmaCfg {
-    if m.saturating_mul(n) >= W1_CLUSTER_MIN_OUTPUT_ELEMS {
-        &WGMMA_W1_BF16_MCB_V2
-    } else {
-        &WGMMA_W1_BF16_V2
-    }
-}
-
-// --- wave 3 lever 3: the per-shape dispatcher -----------------------------------------------------
+// --- WHAT THE FAMILY SHIPS ------------------------------------------------------------------------
+//
+// **[`wgmma_dispatch_dtype`] IS the shipped rule, for both 16-bit dtypes, as of 2026-08-12.** There
+// is no second spelling: the driver's config seam (`wukong_driver::gpu_accel::wgmma_cfg_for`) and
+// both peer benches (`wgmma_vs_cublas`, `wgmma_bf16_vs_cublas`) call it, so a rule change
+// re-measures itself instead of a bench quietly timing a row the rule no longer returns.
+//
+// # What it replaced, and why that was a DEFECT rather than a stale default
+//
+// Until 2026-08-12 this section held `wgmma_w1_for(m, n)`: a static two-way split that returned the
+// clustered `w1_mcb_v2` at or above 8e6 output elements and the un-clustered `w1_v2` below it. It was
+// honest for what it was -- one measured sign change, a threshold inside the interval that bracketed
+// it, and its own doc said it was "a REGIME RULE, not a dispatcher ... awaiting wave 3's real
+// per-shape dispatcher". Wave 3 then LANDED that dispatcher and its four levers, the 2026-08-12 H100
+// visit MEASURED them as sweep arms, and they won big -- but nothing was rewired, so the compiler
+// went on shipping the wave-2 arms. The defect is not that the old rule was unrefined; it is that
+// **the shipped configuration was measurably not the best available one on 4 of the 7 benched
+// shapes**, and the measurement proving it was already in the tree.
+//
+// Measured, f16 / f32-out, % of cuBLAS, from `bench/gpu/h100/2026-08-12-h100-w3-r2-config-sweep.log`
+// (every delta below is outside both noise floors; clock lock was refused and declared):
+//
+// | shape | old rule shipped | new rule ships | measured | delta |
+// |---|---|---|---|---|
+// | `sq1024` | `w1_v2` | **`w3d_s4_v2`** (128x64 tile) | 48.3 -> **79.6** | **+31.3** |
+// | `sq2048` | `w1_v2` | `w1_v2` (unchanged) | 94.1 | 0 -- and that is a FINDING |
+// | `sq4096` | `w1_mcb_v2` | **`w1_mcb_v2_p`** | 88.3 -> **94.3** | **+6.0** |
+// | `sq8192` | `w1_mcb_v2` | **`w1_mcb_v2_r16_p`** | 92.0 -> **102.0** | **+10.0 (ABOVE cuBLAS)** |
+// | `gpt_d1024_up` | `w1_mcb_v2` | **`w1_v2_p`** | 80.6 -> **90.0** | **+9.4** |
+// | `gpt_d1024_down` | `w1_v2` | `w1_v2` (unchanged) | 96.8 | 0 -- see below |
+// | `gpt_d4096_up` | `w1_mcb_v2` | **`w1_mcb_v2_r16_p`** | 73.3 -> **101.6** | **+28.3 (AT cuBLAS)** |
+//
+// # The two rows that do NOT move are the two that matter most for honesty
+//
+// `sq2048` and `gpt_d1024_down` keep the arm the old rule already shipped, and the reason is the same
+// in both cases: they are single-wave grids at the widest tile, where three of the four levers are
+// provably the identity (WAVE3_DOSSIER 1.3 and 2.2) and the cluster loses. **`gpt_d1024_down` is
+// where the wave-3 dispatcher AS MERGED would have regressed the product**: its `f_L2` of 0.955 is
+// the suite's highest, the one-term cluster predicate called it the table's most confident ON, and
+// the visit measured that ON at 91.4% against the un-clustered 96.8%. That is WAVE3_DOSSIER 3.8's
+// pre-registered falsifier (i) firing, and [`CLUSTER_MIN_WAVES`] is the term it bought.
+//
+// # Why the size-keyed threshold is RETIRED rather than kept as a fallback
+//
+// `W1_CLUSTER_MIN_OUTPUT_ELEMS = 8e6` is gone. It was a threshold on `M * N`, which is not a
+// physical quantity for any of the four levers: the cluster's benefit is an L2-traffic fraction, its
+// cost is a coupling tail amortized over `waves`, the raster's is an L2 residency test on the wave
+// footprint, persistence's is `waves > 1`, and the tile's is wave fill against the PROBED SM count.
+// `M * N` correlates with all of them at the seven benched shapes and with none of them in general --
+// `gpt_d1024_down` and `sq2048` have identical `M * N` and different levers, and `gpt_d1024_up`
+// (16.8e6, cluster OFF) and `sq4096` (16.8e6, cluster ON) are identical in `M * N` and opposite in
+// verdict. Keeping it as a fallback would have preserved exactly one thing: the ability to ship the
+// arm the measurement rejected. A superseded threshold that still compiles is a second spelling of a
+// retracted claim.
+//
+// --- wave 3 lever 3: the per-shape dispatcher, which is now the shipped rule ----------------------
 
 /// L2 on the H100 SXM5 this campaign rents, bytes (50.0 MiB). Measured, r3 log line 522.
 pub const L2_BYTES: f64 = 52_428_800.0;
@@ -3111,6 +3175,91 @@ pub const WAVE_EFFICIENCY_FLOOR: f64 = 0.90;
 /// [`DispatchPlan::f_l2`]: DispatchPlan::f_l2
 pub const CLUSTER_F_L2_THRESHOLD: f64 = 0.78;
 
+/// **The second, INDEPENDENT half of the cluster predicate: how many tiles one CTA must run before
+/// the cluster's cross-SM coupling is amortized.** A PRE-REGISTERED FALSIFIER FIRED HERE.
+///
+/// # The falsifier, and what it eliminated
+///
+/// WAVE3_DOSSIER 3.8 registered falsifier (i) in advance: "`gpt_d1024_down` prefers no cluster ->
+/// `f_L2 >= 0.78` is not the predicate and the real one involves `waves`". The 2026-08-12 H100
+/// visit fired it (`bench/gpu/h100/2026-08-12-h100-w3-r2-config-sweep.log`): at that shape's
+/// `f_L2 = 0.955` -- the highest in the suite -- the clustered arm measured **91.4% of cuBLAS
+/// against the un-clustered arm's 96.8%**, a LOSS, where the `f_L2` term alone predicted the
+/// table's most confident ON.
+///
+/// The round's cluster A/B is a ONE-FACT comparison (`w1_v2` against `w1_mcb_v2`: same tile, same
+/// depth, same v2 store, cluster the only difference) run at five shapes, and it separates cleanly
+/// on `waves` and on nothing else:
+///
+/// | shape | waves | `n_k` | `f_L2` | un-clustered ms | clustered ms | cluster costs | sign |
+/// |---|---|---|---|---|---|---|---|
+/// | `sq2048` | **1** | 32 | 0.769 | 0.027274 | 0.029682 | **+2.41 us** | LOSS |
+/// | `gpt_d1024_down` | **1** | 64 | 0.955 | 0.046398 | 0.049139 | **+2.74 us** | LOSS |
+/// | `gpt_d1024_up` | 4 | 16 | 0.553 | 0.067706 | 0.072208 | +4.50 us (**+1.13/tile**) | LOSS |
+/// | `sq4096` | 4 | 64 | 0.955 | 0.209023 | 0.185573 | **-23.45 us** | WIN |
+/// | `sq8192` | 16 | 128 | 0.812 | 2.284573 | 1.372618 | **-911.96 us** | WIN |
+///
+/// That table is a complete 2x2 in the predicate's two terms, and each term is falsified in exactly
+/// one cell: `gpt_d1024_up` is multi-wave with a LOW `f_L2` and loses (so the `f_L2` term is
+/// necessary -- this is 3.8's falsifier (ii), which did NOT fire), and `gpt_d1024_down` is
+/// single-wave with a HIGH `f_L2` and loses (so this term is necessary). Both ON cells pass both
+/// terms.
+///
+/// # The mechanism, and what the same table refutes
+///
+/// Under [`Multicast::ClusterB`] the two ranks are coupled at **every ring stage**: `empty[s]` is
+/// initialised with `cluster_ctas * consumer_wgs = 4` arrivals instead of 2, so a producer may not
+/// refill a stage until BOTH CTAs' consumers released it, and each release costs a
+/// `mapa.shared::cluster` + `mbarrier.arrive.shared::cluster` DSMEM round trip per peer instead of
+/// one `mbarrier.arrive.shared::cta`. Every stage therefore takes the **max of two SMs** rather than
+/// one, and the launch's critical path is the max over the resident clusters of that accumulated
+/// jitter. On top of it sit two per-kernel `barrier.cluster.arrive/wait` rendezvous and a
+/// cluster-scoped `mbarrier.init` + `fence.mbarrier_init.release.cluster` prologue.
+///
+/// A max-of-two jitter tail accumulates as `sqrt(total stages)` while the work it is charged against
+/// grows as `total stages`, so the penalty **per tile** falls with the number of tiles one CTA runs,
+/// which is `waves`. The table measures that: 2.41 and 2.74 us per tile at one wave against
+/// **1.13 us per tile at four** -- a factor of ~2.2, which is `sqrt(4)` and not 4, so the fall is
+/// sub-linear (and 1.13 is an upper bound on the amortized cost, since `gpt_d1024_up`'s +4.50 us is
+/// cost MINUS whatever L2 saving it got, so the true cost there is at least that).
+///
+/// **It also refutes WAVE3_DOSSIER 3.2's own attribution.** 3.2 reads the same effect as per-stage
+/// and "progressively hidden as the mainloop lengthens" (i.e. a function of `n_k`), because round 3
+/// measured it only at sq2048 / sq4096 / sq8192, where `n_k` (32/64/128) and `waves` (1/4/16) rise
+/// together -- **totally confounded**. `gpt_d1024_down` de-confounds them: it has sq4096's `n_k` of
+/// 64 and sq2048's single wave, and it behaves like sq2048 (+2.74 us) rather than like sq4096
+/// (-23.45 us). Doubling `n_k` at one wave did not shrink the cost at all; it grew it by 14%. The
+/// discriminating variable is `waves`.
+///
+/// # Why a STEP at 2 and not a curve
+///
+/// The measurement brackets the sign change between **1 wave (two shapes lose) and 4 waves (two
+/// shapes win)** and locates it no more finely than that -- there is no 2-wave or 3-wave row. The
+/// amortization exponent is bracketed too (between `1/sqrt(waves)` and `1/waves`) and is not
+/// resolved. So this is the coarsest statement the data supports, exactly the discipline the
+/// superseded `W1_CLUSTER_MIN_OUTPUT_ELEMS` documented for its own crossover: "three points cannot
+/// locate a crossover more finely than the interval that brackets it, and pretending otherwise would
+/// be the kind of precision this repo's own measurement rules forbid." A row at `waves == 2` or 3 is
+/// what would refine it into a curve.
+///
+/// # What it costs when it is wrong, and which way to be wrong
+///
+/// A wrong OFF here costs the cluster's multi-wave win (9.8 points at `sq4096`, 37.1 at `sq8192`);
+/// a wrong ON costs 5.4 points (`gpt_d1024_down`) to 7.5 (`sq2048`). So the asymmetry 3.2 states --
+/// be eager -- still holds, and `2` is the smallest value that clears the measured LOSS side. The
+/// known coarseness is in the other direction and is stated rather than hidden: a **single-wave**
+/// shape with a long enough `n_k` to amortize the coupling by itself is declined by this term, and
+/// nothing in the suite measures one. `gpt_d1024_down` at `K = 16384` would be that shape.
+///
+/// # It is derived from the PROBED SM count, never from a shape
+///
+/// `waves = ceil(ceil(M/bm) * ceil(N/bn) / sm_count)`, so the boundary is exactly `tiles >
+/// sm_count` -- "the launch does not fit in one pass of the device". `sm_count` comes from
+/// `GpuTarget::sm_count` at the call site (this module's [`HOPPER_SM_COUNT`] is the H100 SXM5 value
+/// the derivation was done at, used only by the device-free laws), and the tile comes from the tile
+/// lever. No benchmark shape appears anywhere in it.
+pub const CLUSTER_MIN_WAVES: usize = 2;
+
 /// **What the cluster must actually SAVE to be worth its coupling cost**: the fraction of the binding
 /// roof a `1x2x1` B multicast removes, `f_L2 * multicast_l2_share(bm, bn)`, at the break-even
 /// [`CLUSTER_F_L2_THRESHOLD`] was fitted at -- `0.78 * 1/3 = 0.26`.
@@ -3216,7 +3365,23 @@ pub struct DispatchPlan {
     /// **The quantity [`cluster_l2_saving_threshold`] is compared against**: the fraction of the
     /// binding roof a `1x2x1` B multicast would remove at the tile actually chosen,
     /// `f_l2 * multicast_l2_share(bm, bn)`.
+    ///
+    /// It is the cluster decision's BENEFIT term and is not the decision: see
+    /// [`cluster_amortized`], the cost term the 2026-08-12 falsifier added.
+    ///
+    /// [`cluster_amortized`]: DispatchPlan::cluster_amortized
     pub l2_saving: f64,
+    /// **The cluster decision's COST term: `waves >= CLUSTER_MIN_WAVES`.**
+    ///
+    /// `waves` is how many tiles one CTA runs, so it is what the cluster's per-CTA cross-SM coupling
+    /// tail is amortized over. Carried as its own field rather than recomputed from [`waves`] at
+    /// every reader, because a reader that recomputes it is a second spelling of the predicate --
+    /// and printing the two terms separately is what let the round log say WHICH term declined a
+    /// shape. See [`CLUSTER_MIN_WAVES`] for the measurement that made this term necessary and for
+    /// the mechanism it encodes.
+    ///
+    /// [`waves`]: DispatchPlan::waves
+    pub cluster_amortized: bool,
 }
 
 impl DispatchPlan {
@@ -3226,12 +3391,16 @@ impl DispatchPlan {
     /// instead of inheriting them.
     ///
     /// The cluster column prints the SAVING and its factors (`f_L2 x share`) rather than `f_L2`
-    /// alone, because at any tile but [`FLOOR_REF_TILE`] `f_L2` is not what the rule compared.
+    /// alone, because at any tile but [`FLOOR_REF_TILE`] `f_L2` is not what the rule compared -- and
+    /// it prints BOTH of the cluster's terms with their own verdicts, because the 2026-08-12
+    /// falsifier is exactly a shape where the benefit term says ON and the amortization term says
+    /// OFF, and a log that printed one number could not say which one decided.
     pub fn summary(&self) -> String {
         format!(
             "{}x{} tile, {} tiles / {} waves (eff {:.3} vs floor {:.2}) | cluster {} (saves {:.3} \
-             = f_L2 {:.3} x share {:.3}, vs {:.2}) | raster {} (linear footprint {:.1} MB vs L2 \
-             {:.1} MB) | persistent {} | final footprint {:.1} MB, {}",
+             = f_L2 {:.3} x share {:.3}, vs {:.2}: {}; amortized over {} waves vs {} needed: {}) | \
+             raster {} (linear footprint {:.1} MB vs L2 {:.1} MB) | persistent {} | final footprint \
+             {:.1} MB, {}",
             self.bm,
             self.bn,
             self.tiles,
@@ -3243,6 +3412,14 @@ impl DispatchPlan {
             self.f_l2,
             multicast_l2_share(self.bm, self.bn),
             cluster_l2_saving_threshold(),
+            if self.l2_saving >= cluster_l2_saving_threshold() {
+                "PASS"
+            } else {
+                "fail"
+            },
+            self.waves,
+            CLUSTER_MIN_WAVES,
+            if self.cluster_amortized { "PASS" } else { "fail" },
             if self.raster {
                 format!("ON GROUP_M {}", self.group_m)
             } else {
@@ -3280,16 +3457,24 @@ impl DispatchPlan {
 /// | lever | what it changes | which roof it lowers | zero when |
 /// |---|---|---|---|
 /// | tile | `I_cta`, and how much of the device one wave fills | occupancy, and the L2 roof | never -- it is always a choice |
-/// | cluster (1x2x1 on B) | `L2 -> SMEM` bytes: `(BM+BN)` becomes `(BM+BN/2)` -- 1.5x at W1, 1.33x at 128x128, 1.2x at 128x64 | the **7.00 TB/s L2** roof | the shape is not near that roof, OR the tile is too narrow for `B` to be the wide operand |
+/// | cluster (1x2x1 on B) | `L2 -> SMEM` bytes: `(BM+BN)` becomes `(BM+BN/2)` -- 1.5x at W1, 1.33x at 128x128, 1.2x at 128x64; and it couples two SMs at every ring stage | the **7.00 TB/s L2** roof | the shape is not near that roof, OR the tile is too narrow for `B` to be the wide operand, OR one CTA runs one tile so the coupling has nothing to amortize over |
 /// | raster | `DRAM -> L2` bytes, by changing the WAVE FOOTPRINT; L2->SMEM bytes unchanged | the **3.35 TB/s HBM** roof, and L2 residency | one wave, or the linear footprint already fits L2 |
 /// | persistence | nothing about traffic; removes `X_fill` at `waves-1` boundaries | the **mainloop fixed-cost** floor | one wave |
 ///
 /// So: take the WIDEST tile whose wave efficiency clears [`WAVE_EFFICIENCY_FLOOR`]; raster iff the
 /// grid is multi-wave AND the linear wave footprint blows [`L2_BYTES`]; persist iff multi-wave;
 /// cluster iff what a B multicast would SAVE off the **FINAL** configuration's binding roof clears
-/// [`cluster_l2_saving_threshold`].
+/// [`cluster_l2_saving_threshold`] **AND** the grid is at least [`CLUSTER_MIN_WAVES`] waves deep.
 ///
-/// **That last word is load-bearing, and it is a computation here rather than a story.**
+/// **The cluster's two terms are independent and each was falsified in exactly one measured cell.**
+/// The benefit term (`f_L2 x share`) is necessary because `gpt_d1024_up` is multi-wave at
+/// `f_L2 = 0.553` and the cluster LOSES 5.3 points there. The amortization term (`waves`) is
+/// necessary because `gpt_d1024_down` is single-wave at `f_L2 = 0.955` -- the suite's highest -- and
+/// the cluster LOSES 5.4 points there too. That second cell is WAVE3_DOSSIER 3.8's pre-registered
+/// falsifier (i), which the 2026-08-12 H100 visit FIRED; [`CLUSTER_MIN_WAVES`] carries the whole
+/// table, the mechanism, and why the term is a step rather than a curve.
+///
+/// **"FINAL" is load-bearing, and it is a computation here rather than a story.**
 /// `gpt_d4096_up` FLIPS: with the raster forced OFF its wave footprint is 136.4 MB of a 50.0 MiB L2,
 /// [`dispatch_memory_roof_s`] prices it as thrashing (1329.8 us against a 963.5 us floor), and
 /// `f_L2` lands at **0.692** -- a saving of 0.231 against the 0.26 break-even, **cluster OFF**. Turn
@@ -3398,7 +3583,15 @@ pub fn wgmma_dispatch_plan_with_raster(
     let binding = floor_s.max(memory_roof_s);
     let f_l2 = if binding > 0.0 { t_l2 / binding } else { 0.0 };
     let l2_saving = f_l2 * multicast_l2_share(bm, bn);
-    let cluster = l2_saving >= cluster_l2_saving_threshold();
+    //    ...and the cluster's COST, which the 2026-08-12 falsifier added and which is a term on
+    //    `waves` alone. The two ranks of a 1x2x1 cluster are coupled at every ring stage, so the
+    //    launch carries a max-of-two-SMs jitter tail paid once per CTA lifetime and amortized over
+    //    the `waves` tiles that CTA runs. Measured at +2.41 us (sq2048) and +2.74 us (gpt_d1024_down)
+    //    per tile at ONE wave against +1.13 us per tile at four, with both single-wave shapes LOSING
+    //    and both multi-wave-and-L2-bound shapes WINNING. `CLUSTER_MIN_WAVES` carries the whole
+    //    derivation and the reason it is a step rather than a curve.
+    let cluster_amortized = waves >= CLUSTER_MIN_WAVES;
+    let cluster = l2_saving >= cluster_l2_saving_threshold() && cluster_amortized;
     DispatchPlan {
         bm,
         bn,
@@ -3418,6 +3611,7 @@ pub fn wgmma_dispatch_plan_with_raster(
         dram_bytes,
         f_l2,
         l2_saving,
+        cluster_amortized,
     }
 }
 
@@ -3470,13 +3664,35 @@ pub fn wgmma_dispatch(
     k: usize,
     sm_count: usize,
 ) -> Result<&'static WgmmaCfg, String> {
+    wgmma_dispatch_dtype(WgmmaDtype::F16, m, n, k, sm_count)
+}
+
+/// [`wgmma_dispatch`] for either 16-bit dtype -- **the resolution half of the shipped rule.**
+///
+/// The PLAN is dtype-free by construction: [`wgmma_dispatch_plan`] reads `(M, N, K, sm_count)` and
+/// every quantity it compares is a tile count or a byte count at a fixed 2-byte element, so there is
+/// no dtype term anywhere in it to move a verdict. What depends on the dtype is only which MODULE
+/// carries that verdict, and that is this function. One plan, two module tables, and
+/// `the_f16_and_bf16_rules_select_structurally_corresponding_arms` is the law that keeps the second
+/// table complete.
+///
+/// A dtype with a missing twin therefore DECLINES loudly with the same message the f16 arm would
+/// give, naming the dtype -- it never falls back to the other dtype's module (which would silently
+/// change the arithmetic of a `.wk` program) and never to a nearby configuration.
+pub fn wgmma_dispatch_dtype(
+    dtype: WgmmaDtype,
+    m: usize,
+    n: usize,
+    k: usize,
+    sm_count: usize,
+) -> Result<&'static WgmmaCfg, String> {
     let p = wgmma_dispatch_plan(m, n, k, sm_count);
     wgmma_all_emittable()
         .into_iter()
         .find(|c| {
             c.bm == p.bm
                 && c.bn == p.bn
-                && c.dtype == WgmmaDtype::F16
+                && c.dtype == dtype
                 && c.epilogue == EpilogueStore::V2
                 && c.l2_hint == L2Hint::None
                 && c.wait_depth == 0
@@ -3489,9 +3705,10 @@ pub fn wgmma_dispatch(
         })
         .ok_or_else(|| {
             format!(
-                "{UNSUPPORTED}: no emitted module for {m}x{n}x{k} on {sm_count} SMs -- the rule \
+                "{UNSUPPORTED}: no emitted {} module for {m}x{n}x{k} on {sm_count} SMs -- the rule \
                  wants {}. The dispatcher DECLINES rather than falling back, because a fallback is \
                  how a round publishes a configuration that never ran.",
+                dtype.token(),
                 p.summary()
             )
         })
@@ -3523,11 +3740,17 @@ pub fn wgmma_dispatch_rule_text() -> String {
         "A PURE function of (M, N, K, sm_count), device-free and unit-tested without a GPU:\n  \
          tile    the WIDEST of [{menu}] whose wave efficiency clears {:.2}\n  raster  iff the grid \
          is multi-wave AND the LINEAR wave footprint blows L2 ({:.1} MB)\n  persist iff the grid \
-         is multi-wave\n  cluster iff what a 1x2x1 B multicast would SAVE off the FINAL \
-         configuration's binding roof,\n          f_L2 x (bn/2)/(bm+bn), clears {:.2} -- which is \
-         the {:.2} of WAVE3_DOSSIER 3.2 times the\n          {:.3} share it was fitted at \
-         ({rbm}x{rbn}). The share is 1/4 at 128x128 and 1/6 at 128x64, so a\n          narrow tile \
-         is NOT judged by the wide tile's bar: sq1024 clears {:.2} on f_L2 and is still OFF.\n  \
+         is multi-wave\n  cluster iff BOTH of two independent terms hold:\n          BENEFIT -- \
+         what a 1x2x1 B multicast SAVES off the FINAL configuration's binding roof,\n            \
+         f_L2 x (bn/2)/(bm+bn), clears {:.2} -- which is the {:.2} of WAVE3_DOSSIER 3.2 times\n     \
+         the {:.3} share it was fitted at ({rbm}x{rbn}). The share is 1/4 at 128x128 and 1/6 at\n   \
+         128x64, so a narrow tile is NOT judged by the wide tile's bar: sq1024 clears {:.2}\n       \
+         on f_L2 and is still OFF.\n          COST -- the grid is at least {} waves deep, i.e. one \
+         CTA runs more than one tile, so the\n            cluster's per-CTA cross-SM coupling tail \
+         has something to amortize over. The 2026-08-12\n            visit FIRED \
+         WAVE3_DOSSIER 3.8's falsifier (i): gpt_d1024_down is one wave at f_L2 0.955\n            \
+         and the cluster LOST 5.4 points there (+2.74 us of coupling), while gpt_d1024_up is\n      \
+         multi-wave at f_L2 0.553 and lost 5.3. Each term is falsified in exactly one cell.\n  \
          The raster enters the cluster decision through the FINAL footprint: it is what decides \
          whether the\n  memory roof is max(T_L2, T_DRAM) (L2-resident) or T_hit + T_DRAM \
          (thrashing), which is why gpt_d4096_up's\n  verdict differs between the two arms printed \
@@ -3541,6 +3764,7 @@ pub fn wgmma_dispatch_rule_text() -> String {
         CLUSTER_F_L2_THRESHOLD,
         multicast_l2_share(rbm, rbn),
         CLUSTER_F_L2_THRESHOLD,
+        CLUSTER_MIN_WAVES,
     )
 }
 
@@ -3712,7 +3936,11 @@ pub const WGMMA_W3C_MCB: WgmmaCfg = WgmmaCfg {
 ///
 /// The 2026-08-11 wave-2 round measured this row at **87.4 / 88.7 / 92.0%** of cuBLAS f16 (f32
 /// out) at sq2048/sq4096/sq8192 against the scalar baseline's 62.2 / 73.4 / 81.9 -- +25.2 / +15.3
-/// / +10.1 points from the one-field change, which is why [`wgmma_w1_for`] now ships it.
+/// / +10.1 points from the one-field change, which is why every arm the shipped rule can select
+/// carries the v2 store. **It is no longer itself a shipped arm**: the 2026-08-12 promotion sends
+/// every multi-wave grid to a persistent twin, so this row's job is now to be the CONTROL those
+/// deltas are measured against (it is what the old `M * N >= 8e6` rule shipped at four of the seven
+/// benched shapes).
 pub const WGMMA_W1_MCB_V2: WgmmaCfg = WgmmaCfg {
     name: "wgmma_nt_f16_128x256x64_s4_mcb2_v2",
     key: "wgmma_nt_f16_128x256x64_s4_mcb2_v2",
@@ -3878,16 +4106,20 @@ pub const WGMMA_W3D_V2: WgmmaCfg = WgmmaCfg {
 };
 
 /// The **un-clustered** W1 with the fused v2 epilogue -- the fourth corner of the
-/// `{cluster off/on} x {scalar/v2}` square, and the row [`wgmma_w1_for`] ships below the cluster
-/// threshold.
+/// `{cluster off/on} x {scalar/v2}` square, and **what the shipped rule selects at every single-wave
+/// grid the widest tile fills**: `sq2048` and `gpt_d1024_down`.
 ///
-/// The 2026-08-11 round measured v2 only on the clustered lineage (`w1_mcb_v2`), so the small-shape
-/// half of the shipped rule rides on the mechanism being cluster-independent -- which it textually
-/// is (the epilogue never touches the multicast path; the emitted store sequence is identical
-/// modulo the cluster prologue). This row exists so the next sweep MEASURES that instead of
-/// inheriting it: at `sq2048`, where round 3 showed no-cluster beating the cluster 67.2% to 62.4%
-/// scalar-vs-scalar, this row against `w1_mcb_v2`'s measured 87.4% settles whether the same sign
-/// holds under v2.
+/// Those are the two shapes the 2026-08-12 promotion did NOT move, and that is a finding rather than
+/// a gap. Both are one wave at 97.0% wave efficiency, so the raster and persistence are provably the
+/// identity (WAVE3_DOSSIER 1.3, 2.2) and no tile is better; and the cluster loses at both -- `sq2048`
+/// fails the benefit term (`f_L2` 0.769) and `gpt_d1024_down` fails the amortization one (one wave at
+/// `f_L2` 0.955, measured 96.8% un-clustered against 91.4% clustered). This row measured **94.1% and
+/// 96.8% of cuBLAS** at them, the suite's second- and third-best numbers before the promotion.
+///
+/// The 2026-08-11 round measured v2 only on the clustered lineage (`w1_mcb_v2`), so this arm's
+/// transport rode on the mechanism being cluster-independent -- which it textually is (the epilogue
+/// never touches the multicast path; the emitted store sequence is identical modulo the cluster
+/// prologue). The 2026-08-12 round MEASURED it instead of inheriting it, at six of the seven shapes.
 pub const WGMMA_W1_V2: WgmmaCfg = WgmmaCfg {
     name: "wgmma_nt_f16_128x256x64_s4_v2",
     key: "wgmma_nt_f16_128x256x64_s4_v2",
@@ -4248,11 +4480,14 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
             "gpt_d1024_down",
             "gpt_d1024_up",
         ],
-        why: "The FOURTH CORNER of the {cluster} x {v2} square, and the small-shape half of the \
-              shipped rule (wgmma_w1_for below the cluster threshold). The 2026-08-11 round \
-              measured v2 only on the clustered lineage (+25.2/+15.3/+10.1 points); this row \
-              measures the un-clustered v2 the rule ships at sq2048-class shapes instead of \
-              inheriting cluster-independence from the emitter's text",
+        why: "The FOURTH CORNER of the {cluster} x {v2} square, and WHAT THE SHIPPED RULE SELECTS \
+              at every single-wave grid the widest tile fills -- sq2048 and gpt_d1024_down, the two \
+              shapes the 2026-08-12 promotion left alone (94.1% and 96.8% of cuBLAS). It is also \
+              the OFF arm of the cluster A/B at all six shapes it runs, which is the pair that \
+              separates the cluster predicate's two terms: it beat the clustered arm at sq2048 \
+              (benefit term fails), at gpt_d1024_down (amortization term fails) and at \
+              gpt_d1024_up (benefit term fails, multi-wave), and lost at sq4096 and sq8192 where \
+              both terms pass",
     },
     // --- wave 3 lever 1: the grouped raster, both rows one fact off the shipped default ----------
     SweepRow {
@@ -4327,12 +4562,25 @@ pub const WGMMA_SWEEP_GRID: &[SweepRow] = &[
     SweepRow {
         label: "w1_mcb_v2_p",
         cfg: &WGMMA_W1_MCB_V2_P,
-        shapes: &["sq4096", "sq8192"],
-        why: "The DISPATCHER's sq4096 configuration: persistent, clustered, NO raster (that \
+        // `gpt_d1024_up` added 2026-08-12: it is the ONE cell the promoted rule needs and the round
+        // did not run. See `why`.
+        shapes: &["sq4096", "sq8192", "gpt_d1024_up"],
+        why: "The SHIPPED rule's sq4096 configuration: persistent, clustered, NO raster (that \
               shape's linear wave footprint is 42.2 MB of a 50.0 MiB L2, so the raster is provably \
               worth nothing and including it would be a second fact in a one-fact A/B). Against \
               w1_mcb_v2 it is persistence alone at a shape the raster cannot help; against \
-              w1_mcb_v2_r16_p at sq8192 it is the raster alone on top of persistence",
+              w1_mcb_v2_r16_p at sq8192 it is the raster alone on top of persistence. \
+              gpt_d1024_up is THE DE-CONFOUNDING CELL, and it is the one number the 2026-08-12 \
+              round could not produce: there the rule selects w1_v2_p (measured 90.0% of cuBLAS) \
+              while the round's best arm was w1_mcb_v2_r16_p (91.8%), which differs in TWO facts \
+              (cluster AND raster) -- so the round cannot say which lever earned the 1.8 points, \
+              and the rule declines to chase it because the derivation puts both at zero there \
+              (footprint 10.6 MB, f_L2 0.553) and the one-fact cluster A/B at that shape measured \
+              a LOSS of 5.3 points (w1_v2 85.9 vs w1_mcb_v2 80.6). This row IS that one fact: \
+              cluster-under-persistence, raster off, at gpt_d1024_up. If it lands above w1_v2_p's \
+              90.0 the cluster's benefit term is under-eager under persistence and needs a \
+              persistence interaction the predicate does not have; if it lands at or below, the \
+              rule is already on the best DERIVED arm and the 1.8 belongs to the raster",
     },
     SweepRow {
         label: "w1_v2_p",
@@ -7632,11 +7880,12 @@ mod tests {
         // CPU-priced census must assemble them first.
         //
         // 20 -> 21 when the measured v2 win (+25.2/+15.3/+10.1 points, 2026-08-11) made v2 the
-        // SHIPPED default on both regime arms: `w1_v2` is the un-clustered v2 row the rule ships
-        // below the cluster threshold, and the fourth corner of the {cluster} x {v2} square.
+        // SHIPPED default on both regime arms: `w1_v2` is the un-clustered v2 row the then
+        // size-keyed rule returned below the cluster threshold -- and, after the 2026-08-12
+        // promotion, the row the dispatcher selects at every single-wave grid.
         // 21 -> 23 when the levers went to bf16: the scalar bf16 round measured 65.1/67.5/56.1%
-        // at the squares -- f16's pre-lever numbers to within a point or two -- so
-        // `wgmma_w1_bf16_for` ships the v2 and mcb2+v2 bf16 twins and the round re-measures the
+        // at the squares -- f16's pre-lever numbers to within a point or two -- so the (then
+        // size-keyed) bf16 rule shipped the v2 and mcb2+v2 bf16 twins and the round re-measured the
         // dtype transfer instead of trusting it.
         // 23 -> 25 with WAVE 3 lever 1: the grouped raster at the derived optimum (`r16`) and its
         // +24%-traffic bracket (`r32`), both one fact off the shipped `w1_mcb_v2`. They are
@@ -7664,7 +7913,12 @@ mod tests {
         // exists ONLY so the diagnostic below is one fact from its control rather than two) and
         // `w3c_mcb_v2_d1` (depth 1 where the 6-stage ring can afford it). `drain_tag` puts both
         // fields in `derived_name`, so each is its own module and its own cache key.
-        assert_eq!(mods.len(), 34);
+        // 34 -> 38 on 2026-08-12 when the dispatcher became the SHIPPED rule at both dtypes: the
+        // bf16 mirror of every arm the rule can select (`bf16 w3d_s4_v2`, `bf16 w1_v2_p`,
+        // `bf16 w1_mcb_v2_p`, `bf16 w1_mcb_v2_r16_p`). `wgmma_bf16_vs_cublas` reaches them through
+        // the rule and there is no bf16 config sweep, so this corpus is their only pre-flight --
+        // ASCII, `.target sm_90a`, `.version 8.0` and the CPU ptxas census all scan exactly it.
+        assert_eq!(mods.len(), 38);
         for (what, ptx) in &mods {
             let version = ptx
                 .lines()
@@ -8238,13 +8492,39 @@ mod tests {
             .any(|(r, s)| lb.iter().any(|(r2, s2)| r == r2 && s != s2))
     }
 
-    /// **Every branch target is a defined label, and every label is branched to.** Labels here are
+    /// **Every branch target is a defined label, and every label is REACHABLE.** Labels here are
     /// built by string interpolation from the entry name, which makes a one-character drift a
     /// `CUDA_ERROR_INVALID_PTX` on a machine that is not this one -- and PTX labels are module-scoped,
     /// so an un-prefixed label would also collide the day two entries share a module.
+    ///
+    /// # Two things this law got wrong until 2026-08-12, both found by widening its own scope
+    ///
+    /// It scanned `WGMMA_VARIANTS` -- the seven shipped rows -- and **not** `wgmma_all_emittable()`,
+    /// so no persistent, rastered, drained or drain-depth module was ever covered by it. Every one of
+    /// those is text a rented H100 is handed, which is exactly the corpus the ASCII and `.version`
+    /// laws already scan; there was no reason for this one to be narrower, and the narrowness was
+    /// invisible while the wave-3 arms lived only in the sweep grid. Widening it is what surfaced the
+    /// second error.
+    ///
+    /// "Every label is branched to" is the WRONG spelling of the dead-code half. `CNEXT_<name>` (the
+    /// consumer's tile advance) and `PNEXT_<name>` (the producer's) are **fall-through join labels**:
+    /// control arrives from the instruction above them, and nothing branches to them. They are not
+    /// dead. The property actually worth asserting is REACHABILITY -- a label is reachable if it is
+    /// branched to **or** the preceding instruction can fall into it -- and that is strictly stronger
+    /// than the old spelling in the case that matters: a label preceded by an unconditional `bra` or
+    /// `ret` and never named by any branch is genuinely unreachable code, and the old law could only
+    /// have caught it by accident.
     #[test]
     fn every_branch_target_is_a_defined_label() {
-        for c in WGMMA_VARIANTS {
+        /// Can control fall out of this instruction into the next? Only an UNCONDITIONAL `bra` or
+        /// `ret` ends a block; a predicated one (`@%p0 bra ...`) falls through when the predicate is
+        /// clear, which is the whole point of it.
+        fn is_unconditional_terminator(line: &str) -> bool {
+            let t = line.trim();
+            !t.starts_with('@') && (t.starts_with("bra ") || t.starts_with("ret;"))
+        }
+        let mut checked = 0usize;
+        for c in wgmma_all_emittable() {
             let ptx = wgmma_module(c, &license()).unwrap();
             let defined: Vec<&str> = ptx
                 .lines()
@@ -8266,14 +8546,36 @@ mod tests {
                     c.name
                 );
             }
-            for d in &defined {
+            // The previous non-blank line, per label, so fall-through reachability is decidable.
+            let lines: Vec<&str> = ptx.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                if l.starts_with(' ') || !l.ends_with(':') {
+                    continue;
+                }
+                let d = l.trim_end_matches(':');
+                if used.contains(&d) {
+                    continue;
+                }
+                let prev = lines[..i]
+                    .iter()
+                    .rev()
+                    .find(|p| !p.trim().is_empty())
+                    .unwrap_or(&"");
                 assert!(
-                    used.contains(d),
-                    "{}: label `{d}` is defined but never branched to",
-                    c.name
+                    !is_unconditional_terminator(prev),
+                    "{}: label `{d}` is never branched to AND the instruction above it \
+                     (`{}`) cannot fall into it -- that is unreachable code, not a join point",
+                    c.name,
+                    prev.trim()
                 );
             }
+            checked += 1;
         }
+        // A floor, so a future emittable-corpus change cannot shrink this law to nothing.
+        assert!(
+            checked >= WGMMA_VARIANTS.len(),
+            "the law must cover the WHOLE emittable corpus, not just the shipped rows: {checked}"
+        );
     }
 
     /// The accumulator register file is declared at exactly the size the shape implies -- one short
@@ -11390,43 +11692,184 @@ mod tests {
         }
     }
 
-    /// **The shipped regime rule says what the round-3 log measured, and nothing more.**
+    /// **THE PROMOTION LAW: the shipped rule selects the arm the round MEASURED best, and where it
+    /// does not, the gap is asserted rather than hidden.**
+    ///
+    /// The 2026-08-12 visit measured wave 3's four levers as sweep ARMS and the shipped rule went on
+    /// selecting the wave-2 ones, so the compiler shipped a configuration the tree's own measurement
+    /// had already beaten at 4 of 7 shapes. This law is what makes the promotion checkable: for every
+    /// benched shape it carries the round's whole ranking at that shape, in the source, and requires
+    /// the rule's choice to be the top of it.
+    ///
+    /// # The one shape where it is NOT the top, and why that is the honest answer
+    ///
+    /// At `gpt_d1024_up` the round's best arm is `w1_mcb_v2_r16_p` at **91.8%** and the rule selects
+    /// `w1_v2_p` at **90.0%** -- 1.8 points short. Chasing it would mean turning on the cluster and
+    /// the raster at a shape where the derivation puts both at ZERO and the round's own one-fact A/B
+    /// puts the cluster at MINUS 5.3 points (`w1_v2` 85.9 against `w1_mcb_v2` 80.6): a 10.6 MB wave
+    /// footprint in a 50.0 MiB L2 (WAVE3_DOSSIER 1.3: the raster is worth nothing) and `f_L2 = 0.553`
+    /// (3.2: the cluster costs more than it saves). The winning arm differs from the rule's choice in
+    /// **two** facts at once, so the round cannot say which of them earned the 1.8 -- and a rule
+    /// edited to capture it would be a rule fitted to one cell of one benchmark, which
+    /// `GPU_RETARGET_PLAN.md`'s "a win only counts if the compiler earned it" forbids by name.
+    ///
+    /// So the law asserts the gap and its structure: at most one shape may be off the top, by at most
+    /// 2 points, and the arm that beat it must differ in at least two facts. The de-confounding cell
+    /// (`w1_mcb_v2_p` at `gpt_d1024_up`: cluster-under-persistence as ONE fact) is added to the sweep
+    /// in the same change, so the next round answers it instead of this comment.
     #[test]
-    fn the_w1_regime_rule_follows_the_measured_sign_change() {
-        // The threshold must sit strictly inside the interval the measurement brackets: the cluster
-        // LOSES at sq2048 (4.19e6 output elements) and WINS at sq4096 (16.8e6).
-        const _: () = assert!(W1_CLUSTER_MIN_OUTPUT_ELEMS > 2048 * 2048);
-        const _: () = assert!(W1_CLUSTER_MIN_OUTPUT_ELEMS <= 4096 * 4096);
-        assert_eq!(wgmma_w1_for(2048, 2048).name, WGMMA_W1_V2.name);
-        assert_eq!(wgmma_w1_for(4096, 4096).name, WGMMA_W1_MCB_V2.name);
-        assert_eq!(wgmma_w1_for(8192, 8192).name, WGMMA_W1_MCB_V2.name);
-        // Both arms ship the v2 epilogue since the 2026-08-11 round measured it at +25.2/+15.3/
-        // +10.1 points over the scalar store -- a rule that shipped the scalar anywhere would ship
-        // the measurably worst configuration.
-        for (m, n) in [(2048, 2048), (8192, 8192)] {
-            assert_eq!(
-                wgmma_w1_for(m, n).epilogue,
-                EpilogueStore::V2,
-                "the shipped rule must carry the measured v2 epilogue at {m}x{n}"
-            );
-        }
-        // The GPT shapes the bench grid carries, so the rule is not only defined on squares. Note
-        // `gpt_d1024_down` (4096x1024) and `gpt_d1024_up` (4096x4096): the first has EXACTLY the
-        // output element count of sq2048, where the cluster was measured to LOSE, so the rule sends
-        // it to the un-clustered row. That is the rule declining to extrapolate, not an oversight --
-        // nothing in round 3 measured a rectangular shape at all, and wave 3's dispatcher is what
-        // will.
-        assert_eq!(wgmma_w1_for(4096, 16384).name, WGMMA_W1_MCB_V2.name);
-        assert_eq!(wgmma_w1_for(4096, 4096).name, WGMMA_W1_MCB_V2.name);
-        assert_eq!(wgmma_w1_for(4096, 1024).name, WGMMA_W1_V2.name);
+    fn the_shipped_rule_selects_the_arm_the_round_measured_best() {
+        // (shape, [(sweep row cfg, % of cuBLAS f16 measured 2026-08-12)]), best last.
+        let measured: &[(&str, &[(&WgmmaCfg, f64)])] = &[
+            ("sq1024", &[(&WGMMA_W1_V2, 48.3), (&WGMMA_W3D_V2, 79.6)]),
+            (
+                "sq2048",
+                &[
+                    (&WGMMA_W3D_V2, 61.3),
+                    (&WGMMA_W1_MCB_V2_R16_P, 85.9),
+                    (&WGMMA_W1_MCB_V2_R16_PSTOP, 86.0),
+                    (&WGMMA_W1_MCB_V2, 86.6),
+                    (&WGMMA_W1_MCB_V2_R16, 86.6),
+                    (&WGMMA_W1_V2_P, 93.5),
+                    (&WGMMA_W1_V2, 94.1),
+                ],
+            ),
+            (
+                "sq4096",
+                &[
+                    (&WGMMA_W1_V2, 78.5),
+                    (&WGMMA_W1_MCB_V2, 88.3),
+                    (&WGMMA_W1_MCB_V2_FH, 88.7),
+                    (&WGMMA_W1_MCB_V2_D1, 89.0),
+                    (&WGMMA_W1_MCB_V2_R16, 89.4),
+                    (&WGMMA_W1_MCB_V2_R16_PSTOP, 91.8),
+                    (&WGMMA_W1_MCB_V2_R16_P, 94.3),
+                    (&WGMMA_W1_MCB_V2_P, 94.3),
+                ],
+            ),
+            (
+                "sq8192",
+                &[
+                    (&WGMMA_W1_V2, 54.9),
+                    (&WGMMA_W3C_MCB_V2_D1, 72.3),
+                    (&WGMMA_W3C_MCB_V2, 72.9),
+                    (&WGMMA_W1_MCB_V2, 92.0),
+                    (&WGMMA_W1_MCB_V2_R16, 97.0),
+                    (&WGMMA_W1_MCB_V2_P, 97.2),
+                    (&WGMMA_W1_MCB_V2_R16_PSTOP, 99.9),
+                    (&WGMMA_W1_MCB_V2_R16_P, 102.0),
+                ],
+            ),
+            (
+                "gpt_d1024_up",
+                &[
+                    (&WGMMA_W1_MCB_V2_R16, 79.8),
+                    (&WGMMA_W1_MCB_V2_D1, 80.5),
+                    (&WGMMA_W1_MCB_V2, 80.6),
+                    (&WGMMA_W1_MCB_V2_FH, 80.6),
+                    (&WGMMA_W1_MCB_V2_R16_PSTOP, 85.5),
+                    (&WGMMA_W1_V2, 85.9),
+                    // THE RULE'S CHOICE, 1.8 points off the top. See the doc comment.
+                    (&WGMMA_W1_V2_P, 90.0),
+                    (&WGMMA_W1_MCB_V2_R16_P, 91.8),
+                ],
+            ),
+            (
+                "gpt_d1024_down",
+                &[(&WGMMA_W1_MCB_V2, 91.4), (&WGMMA_W1_V2, 96.8)],
+            ),
+            (
+                "gpt_d4096_up",
+                &[
+                    (&WGMMA_W1_MCB_V2, 73.3),
+                    (&WGMMA_W1_MCB_V2_R32, 90.9),
+                    (&WGMMA_W1_MCB_V2_R16, 94.5),
+                    (&WGMMA_W1_MCB_V2_R16_PSTOP, 99.3),
+                    (&WGMMA_W1_MCB_V2_R16_P, 101.6),
+                ],
+            ),
+        ];
         assert_eq!(
-            4096 * 1024,
-            2048 * 2048,
-            "the two shapes really are the same M*N"
+            measured.len(),
+            WGMMA_BENCH_GRID.len(),
+            "every benched shape carries its measured ranking, or the promotion is unproven \
+             somewhere"
         );
-        assert_eq!(wgmma_w1_for(1024, 1024).name, WGMMA_W1_V2.name);
-        // Both shipped arms AND their scalar controls stay emittable and stay in the sweep, so the
-        // next round re-measures both the split and the store instead of inheriting them.
+        let mut off_the_top: Vec<&str> = Vec::new();
+        for (label, rows) in measured {
+            let g = WGMMA_BENCH_GRID
+                .iter()
+                .find(|g| g.label == *label)
+                .unwrap_or_else(|| panic!("{label} is not a bench grid row"));
+            // The ranking really is sorted, so "last" really is "best".
+            for w in rows.windows(2) {
+                assert!(
+                    w[0].1 <= w[1].1,
+                    "{label}: the ranking must be sorted: {rows:?}"
+                );
+            }
+            let (best, best_pct) = rows[rows.len() - 1];
+            let got = wgmma_dispatch_dtype(WgmmaDtype::F16, g.m, g.n, g.k, HOPPER_SM_COUNT)
+                .unwrap_or_else(|e| panic!("{label}: the shipped rule must resolve: {e}"));
+            let got_pct = rows
+                .iter()
+                .find(|(c, _)| c.key == got.key)
+                .map(|(_, p)| *p)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label}: the rule selects {} and the 2026-08-12 round has no measurement \
+                         for it at this shape, so the promotion rests on nothing here",
+                        got.name
+                    )
+                });
+            if got.key != best.key {
+                off_the_top.push(label);
+                let gap = best_pct - got_pct;
+                assert!(
+                    gap <= 2.0,
+                    "{label}: the rule selects {} at {got_pct}% against a measured best of {} at \
+                     {best_pct}% -- {gap:.1} points is too much to leave on the table without a \
+                     mechanism",
+                    got.name,
+                    best.name
+                );
+                // ...and the arm that beat it must differ in MORE THAN ONE fact, or the round
+                // resolved which lever earned the gap and the rule has no excuse.
+                let facts = usize::from(got.multicast != best.multicast)
+                    + usize::from(got.raster != best.raster)
+                    + usize::from(got.tiles != best.tiles)
+                    + usize::from((got.bm, got.bn) != (best.bm, best.bn))
+                    + usize::from(got.epilogue != best.epilogue)
+                    + usize::from(got.stages != best.stages);
+                assert!(
+                    facts >= 2,
+                    "{label}: {} beats the rule's {} by {gap:.1} points and differs in ONE fact, so \
+                     the round DID resolve which lever earned it -- the rule must follow the \
+                     measurement or state a mechanism for not doing so",
+                    best.name,
+                    got.name
+                );
+            }
+        }
+        assert_eq!(
+            off_the_top,
+            vec!["gpt_d1024_up"],
+            "exactly one shape may sit off the top of its own ranking, and it is the one whose \
+             winning arm differs in two facts at once; anything else is a promotion that did not \
+             promote"
+        );
+        // Every arm the rule selects carries the measured v2 epilogue and is emittable, and every
+        // arm it selects at a benched shape is a sweep row the next round re-measures (which
+        // `every_shape_the_dispatcher_selects_is_measured_at_that_shape` states over the grid).
+        for p in WGMMA_BENCH_GRID {
+            let c = wgmma_dispatch_dtype(WgmmaDtype::F16, p.m, p.n, p.k, HOPPER_SM_COUNT).unwrap();
+            assert_eq!(c.epilogue, EpilogueStore::V2, "{}", p.label);
+            assert!(c.validate().is_ok(), "{}", c.name);
+            assert_eq!(c.name, c.derived_name(), "{}", c.name);
+        }
+        // The wave-2 arms the rule no longer ships stay EMITTABLE and stay in the sweep as controls,
+        // so the promotion is re-measured against them rather than inherited. `w1_mcb_v2` is the row
+        // the old rule shipped at four shapes and is the control for all four deltas above.
         for c in [&WGMMA_W1, &WGMMA_W1_MCB, &WGMMA_W1_V2, &WGMMA_W1_MCB_V2] {
             assert!(c.validate().is_ok(), "{}", c.name);
             assert!(
@@ -11435,10 +11878,219 @@ mod tests {
                 c.name
             );
         }
-        // Saturating, so a caller cannot overflow its way into the wrong arm.
+    }
+
+    /// **THE MIRROR LAW: the f16 and bf16 rules select STRUCTURALLY CORRESPONDING arms at every
+    /// shape, and DECLINE at the same shapes.**
+    ///
+    /// The two dtypes run one dispatcher -- [`wgmma_dispatch_plan`] has no dtype input and cannot
+    /// have one, since every quantity it compares is a tile count or a byte count at a fixed 2-byte
+    /// element -- so a desync can only ever be a MISSING MODULE. That failure is silent in the worst
+    /// way: the bf16 rule declines, `wukong_driver::gpu_accel` routes the offload to the pre-Hopper
+    /// f32 launcher, and the program returns correct numbers at the old speed under a heading that
+    /// says the wgmma family ran.
+    ///
+    /// So the law is stated over the whole surface rather than over the shipped rows: the bench grid,
+    /// the class boundaries the f16 rule is pinned at, and the two shapes where the f16 rule itself
+    /// declines. At every point the two dtypes must agree on the tile, the multicast axis, the
+    /// raster's `GROUP_M`, the schedule, the stage depth and the epilogue -- and where one declines
+    /// the other must too, with the same plan behind it.
+    #[test]
+    fn the_f16_and_bf16_rules_select_structurally_corresponding_arms() {
+        // The benched shapes, plus every class boundary
+        // `the_dispatcher_verdict_is_pinned_at_every_class_boundary` probes. The `bool` is whether
+        // the f16 rule DECLINES there -- four of these reach a verdict no module carries, and the
+        // bf16 rule must decline at exactly the same four. Pinning WHICH rather than HOW MANY is the
+        // point: a count is satisfied by any four, including a bf16-only decline paired with an
+        // f16-only one.
+        let mut points: Vec<(String, usize, usize, usize, bool)> = WGMMA_BENCH_GRID
+            .iter()
+            .map(|g| (g.label.to_string(), g.m, g.n, g.k, false))
+            .collect();
+        for (why, m, n, k, declines) in [
+            ("wave-eff just clears", 128 * 119, 256, 1024, false),
+            // 118 m-tiles fails the floor at all three tiles, so the narrowest is taken -- and it is
+            // multi-wave, so the rule also wants persistence. Nothing emits a persistent 128x64.
+            ("wave-eff just fails", 128 * 118, 256, 1024, true),
+            // The middle tile is reachable, and single-wave, so the verdict is an un-clustered
+            // one-tile-per-CTA 128x128 v2 row -- which nothing emits either (the square tile ships
+            // only clustered, as wave 3 lever 4's depth-diagnostic control).
+            ("the middle tile", 128 * 65, 256, 1024, true),
+            ("raster just off", 4096, 4096, 5056, false),
+            ("raster just on", 4096, 4096, 5120, false),
+            ("benefit term just off", 4096, 4096, 33 * 64, false),
+            ("benefit term just on", 4096, 4096, 34 * 64, false),
+            ("one wave", 4096, 1024, 4096, false),
+            ("two waves, same f_L2", 8192, 1024, 4096, false),
+            ("persistent 128x64: no module", 128 * 140, 256, 1024, true),
+            (
+                "un-clustered 128x128: no module",
+                128 * 65,
+                256,
+                240 * 64,
+                true,
+            ),
+        ] {
+            points.push((why.to_string(), m, n, k, declines));
+        }
+        let mut declines = 0usize;
+        for (why, m, n, k, want_decline) in &points {
+            let (m, n, k) = (*m, *n, *k);
+            let f = wgmma_dispatch_dtype(WgmmaDtype::F16, m, n, k, HOPPER_SM_COUNT);
+            let b = wgmma_dispatch_dtype(WgmmaDtype::Bf16, m, n, k, HOPPER_SM_COUNT);
+            assert_eq!(
+                f.is_err(),
+                *want_decline,
+                "{why} ({m}x{n}x{k}): the f16 rule {} and the pin says it {} -- the pin is what \
+                 makes the bf16 half a statement about the SAME points",
+                if f.is_err() { "DECLINES" } else { "resolves" },
+                if *want_decline {
+                    "DECLINES"
+                } else {
+                    "resolves"
+                }
+            );
+            match (f, b) {
+                (Ok(fc), Ok(bc)) => {
+                    assert_eq!(fc.dtype, WgmmaDtype::F16, "{why}");
+                    assert_eq!(bc.dtype, WgmmaDtype::Bf16, "{why}");
+                    assert_eq!(
+                        (
+                            fc.bm,
+                            fc.bn,
+                            fc.bk,
+                            fc.stages,
+                            fc.multicast,
+                            fc.raster,
+                            fc.tiles,
+                            fc.epilogue,
+                            fc.l2_hint,
+                            fc.wait_depth,
+                            fc.fence_hoisted,
+                            fc.consumer_wgs,
+                        ),
+                        (
+                            bc.bm,
+                            bc.bn,
+                            bc.bk,
+                            bc.stages,
+                            bc.multicast,
+                            bc.raster,
+                            bc.tiles,
+                            bc.epilogue,
+                            bc.l2_hint,
+                            bc.wait_depth,
+                            bc.fence_hoisted,
+                            bc.consumer_wgs,
+                        ),
+                        "{why} ({m}x{n}x{k}): the f16 rule selects {} and the bf16 rule selects {} \
+                         -- one dispatcher, so these must differ in the OPERAND TOKEN and nothing \
+                         else",
+                        fc.name,
+                        bc.name
+                    );
+                    // The twin is a real module, not merely a matching struct.
+                    assert!(wgmma_module(bc, &license()).is_ok(), "{}", bc.name);
+                }
+                (Err(fe), Err(be)) => {
+                    declines += 1;
+                    assert!(fe.starts_with(UNSUPPORTED) && be.starts_with(UNSUPPORTED), "{why}");
+                    // Both declines quote the SAME plan, so the reason is the rule's and not the
+                    // module table's asymmetry.
+                    let p = wgmma_dispatch_plan(m, n, k, HOPPER_SM_COUNT);
+                    assert!(fe.contains(&p.summary()) && be.contains(&p.summary()), "{why}");
+                    assert!(be.contains("bf16"), "the decline must name the dtype: {be}");
+                }
+                (f, b) => panic!(
+                    "{why} ({m}x{n}x{k}): the two dtypes DISAGREE about whether the rule can be \
+                     served -- f16 {f:?}, bf16 {b:?}. A one-sided decline routes the offload to the \
+                     pre-Hopper launcher and returns correct numbers at the old speed."
+                ),
+            }
+        }
         assert_eq!(
-            wgmma_w1_for(usize::MAX, usize::MAX).name,
-            WGMMA_W1_MCB_V2.name
+            declines,
+            points.iter().filter(|p| p.4).count(),
+            "every pinned DECLINE point must actually decline at BOTH dtypes, or this law has no \
+             negative half"
+        );
+        assert!(declines >= 2, "and there must be a negative half at all");
+        // ...and every bf16 twin is census-enumerated, which is what assembles it on a CPU before an
+        // H100 is rented. `wgmma_bf16_vs_cublas` reaches these rows through the RULE and there is no
+        // bf16 config sweep, so `wgmma_all_emittable` is their only pre-flight.
+        for p in WGMMA_BENCH_GRID {
+            let bc =
+                wgmma_dispatch_dtype(WgmmaDtype::Bf16, p.m, p.n, p.k, HOPPER_SM_COUNT).unwrap();
+            assert!(
+                wgmma_all_emittable().iter().any(|c| c.key == bc.key),
+                "{}: {} is not in the emittable corpus the ASCII, .version and ptxas census laws \
+                 scan",
+                p.label,
+                bc.name
+            );
+        }
+    }
+
+    /// **Every bf16 twin's PTX is its f16 twin's PTX with the operand token substituted, and nothing
+    /// else** -- the law that makes the bf16 mirror free of rented device time.
+    ///
+    /// The mirror adds four modules a real H100 will be handed. Gating them on the device would cost
+    /// rented minutes for a claim that is decidable on a CPU, because `wgmma` is precision-generic
+    /// across the 16-bit types: the SMEM image, the swizzle, the tensor-map box, the multicast
+    /// slicing, the barrier protocol, the tile map, the register split and the epilogue are all byte
+    /// arithmetic at a fixed 2-byte element and none of them can see the dtype. So the whole delta
+    /// SHOULD be the token, and here that is asserted rather than asserted-in-prose.
+    ///
+    /// It is a stronger statement than a shape gate: an accidental `..WGMMA_W1_MCB_V2` where
+    /// `..WGMMA_W1_MCB_V2_P` was meant, a dropped `raster: 16`, a stale `stages` -- any of them shows
+    /// up here as a text difference that the substitution cannot explain, at `cargo test` speed.
+    /// `gpu::tests::wgmma_cluster_multicast_is_exact` still gates the multicast's exactness on the
+    /// device, at the f16 rows; this is what carries that result to their twins.
+    #[test]
+    fn every_bf16_twin_is_its_f16_twin_modulo_the_operand_token() {
+        let mut pairs = 0usize;
+        for bc in wgmma_all_emittable() {
+            if bc.dtype != WgmmaDtype::Bf16 {
+                continue;
+            }
+            let want_f16_name = bc.name.replace("bf16", "f16");
+            let fc = wgmma_all_emittable()
+                .into_iter()
+                .find(|c| c.name == want_f16_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} has no f16 twin named {want_f16_name}, so the mirror is not a mirror",
+                        bc.name
+                    )
+                });
+            assert_eq!(fc.dtype, WgmmaDtype::F16);
+            let fptx = wgmma_module(fc, &license()).unwrap();
+            let bptx = wgmma_module(bc, &license()).unwrap();
+            // The substitution is on the TOKEN, in both directions, so a `bf16` that survived in the
+            // f16 module (or an `f16` left in the bf16 one) is a mismatch rather than a wash.
+            assert_eq!(
+                bptx.replace("bf16", "f16"),
+                fptx,
+                "{} is not {} with the operand token substituted -- the mirror must differ in the \
+                 dtype and NOTHING else",
+                bc.name,
+                fc.name
+            );
+            // ...and the substitution is not vacuous: the bf16 module really does name the bf16
+            // operand type in its `wgmma`, so a twin that silently emitted f16 instructions under a
+            // bf16 name would fail here instead of returning f16-rounded numbers on device.
+            assert!(
+                bptx.contains(".f32.bf16.bf16") && !fptx.contains(".f32.bf16.bf16"),
+                "{}: the bf16 wgmma operand type is missing",
+                bc.name
+            );
+            pairs += 1;
+        }
+        // Every bf16 row in the crate is paired, and there are at least the four the shipped rule
+        // needs plus the three wave-2 rows.
+        assert!(
+            pairs >= 7,
+            "the bf16 mirror must cover every arm the rule can select: {pairs} pairs"
         );
     }
 
@@ -11590,6 +12242,107 @@ mod tests {
         );
     }
 
+    /// **THE CLUSTER PREDICATE AGREES WITH EVERY MEASURED SIGN, AND EACH OF ITS TWO TERMS IS
+    /// FALSIFIED IN EXACTLY ONE CELL.**
+    ///
+    /// The 2026-08-12 H100 visit
+    /// (`bench/gpu/h100/2026-08-12-h100-w3-r2-config-sweep.log`) ran the cluster A/B as a ONE-FACT
+    /// comparison -- `w1_v2` against `w1_mcb_v2`: same 128x256 tile, same 4 stages, same v2 store,
+    /// the `1x2x1` B multicast the only difference -- at five of the seven benched shapes. That is a
+    /// complete 2x2 in the predicate's two terms plus one repeat, and it FIRED WAVE3_DOSSIER 3.8's
+    /// pre-registered falsifier (i): `gpt_d1024_down` prefers no cluster at the suite's highest
+    /// `f_L2`.
+    ///
+    /// So this law is the predicate scored against the measurement, shape by shape, with the
+    /// milliseconds in the source. It asserts three things a pin on the verdict alone cannot:
+    ///
+    /// 1. the verdict matches the measured SIGN at all five shapes;
+    /// 2. **which term** declined each loss -- so a later edit cannot "fix" one term by widening the
+    ///    other and still pass;
+    /// 3. that BOTH terms are load-bearing, by finding at least one loss that only the benefit term
+    ///    catches (`gpt_d1024_up`, multi-wave at `f_L2` 0.553) and at least one that only the
+    ///    amortization term catches (`gpt_d1024_down`, one wave at `f_L2` 0.955).
+    ///
+    /// Every row is evaluated on the **linear, un-clustered** arm, because that is the arm the A/B
+    /// ran. `sq8192` also rasters when it ships, where the same function reads 0.8826 instead of
+    /// 0.8124 and the verdict is ON either way -- a margin change, not a sign change.
+    #[test]
+    fn the_cluster_predicate_agrees_with_every_measured_cluster_ab() {
+        /// (label, un-clustered ms, clustered ms, which term must decline it -- `None` if it is ON)
+        #[derive(PartialEq, Debug)]
+        enum Declined {
+            Benefit,
+            Amortization,
+            Both,
+            Nothing,
+        }
+        let rows = [
+            // sq2048: one wave AND under the benefit bar -- the only shape both terms decline.
+            ("sq2048", 0.027274, 0.029682, Declined::Both),
+            // gpt_d1024_down: THE FALSIFIER. f_L2 0.955 (the suite's highest) clears the benefit
+            // term outright; one wave is the whole reason it is OFF.
+            ("gpt_d1024_down", 0.046398, 0.049139, Declined::Amortization),
+            // gpt_d1024_up: four waves, so the amortization term PASSES; f_L2 0.553 is what declines
+            // it. This is dossier 3.8's falsifier (ii), which did NOT fire -- the cluster really
+            // does lose at a low f_L2 even multi-wave.
+            ("gpt_d1024_up", 0.067706, 0.072208, Declined::Benefit),
+            // ...and the two shapes that pass both terms and WIN, by 11.2% and 39.9% of their own
+            // time.
+            ("sq4096", 0.209023, 0.185573, Declined::Nothing),
+            ("sq8192", 2.284573, 1.372618, Declined::Nothing),
+        ];
+        let bar = cluster_l2_saving_threshold();
+        let mut seen = [false, false, false, false];
+        for (label, off_ms, on_ms, want) in rows {
+            let g = WGMMA_BENCH_GRID
+                .iter()
+                .find(|g| g.label == label)
+                .unwrap_or_else(|| panic!("{label} is not a bench grid row"));
+            // The arm the A/B ran: linear order, one tile per CTA.
+            let p = wgmma_dispatch_plan_with_raster(g.m, g.n, g.k, HOPPER_SM_COUNT, Some(false));
+            let benefit = p.l2_saving >= bar;
+            let got = match (benefit, p.cluster_amortized) {
+                (true, true) => Declined::Nothing,
+                (false, true) => Declined::Benefit,
+                (true, false) => Declined::Amortization,
+                (false, false) => Declined::Both,
+            };
+            assert_eq!(
+                got, want,
+                "{label}: the predicate declines on {got:?}, pinned at {want:?} -- saves {:.4} vs \
+                 {bar:.4} on {} wave(s) of {} needed",
+                p.l2_saving, p.waves, CLUSTER_MIN_WAVES
+            );
+            // The verdict is the conjunction, and it must match which arm was actually faster.
+            let cluster_won = on_ms < off_ms;
+            assert_eq!(
+                p.cluster,
+                cluster_won,
+                "{label}: the rule says cluster {} and the round measured the clustered arm at \
+                 {on_ms:.6} ms against {off_ms:.6} un-clustered ({:+.1}%)",
+                if p.cluster { "ON" } else { "off" },
+                100.0 * (on_ms / off_ms - 1.0)
+            );
+            seen[match got {
+                Declined::Benefit => 0,
+                Declined::Amortization => 1,
+                Declined::Both => 2,
+                Declined::Nothing => 3,
+            }] = true;
+        }
+        // THE 2x2 IS COMPLETE. Each term is the sole reason for exactly one measured loss, so
+        // neither can be deleted without a measured shape changing sign -- which is the only form of
+        // "this term is necessary" worth having.
+        assert!(
+            seen[0] && seen[1],
+            "both terms must be SOLELY responsible for at least one measured loss, or one of them \
+             is decoration: benefit-only {} amortization-only {}",
+            seen[0],
+            seen[1]
+        );
+        assert!(seen[2] && seen[3], "and both extremes must be covered");
+    }
+
     /// **WAVE 3 lever 3, law (a): the dispatcher's verdict is PINNED at every benched shape.**
     ///
     /// The dossier states this as a law on the dispatcher itself, and the reason is guard G3 in a
@@ -11737,19 +12490,29 @@ mod tests {
                 0.5528,
                 &WGMMA_W1_V2_P,
             ),
-            // gpt_d1024_down: the predicate's most informative point -- a single-wave shape sitting
-            // exactly at the L2 roof, where the cluster is the SOLE variable.
+            // gpt_d1024_down: the predicate's most informative point, and the one that FIRED
+            // WAVE3_DOSSIER 3.8's pre-registered falsifier (i). A single-wave shape sitting exactly
+            // at the L2 roof, where the cluster is the SOLE variable -- so 3.2's `f_L2 >= 0.78` term
+            // calls it the table's most confident ON (0.955, the suite's highest) and the
+            // 2026-08-12 visit measured the clustered arm at 91.4% of cuBLAS against the
+            // un-clustered arm's 96.8%: a 5.4-point LOSS.
+            //
+            // The cluster is therefore OFF here on the AMORTIZATION term, at one wave against the
+            // two `CLUSTER_MIN_WAVES` needs, and this row is the whole evidence for that term. Note
+            // what did NOT change: `f_L2` is still 0.9552 and the benefit term still PASSES, which
+            // is why the pin below carries both numbers -- a reader must be able to see that the two
+            // terms disagree here rather than infer it.
             pin(
                 "gpt_d1024_down",
                 128,
                 256,
                 128,
                 1,
-                true,
+                false,
                 1,
                 false,
                 0.9552,
-                &WGMMA_W1_MCB_V2,
+                &WGMMA_W1_V2,
             ),
             // gpt_d4096_up: the only shape where all three fire, and the one whose cluster decision
             // the RASTER flips -- 0.692 with the raster forced off (136.4 MB of footprint, priced
@@ -11806,19 +12569,30 @@ mod tests {
                 "{}: the saving must be f_L2 x the tile's multicast share",
                 w.label
             );
+            // The verdict is the CONJUNCTION of the benefit term and the amortization term, and the
+            // test spells both out. gpt_d1024_down is the row that makes the conjunction visible:
+            // its benefit term passes and its amortization term does not.
+            assert_eq!(
+                plan.cluster_amortized,
+                plan.waves >= CLUSTER_MIN_WAVES,
+                "{}: the amortization term is `waves >= CLUSTER_MIN_WAVES` and nothing else",
+                w.label
+            );
             assert_eq!(
                 plan.cluster,
-                plan.l2_saving >= cluster_l2_saving_threshold(),
-                "{}: the verdict is the saving's, not f_L2's",
+                plan.l2_saving >= cluster_l2_saving_threshold() && plan.cluster_amortized,
+                "{}: the verdict is (the saving clears the break-even) AND (the coupling is \
+                 amortized) -- neither term alone",
                 w.label
             );
             let (rbm, rbn, _) = FLOOR_REF_TILE;
             if (plan.bm, plan.bn) == (rbm, rbn) {
                 assert_eq!(
                     plan.cluster,
-                    plan.f_l2 >= CLUSTER_F_L2_THRESHOLD,
-                    "{}: at the tile the threshold was FITTED at, the two spellings are one \
-                     comparison and the dossier's 3.2 column must decide it",
+                    plan.f_l2 >= CLUSTER_F_L2_THRESHOLD && plan.cluster_amortized,
+                    "{}: at the tile the threshold was FITTED at, the benefit term IS the dossier's \
+                     3.2 comparison `f_L2 >= 0.78` -- the share is exactly 1/3 -- so the verdict \
+                     there is that comparison AND the amortization term",
                     w.label
                 );
             }
@@ -12163,6 +12937,10 @@ mod tests {
                 "{:.3}",
                 multicast_l2_share(FLOOR_REF_TILE.0, FLOOR_REF_TILE.1)
             ),
+            // The amortization term the 2026-08-12 falsifier added. Without this needle the header
+            // could state a one-term cluster rule above a table whose gpt_d1024_down row reads
+            // `saves 0.318 ... cluster off` -- the exact contradiction this law exists to forbid.
+            format!("at least {} waves deep", CLUSTER_MIN_WAVES),
         ] {
             assert!(
                 t.contains(&needle),
@@ -12192,6 +12970,21 @@ mod tests {
         assert!(
             t.contains("SAVE") && t.contains("(bn/2)/(bm+bn)"),
             "the header must name the quantity actually compared: {t}"
+        );
+        // THE SECOND FALSIFIER, and the one a round log would have gone stale on: gpt_d1024_down
+        // CLEARS the benefit term (0.318 of 0.26) and is still OFF, so a header stating only the
+        // benefit term would contradict the table printed under it at the shape whose measurement
+        // added the second term.
+        let down = wgmma_dispatch_plan(4096, 1024, 4096, HOPPER_SM_COUNT);
+        assert!(
+            down.l2_saving >= cluster_l2_saving_threshold() && !down.cluster,
+            "gpt_d1024_down is what makes the one-term and two-term rules distinguishable: {down:?}"
+        );
+        assert!(
+            down.summary()
+                .contains("amortized over 1 waves vs 2 needed: fail"),
+            "the per-shape line must say WHICH term declined it: {}",
+            down.summary()
         );
         // Printed under `--nocapture` so the text a round log will carry is readable from a plain
         // `cargo test` rather than only from a rented hour.
@@ -12247,10 +13040,15 @@ mod tests {
             "one wave: every tile is resident simultaneously, so no permutation of the launch \
              order can change a single byte of traffic"
         );
-        // --- 3. the cluster's f_L2 threshold, from both sides at one k-stage of resolution -------
-        // At 2048x2048 (128 tiles, one wave) f_L2 crosses 0.78 between n_k = 33 and n_k = 34.
-        let off = plan(2048, 2048, 33 * 64);
-        let on = plan(2048, 2048, 34 * 64);
+        // --- 3. the cluster's BENEFIT term, from both sides at one k-stage of resolution ----------
+        // At 4096x4096 (512 tiles, FOUR waves, so the amortization term is satisfied on both sides
+        // and the benefit term is the only variable) f_L2 crosses 0.78 between n_k = 33 and 34.
+        let off = plan(4096, 4096, 33 * 64);
+        let on = plan(4096, 4096, 34 * 64);
+        assert!(
+            off.cluster_amortized && on.cluster_amortized,
+            "both sides are multi-wave, or this probe tests two things at once"
+        );
         assert!(!off.cluster && off.f_l2 < CLUSTER_F_L2_THRESHOLD, "{off:?}");
         assert!(on.cluster && on.f_l2 >= CLUSTER_F_L2_THRESHOLD, "{on:?}");
         assert!(
@@ -12258,6 +13056,63 @@ mod tests {
             "the bracket must be TIGHT or it is not a boundary test: {:.4} vs {:.4}",
             off.f_l2,
             on.f_l2
+        );
+        // --- 3b. the cluster's AMORTIZATION term, at the same f_L2 EXACTLY -----------------------
+        //
+        // The term the 2026-08-12 falsifier added, tested the only way a term on `waves` can be:
+        // two shapes with the SAME `f_L2` and different wave counts. `gpt_d1024_down` doubled in M
+        // is that pair by construction -- doubling `M` doubles `tiles` and doubles `waves`, and it
+        // doubles `T_L2` and the floor together, so `f_L2` is EXACTLY invariant. Everything else the
+        // rule reads is equal too: same tile, same `n_k`, same raster verdict, same residency. The
+        // cluster verdict differs, and `waves` is the only thing that moved.
+        let one_wave = plan(4096, 1024, 4096);
+        let two_waves = plan(8192, 1024, 4096);
+        assert_eq!(
+            (one_wave.waves, two_waves.waves),
+            (1, 2),
+            "the pair must straddle CLUSTER_MIN_WAVES at one wave of resolution"
+        );
+        assert!(
+            (one_wave.f_l2 - two_waves.f_l2).abs() < 1e-12,
+            "the pair must sit at the SAME f_L2 or the probe is not about `waves`: {:.6} vs {:.6}",
+            one_wave.f_l2,
+            two_waves.f_l2
+        );
+        assert_eq!(
+            (
+                one_wave.bm,
+                one_wave.bn,
+                one_wave.raster,
+                one_wave.l2_resident
+            ),
+            (
+                two_waves.bm,
+                two_waves.bn,
+                two_waves.raster,
+                two_waves.l2_resident
+            ),
+            "and in the same tile, order and residency"
+        );
+        assert!(
+            one_wave.l2_saving >= cluster_l2_saving_threshold()
+                && two_waves.l2_saving >= cluster_l2_saving_threshold(),
+            "BOTH clear the benefit term -- that is what makes this a test of the other one"
+        );
+        assert!(
+            !one_wave.cluster_amortized && !one_wave.cluster,
+            "a SINGLE-WAVE grid does not get the cluster however L2-bound it is: {one_wave:?}"
+        );
+        assert!(
+            two_waves.cluster_amortized && two_waves.cluster,
+            "a MULTI-WAVE grid at the identical f_L2 DOES: {two_waves:?}"
+        );
+        // ...and the multi-wave side lands on a real module, so the term cannot buy its verdict with
+        // a configuration nothing emits.
+        assert_eq!(
+            wgmma_dispatch(8192, 1024, 4096, HOPPER_SM_COUNT)
+                .expect("the clustered persistent row is emitted")
+                .key,
+            WGMMA_W1_MCB_V2_P.key
         );
         // --- 4. THE DECLINE, which is the law's whole point --------------------------------------
         // 140 m-tiles by one 256-wide n-tile fails the efficiency floor at ALL THREE tiles (0.530,
@@ -12299,6 +13154,14 @@ mod tests {
         assert!(
             (sq.f_l2 - 1.0).abs() < 1e-9 && !sq.cluster,
             "fully L2-bound and still un-clustered: {sq:?}"
+        );
+        // The square-tile refusal is a claim about the BENEFIT term (1/4 of the L2 read against a
+        // 0.26 break-even), so it is asserted on that term directly. This particular shape is also
+        // one wave, so the amortization term declines it too, and reading the refusal off the
+        // conjunction would let a later edit break the benefit half without failing anything.
+        assert!(
+            sq.l2_saving < cluster_l2_saving_threshold(),
+            "the square tile must fail the BENEFIT term specifically: {sq:?}"
         );
         let margin = cluster_l2_saving_threshold() - sq.l2_saving;
         assert!(
