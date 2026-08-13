@@ -1,6 +1,6 @@
 # `tests/fail/` — compile-fail fixtures
 
-**110** user-written `.wk` programs that must be **rejected at compile time** with a pinned diagnostic
+**112** user-written `.wk` programs that must be **rejected at compile time** with a pinned diagnostic
 code. Directory name is `tests/fail` — **not** `tests/compile-fail`.
 
 ## Format
@@ -15,6 +15,15 @@ module tests.fail.my_fixture
 - Harness runs `--error-format=json --emit=mir` and checks stderr for `"code":"<code>"`.
 
 Codes are permanently stable — never renumber or recycle. `E0001` is retired.
+
+## Fixtures whose MESSAGE is pinned too
+
+A handful of shape fixtures are also listed in `NAMED_DIM_MESSAGES`
+(`crates/wukongc/tests/fail.rs`), which asserts the exact headline in the JSON stream: `wrong_k.wk`
+and `wrong_m.wk` (the dimension is named — `` dimension mismatch on `K` (axis 0) ``), `rank.wk` (rank
+against rank plus both shapes) and `tensor_index_oob.wk` (the axis of the offending index). Editing
+the prose of one of those messages means editing that table in the same commit; the code alone
+staying green does not mean the diagnostic is still useful.
 
 ## Adding a fixture
 
