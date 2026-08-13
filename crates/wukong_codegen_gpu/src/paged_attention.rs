@@ -81,11 +81,284 @@ use crate::ptx_target::HDR_SM80;
 
 /// `(slot, head)` pairs per CTA — one **warp** each (block_dim = `32 * PAGED_ATTN_WARPS`). The warp's
 /// 32 lanes cooperatively stream the context, so the launch fills the GPU (`num_slots*heads` warps)
-/// instead of the one-thread-per-pair version's `num_slots*heads` *threads* (which left 39/40 SMs idle).
+/// instead of the one-thread-per-pair version's `num_slots*heads` *threads* (which left 19/20 SMs idle
+/// on the 4050 — the probe prints 20, not 40; see WAVE6_DOSSIER.md §1.2).
 pub const PAGED_ATTN_WARPS: u32 = 4;
+
+/// Largest GQA group size the K-side fold bakes a shared-acc tile for. Llama-3-8B is `g = 4`,
+/// Llama-3-70B / MQA-8 is `g = 8`. A `g > 8` geometry stays on the one-head-per-warp kernel.
+pub const KFOLD_G_MAX: usize = 8;
 
 /// PTX entry name for the paged decode-attention kernel.
 pub const PAGED_ATTN_ENTRY: &str = "paged_attn_decode";
+
+/// PTX entry name for the K-side GQA-fold decode-attention kernel (WAVE6 lever 5). Same params and
+/// query-headed warp map as [`PAGED_ATTN_ENTRY`]; warp 0 of each CTA stages K into shared.
+pub const PAGED_ATTN_KFOLD_ENTRY: &str = "paged_attn_decode_kfold";
+
+/// Where the K and V planes the append kernels read live inside their source buffer(s): `row_stride`
+/// f32 elements per slot row, K starting at column `k_off` and V at column `v_off`.
+///
+/// **Why this exists.** The shipped decode layer projects K and V into two packed `[Bcap, kv_dim]`
+/// buffers, and the append kernel's source index was exactly its own thread id. The merged-QKV
+/// projection ([`crate::serving::QkvArm::Merged`]) issues **one** GEMM into a single
+/// `[Bcap, D + 2*kv_dim]` buffer, whose C is row-major — so K's rows are `D` elements into a row
+/// that is `D + 2*kv_dim` long, not the start of a buffer. That is a **row stride plus a column
+/// offset**, and nothing else: the same bytes, in the same order, read from a different address.
+/// Both arms are expressible here, and [`packed`](Self::packed) reproduces the shipped indexing
+/// exactly (`row_stride == kv_dim`, both offsets 0), which is what makes the merge bit-identical
+/// rather than merely close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvSourceLayout {
+    /// f32 elements between one slot's row and the next, in **both** source buffers.
+    pub row_stride: usize,
+    /// Column at which the K plane starts.
+    pub k_off: usize,
+    /// Column at which the V plane starts.
+    pub v_off: usize,
+}
+
+impl KvSourceLayout {
+    /// Two separate packed `[Bcap, kv_dim]` buffers — the shipped layout, and the one every
+    /// pre-Wave-6 caller means.
+    pub fn packed(kv_dim: usize) -> Self {
+        Self {
+            row_stride: kv_dim,
+            k_off: 0,
+            v_off: 0,
+        }
+    }
+
+    /// One merged `[Bcap, q_dim + 2*kv_dim]` QKV projection, laid out **Q, then K, then V** along the
+    /// row (the order [`crate::serving::decode_weight_extents`] lists the weights in, and the order
+    /// the row-concatenated weight is built in). Both `knew`/`vnew` pointers are then the same
+    /// buffer.
+    pub fn merged_qkv(q_dim: usize, kv_dim: usize) -> Self {
+        Self {
+            row_stride: q_dim + 2 * kv_dim,
+            k_off: q_dim,
+            v_off: q_dim + kv_dim,
+        }
+    }
+
+    /// Both planes must fit inside a row, and a row must be at least `kv_dim` wide. Panics naming the
+    /// offender — a layout mistake here scatters a neighbouring plane's numbers into the cache with
+    /// no fault and no tolerance gate able to attribute it.
+    pub fn assert_fits(&self, kv_dim: usize) {
+        assert!(
+            self.k_off + kv_dim <= self.row_stride && self.v_off + kv_dim <= self.row_stride,
+            "KvSourceLayout {self:?}: a [.., kv_dim={kv_dim}] plane at k_off/v_off must fit inside \
+             a row of row_stride elements"
+        );
+    }
+}
+
+/// How the inner K/V loops issue global loads. **Values and FMA order are identical**; only the
+/// instruction width changes. `V4` is the shipped default (WAVE6 lever 4). `Scalar` is the pre-Wave-6
+/// kernel, retained so the `==` gate has a twin to compare against rather than a tolerance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnVec {
+    /// One `ld.global.u16` / `ld.global.s8` per element — the kernel the layout-invariance gates
+    /// were written against.
+    Scalar,
+    /// `ld.global.v4.b32` (16 B) per eight f16s / sixteen int8s, then unpack in element order.
+    /// Ampere-legal, keeps the `sm_80` floor (G-W6-7). Needs `head_dim % 8 == 0` (f16) or
+    /// `head_dim % 16 == 0` (int8) because `elem_offset` puts a vector at byte
+    /// `es * head_dim * sizeof(elem)` (G-W6-2).
+    V4,
+}
+
+/// Whether the K-side GQA fold applies. The fold is a **CTA-cooperative K load**: the four warps
+/// of a CTA share one K vector per lane (same `t`, same `kv_head`) via a 32-row shared tile, while
+/// each warp still owns one `(slot, q_head)` and keeps its own `%acc<hd>` — so the V-side register
+/// wall never appears. That sharing holds iff `g >= PAGED_ATTN_WARPS` (four consecutive query heads
+/// lie in one KV group) and `q_heads` is a multiple of the warp count (no partial CTA, so `bar.sync`
+/// cannot hang). Llama-3-8B (`32q/8kv`, g=4) and 70B (`64q/8kv`, g=8) both qualify; MHA does not.
+pub fn kfold_applies(q_heads: usize, kv_heads: usize) -> bool {
+    kv_heads > 0
+        && q_heads.is_multiple_of(kv_heads)
+        && q_heads.is_multiple_of(PAGED_ATTN_WARPS as usize)
+        && {
+            let g = q_heads / kv_heads;
+            g >= PAGED_ATTN_WARPS as usize && g <= KFOLD_G_MAX && g.is_power_of_two()
+        }
+}
+
+fn assert_f16_vec_align(head_dim: usize, vec: AttnVec) {
+    assert!(
+        head_dim > 0 && head_dim.is_multiple_of(2),
+        "head_dim must be a positive even number"
+    );
+    if vec == AttnVec::V4 {
+        assert!(
+            head_dim.is_multiple_of(8),
+            "paged_attn_decode_ptx: ld.global.v4.b32 needs 16-byte alignment; elem_offset puts a \
+             vector at byte es*head_dim*sizeof(f16)=es*{head_dim}*2, so head_dim % 8 == 0 (got \
+             {head_dim})"
+        );
+    }
+}
+
+fn assert_int8_vec_align(head_dim: usize, vec: AttnVec) {
+    assert!(
+        head_dim > 0 && head_dim.is_multiple_of(2),
+        "head_dim must be a positive even number"
+    );
+    if vec == AttnVec::V4 {
+        assert!(
+            head_dim.is_multiple_of(16),
+            "paged_attn_decode_int8_ptx: ld.global.v4.b32 needs 16-byte alignment; elem_offset \
+             puts a vector at byte es*head_dim*sizeof(i8)=es*{head_dim}, so head_dim % 16 == 0 \
+             (got {head_dim})"
+        );
+    }
+}
+
+fn emit_f16_k_dot(hd: usize, vec: AttnVec) -> String {
+    let mut s = String::from("    mov.f32 %score,0f00000000;\n");
+    match vec {
+        AttnVec::Scalar => {
+            for d in 0..hd {
+                s += &format!(
+                    "    ld.shared.f32 %qv,[%qshw+{}];\n    ld.global.u16 %h,[%kbase+{}];\n    cvt.f32.f16 %kf,%h;\n    fma.rn.f32 %score,%qv,%kf,%score;\n",
+                    d * 4,
+                    d * 2
+                );
+            }
+        }
+        AttnVec::V4 => {
+            for c in 0..hd / 8 {
+                let off = c * 16;
+                s += &format!("    ld.global.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%kbase+{off}];\n");
+                for i in 0..4 {
+                    let d0 = c * 8 + i * 2;
+                    let d1 = d0 + 1;
+                    s += &format!(
+                        "    mov.b32 {{%h0,%h1}},%pk{i};\n    ld.shared.f32 %qv,[%qshw+{}];\n    cvt.f32.f16 %kf,%h0;\n    fma.rn.f32 %score,%qv,%kf,%score;\n    ld.shared.f32 %qv,[%qshw+{}];\n    cvt.f32.f16 %kf,%h1;\n    fma.rn.f32 %score,%qv,%kf,%score;\n",
+                        d0 * 4,
+                        d1 * 4
+                    );
+                }
+            }
+        }
+    }
+    s
+}
+
+fn emit_f16_v_acc(hd: usize, vec: AttnVec) -> String {
+    let mut s = String::new();
+    match vec {
+        AttnVec::Scalar => {
+            for d in 0..hd {
+                s += &format!(
+                    "    ld.global.u16 %h,[%vbase+{}];\n    cvt.f32.f16 %vf,%h;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%p,%vf,%acc{d};\n",
+                    d * 2
+                );
+            }
+        }
+        AttnVec::V4 => {
+            for c in 0..hd / 8 {
+                let off = c * 16;
+                s += &format!("    ld.global.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%vbase+{off}];\n");
+                for i in 0..4 {
+                    let d0 = c * 8 + i * 2;
+                    let d1 = d0 + 1;
+                    s += &format!(
+                        "    mov.b32 {{%h0,%h1}},%pk{i};\n    cvt.f32.f16 %vf,%h0;\n    mul.f32 %acc{d0},%acc{d0},%corr;\n    fma.rn.f32 %acc{d0},%p,%vf,%acc{d0};\n    cvt.f32.f16 %vf,%h1;\n    mul.f32 %acc{d1},%acc{d1},%corr;\n    fma.rn.f32 %acc{d1},%p,%vf,%acc{d1};\n"
+                    );
+                }
+            }
+        }
+    }
+    s
+}
+
+/// K-dot against a per-lane f16 vector already staged at `%kshw` (CTA-shared K tile, WAVE6 lever 5).
+/// Unpack order is the same `d = 0,1,2,...` as [`emit_f16_k_dot`].
+fn emit_f16_k_dot_from_ksh(hd: usize) -> String {
+    let mut s = String::from("    mov.f32 %score,0f00000000;\n");
+    for c in 0..hd / 8 {
+        let off = c * 16;
+        s += &format!("    ld.shared.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%kshw+{off}];\n");
+        for i in 0..4 {
+            let d0 = c * 8 + i * 2;
+            let d1 = d0 + 1;
+            s += &format!(
+                "    mov.b32 {{%h0,%h1}},%pk{i};\n    ld.shared.f32 %qv,[%qshw+{}];\n    cvt.f32.f16 %kf,%h0;\n    fma.rn.f32 %score,%qv,%kf,%score;\n    ld.shared.f32 %qv,[%qshw+{}];\n    cvt.f32.f16 %kf,%h1;\n    fma.rn.f32 %score,%qv,%kf,%score;\n",
+                d0 * 4,
+                d1 * 4
+            );
+        }
+    }
+    s
+}
+
+fn emit_int8_k_dot(hd: usize, vec: AttnVec) -> String {
+    let mut s = String::from("    mov.f32 %score,0f00000000;\n");
+    match vec {
+        AttnVec::Scalar => {
+            for d in 0..hd {
+                s += &format!(
+                    "    ld.shared.f32 %qv,[%qshw+{}];\n    ld.global.s8 %ki,[%kbase+{}];\n    cvt.rn.f32.s32 %kf,%ki;\n    fma.rn.f32 %score,%qv,%kf,%score;\n",
+                    d * 4, d
+                );
+            }
+        }
+        AttnVec::V4 => {
+            for c in 0..hd / 16 {
+                let off = c * 16;
+                s += &format!("    ld.global.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%kbase+{off}];\n");
+                for i in 0..4 {
+                    for b in 0..4 {
+                        let d = c * 16 + i * 4 + b;
+                        let bit = b * 8;
+                        s += &format!(
+                            "    bfe.s32 %ki,%pk{i},{bit},8;\n    ld.shared.f32 %qv,[%qshw+{}];\n    cvt.rn.f32.s32 %kf,%ki;\n    fma.rn.f32 %score,%qv,%kf,%score;\n",
+                            d * 4
+                        );
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
+fn emit_int8_v_acc(hd: usize, vec: AttnVec) -> String {
+    let mut s = String::new();
+    match vec {
+        AttnVec::Scalar => {
+            for d in 0..hd {
+                s += &format!(
+                    "    ld.global.s8 %ki,[%vbase+{d}];\n    cvt.rn.f32.s32 %vf,%ki;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%pv,%vf,%acc{d};\n"
+                );
+            }
+        }
+        AttnVec::V4 => {
+            for c in 0..hd / 16 {
+                let off = c * 16;
+                s += &format!("    ld.global.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%vbase+{off}];\n");
+                for i in 0..4 {
+                    for b in 0..4 {
+                        let d = c * 16 + i * 4 + b;
+                        let bit = b * 8;
+                        s += &format!(
+                            "    bfe.s32 %ki,%pk{i},{bit},8;\n    cvt.rn.f32.s32 %vf,%ki;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%pv,%vf,%acc{d};\n"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
+fn vec_regs(vec: AttnVec) -> &'static str {
+    match vec {
+        AttnVec::Scalar => "",
+        AttnVec::V4 => "    .reg .b16 %h0,%h1;\n    .reg .b32 %pk0,%pk1,%pk2,%pk3;\n",
+    }
+}
 
 /// Generate the paged decode-attention PTX, **specialized to `head_dim`** (baked so the V accumulator
 /// unrolls into named registers `%acc0..` and the per-position dot unrolls). **Warp-cooperative**: one
@@ -104,11 +377,23 @@ pub const PAGED_ATTN_ENTRY: &str = "paged_attn_decode";
 /// per-`g` variant would need a per-`g` module-cache key, and [`crate::Gpu::function`] caches on the
 /// key alone and never re-examines the PTX on a hit. `q_heads == kv_heads` makes the group size 1 and
 /// the mapping the identity, i.e. exactly the pre-GQA kernel.
+///
+/// **Wave-6 v4 coalescing.** The shipped generator emits [`AttnVec::V4`]. The scalar twin
+/// [`paged_attn_decode_scalar_ptx`] is the `==` control: same lane partition, same FMA order, 8x
+/// fewer load instructions. Alignment is G-W6-2 (`head_dim % 8 == 0`).
 pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
-    assert!(
-        head_dim > 0 && head_dim.is_multiple_of(2),
-        "head_dim must be a positive even number"
-    );
+    paged_attn_decode_ptx_with(head_dim, AttnVec::V4)
+}
+
+/// Pre-Wave-6 scalar `ld.global.u16` twin of [`paged_attn_decode_ptx`]. Same entry name, same
+/// params, same values — only the load instruction width differs. The device `==` gate loads this
+/// under a **different** module-cache key so the two modules cannot collide.
+pub fn paged_attn_decode_scalar_ptx(head_dim: usize) -> String {
+    paged_attn_decode_ptx_with(head_dim, AttnVec::Scalar)
+}
+
+fn paged_attn_decode_ptx_with(head_dim: usize, vec: AttnVec) -> String {
+    assert_f16_vec_align(head_dim, vec);
     let hd = head_dim;
     let w = PAGED_ATTN_WARPS as usize;
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
@@ -141,13 +426,15 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
         \x20   .param .u32 pBsz,\n\
         \x20   .param .u32 pNblk,\n\
         \x20   .param .u32 pMbps,\n\
-        \x20   .param .u32 pLayer\n)\n{{\n"
+        \x20   .param .u32 pLayer,\n\
+        \x20   .param .u32 pQStride\n)\n{{\n"
     );
     s += &format!("    .shared .f32 qsh[{}];\n", w * hd);
     s += &format!("    .reg .f32 %acc<{hd}>;\n");
     s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt;\n";
     s += "    .reg .b16 %h;\n";
-    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e,%dd,%kvheads,%kvhead,%grp;\n";
+    s += vec_regs(vec);
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%oidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%qstride,%e,%dd,%kvheads,%kvhead,%grp;\n";
     s += "    .reg .b64 %Q,%K,%V,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw;\n";
     s += "    .reg .pred %p0,%p1,%p2;\n";
     s += "    ld.param.u64 %Q,[pQ];   cvta.to.global.u64 %Q,%Q;\n";
@@ -159,6 +446,7 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     s += "    ld.param.f32 %scale,[pScale];\n";
     s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %kvheads,[pKvHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
     s += "    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    ld.param.u32 %qstride,[pQStride];\n";
     // tid = tid.x ; warp = tid/32 ; lane = tid%32 ; gid = ctaid.x*WARPS + warp.
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
@@ -170,9 +458,15 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     // which is what makes `grp` exact and non-zero; MHA gives grp = 1 and kvhead = head.
     s += "    div.u32 %grp,%heads,%kvheads;\n    div.u32 %kvhead,%head,%grp;\n";
     s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%CL,%offb;\n    ld.global.u32 %ctx,[%addr];\n";
-    // qidx = slot*D + head*hd ; qrow = Q + qidx*4 ; obase = O + qidx*4.
-    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %qidx,%slot,%D;\n    mul.lo.s32 %tmp,%head,{hd};\n    add.u32 %qidx,%qidx,%tmp;\n");
-    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n    add.s64 %obase,%O,%offb;\n";
+    // O row: oidx = slot*D + head*hd, D = q_heads*hd — the output is always the packed [bcap, D]
+    // activation the next GEMM consumes. Q row: qidx = slot*qstride + head*hd, because a merged QKV
+    // projection puts this slot's Q at column 0 of a WIDER row (pQStride = D + 2*kv_dim). The two
+    // strides are equal on the shipped split-projection path, where pQStride == D.
+    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %tmp,%head,{hd};\n");
+    s += "    mul.lo.s32 %oidx,%slot,%D;\n    add.u32 %oidx,%oidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%oidx,4;\n    add.s64 %obase,%O,%offb;\n";
+    s += "    mul.lo.s32 %qidx,%slot,%qstride;\n    add.u32 %qidx,%qidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n";
     // qshw = &qsh[warp*hd] (this warp's query staging in shared).
     s += &format!("    mov.u64 %qshw,qsh;\n    mul.wide.u32 %offb,%warp,{};\n    add.s64 %qshw,%qshw,%offb;\n", hd * 4);
     // Cooperatively stage q into shared: lane stores d = lane, lane+32, … ; warp-sync before the dot.
@@ -199,10 +493,7 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
     );
     s += "    mul.wide.u32 %offb,%e,2;\n    add.s64 %kbase,%K,%offb;\n    add.s64 %vbase,%V,%offb;\n";
     // score = scale * dot(q, K[t])  (q from shared, K widened from f16).
-    s += "    mov.f32 %score,0f00000000;\n";
-    for d in 0..hd {
-        s += &format!("    ld.shared.f32 %qv,[%qshw+{}];\n    ld.global.u16 %h,[%kbase+{}];\n    cvt.f32.f16 %kf,%h;\n    fma.rn.f32 %score,%qv,%kf,%score;\n", d * 4, d * 2);
-    }
+    s += &emit_f16_k_dot(hd, vec);
     s += "    mul.f32 %score,%score,%scale;\n";
     s += "    max.f32 %newm,%m,%score;\n";
     s += &format!(
@@ -212,9 +503,7 @@ pub fn paged_attn_decode_ptx(head_dim: usize) -> String {
         "    sub.f32 %t0,%score,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %p,%t0;\n"
     );
     s += "    mul.f32 %l,%l,%corr;\n    add.f32 %l,%l,%p;\n";
-    for d in 0..hd {
-        s += &format!("    ld.global.u16 %h,[%vbase+{}];\n    cvt.f32.f16 %vf,%h;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%p,%vf,%acc{d};\n", d * 2);
-    }
+    s += &emit_f16_v_acc(hd, vec);
     s += "    mov.f32 %m,%newm;\n    add.u32 %t,%t,32;\n    bra LOOP;\nENDLOOP:\n";
     // Cross-lane merge (fixed butterfly order): M = max(m) ; rescale by exp(m−M) ; L = Σl ; ACC = Σacc.
     s += "    mov.f32 %M,%m;\n";
@@ -316,11 +605,61 @@ pub fn launch_paged_attn_decode_gqa(
     bcap: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
+    launch_paged_attn_decode_gqa_at(
+        stream,
+        func,
+        q_d,
+        gqa.q_dim(),
+        k_d,
+        v_d,
+        out_d,
+        bt_d,
+        cl_d,
+        gqa,
+        layer,
+        bcap,
+        scale,
+    )
+}
+
+/// [`launch_paged_attn_decode_gqa`] with an explicit **Q row stride** — the seam the merged-QKV
+/// projection needs and the only thing it needs.
+///
+/// `q_row_stride` is the number of f32 elements between one slot's query row and the next.
+/// `gqa.q_dim()` is the packed case (three separate projections, the shipped path);
+/// `q_dim + 2*kv_dim` is the merged case, where this slot's Q occupies the first `q_dim` columns of a
+/// wider row. **The output stays packed at `q_dim`** — it feeds the O-projection GEMM, which reads a
+/// dense `[Bcap, D]` activation — so the kernel carries the two strides separately.
+///
+/// Nothing else moves: same warp map, same lane partition, same K/V addresses, same butterfly. The
+/// values are bit-identical to the packed launch over the same numbers, which is what
+/// `serving::tests::merged_qkv_decode_step_is_bit_identical_to_three_launches` proves on device.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attn_decode_gqa_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    q_d: &CudaSlice<f32>,
+    q_row_stride: usize,
+    k_d: &CudaSlice<half::f16>,
+    v_d: &CudaSlice<half::f16>,
+    out_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    cl_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
     let cfg = gqa.kv();
-    debug_assert_eq!(
-        q_d.len(),
-        bcap * gqa.q_dim(),
-        "q must be [bcap, q_heads*head_dim] (query-headed, not KV-headed)"
+    assert!(
+        q_row_stride >= gqa.q_dim(),
+        "q_row_stride {q_row_stride} is narrower than the query row it must contain ({})",
+        gqa.q_dim()
+    );
+    debug_assert!(
+        q_d.len() >= bcap.saturating_sub(1) * q_row_stride + gqa.q_dim(),
+        "q must hold [bcap, q_heads*head_dim] at row stride {q_row_stride} (query-headed)"
     );
     debug_assert_eq!(
         out_d.len(),
@@ -359,6 +698,7 @@ pub fn launch_paged_attn_decode_gqa(
         layer as u32,
     );
     let bcap_u = bcap as u32;
+    let qstride_u = q_row_stride as u32;
     let mut b = stream.launch_builder(func);
     b.arg(q_d)
         .arg(k_d)
@@ -373,21 +713,70 @@ pub fn launch_paged_attn_decode_gqa(
         .arg(&bsz)
         .arg(&nblk)
         .arg(&mbps)
-        .arg(&layer_u);
+        .arg(&layer_u)
+        .arg(&qstride_u);
     // SAFETY: the pushed arguments match `PAGED_ATTN_ENTRY`'s parameter list in order and width (six
-    // .u64 pointers, one .f32, **seven** .u32 — `pKvHeads` sits between `pHeads` and `pBsz`; see
-    // `paged_attn_decode_ptx`, and `attention_entry_param_counts_match_the_launcher_push_lists` pins
-    // the counts textually against this list). `func` was loaded from PTX generated for
-    // `cfg.head_dim` (the entry is head_dim-specialized). Every buffer is at least as long as the
-    // largest index this kernel's address arithmetic can produce for `bcap` slots at `layer`: the
-    // `%e` chain reproduces `KvConfig::elem_offset` at the **KV** head axis, bounded by
-    // `slab_elems()`; `BT[slot*mbps+logical]` by `bcap * max_blocks_per_seq`; `CL[slot]` and the
-    // query-headed `Q`/`O` rows by the shapes asserted above — which the caller guarantees and the
-    // debug asserts check at the call site. The device `div.u32 %grp,%heads,%kvheads` is exact and
-    // non-zero because `GqaConfig`'s constructor rejects a non-divisible or zero pair, so `%kvhead`
-    // cannot exceed `kv_heads - 1` and the offset cannot leave the slab.
+    // .u64 pointers, one .f32, **eight** .u32 — `pKvHeads` sits between `pHeads` and `pBsz`, and
+    // `pQStride` is last; see `paged_attn_decode_ptx`, and
+    // `attention_entry_param_counts_match_the_launcher_push_lists` pins the counts textually against
+    // this list). `func` was loaded from PTX generated for `cfg.head_dim` (the entry is
+    // head_dim-specialized). Every buffer is at least as long as the largest index this kernel's
+    // address arithmetic can produce for `bcap` slots at `layer`: the `%e` chain reproduces
+    // `KvConfig::elem_offset` at the **KV** head axis, bounded by `slab_elems()`;
+    // `BT[slot*mbps+logical]` by `bcap * max_blocks_per_seq`; `CL[slot]` by `bcap`; the packed
+    // query-headed `O` row by `bcap*q_dim`; and the `Q` row by
+    // `(bcap-1)*q_row_stride + q_dim`, which is the bound the debug assert above checks at the call
+    // site (`q_row_stride >= q_dim` is checked unconditionally, since a too-narrow stride would read
+    // a *different slot's* query rather than run off the end). The device
+    // `div.u32 %grp,%heads,%kvheads` is exact and non-zero because `GqaConfig`'s constructor rejects
+    // a non-divisible or zero pair, so `%kvhead` cannot exceed `kv_heads - 1` and the offset cannot
+    // leave the slab.
     unsafe { b.launch(cfg_launch)? };
     Ok(())
+}
+
+/// Launch the K-side GQA-fold decode-attention kernel. Same buffers, params, and **query-headed**
+/// grid as [`launch_paged_attn_decode_gqa_at`]; [`kfold_applies`] is asserted so the CTA-shared K
+/// tile is a legal `bar.sync` (full CTAs, `g >= WARPS`). A `g = 1` or `g = 2` geometry is a
+/// programming error here, not a silent fall-back to the one-head kernel.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attn_decode_kfold_gqa_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    q_d: &CudaSlice<f32>,
+    q_row_stride: usize,
+    k_d: &CudaSlice<half::f16>,
+    v_d: &CudaSlice<half::f16>,
+    out_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    cl_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    assert!(
+        kfold_applies(gqa.q_heads(), gqa.kv_heads()),
+        "launch_paged_attn_decode_kfold_gqa_at: kfold does not apply at {}q/{}kv",
+        gqa.q_heads(),
+        gqa.kv_heads()
+    );
+    launch_paged_attn_decode_gqa_at(
+        stream,
+        func,
+        q_d,
+        q_row_stride,
+        k_d,
+        v_d,
+        out_d,
+        bt_d,
+        cl_d,
+        gqa,
+        layer,
+        bcap,
+        scale,
+    )
 }
 
 /// PTX entry name for the **int8** paged decode-attention kernel.
@@ -405,11 +794,20 @@ pub const PAGED_ATTN_INT8_ENTRY: &str = "paged_attn_decode_int8";
 /// one, and query head `h` reads KV head `h / (q_heads / kv_heads)`. Both the int8 value index and the
 /// per-(token, head) *scale* index are KV-headed, since the scale slab has one entry per cached
 /// `(token, kv_head)`.
+///
+/// **Wave-6 v4 coalescing** on the int8 twin: [`AttnVec::V4`] is the default (`head_dim % 16 == 0`,
+/// G-W6-2). The scalar twin is [`paged_attn_decode_int8_scalar_ptx`].
 pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
-    assert!(
-        head_dim > 0 && head_dim.is_multiple_of(2),
-        "head_dim must be a positive even number"
-    );
+    paged_attn_decode_int8_ptx_with(head_dim, AttnVec::V4)
+}
+
+/// Pre-Wave-6 scalar `ld.global.s8` twin of [`paged_attn_decode_int8_ptx`].
+pub fn paged_attn_decode_int8_scalar_ptx(head_dim: usize) -> String {
+    paged_attn_decode_int8_ptx_with(head_dim, AttnVec::Scalar)
+}
+
+fn paged_attn_decode_int8_ptx_with(head_dim: usize, vec: AttnVec) -> String {
+    assert_int8_vec_align(head_dim, vec);
     let hd = head_dim;
     let w = PAGED_ATTN_WARPS as usize;
     let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
@@ -441,12 +839,14 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
         \x20   .param .u32 pBsz,\n\
         \x20   .param .u32 pNblk,\n\
         \x20   .param .u32 pMbps,\n\
-        \x20   .param .u32 pLayer\n)\n{{\n"
+        \x20   .param .u32 pLayer,\n\
+        \x20   .param .u32 pQStride\n)\n{{\n"
     );
     s += &format!("    .shared .f32 qsh[{}];\n", w * hd);
     s += &format!("    .reg .f32 %acc<{hd}>;\n");
     s += "    .reg .f32 %score,%m,%l,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt,%scK,%scV,%pv;\n";
-    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%e,%es,%ki,%dd,%kvheads,%kvhead,%grp;\n";
+    s += vec_regs(vec);
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%ctx,%t,%logical,%off,%phys,%D,%qidx,%oidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%qstride,%e,%es,%ki,%dd,%kvheads,%kvhead,%grp;\n";
     s += "    .reg .b64 %Q,%K,%V,%Ksc,%Vsc,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw;\n";
     s += "    .reg .pred %p0,%p1,%p2;\n";
     s += "    ld.param.u64 %Q,[pQ];     cvta.to.global.u64 %Q,%Q;\n";
@@ -460,6 +860,7 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     s += "    ld.param.f32 %scale,[pScale];\n";
     s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %kvheads,[pKvHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
     s += "    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    ld.param.u32 %qstride,[pQStride];\n";
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
     s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
     s += "    mul.lo.s32 %nq,%bcap,%heads;\n    setp.ge.u32 %p0,%gid,%nq;\n    @%p0 bra DONE;\n";
@@ -467,8 +868,12 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     // GQA head mapping, exactly as in the f16 twin: kvhead = q_head / (q_heads / kv_heads).
     s += "    div.u32 %grp,%heads,%kvheads;\n    div.u32 %kvhead,%head,%grp;\n";
     s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%CL,%offb;\n    ld.global.u32 %ctx,[%addr];\n";
-    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %qidx,%slot,%D;\n    mul.lo.s32 %tmp,%head,{hd};\n    add.u32 %qidx,%qidx,%tmp;\n");
-    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n    add.s64 %obase,%O,%offb;\n";
+    // Q reads at pQStride, O writes at D — see the f16 twin for why the two strides are held apart.
+    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %tmp,%head,{hd};\n");
+    s += "    mul.lo.s32 %oidx,%slot,%D;\n    add.u32 %oidx,%oidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%oidx,4;\n    add.s64 %obase,%O,%offb;\n";
+    s += "    mul.lo.s32 %qidx,%slot,%qstride;\n    add.u32 %qidx,%qidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n";
     s += &format!("    mov.u64 %qshw,qsh;\n    mul.wide.u32 %offb,%warp,{};\n    add.s64 %qshw,%qshw,%offb;\n", hd * 4);
     s +=
         &format!("    mov.u32 %dd,%lane;\nQL:\n    setp.ge.u32 %p1,%dd,{hd};\n    @%p1 bra QLE;\n");
@@ -492,10 +897,7 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     // int8 K/V bases (1 byte/elem).
     s += "    mul.wide.u32 %offb,%e,1;\n    add.s64 %kbase,%K,%offb;\n    add.s64 %vbase,%V,%offb;\n";
     // raw int dot, then scale by scaleK and the attention scale.
-    s += "    mov.f32 %score,0f00000000;\n";
-    for d in 0..hd {
-        s += &format!("    ld.shared.f32 %qv,[%qshw+{}];\n    ld.global.s8 %ki,[%kbase+{}];\n    cvt.rn.f32.s32 %kf,%ki;\n    fma.rn.f32 %score,%qv,%kf,%score;\n", d * 4, d);
-    }
+    s += &emit_int8_k_dot(hd, vec);
     s += "    mul.f32 %score,%score,%scK;\n    mul.f32 %score,%score,%scale;\n";
     s += "    max.f32 %newm,%m,%score;\n";
     s += &format!(
@@ -506,10 +908,172 @@ pub fn paged_attn_decode_int8_ptx(head_dim: usize) -> String {
     );
     s += "    mul.f32 %l,%l,%corr;\n    add.f32 %l,%l,%p;\n";
     s += "    mul.f32 %pv,%p,%scV;\n";
-    for d in 0..hd {
-        s += &format!("    ld.global.s8 %ki,[%vbase+{}];\n    cvt.rn.f32.s32 %vf,%ki;\n    mul.f32 %acc{d},%acc{d},%corr;\n    fma.rn.f32 %acc{d},%pv,%vf,%acc{d};\n", d);
-    }
+    s += &emit_int8_v_acc(hd, vec);
     s += "    mov.f32 %m,%newm;\n    add.u32 %t,%t,32;\n    bra LOOP;\nENDLOOP:\n";
+    s += "    mov.f32 %M,%m;\n";
+    s += &bfly("%M", "max");
+    s += &format!(
+        "    sub.f32 %t0,%m,%M;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %factor,%t0;\n"
+    );
+    s += "    mul.f32 %l,%l,%factor;\n";
+    for d in 0..hd {
+        s += &format!("    mul.f32 %acc{d},%acc{d},%factor;\n");
+    }
+    s += "    mov.f32 %L,%l;\n";
+    s += &bfly("%L", "add");
+    for d in 0..hd {
+        s += &bfly(&format!("%acc{d}"), "add");
+    }
+    s += "    rcp.rn.f32 %invl,%L;\n    setp.gt.f32 %p2,%L,0f00000000;\n    selp.f32 %invl,%invl,0f00000000,%p2;\n";
+    s += "    setp.ne.u32 %p0,%lane,0;\n    @%p0 bra DONE;\n";
+    for d in 0..hd {
+        s += &format!(
+            "    mul.f32 %t0,%acc{d},%invl;\n    st.global.f32 [%obase+{}],%t0;\n",
+            d * 4
+        );
+    }
+    s += "DONE:\n    ret;\n}\n";
+    s
+}
+
+/// Generate the **K-side GQA-fold** paged decode-attention PTX (WAVE6 lever 5).
+///
+/// The warp map is the same query-headed one as [`paged_attn_decode_ptx`]: warp `gid` owns
+/// `(slot, q_head)` and keeps `%acc<hd>` in registers. The four warps of a CTA share `(slot, kv_head)`
+/// when `g >= PAGED_ATTN_WARPS`, so they score against the same K vector. Warp 0 stages that vector
+/// once into a 32-row CTA-shared tile (`ksh[32 * hd]` f16); the other three warps score from shared
+/// instead of re-reading HBM. V is still loaded per-warp (G-W6-3: folding V would put `g * hd`
+/// accumulators in the register file and hit the 512-reg wall at Llama-class `g = 4, hd = 128`).
+///
+/// The `t`-loop is over a **uniform** `tbase` so `bar.sync` is legal even when some lanes have
+/// `t >= ctx`. FMA order stays `d = 0,1,2,...`. Bit-identical to the one-head kernel — proved by
+/// `kfold_decode_is_bit_identical_to_one_head_per_warp`. `g` is not baked: the tile is 32 rows
+/// regardless of `g`. [`kfold_applies`] is the predicate the launcher asserts.
+pub fn paged_attn_decode_kfold_ptx(head_dim: usize) -> String {
+    assert_f16_vec_align(head_dim, AttnVec::V4);
+    let hd = head_dim;
+    let w = PAGED_ATTN_WARPS as usize;
+    let log2e = format!("0f{:08X}", std::f32::consts::LOG2_E.to_bits());
+    let neg_big = format!("0f{:08X}", (-1.0e30f32).to_bits());
+    let bfly = |reg: &str, op: &str| -> String {
+        let mut t = String::new();
+        for off in [16, 8, 4, 2, 1] {
+            t += &format!("    shfl.sync.bfly.b32 %rt,{reg},{off},0x1f,0xffffffff;\n    {op}.f32 {reg},{reg},%rt;\n");
+        }
+        t
+    };
+    let mut s = String::new();
+    s += HDR_SM80;
+    s += "\n";
+    s += &format!(
+        ".visible .entry {PAGED_ATTN_KFOLD_ENTRY}(\n\
+        \x20   .param .u64 pQ,\n\
+        \x20   .param .u64 pK,\n\
+        \x20   .param .u64 pV,\n\
+        \x20   .param .u64 pO,\n\
+        \x20   .param .u64 pBT,\n\
+        \x20   .param .u64 pCL,\n\
+        \x20   .param .f32 pScale,\n\
+        \x20   .param .u32 pBcap,\n\
+        \x20   .param .u32 pHeads,\n\
+        \x20   .param .u32 pKvHeads,\n\
+        \x20   .param .u32 pBsz,\n\
+        \x20   .param .u32 pNblk,\n\
+        \x20   .param .u32 pMbps,\n\
+        \x20   .param .u32 pLayer,\n\
+        \x20   .param .u32 pQStride\n)\n{{\n"
+    );
+    // One query row per warp (f32) plus a 32-row K tile (packed f16). At hd=128: 2 KiB + 8 KiB.
+    s += &format!("    .shared .f32 qsh[{}];\n", w * hd);
+    s += &format!("    .shared .b16 ksh[{}];\n", 32 * hd);
+    s += &format!("    .reg .f32 %acc<{hd}>;\n");
+    s += "    .reg .f32 %m,%l,%score,%newm,%p,%corr,%kf,%vf,%qv,%invl,%scale,%factor,%M,%L,%t0,%rt;\n";
+    s += vec_regs(AttnVec::V4);
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%kvhead,%ctx,%t,%tbase,%logical,%off,%phys,%D,%qidx,%oidx,%nq,%tmp,%bcap,%heads,%bsz,%nblk,%mbps,%layer,%qstride,%e,%dd,%kvheads,%grp;\n";
+    s += "    .reg .b64 %Q,%K,%V,%O,%BT,%CL,%addr,%qrow,%obase,%kbase,%vbase,%offb,%qshw,%kshw;\n";
+    s += "    .reg .pred %p0,%p1,%p2,%p_act;\n";
+    s += "    ld.param.u64 %Q,[pQ];   cvta.to.global.u64 %Q,%Q;\n";
+    s += "    ld.param.u64 %K,[pK];   cvta.to.global.u64 %K,%K;\n";
+    s += "    ld.param.u64 %V,[pV];   cvta.to.global.u64 %V,%V;\n";
+    s += "    ld.param.u64 %O,[pO];   cvta.to.global.u64 %O,%O;\n";
+    s += "    ld.param.u64 %BT,[pBT]; cvta.to.global.u64 %BT,%BT;\n";
+    s += "    ld.param.u64 %CL,[pCL]; cvta.to.global.u64 %CL,%CL;\n";
+    s += "    ld.param.f32 %scale,[pScale];\n";
+    s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %kvheads,[pKvHeads];\n    ld.param.u32 %bsz,[pBsz];\n";
+    s += "    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    ld.param.u32 %qstride,[pQStride];\n";
+    s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
+    s += &format!("    mov.u32 %tmp,%ctaid.x;\n    mad.lo.s32 %gid,%tmp,{w},%warp;\n");
+    // Query-headed warp map — identical to paged_attn_decode_ptx.
+    s += "    mul.lo.s32 %nq,%bcap,%heads;\n    setp.ge.u32 %p0,%gid,%nq;\n    @%p0 bra DONE;\n";
+    s += "    div.u32 %slot,%gid,%heads;\n    mul.lo.s32 %tmp,%slot,%heads;\n    sub.u32 %head,%gid,%tmp;\n";
+    s += "    div.u32 %grp,%heads,%kvheads;\n    div.u32 %kvhead,%head,%grp;\n";
+    s += "    mul.wide.u32 %offb,%slot,4;\n    add.s64 %addr,%CL,%offb;\n    ld.global.u32 %ctx,[%addr];\n";
+    s += &format!("    mul.lo.s32 %D,%heads,{hd};\n    mul.lo.s32 %tmp,%head,{hd};\n");
+    s += "    mul.lo.s32 %oidx,%slot,%D;\n    add.u32 %oidx,%oidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%oidx,4;\n    add.s64 %obase,%O,%offb;\n";
+    s += "    mul.lo.s32 %qidx,%slot,%qstride;\n    add.u32 %qidx,%qidx,%tmp;\n";
+    s += "    mul.wide.u32 %offb,%qidx,4;\n    add.s64 %qrow,%Q,%offb;\n";
+    s += &format!(
+        "    mov.u64 %qshw,qsh;\n    mul.wide.u32 %offb,%warp,{};\n    add.s64 %qshw,%qshw,%offb;\n",
+        hd * 4
+    );
+    // kshw = &ksh[lane * hd] — this lane's row of the CTA-shared K tile (packed f16).
+    s += &format!(
+        "    mov.u64 %kshw,ksh;\n    mul.lo.s32 %tmp,%lane,{hd};\n    mul.wide.u32 %offb,%tmp,2;\n    add.s64 %kshw,%kshw,%offb;\n"
+    );
+    s += &format!(
+        "    mov.u32 %dd,%lane;\nQLOOP:\n    setp.ge.u32 %p1,%dd,{hd};\n    @%p1 bra QDONE;\n"
+    );
+    s += "    mul.wide.u32 %offb,%dd,4;\n    add.s64 %addr,%qrow,%offb;\n    ld.global.f32 %qv,[%addr];\n";
+    s += "    add.s64 %addr,%qshw,%offb;\n    st.shared.f32 [%addr],%qv;\n    add.u32 %dd,%dd,32;\n    bra QLOOP;\nQDONE:\n";
+    s += "    bar.warp.sync 0xffffffff;\n";
+    for d in 0..hd {
+        s += &format!("    mov.f32 %acc{d},0f00000000;\n");
+    }
+    s += &format!("    mov.f32 %m,{neg_big};\n    mov.f32 %l,0f00000000;\n");
+    // Uniform tbase so bar.sync is legal when some lanes have t >= ctx. ctx==0 skips the loop
+    // (every lane of every warp in the CTA takes the same branch — kfold_applies forbids partial CTAs).
+    s += "    mov.u32 %tbase,0;\nLOOP:\n    setp.ge.u32 %p1,%tbase,%ctx;\n    @%p1 bra ENDLOOP;\n";
+    s += "    add.u32 %t,%tbase,%lane;\n    setp.lt.u32 %p_act,%t,%ctx;\n";
+    s += "    bar.sync 0;\n";
+    // Warp 0, active lanes: stage K into ksh[lane]. Inactive lanes skip the store (no barrier inside).
+    s += "    setp.eq.u32 %p0,%warp,0;\n    @!%p0 bra KSTAGED;\n    @!%p_act bra KSTAGED;\n";
+    s += "    div.u32 %logical,%t,%bsz;\n    mul.lo.s32 %off,%logical,%bsz;\n    sub.u32 %off,%t,%off;\n";
+    s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %addr,%BT,%offb;\n    ld.global.u32 %phys,[%addr];\n";
+    s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
+    s += &format!(
+        "    mul.lo.s32 %e,%e,%kvheads;\n    add.u32 %e,%e,%kvhead;\n    mul.lo.s32 %e,%e,{hd};\n"
+    );
+    s += "    mul.wide.u32 %offb,%e,2;\n    add.s64 %kbase,%K,%offb;\n";
+    for c in 0..hd / 8 {
+        let off = c * 16;
+        s += &format!("    ld.global.v4.b32 {{%pk0,%pk1,%pk2,%pk3}},[%kbase+{off}];\n");
+        s += &format!("    st.shared.v4.b32 [%kshw+{off}],{{%pk0,%pk1,%pk2,%pk3}};\n");
+    }
+    s += "KSTAGED:\n    bar.sync 0;\n";
+    s += "    @!%p_act bra SKIPPOS;\n";
+    // Page-table walk for V (and for warps 1-3, which did not compute kbase). Same t as warp 0.
+    s += "    div.u32 %logical,%t,%bsz;\n    mul.lo.s32 %off,%logical,%bsz;\n    sub.u32 %off,%t,%off;\n";
+    s += "    mul.lo.s32 %tmp,%slot,%mbps;\n    add.u32 %tmp,%tmp,%logical;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %addr,%BT,%offb;\n    ld.global.u32 %phys,[%addr];\n";
+    s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
+    s += &format!(
+        "    mul.lo.s32 %e,%e,%kvheads;\n    add.u32 %e,%e,%kvhead;\n    mul.lo.s32 %e,%e,{hd};\n"
+    );
+    s += "    mul.wide.u32 %offb,%e,2;\n    add.s64 %vbase,%V,%offb;\n";
+    s += &emit_f16_k_dot_from_ksh(hd);
+    s += "    mul.f32 %score,%score,%scale;\n";
+    s += "    max.f32 %newm,%m,%score;\n";
+    s += &format!(
+        "    sub.f32 %t0,%m,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %corr,%t0;\n"
+    );
+    s += &format!(
+        "    sub.f32 %t0,%score,%newm;\n    mul.f32 %t0,%t0,{log2e};\n    ex2.approx.f32 %p,%t0;\n"
+    );
+    s += "    mul.f32 %l,%l,%corr;\n    add.f32 %l,%l,%p;\n";
+    s += &emit_f16_v_acc(hd, AttnVec::V4);
+    s += "    mov.f32 %m,%newm;\n";
+    s += "SKIPPOS:\n    add.u32 %tbase,%tbase,32;\n    bra LOOP;\nENDLOOP:\n";
     s += "    mov.f32 %M,%m;\n";
     s += &bfly("%M", "max");
     s += &format!(
@@ -600,11 +1164,57 @@ pub fn launch_paged_attn_decode_int8_gqa(
     bcap: usize,
     scale: f32,
 ) -> Result<(), DriverError> {
+    launch_paged_attn_decode_int8_gqa_at(
+        stream,
+        func,
+        q_d,
+        gqa.q_dim(),
+        k_d,
+        v_d,
+        ksc_d,
+        vsc_d,
+        out_d,
+        bt_d,
+        cl_d,
+        gqa,
+        layer,
+        bcap,
+        scale,
+    )
+}
+
+/// [`launch_paged_attn_decode_int8_gqa`] with an explicit **Q row stride** — the int8 twin of
+/// [`launch_paged_attn_decode_gqa_at`], and it exists for the same one reason: a merged-QKV
+/// projection leaves this slot's query in the first `q_dim` columns of a `q_dim + 2*kv_dim` row. The
+/// output stays packed.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_paged_attn_decode_int8_gqa_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    q_d: &CudaSlice<f32>,
+    q_row_stride: usize,
+    k_d: &CudaSlice<i8>,
+    v_d: &CudaSlice<i8>,
+    ksc_d: &CudaSlice<f32>,
+    vsc_d: &CudaSlice<f32>,
+    out_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    cl_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
     let cfg = gqa.kv();
-    debug_assert_eq!(
-        q_d.len(),
-        bcap * gqa.q_dim(),
-        "q must be [bcap, q_heads*head_dim] (query-headed, not KV-headed)"
+    assert!(
+        q_row_stride >= gqa.q_dim(),
+        "q_row_stride {q_row_stride} is narrower than the query row it must contain ({})",
+        gqa.q_dim()
+    );
+    debug_assert!(
+        q_d.len() >= bcap.saturating_sub(1) * q_row_stride + gqa.q_dim(),
+        "q must hold [bcap, q_heads*head_dim] at row stride {q_row_stride} (query-headed)"
     );
     debug_assert_eq!(
         out_d.len(),
@@ -653,6 +1263,7 @@ pub fn launch_paged_attn_decode_int8_gqa(
         layer as u32,
     );
     let bcap_u = bcap as u32;
+    let qstride_u = q_row_stride as u32;
     let mut b = stream.launch_builder(func);
     b.arg(q_d)
         .arg(k_d)
@@ -669,17 +1280,19 @@ pub fn launch_paged_attn_decode_int8_gqa(
         .arg(&bsz)
         .arg(&nblk)
         .arg(&mbps)
-        .arg(&layer_u);
+        .arg(&layer_u)
+        .arg(&qstride_u);
     // SAFETY: the pushed arguments match `PAGED_ATTN_INT8_ENTRY`'s parameter list in order and width
-    // (eight .u64 pointers, one .f32, **seven** .u32 — `pKvHeads` between `pHeads` and `pBsz`; see
-    // `paged_attn_decode_int8_ptx`, textually pinned by
+    // (eight .u64 pointers, one .f32, **eight** .u32 — `pKvHeads` between `pHeads` and `pBsz`,
+    // `pQStride` last; see `paged_attn_decode_int8_ptx`, textually pinned by
     // `attention_entry_param_counts_match_the_launcher_push_lists`), and `func` was loaded from PTX
     // generated for `cfg.head_dim`. Every buffer is at least as long as the largest index the kernel
     // can produce for `bcap` slots at `layer`: `%e` reproduces `KvConfig::elem_offset` and `%es`
     // `KvConfig::scale_offset`, both at the **KV** head axis (bounded by `slab_elems()` /
-    // `scale_slab_elems()`); the table/lengths/query-headed rows are bounded by the shapes asserted
-    // above, which the caller guarantees and the debug asserts check at the call site. `GqaConfig`'s
-    // constructor is what makes the device `div.u32 %grp,%heads,%kvheads` exact and non-zero.
+    // `scale_slab_elems()`); the table/lengths/packed output rows are bounded by the shapes asserted
+    // above, and the query row by `(bcap-1)*q_row_stride + q_dim` — which the caller guarantees and
+    // the debug asserts check at the call site. `GqaConfig`'s constructor is what makes the device
+    // `div.u32 %grp,%heads,%kvheads` exact and non-zero.
     unsafe { b.launch(cfg_launch)? };
     Ok(())
 }
@@ -746,12 +1359,15 @@ pub fn kv_append_ptx() -> String {
         \x20   .param .u32 pBsz,\n\
         \x20   .param .u32 pNblk,\n\
         \x20   .param .u32 pMbps,\n\
-        \x20   .param .u32 pLayer\n)\n{{\n"
+        \x20   .param .u32 pLayer,\n\
+        \x20   .param .u32 pSrcStride,\n\
+        \x20   .param .u32 pKOff,\n\
+        \x20   .param .u32 pVOff\n)\n{{\n"
     );
     s += "    .reg .pred %p0;\n";
     s += "    .reg .b16 %hk,%hv;\n";
     s += "    .reg .f32 %fk,%fv;\n";
-    s += "    .reg .b32 %gid,%b,%d,%hh,%dh,%D,%total,%pos,%logical,%off,%phys,%e,%tmp,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer;\n";
+    s += "    .reg .b32 %gid,%b,%d,%hh,%dh,%D,%total,%pos,%logical,%off,%phys,%e,%tmp,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer,%sstride,%koff,%voff,%src;\n";
     s += "    .reg .b64 %Knew,%Vnew,%K,%V,%BT,%WP,%ACT,%addr,%o64;\n";
     s += "    ld.param.u64 %Knew,[pKnew]; cvta.to.global.u64 %Knew,%Knew;\n";
     s += "    ld.param.u64 %Vnew,[pVnew]; cvta.to.global.u64 %Vnew,%Vnew;\n";
@@ -762,6 +1378,7 @@ pub fn kv_append_ptx() -> String {
     s += "    ld.param.u64 %ACT,[pAct];   cvta.to.global.u64 %ACT,%ACT;\n";
     s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %hd,[pHd];\n";
     s += "    ld.param.u32 %bsz,[pBsz];\n    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    ld.param.u32 %sstride,[pSrcStride];\n    ld.param.u32 %koff,[pKOff];\n    ld.param.u32 %voff,[pVOff];\n";
     // gid = ctaid.x*ntid.x + tid.x ; D = heads*hd ; total = bcap*D ; bail if gid>=total.
     s += "    mov.u32 %tmp,%ctaid.x;\n    mov.u32 %gid,%ntid.x;\n    mov.u32 %b,%tid.x;\n    mad.lo.s32 %gid,%tmp,%gid,%b;\n";
     s += "    mul.lo.s32 %D,%heads,%hd;\n    mul.lo.s32 %total,%bcap,%D;\n";
@@ -780,8 +1397,12 @@ pub fn kv_append_ptx() -> String {
     // e = ((((layer*nblk)+phys)*bsz+off)*heads+hh)*hd + dh.
     s += "    mul.lo.s32 %e,%layer,%nblk;\n    add.u32 %e,%e,%phys;\n    mul.lo.s32 %e,%e,%bsz;\n    add.u32 %e,%e,%off;\n";
     s += "    mul.lo.s32 %e,%e,%heads;\n    add.u32 %e,%e,%hh;\n    mul.lo.s32 %e,%e,%hd;\n    add.u32 %e,%e,%dh;\n";
-    // load Knew[gid]/Vnew[gid], narrow to f16, store at slab[e].
-    s += "    mul.wide.u32 %o64,%gid,4;\n    add.s64 %addr,%Knew,%o64;\n    ld.global.f32 %fk,[%addr];\n    add.s64 %addr,%Vnew,%o64;\n    ld.global.f32 %fv,[%addr];\n";
+    // Source index: src = b*srcStride + d, then + the plane's own column offset. At the shipped
+    // packed layout (srcStride == D, both offsets 0) that is `gid` exactly — the pre-merge index —
+    // which is what makes the merged-QKV projection bit-identical rather than merely equivalent.
+    s += "    mad.lo.s32 %src,%b,%sstride,%d;\n";
+    s += "    add.u32 %tmp,%src,%koff;\n    mul.wide.u32 %o64,%tmp,4;\n    add.s64 %addr,%Knew,%o64;\n    ld.global.f32 %fk,[%addr];\n";
+    s += "    add.u32 %tmp,%src,%voff;\n    mul.wide.u32 %o64,%tmp,4;\n    add.s64 %addr,%Vnew,%o64;\n    ld.global.f32 %fv,[%addr];\n";
     s += "    cvt.rn.f16.f32 %hk,%fk;\n    cvt.rn.f16.f32 %hv,%fv;\n";
     s += "    mul.wide.u32 %o64,%e,2;\n    add.s64 %addr,%K,%o64;\n    st.global.b16 [%addr],%hk;\n    add.s64 %addr,%V,%o64;\n    st.global.b16 [%addr],%hv;\n";
     s += "DONE:\n    ret;\n}\n";
@@ -816,15 +1437,53 @@ pub fn launch_kv_append(
     layer: usize,
     bcap: usize,
 ) -> Result<(), DriverError> {
-    debug_assert_eq!(
-        knew_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "knew must be [bcap, heads*head_dim]"
+    launch_kv_append_at(
+        stream,
+        func,
+        knew_d,
+        vnew_d,
+        KvSourceLayout::packed(cfg.heads * cfg.head_dim),
+        k_d,
+        v_d,
+        bt_d,
+        wpos_d,
+        active_d,
+        cfg,
+        layer,
+        bcap,
+    )
+}
+
+/// [`launch_kv_append`] over an explicit [`KvSourceLayout`] — the seam a merged-QKV projection needs.
+/// At [`KvSourceLayout::packed`] this *is* [`launch_kv_append`] (the device index reduces to the
+/// thread's own `gid`); at [`KvSourceLayout::merged_qkv`] `knew_d` and `vnew_d` are the **same**
+/// buffer and the two planes are found by column offset. The cached bytes are identical either way.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    src: KvSourceLayout,
+    k_d: &mut CudaSlice<half::f16>,
+    v_d: &mut CudaSlice<half::f16>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    cfg: &KvConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    let kvd = cfg.heads * cfg.head_dim;
+    src.assert_fits(kvd);
+    debug_assert!(
+        knew_d.len() >= bcap.saturating_sub(1) * src.row_stride + src.k_off + kvd,
+        "knew must hold [bcap, heads*head_dim] at {src:?}"
     );
-    debug_assert_eq!(
-        vnew_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "vnew must be [bcap, heads*head_dim]"
+    debug_assert!(
+        vnew_d.len() >= bcap.saturating_sub(1) * src.row_stride + src.v_off + kvd,
+        "vnew must hold [bcap, heads*head_dim] at {src:?}"
     );
     debug_assert_eq!(
         k_d.len(),
@@ -862,6 +1521,7 @@ pub fn launch_kv_append(
         cfg.max_blocks_per_seq as u32,
         layer as u32,
     );
+    let (sstride, koff, voff) = (src.row_stride as u32, src.k_off as u32, src.v_off as u32);
     let mut b = stream.launch_builder(func);
     b.arg(knew_d)
         .arg(vnew_d)
@@ -876,15 +1536,20 @@ pub fn launch_kv_append(
         .arg(&bsz)
         .arg(&nblk)
         .arg(&mbps)
-        .arg(&layer_u);
+        .arg(&layer_u)
+        .arg(&sstride)
+        .arg(&koff)
+        .arg(&voff);
     // SAFETY: the pushed arguments match `KV_APPEND_ENTRY`'s parameter list in order and width (seven
-    // .u64 pointers, seven .u32 — see `kv_append_ptx`). Every buffer is at least as long as the largest
-    // index the kernel can produce for `bcap` slots at `layer`: the store index `%e` reproduces
-    // `KvConfig::elem_offset` (bounded by `slab_elems()`), the load index is the thread's own `gid <
-    // bcap*heads*hd`, and `BT`/`WP`/`ACT` are bounded by `bcap * max_blocks_per_seq` and `bcap`. That,
-    // plus each active slot's write position already having a reserved block (the caller's contract,
-    // established by `BlockManager::append`), is what keeps the scatter inside the slabs. The debug
-    // asserts above check the lengths at the call site.
+    // .u64 pointers, **ten** .u32 — the three source-layout params are last; see `kv_append_ptx`).
+    // Every buffer is at least as long as the largest index the kernel can produce for `bcap` slots
+    // at `layer`: the store index `%e` reproduces `KvConfig::elem_offset` (bounded by
+    // `slab_elems()`), the load index is `b*row_stride + d + {k,v}_off` with `b < bcap` and
+    // `d < heads*hd` — bounded by the two debug asserts above, which is why the layout is validated
+    // (`assert_fits`) rather than trusted — and `BT`/`WP`/`ACT` are bounded by
+    // `bcap * max_blocks_per_seq` and `bcap`. That, plus each active slot's write position already
+    // having a reserved block (the caller's contract, established by `BlockManager::append`), is what
+    // keeps the scatter inside the slabs.
     unsafe { b.launch(launch)? };
     Ok(())
 }
@@ -921,11 +1586,51 @@ pub fn launch_kv_append_gqa(
         bcap * gqa.kv_dim(),
         "vnew must be [bcap, kv_heads*head_dim] — the K/V projection width, not the hidden size"
     );
-    launch_kv_append(
+    launch_kv_append_gqa_at(
         stream,
         func,
         knew_d,
         vnew_d,
+        KvSourceLayout::packed(gqa.kv_dim()),
+        k_d,
+        v_d,
+        bt_d,
+        wpos_d,
+        active_d,
+        gqa,
+        layer,
+        bcap,
+    )
+}
+
+/// [`launch_kv_append_gqa`] over an explicit [`KvSourceLayout`]. The grouped-query assertion the
+/// packed entry point carries — "the source row is the K/V **projection** width, never the hidden
+/// size" — becomes, under a stride, "the K and V planes are `kv_dim` wide wherever they sit in the
+/// row", which is exactly what [`KvSourceLayout::assert_fits`] checks.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_gqa_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    src: KvSourceLayout,
+    k_d: &mut CudaSlice<half::f16>,
+    v_d: &mut CudaSlice<half::f16>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    src.assert_fits(gqa.kv_dim());
+    launch_kv_append_at(
+        stream,
+        func,
+        knew_d,
+        vnew_d,
+        src,
         k_d,
         v_d,
         bt_d,
@@ -991,11 +1696,14 @@ pub fn kv_append_int8_ptx() -> String {
         \x20   .param .u32 pBsz,\n\
         \x20   .param .u32 pNblk,\n\
         \x20   .param .u32 pMbps,\n\
-        \x20   .param .u32 pLayer\n)\n{{\n"
+        \x20   .param .u32 pLayer,\n\
+        \x20   .param .u32 pSrcStride,\n\
+        \x20   .param .u32 pKOff,\n\
+        \x20   .param .u32 pVOff\n)\n{{\n"
     );
     s += "    .reg .pred %p0,%p1;\n";
     s += "    .reg .f32 %x,%q,%amk,%amv,%sck,%scv,%rt;\n";
-    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%pos,%logical,%off,%phys,%es,%e,%src,%dd,%tmp,%nq,%qi,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer;\n";
+    s += "    .reg .b32 %tix,%warp,%lane,%gid,%slot,%head,%pos,%logical,%off,%phys,%es,%e,%src,%dd,%tmp,%nq,%qi,%bcap,%heads,%hd,%bsz,%nblk,%mbps,%layer,%sstride,%koff,%voff;\n";
     s += "    .reg .b64 %Knew,%Vnew,%K,%V,%Ksc,%Vsc,%BT,%WP,%ACT,%addr,%offb,%kdst,%vdst,%ksrc,%vsrc;\n";
     s += "    ld.param.u64 %Knew,[pKnew]; cvta.to.global.u64 %Knew,%Knew;\n";
     s += "    ld.param.u64 %Vnew,[pVnew]; cvta.to.global.u64 %Vnew,%Vnew;\n";
@@ -1008,6 +1716,7 @@ pub fn kv_append_int8_ptx() -> String {
     s += "    ld.param.u64 %ACT,[pAct];   cvta.to.global.u64 %ACT,%ACT;\n";
     s += "    ld.param.u32 %bcap,[pBcap];\n    ld.param.u32 %heads,[pHeads];\n    ld.param.u32 %hd,[pHd];\n";
     s += "    ld.param.u32 %bsz,[pBsz];\n    ld.param.u32 %nblk,[pNblk];\n    ld.param.u32 %mbps,[pMbps];\n    ld.param.u32 %layer,[pLayer];\n";
+    s += "    ld.param.u32 %sstride,[pSrcStride];\n    ld.param.u32 %koff,[pKOff];\n    ld.param.u32 %voff,[pVOff];\n";
     // gid = ctaid.x*WARPS + warp ; one warp per (slot, head) ⇒ every lane of a warp shares the gid,
     // so the early exits below are warp-uniform (shfl full-mask stays safe).
     s += "    mov.u32 %tix,%tid.x;\n    shr.u32 %warp,%tix,5;\n    and.b32 %lane,%tix,31;\n";
@@ -1023,8 +1732,12 @@ pub fn kv_append_int8_ptx() -> String {
     // es = (((layer*nblk + phys)*bsz + off)*heads + head)  (scale-slab index) ; e = es*hd ;
     // src = gid*hd  (the (slot, head) row base in the [bcap, D] f32 input).
     s += "    mul.lo.s32 %es,%layer,%nblk;\n    add.u32 %es,%es,%phys;\n    mul.lo.s32 %es,%es,%bsz;\n    add.u32 %es,%es,%off;\n";
-    s += "    mul.lo.s32 %es,%es,%heads;\n    add.u32 %es,%es,%head;\n    mul.lo.s32 %e,%es,%hd;\n    mul.lo.s32 %src,%gid,%hd;\n";
-    s += "    mul.wide.u32 %offb,%src,4;\n    add.s64 %ksrc,%Knew,%offb;\n    add.s64 %vsrc,%Vnew,%offb;\n";
+    s += "    mul.lo.s32 %es,%es,%heads;\n    add.u32 %es,%es,%head;\n    mul.lo.s32 %e,%es,%hd;\n";
+    // src = slot*srcStride + head*hd, then + the plane's column offset. At the shipped packed layout
+    // (srcStride == heads*hd, offsets 0) that is `gid*hd` exactly — the pre-merge row base.
+    s += "    mul.lo.s32 %src,%slot,%sstride;\n    mad.lo.s32 %src,%head,%hd,%src;\n";
+    s += "    add.u32 %tmp,%src,%koff;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %ksrc,%Knew,%offb;\n";
+    s += "    add.u32 %tmp,%src,%voff;\n    mul.wide.u32 %offb,%tmp,4;\n    add.s64 %vsrc,%Vnew,%offb;\n";
     s += "    mul.wide.u32 %offb,%e,1;\n    add.s64 %kdst,%K,%offb;\n    add.s64 %vdst,%V,%offb;\n";
     // Per-lane strided |x| maxima over the head_dim (fold starts at 0, as the host's does).
     s += "    mov.f32 %amk,0f00000000;\n    mov.f32 %amv,0f00000000;\n";
@@ -1075,15 +1788,56 @@ pub fn launch_kv_append_int8(
     layer: usize,
     bcap: usize,
 ) -> Result<(), DriverError> {
-    debug_assert_eq!(
-        knew_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "knew must be [bcap, heads*head_dim]"
+    launch_kv_append_int8_at(
+        stream,
+        func,
+        knew_d,
+        vnew_d,
+        KvSourceLayout::packed(cfg.heads * cfg.head_dim),
+        k_d,
+        v_d,
+        ksc_d,
+        vsc_d,
+        bt_d,
+        wpos_d,
+        active_d,
+        cfg,
+        layer,
+        bcap,
+    )
+}
+
+/// [`launch_kv_append_int8`] over an explicit [`KvSourceLayout`] — the int8 twin of
+/// [`launch_kv_append_at`]. The quantizer reads the same numbers through a stride, so the per-(token,
+/// head) amax, the scale and every stored byte are unchanged.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_int8_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    src: KvSourceLayout,
+    k_d: &mut CudaSlice<i8>,
+    v_d: &mut CudaSlice<i8>,
+    ksc_d: &mut CudaSlice<f32>,
+    vsc_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    cfg: &KvConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    let kvd = cfg.heads * cfg.head_dim;
+    src.assert_fits(kvd);
+    debug_assert!(
+        knew_d.len() >= bcap.saturating_sub(1) * src.row_stride + src.k_off + kvd,
+        "knew must hold [bcap, heads*head_dim] at {src:?}"
     );
-    debug_assert_eq!(
-        vnew_d.len(),
-        bcap * cfg.heads * cfg.head_dim,
-        "vnew must be [bcap, heads*head_dim]"
+    debug_assert!(
+        vnew_d.len() >= bcap.saturating_sub(1) * src.row_stride + src.v_off + kvd,
+        "vnew must hold [bcap, heads*head_dim] at {src:?}"
     );
     debug_assert_eq!(
         k_d.len(),
@@ -1141,21 +1895,26 @@ pub fn launch_kv_append_int8(
         .arg(bt_d)
         .arg(wpos_d)
         .arg(active_d);
+    let (sstride, koff, voff) = (src.row_stride as u32, src.k_off as u32, src.v_off as u32);
     b.arg(&bcap_u)
         .arg(&heads)
         .arg(&hd)
         .arg(&bsz)
         .arg(&nblk)
         .arg(&mbps)
-        .arg(&layer_u);
+        .arg(&layer_u)
+        .arg(&sstride)
+        .arg(&koff)
+        .arg(&voff);
     // SAFETY: the pushed arguments match `KV_APPEND_INT8_ENTRY`'s parameter list in order and width
-    // (nine .u64 pointers, seven .u32 — see `kv_append_int8_ptx`). Every buffer is at least as long as
-    // the largest index the kernel can produce for `bcap` slots at `layer`: `%e` reproduces
-    // `KvConfig::elem_offset` (bounded by `slab_elems()`), `%es` reproduces `KvConfig::scale_offset`
-    // (bounded by `scale_slab_elems()`), the source row base is `gid*hd < bcap*heads*hd`, and
-    // `BT`/`WP`/`ACT` are bounded by `bcap * max_blocks_per_seq` and `bcap`. As for the f16 append, the
-    // caller also guarantees every active slot's write position has a reserved block. The debug asserts
-    // above check the lengths at the call site.
+    // (nine .u64 pointers, **ten** .u32, the three source-layout params last — see
+    // `kv_append_int8_ptx`). Every buffer is at least as long as the largest index the kernel can
+    // produce for `bcap` slots at `layer`: `%e` reproduces `KvConfig::elem_offset` (bounded by
+    // `slab_elems()`), `%es` reproduces `KvConfig::scale_offset` (bounded by `scale_slab_elems()`),
+    // the source row base is `slot*row_stride + head*hd + {k,v}_off` with the two debug asserts above
+    // bounding it, and `BT`/`WP`/`ACT` are bounded by `bcap * max_blocks_per_seq` and `bcap`. As for
+    // the f16 append, the caller also guarantees every active slot's write position has a reserved
+    // block.
     unsafe { b.launch(launch)? };
     Ok(())
 }
@@ -1192,11 +1951,53 @@ pub fn launch_kv_append_int8_gqa(
         bcap * gqa.kv_dim(),
         "vnew must be [bcap, kv_heads*head_dim] — the K/V projection width, not the hidden size"
     );
-    launch_kv_append_int8(
+    launch_kv_append_int8_gqa_at(
         stream,
         func,
         knew_d,
         vnew_d,
+        KvSourceLayout::packed(gqa.kv_dim()),
+        k_d,
+        v_d,
+        ksc_d,
+        vsc_d,
+        bt_d,
+        wpos_d,
+        active_d,
+        gqa,
+        layer,
+        bcap,
+    )
+}
+
+/// [`launch_kv_append_int8_gqa`] over an explicit [`KvSourceLayout`] — the int8 twin of
+/// [`launch_kv_append_gqa_at`].
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn launch_kv_append_int8_gqa_at(
+    stream: &Arc<CudaStream>,
+    func: &CudaFunction,
+    knew_d: &CudaSlice<f32>,
+    vnew_d: &CudaSlice<f32>,
+    src: KvSourceLayout,
+    k_d: &mut CudaSlice<i8>,
+    v_d: &mut CudaSlice<i8>,
+    ksc_d: &mut CudaSlice<f32>,
+    vsc_d: &mut CudaSlice<f32>,
+    bt_d: &CudaSlice<u32>,
+    wpos_d: &CudaSlice<u32>,
+    active_d: &CudaSlice<u32>,
+    gqa: &GqaConfig,
+    layer: usize,
+    bcap: usize,
+) -> Result<(), DriverError> {
+    src.assert_fits(gqa.kv_dim());
+    launch_kv_append_int8_at(
+        stream,
+        func,
+        knew_d,
+        vnew_d,
+        src,
         k_d,
         v_d,
         ksc_d,
@@ -1378,6 +2179,14 @@ mod tests {
             assert!(ptx.contains("bar.warp.sync"), "warp sync after staging q");
             assert!(ptx.contains("ex2.approx.f32"), "online softmax exp");
             assert!(ptx.contains("cvt.f32.f16"), "f16 cache widened to f32");
+            assert!(
+                ptx.contains("ld.global.v4.b32"),
+                "head dim {hd}: shipped decode kernel must issue ld.global.v4.b32 (WAVE6 lever 4)"
+            );
+            assert!(
+                !ptx.contains("ld.global.u16"),
+                "head dim {hd}: shipped decode kernel must not fall back to scalar u16 loads"
+            );
             // The output uses rcp + select (the empty-sequence NaN guard).
             assert!(ptx.contains("rcp.rn.f32") && ptx.contains("selp.f32"));
             assert_gqa_shape(&ptx, "paged_attn_decode");
@@ -1431,6 +2240,201 @@ mod tests {
         );
     }
 
+    /// **The merged-QKV stride law.** The Q row is read at a caller-supplied `pQStride` and the O row
+    /// is written at the packed query-headed `D` — two different strides that are *equal* on the
+    /// shipped split-projection path, which is precisely why a regression that collapsed them back
+    /// into one would pass every existing gate and then write the merged path's output rows `2*kv_dim`
+    /// apart. Textual, device-free, and checked at both head dims and on both cache dtypes.
+    #[test]
+    fn the_query_row_stride_is_a_parameter_and_the_output_row_stride_is_not() {
+        for hd in GATED_HEAD_DIMS {
+            for (what, ptx) in [
+                ("paged_attn_decode", paged_attn_decode_ptx(hd)),
+                ("paged_attn_decode_int8", paged_attn_decode_int8_ptx(hd)),
+            ] {
+                assert!(
+                    ptx.contains(".param .u32 pQStride"),
+                    "{what}: the Q row stride must be a runtime .param — a merged QKV projection \
+                     leaves this slot's query in the first q_dim columns of a wider row"
+                );
+                assert!(
+                    ptx.contains("ld.param.u32 %qstride,[pQStride];"),
+                    "{what}: pQStride must actually be loaded"
+                );
+                assert!(
+                    ptx.contains("mul.lo.s32 %qidx,%slot,%qstride;"),
+                    "{what}: the Q row must be indexed by pQStride"
+                );
+                assert!(
+                    ptx.contains("mul.lo.s32 %oidx,%slot,%D;"),
+                    "{what}: the OUTPUT row must stay at the packed query-headed D — it feeds the \
+                     O-projection GEMM, which reads a dense [bcap, D] activation"
+                );
+                assert!(
+                    ptx.contains("add.s64 %qrow,%Q,%offb;")
+                        && ptx.contains("add.s64 %obase,%O,%offb;"),
+                    "{what}: both rows must still be formed"
+                );
+            }
+        }
+    }
+
+    /// **WAVE6 lever 4, device-free.** The shipped generators issue `ld.global.v4.b32`; the scalar
+    /// twins still issue the pre-Wave-6 element load. Same FMA order is pinned by the unpack walking
+    /// `d = 0,1,2,...` after each vector load (the `==` gate on device is what proves the values).
+    #[test]
+    fn v4_loads_are_the_shipped_default_and_the_scalar_twin_still_exists() {
+        for hd in GATED_HEAD_DIMS {
+            let v4 = paged_attn_decode_ptx(hd);
+            let sc = paged_attn_decode_scalar_ptx(hd);
+            assert_floor(&v4, "paged_attn_decode v4");
+            assert_floor(&sc, "paged_attn_decode scalar");
+            assert!(v4.contains("ld.global.v4.b32") && !v4.contains("ld.global.u16"));
+            assert!(sc.contains("ld.global.u16") && !sc.contains("ld.global.v4.b32"));
+            assert!(v4.is_ascii() && sc.is_ascii());
+            let v4i = paged_attn_decode_int8_ptx(hd);
+            let sci = paged_attn_decode_int8_scalar_ptx(hd);
+            assert!(v4i.contains("ld.global.v4.b32") && v4i.contains("bfe.s32"));
+            assert!(sci.contains("ld.global.s8") && !sci.contains("ld.global.v4.b32"));
+            assert!(v4i.is_ascii() && sci.is_ascii());
+            assert_eq!(v4.matches('{').count(), v4.matches('}').count());
+            assert_eq!(sc.matches('{').count(), sc.matches('}').count());
+        }
+    }
+
+    /// **G-W6-2.** A `head_dim` that is even but not 8-aligned must not emit a 16-byte load — the
+    /// corpus's 64/128 would never catch it.
+    #[test]
+    #[should_panic(expected = "head_dim % 8 == 0")]
+    fn v4_f16_rejects_a_misaligned_head_dim() {
+        let _ = paged_attn_decode_ptx(4);
+    }
+
+    #[test]
+    #[should_panic(expected = "head_dim % 16 == 0")]
+    fn v4_int8_rejects_a_misaligned_head_dim() {
+        let _ = paged_attn_decode_int8_ptx(8);
+    }
+
+    /// **WAVE6 lever 5, device-free.** The K-fold kernel keeps the query-headed warp map (one warp
+    /// per `(slot, q_head)`), stages K into a 32-row CTA-shared tile (`ksh[32 * hd]`), issues
+    /// `ld.global.v4.b32` from warp 0 and `ld.shared.v4.b32` from every warp, keeps the `sm_80`
+    /// floor, and is pure ASCII. Accumulators stay per-lane registers — folding V is the 512-reg
+    /// wall this kernel exists to avoid.
+    #[test]
+    fn kfold_ptx_is_cta_shared_k_v4_and_pure_ascii() {
+        for hd in GATED_HEAD_DIMS {
+            let ptx = paged_attn_decode_kfold_ptx(hd);
+            assert_floor(&ptx, "paged_attn_decode_kfold");
+            assert!(ptx.contains(&format!(".visible .entry {PAGED_ATTN_KFOLD_ENTRY}(")));
+            assert!(
+                ptx.contains("mul.lo.s32 %nq,%bcap,%heads;"),
+                "hd={hd}: the warp grid must stay query-headed"
+            );
+            assert!(
+                !ptx.contains("mul.lo.s32 %nq,%bcap,%kvheads;"),
+                "hd={hd}: a KV-headed grid would change the warp map and the values"
+            );
+            assert!(
+                ptx.contains("div.u32 %grp,%heads,%kvheads;")
+                    && ptx.contains("div.u32 %kvhead,%head,%grp;"),
+                "hd={hd}: GQA mapping must be grp = q_heads/kv_heads, kvhead = head/grp"
+            );
+            assert!(ptx.contains("ld.global.v4.b32"), "kfold composes with v4");
+            assert!(
+                ptx.contains("ld.shared.v4.b32"),
+                "hd={hd}: non-staging warps must score from the CTA-shared K tile"
+            );
+            assert!(
+                ptx.contains(&format!("ksh[{}]", 32 * hd)),
+                "hd={hd}: one packed-f16 K vector per lane"
+            );
+            assert!(
+                ptx.contains(&format!("qsh[{}]", PAGED_ATTN_WARPS as usize * hd)),
+                "hd={hd}: one query row per warp, not g rows"
+            );
+            assert!(
+                !ptx.contains("accsh["),
+                "hd={hd}: accs stay in registers; a shared-acc tile is the refuted per-warp g-fold"
+            );
+            assert!(
+                ptx.contains("bar.sync 0;"),
+                "hd={hd}: CTA barrier around the K tile"
+            );
+            assert!(ptx.is_ascii(), "PTX must be pure ASCII (hd={hd})");
+            assert_eq!(ptx.matches('{').count(), ptx.matches('}').count());
+            assert!(!ptx.contains(crate::ptx_target::TARGET_SM89));
+        }
+        assert!(kfold_applies(32, 8)); // Llama-3-8B, g=4
+        assert!(kfold_applies(64, 8)); // Llama-3-70B, g=8
+        assert!(kfold_applies(8, 1)); // g=8, full CTAs
+        assert!(kfold_applies(8, 2)); // g=4 — the laptop-width Llama grouping
+        assert!(kfold_applies(16, 4)); // g=4
+        assert!(!kfold_applies(12, 12)); // MHA
+        assert!(!kfold_applies(8, 4)); // g=2 splits a CTA across two kv_heads
+        assert!(!kfold_applies(32, 1)); // MQA-32, g=32 > KFOLD_G_MAX
+        assert!(!kfold_applies(6, 2)); // q_heads not a multiple of WARPS
+    }
+
+    /// The append source-layout law. Both append kernels read their K and V planes at
+    /// `slot_row*pSrcStride + <plane offset>`, so one merged `[Bcap, D + 2*kv_dim]` projection buffer
+    /// is addressable without a copy. At [`KvSourceLayout::packed`] the arithmetic reduces to the
+    /// pre-merge index exactly (`row_stride == kv_dim`, both offsets 0) — that reduction is what makes
+    /// the merge bit-identical, and this law is what keeps the reduction spelled out in the text.
+    #[test]
+    fn both_appends_read_their_source_through_a_row_stride_and_a_plane_offset() {
+        for (what, ptx) in [
+            ("kv_append", kv_append_ptx()),
+            ("kv_append_int8", kv_append_int8_ptx()),
+        ] {
+            for p in [
+                ".param .u32 pSrcStride",
+                ".param .u32 pKOff",
+                ".param .u32 pVOff",
+            ] {
+                assert!(ptx.contains(p), "{what}: missing `{p}`");
+            }
+            assert!(
+                ptx.contains("ld.param.u32 %sstride,[pSrcStride];")
+                    && ptx.contains("ld.param.u32 %koff,[pKOff];")
+                    && ptx.contains("ld.param.u32 %voff,[pVOff];"),
+                "{what}: all three source-layout params must be loaded"
+            );
+            assert!(
+                ptx.contains("add.u32 %tmp,%src,%koff;")
+                    && ptx.contains("add.u32 %tmp,%src,%voff;"),
+                "{what}: the K and V planes must each be reached by their own column offset"
+            );
+        }
+        // The packed layout is the identity, stated as arithmetic rather than as a comment.
+        let packed = KvSourceLayout::packed(96);
+        assert_eq!(
+            (packed.row_stride, packed.k_off, packed.v_off),
+            (96, 0, 0),
+            "packed: b*kv_dim + d + 0 is exactly the pre-merge `gid`"
+        );
+        let merged = KvSourceLayout::merged_qkv(512, 128);
+        assert_eq!(
+            (merged.row_stride, merged.k_off, merged.v_off),
+            (768, 512, 640),
+            "merged: [Q(512) | K(128) | V(128)] per row"
+        );
+        merged.assert_fits(128);
+    }
+
+    /// A layout whose planes do not fit its row is a panic, not a silent scatter into whatever the
+    /// neighbouring columns hold.
+    #[test]
+    #[should_panic(expected = "must fit inside")]
+    fn a_kv_source_layout_that_overruns_its_row_is_rejected() {
+        KvSourceLayout {
+            row_stride: 128,
+            k_off: 0,
+            v_off: 64,
+        }
+        .assert_fits(128);
+    }
+
     /// **Launch-seam law (crate rule 2).** The argument list each launcher pushes must match its
     /// entry's declared `.param` count, derived from the same text. `pKvHeads` moved every attention
     /// entry from six `.u32` params to seven; pushing the old six would make the driver read adjacent
@@ -1440,18 +2444,27 @@ mod tests {
     fn attention_entry_param_counts_match_the_launcher_push_lists() {
         let count = |ptx: &str, ty: &str| ptx.matches(&format!(".param .{ty} ")).count();
         for (what, ptx, u64s, f32s, u32s) in [
-            // (pointers, scale, [bcap, heads, kv_heads, bsz, nblk, mbps, layer])
-            ("paged_attn_decode", paged_attn_decode_ptx(64), 6, 1, 7),
+            // (pointers, scale, [bcap, heads, kv_heads, bsz, nblk, mbps, layer, q_stride])
+            ("paged_attn_decode", paged_attn_decode_ptx(64), 6, 1, 8),
             (
                 "paged_attn_decode_int8",
                 paged_attn_decode_int8_ptx(64),
                 8,
                 1,
-                7,
+                8,
             ),
-            // The appends are KV-headed and gained nothing: [bcap, heads, hd, bsz, nblk, mbps, layer].
-            ("kv_append", kv_append_ptx(), 7, 0, 7),
-            ("kv_append_int8", kv_append_int8_ptx(), 9, 0, 7),
+            (
+                "paged_attn_decode_kfold",
+                paged_attn_decode_kfold_ptx(64),
+                6,
+                1,
+                8,
+            ),
+            // The appends are KV-headed and never see a query head; they gained the three
+            // source-layout params instead: [bcap, heads, hd, bsz, nblk, mbps, layer,
+            // src_stride, k_off, v_off].
+            ("kv_append", kv_append_ptx(), 7, 0, 10),
+            ("kv_append_int8", kv_append_int8_ptx(), 9, 0, 10),
         ] {
             assert_eq!(count(&ptx, "u64"), u64s, "{what}: .u64 param count");
             assert_eq!(count(&ptx, "f32"), f32s, "{what}: .f32 param count");
@@ -1478,7 +2491,18 @@ mod tests {
             let ptx = paged_attn_decode_int8_ptx(hd);
             assert!(ptx.contains(".visible .entry paged_attn_decode_int8("));
             assert_floor(&ptx, "paged_attn_decode_int8");
-            assert!(ptx.contains("ld.global.s8"), "int8 cache read");
+            assert!(
+                ptx.contains("ld.global.v4.b32"),
+                "int8 cache read is a 16-byte vector (WAVE6 lever 4)"
+            );
+            assert!(
+                ptx.contains("bfe.s32"),
+                "int8 v4 unpack must sign-extend each byte (same as ld.global.s8)"
+            );
+            assert!(
+                !ptx.contains("ld.global.s8"),
+                "shipped int8 kernel must not fall back to scalar s8 loads"
+            );
             assert!(
                 !ptx.contains("cvt.f32.f16"),
                 "the int8 kernel stores no f16 — nothing to widen"
@@ -1868,6 +2892,117 @@ mod tests {
         g.stream.memcpy_dtov(&out_d).unwrap()
     }
 
+    #[cfg(feature = "gpu")]
+    #[derive(Clone, Copy, Debug)]
+    enum AttnKernel {
+        Scalar,
+        V4,
+        KFold,
+    }
+
+    /// [`run_paged_attn_gqa`] with an explicit kernel. Keys are distinct so [`crate::Gpu::function`]
+    /// cannot hand the v4 module to a scalar launch (crate rule 4).
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_paged_attn_gqa_kind(
+        g: &mut crate::Gpu,
+        mgr: &BlockManager,
+        gqa: &GqaConfig,
+        layer: usize,
+        q: &[f32],
+        k_slots: &[Vec<f32>],
+        v_slots: &[Vec<f32>],
+        scale: f32,
+        kind: AttnKernel,
+    ) -> Vec<f32> {
+        use half::f16;
+        let cfg = gqa.kv();
+        let bcap = cfg.num_slots;
+        let (kvh_n, hd) = (gqa.kv_heads(), cfg.head_dim);
+        let mut kh = vec![f16::from_f32(0.0); cfg.slab_elems()];
+        let mut vh = vec![f16::from_f32(0.0); cfg.slab_elems()];
+        for b in 0..bcap {
+            for t in 0..mgr.context_len(b) {
+                let (phys, off) = mgr.locate(b, t);
+                for h in 0..kvh_n {
+                    for dh in 0..hd {
+                        let idx = cfg.elem_offset(layer, phys, off, h, dh);
+                        let src = (t * kvh_n + h) * hd + dh;
+                        kh[idx] = f16::from_f32(k_slots[b][src]);
+                        vh[idx] = f16::from_f32(v_slots[b][src]);
+                    }
+                }
+            }
+        }
+        let q_d = g.stream.memcpy_stod(q).unwrap();
+        let k_d = g.stream.memcpy_stod(&kh).unwrap();
+        let v_d = g.stream.memcpy_stod(&vh).unwrap();
+        let bt_d = g.stream.memcpy_stod(&mgr.flat_block_table()).unwrap();
+        let cl_d = g.stream.memcpy_stod(&mgr.ctx_lens()).unwrap();
+        let mut out_d = g.stream.alloc_zeros::<f32>(bcap * gqa.q_dim()).unwrap();
+        let (key, ptx, entry): (&'static str, String, &str) = match (kind, hd) {
+            (AttnKernel::V4, 64) => (
+                "paged_attn_d64",
+                paged_attn_decode_ptx(hd),
+                PAGED_ATTN_ENTRY,
+            ),
+            (AttnKernel::V4, 128) => (
+                "paged_attn_d128",
+                paged_attn_decode_ptx(hd),
+                PAGED_ATTN_ENTRY,
+            ),
+            (AttnKernel::Scalar, 64) => (
+                "paged_attn_scalar_d64",
+                paged_attn_decode_scalar_ptx(hd),
+                PAGED_ATTN_ENTRY,
+            ),
+            (AttnKernel::Scalar, 128) => (
+                "paged_attn_scalar_d128",
+                paged_attn_decode_scalar_ptx(hd),
+                PAGED_ATTN_ENTRY,
+            ),
+            (AttnKernel::KFold, 64) => (
+                "paged_attn_kfold_d64",
+                paged_attn_decode_kfold_ptx(hd),
+                PAGED_ATTN_KFOLD_ENTRY,
+            ),
+            (AttnKernel::KFold, 128) => (
+                "paged_attn_kfold_d128",
+                paged_attn_decode_kfold_ptx(hd),
+                PAGED_ATTN_KFOLD_ENTRY,
+            ),
+            (kind, hd) => {
+                panic!("paged-attn test harness: no module-cache key for {kind:?} hd={hd}")
+            }
+        };
+        let func = g.function(key, &ptx, entry).unwrap();
+        match kind {
+            AttnKernel::KFold => launch_paged_attn_decode_kfold_gqa_at(
+                &g.stream,
+                &func,
+                &q_d,
+                gqa.q_dim(),
+                &k_d,
+                &v_d,
+                &mut out_d,
+                &bt_d,
+                &cl_d,
+                gqa,
+                layer,
+                bcap,
+                scale,
+            )
+            .unwrap(),
+            AttnKernel::Scalar | AttnKernel::V4 => launch_paged_attn_decode_gqa(
+                &g.stream, &func, &q_d, &k_d, &v_d, &mut out_d, &bt_d, &cl_d, gqa, layer, bcap,
+                scale,
+            )
+            .unwrap(),
+        }
+        g.stream.synchronize().unwrap();
+        g.stream.memcpy_dtov(&out_d).unwrap()
+    }
+
     /// Build a fixture: ragged context lengths (incl. an inactive 0 and non-block-multiple lengths),
     /// f16-rounded per-slot K/V, a query, and the `KvConfig`. Returns `(cfg, ctx, q, k, v, scale)`.
     #[cfg(feature = "gpu")]
@@ -2253,6 +3388,130 @@ mod tests {
                 a.table(first_active),
                 bm.table(first_active)
             );
+        });
+    }
+
+    /// **WAVE6 lever 4, on device.** `ld.global.v4.b32` must be bit-identical to the scalar
+    /// `ld.global.u16` kernel: same values, same FMA order, same lane partition. `==` on bits, never
+    /// a tolerance — a tolerance would pass a transpose of the unpack.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn v4_decode_is_bit_identical_to_the_scalar_kernel() {
+        with_gpu("v4_decode_is_bit_identical_to_the_scalar_kernel", |g| {
+            for (q_heads, kv_heads, hd) in [(8usize, 2, 64), (8, 8, 64), (8, 2, 128)] {
+                let block_size = 16usize;
+                let (gqa, ctx, q, k, v, scale) = fixture_gqa(
+                    0x5400,
+                    q_heads,
+                    kv_heads,
+                    hd,
+                    block_size,
+                    vec![37, 0, 16, 100, 5, 64],
+                );
+                let cfg = *gqa.kv();
+                let mut mgr = BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                );
+                for (b, &c) in ctx.iter().enumerate() {
+                    if c > 0 {
+                        mgr.reserve(b, c).unwrap();
+                    }
+                }
+                let scalar = run_paged_attn_gqa_kind(
+                    g,
+                    &mgr,
+                    &gqa,
+                    0,
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    AttnKernel::Scalar,
+                );
+                let v4 =
+                    run_paged_attn_gqa_kind(g, &mgr, &gqa, 0, &q, &k, &v, scale, AttnKernel::V4);
+                let differing = scalar
+                    .iter()
+                    .zip(&v4)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "{q_heads}q/{kv_heads}kv x {hd}: v4 differs from scalar in {differing} of {} lanes",
+                    scalar.len()
+                );
+                assert!(
+                    scalar.iter().any(|&z| z != 0.0),
+                    "control arm produced an all-zero output"
+                );
+                eprintln!(
+                    "v4 == scalar bit-for-bit on {} f32 ({q_heads}q/{kv_heads}kv x {hd})",
+                    scalar.len()
+                );
+            }
+        });
+    }
+
+    /// **WAVE6 lever 5, on device.** The K-side GQA fold must be bit-identical to the one-warp-per
+    /// query-head kernel (which is itself v4). Same lane partition, same butterfly, g scores from
+    /// one K load.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn kfold_decode_is_bit_identical_to_one_head_per_warp() {
+        with_gpu("kfold_decode_is_bit_identical_to_one_head_per_warp", |g| {
+            for (q_heads, kv_heads, hd) in [(8usize, 2, 64), (8, 1, 64), (16, 4, 64), (8, 2, 128)] {
+                assert!(
+                    kfold_applies(q_heads, kv_heads),
+                    "{q_heads}q/{kv_heads}kv must be a kfold geometry"
+                );
+                let block_size = 16usize;
+                let (gqa, ctx, q, k, v, scale) = fixture_gqa(
+                    0x6F0D,
+                    q_heads,
+                    kv_heads,
+                    hd,
+                    block_size,
+                    vec![37, 0, 16, 100, 5, 64],
+                );
+                let cfg = *gqa.kv();
+                let mut mgr = BlockManager::new(
+                    cfg.num_blocks,
+                    block_size,
+                    cfg.num_slots,
+                    cfg.max_blocks_per_seq,
+                );
+                for (b, &c) in ctx.iter().enumerate() {
+                    if c > 0 {
+                        mgr.reserve(b, c).unwrap();
+                    }
+                }
+                let v4 =
+                    run_paged_attn_gqa_kind(g, &mgr, &gqa, 0, &q, &k, &v, scale, AttnKernel::V4);
+                let fold =
+                    run_paged_attn_gqa_kind(g, &mgr, &gqa, 0, &q, &k, &v, scale, AttnKernel::KFold);
+                let differing = v4
+                    .iter()
+                    .zip(&fold)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "{q_heads}q/{kv_heads}kv x {hd}: kfold differs from v4 in {differing} of {} lanes",
+                    v4.len()
+                );
+                assert!(
+                    v4.iter().any(|&z| z != 0.0),
+                    "control arm produced all zeros"
+                );
+                eprintln!(
+                    "kfold == v4 bit-for-bit on {} f32 ({q_heads}q/{kv_heads}kv x {hd}, g={})",
+                    v4.len(),
+                    gqa.group_size()
+                );
+            }
         });
     }
 
