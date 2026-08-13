@@ -12,8 +12,8 @@ module tests.fail.wrong_k
 ///
 /// The name can only come from the declared signature — by the time the mismatch is found, the
 /// parameter has been substituted to `Tensor[f32, 512, 512]` and `K` is gone from it. The text is
-/// pinned by `wrong_k_names_the_dim_in_json` in `crates/wukongc/tests/fail.rs`; the code is pinned
-/// here, by `compile_fail_suite`.
+/// pinned by `shape_diagnostics_name_the_dim_in_json` in `crates/wukongc/tests/fail.rs`; the code
+/// is pinned here, by `compile_fail_suite`.
 fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], c: Tensor[f32, M, N]) {}
 
 fn main() -> i32 {
