@@ -892,7 +892,11 @@ flag store is idempotent. On the **single-thread** path `wukong_parallel_for` ke
 iterations to, and it stays the reference every mega run is compared against. Both lowerings need
 `-O1` or better in practice, not because of the ops: at `-O0` the entry's loop counters still live in
 allocas, so a loop condition branches on a `Load` and the data-independent-control-flow gate declines
-the program before either op is considered.
+the program before either op is considered. And the grid-stride form is reached only when the
+`@parallel` region is in the **entry** function: eligibility rejects an entry that calls a user
+function, so the common `@parallel fn saxpy(..)` called from `main` still runs the sequential chunk.
+Lifting that means giving callees the mega thread discipline (their stores would need the `tid == 0`
+guard the entry's have), which is a design change rather than another arm.
 
 A **cooperative multi-CTA launch path** exists beside that single-block form, because "the whole
 program in one kernel" on a one-CTA grid is a statement about one SM rather than about the machine —
