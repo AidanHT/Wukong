@@ -9,10 +9,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
 Recognized kernels are **gate-blind**: a recognizer fires identically on interp and native at every
 `-O` level (both call the same `wukong_runtime` symbol), so no differential or invariance gate can see
 whether it fired — and until now the recognizer-free lowering of a program could not be built at all,
-which made every claim about the *language* unfalsifiable. Setting `WUKONG_NO_RECOGNIZE` skips both
-cascade heads in `wukong_mir_build` (`lower_program`'s whole-function interceptions and
-`lower_for`'s ordered `match_*` cascade); the autovectorizer, `@parallel` outlining, canonicalization
-and the optimizer all stay on, so the loop the user wrote is what runs.
+which made every claim about the *language* unfalsifiable. Setting `WUKONG_NO_RECOGNIZE` skips all four
+places `wukong_mir_build` probes a recognizer from — `lower_program`'s whole-function interceptions,
+`lower_for`'s ordered `match_*` cascade, `lower_block`'s statement **windows** (GEMM + epilogue, the
+multi-pass norm idiom, flat 1-D scans) and the elementwise probes that open the vectorizer; the
+autovectorizer, loop fusion, `@parallel` outlining, canonicalization, the optimizer and every explicit
+builtin (`alloc_*`, `read_*`/`write_*`, `sdpa`, `now_ns`) all stay on, so the loop the user wrote is
+what runs.
 
 ```
 cargo run -q -p wukongc -- --emit=mir -O2 tests/run/tensor_matmul.wk   # call wukong_sgemm(...)

@@ -76,12 +76,53 @@ fn no_recognize_removes_every_kernel_call() {
     );
 }
 
+/// One fixture per *cascade head*, so a head that stops answering to the switch is caught by name
+/// rather than by a vague corpus statistic: `lower_program`'s whole-function interception, the
+/// per-loop `lower_for` cascade, the statement-window matchers in `lower_block`, and the elementwise
+/// kernel probes inside the vectorizer.
+const KERNEL_WITNESSES: &[(&str, &str)] = &[
+    ("tensor_matmul.wk", "wukong_sgemm"), // whole-function + lower_for
+    ("softmax.wk", "wukong_norm_f32"),    // statement window (the multi-pass norm idiom)
+    ("scan_1d.wk", "wukong_cumsum_f32"),  // statement window (flat 1-D scan)
+    ("linear_bias_relu.wk", "wukong_sgemm_nt_epi"), // statement window (GEMM + epilogue loop)
+    ("transcendental_kernel.wk", "wukong_vmath_f32"), // elementwise probe inside the vectorizer
+];
+
+/// Each witness kernel is dispatched by default and gone with the instrument set. Without the first
+/// half this test could pass on a fixture that never had a kernel; without the second it would not
+/// test the instrument.
+#[test]
+fn every_cascade_head_answers_to_the_switch() {
+    for (name, kernel) in KERNEL_WITNESSES {
+        let p = fixture(name);
+        let (code, on, stderr) = wukongc(&["--emit=mir", "-O2"], &p, false);
+        assert_eq!(code, Some(0), "{name}: compile failed:\n{stderr}");
+        assert!(
+            on.contains(&format!("call {kernel}")),
+            "{name} no longer dispatches {kernel} at -O2, so it cannot witness the switch"
+        );
+        let (code, off, stderr) = wukongc(&["--emit=mir", "-O2"], &p, true);
+        assert_eq!(code, Some(0), "{name}: compile failed:\n{stderr}");
+        assert!(
+            !off.contains(&format!("call {kernel}")),
+            "{name} still dispatches {kernel} with the instrument set"
+        );
+    }
+}
+
 /// Recognition off must change only *how* the program is compiled: the answer is identical on the
 /// interpreter and on native, at -O0 and -O2. A kernel that disagreed with the loop it replaced
 /// would show up here as a difference between the two columns.
 #[test]
 fn no_recognize_keeps_the_program_correct_on_both_backends() {
-    for name in ["tensor_matmul.wk", "saxpy.wk", "transcendental_kernel.wk"] {
+    for name in [
+        "tensor_matmul.wk",
+        "saxpy.wk",
+        "transcendental_kernel.wk",
+        "softmax.wk",
+        "scan_1d.wk",
+        "linear_bias_relu.wk",
+    ] {
         let p = fixture(name);
         for opt in ["-O0", "-O2"] {
             for backend in ["--backend=interp", "--backend=native"] {

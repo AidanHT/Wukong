@@ -677,11 +677,21 @@ from "a pattern matcher swapped in a hand-written kernel."
 
 Setting `WUKONG_NO_RECOGNIZE` (to any value) builds the program with the recognizers off:
 `wukong_driver::compile` turns it into `wukong_mir_build::LowerOptions { recognize: false }`, which
-skips both cascade heads — `lower_program`'s whole-function kernel interceptions and
-`FnLowerer::lower_for`'s ordered `match_*` cascade — so every loop nest lowers as written. What stays
-on is everything that compiles the loop the user actually wrote: the autovectorizer, `@parallel`
+skips all **four** places a recognizer is probed from, so every loop nest lowers as written:
+
+| Cascade head | What it claims |
+|---|---|
+| `lower_program`, per item | Whole-function interceptions (`matmul_fn`, the `@parallel` kernel probes) |
+| `FnLowerer::lower_for` | The ordered per-loop `match_*` cascade (~40 arms), plus `try_emit_argreduce` |
+| `FnLowerer::lower_block` | Statement **windows**: GEMM + epilogue loop, the multi-pass softmax / LayerNorm / RMSNorm / L2-norm idiom, a flat 1-D scan's `let acc` + `for` |
+| `try_vectorize_for` / `try_vectorize_ranged` | The elementwise probes that open the vectorizer (vmath, velem, vhorner, dequant, the low-precision axpby twins) |
+
+What stays on is everything that compiles the loop the user actually wrote: the autovectorizer,
+`try_fuse_run` (fusing adjacent same-range loops emits vector MIR, not a kernel call), `@parallel`
 outlining (`wukong_parallel_for` is the user asking for threads, not a guess at intent), `tindex` and
-`canon` normalization, and the whole optimizer.
+`canon` normalization, and the whole optimizer. So do the **explicit builtins** — `alloc_*`/`free`,
+`read_*`/`write_*`, `now_ns`, `sdpa` all still lower to their `wukong_*` runtime entry points, because
+the user named them; declining those would be a compile error, not a generic lowering.
 
 The witness, and the shape of any claim about the language:
 
@@ -700,9 +710,11 @@ Two rules about it:
   variable is set, because `wukong_autodiff`'s VJP rules are keyed on the recognized kernel calls. A
   named refusal, never a silently zero gradient.
 
-`crates/wukongc/tests/recognize.rs` gates all of this: the kernel is dispatched by default, no
-`call wukong_` survives with the variable set, the program still prints the same bytes on both
-backends at `-O0` and `-O2`, and autodiff is refused.
+`crates/wukongc/tests/recognize.rs` gates all of this: one witness fixture per cascade head (its
+kernel is dispatched by default and gone with the variable set — the first half matters, or the
+second is vacuous), no `call wukong_` at all survives for `tensor_matmul.wk`, the program still prints
+the same bytes on both backends at `-O0` and `-O2`, and autodiff is refused. All 361 `tests/run`
+fixtures were swept on/off for byte-identical stdout when the switch landed.
 
 ## GPU backend
 
