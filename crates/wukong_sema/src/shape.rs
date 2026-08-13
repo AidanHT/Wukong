@@ -705,14 +705,18 @@ impl Sema<'_> {
                     *len != const_prod
                 };
                 if bad {
+                    // Show the shape the length is judged against — the SUBSTITUTED one, so the
+                    // extents printed are the ones `const_prod` is the product of.
+                    let dims = self.shape_str(shape);
                     let msg = if has_free_dim {
                         format!(
                             "array of length {len} is not a multiple of the tensor's known \
-                             dimensions (product {const_prod})"
+                             dimensions (shape {dims}, product of the fixed axes {const_prod})"
                         )
                     } else {
                         format!(
-                            "array of length {len} cannot satisfy a tensor of {const_prod} element{}",
+                            "array of length {len} cannot satisfy a tensor of shape {dims} \
+                             ({const_prod} element{})",
                             if const_prod == 1 { "" } else { "s" }
                         )
                     };

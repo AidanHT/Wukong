@@ -4539,6 +4539,27 @@ mod tests {
     }
 
     #[test]
+    fn array_decay_length_error_names_the_shape() {
+        // Array -> tensor decay has no single disagreeing axis (an array has one length against a
+        // whole shape), so this one names the shape and the element count, honestly.
+        let exact = "fn take(a: Tensor[f32, 2, 4]) {} \
+                     fn f() { let b: [f32; 6] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]; take(b); }";
+        assert_message_has(
+            exact,
+            "E0501",
+            &["array of length 6", "shape [2, 4]", "8 elements"],
+        );
+        // With a free dim there is no exact count, only divisibility by the fixed axes.
+        let free = "fn take<N>(a: Tensor[f32, N, 4]) {} \
+                    fn f() { let b: [f32; 6] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]; take(b); }";
+        assert_message_has(
+            free,
+            "E0501",
+            &["array of length 6", "shape [N, 4]", "fixed axes 4"],
+        );
+    }
+
+    #[test]
     fn out_of_bounds_tensor_index_names_the_axis() {
         // With one message per axis, `a[0, 5]` on a `Tensor[f32, 2, 2]` has to say WHICH index is
         // the offending one — both are spelled `0`/`5` in source but only axis 1 is out of range.
