@@ -140,6 +140,30 @@ fn no_recognize_keeps_the_program_correct_on_both_backends() {
     }
 }
 
+/// The `@generic` fixtures each hold the SAME body twice — once with the attribute, once without —
+/// so the module's MIR must contain exactly one dispatch of the kernel that body would be recognized
+/// as. Zero would mean the attribute leaked into the whole module (or the recognizer stopped firing,
+/// making the fixture worthless); two would mean the attribute did nothing. This is the only way to
+/// see a per-function opt-out: `run.rs` cannot, since both spellings print the same lanes.
+#[test]
+fn generic_opts_out_one_function_not_the_module() {
+    for (name, kernel) in [
+        ("lang_generic_saxpy.wk", "call wukong_velem_f32"),
+        ("lang_generic_naive_gemm.wk", "call wukong_sgemm"),
+    ] {
+        let p = fixture(name);
+        for opt in ["-O0", "-O2"] {
+            let (code, mir, stderr) = wukongc(&["--emit=mir", opt], &p, false);
+            assert_eq!(code, Some(0), "{name}: compile failed:\n{stderr}");
+            let n = mir.matches(kernel).count();
+            assert_eq!(
+                n, 1,
+                "{name} at {opt}: expected exactly one `{kernel}` (the un-attributed twin), got {n}"
+            );
+        }
+    }
+}
+
 /// Autodiff and the instrument are mutually exclusive, by a named refusal rather than a zero
 /// gradient: the VJP rules are keyed on the kernel calls recognition removes.
 #[test]
