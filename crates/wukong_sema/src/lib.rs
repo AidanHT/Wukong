@@ -4539,6 +4539,19 @@ mod tests {
     }
 
     #[test]
+    fn rank_mismatch_names_both_shapes() {
+        // A rank mismatch has no single disagreeing dim to name, so it names rank against rank —
+        // and now the two shapes as well, so the reader sees which signature is rank-2.
+        let src = "fn use2d<M, N>(a: Tensor[f32, M, N]) {} \
+                   fn f(a: Tensor[f32, 4, 4, 4]) { use2d(a); }";
+        assert_message_has(
+            src,
+            "E0501",
+            &["expected rank 2 [M, N]", "found rank 3 [4, 4, 4]"],
+        );
+    }
+
+    #[test]
     fn tensor_index_rank_mismatch_errors() {
         let src = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0]; }";
         assert!(

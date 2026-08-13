@@ -596,11 +596,16 @@ impl Sema<'_> {
                     );
                 }
                 if ps.rank() != as_.rank() {
+                    // Name the two shapes, not just their ranks: `expected rank 2 [M, N]` points at
+                    // the declared signature (the parameter still spells its dimension variables
+                    // here, so the reader can find it), `found rank 3 [4, 4, 4]` at the argument.
+                    let expected = self.shape_str(tensor_shape_of(decl).unwrap_or(ps));
+                    let found = self.shape_str(as_);
                     self.error(
                         span,
                         "E0501",
                         format!(
-                            "tensor rank mismatch: expected rank {}, found rank {}",
+                            "tensor rank mismatch: expected rank {} {expected}, found rank {} {found}",
                             ps.rank(),
                             as_.rank()
                         ),
@@ -1096,6 +1101,12 @@ impl Sema<'_> {
             self.defs.lookup(n).map(|d| &d.kind),
             Some(DefKind::Struct(_) | DefKind::Enum(_))
         )
+    }
+
+    /// A shape as a diagnostic renders it: `[M, K]`, `[512, 513]`, `[?]`.
+    fn shape_str(&self, s: &Shape) -> String {
+        let dims: Vec<String> = s.0.iter().map(|d| self.dim_str(*d)).collect();
+        format!("[{}]", dims.join(", "))
     }
 
     /// How a diagnostic points at one axis: ``` `K` (axis 1) ``` when the shape names it, `axis 1`
