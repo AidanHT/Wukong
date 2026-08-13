@@ -3970,6 +3970,28 @@ mod tests {
         analyze(src).0.into_iter().filter_map(|d| d.code).collect()
     }
 
+    /// The headline messages of every diagnostic carrying `code`. The shape diagnostics are asserted
+    /// on their TEXT and not only their code: naming the disagreeing dimension is the contract, and
+    /// a message that regresses to a bare "expected 512, found 513" still carries the right code.
+    fn messages_for(src: &str, code: &str) -> Vec<String> {
+        analyze(src)
+            .0
+            .into_iter()
+            .filter(|d| d.code == Some(code))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// Assert that some diagnostic with `code` contains every one of `needles`.
+    #[track_caller]
+    fn assert_message_has(src: &str, code: &str, needles: &[&str]) {
+        let msgs = messages_for(src, code);
+        assert!(
+            msgs.iter().any(|m| needles.iter().all(|n| m.contains(n))),
+            "no {code} message contains {needles:?}; got {msgs:?} for {src:?}"
+        );
+    }
+
     #[test]
     fn clean_kernel_has_no_errors() {
         let src = "fn add<N>(x: Tensor[f32, N], y: Tensor[f32, N]) { \
@@ -4447,6 +4469,17 @@ mod tests {
             "an order-sensitive turbofish must bind by position: {:?}",
             errors(ok)
         );
+    }
+
+    #[test]
+    fn rigid_shape_mismatch_names_the_axis() {
+        // A body-context (RIGID) shape mismatch must say WHICH axis disagrees. `grow` returns
+        // `Tensor[f32, M, N]` as `Tensor[f32, N, 5]`: axis 0 is `N` against `M`, axis 1 is the bare
+        // constant `5` against `N`. Reporting only "expected N, found M" left the reader counting
+        // axes across two shapes.
+        let src = "fn grow<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, N, 5] { return a; }";
+        assert_message_has(src, "E0502", &["`N` (axis 0)", "expected N, found M"]);
+        assert_message_has(src, "E0502", &["axis 1", "expected 5, found N"]);
     }
 
     #[test]

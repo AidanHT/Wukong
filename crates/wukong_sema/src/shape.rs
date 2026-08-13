@@ -85,6 +85,24 @@ fn kind_name(t: &Ty) -> &'static str {
     }
 }
 
+/// Where a dimension disagreement sits, for the diagnostic that reports it: the 0-based axis, plus
+/// the declared *name* of that axis (`K`) when a shape spells a dimension variable there. The name
+/// is what makes an `E0502` actionable — "expected 512, found 513" leaves the reader counting axes
+/// across two signatures, while "dimension mismatch on `K`" names the thing to fix.
+#[derive(Clone, Copy)]
+struct DimSite {
+    axis: usize,
+    name: Option<Symbol>,
+}
+
+/// The dimension variable a shape spells at `axis`, if any.
+fn dim_var_at(shape: Option<&Shape>, axis: usize) -> Option<Symbol> {
+    match shape?.0.get(axis)? {
+        Dim::Var(v) => Some(*v),
+        _ => None,
+    }
+}
+
 /// A short human name for a tensor's declared layout, for the layout-mismatch diagnostic.
 fn layout_name(l: &Layout) -> String {
     match l {
@@ -550,8 +568,12 @@ impl Sema<'_> {
                     );
                     return;
                 }
-                for (pd, ad) in ps.0.iter().zip(&as_.0) {
-                    self.unify_dim(*pd, *ad, dims, span, rigid);
+                for (axis, (pd, ad)) in ps.0.iter().zip(&as_.0).enumerate() {
+                    let site = DimSite {
+                        axis,
+                        name: dim_var_at(Some(ps), axis),
+                    };
+                    self.unify_dim(*pd, *ad, dims, span, rigid, site);
                 }
             }
             // Array → tensor *decay*: an `Array` argument is intentionally accepted for a tensor
@@ -603,7 +625,11 @@ impl Sema<'_> {
                 // symbolic factors).
                 if shape.0.len() == 1 {
                     if let Dim::Var(_) = shape.0[0] {
-                        self.unify_dim(shape.0[0], Dim::Const(*len), dims, span, rigid);
+                        let site = DimSite {
+                            axis: 0,
+                            name: dim_var_at(Some(shape), 0),
+                        };
+                        self.unify_dim(shape.0[0], Dim::Const(*len), dims, span, rigid, site);
                     }
                 }
                 // The array must supply a whole number of the tensor's *known* (const) sub-slabs.
@@ -794,6 +820,7 @@ impl Sema<'_> {
         dims: &mut HashMap<Symbol, Dim>,
         span: Span,
         rigid: bool,
+        site: DimSite,
     ) {
         // RIGID mode — used by the body shape checks (return type, operator / branch-arm operands).
         // There both shapes are FULLY DETERMINED by the signature and the body, so there is nothing
@@ -813,7 +840,8 @@ impl Sema<'_> {
                     span,
                     "E0502",
                     format!(
-                        "dimension mismatch: expected {}, found {}",
+                        "dimension mismatch on {}: expected {}, found {}",
+                        self.dim_site(site),
                         self.dim_str(pd),
                         self.dim_str(ad)
                     ),
@@ -1019,6 +1047,15 @@ impl Sema<'_> {
             self.defs.lookup(n).map(|d| &d.kind),
             Some(DefKind::Struct(_) | DefKind::Enum(_))
         )
+    }
+
+    /// How a diagnostic points at one axis: ``` `K` (axis 1) ``` when the shape names it, `axis 1`
+    /// when it is a bare constant.
+    fn dim_site(&self, site: DimSite) -> String {
+        match site.name {
+            Some(n) => format!("`{}` (axis {})", self.sym_str(n), site.axis),
+            None => format!("axis {}", site.axis),
+        }
     }
 
     fn dim_str(&self, d: Dim) -> String {
