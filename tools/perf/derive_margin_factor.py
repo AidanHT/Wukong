@@ -47,9 +47,14 @@ BENCH_NEW = re.compile(
     r"contender spread\s*([+-][\d.]+)%\s*\(ours\)"
 )
 BENCH_OLD = re.compile(r"bench\s+(\S+?)@(\S+?)/(\S+?):\s*floor\s*([+-][\d.]+)%\s*\(bar")
+# `A C B  C/A-1 B/A-1 [B spread] [margin] verdict`. The optional `B spread` is the older format;
+# the optional `margin` column (`1.21x` / `inf` / `n/a`) arrived with the 2026-08-13 instrument
+# change, and WITHOUT it here every future round log parses to zero cells -- which would make the
+# constant's own "re-derive by re-running this script" instruction unfollowable the moment a new
+# round lands, i.e. exactly when it is needed.
 GEMM = re.compile(
     r"^\s*(\w+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([+-][\d.]+)%\s+([+-][\d.]+)%"
-    r"(?:\s+([+-][\d.]+)%)?\s+(\w+)\s*$"
+    r"(?:\s+([+-][\d.]+)%)?(?:\s+(?:[\d.]+x|inf|n/a))?\s+(\w+)\s*$"
 )
 
 

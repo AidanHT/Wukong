@@ -1052,7 +1052,7 @@ impl fmt::Display for Refusal {
                 cell: Cell::Marginal,
             } => write!(
                 f,
-                "                 field '{field}' is MARGINAL: the effect cleared this round's resolution threshold \
+                "field '{field}' is MARGINAL: the effect cleared this round's resolution threshold \
                  but by less than {:.0}x, and 43.6% of the replicated cells in \
                  bench/gpu/h100/*.log drifted further BETWEEN rounds than one round's own \
                  threshold (upper quartile 1.9x; see tools/perf/derive_margin_factor.py). It is a \
@@ -1674,6 +1674,23 @@ pub struct Provenance {
 }
 
 impl Provenance {
+    /// The operator metadata this round was opened with.
+    ///
+    /// **Read this instead of the field.** `meta` is still `pub`, which leaves two bypasses of the
+    /// §6.3 gate that [`RoundMeta::class`]'s privacy does not reach: `prov.meta = RoundMeta::default()`
+    /// (class -> `Synthetic`, gate skipped) and `prov.meta.clock_lock = ClockLock::Locked(..)`
+    /// (forged publication class for a container round). Both are one line, both compile, and both
+    /// are invisible to `only_a_device_free_unit_test_may_hand_build_a_round`, whose window sees the
+    /// `from_env()` that is still right there in the constructor call.
+    ///
+    /// Closing them means making `meta` private, and the one call site that reads it through the
+    /// field is in `gpu.rs` (`prov.meta.clock_lock`) — owned by another lane this wave. This
+    /// accessor exists so that change is a one-line call-site edit there and a `pub` removal here.
+    /// **HANDOFF.**
+    pub fn meta(&self) -> &RoundMeta {
+        &self.meta
+    }
+
     /// Build the block and run the device check.
     pub fn new(
         round: &str,
@@ -1758,9 +1775,12 @@ impl Provenance {
                 ),
                 RoundClass::Measured if self.meta.clock_lock.is_locked() =>
                     "PUBLICATION (clocks locked)".to_string(),
+                // Not "is unset": after the allow-list narrowing the variable can be SET to
+                // something unrecognised (`y`, `enabled`, `2`) and still refuse, and an operator
+                // told "unset" would go looking in the wrong place.
                 RoundClass::Measured => format!(
-                    "REFUSED (clocks not locked and {ITERATION_DATA_ENV} is unset) - this round \
-                     mints no numbers"
+                    "REFUSED (clocks not locked, and {ITERATION_DATA_ENV} is not set to a \
+                     recognised declaration: 1/true/yes/on/iteration) - this round mints no numbers"
                 ),
             }
         );
