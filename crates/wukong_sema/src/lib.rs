@@ -4483,6 +4483,29 @@ mod tests {
     }
 
     #[test]
+    fn inferred_dim_conflict_names_the_declared_dim() {
+        // The flagship message (master plan §7.1 `wrong_k.wk`): `a` binds `K := 512`, `b`'s first
+        // axis is 513. `apply_subst` has already turned the parameter into `Tensor[f32, 512, N]` by
+        // then, so the name `K` can only come from the DECLARED signature — that is what
+        // `unify_decl` carries.
+        let src = format!(
+            "{MATMUL}\nfn driver(a: Tensor[f32, 512, 512], b: Tensor[f32, 513, 512], \
+             c: Tensor[f32, 512, 512]) {{ matmul(a, b, c); }}"
+        );
+        assert_message_has(&src, "E0502", &["`K` (axis 0)", "expected 512, found 513"]);
+    }
+
+    #[test]
+    fn turbofished_dim_conflict_names_the_declared_dim() {
+        // Same, with the dims pinned by a turbofish rather than inferred: `c`'s axis 1 must be `N`.
+        let src = format!(
+            "{MATMUL}\nfn driver(a: Tensor[f32, 512, 512], b: Tensor[f32, 512, 512], \
+             c: Tensor[f32, 512, 513]) {{ matmul::<512, 512, 512>(a, b, c); }}"
+        );
+        assert_message_has(&src, "E0502", &["`N` (axis 1)", "expected 512, found 513"]);
+    }
+
+    #[test]
     fn constant_dim_mismatch_at_a_call_names_the_axis() {
         // A fully concrete call: the callee's axis 1 is 8, the argument's is 9. Both numbers were
         // already in the message; the axis was not.

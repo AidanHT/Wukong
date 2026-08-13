@@ -103,6 +103,24 @@ fn dim_var_at(shape: Option<&Shape>, axis: usize) -> Option<Symbol> {
     }
 }
 
+/// A tensor's shape, for the optional *declared* type threaded through `unify_decl`.
+fn tensor_shape_of(t: Option<&Ty>) -> Option<&Shape> {
+    match t? {
+        Ty::Tensor { shape, .. } => Some(shape),
+        _ => None,
+    }
+}
+
+/// The pointee / element of the declared type, so the recursion through a pointer, reference,
+/// slice or array keeps the declared names in step with the substituted parameter.
+fn decl_pointee(t: Option<&Ty>) -> Option<&Ty> {
+    match t? {
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => Some(pointee),
+        Ty::Slice(elem) | Ty::Array { elem, .. } => Some(elem),
+        _ => None,
+    }
+}
+
 /// A short human name for a tensor's declared layout, for the layout-mismatch diagnostic.
 fn layout_name(l: &Layout) -> String {
     match l {
@@ -497,8 +515,10 @@ impl Sema<'_> {
             infer_type_generics(param, arg, &sig.generics, &mut tys);
             let p = apply_subst(param, &dims, &tys);
             // Call site: the callee's not-yet-substituted dim vars are INFERENCE variables to bind
-            // from the argument shapes (`rigid == false`).
-            self.unify(&p, arg, &mut dims, span, false);
+            // from the argument shapes (`rigid == false`). `param` — the DECLARED type, before the
+            // substitution that produced `p` — rides along so a mismatch can be reported against the
+            // name the signature wrote (`K`), not just the extent it resolved to.
+            self.unify_decl(&p, arg, Some(param), &mut dims, span, false);
         }
 
         apply_subst(&sig.ret, &dims, &tys)
@@ -508,6 +528,25 @@ impl Sema<'_> {
         &mut self,
         param: &Ty,
         arg: &Ty,
+        dims: &mut HashMap<Symbol, Dim>,
+        span: Span,
+        rigid: bool,
+    ) {
+        self.unify_decl(param, arg, None, dims, span, rigid)
+    }
+
+    /// `unify`, plus the callee's **pre-substitution** declared type. `check_fn_call` substitutes the
+    /// dims it has already bound into the parameter before unifying, so by the time a mismatch is
+    /// reported the shape reads `Tensor[f32, 512, 512]` and the name `K` the programmer wrote is
+    /// gone. `decl` carries that name — and *only* the name: every check still runs against the
+    /// substituted `param`, so nothing about what is accepted changes. Body checks
+    /// (`check_return_shape`, `check_binop_shapes`) pass `None`; their shapes are the declared ones
+    /// already.
+    fn unify_decl(
+        &mut self,
+        param: &Ty,
+        arg: &Ty,
+        decl: Option<&Ty>,
         dims: &mut HashMap<Symbol, Dim>,
         span: Span,
         rigid: bool,
@@ -568,10 +607,11 @@ impl Sema<'_> {
                     );
                     return;
                 }
+                let decl_shape = tensor_shape_of(decl);
                 for (axis, (pd, ad)) in ps.0.iter().zip(&as_.0).enumerate() {
                     let site = DimSite {
                         axis,
-                        name: dim_var_at(Some(ps), axis),
+                        name: dim_var_at(decl_shape, axis).or_else(|| dim_var_at(Some(ps), axis)),
                     };
                     self.unify_dim(*pd, *ad, dims, span, rigid, site);
                 }
@@ -627,7 +667,8 @@ impl Sema<'_> {
                     if let Dim::Var(_) = shape.0[0] {
                         let site = DimSite {
                             axis: 0,
-                            name: dim_var_at(Some(shape), 0),
+                            name: dim_var_at(tensor_shape_of(decl), 0)
+                                .or_else(|| dim_var_at(Some(shape), 0)),
                         };
                         self.unify_dim(shape.0[0], Dim::Const(*len), dims, span, rigid, site);
                     }
@@ -675,14 +716,14 @@ impl Sema<'_> {
             }
             (Ty::Ptr { pointee: pp, .. }, Ty::Ptr { pointee: ap, .. })
             | (Ty::Ref { pointee: pp, .. }, Ty::Ref { pointee: ap, .. }) => {
-                self.unify(pp, ap, dims, span, rigid)
+                self.unify_decl(pp, ap, decl_pointee(decl), dims, span, rigid)
             }
             // A slice parameter `[]T` accepts a slice `[]T` or — via unsizing — a fixed-size array
             // `[T; N]` argument; either way the element types must unify (a slice of a different
             // element type has a different stride, so `s[i]` would read the wrong bytes). The
             // array's static length is intentionally dropped to the slice's runtime length.
             (Ty::Slice(pe), Ty::Slice(ae) | Ty::Array { elem: ae, .. }) => {
-                self.unify(pe, ae, dims, span, rigid)
+                self.unify_decl(pe, ae, decl_pointee(decl), dims, span, rigid)
             }
             (
                 Ty::Vector {
