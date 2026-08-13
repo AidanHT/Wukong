@@ -1,0 +1,39 @@
+# wukong_bench
+
+Benchmark harness for **optimizer effectiveness** and **interpreter timing**. Measures the compiler;
+it is not the product.
+
+For each `.wk` program it can lower, reports `-O0` vs `-O3`:
+
+- total MIR op count and reduction
+- interpreter wall-clock per run (adaptively batched), including the 512 MiB worker-thread spawn cost
+
+Every program is also a correctness check: `-O0` and `-O3` must verify, agree on exit code and
+stdout, and Cranelift at `-O3` must agree with the interpreter at `-O3`. Failures print `*** FAILED`
+and exit 1.
+
+## Usage
+
+```sh
+cargo run -p wukong_bench --release -- tests/run examples bench/kernels
+```
+
+**Timing numbers require `--release`.** A debug build makes runtime kernels look far slower than
+JIT'd loops; the harness warns but still runs the correctness gate.
+
+## Modes (first CLI argument)
+
+| mode | report |
+|---|---|
+| *(default)* | optimizer effectiveness + execution timing |
+| `compile-time` / `--compile-time` / `ctime` | in-process optimizer timing |
+| `compile-profile` / `profile` | full-pipeline per-stage breakdown |
+| `spawn-overhead` / `spawn` | in-process vs process-spawn characterization |
+| `compile-vs [wukongc-path]` | cross-compiler compile-time comparison |
+
+With no arguments the corpus defaults to `tests/run`. Non-mode arguments are corpus directories.
+
+## Testing
+
+This crate has no `cargo test` suite of its own — it is a measurement tool. Correctness is embedded
+in each run's `-O0`/`-O3` equivalence check.
