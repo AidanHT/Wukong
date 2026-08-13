@@ -421,12 +421,19 @@ pub(crate) const HOPPER_GATE_SHAPES: [(usize, usize, usize); 4] = [
     // requirement is a launch FAILURE, not a wrong number, so this arm has a mechanism the other
     // three do not and the gate would look complete without it.
     //
-    // It is the cheapest shape that reaches it: 2 waves needs > 132 tiles at 128x256 and 0.90 wave
-    // efficiency needs >= 238, while `f_L2 >= 0.78` needs `K >= ~2200` at that tile count. 42.9 GFLOP
-    // of CPU reference is the price of covering the arm. The multicast's own exactness (including the
-    // odd-M-tile pad CTA, at both the linear and rastered tile maps) is gated in the generator crate
-    // by `gpu::tests::wgmma_cluster_multicast_is_exact`, whose rows already include both persistent
-    // clustered arms — so this shape's job is the ROUTE and the launch, not the slicing.
+    // Reaching that arm needs > 132 tiles at 128x256 for two waves, >= 238 for the 0.90 wave-fill
+    // floor, and `K >= ~2200` for `f_L2 >= 0.78` at that tile count. This shape is **68.7 GFLOP** of
+    // CPU reference (`2 * 2048 * 4096 * 4096`), which is not the cheapest that reaches the arm --
+    // `K = 2560` reaches it at 42.9 GFLOP with `f_L2 = 0.834` and a saving of 0.278 against the 0.26
+    // bar. `K = 4096` buys a 22% margin over the threshold instead of 6.9%, and a gate shape that sits
+    // 6.9% from a predicate boundary is a gate that a re-derived constant turns into a silent
+    // narrowing. The reference goes through the recognized `wukong_sgemm_nt` runtime kernel, so it is
+    // seconds in a release build, not minutes.
+    //
+    // The multicast's own exactness (including the odd-M-tile pad CTA, at both the linear and rastered
+    // tile maps) is gated in the generator crate by `gpu::tests::wgmma_cluster_multicast_is_exact`,
+    // whose rows already include both persistent clustered arms — so this shape's job is the ROUTE and
+    // the launch, not the slicing.
     (2048, 4096, 4096),
 ];
 
@@ -2038,14 +2045,22 @@ mod tests {
         // shape this test would then have to know — the clustered row rounds the y axis up to a
         // multiple of 2, and hard-coding `128 * 65535` lands on the wrong side of that.
         //
-        // **It must be a ONE-TILE-PER-CTA plan, and that is a fact about the promoted rule.** A
-        // persistent plan's grid is `(cluster slots, cluster.y, 1)` — bounded by the DEVICE, not by
-        // the output — so `gridDim.y` can no longer be exceeded and the ceiling is structurally
-        // unreachable there. `cfg` above is the rule's answer at 4096-cubed, which is now persistent,
-        // and searching its grid for the ceiling runs to `usize` (the assertion below caught exactly
-        // that). `small` is the rule's answer at a tiny shape: one tile per CTA, so its `gridDim.y`
-        // still tracks `ceil(M / bm)` and the decline is reachable. The decline itself is NOT dead
-        // code — every single-wave shape the rule serves takes a one-tile-per-CTA row.
+        // **The ceiling is now UNREACHABLE THROUGH THE SHIPPED RULE, and this probe therefore tests
+        // `LaunchPlan::grid` rather than a shape the rule can produce.** Say it plainly, because the
+        // arithmetic is short and a reader who works it out will otherwise conclude the comment is
+        // wrong: a one-tile-per-CTA plan is selected iff `waves == 1` iff `tiles <= sm_count`, and
+        // `gridDim.y = ceil(M/bm) <= tiles <= sm_count` (132 on the SXM5) -- while a PERSISTENT plan's
+        // grid is `(cluster slots, cluster.y, 1)`, bounded by the device. So no shape the rule can
+        // serve, at either dtype, can present `gridDim.y > 65535`.
+        //
+        // The decline is kept as **defence in depth on `LaunchPlan::grid`**, not as a live routing
+        // path: `grid` is `pub`, the tile menu and the schedule set are both things later waves will
+        // widen, and the failure it prevents is a `CUDA_ERROR_INVALID_VALUE` on a call that had a
+        // working fallback. The probe below feeds `small.launch_plan()` an `M` the rule would never
+        // send to that plan (at that `M` the rule returns a persistent row), which is exactly what
+        // testing the plan rather than the rule means -- and `cfg` cannot be used at all, because
+        // searching a persistent plan's grid for the ceiling runs to `usize` (the assertion below
+        // caught precisely that).
         let gplan = small.launch_plan();
         assert!(
             !small.tiles.carries_ring(),
