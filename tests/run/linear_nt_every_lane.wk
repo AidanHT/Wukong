@@ -34,8 +34,15 @@ module tests.run.linear_nt_every_lane
 //
 // PROOF THE RECOGNIZER FIRES (do this by hand after touching the recognizer; no gate can):
 //     cargo run -q -p wukongc -- --emit=mir -O2 tests/run/linear_nt_every_lane.wk | grep wukong_
-// prints `call wukong_sgemm_nt(...)`. The flat-index spelling `x[i*8+k] * w[j*8+k]` lowers to
-// byte-identical MIR, so this fixture is the idiomatic surface over the same kernel, not a dialect.
+// prints `call wukong_sgemm_nt(...)`. The same nest written against *flat* parameters — `[f32; 24]`
+// and `[f32; 48]` with `x[i*8+k] * w[j*8+k]`, the spelling `gpu_e2e_tests::linear_src` generates
+// (note the e2e *bench*'s generator produces THIS file's spelling instead, and a law pins them
+// equal) —
+// lowers to byte-identical MIR (checked: same call, same vreg numbers), so this fixture is the
+// idiomatic surface over one kernel rather than a dialect. Note the flat *index* is not
+// interchangeable with the multi-index against THESE parameters: `x[i*8+k]` on a `Tensor[f32,3,8]`
+// is E0501 ("rank 2 but indexed with 1 index"). The two spellings are two whole signatures, and
+// `docs/language-guide.md`'s byte-identity claim is about exactly that pair.
 //
 // WHERE THE EXPECTED VALUES COME FROM — the scalar semantics of the nest, never a compiler run.
 // The fills are `x[i,k] = i*8 + k + 1` (so 1..24) and `w[j,k] = k - j` (so -5..7), and with
