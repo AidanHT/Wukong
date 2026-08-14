@@ -27,7 +27,9 @@ These are the small loops a human or AI editor should copy: `lang_saxpy.wk`,
 to request recognition-off behavior, spell the scalar algorithm directly, and
 print every output lane. The matching C/CUDA comparison peers live under
 [`tests/compare/`](../tests/compare/); these examples are correctness
-few-shots, not performance claims.
+few-shots, not performance claims. Phase 3 adds `tests/run/lang_generic_copy.wk`
+as an `@generic` streaming-copy fixture (every lane printed) for coalesced vector
+global ld/st smoke on gpu-native.
 
 ## Runnable today (interpreter)
 
