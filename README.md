@@ -71,9 +71,10 @@ not duplicate them. In summary, Wukong:
   execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` is the only attribute with a consumer
   today, and only its bare form — `@simd`/`@tile`/`@align`/`@extern`/`@export` and `@parallel`'s
   `grain =` argument parse and are inert — layout is
-  enforced across call boundaries but only the default row-major (contiguous) layout lowers a
-  multi-dimensional index, and arena/scratch/pool allocator selection is not implemented (the
-  language's only runtime-sized memory today is `alloc_<T>`/`free`).
+  enforced across call boundaries; the default row-major (contiguous) layout and `.col_major` both
+  lower multi-dimensional indexing (`.col_major` is byte-identical to `a[i + j*M]`); `.strided` /
+  `.tiled(…)` still reject indexing (`C0001`). Arena/scratch/pool allocator selection is not
+  implemented (the language's only runtime-sized memory today is `alloc_<T>`/`free`).
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and may lower it to a tuned
