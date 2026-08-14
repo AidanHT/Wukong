@@ -374,10 +374,11 @@ pub(crate) fn map_op_uses(op: &mut Op, mut f: impl FnMut(ValueId) -> ValueId) {
         }
         Op::ConstInt(..)
         | Op::ConstFloat(..)
-        | Op::Alloca(..)
+        | Op::Alloca { .. }
         | Op::FuncAddr(..)
         | Op::GlobalAddr(..)
-        | Op::Iota(..) => {}
+        | Op::Iota(..)
+        | Op::Barrier => {}
     }
 }
 
@@ -450,10 +451,11 @@ pub(crate) fn each_op_use(op: &Op, f: &mut impl FnMut(ValueId)) {
         }
         Op::ConstInt(..)
         | Op::ConstFloat(..)
-        | Op::Alloca(..)
+        | Op::Alloca { .. }
         | Op::FuncAddr(..)
         | Op::GlobalAddr(..)
-        | Op::Iota(..) => {}
+        | Op::Iota(..)
+        | Op::Barrier => {}
     }
 }
 
@@ -480,7 +482,7 @@ pub(crate) fn each_term_use(t: &Terminator, f: &mut impl FnMut(ValueId)) {
 pub(crate) fn has_side_effects(op: &Op) -> bool {
     matches!(
         op,
-        Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. }
+        Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier
     )
 }
 
@@ -750,7 +752,7 @@ mod tests {
         f.blocks
             .iter()
             .flat_map(|b| &b.insts)
-            .filter(|i| matches!(i.op, Op::Alloca(_)))
+            .filter(|i| matches!(i.op, Op::Alloca { ty: _, space: wukong_mir::AddrSpace::Local }))
             .count()
     }
 
@@ -1079,7 +1081,7 @@ mod tests {
         let mut reloads = 0;
         for i in f.blocks.iter().flat_map(|b| &b.insts) {
             match &i.op {
-                Op::Alloca(MirType::Ptr) => slots += 1,
+                Op::Alloca { ty: MirType::Ptr, space: wukong_mir::AddrSpace::Local } => slots += 1,
                 Op::Load(_, MirType::Ptr) => reloads += 1,
                 _ => {}
             }

@@ -1,0 +1,36 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+module tests.run.lang_shared_transpose
+
+// A minimal shared-memory staging kernel: load a 2x2 tile into `shared`, barrier, read back out.
+// Expected values are scalar semantics (not recorded from compiler output).
+
+@generic
+@parallel
+fn stage(mut out: [f32; 4], inp: [f32; 4]) {
+    let mut tile: shared [f32; 4];
+    tile[0] = inp[0];
+    tile[1] = inp[1];
+    tile[2] = inp[2];
+    tile[3] = inp[3];
+    sync_block();
+    out[0] = tile[0];
+    out[1] = tile[1];
+    out[2] = tile[2];
+    out[3] = tile[3];
+}
+
+fn main() -> i32 {
+    let inp: [f32; 4] = [11.0, 12.0, 21.0, 22.0];
+    let mut out: [f32; 4] = [0.0; 4];
+    stage(out, inp);
+    print(out[0] as i32);
+    print(out[1] as i32);
+    print(out[2] as i32);
+    print(out[3] as i32);
+    return 0;
+}

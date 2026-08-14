@@ -95,8 +95,13 @@ impl AstPrinter<'_> {
                 )
             }
             TypeKind::Slice(e) => format!("[]{}", self.type_str(e)),
-            TypeKind::Array { elem, len } => {
-                format!("[{}; {}]", self.type_str(elem), self.expr_inline(len))
+            TypeKind::Array { elem, len, shared } => {
+                let inner = format!("[{}; {}]", self.type_str(elem), self.expr_inline(len));
+                if *shared {
+                    format!("shared {inner}")
+                } else {
+                    inner
+                }
             }
             TypeKind::Tuple(items) => {
                 let parts: Vec<_> = items.iter().map(|i| self.type_str(i)).collect();

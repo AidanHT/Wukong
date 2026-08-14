@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0308
+module tests.fail.sync_outside_parallel
+
+fn f() {
+    sync_block();
+}
+
+fn main() -> i32 {
+    f();
+    return 0;
+}

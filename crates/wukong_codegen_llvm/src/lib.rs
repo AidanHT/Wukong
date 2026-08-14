@@ -222,7 +222,7 @@ impl Emitter<'_> {
             .map(|r| format!("%v{} = ", r.0))
             .unwrap_or_default();
         let line = match &inst.op {
-            Op::ConstInt(..) | Op::ConstFloat(..) => return,
+            Op::ConstInt(..) | Op::ConstFloat(..) | Op::Barrier => return,
             Op::Bin(op, l, r) => {
                 let ty = self.ty(inst.result.unwrap());
                 format!(
@@ -232,6 +232,7 @@ impl Emitter<'_> {
                     self.operand(*r)
                 )
             }
+            Op::Alloca { ty, .. } => format!("{res}alloca {}", llvm_ty(ty)),
             Op::Cmp(op, l, r) => {
                 let opty = self.ty(*l);
                 let (instr, pred) = cmp_instr(*op);
@@ -271,7 +272,6 @@ impl Emitter<'_> {
                     self.operand(*b)
                 )
             }
-            Op::Alloca(ty) => format!("{res}alloca {}", llvm_ty(ty)),
             Op::Load(p, ty) => format!("{res}load {}, ptr {}", llvm_ty(ty), self.operand(*p)),
             Op::Store { ptr, value } => {
                 let ty = self.ty(*value);

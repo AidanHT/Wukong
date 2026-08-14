@@ -1,0 +1,32 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+module tests.run.lang_tile_saxpy
+
+// `@tile(2)` strip-mines the loop into full tiles plus a remainder (n=5). Values are the scalar
+// semantics: a=2, x[i]=1, y[i]=1 => out[i]=3 for every lane. Every lane is printed.
+
+@generic
+@tile(2)
+fn saxpy_tiled(a: f32, x: [f32; 5], y: [f32; 5], mut out: [f32; 5]) {
+    for i in 0..5 {
+        out[i] = a * x[i] + y[i];
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 5] = [1.0, 1.0, 1.0, 1.0, 1.0];
+    let y: [f32; 5] = [1.0, 1.0, 1.0, 1.0, 1.0];
+    let mut out: [f32; 5] = [0.0; 5];
+    saxpy_tiled(2.0, x, y, out);
+    print(out[0] as i32);
+    print(out[1] as i32);
+    print(out[2] as i32);
+    print(out[3] as i32);
+    print(out[4] as i32);
+    return 0;
+}

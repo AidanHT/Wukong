@@ -188,6 +188,19 @@ static CATALOG: &[Explanation] = &[
          (`@inline`, `@simd`, `@align`, `@export`) stay legal wherever they parse."
     ),
     entry!(
+        "E0307",
+        "shared array too large",
+        "A `shared [T; N]` array's static size exceeds the per-CTA shared memory budget (48 KiB in \
+         v1). Use a smaller tile or split the staging across multiple barriers."
+    ),
+    entry!(
+        "E0308",
+        "sync_block outside @parallel",
+        "`sync_block()` is a cooperative thread-block barrier and is only meaningful inside a \
+         `@parallel` function. On CPU backends it is a no-op, but the language requires the SPMD \
+         context so misuse is rejected at compile time."
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type required by its context — for example a `let` with \

@@ -32,8 +32,12 @@ pub enum TypeKind {
     },
     /// `[]T`.
     Slice(Box<TypeExpr>),
-    /// `[T; N]`.
-    Array { elem: Box<TypeExpr>, len: Box<Expr> },
+    /// `[T; N]` or `shared [T; N]`.
+    Array {
+        elem: Box<TypeExpr>,
+        len: Box<Expr>,
+        shared: bool,
+    },
     /// `(A, B, ...)`.
     Tuple(Vec<TypeExpr>),
     /// A SIMD vector type: `f32x8` or `vec[T, N]`.

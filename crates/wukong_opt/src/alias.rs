@@ -245,7 +245,7 @@ impl AliasInfo {
                         continue;
                     }
                     match &inst.op {
-                        Op::Alloca(ty) => {
+                        Op::Alloca { ty, .. } => {
                             let fact = &mut info.facts[r];
                             fact.prov = Prov::Alloca(res);
                             fact.offset = 0;
@@ -469,7 +469,7 @@ impl AliasInfo {
             | Op::Not(..)
             | Op::Cast(..)
             | Op::Select(..)
-            | Op::Alloca(..)
+            | Op::Alloca { .. }
             | Op::Load(..)
             | Op::Gep { .. }
             | Op::FuncAddr(..)
@@ -479,7 +479,8 @@ impl AliasInfo {
             | Op::Iota(..)
             | Op::Fma(..)
             | Op::Sqrt(..)
-            | Op::Round(..) => false,
+            | Op::Round(..)
+            | Op::Barrier => false,
         }
     }
 

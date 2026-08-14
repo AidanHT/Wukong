@@ -273,6 +273,27 @@ impl<'a> Parser<'a> {
             self.depth = saved;
             return self.finish_type(start, TypeKind::Unit);
         }
+        if self.at(T::Ident) {
+            let sp = self.span();
+            let sym = self.intern_span(sp);
+            if self.interner.resolve(sym) == "shared" {
+                self.bump();
+                self.expect(T::LBracket);
+                let elem = Box::new(self.parse_type());
+                self.expect(T::Semi);
+                let len = Box::new(self.parse_expr());
+                self.expect(T::RBracket);
+                self.depth = saved;
+                return self.finish_type(
+                    start,
+                    TypeKind::Array {
+                        elem,
+                        len,
+                        shared: true,
+                    },
+                );
+            }
+        }
         let kind = match self.kind() {
             T::Star => {
                 self.bump();
@@ -299,7 +320,11 @@ impl<'a> Parser<'a> {
                     self.expect(T::Semi);
                     let len = Box::new(self.parse_expr());
                     self.expect(T::RBracket);
-                    TypeKind::Array { elem, len }
+                    TypeKind::Array {
+                        elem,
+                        len,
+                        shared: false,
+                    }
                 }
             }
             T::LParen => {

@@ -155,7 +155,11 @@ impl<'a> Vjp<'a> {
                 def_op.insert(r, &inst.op);
                 // Record the element count of each intermediate buffer (an array alloca), so its
                 // gradient buffer can be sized to match.
-                if let Op::Alloca(MirType::Array(_, count)) = &inst.op {
+                if let Op::Alloca {
+                    ty: MirType::Array(_, count),
+                    space: wukong_mir::AddrSpace::Local,
+                } = &inst.op
+                {
                     buf_count.insert(r, *count);
                 }
             }
@@ -487,7 +491,8 @@ impl<'a> Vjp<'a> {
         match op {
             Op::ConstInt(..)
             | Op::ConstFloat(..)
-            | Op::Alloca(..)
+            | Op::Alloca { .. }
+            | Op::Barrier
             | Op::FuncAddr(..)
             | Op::GlobalAddr(..) => op.clone(),
             Op::Bin(b, l, r) => Op::Bin(*b, self.remap(*l), self.remap(*r)),
@@ -542,7 +547,8 @@ fn op_name(op: &Op) -> &'static str {
         Op::Not(..) => "not",
         Op::Cast(k, ..) => k.name(),
         Op::Select(..) => "select",
-        Op::Alloca(..) => "alloca",
+        Op::Alloca { .. } => "alloca",
+        Op::Barrier => "barrier",
         Op::Load(..) => "load",
         Op::Store { .. } => "store",
         Op::Gep { .. } => "gep",

@@ -145,6 +145,15 @@ impl CastKind {
     }
 }
 
+/// Where an [`Op::Alloca`] slot lives. CPU backends treat [`AddrSpace::Shared`] as ordinary local
+/// storage; the GPU backend maps it to PTX `.shared`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AddrSpace {
+    #[default]
+    Local,
+    Shared,
+}
+
 /// An operation that may produce a value.
 #[derive(Clone, Debug)]
 pub enum Op {
@@ -159,7 +168,12 @@ pub enum Op {
     Cast(CastKind, ValueId, MirType),
     Select(ValueId, ValueId, ValueId),
     /// A stack slot; result is a pointer.
-    Alloca(MirType),
+    Alloca {
+        ty: MirType,
+        space: AddrSpace,
+    },
+    /// A cooperative thread-block barrier (`sync_block()` in source). No result; a no-op on CPU.
+    Barrier,
     /// Load a value of the given type from a pointer.
     Load(ValueId, MirType),
     /// Store `value` to `ptr` (no result).

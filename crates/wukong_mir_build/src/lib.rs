@@ -27,6 +27,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 mod canon;
+mod tile;
 mod tindex;
 
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -40,7 +41,7 @@ use wukong_mir::{
     host_supports_vec_kernels, BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program,
     RoundMode, ValueId, VecBin, VecCmp, VecKernel, VecOp, VecRedOp, VecReduce,
 };
-use wukong_sema::{heap_alloc_elem, is_now_ns, DefKind, EnumVariant, SemaResult, VariantPayload};
+use wukong_sema::{heap_alloc_elem, is_now_ns, is_sync_block, DefKind, EnumVariant, SemaResult, VariantPayload};
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::Ty;
 
@@ -102,9 +103,10 @@ fn subst_ty(ty: &Ty, subst: &HashMap<Symbol, Ty>) -> Ty {
             pointee: Box::new(subst_ty(pointee, subst)),
         },
         Ty::Slice(inner) => Ty::Slice(Box::new(subst_ty(inner, subst))),
-        Ty::Array { elem, len } => Ty::Array {
+        Ty::Array { elem, len, shared } => Ty::Array {
             elem: Box::new(subst_ty(elem, subst)),
             len: *len,
+            shared: *shared,
         },
         Ty::Tuple(fields) => Ty::Tuple(fields.iter().map(|t| subst_ty(t, subst)).collect()),
         Ty::Fn { params, ret } => Ty::Fn {
@@ -234,7 +236,7 @@ fn mono_type_name(ty: &Ty, interner: &Interner) -> String {
         Ty::Ptr { pointee, .. } => format!("p${}", mono_type_name(pointee, interner)),
         Ty::Ref { pointee, .. } => format!("r${}", mono_type_name(pointee, interner)),
         Ty::Slice(inner) => format!("s${}", mono_type_name(inner, interner)),
-        Ty::Array { elem, len } => format!("a{len}${}", mono_type_name(elem, interner)),
+        Ty::Array { elem, len, .. } => format!("a{len}${}", mono_type_name(elem, interner)),
         Ty::Tuple(fields) => {
             let parts: Vec<String> = fields.iter().map(|t| mono_type_name(t, interner)).collect();
             format!("t{}${}", fields.len(), parts.join("$"))
@@ -1156,6 +1158,17 @@ pub fn lower_program_with(
             _ => None,
         })
         .collect();
+    let fn_tiles: HashMap<Symbol, Vec<u64>> = module
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::Fn(f) => Some((
+                f.name.sym,
+                tile::tile_sizes_from_attrs(&item.attrs, interner),
+            )),
+            _ => None,
+        })
+        .collect();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
@@ -1231,6 +1244,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1262,6 +1276,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1286,6 +1301,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1310,6 +1326,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1333,6 +1350,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1355,6 +1373,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1378,6 +1397,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1402,6 +1422,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1422,6 +1443,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1443,6 +1465,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1463,6 +1486,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1484,6 +1508,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1504,6 +1529,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1541,6 +1567,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1565,6 +1592,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1589,6 +1617,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1612,6 +1641,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1635,6 +1665,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1658,6 +1689,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1680,6 +1712,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1705,6 +1738,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1729,6 +1763,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1751,6 +1786,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1776,6 +1812,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1801,6 +1838,7 @@ pub fn lower_program_with(
                             &mono,
                             &mut diags,
                             Some(&mut par_regions),
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                         );
                         program.funcs.push(func);
                         continue;
@@ -1838,13 +1876,15 @@ pub fn lower_program_with(
                         &mono,
                         &mut diags,
                         Some(&mut par_regions),
-                    );
+                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
+                        );
                     program.funcs.push(func);
                     continue;
                 }
                 let func = lower_fn(
                     f, body, sema, interner, gemm, false, &no_subst, f.name.sym, &mono, &mut diags,
                     None,
+                    fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                 );
                 program.funcs.push(func);
             }
@@ -1866,6 +1906,7 @@ pub fn lower_program_with(
             let gemm = generic_gemm(gemm, generic_fns.contains(orig));
             let func = lower_fn(
                 f, body, sema, interner, gemm, false, subst, *mangled, &mono, &mut diags, None,
+                fn_tiles.get(orig).cloned().unwrap_or_default(),
             );
             program.funcs.push(func);
         }
@@ -2145,6 +2186,8 @@ fn is_batched_norm_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
+    
+        tile_queue: vec![],
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
 }
@@ -2193,6 +2236,8 @@ fn is_bias_bcast_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
+    
+        tile_queue: vec![],
     };
     probe.match_bias_bcast(pat, iter, lb).is_some()
 }
@@ -2210,6 +2255,7 @@ fn lower_fn(
     mono: &Mono,
     diags: &mut Vec<Diagnostic>,
     par: Option<&mut ParRegions>,
+    tile_queue: Vec<u64>,
 ) -> Function {
     // Recover the resolved signature for parameter/return types, applying the monomorphization
     // substitution (empty for a non-generic function) so a generic parameter/return lowers at its
@@ -2250,6 +2296,7 @@ fn lower_fn(
         subst: subst.clone(),
         mono: Some(mono),
         par,
+        tile_queue,
     };
 
     // The sret pointer is parameter 0 — declared before the real params so the call site can prepend
@@ -2449,6 +2496,8 @@ fn lower_parallel(
             subst: HashMap::default(),
             mono: None,
             par: None,
+        
+            tile_queue: vec![],
         };
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
@@ -2514,6 +2563,8 @@ fn lower_parallel(
             subst: HashMap::default(),
             mono: None,
             par: None,
+        
+            tile_queue: vec![],
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
@@ -3211,6 +3262,9 @@ struct FnLowerer<'a> {
     /// lowerers and the outlined-body lowerers pass `None`, so a probe can never emit a region and
     /// an outlined body can never nest one.
     par: Option<&'a mut ParRegions>,
+    /// Remaining tile widths from a function-item `@tile(BM, BN, …)`, consumed by nested `for`
+    /// loops in source order (statement-level `@tile` overrides for one loop).
+    tile_queue: Vec<u64>,
     /// The bound slot values that hold a `[]T` **slice** fat pointer, recorded by `bind_slice` at
     /// every binding site whose sema type is `Ty::Slice`. `kernel_base_ptr` needs this because the
     /// slice's MIR slot type — `Array(I8, SLICE_SIZE)` — is *not* unique to slices: a tuple, a
@@ -3448,7 +3502,7 @@ impl FnLowerer<'_> {
                 Some(size) => MirType::Array(Box::new(MirType::I8), size as u32),
                 None => mir_ty(ty),
             },
-            Ty::Array { elem, len } => MirType::Array(Box::new(self.mir_ty_of(elem)), *len as u32),
+            Ty::Array { elem, len, .. } => MirType::Array(Box::new(self.mir_ty_of(elem)), *len as u32),
             Ty::Tuple(_) => {
                 MirType::Array(Box::new(MirType::I8), self.ty_size(ty).unwrap_or(0) as u32)
             }
@@ -3497,7 +3551,7 @@ impl FnLowerer<'_> {
                     MirType::I32
                 }
             }
-            Array { elem, len } => match const_usize_expr(len, self.interner, self.sema) {
+            Array { elem, len, .. } => match const_usize_expr(len, self.interner, self.sema) {
                 Some(n) => MirType::Array(Box::new(self.mir_ty_of_ann(elem)), n),
                 None => MirType::Ptr,
             },
@@ -3612,7 +3666,7 @@ impl FnLowerer<'_> {
                 self.enum_layout(*sym).map(|(size, _, _)| size)
             }
             Ty::Named(sym) => self.struct_size(*sym),
-            Ty::Array { elem, len } => Some(self.ty_size(elem)? * len),
+            Ty::Array { elem, len, .. } => Some(self.ty_size(elem)? * len),
             Ty::Tuple(fields) => self.aggregate_layout(fields).map(|(_, size, _)| size),
             _ => ty.size_of(),
         }
@@ -4103,7 +4157,7 @@ impl FnLowerer<'_> {
             (ExprKind::TupleLit(items), Ty::Tuple(_)) => {
                 self.lower_tuple_init(dst, fty, items);
             }
-            (ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }, Ty::Array { elem, len }) => {
+            (ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat { .. }, Ty::Array { elem, len, .. }) => {
                 let emir = self.mir_ty_of(elem);
                 self.lower_array_init(dst, &emir, *len as u32, value);
             }
@@ -4178,7 +4232,7 @@ impl FnLowerer<'_> {
                     }
                 }
             }
-            Ty::Array { elem, len } => {
+            Ty::Array { elem, len, .. } => {
                 let emir = self.mir_ty_of(elem);
                 for i in 0..*len as i128 {
                     let s = self.gep_elem(src, &emir, i);
@@ -4461,7 +4515,7 @@ impl FnLowerer<'_> {
         for m in (2..=run).rev() {
             let fused = fuse_for_bodies(&stmts[..m]);
             if self.vectorizable(&fused, var).is_some() {
-                self.lower_for(None, pat0, iter0, &fused);
+                self.lower_for(None, pat0, iter0, &fused, &[]);
                 return Some(m);
             }
         }
@@ -8090,7 +8144,15 @@ impl FnLowerer<'_> {
                     (None, Some(e)) => self.expr_mir(e),
                     (None, None) => MirType::I32,
                 };
-                let slot = self.builder.alloca(mty.clone());
+                let is_shared = ty.as_ref().is_some_and(|t| {
+                    matches!(t.kind, ast::TypeKind::Array { shared: true, .. })
+                });
+                let slot = if is_shared {
+                    self.builder
+                        .alloca_in(mty.clone(), wukong_mir::AddrSpace::Shared)
+                } else {
+                    self.builder.alloca(mty.clone())
+                };
                 if let Some(e) = init {
                     // A slice binding coerces its initializer to the fat-pointer buffer (an array
                     // source becomes `{ base, len }`; a slice source is copied) — checked first so a
@@ -8279,7 +8341,7 @@ impl FnLowerer<'_> {
                 body,
                 label,
                 ..
-            } => self.lower_for(label.map(|l| l.sym), pat, iter, body),
+            } => self.lower_for(label.map(|l| l.sym), pat, iter, body, &s.attrs),
             StmtKind::Break(label, value) => {
                 if let Some((_, _, brk)) = self.find_loop(label.as_ref().map(|l| l.sym)) {
                     // A value loop's break target (its exit/merge block) carries a typed param;
@@ -11157,7 +11219,27 @@ impl FnLowerer<'_> {
         false
     }
 
-    fn lower_for(&mut self, label: Option<Symbol>, pat: &Pattern, iter: &ForIter, body: &Block) {
+    fn lower_for(
+        &mut self,
+        label: Option<Symbol>,
+        pat: &Pattern,
+        iter: &ForIter,
+        body: &Block,
+        stmt_attrs: &[ast::Attr],
+    ) {
+        if let Some(tile) = self.take_tile_size(stmt_attrs) {
+            if let ForIter::Range {
+                start,
+                end: Some(end),
+                inclusive: false,
+                step: None,
+            } = iter
+            {
+                if self.lower_tiled_range_for(label, pat, start, end, body, tile) {
+                    return;
+                }
+            }
+        }
         // ---- The ordered kernel-recognizer cascade -------------------------------------------
         //
         // Order is load-bearing (each comment below says why its arm is tried where it is), and the
@@ -12300,6 +12382,7 @@ impl FnLowerer<'_> {
                 subst: self.subst.clone(),
                 mono: self.mono,
                 par: None,
+                tile_queue: vec![],
             };
             let start = fl.builder.add_param(MirType::I64);
             let end = fl.builder.add_param(MirType::I64);
@@ -14766,6 +14849,7 @@ impl FnLowerer<'_> {
             Some((_, MirType::Array(..))) => Some(Ty::Array {
                 elem: Box::new(Ty::Scalar(elem)),
                 len: n as u64,
+                shared: false,
             }),
             _ => None,
         }
@@ -18608,6 +18692,9 @@ impl FnLowerer<'_> {
                 if let Some(v) = self.lower_now_ns(self.interner.resolve(name), args) {
                     return v;
                 }
+                if let Some(()) = self.lower_sync_block(self.interner.resolve(name), args) {
+                    return self.const_zero(MirType::I32);
+                }
                 // Fused attention `sdpa(...)` lowers to one runtime-kernel call (no S×S scores).
                 if let Some(v) = self.lower_attention(name, args) {
                     return v;
@@ -18845,6 +18932,16 @@ impl FnLowerer<'_> {
                 args: vec![],
             },
         ))
+    }
+
+    /// Lower `sync_block()` to [`Op::Barrier`]. CPU backends treat it as a no-op; gpu-native emits
+    /// `bar.sync`. Sema rejects the call outside `@parallel`.
+    fn lower_sync_block(&mut self, name: &str, args: &[Expr]) -> Option<()> {
+        if !is_sync_block(name) || !args.is_empty() {
+            return None;
+        }
+        self.builder.barrier();
+        Some(())
     }
 
     /// Recognize `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention —
@@ -20583,7 +20680,7 @@ fn mir_byte_align(t: &MirType) -> u64 {
 fn mir_ty(ty: &Ty) -> MirType {
     match ty {
         Ty::Scalar(s) => MirType::from_scalar(*s),
-        Ty::Array { elem, len } => MirType::Array(Box::new(mir_ty(elem)), *len as u32),
+        Ty::Array { elem, len, .. } => MirType::Array(Box::new(mir_ty(elem)), *len as u32),
         Ty::Ptr { .. } | Ty::Ref { .. } | Ty::Tensor { .. } | Ty::Slice(_) => MirType::Ptr,
         Ty::Vector { elem, lanes } => MirType::Vec(Box::new(MirType::from_scalar(*elem)), *lanes),
         Ty::Unit => MirType::Void,
@@ -20612,7 +20709,7 @@ fn const_usize_expr(e: &Expr, interner: &Interner, sema: &SemaResult) -> Option<
 fn attn_buffer_extent(t: &Ty) -> Option<Option<u64>> {
     let f32_elem = |e: &Ty| matches!(e, Ty::Scalar(wukong_types::Scalar::F32));
     match t {
-        Ty::Array { elem, len } if f32_elem(elem) => Some(Some(*len)),
+        Ty::Array { elem, len, .. } if f32_elem(elem) => Some(Some(*len)),
         Ty::Slice(elem) if f32_elem(elem) => Some(None),
         Ty::Tensor {
             elem: wukong_types::Scalar::F32,
@@ -24539,6 +24636,8 @@ fn lower_matmul_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
+    
+        tile_queue: vec![],
     };
     // A symbolic-generic matmul (`fn matmul<M, N, K>(a: Tensor[f32, M, K], …)`) reaches this
     // whole-function path too. Bind its hidden runtime-dim params first (leading, before the real
@@ -26233,6 +26332,8 @@ fn xent_bwd_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
+    
+        tile_queue: vec![],
     };
     probe.match_xent_bwd(pat, iter, lb).is_some()
 }
@@ -26276,6 +26377,8 @@ fn xent_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
+    
+        tile_queue: vec![],
     };
     probe.match_xent(pat, iter, lb).is_some()
 }
@@ -26327,6 +26430,8 @@ fn logsumexp_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
+    
+        tile_queue: vec![],
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
 }
@@ -26466,6 +26571,8 @@ fn probe_single_for(
         subst: HashMap::default(),
         mono: None,
         par: None,
+    
+        tile_queue: vec![],
     };
     check(&probe, pat, iter, lb)
 }
@@ -27492,6 +27599,8 @@ fn lower_i8matmul_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
+    
+        tile_queue: vec![],
     };
     let param_vals: Vec<ValueId> = param_tys
         .iter()
@@ -28853,7 +28962,15 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
             main.blocks
                 .iter()
                 .flat_map(|b| &b.insts)
-                .any(|i| matches!(&i.op, Op::Alloca(MirType::Array(_, 3)))),
+                .any(|i| {
+                    matches!(
+                        &i.op,
+                        Op::Alloca {
+                            ty: MirType::Array(_, 3),
+                            space: wukong_mir::AddrSpace::Local,
+                        }
+                    )
+                }),
             "expected an array alloca"
         );
         assert!(verify_function(main).is_empty(), "verify failed");
@@ -28896,7 +29013,7 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
             !k.blocks
                 .iter()
                 .flat_map(|b| &b.insts)
-                .any(|i| matches!(&i.op, Op::Alloca(MirType::Ptr))),
+                .any(|i| matches!(&i.op, Op::Alloca { ty: MirType::Ptr, space: wukong_mir::AddrSpace::Local })),
             "a statically-shaped tensor param must bind directly, not through a reloaded ptr slot"
         );
     }
@@ -28922,7 +29039,15 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
             !dot.blocks
                 .iter()
                 .flat_map(|b| &b.insts)
-                .any(|i| matches!(&i.op, Op::Alloca(MirType::Array(..)))),
+                .any(|i| {
+                    matches!(
+                        &i.op,
+                        Op::Alloca {
+                            ty: MirType::Array(..),
+                            space: wukong_mir::AddrSpace::Local,
+                        }
+                    )
+                }),
             "array params must not alloca array storage in the callee"
         );
         assert!(verify_function(dot).is_empty());
@@ -29475,3 +29600,4 @@ fn main() -> i32 { return 0; }
         );
     }
 }
+

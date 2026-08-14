@@ -175,6 +175,8 @@ pub enum Ty {
     Array {
         elem: Box<Ty>,
         len: u64,
+        /// `true` for `shared [T; N]` — CTA shared memory on GPU, ordinary local on CPU.
+        shared: bool,
     },
     Tuple(Vec<Ty>),
     /// A SIMD vector: a power-of-two count of scalar lanes.
@@ -233,7 +235,7 @@ impl Ty {
             // aggregate (8-byte pointer + 8-byte length), even though the *pointee* is unsized. This
             // is what lets a slice be a struct/tuple field and be passed/returned by value.
             Ty::Slice(_) => Some(16),
-            Ty::Array { elem, len } => Some(elem.size_of()? * len),
+            Ty::Array { elem, len, .. } => Some(elem.size_of()? * len),
             Ty::Tuple(fields) => {
                 let mut size = 0u64;
                 let mut align = 1u64;
@@ -313,7 +315,14 @@ impl Ty {
                 )
             }
             Ty::Slice(e) => format!("[]{}", e.display(interner)),
-            Ty::Array { elem, len } => format!("[{}; {}]", elem.display(interner), len),
+            Ty::Array { elem, len, shared } => {
+                let inner = format!("[{}; {}]", elem.display(interner), len);
+                if *shared {
+                    format!("shared {inner}")
+                } else {
+                    inner
+                }
+            }
             Ty::Tuple(fields) => {
                 let parts: Vec<_> = fields.iter().map(|f| f.display(interner)).collect();
                 format!("({})", parts.join(", "))
@@ -378,6 +387,7 @@ mod tests {
         let a = Ty::Array {
             elem: Box::new(Ty::Scalar(Scalar::I32)),
             len: 4,
+            shared: false,
         };
         assert_eq!(a.size_of(), Some(16));
     }
@@ -515,10 +525,12 @@ mod tests {
         let inner = Ty::Array {
             elem: Box::new(Ty::Scalar(Scalar::I32)),
             len: 4,
+            shared: false,
         };
         let outer = Ty::Array {
             elem: Box::new(inner),
             len: 3,
+            shared: false,
         };
         assert_eq!(outer.size_of(), Some(48));
     }

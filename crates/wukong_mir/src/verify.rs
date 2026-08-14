@@ -372,7 +372,7 @@ impl Verifier<'_> {
         // against the recipe below). Every other op must produce exactly one result.
         let must_produce = !matches!(
             op,
-            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. }
+            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier
         );
         if must_produce && result.is_none() {
             self.err(format!("operation {op:?} must produce a result value"));
@@ -495,7 +495,12 @@ impl Verifier<'_> {
                     self.expect_ty(*c, &MirType::I1, "select condition");
                 }
             }
-            Op::Alloca(_) => self.check_result_is(result, &MirType::Ptr),
+            Op::Alloca { .. } => self.check_result_is(result, &MirType::Ptr),
+            Op::Barrier => {
+                if result.is_some() {
+                    self.err("barrier must not produce a value");
+                }
+            }
             Op::Load(p, ty) => {
                 if self.use_val(*p) {
                     self.expect_ty(*p, &MirType::Ptr, "load pointer");

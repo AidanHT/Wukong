@@ -281,7 +281,7 @@ fn pure_header_op(op: &Op) -> bool {
             | Op::Store { .. }
             | Op::Call { .. }
             | Op::VecKernelCall { .. }
-            | Op::Alloca(..)
+            | Op::Alloca { space: wukong_mir::AddrSpace::Local, .. }
     )
 }
 
@@ -292,7 +292,7 @@ fn pure_header_op(op: &Op) -> bool {
 fn unrollable_body_op(op: &Op) -> bool {
     !matches!(
         op,
-        Op::Call { .. } | Op::VecKernelCall { .. } | Op::Alloca(..)
+        Op::Call { .. } | Op::VecKernelCall { .. } | Op::Alloca { space: wukong_mir::AddrSpace::Local, .. }
     )
 }
 

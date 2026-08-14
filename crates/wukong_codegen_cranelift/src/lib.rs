@@ -689,7 +689,7 @@ impl<'a> FnTranslator<'a> {
                     self.builder.ins().select(cc, av, bv)
                 }
             }
-            Op::Alloca(ty) => {
+            Op::Alloca { ty, .. } => {
                 let bytes = self.size_of_or_err(ty).max(1);
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
@@ -697,6 +697,10 @@ impl<'a> FnTranslator<'a> {
                     align_shift(bytes),
                 ));
                 self.builder.ins().stack_addr(self.ptr_ty, slot, 0)
+            }
+            Op::Barrier => {
+                self.builder.ins().fence();
+                return;
             }
             Op::Load(p, ty) => {
                 let addr = self.val(*p);
