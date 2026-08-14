@@ -683,6 +683,13 @@ impl<'a> FnEmit<'a> {
             ".visible .entry {MEGA_KERNEL_NAME}(.param .u64 p_ctx, .param .u64 p_frame)\n{{\n"
         ));
         e.write_reg_decls(&mut out);
+        if e.shared_bytes > 0 {
+            let _ = writeln!(
+                out,
+                "    .shared .align 8 .b8 __user_smem[{}];",
+                e.shared_bytes
+            );
+        }
         out.push_str(&e.body);
         out.push_str("}\n");
         Ok(out)
@@ -923,6 +930,13 @@ impl<'a> FnEmit<'a> {
                 "cvta.to.global.u64 {}, {fr_raw};",
                 self.frame_base
             ));
+        }
+
+        if self.shared_bytes > 0 {
+            let smem = self.fresh(RC::Rd);
+            self.shared_base = self.fresh(RC::Rd);
+            self.emit(&format!("mov.u64 {smem}, __user_smem;"));
+            self.emit(&format!("cvta.shared.u64 {}, {smem};", self.shared_base));
         }
 
         // tid0 = (threadIdx.x == 0): the predicate guarding stores + side effects in SPMD mode.
@@ -1625,14 +1639,10 @@ impl<'a> FnEmit<'a> {
     }
 
     /// Load one (scalar or lane) value of MIR type `ty` from address `addr` into `d`.
-    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType, shared: bool) -> Result<(), String> {
-        let ld = |op: &str| {
-            if shared {
-                format!("ld.shared.{op}")
-            } else {
-                format!("ld.{op}")
-            }
-        };
+    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType, _shared: bool) -> Result<(), String> {
+        // User `shared [T; N]` allocas are addressed via `cvta.shared` (generic state space), exactly
+        // like `.local` allocas use `cvta.local` + generic `ld.*` — never `ld.local` / `ld.shared`.
+        let ld = |op: &str| format!("ld.{op}");
         match ty {
             // `i1` occupies ONE byte in memory (`size_of(I1) == 1`, and `Op::Gep` strides bools by 1),
             // exactly like Cranelift's `types::I8` mapping — so it must be accessed with `ld.u8`. A
@@ -1720,14 +1730,9 @@ impl<'a> FnEmit<'a> {
     }
 
     /// Store one (scalar or lane) value `v` of MIR type `ty` to address `addr`.
-    fn store_into(&mut self, addr: &str, v: &str, ty: &MirType, shared: bool) -> Result<(), String> {
-        let st = |op: &str| {
-            if shared {
-                format!("st.shared.{op}")
-            } else {
-                format!("st.{op}")
-            }
-        };
+    fn store_into(&mut self, addr: &str, v: &str, ty: &MirType, _shared: bool) -> Result<(), String> {
+        // Mirror `load_into`: `cvta.shared` addresses use generic `st.*`, not `st.shared.*`.
+        let st = |op: &str| format!("st.{op}");
         let g = self.st_guard();
         match ty {
             MirType::F32 => self.emit(&format!("{g}{} [{addr}], {v};", st("f32"))),
@@ -5086,6 +5091,33 @@ fn main() -> i32 {
                  count visits a fraction of the domain as soon as the launch changes:\n{pre}"
             );
         }
+    }
+
+    /// User `shared [T; N]` allocas lower through `cvta.shared` (generic addresses). `ld.shared` /
+    /// `st.shared` require shared-space addresses and fault on the generic pointers — mirror the
+    /// `.local` frame path (`cvta.local` + generic `ld`/`st`, never `ld.local`). Device-free.
+    #[test]
+    fn shared_user_smem_uses_generic_ld_after_cvta_shared() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/run/lang_shared_transpose.wk"
+        );
+        let src = std::fs::read_to_string(path).expect("lang_shared_transpose.wk");
+        let (program, mut interner) = build(&src, 2).expect("compile shared transpose fixture");
+        let entry = interner.intern("main");
+        let ptx = emit_ptx(&program, entry, &interner).expect("emit_ptx");
+        assert!(
+            ptx.contains("cvta.shared.u64"),
+            "shared alloca base must be cvta.shared"
+        );
+        assert!(
+            !ptx.contains("ld.shared"),
+            "cvta.shared addresses must use generic ld, not ld.shared"
+        );
+        assert!(
+            !ptx.contains("st.shared"),
+            "cvta.shared addresses must use generic st, not st.shared"
+        );
     }
 
     /// The comparator the corpus gate is built on, pinned against the real divergence it used to
