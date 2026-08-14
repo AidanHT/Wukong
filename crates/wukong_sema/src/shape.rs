@@ -317,7 +317,30 @@ impl Sema<'_> {
                     }
                     return Ty::Scalar(Scalar::I64);
                 }
-                // `print`/`println` render exactly one value. Extra arguments were silently dropped
+                // `sync_block()` — a cooperative thread-block barrier. Legal only inside a `@parallel`
+                // function (the GPU maps it to `bar.sync`; CPU backends treat it as a no-op).
+                if crate::is_sync_block(self.sym_str(name)) {
+                    self.types.insert(callee.id, Ty::Unknown);
+                    if !args.is_empty() {
+                        self.error(
+                            span,
+                            "E0503",
+                            format!(
+                                "`sync_block` takes no arguments, but {} were supplied",
+                                args.len()
+                            ),
+                        );
+                    }
+                    if !self.parallel_fn {
+                        self.error(
+                            span,
+                            "E0308",
+                            "`sync_block()` is only valid inside a `@parallel` function".to_string(),
+                        );
+                    }
+                    return Ty::Unit;
+                }
+                // `print`/`println` render exactly one value.
                 // (`print(1, 2)` printed just `1`) — both backends agree, so it is not a divergence,
                 // but a quiet footgun where the programmer expects all arguments to appear. Reject a
                 // too-many-argument call (E0503). A zero-argument `print()` / `println()` (a blank
@@ -568,7 +591,7 @@ impl Sema<'_> {
                     shape,
                     layout: pl,
                 },
-                Ty::Array { elem: ae, len },
+                Ty::Array { elem: ae, len, .. },
             ) => {
                 // A fixed-size array is row-major, so it can only decay to a `Contiguous` tensor.
                 if *pl != Layout::Contiguous {
@@ -989,7 +1012,7 @@ impl Sema<'_> {
                 }
                 Ty::Scalar(elem)
             }
-            Ty::Array { elem, len } => {
+            Ty::Array { elem, len, .. } => {
                 // A constant index known at compile time must be in bounds — the headline
                 // compile-time-safety check applied to fixed-size arrays (an out-of-bounds read is
                 // otherwise undefined: the backends disagree). Only a literal index is checked; a
@@ -1101,9 +1124,10 @@ fn apply_subst(ty: &Ty, dims: &HashMap<Symbol, Dim>, tys: &HashMap<Symbol, Ty>) 
             pointee: Box::new(apply_subst(pointee, dims, tys)),
         },
         Ty::Slice(e) => Ty::Slice(Box::new(apply_subst(e, dims, tys))),
-        Ty::Array { elem, len } => Ty::Array {
+        Ty::Array { elem, len, shared } => Ty::Array {
             elem: Box::new(apply_subst(elem, dims, tys)),
             len: *len,
+            shared: *shared,
         },
         Ty::Tuple(items) => Ty::Tuple(items.iter().map(|i| apply_subst(i, dims, tys)).collect()),
         other => other.clone(),

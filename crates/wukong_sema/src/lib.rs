@@ -80,6 +80,11 @@ pub fn is_now_ns(name: &str) -> bool {
     name == "now_ns"
 }
 
+/// Whether `name` is the cooperative thread-block barrier builtin (`sync_block()`).
+pub fn is_sync_block(name: &str) -> bool {
+    name == "sync_block"
+}
+
 /// A resolved top-level definition.
 #[derive(Clone, Debug)]
 pub struct FnSig {
@@ -329,6 +334,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         loop_ctx: Vec::new(),
         consts: HashMap::default(),
         checking_bodies: false,
+        parallel_fn: false,
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -388,6 +394,8 @@ struct Sema<'a> {
     /// unknown dim name is distinguished from a declared generic / a `const` with no forward-reference
     /// false positive, and a function signature (re-lowered in `check_fn`) is reported exactly once.
     checking_bodies: bool,
+    /// True while checking a `@parallel` function body (`sync_block()` is legal only here).
+    parallel_fn: bool,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -824,11 +832,12 @@ impl Sema<'_> {
                 pointee: Box::new(self.lower_type(pointee)),
             },
             TypeKind::Slice(e) => Ty::Slice(Box::new(self.lower_type(e))),
-            TypeKind::Array { elem, len } => {
+            TypeKind::Array { elem, len, shared } => {
                 let elem = Box::new(self.lower_type(elem));
                 Ty::Array {
                     elem,
                     len: self.array_len(len),
+                    shared: *shared,
                 }
             }
             TypeKind::Tuple(items) => Ty::Tuple(items.iter().map(|i| self.lower_type(i)).collect()),
@@ -1078,7 +1087,7 @@ impl Sema<'_> {
             match &item.kind {
                 ItemKind::Fn(f) => {
                     if let Some(body) = &f.body {
-                        self.check_fn(f, body);
+                        self.check_fn(f, body, &item.attrs);
                     }
                 }
                 ItemKind::Const(c) => self.check_const(c, item.span),
@@ -1125,7 +1134,10 @@ impl Sema<'_> {
         self.consts.insert(c.name.sym, c.value.clone());
     }
 
-    fn check_fn(&mut self, f: &FnDecl, body: &Block) {
+    fn check_fn(&mut self, f: &FnDecl, body: &Block, item_attrs: &[Attr]) {
+        self.parallel_fn = item_attrs
+            .iter()
+            .any(|a| self.interner.resolve(a.name.sym) == "parallel");
         self.generics = generic_names(&f.generics);
         self.scopes.clear();
         self.scopes.push(HashMap::default());
@@ -1715,6 +1727,32 @@ impl Sema<'_> {
                     (None, None) => Ty::Unknown,
                 };
                 self.bind_pattern(pat, &bound);
+                if let Ty::Array {
+                    shared: true,
+                    elem,
+                    len,
+                    ..
+                } = &bound
+                {
+                    const STATIC_SMEM_CAP: u64 = 48 * 1024;
+                    let sizing = Ty::Array {
+                        elem: elem.clone(),
+                        len: *len,
+                        shared: false,
+                    };
+                    if let Some(bytes) = sizing.size_of() {
+                        if bytes > STATIC_SMEM_CAP {
+                            self.error(
+                                s.span,
+                                "E0307",
+                                format!(
+                                    "shared array requires {bytes} bytes of static shared memory, \
+                                     exceeding the {STATIC_SMEM_CAP} byte limit"
+                                ),
+                            );
+                        }
+                    }
+                }
                 // Track immutability for a simple binding: a `let` without `mut` that has an
                 // initializer is fully initialized at the binding, so a later `x = …` is a
                 // reassignment to reject. A `mut` binding (or a deferred `let x;` with no
@@ -2495,7 +2533,7 @@ impl Sema<'_> {
             // `let t: (u8, u8) = (200, 1)` previously failed as `[i32; 2]`/`(i32, i32)` mismatches.
             // Lengths must match and every element must itself adapt (recursively, so nested
             // aggregates work too).
-            (ExprKind::ArrayLit(items), Ty::Array { elem, len }) => {
+            (ExprKind::ArrayLit(items), Ty::Array { elem, len, .. }) => {
                 items.len() as u64 == *len && items.iter().all(|it| self.literal_adapts(elem, it))
             }
             // …and so does a repeat initializer — but its COUNT must match the annotation's length,
@@ -2503,7 +2541,7 @@ impl Sema<'_> {
             // Without it `let a: [i32; 4] = [7; 2];` compiled clean and mir_build filled the slot to
             // the annotation's 4, silently discarding the count the programmer wrote (the identical
             // mismatch is a hard error as a struct field and as an array literal).
-            (ExprKind::ArrayRepeat { value, count }, Ty::Array { elem, len }) => {
+            (ExprKind::ArrayRepeat { value, count }, Ty::Array { elem, len, .. }) => {
                 self.eval_usize(count) == *len && self.literal_adapts(elem, value)
             }
             (ExprKind::TupleLit(items), Ty::Tuple(tys)) => {
@@ -3202,6 +3240,7 @@ impl Sema<'_> {
                 Ty::Array {
                     elem: Box::new(elem),
                     len: items.len() as u64,
+                    shared: false,
                 }
             }
             ExprKind::ArrayRepeat { value, count } => {
@@ -3211,6 +3250,7 @@ impl Sema<'_> {
                 Ty::Array {
                     elem: Box::new(elem),
                     len,
+                    shared: false,
                 }
             }
             ExprKind::TupleLit(items) => {
