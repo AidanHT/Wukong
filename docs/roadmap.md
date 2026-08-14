@@ -779,9 +779,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   `@tile` is consumed as loop strip-mining; `@generic` opts out of recognizers (see above).
 - **Non-contiguous tensor layouts** `.col_major` / `.strided` / `.tiled(N, M)`: they parse (an unknown
   layout name is `E0204`), they are part of the tensor type, and they are enforced across a call
-  boundary — passing a `.col_major` tensor to a `Contiguous`-typed parameter is `E0502`. But **indexing
-  one cannot be lowered**: `a[i, j]` on any non-contiguous or symbolically-strided tensor is a hard
-  `C0001`. Only the default row-major `.contiguous` layout executes.
+  boundary — passing a `.col_major` tensor to a `Contiguous`-typed parameter is `E0502`. **`.col_major`
+  indexing executes** (`a[i, j]` is byte-identical to `a[i + j*M]` on constant-shape tensors; branch
+  `lang/p3-coalesce`). `.strided` / `.tiled(…)` indexing remains `C0001`. Only the default row-major
+  `.contiguous` layout was the sole executing non-symbolic layout before Phase 3.
 
 ## Planned
 
