@@ -1,0 +1,69 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 8
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 9
+module tests.run.lang_tiled_transpose
+
+// Composed Phase 2 fixture: `@tile(2, 2)` strip-mines the tile-origin loops (n=3 exercises remainder
+// tile rows/cols), a 2x2 `shared` tile is loaded, `sync_block()` fences load/write, then the
+// transposed block is written. `@generic` keeps the transpose recognizer off:
+//
+//   cargo run -q -p wukongc -- --emit=mir -O2 tests/run/lang_tiled_transpose.wk | grep wukong_transpose
+//     -> no output (no `wukong_transpose_f32` call)
+//
+// Expected values are scalar semantics: a is the 3x3 row-major matrix 1..9, transpose is 1,4,7,2,5,8,3,6,9.
+// Every lane is printed.
+
+@generic
+@parallel
+@tile(2, 2)
+fn tiled_transpose(a: [f32; 9], mut b: [f32; 9]) {
+    let n: i32 = 3;
+    for io in 0..3 {
+        for jo in 0..3 {
+            let mut tile: shared [f32; 4];
+            for i in 0..2 {
+                for j in 0..2 {
+                    let gi = io + i;
+                    let gj = jo + j;
+                    if gi < n && gj < n {
+                        tile[j * 2 + i] = a[gi * n + gj];
+                    }
+                }
+            }
+            sync_block();
+            for i in 0..2 {
+                for j in 0..2 {
+                    let gi = io + i;
+                    let gj = jo + j;
+                    if gi < n && gj < n {
+                        b[gj * n + gi] = tile[i * 2 + j];
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() -> i32 {
+    let a: [f32; 9] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    let mut b: [f32; 9] = [0.0; 9];
+    tiled_transpose(a, b);
+    print(b[0] as i32);
+    print(b[1] as i32);
+    print(b[2] as i32);
+    print(b[3] as i32);
+    print(b[4] as i32);
+    print(b[5] as i32);
+    print(b[6] as i32);
+    print(b[7] as i32);
+    print(b[8] as i32);
+    return 0;
+}
