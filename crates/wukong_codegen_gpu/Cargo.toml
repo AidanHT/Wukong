@@ -50,6 +50,7 @@ half = { version = "2", optional = true }
 # seam, so *any* Wukong program runs on the GPU (not just the recognizer-offload kernel menu).
 # Behind the `gpu` feature so plain `cargo test` stays toolchain-free and the crate is ~empty.
 wukong_mir = { workspace = true, optional = true }
+wukong_opt = { workspace = true, optional = true }
 wukong_backend = { workspace = true, optional = true }
 wukong_span = { workspace = true, optional = true }
 
@@ -59,6 +60,7 @@ gpu = [
     "dep:wukong_runtime",
     "dep:half",
     "dep:wukong_mir",
+    "dep:wukong_opt",
     "dep:wukong_backend",
     "dep:wukong_span",
 ]
