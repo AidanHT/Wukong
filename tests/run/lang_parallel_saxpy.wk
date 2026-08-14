@@ -1,0 +1,51 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 12
+// EXPECT-OUT: 19
+// EXPECT-OUT: 28
+// EXPECT-OUT: 39
+// EXPECT-OUT: 52
+// EXPECT-OUT: 67
+// EXPECT-OUT: 84
+// EXPECT-OUT: 103
+// EXPECT-OUT: 124
+// EXPECT-OUT: 147
+// EXPECT-OUT: 172
+// EXPECT-OUT: 199
+// EXPECT-OUT: 228
+module tests.run.lang_parallel_saxpy
+
+// A `@parallel` elementwise loop whose body NO recognizer claims (`--emit=mir -O2` shows one
+// `wukong_parallel_for` and no `wukong_*` kernel), which is what makes it the fixture for the
+// generic GPU path: on `--backend=gpu-native` the outlined body is lowered as a device `.func` and
+// the region runs as a grid-stride loop over the megakernel's threads, so this program is the
+// three-way agreement (interp == native == gpu-native) for that lowering.
+//
+// Every lane is printed, never a sum: a partially-correct buffer — the exact failure mode a
+// mis-strided grid-stride loop produces, where some indices are visited twice and others never —
+// passes a reduction and fails here.
+//
+// Expected values are the scalar semantics of the loop, computed by hand from the source and not
+// recorded from any backend: x[i] = 2i, so y[i] = (2i)*(2i)*0.25 + 3 = i*i + 3, and every
+// intermediate is exact in f32 for i < 16. N is deliberately tiny (a `tests/run` fixture is a
+// correctness gate, not a timing one — 16 lanes leave 240 of the block's threads idle by design).
+
+@parallel
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut y: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i as f32) * 2.0;
+    }
+    for i in 0..16 {
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }
+    for i in 0..16 {
+        print(y[i] as i32);
+    }
+    return 0;
+}

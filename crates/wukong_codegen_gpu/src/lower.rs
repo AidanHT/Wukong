@@ -30,11 +30,19 @@
 //!
 //! Recognized ops (matmul / vmath / norm / reduce / `@parallel`) *are* lowered here: `rt_helper` maps
 //! each recognized `wukong_*` runtime symbol — and its `_parallel` twin — to an `mrt_*` PTX `.func`
-//! reproducing the CPU microkernel's numeric contract as a naive single-thread device loop, and
-//! `wukong_parallel_for(n, func_addr F, ctx)` lowers to the single sequential chunk `F(0, n, ctx)`
-//! (correct because the outlined body is chunk-decomposable; grid-stride parallelism is a later
-//! performance increment, and the *cooperative* forms of these ops are emitted by `lower_call_mega`
-//! in mega mode, which [`crate::megakernel`] drives).
+//! reproducing the CPU microkernel's numeric contract as a naive single-thread device loop. The
+//! *cooperative* forms are emitted by `lower_call_mega` in mega mode, which [`crate::megakernel`]
+//! drives — including `wukong_parallel_for(n, func_addr F, ctx)`, which lowers there as a
+//! **grid-stride loop** over the outlined body
+//! ([`emit_parallel_for_gridstride`](FnEmit::emit_parallel_for_gridstride)). On the single-thread
+//! path the same op stays the one sequential chunk `F(0, n, ctx)`: that kernel is launched with one
+//! thread, so there is no other thread to give the iterations to, and it remains the correctness
+//! reference every mega run is compared against.
+//!
+//! Vectorized (`<N x T>`) MIR is lowered by scalarizing each value into one register per lane
+//! (`lower_vec_inst`, plus lane-wise block-param edges), so the portable SIMD the CPU loop vectorizer
+//! emits reaches the device. `Op::VecKernelCall` — the *other* vectorizer output, a raw-AVX2 Win64
+//! microkernel recipe — has no PTX analogue and stays a decline.
 //! A symbol with no helper — and an op code the helper does not implement — returns a classifiable
 //! `UNSUPPORTED:` error so the coverage gate reports it honestly as not-yet-covered. The headline for
 //! this phase is **coverage measured against the interpreter oracle**, never an asserted speed.
@@ -259,18 +267,27 @@ pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result
 /// `.visible .entry wukong_mega` (run by a block of threads — see [`crate::megakernel`]). The entry
 /// is lowered SPMD with its frame in a shared `.global` buffer; recognized ops emit a block-wide-tree
 /// (`mrt_sreduce_coop`), chunked-cooperative (the serial `mrt_*` over per-thread sub-ranges) or
-/// `tid==0`-serial (`mrt_*`) call bracketed by `bar.sync`. Eligibility
-/// (`crate::fusion::analyze`) guarantees the entry calls no other user function, so no `mfn_*`
-/// bodies are emitted — only the helpers it uses + the kernel. Public so `megakernel.rs` and tooling
-/// can JIT / inspect it.
+/// `tid==0`-serial (`mrt_*`) call bracketed by `bar.sync`. Public so `megakernel.rs` and tooling can
+/// JIT / inspect it.
+///
+/// Eligibility (`crate::fusion::analyze`) now allows the entry to call user-defined callees when
+/// they (transitively) contain only recognized cooperative ops and side effects. An `@parallel`
+/// outline still reaches its body through `Op::FuncAddr` plus `wukong_parallel_for`, whose
+/// grid-stride lowering calls the outlined body per iteration. The module carries the **reachability
+/// closure** of the entry: user callees on the `Op::Call` path are lowered SPMD (`tid==0`-guarded
+/// stores, grid-stride `wukong_parallel_for`), while `FuncAddr`-only outlined bodies stay
+/// single-thread `.func` bodies (per-thread `.local` frame, unguarded stores).
 pub fn emit_mega_ptx(
     program: &Program,
     entry: Symbol,
     interner: &Interner,
 ) -> Result<String, String> {
-    let entry_fn = program
-        .function(entry)
+    let entry_idx = program
+        .funcs
+        .iter()
+        .position(|f| f.name == entry)
         .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    let entry_fn = &program.funcs[entry_idx];
     if !entry_fn.params.is_empty() {
         return Err(format!(
             "{UNSUPPORTED} mega entry `{}` must take no parameters",
@@ -282,34 +299,42 @@ pub fn emit_mega_ptx(
     for (i, f) in program.funcs.iter().enumerate() {
         func_idx.insert(f.name, i);
     }
+    let reachable = reachable_funcs(program, entry_idx, &func_idx);
+    let mega_callees = call_reachable_funcs(program, entry_idx, &func_idx);
 
     let mut out = String::new();
     out.push_str(crate::ptx_target::HDR_SM80);
     out.push('\n');
 
-    // Scan the entry for the helpers it needs: cooperative reduce (+ its shared scratch), the serial
+    // Scan for the helpers the module needs: cooperative reduce (+ its shared scratch), the serial
     // `mrt_*` defs for not-yet-cooperative recognized ops, and the device fmod for float `%`.
     let mut needs_reduce_coop = false;
     let mut needs_fmod = false;
     let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
     let mut serial_defs = String::new();
-    for b in &entry_fn.blocks {
-        for inst in &b.insts {
-            match &inst.op {
-                Op::Call { func, .. } => {
-                    let nm = interner.resolve(*func);
-                    use crate::fusion::{classify_call, CallClass, CoopKind};
-                    if matches!(classify_call(nm), CallClass::Coop(CoopKind::Reduce)) {
-                        needs_reduce_coop = true;
-                    } else if let Some(h) = rt_helper(nm) {
-                        if seen.insert(h.ptx_name) {
-                            serial_defs.push_str(&h.def);
-                            serial_defs.push('\n');
+    for &fi in &reachable {
+        for b in &program.funcs[fi].blocks {
+            for inst in &b.insts {
+                match &inst.op {
+                    Op::Call { func, .. } => {
+                        let nm = interner.resolve(*func);
+                        use crate::fusion::{classify_call, CallClass, CoopKind};
+                        // Only the ENTRY runs a reduction cooperatively; inside a called body the
+                        // same op is the serial helper, so both definitions can be needed at once.
+                        if fi == entry_idx
+                            && matches!(classify_call(nm), CallClass::Coop(CoopKind::Reduce))
+                        {
+                            needs_reduce_coop = true;
+                        } else if let Some(h) = rt_helper(nm) {
+                            if seen.insert(h.ptx_name) {
+                                serial_defs.push_str(&h.def);
+                                serial_defs.push('\n');
+                            }
                         }
                     }
+                    Op::Bin(BinOp::FRem, _, _) => needs_fmod = true,
+                    _ => {}
                 }
-                Op::Bin(BinOp::FRem, _, _) => needs_fmod = true,
-                _ => {}
             }
         }
     }
@@ -324,9 +349,93 @@ pub fn emit_mega_ptx(
     }
     out.push_str(&serial_defs);
 
+    // Forward-declare every reachable callee (so mutual recursion and definition order are moot),
+    // then define them, then the entry.
+    let callees: Vec<usize> = reachable.iter().copied().filter(|&i| i != entry_idx).collect();
+    for &fi in &callees {
+        out.push_str(&fn_signature(&program.funcs[fi], fi));
+        out.push_str(";\n");
+    }
+    if !callees.is_empty() {
+        out.push('\n');
+    }
+    for &fi in &callees {
+        let body = if mega_callees.contains(&fi)
+            && crate::fusion::function_contains_parallel_for(interner, &program.funcs[fi])
+        {
+            FnEmit::lower_mega_callee(&program.funcs[fi], fi, &func_idx, program, interner)?
+        } else {
+            FnEmit::lower(&program.funcs[fi], fi, &func_idx, program, interner)?
+        };
+        out.push_str(&body);
+        out.push('\n');
+    }
+
     let body = FnEmit::lower_mega(entry_fn, &func_idx, program, interner)?;
     out.push_str(&body);
     Ok(out)
+}
+
+/// The reachability closure of `root`: every function it can reach through a direct `Op::Call` or
+/// through an `Op::FuncAddr` (the `@parallel` outliner's handle on its outlined body), plus `root`
+/// itself, in index order.
+fn reachable_funcs(
+    program: &Program,
+    root: usize,
+    func_idx: &HashMap<Symbol, usize>,
+) -> Vec<usize> {
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut work = vec![root];
+    while let Some(fi) = work.pop() {
+        if !seen.insert(fi) {
+            continue;
+        }
+        for b in &program.funcs[fi].blocks {
+            for inst in &b.insts {
+                let target = match &inst.op {
+                    Op::Call { func, .. } => func_idx.get(func).copied(),
+                    Op::FuncAddr(sym) => func_idx.get(sym).copied(),
+                    _ => None,
+                };
+                if let Some(t) = target {
+                    if !seen.contains(&t) {
+                        work.push(t);
+                    }
+                }
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Every user function reachable from `root` through `Op::Call` edges only (not `FuncAddr`).
+/// These are the callees that run SPMD when called from the megakernel entry and need
+/// `tid==0`-guarded stores plus grid-stride `wukong_parallel_for`.
+fn call_reachable_funcs(
+    program: &Program,
+    root: usize,
+    func_idx: &HashMap<Symbol, usize>,
+) -> std::collections::BTreeSet<usize> {
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut work = vec![root];
+    while let Some(fi) = work.pop() {
+        if !seen.insert(fi) {
+            continue;
+        }
+        for b in &program.funcs[fi].blocks {
+            for inst in &b.insts {
+                if let Op::Call { func, .. } = &inst.op {
+                    if let Some(&t) = func_idx.get(func) {
+                        if !seen.contains(&t) {
+                            work.push(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    seen.remove(&root);
+    seen
 }
 
 // ============================================================================================
@@ -452,12 +561,11 @@ struct FnEmit<'a> {
     ctx_reg: String,
 
     // --- cooperative-megakernel mode (see `megakernel.rs`) ---
-    // When set, this function is lowered as the `.visible .entry` megakernel run by a *block* of
-    // threads (SPMD): the frame lives in one shared `.global` buffer (not a per-thread `.local`
-    // frame), every `Store` / side-effect is predicated to `tid==0`, and every recognized op is
-    // bracketed by `bar.sync` (cooperative across the block, or `@tid0` serial). Default `false`
-    // keeps the single-thread `.func` path byte-for-byte unchanged.
+    // When set, this function is lowered SPMD: stores/side-effects are `tid==0`-guarded and
+    // recognized ops are `bar.sync`-bracketed. `mega_entry` is true only for the `.visible .entry`
+    // kernel (which writes the exit code); mega callees use normal `.func` returns.
     mega: bool,
+    mega_entry: bool,
     // The predicate register holding `threadIdx.x == 0` (only bound in `mega` mode).
     tid0: String,
 }
@@ -492,6 +600,7 @@ impl<'a> FnEmit<'a> {
             frame_base: String::new(),
             ctx_reg: String::new(),
             mega: false,
+            mega_entry: false,
             tid0: String::new(),
         };
         e.assign_frame();
@@ -542,6 +651,7 @@ impl<'a> FnEmit<'a> {
             frame_base: String::new(),
             ctx_reg: String::new(),
             mega: true,
+            mega_entry: true,
             tid0: String::new(),
         };
         e.assign_frame();
@@ -552,6 +662,57 @@ impl<'a> FnEmit<'a> {
             ".visible .entry {MEGA_KERNEL_NAME}(.param .u64 p_ctx, .param .u64 p_frame)\n{{\n"
         ));
         e.write_reg_decls(&mut out);
+        out.push_str(&e.body);
+        out.push_str("}\n");
+        Ok(out)
+    }
+
+    /// Lower a user-defined callee that the megakernel entry reaches through `Op::Call`. Same SPMD
+    /// discipline as [`lower_mega`](Self::lower_mega) — `tid==0`-guarded stores, grid-stride
+    /// `wukong_parallel_for`, `bar.sync`-bracketed recognized ops — but emitted as an ordinary
+    /// `.func mfn_*` with a per-thread `.local` frame and a normal `ret` (not the exit-code slot).
+    fn lower_mega_callee(
+        func: &'a Function,
+        idx: usize,
+        func_idx: &'a HashMap<Symbol, usize>,
+        program: &'a Program,
+        interner: &'a Interner,
+    ) -> Result<String, String> {
+        let mut e = FnEmit {
+            func,
+            program,
+            interner,
+            func_idx,
+            body: String::new(),
+            n_rd: 0,
+            n_r: 0,
+            n_rs: 0,
+            n_f: 0,
+            n_fd: 0,
+            n_p: 0,
+            vreg: HashMap::new(),
+            vlanes: HashMap::new(),
+            const_ints: HashMap::new(),
+            func_addr_of: HashMap::new(),
+            n_lbl: 0,
+            frame_off: HashMap::new(),
+            frame_bytes: 0,
+            frame_base: String::new(),
+            ctx_reg: String::new(),
+            mega: true,
+            mega_entry: false,
+            tid0: String::new(),
+        };
+        e.assign_frame();
+        e.translate_mega_callee()?;
+
+        let mut out = String::new();
+        out.push_str(&fn_signature(func, idx));
+        out.push_str("\n{\n");
+        e.write_reg_decls(&mut out);
+        if e.frame_bytes > 0 {
+            let _ = writeln!(out, "    .local .align 8 .b8 __frame[{}];", e.frame_bytes);
+        }
         out.push_str(&e.body);
         out.push_str("}\n");
         Ok(out)
@@ -680,6 +841,16 @@ impl<'a> FnEmit<'a> {
 
         let params: Vec<ValueId> = self.func.params.clone();
         for (i, p) in params.iter().enumerate() {
+            // A *block* param may be a vector (lane registers, see `assign_vector_block_params`); a
+            // FUNCTION param may not, because `fn_signature` gives it one scalar `.param` slot and
+            // there is no ABI here to pass N lanes through. MIR signatures are scalars and pointers
+            // today, so this is a decline against a future op, not a live limitation.
+            if self.func.value_type(*p).is_vector() {
+                return Err(format!(
+                    "{UNSUPPORTED} SIMD function parameter v{} (no vector `.param` ABI)",
+                    p.0
+                ));
+            }
             let r = self.reg(*p);
             let abi = abi_ty(self.func.value_type(*p));
             self.emit(&format!("ld.param.{abi} {r}, [p{i}];"));
@@ -717,8 +888,45 @@ impl<'a> FnEmit<'a> {
         self.emit_blocks()
     }
 
+    /// Mega callee preamble: per-thread `.local` frame, explicit params, and the `tid==0` predicate
+    /// that guards stores and side effects when this `.func` is called SPMD from the megakernel.
+    fn translate_mega_callee(&mut self) -> Result<(), String> {
+        let ctx_raw = self.fresh(RC::Rd);
+        self.ctx_reg = self.fresh(RC::Rd);
+        self.emit(&format!("ld.param.u64 {ctx_raw}, [p_ctx];"));
+        self.emit(&format!("cvta.to.global.u64 {}, {ctx_raw};", self.ctx_reg));
+
+        if self.frame_bytes > 0 {
+            let loc = self.fresh(RC::Rd);
+            self.frame_base = self.fresh(RC::Rd);
+            self.emit(&format!("mov.u64 {loc}, __frame;"));
+            self.emit(&format!("cvta.local.u64 {}, {loc};", self.frame_base));
+        }
+
+        let params: Vec<ValueId> = self.func.params.clone();
+        for (i, p) in params.iter().enumerate() {
+            if self.func.value_type(*p).is_vector() {
+                return Err(format!(
+                    "{UNSUPPORTED} SIMD function parameter v{} (no vector `.param` ABI)",
+                    p.0
+                ));
+            }
+            let r = self.reg(*p);
+            let abi = abi_ty(self.func.value_type(*p));
+            self.emit(&format!("ld.param.{abi} {r}, [p{i}];"));
+        }
+
+        let tid = self.fresh_r32();
+        self.tid0 = self.fresh_pred();
+        self.emit(&format!("mov.u32 {tid}, %tid.x;"));
+        self.emit(&format!("setp.eq.u32 {}, {tid}, 0;", self.tid0));
+
+        self.emit_blocks()
+    }
+
     /// The shared block-emitting loop used by both the single-thread `.func` path and the mega entry.
     fn emit_blocks(&mut self) -> Result<(), String> {
+        self.assign_vector_block_params();
         // Branch to the entry block, then emit blocks in id order.
         self.emit(&format!("bra BB{};", self.func.entry.0));
         let blocks = self.func.blocks.clone();
@@ -834,19 +1042,38 @@ impl<'a> FnEmit<'a> {
                 let d = self.reg(r);
                 self.round_into(&d, *mode, &x, &rty);
             }
+            // A `Splat` or `Iota` whose result is NOT a vector never reaches here from verified MIR
+            // (`wukong_mir::verify` requires a vector result for both), and the vector case went to
+            // `lower_vec_inst` above. Keep them as declines rather than `unreachable!`, but say what
+            // they mean: the old text was "SIMD not yet lowered to PTX", which now reads as a claim
+            // about the SIMD path in general to anyone debugging a decline.
             Op::Splat(_) => {
                 return Err(format!(
-                    "{UNSUPPORTED} SIMD `Splat` (vectorized MIR) not yet lowered to PTX"
+                    "{UNSUPPORTED} `Splat` with a non-vector result type {} (malformed MIR)",
+                    rty.display()
                 ))
             }
-            Op::ExtractLane(..) => {
-                return Err(format!(
-                    "{UNSUPPORTED} SIMD `ExtractLane` (vectorized MIR) not yet lowered to PTX"
-                ))
+            // Read lane `k` of a SIMD value back as a scalar — the shape the loop vectorizer's
+            // reduction epilogue folds in index order, and how a vector guard reaches a `CondBr`.
+            // `lower_vec_inst` already scalarizes every vector into one register per lane, so this is
+            // a register copy: the "one shuffle, lane 0 is free" cost model in
+            // `wukong_mir::Op::ExtractLane`'s doc is a CPU-SIMD statement, not a PTX one.
+            Op::ExtractLane(v, k) => {
+                let lanes = self.lanes(*v)?;
+                let src = lanes.get(*k as usize).cloned().ok_or_else(|| {
+                    format!(
+                        "{UNSUPPORTED} SIMD `ExtractLane` lane {k} is past the {} lane(s) of v{}",
+                        lanes.len(),
+                        v.0
+                    )
+                })?;
+                let d = self.reg(r);
+                self.emit(&format!("mov.{} {d}, {src};", mov_ty(rc_of(&rty))));
             }
             Op::Iota(..) => {
                 return Err(format!(
-                    "{UNSUPPORTED} SIMD `Iota` (vectorized MIR) not yet lowered to PTX"
+                    "{UNSUPPORTED} `Iota` with a non-vector result type {} (malformed MIR)",
+                    rty.display()
                 ))
             }
             Op::FuncAddr(sym) => {
@@ -1482,14 +1709,42 @@ impl<'a> FnEmit<'a> {
 
     // --- SIMD (vector) lowering: scalarize each `<N x T>` op into N lane ops ---
 
-    /// The N lane registers of a SIMD value (materialized by the op that produced it).
+    /// The N lane registers of a SIMD value (materialized by the op that produced it, or
+    /// pre-assigned by [`assign_vector_block_params`](Self::assign_vector_block_params) when the
+    /// value is a block param).
     fn lanes(&mut self, v: ValueId) -> Result<Vec<String>, String> {
-        self.vlanes.get(&v.0).cloned().ok_or_else(|| {
-            format!(
-                "{UNSUPPORTED} SIMD value v{} used before definition (vector block params not lowered)",
-                v.0
-            )
-        })
+        self.vlanes
+            .get(&v.0)
+            .cloned()
+            .ok_or_else(|| format!("{UNSUPPORTED} SIMD value v{} used before definition", v.0))
+    }
+
+    /// Give every **vector-typed block param** its own register per lane, before any block is
+    /// emitted.
+    ///
+    /// A vector block param is how a loop carries a SIMD value across iterations — the vectorized
+    /// reduction accumulator is exactly this shape — and it has to be pre-assigned rather than
+    /// materialized on first use, because the *edge* that writes it (`emit_edge`, in a predecessor
+    /// block) runs before the block that reads it. Everything else here scalarizes a vector as N
+    /// registers produced by one op, so the only new obligation is that the two sides agree on which
+    /// N registers; a fixed pre-assignment is that agreement.
+    fn assign_vector_block_params(&mut self) {
+        let params: Vec<ValueId> = self
+            .func
+            .blocks
+            .iter()
+            .flat_map(|b| b.params.iter().copied())
+            .collect();
+        for p in params {
+            if let MirType::Vec(lane, n) = self.ty(p) {
+                let rc = rc_of(&lane);
+                let mut lanes = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    lanes.push(self.fresh(rc));
+                }
+                self.vlanes.insert(p.0, lanes);
+            }
+        }
     }
 
     /// Address of lane `i` given a base address register and the lane byte size.
@@ -1736,8 +1991,13 @@ impl<'a> FnEmit<'a> {
             // `wukong_parallel_for(n, func_addr F, ctx)`: the @parallel outliner splits `[0,n)` into
             // per-core chunks and runs `F(lo, hi, ctx)` on each. The chunking is deterministic and the
             // outlined body is chunk-decomposable, so a single sequential chunk `F(0, n, ctx)` gives
-            // the same result as the interpreter (serial == parallel). (Grid-stride parallelism is a
-            // later performance increment; this is the correct, general lowering.)
+            // the same result as the interpreter (serial == parallel).
+            //
+            // This path is the ONE-THREAD kernel (`run_on_device` launches 1x1), so the sequential
+            // chunk is not a missing optimization here — there is no second thread to give iterations
+            // to. The parallel form is `emit_parallel_for_gridstride` in mega mode, where the launch
+            // really is a block of threads; a program mega declines falls back here, and this
+            // lowering is what that fallback (and the differential gate) rests on.
             "wukong_parallel_for" if args.len() == 3 => {
                 let sym = self.func_addr_of.get(&args[1].0).copied().ok_or_else(|| {
                     format!("{UNSUPPORTED} wukong_parallel_for target is not a func_addr")
@@ -1817,9 +2077,10 @@ impl<'a> FnEmit<'a> {
                     ));
                 }
             }
-            CoopKind::ParallelFor => {
+            CoopKind::ParallelFor if args.len() != 3 => {
                 return Err(format!(
-                    "{UNSUPPORTED} wukong_parallel_for not cooperative in mega"
+                    "{UNSUPPORTED} wukong_parallel_for takes 3 args, got {}",
+                    args.len()
                 ));
             }
             _ => {}
@@ -1951,6 +2212,8 @@ impl<'a> FnEmit<'a> {
                     &[(0, Stride::Arg(5, 4)), (1, Stride::Arg(5, 4))],
                 );
             }
+            // The generic `@parallel` outline: a grid-stride loop over the independent domain.
+            CoopKind::ParallelFor => self.emit_parallel_for_gridstride(args)?,
             // Serial on `tid==0` over the shared frame (correct; cooperative bodies land later for
             // the remaining ops — e.g. axpby).
             _ => {
@@ -1961,6 +2224,106 @@ impl<'a> FnEmit<'a> {
             }
         }
         self.emit("bar.sync 0;");
+        Ok(())
+    }
+
+    /// **Grid-stride lowering of `wukong_parallel_for(n, func_addr F, ctx)`** (mega mode) — the
+    /// `@parallel` half of Phase 1.
+    ///
+    /// Iteration `i` runs on the thread with flat id `i mod stride`, where
+    /// `stride = blockDim.x * gridDim.x`, as the one-iteration chunk `F(i, i+1, ctx)`:
+    ///
+    /// ```text
+    /// for (i = threadIdx.x + blockIdx.x*blockDim.x; i < n; i += blockDim.x*gridDim.x)
+    ///     F(i, i+1, ctx);
+    /// ```
+    ///
+    /// **Why per-iteration chunks and not one contiguous range per thread.** Both partitions are
+    /// legal (see `fusion::parallel_for_is_cooperative` for what makes any partition legal), and a
+    /// contiguous range would be one call per thread instead of one per iteration. But neighbouring
+    /// *threads* would then touch addresses `chunk` elements apart, which is the uncoalesced access
+    /// pattern; with the grid-stride interleave, lane `t` and lane `t+1` of a warp read adjacent
+    /// elements, which is what a hand-written CUDA elementwise kernel does and the only shape that
+    /// can approach memory throughput. The cost is a `.func` call per iteration, and buying
+    /// coalescing with it is the right trade on a memory-bound loop; a compute-bound body would
+    /// prefer the other partition, which is a scheduling decision this phase does not have a place
+    /// to record yet.
+    ///
+    /// **Why the trip count is uniform.** The loop runs `ceil(n/stride)` times on *every* thread and
+    /// the tail is absorbed by passing an empty range (`hi = min(i+1, n)`, so `hi <= lo` once
+    /// `i >= n`, and the callee's `lo..hi` loop body never executes) rather than by exiting early.
+    /// A `call.uni` inside a region some threads have left is undefined, and every other call this
+    /// file emits is `call.uni`; keeping the loop convergent keeps that one convention instead of
+    /// introducing a divergent-call rule for one op. `n <= 0` skips the loop outright — computing
+    /// `ceil(n/stride)` unsigned on a negative `n` would spin ~2^64 times over empty ranges.
+    ///
+    /// The caller (`lower_call_mega`) brackets this with `bar.sync`, which is what makes the ctx
+    /// struct written by `tid==0` visible to every thread before the first call, and the results
+    /// visible to whatever `tid==0` reads next.
+    fn emit_parallel_for_gridstride(&mut self, args: &[ValueId]) -> Result<(), String> {
+        let sym = self.func_addr_of.get(&args[1].0).copied().ok_or_else(|| {
+            format!("{UNSUPPORTED} wukong_parallel_for target is not a func_addr")
+        })?;
+        let idx = *self.func_idx.get(&sym).ok_or_else(|| {
+            format!(
+                "{UNSUPPORTED} wukong_parallel_for target `{}` is not a known function",
+                self.interner.resolve(sym)
+            )
+        })?;
+        let n = self.reg(args[0]);
+        let ctx = self.reg(args[2]);
+
+        // stride = ntid.x * nctaid.x ; i = tid.x + ctaid.x*ntid.x   (both 64-bit)
+        let tid32 = self.fresh_r32();
+        let ntid32 = self.fresh_r32();
+        let ctaid32 = self.fresh_r32();
+        let nctaid32 = self.fresh_r32();
+        self.emit(&format!("mov.u32 {tid32}, %tid.x;"));
+        self.emit(&format!("mov.u32 {ntid32}, %ntid.x;"));
+        self.emit(&format!("mov.u32 {ctaid32}, %ctaid.x;"));
+        self.emit(&format!("mov.u32 {nctaid32}, %nctaid.x;"));
+        let i = self.fresh(RC::Rd);
+        let stride = self.fresh(RC::Rd);
+        let t = self.fresh(RC::Rd);
+        self.emit(&format!("cvt.u64.u32 {i}, {tid32};"));
+        self.emit(&format!("cvt.u64.u32 {stride}, {ntid32};"));
+        self.emit(&format!("cvt.u64.u32 {t}, {ctaid32};"));
+        self.emit(&format!("mul.lo.s64 {t}, {t}, {stride};"));
+        self.emit(&format!("add.s64 {i}, {i}, {t};"));
+        let ncta = self.fresh(RC::Rd);
+        self.emit(&format!("cvt.u64.u32 {ncta}, {nctaid32};"));
+        self.emit(&format!("mul.lo.s64 {stride}, {stride}, {ncta};"));
+
+        let lbl = self.n_lbl;
+        self.n_lbl += 1;
+
+        // Empty domain: nothing to do (and `ceil(n/stride)` unsigned on n<=0 is a ~2^64 trip count).
+        let pempty = self.fresh_pred();
+        self.emit(&format!("setp.le.s64 {pempty}, {n}, 0;"));
+        self.emit(&format!("@{pempty} bra PFOR_END{lbl};"));
+
+        // trip = ceil(n / stride), the same value on every thread.
+        let trip = self.fresh(RC::Rd);
+        self.emit(&format!("add.s64 {trip}, {n}, {stride};"));
+        self.emit(&format!("sub.s64 {trip}, {trip}, 1;"));
+        self.emit(&format!("div.u64 {trip}, {trip}, {stride};"));
+        let c = self.fresh(RC::Rd);
+        self.emit(&format!("mov.b64 {c}, 0;"));
+
+        self.body.push_str(&format!("PFOR{lbl}:\n"));
+        let pdone = self.fresh_pred();
+        self.emit(&format!("setp.ge.s64 {pdone}, {c}, {trip};"));
+        self.emit(&format!("@{pdone} bra PFOR_END{lbl};"));
+        // hi = min(i+1, n): the real one-iteration range, or an empty one on the tail threads.
+        let hi = self.fresh(RC::Rd);
+        self.emit(&format!("add.s64 {hi}, {i}, 1;"));
+        self.emit(&format!("min.s64 {hi}, {hi}, {n};"));
+        let arg_regs = vec![(i.clone(), "b64"), (hi, "b64"), (ctx.clone(), "b64")];
+        self.emit_call_to(idx, &arg_regs, None);
+        self.emit(&format!("add.s64 {i}, {i}, {stride};"));
+        self.emit(&format!("add.s64 {c}, {c}, 1;"));
+        self.emit(&format!("bra PFOR{lbl};"));
+        self.body.push_str(&format!("PFOR_END{lbl}:\n"));
         Ok(())
     }
 
@@ -2266,13 +2629,13 @@ impl<'a> FnEmit<'a> {
 
     fn lower_term(&mut self, term: &Terminator) -> Result<(), String> {
         match term {
-            // In mega mode the entry *is* the kernel: a `Ret` writes the exit code into the context
-            // exit slot (tid==0) and returns, mirroring `emit_entry_kernel`'s wrapper.
-            Terminator::Ret(None) if self.mega => {
+            // In mega *entry* mode the kernel writes the exit code into the context exit slot
+            // (`tid==0`) and returns. Mega callees use the ordinary `.func` return path.
+            Terminator::Ret(None) if self.mega && self.mega_entry => {
                 self.emit_mega_exit(None);
                 self.emit("ret;");
             }
-            Terminator::Ret(Some(v)) if self.mega => {
+            Terminator::Ret(Some(v)) if self.mega && self.mega_entry => {
                 let v = *v;
                 self.emit_mega_exit(Some(v));
                 self.emit("ret;");
@@ -2285,7 +2648,7 @@ impl<'a> FnEmit<'a> {
                 self.emit("ret;");
             }
             Terminator::Br { target, args } => {
-                self.emit_edge(target.0, args);
+                self.emit_edge(target.0, args)?;
                 self.emit(&format!("bra BB{};", target.0));
             }
             Terminator::CondBr {
@@ -2301,10 +2664,10 @@ impl<'a> FnEmit<'a> {
                 self.n_lbl += 1;
                 self.emit(&format!("setp.ne.s64 {p}, {c}, 0;"));
                 self.emit(&format!("@!{p} bra ELSE{lbl};"));
-                self.emit_edge(then_blk.0, then_args);
+                self.emit_edge(then_blk.0, then_args)?;
                 self.emit(&format!("bra BB{};", then_blk.0));
                 self.body.push_str(&format!("ELSE{lbl}:\n"));
-                self.emit_edge(else_blk.0, else_args);
+                self.emit_edge(else_blk.0, else_args)?;
                 self.emit(&format!("bra BB{};", else_blk.0));
             }
             Terminator::Unreachable => self.emit("trap;"),
@@ -2337,23 +2700,58 @@ impl<'a> FnEmit<'a> {
 
     /// Realize the block-param convention for one edge: copy each arg into a temp, then each temp into
     /// the target block's param register. The temp hop makes permuted / self-referential edges safe.
-    fn emit_edge(&mut self, target: u32, args: &[ValueId]) {
+    ///
+    /// A vector arg travels **lane by lane** into the target param's pre-assigned lane registers
+    /// (see [`assign_vector_block_params`](Self::assign_vector_block_params)) — one `mov` per lane,
+    /// through per-lane temps for the same permutation safety.
+    fn emit_edge(&mut self, target: u32, args: &[ValueId]) -> Result<(), String> {
         if args.is_empty() {
-            return;
+            return Ok(());
         }
         let params: Vec<ValueId> = self.func.blocks[target as usize].params.clone();
-        let mut temps = Vec::with_capacity(args.len());
+        let mut temps: Vec<Vec<(String, RC)>> = Vec::with_capacity(args.len());
         for a in args {
-            let rc = rc_of(self.func.value_type(*a));
-            let t = self.fresh(rc);
-            let src = self.reg(*a);
-            self.emit(&format!("mov.{} {t}, {src};", mov_ty(rc)));
-            temps.push((t, rc));
+            let ty = self.ty(*a);
+            if ty.is_vector() {
+                let rc = rc_of(ty.lane_type());
+                let lanes = self.lanes(*a)?;
+                let mut ts = Vec::with_capacity(lanes.len());
+                for l in lanes {
+                    let t = self.fresh(rc);
+                    self.emit(&format!("mov.{} {t}, {l};", mov_ty(rc)));
+                    ts.push((t, rc));
+                }
+                temps.push(ts);
+            } else {
+                let rc = rc_of(&ty);
+                let t = self.fresh(rc);
+                let src = self.reg(*a);
+                self.emit(&format!("mov.{} {t}, {src};", mov_ty(rc)));
+                temps.push(vec![(t, rc)]);
+            }
         }
-        for (p, (t, rc)) in params.iter().zip(temps) {
-            let pr = self.reg(*p);
-            self.emit(&format!("mov.{} {pr}, {t};", mov_ty(rc)));
+        for (p, ts) in params.iter().zip(temps) {
+            if self.ty(*p).is_vector() {
+                let dst = self.lanes(*p)?;
+                if dst.len() != ts.len() {
+                    return Err(format!(
+                        "{UNSUPPORTED} vector edge into BB{target} param v{} carries {} lane(s) \
+                         for a {}-lane param",
+                        p.0,
+                        ts.len(),
+                        dst.len()
+                    ));
+                }
+                for (d, (t, rc)) in dst.iter().zip(ts) {
+                    self.emit(&format!("mov.{} {d}, {t};", mov_ty(rc)));
+                }
+            } else {
+                let (t, rc) = ts[0].clone();
+                let pr = self.reg(*p);
+                self.emit(&format!("mov.{} {pr}, {t};", mov_ty(rc)));
+            }
         }
+        Ok(())
     }
 
     fn coerce_float(&mut self, v: ValueId, want: RC) -> String {
@@ -4291,7 +4689,7 @@ mod tests {
 
         // A parameterless `main` (the megakernel entry requires no params) with a loop, integer
         // arithmetic and a print — enough MIR that both emitters walk their real emission tables.
-        const SRC: &str = r#"module gate
+        const SCALAR: &str = r#"module gate
 
 fn main() -> i32 {
     let mut s: i32 = 0;
@@ -4305,36 +4703,307 @@ fn main() -> i32 {
 }
 "#;
 
-        for opt in [0u8, 3u8] {
-            let (program, mut interner) =
-                build(SRC, opt).expect("the floor probe program must compile");
-            let entry = interner.intern("main");
-            let modules = [
-                ("emit_ptx", emit_ptx(&program, entry, &interner)),
-                ("emit_mega_ptx", emit_mega_ptx(&program, entry, &interner)),
-            ];
-            for (what, res) in modules {
-                let ptx = res.unwrap_or_else(|e| panic!("{what}@O{opt}: lowering failed: {e}"));
-                assert!(
-                    ptx.starts_with(HDR_SM80),
-                    "{what}@O{opt}: must open with HDR_SM80 (`.version 7.8` / `.target sm_80`), got: {:?}",
-                    ptx.lines().take(3).collect::<Vec<_>>()
-                );
-                assert!(
-                    ptx.contains(TARGET_SM80),
-                    "{what}@O{opt}: lost the sm_80 floor"
-                );
-                assert!(
-                    !ptx.contains(TARGET_SM89),
-                    "{what}@O{opt}: `{TARGET_SM89}` loads on zero A100s and nothing here needs Ada"
-                );
-                assert!(
-                    !ptx.contains(".version 8.4"),
-                    "{what}@O{opt}: `.version 8.4` demands driver r550+; this instruction mix \
-                     (generic scalar PTX, `bar.sync`, `red.f32`, one `atom.global.add`) needs \
-                     nothing above ISA 7.0"
-                );
+        // And a `@parallel` elementwise nest, which is what walks the two emission paths added in
+        // Phase 1: the lane-wise SIMD emitters (`mir_build` vectorizes this loop) and the grid-stride
+        // `wukong_parallel_for` arm, whose `%nctaid.x` read, `min.s64` and `div.u64` are all
+        // pre-Ampere — asserted here rather than assumed, because this gate's whole reason for
+        // existing is that an over-declared floor JITs perfectly on the Ada card the corpus runs on
+        // and loads on zero A100s.
+        const PARALLEL: &str = r#"module gate_par
+@parallel
+fn main() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    let mut y: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = (i as f32) * 2.0; }
+    for i in 0..64 {
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }
+    print(y[63] as i32);
+    return 0;
+}
+"#;
+
+        for (probe, src) in [("scalar", SCALAR), ("parallel", PARALLEL)] {
+            for opt in [0u8, 3u8] {
+                let (program, mut interner) =
+                    build(src, opt).expect("the floor probe program must compile");
+                let entry = interner.intern("main");
+                let modules = [
+                    ("emit_ptx", emit_ptx(&program, entry, &interner)),
+                    ("emit_mega_ptx", emit_mega_ptx(&program, entry, &interner)),
+                ];
+                for (what, res) in modules {
+                    // A decline is not this gate's business (the corpus floors own coverage), but a
+                    // module that IS emitted must open at the floor.
+                    let ptx = match res {
+                        Ok(p) => p,
+                        Err(e) if e.starts_with(UNSUPPORTED) => continue,
+                        Err(e) => panic!("{probe}/{what}@O{opt}: lowering failed: {e}"),
+                    };
+                    assert!(
+                        ptx.starts_with(HDR_SM80),
+                        "{probe}/{what}@O{opt}: must open with HDR_SM80 (`.version 7.8` / \
+                         `.target sm_80`), got: {:?}",
+                        ptx.lines().take(3).collect::<Vec<_>>()
+                    );
+                    assert!(
+                        ptx.contains(TARGET_SM80),
+                        "{probe}/{what}@O{opt}: lost the sm_80 floor"
+                    );
+                    assert!(
+                        !ptx.contains(TARGET_SM89),
+                        "{probe}/{what}@O{opt}: `{TARGET_SM89}` loads on zero A100s and nothing \
+                         here needs Ada"
+                    );
+                    assert!(
+                        !ptx.contains(".version 8.4"),
+                        "{probe}/{what}@O{opt}: `.version 8.4` demands driver r550+; this \
+                         instruction mix (generic scalar PTX, `bar.sync`, `red.f32`, one \
+                         `atom.global.add`) needs nothing above ISA 7.0"
+                    );
+                }
             }
+        }
+    }
+
+    /// A hand-built MIR function carrying the **portable SIMD** shape the CPU loop vectorizer emits:
+    /// `Splat`, `Iota`, a lane-wise `Bin`, a vector `Store`, and `ExtractLane` reading one lane back
+    /// out as a scalar. Device-free: it asserts the emitted text, not a run.
+    ///
+    /// Built here rather than through the frontend because the shape is a *lowering* contract, not a
+    /// source pattern — which loop `wukong_opt::vectorize` chooses to vectorize (and whether a
+    /// recognizer claims it first) can change without this obligation changing. `verify_program`
+    /// runs on it first so a test that stopped exercising legal MIR fails as a bad test rather than
+    /// as a lowering bug.
+    fn simd_probe(interner: &mut Interner) -> Program {
+        use wukong_mir::Builder;
+        let vt = MirType::Vec(Box::new(MirType::F32), 4);
+        let mut b = Builder::new(interner.intern("main"), MirType::I32);
+        let p = b.alloca(MirType::Array(Box::new(MirType::F32), 4));
+        let c = b.build(MirType::F32, Op::ConstFloat(2.5, MirType::F32));
+        let splat = b.build(vt.clone(), Op::Splat(c));
+        let ramp = b.build(
+            MirType::Vec(Box::new(MirType::I32), 4),
+            Op::Iota(MirType::Vec(Box::new(MirType::I32), 4)),
+        );
+        let ramp_f = b.build(vt.clone(), Op::Cast(CastKind::SiToFp, ramp, vt.clone()));
+        let sum = b.build(vt.clone(), Op::Bin(BinOp::FAdd, splat, ramp_f));
+        b.build_void(Op::Store {
+            ptr: p,
+            value: sum,
+        });
+        // Read the vector back and run the rest of the lane-wise menu over it, so one probe covers
+        // every vector op `wukong_opt::vectorize` can emit rather than just the three that were
+        // declining.
+        let back = b.build(vt.clone(), Op::Load(p, vt.clone()));
+        let fma = b.build(vt.clone(), Op::Fma(back, splat, sum));
+        let root = b.build(vt.clone(), Op::Sqrt(fma));
+        let mask = b.build(
+            MirType::Vec(Box::new(MirType::I1), 4),
+            Op::Cmp(CmpOp::Fogt, root, splat),
+        );
+        let pick = b.build(vt.clone(), Op::Select(mask, root, splat));
+        let lane3 = b.build(MirType::F32, Op::ExtractLane(pick, 3));
+        b.build_void(Op::Call {
+            func: interner.intern("print"),
+            args: vec![lane3],
+        });
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        b.ret(Some(zero));
+        let mut program = Program::new();
+        program.funcs.push(b.finish());
+        let errs = wukong_mir::verify::verify_program(&program);
+        assert!(errs.is_empty(), "the SIMD probe MIR must verify: {errs:?}");
+        program
+    }
+
+    /// **Portable SIMD MIR lowers to PTX** (Task 1.1) — one lane's worth of instructions per lane,
+    /// ASCII only, at the `sm_80` floor. Before this, `Splat`/`ExtractLane`/`Iota` were three
+    /// `UNSUPPORTED:` declines and any vectorized function skipped the device entirely.
+    #[test]
+    fn portable_simd_mir_lowers_to_ascii_ptx() {
+        let mut interner = Interner::new();
+        let program = simd_probe(&mut interner);
+        let entry = interner.intern("main");
+        let ptx = emit_ptx(&program, entry, &interner).expect("portable SIMD must lower");
+
+        assert!(ptx.is_ascii(), "PTX must stay ASCII (ptxas rejects non-ASCII)");
+        assert!(
+            ptx.starts_with(crate::ptx_target::HDR_SM80),
+            "the SIMD lowering must not introduce a header of its own"
+        );
+        // Scalarized: one lane's worth of instructions per lane, not one vector op. Every emitter the
+        // probe exercises must show up four times.
+        for (op, what) in [
+            ("add.rn.f32", "vector Bin"),
+            ("st.f32", "vector Store"),
+            ("ld.f32", "vector Load"),
+            ("fma.rn.f32", "vector Fma"),
+            ("sqrt.rn.f32", "vector Sqrt"),
+            ("setp.gt.f32", "vector Cmp"),
+            ("selp.f32", "vector Select"),
+        ] {
+            assert_eq!(
+                ptx.matches(op).count(),
+                4,
+                "expected one `{op}` per lane for {what}, found {} in:\n{ptx}",
+                ptx.matches(op).count()
+            );
+        }
+        // `Iota` materializes lane k as the constant k; `ExtractLane` is a register copy.
+        for k in 0..4 {
+            assert!(
+                ptx.contains(&format!(", {k};")),
+                "lane constant {k} missing from the iota ramp in:\n{ptx}"
+            );
+        }
+        assert!(
+            ptx.contains("mov.f32"),
+            "ExtractLane must copy the lane register into the scalar result in:\n{ptx}"
+        );
+    }
+
+    /// **A SIMD value can cross a block edge** (Task 1.1): a loop whose accumulator is a
+    /// `<4 x f32>` block param — the shape a vectorized reduction has — lowers to one `mov` per lane
+    /// per edge, and the epilogue reads the lanes back with `ExtractLane`.
+    ///
+    /// This was the second half of the SIMD hole and it failed *differently* from a missing op arm:
+    /// `lanes()` declined with "used before definition" because the register set of a vector param
+    /// had no owner. Hand-built for the same reason as `simd_probe`.
+    #[test]
+    fn simd_accumulator_crosses_a_block_edge() {
+        use wukong_mir::Builder;
+
+        let mut interner = Interner::new();
+        let vt = MirType::Vec(Box::new(MirType::F32), 4);
+        let mut b = Builder::new(interner.intern("main"), MirType::I32);
+
+        // entry: acc = splat 0.0 ; i = 0 ; br loop(acc, i)
+        let zerof = b.build(MirType::F32, Op::ConstFloat(0.0, MirType::F32));
+        let acc0 = b.build(vt.clone(), Op::Splat(zerof));
+        let i0 = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let four = b.build(MirType::I64, Op::ConstInt(4, MirType::I64));
+        let step = b.build(MirType::F32, Op::ConstFloat(1.5, MirType::F32));
+        let vstep = b.build(vt.clone(), Op::Splat(step));
+
+        let loop_blk = b.new_block();
+        let exit_blk = b.new_block();
+        let acc = b.block_param(loop_blk, vt.clone());
+        let iv = b.block_param(loop_blk, MirType::I64);
+        let acc_out = b.block_param(exit_blk, vt.clone());
+        b.br(loop_blk, vec![acc0, i0]);
+
+        // loop(acc, i): acc' = acc + vstep ; i' = i + 1 ; if i' < 4 -> loop else exit(acc')
+        b.switch_to(loop_blk);
+        let acc1 = b.build(vt.clone(), Op::Bin(BinOp::FAdd, acc, vstep));
+        let i1 = b.build(MirType::I64, Op::Bin(BinOp::Add, iv, one));
+        let more = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i1, four));
+        b.set_term(Terminator::CondBr {
+            cond: more,
+            then_blk: loop_blk,
+            then_args: vec![acc1, i1],
+            else_blk: exit_blk,
+            else_args: vec![acc1],
+        });
+
+        // exit(acc'): print(lane0 + lane3) ; return 0
+        b.switch_to(exit_blk);
+        let l0 = b.build(MirType::F32, Op::ExtractLane(acc_out, 0));
+        let l3 = b.build(MirType::F32, Op::ExtractLane(acc_out, 3));
+        let s = b.build(MirType::F32, Op::Bin(BinOp::FAdd, l0, l3));
+        b.build_void(Op::Call {
+            func: interner.intern("print"),
+            args: vec![s],
+        });
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        b.ret(Some(zero));
+
+        let mut program = Program::new();
+        program.funcs.push(b.finish());
+        let errs = wukong_mir::verify::verify_program(&program);
+        assert!(errs.is_empty(), "the SIMD-edge probe MIR must verify: {errs:?}");
+
+        let entry = interner.intern("main");
+        let ptx = emit_ptx(&program, entry, &interner)
+            .expect("a vector block param must lower, not decline");
+        assert!(ptx.is_ascii(), "PTX must stay ASCII");
+        // Two vector edges (loop back-edge and exit edge) x 4 lanes x (temp + param copy) = 16
+        // lane copies, plus the two `ExtractLane` reads.
+        assert!(
+            ptx.matches("mov.f32").count() >= 18,
+            "expected per-lane edge copies, found {} `mov.f32` in:\n{ptx}",
+            ptx.matches("mov.f32").count()
+        );
+        assert_eq!(
+            ptx.matches("add.rn.f32").count(),
+            5,
+            "expected 4 lane adds in the loop body + 1 scalar add in the epilogue in:\n{ptx}"
+        );
+    }
+
+    /// **The grid-stride loop takes its geometry from the launch, not from a literal** (Task 1.3).
+    ///
+    /// The occupancy discipline in this crate is that a device fact is probed or the process fails:
+    /// `Gpu::new` aborts on an unqueryable SM count (it used to fall back to a silent `20`, this
+    /// laptop's number, which is wrong-but-plausible on every other card) and `megakernel::plan_grid`
+    /// derives the grid from `cuOccupancyMaxActiveBlocksPerMultiprocessor x sm_count`. A lowering
+    /// that hardcoded `256` threads would sit *underneath* all of that and silently visit a fraction
+    /// of the domain the moment the launch geometry changed — including the existing
+    /// `WUKONG_MEGA_GRID` sweep and the grid-parallel ABI this module already emits for the barrier
+    /// probe.
+    ///
+    /// So the index and stride must be read out of `%tid.x`/`%ctaid.x` and `%ntid.x`/`%nctaid.x`, and
+    /// the emitted preamble is checked to carry no thread- or SM-count immediate. Device-free: it
+    /// reads the text.
+    #[test]
+    fn grid_stride_geometry_comes_from_the_launch() {
+        const SRC: &str = r#"module gate_par
+@parallel
+fn main() -> i32 {
+    let mut x: [f32; 512] = [0.0; 512];
+    let mut y: [f32; 512] = [0.0; 512];
+    for i in 0..512 { x[i] = (i as f32) * 2.0; }
+    for i in 0..512 {
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }
+    print(y[511] as i32);
+    return 0;
+}
+"#;
+        let (program, mut interner) = build(SRC, 2).expect("the @parallel probe must compile");
+        let entry = interner.intern("main");
+        let ptx = emit_mega_ptx(&program, entry, &interner)
+            .expect("a generic @parallel region must lower in mega mode");
+        assert!(ptx.is_ascii(), "PTX must stay ASCII");
+
+        for reg in ["%tid.x", "%ntid.x", "%ctaid.x", "%nctaid.x"] {
+            assert!(
+                ptx.contains(reg),
+                "the grid-stride index/stride must be derived from {reg} in:\n{ptx}"
+            );
+        }
+        // The stride preamble: the grid-stride emitter's own geometry reads, i.e. from the LAST
+        // `%tid.x` before the loop label (the mega preamble reads one too, for the `tid==0` guard).
+        let to = ptx.find("PFOR").expect("the grid-stride loop label");
+        let from = ptx[..to].rfind("%tid.x").expect("a geometry read");
+        let pre = &ptx[from..to];
+        assert!(
+            pre.contains("%nctaid.x"),
+            "the stride must span the whole GRID (blockDim x gridDim), not one CTA:\n{pre}"
+        );
+        for lit in [
+            format!(", {};", crate::megakernel::MEGA_BLOCK),
+            ", 20;".to_string(),
+        ] {
+            assert!(
+                !pre.contains(&lit),
+                "the grid-stride preamble carries the immediate `{lit}`, i.e. a launch-geometry \
+                 literal. Read it from the launch (%ntid.x / %nctaid.x) — a baked-in thread or SM \
+                 count visits a fraction of the domain as soon as the launch changes:\n{pre}"
+            );
         }
     }
 
@@ -4445,7 +5114,21 @@ fn main() -> i32 {
     /// two cards now agree on one constant. The remaining 122 declines are honest `UNSUPPORTED`,
     /// dominated by not-yet-lowered `wukong_*` runtime kernel calls. Raise this whenever coverage
     /// grows; lower it ONLY in the same commit as the intentional decline, and say why here.
-    const RUN_CORPUS_COVERAGE_FLOOR: usize = 235;
+    ///
+    /// **2026-08-13, raised 235 -> 256** (RTX 4050 / Windows, same box and the same
+    /// three-way agreement: this device gate reads 256, the device-free sweep above reads 256
+    /// lowerable, and the host-native re-sweep still attributes its whole delta to the host CPU
+    /// vectorizer). +17 over the 239 the branch point measured on a 361-program corpus, from Phase 1
+    /// SIMD lowering: `Op::ExtractLane` and vector block params were the last two portable-SIMD
+    /// holes, and a vectorized function that hit either skipped the device entirely. One of the +17
+    /// is `lang_parallel_saxpy`, added in the same series. The remaining 106 declines are honest
+    /// `UNSUPPORTED` — still dominated by not-yet-lowered `wukong_*` kernels, plus `GlobalAddr`
+    /// (string data), `wukong_rt_alloc` (heap) and `print_u`.
+    ///
+    /// **256 -> 257** in the same series, when `lang_parallel_int_regions` was added: an i64
+    /// `@parallel` fixture, which lowers on Win64 in the default host mode because the 256-bit
+    /// raw-AVX2 recipe is f32-only. 257 of 363 on the device gate and 257 lowerable device-free.
+    const RUN_CORPUS_COVERAGE_FLOOR: usize = 258;
 
     /// The corpus directory both coverage gates and the invariance gate below sweep.
     fn corpus_files() -> Vec<PathBuf> {

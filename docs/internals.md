@@ -923,6 +923,33 @@ one block of `MEGA_BLOCK` (256) threads, with the alloca frame in one shared `.g
 effects `tid == 0`-guarded. `WUKONG_GPU_NO_MEGA=1` forces the single-thread path for A/B timing and
 debugging.
 
+Two things the backend used to leave on the floor now reach the device. **Vectorized MIR** is lowered
+by scalarizing each `<N x T>` value into one register per lane — `Splat` aliases a scalar across the
+lanes, `Iota` materializes lane *k* as the constant *k*, `ExtractLane` copies one lane register back
+out as a scalar, and a vector block param (a loop-carried SIMD accumulator) gets its lane registers
+pre-assigned so the edge that writes it can copy lane by lane. The other vectorizer output,
+`Op::VecKernelCall`, stays a decline: it is a raw-AVX2 Win64 microkernel recipe with no PTX
+analogue, and it is also why the corpus sweeps normalize their MIR (see the coverage note below).
+**`wukong_parallel_for`** — the `@parallel` outliner's runtime call — lowers in mega mode as a
+grid-stride loop: iteration *i* runs on the thread with flat id `i mod (blockDim·gridDim)` as the
+one-iteration chunk `F(i, i+1, ctx)`, with a uniform trip count and an empty range on the tail so the
+loop stays convergent and the call stays `call.uni`. Per-iteration chunks rather than one contiguous
+range per thread is a coalescing choice: adjacent lanes then touch adjacent elements. Any partition
+is legal because `wukong_mir_build` only emits the op after proving the iterations independent, which
+is the same fact that lets the CPU runtime pick chunk boundaries from the core count; what that proof
+does *not* cover is side effects, so `fusion::analyze` declines an outlined body containing
+`print`/`println` (one record per thread instead of one per iteration) while allowing `assert`, whose
+flag store is idempotent. On the **single-thread** path `wukong_parallel_for` keeps its sequential
+`F(0, n, ctx)` chunk — that kernel is launched with one thread, so there is nothing to hand the
+iterations to, and it stays the reference every mega run is compared against. Both lowerings need
+`-O1` or better in practice, not because of the ops: at `-O0` the entry's loop counters still live in
+allocas, so a loop condition branches on a `Load` and the data-independent-control-flow gate declines
+the program before either op is considered. And the grid-stride form is reached only when the
+`@parallel` region is in the **entry** function: eligibility rejects an entry that calls a user
+function, so the common `@parallel fn saxpy(..)` called from `main` still runs the sequential chunk.
+Lifting that means giving callees the mega thread discipline (their stores would need the `tid == 0`
+guard the entry's have), which is a design change rather than another arm.
+
 A **cooperative multi-CTA launch path** exists beside that single-block form, because "the whole
 program in one kernel" on a one-CTA grid is a statement about one SM rather than about the machine —
 which matters little on a 20-SM laptop and makes the result meaningless on a 132-SM part. The launch

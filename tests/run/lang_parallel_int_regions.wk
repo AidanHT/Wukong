@@ -1,0 +1,88 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 9
+// EXPECT-OUT: 15
+// EXPECT-OUT: 23
+// EXPECT-OUT: 36
+// EXPECT-OUT: 48
+// EXPECT-OUT: 62
+// EXPECT-OUT: 81
+// EXPECT-OUT: 99
+// EXPECT-OUT: 119
+// EXPECT-OUT: 144
+// EXPECT-OUT: 168
+// EXPECT-OUT: 194
+// EXPECT-OUT: 225
+// EXPECT-OUT: 255
+// EXPECT-OUT: 287
+// EXPECT-OUT: 324
+// EXPECT-OUT: 360
+// EXPECT-OUT: 398
+// EXPECT-OUT: 441
+// EXPECT-OUT: 483
+// EXPECT-OUT: 527
+// EXPECT-OUT: 576
+// EXPECT-OUT: 100
+// EXPECT-OUT: 102
+// EXPECT-OUT: 109
+// EXPECT-OUT: 115
+// EXPECT-OUT: 123
+// EXPECT-OUT: 136
+// EXPECT-OUT: 148
+// EXPECT-OUT: 162
+// EXPECT-OUT: 181
+// EXPECT-OUT: 199
+// EXPECT-OUT: 219
+// EXPECT-OUT: 244
+// EXPECT-OUT: 268
+// EXPECT-OUT: 294
+// EXPECT-OUT: 325
+// EXPECT-OUT: 355
+// EXPECT-OUT: 387
+// EXPECT-OUT: 424
+// EXPECT-OUT: 460
+// EXPECT-OUT: 498
+// EXPECT-OUT: 541
+// EXPECT-OUT: 583
+// EXPECT-OUT: 627
+// EXPECT-OUT: 676
+module tests.run.lang_parallel_int_regions
+
+// TWO `@parallel` regions in one entry function, over i64 rather than f32, and the second one writes
+// a STRIDED slice (`b[i*2]`). Three things that distinguishes it from lang_parallel_saxpy.wk:
+//
+//  * two regions means the grid-stride lowering is emitted twice in one kernel, so its labels and
+//    registers must not collide (a shared label would be a duplicate-symbol PTX load failure, and a
+//    shared index register would silently make the second region iterate from where the first left
+//    off — which is the kind of aliasing bug that a one-region fixture can never see);
+//  * a strided write is a different index pattern through the same lowering, and it is the pattern
+//    where "some indices visited twice, others never" would still leave a plausible-looking buffer;
+//  * INTEGERS, so `mir_build`'s 256-bit raw-AVX2 recipe (f32-only) never fires. That makes this the
+//    `@parallel` fixture that reaches `--backend=gpu-native` on Win64 in the DEFAULT host mode,
+//    without `WUKONG_P4_NO_256=1` — and integer output is compared bit-exactly, not within the
+//    CPU<->GPU float tolerance.
+//
+// Every lane of both arrays is printed. Expected values are the scalar semantics computed by hand:
+// with v = i+1, a[i] = v*v - (v % 3) and b[2i] = a[i] + 100, all exact in i64.
+
+@parallel
+fn main() -> i32 {
+    let mut a: [i64; 24] = [0; 24];
+    let mut b: [i64; 48] = [0; 48];
+    for i in 0..24 {
+        let v = (i as i64) + 1;
+        a[i] = v * v - (v % 3);
+    }
+    for i in 0..24 {
+        b[i * 2] = a[i] + 100;
+    }
+    for i in 0..24 {
+        print(a[i]);
+    }
+    for i in 0..24 {
+        print(b[i * 2]);
+    }
+    return 0;
+}

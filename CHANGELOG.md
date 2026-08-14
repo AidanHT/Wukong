@@ -76,6 +76,36 @@ end-to-end by `crates/wukongc/tests/fail.rs::shape_diagnostics_name_the_dim_in_j
 
 - Added the Phase 0 comparison corpus and `@generic` few-shot loops as a reproducible language ruler, without recording a performance result.
 
+### gpu-native lowers portable SIMD MIR and runs `@parallel` grid-stride
+Two things the general MIR→PTX backend received and dropped: the CPU loop vectorizer's portable SIMD
+MIR, and `@parallel`'s `wukong_parallel_for` outline. Both are now lowered — and this is a *lowering*
+change, not a new named PTX family: no `ptx_*.rs` was added or touched, no recognizer arm exists for
+either, and `--emit=mir` of the fixtures shows no `wukong_*` kernel call.
+
+- **Portable SIMD reaches the device.** `Op::ExtractLane` and vector block params were the two
+  remaining holes — the first is how a vectorized reduction epilogue reads its lanes, the second is
+  how a loop carries a SIMD accumulator — so a function hitting either declined and skipped the GPU
+  entirely. `Op::VecKernelCall` (the raw-AVX2 Win64 microkernel recipe) stays declined by design; on
+  Windows it is still what claims most f32 elementwise loops before the GPU sees them, which is why
+  the corpus sweeps normalize their MIR and why a `@parallel` elementwise fixture needs
+  `WUKONG_P4_NO_256=1` here to reach gpu-native at all.
+- **`@parallel` runs as a grid-stride loop** inside the cooperative megakernel: iteration `i` on the
+  thread with flat id `i mod (blockDim·gridDim)`, per-iteration chunks so adjacent lanes touch
+  adjacent elements, uniform trip count, empty range on the tail. `fusion::analyze` admits the
+  outline as cooperative work; it declines one whose body prints, because the body is called by every
+  thread and a `print` there would produce one line per thread instead of one per iteration. The
+  single-thread path deliberately keeps its sequential `F(0, n)` chunk: that kernel is launched with
+  one thread, and it stays the correctness reference.
+- **Corpus coverage 239 → 257 of 363 programs** matching the interpreter oracle, and the megakernel
+  105 ran / 111 eligible configs (was 94 / 107), both floors ratcheted in the same commits. Zero
+  mismatches, zero faults. Two new fixtures carry the generic path: `lang_parallel_saxpy` (f32, every
+  lane printed) and `lang_parallel_int_regions` (i64, two regions in one entry, one of them writing a
+  strided slice — and the one that reaches gpu-native on Win64 without `WUKONG_P4_NO_256`).
+- **No speed claim, and none is in `BENCHMARKS.md`.** Nothing here was timed: a `.wk` elementwise
+  kernel through this path may well still be slower than the same program on the native CPU backend,
+  and it is certainly slower than the recognized `wukong_velem` GPU kernel it deliberately avoids.
+  What is established is that the generic path *runs* and agrees with the oracle lane by lane.
+
 ### GPU (Hopper `wgmma`) — the shipped dispatch rule is now wave 3's per-shape dispatcher
 Wave 3's four schedule levers (grouped raster, persistent CTAs, per-shape tile dispatch, mainloop
 drain) landed on 2026-08-12 and the H100 visit of the same day measured them as sweep **arms**. They

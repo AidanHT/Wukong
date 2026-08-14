@@ -25,7 +25,7 @@ loop nest the compiler may recognize and lower. On CPU that means tuned `wukong_
 microkernels behind the scenes; on GPU, `--backend=gpu` offloads five recognized kernel hooks
 (`sgemm_nt`, `vmath`, `norm`, `sreduce`, `sgemm_nt_epi` on `wukong_interp::Accelerator` /
 `GpuAccel` in `wukong_driver`), while `--backend=gpu-native` lowers MIR→PTX for a growing subset of
-programs (~235/357 `tests/run` fixtures today — naive helpers, no tensor cores). Flash attention,
+programs (257/363 `tests/run` fixtures today — naive helpers, no tensor cores). Flash attention,
 conv, and serving benchmarks in the tree are Rust launchers, not `.wk` programs.
 
 ```sh

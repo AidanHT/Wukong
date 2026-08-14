@@ -675,7 +675,24 @@ of truncating mod 2^w (`float_cast_narrow`: `300.0 as u8 == 255`, `-300.0 as i8 
 megakernel stores pointer values homed in the shared frame **unconditionally** rather than
 `tid==0`-guarded — a frame pointer slot is uniform across the SPMD threads, and the old guard left
 threads ≠ 0 loading a zero-initialized slot and dereferencing null in non-recognized scalar loops
-(the `tensor_1d_kernels@O3` `CUDA_ERROR_ILLEGAL_ADDRESS`). Corpus standing is printed by the gates
+(the `tensor_1d_kernels@O3` `CUDA_ERROR_ILLEGAL_ADDRESS`).
+
+Two further gaps closed on 2026-08-13, and both are *generic lowering* rather than new kernels — no
+`ptx_*.rs` family and no recognizer arm is involved. **Portable SIMD MIR lowers** (lane-scalarized:
+`Splat`, `Iota`, `ExtractLane`, lane-wise arithmetic and loads/stores, and vector block params so a
+loop can carry a SIMD accumulator), which is what a vectorized function needed to reach the device at
+all; `Op::VecKernelCall`, the raw-AVX2 Win64 recipe, is still declined by design. And **`@parallel`
+runs grid-stride** in the megakernel — iteration `i` on the thread with flat id
+`i mod (blockDim·gridDim)`, per-iteration chunks so adjacent lanes touch adjacent elements — instead
+of being declined there and run as one sequential chunk. An outlined body that *prints* still declines
+(it is called by every thread, so a record would be appended per thread, not per iteration); the
+single-thread path still runs the sequential chunk, since that kernel is launched with one thread.
+Both need `-O1`+ in practice, because at `-O0` a loop condition reads a counter out of an alloca and
+the data-independent-control-flow gate declines the program first. Nothing here has been **timed**: a
+generic `.wk` elementwise kernel on this path may still lose to the native CPU backend, and certainly
+loses to the recognized `wukong_velem` GPU kernel it avoids by construction.
+
+Corpus standing is printed by the gates
 themselves, over every fixture in `tests/run` (357 today — `ls tests/run/*.wk | wc -l`;
 this line has gone stale before): `lower::tests::run_corpus_matches_interp_oracle`
 sweeps each program at `-O0` and `-O3`, requires zero mismatches and zero device faults and non-zero
