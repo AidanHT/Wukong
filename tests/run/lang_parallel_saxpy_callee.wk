@@ -1,0 +1,45 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 12
+// EXPECT-OUT: 19
+// EXPECT-OUT: 28
+// EXPECT-OUT: 39
+// EXPECT-OUT: 52
+// EXPECT-OUT: 67
+// EXPECT-OUT: 84
+// EXPECT-OUT: 103
+// EXPECT-OUT: 124
+// EXPECT-OUT: 147
+// EXPECT-OUT: 172
+// EXPECT-OUT: 199
+// EXPECT-OUT: 228
+module tests.run.lang_parallel_saxpy_callee
+
+// Same elementwise body as lang_parallel_saxpy.wk, but the `@parallel` region lives in a callee
+// called from `main` — the shape most tests/run/parallel_*.wk use. Until Phase 1.2b the callee was
+// lowered single-thread inside the megakernel, so wukong_parallel_for ran F(0,n) on every SPMD
+// thread instead of grid-stride. Every lane is printed (never a sum).
+
+@parallel
+fn saxpy(mut x: [f32; 16], mut y: [f32; 16]) {
+    for i in 0..16 {
+        x[i] = (i as f32) * 2.0;
+    }
+    for i in 0..16 {
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut y: [f32; 16] = [0.0; 16];
+    saxpy(x, y);
+    for i in 0..16 {
+        print(y[i] as i32);
+    }
+    return 0;
+}
