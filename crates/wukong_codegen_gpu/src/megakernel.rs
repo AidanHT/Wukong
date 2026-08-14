@@ -642,9 +642,10 @@ pub(crate) mod tests {
     /// grew only 107 -> 110, so most of the +10 is configs that were already eligible and declining
     /// at emission: the gap between `eligible` and `ran` closed from 13 to 6.
     ///
-    /// **104 -> 105** in the same series, when `lang_parallel_int_regions` was added: **105 ran / 111
-    /// eligible**, 101 mega-lowerable host-native, so the attribution is unchanged.
-    pub(crate) const MEGA_CORPUS_COVERAGE_FLOOR: usize = 105;
+    /// **105 -> 107** when `lang_parallel_saxpy_callee` landed and `@parallel` callees became
+    /// megakernel-eligible at -O0 (heads_par no longer declines because the callee carries
+    /// `wukong_parallel_for`): **107 ran / 113 eligible**, 103 mega-lowerable host-native.
+    pub(crate) const MEGA_CORPUS_COVERAGE_FLOOR: usize = 107;
 
     /// Every **megakernel-eligible** `tests/run` program, run through the cooperative megakernel,
     /// matches the interpreter oracle (tolerance for floats, exact otherwise) at both -O0 and -O3.
@@ -992,6 +993,82 @@ fn main() -> i32 {{
              ({MEGA_BLOCK} threads/CTA, {} trips, ragged tail of {})",
             N.div_ceil(MEGA_BLOCK as usize),
             N % MEGA_BLOCK as usize,
+        );
+    }
+
+    /// Same gate as [`mega_generic_parallel_matches_single_and_oracle`], but the `@parallel` region
+    /// lives in a callee (`saxpy`) called from `main` — the shape most of `tests/run/parallel_*.wk`
+    /// use. Until Phase 1.2b the callee was lowered single-thread, so `wukong_parallel_for` inside
+    /// it ran the sequential chunk on every SPMD thread instead of grid-stride.
+    #[test]
+    fn mega_generic_parallel_callee_matches_single_and_oracle() {
+        const N: usize = 600;
+        let src = format!(
+            r#"module mega_generic_par_callee
+@parallel
+fn saxpy(mut x: [f32; {N}], mut y: [f32; {N}]) {{
+    for i in 0..{N} {{ x[i] = (i as f32) * 2.0; }}
+    for i in 0..{N} {{
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }}
+}}
+fn main() -> i32 {{
+    let mut x: [f32; {N}] = [0.0; {N}];
+    let mut y: [f32; {N}] = [0.0; {N}];
+    saxpy(x, y);
+    for i in 0..{N} {{ print(y[i] as i32); }}
+    return 0;
+}}
+"#
+        );
+        let (program, mut interner) = build(&src, 2).expect("frontend ok");
+        let entry = interner.intern("main");
+        let plan = crate::fusion::analyze(&program, entry, &interner);
+        assert!(
+            plan.eligible,
+            "a generic @parallel callee must be megakernel-eligible, got: {}",
+            plan.reason
+        );
+        assert!(
+            plan.coop_ops
+                .iter()
+                .any(|c| c.kind == crate::fusion::CoopKind::ParallelFor),
+            "expected a ParallelFor coop op, got {:?}",
+            plan.coop_ops.iter().map(|c| c.kind).collect::<Vec<_>>()
+        );
+        let oracle = wukong_interp::run_with_output(&program, entry, &interner).expect("interp");
+        if crate::gpu::gpu().is_none() {
+            crate::diff::skip_or_fail(
+                "mega_generic_parallel_callee_matches_single_and_oracle",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
+            return;
+        }
+        let mega = try_run(&program, entry, &interner)
+            .expect("mega run")
+            .expect("mega eligible");
+        let single = lower::jit_run_single(&program, entry, &interner).expect("single run");
+        assert_eq!(mega.0, single.0, "exit codes differ");
+        assert_eq!(
+            String::from_utf8_lossy(&mega.1),
+            String::from_utf8_lossy(&single.1),
+            "cooperative and single-thread output differ"
+        );
+        assert!(
+            outputs_match(&mega.1, &oracle.1),
+            "mega vs interpreter oracle differ:\nmega:   {}\noracle: {}",
+            String::from_utf8_lossy(&mega.1).trim(),
+            String::from_utf8_lossy(&oracle.1).trim()
+        );
+        let ptx = lower::emit_mega_ptx(&program, entry, &interner).expect("mega ptx");
+        assert!(ptx.is_ascii(), "PTX must stay ASCII");
+        assert!(
+            ptx.contains("%ntid.x") && ptx.contains("%nctaid.x"),
+            "callee grid-stride must read launch geometry, not a literal"
+        );
+        eprintln!(
+            "[gate] generic @parallel callee grid-stride == single == oracle over {N} lanes"
         );
     }
 
