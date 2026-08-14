@@ -1,0 +1,39 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+module tests.run.lang_generic_copy
+
+// `@generic` streaming copy — peer for coalesced vector loads on gpu-native (not a named kernel).
+// Every lane printed; expected values are scalar loop semantics (src[i] copied to dst[i]).
+
+@generic
+fn copy_generic(src: [f32; 8], mut dst: [f32; 8]) {
+    for i in 0..8 {
+        dst[i] = src[i];
+    }
+}
+
+fn copy_recognized(src: [f32; 8], mut dst: [f32; 8]) {
+    for i in 0..8 {
+        dst[i] = src[i];
+    }
+}
+
+fn main() -> i32 {
+    let src: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let mut g: [f32; 8] = [0.0; 8];
+    let mut r: [f32; 8] = [0.0; 8];
+    copy_generic(src, g);
+    copy_recognized(src, r);
+    for i in 0..8 {
+        print(g[i] as i32);
+    }
+    return 0;
+}
