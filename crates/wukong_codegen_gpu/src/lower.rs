@@ -62,7 +62,7 @@
 //! gate below runs on this box's Ada card, where either over-declaration would JIT perfectly.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
@@ -448,6 +448,12 @@ struct FnEmit<'a> {
     frame_off: HashMap<u32, u64>,
     frame_bytes: u64,
     frame_base: String,
+    /// User `shared [T; N]` slots: byte offset within the static `.shared` frame.
+    shared_off: HashMap<u32, u64>,
+    shared_bytes: u64,
+    shared_base: String,
+    /// ValueIds whose pointer originates in shared memory (alloca or gep off shared).
+    shared_ptrs: HashSet<u32>,
     // The cvta'd-to-global context-buffer base register (print/assert/exit live here).
     ctx_reg: String,
 
@@ -490,6 +496,10 @@ impl<'a> FnEmit<'a> {
             frame_off: HashMap::new(),
             frame_bytes: 0,
             frame_base: String::new(),
+            shared_off: HashMap::new(),
+            shared_bytes: 0,
+            shared_base: String::new(),
+            shared_ptrs: HashSet::new(),
             ctx_reg: String::new(),
             mega: false,
             tid0: String::new(),
@@ -504,6 +514,13 @@ impl<'a> FnEmit<'a> {
         e.write_reg_decls(&mut out);
         if e.frame_bytes > 0 {
             let _ = writeln!(out, "    .local .align 8 .b8 __frame[{}];", e.frame_bytes);
+        }
+        if e.shared_bytes > 0 {
+            let _ = writeln!(
+                out,
+                "    .shared .align 8 .b8 __user_smem[{}];",
+                e.shared_bytes
+            );
         }
         out.push_str(&e.body);
         out.push_str("}\n");
@@ -540,6 +557,10 @@ impl<'a> FnEmit<'a> {
             frame_off: HashMap::new(),
             frame_bytes: 0,
             frame_base: String::new(),
+            shared_off: HashMap::new(),
+            shared_bytes: 0,
+            shared_base: String::new(),
+            shared_ptrs: HashSet::new(),
             ctx_reg: String::new(),
             mega: true,
             tid0: String::new(),
@@ -644,22 +665,36 @@ impl<'a> FnEmit<'a> {
 
     // --- stack frame ---
 
-    /// Pre-scan all allocas and assign each a (8-aligned) byte offset within one `.local` frame.
+    /// Pre-scan all allocas and assign byte offsets within the `.local` and `.shared` frames.
     fn assign_frame(&mut self) {
         let mut off = 0u64;
+        let mut sh_off = 0u64;
         for b in &self.func.blocks {
             for inst in &b.insts {
-                if let Op::Alloca(ty) = &inst.op {
+                if let Op::Alloca { ty, space } = &inst.op {
                     if let Some(r) = inst.result {
                         let sz = size_of(ty).max(1);
-                        let slot = sz.div_ceil(8) * 8; // round up to 8
-                        self.frame_off.insert(r.0, off);
-                        off += slot;
+                        let slot = sz.div_ceil(8) * 8;
+                        match space {
+                            wukong_mir::AddrSpace::Local => {
+                                self.frame_off.insert(r.0, off);
+                                off += slot;
+                            }
+                            wukong_mir::AddrSpace::Shared => {
+                                self.shared_off.insert(r.0, sh_off);
+                                sh_off += slot;
+                            }
+                        }
                     }
                 }
             }
         }
         self.frame_bytes = off;
+        self.shared_bytes = sh_off;
+    }
+
+    fn is_shared_ptr(&self, v: ValueId) -> bool {
+        self.shared_ptrs.contains(&v.0)
     }
 
     // --- translation ---
@@ -676,6 +711,13 @@ impl<'a> FnEmit<'a> {
             self.frame_base = self.fresh(RC::Rd);
             self.emit(&format!("mov.u64 {loc}, __frame;"));
             self.emit(&format!("cvta.local.u64 {}, {loc};", self.frame_base));
+        }
+
+        if self.shared_bytes > 0 {
+            let smem = self.fresh(RC::Rd);
+            self.shared_base = self.fresh(RC::Rd);
+            self.emit(&format!("mov.u64 {smem}, __user_smem;"));
+            self.emit(&format!("cvta.shared.u64 {}, {smem};", self.shared_base));
         }
 
         let params: Vec<ValueId> = self.func.params.clone();
@@ -736,6 +778,10 @@ impl<'a> FnEmit<'a> {
         // Result-less ops first.
         match &inst.op {
             Op::Store { ptr, value } => return self.lower_store(*ptr, *value),
+            Op::Barrier => {
+                self.emit("bar.sync 0;");
+                return Ok(());
+            }
             Op::Call { func, args } => return self.lower_call(*func, args, inst.result),
             // A raw-AVX2 CPU microkernel call (the general 256-bit loop vectorizer's `VecKernelCall`)
             // has no PTX analog; report it UNSUPPORTED so the coverage gate skips this function.
@@ -795,14 +841,28 @@ impl<'a> FnEmit<'a> {
             }
             Op::Cast(kind, v, to) => self.lower_cast(*kind, *v, to, r)?,
             Op::Select(c, a, b) => self.lower_select(*c, *a, *b, &rty, r),
-            Op::Alloca(_) => {
-                let off = *self.frame_off.get(&r.0).expect("alloca offset");
-                let base = self.frame_base.clone();
+            Op::Alloca { ty: _, space } => {
                 let d = self.reg(r);
-                if off == 0 {
-                    self.emit(&format!("mov.b64 {d}, {base};"));
-                } else {
-                    self.emit(&format!("add.s64 {d}, {base}, {off};"));
+                match space {
+                    wukong_mir::AddrSpace::Local => {
+                        let off = *self.frame_off.get(&r.0).expect("alloca offset");
+                        let base = self.frame_base.clone();
+                        if off == 0 {
+                            self.emit(&format!("mov.b64 {d}, {base};"));
+                        } else {
+                            self.emit(&format!("add.s64 {d}, {base}, {off};"));
+                        }
+                    }
+                    wukong_mir::AddrSpace::Shared => {
+                        let off = *self.shared_off.get(&r.0).expect("shared alloca offset");
+                        let base = self.shared_base.clone();
+                        if off == 0 {
+                            self.emit(&format!("mov.b64 {d}, {base};"));
+                        } else {
+                            self.emit(&format!("add.s64 {d}, {base}, {off};"));
+                        }
+                        self.shared_ptrs.insert(r.0);
+                    }
                 }
             }
             Op::Load(p, ty) => self.lower_load(*p, ty, r)?,
@@ -813,6 +873,9 @@ impl<'a> FnEmit<'a> {
                 let d = self.reg(r);
                 self.emit(&format!("mul.lo.s64 {off}, {idx}, {};", size_of(elem)));
                 self.emit(&format!("add.s64 {d}, {base}, {off};"));
+                if self.is_shared_ptr(*ptr) {
+                    self.shared_ptrs.insert(r.0);
+                }
             }
             Op::Fma(a, b, c) => {
                 let rc = rc_of(&rty);
@@ -861,7 +924,7 @@ impl<'a> FnEmit<'a> {
                     "{UNSUPPORTED} `GlobalAddr` (static string data) not lowered to PTX"
                 ));
             }
-            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } => {
+            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier => {
                 unreachable!("handled above")
             }
         }
@@ -1327,11 +1390,18 @@ impl<'a> FnEmit<'a> {
     fn lower_load(&mut self, p: ValueId, ty: &MirType, res: ValueId) -> Result<(), String> {
         let addr = self.reg(p);
         let d = self.reg(res);
-        self.load_into(&d, &addr, ty)
+        self.load_into(&d, &addr, ty, self.is_shared_ptr(p))
     }
 
-    /// Load one (scalar or lane) value of MIR type `ty` from generic address `addr` into `d`.
-    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType) -> Result<(), String> {
+    /// Load one (scalar or lane) value of MIR type `ty` from address `addr` into `d`.
+    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType, shared: bool) -> Result<(), String> {
+        let ld = |op: &str| {
+            if shared {
+                format!("ld.shared.{op}")
+            } else {
+                format!("ld.{op}")
+            }
+        };
         match ty {
             // `i1` occupies ONE byte in memory (`size_of(I1) == 1`, and `Op::Gep` strides bools by 1),
             // exactly like Cranelift's `types::I8` mapping — so it must be accessed with `ld.u8`. A
@@ -1343,18 +1413,18 @@ impl<'a> FnEmit<'a> {
                 self.emit(&format!("cvt.u64.u32 {d}, {w};"));
                 self.mask_int(d, ty);
             }
-            MirType::F32 => self.emit(&format!("ld.f32 {d}, [{addr}];")),
-            MirType::F64 => self.emit(&format!("ld.f64 {d}, [{addr}];")),
-            MirType::I64 | MirType::Ptr => self.emit(&format!("ld.u64 {d}, [{addr}];")),
+            MirType::F32 => self.emit(&format!("{} {d}, [{addr}];", ld("f32"))),
+            MirType::F64 => self.emit(&format!("{} {d}, [{addr}];", ld("f64"))),
+            MirType::I64 | MirType::Ptr => self.emit(&format!("{} {d}, [{addr}];", ld("u64"))),
             // bf16/f16 storage is 2 bytes; load the 16 bits and widen to the f32 register.
             MirType::BF16 => {
                 let h = self.fresh_r16();
-                self.emit(&format!("ld.u16 {h}, [{addr}];"));
+                self.emit(&format!("{} {h}, [{addr}];", ld("u16")));
                 self.emit(&format!("cvt.f32.bf16 {d}, {h};"));
             }
             MirType::F16 => {
                 let h = self.fresh_r16();
-                self.emit(&format!("ld.u16 {h}, [{addr}];"));
+                self.emit(&format!("{} {h}, [{addr}];", ld("u16")));
                 self.emit(&format!("cvt.f32.f16 {d}, {h};"));
             }
             MirType::I8 => {
@@ -1399,12 +1469,12 @@ impl<'a> FnEmit<'a> {
                     self.emit(&format!("add.s64 {t}, {addr}, {};", i as u64 * esz));
                     t
                 };
-                self.store_into(&la, &lv, &elem)?;
+                self.store_into(&la, &lv, &elem, false)?;
             }
             return Ok(());
         }
         let v = self.reg(value);
-        self.store_into(&addr, &v, &vty)
+        self.store_into(&addr, &v, &vty, self.is_shared_ptr(ptr))
     }
 
     /// A store predicate prefix: in mega mode every store targets the *shared* frame, so only
@@ -1418,13 +1488,20 @@ impl<'a> FnEmit<'a> {
         }
     }
 
-    /// Store one (scalar or lane) value `v` of MIR type `ty` to generic address `addr`.
-    fn store_into(&mut self, addr: &str, v: &str, ty: &MirType) -> Result<(), String> {
+    /// Store one (scalar or lane) value `v` of MIR type `ty` to address `addr`.
+    fn store_into(&mut self, addr: &str, v: &str, ty: &MirType, shared: bool) -> Result<(), String> {
+        let st = |op: &str| {
+            if shared {
+                format!("st.shared.{op}")
+            } else {
+                format!("st.{op}")
+            }
+        };
         let g = self.st_guard();
         match ty {
-            MirType::F32 => self.emit(&format!("{g}st.f32 [{addr}], {v};")),
-            MirType::F64 => self.emit(&format!("{g}st.f64 [{addr}], {v};")),
-            MirType::I64 => self.emit(&format!("{g}st.u64 [{addr}], {v};")),
+            MirType::F32 => self.emit(&format!("{g}{} [{addr}], {v};", st("f32"))),
+            MirType::F64 => self.emit(&format!("{g}{} [{addr}], {v};", st("f64"))),
+            MirType::I64 => self.emit(&format!("{g}{} [{addr}], {v};", st("u64"))),
             // A pointer homed in the shared frame (an inlined function's Tensor/array param slot) is a
             // UNIFORM value across the SPMD threads — it is frame-base / kernel-param derived, never a
             // loaded, per-thread-varying value. It must be stored *unconditionally* (no `@tid0` guard):
@@ -1532,7 +1609,7 @@ impl<'a> FnEmit<'a> {
                 for i in 0..n {
                     let la = self.lane_addr(&addr, i, esz);
                     let d = self.fresh(lane_rc);
-                    self.load_into(&d, &la, &lane)?;
+                    self.load_into(&d, &la, &lane, false)?;
                     ls.push(d);
                 }
                 ls
@@ -4030,7 +4107,7 @@ pub fn mega_frame_bytes(func: &Function) -> u64 {
     let mut off = 0u64;
     for b in &func.blocks {
         for inst in &b.insts {
-            if let Op::Alloca(ty) = &inst.op {
+            if let Op::Alloca { ty: ty, space: wukong_mir::AddrSpace::Local } = &inst.op {
                 if inst.result.is_some() {
                     let sz = size_of(ty).max(1);
                     off += sz.div_ceil(8) * 8;

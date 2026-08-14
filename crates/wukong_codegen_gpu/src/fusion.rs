@@ -171,7 +171,8 @@ fn op_operands(op: &Op) -> Vec<ValueId> {
     match op {
         Op::ConstInt(..)
         | Op::ConstFloat(..)
-        | Op::Alloca(_)
+        | Op::Alloca { .. }
+        | Op::Barrier
         | Op::FuncAddr(_)
         | Op::GlobalAddr(_)
         | Op::Iota(_) => Vec::new(),
