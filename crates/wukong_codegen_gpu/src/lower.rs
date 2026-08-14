@@ -1,15 +1,5860 @@
-//! General **MIR -> PTX lowering** (Phase 4) GÇö the lever that turns GPU coverage from "a fixed//! recognizer kernel menu" into "the whole language."//!//! The existing `--backend=gpu` path is an *offloading interpreter*: it tree-walks the program on the//! CPU and only the recognized GEMM/vmath/norm/reduce calls ever reach the device. This module instead//! consumes **MIR directly** and emits a **PTX kernel** for the entry function (and a `.func` per other//! function), then driver-JIT-loads and launches it via the shared [`crate::gpu::Gpu`] harness GÇö so an//! *arbitrary* Wukong program runs on the GPU. It mirrors the Cranelift backend//! (`wukong_codegen_cranelift`): same `Backend` seam, same `jit_run(program, entry, interner) ->//! (exit_code, stdout)` shape, PTX virtual registers instead of CLIF SSA values. (The `Backend` impl//! below is the *declared* seam only GÇö nothing in the workspace calls `Backend::compile`;//! `wukong_driver::run_on_gpu_lower` calls [`jit_run`](crate::lower::jit_run) directly off its own//! `BackendKind::GpuLower`.)//!//! Mapping (the seams the prompt names)://! - **SSA values -> PTX virtual registers.** Integers/pointers live in 64-bit `%rd` registers kept//!   *sign-extended* and masked to the MIR width after each op (mirroring the interpreter's `i128`//!   value + `mask`); `f32` in `%f`, `f64` in `%fd`; predicates are ephemeral `%p`.//! - **Block params -> a register-passing convention.** Each block param gets a fixed register; every//!   branch edge copies its args into the target's param registers (through temporaries, so permuted//!   / self-referential edges are safe) and then `bra`s GÇö exactly the role Cranelift block params play.//! - **`CondBr` -> predicated `bra`.** `Br`/`CondBr`/`Ret`/`Unreachable` map to `bra`/`@p bra`/`ret`.//! - **`Alloca`/`Load`/`Store`/`Gep` -> local/global memory.** Allocas share one `.local` frame//!   (generic-addressed via `cvta.local`); loads/stores use generic `ld`/`st`, so the same code works//!   for stack locals and device-global tensor pointers.//! - **`print`/`println`/`assert` -> a device record buffer.** The kernel can't format on the host, so//!   it appends `(tag, payload)` records to a context buffer (atomic counter); the host replays them//!   with the *identical* `format!("{}\n")` the interpreter/Cranelift runtime uses GÇö byte-identical//!   integer output, tolerance-comparable float output.//!//! Recognized ops (matmul / vmath / norm / reduce / `@parallel`) *are* lowered here: `rt_helper` maps//! each recognized `wukong_*` runtime symbol GÇö and its `_parallel` twin GÇö to an `mrt_*` PTX `.func`//! reproducing the CPU microkernel's numeric contract as a naive single-thread device loop. The//! *cooperative* forms are emitted by `lower_call_mega` in mega mode, which [`crate::megakernel`]//! drives GÇö including `wukong_parallel_for(n, func_addr F, ctx)`, which lowers there as a//! **grid-stride loop** over the outlined body//! ([`emit_parallel_for_gridstride`](FnEmit::emit_parallel_for_gridstride)). On the single-thread//! path the same op stays the one sequential chunk `F(0, n, ctx)`: that kernel is launched with one//! thread, so there is no other thread to give the iterations to, and it remains the correctness//! reference every mega run is compared against.//!//! Vectorized (`<N x T>`) MIR is lowered by scalarizing each value into one register per lane//! (`lower_vec_inst`, plus lane-wise block-param edges), so the portable SIMD the CPU loop vectorizer//! emits reaches the device. `Op::VecKernelCall` GÇö the *other* vectorizer output, a raw-AVX2 Win64//! microkernel recipe GÇö has no PTX analogue and stays a decline.//! A symbol with no helper GÇö and an op code the helper does not implement GÇö returns a classifiable//! `UNSUPPORTED:` error so the coverage gate reports it honestly as not-yet-covered. The headline for//! this phase is **coverage measured against the interpreter oracle**, never an asserted speed.//!//! Correctness gate: a sweep of `tests/run/*.wk` run through this backend matches the interpreter//! oracle (integer/control-flow programs bit-exact; float programs within the CPU<->GPU tolerance) and//! `-O0` == `-O3` (see the `#[cfg(test)]` module). The existing offload path and the toolchain-free//! core stay byte-for-byte unchanged GÇö this path is purely additive.//!//! **Target floor.** Both modules this file emits GÇö [`emit_ptx`] (the per-entry kernel) and//! [`emit_mega_ptx`] (the cooperative megakernel [`crate::megakernel`] launches) GÇö open with//! [`crate::ptx_target::HDR_SM80`]. The whole instruction mix is generic scalar PTX that predates//! Ampere: `ld`/`st`, integer/float ALU, `bra`, `bar.sync`, `red.f32` and one `atom.global.add`.//! The emission tables contain no Ada-or-later token at all (the census greps them for the fp8//! converters, the Hopper-era async/warpgroup families and cluster-scoped sync, and find zero), so//! `sm_80` is the LOWEST legal target GÇö and PTX is forward-compatible only: an `sm_80` module//! driver-JITs on every later part, an `sm_89` one loads on zero A100s. `megakernel.rs` emits no//! header of its own, so these two `push_str` calls are the single floor for all gpu-native output.//!//! The header's `.version 7.8` is the **second** floor, on an independent axis: `.version` is a//! *driver* requirement the way `.target` is a *device* one, and `cuModuleLoadData` refuses a//! `.version 8.4` module on any driver below r550 (observed cloud fleets run r535/r545). The mix//! above needs nothing above ISA 7.0, so both floors are the crate's Ampere default. Both are pinned//! by `tests::gpu_native_modules_open_at_the_sm80_floor` GÇö a device-free gate, because the corpus//! gate below runs on this box's Ada card, where either over-declaration would JIT perfectly.use std::collections::hash_map::DefaultHasher;use std::collections::{HashMap, HashSet};use std::fmt::Write as _;use std::hash::{Hash, Hasher};use cudarc::driver::{LaunchConfig, PushKernelArg};use wukong_backend::{Artifact, Backend};use wukong_mir::{    BinOp, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, Terminator, ValueId,};use wukong_span::{Interner, Symbol};// --- Device context-buffer layout (u64 slots) -----------------------------------------------// [0] = record count (atomic), [1] = assert-failed flag, [2] = exit code (i64), [3] = reserved;// records start at slot 4, two u64 each: [tag, payload]. tag 0 = int (payload = i64 bits), 1 =// float (payload = f64 bits). Byte offsets are what the PTX uses.const CTX_COUNT_OFF: u64 = 0;const CTX_ASSERT_OFF: u64 = 8;const CTX_EXIT_OFF: u64 = 16;const CTX_RECORDS_OFF: u64 = 32;const RECORD_BYTES: u64 = 16;/// Capacity of the print-record buffer. Generous for the test corpus; overflow is *detected* (the/// atomic counter still advances) and surfaced as an error rather than silently corrupting memory.const RECORD_CAP: u64 = 1 << 16;/// The PTX name of the launched entry kernel (a thin `.visible .entry` wrapper).const KERNEL_NAME: &str = "wukong_kernel";/// The PTX name of the cooperative-megakernel entry (`megakernel.rs` launches a block of threads on/// it). Distinct from [`KERNEL_NAME`] so a program can have both lowerings cached side-by-side.pub const MEGA_KERNEL_NAME: &str = "wukong_mega";/// Prefix marking a *lowering decline* (an op/construct not yet handled) as opposed to a genuine/// JIT/launch failure GÇö the coverage gate treats the former as "not yet covered" (skip) and the/// latter as a hard failure.pub const UNSUPPORTED: &str = "UNSUPPORTED:";// ============================================================================================// Public API (mirrors `wukong_codegen_cranelift`)// ============================================================================================/// The general MIR->PTX GPU backend: lowers an arbitrary program to PTX, JITs it on the device, and/// runs `entry`, capturing stdout + the exit code into [`Artifact::Executed`] GÇö the same shape the/// interpreter and Cranelift produce, so the driver and differential gate treat all three alike.pub struct GpuLowerBackend;impl Backend for GpuLowerBackend {    fn name(&self) -> &'static str {        "gpu-lower"    }    fn compile(        &self,        program: &Program,        entry: Symbol,        interner: &Interner,    ) -> Result<Artifact, String> {        let (exit_code, stdout) = jit_run(program, entry, interner)?;        Ok(Artifact::Executed { exit_code, stdout })    }}/// Lower `program` to PTX, JIT it on the local CUDA device, run `entry`, and return its exit code and/// captured stdout GÇö the GPU-lowering counterpart to `wukong_codegen_cranelift::jit_run` and/// `wukong_interp::run_with_output`.pub fn jit_run(    program: &Program,    entry: Symbol,    interner: &Interner,) -> Result<(i64, Vec<u8>), String> {    let entry_fn = program        .function(entry)        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;    if !entry_fn.params.is_empty() {        return Err(format!(            "{UNSUPPORTED} gpu-native entry point `{}` must take no parameters",            interner.resolve(entry)        ));    }    // Fast path: an eligible program runs as the cooperative megakernel (whole program, one launch,    // recognized ops cooperative across the block). Anything it can't accelerate returns `Ok(None)`    // and falls through to the correct single-thread lowering below GÇö the universal reference. The    // `WUKONG_GPU_NO_MEGA` escape hatch forces the single-thread path (for A/B timing / debugging).    if std::env::var_os("WUKONG_GPU_NO_MEGA").is_none() {        if let Some(r) = crate::megakernel::try_run(program, entry, interner)? {            return Ok(r);        }    }    jit_run_single(program, entry, interner)}/// The single-thread lowering only GÇö bypasses the cooperative megakernel. This is the universal/// correctness reference (any program, any control flow) and the A/B baseline the megakernel speedup/// is measured against same-run. Public so benches can time the two paths back-to-back.pub fn jit_run_single(    program: &Program,    entry: Symbol,    interner: &Interner,) -> Result<(i64, Vec<u8>), String> {    let entry_fn = program        .function(entry)        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;    let ptx = emit_ptx(program, entry, interner)?;    let ret = entry_fn.ret.clone();    let mut guard = crate::gpu::gpu();    let g = guard.as_mut().ok_or_else(|| {        // The library name is per-OS (`nvcuda.dll` on Windows, `libcuda.so.1` on Linux) GÇö naming the        // wrong one sends the operator hunting for a file their box will never have. Resolved at run        // time through `baselines::cuda_driver_lib_name`, the single source of truth this message and        // `wukong_driver`'s `--backend=gpu` twin both read.        format!(            "`--backend=gpu-native` requires a CUDA device, but none was reachable (the driver \             dlopens `{}`; check the NVIDIA driver is installed)",            crate::baselines::cuda_driver_lib_name()        )    })?;    run_on_device(g, &ptx, &ret)}/// Emit the full PTX module for `program` with `entry` as the launched kernel. Public so tests and/// tooling can inspect the generated PTX (and so a future `--emit=ptx` can surface it).pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result<String, String> {    let entry_idx = program        .funcs        .iter()        .position(|f| f.name == entry)        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;    let mut func_idx: HashMap<Symbol, usize> = HashMap::new();    for (i, f) in program.funcs.iter().enumerate() {        func_idx.insert(f.name, i);    }    let mut out = String::new();    out.push_str(crate::ptx_target::HDR_SM80);    out.push('\n');    // Emit a device `.func` helper for each recognized runtime kernel the program calls (matmul /    // reduce / norm / int8 GEMM / elementwise). These reproduce the CPU microkernels' numeric    // contract as naive single-thread device loops, so the whole program runs on the GPU; the    // CPU<->GPU tolerance gate covers reduction-order / SFU differences. Emitted before the user    // functions that call them. (Recognized-op dispatch to the *tuned* launchers is a later phase.)    {        let mut seen = std::collections::HashSet::new();        let mut needs_fmod = false;        for f in &program.funcs {            for b in &f.blocks {                for (i, inst) in b.insts.iter().enumerate() {
+//! General **MIR -> PTX lowering** (Phase 4) â€” the lever that turns GPU coverage from "a fixed
+//! recognizer kernel menu" into "the whole language."
+//!
+//! The existing `--backend=gpu` path is an *offloading interpreter*: it tree-walks the program on the
+//! CPU and only the recognized GEMM/vmath/norm/reduce calls ever reach the device. This module instead
+//! consumes **MIR directly** and emits a **PTX kernel** for the entry function (and a `.func` per other
+//! function), then driver-JIT-loads and launches it via the shared [`crate::gpu::Gpu`] harness â€” so an
+//! *arbitrary* Wukong program runs on the GPU. It mirrors the Cranelift backend
+//! (`wukong_codegen_cranelift`): same `Backend` seam, same `jit_run(program, entry, interner) ->
+//! (exit_code, stdout)` shape, PTX virtual registers instead of CLIF SSA values. (The `Backend` impl
+//! below is the *declared* seam only â€” nothing in the workspace calls `Backend::compile`;
+//! `wukong_driver::run_on_gpu_lower` calls [`jit_run`](crate::lower::jit_run) directly off its own
+//! `BackendKind::GpuLower`.)
+//!
+//! Mapping (the seams the prompt names):
+//! - **SSA values -> PTX virtual registers.** Integers/pointers live in 64-bit `%rd` registers kept
+//!   *sign-extended* and masked to the MIR width after each op (mirroring the interpreter's `i128`
+//!   value + `mask`); `f32` in `%f`, `f64` in `%fd`; predicates are ephemeral `%p`.
+//! - **Block params -> a register-passing convention.** Each block param gets a fixed register; every
+//!   branch edge copies its args into the target's param registers (through temporaries, so permuted
+//!   / self-referential edges are safe) and then `bra`s â€” exactly the role Cranelift block params play.
+//! - **`CondBr` -> predicated `bra`.** `Br`/`CondBr`/`Ret`/`Unreachable` map to `bra`/`@p bra`/`ret`.
+//! - **`Alloca`/`Load`/`Store`/`Gep` -> local/global memory.** Allocas share one `.local` frame
+//!   (generic-addressed via `cvta.local`); loads/stores use generic `ld`/`st`, so the same code works
+//!   for stack locals and device-global tensor pointers.
+//! - **`print`/`println`/`assert` -> a device record buffer.** The kernel can't format on the host, so
+//!   it appends `(tag, payload)` records to a context buffer (atomic counter); the host replays them
+//!   with the *identical* `format!("{}\n")` the interpreter/Cranelift runtime uses â€” byte-identical
+//!   integer output, tolerance-comparable float output.
+//!
+//! Recognized ops (matmul / vmath / norm / reduce / `@parallel`) *are* lowered here: `rt_helper` maps
+//! each recognized `wukong_*` runtime symbol â€” and its `_parallel` twin â€” to an `mrt_*` PTX `.func`
+//! reproducing the CPU microkernel's numeric contract as a naive single-thread device loop. The
+//! *cooperative* forms are emitted by `lower_call_mega` in mega mode, which [`crate::megakernel`]
+//! drives â€” including `wukong_parallel_for(n, func_addr F, ctx)`, which lowers there as a
+//! **grid-stride loop** over the outlined body
+//! ([`emit_parallel_for_gridstride`](FnEmit::emit_parallel_for_gridstride)). On the single-thread
+//! path the same op stays the one sequential chunk `F(0, n, ctx)`: that kernel is launched with one
+//! thread, so there is no other thread to give the iterations to, and it remains the correctness
+//! reference every mega run is compared against.
+//!
+//! Vectorized (`<N x T>`) MIR is lowered by scalarizing each value into one register per lane
+//! (`lower_vec_inst`, plus lane-wise block-param edges), so the portable SIMD the CPU loop vectorizer
+//! emits reaches the device. `Op::VecKernelCall` â€” the *other* vectorizer output, a raw-AVX2 Win64
+//! microkernel recipe â€” has no PTX analogue and stays a decline.
+//! A symbol with no helper â€” and an op code the helper does not implement â€” returns a classifiable
+//! `UNSUPPORTED:` error so the coverage gate reports it honestly as not-yet-covered. The headline for
+//! this phase is **coverage measured against the interpreter oracle**, never an asserted speed.
+//!
+//! Correctness gate: a sweep of `tests/run/*.wk` run through this backend matches the interpreter
+//! oracle (integer/control-flow programs bit-exact; float programs within the CPU<->GPU tolerance) and
+//! `-O0` == `-O3` (see the `#[cfg(test)]` module). The existing offload path and the toolchain-free
+//! core stay byte-for-byte unchanged â€” this path is purely additive.
+//!
+//! **Target floor.** Both modules this file emits â€” [`emit_ptx`] (the per-entry kernel) and
+//! [`emit_mega_ptx`] (the cooperative megakernel [`crate::megakernel`] launches) â€” open with
+//! [`crate::ptx_target::HDR_SM80`]. The whole instruction mix is generic scalar PTX that predates
+//! Ampere: `ld`/`st`, integer/float ALU, `bra`, `bar.sync`, `red.f32` and one `atom.global.add`.
+//! The emission tables contain no Ada-or-later token at all (the census greps them for the fp8
+//! converters, the Hopper-era async/warpgroup families and cluster-scoped sync, and find zero), so
+//! `sm_80` is the LOWEST legal target â€” and PTX is forward-compatible only: an `sm_80` module
+//! driver-JITs on every later part, an `sm_89` one loads on zero A100s. `megakernel.rs` emits no
+//! header of its own, so these two `push_str` calls are the single floor for all gpu-native output.
+//!
+//! The header's `.version 7.8` is the **second** floor, on an independent axis: `.version` is a
+//! *driver* requirement the way `.target` is a *device* one, and `cuModuleLoadData` refuses a
+//! `.version 8.4` module on any driver below r550 (observed cloud fleets run r535/r545). The mix
+//! above needs nothing above ISA 7.0, so both floors are the crate's Ampere default. Both are pinned
+//! by `tests::gpu_native_modules_open_at_the_sm80_floor` â€” a device-free gate, because the corpus
+//! gate below runs on this box's Ada card, where either over-declaration would JIT perfectly.
+
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
+
+use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+use wukong_backend::{Artifact, Backend};
+use wukong_mir::{
+    BinOp, CastKind, CmpOp, Function, MirType, Op, Program, RoundMode, Terminator, ValueId,
+};
+use wukong_span::{Interner, Symbol};
+
+// --- Device context-buffer layout (u64 slots) -----------------------------------------------
+// [0] = record count (atomic), [1] = assert-failed flag, [2] = exit code (i64), [3] = reserved;
+// records start at slot 4, two u64 each: [tag, payload]. tag 0 = int (payload = i64 bits), 1 =
+// float (payload = f64 bits). Byte offsets are what the PTX uses.
+const CTX_COUNT_OFF: u64 = 0;
+const CTX_ASSERT_OFF: u64 = 8;
+const CTX_EXIT_OFF: u64 = 16;
+const CTX_RECORDS_OFF: u64 = 32;
+const RECORD_BYTES: u64 = 16;
+/// Capacity of the print-record buffer. Generous for the test corpus; overflow is *detected* (the
+/// atomic counter still advances) and surfaced as an error rather than silently corrupting memory.
+const RECORD_CAP: u64 = 1 << 16;
+
+/// The PTX name of the launched entry kernel (a thin `.visible .entry` wrapper).
+const KERNEL_NAME: &str = "wukong_kernel";
+
+/// The PTX name of the cooperative-megakernel entry (`megakernel.rs` launches a block of threads on
+/// it). Distinct from [`KERNEL_NAME`] so a program can have both lowerings cached side-by-side.
+pub const MEGA_KERNEL_NAME: &str = "wukong_mega";
+
+/// Prefix marking a *lowering decline* (an op/construct not yet handled) as opposed to a genuine
+/// JIT/launch failure â€” the coverage gate treats the former as "not yet covered" (skip) and the
+/// latter as a hard failure.
+pub const UNSUPPORTED: &str = "UNSUPPORTED:";
+
+// ============================================================================================
+// Public API (mirrors `wukong_codegen_cranelift`)
+// ============================================================================================
+
+/// The general MIR->PTX GPU backend: lowers an arbitrary program to PTX, JITs it on the device, and
+/// runs `entry`, capturing stdout + the exit code into [`Artifact::Executed`] â€” the same shape the
+/// interpreter and Cranelift produce, so the driver and differential gate treat all three alike.
+pub struct GpuLowerBackend;
+
+impl Backend for GpuLowerBackend {
+    fn name(&self) -> &'static str {
+        "gpu-lower"
+    }
+
+    fn compile(
+        &self,
+        program: &Program,
+        entry: Symbol,
+        interner: &Interner,
+    ) -> Result<Artifact, String> {
+        let (exit_code, stdout) = jit_run(program, entry, interner)?;
+        Ok(Artifact::Executed { exit_code, stdout })
+    }
+}
+
+/// Lower `program` to PTX, JIT it on the local CUDA device, run `entry`, and return its exit code and
+/// captured stdout â€” the GPU-lowering counterpart to `wukong_codegen_cranelift::jit_run` and
+/// `wukong_interp::run_with_output`.
+pub fn jit_run(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> Result<(i64, Vec<u8>), String> {
+    let entry_fn = program
+        .function(entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    if !entry_fn.params.is_empty() {
+        return Err(format!(
+            "{UNSUPPORTED} gpu-native entry point `{}` must take no parameters",
+            interner.resolve(entry)
+        ));
+    }
+
+    // Fast path: an eligible program runs as the cooperative megakernel (whole program, one launch,
+    // recognized ops cooperative across the block). Anything it can't accelerate returns `Ok(None)`
+    // and falls through to the correct single-thread lowering below â€” the universal reference. The
+    // `WUKONG_GPU_NO_MEGA` escape hatch forces the single-thread path (for A/B timing / debugging).
+    if std::env::var_os("WUKONG_GPU_NO_MEGA").is_none() {
+        if let Some(r) = crate::megakernel::try_run(program, entry, interner)? {
+            return Ok(r);
+        }
+    }
+
+    jit_run_single(program, entry, interner)
+}
+
+/// The single-thread lowering only â€” bypasses the cooperative megakernel. This is the universal
+/// correctness reference (any program, any control flow) and the A/B baseline the megakernel speedup
+/// is measured against same-run. Public so benches can time the two paths back-to-back.
+pub fn jit_run_single(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> Result<(i64, Vec<u8>), String> {
+    let entry_fn = program
+        .function(entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    let ptx = emit_ptx(program, entry, interner)?;
+    let ret = entry_fn.ret.clone();
+
+    let mut guard = crate::gpu::gpu();
+    let g = guard.as_mut().ok_or_else(|| {
+        // The library name is per-OS (`nvcuda.dll` on Windows, `libcuda.so.1` on Linux) â€” naming the
+        // wrong one sends the operator hunting for a file their box will never have. Resolved at run
+        // time through `baselines::cuda_driver_lib_name`, the single source of truth this message and
+        // `wukong_driver`'s `--backend=gpu` twin both read.
+        format!(
+            "`--backend=gpu-native` requires a CUDA device, but none was reachable (the driver \
+             dlopens `{}`; check the NVIDIA driver is installed)",
+            crate::baselines::cuda_driver_lib_name()
+        )
+    })?;
+    run_on_device(g, &ptx, &ret)
+}
+
+/// Emit the full PTX module for `program` with `entry` as the launched kernel. Public so tests and
+/// tooling can inspect the generated PTX (and so a future `--emit=ptx` can surface it).
+pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result<String, String> {
+    let entry_idx = program
+        .funcs
+        .iter()
+        .position(|f| f.name == entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+
+    let mut func_idx: HashMap<Symbol, usize> = HashMap::new();
+    for (i, f) in program.funcs.iter().enumerate() {
+        func_idx.insert(f.name, i);
+    }
+
+    let mut out = String::new();
+    out.push_str(crate::ptx_target::HDR_SM80);
+    out.push('\n');
+
+    // Emit a device `.func` helper for each recognized runtime kernel the program calls (matmul /
+    // reduce / norm / int8 GEMM / elementwise). These reproduce the CPU microkernels' numeric
+    // contract as naive single-thread device loops, so the whole program runs on the GPU; the
+    // CPU<->GPU tolerance gate covers reduction-order / SFU differences. Emitted before the user
+    // functions that call them. (Recognized-op dispatch to the *tuned* launchers is a later phase.)
+    {
+        let mut seen = std::collections::HashSet::new();
+        let mut needs_fmod = false;
+        for f in &program.funcs {
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    match &inst.op {
+                        Op::Call { func, .. } => {
+                            if let Some(h) = rt_helper(interner.resolve(*func)) {
+                                if seen.insert(h.ptx_name) {
+                                    out.push_str(&h.def);
+                                    out.push('\n');
+                                }
+                            }
+                        }
+                        // Float `%` lowers to a call to the device fmod helper (below).
+                        Op::Bin(BinOp::FRem, _, _) => needs_fmod = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if needs_fmod {
+            out.push_str(PTX_FMOD);
+            out.push('\n');
+        }
+    }
+
+    // Forward-declare every function so calls (incl. recursion / mutual recursion) resolve
+    // regardless of definition order.
+    for (i, f) in program.funcs.iter().enumerate() {
+        out.push_str(&fn_signature(f, i));
+        out.push_str(";\n");
+    }
+    out.push('\n');
+
+    // Define each function body.
+    for (i, f) in program.funcs.iter().enumerate() {
+        let body = FnEmit::lower(f, i, &func_idx, program, interner)?;
+        out.push_str(&body);
+        out.push('\n');
+    }
+
+    // The launched entry kernel: a thin wrapper that calls the entry `.func` and records the exit code.
+    out.push_str(&emit_entry_kernel(entry_idx, &program.funcs[entry_idx].ret));
+    Ok(out)
+}
+
+/// Emit the **cooperative-megakernel** PTX module for `program` with `entry` as the single
+/// `.visible .entry wukong_mega` (run by a block of threads â€” see [`crate::megakernel`]). The entry
+/// is lowered SPMD with its frame in a shared `.global` buffer; recognized ops emit a block-wide-tree
+/// (`mrt_sreduce_coop`), chunked-cooperative (the serial `mrt_*` over per-thread sub-ranges) or
+/// `tid==0`-serial (`mrt_*`) call bracketed by `bar.sync`. Public so `megakernel.rs` and tooling can
+/// JIT / inspect it.
+///
+/// Eligibility (`crate::fusion::analyze`) now allows the entry to call user-defined callees when
+/// they (transitively) contain only recognized cooperative ops and side effects. An `@parallel`
+/// outline still reaches its body through `Op::FuncAddr` plus `wukong_parallel_for`, whose
+/// grid-stride lowering calls the outlined body per iteration. The module carries the **reachability
+/// closure** of the entry: user callees on the `Op::Call` path are lowered SPMD (`tid==0`-guarded
+/// stores, grid-stride `wukong_parallel_for`), while `FuncAddr`-only outlined bodies stay
+/// single-thread `.func` bodies (per-thread `.local` frame, unguarded stores).
+pub fn emit_mega_ptx(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> Result<String, String> {
+    let entry_idx = program
+        .funcs
+        .iter()
+        .position(|f| f.name == entry)
+        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+    let entry_fn = &program.funcs[entry_idx];
+    if !entry_fn.params.is_empty() {
+        return Err(format!(
+            "{UNSUPPORTED} mega entry `{}` must take no parameters",
+            interner.resolve(entry)
+        ));
+    }
+
+    let mut func_idx: HashMap<Symbol, usize> = HashMap::new();
+    for (i, f) in program.funcs.iter().enumerate() {
+        func_idx.insert(f.name, i);
+    }
+    let reachable = reachable_funcs(program, entry_idx, &func_idx);
+    let mega_callees = call_reachable_funcs(program, entry_idx, &func_idx);
+
+    let mut out = String::new();
+    out.push_str(crate::ptx_target::HDR_SM80);
+    out.push('\n');
+
+    // Scan for the helpers the module needs: cooperative reduce (+ its shared scratch), the serial
+    // `mrt_*` defs for not-yet-cooperative recognized ops, and the device fmod for float `%`.
+    let mut needs_reduce_coop = false;
+    let mut needs_fmod = false;
+    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let mut serial_defs = String::new();
+    for &fi in &reachable {
+        for b in &program.funcs[fi].blocks {
+            for inst in &b.insts {
+                match &inst.op {
+                    Op::Call { func, .. } => {
+                        let nm = interner.resolve(*func);
+                        use crate::fusion::{classify_call, CallClass, CoopKind};
+                        // Only the ENTRY runs a reduction cooperatively; inside a called body the
+                        // same op is the serial helper, so both definitions can be needed at once.
+                        if fi == entry_idx
+                            && matches!(classify_call(nm), CallClass::Coop(CoopKind::Reduce))
+                        {
+                            needs_reduce_coop = true;
+                        } else if let Some(h) = rt_helper(nm) {
+                            if seen.insert(h.ptx_name) {
+                                serial_defs.push_str(&h.def);
+                                serial_defs.push('\n');
+                            }
+                        }
+                    }
+                    Op::Bin(BinOp::FRem, _, _) => needs_fmod = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    if needs_reduce_coop {
+        out.push_str(PTX_MEGA_SMEM);
+        out.push_str(PTX_SREDUCE_COOP);
+        out.push('\n');
+    }
+    if needs_fmod {
+        out.push_str(PTX_FMOD);
+        out.push('\n');
+    }
+    out.push_str(&serial_defs);
+
+    // Forward-declare every reachable callee (so mutual recursion and definition order are moot),
+    // then define them, then the entry.
+    let callees: Vec<usize> = reachable.iter().copied().filter(|&i| i != entry_idx).collect();
+    for &fi in &callees {
+        out.push_str(&fn_signature(&program.funcs[fi], fi));
+        out.push_str(";\n");
+    }
+    if !callees.is_empty() {
+        out.push('\n');
+    }
+    for &fi in &callees {
+        let body = if mega_callees.contains(&fi)
+            && crate::fusion::function_contains_parallel_for(interner, &program.funcs[fi])
+        {
+            FnEmit::lower_mega_callee(&program.funcs[fi], fi, &func_idx, program, interner)?
+        } else {
+            FnEmit::lower(&program.funcs[fi], fi, &func_idx, program, interner)?
+        };
+        out.push_str(&body);
+        out.push('\n');
+    }
+
+    let body = FnEmit::lower_mega(entry_fn, &func_idx, program, interner)?;
+    out.push_str(&body);
+    Ok(out)
+}
+
+/// The reachability closure of `root`: every function it can reach through a direct `Op::Call` or
+/// through an `Op::FuncAddr` (the `@parallel` outliner's handle on its outlined body), plus `root`
+/// itself, in index order.
+fn reachable_funcs(
+    program: &Program,
+    root: usize,
+    func_idx: &HashMap<Symbol, usize>,
+) -> Vec<usize> {
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut work = vec![root];
+    while let Some(fi) = work.pop() {
+        if !seen.insert(fi) {
+            continue;
+        }
+        for b in &program.funcs[fi].blocks {
+            for inst in &b.insts {
+                let target = match &inst.op {
+                    Op::Call { func, .. } => func_idx.get(func).copied(),
+                    Op::FuncAddr(sym) => func_idx.get(sym).copied(),
+                    _ => None,
+                };
+                if let Some(t) = target {
+                    if !seen.contains(&t) {
+                        work.push(t);
+                    }
+                }
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Every user function reachable from `root` through `Op::Call` edges only (not `FuncAddr`).
+/// These are the callees that run SPMD when called from the megakernel entry and need
+/// `tid==0`-guarded stores plus grid-stride `wukong_parallel_for`.
+fn call_reachable_funcs(
+    program: &Program,
+    root: usize,
+    func_idx: &HashMap<Symbol, usize>,
+) -> std::collections::BTreeSet<usize> {
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut work = vec![root];
+    while let Some(fi) = work.pop() {
+        if !seen.insert(fi) {
+            continue;
+        }
+        for b in &program.funcs[fi].blocks {
+            for inst in &b.insts {
+                if let Op::Call { func, .. } = &inst.op {
+                    if let Some(&t) = func_idx.get(func) {
+                        if !seen.contains(&t) {
+                            work.push(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    seen.remove(&root);
+    seen
+}
+
+// ============================================================================================
+// Register classes & type mapping
+// ============================================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RC {
+    /// 64-bit integer / pointer (`%rd`). Integer values are kept sign-extended to 64 bits.
+    Rd,
+    /// 32-bit float (`%f`). `f16`/`bf16` compute as `f32`, matching the interpreter/Cranelift.
+    F32,
+    /// 64-bit float (`%fd`).
+    F64,
+}
+
+fn rc_of(t: &MirType) -> RC {
+    match t {
+        MirType::F64 => RC::F64,
+        MirType::F16 | MirType::BF16 | MirType::F32 => RC::F32,
+        _ => RC::Rd,
+    }
+}
+
+/// The `.param`/ABI type string for a value of MIR type `t`.
+fn abi_ty(t: &MirType) -> &'static str {
+    match rc_of(t) {
+        RC::Rd => "b64",
+        RC::F32 => "f32",
+        RC::F64 => "f64",
+    }
+}
+
+/// The `mov` type suffix for a register class.
+fn mov_ty(rc: RC) -> &'static str {
+    match rc {
+        RC::Rd => "b64",
+        RC::F32 => "f32",
+        RC::F64 => "f64",
+    }
+}
+
+/// Width in bits of an integer MIR type (mirrors `wukong_interp::int_bits`).
+fn int_bits(t: &MirType) -> u32 {
+    match t {
+        MirType::I1 => 1,
+        MirType::I8 => 8,
+        MirType::I16 => 16,
+        MirType::I32 => 32,
+        _ => 64,
+    }
+}
+
+/// Size in bytes of a MIR type (for `gep` scaling and `alloca` frame sizing); mirrors Cranelift's.
+fn size_of(t: &MirType) -> u64 {
+    match t {
+        MirType::I1 | MirType::I8 => 1,
+        MirType::I16 | MirType::F16 | MirType::BF16 => 2,
+        MirType::I32 | MirType::F32 => 4,
+        MirType::I64 | MirType::F64 | MirType::Ptr => 8,
+        MirType::Vec(e, n) | MirType::Array(e, n) => size_of(e) * (*n as u64),
+        MirType::Void => 0,
+    }
+}
+
+/// Sign-extend a constant to a 64-bit value matching the interpreter's `mask(v, ty)` (then printed
+/// to PTX as the unsigned 64-bit reinterpretation, which always parses).
+fn const_to_u64(v: i128, ty: &MirType) -> u64 {
+    let sext: i64 = match ty {
+        MirType::I1 => (v & 1) as i64,
+        MirType::I8 => v as i8 as i64,
+        MirType::I16 => v as i16 as i64,
+        MirType::I32 => v as i32 as i64,
+        _ => v as i64,
+    };
+    sext as u64
+}
+
+/// Per-unit byte stride of a chunked pointer argument (see `FnEmit::emit_chunked_call`): a
+/// compile-time constant (elementwise: 4 B f32 / 2 B bf16), or `args[d] * c` bytes â€” a runtime
+/// dimension scaled by an element size (a GEMM C-row is `n` elements * 4 B, an int8 A-row is `k` * 1 B).
+#[derive(Clone, Copy)]
+enum Stride {
+    Const(u64),
+    Arg(usize, u64),
+}
+
+// ============================================================================================
+// Per-function PTX emission
+// ============================================================================================
+
+struct FnEmit<'a> {
+    func: &'a Function,
+    program: &'a Program,
+    interner: &'a Interner,
+    func_idx: &'a HashMap<Symbol, usize>,
+
+    body: String,
+    // Register counters per class (final values give the `.reg` declaration counts).
+    n_rd: u32,
+    n_r: u32,  // 32-bit scratch (`%r`) for narrow loads/stores, shift counts, bitcasts
+    n_rs: u32, // 16-bit scratch (`%rs`) for bf16/f16 storage conversions
+    n_f: u32,
+    n_fd: u32,
+    n_p: u32,
+    // ValueId -> assigned register name (assigned lazily, once, on first use).
+    vreg: HashMap<u32, String>,
+    // ValueId -> its N lane registers, for SIMD `<N x T>` values (scalarized per lane).
+    vlanes: HashMap<u32, Vec<String>>,
+    // ValueId -> its constant integer value (for op-code dispatch of recognized kernel calls).
+    const_ints: HashMap<u32, i128>,
+    // ValueId(`func_addr F`) -> F, so `wukong_parallel_for(n, func_addr F, ctx)` resolves to a
+    // direct call to F at compile time (PTX has no portable function pointers).
+    func_addr_of: HashMap<u32, Symbol>,
+    // Unique label counter (for cond-branch edge fixups).
+    n_lbl: u32,
+
+    // Stack frame: `ValueId(alloca) -> byte offset`, plus the total size and the generic base reg.
+    frame_off: HashMap<u32, u64>,
+    frame_bytes: u64,
+    frame_base: String,
+    /// User `shared [T; N]` slots: byte offset within the static `.shared` frame.
+    shared_off: HashMap<u32, u64>,
+    shared_bytes: u64,
+    shared_base: String,
+    /// ValueIds whose pointer originates in shared memory (alloca or gep off shared).
+    shared_ptrs: HashSet<u32>,
+    // The cvta'd-to-global context-buffer base register (print/assert/exit live here).
+    ctx_reg: String,
+
+    // --- cooperative-megakernel mode (see `megakernel.rs`) ---
+    // When set, this function is lowered SPMD: stores/side-effects are `tid==0`-guarded and
+    // recognized ops are `bar.sync`-bracketed. `mega_entry` is true only for the `.visible .entry`
+    // kernel (which writes the exit code); mega callees use normal `.func` returns.
+    mega: bool,
+    mega_entry: bool,
+    // The predicate register holding `threadIdx.x == 0` (only bound in `mega` mode).
+    tid0: String,
+    /// Coalescing hints from [`wukong_opt::coalesce`] for vector global `ld`/`st` emission.
+    coalesce: wukong_opt::CoalescePlan,
+    cur_block: wukong_mir::BlockId,
+    cur_inst: usize,
+}
+
+impl<'a> FnEmit<'a> {
+    fn lower(
+        func: &'a Function,
+        idx: usize,
+        func_idx: &'a HashMap<Symbol, usize>,
+        program: &'a Program,
+        interner: &'a Interner,
+    ) -> Result<String, String> {
+        let mut e = FnEmit {
+            func,
+            program,
+            interner,
+            func_idx,
+            body: String::new(),
+            n_rd: 0,
+            n_r: 0,
+            n_rs: 0,
+            n_f: 0,
+            n_fd: 0,
+            n_p: 0,
+            vreg: HashMap::new(),
+            vlanes: HashMap::new(),
+            const_ints: HashMap::new(),
+            func_addr_of: HashMap::new(),
+            n_lbl: 0,
+            frame_off: HashMap::new(),
+            frame_bytes: 0,
+            frame_base: String::new(),
+            shared_off: HashMap::new(),
+            shared_bytes: 0,
+            shared_base: String::new(),
+            shared_ptrs: HashSet::new(),
+            ctx_reg: String::new(),
+            mega: false,
+            mega_entry: false,
+            tid0: String::new(),
+            coalesce: wukong_opt::coalesce_function(func),
+            cur_block: func.entry,
+            cur_inst: 0,
+        };
+        e.assign_frame();
+        e.translate()?;
+
+        // Assemble: signature, reg/local declarations, then preamble + body.
+        let mut out = String::new();
+        out.push_str(&fn_signature(func, idx));
+        out.push_str("\n{\n");
+        e.write_reg_decls(&mut out);
+        if e.frame_bytes > 0 {
+            let _ = writeln!(out, "    .local .align 8 .b8 __frame[{}];", e.frame_bytes);
+        }
+        if e.shared_bytes > 0 {
+            let _ = writeln!(
+                out,
+                "    .shared .align 8 .b8 __user_smem[{}];",
+                e.shared_bytes
+            );
+        }
+        out.push_str(&e.body);
+        out.push_str("}\n");
+        Ok(out)
+    }
+
+    /// Lower `func` as the cooperative-megakernel `.visible .entry` (mega mode). Same per-op emitters
+    /// as [`lower`](Self::lower), but the frame is a shared `.global` param (no `.local __frame`),
+    /// stores/side-effects are `tid==0`-guarded, and recognized ops are `bar.sync`-bracketed. The
+    /// entry takes no MIR params and returns via the context exit-code slot. Returns the `.entry` text.
+    fn lower_mega(
+        func: &'a Function,
+        func_idx: &'a HashMap<Symbol, usize>,
+        program: &'a Program,
+        interner: &'a Interner,
+    ) -> Result<String, String> {
+        let mut e = FnEmit {
+            func,
+            program,
+            interner,
+            func_idx,
+            body: String::new(),
+            n_rd: 0,
+            n_r: 0,
+            n_rs: 0,
+            n_f: 0,
+            n_fd: 0,
+            n_p: 0,
+            vreg: HashMap::new(),
+            vlanes: HashMap::new(),
+            const_ints: HashMap::new(),
+            func_addr_of: HashMap::new(),
+            n_lbl: 0,
+            frame_off: HashMap::new(),
+            frame_bytes: 0,
+            frame_base: String::new(),
+            shared_off: HashMap::new(),
+            shared_bytes: 0,
+            shared_base: String::new(),
+            shared_ptrs: HashSet::new(),
+            ctx_reg: String::new(),
+            mega: true,
+            mega_entry: true,
+            tid0: String::new(),
+            coalesce: wukong_opt::coalesce_function(func),
+            cur_block: func.entry,
+            cur_inst: 0,
+        };
+        e.assign_frame();
+        e.translate_mega()?;
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            ".visible .entry {MEGA_KERNEL_NAME}(.param .u64 p_ctx, .param .u64 p_frame)\n{{\n"
+        ));
+        e.write_reg_decls(&mut out);
+        if e.shared_bytes > 0 {
+            let _ = writeln!(
+                out,
+                "    .shared .align 8 .b8 __user_smem[{}];",
+                e.shared_bytes
+            );
+        }
+        out.push_str(&e.body);
+        out.push_str("}\n");
+        Ok(out)
+    }
+
+    /// Lower a user-defined callee that the megakernel entry reaches through `Op::Call`. Same SPMD
+    /// discipline as [`lower_mega`](Self::lower_mega) â€” `tid==0`-guarded stores, grid-stride
+    /// `wukong_parallel_for`, `bar.sync`-bracketed recognized ops â€” but emitted as an ordinary
+    /// `.func mfn_*` with a per-thread `.local` frame and a normal `ret` (not the exit-code slot).
+    fn lower_mega_callee(
+        func: &'a Function,
+        idx: usize,
+        func_idx: &'a HashMap<Symbol, usize>,
+        program: &'a Program,
+        interner: &'a Interner,
+    ) -> Result<String, String> {
+        let mut e = FnEmit {
+            func,
+            program,
+            interner,
+            func_idx,
+            body: String::new(),
+            n_rd: 0,
+            n_r: 0,
+            n_rs: 0,
+            n_f: 0,
+            n_fd: 0,
+            n_p: 0,
+            vreg: HashMap::new(),
+            vlanes: HashMap::new(),
+            const_ints: HashMap::new(),
+            func_addr_of: HashMap::new(),
+            n_lbl: 0,
+            frame_off: HashMap::new(),
+            frame_bytes: 0,
+            frame_base: String::new(),
+            shared_off: HashMap::new(),
+            shared_bytes: 0,
+            shared_base: String::new(),
+            shared_ptrs: HashSet::new(),
+            ctx_reg: String::new(),
+            mega: true,
+            mega_entry: false,
+            tid0: String::new(),
+            coalesce: wukong_opt::coalesce_function(func),
+            cur_block: func.entry,
+            cur_inst: 0,
+        };
+        e.assign_frame();
+        e.translate_mega_callee()?;
+
+        let mut out = String::new();
+        out.push_str(&fn_signature(func, idx));
+        out.push_str("\n{\n");
+        e.write_reg_decls(&mut out);
+        if e.frame_bytes > 0 {
+            let _ = writeln!(out, "    .local .align 8 .b8 __frame[{}];", e.frame_bytes);
+        }
+        out.push_str(&e.body);
+        out.push_str("}\n");
+        Ok(out)
+    }
+
+    /// Emit the per-class `.reg` count declarations for the assembled function/kernel.
+    fn write_reg_decls(&self, out: &mut String) {
+        if self.n_rd > 0 {
+            let _ = writeln!(out, "    .reg .b64 %rd<{}>;", self.n_rd);
+        }
+        if self.n_r > 0 {
+            let _ = writeln!(out, "    .reg .b32 %r<{}>;", self.n_r);
+        }
+        if self.n_rs > 0 {
+            let _ = writeln!(out, "    .reg .b16 %rs<{}>;", self.n_rs);
+        }
+        if self.n_f > 0 {
+            let _ = writeln!(out, "    .reg .f32 %f<{}>;", self.n_f);
+        }
+        if self.n_fd > 0 {
+            let _ = writeln!(out, "    .reg .f64 %fd<{}>;", self.n_fd);
+        }
+        if self.n_p > 0 {
+            let _ = writeln!(out, "    .reg .pred %p<{}>;", self.n_p);
+        }
+    }
+
+    // --- register / temp allocation ---
+
+    fn fresh(&mut self, rc: RC) -> String {
+        match rc {
+            RC::Rd => {
+                let r = format!("%rd{}", self.n_rd);
+                self.n_rd += 1;
+                r
+            }
+            RC::F32 => {
+                let r = format!("%f{}", self.n_f);
+                self.n_f += 1;
+                r
+            }
+            RC::F64 => {
+                let r = format!("%fd{}", self.n_fd);
+                self.n_fd += 1;
+                r
+            }
+        }
+    }
+
+    fn fresh_pred(&mut self) -> String {
+        let r = format!("%p{}", self.n_p);
+        self.n_p += 1;
+        r
+    }
+
+    /// A fresh 32-bit scratch register (`%r`), for narrow loads/stores, shift counts, and bitcasts.
+    fn fresh_r32(&mut self) -> String {
+        let r = format!("%r{}", self.n_r);
+        self.n_r += 1;
+        r
+    }
+
+    /// A fresh 16-bit scratch register (`%rs`), for bf16/f16 storage conversions.
+    fn fresh_r16(&mut self) -> String {
+        let r = format!("%rs{}", self.n_rs);
+        self.n_rs += 1;
+        r
+    }
+
+    /// The register holding `v` (assigned on first reference, by `v`'s MIR type).
+    fn reg(&mut self, v: ValueId) -> String {
+        if let Some(r) = self.vreg.get(&v.0) {
+            return r.clone();
+        }
+        let rc = rc_of(self.func.value_type(v));
+        let r = self.fresh(rc);
+        self.vreg.insert(v.0, r.clone());
+        r
+    }
+
+    fn ty(&self, v: ValueId) -> MirType {
+        self.func.value_type(v).clone()
+    }
+
+    fn emit(&mut self, s: &str) {
+        self.body.push_str("    ");
+        self.body.push_str(s);
+        self.body.push('\n');
+    }
+
+    // --- stack frame ---
+
+    /// Pre-scan all allocas and assign byte offsets within the `.local` and `.shared` frames.
+    fn assign_frame(&mut self) {
+        let mut off = 0u64;
+        let mut sh_off = 0u64;
+        for b in &self.func.blocks {
+            for inst in &b.insts {
+                if let Op::Alloca { ty, space } = &inst.op {
+                    if let Some(r) = inst.result {
+                        let sz = size_of(ty).max(1);
+                        let slot = sz.div_ceil(8) * 8;
+                        match space {
+                            wukong_mir::AddrSpace::Local => {
+                                self.frame_off.insert(r.0, off);
+                                off += slot;
+                            }
+                            wukong_mir::AddrSpace::Shared => {
+                                self.shared_off.insert(r.0, sh_off);
+                                sh_off += slot;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.frame_bytes = off;
+        self.shared_bytes = sh_off;
+    }
+
+    fn is_shared_ptr(&self, v: ValueId) -> bool {
+        self.shared_ptrs.contains(&v.0)
+    }
+
+    // --- translation ---
+
+    fn translate(&mut self) -> Result<(), String> {
+        // Preamble: bind ctx (first hidden param), the stack-frame base, and the real params.
+        let ctx_raw = self.fresh(RC::Rd);
+        self.ctx_reg = self.fresh(RC::Rd);
+        self.emit(&format!("ld.param.u64 {ctx_raw}, [p_ctx];"));
+        self.emit(&format!("cvta.to.global.u64 {}, {ctx_raw};", self.ctx_reg));
+
+        if self.frame_bytes > 0 {
+            let loc = self.fresh(RC::Rd);
+            self.frame_base = self.fresh(RC::Rd);
+            self.emit(&format!("mov.u64 {loc}, __frame;"));
+            self.emit(&format!("cvta.local.u64 {}, {loc};", self.frame_base));
+        }
+
+        if self.shared_bytes > 0 {
+            let smem = self.fresh(RC::Rd);
+            self.shared_base = self.fresh(RC::Rd);
+            self.emit(&format!("mov.u64 {smem}, __user_smem;"));
+            self.emit(&format!("cvta.shared.u64 {}, {smem};", self.shared_base));
+        }
+
+        let params: Vec<ValueId> = self.func.params.clone();
+        for (i, p) in params.iter().enumerate() {
+            // A *block* param may be a vector (lane registers, see `assign_vector_block_params`); a
+            // FUNCTION param may not, because `fn_signature` gives it one scalar `.param` slot and
+            // there is no ABI here to pass N lanes through. MIR signatures are scalars and pointers
+            // today, so this is a decline against a future op, not a live limitation.
+            if self.func.value_type(*p).is_vector() {
+                return Err(format!(
+                    "{UNSUPPORTED} SIMD function parameter v{} (no vector `.param` ABI)",
+                    p.0
+                ));
+            }
+            let r = self.reg(*p);
+            let abi = abi_ty(self.func.value_type(*p));
+            self.emit(&format!("ld.param.{abi} {r}, [p{i}];"));
+        }
+
+        self.emit_blocks()
+    }
+
+    /// Mega preamble (the `.visible .entry` cooperative megakernel): the frame lives in a shared
+    /// `.global` buffer passed as `p_frame` (one copy the whole block sub-allocates), `p_ctx` is the
+    /// same print/assert/exit record buffer, and `tid0` is the `threadIdx.x == 0` predicate that
+    /// guards every store / side effect. The entry takes no MIR params (eligibility enforces this).
+    fn translate_mega(&mut self) -> Result<(), String> {
+        let ctx_raw = self.fresh(RC::Rd);
+        self.ctx_reg = self.fresh(RC::Rd);
+        self.emit(&format!("ld.param.u64 {ctx_raw}, [p_ctx];"));
+        self.emit(&format!("cvta.to.global.u64 {}, {ctx_raw};", self.ctx_reg));
+
+        if self.frame_bytes > 0 {
+            let fr_raw = self.fresh(RC::Rd);
+            self.frame_base = self.fresh(RC::Rd);
+            self.emit(&format!("ld.param.u64 {fr_raw}, [p_frame];"));
+            self.emit(&format!(
+                "cvta.to.global.u64 {}, {fr_raw};",
+                self.frame_base
+            ));
+        }
+
+        if self.shared_bytes > 0 {
+            let smem = self.fresh(RC::Rd);
+            self.shared_base = self.fresh(RC::Rd);
+            self.emit(&format!("mov.u64 {smem}, __user_smem;"));
+            self.emit(&format!("cvta.shared.u64 {}, {smem};", self.shared_base));
+        }
+
+        // tid0 = (threadIdx.x == 0): the predicate guarding stores + side effects in SPMD mode.
+        let tid = self.fresh_r32();
+        self.tid0 = self.fresh_pred();
+        self.emit(&format!("mov.u32 {tid}, %tid.x;"));
+        self.emit(&format!("setp.eq.u32 {}, {tid}, 0;", self.tid0));
+
+        self.emit_blocks()
+    }
+
+    /// Mega callee preamble: per-thread `.local` frame, explicit params, and the `tid==0` predicate
+    /// that guards stores and side effects when this `.func` is called SPMD from the megakernel.
+    fn translate_mega_callee(&mut self) -> Result<(), String> {
+        let ctx_raw = self.fresh(RC::Rd);
+        self.ctx_reg = self.fresh(RC::Rd);
+        self.emit(&format!("ld.param.u64 {ctx_raw}, [p_ctx];"));
+        self.emit(&format!("cvta.to.global.u64 {}, {ctx_raw};", self.ctx_reg));
+
+        if self.frame_bytes > 0 {
+            let loc = self.fresh(RC::Rd);
+            self.frame_base = self.fresh(RC::Rd);
+            self.emit(&format!("mov.u64 {loc}, __frame;"));
+            self.emit(&format!("cvta.local.u64 {}, {loc};", self.frame_base));
+        }
+
+        let params: Vec<ValueId> = self.func.params.clone();
+        for (i, p) in params.iter().enumerate() {
+            if self.func.value_type(*p).is_vector() {
+                return Err(format!(
+                    "{UNSUPPORTED} SIMD function parameter v{} (no vector `.param` ABI)",
+                    p.0
+                ));
+            }
+            let r = self.reg(*p);
+            let abi = abi_ty(self.func.value_type(*p));
+            self.emit(&format!("ld.param.{abi} {r}, [p{i}];"));
+        }
+
+        let tid = self.fresh_r32();
+        self.tid0 = self.fresh_pred();
+        self.emit(&format!("mov.u32 {tid}, %tid.x;"));
+        self.emit(&format!("setp.eq.u32 {}, {tid}, 0;", self.tid0));
+
+        self.emit_blocks()
+    }
+
+    /// The shared block-emitting loop used by both the single-thread `.func` path and the mega entry.
+    fn emit_blocks(&mut self) -> Result<(), String> {
+        self.assign_vector_block_params();
+        // Branch to the entry block, then emit blocks in id order.
+        self.emit(&format!("bra BB{};", self.func.entry.0));
+        let blocks = self.func.blocks.clone();
+        for b in &blocks {
+            self.body.push_str(&format!("BB{}:\n", b.id.0));
+            for (i, inst) in b.insts.iter().enumerate() {
                 self.cur_block = b.id;
-                self.cur_inst = i;                    match &inst.op {                        Op::Call { func, .. } => {                            if let Some(h) = rt_helper(interner.resolve(*func)) {                                if seen.insert(h.ptx_name) {                                    out.push_str(&h.def);                                    out.push('\n');                                }                            }                        }                        // Float `%` lowers to a call to the device fmod helper (below).                        Op::Bin(BinOp::FRem, _, _) => needs_fmod = true,                        _ => {}                    }                }            }        }        if needs_fmod {            out.push_str(PTX_FMOD);            out.push('\n');        }    }    // Forward-declare every function so calls (incl. recursion / mutual recursion) resolve    // regardless of definition order.    for (i, f) in program.funcs.iter().enumerate() {        out.push_str(&fn_signature(f, i));        out.push_str(";\n");    }    out.push('\n');    // Define each function body.    for (i, f) in program.funcs.iter().enumerate() {        let body = FnEmit::lower(f, i, &func_idx, program, interner)?;        out.push_str(&body);        out.push('\n');    }    // The launched entry kernel: a thin wrapper that calls the entry `.func` and records the exit code.    out.push_str(&emit_entry_kernel(entry_idx, &program.funcs[entry_idx].ret));    Ok(out)}/// Emit the **cooperative-megakernel** PTX module for `program` with `entry` as the single/// `.visible .entry wukong_mega` (run by a block of threads GÇö see [`crate::megakernel`]). The entry/// is lowered SPMD with its frame in a shared `.global` buffer; recognized ops emit a block-wide-tree/// (`mrt_sreduce_coop`), chunked-cooperative (the serial `mrt_*` over per-thread sub-ranges) or/// `tid==0`-serial (`mrt_*`) call bracketed by `bar.sync`. Public so `megakernel.rs` and tooling can/// JIT / inspect it.////// Eligibility (`crate::fusion::analyze`) now allows the entry to call user-defined callees when/// they (transitively) contain only recognized cooperative ops and side effects. An `@parallel`/// outline still reaches its body through `Op::FuncAddr` plus `wukong_parallel_for`, whose/// grid-stride lowering calls the outlined body per iteration. The module carries the **reachability/// closure** of the entry: user callees on the `Op::Call` path are lowered SPMD (`tid==0`-guarded/// stores, grid-stride `wukong_parallel_for`), while `FuncAddr`-only outlined bodies stay/// single-thread `.func` bodies (per-thread `.local` frame, unguarded stores).pub fn emit_mega_ptx(    program: &Program,    entry: Symbol,    interner: &Interner,) -> Result<String, String> {    let entry_idx = program        .funcs        .iter()        .position(|f| f.name == entry)        .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;    let entry_fn = &program.funcs[entry_idx];    if !entry_fn.params.is_empty() {        return Err(format!(            "{UNSUPPORTED} mega entry `{}` must take no parameters",            interner.resolve(entry)        ));    }    let mut func_idx: HashMap<Symbol, usize> = HashMap::new();    for (i, f) in program.funcs.iter().enumerate() {        func_idx.insert(f.name, i);    }    let reachable = reachable_funcs(program, entry_idx, &func_idx);    let mega_callees = call_reachable_funcs(program, entry_idx, &func_idx);    let mut out = String::new();    out.push_str(crate::ptx_target::HDR_SM80);    out.push('\n');    // Scan for the helpers the module needs: cooperative reduce (+ its shared scratch), the serial    // `mrt_*` defs for not-yet-cooperative recognized ops, and the device fmod for float `%`.    let mut needs_reduce_coop = false;    let mut needs_fmod = false;    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();    let mut serial_defs = String::new();    for &fi in &reachable {        for b in &program.funcs[fi].blocks {            for (i, inst) in b.insts.iter().enumerate() {
-                self.cur_block = b.id;
-                self.cur_inst = i;                match &inst.op {                    Op::Call { func, .. } => {                        let nm = interner.resolve(*func);                        use crate::fusion::{classify_call, CallClass, CoopKind};                        // Only the ENTRY runs a reduction cooperatively; inside a called body the                        // same op is the serial helper, so both definitions can be needed at once.                        if fi == entry_idx                            && matches!(classify_call(nm), CallClass::Coop(CoopKind::Reduce))                        {                            needs_reduce_coop = true;                        } else if let Some(h) = rt_helper(nm) {                            if seen.insert(h.ptx_name) {                                serial_defs.push_str(&h.def);                                serial_defs.push('\n');                            }                        }                    }                    Op::Bin(BinOp::FRem, _, _) => needs_fmod = true,                    _ => {}                }            }        }    }    if needs_reduce_coop {        out.push_str(PTX_MEGA_SMEM);        out.push_str(PTX_SREDUCE_COOP);        out.push('\n');    }    if needs_fmod {        out.push_str(PTX_FMOD);        out.push('\n');    }    out.push_str(&serial_defs);    // Forward-declare every reachable callee (so mutual recursion and definition order are moot),    // then define them, then the entry.    let callees: Vec<usize> = reachable.iter().copied().filter(|&i| i != entry_idx).collect();    for &fi in &callees {        out.push_str(&fn_signature(&program.funcs[fi], fi));        out.push_str(";\n");    }    if !callees.is_empty() {        out.push('\n');    }    for &fi in &callees {        let body = if mega_callees.contains(&fi)            && crate::fusion::function_contains_parallel_for(interner, &program.funcs[fi])        {            FnEmit::lower_mega_callee(&program.funcs[fi], fi, &func_idx, program, interner)?        } else {            FnEmit::lower(&program.funcs[fi], fi, &func_idx, program, interner)?        };        out.push_str(&body);        out.push('\n');    }    let body = FnEmit::lower_mega(entry_fn, &func_idx, program, interner)?;    out.push_str(&body);    Ok(out)}/// The reachability closure of `root`: every function it can reach through a direct `Op::Call` or/// through an `Op::FuncAddr` (the `@parallel` outliner's handle on its outlined body), plus `root`/// itself, in index order.fn reachable_funcs(    program: &Program,    root: usize,    func_idx: &HashMap<Symbol, usize>,) -> Vec<usize> {    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();    let mut work = vec![root];    while let Some(fi) = work.pop() {        if !seen.insert(fi) {            continue;        }        for b in &program.funcs[fi].blocks {            for (i, inst) in b.insts.iter().enumerate() {
-                self.cur_block = b.id;
-                self.cur_inst = i;                let target = match &inst.op {                    Op::Call { func, .. } => func_idx.get(func).copied(),                    Op::FuncAddr(sym) => func_idx.get(sym).copied(),                    _ => None,                };                if let Some(t) = target {                    if !seen.contains(&t) {                        work.push(t);                    }                }            }        }    }    seen.into_iter().collect()}/// Every user function reachable from `root` through `Op::Call` edges only (not `FuncAddr`)./// These are the callees that run SPMD when called from the megakernel entry and need/// `tid==0`-guarded stores plus grid-stride `wukong_parallel_for`.fn call_reachable_funcs(    program: &Program,    root: usize,    func_idx: &HashMap<Symbol, usize>,) -> std::collections::BTreeSet<usize> {    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();    let mut work = vec![root];    while let Some(fi) = work.pop() {        if !seen.insert(fi) {            continue;        }        for b in &program.funcs[fi].blocks {            for (i, inst) in b.insts.iter().enumerate() {
-                self.cur_block = b.id;
-                self.cur_inst = i;                if let Op::Call { func, .. } = &inst.op {                    if let Some(&t) = func_idx.get(func) {                        if !seen.contains(&t) {                            work.push(t);                        }                    }                }            }        }    }    seen.remove(&root);    seen}// ============================================================================================// Register classes & type mapping// ============================================================================================#[derive(Clone, Copy, PartialEq, Eq)]enum RC {    /// 64-bit integer / pointer (`%rd`). Integer values are kept sign-extended to 64 bits.    Rd,    /// 32-bit float (`%f`). `f16`/`bf16` compute as `f32`, matching the interpreter/Cranelift.    F32,    /// 64-bit float (`%fd`).    F64,}fn rc_of(t: &MirType) -> RC {    match t {        MirType::F64 => RC::F64,        MirType::F16 | MirType::BF16 | MirType::F32 => RC::F32,        _ => RC::Rd,    }}/// The `.param`/ABI type string for a value of MIR type `t`.fn abi_ty(t: &MirType) -> &'static str {    match rc_of(t) {        RC::Rd => "b64",        RC::F32 => "f32",        RC::F64 => "f64",    }}/// The `mov` type suffix for a register class.fn mov_ty(rc: RC) -> &'static str {    match rc {        RC::Rd => "b64",        RC::F32 => "f32",        RC::F64 => "f64",    }}/// Width in bits of an integer MIR type (mirrors `wukong_interp::int_bits`).fn int_bits(t: &MirType) -> u32 {    match t {        MirType::I1 => 1,        MirType::I8 => 8,        MirType::I16 => 16,        MirType::I32 => 32,        _ => 64,    }}/// Size in bytes of a MIR type (for `gep` scaling and `alloca` frame sizing); mirrors Cranelift's.fn size_of(t: &MirType) -> u64 {    match t {        MirType::I1 | MirType::I8 => 1,        MirType::I16 | MirType::F16 | MirType::BF16 => 2,        MirType::I32 | MirType::F32 => 4,        MirType::I64 | MirType::F64 | MirType::Ptr => 8,        MirType::Vec(e, n) | MirType::Array(e, n) => size_of(e) * (*n as u64),        MirType::Void => 0,    }}/// Sign-extend a constant to a 64-bit value matching the interpreter's `mask(v, ty)` (then printed/// to PTX as the unsigned 64-bit reinterpretation, which always parses).fn const_to_u64(v: i128, ty: &MirType) -> u64 {    let sext: i64 = match ty {        MirType::I1 => (v & 1) as i64,        MirType::I8 => v as i8 as i64,        MirType::I16 => v as i16 as i64,        MirType::I32 => v as i32 as i64,        _ => v as i64,    };    sext as u64}/// Per-unit byte stride of a chunked pointer argument (see `FnEmit::emit_chunked_call`): a/// compile-time constant (elementwise: 4 B f32 / 2 B bf16), or `args[d] * c` bytes GÇö a runtime/// dimension scaled by an element size (a GEMM C-row is `n` elements * 4 B, an int8 A-row is `k` * 1 B).#[derive(Clone, Copy)]enum Stride {    Const(u64),    Arg(usize, u64),}// ============================================================================================// Per-function PTX emission// ============================================================================================struct FnEmit<'a> {    func: &'a Function,    program: &'a Program,    interner: &'a Interner,    func_idx: &'a HashMap<Symbol, usize>,    body: String,    // Register counters per class (final values give the `.reg` declaration counts).    n_rd: u32,    n_r: u32,  // 32-bit scratch (`%r`) for narrow loads/stores, shift counts, bitcasts    n_rs: u32, // 16-bit scratch (`%rs`) for bf16/f16 storage conversions    n_f: u32,    n_fd: u32,    n_p: u32,    // ValueId -> assigned register name (assigned lazily, once, on first use).    vreg: HashMap<u32, String>,    // ValueId -> its N lane registers, for SIMD `<N x T>` values (scalarized per lane).    vlanes: HashMap<u32, Vec<String>>,    // ValueId -> its constant integer value (for op-code dispatch of recognized kernel calls).    const_ints: HashMap<u32, i128>,    // ValueId(`func_addr F`) -> F, so `wukong_parallel_for(n, func_addr F, ctx)` resolves to a    // direct call to F at compile time (PTX has no portable function pointers).    func_addr_of: HashMap<u32, Symbol>,    // Unique label counter (for cond-branch edge fixups).    n_lbl: u32,    // Stack frame: `ValueId(alloca) -> byte offset`, plus the total size and the generic base reg.    frame_off: HashMap<u32, u64>,    frame_bytes: u64,    frame_base: String,    /// User `shared [T; N]` slots: byte offset within the static `.shared` frame.    shared_off: HashMap<u32, u64>,    shared_bytes: u64,    shared_base: String,    /// ValueIds whose pointer originates in shared memory (alloca or gep off shared).    shared_ptrs: HashSet<u32>,    // The cvta'd-to-global context-buffer base register (print/assert/exit live here).    ctx_reg: String,    // --- cooperative-megakernel mode (see `megakernel.rs`) ---    // When set, this function is lowered SPMD: stores/side-effects are `tid==0`-guarded and    // recognized ops are `bar.sync`-bracketed. `mega_entry` is true only for the `.visible .entry`    // kernel (which writes the exit code); mega callees use normal `.func` returns.    mega: bool,    mega_entry: bool,    // The predicate register holding `threadIdx.x == 0` (only bound in `mega` mode).    tid0: String,}impl<'a> FnEmit<'a> {    fn lower(        func: &'a Function,        idx: usize,        func_idx: &'a HashMap<Symbol, usize>,        program: &'a Program,        interner: &'a Interner,    ) -> Result<String, String> {        let mut e = FnEmit {            func,            program,            interner,            func_idx,            body: String::new(),            n_rd: 0,            n_r: 0,            n_rs: 0,            n_f: 0,            n_fd: 0,            n_p: 0,            vreg: HashMap::new(),            vlanes: HashMap::new(),            const_ints: HashMap::new(),            func_addr_of: HashMap::new(),            n_lbl: 0,            frame_off: HashMap::new(),            frame_bytes: 0,            frame_base: String::new(),            shared_off: HashMap::new(),            shared_bytes: 0,            shared_base: String::new(),            shared_ptrs: HashSet::new(),            ctx_reg: String::new(),            mega: false,            mega_entry: false,            tid0: String::new(),        };        e.assign_frame();        e.translate()?;        // Assemble: signature, reg/local declarations, then preamble + body.        let mut out = String::new();        out.push_str(&fn_signature(func, idx));        out.push_str("\n{\n");        e.write_reg_decls(&mut out);        if e.frame_bytes > 0 {            let _ = writeln!(out, "    .local .align 8 .b8 __frame[{}];", e.frame_bytes);        }        if e.shared_bytes > 0 {            let _ = writeln!(                out,                "    .shared .align 8 .b8 __user_smem[{}];",                e.shared_bytes            );        }        out.push_str(&e.body);        out.push_str("}\n");        Ok(out)    }    /// Lower `func` as the cooperative-megakernel `.visible .entry` (mega mode). Same per-op emitters    /// as [`lower`](Self::lower), but the frame is a shared `.global` param (no `.local __frame`),    /// stores/side-effects are `tid==0`-guarded, and recognized ops are `bar.sync`-bracketed. The    /// entry takes no MIR params and returns via the context exit-code slot. Returns the `.entry` text.    fn lower_mega(        func: &'a Function,        func_idx: &'a HashMap<Symbol, usize>,        program: &'a Program,        interner: &'a Interner,    ) -> Result<String, String> {        let mut e = FnEmit {            func,            program,            interner,            func_idx,            body: String::new(),            n_rd: 0,            n_r: 0,            n_rs: 0,            n_f: 0,            n_fd: 0,            n_p: 0,            vreg: HashMap::new(),            vlanes: HashMap::new(),            const_ints: HashMap::new(),            func_addr_of: HashMap::new(),            n_lbl: 0,            frame_off: HashMap::new(),            frame_bytes: 0,            frame_base: String::new(),            shared_off: HashMap::new(),            shared_bytes: 0,            shared_base: String::new(),            shared_ptrs: HashSet::new(),            ctx_reg: String::new(),            mega: true,            mega_entry: true,            tid0: String::new(),        };        e.assign_frame();        e.translate_mega()?;        let mut out = String::new();        out.push_str(&format!(            ".visible .entry {MEGA_KERNEL_NAME}(.param .u64 p_ctx, .param .u64 p_frame)\n{{\n"        ));        e.write_reg_decls(&mut out);        if e.shared_bytes > 0 {            let _ = writeln!(                out,                "    .shared .align 8 .b8 __user_smem[{}];",                e.shared_bytes            );        }        out.push_str(&e.body);        out.push_str("}\n");        Ok(out)    }    /// Lower a user-defined callee that the megakernel entry reaches through `Op::Call`. Same SPMD    /// discipline as [`lower_mega`](Self::lower_mega) GÇö `tid==0`-guarded stores, grid-stride    /// `wukong_parallel_for`, `bar.sync`-bracketed recognized ops GÇö but emitted as an ordinary    /// `.func mfn_*` with a per-thread `.local` frame and a normal `ret` (not the exit-code slot).    fn lower_mega_callee(        func: &'a Function,        idx: usize,        func_idx: &'a HashMap<Symbol, usize>,        program: &'a Program,        interner: &'a Interner,    ) -> Result<String, String> {        let mut e = FnEmit {            func,            program,            interner,            func_idx,            body: String::new(),            n_rd: 0,            n_r: 0,            n_rs: 0,            n_f: 0,            n_fd: 0,            n_p: 0,            vreg: HashMap::new(),            vlanes: HashMap::new(),            const_ints: HashMap::new(),            func_addr_of: HashMap::new(),            n_lbl: 0,            frame_off: HashMap::new(),            frame_bytes: 0,            frame_base: String::new(),            shared_off: HashMap::new(),            shared_bytes: 0,            shared_base: String::new(),            shared_ptrs: HashSet::new(),            ctx_reg: String::new(),            mega: true,            mega_entry: false,            tid0: String::new(),        };        e.assign_frame();        e.translate_mega_callee()?;        let mut out = String::new();        out.push_str(&fn_signature(func, idx));        out.push_str("\n{\n");        e.write_reg_decls(&mut out);        if e.frame_bytes > 0 {            let _ = writeln!(out, "    .local .align 8 .b8 __frame[{}];", e.frame_bytes);        }        out.push_str(&e.body);        out.push_str("}\n");        Ok(out)    }    /// Emit the per-class `.reg` count declarations for the assembled function/kernel.    fn write_reg_decls(&self, out: &mut String) {        if self.n_rd > 0 {            let _ = writeln!(out, "    .reg .b64 %rd<{}>;", self.n_rd);        }        if self.n_r > 0 {            let _ = writeln!(out, "    .reg .b32 %r<{}>;", self.n_r);        }        if self.n_rs > 0 {            let _ = writeln!(out, "    .reg .b16 %rs<{}>;", self.n_rs);        }        if self.n_f > 0 {            let _ = writeln!(out, "    .reg .f32 %f<{}>;", self.n_f);        }        if self.n_fd > 0 {            let _ = writeln!(out, "    .reg .f64 %fd<{}>;", self.n_fd);        }        if self.n_p > 0 {            let _ = writeln!(out, "    .reg .pred %p<{}>;", self.n_p);        }    }    // --- register / temp allocation ---    fn fresh(&mut self, rc: RC) -> String {        match rc {            RC::Rd => {                let r = format!("%rd{}", self.n_rd);                self.n_rd += 1;                r            }            RC::F32 => {                let r = format!("%f{}", self.n_f);                self.n_f += 1;                r            }            RC::F64 => {                let r = format!("%fd{}", self.n_fd);                self.n_fd += 1;                r            }        }    }    fn fresh_pred(&mut self) -> String {        let r = format!("%p{}", self.n_p);        self.n_p += 1;        r    }    /// A fresh 32-bit scratch register (`%r`), for narrow loads/stores, shift counts, and bitcasts.    fn fresh_r32(&mut self) -> String {        let r = format!("%r{}", self.n_r);        self.n_r += 1;        r    }    /// A fresh 16-bit scratch register (`%rs`), for bf16/f16 storage conversions.    fn fresh_r16(&mut self) -> String {        let r = format!("%rs{}", self.n_rs);        self.n_rs += 1;        r    }    /// The register holding `v` (assigned on first reference, by `v`'s MIR type).    fn reg(&mut self, v: ValueId) -> String {        if let Some(r) = self.vreg.get(&v.0) {            return r.clone();        }        let rc = rc_of(self.func.value_type(v));        let r = self.fresh(rc);        self.vreg.insert(v.0, r.clone());        r    }    fn ty(&self, v: ValueId) -> MirType {        self.func.value_type(v).clone()    }    fn emit(&mut self, s: &str) {        self.body.push_str("    ");        self.body.push_str(s);        self.body.push('\n');    }    // --- stack frame ---    /// Pre-scan all allocas and assign byte offsets within the `.local` and `.shared` frames.    fn assign_frame(&mut self) {        let mut off = 0u64;        let mut sh_off = 0u64;        for b in &self.func.blocks {            for (i, inst) in b.insts.iter().enumerate() {
-                self.cur_block = b.id;
-                self.cur_inst = i;                if let Op::Alloca { ty, space } = &inst.op {                    if let Some(r) = inst.result {                        let sz = size_of(ty).max(1);                        let slot = sz.div_ceil(8) * 8;                        match space {                            wukong_mir::AddrSpace::Local => {                                self.frame_off.insert(r.0, off);                                off += slot;                            }                            wukong_mir::AddrSpace::Shared => {                                self.shared_off.insert(r.0, sh_off);                                sh_off += slot;                            }                        }                    }                }            }        }        self.frame_bytes = off;        self.shared_bytes = sh_off;    }    fn is_shared_ptr(&self, v: ValueId) -> bool {        self.shared_ptrs.contains(&v.0)    }    // --- translation ---    fn translate(&mut self) -> Result<(), String> {        // Preamble: bind ctx (first hidden param), the stack-frame base, and the real params.        let ctx_raw = self.fresh(RC::Rd);        self.ctx_reg = self.fresh(RC::Rd);        self.emit(&format!("ld.param.u64 {ctx_raw}, [p_ctx];"));        self.emit(&format!("cvta.to.global.u64 {}, {ctx_raw};", self.ctx_reg));        if self.frame_bytes > 0 {            let loc = self.fresh(RC::Rd);            self.frame_base = self.fresh(RC::Rd);            self.emit(&format!("mov.u64 {loc}, __frame;"));            self.emit(&format!("cvta.local.u64 {}, {loc};", self.frame_base));        }        if self.shared_bytes > 0 {            let smem = self.fresh(RC::Rd);            self.shared_base = self.fresh(RC::Rd);            self.emit(&format!("mov.u64 {smem}, __user_smem;"));            self.emit(&format!("cvta.shared.u64 {}, {smem};", self.shared_base));        }        let params: Vec<ValueId> = self.func.params.clone();        for (i, p) in params.iter().enumerate() {            // A *block* param may be a vector (lane registers, see `assign_vector_block_params`); a            // FUNCTION param may not, because `fn_signature` gives it one scalar `.param` slot and            // there is no ABI here to pass N lanes through. MIR signatures are scalars and pointers            // today, so this is a decline against a future op, not a live limitation.            if self.func.value_type(*p).is_vector() {                return Err(format!(                    "{UNSUPPORTED} SIMD function parameter v{} (no vector `.param` ABI)",                    p.0                ));            }            let r = self.reg(*p);            let abi = abi_ty(self.func.value_type(*p));            self.emit(&format!("ld.param.{abi} {r}, [p{i}];"));        }        self.emit_blocks()    }    /// Mega preamble (the `.visible .entry` cooperative megakernel): the frame lives in a shared    /// `.global` buffer passed as `p_frame` (one copy the whole block sub-allocates), `p_ctx` is the    /// same print/assert/exit record buffer, and `tid0` is the `threadIdx.x == 0` predicate that    /// guards every store / side effect. The entry takes no MIR params (eligibility enforces this).    fn translate_mega(&mut self) -> Result<(), String> {        let ctx_raw = self.fresh(RC::Rd);        self.ctx_reg = self.fresh(RC::Rd);        self.emit(&format!("ld.param.u64 {ctx_raw}, [p_ctx];"));        self.emit(&format!("cvta.to.global.u64 {}, {ctx_raw};", self.ctx_reg));        if self.frame_bytes > 0 {            let fr_raw = self.fresh(RC::Rd);            self.frame_base = self.fresh(RC::Rd);            self.emit(&format!("ld.param.u64 {fr_raw}, [p_frame];"));            self.emit(&format!(                "cvta.to.global.u64 {}, {fr_raw};",                self.frame_base            ));        }        if self.shared_bytes > 0 {            let smem = self.fresh(RC::Rd);            self.shared_base = self.fresh(RC::Rd);            self.emit(&format!("mov.u64 {smem}, __user_smem;"));            self.emit(&format!("cvta.shared.u64 {}, {smem};", self.shared_base));        }        // tid0 = (threadIdx.x == 0): the predicate guarding stores + side effects in SPMD mode.        let tid = self.fresh_r32();        self.tid0 = self.fresh_pred();        self.emit(&format!("mov.u32 {tid}, %tid.x;"));        self.emit(&format!("setp.eq.u32 {}, {tid}, 0;", self.tid0));        self.emit_blocks()    }    /// Mega callee preamble: per-thread `.local` frame, explicit params, and the `tid==0` predicate    /// that guards stores and side effects when this `.func` is called SPMD from the megakernel.    fn translate_mega_callee(&mut self) -> Result<(), String> {        let ctx_raw = self.fresh(RC::Rd);        self.ctx_reg = self.fresh(RC::Rd);        self.emit(&format!("ld.param.u64 {ctx_raw}, [p_ctx];"));        self.emit(&format!("cvta.to.global.u64 {}, {ctx_raw};", self.ctx_reg));        if self.frame_bytes > 0 {            let loc = self.fresh(RC::Rd);            self.frame_base = self.fresh(RC::Rd);            self.emit(&format!("mov.u64 {loc}, __frame;"));            self.emit(&format!("cvta.local.u64 {}, {loc};", self.frame_base));        }        let params: Vec<ValueId> = self.func.params.clone();        for (i, p) in params.iter().enumerate() {            if self.func.value_type(*p).is_vector() {                return Err(format!(                    "{UNSUPPORTED} SIMD function parameter v{} (no vector `.param` ABI)",                    p.0                ));            }            let r = self.reg(*p);            let abi = abi_ty(self.func.value_type(*p));            self.emit(&format!("ld.param.{abi} {r}, [p{i}];"));        }        let tid = self.fresh_r32();        self.tid0 = self.fresh_pred();        self.emit(&format!("mov.u32 {tid}, %tid.x;"));        self.emit(&format!("setp.eq.u32 {}, {tid}, 0;", self.tid0));        self.emit_blocks()    }    /// The shared block-emitting loop used by both the single-thread `.func` path and the mega entry.    fn emit_blocks(&mut self) -> Result<(), String> {        self.assign_vector_block_params();        // Branch to the entry block, then emit blocks in id order.        self.emit(&format!("bra BB{};", self.func.entry.0));        let blocks = self.func.blocks.clone();        for b in &blocks {            self.body.push_str(&format!("BB{}:\n", b.id.0));            for (i, inst) in b.insts.iter().enumerate() {
-                self.cur_block = b.id;
-                self.cur_inst = i;                self.lower_inst(inst)?;            }            self.lower_term(&b.term)?;        }        Ok(())    }    fn lower_inst(&mut self, inst: &wukong_mir::Inst) -> Result<(), String> {        // Result-less ops first.        match &inst.op {            Op::Store { ptr, value } => return self.lower_store(*ptr, *value),            Op::Barrier => {                self.emit("bar.sync 0;");                return Ok(());            }            Op::Call { func, args } => return self.lower_call(*func, args, inst.result),            // A raw-AVX2 CPU microkernel call (the general 256-bit loop vectorizer's `VecKernelCall`)            // has no PTX analog; report it UNSUPPORTED so the coverage gate skips this function.            Op::VecKernelCall { .. } => {                return Err(format!(                    "{UNSUPPORTED} `VecKernelCall` (CPU raw-AVX2 kernel) not lowered to PTX"                ))            }            _ => {}        }        let r = inst            .result            .ok_or_else(|| format!("{UNSUPPORTED} value-less op {:?}", inst.op))?;        let rty = self.ty(r);        // Vectorized MIR (`<N x T>`): the AST-level vectorizer fires even at -O0 on array loops.        // Scalarize each lane through the same reg-based `*_into` emitters the scalar path uses.        if rty.is_vector() {            return self.lower_vec_inst(inst, r, &rty);        }        match &inst.op {            Op::ConstInt(v, ty) => {                self.const_ints.insert(r.0, *v);                let d = self.reg(r);                self.emit(&format!("mov.b64 {d}, {};", const_to_u64(*v, ty)));            }            Op::ConstFloat(v, ty) => {                let d = self.reg(r);                if matches!(ty, MirType::F64) {                    self.emit(&format!("mov.f64 {d}, 0d{:016X};", v.to_bits()));                } else {                    // A bf16/f16 const IS its grid-rounded value, so materialize it rounded GÇö the                    // same host-side `wukong_runtime::round_*` the interpreter and Cranelift use at                    // this exact point. The per-store rounding in `store_into` alone is fragile:                    // mem2reg/CSE forward the value past its store, so `let b: bf16 = 0.1` reached                    // the multiply as the raw f32 0.1 at -O3 (and as the bf16 grid value at -O0).                    let f = match ty {                        MirType::BF16 => wukong_runtime::round_bf16(*v as f32),                        MirType::F16 => wukong_runtime::round_f16(*v as f32),                        _ => *v as f32,                    };                    self.emit(&format!("mov.f32 {d}, 0f{:08X};", f.to_bits()));                }            }            Op::Bin(op, l, r2) => self.lower_bin(*op, *l, *r2, &rty, r)?,            Op::Cmp(op, l, r2) => self.lower_cmp(*op, *l, *r2, r),            Op::Neg(v) => {                let x = self.reg(*v);                let d = self.reg(r);                self.neg_into(&d, &x, &rty);            }            Op::Not(v) => {                let x = self.reg(*v);                let d = self.reg(r);                self.not_into(&d, &x, &rty);            }            Op::Cast(kind, v, to) => self.lower_cast(*kind, *v, to, r)?,            Op::Select(c, a, b) => self.lower_select(*c, *a, *b, &rty, r),            Op::Alloca { ty: _, space } => {                let d = self.reg(r);                match space {                    wukong_mir::AddrSpace::Local => {                        let off = *self.frame_off.get(&r.0).expect("alloca offset");                        let base = self.frame_base.clone();                        if off == 0 {                            self.emit(&format!("mov.b64 {d}, {base};"));                        } else {                            self.emit(&format!("add.s64 {d}, {base}, {off};"));                        }                    }                    wukong_mir::AddrSpace::Shared => {                        let off = *self.shared_off.get(&r.0).expect("shared alloca offset");                        let base = self.shared_base.clone();                        if off == 0 {                            self.emit(&format!("mov.b64 {d}, {base};"));                        } else {                            self.emit(&format!("add.s64 {d}, {base}, {off};"));                        }                        self.shared_ptrs.insert(r.0);                    }                }            }            Op::Load(p, ty) => self.lower_load(*p, ty, r)?,            Op::Gep { ptr, index, elem } => {                let base = self.reg(*ptr);                let idx = self.reg(*index);                let off = self.fresh(RC::Rd);                let d = self.reg(r);                self.emit(&format!("mul.lo.s64 {off}, {idx}, {};", size_of(elem)));                self.emit(&format!("add.s64 {d}, {base}, {off};"));                if self.is_shared_ptr(*ptr) {                    self.shared_ptrs.insert(r.0);                }            }            Op::Fma(a, b, c) => {                let rc = rc_of(&rty);                let av = self.coerce_float(*a, rc);                let bv = self.coerce_float(*b, rc);                let cv = self.coerce_float(*c, rc);                let d = self.reg(r);                self.fma_into(&d, &av, &bv, &cv, &rty);            }            Op::Sqrt(v) => {                let rc = rc_of(&rty);                let x = self.coerce_float(*v, rc);                let d = self.reg(r);                self.sqrt_into(&d, &x, &rty);            }            Op::Round(mode, v) => {                let rc = rc_of(&rty);                let x = self.coerce_float(*v, rc);                let d = self.reg(r);                self.round_into(&d, *mode, &x, &rty);            }            // A `Splat` or `Iota` whose result is NOT a vector never reaches here from verified MIR            // (`wukong_mir::verify` requires a vector result for both), and the vector case went to            // `lower_vec_inst` above. Keep them as declines rather than `unreachable!`, but say what            // they mean: the old text was "SIMD not yet lowered to PTX", which now reads as a claim            // about the SIMD path in general to anyone debugging a decline.            Op::Splat(_) => {                return Err(format!(                    "{UNSUPPORTED} `Splat` with a non-vector result type {} (malformed MIR)",                    rty.display()                ))            }            // Read lane `k` of a SIMD value back as a scalar GÇö the shape the loop vectorizer's            // reduction epilogue folds in index order, and how a vector guard reaches a `CondBr`.            // `lower_vec_inst` already scalarizes every vector into one register per lane, so this is            // a register copy: the "one shuffle, lane 0 is free" cost model in            // `wukong_mir::Op::ExtractLane`'s doc is a CPU-SIMD statement, not a PTX one.            Op::ExtractLane(v, k) => {                let lanes = self.lanes(*v)?;                let src = lanes.get(*k as usize).cloned().ok_or_else(|| {                    format!(                        "{UNSUPPORTED} SIMD `ExtractLane` lane {k} is past the {} lane(s) of v{}",                        lanes.len(),                        v.0                    )                })?;                let d = self.reg(r);                self.emit(&format!("mov.{} {d}, {src};", mov_ty(rc_of(&rty))));            }            Op::Iota(..) => {                return Err(format!(                    "{UNSUPPORTED} `Iota` with a non-vector result type {} (malformed MIR)",                    rty.display()                ))            }            Op::FuncAddr(sym) => {                // Record the target for the `wukong_parallel_for` special-case; the value itself is                // never materialized as a device function pointer, so emit no instruction.                self.func_addr_of.insert(r.0, *sym);            }            Op::GlobalAddr(_) => {                // A `.rodata` string address GÇö strings never occur in GPU-eligible numeric kernels,                // so decline (skip to the single-thread / CPU path) rather than miscompile.                return Err(format!(                    "{UNSUPPORTED} `GlobalAddr` (static string data) not lowered to PTX"                ));            }            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier => {                unreachable!("handled above")            }        }        Ok(())    }    // --- integer / float binary ops ---    fn lower_bin(        &mut self,        op: BinOp,        l: ValueId,        r2: ValueId,        rty: &MirType,        res: ValueId,    ) -> Result<(), String> {        let (a, b) = if op.is_float() {            let rc = rc_of(rty);            (self.coerce_float(l, rc), self.coerce_float(r2, rc))        } else {            (self.reg(l), self.reg(r2))        };        let d = self.reg(res);        self.bin_into(&d, op, &a, &b, rty)    }    /// Emit `d = a OP b` for one (scalar or lane) value. Operands are registers already of the result    /// type; floats round per op (no auto-FMA), ints compute in 64-bit and mask to the result width.    fn bin_into(        &mut self,        d: &str,        op: BinOp,        a: &str,        b: &str,        rty: &MirType,    ) -> Result<(), String> {        use BinOp::*;        if op.is_float() {            let sfx = float_suffix(rty);            match op {                FAdd => self.emit(&format!("add.rn.{sfx} {d}, {a}, {b};")),                FSub => self.emit(&format!("sub.rn.{sfx} {d}, {a}, {b};")),                FMul => self.emit(&format!("mul.rn.{sfx} {d}, {a}, {b};")),                FDiv => self.emit(&format!("div.rn.{sfx} {d}, {a}, {b};")),                // No PTX frem op, and the `a - trunc(a/b)*b` identity loses precision past the                // mantissa's integer range (`1e18 % 3` -> 0, not 1). Call the exact device fmod                // helper instead; compute in f64 (exact for f32 inputs) and narrow the f32 result.                FRem => {                    let (af, bf) = if rc_of(rty) == RC::F64 {                        (a.to_string(), b.to_string())                    } else {                        let ta = self.fresh(RC::F64);                        self.emit(&format!("cvt.f64.f32 {ta}, {a};"));                        let tb = self.fresh(RC::F64);                        self.emit(&format!("cvt.f64.f32 {tb}, {b};"));                        (ta, tb)                    };                    let rr = self.fresh(RC::F64);                    self.emit("{");                    self.emit(".param .f64 _fa;");                    self.emit(".param .f64 _fb;");                    self.emit(".param .f64 _fr;");                    self.emit(&format!("st.param.f64 [_fa], {af};"));                    self.emit(&format!("st.param.f64 [_fb], {bf};"));                    self.emit("call.uni (_fr), mrt_fmod, (_fa, _fb);");                    self.emit(&format!("ld.param.f64 {rr}, [_fr];"));                    self.emit("}");                    if rc_of(rty) == RC::F64 {                        self.emit(&format!("mov.f64 {d}, {rr};"));                    } else {                        self.emit(&format!("cvt.rn.f32.f64 {d}, {rr};"));                    }                }                _ => unreachable!(),            }            return Ok(());        }        let bits = int_bits(rty);        match op {            Add => self.emit(&format!("add.s64 {d}, {a}, {b};")),            Sub => self.emit(&format!("sub.s64 {d}, {a}, {b};")),            Mul => self.emit(&format!("mul.lo.s64 {d}, {a}, {b};")),            And => self.emit(&format!("and.b64 {d}, {a}, {b};")),            Or => self.emit(&format!("or.b64 {d}, {a}, {b};")),            Xor => self.emit(&format!("xor.b64 {d}, {a}, {b};")),            SDiv => self.guarded_divrem("div.s64", a, b, d),            SRem => self.guarded_divrem("rem.s64", a, b, d),            UDiv => {                let au = self.mask_unsigned(a, bits);                let bu = self.mask_unsigned(b, bits);                self.guarded_divrem("div.u64", &au, &bu, d);            }            URem => {                let au = self.mask_unsigned(a, bits);                let bu = self.mask_unsigned(b, bits);                self.guarded_divrem("rem.u64", &au, &bu, d);            }            Shl => {                let sc = self.shift_count(b, bits);                self.emit(&format!("shl.b64 {d}, {a}, {sc};"));            }            LShr => {                let au = self.mask_unsigned(a, bits);                let sc = self.shift_count(b, bits);                self.emit(&format!("shr.u64 {d}, {au}, {sc};"));            }            AShr => {                let sc = self.shift_count(b, bits);                self.emit(&format!("shr.s64 {d}, {a}, {sc};"));            }            FAdd | FSub | FMul | FDiv | FRem => unreachable!("handled above"),        }        self.mask_int(d, rty);        Ok(())    }    fn neg_into(&mut self, d: &str, a: &str, rty: &MirType) {        if rty.is_float() {            self.emit(&format!("neg.{} {d}, {a};", float_suffix(rty)));        } else {            self.emit(&format!("neg.s64 {d}, {a};"));            self.mask_int(d, rty);        }    }    fn not_into(&mut self, d: &str, a: &str, rty: &MirType) {        self.emit(&format!("not.b64 {d}, {a};"));        self.mask_int(d, rty);    }    fn fma_into(&mut self, d: &str, a: &str, b: &str, c: &str, rty: &MirType) {        self.emit(&format!("fma.rn.{} {d}, {a}, {b}, {c};", float_suffix(rty)));    }    fn sqrt_into(&mut self, d: &str, a: &str, rty: &MirType) {        self.emit(&format!("sqrt.rn.{} {d}, {a};", float_suffix(rty)));    }    fn round_into(&mut self, d: &str, mode: RoundMode, a: &str, rty: &MirType) {        let sfx = float_suffix(rty);        let m = match mode {            RoundMode::Nearest => "rni",            RoundMode::Floor => "rmi",            RoundMode::Ceil => "rpi",            RoundMode::Trunc => "rzi",        };        self.emit(&format!("cvt.{m}.{sfx}.{sfx} {d}, {a};"));    }    /// `d = (b == 0) ? 0 : (a OP b)` with `b` swapped to 1 in the divide so the hardware never sees a    /// zero divisor (matching the interpreter/Cranelift "div-by-zero yields 0, no trap" contract).    fn guarded_divrem(&mut self, opc: &str, a: &str, b: &str, d: &str) {        let pz = self.fresh_pred();        let one = self.fresh(RC::Rd);        let zero = self.fresh(RC::Rd);        let safe = self.fresh(RC::Rd);        let q = self.fresh(RC::Rd);        self.emit(&format!("setp.eq.s64 {pz}, {b}, 0;"));        self.emit(&format!("mov.b64 {one}, 1;"));        self.emit(&format!("mov.b64 {zero}, 0;"));        self.emit(&format!("selp.b64 {safe}, {one}, {b}, {pz};"));        self.emit(&format!("{opc} {q}, {a}, {safe};"));        self.emit(&format!("selp.b64 {d}, {zero}, {q}, {pz};"));    }    /// Mask the shift amount to the result width (x86/Cranelift/interp semantics) and narrow to the    /// `.u32` PTX shift operand.    fn shift_count(&mut self, b: &str, bits: u32) -> String {        let masked = self.fresh(RC::Rd);        let sc = self.fresh_r32();        self.emit(&format!("and.b64 {masked}, {b}, {};", bits - 1));        // PTX shift amount is a 32-bit value.        self.emit(&format!("cvt.u32.u64 {sc}, {masked};"));        sc    }    /// Zero-extend the low `bits` of a sign-extended value (the unsigned-width window the interpreter    /// reads for unsigned ops). No-op at 64 bits.    fn mask_unsigned(&mut self, src: &str, bits: u32) -> String {        if bits >= 64 {            return src.to_string();        }        let d = self.fresh(RC::Rd);        let mask: u64 = (1u64 << bits) - 1;        self.emit(&format!("and.b64 {d}, {src}, {mask};"));        d    }    /// Narrow a computed 64-bit integer result to its declared MIR width, sign-extended (mirrors the    /// interpreter's per-result `mask`). No-op for `i64`/pointer.    fn mask_int(&mut self, reg: &str, ty: &MirType) {        match ty {            MirType::I1 => self.emit(&format!("and.b64 {reg}, {reg}, 1;")),            MirType::I8 => self.emit(&format!("cvt.s64.s8 {reg}, {reg};")),            MirType::I16 => self.emit(&format!("cvt.s64.s16 {reg}, {reg};")),            MirType::I32 => self.emit(&format!("cvt.s64.s32 {reg}, {reg};")),            _ => {}        }    }    // --- compares / select ---    fn lower_cmp(&mut self, op: CmpOp, l: ValueId, r2: ValueId, res: ValueId) {        let (a, b, opnd_ty) = if op.is_float() {            // Compare in the wider operand type (Cranelift's rule), which preserves order vs the            // interpreter's f64 compare.            let common =                if matches!(self.ty(l), MirType::F64) || matches!(self.ty(r2), MirType::F64) {                    MirType::F64                } else {                    MirType::F32                };            let rc = rc_of(&common);            (self.coerce_float(l, rc), self.coerce_float(r2, rc), common)        } else {            (self.reg(l), self.reg(r2), self.ty(l))        };        let d = self.reg(res);        self.cmp_into(&d, op, &a, &b, &opnd_ty);    }    /// Emit `d = (a CMP b) ? 1 : 0` into a 64-bit `i1` holder. `opnd_ty` selects the compare width.    fn cmp_into(&mut self, d: &str, op: CmpOp, a: &str, b: &str, opnd_ty: &MirType) {        let p = self.fresh_pred();        if op.is_float() {            self.emit(&format!(                "setp.{}.{} {p}, {a}, {b};",                float_cc(op),                float_suffix(opnd_ty)            ));        } else {            self.emit(&format!("setp.{} {p}, {a}, {b};", int_cc(op)));        }        let one = self.fresh(RC::Rd);        let zero = self.fresh(RC::Rd);        self.emit(&format!("mov.b64 {one}, 1;"));        self.emit(&format!("mov.b64 {zero}, 0;"));        self.emit(&format!("selp.b64 {d}, {one}, {zero}, {p};"));    }    fn lower_select(&mut self, c: ValueId, a: ValueId, b: ValueId, rty: &MirType, res: ValueId) {        let rc = rc_of(rty);        let cc = self.reg(c);        let (av, bv) = if rty.is_float() {            (self.coerce_float(a, rc), self.coerce_float(b, rc))        } else {            (self.reg(a), self.reg(b))        };        let d = self.reg(res);        self.select_into(&d, &cc, &av, &bv, rty);    }    /// Emit `d = c ? a : b` for one (scalar or lane) value; `c` is a 64-bit `i1` (0/1).    fn select_into(&mut self, d: &str, c: &str, a: &str, b: &str, rty: &MirType) {        let rc = rc_of(rty);        let p = self.fresh_pred();        self.emit(&format!("setp.ne.s64 {p}, {c}, 0;"));        self.emit(&format!("selp.{} {d}, {a}, {b}, {p};", mov_ty(rc)));        if !rty.is_float() {            self.mask_int(d, rty);        }    }    // --- casts ---    fn lower_cast(        &mut self,        kind: CastKind,        v: ValueId,        to: &MirType,        res: ValueId,    ) -> Result<(), String> {        let from = self.ty(v);        let x = self.reg(v);        let d = self.reg(res);        self.cast_into(&d, kind, &x, &from, to)    }    /// Emit a cast `d = (to)a` for one (scalar or lane) value, mirroring `wukong_interp::apply_cast`.    fn cast_into(        &mut self,        d: &str,        kind: CastKind,        x: &str,        from: &MirType,        to: &MirType,    ) -> Result<(), String> {        use CastKind::*;        match kind {            SExt | Trunc => {                self.emit(&format!("mov.b64 {d}, {x};"));                self.mask_int(d, to);            }            ZExt => {                let u = self.mask_unsigned(x, int_bits(from));                self.emit(&format!("mov.b64 {d}, {u};"));                self.mask_int(d, to);            }            SiToFp => {                if matches!(to, MirType::F64) {                    self.emit(&format!("cvt.rn.f64.s64 {d}, {x};"));                } else {                    // Match the interpreter's i->f64->f32 double rounding exactly.                    let t = self.fresh(RC::F64);                    self.emit(&format!("cvt.rn.f64.s64 {t}, {x};"));                    self.emit(&format!("cvt.rn.f32.f64 {d}, {t};"));                }            }            UiToFp => {                let u = self.mask_unsigned(x, int_bits(from));                if matches!(to, MirType::F64) {                    self.emit(&format!("cvt.rn.f64.u64 {d}, {u};"));                } else {                    let t = self.fresh(RC::F64);                    self.emit(&format!("cvt.rn.f64.u64 {t}, {u};"));                    self.emit(&format!("cvt.rn.f32.f64 {d}, {t};"));                }            }            FpToSi => self.fp_to_int_into(d, x, from, to, true),            FpToUi => self.fp_to_int_into(d, x, from, to, false),            FpExt => {                // A bf16/f16 source must round to its grid before widening. bf16/f16 share f32's                // register, so the per-store rounding is fragile GÇö an optimizer can forward a bf16 op                // result past its store, leaving an unrounded f32 that this widen would pass through                // unchanged. Round at the observation boundary too, exactly as                // `wukong_codegen_cranelift`'s FpExt arm and the interpreter's `apply_cast` do.                let xr = match from {                    MirType::BF16 | MirType::F16 => {                        let h = self.fresh_r16();                        let t = self.fresh(RC::F32);                        let c = if matches!(from, MirType::BF16) {                            "bf16"                        } else {                            "f16"                        };                        self.emit(&format!("cvt.rn.{c}.f32 {h}, {x};"));                        self.emit(&format!("cvt.f32.{c} {t}, {h};"));                        t                    }                    _ => x.to_string(),                };                match to {                    // Widen to f64. Source is f64 already (mov) or f32/bf16/f16 held as f32 (cvt up).                    MirType::F64 => {                        if rc_of(from) == RC::F64 {                            self.emit(&format!("mov.f64 {d}, {xr};"));                        } else {                            self.emit(&format!("cvt.f64.f32 {d}, {xr};"));                        }                    }                    // bf16/f16 -> f32: loads/casts already widen low-precision floats into an f32                    // register, so after the grid rounding above the widening is just a move.                    MirType::F32 => self.emit(&format!("mov.f32 {d}, {xr};")),                    _ => return Err(format!("{UNSUPPORTED} FpExt to {:?}", to)),                }            }            FpTrunc => {                // Demote an f64 source to f32 first; the result reg is always f32 (rc_of bf16/f16/f32).                let src = if rc_of(from) == RC::F64 {                    let t = self.fresh(RC::F32);                    self.emit(&format!("cvt.rn.f32.f64 {t}, {x};"));                    t                } else {                    x.to_string()                };                match to {                    MirType::F32 => self.emit(&format!("mov.f32 {d}, {src};")),                    // Round to the bf16/f16 grid (RNE) and widen back to f32 GÇö matches the                    // interpreter's round_bf16/round_f16 (tolerance-gated).                    MirType::BF16 => {                        let h = self.fresh_r16();                        self.emit(&format!("cvt.rn.bf16.f32 {h}, {src};"));                        self.emit(&format!("cvt.f32.bf16 {d}, {h};"));                    }                    MirType::F16 => {                        let h = self.fresh_r16();                        self.emit(&format!("cvt.rn.f16.f32 {h}, {src};"));                        self.emit(&format!("cvt.f32.f16 {d}, {h};"));                    }                    _ => {                        return Err(format!("{UNSUPPORTED} FpTrunc to {:?}", to));                    }                }            }            Bitcast => self.bitcast_into(d, x, from, to),            IntToPtr | PtrToInt => self.emit(&format!("mov.b64 {d}, {x};")),        }        Ok(())    }    fn fp_to_int_into(&mut self, d: &str, x: &str, from: &MirType, to: &MirType, signed: bool) {        let fsfx = float_suffix(from);        let s = if signed { 's' } else { 'u' };        let w = match to {            MirType::I8 => 8,            MirType::I16 => 16,            MirType::I64 => 64,            _ => 32,        };        // PTX float->int `cvt` *saturates* to the destination integer type (out-of-range clamps to the        // type's min/max; NaN -> 0) GÇö exactly the Rust `as` / interpreter / Cranelift `fcvt_to_*_sat`        // semantics. For a 32/64-bit target the single `cvt` is the whole story.        if w == 64 {            self.emit(&format!("cvt.rzi.{s}64.{fsfx} {d}, {x};"));        } else if w == 32 {            // Saturating cvt to a 32-bit temp, then sign/zero-extend into the 64-bit holder. `mask_int`            // is a no-op for i32 (the extend already canonicalizes) but keeps the i1 fallback (`& 1`).            let t = self.fresh_r32();            self.emit(&format!("cvt.rzi.{s}32.{fsfx} {t}, {x};"));            self.emit(&format!("cvt.{s}64.{s}32 {d}, {t};"));            self.mask_int(d, to);        } else {            // Narrow (i8/i16/u8/u16): PTX can only cvt-saturate to i32/u32, so saturate to 32 bits then            // CLAMP to the narrow type's range and reduce GÇö mirroring Cranelift's `fcvt_to_int_sat`            // (smin/smax for signed; umin for unsigned, whose lower bound is already 0 from the            // unsigned saturation). This makes e.g. `300.0 as u8 == 255`, `-300.0 as i8 == -128`,            // `-1.0 as u8 == 0`, not the mod-2^w truncation the old `mask_int` produced.            let t = self.fresh_r32();            self.emit(&format!("cvt.rzi.{s}32.{fsfx} {t}, {x};"));            if signed {                let (lo, hi) = if w == 8 { (-128, 127) } else { (-32768, 32767) };                self.emit(&format!("min.s32 {t}, {t}, {hi};"));                self.emit(&format!("max.s32 {t}, {t}, {lo};"));                self.emit(&format!("cvt.s64.s32 {d}, {t};"));            } else {                let hi = if w == 8 { 255 } else { 65535 };                self.emit(&format!("min.u32 {t}, {t}, {hi};"));                self.emit(&format!("cvt.u64.u32 {d}, {t};"));                // `cvt.u64.u32` leaves the clamped value ZERO-extended, but every integer register in                // this backend is kept SIGN-extended to its MIR width (the interpreter's `mask`). Skip                // this and `250.0 as u8` sits in the register as +250 while `const.i8 250` materializes                // as -6, so a following `setp.eq.s64` against it is false. The signed branch above is                // already canonical (`cvt.s64.s32` after the clamp sign-extends).                self.mask_int(d, to);            }        }    }    fn bitcast_into(&mut self, d: &str, x: &str, from: &MirType, to: &MirType) {        match (from, to) {            (MirType::I32, MirType::F32) => {                let lo = self.fresh_r32();                self.emit(&format!("cvt.u32.u64 {lo}, {x};"));                self.emit(&format!("mov.b32 {d}, {lo};"));            }            (MirType::F32, MirType::I32) => {                let lo = self.fresh_r32();                self.emit(&format!("mov.b32 {lo}, {x};"));                self.emit(&format!("cvt.s64.s32 {d}, {lo};"));            }            (MirType::I64, MirType::F64) | (MirType::F64, MirType::I64) => {                self.emit(&format!("mov.b64 {d}, {x};"));            }            _ => {                // Same-class passthrough.                self.emit(&format!("mov.{} {d}, {x};", mov_ty(rc_of(to))));            }        }    }    // --- memory ---    fn lower_load(&mut self, p: ValueId, ty: &MirType, res: ValueId) -> Result<(), String> {        let addr = self.reg(p);        let d = self.reg(res);        self.load_into(&d, &addr, ty, self.is_shared_ptr(p))    }    /// Load one (scalar or lane) value of MIR type `ty` from address `addr` into `d`.    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType, _shared: bool) -> Result<(), String> {        // User `shared [T; N]` allocas are addressed via `cvta.shared` (generic state space), exactly        // like `.local` allocas use `cvta.local` + generic `ld.*` GÇö never `ld.local` / `ld.shared`.        let ld = |op: &str| format!("ld.{op}");        match ty {            // `i1` occupies ONE byte in memory (`size_of(I1) == 1`, and `Op::Gep` strides bools by 1),            // exactly like Cranelift's `types::I8` mapping GÇö so it must be accessed with `ld.u8`. A            // 4-byte access would read three neighbouring bools (or run past the frame) and, on an            // odd address, faults the device outright with CUDA_ERROR_MISALIGNED_ADDRESS.            MirType::I1 => {                let w = self.fresh_r32();                self.emit(&format!("ld.u8 {w}, [{addr}];"));                self.emit(&format!("cvt.u64.u32 {d}, {w};"));                self.mask_int(d, ty);            }            MirType::F32 => self.emit(&format!("{} {d}, [{addr}];", ld("f32"))),            MirType::F64 => self.emit(&format!("{} {d}, [{addr}];", ld("f64"))),            MirType::I64 | MirType::Ptr => self.emit(&format!("{} {d}, [{addr}];", ld("u64"))),            // bf16/f16 storage is 2 bytes; load the 16 bits and widen to the f32 register.            MirType::BF16 => {                let h = self.fresh_r16();                self.emit(&format!("{} {h}, [{addr}];", ld("u16")));                self.emit(&format!("cvt.f32.bf16 {d}, {h};"));            }            MirType::F16 => {                let h = self.fresh_r16();                self.emit(&format!("{} {h}, [{addr}];", ld("u16")));                self.emit(&format!("cvt.f32.f16 {d}, {h};"));            }            MirType::I8 => {                let w = self.fresh_r32();                self.emit(&format!("ld.s8 {w}, [{addr}];"));                self.emit(&format!("cvt.s64.s32 {d}, {w};"));            }            MirType::I16 => {                let w = self.fresh_r32();                self.emit(&format!("ld.s16 {w}, [{addr}];"));                self.emit(&format!("cvt.s64.s32 {d}, {w};"));            }            // i32: load 32 bits, sign-extend to 64.            MirType::I32 => {                let w = self.fresh_r32();                self.emit(&format!("ld.u32 {w}, [{addr}];"));                self.emit(&format!("cvt.s64.s32 {d}, {w};"));            }            // An aggregate/void has no single-register load. Falling through to the 4-byte `ld.u32`            // would emit *plausible but wrong* PTX (a `load [2 x i32]` would read only its first            // element) GÇö the contract is to decline so the gate reports it as not-yet-covered.            MirType::Vec(..) | MirType::Array(..) | MirType::Void => {                return Err(format!("{UNSUPPORTED} load of aggregate type {ty:?}"))            }        }        Ok(())    }    fn lower_store(&mut self, ptr: ValueId, value: ValueId) -> Result<(), String> {        let vty = self.ty(value);        let addr = self.reg(ptr);        // Vector store: write each lane at addr + i*sizeof(lane).        if let MirType::Vec(elem, n) = &vty {            let elem = (**elem).clone();            let esz = size_of(&elem);            let lanes = self.lanes(value)?;            for (i, lv) in lanes.into_iter().enumerate().take(*n as usize) {                let la = if i == 0 {                    addr.clone()                } else {                    let t = self.fresh(RC::Rd);                    self.emit(&format!("add.s64 {t}, {addr}, {};", i as u64 * esz));                    t                };                self.store_into(&la, &lv, &elem, false)?;            }            return Ok(());        }        let v = self.reg(value);        self.store_into(&addr, &v, &vty, self.is_shared_ptr(ptr))    }    /// A store predicate prefix: in mega mode every store targets the *shared* frame, so only    /// `tid==0` may write it (the SPMD threads otherwise race on identical data and multiply the    /// atomic print counter); in single-thread mode it is empty (unconditional).    fn st_guard(&self) -> String {        if self.mega {            format!("@{} ", self.tid0)        } else {            String::new()        }    }    /// Store one (scalar or lane) value `v` of MIR type `ty` to address `addr`.    fn store_into(&mut self, addr: &str, v: &str, ty: &MirType, _shared: bool) -> Result<(), String> {        // Mirror `load_into`: `cvta.shared` addresses use generic `st.*`, not `st.shared.*`.        let st = |op: &str| format!("st.{op}");        let g = self.st_guard();        match ty {            MirType::F32 => self.emit(&format!("{g}{} [{addr}], {v};", st("f32"))),            MirType::F64 => self.emit(&format!("{g}{} [{addr}], {v};", st("f64"))),            MirType::I64 => self.emit(&format!("{g}{} [{addr}], {v};", st("u64"))),            // A pointer homed in the shared frame (an inlined function's Tensor/array param slot) is a            // UNIFORM value across the SPMD threads GÇö it is frame-base / kernel-param derived, never a            // loaded, per-thread-varying value. It must be stored *unconditionally* (no `@tid0` guard):            // in a megakernel the scalar glue can `load` that slot on **every** thread and dereference            // it (e.g. a non-recognized reduction over a Tensor param), so a `tid==0`-only store would            // leave the zero-initialized slot on threads != 0 and their deref of that null pointer            // faults (CUDA_ERROR_ILLEGAL_ADDRESS) GÇö even though the result is ultimately discarded.            // Writing the same pointer from all threads is a benign identical-data race (a pointer slot            // is homed once, never read-modify-written), so every thread reads the correct base. In the            // single-thread lowering `st_guard` is empty anyway, so this is a no-op there.            MirType::Ptr => self.emit(&format!("st.u64 [{addr}], {v};")),            // bf16/f16 storage is 2 bytes; narrow the f32 value to 16 bits, store the raw u16.            MirType::BF16 => {                let h = self.fresh_r16();                self.emit(&format!("cvt.rn.bf16.f32 {h}, {v};"));                self.emit(&format!("{g}st.u16 [{addr}], {h};"));            }            MirType::F16 => {                let h = self.fresh_r16();                self.emit(&format!("cvt.rn.f16.f32 {h}, {v};"));                self.emit(&format!("{g}st.u16 [{addr}], {h};"));            }            // `i1` is a ONE-byte object (see `load_into`): store the low byte, masked to 0/1 so the            // byte read back is canonical whatever produced the value.            MirType::I1 => {                let w = self.fresh_r32();                self.emit(&format!("cvt.u32.u64 {w}, {v};"));                self.emit(&format!("and.b32 {w}, {w}, 1;"));                self.emit(&format!("{g}st.u8 [{addr}], {w};"));            }            // Narrow stores take a 32-bit source register (low bits); narrow the 64-bit value first.            MirType::I8 => {                let w = self.fresh_r32();                self.emit(&format!("cvt.u32.u64 {w}, {v};"));                self.emit(&format!("{g}st.u8 [{addr}], {w};"));            }            MirType::I16 => {                let w = self.fresh_r32();                self.emit(&format!("cvt.u32.u64 {w}, {v};"));                self.emit(&format!("{g}st.u16 [{addr}], {w};"));            }            MirType::I32 => {                let w = self.fresh_r32();                self.emit(&format!("cvt.u32.u64 {w}, {v};"));                self.emit(&format!("{g}st.u32 [{addr}], {w};"));            }            // As in `load_into`: an aggregate/void has no single-register store, and a 4-byte            // `st.u32` would write only part of it. Decline instead of emitting a partial write.            MirType::Vec(..) | MirType::Array(..) | MirType::Void => {                return Err(format!("{UNSUPPORTED} store of aggregate type {ty:?}"))            }        }        Ok(())    }    // --- SIMD (vector) lowering: scalarize each `<N x T>` op into N lane ops ---    /// The N lane registers of a SIMD value (materialized by the op that produced it, or    /// pre-assigned by [`assign_vector_block_params`](Self::assign_vector_block_params) when the    /// value is a block param).    fn lanes(&mut self, v: ValueId) -> Result<Vec<String>, String> {        self.vlanes            .get(&v.0)            .cloned()            .ok_or_else(|| format!("{UNSUPPORTED} SIMD value v{} used before definition", v.0))    }    /// Give every **vector-typed block param** its own register per lane, before any block is    /// emitted.    ///    /// A vector block param is how a loop carries a SIMD value across iterations GÇö the vectorized    /// reduction accumulator is exactly this shape GÇö and it has to be pre-assigned rather than    /// materialized on first use, because the *edge* that writes it (`emit_edge`, in a predecessor    /// block) runs before the block that reads it. Everything else here scalarizes a vector as N    /// registers produced by one op, so the only new obligation is that the two sides agree on which    /// N registers; a fixed pre-assignment is that agreement.    fn assign_vector_block_params(&mut self) {        let params: Vec<ValueId> = self            .func            .blocks            .iter()            .flat_map(|b| b.params.iter().copied())            .collect();        for p in params {            if let MirType::Vec(lane, n) = self.ty(p) {                let rc = rc_of(&lane);                let mut lanes = Vec::with_capacity(n as usize);                for _ in 0..n {                    lanes.push(self.fresh(rc));                }                self.vlanes.insert(p.0, lanes);            }        }    }    /// Address of lane `i` given a base address register and the lane byte size.    fn lane_addr(&mut self, base: &str, i: usize, esz: u64) -> String {        if i == 0 {            base.to_string()        } else {            let t = self.fresh(RC::Rd);            self.emit(&format!("add.s64 {t}, {base}, {};", i as u64 * esz));            t        }    }    /// Scalarize a vectorized (`<N x T>`) instruction into N lane operations, reusing the same    /// reg-based emitters the scalar path uses. Vector loads/stores stride by the lane size; a `Splat`    /// aliases the scalar across all lanes. (Vectorized values are produced and consumed within one    /// block, so there are no vector block params to thread.)    fn lower_vec_inst(        &mut self,        inst: &wukong_mir::Inst,        r: ValueId,        rty: &MirType,    ) -> Result<(), String> {        let n = match rty {            MirType::Vec(_, n) => *n as usize,            _ => unreachable!("lower_vec_inst on non-vector"),        };        let lane = rty.lane_type().clone();        let lane_rc = rc_of(&lane);        let out: Vec<String> = match &inst.op {            Op::Splat(s) => {                let sr = self.reg(*s);                vec![sr; n]            }            Op::Load(p, _) => {                let addr = self.reg(*p);                let esz = size_of(&lane);                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let la = self.lane_addr(&addr, i, esz);                    let d = self.fresh(lane_rc);                    self.load_into(&d, &la, &lane, false)?;                    ls.push(d);                }                ls            }            Op::Bin(op, l, r2) => {                let la = self.lanes(*l)?;                let lb = self.lanes(*r2)?;                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let d = self.fresh(lane_rc);                    self.bin_into(&d, *op, &la[i], &lb[i], &lane)?;                    ls.push(d);                }                ls            }            Op::Fma(a, b, c) => {                let la = self.lanes(*a)?;                let lb = self.lanes(*b)?;                let lc = self.lanes(*c)?;                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let d = self.fresh(lane_rc);                    self.fma_into(&d, &la[i], &lb[i], &lc[i], &lane);                    ls.push(d);                }                ls            }            Op::Sqrt(v) => {                let lv = self.lanes(*v)?;                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let d = self.fresh(lane_rc);                    self.sqrt_into(&d, &lv[i], &lane);                    ls.push(d);                }                ls            }            Op::Round(mode, v) => {                let lv = self.lanes(*v)?;                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let d = self.fresh(lane_rc);                    self.round_into(&d, *mode, &lv[i], &lane);                    ls.push(d);                }                ls            }            Op::Neg(v) => {                let lv = self.lanes(*v)?;                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let d = self.fresh(lane_rc);                    self.neg_into(&d, &lv[i], &lane);                    ls.push(d);                }                ls            }            Op::Not(v) => {                let lv = self.lanes(*v)?;                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let d = self.fresh(lane_rc);                    self.not_into(&d, &lv[i], &lane);                    ls.push(d);                }                ls            }            Op::Cmp(op, l, r2) => {                let opnd_lane = self.ty(*l).lane_type().clone();                let la = self.lanes(*l)?;                let lb = self.lanes(*r2)?;                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let d = self.fresh(RC::Rd);                    self.cmp_into(&d, *op, &la[i], &lb[i], &opnd_lane);                    ls.push(d);                }                ls            }            Op::Select(c, a, b) => {                let lc = self.lanes(*c)?;                let la = self.lanes(*a)?;                let lb = self.lanes(*b)?;                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let d = self.fresh(lane_rc);                    self.select_into(&d, &lc[i], &la[i], &lb[i], &lane);                    ls.push(d);                }                ls            }            Op::Cast(kind, v, to) => {                let from_lane = self.ty(*v).lane_type().clone();                let to_lane = to.lane_type().clone();                let lv = self.lanes(*v)?;                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let d = self.fresh(rc_of(&to_lane));                    self.cast_into(&d, *kind, &lv[i], &from_lane, &to_lane)?;                    ls.push(d);                }                ls            }            // The lane ramp `<0, 1, .., n-1>` the loop vectorizer emits for a value-carrying            // induction variable (`splat(i) + iota`). Every lane is a small non-negative integer, so            // materializing lane k as the 64-bit constant k is exact for every lane type the verifier            // admits (integer lanes, n <= 16) GÇö the same values `wukong_interp` pushes untruncated            // and the same ones Cranelift's `vconst` pool holds. `rc_of` maps every integer type to            // `RC::Rd`, so `mov.b64` is the lane class every consumer of these lanes expects.            Op::Iota(_) => {                let mut ls = Vec::with_capacity(n);                for i in 0..n {                    let d = self.fresh(RC::Rd);                    self.emit(&format!("mov.b64 {d}, {i};"));                    ls.push(d);                }                ls            }            other => {                return Err(format!(                    "{UNSUPPORTED} SIMD op {other:?} not yet lowered to PTX"                ))            }        };        self.vlanes.insert(r.0, out);        Ok(())    }    // --- calls / intrinsics ---    fn lower_call(        &mut self,        func: Symbol,        args: &[ValueId],        result: Option<ValueId>,    ) -> Result<(), String> {        if let Some(&idx) = self.func_idx.get(&func) {            return self.lower_user_call(idx, args, result);        }        let name = self.interner.resolve(func).to_string();        // Side effects share both paths (their record/flag writes are mega-guarded internally).        match name.as_str() {            "print" | "println" => return self.lower_print(args),            "assert" => return self.lower_assert(args),            _ => {}        }        // Mega mode: bracket every recognized op with `bar.sync` and run it cooperatively (or        // `tid==0`-serial) over the shared frame. The single-thread dispatch below is left intact.        if self.mega {            return self.lower_call_mega(&name, args, result);        }        match name.as_str() {            // The elementwise transcendental kernel dispatches on a compile-time op code; only lower            // the ops `mrt_vmath` implements (a few inverse fns need an atan polynomial, not yet done).            // The bf16/f16 variants share the op-switch (and the op gate) GÇö only the input load differs.            // NOTE: every spelling `rt_helper` maps to `mrt_vmath*` must be listed here, or it falls            // through to the generic `other =>` arm below and reaches the helper with this op-code            // gate BYPASSED GÇö an unimplemented op would then silently run `mrt_vmath`'s identity            // default instead of declining.            "wukong_vmath_f32"            | "wukong_vmath_f32_parallel"            | "wukong_vmath_bf16"            | "wukong_vmath_f16"                if args.len() == 4 =>            {                let op = self                    .const_ints                    .get(&args[3].0)                    .copied()                    .ok_or_else(|| format!("{UNSUPPORTED} vmath op code is not a constant"))?;                if vmath_supported(op) {                    let pname = match name.as_str() {                        "wukong_vmath_bf16" => "mrt_vmath_bf16",                        "wukong_vmath_f16" => "mrt_vmath_f16",                        _ => "mrt_vmath",                    };                    self.emit_helper_call(pname, None, args, None);                    Ok(())                } else {                    Err(format!(                        "{UNSUPPORTED} vmath op {op} not yet lowered to PTX"                    ))                }            }            // Two-arg transcendentals: pow(0)/atan2(1)/hypot(2), dispatched on a compile-time op code.            "wukong_vmath2_f32" if args.len() == 5 => {                let op = self                    .const_ints                    .get(&args[4].0)                    .copied()                    .ok_or_else(|| format!("{UNSUPPORTED} vmath2 op code is not a constant"))?;                if matches!(op, 0..=2) {                    self.emit_helper_call("mrt_vmath2", None, args, None);                    Ok(())                } else {                    Err(format!(                        "{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"                    ))                }            }            // `wukong_parallel_for(n, func_addr F, ctx)`: the @parallel outliner splits `[0,n)` into            // per-core chunks and runs `F(lo, hi, ctx)` on each. The chunking is deterministic and the            // outlined body is chunk-decomposable, so a single sequential chunk `F(0, n, ctx)` gives            // the same result as the interpreter (serial == parallel).            //            // This path is the ONE-THREAD kernel (`run_on_device` launches 1x1), so the sequential            // chunk is not a missing optimization here GÇö there is no second thread to give iterations            // to. The parallel form is `emit_parallel_for_gridstride` in mega mode, where the launch            // really is a block of threads; a program mega declines falls back here, and this            // lowering is what that fallback (and the differential gate) rests on.            "wukong_parallel_for" if args.len() == 3 => {                let sym = self.func_addr_of.get(&args[1].0).copied().ok_or_else(|| {                    format!("{UNSUPPORTED} wukong_parallel_for target is not a func_addr")                })?;                let idx = *self.func_idx.get(&sym).ok_or_else(|| {                    format!(                        "{UNSUPPORTED} wukong_parallel_for target `{}` is not a known function",                        self.interner.resolve(sym)                    )                })?;                let zero = self.fresh(RC::Rd);                self.emit(&format!("mov.b64 {zero}, 0;"));                let n_reg = self.reg(args[0]);                let ctx_reg = self.reg(args[2]);                // F(lo=0, hi=n, ctx); all three args are 64-bit (i64 count / pointers).                let arg_regs = vec![(zero, "b64"), (n_reg, "b64"), (ctx_reg, "b64")];                self.emit_call_to(idx, &arg_regs, None);                Ok(())            }            other => {                if let Some(h) = rt_helper(other) {                    self.emit_helper_call(h.ptx_name, h.ret, args, result);                    Ok(())                } else {                    Err(format!(                        "{UNSUPPORTED} call to `{other}` not yet lowered to PTX"                    ))                }            }        }    }    /// Mega-mode dispatch of one recognized op: bracket it with `bar.sync` (so the cooperating    /// threads see the prior `tid==0` setup and the next `tid==0` read sees this op's output), and run    /// it one of three ways GÇö a block-wide *tree* (`Reduce`, result broadcast to every thread),    /// **chunked-cooperative** over disjoint per-thread sub-ranges of the serial helper    /// (`Vmath`/`Vmath2`/`Velem` by elements, `Gemm*`/`I8GemmNt` by output rows, `Norm`/`NormAffine`    /// by rows GÇö see [`emit_chunked_call`](Self::emit_chunked_call)), or `tid==0`-serial (the    /// remaining ops, e.g. axpby and the bf16/f16 reductions). An unsupported op code GÇö and    /// `wukong_parallel_for`, which has no cooperative form GÇö declines with `UNSUPPORTED:` so the    /// whole program falls back to the single-thread path.    fn lower_call_mega(        &mut self,        name: &str,        args: &[ValueId],        result: Option<ValueId>,    ) -> Result<(), String> {        use crate::fusion::{classify_call, CallClass, CoopKind};        let CallClass::Coop(kind) = classify_call(name) else {            return Err(format!(                "{UNSUPPORTED} mega call to `{name}` (not a cooperative op)"            ));        };        // Op-code gates, mirroring the single-thread dispatch.        match kind {            CoopKind::Vmath if args.len() == 4 => {                let op = self                    .const_ints                    .get(&args[3].0)                    .copied()                    .ok_or_else(|| format!("{UNSUPPORTED} vmath op code is not a constant"))?;                if !vmath_supported(op) {                    return Err(format!(                        "{UNSUPPORTED} vmath op {op} not yet lowered to PTX"                    ));                }            }            CoopKind::Vmath2 if args.len() == 5 => {                let op = self                    .const_ints                    .get(&args[4].0)                    .copied()                    .ok_or_else(|| format!("{UNSUPPORTED} vmath2 op code is not a constant"))?;                if !matches!(op, 0..=2) {                    return Err(format!(                        "{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"                    ));                }            }            CoopKind::ParallelFor if args.len() != 3 => {                return Err(format!(                    "{UNSUPPORTED} wukong_parallel_for takes 3 args, got {}",                    args.len()                ));            }            _ => {}        }        self.emit("bar.sync 0;");        match kind {            // Cooperative reduction across the whole block; the result is broadcast to every thread.            CoopKind::Reduce => {                self.emit_helper_call_pred("mrt_sreduce_coop", Some(RC::F32), args, result, false);            }            // Elementwise: each thread runs the serial `mrt_*` over a contiguous slice of the `n`            // elements. `mrt_vmath`(x,out,n,op) / `mrt_vmath2`(a,b,out,n,op) / `mrt_velem`(x,y,out,n,            // a,b,c,op). The vmath INPUT is f32 (4 B) or bf16/f16 storage (2 B), but its OUTPUT is            // *always* f32 (4 B) GÇö the activation result is computed and stored in f32 GÇö so the two            // pointers can have different per-element strides (a 2/4 mismatch was a misaligned store).            CoopKind::Vmath => {                // Keyed on the f32 family (`wukong_vmath_f32` and its `_parallel` twin), NOT on the                // one exact serial spelling: giving an f32 input buffer the bf16 2-byte stride would                // walk each thread's chunk over the wrong half of the array.                let in_esz = if name.starts_with("wukong_vmath_f32") {                    4                } else {                    2                };                let h = rt_helper(name).ok_or_else(|| {                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")                })?;                self.emit_chunked_call(                    h.ptx_name,                    h.ret,                    args,                    result,                    2,                    &[(0, Stride::Const(in_esz)), (1, Stride::Const(4))],                );            }            CoopKind::Vmath2 => {                let h = rt_helper(name).ok_or_else(|| {                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")                })?;                self.emit_chunked_call(                    h.ptx_name,                    h.ret,                    args,                    result,                    3,                    &[                        (0, Stride::Const(4)),                        (1, Stride::Const(4)),                        (2, Stride::Const(4)),                    ],                );            }            CoopKind::Velem => {                let h = rt_helper(name).ok_or_else(|| {                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")                })?;                self.emit_chunked_call(                    h.ptx_name,                    h.ret,                    args,                    result,                    3,                    &[                        (0, Stride::Const(4)),                        (1, Stride::Const(4)),                        (2, Stride::Const(4)),                    ],                );            }            // GEMM: the output rows are independent, so chunk `m` (rows). C[i,:] = A[i,:]-+Bß¦Ç (+epi):            // each thread owns a contiguous A-row / C-row block; B / bias / beta / act are shared. A-row            // = `k` elems, C-row = `n` elems. (a=0, b=1, c=2, m=3, k=4, n=5, ...)            CoopKind::Gemm | CoopKind::GemmNt | CoopKind::GemmNtEpi => {                let h = rt_helper(name).ok_or_else(|| {                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")                })?;                self.emit_chunked_call(                    h.ptx_name,                    h.ret,                    args,                    result,                    3,                    &[(0, Stride::Arg(4, 4)), (2, Stride::Arg(5, 4))],                );            }            // int8 GEMM: A rows are u8 (`k`*1 B), C rows are i32 (`n`*4 B).            CoopKind::I8GemmNt => {                let h = rt_helper(name).ok_or_else(|| {                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")                })?;                self.emit_chunked_call(                    h.ptx_name,                    h.ret,                    args,                    result,                    3,                    &[(0, Stride::Arg(4, 1)), (2, Stride::Arg(5, 4))],                );            }            // Row-wise norm: each row's softmax/LayerNorm/RMSNorm is independent -> chunk `rows`.            // (x=0, out=1, rows=2, cols=3, ...); each row is `cols` f32.            CoopKind::Norm => {                let h = rt_helper(name).ok_or_else(|| {                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")                })?;                self.emit_chunked_call(                    h.ptx_name,                    h.ret,                    args,                    result,                    2,                    &[(0, Stride::Arg(3, 4)), (1, Stride::Arg(3, 4))],                );            }            // Affine norm: (x=0, out=1, gamma=2, beta=3, rows=4, cols=5, ...); gamma/beta are            // per-column (shared across rows), so only x/out are row-offset by `cols`*4 B.            CoopKind::NormAffine => {                let h = rt_helper(name).ok_or_else(|| {                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")                })?;                self.emit_chunked_call(                    h.ptx_name,                    h.ret,                    args,                    result,                    4,                    &[(0, Stride::Arg(5, 4)), (1, Stride::Arg(5, 4))],                );            }            // The generic `@parallel` outline: a grid-stride loop over the independent domain.            CoopKind::ParallelFor => self.emit_parallel_for_gridstride(args)?,            // Serial on `tid==0` over the shared frame (correct; cooperative bodies land later for            // the remaining ops GÇö e.g. axpby).            _ => {                let h = rt_helper(name).ok_or_else(|| {                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")                })?;                self.emit_helper_call_pred(h.ptx_name, h.ret, args, result, true);            }        }        self.emit("bar.sync 0;");        Ok(())    }    /// **Grid-stride lowering of `wukong_parallel_for(n, func_addr F, ctx)`** (mega mode) GÇö the    /// `@parallel` half of Phase 1.    ///    /// Iteration `i` runs on the thread with flat id `i mod stride`, where    /// `stride = blockDim.x * gridDim.x`, as the one-iteration chunk `F(i, i+1, ctx)`:    ///    /// ```text    /// for (i = threadIdx.x + blockIdx.x*blockDim.x; i < n; i += blockDim.x*gridDim.x)    ///     F(i, i+1, ctx);    /// ```    ///    /// **Why per-iteration chunks and not one contiguous range per thread.** Both partitions are    /// legal (see `fusion::parallel_for_is_cooperative` for what makes any partition legal), and a    /// contiguous range would be one call per thread instead of one per iteration. But neighbouring    /// *threads* would then touch addresses `chunk` elements apart, which is the uncoalesced access    /// pattern; with the grid-stride interleave, lane `t` and lane `t+1` of a warp read adjacent    /// elements, which is what a hand-written CUDA elementwise kernel does and the only shape that    /// can approach memory throughput. The cost is a `.func` call per iteration, and buying    /// coalescing with it is the right trade on a memory-bound loop; a compute-bound body would    /// prefer the other partition, which is a scheduling decision this phase does not have a place    /// to record yet.    ///    /// **Why the trip count is uniform.** The loop runs `ceil(n/stride)` times on *every* thread and    /// the tail is absorbed by passing an empty range (`hi = min(i+1, n)`, so `hi <= lo` once    /// `i >= n`, and the callee's `lo..hi` loop body never executes) rather than by exiting early.    /// A `call.uni` inside a region some threads have left is undefined, and every other call this    /// file emits is `call.uni`; keeping the loop convergent keeps that one convention instead of    /// introducing a divergent-call rule for one op. `n <= 0` skips the loop outright GÇö computing    /// `ceil(n/stride)` unsigned on a negative `n` would spin ~2^64 times over empty ranges.    ///    /// The caller (`lower_call_mega`) brackets this with `bar.sync`, which is what makes the ctx    /// struct written by `tid==0` visible to every thread before the first call, and the results    /// visible to whatever `tid==0` reads next.    fn emit_parallel_for_gridstride(&mut self, args: &[ValueId]) -> Result<(), String> {        let sym = self.func_addr_of.get(&args[1].0).copied().ok_or_else(|| {            format!("{UNSUPPORTED} wukong_parallel_for target is not a func_addr")        })?;        let idx = *self.func_idx.get(&sym).ok_or_else(|| {            format!(                "{UNSUPPORTED} wukong_parallel_for target `{}` is not a known function",                self.interner.resolve(sym)            )        })?;        let n = self.reg(args[0]);        let ctx = self.reg(args[2]);        // stride = ntid.x * nctaid.x ; i = tid.x + ctaid.x*ntid.x   (both 64-bit)        let tid32 = self.fresh_r32();        let ntid32 = self.fresh_r32();        let ctaid32 = self.fresh_r32();        let nctaid32 = self.fresh_r32();        self.emit(&format!("mov.u32 {tid32}, %tid.x;"));        self.emit(&format!("mov.u32 {ntid32}, %ntid.x;"));        self.emit(&format!("mov.u32 {ctaid32}, %ctaid.x;"));        self.emit(&format!("mov.u32 {nctaid32}, %nctaid.x;"));        let i = self.fresh(RC::Rd);        let stride = self.fresh(RC::Rd);        let t = self.fresh(RC::Rd);        self.emit(&format!("cvt.u64.u32 {i}, {tid32};"));        self.emit(&format!("cvt.u64.u32 {stride}, {ntid32};"));        self.emit(&format!("cvt.u64.u32 {t}, {ctaid32};"));        self.emit(&format!("mul.lo.s64 {t}, {t}, {stride};"));        self.emit(&format!("add.s64 {i}, {i}, {t};"));        let ncta = self.fresh(RC::Rd);        self.emit(&format!("cvt.u64.u32 {ncta}, {nctaid32};"));        self.emit(&format!("mul.lo.s64 {stride}, {stride}, {ncta};"));        let lbl = self.n_lbl;        self.n_lbl += 1;        // Empty domain: nothing to do (and `ceil(n/stride)` unsigned on n<=0 is a ~2^64 trip count).        let pempty = self.fresh_pred();        self.emit(&format!("setp.le.s64 {pempty}, {n}, 0;"));        self.emit(&format!("@{pempty} bra PFOR_END{lbl};"));        // trip = ceil(n / stride), the same value on every thread.        let trip = self.fresh(RC::Rd);        self.emit(&format!("add.s64 {trip}, {n}, {stride};"));        self.emit(&format!("sub.s64 {trip}, {trip}, 1;"));        self.emit(&format!("div.u64 {trip}, {trip}, {stride};"));        let c = self.fresh(RC::Rd);        self.emit(&format!("mov.b64 {c}, 0;"));        self.body.push_str(&format!("PFOR{lbl}:\n"));        let pdone = self.fresh_pred();        self.emit(&format!("setp.ge.s64 {pdone}, {c}, {trip};"));        self.emit(&format!("@{pdone} bra PFOR_END{lbl};"));        // hi = min(i+1, n): the real one-iteration range, or an empty one on the tail threads.        let hi = self.fresh(RC::Rd);        self.emit(&format!("add.s64 {hi}, {i}, 1;"));        self.emit(&format!("min.s64 {hi}, {hi}, {n};"));        let arg_regs = vec![(i.clone(), "b64"), (hi, "b64"), (ctx.clone(), "b64")];        self.emit_call_to(idx, &arg_regs, None);        self.emit(&format!("add.s64 {i}, {i}, {stride};"));        self.emit(&format!("add.s64 {c}, {c}, 1;"));        self.emit(&format!("bra PFOR{lbl};"));        self.body.push_str(&format!("PFOR_END{lbl}:\n"));        Ok(())    }    /// Emit a call to a device-side runtime helper (`mrt_*`): declare a param scope, pass each arg by    /// its ABI type, call, and bind the return (if any). Same convention as a user-function call.    fn emit_helper_call(        &mut self,        ptx_name: &str,        ret: Option<RC>,        args: &[ValueId],        result: Option<ValueId>,    ) {        self.emit_helper_call_pred(ptx_name, ret, args, result, false);    }    /// As [`emit_helper_call`], but when `tid0_guard` the `call.uni` itself is predicated on    /// `tid==0` GÇö the mega-mode "serial recognized op" path: a single thread runs the naive `mrt_*`    /// over the shared frame (bracketed by `bar.sync` at the call site), the rest idle. Arg marshaling    /// and result `ld.param` stay unpredicated (per-thread param space; non-zero threads' result is    /// discarded by the `tid==0`-guarded store that consumes it).    fn emit_helper_call_pred(        &mut self,        ptx_name: &str,        ret: Option<RC>,        args: &[ValueId],        result: Option<ValueId>,        tid0_guard: bool,    ) {        let arg_regs: Vec<(String, &'static str)> = args            .iter()            .map(|a| (self.reg(*a), abi_ty(self.func.value_type(*a))))            .collect();        self.emit_helper_call_regs(ptx_name, ret, &arg_regs, result, tid0_guard);    }    /// As [`emit_helper_call_pred`] but with pre-built `(reg, abi)` argument pairs GÇö lets the    /// chunked-cooperative path pass *adjusted* pointer/count registers (each thread's sub-range)    /// without re-deriving them from `ValueId`s.    fn emit_helper_call_regs(        &mut self,        ptx_name: &str,        ret: Option<RC>,        arg_regs: &[(String, &'static str)],        result: Option<ValueId>,        tid0_guard: bool,    ) {        let g = if tid0_guard {            format!("@{} ", self.tid0)        } else {            String::new()        };        self.emit("{");        for (i, (_, abi)) in arg_regs.iter().enumerate() {            self.emit(&format!(".param .{abi} _a{i};"));        }        if let Some(rc) = ret {            self.emit(&format!(".param .{} _r;", mov_ty(rc)));        }        for (i, (r, abi)) in arg_regs.iter().enumerate() {            self.emit(&format!("st.param.{abi} [_a{i}], {r};"));        }        let mut arglist = String::new();        for i in 0..arg_regs.len() {            if i > 0 {                arglist.push_str(", ");            }            arglist.push_str(&format!("_a{i}"));        }        match ret {            Some(_) => self.emit(&format!("{g}call.uni (_r), {ptx_name}, ({arglist});")),            None => self.emit(&format!("{g}call.uni {ptx_name}, ({arglist});")),        }        if let (Some(rc), Some(res)) = (ret, result) {            let d = self.reg(res);            self.emit(&format!("ld.param.{} {d}, [_r];", mov_ty(rc)));        }        self.emit("}");    }    /// Emit a **chunked-cooperative** call of a recognized op: partition `[0, count)` (the arg at    /// `count_idx` GÇö elements for elementwise, rows for GEMM/norm) into contiguous per-thread chunks,    /// offset each pointer arg in `ptr_strides` (`(arg_idx, Stride)`) by `lo*stride`, and have every    /// thread call the *existing serial* `mrt_*` over its own disjoint sub-range. No new kernel, no    /// internal barrier (chunks are disjoint), no races; the caller's `bar.sync` bracket orders it    /// against neighbours. This is the GPU analogue of `wukong_runtime::parallel_for`'s fixed    /// chunking, so it is deterministic and serial==parallel.    fn emit_chunked_call(        &mut self,        ptx_name: &str,        ret: Option<RC>,        args: &[ValueId],        result: Option<ValueId>,        count_idx: usize,        ptr_strides: &[(usize, Stride)],    ) {        // tid / ntid as 64-bit.        let tid32 = self.fresh_r32();        let ntid32 = self.fresh_r32();        self.emit(&format!("mov.u32 {tid32}, %tid.x;"));        self.emit(&format!("mov.u32 {ntid32}, %ntid.x;"));        let tid = self.fresh(RC::Rd);        let ntid = self.fresh(RC::Rd);        self.emit(&format!("cvt.u64.u32 {tid}, {tid32};"));        self.emit(&format!("cvt.u64.u32 {ntid}, {ntid32};"));        let count = self.reg(args[count_idx]);        // chunk = (count + ntid - 1) / ntid   (ceil; count>0, ntid>0)        let chunk = self.fresh(RC::Rd);        self.emit(&format!("add.s64 {chunk}, {count}, {ntid};"));        self.emit(&format!("sub.s64 {chunk}, {chunk}, 1;"));        self.emit(&format!("div.u64 {chunk}, {chunk}, {ntid};"));        // lo = tid*chunk ; hi = min(lo+chunk, count) ; cnt = max(hi-lo, 0)        let lo = self.fresh(RC::Rd);        self.emit(&format!("mul.lo.s64 {lo}, {tid}, {chunk};"));        let hi = self.fresh(RC::Rd);        self.emit(&format!("add.s64 {hi}, {lo}, {chunk};"));        self.emit(&format!("min.s64 {hi}, {hi}, {count};"));        let cnt = self.fresh(RC::Rd);        self.emit(&format!("sub.s64 {cnt}, {hi}, {lo};"));        self.emit(&format!("max.s64 {cnt}, {cnt}, 0;"));        // Build the adjusted argument registers: pointers offset by lo*stride, count replaced by cnt.        let mut arg_regs: Vec<(String, &'static str)> = Vec::with_capacity(args.len());        for (i, a) in args.iter().enumerate() {            if i == count_idx {                arg_regs.push((cnt.clone(), "b64"));            } else if let Some((_, stride)) = ptr_strides.iter().find(|(idx, _)| *idx == i) {                // Per-unit byte stride: a constant, or a runtime dim (`args[d]`) times a constant                // (a GEMM row = `k` elements * 4 B, an int8-GEMM A-row = `k` * 1 B, ...).                let stride_bytes = match *stride {                    Stride::Const(c) => {                        let s = self.fresh(RC::Rd);                        self.emit(&format!("mov.b64 {s}, {c};"));                        s                    }                    Stride::Arg(d, c) => {                        let dim = self.reg(args[d]);                        let s = self.fresh(RC::Rd);                        self.emit(&format!("mul.lo.s64 {s}, {dim}, {c};"));                        s                    }                };                let base = self.reg(*a);                let off = self.fresh(RC::Rd);                let np = self.fresh(RC::Rd);                self.emit(&format!("mul.lo.s64 {off}, {lo}, {stride_bytes};"));                self.emit(&format!("add.s64 {np}, {base}, {off};"));                arg_regs.push((np, "b64"));            } else {                arg_regs.push((self.reg(*a), abi_ty(self.func.value_type(*a))));            }        }        self.emit_helper_call_regs(ptx_name, ret, &arg_regs, result, false);    }    fn lower_user_call(        &mut self,        idx: usize,        args: &[ValueId],        result: Option<ValueId>,    ) -> Result<(), String> {        // Snapshot arg regs/types before mutating the builder.        let arg_regs: Vec<(String, &'static str)> = args            .iter()            .map(|a| (self.reg(*a), abi_ty(self.func.value_type(*a))))            .collect();        self.emit_call_to(idx, &arg_regs, result);        Ok(())    }    /// Emit a call to user function `idx` with pre-built `(reg, abi)` arg pairs. Every `mfn_*` takes    /// the device context buffer as an implicit leading param (for print/assert/exit), followed by    /// the explicit args; the return (if any) is bound into `result`.    fn emit_call_to(        &mut self,        idx: usize,        arg_regs: &[(String, &'static str)],        result: Option<ValueId>,    ) {        let callee = &self.program.funcs[idx];        let ret = callee.ret.clone();        let has_ret = !matches!(ret, MirType::Void);        let ctx = self.ctx_reg.clone();        self.emit("{");        self.emit(".param .b64 _pc;");        for (i, (_, abi)) in arg_regs.iter().enumerate() {            self.emit(&format!(".param .{abi} _p{i};"));        }        if has_ret {            self.emit(&format!(".param .{} _pr;", abi_ty(&ret)));        }        self.emit(&format!("st.param.b64 [_pc], {ctx};"));        for (i, (r, abi)) in arg_regs.iter().enumerate() {            self.emit(&format!("st.param.{abi} [_p{i}], {r};"));        }        let mut arglist = String::from("_pc");        for i in 0..arg_regs.len() {            arglist.push_str(&format!(", _p{i}"));        }        if has_ret {            self.emit(&format!("call.uni (_pr), mfn_{idx}, ({arglist});"));        } else {            self.emit(&format!("call.uni mfn_{idx}, ({arglist});"));        }        if let Some(r) = result {            if has_ret {                let d = self.reg(r);                self.emit(&format!("ld.param.{} {d}, [_pr];", abi_ty(&ret)));            }        }        self.emit("}");    }    fn lower_print(&mut self, args: &[ValueId]) -> Result<(), String> {        let arg = *args            .first()            .ok_or_else(|| format!("{UNSUPPORTED} print with no argument"))?;        let aty = self.ty(arg);        let (tag, payload) = if aty.is_float() {            let f = self.reg(arg);            let pl = self.fresh(RC::Rd);            if rc_of(&aty) == RC::F32 {                let fd = self.fresh(RC::F64);                self.emit(&format!("cvt.f64.f32 {fd}, {f};"));                self.emit(&format!("mov.b64 {pl}, {fd};"));            } else {                self.emit(&format!("mov.b64 {pl}, {f};"));            }            (1u64, pl)        } else {            (0u64, self.reg(arg))        };        self.emit_record(tag, &payload);        Ok(())    }    /// Append one `(tag, payload)` print record to the context buffer (atomic slot, bounds-guarded).    /// In mega mode the whole append is `tid==0`-only: the SPMD threads all compute the *same* record    /// (control flow is data-independent), so emitting once preserves byte-identical stdout GÇö and the    /// atomic counter must advance exactly once, not once per thread.    fn emit_record(&mut self, tag: u64, payload: &str) {        let ctx = self.ctx_reg.clone();        let idx = self.fresh(RC::Rd);        let off = self.fresh(RC::Rd);        let addr = self.fresh(RC::Rd);        let tagr = self.fresh(RC::Rd);        let pw = self.fresh_pred();        let ag = self.st_guard(); // `@tid0 ` (mega) or empty        self.emit(&format!(            "{ag}atom.global.add.u64 {idx}, [{ctx}+{CTX_COUNT_OFF}], 1;"        ));        self.emit(&format!("setp.lt.u64 {pw}, {idx}, {RECORD_CAP};"));        if self.mega {            // Fold tid0 into the bounds predicate so non-zero threads (whose `idx` is undefined,            // having skipped the guarded atomic) never store.            self.emit(&format!("and.pred {pw}, {pw}, {};", self.tid0));        }        self.emit(&format!("mul.lo.s64 {off}, {idx}, {RECORD_BYTES};"));        self.emit(&format!("add.s64 {addr}, {ctx}, {off};"));        self.emit(&format!("add.s64 {addr}, {addr}, {CTX_RECORDS_OFF};"));        self.emit(&format!("mov.b64 {tagr}, {tag};"));        self.emit(&format!("@{pw} st.global.u64 [{addr}], {tagr};"));        self.emit(&format!("@{pw} st.global.u64 [{addr}+8], {payload};"));    }    fn lower_assert(&mut self, args: &[ValueId]) -> Result<(), String> {        let arg = *args            .first()            .ok_or_else(|| format!("{UNSUPPORTED} assert with no argument"))?;        let aty = self.ty(arg);        let ctx = self.ctx_reg.clone();        let cond = self.reg(arg);        let pz = self.fresh_pred();        if aty.is_float() {            let z = self.fresh(rc_of(&aty));            let sfx = float_suffix(&aty);            self.emit(&format!(                "mov.{sfx} {z}, 0{};",                if sfx == "f64" {                    "d0000000000000000"                } else {                    "f00000000"                }            ));            self.emit(&format!("setp.eq.{sfx} {pz}, {cond}, {z};"));        } else {            self.emit(&format!("setp.eq.s64 {pz}, {cond}, 0;"));        }        if self.mega {            // Only `tid==0` records the (identical, data-independent) assert outcome.            self.emit(&format!("and.pred {pz}, {pz}, {};", self.tid0));        }        let one = self.fresh(RC::Rd);        self.emit(&format!("mov.b64 {one}, 1;"));        self.emit(&format!(            "@{pz} st.global.u64 [{ctx}+{CTX_ASSERT_OFF}], {one};"        ));        Ok(())    }    // --- terminators ---    fn lower_term(&mut self, term: &Terminator) -> Result<(), String> {        match term {            // In mega *entry* mode the kernel writes the exit code into the context exit slot            // (`tid==0`) and returns. Mega callees use the ordinary `.func` return path.            Terminator::Ret(None) if self.mega && self.mega_entry => {                self.emit_mega_exit(None);                self.emit("ret;");            }            Terminator::Ret(Some(v)) if self.mega && self.mega_entry => {                let v = *v;                self.emit_mega_exit(Some(v));                self.emit("ret;");            }            Terminator::Ret(None) => self.emit("ret;"),            Terminator::Ret(Some(v)) => {                let abi = abi_ty(self.func.value_type(*v));                let r = self.reg(*v);                self.emit(&format!("st.param.{abi} [retp], {r};"));                self.emit("ret;");            }            Terminator::Br { target, args } => {                self.emit_edge(target.0, args)?;                self.emit(&format!("bra BB{};", target.0));            }            Terminator::CondBr {                cond,                then_blk,                then_args,                else_blk,                else_args,            } => {                let c = self.reg(*cond);                let p = self.fresh_pred();                let lbl = self.n_lbl;                self.n_lbl += 1;                self.emit(&format!("setp.ne.s64 {p}, {c}, 0;"));                self.emit(&format!("@!{p} bra ELSE{lbl};"));                self.emit_edge(then_blk.0, then_args)?;                self.emit(&format!("bra BB{};", then_blk.0));                self.body.push_str(&format!("ELSE{lbl}:\n"));                self.emit_edge(else_blk.0, else_args)?;                self.emit(&format!("bra BB{};", else_blk.0));            }            Terminator::Unreachable => self.emit("trap;"),        }        Ok(())    }    /// Store the megakernel exit code (the entry's return, truncated to i64) into the context exit    /// slot, `tid==0`-only. A void/`None` return exits 0 (matching the single-thread wrapper).    fn emit_mega_exit(&mut self, v: Option<ValueId>) {        let ctx = self.ctx_reg.clone();        let tid0 = self.tid0.clone();        let code = self.fresh(RC::Rd);        match v {            None => self.emit(&format!("mov.b64 {code}, 0;")),            Some(v) => {                let rc = rc_of(&self.ty(v));                let r = self.reg(v);                match rc {                    RC::Rd => self.emit(&format!("mov.b64 {code}, {r};")),                    RC::F32 => self.emit(&format!("cvt.rzi.s64.f32 {code}, {r};")),                    RC::F64 => self.emit(&format!("cvt.rzi.s64.f64 {code}, {r};")),                }            }        }        self.emit(&format!(            "@{tid0} st.global.u64 [{ctx}+{CTX_EXIT_OFF}], {code};"        ));    }    /// Realize the block-param convention for one edge: copy each arg into a temp, then each temp into    /// the target block's param register. The temp hop makes permuted / self-referential edges safe.    ///    /// A vector arg travels **lane by lane** into the target param's pre-assigned lane registers    /// (see [`assign_vector_block_params`](Self::assign_vector_block_params)) GÇö one `mov` per lane,    /// through per-lane temps for the same permutation safety.    fn emit_edge(&mut self, target: u32, args: &[ValueId]) -> Result<(), String> {        if args.is_empty() {            return Ok(());        }        let params: Vec<ValueId> = self.func.blocks[target as usize].params.clone();        let mut temps: Vec<Vec<(String, RC)>> = Vec::with_capacity(args.len());        for a in args {            let ty = self.ty(*a);            if ty.is_vector() {                let rc = rc_of(ty.lane_type());                let lanes = self.lanes(*a)?;                let mut ts = Vec::with_capacity(lanes.len());                for l in lanes {                    let t = self.fresh(rc);                    self.emit(&format!("mov.{} {t}, {l};", mov_ty(rc)));                    ts.push((t, rc));                }                temps.push(ts);            } else {                let rc = rc_of(&ty);                let t = self.fresh(rc);                let src = self.reg(*a);                self.emit(&format!("mov.{} {t}, {src};", mov_ty(rc)));                temps.push(vec![(t, rc)]);            }        }        for (p, ts) in params.iter().zip(temps) {            if self.ty(*p).is_vector() {                let dst = self.lanes(*p)?;                if dst.len() != ts.len() {                    return Err(format!(                        "{UNSUPPORTED} vector edge into BB{target} param v{} carries {} lane(s) \                         for a {}-lane param",                        p.0,                        ts.len(),                        dst.len()                    ));                }                for (d, (t, rc)) in dst.iter().zip(ts) {                    self.emit(&format!("mov.{} {d}, {t};", mov_ty(rc)));                }            } else {                let (t, rc) = ts[0].clone();                let pr = self.reg(*p);                self.emit(&format!("mov.{} {pr}, {t};", mov_ty(rc)));            }        }        Ok(())    }    fn coerce_float(&mut self, v: ValueId, want: RC) -> String {        let from = rc_of(&self.ty(v));        let r = self.reg(v);        if from == want {            return r;        }        match (from, want) {            (RC::F32, RC::F64) => {                let d = self.fresh(RC::F64);                self.emit(&format!("cvt.f64.f32 {d}, {r};"));                d            }            (RC::F64, RC::F32) => {                let d = self.fresh(RC::F32);                self.emit(&format!("cvt.rn.f32.f64 {d}, {r};"));                d            }            // An int operand reaching a float op is a lowering bug upstream; pass through.            _ => r,        }    }}fn float_suffix(t: &MirType) -> &'static str {    if matches!(t, MirType::F64) {        "f64"    } else {        "f32"    }}fn int_cc(op: CmpOp) -> &'static str {    use CmpOp::*;    match op {        Eq => "eq.s64",        Ne => "ne.s64",        Slt => "lt.s64",        Sle => "le.s64",        Sgt => "gt.s64",        Sge => "ge.s64",        Ult => "lt.u64",        Ule => "le.u64",        Ugt => "gt.u64",        Uge => "ge.u64",        _ => unreachable!("float predicate in int_cc"),    }}fn float_cc(op: CmpOp) -> &'static str {    use CmpOp::*;    match op {        Foeq => "eq",        // The interpreter's `!=` is Rust's (unordered-or-not-equal), so use the unordered form.        Fone => "neu",        Folt => "lt",        Fole => "le",        Fogt => "gt",        Foge => "ge",        _ => unreachable!("int predicate in float_cc"),    }}/// The PTX `.func` header (without the trailing body or `;`), shared by the prototype and definition./// Every function takes a hidden `p_ctx` first parameter (the device context buffer) so prints //// asserts anywhere in the call graph reach it.fn fn_signature(f: &Function, idx: usize) -> String {    let mut s = String::from(".func ");    if !matches!(f.ret, MirType::Void) {        let _ = write!(s, "(.param .{} retp) ", abi_ty(&f.ret));    }    let _ = write!(s, "mfn_{idx} (.param .b64 p_ctx");    for (i, p) in f.params.iter().enumerate() {        let _ = write!(s, ", .param .{} p{i}", abi_ty(f.value_type(*p)));    }    s.push(')');    s}/// The launched entry kernel: load the context pointer, call the entry `.func`, and store its return/// value into the context's exit-code slot (`as_int`-truncated for a float entry).fn emit_entry_kernel(entry_idx: usize, ret: &MirType) -> String {    let mut s = String::new();    s.push_str(&format!(        ".visible .entry {KERNEL_NAME}(.param .u64 ctxp)\n{{\n"    ));    s.push_str("    .reg .b64 %rd<4>;\n");    match rc_of(ret) {        RC::F32 if !matches!(ret, MirType::Void) => s.push_str("    .reg .f32 %f<1>;\n"),        RC::F64 if !matches!(ret, MirType::Void) => s.push_str("    .reg .f64 %fd<1>;\n"),        _ => {}    }    s.push_str("    ld.param.u64 %rd0, [ctxp];\n");    let has_ret = !matches!(ret, MirType::Void);    s.push_str("    {\n");    s.push_str("    .param .b64 _pc;\n");    if has_ret {        s.push_str(&format!("    .param .{} _pr;\n", abi_ty(ret)));    }    s.push_str("    st.param.b64 [_pc], %rd0;\n");    if has_ret {        s.push_str(&format!("    call.uni (_pr), mfn_{entry_idx}, (_pc);\n"));        match rc_of(ret) {            RC::Rd => s.push_str("    ld.param.b64 %rd1, [_pr];\n"),            RC::F32 => {                s.push_str("    ld.param.f32 %f0, [_pr];\n");                s.push_str("    cvt.rzi.s64.f32 %rd1, %f0;\n");            }            RC::F64 => {                s.push_str("    ld.param.f64 %fd0, [_pr];\n");                s.push_str("    cvt.rzi.s64.f64 %rd1, %fd0;\n");            }        }    } else {        s.push_str(&format!("    call.uni mfn_{entry_idx}, (_pc);\n"));        s.push_str("    mov.b64 %rd1, 0;\n");    }    s.push_str("    }\n");    s.push_str("    cvta.to.global.u64 %rd2, %rd0;\n");    s.push_str(&format!("    st.global.u64 [%rd2+{CTX_EXIT_OFF}], %rd1;\n"));    s.push_str("    ret;\n}\n");    s}// ============================================================================================// Recognized-kernel device helpers (`mrt_*`)//// One `.func` per recognized runtime symbol, reproducing the CPU microkernel's numeric contract as// a naive single-thread device loop (the host single-thread kernel calls them in place). Op codes// and formulas match `wukong_runtime` (reduce/gemm/i8gemm/...); the CPU<->GPU tolerance gate covers// reduction-order differences. Each helper is self-contained (no inter-helper calls) and uses// function-scoped labels prefixed per kernel so they never collide.// ============================================================================================/// A device helper for a recognized runtime call: its PTX `.func` name, return register class, and/// the full `.func` definition text (emitted once per program when the symbol is called). `def` is/// owned because the mixed-precision helpers are generated per (op, precision).struct RtHelper {    ptx_name: &'static str,    ret: Option<RC>,    def: String,}/// Map a recognized runtime-symbol name to its device helper, or `None` for general lowering.fn rt_helper(name: &str) -> Option<RtHelper> {    let (ptx_name, ret, def): (&'static str, Option<RC>, String) = match name {        "wukong_sreduce_f32" | "wukong_sreduce_f32_parallel" => {            ("mrt_sreduce", Some(RC::F32), PTX_SREDUCE.to_string())        }        "wukong_sgemm_nt" | "wukong_sgemm_nt_parallel" => {            ("mrt_sgemm_nt", None, PTX_SGEMM_NT.to_string())        }        "wukong_sgemm" | "wukong_sgemm_parallel" => ("mrt_sgemm", None, PTX_SGEMM.to_string()),        "wukong_i8gemm_nt" | "wukong_i8gemm_nt_parallel" => {            ("mrt_i8gemm_nt", None, PTX_I8GEMM_NT.to_string())        }        "wukong_norm_f32" | "wukong_norm_f32_parallel" => ("mrt_norm", None, PTX_NORM.to_string()),        "wukong_norm_affine_f32" | "wukong_norm_affine_f32_parallel" => {            ("mrt_norm_affine", None, PTX_NORM_AFFINE.to_string())        }        "wukong_vmath_f32" | "wukong_vmath_f32_parallel" => {            ("mrt_vmath", None, PTX_VMATH.to_string())        }        "wukong_sgemm_nt_epi" | "wukong_sgemm_nt_epi_parallel" => {            ("mrt_sgemm_nt_epi", None, PTX_SGEMM_NT_EPI.to_string())        }        // Mixed-precision (bf16/f16 storage, f32 compute) GÇö generated per precision.        "wukong_vmath_bf16" => (            "mrt_vmath_bf16",            None,            ptx_vmath_lowp("mrt_vmath_bf16", "bf16")?,        ),        "wukong_vmath_f16" => (            "mrt_vmath_f16",            None,            ptx_vmath_lowp("mrt_vmath_f16", "f16")?,        ),        "wukong_dot_bf16" | "wukong_dot_bf16_parallel" => (            "mrt_dot_bf16",            Some(RC::F32),            ptx_dot_lowp("mrt_dot_bf16", "bf16"),        ),        "wukong_dot_f16" | "wukong_dot_f16_parallel" => (            "mrt_dot_f16",            Some(RC::F32),            ptx_dot_lowp("mrt_dot_f16", "f16"),        ),        "wukong_sum_bf16" | "wukong_sum_bf16_parallel" => (            "mrt_sum_bf16",            Some(RC::F32),            ptx_sum_lowp("mrt_sum_bf16", "bf16"),        ),        "wukong_sum_f16" | "wukong_sum_f16_parallel" => (            "mrt_sum_f16",            Some(RC::F32),            ptx_sum_lowp("mrt_sum_f16", "f16"),        ),        "wukong_reduce_bf16" | "wukong_reduce_bf16_parallel" => (            "mrt_reduce_bf16",            Some(RC::F32),            ptx_reduce_lowp("mrt_reduce_bf16", "bf16"),        ),        "wukong_reduce_f16" | "wukong_reduce_f16_parallel" => (            "mrt_reduce_f16",            Some(RC::F32),            ptx_reduce_lowp("mrt_reduce_f16", "f16"),        ),        "wukong_axpby_bf16" => (            "mrt_axpby_bf16",            None,            ptx_axpby_lowp("mrt_axpby_bf16", "bf16"),        ),        "wukong_axpby_f16" => (            "mrt_axpby_f16",            None,            ptx_axpby_lowp("mrt_axpby_f16", "f16"),        ),        // Two-arg transcendentals (pow/atan2/hypot), op-gated in lower_call.        "wukong_vmath2_f32" => ("mrt_vmath2", None, PTX_VMATH2.to_string()),        // Streaming elementwise act(a*x + b*y + c) (residual add, fused bias/act).        "wukong_velem_f32" | "wukong_velem_f32_parallel" => {            ("mrt_velem", None, PTX_VELEM.to_string())        }        _ => return None,    };    Some(RtHelper { ptx_name, ret, def })}/// Which `wukong_vmath_f32` op codes `mrt_vmath` implements: the full single-arg set 0..=35/// (atan(25)/asin(33)/acos(34) use an inline minimax `atan` poly since PTX has no SFU for them).fn vmath_supported(op: i128) -> bool {    matches!(op, 0..=35)}/// `wukong_sreduce_f32(x, y, n, op) -> f32`: dot(0)/ssd(1)/sum(2)/sumsq(3)/max(4)/min(5)/maxabs(6)//// sumabs(9, +ú|x|)/absdiff(10, +ú|xGêÆy|). (Codes 7/8 are the arg-reductions GÇö a separate `-> i64` ABI GÇö/// so they never reach here.) Sequential fold (not the CPU's fixed-chunk tree) GÇö additive ops differ/// only by reduction order (tolerance-gated); max/min/maxabs are order-independent and exact.const PTX_SREDUCE: &str = r#".func (.param .f32 _r) mrt_sreduce (.param .b64 px, .param .b64 py, .param .b64 pn, .param .b64 pop){    .reg .b64 %rd<8>;    .reg .f32 %f<6>;    .reg .pred %p<6>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [py];    ld.param.u64 %rd2, [pn];    ld.param.u64 %rd3, [pop];    mov.f32 %f0, 0f00000000;    setp.eq.s64 %p0, %rd3, 4;    setp.eq.s64 %p1, %rd3, 6;    or.pred %p0, %p0, %p1;    @%p0 mov.f32 %f0, 0fFF800000;    setp.eq.s64 %p1, %rd3, 5;    @%p1 mov.f32 %f0, 0f7F800000;    mov.b64 %rd4, 0;RED_LOOP:    setp.ge.s64 %p2, %rd4, %rd2;    @%p2 bra RED_DONE;    shl.b64 %rd5, %rd4, 2;    add.s64 %rd6, %rd0, %rd5;    ld.f32 %f1, [%rd6];    add.s64 %rd7, %rd1, %rd5;    ld.f32 %f2, [%rd7];    setp.eq.s64 %p3, %rd3, 0;    @%p3 fma.rn.f32 %f0, %f1, %f2, %f0;    setp.eq.s64 %p3, %rd3, 1;    @%p3 sub.rn.f32 %f3, %f1, %f2;    @%p3 fma.rn.f32 %f0, %f3, %f3, %f0;    setp.eq.s64 %p3, %rd3, 2;    @%p3 add.rn.f32 %f0, %f0, %f1;    setp.eq.s64 %p3, %rd3, 3;    @%p3 fma.rn.f32 %f0, %f1, %f1, %f0;    setp.eq.s64 %p3, %rd3, 4;    @%p3 max.f32 %f0, %f0, %f1;    setp.eq.s64 %p3, %rd3, 5;    @%p3 min.f32 %f0, %f0, %f1;    setp.eq.s64 %p3, %rd3, 6;    @%p3 abs.f32 %f4, %f1;    @%p3 max.f32 %f0, %f0, %f4;    setp.eq.s64 %p3, %rd3, 9;    @%p3 abs.f32 %f4, %f1;    @%p3 add.rn.f32 %f0, %f0, %f4;    setp.eq.s64 %p3, %rd3, 10;    @%p3 sub.rn.f32 %f5, %f1, %f2;    @%p3 abs.f32 %f5, %f5;    @%p3 add.rn.f32 %f0, %f0, %f5;    add.s64 %rd4, %rd4, 1;    bra RED_LOOP;RED_DONE:    st.param.f32 [_r], %f0;    ret;}"#;/// Block-shared scratch for the cooperative reduction tree (`mrt_sreduce_coop`). One f32 per thread;/// 1024 covers the largest block the megakernel launcher uses. Static `.shared` (4 KiB), so the/// launch needs no dynamic shared memory.const PTX_MEGA_SMEM: &str = ".shared .align 4 .b32 mrt_red_smem[1024];\n";/// **Cooperative** `wukong_sreduce_f32(x, y, n, op) -> f32` for the megakernel: every thread in the/// block folds a `tid`-strided slice of `[0,n)` into a private partial (the *same* per-element op as/// the single-thread `mrt_sreduce`), then a fixed shared-memory **tree** combines the partials and/// broadcasts the result to all threads. Deterministic (no atomics, M12); the tree's reassociation vs/// the sequential fold is covered by the CPU<->GPU tolerance gate. Block size must be a power of two/// (the launcher uses 256). Combine: add for the additive ops dot/ssd/sum/sumsq (op<4) *and*/// sumabs/absdiff (op>=9), max for max/maxabs, min for min.const PTX_SREDUCE_COOP: &str = r#".func (.param .f32 _r) mrt_sreduce_coop (.param .b64 px, .param .b64 py, .param .b64 pn, .param .b64 pop){    .reg .b64 %rd<12>;    .reg .b32 %r<10>;    .reg .f32 %f<8>;    .reg .pred %p<8>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [py];    ld.param.u64 %rd2, [pn];    ld.param.u64 %rd3, [pop];    mov.u32 %r0, %tid.x;    mov.u32 %r1, %ntid.x;    cvt.u64.u32 %rd4, %r0;    cvt.u64.u32 %rd5, %r1;    mov.f32 %f0, 0f00000000;    setp.eq.s64 %p0, %rd3, 4;    setp.eq.s64 %p1, %rd3, 6;    or.pred %p0, %p0, %p1;    @%p0 mov.f32 %f0, 0fFF800000;    setp.eq.s64 %p1, %rd3, 5;    @%p1 mov.f32 %f0, 0f7F800000;RC_LOOP:    setp.ge.s64 %p2, %rd4, %rd2;    @%p2 bra RC_DONE;    shl.b64 %rd6, %rd4, 2;    add.s64 %rd7, %rd0, %rd6;    ld.f32 %f1, [%rd7];    add.s64 %rd8, %rd1, %rd6;    ld.f32 %f2, [%rd8];    setp.eq.s64 %p3, %rd3, 0;    @%p3 fma.rn.f32 %f0, %f1, %f2, %f0;    setp.eq.s64 %p3, %rd3, 1;    @%p3 sub.rn.f32 %f3, %f1, %f2;    @%p3 fma.rn.f32 %f0, %f3, %f3, %f0;    setp.eq.s64 %p3, %rd3, 2;    @%p3 add.rn.f32 %f0, %f0, %f1;    setp.eq.s64 %p3, %rd3, 3;    @%p3 fma.rn.f32 %f0, %f1, %f1, %f0;    setp.eq.s64 %p3, %rd3, 4;    @%p3 max.f32 %f0, %f0, %f1;    setp.eq.s64 %p3, %rd3, 5;    @%p3 min.f32 %f0, %f0, %f1;    setp.eq.s64 %p3, %rd3, 6;    @%p3 abs.f32 %f4, %f1;    @%p3 max.f32 %f0, %f0, %f4;    setp.eq.s64 %p3, %rd3, 9;    @%p3 abs.f32 %f4, %f1;    @%p3 add.rn.f32 %f0, %f0, %f4;    setp.eq.s64 %p3, %rd3, 10;    @%p3 sub.rn.f32 %f4, %f1, %f2;    @%p3 abs.f32 %f4, %f4;    @%p3 add.rn.f32 %f0, %f0, %f4;    add.s64 %rd4, %rd4, %rd5;    bra RC_LOOP;RC_DONE:    shl.b32 %r2, %r0, 2;    mov.u32 %r3, mrt_red_smem;    add.s32 %r4, %r3, %r2;    st.shared.f32 [%r4], %f0;    bar.sync 0;    shr.u32 %r5, %r1, 1;RC_TREE:    setp.eq.s32 %p4, %r5, 0;    @%p4 bra RC_TREE_DONE;    setp.lt.u32 %p5, %r0, %r5;    @!%p5 bra RC_TREE_SYNC;    ld.shared.f32 %f5, [%r4];    add.u32 %r6, %r0, %r5;    shl.b32 %r6, %r6, 2;    add.u32 %r7, %r3, %r6;    ld.shared.f32 %f6, [%r7];    setp.eq.s64 %p6, %rd3, 4;    setp.eq.s64 %p7, %rd3, 6;    or.pred %p6, %p6, %p7;    @%p6 max.f32 %f5, %f5, %f6;    setp.eq.s64 %p7, %rd3, 5;    @%p7 min.f32 %f5, %f5, %f6;    setp.lt.s64 %p6, %rd3, 4;    setp.ge.s64 %p7, %rd3, 9;    or.pred %p6, %p6, %p7;    @%p6 add.rn.f32 %f5, %f5, %f6;    st.shared.f32 [%r4], %f5;RC_TREE_SYNC:    bar.sync 0;    shr.u32 %r5, %r5, 1;    bra RC_TREE;RC_TREE_DONE:    mov.u32 %r8, mrt_red_smem;    ld.shared.f32 %f0, [%r8];    st.param.f32 [_r], %f0;    ret;}"#;/// `wukong_sgemm_nt(a, b, c, m, k, n, beta)`: `C[i*n+j] = sum_p A[i*k+p]*B[j*k+p]`; `beta != 0`/// accumulates into the existing C (B is row-major `[n,k]`, i.e. transposed GÇö the nn.Linear form).const PTX_SGEMM_NT: &str = r#".func mrt_sgemm_nt (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn, .param .b64 pbeta){    .reg .b64 %rd<24>;    .reg .f32 %f<8>;    .reg .pred %p<6>;    ld.param.u64 %rd0, [pa];    ld.param.u64 %rd1, [pb];    ld.param.u64 %rd2, [pc];    ld.param.u64 %rd3, [pm];    ld.param.u64 %rd4, [pk];    ld.param.u64 %rd5, [pn];    ld.param.u64 %rd6, [pbeta];    mov.b64 %rd7, 0;SNT_LI:    setp.ge.s64 %p0, %rd7, %rd3;    @%p0 bra SNT_EI;    mov.b64 %rd8, 0;SNT_LJ:    setp.ge.s64 %p1, %rd8, %rd5;    @%p1 bra SNT_EJ;    mov.f32 %f0, 0f00000000;    mul.lo.s64 %rd9, %rd7, %rd4;    shl.b64 %rd9, %rd9, 2;    add.s64 %rd9, %rd0, %rd9;    mul.lo.s64 %rd10, %rd8, %rd4;    shl.b64 %rd10, %rd10, 2;    add.s64 %rd10, %rd1, %rd10;    mov.b64 %rd11, 0;SNT_LL:    setp.ge.s64 %p2, %rd11, %rd4;    @%p2 bra SNT_EL;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    add.s64 %rd14, %rd10, %rd12;    ld.f32 %f2, [%rd14];    fma.rn.f32 %f0, %f1, %f2, %f0;    add.s64 %rd11, %rd11, 1;    bra SNT_LL;SNT_EL:    mul.lo.s64 %rd15, %rd7, %rd5;    add.s64 %rd15, %rd15, %rd8;    shl.b64 %rd15, %rd15, 2;    add.s64 %rd15, %rd2, %rd15;    setp.eq.s64 %p3, %rd6, 0;    @%p3 bra SNT_ST;    ld.f32 %f3, [%rd15];    add.rn.f32 %f0, %f0, %f3;SNT_ST:    st.f32 [%rd15], %f0;    add.s64 %rd8, %rd8, 1;    bra SNT_LJ;SNT_EJ:    add.s64 %rd7, %rd7, 1;    bra SNT_LI;SNT_EI:    ret;}"#;/// `wukong_sgemm(a, b, c, m, k, n, beta)`: `C[i*n+j] = sum_p A[i*k+p]*B[p*n+j]`; `beta != 0`/// accumulates (both A `[m,k]` and B `[k,n]` row-major).const PTX_SGEMM: &str = r#".func mrt_sgemm (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn, .param .b64 pbeta){    .reg .b64 %rd<24>;    .reg .f32 %f<8>;    .reg .pred %p<6>;    ld.param.u64 %rd0, [pa];    ld.param.u64 %rd1, [pb];    ld.param.u64 %rd2, [pc];    ld.param.u64 %rd3, [pm];    ld.param.u64 %rd4, [pk];    ld.param.u64 %rd5, [pn];    ld.param.u64 %rd6, [pbeta];    mov.b64 %rd7, 0;SM_LI:    setp.ge.s64 %p0, %rd7, %rd3;    @%p0 bra SM_EI;    mov.b64 %rd8, 0;SM_LJ:    setp.ge.s64 %p1, %rd8, %rd5;    @%p1 bra SM_EJ;    mov.f32 %f0, 0f00000000;    mul.lo.s64 %rd9, %rd7, %rd4;    shl.b64 %rd9, %rd9, 2;    add.s64 %rd9, %rd0, %rd9;    mov.b64 %rd11, 0;SM_LL:    setp.ge.s64 %p2, %rd11, %rd4;    @%p2 bra SM_EL;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    mul.lo.s64 %rd14, %rd11, %rd5;    add.s64 %rd14, %rd14, %rd8;    shl.b64 %rd14, %rd14, 2;    add.s64 %rd14, %rd1, %rd14;    ld.f32 %f2, [%rd14];    fma.rn.f32 %f0, %f1, %f2, %f0;    add.s64 %rd11, %rd11, 1;    bra SM_LL;SM_EL:    mul.lo.s64 %rd15, %rd7, %rd5;    add.s64 %rd15, %rd15, %rd8;    shl.b64 %rd15, %rd15, 2;    add.s64 %rd15, %rd2, %rd15;    setp.eq.s64 %p3, %rd6, 0;    @%p3 bra SM_ST;    ld.f32 %f3, [%rd15];    add.rn.f32 %f0, %f0, %f3;SM_ST:    st.f32 [%rd15], %f0;    add.s64 %rd8, %rd8, 1;    bra SM_LJ;SM_EJ:    add.s64 %rd7, %rd7, 1;    bra SM_LI;SM_EI:    ret;}"#;/// `wukong_i8gemm_nt(a, b, c, m, k, n)`: `C[i*n+j] = sum_p (u8 A[i*k+p]) * (i8 B[j*k+p])`, exact/// i32 (wrapping mod 2^32). A is `u8 [m,k]`, B is `i8 [n,k]`, C is `i32 [m,n]`.const PTX_I8GEMM_NT: &str = r#".func mrt_i8gemm_nt (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn){    .reg .b64 %rd<24>;    .reg .b32 %r<8>;    .reg .pred %p<4>;    ld.param.u64 %rd0, [pa];    ld.param.u64 %rd1, [pb];    ld.param.u64 %rd2, [pc];    ld.param.u64 %rd3, [pm];    ld.param.u64 %rd4, [pk];    ld.param.u64 %rd5, [pn];    mov.b64 %rd6, 0;I8_LI:    setp.ge.s64 %p0, %rd6, %rd3;    @%p0 bra I8_EI;    mov.b64 %rd7, 0;I8_LJ:    setp.ge.s64 %p1, %rd7, %rd5;    @%p1 bra I8_EJ;    mov.b32 %r0, 0;    mul.lo.s64 %rd8, %rd6, %rd4;    add.s64 %rd8, %rd0, %rd8;    mul.lo.s64 %rd9, %rd7, %rd4;    add.s64 %rd9, %rd1, %rd9;    mov.b64 %rd10, 0;I8_LL:    setp.ge.s64 %p2, %rd10, %rd4;    @%p2 bra I8_EL;    add.s64 %rd11, %rd8, %rd10;    ld.u8 %r1, [%rd11];    add.s64 %rd12, %rd9, %rd10;    ld.s8 %r2, [%rd12];    mad.lo.s32 %r0, %r1, %r2, %r0;    add.s64 %rd10, %rd10, 1;    bra I8_LL;I8_EL:    mul.lo.s64 %rd13, %rd6, %rd5;    add.s64 %rd13, %rd13, %rd7;    shl.b64 %rd13, %rd13, 2;    add.s64 %rd13, %rd2, %rd13;    st.u32 [%rd13], %r0;    add.s64 %rd7, %rd7, 1;    bra I8_LJ;I8_EJ:    add.s64 %rd6, %rd6, 1;    bra I8_LI;I8_EI:    ret;}"#;/// `wukong_norm_f32(x, out, rows, cols, eps_bits, op)`: row-wise softmax(0)/layernorm(1)/rmsnorm(2)//// log-softmax(3)/l2norm(4) over an `[rows, cols]` matrix. `exp` uses the SFU `ex2.approx` and `log`/// uses `lg2.approx-+ln2` (both match the offload path; the CPU oracle's Cephes `exp`/`log` differ by/// <~1e-6, inside the tolerance gate). `eps_bits` is the f32 bits of epsilon (used by layernorm//// rmsnorm/l2norm; softmax/log-softmax ignore it). Sequential per-row reductions (CPU uses an 8-lane/// tree) GÇö tolerance-gated. Ops 0..=3 branch explicitly and 4 (l2norm) is the *default* arm, so no op/// falls into the wrong body GÇö but the arm is a bare `bra`, not an equality test: extending the/// recognizer past code 4 must add a branch here (and an op gate in `lower_call`, which currently/// gates only vmath/vmath2) or the new code would silently run l2norm.const PTX_NORM: &str = r#".func mrt_norm (.param .b64 px, .param .b64 pout, .param .b64 prows, .param .b64 pcols, .param .b64 peps, .param .b64 pop){    .reg .b64 %rd<16>;    .reg .f32 %f<16>;    .reg .b32 %r<4>;    .reg .pred %p<6>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [pout];    ld.param.u64 %rd2, [prows];    ld.param.u64 %rd3, [pcols];    ld.param.u64 %rd4, [peps];    ld.param.u64 %rd5, [pop];    cvt.u32.u64 %r0, %rd4;    mov.b32 %f15, %r0;    mov.b64 %rd6, 0;NORM_ROW:    setp.ge.s64 %p0, %rd6, %rd2;    @%p0 bra NORM_DONE;    mul.lo.s64 %rd7, %rd6, %rd3;    shl.b64 %rd8, %rd7, 2;    add.s64 %rd9, %rd0, %rd8;    add.s64 %rd10, %rd1, %rd8;    setp.eq.s64 %p1, %rd5, 0;    @%p1 bra NORM_SM;    setp.eq.s64 %p1, %rd5, 1;    @%p1 bra NORM_LN;    setp.eq.s64 %p1, %rd5, 2;    @%p1 bra NORM_RMS;    setp.eq.s64 %p1, %rd5, 3;    @%p1 bra NORM_LS;    bra NORM_L2;NORM_SM:    mov.f32 %f0, 0fFF800000;    mov.b64 %rd11, 0;SM_MAX:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra SM_MAXE;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    max.f32 %f0, %f0, %f1;    add.s64 %rd11, %rd11, 1;    bra SM_MAX;SM_MAXE:    mov.f32 %f2, 0f00000000;    mov.b64 %rd11, 0;SM_EXP:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra SM_EXPE;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    sub.f32 %f3, %f1, %f0;    mul.f32 %f3, %f3, 0f3FB8AA3B;    ex2.approx.f32 %f4, %f3;    add.s64 %rd14, %rd10, %rd12;    st.f32 [%rd14], %f4;    add.f32 %f2, %f2, %f4;    add.s64 %rd11, %rd11, 1;    bra SM_EXP;SM_EXPE:    mov.f32 %f6, 0f3F800000;    div.rn.f32 %f5, %f6, %f2;    mov.b64 %rd11, 0;SM_NORM:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra NORM_NEXT;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd14, %rd10, %rd12;    ld.f32 %f4, [%rd14];    mul.f32 %f4, %f4, %f5;    st.f32 [%rd14], %f4;    add.s64 %rd11, %rd11, 1;    bra SM_NORM;NORM_LN:    mov.f32 %f2, 0f00000000;    mov.b64 %rd11, 0;LN_S1:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra LN_S1E;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    add.f32 %f2, %f2, %f1;    add.s64 %rd11, %rd11, 1;    bra LN_S1;LN_S1E:    cvt.rn.f32.s64 %f7, %rd3;    div.rn.f32 %f8, %f2, %f7;    mov.f32 %f2, 0f00000000;    mov.b64 %rd11, 0;LN_S2:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra LN_S2E;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    sub.f32 %f3, %f1, %f8;    fma.rn.f32 %f2, %f3, %f3, %f2;    add.s64 %rd11, %rd11, 1;    bra LN_S2;LN_S2E:    div.rn.f32 %f9, %f2, %f7;    add.f32 %f9, %f9, %f15;    sqrt.rn.f32 %f9, %f9;    mov.f32 %f6, 0f3F800000;    div.rn.f32 %f10, %f6, %f9;    mov.b64 %rd11, 0;LN_S3:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra NORM_NEXT;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    sub.f32 %f3, %f1, %f8;    mul.f32 %f3, %f3, %f10;    add.s64 %rd14, %rd10, %rd12;    st.f32 [%rd14], %f3;    add.s64 %rd11, %rd11, 1;    bra LN_S3;NORM_RMS:    mov.f32 %f2, 0f00000000;    mov.b64 %rd11, 0;RMS_S1:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra RMS_S1E;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    fma.rn.f32 %f2, %f1, %f1, %f2;    add.s64 %rd11, %rd11, 1;    bra RMS_S1;RMS_S1E:    cvt.rn.f32.s64 %f7, %rd3;    div.rn.f32 %f9, %f2, %f7;    add.f32 %f9, %f9, %f15;    sqrt.rn.f32 %f9, %f9;    mov.f32 %f6, 0f3F800000;    div.rn.f32 %f10, %f6, %f9;    mov.b64 %rd11, 0;RMS_S3:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra NORM_NEXT;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    mul.f32 %f3, %f1, %f10;    add.s64 %rd14, %rd10, %rd12;    st.f32 [%rd14], %f3;    add.s64 %rd11, %rd11, 1;    bra RMS_S3;NORM_LS:    mov.f32 %f0, 0fFF800000;    mov.b64 %rd11, 0;LS_MAX:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra LS_MAXE;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    max.f32 %f0, %f0, %f1;    add.s64 %rd11, %rd11, 1;    bra LS_MAX;LS_MAXE:    mov.f32 %f2, 0f00000000;    mov.b64 %rd11, 0;LS_EXP:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra LS_EXPE;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    sub.f32 %f3, %f1, %f0;    mul.f32 %f3, %f3, 0f3FB8AA3B;    ex2.approx.f32 %f4, %f3;    add.f32 %f2, %f2, %f4;    add.s64 %rd11, %rd11, 1;    bra LS_EXP;LS_EXPE:    lg2.approx.f32 %f5, %f2;    mul.f32 %f5, %f5, 0f3F317218;    add.f32 %f6, %f0, %f5;    mov.b64 %rd11, 0;LS_OUT:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra NORM_NEXT;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    sub.f32 %f3, %f1, %f6;    add.s64 %rd14, %rd10, %rd12;    st.f32 [%rd14], %f3;    add.s64 %rd11, %rd11, 1;    bra LS_OUT;NORM_L2:    mov.f32 %f2, 0f00000000;    mov.b64 %rd11, 0;L2_S1:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra L2_S1E;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    fma.rn.f32 %f2, %f1, %f1, %f2;    add.s64 %rd11, %rd11, 1;    bra L2_S1;L2_S1E:    add.f32 %f9, %f2, %f15;    sqrt.rn.f32 %f9, %f9;    mov.f32 %f6, 0f3F800000;    div.rn.f32 %f10, %f6, %f9;    mov.b64 %rd11, 0;L2_S3:    setp.ge.s64 %p2, %rd11, %rd3;    @%p2 bra NORM_NEXT;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    mul.f32 %f3, %f1, %f10;    add.s64 %rd14, %rd10, %rd12;    st.f32 [%rd14], %f3;    add.s64 %rd11, %rd11, 1;    bra L2_S3;NORM_NEXT:    add.s64 %rd6, %rd6, 1;    bra NORM_ROW;NORM_DONE:    ret;}"#;/// `wukong_norm_affine_f32(x, out, gamma, beta, rows, cols, eps_bits, op)`: per-row LayerNorm(1)//// RMSNorm(2) with an affine writeback `out = norm-+g + b`, where `g = gamma[col]` (1.0 if gamma is/// null) and `b = beta[col]` (0.0 if beta is null) GÇö gamma/beta arrive as integer 0 when absent./// (Softmax is never affine, so only op 1/2 reach here.) eps is the low 32 bits of `eps_bits`.const PTX_NORM_AFFINE: &str = r#".func mrt_norm_affine (.param .b64 px, .param .b64 pout, .param .b64 pgamma, .param .b64 pbeta, .param .b64 prows, .param .b64 pcols, .param .b64 peps, .param .b64 pop){    .reg .b64 %rd<18>;    .reg .f32 %f<16>;    .reg .b32 %r<3>;    .reg .pred %p<6>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [pout];    ld.param.u64 %rd2, [pgamma];    ld.param.u64 %rd3, [pbeta];    ld.param.u64 %rd4, [prows];    ld.param.u64 %rd5, [pcols];    ld.param.u64 %rd6, [peps];    ld.param.u64 %rd7, [pop];    cvt.u32.u64 %r0, %rd6;    mov.b32 %f0, %r0;    cvt.rn.f32.s64 %f1, %rd5;    mov.b64 %rd8, 0;NA_ROW:    setp.ge.s64 %p0, %rd8, %rd4;    @%p0 bra NA_DONE;    mul.lo.s64 %rd9, %rd8, %rd5;    shl.b64 %rd10, %rd9, 2;    add.s64 %rd11, %rd0, %rd10;    add.s64 %rd12, %rd1, %rd10;    setp.eq.s64 %p1, %rd7, 1;    @%p1 bra NA_LN;    bra NA_RMS;NA_LN:    mov.f32 %f2, 0f00000000; mov.b64 %rd13, 0;LNA1:    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra LNA1E;    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;    ld.f32 %f3, [%rd15]; add.f32 %f2, %f2, %f3;    add.s64 %rd13, %rd13, 1; bra LNA1;LNA1E:    div.rn.f32 %f4, %f2, %f1;    mov.f32 %f2, 0f00000000; mov.b64 %rd13, 0;LNA2:    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra LNA2E;    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;    ld.f32 %f3, [%rd15]; sub.f32 %f3, %f3, %f4; fma.rn.f32 %f2, %f3, %f3, %f2;    add.s64 %rd13, %rd13, 1; bra LNA2;LNA2E:    div.rn.f32 %f5, %f2, %f1; add.f32 %f5, %f5, %f0; sqrt.rn.f32 %f5, %f5;    mov.f32 %f6, 0f3F800000; div.rn.f32 %f5, %f6, %f5;    mov.b64 %rd13, 0;LNA3:    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra NA_NEXT;    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;    ld.f32 %f3, [%rd15]; sub.f32 %f3, %f3, %f4; mul.f32 %f3, %f3, %f5;    mov.f32 %f7, 0f3F800000; setp.ne.s64 %p3, %rd2, 0;    @%p3 add.s64 %rd16, %rd2, %rd14; @%p3 ld.f32 %f7, [%rd16];    mov.f32 %f8, 0f00000000; setp.ne.s64 %p3, %rd3, 0;    @%p3 add.s64 %rd16, %rd3, %rd14; @%p3 ld.f32 %f8, [%rd16];    fma.rn.f32 %f3, %f3, %f7, %f8;    add.s64 %rd16, %rd12, %rd14; st.f32 [%rd16], %f3;    add.s64 %rd13, %rd13, 1; bra LNA3;NA_RMS:    mov.f32 %f2, 0f00000000; mov.b64 %rd13, 0;RMA1:    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra RMA1E;    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;    ld.f32 %f3, [%rd15]; fma.rn.f32 %f2, %f3, %f3, %f2;    add.s64 %rd13, %rd13, 1; bra RMA1;RMA1E:    div.rn.f32 %f5, %f2, %f1; add.f32 %f5, %f5, %f0; sqrt.rn.f32 %f5, %f5;    mov.f32 %f6, 0f3F800000; div.rn.f32 %f5, %f6, %f5;    mov.b64 %rd13, 0;RMA3:    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra NA_NEXT;    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;    ld.f32 %f3, [%rd15]; mul.f32 %f3, %f3, %f5;    mov.f32 %f7, 0f3F800000; setp.ne.s64 %p3, %rd2, 0;    @%p3 add.s64 %rd16, %rd2, %rd14; @%p3 ld.f32 %f7, [%rd16];    mov.f32 %f8, 0f00000000; setp.ne.s64 %p3, %rd3, 0;    @%p3 add.s64 %rd16, %rd3, %rd14; @%p3 ld.f32 %f8, [%rd16];    fma.rn.f32 %f3, %f3, %f7, %f8;    add.s64 %rd16, %rd12, %rd14; st.f32 [%rd16], %f3;    add.s64 %rd13, %rd13, 1; bra RMA3;NA_NEXT:    add.s64 %rd8, %rd8, 1; bra NA_ROW;NA_DONE:    ret;}"#;/// `wukong_vmath_f32(x, out, n, op)`: elementwise activation, dispatched on the compile-time op/// code (gated by `vmath_supported`). Transcendentals use the SFU (`ex2.approx`/`lg2.approx`//// `sin.approx`/`cos.approx`) and the same closed forms as the CPU kernel; the CPU<->GPU tolerance/// gate covers the SFU-vs-Cephes difference (the offload path uses the identical SFU formulas).const PTX_VMATH: &str = r#".func mrt_vmath (.param .b64 px, .param .b64 pout, .param .b64 pn, .param .b64 pop){    .reg .b64 %rd<8>;    .reg .f32 %f<12>;    .reg .pred %p<4>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [pout];    ld.param.u64 %rd2, [pn];    ld.param.u64 %rd3, [pop];    mov.b64 %rd4, 0;VM_LOOP:    setp.ge.s64 %p0, %rd4, %rd2;    @%p0 bra VM_DONE;    shl.b64 %rd5, %rd4, 2;    add.s64 %rd6, %rd0, %rd5;    ld.f32 %f1, [%rd6];    setp.eq.s64 %p1, %rd3, 0;  @%p1 bra VM0;    setp.eq.s64 %p1, %rd3, 1;  @%p1 bra VM1;    setp.eq.s64 %p1, %rd3, 2;  @%p1 bra VM2;    setp.eq.s64 %p1, %rd3, 3;  @%p1 bra VM3;    setp.eq.s64 %p1, %rd3, 4;  @%p1 bra VM4;    setp.eq.s64 %p1, %rd3, 5;  @%p1 bra VM5;    setp.eq.s64 %p1, %rd3, 6;  @%p1 bra VM6;    setp.eq.s64 %p1, %rd3, 7;  @%p1 bra VM7;    setp.eq.s64 %p1, %rd3, 8;  @%p1 bra VM8;    setp.eq.s64 %p1, %rd3, 9;  @%p1 bra VM9;    setp.eq.s64 %p1, %rd3, 10; @%p1 bra VM10;    setp.eq.s64 %p1, %rd3, 11; @%p1 bra VM11;    setp.eq.s64 %p1, %rd3, 12; @%p1 bra VM12;    setp.eq.s64 %p1, %rd3, 13; @%p1 bra VM13;    setp.eq.s64 %p1, %rd3, 14; @%p1 bra VM14;    setp.eq.s64 %p1, %rd3, 15; @%p1 bra VM15;    setp.eq.s64 %p1, %rd3, 16; @%p1 bra VM16;    setp.eq.s64 %p1, %rd3, 17; @%p1 bra VM17;    setp.eq.s64 %p1, %rd3, 18; @%p1 bra VM18;    setp.eq.s64 %p1, %rd3, 19; @%p1 bra VM19;    setp.eq.s64 %p1, %rd3, 20; @%p1 bra VM20;    setp.eq.s64 %p1, %rd3, 21; @%p1 bra VM21;    setp.eq.s64 %p1, %rd3, 22; @%p1 bra VM22;    setp.eq.s64 %p1, %rd3, 23; @%p1 bra VM23;    setp.eq.s64 %p1, %rd3, 24; @%p1 bra VM24;    setp.eq.s64 %p1, %rd3, 26; @%p1 bra VM26;    setp.eq.s64 %p1, %rd3, 27; @%p1 bra VM27;    setp.eq.s64 %p1, %rd3, 28; @%p1 bra VM28;    setp.eq.s64 %p1, %rd3, 29; @%p1 bra VM29;    setp.eq.s64 %p1, %rd3, 30; @%p1 bra VM30;    setp.eq.s64 %p1, %rd3, 31; @%p1 bra VM31;    setp.eq.s64 %p1, %rd3, 32; @%p1 bra VM32;    setp.eq.s64 %p1, %rd3, 25; @%p1 bra VM25;    setp.eq.s64 %p1, %rd3, 33; @%p1 bra VM33;    setp.eq.s64 %p1, %rd3, 34; @%p1 bra VM34;    setp.eq.s64 %p1, %rd3, 35; @%p1 bra VM35;    bra VM_DEF;VM0:    mul.f32 %f2, %f1, 0f3FB8AA3B; ex2.approx.f32 %f2, %f2; bra VM_ST;VM1:    lg2.approx.f32 %f2, %f1; mul.f32 %f2, %f2, 0f3F317218; bra VM_ST;VM2:    add.f32 %f3, %f1, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f4, 0f40000000; div.rn.f32 %f4, %f4, %f3;    mov.f32 %f2, 0f3F800000; sub.f32 %f2, %f2, %f4; bra VM_ST;VM3:    neg.f32 %f3, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f2, 0f3F800000; div.rn.f32 %f2, %f2, %f3; bra VM_ST;VM4:    max.f32 %f2, %f1, 0f00000000; bra VM_ST;VM5:    neg.f32 %f3, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f4, 0f3F800000; div.rn.f32 %f4, %f4, %f3;    mul.f32 %f2, %f1, %f4; bra VM_ST;VM6:    mul.f32 %f3, %f1, %f1; mul.f32 %f3, %f3, %f1;    fma.rn.f32 %f3, %f3, 0f3D372713, %f1; mul.f32 %f3, %f3, 0f3F4C422A;    add.f32 %f4, %f3, %f3; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;    add.f32 %f4, %f4, 0f3F800000; mov.f32 %f5, 0f40000000; div.rn.f32 %f5, %f5, %f4;    mov.f32 %f6, 0f3F800000; sub.f32 %f6, %f6, %f5; add.f32 %f6, %f6, 0f3F800000;    mul.f32 %f2, %f1, %f6; mul.f32 %f2, %f2, 0f3F000000; bra VM_ST;VM7:    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3; sub.f32 %f3, %f3, 0f3F800000;    setp.gt.f32 %p1, %f1, 0f00000000; selp.f32 %f2, %f1, %f3, %p1; bra VM_ST;VM8:    mul.f32 %f3, %f1, 0f3C23D70A; setp.gt.f32 %p1, %f1, 0f00000000;    selp.f32 %f2, %f1, %f3, %p1; bra VM_ST;VM9:    abs.f32 %f3, %f1; neg.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;    add.f32 %f3, %f3, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;    max.f32 %f4, %f1, 0f00000000; add.f32 %f2, %f4, %f3; bra VM_ST;VM10:    abs.f32 %f3, %f1; neg.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;    add.f32 %f3, %f3, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;    max.f32 %f4, %f1, 0f00000000; add.f32 %f5, %f4, %f3;    add.f32 %f6, %f5, %f5; mul.f32 %f6, %f6, 0f3FB8AA3B; ex2.approx.f32 %f6, %f6;    add.f32 %f6, %f6, 0f3F800000; mov.f32 %f7, 0f40000000; div.rn.f32 %f7, %f7, %f6;    mov.f32 %f8, 0f3F800000; sub.f32 %f8, %f8, %f7; mul.f32 %f2, %f1, %f8; bra VM_ST;VM11:    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3; sub.f32 %f3, %f3, 0f3F800000;    mul.f32 %f3, %f3, 0f3FD62D7D; setp.gt.f32 %p1, %f1, 0f00000000;    selp.f32 %f2, %f1, %f3, %p1; mul.f32 %f2, %f2, 0f3F867D5F; bra VM_ST;VM12:    add.f32 %f3, %f1, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f4, 0f40000000; div.rn.f32 %f4, %f4, %f3;    mov.f32 %f5, 0f3F800000; sub.f32 %f5, %f5, %f4; sub.f32 %f2, %f1, %f5; bra VM_ST;VM13:    add.f32 %f3, %f1, 0f40400000; mul.f32 %f3, %f3, 0f3E2AAAAB;    max.f32 %f3, %f3, 0f00000000; min.f32 %f2, %f3, 0f3F800000; bra VM_ST;VM14:    add.f32 %f3, %f1, 0f40400000; mul.f32 %f3, %f3, 0f3E2AAAAB;    max.f32 %f3, %f3, 0f00000000; min.f32 %f3, %f3, 0f3F800000; mul.f32 %f2, %f1, %f3; bra VM_ST;VM15:    sin.approx.f32 %f2, %f1; bra VM_ST;VM16:    cos.approx.f32 %f2, %f1; bra VM_ST;VM17:    abs.f32 %f3, %f1; fma.rn.f32 %f4, %f3, 0f3EA7BA05, 0f3F800000;    mov.f32 %f5, 0f3F800000; div.rn.f32 %f4, %f5, %f4;    mov.f32 %f6, 0f3F87DC22;    fma.rn.f32 %f6, %f6, %f4, 0fBFBA00E3;    fma.rn.f32 %f6, %f6, %f4, 0f3FB5F0E3;    fma.rn.f32 %f6, %f6, %f4, 0fBE91A98E;    fma.rn.f32 %f6, %f6, %f4, 0f3E827906;    mul.f32 %f6, %f6, %f4;    mul.f32 %f7, %f3, %f3; neg.f32 %f7, %f7; mul.f32 %f7, %f7, 0f3FB8AA3B; ex2.approx.f32 %f7, %f7;    mul.f32 %f6, %f6, %f7; mov.f32 %f2, 0f3F800000; sub.f32 %f2, %f2, %f6;    copysign.f32 %f2, %f1, %f2; bra VM_ST;VM18:    ex2.approx.f32 %f2, %f1; bra VM_ST;VM19:    lg2.approx.f32 %f2, %f1; bra VM_ST;VM20:    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;    neg.f32 %f4, %f1; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;    sub.f32 %f2, %f3, %f4; mul.f32 %f2, %f2, 0f3F000000; bra VM_ST;VM21:    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;    neg.f32 %f4, %f1; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;    add.f32 %f2, %f3, %f4; mul.f32 %f2, %f2, 0f3F000000; bra VM_ST;VM22:    abs.f32 %f3, %f1; fma.rn.f32 %f4, %f1, %f1, 0f3F800000; sqrt.rn.f32 %f4, %f4;    add.f32 %f4, %f3, %f4; lg2.approx.f32 %f4, %f4; mul.f32 %f4, %f4, 0f3F317218;    copysign.f32 %f2, %f1, %f4; bra VM_ST;VM23:    fma.rn.f32 %f4, %f1, %f1, 0fBF800000; sqrt.rn.f32 %f4, %f4; add.f32 %f4, %f1, %f4;    lg2.approx.f32 %f4, %f4; mul.f32 %f2, %f4, 0f3F317218; bra VM_ST;VM24:    add.f32 %f3, %f1, 0f3F800000; mov.f32 %f4, 0f3F800000; sub.f32 %f4, %f4, %f1;    div.rn.f32 %f3, %f3, %f4; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;    mul.f32 %f2, %f3, 0f3F000000; bra VM_ST;VM26:    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3; sub.f32 %f2, %f3, 0f3F800000; bra VM_ST;VM27:    add.f32 %f3, %f1, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f2, %f3, 0f3F317218; bra VM_ST;VM28:    mul.f32 %f3, %f1, 0f40549A78; ex2.approx.f32 %f2, %f3; bra VM_ST;VM29:    lg2.approx.f32 %f3, %f1; mul.f32 %f2, %f3, 0f3E9A209B; bra VM_ST;VM30:    abs.f32 %f3, %f1; add.f32 %f3, %f3, 0f3F800000; div.rn.f32 %f2, %f1, %f3; bra VM_ST;VM31:    abs.f32 %f3, %f1; neg.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;    add.f32 %f3, %f3, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;    neg.f32 %f4, %f1; max.f32 %f4, %f4, 0f00000000; add.f32 %f3, %f4, %f3; neg.f32 %f2, %f3; bra VM_ST;VM32:    sin.approx.f32 %f3, %f1; cos.approx.f32 %f4, %f1; div.rn.f32 %f2, %f3, %f4; bra VM_ST;VM35:    abs.f32 %f3, %f1; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;    mul.f32 %f3, %f3, 0f3EAAAAAB; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;    copysign.f32 %f2, %f1, %f3; bra VM_ST;VM25:    // atan(x): minimax poly atan(z)=z*P(z^2) on |z|<=1 (~1e-5 at z=1); reduce |x|>1 via pi/2-atan(1/|x|).    abs.f32 %f3, %f1; setp.gt.f32 %p1, %f3, 0f3F800000;    rcp.approx.f32 %f4, %f3; selp.f32 %f4, %f4, %f3, %p1;    mul.f32 %f5, %f4, %f4; mov.f32 %f6, 0f3CAAAE5F;    fma.rn.f32 %f6, %f6, %f5, 0fBDAE5A36; fma.rn.f32 %f6, %f6, %f5, 0f3E3876E2;    fma.rn.f32 %f6, %f6, %f5, 0fBEA91D04; fma.rn.f32 %f6, %f6, %f5, 0f3F7FF738;    mul.f32 %f6, %f6, %f4; mov.f32 %f7, 0f3FC90FDB; sub.f32 %f7, %f7, %f6;    selp.f32 %f6, %f7, %f6, %p1; copysign.f32 %f2, %f1, %f6; bra VM_ST;VM33:    // asin(x) = atan(x / sqrt(1-x^2)), sign preserved.    mul.f32 %f3, %f1, %f1; mov.f32 %f4, 0f3F800000; sub.f32 %f4, %f4, %f3; sqrt.rn.f32 %f4, %f4;    abs.f32 %f5, %f1; div.rn.f32 %f3, %f5, %f4;    setp.gt.f32 %p1, %f3, 0f3F800000; rcp.approx.f32 %f4, %f3; selp.f32 %f4, %f4, %f3, %p1;    mul.f32 %f5, %f4, %f4; mov.f32 %f6, 0f3CAAAE5F;    fma.rn.f32 %f6, %f6, %f5, 0fBDAE5A36; fma.rn.f32 %f6, %f6, %f5, 0f3E3876E2;    fma.rn.f32 %f6, %f6, %f5, 0fBEA91D04; fma.rn.f32 %f6, %f6, %f5, 0f3F7FF738;    mul.f32 %f6, %f6, %f4; mov.f32 %f7, 0f3FC90FDB; sub.f32 %f7, %f7, %f6;    selp.f32 %f6, %f7, %f6, %p1; copysign.f32 %f2, %f1, %f6; bra VM_ST;VM34:    // acos(x) = pi/2 - asin(x).    mul.f32 %f3, %f1, %f1; mov.f32 %f4, 0f3F800000; sub.f32 %f4, %f4, %f3; sqrt.rn.f32 %f4, %f4;    abs.f32 %f5, %f1; div.rn.f32 %f3, %f5, %f4;    setp.gt.f32 %p1, %f3, 0f3F800000; rcp.approx.f32 %f4, %f3; selp.f32 %f4, %f4, %f3, %p1;    mul.f32 %f5, %f4, %f4; mov.f32 %f6, 0f3CAAAE5F;    fma.rn.f32 %f6, %f6, %f5, 0fBDAE5A36; fma.rn.f32 %f6, %f6, %f5, 0f3E3876E2;    fma.rn.f32 %f6, %f6, %f5, 0fBEA91D04; fma.rn.f32 %f6, %f6, %f5, 0f3F7FF738;    mul.f32 %f6, %f6, %f4; mov.f32 %f7, 0f3FC90FDB; sub.f32 %f7, %f7, %f6;    selp.f32 %f6, %f7, %f6, %p1; copysign.f32 %f6, %f1, %f6;    mov.f32 %f7, 0f3FC90FDB; sub.f32 %f2, %f7, %f6; bra VM_ST;VM_DEF:    mov.f32 %f2, %f1;VM_ST:    add.s64 %rd6, %rd1, %rd5;    st.f32 [%rd6], %f2;    add.s64 %rd4, %rd4, 1;    bra VM_LOOP;VM_DONE:    ret;}"#;/// `wukong_vmath2_f32(in1, in2, out, n, op)`: the two-arg transcendentals over f32 arrays GÇö/// pow(0) = `in1^in2` = exp2(in2-+log2(in1)); atan2(1) = angle of (in2, in1) = atan(in1/in2) +/// quadrant fix; hypot(2) = `sqrt(in1-¦+in2-¦)`. atan uses the same inline minimax poly as VM25; the/// CPU<->GPU tolerance gate covers the SFU/poly-vs-libm difference.const PTX_VMATH2: &str = r#".func mrt_vmath2 (.param .b64 p1, .param .b64 p2, .param .b64 pout, .param .b64 pn, .param .b64 pop){    .reg .b64 %rd<9>;    .reg .f32 %f<12>;    .reg .pred %p<4>;    ld.param.u64 %rd0, [p1];    ld.param.u64 %rd1, [p2];    ld.param.u64 %rd2, [pout];    ld.param.u64 %rd3, [pn];    ld.param.u64 %rd4, [pop];    mov.b64 %rd5, 0;V2_LOOP:    setp.ge.s64 %p0, %rd5, %rd3;    @%p0 bra V2_DONE;    shl.b64 %rd6, %rd5, 2;    add.s64 %rd7, %rd0, %rd6;    ld.f32 %f1, [%rd7];    add.s64 %rd7, %rd1, %rd6;    ld.f32 %f2, [%rd7];    setp.eq.s64 %p1, %rd4, 0; @%p1 bra V2_POW;    setp.eq.s64 %p1, %rd4, 1; @%p1 bra V2_ATAN2;    setp.eq.s64 %p1, %rd4, 2; @%p1 bra V2_HYPOT;    mov.f32 %f3, %f1; bra V2_ST;V2_POW:    lg2.approx.f32 %f3, %f1; mul.f32 %f3, %f3, %f2; ex2.approx.f32 %f3, %f3; bra V2_ST;V2_HYPOT:    mul.f32 %f3, %f1, %f1; fma.rn.f32 %f3, %f2, %f2, %f3; sqrt.rn.f32 %f3, %f3; bra V2_ST;V2_ATAN2:    div.rn.f32 %f4, %f1, %f2;    abs.f32 %f5, %f4; setp.gt.f32 %p1, %f5, 0f3F800000;    rcp.approx.f32 %f6, %f5; selp.f32 %f6, %f6, %f5, %p1;    mul.f32 %f7, %f6, %f6; mov.f32 %f3, 0f3CAAAE5F;    fma.rn.f32 %f3, %f3, %f7, 0fBDAE5A36; fma.rn.f32 %f3, %f3, %f7, 0f3E3876E2;    fma.rn.f32 %f3, %f3, %f7, 0fBEA91D04; fma.rn.f32 %f3, %f3, %f7, 0f3F7FF738;    mul.f32 %f3, %f3, %f6; mov.f32 %f8, 0f3FC90FDB; sub.f32 %f8, %f8, %f3;    selp.f32 %f3, %f8, %f3, %p1; copysign.f32 %f3, %f4, %f3;    setp.lt.f32 %p1, %f2, 0f00000000;    mov.f32 %f8, 0f40490FDB; copysign.f32 %f8, %f1, %f8; add.f32 %f9, %f3, %f8;    selp.f32 %f3, %f9, %f3, %p1; bra V2_ST;V2_ST:    add.s64 %rd7, %rd2, %rd6;    st.f32 [%rd7], %f3;    add.s64 %rd5, %rd5, 1;    bra V2_LOOP;V2_DONE:    ret;}"#;/// `wukong_velem_f32(x, y, out, n, a, b, c, op)`: streaming elementwise `out[i] = act(base)` where/// `base` is the **binary** product `x-+y` (`op & 512`, VE_HADAMARD) or quotient `x/y` (`op & 1024`,/// VE_DIV) GÇö both read `y` GÇö else the **affine** `a-+x[i] + inner` with `inner = (op & 256) ? b-+y[i]+c :/// c`; `act = op & 0xff` is identity(0)/relu(1)/relu6(2). `div.rn.f32` is correctly-rounded IEEE/// division, matching the CPU kernel's `x / y` bit-for-bit within the gate. The two-fma affine chain/// matches the CPU kernel (e.g. the residual add `x + y` is `op=256, a=b=1, c=0`).const PTX_VELEM: &str = r#".func mrt_velem (.param .b64 px, .param .b64 py, .param .b64 pout, .param .b64 pn, .param .f32 pa, .param .f32 pb, .param .f32 pc, .param .b64 pop){    .reg .b64 %rd<12>;    .reg .f32 %f<8>;    .reg .pred %p<4>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [py];    ld.param.u64 %rd2, [pout];    ld.param.u64 %rd3, [pn];    ld.param.f32 %f4, [pa];    ld.param.f32 %f5, [pb];    ld.param.f32 %f6, [pc];    ld.param.u64 %rd4, [pop];    and.b64 %rd5, %rd4, 256;    and.b64 %rd6, %rd4, 255;    and.b64 %rd10, %rd4, 512;    and.b64 %rd11, %rd4, 1024;    or.b64 %rd5, %rd5, %rd10;    or.b64 %rd5, %rd5, %rd11;    mov.b64 %rd7, 0;VE_LOOP:    setp.ge.s64 %p0, %rd7, %rd3;    @%p0 bra VE_DONE;    shl.b64 %rd8, %rd7, 2;    add.s64 %rd9, %rd0, %rd8;    ld.f32 %f1, [%rd9];    setp.ne.s64 %p1, %rd5, 0;    mov.f32 %f7, %f6;    @%p1 add.s64 %rd9, %rd1, %rd8;    @%p1 ld.f32 %f2, [%rd9];    @%p1 fma.rn.f32 %f7, %f5, %f2, %f6;    fma.rn.f32 %f3, %f4, %f1, %f7;    setp.ne.s64 %p2, %rd10, 0;    setp.ne.s64 %p3, %rd11, 0;    @%p2 mul.f32 %f3, %f1, %f2;    @%p3 div.rn.f32 %f3, %f1, %f2;    setp.eq.s64 %p1, %rd6, 1;    setp.eq.s64 %p2, %rd6, 2;    @%p1 max.f32 %f3, %f3, 0f00000000;    @%p2 max.f32 %f3, %f3, 0f00000000;    @%p2 min.f32 %f3, %f3, 0f40C00000;    add.s64 %rd9, %rd2, %rd8;    st.f32 [%rd9], %f3;    add.s64 %rd7, %rd7, 1;    bra VE_LOOP;VE_DONE:    ret;}"#;/// `mrt_fmod(a, b) -> a % b` (true IEEE fmod, f64), the helper float `%` calls. Exact via binary/// scaling: align `rb-+2^k` just below `ra=|a|`, then subtract-and-halve down to `rb` GÇö every step/// (`*2`, `*0.5`, `ra-=m`) is exact, so the result is the exact remainder regardless of magnitude/// (the `a-trunc(a/b)*b` identity fails past 2^53). f32 `%` widens to f64 here and narrows the result.const PTX_FMOD: &str = r#".func (.param .f64 _r) mrt_fmod (.param .f64 pa, .param .f64 pb){    .reg .f64 %fd<6>;    .reg .pred %p<3>;    ld.param.f64 %fd0, [pa];    ld.param.f64 %fd1, [pb];    abs.f64 %fd2, %fd0;    abs.f64 %fd3, %fd1;    setp.eq.f64 %p0, %fd3, 0d0000000000000000;    @%p0 bra FMOD_RET;    setp.lt.f64 %p0, %fd2, %fd3;    @%p0 bra FMOD_RET;    mov.f64 %fd4, %fd3;FMOD_UP:    add.f64 %fd5, %fd4, %fd4;    setp.gt.f64 %p1, %fd5, %fd2;    @%p1 bra FMOD_LOOP;    mov.f64 %fd4, %fd5;    bra FMOD_UP;FMOD_LOOP:    setp.lt.f64 %p1, %fd2, %fd4;    @%p1 bra FMOD_SKIP;    sub.f64 %fd2, %fd2, %fd4;FMOD_SKIP:    setp.eq.f64 %p1, %fd4, %fd3;    @%p1 bra FMOD_RET;    mul.f64 %fd4, %fd4, 0d3FE0000000000000;    bra FMOD_LOOP;FMOD_RET:    copysign.f64 %fd2, %fd0, %fd2;    st.param.f64 [_r], %fd2;    ret;}"#;// --------------------------------------------------------------------------------------------// Mixed-precision (bf16/f16 storage, f32 compute) device helpers.//// These reproduce the `wukong_{vmath,dot,sum,reduce,axpby}_{bf16,f16}` CPU kernels: the storage is// 2-byte bf16/f16 (loaded with `ld.u16` + `cvt.f32.{bf16,f16}`, a lossless widen for the bf16-/f16-// exact corpus values), all math is f32, and outputs/accumulators are f32 (the standard ML// "low-precision storage, f32 accumulate" contract). PTX labels are function-scoped (verified), so// the bf16 and f16 variants reuse the same internal label names without colliding. `cvt` is// `"bf16"` or `"f16"`; the two variants differ only in that conversion suffix.// --------------------------------------------------------------------------------------------/// `wukong_vmath_{bf16,f16}(x, out, n, op)`: elementwise activation reading a bf16/f16 input array/// (2-byte stride) and writing f32 (4-byte stride). Reuses the f32 kernel's op-switch verbatim (the/// op codes and SFU formulas are identical; only the input load differs), so the result is bit-for-/// bit the f32 kernel run on the widened inputs.fn ptx_vmath_lowp(fn_name: &str, cvt: &str) -> Option<String> {    // Splice in the shared dispatch + op bodies (`setp GÇª; VM0: GÇª; VM_DEF: mov %f2,%f1`) from the    // committed f32 kernel so there is one source of truth for the ~30 activation formulas.    // The two markers are an invariant of `PTX_VMATH` in this same file; if an edit ever renames or    // reflows them, DECLINE (the caller turns `None` into an `UNSUPPORTED:` diagnostic) instead of    // panicking with internal text on a path a user program reaches. `vmath_lowp_markers_present`    // below pins the invariant so a desync is caught at edit time, not at compile time of a program.    let s = PTX_VMATH;    let start = s.find(VM_DISPATCH_MARKER)?;    let end = s.find(VM_STORE_MARKER)?;    let ops = &s[start..end];    Some(format!(        r#".func {fn_name} (.param .b64 px, .param .b64 pout, .param .b64 pn, .param .b64 pop){{    .reg .b64 %rd<9>;    .reg .f32 %f<12>;    .reg .b16 %rs<1>;    .reg .pred %p<4>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [pout];    ld.param.u64 %rd2, [pn];    ld.param.u64 %rd3, [pop];    mov.b64 %rd4, 0;VM_LOOP:    setp.ge.s64 %p0, %rd4, %rd2;    @%p0 bra VM_DONE;    shl.b64 %rd5, %rd4, 1;    add.s64 %rd6, %rd0, %rd5;    ld.u16 %rs0, [%rd6];    cvt.f32.{cvt} %f1, %rs0;{ops}VM_ST:    shl.b64 %rd8, %rd4, 2;    add.s64 %rd6, %rd1, %rd8;    st.f32 [%rd6], %f2;    add.s64 %rd4, %rd4, 1;    bra VM_LOOP;VM_DONE:    ret;}}"#    ))}/// The two `PTX_VMATH` anchors [`ptx_vmath_lowp`] splices between: the first line of the op-code/// dispatch, and the shared store label that ends the op bodies. Named constants so the test below/// pins exactly what the splice looks for.const VM_DISPATCH_MARKER: &str = "    setp.eq.s64 %p1, %rd3, 0;";const VM_STORE_MARKER: &str = "VM_ST:";/// `wukong_dot_{bf16,f16}(x, y, n) -> f32`: `+ú widen(x[k])-+widen(y[k])`, f32 accumulate.fn ptx_dot_lowp(fn_name: &str, cvt: &str) -> String {    format!(        r#".func (.param .f32 _r) {fn_name} (.param .b64 px, .param .b64 py, .param .b64 pn){{    .reg .b64 %rd<7>;    .reg .f32 %f<4>;    .reg .b16 %rs<2>;    .reg .pred %p<2>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [py];    ld.param.u64 %rd2, [pn];    mov.b64 %rd3, 0;    mov.f32 %f0, 0f00000000;DOT_LOOP:    setp.ge.s64 %p0, %rd3, %rd2;    @%p0 bra DOT_DONE;    shl.b64 %rd4, %rd3, 1;    add.s64 %rd5, %rd0, %rd4;    ld.u16 %rs0, [%rd5];    cvt.f32.{cvt} %f1, %rs0;    add.s64 %rd6, %rd1, %rd4;    ld.u16 %rs1, [%rd6];    cvt.f32.{cvt} %f2, %rs1;    fma.rn.f32 %f0, %f1, %f2, %f0;    add.s64 %rd3, %rd3, 1;    bra DOT_LOOP;DOT_DONE:    st.param.f32 [_r], %f0;    ret;}}"#    )}/// `wukong_sum_{bf16,f16}(x, n) -> f32`: `+ú widen(x[k])`, f32 accumulate.fn ptx_sum_lowp(fn_name: &str, cvt: &str) -> String {    format!(        r#".func (.param .f32 _r) {fn_name} (.param .b64 px, .param .b64 pn){{    .reg .b64 %rd<6>;    .reg .f32 %f<2>;    .reg .b16 %rs<1>;    .reg .pred %p<2>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [pn];    mov.b64 %rd2, 0;    mov.f32 %f0, 0f00000000;SUM_LOOP:    setp.ge.s64 %p0, %rd2, %rd1;    @%p0 bra SUM_DONE;    shl.b64 %rd3, %rd2, 1;    add.s64 %rd4, %rd0, %rd3;    ld.u16 %rs0, [%rd4];    cvt.f32.{cvt} %f1, %rs0;    add.f32 %f0, %f0, %f1;    add.s64 %rd2, %rd2, 1;    bra SUM_LOOP;SUM_DONE:    st.param.f32 [_r], %f0;    ret;}}"#    )}/// `wukong_reduce_{bf16,f16}(x, n, op) -> f32`: max(4)/min(5)/maxabs(6) fold over `widen(x[k])`./// Order-independent and exact (no rounding), so it matches the CPU kernel's result for any order.fn ptx_reduce_lowp(fn_name: &str, cvt: &str) -> String {    format!(        r#".func (.param .f32 _r) {fn_name} (.param .b64 px, .param .b64 pn, .param .b64 pop){{    .reg .b64 %rd<6>;    .reg .f32 %f<2>;    .reg .b16 %rs<1>;    .reg .pred %p<3>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [pn];    ld.param.u64 %rd2, [pop];    mov.b64 %rd3, 0;    // init: -inf for max/maxabs, +inf for min.    mov.f32 %f0, 0fFF800000;    setp.eq.s64 %p1, %rd2, 5;    @%p1 mov.f32 %f0, 0f7F800000;RED_LOOP:    setp.ge.s64 %p0, %rd3, %rd1;    @%p0 bra RED_DONE;    shl.b64 %rd4, %rd3, 1;    add.s64 %rd5, %rd0, %rd4;    ld.u16 %rs0, [%rd5];    cvt.f32.{cvt} %f1, %rs0;    setp.eq.s64 %p2, %rd2, 6;    @%p2 abs.f32 %f1, %f1;    setp.eq.s64 %p1, %rd2, 5;    @%p1 min.f32 %f0, %f0, %f1;    @!%p1 max.f32 %f0, %f0, %f1;    add.s64 %rd3, %rd3, 1;    bra RED_LOOP;RED_DONE:    st.param.f32 [_r], %f0;    ret;}}"#    )}/// `wukong_axpby_{bf16,f16}(x, y, out, n, a, b)`: `out[i] = a-+widen(x[i]) + b-+widen(y[i])` (bf16/f16/// in, f32 out, f32 math).fn ptx_axpby_lowp(fn_name: &str, cvt: &str) -> String {    format!(        r#".func {fn_name} (.param .b64 px, .param .b64 py, .param .b64 pout, .param .b64 pn, .param .f32 pa, .param .f32 pb){{    .reg .b64 %rd<8>;    .reg .f32 %f<6>;    .reg .b16 %rs<2>;    .reg .pred %p<2>;    ld.param.u64 %rd0, [px];    ld.param.u64 %rd1, [py];    ld.param.u64 %rd2, [pout];    ld.param.u64 %rd3, [pn];    ld.param.f32 %f4, [pa];    ld.param.f32 %f5, [pb];    mov.b64 %rd4, 0;AXPBY_LOOP:    setp.ge.s64 %p0, %rd4, %rd3;    @%p0 bra AXPBY_DONE;    shl.b64 %rd5, %rd4, 1;    add.s64 %rd6, %rd0, %rd5;    ld.u16 %rs0, [%rd6];    cvt.f32.{cvt} %f1, %rs0;    add.s64 %rd6, %rd1, %rd5;    ld.u16 %rs1, [%rd6];    cvt.f32.{cvt} %f2, %rs1;    mul.f32 %f3, %f4, %f1;    fma.rn.f32 %f3, %f5, %f2, %f3;    shl.b64 %rd7, %rd4, 2;    add.s64 %rd6, %rd2, %rd7;    st.f32 [%rd6], %f3;    add.s64 %rd4, %rd4, 1;    bra AXPBY_LOOP;AXPBY_DONE:    ret;}}"#    )}/// `wukong_sgemm_nt_epi(a, b, c, m, k, n, beta, bias, act)`: fused `C = act(A.Bt [+ bias])` (the/// nn.Linear/FFN epilogue). `bias` is null (passed as integer 0) for no bias; `act` is/// identity(0)/relu(1)/gelu(2)/silu(3). silu/gelu reuse the SFU forms from mrt_vmath; tolerance-gated.const PTX_SGEMM_NT_EPI: &str = r#".func mrt_sgemm_nt_epi (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn, .param .b64 pbeta, .param .b64 pbias, .param .b64 pact){    .reg .b64 %rd<24>;    .reg .f32 %f<12>;    .reg .pred %p<6>;    ld.param.u64 %rd0, [pa];    ld.param.u64 %rd1, [pb];    ld.param.u64 %rd2, [pc];    ld.param.u64 %rd3, [pm];    ld.param.u64 %rd4, [pk];    ld.param.u64 %rd5, [pn];    ld.param.u64 %rd6, [pbeta];    ld.param.u64 %rd16, [pbias];    ld.param.u64 %rd17, [pact];    mov.b64 %rd7, 0;EPI_LI:    setp.ge.s64 %p0, %rd7, %rd3;    @%p0 bra EPI_EI;    mov.b64 %rd8, 0;EPI_LJ:    setp.ge.s64 %p1, %rd8, %rd5;    @%p1 bra EPI_EJ;    mov.f32 %f0, 0f00000000;    mul.lo.s64 %rd9, %rd7, %rd4;    shl.b64 %rd9, %rd9, 2;    add.s64 %rd9, %rd0, %rd9;    mul.lo.s64 %rd10, %rd8, %rd4;    shl.b64 %rd10, %rd10, 2;    add.s64 %rd10, %rd1, %rd10;    mov.b64 %rd11, 0;EPI_LL:    setp.ge.s64 %p2, %rd11, %rd4;    @%p2 bra EPI_EL;    shl.b64 %rd12, %rd11, 2;    add.s64 %rd13, %rd9, %rd12;    ld.f32 %f1, [%rd13];    add.s64 %rd14, %rd10, %rd12;    ld.f32 %f2, [%rd14];    fma.rn.f32 %f0, %f1, %f2, %f0;    add.s64 %rd11, %rd11, 1;    bra EPI_LL;EPI_EL:    mul.lo.s64 %rd15, %rd7, %rd5;    add.s64 %rd15, %rd15, %rd8;    shl.b64 %rd15, %rd15, 2;    add.s64 %rd15, %rd2, %rd15;    setp.eq.s64 %p3, %rd6, 0;    @%p3 bra EPI_NOACC;    ld.f32 %f3, [%rd15];    add.rn.f32 %f0, %f0, %f3;EPI_NOACC:    setp.eq.s64 %p3, %rd16, 0;    @%p3 bra EPI_NOBIAS;    shl.b64 %rd18, %rd8, 2;    add.s64 %rd18, %rd16, %rd18;    ld.f32 %f3, [%rd18];    add.rn.f32 %f0, %f0, %f3;EPI_NOBIAS:    setp.eq.s64 %p3, %rd17, 1;    @%p3 bra EPI_RELU;    setp.eq.s64 %p3, %rd17, 2;    @%p3 bra EPI_GELU;    setp.eq.s64 %p3, %rd17, 3;    @%p3 bra EPI_SILU;    bra EPI_ST;EPI_RELU:    max.f32 %f0, %f0, 0f00000000;    bra EPI_ST;EPI_SILU:    neg.f32 %f4, %f0; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;    add.f32 %f4, %f4, 0f3F800000; mov.f32 %f5, 0f3F800000; div.rn.f32 %f5, %f5, %f4;    mul.f32 %f0, %f0, %f5;    bra EPI_ST;EPI_GELU:    mul.f32 %f4, %f0, %f0; mul.f32 %f4, %f4, %f0;    fma.rn.f32 %f4, %f4, 0f3D372713, %f0; mul.f32 %f4, %f4, 0f3F4C422A;    add.f32 %f5, %f4, %f4; mul.f32 %f5, %f5, 0f3FB8AA3B; ex2.approx.f32 %f5, %f5;    add.f32 %f5, %f5, 0f3F800000; mov.f32 %f6, 0f40000000; div.rn.f32 %f6, %f6, %f5;    mov.f32 %f7, 0f3F800000; sub.f32 %f7, %f7, %f6; add.f32 %f7, %f7, 0f3F800000;    mul.f32 %f0, %f0, %f7; mul.f32 %f0, %f0, 0f3F000000;    bra EPI_ST;EPI_ST:    st.f32 [%rd15], %f0;    add.s64 %rd8, %rd8, 1;    bra EPI_LJ;EPI_EJ:    add.s64 %rd7, %rd7, 1;    bra EPI_LI;EPI_EI:    ret;}"#;// ============================================================================================// Device execution// ============================================================================================fn run_on_device(    g: &mut crate::gpu::Gpu,    ptx: &str,    ret: &MirType,) -> Result<(i64, Vec<u8>), String> {    let _ = ret;    // A stable per-PTX module key (leaked once per distinct module GÇö bounded by programs compiled in    // the process) so the shared `Gpu` in-process + cubin caches apply.    let mut h = DefaultHasher::new();    ptx.hash(&mut h);    let key: &'static str = Box::leak(format!("mir_lower_{:016x}", h.finish()).into_boxed_str());    if std::env::var_os("WUKONG_GPU_DUMP_PTX").is_some() {        eprintln!("--- gpu-native PTX ---\n{ptx}\n--- end PTX ---");    }    let f = g.function(key, ptx, KERNEL_NAME).map_err(|e| {        // Persist the PTX so a JIT/ptxas error (otherwise an opaque driver code) is debuggable.        let p = std::env::temp_dir().join(format!("{key}.ptx"));        let _ = std::fs::write(&p, ptx);        format!(            "gpu-native JIT/load failed: {e:?}\n  (PTX written to {})",            p.display()        )    })?;    let host = new_ctx_host();    let mut ctx_d = g        .stream        .memcpy_stod(&host)        .map_err(|e| format!("gpu-native ctx alloc failed: {e:?}"))?;    let cfg = LaunchConfig {        grid_dim: (1, 1, 1),        block_dim: (1, 1, 1),        shared_mem_bytes: 0,    };    let mut b = g.stream.launch_builder(&f);    b.arg(&mut ctx_d);    unsafe {        b.launch(cfg)            .map_err(|e| format!("gpu-native launch failed: {e:?}"))?;    }    let out = g        .stream        .memcpy_dtov(&ctx_d)        .map_err(|e| format!("gpu-native readback failed: {e:?}"))?;    decode_ctx(&out)}/// The zeroed host mirror of the device context buffer (record count + assert flag + exit code +/// reserved, then `RECORD_CAP` two-u64 print records). Shared by the single-thread and mega launchers.pub(crate) fn new_ctx_host() -> Vec<u64> {    vec![0u64; 4 + 2 * RECORD_CAP as usize]}/// Decode a context buffer read back from the device into `(exit_code, stdout)` GÇö the print records/// replayed with the *identical* `format!("{}\n")` the interpreter/Cranelift runtime uses. Shared by/// `run_on_device` and the megakernel launcher so both produce byte-identical output.pub(crate) fn decode_ctx(out: &[u64]) -> Result<(i64, Vec<u8>), String> {    let count = out[CTX_COUNT_OFF as usize / 8];    let assert_failed = out[CTX_ASSERT_OFF as usize / 8];    let exit = out[CTX_EXIT_OFF as usize / 8] as i64;    if assert_failed != 0 {        return Err("assertion failed".into());    }    if count > RECORD_CAP {        return Err(format!(            "gpu-native print buffer overflow: {count} records exceed capacity {RECORD_CAP}"        ));    }    let mut stdout = Vec::new();    let base = CTX_RECORDS_OFF as usize / 8;    for i in 0..count as usize {        let tag = out[base + 2 * i];        let payload = out[base + 2 * i + 1];        let line = if tag == 1 {            format!("{}\n", f64::from_bits(payload))        } else {            format!("{}\n", payload as i64)        };        stdout.extend_from_slice(line.as_bytes());    }    Ok((exit, stdout))}/// Total bytes of `func`'s alloca frame (mirrors `FnEmit::assign_frame`'s slot sizing) GÇö the size of/// the shared `.global` frame buffer the megakernel launcher allocates + zeroes for the whole block.pub fn mega_frame_bytes(func: &Function) -> u64 {    let mut off = 0u64;    for b in &func.blocks {        for (i, inst) in b.insts.iter().enumerate() {
-                self.cur_block = b.id;
-                self.cur_inst = i;            if let Op::Alloca { ty: ty, space: wukong_mir::AddrSpace::Local } = &inst.op {                if inst.result.is_some() {                    let sz = size_of(ty).max(1);                    off += sz.div_ceil(8) * 8;                }            }        }    }    off}// ============================================================================================// Corpus-sweep MIR normalization (test support, shared with `megakernel.rs`).// ============================================================================================/// **Makes the corpus coverage counts a property of this backend instead of a property of the host/// CPU.** Every gate in this crate that reports a coverage number builds its MIR through [`build`]/// here GÇö including `megakernel.rs`'s, which shares this module's copy rather than keeping its own.////// The confound it removes: `wukong_mir_build`'s general 256-bit loop vectorizer emits an/// `Op::VecKernelCall` (a raw-AVX2 CPU microkernel recipe) only where/// [`wukong_mir::host_supports_vec_kernels`] is true GÇö and that predicate is/// `cfg(all(target_arch = "x86_64", target_os = "windows"))`, because the assembled bytes hardcode/// the Win64 argument registers. `lower.rs` declines exactly that op/// (`UNSUPPORTED: VecKernelCall`), so on Windows every program carrying one is a skip, while on/// Linux the same source compiles to 128-bit CLIF strips and lowers fine.////// Measured on this corpus, device-free, by `corpus_lowering_floors_are_host_vectorizer_invariant`:/// 26 of the 357 `tests/run` programs carry a `VecKernelCall` on Win64, and 18 of them lower once/// it is gone. That is the entire difference between the Windows sweep's 217/357 + 87 mega and the/// Modal L4 sweep's (2026-08-09) 235/357 + 90 mega. **The Linux run was not better at lowering; it/// simply never saw the op.** With two hosts reading two numbers, one hardcoded floor is a live/// gate on exactly one of them and vacuous on the other GÇö and the datacenter round is about to/// spend real money running this gate on Linux.////// The fix is to normalize the *input*, not to special-case the floor: `WUKONG_P4_NO_256=1` forces/// the same 128-bit fallback the non-Windows host takes anyway, so the swept MIR is byte-comparable/// on both. That switch is documented and pinned as **result-identical** by/// `wukong_codegen_cranelift`'s `p4_kill_switch_is_result_identical`, so the interpreter oracle in/// the same sweep is unaffected GÇö and gpu-native gets *more* device coverage on Windows, not less,/// since those 18 programs now really run.////// Excluding the `VecKernelCall` carriers from the denominator instead GÇö count coverage only over/// the programs where "can gpu-native lower this?" is well-posed GÇö reads like the more conservative/// fix, but it does not actually produce one number: **the excluded set is itself host-dependent.**/// On Win64 it is 26 programs and the ratio is 217/331; on Linux no program carries the op, nothing/// is excluded, and the ratio is 235/357. To exclude the same set on both hosts you must first know/// which programs *would* carry the op under the Win64 ABI, and the only way to learn that is to/// build the corpus both ways GÇö i.e. this switch. A `#[cfg(windows)] 217 / #[cfg(unix)] 235` floor/// is worse still: it encodes the confound instead of removing it, leaves each arm ratcheting a/// different quantity, and has to be re-derived on every new host.////// With the normalization in place the *device* sweep on this RTX 4050 reads 235/357 and 90/103 GÇö/// the L4's numbers exactly, on a different OS and a different card, with zero mismatches and zero/// faults. The invariance is measured, not argued.////// LANDMINE: the switch is read from the process environment, which is global to the test binary,/// so [`normalized`] and [`host_native`] take one crate-wide mutex and restore the previous value/// on the way out (including on a panic) GÇö two gates can hold opposite settings without racing./// They touch the environment **only where [`switch_can_matter`] holds**; see its comment for why/// that is a soundness property and not a shortcut. **There is no MIR builder in this crate outside/// the lock**: `fusion.rs`'s tests import [`build`]/[`build_in_current_host_mode`] from here, so every/// MIR build in the crate is serialized by the one mutex. Their switch-insensitivity is no longer a/// manual check either GÇö `fusion::tests::fusion_eligibility_is_host_vectorizer_invariant` runs the/// same source through both host-vectorizer modes and asserts the `MegaPlan` is identical, over a/// program that genuinely carries an `Op::VecKernelCall` in one mode and not the other. Route any new/// MIR-building helper through here rather than re-deriving that.#[cfg(all(test, feature = "gpu"))]pub(crate) mod hostvec {    use super::{Interner, Program};    use std::ffi::OsString;    use std::sync::{Mutex, MutexGuard};    /// The `wukong_mir_build` kill-switch that forces the 128-bit fallback for both 256-bit recipe    /// sites (elementwise and reduction).    const VAR: &str = "WUKONG_P4_NO_256";    /// Serializes every window in which this crate's tests hold a non-default value of [`VAR`].    static ENV_LOCK: Mutex<()> = Mutex::new(());    /// Whether [`VAR`] can change one byte of MIR on this host.    ///    /// It is the *other* conjunct at both `mir_build` recipe sites, which read    /// `lane == F32 && host_supports_vec_kernels() && var_os(VAR).is_none()`, and those two sites    /// are the only non-test readers of the variable in the workspace. `&&` short-circuits, so    /// where this is false the environment is never even consulted GÇö and [`scoped`] below then    /// skips the write entirely: `normalized(f)` is literally `f()`, over the MIR an untouched    /// `mir_build` produced.    ///    /// That is a soundness property, not a micro-optimization. `setenv` racing another thread's    /// `getenv` is a data race in glibc GÇö Rust makes `std::env::set_var` `unsafe` in edition 2024    /// for exactly this reason GÇö and this crate does have a concurrent reader outside the lock    /// (`fusion.rs`'s test `build`, plus anything in `std` that reads the environment). On Windows    /// the calls go to `SetEnvironmentVariableW`/`GetEnvironmentVariableW`, which are serialized by    /// the OS and cannot corrupt; on Linux they are not. So the arrangement is: the host that has    /// the confound (Win64) pays a lock to remove it, and the host that never had it (every other,    /// including the datacenter fleet this gate is being flown to) is not touched at all.    fn switch_can_matter() -> bool {        wukong_mir::host_supports_vec_kernels()    }    /// Holds the lock for the window and puts the previous value back when dropped GÇö field drops    /// run *after* `Drop::drop`, so the restore happens while the lock is still held.    struct Scoped {        prev: Option<OsString>,        _guard: MutexGuard<'static, ()>,    }    impl Drop for Scoped {        fn drop(&mut self) {            match self.prev.take() {                Some(v) => std::env::set_var(VAR, v),                None => std::env::remove_var(VAR),            }        }    }    /// `None` where the switch is inert GÇö the caller's closure then runs against this host's    /// ordinary `mir_build` output, which on such a host is already the normalized MIR.    fn scoped(set: bool) -> Option<Scoped> {        if !switch_can_matter() {            return None;        }        // A panicking test must not wedge every later one: take the guard out of a poisoned lock.        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());        let prev = std::env::var_os(VAR);        if set {            std::env::set_var(VAR, "1");        } else {            std::env::remove_var(VAR);        }        Some(Scoped {            prev,            _guard: guard,        })    }    /// Run `f` with the host's 256-bit raw-AVX2 loop vectorizer suppressed GÇö the host-invariant    /// condition every corpus coverage count in this crate is measured in. Where the vectorizer    /// does not exist this is already that condition, so `f` simply runs.    pub(crate) fn normalized<R>(f: impl FnOnce() -> R) -> R {        let _s = scoped(true);        f()    }    /// Run `f` with the kill-switch *removed*, i.e. with whatever `mir_build` does by default on    /// this host. Only the invariance gate wants this GÇö it is the condition that makes a coverage    /// count host-dependent in the first place, and it is the arm that reproduces the old 217/87.    /// (Removing rather than merely not-setting matters: it keeps the arm meaningful even when the    /// whole suite is run with `WUKONG_P4_NO_256=1` in the environment, and the previous value is    /// restored on the way out.) Where [`switch_can_matter`] is false this is indistinguishable    /// from [`normalized`] by construction, and the gate skips the arm rather than compare a    /// sweep against itself.    pub(crate) fn host_native<R>(f: impl FnOnce() -> R) -> R {        let _s = scoped(false);        f()    }    /// **The one MIR builder both corpus gates use** (lex -> parse -> sema -> mir_build -> opt),    /// normalized. It lives here rather than once per test module because the two gates now ratchet    /// cross-referenced constants GÇö [`super::tests::RUN_CORPUS_COVERAGE_FLOOR`] and    /// [`crate::megakernel::tests::MEGA_CORPUS_COVERAGE_FLOOR`] are asserted together by    /// `corpus_lowering_floors_are_host_vectorizer_invariant` GÇö and two copies of the builder is    /// how the two sweeps would quietly start measuring different MIR while both stayed green.    pub(crate) fn build(src: &str, opt: u8) -> Option<(Program, Interner)> {        normalized(|| build_in_current_host_mode(src, opt))    }    /// [`build`] without the normalization: whatever MIR *this* host's `mir_build` produces under    /// whichever window is currently open. Every gate that reports a number must use [`build`];    /// this exists for the invariance gate, whose two sweeps pick the condition per program and so    /// must supply their own [`normalized`]/[`host_native`] wrapper.    ///    /// It deliberately does NOT take the lock itself. [`ENV_LOCK`] is a plain `Mutex` and is not    /// reentrant, so a caller that already holds a window and then called [`build`] would deadlock    /// against itself GÇö which is exactly what `sweep_corpus` would do if it wrapped [`build`]    /// instead of this.    pub(crate) fn build_in_current_host_mode(src: &str, opt: u8) -> Option<(Program, Interner)> {        use wukong_span::SourceMap;        let mut sm = SourceMap::new();        let id = sm.add("gate.wk".to_string(), src.to_string());        let (tokens, ld) = wukong_lexer::tokenize(sm.source(id), id);        if ld.iter().any(|d| d.is_error()) {            return None;        }        let mut interner = Interner::new();        let (module, pd) =            wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);        if pd.iter().any(|d| d.is_error()) {            return None;        }        let (sema, sd) = wukong_sema::check(&module, &interner);        if sd.iter().any(|d| d.is_error()) {            return None;        }        let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);        if md.iter().any(|d| d.is_error()) {            return None;        }        wukong_opt::optimize(&mut program, opt);        Some((program, interner))    }}// ============================================================================================// Coverage gate: tests/run corpus through the GPU-lowering backend vs the interpreter oracle.// ============================================================================================#[cfg(all(test, feature = "gpu"))]mod tests {    use super::*;    use std::path::PathBuf;    /// `ptx_vmath_lowp` builds the bf16/f16 activation kernels by slicing `PTX_VMATH` between two    /// literal markers. That is a self-referential invariant of this file: renaming `VM_ST:` or    /// reflowing the first dispatch line silently turns every bf16/f16 activation program into an    /// `UNSUPPORTED:` decline. Pin it here GÇö this test needs no CUDA device, so it fires on any    /// `--features gpu` build the moment the PTX literal and the splice desync.    #[test]    fn vmath_lowp_markers_present() {        assert!(            PTX_VMATH.contains(VM_DISPATCH_MARKER),            "PTX_VMATH no longer contains the op-dispatch marker {VM_DISPATCH_MARKER:?} that \             ptx_vmath_lowp splices from"        );        assert!(            PTX_VMATH.contains(VM_STORE_MARKER),            "PTX_VMATH no longer contains the store marker {VM_STORE_MARKER:?} that \             ptx_vmath_lowp splices to"        );        // And the splice really produces a kernel (markers in the right order, non-empty body).        let k = ptx_vmath_lowp("mrt_vmath_bf16", "bf16").expect("bf16 vmath kernel");        assert!(            k.contains("cvt.f32.bf16"),            "spliced kernel lost its bf16 input widen"        );        assert!(k.is_ascii(), "PTX must stay ASCII");    }    /// **The gpu-native floor gate** GÇö the one this crate did not have. Every other PTX family pins    /// its module header in a device-free test (`ptx_fp8_train::fp8_train_floors_are_split_by_...`,    /// `baselines::int8_dequant_chain_peer_ptx_is_floored_and_ascii`, the `ptx*` family gates); the    /// general MIR->PTX path GÇö the only backend that emits a module for an *arbitrary* program, and    /// therefore the one whose floor governs the most output GÇö referenced    /// [`crate::ptx_target::HDR_SM80`] at both `push_str` sites with nothing asserting it.    ///    /// Both over-declarations are invisible to every other gate in this crate, because both JIT fine    /// on the Ada card the corpus gate runs on:    ///   * `.target sm_89` loads on **zero** A100s GÇö PTX is forward-compatible only;    ///   * `.version 8.4` is refused by `cuModuleLoadData` on any driver **below r550**, and the    ///     cloud fleets this retarget exists for run r535/r545. The version is an independent    ///     portability axis from the target, so it is asserted independently.    ///    /// Both emitters are gated: [`emit_ptx`] and [`emit_mega_ptx`] only build text (the device is    /// touched later, by `jit_run*`), so this is pure-CPU and fires on any `--features gpu` build.    /// Swept at `-O0` and `-O3` because the two levels present different MIR to the emitters.    #[test]    fn gpu_native_modules_open_at_the_sm80_floor() {        use crate::ptx_target::{HDR_SM80, TARGET_SM80, TARGET_SM89};        // A parameterless `main` (the megakernel entry requires no params) with a loop, integer        // arithmetic and a print GÇö enough MIR that both emitters walk their real emission tables.        const SCALAR: &str = r#"module gatefn main() -> i32 {    let mut s: i32 = 0;    let mut i: i32 = 0;    while i < 8 {        s = s + i * 2;        i = i + 1;    }    print(s);    return 0;}"#;        // And a `@parallel` elementwise nest, which is what walks the two emission paths added in        // Phase 1: the lane-wise SIMD emitters (`mir_build` vectorizes this loop) and the grid-stride        // `wukong_parallel_for` arm, whose `%nctaid.x` read, `min.s64` and `div.u64` are all        // pre-Ampere GÇö asserted here rather than assumed, because this gate's whole reason for        // existing is that an over-declared floor JITs perfectly on the Ada card the corpus runs on        // and loads on zero A100s.        const PARALLEL: &str = r#"module gate_par@parallelfn main() -> i32 {    let mut x: [f32; 64] = [0.0; 64];    let mut y: [f32; 64] = [0.0; 64];    for i in 0..64 { x[i] = (i as f32) * 2.0; }    for i in 0..64 {        let v = x[i];        y[i] = v * v * 0.25 + 3.0;    }    print(y[63] as i32);    return 0;}"#;        for (probe, src) in [("scalar", SCALAR), ("parallel", PARALLEL)] {            for opt in [0u8, 3u8] {                let (program, mut interner) =                    build(src, opt).expect("the floor probe program must compile");                let entry = interner.intern("main");                let modules = [                    ("emit_ptx", emit_ptx(&program, entry, &interner)),                    ("emit_mega_ptx", emit_mega_ptx(&program, entry, &interner)),                ];                for (what, res) in modules {                    // A decline is not this gate's business (the corpus floors own coverage), but a                    // module that IS emitted must open at the floor.                    let ptx = match res {                        Ok(p) => p,                        Err(e) if e.starts_with(UNSUPPORTED) => continue,                        Err(e) => panic!("{probe}/{what}@O{opt}: lowering failed: {e}"),                    };                    assert!(                        ptx.starts_with(HDR_SM80),                        "{probe}/{what}@O{opt}: must open with HDR_SM80 (`.version 7.8` / \                         `.target sm_80`), got: {:?}",                        ptx.lines().take(3).collect::<Vec<_>>()                    );                    assert!(                        ptx.contains(TARGET_SM80),                        "{probe}/{what}@O{opt}: lost the sm_80 floor"                    );                    assert!(                        !ptx.contains(TARGET_SM89),                        "{probe}/{what}@O{opt}: `{TARGET_SM89}` loads on zero A100s and nothing \                         here needs Ada"                    );                    assert!(                        !ptx.contains(".version 8.4"),                        "{probe}/{what}@O{opt}: `.version 8.4` demands driver r550+; this \                         instruction mix (generic scalar PTX, `bar.sync`, `red.f32`, one \                         `atom.global.add`) needs nothing above ISA 7.0"                    );                }            }        }    }    /// A hand-built MIR function carrying the **portable SIMD** shape the CPU loop vectorizer emits:    /// `Splat`, `Iota`, a lane-wise `Bin`, a vector `Store`, and `ExtractLane` reading one lane back    /// out as a scalar. Device-free: it asserts the emitted text, not a run.    ///    /// Built here rather than through the frontend because the shape is a *lowering* contract, not a    /// source pattern GÇö which loop `wukong_opt::vectorize` chooses to vectorize (and whether a    /// recognizer claims it first) can change without this obligation changing. `verify_program`    /// runs on it first so a test that stopped exercising legal MIR fails as a bad test rather than    /// as a lowering bug.    fn simd_probe(interner: &mut Interner) -> Program {        use wukong_mir::Builder;        let vt = MirType::Vec(Box::new(MirType::F32), 4);        let mut b = Builder::new(interner.intern("main"), MirType::I32);        let p = b.alloca(MirType::Array(Box::new(MirType::F32), 4));        let c = b.build(MirType::F32, Op::ConstFloat(2.5, MirType::F32));        let splat = b.build(vt.clone(), Op::Splat(c));        let ramp = b.build(            MirType::Vec(Box::new(MirType::I32), 4),            Op::Iota(MirType::Vec(Box::new(MirType::I32), 4)),        );        let ramp_f = b.build(vt.clone(), Op::Cast(CastKind::SiToFp, ramp, vt.clone()));        let sum = b.build(vt.clone(), Op::Bin(BinOp::FAdd, splat, ramp_f));        b.build_void(Op::Store {            ptr: p,            value: sum,        });        // Read the vector back and run the rest of the lane-wise menu over it, so one probe covers        // every vector op `wukong_opt::vectorize` can emit rather than just the three that were        // declining.        let back = b.build(vt.clone(), Op::Load(p, vt.clone()));        let fma = b.build(vt.clone(), Op::Fma(back, splat, sum));        let root = b.build(vt.clone(), Op::Sqrt(fma));        let mask = b.build(            MirType::Vec(Box::new(MirType::I1), 4),            Op::Cmp(CmpOp::Fogt, root, splat),        );        let pick = b.build(vt.clone(), Op::Select(mask, root, splat));        let lane3 = b.build(MirType::F32, Op::ExtractLane(pick, 3));        b.build_void(Op::Call {            func: interner.intern("print"),            args: vec![lane3],        });        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));        b.ret(Some(zero));        let mut program = Program::new();        program.funcs.push(b.finish());        let errs = wukong_mir::verify::verify_program(&program);        assert!(errs.is_empty(), "the SIMD probe MIR must verify: {errs:?}");        program    }    /// **Portable SIMD MIR lowers to PTX** (Task 1.1) GÇö one lane's worth of instructions per lane,    /// ASCII only, at the `sm_80` floor. Before this, `Splat`/`ExtractLane`/`Iota` were three    /// `UNSUPPORTED:` declines and any vectorized function skipped the device entirely.    #[test]    fn portable_simd_mir_lowers_to_ascii_ptx() {        let mut interner = Interner::new();        let program = simd_probe(&mut interner);        let entry = interner.intern("main");        let ptx = emit_ptx(&program, entry, &interner).expect("portable SIMD must lower");        assert!(ptx.is_ascii(), "PTX must stay ASCII (ptxas rejects non-ASCII)");        assert!(            ptx.starts_with(crate::ptx_target::HDR_SM80),            "the SIMD lowering must not introduce a header of its own"        );        // Scalarized: one lane's worth of instructions per lane, not one vector op. Every emitter the        // probe exercises must show up four times.        for (op, what) in [            ("add.rn.f32", "vector Bin"),            ("st.f32", "vector Store"),            ("ld.f32", "vector Load"),            ("fma.rn.f32", "vector Fma"),            ("sqrt.rn.f32", "vector Sqrt"),            ("setp.gt.f32", "vector Cmp"),            ("selp.f32", "vector Select"),        ] {            assert_eq!(                ptx.matches(op).count(),                4,                "expected one `{op}` per lane for {what}, found {} in:\n{ptx}",                ptx.matches(op).count()            );        }        // `Iota` materializes lane k as the constant k; `ExtractLane` is a register copy.        for k in 0..4 {            assert!(                ptx.contains(&format!(", {k};")),                "lane constant {k} missing from the iota ramp in:\n{ptx}"            );        }        assert!(            ptx.contains("mov.f32"),            "ExtractLane must copy the lane register into the scalar result in:\n{ptx}"        );    }    /// **A SIMD value can cross a block edge** (Task 1.1): a loop whose accumulator is a    /// `<4 x f32>` block param GÇö the shape a vectorized reduction has GÇö lowers to one `mov` per lane    /// per edge, and the epilogue reads the lanes back with `ExtractLane`.    ///    /// This was the second half of the SIMD hole and it failed *differently* from a missing op arm:    /// `lanes()` declined with "used before definition" because the register set of a vector param    /// had no owner. Hand-built for the same reason as `simd_probe`.    #[test]    fn simd_accumulator_crosses_a_block_edge() {        use wukong_mir::Builder;        let mut interner = Interner::new();        let vt = MirType::Vec(Box::new(MirType::F32), 4);        let mut b = Builder::new(interner.intern("main"), MirType::I32);        // entry: acc = splat 0.0 ; i = 0 ; br loop(acc, i)        let zerof = b.build(MirType::F32, Op::ConstFloat(0.0, MirType::F32));        let acc0 = b.build(vt.clone(), Op::Splat(zerof));        let i0 = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));        let four = b.build(MirType::I64, Op::ConstInt(4, MirType::I64));        let step = b.build(MirType::F32, Op::ConstFloat(1.5, MirType::F32));        let vstep = b.build(vt.clone(), Op::Splat(step));        let loop_blk = b.new_block();        let exit_blk = b.new_block();        let acc = b.block_param(loop_blk, vt.clone());        let iv = b.block_param(loop_blk, MirType::I64);        let acc_out = b.block_param(exit_blk, vt.clone());        b.br(loop_blk, vec![acc0, i0]);        // loop(acc, i): acc' = acc + vstep ; i' = i + 1 ; if i' < 4 -> loop else exit(acc')        b.switch_to(loop_blk);        let acc1 = b.build(vt.clone(), Op::Bin(BinOp::FAdd, acc, vstep));        let i1 = b.build(MirType::I64, Op::Bin(BinOp::Add, iv, one));        let more = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i1, four));        b.set_term(Terminator::CondBr {            cond: more,            then_blk: loop_blk,            then_args: vec![acc1, i1],            else_blk: exit_blk,            else_args: vec![acc1],        });        // exit(acc'): print(lane0 + lane3) ; return 0        b.switch_to(exit_blk);        let l0 = b.build(MirType::F32, Op::ExtractLane(acc_out, 0));        let l3 = b.build(MirType::F32, Op::ExtractLane(acc_out, 3));        let s = b.build(MirType::F32, Op::Bin(BinOp::FAdd, l0, l3));        b.build_void(Op::Call {            func: interner.intern("print"),            args: vec![s],        });        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));        b.ret(Some(zero));        let mut program = Program::new();        program.funcs.push(b.finish());        let errs = wukong_mir::verify::verify_program(&program);        assert!(errs.is_empty(), "the SIMD-edge probe MIR must verify: {errs:?}");        let entry = interner.intern("main");        let ptx = emit_ptx(&program, entry, &interner)            .expect("a vector block param must lower, not decline");        assert!(ptx.is_ascii(), "PTX must stay ASCII");        // Two vector edges (loop back-edge and exit edge) x 4 lanes x (temp + param copy) = 16        // lane copies, plus the two `ExtractLane` reads.        assert!(            ptx.matches("mov.f32").count() >= 18,            "expected per-lane edge copies, found {} `mov.f32` in:\n{ptx}",            ptx.matches("mov.f32").count()        );        assert_eq!(            ptx.matches("add.rn.f32").count(),            5,            "expected 4 lane adds in the loop body + 1 scalar add in the epilogue in:\n{ptx}"        );    }    /// **The grid-stride loop takes its geometry from the launch, not from a literal** (Task 1.3).    ///    /// The occupancy discipline in this crate is that a device fact is probed or the process fails:    /// `Gpu::new` aborts on an unqueryable SM count (it used to fall back to a silent `20`, this    /// laptop's number, which is wrong-but-plausible on every other card) and `megakernel::plan_grid`    /// derives the grid from `cuOccupancyMaxActiveBlocksPerMultiprocessor x sm_count`. A lowering    /// that hardcoded `256` threads would sit *underneath* all of that and silently visit a fraction    /// of the domain the moment the launch geometry changed GÇö including the existing    /// `WUKONG_MEGA_GRID` sweep and the grid-parallel ABI this module already emits for the barrier    /// probe.    ///    /// So the index and stride must be read out of `%tid.x`/`%ctaid.x` and `%ntid.x`/`%nctaid.x`, and    /// the emitted preamble is checked to carry no thread- or SM-count immediate. Device-free: it    /// reads the text.    #[test]    fn grid_stride_geometry_comes_from_the_launch() {        const SRC: &str = r#"module gate_par@parallelfn main() -> i32 {    let mut x: [f32; 512] = [0.0; 512];    let mut y: [f32; 512] = [0.0; 512];    for i in 0..512 { x[i] = (i as f32) * 2.0; }    for i in 0..512 {        let v = x[i];        y[i] = v * v * 0.25 + 3.0;    }    print(y[511] as i32);    return 0;}"#;        let (program, mut interner) = build(SRC, 2).expect("the @parallel probe must compile");        let entry = interner.intern("main");        let ptx = emit_mega_ptx(&program, entry, &interner)            .expect("a generic @parallel region must lower in mega mode");        assert!(ptx.is_ascii(), "PTX must stay ASCII");        for reg in ["%tid.x", "%ntid.x", "%ctaid.x", "%nctaid.x"] {            assert!(                ptx.contains(reg),                "the grid-stride index/stride must be derived from {reg} in:\n{ptx}"            );        }        // The stride preamble: the grid-stride emitter's own geometry reads, i.e. from the LAST        // `%tid.x` before the loop label (the mega preamble reads one too, for the `tid==0` guard).        let to = ptx.find("PFOR").expect("the grid-stride loop label");        let from = ptx[..to].rfind("%tid.x").expect("a geometry read");        let pre = &ptx[from..to];        assert!(            pre.contains("%nctaid.x"),            "the stride must span the whole GRID (blockDim x gridDim), not one CTA:\n{pre}"        );        for lit in [            format!(", {};", crate::megakernel::MEGA_BLOCK),            ", 20;".to_string(),        ] {            assert!(                !pre.contains(&lit),                "the grid-stride preamble carries the immediate `{lit}`, i.e. a launch-geometry \                 literal. Read it from the launch (%ntid.x / %nctaid.x) GÇö a baked-in thread or SM \                 count visits a fraction of the domain as soon as the launch changes:\n{pre}"            );        }    }    /// User `shared [T; N]` allocas lower through `cvta.shared` (generic addresses). `ld.shared` /    /// `st.shared` require shared-space addresses and fault on the generic pointers GÇö mirror the    /// `.local` frame path (`cvta.local` + generic `ld`/`st`, never `ld.local`). Device-free.    #[test]    fn shared_user_smem_uses_generic_ld_after_cvta_shared() {        let path = concat!(            env!("CARGO_MANIFEST_DIR"),            "/../../tests/run/lang_shared_transpose.wk"        );        let src = std::fs::read_to_string(path).expect("lang_shared_transpose.wk");        let (program, mut interner) = build(&src, 2).expect("compile shared transpose fixture");        let entry = interner.intern("main");        let ptx = emit_ptx(&program, entry, &interner).expect("emit_ptx");        assert!(            ptx.contains("cvta.shared.u64"),            "shared alloca base must be cvta.shared"        );        assert!(            !ptx.contains("ld.shared"),            "cvta.shared addresses must use generic ld, not ld.shared"        );        assert!(            !ptx.contains("st.shared"),            "cvta.shared addresses must use generic st, not st.shared"        );    }    /// The comparator the corpus gate is built on, pinned against the real divergence it used to    /// wave through. The four "before" lines are the actual gpu-native -O3 output of    /// `tests/run/bf16_literal_grid.wk` when bf16/f16 constants were not grid-rounded; the oracle    /// column is the interpreter's. Every one of them passed the old 1e-2 relative tolerance.    /// Needs no CUDA device.    #[test]    fn integer_lines_compare_exactly() {        for (gpu, cpu) in [            ("10000", "10009"),            ("10000", "9997"),            ("32968", "33125"),            ("3141", "3140"),        ] {            assert!(                !line_matches(gpu, cpu),                "integer line {gpu} must not match the oracle's {cpu}"            );        }        assert!(!outputs_match(            b"10000\n10000\n32968\n3141\n",            b"10009\n9997\n33125\n3140\n"        ));        // Equal integers still match, in any spelling that parses to the same value.        assert!(line_matches("12345678901", "12345678901"));        assert!(line_matches("-0", "0"));        // Floats keep the CPU<->GPU tolerance (reduction order / SFU differences).        assert!(line_matches("1.0000001", "1.0"));        assert!(line_matches("0.30000000000000004", "0.3"));        assert!(!line_matches("1.5", "2.5"));    }    // `build` compiles `.wk` source with the host's 256-bit raw-AVX2 loop vectorizer suppressed GÇö    // the normalization that makes every coverage count below mean the same thing on a Win64 box    // and on a Linux datacenter box. `build_in_current_host_mode` is the un-normalized twin, for    // the invariance gate's attribution arm only. Both are shared with `megakernel.rs`'s corpus    // gate so the two sweeps cannot drift; see `crate::lower::hostvec` for mechanism and    // measurement.    use hostvec::{build, build_in_current_host_mode};    /// Compare one output line. **Integer output is compared exactly**: `decode_ctx` replays an    /// integer print record with the identical `format!("{}\n", payload as i64)` the interpreter    /// uses, so any difference on such a line is a miscompile, never a rounding artifact. Only a    /// line carrying a float form gets the CPU<->GPU tolerance, which exists for reduction-order and    /// SFU differences.    ///    /// The tolerance used to apply to *every* numeric line, which made a large class of miscompiles    /// report green: on `bf16_literal_grid.wk` the GPU printed 10000 where the oracle printed 10009    /// and `9 <= 1e-2 * 10009` accepted it. bf16/f16 error is structurally bounded by 2^-9 relative,    /// so a 1e-2 relative slack could never catch that bug class.    fn line_matches(g: &str, c: &str) -> bool {        if g == c {            return true;        }        let (gt, ct) = (g.trim(), c.trim());        if let (Ok(a), Ok(b)) = (gt.parse::<i128>(), ct.parse::<i128>()) {            return a == b;        }        match (gt.parse::<f64>(), ct.parse::<f64>()) {            (Ok(a), Ok(b)) => {                let diff = (a - b).abs();                diff <= 1e-3 || diff <= 1e-2 * b.abs().max(a.abs())            }            _ => false,        }    }    fn outputs_match(gpu: &[u8], cpu: &[u8]) -> bool {        let gs = String::from_utf8_lossy(gpu);        let cs = String::from_utf8_lossy(cpu);        let gl: Vec<&str> = gs.lines().collect();        let cl: Vec<&str> = cs.lines().collect();        gl.len() == cl.len() && gl.iter().zip(&cl).all(|(a, b)| line_matches(a, b))    }    /// The **coverage ratchet** for `run_corpus_matches_interp_oracle`: how many `tests/run`    /// programs must lower, run on the device and match the interpreter oracle at BOTH -O0 and -O3.    ///    /// The gate below asserts correctness *of what runs*. A `lower::UNSUPPORTED` decline is a skip,    /// so without this floor a change that stops lowering some construct turns **nothing** red GÇö it    /// just quietly shrinks the set being checked. That is proven history, not theory: the    /// loop-vectorizer campaign cost gpu-native ~10% of the corpus (39 programs declined on a single    /// missing `Op::Iota` arm) and every gate in the workspace stayed green until an agent probed a    /// decline by hand.    ///    /// Deliberately a **count**, not a ratio: a newly added fixture that declines leaves `covered`    /// unchanged, so corpus growth can never trip this, while a construct that stops lowering always    /// does.    ///    /// **The count is host-invariant**, which it was not until 2026-08-09. It is measured over MIR    /// built with the host CPU's 256-bit raw-AVX2 loop vectorizer suppressed (see    /// [`crate::lower::hostvec`], which every `build` here routes through), because that vectorizer    /// only exists on Win64 and this backend declines the `Op::VecKernelCall` it emits. The old    /// floor of 217 was a Windows number: the very same sweep read 235 on a Modal L4 purely because    /// Linux never produced the op, so on Linux `235 > 217` passed trivially and the ratchet could    /// never have caught a regression there GÇö on the hosts the datacenter round is paid for.    /// Normalizing the input rather than the floor also *adds* Windows device coverage: the 18    /// affected programs now genuinely lower, run and get compared.    ///    /// Recorded 2026-08-09 by this gate on an RTX 4050 / Windows: **235 of 357** programs, zero    /// mismatches, zero faults. The same number three independent ways GÇö the pre-normalization    /// Modal L4 (Linux) sweep the same day read exactly 235/357, because Linux was already in this    /// condition; the device-free `corpus_lowering_floors_are_host_vectorizer_invariant` counts 235    /// lowerable; and that gate reproduces the old 217 exactly when it re-sweeps host-native, which    /// is what pins the +18 on the host CPU vectorizer and nothing else. Two operating systems and    /// two cards now agree on one constant. The remaining 122 declines are honest `UNSUPPORTED`,    /// dominated by not-yet-lowered `wukong_*` runtime kernel calls. Raise this whenever coverage    /// grows; lower it ONLY in the same commit as the intentional decline, and say why here.    ///    /// **2026-08-13, raised 235 -> 256** (RTX 4050 / Windows, same box and the same    /// three-way agreement: this device gate reads 256, the device-free sweep above reads 256    /// lowerable, and the host-native re-sweep still attributes its whole delta to the host CPU    /// vectorizer). +17 over the 239 the branch point measured on a 361-program corpus, from Phase 1    /// SIMD lowering: `Op::ExtractLane` and vector block params were the last two portable-SIMD    /// holes, and a vectorized function that hit either skipped the device entirely. One of the +17    /// is `lang_parallel_saxpy`, added in the same series. The remaining 106 declines are honest    /// `UNSUPPORTED` GÇö still dominated by not-yet-lowered `wukong_*` kernels, plus `GlobalAddr`    /// (string data), `wukong_rt_alloc` (heap) and `print_u`.    ///    /// **256 -> 257** in the same series, when `lang_parallel_int_regions` was added: an i64    /// `@parallel` fixture, which lowers on Win64 in the default host mode because the 256-bit    /// raw-AVX2 recipe is f32-only. 257 of 363 on the device gate and 257 lowerable device-free.    const RUN_CORPUS_COVERAGE_FLOOR: usize = 258;    /// The corpus directory both coverage gates and the invariance gate below sweep.    fn corpus_files() -> Vec<PathBuf> {        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/run");        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)            .expect("read tests/run")            .filter_map(|e| e.ok().map(|e| e.path()))            .filter(|p| p.extension().map(|x| x == "wk").unwrap_or(false))            .collect();        files.sort();        files    }    /// What one device-free sweep of the corpus can establish about coverage.    #[derive(Default)]    struct Sweep {        /// Programs `jit_run` would obtain a PTX module for at BOTH -O0 and -O3 GÇö an upper bound on        /// `run_corpus_matches_interp_oracle`'s `covered`, and empirically equal to it (see the        /// gate's doc).        lowerable: std::collections::BTreeSet<String>,        /// `name@O{opt}` configs `fusion::analyze` accepts GÇö `mega_corpus_matches_oracle`'s        /// `eligible`.        mega_eligible: std::collections::BTreeSet<String>,        /// `name@O{opt}` configs the megakernel emitter also produces a module for GÇö its `ran`.        mega_lowerable: std::collections::BTreeSet<String>,        /// Programs whose MIR carries a raw-AVX2 `Op::VecKernelCall`. **This is the entire        /// host-dependent term** in every count above.        veckernel: std::collections::BTreeSet<String>,        /// Emitter errors that are NOT an `UNSUPPORTED:` decline. A decline is coverage the backend        /// honestly does not have; anything else is a bug that would show up on the device as a        /// *fault*, so it is asserted away here where no GPU is needed to see it.        hard_errors: Vec<String>,    }    /// Sweep the corpus device-free, either with the host's 256-bit raw-AVX2 loop vectorizer    /// suppressed (`normalize`) or with this host's own setting GÇö the two arms whose difference is    /// the whole point of the gate below.    ///    /// Because the condition is a parameter, it opens the window itself around    /// [`hostvec::build_in_current_host_mode`] rather than calling [`build`], which hardcodes the    /// normalized arm and would re-enter `hostvec`'s non-reentrant mutex and deadlock.    fn sweep_corpus(files: &[PathBuf], normalize: bool) -> Sweep {        /// An emitter result as coverage: `Ok` covers, an `UNSUPPORTED:` decline does not, anything        /// else is a bug recorded on `hard`.        fn covers(            hard: &mut Vec<String>,            cfg: &str,            what: &str,            r: Result<String, String>,        ) -> bool {            match r {                Ok(_) => true,                Err(e) if e.starts_with(UNSUPPORTED) => false,                Err(e) => {                    hard.push(format!("{cfg}: {what}: {e}"));                    false                }            }        }        let mut s = Sweep::default();        for path in files {            let name = path.file_stem().unwrap().to_string_lossy().to_string();            let src = std::fs::read_to_string(path).unwrap();            let mut lowerable = true;            for opt in [0u8, 3u8] {                let cfg = format!("{name}@O{opt}");                let built = if normalize {                    hostvec::normalized(|| build_in_current_host_mode(&src, opt))                } else {                    hostvec::host_native(|| build_in_current_host_mode(&src, opt))                };                let Some((program, mut interner)) = built else {                    lowerable = false;                    continue;                };                let entry = interner.intern("main");                if program.function(entry).is_none() {                    lowerable = false;                    continue;                }                if program.funcs.iter().any(|f| {                    f.blocks.iter().any(|b| {                        b.insts                            .iter()                            .any(|i| matches!(i.op, Op::VecKernelCall { .. }))                    })                }) {                    s.veckernel.insert(name.clone());                }                // Model `jit_run`: the megakernel first when `fusion::analyze` accepts the program,                // then the single-thread lowering. Either module means the device would have run it.                let mega = if crate::fusion::analyze(&program, entry, &interner).eligible {                    s.mega_eligible.insert(cfg.clone());                    covers(                        &mut s.hard_errors,                        &cfg,                        "emit_mega_ptx",                        emit_mega_ptx(&program, entry, &interner),                    )                } else {                    false                };                let single = covers(                    &mut s.hard_errors,                    &cfg,                    "emit_ptx",                    emit_ptx(&program, entry, &interner),                );                if mega {                    s.mega_lowerable.insert(cfg);                }                lowerable &= mega || single;            }            if lowerable {                s.lowerable.insert(name);            }        }        s    }    /// **The device-free proof that both corpus floors measure this backend and not the host CPU.**    ///    /// [`RUN_CORPUS_COVERAGE_FLOOR`] and    /// [`crate::megakernel::tests::MEGA_CORPUS_COVERAGE_FLOOR`] used to be Windows numbers: 217 and    /// 87 here, 235 and 90 on a Modal L4 the same day, because `wukong_mir_build`'s 256-bit    /// raw-AVX2 loop vectorizer exists only under the Win64 ABI and this backend declines the    /// `Op::VecKernelCall` it emits. A single hardcoded floor cannot ratchet two numbers: on the    /// higher-reading host it passes with slack and would never catch a regression GÇö and the higher    /// reading was Linux, i.e. exactly the datacenter fleet the GPU retarget is being paid to run    /// on. Worse, the +18 read as *progress* in a log.    ///    /// So the sweeps normalize their input (`crate::lower::hostvec`) and this gate proves the    /// normalization is both effective and complete:    ///    /// 1. **Effective** GÇö no program in the normalized corpus carries a `VecKernelCall` at all, so    ///    the one host-dependent term in the count is identically zero on every host. Delete the    ///    normalization and this fails on Windows immediately (26 programs carry one). And it is    ///    checked **non-vacuously**: where the vectorizer exists, the host-native re-sweep must    ///    find at least one carrier, or "the normalized sweep has none" would hold for free.    /// 2. **Complete** GÇö re-sweeping host-native (only meaningful where    ///    `wukong_mir::host_supports_vec_kernels()` is true; elsewhere the two sweeps are the same    ///    build by construction) recovers the *old* counts, and every program the normalization    ///    gained is one that carried a `VecKernelCall`, with nothing lost. That is what attributes    ///    the whole 217GåÆ235 / 87GåÆ90 delta to the host CPU vectorizer rather than to anything in    ///    `lower.rs`. Note this is the only direction that can be checked from one machine: it    ///    shows the Win64 sweep reproduces the Linux number, which is what "invariant" has to mean    ///    when you can only run one OS at a time.    /// 3. It re-asserts both floors against a count that needs **no GPU**, so a lowering regression    ///    is catchable on any box with the toolchain GÇö until now the two device gates were the only    ///    check and they skip wherever there is no card. (It is still behind `--features gpu` like    ///    everything else in this module, and CI's gpu job is `cargo check`, so CI compiles this    ///    but does not run it. `cargo test -p wukong_codegen_gpu --features gpu` runs it anywhere.)    ///    /// `emit_ptx`/`emit_mega_ptx`/`fusion::analyze` are pure host code, so this is CPU-only. The    /// counts here are an *upper bound* on the device gates' `covered`/`ran` (a program can still    /// mismatch or overflow the print buffer at run time), but measured 2026-08-09 they are exactly    /// equal on both hosts, which is why they can ratchet the same constants. It sweeps the corpus    /// twice, so it costs ~35 s in a debug build GÇö the price of the floors being checkable at all    /// without silicon.    #[test]    fn corpus_lowering_floors_are_host_vectorizer_invariant() {        use crate::megakernel::tests::MEGA_CORPUS_COVERAGE_FLOOR;        let files = corpus_files();        let norm = sweep_corpus(&files, true);        eprintln!(            "\n=== corpus lowering (device-free) GÇö normalized, host 256-bit AVX2 vectorizer OFF ===\             \n    single: {}/{} programs lowerable (floor {RUN_CORPUS_COVERAGE_FLOOR})\             \n    mega:   {} lowerable / {} eligible configs (floor {MEGA_CORPUS_COVERAGE_FLOOR})\             \n    programs carrying a VecKernelCall: {} (must be 0)",            norm.lowerable.len(),            files.len(),            norm.mega_lowerable.len(),            norm.mega_eligible.len(),            norm.veckernel.len(),        );        assert!(            norm.hard_errors.is_empty(),            "the PTX emitters failed with something other than an `{UNSUPPORTED}` decline. A \             decline is coverage this backend honestly lacks; this is a bug, and on a device it \             would surface as a corpus FAULT:\n{}",            norm.hard_errors.join("\n")        );        assert!(            norm.veckernel.is_empty(),            "the corpus sweep's MIR still carries `Op::VecKernelCall` in {} program(s): {}. That op \             is emitted only where `wukong_mir::host_supports_vec_kernels()` is true (Win64 only) \             and is declined by `lower.rs`, so its presence makes every coverage count below a \             property of the HOST CPU instead of this backend. `crate::lower::hostvec::normalized` \             is supposed to have suppressed it GÇö restore that rather than adjusting a floor.",            norm.veckernel.len(),            norm.veckernel.iter().cloned().collect::<Vec<_>>().join(", ")        );        // The floors, re-asserted without a GPU. Same constants the device gates ratchet.        assert!(            norm.lowerable.len() >= RUN_CORPUS_COVERAGE_FLOOR,            "gpu-native corpus LOWERING regressed: {} of {} programs still produce a PTX module at \             both -O0 and -O3, floor is {RUN_CORPUS_COVERAGE_FLOOR}. This needs no device, so it is \             the first thing to fix. If the decline is INTENTIONAL, update the floor in the SAME \             commit and say why in its comment.",            norm.lowerable.len(),            files.len(),        );        assert!(            norm.mega_lowerable.len() >= MEGA_CORPUS_COVERAGE_FLOOR,            "megakernel corpus LOWERING regressed: {} of {} eligible program-configs still produce \             a mega PTX module, floor is {MEGA_CORPUS_COVERAGE_FLOOR}. Either `fusion::analyze` \             stopped accepting programs or `emit_mega_ptx` started declining them GÇö both are silent \             on the device gate. If INTENTIONAL, update the floor in the SAME commit.",            norm.mega_lowerable.len(),            norm.mega_eligible.len(),        );        if !wukong_mir::host_supports_vec_kernels() {            eprintln!(                "    host-native re-sweep skipped: `host_supports_vec_kernels()` is false on this \                 host, so `mir_build` emits no 256-bit recipe and the two sweeps are the same build \                 by construction. The attribution half of this gate runs on a Win64 box."            );            return;        }        // This host DOES have the vectorizer, so it can prove where the difference comes from.        let host = sweep_corpus(&files, false);        eprintln!(            "    host-native re-sweep (this host's own setting):\             \n      single: {}/{} lowerable   mega: {} lowerable / {} eligible\             \n      programs carrying a VecKernelCall: {}",            host.lowerable.len(),            files.len(),            host.mega_lowerable.len(),            host.mega_eligible.len(),            host.veckernel.len(),        );        // NON-VACUITY. `norm.veckernel.is_empty()` above is a strong claim only if the corpus can        // produce a `VecKernelCall` here in the first place; if it cannot, that assert holds for        // free and this whole gate degrades into "two identical sweeps agree". On a host with the        // vectorizer the corpus must exercise it, or the normalization is no longer load-bearing        // and the floors have quietly gone back to being unattributed numbers.        assert!(            !host.veckernel.is_empty(),            "no `tests/run` program produced an `Op::VecKernelCall` on a host where \             `host_supports_vec_kernels()` is true. Either the corpus lost every fixture with a \             256-bit-eligible f32 loop, or `mir_build` stopped building the recipe GÇö and until one \             of those is understood, this gate's `norm.veckernel.is_empty()` assertion proves \             nothing and neither floor is attributed to anything. Do NOT delete this check to get \             green; the coverage numbers depend on knowing which side the +18 came from."        );        let lost: Vec<&String> = host.lowerable.difference(&norm.lowerable).collect();        assert!(            lost.is_empty(),            "suppressing the host's 256-bit vectorizer LOST lowering coverage for {:?}. The switch \             is documented as result-identical (`wukong_codegen_cranelift`'s \             `p4_kill_switch_is_result_identical`), so the 128-bit fallback presenting MIR this \             backend cannot lower is a real hole GÇö find it before trusting any coverage number.",            lost        );        let gained: Vec<&String> = norm.lowerable.difference(&host.lowerable).collect();        for g in &gained {            assert!(                host.veckernel.contains(*g),                "`{g}` lowers only when the host vectorizer is off, yet its host-native MIR carries \                 no `VecKernelCall`. Then the two sweeps differ for some OTHER reason and the \                 host-invariance claim behind {RUN_CORPUS_COVERAGE_FLOOR} does not hold GÇö do not \                 paper over it by moving the floor."            );        }        let mega_gained: Vec<&String> = norm            .mega_lowerable            .difference(&host.mega_lowerable)            .collect();        for g in &mega_gained {            let prog = g.split_once("@O").map(|(p, _)| p).unwrap_or(g);            assert!(                host.veckernel.contains(prog),                "mega config `{g}` runs only when the host vectorizer is off, yet `{prog}`'s \                 host-native MIR carries no `VecKernelCall` GÇö same problem as above, for \                 {MEGA_CORPUS_COVERAGE_FLOOR}."            );        }        eprintln!(            "    => the whole difference is the host CPU vectorizer: single +{} programs, mega +{} \             configs, all of them VecKernelCall carriers ({} such programs on this host). Without \             the normalization the floors would have to be {} / {} here and \             {RUN_CORPUS_COVERAGE_FLOOR} / {MEGA_CORPUS_COVERAGE_FLOOR} on Linux.",            gained.len(),            mega_gained.len(),            host.veckernel.len(),            host.lowerable.len(),            host.mega_lowerable.len(),        );    }    #[test]    fn run_corpus_matches_interp_oracle() {        if crate::gpu::gpu().is_none() {            // -º3A P3: a bare `eprintln!` + `return` here reported `ok` having lowered nothing GÇö            // and this is the widest gate in the crate (357 fixtures x 2 opt levels). Its            // megakernel sibling already escalates (`megakernel.rs`'s `mega_corpus_matches_oracle`);            // match it, so a rented box that cannot reach its device fails loudly instead of            // billing for a green run.            crate::diff::skip_or_fail(                "run_corpus_matches_interp_oracle",                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),            );            return;        }        // The mission corpus: the e2e `tests/run` fixtures. (The example/bench kernels are        // compute-heavy perf benchmarks GÇö e.g. fib(30) is ~2.7M calls GÇö which the single-thread        // execution model can't run within the OS GPU watchdog; their *lowering* is correct, but        // running them needs the grid-parallel perf phase. They are not a lowering-correctness gate.)        let files = corpus_files();        let mut covered = 0usize;        let mut skipped: Vec<String> = Vec::new();        let mut mismatches: Vec<String> = Vec::new();        // Genuine *driver* faults (a kernel that dereferenced out of bounds -> ILLEGAL_ADDRESS), kept        // distinct from miscompiles (wrong output on a healthy context). A fault poisons the shared        // primary context; `crate::gpu::reset_gpu` attempts recovery, but on this driver error 700 is        // process-fatal (the re-retain still returns it), so recovery degrades to record-and-skip:        // the remaining programs land on `lost` with a loud count instead of cascading as false        // failures. Only the *root* fault is ever reported as a fault.        let mut faults: Vec<String> = Vec::new();        let mut lost: Vec<String> = Vec::new();        for path in &files {            let name = path.file_stem().unwrap().to_string_lossy().to_string();            // After an unrecoverable fault, stop attempting GPU work: every further run would fail            // with the same sticky error and misreport healthy programs as broken.            if crate::gpu::device_lost() {                lost.push(name);                continue;            }            let src = std::fs::read_to_string(path).unwrap();            // -O0 and -O3 must both match the interpreter (which gives -O0 == -O3 transitively).            let mut covered_here = true;            for opt in [0u8, 3u8] {                let Some((program, mut interner)) = build(&src, opt) else {                    covered_here = false;                    skipped.push(format!("{name}@O{opt} (frontend rejected)"));                    break;                };                let entry = interner.intern("main");                if program.function(entry).is_none() {                    covered_here = false;                    skipped.push(format!("{name} (no main)"));                    break;                }                let cpu = wukong_interp::run_with_output(&program, entry, &interner);                let gpu = jit_run(&program, entry, &interner);                match (&cpu, &gpu) {                    // Both errored. That is only *agreement* when the GPU's error is the one                    // deterministic program-level error both executors produce identically. An                    // unchecked "both Err" arm counted an `UNSUPPORTED:` decline as coverage and,                    // worse, let a genuine driver fault through without landing on `faults` or                    // resetting the context GÇö so the next healthy program inherited the sticky                    // CUDA error and took the blame, breaking this gate's root-cause-only rule.                    (Err(ce), Err(ge)) => {                        if ge.starts_with(UNSUPPORTED)                            || ge.starts_with("gpu-native print buffer overflow")                        {                            // A decline or a device-capacity limit: no GPU output existed to compare.                            covered_here = false;                            skipped.push(format!("{name}@O{opt}: {ge}"));                            break;                        }                        if ge != "assertion failed" {                            covered_here = false;                            faults.push(format!("{name}@O{opt}: gpu errored: {ge}"));                            crate::gpu::reset_gpu();                            break;                        }                        if ce != ge {                            covered_here = false;                            mismatches                                .push(format!("{name}@O{opt}: cpu err `{ce}` gpu err `{ge}`"));                            break;                        }                        // Both `assertion failed` GÇö agree.                    }                    (Ok((ce, co)), Ok((ge, go))) => {                        if ce != ge || !outputs_match(go, co) {                            mismatches.push(format!(                                "{name}@O{opt}: cpu=({ce},{:?}) gpu=({ge},{:?})",                                String::from_utf8_lossy(co),                                String::from_utf8_lossy(go)                            ));                            covered_here = false;                            break;                        }                    }                    (Ok(_), Err(e)) => {                        covered_here = false;                        if e.starts_with(UNSUPPORTED) {                            skipped.push(format!("{name}@O{opt}: {e}"));                        } else {                            // A real driver fault poisons the shared context: record it on the fault                            // ledger and attempt a context reset. If the reset fails (sticky                            // process-level error), `device_lost()` flips and the loop above skips                            // the remaining programs loudly instead of cascading.                            faults.push(format!("{name}@O{opt}: gpu errored: {e}"));                            crate::gpu::reset_gpu();                        }                        break;                    }                    (Err(ce), Ok((ge, _))) => {                        mismatches.push(format!("{name}@O{opt}: cpu err `{ce}` but gpu ok ({ge})"));                        covered_here = false;                        break;                    }                }            }            if covered_here {                covered += 1;            }        }        eprintln!(            "\n=== gpu-native MIR->PTX coverage: {covered}/{} programs match the interp oracle (-O0==-O3) ===",            files.len()        );        // The raw count above is over the WHOLE corpus GÇö nothing is excluded from the denominator.        // What is normalized is the input: state that, and state the host's own setting, so a reader        // comparing this log against a run on another OS knows the two are the same measurement.        eprintln!(            "    (host 256-bit raw-AVX2 loop vectorizer suppressed for every build in this sweep, \             so the count is host-invariant; this host would otherwise emit VecKernelCall: {}. \             See `corpus_lowering_floors_are_host_vectorizer_invariant` for the device-free proof.)",            wukong_mir::host_supports_vec_kernels()        );        if !skipped.is_empty() {            eprintln!("-- not yet covered ({}):", skipped.len());            for s in &skipped {                eprintln!("   {s}");            }        }        if !faults.is_empty() {            eprintln!(                "-- driver FAULTS ({}, root causes only GÇö no cascade):",                faults.len()            );            for f in &faults {                eprintln!("   {f}");            }        }        if !lost.is_empty() {            eprintln!(                "-- NOT RUN ({}): device lost after the fault above (sticky CUDA error; restart to \                 re-test): {}",                lost.len(),                lost.join(", ")            );        }        assert!(            mismatches.is_empty(),            "GPU-lowered programs disagree with the interpreter oracle (miscompiles):\n{}",            mismatches.join("\n")        );        assert!(            faults.is_empty(),            "GPU-lowered programs faulted on the device ({} root fault(s); {} later programs \             were skipped after device loss, NOT failed GÇö these are genuine kernel faults, not \             miscompiles):\n{}",            faults.len(),            lost.len(),            faults.join("\n")        );        assert!(covered > 0, "no programs covered GÇö pipeline broken");        assert!(            covered >= RUN_CORPUS_COVERAGE_FLOOR,            "gpu-native corpus coverage regressed below the recorded floor: {covered} of {} \             programs match the oracle, floor is {RUN_CORPUS_COVERAGE_FLOOR} ({} lost). This count \             is measured over host-vectorizer-normalized MIR (see `crate::lower::hostvec`), so it \             is the SAME number on Windows and on a Linux datacenter box GÇö a shortfall here is a \             real lowering regression, never an OS difference. Every program that stopped running \             is on the `-- not yet covered` list printed above (re-run with --nocapture). If the \             decline is INTENTIONAL, update RUN_CORPUS_COVERAGE_FLOOR in the SAME commit and say \             why in its comment. If it is not, you just silently lost gpu-native corpus coverage GÇö \             a decline is a skip here, so no other gate in this workspace would ever have told you.",            files.len(),            RUN_CORPUS_COVERAGE_FLOOR - covered        );    }    /// Diagnostic: JIT the PTX file named by `WUKONG_PTX_FILE` with the driver error-log buffer    /// attached, printing ptxas's actual line/error. Run:    /// `WUKONG_PTX_FILE=... cargo test -p wukong_codegen_gpu --features gpu jit_log_file -- --ignored --nocapture`    #[test]    #[ignore = "diagnostic; prints the driver JIT log for a PTX file"]    fn jit_log_file() {        let path = std::env::var("WUKONG_PTX_FILE").expect("set WUKONG_PTX_FILE");        let ptx = std::fs::read_to_string(&path).unwrap();        let mut guard = crate::gpu::gpu();        let Some(g) = guard.as_mut() else {            eprintln!("skip jit_log_file: no CUDA device");            return;        };        {            use cudarc::driver::sys;            g.ctx.bind_to_thread().unwrap();            let ptx_c = std::ffi::CString::new(ptx.as_str()).unwrap();            let mut log = vec![0u8; 32768];            let mut opts = [                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,            ];            let mut vals: [*mut std::ffi::c_void; 2] =                [log.as_mut_ptr() as *mut _, log.len() as *mut _];            let mut module: sys::CUmodule = std::ptr::null_mut();            let res = unsafe {                sys::cuModuleLoadDataEx(                    &mut module,                    ptx_c.as_ptr() as *const _,                    2,                    opts.as_mut_ptr(),                    vals.as_mut_ptr(),                )            };            eprintln!(                "=== JIT result {:?} ===\n{}",                res,                String::from_utf8_lossy(&log).trim_end_matches('\0')            );        }    }}
+                self.cur_inst = i;
+                self.lower_inst(inst)?;
+            }
+            self.lower_term(&b.term)?;
+        }
+        Ok(())
+    }
+
+    fn lower_inst(&mut self, inst: &wukong_mir::Inst) -> Result<(), String> {
+        // Result-less ops first.
+        match &inst.op {
+            Op::Store { ptr, value } => return self.lower_store(*ptr, *value),
+            Op::Barrier => {
+                self.emit("bar.sync 0;");
+                return Ok(());
+            }
+            Op::Call { func, args } => return self.lower_call(*func, args, inst.result),
+            // A raw-AVX2 CPU microkernel call (the general 256-bit loop vectorizer's `VecKernelCall`)
+            // has no PTX analog; report it UNSUPPORTED so the coverage gate skips this function.
+            Op::VecKernelCall { .. } => {
+                return Err(format!(
+                    "{UNSUPPORTED} `VecKernelCall` (CPU raw-AVX2 kernel) not lowered to PTX"
+                ))
+            }
+            _ => {}
+        }
+        let r = inst
+            .result
+            .ok_or_else(|| format!("{UNSUPPORTED} value-less op {:?}", inst.op))?;
+        let rty = self.ty(r);
+
+        // Vectorized MIR (`<N x T>`): the AST-level vectorizer fires even at -O0 on array loops.
+        // Scalarize each lane through the same reg-based `*_into` emitters the scalar path uses.
+        if rty.is_vector() {
+            return self.lower_vec_inst(inst, r, &rty);
+        }
+
+        match &inst.op {
+            Op::ConstInt(v, ty) => {
+                self.const_ints.insert(r.0, *v);
+                let d = self.reg(r);
+                self.emit(&format!("mov.b64 {d}, {};", const_to_u64(*v, ty)));
+            }
+            Op::ConstFloat(v, ty) => {
+                let d = self.reg(r);
+                if matches!(ty, MirType::F64) {
+                    self.emit(&format!("mov.f64 {d}, 0d{:016X};", v.to_bits()));
+                } else {
+                    // A bf16/f16 const IS its grid-rounded value, so materialize it rounded â€” the
+                    // same host-side `wukong_runtime::round_*` the interpreter and Cranelift use at
+                    // this exact point. The per-store rounding in `store_into` alone is fragile:
+                    // mem2reg/CSE forward the value past its store, so `let b: bf16 = 0.1` reached
+                    // the multiply as the raw f32 0.1 at -O3 (and as the bf16 grid value at -O0).
+                    let f = match ty {
+                        MirType::BF16 => wukong_runtime::round_bf16(*v as f32),
+                        MirType::F16 => wukong_runtime::round_f16(*v as f32),
+                        _ => *v as f32,
+                    };
+                    self.emit(&format!("mov.f32 {d}, 0f{:08X};", f.to_bits()));
+                }
+            }
+            Op::Bin(op, l, r2) => self.lower_bin(*op, *l, *r2, &rty, r)?,
+            Op::Cmp(op, l, r2) => self.lower_cmp(*op, *l, *r2, r),
+            Op::Neg(v) => {
+                let x = self.reg(*v);
+                let d = self.reg(r);
+                self.neg_into(&d, &x, &rty);
+            }
+            Op::Not(v) => {
+                let x = self.reg(*v);
+                let d = self.reg(r);
+                self.not_into(&d, &x, &rty);
+            }
+            Op::Cast(kind, v, to) => self.lower_cast(*kind, *v, to, r)?,
+            Op::Select(c, a, b) => self.lower_select(*c, *a, *b, &rty, r),
+            Op::Alloca { ty: _, space } => {
+                let d = self.reg(r);
+                match space {
+                    wukong_mir::AddrSpace::Local => {
+                        let off = *self.frame_off.get(&r.0).expect("alloca offset");
+                        let base = self.frame_base.clone();
+                        if off == 0 {
+                            self.emit(&format!("mov.b64 {d}, {base};"));
+                        } else {
+                            self.emit(&format!("add.s64 {d}, {base}, {off};"));
+                        }
+                    }
+                    wukong_mir::AddrSpace::Shared => {
+                        let off = *self.shared_off.get(&r.0).expect("shared alloca offset");
+                        let base = self.shared_base.clone();
+                        if off == 0 {
+                            self.emit(&format!("mov.b64 {d}, {base};"));
+                        } else {
+                            self.emit(&format!("add.s64 {d}, {base}, {off};"));
+                        }
+                        self.shared_ptrs.insert(r.0);
+                    }
+                }
+            }
+            Op::Load(p, ty) => self.lower_load(*p, ty, r)?,
+            Op::Gep { ptr, index, elem } => {
+                let base = self.reg(*ptr);
+                let idx = self.reg(*index);
+                let off = self.fresh(RC::Rd);
+                let d = self.reg(r);
+                self.emit(&format!("mul.lo.s64 {off}, {idx}, {};", size_of(elem)));
+                self.emit(&format!("add.s64 {d}, {base}, {off};"));
+                if self.is_shared_ptr(*ptr) {
+                    self.shared_ptrs.insert(r.0);
+                }
+            }
+            Op::Fma(a, b, c) => {
+                let rc = rc_of(&rty);
+                let av = self.coerce_float(*a, rc);
+                let bv = self.coerce_float(*b, rc);
+                let cv = self.coerce_float(*c, rc);
+                let d = self.reg(r);
+                self.fma_into(&d, &av, &bv, &cv, &rty);
+            }
+            Op::Sqrt(v) => {
+                let rc = rc_of(&rty);
+                let x = self.coerce_float(*v, rc);
+                let d = self.reg(r);
+                self.sqrt_into(&d, &x, &rty);
+            }
+            Op::Round(mode, v) => {
+                let rc = rc_of(&rty);
+                let x = self.coerce_float(*v, rc);
+                let d = self.reg(r);
+                self.round_into(&d, *mode, &x, &rty);
+            }
+            // A `Splat` or `Iota` whose result is NOT a vector never reaches here from verified MIR
+            // (`wukong_mir::verify` requires a vector result for both), and the vector case went to
+            // `lower_vec_inst` above. Keep them as declines rather than `unreachable!`, but say what
+            // they mean: the old text was "SIMD not yet lowered to PTX", which now reads as a claim
+            // about the SIMD path in general to anyone debugging a decline.
+            Op::Splat(_) => {
+                return Err(format!(
+                    "{UNSUPPORTED} `Splat` with a non-vector result type {} (malformed MIR)",
+                    rty.display()
+                ))
+            }
+            // Read lane `k` of a SIMD value back as a scalar â€” the shape the loop vectorizer's
+            // reduction epilogue folds in index order, and how a vector guard reaches a `CondBr`.
+            // `lower_vec_inst` already scalarizes every vector into one register per lane, so this is
+            // a register copy: the "one shuffle, lane 0 is free" cost model in
+            // `wukong_mir::Op::ExtractLane`'s doc is a CPU-SIMD statement, not a PTX one.
+            Op::ExtractLane(v, k) => {
+                let lanes = self.lanes(*v)?;
+                let src = lanes.get(*k as usize).cloned().ok_or_else(|| {
+                    format!(
+                        "{UNSUPPORTED} SIMD `ExtractLane` lane {k} is past the {} lane(s) of v{}",
+                        lanes.len(),
+                        v.0
+                    )
+                })?;
+                let d = self.reg(r);
+                self.emit(&format!("mov.{} {d}, {src};", mov_ty(rc_of(&rty))));
+            }
+            Op::Iota(..) => {
+                return Err(format!(
+                    "{UNSUPPORTED} `Iota` with a non-vector result type {} (malformed MIR)",
+                    rty.display()
+                ))
+            }
+            Op::FuncAddr(sym) => {
+                // Record the target for the `wukong_parallel_for` special-case; the value itself is
+                // never materialized as a device function pointer, so emit no instruction.
+                self.func_addr_of.insert(r.0, *sym);
+            }
+            Op::GlobalAddr(_) => {
+                // A `.rodata` string address â€” strings never occur in GPU-eligible numeric kernels,
+                // so decline (skip to the single-thread / CPU path) rather than miscompile.
+                return Err(format!(
+                    "{UNSUPPORTED} `GlobalAddr` (static string data) not lowered to PTX"
+                ));
+            }
+            Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Barrier => {
+                unreachable!("handled above")
+            }
+        }
+        Ok(())
+    }
+
+    // --- integer / float binary ops ---
+
+    fn lower_bin(
+        &mut self,
+        op: BinOp,
+        l: ValueId,
+        r2: ValueId,
+        rty: &MirType,
+        res: ValueId,
+    ) -> Result<(), String> {
+        let (a, b) = if op.is_float() {
+            let rc = rc_of(rty);
+            (self.coerce_float(l, rc), self.coerce_float(r2, rc))
+        } else {
+            (self.reg(l), self.reg(r2))
+        };
+        let d = self.reg(res);
+        self.bin_into(&d, op, &a, &b, rty)
+    }
+
+    /// Emit `d = a OP b` for one (scalar or lane) value. Operands are registers already of the result
+    /// type; floats round per op (no auto-FMA), ints compute in 64-bit and mask to the result width.
+    fn bin_into(
+        &mut self,
+        d: &str,
+        op: BinOp,
+        a: &str,
+        b: &str,
+        rty: &MirType,
+    ) -> Result<(), String> {
+        use BinOp::*;
+        if op.is_float() {
+            let sfx = float_suffix(rty);
+            match op {
+                FAdd => self.emit(&format!("add.rn.{sfx} {d}, {a}, {b};")),
+                FSub => self.emit(&format!("sub.rn.{sfx} {d}, {a}, {b};")),
+                FMul => self.emit(&format!("mul.rn.{sfx} {d}, {a}, {b};")),
+                FDiv => self.emit(&format!("div.rn.{sfx} {d}, {a}, {b};")),
+                // No PTX frem op, and the `a - trunc(a/b)*b` identity loses precision past the
+                // mantissa's integer range (`1e18 % 3` -> 0, not 1). Call the exact device fmod
+                // helper instead; compute in f64 (exact for f32 inputs) and narrow the f32 result.
+                FRem => {
+                    let (af, bf) = if rc_of(rty) == RC::F64 {
+                        (a.to_string(), b.to_string())
+                    } else {
+                        let ta = self.fresh(RC::F64);
+                        self.emit(&format!("cvt.f64.f32 {ta}, {a};"));
+                        let tb = self.fresh(RC::F64);
+                        self.emit(&format!("cvt.f64.f32 {tb}, {b};"));
+                        (ta, tb)
+                    };
+                    let rr = self.fresh(RC::F64);
+                    self.emit("{");
+                    self.emit(".param .f64 _fa;");
+                    self.emit(".param .f64 _fb;");
+                    self.emit(".param .f64 _fr;");
+                    self.emit(&format!("st.param.f64 [_fa], {af};"));
+                    self.emit(&format!("st.param.f64 [_fb], {bf};"));
+                    self.emit("call.uni (_fr), mrt_fmod, (_fa, _fb);");
+                    self.emit(&format!("ld.param.f64 {rr}, [_fr];"));
+                    self.emit("}");
+                    if rc_of(rty) == RC::F64 {
+                        self.emit(&format!("mov.f64 {d}, {rr};"));
+                    } else {
+                        self.emit(&format!("cvt.rn.f32.f64 {d}, {rr};"));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            return Ok(());
+        }
+        let bits = int_bits(rty);
+        match op {
+            Add => self.emit(&format!("add.s64 {d}, {a}, {b};")),
+            Sub => self.emit(&format!("sub.s64 {d}, {a}, {b};")),
+            Mul => self.emit(&format!("mul.lo.s64 {d}, {a}, {b};")),
+            And => self.emit(&format!("and.b64 {d}, {a}, {b};")),
+            Or => self.emit(&format!("or.b64 {d}, {a}, {b};")),
+            Xor => self.emit(&format!("xor.b64 {d}, {a}, {b};")),
+            SDiv => self.guarded_divrem("div.s64", a, b, d),
+            SRem => self.guarded_divrem("rem.s64", a, b, d),
+            UDiv => {
+                let au = self.mask_unsigned(a, bits);
+                let bu = self.mask_unsigned(b, bits);
+                self.guarded_divrem("div.u64", &au, &bu, d);
+            }
+            URem => {
+                let au = self.mask_unsigned(a, bits);
+                let bu = self.mask_unsigned(b, bits);
+                self.guarded_divrem("rem.u64", &au, &bu, d);
+            }
+            Shl => {
+                let sc = self.shift_count(b, bits);
+                self.emit(&format!("shl.b64 {d}, {a}, {sc};"));
+            }
+            LShr => {
+                let au = self.mask_unsigned(a, bits);
+                let sc = self.shift_count(b, bits);
+                self.emit(&format!("shr.u64 {d}, {au}, {sc};"));
+            }
+            AShr => {
+                let sc = self.shift_count(b, bits);
+                self.emit(&format!("shr.s64 {d}, {a}, {sc};"));
+            }
+            FAdd | FSub | FMul | FDiv | FRem => unreachable!("handled above"),
+        }
+        self.mask_int(d, rty);
+        Ok(())
+    }
+
+    fn neg_into(&mut self, d: &str, a: &str, rty: &MirType) {
+        if rty.is_float() {
+            self.emit(&format!("neg.{} {d}, {a};", float_suffix(rty)));
+        } else {
+            self.emit(&format!("neg.s64 {d}, {a};"));
+            self.mask_int(d, rty);
+        }
+    }
+
+    fn not_into(&mut self, d: &str, a: &str, rty: &MirType) {
+        self.emit(&format!("not.b64 {d}, {a};"));
+        self.mask_int(d, rty);
+    }
+
+    fn fma_into(&mut self, d: &str, a: &str, b: &str, c: &str, rty: &MirType) {
+        self.emit(&format!("fma.rn.{} {d}, {a}, {b}, {c};", float_suffix(rty)));
+    }
+
+    fn sqrt_into(&mut self, d: &str, a: &str, rty: &MirType) {
+        self.emit(&format!("sqrt.rn.{} {d}, {a};", float_suffix(rty)));
+    }
+
+    fn round_into(&mut self, d: &str, mode: RoundMode, a: &str, rty: &MirType) {
+        let sfx = float_suffix(rty);
+        let m = match mode {
+            RoundMode::Nearest => "rni",
+            RoundMode::Floor => "rmi",
+            RoundMode::Ceil => "rpi",
+            RoundMode::Trunc => "rzi",
+        };
+        self.emit(&format!("cvt.{m}.{sfx}.{sfx} {d}, {a};"));
+    }
+
+    /// `d = (b == 0) ? 0 : (a OP b)` with `b` swapped to 1 in the divide so the hardware never sees a
+    /// zero divisor (matching the interpreter/Cranelift "div-by-zero yields 0, no trap" contract).
+    fn guarded_divrem(&mut self, opc: &str, a: &str, b: &str, d: &str) {
+        let pz = self.fresh_pred();
+        let one = self.fresh(RC::Rd);
+        let zero = self.fresh(RC::Rd);
+        let safe = self.fresh(RC::Rd);
+        let q = self.fresh(RC::Rd);
+        self.emit(&format!("setp.eq.s64 {pz}, {b}, 0;"));
+        self.emit(&format!("mov.b64 {one}, 1;"));
+        self.emit(&format!("mov.b64 {zero}, 0;"));
+        self.emit(&format!("selp.b64 {safe}, {one}, {b}, {pz};"));
+        self.emit(&format!("{opc} {q}, {a}, {safe};"));
+        self.emit(&format!("selp.b64 {d}, {zero}, {q}, {pz};"));
+    }
+
+    /// Mask the shift amount to the result width (x86/Cranelift/interp semantics) and narrow to the
+    /// `.u32` PTX shift operand.
+    fn shift_count(&mut self, b: &str, bits: u32) -> String {
+        let masked = self.fresh(RC::Rd);
+        let sc = self.fresh_r32();
+        self.emit(&format!("and.b64 {masked}, {b}, {};", bits - 1));
+        // PTX shift amount is a 32-bit value.
+        self.emit(&format!("cvt.u32.u64 {sc}, {masked};"));
+        sc
+    }
+
+    /// Zero-extend the low `bits` of a sign-extended value (the unsigned-width window the interpreter
+    /// reads for unsigned ops). No-op at 64 bits.
+    fn mask_unsigned(&mut self, src: &str, bits: u32) -> String {
+        if bits >= 64 {
+            return src.to_string();
+        }
+        let d = self.fresh(RC::Rd);
+        let mask: u64 = (1u64 << bits) - 1;
+        self.emit(&format!("and.b64 {d}, {src}, {mask};"));
+        d
+    }
+
+    /// Narrow a computed 64-bit integer result to its declared MIR width, sign-extended (mirrors the
+    /// interpreter's per-result `mask`). No-op for `i64`/pointer.
+    fn mask_int(&mut self, reg: &str, ty: &MirType) {
+        match ty {
+            MirType::I1 => self.emit(&format!("and.b64 {reg}, {reg}, 1;")),
+            MirType::I8 => self.emit(&format!("cvt.s64.s8 {reg}, {reg};")),
+            MirType::I16 => self.emit(&format!("cvt.s64.s16 {reg}, {reg};")),
+            MirType::I32 => self.emit(&format!("cvt.s64.s32 {reg}, {reg};")),
+            _ => {}
+        }
+    }
+
+    // --- compares / select ---
+
+    fn lower_cmp(&mut self, op: CmpOp, l: ValueId, r2: ValueId, res: ValueId) {
+        let (a, b, opnd_ty) = if op.is_float() {
+            // Compare in the wider operand type (Cranelift's rule), which preserves order vs the
+            // interpreter's f64 compare.
+            let common =
+                if matches!(self.ty(l), MirType::F64) || matches!(self.ty(r2), MirType::F64) {
+                    MirType::F64
+                } else {
+                    MirType::F32
+                };
+            let rc = rc_of(&common);
+            (self.coerce_float(l, rc), self.coerce_float(r2, rc), common)
+        } else {
+            (self.reg(l), self.reg(r2), self.ty(l))
+        };
+        let d = self.reg(res);
+        self.cmp_into(&d, op, &a, &b, &opnd_ty);
+    }
+
+    /// Emit `d = (a CMP b) ? 1 : 0` into a 64-bit `i1` holder. `opnd_ty` selects the compare width.
+    fn cmp_into(&mut self, d: &str, op: CmpOp, a: &str, b: &str, opnd_ty: &MirType) {
+        let p = self.fresh_pred();
+        if op.is_float() {
+            self.emit(&format!(
+                "setp.{}.{} {p}, {a}, {b};",
+                float_cc(op),
+                float_suffix(opnd_ty)
+            ));
+        } else {
+            self.emit(&format!("setp.{} {p}, {a}, {b};", int_cc(op)));
+        }
+        let one = self.fresh(RC::Rd);
+        let zero = self.fresh(RC::Rd);
+        self.emit(&format!("mov.b64 {one}, 1;"));
+        self.emit(&format!("mov.b64 {zero}, 0;"));
+        self.emit(&format!("selp.b64 {d}, {one}, {zero}, {p};"));
+    }
+
+    fn lower_select(&mut self, c: ValueId, a: ValueId, b: ValueId, rty: &MirType, res: ValueId) {
+        let rc = rc_of(rty);
+        let cc = self.reg(c);
+        let (av, bv) = if rty.is_float() {
+            (self.coerce_float(a, rc), self.coerce_float(b, rc))
+        } else {
+            (self.reg(a), self.reg(b))
+        };
+        let d = self.reg(res);
+        self.select_into(&d, &cc, &av, &bv, rty);
+    }
+
+    /// Emit `d = c ? a : b` for one (scalar or lane) value; `c` is a 64-bit `i1` (0/1).
+    fn select_into(&mut self, d: &str, c: &str, a: &str, b: &str, rty: &MirType) {
+        let rc = rc_of(rty);
+        let p = self.fresh_pred();
+        self.emit(&format!("setp.ne.s64 {p}, {c}, 0;"));
+        self.emit(&format!("selp.{} {d}, {a}, {b}, {p};", mov_ty(rc)));
+        if !rty.is_float() {
+            self.mask_int(d, rty);
+        }
+    }
+
+    // --- casts ---
+
+    fn lower_cast(
+        &mut self,
+        kind: CastKind,
+        v: ValueId,
+        to: &MirType,
+        res: ValueId,
+    ) -> Result<(), String> {
+        let from = self.ty(v);
+        let x = self.reg(v);
+        let d = self.reg(res);
+        self.cast_into(&d, kind, &x, &from, to)
+    }
+
+    /// Emit a cast `d = (to)a` for one (scalar or lane) value, mirroring `wukong_interp::apply_cast`.
+    fn cast_into(
+        &mut self,
+        d: &str,
+        kind: CastKind,
+        x: &str,
+        from: &MirType,
+        to: &MirType,
+    ) -> Result<(), String> {
+        use CastKind::*;
+        match kind {
+            SExt | Trunc => {
+                self.emit(&format!("mov.b64 {d}, {x};"));
+                self.mask_int(d, to);
+            }
+            ZExt => {
+                let u = self.mask_unsigned(x, int_bits(from));
+                self.emit(&format!("mov.b64 {d}, {u};"));
+                self.mask_int(d, to);
+            }
+            SiToFp => {
+                if matches!(to, MirType::F64) {
+                    self.emit(&format!("cvt.rn.f64.s64 {d}, {x};"));
+                } else {
+                    // Match the interpreter's i->f64->f32 double rounding exactly.
+                    let t = self.fresh(RC::F64);
+                    self.emit(&format!("cvt.rn.f64.s64 {t}, {x};"));
+                    self.emit(&format!("cvt.rn.f32.f64 {d}, {t};"));
+                }
+            }
+            UiToFp => {
+                let u = self.mask_unsigned(x, int_bits(from));
+                if matches!(to, MirType::F64) {
+                    self.emit(&format!("cvt.rn.f64.u64 {d}, {u};"));
+                } else {
+                    let t = self.fresh(RC::F64);
+                    self.emit(&format!("cvt.rn.f64.u64 {t}, {u};"));
+                    self.emit(&format!("cvt.rn.f32.f64 {d}, {t};"));
+                }
+            }
+            FpToSi => self.fp_to_int_into(d, x, from, to, true),
+            FpToUi => self.fp_to_int_into(d, x, from, to, false),
+            FpExt => {
+                // A bf16/f16 source must round to its grid before widening. bf16/f16 share f32's
+                // register, so the per-store rounding is fragile â€” an optimizer can forward a bf16 op
+                // result past its store, leaving an unrounded f32 that this widen would pass through
+                // unchanged. Round at the observation boundary too, exactly as
+                // `wukong_codegen_cranelift`'s FpExt arm and the interpreter's `apply_cast` do.
+                let xr = match from {
+                    MirType::BF16 | MirType::F16 => {
+                        let h = self.fresh_r16();
+                        let t = self.fresh(RC::F32);
+                        let c = if matches!(from, MirType::BF16) {
+                            "bf16"
+                        } else {
+                            "f16"
+                        };
+                        self.emit(&format!("cvt.rn.{c}.f32 {h}, {x};"));
+                        self.emit(&format!("cvt.f32.{c} {t}, {h};"));
+                        t
+                    }
+                    _ => x.to_string(),
+                };
+                match to {
+                    // Widen to f64. Source is f64 already (mov) or f32/bf16/f16 held as f32 (cvt up).
+                    MirType::F64 => {
+                        if rc_of(from) == RC::F64 {
+                            self.emit(&format!("mov.f64 {d}, {xr};"));
+                        } else {
+                            self.emit(&format!("cvt.f64.f32 {d}, {xr};"));
+                        }
+                    }
+                    // bf16/f16 -> f32: loads/casts already widen low-precision floats into an f32
+                    // register, so after the grid rounding above the widening is just a move.
+                    MirType::F32 => self.emit(&format!("mov.f32 {d}, {xr};")),
+                    _ => return Err(format!("{UNSUPPORTED} FpExt to {:?}", to)),
+                }
+            }
+            FpTrunc => {
+                // Demote an f64 source to f32 first; the result reg is always f32 (rc_of bf16/f16/f32).
+                let src = if rc_of(from) == RC::F64 {
+                    let t = self.fresh(RC::F32);
+                    self.emit(&format!("cvt.rn.f32.f64 {t}, {x};"));
+                    t
+                } else {
+                    x.to_string()
+                };
+                match to {
+                    MirType::F32 => self.emit(&format!("mov.f32 {d}, {src};")),
+                    // Round to the bf16/f16 grid (RNE) and widen back to f32 â€” matches the
+                    // interpreter's round_bf16/round_f16 (tolerance-gated).
+                    MirType::BF16 => {
+                        let h = self.fresh_r16();
+                        self.emit(&format!("cvt.rn.bf16.f32 {h}, {src};"));
+                        self.emit(&format!("cvt.f32.bf16 {d}, {h};"));
+                    }
+                    MirType::F16 => {
+                        let h = self.fresh_r16();
+                        self.emit(&format!("cvt.rn.f16.f32 {h}, {src};"));
+                        self.emit(&format!("cvt.f32.f16 {d}, {h};"));
+                    }
+                    _ => {
+                        return Err(format!("{UNSUPPORTED} FpTrunc to {:?}", to));
+                    }
+                }
+            }
+            Bitcast => self.bitcast_into(d, x, from, to),
+            IntToPtr | PtrToInt => self.emit(&format!("mov.b64 {d}, {x};")),
+        }
+        Ok(())
+    }
+
+    fn fp_to_int_into(&mut self, d: &str, x: &str, from: &MirType, to: &MirType, signed: bool) {
+        let fsfx = float_suffix(from);
+        let s = if signed { 's' } else { 'u' };
+        let w = match to {
+            MirType::I8 => 8,
+            MirType::I16 => 16,
+            MirType::I64 => 64,
+            _ => 32,
+        };
+        // PTX float->int `cvt` *saturates* to the destination integer type (out-of-range clamps to the
+        // type's min/max; NaN -> 0) â€” exactly the Rust `as` / interpreter / Cranelift `fcvt_to_*_sat`
+        // semantics. For a 32/64-bit target the single `cvt` is the whole story.
+        if w == 64 {
+            self.emit(&format!("cvt.rzi.{s}64.{fsfx} {d}, {x};"));
+        } else if w == 32 {
+            // Saturating cvt to a 32-bit temp, then sign/zero-extend into the 64-bit holder. `mask_int`
+            // is a no-op for i32 (the extend already canonicalizes) but keeps the i1 fallback (`& 1`).
+            let t = self.fresh_r32();
+            self.emit(&format!("cvt.rzi.{s}32.{fsfx} {t}, {x};"));
+            self.emit(&format!("cvt.{s}64.{s}32 {d}, {t};"));
+            self.mask_int(d, to);
+        } else {
+            // Narrow (i8/i16/u8/u16): PTX can only cvt-saturate to i32/u32, so saturate to 32 bits then
+            // CLAMP to the narrow type's range and reduce â€” mirroring Cranelift's `fcvt_to_int_sat`
+            // (smin/smax for signed; umin for unsigned, whose lower bound is already 0 from the
+            // unsigned saturation). This makes e.g. `300.0 as u8 == 255`, `-300.0 as i8 == -128`,
+            // `-1.0 as u8 == 0`, not the mod-2^w truncation the old `mask_int` produced.
+            let t = self.fresh_r32();
+            self.emit(&format!("cvt.rzi.{s}32.{fsfx} {t}, {x};"));
+            if signed {
+                let (lo, hi) = if w == 8 { (-128, 127) } else { (-32768, 32767) };
+                self.emit(&format!("min.s32 {t}, {t}, {hi};"));
+                self.emit(&format!("max.s32 {t}, {t}, {lo};"));
+                self.emit(&format!("cvt.s64.s32 {d}, {t};"));
+            } else {
+                let hi = if w == 8 { 255 } else { 65535 };
+                self.emit(&format!("min.u32 {t}, {t}, {hi};"));
+                self.emit(&format!("cvt.u64.u32 {d}, {t};"));
+                // `cvt.u64.u32` leaves the clamped value ZERO-extended, but every integer register in
+                // this backend is kept SIGN-extended to its MIR width (the interpreter's `mask`). Skip
+                // this and `250.0 as u8` sits in the register as +250 while `const.i8 250` materializes
+                // as -6, so a following `setp.eq.s64` against it is false. The signed branch above is
+                // already canonical (`cvt.s64.s32` after the clamp sign-extends).
+                self.mask_int(d, to);
+            }
+        }
+    }
+
+    fn bitcast_into(&mut self, d: &str, x: &str, from: &MirType, to: &MirType) {
+        match (from, to) {
+            (MirType::I32, MirType::F32) => {
+                let lo = self.fresh_r32();
+                self.emit(&format!("cvt.u32.u64 {lo}, {x};"));
+                self.emit(&format!("mov.b32 {d}, {lo};"));
+            }
+            (MirType::F32, MirType::I32) => {
+                let lo = self.fresh_r32();
+                self.emit(&format!("mov.b32 {lo}, {x};"));
+                self.emit(&format!("cvt.s64.s32 {d}, {lo};"));
+            }
+            (MirType::I64, MirType::F64) | (MirType::F64, MirType::I64) => {
+                self.emit(&format!("mov.b64 {d}, {x};"));
+            }
+            _ => {
+                // Same-class passthrough.
+                self.emit(&format!("mov.{} {d}, {x};", mov_ty(rc_of(to))));
+            }
+        }
+    }
+
+    // --- memory ---
+
+    fn lower_load(&mut self, p: ValueId, ty: &MirType, res: ValueId) -> Result<(), String> {
+        let addr = self.reg(p);
+        let d = self.reg(res);
+        self.load_into(&d, &addr, ty, self.is_shared_ptr(p))
+    }
+
+    /// Load one (scalar or lane) value of MIR type `ty` from address `addr` into `d`.
+    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType, _shared: bool) -> Result<(), String> {
+        // User `shared [T; N]` allocas are addressed via `cvta.shared` (generic state space), exactly
+        // like `.local` allocas use `cvta.local` + generic `ld.*` â€” never `ld.local` / `ld.shared`.
+        let ld = |op: &str| format!("ld.{op}");
+        match ty {
+            // `i1` occupies ONE byte in memory (`size_of(I1) == 1`, and `Op::Gep` strides bools by 1),
+            // exactly like Cranelift's `types::I8` mapping â€” so it must be accessed with `ld.u8`. A
+            // 4-byte access would read three neighbouring bools (or run past the frame) and, on an
+            // odd address, faults the device outright with CUDA_ERROR_MISALIGNED_ADDRESS.
+            MirType::I1 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("ld.u8 {w}, [{addr}];"));
+                self.emit(&format!("cvt.u64.u32 {d}, {w};"));
+                self.mask_int(d, ty);
+            }
+            MirType::F32 => self.emit(&format!("{} {d}, [{addr}];", ld("f32"))),
+            MirType::F64 => self.emit(&format!("{} {d}, [{addr}];", ld("f64"))),
+            MirType::I64 | MirType::Ptr => self.emit(&format!("{} {d}, [{addr}];", ld("u64"))),
+            // bf16/f16 storage is 2 bytes; load the 16 bits and widen to the f32 register.
+            MirType::BF16 => {
+                let h = self.fresh_r16();
+                self.emit(&format!("{} {h}, [{addr}];", ld("u16")));
+                self.emit(&format!("cvt.f32.bf16 {d}, {h};"));
+            }
+            MirType::F16 => {
+                let h = self.fresh_r16();
+                self.emit(&format!("{} {h}, [{addr}];", ld("u16")));
+                self.emit(&format!("cvt.f32.f16 {d}, {h};"));
+            }
+            MirType::I8 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("ld.s8 {w}, [{addr}];"));
+                self.emit(&format!("cvt.s64.s32 {d}, {w};"));
+            }
+            MirType::I16 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("ld.s16 {w}, [{addr}];"));
+                self.emit(&format!("cvt.s64.s32 {d}, {w};"));
+            }
+            // i32: load 32 bits, sign-extend to 64.
+            MirType::I32 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("ld.u32 {w}, [{addr}];"));
+                self.emit(&format!("cvt.s64.s32 {d}, {w};"));
+            }
+            // An aggregate/void has no single-register load. Falling through to the 4-byte `ld.u32`
+            // would emit *plausible but wrong* PTX (a `load [2 x i32]` would read only its first
+            // element) â€” the contract is to decline so the gate reports it as not-yet-covered.
+            MirType::Vec(..) | MirType::Array(..) | MirType::Void => {
+                return Err(format!("{UNSUPPORTED} load of aggregate type {ty:?}"))
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_store(&mut self, ptr: ValueId, value: ValueId) -> Result<(), String> {
+        let vty = self.ty(value);
+        let addr = self.reg(ptr);
+        // Vector store: write each lane at addr + i*sizeof(lane).
+        if let MirType::Vec(elem, n) = &vty {
+            let elem = (**elem).clone();
+            let hint = self.coalesce.get(self.cur_block, self.cur_inst);
+            if *n == 4
+                && elem == MirType::F32
+                && !self.is_shared_ptr(ptr)
+                && matches!(
+                    hint,
+                    Some(wukong_opt::CoalesceHint::UnitStride {
+                        width: wukong_opt::VectorWidth::V4
+                    })
+                )
+            {
+                let lanes = self.lanes(value)?;
+                let g = self.st_guard();
+                self.emit(&format!(
+                    "{g}st.global.v4.f32 [{addr}], {{{}, {}, {}, {}}};",
+                    lanes[0], lanes[1], lanes[2], lanes[3]
+                ));
+                return Ok(());
+            }
+            let esz = size_of(&elem);
+            let lanes = self.lanes(value)?;
+            for (i, lv) in lanes.into_iter().enumerate().take(*n as usize) {
+                let la = if i == 0 {
+                    addr.clone()
+                } else {
+                    let t = self.fresh(RC::Rd);
+                    self.emit(&format!("add.s64 {t}, {addr}, {};", i as u64 * esz));
+                    t
+                };
+                self.store_into(&la, &lv, &elem, false)?;
+            }
+            return Ok(());
+        }
+        let v = self.reg(value);
+        self.store_into(&addr, &v, &vty, self.is_shared_ptr(ptr))
+    }
+
+    /// A store predicate prefix: in mega mode every store targets the *shared* frame, so only
+    /// `tid==0` may write it (the SPMD threads otherwise race on identical data and multiply the
+    /// atomic print counter); in single-thread mode it is empty (unconditional).
+    fn st_guard(&self) -> String {
+        if self.mega {
+            format!("@{} ", self.tid0)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Store one (scalar or lane) value `v` of MIR type `ty` to address `addr`.
+    fn store_into(&mut self, addr: &str, v: &str, ty: &MirType, _shared: bool) -> Result<(), String> {
+        // Mirror `load_into`: `cvta.shared` addresses use generic `st.*`, not `st.shared.*`.
+        let st = |op: &str| format!("st.{op}");
+        let g = self.st_guard();
+        match ty {
+            MirType::F32 => self.emit(&format!("{g}{} [{addr}], {v};", st("f32"))),
+            MirType::F64 => self.emit(&format!("{g}{} [{addr}], {v};", st("f64"))),
+            MirType::I64 => self.emit(&format!("{g}{} [{addr}], {v};", st("u64"))),
+            // A pointer homed in the shared frame (an inlined function's Tensor/array param slot) is a
+            // UNIFORM value across the SPMD threads â€” it is frame-base / kernel-param derived, never a
+            // loaded, per-thread-varying value. It must be stored *unconditionally* (no `@tid0` guard):
+            // in a megakernel the scalar glue can `load` that slot on **every** thread and dereference
+            // it (e.g. a non-recognized reduction over a Tensor param), so a `tid==0`-only store would
+            // leave the zero-initialized slot on threads != 0 and their deref of that null pointer
+            // faults (CUDA_ERROR_ILLEGAL_ADDRESS) â€” even though the result is ultimately discarded.
+            // Writing the same pointer from all threads is a benign identical-data race (a pointer slot
+            // is homed once, never read-modify-written), so every thread reads the correct base. In the
+            // single-thread lowering `st_guard` is empty anyway, so this is a no-op there.
+            MirType::Ptr => self.emit(&format!("st.u64 [{addr}], {v};")),
+            // bf16/f16 storage is 2 bytes; narrow the f32 value to 16 bits, store the raw u16.
+            MirType::BF16 => {
+                let h = self.fresh_r16();
+                self.emit(&format!("cvt.rn.bf16.f32 {h}, {v};"));
+                self.emit(&format!("{g}st.u16 [{addr}], {h};"));
+            }
+            MirType::F16 => {
+                let h = self.fresh_r16();
+                self.emit(&format!("cvt.rn.f16.f32 {h}, {v};"));
+                self.emit(&format!("{g}st.u16 [{addr}], {h};"));
+            }
+            // `i1` is a ONE-byte object (see `load_into`): store the low byte, masked to 0/1 so the
+            // byte read back is canonical whatever produced the value.
+            MirType::I1 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("cvt.u32.u64 {w}, {v};"));
+                self.emit(&format!("and.b32 {w}, {w}, 1;"));
+                self.emit(&format!("{g}st.u8 [{addr}], {w};"));
+            }
+            // Narrow stores take a 32-bit source register (low bits); narrow the 64-bit value first.
+            MirType::I8 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("cvt.u32.u64 {w}, {v};"));
+                self.emit(&format!("{g}st.u8 [{addr}], {w};"));
+            }
+            MirType::I16 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("cvt.u32.u64 {w}, {v};"));
+                self.emit(&format!("{g}st.u16 [{addr}], {w};"));
+            }
+            MirType::I32 => {
+                let w = self.fresh_r32();
+                self.emit(&format!("cvt.u32.u64 {w}, {v};"));
+                self.emit(&format!("{g}st.u32 [{addr}], {w};"));
+            }
+            // As in `load_into`: an aggregate/void has no single-register store, and a 4-byte
+            // `st.u32` would write only part of it. Decline instead of emitting a partial write.
+            MirType::Vec(..) | MirType::Array(..) | MirType::Void => {
+                return Err(format!("{UNSUPPORTED} store of aggregate type {ty:?}"))
+            }
+        }
+        Ok(())
+    }
+
+    // --- SIMD (vector) lowering: scalarize each `<N x T>` op into N lane ops ---
+
+    /// The N lane registers of a SIMD value (materialized by the op that produced it, or
+    /// pre-assigned by [`assign_vector_block_params`](Self::assign_vector_block_params) when the
+    /// value is a block param).
+    fn lanes(&mut self, v: ValueId) -> Result<Vec<String>, String> {
+        self.vlanes
+            .get(&v.0)
+            .cloned()
+            .ok_or_else(|| format!("{UNSUPPORTED} SIMD value v{} used before definition", v.0))
+    }
+
+    /// Give every **vector-typed block param** its own register per lane, before any block is
+    /// emitted.
+    ///
+    /// A vector block param is how a loop carries a SIMD value across iterations â€” the vectorized
+    /// reduction accumulator is exactly this shape â€” and it has to be pre-assigned rather than
+    /// materialized on first use, because the *edge* that writes it (`emit_edge`, in a predecessor
+    /// block) runs before the block that reads it. Everything else here scalarizes a vector as N
+    /// registers produced by one op, so the only new obligation is that the two sides agree on which
+    /// N registers; a fixed pre-assignment is that agreement.
+    fn assign_vector_block_params(&mut self) {
+        let params: Vec<ValueId> = self
+            .func
+            .blocks
+            .iter()
+            .flat_map(|b| b.params.iter().copied())
+            .collect();
+        for p in params {
+            if let MirType::Vec(lane, n) = self.ty(p) {
+                let rc = rc_of(&lane);
+                let mut lanes = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    lanes.push(self.fresh(rc));
+                }
+                self.vlanes.insert(p.0, lanes);
+            }
+        }
+    }
+
+    /// Address of lane `i` given a base address register and the lane byte size.
+    fn lane_addr(&mut self, base: &str, i: usize, esz: u64) -> String {
+        if i == 0 {
+            base.to_string()
+        } else {
+            let t = self.fresh(RC::Rd);
+            self.emit(&format!("add.s64 {t}, {base}, {};", i as u64 * esz));
+            t
+        }
+    }
+
+    /// Scalarize a vectorized (`<N x T>`) instruction into N lane operations, reusing the same
+    /// reg-based emitters the scalar path uses. Vector loads/stores stride by the lane size; a `Splat`
+    /// aliases the scalar across all lanes. (Vectorized values are produced and consumed within one
+    /// block, so there are no vector block params to thread.)
+    fn lower_vec_inst(
+        &mut self,
+        inst: &wukong_mir::Inst,
+        r: ValueId,
+        rty: &MirType,
+    ) -> Result<(), String> {
+        let n = match rty {
+            MirType::Vec(_, n) => *n as usize,
+            _ => unreachable!("lower_vec_inst on non-vector"),
+        };
+        let lane = rty.lane_type().clone();
+        let lane_rc = rc_of(&lane);
+
+        let out: Vec<String> = match &inst.op {
+            Op::Splat(s) => {
+                let sr = self.reg(*s);
+                vec![sr; n]
+            }
+            Op::Load(p, _) => {
+                let addr = self.reg(*p);
+                let shared = self.is_shared_ptr(*p);
+                let hint = self.coalesce.get(self.cur_block, self.cur_inst);
+                if n == 4
+                    && lane == MirType::F32
+                    && !shared
+                    && matches!(
+                        hint,
+                        Some(wukong_opt::CoalesceHint::UnitStride {
+                            width: wukong_opt::VectorWidth::V4
+                        })
+                    )
+                {
+                    let r0 = self.fresh(RC::F32);
+                    let r1 = self.fresh(RC::F32);
+                    let r2 = self.fresh(RC::F32);
+                    let r3 = self.fresh(RC::F32);
+                    self.emit(&format!(
+                        "ld.global.v4.f32 {{{r0}, {r1}, {r2}, {r3}}}, [{addr}];"
+                    ));
+                    vec![r0, r1, r2, r3]
+                } else {
+                    let esz = size_of(&lane);
+                    let mut ls = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let la = self.lane_addr(&addr, i, esz);
+                        let d = self.fresh(lane_rc);
+                        self.load_into(&d, &la, &lane, shared)?;
+                        ls.push(d);
+                    }
+                    ls
+                }
+            }
+            Op::Bin(op, l, r2) => {
+                let la = self.lanes(*l)?;
+                let lb = self.lanes(*r2)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.bin_into(&d, *op, &la[i], &lb[i], &lane)?;
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Fma(a, b, c) => {
+                let la = self.lanes(*a)?;
+                let lb = self.lanes(*b)?;
+                let lc = self.lanes(*c)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.fma_into(&d, &la[i], &lb[i], &lc[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Sqrt(v) => {
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.sqrt_into(&d, &lv[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Round(mode, v) => {
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.round_into(&d, *mode, &lv[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Neg(v) => {
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.neg_into(&d, &lv[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Not(v) => {
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.not_into(&d, &lv[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Cmp(op, l, r2) => {
+                let opnd_lane = self.ty(*l).lane_type().clone();
+                let la = self.lanes(*l)?;
+                let lb = self.lanes(*r2)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(RC::Rd);
+                    self.cmp_into(&d, *op, &la[i], &lb[i], &opnd_lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Select(c, a, b) => {
+                let lc = self.lanes(*c)?;
+                let la = self.lanes(*a)?;
+                let lb = self.lanes(*b)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(lane_rc);
+                    self.select_into(&d, &lc[i], &la[i], &lb[i], &lane);
+                    ls.push(d);
+                }
+                ls
+            }
+            Op::Cast(kind, v, to) => {
+                let from_lane = self.ty(*v).lane_type().clone();
+                let to_lane = to.lane_type().clone();
+                let lv = self.lanes(*v)?;
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(rc_of(&to_lane));
+                    self.cast_into(&d, *kind, &lv[i], &from_lane, &to_lane)?;
+                    ls.push(d);
+                }
+                ls
+            }
+            // The lane ramp `<0, 1, .., n-1>` the loop vectorizer emits for a value-carrying
+            // induction variable (`splat(i) + iota`). Every lane is a small non-negative integer, so
+            // materializing lane k as the 64-bit constant k is exact for every lane type the verifier
+            // admits (integer lanes, n <= 16) â€” the same values `wukong_interp` pushes untruncated
+            // and the same ones Cranelift's `vconst` pool holds. `rc_of` maps every integer type to
+            // `RC::Rd`, so `mov.b64` is the lane class every consumer of these lanes expects.
+            Op::Iota(_) => {
+                let mut ls = Vec::with_capacity(n);
+                for i in 0..n {
+                    let d = self.fresh(RC::Rd);
+                    self.emit(&format!("mov.b64 {d}, {i};"));
+                    ls.push(d);
+                }
+                ls
+            }
+            other => {
+                return Err(format!(
+                    "{UNSUPPORTED} SIMD op {other:?} not yet lowered to PTX"
+                ))
+            }
+        };
+        self.vlanes.insert(r.0, out);
+        Ok(())
+    }
+
+    // --- calls / intrinsics ---
+
+    fn lower_call(
+        &mut self,
+        func: Symbol,
+        args: &[ValueId],
+        result: Option<ValueId>,
+    ) -> Result<(), String> {
+        if let Some(&idx) = self.func_idx.get(&func) {
+            return self.lower_user_call(idx, args, result);
+        }
+        let name = self.interner.resolve(func).to_string();
+        // Side effects share both paths (their record/flag writes are mega-guarded internally).
+        match name.as_str() {
+            "print" | "println" => return self.lower_print(args),
+            "assert" => return self.lower_assert(args),
+            _ => {}
+        }
+        // Mega mode: bracket every recognized op with `bar.sync` and run it cooperatively (or
+        // `tid==0`-serial) over the shared frame. The single-thread dispatch below is left intact.
+        if self.mega {
+            return self.lower_call_mega(&name, args, result);
+        }
+        match name.as_str() {
+            // The elementwise transcendental kernel dispatches on a compile-time op code; only lower
+            // the ops `mrt_vmath` implements (a few inverse fns need an atan polynomial, not yet done).
+            // The bf16/f16 variants share the op-switch (and the op gate) â€” only the input load differs.
+            // NOTE: every spelling `rt_helper` maps to `mrt_vmath*` must be listed here, or it falls
+            // through to the generic `other =>` arm below and reaches the helper with this op-code
+            // gate BYPASSED â€” an unimplemented op would then silently run `mrt_vmath`'s identity
+            // default instead of declining.
+            "wukong_vmath_f32"
+            | "wukong_vmath_f32_parallel"
+            | "wukong_vmath_bf16"
+            | "wukong_vmath_f16"
+                if args.len() == 4 =>
+            {
+                let op = self
+                    .const_ints
+                    .get(&args[3].0)
+                    .copied()
+                    .ok_or_else(|| format!("{UNSUPPORTED} vmath op code is not a constant"))?;
+                if vmath_supported(op) {
+                    let pname = match name.as_str() {
+                        "wukong_vmath_bf16" => "mrt_vmath_bf16",
+                        "wukong_vmath_f16" => "mrt_vmath_f16",
+                        _ => "mrt_vmath",
+                    };
+                    self.emit_helper_call(pname, None, args, None);
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{UNSUPPORTED} vmath op {op} not yet lowered to PTX"
+                    ))
+                }
+            }
+            // Two-arg transcendentals: pow(0)/atan2(1)/hypot(2), dispatched on a compile-time op code.
+            "wukong_vmath2_f32" if args.len() == 5 => {
+                let op = self
+                    .const_ints
+                    .get(&args[4].0)
+                    .copied()
+                    .ok_or_else(|| format!("{UNSUPPORTED} vmath2 op code is not a constant"))?;
+                if matches!(op, 0..=2) {
+                    self.emit_helper_call("mrt_vmath2", None, args, None);
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"
+                    ))
+                }
+            }
+            // `wukong_parallel_for(n, func_addr F, ctx)`: the @parallel outliner splits `[0,n)` into
+            // per-core chunks and runs `F(lo, hi, ctx)` on each. The chunking is deterministic and the
+            // outlined body is chunk-decomposable, so a single sequential chunk `F(0, n, ctx)` gives
+            // the same result as the interpreter (serial == parallel).
+            //
+            // This path is the ONE-THREAD kernel (`run_on_device` launches 1x1), so the sequential
+            // chunk is not a missing optimization here â€” there is no second thread to give iterations
+            // to. The parallel form is `emit_parallel_for_gridstride` in mega mode, where the launch
+            // really is a block of threads; a program mega declines falls back here, and this
+            // lowering is what that fallback (and the differential gate) rests on.
+            "wukong_parallel_for" if args.len() == 3 => {
+                let sym = self.func_addr_of.get(&args[1].0).copied().ok_or_else(|| {
+                    format!("{UNSUPPORTED} wukong_parallel_for target is not a func_addr")
+                })?;
+                let idx = *self.func_idx.get(&sym).ok_or_else(|| {
+                    format!(
+                        "{UNSUPPORTED} wukong_parallel_for target `{}` is not a known function",
+                        self.interner.resolve(sym)
+                    )
+                })?;
+                let zero = self.fresh(RC::Rd);
+                self.emit(&format!("mov.b64 {zero}, 0;"));
+                let n_reg = self.reg(args[0]);
+                let ctx_reg = self.reg(args[2]);
+                // F(lo=0, hi=n, ctx); all three args are 64-bit (i64 count / pointers).
+                let arg_regs = vec![(zero, "b64"), (n_reg, "b64"), (ctx_reg, "b64")];
+                self.emit_call_to(idx, &arg_regs, None);
+                Ok(())
+            }
+            other => {
+                if let Some(h) = rt_helper(other) {
+                    self.emit_helper_call(h.ptx_name, h.ret, args, result);
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{UNSUPPORTED} call to `{other}` not yet lowered to PTX"
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Mega-mode dispatch of one recognized op: bracket it with `bar.sync` (so the cooperating
+    /// threads see the prior `tid==0` setup and the next `tid==0` read sees this op's output), and run
+    /// it one of three ways â€” a block-wide *tree* (`Reduce`, result broadcast to every thread),
+    /// **chunked-cooperative** over disjoint per-thread sub-ranges of the serial helper
+    /// (`Vmath`/`Vmath2`/`Velem` by elements, `Gemm*`/`I8GemmNt` by output rows, `Norm`/`NormAffine`
+    /// by rows â€” see [`emit_chunked_call`](Self::emit_chunked_call)), or `tid==0`-serial (the
+    /// remaining ops, e.g. axpby and the bf16/f16 reductions). An unsupported op code â€” and
+    /// `wukong_parallel_for`, which has no cooperative form â€” declines with `UNSUPPORTED:` so the
+    /// whole program falls back to the single-thread path.
+    fn lower_call_mega(
+        &mut self,
+        name: &str,
+        args: &[ValueId],
+        result: Option<ValueId>,
+    ) -> Result<(), String> {
+        use crate::fusion::{classify_call, CallClass, CoopKind};
+        let CallClass::Coop(kind) = classify_call(name) else {
+            return Err(format!(
+                "{UNSUPPORTED} mega call to `{name}` (not a cooperative op)"
+            ));
+        };
+        // Op-code gates, mirroring the single-thread dispatch.
+        match kind {
+            CoopKind::Vmath if args.len() == 4 => {
+                let op = self
+                    .const_ints
+                    .get(&args[3].0)
+                    .copied()
+                    .ok_or_else(|| format!("{UNSUPPORTED} vmath op code is not a constant"))?;
+                if !vmath_supported(op) {
+                    return Err(format!(
+                        "{UNSUPPORTED} vmath op {op} not yet lowered to PTX"
+                    ));
+                }
+            }
+            CoopKind::Vmath2 if args.len() == 5 => {
+                let op = self
+                    .const_ints
+                    .get(&args[4].0)
+                    .copied()
+                    .ok_or_else(|| format!("{UNSUPPORTED} vmath2 op code is not a constant"))?;
+                if !matches!(op, 0..=2) {
+                    return Err(format!(
+                        "{UNSUPPORTED} vmath2 op {op} not yet lowered to PTX"
+                    ));
+                }
+            }
+            CoopKind::ParallelFor if args.len() != 3 => {
+                return Err(format!(
+                    "{UNSUPPORTED} wukong_parallel_for takes 3 args, got {}",
+                    args.len()
+                ));
+            }
+            _ => {}
+        }
+
+        self.emit("bar.sync 0;");
+        match kind {
+            // Cooperative reduction across the whole block; the result is broadcast to every thread.
+            CoopKind::Reduce => {
+                self.emit_helper_call_pred("mrt_sreduce_coop", Some(RC::F32), args, result, false);
+            }
+            // Elementwise: each thread runs the serial `mrt_*` over a contiguous slice of the `n`
+            // elements. `mrt_vmath`(x,out,n,op) / `mrt_vmath2`(a,b,out,n,op) / `mrt_velem`(x,y,out,n,
+            // a,b,c,op). The vmath INPUT is f32 (4 B) or bf16/f16 storage (2 B), but its OUTPUT is
+            // *always* f32 (4 B) â€” the activation result is computed and stored in f32 â€” so the two
+            // pointers can have different per-element strides (a 2/4 mismatch was a misaligned store).
+            CoopKind::Vmath => {
+                // Keyed on the f32 family (`wukong_vmath_f32` and its `_parallel` twin), NOT on the
+                // one exact serial spelling: giving an f32 input buffer the bf16 2-byte stride would
+                // walk each thread's chunk over the wrong half of the array.
+                let in_esz = if name.starts_with("wukong_vmath_f32") {
+                    4
+                } else {
+                    2
+                };
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    2,
+                    &[(0, Stride::Const(in_esz)), (1, Stride::Const(4))],
+                );
+            }
+            CoopKind::Vmath2 => {
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    3,
+                    &[
+                        (0, Stride::Const(4)),
+                        (1, Stride::Const(4)),
+                        (2, Stride::Const(4)),
+                    ],
+                );
+            }
+            CoopKind::Velem => {
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    3,
+                    &[
+                        (0, Stride::Const(4)),
+                        (1, Stride::Const(4)),
+                        (2, Stride::Const(4)),
+                    ],
+                );
+            }
+            // GEMM: the output rows are independent, so chunk `m` (rows). C[i,:] = A[i,:]Â·Báµ€ (+epi):
+            // each thread owns a contiguous A-row / C-row block; B / bias / beta / act are shared. A-row
+            // = `k` elems, C-row = `n` elems. (a=0, b=1, c=2, m=3, k=4, n=5, ...)
+            CoopKind::Gemm | CoopKind::GemmNt | CoopKind::GemmNtEpi => {
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    3,
+                    &[(0, Stride::Arg(4, 4)), (2, Stride::Arg(5, 4))],
+                );
+            }
+            // int8 GEMM: A rows are u8 (`k`*1 B), C rows are i32 (`n`*4 B).
+            CoopKind::I8GemmNt => {
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    3,
+                    &[(0, Stride::Arg(4, 1)), (2, Stride::Arg(5, 4))],
+                );
+            }
+            // Row-wise norm: each row's softmax/LayerNorm/RMSNorm is independent -> chunk `rows`.
+            // (x=0, out=1, rows=2, cols=3, ...); each row is `cols` f32.
+            CoopKind::Norm => {
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    2,
+                    &[(0, Stride::Arg(3, 4)), (1, Stride::Arg(3, 4))],
+                );
+            }
+            // Affine norm: (x=0, out=1, gamma=2, beta=3, rows=4, cols=5, ...); gamma/beta are
+            // per-column (shared across rows), so only x/out are row-offset by `cols`*4 B.
+            CoopKind::NormAffine => {
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
+                self.emit_chunked_call(
+                    h.ptx_name,
+                    h.ret,
+                    args,
+                    result,
+                    4,
+                    &[(0, Stride::Arg(5, 4)), (1, Stride::Arg(5, 4))],
+                );
+            }
+            // The generic `@parallel` outline: a grid-stride loop over the independent domain.
+            CoopKind::ParallelFor => self.emit_parallel_for_gridstride(args)?,
+            // Serial on `tid==0` over the shared frame (correct; cooperative bodies land later for
+            // the remaining ops â€” e.g. axpby).
+            _ => {
+                let h = rt_helper(name).ok_or_else(|| {
+                    format!("{UNSUPPORTED} no device helper for recognized op `{name}`")
+                })?;
+                self.emit_helper_call_pred(h.ptx_name, h.ret, args, result, true);
+            }
+        }
+        self.emit("bar.sync 0;");
+        Ok(())
+    }
+
+    /// **Grid-stride lowering of `wukong_parallel_for(n, func_addr F, ctx)`** (mega mode) â€” the
+    /// `@parallel` half of Phase 1.
+    ///
+    /// Iteration `i` runs on the thread with flat id `i mod stride`, where
+    /// `stride = blockDim.x * gridDim.x`, as the one-iteration chunk `F(i, i+1, ctx)`:
+    ///
+    /// ```text
+    /// for (i = threadIdx.x + blockIdx.x*blockDim.x; i < n; i += blockDim.x*gridDim.x)
+    ///     F(i, i+1, ctx);
+    /// ```
+    ///
+    /// **Why per-iteration chunks and not one contiguous range per thread.** Both partitions are
+    /// legal (see `fusion::parallel_for_is_cooperative` for what makes any partition legal), and a
+    /// contiguous range would be one call per thread instead of one per iteration. But neighbouring
+    /// *threads* would then touch addresses `chunk` elements apart, which is the uncoalesced access
+    /// pattern; with the grid-stride interleave, lane `t` and lane `t+1` of a warp read adjacent
+    /// elements, which is what a hand-written CUDA elementwise kernel does and the only shape that
+    /// can approach memory throughput. The cost is a `.func` call per iteration, and buying
+    /// coalescing with it is the right trade on a memory-bound loop; a compute-bound body would
+    /// prefer the other partition, which is a scheduling decision this phase does not have a place
+    /// to record yet.
+    ///
+    /// **Why the trip count is uniform.** The loop runs `ceil(n/stride)` times on *every* thread and
+    /// the tail is absorbed by passing an empty range (`hi = min(i+1, n)`, so `hi <= lo` once
+    /// `i >= n`, and the callee's `lo..hi` loop body never executes) rather than by exiting early.
+    /// A `call.uni` inside a region some threads have left is undefined, and every other call this
+    /// file emits is `call.uni`; keeping the loop convergent keeps that one convention instead of
+    /// introducing a divergent-call rule for one op. `n <= 0` skips the loop outright â€” computing
+    /// `ceil(n/stride)` unsigned on a negative `n` would spin ~2^64 times over empty ranges.
+    ///
+    /// The caller (`lower_call_mega`) brackets this with `bar.sync`, which is what makes the ctx
+    /// struct written by `tid==0` visible to every thread before the first call, and the results
+    /// visible to whatever `tid==0` reads next.
+    fn emit_parallel_for_gridstride(&mut self, args: &[ValueId]) -> Result<(), String> {
+        let sym = self.func_addr_of.get(&args[1].0).copied().ok_or_else(|| {
+            format!("{UNSUPPORTED} wukong_parallel_for target is not a func_addr")
+        })?;
+        let idx = *self.func_idx.get(&sym).ok_or_else(|| {
+            format!(
+                "{UNSUPPORTED} wukong_parallel_for target `{}` is not a known function",
+                self.interner.resolve(sym)
+            )
+        })?;
+        let n = self.reg(args[0]);
+        let ctx = self.reg(args[2]);
+
+        // stride = ntid.x * nctaid.x ; i = tid.x + ctaid.x*ntid.x   (both 64-bit)
+        let tid32 = self.fresh_r32();
+        let ntid32 = self.fresh_r32();
+        let ctaid32 = self.fresh_r32();
+        let nctaid32 = self.fresh_r32();
+        self.emit(&format!("mov.u32 {tid32}, %tid.x;"));
+        self.emit(&format!("mov.u32 {ntid32}, %ntid.x;"));
+        self.emit(&format!("mov.u32 {ctaid32}, %ctaid.x;"));
+        self.emit(&format!("mov.u32 {nctaid32}, %nctaid.x;"));
+        let i = self.fresh(RC::Rd);
+        let stride = self.fresh(RC::Rd);
+        let t = self.fresh(RC::Rd);
+        self.emit(&format!("cvt.u64.u32 {i}, {tid32};"));
+        self.emit(&format!("cvt.u64.u32 {stride}, {ntid32};"));
+        self.emit(&format!("cvt.u64.u32 {t}, {ctaid32};"));
+        self.emit(&format!("mul.lo.s64 {t}, {t}, {stride};"));
+        self.emit(&format!("add.s64 {i}, {i}, {t};"));
+        let ncta = self.fresh(RC::Rd);
+        self.emit(&format!("cvt.u64.u32 {ncta}, {nctaid32};"));
+        self.emit(&format!("mul.lo.s64 {stride}, {stride}, {ncta};"));
+
+        let lbl = self.n_lbl;
+        self.n_lbl += 1;
+
+        // Empty domain: nothing to do (and `ceil(n/stride)` unsigned on n<=0 is a ~2^64 trip count).
+        let pempty = self.fresh_pred();
+        self.emit(&format!("setp.le.s64 {pempty}, {n}, 0;"));
+        self.emit(&format!("@{pempty} bra PFOR_END{lbl};"));
+
+        // trip = ceil(n / stride), the same value on every thread.
+        let trip = self.fresh(RC::Rd);
+        self.emit(&format!("add.s64 {trip}, {n}, {stride};"));
+        self.emit(&format!("sub.s64 {trip}, {trip}, 1;"));
+        self.emit(&format!("div.u64 {trip}, {trip}, {stride};"));
+        let c = self.fresh(RC::Rd);
+        self.emit(&format!("mov.b64 {c}, 0;"));
+
+        self.body.push_str(&format!("PFOR{lbl}:\n"));
+        let pdone = self.fresh_pred();
+        self.emit(&format!("setp.ge.s64 {pdone}, {c}, {trip};"));
+        self.emit(&format!("@{pdone} bra PFOR_END{lbl};"));
+        // hi = min(i+1, n): the real one-iteration range, or an empty one on the tail threads.
+        let hi = self.fresh(RC::Rd);
+        self.emit(&format!("add.s64 {hi}, {i}, 1;"));
+        self.emit(&format!("min.s64 {hi}, {hi}, {n};"));
+        let arg_regs = vec![(i.clone(), "b64"), (hi, "b64"), (ctx.clone(), "b64")];
+        self.emit_call_to(idx, &arg_regs, None);
+        self.emit(&format!("add.s64 {i}, {i}, {stride};"));
+        self.emit(&format!("add.s64 {c}, {c}, 1;"));
+        self.emit(&format!("bra PFOR{lbl};"));
+        self.body.push_str(&format!("PFOR_END{lbl}:\n"));
+        Ok(())
+    }
+
+    /// Emit a call to a device-side runtime helper (`mrt_*`): declare a param scope, pass each arg by
+    /// its ABI type, call, and bind the return (if any). Same convention as a user-function call.
+    fn emit_helper_call(
+        &mut self,
+        ptx_name: &str,
+        ret: Option<RC>,
+        args: &[ValueId],
+        result: Option<ValueId>,
+    ) {
+        self.emit_helper_call_pred(ptx_name, ret, args, result, false);
+    }
+
+    /// As [`emit_helper_call`], but when `tid0_guard` the `call.uni` itself is predicated on
+    /// `tid==0` â€” the mega-mode "serial recognized op" path: a single thread runs the naive `mrt_*`
+    /// over the shared frame (bracketed by `bar.sync` at the call site), the rest idle. Arg marshaling
+    /// and result `ld.param` stay unpredicated (per-thread param space; non-zero threads' result is
+    /// discarded by the `tid==0`-guarded store that consumes it).
+    fn emit_helper_call_pred(
+        &mut self,
+        ptx_name: &str,
+        ret: Option<RC>,
+        args: &[ValueId],
+        result: Option<ValueId>,
+        tid0_guard: bool,
+    ) {
+        let arg_regs: Vec<(String, &'static str)> = args
+            .iter()
+            .map(|a| (self.reg(*a), abi_ty(self.func.value_type(*a))))
+            .collect();
+        self.emit_helper_call_regs(ptx_name, ret, &arg_regs, result, tid0_guard);
+    }
+
+    /// As [`emit_helper_call_pred`] but with pre-built `(reg, abi)` argument pairs â€” lets the
+    /// chunked-cooperative path pass *adjusted* pointer/count registers (each thread's sub-range)
+    /// without re-deriving them from `ValueId`s.
+    fn emit_helper_call_regs(
+        &mut self,
+        ptx_name: &str,
+        ret: Option<RC>,
+        arg_regs: &[(String, &'static str)],
+        result: Option<ValueId>,
+        tid0_guard: bool,
+    ) {
+        let g = if tid0_guard {
+            format!("@{} ", self.tid0)
+        } else {
+            String::new()
+        };
+        self.emit("{");
+        for (i, (_, abi)) in arg_regs.iter().enumerate() {
+            self.emit(&format!(".param .{abi} _a{i};"));
+        }
+        if let Some(rc) = ret {
+            self.emit(&format!(".param .{} _r;", mov_ty(rc)));
+        }
+        for (i, (r, abi)) in arg_regs.iter().enumerate() {
+            self.emit(&format!("st.param.{abi} [_a{i}], {r};"));
+        }
+        let mut arglist = String::new();
+        for i in 0..arg_regs.len() {
+            if i > 0 {
+                arglist.push_str(", ");
+            }
+            arglist.push_str(&format!("_a{i}"));
+        }
+        match ret {
+            Some(_) => self.emit(&format!("{g}call.uni (_r), {ptx_name}, ({arglist});")),
+            None => self.emit(&format!("{g}call.uni {ptx_name}, ({arglist});")),
+        }
+        if let (Some(rc), Some(res)) = (ret, result) {
+            let d = self.reg(res);
+            self.emit(&format!("ld.param.{} {d}, [_r];", mov_ty(rc)));
+        }
+        self.emit("}");
+    }
+
+    /// Emit a **chunked-cooperative** call of a recognized op: partition `[0, count)` (the arg at
+    /// `count_idx` â€” elements for elementwise, rows for GEMM/norm) into contiguous per-thread chunks,
+    /// offset each pointer arg in `ptr_strides` (`(arg_idx, Stride)`) by `lo*stride`, and have every
+    /// thread call the *existing serial* `mrt_*` over its own disjoint sub-range. No new kernel, no
+    /// internal barrier (chunks are disjoint), no races; the caller's `bar.sync` bracket orders it
+    /// against neighbours. This is the GPU analogue of `wukong_runtime::parallel_for`'s fixed
+    /// chunking, so it is deterministic and serial==parallel.
+    fn emit_chunked_call(
+        &mut self,
+        ptx_name: &str,
+        ret: Option<RC>,
+        args: &[ValueId],
+        result: Option<ValueId>,
+        count_idx: usize,
+        ptr_strides: &[(usize, Stride)],
+    ) {
+        // tid / ntid as 64-bit.
+        let tid32 = self.fresh_r32();
+        let ntid32 = self.fresh_r32();
+        self.emit(&format!("mov.u32 {tid32}, %tid.x;"));
+        self.emit(&format!("mov.u32 {ntid32}, %ntid.x;"));
+        let tid = self.fresh(RC::Rd);
+        let ntid = self.fresh(RC::Rd);
+        self.emit(&format!("cvt.u64.u32 {tid}, {tid32};"));
+        self.emit(&format!("cvt.u64.u32 {ntid}, {ntid32};"));
+
+        let count = self.reg(args[count_idx]);
+        // chunk = (count + ntid - 1) / ntid   (ceil; count>0, ntid>0)
+        let chunk = self.fresh(RC::Rd);
+        self.emit(&format!("add.s64 {chunk}, {count}, {ntid};"));
+        self.emit(&format!("sub.s64 {chunk}, {chunk}, 1;"));
+        self.emit(&format!("div.u64 {chunk}, {chunk}, {ntid};"));
+        // lo = tid*chunk ; hi = min(lo+chunk, count) ; cnt = max(hi-lo, 0)
+        let lo = self.fresh(RC::Rd);
+        self.emit(&format!("mul.lo.s64 {lo}, {tid}, {chunk};"));
+        let hi = self.fresh(RC::Rd);
+        self.emit(&format!("add.s64 {hi}, {lo}, {chunk};"));
+        self.emit(&format!("min.s64 {hi}, {hi}, {count};"));
+        let cnt = self.fresh(RC::Rd);
+        self.emit(&format!("sub.s64 {cnt}, {hi}, {lo};"));
+        self.emit(&format!("max.s64 {cnt}, {cnt}, 0;"));
+
+        // Build the adjusted argument registers: pointers offset by lo*stride, count replaced by cnt.
+        let mut arg_regs: Vec<(String, &'static str)> = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            if i == count_idx {
+                arg_regs.push((cnt.clone(), "b64"));
+            } else if let Some((_, stride)) = ptr_strides.iter().find(|(idx, _)| *idx == i) {
+                // Per-unit byte stride: a constant, or a runtime dim (`args[d]`) times a constant
+                // (a GEMM row = `k` elements * 4 B, an int8-GEMM A-row = `k` * 1 B, ...).
+                let stride_bytes = match *stride {
+                    Stride::Const(c) => {
+                        let s = self.fresh(RC::Rd);
+                        self.emit(&format!("mov.b64 {s}, {c};"));
+                        s
+                    }
+                    Stride::Arg(d, c) => {
+                        let dim = self.reg(args[d]);
+                        let s = self.fresh(RC::Rd);
+                        self.emit(&format!("mul.lo.s64 {s}, {dim}, {c};"));
+                        s
+                    }
+                };
+                let base = self.reg(*a);
+                let off = self.fresh(RC::Rd);
+                let np = self.fresh(RC::Rd);
+                self.emit(&format!("mul.lo.s64 {off}, {lo}, {stride_bytes};"));
+                self.emit(&format!("add.s64 {np}, {base}, {off};"));
+                arg_regs.push((np, "b64"));
+            } else {
+                arg_regs.push((self.reg(*a), abi_ty(self.func.value_type(*a))));
+            }
+        }
+        self.emit_helper_call_regs(ptx_name, ret, &arg_regs, result, false);
+    }
+
+    fn lower_user_call(
+        &mut self,
+        idx: usize,
+        args: &[ValueId],
+        result: Option<ValueId>,
+    ) -> Result<(), String> {
+        // Snapshot arg regs/types before mutating the builder.
+        let arg_regs: Vec<(String, &'static str)> = args
+            .iter()
+            .map(|a| (self.reg(*a), abi_ty(self.func.value_type(*a))))
+            .collect();
+        self.emit_call_to(idx, &arg_regs, result);
+        Ok(())
+    }
+
+    /// Emit a call to user function `idx` with pre-built `(reg, abi)` arg pairs. Every `mfn_*` takes
+    /// the device context buffer as an implicit leading param (for print/assert/exit), followed by
+    /// the explicit args; the return (if any) is bound into `result`.
+    fn emit_call_to(
+        &mut self,
+        idx: usize,
+        arg_regs: &[(String, &'static str)],
+        result: Option<ValueId>,
+    ) {
+        let callee = &self.program.funcs[idx];
+        let ret = callee.ret.clone();
+        let has_ret = !matches!(ret, MirType::Void);
+        let ctx = self.ctx_reg.clone();
+
+        self.emit("{");
+        self.emit(".param .b64 _pc;");
+        for (i, (_, abi)) in arg_regs.iter().enumerate() {
+            self.emit(&format!(".param .{abi} _p{i};"));
+        }
+        if has_ret {
+            self.emit(&format!(".param .{} _pr;", abi_ty(&ret)));
+        }
+        self.emit(&format!("st.param.b64 [_pc], {ctx};"));
+        for (i, (r, abi)) in arg_regs.iter().enumerate() {
+            self.emit(&format!("st.param.{abi} [_p{i}], {r};"));
+        }
+        let mut arglist = String::from("_pc");
+        for i in 0..arg_regs.len() {
+            arglist.push_str(&format!(", _p{i}"));
+        }
+        if has_ret {
+            self.emit(&format!("call.uni (_pr), mfn_{idx}, ({arglist});"));
+        } else {
+            self.emit(&format!("call.uni mfn_{idx}, ({arglist});"));
+        }
+        if let Some(r) = result {
+            if has_ret {
+                let d = self.reg(r);
+                self.emit(&format!("ld.param.{} {d}, [_pr];", abi_ty(&ret)));
+            }
+        }
+        self.emit("}");
+    }
+
+    fn lower_print(&mut self, args: &[ValueId]) -> Result<(), String> {
+        let arg = *args
+            .first()
+            .ok_or_else(|| format!("{UNSUPPORTED} print with no argument"))?;
+        let aty = self.ty(arg);
+        let (tag, payload) = if aty.is_float() {
+            let f = self.reg(arg);
+            let pl = self.fresh(RC::Rd);
+            if rc_of(&aty) == RC::F32 {
+                let fd = self.fresh(RC::F64);
+                self.emit(&format!("cvt.f64.f32 {fd}, {f};"));
+                self.emit(&format!("mov.b64 {pl}, {fd};"));
+            } else {
+                self.emit(&format!("mov.b64 {pl}, {f};"));
+            }
+            (1u64, pl)
+        } else {
+            (0u64, self.reg(arg))
+        };
+        self.emit_record(tag, &payload);
+        Ok(())
+    }
+
+    /// Append one `(tag, payload)` print record to the context buffer (atomic slot, bounds-guarded).
+    /// In mega mode the whole append is `tid==0`-only: the SPMD threads all compute the *same* record
+    /// (control flow is data-independent), so emitting once preserves byte-identical stdout â€” and the
+    /// atomic counter must advance exactly once, not once per thread.
+    fn emit_record(&mut self, tag: u64, payload: &str) {
+        let ctx = self.ctx_reg.clone();
+        let idx = self.fresh(RC::Rd);
+        let off = self.fresh(RC::Rd);
+        let addr = self.fresh(RC::Rd);
+        let tagr = self.fresh(RC::Rd);
+        let pw = self.fresh_pred();
+        let ag = self.st_guard(); // `@tid0 ` (mega) or empty
+        self.emit(&format!(
+            "{ag}atom.global.add.u64 {idx}, [{ctx}+{CTX_COUNT_OFF}], 1;"
+        ));
+        self.emit(&format!("setp.lt.u64 {pw}, {idx}, {RECORD_CAP};"));
+        if self.mega {
+            // Fold tid0 into the bounds predicate so non-zero threads (whose `idx` is undefined,
+            // having skipped the guarded atomic) never store.
+            self.emit(&format!("and.pred {pw}, {pw}, {};", self.tid0));
+        }
+        self.emit(&format!("mul.lo.s64 {off}, {idx}, {RECORD_BYTES};"));
+        self.emit(&format!("add.s64 {addr}, {ctx}, {off};"));
+        self.emit(&format!("add.s64 {addr}, {addr}, {CTX_RECORDS_OFF};"));
+        self.emit(&format!("mov.b64 {tagr}, {tag};"));
+        self.emit(&format!("@{pw} st.global.u64 [{addr}], {tagr};"));
+        self.emit(&format!("@{pw} st.global.u64 [{addr}+8], {payload};"));
+    }
+
+    fn lower_assert(&mut self, args: &[ValueId]) -> Result<(), String> {
+        let arg = *args
+            .first()
+            .ok_or_else(|| format!("{UNSUPPORTED} assert with no argument"))?;
+        let aty = self.ty(arg);
+        let ctx = self.ctx_reg.clone();
+        let cond = self.reg(arg);
+        let pz = self.fresh_pred();
+        if aty.is_float() {
+            let z = self.fresh(rc_of(&aty));
+            let sfx = float_suffix(&aty);
+            self.emit(&format!(
+                "mov.{sfx} {z}, 0{};",
+                if sfx == "f64" {
+                    "d0000000000000000"
+                } else {
+                    "f00000000"
+                }
+            ));
+            self.emit(&format!("setp.eq.{sfx} {pz}, {cond}, {z};"));
+        } else {
+            self.emit(&format!("setp.eq.s64 {pz}, {cond}, 0;"));
+        }
+        if self.mega {
+            // Only `tid==0` records the (identical, data-independent) assert outcome.
+            self.emit(&format!("and.pred {pz}, {pz}, {};", self.tid0));
+        }
+        let one = self.fresh(RC::Rd);
+        self.emit(&format!("mov.b64 {one}, 1;"));
+        self.emit(&format!(
+            "@{pz} st.global.u64 [{ctx}+{CTX_ASSERT_OFF}], {one};"
+        ));
+        Ok(())
+    }
+
+    // --- terminators ---
+
+    fn lower_term(&mut self, term: &Terminator) -> Result<(), String> {
+        match term {
+            // In mega *entry* mode the kernel writes the exit code into the context exit slot
+            // (`tid==0`) and returns. Mega callees use the ordinary `.func` return path.
+            Terminator::Ret(None) if self.mega && self.mega_entry => {
+                self.emit_mega_exit(None);
+                self.emit("ret;");
+            }
+            Terminator::Ret(Some(v)) if self.mega && self.mega_entry => {
+                let v = *v;
+                self.emit_mega_exit(Some(v));
+                self.emit("ret;");
+            }
+            Terminator::Ret(None) => self.emit("ret;"),
+            Terminator::Ret(Some(v)) => {
+                let abi = abi_ty(self.func.value_type(*v));
+                let r = self.reg(*v);
+                self.emit(&format!("st.param.{abi} [retp], {r};"));
+                self.emit("ret;");
+            }
+            Terminator::Br { target, args } => {
+                self.emit_edge(target.0, args)?;
+                self.emit(&format!("bra BB{};", target.0));
+            }
+            Terminator::CondBr {
+                cond,
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+            } => {
+                let c = self.reg(*cond);
+                let p = self.fresh_pred();
+                let lbl = self.n_lbl;
+                self.n_lbl += 1;
+                self.emit(&format!("setp.ne.s64 {p}, {c}, 0;"));
+                self.emit(&format!("@!{p} bra ELSE{lbl};"));
+                self.emit_edge(then_blk.0, then_args)?;
+                self.emit(&format!("bra BB{};", then_blk.0));
+                self.body.push_str(&format!("ELSE{lbl}:\n"));
+                self.emit_edge(else_blk.0, else_args)?;
+                self.emit(&format!("bra BB{};", else_blk.0));
+            }
+            Terminator::Unreachable => self.emit("trap;"),
+        }
+        Ok(())
+    }
+
+    /// Store the megakernel exit code (the entry's return, truncated to i64) into the context exit
+    /// slot, `tid==0`-only. A void/`None` return exits 0 (matching the single-thread wrapper).
+    fn emit_mega_exit(&mut self, v: Option<ValueId>) {
+        let ctx = self.ctx_reg.clone();
+        let tid0 = self.tid0.clone();
+        let code = self.fresh(RC::Rd);
+        match v {
+            None => self.emit(&format!("mov.b64 {code}, 0;")),
+            Some(v) => {
+                let rc = rc_of(&self.ty(v));
+                let r = self.reg(v);
+                match rc {
+                    RC::Rd => self.emit(&format!("mov.b64 {code}, {r};")),
+                    RC::F32 => self.emit(&format!("cvt.rzi.s64.f32 {code}, {r};")),
+                    RC::F64 => self.emit(&format!("cvt.rzi.s64.f64 {code}, {r};")),
+                }
+            }
+        }
+        self.emit(&format!(
+            "@{tid0} st.global.u64 [{ctx}+{CTX_EXIT_OFF}], {code};"
+        ));
+    }
+
+    /// Realize the block-param convention for one edge: copy each arg into a temp, then each temp into
+    /// the target block's param register. The temp hop makes permuted / self-referential edges safe.
+    ///
+    /// A vector arg travels **lane by lane** into the target param's pre-assigned lane registers
+    /// (see [`assign_vector_block_params`](Self::assign_vector_block_params)) â€” one `mov` per lane,
+    /// through per-lane temps for the same permutation safety.
+    fn emit_edge(&mut self, target: u32, args: &[ValueId]) -> Result<(), String> {
+        if args.is_empty() {
+            return Ok(());
+        }
+        let params: Vec<ValueId> = self.func.blocks[target as usize].params.clone();
+        let mut temps: Vec<Vec<(String, RC)>> = Vec::with_capacity(args.len());
+        for a in args {
+            let ty = self.ty(*a);
+            if ty.is_vector() {
+                let rc = rc_of(ty.lane_type());
+                let lanes = self.lanes(*a)?;
+                let mut ts = Vec::with_capacity(lanes.len());
+                for l in lanes {
+                    let t = self.fresh(rc);
+                    self.emit(&format!("mov.{} {t}, {l};", mov_ty(rc)));
+                    ts.push((t, rc));
+                }
+                temps.push(ts);
+            } else {
+                let rc = rc_of(&ty);
+                let t = self.fresh(rc);
+                let src = self.reg(*a);
+                self.emit(&format!("mov.{} {t}, {src};", mov_ty(rc)));
+                temps.push(vec![(t, rc)]);
+            }
+        }
+        for (p, ts) in params.iter().zip(temps) {
+            if self.ty(*p).is_vector() {
+                let dst = self.lanes(*p)?;
+                if dst.len() != ts.len() {
+                    return Err(format!(
+                        "{UNSUPPORTED} vector edge into BB{target} param v{} carries {} lane(s) \
+                         for a {}-lane param",
+                        p.0,
+                        ts.len(),
+                        dst.len()
+                    ));
+                }
+                for (d, (t, rc)) in dst.iter().zip(ts) {
+                    self.emit(&format!("mov.{} {d}, {t};", mov_ty(rc)));
+                }
+            } else {
+                let (t, rc) = ts[0].clone();
+                let pr = self.reg(*p);
+                self.emit(&format!("mov.{} {pr}, {t};", mov_ty(rc)));
+            }
+        }
+        Ok(())
+    }
+
+    fn coerce_float(&mut self, v: ValueId, want: RC) -> String {
+        let from = rc_of(&self.ty(v));
+        let r = self.reg(v);
+        if from == want {
+            return r;
+        }
+        match (from, want) {
+            (RC::F32, RC::F64) => {
+                let d = self.fresh(RC::F64);
+                self.emit(&format!("cvt.f64.f32 {d}, {r};"));
+                d
+            }
+            (RC::F64, RC::F32) => {
+                let d = self.fresh(RC::F32);
+                self.emit(&format!("cvt.rn.f32.f64 {d}, {r};"));
+                d
+            }
+            // An int operand reaching a float op is a lowering bug upstream; pass through.
+            _ => r,
+        }
+    }
+}
+
+fn float_suffix(t: &MirType) -> &'static str {
+    if matches!(t, MirType::F64) {
+        "f64"
+    } else {
+        "f32"
+    }
+}
+
+fn int_cc(op: CmpOp) -> &'static str {
+    use CmpOp::*;
+    match op {
+        Eq => "eq.s64",
+        Ne => "ne.s64",
+        Slt => "lt.s64",
+        Sle => "le.s64",
+        Sgt => "gt.s64",
+        Sge => "ge.s64",
+        Ult => "lt.u64",
+        Ule => "le.u64",
+        Ugt => "gt.u64",
+        Uge => "ge.u64",
+        _ => unreachable!("float predicate in int_cc"),
+    }
+}
+
+fn float_cc(op: CmpOp) -> &'static str {
+    use CmpOp::*;
+    match op {
+        Foeq => "eq",
+        // The interpreter's `!=` is Rust's (unordered-or-not-equal), so use the unordered form.
+        Fone => "neu",
+        Folt => "lt",
+        Fole => "le",
+        Fogt => "gt",
+        Foge => "ge",
+        _ => unreachable!("int predicate in float_cc"),
+    }
+}
+
+/// The PTX `.func` header (without the trailing body or `;`), shared by the prototype and definition.
+/// Every function takes a hidden `p_ctx` first parameter (the device context buffer) so prints /
+/// asserts anywhere in the call graph reach it.
+fn fn_signature(f: &Function, idx: usize) -> String {
+    let mut s = String::from(".func ");
+    if !matches!(f.ret, MirType::Void) {
+        let _ = write!(s, "(.param .{} retp) ", abi_ty(&f.ret));
+    }
+    let _ = write!(s, "mfn_{idx} (.param .b64 p_ctx");
+    for (i, p) in f.params.iter().enumerate() {
+        let _ = write!(s, ", .param .{} p{i}", abi_ty(f.value_type(*p)));
+    }
+    s.push(')');
+    s
+}
+
+/// The launched entry kernel: load the context pointer, call the entry `.func`, and store its return
+/// value into the context's exit-code slot (`as_int`-truncated for a float entry).
+fn emit_entry_kernel(entry_idx: usize, ret: &MirType) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        ".visible .entry {KERNEL_NAME}(.param .u64 ctxp)\n{{\n"
+    ));
+    s.push_str("    .reg .b64 %rd<4>;\n");
+    match rc_of(ret) {
+        RC::F32 if !matches!(ret, MirType::Void) => s.push_str("    .reg .f32 %f<1>;\n"),
+        RC::F64 if !matches!(ret, MirType::Void) => s.push_str("    .reg .f64 %fd<1>;\n"),
+        _ => {}
+    }
+    s.push_str("    ld.param.u64 %rd0, [ctxp];\n");
+    let has_ret = !matches!(ret, MirType::Void);
+    s.push_str("    {\n");
+    s.push_str("    .param .b64 _pc;\n");
+    if has_ret {
+        s.push_str(&format!("    .param .{} _pr;\n", abi_ty(ret)));
+    }
+    s.push_str("    st.param.b64 [_pc], %rd0;\n");
+    if has_ret {
+        s.push_str(&format!("    call.uni (_pr), mfn_{entry_idx}, (_pc);\n"));
+        match rc_of(ret) {
+            RC::Rd => s.push_str("    ld.param.b64 %rd1, [_pr];\n"),
+            RC::F32 => {
+                s.push_str("    ld.param.f32 %f0, [_pr];\n");
+                s.push_str("    cvt.rzi.s64.f32 %rd1, %f0;\n");
+            }
+            RC::F64 => {
+                s.push_str("    ld.param.f64 %fd0, [_pr];\n");
+                s.push_str("    cvt.rzi.s64.f64 %rd1, %fd0;\n");
+            }
+        }
+    } else {
+        s.push_str(&format!("    call.uni mfn_{entry_idx}, (_pc);\n"));
+        s.push_str("    mov.b64 %rd1, 0;\n");
+    }
+    s.push_str("    }\n");
+    s.push_str("    cvta.to.global.u64 %rd2, %rd0;\n");
+    s.push_str(&format!("    st.global.u64 [%rd2+{CTX_EXIT_OFF}], %rd1;\n"));
+    s.push_str("    ret;\n}\n");
+    s
+}
+
+// ============================================================================================
+// Recognized-kernel device helpers (`mrt_*`)
+//
+// One `.func` per recognized runtime symbol, reproducing the CPU microkernel's numeric contract as
+// a naive single-thread device loop (the host single-thread kernel calls them in place). Op codes
+// and formulas match `wukong_runtime` (reduce/gemm/i8gemm/...); the CPU<->GPU tolerance gate covers
+// reduction-order differences. Each helper is self-contained (no inter-helper calls) and uses
+// function-scoped labels prefixed per kernel so they never collide.
+// ============================================================================================
+
+/// A device helper for a recognized runtime call: its PTX `.func` name, return register class, and
+/// the full `.func` definition text (emitted once per program when the symbol is called). `def` is
+/// owned because the mixed-precision helpers are generated per (op, precision).
+struct RtHelper {
+    ptx_name: &'static str,
+    ret: Option<RC>,
+    def: String,
+}
+
+/// Map a recognized runtime-symbol name to its device helper, or `None` for general lowering.
+fn rt_helper(name: &str) -> Option<RtHelper> {
+    let (ptx_name, ret, def): (&'static str, Option<RC>, String) = match name {
+        "wukong_sreduce_f32" | "wukong_sreduce_f32_parallel" => {
+            ("mrt_sreduce", Some(RC::F32), PTX_SREDUCE.to_string())
+        }
+        "wukong_sgemm_nt" | "wukong_sgemm_nt_parallel" => {
+            ("mrt_sgemm_nt", None, PTX_SGEMM_NT.to_string())
+        }
+        "wukong_sgemm" | "wukong_sgemm_parallel" => ("mrt_sgemm", None, PTX_SGEMM.to_string()),
+        "wukong_i8gemm_nt" | "wukong_i8gemm_nt_parallel" => {
+            ("mrt_i8gemm_nt", None, PTX_I8GEMM_NT.to_string())
+        }
+        "wukong_norm_f32" | "wukong_norm_f32_parallel" => ("mrt_norm", None, PTX_NORM.to_string()),
+        "wukong_norm_affine_f32" | "wukong_norm_affine_f32_parallel" => {
+            ("mrt_norm_affine", None, PTX_NORM_AFFINE.to_string())
+        }
+        "wukong_vmath_f32" | "wukong_vmath_f32_parallel" => {
+            ("mrt_vmath", None, PTX_VMATH.to_string())
+        }
+        "wukong_sgemm_nt_epi" | "wukong_sgemm_nt_epi_parallel" => {
+            ("mrt_sgemm_nt_epi", None, PTX_SGEMM_NT_EPI.to_string())
+        }
+        // Mixed-precision (bf16/f16 storage, f32 compute) â€” generated per precision.
+        "wukong_vmath_bf16" => (
+            "mrt_vmath_bf16",
+            None,
+            ptx_vmath_lowp("mrt_vmath_bf16", "bf16")?,
+        ),
+        "wukong_vmath_f16" => (
+            "mrt_vmath_f16",
+            None,
+            ptx_vmath_lowp("mrt_vmath_f16", "f16")?,
+        ),
+        "wukong_dot_bf16" | "wukong_dot_bf16_parallel" => (
+            "mrt_dot_bf16",
+            Some(RC::F32),
+            ptx_dot_lowp("mrt_dot_bf16", "bf16"),
+        ),
+        "wukong_dot_f16" | "wukong_dot_f16_parallel" => (
+            "mrt_dot_f16",
+            Some(RC::F32),
+            ptx_dot_lowp("mrt_dot_f16", "f16"),
+        ),
+        "wukong_sum_bf16" | "wukong_sum_bf16_parallel" => (
+            "mrt_sum_bf16",
+            Some(RC::F32),
+            ptx_sum_lowp("mrt_sum_bf16", "bf16"),
+        ),
+        "wukong_sum_f16" | "wukong_sum_f16_parallel" => (
+            "mrt_sum_f16",
+            Some(RC::F32),
+            ptx_sum_lowp("mrt_sum_f16", "f16"),
+        ),
+        "wukong_reduce_bf16" | "wukong_reduce_bf16_parallel" => (
+            "mrt_reduce_bf16",
+            Some(RC::F32),
+            ptx_reduce_lowp("mrt_reduce_bf16", "bf16"),
+        ),
+        "wukong_reduce_f16" | "wukong_reduce_f16_parallel" => (
+            "mrt_reduce_f16",
+            Some(RC::F32),
+            ptx_reduce_lowp("mrt_reduce_f16", "f16"),
+        ),
+        "wukong_axpby_bf16" => (
+            "mrt_axpby_bf16",
+            None,
+            ptx_axpby_lowp("mrt_axpby_bf16", "bf16"),
+        ),
+        "wukong_axpby_f16" => (
+            "mrt_axpby_f16",
+            None,
+            ptx_axpby_lowp("mrt_axpby_f16", "f16"),
+        ),
+        // Two-arg transcendentals (pow/atan2/hypot), op-gated in lower_call.
+        "wukong_vmath2_f32" => ("mrt_vmath2", None, PTX_VMATH2.to_string()),
+        // Streaming elementwise act(a*x + b*y + c) (residual add, fused bias/act).
+        "wukong_velem_f32" | "wukong_velem_f32_parallel" => {
+            ("mrt_velem", None, PTX_VELEM.to_string())
+        }
+        _ => return None,
+    };
+    Some(RtHelper { ptx_name, ret, def })
+}
+
+/// Which `wukong_vmath_f32` op codes `mrt_vmath` implements: the full single-arg set 0..=35
+/// (atan(25)/asin(33)/acos(34) use an inline minimax `atan` poly since PTX has no SFU for them).
+fn vmath_supported(op: i128) -> bool {
+    matches!(op, 0..=35)
+}
+
+/// `wukong_sreduce_f32(x, y, n, op) -> f32`: dot(0)/ssd(1)/sum(2)/sumsq(3)/max(4)/min(5)/maxabs(6)/
+/// sumabs(9, Î£|x|)/absdiff(10, Î£|xâˆ’y|). (Codes 7/8 are the arg-reductions â€” a separate `-> i64` ABI â€”
+/// so they never reach here.) Sequential fold (not the CPU's fixed-chunk tree) â€” additive ops differ
+/// only by reduction order (tolerance-gated); max/min/maxabs are order-independent and exact.
+const PTX_SREDUCE: &str = r#".func (.param .f32 _r) mrt_sreduce (.param .b64 px, .param .b64 py, .param .b64 pn, .param .b64 pop)
+{
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<6>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [py];
+    ld.param.u64 %rd2, [pn];
+    ld.param.u64 %rd3, [pop];
+    mov.f32 %f0, 0f00000000;
+    setp.eq.s64 %p0, %rd3, 4;
+    setp.eq.s64 %p1, %rd3, 6;
+    or.pred %p0, %p0, %p1;
+    @%p0 mov.f32 %f0, 0fFF800000;
+    setp.eq.s64 %p1, %rd3, 5;
+    @%p1 mov.f32 %f0, 0f7F800000;
+    mov.b64 %rd4, 0;
+RED_LOOP:
+    setp.ge.s64 %p2, %rd4, %rd2;
+    @%p2 bra RED_DONE;
+    shl.b64 %rd5, %rd4, 2;
+    add.s64 %rd6, %rd0, %rd5;
+    ld.f32 %f1, [%rd6];
+    add.s64 %rd7, %rd1, %rd5;
+    ld.f32 %f2, [%rd7];
+    setp.eq.s64 %p3, %rd3, 0;
+    @%p3 fma.rn.f32 %f0, %f1, %f2, %f0;
+    setp.eq.s64 %p3, %rd3, 1;
+    @%p3 sub.rn.f32 %f3, %f1, %f2;
+    @%p3 fma.rn.f32 %f0, %f3, %f3, %f0;
+    setp.eq.s64 %p3, %rd3, 2;
+    @%p3 add.rn.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 3;
+    @%p3 fma.rn.f32 %f0, %f1, %f1, %f0;
+    setp.eq.s64 %p3, %rd3, 4;
+    @%p3 max.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 5;
+    @%p3 min.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 6;
+    @%p3 abs.f32 %f4, %f1;
+    @%p3 max.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 9;
+    @%p3 abs.f32 %f4, %f1;
+    @%p3 add.rn.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 10;
+    @%p3 sub.rn.f32 %f5, %f1, %f2;
+    @%p3 abs.f32 %f5, %f5;
+    @%p3 add.rn.f32 %f0, %f0, %f5;
+    add.s64 %rd4, %rd4, 1;
+    bra RED_LOOP;
+RED_DONE:
+    st.param.f32 [_r], %f0;
+    ret;
+}
+"#;
+
+/// Block-shared scratch for the cooperative reduction tree (`mrt_sreduce_coop`). One f32 per thread;
+/// 1024 covers the largest block the megakernel launcher uses. Static `.shared` (4 KiB), so the
+/// launch needs no dynamic shared memory.
+const PTX_MEGA_SMEM: &str = ".shared .align 4 .b32 mrt_red_smem[1024];\n";
+
+/// **Cooperative** `wukong_sreduce_f32(x, y, n, op) -> f32` for the megakernel: every thread in the
+/// block folds a `tid`-strided slice of `[0,n)` into a private partial (the *same* per-element op as
+/// the single-thread `mrt_sreduce`), then a fixed shared-memory **tree** combines the partials and
+/// broadcasts the result to all threads. Deterministic (no atomics, M12); the tree's reassociation vs
+/// the sequential fold is covered by the CPU<->GPU tolerance gate. Block size must be a power of two
+/// (the launcher uses 256). Combine: add for the additive ops dot/ssd/sum/sumsq (op<4) *and*
+/// sumabs/absdiff (op>=9), max for max/maxabs, min for min.
+const PTX_SREDUCE_COOP: &str = r#".func (.param .f32 _r) mrt_sreduce_coop (.param .b64 px, .param .b64 py, .param .b64 pn, .param .b64 pop)
+{
+    .reg .b64 %rd<12>;
+    .reg .b32 %r<10>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<8>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [py];
+    ld.param.u64 %rd2, [pn];
+    ld.param.u64 %rd3, [pop];
+    mov.u32 %r0, %tid.x;
+    mov.u32 %r1, %ntid.x;
+    cvt.u64.u32 %rd4, %r0;
+    cvt.u64.u32 %rd5, %r1;
+    mov.f32 %f0, 0f00000000;
+    setp.eq.s64 %p0, %rd3, 4;
+    setp.eq.s64 %p1, %rd3, 6;
+    or.pred %p0, %p0, %p1;
+    @%p0 mov.f32 %f0, 0fFF800000;
+    setp.eq.s64 %p1, %rd3, 5;
+    @%p1 mov.f32 %f0, 0f7F800000;
+RC_LOOP:
+    setp.ge.s64 %p2, %rd4, %rd2;
+    @%p2 bra RC_DONE;
+    shl.b64 %rd6, %rd4, 2;
+    add.s64 %rd7, %rd0, %rd6;
+    ld.f32 %f1, [%rd7];
+    add.s64 %rd8, %rd1, %rd6;
+    ld.f32 %f2, [%rd8];
+    setp.eq.s64 %p3, %rd3, 0;
+    @%p3 fma.rn.f32 %f0, %f1, %f2, %f0;
+    setp.eq.s64 %p3, %rd3, 1;
+    @%p3 sub.rn.f32 %f3, %f1, %f2;
+    @%p3 fma.rn.f32 %f0, %f3, %f3, %f0;
+    setp.eq.s64 %p3, %rd3, 2;
+    @%p3 add.rn.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 3;
+    @%p3 fma.rn.f32 %f0, %f1, %f1, %f0;
+    setp.eq.s64 %p3, %rd3, 4;
+    @%p3 max.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 5;
+    @%p3 min.f32 %f0, %f0, %f1;
+    setp.eq.s64 %p3, %rd3, 6;
+    @%p3 abs.f32 %f4, %f1;
+    @%p3 max.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 9;
+    @%p3 abs.f32 %f4, %f1;
+    @%p3 add.rn.f32 %f0, %f0, %f4;
+    setp.eq.s64 %p3, %rd3, 10;
+    @%p3 sub.rn.f32 %f4, %f1, %f2;
+    @%p3 abs.f32 %f4, %f4;
+    @%p3 add.rn.f32 %f0, %f0, %f4;
+    add.s64 %rd4, %rd4, %rd5;
+    bra RC_LOOP;
+RC_DONE:
+    shl.b32 %r2, %r0, 2;
+    mov.u32 %r3, mrt_red_smem;
+    add.s32 %r4, %r3, %r2;
+    st.shared.f32 [%r4], %f0;
+    bar.sync 0;
+    shr.u32 %r5, %r1, 1;
+RC_TREE:
+    setp.eq.s32 %p4, %r5, 0;
+    @%p4 bra RC_TREE_DONE;
+    setp.lt.u32 %p5, %r0, %r5;
+    @!%p5 bra RC_TREE_SYNC;
+    ld.shared.f32 %f5, [%r4];
+    add.u32 %r6, %r0, %r5;
+    shl.b32 %r6, %r6, 2;
+    add.u32 %r7, %r3, %r6;
+    ld.shared.f32 %f6, [%r7];
+    setp.eq.s64 %p6, %rd3, 4;
+    setp.eq.s64 %p7, %rd3, 6;
+    or.pred %p6, %p6, %p7;
+    @%p6 max.f32 %f5, %f5, %f6;
+    setp.eq.s64 %p7, %rd3, 5;
+    @%p7 min.f32 %f5, %f5, %f6;
+    setp.lt.s64 %p6, %rd3, 4;
+    setp.ge.s64 %p7, %rd3, 9;
+    or.pred %p6, %p6, %p7;
+    @%p6 add.rn.f32 %f5, %f5, %f6;
+    st.shared.f32 [%r4], %f5;
+RC_TREE_SYNC:
+    bar.sync 0;
+    shr.u32 %r5, %r5, 1;
+    bra RC_TREE;
+RC_TREE_DONE:
+    mov.u32 %r8, mrt_red_smem;
+    ld.shared.f32 %f0, [%r8];
+    st.param.f32 [_r], %f0;
+    ret;
+}
+"#;
+
+/// `wukong_sgemm_nt(a, b, c, m, k, n, beta)`: `C[i*n+j] = sum_p A[i*k+p]*B[j*k+p]`; `beta != 0`
+/// accumulates into the existing C (B is row-major `[n,k]`, i.e. transposed â€” the nn.Linear form).
+const PTX_SGEMM_NT: &str = r#".func mrt_sgemm_nt (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn, .param .b64 pbeta)
+{
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [pa];
+    ld.param.u64 %rd1, [pb];
+    ld.param.u64 %rd2, [pc];
+    ld.param.u64 %rd3, [pm];
+    ld.param.u64 %rd4, [pk];
+    ld.param.u64 %rd5, [pn];
+    ld.param.u64 %rd6, [pbeta];
+    mov.b64 %rd7, 0;
+SNT_LI:
+    setp.ge.s64 %p0, %rd7, %rd3;
+    @%p0 bra SNT_EI;
+    mov.b64 %rd8, 0;
+SNT_LJ:
+    setp.ge.s64 %p1, %rd8, %rd5;
+    @%p1 bra SNT_EJ;
+    mov.f32 %f0, 0f00000000;
+    mul.lo.s64 %rd9, %rd7, %rd4;
+    shl.b64 %rd9, %rd9, 2;
+    add.s64 %rd9, %rd0, %rd9;
+    mul.lo.s64 %rd10, %rd8, %rd4;
+    shl.b64 %rd10, %rd10, 2;
+    add.s64 %rd10, %rd1, %rd10;
+    mov.b64 %rd11, 0;
+SNT_LL:
+    setp.ge.s64 %p2, %rd11, %rd4;
+    @%p2 bra SNT_EL;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    add.s64 %rd14, %rd10, %rd12;
+    ld.f32 %f2, [%rd14];
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.s64 %rd11, %rd11, 1;
+    bra SNT_LL;
+SNT_EL:
+    mul.lo.s64 %rd15, %rd7, %rd5;
+    add.s64 %rd15, %rd15, %rd8;
+    shl.b64 %rd15, %rd15, 2;
+    add.s64 %rd15, %rd2, %rd15;
+    setp.eq.s64 %p3, %rd6, 0;
+    @%p3 bra SNT_ST;
+    ld.f32 %f3, [%rd15];
+    add.rn.f32 %f0, %f0, %f3;
+SNT_ST:
+    st.f32 [%rd15], %f0;
+    add.s64 %rd8, %rd8, 1;
+    bra SNT_LJ;
+SNT_EJ:
+    add.s64 %rd7, %rd7, 1;
+    bra SNT_LI;
+SNT_EI:
+    ret;
+}
+"#;
+
+/// `wukong_sgemm(a, b, c, m, k, n, beta)`: `C[i*n+j] = sum_p A[i*k+p]*B[p*n+j]`; `beta != 0`
+/// accumulates (both A `[m,k]` and B `[k,n]` row-major).
+const PTX_SGEMM: &str = r#".func mrt_sgemm (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn, .param .b64 pbeta)
+{
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [pa];
+    ld.param.u64 %rd1, [pb];
+    ld.param.u64 %rd2, [pc];
+    ld.param.u64 %rd3, [pm];
+    ld.param.u64 %rd4, [pk];
+    ld.param.u64 %rd5, [pn];
+    ld.param.u64 %rd6, [pbeta];
+    mov.b64 %rd7, 0;
+SM_LI:
+    setp.ge.s64 %p0, %rd7, %rd3;
+    @%p0 bra SM_EI;
+    mov.b64 %rd8, 0;
+SM_LJ:
+    setp.ge.s64 %p1, %rd8, %rd5;
+    @%p1 bra SM_EJ;
+    mov.f32 %f0, 0f00000000;
+    mul.lo.s64 %rd9, %rd7, %rd4;
+    shl.b64 %rd9, %rd9, 2;
+    add.s64 %rd9, %rd0, %rd9;
+    mov.b64 %rd11, 0;
+SM_LL:
+    setp.ge.s64 %p2, %rd11, %rd4;
+    @%p2 bra SM_EL;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    mul.lo.s64 %rd14, %rd11, %rd5;
+    add.s64 %rd14, %rd14, %rd8;
+    shl.b64 %rd14, %rd14, 2;
+    add.s64 %rd14, %rd1, %rd14;
+    ld.f32 %f2, [%rd14];
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.s64 %rd11, %rd11, 1;
+    bra SM_LL;
+SM_EL:
+    mul.lo.s64 %rd15, %rd7, %rd5;
+    add.s64 %rd15, %rd15, %rd8;
+    shl.b64 %rd15, %rd15, 2;
+    add.s64 %rd15, %rd2, %rd15;
+    setp.eq.s64 %p3, %rd6, 0;
+    @%p3 bra SM_ST;
+    ld.f32 %f3, [%rd15];
+    add.rn.f32 %f0, %f0, %f3;
+SM_ST:
+    st.f32 [%rd15], %f0;
+    add.s64 %rd8, %rd8, 1;
+    bra SM_LJ;
+SM_EJ:
+    add.s64 %rd7, %rd7, 1;
+    bra SM_LI;
+SM_EI:
+    ret;
+}
+"#;
+
+/// `wukong_i8gemm_nt(a, b, c, m, k, n)`: `C[i*n+j] = sum_p (u8 A[i*k+p]) * (i8 B[j*k+p])`, exact
+/// i32 (wrapping mod 2^32). A is `u8 [m,k]`, B is `i8 [n,k]`, C is `i32 [m,n]`.
+const PTX_I8GEMM_NT: &str = r#".func mrt_i8gemm_nt (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn)
+{
+    .reg .b64 %rd<24>;
+    .reg .b32 %r<8>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [pa];
+    ld.param.u64 %rd1, [pb];
+    ld.param.u64 %rd2, [pc];
+    ld.param.u64 %rd3, [pm];
+    ld.param.u64 %rd4, [pk];
+    ld.param.u64 %rd5, [pn];
+    mov.b64 %rd6, 0;
+I8_LI:
+    setp.ge.s64 %p0, %rd6, %rd3;
+    @%p0 bra I8_EI;
+    mov.b64 %rd7, 0;
+I8_LJ:
+    setp.ge.s64 %p1, %rd7, %rd5;
+    @%p1 bra I8_EJ;
+    mov.b32 %r0, 0;
+    mul.lo.s64 %rd8, %rd6, %rd4;
+    add.s64 %rd8, %rd0, %rd8;
+    mul.lo.s64 %rd9, %rd7, %rd4;
+    add.s64 %rd9, %rd1, %rd9;
+    mov.b64 %rd10, 0;
+I8_LL:
+    setp.ge.s64 %p2, %rd10, %rd4;
+    @%p2 bra I8_EL;
+    add.s64 %rd11, %rd8, %rd10;
+    ld.u8 %r1, [%rd11];
+    add.s64 %rd12, %rd9, %rd10;
+    ld.s8 %r2, [%rd12];
+    mad.lo.s32 %r0, %r1, %r2, %r0;
+    add.s64 %rd10, %rd10, 1;
+    bra I8_LL;
+I8_EL:
+    mul.lo.s64 %rd13, %rd6, %rd5;
+    add.s64 %rd13, %rd13, %rd7;
+    shl.b64 %rd13, %rd13, 2;
+    add.s64 %rd13, %rd2, %rd13;
+    st.u32 [%rd13], %r0;
+    add.s64 %rd7, %rd7, 1;
+    bra I8_LJ;
+I8_EJ:
+    add.s64 %rd6, %rd6, 1;
+    bra I8_LI;
+I8_EI:
+    ret;
+}
+"#;
+
+/// `wukong_norm_f32(x, out, rows, cols, eps_bits, op)`: row-wise softmax(0)/layernorm(1)/rmsnorm(2)/
+/// log-softmax(3)/l2norm(4) over an `[rows, cols]` matrix. `exp` uses the SFU `ex2.approx` and `log`
+/// uses `lg2.approxÂ·ln2` (both match the offload path; the CPU oracle's Cephes `exp`/`log` differ by
+/// <~1e-6, inside the tolerance gate). `eps_bits` is the f32 bits of epsilon (used by layernorm/
+/// rmsnorm/l2norm; softmax/log-softmax ignore it). Sequential per-row reductions (CPU uses an 8-lane
+/// tree) â€” tolerance-gated. Ops 0..=3 branch explicitly and 4 (l2norm) is the *default* arm, so no op
+/// falls into the wrong body â€” but the arm is a bare `bra`, not an equality test: extending the
+/// recognizer past code 4 must add a branch here (and an op gate in `lower_call`, which currently
+/// gates only vmath/vmath2) or the new code would silently run l2norm.
+const PTX_NORM: &str = r#".func mrt_norm (.param .b64 px, .param .b64 pout, .param .b64 prows, .param .b64 pcols, .param .b64 peps, .param .b64 pop)
+{
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b32 %r<4>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pout];
+    ld.param.u64 %rd2, [prows];
+    ld.param.u64 %rd3, [pcols];
+    ld.param.u64 %rd4, [peps];
+    ld.param.u64 %rd5, [pop];
+    cvt.u32.u64 %r0, %rd4;
+    mov.b32 %f15, %r0;
+    mov.b64 %rd6, 0;
+NORM_ROW:
+    setp.ge.s64 %p0, %rd6, %rd2;
+    @%p0 bra NORM_DONE;
+    mul.lo.s64 %rd7, %rd6, %rd3;
+    shl.b64 %rd8, %rd7, 2;
+    add.s64 %rd9, %rd0, %rd8;
+    add.s64 %rd10, %rd1, %rd8;
+    setp.eq.s64 %p1, %rd5, 0;
+    @%p1 bra NORM_SM;
+    setp.eq.s64 %p1, %rd5, 1;
+    @%p1 bra NORM_LN;
+    setp.eq.s64 %p1, %rd5, 2;
+    @%p1 bra NORM_RMS;
+    setp.eq.s64 %p1, %rd5, 3;
+    @%p1 bra NORM_LS;
+    bra NORM_L2;
+NORM_SM:
+    mov.f32 %f0, 0fFF800000;
+    mov.b64 %rd11, 0;
+SM_MAX:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra SM_MAXE;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    max.f32 %f0, %f0, %f1;
+    add.s64 %rd11, %rd11, 1;
+    bra SM_MAX;
+SM_MAXE:
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+SM_EXP:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra SM_EXPE;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    sub.f32 %f3, %f1, %f0;
+    mul.f32 %f3, %f3, 0f3FB8AA3B;
+    ex2.approx.f32 %f4, %f3;
+    add.s64 %rd14, %rd10, %rd12;
+    st.f32 [%rd14], %f4;
+    add.f32 %f2, %f2, %f4;
+    add.s64 %rd11, %rd11, 1;
+    bra SM_EXP;
+SM_EXPE:
+    mov.f32 %f6, 0f3F800000;
+    div.rn.f32 %f5, %f6, %f2;
+    mov.b64 %rd11, 0;
+SM_NORM:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra NORM_NEXT;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd14, %rd10, %rd12;
+    ld.f32 %f4, [%rd14];
+    mul.f32 %f4, %f4, %f5;
+    st.f32 [%rd14], %f4;
+    add.s64 %rd11, %rd11, 1;
+    bra SM_NORM;
+NORM_LN:
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+LN_S1:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra LN_S1E;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    add.f32 %f2, %f2, %f1;
+    add.s64 %rd11, %rd11, 1;
+    bra LN_S1;
+LN_S1E:
+    cvt.rn.f32.s64 %f7, %rd3;
+    div.rn.f32 %f8, %f2, %f7;
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+LN_S2:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra LN_S2E;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    sub.f32 %f3, %f1, %f8;
+    fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.s64 %rd11, %rd11, 1;
+    bra LN_S2;
+LN_S2E:
+    div.rn.f32 %f9, %f2, %f7;
+    add.f32 %f9, %f9, %f15;
+    sqrt.rn.f32 %f9, %f9;
+    mov.f32 %f6, 0f3F800000;
+    div.rn.f32 %f10, %f6, %f9;
+    mov.b64 %rd11, 0;
+LN_S3:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra NORM_NEXT;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    sub.f32 %f3, %f1, %f8;
+    mul.f32 %f3, %f3, %f10;
+    add.s64 %rd14, %rd10, %rd12;
+    st.f32 [%rd14], %f3;
+    add.s64 %rd11, %rd11, 1;
+    bra LN_S3;
+NORM_RMS:
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+RMS_S1:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra RMS_S1E;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    fma.rn.f32 %f2, %f1, %f1, %f2;
+    add.s64 %rd11, %rd11, 1;
+    bra RMS_S1;
+RMS_S1E:
+    cvt.rn.f32.s64 %f7, %rd3;
+    div.rn.f32 %f9, %f2, %f7;
+    add.f32 %f9, %f9, %f15;
+    sqrt.rn.f32 %f9, %f9;
+    mov.f32 %f6, 0f3F800000;
+    div.rn.f32 %f10, %f6, %f9;
+    mov.b64 %rd11, 0;
+RMS_S3:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra NORM_NEXT;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    mul.f32 %f3, %f1, %f10;
+    add.s64 %rd14, %rd10, %rd12;
+    st.f32 [%rd14], %f3;
+    add.s64 %rd11, %rd11, 1;
+    bra RMS_S3;
+NORM_LS:
+    mov.f32 %f0, 0fFF800000;
+    mov.b64 %rd11, 0;
+LS_MAX:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra LS_MAXE;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    max.f32 %f0, %f0, %f1;
+    add.s64 %rd11, %rd11, 1;
+    bra LS_MAX;
+LS_MAXE:
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+LS_EXP:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra LS_EXPE;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    sub.f32 %f3, %f1, %f0;
+    mul.f32 %f3, %f3, 0f3FB8AA3B;
+    ex2.approx.f32 %f4, %f3;
+    add.f32 %f2, %f2, %f4;
+    add.s64 %rd11, %rd11, 1;
+    bra LS_EXP;
+LS_EXPE:
+    lg2.approx.f32 %f5, %f2;
+    mul.f32 %f5, %f5, 0f3F317218;
+    add.f32 %f6, %f0, %f5;
+    mov.b64 %rd11, 0;
+LS_OUT:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra NORM_NEXT;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    sub.f32 %f3, %f1, %f6;
+    add.s64 %rd14, %rd10, %rd12;
+    st.f32 [%rd14], %f3;
+    add.s64 %rd11, %rd11, 1;
+    bra LS_OUT;
+NORM_L2:
+    mov.f32 %f2, 0f00000000;
+    mov.b64 %rd11, 0;
+L2_S1:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra L2_S1E;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    fma.rn.f32 %f2, %f1, %f1, %f2;
+    add.s64 %rd11, %rd11, 1;
+    bra L2_S1;
+L2_S1E:
+    add.f32 %f9, %f2, %f15;
+    sqrt.rn.f32 %f9, %f9;
+    mov.f32 %f6, 0f3F800000;
+    div.rn.f32 %f10, %f6, %f9;
+    mov.b64 %rd11, 0;
+L2_S3:
+    setp.ge.s64 %p2, %rd11, %rd3;
+    @%p2 bra NORM_NEXT;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    mul.f32 %f3, %f1, %f10;
+    add.s64 %rd14, %rd10, %rd12;
+    st.f32 [%rd14], %f3;
+    add.s64 %rd11, %rd11, 1;
+    bra L2_S3;
+NORM_NEXT:
+    add.s64 %rd6, %rd6, 1;
+    bra NORM_ROW;
+NORM_DONE:
+    ret;
+}
+"#;
+
+/// `wukong_norm_affine_f32(x, out, gamma, beta, rows, cols, eps_bits, op)`: per-row LayerNorm(1)/
+/// RMSNorm(2) with an affine writeback `out = normÂ·g + b`, where `g = gamma[col]` (1.0 if gamma is
+/// null) and `b = beta[col]` (0.0 if beta is null) â€” gamma/beta arrive as integer 0 when absent.
+/// (Softmax is never affine, so only op 1/2 reach here.) eps is the low 32 bits of `eps_bits`.
+const PTX_NORM_AFFINE: &str = r#".func mrt_norm_affine (.param .b64 px, .param .b64 pout, .param .b64 pgamma, .param .b64 pbeta, .param .b64 prows, .param .b64 pcols, .param .b64 peps, .param .b64 pop)
+{
+    .reg .b64 %rd<18>;
+    .reg .f32 %f<16>;
+    .reg .b32 %r<3>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pout];
+    ld.param.u64 %rd2, [pgamma];
+    ld.param.u64 %rd3, [pbeta];
+    ld.param.u64 %rd4, [prows];
+    ld.param.u64 %rd5, [pcols];
+    ld.param.u64 %rd6, [peps];
+    ld.param.u64 %rd7, [pop];
+    cvt.u32.u64 %r0, %rd6;
+    mov.b32 %f0, %r0;
+    cvt.rn.f32.s64 %f1, %rd5;
+    mov.b64 %rd8, 0;
+NA_ROW:
+    setp.ge.s64 %p0, %rd8, %rd4;
+    @%p0 bra NA_DONE;
+    mul.lo.s64 %rd9, %rd8, %rd5;
+    shl.b64 %rd10, %rd9, 2;
+    add.s64 %rd11, %rd0, %rd10;
+    add.s64 %rd12, %rd1, %rd10;
+    setp.eq.s64 %p1, %rd7, 1;
+    @%p1 bra NA_LN;
+    bra NA_RMS;
+NA_LN:
+    mov.f32 %f2, 0f00000000; mov.b64 %rd13, 0;
+LNA1:
+    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra LNA1E;
+    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;
+    ld.f32 %f3, [%rd15]; add.f32 %f2, %f2, %f3;
+    add.s64 %rd13, %rd13, 1; bra LNA1;
+LNA1E:
+    div.rn.f32 %f4, %f2, %f1;
+    mov.f32 %f2, 0f00000000; mov.b64 %rd13, 0;
+LNA2:
+    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra LNA2E;
+    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;
+    ld.f32 %f3, [%rd15]; sub.f32 %f3, %f3, %f4; fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.s64 %rd13, %rd13, 1; bra LNA2;
+LNA2E:
+    div.rn.f32 %f5, %f2, %f1; add.f32 %f5, %f5, %f0; sqrt.rn.f32 %f5, %f5;
+    mov.f32 %f6, 0f3F800000; div.rn.f32 %f5, %f6, %f5;
+    mov.b64 %rd13, 0;
+LNA3:
+    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra NA_NEXT;
+    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;
+    ld.f32 %f3, [%rd15]; sub.f32 %f3, %f3, %f4; mul.f32 %f3, %f3, %f5;
+    mov.f32 %f7, 0f3F800000; setp.ne.s64 %p3, %rd2, 0;
+    @%p3 add.s64 %rd16, %rd2, %rd14; @%p3 ld.f32 %f7, [%rd16];
+    mov.f32 %f8, 0f00000000; setp.ne.s64 %p3, %rd3, 0;
+    @%p3 add.s64 %rd16, %rd3, %rd14; @%p3 ld.f32 %f8, [%rd16];
+    fma.rn.f32 %f3, %f3, %f7, %f8;
+    add.s64 %rd16, %rd12, %rd14; st.f32 [%rd16], %f3;
+    add.s64 %rd13, %rd13, 1; bra LNA3;
+NA_RMS:
+    mov.f32 %f2, 0f00000000; mov.b64 %rd13, 0;
+RMA1:
+    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra RMA1E;
+    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;
+    ld.f32 %f3, [%rd15]; fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.s64 %rd13, %rd13, 1; bra RMA1;
+RMA1E:
+    div.rn.f32 %f5, %f2, %f1; add.f32 %f5, %f5, %f0; sqrt.rn.f32 %f5, %f5;
+    mov.f32 %f6, 0f3F800000; div.rn.f32 %f5, %f6, %f5;
+    mov.b64 %rd13, 0;
+RMA3:
+    setp.ge.s64 %p2, %rd13, %rd5; @%p2 bra NA_NEXT;
+    shl.b64 %rd14, %rd13, 2; add.s64 %rd15, %rd11, %rd14;
+    ld.f32 %f3, [%rd15]; mul.f32 %f3, %f3, %f5;
+    mov.f32 %f7, 0f3F800000; setp.ne.s64 %p3, %rd2, 0;
+    @%p3 add.s64 %rd16, %rd2, %rd14; @%p3 ld.f32 %f7, [%rd16];
+    mov.f32 %f8, 0f00000000; setp.ne.s64 %p3, %rd3, 0;
+    @%p3 add.s64 %rd16, %rd3, %rd14; @%p3 ld.f32 %f8, [%rd16];
+    fma.rn.f32 %f3, %f3, %f7, %f8;
+    add.s64 %rd16, %rd12, %rd14; st.f32 [%rd16], %f3;
+    add.s64 %rd13, %rd13, 1; bra RMA3;
+NA_NEXT:
+    add.s64 %rd8, %rd8, 1; bra NA_ROW;
+NA_DONE:
+    ret;
+}
+"#;
+
+/// `wukong_vmath_f32(x, out, n, op)`: elementwise activation, dispatched on the compile-time op
+/// code (gated by `vmath_supported`). Transcendentals use the SFU (`ex2.approx`/`lg2.approx`/
+/// `sin.approx`/`cos.approx`) and the same closed forms as the CPU kernel; the CPU<->GPU tolerance
+/// gate covers the SFU-vs-Cephes difference (the offload path uses the identical SFU formulas).
+const PTX_VMATH: &str = r#".func mrt_vmath (.param .b64 px, .param .b64 pout, .param .b64 pn, .param .b64 pop)
+{
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<12>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pout];
+    ld.param.u64 %rd2, [pn];
+    ld.param.u64 %rd3, [pop];
+    mov.b64 %rd4, 0;
+VM_LOOP:
+    setp.ge.s64 %p0, %rd4, %rd2;
+    @%p0 bra VM_DONE;
+    shl.b64 %rd5, %rd4, 2;
+    add.s64 %rd6, %rd0, %rd5;
+    ld.f32 %f1, [%rd6];
+    setp.eq.s64 %p1, %rd3, 0;  @%p1 bra VM0;
+    setp.eq.s64 %p1, %rd3, 1;  @%p1 bra VM1;
+    setp.eq.s64 %p1, %rd3, 2;  @%p1 bra VM2;
+    setp.eq.s64 %p1, %rd3, 3;  @%p1 bra VM3;
+    setp.eq.s64 %p1, %rd3, 4;  @%p1 bra VM4;
+    setp.eq.s64 %p1, %rd3, 5;  @%p1 bra VM5;
+    setp.eq.s64 %p1, %rd3, 6;  @%p1 bra VM6;
+    setp.eq.s64 %p1, %rd3, 7;  @%p1 bra VM7;
+    setp.eq.s64 %p1, %rd3, 8;  @%p1 bra VM8;
+    setp.eq.s64 %p1, %rd3, 9;  @%p1 bra VM9;
+    setp.eq.s64 %p1, %rd3, 10; @%p1 bra VM10;
+    setp.eq.s64 %p1, %rd3, 11; @%p1 bra VM11;
+    setp.eq.s64 %p1, %rd3, 12; @%p1 bra VM12;
+    setp.eq.s64 %p1, %rd3, 13; @%p1 bra VM13;
+    setp.eq.s64 %p1, %rd3, 14; @%p1 bra VM14;
+    setp.eq.s64 %p1, %rd3, 15; @%p1 bra VM15;
+    setp.eq.s64 %p1, %rd3, 16; @%p1 bra VM16;
+    setp.eq.s64 %p1, %rd3, 17; @%p1 bra VM17;
+    setp.eq.s64 %p1, %rd3, 18; @%p1 bra VM18;
+    setp.eq.s64 %p1, %rd3, 19; @%p1 bra VM19;
+    setp.eq.s64 %p1, %rd3, 20; @%p1 bra VM20;
+    setp.eq.s64 %p1, %rd3, 21; @%p1 bra VM21;
+    setp.eq.s64 %p1, %rd3, 22; @%p1 bra VM22;
+    setp.eq.s64 %p1, %rd3, 23; @%p1 bra VM23;
+    setp.eq.s64 %p1, %rd3, 24; @%p1 bra VM24;
+    setp.eq.s64 %p1, %rd3, 26; @%p1 bra VM26;
+    setp.eq.s64 %p1, %rd3, 27; @%p1 bra VM27;
+    setp.eq.s64 %p1, %rd3, 28; @%p1 bra VM28;
+    setp.eq.s64 %p1, %rd3, 29; @%p1 bra VM29;
+    setp.eq.s64 %p1, %rd3, 30; @%p1 bra VM30;
+    setp.eq.s64 %p1, %rd3, 31; @%p1 bra VM31;
+    setp.eq.s64 %p1, %rd3, 32; @%p1 bra VM32;
+    setp.eq.s64 %p1, %rd3, 25; @%p1 bra VM25;
+    setp.eq.s64 %p1, %rd3, 33; @%p1 bra VM33;
+    setp.eq.s64 %p1, %rd3, 34; @%p1 bra VM34;
+    setp.eq.s64 %p1, %rd3, 35; @%p1 bra VM35;
+    bra VM_DEF;
+VM0:
+    mul.f32 %f2, %f1, 0f3FB8AA3B; ex2.approx.f32 %f2, %f2; bra VM_ST;
+VM1:
+    lg2.approx.f32 %f2, %f1; mul.f32 %f2, %f2, 0f3F317218; bra VM_ST;
+VM2:
+    add.f32 %f3, %f1, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f4, 0f40000000; div.rn.f32 %f4, %f4, %f3;
+    mov.f32 %f2, 0f3F800000; sub.f32 %f2, %f2, %f4; bra VM_ST;
+VM3:
+    neg.f32 %f3, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f2, 0f3F800000; div.rn.f32 %f2, %f2, %f3; bra VM_ST;
+VM4:
+    max.f32 %f2, %f1, 0f00000000; bra VM_ST;
+VM5:
+    neg.f32 %f3, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f4, 0f3F800000; div.rn.f32 %f4, %f4, %f3;
+    mul.f32 %f2, %f1, %f4; bra VM_ST;
+VM6:
+    mul.f32 %f3, %f1, %f1; mul.f32 %f3, %f3, %f1;
+    fma.rn.f32 %f3, %f3, 0f3D372713, %f1; mul.f32 %f3, %f3, 0f3F4C422A;
+    add.f32 %f4, %f3, %f3; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;
+    add.f32 %f4, %f4, 0f3F800000; mov.f32 %f5, 0f40000000; div.rn.f32 %f5, %f5, %f4;
+    mov.f32 %f6, 0f3F800000; sub.f32 %f6, %f6, %f5; add.f32 %f6, %f6, 0f3F800000;
+    mul.f32 %f2, %f1, %f6; mul.f32 %f2, %f2, 0f3F000000; bra VM_ST;
+VM7:
+    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3; sub.f32 %f3, %f3, 0f3F800000;
+    setp.gt.f32 %p1, %f1, 0f00000000; selp.f32 %f2, %f1, %f3, %p1; bra VM_ST;
+VM8:
+    mul.f32 %f3, %f1, 0f3C23D70A; setp.gt.f32 %p1, %f1, 0f00000000;
+    selp.f32 %f2, %f1, %f3, %p1; bra VM_ST;
+VM9:
+    abs.f32 %f3, %f1; neg.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
+    max.f32 %f4, %f1, 0f00000000; add.f32 %f2, %f4, %f3; bra VM_ST;
+VM10:
+    abs.f32 %f3, %f1; neg.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
+    max.f32 %f4, %f1, 0f00000000; add.f32 %f5, %f4, %f3;
+    add.f32 %f6, %f5, %f5; mul.f32 %f6, %f6, 0f3FB8AA3B; ex2.approx.f32 %f6, %f6;
+    add.f32 %f6, %f6, 0f3F800000; mov.f32 %f7, 0f40000000; div.rn.f32 %f7, %f7, %f6;
+    mov.f32 %f8, 0f3F800000; sub.f32 %f8, %f8, %f7; mul.f32 %f2, %f1, %f8; bra VM_ST;
+VM11:
+    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3; sub.f32 %f3, %f3, 0f3F800000;
+    mul.f32 %f3, %f3, 0f3FD62D7D; setp.gt.f32 %p1, %f1, 0f00000000;
+    selp.f32 %f2, %f1, %f3, %p1; mul.f32 %f2, %f2, 0f3F867D5F; bra VM_ST;
+VM12:
+    add.f32 %f3, %f1, %f1; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; mov.f32 %f4, 0f40000000; div.rn.f32 %f4, %f4, %f3;
+    mov.f32 %f5, 0f3F800000; sub.f32 %f5, %f5, %f4; sub.f32 %f2, %f1, %f5; bra VM_ST;
+VM13:
+    add.f32 %f3, %f1, 0f40400000; mul.f32 %f3, %f3, 0f3E2AAAAB;
+    max.f32 %f3, %f3, 0f00000000; min.f32 %f2, %f3, 0f3F800000; bra VM_ST;
+VM14:
+    add.f32 %f3, %f1, 0f40400000; mul.f32 %f3, %f3, 0f3E2AAAAB;
+    max.f32 %f3, %f3, 0f00000000; min.f32 %f3, %f3, 0f3F800000; mul.f32 %f2, %f1, %f3; bra VM_ST;
+VM15:
+    sin.approx.f32 %f2, %f1; bra VM_ST;
+VM16:
+    cos.approx.f32 %f2, %f1; bra VM_ST;
+VM17:
+    abs.f32 %f3, %f1; fma.rn.f32 %f4, %f3, 0f3EA7BA05, 0f3F800000;
+    mov.f32 %f5, 0f3F800000; div.rn.f32 %f4, %f5, %f4;
+    mov.f32 %f6, 0f3F87DC22;
+    fma.rn.f32 %f6, %f6, %f4, 0fBFBA00E3;
+    fma.rn.f32 %f6, %f6, %f4, 0f3FB5F0E3;
+    fma.rn.f32 %f6, %f6, %f4, 0fBE91A98E;
+    fma.rn.f32 %f6, %f6, %f4, 0f3E827906;
+    mul.f32 %f6, %f6, %f4;
+    mul.f32 %f7, %f3, %f3; neg.f32 %f7, %f7; mul.f32 %f7, %f7, 0f3FB8AA3B; ex2.approx.f32 %f7, %f7;
+    mul.f32 %f6, %f6, %f7; mov.f32 %f2, 0f3F800000; sub.f32 %f2, %f2, %f6;
+    copysign.f32 %f2, %f1, %f2; bra VM_ST;
+VM18:
+    ex2.approx.f32 %f2, %f1; bra VM_ST;
+VM19:
+    lg2.approx.f32 %f2, %f1; bra VM_ST;
+VM20:
+    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    neg.f32 %f4, %f1; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;
+    sub.f32 %f2, %f3, %f4; mul.f32 %f2, %f2, 0f3F000000; bra VM_ST;
+VM21:
+    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    neg.f32 %f4, %f1; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;
+    add.f32 %f2, %f3, %f4; mul.f32 %f2, %f2, 0f3F000000; bra VM_ST;
+VM22:
+    abs.f32 %f3, %f1; fma.rn.f32 %f4, %f1, %f1, 0f3F800000; sqrt.rn.f32 %f4, %f4;
+    add.f32 %f4, %f3, %f4; lg2.approx.f32 %f4, %f4; mul.f32 %f4, %f4, 0f3F317218;
+    copysign.f32 %f2, %f1, %f4; bra VM_ST;
+VM23:
+    fma.rn.f32 %f4, %f1, %f1, 0fBF800000; sqrt.rn.f32 %f4, %f4; add.f32 %f4, %f1, %f4;
+    lg2.approx.f32 %f4, %f4; mul.f32 %f2, %f4, 0f3F317218; bra VM_ST;
+VM24:
+    add.f32 %f3, %f1, 0f3F800000; mov.f32 %f4, 0f3F800000; sub.f32 %f4, %f4, %f1;
+    div.rn.f32 %f3, %f3, %f4; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
+    mul.f32 %f2, %f3, 0f3F000000; bra VM_ST;
+VM26:
+    mul.f32 %f3, %f1, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3; sub.f32 %f2, %f3, 0f3F800000; bra VM_ST;
+VM27:
+    add.f32 %f3, %f1, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f2, %f3, 0f3F317218; bra VM_ST;
+VM28:
+    mul.f32 %f3, %f1, 0f40549A78; ex2.approx.f32 %f2, %f3; bra VM_ST;
+VM29:
+    lg2.approx.f32 %f3, %f1; mul.f32 %f2, %f3, 0f3E9A209B; bra VM_ST;
+VM30:
+    abs.f32 %f3, %f1; add.f32 %f3, %f3, 0f3F800000; div.rn.f32 %f2, %f1, %f3; bra VM_ST;
+VM31:
+    abs.f32 %f3, %f1; neg.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    add.f32 %f3, %f3, 0f3F800000; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
+    neg.f32 %f4, %f1; max.f32 %f4, %f4, 0f00000000; add.f32 %f3, %f4, %f3; neg.f32 %f2, %f3; bra VM_ST;
+VM32:
+    sin.approx.f32 %f3, %f1; cos.approx.f32 %f4, %f1; div.rn.f32 %f2, %f3, %f4; bra VM_ST;
+VM35:
+    abs.f32 %f3, %f1; lg2.approx.f32 %f3, %f3; mul.f32 %f3, %f3, 0f3F317218;
+    mul.f32 %f3, %f3, 0f3EAAAAAB; mul.f32 %f3, %f3, 0f3FB8AA3B; ex2.approx.f32 %f3, %f3;
+    copysign.f32 %f2, %f1, %f3; bra VM_ST;
+VM25:
+    // atan(x): minimax poly atan(z)=z*P(z^2) on |z|<=1 (~1e-5 at z=1); reduce |x|>1 via pi/2-atan(1/|x|).
+    abs.f32 %f3, %f1; setp.gt.f32 %p1, %f3, 0f3F800000;
+    rcp.approx.f32 %f4, %f3; selp.f32 %f4, %f4, %f3, %p1;
+    mul.f32 %f5, %f4, %f4; mov.f32 %f6, 0f3CAAAE5F;
+    fma.rn.f32 %f6, %f6, %f5, 0fBDAE5A36; fma.rn.f32 %f6, %f6, %f5, 0f3E3876E2;
+    fma.rn.f32 %f6, %f6, %f5, 0fBEA91D04; fma.rn.f32 %f6, %f6, %f5, 0f3F7FF738;
+    mul.f32 %f6, %f6, %f4; mov.f32 %f7, 0f3FC90FDB; sub.f32 %f7, %f7, %f6;
+    selp.f32 %f6, %f7, %f6, %p1; copysign.f32 %f2, %f1, %f6; bra VM_ST;
+VM33:
+    // asin(x) = atan(x / sqrt(1-x^2)), sign preserved.
+    mul.f32 %f3, %f1, %f1; mov.f32 %f4, 0f3F800000; sub.f32 %f4, %f4, %f3; sqrt.rn.f32 %f4, %f4;
+    abs.f32 %f5, %f1; div.rn.f32 %f3, %f5, %f4;
+    setp.gt.f32 %p1, %f3, 0f3F800000; rcp.approx.f32 %f4, %f3; selp.f32 %f4, %f4, %f3, %p1;
+    mul.f32 %f5, %f4, %f4; mov.f32 %f6, 0f3CAAAE5F;
+    fma.rn.f32 %f6, %f6, %f5, 0fBDAE5A36; fma.rn.f32 %f6, %f6, %f5, 0f3E3876E2;
+    fma.rn.f32 %f6, %f6, %f5, 0fBEA91D04; fma.rn.f32 %f6, %f6, %f5, 0f3F7FF738;
+    mul.f32 %f6, %f6, %f4; mov.f32 %f7, 0f3FC90FDB; sub.f32 %f7, %f7, %f6;
+    selp.f32 %f6, %f7, %f6, %p1; copysign.f32 %f2, %f1, %f6; bra VM_ST;
+VM34:
+    // acos(x) = pi/2 - asin(x).
+    mul.f32 %f3, %f1, %f1; mov.f32 %f4, 0f3F800000; sub.f32 %f4, %f4, %f3; sqrt.rn.f32 %f4, %f4;
+    abs.f32 %f5, %f1; div.rn.f32 %f3, %f5, %f4;
+    setp.gt.f32 %p1, %f3, 0f3F800000; rcp.approx.f32 %f4, %f3; selp.f32 %f4, %f4, %f3, %p1;
+    mul.f32 %f5, %f4, %f4; mov.f32 %f6, 0f3CAAAE5F;
+    fma.rn.f32 %f6, %f6, %f5, 0fBDAE5A36; fma.rn.f32 %f6, %f6, %f5, 0f3E3876E2;
+    fma.rn.f32 %f6, %f6, %f5, 0fBEA91D04; fma.rn.f32 %f6, %f6, %f5, 0f3F7FF738;
+    mul.f32 %f6, %f6, %f4; mov.f32 %f7, 0f3FC90FDB; sub.f32 %f7, %f7, %f6;
+    selp.f32 %f6, %f7, %f6, %p1; copysign.f32 %f6, %f1, %f6;
+    mov.f32 %f7, 0f3FC90FDB; sub.f32 %f2, %f7, %f6; bra VM_ST;
+VM_DEF:
+    mov.f32 %f2, %f1;
+VM_ST:
+    add.s64 %rd6, %rd1, %rd5;
+    st.f32 [%rd6], %f2;
+    add.s64 %rd4, %rd4, 1;
+    bra VM_LOOP;
+VM_DONE:
+    ret;
+}
+"#;
+
+/// `wukong_vmath2_f32(in1, in2, out, n, op)`: the two-arg transcendentals over f32 arrays â€”
+/// pow(0) = `in1^in2` = exp2(in2Â·log2(in1)); atan2(1) = angle of (in2, in1) = atan(in1/in2) +
+/// quadrant fix; hypot(2) = `sqrt(in1Â²+in2Â²)`. atan uses the same inline minimax poly as VM25; the
+/// CPU<->GPU tolerance gate covers the SFU/poly-vs-libm difference.
+const PTX_VMATH2: &str = r#".func mrt_vmath2 (.param .b64 p1, .param .b64 p2, .param .b64 pout, .param .b64 pn, .param .b64 pop)
+{
+    .reg .b64 %rd<9>;
+    .reg .f32 %f<12>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [p1];
+    ld.param.u64 %rd1, [p2];
+    ld.param.u64 %rd2, [pout];
+    ld.param.u64 %rd3, [pn];
+    ld.param.u64 %rd4, [pop];
+    mov.b64 %rd5, 0;
+V2_LOOP:
+    setp.ge.s64 %p0, %rd5, %rd3;
+    @%p0 bra V2_DONE;
+    shl.b64 %rd6, %rd5, 2;
+    add.s64 %rd7, %rd0, %rd6;
+    ld.f32 %f1, [%rd7];
+    add.s64 %rd7, %rd1, %rd6;
+    ld.f32 %f2, [%rd7];
+    setp.eq.s64 %p1, %rd4, 0; @%p1 bra V2_POW;
+    setp.eq.s64 %p1, %rd4, 1; @%p1 bra V2_ATAN2;
+    setp.eq.s64 %p1, %rd4, 2; @%p1 bra V2_HYPOT;
+    mov.f32 %f3, %f1; bra V2_ST;
+V2_POW:
+    lg2.approx.f32 %f3, %f1; mul.f32 %f3, %f3, %f2; ex2.approx.f32 %f3, %f3; bra V2_ST;
+V2_HYPOT:
+    mul.f32 %f3, %f1, %f1; fma.rn.f32 %f3, %f2, %f2, %f3; sqrt.rn.f32 %f3, %f3; bra V2_ST;
+V2_ATAN2:
+    div.rn.f32 %f4, %f1, %f2;
+    abs.f32 %f5, %f4; setp.gt.f32 %p1, %f5, 0f3F800000;
+    rcp.approx.f32 %f6, %f5; selp.f32 %f6, %f6, %f5, %p1;
+    mul.f32 %f7, %f6, %f6; mov.f32 %f3, 0f3CAAAE5F;
+    fma.rn.f32 %f3, %f3, %f7, 0fBDAE5A36; fma.rn.f32 %f3, %f3, %f7, 0f3E3876E2;
+    fma.rn.f32 %f3, %f3, %f7, 0fBEA91D04; fma.rn.f32 %f3, %f3, %f7, 0f3F7FF738;
+    mul.f32 %f3, %f3, %f6; mov.f32 %f8, 0f3FC90FDB; sub.f32 %f8, %f8, %f3;
+    selp.f32 %f3, %f8, %f3, %p1; copysign.f32 %f3, %f4, %f3;
+    setp.lt.f32 %p1, %f2, 0f00000000;
+    mov.f32 %f8, 0f40490FDB; copysign.f32 %f8, %f1, %f8; add.f32 %f9, %f3, %f8;
+    selp.f32 %f3, %f9, %f3, %p1; bra V2_ST;
+V2_ST:
+    add.s64 %rd7, %rd2, %rd6;
+    st.f32 [%rd7], %f3;
+    add.s64 %rd5, %rd5, 1;
+    bra V2_LOOP;
+V2_DONE:
+    ret;
+}
+"#;
+
+/// `wukong_velem_f32(x, y, out, n, a, b, c, op)`: streaming elementwise `out[i] = act(base)` where
+/// `base` is the **binary** product `xÂ·y` (`op & 512`, VE_HADAMARD) or quotient `x/y` (`op & 1024`,
+/// VE_DIV) â€” both read `y` â€” else the **affine** `aÂ·x[i] + inner` with `inner = (op & 256) ? bÂ·y[i]+c :
+/// c`; `act = op & 0xff` is identity(0)/relu(1)/relu6(2). `div.rn.f32` is correctly-rounded IEEE
+/// division, matching the CPU kernel's `x / y` bit-for-bit within the gate. The two-fma affine chain
+/// matches the CPU kernel (e.g. the residual add `x + y` is `op=256, a=b=1, c=0`).
+const PTX_VELEM: &str = r#".func mrt_velem (.param .b64 px, .param .b64 py, .param .b64 pout, .param .b64 pn, .param .f32 pa, .param .f32 pb, .param .f32 pc, .param .b64 pop)
+{
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [py];
+    ld.param.u64 %rd2, [pout];
+    ld.param.u64 %rd3, [pn];
+    ld.param.f32 %f4, [pa];
+    ld.param.f32 %f5, [pb];
+    ld.param.f32 %f6, [pc];
+    ld.param.u64 %rd4, [pop];
+    and.b64 %rd5, %rd4, 256;
+    and.b64 %rd6, %rd4, 255;
+    and.b64 %rd10, %rd4, 512;
+    and.b64 %rd11, %rd4, 1024;
+    or.b64 %rd5, %rd5, %rd10;
+    or.b64 %rd5, %rd5, %rd11;
+    mov.b64 %rd7, 0;
+VE_LOOP:
+    setp.ge.s64 %p0, %rd7, %rd3;
+    @%p0 bra VE_DONE;
+    shl.b64 %rd8, %rd7, 2;
+    add.s64 %rd9, %rd0, %rd8;
+    ld.f32 %f1, [%rd9];
+    setp.ne.s64 %p1, %rd5, 0;
+    mov.f32 %f7, %f6;
+    @%p1 add.s64 %rd9, %rd1, %rd8;
+    @%p1 ld.f32 %f2, [%rd9];
+    @%p1 fma.rn.f32 %f7, %f5, %f2, %f6;
+    fma.rn.f32 %f3, %f4, %f1, %f7;
+    setp.ne.s64 %p2, %rd10, 0;
+    setp.ne.s64 %p3, %rd11, 0;
+    @%p2 mul.f32 %f3, %f1, %f2;
+    @%p3 div.rn.f32 %f3, %f1, %f2;
+    setp.eq.s64 %p1, %rd6, 1;
+    setp.eq.s64 %p2, %rd6, 2;
+    @%p1 max.f32 %f3, %f3, 0f00000000;
+    @%p2 max.f32 %f3, %f3, 0f00000000;
+    @%p2 min.f32 %f3, %f3, 0f40C00000;
+    add.s64 %rd9, %rd2, %rd8;
+    st.f32 [%rd9], %f3;
+    add.s64 %rd7, %rd7, 1;
+    bra VE_LOOP;
+VE_DONE:
+    ret;
+}
+"#;
+
+/// `mrt_fmod(a, b) -> a % b` (true IEEE fmod, f64), the helper float `%` calls. Exact via binary
+/// scaling: align `rbÂ·2^k` just below `ra=|a|`, then subtract-and-halve down to `rb` â€” every step
+/// (`*2`, `*0.5`, `ra-=m`) is exact, so the result is the exact remainder regardless of magnitude
+/// (the `a-trunc(a/b)*b` identity fails past 2^53). f32 `%` widens to f64 here and narrows the result.
+const PTX_FMOD: &str = r#".func (.param .f64 _r) mrt_fmod (.param .f64 pa, .param .f64 pb)
+{
+    .reg .f64 %fd<6>;
+    .reg .pred %p<3>;
+    ld.param.f64 %fd0, [pa];
+    ld.param.f64 %fd1, [pb];
+    abs.f64 %fd2, %fd0;
+    abs.f64 %fd3, %fd1;
+    setp.eq.f64 %p0, %fd3, 0d0000000000000000;
+    @%p0 bra FMOD_RET;
+    setp.lt.f64 %p0, %fd2, %fd3;
+    @%p0 bra FMOD_RET;
+    mov.f64 %fd4, %fd3;
+FMOD_UP:
+    add.f64 %fd5, %fd4, %fd4;
+    setp.gt.f64 %p1, %fd5, %fd2;
+    @%p1 bra FMOD_LOOP;
+    mov.f64 %fd4, %fd5;
+    bra FMOD_UP;
+FMOD_LOOP:
+    setp.lt.f64 %p1, %fd2, %fd4;
+    @%p1 bra FMOD_SKIP;
+    sub.f64 %fd2, %fd2, %fd4;
+FMOD_SKIP:
+    setp.eq.f64 %p1, %fd4, %fd3;
+    @%p1 bra FMOD_RET;
+    mul.f64 %fd4, %fd4, 0d3FE0000000000000;
+    bra FMOD_LOOP;
+FMOD_RET:
+    copysign.f64 %fd2, %fd0, %fd2;
+    st.param.f64 [_r], %fd2;
+    ret;
+}
+"#;
+
+// --------------------------------------------------------------------------------------------
+// Mixed-precision (bf16/f16 storage, f32 compute) device helpers.
+//
+// These reproduce the `wukong_{vmath,dot,sum,reduce,axpby}_{bf16,f16}` CPU kernels: the storage is
+// 2-byte bf16/f16 (loaded with `ld.u16` + `cvt.f32.{bf16,f16}`, a lossless widen for the bf16-/f16-
+// exact corpus values), all math is f32, and outputs/accumulators are f32 (the standard ML
+// "low-precision storage, f32 accumulate" contract). PTX labels are function-scoped (verified), so
+// the bf16 and f16 variants reuse the same internal label names without colliding. `cvt` is
+// `"bf16"` or `"f16"`; the two variants differ only in that conversion suffix.
+// --------------------------------------------------------------------------------------------
+
+/// `wukong_vmath_{bf16,f16}(x, out, n, op)`: elementwise activation reading a bf16/f16 input array
+/// (2-byte stride) and writing f32 (4-byte stride). Reuses the f32 kernel's op-switch verbatim (the
+/// op codes and SFU formulas are identical; only the input load differs), so the result is bit-for-
+/// bit the f32 kernel run on the widened inputs.
+fn ptx_vmath_lowp(fn_name: &str, cvt: &str) -> Option<String> {
+    // Splice in the shared dispatch + op bodies (`setp â€¦; VM0: â€¦; VM_DEF: mov %f2,%f1`) from the
+    // committed f32 kernel so there is one source of truth for the ~30 activation formulas.
+    // The two markers are an invariant of `PTX_VMATH` in this same file; if an edit ever renames or
+    // reflows them, DECLINE (the caller turns `None` into an `UNSUPPORTED:` diagnostic) instead of
+    // panicking with internal text on a path a user program reaches. `vmath_lowp_markers_present`
+    // below pins the invariant so a desync is caught at edit time, not at compile time of a program.
+    let s = PTX_VMATH;
+    let start = s.find(VM_DISPATCH_MARKER)?;
+    let end = s.find(VM_STORE_MARKER)?;
+    let ops = &s[start..end];
+    Some(format!(
+        r#".func {fn_name} (.param .b64 px, .param .b64 pout, .param .b64 pn, .param .b64 pop)
+{{
+    .reg .b64 %rd<9>;
+    .reg .f32 %f<12>;
+    .reg .b16 %rs<1>;
+    .reg .pred %p<4>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pout];
+    ld.param.u64 %rd2, [pn];
+    ld.param.u64 %rd3, [pop];
+    mov.b64 %rd4, 0;
+VM_LOOP:
+    setp.ge.s64 %p0, %rd4, %rd2;
+    @%p0 bra VM_DONE;
+    shl.b64 %rd5, %rd4, 1;
+    add.s64 %rd6, %rd0, %rd5;
+    ld.u16 %rs0, [%rd6];
+    cvt.f32.{cvt} %f1, %rs0;
+{ops}VM_ST:
+    shl.b64 %rd8, %rd4, 2;
+    add.s64 %rd6, %rd1, %rd8;
+    st.f32 [%rd6], %f2;
+    add.s64 %rd4, %rd4, 1;
+    bra VM_LOOP;
+VM_DONE:
+    ret;
+}}
+"#
+    ))
+}
+
+/// The two `PTX_VMATH` anchors [`ptx_vmath_lowp`] splices between: the first line of the op-code
+/// dispatch, and the shared store label that ends the op bodies. Named constants so the test below
+/// pins exactly what the splice looks for.
+const VM_DISPATCH_MARKER: &str = "    setp.eq.s64 %p1, %rd3, 0;";
+const VM_STORE_MARKER: &str = "VM_ST:";
+
+/// `wukong_dot_{bf16,f16}(x, y, n) -> f32`: `Î£ widen(x[k])Â·widen(y[k])`, f32 accumulate.
+fn ptx_dot_lowp(fn_name: &str, cvt: &str) -> String {
+    format!(
+        r#".func (.param .f32 _r) {fn_name} (.param .b64 px, .param .b64 py, .param .b64 pn)
+{{
+    .reg .b64 %rd<7>;
+    .reg .f32 %f<4>;
+    .reg .b16 %rs<2>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [py];
+    ld.param.u64 %rd2, [pn];
+    mov.b64 %rd3, 0;
+    mov.f32 %f0, 0f00000000;
+DOT_LOOP:
+    setp.ge.s64 %p0, %rd3, %rd2;
+    @%p0 bra DOT_DONE;
+    shl.b64 %rd4, %rd3, 1;
+    add.s64 %rd5, %rd0, %rd4;
+    ld.u16 %rs0, [%rd5];
+    cvt.f32.{cvt} %f1, %rs0;
+    add.s64 %rd6, %rd1, %rd4;
+    ld.u16 %rs1, [%rd6];
+    cvt.f32.{cvt} %f2, %rs1;
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.s64 %rd3, %rd3, 1;
+    bra DOT_LOOP;
+DOT_DONE:
+    st.param.f32 [_r], %f0;
+    ret;
+}}
+"#
+    )
+}
+
+/// `wukong_sum_{bf16,f16}(x, n) -> f32`: `Î£ widen(x[k])`, f32 accumulate.
+fn ptx_sum_lowp(fn_name: &str, cvt: &str) -> String {
+    format!(
+        r#".func (.param .f32 _r) {fn_name} (.param .b64 px, .param .b64 pn)
+{{
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<2>;
+    .reg .b16 %rs<1>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pn];
+    mov.b64 %rd2, 0;
+    mov.f32 %f0, 0f00000000;
+SUM_LOOP:
+    setp.ge.s64 %p0, %rd2, %rd1;
+    @%p0 bra SUM_DONE;
+    shl.b64 %rd3, %rd2, 1;
+    add.s64 %rd4, %rd0, %rd3;
+    ld.u16 %rs0, [%rd4];
+    cvt.f32.{cvt} %f1, %rs0;
+    add.f32 %f0, %f0, %f1;
+    add.s64 %rd2, %rd2, 1;
+    bra SUM_LOOP;
+SUM_DONE:
+    st.param.f32 [_r], %f0;
+    ret;
+}}
+"#
+    )
+}
+
+/// `wukong_reduce_{bf16,f16}(x, n, op) -> f32`: max(4)/min(5)/maxabs(6) fold over `widen(x[k])`.
+/// Order-independent and exact (no rounding), so it matches the CPU kernel's result for any order.
+fn ptx_reduce_lowp(fn_name: &str, cvt: &str) -> String {
+    format!(
+        r#".func (.param .f32 _r) {fn_name} (.param .b64 px, .param .b64 pn, .param .b64 pop)
+{{
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<2>;
+    .reg .b16 %rs<1>;
+    .reg .pred %p<3>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [pn];
+    ld.param.u64 %rd2, [pop];
+    mov.b64 %rd3, 0;
+    // init: -inf for max/maxabs, +inf for min.
+    mov.f32 %f0, 0fFF800000;
+    setp.eq.s64 %p1, %rd2, 5;
+    @%p1 mov.f32 %f0, 0f7F800000;
+RED_LOOP:
+    setp.ge.s64 %p0, %rd3, %rd1;
+    @%p0 bra RED_DONE;
+    shl.b64 %rd4, %rd3, 1;
+    add.s64 %rd5, %rd0, %rd4;
+    ld.u16 %rs0, [%rd5];
+    cvt.f32.{cvt} %f1, %rs0;
+    setp.eq.s64 %p2, %rd2, 6;
+    @%p2 abs.f32 %f1, %f1;
+    setp.eq.s64 %p1, %rd2, 5;
+    @%p1 min.f32 %f0, %f0, %f1;
+    @!%p1 max.f32 %f0, %f0, %f1;
+    add.s64 %rd3, %rd3, 1;
+    bra RED_LOOP;
+RED_DONE:
+    st.param.f32 [_r], %f0;
+    ret;
+}}
+"#
+    )
+}
+
+/// `wukong_axpby_{bf16,f16}(x, y, out, n, a, b)`: `out[i] = aÂ·widen(x[i]) + bÂ·widen(y[i])` (bf16/f16
+/// in, f32 out, f32 math).
+fn ptx_axpby_lowp(fn_name: &str, cvt: &str) -> String {
+    format!(
+        r#".func {fn_name} (.param .b64 px, .param .b64 py, .param .b64 pout, .param .b64 pn, .param .f32 pa, .param .f32 pb)
+{{
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<6>;
+    .reg .b16 %rs<2>;
+    .reg .pred %p<2>;
+    ld.param.u64 %rd0, [px];
+    ld.param.u64 %rd1, [py];
+    ld.param.u64 %rd2, [pout];
+    ld.param.u64 %rd3, [pn];
+    ld.param.f32 %f4, [pa];
+    ld.param.f32 %f5, [pb];
+    mov.b64 %rd4, 0;
+AXPBY_LOOP:
+    setp.ge.s64 %p0, %rd4, %rd3;
+    @%p0 bra AXPBY_DONE;
+    shl.b64 %rd5, %rd4, 1;
+    add.s64 %rd6, %rd0, %rd5;
+    ld.u16 %rs0, [%rd6];
+    cvt.f32.{cvt} %f1, %rs0;
+    add.s64 %rd6, %rd1, %rd5;
+    ld.u16 %rs1, [%rd6];
+    cvt.f32.{cvt} %f2, %rs1;
+    mul.f32 %f3, %f4, %f1;
+    fma.rn.f32 %f3, %f5, %f2, %f3;
+    shl.b64 %rd7, %rd4, 2;
+    add.s64 %rd6, %rd2, %rd7;
+    st.f32 [%rd6], %f3;
+    add.s64 %rd4, %rd4, 1;
+    bra AXPBY_LOOP;
+AXPBY_DONE:
+    ret;
+}}
+"#
+    )
+}
+
+/// `wukong_sgemm_nt_epi(a, b, c, m, k, n, beta, bias, act)`: fused `C = act(A.Bt [+ bias])` (the
+/// nn.Linear/FFN epilogue). `bias` is null (passed as integer 0) for no bias; `act` is
+/// identity(0)/relu(1)/gelu(2)/silu(3). silu/gelu reuse the SFU forms from mrt_vmath; tolerance-gated.
+const PTX_SGEMM_NT_EPI: &str = r#".func mrt_sgemm_nt_epi (.param .b64 pa, .param .b64 pb, .param .b64 pc, .param .b64 pm, .param .b64 pk, .param .b64 pn, .param .b64 pbeta, .param .b64 pbias, .param .b64 pact)
+{
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<12>;
+    .reg .pred %p<6>;
+    ld.param.u64 %rd0, [pa];
+    ld.param.u64 %rd1, [pb];
+    ld.param.u64 %rd2, [pc];
+    ld.param.u64 %rd3, [pm];
+    ld.param.u64 %rd4, [pk];
+    ld.param.u64 %rd5, [pn];
+    ld.param.u64 %rd6, [pbeta];
+    ld.param.u64 %rd16, [pbias];
+    ld.param.u64 %rd17, [pact];
+    mov.b64 %rd7, 0;
+EPI_LI:
+    setp.ge.s64 %p0, %rd7, %rd3;
+    @%p0 bra EPI_EI;
+    mov.b64 %rd8, 0;
+EPI_LJ:
+    setp.ge.s64 %p1, %rd8, %rd5;
+    @%p1 bra EPI_EJ;
+    mov.f32 %f0, 0f00000000;
+    mul.lo.s64 %rd9, %rd7, %rd4;
+    shl.b64 %rd9, %rd9, 2;
+    add.s64 %rd9, %rd0, %rd9;
+    mul.lo.s64 %rd10, %rd8, %rd4;
+    shl.b64 %rd10, %rd10, 2;
+    add.s64 %rd10, %rd1, %rd10;
+    mov.b64 %rd11, 0;
+EPI_LL:
+    setp.ge.s64 %p2, %rd11, %rd4;
+    @%p2 bra EPI_EL;
+    shl.b64 %rd12, %rd11, 2;
+    add.s64 %rd13, %rd9, %rd12;
+    ld.f32 %f1, [%rd13];
+    add.s64 %rd14, %rd10, %rd12;
+    ld.f32 %f2, [%rd14];
+    fma.rn.f32 %f0, %f1, %f2, %f0;
+    add.s64 %rd11, %rd11, 1;
+    bra EPI_LL;
+EPI_EL:
+    mul.lo.s64 %rd15, %rd7, %rd5;
+    add.s64 %rd15, %rd15, %rd8;
+    shl.b64 %rd15, %rd15, 2;
+    add.s64 %rd15, %rd2, %rd15;
+    setp.eq.s64 %p3, %rd6, 0;
+    @%p3 bra EPI_NOACC;
+    ld.f32 %f3, [%rd15];
+    add.rn.f32 %f0, %f0, %f3;
+EPI_NOACC:
+    setp.eq.s64 %p3, %rd16, 0;
+    @%p3 bra EPI_NOBIAS;
+    shl.b64 %rd18, %rd8, 2;
+    add.s64 %rd18, %rd16, %rd18;
+    ld.f32 %f3, [%rd18];
+    add.rn.f32 %f0, %f0, %f3;
+EPI_NOBIAS:
+    setp.eq.s64 %p3, %rd17, 1;
+    @%p3 bra EPI_RELU;
+    setp.eq.s64 %p3, %rd17, 2;
+    @%p3 bra EPI_GELU;
+    setp.eq.s64 %p3, %rd17, 3;
+    @%p3 bra EPI_SILU;
+    bra EPI_ST;
+EPI_RELU:
+    max.f32 %f0, %f0, 0f00000000;
+    bra EPI_ST;
+EPI_SILU:
+    neg.f32 %f4, %f0; mul.f32 %f4, %f4, 0f3FB8AA3B; ex2.approx.f32 %f4, %f4;
+    add.f32 %f4, %f4, 0f3F800000; mov.f32 %f5, 0f3F800000; div.rn.f32 %f5, %f5, %f4;
+    mul.f32 %f0, %f0, %f5;
+    bra EPI_ST;
+EPI_GELU:
+    mul.f32 %f4, %f0, %f0; mul.f32 %f4, %f4, %f0;
+    fma.rn.f32 %f4, %f4, 0f3D372713, %f0; mul.f32 %f4, %f4, 0f3F4C422A;
+    add.f32 %f5, %f4, %f4; mul.f32 %f5, %f5, 0f3FB8AA3B; ex2.approx.f32 %f5, %f5;
+    add.f32 %f5, %f5, 0f3F800000; mov.f32 %f6, 0f40000000; div.rn.f32 %f6, %f6, %f5;
+    mov.f32 %f7, 0f3F800000; sub.f32 %f7, %f7, %f6; add.f32 %f7, %f7, 0f3F800000;
+    mul.f32 %f0, %f0, %f7; mul.f32 %f0, %f0, 0f3F000000;
+    bra EPI_ST;
+EPI_ST:
+    st.f32 [%rd15], %f0;
+    add.s64 %rd8, %rd8, 1;
+    bra EPI_LJ;
+EPI_EJ:
+    add.s64 %rd7, %rd7, 1;
+    bra EPI_LI;
+EPI_EI:
+    ret;
+}
+"#;
+
+// ============================================================================================
+// Device execution
+// ============================================================================================
+
+fn run_on_device(
+    g: &mut crate::gpu::Gpu,
+    ptx: &str,
+    ret: &MirType,
+) -> Result<(i64, Vec<u8>), String> {
+    let _ = ret;
+    // A stable per-PTX module key (leaked once per distinct module â€” bounded by programs compiled in
+    // the process) so the shared `Gpu` in-process + cubin caches apply.
+    let mut h = DefaultHasher::new();
+    ptx.hash(&mut h);
+    let key: &'static str = Box::leak(format!("mir_lower_{:016x}", h.finish()).into_boxed_str());
+
+    if std::env::var_os("WUKONG_GPU_DUMP_PTX").is_some() {
+        eprintln!("--- gpu-native PTX ---\n{ptx}\n--- end PTX ---");
+    }
+
+    let f = g.function(key, ptx, KERNEL_NAME).map_err(|e| {
+        // Persist the PTX so a JIT/ptxas error (otherwise an opaque driver code) is debuggable.
+        let p = std::env::temp_dir().join(format!("{key}.ptx"));
+        let _ = std::fs::write(&p, ptx);
+        format!(
+            "gpu-native JIT/load failed: {e:?}\n  (PTX written to {})",
+            p.display()
+        )
+    })?;
+
+    let host = new_ctx_host();
+    let mut ctx_d = g
+        .stream
+        .memcpy_stod(&host)
+        .map_err(|e| format!("gpu-native ctx alloc failed: {e:?}"))?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = g.stream.launch_builder(&f);
+    b.arg(&mut ctx_d);
+    unsafe {
+        b.launch(cfg)
+            .map_err(|e| format!("gpu-native launch failed: {e:?}"))?;
+    }
+    let out = g
+        .stream
+        .memcpy_dtov(&ctx_d)
+        .map_err(|e| format!("gpu-native readback failed: {e:?}"))?;
+
+    decode_ctx(&out)
+}
+
+/// The zeroed host mirror of the device context buffer (record count + assert flag + exit code +
+/// reserved, then `RECORD_CAP` two-u64 print records). Shared by the single-thread and mega launchers.
+pub(crate) fn new_ctx_host() -> Vec<u64> {
+    vec![0u64; 4 + 2 * RECORD_CAP as usize]
+}
+
+/// Decode a context buffer read back from the device into `(exit_code, stdout)` â€” the print records
+/// replayed with the *identical* `format!("{}\n")` the interpreter/Cranelift runtime uses. Shared by
+/// `run_on_device` and the megakernel launcher so both produce byte-identical output.
+pub(crate) fn decode_ctx(out: &[u64]) -> Result<(i64, Vec<u8>), String> {
+    let count = out[CTX_COUNT_OFF as usize / 8];
+    let assert_failed = out[CTX_ASSERT_OFF as usize / 8];
+    let exit = out[CTX_EXIT_OFF as usize / 8] as i64;
+
+    if assert_failed != 0 {
+        return Err("assertion failed".into());
+    }
+    if count > RECORD_CAP {
+        return Err(format!(
+            "gpu-native print buffer overflow: {count} records exceed capacity {RECORD_CAP}"
+        ));
+    }
+
+    let mut stdout = Vec::new();
+    let base = CTX_RECORDS_OFF as usize / 8;
+    for i in 0..count as usize {
+        let tag = out[base + 2 * i];
+        let payload = out[base + 2 * i + 1];
+        let line = if tag == 1 {
+            format!("{}\n", f64::from_bits(payload))
+        } else {
+            format!("{}\n", payload as i64)
+        };
+        stdout.extend_from_slice(line.as_bytes());
+    }
+    Ok((exit, stdout))
+}
+
+/// Total bytes of `func`'s alloca frame (mirrors `FnEmit::assign_frame`'s slot sizing) â€” the size of
+/// the shared `.global` frame buffer the megakernel launcher allocates + zeroes for the whole block.
+pub fn mega_frame_bytes(func: &Function) -> u64 {
+    let mut off = 0u64;
+    for b in &func.blocks {
+        for inst in &b.insts {
+            if let Op::Alloca { ty: ty, space: wukong_mir::AddrSpace::Local } = &inst.op {
+                if inst.result.is_some() {
+                    let sz = size_of(ty).max(1);
+                    off += sz.div_ceil(8) * 8;
+                }
+            }
+        }
+    }
+    off
+}
+
+// ============================================================================================
+// Corpus-sweep MIR normalization (test support, shared with `megakernel.rs`).
+// ============================================================================================
+
+/// **Makes the corpus coverage counts a property of this backend instead of a property of the host
+/// CPU.** Every gate in this crate that reports a coverage number builds its MIR through [`build`]
+/// here â€” including `megakernel.rs`'s, which shares this module's copy rather than keeping its own.
+///
+/// The confound it removes: `wukong_mir_build`'s general 256-bit loop vectorizer emits an
+/// `Op::VecKernelCall` (a raw-AVX2 CPU microkernel recipe) only where
+/// [`wukong_mir::host_supports_vec_kernels`] is true â€” and that predicate is
+/// `cfg(all(target_arch = "x86_64", target_os = "windows"))`, because the assembled bytes hardcode
+/// the Win64 argument registers. `lower.rs` declines exactly that op
+/// (`UNSUPPORTED: VecKernelCall`), so on Windows every program carrying one is a skip, while on
+/// Linux the same source compiles to 128-bit CLIF strips and lowers fine.
+///
+/// Measured on this corpus, device-free, by `corpus_lowering_floors_are_host_vectorizer_invariant`:
+/// 26 of the 357 `tests/run` programs carry a `VecKernelCall` on Win64, and 18 of them lower once
+/// it is gone. That is the entire difference between the Windows sweep's 217/357 + 87 mega and the
+/// Modal L4 sweep's (2026-08-09) 235/357 + 90 mega. **The Linux run was not better at lowering; it
+/// simply never saw the op.** With two hosts reading two numbers, one hardcoded floor is a live
+/// gate on exactly one of them and vacuous on the other â€” and the datacenter round is about to
+/// spend real money running this gate on Linux.
+///
+/// The fix is to normalize the *input*, not to special-case the floor: `WUKONG_P4_NO_256=1` forces
+/// the same 128-bit fallback the non-Windows host takes anyway, so the swept MIR is byte-comparable
+/// on both. That switch is documented and pinned as **result-identical** by
+/// `wukong_codegen_cranelift`'s `p4_kill_switch_is_result_identical`, so the interpreter oracle in
+/// the same sweep is unaffected â€” and gpu-native gets *more* device coverage on Windows, not less,
+/// since those 18 programs now really run.
+///
+/// Excluding the `VecKernelCall` carriers from the denominator instead â€” count coverage only over
+/// the programs where "can gpu-native lower this?" is well-posed â€” reads like the more conservative
+/// fix, but it does not actually produce one number: **the excluded set is itself host-dependent.**
+/// On Win64 it is 26 programs and the ratio is 217/331; on Linux no program carries the op, nothing
+/// is excluded, and the ratio is 235/357. To exclude the same set on both hosts you must first know
+/// which programs *would* carry the op under the Win64 ABI, and the only way to learn that is to
+/// build the corpus both ways â€” i.e. this switch. A `#[cfg(windows)] 217 / #[cfg(unix)] 235` floor
+/// is worse still: it encodes the confound instead of removing it, leaves each arm ratcheting a
+/// different quantity, and has to be re-derived on every new host.
+///
+/// With the normalization in place the *device* sweep on this RTX 4050 reads 235/357 and 90/103 â€”
+/// the L4's numbers exactly, on a different OS and a different card, with zero mismatches and zero
+/// faults. The invariance is measured, not argued.
+///
+/// LANDMINE: the switch is read from the process environment, which is global to the test binary,
+/// so [`normalized`] and [`host_native`] take one crate-wide mutex and restore the previous value
+/// on the way out (including on a panic) â€” two gates can hold opposite settings without racing.
+/// They touch the environment **only where [`switch_can_matter`] holds**; see its comment for why
+/// that is a soundness property and not a shortcut. **There is no MIR builder in this crate outside
+/// the lock**: `fusion.rs`'s tests import [`build`]/[`build_in_current_host_mode`] from here, so every
+/// MIR build in the crate is serialized by the one mutex. Their switch-insensitivity is no longer a
+/// manual check either â€” `fusion::tests::fusion_eligibility_is_host_vectorizer_invariant` runs the
+/// same source through both host-vectorizer modes and asserts the `MegaPlan` is identical, over a
+/// program that genuinely carries an `Op::VecKernelCall` in one mode and not the other. Route any new
+/// MIR-building helper through here rather than re-deriving that.
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) mod hostvec {
+    use super::{Interner, Program};
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The `wukong_mir_build` kill-switch that forces the 128-bit fallback for both 256-bit recipe
+    /// sites (elementwise and reduction).
+    const VAR: &str = "WUKONG_P4_NO_256";
+
+    /// Serializes every window in which this crate's tests hold a non-default value of [`VAR`].
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Whether [`VAR`] can change one byte of MIR on this host.
+    ///
+    /// It is the *other* conjunct at both `mir_build` recipe sites, which read
+    /// `lane == F32 && host_supports_vec_kernels() && var_os(VAR).is_none()`, and those two sites
+    /// are the only non-test readers of the variable in the workspace. `&&` short-circuits, so
+    /// where this is false the environment is never even consulted â€” and [`scoped`] below then
+    /// skips the write entirely: `normalized(f)` is literally `f()`, over the MIR an untouched
+    /// `mir_build` produced.
+    ///
+    /// That is a soundness property, not a micro-optimization. `setenv` racing another thread's
+    /// `getenv` is a data race in glibc â€” Rust makes `std::env::set_var` `unsafe` in edition 2024
+    /// for exactly this reason â€” and this crate does have a concurrent reader outside the lock
+    /// (`fusion.rs`'s test `build`, plus anything in `std` that reads the environment). On Windows
+    /// the calls go to `SetEnvironmentVariableW`/`GetEnvironmentVariableW`, which are serialized by
+    /// the OS and cannot corrupt; on Linux they are not. So the arrangement is: the host that has
+    /// the confound (Win64) pays a lock to remove it, and the host that never had it (every other,
+    /// including the datacenter fleet this gate is being flown to) is not touched at all.
+    fn switch_can_matter() -> bool {
+        wukong_mir::host_supports_vec_kernels()
+    }
+
+    /// Holds the lock for the window and puts the previous value back when dropped â€” field drops
+    /// run *after* `Drop::drop`, so the restore happens while the lock is still held.
+    struct Scoped {
+        prev: Option<OsString>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Scoped {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(VAR, v),
+                None => std::env::remove_var(VAR),
+            }
+        }
+    }
+
+    /// `None` where the switch is inert â€” the caller's closure then runs against this host's
+    /// ordinary `mir_build` output, which on such a host is already the normalized MIR.
+    fn scoped(set: bool) -> Option<Scoped> {
+        if !switch_can_matter() {
+            return None;
+        }
+        // A panicking test must not wedge every later one: take the guard out of a poisoned lock.
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os(VAR);
+        if set {
+            std::env::set_var(VAR, "1");
+        } else {
+            std::env::remove_var(VAR);
+        }
+        Some(Scoped {
+            prev,
+            _guard: guard,
+        })
+    }
+
+    /// Run `f` with the host's 256-bit raw-AVX2 loop vectorizer suppressed â€” the host-invariant
+    /// condition every corpus coverage count in this crate is measured in. Where the vectorizer
+    /// does not exist this is already that condition, so `f` simply runs.
+    pub(crate) fn normalized<R>(f: impl FnOnce() -> R) -> R {
+        let _s = scoped(true);
+        f()
+    }
+
+    /// Run `f` with the kill-switch *removed*, i.e. with whatever `mir_build` does by default on
+    /// this host. Only the invariance gate wants this â€” it is the condition that makes a coverage
+    /// count host-dependent in the first place, and it is the arm that reproduces the old 217/87.
+    /// (Removing rather than merely not-setting matters: it keeps the arm meaningful even when the
+    /// whole suite is run with `WUKONG_P4_NO_256=1` in the environment, and the previous value is
+    /// restored on the way out.) Where [`switch_can_matter`] is false this is indistinguishable
+    /// from [`normalized`] by construction, and the gate skips the arm rather than compare a
+    /// sweep against itself.
+    pub(crate) fn host_native<R>(f: impl FnOnce() -> R) -> R {
+        let _s = scoped(false);
+        f()
+    }
+
+    /// **The one MIR builder both corpus gates use** (lex -> parse -> sema -> mir_build -> opt),
+    /// normalized. It lives here rather than once per test module because the two gates now ratchet
+    /// cross-referenced constants â€” [`super::tests::RUN_CORPUS_COVERAGE_FLOOR`] and
+    /// [`crate::megakernel::tests::MEGA_CORPUS_COVERAGE_FLOOR`] are asserted together by
+    /// `corpus_lowering_floors_are_host_vectorizer_invariant` â€” and two copies of the builder is
+    /// how the two sweeps would quietly start measuring different MIR while both stayed green.
+    pub(crate) fn build(src: &str, opt: u8) -> Option<(Program, Interner)> {
+        normalized(|| build_in_current_host_mode(src, opt))
+    }
+
+    /// [`build`] without the normalization: whatever MIR *this* host's `mir_build` produces under
+    /// whichever window is currently open. Every gate that reports a number must use [`build`];
+    /// this exists for the invariance gate, whose two sweeps pick the condition per program and so
+    /// must supply their own [`normalized`]/[`host_native`] wrapper.
+    ///
+    /// It deliberately does NOT take the lock itself. [`ENV_LOCK`] is a plain `Mutex` and is not
+    /// reentrant, so a caller that already holds a window and then called [`build`] would deadlock
+    /// against itself â€” which is exactly what `sweep_corpus` would do if it wrapped [`build`]
+    /// instead of this.
+    pub(crate) fn build_in_current_host_mode(src: &str, opt: u8) -> Option<(Program, Interner)> {
+        use wukong_span::SourceMap;
+        let mut sm = SourceMap::new();
+        let id = sm.add("gate.wk".to_string(), src.to_string());
+        let (tokens, ld) = wukong_lexer::tokenize(sm.source(id), id);
+        if ld.iter().any(|d| d.is_error()) {
+            return None;
+        }
+        let mut interner = Interner::new();
+        let (module, pd) =
+            wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        if pd.iter().any(|d| d.is_error()) {
+            return None;
+        }
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        if sd.iter().any(|d| d.is_error()) {
+            return None;
+        }
+        let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        if md.iter().any(|d| d.is_error()) {
+            return None;
+        }
+        wukong_opt::optimize(&mut program, opt);
+        Some((program, interner))
+    }
+}
+
+// ============================================================================================
+// Coverage gate: tests/run corpus through the GPU-lowering backend vs the interpreter oracle.
+// ============================================================================================
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// `ptx_vmath_lowp` builds the bf16/f16 activation kernels by slicing `PTX_VMATH` between two
+    /// literal markers. That is a self-referential invariant of this file: renaming `VM_ST:` or
+    /// reflowing the first dispatch line silently turns every bf16/f16 activation program into an
+    /// `UNSUPPORTED:` decline. Pin it here â€” this test needs no CUDA device, so it fires on any
+    /// `--features gpu` build the moment the PTX literal and the splice desync.
+    #[test]
+    fn vmath_lowp_markers_present() {
+        assert!(
+            PTX_VMATH.contains(VM_DISPATCH_MARKER),
+            "PTX_VMATH no longer contains the op-dispatch marker {VM_DISPATCH_MARKER:?} that \
+             ptx_vmath_lowp splices from"
+        );
+        assert!(
+            PTX_VMATH.contains(VM_STORE_MARKER),
+            "PTX_VMATH no longer contains the store marker {VM_STORE_MARKER:?} that \
+             ptx_vmath_lowp splices to"
+        );
+        // And the splice really produces a kernel (markers in the right order, non-empty body).
+        let k = ptx_vmath_lowp("mrt_vmath_bf16", "bf16").expect("bf16 vmath kernel");
+        assert!(
+            k.contains("cvt.f32.bf16"),
+            "spliced kernel lost its bf16 input widen"
+        );
+        assert!(k.is_ascii(), "PTX must stay ASCII");
+    }
+
+    /// **The gpu-native floor gate** â€” the one this crate did not have. Every other PTX family pins
+    /// its module header in a device-free test (`ptx_fp8_train::fp8_train_floors_are_split_by_...`,
+    /// `baselines::int8_dequant_chain_peer_ptx_is_floored_and_ascii`, the `ptx*` family gates); the
+    /// general MIR->PTX path â€” the only backend that emits a module for an *arbitrary* program, and
+    /// therefore the one whose floor governs the most output â€” referenced
+    /// [`crate::ptx_target::HDR_SM80`] at both `push_str` sites with nothing asserting it.
+    ///
+    /// Both over-declarations are invisible to every other gate in this crate, because both JIT fine
+    /// on the Ada card the corpus gate runs on:
+    ///   * `.target sm_89` loads on **zero** A100s â€” PTX is forward-compatible only;
+    ///   * `.version 8.4` is refused by `cuModuleLoadData` on any driver **below r550**, and the
+    ///     cloud fleets this retarget exists for run r535/r545. The version is an independent
+    ///     portability axis from the target, so it is asserted independently.
+    ///
+    /// Both emitters are gated: [`emit_ptx`] and [`emit_mega_ptx`] only build text (the device is
+    /// touched later, by `jit_run*`), so this is pure-CPU and fires on any `--features gpu` build.
+    /// Swept at `-O0` and `-O3` because the two levels present different MIR to the emitters.
+    #[test]
+    fn gpu_native_modules_open_at_the_sm80_floor() {
+        use crate::ptx_target::{HDR_SM80, TARGET_SM80, TARGET_SM89};
+
+        // A parameterless `main` (the megakernel entry requires no params) with a loop, integer
+        // arithmetic and a print â€” enough MIR that both emitters walk their real emission tables.
+        const SCALAR: &str = r#"module gate
+
+fn main() -> i32 {
+    let mut s: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 8 {
+        s = s + i * 2;
+        i = i + 1;
+    }
+    print(s);
+    return 0;
+}
+"#;
+
+        // And a `@parallel` elementwise nest, which is what walks the two emission paths added in
+        // Phase 1: the lane-wise SIMD emitters (`mir_build` vectorizes this loop) and the grid-stride
+        // `wukong_parallel_for` arm, whose `%nctaid.x` read, `min.s64` and `div.u64` are all
+        // pre-Ampere â€” asserted here rather than assumed, because this gate's whole reason for
+        // existing is that an over-declared floor JITs perfectly on the Ada card the corpus runs on
+        // and loads on zero A100s.
+        const PARALLEL: &str = r#"module gate_par
+@parallel
+fn main() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    let mut y: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = (i as f32) * 2.0; }
+    for i in 0..64 {
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }
+    print(y[63] as i32);
+    return 0;
+}
+"#;
+
+        for (probe, src) in [("scalar", SCALAR), ("parallel", PARALLEL)] {
+            for opt in [0u8, 3u8] {
+                let (program, mut interner) =
+                    build(src, opt).expect("the floor probe program must compile");
+                let entry = interner.intern("main");
+                let modules = [
+                    ("emit_ptx", emit_ptx(&program, entry, &interner)),
+                    ("emit_mega_ptx", emit_mega_ptx(&program, entry, &interner)),
+                ];
+                for (what, res) in modules {
+                    // A decline is not this gate's business (the corpus floors own coverage), but a
+                    // module that IS emitted must open at the floor.
+                    let ptx = match res {
+                        Ok(p) => p,
+                        Err(e) if e.starts_with(UNSUPPORTED) => continue,
+                        Err(e) => panic!("{probe}/{what}@O{opt}: lowering failed: {e}"),
+                    };
+                    assert!(
+                        ptx.starts_with(HDR_SM80),
+                        "{probe}/{what}@O{opt}: must open with HDR_SM80 (`.version 7.8` / \
+                         `.target sm_80`), got: {:?}",
+                        ptx.lines().take(3).collect::<Vec<_>>()
+                    );
+                    assert!(
+                        ptx.contains(TARGET_SM80),
+                        "{probe}/{what}@O{opt}: lost the sm_80 floor"
+                    );
+                    assert!(
+                        !ptx.contains(TARGET_SM89),
+                        "{probe}/{what}@O{opt}: `{TARGET_SM89}` loads on zero A100s and nothing \
+                         here needs Ada"
+                    );
+                    assert!(
+                        !ptx.contains(".version 8.4"),
+                        "{probe}/{what}@O{opt}: `.version 8.4` demands driver r550+; this \
+                         instruction mix (generic scalar PTX, `bar.sync`, `red.f32`, one \
+                         `atom.global.add`) needs nothing above ISA 7.0"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A hand-built MIR function carrying the **portable SIMD** shape the CPU loop vectorizer emits:
+    /// `Splat`, `Iota`, a lane-wise `Bin`, a vector `Store`, and `ExtractLane` reading one lane back
+    /// out as a scalar. Device-free: it asserts the emitted text, not a run.
+    ///
+    /// Built here rather than through the frontend because the shape is a *lowering* contract, not a
+    /// source pattern â€” which loop `wukong_opt::vectorize` chooses to vectorize (and whether a
+    /// recognizer claims it first) can change without this obligation changing. `verify_program`
+    /// runs on it first so a test that stopped exercising legal MIR fails as a bad test rather than
+    /// as a lowering bug.
+    fn simd_probe(interner: &mut Interner) -> Program {
+        use wukong_mir::Builder;
+        let vt = MirType::Vec(Box::new(MirType::F32), 4);
+        let mut b = Builder::new(interner.intern("main"), MirType::I32);
+        let p = b.alloca(MirType::Array(Box::new(MirType::F32), 4));
+        let c = b.build(MirType::F32, Op::ConstFloat(2.5, MirType::F32));
+        let splat = b.build(vt.clone(), Op::Splat(c));
+        let ramp = b.build(
+            MirType::Vec(Box::new(MirType::I32), 4),
+            Op::Iota(MirType::Vec(Box::new(MirType::I32), 4)),
+        );
+        let ramp_f = b.build(vt.clone(), Op::Cast(CastKind::SiToFp, ramp, vt.clone()));
+        let sum = b.build(vt.clone(), Op::Bin(BinOp::FAdd, splat, ramp_f));
+        b.build_void(Op::Store {
+            ptr: p,
+            value: sum,
+        });
+        // Read the vector back and run the rest of the lane-wise menu over it, so one probe covers
+        // every vector op `wukong_opt::vectorize` can emit rather than just the three that were
+        // declining.
+        let back = b.build(vt.clone(), Op::Load(p, vt.clone()));
+        let fma = b.build(vt.clone(), Op::Fma(back, splat, sum));
+        let root = b.build(vt.clone(), Op::Sqrt(fma));
+        let mask = b.build(
+            MirType::Vec(Box::new(MirType::I1), 4),
+            Op::Cmp(CmpOp::Fogt, root, splat),
+        );
+        let pick = b.build(vt.clone(), Op::Select(mask, root, splat));
+        let lane3 = b.build(MirType::F32, Op::ExtractLane(pick, 3));
+        b.build_void(Op::Call {
+            func: interner.intern("print"),
+            args: vec![lane3],
+        });
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        b.ret(Some(zero));
+        let mut program = Program::new();
+        program.funcs.push(b.finish());
+        let errs = wukong_mir::verify::verify_program(&program);
+        assert!(errs.is_empty(), "the SIMD probe MIR must verify: {errs:?}");
+        program
+    }
+
+    /// **Portable SIMD MIR lowers to PTX** (Task 1.1) â€” one lane's worth of instructions per lane,
+    /// ASCII only, at the `sm_80` floor. Before this, `Splat`/`ExtractLane`/`Iota` were three
+    /// `UNSUPPORTED:` declines and any vectorized function skipped the device entirely.
+    #[test]
+    fn portable_simd_mir_lowers_to_ascii_ptx() {
+        let mut interner = Interner::new();
+        let program = simd_probe(&mut interner);
+        let entry = interner.intern("main");
+        let ptx = emit_ptx(&program, entry, &interner).expect("portable SIMD must lower");
+
+        assert!(ptx.is_ascii(), "PTX must stay ASCII (ptxas rejects non-ASCII)");
+        assert!(
+            ptx.starts_with(crate::ptx_target::HDR_SM80),
+            "the SIMD lowering must not introduce a header of its own"
+        );
+        // Scalarized: one lane's worth of instructions per lane, not one vector op. Every emitter the
+        // probe exercises must show up four times.
+        for (op, what) in [
+            ("add.rn.f32", "vector Bin"),
+            ("st.f32", "vector Store"),
+            ("ld.f32", "vector Load"),
+            ("fma.rn.f32", "vector Fma"),
+            ("sqrt.rn.f32", "vector Sqrt"),
+            ("setp.gt.f32", "vector Cmp"),
+            ("selp.f32", "vector Select"),
+        ] {
+            assert_eq!(
+                ptx.matches(op).count(),
+                4,
+                "expected one `{op}` per lane for {what}, found {} in:\n{ptx}",
+                ptx.matches(op).count()
+            );
+        }
+        // `Iota` materializes lane k as the constant k; `ExtractLane` is a register copy.
+        for k in 0..4 {
+            assert!(
+                ptx.contains(&format!(", {k};")),
+                "lane constant {k} missing from the iota ramp in:\n{ptx}"
+            );
+        }
+        assert!(
+            ptx.contains("mov.f32"),
+            "ExtractLane must copy the lane register into the scalar result in:\n{ptx}"
+        );
+    }
+
+    /// **A SIMD value can cross a block edge** (Task 1.1): a loop whose accumulator is a
+    /// `<4 x f32>` block param â€” the shape a vectorized reduction has â€” lowers to one `mov` per lane
+    /// per edge, and the epilogue reads the lanes back with `ExtractLane`.
+    ///
+    /// This was the second half of the SIMD hole and it failed *differently* from a missing op arm:
+    /// `lanes()` declined with "used before definition" because the register set of a vector param
+    /// had no owner. Hand-built for the same reason as `simd_probe`.
+    #[test]
+    fn simd_accumulator_crosses_a_block_edge() {
+        use wukong_mir::Builder;
+
+        let mut interner = Interner::new();
+        let vt = MirType::Vec(Box::new(MirType::F32), 4);
+        let mut b = Builder::new(interner.intern("main"), MirType::I32);
+
+        // entry: acc = splat 0.0 ; i = 0 ; br loop(acc, i)
+        let zerof = b.build(MirType::F32, Op::ConstFloat(0.0, MirType::F32));
+        let acc0 = b.build(vt.clone(), Op::Splat(zerof));
+        let i0 = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let four = b.build(MirType::I64, Op::ConstInt(4, MirType::I64));
+        let step = b.build(MirType::F32, Op::ConstFloat(1.5, MirType::F32));
+        let vstep = b.build(vt.clone(), Op::Splat(step));
+
+        let loop_blk = b.new_block();
+        let exit_blk = b.new_block();
+        let acc = b.block_param(loop_blk, vt.clone());
+        let iv = b.block_param(loop_blk, MirType::I64);
+        let acc_out = b.block_param(exit_blk, vt.clone());
+        b.br(loop_blk, vec![acc0, i0]);
+
+        // loop(acc, i): acc' = acc + vstep ; i' = i + 1 ; if i' < 4 -> loop else exit(acc')
+        b.switch_to(loop_blk);
+        let acc1 = b.build(vt.clone(), Op::Bin(BinOp::FAdd, acc, vstep));
+        let i1 = b.build(MirType::I64, Op::Bin(BinOp::Add, iv, one));
+        let more = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i1, four));
+        b.set_term(Terminator::CondBr {
+            cond: more,
+            then_blk: loop_blk,
+            then_args: vec![acc1, i1],
+            else_blk: exit_blk,
+            else_args: vec![acc1],
+        });
+
+        // exit(acc'): print(lane0 + lane3) ; return 0
+        b.switch_to(exit_blk);
+        let l0 = b.build(MirType::F32, Op::ExtractLane(acc_out, 0));
+        let l3 = b.build(MirType::F32, Op::ExtractLane(acc_out, 3));
+        let s = b.build(MirType::F32, Op::Bin(BinOp::FAdd, l0, l3));
+        b.build_void(Op::Call {
+            func: interner.intern("print"),
+            args: vec![s],
+        });
+        let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        b.ret(Some(zero));
+
+        let mut program = Program::new();
+        program.funcs.push(b.finish());
+        let errs = wukong_mir::verify::verify_program(&program);
+        assert!(errs.is_empty(), "the SIMD-edge probe MIR must verify: {errs:?}");
+
+        let entry = interner.intern("main");
+        let ptx = emit_ptx(&program, entry, &interner)
+            .expect("a vector block param must lower, not decline");
+        assert!(ptx.is_ascii(), "PTX must stay ASCII");
+        // Two vector edges (loop back-edge and exit edge) x 4 lanes x (temp + param copy) = 16
+        // lane copies, plus the two `ExtractLane` reads.
+        assert!(
+            ptx.matches("mov.f32").count() >= 18,
+            "expected per-lane edge copies, found {} `mov.f32` in:\n{ptx}",
+            ptx.matches("mov.f32").count()
+        );
+        assert_eq!(
+            ptx.matches("add.rn.f32").count(),
+            5,
+            "expected 4 lane adds in the loop body + 1 scalar add in the epilogue in:\n{ptx}"
+        );
+    }
+
+    /// **The grid-stride loop takes its geometry from the launch, not from a literal** (Task 1.3).
+    ///
+    /// The occupancy discipline in this crate is that a device fact is probed or the process fails:
+    /// `Gpu::new` aborts on an unqueryable SM count (it used to fall back to a silent `20`, this
+    /// laptop's number, which is wrong-but-plausible on every other card) and `megakernel::plan_grid`
+    /// derives the grid from `cuOccupancyMaxActiveBlocksPerMultiprocessor x sm_count`. A lowering
+    /// that hardcoded `256` threads would sit *underneath* all of that and silently visit a fraction
+    /// of the domain the moment the launch geometry changed â€” including the existing
+    /// `WUKONG_MEGA_GRID` sweep and the grid-parallel ABI this module already emits for the barrier
+    /// probe.
+    ///
+    /// So the index and stride must be read out of `%tid.x`/`%ctaid.x` and `%ntid.x`/`%nctaid.x`, and
+    /// the emitted preamble is checked to carry no thread- or SM-count immediate. Device-free: it
+    /// reads the text.
+    #[test]
+    fn grid_stride_geometry_comes_from_the_launch() {
+        const SRC: &str = r#"module gate_par
+@parallel
+fn main() -> i32 {
+    let mut x: [f32; 512] = [0.0; 512];
+    let mut y: [f32; 512] = [0.0; 512];
+    for i in 0..512 { x[i] = (i as f32) * 2.0; }
+    for i in 0..512 {
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }
+    print(y[511] as i32);
+    return 0;
+}
+"#;
+        let (program, mut interner) = build(SRC, 2).expect("the @parallel probe must compile");
+        let entry = interner.intern("main");
+        let ptx = emit_mega_ptx(&program, entry, &interner)
+            .expect("a generic @parallel region must lower in mega mode");
+        assert!(ptx.is_ascii(), "PTX must stay ASCII");
+
+        for reg in ["%tid.x", "%ntid.x", "%ctaid.x", "%nctaid.x"] {
+            assert!(
+                ptx.contains(reg),
+                "the grid-stride index/stride must be derived from {reg} in:\n{ptx}"
+            );
+        }
+        // The stride preamble: the grid-stride emitter's own geometry reads, i.e. from the LAST
+        // `%tid.x` before the loop label (the mega preamble reads one too, for the `tid==0` guard).
+        let to = ptx.find("PFOR").expect("the grid-stride loop label");
+        let from = ptx[..to].rfind("%tid.x").expect("a geometry read");
+        let pre = &ptx[from..to];
+        assert!(
+            pre.contains("%nctaid.x"),
+            "the stride must span the whole GRID (blockDim x gridDim), not one CTA:\n{pre}"
+        );
+        for lit in [
+            format!(", {};", crate::megakernel::MEGA_BLOCK),
+            ", 20;".to_string(),
+        ] {
+            assert!(
+                !pre.contains(&lit),
+                "the grid-stride preamble carries the immediate `{lit}`, i.e. a launch-geometry \
+                 literal. Read it from the launch (%ntid.x / %nctaid.x) â€” a baked-in thread or SM \
+                 count visits a fraction of the domain as soon as the launch changes:\n{pre}"
+            );
+        }
+    }
+
+    /// User `shared [T; N]` allocas lower through `cvta.shared` (generic addresses). `ld.shared` /
+    /// `st.shared` require shared-space addresses and fault on the generic pointers â€” mirror the
+    /// `.local` frame path (`cvta.local` + generic `ld`/`st`, never `ld.local`). Device-free.
+    #[test]
+    fn shared_user_smem_uses_generic_ld_after_cvta_shared() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/run/lang_shared_transpose.wk"
+        );
+        let src = std::fs::read_to_string(path).expect("lang_shared_transpose.wk");
+        let (program, mut interner) = build(&src, 2).expect("compile shared transpose fixture");
+        let entry = interner.intern("main");
+        let ptx = emit_ptx(&program, entry, &interner).expect("emit_ptx");
+        assert!(
+            ptx.contains("cvta.shared.u64"),
+            "shared alloca base must be cvta.shared"
+        );
+        assert!(
+            !ptx.contains("ld.shared"),
+            "cvta.shared addresses must use generic ld, not ld.shared"
+        );
+        assert!(
+            !ptx.contains("st.shared"),
+            "cvta.shared addresses must use generic st, not st.shared"
+        );
+    }
+
+    /// Coalesced vector loads: when coalesce analysis marks a `<4 x f32>` global load, emit
+    /// `ld.global.v4.f32` instead of four scalar generic loads. Device-free.
+    #[test]
+    fn coalesced_vector_loads_emit_ld_global_v4() {
+        const SRC: &str = r#"module v4
+@generic
+fn copy(mut dst: [f32; 16], src: [f32; 16]) {
+    for i in 0..16 { dst[i] = src[i]; }
+}
+fn main() -> i32 {
+    let s: [f32; 16] = [1.0; 16];
+    let mut d: [f32; 16] = [0.0; 16];
+    copy(d, s);
+    return 0;
+}
+"#;
+        let (program, mut interner) = build(SRC, 2).expect("vectorized generic copy must compile");
+        let entry = interner.intern("main");
+        let ptx = emit_ptx(&program, entry, &interner).expect("emit_ptx");
+        assert!(ptx.is_ascii(), "PTX must stay ASCII");
+        assert!(
+            ptx.contains("ld.global.v4.f32"),
+            "coalesced <4 x f32> loads should emit ld.global.v4.f32 in:\n{ptx}"
+        );
+    }
+
+    /// The comparator the corpus gate is built on, pinned against the real divergence it used to
+    /// wave through. The four "before" lines are the actual gpu-native -O3 output of
+    /// `tests/run/bf16_literal_grid.wk` when bf16/f16 constants were not grid-rounded; the oracle
+    /// column is the interpreter's. Every one of them passed the old 1e-2 relative tolerance.
+    /// Needs no CUDA device.
+    #[test]
+    fn integer_lines_compare_exactly() {
+        for (gpu, cpu) in [
+            ("10000", "10009"),
+            ("10000", "9997"),
+            ("32968", "33125"),
+            ("3141", "3140"),
+        ] {
+            assert!(
+                !line_matches(gpu, cpu),
+                "integer line {gpu} must not match the oracle's {cpu}"
+            );
+        }
+        assert!(!outputs_match(
+            b"10000\n10000\n32968\n3141\n",
+            b"10009\n9997\n33125\n3140\n"
+        ));
+        // Equal integers still match, in any spelling that parses to the same value.
+        assert!(line_matches("12345678901", "12345678901"));
+        assert!(line_matches("-0", "0"));
+        // Floats keep the CPU<->GPU tolerance (reduction order / SFU differences).
+        assert!(line_matches("1.0000001", "1.0"));
+        assert!(line_matches("0.30000000000000004", "0.3"));
+        assert!(!line_matches("1.5", "2.5"));
+    }
+
+    // `build` compiles `.wk` source with the host's 256-bit raw-AVX2 loop vectorizer suppressed â€”
+    // the normalization that makes every coverage count below mean the same thing on a Win64 box
+    // and on a Linux datacenter box. `build_in_current_host_mode` is the un-normalized twin, for
+    // the invariance gate's attribution arm only. Both are shared with `megakernel.rs`'s corpus
+    // gate so the two sweeps cannot drift; see `crate::lower::hostvec` for mechanism and
+    // measurement.
+    use hostvec::{build, build_in_current_host_mode};
+
+    /// Compare one output line. **Integer output is compared exactly**: `decode_ctx` replays an
+    /// integer print record with the identical `format!("{}\n", payload as i64)` the interpreter
+    /// uses, so any difference on such a line is a miscompile, never a rounding artifact. Only a
+    /// line carrying a float form gets the CPU<->GPU tolerance, which exists for reduction-order and
+    /// SFU differences.
+    ///
+    /// The tolerance used to apply to *every* numeric line, which made a large class of miscompiles
+    /// report green: on `bf16_literal_grid.wk` the GPU printed 10000 where the oracle printed 10009
+    /// and `9 <= 1e-2 * 10009` accepted it. bf16/f16 error is structurally bounded by 2^-9 relative,
+    /// so a 1e-2 relative slack could never catch that bug class.
+    fn line_matches(g: &str, c: &str) -> bool {
+        if g == c {
+            return true;
+        }
+        let (gt, ct) = (g.trim(), c.trim());
+        if let (Ok(a), Ok(b)) = (gt.parse::<i128>(), ct.parse::<i128>()) {
+            return a == b;
+        }
+        match (gt.parse::<f64>(), ct.parse::<f64>()) {
+            (Ok(a), Ok(b)) => {
+                let diff = (a - b).abs();
+                diff <= 1e-3 || diff <= 1e-2 * b.abs().max(a.abs())
+            }
+            _ => false,
+        }
+    }
+
+    fn outputs_match(gpu: &[u8], cpu: &[u8]) -> bool {
+        let gs = String::from_utf8_lossy(gpu);
+        let cs = String::from_utf8_lossy(cpu);
+        let gl: Vec<&str> = gs.lines().collect();
+        let cl: Vec<&str> = cs.lines().collect();
+        gl.len() == cl.len() && gl.iter().zip(&cl).all(|(a, b)| line_matches(a, b))
+    }
+
+    /// The **coverage ratchet** for `run_corpus_matches_interp_oracle`: how many `tests/run`
+    /// programs must lower, run on the device and match the interpreter oracle at BOTH -O0 and -O3.
+    ///
+    /// The gate below asserts correctness *of what runs*. A `lower::UNSUPPORTED` decline is a skip,
+    /// so without this floor a change that stops lowering some construct turns **nothing** red â€” it
+    /// just quietly shrinks the set being checked. That is proven history, not theory: the
+    /// loop-vectorizer campaign cost gpu-native ~10% of the corpus (39 programs declined on a single
+    /// missing `Op::Iota` arm) and every gate in the workspace stayed green until an agent probed a
+    /// decline by hand.
+    ///
+    /// Deliberately a **count**, not a ratio: a newly added fixture that declines leaves `covered`
+    /// unchanged, so corpus growth can never trip this, while a construct that stops lowering always
+    /// does.
+    ///
+    /// **The count is host-invariant**, which it was not until 2026-08-09. It is measured over MIR
+    /// built with the host CPU's 256-bit raw-AVX2 loop vectorizer suppressed (see
+    /// [`crate::lower::hostvec`], which every `build` here routes through), because that vectorizer
+    /// only exists on Win64 and this backend declines the `Op::VecKernelCall` it emits. The old
+    /// floor of 217 was a Windows number: the very same sweep read 235 on a Modal L4 purely because
+    /// Linux never produced the op, so on Linux `235 > 217` passed trivially and the ratchet could
+    /// never have caught a regression there â€” on the hosts the datacenter round is paid for.
+    /// Normalizing the input rather than the floor also *adds* Windows device coverage: the 18
+    /// affected programs now genuinely lower, run and get compared.
+    ///
+    /// Recorded 2026-08-09 by this gate on an RTX 4050 / Windows: **235 of 357** programs, zero
+    /// mismatches, zero faults. The same number three independent ways â€” the pre-normalization
+    /// Modal L4 (Linux) sweep the same day read exactly 235/357, because Linux was already in this
+    /// condition; the device-free `corpus_lowering_floors_are_host_vectorizer_invariant` counts 235
+    /// lowerable; and that gate reproduces the old 217 exactly when it re-sweeps host-native, which
+    /// is what pins the +18 on the host CPU vectorizer and nothing else. Two operating systems and
+    /// two cards now agree on one constant. The remaining 122 declines are honest `UNSUPPORTED`,
+    /// dominated by not-yet-lowered `wukong_*` runtime kernel calls. Raise this whenever coverage
+    /// grows; lower it ONLY in the same commit as the intentional decline, and say why here.
+    ///
+    /// **2026-08-13, raised 235 -> 256** (RTX 4050 / Windows, same box and the same
+    /// three-way agreement: this device gate reads 256, the device-free sweep above reads 256
+    /// lowerable, and the host-native re-sweep still attributes its whole delta to the host CPU
+    /// vectorizer). +17 over the 239 the branch point measured on a 361-program corpus, from Phase 1
+    /// SIMD lowering: `Op::ExtractLane` and vector block params were the last two portable-SIMD
+    /// holes, and a vectorized function that hit either skipped the device entirely. One of the +17
+    /// is `lang_parallel_saxpy`, added in the same series. The remaining 106 declines are honest
+    /// `UNSUPPORTED` â€” still dominated by not-yet-lowered `wukong_*` kernels, plus `GlobalAddr`
+    /// (string data), `wukong_rt_alloc` (heap) and `print_u`.
+    ///
+    /// **256 -> 257** in the same series, when `lang_parallel_int_regions` was added: an i64
+    /// `@parallel` fixture, which lowers on Win64 in the default host mode because the 256-bit
+    /// raw-AVX2 recipe is f32-only. 257 of 363 on the device gate and 257 lowerable device-free.
+    const RUN_CORPUS_COVERAGE_FLOOR: usize = 258;
+
+    /// The corpus directory both coverage gates and the invariance gate below sweep.
+    fn corpus_files() -> Vec<PathBuf> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/run");
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("read tests/run")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "wk").unwrap_or(false))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// What one device-free sweep of the corpus can establish about coverage.
+    #[derive(Default)]
+    struct Sweep {
+        /// Programs `jit_run` would obtain a PTX module for at BOTH -O0 and -O3 â€” an upper bound on
+        /// `run_corpus_matches_interp_oracle`'s `covered`, and empirically equal to it (see the
+        /// gate's doc).
+        lowerable: std::collections::BTreeSet<String>,
+        /// `name@O{opt}` configs `fusion::analyze` accepts â€” `mega_corpus_matches_oracle`'s
+        /// `eligible`.
+        mega_eligible: std::collections::BTreeSet<String>,
+        /// `name@O{opt}` configs the megakernel emitter also produces a module for â€” its `ran`.
+        mega_lowerable: std::collections::BTreeSet<String>,
+        /// Programs whose MIR carries a raw-AVX2 `Op::VecKernelCall`. **This is the entire
+        /// host-dependent term** in every count above.
+        veckernel: std::collections::BTreeSet<String>,
+        /// Emitter errors that are NOT an `UNSUPPORTED:` decline. A decline is coverage the backend
+        /// honestly does not have; anything else is a bug that would show up on the device as a
+        /// *fault*, so it is asserted away here where no GPU is needed to see it.
+        hard_errors: Vec<String>,
+    }
+
+    /// Sweep the corpus device-free, either with the host's 256-bit raw-AVX2 loop vectorizer
+    /// suppressed (`normalize`) or with this host's own setting â€” the two arms whose difference is
+    /// the whole point of the gate below.
+    ///
+    /// Because the condition is a parameter, it opens the window itself around
+    /// [`hostvec::build_in_current_host_mode`] rather than calling [`build`], which hardcodes the
+    /// normalized arm and would re-enter `hostvec`'s non-reentrant mutex and deadlock.
+    fn sweep_corpus(files: &[PathBuf], normalize: bool) -> Sweep {
+        /// An emitter result as coverage: `Ok` covers, an `UNSUPPORTED:` decline does not, anything
+        /// else is a bug recorded on `hard`.
+        fn covers(
+            hard: &mut Vec<String>,
+            cfg: &str,
+            what: &str,
+            r: Result<String, String>,
+        ) -> bool {
+            match r {
+                Ok(_) => true,
+                Err(e) if e.starts_with(UNSUPPORTED) => false,
+                Err(e) => {
+                    hard.push(format!("{cfg}: {what}: {e}"));
+                    false
+                }
+            }
+        }
+
+        let mut s = Sweep::default();
+        for path in files {
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            let src = std::fs::read_to_string(path).unwrap();
+            let mut lowerable = true;
+            for opt in [0u8, 3u8] {
+                let cfg = format!("{name}@O{opt}");
+                let built = if normalize {
+                    hostvec::normalized(|| build_in_current_host_mode(&src, opt))
+                } else {
+                    hostvec::host_native(|| build_in_current_host_mode(&src, opt))
+                };
+                let Some((program, mut interner)) = built else {
+                    lowerable = false;
+                    continue;
+                };
+                let entry = interner.intern("main");
+                if program.function(entry).is_none() {
+                    lowerable = false;
+                    continue;
+                }
+                if program.funcs.iter().any(|f| {
+                    f.blocks.iter().any(|b| {
+                        b.insts
+                            .iter()
+                            .any(|i| matches!(i.op, Op::VecKernelCall { .. }))
+                    })
+                }) {
+                    s.veckernel.insert(name.clone());
+                }
+
+                // Model `jit_run`: the megakernel first when `fusion::analyze` accepts the program,
+                // then the single-thread lowering. Either module means the device would have run it.
+                let mega = if crate::fusion::analyze(&program, entry, &interner).eligible {
+                    s.mega_eligible.insert(cfg.clone());
+                    covers(
+                        &mut s.hard_errors,
+                        &cfg,
+                        "emit_mega_ptx",
+                        emit_mega_ptx(&program, entry, &interner),
+                    )
+                } else {
+                    false
+                };
+                let single = covers(
+                    &mut s.hard_errors,
+                    &cfg,
+                    "emit_ptx",
+                    emit_ptx(&program, entry, &interner),
+                );
+                if mega {
+                    s.mega_lowerable.insert(cfg);
+                }
+                lowerable &= mega || single;
+            }
+            if lowerable {
+                s.lowerable.insert(name);
+            }
+        }
+        s
+    }
+
+    /// **The device-free proof that both corpus floors measure this backend and not the host CPU.**
+    ///
+    /// [`RUN_CORPUS_COVERAGE_FLOOR`] and
+    /// [`crate::megakernel::tests::MEGA_CORPUS_COVERAGE_FLOOR`] used to be Windows numbers: 217 and
+    /// 87 here, 235 and 90 on a Modal L4 the same day, because `wukong_mir_build`'s 256-bit
+    /// raw-AVX2 loop vectorizer exists only under the Win64 ABI and this backend declines the
+    /// `Op::VecKernelCall` it emits. A single hardcoded floor cannot ratchet two numbers: on the
+    /// higher-reading host it passes with slack and would never catch a regression â€” and the higher
+    /// reading was Linux, i.e. exactly the datacenter fleet the GPU retarget is being paid to run
+    /// on. Worse, the +18 read as *progress* in a log.
+    ///
+    /// So the sweeps normalize their input (`crate::lower::hostvec`) and this gate proves the
+    /// normalization is both effective and complete:
+    ///
+    /// 1. **Effective** â€” no program in the normalized corpus carries a `VecKernelCall` at all, so
+    ///    the one host-dependent term in the count is identically zero on every host. Delete the
+    ///    normalization and this fails on Windows immediately (26 programs carry one). And it is
+    ///    checked **non-vacuously**: where the vectorizer exists, the host-native re-sweep must
+    ///    find at least one carrier, or "the normalized sweep has none" would hold for free.
+    /// 2. **Complete** â€” re-sweeping host-native (only meaningful where
+    ///    `wukong_mir::host_supports_vec_kernels()` is true; elsewhere the two sweeps are the same
+    ///    build by construction) recovers the *old* counts, and every program the normalization
+    ///    gained is one that carried a `VecKernelCall`, with nothing lost. That is what attributes
+    ///    the whole 217â†’235 / 87â†’90 delta to the host CPU vectorizer rather than to anything in
+    ///    `lower.rs`. Note this is the only direction that can be checked from one machine: it
+    ///    shows the Win64 sweep reproduces the Linux number, which is what "invariant" has to mean
+    ///    when you can only run one OS at a time.
+    /// 3. It re-asserts both floors against a count that needs **no GPU**, so a lowering regression
+    ///    is catchable on any box with the toolchain â€” until now the two device gates were the only
+    ///    check and they skip wherever there is no card. (It is still behind `--features gpu` like
+    ///    everything else in this module, and CI's gpu job is `cargo check`, so CI compiles this
+    ///    but does not run it. `cargo test -p wukong_codegen_gpu --features gpu` runs it anywhere.)
+    ///
+    /// `emit_ptx`/`emit_mega_ptx`/`fusion::analyze` are pure host code, so this is CPU-only. The
+    /// counts here are an *upper bound* on the device gates' `covered`/`ran` (a program can still
+    /// mismatch or overflow the print buffer at run time), but measured 2026-08-09 they are exactly
+    /// equal on both hosts, which is why they can ratchet the same constants. It sweeps the corpus
+    /// twice, so it costs ~35 s in a debug build â€” the price of the floors being checkable at all
+    /// without silicon.
+    #[test]
+    fn corpus_lowering_floors_are_host_vectorizer_invariant() {
+        use crate::megakernel::tests::MEGA_CORPUS_COVERAGE_FLOOR;
+
+        let files = corpus_files();
+        let norm = sweep_corpus(&files, true);
+
+        eprintln!(
+            "\n=== corpus lowering (device-free) â€” normalized, host 256-bit AVX2 vectorizer OFF ===\
+             \n    single: {}/{} programs lowerable (floor {RUN_CORPUS_COVERAGE_FLOOR})\
+             \n    mega:   {} lowerable / {} eligible configs (floor {MEGA_CORPUS_COVERAGE_FLOOR})\
+             \n    programs carrying a VecKernelCall: {} (must be 0)",
+            norm.lowerable.len(),
+            files.len(),
+            norm.mega_lowerable.len(),
+            norm.mega_eligible.len(),
+            norm.veckernel.len(),
+        );
+
+        assert!(
+            norm.hard_errors.is_empty(),
+            "the PTX emitters failed with something other than an `{UNSUPPORTED}` decline. A \
+             decline is coverage this backend honestly lacks; this is a bug, and on a device it \
+             would surface as a corpus FAULT:\n{}",
+            norm.hard_errors.join("\n")
+        );
+        assert!(
+            norm.veckernel.is_empty(),
+            "the corpus sweep's MIR still carries `Op::VecKernelCall` in {} program(s): {}. That op \
+             is emitted only where `wukong_mir::host_supports_vec_kernels()` is true (Win64 only) \
+             and is declined by `lower.rs`, so its presence makes every coverage count below a \
+             property of the HOST CPU instead of this backend. `crate::lower::hostvec::normalized` \
+             is supposed to have suppressed it â€” restore that rather than adjusting a floor.",
+            norm.veckernel.len(),
+            norm.veckernel.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+
+        // The floors, re-asserted without a GPU. Same constants the device gates ratchet.
+        assert!(
+            norm.lowerable.len() >= RUN_CORPUS_COVERAGE_FLOOR,
+            "gpu-native corpus LOWERING regressed: {} of {} programs still produce a PTX module at \
+             both -O0 and -O3, floor is {RUN_CORPUS_COVERAGE_FLOOR}. This needs no device, so it is \
+             the first thing to fix. If the decline is INTENTIONAL, update the floor in the SAME \
+             commit and say why in its comment.",
+            norm.lowerable.len(),
+            files.len(),
+        );
+        assert!(
+            norm.mega_lowerable.len() >= MEGA_CORPUS_COVERAGE_FLOOR,
+            "megakernel corpus LOWERING regressed: {} of {} eligible program-configs still produce \
+             a mega PTX module, floor is {MEGA_CORPUS_COVERAGE_FLOOR}. Either `fusion::analyze` \
+             stopped accepting programs or `emit_mega_ptx` started declining them â€” both are silent \
+             on the device gate. If INTENTIONAL, update the floor in the SAME commit.",
+            norm.mega_lowerable.len(),
+            norm.mega_eligible.len(),
+        );
+
+        if !wukong_mir::host_supports_vec_kernels() {
+            eprintln!(
+                "    host-native re-sweep skipped: `host_supports_vec_kernels()` is false on this \
+                 host, so `mir_build` emits no 256-bit recipe and the two sweeps are the same build \
+                 by construction. The attribution half of this gate runs on a Win64 box."
+            );
+            return;
+        }
+
+        // This host DOES have the vectorizer, so it can prove where the difference comes from.
+        let host = sweep_corpus(&files, false);
+        eprintln!(
+            "    host-native re-sweep (this host's own setting):\
+             \n      single: {}/{} lowerable   mega: {} lowerable / {} eligible\
+             \n      programs carrying a VecKernelCall: {}",
+            host.lowerable.len(),
+            files.len(),
+            host.mega_lowerable.len(),
+            host.mega_eligible.len(),
+            host.veckernel.len(),
+        );
+
+        // NON-VACUITY. `norm.veckernel.is_empty()` above is a strong claim only if the corpus can
+        // produce a `VecKernelCall` here in the first place; if it cannot, that assert holds for
+        // free and this whole gate degrades into "two identical sweeps agree". On a host with the
+        // vectorizer the corpus must exercise it, or the normalization is no longer load-bearing
+        // and the floors have quietly gone back to being unattributed numbers.
+        assert!(
+            !host.veckernel.is_empty(),
+            "no `tests/run` program produced an `Op::VecKernelCall` on a host where \
+             `host_supports_vec_kernels()` is true. Either the corpus lost every fixture with a \
+             256-bit-eligible f32 loop, or `mir_build` stopped building the recipe â€” and until one \
+             of those is understood, this gate's `norm.veckernel.is_empty()` assertion proves \
+             nothing and neither floor is attributed to anything. Do NOT delete this check to get \
+             green; the coverage numbers depend on knowing which side the +18 came from."
+        );
+
+        let lost: Vec<&String> = host.lowerable.difference(&norm.lowerable).collect();
+        assert!(
+            lost.is_empty(),
+            "suppressing the host's 256-bit vectorizer LOST lowering coverage for {:?}. The switch \
+             is documented as result-identical (`wukong_codegen_cranelift`'s \
+             `p4_kill_switch_is_result_identical`), so the 128-bit fallback presenting MIR this \
+             backend cannot lower is a real hole â€” find it before trusting any coverage number.",
+            lost
+        );
+        let gained: Vec<&String> = norm.lowerable.difference(&host.lowerable).collect();
+        for g in &gained {
+            assert!(
+                host.veckernel.contains(*g),
+                "`{g}` lowers only when the host vectorizer is off, yet its host-native MIR carries \
+                 no `VecKernelCall`. Then the two sweeps differ for some OTHER reason and the \
+                 host-invariance claim behind {RUN_CORPUS_COVERAGE_FLOOR} does not hold â€” do not \
+                 paper over it by moving the floor."
+            );
+        }
+        let mega_gained: Vec<&String> = norm
+            .mega_lowerable
+            .difference(&host.mega_lowerable)
+            .collect();
+        for g in &mega_gained {
+            let prog = g.split_once("@O").map(|(p, _)| p).unwrap_or(g);
+            assert!(
+                host.veckernel.contains(prog),
+                "mega config `{g}` runs only when the host vectorizer is off, yet `{prog}`'s \
+                 host-native MIR carries no `VecKernelCall` â€” same problem as above, for \
+                 {MEGA_CORPUS_COVERAGE_FLOOR}."
+            );
+        }
+        eprintln!(
+            "    => the whole difference is the host CPU vectorizer: single +{} programs, mega +{} \
+             configs, all of them VecKernelCall carriers ({} such programs on this host). Without \
+             the normalization the floors would have to be {} / {} here and \
+             {RUN_CORPUS_COVERAGE_FLOOR} / {MEGA_CORPUS_COVERAGE_FLOOR} on Linux.",
+            gained.len(),
+            mega_gained.len(),
+            host.veckernel.len(),
+            host.lowerable.len(),
+            host.mega_lowerable.len(),
+        );
+    }
+
+    #[test]
+    fn run_corpus_matches_interp_oracle() {
+        if crate::gpu::gpu().is_none() {
+            // Â§3A P3: a bare `eprintln!` + `return` here reported `ok` having lowered nothing â€”
+            // and this is the widest gate in the crate (357 fixtures x 2 opt levels). Its
+            // megakernel sibling already escalates (`megakernel.rs`'s `mega_corpus_matches_oracle`);
+            // match it, so a rented box that cannot reach its device fails loudly instead of
+            // billing for a green run.
+            crate::diff::skip_or_fail(
+                "run_corpus_matches_interp_oracle",
+                crate::gpu::init_error().unwrap_or("no CUDA device reachable"),
+            );
+            return;
+        }
+        // The mission corpus: the e2e `tests/run` fixtures. (The example/bench kernels are
+        // compute-heavy perf benchmarks â€” e.g. fib(30) is ~2.7M calls â€” which the single-thread
+        // execution model can't run within the OS GPU watchdog; their *lowering* is correct, but
+        // running them needs the grid-parallel perf phase. They are not a lowering-correctness gate.)
+        let files = corpus_files();
+
+        let mut covered = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
+        let mut mismatches: Vec<String> = Vec::new();
+        // Genuine *driver* faults (a kernel that dereferenced out of bounds -> ILLEGAL_ADDRESS), kept
+        // distinct from miscompiles (wrong output on a healthy context). A fault poisons the shared
+        // primary context; `crate::gpu::reset_gpu` attempts recovery, but on this driver error 700 is
+        // process-fatal (the re-retain still returns it), so recovery degrades to record-and-skip:
+        // the remaining programs land on `lost` with a loud count instead of cascading as false
+        // failures. Only the *root* fault is ever reported as a fault.
+        let mut faults: Vec<String> = Vec::new();
+        let mut lost: Vec<String> = Vec::new();
+
+        for path in &files {
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            // After an unrecoverable fault, stop attempting GPU work: every further run would fail
+            // with the same sticky error and misreport healthy programs as broken.
+            if crate::gpu::device_lost() {
+                lost.push(name);
+                continue;
+            }
+            let src = std::fs::read_to_string(path).unwrap();
+
+            // -O0 and -O3 must both match the interpreter (which gives -O0 == -O3 transitively).
+            let mut covered_here = true;
+            for opt in [0u8, 3u8] {
+                let Some((program, mut interner)) = build(&src, opt) else {
+                    covered_here = false;
+                    skipped.push(format!("{name}@O{opt} (frontend rejected)"));
+                    break;
+                };
+                let entry = interner.intern("main");
+                if program.function(entry).is_none() {
+                    covered_here = false;
+                    skipped.push(format!("{name} (no main)"));
+                    break;
+                }
+                let cpu = wukong_interp::run_with_output(&program, entry, &interner);
+                let gpu = jit_run(&program, entry, &interner);
+                match (&cpu, &gpu) {
+                    // Both errored. That is only *agreement* when the GPU's error is the one
+                    // deterministic program-level error both executors produce identically. An
+                    // unchecked "both Err" arm counted an `UNSUPPORTED:` decline as coverage and,
+                    // worse, let a genuine driver fault through without landing on `faults` or
+                    // resetting the context â€” so the next healthy program inherited the sticky
+                    // CUDA error and took the blame, breaking this gate's root-cause-only rule.
+                    (Err(ce), Err(ge)) => {
+                        if ge.starts_with(UNSUPPORTED)
+                            || ge.starts_with("gpu-native print buffer overflow")
+                        {
+                            // A decline or a device-capacity limit: no GPU output existed to compare.
+                            covered_here = false;
+                            skipped.push(format!("{name}@O{opt}: {ge}"));
+                            break;
+                        }
+                        if ge != "assertion failed" {
+                            covered_here = false;
+                            faults.push(format!("{name}@O{opt}: gpu errored: {ge}"));
+                            crate::gpu::reset_gpu();
+                            break;
+                        }
+                        if ce != ge {
+                            covered_here = false;
+                            mismatches
+                                .push(format!("{name}@O{opt}: cpu err `{ce}` gpu err `{ge}`"));
+                            break;
+                        }
+                        // Both `assertion failed` â€” agree.
+                    }
+                    (Ok((ce, co)), Ok((ge, go))) => {
+                        if ce != ge || !outputs_match(go, co) {
+                            mismatches.push(format!(
+                                "{name}@O{opt}: cpu=({ce},{:?}) gpu=({ge},{:?})",
+                                String::from_utf8_lossy(co),
+                                String::from_utf8_lossy(go)
+                            ));
+                            covered_here = false;
+                            break;
+                        }
+                    }
+                    (Ok(_), Err(e)) => {
+                        covered_here = false;
+                        if e.starts_with(UNSUPPORTED) {
+                            skipped.push(format!("{name}@O{opt}: {e}"));
+                        } else {
+                            // A real driver fault poisons the shared context: record it on the fault
+                            // ledger and attempt a context reset. If the reset fails (sticky
+                            // process-level error), `device_lost()` flips and the loop above skips
+                            // the remaining programs loudly instead of cascading.
+                            faults.push(format!("{name}@O{opt}: gpu errored: {e}"));
+                            crate::gpu::reset_gpu();
+                        }
+                        break;
+                    }
+                    (Err(ce), Ok((ge, _))) => {
+                        mismatches.push(format!("{name}@O{opt}: cpu err `{ce}` but gpu ok ({ge})"));
+                        covered_here = false;
+                        break;
+                    }
+                }
+            }
+            if covered_here {
+                covered += 1;
+            }
+        }
+
+        eprintln!(
+            "\n=== gpu-native MIR->PTX coverage: {covered}/{} programs match the interp oracle (-O0==-O3) ===",
+            files.len()
+        );
+        // The raw count above is over the WHOLE corpus â€” nothing is excluded from the denominator.
+        // What is normalized is the input: state that, and state the host's own setting, so a reader
+        // comparing this log against a run on another OS knows the two are the same measurement.
+        eprintln!(
+            "    (host 256-bit raw-AVX2 loop vectorizer suppressed for every build in this sweep, \
+             so the count is host-invariant; this host would otherwise emit VecKernelCall: {}. \
+             See `corpus_lowering_floors_are_host_vectorizer_invariant` for the device-free proof.)",
+            wukong_mir::host_supports_vec_kernels()
+        );
+        if !skipped.is_empty() {
+            eprintln!("-- not yet covered ({}):", skipped.len());
+            for s in &skipped {
+                eprintln!("   {s}");
+            }
+        }
+        if !faults.is_empty() {
+            eprintln!(
+                "-- driver FAULTS ({}, root causes only â€” no cascade):",
+                faults.len()
+            );
+            for f in &faults {
+                eprintln!("   {f}");
+            }
+        }
+        if !lost.is_empty() {
+            eprintln!(
+                "-- NOT RUN ({}): device lost after the fault above (sticky CUDA error; restart to \
+                 re-test): {}",
+                lost.len(),
+                lost.join(", ")
+            );
+        }
+        assert!(
+            mismatches.is_empty(),
+            "GPU-lowered programs disagree with the interpreter oracle (miscompiles):\n{}",
+            mismatches.join("\n")
+        );
+        assert!(
+            faults.is_empty(),
+            "GPU-lowered programs faulted on the device ({} root fault(s); {} later programs \
+             were skipped after device loss, NOT failed â€” these are genuine kernel faults, not \
+             miscompiles):\n{}",
+            faults.len(),
+            lost.len(),
+            faults.join("\n")
+        );
+        assert!(covered > 0, "no programs covered â€” pipeline broken");
+        assert!(
+            covered >= RUN_CORPUS_COVERAGE_FLOOR,
+            "gpu-native corpus coverage regressed below the recorded floor: {covered} of {} \
+             programs match the oracle, floor is {RUN_CORPUS_COVERAGE_FLOOR} ({} lost). This count \
+             is measured over host-vectorizer-normalized MIR (see `crate::lower::hostvec`), so it \
+             is the SAME number on Windows and on a Linux datacenter box â€” a shortfall here is a \
+             real lowering regression, never an OS difference. Every program that stopped running \
+             is on the `-- not yet covered` list printed above (re-run with --nocapture). If the \
+             decline is INTENTIONAL, update RUN_CORPUS_COVERAGE_FLOOR in the SAME commit and say \
+             why in its comment. If it is not, you just silently lost gpu-native corpus coverage â€” \
+             a decline is a skip here, so no other gate in this workspace would ever have told you.",
+            files.len(),
+            RUN_CORPUS_COVERAGE_FLOOR - covered
+        );
+    }
+
+    /// Diagnostic: JIT the PTX file named by `WUKONG_PTX_FILE` with the driver error-log buffer
+    /// attached, printing ptxas's actual line/error. Run:
+    /// `WUKONG_PTX_FILE=... cargo test -p wukong_codegen_gpu --features gpu jit_log_file -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic; prints the driver JIT log for a PTX file"]
+    fn jit_log_file() {
+        let path = std::env::var("WUKONG_PTX_FILE").expect("set WUKONG_PTX_FILE");
+        let ptx = std::fs::read_to_string(&path).unwrap();
+        let mut guard = crate::gpu::gpu();
+        let Some(g) = guard.as_mut() else {
+            eprintln!("skip jit_log_file: no CUDA device");
+            return;
+        };
+        {
+            use cudarc::driver::sys;
+            g.ctx.bind_to_thread().unwrap();
+            let ptx_c = std::ffi::CString::new(ptx.as_str()).unwrap();
+            let mut log = vec![0u8; 32768];
+            let mut opts = [
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+                sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            ];
+            let mut vals: [*mut std::ffi::c_void; 2] =
+                [log.as_mut_ptr() as *mut _, log.len() as *mut _];
+            let mut module: sys::CUmodule = std::ptr::null_mut();
+            let res = unsafe {
+                sys::cuModuleLoadDataEx(
+                    &mut module,
+                    ptx_c.as_ptr() as *const _,
+                    2,
+                    opts.as_mut_ptr(),
+                    vals.as_mut_ptr(),
+                )
+            };
+            eprintln!(
+                "=== JIT result {:?} ===\n{}",
+                res,
+                String::from_utf8_lossy(&log).trim_end_matches('\0')
+            );
+        }
+    }
+}
