@@ -110,6 +110,21 @@ fn every_cascade_head_answers_to_the_switch() {
     }
 }
 
+/// Phase 2 `@generic` tiled transpose must lower as written — no transpose recognizer, shared alloca
+/// and cooperative barriers in the MIR.
+#[test]
+fn lang_tiled_transpose_has_no_transpose_kernel() {
+    let p = fixture("lang_tiled_transpose.wk");
+    let (code, mir, stderr) = wukongc(&["--emit=mir", "-O2"], &p, false);
+    assert_eq!(code, Some(0), "compile failed:\n{stderr}");
+    assert!(
+        !mir.contains("call wukong_transpose"),
+        "lang_tiled_transpose.wk should not dispatch to wukong_transpose:\n{mir}"
+    );
+    assert!(mir.contains("alloca.shared"), "expected shared alloca in MIR:\n{mir}");
+    assert!(mir.contains("barrier"), "expected barrier in MIR:\n{mir}");
+}
+
 /// Recognition off must change only *how* the program is compiled: the answer is identical on the
 /// interpreter and on native, at -O0 and -O2. A kernel that disagreed with the loop it replaced
 /// would show up here as a difference between the two columns.
