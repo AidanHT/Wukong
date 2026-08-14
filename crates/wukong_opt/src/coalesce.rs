@@ -212,4 +212,40 @@ mod tests {
             "store o[j] should still be a unit-stride v4 candidate"
         );
     }
+
+    #[test]
+    fn coalesce_plan_get_matches_inst() {
+        let src = "fn k(mut o: [f32; 4]) { \
+                   let mut i: i32 = 0; \
+                   while i < 4 { o[i] = 1.0; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let plan = hints_for(src, "k");
+        let (block, inst) = unit_stride_f32_accesses(&plan)[0];
+        assert_eq!(
+            plan.get(block, inst),
+            Some(CoalesceHint::UnitStride {
+                width: VectorWidth::V4
+            })
+        );
+        assert_eq!(plan.get(block, inst + 999), None);
+    }
+
+    #[test]
+    fn f64_unit_stride_is_v2_candidate() {
+        let src = "fn k(x: [f64; 8], mut o: [f64; 8]) { \
+                   let mut i: i32 = 0; \
+                   while i < 8 { o[i] = x[i]; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        let plan = hints_for(src, "k");
+        let v2 = plan
+            .hints
+            .iter()
+            .any(|h| matches!(
+                h.hint,
+                CoalesceHint::UnitStride {
+                    width: VectorWidth::V2
+                }
+            ));
+        assert!(v2, "f64 unit stride should tag V2, got {:?}", plan.hints);
+    }
 }
