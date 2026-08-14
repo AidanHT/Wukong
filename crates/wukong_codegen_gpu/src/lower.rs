@@ -1394,14 +1394,10 @@ impl<'a> FnEmit<'a> {
     }
 
     /// Load one (scalar or lane) value of MIR type `ty` from address `addr` into `d`.
-    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType, shared: bool) -> Result<(), String> {
-        let ld = |op: &str| {
-            if shared {
-                format!("ld.shared.{op}")
-            } else {
-                format!("ld.{op}")
-            }
-        };
+    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType, _shared: bool) -> Result<(), String> {
+        // User `shared [T; N]` allocas are addressed via `cvta.shared` (generic state space), exactly
+        // like `.local` allocas use `cvta.local` + generic `ld.*` — never `ld.local` / `ld.shared`.
+        let ld = |op: &str| format!("ld.{op}");
         match ty {
             // `i1` occupies ONE byte in memory (`size_of(I1) == 1`, and `Op::Gep` strides bools by 1),
             // exactly like Cranelift's `types::I8` mapping — so it must be accessed with `ld.u8`. A
@@ -1489,14 +1485,9 @@ impl<'a> FnEmit<'a> {
     }
 
     /// Store one (scalar or lane) value `v` of MIR type `ty` to address `addr`.
-    fn store_into(&mut self, addr: &str, v: &str, ty: &MirType, shared: bool) -> Result<(), String> {
-        let st = |op: &str| {
-            if shared {
-                format!("st.shared.{op}")
-            } else {
-                format!("st.{op}")
-            }
-        };
+    fn store_into(&mut self, addr: &str, v: &str, ty: &MirType, _shared: bool) -> Result<(), String> {
+        // Mirror `load_into`: `cvta.shared` addresses use generic `st.*`, not `st.shared.*`.
+        let st = |op: &str| format!("st.{op}");
         let g = self.st_guard();
         match ty {
             MirType::F32 => self.emit(&format!("{g}{} [{addr}], {v};", st("f32"))),
