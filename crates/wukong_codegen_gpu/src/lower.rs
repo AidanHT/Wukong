@@ -573,6 +573,13 @@ impl<'a> FnEmit<'a> {
             ".visible .entry {MEGA_KERNEL_NAME}(.param .u64 p_ctx, .param .u64 p_frame)\n{{\n"
         ));
         e.write_reg_decls(&mut out);
+        if e.shared_bytes > 0 {
+            let _ = writeln!(
+                out,
+                "    .shared .align 8 .b8 __user_smem[{}];",
+                e.shared_bytes
+            );
+        }
         out.push_str(&e.body);
         out.push_str("}\n");
         Ok(out)
@@ -748,6 +755,13 @@ impl<'a> FnEmit<'a> {
                 "cvta.to.global.u64 {}, {fr_raw};",
                 self.frame_base
             ));
+        }
+
+        if self.shared_bytes > 0 {
+            let smem = self.fresh(RC::Rd);
+            self.shared_base = self.fresh(RC::Rd);
+            self.emit(&format!("mov.u64 {smem}, __user_smem;"));
+            self.emit(&format!("cvta.shared.u64 {}, {smem};", self.shared_base));
         }
 
         // tid0 = (threadIdx.x == 0): the predicate guarding stores + side effects in SPMD mode.
