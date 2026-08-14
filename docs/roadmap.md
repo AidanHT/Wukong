@@ -421,6 +421,16 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   (`tests/run/{i8_linear,i8_linear_dequant,i8_linear_parallel,dequant_perchan}.wk`). The
   per-tensor/per-channel `absmax` that produces the symmetric quantization scale is the
   column-reduction family above.
+- **`@tile` strip-mining** on a half-open unit-step `for i in start..end`: `@tile(B)` on the function
+  (or one loop) expands into full tiles plus a remainder loop, before the recognizer cascade.
+  `@tile(BM, BN, …)` queues widths for nested `for` loops in source order (`tests/run/lang_tile_saxpy.wk`).
+- **`shared [T; N]`** and **`sync_block()`**: shared address space on `alloca`; cooperative barrier
+  inside `@parallel` only (`E0308` otherwise). Static shared size above 48 KiB is `E0307`. CPU:
+  shared = stack `alloca`, barrier = no-op/fence. gpu-native: PTX `.shared` + `bar.sync` in
+  `lower.rs` only (`tests/run/lang_shared_transpose.wk`, `lang_tiled_transpose.wk`). gpu-native smoke
+  on this branch: `lang_tile_saxpy.wk` runs; `lang_shared_transpose.wk` and `lang_tiled_transpose.wk`
+  hit `CUDA_ERROR_ILLEGAL_ADDRESS` on the RTX 4050 (shared SMEM lowering still has bugs — not a silent
+  CPU fallback).
 - **`@parallel`** functions execute across CPU cores (rayon runtime); the per-core chunk is itself
   vectorized. The interpreter runs the same range sequentially, so results stay differential-equal.
   `@parallel` is a *request*, and a shape it cannot prove safe **falls back to serial lowering with no
@@ -742,13 +752,14 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   no trip-count requirement for an elementwise body; only a float *reduction* needs a
   compile-time-known trip ≥ 2048; the recognized kernels get 256-bit AVX2 via the
   runtime microkernels.)
-- **Attributes** other than `@parallel`: **parsed but not validated and not consumed.**
-  `@simd`/`@tile`/`@align`/`@extern`/`@export` are shaped by the parser and then ignored — there is no
+- **Attributes** other than `@parallel`, `@generic`, and `@tile`: **parsed but not consumed.**
+  `@simd`/`@align`/`@extern`/`@export` are shaped by the parser and then ignored — there is no
   name check, so an unknown or misspelled attribute (`@bogus(nonsense = 3)`, `@align(3)`) compiles
   clean with no diagnostic, and no crate reads them (`wukong_sema` never inspects `.attrs`). The single
   consumer in the tree is `mir_build`'s `has_parallel_attr`, a name test for `"parallel"`; even
   `@parallel`'s own arguments (e.g. `grain = …`) are parsed and discarded. `E0207` fires only for a
   malformed argument such as a missing value after `=`. (`@parallel` itself executes — see above.)
+  `@tile` is consumed as loop strip-mining; `@generic` opts out of recognizers (see above).
 - **Non-contiguous tensor layouts** `.col_major` / `.strided` / `.tiled(N, M)`: they parse (an unknown
   layout name is `E0204`), they are part of the tensor type, and they are enforced across a call
   boundary — passing a `.col_major` tensor to a `Contiguous`-typed parameter is `E0502`. But **indexing
@@ -761,8 +772,9 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   campaign is wrapping special-case PTX separately. The plan for making Wukong
   itself a strong ML/DL kernel language — generic gpu-native lowering, consuming
   `@tile` / `@generic` / `shared`, explicit vendor kernels rather than silent
-  rewrites — lives in [`docs/LANGUAGE_DIRECTION.md`](LANGUAGE_DIRECTION.md). It is
-  a design for review, not a claim that those features run today. The sequenced
+  rewrites — lives in [`docs/LANGUAGE_DIRECTION.md`](LANGUAGE_DIRECTION.md). Phase 2 (`@tile`,
+  `shared`, `sync_block`) is on branch `lang/p2-tile-shared` (not merged to `main`); see roadmap
+  "Works end to end" for what runs today. The sequenced
   language mission (including AI-editor / vibe-coding) lives in
   [`docs/WUKONG_MASTER_PLAN.md`](WUKONG_MASTER_PLAN.md).
 - Fusing arbitrary elementwise chains *under* `@parallel`. (The **parallel fused-epilogue GEMM** that
