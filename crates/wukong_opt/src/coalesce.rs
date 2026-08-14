@@ -53,4 +53,73 @@ impl CoalescePlan {
             .map(|h| h.hint)
     }
 }
-pub fn analyze_function(_f: &Function) -> CoalescePlan { CoalescePlan::default() }
+
+/// Analyze every natural loop of `f` and record coalescing hints for its memory accesses.
+pub fn analyze_function(f: &Function) -> CoalescePlan {
+    let forest = loop_info::analyze_function(f);
+    analyze_forest(&forest)
+}
+
+fn analyze_forest(forest: &LoopForest) -> CoalescePlan {
+    let mut hints = Vec::new();
+    for l in &forest.loops {
+        for access in &l.accesses {
+            let hint = hint_for_access(l, access);
+            if !matches!(hint, CoalesceHint::Unknown) {
+                hints.push(AccessHint {
+                    block: access.block,
+                    inst: access.inst,
+                    hint,
+                });
+            }
+        }
+    }
+    CoalescePlan { hints }
+}
+
+fn hint_for_access(l: &NaturalLoop, access: &MemAccess) -> CoalesceHint {
+  // Only classify accesses whose affine index is expressed against this loop's primary IV.
+  if l.primary_iv.is_none() {
+    return CoalesceHint::Unknown;
+  }
+  match &access.addr {
+    AddrForm::Affine { index, elem, .. } => {
+      let elem_bytes = type_bytes(elem)
+        .or_else(|| type_bytes(&access.value_ty))
+        .unwrap_or(0) as u64;
+      if elem_bytes == 0 {
+        return CoalesceHint::Unknown;
+      }
+      let stride_elems = iv_stride_elems(index);
+      match stride_elems {
+        None => CoalesceHint::Unknown,
+        Some(None) => CoalesceHint::Strided,
+        Some(Some(0)) => CoalesceHint::Unknown,
+        Some(Some(1)) => CoalesceHint::UnitStride {
+          width: vector_width_for(elem_bytes),
+        },
+        Some(Some(_)) => CoalesceHint::Strided,
+      }
+    }
+    AddrForm::Invariant(_) | AddrForm::Unknown => CoalesceHint::Unknown,
+  }
+}
+
+/// Element stride per primary-IV step. `Coeff::Sym` is a runtime stride (e.g. symbolic `N` in
+/// `i*N`) and is treated as strided — only a compile-time unit stride is a vector candidate.
+fn iv_stride_elems(index: &loop_info::AffineExpr) -> Option<Option<i64>> {
+  match index.coeff {
+    loop_info::Coeff::Zero => Some(Some(0)),
+    loop_info::Coeff::Const(k) => Some(Some(k)),
+    loop_info::Coeff::Sym(..) => Some(None), // runtime stride → strided, not unit
+  }
+}
+
+/// Pick the widest 128-bit vector op that fits `elem_bytes` lanes.
+fn vector_width_for(elem_bytes: u64) -> VectorWidth {
+  match elem_bytes {
+    1 | 2 | 4 => VectorWidth::V4,
+    8 => VectorWidth::V2,
+    _ => VectorWidth::Scalar,
+  }
+}
