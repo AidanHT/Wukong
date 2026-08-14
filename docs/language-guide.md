@@ -183,7 +183,7 @@ concatenation/indexing/length operators — a string is a NUL-terminated `*u8` i
 | Enums       | C-style `enum E { A = 10, B }` (variant = its `i32` discriminant) **and data-carrying** `V(i32)` / `V { f: T }` variants | ✅ |
 | Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, indexed load/store, iteration, array→slice unsizing | ✅ |
 | SIMD vectors| `f32x4`/`i32x4`, generic `vec[T, N]` — the type **parses and type-checks** (a non-scalar element is `E0302`, a lane/element mismatch at a call is `E0401`), but no vector value can be constructed in source (`f32x4::load(p)` is `C0001`) and float-vector arithmetic is an internal error, so nothing uses it. SIMD ships through the **automatic** 128-bit/256-bit loop vectorizer, which needs no vector type in source. | 🔵 |
-| Tensors     | `Tensor[f32, M, N]` — shape checking, and **indexing** (`a[i, j]`) for both const and symbolic-generic dims, on the default `contiguous` layout. A constant-shape tensor costs **nothing** over the hand-flattened `[f32; M*N]` + `a[i*N + j]` spelling: the two compile to byte-identical MIR, same kernel dispatch and same vectorization. Whole-tensor arithmetic (`a + b`) is `E0401` — operate elementwise. A `.col_major`/`.strided`/`.tiled(…)` layout type-checks but cannot be indexed (`C0001`). | ✅ |
+| Tensors     | `Tensor[f32, M, N]` — shape checking, and **indexing** (`a[i, j]`) for both const and symbolic-generic dims, on the default `contiguous` layout. A constant-shape tensor costs **nothing** over the hand-flattened `[f32; M*N]` + `a[i*N + j]` spelling: the two compile to byte-identical MIR, same kernel dispatch and same vectorization. `.col_major` indexing executes for constant-shape tensors (`a[i, j]` is byte-identical to `a[i + j*M]`). `.strided`/`.tiled(…)` type-check but cannot be indexed (`C0001`). Whole-tensor arithmetic (`a + b`) is `E0401` — operate elementwise. | ✅ |
 
 `&x` and `&mut x` have type `*T` and `*mut T`. A `&T`/`&mut T` **parameter** accepts them
 (`fn deref(p: &i32) -> i32 { return *p; }` with `deref(&x)`), but the two spellings are distinct types
@@ -385,9 +385,9 @@ Tensor element types must be scalars (`E0302`).
 brackets: `Tensor[f32, M, N, .contiguous]` (the default, row-major), `.col_major`, `.strided`, or
 `.tiled(64, 64)`. An unrecognized layout name is `E0204`. The layout is part of the type — sema unifies
 it at a call, so a `.col_major` value cannot be routed through a `contiguous`-typed callee (`E0502`).
-Today only `contiguous` **executes**: multi-dimensional indexing of a `.col_major`/`.strided`/
-`.tiled(…)` tensor is `C0001`, and a fixed-size array decays only to a `contiguous` tensor, so the
-other three layouts parse and type-check but cannot yet be indexed (🔵).
+Today `contiguous` and `.col_major` **execute** for multi-dimensional indexing (`.col_major` is
+byte-identical to the hand-flattened `a[i + j*M]` spelling). `.strided`/`.tiled(…)` still decline at
+index (`C0001`). A fixed-size array decays only to a `contiguous` tensor.
 
 Shape checking is not limited to call arguments. A function whose returned value's shape disagrees
 with its declared `-> Tensor[…]` is rejected — `E0501` when the rank differs, `E0502` when a dimension
