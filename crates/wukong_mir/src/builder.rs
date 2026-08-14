@@ -1,6 +1,6 @@
 //! A convenience builder for constructing MIR functions imperatively.
 
-use crate::{BasicBlock, BlockId, Function, Inst, MirType, Op, Terminator, ValueId, VecKernel};
+use crate::{AddrSpace, BasicBlock, BlockId, Function, Inst, MirType, Op, Terminator, ValueId, VecKernel};
 use wukong_span::Symbol;
 
 /// Builds one [`Function`]. Create it, add parameters, carve out blocks, append instructions to
@@ -129,13 +129,22 @@ impl Builder {
     /// Allocate a stack slot in the entry block, returning the pointer value. Putting allocas in
     /// the entry block keeps them dominating all uses and out of loop bodies.
     pub fn alloca(&mut self, ty: MirType) -> ValueId {
+        self.alloca_in(ty, AddrSpace::Local)
+    }
+
+    /// Allocate a local slot in `space` (shared arrays use [`AddrSpace::Shared`]).
+    pub fn alloca_in(&mut self, ty: MirType, space: AddrSpace) -> ValueId {
         let v = self.new_value(MirType::Ptr);
         let entry = self.entry.0 as usize;
         self.blocks[entry].insts.push(Inst {
             result: Some(v),
-            op: Op::Alloca(ty),
+            op: Op::Alloca { ty, space },
         });
         v
+    }
+
+    pub fn barrier(&mut self) {
+        self.build_void(Op::Barrier);
     }
 
     pub fn set_term(&mut self, term: Terminator) {

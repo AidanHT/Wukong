@@ -75,7 +75,14 @@ fn fmt_op(op: &Op, interner: &Interner) -> String {
         Op::Not(v) => format!("not {}", val(*v)),
         Op::Cast(k, v, to) => format!("{} {} to {}", k.name(), val(*v), to.display()),
         Op::Select(c, a, b) => format!("select {}, {}, {}", val(*c), val(*a), val(*b)),
-        Op::Alloca(ty) => format!("alloca {}", ty.display()),
+        Op::Alloca { ty, space } => {
+            if *space == crate::AddrSpace::Shared {
+                format!("alloca.shared {}", ty.display())
+            } else {
+                format!("alloca {}", ty.display())
+            }
+        }
+        Op::Barrier => "barrier".into(),
         Op::Load(p, ty) => format!("load {} {}", ty.display(), val(*p)),
         Op::Store { ptr, value } => format!("store {}, {}", val(*value), val(*ptr)),
         Op::Gep { ptr, index, elem } => {
