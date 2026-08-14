@@ -153,7 +153,7 @@ impl Linearizer<'_> {
         let Some(Ty::Tensor { shape, layout, .. }) = self.types.get(&base.id) else {
             return None;
         };
-        if !matches!(layout, Layout::Contiguous) || shape.0.len() != indices.len() {
+        if !matches!(layout, Layout::Contiguous | Layout::ColMajor) || shape.0.len() != indices.len() {
             return None;
         }
         let mut extents = Vec::with_capacity(shape.0.len());
@@ -179,8 +179,15 @@ impl Linearizer<'_> {
 
         let rank = extents.len();
         let mut strides = vec![1u64; rank];
-        for k in (0..rank.saturating_sub(1)).rev() {
-            strides[k] = strides[k + 1] * extents[k + 1];
+        if matches!(layout, Layout::ColMajor) {
+            // Column-major: the leading axis has unit stride (`i + j*M`).
+            for k in 1..rank {
+                strides[k] = strides[k - 1] * extents[k - 1];
+            }
+        } else {
+            for k in (0..rank.saturating_sub(1)).rev() {
+                strides[k] = strides[k + 1] * extents[k + 1];
+            }
         }
 
         let mut acc: Option<Expr> = None;
