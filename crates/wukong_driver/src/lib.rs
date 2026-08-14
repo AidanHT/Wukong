@@ -1005,7 +1005,7 @@ fn ty_elem_count(ty: &wukong_types::Ty) -> Option<u64> {
     use wukong_types::{Dim, Ty};
     match ty {
         Ty::Scalar(_) => Some(1),
-        Ty::Array { elem, len } => Some(ty_elem_count(elem)? * len),
+        Ty::Array { elem, len, .. } => Some(ty_elem_count(elem)? * len),
         Ty::Tensor { shape, .. } => shape.0.iter().try_fold(1u64, |acc, d| match d {
             Dim::Const(n) => Some(acc * n),
             _ => None,

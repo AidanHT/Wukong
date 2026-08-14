@@ -815,7 +815,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     reg(regs, *b)
                 }
             }
-            Op::Alloca(ty) => {
+            Op::Alloca { ty, .. } => {
                 let idx = self.memory.len();
                 // Reserve every leaf slot of `ty` (recursing into nested arrays so an array of
                 // structs/tuples is fully sized, not one slot per element); the result points at the
@@ -883,6 +883,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 // arrays and struct/tuple byte-offset field GEPs (`elem = I8`) are unchanged.
                 Value::Ptr((base as i128 + off * slot_count(elem) as i128) as usize)
             }
+            Op::Barrier => Value::Unit,
             Op::Call { func, args } => {
                 let argv: Vec<Value> = args.iter().map(|a| reg(regs, *a)).collect();
                 let prog = self.program;

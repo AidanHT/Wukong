@@ -79,7 +79,7 @@ fn find_promotable(f: &Function) -> BTreeMap<u32, MirType> {
     let mut cand: BTreeMap<u32, MirType> = BTreeMap::new();
     for b in &f.blocks {
         for inst in &b.insts {
-            if let (Some(r), Op::Alloca(ty)) = (inst.result, &inst.op) {
+            if let (Some(r), Op::Alloca { ty, .. }) = (inst.result, &inst.op) {
                 if is_promotable_ty(ty) {
                     cand.insert(r.0, ty.clone());
                 }
@@ -177,7 +177,7 @@ fn initialized_ptr_slots(
     let mut home: FxHashMap<u32, u32> = FxHashMap::default();
     for b in &f.blocks {
         for inst in &b.insts {
-            if let (Some(r), Op::Alloca(_)) = (inst.result, &inst.op) {
+            if let (Some(r), Op::Alloca { .. }) = (inst.result, &inst.op) {
                 if matches!(cand.get(&r.0), Some(MirType::Ptr)) {
                     home.insert(r.0, b.id.0);
                 }
@@ -311,7 +311,7 @@ fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut Cf
             if delete.contains(&(bi as u32, i)) {
                 return false;
             }
-            if let (Some(res), Op::Alloca(_)) = (inst.result, &inst.op) {
+            if let (Some(res), Op::Alloca { .. }) = (inst.result, &inst.op) {
                 if promotable.contains_key(&res.0) {
                     return false;
                 }

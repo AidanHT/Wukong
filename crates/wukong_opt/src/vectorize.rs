@@ -807,7 +807,7 @@ fn linearize_region(
                 Op::Bin(BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem, ..) => {
                     return Err("an arm divides, which may fault on a lane that would not run it")
                 }
-                Op::Call { .. } | Op::VecKernelCall { .. } | Op::Alloca(..) => {
+                Op::Call { .. } | Op::VecKernelCall { .. } | Op::Alloca { space: wukong_mir::AddrSpace::Local, .. } => {
                     return Err("an arm has an effect that cannot be predicated")
                 }
                 _ => {}
@@ -918,7 +918,7 @@ fn header_is_test_only(f: &Function, l: &NaturalLoop) -> bool {
                 | Op::Load(..)
                 | Op::Call { .. }
                 | Op::VecKernelCall { .. }
-                | Op::Alloca(..)
+                | Op::Alloca { space: wukong_mir::AddrSpace::Local, .. }
         )
     }) {
         return false;
@@ -1785,7 +1785,7 @@ fn fits_in(ty: &MirType, k: i64) -> bool {
 
 fn distinct_alloca_pair(f: &Function, a: MemBase, b: MemBase) -> bool {
     let is_alloca = |m: MemBase| match m {
-        MemBase::Outer(v) => matches!(op_of(f, v), Some(Op::Alloca(..))),
+        MemBase::Outer(v) => matches!(op_of(f, v), Some(Op::Alloca { space: wukong_mir::AddrSpace::Local, .. })),
         MemBase::ReloadedOuter { .. } => false,
     };
     is_alloca(a) && is_alloca(b) && !a.same_object(b)

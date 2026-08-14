@@ -149,7 +149,7 @@ impl Numbering<'_> {
 
         for inst in &self.f.blocks[blk as usize].insts {
             match &inst.op {
-                Op::Alloca(_) => {}
+                Op::Alloca { ty: _, space: wukong_mir::AddrSpace::Local } => {}
                 Op::Load(ptr, ty) => {
                     let p = resolve(&self.rewrite, ptr.0);
                     let Some(res) = inst.result else { continue };
@@ -264,7 +264,8 @@ fn pure_key(op: &Op, rewrite: &FxHashMap<u32, u32>) -> Option<Key> {
         | Op::Store { .. }
         | Op::Call { .. }
         | Op::VecKernelCall { .. }
-        | Op::Alloca(..) => return None,
+        | Op::Alloca { .. }
+        | Op::Barrier => return None,
     })
 }
 
@@ -418,7 +419,10 @@ mod tests {
                     // v0 = alloca [4 x f32]
                     Inst {
                         result: Some(ValueId(0)),
-                        op: Op::Alloca(MirType::Array(Box::new(MirType::F32), 4)),
+                        op: Op::Alloca {
+                            ty: MirType::Array(Box::new(MirType::F32), 4),
+                            space: wukong_mir::AddrSpace::Local,
+                        },
                     },
                     // v1 = load <4 x f32> v0   (the vectorizer's lane load)
                     Inst {
@@ -467,7 +471,10 @@ mod tests {
                 insts: vec![
                     Inst {
                         result: Some(ValueId(0)),
-                        op: Op::Alloca(MirType::Array(Box::new(MirType::F32), 4)),
+                        op: Op::Alloca {
+                            ty: MirType::Array(Box::new(MirType::F32), 4),
+                            space: wukong_mir::AddrSpace::Local,
+                        },
                     },
                     // v1 = load <4 x f32> v0
                     Inst {

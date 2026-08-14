@@ -230,7 +230,7 @@ fn safe_to_hoist(f: &Function, op: &Op, alias: &AliasInfo, mem: &LoopMem) -> boo
             let _ = f;
             load_hoistable(alias, *p, type_bytes(ty).unwrap_or(u32::MAX), mem)
         }
-        Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Alloca(..) => false,
+        Op::Store { .. } | Op::Call { .. } | Op::VecKernelCall { .. } | Op::Alloca { .. } | Op::Barrier => false,
     }
 }
 
