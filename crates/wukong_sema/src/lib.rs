@@ -3975,6 +3975,28 @@ mod tests {
         analyze(src).0.into_iter().filter_map(|d| d.code).collect()
     }
 
+    /// The headline messages of every diagnostic carrying `code`. The shape diagnostics are asserted
+    /// on their TEXT and not only their code: naming the disagreeing dimension is the contract, and
+    /// a message that regresses to a bare "expected 512, found 513" still carries the right code.
+    fn messages_for(src: &str, code: &str) -> Vec<String> {
+        analyze(src)
+            .0
+            .into_iter()
+            .filter(|d| d.code == Some(code))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// Assert that some diagnostic with `code` contains every one of `needles`.
+    #[track_caller]
+    fn assert_message_has(src: &str, code: &str, needles: &[&str]) {
+        let msgs = messages_for(src, code);
+        assert!(
+            msgs.iter().any(|m| needles.iter().all(|n| m.contains(n))),
+            "no {code} message contains {needles:?}; got {msgs:?} for {src:?}"
+        );
+    }
+
     #[test]
     fn clean_kernel_has_no_errors() {
         let src = "fn add<N>(x: Tensor[f32, N], y: Tensor[f32, N]) { \
@@ -4455,6 +4477,115 @@ mod tests {
     }
 
     #[test]
+    fn rigid_shape_mismatch_names_the_axis() {
+        // A body-context (RIGID) shape mismatch must say WHICH axis disagrees. `grow` returns
+        // `Tensor[f32, M, N]` as `Tensor[f32, N, 5]`: axis 0 is `N` against `M`, axis 1 is the bare
+        // constant `5` against `N`. Reporting only "expected N, found M" left the reader counting
+        // axes across two shapes.
+        let src = "fn grow<M, N>(a: Tensor[f32, M, N]) -> Tensor[f32, N, 5] { return a; }";
+        assert_message_has(src, "E0502", &["`N` (axis 0)", "expected N, found M"]);
+        assert_message_has(src, "E0502", &["axis 1", "expected 5, found N"]);
+    }
+
+    #[test]
+    fn inferred_dim_conflict_names_the_declared_dim() {
+        // The flagship message (master plan §7.1 `wrong_k.wk`): `a` binds `K := 512`, `b`'s first
+        // axis is 513. `apply_subst` has already turned the parameter into `Tensor[f32, 512, N]` by
+        // then, so the name `K` can only come from the DECLARED signature — that is what
+        // `unify_decl` carries.
+        let src = format!(
+            "{MATMUL}\nfn driver(a: Tensor[f32, 512, 512], b: Tensor[f32, 513, 512], \
+             c: Tensor[f32, 512, 512]) {{ matmul(a, b, c); }}"
+        );
+        assert_message_has(&src, "E0502", &["`K` (axis 0)", "expected 512, found 513"]);
+    }
+
+    #[test]
+    fn turbofished_dim_conflict_names_the_declared_dim() {
+        // Same, with the dims pinned by a turbofish rather than inferred: `c`'s axis 1 must be `N`.
+        let src = format!(
+            "{MATMUL}\nfn driver(a: Tensor[f32, 512, 512], b: Tensor[f32, 512, 512], \
+             c: Tensor[f32, 512, 513]) {{ matmul::<512, 512, 512>(a, b, c); }}"
+        );
+        assert_message_has(&src, "E0502", &["`N` (axis 1)", "expected 512, found 513"]);
+    }
+
+    #[test]
+    fn constant_dim_mismatch_at_a_call_names_the_axis() {
+        // A fully concrete call: the callee's axis 1 is 8, the argument's is 9. Both numbers were
+        // already in the message; the axis was not.
+        let src = "fn takes(a: Tensor[f32, 4, 8]) {} \
+                   fn f(a: Tensor[f32, 4, 9]) { takes(a); }";
+        assert_message_has(src, "E0502", &["axis 1", "expected 8, found 9"]);
+    }
+
+    #[test]
+    fn generic_dim_against_a_fixed_size_names_the_axis() {
+        // Forwarding a caller's own universally-quantified dim into a fixed-size parameter: the
+        // message now says which axis carries the unprovable claim, alongside the size and the
+        // generic's name.
+        let src = "fn takes64(a: Tensor[f32, 64]) -> f32 { return a[63]; } \
+                   fn fwd<N>(a: Tensor[f32, N]) -> f32 { return takes64(a); }";
+        assert_message_has(
+            src,
+            "E0502",
+            &["axis 0", "expected 64", "the generic dimension `N`"],
+        );
+    }
+
+    #[test]
+    fn already_bound_dim_conflict_names_the_dim() {
+        // The one call-site path where a callee dim is still a VARIABLE when it is compared: a
+        // turbofish binds `N` to the caller's own generic of the same name, so the second argument
+        // meets `Var(N)` rather than a substituted constant.
+        let src = "fn takes<N>(a: Tensor[f32, N], b: Tensor[f32, N]) {} \
+                   fn fwd<N>(a: Tensor[f32, N], b: Tensor[f32, 4]) { takes::<N>(a, b); }";
+        assert_message_has(src, "E0502", &["`N` (axis 0)", "expected N, found 4"]);
+    }
+
+    #[test]
+    fn array_decay_length_error_names_the_shape() {
+        // Array -> tensor decay has no single disagreeing axis (an array has one length against a
+        // whole shape), so this one names the shape and the element count, honestly.
+        let exact = "fn take(a: Tensor[f32, 2, 4]) {} \
+                     fn f() { let b: [f32; 6] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]; take(b); }";
+        assert_message_has(
+            exact,
+            "E0501",
+            &["array of length 6", "shape [2, 4]", "8 elements"],
+        );
+        // With a free dim there is no exact count, only divisibility by the fixed axes.
+        let free = "fn take<N>(a: Tensor[f32, N, 4]) {} \
+                    fn f() { let b: [f32; 6] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]; take(b); }";
+        assert_message_has(
+            free,
+            "E0501",
+            &["array of length 6", "shape [N, 4]", "fixed axes 4"],
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_tensor_index_names_the_axis() {
+        // With one message per axis, `a[0, 5]` on a `Tensor[f32, 2, 2]` has to say WHICH index is
+        // the offending one — both are spelled `0`/`5` in source but only axis 1 is out of range.
+        let src = "fn f(a: Tensor[f32, 2, 2]) { let x = a[0, 5]; }";
+        assert_message_has(src, "E0501", &["index 5", "axis 1", "length 2"]);
+    }
+
+    #[test]
+    fn rank_mismatch_names_both_shapes() {
+        // A rank mismatch has no single disagreeing dim to name, so it names rank against rank —
+        // and now the two shapes as well, so the reader sees which signature is rank-2.
+        let src = "fn use2d<M, N>(a: Tensor[f32, M, N]) {} \
+                   fn f(a: Tensor[f32, 4, 4, 4]) { use2d(a); }";
+        assert_message_has(
+            src,
+            "E0501",
+            &["expected rank 2 [M, N]", "found rank 3 [4, 4, 4]"],
+        );
+    }
+
+    #[test]
     fn tensor_index_rank_mismatch_errors() {
         let src = "fn f(a: Tensor[f32, 4, 4]) { let x = a[0]; }";
         assert!(
@@ -4462,6 +4593,9 @@ mod tests {
             "expected a rank mismatch: {:?}",
             errors(src)
         );
+        // An index-count mismatch names how many indices were written against the tensor's rank —
+        // and the shape, so the reader knows what the missing index should range over.
+        assert_message_has(src, "E0501", &["rank 2 [4, 4]", "indexed with 1 index"]);
     }
 
     #[test]

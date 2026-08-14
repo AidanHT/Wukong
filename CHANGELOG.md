@@ -55,6 +55,25 @@ in the set from the start and is rejected off a `fn` item, because it is read fr
 New: `crates/wukong_sema/src/attrs.rs`, `tests/fail/unknown_attr.wk`,
 `tests/fail/unknown_attr_typo.wk`.
 
+### Diagnostics — shape errors name the disagreeing dimension
+`E0501` / `E0502` primary messages carried the two extents but not the axis they sit on
+(`dimension mismatch: expected 512, found 513`), leaving the reader to count axes across two
+signatures. They now name it, taking the name from the *declared* signature — by the time a call-site
+mismatch is found the parameter has been substituted and `K` is gone from it:
+
+```
+error[E0502]: dimension mismatch on `K` (axis 0): expected 512, found 513
+error[E0501]: tensor rank mismatch: expected rank 2 [M, N], found rank 3 [4, 4, 4]
+error[E0501]: index 5 is out of bounds for axis 1 of length 2
+```
+
+Where there is no single dim to name the message stays honest and names what there is: rank against
+rank plus both shapes, the index count against the rank, the shape and element count for an
+array-to-tensor decay, the element type or the layout. **Message text only** — the codes, the
+`--error-format=json` schema and `wukongc --explain` are unchanged. New mutants `tests/fail/
+wrong_k.wk` (turbofished `K`) and `tests/fail/wrong_m.wk` (inferred `M`); the headlines are pinned
+end-to-end by `crates/wukongc/tests/fail.rs::shape_diagnostics_name_the_dim_in_json`.
+
 ### GPU (Hopper `wgmma`) — the shipped dispatch rule is now wave 3's per-shape dispatcher
 Wave 3's four schedule levers (grouped raster, persistent CTAs, per-shape tile dispatch, mainloop
 drain) landed on 2026-08-12 and the H100 visit of the same day measured them as sweep **arms**. They

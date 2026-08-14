@@ -25,6 +25,18 @@
 //!
 //! `Dim::Dynamic` (`?`) is the documented lenient escape hatch in both modes, and `Unknown`/`Error`
 //! on either side short-circuits `unify` — the crate-wide leniency rule.
+//!
+//! **Every shape diagnostic names what disagrees** (master plan §8 task 0.6). A dimension mismatch
+//! names the dim and both values — "dimension mismatch on `K` (axis 0): expected 512, found 513" —
+//! taking the name from the callee's *declared* signature, which is why `unify_decl` carries the
+//! pre-substitution parameter next to the substituted one (`apply_subst` has already erased `K` by
+//! the time the mismatch is found). Where there is no single dim to name the message stays honest
+//! about that instead of inventing one: a rank mismatch names rank against rank plus both shapes,
+//! an index-count mismatch names the count against the rank, an array-decay length error names the
+//! shape and the element count, and an element-type or layout mismatch names the type or the
+//! layout. The codes are unchanged and permanently stable — this is message text, not a protocol.
+//! `crates/wukongc/tests/fail.rs::shape_diagnostics_name_the_dim_in_json` pins the headlines
+//! end-to-end through `--error-format=json`.
 
 use wukong_span::FxHashMap as HashMap;
 
@@ -82,6 +94,42 @@ fn kind_name(t: &Ty) -> &'static str {
         Ty::Slice(_) => "a slice",
         Ty::Named(_) => "a named type",
         _ => "a different type",
+    }
+}
+
+/// Where a dimension disagreement sits, for the diagnostic that reports it: the 0-based axis, plus
+/// the declared *name* of that axis (`K`) when a shape spells a dimension variable there. The name
+/// is what makes an `E0502` actionable — "expected 512, found 513" leaves the reader counting axes
+/// across two signatures, while "dimension mismatch on `K`" names the thing to fix.
+#[derive(Clone, Copy)]
+struct DimSite {
+    axis: usize,
+    name: Option<Symbol>,
+}
+
+/// The dimension variable a shape spells at `axis`, if any.
+fn dim_var_at(shape: Option<&Shape>, axis: usize) -> Option<Symbol> {
+    match shape?.0.get(axis)? {
+        Dim::Var(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// A tensor's shape, for the optional *declared* type threaded through `unify_decl`.
+fn tensor_shape_of(t: Option<&Ty>) -> Option<&Shape> {
+    match t? {
+        Ty::Tensor { shape, .. } => Some(shape),
+        _ => None,
+    }
+}
+
+/// The pointee / element of the declared type, so the recursion through a pointer, reference,
+/// slice or array keeps the declared names in step with the substituted parameter.
+fn decl_pointee(t: Option<&Ty>) -> Option<&Ty> {
+    match t? {
+        Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => Some(pointee),
+        Ty::Slice(elem) | Ty::Array { elem, .. } => Some(elem),
+        _ => None,
     }
 }
 
@@ -479,8 +527,10 @@ impl Sema<'_> {
             infer_type_generics(param, arg, &sig.generics, &mut tys);
             let p = apply_subst(param, &dims, &tys);
             // Call site: the callee's not-yet-substituted dim vars are INFERENCE variables to bind
-            // from the argument shapes (`rigid == false`).
-            self.unify(&p, arg, &mut dims, span, false);
+            // from the argument shapes (`rigid == false`). `param` — the DECLARED type, before the
+            // substitution that produced `p` — rides along so a mismatch can be reported against the
+            // name the signature wrote (`K`), not just the extent it resolved to.
+            self.unify_decl(&p, arg, Some(param), &mut dims, span, false);
         }
 
         apply_subst(&sig.ret, &dims, &tys)
@@ -490,6 +540,25 @@ impl Sema<'_> {
         &mut self,
         param: &Ty,
         arg: &Ty,
+        dims: &mut HashMap<Symbol, Dim>,
+        span: Span,
+        rigid: bool,
+    ) {
+        self.unify_decl(param, arg, None, dims, span, rigid)
+    }
+
+    /// `unify`, plus the callee's **pre-substitution** declared type. `check_fn_call` substitutes the
+    /// dims it has already bound into the parameter before unifying, so by the time a mismatch is
+    /// reported the shape reads `Tensor[f32, 512, 512]` and the name `K` the programmer wrote is
+    /// gone. `decl` carries that name — and *only* the name: every check still runs against the
+    /// substituted `param`, so nothing about what is accepted changes. Body checks
+    /// (`check_return_shape`, `check_binop_shapes`) pass `None`; their shapes are the declared ones
+    /// already.
+    fn unify_decl(
+        &mut self,
+        param: &Ty,
+        arg: &Ty,
+        decl: Option<&Ty>,
         dims: &mut HashMap<Symbol, Dim>,
         span: Span,
         rigid: bool,
@@ -539,19 +608,29 @@ impl Sema<'_> {
                     );
                 }
                 if ps.rank() != as_.rank() {
+                    // Name the two shapes, not just their ranks: `expected rank 2 [M, N]` points at
+                    // the declared signature (the parameter still spells its dimension variables
+                    // here, so the reader can find it), `found rank 3 [4, 4, 4]` at the argument.
+                    let expected = self.shape_str(tensor_shape_of(decl).unwrap_or(ps));
+                    let found = self.shape_str(as_);
                     self.error(
                         span,
                         "E0501",
                         format!(
-                            "tensor rank mismatch: expected rank {}, found rank {}",
+                            "tensor rank mismatch: expected rank {} {expected}, found rank {} {found}",
                             ps.rank(),
                             as_.rank()
                         ),
                     );
                     return;
                 }
-                for (pd, ad) in ps.0.iter().zip(&as_.0) {
-                    self.unify_dim(*pd, *ad, dims, span, rigid);
+                let decl_shape = tensor_shape_of(decl);
+                for (axis, (pd, ad)) in ps.0.iter().zip(&as_.0).enumerate() {
+                    let site = DimSite {
+                        axis,
+                        name: dim_var_at(decl_shape, axis).or_else(|| dim_var_at(Some(ps), axis)),
+                    };
+                    self.unify_dim(*pd, *ad, dims, span, rigid, site);
                 }
             }
             // Array → tensor *decay*: an `Array` argument is intentionally accepted for a tensor
@@ -603,7 +682,12 @@ impl Sema<'_> {
                 // symbolic factors).
                 if shape.0.len() == 1 {
                     if let Dim::Var(_) = shape.0[0] {
-                        self.unify_dim(shape.0[0], Dim::Const(*len), dims, span, rigid);
+                        let site = DimSite {
+                            axis: 0,
+                            name: dim_var_at(tensor_shape_of(decl), 0)
+                                .or_else(|| dim_var_at(Some(shape), 0)),
+                        };
+                        self.unify_dim(shape.0[0], Dim::Const(*len), dims, span, rigid, site);
                     }
                 }
                 // The array must supply a whole number of the tensor's *known* (const) sub-slabs.
@@ -633,14 +717,18 @@ impl Sema<'_> {
                     *len != const_prod
                 };
                 if bad {
+                    // Show the shape the length is judged against — the SUBSTITUTED one, so the
+                    // extents printed are the ones `const_prod` is the product of.
+                    let dims = self.shape_str(shape);
                     let msg = if has_free_dim {
                         format!(
                             "array of length {len} is not a multiple of the tensor's known \
-                             dimensions (product {const_prod})"
+                             dimensions (shape {dims}, product of the fixed axes {const_prod})"
                         )
                     } else {
                         format!(
-                            "array of length {len} cannot satisfy a tensor of {const_prod} element{}",
+                            "array of length {len} cannot satisfy a tensor of shape {dims} \
+                             ({const_prod} element{})",
                             if const_prod == 1 { "" } else { "s" }
                         )
                     };
@@ -649,14 +737,14 @@ impl Sema<'_> {
             }
             (Ty::Ptr { pointee: pp, .. }, Ty::Ptr { pointee: ap, .. })
             | (Ty::Ref { pointee: pp, .. }, Ty::Ref { pointee: ap, .. }) => {
-                self.unify(pp, ap, dims, span, rigid)
+                self.unify_decl(pp, ap, decl_pointee(decl), dims, span, rigid)
             }
             // A slice parameter `[]T` accepts a slice `[]T` or — via unsizing — a fixed-size array
             // `[T; N]` argument; either way the element types must unify (a slice of a different
             // element type has a different stride, so `s[i]` would read the wrong bytes). The
             // array's static length is intentionally dropped to the slice's runtime length.
             (Ty::Slice(pe), Ty::Slice(ae) | Ty::Array { elem: ae, .. }) => {
-                self.unify(pe, ae, dims, span, rigid)
+                self.unify_decl(pe, ae, decl_pointee(decl), dims, span, rigid)
             }
             (
                 Ty::Vector {
@@ -794,6 +882,7 @@ impl Sema<'_> {
         dims: &mut HashMap<Symbol, Dim>,
         span: Span,
         rigid: bool,
+        site: DimSite,
     ) {
         // RIGID mode — used by the body shape checks (return type, operator / branch-arm operands).
         // There both shapes are FULLY DETERMINED by the signature and the body, so there is nothing
@@ -813,7 +902,8 @@ impl Sema<'_> {
                     span,
                     "E0502",
                     format!(
-                        "dimension mismatch: expected {}, found {}",
+                        "dimension mismatch on {}: expected {}, found {}",
+                        self.dim_site(site),
                         self.dim_str(pd),
                         self.dim_str(ad)
                     ),
@@ -823,14 +913,18 @@ impl Sema<'_> {
         }
         match pd {
             Dim::Var(v) => match dims.get(&v) {
+                // Reached when the binding for `v` is itself a dimension VARIABLE — a turbofish
+                // `f::<N>` from a caller whose own generic shares the callee's name — since
+                // `apply_subst` has already rewritten a binding to a constant before `unify` runs.
+                // Same wording as the constant arm: one dimension-mismatch shape for the family.
                 Some(bound) => {
                     if !dims_equal(*bound, ad) {
                         self.error(
                             span,
                             "E0502",
                             format!(
-                                "dimension `{}` was inferred as {} but is {} here",
-                                self.sym_str(v),
+                                "dimension mismatch on {}: expected {}, found {}",
+                                self.dim_site(site),
                                 self.dim_str(*bound),
                                 self.dim_str(ad)
                             ),
@@ -848,11 +942,14 @@ impl Sema<'_> {
                 }
             },
             Dim::Const(pc) => match ad {
-                Dim::Const(ac) if pc != ac => self.error(
-                    span,
-                    "E0502",
-                    format!("dimension mismatch: expected {pc}, found {ac}"),
-                ),
+                Dim::Const(ac) if pc != ac => {
+                    let at = self.dim_site(site);
+                    self.error(
+                        span,
+                        "E0502",
+                        format!("dimension mismatch on {at}: expected {pc}, found {ac}"),
+                    )
+                }
                 // A caller's own universally-quantified dim cannot be ASSUMED equal to the callee's
                 // fixed size — that is a claim the checker cannot prove, and the very hole `rigid`
                 // mode closes on the return path was left open here on the call path: `fn fwd<N>(a:
@@ -861,13 +958,14 @@ impl Sema<'_> {
                 // stays the documented `?` escape hatch.
                 Dim::Var(v) => {
                     let name = self.sym_str(v).to_string();
+                    let at = self.dim_site(site);
                     self.error(
                         span,
                         "E0502",
                         format!(
-                            "dimension mismatch: expected {pc}, found the generic dimension `{name}` \
-                             (a universally-quantified dimension cannot be assumed equal to {pc}; \
-                             declare the parameter `?` if the size is a runtime value)"
+                            "dimension mismatch on {at}: expected {pc}, found the generic dimension \
+                             `{name}` (a universally-quantified dimension cannot be assumed equal \
+                             to {pc}; declare the parameter `?` if the size is a runtime value)"
                         ),
                     );
                 }
@@ -950,11 +1048,12 @@ impl Sema<'_> {
         match base_ty {
             Ty::Tensor { elem, shape, .. } => {
                 if indices.len() != shape.rank() {
+                    let dims = self.shape_str(&shape);
                     self.error(
                         span,
                         "E0501",
                         format!(
-                            "this tensor has rank {} but is indexed with {} {}",
+                            "this tensor has rank {} {dims} but is indexed with {} {}",
                             shape.rank(),
                             indices.len(),
                             if indices.len() == 1 {
@@ -971,7 +1070,7 @@ impl Sema<'_> {
                     // silently accepted, then traps in the interpreter but reads out of bounds in
                     // native codegen — the backends disagree, violating the one hard invariant. A
                     // symbolic/dynamic dim or a non-constant index is left unconstrained.
-                    for (ix, dim) in indices.iter().zip(shape.0.iter()) {
+                    for (axis, (ix, dim)) in indices.iter().zip(shape.0.iter()).enumerate() {
                         if let Dim::Const(n) = dim {
                             if let Some(v) = self.eval_index_const(ix) {
                                 if v < 0 || v as u64 >= *n {
@@ -979,7 +1078,8 @@ impl Sema<'_> {
                                         ix.span,
                                         "E0501",
                                         format!(
-                                            "index {v} is out of bounds for a dimension of length {n}"
+                                            "index {v} is out of bounds for axis {axis} of \
+                                             length {n}"
                                         ),
                                     );
                                 }
@@ -1019,6 +1119,21 @@ impl Sema<'_> {
             self.defs.lookup(n).map(|d| &d.kind),
             Some(DefKind::Struct(_) | DefKind::Enum(_))
         )
+    }
+
+    /// A shape as a diagnostic renders it: `[M, K]`, `[512, 513]`, `[?]`.
+    fn shape_str(&self, s: &Shape) -> String {
+        let dims: Vec<String> = s.0.iter().map(|d| self.dim_str(*d)).collect();
+        format!("[{}]", dims.join(", "))
+    }
+
+    /// How a diagnostic points at one axis: ``` `K` (axis 1) ``` when the shape names it, `axis 1`
+    /// when it is a bare constant.
+    fn dim_site(&self, site: DimSite) -> String {
+        match site.name {
+            Some(n) => format!("`{}` (axis {})", self.sym_str(n), site.axis),
+            None => format!("axis {}", site.axis),
+        }
     }
 
     fn dim_str(&self, d: Dim) -> String {

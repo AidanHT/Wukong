@@ -205,6 +205,68 @@ fn every_catalogued_code_is_exercised() {
     );
 }
 
+/// The shape diagnostics whose primary MESSAGE is pinned, not just their code: each entry is a
+/// fixture, the code its headline must carry, and substrings that headline must contain. Naming the
+/// disagreeing dimension is the whole contract of Phase 0.6 — a message that regresses to a bare
+/// "expected 512, found 513" still carries `E0502`, so `compile_fail_suite` would stay green.
+/// The channel asserted here is `--error-format=json`, the one an editor actually reads.
+const NAMED_DIM_MESSAGES: &[(&str, &str, &[&str])] = &[
+    (
+        "wrong_k.wk",
+        "E0502",
+        &["dimension mismatch on `K` (axis 0): expected 512, found 513"],
+    ),
+    (
+        "wrong_m.wk",
+        "E0502",
+        &["dimension mismatch on `M` (axis 0): expected 512, found 513"],
+    ),
+    // A rank mismatch has no single dim to name, so it names rank against rank plus both shapes.
+    (
+        "rank.wk",
+        "E0501",
+        &["tensor rank mismatch: expected rank 2 [M, N], found rank 3 [4, 4, 4]"],
+    ),
+    // `a[5, 5]` on a square tensor raises one diagnostic per axis; only the axis tells them apart.
+    // The `find` below takes the first, which is axis 0.
+    (
+        "tensor_index_oob.wk",
+        "E0501",
+        &["index 5 is out of bounds for axis 0 of length 2"],
+    ),
+];
+
+/// The dimension a shape error is about must reach a tool through the JSON stream: the stable
+/// `code` field (unchanged, and still the exact `"code":"Ennnn"` substring the suite greps) plus a
+/// `message` field that names the dim and both extents.
+#[test]
+fn shape_diagnostics_name_the_dim_in_json() {
+    for (fixture, code, needles) in NAMED_DIM_MESSAGES {
+        let p = fail_dir().join(fixture);
+        let (ok, stderr) = compile_json(&p);
+        assert!(!ok, "{fixture}: expected a compile error");
+        let line = stderr
+            .lines()
+            .find(|l| l.contains(&format!("\"code\":\"{code}\"")))
+            .unwrap_or_else(|| panic!("{fixture}: no {code} diagnostic in stderr:\n{stderr}"));
+        // One JSON object per line, still parseable as such.
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "{fixture}: the {code} diagnostic is not a single JSON object:\n{line}"
+        );
+        for needle in *needles {
+            assert!(
+                line.contains(&format!("\"message\":\"{needle}")),
+                "{fixture}: the {code} headline must start with {needle:?}:\n{line}"
+            );
+        }
+    }
+    eprintln!(
+        "checked {} pinned shape message(s)",
+        NAMED_DIM_MESSAGES.len()
+    );
+}
+
 /// A diagnostic raised INSIDE an imported file must carry that file's own path and position:
 /// a multi-file program shares one `SourceMap` and every span keeps its own `SourceId`, so the
 /// renderer must name the imported file, not the root. The fixture's root

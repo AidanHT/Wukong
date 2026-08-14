@@ -1,0 +1,25 @@
+// EXPECT-CODE: E0502
+module tests.fail.wrong_k
+
+/// The master-plan §7.1 mutant: `matmul::<512, 512, 512>` pins the shared inner dimension `K` at
+/// 512, but `b`'s first axis is 513. A C or CUDA peer compiles this same mutant and reads past the
+/// buffer at runtime; here it is a compile error.
+///
+/// This fixture exists for the *message*, not only the code (Phase 0.6). The primary diagnostic
+/// must name the disagreeing dimension, not just the two extents:
+///
+///     error[E0502]: dimension mismatch on `K` (axis 0): expected 512, found 513
+///
+/// The name can only come from the declared signature — by the time the mismatch is found, the
+/// parameter has been substituted to `Tensor[f32, 512, 512]` and `K` is gone from it. The text is
+/// pinned by `shape_diagnostics_name_the_dim_in_json` in `crates/wukongc/tests/fail.rs`; the code
+/// is pinned here, by `compile_fail_suite`.
+fn matmul<M, N, K>(a: Tensor[f32, M, K], b: Tensor[f32, K, N], c: Tensor[f32, M, N]) {}
+
+fn main() -> i32 {
+    let a: Tensor[f32, 512, 512];
+    let b: Tensor[f32, 513, 512];
+    let c: Tensor[f32, 512, 512];
+    matmul::<512, 512, 512>(a, b, c);
+    return 0;
+}
