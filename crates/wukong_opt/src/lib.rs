@@ -37,6 +37,8 @@ mod fxhash;
 mod inline;
 mod licm;
 mod loop_canon;
+pub mod coalesce;
+pub mod coalesce;
 pub mod loop_info;
 mod mem2reg;
 mod phi;
@@ -46,6 +48,7 @@ mod unroll;
 mod vectorize;
 
 pub use alias::{type_bytes, AliasInfo, Prov};
+pub use coalesce::{analyze_function as coalesce_function, CoalesceHint, CoalescePlan, VectorWidth};
 pub use cache::CfgAnalyses;
 pub use cse::Cse;
 pub use dce::Dce;
