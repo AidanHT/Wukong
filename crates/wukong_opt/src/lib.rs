@@ -38,7 +38,6 @@ mod inline;
 mod licm;
 mod loop_canon;
 pub mod coalesce;
-pub mod coalesce;
 pub mod loop_info;
 mod mem2reg;
 mod phi;
