@@ -270,14 +270,13 @@ pub fn emit_ptx(program: &Program, entry: Symbol, interner: &Interner) -> Result
 /// `tid==0`-serial (`mrt_*`) call bracketed by `bar.sync`. Public so `megakernel.rs` and tooling can
 /// JIT / inspect it.
 ///
-/// Eligibility (`crate::fusion::analyze`) bars the entry from *calling* another user function, but an
-/// `@parallel` outline reaches one anyway — through `Op::FuncAddr` plus `wukong_parallel_for`, whose
-/// grid-stride lowering calls the outlined body per iteration. So the module carries the
-/// **reachability closure** of the entry as ordinary single-thread `mfn_*` bodies (each with its own
-/// per-thread `.local` frame and unguarded stores, which is what makes a per-thread call of one
-/// correct), and the helper scan covers those bodies too — a body calling `mrt_sgemm` needs the
-/// serial definition emitted even though the entry never mentions it. The closure, not every
-/// function: an unreachable body that declines would shrink mega coverage for no reason.
+/// Eligibility (`crate::fusion::analyze`) now allows the entry to call user-defined callees when
+/// they (transitively) contain only recognized cooperative ops and side effects. An `@parallel`
+/// outline still reaches its body through `Op::FuncAddr` plus `wukong_parallel_for`, whose
+/// grid-stride lowering calls the outlined body per iteration. The module carries the **reachability
+/// closure** of the entry: user callees on the `Op::Call` path are lowered SPMD (`tid==0`-guarded
+/// stores, grid-stride `wukong_parallel_for`), while `FuncAddr`-only outlined bodies stay
+/// single-thread `.func` bodies (per-thread `.local` frame, unguarded stores).
 pub fn emit_mega_ptx(
     program: &Program,
     entry: Symbol,
@@ -301,6 +300,7 @@ pub fn emit_mega_ptx(
         func_idx.insert(f.name, i);
     }
     let reachable = reachable_funcs(program, entry_idx, &func_idx);
+    let mega_callees = call_reachable_funcs(program, entry_idx, &func_idx);
 
     let mut out = String::new();
     out.push_str(crate::ptx_target::HDR_SM80);
@@ -360,7 +360,13 @@ pub fn emit_mega_ptx(
         out.push('\n');
     }
     for &fi in &callees {
-        let body = FnEmit::lower(&program.funcs[fi], fi, &func_idx, program, interner)?;
+        let body = if mega_callees.contains(&fi)
+            && crate::fusion::function_contains_parallel_for(interner, &program.funcs[fi])
+        {
+            FnEmit::lower_mega_callee(&program.funcs[fi], fi, &func_idx, program, interner)?
+        } else {
+            FnEmit::lower(&program.funcs[fi], fi, &func_idx, program, interner)?
+        };
         out.push_str(&body);
         out.push('\n');
     }
@@ -400,6 +406,36 @@ fn reachable_funcs(
         }
     }
     seen.into_iter().collect()
+}
+
+/// Every user function reachable from `root` through `Op::Call` edges only (not `FuncAddr`).
+/// These are the callees that run SPMD when called from the megakernel entry and need
+/// `tid==0`-guarded stores plus grid-stride `wukong_parallel_for`.
+fn call_reachable_funcs(
+    program: &Program,
+    root: usize,
+    func_idx: &HashMap<Symbol, usize>,
+) -> std::collections::BTreeSet<usize> {
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut work = vec![root];
+    while let Some(fi) = work.pop() {
+        if !seen.insert(fi) {
+            continue;
+        }
+        for b in &program.funcs[fi].blocks {
+            for inst in &b.insts {
+                if let Op::Call { func, .. } = &inst.op {
+                    if let Some(&t) = func_idx.get(func) {
+                        if !seen.contains(&t) {
+                            work.push(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    seen.remove(&root);
+    seen
 }
 
 // ============================================================================================
@@ -525,12 +561,11 @@ struct FnEmit<'a> {
     ctx_reg: String,
 
     // --- cooperative-megakernel mode (see `megakernel.rs`) ---
-    // When set, this function is lowered as the `.visible .entry` megakernel run by a *block* of
-    // threads (SPMD): the frame lives in one shared `.global` buffer (not a per-thread `.local`
-    // frame), every `Store` / side-effect is predicated to `tid==0`, and every recognized op is
-    // bracketed by `bar.sync` (cooperative across the block, or `@tid0` serial). Default `false`
-    // keeps the single-thread `.func` path byte-for-byte unchanged.
+    // When set, this function is lowered SPMD: stores/side-effects are `tid==0`-guarded and
+    // recognized ops are `bar.sync`-bracketed. `mega_entry` is true only for the `.visible .entry`
+    // kernel (which writes the exit code); mega callees use normal `.func` returns.
     mega: bool,
+    mega_entry: bool,
     // The predicate register holding `threadIdx.x == 0` (only bound in `mega` mode).
     tid0: String,
 }
@@ -565,6 +600,7 @@ impl<'a> FnEmit<'a> {
             frame_base: String::new(),
             ctx_reg: String::new(),
             mega: false,
+            mega_entry: false,
             tid0: String::new(),
         };
         e.assign_frame();
@@ -615,6 +651,7 @@ impl<'a> FnEmit<'a> {
             frame_base: String::new(),
             ctx_reg: String::new(),
             mega: true,
+            mega_entry: true,
             tid0: String::new(),
         };
         e.assign_frame();
@@ -625,6 +662,57 @@ impl<'a> FnEmit<'a> {
             ".visible .entry {MEGA_KERNEL_NAME}(.param .u64 p_ctx, .param .u64 p_frame)\n{{\n"
         ));
         e.write_reg_decls(&mut out);
+        out.push_str(&e.body);
+        out.push_str("}\n");
+        Ok(out)
+    }
+
+    /// Lower a user-defined callee that the megakernel entry reaches through `Op::Call`. Same SPMD
+    /// discipline as [`lower_mega`](Self::lower_mega) — `tid==0`-guarded stores, grid-stride
+    /// `wukong_parallel_for`, `bar.sync`-bracketed recognized ops — but emitted as an ordinary
+    /// `.func mfn_*` with a per-thread `.local` frame and a normal `ret` (not the exit-code slot).
+    fn lower_mega_callee(
+        func: &'a Function,
+        idx: usize,
+        func_idx: &'a HashMap<Symbol, usize>,
+        program: &'a Program,
+        interner: &'a Interner,
+    ) -> Result<String, String> {
+        let mut e = FnEmit {
+            func,
+            program,
+            interner,
+            func_idx,
+            body: String::new(),
+            n_rd: 0,
+            n_r: 0,
+            n_rs: 0,
+            n_f: 0,
+            n_fd: 0,
+            n_p: 0,
+            vreg: HashMap::new(),
+            vlanes: HashMap::new(),
+            const_ints: HashMap::new(),
+            func_addr_of: HashMap::new(),
+            n_lbl: 0,
+            frame_off: HashMap::new(),
+            frame_bytes: 0,
+            frame_base: String::new(),
+            ctx_reg: String::new(),
+            mega: true,
+            mega_entry: false,
+            tid0: String::new(),
+        };
+        e.assign_frame();
+        e.translate_mega_callee()?;
+
+        let mut out = String::new();
+        out.push_str(&fn_signature(func, idx));
+        out.push_str("\n{\n");
+        e.write_reg_decls(&mut out);
+        if e.frame_bytes > 0 {
+            let _ = writeln!(out, "    .local .align 8 .b8 __frame[{}];", e.frame_bytes);
+        }
         out.push_str(&e.body);
         out.push_str("}\n");
         Ok(out)
@@ -792,6 +880,42 @@ impl<'a> FnEmit<'a> {
         }
 
         // tid0 = (threadIdx.x == 0): the predicate guarding stores + side effects in SPMD mode.
+        let tid = self.fresh_r32();
+        self.tid0 = self.fresh_pred();
+        self.emit(&format!("mov.u32 {tid}, %tid.x;"));
+        self.emit(&format!("setp.eq.u32 {}, {tid}, 0;", self.tid0));
+
+        self.emit_blocks()
+    }
+
+    /// Mega callee preamble: per-thread `.local` frame, explicit params, and the `tid==0` predicate
+    /// that guards stores and side effects when this `.func` is called SPMD from the megakernel.
+    fn translate_mega_callee(&mut self) -> Result<(), String> {
+        let ctx_raw = self.fresh(RC::Rd);
+        self.ctx_reg = self.fresh(RC::Rd);
+        self.emit(&format!("ld.param.u64 {ctx_raw}, [p_ctx];"));
+        self.emit(&format!("cvta.to.global.u64 {}, {ctx_raw};", self.ctx_reg));
+
+        if self.frame_bytes > 0 {
+            let loc = self.fresh(RC::Rd);
+            self.frame_base = self.fresh(RC::Rd);
+            self.emit(&format!("mov.u64 {loc}, __frame;"));
+            self.emit(&format!("cvta.local.u64 {}, {loc};", self.frame_base));
+        }
+
+        let params: Vec<ValueId> = self.func.params.clone();
+        for (i, p) in params.iter().enumerate() {
+            if self.func.value_type(*p).is_vector() {
+                return Err(format!(
+                    "{UNSUPPORTED} SIMD function parameter v{} (no vector `.param` ABI)",
+                    p.0
+                ));
+            }
+            let r = self.reg(*p);
+            let abi = abi_ty(self.func.value_type(*p));
+            self.emit(&format!("ld.param.{abi} {r}, [p{i}];"));
+        }
+
         let tid = self.fresh_r32();
         self.tid0 = self.fresh_pred();
         self.emit(&format!("mov.u32 {tid}, %tid.x;"));
@@ -2505,13 +2629,13 @@ impl<'a> FnEmit<'a> {
 
     fn lower_term(&mut self, term: &Terminator) -> Result<(), String> {
         match term {
-            // In mega mode the entry *is* the kernel: a `Ret` writes the exit code into the context
-            // exit slot (tid==0) and returns, mirroring `emit_entry_kernel`'s wrapper.
-            Terminator::Ret(None) if self.mega => {
+            // In mega *entry* mode the kernel writes the exit code into the context exit slot
+            // (`tid==0`) and returns. Mega callees use the ordinary `.func` return path.
+            Terminator::Ret(None) if self.mega && self.mega_entry => {
                 self.emit_mega_exit(None);
                 self.emit("ret;");
             }
-            Terminator::Ret(Some(v)) if self.mega => {
+            Terminator::Ret(Some(v)) if self.mega && self.mega_entry => {
                 let v = *v;
                 self.emit_mega_exit(Some(v));
                 self.emit("ret;");
@@ -5004,7 +5128,7 @@ fn main() -> i32 {
     /// **256 -> 257** in the same series, when `lang_parallel_int_regions` was added: an i64
     /// `@parallel` fixture, which lowers on Win64 in the default host mode because the 256-bit
     /// raw-AVX2 recipe is f32-only. 257 of 363 on the device gate and 257 lowerable device-free.
-    const RUN_CORPUS_COVERAGE_FLOOR: usize = 257;
+    const RUN_CORPUS_COVERAGE_FLOOR: usize = 258;
 
     /// The corpus directory both coverage gates and the invariance gate below sweep.
     fn corpus_files() -> Vec<PathBuf> {
