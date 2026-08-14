@@ -376,39 +376,85 @@ fn parallel_for_is_cooperative(
     Ok(())
 }
 
-/// Analyze `entry` for cooperative-megakernel eligibility and inventory its recognized ops.
-///
-/// Eligible iff (in this first increment):
-///  - the entry's only calls are recognized cooperative ops or deterministic side effects
-///    (`print`/`assert`) — no other user functions and no unrecognized runtime symbols. A
-///    `wukong_parallel_for` is admitted when [`parallel_for_is_cooperative`] holds, even though its
-///    outlined body is a separate function: the body is reached through `Op::FuncAddr`, not called
-///    from the entry, and `lower.rs` emits it as one more `.func` in the module;
-///  - control flow is data-independent (the safety gate above);
-///  - cooperative-op arguments are themselves data-independent (so every thread computes the same
-///    pointers/sizes — otherwise threads would disagree on what to cooperate on);
-///  - at least one recognized cooperative op is present (else the single-thread path is already fine).
-pub fn analyze(program: &Program, entry: Symbol, interner: &Interner) -> MegaPlan {
-    let Some(func) = program.function(entry) else {
-        return MegaPlan::ineligible("no entry function");
-    };
-    if !func.params.is_empty() {
-        return MegaPlan::ineligible("entry takes parameters");
-    }
+/// Does `func` contain a direct `wukong_parallel_for` call?
+pub(crate) fn function_contains_parallel_for(interner: &Interner, func: &Function) -> bool {
+    func.blocks.iter().any(|b| {
+        b.insts.iter().any(|inst| {
+            matches!(
+                &inst.op,
+                Op::Call { func: callee, .. } if interner.resolve(*callee) == "wukong_parallel_for"
+            )
+        })
+    })
+}
 
+/// May the megakernel entry call this user-defined callee?
+///
+/// Admitted when the callee is a serial helper (no recognized cooperative op) or when it carries
+/// the generic `@parallel` outline (`wukong_parallel_for`). A callee that calls any other
+/// recognized op — `wukong_sgemm`, `wukong_sreduce`, … — stays on the single-thread path: those
+/// ops need the entry's shared frame and the existing cooperative lowering, not an SPMD `.func`.
+fn user_callee_is_admitted(
+    program: &Program,
+    interner: &Interner,
+    func: &Function,
+) -> Result<(), String> {
+    if function_contains_parallel_for(interner, func) {
+        return Ok(());
+    }
+    for b in &func.blocks {
+        for inst in &b.insts {
+            if let Op::Call { func: callee, .. } = &inst.op {
+                if program.function(*callee).is_some() {
+                    continue;
+                }
+                if matches!(classify_call(interner.resolve(*callee)), CallClass::Coop(_)) {
+                    return Err(format!(
+                        "user callee `{}` calls a recognized op other than wukong_parallel_for",
+                        interner.resolve(func.name)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scan one function's call sites for cooperative work, recursing into user-defined callees.
+///
+/// Each function in the call tree must have data-independent control flow. Cooperative-op arguments
+/// must be data-independent in the *calling* function's taint set. Mutual recursion is declined.
+fn scan_function_calls(
+    program: &Program,
+    interner: &Interner,
+    func: &Function,
+    coop_ops: &mut Vec<CoopOp>,
+    visiting: &mut HashSet<Symbol>,
+) -> Result<(), String> {
     let tainted = mem_tainted(func);
     if has_data_dependent_control_flow(func, &tainted) {
-        return MegaPlan::ineligible("data-dependent control flow (a branch reads memory)");
+        return Err("data-dependent control flow (a branch reads memory)".to_string());
     }
 
-    let mut coop_ops: Vec<CoopOp> = Vec::new();
     for (bi, b) in func.blocks.iter().enumerate() {
         for (ii, inst) in b.insts.iter().enumerate() {
             if let Op::Call { func: callee, args } = &inst.op {
                 let name = interner.resolve(*callee).to_string();
-                // A call to another user-defined function is opaque to this single-function analysis.
-                if program.function(*callee).is_some() {
-                    return MegaPlan::ineligible(format!("entry calls user function `{name}`"));
+                if let Some(callee_fn) = program.function(*callee) {
+                    if let Err(why) = user_callee_is_admitted(program, interner, callee_fn) {
+                        return Err(format!("call to user function `{name}`: {why}"));
+                    }
+                    if !visiting.insert(*callee) {
+                        return Err(format!("recursive call to user function `{name}`"));
+                    }
+                    scan_function_calls(program, interner, callee_fn, coop_ops, visiting)?;
+                    visiting.remove(callee);
+                    if args.iter().any(|a| tainted.contains(&a.0)) {
+                        return Err(format!(
+                            "call to user function `{name}` has a data-dependent argument"
+                        ));
+                    }
+                    continue;
                 }
                 match classify_call(&name) {
                     CallClass::Coop(kind) => {
@@ -416,12 +462,11 @@ pub fn analyze(program: &Program, entry: Symbol, interner: &Interner) -> MegaPla
                             if let Err(why) =
                                 parallel_for_is_cooperative(program, interner, func, args)
                             {
-                                return MegaPlan::ineligible(why);
+                                return Err(why);
                             }
                         }
-                        // Cooperative-op args must be data-independent so all threads agree.
                         if args.iter().any(|a| tainted.contains(&a.0)) {
-                            return MegaPlan::ineligible(format!(
+                            return Err(format!(
                                 "recognized op `{name}` has a data-dependent argument"
                             ));
                         }
@@ -436,11 +481,40 @@ pub fn analyze(program: &Program, entry: Symbol, interner: &Interner) -> MegaPla
                     }
                     CallClass::SideEffect => {}
                     CallClass::Other => {
-                        return MegaPlan::ineligible(format!("entry calls unrecognized `{name}`"));
+                        return Err(format!("call to unrecognized `{name}`"));
                     }
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Analyze `entry` for cooperative-megakernel eligibility and inventory its recognized ops.
+///
+/// Eligible iff:
+///  - the entry and every user-defined callee it reaches (transitively) only call recognized
+///    cooperative ops, deterministic side effects (`print`/`assert`), or more such callees. A
+///    `wukong_parallel_for` is admitted when [`parallel_for_is_cooperative`] holds; its outlined body
+///    is reached through `Op::FuncAddr`, not called directly, and `lower.rs` emits it as a
+///    single-thread `.func`;
+///  - control flow is data-independent in every function in that call tree;
+///  - cooperative-op arguments are themselves data-independent (so every thread agrees on sizes and
+///    pointers);
+///  - at least one recognized cooperative op is present (else the single-thread path suffices).
+pub fn analyze(program: &Program, entry: Symbol, interner: &Interner) -> MegaPlan {
+    let Some(func) = program.function(entry) else {
+        return MegaPlan::ineligible("no entry function");
+    };
+    if !func.params.is_empty() {
+        return MegaPlan::ineligible("entry takes parameters");
+    }
+
+    let mut coop_ops: Vec<CoopOp> = Vec::new();
+    let mut visiting = HashSet::new();
+    visiting.insert(entry);
+    if let Err(why) = scan_function_calls(program, interner, func, &mut coop_ops, &mut visiting) {
+        return MegaPlan::ineligible(why);
     }
 
     if coop_ops.is_empty() {
@@ -691,6 +765,68 @@ fn main() -> i32 {
                 p.coop_ops.iter().any(|c| c.kind == CoopKind::ParallelFor),
                 "expected a ParallelFor coop op at -O{opt}, got {:?}",
                 p.coop_ops.iter().map(|c| c.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The common `@parallel fn saxpy(..)` called from `main` shape — cooperative work lives in the
+    /// callee, not the entry. Until Phase 1.2b this was declined ("entry calls user function").
+    const SRC_CALLEE_PARALLEL: &str = r#"module t
+@parallel
+fn saxpy(mut x: [f32; 64], mut y: [f32; 64]) {
+    for i in 0..64 { x[i] = (i as f32) * 2.0; }
+    for i in 0..64 {
+        let v = x[i];
+        y[i] = v * v * 0.25 + 3.0;
+    }
+}
+fn main() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    let mut y: [f32; 64] = [0.0; 64];
+    saxpy(x, y);
+    print(y[63] as i32);
+    return 0;
+}
+"#;
+
+    #[test]
+    fn generic_parallel_callee_is_eligible() {
+        for opt in [2u8, 3u8] {
+            let (p, _prog, _i) = plan(SRC_CALLEE_PARALLEL, opt);
+            assert!(
+                p.eligible,
+                "generic @parallel callee -O{opt} expected eligible, got: {}",
+                p.reason
+            );
+            assert!(
+                p.coop_ops.iter().any(|c| c.kind == CoopKind::ParallelFor),
+                "expected a ParallelFor coop op at -O{opt}, got {:?}",
+                p.coop_ops.iter().map(|c| c.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A user callee that calls `wukong_sgemm` / `wukong_norm` / … directly — not
+    /// `wukong_parallel_for` — must keep the program on the single-thread path. `transformer_block`
+    /// is the shape.
+    #[test]
+    fn gemm_callee_keeps_program_ineligible() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/run/transformer_block.wk"),
+        )
+        .expect("read transformer_block.wk");
+        for opt in [2u8, 3u8] {
+            let (p, _prog, _i) = plan(&src, opt);
+            assert!(
+                !p.eligible,
+                "transformer_block -O{opt} must stay ineligible (gemm callee), got eligible"
+            );
+            assert!(
+                p.reason.contains("wukong_parallel_for")
+                    || p.reason.contains("recognized op")
+                    || p.reason.contains("user callee"),
+                "reason should name the gemm callee: {}",
+                p.reason
             );
         }
     }
