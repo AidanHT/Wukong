@@ -170,9 +170,10 @@ greps for the literal substring `"code":"Ennnn"`, so key order and the absence o
 
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
 Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
-and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 22 variants: constants
+and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 24 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
-(`Alloca`/`Load`/`Store`/`Gep`), `Call`, the float/SIMD primitives
+(`Alloca`/`Load`/`Store`/`Gep`), `Call`, `Barrier` (cooperative thread-block fence from
+`sync_block()`), the float/SIMD primitives
 (`Splat`/`ExtractLane`/`Iota`/`Fma`/`Sqrt`/`Round`), the address-of ops (`FuncAddr`, `GlobalAddr`),
 and `VecKernelCall`. Of the SIMD three, `Splat` broadcasts one scalar to every lane, `ExtractLane`
 reads one lane back out (the only way from vector to scalar form, and what keeps a widened float
@@ -188,6 +189,13 @@ defining frame is gone. `Op::VecKernelCall` — a call into a synthesized 256-bi
 covered under the vectorizer below.
 
 The front-end lowers in **clang style**: one `alloca` per local, with `load`/`store` on every use.
+`Op::Alloca` carries an `AddrSpace` (`Local` or `Shared`); `shared [T; N]` lowers to
+`AddrSpace::Shared`. `sync_block()` lowers to `Op::Barrier`. On CPU backends shared is an ordinary
+stack slot and `Barrier` is a no-op (interpreter) or compiler fence (Cranelift). On gpu-native,
+`lower.rs` maps shared allocas to PTX `.shared __user_smem[]` and `Barrier` to `bar.sync 0` — no
+changes to `gpu.rs` or the `ptx_*.rs` families. `@tile(B)` strip-mining in `wukong_mir_build::tile`
+expands a half-open unit-step range `for` into tiled inner loops plus a remainder loop before the
+recognizer cascade runs.
 This keeps lowering simple and correct; the optimizer's `mem2reg` pass then promotes those slots to
 SSA registers (see below), which is what makes the value-based passes effective.
 

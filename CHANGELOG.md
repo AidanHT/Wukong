@@ -5,6 +5,26 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Language — `@tile` strip-mining, `shared [T; N]`, and `sync_block()` (branch `lang/p2-tile-shared`)
+
+Phase 2 tile and shared-memory constructs (not yet merged to `main`):
+
+- **`@tile(B)`** on a half-open unit-step `for` strip-mines into full tiles plus a remainder loop
+  (`wukong_mir_build::tile`). `@tile(BM, BN, …)` on a function queues widths for nested `for` loops in
+  source order. Runs before the recognizer cascade — not a back-door into `wukong_*` kernels.
+  Fixture: `tests/run/lang_tile_saxpy.wk`.
+- **`shared [T; N]`** lowers to `Op::Alloca { space: Shared }`. **`sync_block()`** lowers to
+  `Op::Barrier`. CPU backends: shared = ordinary stack `alloca`; barrier = no-op (interp) / compiler
+  fence (Cranelift). gpu-native: PTX `.shared` + `bar.sync 0` in `lower.rs` only.
+- **Diagnostics:** `E0307` when static shared size exceeds 48 KiB (`tests/fail/shared_too_large.wk`);
+  `E0308` when `sync_block()` is outside `@parallel` (`tests/fail/sync_outside_parallel.wk`).
+- **Composed fixture:** `tests/run/lang_tiled_transpose.wk` — `@generic @parallel @tile(2, 2)` tiled
+  transpose with 2×2 `shared` staging and `sync_block()`; MIR has no `wukong_transpose_f32` call.
+- **gpu-native smoke** (`cargo run -q -p wukongc --features gpu -- --run --backend=gpu-native -O2` on
+  this laptop's RTX 4050): `lang_tile_saxpy.wk` passes (prints `3` five times); `lang_shared_transpose.wk`
+  and `lang_tiled_transpose.wk` fail with `CUDA_ERROR_ILLEGAL_ADDRESS` during readback — shared SMEM
+  lowering on gpu-native still needs work; CPU interp/native paths are correct.
+
 ### Language — `@generic` on a function suppresses the kernel recognizers ✅
 `@generic fn f(…)` opts one function out of kernel recognition: no `match_*` recognizer,
 whole-function interception, statement-window matcher or elementwise kernel probe fires inside it, so

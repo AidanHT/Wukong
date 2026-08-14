@@ -448,13 +448,14 @@ Attribute *syntax* is parsed on functions, parameters and statements (a missing 
 `E0207`), and the attribute **name is validated against a closed set** (✅): `@parallel`, `@generic`,
 `@tile`, `@extern`, `@inline`, `@simd`, `@align`, `@export`. Anything else — `@bogus(1, 2)`, and far
 more usefully a typo of a real one such as `@parellel` — is **`E0306`**, where it used to be accepted
-and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Two attributes have
-a consumer today, both on a **function**: **`@parallel`** (✅), which makes its loop execute across CPU
-cores, and **`@generic`** (✅), which opts the function out of the kernel recognizers (below).
-Everything else in the list above — `@inline`, `@simd`, `@tile`, `@align`, `@extern`, `@export`, and
-`@parallel`'s own `grain = …` argument — is parsed and discarded (🔵), and stays legal wherever it
-parses. A *discarded* attribute on a statement or loop is dropped there too: `@parallel` must sit on
-the function, and the mid-function parallel region is derived from the enclosing function's
+and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Three attributes have
+a consumer on a **function**: **`@parallel`** (✅), which makes its loop execute across CPU cores,
+**`@generic`** (✅), which opts the function out of the kernel recognizers (below), and **`@tile`** (✅),
+which strip-mines loops (below).
+Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern`, `@export`, and
+`@parallel`'s own `grain = …` argument — is parsed and discarded (🔵). `@tile` is consumed as loop
+strip-mining (see below). A *discarded* attribute on a statement or loop is dropped there too:
+`@parallel` must sit on the function, and the mid-function parallel region is derived from the enclosing function's
 attribute, not from one written on the loop. `@generic` in that position is an error, not a silent
 drop.
 
@@ -521,6 +522,47 @@ case rather than being an f32-only gate: a `bf16`/`f16` array read through the e
 (`tests/run/parallel_reduce_elem_bf16.wk`); an `f64` reduction has no kernel and always declines.
 `@tile` (cache tiling) and
 explicit `@simd`-typed vector values are still under construction (🔵).
+
+### `@tile` — loop strip-mining ✅
+
+```wukong
+@tile(2)           // on the fn: queue consumed by nested `for` loops in order
+@tile(64, 64)      // on the fn: first loop gets 64, second gets 64
+fn saxpy_tiled(...) {
+    for i in 0..n { out[i] = a * x[i] + y[i]; }   // or `@tile(B)` on one loop overrides
+}
+```
+
+`@tile(B)` on a **half-open, unit-step** `for i in start..end` strip-mines that loop into full tiles
+(outer `io`, inner `ii` over `0..B`) plus a **remainder loop** for the tail — not implicit padding.
+`@tile(BM, BN, …)` on a function queues widths consumed by nested `for` loops in source order; a
+statement-level `@tile(B)` overrides for one loop. Strip-mining runs **before** the kernel recognizer
+cascade — it is not a back-door into `wukong_*` kernels. Works with `@generic`. Other `for` forms
+(`step`, `..=`, labelled loops) fall through unchanged. Fixture: `tests/run/lang_tile_saxpy.wk`
+(`@tile(2)`, `n=5`, remainder lane prints 3).
+
+### `shared [T; N]` and `sync_block()` ✅
+
+```wukong
+@parallel
+fn stage(mut out: [f32; 4], inp: [f32; 4]) {
+    let mut tile: shared [f32; 4];
+    tile[0] = inp[0];
+    // ...
+    sync_block();
+    out[0] = tile[0];
+}
+```
+
+`shared [T; N]` declares a statically-sized array in **shared address space**. On CPU backends
+(interpreter, Cranelift) shared lowers to an ordinary `alloca` — thread-local stack — and
+`sync_block()` is a no-op (interp) or a compiler fence (native). On `--backend=gpu-native`, shared
+lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen_gpu::lower.rs` only).
+`sync_block()` is only legal inside a `@parallel` function (`E0308` otherwise;
+`tests/fail/sync_outside_parallel.wk`). A static shared size above 48 KiB is `E0307`
+(`tests/fail/shared_too_large.wk`). Fixtures: `tests/run/lang_shared_transpose.wk`,
+`tests/run/lang_tiled_transpose.wk` (composed `@tile(2,2)` + shared + `sync_block()` tiled transpose;
+`@generic` keeps `wukong_transpose_f32` out of the MIR).
 
 ## Built-in intrinsics ✅
 
