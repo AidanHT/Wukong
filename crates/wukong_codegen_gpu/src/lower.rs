@@ -4420,6 +4420,33 @@ fn main() -> i32 {
         }
     }
 
+    /// User `shared [T; N]` allocas lower through `cvta.shared` (generic addresses). `ld.shared` /
+    /// `st.shared` require shared-space addresses and fault on the generic pointers — mirror the
+    /// `.local` frame path (`cvta.local` + generic `ld`/`st`, never `ld.local`). Device-free.
+    #[test]
+    fn shared_user_smem_uses_generic_ld_after_cvta_shared() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/run/lang_shared_transpose.wk"
+        );
+        let src = std::fs::read_to_string(path).expect("lang_shared_transpose.wk");
+        let (program, mut interner) = build(&src, 2).expect("compile shared transpose fixture");
+        let entry = interner.intern("main");
+        let ptx = emit_ptx(&program, entry, &interner).expect("emit_ptx");
+        assert!(
+            ptx.contains("cvta.shared.u64"),
+            "shared alloca base must be cvta.shared"
+        );
+        assert!(
+            !ptx.contains("ld.shared"),
+            "cvta.shared addresses must use generic ld, not ld.shared"
+        );
+        assert!(
+            !ptx.contains("st.shared"),
+            "cvta.shared addresses must use generic st, not st.shared"
+        );
+    }
+
     /// The comparator the corpus gate is built on, pinned against the real divergence it used to
     /// wave through. The four "before" lines are the actual gpu-native -O3 output of
     /// `tests/run/bf16_literal_grid.wk` when bf16/f16 constants were not grid-rounded; the oracle
