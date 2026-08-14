@@ -1,7 +1,7 @@
 module examples.lang_unknown_op
 
 // Few-shot idiom: a user-invented three-point stencil, not a named operation.
-// MIR witness: no wukong_* call at -O2 on branch lang/p0-corpus.
+// MIR witness: no wukong_* call at -O2 with @generic.
 @generic
 fn main() -> i32 {
     let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];

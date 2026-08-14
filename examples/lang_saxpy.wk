@@ -1,8 +1,8 @@
 module examples.lang_saxpy
 
 // Few-shot idiom: write the scalar loop and use @generic to request no named
-// recognizer. On this branch MIR still calls wukong_velem_f32; recognition-off
-// lands separately. Print every lane so partial writes cannot look correct.
+// recognizer. MIR witness: no wukong_* call at -O2 with @generic. Print every
+// lane so partial writes cannot look correct.
 @generic
 fn main() -> i32 {
     let a: f32 = 2.0;
