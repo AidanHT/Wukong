@@ -22,8 +22,9 @@ Phase 2 tile and shared-memory constructs (not yet merged to `main`):
   transpose with 2×2 `shared` staging and `sync_block()`; MIR has no `wukong_transpose_f32` call.
 - **gpu-native smoke** (`cargo run -q -p wukongc --features gpu -- --run --backend=gpu-native -O2` on
   this laptop's RTX 4050): `lang_tile_saxpy.wk` passes (prints `3` five times); `lang_shared_transpose.wk`
-  and `lang_tiled_transpose.wk` fail with `CUDA_ERROR_ILLEGAL_ADDRESS` during readback — shared SMEM
-  lowering on gpu-native still needs work; CPU interp/native paths are correct.
+  and `lang_tiled_transpose.wk` failed with `CUDA_ERROR_ILLEGAL_ADDRESS` during readback before branch
+  `gpu/p2-shared-addr-fix` — user `shared` allocas used `cvta.shared` (generic addresses) but
+  `ld.shared`/`st.shared` (shared-space ops). Fixed in `lower.rs` only; both fixtures now match interp.
 
 ### Language — `@generic` on a function suppresses the kernel recognizers ✅
 `@generic fn f(…)` opts one function out of kernel recognition: no `match_*` recognizer,
