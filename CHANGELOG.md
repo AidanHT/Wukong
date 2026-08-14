@@ -5,6 +5,26 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Compiler — Phase 3 coalesce analysis, vector global ld/st, and `.col_major` indexing (branch `lang/p3-coalesce`)
+
+Phase 3 generic memory opts and shape completeness (not yet merged to `main`):
+
+- **`wukong_opt::coalesce`** — affine stride analysis over [`loop_info`](crates/wukong_opt/src/loop_info.rs):
+  unit-stride `f32` accesses on a loop IV are tagged as `v4` candidates; column / symbolic strides are
+  `Strided`. Pure analysis — no MIR rewrite and no named-kernel dispatch.
+- **gpu-native vector global `ld`/`st`** — when coalesce marks a `<4 x f32>` global load/store and the
+  pointer is not user shared memory, `lower.rs` emits `ld.global.v4.f32` / `st.global.v4.f32` instead of
+  four scalar generic ops. Requires vectorized MIR (`-O2`); scalar `-O0` loops stay scalar. Does not
+  duplicate Task 1.1 SIMD Splat lowering — this path is for already-widened MIR bodies only.
+- **`.col_major` tensor indexing** — `a[i, j]` on `Tensor[…, .col_major]` lowers to the same flat offset
+  as `a[i + j*M]` (`tindex.rs`, `tensor_strides`, dynamic multi-index). `.strided` / `.tiled(…)` remain
+  `C0001`. Runtime oracle: `tests/run/tensor_col_major.wk`; MIR parity:
+  `crates/wukongc/tests/tensor_parity.rs::col_major_tensor_matches_flat_index`.
+- **Fixtures:** `tests/run/lang_generic_copy.wk` — `@generic` 8-element streaming copy (every lane
+  printed; scalar loop semantics).
+- **Bandwidth:** no fresh same-run A/B on this branch — do not cite `BENCHMARKS.md` numbers. Peer for the
+  vector ld/st work is a hand-written copy/saxpy loop, not cuBLAS.
+
 ### Language — `@tile` strip-mining, `shared [T; N]`, and `sync_block()` (branch `lang/p2-tile-shared`)
 
 Phase 2 tile and shared-memory constructs (not yet merged to `main`):
