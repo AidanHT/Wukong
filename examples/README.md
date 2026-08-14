@@ -20,6 +20,15 @@ cargo run -p wukongc -- --emit=mir -O3 examples/dot.wk
 `--run` and an explicit `--emit=<stage>` are mutually exclusive: the compiler honours exactly one of
 them, so the combination is rejected rather than silently discarding half the work.
 
+## Idiomatic kernel loops (few-shot)
+
+These are the small loops a human or AI editor should copy: `lang_saxpy.wk`,
+`lang_naive_gemm.wk`, and `lang_unknown_op.wk`. They use `@generic` on purpose
+to request recognition-off behavior, spell the scalar algorithm directly, and
+print every output lane. The matching C/CUDA comparison peers live under
+[`tests/compare/`](../tests/compare/); these examples are correctness
+few-shots, not performance claims.
+
 ## Runnable today (interpreter)
 
 | File                | What it shows                                   | Output            |

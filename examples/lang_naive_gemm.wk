@@ -1,0 +1,28 @@
+module examples.lang_naive_gemm
+
+// Few-shot idiom: row-major C[2,2] = A[2,3] * B[3,2] in natural ikj order.
+// On this branch MIR still calls wukong_sgemm; recognition-off lands separately.
+@generic
+fn main() -> i32 {
+    let a: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let mut c: [f32; 4] = [0.0; 4];
+
+    for i in 0..2 {
+        for j0 in 0..2 {
+            c[i * 2 + j0] = 0.0;
+        }
+        for k in 0..3 {
+            let aik: f32 = a[i * 3 + k];
+            for j in 0..2 {
+                c[i * 2 + j] = c[i * 2 + j] + aik * b[k * 2 + j];
+            }
+        }
+    }
+
+    // Every scalar result: [4, 5; 10, 11].
+    for i in 0..4 {
+        print(c[i] as i32);
+    }
+    return 0;
+}

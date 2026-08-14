@@ -1,0 +1,21 @@
+module examples.lang_unknown_op
+
+// Few-shot idiom: a user-invented three-point stencil, not a named operation.
+// MIR witness: no wukong_* call at -O2 on branch lang/p0-corpus.
+@generic
+fn main() -> i32 {
+    let x: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let mut out: [f32; 8] = [0.0; 8];
+    out[0] = x[0];
+    out[7] = x[7];
+
+    for i in 1..7 {
+        out[i] = x[i - 1] + 2.0 * x[i] + x[i + 1];
+    }
+
+    // Every lane from scalar semantics: 1, 8, 12, 16, 20, 24, 28, 8.
+    for i in 0..8 {
+        print(out[i] as i32);
+    }
+    return 0;
+}
