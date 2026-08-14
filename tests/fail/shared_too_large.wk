@@ -1,0 +1,11 @@
+// EXPECT-CODE: E0307
+module tests.fail.shared_too_large
+
+@parallel
+fn f() {
+    let s: shared [f32; 100000];
+}
+
+fn main() -> i32 {
+    return 0;
+}
