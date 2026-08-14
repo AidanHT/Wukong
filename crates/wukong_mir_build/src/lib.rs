@@ -17065,8 +17065,9 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        // Only row-major (contiguous) tensors flatten to `i0*s0 + … + i_{n-1}` with these strides.
-        if !matches!(layout, wukong_types::Layout::Contiguous) {
+        // Row-major and column-major tensors flatten to a single flat offset when every extent is
+        // a compile-time constant.
+        if !matches!(layout, wukong_types::Layout::Contiguous | wukong_types::Layout::ColMajor) {
             return None;
         }
         let dims = &shape.0;
@@ -17074,13 +17075,22 @@ impl FnLowerer<'_> {
         if rank == 0 {
             return None;
         }
+        let mut extents = Vec::with_capacity(rank);
+        for d in dims {
+            match d {
+                wukong_types::Dim::Const(n) => extents.push(*n as usize),
+                _ => return None,
+            }
+        }
         let mut strides = vec![1usize; rank];
-        for k in (0..rank - 1).rev() {
-            let next = match dims[k + 1] {
-                wukong_types::Dim::Const(d) => d as usize,
-                _ => return None, // a symbolic/dynamic interior dim — stride unknown at compile time
-            };
-            strides[k] = strides[k + 1] * next;
+        if matches!(layout, wukong_types::Layout::ColMajor) {
+            for k in 1..rank {
+                strides[k] = strides[k - 1] * extents[k - 1];
+            }
+        } else {
+            for k in (0..rank - 1).rev() {
+                strides[k] = strides[k + 1] * extents[k + 1];
+            }
         }
         Some((strides, mir_ty(&Ty::Scalar(elem))))
     }
@@ -17189,7 +17199,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if !matches!(layout, wukong_types::Layout::Contiguous) {
+        if !matches!(layout, wukong_types::Layout::Contiguous | wukong_types::Layout::ColMajor) {
             return None;
         }
         let dims = shape.0; // owned (`Dim` is `Copy`)
@@ -17199,17 +17209,27 @@ impl FnLowerer<'_> {
         }
         let elem_mir = mir_ty(&Ty::Scalar(elem));
         let base_ptr = self.lower_expr(base);
-        // `strides[k]` = product of the dims *after* axis `k`; the innermost axis (`None`) is the
-        // unit stride, matching the constant path's `if st == 1 { iv }` (no multiply emitted).
         let mut strides: Vec<Option<ValueId>> = vec![None; rank];
-        for k in (0..rank.saturating_sub(1)).rev() {
-            let next = self.tensor_dim_value(dims[k + 1])?;
-            strides[k] = Some(match strides[k + 1] {
-                None => next, // strideₖ = dim_{k+1} · 1
-                Some(s_next) => self
-                    .builder
-                    .build(MirType::I64, Op::Bin(BinOp::Mul, s_next, next)),
-            });
+        if matches!(layout, wukong_types::Layout::ColMajor) {
+            for k in 1..rank {
+                let prev = self.tensor_dim_value(dims[k - 1])?;
+                strides[k] = Some(match strides[k - 1] {
+                    None => prev,
+                    Some(s_prev) => self
+                        .builder
+                        .build(MirType::I64, Op::Bin(BinOp::Mul, s_prev, prev)),
+                });
+            }
+        } else {
+            for k in (0..rank.saturating_sub(1)).rev() {
+                let next = self.tensor_dim_value(dims[k + 1])?;
+                strides[k] = Some(match strides[k + 1] {
+                    None => next,
+                    Some(s_next) => self
+                        .builder
+                        .build(MirType::I64, Op::Bin(BinOp::Mul, s_next, next)),
+                });
+            }
         }
         let mut flat: Option<ValueId> = None;
         for (ix, st) in indices.iter().zip(strides.iter()) {
