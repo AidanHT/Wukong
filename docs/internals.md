@@ -193,7 +193,10 @@ The front-end lowers in **clang style**: one `alloca` per local, with `load`/`st
 `AddrSpace::Shared`. `sync_block()` lowers to `Op::Barrier`. On CPU backends shared is an ordinary
 stack slot and `Barrier` is a no-op (interpreter) or compiler fence (Cranelift). On gpu-native,
 `lower.rs` maps shared allocas to PTX `.shared __user_smem[]` and `Barrier` to `bar.sync 0` — no
-changes to `gpu.rs` or the `ptx_*.rs` families. `@tile(B)` strip-mining in `wukong_mir_build::tile`
+changes to `gpu.rs` or the `ptx_*.rs` families. At `-O2`, `wukong_opt::coalesce` classifies loop
+memory accesses by IV element stride (`loop_info`); when a vectorized MIR body carries `<4 x f32>`
+global loads/stores on a unit-stride hint, `lower.rs` may emit `ld.global.v4.f32` / `st.global.v4.f32`
+instead of four scalar generic ops (Phase 3, branch `lang/p3-coalesce`). `@tile(B)` strip-mining in `wukong_mir_build::tile`
 expands a half-open unit-step range `for` into tiled inner loops plus a remainder loop before the
 recognizer cascade runs.
 This keeps lowering simple and correct; the optimizer's `mem2reg` pass then promotes those slots to
