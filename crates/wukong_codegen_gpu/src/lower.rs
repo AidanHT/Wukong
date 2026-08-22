@@ -4587,7 +4587,7 @@ pub fn mega_frame_bytes(func: &Function) -> u64 {
     for b in &func.blocks {
         for inst in &b.insts {
             if let Op::Alloca {
-                ty: ty,
+                ty,
                 space: wukong_mir::AddrSpace::Local,
             } = &inst.op
             {

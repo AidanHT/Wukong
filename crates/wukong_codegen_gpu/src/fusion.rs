@@ -460,11 +460,7 @@ fn scan_function_calls(
                 match classify_call(&name) {
                     CallClass::Coop(kind) => {
                         if kind == CoopKind::ParallelFor {
-                            if let Err(why) =
-                                parallel_for_is_cooperative(program, interner, func, args)
-                            {
-                                return Err(why);
-                            }
+                            parallel_for_is_cooperative(program, interner, func, args)?;
                         }
                         if args.iter().any(|a| tainted.contains(&a.0)) {
                             return Err(format!(
