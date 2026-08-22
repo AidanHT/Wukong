@@ -12,10 +12,34 @@ Phase 3 generic memory opts and shape completeness (not yet merged to `main`):
 - **`wukong_opt::coalesce`** — affine stride analysis over [`loop_info`](crates/wukong_opt/src/loop_info.rs):
   unit-stride `f32` accesses on a loop IV are tagged as `v4` candidates; column / symbolic strides are
   `Strided`. Pure analysis — no MIR rewrite and no named-kernel dispatch.
-- **gpu-native vector global `ld`/`st`** — when coalesce marks a `<4 x f32>` global load/store and the
-  pointer is not user shared memory, `lower.rs` emits `ld.global.v4.f32` / `st.global.v4.f32` instead of
-  four scalar generic ops. Requires vectorized MIR (`-O2`); scalar `-O0` loops stay scalar. Does not
-  duplicate Task 1.1 SIMD Splat lowering — this path is for already-widened MIR bodies only.
+- **gpu-native vector global `ld`/`st` — implemented, then declined at the emission seam.** The
+  `ld.global.v4.f32` / `st.global.v4.f32` path shipped on `lang/p3-coalesce` guarded only on "the
+  pointer is not user shared memory", and it faulted the device two different ways. Both are
+  *driver* faults, not wrong values, and the CUDA error is sticky — so the first one to fire takes
+  the rest of the corpus sweep down as "not run" and the coverage line reads `0/371`:
+  - **Wrong address window.** PTX has **three**, and which one holds the stack frame is a property
+    of the *emission mode*, not of the MIR: only the cooperative megakernel **entry** homes it in
+    the global `p_frame` buffer, while the single-thread kernel and every mega callee declare a
+    per-thread `.local __frame` reached through `cvta.local`. `!is_shared_ptr` accepts a `.local`
+    slot, so pre-existing `tests/run/abs.wk` — two vectorized `[f32; 64]` stack loops that ran at
+    every `-O` before this landed — died at `-O1`+ with `CUDA_ERROR_INVALID_ADDRESS_SPACE`.
+  - **Insufficient alignment.** `.v4.f32` needs 16 bytes in every state space; frame slots pack at
+    8 (`assign_frame`: `size.div_ceil(8) * 8`), so `tests/run/linear_f32.wk` puts its second
+    `[f32; 6]` at offset 24 and stores into it with `CUDA_ERROR_MISALIGNED_ADDRESS` at `-O3`.
+
+  Address-window provenance is now proven positively (`FnEmit::global_ptrs`, seeded at `Alloca` and
+  propagated through `Gep` exactly as `shared_ptrs` is). Alignment is **not** provable at this seam
+  and so declines the path: the address a vectorized loop touches is `base + IV*4`, and neither
+  `wukong_opt::CoalesceHint::UnitStride` (which states a stride, not an alignment) nor
+  `wukong_opt::vectorize` (which starts its vector loop at the loop's own `start`, with no
+  alignment peeling, so `for i in 3..67` begins at `base + 12`) pins it down. Widening frame slots
+  to 16 bytes would fix `linear_f32.wk` and still not make the emission sound.
+
+  So gpu-native emits the generic scalar lanes — correct in every window at every alignment, one
+  vector width slower. Re-enabling needs an alignment term on the hint (or peeling in the
+  vectorizer) **and** the bandwidth A/B that was never taken for this path; both belong to the wave
+  that measures Phase 3 rather than to a third guess at a guard. `wukong_opt::coalesce` (Phase 3.1)
+  is unaffected and still analyzed and unit-tested.
 - **`.col_major` tensor indexing** — `a[i, j]` on `Tensor[…, .col_major]` lowers to the same flat offset
   as `a[i + j*M]` (`tindex.rs`, `tensor_strides`, dynamic multi-index). `.strided` / `.tiled(…)` remain
   `C0001`. Runtime oracle: `tests/run/tensor_col_major.wk`; MIR parity:
@@ -44,7 +68,10 @@ Phase 2 tile and shared-memory constructs (not yet merged to `main`):
   this laptop's RTX 4050): `lang_tile_saxpy.wk` passes (prints `3` five times); `lang_shared_transpose.wk`
   and `lang_tiled_transpose.wk` failed with `CUDA_ERROR_ILLEGAL_ADDRESS` during readback before branch
   `gpu/p2-shared-addr-fix` — user `shared` allocas used `cvta.shared` (generic addresses) but
-  `ld.shared`/`st.shared` (shared-space ops). Fixed in `lower.rs` only; both fixtures now match interp.
+  `ld.shared`/`st.shared` (shared-space ops). Fixed in `lower.rs` only. `lang_tiled_transpose.wk`
+  then kept failing, with a *different* fault (`CUDA_ERROR_INVALID_ADDRESS_SPACE`) and a different
+  cause — the Phase 3 vector qualifier above, not shared memory. Both fixtures match interp once
+  that is gated on global provenance; all three run on the RTX 4050.
 
 ### Language — `@generic` on a function suppresses the kernel recognizers ✅
 `@generic fn f(…)` opts one function out of kernel recognition: no `match_*` recognizer,

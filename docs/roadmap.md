@@ -428,9 +428,11 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   inside `@parallel` only (`E0308` otherwise). Static shared size above 48 KiB is `E0307`. CPU:
   shared = stack `alloca`, barrier = no-op/fence. gpu-native: PTX `.shared` + `bar.sync` in
   `lower.rs` only (`tests/run/lang_shared_transpose.wk`, `lang_tiled_transpose.wk`). gpu-native smoke
-  on this branch: `lang_tile_saxpy.wk` runs; `lang_shared_transpose.wk` and `lang_tiled_transpose.wk`
-  hit `CUDA_ERROR_ILLEGAL_ADDRESS` on the RTX 4050 (shared SMEM lowering still has bugs — not a silent
-  CPU fallback).
+  on the RTX 4050: all three of `lang_tile_saxpy.wk`, `lang_shared_transpose.wk` and
+  `lang_tiled_transpose.wk` run and match the interpreter. Getting there took two separate fixes —
+  `cvta.shared` addresses must use generic `ld`/`st` rather than `ld.shared`/`st.shared`, and the
+  Phase 3 vector qualifier had to be declined (it was emitting a `.global` 16-byte access on a
+  `.local`, 8-aligned frame slot; see the Phase 3 note below).
 - **`@parallel`** functions execute across CPU cores (rayon runtime); the per-core chunk is itself
   vectorized. The interpreter runs the same range sequentially, so results stay differential-equal.
   `@parallel` is a *request*, and a shape it cannot prove safe **falls back to serial lowering with no
@@ -783,6 +785,19 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   indexing executes** (`a[i, j]` is byte-identical to `a[i + j*M]` on constant-shape tensors; branch
   `lang/p3-coalesce`). `.strided` / `.tiled(…)` indexing remains `C0001`. Only the default row-major
   `.contiguous` layout was the sole executing non-symbolic layout before Phase 3.
+- **Coalesced vector global `ld`/`st` on gpu-native: analyzed, not emitted.**
+  `wukong_opt::coalesce` classifies each innermost-loop access by IV element stride and marks
+  unit-stride `f32` as a `v4` candidate (Phase 3.1, unit-tested). The matching
+  `ld.global.v4.f32` / `st.global.v4.f32` emission is **declined**: a 16-byte vector access needs a
+  pointer that is both provably in the global address window *and* provably 16-byte aligned, and
+  only the first is decidable in `lower.rs`. Frame slots pack at 8 bytes, `CoalesceHint::UnitStride`
+  states a stride rather than an alignment, and the vectorizer starts its vector loop at the loop's
+  own `start` without alignment peeling. The first version of this path shipped without either
+  check and faulted the RTX 4050 two ways (`CUDA_ERROR_INVALID_ADDRESS_SPACE` on `abs.wk`,
+  `CUDA_ERROR_MISALIGNED_ADDRESS` on `linear_f32.wk`) — sticky driver faults that zeroed the whole
+  gpu-native corpus sweep. gpu-native emits generic scalar lanes instead: correct in every window at
+  every alignment, one vector width slower. Re-enabling it is a Phase 3 redesign, and it is gated on
+  a bandwidth A/B that has never been taken for this path.
 
 ## Planned
 
