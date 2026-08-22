@@ -383,7 +383,8 @@ impl Sema<'_> {
                         self.error(
                             span,
                             "E0308",
-                            "`sync_block()` is only valid inside a `@parallel` function".to_string(),
+                            "`sync_block()` is only valid inside a `@parallel` function"
+                                .to_string(),
                         );
                     }
                     return Ty::Unit;

@@ -813,7 +813,8 @@ fn main() -> i32 {
     #[test]
     fn gemm_callee_keeps_program_ineligible() {
         let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/run/transformer_block.wk"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/run/transformer_block.wk"),
         )
         .expect("read transformer_block.wk");
         for opt in [2u8, 3u8] {

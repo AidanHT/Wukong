@@ -29,6 +29,7 @@
 pub mod alias;
 mod cache;
 mod cfg;
+pub mod coalesce;
 mod cse;
 mod dce;
 mod dom;
@@ -37,7 +38,6 @@ mod fxhash;
 mod inline;
 mod licm;
 mod loop_canon;
-pub mod coalesce;
 pub mod loop_info;
 mod mem2reg;
 mod phi;
@@ -47,8 +47,10 @@ mod unroll;
 mod vectorize;
 
 pub use alias::{type_bytes, AliasInfo, Prov};
-pub use coalesce::{analyze_function as coalesce_function, CoalesceHint, CoalescePlan, VectorWidth};
 pub use cache::CfgAnalyses;
+pub use coalesce::{
+    analyze_function as coalesce_function, CoalesceHint, CoalescePlan, VectorWidth,
+};
 pub use cse::Cse;
 pub use dce::Dce;
 pub use dse::Dse;
@@ -754,7 +756,15 @@ mod tests {
         f.blocks
             .iter()
             .flat_map(|b| &b.insts)
-            .filter(|i| matches!(i.op, Op::Alloca { ty: _, space: wukong_mir::AddrSpace::Local }))
+            .filter(|i| {
+                matches!(
+                    i.op,
+                    Op::Alloca {
+                        ty: _,
+                        space: wukong_mir::AddrSpace::Local
+                    }
+                )
+            })
             .count()
     }
 
@@ -1083,7 +1093,10 @@ mod tests {
         let mut reloads = 0;
         for i in f.blocks.iter().flat_map(|b| &b.insts) {
             match &i.op {
-                Op::Alloca { ty: MirType::Ptr, space: wukong_mir::AddrSpace::Local } => slots += 1,
+                Op::Alloca {
+                    ty: MirType::Ptr,
+                    space: wukong_mir::AddrSpace::Local,
+                } => slots += 1,
                 Op::Load(_, MirType::Ptr) => reloads += 1,
                 _ => {}
             }

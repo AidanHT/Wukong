@@ -78,50 +78,50 @@ fn analyze_forest(forest: &LoopForest) -> CoalescePlan {
 }
 
 fn hint_for_access(l: &NaturalLoop, access: &MemAccess) -> CoalesceHint {
-  // Only classify accesses whose affine index is expressed against this loop's primary IV.
-  if l.primary_iv.is_none() {
-    return CoalesceHint::Unknown;
-  }
-  match &access.addr {
-    AddrForm::Affine { index, elem, .. } => {
-      let elem_bytes = type_bytes(elem)
-        .or_else(|| type_bytes(&access.value_ty))
-        .unwrap_or(0) as u64;
-      if elem_bytes == 0 {
+    // Only classify accesses whose affine index is expressed against this loop's primary IV.
+    if l.primary_iv.is_none() {
         return CoalesceHint::Unknown;
-      }
-      let stride_elems = iv_stride_elems(index);
-      match stride_elems {
-        None => CoalesceHint::Unknown,
-        Some(None) => CoalesceHint::Strided,
-        Some(Some(0)) => CoalesceHint::Unknown,
-        Some(Some(1)) => CoalesceHint::UnitStride {
-          width: vector_width_for(elem_bytes),
-        },
-        Some(Some(_)) => CoalesceHint::Strided,
-      }
     }
-    AddrForm::Invariant(_) | AddrForm::Unknown => CoalesceHint::Unknown,
-  }
+    match &access.addr {
+        AddrForm::Affine { index, elem, .. } => {
+            let elem_bytes = type_bytes(elem)
+                .or_else(|| type_bytes(&access.value_ty))
+                .unwrap_or(0) as u64;
+            if elem_bytes == 0 {
+                return CoalesceHint::Unknown;
+            }
+            let stride_elems = iv_stride_elems(index);
+            match stride_elems {
+                None => CoalesceHint::Unknown,
+                Some(None) => CoalesceHint::Strided,
+                Some(Some(0)) => CoalesceHint::Unknown,
+                Some(Some(1)) => CoalesceHint::UnitStride {
+                    width: vector_width_for(elem_bytes),
+                },
+                Some(Some(_)) => CoalesceHint::Strided,
+            }
+        }
+        AddrForm::Invariant(_) | AddrForm::Unknown => CoalesceHint::Unknown,
+    }
 }
 
 /// Element stride per primary-IV step. `Coeff::Sym` is a runtime stride (e.g. symbolic `N` in
 /// `i*N`) and is treated as strided — only a compile-time unit stride is a vector candidate.
 fn iv_stride_elems(index: &loop_info::AffineExpr) -> Option<Option<i64>> {
-  match index.coeff {
-    loop_info::Coeff::Zero => Some(Some(0)),
-    loop_info::Coeff::Const(k) => Some(Some(k)),
-    loop_info::Coeff::Sym(..) => Some(None), // runtime stride → strided, not unit
-  }
+    match index.coeff {
+        loop_info::Coeff::Zero => Some(Some(0)),
+        loop_info::Coeff::Const(k) => Some(Some(k)),
+        loop_info::Coeff::Sym(..) => Some(None), // runtime stride → strided, not unit
+    }
 }
 
 /// Pick the widest 128-bit vector op that fits `elem_bytes` lanes.
 fn vector_width_for(elem_bytes: u64) -> VectorWidth {
-  match elem_bytes {
-    1 | 2 | 4 => VectorWidth::V4,
-    8 => VectorWidth::V2,
-    _ => VectorWidth::Scalar,
-  }
+    match elem_bytes {
+        1 | 2 | 4 => VectorWidth::V4,
+        8 => VectorWidth::V2,
+        _ => VectorWidth::Scalar,
+    }
 }
 
 #[cfg(test)]
@@ -164,8 +164,7 @@ mod tests {
     }
 
     fn strided_accesses(plan: &CoalescePlan) -> Vec<(BlockId, usize)> {
-        plan
-            .hints
+        plan.hints
             .iter()
             .filter(|h| matches!(h.hint, CoalesceHint::Strided))
             .map(|h| (h.block, h.inst))
@@ -237,15 +236,14 @@ mod tests {
                    while i < 8 { o[i] = x[i]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         let plan = hints_for(src, "k");
-        let v2 = plan
-            .hints
-            .iter()
-            .any(|h| matches!(
+        let v2 = plan.hints.iter().any(|h| {
+            matches!(
                 h.hint,
                 CoalesceHint::UnitStride {
                     width: VectorWidth::V2
                 }
-            ));
+            )
+        });
         assert!(v2, "f64 unit stride should tag V2, got {:?}", plan.hints);
     }
 }

@@ -149,7 +149,10 @@ impl Numbering<'_> {
 
         for inst in &self.f.blocks[blk as usize].insts {
             match &inst.op {
-                Op::Alloca { ty: _, space: wukong_mir::AddrSpace::Local } => {}
+                Op::Alloca {
+                    ty: _,
+                    space: wukong_mir::AddrSpace::Local,
+                } => {}
                 Op::Load(ptr, ty) => {
                     let p = resolve(&self.rewrite, ptr.0);
                     let Some(res) = inst.result else { continue };

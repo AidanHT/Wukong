@@ -351,7 +351,11 @@ pub fn emit_mega_ptx(
 
     // Forward-declare every reachable callee (so mutual recursion and definition order are moot),
     // then define them, then the entry.
-    let callees: Vec<usize> = reachable.iter().copied().filter(|&i| i != entry_idx).collect();
+    let callees: Vec<usize> = reachable
+        .iter()
+        .copied()
+        .filter(|&i| i != entry_idx)
+        .collect();
     for &fi in &callees {
         out.push_str(&fn_signature(&program.funcs[fi], fi));
         out.push_str(";\n");
@@ -1654,7 +1658,13 @@ impl<'a> FnEmit<'a> {
     }
 
     /// Load one (scalar or lane) value of MIR type `ty` from address `addr` into `d`.
-    fn load_into(&mut self, d: &str, addr: &str, ty: &MirType, _shared: bool) -> Result<(), String> {
+    fn load_into(
+        &mut self,
+        d: &str,
+        addr: &str,
+        ty: &MirType,
+        _shared: bool,
+    ) -> Result<(), String> {
         // User `shared [T; N]` allocas are addressed via `cvta.shared` (generic state space), exactly
         // like `.local` allocas use `cvta.local` + generic `ld.*` — never `ld.local` / `ld.shared`.
         let ld = |op: &str| format!("ld.{op}");
@@ -1764,7 +1774,13 @@ impl<'a> FnEmit<'a> {
     }
 
     /// Store one (scalar or lane) value `v` of MIR type `ty` to address `addr`.
-    fn store_into(&mut self, addr: &str, v: &str, ty: &MirType, _shared: bool) -> Result<(), String> {
+    fn store_into(
+        &mut self,
+        addr: &str,
+        v: &str,
+        ty: &MirType,
+        _shared: bool,
+    ) -> Result<(), String> {
         // Mirror `load_into`: `cvta.shared` addresses use generic `st.*`, not `st.shared.*`.
         let st = |op: &str| format!("st.{op}");
         let g = self.st_guard();
@@ -4570,7 +4586,11 @@ pub fn mega_frame_bytes(func: &Function) -> u64 {
     let mut off = 0u64;
     for b in &func.blocks {
         for inst in &b.insts {
-            if let Op::Alloca { ty: ty, space: wukong_mir::AddrSpace::Local } = &inst.op {
+            if let Op::Alloca {
+                ty: ty,
+                space: wukong_mir::AddrSpace::Local,
+            } = &inst.op
+            {
                 if inst.result.is_some() {
                     let sz = size_of(ty).max(1);
                     off += sz.div_ceil(8) * 8;
@@ -4931,10 +4951,7 @@ fn main() -> i32 {
         );
         let ramp_f = b.build(vt.clone(), Op::Cast(CastKind::SiToFp, ramp, vt.clone()));
         let sum = b.build(vt.clone(), Op::Bin(BinOp::FAdd, splat, ramp_f));
-        b.build_void(Op::Store {
-            ptr: p,
-            value: sum,
-        });
+        b.build_void(Op::Store { ptr: p, value: sum });
         // Read the vector back and run the rest of the lane-wise menu over it, so one probe covers
         // every vector op `wukong_opt::vectorize` can emit rather than just the three that were
         // declining.
@@ -4970,7 +4987,10 @@ fn main() -> i32 {
         let entry = interner.intern("main");
         let ptx = emit_ptx(&program, entry, &interner).expect("portable SIMD must lower");
 
-        assert!(ptx.is_ascii(), "PTX must stay ASCII (ptxas rejects non-ASCII)");
+        assert!(
+            ptx.is_ascii(),
+            "PTX must stay ASCII (ptxas rejects non-ASCII)"
+        );
         assert!(
             ptx.starts_with(crate::ptx_target::HDR_SM80),
             "the SIMD lowering must not introduce a header of its own"
@@ -5065,7 +5085,10 @@ fn main() -> i32 {
         let mut program = Program::new();
         program.funcs.push(b.finish());
         let errs = wukong_mir::verify::verify_program(&program);
-        assert!(errs.is_empty(), "the SIMD-edge probe MIR must verify: {errs:?}");
+        assert!(
+            errs.is_empty(),
+            "the SIMD-edge probe MIR must verify: {errs:?}"
+        );
 
         let entry = interner.intern("main");
         let ptx = emit_ptx(&program, entry, &interner)

@@ -70,16 +70,17 @@ impl FnLowerer<'_> {
 
         let sty = self.expr_mir(start);
         let ety = self.expr_mir(end);
-        let (ity, signed) =
-            if ety.is_int() && sty.is_int() && crate::mir_byte_size(&ety) > crate::mir_byte_size(&sty)
-            {
-                (ety.clone(), self.signed(end))
-            } else {
-                (
-                    sty.clone(),
-                    self.signed(start) && !self.forces_unsigned_cmp(end, &sty),
-                )
-            };
+        let (ity, signed) = if ety.is_int()
+            && sty.is_int()
+            && crate::mir_byte_size(&ety) > crate::mir_byte_size(&sty)
+        {
+            (ety.clone(), self.signed(end))
+        } else {
+            (
+                sty.clone(),
+                self.signed(start) && !self.forces_unsigned_cmp(end, &sty),
+            )
+        };
 
         let tile_ty = ity.clone();
         let tile_const = self
@@ -94,11 +95,7 @@ impl FnLowerer<'_> {
         let len = self
             .builder
             .build(ity.clone(), Op::Bin(BinOp::Sub, end_val, start_val));
-        let div_op = if signed {
-            BinOp::SDiv
-        } else {
-            BinOp::UDiv
-        };
+        let div_op = if signed { BinOp::SDiv } else { BinOp::UDiv };
         let quot = self
             .builder
             .build(ity.clone(), Op::Bin(div_op, len, tile_const));
@@ -132,18 +129,12 @@ impl FnLowerer<'_> {
         // outer: io < full_end ?
         self.builder.switch_to(outer_header);
         self.terminated = false;
-        let io = self.builder.build(ity.clone(), Op::Load(io_slot, ity.clone()));
+        let io = self
+            .builder
+            .build(ity.clone(), Op::Load(io_slot, ity.clone()));
         let outer_ok = self.builder.build(
             MirType::I1,
-            Op::Cmp(
-                if signed {
-                    CmpOp::Slt
-                } else {
-                    CmpOp::Ult
-                },
-                io,
-                full_end,
-            ),
+            Op::Cmp(if signed { CmpOp::Slt } else { CmpOp::Ult }, io, full_end),
         );
         self.builder
             .cond_br(outer_ok, inner_init, vec![], after_tiles, vec![]);
@@ -151,7 +142,9 @@ impl FnLowerer<'_> {
         // inner init: ii = 0
         self.builder.switch_to(inner_init);
         self.terminated = false;
-        let zero = self.builder.build(tile_ty.clone(), Op::ConstInt(0, tile_ty.clone()));
+        let zero = self
+            .builder
+            .build(tile_ty.clone(), Op::ConstInt(0, tile_ty.clone()));
         self.builder.build_void(Op::Store {
             ptr: ii_slot,
             value: zero,
@@ -166,15 +159,7 @@ impl FnLowerer<'_> {
             .build(tile_ty.clone(), Op::Load(ii_slot, tile_ty.clone()));
         let inner_ok = self.builder.build(
             MirType::I1,
-            Op::Cmp(
-                if signed {
-                    CmpOp::Slt
-                } else {
-                    CmpOp::Ult
-                },
-                ii,
-                tile_const,
-            ),
+            Op::Cmp(if signed { CmpOp::Slt } else { CmpOp::Ult }, ii, tile_const),
         );
         self.builder
             .cond_br(inner_ok, inner_body, vec![], outer_step, vec![]);
@@ -183,7 +168,9 @@ impl FnLowerer<'_> {
         self.builder.switch_to(inner_body);
         self.terminated = false;
         self.push_scope();
-        let io_v = self.builder.build(ity.clone(), Op::Load(io_slot, ity.clone()));
+        let io_v = self
+            .builder
+            .build(ity.clone(), Op::Load(io_slot, ity.clone()));
         let ii_v = self
             .builder
             .build(tile_ty.clone(), Op::Load(ii_slot, tile_ty.clone()));
@@ -225,7 +212,9 @@ impl FnLowerer<'_> {
         // outer step: io += tile
         self.builder.switch_to(outer_step);
         self.terminated = false;
-        let io_cur = self.builder.build(ity.clone(), Op::Load(io_slot, ity.clone()));
+        let io_cur = self
+            .builder
+            .build(ity.clone(), Op::Load(io_slot, ity.clone()));
         let io_next = self
             .builder
             .build(ity.clone(), Op::Bin(BinOp::Add, io_cur, tile_const));
@@ -253,21 +242,14 @@ impl FnLowerer<'_> {
 
         self.builder.switch_to(rem_header);
         self.terminated = false;
-        let ri = self.builder.build(ity.clone(), Op::Load(rem_slot, ity.clone()));
+        let ri = self
+            .builder
+            .build(ity.clone(), Op::Load(rem_slot, ity.clone()));
         let rem_ok = self.builder.build(
             MirType::I1,
-            Op::Cmp(
-                if signed {
-                    CmpOp::Slt
-                } else {
-                    CmpOp::Ult
-                },
-                ri,
-                end_val,
-            ),
+            Op::Cmp(if signed { CmpOp::Slt } else { CmpOp::Ult }, ri, end_val),
         );
-        self.builder
-            .cond_br(rem_ok, rem_body, vec![], exit, vec![]);
+        self.builder.cond_br(rem_ok, rem_body, vec![], exit, vec![]);
 
         self.builder.switch_to(rem_body);
         self.terminated = false;
@@ -283,8 +265,12 @@ impl FnLowerer<'_> {
 
         self.builder.switch_to(rem_step);
         self.terminated = false;
-        let ri_cur = self.builder.build(ity.clone(), Op::Load(rem_slot, ity.clone()));
-        let one_i = self.builder.build(ity.clone(), Op::ConstInt(1, ity.clone()));
+        let ri_cur = self
+            .builder
+            .build(ity.clone(), Op::Load(rem_slot, ity.clone()));
+        let one_i = self
+            .builder
+            .build(ity.clone(), Op::ConstInt(1, ity.clone()));
         let ri_next = self
             .builder
             .build(ity.clone(), Op::Bin(BinOp::Add, ri_cur, one_i));

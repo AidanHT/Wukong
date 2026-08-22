@@ -41,7 +41,9 @@ use wukong_mir::{
     host_supports_vec_kernels, BinOp, Builder, CastKind, CmpOp, Function, MirType, Op, Program,
     RoundMode, ValueId, VecBin, VecCmp, VecKernel, VecOp, VecRedOp, VecReduce,
 };
-use wukong_sema::{heap_alloc_elem, is_now_ns, is_sync_block, DefKind, EnumVariant, SemaResult, VariantPayload};
+use wukong_sema::{
+    heap_alloc_elem, is_now_ns, is_sync_block, DefKind, EnumVariant, SemaResult, VariantPayload,
+};
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::Ty;
 
@@ -1876,13 +1878,22 @@ pub fn lower_program_with(
                         &mono,
                         &mut diags,
                         Some(&mut par_regions),
-                            fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
-                        );
+                        fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
+                    );
                     program.funcs.push(func);
                     continue;
                 }
                 let func = lower_fn(
-                    f, body, sema, interner, gemm, false, &no_subst, f.name.sym, &mono, &mut diags,
+                    f,
+                    body,
+                    sema,
+                    interner,
+                    gemm,
+                    false,
+                    &no_subst,
+                    f.name.sym,
+                    &mono,
+                    &mut diags,
                     None,
                     fn_tiles.get(&f.name.sym).cloned().unwrap_or_default(),
                 );
@@ -1905,7 +1916,17 @@ pub fn lower_program_with(
             // A `@generic` template's instances inherit the opt-out (keyed on the ORIGINAL name).
             let gemm = generic_gemm(gemm, generic_fns.contains(orig));
             let func = lower_fn(
-                f, body, sema, interner, gemm, false, subst, *mangled, &mono, &mut diags, None,
+                f,
+                body,
+                sema,
+                interner,
+                gemm,
+                false,
+                subst,
+                *mangled,
+                &mono,
+                &mut diags,
+                None,
                 fn_tiles.get(orig).cloned().unwrap_or_default(),
             );
             program.funcs.push(func);
@@ -2186,7 +2207,7 @@ fn is_batched_norm_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
-    
+
         tile_queue: vec![],
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
@@ -2236,7 +2257,7 @@ fn is_bias_bcast_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
-    
+
         tile_queue: vec![],
     };
     probe.match_bias_bcast(pat, iter, lb).is_some()
@@ -2496,7 +2517,7 @@ fn lower_parallel(
             subst: HashMap::default(),
             mono: None,
             par: None,
-        
+
             tile_queue: vec![],
         };
         let start = fl.builder.add_param(MirType::I64);
@@ -2563,7 +2584,7 @@ fn lower_parallel(
             subst: HashMap::default(),
             mono: None,
             par: None,
-        
+
             tile_queue: vec![],
         };
         let param_vals: Vec<ValueId> = param_tys
@@ -3502,7 +3523,9 @@ impl FnLowerer<'_> {
                 Some(size) => MirType::Array(Box::new(MirType::I8), size as u32),
                 None => mir_ty(ty),
             },
-            Ty::Array { elem, len, .. } => MirType::Array(Box::new(self.mir_ty_of(elem)), *len as u32),
+            Ty::Array { elem, len, .. } => {
+                MirType::Array(Box::new(self.mir_ty_of(elem)), *len as u32)
+            }
             Ty::Tuple(_) => {
                 MirType::Array(Box::new(MirType::I8), self.ty_size(ty).unwrap_or(0) as u32)
             }
@@ -8144,9 +8167,9 @@ impl FnLowerer<'_> {
                     (None, Some(e)) => self.expr_mir(e),
                     (None, None) => MirType::I32,
                 };
-                let is_shared = ty.as_ref().is_some_and(|t| {
-                    matches!(t.kind, ast::TypeKind::Array { shared: true, .. })
-                });
+                let is_shared = ty
+                    .as_ref()
+                    .is_some_and(|t| matches!(t.kind, ast::TypeKind::Array { shared: true, .. }));
                 let slot = if is_shared {
                     self.builder
                         .alloca_in(mty.clone(), wukong_mir::AddrSpace::Shared)
@@ -17067,7 +17090,10 @@ impl FnLowerer<'_> {
         };
         // Row-major and column-major tensors flatten to a single flat offset when every extent is
         // a compile-time constant.
-        if !matches!(layout, wukong_types::Layout::Contiguous | wukong_types::Layout::ColMajor) {
+        if !matches!(
+            layout,
+            wukong_types::Layout::Contiguous | wukong_types::Layout::ColMajor
+        ) {
             return None;
         }
         let dims = &shape.0;
@@ -17199,7 +17225,10 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if !matches!(layout, wukong_types::Layout::Contiguous | wukong_types::Layout::ColMajor) {
+        if !matches!(
+            layout,
+            wukong_types::Layout::Contiguous | wukong_types::Layout::ColMajor
+        ) {
             return None;
         }
         let dims = shape.0; // owned (`Dim` is `Copy`)
@@ -24656,7 +24685,7 @@ fn lower_matmul_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
-    
+
         tile_queue: vec![],
     };
     // A symbolic-generic matmul (`fn matmul<M, N, K>(a: Tensor[f32, M, K], …)`) reaches this
@@ -26352,7 +26381,7 @@ fn xent_bwd_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
-    
+
         tile_queue: vec![],
     };
     probe.match_xent_bwd(pat, iter, lb).is_some()
@@ -26397,7 +26426,7 @@ fn xent_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
-    
+
         tile_queue: vec![],
     };
     probe.match_xent(pat, iter, lb).is_some()
@@ -26450,7 +26479,7 @@ fn logsumexp_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
-    
+
         tile_queue: vec![],
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
@@ -26591,7 +26620,7 @@ fn probe_single_for(
         subst: HashMap::default(),
         mono: None,
         par: None,
-    
+
         tile_queue: vec![],
     };
     check(&probe, pat, iter, lb)
@@ -27619,7 +27648,7 @@ fn lower_i8matmul_fn(
         subst: HashMap::default(),
         mono: None,
         par: None,
-    
+
         tile_queue: vec![],
     };
     let param_vals: Vec<ValueId> = param_tys
@@ -28979,18 +29008,15 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         let main = &prog.funcs[0];
         assert!(
-            main.blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .any(|i| {
-                    matches!(
-                        &i.op,
-                        Op::Alloca {
-                            ty: MirType::Array(_, 3),
-                            space: wukong_mir::AddrSpace::Local,
-                        }
-                    )
-                }),
+            main.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                matches!(
+                    &i.op,
+                    Op::Alloca {
+                        ty: MirType::Array(_, 3),
+                        space: wukong_mir::AddrSpace::Local,
+                    }
+                )
+            }),
             "expected an array alloca"
         );
         assert!(verify_function(main).is_empty(), "verify failed");
@@ -29030,10 +29056,13 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
         // to a `ptr` slot and reloaded — that cost three extra loads per element (see
         // `tensor_buffer_mir`). An array param has never been spilled; a tensor param must not be.
         assert!(
-            !k.blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .any(|i| matches!(&i.op, Op::Alloca { ty: MirType::Ptr, space: wukong_mir::AddrSpace::Local })),
+            !k.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(
+                &i.op,
+                Op::Alloca {
+                    ty: MirType::Ptr,
+                    space: wukong_mir::AddrSpace::Local
+                }
+            )),
             "a statically-shaped tensor param must bind directly, not through a reloaded ptr slot"
         );
     }
@@ -29056,18 +29085,15 @@ fn eqc(x: [f32; 64], mut out: [f32; 64]) {
             assert_eq!(dot.value_type(p), &MirType::Ptr);
         }
         assert!(
-            !dot.blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .any(|i| {
-                    matches!(
-                        &i.op,
-                        Op::Alloca {
-                            ty: MirType::Array(..),
-                            space: wukong_mir::AddrSpace::Local,
-                        }
-                    )
-                }),
+            !dot.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                matches!(
+                    &i.op,
+                    Op::Alloca {
+                        ty: MirType::Array(..),
+                        space: wukong_mir::AddrSpace::Local,
+                    }
+                )
+            }),
             "array params must not alloca array storage in the callee"
         );
         assert!(verify_function(dot).is_empty());
@@ -29620,4 +29646,3 @@ fn main() -> i32 { return 0; }
         );
     }
 }
-

@@ -1067,9 +1067,7 @@ fn main() -> i32 {{
             ptx.contains("%ntid.x") && ptx.contains("%nctaid.x"),
             "callee grid-stride must read launch geometry, not a literal"
         );
-        eprintln!(
-            "[gate] generic @parallel callee grid-stride == single == oracle over {N} lanes"
-        );
+        eprintln!("[gate] generic @parallel callee grid-stride == single == oracle over {N} lanes");
     }
 
     /// Same-run latency A/B: the cooperative megakernel vs the single-thread lowering on a

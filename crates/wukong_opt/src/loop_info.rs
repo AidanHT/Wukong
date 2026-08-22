@@ -1867,7 +1867,13 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
 /// is the one disjointness fact available without an alias analysis.
 fn distinct_allocas(ctx: &LoopCtx<'_>, a: MemBase, b: MemBase) -> bool {
     let is_alloca = |m: MemBase| match m {
-        MemBase::Outer(v) => matches!(ctx.op_of(v), Some(Op::Alloca { space: wukong_mir::AddrSpace::Local, .. })),
+        MemBase::Outer(v) => matches!(
+            ctx.op_of(v),
+            Some(Op::Alloca {
+                space: wukong_mir::AddrSpace::Local,
+                ..
+            })
+        ),
         MemBase::ReloadedOuter { .. } => false,
     };
     is_alloca(a) && is_alloca(b) && !a.same_object(b)

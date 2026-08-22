@@ -153,7 +153,9 @@ impl Linearizer<'_> {
         let Some(Ty::Tensor { shape, layout, .. }) = self.types.get(&base.id) else {
             return None;
         };
-        if !matches!(layout, Layout::Contiguous | Layout::ColMajor) || shape.0.len() != indices.len() {
+        if !matches!(layout, Layout::Contiguous | Layout::ColMajor)
+            || shape.0.len() != indices.len()
+        {
             return None;
         }
         let mut extents = Vec::with_capacity(shape.0.len());

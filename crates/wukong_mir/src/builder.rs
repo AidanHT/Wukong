@@ -1,6 +1,8 @@
 //! A convenience builder for constructing MIR functions imperatively.
 
-use crate::{AddrSpace, BasicBlock, BlockId, Function, Inst, MirType, Op, Terminator, ValueId, VecKernel};
+use crate::{
+    AddrSpace, BasicBlock, BlockId, Function, Inst, MirType, Op, Terminator, ValueId, VecKernel,
+};
 use wukong_span::Symbol;
 
 /// Builds one [`Function`]. Create it, add parameters, carve out blocks, append instructions to

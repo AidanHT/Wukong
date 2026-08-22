@@ -121,7 +121,10 @@ fn lang_tiled_transpose_has_no_transpose_kernel() {
         !mir.contains("call wukong_transpose"),
         "lang_tiled_transpose.wk should not dispatch to wukong_transpose:\n{mir}"
     );
-    assert!(mir.contains("alloca.shared"), "expected shared alloca in MIR:\n{mir}");
+    assert!(
+        mir.contains("alloca.shared"),
+        "expected shared alloca in MIR:\n{mir}"
+    );
     assert!(mir.contains("barrier"), "expected barrier in MIR:\n{mir}");
 }
 
