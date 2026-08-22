@@ -254,15 +254,18 @@ MIR; GPU cold JIT 0.76 ms / warm cubin 0.16 ms (~10⁴–10⁵× vs Triton cold)
 
 **M5. Static shape safety at zero runtime cost.** Tensor shapes are types; static dims unify
 by equality, symbolic dims bind (with a `rigid` mode so a callee cannot lie about its return
-shape), `?` defers to runtime. Standing: strong and regression-tested (`E05xx` suite), but a
-runtime `?` dim does not *execute* (C0001), which limits real serving code — a Tier-1
-language gap (see M6).
+shape), `?` defers to runtime. Standing: strong and regression-tested (`E05xx` suite). Runtime
+`?` dims **do** execute (`tests/run/generic_shape_runtime.wk`); this metric claimed they were
+`C0001` long after that shipped. The layout half of the type is where the gap now is:
+`.col_major` indexing executes, `.strided` / `.tiled(…)` remain `C0001`.
 
 **M6. Expressiveness for real ML code.** Can a user write a transformer fwd+bwd+train loop in
 pure Wukong without escaping? Standing: forward blocks yes (statically-shaped, recognized
-idioms); training via `--train` (CLI transform, not in-language); **known blockers**: no heap
-allocation / returned tensors, runtime `?` dims don't run, tensors can't be element-generic
-(`Tensor[T,M,N]` rejected → dtype kernels duplicated), no fn pointers/closures. **File I/O now
+idioms); training via `--train` (CLI transform, not in-language); **known blockers**: tensors
+can't be element-generic (`Tensor[T,M,N]` rejected → dtype kernels duplicated, master-plan Phase
+7.1), no heap *tensors* as a type and no returned tensors, no fn pointers/closures. Two blockers
+this metric used to list are gone and were stale for months: **heap allocation runs**
+(`alloc_<T>` / `free`, `tests/run/heap_alloc.wk`) and **runtime `?` dims run** (see M5). **File I/O now
 runs** (✅): the `read_<T>`/`write_<T>` family (`T` in {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`})
 loads and stores headerless raw little-endian blobs and is gated interp == native bit-for-bit, so
 weights can be **read off disk rather than synthesized** — and, built on it, **GPT-2 124M inference
