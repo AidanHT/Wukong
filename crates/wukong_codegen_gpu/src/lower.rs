@@ -567,6 +567,19 @@ struct FnEmit<'a> {
     shared_base: String,
     /// ValueIds whose pointer originates in shared memory (alloca or gep off shared).
     shared_ptrs: HashSet<u32>,
+    /// ValueIds whose pointer is **provably 16-byte aligned**, which `.v4.f32` requires in every
+    /// state space. Seeded at an `Alloca` whose frame slot offset is a multiple of 16; NOT
+    /// propagated through `Gep`, whose index is a runtime value. See [`FnEmit::is_align16_ptr`].
+    align16_ptrs: HashSet<u32>,
+    /// ValueIds whose pointer is **provably in the global window** (alloca or gep off a frame that
+    /// this emission mode puts in global memory).
+    ///
+    /// Only a `.global`-qualified access may use one of these, and the set is deliberately a
+    /// *positive* proof rather than the negation of [`shared_ptrs`]: PTX has three windows, not
+    /// two, and a `.local` frame pointer is neither shared nor global. Anything whose provenance is
+    /// unknown (a pointer loaded out of memory, a callee's `.param`) is simply absent, so the
+    /// caller falls back to the generic scalar path — correct in every window.
+    global_ptrs: HashSet<u32>,
     // The cvta'd-to-global context-buffer base register (print/assert/exit live here).
     ctx_reg: String,
 
@@ -616,6 +629,8 @@ impl<'a> FnEmit<'a> {
             shared_bytes: 0,
             shared_base: String::new(),
             shared_ptrs: HashSet::new(),
+            global_ptrs: HashSet::new(),
+            align16_ptrs: HashSet::new(),
             ctx_reg: String::new(),
             mega: false,
             mega_entry: false,
@@ -681,6 +696,8 @@ impl<'a> FnEmit<'a> {
             shared_bytes: 0,
             shared_base: String::new(),
             shared_ptrs: HashSet::new(),
+            global_ptrs: HashSet::new(),
+            align16_ptrs: HashSet::new(),
             ctx_reg: String::new(),
             mega: true,
             mega_entry: true,
@@ -744,6 +761,8 @@ impl<'a> FnEmit<'a> {
             shared_bytes: 0,
             shared_base: String::new(),
             shared_ptrs: HashSet::new(),
+            global_ptrs: HashSet::new(),
+            align16_ptrs: HashSet::new(),
             ctx_reg: String::new(),
             mega: true,
             mega_entry: false,
@@ -884,6 +903,48 @@ impl<'a> FnEmit<'a> {
 
     fn is_shared_ptr(&self, v: ValueId) -> bool {
         self.shared_ptrs.contains(&v.0)
+    }
+
+    /// Is `v` provably a pointer into the **global** window? Only then may a `.global`-qualified
+    /// access be emitted for it; see [`FnEmit::global_ptrs`]. Unknown provenance answers `false`,
+    /// which costs a vector width, not correctness.
+    fn is_global_ptr(&self, v: ValueId) -> bool {
+        self.global_ptrs.contains(&v.0)
+    }
+
+    /// Is an access through `v` provably **16-byte aligned**, as `.v4.f32` requires in every state
+    /// space?
+    ///
+    /// Deliberately conservative, and the conservatism is the point: the frame packs slots at
+    /// 8-byte granularity (`assign_frame`: `size.div_ceil(8) * 8`), so `tests/run/linear_f32.wk`
+    /// puts its second `[f32; 6]` at offset 24 — `24 % 16 == 8`. A 16-byte store there is
+    /// `CUDA_ERROR_MISALIGNED_ADDRESS`.
+    ///
+    /// Widening the frame to 16-byte slots would fix *that* program and still not make the
+    /// emission sound, which is why it is not done here. The address a vectorized loop actually
+    /// touches is `base + IV*4`, and neither of the two things that would pin it down says
+    /// anything about alignment: [`wukong_opt::CoalesceHint::UnitStride`] states a *stride*, and
+    /// `wukong_opt::vectorize` starts its vector loop at the loop's own `start` with no alignment
+    /// peeling, so `for i in 3..67` vectorizes from `base + 12`. Proving the access aligned needs
+    /// an alignment term on the hint (or peeling in the vectorizer) — a Phase 3 redesign, to be
+    /// done together with the bandwidth A/B that was never taken for this path.
+    ///
+    /// Until then a `Gep` result is absent from the set, so vectorized loop accesses take the
+    /// generic scalar-lane path: correct in every window and at every alignment, one vector width
+    /// slower.
+    fn is_align16_ptr(&self, v: ValueId) -> bool {
+        self.align16_ptrs.contains(&v.0)
+    }
+
+    /// Does this emission mode place the stack frame in the global window?
+    ///
+    /// Only the cooperative megakernel **entry** does: its frame is one `.global` buffer passed as
+    /// `p_frame` and sub-allocated across the block (`translate_mega`). The single-thread kernel
+    /// (`translate`) and every mega **callee** (`translate_mega_callee`) declare a per-thread
+    /// `.local __frame` and reach it through `cvta.local`, so their frame pointers are outside the
+    /// global window even though the MIR is identical.
+    fn frame_is_global(&self) -> bool {
+        self.mega_entry
     }
 
     // --- translation ---
@@ -1097,6 +1158,14 @@ impl<'a> FnEmit<'a> {
                         } else {
                             self.emit(&format!("add.s64 {d}, {base}, {off};"));
                         }
+                        // `Local` names the MIR address space, not the PTX one: the mega entry
+                        // homes the frame in a `.global` buffer, every other mode in `.local`.
+                        if self.frame_is_global() {
+                            self.global_ptrs.insert(r.0);
+                        }
+                        if off.is_multiple_of(16) {
+                            self.align16_ptrs.insert(r.0);
+                        }
                     }
                     wukong_mir::AddrSpace::Shared => {
                         let off = *self.shared_off.get(&r.0).expect("shared alloca offset");
@@ -1120,6 +1189,9 @@ impl<'a> FnEmit<'a> {
                 self.emit(&format!("add.s64 {d}, {base}, {off};"));
                 if self.is_shared_ptr(*ptr) {
                     self.shared_ptrs.insert(r.0);
+                }
+                if self.is_global_ptr(*ptr) {
+                    self.global_ptrs.insert(r.0);
                 }
             }
             Op::Fma(a, b, c) => {
@@ -1728,7 +1800,8 @@ impl<'a> FnEmit<'a> {
             let hint = self.coalesce.get(self.cur_block, self.cur_inst);
             if *n == 4
                 && elem == MirType::F32
-                && !self.is_shared_ptr(ptr)
+                && self.is_global_ptr(ptr)
+                && self.is_align16_ptr(ptr)
                 && matches!(
                     hint,
                     Some(wukong_opt::CoalesceHint::UnitStride {
@@ -1922,7 +1995,8 @@ impl<'a> FnEmit<'a> {
                 let hint = self.coalesce.get(self.cur_block, self.cur_inst);
                 if n == 4
                     && lane == MirType::F32
-                    && !shared
+                    && self.is_global_ptr(*p)
+                    && self.is_align16_ptr(*p)
                     && matches!(
                         hint,
                         Some(wukong_opt::CoalesceHint::UnitStride {
@@ -5122,6 +5196,57 @@ fn main() -> i32 {
     /// So the index and stride must be read out of `%tid.x`/`%ctaid.x` and `%ntid.x`/`%nctaid.x`, and
     /// the emitted preamble is checked to carry no thread- or SM-count immediate. Device-free: it
     /// reads the text.
+    /// A `.global`-qualified vector access may only be emitted for a pointer that is **in** the
+    /// global window. `.local` and `.shared` are separate windows, and `ld.global`/`st.global` on an
+    /// address outside the global one is `CUDA_ERROR_INVALID_ADDRESS_SPACE` at run time — not a
+    /// miscompile the tolerance comparator can see, a driver fault that poisons the context.
+    ///
+    /// The frame's window is decided by the *emission mode*, not by the MIR: `translate` and
+    /// `translate_mega_callee` put it in `.local` (`cvta.local`), while only the mega entry's frame
+    /// is a `.global` buffer passed as `p_frame`. So the same `<4 x f32>` MIR is legal as
+    /// `ld.global.v4.f32` in one mode and a fault in another.
+    ///
+    /// This is a regression gate: `tests/run/abs.wk` -- two vectorized `[f32; 64]` stack loops --
+    /// ran on gpu-native at every `-O` before the coalesced-vector path landed, and faulted at
+    /// `-O1`+ after it, taking the whole device corpus sweep down with it (the CUDA error is sticky,
+    /// so the 370 programs after it are skipped, not failed). Device-free: it reads the text.
+    #[test]
+    fn vector_access_never_targets_a_non_global_frame() {
+        const SRC: &str = r#"module v4_local
+fn main() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    for i in 0..64 { x[i] = (i as f32) - 32.0; }
+    let mut out: [f32; 64] = [0.0; 64];
+    for i in 0..64 { out[i] = abs(x[i]); }
+    print(out[0] as i32);
+    print(out[40] as i32);
+    return 0;
+}
+"#;
+        for opt in [1u8, 2, 3] {
+            let (program, mut interner) = build(SRC, opt).expect("the abs probe must compile");
+            let entry = interner.intern("main");
+            let ptx = emit_ptx(&program, entry, &interner).expect("single-thread emit_ptx");
+            assert!(ptx.is_ascii(), "PTX must stay ASCII");
+            assert!(
+                ptx.contains("cvta.local"),
+                "-O{opt}: this probe exists to cover a .local frame; it no longer has one:\n{ptx}"
+            );
+            for op in [
+                "ld.global.v4",
+                "st.global.v4",
+                "ld.global.v2",
+                "st.global.v2",
+            ] {
+                assert!(
+                    !ptx.contains(op),
+                    "-O{opt}: `{op}` on a cvta.local frame address is \
+                     CUDA_ERROR_INVALID_ADDRESS_SPACE on the device:\n{ptx}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn grid_stride_geometry_comes_from_the_launch() {
         const SRC: &str = r#"module gate_par
@@ -5199,30 +5324,71 @@ fn main() -> i32 {
         );
     }
 
-    /// Coalesced vector loads: when coalesce analysis marks a `<4 x f32>` global load, emit
-    /// `ld.global.v4.f32` instead of four scalar generic loads. Device-free.
+    /// A `.v4.f32` access needs **both** preconditions, and a vectorized loop over a frame array
+    /// satisfies neither reliably — so the coalesced-vector path stays declined and the generic
+    /// scalar lanes run instead.
+    ///
+    /// The two faults this pins are real, both were on `lang/p0-integrate`, and neither was
+    /// reachable by any gate that existed:
+    ///
+    /// - `tests/run/abs.wk` at `-O1`+ — `.global` qualifier on a `cvta.local` frame address →
+    ///   `CUDA_ERROR_INVALID_ADDRESS_SPACE`. PTX has three windows and the guard tested
+    ///   `!is_shared_ptr`, which a `.local` slot passes.
+    /// - `tests/run/linear_f32.wk` at `-O3` — its second `[f32; 6]` sits at frame offset 24
+    ///   (`24 % 16 == 8`, because slots pack at 8-byte granularity) → `CUDA_ERROR_MISALIGNED_ADDRESS`.
+    ///
+    /// Both are *driver faults*, not wrong values: the CUDA error is sticky, so the first one to
+    /// fire takes the rest of the corpus sweep down as "not run" and the coverage line reads
+    /// `0/371`. The device suite is the only gate that can see them, and the Phase 3 gate test
+    /// could not: it was device-free text-matching over a stack-array program, so it asserted the
+    /// presence of an instruction that cannot execute.
+    ///
+    /// Re-enabling this path is a Phase 3 redesign owned by the wave that finally measures it —
+    /// it needs an alignment term on [`wukong_opt::CoalesceHint`] (or peeling in
+    /// `wukong_opt::vectorize`, which today starts the vector loop at the loop's own `start`), and
+    /// a bandwidth A/B showing it is worth having. Device-free.
     #[test]
-    fn coalesced_vector_loads_emit_ld_global_v4() {
+    fn coalesced_vector_access_is_declined_without_both_preconditions() {
         const SRC: &str = r#"module v4
 @generic
-fn copy(mut dst: [f32; 16], src: [f32; 16]) {
-    for i in 0..16 { dst[i] = src[i]; }
-}
 fn main() -> i32 {
-    let s: [f32; 16] = [1.0; 16];
-    let mut d: [f32; 16] = [0.0; 16];
-    copy(d, s);
+    let mut s: [f32; 64] = [1.0; 64];
+    let mut d: [f32; 64] = [0.0; 64];
+    for i in 0..64 { s[i] = (i as f32) * 0.5; }
+    for i in 0..64 { d[i] = s[i]; }
+    print(d[63] as i32);
     return 0;
 }
 "#;
-        let (program, mut interner) = build(SRC, 2).expect("vectorized generic copy must compile");
-        let entry = interner.intern("main");
-        let ptx = emit_ptx(&program, entry, &interner).expect("emit_ptx");
-        assert!(ptx.is_ascii(), "PTX must stay ASCII");
-        assert!(
-            ptx.contains("ld.global.v4.f32"),
-            "coalesced <4 x f32> loads should emit ld.global.v4.f32 in:\n{ptx}"
-        );
+        for opt in [1u8, 2, 3] {
+            let (program, mut interner) =
+                build(SRC, opt).expect("vectorized generic copy must compile");
+            let entry = interner.intern("main");
+            for (which, ptx) in [
+                (
+                    "emit_ptx",
+                    emit_ptx(&program, entry, &interner).expect("emit_ptx"),
+                ),
+                (
+                    "emit_mega_ptx",
+                    emit_mega_ptx(&program, entry, &interner).expect("emit_mega_ptx"),
+                ),
+            ] {
+                assert!(ptx.is_ascii(), "PTX must stay ASCII");
+                for op in [
+                    "ld.global.v4",
+                    "st.global.v4",
+                    "ld.global.v2",
+                    "st.global.v2",
+                ] {
+                    assert!(
+                        !ptx.contains(op),
+                        "-O{opt} {which}: `{op}` over a frame array is not provably aligned; \
+                         the scalar lane path is the correct lowering:\n{ptx}"
+                    );
+                }
+            }
+        }
     }
 
     /// The comparator the corpus gate is built on, pinned against the real divergence it used to
