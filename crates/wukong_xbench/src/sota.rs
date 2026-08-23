@@ -247,11 +247,21 @@ pub(crate) fn evaluate(floors: &[FloorRow], sweep: &[SotaRow]) -> (Vec<String>, 
     // failure (it is how a new program enters the file), but it must be impossible to miss.
     for s in sweep {
         if !floors.iter().any(|f| f.program == s.program) {
-            lines.push(format!(
-                "  NEW  {}: no floor recorded — measure under §4 and add its row to \
-                 bench/sota/FLOOR.md",
-                s.program
-            ));
+            if s.census.starts_with("NOTHING") {
+                lines.push(format!(
+                    "  NEW  {}: no floor recorded — measure under §4 and add its row to \
+                     bench/sota/FLOOR.md",
+                    s.program
+                ));
+            } else {
+                // The bar is recognition-off by definition (§3B1); a row whose census dispatches
+                // kernels measures the dispatcher and is context, not a floorable language row.
+                lines.push(format!(
+                    "  off-bar {}: recognizer-dialect census — context, not floorable under §3B1 \
+                     ({})",
+                    s.program, s.census
+                ));
+            }
         }
     }
 
@@ -437,12 +447,21 @@ mod tests {
         assert!(lines[0].contains("L5"), "{lines:?}");
     }
 
-    /// A sweep row with no floor is loudly NEW, never silently absorbed.
+    /// A sweep row with no floor is loudly NEW, never silently absorbed — unless its census shows
+    /// dispatched kernels, in which case it is off the §3B1 bar and says so instead of nagging
+    /// forever for a floor it must never get.
     #[test]
-    fn an_unfloored_program_is_flagged_new() {
-        let (lines, failed) = evaluate(&[floor("p", 1.00)], &[row("p"), row("q")]);
+    fn an_unfloored_program_is_flagged_new_or_off_bar() {
+        let mut dispatched = row("r");
+        dispatched.census = "2 call site(s): wukong_sgemm_nt, wukong_vmath_f32".into();
+        let (lines, failed) = evaluate(&[floor("p", 1.00)], &[row("p"), row("q"), dispatched]);
         assert!(!failed, "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("NEW  q")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("off-bar r")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("NEW  r")),
+            "a dispatching row must not be asked for a floor: {lines:?}"
+        );
     }
 
     /// An empty floor file is a FAILURE: a gate with no rows checks nothing and must say so.
