@@ -730,7 +730,7 @@ fn block_abi_ok(
 
 /// Count `wukong_*` runtime-kernel calls in optimized MIR — the dispatch census. Textually the same
 /// scan as `wukongc --emit=mir -O2 prog.wk | grep -oE 'wukong_[a-z0-9_]+'`.
-fn kernel_census(mir: &str) -> Vec<(String, usize)> {
+pub(crate) fn kernel_census(mir: &str) -> Vec<(String, usize)> {
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for (i, _) in mir.match_indices("wukong_") {
         let rest = &mir[i..];
@@ -745,7 +745,7 @@ fn kernel_census(mir: &str) -> Vec<(String, usize)> {
         .collect()
 }
 
-fn census_line(census: &[(String, usize)]) -> String {
+pub(crate) fn census_line(census: &[(String, usize)]) -> String {
     if census.is_empty() {
         return "NOTHING — every loop stays generic Cranelift code".to_string();
     }

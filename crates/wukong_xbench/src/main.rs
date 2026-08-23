@@ -758,6 +758,10 @@ fn main() {
     let mut runtime_ratios_cpp = Vec::new();
     let mut par_ratios_c = Vec::new();
     let mut par_ratios_cpp = Vec::new();
+    // The recognition-off accumulators (master plan §7.2): the same split, so the wk(gen) headline
+    // can never pool a multicore row into a single-threaded geomean either.
+    let mut gen_ratios_c = Vec::new();
+    let mut gen_par_ratios_c = Vec::new();
 
     for k in &kernels {
         if !want(k.name) {
@@ -774,7 +778,15 @@ fn main() {
         let mut out: Vec<f32> = vec![0.0; N];
         let (xp, yp): (*const f32, *const f32) = (x.as_ptr(), y.as_mut_ptr());
 
-        let wukong = bench_wukong(&k.wuk, &mut out, xp, yp);
+        let (wukong, wk_census) = match bench_wukong_with(&k.wuk, &mut out, xp, yp, true) {
+            Some((m, cen)) => (Some(m), Some(cen)),
+            None => (None, None),
+        };
+        // The recognition-off column (master plan §7.2): the SAME source, lowered with every kernel
+        // recognizer skipped — what the loop costs as the compiler compiles it, not as the pattern
+        // matcher dispatches it. Timed adjacent to the recognizer-on column so the pair is the
+        // tightest same-run A/B in the row.
+        let wukgen = bench_wukong_with(&k.wuk, &mut out, xp, yp, false);
         let (c, cpp) = bench_c_cpp(
             k.name,
             &k.c,
@@ -837,6 +849,11 @@ fn main() {
 
         println!("=== {} ({}) ===", k.name, k.note);
         report(k, &wukong, &c, &cpp, &rust, &cfast, &comp);
+        // The T2 MIR witness for the row's Wukong column: recognized kernels are gate-blind, so the
+        // census is the only record of what the number above actually measured.
+        if let Some(cen) = &wk_census {
+            println!("  wk dispatch census: {}", general::census_line(cen));
+        }
         // oneMKL VML peer for the transcendentals MKL ships a vector op for: the elementwise analogue
         // of the GEMM-vs-cblas comparison. Wukong's hand-AVX2 vmath vs Intel's hand-tuned VML, both
         // single-thread, same buffer. Cross-checked against Wukong's output (a large rel error would
@@ -880,6 +897,61 @@ fn main() {
             }
         }
         let is_par = k.name.contains("@parallel");
+        // The recognition-off row: ratio vs C (the §7.2 column) and vs the recognizer-on lowering
+        // of the same source (the dispatch win, measured rather than asserted), plus the census
+        // proving no `wukong_*` kernel survived. A divergence between the two lowerings of ONE
+        // source is a compiler defect, not a timing: print it loudly and withhold the ratio.
+        if let Some((g, census)) = &wukgen {
+            let checked = match &wukong {
+                Some(m) => {
+                    let (rel, at) = max_rel_err(&m.out, &g.out);
+                    // Reduction rows get the relaxed bar: the recognized kernel legitimately
+                    // reassociates the f32 sum the as-written serial loop performs.
+                    let bar = if is_reduction_kernel(k.name) {
+                        1e-2
+                    } else {
+                        1e-3
+                    };
+                    if rel > bar {
+                        println!(
+                            "  !!! wk(gen) DIVERGES from the recognizer-on lowering at [{at}] \
+                             (rel {rel:.2e}) — recognition-off column WITHHELD; a divergence \
+                             between two lowerings of one source is a compiler defect"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                None => true,
+            };
+            if checked {
+                let dir = |r: f64| -> (f64, &'static str) {
+                    if r >= 1.0 {
+                        (r, "faster")
+                    } else {
+                        (1.0 / r, "slower")
+                    }
+                };
+                let mut line = format!("  wk(gen) recognition-off: {:.0} ns", g.ns_per_call);
+                if let Some(p) = &c {
+                    let r = p.ns_per_call / g.ns_per_call;
+                    let (v, w) = dir(r);
+                    line.push_str(&format!(" — {v:.2}x {w} than C"));
+                    if is_par {
+                        gen_par_ratios_c.push(r);
+                    } else {
+                        gen_ratios_c.push(r);
+                    }
+                }
+                if let Some(m) = &wukong {
+                    let (v, w) = dir(m.ns_per_call / g.ns_per_call);
+                    line.push_str(&format!("; {v:.2}x {w} than recognizer-on Wukong"));
+                }
+                println!("{line}");
+                println!("     wk(gen) census: {}", general::census_line(census));
+            }
+        }
         if let (Some(m), Some(c)) = (&wukong, &c) {
             let r = c.ns_per_call / m.ns_per_call; // >1 => Wukong faster
             if is_par {
@@ -928,6 +1000,26 @@ fn main() {
         if !compile_ratios_c.is_empty() {
             let (g, w) = standing(geomean(&compile_ratios_c));
             println!("  compile:  Wukong is {g:.1}x {w} to compile than C");
+        }
+    }
+    // The master plan §7.2 headline: the same rows with every recognizer OFF — general code vs gcc,
+    // not the recognizer dialect vs gcc. Printed as its own summary, never pooled with the above.
+    if !gen_ratios_c.is_empty() || !gen_par_ratios_c.is_empty() {
+        println!("Summary vs C, RECOGNITION-OFF (geomean over kernels) — the language without the dispatcher:");
+        if !gen_ratios_c.is_empty() {
+            let (g, w) = standing(geomean(&gen_ratios_c));
+            println!(
+                "  runtime:  Wukong(gen) is {g:.2}x {w} than C  [single-threaded rows: {}]",
+                gen_ratios_c.len()
+            );
+        }
+        if !gen_par_ratios_c.is_empty() {
+            let (g, w) = standing(geomean(&gen_par_ratios_c));
+            println!(
+                "  runtime:  Wukong(gen) is {g:.2}x {w} than C  [@parallel rows: {} — all-core \
+                 Wukong vs 1-thread C; see each row's C(omp) column]",
+                gen_par_ratios_c.len()
+            );
         }
     }
     if !runtime_ratios_cpp.is_empty() || !par_ratios_cpp.is_empty() {
@@ -7309,6 +7401,24 @@ fn kbench_abi_ok(
 /// all-zeros against all-zeros and pass vacuously. Deriving `op` from `out` keeps the kernel's
 /// writes *based on* the parameter, which is exactly what `noalias` permits.
 fn bench_wukong(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32) -> Option<Measure> {
+    bench_wukong_with(src, out, xp, yp, true).map(|(m, _)| m)
+}
+
+/// [`bench_wukong`] with the recognizers switchable and the dispatch census returned.
+///
+/// `recognize: false` is the `WUKONG_NO_RECOGNIZE` / `@generic` lowering — every `match_*` kernel
+/// interception skipped, the loop nest lowered as written (scalar or autovectorized, never a
+/// `wukong_*` runtime call) — through `wukong_mir_build::lower_program_with`, the same knob the
+/// driver sets from the environment. The returned census is the T2 MIR witness
+/// (`--emit=mir -O2 | grep wukong_` equivalent): recognized kernels are gate-blind, so the census
+/// is the only proof of what a timed number actually measured.
+fn bench_wukong_with(
+    src: &str,
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+    recognize: bool,
+) -> Option<(Measure, Vec<(String, usize)>)> {
     let t = Instant::now();
     let mut interner = Interner::new();
     let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
@@ -7321,12 +7431,18 @@ fn bench_wukong(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32) -> O
         eprintln!("wukong sema error: {sd:?}");
         return None;
     }
-    let (mut program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    let opts = wukong_mir_build::LowerOptions {
+        recognize,
+        ..Default::default()
+    };
+    let (mut program, ld) =
+        wukong_mir_build::lower_program_with(&module, &sema, &mut interner, opts);
     if ld.iter().any(|d| d.is_error()) {
         eprintln!("wukong lower error: {ld:?}");
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
+    let census = general::kernel_census(&wukong_mir::print::print_program(&program, &interner));
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
@@ -7349,11 +7465,14 @@ fn bench_wukong(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32) -> O
     let ns = time_ns(|| unsafe { f(xp, yp, op) });
     let snapshot = out.to_vec();
     drop(handle); // keep alive through timing
-    Some(Measure {
-        compile,
-        ns_per_call: ns,
-        out: snapshot,
-    })
+    Some((
+        Measure {
+            compile,
+            ns_per_call: ns,
+            out: snapshot,
+        },
+        census,
+    ))
 }
 
 /// A built-and-loaded peer library, plus the wall time its compiler process took.

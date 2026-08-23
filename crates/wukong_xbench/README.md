@@ -25,6 +25,13 @@ loop over the same buffers:
 
 Reports compile time and ns/call per column. A missing toolchain prints `n/a` and continues.
 
+Every battery row additionally reports a **`wk(gen)` recognition-off line** (master plan §7.2): the
+same source lowered with every kernel recognizer skipped (`LowerOptions::recognize = false`, the
+`WUKONG_NO_RECOGNIZE` / `@generic` lowering), its ratio vs C and vs the recognizer-on column, and
+the MIR dispatch census for **both** lowerings — recognized kernels are gate-blind, so the census is
+the only proof of what a number measured. The whole run pins its timing thread (`XBENCH_PIN=off`
+disables; see the CPU PINNING block in `src/main.rs`).
+
 Optional first CLI argument is a substring filter over kernel/section names (e.g. `saxpy`).
 
 ## Sections
