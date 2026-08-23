@@ -105,6 +105,39 @@ pub fn tile_sizes_from_attrs(
     out
 }
 
+/// Report function-item `@tile` widths that the lowering this function took can never consume:
+/// a queue left non-empty at the end of the body, or a whole-function interception that builds
+/// its lowerer with no queue at all. Silence here was the D4 failure one level up -- the
+/// attribute was read, validated, and then dropped because nothing ever asked for it.
+pub(super) fn report_unapplied_tiles(
+    diags: &mut Vec<Diagnostic>,
+    span: Span,
+    widths: &[u64],
+    label: &str,
+) {
+    if widths.is_empty() {
+        return;
+    }
+    let list = widths
+        .iter()
+        .map(|w| w.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (noun, verb) = if widths.len() == 1 {
+        ("width", "was")
+    } else {
+        ("widths", "were")
+    };
+    push_unique(
+        diags,
+        tile_error(
+            span,
+            &format!("`@tile` {noun} {list} {verb} never applied"),
+            label,
+        ),
+    );
+}
+
 /// The `(start, end)` of a `for` loop [`FnLowerer::lower_tiled_range_for`] can rewrite: a single
 /// identifier bound over an exclusive, step-less range with a known end. Every other form — `0..=n`,
 /// a stepped or open range, iteration over an array, a destructuring pattern — reaches the
@@ -123,15 +156,20 @@ impl FnLowerer<'_> {
     /// validates the statement's own arguments, so a malformed `@tile` is still reported on a loop
     /// the strip-miner would decline anyway.
     pub(super) fn tile_requested(&mut self, stmt_attrs: &[Attr]) -> bool {
-        for a in stmt_attrs {
-            if self.interner.resolve(a.name.sym) != "tile" {
-                continue;
-            }
-            let sizes =
-                tile_sizes_from_attrs(std::slice::from_ref(a), self.interner, &mut *self.diags);
+        if self.has_stmt_tile(stmt_attrs) {
+            let sizes = tile_sizes_from_attrs(stmt_attrs, self.interner, &mut *self.diags);
             return !sizes.is_empty();
         }
         !self.tile_queue.is_empty()
+    }
+
+    /// Does this statement carry a `@tile` of its own? Asked before reading the widths so that a
+    /// statement whose every `@tile` argument is malformed still takes the statement path and
+    /// reports there, instead of silently falling through to the function-item queue.
+    fn has_stmt_tile(&self, stmt_attrs: &[Attr]) -> bool {
+        stmt_attrs
+            .iter()
+            .any(|a| self.interner.resolve(a.name.sym) == "tile")
     }
 
     /// Consume the tile width for this `for` loop: an explicit `@tile(B)` on the statement wins;
@@ -141,12 +179,14 @@ impl FnLowerer<'_> {
     /// anything looked at the loop form, so an unsupported form discarded its width in silence
     /// **and** shifted the queue — the NEXT loop was strip-mined at the wrong width.
     pub(super) fn take_tile_size(&mut self, stmt_attrs: &[Attr]) -> Option<u64> {
-        for a in stmt_attrs {
-            if self.interner.resolve(a.name.sym) != "tile" {
-                continue;
-            }
-            let sizes =
-                tile_sizes_from_attrs(std::slice::from_ref(a), self.interner, &mut *self.diags);
+        if self.has_stmt_tile(stmt_attrs) {
+            // EVERY `@tile` on the statement, not just the first. Both readers used to `return`
+            // inside the loop on the first one, so `@tile(4) @tile(0)` applied the 4 and discarded
+            // the 0 without a word -- while `tile_sizes_from_attrs` on a function ITEM iterates all
+            // of them, so the two positions disagreed about the same spelling. They now agree:
+            // `@tile(4) @tile(8)` means the widths 4 and 8 in source order, exactly like
+            // `@tile(4, 8)`, and a malformed argument in any of them is reported.
+            let sizes = tile_sizes_from_attrs(stmt_attrs, self.interner, &mut *self.diags);
             if sizes.is_empty() {
                 return None;
             }
@@ -165,18 +205,27 @@ impl FnLowerer<'_> {
     /// `@tile` when it has one and at the loop variable when the width came from the function item.
     /// Nothing is consumed, so the width stays at the head of the queue for the next loop rather
     /// than shifting onto it.
-    pub(super) fn tile_not_applicable(&mut self, stmt_attrs: &[Attr], loop_span: Span) {
+    pub(super) fn tile_not_applicable(
+        &mut self,
+        stmt_attrs: &[Attr],
+        pat: &Pattern,
+        loop_span: Span,
+    ) {
         let span = stmt_attrs
             .iter()
             .find(|a| self.interner.resolve(a.name.sym) == "tile")
             .map_or(loop_span, |a| a.span);
+        // Two different rules reach this decline and they used to share one label, so a loop that
+        // WAS written `for <i> in <start>..<end>` was told that only that form can be strip-mined.
+        // Name the rule the loop actually broke.
+        let label = if matches!(pat.kind, ast::PatKind::Ident(_)) {
+            "only `for <i> in <start>..<end>` can be strip-mined"
+        } else {
+            "the loop variable must be a name, not a pattern"
+        };
         push_unique(
             &mut *self.diags,
-            tile_error(
-                span,
-                "`@tile` cannot strip-mine this loop",
-                "only `for <i> in <start>..<end>` can be strip-mined",
-            ),
+            tile_error(span, "`@tile` cannot strip-mine this loop", label),
         );
     }
 
@@ -315,7 +364,15 @@ impl FnLowerer<'_> {
         });
         self.bind(name, i_slot, ity.clone());
         self.loops.push((label, inner_step, exit));
+        // The body is lowered TWICE -- once for the full-tile nest and once for the remainder --
+        // but it is ONE source loop, so a nested `for` inside it must not pop the function-item
+        // `@tile(BM, BN, ...)` queue twice. `@tile(2, 4, 8)` over `for i { for j { } }` used to
+        // give the inner loop 4 in the tiled copy and 8 in the remainder copy: two widths for one
+        // loop the user wrote once, silently, and MIR byte-identical to the pre-E0309 parent.
+        // Snapshot before the first copy, rewind for the second, and keep what the first left.
+        let tiles_before = self.tile_queue.clone();
         self.lower_block(body);
+        let tiles_after = std::mem::replace(&mut self.tile_queue, tiles_before);
         self.loops.pop();
         self.pop_scope();
         if !self.terminated {
@@ -388,6 +445,7 @@ impl FnLowerer<'_> {
         self.bind(name, rem_slot, ity.clone());
         self.loops.push((label, rem_step, exit));
         self.lower_block(body);
+        self.tile_queue = tiles_after;
         self.loops.pop();
         self.pop_scope();
         if !self.terminated {

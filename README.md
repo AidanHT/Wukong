@@ -15,7 +15,7 @@ the GPU stack, are current implementation, not the thesis.
 
 It is **not** a high-level framework. There is no garbage collector, no hidden allocation, and no
 hidden control flow. Every parallel loop has a schedule you chose (`@parallel` and `@tile` today),
-and a schedule the compiler cannot apply is a diagnostic (`E0309`), never a silent no-op.
+and a schedule the compiler cannot apply is a diagnostic (`E0309`) rather than a silent no-op.
 
 ## What you write
 

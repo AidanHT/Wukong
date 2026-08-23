@@ -5,6 +5,44 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### `@tile` — the six paths that still discarded a width in silence
+
+W2a made an unsupported *loop form* and a malformed *width* `E0309`, and the docs then said a `@tile`
+the compiler cannot apply is "never a silent no-op". Six live paths still were. Every one of them
+compiled clean, exit 0, with MIR byte-identical to the same program without the attribute:
+
+- a **second `@tile` on one statement** was never read. Both readers `return`ed on the first
+  attribute named `tile`, while `tile_sizes_from_attrs` on a function *item* iterates all of them —
+  so `@tile(4, 0)` on an item was an error and `@tile(4) @tile(0)` on a statement was not. The two
+  positions agree now: several `@tile`s mean their widths in source order.
+- a **width the queue still held** when the body ended tiled nothing — `@tile(64, 32)` on a function
+  with one strip-minable loop, or `@tile(4)` on a function with no `for` at all.
+- **`@parallel` + `@tile`**: `lower_parallel` builds both halves with an empty tile queue, so a
+  function-item `@tile` never reached `lower_for`. The two are not composable — the outliner rewrites
+  the loop into runtime chunks — and that is now said out loud.
+- a **whole-function recognizer interception** (`lower_matmul_fn`, `lower_i8matmul_fn`) does the
+  same, which made `@tile`'s effect depend on whether an *unrelated* recognizer fired: adding
+  `@generic` to the identical function made the identical `@tile` apply. Silent in both directions.
+- the **mis-assignment was only half fixed**. `lower_tiled_range_for` lowers the body twice — the
+  full-tile nest, then the remainder — so a nested `for` popped the function-item queue twice:
+  `@tile(2, 4, 8)` over `for i { for j { } }` gave the inner loop 4 in one copy and 8 in the other,
+  for one loop the user wrote once. The queue is now rewound between the copies, which also means a
+  `@tile` on a nest applies to the remainder copy too — `tests/run/lang_tiled_transpose.wk`'s MIR
+  grows from 882 to 1129 lines at `-O0` because its inner loop is now tiled in both, as `@tile(2, 2)`
+  asked.
+
+Also: `E0309` on a `for _ in 0..n` blamed the range form, for a loop that *is* written
+`for <i> in <start>..<end>`. It now names the binder.
+
+Four fixtures pin the new conditions (`tests/fail/tile_never_applied.wk`, `tile_on_parallel_fn.wk`,
+`tile_on_recognized_kernel.wk`, `tile_second_on_stmt.wk`); all four compile silently on the parent.
+No program in `tests/run`, `examples`, `bench` or the xbench corpus newly reports `E0309`.
+
+**Still open, and now written down rather than implied away:** `wukong_sema::attrs::FN_ITEM_ONLY` is
+`["generic"]`, so `@tile` is accepted on a `struct`, a parameter, a `let` and a `while` loop, where
+nothing reads it. That is an attribute-*placement* rule and needs its own diagnostic; `@tile` on a
+`while` is the sharpest case — a schedule written on a loop, dropped without a word.
+
 ### Language — `@tile` no longer no-ops in silence, and no longer mis-assigns (`E0309`)
 
 Phase 2.1 shipped `@tile` with a silent-decline hole at both ends. `FnLowerer::take_tile_size` popped

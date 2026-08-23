@@ -204,15 +204,21 @@ static CATALOG: &[Explanation] = &[
         "E0309",
         "`@tile` cannot be applied",
         "A `@tile` attribute names a tiling the compiler cannot perform, so it would have no \
-         effect. Two conditions reach this code. (1) The loop form: `@tile` strip-mines \
+         effect. Four conditions reach this code. (1) The loop form: `@tile` strip-mines \
          `for <i> in <start>..<end>` — one identifier, an exclusive range with a known end and no \
          `step` — into a full-tile nest plus a remainder loop. `for i in 0..=n`, a stepped or open \
          range, and iteration over an array cannot be rewritten that way. (2) The argument: a tile \
          width must be a positive integer literal, so a bare `@tile`, `@tile(0)`, `@tile(rows)` and \
-         a width that does not fit in 64 bits are all rejected. Both used to be silent — the width \
-         was discarded where it stood, and a function-item `@tile(BM, BN, …)` queue additionally \
-         SHIFTED, so the next loop was strip-mined at the wrong width. Either drop the attribute or \
-         write the loop in the form it can rewrite."
+         a width that does not fit in 64 bits are all rejected. (3) The width was never applied: a \
+         function-item `@tile(BM, BN, …)` is a queue consumed by loops in source order, and a width \
+         still in it when the body is done tiled nothing. (4) The lowering cannot carry it: a \
+         whole-function recognizer interception replaces the nest with a kernel that brings its own \
+         blocking, and the whole-function `@parallel` outliner rewrites the loop into runtime \
+         chunks — both build their lowerer with no tile queue at all, so `@generic` is the way to \
+         keep the loops tileable. Every one of these used to be silent — the width was discarded \
+         where it stood, and a function-item queue additionally SHIFTED, so the next loop was \
+         strip-mined at the wrong width. Either drop the attribute or write the loop in the form it \
+         can rewrite."
     ),
     entry!(
         "E0401",

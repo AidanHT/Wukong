@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0309
+module tests.fail.tile_never_applied
+
+// A function-item `@tile(BM, BN, …)` is a queue consumed by loops in source order, and a width left
+// in it when the body is done is a tiling that never happened. `@tile(64, 32)` over a function with
+// ONE strip-minable loop used to apply the 64 and drop the 32 where it stood: exit 0, no diagnostic,
+// and MIR identical to a source that had never named 32 at all. `@tile(4)` on a function with no
+// `for` loop was the same silence with nothing applied.
+
+@generic
+@tile(64, 32)
+fn f(mut out: [i32; 100]) {
+    for i in 0..100 {
+        out[i] = i;
+    }
+}
+
+fn main() -> i32 {
+    let mut o: [i32; 100] = [0; 100];
+    f(o);
+    return 0;
+}
