@@ -1,5 +1,5 @@
 // Comparison line counts: Wukong=29, C=28, CUDA=36.
-// Physical lines include comments and blanks. MIR witness: call wukong_sgemm; @generic is inert here.
+// Physical lines include comments and blanks. MIR witness: no wukong_* call at -O2; @generic is load-bearing.
 module tests.compare.naive_gemm
 
 // Row-major C[2,2] = A[2,3] * B[3,2], using the same ikj order as the C peer.

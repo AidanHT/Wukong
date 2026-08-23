@@ -1,8 +1,8 @@
 // Comparison line counts: Wukong=22, C=23, CUDA=31.
-// Physical lines include comments and blanks. MIR witness: call wukong_velem_f32; @generic is inert here.
+// Physical lines include comments and blanks. MIR witness: no wukong_* call at -O2; @generic is load-bearing.
 module tests.compare.saxpy
 
-// Idiomatic source loop. @generic requests recognition-off once Phase 0.3 lands.
+// Idiomatic source loop. @generic is the per-function recognition-off opt-out (Phase 0.3).
 @generic
 fn main() -> i32 {
     let a: f32 = 2.0;
