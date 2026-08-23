@@ -1,0 +1,39 @@
+// The baseline the master plan §7.1 pass condition names: "faster than Wukong's own naive scatter".
+// Same 8x8 input, same 64 printed lanes, same recognition-off spelling as tiled_transpose.wk -- the
+// only difference is the schedule, so an A/B between the two measures tiling and nothing else.
+//
+// It is NOT a peer under §3B (that is tiled_transpose.c) and it is NOT part of the T5 line-count
+// triple. It carries no timing today: see README.md, "What is owed".
+//
+// MIR witness: at -O2 the only `wukong_` symbol is `wukong_parallel_for`; `@generic` keeps
+// `wukong_transpose_f32` out, which matters more here than anywhere else in the corpus, because the
+// naive scatter is exactly the shape the transpose recognizer matches.
+module tests.compare.tiled_transpose.naive_scatter
+
+const N: i32 = 8;
+
+@generic
+@parallel
+fn naive_scatter(a: [f32; N * N], mut b: [f32; N * N]) {
+    for i in 0..N {
+        for j in 0..N {
+            b[j * N + i] = a[i * N + j]; // stride-N scatter: one cache line touched per store
+        }
+    }
+}
+
+@generic
+fn main() -> i32 {
+    let mut a: [f32; N * N] = [0.0; N * N];
+    for i in 0..N * N {
+        a[i] = (i + 1) as f32;
+    }
+    let mut b: [f32; N * N] = [0.0; N * N];
+    naive_scatter(a, b);
+
+    // Identical to tiled_transpose.wk by construction: b[r * 8 + c] = a[c * 8 + r], a[k] = k + 1.
+    for i in 0..N * N {
+        print(b[i] as i32);
+    }
+    return 0;
+}

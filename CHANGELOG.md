@@ -66,6 +66,59 @@ Both are pinned device-free: `megakernel::tests::the_megakernel_decline_reason_r
 largest `.local` frame in `tests/run` is under 81 KB (`parallel_argmax.wk`, one `[f32; 20000]`),
 and the check sits at the run seam, not in
 `emit_ptx`, so the device-free coverage sweeps still measure what this backend can *lower*.
+### Tests — the `tiled_transpose` comparison fixture, and the gpu-native hang it found (`tests/compare/`)
+
+`docs/WUKONG_MASTER_PLAN.md` §7.1 lists `tiled_transpose` as a required comparison fixture — the one
+carrying the "easier than a CUDA `__shared__` kernel" claim. Phase 2 shipped `@tile`, `shared [T; N]`
+and `sync_block()` and left the slot as a README reading "**Status: NYI**". It is filled:
+`tiled_transpose.wk` (the whole Phase 2 surface, `@generic`, 8x8 over `const N`/`const T`), a
+cache-blocked `__restrict__` C peer that is built and run, the canonical coalesced 32x32 `+1`-padded
+CUDA `__shared__` peer (committed, not built — no `nvcc` on this box), `naive_scatter.wk` as the §7.1
+baseline, and `wrong_shape.c` + `tests/fail/transpose_wrong_shape.wk` as the T4 safety mutant.
+
+- **Correct on all three backends, both `-O` levels, all 64 lanes printed**, one identical stdout —
+  interp, `--backend=native`, and `--backend=gpu-native` on the RTX 4050. The C peer prints the same
+  64 lines under `gcc -O3 -march=native`.
+- **MIR witness (T2):** at `-O2` the only `wukong_` symbol in either program is `wukong_parallel_for`,
+  the `@parallel` outliner. No named kernel, and specifically no `wukong_transpose_f32`. **`@generic`
+  is load-bearing on `naive_scatter.wk`** — delete it and the census becomes
+  `1 wukong_transpose_f32_parallel`, so §7.1's "faster than Wukong's own naive scatter" would have
+  been comparing the tiled loop against the *dispatcher*. It is inert on `tiled_transpose.wk`, where
+  no recognizer matches the tiled spelling. The same measurement shows the `saxpy` and `naive_gemm`
+  fixture headers had gone stale: both said they still dispatched a kernel; since Phase 0.3 neither
+  does, and their headers now say so.
+- **The effort claim does not survive counting, and the honest number is recorded** (T5). Physical
+  lines are Wukong 63, C 41, CUDA 58; code-only, 41 / 25 / 40. The kernels alone are 25 Wukong lines
+  against 20 CUDA lines, because CUDA gets its tile origin free from `blockIdx`/`threadIdx` while the
+  `.wk` writes the tile-origin loops. What Wukong removes is the 9 lines of
+  `cudaMalloc`/`cudaMemcpy`/`dim3`/`<<<>>>`/`cudaFree` and the recompile-per-backend. The supported
+  claim is "one source, no device plumbing, three backends, shapes checked" — not "far fewer lines".
+- **Safety (T4).** Allocating a transpose's output with the input's shape is two `E0502`s that name
+  the disagreeing dimension. The same mistake in C compiles clean at
+  `gcc -O3 -march=native -Wall -Wextra`, runs to completion with every index in bounds — both shapes
+  hold 32 floats — and silently returns the right values in the wrong rows. No sanitizer can see it,
+  and a flat `[f32; 32]` spelling could not either: only the shape carries the information.
+
+**DEFECT FOUND — `--backend=gpu-native` hangs the device, and no watchdog fires.** An array declared
+*inside* a loop whose body also calls `sync_block()` lowers to PTX that never retires: the kernel
+spins (nvidia-smi 100 %, idle 0 %) and the host blocks forever. It is not an `UNSUPPORTED:` decline,
+which is what T7 requires. Committed as `tests/compare/tiled_transpose/shared_in_loop_hang.wk` — a
+25-line program that is correct on interp and native at every `-O` and hangs on gpu-native at `-O0`.
+Neither `shared` (a plain `[f32; 2]` hangs too) nor `@tile` nor the optimizer is required. Hoisting
+the declaration out of the loop fixes it, which is why the fixture declares its tile at function
+scope and fences the tile loop at both ends — where CUDA declares `__shared__` anyway. Two things
+made it invisible: `tests/run/lang_tiled_transpose.wk` declares its tile in the loop and does *not*
+hang, so the discriminator is narrower than the rule above and is still open; and
+`megakernel.rs` calls `stream.synchronize()` directly instead of `gpu::launch_timeout()`'s polling
+drain, so `WUKONG_GPU_LAUNCH_TIMEOUT_MS` — the watchdog written for a kernel that never retires —
+does not cover the gpu-native path at all.
+
+**No timing was taken and none is claimed.** §7.1's "faster than Wukong's own naive scatter" and the
+§3B C comparison both need AC+full, an idle box, a release build, a pinned thread and a `C(twin)`
+control; this fixture was authored on battery. `naive_scatter.wk` is committed so the A/B is a run
+away, and the extent is a one-line `const N` change — but at 8x8 the whole problem is in L1 and
+tiling can show nothing, so a real round needs a larger `N` and a dense-prefix-plus-corners print
+policy in place of all 64 lanes.
 
 ### Measurement — the language ruler, and what it says (`bench/lang/`, `wukong_driver::lang_bench`)
 
