@@ -454,7 +454,8 @@ a consumer on a **function**: **`@parallel`** (✅), which makes its loop execut
 which strip-mines loops (below).
 Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern`, `@export`, and
 `@parallel`'s own `grain = …` argument — is parsed and discarded (🔵). `@tile` is consumed as loop
-strip-mining (see below). A *discarded* attribute on a statement or loop is dropped there too:
+strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
+*discarded* attribute on a statement or loop is dropped there too:
 `@parallel` must sit on the function, and the mid-function parallel region is derived from the enclosing function's
 attribute, not from one written on the loop. `@generic` in that position is an error, not a silent
 drop.
@@ -520,8 +521,7 @@ case rather than being an f32-only gate: a `bf16`/`f16` array read through the e
 `s = s + (x[k] as f32)` — dispatches to the multicore low-precision reduction kernels
 (`tests/run/parallel_reduce_lowp.wk`), while the *uncast* spelling `s = s + x[k]` stays a scalar loop
 (`tests/run/parallel_reduce_elem_bf16.wk`); an `f64` reduction has no kernel and always declines.
-`@tile` (cache tiling) and
-explicit `@simd`-typed vector values are still under construction (🔵).
+Explicit `@simd`-typed vector values are still under construction (🔵); `@tile` ships (next section).
 
 ### `@tile` — loop strip-mining ✅
 
@@ -537,9 +537,23 @@ fn saxpy_tiled(...) {
 (outer `io`, inner `ii` over `0..B`) plus a **remainder loop** for the tail — not implicit padding.
 `@tile(BM, BN, …)` on a function queues widths consumed by nested `for` loops in source order; a
 statement-level `@tile(B)` overrides for one loop. Strip-mining runs **before** the kernel recognizer
-cascade — it is not a back-door into `wukong_*` kernels. Works with `@generic`. Other `for` forms
-(`step`, `..=`, labelled loops) fall through unchanged. Fixture: `tests/run/lang_tile_saxpy.wk`
-(`@tile(2)`, `n=5`, remainder lane prints 3).
+cascade — it is not a back-door into `wukong_*` kernels. Works with `@generic`, and with a label
+(`'outer: for i in 0..n` is strip-mined and keeps its label). Fixture:
+`tests/run/lang_tile_saxpy.wk` (`@tile(2)`, `n=5`, remainder lane prints 3).
+
+**A `@tile` that cannot be applied is `E0309`, not silence.** Two conditions reach it:
+
+- the **loop form** — anything other than one identifier over an exclusive, step-less range with a
+  known end. `for i in 0..=n`, a stepped range, an open range and `for x in xs` cannot be strip-mined
+  (`tests/fail/tile_bad_form.wk`);
+- the **argument** — a width must be a positive integer literal, so a bare `@tile`, `@tile(0)`,
+  `@tile(rows)` and a width that does not fit in 64 bits are all rejected
+  (`tests/fail/tile_zero_width.wk`, `tests/fail/tile_non_integer_width.wk`).
+
+A refused width is **not** consumed, so the function-item queue does not shift: it stays at the head
+for the next loop that can take it. Before `E0309`, an unsupported first loop discarded its width
+without a word *and* moved every later width one loop earlier, so the second loop was silently
+strip-mined at the wrong tile. `wukongc --explain E0309` prints the rule.
 
 ### `shared [T; N]` and `sync_block()` ✅
 

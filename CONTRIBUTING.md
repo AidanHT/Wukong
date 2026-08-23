@@ -236,7 +236,11 @@ Update `docs/language-guide.md` and its maturity legend.
 join the closed set in `crates/wukong_sema/src/attrs.rs` (`KNOWN_ATTRS`) or it is `E0306` — and if it
 is only legal in one position, `FN_ITEM_ONLY` is where that is said, with a `tests/fail/` fixture for
 the misplacement. Then give it a consumer, and a `tests/run/` fixture that *witnesses* the consumer:
-an attribute whose effect no gate can see is how `@tile` did nothing for months.
+an attribute whose effect no gate can see is how `@tile` did nothing for months. The consumer needs a
+`tests/fail/` fixture too, for the input it must refuse — an attribute the compiler cannot apply is a
+diagnostic, never silence, which is why `@tile` on a loop form it cannot strip-mine, and a `@tile`
+width that is not a positive integer literal, are both `E0309` (`tests/fail/tile_bad_form.wk`,
+`tile_zero_width.wk`, `tile_non_integer_width.wk`).
 
 ## Adding a MIR `Op`
 

@@ -424,6 +424,11 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **`@tile` strip-mining** on a half-open unit-step `for i in start..end`: `@tile(B)` on the function
   (or one loop) expands into full tiles plus a remainder loop, before the recognizer cascade.
   `@tile(BM, BN, …)` queues widths for nested `for` loops in source order (`tests/run/lang_tile_saxpy.wk`).
+  A `@tile` the compiler cannot apply is **`E0309`**, never a silent no-op: an unsupported loop form
+  (`0..=n`, a stepped or open range, `for x in xs`) and a width that is not a positive integer literal
+  (a bare `@tile`, `@tile(0)`, `@tile(rows)`) are both rejected, and a refused width is not consumed,
+  so the function-item queue cannot shift onto the wrong loop (`tests/fail/tile_bad_form.wk`,
+  `tile_zero_width.wk`, `tile_non_integer_width.wk`).
 - **`shared [T; N]`** and **`sync_block()`**: shared address space on `alloca`; cooperative barrier
   inside `@parallel` only (`E0308` otherwise). Static shared size above 48 KiB is `E0307`. CPU:
   shared = stack `alloca`, barrier = no-op/fence. gpu-native: PTX `.shared` + `bar.sync` in
@@ -793,7 +798,8 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   consumer in the tree is `mir_build`'s `has_parallel_attr`, a name test for `"parallel"`; even
   `@parallel`'s own arguments (e.g. `grain = …`) are parsed and discarded. `E0207` fires only for a
   malformed argument such as a missing value after `=`. (`@parallel` itself executes — see above.)
-  `@tile` is consumed as loop strip-mining; `@generic` opts out of recognizers (see above).
+  `@tile` is consumed as loop strip-mining, and a `@tile` that cannot be applied is `E0309` rather
+  than a silent drop; `@generic` opts out of recognizers (see above).
 - **Non-contiguous tensor layouts** `.col_major` / `.strided` / `.tiled(N, M)`: they parse (an unknown
   layout name is `E0204`), they are part of the tensor type, and they are enforced across a call
   boundary — passing a `.col_major` tensor to a `Contiguous`-typed parameter is `E0502`. **`.col_major`

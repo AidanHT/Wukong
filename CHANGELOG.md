@@ -5,6 +5,32 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Language — `@tile` no longer no-ops in silence, and no longer mis-assigns (`E0309`)
+
+Phase 2.1 shipped `@tile` with a silent-decline hole at both ends. `FnLowerer::take_tile_size` popped
+the function-item `@tile(BM, BN, …)` queue **before** `lower_for` looked at the loop, so a form the
+strip-miner cannot rewrite fell through to the ordinary lowering with the width already spent: the
+attribute did nothing, reported nothing, and every later width shifted one loop earlier. One level
+down, `tile_sizes_from_attrs` skipped any argument that was not a positive integer literal where it
+stood. Both are the failure `E0306` was introduced to end, one attribute later.
+
+- **`E0309`** — a `@tile` the compiler cannot apply is an error. Two conditions reach it: the **loop
+  form** (only one identifier over an exclusive, step-less range with a known end can be strip-mined —
+  not `0..=n`, not a stepped or open range, not `for x in xs`) and the **argument** (a width must be a
+  positive integer literal, so a bare `@tile`, `@tile(0)`, `@tile(rows)` and a width that overflows 64
+  bits are rejected). One code for both, because both say the same thing; `E0310` stays free.
+- **The queue no longer shifts.** `tile::tileable_range` is asked first and a refused width is not
+  consumed, so it stays at the head for the next loop that can take it. Before this,
+  `@tile(64, 32)` on a function whose first loop was `for i in 0..=2` compiled clean, exited 0, and
+  strip-mined the **second** loop — which had asked for nothing — at 32.
+- **Fixtures:** `tests/fail/tile_bad_form.wk`, `tests/fail/tile_zero_width.wk`,
+  `tests/fail/tile_non_integer_width.wk`, plus four `wukong_mir_build` unit tests; three of the four
+  fail on the parent commit.
+- **No behaviour change for a supported `@tile`.** `--emit=mir` at `-O0` and `-O2` for
+  `tests/run/lang_tile_saxpy.wk`, `lang_tiled_transpose.wk` and `lang_shared_transpose.wk` is
+  byte-identical to the parent commit on all six outputs. No measurement was taken and none is
+  claimed: this change adds diagnostics and consumes no width it did not consume before.
+
 ### Measurement — the language ruler, and what it says (`bench/lang/`, `wukong_driver::lang_bench`)
 
 `WUKONG_MASTER_PLAN` Task 0.4 — the honest gpu-native baseline of a `@generic` kernel — was skipped
