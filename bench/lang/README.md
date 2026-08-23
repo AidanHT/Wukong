@@ -25,9 +25,11 @@ that, and each cost a probe to find:
    (`UNSUPPORTED: call to 'wukong_rt_alloc' not yet lowered to PTX`), so the buffers must be `main`
    locals — which the megakernel homes in the shared `.global` frame it allocates for the grid.
 2. **A program with no `wukong_parallel_for` and no recognized kernel is not megakernel eligible.**
-   It falls through to the single-thread lowering, whose frame is per-thread `.local`; at 32 MiB the
-   driver rejects that launch with a bare `DriverError(CUDA_ERROR_INVALID_VALUE)` — not an
-   `UNSUPPORTED:` decline. Hence the anchor loop, whose only job is eligibility.
+   It falls through to the single-thread lowering, whose frame is per-thread `.local`, and CUDA caps
+   local memory at 512 KiB per thread, so a 32 MiB frame cannot be launched at all. (When this
+   directory was written that surfaced as a bare `DriverError(CUDA_ERROR_INVALID_VALUE)`; it is an
+   `UNSUPPORTED:` decline now, naming the frame size — `lower::MAX_LOCAL_FRAME_BYTES`. Either way the
+   fixture does not run.) Hence the anchor loop, whose only job is eligibility.
 3. **`[0.0; N]` is not free.** It lowers to a 4x-unrolled *scalar* store loop the `@parallel`
    outliner does not claim, so each declaration is N serial device stores.
 

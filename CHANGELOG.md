@@ -5,6 +5,43 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### gpu-native: two silent declines made legible (`WUKONG_GPU_EXPLAIN`, the `.local` frame cap)
+
+A decline is coverage the backend honestly lacks. Neither of these was legible: one said nothing at
+all, the other said `DriverError`.
+
+- **`WUKONG_GPU_EXPLAIN=1` prints why the cooperative megakernel declined**, and what ran instead.
+  `fusion::MegaPlan` has always carried a human-readable `reason` "for honest reporting", and the only
+  thing that ever rendered it was `megakernel::decline` under `WUKONG_GPU_DUMP_PTX` — a switch
+  documented as a PTX dumper, which buries the line under the whole module. So a gpu-native run that
+  quietly fell back to **one device thread** instead of the block-cooperative megakernel said nothing.
+  `LANGUAGE_DIRECTION` Task 1.2 asks for "decline to serial **and** diagnostic"; this is the
+  diagnostic. It is **env-gated on purpose**: the fallback is correct (that path is the reference every
+  megakernel run is checked against) and it is the common case, so an unconditional note would write to
+  stderr on the majority of gpu-native runs. `WUKONG_GPU_DUMP_PTX` still prints it too.
+- **An over-cap per-thread `.local` frame is now an `UNSUPPORTED:` decline instead of a driver code.**
+  The single-thread gpu-native lowering homes the entry's allocas in a per-thread `.local __frame`, and
+  CUDA caps local memory at **512 KiB per thread** (CUDA C Programming Guide, *Technical Specifications
+  per Compute Capability*, "Maximum amount of local memory per thread"; it is not a
+  `CU_DEVICE_ATTRIBUTE_*`, so it cannot be probed like SM count or L2). `ptxas` compiles a larger frame
+  and `cuModuleLoadData` loads it — only the **launch** fails, with
+  `DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")`, which reads as a crash. `jit_run_single`
+  now checks the entry frame against `lower::MAX_LOCAL_FRAME_BYTES` first and declines by name and by
+  size, and says what to do about it (the megakernel homes the frame in one shared `.global` buffer and
+  has no such cap, so a `@parallel` loop or a recognized kernel lifts the program onto it). MEASURED
+  boundary on the RTX 4050: a 523,648-byte `__frame` launches, 523,712 does not — `524288 − 523648 =
+  640` bytes of entry-wrapper ABI frame, which `ENTRY_ABI_FRAME_RESERVE` rounds up to 1 KiB. A
+  **callee** frame is charged to the same budget but cannot be attributed to one launch without a
+  call-graph walk, so it is annotated onto the device error rather than declined — never reclassified,
+  so a genuine fault stays a fault for the corpus gate.
+
+Both are pinned device-free: `megakernel::tests::the_megakernel_decline_reason_reaches_the_note`
+(three different `fusion::analyze` arms) and
+`lower::tests::oversized_local_frame_declines_before_the_launch`. Neither corpus floor moves — the
+largest `.local` frame in `tests/run` is under 81 KB (`parallel_argmax.wk`, one `[f32; 20000]`),
+and the check sits at the run seam, not in
+`emit_ptx`, so the device-free coverage sweeps still measure what this backend can *lower*.
+
 ### Measurement — the language ruler, and what it says (`bench/lang/`, `wukong_driver::lang_bench`)
 
 `WUKONG_MASTER_PLAN` Task 0.4 — the honest gpu-native baseline of a `@generic` kernel — was skipped
@@ -21,7 +58,8 @@ is a loss.
 - **Three gpu-native properties force the fixture shape**, each found by probe: `alloc_f32` never
   reaches the device (`UNSUPPORTED: call to 'wukong_rt_alloc' not yet lowered to PTX`); a program with
   no `wukong_parallel_for` and no recognized kernel is not megakernel-eligible and its single-thread
-  fallback is rejected at a 32 MiB frame with a bare `DriverError(CUDA_ERROR_INVALID_VALUE)`; and
+  fallback is rejected at a 32 MiB frame (with a bare `DriverError(CUDA_ERROR_INVALID_VALUE)` when this
+  was written — it is an `UNSUPPORTED:` decline now, see the entry above); and
   `[0.0; N]` lowers to a serial scalar store loop. Hence one shared skeleton and a `base.wk` control —
   **every number from that directory is a difference against it.** Details in `bench/lang/README.md`.
 

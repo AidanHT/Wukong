@@ -35,8 +35,10 @@
 //!     are `main` locals, which the megakernel homes in the shared `.global` frame.
 //!  2. A program with no `wukong_parallel_for` and no recognized kernel is **not megakernel
 //!     eligible**, falls through to the single-thread lowering, and at this size that launch is
-//!     rejected with a bare `DriverError(CUDA_ERROR_INVALID_VALUE)`. So every fixture carries an
-//!     *anchor* `@parallel` loop whose only job is to make the program eligible.
+//!     impossible -- CUDA caps local memory at 512 KiB per thread, and the frame here is 32 MiB.
+//!     (It surfaced as a bare `DriverError(CUDA_ERROR_INVALID_VALUE)` when this was written; it is
+//!     an `UNSUPPORTED:` decline now.) So every fixture carries an *anchor* `@parallel` loop whose
+//!     only job is to make the program eligible.
 //!  3. `[0.0; N]` lowers to a 4x-unrolled scalar store loop the outliner does not claim, so each
 //!     declaration is N serial device stores.
 //!

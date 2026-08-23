@@ -719,6 +719,35 @@ part's ~192 GB/s**. Two things account for it, and neither is the kernel menu:
 So the sentence above is confirmed in the direction that matters: this path loses to the native CPU
 backend today, and it loses to the recognized `wukong_velem` GPU kernel by a wider margin still.
 
+**Its two declines are now legible, which they were not.** A decline is coverage this backend honestly
+lacks; both of these used to read as either silence or a crash.
+
+- **Why the megakernel declined: `WUKONG_GPU_EXPLAIN=1`.** `fusion::analyze` always built a
+  human-readable reason, and nothing printed it except `WUKONG_GPU_DUMP_PTX`, which buries it under the
+  whole PTX module. With the knob set, a fallback prints one line naming the reason and the fallback:
+
+  ```text
+  $ WUKONG_GPU_EXPLAIN=1 wukongc --run -O2 --backend=gpu-native prog.wk
+  gpu-mega: declined (ineligible: no recognized cooperative op (single-thread path suffices)) --
+  falling back to the single-thread gpu-native lowering (one device thread; correct, and the
+  reference the megakernel is checked against)
+  ```
+
+  It is env-gated rather than always-on because the fallback is **correct** and is the common case —
+  the single-thread path is the oracle every megakernel run is checked against — so an unconditional
+  note would write to stderr on the majority of gpu-native runs.
+- **A per-thread `.local` frame past the CUDA cap declines before the launch.** When a program is not
+  megakernel-eligible it runs the single-thread lowering, whose frame is a per-thread `.local __frame`,
+  and CUDA caps local memory at **512 KiB per thread**. Everything before the launch succeeds at any
+  size — `ptxas` compiles the frame, the module loads — so a 32 MiB frame used to surface as
+  `DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")`, which reads as a crash. It is now
+  `UNSUPPORTED:` naming the entry, the frame size and the budget, and saying what lifts the program
+  onto the megakernel (whose `.global` frame has no such cap): a `@parallel` loop or a recognized
+  kernel. A **callee** frame is charged to the same per-thread budget but cannot be attributed to one
+  launch without a call-graph walk, so it is annotated onto the device error instead of declined.
+  The knobs on this backend are therefore `WUKONG_GPU_EXPLAIN`, `WUKONG_GPU_NO_MEGA`,
+  `WUKONG_MEGA_GRID` and `WUKONG_GPU_DUMP_PTX` — environment only, none of them a CLI flag.
+
 Corpus standing is printed by the gates
 themselves, over every fixture in `tests/run` (357 today — `ls tests/run/*.wk | wc -l`;
 this line has gone stale before): `lower::tests::run_corpus_matches_interp_oracle`
