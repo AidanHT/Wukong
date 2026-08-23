@@ -1210,11 +1210,29 @@ fn reference_f64(m: Dims, inp: &[Vec<f32>]) -> Vec<f64> {
 /// Worst per-lane relative deviation of `got` from the f64 reference, with the lane it happened at.
 /// Relative to `max(|ref|, 1e-3)` so a lane that is legitimately near zero cannot manufacture a huge
 /// ratio out of an absolute error that is nothing.
+///
+/// A non-finite deviation returns `f64::INFINITY`, and it has to: `NaN > worst` is **false**, so a
+/// NaN lane compared naively is *skipped*, and a kernel that returned NaN in every lane would score
+/// this function's bit-exact sentinel `0.0`, clear the oracle bar, and have its ratio published.
+/// `max_rel_err` in `main.rs` documents that trap in full; this is the same trap, in the oracle every
+/// row of the compare corpus and the general suite is admitted by. A length mismatch is infinite for
+/// the same reason — `zip` stops at the shorter side, so a truncated `got` would otherwise be scored
+/// on the prefix it did fill and reported as perfect.
 pub(crate) fn max_rel_vs_ref(got: &[f32], want: &[f64]) -> (f64, usize) {
+    if got.len() != want.len() {
+        return (f64::INFINITY, got.len().min(want.len()));
+    }
     let mut worst = 0.0f64;
     let mut at = 0usize;
     for (i, (&a, &b)) in got.iter().zip(want.iter()).enumerate() {
-        let e = (a as f64 - b).abs() / b.abs().max(1.0e-3);
+        let a = a as f64;
+        if (a.is_nan() && b.is_nan()) || a == b {
+            continue; // agreed: both NaN, or exact — which covers ±0 and equal infinities
+        }
+        let e = (a - b).abs() / b.abs().max(1.0e-3);
+        if !e.is_finite() {
+            return (f64::INFINITY, i); // NaN against a number, or opposite-signed infinities
+        }
         if e > worst {
             worst = e;
             at = i;
@@ -1224,14 +1242,27 @@ pub(crate) fn max_rel_vs_ref(got: &[f32], want: &[f64]) -> (f64, usize) {
 }
 
 /// Worst relative deviation between two f32 buffers, plus whether they are bit-identical.
+///
+/// Non-finite deviations are infinite here for the reason given on [`max_rel_vs_ref`]: the bit test
+/// alone would catch a NaN lane, but the deviation it reported alongside would read `0.0`.
 fn max_rel_pair(a: &[f32], b: &[f32]) -> (f64, bool) {
+    if a.len() != b.len() {
+        return (f64::INFINITY, false);
+    }
     let mut worst = 0.0f64;
-    let mut same = a.len() == b.len();
+    let mut same = true;
     for (&p, &q) in a.iter().zip(b.iter()) {
         if p.to_bits() != q.to_bits() {
             same = false;
         }
-        let e = (p as f64 - q as f64).abs() / (q as f64).abs().max(1.0e-3);
+        let (p, q) = (p as f64, q as f64);
+        if (p.is_nan() && q.is_nan()) || p == q {
+            continue;
+        }
+        let e = (p - q).abs() / q.abs().max(1.0e-3);
+        if !e.is_finite() {
+            return (f64::INFINITY, false);
+        }
         if e > worst {
             worst = e;
         }
@@ -2818,5 +2849,72 @@ mod tests {
             r.iter().all(|v| v.is_finite()),
             "reference has non-finite lanes"
         );
+    }
+
+    /// The oracle must still score an agreeing buffer at ~0, or every test below is vacuous.
+    #[test]
+    fn the_oracle_still_passes_a_buffer_that_agrees() {
+        let want = [1.0f64, -2.5, 1.0e-9, 0.0];
+        let got = [1.0f32, -2.5, 1.0e-9, 0.0];
+        let (dev, _) = max_rel_vs_ref(&got, &want);
+        assert!(dev < 1.0e-6, "an agreeing buffer scored {dev}");
+        let (dev, same) = max_rel_pair(&got, &got);
+        assert!(
+            dev < 1.0e-6 && same,
+            "a buffer disagreed with itself: {dev}"
+        );
+    }
+
+    /// A kernel that returns NaN everywhere must not score the bit-exact sentinel.
+    ///
+    /// `NaN > worst` is false, so the naive loop *skips* every NaN lane and returns `0.0` — the
+    /// score of a perfect buffer. That is a published ratio for a kernel computing nothing.
+    #[test]
+    fn an_all_nan_buffer_never_clears_the_oracle_bar() {
+        let want = vec![1.0f64; 64];
+        let got = vec![f32::NAN; 64];
+        let (dev, _) = max_rel_vs_ref(&got, &want);
+        assert!(
+            !dev.is_finite(),
+            "an all-NaN buffer scored {dev} against a finite reference"
+        );
+        let finite = vec![1.0f32; 64];
+        let (dev, _) = max_rel_pair(&got, &finite);
+        assert!(!dev.is_finite(), "all-NaN scored {dev} against finite");
+    }
+
+    /// One bad lane in a buffer that is otherwise perfect is the case a reduction would hide.
+    #[test]
+    fn a_single_non_finite_lane_is_not_skipped() {
+        let want = vec![2.0f64; 1024];
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut got = vec![2.0f32; 1024];
+            got[517] = bad;
+            let (dev, at) = max_rel_vs_ref(&got, &want);
+            assert!(!dev.is_finite(), "lane 517 = {bad} scored {dev}");
+            assert_eq!(at, 517, "wrong lane reported for {bad}");
+        }
+    }
+
+    /// Infinities that agree are agreement, not divergence — the exact-equality arm must cover them.
+    #[test]
+    fn agreeing_infinities_are_not_a_divergence() {
+        let want = [f64::INFINITY, f64::NEG_INFINITY, f64::NAN];
+        let got = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+        let (dev, _) = max_rel_vs_ref(&got, &want);
+        assert!(dev.is_finite(), "agreeing non-finite lanes scored {dev}");
+    }
+
+    /// `zip` stops at the shorter side, so a truncated result would be scored on the prefix it did
+    /// fill — and a kernel that wrote half its output would report perfect agreement.
+    #[test]
+    fn a_truncated_buffer_is_not_scored_on_its_prefix() {
+        let want = vec![1.0f64; 64];
+        let got = vec![1.0f32; 32];
+        let (dev, _) = max_rel_vs_ref(&got, &want);
+        assert!(!dev.is_finite(), "a half-length buffer scored {dev}");
+        let full = vec![1.0f32; 64];
+        let (dev, same) = max_rel_pair(&got, &full);
+        assert!(!dev.is_finite() && !same, "a half-length pair scored {dev}");
     }
 }
