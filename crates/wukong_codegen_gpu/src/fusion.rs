@@ -85,8 +85,10 @@ pub enum CallClass {
 /// multicore recognizer arm but the same cooperative kernel, so both map to the same [`CoopKind`].
 ///
 /// **Every spelling `lower::rt_helper` maps must appear here**, or a program whose recognized op came
-/// out of an `@parallel fn` is declared ineligible and silently falls back to the one-thread path —
-/// the megakernel never accelerating the very shape the user asked to parallelize. (The converse
+/// out of an `@parallel fn` is declared ineligible and falls back to the one-thread path — the
+/// megakernel never accelerating the very shape the user asked to parallelize. `WUKONG_GPU_EXPLAIN=1`
+/// now names the missing spelling in the decline note instead of leaving that fallback silent, but
+/// the note is a diagnosis, not a fix: the entry still belongs here. (The converse
 /// direction is safe: a name classified here that `rt_helper` does not know now returns an
 /// `UNSUPPORTED:` decline rather than panicking.)
 pub fn classify_call(name: &str) -> CallClass {
@@ -149,6 +151,13 @@ pub struct MegaPlan {
     /// True iff the entry can be compiled into the cooperative single-block megakernel.
     pub eligible: bool,
     /// Human-readable reason the program is ineligible (empty when eligible) — for honest reporting.
+    ///
+    /// **It reaches a user through `WUKONG_GPU_EXPLAIN=1`** (`megakernel::EXPLAIN_ENV`), which makes
+    /// `megakernel::decline` print it beside the fallback it took. It has to be non-empty for every
+    /// ineligible plan or the note says nothing, which is what
+    /// `megakernel::tests::the_megakernel_decline_reason_reaches_the_note` pins over three arms of
+    /// [`analyze`]. Until that knob existed the field really was written and never read outside a
+    /// `WUKONG_GPU_DUMP_PTX` dump — a silent decline is this project's signature failure.
     pub reason: String,
     /// The recognized cooperative ops in entry order (program order within the block sweep).
     pub coop_ops: Vec<CoopOp>,
