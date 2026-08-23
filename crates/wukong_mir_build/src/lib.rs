@@ -1189,7 +1189,7 @@ pub fn lower_program_with(
         .filter_map(|item| match &item.kind {
             ast::ItemKind::Fn(f) => Some((
                 f.name.sym,
-                tile::tile_sizes_from_attrs(&item.attrs, interner),
+                tile::tile_sizes_from_attrs(&item.attrs, interner, &mut diags),
             )),
             _ => None,
         })
@@ -11279,17 +11279,22 @@ impl FnLowerer<'_> {
         body: &Block,
         stmt_attrs: &[ast::Attr],
     ) {
-        if let Some(tile) = self.take_tile_size(stmt_attrs) {
-            if let ForIter::Range {
-                start,
-                end: Some(end),
-                inclusive: false,
-                step: None,
-            } = iter
-            {
-                if self.lower_tiled_range_for(label, pat, start, end, body, tile) {
-                    return;
+        // `@tile` is consumed only by a loop the strip-miner can actually rewrite, and the loop FORM
+        // is settled first. `take_tile_size` used to pop the function-item `@tile(BM, BN, …)` queue
+        // before anything looked at the loop: a form other than an exclusive step-less range then
+        // fell through to the ordinary lowering below, so the attribute did nothing, said nothing,
+        // and every later width shifted one loop earlier — the NEXT loop was silently strip-mined at
+        // the wrong tile. A width with nowhere to go is `E0309` and stays at the head of the queue.
+        if self.tile_requested(stmt_attrs) {
+            match tile::tileable_range(pat, iter) {
+                Some((start, end)) => {
+                    if let Some(tile) = self.take_tile_size(stmt_attrs) {
+                        if self.lower_tiled_range_for(label, pat, start, end, body, tile) {
+                            return;
+                        }
+                    }
                 }
+                None => self.tile_not_applicable(stmt_attrs, pat.span),
             }
         }
         // ---- The ordered kernel-recognizer cascade -------------------------------------------
@@ -29687,5 +29692,137 @@ fn main() -> i32 { return 0; }
             !prog_calls(&prog, &interner, "wukong_sgemm_nt"),
             "an input aliasing C is not a matmul the blocked kernel can run"
         );
+    }
+
+    // ---- `@tile` (D4): the attribute either strip-mines or says why not ------------------------
+
+    /// Every `ConstInt` literal in the program, which for a strip-mined loop includes the tile
+    /// width: `lower_tiled_range_for` materializes the tile as `Op::ConstInt(b, ity)` and uses it
+    /// as the inner-loop bound and the outer-loop step.
+    fn const_ints(prog: &Program) -> Vec<i128> {
+        let mut out = Vec::new();
+        for f in &prog.funcs {
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Op::ConstInt(v, _) = &i.op {
+                        out.push(*v);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// D4, the mis-assignment half. `take_tile_size` popped the function-item `@tile(BM, BN, …)`
+    /// queue *before* anything looked at the loop, so a form the strip-miner cannot rewrite
+    /// discarded its width in silence AND shifted the queue: with `@tile(64, 37)` on a function
+    /// whose first loop is inclusive, 64 vanished and the SECOND loop — which asked for nothing —
+    /// was strip-mined at 37. The program compiled clean and ran (exit 0) with the wrong schedule.
+    #[test]
+    fn an_untileable_loop_does_not_shift_the_queue_onto_the_next_loop() {
+        let src = "module m
+@generic
+@tile(64, 37)
+fn f(mut out: [i32; 100]) {
+    for i in 0..=2 { out[i] = i; }
+    for j in 0..100 { out[j] = j; }
+}
+fn main() -> i32 { let mut o: [i32; 100] = [0; 100]; f(o); return 0; }
+";
+        let (prog, diags, _interner) = lower(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some("E0309") && d.is_error()),
+            "an inclusive range cannot be strip-mined, so `@tile` must say so: {diags:?}"
+        );
+        assert!(
+            !const_ints(&prog).contains(&37),
+            "the second loop was strip-mined at the FIRST loop's successor width"
+        );
+    }
+
+    /// The other half of D4: the width the unsupported loop could not take must still be there for
+    /// the loop that can. Same source, one width, and the loop that gets it is the second one.
+    #[test]
+    fn an_untileable_loop_leaves_its_width_for_the_next_loop() {
+        let src = "module m
+@generic
+@tile(37)
+fn f(mut out: [i32; 100]) {
+    for i in 0..=2 { out[i] = i; }
+    for j in 0..100 { out[j] = j; }
+}
+fn main() -> i32 { let mut o: [i32; 100] = [0; 100]; f(o); return 0; }
+";
+        let (prog, diags, _interner) = lower(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some("E0309") && d.is_error()),
+            "{diags:?}"
+        );
+        assert!(
+            const_ints(&prog).contains(&37),
+            "the width was consumed by the loop that could not use it"
+        );
+    }
+
+    /// A `@tile` argument that is not a positive integer literal used to be dropped where it stood,
+    /// so the program compiled with no tiling and no diagnostic. All four spellings are `E0309`.
+    #[test]
+    fn a_malformed_tile_width_is_rejected() {
+        for attr in ["@tile", "@tile(0)", "@tile(rows)", "@tile(\"4\")"] {
+            let src = format!(
+                "module m
+@generic
+{attr}
+fn f(mut out: [i32; 8]) {{
+    for i in 0..8 {{ out[i] = i; }}
+}}
+fn main() -> i32 {{ let mut o: [i32; 8] = [0; 8]; f(o); return 0; }}
+"
+            );
+            let (_prog, diags, _interner) = lower(&src);
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| d.code == Some("E0309") && d.is_error()),
+                "{attr} was accepted and discarded: {diags:?}"
+            );
+        }
+    }
+
+    /// The supported spellings keep strip-mining and stay silent — `@tile(2)` on the one loop of
+    /// `tests/run/lang_tile_saxpy.wk`, and a two-width function queue feeding a nest in source
+    /// order, which is `tests/run/lang_tiled_transpose.wk`'s shape.
+    #[test]
+    fn a_supported_tile_still_strip_mines_without_a_diagnostic() {
+        let one = "module m
+@generic
+@tile(37)
+fn f(mut out: [i32; 100]) {
+    for i in 0..100 { out[i] = i; }
+}
+fn main() -> i32 { let mut o: [i32; 100] = [0; 100]; f(o); return 0; }
+";
+        let (prog, diags, _interner) = lower(one);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(const_ints(&prog).contains(&37), "the loop was not tiled");
+
+        let nest = "module m
+@generic
+@tile(37, 41)
+fn f(mut out: [i32; 100]) {
+    for i in 0..10 {
+        for j in 0..10 { out[i * 10 + j] = i + j; }
+    }
+}
+fn main() -> i32 { let mut o: [i32; 100] = [0; 100]; f(o); return 0; }
+";
+        let (prog, diags, _interner) = lower(nest);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let ints = const_ints(&prog);
+        assert!(ints.contains(&37) && ints.contains(&41), "widths: {ints:?}");
     }
 }

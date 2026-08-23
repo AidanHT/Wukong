@@ -205,7 +205,11 @@ states a stride rather than an alignment, and `wukong_opt::vectorize` starts its
 loop's own `start` without peeling. gpu-native therefore lowers these as generic scalar lanes, which
 are correct in every window at every alignment. `@tile(B)` strip-mining in `wukong_mir_build::tile`
 expands a half-open unit-step range `for` into tiled inner loops plus a remainder loop before the
-recognizer cascade runs.
+recognizer cascade runs. `lower_for` settles the **loop form first** (`tile::tileable_range`) and only
+then consumes a width: popping the function-item `@tile(BM, BN, …)` queue before the form check both
+discarded the width in silence and shifted the queue, so the next loop was strip-mined at the wrong
+tile. A width with nowhere to go — and any argument that is not a positive integer literal — is
+`E0309`, and nothing is consumed.
 This keeps lowering simple and correct; the optimizer's `mem2reg` pass then promotes those slots to
 SSA registers (see below), which is what makes the value-based passes effective.
 

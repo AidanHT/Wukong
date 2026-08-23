@@ -14,8 +14,8 @@ runs. Silent pattern recognizers that swap loop nests for tuned microkernels, an
 the GPU stack, are current implementation, not the thesis.
 
 It is **not** a high-level framework. There is no garbage collector, no hidden allocation, and no
-hidden control flow. Every parallel loop has a schedule you chose (`@parallel` today; `@tile` parses
-and is discarded).
+hidden control flow. Every parallel loop has a schedule you chose (`@parallel` and `@tile` today),
+and a schedule the compiler cannot apply is a diagnostic (`E0309`), never a silent no-op.
 
 ## What you write
 
@@ -68,9 +68,10 @@ not duplicate them. In summary, Wukong:
   layout declared in the type (`Tensor[f32, 512, 512, .col_major]`, `.tiled(64, 64)`, strided) and
   parallel schedules (`@parallel`) are part of the language rather than a soup of intrinsics and
   `#pragma`s. Honest status: a user-written `vec[f32, 8]` *value* parses and type-checks but does not
-  execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` is the only attribute with a consumer
-  today, and only its bare form — `@simd`/`@tile`/`@align`/`@extern`/`@export` and `@parallel`'s
-  `grain =` argument parse and are inert — layout is
+  execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` (bare form), `@generic` and `@tile`
+  have consumers today, and a `@tile` the compiler cannot apply — an unsupported loop form, a width
+  that is not a positive integer literal — is `E0309` rather than a silent drop, while
+  `@simd`/`@align`/`@extern`/`@export` and `@parallel`'s `grain =` argument parse and are inert — layout is
   enforced across call boundaries; the default row-major (contiguous) layout and `.col_major` both
   lower multi-dimensional indexing (`.col_major` is byte-identical to `a[i + j*M]`); `.strided` /
   `.tiled(…)` still reject indexing (`C0001`). Arena/scratch/pool allocator selection is not

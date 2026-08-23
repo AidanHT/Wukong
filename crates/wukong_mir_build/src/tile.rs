@@ -1,40 +1,152 @@
 //! `@tile` strip-mining: expand one range `for` into tiled inner loops plus a remainder loop.
 
-use wukong_ast::{self as ast, Attr, AttrArg, Block, Expr, Pattern};
+use wukong_ast::{self as ast, Attr, AttrArg, Block, Expr, ForIter, Pattern};
+use wukong_diag::Diagnostic;
 use wukong_mir::{BinOp, CmpOp, MirType, Op};
-use wukong_span::{Interner, Symbol};
+use wukong_span::{Interner, Span, Symbol};
 
 use crate::FnLowerer;
 
-/// Every integer argument on a `@tile(...)` attribute, in source order.
-pub fn tile_sizes_from_attrs(attrs: &[Attr], interner: &Interner) -> Vec<u64> {
+/// The help line every `E0309` carries: one sentence stating both rules the attribute has.
+const TILE_HELP: &str = "`@tile` takes one or more positive integer widths (`@tile(64)`, \
+                         `@tile(64, 32)`) and applies them, in source order, to loops written \
+                         `for <i> in <start>..<end>`";
+
+/// One `E0309`. A `@tile` the compiler cannot apply is an error and never silence — the width used
+/// to be dropped where it stood, which is the silent-discard failure `E0306` was introduced to end.
+fn tile_error(span: Span, message: &str, label: &str) -> Diagnostic {
+    Diagnostic::error(message.to_string())
+        .with_code("E0309")
+        .primary(span, label)
+        .help(TILE_HELP)
+}
+
+/// Push `d` unless the same message is already recorded at the same span. One statement's
+/// attributes can be read more than once — a generic function is lowered once per instantiation —
+/// and the second reading carries nothing the first did not.
+fn push_unique(diags: &mut Vec<Diagnostic>, d: Diagnostic) {
+    let dup = diags.iter().any(|x| {
+        x.code == d.code
+            && x.message == d.message
+            && x.labels.first().map(|l| l.span) == d.labels.first().map(|l| l.span)
+    });
+    if !dup {
+        diags.push(d);
+    }
+}
+
+/// Where to point `E0309` for one malformed argument.
+fn arg_span(arg: &AttrArg) -> Span {
+    match arg {
+        AttrArg::Word(_, s) | AttrArg::Int(_, s) | AttrArg::Str(_, s) => *s,
+        AttrArg::KeyValue { key, .. } => key.span,
+    }
+}
+
+/// Every tile width on a `@tile(...)` attribute, in source order, with each argument that is not a
+/// positive integer literal reported as `E0309`.
+///
+/// `@tile(0)`, `@tile(rows)` and a bare `@tile` used to be dropped here without a word, so the
+/// program compiled with none of the requested tiling and no diagnostic at all.
+pub fn tile_sizes_from_attrs(
+    attrs: &[Attr],
+    interner: &Interner,
+    diags: &mut Vec<Diagnostic>,
+) -> Vec<u64> {
     let mut out = Vec::new();
     for a in attrs {
         if interner.resolve(a.name.sym) != "tile" {
             continue;
         }
+        if a.args().is_empty() {
+            push_unique(
+                diags,
+                tile_error(
+                    a.span,
+                    "`@tile` needs a tile width",
+                    "no tile width was given",
+                ),
+            );
+            continue;
+        }
         for arg in a.args() {
-            if let AttrArg::Int(sym, _) = arg {
-                if let Ok(n) = interner.resolve(*sym).parse::<u64>() {
-                    if n > 0 {
-                        out.push(n);
-                    }
-                }
+            let AttrArg::Int(sym, span) = arg else {
+                push_unique(
+                    diags,
+                    tile_error(
+                        arg_span(arg),
+                        "a `@tile` width must be an integer literal",
+                        "not an integer literal",
+                    ),
+                );
+                continue;
+            };
+            match interner.resolve(*sym).parse::<u64>() {
+                Ok(n) if n > 0 => out.push(n),
+                Ok(_) => push_unique(
+                    diags,
+                    tile_error(
+                        *span,
+                        "a `@tile` width must be at least 1",
+                        "a tile of zero iterations",
+                    ),
+                ),
+                Err(_) => push_unique(
+                    diags,
+                    tile_error(
+                        *span,
+                        "this `@tile` width does not fit in 64 bits",
+                        "tile width out of range",
+                    ),
+                ),
             }
         }
     }
     out
 }
 
+/// The `(start, end)` of a `for` loop [`FnLowerer::lower_tiled_range_for`] can rewrite: a single
+/// identifier bound over an exclusive, step-less range with a known end. Every other form — `0..=n`,
+/// a stepped or open range, iteration over an array, a destructuring pattern — reaches the
+/// strip-miner only to be declined, which is exactly why the caller must ask this *before* it
+/// consumes a width.
+pub(super) fn tileable_range<'e>(pat: &Pattern, iter: &'e ForIter) -> Option<(&'e Expr, &'e Expr)> {
+    if !matches!(pat.kind, ast::PatKind::Ident(_)) {
+        return None;
+    }
+    crate::range_bounds(iter)
+}
+
 impl FnLowerer<'_> {
-    /// The tile width for the next `for` loop: an explicit `@tile(B)` on the statement wins; else
-    /// the next size from the function-item `@tile(BM, BN, …)` queue.
+    /// Is a tile width waiting for the next `for` loop — an explicit `@tile(B)` on the statement, or
+    /// the head of the function-item `@tile(BM, BN, …)` queue? Reads without consuming, and
+    /// validates the statement's own arguments, so a malformed `@tile` is still reported on a loop
+    /// the strip-miner would decline anyway.
+    pub(super) fn tile_requested(&mut self, stmt_attrs: &[Attr]) -> bool {
+        for a in stmt_attrs {
+            if self.interner.resolve(a.name.sym) != "tile" {
+                continue;
+            }
+            let sizes =
+                tile_sizes_from_attrs(std::slice::from_ref(a), self.interner, &mut *self.diags);
+            return !sizes.is_empty();
+        }
+        !self.tile_queue.is_empty()
+    }
+
+    /// Consume the tile width for this `for` loop: an explicit `@tile(B)` on the statement wins;
+    /// else the next size from the function-item `@tile(BM, BN, …)` queue.
+    ///
+    /// Call this only once [`tileable_range`] has accepted the loop. It used to pop the queue before
+    /// anything looked at the loop form, so an unsupported form discarded its width in silence
+    /// **and** shifted the queue — the NEXT loop was strip-mined at the wrong width.
     pub(super) fn take_tile_size(&mut self, stmt_attrs: &[Attr]) -> Option<u64> {
         for a in stmt_attrs {
             if self.interner.resolve(a.name.sym) != "tile" {
                 continue;
             }
-            let sizes = tile_sizes_from_attrs(std::slice::from_ref(a), self.interner);
+            let sizes =
+                tile_sizes_from_attrs(std::slice::from_ref(a), self.interner, &mut *self.diags);
             if sizes.is_empty() {
                 return None;
             }
@@ -47,6 +159,25 @@ impl FnLowerer<'_> {
             return None;
         }
         Some(self.tile_queue.remove(0))
+    }
+
+    /// Report the `@tile` width that has nowhere to go: `E0309`, pointed at the statement's own
+    /// `@tile` when it has one and at the loop variable when the width came from the function item.
+    /// Nothing is consumed, so the width stays at the head of the queue for the next loop rather
+    /// than shifting onto it.
+    pub(super) fn tile_not_applicable(&mut self, stmt_attrs: &[Attr], loop_span: Span) {
+        let span = stmt_attrs
+            .iter()
+            .find(|a| self.interner.resolve(a.name.sym) == "tile")
+            .map_or(loop_span, |a| a.span);
+        push_unique(
+            &mut *self.diags,
+            tile_error(
+                span,
+                "`@tile` cannot strip-mine this loop",
+                "only `for <i> in <start>..<end>` can be strip-mined",
+            ),
+        );
     }
 
     /// Strip-mine `for pat in start..end` with tile `tile` into a full-tile nest plus a remainder
