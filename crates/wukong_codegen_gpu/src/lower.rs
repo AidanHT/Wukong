@@ -107,6 +107,33 @@ pub const MEGA_KERNEL_NAME: &str = "wukong_mega";
 /// latter as a hard failure.
 pub const UNSUPPORTED: &str = "UNSUPPORTED:";
 
+/// **CUDA's architectural cap on local memory per thread: 512 KiB.**
+///
+/// Not a device attribute — there is no `CU_DEVICE_ATTRIBUTE_*` for it, so unlike SM count, L2 size
+/// or the opt-in SMEM budget it cannot be probed into [`crate::gpu::GpuTarget`]. It is a documented
+/// constant of the ISA: the CUDA C Programming Guide's *Technical Specifications per Compute
+/// Capability* table, row **"Maximum amount of local memory per thread"**, which reads 512 KB for
+/// every compute capability the table covers. `ptxas` compiles a larger `.local` frame happily and
+/// `cuModuleLoadData` accepts the module; the **launch** is what fails, with
+/// `CUDA_ERROR_INVALID_VALUE`.
+pub const MAX_LOCAL_MEM_PER_THREAD: u64 = 512 * 1024;
+
+/// What `ptxas` charges the launched entry *on top of* `__frame`: the entry wrapper's own ABI frame
+/// (parameter save area, the callee `.func`'s frame, spills).
+///
+/// MEASURED on this box (RTX 4050, Windows/WDDM) by bisecting a single-array fixture through
+/// `--backend=gpu-native`: a **523,648**-byte `__frame` launches and **523,712** does not, and
+/// `524,288 - 523,648 = 640`, so the wrapper cost 640 bytes for that program. It is a property of
+/// the program, not a constant, so this is rounded up to 1 KiB and used as a *budget*, never as an
+/// oracle: the residual band it mis-calls is the 384 bytes between 523,264 and 523,648, and a
+/// program that lands there was within 384 bytes of unlaunchable anyway.
+const ENTRY_ABI_FRAME_RESERVE: u64 = 1024;
+
+/// The largest per-thread `.local __frame` [`jit_run_single`] will try to launch — the cap minus the
+/// emitter's own reserve. Over this the backend **declines** ([`UNSUPPORTED`]) instead of handing the
+/// driver a launch it will reject with an opaque `CUDA_ERROR_INVALID_VALUE` (campaign D21).
+pub const MAX_LOCAL_FRAME_BYTES: u64 = MAX_LOCAL_MEM_PER_THREAD - ENTRY_ABI_FRAME_RESERVE;
+
 // ============================================================================================
 // Public API (mirrors `wukong_codegen_cranelift`)
 // ============================================================================================
@@ -174,6 +201,29 @@ pub fn jit_run_single(
     let entry_fn = program
         .function(entry)
         .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+
+    // **The frame the driver will refuse, refused here instead** (campaign D21). This path homes the
+    // entry's allocas in a per-thread `.local __frame`, and CUDA caps local memory per thread at
+    // [`MAX_LOCAL_MEM_PER_THREAD`]. Everything up to the launch succeeds at any size -- `ptxas`
+    // compiles the frame and `cuModuleLoadData` loads the module -- so without this the first sign
+    // is `DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")` out of `run_on_device`, which
+    // reads as a crash rather than as coverage the backend honestly lacks. It has to be checked
+    // *here* and not in `emit_ptx`: the lowering is correct, it is the launch that is impossible,
+    // and keeping the decline out of the emitter keeps the device-free coverage sweeps measuring
+    // what this backend can lower.
+    let frame = local_frame_bytes(entry_fn);
+    if frame > MAX_LOCAL_FRAME_BYTES {
+        return Err(format!(
+            "{UNSUPPORTED} entry `{}` needs a {frame}-byte per-thread `.local` frame on the \
+             single-thread gpu-native path, over the {MAX_LOCAL_FRAME_BYTES}-byte budget (CUDA \
+             caps local memory at {MAX_LOCAL_MEM_PER_THREAD} bytes per thread). The cooperative \
+             megakernel has no such limit -- it homes the frame in one shared `.global` buffer -- \
+             so this is reachable only because the program is not megakernel-eligible; give it a \
+             `@parallel` loop or a recognized kernel, or make the buffers smaller",
+            interner.resolve(entry)
+        ));
+    }
+
     let ptx = emit_ptx(program, entry, interner)?;
     let ret = entry_fn.ret.clone();
 
@@ -189,7 +239,42 @@ pub fn jit_run_single(
             crate::baselines::cuda_driver_lib_name()
         )
     })?;
-    run_on_device(g, &ptx, &ret)
+    // The check above covers the *entry*'s frame, which is the only one it can attribute to a launch
+    // without a call-graph walk. A **callee** frame is charged to the same per-thread budget along
+    // the call path, so it can still reach the driver; annotate rather than decline there, because a
+    // decline on a function this launch may never enter would be a false coverage loss.
+    run_on_device(g, &ptx, &ret).map_err(|e| annotate_local_frames(e, program, interner))
+}
+
+/// Append the per-thread `.local` frame diagnosis to a device error when some function in the module
+/// is over [`MAX_LOCAL_FRAME_BYTES`], so an over-budget **callee** frame is legible instead of a bare
+/// driver code. Returns `e` unchanged otherwise — this never reclassifies an error, so a genuine
+/// fault stays a fault for the corpus gate.
+///
+/// Only the two errors a frame can *explain* are annotated, and that narrowness is load-bearing:
+/// `decode_ctx` returns the deterministic program-level errors (`"assertion failed"`, the print-buffer
+/// overflow) through this same `map_err`, and `run_corpus_matches_interp_oracle` compares
+/// `"assertion failed"` by **equality** against the interpreter's. Appending a note to that string
+/// would turn an agreeing pair into a reported fault.
+fn annotate_local_frames(e: String, program: &Program, interner: &Interner) -> String {
+    if !e.starts_with("gpu-native launch failed") && !e.starts_with("gpu-native JIT/load failed") {
+        return e;
+    }
+    let over: Vec<String> = program
+        .funcs
+        .iter()
+        .map(|f| (f.name, local_frame_bytes(f)))
+        .filter(|(_, bytes)| *bytes > MAX_LOCAL_FRAME_BYTES)
+        .map(|(name, bytes)| format!("`{}` ({bytes} bytes)", interner.resolve(name)))
+        .collect();
+    if over.is_empty() {
+        return e;
+    }
+    format!(
+        "{e}\n  (per-thread `.local` frames over the {MAX_LOCAL_FRAME_BYTES}-byte \
+         budget: {}; CUDA caps local memory at {MAX_LOCAL_MEM_PER_THREAD} bytes per thread)",
+        over.join(", ")
+    )
 }
 
 /// Emit the full PTX module for `program` with `entry` as the launched kernel. Public so tests and
@@ -4656,7 +4741,18 @@ pub(crate) fn decode_ctx(out: &[u64]) -> Result<(i64, Vec<u8>), String> {
 
 /// Total bytes of `func`'s alloca frame (mirrors `FnEmit::assign_frame`'s slot sizing) — the size of
 /// the shared `.global` frame buffer the megakernel launcher allocates + zeroes for the whole block.
+///
+/// Same computation as [`local_frame_bytes`], which is what the *single-thread* path allocates as a
+/// per-thread `.local __frame`; the two names exist because the two paths put those bytes in
+/// different address windows, and only one of them has a cap ([`MAX_LOCAL_FRAME_BYTES`]).
 pub fn mega_frame_bytes(func: &Function) -> u64 {
+    local_frame_bytes(func)
+}
+
+/// Bytes of `func`'s `AddrSpace::Local` alloca frame — the size of the `.local __frame` the
+/// single-thread lowering emits for it. Mirrors `FnEmit::assign_frame`'s slot sizing (each alloca
+/// rounded up to 8 bytes, in first-seen order).
+pub fn local_frame_bytes(func: &Function) -> u64 {
     let mut off = 0u64;
     for b in &func.blocks {
         for inst in &b.insts {
@@ -4875,6 +4971,120 @@ pub(crate) mod hostvec {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// **A per-thread `.local` frame past the CUDA cap must be a decline, not a driver code.**
+    ///
+    /// A program with no `wukong_parallel_for` and no recognized kernel is not megakernel-eligible
+    /// (`fusion::analyze` -> "no recognized cooperative op"), so `jit_run` falls through to
+    /// [`jit_run_single`], whose frame is a per-thread `.local __frame`. PTX and the module load
+    /// both succeed at any size; the **launch** is what the driver rejects, and it rejects it with a
+    /// bare `DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")` that reads as a crash rather
+    /// than as coverage this backend honestly lacks. `bench/lang/README.md` had to carry a paragraph
+    /// of prose warning fixture authors away from the shape for exactly this reason.
+    ///
+    /// The fixture is one `[f32; 262144]` local = 1 MiB of frame, twice the cap. It is deliberately
+    /// **not** in `tests/run` — the corpus gates would then have to launch it — and it is checked
+    /// through `jit_run_single` rather than `jit_run` so the assertion is about the single-thread
+    /// path and not about whichever way `fusion::analyze` happens to classify it.
+    ///
+    /// This test needs **no device**: the whole point of the fix is that the decline happens before
+    /// anything is asked of the driver, so a box with no GPU at all reaches the same `UNSUPPORTED:`.
+    /// Before the fix it fails on both kinds of box, with the launch error here and with
+    /// "requires a CUDA device" where there is none.
+    #[test]
+    fn oversized_local_frame_declines_before_the_launch() {
+        let src = "module gate
+
+@generic
+fn main() -> i32 {
+    let mut a: [f32; 262144] = [0.0; 262144];
+    a[0] = 1.0;
+    print(a[262143] as i32);
+    return 0;
+}
+";
+        let (program, mut interner) = hostvec::build(src, 2).expect("fixture builds");
+        let entry = interner.intern("main");
+        let err = jit_run_single(&program, entry, &interner)
+            .expect_err("a 1 MiB per-thread .local frame cannot be launched");
+        assert!(
+            err.starts_with(UNSUPPORTED),
+            "an unlaunchable frame must be an honest decline, got: {err}"
+        );
+        assert!(
+            err.contains("1048576"),
+            "the decline must name the frame size in bytes, got: {err}"
+        );
+    }
+
+    /// **The callee-frame residual is annotated, and annotated narrowly.**
+    ///
+    /// `jit_run_single` can only decline the *entry*'s frame — a callee's is charged to the same
+    /// per-thread budget along the call path, but attributing it to one launch needs a call-graph
+    /// walk, and declining a function this launch may never enter would be a false coverage loss. So
+    /// that case stays an error and [`annotate_local_frames`] makes it legible instead of leaving a
+    /// bare driver code.
+    ///
+    /// The second half of this test is the load-bearing one. `decode_ctx` returns the deterministic
+    /// program-level errors through the same `map_err`, and `run_corpus_matches_interp_oracle`
+    /// compares `"assertion failed"` by **equality** against the interpreter's — so an annotation
+    /// appended there would turn an agreeing pair into a reported device fault. Device-free.
+    #[test]
+    fn a_callee_frame_annotates_only_the_errors_it_explains() {
+        let src = "module gate
+
+fn big() -> f32 {
+    let mut a: [f32; 262144] = [0.0; 262144];
+    a[0] = 1.0;
+    return a[262143];
+}
+
+fn main() -> i32 {
+    print(big() as i32);
+    return 0;
+}
+";
+        // `-O0` on purpose: at `-O2` the inliner folds `big` into `main` and the frame under test
+        // moves to the entry, where the pre-launch decline — not this annotation — is what fires.
+        let (program, mut interner) = hostvec::build(src, 0).expect("fixture builds");
+        let entry = interner.intern("main");
+        // The entry itself is tiny, so the pre-launch decline does not fire and the error path is
+        // the one under test.
+        assert!(
+            local_frame_bytes(program.function(entry).unwrap()) <= MAX_LOCAL_FRAME_BYTES,
+            "the entry must be under budget for this to exercise the callee path"
+        );
+
+        let launch =
+            "gpu-native launch failed: DriverError(CUDA_ERROR_INVALID_VALUE, \"invalid argument\")"
+                .to_string();
+        let annotated = annotate_local_frames(launch.clone(), &program, &interner);
+        assert!(
+            annotated.starts_with(&launch),
+            "the original error must survive verbatim at the front: {annotated}"
+        );
+        let big = interner.intern("big");
+        let big_frame = local_frame_bytes(program.function(big).expect("callee `big`"));
+        assert!(
+            big_frame > MAX_LOCAL_FRAME_BYTES,
+            "the callee must be over budget: {big_frame}"
+        );
+        assert!(
+            annotated.contains("`big`") && annotated.contains(&big_frame.to_string()),
+            "the annotation must name the over-budget function and its frame: {annotated}"
+        );
+
+        for untouched in [
+            "assertion failed",
+            "gpu-native print buffer overflow: 9 records",
+        ] {
+            assert_eq!(
+                annotate_local_frames(untouched.to_string(), &program, &interner),
+                untouched,
+                "a frame note on this error would break the corpus gate's comparison"
+            );
+        }
+    }
 
     /// `ptx_vmath_lowp` builds the bf16/f16 activation kernels by slicing `PTX_VMATH` between two
     /// literal markers. That is a self-referential invariant of this file: renaming `VM_ST:` or

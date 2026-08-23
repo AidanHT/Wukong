@@ -100,6 +100,43 @@ pub const GRID_BARRIER_BYTES: usize = 8;
 /// measurement for a grid the caller did not ask for.
 pub const GRID_ENV: &str = "WUKONG_MEGA_GRID";
 
+/// **The knob that makes a megakernel decline legible: `WUKONG_GPU_EXPLAIN=1`.**
+///
+/// [`crate::fusion::MegaPlan`] has always carried a human-readable `reason` "for honest reporting",
+/// and until this knob existed the only thing that ever printed it was [`decline`] under
+/// `WUKONG_GPU_DUMP_PTX` — a switch documented as, and used as, a *PTX dumper*, which buries the one
+/// line that matters under the whole module. So in practice a gpu-native run that quietly ran on one
+/// device thread instead of the block-cooperative megakernel said nothing at all, which is the
+/// campaign's signature failure (D10) and precisely what `LANGUAGE_DIRECTION` Task 1.2's "decline to
+/// serial **and diagnostic**" asks for.
+///
+/// **Why env-gated and not always-on.** Declining to the single-thread path is the *common* case and
+/// it is not an error: that path is the correctness reference every megakernel run is checked
+/// against, so the program still produces the right answer. Only a minority of `tests/run` configs
+/// are megakernel-eligible, so an unconditional note would write a line to stderr on the majority of
+/// gpu-native runs — a change to the behaviour of the *successful* path, on a backend whose corpus
+/// gates sweep every fixture twice. The knob is also the shape this backend already uses for
+/// exactly this question (`WUKONG_GPU_NO_MEGA`, [`GRID_ENV`], `WUKONG_GPU_DUMP_PTX`). A *failure*,
+/// by contrast, is always loud: the frame-cap decline is an `UNSUPPORTED:` error, not a note.
+pub const EXPLAIN_ENV: &str = "WUKONG_GPU_EXPLAIN";
+
+/// The decline text for an ineligible plan — [`try_run`]'s one composition of
+/// [`crate::fusion::MegaPlan::reason`]. Named rather than inlined so the law test can pin the exact
+/// string a real run prints, instead of re-deriving a plausible one beside it.
+pub fn ineligible_why(plan: &crate::fusion::MegaPlan) -> String {
+    format!("ineligible: {}", plan.reason)
+}
+
+/// The one-line note [`decline`] prints, rendered from the decline reason. Split out from the
+/// `eprintln!` so a device-free law can assert that the reason actually reaches the text and that
+/// the text names the fallback — the two properties that make the note worth having.
+pub fn decline_note(why: &str) -> String {
+    format!(
+        "gpu-mega: declined ({why}) -- falling back to the single-thread gpu-native lowering \
+         (one device thread; correct, and the reference the megakernel is checked against)"
+    )
+}
+
 /// **The grid-wide barrier, as PTX.** A `.func` spliced into a mega module (no header of its own —
 /// the module already carries `ptx_target::HDR_SM80`, and every instruction here is Ampere-legal).
 ///
@@ -383,8 +420,11 @@ fn env_grid() -> Result<Option<u32>, String> {
 /// eligibility separately. Coverage is the headline for this phase, so a coverage loss must be
 /// *legible*, not merely harmless.
 fn decline(why: impl std::fmt::Display) -> Result<Option<(i64, Vec<u8>)>, String> {
-    if std::env::var_os("WUKONG_GPU_DUMP_PTX").is_some() {
-        eprintln!("gpu-mega: declined ({why})");
+    // [`EXPLAIN_ENV`] is the documented knob; `WUKONG_GPU_DUMP_PTX` keeps working because it was the
+    // only route before and the PTX dump is useless without the reason beside it.
+    if std::env::var_os(EXPLAIN_ENV).is_some() || std::env::var_os("WUKONG_GPU_DUMP_PTX").is_some()
+    {
+        eprintln!("{}", decline_note(&why.to_string()));
     }
     Ok(None)
 }
@@ -406,7 +446,7 @@ pub fn try_run(
     let plan = crate::fusion::analyze(program, entry, interner);
     if !plan.eligible {
         // `MegaPlan` already carries a human-readable reason; surface it instead of dropping it.
-        return decline(format_args!("ineligible: {}", plan.reason));
+        return decline(ineligible_why(&plan));
     }
     let Some(entry_fn) = program.function(entry) else {
         return decline(format_args!(
@@ -816,6 +856,100 @@ pub(crate) mod tests {
         let gl: Vec<&str> = gs.lines().collect();
         let cl: Vec<&str> = cs.lines().collect();
         gl.len() == cl.len() && gl.iter().zip(&cl).all(|(a, b)| line_matches(a, b))
+    }
+
+    /// **The megakernel decline reason must reach a user** (campaign D10, `LANGUAGE_DIRECTION`
+    /// Task 1.2's "decline to serial **and** diagnostic").
+    ///
+    /// `fusion::MegaPlan` has carried `reason` "for honest reporting" since it was written, and the
+    /// only thing that ever rendered it was [`decline`] under `WUKONG_GPU_DUMP_PTX` — a PTX dumper,
+    /// which buries the one line that matters under the whole module. This pins the two halves that
+    /// make [`EXPLAIN_ENV`] worth having, over three *different* decline shapes so it cannot pass on
+    /// one hardcoded string: every ineligible plan carries a non-empty reason, and the text a real
+    /// run prints — [`decline_note`] of [`ineligible_why`], the same two calls `try_run` makes —
+    /// contains that reason verbatim and names the fallback.
+    ///
+    /// Device-free: nothing here launches anything.
+    #[test]
+    fn the_megakernel_decline_reason_reaches_the_note() {
+        // Three distinct arms of `fusion::analyze`: no recognized op, data-dependent control flow,
+        // and a call the classifier does not know.
+        let sources = [
+            (
+                "no recognized cooperative op",
+                r#"module t
+fn main() -> i32 {
+    let mut s: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 10 { s = s + i; i = i + 1; }
+    print(s);
+    return 0;
+}
+"#,
+            ),
+            (
+                "data-dependent",
+                r#"module t
+fn main() -> i32 {
+    let mut a: [f32; 8] = [0.0; 8];
+    let mut i: i32 = 0;
+    while i < 8 { a[i] = (i as f32) * 1.5; i = i + 1; }
+    if a[3] > 1.0 { print(1); } else { print(2); }
+    return 0;
+}
+"#,
+            ),
+            (
+                "wukong_rt_alloc",
+                r#"module t
+fn main() -> i32 {
+    let mut h: []f32 = alloc_f32(4i64);
+    h[0] = 1.5;
+    print(h[0] as i32);
+    free(h);
+    return 0;
+}
+"#,
+            ),
+        ];
+
+        for (expected_fragment, src) in sources {
+            let Some((program, mut interner)) = build(src, 2) else {
+                panic!("fixture builds: {src}");
+            };
+            let entry = interner.intern("main");
+            let plan = crate::fusion::analyze(&program, entry, &interner);
+            assert!(
+                !plan.eligible,
+                "fixture must be ineligible for the note to exist: {src}"
+            );
+            assert!(
+                !plan.reason.is_empty(),
+                "an ineligible plan with an empty reason is a silent decline: {src}"
+            );
+            assert!(
+                plan.reason.contains(expected_fragment),
+                "reason {:?} no longer names {expected_fragment:?} — the arms this law covers \
+                 have moved, so re-pick them rather than relaxing the assertion",
+                plan.reason
+            );
+
+            let note = decline_note(&ineligible_why(&plan));
+            assert!(
+                note.contains(&plan.reason),
+                "the note dropped the reason: note {note:?}, reason {:?}",
+                plan.reason
+            );
+            assert!(
+                note.contains("single-thread"),
+                "the note must say what the fallback is, got: {note}"
+            );
+            assert!(note.is_ascii(), "the note must stay ASCII: {note}");
+        }
+
+        // The knob is part of the contract — it is documented in `docs/roadmap.md` and
+        // `docs/internals.md`, and a rename that only moved the constant would leave both lying.
+        assert_eq!(EXPLAIN_ENV, "WUKONG_GPU_EXPLAIN");
     }
 
     /// The **coverage ratchet** for `mega_corpus_matches_oracle`: how many `tests/run`

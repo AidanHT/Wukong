@@ -945,6 +945,26 @@ one block of `MEGA_BLOCK` (256) threads, with the alloca frame in one shared `.g
 effects `tid == 0`-guarded. `WUKONG_GPU_NO_MEGA=1` forces the single-thread path for A/B timing and
 debugging.
 
+**Both of this backend's declines are legible, and they are legible in different shapes because they
+are different things.** A megakernel decline is not an error — the single-thread path is the
+correctness reference every megakernel run is compared against — so it is a note, printed only when
+asked for: `WUKONG_GPU_EXPLAIN=1` (or the older `WUKONG_GPU_DUMP_PTX`) makes `megakernel::decline`
+print one line naming `fusion::MegaPlan`'s reason and the fallback. Making it unconditional would
+change the behaviour of the *successful* path on the majority of gpu-native runs, since only a
+minority of corpus configs are eligible. An **unlaunchable frame** is the opposite: the single-thread
+lowering homes the entry's allocas in a per-thread `.local __frame`, and CUDA caps local memory at
+512 KiB per thread — a documented ISA constant (CUDA C Programming Guide, *Technical Specifications
+per Compute Capability*), not a `CU_DEVICE_ATTRIBUTE_*`, so unlike SM count, L2 or the opt-in SMEM
+budget it cannot be probed into `GpuTarget`. `ptxas` compiles a larger frame and the module loads;
+only the launch fails, and it fails with a bare `CUDA_ERROR_INVALID_VALUE`. `jit_run_single`
+therefore checks the entry frame against `lower::MAX_LOCAL_FRAME_BYTES` and returns `UNSUPPORTED:`
+before touching the driver. The check sits at the **run** seam and not in `emit_ptx` on purpose: the
+lowering is correct, it is the launch that is impossible, and moving it into the emitter would make
+the device-free coverage sweeps stop measuring what this backend can lower. A callee's frame is
+charged to the same per-thread budget but is not attributable to one launch without a call-graph
+walk, so `annotate_local_frames` appends the diagnosis to the device error there rather than
+declining — it never reclassifies, so a genuine fault stays a fault for the corpus gate.
+
 Two things the backend used to leave on the floor now reach the device. **Vectorized MIR** is lowered
 by scalarizing each `<N x T>` value into one register per lane — `Splat` aliases a scalar across the
 lanes, `Iota` materializes lane *k* as the constant *k*, `ExtractLane` copies one lane register back
