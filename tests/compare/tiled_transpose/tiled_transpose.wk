@@ -1,0 +1,63 @@
+// Comparison line counts: Wukong=63, C=41, CUDA=58.
+// Physical lines include comments and blanks; update all peer headers together.
+// MIR witness: at -O2 the only `wukong_` symbol is `wukong_parallel_for` (the `@parallel`
+// outliner). No kernel dispatch, and in particular no `wukong_transpose_f32`. Census in README.md.
+module tests.compare.tiled_transpose
+
+// Tiled transpose of a row-major 8x8 f32 matrix, composed from the whole Phase 2 surface: a
+// `shared` staging tile, `sync_block()` fencing it, and `@tile(2)` strip-mining each intra-tile row
+// loop -- the direct analogue of CUDA's BLOCK_ROWS. `@generic` keeps the transpose recognizer off;
+// both matrices are `main` locals because gpu-native declines heap allocation.
+//
+// The tile is declared once at function scope, where CUDA declares `__shared__`, so it is a REUSED
+// buffer and the tile loop is fenced at BOTH ends -- see README.md, "Why two barriers".
+const N: i32 = 8;
+const T: i32 = 4;
+
+@generic
+@parallel
+fn tiled_transpose(a: [f32; N * N], mut b: [f32; N * N]) {
+    let mut tile: shared [f32; T * T];
+    for it in 0..N / T {
+        for jt in 0..N / T {
+            let io: i32 = it * T;
+            let jo: i32 = jt * T;
+
+            // Row-major reads of a's tile; the stride-N turn happens inside the tile, where it is free.
+            @tile(2)
+            for i in 0..T {
+                for j in 0..T {
+                    tile[i * T + j] = a[(io + i) * N + (jo + j)];
+                }
+            }
+            sync_block();
+
+            // Row-major writes of b's tile: consecutive `j` writes consecutive elements of `b`.
+            @tile(2)
+            for i in 0..T {
+                for j in 0..T {
+                    b[(jo + i) * N + (io + j)] = tile[j * T + i];
+                }
+            }
+            sync_block();
+        }
+    }
+}
+
+@generic
+fn main() -> i32 {
+    let mut a: [f32; N * N] = [0.0; N * N];
+    for i in 0..N * N {
+        a[i] = (i + 1) as f32;
+    }
+    let mut b: [f32; N * N] = [0.0; N * N];
+    tiled_transpose(a, b);
+
+    // Every one of the 64 lanes, from the scalar semantics b[r * 8 + c] = a[c * 8 + r] with
+    // a[k] = k + 1: the printed value at index r * 8 + c is c * 8 + r + 1, so the sequence runs
+    // 1, 9, 17, 25, 33, 41, 49, 57, then 2, 10, 18, ..., and ends 8, 16, 24, 32, 40, 48, 56, 64.
+    for i in 0..N * N {
+        print(b[i] as i32);
+    }
+    return 0;
+}

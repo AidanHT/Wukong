@@ -1,0 +1,25 @@
+// EXPECT-CODE: E0502
+module tests.fail.transpose_wrong_shape
+
+/// The safety mutant for `tests/compare/tiled_transpose/` (master plan §7.1, T4): the output buffer
+/// of a transpose is allocated with the INPUT's shape, `Tensor[f32, 8, 4]`, instead of the
+/// transposed `Tensor[f32, 4, 8]`.
+///
+/// This is the mutant a shape checker has to catch and a length check cannot: both spellings hold
+/// exactly 32 elements, so nothing overruns and no sanitizer fires. The C peer
+/// `tests/compare/tiled_transpose/wrong_shape.c` compiles it clean at `-O3 -march=native -Wall
+/// -Wextra` and runs to completion, silently writing the 4x8 result into a buffer the rest of the
+/// program reads as 8x4.
+///
+/// Here it is two compile errors, one per disagreeing axis, both naming the dimension:
+///
+///     error[E0502]: dimension mismatch on `N` (axis 0): expected 4, found 8
+///     error[E0502]: dimension mismatch on `M` (axis 1): expected 8, found 4
+fn transpose<M, N>(a: Tensor[f32, M, N], b: Tensor[f32, N, M]) {}
+
+fn main() -> i32 {
+    let a: Tensor[f32, 8, 4];
+    let b: Tensor[f32, 8, 4];
+    transpose::<8, 4>(a, b);
+    return 0;
+}
