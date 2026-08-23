@@ -352,7 +352,7 @@ fn bench_fixture(fx: &Fixture, cc: &str, dir: &Path) -> SotaRow {
         .iter()
         .find(|c| c.label == "Wukong")
         .map(|c| c.census.clone())
-        .unwrap_or_else(|| "did not compile".into());
+        .unwrap_or_else(|| crate::sota::CENSUS_DID_NOT_COMPILE.into());
     println!();
     println!("  census (Wukong twin, must be NOTHING for the row to be admissible): {census}");
     let mut oracle_ok = true;

@@ -36,6 +36,13 @@ pub(crate) struct FloorRow {
     pub(crate) wave: String,
 }
 
+/// The census a sweep reports when its Wukong column never built.
+///
+/// Shared rather than spelled twice, because the gate branches on it: a census is a description of a
+/// lowering that happened, and this is the one string that says none did. A sweep that invents its
+/// own wording here would land in the off-bar arm and pass.
+pub(crate) const CENSUS_DID_NOT_COMPILE: &str = "did not compile";
+
 /// The bar a tier names. `waived` rows carry an owner line naming the master plan §3.4 non-goal
 /// that covers them and have no numeric bar.
 fn tier_bar(tier: &str) -> Result<Option<f64>, String> {
@@ -322,7 +329,21 @@ pub(crate) fn evaluate(floors: &[FloorRow], sweep: &[SotaRow]) -> (Vec<String>, 
     // failure (it is how a new program enters the file), but it must be impossible to miss.
     for s in sweep {
         if !floors.iter().any(|f| f.program == s.program) {
-            if s.census.starts_with("NOTHING") {
+            if s.census == CENSUS_DID_NOT_COMPILE {
+                // Not "context". The census is only a *description* of a lowering that happened,
+                // and this one did not: the Wukong column never built. Falling through to the
+                // off-bar arm below would announce a broken benchmark as a recognizer-dialect row
+                // and leave the gate green, which is the same shape of silence as a program leaving
+                // the sweep — the failure this gate exists for.
+                fail(
+                    &mut lines,
+                    format!(
+                        "{}: the Wukong column did not compile, so there is no lowering to describe \
+                         — a benchmark that stopped building is a failure, not context",
+                        s.program
+                    ),
+                );
+            } else if s.census.starts_with("NOTHING") {
                 lines.push(format!(
                     "  NEW  {}: no floor recorded — measure under §4 and add its row to \
                      bench/sota/FLOOR.md",
@@ -659,5 +680,29 @@ mod tests {
 | general/s6_scan:Wukong(gen) | C | PARITY | 1.20x | d | AC+full | t | — | — | — |\n";
         let err = parse_floor(text).unwrap_err();
         assert!(err.contains("appears twice"), "{err}");
+    }
+
+    /// A Wukong column that never built is a failure, not "context".
+    ///
+    /// The sweep row still exists and still carries a census string, so it reached the unfloored-row
+    /// arm and was announced as a recognizer-dialect row with the gate green. The other row here is
+    /// healthy and floored, so the gate would otherwise pass — the failure has to come from `p`.
+    #[test]
+    fn a_column_that_did_not_compile_fails_rather_than_reading_as_context() {
+        let mut bad = row("p");
+        bad.census = CENSUS_DID_NOT_COMPILE.to_string();
+        let (lines, failed) = evaluate(&[floor("q", 1.00)], &[row("q"), bad]);
+        assert!(
+            failed,
+            "a column that never built passed the gate: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("did not compile")),
+            "the failure must say what happened: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("off-bar")),
+            "a column that never built was described as context: {lines:?}"
+        );
     }
 }

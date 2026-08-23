@@ -1402,8 +1402,12 @@ fn sota_rows<F>(
 
 /// Entry point: every program in the general-code suite, in priority order.
 ///
-/// The pin is taken ONCE here and released when this returns, so all three programs are measured on
-/// the same core and nothing after this function is left pinned — see [`crate::pin_for_section`].
+/// The pin taken here NESTS inside the harness-wide one `main` now holds; it is no longer the only
+/// one, and the two do not fight. `set_thread_affinity` returns the previous mask, so this guard
+/// restores the outer pin rather than releasing the thread to the scheduler — which is what keeps
+/// all three programs on the same core and leaves nothing unpinned behind it. Kept rather than
+/// deleted because it is what makes this function correct when called directly, as the tests do.
+/// See [`crate::pin_for_section`].
 pub(crate) fn bench_general(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     bench_ablation();
     println!();
