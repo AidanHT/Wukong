@@ -1,0 +1,50 @@
+// DO NOT RUN THIS ON --backend=gpu-native. It wedges the GPU.
+//
+// Committed evidence for the defect this fixture found, in the wrong_k.c tradition: a program that
+// is committed precisely because of what it does, and is not run by any harness. `tests/compare/`
+// is not scanned by the `tests/run` or `tests/fail` collectors, and `run_cpu.ps1` runs only the
+// fixture stem on the native backend, so nothing in the repository executes this file.
+//
+// DEFECT. An array declared INSIDE a loop whose body also calls `sync_block()` lowers to PTX that
+// never retires. The kernel spins (nvidia-smi shows 100% utilization, idle is 0%), the host blocks
+// in `stream.synchronize()`, and there is no timeout: `megakernel.rs` synchronizes directly instead
+// of going through `gpu::launch_timeout()`'s polling drain, so `WUKONG_GPU_LAUNCH_TIMEOUT_MS` --
+// the watchdog written for exactly this failure -- never fires on this path. It is not an
+// `UNSUPPORTED:` decline, which is what T7 requires of anything gpu-native cannot lower.
+//
+//   ./wukongc --run --backend=gpu-native tests/compare/tiled_transpose/shared_in_loop_hang.wk
+//     -> no output, no exit, GPU at 100%, killed at 35s
+//   ./wukongc --run tests/compare/tiled_transpose/shared_in_loop_hang.wk
+//     -> 2 1 4 3, correct, on interp and on --backend=native, at every -O level
+//
+// BISECTED. Hoisting `let mut t` above the `for k` loop makes it run and print 2 1 4 3 -- which is
+// why `tiled_transpose.wk` declares its tile at function scope and fences the loop at both ends,
+// the same place CUDA declares `__shared__`. Neither `shared` nor `@tile` nor the optimizer is
+// required: replacing `shared [f32; 2]` with a plain `[f32; 2]` still hangs, and so does -O0.
+// `tests/run/lang_tiled_transpose.wk` declares its tile inside the loop and does NOT hang, so the
+// discriminator is narrower than "declaration in a loop with a barrier" and is still open.
+module tests.compare.tiled_transpose.shared_in_loop_hang
+
+@generic
+@parallel
+fn f(a: [f32; 4], mut b: [f32; 4]) {
+    for k in 0..2 {
+        let mut t: shared [f32; 2];
+        t[0] = a[k * 2];
+        t[1] = a[k * 2 + 1];
+        sync_block();
+        b[k * 2] = t[1];
+        b[k * 2 + 1] = t[0];
+    }
+}
+
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut b: [f32; 4] = [0.0; 4];
+    f(a, b);
+    print(b[0] as i32);
+    print(b[1] as i32);
+    print(b[2] as i32);
+    print(b[3] as i32);
+    return 0;
+}
