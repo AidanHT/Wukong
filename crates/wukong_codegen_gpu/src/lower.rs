@@ -248,9 +248,18 @@ pub fn jit_run_single(
 
 /// Append the per-thread `.local` frame diagnosis to a device error when some function in the module
 /// is over [`MAX_LOCAL_FRAME_BYTES`], so an over-budget **callee** frame is legible instead of a bare
-/// driver code. Returns `e` unchanged when no frame is over budget — this never reclassifies an
-/// error, so a genuine fault stays a fault for the corpus gate.
+/// driver code. Returns `e` unchanged otherwise — this never reclassifies an error, so a genuine
+/// fault stays a fault for the corpus gate.
+///
+/// Only the two errors a frame can *explain* are annotated, and that narrowness is load-bearing:
+/// `decode_ctx` returns the deterministic program-level errors (`"assertion failed"`, the print-buffer
+/// overflow) through this same `map_err`, and `run_corpus_matches_interp_oracle` compares
+/// `"assertion failed"` by **equality** against the interpreter's. Appending a note to that string
+/// would turn an agreeing pair into a reported fault.
 fn annotate_local_frames(e: String, program: &Program, interner: &Interner) -> String {
+    if !e.starts_with("gpu-native launch failed") && !e.starts_with("gpu-native JIT/load failed") {
+        return e;
+    }
     let over: Vec<String> = program
         .funcs
         .iter()
@@ -5006,6 +5015,75 @@ fn main() -> i32 {
             err.contains("1048576"),
             "the decline must name the frame size in bytes, got: {err}"
         );
+    }
+
+    /// **The callee-frame residual is annotated, and annotated narrowly.**
+    ///
+    /// `jit_run_single` can only decline the *entry*'s frame — a callee's is charged to the same
+    /// per-thread budget along the call path, but attributing it to one launch needs a call-graph
+    /// walk, and declining a function this launch may never enter would be a false coverage loss. So
+    /// that case stays an error and [`annotate_local_frames`] makes it legible instead of leaving a
+    /// bare driver code.
+    ///
+    /// The second half of this test is the load-bearing one. `decode_ctx` returns the deterministic
+    /// program-level errors through the same `map_err`, and `run_corpus_matches_interp_oracle`
+    /// compares `"assertion failed"` by **equality** against the interpreter's — so an annotation
+    /// appended there would turn an agreeing pair into a reported device fault. Device-free.
+    #[test]
+    fn a_callee_frame_annotates_only_the_errors_it_explains() {
+        let src = "module gate
+
+fn big() -> f32 {
+    let mut a: [f32; 262144] = [0.0; 262144];
+    a[0] = 1.0;
+    return a[262143];
+}
+
+fn main() -> i32 {
+    print(big() as i32);
+    return 0;
+}
+";
+        // `-O0` on purpose: at `-O2` the inliner folds `big` into `main` and the frame under test
+        // moves to the entry, where the pre-launch decline — not this annotation — is what fires.
+        let (program, mut interner) = hostvec::build(src, 0).expect("fixture builds");
+        let entry = interner.intern("main");
+        // The entry itself is tiny, so the pre-launch decline does not fire and the error path is
+        // the one under test.
+        assert!(
+            local_frame_bytes(program.function(entry).unwrap()) <= MAX_LOCAL_FRAME_BYTES,
+            "the entry must be under budget for this to exercise the callee path"
+        );
+
+        let launch =
+            "gpu-native launch failed: DriverError(CUDA_ERROR_INVALID_VALUE, \"invalid argument\")"
+                .to_string();
+        let annotated = annotate_local_frames(launch.clone(), &program, &interner);
+        assert!(
+            annotated.starts_with(&launch),
+            "the original error must survive verbatim at the front: {annotated}"
+        );
+        let big = interner.intern("big");
+        let big_frame = local_frame_bytes(program.function(big).expect("callee `big`"));
+        assert!(
+            big_frame > MAX_LOCAL_FRAME_BYTES,
+            "the callee must be over budget: {big_frame}"
+        );
+        assert!(
+            annotated.contains("`big`") && annotated.contains(&big_frame.to_string()),
+            "the annotation must name the over-budget function and its frame: {annotated}"
+        );
+
+        for untouched in [
+            "assertion failed",
+            "gpu-native print buffer overflow: 9 records",
+        ] {
+            assert_eq!(
+                annotate_local_frames(untouched.to_string(), &program, &interner),
+                untouched,
+                "a frame note on this error would break the corpus gate's comparison"
+            );
+        }
     }
 
     /// `ptx_vmath_lowp` builds the bf16/f16 activation kernels by slicing `PTX_VMATH` between two
