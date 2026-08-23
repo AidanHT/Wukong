@@ -957,13 +957,32 @@ lowering homes the entry's allocas in a per-thread `.local __frame`, and CUDA ca
 per Compute Capability*), not a `CU_DEVICE_ATTRIBUTE_*`, so unlike SM count, L2 or the opt-in SMEM
 budget it cannot be probed into `GpuTarget`. `ptxas` compiles a larger frame and the module loads;
 only the launch fails, and it fails with a bare `CUDA_ERROR_INVALID_VALUE`. `jit_run_single`
-therefore checks the entry frame against `lower::MAX_LOCAL_FRAME_BYTES` and returns `UNSUPPORTED:`
-before touching the driver. The check sits at the **run** seam and not in `emit_ptx` on purpose: the
-lowering is correct, it is the launch that is impossible, and moving it into the emitter would make
-the device-free coverage sweeps stop measuring what this backend can lower. A callee's frame is
-charged to the same per-thread budget but is not attributable to one launch without a call-graph
-walk, so `annotate_local_frames` appends the diagnosis to the device error there rather than
-declining — it never reclassifies, so a genuine fault stays a fault for the corpus gate.
+therefore checks the **worst call path** against `lower::MAX_LOCAL_FRAME_BYTES` and returns
+`UNSUPPORTED:` before touching the driver. The path is the quantity, not the entry's own frame: CUDA
+charges the budget along the path, so two functions each under budget can be unlaunchable together,
+and that shape is reachable at the CLI's default `-O0` (at `-O2` the inliner folds them into one
+frame and an entry-only test would fire). `worst_call_path_frame` takes the maximum over paths, not
+the sum over reachable functions — two sibling callees are never live at once — and declines to
+answer for a recursive graph, where depth is a run-time property; those programs keep the entry-only
+test. The check sits at the **run** seam and not in `emit_ptx` on purpose: the lowering is correct, it
+is the launch that is impossible, and moving it into the emitter would make the device-free coverage
+sweeps stop measuring what this backend can lower.
+
+The **megakernel is not exempt**, and the earlier text here said it was. The mega *entry*'s allocas
+are homed in the shared `.global` frame buffer, so its size is unbounded by this cap — but
+`translate_mega_callee` gives every callee an ordinary per-thread `.local __frame`, charged exactly
+like the single-thread path. `megakernel::try_run` checks the worst callee path and declines to the
+single-thread lowering, which reports the budget with the full path. Without it a `@parallel` program
+with a large per-iteration local died on a bare `gpu-mega launch failed` — with less diagnosis than
+the single-thread path gives, and reached by following the single-thread decline's own advice.
+
+`annotate_local_frames` covers what no static walk can. It names an over-budget function only if the
+launch can reach it (a never-called one used to explain unrelated faults with its size), and when
+nothing is statically over budget it still explains a `CUDA_ERROR_INVALID_VALUE`: `ptxas` charges
+register **spills** to the same per-thread cap, measured here at 1,280–1,480 bytes for an entry with
+256 live accumulators, against a 1,024-byte reserve. That stays an annotation and never a decline —
+the program may be a few hundred bytes from running — and it never reclassifies, so a genuine fault
+stays a fault for the corpus gate.
 
 Two things the backend used to leave on the floor now reach the device. **Vectorized MIR** is lowered
 by scalarizing each `<N x T>` value into one register per lane — `Splat` aliases a scalar across the

@@ -120,6 +120,23 @@ pub const GRID_ENV: &str = "WUKONG_MEGA_GRID";
 /// by contrast, is always loud: the frame-cap decline is an `UNSUPPORTED:` error, not a note.
 pub const EXPLAIN_ENV: &str = "WUKONG_GPU_EXPLAIN";
 
+/// Is the documented decline-explanation knob on?
+///
+/// Presence alone used to mean on, so `WUKONG_GPU_EXPLAIN=0` turned the notes ON -- the one spelling
+/// a user reaches for to turn something off. That is tolerable in a debug-only knob nobody writes a
+/// value into; `EXPLAIN_ENV` is neither, it is the user-facing surface W2b added and documented in
+/// prose, so it reads its value. Empty, `0`, `false`, `no` and `off` are off (any case); anything
+/// else, including a bare `=1`, is on.
+pub fn explain_enabled() -> bool {
+    match std::env::var(EXPLAIN_ENV) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// The decline text for an ineligible plan — [`try_run`]'s one composition of
 /// [`crate::fusion::MegaPlan::reason`]. Named rather than inlined so the law test can pin the exact
 /// string a real run prints, instead of re-deriving a plausible one beside it.
@@ -422,8 +439,7 @@ fn env_grid() -> Result<Option<u32>, String> {
 fn decline(why: impl std::fmt::Display) -> Result<Option<(i64, Vec<u8>)>, String> {
     // [`EXPLAIN_ENV`] is the documented knob; `WUKONG_GPU_DUMP_PTX` keeps working because it was the
     // only route before and the PTX dump is useless without the reason beside it.
-    if std::env::var_os(EXPLAIN_ENV).is_some() || std::env::var_os("WUKONG_GPU_DUMP_PTX").is_some()
-    {
+    if explain_enabled() || std::env::var_os("WUKONG_GPU_DUMP_PTX").is_some() {
         eprintln!("{}", decline_note(&why.to_string()));
     }
     Ok(None)
@@ -455,6 +471,25 @@ pub fn try_run(
         ));
     };
     let frame_bytes = lower::mega_frame_bytes(entry_fn);
+
+    // The entry's frame is homed in the shared `.global` buffer, so its size is not the question --
+    // but every mega CALLEE gets a per-thread `.local __frame` and is charged the same 512 KiB cap.
+    // That was unchecked and undiagnosed: `@parallel` with a large per-iteration local died on a bare
+    // `gpu-mega launch failed: DriverError(CUDA_ERROR_INVALID_VALUE)`, which is strictly less
+    // diagnosis than the single-thread path gives -- and the single-thread decline's own advice
+    // ("give it a `@parallel` loop") routes users here. Declining hands the program to the
+    // single-thread path, which reports the same budget with the full call-path explanation.
+    if let Some((bytes, path)) = lower::mega_callee_frame_bytes(program, entry) {
+        if bytes > lower::MAX_LOCAL_FRAME_BYTES {
+            let names: Vec<&str> = path.iter().map(|s| interner.resolve(*s)).collect();
+            return decline(format_args!(
+                "megakernel callee path {} needs {bytes} bytes of per-thread `.local` frame, over \
+                 the {}-byte budget; the entry's frame is global but a callee's is not",
+                names.join(" -> "),
+                lower::MAX_LOCAL_FRAME_BYTES
+            ));
+        }
+    }
 
     let ptx = match lower::emit_mega_ptx(program, entry, interner) {
         Ok(p) => p,
