@@ -7,6 +7,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Correctness — `@parallel`'s two vehicles, and the one that proves nothing
 
+- **Gate added: a `Tensor` local that runs.** No program in `tests/run` used one — the nine
+  uninitialized `Tensor` locals in the corpus are all in compile-fail fixtures that never reach a
+  backend — so the declare-then-assign form had no coverage at all.
+  `tests/run/tensor_local_assign.wk` prints every lane on both backends at every `-O`. Found while
+  scoping the neighbouring hazard: **reading** such a local before anything is assigned to it is
+  accepted and then does three different things (interp `-O0` `expected a pointer`, interp `-O2`
+  prints a value, native SIGSEGV at every `-O`) because a view local's slot holds a base pointer and
+  nothing ever stored one. Null-initializing it is ruled out — interpreter address 0 is a valid
+  address — and the real fix is a definite-assignment rule, which is Phase 7 language work. Recorded
+  under **Known limitations / sharp edges** with the reproducer and the measured table.
+
 - **Fixed: a mid-function `@parallel` region no longer assumes two array *parameters* are two
   buffers.** `match_parallel_region` proved per-iteration disjointness once per **written** array and
   treated distinct captured symbols as distinct storage — a fact for two locals (distinct `alloca`s),

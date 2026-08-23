@@ -1,0 +1,40 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 21
+// EXPECT-OUT: 32
+// EXPECT-OUT: 43
+module tests.run.tensor_local_assign
+
+// A `Tensor[T, ...]` local is a VIEW: its slot holds a base pointer, not storage. Declaring one
+// without an initializer and assigning it later is legal and is the only shape of `Tensor` local the
+// corpus runs — `tests/fail/{matmul_dim,rank,wrong_k,wrong_m}.wk` declare uninitialized tensors too,
+// but only to give the shape checker something to reject, so they never reach a backend. Nothing
+// pinned the RUNNING form until this fixture, which is why the hazard below went unseen.
+//
+// Every lane is printed, and the expected values are the scalar meaning of the writes, not a
+// recording: src[i] = i*11 + 10 truncated to i32 gives 10, 21, 32, 43.
+//
+// HAZARD, deliberately not exercised here: READING such a local before anything is assigned to it
+// loads an undefined pointer. There is no definite-assignment rule in the language, so
+// `let y: Tensor[f32, 4]; y[0] = 1.0;` is accepted and then does three different things — interp
+// `-O0` fails with `expected a pointer`, interp `-O2` prints 1, and native segfaults at every `-O`.
+// See "Known limitations / sharp edges" in `docs/roadmap.md`.
+
+fn view(x: Tensor[f32, 4]) -> Tensor[f32, 4] {
+    return x;
+}
+
+fn main() -> i32 {
+    let mut src: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        src[i] = (i as f32) * 11.0 + 10.0;
+    }
+
+    let y: Tensor[f32, 4];
+    y = view(src);
+    for i in 0..4 {
+        print(y[i] as i32);
+    }
+    return 0;
+}
