@@ -28817,7 +28817,8 @@ fn main() -> i32 {
         assert_eq!(
             count_parallel_for(&prog, &interner),
             0,
-            "a gather whose index cannot carry the digit must not be outlined when its source              buffer may be the destination"
+            "a gather whose index cannot carry the digit must not be outlined when its 
+             source buffer may be the destination"
         );
     }
 
@@ -28850,7 +28851,8 @@ fn main() -> i32 {
         assert_eq!(
             count_parallel_for(&prog, &interner),
             1,
-            "every index carries the digit under one signature, so the aliasing is harmless and              the region must still outline"
+            "every index carries the digit under one signature, so the aliasing is harmless 
+             and the region must still outline"
         );
     }
 
