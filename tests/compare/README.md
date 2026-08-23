@@ -10,8 +10,10 @@ explicitly.
 
 ## Recognition-off runs
 
-The Wukong fixtures mark their kernel functions `@generic`. Once the recognition
-controls land, either spelling below must leave the source loop generic:
+The Wukong fixtures mark their kernel functions `@generic`. **The recognition
+controls have since landed** (Phase 0 tasks 0.2 and 0.3), so `@generic` on the
+function is the per-fixture opt-out and either spelling below is the
+whole-program instrument:
 
 ```powershell
 $env:WUKONG_NO_RECOGNIZE = "1"
@@ -23,10 +25,17 @@ WUKONG_NO_RECOGNIZE=1 cargo run -q -p wukongc -- \
   --run --backend=native -O2 tests/compare/saxpy/saxpy.wk
 ```
 
-Until that implementation merges, inspect `--emit=mir -O2` and report any
-`wukong_*` call honestly. The unknown-op fixture must have no
-`wukong_sgemm`, `wukong_vmath`, `wukong_norm`, `wukong_axpby`, or
-`wukong_velem` call even on today's branch.
+Recognizers are gate-blind, so `--emit=mir -O2` is the only proof that exists
+and every fixture header records its census:
+
+```sh
+cargo run -q -p wukongc -- --emit=mir -O2 <fixture>.wk \
+  | grep -o 'wukong_[a-z0-9_]*' | sort | uniq -c
+```
+
+Measured at the time of writing, `saxpy`, `naive_gemm` and `unknown_op` emit
+**no** `wukong_*` call at all, and the two `tiled_transpose` programs emit only
+`wukong_parallel_for` -- the `@parallel` outliner, not a named kernel.
 
 ## Peer rules
 
@@ -54,11 +63,16 @@ source of truth.
   demonstrates that C accepts a mismatched inner dimension.
 - `unknown_op/`: a small three-point stencil no current named recognizer
   matches.
-- `tiled_transpose/`: Phase 2 placeholder; no implementation is claimed.
+- `tiled_transpose/`: the Phase 2 surface end to end -- `@tile` + `shared` +
+  `sync_block()` -- against the canonical coalesced CUDA `__shared__` transpose
+  and a cache-blocked C peer. `naive_scatter.wk` is the §7.1 baseline,
+  `wrong_shape.c` the safety mutant, and `shared_in_loop_hang.wk` committed
+  evidence of a gpu-native defect the fixture found. Its README carries the
+  census, the line counts and the timing that is still owed.
 
 The shape-mismatched Wukong counterpart belongs in the compile-fail corpus, not
-here. See `tests/fail/wrong_k.wk` when the sibling Phase 0 shape-diagnostic work
-lands.
+here: `tests/fail/wrong_k.wk` for `naive_gemm`, and
+`tests/fail/transpose_wrong_shape.wk` for `tiled_transpose`.
 
 `run_cpu.ps1` builds each C peer with `gcc -O3 -march=native` when available and
 runs the matching Wukong source on the native backend. It prints program output

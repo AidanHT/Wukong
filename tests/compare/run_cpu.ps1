@@ -1,12 +1,12 @@
 param(
-    [ValidateSet("saxpy", "naive_gemm", "unknown_op", "all")]
+    [ValidateSet("saxpy", "naive_gemm", "unknown_op", "tiled_transpose", "all")]
     [string]$Fixture = "all"
 )
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $fixtures = if ($Fixture -eq "all") {
-    @("saxpy", "naive_gemm", "unknown_op")
+    @("saxpy", "naive_gemm", "unknown_op", "tiled_transpose")
 } else {
     @($Fixture)
 }
