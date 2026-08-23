@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0309
+module tests.fail.tile_non_integer_width
+
+// A tile width must be an integer literal. A bareword argument parses fine as an attribute
+// argument, so `@tile(rows)` reached the width reader, was skipped, and left a program that
+// compiled clean with none of the requested tiling.
+@generic
+@tile(rows)
+fn f(mut out: [i32; 8]) {
+    for i in 0..8 {
+        out[i] = i;
+    }
+}
+
+fn main() -> i32 {
+    let mut o: [i32; 8] = [0; 8];
+    f(o);
+    return 0;
+}

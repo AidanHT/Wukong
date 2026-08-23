@@ -1189,7 +1189,7 @@ pub fn lower_program_with(
         .filter_map(|item| match &item.kind {
             ast::ItemKind::Fn(f) => Some((
                 f.name.sym,
-                tile::tile_sizes_from_attrs(&item.attrs, interner),
+                tile::tile_sizes_from_attrs(&item.attrs, interner, &mut diags),
             )),
             _ => None,
         })
@@ -11279,17 +11279,22 @@ impl FnLowerer<'_> {
         body: &Block,
         stmt_attrs: &[ast::Attr],
     ) {
-        if let Some(tile) = self.take_tile_size(stmt_attrs) {
-            if let ForIter::Range {
-                start,
-                end: Some(end),
-                inclusive: false,
-                step: None,
-            } = iter
-            {
-                if self.lower_tiled_range_for(label, pat, start, end, body, tile) {
-                    return;
+        // `@tile` is consumed only by a loop the strip-miner can actually rewrite, and the loop FORM
+        // is settled first. `take_tile_size` used to pop the function-item `@tile(BM, BN, …)` queue
+        // before anything looked at the loop: a form other than an exclusive step-less range then
+        // fell through to the ordinary lowering below, so the attribute did nothing, said nothing,
+        // and every later width shifted one loop earlier — the NEXT loop was silently strip-mined at
+        // the wrong tile. A width with nowhere to go is `E0309` and stays at the head of the queue.
+        if self.tile_requested(stmt_attrs) {
+            match tile::tileable_range(pat, iter) {
+                Some((start, end)) => {
+                    if let Some(tile) = self.take_tile_size(stmt_attrs) {
+                        if self.lower_tiled_range_for(label, pat, start, end, body, tile) {
+                            return;
+                        }
+                    }
                 }
+                None => self.tile_not_applicable(stmt_attrs, pat.span),
             }
         }
         // ---- The ordered kernel-recognizer cascade -------------------------------------------

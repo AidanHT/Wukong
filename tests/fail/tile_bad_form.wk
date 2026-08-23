@@ -1,0 +1,23 @@
+// EXPECT-CODE: E0309
+module tests.fail.tile_bad_form
+
+// `@tile` strip-mines `for <i> in <start>..<end>` and nothing else, but an unsupported loop form
+// used to consume its width and then fall through to the ordinary lowering: the attribute did
+// nothing, said nothing, and — because the width came off the function-item queue — the NEXT loop
+// was silently strip-mined at 32 instead. `for i in 0..=2` is inclusive, so it cannot be tiled.
+@generic
+@tile(64, 32)
+fn f(mut out: [i32; 100]) {
+    for i in 0..=2 {
+        out[i] = i;
+    }
+    for j in 0..100 {
+        out[j] = j;
+    }
+}
+
+fn main() -> i32 {
+    let mut o: [i32; 100] = [0; 100];
+    f(o);
+    return 0;
+}
