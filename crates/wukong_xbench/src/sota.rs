@@ -210,10 +210,60 @@ pub(crate) fn evaluate(floors: &[FloorRow], sweep: &[SotaRow]) -> (Vec<String>, 
             );
             continue;
         };
+        // The control is this run's own resolution, so it has to be sound before it can be spent as
+        // one. Two ways it is not: rounds that disagree by more than the harness's own publishing
+        // limit, and a departure from the control's true value of 1.00 beyond that same limit. Both
+        // matter in the SAME direction, which is why neither can be left to the ratchet below:
+        // `floor_factor` GROWS when the control degrades, and a wider tolerance makes the ratchet
+        // more forgiving — so without these two gates a broken instrument buys silence rather than a
+        // failure, and the worse the run, the less it can be caught saying.
+        let limit = crate::spread_limit();
+        if !t.conclusive() {
+            fail(
+                &mut lines,
+                format!(
+                    "{}: the C(twin) control did not settle ({:.2}x spread over {} round(s), limit \
+                     {:.2}x) — a run with no resolution cannot certify a floor",
+                    f.program,
+                    t.spread(),
+                    t.rounds,
+                    limit
+                ),
+            );
+            continue;
+        }
+        let tol = crate::floor_factor(t);
+        if tol > limit {
+            fail(
+                &mut lines,
+                format!(
+                    "{}: the C(twin) control moved {:.2}x on a ratio whose true value is 1.00 \
+                     (limit {:.2}x) — this run's noise floor is wider than the claims it would be \
+                     certifying",
+                    f.program, tol, limit
+                ),
+            );
+            continue;
+        }
+        // A ratio the run could not pin is not a number to ratchet against. `evaluate` reads the
+        // median, and a median is only a measurement when the rounds behind it agree.
+        if !r.conclusive() {
+            fail(
+                &mut lines,
+                format!(
+                    "{}: rounds disagree {:.2}x over {} round(s) (limit {:.2}x) — INCONCLUSIVE, not \
+                     a ratio the floor file can be graded against",
+                    f.program,
+                    r.spread(),
+                    r.rounds,
+                    limit
+                ),
+            );
+            continue;
+        }
         // The ratchet, with the run's own measured resolution as the tolerance: the recorded floor
         // is violated only when today's median is below it by MORE than what a zero-difference
         // control moved this run. Anything inside that band is the instrument, not a regression.
-        let tol = crate::floor_factor(t);
         if r.med * tol < f.floor {
             fail(
                 &mut lines,
@@ -228,9 +278,19 @@ pub(crate) fn evaluate(floors: &[FloorRow], sweep: &[SotaRow]) -> (Vec<String>, 
             continue;
         }
         // Held. Report the tier standing beside it (informational — §3B7's merge gate, owner-run).
+        //
+        // A median that clears the bar is not the same as a run that RESOLVED it: when the round
+        // range overlaps what a byte-identical control column did, the machine in this state cannot
+        // tell the two columns apart at all, and announcing "at or above PARITY" from inside the
+        // noise floor is the instrument reporting its own jitter as a result.
         let bar = tier_bar(&f.tier).expect("validated at parse");
         let tier_note = match bar {
             None => format!("tier waived ({})", f.cause),
+            Some(_) if crate::verdict(r, Some(tol)) == crate::Verdict::BelowFloor => format!(
+                "tier NOT RESOLVED: {:.2}x [{:.2}-{:.2}] overlaps this run's own {:.2}x control \
+                 floor — no tier can be read off a difference this run could not measure",
+                r.med, r.lo, r.hi, tol
+            ),
             Some(b) if r.med >= b => format!("at or above {} ({:.2}x >= {:.2}x)", f.tier, r.med, b),
             Some(b) => format!(
                 "BELOW {} ({:.2}x < {:.2}x) — cause {}, owner {}, wave {}",
@@ -440,7 +500,11 @@ mod tests {
         let mut f = floor("p", 0.30);
         f.cause = "L5".into();
         let mut s = row("p");
-        s.ratio = Some(stat(0.32, 0.30, 0.34));
+        // Tight on purpose: rounds spanning 0.30-0.34 are a 1.13x spread, past the harness's own
+        // 1.10x publishing limit, and `evaluate` now refuses to grade a median its rounds do not
+        // support. This test is about a tier reported BELOW bar without failing the gate, so it has
+        // to hand `evaluate` a ratio the run actually resolved.
+        s.ratio = Some(stat(0.32, 0.31, 0.33));
         let (lines, failed) = evaluate(&[f], &[s]);
         assert!(!failed, "{lines:?}");
         assert!(lines[0].contains("BELOW PARITY"), "{lines:?}");
@@ -490,5 +554,82 @@ mod tests {
         assert!(parse_floor("| too | few | cells |\n").is_err());
         assert!(parse_floor("| p | C | GOLD | 1.00x | d | AC+full | t | — | — | — |\n").is_err());
         assert!(parse_floor("| p | C | PARITY | fast | d | AC+full | t | — | — | — |\n").is_err());
+    }
+
+    /// A control whose own rounds disagree is not a resolution, and must not be spent as one.
+    ///
+    /// This is the direction that matters: `floor_factor` grows with a degraded control, and a wider
+    /// tolerance makes the ratchet *more* permissive — so before this gate the worst runs were the
+    /// hardest to catch saying anything wrong.
+    #[test]
+    fn a_control_that_did_not_settle_cannot_certify() {
+        let mut s = row("p");
+        s.twin = Some(stat(1.00, 0.80, 1.40)); // spread 1.75x, far outside the publishing limit
+        let (lines, failed) = evaluate(&[floor("p", 1.00)], &[s]);
+        assert!(failed, "an unsettled control certified a floor: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("did not settle")),
+            "the failure must name the control: {lines:?}"
+        );
+    }
+
+    /// A control that settled but landed far from its own true value of 1.00 is a wide noise floor,
+    /// and a noise floor wider than the harness's publishing limit cannot certify claims made to it.
+    #[test]
+    fn a_control_wider_than_the_publishing_limit_cannot_certify() {
+        let mut s = row("p");
+        s.twin = Some(stat(1.15, 1.11, 1.20)); // spread 1.08x (settled) but 1.20x off 1.00
+        let (lines, failed) = evaluate(&[floor("p", 1.00)], &[s]);
+        assert!(failed, "a 1.20x noise floor certified a floor: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("noise floor is wider")),
+            "the failure must name the floor width: {lines:?}"
+        );
+    }
+
+    /// `evaluate` grades a median, and a median is a measurement only when its rounds agree.
+    #[test]
+    fn an_inconclusive_ratio_is_not_graded_against_a_floor() {
+        let mut s = row("p");
+        s.ratio = Some(stat(1.05, 0.90, 1.50)); // spread 1.67x
+        let (lines, failed) = evaluate(&[floor("p", 1.00)], &[s]);
+        assert!(failed, "an inconclusive ratio was graded: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("INCONCLUSIVE")),
+            "the failure must say so: {lines:?}"
+        );
+    }
+
+    /// A median above the bar is not a tier when the round range overlaps the control's own band —
+    /// that is the instrument reporting its jitter as a result.
+    #[test]
+    fn a_tier_inside_the_noise_floor_is_not_announced() {
+        let mut s = row("p");
+        s.ratio = Some(stat(1.01, 0.99, 1.03)); // settled, but straddles the 1.02x control band
+        s.twin = Some(stat(1.00, 0.98, 1.02));
+        let (lines, failed) = evaluate(&[floor("p", 1.00)], &[s]);
+        assert!(!failed, "holding the floor is not a failure: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("tier NOT RESOLVED")),
+            "an unresolved tier must say so: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("at or above")),
+            "a tier was announced from inside the noise floor: {lines:?}"
+        );
+    }
+
+    /// The whole set above must not have made the ordinary passing row impossible.
+    #[test]
+    fn a_clean_row_still_passes_every_new_gate() {
+        let mut s = row("p");
+        s.ratio = Some(stat(1.40, 1.36, 1.44)); // settled, and clear of the control band
+        s.twin = Some(stat(1.00, 0.98, 1.02));
+        let (lines, failed) = evaluate(&[floor("p", 1.20)], &[s]);
+        assert!(!failed, "a clean row failed: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("at or above PARITY")),
+            "a resolved row must still report its tier: {lines:?}"
+        );
     }
 }
