@@ -700,9 +700,24 @@ of being declined there and run as one sequential chunk. An outlined body that *
 (it is called by every thread, so a record would be appended per thread, not per iteration); the
 single-thread path still runs the sequential chunk, since that kernel is launched with one thread.
 Both need `-O1`+ in practice, because at `-O0` a loop condition reads a counter out of an alloca and
-the data-independent-control-flow gate declines the program first. Nothing here has been **timed**: a
-generic `.wk` elementwise kernel on this path may still lose to the native CPU backend, and certainly
-loses to the recognized `wukong_velem` GPU kernel it avoids by construction.
+the data-independent-control-flow gate declines the program first.
+
+**It has now been timed, and it loses.** `bench/lang/` + `wukong_driver::lang_bench` (2026-08-22, RTX
+4050, two adjacent rounds) put a generic `.wk` elementwise kernel at **6.6-13.3x slower than the
+Cranelift CPU backend** on the same program, and the fastest language-path loop at **1.4-1.6 % of the
+part's ~192 GB/s**. Two things account for it, and neither is the kernel menu:
+
+- **`@parallel` does not reach the canonical elementwise loop at all.** `FnLowerer::lower_for` tries
+  `try_vectorize_for` *before* `try_emit_parallel_region`, so `dst[i] = src[i] * 2.0 + 1.0` is claimed
+  by the CPU SIMD vectorizer and the region outliner is never asked. Right on a CPU; on gpu-native the
+  vectorized form runs on **one** device thread, four lanes at a time -- ~22-25x per iteration against
+  the same loop outlined. `tests/run/lang_parallel_saxpy.wk` is affected: it outlines its *setup* loop
+  and runs its saxpy serially.
+- **Every program runs on one CTA** (the block-scoped megakernel entry, see `docs/internals.md`), so
+  even the loop that *is* outlined gets 256 threads out of the 20480 this part can hold resident.
+
+So the sentence above is confirmed in the direction that matters: this path loses to the native CPU
+backend today, and it loses to the recognized `wukong_velem` GPU kernel by a wider margin still.
 
 Corpus standing is printed by the gates
 themselves, over every fixture in `tests/run` (357 today — `ls tests/run/*.wk | wc -l`;

@@ -986,6 +986,11 @@ either shape is a hard error rather than a decline, because the two halves fail 
 equally silent ways — a barrier no launch made resident deadlocks, and a multi-CTA launch of
 `tid == 0`-guarded stores duplicates every `print` and races the shared frame. `lower::emit_mega_ptx`
 still emits the block-scoped form, so every corpus program is launched exactly as before.
+**What that costs is now measured** (`bench/lang/`, 2026-08-22, RTX 4050): the best language-path loop
+reaches 2.7-3.0 GB/s, **1.4-1.6 % of the part's ~192 GB/s**, on one CTA of the 80 this device can hold
+resident -- and gpu-native is 6.6-13.3x *slower* than the Cranelift CPU backend on the same programs.
+Emitting a grid-parallel entry is therefore the largest single lever on this backend, ahead of any
+load-width or pipelining work.
 
 The CPU↔GPU boundary is **tolerance-gated** (`c·√K·ε`) rather than bit-exact — the GPU analogue of the
 CPU differential oracle — and the path stays optimization-invariant (`-O0` ≡ `-O3`). Nearly every

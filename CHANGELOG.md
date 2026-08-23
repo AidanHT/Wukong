@@ -5,6 +5,84 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Measurement — the language ruler, and what it says (`bench/lang/`, `wukong_driver::lang_bench`)
+
+`WUKONG_MASTER_PLAN` Task 0.4 — the honest gpu-native baseline of a `@generic` kernel — was skipped
+when Phase 0 was executed, so Phases 1 and 3 shipped speed features with **zero** measurement and
+Phase 4's own criterion ("improves vs Phase 3") had no baseline. It exists now, and the first round
+is a loss.
+
+- **`bench/lang/{base,write_grid,saxpy_lane}.wk`** at `N = 1<<22`, plus
+  `crates/wukong_driver/src/lang_bench.rs` and `wukong_codegen_gpu::megakernel::time_mega`. Quantity
+  names are `gpu_e2e_bench.rs`'s (`compile_ms`, `kernel_ms`, `launch_ms`) so language and campaign
+  numbers stay comparable; `time_mega` hoists analyze, PTX emit, module resolve and frame allocation
+  out of the timed region, so `kernel_ms` is a launch and a `synchronize`. Run it with
+  `cargo test -p wukong_driver --features gpu --release --lib lang_ruler_round -- --ignored --nocapture`.
+- **Three gpu-native properties force the fixture shape**, each found by probe: `alloc_f32` never
+  reaches the device (`UNSUPPORTED: call to 'wukong_rt_alloc' not yet lowered to PTX`); a program with
+  no `wukong_parallel_for` and no recognized kernel is not megakernel-eligible and its single-thread
+  fallback is rejected at a 32 MiB frame with a bare `DriverError(CUDA_ERROR_INVALID_VALUE)`; and
+  `[0.0; N]` lowers to a serial scalar store loop. Hence one shared skeleton and a `base.wk` control —
+  **every number from that directory is a difference against it.** Details in `bench/lang/README.md`.
+
+**Measured, RTX 4050 (20 SMs), two adjacent rounds, box on AC at 35–42%:**
+
+| the loop alone | ms | ns/element | GB/s | % of the 4050's ~192 GB/s |
+|---|---|---|---|---|
+| `write_grid` — outlined, 256 threads | 5.53–6.13 | 1.32–1.46 | 2.7–3.0 | **1.4–1.6 %** |
+| `saxpy_lane` — vectorizer-claimed, 1 thread | 137.06–138.16 | 32.7–32.9 | 0.24 | **0.13 %** |
+
+| program | gpu-native `kernel_ms` | CPU native (whole `jit_run`) | gpu-native is |
+|---|---|---|---|
+| `base` | 133.7–134.4 ms | 18.9–20.4 ms | **6.6–7.1× slower** |
+| `write_grid` | 139.9 ms | 19.4–19.7 ms | **7.1–7.2× slower** |
+| `saxpy_lane` | 271.4–271.9 ms | 20.5 ms | **13.3× slower** |
+
+The comparison flatters the GPU: `kernel_ms` excludes gpu-native's compile *and* module load, while
+the CPU column is the whole `jit_run` call. **A loss is a result**, and two defects explain it — both
+invisible to every gate in the tree, and both Phase 1 not having shipped what its name says:
+
+- **`@parallel` never reaches the canonical elementwise loop.** `FnLowerer::lower_for` tries
+  `try_vectorize_for` **before** `try_emit_parallel_region`, so `dst[i] = src[i] * 2.0 + 1.0` is
+  claimed by the CPU SIMD vectorizer and the region outliner is never asked. On a CPU that ordering is
+  right; on gpu-native it inverts, because the vectorized form runs on **one** device thread four lanes
+  at a time. ~22–25× per iteration against the same trip count outlined. It reaches the flagship
+  fixture: `tests/run/lang_parallel_saxpy.wk` outlines its *setup* loop and runs its saxpy serially,
+  and its own header describes that region as grid-strided.
+- **Every gpu-native program runs on one CTA** — a *known* limitation, stated in `docs/internals.md`
+  ("`lower::emit_mega_ptx` still emits the block-scoped form, so every corpus program is launched
+  exactly as before"), and until now never costed. `lower.rs` contains **zero** occurrences of
+  `p_gbar` or `mrt_grid_barrier`, so the entry is always the two-parameter block-scoped form and
+  `plan_grid` returns `grid = 1`; the grid barrier, `launch_cooperative` and `plan_grid`'s cooperative
+  branch are exercised only by hand-written PTX in `megakernel.rs`'s own tests.
+  `WUKONG_GPU_DUMP_PTX=1` gives `.visible .entry wukong_mega(.param .u64 p_ctx, .param .u64 p_frame)`
+  and `gpu-mega: grid 1x256 (block-scoped), 4 blocks/SM x 20 SMs = 80 resident max`. **One CTA of the
+  80 this device can hold** — so "grid-stride `@parallel`" is today a **block**-stride, and that is
+  the ceiling the 1.4–1.6 % figure above is sitting against.
+
+The round's own Phase 1 A/B — one program at 1 CTA against a full resident wave — reads `tie` for
+exactly that reason (floor +0.01 %, B/A −0.01 %, margin 0.29×), and that is the twin protocol working:
+both arms really were one CTA, and the control refused to publish a number for an experiment that
+varied nothing.
+
+**Consequence for Phase 3.2.** The measurement W1 owed before reinstating `ld.global.v4.f32` now
+exists and says the v4 form is not the lever: a path stuck at 1.4–1.6 % of device bandwidth because it
+runs on one CTA does not become fast by loading four floats at a time. It stays declined.
+
+### Compiler — gpu-native no longer inherits the CPU's Win64 vector recipes
+
+- **`wukong_mir_build::LowerOptions` gains `vec_kernels`**, chosen by
+  `wukong_driver::lower_options_for` from the requested backend. The 256-bit raw-AVX2 recipes
+  assemble Win64-ABI machine code into `Op::VecKernelCall`, which no PTX backend can lower and
+  `wukong_codegen_gpu` declines by design — so on an AVX2 Win64 host the *CPU* vectorizer's choice was
+  deciding whether the *GPU* backend could run a program at all. `--backend=gpu-native` on any
+  unrecognized f32 elementwise program (all three `tests/run/lang_*` language fixtures) failed with
+  `UNSUPPORTED: VecKernelCall (CPU raw-AVX2 kernel) not lowered to PTX` unless the operator knew to set
+  `WUKONG_P4_NO_256=1`. `BackendKind::Gpu` (recognizer offload) is deliberately unaffected: it
+  tree-walks in the interpreter and wants the CPU recipes. `WUKONG_P4_NO_256` is untouched and remains
+  the same-run A/B knob for the 256-bit win on CPU.
+
+
 ### Compiler — Phase 3 coalesce analysis, vector global ld/st, and `.col_major` indexing (branch `lang/p3-coalesce`)
 
 Phase 3 generic memory opts and shape completeness (not yet merged to `main`):
