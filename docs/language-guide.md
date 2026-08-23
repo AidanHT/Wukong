@@ -569,9 +569,12 @@ strip-mined at the wrong tile. A tiled loop's body is lowered twice — the full
 remainder — and the queue is rewound between the two, so a nested `for` written once takes one
 width rather than two. `wukongc --explain E0309` prints the rule.
 
-The one position `@tile` is still accepted and ignored is a place nothing reads it: on a `struct`, a
-parameter, a `let`, or a `while` loop. That is an attribute-placement rule and it is open — see
-`docs/roadmap.md`.
+`@tile` is only accepted where something reads it: on a `fn` item, or on the `for` statement it
+schedules. On a `struct`, a parameter, a `let` or a `while` it is **`E0306`** — the same
+attribute-placement code `@generic` off a `fn` item carries, and for the same reason. `@tile` on a
+`while` is the one worth calling out: a `while` has no induction variable and no range, so there is
+nothing to strip-mine, and the attribute used to sit there reading exactly as if it applied
+(`tests/fail/tile_on_while.wk`).
 
 ### `shared [T; N]` and `sync_block()` ✅
 

@@ -31,17 +31,21 @@ compiled clean, exit 0, with MIR byte-identical to the same program without the 
   grows from 882 to 1129 lines at `-O0` because its inner loop is now tiled in both, as `@tile(2, 2)`
   asked.
 
+- **`@tile` in a position nothing reads is `E0306`.** `wukong_sema::attrs::FN_ITEM_ONLY` listed only
+  `generic`, so `@tile` was accepted on a `struct`, a parameter, a `let` and a `while` loop, and
+  dropped in all four — `--emit=ast` showed the attribute sitting there. It is now accepted only
+  where something reads it: a `fn` item (the width queue) or the `for` statement it schedules. The
+  `while` case is the one worth naming: a `while` has no induction variable and no range, so there
+  is nothing to strip-mine, and a schedule written on a loop reads exactly as if it applied
+  (`tests/fail/tile_on_while.wk`). No new code — this is an attribute-*placement* error, the same
+  shape and the same `E0306` that `@generic` off a `fn` item already carried.
+
 Also: `E0309` on a `for _ in 0..n` blamed the range form, for a loop that *is* written
 `for <i> in <start>..<end>`. It now names the binder.
 
 Four fixtures pin the new conditions (`tests/fail/tile_never_applied.wk`, `tile_on_parallel_fn.wk`,
 `tile_on_recognized_kernel.wk`, `tile_second_on_stmt.wk`); all four compile silently on the parent.
 No program in `tests/run`, `examples`, `bench` or the xbench corpus newly reports `E0309`.
-
-**Still open, and now written down rather than implied away:** `wukong_sema::attrs::FN_ITEM_ONLY` is
-`["generic"]`, so `@tile` is accepted on a `struct`, a parameter, a `let` and a `while` loop, where
-nothing reads it. That is an attribute-*placement* rule and needs its own diagnostic; `@tile` on a
-`while` is the sharpest case — a schedule written on a loop, dropped without a word.
 
 ### Language — `@tile` no longer no-ops in silence, and no longer mis-assigns (`E0309`)
 

@@ -10,11 +10,14 @@
 //! today and stay in the set so existing programs keep compiling. Anything else is an error, which
 //! also means a future attribute cannot be *used* before it is *implemented*.
 //!
-//! Placement is checked here too, but only where a misplaced attribute would be a silent lie:
+//! Placement is checked here too, but only where a misplaced attribute would be a silent lie.
 //! `@generic` (suppress the kernel recognizers for one function, see `wukong_mir_build`) is read
 //! from the **function item**, so accepting it on a statement would promise a per-loop opt-out that
-//! nothing implements. Every other attribute's placement is unchecked in v1 — the ones that are
-//! discarded are discarded wherever they appear.
+//! nothing implements. `@tile` is read from the function item (into a width queue) or from the
+//! `for` statement it sits on, and from nowhere else — so on a `struct`, a parameter, a `let` or a
+//! `while` it used to be accepted and dropped, a schedule written on a loop being the sharpest of
+//! those. Every other attribute's placement is unchecked in v1 — the ones that are discarded are
+//! discarded wherever they appear.
 //!
 //! This walk is independent of name resolution and types (an attribute names no value), so
 //! [`check`] runs before the collection pass and reports every offending attribute in one go.
@@ -32,6 +35,11 @@ pub const KNOWN_ATTRS: &[&str] = &[
 /// Attributes that are read from a function item and therefore mean nothing anywhere else.
 const FN_ITEM_ONLY: &[&str] = &["generic"];
 
+/// Attributes read from a function item **or** from the `for` statement they sit on, and nowhere
+/// else. `@tile` is a loop schedule: `lower_program_with` reads it off the `fn` into a width queue
+/// and `lower_for` reads it off the loop. In every other position nothing reads it at all.
+const FN_ITEM_OR_FOR: &[&str] = &["tile"];
+
 /// Is `name` (the bare attribute name, without the `@`) part of the v1 known set?
 pub fn is_known(name: &str) -> bool {
     KNOWN_ATTRS.contains(&name)
@@ -46,7 +54,12 @@ enum Place {
     Item,
     /// On a function parameter.
     Param,
-    /// On a statement inside a body (`@generic for i in 0..n { … }`).
+    /// On a `for` statement inside a body — the one statement `@tile` is read from.
+    ForStmt,
+    /// On a `while` statement. Split out from [`Place::Stmt`] only so the diagnostic can say so:
+    /// `@tile(2) while …` is a schedule written on a loop, and reads as if it applied.
+    WhileStmt,
+    /// On any other statement inside a body (`@generic let x = …`).
     Stmt,
 }
 
@@ -56,7 +69,8 @@ impl Place {
             Place::FnItem => "a function",
             Place::Item => "this item",
             Place::Param => "a parameter",
-            Place::Stmt => "a statement",
+            Place::ForStmt | Place::Stmt => "a statement",
+            Place::WhileStmt => "a `while` loop",
         }
     }
 }
@@ -112,6 +126,20 @@ fn check_attr(a: &Attr, place: Place, interner: &Interner, diags: &mut Vec<Diagn
             .primary(a.span, "only a `fn` item may carry this attribute")
             .help(format!("move `@{name}` onto the enclosing `fn`")),
         );
+        return;
+    }
+    if !matches!(place, Place::FnItem | Place::ForStmt) && FN_ITEM_OR_FOR.contains(&name) {
+        diags.push(
+            Diagnostic::error(format!(
+                "attribute `@{name}` is not valid on {}",
+                place.what()
+            ))
+            .with_code("E0306")
+            .primary(a.span, "nothing reads this attribute here")
+            .help(format!(
+                "write `@{name}` on a `for` statement, or on the enclosing `fn`"
+            )),
+        );
     }
 }
 
@@ -127,8 +155,13 @@ fn check_block(b: &Block, interner: &Interner, diags: &mut Vec<Diagnostic>) {
 }
 
 fn check_stmt(s: &Stmt, interner: &Interner, diags: &mut Vec<Diagnostic>) {
+    let place = match &s.kind {
+        StmtKind::For { .. } => Place::ForStmt,
+        StmtKind::While { .. } => Place::WhileStmt,
+        _ => Place::Stmt,
+    };
     for a in &s.attrs {
-        check_attr(a, Place::Stmt, interner, diags);
+        check_attr(a, place, interner, diags);
     }
     match &s.kind {
         StmtKind::Let { init, .. } => {
@@ -305,6 +338,54 @@ mod tests {
             codes("@generic\nstruct S { x: i32 }"),
             vec!["E0306"],
             "struct"
+        );
+    }
+
+    /// `@tile` is read off a function item or off the `for` it sits on. Everywhere else nothing
+    /// reads it, so it used to be accepted and dropped -- `@tile(2)` on a `while` being the
+    /// sharpest: a schedule written on a loop, silently.
+    #[test]
+    fn tile_is_rejected_where_nothing_reads_it() {
+        assert_eq!(
+            codes("fn f(mut o: [i32; 4]) { @tile(2) while true { o[0] = 1; } }"),
+            vec!["E0306"],
+            "while"
+        );
+        assert_eq!(
+            codes("fn f() { @tile(2) let x: i32 = 1; }"),
+            vec!["E0306"],
+            "let"
+        );
+        assert_eq!(
+            codes("fn f(@tile(2) x: i32) {}"),
+            vec!["E0306"],
+            "parameter"
+        );
+        assert_eq!(
+            codes(
+                "@tile(64)
+struct S { x: i32 }"
+            ),
+            vec!["E0306"],
+            "struct"
+        );
+    }
+
+    /// ...and stays legal in the two positions that DO read it.
+    #[test]
+    fn tile_is_accepted_on_a_fn_item_and_on_a_for() {
+        assert_eq!(
+            codes(
+                "@tile(2)
+fn f(mut o: [i32; 4]) { for i in 0..4 { o[i] = i; } }"
+            ),
+            Vec::<&str>::new(),
+            "fn item"
+        );
+        assert_eq!(
+            codes("fn f(mut o: [i32; 4]) { @tile(2) for i in 0..4 { o[i] = i; } }"),
+            Vec::<&str>::new(),
+            "for statement"
         );
     }
 

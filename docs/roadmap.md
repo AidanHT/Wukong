@@ -434,11 +434,9 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
   rewound between a tiled loop's two body copies so one source loop takes one width
   (`tests/fail/tile_bad_form.wk`, `tile_zero_width.wk`, `tile_non_integer_width.wk`,
   `tile_never_applied.wk`, `tile_on_parallel_fn.wk`, `tile_on_recognized_kernel.wk`,
-  `tile_second_on_stmt.wk`). **Still open:** `wukong_sema::attrs::FN_ITEM_ONLY` is `["generic"]`, so
-  `@tile` is accepted anywhere an attribute may be written — on a `struct`, a parameter, a `let`, a
-  `while` — and nothing reads it there. `@tile` on a `while` is the sharpest of those: a schedule
-  written on a loop, silently. That is an attribute-*placement* rule, not a strip-mining one, and it
-  needs its own diagnostic.
+  `tile_second_on_stmt.wk`).   `@tile` is accepted only where something reads it — a `fn` item or the `for` statement it schedules
+  — and is **`E0306`** on a `struct`, a parameter, a `let` or a `while`, the same placement code
+  `@generic` carries off a `fn` item (`tests/fail/tile_on_while.wk`).
 - **`shared [T; N]`** and **`sync_block()`**: shared address space on `alloca`; cooperative barrier
   inside `@parallel` only (`E0308` otherwise). Static shared size above 48 KiB is `E0307`. CPU:
   shared = stack `alloca`, barrier = no-op/fence. gpu-native: PTX `.shared` + `bar.sync` in
