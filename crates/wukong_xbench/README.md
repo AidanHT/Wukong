@@ -48,10 +48,20 @@ kernels are GATE-BLIND to `cargo test`.
 ## Usage
 
 ```sh
-cargo run -p wukong_xbench --release --           # all kernels
-cargo run -p wukong_xbench --release -- saxpy     # smoke filter
-cargo run -p wukong_xbench --release -- general   # general-code section only
+cargo run -p wukong_xbench --release --             # all kernels
+cargo run -p wukong_xbench --release -- saxpy       # smoke filter
+cargo run -p wukong_xbench --release -- general     # general-code section only
+cargo run -p wukong_xbench --release -- compare     # tests/compare/ timed vs its committed C peers
+cargo run -p wukong_xbench --release -- sota-check  # gate: sweep vs bench/sota/FLOOR.md (exit code!)
 ```
+
+`compare` times timing-scale twins of the `tests/compare/` fixtures (recognition-off, `@generic`,
+census-witnessed) against the committed C peers' kernels on the round-interleaved pinned protocol.
+`sota-check` is part 11 of the language close-out verification gate: it re-runs the in-scope sweep
+(general + compare) and exits non-zero when a ratio falls below its recorded floor in
+`bench/sota/FLOOR.md`, when a program leaves the sweep, when a bar peer fails to compile, or when
+the run is not evaluable (battery / AC+charging / power-state change / failed oracle). It requires
+AC+full and an idle box; `WUKONG_SOTA_FLOOR` overrides the floor-file path.
 
 **Timing requires `--release`.** Peers need gcc/g++/rustc on PATH; Wukong needs no external LLVM.
 

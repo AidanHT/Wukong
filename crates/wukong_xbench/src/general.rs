@@ -1298,26 +1298,82 @@ pub(crate) fn ix_of(labels: &[String], name: &str) -> Option<usize> {
     labels.iter().position(|l| l == name)
 }
 
+/// The f64-oracle bar a column must clear for its `sota-check` row to stand. Deliberately generous:
+/// it exists to void a WRONG buffer (garbage, zeros, a missed store), not to relitigate f32-vs-f64
+/// rounding — the per-lane devs printed in each section's CORRECTNESS block remain the fine-grained
+/// record, and the general programs measure well under this on every honest run.
+const GENERAL_ORACLE_BAR: f64 = 1e-2;
+
+/// Build the sweep rows one program contributes to `sota-check`: for each named Wukong column, the
+/// per-round ratio against the STRONGEST present bar peer among C / C++ / Rust — smallest median,
+/// i.e. the fastest peer, which is what the campaign's §3B bar reads. `C(fast)` is context and
+/// `C(twin)` is the control; neither can be the bar. A missing bar peer marks the row
+/// `peer_missing`, which `sota-check` reads as a FAILURE, never a skip — a cross-language sweep
+/// otherwise drops a column silently.
+fn sota_rows<F>(
+    names: &[(usize, String)],
+    cols: &[Col<F>],
+    rr: &Rounds,
+    twin: Option<crate::RatioStat>,
+    oracle_ok: &[bool],
+) -> Vec<crate::SotaRow> {
+    let labels = labels_of(cols);
+    const BAR_PEERS: [&str; 3] = ["C", "C++", "Rust"];
+    let present: Vec<(&str, usize)> = BAR_PEERS
+        .iter()
+        .filter_map(|p| ix_of(&labels, p).map(|ix| (*p, ix)))
+        .collect();
+    let peer_missing = present.len() != BAR_PEERS.len();
+    names
+        .iter()
+        .map(|&(i, ref name)| {
+            let mut best: Option<(&str, crate::RatioStat)> = None;
+            for &(p, pix) in &present {
+                if let Some(s) = rr.ratio(pix, i) {
+                    if best.is_none_or(|(_, b)| s.med < b.med) {
+                        best = Some((p, s));
+                    }
+                }
+            }
+            let ok = oracle_ok.get(i).copied().unwrap_or(false);
+            crate::SotaRow {
+                program: name.clone(),
+                peer: best
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                ratio: if ok { best.map(|(_, s)| s) } else { None },
+                twin,
+                reportable: rr.reportable(),
+                power: rr.state_key(),
+                census: cols[i].census.clone(),
+                peer_missing,
+                oracle_ok: ok,
+            }
+        })
+        .collect()
+}
+
 /// Entry point: every program in the general-code suite, in priority order.
 ///
 /// The pin is taken ONCE here and released when this returns, so all three programs are measured on
 /// the same core and nothing after this function is left pinned — see [`crate::pin_for_section`].
-pub(crate) fn bench_general(cc: &str, cxx: &str, dir: &Path) {
+pub(crate) fn bench_general(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     bench_ablation();
     println!();
     let _pin = crate::pin_for_section();
-    bench_structure_tax(cc, cxx, dir);
+    let mut rows = bench_structure_tax(cc, cxx, dir);
     println!();
-    bench_focal_loss(cc, cxx, dir);
+    rows.extend(bench_focal_loss(cc, cxx, dir));
     println!();
-    bench_scan(cc, cxx, dir);
+    rows.extend(bench_scan(cc, cxx, dir));
+    rows
 }
 
-fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
+fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     let m = Dims::from_env();
     if let Err(e) = m.ok() {
         println!("general: bad dimensions ({e}) — skipping");
-        return;
+        return Vec::new();
     }
     let hd = m.hd();
 
@@ -1378,7 +1434,7 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
     });
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
-        return;
+        return Vec::new();
     }
     let labels = labels_of(&cols);
 
@@ -1465,8 +1521,10 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
         "  CORRECTNESS vs the f64 scalar reference (worst of all {} lanes)",
         reference.len()
     );
+    let mut oks = vec![false; cols.len()];
     for (i, col) in cols.iter().enumerate() {
         let (dev, at) = max_rel_vs_ref(&outs[i], &reference);
+        oks[i] = dev <= GENERAL_ORACLE_BAR;
         println!("    {:<14} max rel dev {dev:.3e} at lane {at}", col.label);
     }
     if let Some(base_ix) = ix_of(&labels, "b-natural") {
@@ -1623,6 +1681,14 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
             .join(", ")
     );
     println!("  {}", crate::model::power_status_line());
+
+    let names: Vec<(usize, String)> = cols
+        .iter()
+        .take(n_wuk)
+        .enumerate()
+        .map(|(i, c)| (i, format!("general/block:{}", c.label)))
+        .collect();
+    sota_rows(&names, &cols, &rr, twin, &oks)
 }
 
 /// The raw per-round timings for every column, so the whole table above can be re-derived — and
@@ -1861,7 +1927,7 @@ const LOSS_WK: &str = include_str!("../wk/general/loss_focal.wk");
 const LOSS_C: &str = include_str!("../wk/general/peer_loss.c");
 const LOSS_RS: &str = include_str!("../wk/general/peer_loss.rs");
 
-fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
+fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     let m = LossDims::from_env();
     let bytes = (2 * m.r * m.c + m.r * m.c) * 4;
     println!("================================================================================");
@@ -1924,7 +1990,7 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
     });
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
-        return;
+        return Vec::new();
     }
     let labels = labels_of(&cols);
 
@@ -1996,6 +2062,18 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
         );
     }
     println!("  {}", crate::model::power_status_line());
+
+    let oks: Vec<bool> = devs
+        .iter()
+        .map(|&(dev, _, ldev)| dev <= GENERAL_ORACLE_BAR && ldev <= GENERAL_ORACLE_BAR)
+        .collect();
+    let names: Vec<(usize, String)> = cols
+        .iter()
+        .take(n_wuk)
+        .enumerate()
+        .map(|(i, _)| (i, "general/focal_loss".to_string()))
+        .collect();
+    sota_rows(&names, &cols, &rr, twin, &oks)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2351,7 +2429,7 @@ const SCAN_WK: &str = include_str!("../wk/general/scan_s6.wk");
 const SCAN_C: &str = include_str!("../wk/general/peer_scan.c");
 const SCAN_RS: &str = include_str!("../wk/general/peer_scan.rs");
 
-fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
+fn bench_scan(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     let m = ScanDims::from_env();
     println!("================================================================================");
     println!(
@@ -2405,7 +2483,7 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
     });
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
-        return;
+        return Vec::new();
     }
     let labels = labels_of(&cols);
 
@@ -2473,6 +2551,18 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
         println!("    {:<10} max rel {dev:.3e} at lane {at}", col.label);
     }
     println!("  {}", crate::model::power_status_line());
+
+    let oks: Vec<bool> = devs
+        .iter()
+        .map(|&(dev, _)| dev <= GENERAL_ORACLE_BAR)
+        .collect();
+    let names: Vec<(usize, String)> = cols
+        .iter()
+        .take(n_wuk)
+        .enumerate()
+        .map(|(i, _)| (i, "general/s6_scan".to_string()))
+        .collect();
+    sota_rows(&names, &cols, &rr, twin, &oks)
 }
 
 #[cfg(test)]

@@ -52,6 +52,7 @@ use wukong_span::{Interner, SourceId};
 mod compare;
 mod general;
 mod model;
+mod sota;
 
 /// The shared C ABI of every kernel: `(x, y, out)` over `N` `f32` elements (`N` baked in).
 type KernelFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32);
@@ -747,12 +748,17 @@ fn main() {
     let filter = std::env::args().nth(1);
     let want = |name: &str| filter.as_deref().is_none_or(|f| name.contains(f));
 
-    // `compare` is a MODE, not a substring filter: the timed `tests/compare/` corpus (compare.rs),
-    // dispatched before the battery so the run contains nothing else.
+    // `compare` and `sota-check` are MODES, not substring filters, dispatched before the battery
+    // so their runs contain nothing else. `compare` is the timed `tests/compare/` corpus
+    // (compare.rs); `sota-check` is part 11 of the verification gate (sota.rs) and is the one
+    // subcommand here whose EXIT CODE is the product.
     if filter.as_deref() == Some("compare") {
         let rows = compare::bench_compare(&cc, &dir);
         print_sota_scorecard(&rows);
         return;
+    }
+    if filter.as_deref() == Some("sota-check") {
+        std::process::exit(sota::sota_check(&cc, cxx, &dir));
     }
 
     let kernels = kernels();
@@ -1184,7 +1190,9 @@ fn main() {
     // The general-code suite: Wukong written OUTSIDE the recognizer dialect. Opt-in (`general`),
     // because every other row above deliberately writes the pattern.
     if filter.as_deref() == Some("general") {
-        general::bench_general(&cc, cxx, &dir);
+        let rows = general::bench_general(&cc, cxx, &dir);
+        println!();
+        print_sota_scorecard(&rows);
     }
 }
 
