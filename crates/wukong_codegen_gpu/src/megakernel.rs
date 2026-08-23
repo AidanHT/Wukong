@@ -565,6 +565,222 @@ fn launch_mega(
     lower::decode_ctx(&out).map(Some)
 }
 
+/// What one timed gpu-native run of a whole program cost, with the quantities named as in
+/// `wukong_driver::gpu_e2e_bench` so language numbers and campaign numbers stay comparable.
+///
+/// **`kernel_ms` is the published quantity.** Everything a real `--backend=gpu-native` run pays and a
+/// kernel bench does not — emitting the PTX text, the module lookup, the frame allocation — happens
+/// once, outside the loop, exactly as `gpu::time_gemm_nt_wgmma` resolves its handles outside its
+/// timed region. What is left inside is a launch and a `synchronize`.
+#[derive(Debug, Clone)]
+pub struct MegaTiming {
+    /// The launch alone: `cuLaunchKernel` (or the cooperative launch) plus `stream.synchronize()`,
+    /// with the module resolved and both device buffers already resident. **Minimum** over the reps,
+    /// which is the statistic this repo publishes for a device time (`docs/metrics.md`); the spread
+    /// is in `kernel_ms_max` so a caller can see whether the minimum meant anything.
+    pub kernel_ms: f64,
+    /// The largest of the same samples. A `kernel_ms_max / kernel_ms` far from 1 means the device was
+    /// still ramping (or something else was on it) and the minimum is not yet a floor.
+    pub kernel_ms_max: f64,
+    /// `kernel_ms` plus the per-run driver traffic around it: the zeroed context upload before the
+    /// launch and the readback after. Minimum over the same reps. This is the honest peer for a
+    /// host-to-host number and must never be quoted against a resident-buffer peer.
+    pub launch_ms: f64,
+    /// Emitting the mega PTX text for this program — host only, no device. Measured once, because it
+    /// is not per-run: a real process pays it once and then hits the module cache.
+    pub emit_ms: f64,
+    /// CTAs actually launched. **This is where Phase 1 is visible and nowhere else in the numbers**:
+    /// a program with no `@parallel` region lowers block-scoped and runs at `grid = 1`.
+    pub grid: u32,
+    /// Threads per CTA (always [`MEGA_BLOCK`]).
+    pub block: u32,
+    /// Whether the launch went through `cuLaunchCooperativeKernel` — true for every `grid > 1` plan.
+    pub cooperative: bool,
+    /// Bytes of the shared `.global` frame the whole grid sub-allocates: the program's working set,
+    /// and the denominator of any bandwidth claim made from `kernel_ms`.
+    pub frame_bytes: u64,
+    /// The decoded exit code and stdout of the LAST rep, so a caller can gate the timing on the
+    /// program having actually produced the right answer. A timing of a wrong kernel is not a
+    /// measurement, and this makes it impossible to report one without having looked.
+    pub exit_code: i64,
+    /// See [`MegaTiming::exit_code`].
+    pub stdout: Vec<u8>,
+}
+
+/// Time `reps` gpu-native launches of `program`, or `Ok(None)` if the program is not megakernel
+/// eligible on this device.
+///
+/// `grid_override` pins the CTA count ([`GRID_ENV`]'s value as an argument): `Some(1)` against
+/// `None` (one full resident wave) is the same-program, same-PTX, same-module A/B for what the
+/// grid-stride lowering buys. `plan_grid` still declines a count above what can be made resident,
+/// because a cooperative grid that is not co-resident spins on its barrier forever.
+///
+/// **`None` is not "zero" and must not be reported as a slow result.** It means this program does not
+/// have a gpu-native mega time at all — [`try_run`] would fall through to the single-thread lowering,
+/// which for a real-size fixture is a different kernel entirely (and, above a 512 KB frame, is not
+/// launchable: `.local` is per thread, so an 8 MiB frame is rejected with a bare
+/// `CUDA_ERROR_INVALID_VALUE`). A caller that substitutes one for the other is comparing two
+/// different programs.
+///
+/// The context buffer is re-zeroed **between** reps and outside the timed region: it accumulates
+/// print records, so without the reset a program that prints would overflow `RECORD_CAP` after a few
+/// launches and the timing would silently become a timing of a kernel hitting its record cap. The
+/// frame is deliberately *not* re-zeroed — a fixture that reads a buffer it wrote itself is
+/// idempotent across reps, and zeroing 32 MiB per rep would put a `memset` the real run never pays
+/// into the untimed region, distorting `launch_ms`.
+pub fn time_mega(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    reps: usize,
+    grid_override: Option<u32>,
+) -> Result<Option<MegaTiming>, String> {
+    use std::time::Instant;
+
+    assert!(reps >= 1, "time_mega: reps must be >= 1");
+
+    let plan = crate::fusion::analyze(program, entry, interner);
+    if !plan.eligible {
+        return Ok(None);
+    }
+    let Some(entry_fn) = program.function(entry) else {
+        return Ok(None);
+    };
+    let frame_bytes = lower::mega_frame_bytes(entry_fn);
+
+    let t_emit = Instant::now();
+    let ptx = match lower::emit_mega_ptx(program, entry, interner) {
+        Ok(p) => p,
+        Err(e) if e.starts_with(lower::UNSUPPORTED) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let emit_ms = t_emit.elapsed().as_secs_f64() * 1e3;
+
+    let mut guard = crate::gpu::gpu();
+    let Some(g) = guard.as_mut() else {
+        return Ok(None);
+    };
+
+    let mut h = DefaultHasher::new();
+    ptx.hash(&mut h);
+    let key: &'static str = Box::leak(format!("mega_{:016x}", h.finish()).into_boxed_str());
+    let abi = mega_abi(&ptx)?;
+    let f = g
+        .function(key, &ptx, MEGA_KERNEL_NAME)
+        .map_err(|e| format!("gpu-mega JIT/load failed: {e:?}"))?;
+    // `grid_override` is a PARAMETER and not a read of `GRID_ENV`, deliberately. The A/B this
+    // function exists for is one program at 1 CTA against the same program at a full resident wave,
+    // and driving that through a process-global environment variable would make the two arms race
+    // whenever anything else in the process builds MIR -- the exact confound `lower.rs`'s corpus
+    // sweep pays a mutex to remove. `None` still means "whatever `GRID_ENV` says, else one wave", so
+    // an operator's override of a plain run is untouched.
+    let desired = match grid_override {
+        Some(n) => Some(n),
+        None => env_grid()?,
+    };
+    let Some(gp) = plan_grid(g, &f, abi.grid_parallel, desired)? else {
+        return Ok(None);
+    };
+    assert!(
+        gp.grid == 1 || gp.cooperative,
+        "gpu-mega: a {}-CTA grid must be launched cooperatively",
+        gp.grid
+    );
+
+    let host = lower::new_ctx_host();
+    let mut frame_d = g
+        .stream
+        .alloc_zeros::<u8>(frame_bytes.max(8) as usize)
+        .map_err(|e| format!("gpu-mega frame alloc failed: {e:?}"))?;
+    let mut bar_d = if abi.grid_parallel {
+        Some(
+            g.stream
+                .alloc_zeros::<u8>(GRID_BARRIER_BYTES)
+                .map_err(|e| format!("gpu-mega barrier alloc failed: {e:?}"))?,
+        )
+    } else {
+        None
+    };
+
+    let cfg = LaunchConfig {
+        grid_dim: (gp.grid, 1, 1),
+        block_dim: (gp.block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut kernel_samples: Vec<f64> = Vec::with_capacity(reps);
+    let mut launch_samples: Vec<f64> = Vec::with_capacity(reps);
+    let mut last: Option<(i64, Vec<u8>)> = None;
+
+    for _ in 0..reps {
+        let t_launch = Instant::now();
+        // Fresh zeroed context per rep. Inside `launch_ms` (a real run pays it), outside `kernel_ms`.
+        let mut ctx_d = g
+            .stream
+            .memcpy_stod(&host)
+            .map_err(|e| format!("gpu-mega ctx alloc failed: {e:?}"))?;
+        g.stream
+            .synchronize()
+            .map_err(|e| format!("gpu-mega pre-launch sync failed: {e:?}"))?;
+
+        let t_kernel = Instant::now();
+        {
+            let mut b = g.stream.launch_builder(&f);
+            let mut pushed = 0usize;
+            b.arg(&mut ctx_d);
+            pushed += 1;
+            b.arg(&mut frame_d);
+            pushed += 1;
+            if let Some(bar) = bar_d.as_mut() {
+                b.arg(bar);
+                pushed += 1;
+            }
+            assert_eq!(
+                pushed,
+                abi.params.len(),
+                "gpu-mega: pushed {pushed} kernel arguments for an entry declaring {:?}",
+                abi.params
+            );
+            unsafe {
+                if gp.cooperative {
+                    b.launch_cooperative(cfg)
+                        .map_err(|e| format!("gpu-mega cooperative launch failed: {e:?}"))?;
+                } else {
+                    b.launch(cfg)
+                        .map_err(|e| format!("gpu-mega launch failed: {e:?}"))?;
+                }
+            }
+        }
+        g.stream
+            .synchronize()
+            .map_err(|e| format!("gpu-mega launch sync failed: {e:?}"))?;
+        kernel_samples.push(t_kernel.elapsed().as_secs_f64() * 1e3);
+
+        let out = g
+            .stream
+            .memcpy_dtov(&ctx_d)
+            .map_err(|e| format!("gpu-mega readback failed: {e:?}"))?;
+        launch_samples.push(t_launch.elapsed().as_secs_f64() * 1e3);
+        last = Some(lower::decode_ctx(&out)?);
+    }
+
+    let (exit_code, stdout) = last.expect("reps >= 1");
+    let min = |xs: &[f64]| xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = |xs: &[f64]| xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Ok(Some(MegaTiming {
+        kernel_ms: min(&kernel_samples),
+        kernel_ms_max: max(&kernel_samples),
+        launch_ms: min(&launch_samples),
+        emit_ms,
+        grid: gp.grid,
+        block: gp.block,
+        cooperative: gp.cooperative,
+        frame_bytes,
+        exit_code,
+        stdout,
+    }))
+}
+
 // `pub(crate)` so `MEGA_CORPUS_COVERAGE_FLOOR` has exactly one definition: the device-free
 // invariance gate in `lower.rs` checks the same constant this device gate ratchets on, and two
 // copies of a floor is how a floor silently stops meaning anything.

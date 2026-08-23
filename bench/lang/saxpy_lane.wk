@@ -1,0 +1,51 @@
+// **A bench fixture, not a correctness gate.** Nothing in `cargo test` runs `bench/lang/`; the
+// correctness twins are `tests/run/lang_*.wk`, which stay tiny and print every lane. These exist to
+// give `wukong_driver::lang_bench` -- the ruler Task 0.4 owes -- something at a size where a device
+// time means anything.
+//
+// **The shared skeleton.** Every fixture here declares the same two `[f32; 4194304]` locals (16 MiB
+// each, 32 MiB of frame) and runs the same *anchor* loop, and differs only in what it adds after
+// it. Three properties of gpu-native force that shape, and each cost a probe to find:
+//
+//  1. `alloc_f32` never reaches the device -- gpu-native declines `wukong_rt_alloc`
+//     ("UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX"). Buffers must be `main`
+//     locals, which the megakernel homes in the shared `.global` frame it allocates for the grid.
+//  2. **A program with no `wukong_parallel_for` and no recognized kernel is not megakernel-eligible**,
+//     so it falls through to the single-thread lowering, whose frame is per-thread `.local`. At this
+//     size the driver rejects that launch outright with a bare
+//     `DriverError(CUDA_ERROR_INVALID_VALUE)` -- not an `UNSUPPORTED:` decline. So every fixture
+//     here carries the anchor loop, whose only job is to make the program eligible.
+//  3. `[0.0; 4194304]` lowers to a 4x-unrolled *scalar* store loop the `@parallel` outliner does not
+//     claim, so each declaration is 4194304 serial device stores. That, plus the anchor, is what
+//     `base.wk` measures -- and **every number from this directory is a difference against
+//     `base.wk`**, never a raw `kernel_ms`.
+//
+// `@generic` is on every one of them: without it the recognizers claim these loops and the number
+// becomes a measurement of the dispatcher, which is the one thing this campaign is trying not to do.
+//
+// **The finding.** Adds the canonical parallel elementwise loop -- `dst[i] = src[i] * 2.0 + 1.0` --
+// and `@parallel` does not reach it. `FnLowerer::lower_for` tries `try_vectorize_for` BEFORE
+// `try_emit_parallel_region`; the elementwise SIMD vectorizer claims the loop and the region
+// outliner is never asked. `--emit=mir-high` shows ONE `wukong_parallel_for` (the anchor) and this
+// loop nowhere in it.
+//
+// On a CPU that ordering is right: SIMD in the same thread beats paying `parallel_for` dispatch for
+// one FMA per element. On gpu-native it inverts -- the vectorized form runs on ONE device thread,
+// four lanes at a time, where the outlined form would run across the whole resident grid.
+//
+// `kernel_ms(saxpy_lane) - kernel_ms(base)` is one such loop over 4194304 elements
+// (4194304 reads + 4194304 writes x 4 B = 32 MiB). Against `write_grid`'s difference, normalized by
+// bytes, that is the cost of the ordering.
+module bench.lang.saxpy_lane
+
+@generic
+@parallel
+fn main() -> i32 {
+    let mut src: [f32; 4194304] = [0.0; 4194304];
+    let mut dst: [f32; 4194304] = [0.0; 4194304];
+    for i in 0..4194304 { src[i] = (i % 1024) as f32; }
+    for i in 0..4194304 { dst[i] = src[i] * 2.0 + 1.0; }
+    print(src[4194304 - 1] as i32);
+    print(dst[4194304 - 1] as i32);
+    return 0;
+}

@@ -29,6 +29,14 @@ mod gpu_accel;
 #[cfg(all(test, feature = "gpu"))]
 mod gpu_e2e_bench;
 
+/// **The ruler** (`WUKONG_MASTER_PLAN` Task 0.4): the honest gpu-native baseline of a `@generic`
+/// kernel, and the retro-measurement Phases 1 and 3 owe against it. Test-only, like
+/// [`gpu_e2e_bench`]; its device round is `#[ignore]`d and its device-free laws (the fixtures carry
+/// `@generic` and a `@parallel` anchor; the control fixture exists) run in the ordinary
+/// `cargo test -p wukong_driver --features gpu --lib` step.
+#[cfg(all(test, feature = "gpu"))]
+mod lang_bench;
+
 /// The multi-file front end: resolves `import`s to files, loads each once (depth-first,
 /// cycle-safe), and splices their items into the root module — one merged flat namespace.
 mod loader;

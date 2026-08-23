@@ -1,0 +1,44 @@
+// **A bench fixture, not a correctness gate.** Nothing in `cargo test` runs `bench/lang/`; the
+// correctness twins are `tests/run/lang_*.wk`, which stay tiny and print every lane. These exist to
+// give `wukong_driver::lang_bench` -- the ruler Task 0.4 owes -- something at a size where a device
+// time means anything.
+//
+// **The shared skeleton.** Every fixture here declares the same two `[f32; 4194304]` locals (16 MiB
+// each, 32 MiB of frame) and runs the same *anchor* loop, and differs only in what it adds after
+// it. Three properties of gpu-native force that shape, and each cost a probe to find:
+//
+//  1. `alloc_f32` never reaches the device -- gpu-native declines `wukong_rt_alloc`
+//     ("UNSUPPORTED: call to `wukong_rt_alloc` not yet lowered to PTX"). Buffers must be `main`
+//     locals, which the megakernel homes in the shared `.global` frame it allocates for the grid.
+//  2. **A program with no `wukong_parallel_for` and no recognized kernel is not megakernel-eligible**,
+//     so it falls through to the single-thread lowering, whose frame is per-thread `.local`. At this
+//     size the driver rejects that launch outright with a bare
+//     `DriverError(CUDA_ERROR_INVALID_VALUE)` -- not an `UNSUPPORTED:` decline. So every fixture
+//     here carries the anchor loop, whose only job is to make the program eligible.
+//  3. `[0.0; 4194304]` lowers to a 4x-unrolled *scalar* store loop the `@parallel` outliner does not
+//     claim, so each declaration is 4194304 serial device stores. That, plus the anchor, is what
+//     `base.wk` measures -- and **every number from this directory is a difference against
+//     `base.wk`**, never a raw `kernel_ms`.
+//
+// `@generic` is on every one of them: without it the recognizers claim these loops and the number
+// becomes a measurement of the dispatcher, which is the one thing this campaign is trying not to do.
+//
+// **The Phase 1 contender.** Adds a second loop of the shape that DOES reach the outliner:
+// `dst[i] = f(i)`, whose value depends on the loop variable, so the elementwise SIMD vectorizer
+// declines it and `try_emit_parallel_region` gets it. `--emit=mir-high` shows TWO
+// `wukong_parallel_for` calls.
+//
+// `kernel_ms(write_grid) - kernel_ms(base)` is one grid-strided 4194304 x 4 B = 16 MiB write.
+module bench.lang.write_grid
+
+@generic
+@parallel
+fn main() -> i32 {
+    let mut src: [f32; 4194304] = [0.0; 4194304];
+    let mut dst: [f32; 4194304] = [0.0; 4194304];
+    for i in 0..4194304 { src[i] = (i % 1024) as f32; }
+    for i in 0..4194304 { dst[i] = (i % 1024) as f32; }
+    print(src[4194304 - 1] as i32);
+    print(dst[4194304 - 1] as i32);
+    return 0;
+}
