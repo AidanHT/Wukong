@@ -487,9 +487,13 @@ from the function item, so accepting it there would promise a per-loop opt-out t
 `WUKONG_NO_RECOGNIZE` environment instrument, documented in `docs/internals.md`; it is not a CLI flag
 and not a user feature.
 
-`@parallel` **declines and lowers serially, with no diagnostic**, when the loop cannot be split into
-independent chunks: a labelled loop, a plain `break` out of the parallelized loop, a `return` out of
-it, or a mid-function region whose modelled body-local is reassigned inside an inner loop. (A
+`@parallel` **declines and lowers serially, with no diagnostic**, when the loop has a shape the
+chunking contract cannot carry: a labelled loop, a plain `break` out of the parallelized loop, a
+`return` out of it, or a mid-function region whose modelled body-local is reassigned inside an inner
+loop. Those are *shape* declines, and only the mid-function region vehicle additionally proves that
+the iterations are independent — see the sharp-edge entry in `docs/roadmap.md` for what the
+whole-function vehicle does not check, and for the open decision about which contract `@parallel`
+should carry. (A
 `break`/`continue` targeting an *inner* loop is that loop's own control flow and stays legal.) The
 result is always correct — the fallback is the ordinary scalar/vectorized loop — but the parallel
 speedup is silently absent, so check with `wukongc --emit=mir -O2 f.wk | grep wukong_parallel_for`.
@@ -682,14 +686,25 @@ execute today** (✅): the native backend outlines the loop body into its own fu
 across CPU cores through the `wukong_runtime` rayon-backed C-ABI entry point
 `wukong_parallel_for(n, body, env)`, which hands each worker a contiguous chunk of `[0, n)` and returns
 only once every chunk has completed; each per-core chunk is itself auto-vectorized (parallelism ×
-SIMD). The interpreter runs the same range sequentially, so results stay differentially equal.
+SIMD). The interpreter runs the same range sequentially, so results stay differentially equal **for a
+body whose iterations really are independent** — which, for this vehicle, is your obligation and not a
+checked one (see below).
 
 The whole-function vehicle fires on a narrow shape: **every** parameter must be a fixed-size array
 (`[T; N]`) — a `[]T` slice, a `Tensor[..]`, a pointer or a scalar parameter declines — the body must be
 exactly one unlabelled `for i in 0..hi { … }` over a half-open, unit-step range starting at literal `0`,
 and the body must not `return`, `defer`, or `break`/`continue` out of that loop (a `break`/`continue`
-inside an *inner* loop is fine). Anything the recognizer cannot prove declines **silently to the
-ordinary serial lowering**: the program is still correct, it just does not use more than one core. A
+inside an *inner* loop is fine). Any *shape* the outliner cannot carry declines **silently to the
+ordinary serial lowering**: the program is still correct, it just does not use more than one core.
+What the outliner never examines is whether the iterations are **independent**. It checks the shape
+above and then chunks `[0, hi)` across cores, so a loop-carried dependence
+(`for i in 0..n { a[0] = a[0] + 1.0; }`) or two array parameters bound to one array at the call site
+(`embed(ids, buf, buf)`) races on the native backend while the interpreter — sequential by
+construction — keeps returning the scalar answer. Such a program is outside the differential contract
+today, the same way use-after-`free` is; both reproducers, the measured wrong answers, and the open
+language decision (make the promise real, or state the obligation) are recorded under **Known
+limitations / sharp edges** in `docs/roadmap.md`. The mid-function region vehicle below does not share
+this hole: it proves disjointness, across parameters that may be one buffer included. A
 `@parallel` function whose body is instead a recognized kernel nest (a matmul, GEMV, batched norm,
 transpose, elementwise activation, …) is intercepted *before* the outliner and dispatches the multicore
 `wukong_*_parallel` kernel directly. A reduction takes the other route: it is not a single `for`

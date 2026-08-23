@@ -400,6 +400,15 @@ other use publishes it.
 "may alias" and `tests/run/alias_slice_params.wk` pins the behaviour that depends on it. This is the
 single biggest fact the optimizer is missing, and closing it is a **language** decision, not an
 analysis one — see the roadmap.
+Two transforms outside this module face the same question and answer it differently, which is worth
+knowing before you read either. The mid-function `@parallel` **region** outliner
+(`wukong_mir_build::match_parallel_region`) proves per-iteration disjointness per buffer, and adopts
+this module's answer: captured **parameters** that could be one buffer are proved together, over the
+union of their accesses, so a gather whose index cannot carry the loop digit declines rather than
+racing. The **whole-function** `@parallel` outliner (`parallel_spec`) asks nothing at all — it matches
+a shape and chunks — so it is unsound for any dependent body, aliasing or not. That is a known sharp
+edge with reproducers and an open language decision, recorded in the roadmap; do not read the two
+vehicles as sharing a contract.
 
 `is_dereferenceable(ptr, bytes)` is a separate question that only a *speculating* transform asks: may
 this access run on a path the program might not have taken? It is true only for a known in-bounds

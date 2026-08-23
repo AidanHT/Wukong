@@ -362,13 +362,21 @@ fn run_program(path: &Path, opt: &str, backend: &str, no_recognize: bool) -> (Op
 /// how the fix gets its gate.
 const NATIVE_AXIS_WITHHELD: &[(&str, &str)] = &[(
     "embedding_alias_parallel.wk",
-    "the generic `@parallel` outliner races on native when two array parameters are bound to the \
-     same array at the call site: 11 of 40 recognition-off runs printed a wrong first line, across \
-     9 distinct wrong values, and one also corrupted an unrelated later line. The interpreter is \
-     25/25 correct and recognition ON is 40/40, because the recognizer answers an aliased region \
-     with the *serial* kernel when it cannot prove the buffers disjoint — the generic outliner has \
-     no such test. `@generic @parallel` reproduces it with no environment variable set at all, so \
-     correctness here currently rests on a recognizer.",
+    "the WHOLE-FUNCTION `@parallel` vehicle performs no independence analysis of any kind. \
+     `parallel_spec` checks shape only — every parameter a fixed-size array, the body exactly one \
+     unlabelled `for i in 0..hi`, no escape from that loop — and then hands contiguous chunks of \
+     `[0, hi)` to the core pool. Nothing proves two iterations do not collide. Aliasing is one way \
+     in (11 of 40 recognition-off runs printed a wrong first line across 9 distinct values), and it \
+     is not the smallest: `@generic @parallel fn bump(mut a: [f32; 4096]) { for i in 0..4096 { \
+     a[0] = a[0] + 1.0; } }` needs no aliasing at all and printed 7 wrong answers in 12 native \
+     runs (1453..3704 for a nest whose scalar meaning is 4096). The interpreter runs `[0, hi)` \
+     sequentially and is always right, so this is an interp/native divergence no differential gate \
+     can hold: a race is not reproducible, and the gate reruns. Recognition ON is 40/40 here only \
+     because the recognizer answers an aliased region with the *serial* kernel, so correctness on \
+     this program rests on a recognizer. The mid-function region vehicle does prove disjointness, \
+     and now proves it across parameters that may be one buffer (`parallel_region_alias.wk`); the \
+     two vehicles simply have opposite contracts. Which one `@parallel` is meant to carry is the \
+     master plan's Task 7.2 alias decision, recorded with these reproducers in `docs/roadmap.md`.",
 )];
 
 /// Every program that depends on a recognizer must compute exactly what its own source loop

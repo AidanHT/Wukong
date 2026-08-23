@@ -840,6 +840,43 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 
 ## Known limitations / sharp edges
 
+- **`@parallel`'s two vehicles have opposite contracts, and the whole-function one proves nothing.**
+  The mid-function *region* vehicle proves per-iteration disjointness before it outlines, and declines
+  otherwise. The **whole-function** vehicle (`wukong_mir_build::parallel_spec`) performs **no
+  dependence analysis of any kind**: it checks a shape — every parameter a fixed-size array, the body
+  exactly one unlabelled `for i in 0..hi` over a half-open unit-step range from literal `0`, no
+  `return`/`defer`/`break` out of that loop — and then hands contiguous chunks of `[0, hi)` to the
+  core pool. Nothing establishes that two iterations do not collide, so a body that carries a
+  dependence races on native while the interpreter, which runs `[0, hi)` sequentially, stays right.
+  Two reproducers, both `@generic` so no recognizer is involved and no environment variable is needed.
+  Only the second is a corpus fixture — the first is quoted in full here precisely because it **must
+  not** join `tests/run`, since a program that races makes the suite flaky, which is the defect
+  itself:
+  - a loop-carried write, no aliasing at all —
+    `@parallel fn bump(mut a: [f32; 4096]) { for i in 0..4096 { a[0] = a[0] + 1.0; } }` printed
+    **7 wrong answers in 12 native runs** (1453, 1941, 2051, 2560, 2573, 2593, 3704 for a nest whose
+    scalar meaning is 4096);
+  - one array bound to two parameters — `tests/run/embedding_alias_parallel.wk`'s `embed(ids, buf,
+    buf)`, **11 of 40** recognition-off native runs wrong across 9 distinct values. That program is
+    correct *with* recognition on only because the recognizer answers an aliased region with the
+    serial kernel, so its correctness rests on a recognizer.
+
+  **No gate in the tree can hold this**, which is why it survived: a race is not reproducible, and
+  `native_matches_interpreter` reruns. The withheld-native-axis entry in
+  `crates/wukongc/tests/recognize.rs` records it against the one corpus program that reaches it.
+  Note the asymmetry with the rest of the compiler — `wukong_opt::alias` refuses the parameter
+  no-alias assumption in writing, and the *region* vehicle now refuses it too (two parameters that
+  may be one buffer are proved as one buffer; `tests/run/parallel_region_alias.wk`).
+
+  **The fix is a language decision, not an analysis**, and it is the master plan's Task 7.2: either
+  make the promise real (a rule that a `mut` aggregate parameter may not alias another parameter,
+  plus a dependence proof for the whole-function vehicle — sound, and it would decline shapes that
+  parallelize today), or state the obligation on the user OpenMP-style and put racy `@parallel` bodies
+  outside the differential contract the way `free`/use-after-free already are. Both are defensible;
+  what is not is the present silence. Recognition-off, **14** of the 371 corpus programs plus
+  `examples/` dispatch `wukong_parallel_for` at `-O2` (10 with recognition on), so the blast radius of
+  the strict route is measurable rather than hypothetical.
+
 - `bf16` **and** `f16` are both real 2-byte storage (round-to-nearest-even), f32 compute, with a full
   symmetric mixed-precision op suite (reductions, max-family, axpby, activations — see above) **and a
   mixed-precision GEMM**: a bf16/f16 `C = A·Bᵀ` `nn.Linear` nest dispatches to `wukong_sgemm_{bf16,

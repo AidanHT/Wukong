@@ -5,6 +5,39 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Correctness — `@parallel`'s two vehicles, and the one that proves nothing
+
+- **Fixed: a mid-function `@parallel` region no longer assumes two array *parameters* are two
+  buffers.** `match_parallel_region` proved per-iteration disjointness once per **written** array and
+  treated distinct captured symbols as distinct storage — a fact for two locals (distinct `alloca`s),
+  an assumption for two parameters, which one array defeats by being passed twice. An array that was
+  only *read* was never examined at all, so a gather (`w[ids[t] * 2 + d]`, an index no digit argument
+  can cover) outlined freely and iterations read rows other iterations were rewriting. Now, whenever a
+  written capture is a buffer parameter, every other captured parameter that could be that same
+  storage joins it and the same proof runs over the **union** of their accesses: the ordinary shape
+  still outlines (each iteration owns one slice of the shared buffer whether or not the caller
+  aliased), the gather declines to the serial lowering. `tests/run/parallel_region_alias.wk` prints
+  every lane; on the parent, 5 of 20 native runs at `-O2` printed a wrong buffer across 4 distinct
+  wrong answers. Corpus-wide `--emit=mir -O2 | grep -c wukong_parallel_for` is unchanged on all 371
+  pre-existing programs, and the three fixtures that exercise this path each declare five parameters
+  of one type — so the new obligation runs on them and passes.
+
+- **Found, not fixed — the whole-function `@parallel` vehicle performs no dependence analysis at
+  all**, and that is now written down instead of implied otherwise. `parallel_spec` checks a shape and
+  then hands contiguous chunks of `[0, hi)` to the core pool. A loop-carried write needs no aliasing
+  to break it: `@generic @parallel fn bump(mut a: [f32; 4096]) { for i in 0..4096 { a[0] = a[0] + 1.0;
+  } }` printed **7 wrong answers in 12 native runs** (1453…3704 where the scalar meaning is 4096),
+  while the interpreter — sequential by construction — is always right. No gate in the tree can hold
+  it: a race is not reproducible and the differential suite reruns. `docs/language-guide.md` said
+  results "stay differentially equal" and `docs/roadmap.md` said nothing; both now state the actual
+  contract, the two committed reproducers and the open decision. **Choosing that contract is the
+  master plan's Task 7.2** — make the promise real (a no-alias rule for `mut` aggregate parameters
+  plus a dependence proof, which would decline shapes that parallelize today), or state the obligation
+  on the user OpenMP-style and place racy `@parallel` bodies outside the differential contract as
+  use-after-`free` already is. Recognition-off, 14 corpus/`examples` programs dispatch
+  `wukong_parallel_for` at `-O2` (10 with recognition on), so the strict route's blast radius is
+  measurable rather than hypothetical.
+
 ### Measurement — the language ruler, and what it says (`bench/lang/`, `wukong_driver::lang_bench`)
 
 `WUKONG_MASTER_PLAN` Task 0.4 — the honest gpu-native baseline of a `@generic` kernel — was skipped
