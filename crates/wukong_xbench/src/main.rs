@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use wukong_span::{Interner, SourceId};
 
+mod compare;
 mod general;
 mod model;
 
@@ -745,6 +746,14 @@ fn main() {
     // for fast single-kernel iteration. No arg → the full suite, byte-for-byte as before.
     let filter = std::env::args().nth(1);
     let want = |name: &str| filter.as_deref().is_none_or(|f| name.contains(f));
+
+    // `compare` is a MODE, not a substring filter: the timed `tests/compare/` corpus (compare.rs),
+    // dispatched before the battery so the run contains nothing else.
+    if filter.as_deref() == Some("compare") {
+        let rows = compare::bench_compare(&cc, &dir);
+        print_sota_scorecard(&rows);
+        return;
+    }
 
     let kernels = kernels();
     // Two separate accumulators, because the two groups of rows are not the same comparison. The
@@ -8878,6 +8887,65 @@ fn median(xs: &[f64]) -> f64 {
     } else {
         0.5 * (v[n / 2 - 1] + v[n / 2])
     }
+}
+
+/// The one-screen summary of a sweep's [`SotaRow`]s: every field a floor-file row records, in
+/// floor-file order, so a passing round can be transcribed into `bench/sota/FLOOR.md` by reading
+/// this block and nothing else.
+fn print_sota_scorecard(rows: &[SotaRow]) {
+    println!("SOTA scorecard (ratio = peer_time / wukong_time; > 1.00 means Wukong faster):");
+    for r in rows {
+        let ratio = match &r.ratio {
+            Some(s) => format!("{:.2}x [{:.2}-{:.2}]", s.med, s.lo, s.hi),
+            None => "n/a".into(),
+        };
+        let twin = match &r.twin {
+            Some(t) => format!("{:.2}x", floor_factor(*t)),
+            None => "none".into(),
+        };
+        let mut flags = String::new();
+        if !r.reportable {
+            flags.push_str("  POWER-CHANGED");
+        }
+        if r.peer_missing {
+            flags.push_str("  PEER-MISSING");
+        }
+        if !r.oracle_ok {
+            flags.push_str("  ORACLE-FAILED");
+        }
+        println!(
+            "  {:<22} vs {:<3} ratio {:<22} twin-floor {:<6} power {}{}",
+            r.program, r.peer, ratio, twin, r.power, flags
+        );
+        println!("      census: {}", r.census);
+    }
+}
+
+/// One in-scope program's outcome from a sweep — what `sota-check` (part 11 of the language
+/// close-out campaign's verification gate) evaluates against `bench/sota/FLOOR.md`, and what the
+/// producing section prints its scorecard from. Produced by `compare::bench_compare` (and the
+/// general suite once its programs join the floor file).
+pub(crate) struct SotaRow {
+    /// Floor-file row name, e.g. `compare/saxpy`.
+    pub(crate) program: String,
+    /// Which peer the ratio is against (the strongest honest one this row carries).
+    pub(crate) peer: String,
+    /// `peer_time / wukong_time`, per round — `> 1` means Wukong faster. `None` when the row could
+    /// not honestly produce one (a column missing, the oracle failed, the census inadmissible).
+    pub(crate) ratio: Option<RatioStat>,
+    /// The run's own `C(twin)` control for this section.
+    pub(crate) twin: Option<RatioStat>,
+    /// Did the power state hold across every round?
+    pub(crate) reportable: bool,
+    /// The power-state key the rounds ran under (`AC+full` / `AC+CHARGING` / `BATTERY` / …).
+    pub(crate) power: String,
+    /// The dispatch-census line for the Wukong column — the T2 recognition-off witness.
+    pub(crate) census: String,
+    /// The bar peer failed to compile or load — `sota-check` reads this as a FAILURE, never a skip
+    /// (a cross-language sweep drops a column silently otherwise).
+    pub(crate) peer_missing: bool,
+    /// Every column agreed with the f64 scalar reference within the section's bar.
+    pub(crate) oracle_ok: bool,
 }
 
 /// A ratio between two columns, measured ROUND BY ROUND: the median across rounds and the range the

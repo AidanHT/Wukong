@@ -23,10 +23,30 @@ WUKONG_NO_RECOGNIZE=1 cargo run -q -p wukongc -- \
   --run --backend=native -O2 tests/compare/saxpy/saxpy.wk
 ```
 
-Until that implementation merges, inspect `--emit=mir -O2` and report any
-`wukong_*` call honestly. The unknown-op fixture must have no
+Both controls are landed (`@generic` per function, `WUKONG_NO_RECOGNIZE` for a
+whole invocation), so either spelling above is live. Inspect `--emit=mir -O2`
+and report any `wukong_*` call honestly. The unknown-op fixture must have no
 `wukong_sgemm`, `wukong_vmath`, `wukong_norm`, `wukong_axpby`, or
-`wukong_velem` call even on today's branch.
+`wukong_velem` call.
+
+## Timing — the master plan §7.1 "CPU within the §3.3 band" condition
+
+`run_cpu.ps1` prints program output only; it does not and will not fabricate
+timings. The timing surface for this corpus is
+
+```sh
+cargo run -p wukong_xbench --release -- compare
+```
+
+which times a **timing-scale twin** of each CPU fixture's loop (same algorithm,
+same spelling, same `@generic`; the toy extent replaced by 2²² elements /
+256³) against the committed C peer's kernel exported as `kbench`, on the
+pinned, round-interleaved, `C(twin)`-controlled protocol, with every column
+checked per-lane against an f64 scalar reference and the dispatch census
+printed as the recognition-off witness. The twins live in
+`crates/wukong_xbench/src/compare.rs` and cite these fixtures; keeping the two
+in step is part of reviewing any edit to either. Measured floors live in
+`bench/sota/FLOOR.md` and are enforced by `wukong_xbench -- sota-check`.
 
 ## Peer rules
 

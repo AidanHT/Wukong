@@ -371,7 +371,7 @@ unsafe fn call_block(f: BlockFn, bufs: &mut Bufs) {
 /// timing thread, and the core re-boosts across it; building everything first and then timing
 /// continuously measures the sustained clock instead. Neither is wrong and neither is comparable to
 /// the other. Read `ms` only against other `ms` from the SAME run.
-fn time_round(mut run: impl FnMut()) -> f64 {
+pub(crate) fn time_round(mut run: impl FnMut()) -> f64 {
     // Warm-ups: the column last ran a whole round ago and every other column has walked the same
     // buffers since, so without these the first timed call would charge one column's cache refill,
     // branch-predictor warm-up and (for the JIT columns) first-touch page faults to it alone.
@@ -399,7 +399,7 @@ fn time_round(mut run: impl FnMut()) -> f64 {
 /// A section builds ALL its columns first (compiling and loading is not timed and must not sit
 /// between two timed columns), then hands them here. Column `i` is timed once per round; the visit
 /// order rotates and alternates direction so no column keeps a slot — see [`crate::round_order`].
-struct Rounds {
+pub(crate) struct Rounds {
     /// How many rounds were run. Not derived from a vector length: `power` deliberately carries one
     /// MORE entry than there are rounds.
     rounds: usize,
@@ -429,7 +429,11 @@ impl Rounds {
     // `r` is a round counter driving the interleave order, the power sampler and the per-round
     // cell together — iterating `ns` instead would invert what the loop means.
     #[allow(clippy::needless_range_loop)]
-    fn run(n: usize, rounds: usize, mut visit: impl FnMut(usize, usize) -> f64) -> Rounds {
+    pub(crate) fn run(
+        n: usize,
+        rounds: usize,
+        mut visit: impl FnMut(usize, usize) -> f64,
+    ) -> Rounds {
         let mut ns = vec![vec![f64::NAN; rounds]; n];
         let mut power = Vec::with_capacity(rounds + 1);
         let mut pct = Vec::with_capacity(rounds + 1);
@@ -458,7 +462,7 @@ impl Rounds {
     }
 
     /// Best observed time for a column across all rounds — the point estimate for the ms column.
-    fn best(&self, i: usize) -> f64 {
+    pub(crate) fn best(&self, i: usize) -> f64 {
         self.ns[i].iter().copied().fold(f64::INFINITY, f64::min)
     }
 
@@ -466,8 +470,17 @@ impl Rounds {
     /// in the section is replaced by `NON-REPORTABLE` rather than merely flagged: the three states
     /// (battery / AC+charging / AC+full) are three different machines, and a ratio whose two columns
     /// were measured on different machines is not a ratio.
-    fn reportable(&self) -> bool {
+    pub(crate) fn reportable(&self) -> bool {
         self.power.windows(2).all(|w| w[0] == w[1])
+    }
+
+    /// The power-state key the section ran under: the first sample, which [`Rounds::reportable`]
+    /// proves equal to every later one before any ratio is quoted from this run.
+    pub(crate) fn state_key(&self) -> String {
+        self.power
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "unknown".into())
     }
 
     /// `(first, last)` battery charge when the section drained or charged while its STATE held.
@@ -484,7 +497,7 @@ impl Rounds {
     }
 
     /// The per-round ratio `column(num) / column(den)` as a median plus the range the rounds spanned.
-    fn ratio(&self, num: usize, den: usize) -> Option<crate::RatioStat> {
+    pub(crate) fn ratio(&self, num: usize, den: usize) -> Option<crate::RatioStat> {
         crate::RatioStat::over_rounds(&self.ns[num], &self.ns[den])
     }
 
@@ -510,7 +523,7 @@ impl Rounds {
 // size difference is immaterial for the same reason: one `Keep` per loaded column, held for
 // liveness only, never moved through hot code.
 #[allow(dead_code, clippy::large_enum_variant)]
-enum Keep {
+pub(crate) enum Keep {
     Jit(wukong_codegen_cranelift::JitModuleHandle),
     Dll(libloading::Library),
 }
@@ -518,7 +531,7 @@ enum Keep {
 /// The `vs C` cell for column `i`: the word `reference` in C's own row (a row reading "1.00x faster
 /// than itself" is noise), a round-formed [`crate::RatioStat`] classified against this run's measured
 /// noise floor everywhere else.
-fn vs_c_cell(
+pub(crate) fn vs_c_cell(
     i: usize,
     c_ix: Option<usize>,
     rr: &Rounds,
@@ -536,7 +549,7 @@ fn vs_c_cell(
 /// with each other by construction — and they must not be, because two columns' minima can fall in
 /// different rounds and their quotient is then exactly the cross-round artifact this whole protocol
 /// exists to remove. Say so where the numbers are, not in a doc comment nobody reads.
-const DIVIDE_WARNING: &str =
+pub(crate) const DIVIDE_WARNING: &str =
     "  Do NOT divide two ms entries: their minima can come from DIFFERENT rounds, and that\n\
      \x20 quotient is precisely the cross-round artifact this protocol removes. The ratio column\n\
      \x20 is formed inside single rounds and is the only comparison here; the ms column is\n\
@@ -544,7 +557,7 @@ const DIVIDE_WARNING: &str =
 
 /// The control ratio `C / C(twin)`, the run's own measured floor. `None` when either column failed
 /// to build, in which case the run genuinely has no floor and [`print_instrument`] says so.
-fn twin_ratio(labels: &[String], rr: &Rounds) -> Option<crate::RatioStat> {
+pub(crate) fn twin_ratio(labels: &[String], rr: &Rounds) -> Option<crate::RatioStat> {
     let c = ix_of(labels, "C")?;
     let t = ix_of(labels, "C(twin)")?;
     rr.ratio(c, t)
@@ -557,7 +570,7 @@ fn twin_ratio(labels: &[String], rr: &Rounds) -> Option<crate::RatioStat> {
 /// identical flags — so its expected value is 1.00 with no language content, and what it reads away
 /// from 1.00 is the instrument rather than a language. See [`PEER_SPECS`] for what that does and does
 /// not bound.
-fn print_instrument(rr: &Rounds, twin: Option<crate::RatioStat>) {
+pub(crate) fn print_instrument(rr: &Rounds, twin: Option<crate::RatioStat>) {
     let rounds = rr.rounds;
     let (w, s) = (crate::gen_warmups(), crate::gen_samples());
     println!(
@@ -652,14 +665,14 @@ fn print_instrument(rr: &Rounds, twin: Option<crate::RatioStat>) {
 /// The real pipeline — parse -> sema -> mir_build -> optimize(-O3) -> Cranelift JIT — plus the
 /// optimized MIR text the dispatch census is read from. `-O3` is byte-identical to `-O2` here
 /// (`wukong_opt` only tests `>= 1` and `>= 2`), so the census equals `--emit=mir -O2`'s.
-struct WukBlock {
-    handle: wukong_codegen_cranelift::JitModuleHandle,
-    ptr: *const u8,
-    compile: Duration,
-    census: Vec<(String, usize)>,
+pub(crate) struct WukBlock {
+    pub(crate) handle: wukong_codegen_cranelift::JitModuleHandle,
+    pub(crate) ptr: *const u8,
+    pub(crate) compile: Duration,
+    pub(crate) census: Vec<(String, usize)>,
 }
 
-fn compile_block(src: &str, label: &str, nparams: usize) -> Option<WukBlock> {
+pub(crate) fn compile_block(src: &str, label: &str, nparams: usize) -> Option<WukBlock> {
     let t = Instant::now();
     let mut interner = Interner::new();
     let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
@@ -848,7 +861,7 @@ fn load_peer(
 /// `F` must be exactly the `extern "C"` signature the peer's `kbench` was written with. Every caller
 /// passes the same `BlockFn`/`LossFn`/`ScanFn` the Wukong side is arity-checked against by
 /// [`block_abi_ok`].
-unsafe fn peer_col<F: Copy>(
+pub(crate) unsafe fn peer_col<F: Copy>(
     ext: &str,
     src: &str,
     dir: &Path,
@@ -886,7 +899,8 @@ const RUSTC_ARGS: [&str; 3] = [
     "-Ctarget-cpu=native",
     "--crate-type=cdylib",
 ];
-const HONEST_FLAGS: [&str; 4] = ["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
+pub(crate) const HONEST_FLAGS: [&str; 4] =
+    ["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
 const FASTM_FLAGS: [&str; 5] = [
     "-O3",
     "-march=native",
@@ -1196,7 +1210,7 @@ fn reference_f64(m: Dims, inp: &[Vec<f32>]) -> Vec<f64> {
 /// Worst per-lane relative deviation of `got` from the f64 reference, with the lane it happened at.
 /// Relative to `max(|ref|, 1e-3)` so a lane that is legitimately near zero cannot manufacture a huge
 /// ratio out of an absolute error that is nothing.
-fn max_rel_vs_ref(got: &[f32], want: &[f64]) -> (f64, usize) {
+pub(crate) fn max_rel_vs_ref(got: &[f32], want: &[f64]) -> (f64, usize) {
     let mut worst = 0.0f64;
     let mut at = 0usize;
     for (i, (&a, &b)) in got.iter().zip(want.iter()).enumerate() {
@@ -1264,23 +1278,23 @@ const PEER_RS: &str = include_str!("../wk/general/peer_block.rs");
 /// One built, callable column of a round-interleaved table — a Wukong spelling or a peer, held in
 /// ONE type so the round schedule cannot tell them apart and cannot favour either. `F` is the
 /// program's `extern "C"` ABI: [`BlockFn`], [`LossFn`] or [`ScanFn`].
-struct Col<F> {
-    label: String,
-    note: String,
-    census: String,
-    compile: Duration,
-    f: F,
+pub(crate) struct Col<F> {
+    pub(crate) label: String,
+    pub(crate) note: String,
+    pub(crate) census: String,
+    pub(crate) compile: Duration,
+    pub(crate) f: F,
     /// The JIT module or DLL that keeps `f` callable, held until the last round is done.
-    _keep: Keep,
+    pub(crate) _keep: Keep,
 }
 
 /// The column labels, in build order — what [`Rounds`] indices mean.
-fn labels_of<F>(cols: &[Col<F>]) -> Vec<String> {
+pub(crate) fn labels_of<F>(cols: &[Col<F>]) -> Vec<String> {
     cols.iter().map(|c| c.label.clone()).collect()
 }
 
 /// Position of a column by label.
-fn ix_of(labels: &[String], name: &str) -> Option<usize> {
+pub(crate) fn ix_of(labels: &[String], name: &str) -> Option<usize> {
     labels.iter().position(|l| l == name)
 }
 
@@ -1614,7 +1628,7 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
 /// The raw per-round timings for every column, so the whole table above can be re-derived — and
 /// disagreed with — from the printed log rather than taken on trust. Cheap: `columns x rounds`
 /// numbers.
-fn print_round_trace(labels: &[String], rr: &Rounds) {
+pub(crate) fn print_round_trace(labels: &[String], rr: &Rounds) {
     println!("  PER-ROUND ns (raw; every number above is derived from this table)");
     print!("    {:<14}", "round");
     for r in 0..rr.rounds {
