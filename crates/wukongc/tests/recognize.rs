@@ -11,9 +11,16 @@
 //! variable unset a known kernel *is* dispatched (otherwise "recognition off" would be vacuous),
 //! and with it set the same program still runs and prints the same bytes on both backends (otherwise
 //! the instrument would be measuring a broken program rather than the generic lowering).
+//!
+//! The named tests below pin one fixture per *cascade head*. The corpus sweep at the bottom of the
+//! file pins the rest: it walks all of `tests/run`, works out which programs recognition is actually
+//! responsible for, and holds each of them to its own generic lowering. Before it existed the ratio
+//! was 6 checked out of 184 that depend on a recognizer.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 fn fixture(name: &str) -> PathBuf {
     // CARGO_MANIFEST_DIR = crates/wukongc; the corpus lives at <repo>/tests/run.
@@ -195,4 +202,277 @@ fn autodiff_is_refused_under_no_recognize() {
             "{args:?}: the refusal must name the variable:\n{stderr}"
         );
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// The corpus sweep.
+//
+// `run.rs` owns a family of corpus-wide differentials, one per axis along which the compiler may
+// vary without changing the answer: `optimization_is_observationally_invariant` walks the
+// *optimization* axis, `native_matches_interpreter` the *backend* axis. Neither can see the third
+// axis, recognition, and by construction: a recognized kernel fires on the interpreter and on native
+// alike, at every `-O` level, because both call the same `wukong_runtime` symbol. That is what
+// "recognized kernels are gate-blind" means, and it leaves the substitution itself — a hand-written
+// AVX2 kernel standing in for the loop the user actually wrote — as the one rewrite in the pipeline
+// with no differential behind it.
+//
+// `WUKONG_NO_RECOGNIZE` closes that, because it gives the substitution a second side to be compared
+// against. These two tests are the axis's entry in the family.
+// -------------------------------------------------------------------------------------------------
+
+/// The corpus directory. Non-recursive scans are the house rule: `tests/run/lib` holds imported
+/// support modules rather than programs, which is exactly why they live in a subdirectory.
+fn run_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("run")
+}
+
+/// Every `.wk` program in `tests/run`, sorted, absolute.
+fn collect_programs() -> Vec<PathBuf> {
+    let dir = run_dir();
+    let mut programs: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "wk"))
+        .collect();
+    programs.sort();
+    assert!(
+        !programs.is_empty(),
+        "no .wk programs found in {}",
+        dir.display()
+    );
+    programs
+}
+
+/// A scratch working directory, unique to this process and created once.
+///
+/// The file-I/O fixtures address their blobs by *relative* path, so the runs below need a working
+/// directory that is neither the repository (which they would litter) nor one shared with another
+/// test binary (where the concurrent sweep in `run.rs` would clobber the same `io_test_*.bin`).
+fn scratch_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir()
+            .join("wukongc_recognize")
+            .join(std::process::id().to_string());
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    })
+}
+
+/// The `wukong_*` runtime symbols a MIR dump calls.
+///
+/// Textual, for the same reason the diagnostic-catalogue scan is: the emitted MIR is the only
+/// artifact that records a recognizer firing, and `--emit=mir` is the only way to obtain it.
+fn kernel_symbols(mir: &str) -> BTreeSet<String> {
+    const CALL: &str = "call wukong_";
+    let mut out = BTreeSet::new();
+    for line in mir.lines() {
+        let mut rest = line;
+        while let Some(i) = rest.find(CALL) {
+            let sym = &rest[i + "call ".len()..];
+            let end = sym
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(sym.len());
+            out.insert(sym[..end].to_string());
+            rest = &sym[end..];
+        }
+    }
+    out
+}
+
+/// One corpus program's kernel symbols, with recognition on and with it off.
+struct Census {
+    name: String,
+    path: PathBuf,
+    on: BTreeSet<String>,
+    off: BTreeSet<String>,
+}
+
+impl Census {
+    /// The symbols recognition is responsible for: dispatched with the instrument unset, gone with
+    /// it set.
+    ///
+    /// Derived rather than listed, so a new recognizer arm joins this gate by existing. Membership
+    /// is also the honest test of what "recognition off" means — it removes pattern *recognition*,
+    /// not intrinsics, so a program that calls a runtime routine outright keeps it on both sides and
+    /// correctly reports nothing here. Three kinds do: `sdpa.wk` names the flash-attention kernel,
+    /// every heap program calls `wukong_rt_alloc`, and a `@parallel` region whose `_parallel`
+    /// recognizer arm is gone falls through to the generic `wukong_parallel_for` outliner.
+    fn recognizer_dependent(&self) -> Vec<&str> {
+        self.on.difference(&self.off).map(String::as_str).collect()
+    }
+}
+
+/// The corpus census, computed once and shared by both tests below.
+fn corpus_census() -> &'static Vec<Census> {
+    static CENSUS: OnceLock<Vec<Census>> = OnceLock::new();
+    CENSUS.get_or_init(|| {
+        collect_programs()
+            .into_iter()
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let (code, on, err) = wukongc(&["--emit=mir", "-O2"], &path, false);
+                assert_eq!(code, Some(0), "{name}: --emit=mir -O2 failed:\n{err}");
+                let (code, off, err) = wukongc(&["--emit=mir", "-O2"], &path, true);
+                assert_eq!(
+                    code,
+                    Some(0),
+                    "{name}: --emit=mir -O2 failed with the instrument set:\n{err}"
+                );
+                Census {
+                    name,
+                    path,
+                    on: kernel_symbols(&on),
+                    off: kernel_symbols(&off),
+                }
+            })
+            .collect()
+    })
+}
+
+/// Run a corpus program, returning (exit code, stdout) — the same observable pair `run.rs` compares.
+fn run_program(path: &Path, opt: &str, backend: &str, no_recognize: bool) -> (Option<i32>, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wukongc"));
+    cmd.arg("--run")
+        .arg(opt)
+        .arg(format!("--backend={backend}"))
+        .arg(path)
+        .current_dir(scratch_dir());
+    if no_recognize {
+        cmd.env(wukong_driver::NO_RECOGNIZE_ENV, "1");
+    } else {
+        cmd.env_remove(wukong_driver::NO_RECOGNIZE_ENV);
+    }
+    let out = cmd.output().expect("spawn wukongc");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// Programs whose *native* half of this differential is withheld, and the open defect that is why.
+///
+/// This is not a convenience list. Each entry keeps its interpreter comparisons — the
+/// recognizer-versus-generic question is still asked, only one axis of it is not — and each names a
+/// defect with a reproducer, so an exclusion cannot quietly become permanent. Deleting an entry is
+/// how the fix gets its gate.
+const NATIVE_AXIS_WITHHELD: &[(&str, &str)] = &[(
+    "embedding_alias_parallel.wk",
+    "the generic `@parallel` outliner races on native when two array parameters are bound to the \
+     same array at the call site: 11 of 40 recognition-off runs printed a wrong first line, across \
+     9 distinct wrong values, and one also corrupted an unrelated later line. The interpreter is \
+     25/25 correct and recognition ON is 40/40, because the recognizer answers an aliased region \
+     with the *serial* kernel when it cannot prove the buffers disjoint — the generic outliner has \
+     no such test. `@generic @parallel` reproduces it with no environment variable set at all, so \
+     correctness here currently rests on a recognizer.",
+)];
+
+/// Every program that depends on a recognizer must compute exactly what its own source loop
+/// computes.
+///
+/// This is the gate the repository did not have. A wrong kernel — one whose AVX2 body disagrees with
+/// the loop it replaced, or a recognizer arm that matched a loop it should not have — produces the
+/// same wrong answer on both backends at every `-O` level, so it passes `native_matches_interpreter`
+/// and both invariance suites without a murmur. Recognition off is the only second opinion, and the
+/// interpreter's generic lowering is the language's own definition of the answer.
+///
+/// Three comparisons per program:
+///   * `-O2` on the interpreter — the oracle, and therefore the spec;
+///   * `-O2` on native — the path `wukong_xbench` times for its recognition-off column, so a broken
+///     generic lowering there would quietly turn every such measurement into the timing of a broken
+///     program;
+///   * `-O0` on the interpreter — the `mir_build` arms fire at every level, and this is the one
+///     where the optimizer has not rewritten around them.
+#[test]
+fn every_recognizer_dependent_program_agrees_with_its_generic_lowering() {
+    let mut mismatches = Vec::new();
+    let mut checked = 0usize;
+    for (name, _) in NATIVE_AXIS_WITHHELD {
+        assert!(
+            corpus_census().iter().any(|c| &c.name == name),
+            "{name} is withheld from the native axis but is no longer in the corpus — \
+             re-justify or delete the entry"
+        );
+    }
+    for c in corpus_census() {
+        let dependent = c.recognizer_dependent();
+        if dependent.is_empty() {
+            continue;
+        }
+        checked += 1;
+        for (opt, backend) in [("-O2", "interp"), ("-O2", "native"), ("-O0", "interp")] {
+            if backend == "native" && NATIVE_AXIS_WITHHELD.iter().any(|(n, _)| *n == c.name) {
+                continue;
+            }
+            let on = run_program(&c.path, opt, backend, false);
+            let off = run_program(&c.path, opt, backend, true);
+            assert_eq!(
+                on.0,
+                Some(0),
+                "{} @ {opt} {backend}: the corpus program itself failed",
+                c.name
+            );
+            if on != off {
+                mismatches.push(format!(
+                    "{} @ {opt} {backend} (recognizes {dependent:?}):\n    on  = {on:?}\n    off = {off:?}",
+                    c.name
+                ));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "recognition changed the answer for {} program/config pair(s):\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+    eprintln!("checked {checked} recognizer-dependent program(s)");
+    for (name, why) in NATIVE_AXIS_WITHHELD {
+        eprintln!("  native axis withheld for {name}: {why}");
+    }
+}
+
+/// How much of the corpus depends on a recognizer, held as a floor.
+///
+/// Coverage ratchets only ever move up. The failure this catches is a recognizer that quietly stops
+/// firing: the corpus keeps passing, because a program lowered as written still prints the right
+/// lanes, and the only visible symptom is that the test above silently has less to check. Pinning
+/// both counts turns that from invisible into a failure with a name.
+#[test]
+fn the_recognizer_dependent_corpus_holds_its_floor() {
+    /// Corpus programs whose MIR loses a `wukong_*` call when the instrument is set. Measured.
+    const PROGRAM_FLOOR: usize = 184;
+    /// Distinct kernels those programs reach between them.
+    const KERNEL_FLOOR: usize = 91;
+
+    let census = corpus_census();
+    let programs = census
+        .iter()
+        .filter(|c| !c.recognizer_dependent().is_empty())
+        .count();
+    let kernels: BTreeSet<&str> = census
+        .iter()
+        .flat_map(Census::recognizer_dependent)
+        .collect();
+
+    assert!(
+        programs >= PROGRAM_FLOOR,
+        "only {programs} of {} corpus programs still depend on a recognizer (floor {PROGRAM_FLOOR}) \
+         — a recognizer stopped firing",
+        census.len()
+    );
+    assert!(
+        kernels.len() >= KERNEL_FLOOR,
+        "only {} distinct kernels are still reached by the corpus (floor {KERNEL_FLOOR})",
+        kernels.len()
+    );
+    eprintln!(
+        "{programs}/{} programs depend on a recognizer; {} distinct kernels",
+        census.len(),
+        kernels.len()
+    );
 }
