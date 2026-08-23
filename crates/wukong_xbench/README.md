@@ -80,6 +80,13 @@ census-witnessed) against the committed C peers' kernels on the round-interleave
 the run is not evaluable (battery / AC+charging / power-state change / failed oracle). It requires
 AC+full and an idle box; `WUKONG_SOTA_FLOOR` overrides the floor-file path.
 
+**Part 11 is a local, Windows-only gate.** The power reading comes from `GetSystemPowerStatus`, and
+`power_status_line` has no non-Windows implementation — off Windows every row reports `power: n/a`,
+so the gate cannot tell AC+full from battery and refuses the whole sweep with one line saying so.
+That is the right outcome (a green meaning "could not check the machine" is not a green) but it does
+mean part 11 cannot run in CI even in principle, which is a second reason on top of the ubuntu
+runner having no stable clock. Read a green CI as saying nothing at all about part 11.
+
 > **`sota-check` is built but NOT YET ARMED.** `bench/sota/FLOOR.md` does not exist, so the mode
 > exits 2 with `cannot read …/bench/sota/FLOOR.md` and has never held a floor. Read every sentence
 > above as a description of the mechanism, not of a gate that is currently guarding anything. Arming

@@ -757,12 +757,20 @@ fn block_abi_ok(
     true
 }
 
-/// Count `wukong_*` runtime-kernel calls in optimized MIR — the dispatch census. Textually the same
-/// scan as `wukongc --emit=mir -O2 prog.wk | grep -oE 'wukong_[a-z0-9_]+'`.
+/// Every recognized-kernel CALL in a MIR dump, by symbol, with how many call sites each has.
+///
+/// The anchor is `call wukong_`, not `wukong_`. Counting bare occurrences counted anything the
+/// printer happens to spell with that prefix — a declaration, a type, a comment — and reported the
+/// total as "call site(s)", so the one number this corpus offers as proof of what a timing measured
+/// was a substring tally wearing a call-site label. Real MIR happens to agree today, which is
+/// exactly why it needed pinning rather than watching: the census is the T2 witness, and a witness
+/// that is only accidentally right is not one. `crates/wukongc/tests/recognize.rs` anchors on the
+/// same prefix, so the harness and the corpus gate count the same thing by construction.
 pub(crate) fn kernel_census(mir: &str) -> Vec<(String, usize)> {
+    const CALL: &str = "call wukong_";
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for (i, _) in mir.match_indices("wukong_") {
-        let rest = &mir[i..];
+    for (i, _) in mir.match_indices(CALL) {
+        let rest = &mir[i + "call ".len()..];
         let end = rest
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
@@ -2655,6 +2663,33 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The census is the T2 witness — the only proof of what a published number measured — so it
+    /// must count CALL SITES and not every occurrence of the prefix. Anchored on `wukong_` alone,
+    /// this MIR reports four "call site(s)" where the program makes one call.
+    #[test]
+    fn the_census_counts_calls_and_not_every_mention_of_the_prefix() {
+        let mir = "fn f(v0 ptr) -> void {\n  bb0:\n    // wukong_sgemm was considered here\n    v1 = const.i64 0 : wukong_sgemm\n    call wukong_sgemm(v0, v1)\n    ret\n}\ndeclare wukong_sgemm(ptr, i64)\n";
+        assert_eq!(
+            kernel_census(mir),
+            vec![("wukong_sgemm".to_string(), 1)],
+            "a comment, a type position and a declaration are not call sites"
+        );
+        assert_eq!(
+            census_line(&kernel_census(mir)),
+            "1 call site(s): wukong_sgemm"
+        );
+    }
+
+    /// Two real calls to one symbol are two call sites, and the line says so.
+    #[test]
+    fn the_census_reports_repeat_calls_with_their_count() {
+        let mir = "    call wukong_velem_f32(v0)\n    call wukong_velem_f32(v1)\n    call wukong_sgemm(v2)\n";
+        assert_eq!(
+            census_line(&kernel_census(mir)),
+            "3 call site(s): wukong_sgemm, wukong_velem_f32x2"
+        );
+    }
     use super::*;
 
     /// Every `$TOKEN$` in every corpus source must be one this module knows how to substitute —

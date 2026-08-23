@@ -133,6 +133,10 @@ pub(crate) fn parse_floor(text: &str) -> Result<Vec<FloorRow>, String> {
     Ok(rows)
 }
 
+/// The power-state key [`crate::model::power_status_line`] reports when the OS cannot be asked.
+/// Only Windows has an implementation, so every row of an off-Windows sweep carries this.
+pub(crate) const POWER_UNAVAILABLE: &str = "n/a";
+
 /// Is this power-state key one the gate accepts? Part 11 runs on AC+full and idle; `AC` covers a
 /// machine with no battery to report. Battery and AC+charging are different machines (the latter
 /// caps all-core at ~25% on this laptop), and a gate that went green there would certify nothing.
@@ -155,6 +159,25 @@ pub(crate) fn evaluate(floors: &[FloorRow], sweep: &[SotaRow]) -> (Vec<String>, 
             vec!["  FAIL FLOOR.md contains no rows — nothing is being checked".into()],
             true,
         );
+    }
+
+    // Part 11 is Windows-only today, and it has to say that ONCE rather than once per floored row.
+    // `power_status_line` has no non-Windows implementation, so off Windows every row arrives with
+    // `power: n/a`, `power_ok` rejects it, and the gate used to emit N copies of a message phrased
+    // as a power-STATE problem -- which reads like "unplug the laptop", not "this gate cannot run
+    // here". The refusal is the right outcome either way: a gate that cannot tell AC+full from
+    // battery certifies nothing. What was missing is that it never said why.
+    if !sweep.is_empty() && sweep.iter().all(|s| s.power == POWER_UNAVAILABLE) {
+        fail(
+            &mut lines,
+            "no power reading is available on this platform, so no row can be evaluated: \
+             `power_status_line` is implemented for Windows only and reports `n/a` everywhere else. \
+             Part 11 is a LOCAL, Windows-only gate today -- it is deliberately not in CI (the ubuntu \
+             runner has gcc, g++ and rustc but no stable clock), and a green that means \
+             \"could not check the machine\" is not a green."
+                .to_string(),
+        );
+        return (lines, true);
     }
 
     for f in floors {
@@ -652,6 +675,31 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("at or above")),
             "a tier was announced from inside the noise floor: {lines:?}"
+        );
+    }
+
+    /// Off Windows there is no power reading at all, so the gate cannot tell AC+full from battery
+    /// and must refuse. It has always refused; what it did was emit one power-STATE complaint per
+    /// floored row, which reads like "unplug the laptop" rather than "this gate does not run here".
+    /// One refusal, naming the platform, and no per-row noise.
+    #[test]
+    fn a_sweep_with_no_power_reading_refuses_once_and_says_why() {
+        let mut a = row("p");
+        a.ratio = Some(stat(1.40, 1.36, 1.44));
+        a.twin = Some(stat(1.00, 0.98, 1.02));
+        a.power = POWER_UNAVAILABLE.into();
+        let mut b = row("q");
+        b.ratio = Some(stat(1.40, 1.36, 1.44));
+        b.twin = Some(stat(1.00, 0.98, 1.02));
+        b.power = POWER_UNAVAILABLE.into();
+        let (lines, failed) = evaluate(&[floor("p", 1.20), floor("q", 1.20)], &[a, b]);
+        assert!(failed, "a sweep with no power reading must not pass");
+        let fails: Vec<&String> = lines.iter().filter(|l| l.contains("FAIL")).collect();
+        assert_eq!(fails.len(), 1, "one refusal, not one per row: {lines:?}");
+        assert!(
+            fails[0].contains("Windows only"),
+            "the refusal must name the platform limitation: {:?}",
+            fails[0]
         );
     }
 
