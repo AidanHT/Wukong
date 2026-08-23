@@ -391,176 +391,6 @@ fn time_round(mut run: impl FnMut()) -> f64 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// CPU PINNING — the largest single confound this section has, measured
-// ---------------------------------------------------------------------------------------------
-//
-// This laptop is an Intel Core Ultra 7 155H: 6 P-cores (SMT, logical 0-11), 8 E-cores and 2 LP
-// E-cores, 22 logical processors in three performance classes. Every program in this section is
-// single-threaded and each peer call is 50-200 ms, so a visit is ~1 s of uninterrupted scalar/AVX2
-// work — exactly the profile Windows' Thread Director demotes off a P-core.
-//
-// MEASURED, 2026-08-06, AC+CHARGING, same binary, same 4-round protocol, back to back, kill switch
-// only. The block section's raw per-round ms for the peer columns:
-//
-//   UNPINNED   C     81.16  105.32  127.66  174.30      (2.15x within ONE run, monotone)
-//              C++  108.88  109.65  112.24  205.66
-//              Rust 135.97  136.06  120.28  123.91
-//              -> C(twin) control 1.057x [0.695-1.472], spread 2.118x: THE CONTROL FAILED
-//
-//   PINNED     C     75.21   74.77   74.09   70.55      (1.07x)
-//   (CPU 0-1)  C++   73.46   74.15   73.21   73.75      (1.01x)
-//              Rust  88.70   83.70   85.12   87.13      (1.06x)
-//              -> C(twin) control spread ~1.05x: THE CONTROL PASSES
-//
-// The C column does not merely jitter unpinned — it DEGRADES MONOTONICALLY, 81 -> 174 ms, inside one
-// run, while the 4-5 ms Wukong columns in the same rounds do not move at all. That is the signature
-// of a long-running thread being walked down the performance classes, not of noise.
-//
-// Replicated on BATTERY the same day, three interleaved runs per arm (2026-08-06, discharging
-// 83%->76%, so the LEVELS are battery levels and not comparable to the AC pair above; the RATIO
-// between the arms is what is being read):
-//
-//   block C best-of-rounds, unpinned  276.6 / 280.9 / 289.2 ms
-//   block C best-of-rounds, pinned    154.5 / 130.0 / 154.8 ms      -> 1.79x / 2.16x / 1.87x
-//   run-to-run spread of the published `vs C` ratio, 19 rows:
-//       unpinned  median 1.085x  worst 1.823x
-//       pinned    median 1.035x  worst 1.076x
-//   and the same lever helps the OLD single-visit protocol just as much (main's binary, same runs):
-//       unpinned  median 1.170x  worst 1.271x
-//       pinned    median 1.055x  worst 1.103x
-//
-// So the "protocol changed the measured LEVEL of an unchanged peer by ~1.78x" finding is neither
-// thermal accumulation nor the round protocol's arithmetic. It is CORE PLACEMENT, it reproduces to
-// the decimal as a same-binary kill-switch A/B, and it is the single largest confound this section
-// has ever had — larger than the protocol change that exposed it.
-//
-// AND THE HARNESS HAD ALREADY PRINTED THE SMOKING GUN. The per-round clock probe of an unpinned run
-// (ec08db2's binary, AC+CHARGING, block section) traced
-//
-//     145 -> 85 -> 71 -> 51 -> 106 -> 101 GF/s   spread 2.85x
-//
-// across six rounds of ONE section, on a machine whose power state never changed. A 2.85x collapse
-// and partial recovery in a fixed AVX2-FMA loop is a thread moving between core classes, and it sat
-// in the output for anyone to read. The lesson is in `clock_probe_gflops`: a trace is only useful if
-// someone acts on it, and this one was reported as "the drift the ratios had to survive" rather than
-// as a defect to remove.
-//
-// Pinning is uniform across every column and carries no language content whatever — and it does not
-// have to be taken on trust, because `C(twin)` is exactly the instrument that checks it: a control
-// whose true ratio is 1.00 went from 2.12x spread to ~1.05x. That is the justification for turning it
-// on by default, and it is the only kind of justification worth having here.
-//
-// LIMITS, stated rather than glossed. One core is not the machine: an L3 shared with 15 idle
-// siblings behaves differently from a loaded one, and a single-core measurement says nothing about
-// throughput under load. This section only ever compares single-threaded columns against each other,
-// so that is the right trade — but do not carry a pinned number into a multicore claim. And the pin
-// does NOT make the `ms` column comparable across protocols: see [`time_round`].
-
-/// Which logical CPUs the general suite pins its timing thread to, from `XBENCH_PIN`.
-///
-/// * unset — CPUs 0 and 1, the two SMT threads of the first P-core. Logical processors are
-///   enumerated performance-class-first on every Intel hybrid client part, so CPU 0 is a P-core;
-///   allowing both siblings of one physical core costs nothing (only one of our threads runs) and
-///   leaves the OS somewhere to put an interrupt without evicting us.
-/// * `off` / `none` / `0` — no pinning. This is the kill switch the A/B above was measured with.
-/// * a comma-separated list of logical CPU indices — pin to exactly those.
-///
-/// An unparseable value falls back to the default rather than to "off": a typo must not silently
-/// remove the control that makes this section measurable.
-fn pin_mask() -> Option<usize> {
-    parse_pin(std::env::var("XBENCH_PIN").ok().as_deref())
-}
-
-/// The pure half of [`pin_mask`], so the contract is testable without mutating a process-global env
-/// var underneath every other test in the binary.
-fn parse_pin(v: Option<&str>) -> Option<usize> {
-    let Some(v) = v.map(str::trim) else {
-        return Some(0b11);
-    };
-    if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") || v == "0" {
-        return None;
-    }
-    let mut mask = 0usize;
-    for tok in v.split(',') {
-        match tok.trim().parse::<u32>() {
-            Ok(n) if (n as usize) < usize::BITS as usize => mask |= 1usize << n,
-            _ => return Some(0b11),
-        }
-    }
-    if mask == 0 {
-        Some(0b11)
-    } else {
-        Some(mask)
-    }
-}
-
-/// Pin the CALLING THREAD (not the process) to `mask`, returning the previous mask so it can be put
-/// back. Thread affinity is not inherited by child processes, so the `gcc`/`g++`/`rustc` peer
-/// compiles this section spawns still get the whole machine.
-#[cfg(windows)]
-fn set_thread_affinity(mask: usize) -> Option<usize> {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetCurrentThread() -> isize;
-        fn SetThreadAffinityMask(thread: isize, mask: usize) -> usize;
-    }
-    // SAFETY: `GetCurrentThread` returns a pseudo-handle that needs no closing, and
-    // `SetThreadAffinityMask` only reads it. A zero return is the documented failure signal (an
-    // empty mask, or one naming a processor this process is not allowed to run on).
-    let prev = unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
-    (prev != 0).then_some(prev)
-}
-
-#[cfg(not(windows))]
-fn set_thread_affinity(_mask: usize) -> Option<usize> {
-    None
-}
-
-/// Restores the thread's original affinity when the section ends, however it ends. A section that
-/// left the benchmark process pinned to one core would silently cap every LATER section's multicore
-/// rows — a benchmark bug that would look like a performance finding.
-struct PinGuard(Option<usize>);
-
-impl Drop for PinGuard {
-    fn drop(&mut self) {
-        if let Some(prev) = self.0 {
-            let _ = set_thread_affinity(prev);
-        }
-    }
-}
-
-/// Apply [`pin_mask`], print what happened, and hand back the guard that undoes it.
-fn pin_for_section() -> PinGuard {
-    let Some(mask) = pin_mask() else {
-        println!(
-            "  CPU PINNING: OFF (XBENCH_PIN). On this hybrid P/E laptop an unpinned single-threaded\n\
-             \x20   section migrates across performance classes mid-run — measured, the C(twin) control\n\
-             \x20   went 1.05x spread pinned to 2.12x unpinned, and the block C column drifted 81 ->\n\
-             \x20   174 ms inside ONE run. Expect this section to resolve nothing."
-        );
-        return PinGuard(None);
-    };
-    match set_thread_affinity(mask) {
-        Some(prev) => {
-            println!(
-                "  CPU PINNING: this section's timing thread is pinned to logical CPU mask {mask:#x}\n\
-                 \x20   (XBENCH_PIN=off disables; XBENCH_PIN=4,5 chooses). Every column is pinned the\n\
-                 \x20   same way, so this carries no language content — and the C(twin) control is what\n\
-                 \x20   checks it rather than asserting it. Peer compiles are separate processes and\n\
-                 \x20   still get the whole machine. A pinned figure is single-core only."
-            );
-            PinGuard(Some(prev))
-        }
-        None => {
-            println!(
-                "  CPU PINNING: requested mask {mask:#x} was REFUSED by the OS — running unpinned."
-            );
-            PinGuard(None)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
 // The round-interleaved measurement core, shared by all three programs
 // ---------------------------------------------------------------------------------------------
 
@@ -1457,11 +1287,11 @@ fn ix_of(labels: &[String], name: &str) -> Option<usize> {
 /// Entry point: every program in the general-code suite, in priority order.
 ///
 /// The pin is taken ONCE here and released when this returns, so all three programs are measured on
-/// the same core and nothing after this function is left pinned — see [`pin_for_section`].
+/// the same core and nothing after this function is left pinned — see [`crate::pin_for_section`].
 pub(crate) fn bench_general(cc: &str, cxx: &str, dir: &Path) {
     bench_ablation();
     println!();
-    let _pin = pin_for_section();
+    let _pin = crate::pin_for_section();
     bench_structure_tax(cc, cxx, dir);
     println!();
     bench_focal_loss(cc, cxx, dir);
@@ -2731,58 +2561,6 @@ mod tests {
                  \n{entry_body}"
             );
         }
-    }
-
-    /// `XBENCH_PIN` must default to pinning and must never fall THROUGH to "off" on a typo.
-    ///
-    /// The direction of the fallback is the whole point. Unpinned, this section's control column
-    /// (`C(twin)`, true ratio 1.00) measured 2.12x spread and the C column drifted 81 -> 174 ms
-    /// inside one run; pinned it measured ~1.05x and stayed flat. A mistyped `XBENCH_PIN=cpu0`
-    /// silently turning the pin off would hand a reader a page of numbers with no resolution at all
-    /// and no indication that anything had changed.
-    #[test]
-    fn pin_defaults_on_and_a_typo_does_not_disable_it() {
-        assert_eq!(parse_pin(None), Some(0b11), "unset must pin");
-        for off in ["off", "OFF", "none", "0", " off "] {
-            assert_eq!(parse_pin(Some(off)), None, "XBENCH_PIN={off:?}");
-        }
-        assert_eq!(parse_pin(Some("4")), Some(1 << 4));
-        assert_eq!(parse_pin(Some(" 4 , 5 ")), Some((1 << 4) | (1 << 5)));
-        for junk in ["cpu0", "", "-1", "4,cpu5", "999"] {
-            assert_eq!(
-                parse_pin(Some(junk)),
-                Some(0b11),
-                "XBENCH_PIN={junk:?} must fall back to the default, not to off"
-            );
-        }
-        // And the live reader must agree with the pure one under the ambient environment.
-        assert_eq!(
-            pin_mask(),
-            parse_pin(std::env::var("XBENCH_PIN").ok().as_deref())
-        );
-    }
-
-    /// A pin must be UNDONE. `bench_general` runs inside one process with the rest of the suite, and
-    /// a section that leaked a one-core affinity would cap every later multicore row — which would
-    /// read as a performance finding, not as a benchmark bug.
-    #[test]
-    fn the_pin_guard_restores_the_previous_affinity() {
-        let Some(before) = set_thread_affinity(!0usize) else {
-            return; // not Windows, or the OS refused: nothing to restore, nothing to prove.
-        };
-        {
-            let _g = PinGuard(set_thread_affinity(0b1));
-            // Re-reading the mask requires setting it, so prove the restore instead: the guard was
-            // handed the mask that was live before it narrowed things.
-        }
-        // After the guard, setting a fresh mask must report the FULL mask as the previous one, i.e.
-        // the guard put it back rather than leaving us on CPU 0.
-        let after = set_thread_affinity(!0usize).expect("affinity readable");
-        assert!(
-            after.count_ones() > 1,
-            "still pinned to one CPU after the guard: {after:#x}"
-        );
-        let _ = set_thread_affinity(before);
     }
 
     /// Every ablation probe must reach optimized MIR — a probe that failed to compile would print
