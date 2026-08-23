@@ -63,9 +63,24 @@ census-witnessed) against the committed C peers' kernels on the round-interleave
 the run is not evaluable (battery / AC+charging / power-state change / failed oracle). It requires
 AC+full and an idle box; `WUKONG_SOTA_FLOOR` overrides the floor-file path.
 
+> **`sota-check` is built but NOT YET ARMED.** `bench/sota/FLOOR.md` does not exist, so the mode
+> exits 2 with `cannot read …/bench/sota/FLOOR.md` and has never held a floor. Read every sentence
+> above as a description of the mechanism, not of a gate that is currently guarding anything. Arming
+> it needs a measurement round the machine cannot currently give: the floor values are transcribed
+> from a sweep run at **AC+full on an idle box**, and this laptop's other two power states (battery,
+> AC+charging) are different machines. Until that round happens and the owner has read the file,
+> part 11 of the ten-part gate is a step that refuses rather than a step that passes.
+
 **Timing requires `--release`.** Peers need gcc/g++/rustc on PATH; Wukong needs no external LLVM.
 
 ## Testing
 
-No dedicated `cargo test` suite — the harness is the instrument. Wukong output is checked against
-the interpreter oracle (bit-exact) inside each timed row.
+The timed rows are the instrument and have no `cargo test` equivalent: Wukong output is checked
+against the interpreter oracle (bit-exact) inside each row as it runs. What `cargo test -p
+wukong_xbench` does cover is the *pure* half — the f64 comparison oracles, the round/spread
+statistics, `parse_floor`, and `evaluate`'s refusals — which is where a measurement instrument
+fails silently rather than loudly. Two properties worth keeping there: the oracles return infinity
+for a non-finite deviation (`NaN > worst` is false, so a naive loop scores an all-NaN buffer as
+bit-exact), and `evaluate` refuses a run whose `C(twin)` control did not settle (`floor_factor`
+*grows* with a degraded control, so a wider tolerance would otherwise make the ratchet more
+forgiving exactly when the instrument is worst).
