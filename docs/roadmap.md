@@ -752,17 +752,28 @@ lacks; both of these used to read as either silence or a crash.
 - **A per-thread `.local` frame past the CUDA cap declines before the launch.** When a program is not
   megakernel-eligible it runs the single-thread lowering, whose frame is a per-thread `.local __frame`,
   and CUDA caps local memory at **512 KiB per thread**. Everything before the launch succeeds at any
-  size — `ptxas` compiles the frame, the module loads — so a 32 MiB frame used to surface as
+  size — `ptxas` compiles the frame, the module loads — so an over-cap frame used to surface as
   `DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")`, which reads as a crash. It is now
-  `UNSUPPORTED:` naming the entry, the frame size and the budget, and saying what lifts the program
-  onto the megakernel (whose `.global` frame has no such cap): a `@parallel` loop or a recognized
-  kernel. A **callee** frame is charged to the same per-thread budget but cannot be attributed to one
-  launch without a call-graph walk, so it is annotated onto the device error instead of declined.
+  `UNSUPPORTED:` naming the entry, the size and the budget. The quantity is the worst **call path**,
+  not the entry's own frame — CUDA charges the budget along the path, so two functions each under it
+  can be unlaunchable together, which is reachable at the CLI's default `-O0` — and the maximum over
+  paths is taken, not the sum over reachable functions. A recursive graph is not measured (depth is a
+  run-time property) and keeps the entry-only test.
+- **The megakernel is not exempt from that cap, only its entry is.** The mega entry's allocas live in
+  the shared `.global` frame buffer, but every mega *callee* gets an ordinary per-thread `.local`
+  frame, so a `@parallel` program with a large per-iteration local is declined to the single-thread
+  path rather than dying on a bare `gpu-mega launch failed`.
+- **A frame under budget can still be refused, and the note says so.** `ptxas` charges register spills
+  to the same per-thread cap and no static walk sees them — measured at 1,280–1,480 bytes for an entry
+  with 256 live accumulators, against a 1,024-byte reserve — so a `CUDA_ERROR_INVALID_VALUE` on this
+  path is annotated with the frame arithmetic even when nothing is statically over budget. An
+  annotation, never a decline: the program may be a few hundred bytes from running.
   The knobs on this backend are therefore `WUKONG_GPU_EXPLAIN`, `WUKONG_GPU_NO_MEGA`,
   `WUKONG_MEGA_GRID` and `WUKONG_GPU_DUMP_PTX` — environment only, none of them a CLI flag.
+  `WUKONG_GPU_EXPLAIN` reads its value, so `=0` is off.
 
 Corpus standing is printed by the gates
-themselves, over every fixture in `tests/run` (357 today — `ls tests/run/*.wk | wc -l`;
+themselves, over every fixture in `tests/run` (371 today — `ls tests/run/*.wk | wc -l`;
 this line has gone stale before): `lower::tests::run_corpus_matches_interp_oracle`
 sweeps each program at `-O0` and `-O3`, requires zero mismatches and zero device faults and non-zero
 coverage, and reports the rest as honest `UNSUPPORTED:` skips; `megakernel::tests::mega_corpus_matches_oracle`

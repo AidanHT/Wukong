@@ -93,14 +93,43 @@ all, the other said `DriverError`.
   `CU_DEVICE_ATTRIBUTE_*`, so it cannot be probed like SM count or L2). `ptxas` compiles a larger frame
   and `cuModuleLoadData` loads it — only the **launch** fails, with
   `DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")`, which reads as a crash. `jit_run_single`
-  now checks the entry frame against `lower::MAX_LOCAL_FRAME_BYTES` first and declines by name and by
-  size, and says what to do about it (the megakernel homes the frame in one shared `.global` buffer and
-  has no such cap, so a `@parallel` loop or a recognized kernel lifts the program onto it). MEASURED
-  boundary on the RTX 4050: a 523,648-byte `__frame` launches, 523,712 does not — `524288 − 523648 =
-  640` bytes of entry-wrapper ABI frame, which `ENTRY_ABI_FRAME_RESERVE` rounds up to 1 KiB. A
-  **callee** frame is charged to the same budget but cannot be attributed to one launch without a
-  call-graph walk, so it is annotated onto the device error rather than declined — never reclassified,
-  so a genuine fault stays a fault for the corpus gate.
+  now declines by name and by size before the launch.
+
+  **The quantity is the worst CALL PATH, not the entry's own frame**, and the first version of this
+  entry got that wrong in a way its own tests could not see. CUDA charges the budget along the path, so
+  `fn main` at 260,008 bytes calling `fn big` at 264,016 — each comfortably under budget, neither one
+  nameable by the annotation — launched with a sum of 524,024 and died bare, **at the CLI's default
+  `-O0`**. At `-O2` the inliner folds the two into one frame and the entry-only test fires, so the fix
+  worked at the level it was tested at and not at the level users get. `worst_call_path_frame` walks the
+  call graph (`Op::Call` and `Op::FuncAddr`), takes the maximum over paths rather than the sum over
+  reachable functions (two sibling callees are never live at once), and returns nothing for a recursive
+  graph — where depth, and so the charge, is a run-time property — leaving those programs exactly the
+  entry-only test they had before.
+
+  The same walk fixes two more. The **megakernel** path had the identical fault with neither decline nor
+  annotation: the mega *entry*'s frame is global, but `translate_mega_callee` gives every callee an
+  ordinary per-thread `.local __frame`, so `@parallel` with a large per-iteration local died on a bare
+  `gpu-mega launch failed` — reached by following the single-thread decline's own advice. And
+  `annotate_local_frames` had no reachability filter, so a module merely *containing* a huge never-called
+  function explained every unrelated fault with that dead function's size.
+
+  MEASURED on the RTX 4050, and the previously published boundary was wrong. A **523,712**-byte frame
+  launches and **523,720** does not, so the entry wrapper cost that program `524288 − 523712 = 576`
+  bytes, not 640; an independent two-function path measurement (523,704 launches, 523,728 does not)
+  brackets the same figure. The residual band `ENTRY_ABI_FRAME_RESERVE` mis-calls on the wrapper term is
+  therefore 448 bytes, not 384.
+
+  **And the 1 KiB reserve is a budget, not a bound — measured, not supposed.** `ptxas` charges register
+  SPILLS to the same per-thread cap and no walk over `Op::Alloca` can see them: an entry with 256 live
+  `f32` accumulators over a large array launches at a 522,808-byte frame and fails at 523,008, a
+  non-frame charge of **1,280 to 1,480 bytes**. No constant fixes that, so a `CUDA_ERROR_INVALID_VALUE`
+  launch failure on this path is now explained even when nothing is statically over budget — an
+  annotation, never a decline, because the program may be a few hundred bytes from running. The oracle
+  that would settle it is `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES` on the loaded function, which `cudarc`
+  0.16.6 does not expose (`CudaFunction`'s raw handle is `pub(crate)`); reading it needs a `gpu.rs`
+  change or a dependency bump, both out of scope here.
+
+  `WUKONG_GPU_EXPLAIN` now reads its value: `=0` used to turn the notes **on**, presence being the test.
 
 Both are pinned device-free: `megakernel::tests::the_megakernel_decline_reason_reaches_the_note`
 (three different `fusion::analyze` arms) and

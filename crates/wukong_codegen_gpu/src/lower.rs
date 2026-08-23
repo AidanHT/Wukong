@@ -118,15 +118,30 @@ pub const UNSUPPORTED: &str = "UNSUPPORTED:";
 /// `CUDA_ERROR_INVALID_VALUE`.
 pub const MAX_LOCAL_MEM_PER_THREAD: u64 = 512 * 1024;
 
-/// What `ptxas` charges the launched entry *on top of* `__frame`: the entry wrapper's own ABI frame
-/// (parameter save area, the callee `.func`'s frame, spills).
+/// What `ptxas` charges the launched entry *on top of* the `.local` frames this compiler can see:
+/// the entry wrapper's own ABI frame (parameter save area, return slot) **and its spill depot**.
 ///
-/// MEASURED on this box (RTX 4050, Windows/WDDM) by bisecting a single-array fixture through
-/// `--backend=gpu-native`: a **523,648**-byte `__frame` launches and **523,712** does not, and
-/// `524,288 - 523,648 = 640`, so the wrapper cost 640 bytes for that program. It is a property of
-/// the program, not a constant, so this is rounded up to 1 KiB and used as a *budget*, never as an
-/// oracle: the residual band it mis-calls is the 384 bytes between 523,264 and 523,648, and a
-/// program that lands there was within 384 bytes of unlaunchable anyway.
+/// MEASURED on this box (RTX 4050, Windows/WDDM), twice, from two different program shapes:
+///  - a single-array entry: a **523,712**-byte frame launches and **523,720** does not, so the
+///    wrapper cost that program `524,288 - 523,712 = 576` bytes;
+///  - a two-function call path: a **523,704**-byte sum launches and **523,728** does not, bracketing
+///    the same 576.
+///
+/// **This constant is a budget and NOT a bound, and the difference is measured, not hypothetical.**
+/// `ptxas` also spends per-thread local memory on register spills, which no static frame walk can
+/// see: an entry with 256 live `f32` accumulators over a large array launches at a **522,808**-byte
+/// frame and fails at **523,008**, so its non-frame charge is between **1,280 and 1,480 bytes** --
+/// above this reserve. A frame in that band is accepted here and refused by the driver, which is why
+/// [`annotate_local_frames`] explains a `CUDA_ERROR_INVALID_VALUE` launch failure on this path even
+/// when nothing is statically over budget. Raising the constant cannot fix it: the spill depot is a
+/// property of the program, and 512 accumulators would spend more. The oracle that WOULD settle it
+/// is `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES` on the loaded function -- ptxas's own number, spills and
+/// callee frames included -- but `cudarc` 0.16.6 exposes no getter and keeps `CudaFunction`'s raw
+/// `CUfunction` `pub(crate)`, so reading it means either a `gpu.rs` change or a dependency bump, and
+/// both are out of scope for a language wave.
+///
+/// The residual band this mis-calls on the wrapper term alone is the 448 bytes between 523,264 and
+/// 523,712.
 const ENTRY_ABI_FRAME_RESERVE: u64 = 1024;
 
 /// The largest per-thread `.local __frame` [`jit_run_single`] will try to launch — the cap minus the
@@ -211,15 +226,33 @@ pub fn jit_run_single(
     // *here* and not in `emit_ptx`: the lowering is correct, it is the launch that is impossible,
     // and keeping the decline out of the emitter keeps the device-free coverage sweeps measuring
     // what this backend can lower.
-    let frame = local_frame_bytes(entry_fn);
+    //
+    // The quantity is the worst CALL PATH, not the entry's own frame. The budget is charged along
+    // the path, so `fn main` at 260,008 bytes calling `fn big` at 264,016 -- each under budget,
+    // neither named by `annotate_local_frames` -- launches with a sum of 524,024 and dies bare. At
+    // `-O2` the inliner folds the two together and the entry-only test catches it, so the entry-only
+    // version worked at the optimization level it was tested at and not at the CLI's default `-O0`.
+    // Recursion yields `None` (depth is a run-time property) and falls back to the entry-only test,
+    // which is what every program had before.
+    let entry_frame = local_frame_bytes(entry_fn);
+    let (frame, path) =
+        worst_call_path_frame(program, entry).unwrap_or_else(|| (entry_frame, vec![entry]));
     if frame > MAX_LOCAL_FRAME_BYTES {
+        let via = if path.len() > 1 {
+            let names: Vec<&str> = path.iter().map(|s| interner.resolve(*s)).collect();
+            format!(" along the call path {} (frames sum along a path, so no single function here need be over budget)", names.join(" -> "))
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "{UNSUPPORTED} entry `{}` needs a {frame}-byte per-thread `.local` frame on the \
-             single-thread gpu-native path, over the {MAX_LOCAL_FRAME_BYTES}-byte budget (CUDA \
+            "{UNSUPPORTED} entry `{}` needs {frame} bytes of per-thread `.local` frame on the \
+             single-thread gpu-native path{via}, over the {MAX_LOCAL_FRAME_BYTES}-byte budget (CUDA \
              caps local memory at {MAX_LOCAL_MEM_PER_THREAD} bytes per thread). The cooperative \
-             megakernel has no such limit -- it homes the frame in one shared `.global` buffer -- \
-             so this is reachable only because the program is not megakernel-eligible; give it a \
-             `@parallel` loop or a recognized kernel, or make the buffers smaller",
+             megakernel homes the ENTRY's frame in one shared `.global` buffer and so has no such \
+             limit on it -- but its callees still get a per-thread `.local` frame and are charged \
+             the same cap -- so making the program megakernel-eligible with a `@parallel` loop or a \
+             recognized kernel helps only if the large buffers are the entry's own; otherwise make \
+             the buffers smaller",
             interner.resolve(entry)
         ));
     }
@@ -243,7 +276,130 @@ pub fn jit_run_single(
     // without a call-graph walk. A **callee** frame is charged to the same per-thread budget along
     // the call path, so it can still reach the driver; annotate rather than decline there, because a
     // decline on a function this launch may never enter would be a false coverage loss.
-    run_on_device(g, &ptx, &ret).map_err(|e| annotate_local_frames(e, program, interner))
+    run_on_device(g, &ptx, &ret).map_err(|e| annotate_local_frames(e, program, entry, interner))
+}
+
+/// Every MIR function `func` can transfer control into: a direct [`Op::Call`], and an
+/// [`Op::FuncAddr`] — the outlined `@parallel` body a runtime entry point calls back, which runs
+/// while the caller's frame is still live and is therefore on the same call path.
+fn callee_symbols(func: &Function) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    for b in &func.blocks {
+        for inst in &b.insts {
+            let sym = match &inst.op {
+                Op::Call { func, .. } => *func,
+                Op::FuncAddr(f) => *f,
+                _ => continue,
+            };
+            if !out.contains(&sym) {
+                out.push(sym);
+            }
+        }
+    }
+    out
+}
+
+/// The largest per-thread `.local` charge ONE call path starting at `from` can incur, and the path
+/// that incurs it (`from` first).
+///
+/// **CUDA charges the per-thread local budget along the call path, not against one function's
+/// `__frame`.** That is the half of D21 the entry-only test could not see, and it is reachable from
+/// the CLI's default `-O0`: two functions of 260,008 and 264,016 bytes are each comfortably under
+/// [`MAX_LOCAL_FRAME_BYTES`], and their sum of 524,024 is over the 524,288-byte hardware cap, so the
+/// launch fails with a bare `CUDA_ERROR_INVALID_VALUE` and nothing in the module is over budget for
+/// `annotate_local_frames` to name. At `-O2` the inliner folds the callee into the entry and the
+/// entry-only test does fire — the fix worked at the optimization level it was tested at and not at
+/// the one the CLI defaults to.
+///
+/// The maximum over paths is the right quantity, not the sum over reachable functions: two sibling
+/// callees are never live at once, and charging both would decline programs the device runs.
+///
+/// Returns `None` when a **cycle** is reachable — recursion makes the depth, and therefore the
+/// charge, a run-time property no static walk can bound. The caller then keeps the entry-only test,
+/// which is exactly the behaviour every program had before this walk existed, so recursion loses
+/// nothing it previously had.
+///
+/// A symbol with no MIR function is a runtime entry point (`wukong_*`); it contributes no `.local`
+/// frame of its own here, and if this backend cannot lower it the emitter has already declined.
+fn worst_call_path_frame(program: &Program, from: Symbol) -> Option<(u64, Vec<Symbol>)> {
+    fn walk(
+        program: &Program,
+        f: Symbol,
+        on_path: &mut Vec<Symbol>,
+        memo: &mut HashMap<Symbol, (u64, Vec<Symbol>)>,
+    ) -> Option<(u64, Vec<Symbol>)> {
+        if on_path.contains(&f) {
+            return None;
+        }
+        if let Some(hit) = memo.get(&f) {
+            return Some(hit.clone());
+        }
+        let Some(func) = program.function(f) else {
+            return Some((0, Vec::new()));
+        };
+        on_path.push(f);
+        let mut best = (0u64, Vec::new());
+        for callee in callee_symbols(func) {
+            let Some((bytes, path)) = walk(program, callee, on_path, memo) else {
+                on_path.pop();
+                return None;
+            };
+            if bytes > best.0 {
+                best = (bytes, path);
+            }
+        }
+        on_path.pop();
+        let mut path = vec![f];
+        path.extend(best.1);
+        let out = (local_frame_bytes(func) + best.0, path);
+        // Only successes are memoized. The value is "the worst path STARTING at `f`", which is
+        // independent of how `f` was reached, so caching it is sound; a `None` is a property of the
+        // path above `f` and caching that would be wrong.
+        memo.insert(f, out.clone());
+        Some(out)
+    }
+    walk(program, from, &mut Vec::new(), &mut HashMap::new())
+}
+
+/// The worst per-thread `.local` charge a megakernel **callee** path can incur, and the path.
+///
+/// The mega ENTRY's allocas are homed in the one shared `.global` frame buffer, which is why the
+/// megakernel has no per-thread cap on the entry -- but `translate_mega_callee` declares an ordinary
+/// per-thread `.local __frame` for every callee (`lower.rs`'s callee emitter), so the 512 KiB cap
+/// applies to them exactly as it does on the single-thread path. Nothing checked that, and nothing
+/// explained it: a `@parallel` program with a large per-iteration local died on a bare
+/// `gpu-mega launch failed: DriverError(CUDA_ERROR_INVALID_VALUE)` -- with strictly LESS diagnosis
+/// than the single-thread path gives, which mattered because the single-thread decline's own remedy
+/// is "give it a `@parallel` loop", routing users straight here.
+///
+/// `None` when a cycle is reachable (see [`worst_call_path_frame`]) or the entry has no callees.
+pub fn mega_callee_frame_bytes(program: &Program, entry: Symbol) -> Option<(u64, Vec<Symbol>)> {
+    let entry_fn = program.function(entry)?;
+    let mut best: Option<(u64, Vec<Symbol>)> = None;
+    for callee in callee_symbols(entry_fn) {
+        let hit = worst_call_path_frame(program, callee)?;
+        if best.as_ref().is_none_or(|b| hit.0 > b.0) {
+            best = Some(hit);
+        }
+    }
+    best
+}
+
+/// Every function reachable from `entry`, including it. Used to keep a diagnosis pointed at code the
+/// launch can actually enter.
+fn reachable_from(program: &Program, entry: Symbol) -> Vec<Symbol> {
+    let mut seen: Vec<Symbol> = Vec::new();
+    let mut stack = vec![entry];
+    while let Some(f) = stack.pop() {
+        if seen.contains(&f) {
+            continue;
+        }
+        seen.push(f);
+        if let Some(func) = program.function(f) {
+            stack.extend(callee_symbols(func));
+        }
+    }
+    seen
 }
 
 /// Append the per-thread `.local` frame diagnosis to a device error when some function in the module
@@ -256,25 +412,61 @@ pub fn jit_run_single(
 /// overflow) through this same `map_err`, and `run_corpus_matches_interp_oracle` compares
 /// `"assertion failed"` by **equality** against the interpreter's. Appending a note to that string
 /// would turn an agreeing pair into a reported fault.
-fn annotate_local_frames(e: String, program: &Program, interner: &Interner) -> String {
+fn annotate_local_frames(
+    e: String,
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> String {
     if !e.starts_with("gpu-native launch failed") && !e.starts_with("gpu-native JIT/load failed") {
         return e;
     }
+    // Only functions this launch can ENTER. Without the reachability filter a module that merely
+    // contains a never-called function with a huge frame explained every unrelated fault -- an
+    // illegal address or a bad PTX -- with that dead function's size, which points an operator at
+    // code the launch never touched. This crate's own rule is to read the first fault and its real
+    // cause.
+    let live = reachable_from(program, entry);
     let over: Vec<String> = program
         .funcs
         .iter()
+        .filter(|f| live.contains(&f.name))
         .map(|f| (f.name, local_frame_bytes(f)))
         .filter(|(_, bytes)| *bytes > MAX_LOCAL_FRAME_BYTES)
         .map(|(name, bytes)| format!("`{}` ({bytes} bytes)", interner.resolve(name)))
         .collect();
-    if over.is_empty() {
-        return e;
+    if !over.is_empty() {
+        return format!(
+            "{e}\n  (per-thread `.local` frames over the {MAX_LOCAL_FRAME_BYTES}-byte \
+             budget: {}; CUDA caps local memory at {MAX_LOCAL_MEM_PER_THREAD} bytes per thread)",
+            over.join(", ")
+        );
     }
-    format!(
-        "{e}\n  (per-thread `.local` frames over the {MAX_LOCAL_FRAME_BYTES}-byte \
-         budget: {}; CUDA caps local memory at {MAX_LOCAL_MEM_PER_THREAD} bytes per thread)",
-        over.join(", ")
-    )
+    // Nothing is statically over budget, and the launch still failed with the code a too-large
+    // per-thread frame produces. That is the residual band `ENTRY_ABI_FRAME_RESERVE` cannot bound:
+    // `ptxas` charges register SPILLS to the same per-thread budget, and no walk over `Op::Alloca`
+    // can see them. MEASURED here -- an entry with 256 live `f32` accumulators over a large array
+    // launches at a 522,808-byte frame and fails at 523,008, a non-frame charge of 1,280 to 1,480
+    // bytes against a 1,024-byte reserve. The launch geometry on this path is fixed at 1x1x1, so
+    // this code has essentially one other cause, and naming it beats handing back a bare driver
+    // enum. It stays an annotation and never a decline: the program may be a few hundred bytes from
+    // running, and declining it would be a coverage loss for a bound we do not have.
+    if e.contains("CUDA_ERROR_INVALID_VALUE") {
+        let path = worst_call_path_frame(program, entry)
+            .map(|(bytes, p)| {
+                let names: Vec<&str> = p.iter().map(|s| interner.resolve(*s)).collect();
+                format!("{bytes} bytes along {}", names.join(" -> "))
+            })
+            .unwrap_or_else(|| "unknown (the call graph is recursive)".to_string());
+        return format!(
+            "{e}\n  (the per-thread `.local` frame this launch needs is {path}, under the \
+             {MAX_LOCAL_FRAME_BYTES}-byte budget -- but `ptxas` charges register SPILLS to the same \
+             {MAX_LOCAL_MEM_PER_THREAD}-byte-per-thread cap and no static walk can see them, so a \
+             frame within about 1.5 KiB of the cap can still be refused. Shrink the largest local \
+             buffer, or reduce the number of values live across the loop)"
+        );
+    }
+    e
 }
 
 /// Emit the full PTX module for `program` with `entry` as the launched kernel. Public so tests and
@@ -5022,6 +5214,153 @@ fn main() -> i32 {
     /// `jit_run_single` can only decline the *entry*'s frame — a callee's is charged to the same
     /// per-thread budget along the call path, but attributing it to one launch needs a call-graph
     /// walk, and declining a function this launch may never enter would be a false coverage loss. So
+    /// CUDA charges the per-thread local budget along a CALL PATH, so two functions that are each
+    /// under budget can still be unlaunchable together. Device-free; the device measurement that
+    /// establishes the same thing is in `ENTRY_ABI_FRAME_RESERVE`'s note.
+    ///
+    /// `-O0` on purpose: at `-O2` the inliner folds the callee into the entry and the sum lands in
+    /// one frame, which is exactly why the entry-only test passed its own gate and failed the CLI's
+    /// default level.
+    #[test]
+    fn the_frame_budget_is_charged_along_the_call_path() {
+        let src = "module gate
+
+fn big(k: i32) -> f32 {
+    let mut b: [f32; 66000] = [0.0; 66000];
+    b[0] = 2.0;
+    b[65999] = k as f32;
+    return b[0] + b[65999];
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 65000] = [0.0; 65000];
+    a[0] = 1.0;
+    a[64999] = big(3);
+    print(a[64999] as i32);
+    return 0;
+}
+";
+        let (program, mut interner) = hostvec::build(src, 0).expect("fixture builds");
+        let entry = interner.intern("main");
+        let big = interner.intern("big");
+        for f in [entry, big] {
+            let own = local_frame_bytes(program.function(f).unwrap());
+            assert!(
+                own <= MAX_LOCAL_FRAME_BYTES,
+                "neither function may be over budget on its own, or this proves nothing: {own}"
+            );
+        }
+        let (sum, path) = worst_call_path_frame(&program, entry).expect("no recursion here");
+        assert!(
+            sum > MAX_LOCAL_FRAME_BYTES,
+            "the PATH must be over budget: {sum}"
+        );
+        assert_eq!(
+            path.iter()
+                .map(|s| interner.resolve(*s))
+                .collect::<Vec<_>>(),
+            vec!["main", "big"],
+            "the decline has to be able to name the path it measured"
+        );
+    }
+
+    /// The quantity is the MAXIMUM over paths, not the sum over reachable functions: two sibling
+    /// callees are never live at once, and charging both would decline programs the device runs.
+    #[test]
+    fn sibling_callees_are_not_charged_together() {
+        let src = "module gate
+
+fn left() -> f32 {
+    let mut a: [f32; 60000] = [0.0; 60000];
+    a[0] = 1.0;
+    return a[59999];
+}
+
+fn right() -> f32 {
+    let mut b: [f32; 60000] = [0.0; 60000];
+    b[0] = 2.0;
+    return b[59999];
+}
+
+fn main() -> i32 {
+    print((left() + right()) as i32);
+    return 0;
+}
+";
+        let (program, mut interner) = hostvec::build(src, 0).expect("fixture builds");
+        let entry = interner.intern("main");
+        let (sum, path) = worst_call_path_frame(&program, entry).expect("no recursion here");
+        let one = local_frame_bytes(program.function(interner.intern("left")).unwrap());
+        let root = local_frame_bytes(program.function(entry).unwrap());
+        assert_eq!(
+            sum,
+            root + one,
+            "one sibling, not both: {sum} (root {root}, sibling {one})"
+        );
+        assert_eq!(path.len(), 2, "the path is entry + one callee: {path:?}");
+    }
+
+    /// Recursion makes the depth, and therefore the charge, a run-time property. The walk declines
+    /// to answer rather than guess, and the caller keeps the entry-only test -- which is what every
+    /// program had before the walk existed, so recursion loses nothing.
+    #[test]
+    fn a_recursive_call_graph_declines_to_be_measured() {
+        let src = "module gate
+
+fn down(n: i32) -> i32 {
+    let mut a: [f32; 64] = [0.0; 64];
+    a[0] = n as f32;
+    if n <= 0 {
+        return 0;
+    }
+    return down(n - 1) + (a[0] as i32);
+}
+
+fn main() -> i32 {
+    print(down(3));
+    return 0;
+}
+";
+        let (program, mut interner) = hostvec::build(src, 0).expect("fixture builds");
+        let entry = interner.intern("main");
+        assert!(
+            worst_call_path_frame(&program, entry).is_none(),
+            "a reachable cycle must not produce a number"
+        );
+    }
+
+    /// A diagnosis must point at code the launch can enter. Without the reachability filter a module
+    /// that merely CONTAINS a huge never-called function explained every unrelated fault with that
+    /// dead function's size.
+    #[test]
+    fn a_never_called_function_does_not_explain_a_fault() {
+        let src = "module gate
+
+fn unused() -> f32 {
+    let mut a: [f32; 262144] = [0.0; 262144];
+    a[0] = 1.0;
+    return a[262143];
+}
+
+fn main() -> i32 {
+    print(7);
+    return 0;
+}
+";
+        let (program, mut interner) = hostvec::build(src, 0).expect("fixture builds");
+        let entry = interner.intern("main");
+        let dead = interner.intern("unused");
+        assert!(
+            local_frame_bytes(program.function(dead).expect("dead fn is in the module"))
+                > MAX_LOCAL_FRAME_BYTES,
+            "the dead function must be over budget or this proves nothing"
+        );
+        let e =
+            "gpu-native launch failed: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"x\")".to_string();
+        let out = annotate_local_frames(e.clone(), &program, entry, &interner);
+        assert_eq!(out, e, "an unreachable frame must not explain this fault");
+    }
+
     /// that case stays an error and [`annotate_local_frames`] makes it legible instead of leaving a
     /// bare driver code.
     ///
@@ -5058,7 +5397,7 @@ fn main() -> i32 {
         let launch =
             "gpu-native launch failed: DriverError(CUDA_ERROR_INVALID_VALUE, \"invalid argument\")"
                 .to_string();
-        let annotated = annotate_local_frames(launch.clone(), &program, &interner);
+        let annotated = annotate_local_frames(launch.clone(), &program, entry, &interner);
         assert!(
             annotated.starts_with(&launch),
             "the original error must survive verbatim at the front: {annotated}"
@@ -5079,7 +5418,7 @@ fn main() -> i32 {
             "gpu-native print buffer overflow: 9 records",
         ] {
             assert_eq!(
-                annotate_local_frames(untouched.to_string(), &program, &interner),
+                annotate_local_frames(untouched.to_string(), &program, entry, &interner),
                 untouched,
                 "a frame note on this error would break the corpus gate's comparison"
             );
