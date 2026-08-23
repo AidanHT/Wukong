@@ -32,6 +32,17 @@ the MIR dispatch census for **both** lowerings — recognized kernels are gate-b
 the only proof of what a number measured. The whole run pins its timing thread (`XBENCH_PIN=off`
 disables; see the CPU PINNING block in `src/main.rs`).
 
+The two lowerings are **built first and then timed A B B A**, and each row prints the `row floor`
+its own samples measured. Both matter for the same reason. Timed in source order, the
+recognition-off column was always second with a full parse + sema + lower + `optimize(3)` + JIT
+between the two timed regions, so every within-pair drift landed on `wk(gen)`, in every family, in
+one direction — the identical systematic bias `abba_min` exists to remove for C vs C++, sitting on
+the column the language's §3B ratio is read from rather than on context. And because the interleave
+times each build twice, the spread of one build's two samples is a twin control for that column, in
+that run, for free: `row floor 1.02x` is what an effect on that row has to beat, and a ratio inside
+it is printed `[INSIDE FLOOR]` rather than quoted. Before this the recognition-off headline had no
+control of any kind.
+
 Optional first CLI argument is a substring filter over kernel/section names (e.g. `saxpy`).
 
 ## Sections

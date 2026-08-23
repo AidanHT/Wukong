@@ -793,15 +793,21 @@ fn main() {
         let mut out: Vec<f32> = vec![0.0; N];
         let (xp, yp): (*const f32, *const f32) = (x.as_ptr(), y.as_mut_ptr());
 
-        let (wukong, wk_census) = match bench_wukong_with(&k.wuk, &mut out, xp, yp, true) {
-            Some((m, cen)) => (Some(m), Some(cen)),
-            None => (None, None),
-        };
-        // The recognition-off column (master plan §7.2): the SAME source, lowered with every kernel
-        // recognizer skipped — what the loop costs as the compiler compiles it, not as the pattern
-        // matcher dispatches it. Timed adjacent to the recognizer-on column so the pair is the
-        // tightest same-run A/B in the row.
-        let wukgen = bench_wukong_with(&k.wuk, &mut out, xp, yp, false);
+        // The recognizer-on and recognition-off columns (master plan §7.2) are the SAME source
+        // lowered twice: what the pattern matcher dispatches, and what the compiler compiles. Both
+        // are BUILT first and then timed A B B A, because they used to be timed in source order with
+        // a full parse + sema + lower + optimize + JIT sitting between the two timed regions — the
+        // exact systematic bias `abba_min` was written to remove for C vs C++, landing here on the
+        // column the language's §3B ratio is read from. See [`abba_min_wukong`].
+        let wk_on = build_wukong_with(&k.wuk, true);
+        let wk_off = build_wukong_with(&k.wuk, false);
+        let wk_census = wk_on.as_ref().map(|(_, c)| c.clone());
+        let wkgen_census = wk_off.as_ref().map(|(_, c)| c.clone());
+        let pair = abba_min_wukong(&wk_on.map(|(b, _)| b), &wk_off.map(|(b, _)| b), |b| {
+            time_wukong(b, &mut out, xp, yp)
+        });
+        let wk_floor = pair.floor();
+        let (wukong, wukgen) = (pair.on, pair.off);
         let (c, cpp) = bench_c_cpp(
             k.name,
             &k.c,
@@ -916,7 +922,7 @@ fn main() {
         // of the same source (the dispatch win, measured rather than asserted), plus the census
         // proving no `wukong_*` kernel survived. A divergence between the two lowerings of ONE
         // source is a compiler defect, not a timing: print it loudly and withhold the ratio.
-        if let Some((g, census)) = &wukgen {
+        if let (Some(g), Some(census)) = (&wukgen, &wkgen_census) {
             let checked = match &wukong {
                 Some(m) => {
                     let (rel, at) = max_rel_err(&m.out, &g.out);
@@ -949,10 +955,18 @@ fn main() {
                     }
                 };
                 let mut line = format!("  wk(gen) recognition-off: {:.0} ns", g.ns_per_call);
+                // Every ratio on this line is checked against the floor the row measured for
+                // itself: the ABBA timed each build TWICE, so the spread of one build's two samples
+                // is a twin control for this column, in this run. An effect inside it is not an
+                // effect (§4.1), and saying so here is the difference between a number and a claim.
+                let inside = |v: f64| wk_floor.is_some_and(|f| v < f);
                 if let Some(p) = &c {
                     let r = p.ns_per_call / g.ns_per_call;
                     let (v, w) = dir(r);
                     line.push_str(&format!(" — {v:.2}x {w} than C"));
+                    if inside(v) {
+                        line.push_str(" [INSIDE FLOOR]");
+                    }
                     if is_par {
                         gen_par_ratios_c.push(r);
                     } else {
@@ -962,6 +976,12 @@ fn main() {
                 if let Some(m) = &wukong {
                     let (v, w) = dir(m.ns_per_call / g.ns_per_call);
                     line.push_str(&format!("; {v:.2}x {w} than recognizer-on Wukong"));
+                    if inside(v) {
+                        line.push_str(" [INSIDE FLOOR]");
+                    }
+                }
+                if let Some(f) = wk_floor {
+                    line.push_str(&format!("; row floor {f:.2}x"));
                 }
                 println!("{line}");
                 println!("     wk(gen) census: {}", general::census_line(census));
@@ -7429,13 +7449,25 @@ fn bench_wukong(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32) -> O
 /// driver sets from the environment. The returned census is the T2 MIR witness
 /// (`--emit=mir -O2 | grep wukong_` equivalent): recognized kernels are gate-blind, so the census
 /// is the only proof of what a timed number actually measured.
-fn bench_wukong_with(
-    src: &str,
-    out: &mut [f32],
-    xp: *const f32,
-    yp: *const f32,
-    recognize: bool,
-) -> Option<(Measure, Vec<(String, usize)>)> {
+/// A JIT-compiled `kbench` that has NOT been timed yet, plus the wall time its compile took.
+///
+/// Split out of [`bench_wukong_with`] for the same reason [`build_peer`] was split out of
+/// [`bench_external`]: the recognizer-on and recognition-off lowerings of one source have to be
+/// BUILT first so that the two timed regions can be interleaved (A B B A) with nothing between
+/// them. Parse, sema, lower, `optimize(3)` and a Cranelift JIT is the noisiest thing this harness
+/// does short of spawning a compiler, and it used to sit squarely between the two.
+struct WukBuild {
+    /// Kept alive for exactly as long as `f` is called through — dropping it unmaps the code, so
+    /// this field is load-bearing precisely by never being read.
+    #[allow(dead_code)]
+    handle: wukong_codegen_cranelift::JitModuleHandle,
+    f: KernelFn,
+    compile: Duration,
+}
+
+/// Build one lowering of `src` — `recognize` picks the recognizer-on or the recognition-off column —
+/// and return it ready to time, with its kernel census.
+fn build_wukong_with(src: &str, recognize: bool) -> Option<(WukBuild, Vec<(String, usize)>)> {
     let t = Instant::now();
     let mut interner = Interner::new();
     let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
@@ -7472,24 +7504,101 @@ fn bench_wukong_with(
         return None;
     }
     let ptr = handle.func_ptr(sym)?;
-    let compile = t.elapsed();
-    // SAFETY: `kbench_abi_ok` just checked the lowered `kbench` is (ptr, ptr, ptr) -> void,
-    // which is exactly `KernelFn`; `handle` is kept alive across the call below.
+    // SAFETY: `kbench_abi_ok` just checked the lowered `kbench` is (ptr, ptr, ptr) -> void, which is
+    // exactly `KernelFn`; `handle` is stored beside it and outlives every call through it.
     let f: KernelFn = unsafe { std::mem::transmute(ptr) };
-
-    out.iter_mut().for_each(|v| *v = 0.0);
-    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
-    let ns = time_ns(|| unsafe { f(xp, yp, op) });
-    let snapshot = out.to_vec();
-    drop(handle); // keep alive through timing
     Some((
-        Measure {
-            compile,
-            ns_per_call: ns,
-            out: snapshot,
+        WukBuild {
+            handle,
+            f,
+            compile: t.elapsed(),
         },
         census,
     ))
+}
+
+/// Time an already-built lowering. Derives the kernel's output pointer from `out` — see the
+/// one-live-pointer law on [`bench_wukong`].
+fn time_wukong(b: &WukBuild, out: &mut [f32], xp: *const f32, yp: *const f32) -> Option<Measure> {
+    out.iter_mut().for_each(|v| *v = 0.0);
+    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let f = b.f;
+    let ns = time_ns(|| unsafe { f(xp, yp, op) });
+    let snapshot = out.to_vec();
+    Some(Measure {
+        compile: b.compile,
+        ns_per_call: ns,
+        out: snapshot,
+    })
+}
+
+/// Both timed lowerings of one source, each with the noise floor its own two samples measured.
+struct WukPair {
+    on: Option<Measure>,
+    off: Option<Measure>,
+    /// `max/min` of the two samples of the SAME build — a twin control, free, on this exact row.
+    /// `None` when a column produced fewer than two samples.
+    on_floor: Option<f64>,
+    off_floor: Option<f64>,
+}
+
+impl WukPair {
+    /// The widest floor either column measured: any ratio BETWEEN the two columns is subject to
+    /// both, so this is the number a `wk(gen)` effect has to beat to be an effect at all (§4.1).
+    fn floor(&self) -> Option<f64> {
+        match (self.on_floor, self.off_floor) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// Time two already-built lowerings of one source **A B B A**, keeping each column's own fastest
+/// sample and the spread of its two.
+///
+/// The bias this removes is the one [`abba_min`]'s note measured for C vs C++, in the place it was
+/// worse: the recognition-off column was ALWAYS second, and a full parse + sema + lower +
+/// `optimize(3)` + JIT ran between the two timed regions. Every within-pair drift therefore landed
+/// on `wk(gen)` in every family, in the same direction — and `wk(gen)` is the column the language's
+/// own §3B ratio is read from, so the bias sat on the headline rather than on context.
+///
+/// The two samples per column are not extra precision, they are the CONTROL: `a1` and `a2` time the
+/// identical build, so their spread is a `C(twin)` for this row, of this column, in this run. The
+/// recognition-off headline had no control of any kind before.
+fn abba_min_wukong(
+    on: &Option<WukBuild>,
+    off: &Option<WukBuild>,
+    mut time: impl FnMut(&WukBuild) -> Option<Measure>,
+) -> WukPair {
+    let a1 = on.as_ref().and_then(&mut time);
+    let b1 = off.as_ref().and_then(&mut time);
+    let b2 = off.as_ref().and_then(&mut time);
+    let a2 = on.as_ref().and_then(&mut time);
+    let spread = |x: &Option<Measure>, y: &Option<Measure>| match (x, y) {
+        (Some(p), Some(q)) if p.ns_per_call > 0.0 && q.ns_per_call > 0.0 => {
+            Some((p.ns_per_call / q.ns_per_call).max(q.ns_per_call / p.ns_per_call))
+        }
+        _ => None,
+    };
+    let (on_floor, off_floor) = (spread(&a1, &a2), spread(&b1, &b2));
+    WukPair {
+        on: faster(a1, a2),
+        off: faster(b1, b2),
+        on_floor,
+        off_floor,
+    }
+}
+
+fn bench_wukong_with(
+    src: &str,
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+    recognize: bool,
+) -> Option<(Measure, Vec<(String, usize)>)> {
+    let (build, census) = build_wukong_with(src, recognize)?;
+    let m = time_wukong(&build, out, xp, yp)?;
+    Some((m, census))
 }
 
 /// A built-and-loaded peer library, plus the wall time its compiler process took.
