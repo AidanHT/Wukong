@@ -39,11 +39,17 @@ Optional first CLI argument is a substring filter over kernel/section names (e.g
 | section | module | focus |
 |---|---|---|
 | elementwise / GEMM / … | `src/main.rs` | recognizer-dialect kernels |
-| general code | `src/general.rs` | ML-engineer spellings that may miss recognizers |
+| general code | `src/general.rs` | ML-engineer spellings, each lowered twice: as written, and `(gen)` = recognition off |
 | model | `src/model.rs` | 12-layer forward vs PyTorch |
 
 The `general` section prints a **dispatch census** (`grep wukong_` equivalent) because recognized
 kernels are GATE-BLIND to `cargo test`.
+
+This section was built on the premise that these spellings *miss* the recognizers, and measurement
+says otherwise: all five block spellings dispatch 13-16 call sites, `b-natural` included. So each
+Wukong program is built twice — as written, and again with recognition off (the `(gen)` columns) —
+and only the `(gen)` rows are floorable under §3B, because only they measure the language rather than
+the dispatcher. The recognizer-on rows are kept as context and `sota-check` marks them `off-bar`.
 
 ## Usage
 

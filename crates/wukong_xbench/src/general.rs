@@ -672,7 +672,18 @@ pub(crate) struct WukBlock {
     pub(crate) census: Vec<(String, usize)>,
 }
 
-pub(crate) fn compile_block(src: &str, label: &str, nparams: usize) -> Option<WukBlock> {
+/// `recognize` is the §3B instrument, not a tuning knob. With it OFF the program is lowered as
+/// written — no recognizer may intercept a loop and substitute a hand-written `wukong_runtime`
+/// kernel — which is the only lowering a *language* ratio may be read from. With it ON the column
+/// measures the dispatcher, which is context. It is the same switch `WUKONG_NO_RECOGNIZE` sets in
+/// the driver and `bench_wukong_with` sets for the ~45-family battery, reached the same way, so all
+/// three agree by construction rather than by comment.
+pub(crate) fn compile_block(
+    src: &str,
+    label: &str,
+    nparams: usize,
+    recognize: bool,
+) -> Option<WukBlock> {
     let t = Instant::now();
     let mut interner = Interner::new();
     let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
@@ -685,7 +696,12 @@ pub(crate) fn compile_block(src: &str, label: &str, nparams: usize) -> Option<Wu
         eprintln!("general/{label}: wukong sema error: {sd:?}");
         return None;
     }
-    let (mut program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    let opts = wukong_mir_build::LowerOptions {
+        recognize,
+        ..Default::default()
+    };
+    let (mut program, ld) =
+        wukong_mir_build::lower_program_with(&module, &sema, &mut interner, opts);
     if ld.iter().any(|d| d.is_error()) {
         eprintln!("general/{label}: wukong lower error: {ld:?}");
         return None;
@@ -780,8 +796,8 @@ pub(crate) fn census_line(census: &[(String, usize)]) -> String {
 /// Build one Wukong column of the structure-tax table. Build ONLY — nothing is timed here, because
 /// round interleaving requires every column to exist before any of them is measured, and a JIT
 /// compile sitting between two timed columns is exactly the kind of gap the drift hides in.
-fn build_wukong_col(src: &str, label: &str, note: &str) -> Option<Col<BlockFn>> {
-    let blk = compile_block(src, label, N_IN + N_SCRATCH)?;
+fn build_wukong_col(src: &str, label: &str, note: &str, recognize: bool) -> Option<Col<BlockFn>> {
+    let blk = compile_block(src, label, N_IN + N_SCRATCH, recognize)?;
     // SAFETY: `block_abi_ok` just proved the lowered `kbench` is 27 pointers -> void, which is
     // exactly `BlockFn`; the handle is moved into `Keep` and outlives every call.
     let f: BlockFn = unsafe { std::mem::transmute(blk.ptr) };
@@ -1441,16 +1457,32 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     // built and timed the peers, one language after another. Two consequences, both systematic and
     // neither visible in the output: any drift across the section was charged to whichever column
     // ran last (always Rust), and the Wukong columns always got the earliest, coolest slots — a bias
-    // in Wukong's own favour, in Wukong's own benchmark. Building everything first and putting all
-    // ten columns into ONE rotating round schedule removes both.
+    // in Wukong's own favour, in Wukong's own benchmark. Building everything first and putting every
+    // column into ONE rotating round schedule removes both.
     let mut cols: Vec<Col<BlockFn>> = Vec::new();
     for (label, src, note) in VARIANTS {
         let text = subst(src, m);
         // Dump the exact compiled source so `wukongc --emit=mir -O2 <file>` reproduces the census.
         let _ = std::fs::write(dir.join(format!("general_block_{label}.wk")), &text);
-        match build_wukong_col(&text, label, note) {
+        match build_wukong_col(&text, label, note, true) {
             Some(c) => cols.push(c),
             None => println!("  ! {label}: did not compile — row dropped"),
+        }
+    }
+    // The same five spellings again, lowered with recognition OFF, and they are the only columns of
+    // this table a §3B *language* ratio may be read from. With recognizers on all five dispatch
+    // hand-written AVX2 kernels — `a-recognizer` by design, but `b-natural` too, the one written
+    // with no regard for them at all — so every ratio in the top half measures the dispatcher, and
+    // the geomean is a dispatcher number however the section is titled. Both halves are kept
+    // because both are true and they answer different questions: what the recognizer reaches, and
+    // what the language does unaided. Reproduce a `(gen)` census with `WUKONG_NO_RECOGNIZE=1
+    // wukongc --emit=mir -O2 <the dumped file>` — same source, the switch is the only difference.
+    for (label, src, note) in VARIANTS {
+        let text = subst(src, m);
+        let gen_label = format!("{label}(gen)");
+        match build_wukong_col(&text, &gen_label, note, false) {
+            Some(c) => cols.push(c),
+            None => println!("  ! {gen_label}: did not compile — row dropped"),
         }
     }
     let n_wuk = cols.len();
@@ -1994,21 +2026,32 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     let wk_src = subst_loss(LOSS_WK, m);
     let path = dir.join("general_loss_focal.wk");
     let _ = std::fs::write(&path, &wk_src);
-    match compile_block(&wk_src, "loss", LOSS_PARAMS) {
-        Some(blk) => {
-            // SAFETY: `block_abi_ok` proved the lowered `kbench` is 6 pointers -> void = `LossFn`;
-            // the handle is moved into `Keep` and outlives every call.
-            let f: LossFn = unsafe { std::mem::transmute(blk.ptr) };
-            cols.push(Col {
-                label: "Wukong".to_string(),
-                note: "the .wk source, through the real pipeline".to_string(),
-                census: census_line(&blk.census),
-                compile: blk.compile,
-                f,
-                _keep: Keep::Jit(blk.handle),
-            });
+    // Both lowerings of the one source. `Wukong` is the dispatcher's column and is context;
+    // `Wukong(gen)` is recognition-off and is the only one a §3B language ratio may be read from.
+    for (label, recognize, note) in [
+        ("Wukong", true, "the .wk source, through the real pipeline"),
+        (
+            "Wukong(gen)",
+            false,
+            "the same source, recognition off — lowered as written",
+        ),
+    ] {
+        match compile_block(&wk_src, label, LOSS_PARAMS, recognize) {
+            Some(blk) => {
+                // SAFETY: `block_abi_ok` proved the lowered `kbench` is 6 pointers -> void =
+                // `LossFn`; the handle is moved into `Keep` and outlives every call.
+                let f: LossFn = unsafe { std::mem::transmute(blk.ptr) };
+                cols.push(Col {
+                    label: label.to_string(),
+                    note: note.to_string(),
+                    census: census_line(&blk.census),
+                    compile: blk.compile,
+                    f,
+                    _keep: Keep::Jit(blk.handle),
+                });
+            }
+            None => println!("  ! {label} loss did not compile — row dropped"),
         }
-        None => println!("  ! Wukong loss did not compile — row dropped"),
     }
     let n_wuk = cols.len();
 
@@ -2102,7 +2145,7 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
         .iter()
         .take(n_wuk)
         .enumerate()
-        .map(|(i, _)| (i, "general/focal_loss".to_string()))
+        .map(|(i, c)| (i, format!("general/focal_loss:{}", c.label)))
         .collect();
     sota_rows(&names, &cols, &rr, twin, &oks)
 }
@@ -2487,21 +2530,31 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     let wk_src = subst_scan(SCAN_WK, m);
     let path = dir.join("general_scan_s6.wk");
     let _ = std::fs::write(&path, &wk_src);
-    match compile_block(&wk_src, "scan", SCAN_PARAMS) {
-        Some(blk) => {
-            // SAFETY: `block_abi_ok` proved the lowered `kbench` is 8 pointers -> void = `ScanFn`;
-            // the handle is moved into `Keep` and outlives every call.
-            let f: ScanFn = unsafe { std::mem::transmute(blk.ptr) };
-            cols.push(Col {
-                label: "Wukong".to_string(),
-                note: "the .wk source, through the real pipeline".to_string(),
-                census: census_line(&blk.census),
-                compile: blk.compile,
-                f,
-                _keep: Keep::Jit(blk.handle),
-            });
+    // Both lowerings of the one source — see the focal-loss section for why both are kept.
+    for (label, recognize, note) in [
+        ("Wukong", true, "the .wk source, through the real pipeline"),
+        (
+            "Wukong(gen)",
+            false,
+            "the same source, recognition off — lowered as written",
+        ),
+    ] {
+        match compile_block(&wk_src, label, SCAN_PARAMS, recognize) {
+            Some(blk) => {
+                // SAFETY: `block_abi_ok` proved the lowered `kbench` is 8 pointers -> void =
+                // `ScanFn`; the handle is moved into `Keep` and outlives every call.
+                let f: ScanFn = unsafe { std::mem::transmute(blk.ptr) };
+                cols.push(Col {
+                    label: label.to_string(),
+                    note: note.to_string(),
+                    census: census_line(&blk.census),
+                    compile: blk.compile,
+                    f,
+                    _keep: Keep::Jit(blk.handle),
+                });
+            }
+            None => println!("  ! {label} scan did not compile — row dropped"),
         }
-        None => println!("  ! Wukong scan did not compile — row dropped"),
     }
     let n_wuk = cols.len();
 
@@ -2591,7 +2644,7 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
         .iter()
         .take(n_wuk)
         .enumerate()
-        .map(|(i, _)| (i, "general/s6_scan".to_string()))
+        .map(|(i, c)| (i, format!("general/s6_scan:{}", c.label)))
         .collect();
     sota_rows(&names, &cols, &rr, twin, &oks)
 }

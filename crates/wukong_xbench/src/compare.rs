@@ -261,7 +261,11 @@ fn bench_fixture(fx: &Fixture, cc: &str, dir: &Path) -> SotaRow {
     // ---- build every column first, time nothing yet (the round protocol's precondition) ----
     let stem = fx.program.replace('/', "_");
     let mut cols: Vec<Col<CmpFn>> = Vec::new();
-    match compile_block(&fx.wk, &stem, 3) {
+    // Recognizers stay ENABLED here on purpose: these twins carry `@generic` in the source, which is
+    // the per-function opt-out, and the census check below is what proves it held. Passing `false`
+    // would reach the same lowering by a different road and quietly make both the attribute and that
+    // check vacuous — a fixture that lost its `@generic` would still read `NOTHING` and pass.
+    match compile_block(&fx.wk, &stem, 3, true) {
         Some(blk) => {
             // Dump the exact compiled source so `wukongc --emit=mir -O2 <file>` reproduces the
             // census.

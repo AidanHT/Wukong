@@ -108,6 +108,21 @@ pub(crate) fn parse_floor(text: &str) -> Result<Vec<FloorRow>, String> {
             wave: cells[9].to_string(),
         });
     }
+    // A program name is the key `evaluate` looks a sweep row up by, so a repeated one is not a
+    // duplicate record — it is a floor that will never be read. The lookup takes the first match and
+    // every later row with that name is silently skipped, which is the one failure a ratchet file
+    // must not have: the row is present, the reviewer sees it, and nothing grades it.
+    for (i, r) in rows.iter().enumerate() {
+        if let Some(j) = rows[..i].iter().position(|p| p.program == r.program) {
+            return Err(format!(
+                "FLOOR.md: program {:?} appears twice (rows {} and {}) — the second would never be \
+                 graded, because the sweep is looked up by name",
+                r.program,
+                j + 1,
+                i + 1
+            ));
+        }
+    }
     Ok(rows)
 }
 
@@ -631,5 +646,18 @@ mod tests {
             lines.iter().any(|l| l.contains("at or above PARITY")),
             "a resolved row must still report its tier: {lines:?}"
         );
+    }
+
+    /// A repeated program name is not a duplicate record — it is a floor that will never be graded,
+    /// because `evaluate` looks the sweep up by name and takes the first match.
+    #[test]
+    fn a_floor_file_with_a_repeated_program_is_rejected() {
+        let text =
+            "| program | peer | tier | floor | date | power | twin | cause | owner | wave |\n\
+|---|---|---|---|---|---|---|---|---|---|\n\
+| general/s6_scan:Wukong(gen) | C | PARITY | 1.00x | d | AC+full | t | — | — | — |\n\
+| general/s6_scan:Wukong(gen) | C | PARITY | 1.20x | d | AC+full | t | — | — | — |\n";
+        let err = parse_floor(text).unwrap_err();
+        assert!(err.contains("appears twice"), "{err}");
     }
 }
