@@ -884,11 +884,33 @@ pub struct LowerOptions {
     /// kernel") becomes measurable. `wukong_driver` sets it from `WUKONG_NO_RECOGNIZE`, and
     /// `@generic` on a function turns it off for that function alone.
     pub recognize: bool,
+
+    /// Build the 256-bit raw-AVX2 `Op::VecKernelCall` recipes (`true`, the default and the shipped
+    /// behavior on a Win64 host with AVX2+FMA3). When `false`, both recipe sites fall through to
+    /// the **result-identical** 128-bit CLIF path.
+    ///
+    /// This exists because `VecKernelCall` is not portable SIMD — it carries assembled bytes that
+    /// hardcode the Win64 argument registers — so `wukong_codegen_gpu` declines it, by design and
+    /// permanently. The MIR is built once and handed to whichever backend was asked for, so on this
+    /// host the CPU vectorizer's choice was silently deciding whether the *GPU* backend could run
+    /// the program at all: `--backend=gpu-native` on `tests/run/lang_generic_saxpy.wk` failed with
+    /// `UNSUPPORTED: VecKernelCall (CPU raw-AVX2 kernel) not lowered to PTX` unless the operator
+    /// happened to know to set `WUKONG_P4_NO_256=1`. `wukong_driver` now clears this for the
+    /// GPU-lowering backend instead.
+    ///
+    /// The `WUKONG_P4_NO_256` kill-switch is unchanged and still read at both sites; it stays the
+    /// same-run A/B knob for measuring the 256-bit win on CPU, and the escape hatch if a recipe
+    /// body is ever found miscompiled. This option is the *other* conjunct, chosen by the pipeline
+    /// rather than the environment.
+    pub vec_kernels: bool,
 }
 
 impl Default for LowerOptions {
     fn default() -> LowerOptions {
-        LowerOptions { recognize: true }
+        LowerOptions {
+            recognize: true,
+            vec_kernels: true,
+        }
     }
 }
 
@@ -954,6 +976,7 @@ pub fn lower_program_with(
     // Runtime symbols the matmul recognizer lowers a GEMM nest to (interned once, threaded down).
     let gemm = GemmSyms {
         recognize: opts.recognize,
+        vec_kernels: opts.vec_kernels,
         mm: interner.intern("wukong_sgemm"),
         mm_par: interner.intern("wukong_sgemm_parallel"),
         print_str: interner.intern("print_str"),
@@ -2666,6 +2689,12 @@ struct GemmSyms {
     /// the loop the user wrote. Read at the two cascade heads (`lower_program`'s whole-function
     /// interceptions and `FnLowerer::lower_for`), so a recognizer body never has to check it.
     recognize: bool,
+    /// 256-bit raw-AVX2 recipe switch ([`LowerOptions::vec_kernels`]). Rides here for the same
+    /// reason `recognize` does: this struct already reaches both recipe sites. `false` means take
+    /// the result-identical 128-bit CLIF path, which is what every non-Win64 host does anyway and
+    /// what `--backend=gpu-native` needs, since `VecKernelCall` carries Win64-ABI bytes no PTX
+    /// backend can lower.
+    vec_kernels: bool,
     mm: Symbol,
     mm_par: Symbol,
     /// Runtime print of a null-terminated string buffer (a `*u8` argument to `print`/`println`),
@@ -15301,6 +15330,7 @@ impl FnLowerer<'_> {
         // ("avx2 assemble vec kernel 0.0: avx2: host lacks AVX2+FMA3 under the Win64 ABI these
         // kernels encode") — declining here is the documented, result-identical 128-bit fallback.
         if *lane == MirType::F32
+            && self.gemm.vec_kernels
             && host_supports_vec_kernels()
             && std::env::var_os("WUKONG_P4_NO_256").is_none()
         {
@@ -15739,6 +15769,7 @@ impl FnLowerer<'_> {
         let trip_ok = known_trip.is_some_and(|t| t >= VEC256_REDUCTION_MIN_TRIP);
         if trip_ok
             && *lane == MirType::F32
+            && self.gemm.vec_kernels
             && host_supports_vec_kernels()
             && std::env::var_os("WUKONG_P4_NO_256").is_none()
             && self.try_emit_reduction_256(j, s0, end_v, ity, s_sym, addend, redop)
@@ -28464,7 +28495,13 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
             "the default must still dispatch the kernel, or the test below is vacuous"
         );
 
-        let (off, diags, interner) = lower_with(MATMUL_SRC, LowerOptions { recognize: false });
+        let (off, diags, interner) = lower_with(
+            MATMUL_SRC,
+            LowerOptions {
+                recognize: false,
+                ..LowerOptions::default()
+            },
+        );
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         let calls = kernel_calls(&off, &interner);
         assert!(
@@ -28486,7 +28523,13 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
     #[test]
     fn recognize_off_keeps_parallel_outlining() {
         let src = head_loop_src("@parallel\n");
-        let (prog, diags, interner) = lower_with(&src, LowerOptions { recognize: false });
+        let (prog, diags, interner) = lower_with(
+            &src,
+            LowerOptions {
+                recognize: false,
+                ..LowerOptions::default()
+            },
+        );
         assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
         assert!(
             prog_calls(&prog, &interner, "wukong_parallel_for"),

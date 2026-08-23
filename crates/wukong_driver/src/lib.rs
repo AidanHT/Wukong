@@ -197,6 +197,37 @@ fn no_recognize() -> bool {
     std::env::var_os(NO_RECOGNIZE_ENV).is_some()
 }
 
+/// The `mir_build` options for this invocation.
+///
+/// Two switches, and they are decided *here* for the same reason: the MIR is built **once** and
+/// handed to whichever backend was asked for, so anything that changes what the MIR contains has to
+/// be a value chosen by the pipeline rather than an environment read buried in a recognizer.
+///
+/// * `recognize` - the `WUKONG_NO_RECOGNIZE` measurement instrument ([`NO_RECOGNIZE_ENV`]), read in
+///   this function and nowhere else in the compiler.
+/// * `vec_kernels` - the 256-bit raw-AVX2 recipes, which assemble Win64-ABI machine code into
+///   `Op::VecKernelCall`. No PTX backend can lower that, and `wukong_codegen_gpu` declines it by
+///   design and permanently - so on an AVX2 Win64 host the *CPU* vectorizer's choice was deciding
+///   whether the *GPU* backend could run the program at all. `--backend=gpu-native` on any
+///   unrecognized f32 elementwise loop (`tests/run/lang_parallel_saxpy.wk`,
+///   `lang_generic_saxpy.wk`, `lang_generic_copy.wk` - the three flagship language fixtures) failed
+///   with `UNSUPPORTED: VecKernelCall (CPU raw-AVX2 kernel) not lowered to PTX` unless the operator
+///   happened to know to set `WUKONG_P4_NO_256=1`.
+///
+/// [`BackendKind::Gpu`] is deliberately NOT in the second rule: that path tree-walks the program in
+/// the interpreter and offloads recognized calls only, so it wants the CPU recipes exactly as much
+/// as `interp` and `native` do. Only *whole-program* lowering needs MIR a PTX backend can consume.
+///
+/// The `WUKONG_P4_NO_256` kill-switch is untouched and still read inside `mir_build`; it remains the
+/// same-run A/B knob for measuring the 256-bit win on CPU, and the escape hatch if a recipe body is
+/// ever found miscompiled. This option is the *other* conjunct of the same gate.
+fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
+    wukong_mir_build::LowerOptions {
+        recognize: !no_recognize(),
+        vec_kernels: !matches!(opts.backend, BackendKind::GpuLower),
+    }
+}
+
 /// Run the pipeline for `opts`, printing artifacts to stdout and diagnostics to stderr.
 /// Returns a process exit code.
 pub fn compile(opts: &Options) -> i32 {
@@ -319,12 +350,10 @@ pub fn compile(opts: &Options) -> i32 {
     };
 
     // --- MIR construction ---
-    // `WUKONG_NO_RECOGNIZE` (the measurement instrument, see `NO_RECOGNIZE_ENV`) is read here and
-    // nowhere else: mir_build takes it as an option so the switch is a value in the pipeline rather
-    // than an environment read buried in a recognizer.
-    let lower_opts = wukong_mir_build::LowerOptions {
-        recognize: !no_recognize(),
-    };
+    // Both switches that change *what the MIR contains* are values chosen by the pipeline, not
+    // environment reads inside a recognizer; `lower_options_for` is where that choice lives and why
+    // the requested backend is part of it.
+    let lower_opts = lower_options_for(opts);
     let (mut program, lower_diags) =
         wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lower_opts);
     for d in &lower_diags {
@@ -1305,6 +1334,111 @@ fn render_all(fmt: ErrorFormat, renderer: &Renderer, sink: &DiagnosticSink, sm: 
 /// that autodiff-from-source is correct — the recognized backward kernels are gate-blind (both
 /// backends call the same symbol), so the f64/closed-form finite-difference check, not interp==native,
 /// is what proves the gradient. Toolchain-free: it runs entirely on the interpreter oracle.
+#[cfg(test)]
+mod lower_options_tests {
+    use super::*;
+
+    fn opts_for(backend: BackendKind) -> Options {
+        Options {
+            backend,
+            ..Options::default()
+        }
+    }
+
+    /// Lower `src` at `-O2` under `lo` and count the `Op::VecKernelCall`s that survive.
+    fn count_vec_kernels(src: &str, lo: wukong_mir_build::LowerOptions) -> usize {
+        let mut sm = SourceMap::new();
+        let id = sm.add("lower_opts.wk".to_string(), src.to_string());
+        let (tokens, ld) = wukong_lexer::tokenize(sm.source(id), id);
+        assert!(!ld.iter().any(|d| d.is_error()), "lex errors: {ld:?}");
+        let mut interner = Interner::new();
+        let (module, pd) =
+            wukong_parser::parse_module_tokens(&tokens, sm.source(id), &mut interner);
+        assert!(!pd.iter().any(|d| d.is_error()), "parse errors: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(!sd.iter().any(|d| d.is_error()), "sema errors: {sd:?}");
+        let (mut program, md) =
+            wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lo);
+        assert!(!md.iter().any(|d| d.is_error()), "mir_build errors: {md:?}");
+        wukong_opt::optimize(&mut program, 2);
+        program
+            .funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(i.op, wukong_mir::Op::VecKernelCall { .. }))
+            .count()
+    }
+
+    /// Whole-program GPU lowering is the one pipeline that must not be handed a CPU recipe - and it
+    /// is the *only* one. In particular `--backend=gpu` (recognizer offload) still tree-walks the
+    /// program in the interpreter, so it wants the recipes exactly as `interp` and `native` do; the
+    /// cheapest way to break this fix would be to widen the match to "any GPU backend".
+    #[test]
+    fn only_whole_program_gpu_lowering_clears_the_vec_kernel_recipes() {
+        for b in [BackendKind::Interp, BackendKind::Native, BackendKind::Gpu] {
+            assert!(
+                lower_options_for(&opts_for(b)).vec_kernels,
+                "{b:?} executes on the CPU (offload tree-walks in the interpreter) and must keep \
+                 the 256-bit recipes"
+            );
+        }
+        assert!(
+            !lower_options_for(&opts_for(BackendKind::GpuLower)).vec_kernels,
+            "gpu-native lowers the whole program to PTX and cannot lower Win64 machine code"
+        );
+    }
+
+    /// The property the option exists for, asserted on real MIR rather than on the flag: an
+    /// unrecognized `@generic` f32 elementwise loop - the shape `tests/run/lang_generic_copy.wk`
+    /// pins - lowers with **no** `VecKernelCall` when the target is gpu-native.
+    ///
+    /// This is a `cargo test --workspace` gate on purpose. The defect it pins was invisible to
+    /// every CPU gate (the recipes are result-identical to the 128-bit path, so no differential or
+    /// invariance test can see them) and reachable only by running the GPU backend on a host that
+    /// has AVX2 - i.e. by gate part 10, on one machine.
+    #[test]
+    fn a_generic_f32_elementwise_loop_reaches_gpu_native_without_a_cpu_recipe() {
+        const SRC: &str = "module t\n\
+             \n\
+             @generic\n\
+             fn copy_generic(src: [f32; 8], mut dst: [f32; 8]) {\n\
+                 for i in 0..8 { dst[i] = src[i]; }\n\
+             }\n\
+             \n\
+             fn main() -> i32 {\n\
+                 let src: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];\n\
+                 let mut g: [f32; 8] = [0.0; 8];\n\
+                 copy_generic(src, g);\n\
+                 print(g[7] as i32);\n\
+                 return 0;\n\
+             }\n";
+
+        assert_eq!(
+            count_vec_kernels(SRC, lower_options_for(&opts_for(BackendKind::GpuLower))),
+            0,
+            "gpu-native MIR must carry no VecKernelCall - wukong_codegen_gpu declines it and the \
+             program then fails with `UNSUPPORTED: VecKernelCall (CPU raw-AVX2 kernel) not lowered \
+             to PTX`"
+        );
+
+        // The other arm is what makes the first one evidence rather than a tautology: where the
+        // recipes can actually fire, the SAME program under the CPU options DOES carry one, so the
+        // zero above is the backend's doing and not the program's. Skipped where the switch is
+        // inert (no AVX2+FMA3, or the kill-switch set) - there is nothing to distinguish there.
+        let can_fire = wukong_mir::host_supports_vec_kernels()
+            && std::env::var_os("WUKONG_P4_NO_256").is_none();
+        if can_fire {
+            assert!(
+                count_vec_kernels(SRC, lower_options_for(&opts_for(BackendKind::Native))) > 0,
+                "this host assembles 256-bit recipes, so the CPU pipeline must still get one - if \
+                 this fires, the elementwise recipe stopped claiming the loop and the arm above no \
+                 longer proves anything"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod grad_cli_tests {
     use super::*;
