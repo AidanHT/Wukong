@@ -424,11 +424,19 @@ from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, obj
 - **`@tile` strip-mining** on a half-open unit-step `for i in start..end`: `@tile(B)` on the function
   (or one loop) expands into full tiles plus a remainder loop, before the recognizer cascade.
   `@tile(BM, BN, …)` queues widths for nested `for` loops in source order (`tests/run/lang_tile_saxpy.wk`).
-  A `@tile` the compiler cannot apply is **`E0309`**, never a silent no-op: an unsupported loop form
-  (`0..=n`, a stepped or open range, `for x in xs`) and a width that is not a positive integer literal
-  (a bare `@tile`, `@tile(0)`, `@tile(rows)`) are both rejected, and a refused width is not consumed,
-  so the function-item queue cannot shift onto the wrong loop (`tests/fail/tile_bad_form.wk`,
-  `tile_zero_width.wk`, `tile_non_integer_width.wk`).
+  A `@tile` the compiler cannot apply is **`E0309`**, not a silent no-op: an unsupported loop form
+  (`0..=n`, a stepped or open range, `for x in xs`, a `_` binder), a width that is not a positive
+  integer literal (a bare `@tile`, `@tile(0)`, `@tile(rows)`) — including in a *second* `@tile` on the
+  same statement, which used to be read by nobody — a width the queue still holds when the body ends,
+  and a lowering that carries no queue at all (a whole-function recognizer interception, or the
+  whole-function `@parallel` outliner: `@generic` is what keeps the loops tileable). A refused width
+  is not consumed, so the function-item queue cannot shift onto the wrong loop, and the queue is
+  rewound between a tiled loop's two body copies so one source loop takes one width
+  (`tests/fail/tile_bad_form.wk`, `tile_zero_width.wk`, `tile_non_integer_width.wk`,
+  `tile_never_applied.wk`, `tile_on_parallel_fn.wk`, `tile_on_recognized_kernel.wk`,
+  `tile_second_on_stmt.wk`).   `@tile` is accepted only where something reads it — a `fn` item or the `for` statement it schedules
+  — and is **`E0306`** on a `struct`, a parameter, a `let` or a `while`, the same placement code
+  `@generic` carries off a `fn` item (`tests/fail/tile_on_while.wk`).
 - **`shared [T; N]`** and **`sync_block()`**: shared address space on `alloca`; cooperative barrier
   inside `@parallel` only (`E0308` otherwise). Static shared size above 48 KiB is `E0307`. CPU:
   shared = stack `alloca`, barrier = no-op/fence. gpu-native: PTX `.shared` + `bar.sync` in

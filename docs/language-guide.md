@@ -541,19 +541,40 @@ cascade — it is not a back-door into `wukong_*` kernels. Works with `@generic`
 (`'outer: for i in 0..n` is strip-mined and keeps its label). Fixture:
 `tests/run/lang_tile_saxpy.wk` (`@tile(2)`, `n=5`, remainder lane prints 3).
 
-**A `@tile` that cannot be applied is `E0309`, not silence.** Two conditions reach it:
+**A `@tile` that cannot be applied is `E0309`, not silence.** Four conditions reach it:
 
 - the **loop form** — anything other than one identifier over an exclusive, step-less range with a
   known end. `for i in 0..=n`, a stepped range, an open range and `for x in xs` cannot be strip-mined
-  (`tests/fail/tile_bad_form.wk`);
+  (`tests/fail/tile_bad_form.wk`). A `for _ in 0..n` is refused for the *binder*, and says so;
 - the **argument** — a width must be a positive integer literal, so a bare `@tile`, `@tile(0)`,
   `@tile(rows)` and a width that does not fit in 64 bits are all rejected
-  (`tests/fail/tile_zero_width.wk`, `tests/fail/tile_non_integer_width.wk`).
+  (`tests/fail/tile_zero_width.wk`, `tests/fail/tile_non_integer_width.wk`). Several `@tile`s on one
+  statement mean their widths in source order, exactly like one `@tile` with several arguments, and
+  every one of them is validated (`tests/fail/tile_second_on_stmt.wk`);
+- a **width nothing applied** — the function-item queue is consumed by loops in source order, and a
+  width still in it when the body ends tiled nothing: `@tile(64, 32)` over a function with one
+  strip-minable loop, or a `@tile` on a function with no `for` at all
+  (`tests/fail/tile_never_applied.wk`);
+- a **lowering that cannot carry it** — a whole-function recognizer interception replaces the nest
+  with a kernel that brings its own blocking (`tests/fail/tile_on_recognized_kernel.wk`), and the
+  whole-function `@parallel` outliner rewrites the loop into runtime chunks
+  (`tests/fail/tile_on_parallel_fn.wk`). Both build their lowerer with no tile queue, so `@generic`
+  — which keeps the loops — is what makes `@tile` apply. Composing `@parallel` with `@tile` means
+  writing the nest yourself, as `tests/run/lang_tiled_transpose.wk` does.
 
 A refused width is **not** consumed, so the function-item queue does not shift: it stays at the head
 for the next loop that can take it. Before `E0309`, an unsupported first loop discarded its width
 without a word *and* moved every later width one loop earlier, so the second loop was silently
-strip-mined at the wrong tile. `wukongc --explain E0309` prints the rule.
+strip-mined at the wrong tile. A tiled loop's body is lowered twice — the full-tile nest and the
+remainder — and the queue is rewound between the two, so a nested `for` written once takes one
+width rather than two. `wukongc --explain E0309` prints the rule.
+
+`@tile` is only accepted where something reads it: on a `fn` item, or on the `for` statement it
+schedules. On a `struct`, a parameter, a `let` or a `while` it is **`E0306`** — the same
+attribute-placement code `@generic` off a `fn` item carries, and for the same reason. `@tile` on a
+`while` is the one worth calling out: a `while` has no induction variable and no range, so there is
+nothing to strip-mine, and the attribute used to sit there reading exactly as if it applied
+(`tests/fail/tile_on_while.wk`).
 
 ### `shared [T; N]` and `sync_block()` ✅
 

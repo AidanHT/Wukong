@@ -1,0 +1,28 @@
+// EXPECT-CODE: E0306
+module tests.fail.tile_on_while
+
+// `@tile` is read off a function item (into a width queue) or off the `for` statement it sits on,
+// and from nowhere else — `wukong_sema::attrs::FN_ITEM_ONLY` listed only `generic`, so `@tile` was
+// accepted on a `struct`, a parameter, a `let` and a `while`, and dropped in all four. The `while`
+// is the sharpest: a schedule written on a loop, which reads exactly as if it applied, and
+// `--emit=ast` shows the attribute sitting there.
+//
+// A `while` has no induction variable and no range, so there is nothing to strip-mine; this is an
+// attribute-PLACEMENT error, the same shape as `@generic` on a statement, and it carries the same
+// code.
+
+@generic
+fn f(mut out: [i32; 8]) {
+    let mut k: i32 = 0;
+    @tile(2)
+    while k < 8 {
+        out[k] = k;
+        k = k + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut o: [i32; 8] = [0; 8];
+    f(o);
+    return 0;
+}

@@ -1,0 +1,29 @@
+// EXPECT-CODE: E0309
+module tests.fail.tile_on_recognized_kernel
+
+// A whole-function recognizer interception replaces the nest with one `wukong_sgemm` call and builds
+// its lowerer with an empty tile queue, so `@tile` had nothing to reach. That made the attribute's
+// effect depend on whether an UNRELATED recognizer happened to fire: adding `@generic` to this exact
+// function makes the identical `@tile` apply. Silence in both directions is the D4 failure, and the
+// kernel brings its own blocking anyway — so say so, and name the escape hatch.
+
+@tile(64)
+fn mm(a: [f32; 64], b: [f32; 64], mut c: [f32; 64]) {
+    for i in 0..8 {
+        for j in 0..8 {
+            let mut s: f32 = 0.0;
+            for k in 0..8 {
+                s = s + a[i * 8 + k] * b[k * 8 + j];
+            }
+            c[i * 8 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let a: [f32; 64] = [1.0; 64];
+    let b: [f32; 64] = [1.0; 64];
+    let mut c: [f32; 64] = [0.0; 64];
+    mm(a, b, c);
+    return 0;
+}

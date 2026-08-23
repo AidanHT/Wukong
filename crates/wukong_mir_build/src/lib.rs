@@ -1231,6 +1231,17 @@ pub fn lower_program_with(
                         if let Some(func) =
                             lower_matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags)
                         {
+                            // This arm replaces the nest with one `wukong_sgemm` call, and builds
+                            // its lowerer with an EMPTY tile queue -- so a function-item `@tile`
+                            // here was read, validated, and then had nothing to reach. Whether the
+                            // attribute did anything used to depend on whether an unrelated
+                            // recognizer fired, silently and in both directions.
+                            tile::report_unapplied_tiles(
+                                &mut diags,
+                                f.name.span,
+                                fn_tiles.get(&f.name.sym).map_or(&[][..], |v| &v[..]),
+                                "lowered as a recognized GEMM kernel; `@generic` keeps the loops tileable",
+                            );
                             program.funcs.push(func);
                             continue;
                         }
@@ -1245,6 +1256,12 @@ pub fn lower_program_with(
                         if let Some(func) =
                             lower_i8matmul_fn(f, &nest, parallel, sema, interner, gemm, &mut diags)
                         {
+                            tile::report_unapplied_tiles(
+                                &mut diags,
+                                f.name.span,
+                                fn_tiles.get(&f.name.sym).map_or(&[][..], |v| &v[..]),
+                                "lowered as a recognized int8 GEMM kernel; `@generic` keeps the loops tileable",
+                            );
                             program.funcs.push(func);
                             continue;
                         }
@@ -1882,6 +1899,15 @@ pub fn lower_program_with(
                             f, par_sym, pfor_sym, idx, hi, loop_body, sema, interner, gemm,
                             &mut diags,
                         );
+                        // Both halves are built with an empty tile queue (`lower_parallel`), so a
+                        // function-item `@tile` never reaches `lower_for` at all -- no tiling, and
+                        // no diagnostic either.
+                        tile::report_unapplied_tiles(
+                            &mut diags,
+                            f.name.span,
+                            fn_tiles.get(&f.name.sym).map_or(&[][..], |v| &v[..]),
+                            "the `@parallel` outliner rewrites this loop into runtime chunks",
+                        );
                         program.funcs.push(outlined);
                         program.funcs.push(wrapper);
                         continue;
@@ -2433,6 +2459,16 @@ fn lower_fn(
             }
         }
     }
+    // Whatever is still queued is a `@tile` width no loop in this function took. The attribute was
+    // read and validated at the item and then simply outlived every loop that could consume it --
+    // `@tile(64, 32)` on a function with one tileable loop, or `@tile(4)` on a function with no
+    // `for` at all, both compiled clean and tiled nothing with the leftover.
+    tile::report_unapplied_tiles(
+        fl.diags,
+        f.name.span,
+        &fl.tile_queue,
+        "this function has fewer loops `@tile` can strip-mine than widths were given",
+    );
     fl.builder.finish()
 }
 
@@ -11294,7 +11330,7 @@ impl FnLowerer<'_> {
                         }
                     }
                 }
-                None => self.tile_not_applicable(stmt_attrs, pat.span),
+                None => self.tile_not_applicable(stmt_attrs, pat, pat.span),
             }
         }
         // ---- The ordered kernel-recognizer cascade -------------------------------------------

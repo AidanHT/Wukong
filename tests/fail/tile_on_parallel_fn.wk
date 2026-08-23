@@ -1,0 +1,28 @@
+// EXPECT-CODE: E0309
+module tests.fail.tile_on_parallel_fn
+
+// The whole-function `@parallel` outliner builds BOTH halves — the outlined body and the wrapper —
+// with an empty tile queue, so a function-item `@tile` never reached `lower_for` and no loop was
+// ever offered the width. The attribute did nothing and said nothing; `--emit=mir` was
+// byte-identical to the same program without it.
+//
+// The two attributes are not composable today: the outliner rewrites the loop into runtime chunks
+// and cannot also strip-mine it. Tiling a `@parallel` loop means writing the loop nest yourself, as
+// `tests/run/lang_tiled_transpose.wk` does — there the body is more than one statement, so the
+// whole-function vehicle declines and the tile queue survives into the ordinary lowering.
+
+@generic
+@parallel
+@tile(64)
+fn f(x: [f32; 4096], mut out: [f32; 4096]) {
+    for i in 0..4096 {
+        out[i] = x[i] * 2.0;
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 4096] = [1.0; 4096];
+    let mut o: [f32; 4096] = [0.0; 4096];
+    f(x, o);
+    return 0;
+}
