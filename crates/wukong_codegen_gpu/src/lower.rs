@@ -4876,6 +4876,51 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// **A per-thread `.local` frame past the CUDA cap must be a decline, not a driver code.**
+    ///
+    /// A program with no `wukong_parallel_for` and no recognized kernel is not megakernel-eligible
+    /// (`fusion::analyze` -> "no recognized cooperative op"), so `jit_run` falls through to
+    /// [`jit_run_single`], whose frame is a per-thread `.local __frame`. PTX and the module load
+    /// both succeed at any size; the **launch** is what the driver rejects, and it rejects it with a
+    /// bare `DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")` that reads as a crash rather
+    /// than as coverage this backend honestly lacks. `bench/lang/README.md` had to carry a paragraph
+    /// of prose warning fixture authors away from the shape for exactly this reason.
+    ///
+    /// The fixture is one `[f32; 262144]` local = 1 MiB of frame, twice the cap. It is deliberately
+    /// **not** in `tests/run` — the corpus gates would then have to launch it — and it is checked
+    /// through `jit_run_single` rather than `jit_run` so the assertion is about the single-thread
+    /// path and not about whichever way `fusion::analyze` happens to classify it.
+    ///
+    /// This test needs **no device**: the whole point of the fix is that the decline happens before
+    /// anything is asked of the driver, so a box with no GPU at all reaches the same `UNSUPPORTED:`.
+    /// Before the fix it fails on both kinds of box, with the launch error here and with
+    /// "requires a CUDA device" where there is none.
+    #[test]
+    fn oversized_local_frame_declines_before_the_launch() {
+        let src = "module gate
+
+@generic
+fn main() -> i32 {
+    let mut a: [f32; 262144] = [0.0; 262144];
+    a[0] = 1.0;
+    print(a[262143] as i32);
+    return 0;
+}
+";
+        let (program, mut interner) = hostvec::build(src, 2).expect("fixture builds");
+        let entry = interner.intern("main");
+        let err = jit_run_single(&program, entry, &interner)
+            .expect_err("a 1 MiB per-thread .local frame cannot be launched");
+        assert!(
+            err.starts_with(UNSUPPORTED),
+            "an unlaunchable frame must be an honest decline, got: {err}"
+        );
+        assert!(
+            err.contains("1048576"),
+            "the decline must name the frame size in bytes, got: {err}"
+        );
+    }
+
     /// `ptx_vmath_lowp` builds the bf16/f16 activation kernels by slicing `PTX_VMATH` between two
     /// literal markers. That is a self-referential invariant of this file: renaming `VM_ST:` or
     /// reflowing the first dispatch line silently turns every bf16/f16 activation program into an
