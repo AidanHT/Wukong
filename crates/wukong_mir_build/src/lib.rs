@@ -12100,12 +12100,9 @@ impl FnLowerer<'_> {
             StmtKind::Let { pat, ty, init, .. } => {
                 if let Some(e) = init {
                     self.scan_region_expr(e, sc);
-                    // A local bound to an indirection (slice / pointer / reference) could alias a
-                    // capture and launder writes past the write rules — decline.
-                    if matches!(
-                        self.expr_ty(e),
-                        Ty::Slice(_) | Ty::Ptr { .. } | Ty::Ref { .. }
-                    ) {
+                    // Copying a tuple/array/struct containing an indirection copies its pointer,
+                    // not the pointee. Destructuring cannot make that shared storage private.
+                    if !self.region_value_is_owned(&self.expr_ty(e)) {
                         sc.ok = false;
                     }
                 }
@@ -12277,10 +12274,15 @@ impl FnLowerer<'_> {
                     return;
                 };
                 if sc.is_local(bsym) {
-                    return; // body-local array: private
+                    // A local slice/pointer can be extracted from an aggregate. Its slot is
+                    // private, but indexing follows a pointee that may still be shared.
+                    sc.ok = matches!(self.expr_ty(base), Ty::Array { .. })
+                        && self.region_value_is_owned(&self.expr_ty(base));
+                    return;
                 }
                 if !self.region_capture(bsym, sc)
                     || !matches!(self.expr_ty(base), Ty::Array { .. })
+                    || !self.region_value_is_owned(&self.expr_ty(base))
                     || indices.len() != 1
                 {
                     sc.ok = false;
@@ -12306,6 +12308,14 @@ impl FnLowerer<'_> {
             | ExprKind::AlignOf(_) => {}
             ExprKind::Path(p) => {
                 if p.is_single() {
+                    // Fresh aggregate slots can still contain borrowed pointees. Reject those
+                    // captures before a field read or tuple copy can hide the indirection.
+                    if self.lookup(p.first().sym).is_some()
+                        && !self.region_value_is_owned(&self.expr_ty(e))
+                    {
+                        sc.ok = false;
+                        return;
+                    }
                     self.scan_region_read_path(p.first().sym, sc);
                 }
                 // A multi-segment path (enum variant, namespaced const) is a compile-time value.
@@ -12344,13 +12354,17 @@ impl FnLowerer<'_> {
                     return;
                 };
                 if bsym == sc.hh || sc.is_local(bsym) {
+                    sc.ok = matches!(self.expr_ty(base), Ty::Array { .. })
+                        && self.region_value_is_owned(&self.expr_ty(base));
                     return;
                 }
                 if self.lookup(bsym).is_none() {
                     sc.ok = false; // indexing something that is not a runtime binding
                     return;
                 }
-                if !self.region_capture(bsym, sc) || !matches!(self.expr_ty(base), Ty::Array { .. })
+                if !self.region_capture(bsym, sc)
+                    || !matches!(self.expr_ty(base), Ty::Array { .. })
+                    || !self.region_value_is_owned(&self.expr_ty(base))
                 {
                     sc.ok = false;
                     return;
@@ -12418,6 +12432,60 @@ impl FnLowerer<'_> {
         if matches!(mty, MirType::Array(..)) {
             sc.record(sym, None, false);
         }
+    }
+
+    /// Does copying this value own all its storage? Follow aggregate fields so an indirection
+    /// cannot hide inside a tuple, array, struct or enum payload. Unknown types fail closed.
+    fn region_value_is_owned(&self, ty: &Ty) -> bool {
+        // Scalar expressions dominate the scan; do not allocate a worklist for them.
+        match ty {
+            Ty::Scalar(_) | Ty::Unit | Ty::Vector { .. } => return true,
+            Ty::Array { .. } | Ty::Tuple(_) | Ty::Named(_) => {}
+            _ => return false,
+        }
+        let mut work = vec![ty];
+        let mut named = HashSet::default();
+        while let Some(ty) = work.pop() {
+            match ty {
+                Ty::Scalar(_) | Ty::Unit | Ty::Vector { .. } => {}
+                Ty::Array { elem, .. } => work.push(elem),
+                Ty::Tuple(fields) => work.extend(fields),
+                Ty::Named(sym) => {
+                    if !named.insert(*sym) {
+                        continue;
+                    }
+                    if let Some(concrete) = self.subst.get(sym) {
+                        work.push(concrete);
+                        continue;
+                    }
+                    match self.sema.defs.lookup(*sym).map(|def| &def.kind) {
+                        Some(DefKind::Struct(fields)) => {
+                            work.extend(fields.iter().map(|(_, ty)| ty));
+                        }
+                        Some(DefKind::Enum(variants)) => {
+                            for variant in variants {
+                                match &variant.payload {
+                                    VariantPayload::Unit => {}
+                                    VariantPayload::Tuple(fields) => work.extend(fields),
+                                    VariantPayload::Struct(fields) => {
+                                        work.extend(fields.iter().map(|(_, ty)| ty));
+                                    }
+                                }
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                Ty::Slice(_)
+                | Ty::Ptr { .. }
+                | Ty::Ref { .. }
+                | Ty::Tensor { .. }
+                | Ty::Fn { .. }
+                | Ty::Unknown
+                | Ty::Error => return false,
+            }
+        }
+        true
     }
 
     /// Register a capture whose storage identity is known. An array must be a fresh alloca or a
