@@ -235,8 +235,13 @@ impl<'a> Vjp<'a> {
         // Normalize every buffer operand to its base alloca/param so the buffer-adjoint bookkeeping
         // is keyed consistently regardless of which whole-buffer pointer form lowering chose. (The
         // scalar `result` of a reduction is never a gep, so it needs no canonicalization.)
-        let args: Vec<ValueId> = raw_args.iter().map(|&a| self.canon(a)).collect();
-        let args = &args[..];
+        // The largest recognized ABI is velem's eight operands (see kernel_arity). Keep this
+        // short-lived normalization on the stack instead of allocating once per tape call.
+        let mut normalized = [ValueId(0); 8];
+        let args = &mut normalized[..want];
+        for (arg, &raw) in args.iter_mut().zip(raw_args) {
+            *arg = self.canon(raw);
+        }
         if func == self.syms.sreduce || func == self.syms.sreduce_parallel {
             self.diff_sreduce(args, result)
         } else if func == self.syms.sgemm_nt || func == self.syms.sgemm_nt_parallel {
