@@ -30,7 +30,7 @@ use wukong_ast::{Import, Item, ItemKind, Module};
 use wukong_diag::{Diagnostic, DiagnosticSink};
 use wukong_span::{Interner, SourceMap};
 
-/// Recursively load every file `module` imports (directly or transitively) and splice their items
+/// Load every file `module` imports (directly or transitively) depth-first and splice their items
 /// into `module.items`. `root_path` is the root source file (its directory anchors resolution and
 /// it is pre-seeded as "loaded" so a cycle back to the root is a no-op). Lex/parse diagnostics of
 /// imported files and E0305 for unresolvable imports are emitted into `sink`; `next_node` is the
@@ -64,25 +64,42 @@ pub(crate) fn load_imports(
     loaded.insert(canonical(root_path));
 
     let mut extra: Vec<Item> = Vec::new();
+    let mut pending = Vec::new();
     for imp in std::iter::once(first).chain(imports) {
-        load_one(
-            imp,
-            &root_dir,
-            sm,
-            interner,
-            sink,
-            next_node,
-            &mut loaded,
-            &mut extra,
-        );
+        if let Some(items) = load_file(imp, &root_dir, sm, interner, sink, next_node, &mut loaded) {
+            pending.push(items);
+        }
+        // Iterator frames retain only unvisited items. Each child's token buffer is released
+        // by load_file before descending, and import depth no longer consumes the call stack.
+        // The parent frame stays in place so traversal and item order match recursive DFS.
+        while let Some(items) = pending.last_mut() {
+            let Some(item) = items.next() else {
+                pending.pop();
+                continue;
+            };
+            if let ItemKind::Import(nested) = &item.kind {
+                if let Some(items) = load_file(
+                    nested,
+                    &root_dir,
+                    sm,
+                    interner,
+                    sink,
+                    next_node,
+                    &mut loaded,
+                ) {
+                    pending.push(items);
+                }
+            } else {
+                extra.push(item);
+            }
+        }
     }
     module.items.append(&mut extra);
 }
 
-/// Load the file `imp` names (unless already loaded), recurse into its own imports depth-first,
-/// and push its non-import items onto `out`.
-#[allow(clippy::too_many_arguments)] // internal DFS; a state struct would just rename the args
-fn load_one(
+/// Parse the file `imp` names (unless already loaded), returning its items for the DFS walk.
+/// Source text remains in the SourceMap for diagnostics, but tokens need not survive parsing.
+fn load_file(
     imp: &Import,
     root_dir: &Path,
     sm: &mut SourceMap,
@@ -90,8 +107,7 @@ fn load_one(
     sink: &mut DiagnosticSink,
     next_node: &mut u32,
     loaded: &mut HashSet<PathBuf>,
-    out: &mut Vec<Item>,
-) {
+) -> Option<std::vec::IntoIter<Item>> {
     // `a.b.c` -> `<root-dir>/a/b/c.wk`.
     let mut file = root_dir.to_path_buf();
     for seg in &imp.path.segments {
@@ -102,7 +118,7 @@ fn load_one(
     // Dedup / cycle break by canonical path identity — inserted BEFORE parsing the file, so a
     // cycle back through this file (or a second report for the same missing file) is a no-op.
     if !loaded.insert(canonical(&file)) {
-        return;
+        return None;
     }
 
     let src = match std::fs::read_to_string(&file) {
@@ -132,7 +148,7 @@ fn load_one(
                     file.display()
                 )),
             );
-            return;
+            return None;
         }
     };
 
@@ -148,15 +164,8 @@ fn load_one(
         sink.emit(d);
     }
 
-    // Depth-first, in source order: an import recurses immediately; every other item is spliced.
-    // (The imported file's `module` header — `m.name` — is informational and intentionally unused.)
-    for item in m.items {
-        if let ItemKind::Import(nested) = &item.kind {
-            load_one(nested, root_dir, sm, interner, sink, next_node, loaded, out);
-        } else {
-            out.push(item);
-        }
-    }
+    // The imported file's `module` header — `m.name` — remains informational and unused.
+    Some(m.items.into_iter())
 }
 
 /// Canonical path identity for dedup: two spellings of the same on-disk file (case, `..`, symlink)
