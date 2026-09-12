@@ -27,26 +27,28 @@ The only level tests are `>= 1` and `>= 2`, so **`-O3` is byte-identical to `-O2
 | `-O2` | `inline_program` first, then the pipeline, then `unroll_program` with a reduced cleanup sweep |
 | `-O3` | same as `-O2` |
 
-At `-O2`+, `wukong_driver` also forces `opt_level.max(1)` for `--emit=grad` and `--train` because
+`wukong_driver` forces `opt_level.max(1)` for `--emit=grad` and `--train` because
 autodiff consumes SSA MIR.
 
 ## Per-function pass order (`PassManager::standard`)
 
-The list runs to a fixpoint (capped at 100 iterations) with per-pass clean-tracking. Order is
+The list runs to a fixpoint (stopping after 101 sweeps at the latest) with per-pass clean-tracking. Order is
 load-bearing.
 
 **`-O1`:** mem2reg → simplify → simplify-cfg → simplify-phis → dce
 
 **`-O2` appends:** cse → dse → loop-canon → licm → vectorize
 
-- **mem2reg** — scalar `alloca`/`load`/`store` → block-parameter SSA (Cytron). First because every
-  value-based pass is far more effective on SSA than on memory traffic.
+- **mem2reg** — scalar `alloca`/`load`/`store` → block-parameter SSA (Cytron), including pointer
+  slots whose initialization is proven. First because later passes work directly on SSA values.
 - **simplify** — constant folding and algebraic identities.
-- **simplify-cfg** — constant-branch folding, straight-line merge, prune unreachable blocks. The
-  only pass that restructures the CFG; must invalidate the analysis cache when it changes anything.
+- **simplify-cfg** — constant-branch folding, straight-line merge, prune unreachable blocks. Like
+  every pass that changes CFG edges or blocks, it must invalidate the analysis cache.
 - **simplify-phis** — drop dead or trivial block parameters mem2reg introduced.
-- **dce** — remove pure instructions whose results are unused, and unused allocas.
-- **cse** — dominator-tree value numbering plus intra-block load forwarding.
+- **dce** — retain the dependency closure of effectful instructions and terminators, removing
+  complete dead instruction chains in one linear worklist traversal.
+- **cse** — dominator-tree value numbering plus intra-block load forwarding. Keys recognize
+  commuted integer arithmetic and distinguish vector splat widths; float operand order is retained.
 - **dse** — intra-block dead-store elimination.
 - **loop-canon** — one shape per loop: preheader, single latch, one exit-test polarity. LICM hoists
   only into an existing preheader.
@@ -56,8 +58,9 @@ load-bearing.
 
 **Whole-program stages at `-O2`+ (not `Pass` traits):**
 
-- `inline_program` — runs *before* the per-function pipeline (needs callee bodies). Leaf-only,
-  size-capped; no cycle detection.
+- `inline_program` — runs *before* the per-function pipeline, bottom-up over call-graph strongly
+  connected components. Recursive callees are excluded; per-site budgets account for sole callers,
+  loops and constant arguments, with absolute growth, relative growth and splice-count limits.
 - `unroll_program` — runs *after* the pipeline; changed functions get a reduced cleanup pass
   (`cse` → `dce`).
 
@@ -90,8 +93,12 @@ emitted IR; where order matters, sort explicitly (LICM sorts loops by header id)
 cargo test -p wukong_opt --lib
 ```
 
-18 integration tests: source → parse → sema → mir_build → optimize → interp, asserting clean
-`verify_function` and comparing levels 0/1/2/3.
+Source integration tests follow parse → sema → mir_build → optimize → interp, asserting clean
+`verify_function` and comparing levels 0/1/2/3. Individual modules also contain structural tests.
+
+The September 2026 CPU optimization work did not execute tests or benchmarks. Its changes,
+limitations and deferred validation commands are recorded in
+[`docs/cpu-optimizer-review-2026-09.md`](../../docs/cpu-optimizer-review-2026-09.md).
 
 The real gate for any change here:
 

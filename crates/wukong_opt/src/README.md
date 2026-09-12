@@ -10,13 +10,13 @@
 | `simplify.rs` | `Simplify` — constant folding + algebraic identities |
 | `simplify_cfg.rs` | `SimplifyCfg` — constant-branch folding, straight-line merge, prune |
 | `phi.rs` | `SimplifyPhis` — drop dead/trivial block parameters and edge args |
-| `dce.rs` | `Dce` — drop pure unused instructions and promoted allocas |
-| `cse.rs` | `Cse` — dominator-tree value numbering + intra-block load forwarding |
+| `dce.rs` | `Dce` — dependency worklist removes complete dead instruction chains |
+| `cse.rs` | `Cse` — typed dominator-tree value numbering, integer commutation, intra-block load forwarding |
 | `dse.rs` | `Dse` — intra-block dead-store elimination |
 | `loop_canon.rs` | `LoopCanon` — canonical loop shape (preheader, latch, exit polarity) |
 | `licm.rs` | `Licm` — hoist loop-invariant non-trapping ops into an existing preheader |
 | `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue |
-| `inline.rs` | `inline_program` — whole-program inlining of small leaf functions |
+| `inline.rs` | `inline_program` — bottom-up call-graph SCC inlining with per-site growth budgets |
 | `unroll.rs` | `unroll_program` — partial loop unrolling at `-O2`+ |
 | `alias.rs` | `AliasInfo`, `Prov` — provenance for load/store disambiguation |
 | `loop_info.rs` | Natural-loop analysis (induction vars, trip counts, dependences) |
