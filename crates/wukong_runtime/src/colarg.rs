@@ -17,13 +17,12 @@
 //! and friends: process **8 adjacent columns per AVX2 step**. For each row `i`, load 8 contiguous f32
 //! (`x[i*cols + j .. +8]` = 8 columns of row `i`), compare against a per-lane running best-value vector,
 //! and **blend-update** both that best-value vector *and* a best-index vector — the row `i` broadcast to
-//! all 8 lanes (`_mm256_set1_ps(i as f32)`) is written only into the strictly-winning lanes (masked by
+//! all 8 lanes (`_mm256_set1_epi32(i as i32)`) is written only into the strictly-winning lanes (masked by
 //! `_CMP_GT_OQ` for max, `_CMP_LT_OQ` for min), exactly the lane-update idiom of [`crate::wukong_rowargmax_i32`].
 //! Each lane is an **independent column**, so — unlike the per-row kernel — there is *no* horizontal
 //! lane collapse (the eight results are eight separate columns), which makes this simpler. Row indices
-//! ride an f32 lane, which is exact only below the f32 mantissa limit `2^24`, so [`colarg_range`]
-//! dispatches to the AVX2 path only when `rows < 2^24` and hands taller matrices to the exact-integer
-//! scalar twin (the same guard shape `argreduce_chunk` uses for its i32 index lanes). The
+//! use i32 lanes directly in the output buffer, preserving the scalar twin's integer cast even above
+//! the f32 mantissa limit `2^24` without a separate index allocation or final conversion. The
 //! best-value vector is seeded from **row 0** and the best-index vector from 0, then rows `1..rows` are
 //! scanned. The `cols % 8` remainder columns are a scalar tail (the same strict-compare scan).
 //!
@@ -117,9 +116,8 @@ unsafe fn colarg_scalar(
 ///
 /// # Safety
 /// `x` valid for `rows*cols` `f32`; `out` valid for `cols` `i32`; `j0 <= j1 <= cols`; `rows >= 1`;
-/// AVX2 must be available. `rows < 2^24` — the running row index lives in an f32 lane, so above the
-/// f32 mantissa limit it would round and stop matching [`colarg_scalar`]; [`colarg_range`] is the
-/// only caller and is what guarantees the bound.
+/// AVX2 must be available; `x` and `out` must not overlap. Row indices use the same `usize as i32`
+/// conversion as [`colarg_scalar`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn colarg_avx2(
@@ -133,16 +131,12 @@ unsafe fn colarg_avx2(
 ) {
     use std::arch::x86_64::*;
     let width = j1 - j0;
-    // L1-resident running best for every column in the range (row index tracked as f32 — exact for the
-    // `< rows` integers, matching the scalar twin's `cvtt`). Seeded from row 0.
-    let mut best_val = vec![0f32; width];
-    let mut best_idx = vec![0f32; width];
+    // Seed the best values directly from row 0. The output is already disjoint from x and can hold
+    // the exact integer indices throughout the scan: no second scratch buffer or conversion pass.
+    let mut best_val = std::slice::from_raw_parts(x.add(j0), width).to_vec();
     let bvp = best_val.as_mut_ptr();
-    let bip = best_idx.as_mut_ptr();
-    for jj in 0..width {
-        *bvp.add(jj) = *x.add(j0 + jj); // x[0, j0+jj]
-                                        // best_idx already 0.0 (row 0)
-    }
+    let bip = out.add(j0);
+    std::ptr::write_bytes(bip, 0, width); // row 0
     const NB: usize = COLARG_JB / 8; // YMM lanes per tile
     let n8 = width & !7; // floor to multiple of 8
 
@@ -180,14 +174,14 @@ unsafe fn colarg_avx2(
                         // No lane strictly beats its running best => both blends are the identity
                         // and both stores write back what they read. Skipping is exact.
                         if _mm256_testz_ps(any, any) == 0 {
-                            let row = _mm256_set1_ps((i + k) as f32);
+                            let row = _mm256_set1_epi32((i + k) as i32);
                             let mut b = 0usize;
                             while b < NB {
                                 bv[b] = _mm256_blendv_ps(bv[b], v[b], m[b]);
-                                let bi = _mm256_loadu_ps(bip.add(jj + b * 8));
-                                _mm256_storeu_ps(
-                                    bip.add(jj + b * 8),
-                                    _mm256_blendv_ps(bi, row, m[b]),
+                                let bi = _mm256_loadu_si256(bip.add(jj + b * 8).cast());
+                                _mm256_storeu_si256(
+                                    bip.add(jj + b * 8).cast(),
+                                    _mm256_blendv_epi8(bi, row, _mm256_castps_si256(m[b])),
                                 );
                                 b += 1;
                             }
@@ -207,18 +201,18 @@ unsafe fn colarg_avx2(
                 // width % COLARG_JB trailing columns of this row block: 8-wide, then scalar.
                 while jj + 8 <= width {
                     let mut bv = _mm256_loadu_ps(bvp.add(jj));
-                    let mut bi = _mm256_loadu_ps(bip.add(jj));
+                    let mut bi = _mm256_loadu_si256(bip.add(jj).cast());
                     let mut k = 0usize;
                     while k < COLARG_RB {
-                        let row = _mm256_set1_ps((i + k) as f32);
+                        let row = _mm256_set1_epi32((i + k) as i32);
                         let v = _mm256_loadu_ps(x.add((i + k) * cols + j0 + jj));
                         let m = _mm256_cmp_ps(v, bv, $cmp);
                         bv = _mm256_blendv_ps(bv, v, m);
-                        bi = _mm256_blendv_ps(bi, row, m);
+                        bi = _mm256_blendv_epi8(bi, row, _mm256_castps_si256(m));
                         k += 1;
                     }
                     _mm256_storeu_ps(bvp.add(jj), bv);
-                    _mm256_storeu_ps(bip.add(jj), bi);
+                    _mm256_storeu_si256(bip.add(jj).cast(), bi);
                     jj += 8;
                 }
                 while jj < width {
@@ -230,7 +224,7 @@ unsafe fn colarg_avx2(
                         let ($a, $b) = (v, s);
                         if $better {
                             s = v;
-                            si = (i + k) as f32;
+                            si = (i + k) as i32;
                         }
                         k += 1;
                     }
@@ -242,16 +236,19 @@ unsafe fn colarg_avx2(
             }
             // rows % COLARG_RB trailing rows, one at a time — the same ascending-`i` continuation.
             while i < rows {
-                let row_i = _mm256_set1_ps(i as f32);
+                let row_i = _mm256_set1_epi32(i as i32);
                 let xrow = x.add(i * cols + j0);
                 let mut jj = 0usize;
                 while jj < n8 {
                     let bv = _mm256_loadu_ps(bvp.add(jj));
-                    let bi = _mm256_loadu_ps(bip.add(jj));
+                    let bi = _mm256_loadu_si256(bip.add(jj).cast());
                     let v = _mm256_loadu_ps(xrow.add(jj)); // 8 columns of row i
                     let mask = _mm256_cmp_ps(v, bv, $cmp);
                     _mm256_storeu_ps(bvp.add(jj), _mm256_blendv_ps(bv, v, mask));
-                    _mm256_storeu_ps(bip.add(jj), _mm256_blendv_ps(bi, row_i, mask));
+                    _mm256_storeu_si256(
+                        bip.add(jj).cast(),
+                        _mm256_blendv_epi8(bi, row_i, _mm256_castps_si256(mask)),
+                    );
                     jj += 8;
                 }
                 // Per-row scalar tail for the `width % 8` trailing columns (same strict compare).
@@ -260,7 +257,7 @@ unsafe fn colarg_avx2(
                     let ($a, $b) = (v, *bvp.add(jj));
                     if $better {
                         *bvp.add(jj) = v;
-                        *bip.add(jj) = i as f32;
+                        *bip.add(jj) = i as i32;
                     }
                     jj += 1;
                 }
@@ -272,17 +269,6 @@ unsafe fn colarg_avx2(
         scan!(_CMP_GT_OQ, |a, b| a > b);
     } else {
         scan!(_CMP_LT_OQ, |a, b| a < b);
-    }
-    // Write the winning row indices as i32 (round-toward-zero recovers the exact integers).
-    let mut jj = 0usize;
-    while jj < n8 {
-        let idx_i = _mm256_cvttps_epi32(_mm256_loadu_ps(bip.add(jj)));
-        _mm256_storeu_si256(out.add(j0 + jj) as *mut __m256i, idx_i);
-        jj += 8;
-    }
-    while jj < width {
-        *out.add(j0 + jj) = *bip.add(jj) as i32;
-        jj += 1;
     }
 }
 
@@ -302,11 +288,7 @@ unsafe fn colarg_range(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        // The AVX2 twin carries the running row index in an f32 lane, exact only below the f32
-        // mantissa limit; past it `i as f32` rounds and the recovered index is off by one, so the
-        // exact-integer scalar twin takes over. Same guard shape `argreduce_chunk` (reduce.rs) uses
-        // for its i32 index lanes; one comparison per call.
-        if is_x86_feature_detected!("avx2") && rows < (1usize << 24) {
+        if is_x86_feature_detected!("avx2") {
             colarg_avx2(x, out, rows, cols, j0, j1, is_max);
             return;
         }
