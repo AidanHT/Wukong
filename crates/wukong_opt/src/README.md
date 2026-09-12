@@ -11,11 +11,11 @@
 | `simplify_cfg.rs` | `SimplifyCfg` — constant-branch folding, straight-line merge, prune |
 | `phi.rs` | `SimplifyPhis` — drop dead/trivial block parameters and edge args |
 | `dce.rs` | `Dce` — dependency worklist removes complete dead instruction chains |
-| `cse.rs` | `Cse` — typed dominator-tree value numbering, integer commutation, intra-block load forwarding |
+| `cse.rs` | `Cse` — typed dominator-tree value numbering, integer commutation, load forwarding across single-predecessor edges |
 | `dse.rs` | `Dse` — intra-block dead-store elimination |
 | `loop_canon.rs` | `LoopCanon` — canonical loop shape (preheader, latch, exit polarity) |
 | `licm.rs` | `Licm` — hoist loop-invariant non-trapping ops into an existing preheader |
-| `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue |
+| `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue; constant left shifts use wrapping multiply |
 | `inline.rs` | `inline_program` — bottom-up call-graph SCC inlining with per-site growth budgets |
 | `unroll.rs` | `unroll_program` — partial loop unrolling at `-O2`+ |
 | `alias.rs` | `AliasInfo`, `Prov` — provenance for load/store disambiguation |

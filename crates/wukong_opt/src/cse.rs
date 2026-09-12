@@ -6,7 +6,8 @@
 //! legal without re-checking dominance per candidate. This catches redundancy across blocks, not
 //! just within one.
 //!
-//! Loads are forwarded **within a block**, keyed by the SSA address value and the accessed type:
+//! Loads are forwarded within a block and along **single-predecessor edges**, keyed by the SSA
+//! address value and the accessed type:
 //! a `store p, v` makes `v` the current contents of `(p, typeof v)`, the first `load p` becomes the
 //! current contents of `(p, ty)`, and a later load of the same address and type reuses it. Which
 //! entries a store or call invalidates is decided by [`crate::alias`] — a store only forgets the
@@ -16,8 +17,12 @@
 //! whole table on any other store; the difference is visible on every `[]T` slice loop, whose
 //! fat-pointer header loads sit behind a `gep`.
 //!
-//! Cross-block memory forwarding would need memory SSA, which this pass does not build, so it is
-//! simply not attempted here — whatever survives is left to the native backend's own optimizer.
+//! A dominator child inherits its parent's final memory table only when that parent is its only
+//! predecessor. Every execution of the child then sees exactly the state the table describes:
+//! there is no intervening block or alternate incoming edge. Joins and loop headers start with an
+//! empty table, so back-edge writes cannot be missed. This limited cross-block forwarding needs
+//! neither memory SSA nor a speculative load; it removes a load only after the same address was
+//! already read or written on the path actually taken.
 //!
 //! Forwarding loads to a common value lets the pure value-numbering then collapse the expressions
 //! built on top of them. DCE deletes the dead remains.
@@ -49,17 +54,18 @@ impl Pass for Cse {
             cfg::prune_unreachable(f);
             cache.invalidate(); // pruning renumbered blocks
         }
-        let children = cache.dom_children(f);
+        let (children, preds) = cache.children_and_preds(f);
         let alias = AliasInfo::analyze(f);
 
         let mut cx = Numbering {
             f,
             children,
+            preds,
             alias: &alias,
             vn: FxHashMap::default(),
             rewrite: FxHashMap::default(),
         };
-        cx.visit(f.entry.0);
+        cx.visit(f.entry.0, FxHashMap::default());
         let rewrite = cx.rewrite;
 
         if rewrite.is_empty() {
@@ -78,6 +84,7 @@ impl Pass for Cse {
 struct Numbering<'a> {
     f: &'a Function,
     children: &'a [Vec<u32>],
+    preds: &'a [Vec<u32>],
     /// Provenance facts for `f`, computed once per pass run. Decides which memory-table entries a
     /// store or a call has to forget.
     alias: &'a AliasInfo,
@@ -141,13 +148,9 @@ enum Key {
 }
 
 impl Numbering<'_> {
-    fn visit(&mut self, blk: u32) {
+    fn visit(&mut self, blk: u32, mut mem: FxHashMap<MemKey, u32>) {
         // Keys this block introduced into `vn`, to remove when we leave its subtree.
         let mut added: Vec<Key> = Vec::new();
-        // Load forwarding is intra-block: what each tracked location currently holds, reset per
-        // block.
-        let mut mem: FxHashMap<MemKey, u32> = FxHashMap::default();
-
         for inst in &self.f.blocks[blk as usize].insts {
             match &inst.op {
                 Op::Alloca {
@@ -217,9 +220,22 @@ impl Numbering<'_> {
             }
         }
 
+        // At most the actual CFG successors can inherit this table. Clone only when more than
+        // one child needs it, then move it into the last such child. Straight-line regions incur
+        // no table copy, and the existing location cap bounds the cost at conditional branches.
+        let last_inheriting = self.children[blk as usize]
+            .iter()
+            .rposition(|&c| self.preds[c as usize].as_slice() == [blk]);
         for i in 0..self.children[blk as usize].len() {
             let c = self.children[blk as usize][i];
-            self.visit(c);
+            let inherited = if Some(i) == last_inheriting {
+                std::mem::take(&mut mem)
+            } else if self.preds[c as usize].as_slice() == [blk] {
+                mem.clone()
+            } else {
+                FxHashMap::default()
+            };
+            self.visit(c, inherited);
         }
 
         for k in added {

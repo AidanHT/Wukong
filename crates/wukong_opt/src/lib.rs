@@ -7,7 +7,8 @@
 //!  * **simplify-cfg** — fold constant branches, merge straight-line blocks, prune dead blocks.
 //!  * **simplify-phis** — drop dead/trivial block parameters mem2reg introduced.
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
-//!  * **cse** — dominator-tree value numbering with intra-block load forwarding (`-O2`).
+//!  * **cse** — dominator-tree value numbering with load forwarding across unique incoming edges
+//!    (`-O2`).
 //!  * **dse** — dead-store elimination (`-O2`).
 //!  * **loop-canon** — one shape per loop: a preheader, a single latch, one exit-test polarity
 //!    (`-O2`).

@@ -47,14 +47,16 @@ load-bearing.
 - **simplify-phis** — drop dead or trivial block parameters mem2reg introduced.
 - **dce** — retain the dependency closure of effectful instructions and terminators, removing
   complete dead instruction chains in one linear worklist traversal.
-- **cse** — dominator-tree value numbering plus intra-block load forwarding. Keys recognize
+- **cse** — dominator-tree value numbering plus load forwarding within blocks and across
+  single-predecessor edges; joins and loop headers discard incoming memory facts. Keys recognize
   commuted integer arithmetic and distinguish vector splat widths; float operand order is retained.
 - **dse** — intra-block dead-store elimination.
 - **loop-canon** — one shape per loop: preheader, single latch, one exit-test polarity. LICM hoists
   only into an existing preheader.
 - **licm** — hoist loop-invariant non-trapping ops into that preheader.
 - **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting conditionals to lane
-  masks), keeping the original loop as scalar epilogue.
+  masks), keeping the original loop as scalar epilogue. Constant integer left shifts use wrapping
+  vector multiplication at supported widths; other shifts retain scalar lowering.
 
 **Whole-program stages at `-O2`+ (not `Pass` traits):**
 
