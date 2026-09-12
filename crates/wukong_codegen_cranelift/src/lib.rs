@@ -462,7 +462,9 @@ struct FnTranslator<'a> {
     blocks: Vec<Block>,
     /// Pre-declared FuncRefs for callees and runtime imports in this function.
     func_refs: &'a HashMap<Symbol, FuncRef>,
-    rt_refs: &'a HashMap<&'static str, FuncRef>,
+    decls: &'a Decls<'a>,
+    rt_ids: &'a HashMap<&'static str, FuncId>,
+    rt_refs: HashMap<&'static str, FuncRef>,
     /// Pre-declared GlobalValues for the read-only static-data blobs (`Op::GlobalAddr`), one per
     /// unique string literal, imported into this function's DFG.
     data_refs: &'a HashMap<Symbol, GlobalValue>,
@@ -482,6 +484,21 @@ struct FnTranslator<'a> {
 }
 
 impl<'a> FnTranslator<'a> {
+    /// Import a runtime signature only when an emitted instruction needs it. The cache is
+    /// keyed by the registry's static names; its iteration order never enters generated code.
+    fn runtime_ref(&mut self, name: &str) -> FuncRef {
+        if let Some(&fref) = self.rt_refs.get(name) {
+            return fref;
+        }
+        let (&name, &id) = self
+            .rt_ids
+            .get_key_value(name)
+            .expect("unknown runtime symbol");
+        let fref = self.decls.declare_func_in_func(id, self.builder.func);
+        self.rt_refs.insert(name, fref);
+        fref
+    }
+
     fn val(&self, v: ValueId) -> Value {
         self.vmap[v.0 as usize].expect("MIR value used before definition (non-SSA input?)")
     }
@@ -720,7 +737,7 @@ impl<'a> FnTranslator<'a> {
                     // like bf16). Register type is f32.
                     let half = self.builder.ins().load(types::I16, flags, addr, 0);
                     let ext = self.builder.ins().uextend(types::I32, half);
-                    let fref = self.rt_refs[RT_F16_TO_F32];
+                    let fref = self.runtime_ref(RT_F16_TO_F32);
                     let call = self.builder.ins().call(fref, &[ext]);
                     self.builder.inst_results(call)[0]
                 } else {
@@ -745,7 +762,7 @@ impl<'a> FnTranslator<'a> {
                 } else if matches!(self.ty_of(*value), MirType::F16) {
                     // Round the f32 register to f16 via the runtime shim, store the 16 bits (2 bytes).
                     let v = self.val(*value);
-                    let fref = self.rt_refs[RT_F32_TO_F16];
+                    let fref = self.runtime_ref(RT_F32_TO_F16);
                     let call = self.builder.ins().call(fref, &[v]);
                     let bits = self.builder.inst_results(call)[0]; // i32, low 16 = f16 bits
                     let half = self.builder.ins().ireduce(types::I16, bits);
@@ -915,7 +932,7 @@ impl<'a> FnTranslator<'a> {
                     } else {
                         RT_FMOD_F64
                     };
-                    let fref = self.rt_refs[name];
+                    let fref = self.runtime_ref(name);
                     let call = self.builder.ins().call(fref, &[a, b]);
                     self.builder.inst_results(call)[0]
                 }
@@ -1114,10 +1131,10 @@ impl<'a> FnTranslator<'a> {
     /// no cheap inline round like bf16, so a call to the *identical* `half`-crate conversion the
     /// interpreter uses keeps native == interp bit-for-bit. Returns the f16-rounded `f32`.
     fn round_to_f16(&mut self, x: Value) -> Value {
-        let pack = self.rt_refs[RT_F32_TO_F16];
+        let pack = self.runtime_ref(RT_F32_TO_F16);
         let c1 = self.builder.ins().call(pack, &[x]);
         let bits = self.builder.inst_results(c1)[0]; // i32, low 16 = f16 bits
-        let unpack = self.rt_refs[RT_F16_TO_F32];
+        let unpack = self.runtime_ref(RT_F16_TO_F32);
         let c2 = self.builder.ins().call(unpack, &[bits]);
         self.builder.inst_results(c2)[0]
     }
@@ -1169,7 +1186,7 @@ impl<'a> FnTranslator<'a> {
             let n = self.coerce_to_i64(args[0]);
             let body = self.val(args[1]);
             let env = self.val(args[2]);
-            let fref = self.rt_refs[RT_PARALLEL_FOR];
+            let fref = self.runtime_ref(RT_PARALLEL_FOR);
             self.builder.ins().call(fref, &[n, body, env]);
             return None;
         }
@@ -1200,7 +1217,7 @@ impl<'a> FnTranslator<'a> {
             let k = self.coerce_to_i64(args[4]);
             let n = self.coerce_to_i64(args[5]);
             let beta = self.coerce_to_i64(args[6]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[a, b, c, m, k, n, beta]);
             return None;
         }
@@ -1227,7 +1244,7 @@ impl<'a> FnTranslator<'a> {
             let beta = self.coerce_to_i64(args[6]);
             let bias = self.val(args[7]);
             let act = self.coerce_to_i64(args[8]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[a, b, c, m, k, n, beta, bias, act]);
@@ -1240,7 +1257,7 @@ impl<'a> FnTranslator<'a> {
             let y = self.val(args[2]);
             let m = self.coerce_to_i64(args[3]);
             let n = self.coerce_to_i64(args[4]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[a, x, y, m, n]);
             return None;
         }
@@ -1258,7 +1275,7 @@ impl<'a> FnTranslator<'a> {
             let m = self.coerce_to_i64(args[3]);
             let n = self.coerce_to_i64(args[4]);
             let alpha = self.val(args[5]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[a, x, y, m, n, alpha]);
             return None;
         }
@@ -1273,7 +1290,7 @@ impl<'a> FnTranslator<'a> {
             let n = self.coerce_to_i64(args[5]);
             let beta = self.coerce_to_i64(args[6]);
             let alpha = self.val(args[7]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[a, b, c, m, k, n, beta, alpha]);
@@ -1296,7 +1313,7 @@ impl<'a> FnTranslator<'a> {
             let out = self.val(args[1]);
             let n = self.coerce_to_i64(args[2]);
             let op = self.coerce_to_i64(args[3]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[x, out, n, op]);
             return None;
         }
@@ -1332,7 +1349,7 @@ impl<'a> FnTranslator<'a> {
             let out = self.val(args[1]);
             let rows = self.coerce_to_i64(args[2]);
             let cols = self.coerce_to_i64(args[3]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[x, out, rows, cols]);
             return None;
         }
@@ -1345,7 +1362,7 @@ impl<'a> FnTranslator<'a> {
             let out = self.val(args[2]);
             let rows = self.coerce_to_i64(args[3]);
             let cols = self.coerce_to_i64(args[4]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[a, b, out, rows, cols]);
             return None;
         }
@@ -1360,7 +1377,7 @@ impl<'a> FnTranslator<'a> {
             let dst = self.val(args[1]);
             let rows = self.coerce_to_i64(args[2]);
             let cols = self.coerce_to_i64(args[3]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[src, dst, rows, cols]);
             return None;
         }
@@ -1377,7 +1394,7 @@ impl<'a> FnTranslator<'a> {
             for a in &args[2..] {
                 call_args.push(self.coerce_to_i64(*a));
             }
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &call_args);
             return None;
         }
@@ -1407,7 +1424,7 @@ impl<'a> FnTranslator<'a> {
             let out = self.val(args[1]);
             let rows = self.coerce_to_i64(args[2]);
             let cols = self.coerce_to_i64(args[3]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[x, out, rows, cols]);
             return None;
         }
@@ -1420,7 +1437,7 @@ impl<'a> FnTranslator<'a> {
             let out = self.val(args[2]);
             let n = self.coerce_to_i64(args[3]);
             let op = self.coerce_to_i64(args[4]);
-            let fref = self.rt_refs[RT_VMATH2];
+            let fref = self.runtime_ref(RT_VMATH2);
             self.builder.ins().call(fref, &[x, y, out, n, op]);
             return None;
         }
@@ -1432,7 +1449,7 @@ impl<'a> FnTranslator<'a> {
             let dx = self.val(args[2]);
             let rows = self.coerce_to_i64(args[3]);
             let cols = self.coerce_to_i64(args[4]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[y, dy, dx, rows, cols]);
             return None;
         }
@@ -1445,7 +1462,7 @@ impl<'a> FnTranslator<'a> {
             let out = self.val(args[2]);
             let rows = self.coerce_to_i64(args[3]);
             let cols = self.coerce_to_i64(args[4]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[a, b, out, rows, cols]);
             return None;
         }
@@ -1457,7 +1474,7 @@ impl<'a> FnTranslator<'a> {
             let loss = self.val(args[2]);
             let rows = self.coerce_to_i64(args[3]);
             let cols = self.coerce_to_i64(args[4]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[x, target, loss, rows, cols]);
@@ -1471,7 +1488,7 @@ impl<'a> FnTranslator<'a> {
             let dx = self.val(args[2]);
             let rows = self.coerce_to_i64(args[3]);
             let cols = self.coerce_to_i64(args[4]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[x, target, dx, rows, cols]);
             return None;
         }
@@ -1484,7 +1501,7 @@ impl<'a> FnTranslator<'a> {
             let out = self.val(args[2]);
             let rows = self.coerce_to_i64(args[3]);
             let half = self.coerce_to_i64(args[4]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[x, inv_freq, out, rows, half]);
@@ -1504,7 +1521,7 @@ impl<'a> FnTranslator<'a> {
             let rows = self.coerce_to_i64(args[4]);
             let cols = self.coerce_to_i64(args[5]);
             let eps = self.coerce_to_i64(args[6]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[x, dy, gamma, dx, rows, cols, eps]);
@@ -1523,7 +1540,7 @@ impl<'a> FnTranslator<'a> {
             let b = self.val(args[5]);
             let c = self.val(args[6]);
             let op = self.coerce_to_i64(args[7]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[x, y, out, n, a, b, c, op]);
             return None;
         }
@@ -1536,7 +1553,7 @@ impl<'a> FnTranslator<'a> {
             let rows = self.coerce_to_i64(args[3]);
             let cols = self.coerce_to_i64(args[4]);
             let op = self.coerce_to_i64(args[5]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[x, b, out, rows, cols, op]);
             return None;
         }
@@ -1548,7 +1565,7 @@ impl<'a> FnTranslator<'a> {
             let n = self.coerce_to_i64(args[2]);
             let coeffs = self.val(args[3]);
             let ncoeff = self.coerce_to_i64(args[4]);
-            let fref = self.rt_refs[RT_VHORNER];
+            let fref = self.runtime_ref(RT_VHORNER);
             self.builder.ins().call(fref, &[x, out, n, coeffs, ncoeff]);
             return None;
         }
@@ -1559,13 +1576,13 @@ impl<'a> FnTranslator<'a> {
             let count = self.coerce_to_i64(args[0]);
             let esize = self.coerce_to_i64(args[1]);
             let isf = self.coerce_to_i64(args[2]);
-            let fref = self.rt_refs[RT_ALLOC];
+            let fref = self.runtime_ref(RT_ALLOC);
             let call = self.builder.ins().call(fref, &[count, esize, isf]);
             return self.builder.inst_results(call).first().copied();
         }
         if name == RT_FREE && args.len() == 1 {
             let data = self.val(args[0]);
-            let fref = self.rt_refs[RT_FREE];
+            let fref = self.runtime_ref(RT_FREE);
             self.builder.ins().call(fref, &[data]);
             return None;
         }
@@ -1573,7 +1590,7 @@ impl<'a> FnTranslator<'a> {
         // nanosecond clock. No arguments; returns the i64 stamp, bound like the value-returning
         // runtime calls below.
         if name == RT_NOW_NS && args.is_empty() {
-            let fref = self.rt_refs[RT_NOW_NS];
+            let fref = self.runtime_ref(RT_NOW_NS);
             let call = self.builder.ins().call(fref, &[]);
             return self.builder.inst_results(call).first().copied();
         }
@@ -1600,7 +1617,7 @@ impl<'a> FnTranslator<'a> {
             let path = self.val(args[0]);
             let data = self.val(args[1]);
             let len = self.coerce_to_i64(args[2]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             let call = self.builder.ins().call(fref, &[path, data, len]);
             return self.builder.inst_results(call).first().copied();
         }
@@ -1612,7 +1629,7 @@ impl<'a> FnTranslator<'a> {
             let y = self.val(args[1]);
             let n = self.coerce_to_i64(args[2]);
             let op = self.coerce_to_i64(args[3]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             let call = self.builder.ins().call(fref, &[x, y, n, op]);
             return self.builder.inst_results(call).first().copied();
         }
@@ -1623,7 +1640,7 @@ impl<'a> FnTranslator<'a> {
             let x = self.val(args[0]);
             let n = self.coerce_to_i64(args[1]);
             let op = self.coerce_to_i64(args[2]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             let call = self.builder.ins().call(fref, &[x, n, op]);
             return self.builder.inst_results(call).first().copied();
         }
@@ -1638,7 +1655,7 @@ impl<'a> FnTranslator<'a> {
             let x = self.val(args[0]);
             let y = self.val(args[1]);
             let n = self.coerce_to_i64(args[2]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             let call = self.builder.ins().call(fref, &[x, y, n]);
             return self.builder.inst_results(call).first().copied();
         }
@@ -1649,7 +1666,7 @@ impl<'a> FnTranslator<'a> {
         {
             let x = self.val(args[0]);
             let n = self.coerce_to_i64(args[1]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             let call = self.builder.ins().call(fref, &[x, n]);
             return self.builder.inst_results(call).first().copied();
         }
@@ -1663,7 +1680,7 @@ impl<'a> FnTranslator<'a> {
             let x = self.val(args[0]);
             let n = self.coerce_to_i64(args[1]);
             let op = self.coerce_to_i64(args[2]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             let call = self.builder.ins().call(fref, &[x, n, op]);
             return self.builder.inst_results(call).first().copied();
         }
@@ -1681,7 +1698,7 @@ impl<'a> FnTranslator<'a> {
             let n = self.coerce_to_i64(args[3]);
             let a = self.val(args[4]);
             let b = self.val(args[5]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[x, y, out, n, a, b]);
             return None;
         }
@@ -1695,7 +1712,7 @@ impl<'a> FnTranslator<'a> {
             let cols = self.coerce_to_i64(args[3]);
             let eps = self.coerce_to_i64(args[4]);
             let op = self.coerce_to_i64(args[5]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[x, out, rows, cols, eps, op]);
@@ -1714,7 +1731,7 @@ impl<'a> FnTranslator<'a> {
             let cols = self.coerce_to_i64(args[5]);
             let eps = self.coerce_to_i64(args[6]);
             let op = self.coerce_to_i64(args[7]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[x, out, gamma, beta, rows, cols, eps, op]);
@@ -1729,7 +1746,7 @@ impl<'a> FnTranslator<'a> {
             let m = self.coerce_to_i64(args[3]);
             let k = self.coerce_to_i64(args[4]);
             let n = self.coerce_to_i64(args[5]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[a, b, c, m, k, n]);
             return None;
         }
@@ -1743,7 +1760,7 @@ impl<'a> FnTranslator<'a> {
             let t = self.coerce_to_i64(args[3]);
             let h = self.coerce_to_i64(args[4]);
             let v = self.coerce_to_i64(args[5]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[out, weight, ids, t, h, v]);
             return None;
         }
@@ -1759,7 +1776,7 @@ impl<'a> FnTranslator<'a> {
             let d = self.coerce_to_i64(args[5]);
             let scale = self.coerce_to_f32(args[6]);
             let causal = self.coerce_to_i64(args[7]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[q, k, v, out, s, d, scale, causal]);
@@ -1776,7 +1793,7 @@ impl<'a> FnTranslator<'a> {
             let t = self.coerce_to_i64(args[3]);
             let h = self.coerce_to_i64(args[4]);
             let v = self.coerce_to_i64(args[5]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[grad_w, grad_out, ids, t, h, v]);
@@ -1797,7 +1814,7 @@ impl<'a> FnTranslator<'a> {
             let scale_b = self.val(args[7]);
             let bias = self.val(args[8]);
             let act = self.coerce_to_i64(args[9]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[a, b, out, m, k, n, scale_a, scale_b, bias, act]);
@@ -1811,7 +1828,7 @@ impl<'a> FnTranslator<'a> {
             let n = self.coerce_to_i64(args[2]);
             let scale = self.val(args[3]);
             let op = self.coerce_to_i64(args[4]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder.ins().call(fref, &[q, out, n, scale, op]);
             return None;
         }
@@ -1824,13 +1841,13 @@ impl<'a> FnTranslator<'a> {
             let cols = self.coerce_to_i64(args[3]);
             let scale = self.val(args[4]);
             let op = self.coerce_to_i64(args[5]);
-            let fref = self.rt_refs[name];
+            let fref = self.runtime_ref(name);
             self.builder
                 .ins()
                 .call(fref, &[q, out, rows, cols, scale, op]);
             return None;
         }
-        // Everything above dispatches a runtime kernel on (name, arity). `rt_refs` holds exactly
+        // Everything above dispatches a runtime kernel on (name, arity). `rt_ids` holds exactly
         // the runtime symbols this function is responsible for, so reaching here with one of them
         // means a recognizer emitted an arity no arm accepts. Without this guard `?` below returns
         // `None`, `Op::Call` lowers to *nothing*, and the call is silently deleted: a void kernel
@@ -1839,7 +1856,7 @@ impl<'a> FnTranslator<'a> {
         // name alone with no arity check, does not reproduce — and a value-returning kernel never
         // enters `vmap`, so the first use panics with `MIR value used before definition`. Record it
         // as a lowering error instead; `build_function_clif` aborts before the function is defined.
-        if self.rt_refs.contains_key(name) {
+        if self.rt_ids.contains_key(name) {
             if self.layout_err.is_none() {
                 self.layout_err = Some(format!(
                     "internal compiler error: runtime kernel `{name}` reached codegen with {} \
@@ -1858,7 +1875,7 @@ impl<'a> FnTranslator<'a> {
             Intrinsic::PrintInt => {
                 if let Some(&a) = args.first() {
                     let v = self.coerce_to_i64(a);
-                    let fref = self.rt_refs[RT_PRINT_I64];
+                    let fref = self.runtime_ref(RT_PRINT_I64);
                     self.builder.ins().call(fref, &[v]);
                 }
             }
@@ -1868,14 +1885,14 @@ impl<'a> FnTranslator<'a> {
                     // (Cranelift has no unsigned types — `rt_print_u64` formats the same i64 bits
                     // as `u64`).
                     let v = self.coerce_to_i64(a);
-                    let fref = self.rt_refs[RT_PRINT_U64];
+                    let fref = self.runtime_ref(RT_PRINT_U64);
                     self.builder.ins().call(fref, &[v]);
                 }
             }
             Intrinsic::PrintFloat => {
                 if let Some(&a) = args.first() {
                     let v = self.coerce_to_f64(a);
-                    let fref = self.rt_refs[RT_PRINT_F64];
+                    let fref = self.runtime_ref(RT_PRINT_F64);
                     self.builder.ins().call(fref, &[v]);
                 }
             }
@@ -1883,14 +1900,14 @@ impl<'a> FnTranslator<'a> {
                 if let Some(&a) = args.first() {
                     // The argument is already a pointer (the string buffer's base); pass it through.
                     let v = self.val(a);
-                    let fref = self.rt_refs[RT_PRINT_STR];
+                    let fref = self.runtime_ref(RT_PRINT_STR);
                     self.builder.ins().call(fref, &[v]);
                 }
             }
             Intrinsic::Assert => {
                 if let Some(&a) = args.first() {
                     let v = self.coerce_to_i64(a);
-                    let fref = self.rt_refs[RT_ASSERT];
+                    let fref = self.runtime_ref(RT_ASSERT);
                     self.builder.ins().call(fref, &[v]);
                 }
             }
@@ -3002,6 +3019,177 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
     };
 
+    // Module-wide symbol membership is also the arity-error guard. Per-function
+    // signature imports are created lazily by FnTranslator::runtime_ref.
+    let rt_ids: HashMap<&'static str, FuncId> = HashMap::from([
+        (RT_PRINT_I64, rt.print_i64),
+        (RT_PRINT_U64, rt.print_u64),
+        (RT_PRINT_STR, rt.print_str),
+        (RT_PRINT_F64, rt.print_f64),
+        (RT_ASSERT, rt.assert),
+        (RT_ALLOC, rt.rt_alloc),
+        (RT_FREE, rt.rt_free),
+        (RT_READ_F32, rt.rt_read_f32),
+        (RT_READ_F64, rt.rt_read_f64),
+        (RT_READ_I32, rt.rt_read_i32),
+        (RT_READ_I64, rt.rt_read_i64),
+        (RT_READ_I8, rt.rt_read_i8),
+        (RT_READ_U8, rt.rt_read_u8),
+        (RT_WRITE_F32, rt.rt_write_f32),
+        (RT_WRITE_F64, rt.rt_write_f64),
+        (RT_WRITE_I32, rt.rt_write_i32),
+        (RT_WRITE_I64, rt.rt_write_i64),
+        (RT_WRITE_I8, rt.rt_write_i8),
+        (RT_WRITE_U8, rt.rt_write_u8),
+        (RT_NOW_NS, rt.now_ns),
+        (RT_PARALLEL_FOR, rt.parallel_for),
+        (RT_SGEMM, rt.sgemm),
+        (RT_SGEMM_PARALLEL, rt.sgemm_parallel),
+        (RT_SGEMM_NT, rt.sgemm_nt),
+        (RT_SGEMM_NT_PARALLEL, rt.sgemm_nt_parallel),
+        (RT_SGEMM_TN, rt.sgemm_tn),
+        (RT_SGEMM_TN_PARALLEL, rt.sgemm_tn_parallel),
+        (RT_SGEMM_BF16_NT, rt.sgemm_bf16_nt),
+        (RT_SGEMM_BF16_NT_PARALLEL, rt.sgemm_bf16_nt_parallel),
+        (RT_SGEMM_F16_NT, rt.sgemm_f16_nt),
+        (RT_SGEMM_F16_NT_PARALLEL, rt.sgemm_f16_nt_parallel),
+        (RT_SGEMM_BF16_TN, rt.sgemm_bf16_tn),
+        (RT_SGEMM_BF16_TN_PARALLEL, rt.sgemm_bf16_tn_parallel),
+        (RT_SGEMM_F16_TN, rt.sgemm_f16_tn),
+        (RT_SGEMM_F16_TN_PARALLEL, rt.sgemm_f16_tn_parallel),
+        (RT_SGEMM_NT_EPI, rt.sgemm_nt_epi),
+        (RT_SGEMM_NT_EPI_PAR, rt.sgemm_nt_epi_par),
+        (RT_SGEMV, rt.sgemv),
+        (RT_SGEMV_PAR, rt.sgemv_par),
+        (RT_SGEMV_ALPHA, rt.sgemv_alpha),
+        (RT_SGEMV_ALPHA_PAR, rt.sgemv_alpha_par),
+        (RT_SGEVM, rt.gevm),
+        (RT_SGEVM_PAR, rt.gevm_par),
+        (RT_SGEMM_NT_ALPHA, rt.sgemm_nt_alpha),
+        (RT_SGEMM_NT_ALPHA_PAR, rt.sgemm_nt_alpha_par),
+        (RT_SGEMM_BF16_NT_EPI, rt.sgemm_bf16_nt_epi),
+        (RT_SGEMM_BF16_NT_EPI_PAR, rt.sgemm_bf16_nt_epi_par),
+        (RT_SGEMM_F16_NT_EPI, rt.sgemm_f16_nt_epi),
+        (RT_SGEMM_F16_NT_EPI_PAR, rt.sgemm_f16_nt_epi_par),
+        (RT_VMATH, rt.vmath),
+        (RT_VMATH_PARALLEL, rt.vmath_par),
+        (RT_VMATH2, rt.vmath2),
+        (RT_SOFTMAX_BWD, rt.softmax_bwd),
+        (RT_SOFTMAX_BWD_PAR, rt.softmax_bwd_par),
+        (RT_LRSCAN, rt.lrscan),
+        (RT_LRSCAN_PAR, rt.lrscan_par),
+        (RT_RMSNORM_BWD, rt.rmsnorm_bwd),
+        (RT_RMSNORM_BWD_PAR, rt.rmsnorm_bwd_par),
+        (RT_LAYERNORM_BWD, rt.layernorm_bwd),
+        (RT_LAYERNORM_BWD_PAR, rt.layernorm_bwd_par),
+        (RT_XENT, rt.xent),
+        (RT_XENT_PAR, rt.xent_par),
+        (RT_XENT_BWD, rt.xent_bwd),
+        (RT_XENT_BWD_PAR, rt.xent_bwd_par),
+        (RT_ROPE, rt.rope),
+        (RT_ROPE_PAR, rt.rope_par),
+        (RT_ROPE_BWD, rt.rope_bwd),
+        (RT_ROPE_BWD_PAR, rt.rope_bwd_par),
+        (RT_LOGSUMEXP, rt.logsumexp),
+        (RT_LOGSUMEXP_PAR, rt.logsumexp_par),
+        (RT_KLDIV, rt.kldiv),
+        (RT_KLDIV_PAR, rt.kldiv_par),
+        (RT_ENTROPY, rt.entropy),
+        (RT_ENTROPY_PAR, rt.entropy_par),
+        (RT_KD_LOSS, rt.kd_loss),
+        (RT_KD_LOSS_PAR, rt.kd_loss_par),
+        (RT_ROWARGMAX, rt.rowargmax),
+        (RT_ROWARGMAX_PAR, rt.rowargmax_par),
+        (RT_ROWARGMIN, rt.rowargmin),
+        (RT_ROWARGMIN_PAR, rt.rowargmin_par),
+        (RT_COLARGMAX, rt.colargmax),
+        (RT_COLARGMAX_PAR, rt.colargmax_par),
+        (RT_COLARGMIN, rt.colargmin),
+        (RT_COLARGMIN_PAR, rt.colargmin_par),
+        (RT_CUMSUM, rt.cumsum),
+        (RT_CUMSUM_PAR, rt.cumsum_par),
+        (RT_CUMPROD, rt.cumprod),
+        (RT_CUMPROD_PAR, rt.cumprod_par),
+        (RT_CUMMAX, rt.cummax),
+        (RT_CUMMAX_PAR, rt.cummax_par),
+        (RT_CUMMIN, rt.cummin),
+        (RT_CUMMIN_PAR, rt.cummin_par),
+        (RT_MAXPOOL2D, rt.maxpool2d),
+        (RT_MAXPOOL2D_PAR, rt.maxpool2d_par),
+        (RT_AVGPOOL2D, rt.avgpool2d),
+        (RT_AVGPOOL2D_PAR, rt.avgpool2d_par),
+        (RT_VMATH_BF16, rt.vmath_bf16),
+        (RT_VMATH_F16, rt.vmath_f16),
+        (RT_VMATH_BF16_OUT, rt.vmath_bf16_out),
+        (RT_VMATH_F16_OUT, rt.vmath_f16_out),
+        (RT_TRANSPOSE, rt.transpose),
+        (RT_TRANSPOSE_PAR, rt.transpose_par),
+        (RT_TRANSPOSE_U16, rt.transpose_u16),
+        (RT_TRANSPOSE_U16_PAR, rt.transpose_u16_par),
+        (RT_COLSUM, rt.colsum),
+        (RT_COLSUM_PAR, rt.colsum_par),
+        (RT_COLMAX, rt.colmax),
+        (RT_COLMAX_PAR, rt.colmax_par),
+        (RT_COLMIN, rt.colmin),
+        (RT_COLMIN_PAR, rt.colmin_par),
+        (RT_COLMAXABS, rt.colmaxabs),
+        (RT_COLMAXABS_PAR, rt.colmaxabs_par),
+        (RT_COLMEAN, rt.colmean),
+        (RT_COLMEAN_PAR, rt.colmean_par),
+        (RT_COLSUMSQ, rt.colsumsq),
+        (RT_COLSUMSQ_PAR, rt.colsumsq_par),
+        (RT_COLL2, rt.coll2),
+        (RT_COLL2_PAR, rt.coll2_par),
+        (RT_COLRMS, rt.colrms),
+        (RT_COLRMS_PAR, rt.colrms_par),
+        (RT_VELEM, rt.velem),
+        (RT_VELEM_PARALLEL, rt.velem_par),
+        (RT_VHORNER, rt.vhorner),
+        (RT_BIAS_BCAST, rt.bias_bcast),
+        (RT_BIAS_BCAST_PAR, rt.bias_bcast_par),
+        (RT_SREDUCE, rt.sred),
+        (RT_SREDUCE_PARALLEL, rt.sred_par),
+        (RT_ARGREDUCE, rt.argreduce),
+        (RT_ARGREDUCE_PARALLEL, rt.argreduce_par),
+        (RT_NORM, rt.norm),
+        (RT_NORM_PARALLEL, rt.norm_par),
+        (RT_NORM_AFFINE, rt.norm_affine),
+        (RT_NORM_AFFINE_PARALLEL, rt.norm_affine_par),
+        (RT_I8GEMM_NT, rt.i8nt),
+        (RT_I8GEMM_NT_PARALLEL, rt.i8nt_par),
+        (RT_I8GEMM_NT_DEQ, rt.i8nt_deq),
+        (RT_I8GEMM_NT_DEQ_PARALLEL, rt.i8nt_deq_par),
+        (RT_DEQUANT, rt.dequant),
+        (RT_DEQUANT_PAR, rt.dequant_par),
+        (RT_DEQUANT_PERCHAN, rt.dequant_perchan),
+        (RT_DEQUANT_PERCHAN_PAR, rt.dequant_perchan_par),
+        (RT_EMBEDDING, rt.embedding),
+        (RT_EMBEDDING_PAR, rt.embedding_par),
+        (RT_ATTENTION, rt.attention),
+        (RT_SCATTER_ADD, rt.scatter_add),
+        (RT_SCATTER_ADD_PAR, rt.scatter_add_par),
+        (RT_AXPBY_BF16, rt.axpby_bf16),
+        (RT_AXPBY_BF16_OUT, rt.axpby_bf16_out),
+        (RT_AXPBY_F16_OUT, rt.axpby_f16_out),
+        (RT_DOT_BF16, rt.dot_bf16),
+        (RT_SUM_BF16, rt.sum_bf16),
+        (RT_REDUCE_BF16, rt.reduce_bf16),
+        (RT_AXPBY_F16, rt.axpby_f16),
+        (RT_DOT_F16, rt.dot_f16),
+        (RT_SUM_F16, rt.sum_f16),
+        (RT_REDUCE_F16, rt.reduce_f16),
+        (RT_DOT_BF16_PAR, rt.dot_bf16_par),
+        (RT_SUM_BF16_PAR, rt.sum_bf16_par),
+        (RT_REDUCE_BF16_PAR, rt.reduce_bf16_par),
+        (RT_DOT_F16_PAR, rt.dot_f16_par),
+        (RT_SUM_F16_PAR, rt.sum_f16_par),
+        (RT_REDUCE_F16_PAR, rt.reduce_f16_par),
+        (RT_F32_TO_F16, rt.f32_to_f16),
+        (RT_F16_TO_F32, rt.f16_to_f32),
+        (RT_FMOD_F64, rt.fmod_f64),
+        (RT_FMOD_F32, rt.fmod_f32),
+    ]);
+
     // Declare all user functions first so calls resolve regardless of definition order.
     let mut ids: HashMap<Symbol, FuncId> = HashMap::new();
     for f in &program.funcs {
@@ -3076,7 +3264,7 @@ fn populate_module<M: Module>(
             interner,
             ptr_ty,
             call_conv,
-            &rt,
+            &rt_ids,
             &ids,
             &data_ids,
             &kernel_ids,
@@ -3088,7 +3276,7 @@ fn populate_module<M: Module>(
             interner,
             ptr_ty,
             call_conv,
-            &rt,
+            &rt_ids,
             &ids,
             &data_ids,
             &kernel_ids,
@@ -3098,12 +3286,10 @@ fn populate_module<M: Module>(
 }
 
 /// Lower one MIR function to a complete Cranelift IR function (the instruction-selection input),
-/// building into `clif`. The module-declarations dependency is a **read-only** [`Decls`] view (named
-/// `module` so the ~150 `module.declare_func_in_func` call sites below are unchanged), so this runs
-/// entirely off the object module's `&mut` mutation path — which is exactly what lets
-/// [`define_functions_parallel`] build and compile many functions concurrently. The CLIF is
-/// byte-for-byte what the previous inline loop produced: `Decls`' shims replicate
-/// `Module::declare_{func,data}_in_func` verbatim.
+/// building into `clif`. The module-declarations dependency is a read-only [`Decls`] view, so
+/// [`define_functions_parallel`] can build and compile functions concurrently. User symbols are
+/// imported in MIR order and runtime signatures on first use; both paths use the same ordering.
+/// `Decls`' shims replicate `Module::declare_{func,data}_in_func` verbatim.
 #[allow(clippy::too_many_arguments)]
 fn build_function_clif(
     module: &Decls,
@@ -3112,7 +3298,7 @@ fn build_function_clif(
     interner: &Interner,
     ptr_ty: Type,
     call_conv: cranelift_codegen::isa::CallConv,
-    rt: &RtFuncs,
+    rt_ids: &HashMap<&'static str, FuncId>,
     ids: &HashMap<Symbol, FuncId>,
     data_ids: &HashMap<Symbol, DataId>,
     kernel_ids: &[Vec<FuncId>],
@@ -3152,660 +3338,6 @@ fn build_function_clif(
                 .iter()
                 .map(|&kid| module.declare_func_in_func(kid, builder.func))
                 .collect();
-            let mut rt_refs: HashMap<&'static str, FuncRef> = HashMap::new();
-            rt_refs.insert(
-                RT_PRINT_I64,
-                module.declare_func_in_func(rt.print_i64, builder.func),
-            );
-            rt_refs.insert(
-                RT_PRINT_U64,
-                module.declare_func_in_func(rt.print_u64, builder.func),
-            );
-            rt_refs.insert(
-                RT_PRINT_STR,
-                module.declare_func_in_func(rt.print_str, builder.func),
-            );
-            rt_refs.insert(
-                RT_PRINT_F64,
-                module.declare_func_in_func(rt.print_f64, builder.func),
-            );
-            rt_refs.insert(
-                RT_ASSERT,
-                module.declare_func_in_func(rt.assert, builder.func),
-            );
-            rt_refs.insert(
-                RT_ALLOC,
-                module.declare_func_in_func(rt.rt_alloc, builder.func),
-            );
-            rt_refs.insert(
-                RT_FREE,
-                module.declare_func_in_func(rt.rt_free, builder.func),
-            );
-            rt_refs.insert(
-                RT_READ_F32,
-                module.declare_func_in_func(rt.rt_read_f32, builder.func),
-            );
-            rt_refs.insert(
-                RT_READ_F64,
-                module.declare_func_in_func(rt.rt_read_f64, builder.func),
-            );
-            rt_refs.insert(
-                RT_READ_I32,
-                module.declare_func_in_func(rt.rt_read_i32, builder.func),
-            );
-            rt_refs.insert(
-                RT_READ_I64,
-                module.declare_func_in_func(rt.rt_read_i64, builder.func),
-            );
-            rt_refs.insert(
-                RT_READ_I8,
-                module.declare_func_in_func(rt.rt_read_i8, builder.func),
-            );
-            rt_refs.insert(
-                RT_READ_U8,
-                module.declare_func_in_func(rt.rt_read_u8, builder.func),
-            );
-            rt_refs.insert(
-                RT_WRITE_F32,
-                module.declare_func_in_func(rt.rt_write_f32, builder.func),
-            );
-            rt_refs.insert(
-                RT_WRITE_F64,
-                module.declare_func_in_func(rt.rt_write_f64, builder.func),
-            );
-            rt_refs.insert(
-                RT_WRITE_I32,
-                module.declare_func_in_func(rt.rt_write_i32, builder.func),
-            );
-            rt_refs.insert(
-                RT_WRITE_I64,
-                module.declare_func_in_func(rt.rt_write_i64, builder.func),
-            );
-            rt_refs.insert(
-                RT_WRITE_I8,
-                module.declare_func_in_func(rt.rt_write_i8, builder.func),
-            );
-            rt_refs.insert(
-                RT_WRITE_U8,
-                module.declare_func_in_func(rt.rt_write_u8, builder.func),
-            );
-            rt_refs.insert(
-                RT_NOW_NS,
-                module.declare_func_in_func(rt.now_ns, builder.func),
-            );
-            rt_refs.insert(
-                RT_PARALLEL_FOR,
-                module.declare_func_in_func(rt.parallel_for, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM,
-                module.declare_func_in_func(rt.sgemm, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_PARALLEL,
-                module.declare_func_in_func(rt.sgemm_parallel, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_NT,
-                module.declare_func_in_func(rt.sgemm_nt, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_NT_PARALLEL,
-                module.declare_func_in_func(rt.sgemm_nt_parallel, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_TN,
-                module.declare_func_in_func(rt.sgemm_tn, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_TN_PARALLEL,
-                module.declare_func_in_func(rt.sgemm_tn_parallel, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_BF16_NT,
-                module.declare_func_in_func(rt.sgemm_bf16_nt, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_BF16_NT_PARALLEL,
-                module.declare_func_in_func(rt.sgemm_bf16_nt_parallel, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_F16_NT,
-                module.declare_func_in_func(rt.sgemm_f16_nt, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_F16_NT_PARALLEL,
-                module.declare_func_in_func(rt.sgemm_f16_nt_parallel, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_BF16_TN,
-                module.declare_func_in_func(rt.sgemm_bf16_tn, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_BF16_TN_PARALLEL,
-                module.declare_func_in_func(rt.sgemm_bf16_tn_parallel, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_F16_TN,
-                module.declare_func_in_func(rt.sgemm_f16_tn, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_F16_TN_PARALLEL,
-                module.declare_func_in_func(rt.sgemm_f16_tn_parallel, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_NT_EPI,
-                module.declare_func_in_func(rt.sgemm_nt_epi, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_NT_EPI_PAR,
-                module.declare_func_in_func(rt.sgemm_nt_epi_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMV,
-                module.declare_func_in_func(rt.sgemv, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMV_PAR,
-                module.declare_func_in_func(rt.sgemv_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMV_ALPHA,
-                module.declare_func_in_func(rt.sgemv_alpha, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMV_ALPHA_PAR,
-                module.declare_func_in_func(rt.sgemv_alpha_par, builder.func),
-            );
-            rt_refs.insert(RT_SGEVM, module.declare_func_in_func(rt.gevm, builder.func));
-            rt_refs.insert(
-                RT_SGEVM_PAR,
-                module.declare_func_in_func(rt.gevm_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_NT_ALPHA,
-                module.declare_func_in_func(rt.sgemm_nt_alpha, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_NT_ALPHA_PAR,
-                module.declare_func_in_func(rt.sgemm_nt_alpha_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_BF16_NT_EPI,
-                module.declare_func_in_func(rt.sgemm_bf16_nt_epi, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_BF16_NT_EPI_PAR,
-                module.declare_func_in_func(rt.sgemm_bf16_nt_epi_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_F16_NT_EPI,
-                module.declare_func_in_func(rt.sgemm_f16_nt_epi, builder.func),
-            );
-            rt_refs.insert(
-                RT_SGEMM_F16_NT_EPI_PAR,
-                module.declare_func_in_func(rt.sgemm_f16_nt_epi_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_VMATH,
-                module.declare_func_in_func(rt.vmath, builder.func),
-            );
-            rt_refs.insert(
-                RT_VMATH_PARALLEL,
-                module.declare_func_in_func(rt.vmath_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_VMATH2,
-                module.declare_func_in_func(rt.vmath2, builder.func),
-            );
-            rt_refs.insert(
-                RT_SOFTMAX_BWD,
-                module.declare_func_in_func(rt.softmax_bwd, builder.func),
-            );
-            rt_refs.insert(
-                RT_SOFTMAX_BWD_PAR,
-                module.declare_func_in_func(rt.softmax_bwd_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_LRSCAN,
-                module.declare_func_in_func(rt.lrscan, builder.func),
-            );
-            rt_refs.insert(
-                RT_LRSCAN_PAR,
-                module.declare_func_in_func(rt.lrscan_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_RMSNORM_BWD,
-                module.declare_func_in_func(rt.rmsnorm_bwd, builder.func),
-            );
-            rt_refs.insert(
-                RT_RMSNORM_BWD_PAR,
-                module.declare_func_in_func(rt.rmsnorm_bwd_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_LAYERNORM_BWD,
-                module.declare_func_in_func(rt.layernorm_bwd, builder.func),
-            );
-            rt_refs.insert(
-                RT_LAYERNORM_BWD_PAR,
-                module.declare_func_in_func(rt.layernorm_bwd_par, builder.func),
-            );
-            rt_refs.insert(RT_XENT, module.declare_func_in_func(rt.xent, builder.func));
-            rt_refs.insert(
-                RT_XENT_PAR,
-                module.declare_func_in_func(rt.xent_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_XENT_BWD,
-                module.declare_func_in_func(rt.xent_bwd, builder.func),
-            );
-            rt_refs.insert(
-                RT_XENT_BWD_PAR,
-                module.declare_func_in_func(rt.xent_bwd_par, builder.func),
-            );
-            rt_refs.insert(RT_ROPE, module.declare_func_in_func(rt.rope, builder.func));
-            rt_refs.insert(
-                RT_ROPE_PAR,
-                module.declare_func_in_func(rt.rope_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_ROPE_BWD,
-                module.declare_func_in_func(rt.rope_bwd, builder.func),
-            );
-            rt_refs.insert(
-                RT_ROPE_BWD_PAR,
-                module.declare_func_in_func(rt.rope_bwd_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_LOGSUMEXP,
-                module.declare_func_in_func(rt.logsumexp, builder.func),
-            );
-            rt_refs.insert(
-                RT_LOGSUMEXP_PAR,
-                module.declare_func_in_func(rt.logsumexp_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_KLDIV,
-                module.declare_func_in_func(rt.kldiv, builder.func),
-            );
-            rt_refs.insert(
-                RT_KLDIV_PAR,
-                module.declare_func_in_func(rt.kldiv_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_ENTROPY,
-                module.declare_func_in_func(rt.entropy, builder.func),
-            );
-            rt_refs.insert(
-                RT_ENTROPY_PAR,
-                module.declare_func_in_func(rt.entropy_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_KD_LOSS,
-                module.declare_func_in_func(rt.kd_loss, builder.func),
-            );
-            rt_refs.insert(
-                RT_KD_LOSS_PAR,
-                module.declare_func_in_func(rt.kd_loss_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_ROWARGMAX,
-                module.declare_func_in_func(rt.rowargmax, builder.func),
-            );
-            rt_refs.insert(
-                RT_ROWARGMAX_PAR,
-                module.declare_func_in_func(rt.rowargmax_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_ROWARGMIN,
-                module.declare_func_in_func(rt.rowargmin, builder.func),
-            );
-            rt_refs.insert(
-                RT_ROWARGMIN_PAR,
-                module.declare_func_in_func(rt.rowargmin_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLARGMAX,
-                module.declare_func_in_func(rt.colargmax, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLARGMAX_PAR,
-                module.declare_func_in_func(rt.colargmax_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLARGMIN,
-                module.declare_func_in_func(rt.colargmin, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLARGMIN_PAR,
-                module.declare_func_in_func(rt.colargmin_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_CUMSUM,
-                module.declare_func_in_func(rt.cumsum, builder.func),
-            );
-            rt_refs.insert(
-                RT_CUMSUM_PAR,
-                module.declare_func_in_func(rt.cumsum_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_CUMPROD,
-                module.declare_func_in_func(rt.cumprod, builder.func),
-            );
-            rt_refs.insert(
-                RT_CUMPROD_PAR,
-                module.declare_func_in_func(rt.cumprod_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_CUMMAX,
-                module.declare_func_in_func(rt.cummax, builder.func),
-            );
-            rt_refs.insert(
-                RT_CUMMAX_PAR,
-                module.declare_func_in_func(rt.cummax_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_CUMMIN,
-                module.declare_func_in_func(rt.cummin, builder.func),
-            );
-            rt_refs.insert(
-                RT_CUMMIN_PAR,
-                module.declare_func_in_func(rt.cummin_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_MAXPOOL2D,
-                module.declare_func_in_func(rt.maxpool2d, builder.func),
-            );
-            rt_refs.insert(
-                RT_MAXPOOL2D_PAR,
-                module.declare_func_in_func(rt.maxpool2d_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_AVGPOOL2D,
-                module.declare_func_in_func(rt.avgpool2d, builder.func),
-            );
-            rt_refs.insert(
-                RT_AVGPOOL2D_PAR,
-                module.declare_func_in_func(rt.avgpool2d_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_VMATH_BF16,
-                module.declare_func_in_func(rt.vmath_bf16, builder.func),
-            );
-            rt_refs.insert(
-                RT_VMATH_F16,
-                module.declare_func_in_func(rt.vmath_f16, builder.func),
-            );
-            rt_refs.insert(
-                RT_VMATH_BF16_OUT,
-                module.declare_func_in_func(rt.vmath_bf16_out, builder.func),
-            );
-            rt_refs.insert(
-                RT_VMATH_F16_OUT,
-                module.declare_func_in_func(rt.vmath_f16_out, builder.func),
-            );
-            rt_refs.insert(
-                RT_TRANSPOSE,
-                module.declare_func_in_func(rt.transpose, builder.func),
-            );
-            rt_refs.insert(
-                RT_TRANSPOSE_PAR,
-                module.declare_func_in_func(rt.transpose_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_TRANSPOSE_U16,
-                module.declare_func_in_func(rt.transpose_u16, builder.func),
-            );
-            rt_refs.insert(
-                RT_TRANSPOSE_U16_PAR,
-                module.declare_func_in_func(rt.transpose_u16_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLSUM,
-                module.declare_func_in_func(rt.colsum, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLSUM_PAR,
-                module.declare_func_in_func(rt.colsum_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLMAX,
-                module.declare_func_in_func(rt.colmax, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLMAX_PAR,
-                module.declare_func_in_func(rt.colmax_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLMIN,
-                module.declare_func_in_func(rt.colmin, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLMIN_PAR,
-                module.declare_func_in_func(rt.colmin_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLMAXABS,
-                module.declare_func_in_func(rt.colmaxabs, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLMAXABS_PAR,
-                module.declare_func_in_func(rt.colmaxabs_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLMEAN,
-                module.declare_func_in_func(rt.colmean, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLMEAN_PAR,
-                module.declare_func_in_func(rt.colmean_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLSUMSQ,
-                module.declare_func_in_func(rt.colsumsq, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLSUMSQ_PAR,
-                module.declare_func_in_func(rt.colsumsq_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLL2,
-                module.declare_func_in_func(rt.coll2, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLL2_PAR,
-                module.declare_func_in_func(rt.coll2_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLRMS,
-                module.declare_func_in_func(rt.colrms, builder.func),
-            );
-            rt_refs.insert(
-                RT_COLRMS_PAR,
-                module.declare_func_in_func(rt.colrms_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_VELEM,
-                module.declare_func_in_func(rt.velem, builder.func),
-            );
-            rt_refs.insert(
-                RT_VELEM_PARALLEL,
-                module.declare_func_in_func(rt.velem_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_VHORNER,
-                module.declare_func_in_func(rt.vhorner, builder.func),
-            );
-            rt_refs.insert(
-                RT_BIAS_BCAST,
-                module.declare_func_in_func(rt.bias_bcast, builder.func),
-            );
-            rt_refs.insert(
-                RT_BIAS_BCAST_PAR,
-                module.declare_func_in_func(rt.bias_bcast_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_SREDUCE,
-                module.declare_func_in_func(rt.sred, builder.func),
-            );
-            rt_refs.insert(
-                RT_SREDUCE_PARALLEL,
-                module.declare_func_in_func(rt.sred_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_ARGREDUCE,
-                module.declare_func_in_func(rt.argreduce, builder.func),
-            );
-            rt_refs.insert(
-                RT_ARGREDUCE_PARALLEL,
-                module.declare_func_in_func(rt.argreduce_par, builder.func),
-            );
-            rt_refs.insert(RT_NORM, module.declare_func_in_func(rt.norm, builder.func));
-            rt_refs.insert(
-                RT_NORM_PARALLEL,
-                module.declare_func_in_func(rt.norm_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_NORM_AFFINE,
-                module.declare_func_in_func(rt.norm_affine, builder.func),
-            );
-            rt_refs.insert(
-                RT_NORM_AFFINE_PARALLEL,
-                module.declare_func_in_func(rt.norm_affine_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_I8GEMM_NT,
-                module.declare_func_in_func(rt.i8nt, builder.func),
-            );
-            rt_refs.insert(
-                RT_I8GEMM_NT_PARALLEL,
-                module.declare_func_in_func(rt.i8nt_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_I8GEMM_NT_DEQ,
-                module.declare_func_in_func(rt.i8nt_deq, builder.func),
-            );
-            rt_refs.insert(
-                RT_I8GEMM_NT_DEQ_PARALLEL,
-                module.declare_func_in_func(rt.i8nt_deq_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_DEQUANT,
-                module.declare_func_in_func(rt.dequant, builder.func),
-            );
-            rt_refs.insert(
-                RT_DEQUANT_PAR,
-                module.declare_func_in_func(rt.dequant_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_DEQUANT_PERCHAN,
-                module.declare_func_in_func(rt.dequant_perchan, builder.func),
-            );
-            rt_refs.insert(
-                RT_DEQUANT_PERCHAN_PAR,
-                module.declare_func_in_func(rt.dequant_perchan_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_EMBEDDING,
-                module.declare_func_in_func(rt.embedding, builder.func),
-            );
-            rt_refs.insert(
-                RT_EMBEDDING_PAR,
-                module.declare_func_in_func(rt.embedding_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_ATTENTION,
-                module.declare_func_in_func(rt.attention, builder.func),
-            );
-            rt_refs.insert(
-                RT_SCATTER_ADD,
-                module.declare_func_in_func(rt.scatter_add, builder.func),
-            );
-            rt_refs.insert(
-                RT_SCATTER_ADD_PAR,
-                module.declare_func_in_func(rt.scatter_add_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_AXPBY_BF16,
-                module.declare_func_in_func(rt.axpby_bf16, builder.func),
-            );
-            rt_refs.insert(
-                RT_AXPBY_BF16_OUT,
-                module.declare_func_in_func(rt.axpby_bf16_out, builder.func),
-            );
-            rt_refs.insert(
-                RT_AXPBY_F16_OUT,
-                module.declare_func_in_func(rt.axpby_f16_out, builder.func),
-            );
-            rt_refs.insert(
-                RT_DOT_BF16,
-                module.declare_func_in_func(rt.dot_bf16, builder.func),
-            );
-            rt_refs.insert(
-                RT_SUM_BF16,
-                module.declare_func_in_func(rt.sum_bf16, builder.func),
-            );
-            rt_refs.insert(
-                RT_REDUCE_BF16,
-                module.declare_func_in_func(rt.reduce_bf16, builder.func),
-            );
-            rt_refs.insert(
-                RT_AXPBY_F16,
-                module.declare_func_in_func(rt.axpby_f16, builder.func),
-            );
-            rt_refs.insert(
-                RT_DOT_F16,
-                module.declare_func_in_func(rt.dot_f16, builder.func),
-            );
-            rt_refs.insert(
-                RT_SUM_F16,
-                module.declare_func_in_func(rt.sum_f16, builder.func),
-            );
-            rt_refs.insert(
-                RT_REDUCE_F16,
-                module.declare_func_in_func(rt.reduce_f16, builder.func),
-            );
-            rt_refs.insert(
-                RT_DOT_BF16_PAR,
-                module.declare_func_in_func(rt.dot_bf16_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_SUM_BF16_PAR,
-                module.declare_func_in_func(rt.sum_bf16_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_REDUCE_BF16_PAR,
-                module.declare_func_in_func(rt.reduce_bf16_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_DOT_F16_PAR,
-                module.declare_func_in_func(rt.dot_f16_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_SUM_F16_PAR,
-                module.declare_func_in_func(rt.sum_f16_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_REDUCE_F16_PAR,
-                module.declare_func_in_func(rt.reduce_f16_par, builder.func),
-            );
-            rt_refs.insert(
-                RT_F32_TO_F16,
-                module.declare_func_in_func(rt.f32_to_f16, builder.func),
-            );
-            rt_refs.insert(
-                RT_F16_TO_F32,
-                module.declare_func_in_func(rt.f16_to_f32, builder.func),
-            );
-            rt_refs.insert(
-                RT_FMOD_F64,
-                module.declare_func_in_func(rt.fmod_f64, builder.func),
-            );
-            rt_refs.insert(
-                RT_FMOD_F32,
-                module.declare_func_in_func(rt.fmod_f32, builder.func),
-            );
-
             let blocks: Vec<Block> = f.blocks.iter().map(|_| builder.create_block()).collect();
             let mut t = FnTranslator {
                 builder,
@@ -3815,7 +3347,9 @@ fn build_function_clif(
                 vmap: vec![None; f.value_types.len()],
                 blocks,
                 func_refs: &func_refs,
-                rt_refs: &rt_refs,
+                decls: module,
+                rt_ids,
+                rt_refs: HashMap::new(),
                 data_refs: &data_refs,
                 kernel_refs: &kernel_refs,
                 alias: wukong_opt::AliasInfo::analyze(f),
@@ -3900,7 +3434,7 @@ fn define_functions_serial<M: Module>(
     interner: &Interner,
     ptr_ty: Type,
     call_conv: cranelift_codegen::isa::CallConv,
-    rt: &RtFuncs,
+    rt_ids: &HashMap<&'static str, FuncId>,
     ids: &HashMap<Symbol, FuncId>,
     data_ids: &HashMap<Symbol, DataId>,
     kernel_ids: &[Vec<FuncId>],
@@ -3915,7 +3449,7 @@ fn define_functions_serial<M: Module>(
         for (fi, f) in program.funcs.iter().enumerate() {
             let mut clif = cranelift_codegen::ir::Function::new();
             build_function_clif(
-                &decls, f, fi, interner, ptr_ty, call_conv, rt, ids, data_ids, kernel_ids,
+                &decls, f, fi, interner, ptr_ty, call_conv, rt_ids, ids, data_ids, kernel_ids,
                 &mut fbctx, &mut clif,
             )?;
             clifs.push((ids[&f.name], clif));
@@ -3945,7 +3479,7 @@ fn define_functions_parallel<M: Module>(
     interner: &Interner,
     ptr_ty: Type,
     call_conv: cranelift_codegen::isa::CallConv,
-    rt: &RtFuncs,
+    rt_ids: &HashMap<&'static str, FuncId>,
     ids: &HashMap<Symbol, FuncId>,
     data_ids: &HashMap<Symbol, DataId>,
     kernel_ids: &[Vec<FuncId>],
@@ -3982,7 +3516,7 @@ fn define_functions_parallel<M: Module>(
                         interner,
                         ptr_ty,
                         call_conv,
-                        rt,
+                        rt_ids,
                         ids,
                         data_ids,
                         kernel_ids,
