@@ -12204,7 +12204,11 @@ impl FnLowerer<'_> {
                             }
                         }
                     }
-                    ForIter::Expr(e) => self.scan_region_expr(e, sc),
+                    // Aggregate foreach elements bind directly to the iterand's storage during
+                    // lowering. Treating the element name as a private body-local would hide
+                    // writes to a shared capture (`for row in rows { row[0] = h; }`). Until the
+                    // scan models those aliases, only range iterators establish private locals.
+                    ForIter::Expr(_) => sc.ok = false,
                 }
                 if !sc.ok {
                     return;
