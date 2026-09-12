@@ -270,8 +270,8 @@ impl FnLowerer<'_> {
             .build(tile_ty.clone(), Op::ConstInt(b, tile_ty.clone()));
         let tile_offset = self.coerce_to(tile_const, &tile_ty, &ity, false);
 
-        let start_val = self.lower_range_bound(start, &ity);
-        let end_val = self.lower_range_bound(end, &ity);
+        let start_val = self.lower_range_bound(start, &ity, signed);
+        let end_val = self.lower_range_bound(end, &ity, signed);
         let exit = self.builder.new_block();
         let nonempty = self.builder.new_block();
         let ordered = self.builder.build(
