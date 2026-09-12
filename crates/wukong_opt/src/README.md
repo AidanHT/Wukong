@@ -15,7 +15,7 @@
 | `dse.rs` | `Dse` — intra-block dead-store elimination |
 | `loop_canon.rs` | `LoopCanon` — canonical loop shape (preheader, latch, exit polarity) |
 | `licm.rs` | `Licm` — hoist loop-invariant non-trapping ops into an existing preheader |
-| `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue; constant left shifts use wrapping multiply |
+| `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue; constant `i16`/`i32` left shifts use wrapping multiply |
 | `inline.rs` | `inline_program` — bottom-up call-graph SCC inlining with per-site growth budgets |
 | `unroll.rs` | `unroll_program` — partial loop unrolling at `-O2`+ |
 | `alias.rs` | `AliasInfo`, `Prov` — provenance for load/store disambiguation |
