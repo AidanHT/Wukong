@@ -798,19 +798,17 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi_parallel(
 }
 
 /// Transpose a row-major `[rows, cols]` matrix `src` into a row-major `[cols, rows]` matrix `dst`
-/// (`dst[c*rows + r] = src[r*cols + c]`). Reads each source row contiguously; a one-time
-/// O(rows·cols) reorg used by the `C = Aᵀ·B` GEMM below.
+/// (`dst[c*rows + r] = src[r*cols + c]`). Reuse the cache-blocked transpose kernel, including its
+/// 8×8 AVX2 path, for this one-time O(rows·cols) reorganization before `C = Aᵀ·B`.
 ///
 /// # Safety
 /// `src` and `dst` must each be valid for `rows*cols` `f32`, and must not overlap.
 #[inline]
 unsafe fn transpose_into(src: *const f32, dst: *mut f32, rows: usize, cols: usize) {
-    for r in 0..rows {
-        let s = src.add(r * cols);
-        for c in 0..cols {
-            *dst.add(c * rows + r) = *s.add(c);
-        }
-    }
+    // The GEMM entry points validate positive i64 dimensions before converting them to usize,
+    // so these casts recover the original extents. Scratch is distinct from the source, as the
+    // transpose kernel requires. No arithmetic touches the values, including NaN payloads.
+    crate::transpose::wukong_transpose_f32(src, dst, rows as i64, cols as i64);
 }
 
 /// `C = Aᵀ·B` — A is stored row-major as `[k, m]` (`a[p*m + i]`), B row-major `[k, n]` (`b[p*n + j]`),
