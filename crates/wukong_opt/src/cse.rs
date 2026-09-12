@@ -25,7 +25,7 @@
 use crate::alias::{type_bytes, AliasInfo};
 use crate::fxhash::FxHashMap;
 
-use wukong_mir::{Function, MirType, Op, ValueId};
+use wukong_mir::{BinOp, CmpOp, Function, MirType, Op, ValueId};
 
 use crate::{cfg, map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
@@ -248,8 +248,28 @@ fn pure_key(op: &Op, result_ty: &MirType, rewrite: &FxHashMap<u32, u32>) -> Opti
     Some(match op {
         Op::ConstInt(n, ty) => Key::ConstInt(*n, ty.clone()),
         Op::ConstFloat(x, ty) => Key::ConstFloat(x.to_bits(), ty.clone()),
-        Op::Bin(o, a, b) => Key::Bin(*o as u8, m(*a), m(*b)),
-        Op::Cmp(o, a, b) => Key::Cmp(*o as u8, m(*a), m(*b)),
+        Op::Bin(o, a, b) => {
+            let (mut a, mut b) = (m(*a), m(*b));
+            // Wrapping integer addition/multiplication and bitwise operations commute at every
+            // scalar and vector lane width. Canonicalize only their lookup key, retaining the
+            // first dominating computation's operand order in the emitted MIR. Floating-point
+            // arithmetic is deliberately excluded: swapping NaN operands may change payloads.
+            if matches!(
+                o,
+                BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor
+            ) && a > b
+            {
+                std::mem::swap(&mut a, &mut b);
+            }
+            Key::Bin(*o as u8, a, b)
+        }
+        Op::Cmp(o, a, b) => {
+            let (mut a, mut b) = (m(*a), m(*b));
+            if matches!(o, CmpOp::Eq | CmpOp::Ne) && a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            Key::Cmp(*o as u8, a, b)
+        }
         Op::Neg(a) => Key::Neg(m(*a)),
         Op::Not(a) => Key::Not(m(*a)),
         Op::Cast(k, a, ty) => Key::Cast(*k as u8, m(*a), ty.clone()),
