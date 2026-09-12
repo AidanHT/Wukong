@@ -273,12 +273,20 @@ impl<'a> Vjp<'a> {
         // has no VJP rule, so refuse. Constant stores stay skippable: `[0.0; N]` array zero-init
         // carries no gradient, and the loss sink writes into a buffer no kernel reads.
         if let Op::Store { ptr, value } = &inst.op {
+            // Without a live buffer adjoint, no destination can trigger this refusal. Constant
+            // initialization is also always skippable, regardless of pointer-chain depth.
+            if self.buf_adj.is_empty() {
+                return Ok(());
+            }
             let is_const = matches!(
                 self.def_op.get(value),
                 Some(Op::ConstFloat(..)) | Some(Op::ConstInt(..))
             );
+            if is_const {
+                return Ok(());
+            }
             let base = self.store_base(*ptr);
-            if !is_const && self.buf_adj.contains_key(&base) {
+            if self.buf_adj.contains_key(&base) {
                 return Err(format!(
                     "autodiff: store into buffer v{} has no VJP rule, but that buffer's gradient \
                      is live (a recognized kernel reads it downstream) — read-after-write through \
@@ -420,11 +428,11 @@ impl<'a> Vjp<'a> {
     /// underlying alloca / parameter, whatever the index. (Unlike `tape::canon`, which peels only a
     /// whole-buffer `gep ..., 0` because a non-zero offset there is a genuine sub-slice operand,
     /// this must see through an element index: `h[3] = v` still writes into `h`.)
-    fn store_base(&self, ptr: ValueId) -> ValueId {
-        match self.def_op.get(&ptr) {
-            Some(Op::Gep { ptr: base, .. }) => self.store_base(*base),
-            _ => ptr,
+    fn store_base(&self, mut ptr: ValueId) -> ValueId {
+        while let Some(Op::Gep { ptr: base, .. }) = self.def_op.get(&ptr) {
+            ptr = *base;
         }
+        ptr
     }
 
     /// Trace a load pointer to `(input parameter, optional element index in the new value space)`.

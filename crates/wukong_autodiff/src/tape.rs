@@ -168,22 +168,25 @@ impl<'a> Vjp<'a> {
     /// *different* buffer-adjoint entries and the gradient chain silently breaks between the ops. A
     /// non-zero-offset gep is a genuine sub-slice and is left alone. Dim/op-code operands are constants
     /// (not geps), so canonicalizing the whole argument list is a no-op for them.
-    fn canon(&self, v: ValueId) -> ValueId {
-        if let Some(Op::Gep { ptr, index, .. }) = self.def_op.get(&v) {
-            if self.is_const_zero(*index) {
-                return self.canon(*ptr);
+    fn canon(&self, mut v: ValueId) -> ValueId {
+        while let Some(Op::Gep { ptr, index, .. }) = self.def_op.get(&v) {
+            if !self.is_const_zero(*index) {
+                break;
             }
+            v = *ptr;
         }
         v
     }
 
     /// Whether `v` is the integer constant 0, tracing through the sign-/zero-extend casts lowering
     /// inserts on a loop index (`gep buf, sext(const.i32 0)` is still the buffer base).
-    fn is_const_zero(&self, v: ValueId) -> bool {
-        match self.def_op.get(&v) {
-            Some(Op::ConstInt(0, _)) => true,
-            Some(Op::Cast(_, inner, _)) => self.is_const_zero(*inner),
-            _ => false,
+    fn is_const_zero(&self, mut v: ValueId) -> bool {
+        loop {
+            match self.def_op.get(&v) {
+                Some(Op::ConstInt(0, _)) => return true,
+                Some(Op::Cast(_, inner, _)) => v = *inner,
+                _ => return false,
+            }
         }
     }
 
