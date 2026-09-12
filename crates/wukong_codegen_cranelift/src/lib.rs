@@ -3560,7 +3560,7 @@ fn define_functions_parallel<M: Module>(
                 |(fbctx, ctx, scratch), (fi, f)| -> Result<_, String> {
                     let fid = ids[&f.name];
                     ctx.clear();
-                    build_function_clif(
+                    if let Err(error) = build_function_clif(
                         &decls,
                         f,
                         fi,
@@ -3574,7 +3574,14 @@ fn define_functions_parallel<M: Module>(
                         fbctx,
                         &mut ctx.func,
                         scratch,
-                    )?;
+                    ) {
+                        // Lowering errors return before FunctionBuilder::finalize, which normally
+                        // clears its context. Positional error collection can visit another
+                        // function with this same iterator state, so discard that incomplete SSA
+                        // state before reuse. The next invocation clears ctx and scratch as usual.
+                        *fbctx = FunctionBuilderContext::new();
+                        return Err(error);
+                    }
                     let mut cp = cranelift_codegen::control::ControlPlane::default();
                     ctx.compile(isa, &mut cp)
                         .map_err(|e| format!("cranelift compile fn: {:?}", e.inner))?;
