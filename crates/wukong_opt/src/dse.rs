@@ -16,7 +16,7 @@
 //! Pending stores that survive to the end of the block are kept: a successor block may read them.
 
 use crate::alias::{type_bytes, AliasInfo};
-use crate::fxhash::{FxHashMap, FxHashSet};
+use crate::fxhash::FxHashMap;
 
 use wukong_mir::{Function, MirType, Op, ValueId};
 
@@ -41,10 +41,13 @@ impl Pass for Dse {
         let alias = AliasInfo::analyze(f);
 
         let mut changed = false;
+        // Reuse deletion storage between blocks. The bitmap is allocated only after
+        // finding a redundant store; a retained instruction needs one bit lookup, not hashing.
+        let mut dead: Vec<u64> = Vec::new();
         for b in &mut f.blocks {
             // location -> index of the last store to it that has not yet been read.
             let mut pending: FxHashMap<StoreKey, usize> = FxHashMap::default();
-            let mut dead: Vec<usize> = Vec::new();
+            dead.clear();
 
             for (i, inst) in b.insts.iter().enumerate() {
                 match &inst.op {
@@ -56,7 +59,10 @@ impl Pass for Dse {
                             ty: f.value_types[value.0 as usize].clone(),
                         };
                         if let Some(prev) = pending.insert(key, i) {
-                            dead.push(prev);
+                            if dead.is_empty() {
+                                dead.resize(b.insts.len().div_ceil(64), 0);
+                            }
+                            dead[prev / 64] |= 1u64 << (prev % 64);
                         }
                     }
                     Op::Load(ptr, ty) => {
@@ -80,10 +86,9 @@ impl Pass for Dse {
             }
 
             if !dead.is_empty() {
-                let dead: FxHashSet<usize> = dead.into_iter().collect();
                 let mut i = 0;
                 b.insts.retain(|_| {
-                    let keep = !dead.contains(&i);
+                    let keep = dead[i / 64] & (1u64 << (i % 64)) == 0;
                     i += 1;
                     keep
                 });

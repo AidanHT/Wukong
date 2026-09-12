@@ -94,6 +94,16 @@ struct Numbering<'a> {
     rewrite: FxHashMap<u32, u32>,
 }
 
+/// State suspended while a dominator child's subtree is numbered. Keep pending siblings in
+/// their parent frame instead of eagerly copying a memory table for every child.
+struct Scope {
+    block: u32,
+    next_child: usize,
+    last_inheriting: Option<usize>,
+    mem: FxHashMap<MemKey, u32>,
+    added_start: usize,
+}
+
 /// One tracked memory location: an SSA address value plus the type read/written there. The type is
 /// part of the key because a `store f32` and a `load i32` at one address are not the same value —
 /// keying on the address alone would forward the raw bits of one as the other.
@@ -148,9 +158,38 @@ enum Key {
 }
 
 impl Numbering<'_> {
-    fn visit(&mut self, blk: u32, mut mem: FxHashMap<MemKey, u32>) {
-        // Keys this block introduced into `vn`, to remove when we leave its subtree.
+    fn visit(&mut self, entry: u32, mem: FxHashMap<MemKey, u32>) {
+        // One undo log serves the whole DFS. Each scope removes its suffix on exit, so sibling
+        // computations never become candidates for one another. Reusing the log also avoids a
+        // separate allocation for every block that contributes a pure expression.
         let mut added: Vec<Key> = Vec::new();
+        let mut stack = vec![self.enter(entry, mem, &mut added)];
+        while let Some(scope) = stack.last_mut() {
+            let children = &self.children[scope.block as usize];
+            if let Some(&child) = children.get(scope.next_child) {
+                let i = scope.next_child;
+                scope.next_child += 1;
+                // Preserve the recursive walk's child order and move the table into its last
+                // inheriting child. Straight-line regions still incur no table copy.
+                let inherited = if Some(i) == scope.last_inheriting {
+                    std::mem::take(&mut scope.mem)
+                } else if self.preds[child as usize].as_slice() == [scope.block] {
+                    scope.mem.clone()
+                } else {
+                    FxHashMap::default()
+                };
+                stack.push(self.enter(child, inherited, &mut added));
+            } else {
+                for key in added.drain(scope.added_start..) {
+                    self.vn.remove(&key);
+                }
+                stack.pop();
+            }
+        }
+    }
+
+    fn enter(&mut self, blk: u32, mut mem: FxHashMap<MemKey, u32>, added: &mut Vec<Key>) -> Scope {
+        let added_start = added.len();
         for inst in &self.f.blocks[blk as usize].insts {
             match &inst.op {
                 Op::Alloca {
@@ -226,20 +265,12 @@ impl Numbering<'_> {
         let last_inheriting = self.children[blk as usize]
             .iter()
             .rposition(|&c| self.preds[c as usize].as_slice() == [blk]);
-        for i in 0..self.children[blk as usize].len() {
-            let c = self.children[blk as usize][i];
-            let inherited = if Some(i) == last_inheriting {
-                std::mem::take(&mut mem)
-            } else if self.preds[c as usize].as_slice() == [blk] {
-                mem.clone()
-            } else {
-                FxHashMap::default()
-            };
-            self.visit(c, inherited);
-        }
-
-        for k in added {
-            self.vn.remove(&k);
+        Scope {
+            block: blk,
+            next_child: 0,
+            last_inheriting,
+            mem,
+            added_start,
         }
     }
 }
