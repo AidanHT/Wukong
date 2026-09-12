@@ -291,6 +291,8 @@ pub fn compile(opts: &Options) -> i32 {
     let mut interner = Interner::new();
     let (mut module, parse_diags, mut next_node) =
         wukong_parser::parse_module_tokens_from(&tokens, sm.source(id), &mut interner, 0);
+    // The AST owns its data; keep root tokens out of the import/sema/backend memory peak.
+    drop(tokens);
     for d in parse_diags {
         sink.emit(d);
     }
@@ -332,6 +334,7 @@ pub fn compile(opts: &Options) -> i32 {
     if sink.has_errors() {
         return exit::COMPILE_ERROR;
     }
+    drop(sink);
 
     // --- Semantic analysis (name resolution, type checking, shape checking) ---
     let (sema, sema_diags) = wukong_sema::check(&module, &interner);
@@ -341,6 +344,7 @@ pub fn compile(opts: &Options) -> i32 {
     if sema_diags.iter().any(|d| d.is_error()) {
         return exit::COMPILE_ERROR;
     }
+    drop(sema_diags);
 
     // For `--train`, recover the loss function's buffer element counts from the semantic types now,
     // while the `[f32; N]` / `Tensor[..]` annotations are still available (they are lost once the
@@ -364,9 +368,16 @@ pub fn compile(opts: &Options) -> i32 {
     let lower_opts = lower_options_for(opts);
     let (mut program, lower_diags) =
         wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lower_opts);
+    // MIR and train_lens own everything needed downstream. Release completed frontend
+    // artifacts before optimization and codegen allocate their working sets.
+    drop(module);
+    drop(sema);
     for d in &lower_diags {
         emit_diag(d, opts.error_format, &renderer, &sm);
     }
+    drop(sm);
+    let lowering_failed = lower_diags.iter().any(|d| d.is_error());
+    drop(lower_diags);
 
     // High MIR is the pre-optimization form. It is still dumped for debugging even when lowering
     // failed, since seeing the partial MIR is useful.
@@ -374,7 +385,7 @@ pub fn compile(opts: &Options) -> i32 {
         // Dump the (possibly partial) MIR, then fail the process if lowering errored or the verifier
         // reported an internal-compiler-error — a printed ICE must never report success.
         let verify_failed = emit_mir(&program, &interner);
-        return if verify_failed || lower_diags.iter().any(|d| d.is_error()) {
+        return if verify_failed || lowering_failed {
             exit::COMPILE_ERROR
         } else {
             exit::OK
@@ -383,7 +394,7 @@ pub fn compile(opts: &Options) -> i32 {
 
     // A construct codegen could not lower leaves the MIR invalid, so do not optimize, run, or hand
     // it to a backend — that would crash or miscompile. Stop with a clear error instead.
-    if lower_diags.iter().any(|d| d.is_error()) {
+    if lowering_failed {
         return exit::COMPILE_ERROR;
     }
 
@@ -640,6 +651,8 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         eprintln!("error: could not write `{}`: {e}", obj_path.display());
         return exit::IO_ERROR;
     }
+    // Linkers consume the file; the serialized copy need not stay resident while they run.
+    drop(obj);
     if is_obj {
         eprintln!("wrote {}", obj_path.display());
         return exit::OK;
