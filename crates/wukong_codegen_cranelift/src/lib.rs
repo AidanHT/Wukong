@@ -575,9 +575,8 @@ impl<'a> FnTranslator<'a> {
             let cb = self.blocks[i];
             if mb.id == self.func.entry {
                 self.builder.append_block_params_for_function_params(cb);
-                let cps: Vec<Value> = self.builder.block_params(cb).to_vec();
-                for (p, cv) in mb.params.iter().zip(cps) {
-                    self.set(*p, cv);
+                for (p, &cv) in mb.params.iter().zip(self.builder.block_params(cb)) {
+                    self.vmap[p.0 as usize] = Some(cv);
                 }
             } else {
                 for p in &mb.params {
@@ -632,8 +631,8 @@ impl<'a> FnTranslator<'a> {
                 _ => self.builder.ins().f32const(*v as f32),
             },
             Op::Bin(op, l, r) => {
-                let rt = self.ty_of(inst.result.unwrap()).clone();
-                self.lower_bin(*op, *l, *r, &rt)
+                let rt = self.func.value_type(inst.result.unwrap());
+                self.lower_bin(*op, *l, *r, rt)
             }
             Op::Cmp(op, l, r) => {
                 if op.is_float() {
@@ -826,8 +825,8 @@ impl<'a> FnTranslator<'a> {
                 self.builder.ins().global_value(self.ptr_ty, gv)
             }
             Op::Splat(v) => {
-                let rty = self.ty_of(inst.result.unwrap()).clone();
-                let vec_ty = cl_type(&rty, self.ptr_ty).unwrap_or(self.ptr_ty);
+                let rty = self.ty_of(inst.result.unwrap());
+                let vec_ty = cl_type(rty, self.ptr_ty).unwrap_or(self.ptr_ty);
                 let x = self.val(*v);
                 self.builder.ins().splat(vec_ty, x)
             }
@@ -895,11 +894,11 @@ impl<'a> FnTranslator<'a> {
             // Normalise the result to its declared type so `vmap[r]` always has the MIR type's
             // Cranelift type: `i1` -> low bit, and narrow floats rounded to width — both matching
             // the interpreter's per-result normalisation.
-            let rty = self.ty_of(r).clone();
+            let rty = self.func.value_type(r);
             let cv = if matches!(rty, MirType::I1) {
                 self.builder.ins().band_imm(cv, 1)
             } else if rty.is_float() {
-                let want = cl_type(&rty, self.ptr_ty).unwrap_or(types::F64);
+                let want = cl_type(rty, self.ptr_ty).unwrap_or(types::F64);
                 self.coerce_float(cv, want)
             } else {
                 cv
@@ -1011,7 +1010,7 @@ impl<'a> FnTranslator<'a> {
                 // bf16 op result past its store, leaving an unrounded f32, and this widen would then be
                 // a no-op passing the wrong value (so -O2 disagreed with -O0). Round at the observation
                 // boundary too (the interpreter's `apply_cast` FpExt arm does the same).
-                let xr = match self.ty_of(v).clone() {
+                let xr = match self.ty_of(v) {
                     MirType::BF16 => self.round_to_bf16(x),
                     MirType::F16 => self.round_to_f16(x),
                     _ => x,
