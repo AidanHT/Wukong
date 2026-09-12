@@ -1041,9 +1041,9 @@ impl<'a> Sema<'a> {
 
     /// A fixed-size array's compile-time length, with the two diagnostics `eval_usize` cannot report
     /// (it is `&self`, and every caller wants a number): an unresolvable length NAME, and a length
-    /// beyond what lowering can represent — mir_build's mirrored `const_usize_expr` is `u32` end to
-    /// end and narrows the folded value with an unchecked `as u32`, so `[i32; 0x1_0000_0001]` was
-    /// bounds checked here against 4294967297 while the emitted slot held 1 element. Both point at
+    /// beyond what lowering can represent. MIR array extents are u32; lowering now folds the same
+    /// u64 operands and checks the final conversion. Historically, `[i32; 0x1_0000_0001]` was bounds
+    /// checked here against 4294967297 while the emitted slot held 1 element. Both point at
     /// the length expression and are gated on `checking_bodies` exactly like the E0504 dim check, so
     /// a signature re-lowered by `check_fn` is reported once (see the flag's doc-comment).
     fn array_len(&mut self, len: &Expr) -> u64 {
@@ -1116,7 +1116,7 @@ impl<'a> Sema<'a> {
     /// `BinOp::fold_const_len`, or an enum variant's discriminant. Anything else — and any
     /// negative discriminant — is the `0` fallback, not an error (`array_len` reports the unresolvable
     /// *name* case). `self.consts` is populated in `collect` before any body is checked, so this is
-    /// order-independent. `mir_build`'s `const_usize_expr`/`const_usize_depth` mirrors this arm for
+    /// order-independent. `mir_build`'s `const_array_len_expr`/`const_usize_depth` mirrors this arm for
     /// arm — the two must agree on the length, else the slot size desyncs from these bounds checks.
     /// The depth bound guards against a cyclic const initializer (also rejected by
     /// `check_recursive_consts`).
@@ -5019,9 +5019,9 @@ mod tests {
 
     #[test]
     fn array_length_above_u32_max_is_rejected() {
-        // mir_build's mirrored `const_usize_expr` is u32 end to end and narrows with an unchecked
-        // `as u32`, so a longer length wrapped to a small slot while sema bounds-checked the full
-        // value. Reject it here so the truncating path is unreachable.
+        // MIR array extents are u32. Historically, unchecked narrowing made a longer length wrap
+        // to a small slot while sema bounds-checked the full value. Keep the explicit diagnostic
+        // even though lowering now checks its final conversion too.
         let bad = "fn f() { let mut a: [i32; 0x1_0000_0001] = [0; 0x1_0000_0001]; a[0] = 1; }";
         assert!(
             errors(bad).contains(&"E0401"),
