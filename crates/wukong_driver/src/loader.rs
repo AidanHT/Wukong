@@ -43,6 +43,15 @@ pub(crate) fn load_imports(
     sink: &mut DiagnosticSink,
     next_node: &mut u32,
 ) {
+    // Most single-file compilations have no imports. Avoid filesystem identity lookup and
+    // loader allocations entirely in that case; retain this iterator for the actual walk.
+    let mut imports = module.items.iter().filter_map(|item| match &item.kind {
+        ItemKind::Import(imp) => Some(imp),
+        _ => None,
+    });
+    let Some(first) = imports.next() else {
+        return;
+    };
     let root_dir = root_path
         .parent()
         // `parent()` is `Some("")` for a bare relative filename like `prog.wk`; both that and a
@@ -55,19 +64,17 @@ pub(crate) fn load_imports(
     loaded.insert(canonical(root_path));
 
     let mut extra: Vec<Item> = Vec::new();
-    for item in &module.items {
-        if let ItemKind::Import(imp) = &item.kind {
-            load_one(
-                imp,
-                &root_dir,
-                sm,
-                interner,
-                sink,
-                next_node,
-                &mut loaded,
-                &mut extra,
-            );
-        }
+    for imp in std::iter::once(first).chain(imports) {
+        load_one(
+            imp,
+            &root_dir,
+            sm,
+            interner,
+            sink,
+            next_node,
+            &mut loaded,
+            &mut extra,
+        );
     }
     module.items.append(&mut extra);
 }
@@ -85,16 +92,10 @@ fn load_one(
     loaded: &mut HashSet<PathBuf>,
     out: &mut Vec<Item>,
 ) {
-    // `a.b.c` -> `<root-dir>/a/b/c.wk` (+ the dotted form for diagnostics).
+    // `a.b.c` -> `<root-dir>/a/b/c.wk`.
     let mut file = root_dir.to_path_buf();
-    let mut dotted = String::new();
-    for (i, seg) in imp.path.segments.iter().enumerate() {
-        let s = interner.resolve(seg.sym);
-        if i > 0 {
-            dotted.push('.');
-        }
-        dotted.push_str(s);
-        file.push(s);
+    for seg in &imp.path.segments {
+        file.push(interner.resolve(seg.sym));
     }
     file.set_extension("wk");
 
@@ -107,6 +108,14 @@ fn load_one(
     let src = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
+            // Successful and deduplicated imports need no diagnostic spelling allocation.
+            let mut dotted = String::new();
+            for (i, seg) in imp.path.segments.iter().enumerate() {
+                if i > 0 {
+                    dotted.push('.');
+                }
+                dotted.push_str(interner.resolve(seg.sym));
+            }
             sink.emit(
                 Diagnostic::error(format!(
                     "unresolved import `{dotted}`: cannot read `{}`: {e}",
