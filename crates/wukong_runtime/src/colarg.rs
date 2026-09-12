@@ -286,6 +286,11 @@ unsafe fn colarg_range(
     j1: usize,
     is_max: bool,
 ) {
+    // With one row every winner is known without reading x or allocating best-value scratch.
+    if rows == 1 {
+        std::ptr::write_bytes(out.add(j0), 0, j1 - j0);
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -344,6 +349,10 @@ unsafe fn colarg_par(x: *const f32, out: *mut i32, rows: i64, cols: i64, is_max:
     // (the same pattern as the parallel column reductions / GEMM); each task reads all rows and
     // writes a disjoint `out[]` stripe.
     let nthreads = rayon::current_num_threads().max(1);
+    if nthreads == 1 {
+        colarg_range(x, out, r, c, 0, c, is_max);
+        return;
+    }
     let per = (c.div_ceil(nthreads))
         .next_multiple_of(COLARG_JB)
         .max(COLARG_JB);

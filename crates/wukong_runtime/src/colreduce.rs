@@ -448,6 +448,10 @@ unsafe fn colreduce_parallel(x: *const f32, out: *mut f32, rows: i64, cols: i64,
     // column is folded i-ascending over all rows whichever stripe owns it, so widening the stripe
     // cannot move a bit.
     let nthreads = rayon::current_num_threads().max(1);
+    if nthreads == 1 {
+        colreduce_range(x, out, r, c, 0, c, kind);
+        return;
+    }
     let per = (c.div_ceil(nthreads)).next_multiple_of(32).max(32);
     let nstripes = c.div_ceil(per);
     let (x_addr, out_addr) = (x as usize, out as usize);
