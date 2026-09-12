@@ -260,6 +260,9 @@ enum Plan {
     InvariantPtrLoad,
     /// Widen it: same opcode, vector-typed result, operands splatted as needed.
     Widen,
+    /// A constant left shift becomes wrapping multiplication by this power of two. MIR's
+    /// lane-wise shift operand shape cannot be passed directly to Cranelift's vector shift.
+    ShiftLeftConstant(i64),
     /// A `Load` whose address is affine unit-stride: becomes a `Vec` load.
     VecLoad,
     /// A `Store` whose address is affine unit-stride: becomes a `Vec` store.
@@ -1423,16 +1426,23 @@ fn plan_body(
                 Plan::Scalar
             }
             Op::ConstInt(..) | Op::ConstFloat(..) => Plan::Scalar,
-            Op::Bin(op, ..) => {
+            Op::Bin(op, _, rhs) => {
                 if !operand_is_vec {
                     Plan::Scalar
                 } else {
                     let ty = f.value_type(inst.result?).clone();
-                    if lanes_of(&ty)? != w || !bin_widenable(*op, &ty) {
+                    if lanes_of(&ty)? != w {
                         return None;
                     }
+                    let plan = if *op == BinOp::Shl {
+                        Plan::ShiftLeftConstant(left_shift_factor(f, *rhs, &ty)?)
+                    } else if bin_widenable(*op, &ty) {
+                        Plan::Widen
+                    } else {
+                        return None;
+                    };
                     vector_ty.insert(inst.result?.0, ty);
-                    Plan::Widen
+                    plan
                 }
             }
             Op::Cmp(..) => {
@@ -1573,10 +1583,11 @@ fn plan_body(
 ///   a panic inside Cranelift's ISLE (`no rule matched for term bitcast_xmm_to_gpr`). A program
 ///   that runs at `-O0` and crashes the compiler at `-O2`, in the shipping configuration only.
 ///
-///   Widening a shift needs one of two things this pass does not have: a MIR vector shift that
+///   Directly widening a shift needs one of two things this pass does not have: a MIR vector shift that
 ///   takes a scalar amount (a cross-crate operand-shape change, and a real one — `x[i] >> 8` in a
 ///   quantization loop is worth it), or AVX2's genuine per-lane `vpsllvd`/`vpsravd`, which
-///   Cranelift does not expose. Refusing is the only correct thing available here.
+///   Cranelift does not expose. Constant left shifts instead use [`left_shift_factor`] to emit
+///   existing wrapping vector multiplication; variable shifts and right shifts are still refused.
 ///
 /// Those are the only three. An 82-case (operator x lane type) matrix over `i8`/`i16`/`i32`/
 /// `i64`/`f32`/`f64` — add, sub, mul, and, or, xor, shl, ashr, neg, not, compare+select, the
@@ -1593,6 +1604,22 @@ fn bin_widenable(op: BinOp, ty: &MirType) -> bool {
         BinOp::Add | BinOp::Sub | BinOp::Mul => lane.is_int(),
         BinOp::And | BinOp::Or | BinOp::Xor => true,
     }
+}
+
+/// `x << k` is `x * 2^(k mod bits)` in wrapping integer arithmetic. Both the interpreter and
+/// native scalar lowering mask the shift count to the lane width, including negative and oversized
+/// counts. Construct the identical low-bit multiplier, retaining only widths with a legal packed
+/// multiply. No vector shift reaches Cranelift and no source-level overflow promise is needed.
+fn left_shift_factor(f: &Function, rhs: ValueId, ty: &MirType) -> Option<i64> {
+    if !bin_widenable(BinOp::Mul, ty) {
+        return None;
+    }
+    let bits = lane_bytes(ty)? * 8;
+    let Op::ConstInt(k, _) = op_of(f, rhs)? else {
+        return None;
+    };
+    let shift = (*k as u32) & (bits - 1);
+    Some((1u64 << shift) as i64)
 }
 
 /// Casts that are one-for-one at a fixed lane width, and that the x64 backend can lower at that
@@ -2282,6 +2309,20 @@ fn emit_body(
                 let vty = vec_of(&lane, p.w);
                 let op = widen_op(e, vb, &map, &inst.op, p, &vty);
                 let nv = e.push(vb, vty, op);
+                map.insert(r.0, Wide::Vector(nv));
+            }
+            Plan::ShiftLeftConstant(factor) => {
+                let Op::Bin(BinOp::Shl, lhs, _) = &inst.op else {
+                    unreachable!("ShiftLeftConstant plan on a non-left-shift")
+                };
+                let r = inst.result.expect("a shift has a result");
+                let lane = p.vector_ty[&r.0].clone();
+                let vty = vec_of(&lane, p.w);
+                let lhs = to_vector(e, vb, &map, *lhs, &lane, p.w);
+                // The multiplier is invariant and non-trapping, so construct its broadcast once.
+                let factor = e.int(guard, &lane, *factor);
+                let factor = e.push(guard, vty.clone(), Op::Splat(factor));
+                let nv = e.push(vb, vty, Op::Bin(BinOp::Mul, lhs, factor));
                 map.insert(r.0, Wide::Vector(nv));
             }
         }
