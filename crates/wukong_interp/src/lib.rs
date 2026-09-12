@@ -954,8 +954,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                     // in-place streams exact; distinct lanes never alias (the vectorizer's no-alias
                     // precondition), so no hazard.
                     let mut stores: Vec<(u32, f32)> = Vec::new();
+                    let mut loads: Vec<f32> = Vec::with_capacity(stream_bases.len());
                     for i in 0..count {
-                        let mut loads: Vec<f32> = Vec::with_capacity(stream_bases.len());
+                        loads.clear();
                         for &b in &stream_bases {
                             loads.push(
                                 self.memory
