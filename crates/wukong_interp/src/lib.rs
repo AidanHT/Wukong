@@ -858,7 +858,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 match reg(regs, *value) {
                     // A vector store scatters its lanes across contiguous scalar slots.
                     Value::VecRef(vi) => {
-                        let lanes = self.vecs[vi as usize].clone();
+                        let lanes = &self.vecs[vi as usize];
                         for (i, lane) in lanes.iter().enumerate() {
                             *self
                                 .memory
@@ -1108,7 +1108,8 @@ impl<'a, 'k> Interp<'a, 'k> {
         Value::VecRef(i)
     }
 
-    /// The `n` lanes behind a `VecRef` (cloned out so callers can borrow `self` mutably afterwards).
+    /// Borrow the `n` immutable lanes behind a `VecRef`. Callers compute their result before
+    /// appending it to the arena, so operands need no temporary copies.
     ///
     /// An operand that is not an `n`-lane vector is a lowering bug, and every caller indexes
     /// `0..n` — this used to hand back `vec![other]` for a scalar, so the next index panicked with
@@ -1117,11 +1118,9 @@ impl<'a, 'k> Interp<'a, 'k> {
     /// `Op::Cast`, whose arm only checks the result: `%r: <4 x i32> = cast sext %s` with a scalar
     /// `%s` verifies clean and then reached that panic. Report it instead of broadcasting, which
     /// would hide the lowering bug; the durable fix is an operand check in `wukong_mir::verify`.
-    fn vec_lanes(&self, v: Value, n: usize) -> Result<Vec<Value>, String> {
+    fn vec_lanes(&self, v: Value, n: usize) -> Result<&[Value], String> {
         match v {
-            Value::VecRef(i) if self.vecs[i as usize].len() == n => {
-                Ok(self.vecs[i as usize].clone())
-            }
+            Value::VecRef(i) if self.vecs[i as usize].len() == n => Ok(&self.vecs[i as usize]),
             _ => Err(format!(
                 "vector op operand is not a {n}-lane vector (MIR invariant violation)"
             )),
