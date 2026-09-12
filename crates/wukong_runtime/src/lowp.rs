@@ -561,11 +561,7 @@ fn par_half_reduce(
 }
 
 #[inline]
-fn par_half_dot(
-    x: &[u16],
-    y: &[u16],
-    per_chunk: impl Fn(&[u16], &[u16]) -> f32 + Sync,
-) -> f32 {
+fn par_half_dot(x: &[u16], y: &[u16], per_chunk: impl Fn(&[u16], &[u16]) -> f32 + Sync) -> f32 {
     if x.len() <= crate::reduce::RCHUNK {
         return per_chunk(x, y);
     }
@@ -593,12 +589,7 @@ pub unsafe extern "C" fn wukong_sum_bf16_parallel(x: *const u16, n: i64) -> f32 
         // SAFETY: feature detected once; borrowed chunks are read-only valid subslices.
         return par_half_reduce(x, 0.0, |chunk| sum_bf16_avx(chunk), |a, b| a + b);
     }
-    par_half_reduce(
-        x,
-        0.0,
-        |chunk| sum_scalar(Half::Bf16, chunk),
-        |a, b| a + b,
-    )
+    par_half_reduce(x, 0.0, |chunk| sum_scalar(Half::Bf16, chunk), |a, b| a + b)
 }
 
 /// Multicore IEEE-f16 sum — the `@parallel` twin of [`wukong_sum_f16`].
@@ -616,12 +607,7 @@ pub unsafe extern "C" fn wukong_sum_f16_parallel(x: *const u16, n: i64) -> f32 {
         // SAFETY: features detected once; borrowed chunks are read-only valid subslices.
         return par_half_reduce(x, 0.0, |chunk| sum_f16_avx(chunk), |a, b| a + b);
     }
-    par_half_reduce(
-        x,
-        0.0,
-        |chunk| sum_scalar(Half::F16, chunk),
-        |a, b| a + b,
-    )
+    par_half_reduce(x, 0.0, |chunk| sum_scalar(Half::F16, chunk), |a, b| a + b)
 }
 
 /// Multicore bf16 dot — the `@parallel` twin of [`wukong_dot_bf16`].
@@ -673,16 +659,21 @@ pub unsafe extern "C" fn wukong_reduce_bf16_parallel(x: *const u16, n: i64, op: 
     if n <= 0 {
         return crate::reduce::ident(op);
     }
-    let n = n as usize;
-    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
-        return wukong_reduce_bf16(x, n as i64, op);
+    let x = std::slice::from_raw_parts(x, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // Keep the same operand order within each kernel and in the ordered partial fold.
+        return par_half_reduce(
+            x,
+            crate::reduce::ident(op),
+            |chunk| reduce_minmax_bf16_avx(op, chunk),
+            |a, b| crate::reduce::fold2(a, b, op),
+        );
     }
-    let xa = x as usize;
-    par_chunk_reduce(
-        n,
+    par_half_reduce(
+        x,
         crate::reduce::ident(op),
-        // SAFETY: disjoint read-only chunk; `x` valid for `n` u16 by contract.
-        |lo, hi| unsafe { wukong_reduce_bf16((xa as *const u16).add(lo), (hi - lo) as i64, op) },
+        |chunk| reduce_minmax_scalar(Half::Bf16, op, chunk),
         |a, b| crate::reduce::fold2(a, b, op),
     )
 }
@@ -696,16 +687,21 @@ pub unsafe extern "C" fn wukong_reduce_f16_parallel(x: *const u16, n: i64, op: i
     if n <= 0 {
         return crate::reduce::ident(op);
     }
-    let n = n as usize;
-    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
-        return wukong_reduce_f16(x, n as i64, op);
+    let x = std::slice::from_raw_parts(x, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
+        // Keep the same operand order within each kernel and in the ordered partial fold.
+        return par_half_reduce(
+            x,
+            crate::reduce::ident(op),
+            |chunk| reduce_minmax_f16_avx(op, chunk),
+            |a, b| crate::reduce::fold2(a, b, op),
+        );
     }
-    let xa = x as usize;
-    par_chunk_reduce(
-        n,
+    par_half_reduce(
+        x,
         crate::reduce::ident(op),
-        // SAFETY: disjoint read-only chunk; `x` valid for `n` u16 by contract.
-        |lo, hi| unsafe { wukong_reduce_f16((xa as *const u16).add(lo), (hi - lo) as i64, op) },
+        |chunk| reduce_minmax_scalar(Half::F16, op, chunk),
         |a, b| crate::reduce::fold2(a, b, op),
     )
 }
