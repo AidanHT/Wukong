@@ -15729,9 +15729,9 @@ impl FnLowerer<'_> {
             let base = self.lookup(*base_sym).expect("stream base in scope").0;
             let idxv = self.lower_expr(idx_expr);
             let idx_ty = self.operand_mir(idxv, idx_expr);
-            // Match scalar GEP's signed narrow-index widening; source-bound ABI conversion is
-            // separate from the existing pointer-offset contract.
-            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, true);
+            // Match scalar indexing's explicit source-signedness extension before pointer
+            // arithmetic; raw narrow MIR indexes no longer carry that signedness.
+            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, self.signed(idx_expr));
             let sp = self.builder.build(
                 MirType::Ptr,
                 Op::Gep {
@@ -16175,9 +16175,9 @@ impl FnLowerer<'_> {
             let base = self.lookup(*base_sym).expect("stream base in scope").0;
             let idxv = self.lower_expr(idx_expr);
             let idx_ty = self.operand_mir(idxv, idx_expr);
-            // Match scalar GEP's signed narrow-index widening; source-bound ABI conversion is
-            // separate from the existing pointer-offset contract.
-            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, true);
+            // Match scalar indexing's explicit source-signedness extension before pointer
+            // arithmetic; raw narrow MIR indexes no longer carry that signedness.
+            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, self.signed(idx_expr));
             let sp = self.builder.build(
                 MirType::Ptr,
                 Op::Gep {
@@ -17688,12 +17688,13 @@ impl FnLowerer<'_> {
         Some((strides, mir_ty(&Ty::Scalar(elem))))
     }
 
-    /// Lower an index expression and widen it to `I64`, so a multi-dimensional flat-offset
-    /// computation is single-typed regardless of the index's source width (loop vars are usually
-    /// `i32`). Non-negative loop counters, so sign/zero-extension agree; we pick by signedness.
+    /// Lower an index expression and widen it to `I64` before pointer arithmetic. MIR integer
+    /// types do not retain signedness and native GEP sign-extends a narrow index, so an unsigned
+    /// source's magnitude must be preserved here. Read the emitted width because a loop counter
+    /// can already be wider than its semantic expression type.
     fn lower_index_i64(&mut self, e: &Expr) -> ValueId {
         let v = self.lower_expr(e);
-        let ty = self.expr_mir(e);
+        let ty = self.operand_mir(v, e);
         if ty == MirType::I64 {
             return v;
         }
@@ -17884,7 +17885,7 @@ impl FnLowerer<'_> {
                 } else {
                     self.place_base_ptr(base)
                 };
-                let idx = self.lower_expr(&indices[0]);
+                let idx = self.lower_index_i64(&indices[0]);
                 // Prefer the element type from the base's array/slice type; fall back to the indexed
                 // expression's own type (tensors/pointers). Resolve through the registry-aware
                 // `mir_ty_of` so a struct/tuple element becomes its byte-buffer `Array` type (the GEP
