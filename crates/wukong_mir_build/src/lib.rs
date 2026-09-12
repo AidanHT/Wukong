@@ -64,6 +64,7 @@ const REPEAT_UNROLL_LIMIT: u32 = 8;
 // `Dim::Var`, never a `Ty::Named`), so they are excluded by construction.
 
 /// The result of the monomorphization collection pass (see [`collect_mono`]).
+#[derive(Default)]
 struct Mono {
     /// (original fn symbol, canonical comma-joined concrete type-arg names) -> instance symbol.
     instance_of: HashMap<(Symbol, String), Symbol>,
@@ -312,30 +313,36 @@ impl MonoCollector<'_> {
         }
         let name = p.first().sym;
         let tg = match self.type_generics.get(&name) {
-            Some(g) if !g.is_empty() => g.clone(),
+            Some(g) if !g.is_empty() => g,
             _ => return,
         };
-        let params: Vec<Ty> = match self.sema.defs.lookup(name).map(|d| &d.kind) {
-            Some(DefKind::Fn(sig)) => sig.params.clone(),
+        let params = match self.sema.defs.lookup(name).map(|d| &d.kind) {
+            Some(DefKind::Fn(sig)) => &sig.params,
             _ => return,
         };
         let mut subst: HashMap<Symbol, Ty> = HashMap::default();
         for (i, a) in args.iter().enumerate() {
             let Some(pty) = params.get(i) else { break };
-            let aty = subst_ty(
-                &self.sema.types.get(&a.id).cloned().unwrap_or(Ty::Unknown),
-                outer,
-            );
-            bind_generics(pty, &aty, &tg, &mut subst);
+            let aty = self.sema.types.get(&a.id).unwrap_or(&Ty::Unknown);
+            // Concrete callers need no copy of their already-resolved type trees. Generic
+            // callers substitute once, without first cloning the same tree from the side table.
+            let resolved;
+            let aty = if outer.is_empty() {
+                aty
+            } else {
+                resolved = subst_ty(aty, outer);
+                &resolved
+            };
+            bind_generics(pty, aty, tg, &mut subst);
         }
-        let Some(canon) = canon_type_args(&tg, &subst, self.interner) else {
+        let Some(canon) = canon_type_args(tg, &subst, self.interner) else {
             return;
         };
         let key = (name, canon.clone());
         if self.instance_of.contains_key(&key) {
             return;
         }
-        let base = self.interner.resolve(name).to_string();
+        let base = self.interner.resolve(name);
         let mangled = self
             .interner
             .intern(&format!("{base}${}", canon.replace(',', "_")));
@@ -493,6 +500,11 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
                 }
             }
         }
+    }
+    // No value-type-generic declaration means no call can create an instance. Avoid a second
+    // full walk of every body in ordinary scalar and shape-generic tensor modules.
+    if type_generics.is_empty() {
+        return Mono::default();
     }
     let mut c = MonoCollector {
         sema,
