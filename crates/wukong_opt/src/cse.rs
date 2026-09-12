@@ -106,14 +106,11 @@ fn forwardable(ty: &MirType) -> bool {
     !matches!(ty, MirType::F16 | MirType::BF16)
 }
 
-/// A canonical, allocation-free value-numbering key for a pure op. One variant per cacheable
-/// `Op`, carrying exactly the fields the previous `format!`-string key encoded: the op
-/// discriminant (the enum variant itself), every operand `ValueId` (as its inner `u32`, mapped
-/// through prior rewrites), the result/operand `MirType` where the op carried one, immediates,
-/// and op sub-kinds (`BinOp`/`CmpOp`/`CastKind`/`RoundMode`) as their stable `as u8` discriminant.
-/// `Eq`/`Hash` are derived, so two ops compare equal here iff their old strings were equal —
-/// no more, no less. `MirType` is `Hash + Eq` and a bitwise copy for scalars (only `Vec`/`Array`
-/// operand types touch the heap), so this avoids the per-instruction `String` the old key built.
+/// A typed value-numbering key for a pure op. One variant per cacheable `Op`, carrying its
+/// discriminant, operands mapped through prior rewrites, immediate values, and every type that
+/// cannot be recovered from the operands. In particular a splat needs its result vector type.
+/// `Eq`/`Hash` are derived and no textual key is built. Scalar types need no allocation; cloning
+/// `Vec`/`Array` types still copies their boxed element type.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Key {
     ConstInt(i128, MirType),
@@ -129,7 +126,9 @@ enum Key {
     Gep(u32, u32, MirType),
     FuncAddr(u32),
     GlobalAddr(u32),
-    Splat(u32),
+    /// The scalar operand does not encode the destination lane count. Two splats of one value
+    /// into different vector widths are distinct computations even in the same dominator scope.
+    Splat(u32, MirType),
     ExtractLane(u32, u32),
     /// Keyed by the whole vector type: `iota <4 x i32>` and `iota <2 x i64>` are different
     /// constants, and only the type distinguishes them (the op has no operands).
@@ -199,7 +198,8 @@ impl Numbering<'_> {
                 }
                 _ => {
                     let Some(res) = inst.result else { continue };
-                    let Some(key) = pure_key(&inst.op, &self.rewrite) else {
+                    let Some(key) = pure_key(&inst.op, self.f.value_type(res), &self.rewrite)
+                    else {
                         continue;
                     };
                     match self.vn.get(&key) {
@@ -243,7 +243,7 @@ fn resolve(rewrite: &FxHashMap<u32, u32>, mut v: u32) -> u32 {
 /// computations hash identically. Returns `None` for impure/uncacheable ops (handled separately).
 /// The op sub-kinds (`BinOp`/`CmpOp`/`CastKind`/`RoundMode`) are fieldless C-like enums; `as u8`
 /// is their stable discriminant, which distinguishes the same variants the old `{:?}` did.
-fn pure_key(op: &Op, rewrite: &FxHashMap<u32, u32>) -> Option<Key> {
+fn pure_key(op: &Op, result_ty: &MirType, rewrite: &FxHashMap<u32, u32>) -> Option<Key> {
     let m = |v: ValueId| -> u32 { resolve(rewrite, v.0) };
     Some(match op {
         Op::ConstInt(n, ty) => Key::ConstInt(*n, ty.clone()),
@@ -257,7 +257,7 @@ fn pure_key(op: &Op, rewrite: &FxHashMap<u32, u32>) -> Option<Key> {
         Op::Gep { ptr, index, elem } => Key::Gep(m(*ptr), m(*index), elem.clone()),
         Op::FuncAddr(s) => Key::FuncAddr(s.0),
         Op::GlobalAddr(s) => Key::GlobalAddr(s.0),
-        Op::Splat(a) => Key::Splat(m(*a)),
+        Op::Splat(a) => Key::Splat(m(*a), result_ty.clone()),
         Op::ExtractLane(a, k) => Key::ExtractLane(m(*a), *k),
         Op::Iota(ty) => Key::Iota(ty.clone()),
         Op::Fma(a, b, c) => Key::Fma(m(*a), m(*b), m(*c)),
