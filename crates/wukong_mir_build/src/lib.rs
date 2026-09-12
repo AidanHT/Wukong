@@ -2263,6 +2263,7 @@ fn is_batched_norm_fn(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -2314,6 +2315,7 @@ fn is_bias_bcast_fn(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -2391,6 +2393,7 @@ fn lower_fn(
 
     let mut fl = FnLowerer {
         builder: Builder::new(name, ret_mir.clone()),
+        preserve_aggregate_blocks: ret_mir.is_float(),
         sema,
         interner,
         diags,
@@ -2603,6 +2606,7 @@ fn lower_parallel(
     let outlined = {
         let mut fl = FnLowerer {
             builder: Builder::new(par_sym, MirType::Void),
+            preserve_aggregate_blocks: false,
             sema,
             interner,
             diags: &mut *diags,
@@ -2671,6 +2675,7 @@ fn lower_parallel(
     let wrapper = {
         let mut fl = FnLowerer {
             builder: Builder::new(f.name.sym, ret_mir.clone()),
+            preserve_aggregate_blocks: ret_mir.is_float(),
             sema,
             interner,
             diags: &mut *diags,
@@ -3348,6 +3353,10 @@ const NORM_L2NORM: i64 = 4; // out = x / sqrt(sum(x^2) + eps) — L2 / unit norm
 
 struct FnLowerer<'a> {
     builder: Builder,
+    /// Autodiff currently accepts only single-block functions returning a float scalar. Keep
+    /// aggregate operations unrolled in every such function so introducing copy/zero loops does
+    /// not remove an existing gradient candidate, including callers of the public grad API.
+    preserve_aggregate_blocks: bool,
     sema: &'a SemaResult,
     interner: &'a Interner,
     diags: &'a mut Vec<Diagnostic>,
@@ -3742,7 +3751,7 @@ impl FnLowerer<'_> {
                 } else {
                     self.lower_fill_loop(slot, elem, *n, z);
                 }
-            } else if *n <= REPEAT_UNROLL_LIMIT {
+            } else if *n <= REPEAT_UNROLL_LIMIT || self.preserve_aggregate_blocks {
                 for i in 0..*n as i128 {
                     let ep = self.gep_elem(slot, elem, i);
                     self.zero_init(ep, elem);
@@ -4396,7 +4405,7 @@ impl FnLowerer<'_> {
             }
             Ty::Array { elem, len, .. } => {
                 let emir = self.mir_ty_of(elem);
-                if *len <= REPEAT_UNROLL_LIMIT as u64 {
+                if *len <= REPEAT_UNROLL_LIMIT as u64 || self.preserve_aggregate_blocks {
                     for i in 0..*len as i128 {
                         let s = self.gep_elem(src, &emir, i);
                         let d = self.gep_elem(dst, &emir, i);
@@ -4423,7 +4432,7 @@ impl FnLowerer<'_> {
     /// `i8` copy matches the interpreter's 1-slot-per-scalar memory (each `Load(off, i8)` returns the
     /// whole `Value` stored at that offset slot, `Store` writes it back) *and* native's byte memory.
     fn emit_copy_bytes(&mut self, dst: ValueId, src: ValueId, nbytes: u64) {
-        if nbytes <= REPEAT_UNROLL_LIMIT as u64 {
+        if nbytes <= REPEAT_UNROLL_LIMIT as u64 || self.preserve_aggregate_blocks {
             for k in 0..nbytes {
                 let s = self.field_ptr(src, k);
                 let d = self.field_ptr(dst, k);
@@ -12679,6 +12688,7 @@ impl FnLowerer<'_> {
         let outlined = {
             let mut fl = FnLowerer {
                 builder: Builder::new(par_sym, MirType::Void),
+                preserve_aggregate_blocks: false,
                 sema: self.sema,
                 interner: self.interner,
                 diags: &mut tmp_diags,
@@ -24957,6 +24967,7 @@ fn lower_matmul_fn(
     let ret_mir = mir_ty(&ret_ty);
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
+        preserve_aggregate_blocks: ret_mir.is_float(),
         sema,
         interner,
         diags,
@@ -26654,6 +26665,7 @@ fn xent_bwd_fn(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -26700,6 +26712,7 @@ fn xent_fn(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -26754,6 +26767,7 @@ fn logsumexp_fn(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -26896,6 +26910,7 @@ fn probe_single_for(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -27925,6 +27940,7 @@ fn lower_i8matmul_fn(
     let ret_mir = mir_ty(&ret_ty);
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
+        preserve_aggregate_blocks: ret_mir.is_float(),
         sema,
         interner,
         diags,
