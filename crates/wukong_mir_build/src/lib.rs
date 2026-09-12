@@ -2245,7 +2245,9 @@ fn parallel_spec<'a>(
     if mir_byte_size(&start_ty) > mir_byte_size(&end_ty) {
         return None;
     }
-    if !end_scalar.is_signed() {
+    let unsigned_counter =
+        !end_scalar.is_signed() || (!start_scalar.is_signed() && start_ty == end_ty);
+    if unsigned_counter {
         let bound = const_usize_expr(end, interner, sema)? as u64;
         let max_signed = (1u64 << (mir_byte_size(&end_ty) * 8 - 1)) - 1;
         if bound > max_signed {
@@ -15727,7 +15729,9 @@ impl FnLowerer<'_> {
             let base = self.lookup(*base_sym).expect("stream base in scope").0;
             let idxv = self.lower_expr(idx_expr);
             let idx_ty = self.operand_mir(idxv, idx_expr);
-            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, self.signed(idx_expr));
+            // Match scalar GEP's signed narrow-index widening; source-bound ABI conversion is
+            // separate from the existing pointer-offset contract.
+            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, true);
             let sp = self.builder.build(
                 MirType::Ptr,
                 Op::Gep {
@@ -16171,7 +16175,9 @@ impl FnLowerer<'_> {
             let base = self.lookup(*base_sym).expect("stream base in scope").0;
             let idxv = self.lower_expr(idx_expr);
             let idx_ty = self.operand_mir(idxv, idx_expr);
-            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, self.signed(idx_expr));
+            // Match scalar GEP's signed narrow-index widening; source-bound ABI conversion is
+            // separate from the existing pointer-offset contract.
+            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, true);
             let sp = self.builder.build(
                 MirType::Ptr,
                 Op::Gep {
