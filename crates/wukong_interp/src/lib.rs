@@ -1007,12 +1007,11 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .statics
                         .iter()
                         .find(|s| s.name == *sym)
-                        .map(|s| s.bytes.clone())
+                        .map(|s| s.bytes.as_slice())
                         .ok_or("global_addr of unknown static data")?;
                     let base = self.memory.len();
-                    for b in bytes {
-                        self.memory.push(Value::Int(b as i128));
-                    }
+                    self.memory
+                        .extend(bytes.iter().map(|&b| Value::Int(b as i128)));
                     self.data_addrs.insert(*sym, base);
                     Value::Ptr(base)
                 }
