@@ -798,19 +798,17 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi_parallel(
 }
 
 /// Transpose a row-major `[rows, cols]` matrix `src` into a row-major `[cols, rows]` matrix `dst`
-/// (`dst[c*rows + r] = src[r*cols + c]`). Reads each source row contiguously; a one-time
-/// O(rows·cols) reorg used by the `C = Aᵀ·B` GEMM below.
+/// (`dst[c*rows + r] = src[r*cols + c]`). Reuse the cache-blocked transpose kernel, including its
+/// 8×8 AVX2 path, for this one-time O(rows·cols) reorganization before `C = Aᵀ·B`.
 ///
 /// # Safety
 /// `src` and `dst` must each be valid for `rows*cols` `f32`, and must not overlap.
 #[inline]
 unsafe fn transpose_into(src: *const f32, dst: *mut f32, rows: usize, cols: usize) {
-    for r in 0..rows {
-        let s = src.add(r * cols);
-        for c in 0..cols {
-            *dst.add(c * rows + r) = *s.add(c);
-        }
-    }
+    // The GEMM entry points validate positive i64 dimensions before converting them to usize,
+    // so these casts recover the original extents. Scratch is distinct from the source, as the
+    // transpose kernel requires. No arithmetic touches the values, including NaN payloads.
+    crate::transpose::wukong_transpose_f32(src, dst, rows as i64, cols as i64);
 }
 
 /// `C = Aᵀ·B` — A is stored row-major as `[k, m]` (`a[p*m + i]`), B row-major `[k, n]` (`b[p*n + j]`),
@@ -878,6 +876,38 @@ pub unsafe extern "C" fn wukong_sgemm_tn_parallel(
 unsafe fn widen_into_f32(src: *const u16, dst: *mut f32, n: usize, widen: fn(u16) -> f32) {
     for i in 0..n {
         *dst.add(i) = widen(*src.add(i));
+    }
+}
+
+/// Widen and transpose `[rows, cols]` half storage directly into `[cols, rows]` f32 scratch.
+/// Conversion uses the same scalar function as [`widen_into_f32`]; changing the destination of
+/// each independent conversion removes the intervening full-size f32 matrix and transpose pass.
+///
+/// # Safety
+/// `src` valid for `rows*cols` u16, `dst` for `rows*cols` f32, non-overlapping.
+#[inline]
+unsafe fn widen_transpose_into_f32(
+    src: *const u16,
+    dst: *mut f32,
+    rows: usize,
+    cols: usize,
+    widen: fn(u16) -> f32,
+) {
+    // Limit the strided destination stream to eight rows, as in the f32 transpose's 8x8 tile.
+    // In particular, a power-of-two destination stride must not keep every matrix row live in
+    // the same cache set. Ragged edges use the identical element mapping.
+    const TILE: usize = 8;
+    for r0 in (0..rows).step_by(TILE) {
+        let r1 = (r0 + TILE).min(rows);
+        for c0 in (0..cols).step_by(TILE) {
+            let c1 = (c0 + TILE).min(cols);
+            for r in r0..r1 {
+                let s = src.add(r * cols);
+                for c in c0..c1 {
+                    *dst.add(c * rows + r) = widen(*s.add(c));
+                }
+            }
+        }
     }
 }
 
@@ -1157,9 +1187,10 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi_parallel(
 /// `[m, n]` f32.
 ///
 /// Like the f32 `Aᵀ·B` and the half `A·Bᵀ` kernels, this is a cheap prepass feeding the *identical*
-/// proven kernel: widen A and B into f32 scratch (lossless — `O(k·m + k·n)`, dwarfed by the
-/// `O(m·n·k)` GEMM), then delegate to the f32 `wukong_sgemm_tn`, which transposes A once and runs the
-/// tuned `C = A·B` microkernel. Because the widen is lossless, the result is bit-for-bit the f32 TN
+/// proven kernel: widen and transpose A directly into `[m, k]` f32 scratch, widen B into `[k, n]`
+/// f32 scratch (lossless — `O(k·m + k·n)`), then dispatch the tuned `C = A·B` microkernel. This
+/// avoids a separate `[k, m]` f32 copy of A and its full transpose pass. Because each conversion
+/// is unchanged, the result is bit-for-bit the f32 TN
 /// GEMM on the widened values — exactly the differential contract the interpreter marshals (no new
 /// accumulation order). gcc/rustc lose twice on the naive half nest: the inline `bf16→f32` widen won't
 /// vectorize *and* A's column-strided reads (the contraction is A's outer index) defeat vectorization.
@@ -1183,17 +1214,13 @@ unsafe fn gemm_lowp_tn(
         return;
     }
     let (mu, ku, nu) = (m as usize, k as usize, n as usize);
-    let mut af = vec![0.0f32; ku * mu];
+    let mut at = vec![0.0f32; mu * ku];
     let mut bf = vec![0.0f32; ku * nu];
-    widen_into_f32(a, af.as_mut_ptr(), ku * mu, widen);
+    widen_transpose_into_f32(a, at.as_mut_ptr(), ku, mu, widen);
     widen_into_f32(b, bf.as_mut_ptr(), ku * nu, widen);
-    // Delegate to the f32 TN entry point on the widened operands (transpose A prepass + the tuned
-    // C = A·B kernel) — so the half TN GEMM is bit-for-bit the f32 TN GEMM on the widened values.
-    if par {
-        wukong_sgemm_tn_parallel(af.as_ptr(), bf.as_ptr(), c, m, k, n, beta);
-    } else {
-        wukong_sgemm_tn(af.as_ptr(), bf.as_ptr(), c, m, k, n, beta);
-    }
+    // at[i*k + p] == widen(a[p*m + i]), exactly the matrix the old widen-then-transpose
+    // prepasses produced. Preserve beta, parallel routing and the NN kernel's K grouping.
+    gemm_dispatch(at.as_ptr(), bf.as_ptr(), c, m, k, n, beta, false, par, None);
 }
 
 /// `C = Aᵀ·B` with `bf16` inputs (f32 accumulate), single-threaded. See [`gemm_lowp_tn`].

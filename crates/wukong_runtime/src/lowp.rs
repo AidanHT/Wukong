@@ -498,7 +498,8 @@ pub unsafe extern "C" fn wukong_dot_bf16(x: *const u16, y: *const u16, n: i64) -
 /// the native `@parallel` path and the interpreter (which marshals this very function) agree
 /// bit-for-bit. NOTE this chunked fold reassociates vs the *flat* whole-array serial kernel
 /// (`wukong_sum_bf16` et al.), so a `@parallel` reduction is **not** bit-equal to its non-`@parallel`
-/// twin — a reassociation exception, exactly like the f32 `wukong_sreduce_f32_parallel`.
+/// twin. Unlike these half-precision serial entries, the f32 reduction entries already share the
+/// same fixed-chunk decomposition between serial and parallel calls.
 #[inline]
 fn par_chunk_reduce(
     n: usize,
@@ -507,6 +508,19 @@ fn par_chunk_reduce(
     combine: impl Fn(f32, f32) -> f32,
 ) -> f32 {
     let nchunks = n.div_ceil(crate::reduce::RCHUNK);
+    // With one worker, a parallel map cannot reduce the work. Fold directly without allocating
+    // partials or handing off to a pool. Keep every RCHUNK boundary AND the identity-seeded fold:
+    // calling the flat serial sibling would change rounding, and returning an uncombined single
+    // partial could change signed-zero/NaN behavior for the supplied combine operation.
+    if nchunks < 2 || crate::wuk_pool_width() <= 1 {
+        let mut acc = ident;
+        for c in 0..nchunks {
+            let lo = c * crate::reduce::RCHUNK;
+            let hi = ((c + 1) * crate::reduce::RCHUNK).min(n);
+            acc = combine(acc, per_chunk(lo, hi));
+        }
+        return acc;
+    }
     // Fork on the unified kernel pool, never on rayon's implicit global registry: this is a path that
     // can be a process's FIRST rayon touch (a bf16 model whose first parallel op is a reduction), and
     // `run_on_wuk_pool` is what installs the runtime's 16 MiB worker stacks before anything can build
