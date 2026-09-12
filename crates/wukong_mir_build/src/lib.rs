@@ -19473,9 +19473,13 @@ impl FnLowerer<'_> {
 
     /// Lower `e` and coerce the result to `target` (the float/int conversion the call ABI needs).
     fn lower_coerced(&mut self, e: &Expr, target: &MirType) -> ValueId {
-        let ty = self.expr_mir(e);
         let v = self.lower_expr(e);
-        self.coerce_to(v, &ty, target, true)
+        let ty = self.operand_mir(v, e);
+        // The attention ABI takes signed i64 dimensions, but an unsigned source must still
+        // zero-extend: 200u8 denotes 200, not -56. Integer-to-float conversion likewise follows
+        // the source signedness. Float-to-integer conversion uses the signed i64 destination.
+        let signed = ty.is_float() || self.signed(e);
+        self.coerce_to(v, &ty, target, signed)
     }
 
     /// Lower a math builtin (`sqrt`/`rsqrt`/`exp`/`fmax`/`fmin`) to primitive MIR ops, or `None`
