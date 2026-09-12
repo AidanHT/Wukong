@@ -450,6 +450,20 @@ fn successors(t: &Terminator) -> [Option<u32>; 2] {
 
 // --- Per-function lowering ------------------------------------------------------------------
 
+/// Allocation capacity reused by serial lowering and by each parallel iterator state. All
+/// function-local handles are cleared before the next function's DFG is populated.
+#[derive(Default)]
+struct TranslationScratch {
+    vmap: Vec<Option<Value>>,
+    blocks: Vec<Block>,
+    func_refs: HashMap<Symbol, FuncRef>,
+    data_refs: HashMap<Symbol, GlobalValue>,
+    rt_refs: HashMap<&'static str, FuncRef>,
+    kernel_refs: Vec<FuncRef>,
+    call_args: Vec<Value>,
+    branch_args: Vec<BlockArg>,
+}
+
 /// Lowers one MIR `Function` into a Cranelift function body already attached to `builder`.
 struct FnTranslator<'a> {
     builder: FunctionBuilder<'a>,
@@ -457,14 +471,18 @@ struct FnTranslator<'a> {
     interner: &'a Interner,
     ptr_ty: Type,
     /// MIR `ValueId` -> Cranelift value. Block params and instruction results fill this in.
-    vmap: Vec<Option<Value>>,
+    vmap: &'a mut Vec<Option<Value>>,
     /// MIR block index -> Cranelift block.
-    blocks: Vec<Block>,
+    blocks: &'a [Block],
     /// Pre-declared FuncRefs for callees and runtime imports in this function.
     func_refs: &'a HashMap<Symbol, FuncRef>,
     decls: &'a Decls<'a>,
     rt_ids: &'a HashMap<&'static str, FuncId>,
-    rt_refs: HashMap<&'static str, FuncRef>,
+    rt_refs: &'a mut HashMap<&'static str, FuncRef>,
+    /// Temporary arguments are copied into the DFG by the instruction builder. Reuse their
+    /// capacity instead of allocating a new vector at every user call and branch.
+    call_args: &'a mut Vec<Value>,
+    branch_args: &'a mut Vec<BlockArg>,
     /// Pre-declared GlobalValues for the read-only static-data blobs (`Op::GlobalAddr`), one per
     /// unique string literal, imported into this function's DFG.
     data_refs: &'a HashMap<Symbol, GlobalValue>,
@@ -575,9 +593,8 @@ impl<'a> FnTranslator<'a> {
             let cb = self.blocks[i];
             if mb.id == self.func.entry {
                 self.builder.append_block_params_for_function_params(cb);
-                let cps: Vec<Value> = self.builder.block_params(cb).to_vec();
-                for (p, cv) in mb.params.iter().zip(cps) {
-                    self.set(*p, cv);
+                for (p, &cv) in mb.params.iter().zip(self.builder.block_params(cb)) {
+                    self.vmap[p.0 as usize] = Some(cv);
                 }
             } else {
                 for p in &mb.params {
@@ -632,8 +649,8 @@ impl<'a> FnTranslator<'a> {
                 _ => self.builder.ins().f32const(*v as f32),
             },
             Op::Bin(op, l, r) => {
-                let rt = self.ty_of(inst.result.unwrap()).clone();
-                self.lower_bin(*op, *l, *r, &rt)
+                let rt = self.func.value_type(inst.result.unwrap());
+                self.lower_bin(*op, *l, *r, rt)
             }
             Op::Cmp(op, l, r) => {
                 if op.is_float() {
@@ -826,8 +843,8 @@ impl<'a> FnTranslator<'a> {
                 self.builder.ins().global_value(self.ptr_ty, gv)
             }
             Op::Splat(v) => {
-                let rty = self.ty_of(inst.result.unwrap()).clone();
-                let vec_ty = cl_type(&rty, self.ptr_ty).unwrap_or(self.ptr_ty);
+                let rty = self.ty_of(inst.result.unwrap());
+                let vec_ty = cl_type(rty, self.ptr_ty).unwrap_or(self.ptr_ty);
                 let x = self.val(*v);
                 self.builder.ins().splat(vec_ty, x)
             }
@@ -895,11 +912,11 @@ impl<'a> FnTranslator<'a> {
             // Normalise the result to its declared type so `vmap[r]` always has the MIR type's
             // Cranelift type: `i1` -> low bit, and narrow floats rounded to width — both matching
             // the interpreter's per-result normalisation.
-            let rty = self.ty_of(r).clone();
+            let rty = self.func.value_type(r);
             let cv = if matches!(rty, MirType::I1) {
                 self.builder.ins().band_imm(cv, 1)
             } else if rty.is_float() {
-                let want = cl_type(&rty, self.ptr_ty).unwrap_or(types::F64);
+                let want = cl_type(rty, self.ptr_ty).unwrap_or(types::F64);
                 self.coerce_float(cv, want)
             } else {
                 cv
@@ -1011,7 +1028,7 @@ impl<'a> FnTranslator<'a> {
                 // bf16 op result past its store, leaving an unrounded f32, and this widen would then be
                 // a no-op passing the wrong value (so -O2 disagreed with -O0). Round at the observation
                 // boundary too (the interpreter's `apply_cast` FpExt arm does the same).
-                let xr = match self.ty_of(v).clone() {
+                let xr = match self.ty_of(v) {
                     MirType::BF16 => self.round_to_bf16(x),
                     MirType::F16 => self.round_to_f16(x),
                     _ => x,
@@ -1176,8 +1193,13 @@ impl<'a> FnTranslator<'a> {
 
     fn lower_call(&mut self, func: Symbol, args: &[ValueId]) -> Option<Value> {
         if let Some(&fref) = self.func_refs.get(&func) {
-            let argv: Vec<Value> = args.iter().map(|a| self.val(*a)).collect();
-            let call = self.builder.ins().call(fref, &argv);
+            self.call_args.clear();
+            self.call_args.reserve(args.len());
+            for &arg in args {
+                let value = self.val(arg);
+                self.call_args.push(value);
+            }
+            let call = self.builder.ins().call(fref, self.call_args);
             return self.builder.inst_results(call).first().copied();
         }
         let name = self.interner.resolve(func);
@@ -1958,10 +1980,14 @@ impl<'a> FnTranslator<'a> {
                 self.builder.ins().return_(&[x]);
             }
             Terminator::Br { target, args } => {
-                let argv: Vec<BlockArg> =
-                    args.iter().map(|a| BlockArg::Value(self.val(*a))).collect();
+                self.branch_args.clear();
+                self.branch_args.reserve(args.len());
+                for &arg in args {
+                    let value = self.val(arg);
+                    self.branch_args.push(BlockArg::Value(value));
+                }
                 let cb = self.blocks[target.0 as usize];
-                self.builder.ins().jump(cb, &argv);
+                self.builder.ins().jump(cb, &*self.branch_args);
             }
             Terminator::CondBr {
                 cond,
@@ -1971,17 +1997,16 @@ impl<'a> FnTranslator<'a> {
                 else_args,
             } => {
                 let c = self.val(*cond);
-                let ta: Vec<BlockArg> = then_args
-                    .iter()
-                    .map(|a| BlockArg::Value(self.val(*a)))
-                    .collect();
-                let ea: Vec<BlockArg> = else_args
-                    .iter()
-                    .map(|a| BlockArg::Value(self.val(*a)))
-                    .collect();
+                self.branch_args.clear();
+                self.branch_args.reserve(then_args.len() + else_args.len());
+                for &arg in then_args.iter().chain(else_args) {
+                    let value = self.val(arg);
+                    self.branch_args.push(BlockArg::Value(value));
+                }
+                let (ta, ea) = self.branch_args.split_at(then_args.len());
                 let tb = self.blocks[then_blk.0 as usize];
                 let eb = self.blocks[else_blk.0 as usize];
-                self.builder.ins().brif(c, tb, &ta, eb, &ea);
+                self.builder.ins().brif(c, tb, ta, eb, ea);
             }
             Terminator::Unreachable => {
                 let tc = cranelift_codegen::ir::TrapCode::user(1).unwrap();
@@ -3304,8 +3329,28 @@ fn build_function_clif(
     kernel_ids: &[Vec<FuncId>],
     fbctx: &mut FunctionBuilderContext,
     clif: &mut cranelift_codegen::ir::Function,
+    scratch: &mut TranslationScratch,
 ) -> Result<(), String> {
     clif.signature = signature_of(f, ptr_ty, call_conv);
+    let TranslationScratch {
+        vmap,
+        blocks,
+        func_refs,
+        data_refs,
+        rt_refs,
+        kernel_refs,
+        call_args,
+        branch_args,
+    } = scratch;
+    vmap.clear();
+    vmap.resize(f.value_types.len(), None);
+    blocks.clear();
+    func_refs.clear();
+    data_refs.clear();
+    rt_refs.clear();
+    kernel_refs.clear();
+    call_args.clear();
+    branch_args.clear();
     {
         {
             let mut builder = FunctionBuilder::new(clif, fbctx);
@@ -3314,8 +3359,6 @@ fn build_function_clif(
             // every function and static into every DFG grows quadratically with the module size,
             // even when each function only calls one other function. Keep declarations module-wide
             // so forward references, recursion, and address-taken parallel helpers still resolve.
-            let mut func_refs: HashMap<Symbol, FuncRef> = HashMap::new();
-            let mut data_refs: HashMap<Symbol, GlobalValue> = HashMap::new();
             for inst in f.blocks.iter().flat_map(|block| &block.insts) {
                 match &inst.op {
                     Op::Call { func, .. } | Op::FuncAddr(func) => {
@@ -3334,24 +3377,27 @@ fn build_function_clif(
                 }
             }
             // This function's own vector-kernel FuncRefs, indexed by `Op::VecKernelCall`'s `kernel`.
-            let kernel_refs: Vec<FuncRef> = kernel_ids[fi]
-                .iter()
-                .map(|&kid| module.declare_func_in_func(kid, builder.func))
-                .collect();
-            let blocks: Vec<Block> = f.blocks.iter().map(|_| builder.create_block()).collect();
+            kernel_refs.extend(
+                kernel_ids[fi]
+                    .iter()
+                    .map(|&kid| module.declare_func_in_func(kid, builder.func)),
+            );
+            blocks.extend(f.blocks.iter().map(|_| builder.create_block()));
             let mut t = FnTranslator {
                 builder,
                 func: f,
                 interner,
                 ptr_ty,
-                vmap: vec![None; f.value_types.len()],
+                vmap,
                 blocks,
-                func_refs: &func_refs,
+                func_refs,
                 decls: module,
                 rt_ids,
-                rt_refs: HashMap::new(),
-                data_refs: &data_refs,
-                kernel_refs: &kernel_refs,
+                rt_refs,
+                call_args,
+                branch_args,
+                data_refs,
+                kernel_refs,
                 alias: wukong_opt::AliasInfo::analyze(f),
                 layout_err: None,
             };
@@ -3440,6 +3486,7 @@ fn define_functions_serial<M: Module>(
 ) -> Result<(), String> {
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
+    let mut scratch = TranslationScratch::default();
     for (fi, f) in program.funcs.iter().enumerate() {
         {
             let decls = Decls {
@@ -3458,6 +3505,7 @@ fn define_functions_serial<M: Module>(
                 kernel_ids,
                 &mut fbctx,
                 &mut ctx.func,
+                &mut scratch,
             )?;
         }
         module
@@ -3506,9 +3554,10 @@ fn define_functions_parallel<M: Module>(
                     (
                         FunctionBuilderContext::new(),
                         cranelift_codegen::Context::new(),
+                        TranslationScratch::default(),
                     )
                 },
-                |(fbctx, ctx), (fi, f)| -> Result<_, String> {
+                |(fbctx, ctx, scratch), (fi, f)| -> Result<_, String> {
                     let fid = ids[&f.name];
                     ctx.clear();
                     build_function_clif(
@@ -3524,6 +3573,7 @@ fn define_functions_parallel<M: Module>(
                         kernel_ids,
                         fbctx,
                         &mut ctx.func,
+                        scratch,
                     )?;
                     let mut cp = cranelift_codegen::control::ControlPlane::default();
                     ctx.compile(isa, &mut cp)
