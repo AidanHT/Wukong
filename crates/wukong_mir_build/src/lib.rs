@@ -2248,7 +2248,10 @@ fn parallel_spec<'a>(
     let unsigned_counter =
         !end_scalar.is_signed() || (!start_scalar.is_signed() && start_ty == end_ty);
     if unsigned_counter {
-        let bound = const_usize_expr(end, interner, sema)? as u64;
+        let ExprKind::Int(text) = &end.kind else {
+            return None;
+        };
+        let bound = u64::try_from(parse_int_checked(interner.resolve(*text))?).ok()?;
         let max_signed = (1u64 << (mir_byte_size(&end_ty) * 8 - 1)) - 1;
         if bound > max_signed {
             return None;
@@ -28855,6 +28858,11 @@ pub fn is_intrinsic(name: &str) -> bool {
 /// `5usize`), and an optional leading sign. The previous version kept only the leading run of
 /// decimal digits, so every non-decimal literal (`0xFF`, `0b1010`, `0o17`) silently parsed to `0`.
 fn parse_int(text: &str) -> i128 {
+    parse_int_checked(text).unwrap_or(0)
+}
+
+/// The same decoder without the recovery sentinel, for literal-only optimization proofs.
+fn parse_int_checked(text: &str) -> Option<i128> {
     let mut s = text.trim();
     let neg = s.starts_with('-');
     if neg || s.starts_with('+') {
@@ -28888,12 +28896,8 @@ fn parse_int(text: &str) -> i128 {
     } else {
         body.parse::<i128>()
     }
-    .unwrap_or(0);
-    if neg {
-        -val
-    } else {
-        val
-    }
+    .ok()?;
+    Some(if neg { -val } else { val })
 }
 
 fn parse_float(text: &str) -> f64 {
