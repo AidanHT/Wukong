@@ -47,8 +47,8 @@ use wukong_sema::{
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::Ty;
 
-/// Array-repeat initializers (`[v; n]`) with at most this many elements are unrolled to
-/// straight-line stores; larger ones lower to a fill loop to keep the IR compact.
+/// Array fills and copies with at most this many elements are unrolled to straight-line
+/// operations; larger ones lower to a counted loop to keep the IR compact.
 const REPEAT_UNROLL_LIMIT: u32 = 8;
 
 // ===== Type-generic monomorphization =====
@@ -564,8 +564,18 @@ fn collect_static_strings(
         }
     }
     // A `const MSG: *u8 = "…"` inlines its initializer at each use, so its literal needs a blob too.
-    for init in sema.consts.values() {
-        collect_str_expr(init, &mut lits);
+    // Follow declaration order, not hash-table bucket order: rodata names and object layout must
+    // not depend on the sema table's capacity or insertion history. The final sema binding remains
+    // authoritative for a duplicate name during error recovery; visit that name only once.
+    let mut seen_consts = HashSet::default();
+    for item in &module.items {
+        if let ast::ItemKind::Const(c) = &item.kind {
+            if seen_consts.insert(c.name.sym) {
+                if let Some(init) = sema.consts.get(&c.name.sym) {
+                    collect_str_expr(init, &mut lits);
+                }
+            }
+        }
     }
     let mut by_content: HashMap<Vec<u8>, Symbol> = HashMap::default();
     let mut statics: Vec<wukong_mir::StaticData> = Vec::new();
@@ -2253,6 +2263,7 @@ fn is_batched_norm_fn(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -2304,6 +2315,7 @@ fn is_bias_bcast_fn(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -2381,6 +2393,7 @@ fn lower_fn(
 
     let mut fl = FnLowerer {
         builder: Builder::new(name, ret_mir.clone()),
+        preserve_aggregate_blocks: ret_mir.is_float(),
         sema,
         interner,
         diags,
@@ -2593,6 +2606,7 @@ fn lower_parallel(
     let outlined = {
         let mut fl = FnLowerer {
             builder: Builder::new(par_sym, MirType::Void),
+            preserve_aggregate_blocks: false,
             sema,
             interner,
             diags: &mut *diags,
@@ -2661,6 +2675,7 @@ fn lower_parallel(
     let wrapper = {
         let mut fl = FnLowerer {
             builder: Builder::new(f.name.sym, ret_mir.clone()),
+            preserve_aggregate_blocks: ret_mir.is_float(),
             sema,
             interner,
             diags: &mut *diags,
@@ -3338,6 +3353,10 @@ const NORM_L2NORM: i64 = 4; // out = x / sqrt(sum(x^2) + eps) — L2 / unit norm
 
 struct FnLowerer<'a> {
     builder: Builder,
+    /// Autodiff currently accepts only single-block functions returning a float scalar. Keep
+    /// aggregate operations unrolled in every such function so introducing copy/zero loops does
+    /// not remove an existing gradient candidate, including callers of the public grad API.
+    preserve_aggregate_blocks: bool,
     sema: &'a SemaResult,
     interner: &'a Interner,
     diags: &'a mut Vec<Diagnostic>,
@@ -3732,11 +3751,16 @@ impl FnLowerer<'_> {
                 } else {
                     self.lower_fill_loop(slot, elem, *n, z);
                 }
-            } else {
+            } else if *n <= REPEAT_UNROLL_LIMIT || self.preserve_aggregate_blocks {
                 for i in 0..*n as i128 {
                     let ep = self.gep_elem(slot, elem, i);
                     self.zero_init(ep, elem);
                 }
+            } else {
+                self.lower_counted_loop(*n as u64, |this, i| {
+                    let ep = this.gep_elem_value(slot, elem, i);
+                    this.zero_init(ep, elem);
+                });
             }
         }
     }
@@ -3797,7 +3821,7 @@ impl FnLowerer<'_> {
             }
             Ty::Named(sym) => self.struct_size(*sym),
             Ty::Array { elem, len, .. } => Some(self.ty_size(elem)? * len),
-            Ty::Tuple(fields) => self.aggregate_layout(fields).map(|(_, size, _)| size),
+            Ty::Tuple(fields) => self.aggregate_extent(fields, |_| {}).map(|(size, _)| size),
             _ => ty.size_of(),
         }
     }
@@ -3828,19 +3852,34 @@ impl FnLowerer<'_> {
     /// layout authority shared by structs and tuples (the same `round_up` accumulation as
     /// `Ty::size_of`, but registry-aware so a named-struct field is sized recursively). `None` if any
     /// field is genuinely unsized (a slice/tensor/unresolved name).
-    fn aggregate_layout(&self, fields: &[Ty]) -> Option<(Vec<u64>, u64, u64)> {
-        let mut offsets = Vec::with_capacity(fields.len());
+    fn aggregate_layout<'t>(
+        &self,
+        fields: impl IntoIterator<Item = &'t Ty>,
+    ) -> Option<(Vec<u64>, u64, u64)> {
+        let fields = fields.into_iter();
+        let mut offsets = Vec::with_capacity(fields.size_hint().0);
+        let (size, align) = self.aggregate_extent(fields, |off| offsets.push(off))?;
+        Some((offsets, size, align))
+    }
+
+    /// Walk the shared aggregate layout without requiring an offsets allocation. Size-only
+    /// queries pass a no-op visitor; field queries collect the offsets they actually need.
+    fn aggregate_extent<'t>(
+        &self,
+        fields: impl IntoIterator<Item = &'t Ty>,
+        mut field_offset: impl FnMut(u64),
+    ) -> Option<(u64, u64)> {
         let mut size = 0u64;
         let mut align = 1u64;
         for f in fields {
             let fa = self.ty_align(f)?;
             let fs = self.ty_size(f)?;
             size = round_up(size, fa);
-            offsets.push(size);
+            field_offset(size);
             size += fs;
             align = align.max(fa);
         }
-        Some((offsets, round_up(size, align), align))
+        Some((round_up(size, align), align))
     }
 
     /// The field layout of a declared struct: `(field name, byte offset, field MIR type)` in
@@ -3851,8 +3890,7 @@ impl FnLowerer<'_> {
         let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
             return None;
         };
-        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
-        let (offsets, _, _) = self.aggregate_layout(&tys)?;
+        let (offsets, _, _) = self.aggregate_layout(fields.iter().map(|(_, t)| t))?;
         Some(
             fields
                 .iter()
@@ -3869,9 +3907,14 @@ impl FnLowerer<'_> {
         let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
             return None;
         };
-        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
-        let (offsets, _, _) = self.aggregate_layout(&tys)?;
-        Some(tys.into_iter().zip(offsets).map(|(t, o)| (o, t)).collect())
+        let (offsets, _, _) = self.aggregate_layout(fields.iter().map(|(_, t)| t))?;
+        Some(
+            fields
+                .iter()
+                .zip(offsets)
+                .map(|((_, t), off)| (off, t.clone()))
+                .collect(),
+        )
     }
 
     /// Total padded byte size of a declared struct (its alloca size), registry-aware.
@@ -3879,8 +3922,8 @@ impl FnLowerer<'_> {
         let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
             return None;
         };
-        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
-        self.aggregate_layout(&tys).map(|(_, size, _)| size)
+        self.aggregate_extent(fields.iter().map(|(_, t)| t), |_| {})
+            .map(|(size, _)| size)
     }
 
     /// Alignment of a declared struct (the max field alignment), registry-aware.
@@ -4353,21 +4396,27 @@ impl FnLowerer<'_> {
             }
             Ty::Tuple(fields) => {
                 if let Some((offsets, _, _)) = self.aggregate_layout(fields) {
-                    let pairs: Vec<(u64, Ty)> =
-                        offsets.into_iter().zip(fields.iter().cloned()).collect();
-                    for (off, fty) in pairs {
+                    for (off, fty) in offsets.into_iter().zip(fields) {
                         let s = self.field_ptr(src, off);
                         let d = self.field_ptr(dst, off);
-                        self.emit_copy(d, s, &fty);
+                        self.emit_copy(d, s, fty);
                     }
                 }
             }
             Ty::Array { elem, len, .. } => {
                 let emir = self.mir_ty_of(elem);
-                for i in 0..*len as i128 {
-                    let s = self.gep_elem(src, &emir, i);
-                    let d = self.gep_elem(dst, &emir, i);
-                    self.emit_copy(d, s, elem);
+                if *len <= REPEAT_UNROLL_LIMIT as u64 || self.preserve_aggregate_blocks {
+                    for i in 0..*len as i128 {
+                        let s = self.gep_elem(src, &emir, i);
+                        let d = self.gep_elem(dst, &emir, i);
+                        self.emit_copy(d, s, elem);
+                    }
+                } else {
+                    self.lower_counted_loop(*len, |this, i| {
+                        let s = this.gep_elem_value(src, &emir, i);
+                        let d = this.gep_elem_value(dst, &emir, i);
+                        this.emit_copy(d, s, elem);
+                    });
                 }
             }
             _ => {
@@ -4383,11 +4432,20 @@ impl FnLowerer<'_> {
     /// `i8` copy matches the interpreter's 1-slot-per-scalar memory (each `Load(off, i8)` returns the
     /// whole `Value` stored at that offset slot, `Store` writes it back) *and* native's byte memory.
     fn emit_copy_bytes(&mut self, dst: ValueId, src: ValueId, nbytes: u64) {
-        for k in 0..nbytes {
-            let s = self.field_ptr(src, k);
-            let d = self.field_ptr(dst, k);
-            let v = self.builder.build(MirType::I8, Op::Load(s, MirType::I8));
-            self.builder.build_void(Op::Store { ptr: d, value: v });
+        if nbytes <= REPEAT_UNROLL_LIMIT as u64 || self.preserve_aggregate_blocks {
+            for k in 0..nbytes {
+                let s = self.field_ptr(src, k);
+                let d = self.field_ptr(dst, k);
+                let v = self.builder.build(MirType::I8, Op::Load(s, MirType::I8));
+                self.builder.build_void(Op::Store { ptr: d, value: v });
+            }
+        } else {
+            self.lower_counted_loop(nbytes, |this, i| {
+                let s = this.gep_elem_value(src, &MirType::I8, i);
+                let d = this.gep_elem_value(dst, &MirType::I8, i);
+                let v = this.builder.build(MirType::I8, Op::Load(s, MirType::I8));
+                this.builder.build_void(Op::Store { ptr: d, value: v });
+            });
         }
     }
 
@@ -4409,11 +4467,16 @@ impl FnLowerer<'_> {
         let idx = self
             .builder
             .build(MirType::I64, Op::ConstInt(index, MirType::I64));
+        self.gep_elem_value(base, elem, idx)
+    }
+
+    /// Element-typed GEP with an existing index, shared by compact copy/fill loop bodies.
+    fn gep_elem_value(&mut self, base: ValueId, elem: &MirType, index: ValueId) -> ValueId {
         self.builder.build(
             MirType::Ptr,
             Op::Gep {
                 ptr: base,
-                index: idx,
+                index,
                 elem: elem.clone(),
             },
         )
@@ -12625,6 +12688,7 @@ impl FnLowerer<'_> {
         let outlined = {
             let mut fl = FnLowerer {
                 builder: Builder::new(par_sym, MirType::Void),
+                preserve_aggregate_blocks: false,
                 sema: self.sema,
                 interner: self.interner,
                 diags: &mut tmp_diags,
@@ -17183,60 +17247,51 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Emit `for i in 0..n { base[i] = v }` as a CFG loop. Used for large array-repeat initializers
-    /// so the IR stays compact; mem2reg later promotes the loop counter to a register.
+    /// Emit `for i in 0..n { base[i] = v }` as a compact CFG loop.
     fn lower_fill_loop(&mut self, base: ValueId, elem: &MirType, n: u32, v: ValueId) {
+        self.lower_counted_loop(n as u64, |this, i| {
+            let p = this.gep_elem_value(base, elem, i);
+            this.builder.build_void(Op::Store { ptr: p, value: v });
+        });
+    }
+
+    /// Emit an ascending `0..n` loop for compiler-generated memory operations. The body can
+    /// itself emit nested loops; its final block branches back to this loop's header. A block
+    /// parameter carries the index directly, avoiding a stack counter and later mem2reg work.
+    /// All callers emit only memory operations here, so no source-level break/return is hidden.
+    fn lower_counted_loop(&mut self, n: u64, body_ops: impl FnOnce(&mut Self, ValueId)) {
         let i64t = MirType::I64;
-        let slot = self.builder.alloca(i64t.clone());
         let zero = self
             .builder
             .build(i64t.clone(), Op::ConstInt(0, i64t.clone()));
-        self.builder.build_void(Op::Store {
-            ptr: slot,
-            value: zero,
-        });
+        let nconst = self
+            .builder
+            .build(i64t.clone(), Op::ConstInt(n as i128, i64t.clone()));
 
         let header = self.builder.new_block();
         let body = self.builder.new_block();
         let exit = self.builder.new_block();
-        self.builder.br(header, vec![]);
+        let i_val = self.builder.block_param(header, i64t.clone());
+        self.builder.br(header, vec![zero]);
 
         self.builder.switch_to(header);
-        let i_val = self
-            .builder
-            .build(i64t.clone(), Op::Load(slot, i64t.clone()));
-        let nconst = self
-            .builder
-            .build(i64t.clone(), Op::ConstInt(n as i128, i64t.clone()));
-        let cond = self
-            .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Slt, i_val, nconst));
+        let cmp = if n <= i64::MAX as u64 {
+            CmpOp::Slt
+        } else {
+            CmpOp::Ult
+        };
+        let cond = self.builder.build(MirType::I1, Op::Cmp(cmp, i_val, nconst));
         self.builder.cond_br(cond, body, vec![], exit, vec![]);
 
         self.builder.switch_to(body);
-        let i_cur = self
-            .builder
-            .build(i64t.clone(), Op::Load(slot, i64t.clone()));
-        let p = self.builder.build(
-            MirType::Ptr,
-            Op::Gep {
-                ptr: base,
-                index: i_cur,
-                elem: elem.clone(),
-            },
-        );
-        self.builder.build_void(Op::Store { ptr: p, value: v });
+        body_ops(self, i_val);
         let one = self
             .builder
             .build(i64t.clone(), Op::ConstInt(1, i64t.clone()));
         let next = self
             .builder
-            .build(i64t.clone(), Op::Bin(BinOp::Add, i_cur, one));
-        self.builder.build_void(Op::Store {
-            ptr: slot,
-            value: next,
-        });
-        self.builder.br(header, vec![]);
+            .build(i64t.clone(), Op::Bin(BinOp::Add, i_val, one));
+        self.builder.br(header, vec![next]);
 
         self.builder.switch_to(exit);
         self.terminated = false;
@@ -24912,6 +24967,7 @@ fn lower_matmul_fn(
     let ret_mir = mir_ty(&ret_ty);
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
+        preserve_aggregate_blocks: ret_mir.is_float(),
         sema,
         interner,
         diags,
@@ -26609,6 +26665,7 @@ fn xent_bwd_fn(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -26655,6 +26712,7 @@ fn xent_fn(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -26709,6 +26767,7 @@ fn logsumexp_fn(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -26851,6 +26910,7 @@ fn probe_single_for(
     let mut diags = Vec::new();
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
+        preserve_aggregate_blocks: false,
         sema,
         interner,
         diags: &mut diags,
@@ -27880,6 +27940,7 @@ fn lower_i8matmul_fn(
     let ret_mir = mir_ty(&ret_ty);
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
+        preserve_aggregate_blocks: ret_mir.is_float(),
         sema,
         interner,
         diags,
