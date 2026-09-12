@@ -3109,7 +3109,6 @@ fn build_function_clif(
     module: &Decls,
     f: &Function,
     fi: usize,
-    program: &Program,
     interner: &Interner,
     ptr_ty: Type,
     call_conv: cranelift_codegen::isa::CallConv,
@@ -3125,22 +3124,28 @@ fn build_function_clif(
         {
             let mut builder = FunctionBuilder::new(clif, fbctx);
 
-            // Pre-declare callee and runtime FuncRefs into this function's DFG. Iterate the
-            // `program.funcs` Vec (source order), not the `ids` HashMap — the latter's per-process
-            // hash order would allocate `FuncRef` indices nondeterministically. It is washed out today
-            // (every read of `func_refs` is a keyed lookup, and relocations key on the symbol and emit
-            // in code-offset order), but iterating the deterministic Vec keeps the CLIF reproducible
-            // for free and immune to any future Cranelift change that orders a table by FuncRef index.
+            // Import only referenced symbols, in deterministic MIR instruction order. Importing
+            // every function and static into every DFG grows quadratically with the module size,
+            // even when each function only calls one other function. Keep declarations module-wide
+            // so forward references, recursion, and address-taken parallel helpers still resolve.
             let mut func_refs: HashMap<Symbol, FuncRef> = HashMap::new();
-            for callee in &program.funcs {
-                let r = module.declare_func_in_func(ids[&callee.name], builder.func);
-                func_refs.insert(callee.name, r);
-            }
-            // Import the read-only data blobs into this function's DFG (source order, deterministic).
             let mut data_refs: HashMap<Symbol, GlobalValue> = HashMap::new();
-            for s in &program.statics {
-                let gv = module.declare_data_in_func(data_ids[&s.name], builder.func);
-                data_refs.insert(s.name, gv);
+            for inst in f.blocks.iter().flat_map(|block| &block.insts) {
+                match &inst.op {
+                    Op::Call { func, .. } | Op::FuncAddr(func) => {
+                        if let Some(&id) = ids.get(func) {
+                            func_refs
+                                .entry(*func)
+                                .or_insert_with(|| module.declare_func_in_func(id, builder.func));
+                        }
+                    }
+                    Op::GlobalAddr(sym) => {
+                        data_refs.entry(*sym).or_insert_with(|| {
+                            module.declare_data_in_func(data_ids[sym], builder.func)
+                        });
+                    }
+                    _ => {}
+                }
             }
             // This function's own vector-kernel FuncRefs, indexed by `Op::VecKernelCall`'s `kernel`.
             let kernel_refs: Vec<FuncRef> = kernel_ids[fi]
@@ -3910,7 +3915,7 @@ fn define_functions_serial<M: Module>(
         for (fi, f) in program.funcs.iter().enumerate() {
             let mut clif = cranelift_codegen::ir::Function::new();
             build_function_clif(
-                &decls, f, fi, program, interner, ptr_ty, call_conv, rt, ids, data_ids, kernel_ids,
+                &decls, f, fi, interner, ptr_ty, call_conv, rt, ids, data_ids, kernel_ids,
                 &mut fbctx, &mut clif,
             )?;
             clifs.push((ids[&f.name], clif));
@@ -3974,7 +3979,6 @@ fn define_functions_parallel<M: Module>(
                         &decls,
                         f,
                         fi,
-                        program,
                         interner,
                         ptr_ty,
                         call_conv,
