@@ -23,6 +23,7 @@
 //! and `const` is registered.
 
 mod attrs;
+mod dependency;
 mod shape;
 
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -611,6 +612,16 @@ impl Sema<'_> {
     /// the indirection). A field behind a pointer/reference has fixed size and breaks the cycle, as
     /// in C/Rust (cf. Rust's E0072). Runs after `collect`, when every struct is registered.
     fn check_recursive_types(&mut self, module: &Module) {
+        // Build each containment list once, then classify all cycles together. Repeating a DFS
+        // per declaration (with a linear visited list) made long acyclic type chains cubic.
+        let graph = self
+            .defs
+            .defs
+            .iter()
+            .filter(|d| matches!(d.kind, DefKind::Struct(_) | DefKind::Enum(_)))
+            .map(|d| (d.name, self.contained_types(d.name)))
+            .collect();
+        let cyclic = dependency::cyclic_nodes(&graph);
         for item in &module.items {
             // A struct or a data-carrying enum can be recursive by value; a C-style enum holds
             // nothing (`contained_types` returns empty for it), so it can never be flagged.
@@ -619,22 +630,7 @@ impl Sema<'_> {
                 ItemKind::Enum(e) => (e.name.sym, "enum"),
                 _ => continue,
             };
-            // DFS over by-value containment from `root`; reaching `root` means infinite size.
-            let mut stack = self.contained_types(root);
-            let mut visited: Vec<Symbol> = Vec::new();
-            let mut recursive = false;
-            while let Some(cur) = stack.pop() {
-                if cur == root {
-                    recursive = true;
-                    break;
-                }
-                if visited.contains(&cur) {
-                    continue;
-                }
-                visited.push(cur);
-                stack.extend(self.contained_types(cur));
-            }
-            if recursive {
+            if cyclic.contains(&root) {
                 let nm = self.sym_str(root).to_string();
                 self.error(
                     item.span,
@@ -662,8 +658,18 @@ impl Sema<'_> {
             }
             Some(DefKind::Enum(variants)) => {
                 for v in variants {
-                    for fty in v.payload.field_tys() {
-                        collect_value_structs(&fty, &mut out);
+                    match &v.payload {
+                        VariantPayload::Unit => {}
+                        VariantPayload::Tuple(fields) => {
+                            for fty in fields {
+                                collect_value_structs(fty, &mut out);
+                            }
+                        }
+                        VariantPayload::Struct(fields) => {
+                            for (_, fty) in fields {
+                                collect_value_structs(fty, &mut out);
+                            }
+                        }
                     }
                 }
             }
@@ -675,8 +681,8 @@ impl Sema<'_> {
     /// Reject a `const` whose initializer depends on its own value — directly (`const A = A + 1`) or
     /// transitively (`A` uses `B`, `B` uses `A`). `mir_build` inlines a const's initializer at each
     /// use site and recurses for a const-references-const, so a cycle stack-overflows the compiler
-    /// (a crash on a plausible typo). Mirrors `check_recursive_types`: a DFS over the
-    /// const-reference graph that flags reaching the root. Runs after `collect`, when every const is
+    /// (a crash on a plausible typo). Mirrors `check_recursive_types`: classify cycles in the
+    /// const-reference graph. Runs after `collect`, when every const is
     /// registered, and (like the struct check) before `check_bodies`, so the error halts the pipeline
     /// ahead of mir_build's inliner.
     fn check_recursive_consts(&mut self, module: &Module) {
@@ -687,26 +693,44 @@ impl Sema<'_> {
             }
         }
         let names: HashSet<Symbol> = inits.keys().copied().collect();
+        // Walk each initializer once. Shared dependency tails used to be rescanned, including
+        // their entire ASTs, from every root that could reach them.
+        let graph: HashMap<Symbol, Vec<Symbol>> = inits
+            .iter()
+            .map(|(&name, init)| {
+                let mut deps = Vec::new();
+                collect_const_refs(init, &names, &mut deps);
+                (name, deps)
+            })
+            .collect();
+        let cyclic = dependency::cyclic_nodes(&graph);
         for item in &module.items {
             if let ItemKind::Const(c) = &item.kind {
                 let root = c.name.sym;
-                let mut stack: Vec<Symbol> = Vec::new();
-                collect_const_refs(&c.value, &names, &mut stack);
-                let mut visited: Vec<Symbol> = Vec::new();
-                let mut recursive = false;
-                while let Some(cur) = stack.pop() {
-                    if cur == root {
-                        recursive = true;
-                        break;
+                let recursive = if std::ptr::eq(inits[&root], &c.value) {
+                    cyclic.contains(&root)
+                } else {
+                    // Duplicate names already produce E0300. Preserve the former E0403 recovery
+                    // behavior too: start at THIS initializer, then resolve references using the
+                    // last initializer registered for each name. Only these invalid duplicate
+                    // declarations need a separate reachability walk.
+                    let mut stack = Vec::new();
+                    collect_const_refs(&c.value, &names, &mut stack);
+                    let mut visited = HashSet::default();
+                    let mut recursive = false;
+                    while let Some(cur) = stack.pop() {
+                        if cur == root {
+                            recursive = true;
+                            break;
+                        }
+                        if visited.insert(cur) {
+                            if let Some(deps) = graph.get(&cur) {
+                                stack.extend(deps.iter().copied());
+                            }
+                        }
                     }
-                    if visited.contains(&cur) {
-                        continue;
-                    }
-                    visited.push(cur);
-                    if let Some(e) = inits.get(&cur) {
-                        collect_const_refs(e, &names, &mut stack);
-                    }
-                }
+                    recursive
+                };
                 if recursive {
                     let nm = self.sym_str(root).to_string();
                     self.error(

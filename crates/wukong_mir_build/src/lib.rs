@@ -64,6 +64,7 @@ const REPEAT_UNROLL_LIMIT: u32 = 8;
 // `Dim::Var`, never a `Ty::Named`), so they are excluded by construction.
 
 /// The result of the monomorphization collection pass (see [`collect_mono`]).
+#[derive(Default)]
 struct Mono {
     /// (original fn symbol, canonical comma-joined concrete type-arg names) -> instance symbol.
     instance_of: HashMap<(Symbol, String), Symbol>,
@@ -312,30 +313,36 @@ impl MonoCollector<'_> {
         }
         let name = p.first().sym;
         let tg = match self.type_generics.get(&name) {
-            Some(g) if !g.is_empty() => g.clone(),
+            Some(g) if !g.is_empty() => g,
             _ => return,
         };
-        let params: Vec<Ty> = match self.sema.defs.lookup(name).map(|d| &d.kind) {
-            Some(DefKind::Fn(sig)) => sig.params.clone(),
+        let params = match self.sema.defs.lookup(name).map(|d| &d.kind) {
+            Some(DefKind::Fn(sig)) => &sig.params,
             _ => return,
         };
         let mut subst: HashMap<Symbol, Ty> = HashMap::default();
         for (i, a) in args.iter().enumerate() {
             let Some(pty) = params.get(i) else { break };
-            let aty = subst_ty(
-                &self.sema.types.get(&a.id).cloned().unwrap_or(Ty::Unknown),
-                outer,
-            );
-            bind_generics(pty, &aty, &tg, &mut subst);
+            let aty = self.sema.types.get(&a.id).unwrap_or(&Ty::Unknown);
+            // Concrete callers need no copy of their already-resolved type trees. Generic
+            // callers substitute once, without first cloning the same tree from the side table.
+            let resolved;
+            let aty = if outer.is_empty() {
+                aty
+            } else {
+                resolved = subst_ty(aty, outer);
+                &resolved
+            };
+            bind_generics(pty, aty, tg, &mut subst);
         }
-        let Some(canon) = canon_type_args(&tg, &subst, self.interner) else {
+        let Some(canon) = canon_type_args(tg, &subst, self.interner) else {
             return;
         };
         let key = (name, canon.clone());
         if self.instance_of.contains_key(&key) {
             return;
         }
-        let base = self.interner.resolve(name).to_string();
+        let base = self.interner.resolve(name);
         let mangled = self
             .interner
             .intern(&format!("{base}${}", canon.replace(',', "_")));
@@ -493,6 +500,11 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
                 }
             }
         }
+    }
+    // No value-type-generic declaration means no call can create an instance. Avoid a second
+    // full walk of every body in ordinary scalar and shape-generic tensor modules.
+    if type_generics.is_empty() {
+        return Mono::default();
     }
     let mut c = MonoCollector {
         sema,
@@ -2258,6 +2270,7 @@ fn is_batched_norm_fn(
         par: None,
 
         tile_queue: vec![],
+        param_arrays: vec![],
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
 }
@@ -2308,11 +2321,28 @@ fn is_bias_bcast_fn(
         par: None,
 
         tile_queue: vec![],
+        param_arrays: vec![],
     };
     probe.match_bias_bcast(pat, iter, lb).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Can two DISTINCT parameters of this type name the same storage? True for everything Wukong
+/// passes by base pointer — arrays, tensors, slices, pointers, references, tuples and named
+/// aggregates. A scalar parameter arrives as a copy and can alias nothing.
+fn ty_is_buffer_param(t: &Ty) -> bool {
+    matches!(
+        t,
+        Ty::Array { .. }
+            | Ty::Tensor { .. }
+            | Ty::Slice(_)
+            | Ty::Ptr { .. }
+            | Ty::Ref { .. }
+            | Ty::Tuple(_)
+            | Ty::Named(_)
+    )
+}
+
 fn lower_fn(
     f: &FnDecl,
     body: &Block,
@@ -2349,6 +2379,17 @@ fn lower_fn(
         mir_ty(&ret_ty)
     };
 
+    // The buffer parameters, for the region outliner's alias obligation (`match_parallel_region`).
+    // Built here because `lower_fn` is the only lowerer that carries `par: Some(..)` and therefore
+    // the only one that can emit a region at all.
+    let param_arrays: Vec<(Symbol, Ty)> = f
+        .params
+        .iter()
+        .zip(&param_tys)
+        .filter(|(_, pty)| ty_is_buffer_param(pty))
+        .map(|(p, pty)| (p.name.sym, pty.clone()))
+        .collect();
+
     let mut fl = FnLowerer {
         builder: Builder::new(name, ret_mir.clone()),
         sema,
@@ -2367,6 +2408,7 @@ fn lower_fn(
         mono: Some(mono),
         par,
         tile_queue,
+        param_arrays,
     };
 
     // The sret pointer is parameter 0 — declared before the real params so the call site can prepend
@@ -2578,6 +2620,7 @@ fn lower_parallel(
             par: None,
 
             tile_queue: vec![],
+            param_arrays: vec![],
         };
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
@@ -2645,6 +2688,7 @@ fn lower_parallel(
             par: None,
 
             tile_queue: vec![],
+            param_arrays: vec![],
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
@@ -3351,6 +3395,14 @@ struct FnLowerer<'a> {
     /// Remaining tile widths from a function-item `@tile(BM, BN, …)`, consumed by nested `for`
     /// loops in source order (statement-level `@tile` overrides for one loop).
     tile_queue: Vec<u64>,
+    /// The enclosing function's **buffer parameters**, symbol -> declared type, in declaration
+    /// order. Two DISTINCT parameters of the same type may be bound to one buffer at the call site
+    /// (`embed(ids, buf, buf)`), which is the single disjointness fact
+    /// [`FnLowerer::match_parallel_region`]'s per-symbol reasoning cannot establish for itself —
+    /// `wukong_opt::alias` answers "may alias" for `Param(i)` vs `Param(j)` for exactly this reason.
+    /// Empty on every lowerer that carries `par: None`, which is every lowerer that cannot emit a
+    /// region.
+    param_arrays: Vec<(Symbol, Ty)>,
     /// The bound slot values that hold a `[]T` **slice** fat pointer, recorded by `bind_slice` at
     /// every binding site whose sema type is `Ty::Slice`. `kernel_base_ptr` needs this because the
     /// slice's MIR slot type — `Array(I8, SLICE_SIZE)` — is *not* unique to slices: a tuple, a
@@ -11872,9 +11924,11 @@ impl FnLowerer<'_> {
     //    kernels — the identical per-iteration op sequence the non-`@parallel` spelling runs; only
     //    cross-iteration scheduling differs, and iterations never overlap writes, so serial ==
     //    parallel bit-for-bit and the interpreter (sequential `[0, N)`) == native (chunks).
-    //  * Aliasing granularity is the symbol, as everywhere else in the recognizers (two *distinct*
-    //    captured arrays are assumed disjoint buffers — the same contract every kernel dispatch
-    //    already relies on).
+    //  * Aliasing granularity is the symbol, which is a FACT for two distinct locals (distinct
+    //    `alloca`s) and only an ASSUMPTION for two distinct parameters — one array can be bound to
+    //    both (`embed(ids, buf, buf)`), and no rule of the language forbids it. So captured buffer
+    //    parameters that could be the same storage are proved as ONE buffer, over the union of
+    //    their accesses; anything that cannot carry the digit under a shared signature declines.
     //
     // Autodiff note: a function containing a region tapes to an `Op::Call` of
     // `wukong_parallel_for` (a void call with no VJP rule), so `--emit=grad`/`--train` over such a
@@ -11939,61 +11993,106 @@ impl FnLowerer<'_> {
         }
         for arr in &sc.written {
             let accs = sc.accesses.get(arr)?;
-            // Pass 1: every access must carry the loop var under ONE common signature for this
-            // array, reads and writes alike (a read decomposing under a different signature could
-            // reach another iteration's slice): a single direct `hh`/`hh * <lit>` digit, or the
-            // tiled `(hh/C)·qc + (hh%C)·rc` digit pair.
-            let mut sig: Option<RegionSig> = None;
-            let mut parsed: Vec<(Vec<RegionRest>, &RegionAccess)> = Vec::new();
-            for a in accs {
-                let idx = a.idx?; // opaque access (whole-array / multi-index) to a written array
-                let (asig, rest) = region_access_sig(idx, a, hh, self.interner)?;
-                match sig {
-                    Some(s) if s != asig => return None,
-                    _ => sig = Some(asig),
-                }
-                parsed.push((rest, a));
+            self.prove_region_slices(hh, n, &accs.iter().collect::<Vec<_>>())?;
+        }
+        // Aliasing granularity is the symbol. For two distinct LOCALS that is a fact — distinct
+        // `alloca`s, distinct storage — but for two distinct PARAMETERS it is an assumption, and the
+        // caller defeats it by passing one array twice: `embed(ids, buf, buf)` binds `weight` and
+        // `out` to the same buffer, and nothing in the language forbids it (`wukong_opt::alias`
+        // answers "may alias" for `Param(i)` vs `Param(j)` for exactly this reason, and
+        // `docs/roadmap.md` predicted a fixed-size array parameter would be the one to reach it).
+        // So whenever a WRITTEN capture is a buffer parameter, every other captured parameter that
+        // could be that same buffer — same declared type, the only way sema lets one array reach
+        // both — joins it, and the identical proof runs over the UNION of their accesses. Passing
+        // means every iteration owns one slice of the shared buffer, so the aliasing is harmless and
+        // the ordinary `out[i] = x[i] * 2.0` shape still outlines; a gather whose index cannot carry
+        // the digit (`weight[ids[t] * 4 + d]`) declines to the serial lowering instead of racing.
+        for arr in &sc.written {
+            let Some(wty) = self.buffer_param_ty(*arr) else {
+                continue;
+            };
+            let group: Vec<&Vec<RegionAccess>> = sc
+                .captures
+                .iter()
+                .filter(|c| self.buffer_param_ty(**c) == Some(wty))
+                .filter_map(|c| sc.accesses.get(c))
+                .collect();
+            if group.len() < 2 {
+                continue;
             }
-            // Pass 2: classify every remaining term at each radix level — outer (stride ≡ 0 mod
-            // the level's modulus, erased for ANY integer factor value) or bounded (non-negative
-            // constants and inner `for` vars with literal ranges) — and bound each digit's slot.
-            match sig? {
-                RegionSig::T(c) => {
-                    let m = c.checked_mul(n)?;
-                    for (rest, a) in &parsed {
-                        // Everything that is not outer must stay inside the digit's stride C.
-                        let (total, _) = region_extent(rest, a, m, None)?;
-                        if total >= c {
-                            return None;
-                        }
+            self.prove_region_slices(hh, n, &group.into_iter().flatten().collect::<Vec<_>>())?;
+        }
+        Some(sc.captures)
+    }
+
+    /// The declared type of `sym` when it is a **buffer parameter** of the enclosing function — the
+    /// only case in which a symbol distinct from another can still name the same storage.
+    fn buffer_param_ty(&self, sym: Symbol) -> Option<&Ty> {
+        self.param_arrays
+            .iter()
+            .find(|(p, _)| *p == sym)
+            .map(|(_, t)| t)
+    }
+
+    /// The per-buffer disjointness proof, run over every access that can reach one buffer: `Some(())`
+    /// establishes that no two iterations touch the same element, `None` declines. Called once per
+    /// written array (accesses to that symbol), and once more per group of parameters that may be
+    /// the same buffer (the union of their accesses) — see [`FnLowerer::match_parallel_region`].
+    fn prove_region_slices(&self, hh: Symbol, n: i128, accs: &[&RegionAccess<'_>]) -> Option<()> {
+        // Pass 1: every access must carry the loop var under ONE common signature for this
+        // buffer, reads and writes alike (a read decomposing under a different signature could
+        // reach another iteration's slice): a single direct `hh`/`hh * <lit>` digit, or the
+        // tiled `(hh/C)·qc + (hh%C)·rc` digit pair.
+        let mut sig: Option<RegionSig> = None;
+        let mut parsed: Vec<(Vec<RegionRest>, &RegionAccess)> = Vec::new();
+        for &a in accs {
+            let idx = a.idx?; // opaque access (whole-array / multi-index) to a covered buffer
+            let (asig, rest) = region_access_sig(idx, a, hh, self.interner)?;
+            match sig {
+                Some(s) if s != asig => return None,
+                _ => sig = Some(asig),
+            }
+            parsed.push((rest, a));
+        }
+        // Pass 2: classify every remaining term at each radix level — outer (stride ≡ 0 mod
+        // the level's modulus, erased for ANY integer factor value) or bounded (non-negative
+        // constants and inner `for` vars with literal ranges) — and bound each digit's slot.
+        match sig? {
+            RegionSig::T(c) => {
+                let m = c.checked_mul(n)?;
+                for (rest, a) in &parsed {
+                    // Everything that is not outer must stay inside the digit's stride C.
+                    let (total, _) = region_extent(rest, a, m, None)?;
+                    if total >= c {
+                        return None;
                     }
                 }
-                RegionSig::DivMod { c, qc, rc } => {
-                    // Digit ranges from the trip count: q = hh/c ∈ [0, q_max], r = hh%c ∈
-                    // [0, r_max]. H/L order the two digit terms by coefficient.
-                    let q_max = (n - 1) / c;
-                    let r_max = (c - 1).min(n - 1);
-                    let (h, h_max, l, l_max) = if rc > qc {
-                        (rc, r_max, qc, q_max)
-                    } else {
-                        (qc, q_max, rc, r_max)
-                    };
-                    let m = h.checked_mul(h_max.checked_add(1)?)?;
-                    let sm = l.checked_mul(l_max.checked_add(1)?)?;
-                    for (rest, a) in &parsed {
-                        let (total, low) = region_extent(rest, a, m, Some(sm))?;
-                        // The sub-`L` terms must fit inside the L digit's stride, and everything
-                        // below the H digit — the L digit's own reach `l_max·L` included — inside
-                        // H's: then `index mod H·(h_max+1)` recovers the H digit and its remainder
-                        // mod `L·(l_max+1)` the L digit, pinning `hh = q·c + r`.
-                        if low >= l || total.checked_add(l.checked_mul(l_max)?)? >= h {
-                            return None;
-                        }
+            }
+            RegionSig::DivMod { c, qc, rc } => {
+                // Digit ranges from the trip count: q = hh/c ∈ [0, q_max], r = hh%c ∈
+                // [0, r_max]. H/L order the two digit terms by coefficient.
+                let q_max = (n - 1) / c;
+                let r_max = (c - 1).min(n - 1);
+                let (h, h_max, l, l_max) = if rc > qc {
+                    (rc, r_max, qc, q_max)
+                } else {
+                    (qc, q_max, rc, r_max)
+                };
+                let m = h.checked_mul(h_max.checked_add(1)?)?;
+                let sm = l.checked_mul(l_max.checked_add(1)?)?;
+                for (rest, a) in &parsed {
+                    let (total, low) = region_extent(rest, a, m, Some(sm))?;
+                    // The sub-`L` terms must fit inside the L digit's stride, and everything
+                    // below the H digit — the L digit's own reach `l_max·L` included — inside
+                    // H's: then `index mod H·(h_max+1)` recovers the H digit and its remainder
+                    // mod `L·(l_max+1)` the L digit, pinning `hh = q·c + r`.
+                    if low >= l || total.checked_add(l.checked_mul(l_max)?)? >= h {
+                        return None;
                     }
                 }
             }
         }
-        Some(sc.captures)
+        Some(())
     }
 
     /// Walk one block of a candidate region body (its own lexical scope).
@@ -12476,6 +12575,7 @@ impl FnLowerer<'_> {
                 mono: self.mono,
                 par: None,
                 tile_queue: vec![],
+                param_arrays: vec![],
             };
             let start = fl.builder.add_param(MirType::I64);
             let end = fl.builder.add_param(MirType::I64);
@@ -24759,6 +24859,7 @@ fn lower_matmul_fn(
         par: None,
 
         tile_queue: vec![],
+        param_arrays: vec![],
     };
     // A symbolic-generic matmul (`fn matmul<M, N, K>(a: Tensor[f32, M, K], …)`) reaches this
     // whole-function path too. Bind its hidden runtime-dim params first (leading, before the real
@@ -26455,6 +26556,7 @@ fn xent_bwd_fn(
         par: None,
 
         tile_queue: vec![],
+        param_arrays: vec![],
     };
     probe.match_xent_bwd(pat, iter, lb).is_some()
 }
@@ -26500,6 +26602,7 @@ fn xent_fn(
         par: None,
 
         tile_queue: vec![],
+        param_arrays: vec![],
     };
     probe.match_xent(pat, iter, lb).is_some()
 }
@@ -26553,6 +26656,7 @@ fn logsumexp_fn(
         par: None,
 
         tile_queue: vec![],
+        param_arrays: vec![],
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
 }
@@ -26694,6 +26798,7 @@ fn probe_single_for(
         par: None,
 
         tile_queue: vec![],
+        param_arrays: vec![],
     };
     check(&probe, pat, iter, lb)
 }
@@ -27722,6 +27827,7 @@ fn lower_i8matmul_fn(
         par: None,
 
         tile_queue: vec![],
+        param_arrays: vec![],
     };
     let param_vals: Vec<ValueId> = param_tys
         .iter()
@@ -28732,6 +28838,73 @@ fn overlap(x: [f32; 16], mut out: [f32; 16]) {
                 |i| matches!(&i.op, Op::Call { func, .. } if interner.resolve(*func) == "wukong_parallel_for"),
             )
             .count()
+    }
+
+    /// Two array PARAMETERS can be bound to one buffer at the call site, so the region proof's
+    /// per-symbol disjointness is not a fact about them. Here the gather index `ids[t]` cannot carry
+    /// the region variable as a digit, so under `gather(buf, buf, ids)` an iteration may read rows
+    /// another is rewriting. The region must decline; before the alias obligation it outlined and
+    /// native printed a different buffer run to run (`tests/run/parallel_region_alias.wk`).
+    #[test]
+    fn a_region_over_maybe_aliasing_parameters_declines() {
+        let src = "
+module t.region_alias
+@generic
+@parallel
+fn gather(w: [f32; 16], mut out: [f32; 16], ids: [i32; 8]) {
+    let mut guard: i32 = 0;
+    guard = guard + 1;
+    for t in 0..8 {
+        for d in 0..2 { out[t * 2 + d] = w[ids[t] * 2 + d]; }
+    }
+}
+fn main() -> i32 {
+    let mut ids: [i32; 8] = [0; 8];
+    let mut buf: [f32; 16] = [0.0; 16];
+    gather(buf, buf, ids);
+    return 0;
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert_eq!(
+            count_parallel_for(&prog, &interner),
+            0,
+            "a gather whose index cannot carry the digit must not be outlined when its source              buffer may be the destination"
+        );
+    }
+
+    /// The obligation must not swallow the ordinary shape. Five parameters of ONE type is the head
+    /// loop's own signature, so the group is real and the union of its accesses is what gets proved
+    /// — and it passes, because every index carries the digit: each iteration owns one slice of the
+    /// buffer whether or not the caller aliased it. Guards against closing the hole by declining
+    /// everything (`tests/run/parallel_head_loop.wk` is the corpus witness).
+    #[test]
+    fn a_region_over_same_typed_parameters_still_outlines_when_every_index_carries_the_digit() {
+        let src = "
+module t.region_alias_ok
+@generic
+@parallel
+fn f(a: [f32; 32], b: [f32; 32], mut out: [f32; 32]) {
+    let mut guard: i32 = 0;
+    guard = guard + 1;
+    for h in 0..8 {
+        for j in 0..4 { out[h * 4 + j] = a[h * 4 + j] + b[h * 4 + j]; }
+    }
+}
+fn main() -> i32 {
+    let mut x: [f32; 32] = [0.0; 32];
+    f(x, x, x);
+    return 0;
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert_eq!(
+            count_parallel_for(&prog, &interner),
+            1,
+            "every index carries the digit under one signature, so the aliasing is harmless and              the region must still outline"
+        );
     }
 
     /// The TILED head loop — one flat `for t in 0..H*T` with `hh = t / T` (head) and `tile = t %

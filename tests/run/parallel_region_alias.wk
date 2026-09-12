@@ -1,0 +1,66 @@
+// RUN: --run --backend=native
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+module tests.run.parallel_region_alias
+
+// The mid-function `@parallel` region proves per-iteration disjointness *per captured symbol*, and
+// two distinct symbols were assumed to be two distinct buffers. That is a fact for two locals and an
+// assumption for two PARAMETERS: `gather(buf, buf, ids)` binds `w` and `out` to one array, and no
+// rule of the language forbids it (`wukong_opt::alias` answers "may alias" for `Param(i)` vs
+// `Param(j)` for exactly this reason). The gather index `ids[t]` cannot carry the region variable as
+// a digit, so under the aliasing every iteration may read rows another iteration is concurrently
+// rewriting — a race whose answer is only sometimes right. Before the fix this loop outlined and
+// native printed a different buffer run to run; it must now decline to the serial lowering.
+//
+// Every lane is printed, never a sum: a buffer correct in one lane and wrong in another passes a
+// reduction. The expected values are the scalar semantics of the nest, derived by hand and not
+// recorded from compiler output — with `buf[i] = i` and `ids[t] = (t*3+1) % 8`, the sequential
+// rewrite in place gives 2 3 8 9 14 15 14 15 10 11 2 3 14 15 14 15.
+//
+// `@generic` keeps the recognizers out, so this is the lowering under test at every `-O` level and on
+// both backends with no environment variable set. The two leading statements are load-bearing: they
+// make the body more than one `for`, so the WHOLE-FUNCTION `@parallel` vehicle declines and the
+// mid-function region vehicle is the one this fixture pins.
+
+@generic
+@parallel
+fn gather(w: [f32; 16], mut out: [f32; 16], ids: [i32; 8]) {
+    let mut guard: i32 = 0;
+    guard = guard + 1;
+    for t in 0..8 {
+        for d in 0..2 {
+            out[t * 2 + d] = w[ids[t] * 2 + d];
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut ids: [i32; 8] = [0; 8];
+    for i in 0..8 {
+        ids[i] = ((i * 3 + 1) % 8) as i32;
+    }
+    let mut buf: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        buf[i] = i as f32;
+    }
+    gather(buf, buf, ids);
+    for i in 0..16 {
+        print(buf[i] as i32);
+    }
+    return 0;
+}
