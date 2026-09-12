@@ -3797,7 +3797,7 @@ impl FnLowerer<'_> {
             }
             Ty::Named(sym) => self.struct_size(*sym),
             Ty::Array { elem, len, .. } => Some(self.ty_size(elem)? * len),
-            Ty::Tuple(fields) => self.aggregate_layout(fields).map(|(_, size, _)| size),
+            Ty::Tuple(fields) => self.aggregate_extent(fields, |_| {}).map(|(size, _)| size),
             _ => ty.size_of(),
         }
     }
@@ -3828,19 +3828,34 @@ impl FnLowerer<'_> {
     /// layout authority shared by structs and tuples (the same `round_up` accumulation as
     /// `Ty::size_of`, but registry-aware so a named-struct field is sized recursively). `None` if any
     /// field is genuinely unsized (a slice/tensor/unresolved name).
-    fn aggregate_layout(&self, fields: &[Ty]) -> Option<(Vec<u64>, u64, u64)> {
-        let mut offsets = Vec::with_capacity(fields.len());
+    fn aggregate_layout<'t>(
+        &self,
+        fields: impl IntoIterator<Item = &'t Ty>,
+    ) -> Option<(Vec<u64>, u64, u64)> {
+        let fields = fields.into_iter();
+        let mut offsets = Vec::with_capacity(fields.size_hint().0);
+        let (size, align) = self.aggregate_extent(fields, |off| offsets.push(off))?;
+        Some((offsets, size, align))
+    }
+
+    /// Walk the shared aggregate layout without requiring an offsets allocation. Size-only
+    /// queries pass a no-op visitor; field queries collect the offsets they actually need.
+    fn aggregate_extent<'t>(
+        &self,
+        fields: impl IntoIterator<Item = &'t Ty>,
+        mut field_offset: impl FnMut(u64),
+    ) -> Option<(u64, u64)> {
         let mut size = 0u64;
         let mut align = 1u64;
         for f in fields {
             let fa = self.ty_align(f)?;
             let fs = self.ty_size(f)?;
             size = round_up(size, fa);
-            offsets.push(size);
+            field_offset(size);
             size += fs;
             align = align.max(fa);
         }
-        Some((offsets, round_up(size, align), align))
+        Some((round_up(size, align), align))
     }
 
     /// The field layout of a declared struct: `(field name, byte offset, field MIR type)` in
@@ -3851,8 +3866,7 @@ impl FnLowerer<'_> {
         let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
             return None;
         };
-        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
-        let (offsets, _, _) = self.aggregate_layout(&tys)?;
+        let (offsets, _, _) = self.aggregate_layout(fields.iter().map(|(_, t)| t))?;
         Some(
             fields
                 .iter()
@@ -3869,9 +3883,14 @@ impl FnLowerer<'_> {
         let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
             return None;
         };
-        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
-        let (offsets, _, _) = self.aggregate_layout(&tys)?;
-        Some(tys.into_iter().zip(offsets).map(|(t, o)| (o, t)).collect())
+        let (offsets, _, _) = self.aggregate_layout(fields.iter().map(|(_, t)| t))?;
+        Some(
+            fields
+                .iter()
+                .zip(offsets)
+                .map(|((_, t), off)| (off, t.clone()))
+                .collect(),
+        )
     }
 
     /// Total padded byte size of a declared struct (its alloca size), registry-aware.
@@ -3879,8 +3898,8 @@ impl FnLowerer<'_> {
         let DefKind::Struct(fields) = &self.sema.defs.lookup(name)?.kind else {
             return None;
         };
-        let tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
-        self.aggregate_layout(&tys).map(|(_, size, _)| size)
+        self.aggregate_extent(fields.iter().map(|(_, t)| t), |_| {})
+            .map(|(size, _)| size)
     }
 
     /// Alignment of a declared struct (the max field alignment), registry-aware.
@@ -4353,12 +4372,10 @@ impl FnLowerer<'_> {
             }
             Ty::Tuple(fields) => {
                 if let Some((offsets, _, _)) = self.aggregate_layout(fields) {
-                    let pairs: Vec<(u64, Ty)> =
-                        offsets.into_iter().zip(fields.iter().cloned()).collect();
-                    for (off, fty) in pairs {
+                    for (off, fty) in offsets.into_iter().zip(fields) {
                         let s = self.field_ptr(src, off);
                         let d = self.field_ptr(dst, off);
-                        self.emit_copy(d, s, &fty);
+                        self.emit_copy(d, s, fty);
                     }
                 }
             }
