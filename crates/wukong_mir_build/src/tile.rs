@@ -248,45 +248,63 @@ impl FnLowerer<'_> {
             return false;
         }
 
-        let sty = self.expr_mir(start);
-        let ety = self.expr_mir(end);
-        let (ity, signed) = if ety.is_int()
-            && sty.is_int()
-            && crate::mir_byte_size(&ety) > crate::mir_byte_size(&sty)
-        {
-            (ety.clone(), self.signed(end))
-        } else {
-            (
-                sty.clone(),
-                self.signed(start) && !self.forces_unsigned_cmp(end, &sty),
-            )
-        };
+        let (ity, signed) = self.range_counter_type(start, end);
+        if !ity.is_int() || !self.expr_mir(start).is_int() || !self.expr_mir(end).is_int() {
+            push_unique(
+                self.diags,
+                tile_error(
+                    start.span,
+                    "`@tile` requires integer range bounds",
+                    "this range has a non-integer counter",
+                ),
+            );
+            return false;
+        }
 
-        let tile_ty = ity.clone();
+        // A tile is a u64 count, independent of the source counter width. Narrowing it to that
+        // width could turn @tile(256) on u8 into division by zero, or a positive width into a
+        // negative divisor. Keep the full count and the inner offset unsigned through division.
+        let tile_ty = MirType::I64;
         let tile_const = self
             .builder
             .build(tile_ty.clone(), Op::ConstInt(b, tile_ty.clone()));
+        let tile_offset = self.coerce_to(tile_const, &tile_ty, &ity, false);
 
-        let start_raw = self.lower_expr(start);
-        let start_val = self.coerce_to(start_raw, &sty, &ity, signed);
-        let end_raw = self.lower_expr(end);
-        let end_val = self.coerce_to(end_raw, &ety, &ity, signed);
+        let start_val = self.lower_range_bound(start, &ity);
+        let end_val = self.lower_range_bound(end, &ity);
+        let exit = self.builder.new_block();
+        let nonempty = self.builder.new_block();
+        let ordered = self.builder.build(
+            MirType::I1,
+            Op::Cmp(
+                if signed { CmpOp::Slt } else { CmpOp::Ult },
+                start_val,
+                end_val,
+            ),
+        );
+        self.builder
+            .cond_br(ordered, nonempty, vec![], exit, vec![]);
+        self.builder.switch_to(nonempty);
+        self.terminated = false;
 
-        let len = self
+        // Once start < end in the counter's ordering, the modular difference interpreted as
+        // unsigned is their exact positive distance, including signed ranges spanning zero.
+        // A signed difference could overflow even when both endpoints are representable.
+        let len_bits = self
             .builder
             .build(ity.clone(), Op::Bin(BinOp::Sub, end_val, start_val));
-        let div_op = if signed { BinOp::SDiv } else { BinOp::UDiv };
+        let len = self.coerce_to(len_bits, &ity, &tile_ty, false);
         let quot = self
             .builder
-            .build(ity.clone(), Op::Bin(div_op, len, tile_const));
-        let full = self
+            .build(tile_ty.clone(), Op::Bin(BinOp::UDiv, len, tile_const));
+        let full_wide = self
             .builder
-            .build(ity.clone(), Op::Bin(BinOp::Mul, quot, tile_const));
+            .build(tile_ty.clone(), Op::Bin(BinOp::Mul, quot, tile_const));
+        let full = self.coerce_to(full_wide, &tile_ty, &ity, false);
         let full_end = self
             .builder
             .build(ity.clone(), Op::Bin(BinOp::Add, start_val, full));
 
-        let exit = self.builder.new_block();
         let after_tiles = self.builder.new_block();
 
         // --- Full tiles ---------------------------------------------------------
@@ -337,10 +355,9 @@ impl FnLowerer<'_> {
         let ii = self
             .builder
             .build(tile_ty.clone(), Op::Load(ii_slot, tile_ty.clone()));
-        let inner_ok = self.builder.build(
-            MirType::I1,
-            Op::Cmp(if signed { CmpOp::Slt } else { CmpOp::Ult }, ii, tile_const),
-        );
+        let inner_ok = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Ult, ii, tile_const));
         self.builder
             .cond_br(inner_ok, inner_body, vec![], outer_step, vec![]);
 
@@ -354,9 +371,10 @@ impl FnLowerer<'_> {
         let ii_v = self
             .builder
             .build(tile_ty.clone(), Op::Load(ii_slot, tile_ty.clone()));
+        let ii_offset = self.coerce_to(ii_v, &tile_ty, &ity, false);
         let i_val = self
             .builder
-            .build(ity.clone(), Op::Bin(BinOp::Add, io_v, ii_v));
+            .build(ity.clone(), Op::Bin(BinOp::Add, io_v, ii_offset));
         let i_slot = self.builder.alloca(ity.clone());
         self.builder.build_void(Op::Store {
             ptr: i_slot,
@@ -405,7 +423,7 @@ impl FnLowerer<'_> {
             .build(ity.clone(), Op::Load(io_slot, ity.clone()));
         let io_next = self
             .builder
-            .build(ity.clone(), Op::Bin(BinOp::Add, io_cur, tile_const));
+            .build(ity.clone(), Op::Bin(BinOp::Add, io_cur, tile_offset));
         self.builder.build_void(Op::Store {
             ptr: io_slot,
             value: io_next,
