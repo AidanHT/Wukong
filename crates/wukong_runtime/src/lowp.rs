@@ -545,6 +545,38 @@ fn par_chunk_reduce(
     acc
 }
 
+/// Select the ISA before calling this helper, so workers invoke the selected kernel directly.
+/// Short inputs retain the public entries' flat result, without an extra identity fold.
+#[inline]
+fn par_half_reduce(
+    x: &[u16],
+    ident: f32,
+    per_chunk: impl Fn(&[u16]) -> f32 + Sync,
+    combine: impl Fn(f32, f32) -> f32,
+) -> f32 {
+    if x.len() <= crate::reduce::RCHUNK {
+        return per_chunk(x);
+    }
+    par_chunk_reduce(x.len(), ident, |lo, hi| per_chunk(&x[lo..hi]), combine)
+}
+
+#[inline]
+fn par_half_dot(
+    x: &[u16],
+    y: &[u16],
+    per_chunk: impl Fn(&[u16], &[u16]) -> f32 + Sync,
+) -> f32 {
+    if x.len() <= crate::reduce::RCHUNK {
+        return per_chunk(x, y);
+    }
+    par_chunk_reduce(
+        x.len(),
+        0.0,
+        |lo, hi| per_chunk(&x[lo..hi], &y[lo..hi]),
+        |a, b| a + b,
+    )
+}
+
 /// Multicore bf16 sum — the `@parallel` twin of [`wukong_sum_bf16`]. Each fixed chunk is summed by the
 /// serial kernel and the partials added ascending, so the result is deterministic (interp == native).
 ///
@@ -555,16 +587,16 @@ pub unsafe extern "C" fn wukong_sum_bf16_parallel(x: *const u16, n: i64) -> f32 
     if n <= 0 {
         return 0.0;
     }
-    let n = n as usize;
-    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
-        return wukong_sum_bf16(x, n as i64);
+    let x = std::slice::from_raw_parts(x, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: feature detected once; borrowed chunks are read-only valid subslices.
+        return par_half_reduce(x, 0.0, |chunk| sum_bf16_avx(chunk), |a, b| a + b);
     }
-    let xa = x as usize;
-    par_chunk_reduce(
-        n,
+    par_half_reduce(
+        x,
         0.0,
-        // SAFETY: disjoint read-only chunk; `x` valid for `n` u16 by contract.
-        |lo, hi| unsafe { wukong_sum_bf16((xa as *const u16).add(lo), (hi - lo) as i64) },
+        |chunk| sum_scalar(Half::Bf16, chunk),
         |a, b| a + b,
     )
 }
@@ -578,16 +610,16 @@ pub unsafe extern "C" fn wukong_sum_f16_parallel(x: *const u16, n: i64) -> f32 {
     if n <= 0 {
         return 0.0;
     }
-    let n = n as usize;
-    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
-        return wukong_sum_f16(x, n as i64);
+    let x = std::slice::from_raw_parts(x, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
+        // SAFETY: features detected once; borrowed chunks are read-only valid subslices.
+        return par_half_reduce(x, 0.0, |chunk| sum_f16_avx(chunk), |a, b| a + b);
     }
-    let xa = x as usize;
-    par_chunk_reduce(
-        n,
+    par_half_reduce(
+        x,
         0.0,
-        // SAFETY: disjoint read-only chunk; `x` valid for `n` u16 by contract.
-        |lo, hi| unsafe { wukong_sum_f16((xa as *const u16).add(lo), (hi - lo) as i64) },
+        |chunk| sum_scalar(Half::F16, chunk),
         |a, b| a + b,
     )
 }
@@ -601,24 +633,14 @@ pub unsafe extern "C" fn wukong_dot_bf16_parallel(x: *const u16, y: *const u16, 
     if n <= 0 {
         return 0.0;
     }
-    let n = n as usize;
-    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
-        return wukong_dot_bf16(x, y, n as i64);
+    let x = std::slice::from_raw_parts(x, n as usize);
+    let y = std::slice::from_raw_parts(y, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        // SAFETY: features detected once; x/y may overlap because both are read-only.
+        return par_half_dot(x, y, |xc, yc| dot_bf16_avx(xc, yc));
     }
-    let (xa, ya) = (x as usize, y as usize);
-    par_chunk_reduce(
-        n,
-        0.0,
-        // SAFETY: disjoint read-only chunks; `x`/`y` valid for `n` u16 by contract.
-        |lo, hi| unsafe {
-            wukong_dot_bf16(
-                (xa as *const u16).add(lo),
-                (ya as *const u16).add(lo),
-                (hi - lo) as i64,
-            )
-        },
-        |a, b| a + b,
-    )
+    par_half_dot(x, y, |xc, yc| dot_scalar(Half::Bf16, xc, yc))
 }
 
 /// Multicore IEEE-f16 dot — the `@parallel` twin of [`wukong_dot_f16`].
@@ -630,24 +652,14 @@ pub unsafe extern "C" fn wukong_dot_f16_parallel(x: *const u16, y: *const u16, n
     if n <= 0 {
         return 0.0;
     }
-    let n = n as usize;
-    if n.div_ceil(crate::reduce::RCHUNK) < 2 {
-        return wukong_dot_f16(x, y, n as i64);
+    let x = std::slice::from_raw_parts(x, n as usize);
+    let y = std::slice::from_raw_parts(y, n as usize);
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
+        // SAFETY: features detected once; x/y may overlap because both are read-only.
+        return par_half_dot(x, y, |xc, yc| dot_f16_avx(xc, yc));
     }
-    let (xa, ya) = (x as usize, y as usize);
-    par_chunk_reduce(
-        n,
-        0.0,
-        // SAFETY: disjoint read-only chunks; `x`/`y` valid for `n` u16 by contract.
-        |lo, hi| unsafe {
-            wukong_dot_f16(
-                (xa as *const u16).add(lo),
-                (ya as *const u16).add(lo),
-                (hi - lo) as i64,
-            )
-        },
-        |a, b| a + b,
-    )
+    par_half_dot(x, y, |xc, yc| dot_scalar(Half::F16, xc, yc))
 }
 
 /// Multicore bf16 max-family reduction (`RED_MAX`/`RED_MIN`/`RED_MAXABS`) — the `@parallel` twin of
