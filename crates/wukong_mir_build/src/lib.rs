@@ -4639,10 +4639,22 @@ impl FnLowerer<'_> {
 
     /// Lower a source bound using the emitted operand width, which can exceed sema's width for
     /// a reference to an enclosing range counter. This does not evaluate a bound speculatively.
-    fn lower_range_bound(&mut self, bound: &Expr, target: &MirType) -> ValueId {
+    fn lower_range_bound(
+        &mut self,
+        bound: &Expr,
+        target: &MirType,
+        counter_signed: bool,
+    ) -> ValueId {
         let value = self.lower_expr(bound);
         let from = self.operand_mir(value, bound);
-        self.coerce_to(value, &from, target, self.signed(bound))
+        // Sema still accepts noninteger range operands. Preserve the scalar destination's
+        // float-to-integer conversion; only integer widening follows the source signedness.
+        let signed = if from.is_float() && target.is_int() {
+            counter_signed
+        } else {
+            self.signed(bound)
+        };
+        self.coerce_to(value, &from, target, signed)
     }
 
     /// The length-based runtime ABI has signed i64 counts. Narrow integer counters fit after
@@ -4650,7 +4662,9 @@ impl FnLowerer<'_> {
     /// are also representable; other domains retain ordinary loop lowering until proved safe.
     fn kernel_range_supported(&self, start: &Expr, end: &Expr) -> bool {
         let (ity, signed) = self.range_counter_type(start, end);
-        ity.is_int()
+        self.expr_mir(start).is_int()
+            && self.expr_mir(end).is_int()
+            && ity.is_int()
             && (mir_byte_size(&ity) < 8
                 || (ity == MirType::I64 && signed && as_int_lit(start, self.interner) == Some(0)))
     }
@@ -4662,9 +4676,9 @@ impl FnLowerer<'_> {
             return None;
         }
         let (ity, signed) = self.range_counter_type(start, end);
-        let s = self.lower_range_bound(start, &ity);
+        let s = self.lower_range_bound(start, &ity, signed);
         let s = self.coerce_to(s, &ity, &MirType::I64, signed);
-        let e = self.lower_range_bound(end, &ity);
+        let e = self.lower_range_bound(end, &ity, signed);
         let e = self.coerce_to(e, &ity, &MirType::I64, signed);
         Some((s, e))
     }
@@ -8854,7 +8868,7 @@ impl FnLowerer<'_> {
             return false;
         };
         let (common, signed) = self.range_counter_type(lhs, rhs);
-        if !ity.is_int() || common != ity || !signed {
+        if !ity.is_int() || !self.expr_mir(rhs).is_int() || common != ity || !signed {
             return false;
         }
         // The last statement must be the unit increment; strip it for the for-body.
@@ -8880,7 +8894,7 @@ impl FnLowerer<'_> {
         let start_val = self
             .builder
             .build(ity.clone(), Op::Load(islot, ity.clone()));
-        let end_val = self.lower_range_bound(rhs, &ity);
+        let end_val = self.lower_range_bound(rhs, &ity, signed);
         let ok = self.try_vectorize_ranged(i, start_val, end_val, &ity, &stripped);
         debug_assert!(ok, "a vectorizable body must vectorize");
         // Restore `i` to the value the while would have left: `N` if it ran (`start < N`), else the
@@ -12026,7 +12040,7 @@ impl FnLowerer<'_> {
 
         // i = start
         let slot = self.builder.alloca(ity.clone());
-        let s0 = self.lower_range_bound(start, &ity);
+        let s0 = self.lower_range_bound(start, &ity, signed);
         self.builder.build_void(Op::Store {
             ptr: slot,
             value: s0,
@@ -12051,7 +12065,7 @@ impl FnLowerer<'_> {
         self.builder.switch_to(header);
         self.terminated = false;
         let i_val = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-        let end_val = self.lower_range_bound(end, &ity);
+        let end_val = self.lower_range_bound(end, &ity, signed);
         let pred = match (inclusive, signed) {
             (false, true) => CmpOp::Slt,
             (true, true) => CmpOp::Sle,
@@ -12081,7 +12095,8 @@ impl FnLowerer<'_> {
         self.terminated = false;
         let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
         let step_val = match step {
-            Some(st) => self.lower_range_bound(st, &ity),
+            Some(st) if self.expr_mir(st).is_int() => self.lower_range_bound(st, &ity, signed),
+            Some(st) => self.lower_expr(st),
             None => self
                 .builder
                 .build(ity.clone(), Op::ConstInt(1, ity.clone())),
@@ -14776,7 +14791,7 @@ impl FnLowerer<'_> {
             _ => return false,
         };
         let (ity, signed) = self.range_counter_type(start, end);
-        if !ity.is_int() {
+        if !ity.is_int() || !self.expr_mir(start).is_int() || !self.expr_mir(end).is_int() {
             return false;
         }
         // The five arms below are kernel *recognizers* that happen to be probed from here (they all
@@ -14833,8 +14848,8 @@ impl FnLowerer<'_> {
             return false;
         }
         // Lower the bounds (coerced to the index type) and hand off to the matching emitter.
-        let s0 = self.lower_range_bound(start, &ity);
-        let e0 = self.lower_range_bound(end, &ity);
+        let s0 = self.lower_range_bound(start, &ity, signed);
+        let e0 = self.lower_range_bound(end, &ity, signed);
         if let Some((s_sym, addend, lane, w, redop)) = reduction {
             // A compile-time-known trip (literal `for i in A..B`) lets the 256-bit reduction gate on
             // size; a runtime bound stays `None` and keeps the 128-bit path (see
