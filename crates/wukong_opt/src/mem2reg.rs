@@ -411,9 +411,32 @@ impl Rename<'_> {
         vars.into_iter().map(|var| self.current_def(var)).collect()
     }
 
-    fn visit(&mut self, f: &Function, block: u32) {
+    fn visit(&mut self, f: &Function, entry: u32) {
+        // Keep one undo log for definitions introduced along the active dominator path. An
+        // explicit DFS stack avoids using the compiler's call stack for arbitrary CFG depth.
         let mut pushed: Vec<u32> = Vec::new();
+        self.enter(f, entry, &mut pushed);
+        let mut scopes = vec![(entry, 0usize, 0usize)];
+        while let Some((block, next_child, pushed_start)) = scopes.last_mut() {
+            if let Some(&child) = self.children[*block as usize].get(*next_child) {
+                *next_child += 1;
+                let start = pushed.len();
+                self.enter(f, child, &mut pushed);
+                scopes.push((child, 0, start));
+            } else {
+                // Reverse insertion order preserves the reaching-definition stack for slots
+                // written more than once in a block, then exposes the parent's definitions.
+                for var in pushed.drain(*pushed_start..).rev() {
+                    if let Some(s) = self.stack.get_mut(&var) {
+                        s.pop();
+                    }
+                }
+                scopes.pop();
+            }
+        }
+    }
 
+    fn enter(&mut self, f: &Function, block: u32, pushed: &mut Vec<u32>) {
         // (a) Phi definitions provided by this block.
         if let Some(phis) = self.block_phis.get(&block) {
             for &(pv, var) in phis {
@@ -463,18 +486,6 @@ impl Rename<'_> {
                 }
             }
             _ => {}
-        }
-
-        // (d) Recurse into dominator-tree children.
-        for &c in &self.children[block as usize] {
-            self.visit(f, c);
-        }
-
-        // (e) Pop the definitions introduced in this block.
-        for var in pushed.into_iter().rev() {
-            if let Some(s) = self.stack.get_mut(&var) {
-                s.pop();
-            }
         }
     }
 }
