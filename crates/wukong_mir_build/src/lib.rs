@@ -4624,6 +4624,53 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Range comparisons use a common width, but each bound must widen according to its own
+    /// signedness. In particular, `0i32..200u8` compares against 200, not sign-extended -56.
+    fn range_counter_type(&self, start: &Expr, end: &Expr) -> (MirType, bool) {
+        let sty = self.expr_mir(start);
+        let ety = self.expr_mir(end);
+        if ety.is_int() && sty.is_int() && mir_byte_size(&ety) > mir_byte_size(&sty) {
+            (ety, self.signed(end))
+        } else {
+            let signed = self.signed(start) && !self.forces_unsigned_cmp(end, &sty);
+            (sty, signed)
+        }
+    }
+
+    /// Lower a source bound using the emitted operand width, which can exceed sema's width for
+    /// a reference to an enclosing range counter. This does not evaluate a bound speculatively.
+    fn lower_range_bound(&mut self, bound: &Expr, target: &MirType) -> ValueId {
+        let value = self.lower_expr(bound);
+        let from = self.operand_mir(value, bound);
+        self.coerce_to(value, &from, target, self.signed(bound))
+    }
+
+    /// The length-based runtime ABI has signed i64 counts. Narrow integer counters fit after
+    /// promotion with their comparison signedness. For i64 counters, zero-based signed ranges
+    /// are also representable; other domains retain ordinary loop lowering until proved safe.
+    fn kernel_range_supported(&self, start: &Expr, end: &Expr) -> bool {
+        let (ity, signed) = self.range_counter_type(start, end);
+        ity.is_int()
+            && (mir_byte_size(&ity) < 8
+                || (ity == MirType::I64
+                    && signed
+                    && as_int_lit(start, self.interner) == Some(0)))
+    }
+
+    /// Convert through the scalar loop's common type before widening to the kernel ABI. This
+    /// also preserves mixed-sign narrow comparisons, such as `0u8..-1i8` ending at unsigned 255.
+    fn lower_kernel_range(&mut self, start: &Expr, end: &Expr) -> Option<(ValueId, ValueId)> {
+        if !self.kernel_range_supported(start, end) {
+            return None;
+        }
+        let (ity, signed) = self.range_counter_type(start, end);
+        let s = self.lower_range_bound(start, &ity);
+        let s = self.coerce_to(s, &ity, &MirType::I64, signed);
+        let e = self.lower_range_bound(end, &ity);
+        let e = self.coerce_to(e, &ity, &MirType::I64, signed);
+        Some((s, e))
+    }
+
     /// Whether `e` forces an ordered comparison performed in `common` to use an **unsigned**
     /// predicate: it is an unsigned integer operand exactly as wide as `common`.
     ///
@@ -10583,9 +10630,9 @@ impl FnLowerer<'_> {
         let Some(xv) = self.kernel_base_ptr(xb) else {
             return false;
         };
-        let n_ty = self.expr_mir(end);
-        let n = self.lower_expr(end);
-        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        let Some((_, n)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         let opv = self
             .builder
             .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
@@ -10702,9 +10749,9 @@ impl FnLowerer<'_> {
         let (Some(xv), Some(yv)) = (self.kernel_base_ptr(xb), self.kernel_base_ptr(yb)) else {
             return false;
         };
-        let n_ty = self.expr_mir(end);
-        let n = self.lower_expr(end);
-        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        let Some((_, n)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         let opv = self
             .builder
             .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
@@ -11103,9 +11150,9 @@ impl FnLowerer<'_> {
         };
         let av = coef(a_expr);
         let bv = coef(b_expr);
-        let n_ty = self.expr_mir(end);
-        let n = self.lower_expr(end);
-        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        let Some((_, n)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         self.builder.build_void(Op::Call {
             func: if is_f16 {
                 self.gemm.axpby_f16
@@ -11165,9 +11212,9 @@ impl FnLowerer<'_> {
         };
         let av = coef(a_expr);
         let bv = coef(b_expr);
-        let n_ty = self.expr_mir(end);
-        let n = self.lower_expr(end);
-        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        let Some((_, n)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         self.builder.build_void(Op::Call {
             func: if is_f16 {
                 self.gemm.axpby_f16_out
@@ -11287,9 +11334,9 @@ impl FnLowerer<'_> {
         let Some([outv, xv]) = self.kernel_base_ptrs([out, x]) else {
             return false;
         };
-        let n_ty = self.expr_mir(end);
-        let n = self.lower_expr(end);
-        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        let Some((_, n)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         let opv = self
             .builder
             .build(MirType::I64, Op::ConstInt(opcode as i128, MirType::I64));
@@ -11347,9 +11394,9 @@ impl FnLowerer<'_> {
         let (Some(xv), Some(yv)) = (self.kernel_base_ptr(xb), self.kernel_base_ptr(yb)) else {
             return false;
         };
-        let n_ty = self.expr_mir(end);
-        let n = self.lower_expr(end);
-        let n = self.coerce_to(n, &n_ty, &MirType::I64, true);
+        let Some((_, n)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         // Pick the kernel by op and precision: additive dot/sum have dedicated symbols; the max-family
         // routes through the op-coded reduce kernel. f16 uses the F16C twins, bf16 the `<<16` ones.
         // Inside a `@parallel` function the multicore `_parallel` twin fires instead (same ABI, a
@@ -11922,21 +11969,7 @@ impl FnLowerer<'_> {
         // (Only the *scalar* loop hit this: an array loop vectorizes this away, so the bug surfaced
         // only on the tensor-param path, which the vectorizer declines.) The body's index arithmetic
         // widens with the counter. The `@parallel` range path already drives by the end's type.
-        let sty = self.expr_mir(start);
-        let ety = self.expr_mir(end);
-        let (ity, signed) =
-            if ety.is_int() && sty.is_int() && mir_byte_size(&ety) > mir_byte_size(&sty) {
-                (ety.clone(), self.signed(end))
-            } else {
-                // The counter's signedness must consider BOTH bounds (see `forces_unsigned_cmp`).
-                // Reading it off the START alone drove `for i in 0..n` with `n: u32 = 3_000_000_000`
-                // as `cmp.slt i, -1294967296`, so the loop ran zero iterations; the `u64` form was
-                // right only because its end is strictly wider and takes the branch above.
-                (
-                    sty.clone(),
-                    self.signed(start) && !self.forces_unsigned_cmp(end, &sty),
-                )
-            };
+        let (ity, signed) = self.range_counter_type(start, end);
 
         // argmax/argmin: `for k in 0..n { if x[k] CMP bv { bv = x[k]; bi = k } }` → one deterministic
         // `wukong_argreduce_f32` call + a branchless reconcile. Tried before the vectorizer (which
@@ -11978,8 +12011,7 @@ impl FnLowerer<'_> {
 
         // i = start
         let slot = self.builder.alloca(ity.clone());
-        let s0 = self.lower_expr(start);
-        let s0 = self.coerce_to(s0, &sty, &ity, signed);
+        let s0 = self.lower_range_bound(start, &ity);
         self.builder.build_void(Op::Store {
             ptr: slot,
             value: s0,
@@ -12004,8 +12036,7 @@ impl FnLowerer<'_> {
         self.builder.switch_to(header);
         self.terminated = false;
         let i_val = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
-        let end_val = self.lower_expr(end);
-        let end_val = self.coerce_to(end_val, &ety, &ity, signed);
+        let end_val = self.lower_range_bound(end, &ity);
         let pred = match (inclusive, signed) {
             (false, true) => CmpOp::Slt,
             (true, true) => CmpOp::Sle,
@@ -12035,7 +12066,7 @@ impl FnLowerer<'_> {
         self.terminated = false;
         let cur = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
         let step_val = match step {
-            Some(st) => self.lower_expr(st),
+            Some(st) => self.lower_range_bound(st, &ity),
             None => self
                 .builder
                 .build(ity.clone(), Op::ConstInt(1, ity.clone())),
@@ -13364,12 +13395,9 @@ impl FnLowerer<'_> {
             return false;
         };
         // Bounds GEP each base by the start index, so a loop from `lo` begins at element `lo`.
-        let sty = self.expr_mir(start);
-        let s = self.lower_expr(start);
-        let s = self.coerce_to(s, &sty, &MirType::I64, true);
-        let ety = self.expr_mir(end);
-        let e = self.lower_expr(end);
-        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        let Some((s, e)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         self.emit_vmath_calls(s, e, calls);
         true
     }
@@ -13840,12 +13868,9 @@ impl FnLowerer<'_> {
         let Some(calls) = self.match_vmath2_body(j, body) else {
             return false;
         };
-        let sty = self.expr_mir(start);
-        let s = self.lower_expr(start);
-        let s = self.coerce_to(s, &sty, &MirType::I64, true);
-        let ety = self.expr_mir(end);
-        let e = self.lower_expr(end);
-        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        let Some((s, e)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         self.emit_vmath2_calls(s, e, calls);
         true
     }
@@ -14186,12 +14211,9 @@ impl FnLowerer<'_> {
         let Some(plan) = self.match_velem_body(j, body) else {
             return false;
         };
-        let sty = self.expr_mir(start);
-        let s = self.lower_expr(start);
-        let s = self.coerce_to(s, &sty, &MirType::I64, true);
-        let ety = self.expr_mir(end);
-        let e = self.lower_expr(end);
-        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        let Some((s, e)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         self.emit_velem_call(s, e, &plan);
         true
     }
@@ -14375,12 +14397,9 @@ impl FnLowerer<'_> {
         let Some(plan) = self.match_dequant_body(j, body) else {
             return false;
         };
-        let sty = self.expr_mir(start);
-        let s = self.lower_expr(start);
-        let s = self.coerce_to(s, &sty, &MirType::I64, true);
-        let ety = self.expr_mir(end);
-        let e = self.lower_expr(end);
-        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        let Some((s, e)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         self.emit_dequant_call(s, e, &plan)
     }
 
@@ -14714,12 +14733,9 @@ impl FnLowerer<'_> {
         let Some((out_base, x_base, coeffs)) = self.match_vhorner_body(j, body) else {
             return false;
         };
-        let sty = self.expr_mir(start);
-        let s = self.lower_expr(start);
-        let s = self.coerce_to(s, &sty, &MirType::I64, true);
-        let ety = self.expr_mir(end);
-        let e = self.lower_expr(end);
-        let e = self.coerce_to(e, &ety, &MirType::I64, true);
+        let Some((s, e)) = self.lower_kernel_range(start, end) else {
+            return false;
+        };
         self.emit_vhorner(s, e, out_base, x_base, &coeffs)
     }
 
