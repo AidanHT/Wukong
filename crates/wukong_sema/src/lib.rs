@@ -3942,7 +3942,14 @@ fn int_literal_well_formed(text: &str) -> bool {
             break;
         }
     }
-    let body = s.replace('_', "");
+    // Keep separator-free spellings borrowed, as the parser's extent decoder does.
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
     let (digits, radix): (&str, u32) =
         if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
             (h, 16)
@@ -3951,7 +3958,7 @@ fn int_literal_well_formed(text: &str) -> bool {
         } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
             (b, 2)
         } else {
-            (&body, 10)
+            (body, 10)
         };
     !digits.is_empty()
         && (i64::from_str_radix(digits, radix).is_ok()
@@ -3973,7 +3980,14 @@ fn float_literal_well_formed(text: &str) -> bool {
             break;
         }
     }
-    let body = s.replace('_', "");
+    // Keep separator-free spellings borrowed, as the parser's extent decoder does.
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
     !body.is_empty() && body.parse::<f64>().is_ok()
 }
 
@@ -4029,7 +4043,14 @@ fn parse_int_text(text: &str) -> Option<i64> {
             break;
         }
     }
-    let body = s.replace('_', "");
+    // Keep separator-free spellings borrowed, as the parser's extent decoder does.
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
     let v = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         i64::from_str_radix(h, 16)
     } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
@@ -4062,7 +4083,14 @@ pub(crate) fn parse_u64_text(text: &str) -> Option<u64> {
             break;
         }
     }
-    let body = s.replace('_', "");
+    // Keep separator-free spellings borrowed, as the parser's extent decoder does.
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
     if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         u64::from_str_radix(h, 16).ok()
     } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {

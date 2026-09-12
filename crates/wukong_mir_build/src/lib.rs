@@ -28722,7 +28722,14 @@ fn parse_int(text: &str) -> i128 {
             break;
         }
     }
-    let body = s.replace('_', "");
+    // Ordinary literal spellings can be parsed directly from the interned source slice.
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
     let val = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         i128::from_str_radix(h, 16)
     } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
@@ -28758,7 +28765,14 @@ fn parse_float(text: &str) -> f64 {
     // Strip digit-group separators before parsing: a `_` makes Rust's float `parse()` return Err, and
     // the `unwrap_or(0.0)` fallback then silently turned a valid literal like `1_000.5` into 0.0 — a
     // gate-blind wrong value (both backends agreed on 0.0). The integer path already strips `_`.
-    core.replace('_', "").parse().unwrap_or(0.0)
+    let normalized;
+    let body = if core.contains('_') {
+        normalized = core.replace('_', "");
+        normalized.as_str()
+    } else {
+        core
+    };
+    body.parse().unwrap_or(0.0)
 }
 
 /// Decode a char literal's raw source text (including the surrounding single quotes) into its
