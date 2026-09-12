@@ -168,22 +168,25 @@ impl<'a> Vjp<'a> {
     /// *different* buffer-adjoint entries and the gradient chain silently breaks between the ops. A
     /// non-zero-offset gep is a genuine sub-slice and is left alone. Dim/op-code operands are constants
     /// (not geps), so canonicalizing the whole argument list is a no-op for them.
-    fn canon(&self, v: ValueId) -> ValueId {
-        if let Some(Op::Gep { ptr, index, .. }) = self.def_op.get(&v) {
-            if self.is_const_zero(*index) {
-                return self.canon(*ptr);
+    fn canon(&self, mut v: ValueId) -> ValueId {
+        while let Some(Op::Gep { ptr, index, .. }) = self.def_op.get(&v) {
+            if !self.is_const_zero(*index) {
+                break;
             }
+            v = *ptr;
         }
         v
     }
 
     /// Whether `v` is the integer constant 0, tracing through the sign-/zero-extend casts lowering
     /// inserts on a loop index (`gep buf, sext(const.i32 0)` is still the buffer base).
-    fn is_const_zero(&self, v: ValueId) -> bool {
-        match self.def_op.get(&v) {
-            Some(Op::ConstInt(0, _)) => true,
-            Some(Op::Cast(_, inner, _)) => self.is_const_zero(*inner),
-            _ => false,
+    fn is_const_zero(&self, mut v: ValueId) -> bool {
+        loop {
+            match self.def_op.get(&v) {
+                Some(Op::ConstInt(0, _)) => return true,
+                Some(Op::Cast(_, inner, _)) => v = *inner,
+                _ => return false,
+            }
         }
     }
 
@@ -232,8 +235,13 @@ impl<'a> Vjp<'a> {
         // Normalize every buffer operand to its base alloca/param so the buffer-adjoint bookkeeping
         // is keyed consistently regardless of which whole-buffer pointer form lowering chose. (The
         // scalar `result` of a reduction is never a gep, so it needs no canonicalization.)
-        let args: Vec<ValueId> = raw_args.iter().map(|&a| self.canon(a)).collect();
-        let args = &args[..];
+        // The largest recognized ABI is velem's eight operands (see kernel_arity). Keep this
+        // short-lived normalization on the stack instead of allocating once per tape call.
+        let mut normalized = [ValueId(0); 8];
+        let args = &mut normalized[..want];
+        for (arg, &raw) in args.iter_mut().zip(raw_args) {
+            *arg = self.canon(raw);
+        }
         if func == self.syms.sreduce || func == self.syms.sreduce_parallel {
             self.diff_sreduce(args, result)
         } else if func == self.syms.sgemm_nt || func == self.syms.sgemm_nt_parallel {
