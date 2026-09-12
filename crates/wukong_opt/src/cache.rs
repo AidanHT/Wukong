@@ -104,10 +104,14 @@ impl CfgAnalyses {
         self.preds.as_ref().unwrap()
     }
 
-    /// Dominator-tree children, indexed by block id.
-    pub(crate) fn dom_children(&mut self, f: &Function) -> &[Vec<u32>] {
+    /// Dominator children and predecessors together, for forwarding facts across a unique edge.
+    pub(crate) fn children_and_preds(&mut self, f: &Function) -> (&[Vec<u32>], &[Vec<u32>]) {
         self.ensure_children(f);
-        self.children.as_ref().unwrap()
+        self.ensure_preds(f);
+        (
+            self.children.as_ref().unwrap(),
+            self.preds.as_ref().unwrap(),
+        )
     }
 
     /// Immediate dominators and predecessors together (LICM needs both live at once).
