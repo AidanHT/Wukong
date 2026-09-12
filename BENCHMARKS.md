@@ -847,6 +847,11 @@ within the session's run-to-run noise.
 
 ### Compile time — JIT/embedding latency (xbench) and the headline `compile-vs` comparison
 
+**Flag correction, 2026-09-12:** the historical runs below used Rust `-O` (optimization level 3).
+The harness incorrectly described that flag as level 2. It now invokes explicit `-C opt-level=2`
+alongside GCC/G++ `-O2`; this corrected configuration has not been measured. Preserve the historical
+flags when citing these numbers, and use one harness configuration for any baseline/candidate round.
+
 Two distinct measurements, labeled for what each is:
 
 **The headline compiler-to-compiler comparison is `compile-vs`** (`cargo run -p wukong_bench

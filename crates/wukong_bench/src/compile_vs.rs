@@ -8,7 +8,7 @@
 //!   wukongc:  <wukongc> --emit=obj -O2 k.wk -o out.o
 //!   gcc:       gcc -O2 -c k.c -o out.o
 //!   g++:       g++ -O2 -c k.cpp -o out.o
-//!   rustc:     rustc -O --crate-type=lib --emit=obj -A warnings k.rs -o out.o
+//!   rustc:     rustc -C opt-level=2 --crate-type=lib --emit=obj -A warnings k.rs -o out.o
 //!
 //! Each is compile-only (no link), producing an object from the same computation, so the numbers
 //! reflect the compilers' own work — front-end + optimizer + native codegen + process startup. That
@@ -23,8 +23,9 @@
 //! — which is the one asymmetry left, and it is printed under the table with the ratios rather than
 //! only recorded here. (Earlier versions gave C/C++ a `#include <stdio.h>` + `main`/`printf`
 //! harness, charging them a header-parse cost the .rs kernels never paid — flagged and fixed by the
-//! benchmark-fairness audit.) rustc keeps `-O` (= opt-level 2) because gcc/g++ compile at `-O2`:
-//! level 2 across the board is the symmetric choice for a *compile-time* measurement.
+//! benchmark-fairness audit.) rustc uses explicit `-C opt-level=2` alongside gcc/g++ `-O2`.
+//! Their level numbers do not guarantee equivalent optimization work; record the exact flags.
+//! Previously rustc used `-O` (level 3) while the output incorrectly described it as level 2.
 //!
 //! ```text
 //! cargo run -p wukong_bench --release -- compile-vs [path/to/wukongc]
@@ -103,7 +104,8 @@ pub fn report(wukongc: Option<PathBuf>) {
         let t_rc = have_rustc.then(|| {
             best_of(|| {
                 run(Command::new("rustc").args([
-                    "-O",
+                    "-C",
+                    "opt-level=2",
                     "--crate-type=lib",
                     "--emit=obj",
                     "-A",
@@ -131,7 +133,7 @@ pub fn report(wukongc: Option<PathBuf>) {
     println!(
         "ratios > 1.0 mean wukongc compiled the equivalent kernel that many times faster \
          (same run).\ncompile-only (no link); wukongc uses Cranelift (no LLVM), gcc/g++/rustc \
-         their own -O2 backend."
+         their own backend with the level-2 flags listed below."
     );
     // The fairness decision the ratios rest on, printed with the ratios. This table is what gets
     // pasted into BENCHMARKS.md and docs/metrics.md; from the numbers alone a reader cannot tell
@@ -141,7 +143,7 @@ pub fn report(wukongc: Option<PathBuf>) {
     println!(
         "peer sources are header-free bare translation units — no #include, no main — matching the \
          bare\n#[no_mangle] .rs kernels; the .wk arm is a full program with main + print. rustc uses \
-         -O\n(= opt-level 2) to match gcc/g++ -O2."
+         -C opt-level=2; gcc/g++ use -O2.\nMatching level numbers do not imply identical optimizer work."
     );
 }
 

@@ -209,16 +209,21 @@ against `cse`'s 979 suggest call-count, not per-call cost, is what put it on top
 
 ## 5. The reference comparison (why gcc/rustc -O2)
 
+**Correction, 2026-09-12:** previous runs invoked Rust `-O`, which selects level 3, while this
+section and the harness output incorrectly called it level 2. The harness now passes explicit
+`-C opt-level=2`. Historical timings below retain their original flags and are not measurements
+of the corrected configuration. No new compile-time measurements were run for this correction.
+
 `compile-vs` compiles an *equivalent* tensor kernel (GEMM / SAXPY / DOT) to an object with each of
-`wukongc --emit=obj -O2`, `gcc -O2 -c`, `g++ -O2 -c`, `rustc -O --emit=obj`. This is the right
+`wukongc --emit=obj -O2`, `gcc -O2 -c`, `g++ -O2 -c`, `rustc -C opt-level=2 --emit=obj`. This is the
 yardstick for a floor claim because:
 
 - **It is what a user waits for.** Each command is compile-only (no link), producing an object from
   the same computation, so the number reflects the compilers' own work: front-end + optimizer +
   native codegen + process startup. Startup + backend weight is exactly what a lean Cranelift path
   avoids, so including it is fair — it is user-visible latency.
-- **Level 2 across the board** is symmetric: gcc/g++ default the comparison to `-O2`, and rustc `-O`
-  is opt-level 2, so no compiler is charged a heavier optimizer than another.
+- **Explicit level-2 flags** make the chosen settings reproducible. Matching level numbers do not
+  establish that different compilers perform equivalent optimization work.
 - **Bare translation units.** The C/C++ kernels have no `#include` and no `main`, matching the bare
   `#[no_mangle]` Rust kernel, so none is charged a header-parse the others avoid (this was an actual
   fairness fix — see the benchmark-fairness audit in project memory).
