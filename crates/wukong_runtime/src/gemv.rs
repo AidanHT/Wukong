@@ -88,6 +88,54 @@ unsafe fn gemv_row_avx2(a: *const f32, x: *const f32, n: usize) -> f32 {
     s
 }
 
+/// Two adjacent rows sharing each loaded x vector. Each row retains the four accumulator chains,
+/// their reduction tree and the scalar-tail order of `gemv_row_avx2`.
+///
+/// # Safety
+/// `a` valid for `2*n` f32, `x` for `n`; AVX2 + FMA available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemv_pair_avx2(a: *const f32, x: *const f32, n: usize) -> (f32, f32) {
+    use std::arch::x86_64::*;
+    let b = a.add(n);
+    let (mut c0, mut c1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    let (mut c2, mut c3) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    let (mut d0, mut d1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    let (mut d2, mut d3) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    let mut j = 0;
+    while j + 32 <= n {
+        let x0 = _mm256_loadu_ps(x.add(j));
+        c0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(j)), x0, c0);
+        d0 = _mm256_fmadd_ps(_mm256_loadu_ps(b.add(j)), x0, d0);
+        let x1 = _mm256_loadu_ps(x.add(j + 8));
+        c1 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(j + 8)), x1, c1);
+        d1 = _mm256_fmadd_ps(_mm256_loadu_ps(b.add(j + 8)), x1, d1);
+        let x2 = _mm256_loadu_ps(x.add(j + 16));
+        c2 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(j + 16)), x2, c2);
+        d2 = _mm256_fmadd_ps(_mm256_loadu_ps(b.add(j + 16)), x2, d2);
+        let x3 = _mm256_loadu_ps(x.add(j + 24));
+        c3 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(j + 24)), x3, c3);
+        d3 = _mm256_fmadd_ps(_mm256_loadu_ps(b.add(j + 24)), x3, d3);
+        j += 32;
+    }
+    while j + 8 <= n {
+        let xv = _mm256_loadu_ps(x.add(j));
+        c0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(j)), xv, c0);
+        d0 = _mm256_fmadd_ps(_mm256_loadu_ps(b.add(j)), xv, d0);
+        j += 8;
+    }
+    let acc0 = _mm256_add_ps(_mm256_add_ps(c0, c1), _mm256_add_ps(c2, c3));
+    let acc1 = _mm256_add_ps(_mm256_add_ps(d0, d1), _mm256_add_ps(d2, d3));
+    let (mut s0, mut s1) = (hsum256(acc0), hsum256(acc1));
+    while j < n {
+        let xv = *x.add(j);
+        s0 += *a.add(j) * xv;
+        s1 += *b.add(j) * xv;
+        j += 1;
+    }
+    (s0, s1)
+}
+
 /// Scalar reference / no-AVX2 fallback: the straight in-order row dot. Used only where AVX2 is absent
 /// (its accumulation order differs from the AVX2 path, so the two agree only within f32 tolerance — the
 /// AVX2 path is the one the differential gate exercises on this target).
@@ -117,6 +165,29 @@ unsafe fn gemv_row(a: *const f32, x: *const f32, n: usize) -> f32 {
     gemv_row_scalar(a, x, n)
 }
 
+/// Compute consecutive output rows, sharing x loads across pairs on AVX2 + FMA targets.
+///
+/// # Safety
+/// Operand-size and non-overlap contract of `wukong_sgemv` for the supplied submatrix.
+#[inline]
+unsafe fn gemv_rows(a: *const f32, x: *const f32, y: *mut f32, m: usize, n: usize, alpha: f32) {
+    let scale = |s| if alpha != 1.0 { s * alpha } else { s };
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        while i + 2 <= m {
+            let (s0, s1) = gemv_pair_avx2(a.add(i * n), x, n);
+            *y.add(i) = scale(s0);
+            *y.add(i + 1) = scale(s1);
+            i += 2;
+        }
+    }
+    while i < m {
+        *y.add(i) = scale(gemv_row(a.add(i * n), x, n));
+        i += 1;
+    }
+}
+
 /// `y[i] = Σ_j A[i,j]·x[j]` for a row-major `A[M,N]`, `x[N]`, `y[M]` — single-threaded.
 ///
 /// # Safety
@@ -127,15 +198,13 @@ pub unsafe extern "C" fn wukong_sgemv(a: *const f32, x: *const f32, y: *mut f32,
         return;
     }
     let (m, n) = (m as usize, n as usize);
-    for i in 0..m {
-        *y.add(i) = gemv_row(a.add(i * n), x, n);
-    }
+    gemv_rows(a, x, y, m, n, 1.0);
 }
 
 /// `y[i] = alpha · Σ_j A[i,j]·x[j]` — the **α-scaled GEMV**: the decode-time attention score
 /// `scores = (K·q)·(1/√d)` and every scaled single-token projection, where a loop-invariant scalar
 /// `alpha` multiplies the row dot on the store (`y[i] = s * c`). The compiler lowers a recognized
-/// GEMV nest with a scaled store to this. Each row's dot is the *identical* [`gemv_row`] the plain
+/// GEMV nest with a scaled store to this. Each row's dot follows the *identical* arithmetic the plain
 /// [`wukong_sgemv`] computes; `alpha` is applied **exactly once per output element** on the store —
 /// the same single f32 multiply the scalar nest's `y[i] = s * c` performs — and `alpha == 1.0` skips
 /// the multiply (byte-identical to the plain kernel). Single-threaded.
@@ -155,12 +224,7 @@ pub unsafe extern "C" fn wukong_sgemv_alpha(
         return;
     }
     let (m, n) = (m as usize, n as usize);
-    for i in 0..m {
-        let s = gemv_row(a.add(i * n), x, n);
-        // One multiply on the store, skipped for α == 1.0 (the Epilogue convention) so the unscaled
-        // form stays byte-identical to `wukong_sgemv`.
-        *y.add(i) = if alpha != 1.0 { s * alpha } else { s };
-    }
+    gemv_rows(a, x, y, m, n, alpha);
 }
 
 /// Multi-threaded α-scaled GEMV: independent rows across cores, each the identical per-row routine
@@ -197,12 +261,23 @@ pub unsafe extern "C" fn wukong_sgemv_alpha_parallel(
         // 2 MiB stacks. Pool configuration only — the row split below is worker-count independent,
         // so the bits are unchanged.
         crate::ensure_global_pool();
+        if rayon::current_num_threads() == 1 {
+            gemv_rows(a, x, y, mu, nu, alpha);
+            return;
+        }
         let (a_addr, x_addr, y_addr) = (a as usize, x as usize, y as usize);
-        (0..mu).into_par_iter().for_each(|i| {
-            // SAFETY: disjoint output element y[i]; shared read-only a-row / x; pointers re-derived.
+        (0..mu.div_ceil(2)).into_par_iter().for_each(|pair| {
+            let i = pair * 2;
+            // SAFETY: each task owns one disjoint pair of rows (or the final single row).
             unsafe {
-                let s = gemv_row((a_addr as *const f32).add(i * nu), x_addr as *const f32, nu);
-                *(y_addr as *mut f32).add(i) = if alpha != 1.0 { s * alpha } else { s };
+                gemv_rows(
+                    (a_addr as *const f32).add(i * nu),
+                    x_addr as *const f32,
+                    (y_addr as *mut f32).add(i),
+                    (mu - i).min(2),
+                    nu,
+                    alpha,
+                );
             }
         });
     }
@@ -229,31 +304,7 @@ pub unsafe extern "C" fn wukong_sgemv_parallel(
     m: i64,
     n: i64,
 ) {
-    if m <= 0 || n <= 0 {
-        return;
-    }
-    let (mu, nu) = (m as usize, n as usize);
-    if mu < GEMV_PAR_MIN_ROWS {
-        wukong_sgemv(a, x, y, m, n);
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        use rayon::prelude::*;
-        // Configure the global pool before forking, for the reason spelled out in
-        // [`wukong_sgemv_alpha_parallel`] (this entry can equally be the first rayon touch).
-        crate::ensure_global_pool();
-        let (a_addr, x_addr, y_addr) = (a as usize, x as usize, y as usize);
-        (0..mu).into_par_iter().for_each(|i| {
-            // SAFETY: disjoint output element y[i]; shared read-only a-row / x; pointers re-derived.
-            unsafe {
-                *(y_addr as *mut f32).add(i) =
-                    gemv_row((a_addr as *const f32).add(i * nu), x_addr as *const f32, nu);
-            }
-        });
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    wukong_sgemv(a, x, y, m, n);
+    wukong_sgemv_alpha_parallel(a, x, y, m, n, 1.0);
 }
 
 #[cfg(test)]
