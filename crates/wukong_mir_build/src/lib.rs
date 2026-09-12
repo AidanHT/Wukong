@@ -4689,6 +4689,19 @@ impl FnLowerer<'_> {
     /// are also representable; other domains retain ordinary loop lowering until proved safe.
     fn kernel_range_supported(&self, start: &Expr, end: &Expr) -> bool {
         let (ity, signed) = self.range_counter_type(start, end);
+        // Sema assigns the iterator the start's signedness. A signed-start/unsigned-end
+        // comparison can reach the counter's high half, but scalar source index expressions
+        // still interpret those bits as signed. A positive-offset kernel is equivalent only
+        // when the endpoint proves that this half cannot be visited.
+        if !signed && self.signed(start) {
+            let max_signed = (1u64 << (mir_byte_size(&ity) * 8 - 1)) - 1;
+            if !self
+                .const_usize_expr(end)
+                .is_some_and(|end| u64::from(end) <= max_signed)
+            {
+                return false;
+            }
+        }
         self.expr_mir(start).is_int()
             && self.expr_mir(end).is_int()
             && ity.is_int()
