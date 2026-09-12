@@ -1587,7 +1587,8 @@ fn plan_body(
 ///   takes a scalar amount (a cross-crate operand-shape change, and a real one — `x[i] >> 8` in a
 ///   quantization loop is worth it), or AVX2's genuine per-lane `vpsllvd`/`vpsravd`, which
 ///   Cranelift does not expose. Constant left shifts instead use [`left_shift_factor`] to emit
-///   existing wrapping vector multiplication; variable shifts and right shifts are still refused.
+///   existing wrapping vector multiplication at `i16`/`i32`; other widths, variable shifts and right
+///   shifts are still refused.
 ///
 /// Those are the only three. An 82-case (operator x lane type) matrix over `i8`/`i16`/`i32`/
 /// `i64`/`f32`/`f64` — add, sub, mul, and, or, xor, shl, ashr, neg, not, compare+select, the
@@ -1608,10 +1609,12 @@ fn bin_widenable(op: BinOp, ty: &MirType) -> bool {
 
 /// `x << k` is `x * 2^(k mod bits)` in wrapping integer arithmetic. Both the interpreter and
 /// native scalar lowering mask the shift count to the lane width, including negative and oversized
-/// counts. Construct the identical low-bit multiplier, retaining only widths with a legal packed
-/// multiply. No vector shift reaches Cranelift and no source-level overflow promise is needed.
+/// counts. Construct the identical low-bit multiplier for `i16`/`i32` lanes. An `i64x2` multiply is
+/// legal, but Cranelift 0.124.3 does not strength-reduce a splatted power-of-two operand and its
+/// non-AVX-512 fallback needs several packed operations. Leave that width scalar until measured.
+/// No vector shift reaches Cranelift and no source-level overflow promise is needed.
 fn left_shift_factor(f: &Function, rhs: ValueId, ty: &MirType) -> Option<i64> {
-    if !bin_widenable(BinOp::Mul, ty) {
+    if !matches!(ty, MirType::I16 | MirType::I32) {
         return None;
     }
     let bits = lane_bytes(ty)? * 8;
@@ -2964,7 +2967,8 @@ mod tests {
     /// `x[i] << 2` therefore built an `ishl.i32x4` whose second operand was a vector, which the
     /// CLIF verifier rejects — and the verifier only runs in a debug build, so in release the same
     /// program reached lowering and panicked inside Cranelift's ISLE. Only constant left shifts
-    /// with a supported packed multiply now widen through a different opcode.
+    /// at `i16`/`i32` now widen through a different opcode. The legal but costly `i64x2` multiply
+    /// fallback remains excluded until its profitability is measured.
     #[test]
     fn shifts_widen_only_through_a_supported_constant_multiply() {
         for (ty, lit) in [
@@ -2981,7 +2985,7 @@ mod tests {
                 );
                 assert_eq!(
                     is_widened(&src, "k"),
-                    op == "<<" && ty != "i8",
+                    op == "<<" && matches!(ty, "i16" | "i32"),
                     "{ty} {op} eligibility"
                 );
             }
