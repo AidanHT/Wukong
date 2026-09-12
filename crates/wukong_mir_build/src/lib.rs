@@ -4652,9 +4652,7 @@ impl FnLowerer<'_> {
         let (ity, signed) = self.range_counter_type(start, end);
         ity.is_int()
             && (mir_byte_size(&ity) < 8
-                || (ity == MirType::I64
-                    && signed
-                    && as_int_lit(start, self.interner) == Some(0)))
+                || (ity == MirType::I64 && signed && as_int_lit(start, self.interner) == Some(0)))
     }
 
     /// Convert through the scalar loop's common type before widening to the kernel ABI. This
@@ -8855,7 +8853,8 @@ impl FnLowerer<'_> {
         let Some((islot, ity)) = self.lookup(i) else {
             return false;
         };
-        if !ity.is_int() {
+        let (common, signed) = self.range_counter_type(lhs, rhs);
+        if !ity.is_int() || common != ity || !signed {
             return false;
         }
         // The last statement must be the unit increment; strip it for the for-body.
@@ -8881,9 +8880,7 @@ impl FnLowerer<'_> {
         let start_val = self
             .builder
             .build(ity.clone(), Op::Load(islot, ity.clone()));
-        let end_ty = self.expr_mir(rhs);
-        let e0 = self.lower_expr(rhs);
-        let end_val = self.coerce_to(e0, &end_ty, &ity, true);
+        let end_val = self.lower_range_bound(rhs, &ity);
         let ok = self.try_vectorize_ranged(i, start_val, end_val, &ity, &stripped);
         debug_assert!(ok, "a vectorizable body must vectorize");
         // Restore `i` to the value the while would have left: `N` if it ran (`start < N`), else the
@@ -10599,6 +10596,9 @@ impl FnLowerer<'_> {
         end: &Expr,
         body: &Block,
     ) -> bool {
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         // Only `0..n`: the loop must cover the whole array from index 0 so the kernel's reduction over
         // x[0..n], reconciled with the seed, equals the loop independent of the seed value.
         if self.const_usize_expr(start) != Some(0) {
@@ -10724,6 +10724,9 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         // Only `0..n`; a non-zero start would need a pointer/length shift the call does not do.
         if self.const_usize_expr(start) != Some(0) {
             return false;
@@ -11119,6 +11122,9 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         if self.const_usize_expr(start) != Some(0) {
             return false;
         }
@@ -11181,6 +11187,9 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         if self.const_usize_expr(start) != Some(0) {
             return false;
         }
@@ -11318,6 +11327,9 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         if self.const_usize_expr(start) != Some(0) {
             return false;
         }
@@ -11370,6 +11382,9 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         if self.const_usize_expr(start) != Some(0) {
             return false;
         }
@@ -13391,6 +13406,9 @@ impl FnLowerer<'_> {
     /// interpreter marshals through the identical kernel, so the differential oracle stays exact.
     /// Returns false (fall back to the generic vectorizer) unless every statement matches.
     fn try_vmath_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         let Some(calls) = self.match_vmath_body(j, body, None) else {
             return false;
         };
@@ -13865,6 +13883,9 @@ impl FnLowerer<'_> {
     /// AVX2 kernel, vs the generic vectorizer's inlined 128-bit poly. The interpreter marshals through
     /// the identical kernel, so the differential oracle stays exact. Returns false to fall back.
     fn try_vmath2_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         let Some(calls) = self.match_vmath2_body(j, body) else {
             return false;
         };
@@ -14208,6 +14229,9 @@ impl FnLowerer<'_> {
     /// `out` may alias `x`/`y` (in-place). The interpreter marshals the identical kernel, so the
     /// differential oracle stays exact. Returns false (fall through) unless the body matches.
     fn try_velem_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         let Some(plan) = self.match_velem_body(j, body) else {
             return false;
         };
@@ -14394,6 +14418,9 @@ impl FnLowerer<'_> {
     /// The interpreter marshals the identical kernel (integer→f32 is exact), so the differential oracle
     /// stays bit-for-bit. Returns false (fall through) unless the body matches.
     fn try_dequant_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         let Some(plan) = self.match_dequant_body(j, body) else {
             return false;
         };
@@ -14730,6 +14757,9 @@ impl FnLowerer<'_> {
     /// large output) non-temporal stores, both beyond Cranelift's 128-bit vectorizer. Returns false
     /// (fall through) unless the body matches.
     fn try_vhorner_for(&mut self, j: Symbol, start: &Expr, end: &Expr, body: &Block) -> bool {
+        if !self.kernel_range_supported(start, end) {
+            return false;
+        }
         let Some((out_base, x_base, coeffs)) = self.match_vhorner_body(j, body) else {
             return false;
         };
@@ -14745,7 +14775,7 @@ impl FnLowerer<'_> {
             ast::PatKind::Ident(name) => *name,
             _ => return false,
         };
-        let ity = self.expr_mir(start);
+        let (ity, signed) = self.range_counter_type(start, end);
         if !ity.is_int() {
             return false;
         }
@@ -14791,17 +14821,20 @@ impl FnLowerer<'_> {
           // disjoint from the elementwise *store* loops, so try it first. Reductions are vectorized
           // only on this (sequential) path — not the `@parallel` per-thread path, where folding into
           // a shared accumulator across threads would race.
+          // The generic strips and tails use signed comparisons at the counter width. Runtime
+          // recognizers above already support narrow unsigned counters through their i64 ABI;
+          // retain the scalar counter's representation when those probes decline. Widening the
+          // counter here would also change wrapping arithmetic in the source index expressions.
+        if !signed {
+            return false;
+        }
         let reduction = self.reduction_of(body, j);
         if reduction.is_none() && self.vectorizable(body, j).is_none() {
             return false;
         }
         // Lower the bounds (coerced to the index type) and hand off to the matching emitter.
-        let start_ty = self.expr_mir(start);
-        let s0 = self.lower_expr(start);
-        let s0 = self.coerce_to(s0, &start_ty, &ity, true);
-        let end_ty = self.expr_mir(end);
-        let e0 = self.lower_expr(end);
-        let e0 = self.coerce_to(e0, &end_ty, &ity, true);
+        let s0 = self.lower_range_bound(start, &ity);
+        let e0 = self.lower_range_bound(end, &ity);
         if let Some((s_sym, addend, lane, w, redop)) = reduction {
             // A compile-time-known trip (literal `for i in A..B`) lets the 256-bit reduction gate on
             // size; a runtime bound stays `None` and keeps the 128-bit path (see
@@ -15610,12 +15643,18 @@ impl FnLowerer<'_> {
         let lt8 = self
             .builder
             .build(MirType::I1, Op::Cmp(CmpOp::Slt, trip, eight));
+        let empty = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Sge, s64, e64));
+        let skip = self
+            .builder
+            .build(MirType::I1, Op::Bin(BinOp::Or, lt8, empty));
         let zero = self
             .builder
             .build(MirType::I64, Op::ConstInt(0, MirType::I64));
         let n = self
             .builder
-            .build(MirType::I64, Op::Select(lt8, zero, masked));
+            .build(MirType::I64, Op::Select(skip, zero, masked));
 
         // Bind `j` to a slot holding the start element, so lowering each stream's index expression
         // yields its first element and the (j-independent) scalar sources lower cleanly.
@@ -15635,8 +15674,8 @@ impl FnLowerer<'_> {
         for (k, (base_sym, idx_expr)) in recipe.streams.iter().enumerate() {
             let base = self.lookup(*base_sym).expect("stream base in scope").0;
             let idxv = self.lower_expr(idx_expr);
-            let idx_ty = self.expr_mir(idx_expr);
-            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, true);
+            let idx_ty = self.operand_mir(idxv, idx_expr);
+            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, self.signed(idx_expr));
             let sp = self.builder.build(
                 MirType::Ptr,
                 Op::Gep {
@@ -15799,26 +15838,34 @@ impl FnLowerer<'_> {
         body: &Block,
     ) {
         let span = (unroll * w) as i128;
-        let off = self
+        let span_value = self
             .builder
-            .build(ity.clone(), Op::ConstInt(span - 1, ity.clone()));
-        let vlimit = self
-            .builder
-            .build(ity.clone(), Op::Bin(BinOp::Sub, end_v, off));
+            .build(ity.clone(), Op::ConstInt(span, ity.clone()));
 
         let hdr = self.builder.new_block();
         let bb = self.builder.new_block();
         let done = self.builder.new_block();
         self.builder.br(hdr, vec![]);
 
-        // header: while j < end - (unroll*W - 1)
+        // header: j < end and unsigned(end - j) >= unroll*W
         self.builder.switch_to(hdr);
         self.terminated = false;
         self.bind(j, slot, ity.clone());
         let jv = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        // Once j < end is known, the modular difference interpreted unsigned is the exact
+        // remaining distance, even when a signed range spans more than the signed maximum.
+        let ordered = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, end_v));
+        let remaining = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Sub, end_v, jv));
+        let full = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Uge, remaining, span_value));
         let c = self
             .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, vlimit));
+            .build(MirType::I1, Op::Bin(BinOp::And, ordered, full));
         self.builder.cond_br(c, bb, vec![], done, vec![]);
 
         // body: `unroll` vector groups at offsets 0, W, 2W, …; then j += unroll*W
@@ -16033,12 +16080,18 @@ impl FnLowerer<'_> {
         let lt8 = self
             .builder
             .build(MirType::I1, Op::Cmp(CmpOp::Slt, trip, eight));
+        let empty = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Sge, s64, e64));
+        let skip = self
+            .builder
+            .build(MirType::I1, Op::Bin(BinOp::Or, lt8, empty));
         let zero = self
             .builder
             .build(MirType::I64, Op::ConstInt(0, MirType::I64));
         let n = self
             .builder
-            .build(MirType::I64, Op::Select(lt8, zero, masked));
+            .build(MirType::I64, Op::Select(skip, zero, masked));
 
         // Bind j to a start slot so the stream index expressions and scalar sources lower cleanly.
         let jslot = self.builder.alloca(ity.clone());
@@ -16058,8 +16111,8 @@ impl FnLowerer<'_> {
         for (k, (base_sym, idx_expr)) in recipe.streams.iter().enumerate() {
             let base = self.lookup(*base_sym).expect("stream base in scope").0;
             let idxv = self.lower_expr(idx_expr);
-            let idx_ty = self.expr_mir(idx_expr);
-            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, true);
+            let idx_ty = self.operand_mir(idxv, idx_expr);
+            let idx64 = self.coerce_to(idxv, &idx_ty, &MirType::I64, self.signed(idx_expr));
             let sp = self.builder.build(
                 MirType::Ptr,
                 Op::Gep {
@@ -16304,12 +16357,9 @@ impl FnLowerer<'_> {
         redop: RedOp,
     ) {
         let span = (unroll * w) as i128;
-        let off = self
+        let span_value = self
             .builder
-            .build(ity.clone(), Op::ConstInt(span - 1, ity.clone()));
-        let vlimit = self
-            .builder
-            .build(ity.clone(), Op::Bin(BinOp::Sub, end_v, off));
+            .build(ity.clone(), Op::ConstInt(span, ity.clone()));
 
         let hdr = self.builder.new_block();
         let bb = self.builder.new_block();
@@ -16320,9 +16370,20 @@ impl FnLowerer<'_> {
         self.terminated = false;
         self.bind(j, slot, ity.clone());
         let jv = self.builder.build(ity.clone(), Op::Load(slot, ity.clone()));
+        // Once j < end is known, the modular difference interpreted unsigned is the exact
+        // remaining distance, even when a signed range spans more than the signed maximum.
+        let ordered = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, end_v));
+        let remaining = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Sub, end_v, jv));
+        let full = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Uge, remaining, span_value));
         let c = self
             .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Slt, jv, vlimit));
+            .build(MirType::I1, Op::Bin(BinOp::And, ordered, full));
         self.builder.cond_br(c, bb, vec![], done, vec![]);
 
         self.builder.switch_to(bb);
