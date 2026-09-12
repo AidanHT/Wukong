@@ -186,9 +186,9 @@ impl<'a> Vjp<'a> {
     /// Emit the forward instructions verbatim (operands remapped to the new value space), recording
     /// `fwd_to_new` so the reverse pass can reference any forward value.
     fn replay(&mut self) {
-        // Clone the inst list out first to avoid borrowing `self.fwd` while mutating `self.b`.
-        let insts: Vec<Inst> = self.entry_block().insts.clone();
-        for inst in &insts {
+        // The source block belongs to the borrowed forward function, independently of the new
+        // builder. Remap directly from it without a temporary clone of every op and operand list.
+        for inst in &self.entry_block().insts {
             let new_op = self.remap_op(&inst.op);
             match inst.result {
                 Some(old_r) => {
@@ -223,8 +223,7 @@ impl<'a> Vjp<'a> {
 
     /// Walk the forward instructions in reverse, applying each VJP rule.
     fn reverse(&mut self) -> Result<(), String> {
-        let insts: Vec<Inst> = self.entry_block().insts.clone();
-        for inst in insts.iter().rev() {
+        for inst in self.entry_block().insts.iter().rev() {
             self.diff_inst(inst)?;
         }
         self.b.ret(None);
