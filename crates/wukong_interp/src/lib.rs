@@ -197,6 +197,7 @@ pub fn run_with_output(
             memory: Vec::new(),
             stdout: Vec::new(),
             frames: Vec::new(),
+            call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
@@ -205,7 +206,7 @@ pub fn run_with_output(
             accel: None,
             depth: 0,
         };
-        let result = interp.run_function(func, Vec::new())?;
+        let result = interp.run_function(func, &[])?;
         Ok((result.as_int() as i64, interp.stdout))
     })
 }
@@ -286,6 +287,7 @@ pub fn run_with_output_accel(
             memory: Vec::new(),
             stdout: Vec::new(),
             frames: Vec::new(),
+            call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
@@ -295,7 +297,7 @@ pub fn run_with_output_accel(
             accel: unsafe { accel.reborrow() },
             depth: 0,
         };
-        let result = interp.run_function(func, Vec::new())?;
+        let result = interp.run_function(func, &[])?;
         Ok((result.as_int() as i64, interp.stdout))
     })
 }
@@ -362,6 +364,7 @@ fn run_kernel_f32_inner(
             memory: Vec::new(),
             stdout: Vec::new(),
             frames: Vec::new(),
+            call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
@@ -382,7 +385,7 @@ fn run_kernel_f32_inner(
                 .extend(buf.iter().map(|&v| Value::Float(v as f64)));
         }
         let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
-        interp.run_function(func, args)?;
+        interp.run_function(func, &args)?;
         // Copy the final contents back out (captures both outputs and in-place mutation).
         for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
             for (i, slot) in buf.iter_mut().enumerate() {
@@ -428,6 +431,7 @@ pub fn run_kernel_f64(
             memory: Vec::new(),
             stdout: Vec::new(),
             frames: Vec::new(),
+            call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
@@ -442,7 +446,7 @@ pub fn run_kernel_f64(
             interp.memory.extend(buf.iter().map(|&v| Value::Float(v)));
         }
         let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
-        interp.run_function(func, args)?;
+        interp.run_function(func, &args)?;
         for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
             for (i, slot) in buf.iter_mut().enumerate() {
                 *slot = match interp.memory[base + i] {
@@ -489,6 +493,7 @@ pub fn run_kernel_i8(
             memory: Vec::new(),
             stdout: Vec::new(),
             frames: Vec::new(),
+            call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
@@ -511,8 +516,8 @@ pub fn run_kernel_i8(
         interp
             .memory
             .extend(c.iter().map(|&v| Value::Int(v as i128)));
-        let args = vec![Value::Ptr(a_base), Value::Ptr(b_base), Value::Ptr(c_base)];
-        interp.run_function(func, args)?;
+        let args = [Value::Ptr(a_base), Value::Ptr(b_base), Value::Ptr(c_base)];
+        interp.run_function(func, &args)?;
         for (i, slot) in c.iter_mut().enumerate() {
             *slot = match interp.memory[c_base + i] {
                 Value::Int(n) => n as i32,
@@ -532,6 +537,9 @@ struct Interp<'a, 'k> {
     /// Recycled register files, one per active call depth. Pooling them keeps recursion and
     /// call-heavy code from allocating a fresh vector on every call.
     frames: Vec<Vec<Value>>,
+    /// Argument snapshots available for reuse. Each active call owns its buffer until the
+    /// callee returns, so nested calls cannot overwrite an outer call's arguments.
+    call_args: Vec<Vec<Value>>,
     /// Scratch buffer reused when passing block-parameter arguments across an edge.
     scratch: Vec<Value>,
     /// Backing store for SIMD vector values; `Value::VecRef(i)` indexes this. Vectors only live in
@@ -631,7 +639,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             .copied()
     }
 
-    fn run_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, String> {
+    fn run_function(&mut self, func: &Function, args: &[Value]) -> Result<Value, String> {
         // Bound the *host* stack recursion this call is about to perform. `exec`'s step guard is a
         // local of a single `exec` invocation, so a recursion that runs a handful of blocks per
         // frame increments no shared counter and would run to a process-killing stack overflow.
@@ -646,7 +654,7 @@ impl<'a, 'k> Interp<'a, 'k> {
         let mut regs = self.frames.pop().unwrap_or_default();
         regs.clear();
         regs.resize(func.value_types.len(), Value::Unit);
-        for (p, a) in func.params.iter().zip(args) {
+        for (p, &a) in func.params.iter().zip(args) {
             regs[p.0 as usize] = a;
         }
         let result = self.exec(func, &mut regs);
@@ -915,14 +923,18 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             Op::Barrier => Value::Unit,
             Op::Call { func, args } => {
-                let argv: Vec<Value> = args.iter().map(|a| reg(regs, *a)).collect();
-                if let Some(index) = self.function_index(*func) {
+                let mut argv = self.call_args.pop().unwrap_or_default();
+                argv.extend(args.iter().map(|a| reg(regs, *a)));
+                let result = if let Some(index) = self.function_index(*func) {
                     let callee = &self.program.funcs[index];
-                    self.run_function(callee, argv)?
+                    self.run_function(callee, &argv)
                 } else {
                     let name = self.interner.resolve(*func);
-                    self.intrinsic(name, &argv)?
-                }
+                    self.intrinsic(name, &argv)
+                };
+                argv.clear();
+                self.call_args.push(argv);
+                result?
             }
             // A synthesized 256-bit AVX2 vector kernel (the general vectorizer's output). The native
             // backend executes hand-assembled AVX2; the oracle marshals the same `VecKernel` recipe
@@ -1492,7 +1504,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     .funcs
                     .get(body)
                     .ok_or("parallel_for body index out of range")?;
-                self.run_function(func, vec![Value::Int(0), Value::Int(n), env])?;
+                self.run_function(func, &[Value::Int(0), Value::Int(n), env])?;
                 Ok(Value::Unit)
             }
             // `wukong_sgemm(a, b, c, m, k, n, beta)` (and the parallel / transposed `nn.Linear`
