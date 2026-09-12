@@ -2379,17 +2379,6 @@ fn lower_fn(
         mir_ty(&ret_ty)
     };
 
-    // The buffer parameters, for the region outliner's alias obligation (`match_parallel_region`).
-    // Built here because `lower_fn` is the only lowerer that carries `par: Some(..)` and therefore
-    // the only one that can emit a region at all.
-    let param_arrays: Vec<(Symbol, Ty)> = f
-        .params
-        .iter()
-        .zip(&param_tys)
-        .filter(|(_, pty)| ty_is_buffer_param(pty))
-        .map(|(p, pty)| (p.name.sym, pty.clone()))
-        .collect();
-
     let mut fl = FnLowerer {
         builder: Builder::new(name, ret_mir.clone()),
         sema,
@@ -2408,7 +2397,7 @@ fn lower_fn(
         mono: Some(mono),
         par,
         tile_queue,
-        param_arrays,
+        param_arrays: vec![],
     };
 
     // The sret pointer is parameter 0 — declared before the real params so the call site can prepend
@@ -2436,6 +2425,9 @@ fn lower_fn(
         .map(|abi| fl.builder.add_param(abi.clone()))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
+        if ty_is_buffer_param(pty) {
+            fl.param_arrays.push((val, pty.clone()));
+        }
         // A statically-shaped contiguous tensor param binds as the buffer it *is* — `[T; d0·…·dn]` —
         // not as an opaque `Ptr`. Both spellings arrive as the same base pointer (`param_abi` maps
         // `Array(..)` back to `Ptr`, so the ABI is byte-identical), but only the `Array` form takes
@@ -3395,14 +3387,12 @@ struct FnLowerer<'a> {
     /// Remaining tile widths from a function-item `@tile(BM, BN, …)`, consumed by nested `for`
     /// loops in source order (statement-level `@tile` overrides for one loop).
     tile_queue: Vec<u64>,
-    /// The enclosing function's **buffer parameters**, symbol -> declared type, in declaration
-    /// order. Two DISTINCT parameters of the same type may be bound to one buffer at the call site
-    /// (`embed(ids, buf, buf)`), which is the single disjointness fact
-    /// [`FnLowerer::match_parallel_region`]'s per-symbol reasoning cannot establish for itself —
-    /// `wukong_opt::alias` answers "may alias" for `Param(i)` vs `Param(j)` for exactly this reason.
+    /// The enclosing function's buffer parameters, MIR base pointer -> declared type. Tracking the
+    /// actual value also recognizes aggregate match bindings that alias a parameter, and prevents
+    /// a local shadowing its name from inheriting the parameter's alias classification.
     /// Empty on every lowerer that carries `par: None`, which is every lowerer that cannot emit a
     /// region.
-    param_arrays: Vec<(Symbol, Ty)>,
+    param_arrays: Vec<(ValueId, Ty)>,
     /// The bound slot values that hold a `[]T` **slice** fat pointer, recorded by `bind_slice` at
     /// every binding site whose sema type is `Ty::Slice`. `kernel_base_ptr` needs this because the
     /// slice's MIR slot type — `Array(I8, SLICE_SIZE)` — is *not* unique to slices: a tuple, a
@@ -11924,11 +11914,10 @@ impl FnLowerer<'_> {
     //    kernels — the identical per-iteration op sequence the non-`@parallel` spelling runs; only
     //    cross-iteration scheduling differs, and iterations never overlap writes, so serial ==
     //    parallel bit-for-bit and the interpreter (sequential `[0, N)`) == native (chunks).
-    //  * Aliasing granularity is the symbol, which is a FACT for two distinct locals (distinct
-    //    `alloca`s) and only an ASSUMPTION for two distinct parameters — one array can be bound to
-    //    both (`embed(ids, buf, buf)`), and no rule of the language forbids it. So captured buffer
-    //    parameters that could be the same storage are proved as ONE buffer, over the union of
-    //    their accesses; anything that cannot carry the digit under a shared signature declines.
+    //  * Captured array storage must be a fresh alloca or a scalar-element array parameter.
+    //    Names with the same MIR base, and same-typed parameters that the caller could alias, are
+    //    proved as ONE buffer over the union of their accesses. Derived pointers and aggregate
+    //    parameters decline because their overlapping subobjects need an offset-aware proof.
     //
     // Autodiff note: a function containing a region tapes to an `Op::Call` of
     // `wukong_parallel_for` (a void call with no VJP rule), so `--emit=grad`/`--train` over such a
@@ -11995,26 +11984,20 @@ impl FnLowerer<'_> {
             let accs = sc.accesses.get(arr)?;
             self.prove_region_slices(hh, n, &accs.iter().collect::<Vec<_>>())?;
         }
-        // Aliasing granularity is the symbol. For two distinct LOCALS that is a fact — distinct
-        // `alloca`s, distinct storage — but for two distinct PARAMETERS it is an assumption, and the
-        // caller defeats it by passing one array twice: `embed(ids, buf, buf)` binds `weight` and
-        // `out` to the same buffer, and nothing in the language forbids it (`wukong_opt::alias`
-        // answers "may alias" for `Param(i)` vs `Param(j)` for exactly this reason, and
-        // `docs/roadmap.md` predicted a fixed-size array parameter would be the one to reach it).
-        // So whenever a WRITTEN capture is a buffer parameter, every other captured parameter that
-        // could be that same buffer — same declared type, the only way sema lets one array reach
-        // both — joins it, and the identical proof runs over the UNION of their accesses. Passing
-        // means every iteration owns one slice of the shared buffer, so the aliasing is harmless and
-        // the ordinary `out[i] = x[i] * 2.0` shape still outlines; a gather whose index cannot carry
-        // the digit (`weight[ids[t] * 4 + d]`) declines to the serial lowering instead of racing.
+        // Prove the union for aliases of one MIR base, including aggregate match bindings, and
+        // for same-typed parameters that the caller may bind to one array. `region_capture` only
+        // admits direct scalar-element array parameters or fresh allocas: derived pointers and
+        // aggregate parameters could overlap at different offsets or element sizes and decline.
         for arr in &sc.written {
-            let Some(wty) = self.buffer_param_ty(*arr) else {
-                continue;
-            };
+            let (base, _) = self.lookup(*arr)?;
+            let wty = self.buffer_param_ty(*arr);
             let group: Vec<&Vec<RegionAccess>> = sc
                 .captures
                 .iter()
-                .filter(|c| self.buffer_param_ty(**c) == Some(wty))
+                .filter(|c| {
+                    self.lookup(**c).is_some_and(|(other, _)| other == base)
+                        || (wty.is_some() && self.buffer_param_ty(**c) == wty)
+                })
                 .filter_map(|c| sc.accesses.get(c))
                 .collect();
             if group.len() < 2 {
@@ -12025,12 +12008,12 @@ impl FnLowerer<'_> {
         Some(sc.captures)
     }
 
-    /// The declared type of `sym` when it is a **buffer parameter** of the enclosing function — the
-    /// only case in which a symbol distinct from another can still name the same storage.
+    /// The parameter type behind the current binding's base pointer, including direct aliases.
     fn buffer_param_ty(&self, sym: Symbol) -> Option<&Ty> {
+        let (base, _) = self.lookup(sym)?;
         self.param_arrays
             .iter()
-            .find(|(p, _)| *p == sym)
+            .find(|(p, _)| *p == base)
             .map(|(_, t)| t)
     }
 
@@ -12433,17 +12416,32 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Register `sym` as a capture if its binding shape is supported: a fixed-size array (base
-    /// pointer) or an int/float scalar (slot pointer, read-only inside the region). A `Ptr`-slot
-    /// binding (tensor, raw pointer) or vector declines — it may alias other captures.
+    /// Register a capture whose storage identity is known. An array must be a fresh alloca or a
+    /// direct scalar-element array parameter. Derived pointers (match payloads, aggregate foreach
+    /// bindings, merge values) decline. Aggregate parameters decline too: `f(rows, rows[0])` can
+    /// overlap differently typed buffers, which the element-index proof cannot compare.
     fn region_capture(&self, sym: Symbol, sc: &mut RegionScan<'_>) -> bool {
         if sc.captures.contains(&sym) {
             return true;
         }
-        let Some((_, mty)) = self.lookup(sym) else {
+        let Some((base, mty)) = self.lookup(sym) else {
             return false;
         };
-        if matches!(mty, MirType::Array(..)) || mty.is_int() || mty.is_float() {
+        let supported_array = if matches!(mty, MirType::Array(..)) {
+            match self.buffer_param_ty(sym) {
+                Some(Ty::Array { elem, .. }) => matches!(elem.as_ref(), Ty::Scalar(_)),
+                Some(_) => false,
+                None => self
+                    .builder
+                    .block(self.builder.entry())
+                    .insts
+                    .iter()
+                    .any(|inst| inst.result == Some(base) && matches!(inst.op, Op::Alloca { .. })),
+            }
+        } else {
+            false
+        };
+        if supported_array || mty.is_int() || mty.is_float() {
             sc.captures.push(sym);
             return true;
         }
