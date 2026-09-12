@@ -564,8 +564,18 @@ fn collect_static_strings(
         }
     }
     // A `const MSG: *u8 = "…"` inlines its initializer at each use, so its literal needs a blob too.
-    for init in sema.consts.values() {
-        collect_str_expr(init, &mut lits);
+    // Follow declaration order, not hash-table bucket order: rodata names and object layout must
+    // not depend on the sema table's capacity or insertion history. The final sema binding remains
+    // authoritative for a duplicate name during error recovery; visit that name only once.
+    let mut seen_consts = HashSet::default();
+    for item in &module.items {
+        if let ast::ItemKind::Const(c) = &item.kind {
+            if seen_consts.insert(c.name.sym) {
+                if let Some(init) = sema.consts.get(&c.name.sym) {
+                    collect_str_expr(init, &mut lits);
+                }
+            }
+        }
     }
     let mut by_content: HashMap<Vec<u8>, Symbol> = HashMap::default();
     let mut statics: Vec<wukong_mir::StaticData> = Vec::new();
