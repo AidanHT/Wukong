@@ -59,6 +59,14 @@ impl Value {
 /// memory never grows near it.
 const FUNC_TAG: usize = 1 << 60;
 
+fn symbol_indices(symbols: impl ExactSizeIterator<Item = Symbol>) -> HashMap<Symbol, usize> {
+    let mut indices = HashMap::with_capacity(symbols.len());
+    for (index, symbol) in symbols.enumerate() {
+        indices.entry(symbol).or_insert(index);
+    }
+    indices
+}
+
 /// The interpreter backend.
 ///
 /// The `Backend` impl below is a *declared* seam, not the live dispatch path: nothing in the
@@ -192,6 +200,8 @@ pub fn run_with_output(
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
+            function_indices: None,
+            static_indices: None,
             accel: None,
             depth: 0,
         };
@@ -279,6 +289,8 @@ pub fn run_with_output_accel(
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
+            function_indices: None,
+            static_indices: None,
             // SAFETY: first and only re-borrow, on the worker `AccelPtr` was moved into.
             accel: unsafe { accel.reborrow() },
             depth: 0,
@@ -353,6 +365,8 @@ fn run_kernel_f32_inner(
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
+            function_indices: None,
+            static_indices: None,
             // SAFETY: first and only re-borrow, on the worker `AccelPtr` was moved into.
             accel: unsafe { accel.reborrow() },
             depth: 0,
@@ -417,6 +431,8 @@ pub fn run_kernel_f64(
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
+            function_indices: None,
+            static_indices: None,
             accel: None,
             depth: 0,
         };
@@ -476,6 +492,8 @@ pub fn run_kernel_i8(
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
             data_addrs: HashMap::new(),
+            function_indices: None,
+            static_indices: None,
             accel: None,
             depth: 0,
         };
@@ -528,6 +546,11 @@ struct Interp<'a, 'k> {
     /// native `.rodata` (a returned/threaded `*u8` stays valid, and `*u8` pointer equality agrees
     /// across backends). Persistent memory is never freed, so the address outlives its defining frame.
     data_addrs: HashMap<Symbol, usize>,
+    /// Build name indices only when calls/function addresses or static data need them. The
+    /// program is immutably borrowed for this run, so indices cannot become stale. Retain the
+    /// first occurrence of duplicate names, matching the previous linear searches.
+    function_indices: Option<HashMap<Symbol, usize>>,
+    static_indices: Option<HashMap<Symbol, usize>>,
     /// Active Wukong call depth, bounded by [`MAX_CALL_DEPTH`]. The 100M-step guard in `exec` is a
     /// local of one `exec` invocation, so it counts only the blocks of a *single* frame and can
     /// never fire on recursion; this is the counter that does.
@@ -601,6 +624,13 @@ macro_rules! dim {
 }
 
 impl<'a, 'k> Interp<'a, 'k> {
+    fn function_index(&mut self, symbol: Symbol) -> Option<usize> {
+        self.function_indices
+            .get_or_insert_with(|| symbol_indices(self.program.funcs.iter().map(|f| f.name)))
+            .get(&symbol)
+            .copied()
+    }
+
     fn run_function(&mut self, func: &Function, args: Vec<Value>) -> Result<Value, String> {
         // Bound the *host* stack recursion this call is about to perform. `exec`'s step guard is a
         // local of a single `exec` invocation, so a recursion that runs a handful of blocks per
@@ -886,12 +916,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Barrier => Value::Unit,
             Op::Call { func, args } => {
                 let argv: Vec<Value> = args.iter().map(|a| reg(regs, *a)).collect();
-                let prog = self.program;
-                if let Some(callee) = prog.function(*func) {
+                if let Some(index) = self.function_index(*func) {
+                    let callee = &self.program.funcs[index];
                     self.run_function(callee, argv)?
                 } else {
-                    let name = self.interner.resolve(*func).to_string();
-                    self.intrinsic(&name, &argv)?
+                    let name = self.interner.resolve(*func);
+                    self.intrinsic(name, &argv)?
                 }
             }
             // A synthesized 256-bit AVX2 vector kernel (the general vectorizer's output). The native
@@ -988,10 +1018,7 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `parallel_for` intrinsic can call it back. (The native backend uses a real address.)
             Op::FuncAddr(sym) => {
                 let idx = self
-                    .program
-                    .funcs
-                    .iter()
-                    .position(|f| f.name == *sym)
+                    .function_index(*sym)
                     .ok_or("func_addr of unknown function")?;
                 Value::Ptr(FUNC_TAG + idx)
             }
@@ -1004,13 +1031,14 @@ impl<'a, 'k> Interp<'a, 'k> {
                 if let Some(&base) = self.data_addrs.get(sym) {
                     Value::Ptr(base)
                 } else {
-                    let bytes = self
-                        .program
-                        .statics
-                        .iter()
-                        .find(|s| s.name == *sym)
-                        .map(|s| s.bytes.as_slice())
+                    let index = *self
+                        .static_indices
+                        .get_or_insert_with(|| {
+                            symbol_indices(self.program.statics.iter().map(|s| s.name))
+                        })
+                        .get(sym)
                         .ok_or("global_addr of unknown static data")?;
+                    let bytes = &self.program.statics[index].bytes;
                     let base = self.memory.len();
                     self.memory
                         .extend(bytes.iter().map(|&b| Value::Int(b as i128)));
