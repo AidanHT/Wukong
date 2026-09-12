@@ -3423,10 +3423,9 @@ impl Decls<'_> {
     }
 }
 
-/// Serial backend: build every function's CLIF (holding a read-only [`Decls`] view), then compile +
-/// define each in source order via the module's own `define_function`. Two-phase (build all, then
-/// define all) rather than interleaved so the build phase can borrow `module.declarations()` while
-/// the define phase borrows the module `&mut`; byte-identical to the old interleaved loop.
+/// Serial backend: lower, compile and define one function at a time in source order. Limit the
+/// declarations borrow to lowering so the module can then be mutated, and reuse the Cranelift
+/// context instead of retaining a module's worth of CLIF before defining its first function.
 #[allow(clippy::too_many_arguments)]
 fn define_functions_serial<M: Module>(
     module: &mut M,
@@ -3439,27 +3438,30 @@ fn define_functions_serial<M: Module>(
     data_ids: &HashMap<Symbol, DataId>,
     kernel_ids: &[Vec<FuncId>],
 ) -> Result<(), String> {
-    let mut clifs: Vec<(FuncId, cranelift_codegen::ir::Function)> =
-        Vec::with_capacity(program.funcs.len());
-    {
-        let decls = Decls {
-            d: module.declarations(),
-        };
-        let mut fbctx = FunctionBuilderContext::new();
-        for (fi, f) in program.funcs.iter().enumerate() {
-            let mut clif = cranelift_codegen::ir::Function::new();
-            build_function_clif(
-                &decls, f, fi, interner, ptr_ty, call_conv, rt_ids, ids, data_ids, kernel_ids,
-                &mut fbctx, &mut clif,
-            )?;
-            clifs.push((ids[&f.name], clif));
-        }
-    }
     let mut ctx = module.make_context();
-    for (fid, clif) in clifs {
-        ctx.func = clif;
+    let mut fbctx = FunctionBuilderContext::new();
+    for (fi, f) in program.funcs.iter().enumerate() {
+        {
+            let decls = Decls {
+                d: module.declarations(),
+            };
+            build_function_clif(
+                &decls,
+                f,
+                fi,
+                interner,
+                ptr_ty,
+                call_conv,
+                rt_ids,
+                ids,
+                data_ids,
+                kernel_ids,
+                &mut fbctx,
+                &mut ctx.func,
+            )?;
+        }
         module
-            .define_function(fid, &mut ctx)
+            .define_function(ids[&f.name], &mut ctx)
             .map_err(|e| format!("cranelift define fn: {e:?}"))?;
         module.clear_context(&mut ctx);
     }
