@@ -332,20 +332,20 @@ impl<'a> Parser<'a> {
                 if self.eat(T::RParen) {
                     TypeKind::Unit
                 } else {
-                    let mut items = vec![self.parse_type()];
-                    let mut trailing = false;
-                    while self.eat(T::Comma) {
-                        if self.at(T::RParen) {
-                            trailing = true;
-                            break;
+                    let first = self.parse_type();
+                    if self.at(T::Comma) {
+                        let mut items = vec![first];
+                        while self.eat(T::Comma) {
+                            if self.at(T::RParen) {
+                                break;
+                            }
+                            items.push(self.parse_type());
                         }
-                        items.push(self.parse_type());
-                    }
-                    self.expect(T::RParen);
-                    if items.len() == 1 && !trailing {
-                        items.pop().unwrap().kind
-                    } else {
+                        self.expect(T::RParen);
                         TypeKind::Tuple(items)
+                    } else {
+                        self.expect(T::RParen);
+                        first.kind
                     }
                 }
             }
@@ -488,8 +488,8 @@ impl<'a> Parser<'a> {
         self.bump(); // .
         let name_span = self.span();
         let name = self.ident();
-        let text = self.interner.resolve(name.sym).to_string();
-        match text.as_str() {
+        let text = self.interner.resolve(name.sym);
+        match text {
             "contiguous" => Layout::Contiguous,
             "col_major" => Layout::ColMajor,
             "strided" => Layout::Strided,
@@ -1807,7 +1807,15 @@ fn parse_u64_literal(text: &str) -> Option<u64> {
             break;
         }
     }
-    let body = s.replace('_', "");
+    // Extents without digit separators can keep their source slice borrowed;
+    // only normalized spellings need their own storage.
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
     if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         u64::from_str_radix(h, 16).ok()
     } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {

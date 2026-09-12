@@ -7,6 +7,7 @@
 mod token;
 pub use token::{Token, TokenKind};
 
+use std::fmt::Write as _;
 use wukong_diag::Diagnostic;
 use wukong_span::{SourceId, Span};
 
@@ -32,7 +33,7 @@ pub fn dump(tokens: &[Token], src: &str) -> String {
     let mut out = String::new();
     for t in tokens {
         let text = &src[t.span.lo as usize..t.span.hi as usize];
-        out.push_str(&format!("{} {:?}\n", t.kind.name(), text));
+        writeln!(out, "{} {:?}", t.kind.name(), text).unwrap();
     }
     out
 }
@@ -110,7 +111,7 @@ impl<'a> Lexer<'a> {
         for _ in 0..utf8_len(c) {
             self.bump();
         }
-        let text = self.src[start..self.pos].escape_default().to_string();
+        let text = self.src[start..self.pos].escape_default();
         let span = self.span(start);
         self.error(span, "E0101", format!("unexpected character `{text}`"));
         Token::new(TokenKind::Error, span)
@@ -332,9 +333,8 @@ impl<'a> Lexer<'a> {
         if self.peek_at(len) == Some(b'\'') {
             return None;
         }
-        for _ in 0..len {
-            self.bump();
-        }
+        // The lookahead above already proved that all `len` bytes exist.
+        self.pos += len;
         Some(TokenKind::Label)
     }
 
