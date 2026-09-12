@@ -208,63 +208,87 @@ unsafe fn colreduce_avx2(
             // steady-state tile never branches on whether its output has been initialized.
             macro_rules! fold_block {
                 ($first:expr, $end:expr) => {{
-                let mut j = j0;
-                while j + 32 <= j1 {
-                    let mut a0 = if $first { ($vseed)(x.add(j)) } else { _mm256_loadu_ps(out.add(j)) };
-                    let mut a1 = if $first { ($vseed)(x.add(j + 8)) } else { _mm256_loadu_ps(out.add(j + 8)) };
-                    let mut a2 = if $first { ($vseed)(x.add(j + 16)) } else { _mm256_loadu_ps(out.add(j + 16)) };
-                    let mut a3 = if $first { ($vseed)(x.add(j + 24)) } else { _mm256_loadu_ps(out.add(j + 24)) };
-                    let mut k = i;
-                    while k < $end {
-                        let xr = x.add(k * cols + j);
-                        a0 = {
-                            let ($a, $v) = (a0, _mm256_loadu_ps(xr));
-                            $vfold
+                    let mut j = j0;
+                    while j + 32 <= j1 {
+                        let mut a0 = if $first {
+                            ($vseed)(x.add(j))
+                        } else {
+                            _mm256_loadu_ps(out.add(j))
                         };
-                        a1 = {
-                            let ($a, $v) = (a1, _mm256_loadu_ps(xr.add(8)));
-                            $vfold
+                        let mut a1 = if $first {
+                            ($vseed)(x.add(j + 8))
+                        } else {
+                            _mm256_loadu_ps(out.add(j + 8))
                         };
-                        a2 = {
-                            let ($a, $v) = (a2, _mm256_loadu_ps(xr.add(16)));
-                            $vfold
+                        let mut a2 = if $first {
+                            ($vseed)(x.add(j + 16))
+                        } else {
+                            _mm256_loadu_ps(out.add(j + 16))
                         };
-                        a3 = {
-                            let ($a, $v) = (a3, _mm256_loadu_ps(xr.add(24)));
-                            $vfold
+                        let mut a3 = if $first {
+                            ($vseed)(x.add(j + 24))
+                        } else {
+                            _mm256_loadu_ps(out.add(j + 24))
                         };
-                        k += 1;
+                        let mut k = i;
+                        while k < $end {
+                            let xr = x.add(k * cols + j);
+                            a0 = {
+                                let ($a, $v) = (a0, _mm256_loadu_ps(xr));
+                                $vfold
+                            };
+                            a1 = {
+                                let ($a, $v) = (a1, _mm256_loadu_ps(xr.add(8)));
+                                $vfold
+                            };
+                            a2 = {
+                                let ($a, $v) = (a2, _mm256_loadu_ps(xr.add(16)));
+                                $vfold
+                            };
+                            a3 = {
+                                let ($a, $v) = (a3, _mm256_loadu_ps(xr.add(24)));
+                                $vfold
+                            };
+                            k += 1;
+                        }
+                        _mm256_storeu_ps(out.add(j), a0);
+                        _mm256_storeu_ps(out.add(j + 8), a1);
+                        _mm256_storeu_ps(out.add(j + 16), a2);
+                        _mm256_storeu_ps(out.add(j + 24), a3);
+                        j += 32;
                     }
-                    _mm256_storeu_ps(out.add(j), a0);
-                    _mm256_storeu_ps(out.add(j + 8), a1);
-                    _mm256_storeu_ps(out.add(j + 16), a2);
-                    _mm256_storeu_ps(out.add(j + 24), a3);
-                    j += 32;
-                }
-                // (j1-j0) % 32 trailing columns of this row block: 8-wide, then scalar.
-                while j + 8 <= j1 {
-                    let mut acc = if $first { ($vseed)(x.add(j)) } else { _mm256_loadu_ps(out.add(j)) };
-                    let mut k = i;
-                    while k < $end {
-                        acc = {
-                            let ($a, $v) = (acc, _mm256_loadu_ps(x.add(k * cols + j)));
-                            $vfold
+                    // (j1-j0) % 32 trailing columns of this row block: 8-wide, then scalar.
+                    while j + 8 <= j1 {
+                        let mut acc = if $first {
+                            ($vseed)(x.add(j))
+                        } else {
+                            _mm256_loadu_ps(out.add(j))
                         };
-                        k += 1;
+                        let mut k = i;
+                        while k < $end {
+                            acc = {
+                                let ($a, $v) = (acc, _mm256_loadu_ps(x.add(k * cols + j)));
+                                $vfold
+                            };
+                            k += 1;
+                        }
+                        _mm256_storeu_ps(out.add(j), acc);
+                        j += 8;
                     }
-                    _mm256_storeu_ps(out.add(j), acc);
-                    j += 8;
-                }
-                while j < j1 {
-                    let mut s = if $first { ($sseed)(x.add(j)) } else { *out.add(j) };
-                    let mut k = i;
-                    while k < $end {
-                        s = $sfold(s, *x.add(k * cols + j));
-                        k += 1;
+                    while j < j1 {
+                        let mut s = if $first {
+                            ($sseed)(x.add(j))
+                        } else {
+                            *out.add(j)
+                        };
+                        let mut k = i;
+                        while k < $end {
+                            s = $sfold(s, *x.add(k * cols + j));
+                            k += 1;
+                        }
+                        *out.add(j) = s;
+                        j += 1;
                     }
-                    *out.add(j) = s;
-                    j += 1;
-                }
                 }};
             }
             // Even a seed-only Max/Min call (one row) needs the first block's output stores.

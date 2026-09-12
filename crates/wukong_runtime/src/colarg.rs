@@ -50,6 +50,11 @@ const COLARG_RB: usize = 4;
 /// work. Must stay a multiple of 8.
 const COLARG_JB: usize = 64;
 
+/// At most 4 KiB of stack scratch for the running values. This covers the documented 1024-column
+/// shapes and their parallel stripes; wider ranges retain the heap fallback instead of growing
+/// the stack with an unbounded caller dimension. The scratch is copied from row 0 before any read.
+const COLARG_STACK_COLS: usize = 1024;
+
 /// Scalar per-column argmax/argmin reference (the no-AVX2 fallback **and** the bit-exact oracle the
 /// AVX2 path must match lane-for-lane). For each column `j` in `[j0, j1)`: seed `best_row = 0`,
 /// `best_val = x[0*cols + j]`, then scan rows `1..rows` with a **strict** compare
@@ -133,8 +138,18 @@ unsafe fn colarg_avx2(
     let width = j1 - j0;
     // Seed the best values directly from row 0. The output is already disjoint from x and can hold
     // the exact integer indices throughout the scan: no second scratch buffer or conversion pass.
-    let mut best_val = std::slice::from_raw_parts(x.add(j0), width).to_vec();
-    let bvp = best_val.as_mut_ptr();
+    let mut stack = std::mem::MaybeUninit::<[f32; COLARG_STACK_COLS]>::uninit();
+    let mut heap;
+    let bvp = if width <= COLARG_STACK_COLS {
+        let p = stack.as_mut_ptr().cast::<f32>();
+        // Only the first `width` elements are subsequently read, and this copy initializes all of
+        // them. No reference to the uninitialized remainder is ever formed.
+        std::ptr::copy_nonoverlapping(x.add(j0), p, width);
+        p
+    } else {
+        heap = std::slice::from_raw_parts(x.add(j0), width).to_vec();
+        heap.as_mut_ptr()
+    };
     let bip = out.add(j0);
     std::ptr::write_bytes(bip, 0, width); // row 0
     const NB: usize = COLARG_JB / 8; // YMM lanes per tile
