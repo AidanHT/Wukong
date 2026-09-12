@@ -548,13 +548,24 @@ impl Sema<'_> {
             // monomorphizes the callee to `id$f32`. A dimension generic never appears as `Ty::Named`
             // (it is a `Dim::Var` inside a shape), so this binds only type generics; dims are still
             // inferred by `unify` from the shapes below.
-            infer_type_generics(param, arg, &sig.generics, &mut tys);
-            let p = apply_subst(param, &dims, &tys);
+            if !sig.generics.is_empty() {
+                infer_type_generics(param, arg, &sig.generics, &mut tys);
+            }
+            // Until an explicit or inferred binding exists, substitution is the identity.
+            // Borrow the parameter in that common case, avoiding a recursive clone of every
+            // aggregate/shape in non-generic calls and the first inference-only parameter.
+            let substituted;
+            let p = if dims.is_empty() && tys.is_empty() {
+                param
+            } else {
+                substituted = apply_subst(param, &dims, &tys);
+                &substituted
+            };
             // Call site: the callee's not-yet-substituted dim vars are INFERENCE variables to bind
             // from the argument shapes (`rigid == false`). `param` — the DECLARED type, before the
             // substitution that produced `p` — rides along so a mismatch can be reported against the
             // name the signature wrote (`K`), not just the extent it resolved to.
-            self.unify_decl(&p, arg, Some(param), &mut dims, span, false);
+            self.unify_decl(p, arg, Some(param), &mut dims, span, false);
         }
 
         apply_subst(&sig.ret, &dims, &tys)

@@ -26,6 +26,8 @@ mod attrs;
 mod dependency;
 mod shape;
 
+use std::cell::RefCell;
+
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use wukong_ast::*;
@@ -334,6 +336,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         ret_ty: Ty::Unit,
         loop_ctx: Vec::new(),
         consts: HashMap::default(),
+        const_lengths: RefCell::new(HashMap::default()),
         checking_bodies: false,
         parallel_fn: false,
     };
@@ -354,7 +357,11 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     let result = SemaResult {
         types: s.types,
         defs: s.defs,
-        consts: s.consts,
+        consts: s
+            .consts
+            .into_iter()
+            .map(|(name, init)| (name, init.clone()))
+            .collect(),
     };
     (result, s.diags)
 }
@@ -387,8 +394,14 @@ struct Sema<'a> {
     /// E0303. Each frame also carries whether the loop is used as a *value* (so `break v` is legal)
     /// and the running join of its break-value types (the loop's inferred type).
     loop_ctx: Vec<LoopCtx>,
-    /// Top-level `const` initializer expressions (by name), accumulated as their bodies are checked.
-    consts: HashMap<Symbol, Expr>,
+    /// Top-level `const` initializer expressions (by name), borrowed from the immutable input AST.
+    /// Literal adaptation updates `types`, never the initializer; clone each surviving initializer
+    /// only when publishing the owned `SemaResult`.
+    consts: HashMap<Symbol, &'a Expr>,
+    /// Length folds by constant name and the initializer's recursion depth. Depth is observable:
+    /// the existing evaluator substitutes zero past 64, including in rejected cyclic programs.
+    /// Invalidate when a constant initializer changes or a new enum enables discriminant lookup.
+    const_lengths: RefCell<HashMap<(Symbol, u32), u64>>,
     /// `false` during the collection pass, `true` once body checking starts. Gates the
     /// undeclared-tensor-dimension diagnostic (`lower_dim`): reporting it only in the body pass means
     /// every top-level `const` is registered and each item's generics are re-established, so an
@@ -413,7 +426,7 @@ struct LoopCtx {
     break_ty: Option<Ty>,
 }
 
-impl Sema<'_> {
+impl<'a> Sema<'a> {
     fn error(&mut self, span: Span, code: &'static str, msg: impl Into<String>) {
         self.diags
             .push(Diagnostic::error(msg).with_code(code).primary(span, ""));
@@ -425,7 +438,7 @@ impl Sema<'_> {
 
     // ---- Collection pass: register all top-level defs with lowered signatures ----
 
-    fn collect(&mut self, module: &Module) {
+    fn collect(&mut self, module: &'a Module) {
         for item in &module.items {
             match &item.kind {
                 ItemKind::Fn(f) => self.collect_fn(f),
@@ -435,7 +448,7 @@ impl Sema<'_> {
                     // Record the initializer now (it is re-recorded, with its nodes typed, by
                     // `check_const`) so a `const` used as a tensor/array index can be resolved to its
                     // value by the compile-time bounds check regardless of source order.
-                    self.consts.insert(c.name.sym, c.value.clone());
+                    self.record_const(c);
                 }
                 ItemKind::Struct(s) => {
                     self.generics = generic_names(&s.generics);
@@ -593,17 +606,22 @@ impl Sema<'_> {
                 _ => {}
             }
         }
-        let key = |d: &Diagnostic| (d.code, d.message.clone(), d.labels.first().map(|l| l.span));
-        let seen: HashSet<(Option<&'static str>, String, Option<Span>)> =
-            self.diags[..before].iter().map(key).collect();
-        let mut i = before;
-        while i < self.diags.len() {
-            if seen.contains(&key(&self.diags[i])) {
-                self.diags.remove(i);
-            } else {
-                i += 1;
-            }
+        if before == 0 || self.diags.len() == before {
+            return;
         }
+        // The old remove-at-index loop shifted every later diagnostic for every duplicate.
+        // Filter the new suffix in order, borrowing message text from the untouched prefix.
+        // Only collection-pass duplicates are removed: equal NEW diagnostics must both survive.
+        let mut rechecked = self.diags.split_off(before);
+        let seen: HashSet<_> = self
+            .diags
+            .iter()
+            .map(|d| (d.code, d.message.as_str(), d.labels.first().map(|l| l.span)))
+            .collect();
+        rechecked.retain(|d| {
+            !seen.contains(&(d.code, d.message.as_str(), d.labels.first().map(|l| l.span)))
+        });
+        self.diags.extend(rechecked);
     }
 
     /// Reject a struct that contains itself by value — directly (`struct S { x: S }`) or transitively
@@ -823,6 +841,11 @@ impl Sema<'_> {
             return;
         }
         let idx = self.defs.defs.len();
+        if matches!(kind, DefKind::Enum(_)) {
+            // A previously unresolved E::V in an initializer can now resolve. Non-enum
+            // definitions cannot change enum_variant_disc, and duplicates returned above.
+            self.const_lengths.get_mut().clear();
+        }
         self.defs.defs.push(Def {
             name: name.sym,
             kind,
@@ -928,8 +951,8 @@ impl Sema<'_> {
                 // bounds/agreement checking entirely (interp trapped a[7] out-of-bounds while native
                 // read past the buffer — a differential-gate divergence on plausible code). Mirrors
                 // the array-length resolution above so the two agree on the value.
-                if let Some(init) = self.consts.get(s).cloned() {
-                    return Dim::Const(self.eval_usize_depth(&init, 0));
+                if self.consts.contains_key(s) {
+                    return Dim::Const(self.const_length(*s, 0));
                 }
                 // Neither a generic nor a const: an undeclared dim name is a typo, not a fresh
                 // implicit dim. Previously `Tensor[f32, KK]` (when only `K` was declared) silently
@@ -982,6 +1005,38 @@ impl Sema<'_> {
 
     fn eval_usize(&self, e: &Expr) -> u64 {
         self.eval_usize_depth(e, 0)
+    }
+
+    /// Fold a recorded initializer at the caller's exact remaining depth budget. Shared DAG
+    /// dependencies are expanded once per (name, depth), not once per incoming expression path.
+    /// No cache borrow survives the recursive call, so cycles still reach the ordinary depth cap.
+    fn const_length(&self, name: Symbol, depth: u32) -> u64 {
+        if depth > 64 {
+            return 0;
+        }
+        if let Some(&value) = self.const_lengths.borrow().get(&(name, depth)) {
+            return value;
+        }
+        let Some(init) = self.consts.get(&name) else {
+            return 0;
+        };
+        let value = self.eval_usize_depth(init, depth);
+        self.const_lengths.borrow_mut().insert((name, depth), value);
+        value
+    }
+
+    fn record_const(&mut self, c: &'a ConstDecl) {
+        if self
+            .consts
+            .get(&c.name.sym)
+            .is_some_and(|init| std::ptr::eq(*init, &c.value))
+        {
+            // A valid declaration's body only changes type side tables. Retain cached folds
+            // across that visit; duplicate declarations still replace the initializer in order.
+            return;
+        }
+        self.consts.insert(c.name.sym, &c.value);
+        self.const_lengths.get_mut().clear();
     }
 
     /// A fixed-size array's compile-time length, with the two diagnostics `eval_usize` cannot report
@@ -1078,10 +1133,7 @@ impl Sema<'_> {
             // program rejected as "length 0", or (when sema's short length reached a struct layout)
             // silent stack corruption both backends agreed on.
             ExprKind::Int(s) => parse_u64_text(self.sym_str(*s)).unwrap_or(0),
-            ExprKind::Path(p) if p.is_single() => match self.consts.get(&p.first().sym) {
-                Some(init) => self.eval_usize_depth(init, depth + 1),
-                None => 0,
-            },
+            ExprKind::Path(p) if p.is_single() => self.const_length(p.first().sym, depth + 1),
             // Const arithmetic in a length (`[i32; 2+2]`, `[i32; N+1]`): fold via the shared
             // `BinOp::fold_const_len` that mir_build's `const_usize_expr` also uses, so the slot size
             // and this bounds check agree. Previously this fell to `_ => 0`, sizing the array 0 (an
@@ -1106,7 +1158,7 @@ impl Sema<'_> {
 
     // ---- Body checking ----
 
-    fn check_bodies(&mut self, module: &Module) {
+    fn check_bodies(&mut self, module: &'a Module) {
         for item in &module.items {
             match &item.kind {
                 ItemKind::Fn(f) => {
@@ -1124,7 +1176,7 @@ impl Sema<'_> {
     /// unsuffixed literal adapts to the annotated type) and record the initializer so `mir_build`
     /// can inline it at each use site. Evaluated at module scope (a const may reference another
     /// const by name, resolved through the def map, not local scopes).
-    fn check_const(&mut self, c: &ConstDecl, span: Span) {
+    fn check_const(&mut self, c: &'a ConstDecl, span: Span) {
         self.generics.clear();
         self.scopes.clear();
         self.scopes.push(HashMap::default());
@@ -1155,7 +1207,7 @@ impl Sema<'_> {
                 ),
             );
         }
-        self.consts.insert(c.name.sym, c.value.clone());
+        self.record_const(c);
     }
 
     fn check_fn(&mut self, f: &FnDecl, body: &Block, item_attrs: &[Attr]) {
