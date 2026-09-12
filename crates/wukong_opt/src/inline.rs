@@ -350,7 +350,7 @@ fn loop_blocks(f: &Function) -> Vec<bool> {
     let adj: Vec<Vec<u32>> = f
         .blocks
         .iter()
-        .map(|b| cfg::successors(&b.term).iter().map(|s| s.0).collect())
+        .map(|b| cfg::successors(&b.term).map(|s| s.0).collect())
         .collect();
     let mut out = vec![false; f.blocks.len()];
     for comp in strongly_connected(&adj) {

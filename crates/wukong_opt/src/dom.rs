@@ -88,9 +88,14 @@ pub(crate) fn dominance_frontiers_from(
         for &p in ps {
             let mut runner = p;
             while runner != id_b && runner != NONE {
-                if !df[runner as usize].contains(&b) {
-                    df[runner as usize].push(b);
+                let frontier = &mut df[runner as usize];
+                // Joins are processed in ascending order, so b can only be the last entry.
+                // If another predecessor already reached this runner, its entire remaining
+                // ancestor path was visited too: stop instead of walking that common tail again.
+                if frontier.last() == Some(&b) {
+                    break;
                 }
+                frontier.push(b);
                 runner = idom[runner as usize];
             }
         }
