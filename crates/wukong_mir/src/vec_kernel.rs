@@ -146,6 +146,15 @@ pub struct VecKernel {
     pub reduce: Option<VecReduce>,
 }
 
+/// Reusable storage for reference lane evaluation. Each evaluation resets its values and
+/// store-forwarding state, so one scratch can serve successive lanes or different kernels.
+/// Capacity is retained until this value is dropped; it contains no references to stream memory.
+#[derive(Default)]
+pub struct VecKernelScratch {
+    vals: Vec<f32>,
+    stored: Vec<Option<f32>>,
+}
+
 impl VecKernel {
     /// Evaluate the body for one lane and write its stores. `load(stream)` yields that stream's
     /// current element, `scalar(k)` the k-th invariant, `store(stream, v)` writes an output. This is
@@ -159,24 +168,41 @@ impl VecKernel {
         scalar: impl Fn(u32) -> f32,
         store: impl FnMut(u32, f32),
     ) {
-        self.eval_all(load, scalar, store);
+        self.eval_lane_with_scratch(&mut VecKernelScratch::default(), load, scalar, store);
     }
 
-    /// Evaluate every op for one lane, returning all their values (the reference used by both
+    /// Evaluate a lane with reusable storage. Callback order and numerical semantics match
+    /// [`Self::eval_lane`]; retained capacity avoids allocating fresh scratch for each lane.
+    pub fn eval_lane_with_scratch(
+        &self,
+        scratch: &mut VecKernelScratch,
+        load: impl FnMut(u32) -> f32,
+        scalar: impl Fn(u32) -> f32,
+        store: impl FnMut(u32, f32),
+    ) {
+        self.eval_all(scratch, load, scalar, store);
+    }
+
+    /// Evaluate every op for one lane, retaining all its values in scratch (the reference used by both
     /// [`Self::eval_lane`] for elementwise kernels and [`Self::eval_reduction`] for reductions).
     fn eval_all(
         &self,
+        scratch: &mut VecKernelScratch,
         mut load: impl FnMut(u32) -> f32,
         scalar: impl Fn(u32) -> f32,
         mut store: impl FnMut(u32, f32),
-    ) -> Vec<f32> {
-        let mut vals: Vec<f32> = Vec::with_capacity(self.ops.len());
+    ) {
+        let VecKernelScratch { vals, stored } = scratch;
+        vals.clear();
+        vals.reserve(self.ops.len());
         // Store-to-load forwarding within the lane: the assembler stores each stream to memory and a
         // later `Load` of that stream re-reads the same address, so a body that writes then reads a
         // stream — e.g. a fused `t[k] = …; o[k] = f(t[k])` — observes the just-written value. Mirror
         // that here so the interpreter oracle matches the machine code bit-for-bit. `self.streams`
         // bounds every stream index.
-        let mut stored: Vec<Option<f32>> = vec![None; self.streams as usize];
+        // Reset even when the stream count is unchanged: forwarding never crosses a lane boundary.
+        stored.clear();
+        stored.resize(self.streams as usize, None);
         for op in &self.ops {
             let v = match *op {
                 VecOp::Load { stream } => stored[stream as usize].unwrap_or_else(|| load(stream)),
@@ -228,7 +254,6 @@ impl VecKernel {
             };
             vals.push(v);
         }
-        vals
     }
 
     /// The unroll a reduction kernel uses: as many accumulator copies as the requested unroll, capped
@@ -283,6 +308,7 @@ impl VecKernel {
         // acc[copy * lanes + lane]. The addend of element `e` is op `red.value` evaluated with the
         // load closure reading element `e`.
         let mut acc = vec![red.op.identity(); u * lanes];
+        let mut scratch = VecKernelScratch::default();
         let mut i = 0usize;
         // Main loop: U independent accumulators, computed and folded one copy at a time.
         let ustep = u * lanes;
@@ -290,9 +316,9 @@ impl VecKernel {
             for cu in 0..u {
                 for lane in 0..lanes {
                     let e = i + cu * lanes + lane;
-                    let vals = self.eval_all(|s| load(s, e), &scalar, |_, _| {});
+                    self.eval_all(&mut scratch, |s| load(s, e), &scalar, |_, _| {});
                     let idx = cu * lanes + lane;
-                    acc[idx] = addend(acc[idx], &vals);
+                    acc[idx] = addend(acc[idx], &scratch.vals);
                 }
             }
             i += ustep;
@@ -301,8 +327,8 @@ impl VecKernel {
         while i + lanes <= n {
             for (lane, a) in acc.iter_mut().take(lanes).enumerate() {
                 let e = i + lane;
-                let vals = self.eval_all(|s| load(s, e), &scalar, |_, _| {});
-                *a = addend(*a, &vals);
+                self.eval_all(&mut scratch, |s| load(s, e), &scalar, |_, _| {});
+                *a = addend(*a, &scratch.vals);
             }
             i += lanes;
         }

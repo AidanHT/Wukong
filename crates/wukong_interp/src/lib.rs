@@ -955,6 +955,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                     // precondition), so no hazard.
                     let mut stores: Vec<(u32, f32)> = Vec::new();
                     let mut loads: Vec<f32> = Vec::with_capacity(stream_bases.len());
+                    let mut scratch = wukong_mir::vec_kernel::VecKernelScratch::default();
                     for i in 0..count {
                         loads.clear();
                         for &b in &stream_bases {
@@ -966,7 +967,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                             );
                         }
                         stores.clear();
-                        kern.eval_lane(
+                        kern.eval_lane_with_scratch(
+                            &mut scratch,
                             |s| loads[s as usize],
                             |k| scalar_vals[k as usize],
                             |s, v| stores.push((s, v)),
