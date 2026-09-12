@@ -19,6 +19,7 @@ are renting silicon, reading derivation dossiers, or working on `wukong_codegen_
 | [Language branch reports](lang/README.md) | Per-lane implementation records for master-plan Phases 0–3, plus the list of claims in them that a later gate falsified. A record of what each lane did, never the current state. |
 | [Language guide](language-guide.md) | The `.wk` surface — types, tensors, control flow, `@parallel`, CLI flags — with an honest maturity legend per feature. |
 | [Compiler internals](internals.md) | Crate layering, the lexer→MIR pipeline, optimizer passes, the four execution backends, recognizers, and the test gates. |
+| [CPU optimization review](cpu-optimization-review-2026-09.md) | September 2026 branch audit, compiler/runtime changes, strengths, remaining gaps and links to the deferred CPU validation runbook. |
 | [Roadmap & limitations](roadmap.md) | What runs today, what is checked-only, known sharp edges, and planned work — language and compiler first, GPU as one backend among several. |
 | [LLVM setup](llvm-setup.md) | The **optional** textual-LLVM path (`--emit=llvm-ir`). The default native path is Cranelift and needs no LLVM. |
 
