@@ -23,6 +23,7 @@
 //! and `const` is registered.
 
 mod attrs;
+mod dependency;
 mod shape;
 
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -611,6 +612,16 @@ impl Sema<'_> {
     /// the indirection). A field behind a pointer/reference has fixed size and breaks the cycle, as
     /// in C/Rust (cf. Rust's E0072). Runs after `collect`, when every struct is registered.
     fn check_recursive_types(&mut self, module: &Module) {
+        // Build each containment list once, then classify all cycles together. Repeating a DFS
+        // per declaration (with a linear visited list) made long acyclic type chains cubic.
+        let graph = self
+            .defs
+            .defs
+            .iter()
+            .filter(|d| matches!(d.kind, DefKind::Struct(_) | DefKind::Enum(_)))
+            .map(|d| (d.name, self.contained_types(d.name)))
+            .collect();
+        let cyclic = dependency::cyclic_nodes(&graph);
         for item in &module.items {
             // A struct or a data-carrying enum can be recursive by value; a C-style enum holds
             // nothing (`contained_types` returns empty for it), so it can never be flagged.
@@ -619,22 +630,7 @@ impl Sema<'_> {
                 ItemKind::Enum(e) => (e.name.sym, "enum"),
                 _ => continue,
             };
-            // DFS over by-value containment from `root`; reaching `root` means infinite size.
-            let mut stack = self.contained_types(root);
-            let mut visited: Vec<Symbol> = Vec::new();
-            let mut recursive = false;
-            while let Some(cur) = stack.pop() {
-                if cur == root {
-                    recursive = true;
-                    break;
-                }
-                if visited.contains(&cur) {
-                    continue;
-                }
-                visited.push(cur);
-                stack.extend(self.contained_types(cur));
-            }
-            if recursive {
+            if cyclic.contains(&root) {
                 let nm = self.sym_str(root).to_string();
                 self.error(
                     item.span,
@@ -662,8 +658,18 @@ impl Sema<'_> {
             }
             Some(DefKind::Enum(variants)) => {
                 for v in variants {
-                    for fty in v.payload.field_tys() {
-                        collect_value_structs(&fty, &mut out);
+                    match &v.payload {
+                        VariantPayload::Unit => {}
+                        VariantPayload::Tuple(fields) => {
+                            for fty in fields {
+                                collect_value_structs(fty, &mut out);
+                            }
+                        }
+                        VariantPayload::Struct(fields) => {
+                            for (_, fty) in fields {
+                                collect_value_structs(fty, &mut out);
+                            }
+                        }
                     }
                 }
             }
