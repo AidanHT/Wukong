@@ -3581,10 +3581,13 @@ impl FnLowerer<'_> {
     // ---- type helpers ----
 
     fn expr_ty(&self, e: &Expr) -> Ty {
-        let raw = self.sema.types.get(&e.id).cloned().unwrap_or(Ty::Unknown);
         // In a monomorphized instance, resolve a generic type parameter to its concrete type so op
-        // selection, coercion, and widths all see the real type (a no-op when `subst` is empty).
-        subst_ty(&raw, &self.subst)
+        // selection, coercion, and widths all see the real type. Substitution already returns an
+        // owned type, so borrow its input instead of cloning the entire type tree twice.
+        self.sema
+            .types
+            .get(&e.id)
+            .map_or(Ty::Unknown, |raw| subst_ty(raw, &self.subst))
     }
 
     /// Is `e`'s type a string (`*u8`)? Routes a `print`/`println` argument to the byte-rendering
