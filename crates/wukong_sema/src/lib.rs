@@ -354,7 +354,11 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     let result = SemaResult {
         types: s.types,
         defs: s.defs,
-        consts: s.consts,
+        consts: s
+            .consts
+            .into_iter()
+            .map(|(name, init)| (name, init.clone()))
+            .collect(),
     };
     (result, s.diags)
 }
@@ -387,8 +391,10 @@ struct Sema<'a> {
     /// E0303. Each frame also carries whether the loop is used as a *value* (so `break v` is legal)
     /// and the running join of its break-value types (the loop's inferred type).
     loop_ctx: Vec<LoopCtx>,
-    /// Top-level `const` initializer expressions (by name), accumulated as their bodies are checked.
-    consts: HashMap<Symbol, Expr>,
+    /// Top-level `const` initializer expressions (by name), borrowed from the immutable input AST.
+    /// Literal adaptation updates `types`, never the initializer; clone each surviving initializer
+    /// only when publishing the owned `SemaResult`.
+    consts: HashMap<Symbol, &'a Expr>,
     /// `false` during the collection pass, `true` once body checking starts. Gates the
     /// undeclared-tensor-dimension diagnostic (`lower_dim`): reporting it only in the body pass means
     /// every top-level `const` is registered and each item's generics are re-established, so an
@@ -413,7 +419,7 @@ struct LoopCtx {
     break_ty: Option<Ty>,
 }
 
-impl Sema<'_> {
+impl<'a> Sema<'a> {
     fn error(&mut self, span: Span, code: &'static str, msg: impl Into<String>) {
         self.diags
             .push(Diagnostic::error(msg).with_code(code).primary(span, ""));
@@ -425,7 +431,7 @@ impl Sema<'_> {
 
     // ---- Collection pass: register all top-level defs with lowered signatures ----
 
-    fn collect(&mut self, module: &Module) {
+    fn collect(&mut self, module: &'a Module) {
         for item in &module.items {
             match &item.kind {
                 ItemKind::Fn(f) => self.collect_fn(f),
@@ -435,7 +441,7 @@ impl Sema<'_> {
                     // Record the initializer now (it is re-recorded, with its nodes typed, by
                     // `check_const`) so a `const` used as a tensor/array index can be resolved to its
                     // value by the compile-time bounds check regardless of source order.
-                    self.consts.insert(c.name.sym, c.value.clone());
+                    self.consts.insert(c.name.sym, &c.value);
                 }
                 ItemKind::Struct(s) => {
                     self.generics = generic_names(&s.generics);
@@ -928,8 +934,8 @@ impl Sema<'_> {
                 // bounds/agreement checking entirely (interp trapped a[7] out-of-bounds while native
                 // read past the buffer — a differential-gate divergence on plausible code). Mirrors
                 // the array-length resolution above so the two agree on the value.
-                if let Some(init) = self.consts.get(s).cloned() {
-                    return Dim::Const(self.eval_usize_depth(&init, 0));
+                if let Some(init) = self.consts.get(s) {
+                    return Dim::Const(self.eval_usize_depth(init, 0));
                 }
                 // Neither a generic nor a const: an undeclared dim name is a typo, not a fresh
                 // implicit dim. Previously `Tensor[f32, KK]` (when only `K` was declared) silently
@@ -1106,7 +1112,7 @@ impl Sema<'_> {
 
     // ---- Body checking ----
 
-    fn check_bodies(&mut self, module: &Module) {
+    fn check_bodies(&mut self, module: &'a Module) {
         for item in &module.items {
             match &item.kind {
                 ItemKind::Fn(f) => {
@@ -1124,7 +1130,7 @@ impl Sema<'_> {
     /// unsuffixed literal adapts to the annotated type) and record the initializer so `mir_build`
     /// can inline it at each use site. Evaluated at module scope (a const may reference another
     /// const by name, resolved through the def map, not local scopes).
-    fn check_const(&mut self, c: &ConstDecl, span: Span) {
+    fn check_const(&mut self, c: &'a ConstDecl, span: Span) {
         self.generics.clear();
         self.scopes.clear();
         self.scopes.push(HashMap::default());
@@ -1155,7 +1161,7 @@ impl Sema<'_> {
                 ),
             );
         }
-        self.consts.insert(c.name.sym, c.value.clone());
+        self.consts.insert(c.name.sym, &c.value);
     }
 
     fn check_fn(&mut self, f: &FnDecl, body: &Block, item_attrs: &[Attr]) {
