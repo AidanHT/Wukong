@@ -1139,7 +1139,7 @@ enum Role {
 ///
 /// The list is the ops [`plan_body`] knows how to widen, minus the ones whose operands are
 /// addresses. It is a filter, not a promise: `plan_body` still has to accept the widened form (an
-/// integer divide, an `i8` multiply and every shift are refused there by [`bin_widenable`], and a
+/// integer divide, an `i8` multiply and direct shifts are refused there by [`bin_widenable`], and a
 /// lane-width-changing cast by [`cast_widenable`]), so anything this lets through and that cannot
 /// actually be widened comes back as a plain decline rather than bad MIR.
 fn ramp_consumable(op: &Op) -> bool {
@@ -2963,10 +2963,10 @@ mod tests {
     /// A MIR vector shift is lane-wise; Cranelift's is a broadcast of one scalar amount. Widening
     /// `x[i] << 2` therefore built an `ishl.i32x4` whose second operand was a vector, which the
     /// CLIF verifier rejects — and the verifier only runs in a debug build, so in release the same
-    /// program reached lowering and panicked inside Cranelift's ISLE. Refused at every width and
-    /// for every direction.
+    /// program reached lowering and panicked inside Cranelift's ISLE. Only constant left shifts
+    /// with a supported packed multiply now widen through a different opcode.
     #[test]
-    fn a_shift_is_refused_at_every_width() {
+    fn shifts_widen_only_through_a_supported_constant_multiply() {
         for (ty, lit) in [
             ("i8", "(2 as i8)"),
             ("i16", "(2 as i16)"),
@@ -2979,8 +2979,22 @@ mod tests {
                      while i < n {{ o[i] = x[i] {op} {lit}; i = i + 1; }} }} \
                      fn main() -> i32 {{ return 0; }}"
                 );
-                assert!(!is_widened(&src, "k"), "{ty} {op} must not be widened");
+                assert_eq!(
+                    is_widened(&src, "k"),
+                    op == "<<" && ty != "i8",
+                    "{ty} {op} eligibility"
+                );
             }
+            let variable = format!(
+                "fn k(x: [{ty}; 64], mut o: [{ty}; 64], amount: {ty}, n: i64) {{ \
+                 let mut i: i64 = 0; while i < n {{ \
+                 o[i] = x[i] << amount; i = i + 1; }} }} \
+                 fn main() -> i32 {{ return 0; }}"
+            );
+            assert!(
+                !is_widened(&variable, "k"),
+                "{ty} variable shift must stay scalar"
+            );
         }
     }
 
