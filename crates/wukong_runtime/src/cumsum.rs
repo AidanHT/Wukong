@@ -43,9 +43,9 @@ unsafe fn cumsum_row_scalar(x: *const f32, out: *mut f32, base: usize, cols: usi
 ///
 /// The three steps shift the lanes right by 1, 2, then 4 — **filling the vacated low lanes with 0.0** —
 /// and add. The shift is a full 8-lane cross-128-bit shift (NOT the per-128-bit `_mm256_slli_si256`),
-/// done with `_mm256_permutevar8x32_ps` to gather each lane from `j - s` and `_mm256_blendv_ps` to zero
-/// the `s` low lanes that have no source. `permutevar8x32` is a single cross-lane shuffle, so the
-/// 128-bit boundary is crossed correctly by construction; the blend masks pin the zero-fill (the
+/// done with `_mm256_permutevar8x32_ps` and an immediate blend for shifts 1 and 2. Shift 4 moves the
+/// low 128 bits into the high half while zeroing the low half in one `permute2f128`. The
+/// 128-bit boundary is crossed correctly by construction; the immediate controls pin the zero-fill (the
 /// `scalar_vs_avx2_lane_shift` test verifies the exact `[1,2,3,4,5,6,7,8]`-style pattern on integers).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -54,25 +54,19 @@ unsafe fn inclusive_scan8(v: std::arch::x86_64::__m256) -> std::arch::x86_64::__
     use std::arch::x86_64::*;
     // Permute indices: lane j reads source lane (j - s), saturated at 0 for j < s (those lanes are then
     // overwritten with 0.0 by the blend, so the saturated index value is irrelevant).
-    // s = 1: [0,0,1,2,3,4,5,6]; s = 2: [0,0,0,1,2,3,4,5]; s = 4: [0,0,0,0,0,1,2,3].
+    // s = 1: [0,0,1,2,3,4,5,6]; s = 2: [0,0,0,1,2,3,4,5].
     let idx1 = _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6);
     let idx2 = _mm256_setr_epi32(0, 0, 0, 1, 2, 3, 4, 5);
-    let idx4 = _mm256_setr_epi32(0, 0, 0, 0, 0, 1, 2, 3);
-    // Blend masks: high bit set on the lanes to take from the *shifted* (zero) operand, i.e. the first s
-    // lanes. `_mm256_blendv_ps(a, b, mask)` picks b where mask's sign bit is set.
     let zero = _mm256_setzero_ps();
-    let m1 = _mm256_castsi256_ps(_mm256_setr_epi32(-1, 0, 0, 0, 0, 0, 0, 0));
-    let m2 = _mm256_castsi256_ps(_mm256_setr_epi32(-1, -1, 0, 0, 0, 0, 0, 0));
-    let m4 = _mm256_castsi256_ps(_mm256_setr_epi32(-1, -1, -1, -1, 0, 0, 0, 0));
 
     // step 1: v += shift_right_1(v)
-    let s1 = _mm256_blendv_ps(_mm256_permutevar8x32_ps(v, idx1), zero, m1);
+    let s1 = _mm256_blend_ps::<0x01>(_mm256_permutevar8x32_ps(v, idx1), zero);
     let v = _mm256_add_ps(v, s1);
     // step 2: v += shift_right_2(v)
-    let s2 = _mm256_blendv_ps(_mm256_permutevar8x32_ps(v, idx2), zero, m2);
+    let s2 = _mm256_blend_ps::<0x03>(_mm256_permutevar8x32_ps(v, idx2), zero);
     let v = _mm256_add_ps(v, s2);
     // step 4: v += shift_right_4(v)
-    let s4 = _mm256_blendv_ps(_mm256_permutevar8x32_ps(v, idx4), zero, m4);
+    let s4 = _mm256_permute2f128_ps::<0x08>(v, v);
     _mm256_add_ps(v, s4)
 }
 
@@ -90,21 +84,22 @@ unsafe fn cumsum_row_avx2(x: *const f32, out: *mut f32, base: usize, cols: usize
     use std::arch::x86_64::*;
     let xb = x.add(base);
     let ob = out.add(base);
-    let mut carry = 0.0f32;
+    // Keep the carry in vector registers between blocks: lane 7 is broadcast directly instead of
+    // crossing to a scalar and back on every iteration. Only the scalar tail needs extraction.
+    let mut carry = _mm256_setzero_ps();
+    let last_lane = _mm256_set1_epi32(7);
     let mut i = 0usize;
     while i + 8 <= cols {
         let v = _mm256_loadu_ps(xb.add(i));
         let scan = inclusive_scan8(v);
-        let res = _mm256_add_ps(scan, _mm256_set1_ps(carry));
+        let res = _mm256_add_ps(scan, carry);
         _mm256_storeu_ps(ob.add(i), res);
-        // carry = last lane of res = running total through this block. Extract lane 7 by storing the
-        // upper 128 and taking its top element (a plain scalar read, no horizontal op needed).
-        let hi = _mm256_extractf128_ps(res, 1);
-        carry = _mm_cvtss_f32(_mm_shuffle_ps(hi, hi, 0b11_11_11_11));
+        carry = _mm256_permutevar8x32_ps(res, last_lane);
         i += 8;
     }
     // Scalar tail — strict left-to-right, continuing the same carry (identical to the scalar twin's
     // recurrence on these elements).
+    let mut carry = _mm_cvtss_f32(_mm256_castps256_ps128(carry));
     while i < cols {
         carry += *xb.add(i);
         *ob.add(i) = carry;
