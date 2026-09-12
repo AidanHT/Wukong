@@ -19443,14 +19443,15 @@ impl FnLowerer<'_> {
         // When the dims are compile-time constants, every buffer whose extent the type pins must hold
         // the `s*d` elements the kernel reads/writes. A dynamic dim or an unsized view stays the
         // caller's responsibility, as documented on `wukong_attention_f32`.
-        if let (Some(s), Some(d)) = (
-            self.const_runtime_u64_expr(&args[4]),
-            self.const_runtime_u64_expr(&args[5]),
-        ) {
-            // The runtime takes signed i64 dimensions. Do not narrow a known unsigned value
-            // into a negative one, or let an overflowing product bypass the buffer-size check.
-            i64::try_from(s).ok()?;
-            i64::try_from(d).ok()?;
+        let s = self.const_runtime_u64_expr(&args[4]);
+        let d = self.const_runtime_u64_expr(&args[5]);
+        // The runtime takes signed i64 dimensions. A known unsigned value must fit even when
+        // the other dimension is dynamic; otherwise it becomes a negative, no-op dimension.
+        for dim in [s, d].into_iter().flatten() {
+            i64::try_from(dim).ok()?;
+        }
+        if let (Some(s), Some(d)) = (s, d) {
+            // An overflowing product cannot bypass the fixed-buffer extent check.
             let need = s.checked_mul(d)?;
             if extents.iter().any(|e| e.is_some_and(|len| len < need)) {
                 return None;
