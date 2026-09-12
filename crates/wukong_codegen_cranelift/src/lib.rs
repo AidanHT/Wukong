@@ -432,19 +432,19 @@ fn align_shift(bytes: u32) -> u8 {
     shift
 }
 
-fn successors(t: &Terminator) -> Vec<u32> {
+fn successors(t: &Terminator) -> [Option<u32>; 2] {
     match t {
-        Terminator::Br { target, .. } => vec![target.0],
+        Terminator::Br { target, .. } => [Some(target.0), None],
         Terminator::CondBr {
             then_blk, else_blk, ..
         } => {
             if then_blk == else_blk {
-                vec![then_blk.0]
+                [Some(then_blk.0), None]
             } else {
-                vec![then_blk.0, else_blk.0]
+                [Some(then_blk.0), Some(else_blk.0)]
             }
         }
-        Terminator::Ret(_) | Terminator::Unreachable => vec![],
+        Terminator::Ret(_) | Terminator::Unreachable => [None, None],
     }
 }
 
@@ -532,13 +532,12 @@ impl<'a> FnTranslator<'a> {
     /// Reverse-postorder of blocks so every definition is emitted before its uses.
     fn rpo(func: &Function) -> Vec<u32> {
         let mut visited = vec![false; func.blocks.len()];
-        let mut post = Vec::new();
+        let mut post = Vec::with_capacity(func.blocks.len());
         let mut stack = vec![(func.entry.0, 0usize)];
         visited[func.entry.0 as usize] = true;
         while let Some(&mut (b, ref mut i)) = stack.last_mut() {
             let succs = successors(&func.blocks[b as usize].term);
-            if *i < succs.len() {
-                let s = succs[*i];
+            if let Some(s) = succs.get(*i).copied().flatten() {
                 *i += 1;
                 if !visited[s as usize] {
                     visited[s as usize] = true;
@@ -573,10 +572,12 @@ impl<'a> FnTranslator<'a> {
         }
 
         let order = Self::rpo(self.func);
+        // Copy the shared reference so lowering can mutate the translator without cloning MIR.
+        let func = self.func;
         for &bi in &order {
             let cb = self.blocks[bi as usize];
             self.builder.switch_to_block(cb);
-            let mb = self.func.blocks[bi as usize].clone();
+            let mb = &func.blocks[bi as usize];
             for inst in &mb.insts {
                 self.lower_inst(inst);
             }
