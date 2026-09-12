@@ -606,17 +606,22 @@ impl<'a> Sema<'a> {
                 _ => {}
             }
         }
-        let key = |d: &Diagnostic| (d.code, d.message.clone(), d.labels.first().map(|l| l.span));
-        let seen: HashSet<(Option<&'static str>, String, Option<Span>)> =
-            self.diags[..before].iter().map(key).collect();
-        let mut i = before;
-        while i < self.diags.len() {
-            if seen.contains(&key(&self.diags[i])) {
-                self.diags.remove(i);
-            } else {
-                i += 1;
-            }
+        if before == 0 || self.diags.len() == before {
+            return;
         }
+        // The old remove-at-index loop shifted every later diagnostic for every duplicate.
+        // Filter the new suffix in order, borrowing message text from the untouched prefix.
+        // Only collection-pass duplicates are removed: equal NEW diagnostics must both survive.
+        let mut rechecked = self.diags.split_off(before);
+        let seen: HashSet<_> = self
+            .diags
+            .iter()
+            .map(|d| (d.code, d.message.as_str(), d.labels.first().map(|l| l.span)))
+            .collect();
+        rechecked.retain(|d| {
+            !seen.contains(&(d.code, d.message.as_str(), d.labels.first().map(|l| l.span)))
+        });
+        self.diags.extend(rechecked);
     }
 
     /// Reject a struct that contains itself by value — directly (`struct S { x: S }`) or transitively
