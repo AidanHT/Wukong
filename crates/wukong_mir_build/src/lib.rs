@@ -30,6 +30,8 @@ mod canon;
 mod tile;
 mod tindex;
 
+use std::cell::RefCell;
+
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use wukong_ast::{
@@ -2264,6 +2266,7 @@ fn is_batched_norm_fn(
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
+        const_lengths: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -2316,6 +2319,7 @@ fn is_bias_bcast_fn(
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
+        const_lengths: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -2394,6 +2398,7 @@ fn lower_fn(
     let mut fl = FnLowerer {
         builder: Builder::new(name, ret_mir.clone()),
         preserve_aggregate_blocks: ret_mir.is_float(),
+        const_lengths: RefCell::default(),
         sema,
         interner,
         diags,
@@ -2607,6 +2612,7 @@ fn lower_parallel(
         let mut fl = FnLowerer {
             builder: Builder::new(par_sym, MirType::Void),
             preserve_aggregate_blocks: false,
+            const_lengths: RefCell::default(),
             sema,
             interner,
             diags: &mut *diags,
@@ -2676,6 +2682,7 @@ fn lower_parallel(
         let mut fl = FnLowerer {
             builder: Builder::new(f.name.sym, ret_mir.clone()),
             preserve_aggregate_blocks: ret_mir.is_float(),
+            const_lengths: RefCell::default(),
             sema,
             interner,
             diags: &mut *diags,
@@ -3358,6 +3365,10 @@ struct FnLowerer<'a> {
     /// not remove an existing gradient candidate, including callers of the public grad API.
     preserve_aggregate_blocks: bool,
     sema: &'a SemaResult,
+    /// Named initializer folds, keyed by their exact evaluation depth. This lowerer's semantic
+    /// environment is immutable, so results remain valid across annotations and recognizer probes.
+    /// An empty map does not allocate; literal-only queries never populate it.
+    const_lengths: RefCell<HashMap<(Symbol, u32), Option<u32>>>,
     interner: &'a Interner,
     diags: &'a mut Vec<Diagnostic>,
     scopes: Vec<HashMap<Symbol, (ValueId, MirType)>>,
@@ -3580,6 +3591,21 @@ impl FnLowerer<'_> {
 
     // ---- type helpers ----
 
+    /// Fold a compile-time array length or recognizer constant with the existing u32 arithmetic
+    /// and depth fallback. Memoize named initializers at the exact depth, as sema does, to avoid
+    /// repeatedly expanding shared constant dependencies. The borrowed sema environment does not
+    /// change during this lowerer's lifetime; local bindings and type substitutions have never
+    /// participated in this evaluator's name resolution.
+    fn const_usize_expr(&self, e: &Expr) -> Option<u32> {
+        const_usize_depth(
+            e,
+            self.interner,
+            self.sema,
+            0,
+            &mut self.const_lengths.borrow_mut(),
+        )
+    }
+
     fn expr_ty(&self, e: &Expr) -> Ty {
         // In a monomorphized instance, resolve a generic type parameter to its concrete type so op
         // selection, coercion, and widths all see the real type. Substitution already returns an
@@ -3703,7 +3729,7 @@ impl FnLowerer<'_> {
                     MirType::I32
                 }
             }
-            Array { elem, len, .. } => match const_usize_expr(len, self.interner, self.sema) {
+            Array { elem, len, .. } => match self.const_usize_expr(len) {
                 Some(n) => MirType::Array(Box::new(self.mir_ty_of_ann(elem)), n),
                 None => MirType::Ptr,
             },
@@ -4741,7 +4767,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(start) != Some(0) {
             return None;
         }
         Some((*v, end, body))
@@ -10434,7 +10460,7 @@ impl FnLowerer<'_> {
     ) -> bool {
         // Only `0..n`: the loop must cover the whole array from index 0 so the kernel's reduction over
         // x[0..n], reconciled with the seed, equals the loop independent of the seed value.
-        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(start) != Some(0) {
             return false;
         }
         let Pattern {
@@ -10558,7 +10584,7 @@ impl FnLowerer<'_> {
             return false;
         };
         // Only `0..n`; a non-zero start would need a pointer/length shift the call does not do.
-        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(start) != Some(0) {
             return false;
         }
         let Pattern {
@@ -10952,7 +10978,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(start) != Some(0) {
             return false;
         }
         let Pattern {
@@ -11014,7 +11040,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(start) != Some(0) {
             return false;
         }
         let Pattern {
@@ -11151,7 +11177,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(start) != Some(0) {
             return false;
         }
         let Pattern {
@@ -11203,7 +11229,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(start) != Some(0) {
             return false;
         }
         let Pattern {
@@ -11332,7 +11358,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(start) != Some(0) {
             return None;
         }
         let Pattern {
@@ -12692,6 +12718,7 @@ impl FnLowerer<'_> {
             let mut fl = FnLowerer {
                 builder: Builder::new(par_sym, MirType::Void),
                 preserve_aggregate_blocks: false,
+                const_lengths: RefCell::default(),
                 sema: self.sema,
                 interner: self.interner,
                 diags: &mut tmp_diags,
@@ -13275,7 +13302,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(r_start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(r_start) != Some(0) {
             return false;
         }
         let Pattern {
@@ -13307,7 +13334,7 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        if const_usize_expr(j_start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(j_start) != Some(0) {
             return false;
         }
         let Pattern {
@@ -13481,7 +13508,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(i_start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(i_start) != Some(0) {
             return None;
         }
         let Pattern {
@@ -13513,7 +13540,7 @@ impl FnLowerer<'_> {
         else {
             return None;
         };
-        if const_usize_expr(j_start, self.interner, self.sema) != Some(0) {
+        if self.const_usize_expr(j_start) != Some(0) {
             return None;
         }
         let Pattern {
@@ -14669,10 +14696,7 @@ impl FnLowerer<'_> {
             // A compile-time-known trip (literal `for i in A..B`) lets the 256-bit reduction gate on
             // size; a runtime bound stays `None` and keeps the 128-bit path (see
             // `VEC256_REDUCTION_MIN_TRIP`).
-            let known_trip = match (
-                const_usize_expr(start, self.interner, self.sema),
-                const_usize_expr(end, self.interner, self.sema),
-            ) {
+            let known_trip = match (self.const_usize_expr(start), self.const_usize_expr(end)) {
                 (Some(a), Some(b)) if b >= a => Some((b - a) as u64),
                 _ => None,
             };
@@ -19326,8 +19350,8 @@ impl FnLowerer<'_> {
         // the `s*d` elements the kernel reads/writes. A dynamic dim or an unsized view stays the
         // caller's responsibility, as documented on `wukong_attention_f32`.
         if let (Some(s), Some(d)) = (
-            const_usize_expr(&args[4], self.interner, self.sema),
-            const_usize_expr(&args[5], self.interner, self.sema),
+            self.const_usize_expr(&args[4]),
+            self.const_usize_expr(&args[5]),
         ) {
             let need = u64::from(s) * u64::from(d);
             if extents.iter().any(|e| e.is_some_and(|len| len < need)) {
@@ -21041,15 +21065,6 @@ fn mir_ty(ty: &Ty) -> MirType {
     }
 }
 
-/// Evaluate a compile-time array length: a plain integer literal, or a single-segment path naming a
-/// top-level `const` whose initializer is itself such a length (so `const N: usize = 4; [i32; N]`
-/// sizes the array). Mirrors sema's `eval_usize` exactly — the two must agree on the length, else
-/// the alloca'd slot size desyncs from sema's index-bounds checks. The depth bound guards a cyclic
-/// const initializer (also rejected by sema's `check_recursive_consts`).
-fn const_usize_expr(e: &Expr, interner: &Interner, sema: &SemaResult) -> Option<u32> {
-    const_usize_depth(e, interner, sema, 0)
-}
-
 /// Is `t` an `f32` buffer — the only operand kind `wukong_attention_f32` can be handed? Returns the
 /// element count when the type pins one (a fixed-size array), `Some(None)` when the extent is known
 /// only at run time (a `[]f32` slice or a tensor view), and `None` when `t` is not an f32 buffer at
@@ -21069,22 +21084,41 @@ fn attn_buffer_extent(t: &Ty) -> Option<Option<u64>> {
     }
 }
 
-fn const_usize_depth(e: &Expr, interner: &Interner, sema: &SemaResult, depth: u32) -> Option<u32> {
+fn const_usize_depth(
+    e: &Expr,
+    interner: &Interner,
+    sema: &SemaResult,
+    depth: u32,
+    cache: &mut HashMap<(Symbol, u32), Option<u32>>,
+) -> Option<u32> {
     if depth > 64 {
         return None;
     }
     match &e.kind {
         ExprKind::Int(s) => Some(parse_int(interner.resolve(*s)) as u32),
-        ExprKind::Path(p) if p.is_single() => sema
-            .consts
-            .get(&p.first().sym)
-            .and_then(|init| const_usize_depth(init, interner, sema, depth + 1)),
+        ExprKind::Path(p) if p.is_single() => {
+            let name = p.first().sym;
+            let init_depth = depth + 1;
+            // Keep the old depth cutoff before consulting the cache. Cycles revisit a name at
+            // increasing depths, so they still terminate at that cutoff without a special case.
+            if init_depth > 64 {
+                return None;
+            }
+            let key = (name, init_depth);
+            if let Some(&value) = cache.get(&key) {
+                return value;
+            }
+            let init = sema.consts.get(&name)?;
+            let value = const_usize_depth(init, interner, sema, init_depth, cache);
+            cache.insert(key, value);
+            value
+        }
         // Mirror sema's `eval_usize` exactly (both fold via `BinOp::fold_const_len`) so the slot size
         // agrees with the bounds check. An unfoldable operand contributes 0, as sema's evaluator does,
         // so a const-arithmetic length sizes correctly instead of collapsing to an unsized pointer.
         ExprKind::Binary { op, lhs, rhs } => {
-            let l = const_usize_depth(lhs, interner, sema, depth + 1).unwrap_or(0) as u64;
-            let r = const_usize_depth(rhs, interner, sema, depth + 1).unwrap_or(0) as u64;
+            let l = const_usize_depth(lhs, interner, sema, depth + 1, cache).unwrap_or(0) as u64;
+            let r = const_usize_depth(rhs, interner, sema, depth + 1, cache).unwrap_or(0) as u64;
             Some(op.fold_const_len(l, r) as u32)
         }
         // A C-style enum variant as a length (`[i32; E::V]`, or via `const K: E = E::V`) is its
@@ -24971,6 +25005,7 @@ fn lower_matmul_fn(
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
         preserve_aggregate_blocks: ret_mir.is_float(),
+        const_lengths: RefCell::default(),
         sema,
         interner,
         diags,
@@ -26669,6 +26704,7 @@ fn xent_bwd_fn(
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
+        const_lengths: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -26716,6 +26752,7 @@ fn xent_fn(
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
+        const_lengths: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -26771,6 +26808,7 @@ fn logsumexp_fn(
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
+        const_lengths: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -26914,6 +26952,7 @@ fn probe_single_for(
     let probe = FnLowerer {
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
+        const_lengths: RefCell::default(),
         sema,
         interner,
         diags: &mut diags,
@@ -27944,6 +27983,7 @@ fn lower_i8matmul_fn(
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
         preserve_aggregate_blocks: ret_mir.is_float(),
+        const_lengths: RefCell::default(),
         sema,
         interner,
         diags,
