@@ -17,7 +17,9 @@
 //! re-written from `out[]` on **every** row — lost. The traversal is now **[`COL_RB`] rows x 32
 //! columns per tile with the four accumulators resident in YMM registers**, which divides the `out[]`
 //! load/store traffic by `COL_RB` and keeps `COL_RB` independent `x` row streams in flight (the
-//! memory-level parallelism a single sequential stream cannot reach). See [`colreduce_avx2`].
+//! memory-level parallelism a single sequential stream cannot reach). The first block seeds its
+//! registers directly, and the final partial block keeps its accumulators resident too. See
+//! [`colreduce_avx2`].
 //!
 //! The fold order is **i-ascending per column** — identical to the scalar nest — in the AVX2 and
 //! scalar paths, across the row blocking, and across serial/parallel (disjoint column stripes, no
@@ -166,12 +168,14 @@ fn sfold_maxabs(a: f32, v: f32) -> f32 {
 /// BIT-EXACTNESS IS UNAFFECTED, which is the only reason the reshape is admissible: for a fixed
 /// column `j` the sequence is still `out[j] <- ((out[j] (+) x[i,j]) (+) x[i+1,j]) ...` with `i`
 /// strictly ascending and no reassociation — the tile only changes *where the running accumulator
-/// lives*, never the order it is folded in. The `rows % COL_RB` trailing rows fold one row at a time
-/// afterwards, continuing the same ascending sequence, and the `(j1-j0) % 32` trailing columns fold
-/// 8-wide and then scalar inside each row block.
+/// lives*, never the order it is folded in. The first block seeds registers directly, eliminating
+/// the separate output initialization and its first reload. The final partial block also folds
+/// while register-resident, continuing the same ascending sequence. The `(j1-j0) % 32` trailing
+/// columns fold 8-wide and then scalar inside each row block.
 ///
 /// # Safety
-/// `x` valid for `rows*cols`, `out` for `cols` f32; `j0 <= j1 <= cols`; AVX2 available.
+/// `x` valid for `rows*cols`, `out` for `cols` f32; `j0 <= j1 <= cols`; AVX2 available;
+/// `rows >= 1`; `x` and `out` must not overlap.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn colreduce_avx2(
@@ -187,24 +191,8 @@ unsafe fn colreduce_avx2(
     // Seed: the additive folds (Sum/Mean and the square folds SumSq/L2/Rms) -> 0; Max/Min -> first row
     // x[0, j]; MaxAbs -> |x[0, j]| (so the max/min fold starts at row 1).
     let i0 = match kind {
-        ColKind::Sum | ColKind::Mean | ColKind::SumSq | ColKind::L2 | ColKind::Rms => {
-            for j in j0..j1 {
-                *out.add(j) = 0.0;
-            }
-            0
-        }
-        ColKind::Max | ColKind::Min => {
-            for j in j0..j1 {
-                *out.add(j) = *x.add(j);
-            }
-            1
-        }
-        ColKind::MaxAbs => {
-            for j in j0..j1 {
-                *out.add(j) = (*x.add(j)).abs();
-            }
-            1
-        }
+        ColKind::Sum | ColKind::Mean | ColKind::SumSq | ColKind::L2 | ColKind::Rms => 0,
+        ColKind::Max | ColKind::Min | ColKind::MaxAbs => 1,
     };
     let sign = _mm256_set1_ps(-0.0); // for MaxAbs: clear the sign bit with andnot
 
@@ -213,19 +201,22 @@ unsafe fn colreduce_avx2(
     // Writing the traversal once is deliberate — five hand-copied nests are five chances for one of
     // them to lose the ascending-`i` order that the whole file's bit-exactness rests on.
     macro_rules! fold_all {
-        (|$a:ident, $v:ident| $vfold:expr, $sfold:ident) => {{
+        (|$a:ident, $v:ident| $vfold:expr, $sfold:ident, $vseed:expr, $sseed:expr) => {{
             let mut i = i0;
-            // Main tile: COL_RB rows x 32 columns, accumulators resident in 4 YMM registers.
-            while i + COL_RB <= rows {
+            // The first block seeds registers directly, avoiding a separate initialization pass
+            // and the subsequent accumulator reload. `$first` is a macro-time constant, so the
+            // steady-state tile never branches on whether its output has been initialized.
+            macro_rules! fold_block {
+                ($first:expr, $end:expr) => {{
                 let mut j = j0;
                 while j + 32 <= j1 {
-                    let mut a0 = _mm256_loadu_ps(out.add(j));
-                    let mut a1 = _mm256_loadu_ps(out.add(j + 8));
-                    let mut a2 = _mm256_loadu_ps(out.add(j + 16));
-                    let mut a3 = _mm256_loadu_ps(out.add(j + 24));
-                    let mut k = 0usize;
-                    while k < COL_RB {
-                        let xr = x.add((i + k) * cols + j);
+                    let mut a0 = if $first { ($vseed)(x.add(j)) } else { _mm256_loadu_ps(out.add(j)) };
+                    let mut a1 = if $first { ($vseed)(x.add(j + 8)) } else { _mm256_loadu_ps(out.add(j + 8)) };
+                    let mut a2 = if $first { ($vseed)(x.add(j + 16)) } else { _mm256_loadu_ps(out.add(j + 16)) };
+                    let mut a3 = if $first { ($vseed)(x.add(j + 24)) } else { _mm256_loadu_ps(out.add(j + 24)) };
+                    let mut k = i;
+                    while k < $end {
+                        let xr = x.add(k * cols + j);
                         a0 = {
                             let ($a, $v) = (a0, _mm256_loadu_ps(xr));
                             $vfold
@@ -252,11 +243,11 @@ unsafe fn colreduce_avx2(
                 }
                 // (j1-j0) % 32 trailing columns of this row block: 8-wide, then scalar.
                 while j + 8 <= j1 {
-                    let mut acc = _mm256_loadu_ps(out.add(j));
-                    let mut k = 0usize;
-                    while k < COL_RB {
+                    let mut acc = if $first { ($vseed)(x.add(j)) } else { _mm256_loadu_ps(out.add(j)) };
+                    let mut k = i;
+                    while k < $end {
                         acc = {
-                            let ($a, $v) = (acc, _mm256_loadu_ps(x.add((i + k) * cols + j)));
+                            let ($a, $v) = (acc, _mm256_loadu_ps(x.add(k * cols + j)));
                             $vfold
                         };
                         k += 1;
@@ -265,54 +256,71 @@ unsafe fn colreduce_avx2(
                     j += 8;
                 }
                 while j < j1 {
-                    let mut s = *out.add(j);
-                    let mut k = 0usize;
-                    while k < COL_RB {
-                        s = $sfold(s, *x.add((i + k) * cols + j));
+                    let mut s = if $first { ($sseed)(x.add(j)) } else { *out.add(j) };
+                    let mut k = i;
+                    while k < $end {
+                        s = $sfold(s, *x.add(k * cols + j));
                         k += 1;
                     }
                     *out.add(j) = s;
                     j += 1;
                 }
-                i += COL_RB;
+                }};
             }
-            // rows % COL_RB trailing rows, one at a time — the same ascending-`i` continuation.
-            while i < rows {
-                let xr = x.add(i * cols);
-                let mut j = j0;
-                while j + 8 <= j1 {
-                    let acc = {
-                        let ($a, $v) = (_mm256_loadu_ps(out.add(j)), _mm256_loadu_ps(xr.add(j)));
-                        $vfold
-                    };
-                    _mm256_storeu_ps(out.add(j), acc);
-                    j += 8;
-                }
-                while j < j1 {
-                    *out.add(j) = $sfold(*out.add(j), *xr.add(j));
-                    j += 1;
-                }
-                i += 1;
+            // Even a seed-only Max/Min call (one row) needs the first block's output stores.
+            let first_end = (i + COL_RB).min(rows);
+            fold_block!(true, first_end);
+            i = first_end;
+            while i + COL_RB <= rows {
+                let end = i + COL_RB;
+                fold_block!(false, end);
+                i = end;
+            }
+            // Keep the last one to three rows in registers too, in the same ascending order.
+            if i < rows {
+                fold_block!(false, rows);
             }
         }};
     }
     match kind {
         // Σ x[i,j] (Mean reuses the Sum fold, then divides in the finalize).
-        ColKind::Sum | ColKind::Mean => fold_all!(|a, v| _mm256_add_ps(a, v), sfold_add),
+        ColKind::Sum | ColKind::Mean => fold_all!(
+            |a, v| _mm256_add_ps(a, v),
+            sfold_add,
+            |_: *const f32| _mm256_setzero_ps(),
+            |_: *const f32| 0.0
+        ),
         // Σ x[i,j]² (L2/Rms reuse this, then sqrt[/rows] in the finalize). The square is a separate
         // `mul` then `add` (NOT an FMA) so the scalar twin `a + v*v` matches it bit-for-bit (no `fma`
         // target feature assumed here, and one rounding model shared by both paths).
         ColKind::SumSq | ColKind::L2 | ColKind::Rms => {
-            fold_all!(|a, v| _mm256_add_ps(a, _mm256_mul_ps(v, v)), sfold_sq)
+            fold_all!(
+                |a, v| _mm256_add_ps(a, _mm256_mul_ps(v, v)),
+                sfold_sq,
+                |_: *const f32| _mm256_setzero_ps(),
+                |_: *const f32| 0.0
+            )
         }
-        ColKind::Max => fold_all!(|a, v| _mm256_max_ps(a, v), sfold_max),
-        ColKind::Min => fold_all!(|a, v| _mm256_min_ps(a, v), sfold_min),
+        ColKind::Max => fold_all!(
+            |a, v| _mm256_max_ps(a, v),
+            sfold_max,
+            |p: *const f32| _mm256_loadu_ps(p),
+            |p: *const f32| *p
+        ),
+        ColKind::Min => fold_all!(
+            |a, v| _mm256_min_ps(a, v),
+            sfold_min,
+            |p: *const f32| _mm256_loadu_ps(p),
+            |p: *const f32| *p
+        ),
         // |v| = andnot(-0.0, v) (clear the sign bit), then fold by max — the same sign-mask abs the
         // RED_MAXABS reduction uses, so it agrees lane-for-lane with `sfold_maxabs`'s `v.abs()`.
         ColKind::MaxAbs => {
             fold_all!(
                 |a, v| _mm256_max_ps(a, _mm256_andnot_ps(sign, v)),
-                sfold_maxabs
+                sfold_maxabs,
+                |p: *const f32| _mm256_andnot_ps(sign, _mm256_loadu_ps(p)),
+                |p: *const f32| (*p).abs()
             )
         }
     }
