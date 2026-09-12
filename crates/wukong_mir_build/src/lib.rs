@@ -47,8 +47,8 @@ use wukong_sema::{
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::Ty;
 
-/// Array-repeat initializers (`[v; n]`) with at most this many elements are unrolled to
-/// straight-line stores; larger ones lower to a fill loop to keep the IR compact.
+/// Array fills and copies with at most this many elements are unrolled to straight-line
+/// operations; larger ones lower to a counted loop to keep the IR compact.
 const REPEAT_UNROLL_LIMIT: u32 = 8;
 
 // ===== Type-generic monomorphization =====
@@ -3732,11 +3732,16 @@ impl FnLowerer<'_> {
                 } else {
                     self.lower_fill_loop(slot, elem, *n, z);
                 }
-            } else {
+            } else if *n <= REPEAT_UNROLL_LIMIT {
                 for i in 0..*n as i128 {
                     let ep = self.gep_elem(slot, elem, i);
                     self.zero_init(ep, elem);
                 }
+            } else {
+                self.lower_counted_loop(*n as u64, |this, i| {
+                    let ep = this.gep_elem_value(slot, elem, i);
+                    this.zero_init(ep, elem);
+                });
             }
         }
     }
@@ -4381,10 +4386,18 @@ impl FnLowerer<'_> {
             }
             Ty::Array { elem, len, .. } => {
                 let emir = self.mir_ty_of(elem);
-                for i in 0..*len as i128 {
-                    let s = self.gep_elem(src, &emir, i);
-                    let d = self.gep_elem(dst, &emir, i);
-                    self.emit_copy(d, s, elem);
+                if *len <= REPEAT_UNROLL_LIMIT as u64 {
+                    for i in 0..*len as i128 {
+                        let s = self.gep_elem(src, &emir, i);
+                        let d = self.gep_elem(dst, &emir, i);
+                        self.emit_copy(d, s, elem);
+                    }
+                } else {
+                    self.lower_counted_loop(*len, |this, i| {
+                        let s = this.gep_elem_value(src, &emir, i);
+                        let d = this.gep_elem_value(dst, &emir, i);
+                        this.emit_copy(d, s, elem);
+                    });
                 }
             }
             _ => {
@@ -4400,11 +4413,20 @@ impl FnLowerer<'_> {
     /// `i8` copy matches the interpreter's 1-slot-per-scalar memory (each `Load(off, i8)` returns the
     /// whole `Value` stored at that offset slot, `Store` writes it back) *and* native's byte memory.
     fn emit_copy_bytes(&mut self, dst: ValueId, src: ValueId, nbytes: u64) {
-        for k in 0..nbytes {
-            let s = self.field_ptr(src, k);
-            let d = self.field_ptr(dst, k);
-            let v = self.builder.build(MirType::I8, Op::Load(s, MirType::I8));
-            self.builder.build_void(Op::Store { ptr: d, value: v });
+        if nbytes <= REPEAT_UNROLL_LIMIT as u64 {
+            for k in 0..nbytes {
+                let s = self.field_ptr(src, k);
+                let d = self.field_ptr(dst, k);
+                let v = self.builder.build(MirType::I8, Op::Load(s, MirType::I8));
+                self.builder.build_void(Op::Store { ptr: d, value: v });
+            }
+        } else {
+            self.lower_counted_loop(nbytes, |this, i| {
+                let s = this.gep_elem_value(src, &MirType::I8, i);
+                let d = this.gep_elem_value(dst, &MirType::I8, i);
+                let v = this.builder.build(MirType::I8, Op::Load(s, MirType::I8));
+                this.builder.build_void(Op::Store { ptr: d, value: v });
+            });
         }
     }
 
@@ -4426,11 +4448,16 @@ impl FnLowerer<'_> {
         let idx = self
             .builder
             .build(MirType::I64, Op::ConstInt(index, MirType::I64));
+        self.gep_elem_value(base, elem, idx)
+    }
+
+    /// Element-typed GEP with an existing index, shared by compact copy/fill loop bodies.
+    fn gep_elem_value(&mut self, base: ValueId, elem: &MirType, index: ValueId) -> ValueId {
         self.builder.build(
             MirType::Ptr,
             Op::Gep {
                 ptr: base,
-                index: idx,
+                index,
                 elem: elem.clone(),
             },
         )
@@ -17200,60 +17227,51 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// Emit `for i in 0..n { base[i] = v }` as a CFG loop. Used for large array-repeat initializers
-    /// so the IR stays compact; mem2reg later promotes the loop counter to a register.
+    /// Emit `for i in 0..n { base[i] = v }` as a compact CFG loop.
     fn lower_fill_loop(&mut self, base: ValueId, elem: &MirType, n: u32, v: ValueId) {
+        self.lower_counted_loop(n as u64, |this, i| {
+            let p = this.gep_elem_value(base, elem, i);
+            this.builder.build_void(Op::Store { ptr: p, value: v });
+        });
+    }
+
+    /// Emit an ascending `0..n` loop for compiler-generated memory operations. The body can
+    /// itself emit nested loops; its final block branches back to this loop's header. A block
+    /// parameter carries the index directly, avoiding a stack counter and later mem2reg work.
+    /// All callers emit only memory operations here, so no source-level break/return is hidden.
+    fn lower_counted_loop(&mut self, n: u64, body_ops: impl FnOnce(&mut Self, ValueId)) {
         let i64t = MirType::I64;
-        let slot = self.builder.alloca(i64t.clone());
         let zero = self
             .builder
             .build(i64t.clone(), Op::ConstInt(0, i64t.clone()));
-        self.builder.build_void(Op::Store {
-            ptr: slot,
-            value: zero,
-        });
+        let nconst = self
+            .builder
+            .build(i64t.clone(), Op::ConstInt(n as i128, i64t.clone()));
 
         let header = self.builder.new_block();
         let body = self.builder.new_block();
         let exit = self.builder.new_block();
-        self.builder.br(header, vec![]);
+        let i_val = self.builder.block_param(header, i64t.clone());
+        self.builder.br(header, vec![zero]);
 
         self.builder.switch_to(header);
-        let i_val = self
-            .builder
-            .build(i64t.clone(), Op::Load(slot, i64t.clone()));
-        let nconst = self
-            .builder
-            .build(i64t.clone(), Op::ConstInt(n as i128, i64t.clone()));
-        let cond = self
-            .builder
-            .build(MirType::I1, Op::Cmp(CmpOp::Slt, i_val, nconst));
+        let cmp = if n <= i64::MAX as u64 {
+            CmpOp::Slt
+        } else {
+            CmpOp::Ult
+        };
+        let cond = self.builder.build(MirType::I1, Op::Cmp(cmp, i_val, nconst));
         self.builder.cond_br(cond, body, vec![], exit, vec![]);
 
         self.builder.switch_to(body);
-        let i_cur = self
-            .builder
-            .build(i64t.clone(), Op::Load(slot, i64t.clone()));
-        let p = self.builder.build(
-            MirType::Ptr,
-            Op::Gep {
-                ptr: base,
-                index: i_cur,
-                elem: elem.clone(),
-            },
-        );
-        self.builder.build_void(Op::Store { ptr: p, value: v });
+        body_ops(self, i_val);
         let one = self
             .builder
             .build(i64t.clone(), Op::ConstInt(1, i64t.clone()));
         let next = self
             .builder
-            .build(i64t.clone(), Op::Bin(BinOp::Add, i_cur, one));
-        self.builder.build_void(Op::Store {
-            ptr: slot,
-            value: next,
-        });
-        self.builder.br(header, vec![]);
+            .build(i64t.clone(), Op::Bin(BinOp::Add, i_val, one));
+        self.builder.br(header, vec![next]);
 
         self.builder.switch_to(exit);
         self.terminated = false;
