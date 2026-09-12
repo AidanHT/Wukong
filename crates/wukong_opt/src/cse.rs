@@ -118,7 +118,9 @@ enum Key {
     /// payloads stay distinct exactly as before.
     ConstFloat(u64, MirType),
     Bin(u8, u32, u32),
-    Cmp(u8, u32, u32),
+    /// Vector comparisons may have different mask element types for the same operands and lane
+    /// count. Keep the result type so a comparison never substitutes a differently typed mask.
+    Cmp(u8, u32, u32, MirType),
     Neg(u32),
     Not(u32),
     Cast(u8, u32, MirType),
@@ -268,7 +270,7 @@ fn pure_key(op: &Op, result_ty: &MirType, rewrite: &FxHashMap<u32, u32>) -> Opti
             if matches!(o, CmpOp::Eq | CmpOp::Ne) && a > b {
                 std::mem::swap(&mut a, &mut b);
             }
-            Key::Cmp(*o as u8, a, b)
+            Key::Cmp(*o as u8, a, b, result_ty.clone())
         }
         Op::Neg(a) => Key::Neg(m(*a)),
         Op::Not(a) => Key::Not(m(*a)),
