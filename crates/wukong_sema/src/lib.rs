@@ -26,6 +26,8 @@ mod attrs;
 mod dependency;
 mod shape;
 
+use std::cell::RefCell;
+
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use wukong_ast::*;
@@ -334,6 +336,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         ret_ty: Ty::Unit,
         loop_ctx: Vec::new(),
         consts: HashMap::default(),
+        const_lengths: RefCell::new(HashMap::default()),
         checking_bodies: false,
         parallel_fn: false,
     };
@@ -395,6 +398,10 @@ struct Sema<'a> {
     /// Literal adaptation updates `types`, never the initializer; clone each surviving initializer
     /// only when publishing the owned `SemaResult`.
     consts: HashMap<Symbol, &'a Expr>,
+    /// Length folds by constant name and the initializer's recursion depth. Depth is observable:
+    /// the existing evaluator substitutes zero past 64, including in rejected cyclic programs.
+    /// Invalidate when a constant initializer changes or a new enum enables discriminant lookup.
+    const_lengths: RefCell<HashMap<(Symbol, u32), u64>>,
     /// `false` during the collection pass, `true` once body checking starts. Gates the
     /// undeclared-tensor-dimension diagnostic (`lower_dim`): reporting it only in the body pass means
     /// every top-level `const` is registered and each item's generics are re-established, so an
@@ -441,7 +448,7 @@ impl<'a> Sema<'a> {
                     // Record the initializer now (it is re-recorded, with its nodes typed, by
                     // `check_const`) so a `const` used as a tensor/array index can be resolved to its
                     // value by the compile-time bounds check regardless of source order.
-                    self.consts.insert(c.name.sym, &c.value);
+                    self.record_const(c);
                 }
                 ItemKind::Struct(s) => {
                     self.generics = generic_names(&s.generics);
@@ -829,6 +836,11 @@ impl<'a> Sema<'a> {
             return;
         }
         let idx = self.defs.defs.len();
+        if matches!(kind, DefKind::Enum(_)) {
+            // A previously unresolved E::V in an initializer can now resolve. Non-enum
+            // definitions cannot change enum_variant_disc, and duplicates returned above.
+            self.const_lengths.get_mut().clear();
+        }
         self.defs.defs.push(Def {
             name: name.sym,
             kind,
@@ -934,8 +946,8 @@ impl<'a> Sema<'a> {
                 // bounds/agreement checking entirely (interp trapped a[7] out-of-bounds while native
                 // read past the buffer — a differential-gate divergence on plausible code). Mirrors
                 // the array-length resolution above so the two agree on the value.
-                if let Some(init) = self.consts.get(s) {
-                    return Dim::Const(self.eval_usize_depth(init, 0));
+                if self.consts.contains_key(s) {
+                    return Dim::Const(self.const_length(*s, 0));
                 }
                 // Neither a generic nor a const: an undeclared dim name is a typo, not a fresh
                 // implicit dim. Previously `Tensor[f32, KK]` (when only `K` was declared) silently
@@ -988,6 +1000,38 @@ impl<'a> Sema<'a> {
 
     fn eval_usize(&self, e: &Expr) -> u64 {
         self.eval_usize_depth(e, 0)
+    }
+
+    /// Fold a recorded initializer at the caller's exact remaining depth budget. Shared DAG
+    /// dependencies are expanded once per (name, depth), not once per incoming expression path.
+    /// No cache borrow survives the recursive call, so cycles still reach the ordinary depth cap.
+    fn const_length(&self, name: Symbol, depth: u32) -> u64 {
+        if depth > 64 {
+            return 0;
+        }
+        if let Some(&value) = self.const_lengths.borrow().get(&(name, depth)) {
+            return value;
+        }
+        let Some(init) = self.consts.get(&name) else {
+            return 0;
+        };
+        let value = self.eval_usize_depth(init, depth);
+        self.const_lengths.borrow_mut().insert((name, depth), value);
+        value
+    }
+
+    fn record_const(&mut self, c: &'a ConstDecl) {
+        if self
+            .consts
+            .get(&c.name.sym)
+            .is_some_and(|init| std::ptr::eq(*init, &c.value))
+        {
+            // A valid declaration's body only changes type side tables. Retain cached folds
+            // across that visit; duplicate declarations still replace the initializer in order.
+            return;
+        }
+        self.consts.insert(c.name.sym, &c.value);
+        self.const_lengths.get_mut().clear();
     }
 
     /// A fixed-size array's compile-time length, with the two diagnostics `eval_usize` cannot report
@@ -1084,10 +1128,7 @@ impl<'a> Sema<'a> {
             // program rejected as "length 0", or (when sema's short length reached a struct layout)
             // silent stack corruption both backends agreed on.
             ExprKind::Int(s) => parse_u64_text(self.sym_str(*s)).unwrap_or(0),
-            ExprKind::Path(p) if p.is_single() => match self.consts.get(&p.first().sym) {
-                Some(init) => self.eval_usize_depth(init, depth + 1),
-                None => 0,
-            },
+            ExprKind::Path(p) if p.is_single() => self.const_length(p.first().sym, depth + 1),
             // Const arithmetic in a length (`[i32; 2+2]`, `[i32; N+1]`): fold via the shared
             // `BinOp::fold_const_len` that mir_build's `const_usize_expr` also uses, so the slot size
             // and this bounds check agree. Previously this fell to `_ => 0`, sizing the array 0 (an
@@ -1161,7 +1202,7 @@ impl<'a> Sema<'a> {
                 ),
             );
         }
-        self.consts.insert(c.name.sym, &c.value);
+        self.record_const(c);
     }
 
     fn check_fn(&mut self, f: &FnDecl, body: &Block, item_attrs: &[Attr]) {
