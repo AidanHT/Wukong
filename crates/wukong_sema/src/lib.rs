@@ -1041,9 +1041,9 @@ impl<'a> Sema<'a> {
 
     /// A fixed-size array's compile-time length, with the two diagnostics `eval_usize` cannot report
     /// (it is `&self`, and every caller wants a number): an unresolvable length NAME, and a length
-    /// beyond what lowering can represent — mir_build's mirrored `const_usize_expr` is `u32` end to
-    /// end and narrows the folded value with an unchecked `as u32`, so `[i32; 0x1_0000_0001]` was
-    /// bounds checked here against 4294967297 while the emitted slot held 1 element. Both point at
+    /// beyond what lowering can represent. MIR array extents are u32; lowering now folds the same
+    /// u64 operands and checks the final conversion. Historically, `[i32; 0x1_0000_0001]` was bounds
+    /// checked here against 4294967297 while the emitted slot held 1 element. Both point at
     /// the length expression and are gated on `checking_bodies` exactly like the E0504 dim check, so
     /// a signature re-lowered by `check_fn` is reported once (see the flag's doc-comment).
     fn array_len(&mut self, len: &Expr) -> u64 {
@@ -1116,7 +1116,7 @@ impl<'a> Sema<'a> {
     /// `BinOp::fold_const_len`, or an enum variant's discriminant. Anything else — and any
     /// negative discriminant — is the `0` fallback, not an error (`array_len` reports the unresolvable
     /// *name* case). `self.consts` is populated in `collect` before any body is checked, so this is
-    /// order-independent. `mir_build`'s `const_usize_expr`/`const_usize_depth` mirrors this arm for
+    /// order-independent. `mir_build`'s `const_array_len_expr`/`const_usize_depth` mirrors this arm for
     /// arm — the two must agree on the length, else the slot size desyncs from these bounds checks.
     /// The depth bound guards against a cyclic const initializer (also rejected by
     /// `check_recursive_consts`).
@@ -3942,7 +3942,14 @@ fn int_literal_well_formed(text: &str) -> bool {
             break;
         }
     }
-    let body = s.replace('_', "");
+    // Keep separator-free spellings borrowed, as the parser's extent decoder does.
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
     let (digits, radix): (&str, u32) =
         if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
             (h, 16)
@@ -3951,7 +3958,7 @@ fn int_literal_well_formed(text: &str) -> bool {
         } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
             (b, 2)
         } else {
-            (&body, 10)
+            (body, 10)
         };
     !digits.is_empty()
         && (i64::from_str_radix(digits, radix).is_ok()
@@ -3973,7 +3980,14 @@ fn float_literal_well_formed(text: &str) -> bool {
             break;
         }
     }
-    let body = s.replace('_', "");
+    // Keep separator-free spellings borrowed, as the parser's extent decoder does.
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
     !body.is_empty() && body.parse::<f64>().is_ok()
 }
 
@@ -4029,7 +4043,14 @@ fn parse_int_text(text: &str) -> Option<i64> {
             break;
         }
     }
-    let body = s.replace('_', "");
+    // Keep separator-free spellings borrowed, as the parser's extent decoder does.
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
     let v = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         i64::from_str_radix(h, 16)
     } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
@@ -4062,7 +4083,14 @@ pub(crate) fn parse_u64_text(text: &str) -> Option<u64> {
             break;
         }
     }
-    let body = s.replace('_', "");
+    // Keep separator-free spellings borrowed, as the parser's extent decoder does.
+    let normalized;
+    let body = if s.contains('_') {
+        normalized = s.replace('_', "");
+        normalized.as_str()
+    } else {
+        s
+    };
     if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         u64::from_str_radix(h, 16).ok()
     } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
@@ -5019,9 +5047,9 @@ mod tests {
 
     #[test]
     fn array_length_above_u32_max_is_rejected() {
-        // mir_build's mirrored `const_usize_expr` is u32 end to end and narrows with an unchecked
-        // `as u32`, so a longer length wrapped to a small slot while sema bounds-checked the full
-        // value. Reject it here so the truncating path is unreachable.
+        // MIR array extents are u32. Historically, unchecked narrowing made a longer length wrap
+        // to a small slot while sema bounds-checked the full value. Keep the explicit diagnostic
+        // even though lowering now checks its final conversion too.
         let bad = "fn f() { let mut a: [i32; 0x1_0000_0001] = [0; 0x1_0000_0001]; a[0] = 1; }";
         assert!(
             errors(bad).contains(&"E0401"),
