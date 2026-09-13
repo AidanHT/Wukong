@@ -1,0 +1,83 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4279
+// EXPECT-OUT: 225
+// EXPECT-OUT: 4314
+// EXPECT-OUT: 4193
+// EXPECT-OUT: 5327
+// EXPECT-OUT: 5241
+// EXPECT-OUT: 5458
+// EXPECT-OUT: 4417
+// EXPECT-OUT: 5493
+module tests.run.transpose_f32_blocked
+
+// `dst = srcT` at [R=41, C=37] — the shape that makes `wukong_transpose_f32` run every one of its
+// four block paths, which the 2x3 `transpose_f32.wk` cannot reach at all.
+//
+// WHY 41x37. The kernel blocks at B = 32 and fills each block with 8x8 in-register AVX2 tiles, then
+// handles `rows % 8` trailing rows and `cols % 8` trailing columns separately. 41 = 32 + 9 rows and
+// 37 = 32 + 5 columns puts one of each of the four cases in the program:
+//   block (0,0)    tiles only, no tail;
+//   block (0,32)   column tail only (columns 32..37, no full 8-column tile fits);
+//   block (32,0)   tiles for rows 32..40 plus the row tail, row 40;
+//   block (32,32)  both tails at once, including the row-40 / column-36 corner.
+// Both dimensions are also >= 16 columns of tiles in the first block, which is what arms the
+// next-tile destination prefetch.
+//
+// Recognized kernels are gate-blind, so this checks EVERY lane and no lane by a sum. `src[i,j]` is
+// `1 + 131*i + 7*j`, which is injective over this rectangle (131*(i-i') = 7*(j'-j) has no solution
+// with |j'-j| <= 36 and i != i'), so every one of the 1517 entries is a distinct whole f32 that
+// names its own (i, j). The verification loop then compares `dst[j*41+i]` against that formula for
+// all 1517 lanes and prints the number of MISMATCHES and the index of the first one: a count of
+// inequalities is 0 if and only if every lane is right, so unlike a sum it cannot be passed by a
+// partially correct buffer, a permuted group or a dropped tail. Ten individual lanes are printed
+// as well, one at each structural seam named above, with the value written out from the formula —
+// never recorded from compiler output.
+fn main() -> i32 {
+    let mut src: [f32; 1517] = [0.0; 1517];
+    for i in 0..41 {
+        for j in 0..37 {
+            src[i * 37 + j] = (1 + 131 * i + 7 * j) as f32;
+        }
+    }
+
+    let mut dst: [f32; 1517] = [0.0; 1517];
+    for i in 0..41 {
+        for j in 0..37 {
+            dst[j * 41 + i] = src[i * 37 + j];
+        }
+    }
+
+    // Every lane, against the scalar definition of the source.
+    let mut bad: i32 = 0;
+    let mut first: i32 = -1;
+    for i in 0..41 {
+        for j in 0..37 {
+            let want: f32 = (1 + 131 * i + 7 * j) as f32;
+            if dst[j * 41 + i] != want {
+                bad = bad + 1;
+                if first < 0 {
+                    first = (j * 41 + i) as i32;
+                }
+            }
+        }
+    }
+    print(bad); // 0 mismatches over all 1517 lanes
+    print(first); // -1: no first mismatch
+
+    // One lane at each seam, value = 1 + 131*i + 7*j.
+    print(dst[0] as i32); // i=0  j=0   tile, first block           -> 1
+    print(dst[1302] as i32); // i=31 j=31  last tile lane of block (0,0)  -> 4279
+    print(dst[1312] as i32); // i=0  j=32  column tail, block (0,32)      -> 225
+    print(dst[1507] as i32); // i=31 j=36  last column-tail lane          -> 4314
+    print(dst[32] as i32); // i=32 j=0   tile, block (32,0)             -> 4193
+    print(dst[1310] as i32); // i=39 j=31  last tile lane of block (32,0) -> 5327
+    print(dst[40] as i32); // i=40 j=0   ROW tail                      -> 5241
+    print(dst[1311] as i32); // i=40 j=31  row tail, last tiled column    -> 5458
+    print(dst[1344] as i32); // i=32 j=32  both tails, block (32,32)      -> 4417
+    print(dst[1516] as i32); // i=40 j=36  the row/column tail corner     -> 5493
+    return 0;
+}
