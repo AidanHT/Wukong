@@ -207,14 +207,17 @@ fn exe_matches_run() {
          available here (rustc runs and `wukong_driver::runtime_rlib_in` found the runtime rlib), \
          so this is the compiler's own link invocation breaking — not a missing toolchain. Fix \
          `rustc_link`/`WUKONG_RT_SHIM` in crates/wukong_driver/src/lib.rs. If the stderr below \
-         reports `LNK1107: invalid or corrupt file` on libwukong_runtime.rlib, the rlib holds \
-         LLVM bitcode rather than native objects (the workspace `[profile.release]` sets \
-         `lto = \"thin\"`), so `rustc_link` has to be told to consume it accordingly — that is the \
-         release-profile shape of this break, and every `wukong_*` symbol then reads as \
-         unresolved. If instead exactly one or two `wukong_*` symbols are unresolved, the rlib \
-         `runtime_rlib_in` picked is simply STALE — rebuild the workspace. (This gate \
-         previously reported every one of these states as \"no linker toolchain to produce an \
-         exe\" and passed green, which is why the break went unreported.)\n{}",
+         reports `LNK1136`/`LNK1107: invalid or corrupt file` on libwukong_runtime.rlib followed by \
+         EVERY `wukong_*` symbol unresolved, the rlib holds LLVM bitcode rather than native objects \
+         (the workspace `[profile.release]` sets `lto = \"thin\"`, so cargo builds the runtime with \
+         `-C linker-plugin-lto`) and `rlib_holds_bitcode_members` failed to classify it — that \
+         probe is what makes `rustc_link` add `-C lto=thin -C opt-level=3`, and without it no \
+         release-profile executable links at all. If instead exactly one or two `wukong_*` symbols \
+         are unresolved, the rlib `runtime_rlib_in` picked is simply STALE — rebuild the workspace. \
+         (This gate previously reported every one of these states as \"no linker toolchain to \
+         produce an exe\" and passed green, which is why the break went unreported. Note it must be \
+         run under `--release` too: the profiles hand the linker archives of different shapes, and \
+         the release one was 0/4 for the project's whole history while debug was 4/4.)\n{}",
         failures.len(),
         failures.join("\n")
     );
