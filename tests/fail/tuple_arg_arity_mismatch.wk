@@ -1,0 +1,17 @@
+// EXPECT-CODE: E0501
+module tests.fail.tuple_arg_arity_mismatch
+
+// The third missing arm: no `(Tuple, Tuple)` in `unify_decl`, so a 2-tuple satisfied a 3-tuple
+// parameter and `t.2` read past the caller's buffer — the interpreter trapped
+// `error: load out of bounds`, native printed -1037373571. `apply_subst` and `infer_type_generics`
+// already walk tuples pairwise, but only to BIND generics; neither ever reported. Tuples are this
+// language's return-multiple-values idiom (tests/run/let_destructure.wk), so this is a travelled path.
+fn f(t: (i32, i32, i32)) -> i32 {
+    return t.2;
+}
+
+fn main() -> i32 {
+    let p: (i32, i32) = (1, 2);
+    println(f(p));
+    return 0;
+}

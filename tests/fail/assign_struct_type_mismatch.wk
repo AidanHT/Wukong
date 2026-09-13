@@ -1,0 +1,25 @@
+// EXPECT-CODE: E0401
+module tests.fail.assign_struct_type_mismatch
+
+// The assignment statement's shape check is `check_binop_shapes`, which opens with
+// `if matches!((l, r), (Tensor, Tensor) | (Vector, Vector))` and is a no-op for everything else, and
+// the only other guard beside it is `scalar_aggregate_clash` (scalar-versus-aggregate). So an
+// aggregate assignment between two unrelated layouts was accepted and reinterpreted the bytes: the
+// interpreter printed 1 (the i32 field) where native printed 1065353216 (the bits of 1.0f32).
+// The same no-op also covered the `if`/`match` arm merges and a value `loop`'s `break` values.
+struct A {
+    x: i32,
+}
+
+struct B {
+    y: f32,
+    z: f32,
+}
+
+fn main() -> i32 {
+    let mut a: A = A { x: 1 };
+    let b: B = B { y: 1.0, z: 2.0 };
+    a = b;
+    println(a.x);
+    return 0;
+}

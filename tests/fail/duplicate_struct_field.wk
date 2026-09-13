@@ -1,0 +1,16 @@
+// EXPECT-CODE: E0300
+module tests.fail.duplicate_struct_field
+
+// Duplicate parameter names were already E0300, but the same discipline was never applied to a
+// struct's field list: `collect`'s Struct arm built the field vector with no uniqueness pass, so
+// only a literal with a repeated key was rejected (as E0401) and a struct never literal-constructed
+// compiled clean, carrying a field no expression can ever name.
+struct S {
+    x: i32,
+    x: i32,
+}
+
+fn main() -> i32 {
+    let s: S;
+    return 0;
+}

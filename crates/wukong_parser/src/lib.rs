@@ -704,6 +704,7 @@ impl<'a> Parser<'a> {
                     );
                 }
                 T::LBracket => {
+                    let bracket = self.span();
                     self.bump();
                     let mut indices = Vec::new();
                     while !self.at(T::RBracket) && !self.at(T::Eof) {
@@ -711,6 +712,19 @@ impl<'a> Parser<'a> {
                         if !self.eat(T::Comma) {
                             break;
                         }
+                    }
+                    // `a[]` is not a slice-of-everything or any other construct — it is a missing
+                    // index. The loop above happily produced `Index { indices: [] }`, which sema's
+                    // array arm returned the element type for unchecked and mir_build then refused
+                    // with the generic `C0001 'expression' is not yet supported by codegen`: a
+                    // message that tells the user the COMPILER is incomplete and names nothing they
+                    // wrote. Say what is actually missing, where the grammar noticed it.
+                    if indices.is_empty() {
+                        self.error(
+                            bracket,
+                            "E0202",
+                            "an index expression requires at least one index: `a[i]`, or                              `a[i, j]` for a rank-2 tensor",
+                        );
                     }
                     self.expect(T::RBracket);
                     lhs = self.finish_expr(
@@ -1951,6 +1965,26 @@ mod tests {
         let (t, diags) = parse_type_str(src, SourceId(0), &mut i);
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
         print::print_type(&t, &i)
+    }
+
+    #[test]
+    fn empty_index_is_rejected() {
+        // `a[]` built `Index { indices: [] }`, which sema's array arm returned the element type for
+        // unchecked and mir_build then refused with the generic
+        // `C0001 'expression' is not yet supported by codegen` — the compiler reporting itself as
+        // incomplete for what is a missing index.
+        let mut i = Interner::new();
+        let (_e, d) = parse_expr_str("a[]", SourceId(0), &mut i);
+        assert!(
+            d.iter().any(|x| x.code == Some("E0202")),
+            "`a[]` must be an E0202: {d:?}"
+        );
+        // A real index, and a multi-index, still parse clean.
+        for src in ["a[0]", "a[i, j]", "a[i][j]"] {
+            let mut i = Interner::new();
+            let (_e, d) = parse_expr_str(src, SourceId(0), &mut i);
+            assert!(d.is_empty(), "`{src}` must parse clean: {d:?}");
+        }
     }
 
     #[test]

@@ -1,0 +1,27 @@
+// EXPECT-CODE: E0401
+module tests.fail.struct_arg_wrong_nominal
+
+// `unify_decl` had a `(Tensor, Named)` arm but no `(Named, Named)` one, so two declared nominal
+// types fell to the lenient `_ => {}` and an `A` satisfied a `B` parameter. The callee then GEPed
+// the caller's smaller, differently-laid-out buffer: the interpreter reported
+// `error: load out of bounds` while native printed 0. Nominal typing was not enforced across a call
+// boundary at all. A bare generic type variable is also spelled `Ty::Named` and stays lenient — only
+// a name that resolves to a declared struct/enum is reported.
+struct A {
+    x: i32,
+}
+
+struct B {
+    y: f32,
+    z: f32,
+}
+
+fn f(v: B) -> f32 {
+    return v.z;
+}
+
+fn main() -> i32 {
+    let a: A = A { x: 5 };
+    println(f(a) as i32);
+    return 0;
+}

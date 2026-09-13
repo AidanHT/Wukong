@@ -257,6 +257,21 @@ static CATALOG: &[Explanation] = &[
          arms (`if …`) do not count toward coverage because their guard may be false."
     ),
     entry!(
+        "E0406",
+        "array length is not a compile-time constant",
+        "A fixed-size array's length is part of its type, so it must be readable at compile time: \
+         an integer literal, a `const` (possibly through a chain of consts), a non-negative C-style \
+         enum variant, or arithmetic on those. Anything else — a cast (`[i32; 4 as usize]`), a \
+         `sizeof`/`alignof`, a call, a unary operator, a multi-segment path — cannot be folded, and \
+         was previously accepted in silence: the type checker recorded length 0 while lowering \
+         emitted no array slot at all, just an uninitialized pointer that the program then stored \
+         through. A GENERIC parameter is rejected for the same reason and needs the same fix: \
+         `Ty::Array` carries a plain integer length, with no representation for a symbolic extent, \
+         so `[T; N]` inside `fn f<N>(..)` folded to length 0. Where the extent really is a \
+         per-call-site parameter, spell the value `Tensor[T, N]`, whose dimensions are shape-checked \
+         symbolically and bound at each call; where it is a fixed size, declare a `const`."
+    ),
+    entry!(
         "E0501",
         "tensor rank mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \

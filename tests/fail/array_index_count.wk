@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0501
+module tests.fail.array_index_count
+
+// shape.rs's module header states "a wrong index count is E0501", but only the tensor arm enforced
+// it: the array arm gated its bounds check on `indices.len() == 1` and returned the element type
+// unchecked for any other count, and the slice/pointer arm had no count check at all. So `a[i, j]`
+// on a rank-1 array reached mir_build and came back as
+// `error[C0001]: 'multi-dimensional indexing on a non-contiguous or symbolically-strided tensor'` —
+// a diagnostic that tells the user the COMPILER is incomplete when it is their code that is wrong,
+// and that names nothing they wrote.
+fn main() -> i32 {
+    let a: [i32; 4] = [10, 20, 30, 40];
+    return a[1, 2];
+}
