@@ -5,6 +5,47 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### `--emit=exe` never linked a release-profile executable (`LNK1136`)
+
+The AOT gate scored **0/4 in release and 4/4 in debug**, and had done so since the first commit —
+`[profile.release] lto = "thin"` is in `620da00`. Not a regression, a capability that never existed:
+
+```
+libwukong_runtime-1543dc4c25d8f594.rlib : fatal error LNK1136: invalid or corrupt file
+symbols.o : error LNK2001: unresolved external symbol wukong_argreduce_f32
+... (every wukong_* kernel, as a consequence)
+```
+
+With `lto = "thin"` cargo compiles every *dependency* of an LTO unit with `-C linker-plugin-lto`, so
+the release `wukong_runtime` rlib holds an **LLVM bitcode module** where its `.rcgu.o` member should
+be — `file` says `LLVM IR bitcode`, against `Intel amd64 COFF object file` for the same member of the
+debug rlib. MSVC `link.exe` cannot read one, and the unresolved `wukong_*` symbols are the wreckage,
+not the cause. The debug rlib is native because cargo passes a dev-profile dependency
+`-C embed-bitcode=no`, which is why every other gate stayed green over it.
+
+- `rustc_link` now classifies the rlib (`rlib_holds_bitcode_members`: walk the archive's member
+  headers, ask whether any member *starts* with the LLVM bitcode magic) and, for a bitcode rlib, links
+  with `-C lto=thin -C opt-level=3` — mirroring the profile the rlib was built under and doing the LTO
+  the bitcode was emitted for. Asking "is any member bitcode" rather than "is any member native" is
+  deliberate: on an MSVC target `lib.rmeta` is a COFF wrapper in *both* shapes, and cargo's
+  `ObjectAndBitcode` shape keeps its bitcode in a `.llvmbc` section inside a real object.
+- **`opt-level` is not cosmetic.** The LTO backend re-codegens imported modules at the *linking*
+  crate's level; at rustc's default `-C opt-level=0` the same rlib yields
+  `vfmadd213ps %ymm2,%ymm1,%ymm0` off stack reloads where `-C opt-level=3` yields the release form
+  `vfmadd231ps (%rdx,%r11,1),%ymm2,%ymm0`. A correct but deoptimized runtime in every AOT binary is
+  not a fix.
+- The `-o` path handed to rustc is absolutized. Under `-C lto=thin` rustc 1.97.1 names its per-module
+  LTO objects from the output stem and passes the linker a path valid only inside its own temp
+  directory, so `wukongc --emit=exe prog.wk` (a relative default output) died on
+  `LNK1181: cannot open input file 'prog.<crate>….rcgu.o.rcgu.o'`. The user-facing `wrote <path>` note
+  is unchanged.
+
+Debug is byte-for-byte the old path — a native rlib gets neither flag, and the debug gate still runs
+its four fixtures in 2.5 s. The cost is confined to release AOT, where each link is now a full LTO of
+the runtime plus std: `cargo test -p wukongc --release --test exe` takes ~99 s for four fixtures where
+it previously failed instantly. `wukong_bench`'s `spawn-overhead` mode will therefore report a real
+`link(exe-obj)` column in release for the first time, and it will be seconds, not milliseconds.
+
 ### `@tile` — the six paths that still discarded a width in silence
 
 W2a made an unsupported *loop form* and a malformed *width* `E0309`, and the docs then said a `@tile`

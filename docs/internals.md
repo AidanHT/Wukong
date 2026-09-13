@@ -481,6 +481,30 @@ shim's default `unwind` strategy against that rlib. The generated link inputs (t
 runtime for the fallback) are written into a pid-keyed scratch directory that is deleted when the link
 finishes — never into the process's working directory, unless that directory cannot be created.
 
+**The rlib's shape decides the rest of the link line, and the release shape is not the debug one.**
+The workspace `[profile.release]` sets `lto = "thin"`, so cargo compiles every *dependency* of an LTO
+unit with `-C linker-plugin-lto`: the `wukong_runtime` rlib still holds a `*.rcgu.o` member, but that
+member is an **LLVM bitcode module, not a COFF/ELF object**, because the final link is expected to be
+the one that turns it into machine code. MSVC `link.exe` cannot read such a member — it answers
+`LNK1136: invalid or corrupt file` and then reports every `wukong_*` kernel as an unresolved external
+— so the AOT path had never linked a single release-profile executable, while debug linked all of
+them (cargo compiles a dev-profile dependency with `-C embed-bitcode=no`, whose members are ordinary
+objects). `wukong_driver::rlib_holds_bitcode_members` walks the archive's member headers and asks
+whether any member *starts* with the LLVM bitcode magic — the right question, because on an MSVC
+target the `lib.rmeta` member is a COFF wrapper in **both** shapes, and cargo's `ObjectAndBitcode`
+shape keeps its bitcode in a `.llvmbc` section *inside* a real object. When the answer is yes,
+`rustc_link` adds `-C lto=thin -C opt-level=3`, mirroring the profile the rlib was built under and
+letting rustc do the LTO that the bitcode was emitted for. `opt-level` is load-bearing, not cosmetic:
+the LTO backend re-codegens imported modules at the *linking* crate's level, and at rustc's default
+`-C opt-level=0` the AVX2 kernels come out as `vfmadd213ps %ymm2,%ymm1,%ymm0` fed by stack reloads
+instead of the release form `vfmadd231ps (%rdx,%r11,1),%ymm2,%ymm0`. The path rustc is given for `-o`
+is absolutized for the same reason the LTO flag exists: with `-C lto=thin`, rustc 1.97.1 names its
+per-module LTO objects from the output *stem* and hands the linker a path only valid relative to its
+own temp directory, so a relative `-o hello.exe` fails with `LNK1181: cannot open input file
+'hello.<crate>…rcgu.o.rcgu.o'`. Nothing here touches the debug path: a native rlib links exactly as
+before, with neither flag. The cost is confined to release AOT, where the link is a whole LTO of the
+runtime and std — tens of seconds per executable rather than under a second.
+
 The only semantic bridges to stay identical to the interpreter: divide-by-zero yields 0, float→int
 casts saturate, and `i1` results are masked to their low bit. Two further contracts belong to the same
 seam. First, every generated load/store carries `notrap` **only** — deliberately not Cranelift's
@@ -1106,7 +1130,11 @@ device only through `gpu_accel`'s five hooks and `lower.rs`.
   their stdout/exit compared against `--run`, extending the differential gate to the linked exe (string
   `.rodata` and the linked `wukong_runtime` kernels). The gate probes once which link path exists on the
   box and may skip only when neither does; a failure of the compiler's own link is reported with its
-  captured stderr.
+  captured stderr. **Run it under `--release` as well as the default profile** — the two profiles hand
+  the linker archives of different shapes (see the bitcode/LTO paragraph in *Native backend* above), so
+  a green debug run says nothing about release; `cargo test -p wukongc --release --test exe` is the only
+  gate that has ever exercised the release AOT link, and it is minutes of wall time because each fixture
+  is a full LTO of the runtime.
 - **Examples** (`crates/wukongc/tests/examples.rs`): every `examples/*.wk` program is an
   interpreter-vs-native differential fixture *and* carries a declared execution class (`Runs`,
   `NotLowered`, `NoEntry`, `DataGuarded`), because a program that fails to compile trivially satisfies

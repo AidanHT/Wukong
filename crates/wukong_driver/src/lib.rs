@@ -872,6 +872,85 @@ pub fn runtime_rlib_in(dir: &Path) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// The LLVM bitcode magic, `'B' 'C' 0xC0 0xDE`, as it appears at offset 0 of a raw `.bc` module.
+const LLVM_BITCODE_MAGIC: [u8; 4] = [0x42, 0x43, 0xC0, 0xDE];
+/// The LLVM *bitcode wrapper* magic, `0x0B17C0DE` little-endian — the alternative container LLVM
+/// accepts wherever a raw module is accepted, so both spellings must count as "this is bitcode".
+const LLVM_BITCODE_WRAPPER_MAGIC: [u8; 4] = [0xDE, 0xC0, 0x17, 0x0B];
+
+/// Does this rlib's archive hold **LLVM bitcode members instead of native objects**?
+///
+/// **This is the release-profile shape of the AOT link, and it is not an anomaly — it is what cargo
+/// is documented to produce.** The workspace `[profile.release]` sets `lto = "thin"`, and cargo's
+/// LTO planner then compiles every *dependency* of an LTO unit as `Lto::OnlyBitcode`, i.e. with
+/// `-C linker-plugin-lto`: the rlib still contains `*.rcgu.o` members, but each one is an LLVM
+/// bitcode module rather than a COFF/ELF object, because the final link is expected to be the one
+/// that turns them into machine code. MSVC's `link.exe` cannot read a bitcode member, so handing it
+/// such an rlib is `LNK1136: invalid or corrupt file` and, in its wake, every `wukong_*` kernel
+/// reads as an unresolved external. That is a *fatal* link, which is why the AOT gate scored 0/4 in
+/// release while passing 4/4 in debug — cargo compiles a dev-profile dependency with
+/// `-C embed-bitcode=no` and its rlib members are ordinary objects.
+///
+/// The supported way to consume a bitcode-only rlib is to let **rustc** do the LTO (`-C lto`), which
+/// is what [`rustc_link`] switches on when this returns `true`. Note the test is deliberately
+/// "*any* member is bitcode", not "no member is native": on an MSVC target the `lib.rmeta` and
+/// `lib.rmeta-link` members are themselves COFF wrappers around the metadata blob and are present in
+/// *both* shapes, so "contains a native object" does not discriminate. An `ObjectAndBitcode` rlib —
+/// what cargo emits when a crate feeds both an LTO and a non-LTO unit — carries its bitcode inside a
+/// `.llvmbc` *section* of a real object, never as a member that starts with the magic, so it is
+/// correctly classified as native and linked without LTO.
+///
+/// Archive walking, not a full parse: the `!<arch>\n` global header, then 60-byte member headers
+/// (name\[16] mtime\[12] uid\[6] gid\[6] mode\[8] size\[10] "`\n"\[2]) with the data padded to an
+/// even offset. Only the first four bytes of each member are read, so the cost is a handful of
+/// seeks even on the 65 MB debug rlib. Any malformed header stops the walk and answers `false` —
+/// "link it the way we always did", the behaviour that is already known to work.
+fn rlib_holds_bitcode_members(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut global = [0u8; 8];
+    if f.read_exact(&mut global).is_err() || &global != b"!<arch>\n" {
+        return false;
+    }
+    let mut header = [0u8; 60];
+    loop {
+        // A short read here is the clean end of the archive: no bitcode member was found.
+        if f.read_exact(&mut header).is_err() {
+            return false;
+        }
+        if &header[58..60] != b"`\n" {
+            return false; // not a header where one must be — stop rather than guess
+        }
+        let Ok(size_field) = std::str::from_utf8(&header[48..58]) else {
+            return false;
+        };
+        let Ok(size) = size_field.trim().parse::<u64>() else {
+            return false;
+        };
+        if size >= 4 {
+            let mut magic = [0u8; 4];
+            if f.read_exact(&mut magic).is_err() {
+                return false;
+            }
+            if magic == LLVM_BITCODE_MAGIC || magic == LLVM_BITCODE_WRAPPER_MAGIC {
+                return true;
+            }
+            if f.seek(SeekFrom::Current((size - 4) as i64)).is_err() {
+                return false;
+            }
+        } else if f.seek(SeekFrom::Current(size as i64)).is_err() {
+            return false;
+        }
+        // Member data is padded to an even offset with a single `\n`.
+        if size % 2 == 1 && f.seek(SeekFrom::Current(1)).is_err() {
+            return false;
+        }
+    }
+}
+
 /// Link the Cranelift object into an executable with **`rustc` as the link driver**. rustc invokes
 /// the object's native platform linker (on the MSVC host, the installed `link.exe`, discovered
 /// automatically) and links `wukong_runtime` as a real dependency, so a recognized-kernel program's
@@ -908,8 +987,29 @@ fn rustc_link(
         return LinkOutcome::Failed(format!("could not write `{}`: {e}", shim_path.display()));
     }
 
-    let status = Command::new("rustc")
-        .arg(&shim_path)
+    // **The output path handed to rustc must be absolute.** With `-C lto=thin`, rustc names its
+    // per-module LTO objects after the *output file's* stem and then passes them to the linker by a
+    // path that is only valid relative to its own temp directory — so `-o hello.exe` links with
+    // `LNK1181: cannot open input file 'hello.<crate>....rcgu.o.rcgu.o'` while `-o C:\..\hello.exe`
+    // links fine (rustc 1.97.1). Absolutizing costs nothing on the non-LTO path and is what makes
+    // the LTO path below usable from a bare `wukongc --emit=exe prog.wk`. `std::path::absolute` is
+    // pure path arithmetic against the CWD — it does not touch the filesystem, and the *user-facing*
+    // `wrote <path>` note in `emit_native` still prints the path the user asked for.
+    let out_arg = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
+
+    // Consume a bitcode-only rlib the only way it can be consumed: make rustc do the LTO. See
+    // [`rlib_holds_bitcode_members`] — this is the release profile (`lto = "thin"`), where cargo
+    // compiles the runtime with `-C linker-plugin-lto` and `link.exe` answers `LNK1136`. `opt-level`
+    // is not cosmetic here: the LTO backend re-codegens every imported module at the *linking*
+    // crate's level, and at the rustc default (`-C opt-level=0`) the AVX2 kernels come out as
+    // `vfmadd213ps %ymm2,%ymm1,%ymm0` fed from stack reloads instead of the release form
+    // `vfmadd231ps (%rdx,%r11,1),%ymm2,%ymm0` — a correct but deoptimized runtime in every AOT
+    // binary. `lto=thin` + `opt-level=3` mirrors the workspace `[profile.release]` the rlib was
+    // built under, so the kernels land in the exe exactly as that profile compiled them.
+    let bitcode_rlib = rlib_holds_bitcode_members(&rlib);
+
+    let mut cmd = Command::new("rustc");
+    cmd.arg(&shim_path)
         .arg("--edition")
         .arg("2021")
         // The rlib we link against is built by this workspace, whose `[profile.release]` sets
@@ -919,7 +1019,11 @@ fn rustc_link(
         // link before it ever reached the linker. An abort-strategy crate may link unwind-built
         // dependencies, so this is equally correct against a debug-profile rlib.
         .arg("-C")
-        .arg("panic=abort")
+        .arg("panic=abort");
+    if bitcode_rlib {
+        cmd.arg("-C").arg("lto=thin").arg("-C").arg("opt-level=3");
+    }
+    let status = cmd
         .arg("--extern")
         .arg(format!("wukong_runtime={}", rlib.display()))
         .arg("-L")
@@ -927,15 +1031,24 @@ fn rustc_link(
         .arg("-C")
         .arg(format!("link-arg={}", obj_path.display()))
         .arg("-o")
-        .arg(out)
+        .arg(&out_arg)
         .status();
     let _ = std::fs::remove_file(&shim_path);
 
     match status {
         Ok(s) if s.success() => LinkOutcome::Linked,
         Ok(_) => LinkOutcome::Failed(format!(
-            "`rustc` failed to link the native object `{}`",
-            obj_path.display()
+            "`rustc` failed to link the native object `{}`{}",
+            obj_path.display(),
+            if bitcode_rlib {
+                format!(
+                    "\nnote: `{}` holds LLVM bitcode members (an LTO-profile rlib), so the link was \
+                     run with `-C lto=thin -C opt-level=3`",
+                    rlib.display()
+                )
+            } else {
+                String::new()
+            }
         )),
         // rustc not on PATH: fall back to the C-runtime `cc` link (scalar, no-data programs only).
         Err(_) => LinkOutcome::Unavailable,
@@ -2202,6 +2315,134 @@ mod native_link_tests {
             runtime_rlib_in(&dir),
             Some(uplifted),
             "the uplifted rlib must take precedence"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Assemble a `!<arch>` archive from `(name, data)` members, so the bitcode probe can be tested
+    /// on exactly the two shapes cargo emits without needing either profile's real 4–65 MB rlib.
+    fn synth_archive(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        for (name, data) in members {
+            out.extend_from_slice(format!("{name:<16}").as_bytes());
+            out.extend_from_slice(b"0           "); // mtime[12]
+            out.extend_from_slice(b"0     "); // uid[6]
+            out.extend_from_slice(b"0     "); // gid[6]
+            out.extend_from_slice(b"100644  "); // mode[8]
+            out.extend_from_slice(format!("{:<10}", data.len()).as_bytes());
+            out.extend_from_slice(b"`\n");
+            out.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                out.push(b'\n'); // members are padded to an even offset
+            }
+        }
+        out
+    }
+
+    /// The release AOT link's whole diagnosis in one probe: an rlib whose code members are LLVM
+    /// bitcode (what `[profile.release] lto = "thin"` makes cargo emit for a dependency, via
+    /// `-C linker-plugin-lto`) must be recognized, because handing one to MSVC `link.exe` is
+    /// `LNK1136: invalid or corrupt file` and then every `wukong_*` kernel reads as an unresolved
+    /// external — the state in which the AOT gate scored 0/4 in release and 4/4 in debug.
+    ///
+    /// The two negative cases are the ones that would silently break the *working* debug path if the
+    /// probe over-fired: a dev-profile rlib (plain objects), and the `ObjectAndBitcode` shape, whose
+    /// bitcode lives in a `.llvmbc` section *inside* a real object and must therefore still link
+    /// without LTO. Note both shapes carry a COFF-wrapped `lib.rmeta` on an MSVC target, which is why
+    /// the probe asks "is any member bitcode", never "is any member native".
+    #[test]
+    fn an_lto_profile_rlib_is_recognized_as_holding_bitcode_members() {
+        let dir = std::env::temp_dir().join(format!("wukong_bc_probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create probe dir");
+
+        // A COFF object header (machine 0x8664, 0 sections) — what a native member starts with, and
+        // what the MSVC `lib.rmeta` wrapper starts with in BOTH shapes.
+        let coff = |tail: &[u8]| {
+            let mut v = vec![0x64u8, 0x86, 0x00, 0x00];
+            v.extend_from_slice(tail);
+            v
+        };
+        let bitcode = |tail: &[u8]| {
+            let mut v = LLVM_BITCODE_MAGIC.to_vec();
+            v.extend_from_slice(tail);
+            v
+        };
+
+        /// `(what the shape is, its archive members, whether the probe must call it bitcode)`.
+        type Case<'a> = (&'a str, Vec<(&'a str, Vec<u8>)>, bool);
+
+        let cases: [Case; 6] = [
+            (
+                "release: rmeta wrapper + a bitcode code member",
+                vec![
+                    ("lib.rmeta", coff(b"metadata")),
+                    ("lib.rmeta-link", coff(b"x")),
+                    ("crate.rcgu.o", bitcode(b"module body")),
+                ],
+                true,
+            ),
+            (
+                "debug: rmeta wrapper + native code members",
+                vec![
+                    ("lib.rmeta", coff(b"metadata")),
+                    ("a.rcgu.o", coff(b".text")),
+                    ("b.rcgu.o", coff(b".text")),
+                ],
+                false,
+            ),
+            (
+                "ObjectAndBitcode: bitcode lives in a section, not as a member",
+                vec![
+                    ("lib.rmeta", coff(b"metadata")),
+                    ("a.rcgu.o", coff(b".llvmbcBC\xc0\xde")),
+                ],
+                false,
+            ),
+            (
+                "the bitcode WRAPPER container counts too",
+                vec![("crate.rcgu.o", {
+                    let mut v = LLVM_BITCODE_WRAPPER_MAGIC.to_vec();
+                    v.extend_from_slice(b"wrapped");
+                    v
+                })],
+                true,
+            ),
+            (
+                // An odd-length member before the bitcode one: miss the pad byte and the next header
+                // lands one byte early, the walk bails, and a release rlib is misread as native.
+                "an odd-length member does not desynchronize the walk",
+                vec![
+                    ("odd.txt", b"abc".to_vec()),
+                    ("tiny.o", b"ab".to_vec()),
+                    ("crate.rcgu.o", bitcode(b"module body")),
+                ],
+                true,
+            ),
+            ("an archive with no members at all", vec![], false),
+        ];
+
+        for (what, members, expected) in cases {
+            let path = dir.join("probe.rlib");
+            std::fs::write(&path, synth_archive(&members)).expect("write probe rlib");
+            assert_eq!(
+                rlib_holds_bitcode_members(&path),
+                expected,
+                "{what}: misclassified"
+            );
+        }
+
+        // Not an archive at all, and a missing file: both must answer "link it the ordinary way".
+        let junk = dir.join("junk.rlib");
+        std::fs::write(&junk, b"this is not an archive").expect("write junk");
+        assert!(
+            !rlib_holds_bitcode_members(&junk),
+            "a non-archive is not bitcode"
+        );
+        assert!(
+            !rlib_holds_bitcode_members(&dir.join("absent.rlib")),
+            "a missing rlib is not bitcode"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
