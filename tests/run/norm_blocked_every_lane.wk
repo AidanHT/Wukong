@@ -1,0 +1,276 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+module tests.run.norm_blocked_every_lane
+
+// Every lane of a fused single-row norm at a length that reaches the reduction's BLOCKED body.
+//
+// WHY THIS FIXTURE EXISTS. `wukong_runtime::norm` runs its mean / variance / sum-of-squares passes
+// over `UNROLL` = 8 independent accumulators in `BLOCK` = 64-element steps, with a single-accumulator
+// remainder for the leftover 8-lane vectors and a ragged scalar tail. Every pre-existing norm fixture
+// in this corpus normalizes a row of 8, 16 or 32 elements — all SHORTER than one block — so not one
+// of them ever executed the blocked path, the accumulator combine, or the remainder/tail seams. And a
+// recognized kernel is gate-blind: it fires identically on interp and native at every `-O`, so the
+// differential and opt-invariance gates cannot see a wrong reduction. Only expected values written
+// down independently can.
+//
+// WHY EVERY LANE, AND NOT A CHECKSUM. A sum over the row passes over a buffer whose lanes are
+// individually wrong but cancel, and it passes over a writeback that skipped the ragged tail. Each
+// lane is printed on its own line.
+//
+// THE TWO SHAPES cover both reduction helpers and both blocking seams:
+//   * `a` (100 = 64 + 4x8 + 4) drives `ssq8_*` (RMSNorm / L2-norm / affine RMSNorm) through one full
+//     block, four remainder vectors and a 4-element ragged tail, and `scale_row_avx2`'s writeback
+//     through three x4-unrolled groups plus that tail.
+//   * `b` (112 = 64 + 6x8 + 0) drives `sum8_*` and `dev2_8_*` (LayerNorm) through one full block and
+//     six remainder vectors.
+//
+// WHY THESE EXPECTED VALUES ARE INDEPENDENT OF SUMMATION ORDER. Both rows hold small integers, so
+// every partial sum is an exact f32 integer and reassociating the reduction cannot change it:
+//   * `a[i] = ((3i) mod 7) + 1`, so `a[i]` in 1..7 and `sum a[i]^2 = 1977` exactly. The L2 scale is
+//     `1/sqrt(1977 + 1e-5) = 1/sqrt(1977)` to the bit (1e-5 is far below the ulp of 1977), so
+//     `a[i]/44.46347...` and `round(400 * a[i] / sqrt(1977)) = round(8.99615 * a[i]) = 9*a[i]` for
+//     every a[i] in 1..7 — the printed line for lane i is simply nine times its input. The nearest
+//     value to a .5 rounding boundary sits 0.47 of a step away, so the printed integers do not turn
+//     on a last-ulp difference.
+//   * `b` is the same pattern over 112 = 16 full cycles of 1..7, so `sum b[i] = 448` and the mean is
+//     exactly 4. Deviations are the integers -3..3, `sum d^2 = 448`, variance exactly 4, and the
+//     scale `1/sqrt(4 + 1e-5) = 0.49999938`, so `round(1000 * d * 0.49999938) = 500*d`. Margin to the
+//     nearest rounding boundary: 0.498 of a step.
+// Neither expectation was read back from the compiler: both are the scalar reading of the loop.
+
+fn main() -> i32 {
+    // --- L2 / unit normalize a 100-element row, in place (the recognized single-row window).
+    let mut a: [f32; 100] = [0.0; 100];
+    for i in 0..100 { a[i] = ((i * 3) % 7) as f32 + 1.0; }
+    let mut ss: f32 = 0.0;
+    for i in 0..100 { ss = ss + a[i] * a[i]; }
+    let inv: f32 = 1.0 / sqrt(ss + 0.00001);
+    for i in 0..100 { a[i] = a[i] * inv; }
+    for i in 0..100 { print(round(a[i] * 400.0) as i32); }
+
+    // --- LayerNorm a 112-element row, in place.
+    let mut b: [f32; 112] = [0.0; 112];
+    for i in 0..112 { b[i] = ((i * 3) % 7) as f32 + 1.0; }
+    let mut s: f32 = 0.0;
+    for i in 0..112 { s = s + b[i]; }
+    let mean: f32 = s / 112.0;
+    let mut v: f32 = 0.0;
+    for i in 0..112 { v = v + (b[i] - mean) * (b[i] - mean); }
+    let inv2: f32 = rsqrt(v / 112.0 + 0.00001);
+    for i in 0..112 { b[i] = (b[i] - mean) * inv2; }
+    for i in 0..112 { print(round(b[i] * 1000.0) as i32); }
+
+    return 0;
+}

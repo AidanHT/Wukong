@@ -22,10 +22,17 @@
 //! `wuk_pool_width() <= 1` they skip the pool entirely and tail-call the serial sibling, which is the
 //! same bits by that argument). A non-positive `rows` or `cols` is a no-op at every entry, never a
 //! walk off the end. Within a row the
-//! two reductions (softmax's max+sum, LayerNorm's mean+var, RMSNorm's mean-square) use a fixed 8-lane
-//! accumulator and a fixed-order horizontal combine, and the AVX2 path stores its accumulator to the
-//! same `[f32; 8]` the scalar twin builds and calls the *same* combine — so the AVX2 kernel and the
-//! scalar fallback agree bit-for-bit too (pinned by a unit test across partial-chunk / tail sizes).
+//! reductions (softmax's max+sum, LayerNorm's mean+var, RMSNorm's mean-square) use a **fixed**
+//! accumulator layout and a fixed-order combine, so the result depends on `n` alone and never on the
+//! machine or the call site. Softmax's two passes keep the original single 8-lane accumulator; the
+//! non-softmax reductions run `UNROLL` = 8 such accumulators over `BLOCK` = 64-element steps (see the
+//! block above [`ssq8_scalar`] for why — the one-accumulator form was FMA-*latency* bound), with a
+//! single-accumulator remainder and a ragged scalar tail. Both forms end by storing the 8 lanes to an
+//! `[f32; 8]` the scalar twin builds identically and calling the *same* horizontal combine, so the
+//! AVX2 kernel and the scalar fallback agree bit-for-bit (pinned by `scalar_matches_avx2_bit_for_bit`
+//! across 25 sizes covering every block, remainder and tail seam, and by
+//! `tests/run/norm_blocked_every_lane.wk`, which prints every lane of a dispatched 100- and
+//! 112-element row against expectations derived from the scalar reading of the loop).
 
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
@@ -74,6 +81,267 @@ fn maxps(a: f32, b: f32) -> f32 {
     } else {
         b
     }
+}
+
+// --- row reductions: 8 independent accumulators -------------------------------------------------
+//
+// The reduction pass of every non-softmax norm used to run ONE accumulator:
+//
+//     while i + 8 <= n { let v = load(x+i); ssv = fmadd(v, v, ssv); i += 8; }
+//
+// which is a serial dependency chain through `ssv`, so the loop retires one 8-lane step per FMA
+// *latency* (4 cycles on Golden/Redwood Cove) rather than per FMA *throughput* (2 per cycle). At the
+// single-row sizes a transformer actually uses — a 768-wide row is 96 steps, a 4096-wide row 512 —
+// that chain **is** the kernel: 96 x 4 = 384 cycles for a pass whose throughput bound is 48. gcc's
+// `-ffast-math` peer gets a 2x head start here for free, because it emits a separate `vmulps` +
+// `vaddps` and only the 2-cycle `vaddps` is on its chain.
+//
+// So the block below runs `UNROLL` = 8 accumulators over `BLOCK` = 64 elements per step, which puts
+// 8 independent FMA chains in flight and makes the pass throughput-bound. `UNROLL` = 8 (not 4) is
+// what FMA latency x issue width asks for: 4 cycles x 2 per cycle = 8 in flight to saturate.
+//
+// **Each reduction is a matched scalar/AVX2 pair, written adjacently and with the identical block
+// structure**, because the module's contract is that the AVX2 kernel and the scalar twin agree
+// bit-for-bit — and an accumulator layout is exactly the kind of thing that silently desyncs. Lane
+// `j` of scalar accumulator `t` folds the same elements as lane `j` of vector accumulator `t`, and
+// the final combine is the same explicit halving tree on both sides, so they agree by construction.
+//
+// Two consequences worth stating:
+//   * For `n < 64` the blocked loop never runs and everything falls through the single-accumulator
+//     remainder, so **short rows keep byte-identical results to the pre-unroll kernel**.
+//   * For `n >= 64` the summation order changes. It changes toward pairwise summation, so the error
+//     bound improves rather than degrades (`matches_f64_reference` covers this); it is not, and was
+//     never, bit-compatible with a strictly sequential reduction.
+
+/// Accumulators in flight over the reduction's blocked body.
+const UNROLL: usize = 8;
+/// Elements consumed per blocked step (`UNROLL` 8-lane vectors).
+const BLOCK: usize = UNROLL * 8;
+
+/// Fold the 8 lane-accumulator arrays down to one with an explicit halving tree. The AVX2 twins run
+/// the identical tree on `__m256` values, and `_mm256_add_ps` is lane-wise, so lane `j` here is lane
+/// `j` there.
+#[inline(always)]
+fn combine8(a: &mut [[f32; 8]; UNROLL]) {
+    // Halve three times: (0,4)(1,5)(2,6)(3,7), then (0,2)(1,3), then (0,1) — the pairing and the
+    // order the AVX2 twins spell out explicitly with `_mm256_add_ps`.
+    let mut w = UNROLL;
+    while w > 1 {
+        let h = w / 2;
+        let (lo, hi) = a[..w].split_at_mut(h);
+        for (l, r) in lo.iter_mut().zip(hi.iter()) {
+            for (lj, rj) in l.iter_mut().zip(r.iter()) {
+                *lj += *rj;
+            }
+        }
+        w = h;
+    }
+}
+
+/// `Σ x[i]²` as 8 lane accumulators (RMSNorm / L2-norm), scalar twin of [`ssq8_avx2`].
+///
+/// # Safety
+/// `x` valid for `n` `f32`.
+unsafe fn ssq8_scalar(x: *const f32, n: usize) -> [f32; 8] {
+    let mut a = [[0.0f32; 8]; UNROLL];
+    let mut i = 0;
+    while i + BLOCK <= n {
+        for (t, at) in a.iter_mut().enumerate() {
+            for (j, atj) in at.iter_mut().enumerate() {
+                let v = *x.add(i + 8 * t + j);
+                *atj = v.mul_add(v, *atj);
+            }
+        }
+        i += BLOCK;
+    }
+    while i + 8 <= n {
+        for (j, a0j) in a[0].iter_mut().enumerate() {
+            let v = *x.add(i + j);
+            *a0j = v.mul_add(v, *a0j);
+        }
+        i += 8;
+    }
+    combine8(&mut a);
+    let mut ss = a[0];
+    for (j, ssj) in ss.iter_mut().enumerate().take(n - i) {
+        let v = *x.add(i + j);
+        *ssj = v.mul_add(v, *ssj);
+    }
+    ss
+}
+
+/// `Σ x[i]` as 8 lane accumulators (the LayerNorm mean pass), scalar twin of [`sum8_avx2`].
+///
+/// # Safety
+/// `x` valid for `n` `f32`.
+unsafe fn sum8_scalar(x: *const f32, n: usize) -> [f32; 8] {
+    let mut a = [[0.0f32; 8]; UNROLL];
+    let mut i = 0;
+    while i + BLOCK <= n {
+        for (t, at) in a.iter_mut().enumerate() {
+            for (j, atj) in at.iter_mut().enumerate() {
+                *atj += *x.add(i + 8 * t + j);
+            }
+        }
+        i += BLOCK;
+    }
+    while i + 8 <= n {
+        for (j, a0j) in a[0].iter_mut().enumerate() {
+            *a0j += *x.add(i + j);
+        }
+        i += 8;
+    }
+    combine8(&mut a);
+    let mut sm = a[0];
+    for (j, smj) in sm.iter_mut().enumerate().take(n - i) {
+        *smj += *x.add(i + j);
+    }
+    sm
+}
+
+/// `Σ (x[i] - mean)²` as 8 lane accumulators (the LayerNorm variance pass), scalar twin of
+/// [`dev2_8_avx2`]. The addend is a `mul_add`, matching the AVX2 `fmadd`.
+///
+/// # Safety
+/// `x` valid for `n` `f32`.
+unsafe fn dev2_8_scalar(x: *const f32, n: usize, mean: f32) -> [f32; 8] {
+    let mut a = [[0.0f32; 8]; UNROLL];
+    let mut i = 0;
+    while i + BLOCK <= n {
+        for (t, at) in a.iter_mut().enumerate() {
+            for (j, atj) in at.iter_mut().enumerate() {
+                let d = *x.add(i + 8 * t + j) - mean;
+                *atj = d.mul_add(d, *atj);
+            }
+        }
+        i += BLOCK;
+    }
+    while i + 8 <= n {
+        for (j, a0j) in a[0].iter_mut().enumerate() {
+            let d = *x.add(i + j) - mean;
+            *a0j = d.mul_add(d, *a0j);
+        }
+        i += 8;
+    }
+    combine8(&mut a);
+    let mut va = a[0];
+    for (j, vaj) in va.iter_mut().enumerate().take(n - i) {
+        let d = *x.add(i + j) - mean;
+        *vaj = d.mul_add(d, *vaj);
+    }
+    va
+}
+
+/// `Σ x[i]²` as 8 lane accumulators, AVX2 twin of [`ssq8_scalar`] (same block structure, same tree).
+///
+/// # Safety
+/// `x` valid for `n` `f32`; AVX2+FMA detected by the caller.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn ssq8_avx2(x: *const f32, n: usize) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    let mut a = [_mm256_setzero_ps(); UNROLL];
+    let mut i = 0;
+    while i + BLOCK <= n {
+        for (t, at) in a.iter_mut().enumerate() {
+            let v = _mm256_loadu_ps(x.add(i + 8 * t));
+            *at = _mm256_fmadd_ps(v, v, *at);
+        }
+        i += BLOCK;
+    }
+    while i + 8 <= n {
+        let v = _mm256_loadu_ps(x.add(i));
+        a[0] = _mm256_fmadd_ps(v, v, a[0]);
+        i += 8;
+    }
+    a[0] = _mm256_add_ps(a[0], a[4]);
+    a[1] = _mm256_add_ps(a[1], a[5]);
+    a[2] = _mm256_add_ps(a[2], a[6]);
+    a[3] = _mm256_add_ps(a[3], a[7]);
+    a[0] = _mm256_add_ps(a[0], a[2]);
+    a[1] = _mm256_add_ps(a[1], a[3]);
+    a[0] = _mm256_add_ps(a[0], a[1]);
+    let mut ss = [0.0f32; 8];
+    _mm256_storeu_ps(ss.as_mut_ptr(), a[0]);
+    for (j, ssj) in ss.iter_mut().enumerate().take(n - i) {
+        let v = *x.add(i + j);
+        *ssj = v.mul_add(v, *ssj);
+    }
+    ss
+}
+
+/// `Σ x[i]` as 8 lane accumulators, AVX2 twin of [`sum8_scalar`].
+///
+/// # Safety
+/// `x` valid for `n` `f32`; AVX2+FMA detected by the caller.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sum8_avx2(x: *const f32, n: usize) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    let mut a = [_mm256_setzero_ps(); UNROLL];
+    let mut i = 0;
+    while i + BLOCK <= n {
+        for (t, at) in a.iter_mut().enumerate() {
+            *at = _mm256_add_ps(*at, _mm256_loadu_ps(x.add(i + 8 * t)));
+        }
+        i += BLOCK;
+    }
+    while i + 8 <= n {
+        a[0] = _mm256_add_ps(a[0], _mm256_loadu_ps(x.add(i)));
+        i += 8;
+    }
+    a[0] = _mm256_add_ps(a[0], a[4]);
+    a[1] = _mm256_add_ps(a[1], a[5]);
+    a[2] = _mm256_add_ps(a[2], a[6]);
+    a[3] = _mm256_add_ps(a[3], a[7]);
+    a[0] = _mm256_add_ps(a[0], a[2]);
+    a[1] = _mm256_add_ps(a[1], a[3]);
+    a[0] = _mm256_add_ps(a[0], a[1]);
+    let mut sm = [0.0f32; 8];
+    _mm256_storeu_ps(sm.as_mut_ptr(), a[0]);
+    for (j, smj) in sm.iter_mut().enumerate().take(n - i) {
+        *smj += *x.add(i + j);
+    }
+    sm
+}
+
+/// `Σ (x[i] - mean)²` as 8 lane accumulators, AVX2 twin of [`dev2_8_scalar`].
+///
+/// # Safety
+/// `x` valid for `n` `f32`; AVX2+FMA detected by the caller.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dev2_8_avx2(x: *const f32, n: usize, mean: f32) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    let mb = _mm256_set1_ps(mean);
+    let mut a = [_mm256_setzero_ps(); UNROLL];
+    let mut i = 0;
+    while i + BLOCK <= n {
+        for (t, at) in a.iter_mut().enumerate() {
+            let d = _mm256_sub_ps(_mm256_loadu_ps(x.add(i + 8 * t)), mb);
+            *at = _mm256_fmadd_ps(d, d, *at);
+        }
+        i += BLOCK;
+    }
+    while i + 8 <= n {
+        let d = _mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb);
+        a[0] = _mm256_fmadd_ps(d, d, a[0]);
+        i += 8;
+    }
+    a[0] = _mm256_add_ps(a[0], a[4]);
+    a[1] = _mm256_add_ps(a[1], a[5]);
+    a[2] = _mm256_add_ps(a[2], a[6]);
+    a[3] = _mm256_add_ps(a[3], a[7]);
+    a[0] = _mm256_add_ps(a[0], a[2]);
+    a[1] = _mm256_add_ps(a[1], a[3]);
+    a[0] = _mm256_add_ps(a[0], a[1]);
+    let mut va = [0.0f32; 8];
+    _mm256_storeu_ps(va.as_mut_ptr(), a[0]);
+    for (j, vaj) in va.iter_mut().enumerate().take(n - i) {
+        let d = *x.add(i + j) - mean;
+        *vaj = d.mul_add(d, *vaj);
+    }
+    va
 }
 
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback) ------------------------------------------
@@ -168,35 +436,10 @@ unsafe fn logsoftmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
 /// # Safety
 /// `x` and `out` must each be valid for `n` `f32` elements.
 unsafe fn layernorm_row_scalar(x: *const f32, out: *mut f32, n: usize, eps: f32) {
-    let nb = n / 8;
-    let t = nb * 8;
     let invn = 1.0 / (n as f32);
-    // mean
-    let mut sm = [0.0f32; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for (j, smj) in sm.iter_mut().enumerate() {
-            *smj += *x.add(b + j);
-        }
-    }
-    for (j, smj) in sm.iter_mut().enumerate().take(n - t) {
-        *smj += *x.add(t + j);
-    }
-    let mean = hsum8(sm) * invn;
+    let mean = hsum8(sum8_scalar(x, n)) * invn;
     // variance = mean of squared deviations (the addend FMA-contracts, matching the AVX2 fmadd)
-    let mut vv = [0.0f32; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for (j, vvj) in vv.iter_mut().enumerate() {
-            let d = *x.add(b + j) - mean;
-            *vvj = d.mul_add(d, *vvj);
-        }
-    }
-    for (j, vvj) in vv.iter_mut().enumerate().take(n - t) {
-        let d = *x.add(t + j) - mean;
-        *vvj = d.mul_add(d, *vvj);
-    }
-    let inv = 1.0 / (hsum8(vv) * invn + eps).sqrt();
+    let inv = 1.0 / (hsum8(dev2_8_scalar(x, n, mean)) * invn + eps).sqrt();
     for i in 0..n {
         *out.add(i) = (*x.add(i) - mean) * inv;
     }
@@ -207,22 +450,8 @@ unsafe fn layernorm_row_scalar(x: *const f32, out: *mut f32, n: usize, eps: f32)
 /// # Safety
 /// `x` and `out` must each be valid for `n` `f32` elements.
 unsafe fn rmsnorm_row_scalar(x: *const f32, out: *mut f32, n: usize, eps: f32) {
-    let nb = n / 8;
-    let t = nb * 8;
     let invn = 1.0 / (n as f32);
-    let mut ss = [0.0f32; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for (j, ssj) in ss.iter_mut().enumerate() {
-            let v = *x.add(b + j);
-            *ssj = v.mul_add(v, *ssj);
-        }
-    }
-    for (j, ssj) in ss.iter_mut().enumerate().take(n - t) {
-        let v = *x.add(t + j);
-        *ssj = v.mul_add(v, *ssj);
-    }
-    let inv = 1.0 / (hsum8(ss) * invn + eps).sqrt();
+    let inv = 1.0 / (hsum8(ssq8_scalar(x, n)) * invn + eps).sqrt();
     for i in 0..n {
         *out.add(i) = *x.add(i) * inv;
     }
@@ -237,21 +466,7 @@ unsafe fn rmsnorm_row_scalar(x: *const f32, out: *mut f32, n: usize, eps: f32) {
 /// # Safety
 /// `x` and `out` must each be valid for `n` `f32` elements.
 unsafe fn l2norm_row_scalar(x: *const f32, out: *mut f32, n: usize, eps: f32) {
-    let nb = n / 8;
-    let t = nb * 8;
-    let mut ss = [0.0f32; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for (j, ssj) in ss.iter_mut().enumerate() {
-            let v = *x.add(b + j);
-            *ssj = v.mul_add(v, *ssj);
-        }
-    }
-    for (j, ssj) in ss.iter_mut().enumerate().take(n - t) {
-        let v = *x.add(t + j);
-        *ssj = v.mul_add(v, *ssj);
-    }
-    let inv = 1.0 / (hsum8(ss) + eps).sqrt();
+    let inv = 1.0 / (hsum8(ssq8_scalar(x, n)) + eps).sqrt();
     for i in 0..n {
         *out.add(i) = *x.add(i) * inv;
     }
@@ -362,38 +577,21 @@ unsafe fn logsoftmax_row_avx2(x: *const f32, out: *mut f32, n: usize) {
 unsafe fn layernorm_row_avx2(x: *const f32, out: *mut f32, n: usize, eps: f32) {
     use std::arch::x86_64::*;
     let invn = 1.0 / (n as f32);
-    // mean
-    let mut sv = _mm256_setzero_ps();
-    let mut i = 0;
-    while i + 8 <= n {
-        sv = _mm256_add_ps(sv, _mm256_loadu_ps(x.add(i)));
-        i += 8;
-    }
-    let mut sm = [0.0f32; 8];
-    _mm256_storeu_ps(sm.as_mut_ptr(), sv);
-    for (j, smj) in sm.iter_mut().enumerate().take(n - i) {
-        *smj += *x.add(i + j);
-    }
-    let mean = hsum8(sm) * invn;
+    let mean = hsum8(sum8_avx2(x, n)) * invn;
     let mb = _mm256_set1_ps(mean);
-    // variance
-    let mut vv = _mm256_setzero_ps();
-    i = 0;
-    while i + 8 <= n {
-        let d = _mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb);
-        vv = _mm256_fmadd_ps(d, d, vv);
-        i += 8;
-    }
-    let mut va = [0.0f32; 8];
-    _mm256_storeu_ps(va.as_mut_ptr(), vv);
-    for (j, vaj) in va.iter_mut().enumerate().take(n - i) {
-        let d = *x.add(i + j) - mean;
-        *vaj = d.mul_add(d, *vaj);
-    }
-    let inv = 1.0 / (hsum8(va) * invn + eps).sqrt();
+    let inv = 1.0 / (hsum8(dev2_8_avx2(x, n, mean)) * invn + eps).sqrt();
     let ivb = _mm256_set1_ps(inv);
-    // normalize
-    i = 0;
+    // normalize — unrolled x4 so four independent load->sub->mul->store chains are in flight (the
+    // writeback is otherwise one dependent 8-lane step per iteration, the same stall the reduction
+    // above had).
+    let mut i = 0;
+    while i + 32 <= n {
+        for t in 0..4 {
+            let d = _mm256_sub_ps(_mm256_loadu_ps(x.add(i + 8 * t)), mb);
+            _mm256_storeu_ps(out.add(i + 8 * t), _mm256_mul_ps(d, ivb));
+        }
+        i += 32;
+    }
     while i + 8 <= n {
         let d = _mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb);
         _mm256_storeu_ps(out.add(i), _mm256_mul_ps(d, ivb));
@@ -410,22 +608,36 @@ unsafe fn layernorm_row_avx2(x: *const f32, out: *mut f32, n: usize, eps: f32) {
 unsafe fn rmsnorm_row_avx2(x: *const f32, out: *mut f32, n: usize, eps: f32) {
     use std::arch::x86_64::*;
     let invn = 1.0 / (n as f32);
-    let mut ssv = _mm256_setzero_ps();
+    let inv = 1.0 / (hsum8(ssq8_avx2(x, n)) * invn + eps).sqrt();
+    scale_row_avx2(x, out, n, _mm256_set1_ps(inv), inv);
+}
+
+/// `out[i] = x[i] * inv` over a row, unrolled x4 (the shared writeback of RMSNorm and L2-norm).
+/// `ivb` must be `_mm256_set1_ps(inv)`; both are passed so the ragged tail uses the identical scalar
+/// `inv` the lanes were built from.
+///
+/// # Safety
+/// `x` and `out` valid for `n` `f32` (may alias); AVX2 detected by the caller.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn scale_row_avx2(
+    x: *const f32,
+    out: *mut f32,
+    n: usize,
+    ivb: std::arch::x86_64::__m256,
+    inv: f32,
+) {
+    use std::arch::x86_64::*;
     let mut i = 0;
-    while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.add(i));
-        ssv = _mm256_fmadd_ps(v, v, ssv);
-        i += 8;
+    while i + 32 <= n {
+        for t in 0..4 {
+            _mm256_storeu_ps(
+                out.add(i + 8 * t),
+                _mm256_mul_ps(_mm256_loadu_ps(x.add(i + 8 * t)), ivb),
+            );
+        }
+        i += 32;
     }
-    let mut ss = [0.0f32; 8];
-    _mm256_storeu_ps(ss.as_mut_ptr(), ssv);
-    for (j, ssj) in ss.iter_mut().enumerate().take(n - i) {
-        let v = *x.add(i + j);
-        *ssj = v.mul_add(v, *ssj);
-    }
-    let inv = 1.0 / (hsum8(ss) * invn + eps).sqrt();
-    let ivb = _mm256_set1_ps(inv);
-    i = 0;
     while i + 8 <= n {
         _mm256_storeu_ps(out.add(i), _mm256_mul_ps(_mm256_loadu_ps(x.add(i)), ivb));
         i += 8;
@@ -446,30 +658,8 @@ unsafe fn rmsnorm_row_avx2(x: *const f32, out: *mut f32, n: usize, eps: f32) {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn l2norm_row_avx2(x: *const f32, out: *mut f32, n: usize, eps: f32) {
     use std::arch::x86_64::*;
-    let mut ssv = _mm256_setzero_ps();
-    let mut i = 0;
-    while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.add(i));
-        ssv = _mm256_fmadd_ps(v, v, ssv);
-        i += 8;
-    }
-    let mut ss = [0.0f32; 8];
-    _mm256_storeu_ps(ss.as_mut_ptr(), ssv);
-    for (j, ssj) in ss.iter_mut().enumerate().take(n - i) {
-        let v = *x.add(i + j);
-        *ssj = v.mul_add(v, *ssj);
-    }
-    let inv = 1.0 / (hsum8(ss) + eps).sqrt();
-    let ivb = _mm256_set1_ps(inv);
-    i = 0;
-    while i + 8 <= n {
-        _mm256_storeu_ps(out.add(i), _mm256_mul_ps(_mm256_loadu_ps(x.add(i)), ivb));
-        i += 8;
-    }
-    while i < n {
-        *out.add(i) = *x.add(i) * inv;
-        i += 1;
-    }
+    let inv = 1.0 / (hsum8(ssq8_avx2(x, n)) + eps).sqrt();
+    scale_row_avx2(x, out, n, _mm256_set1_ps(inv), inv);
 }
 
 // --- affine variants: `out = norm(x) * gamma[i] (+ beta[i])` ---------------------------------------
@@ -494,33 +684,9 @@ unsafe fn layernorm_affine_row_scalar(
     n: usize,
     eps: f32,
 ) {
-    let nb = n / 8;
-    let t = nb * 8;
     let invn = 1.0 / (n as f32);
-    let mut sm = [0.0f32; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for (j, smj) in sm.iter_mut().enumerate() {
-            *smj += *x.add(b + j);
-        }
-    }
-    for (j, smj) in sm.iter_mut().enumerate().take(n - t) {
-        *smj += *x.add(t + j);
-    }
-    let mean = hsum8(sm) * invn;
-    let mut vv = [0.0f32; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for (j, vvj) in vv.iter_mut().enumerate() {
-            let d = *x.add(b + j) - mean;
-            *vvj = d.mul_add(d, *vvj);
-        }
-    }
-    for (j, vvj) in vv.iter_mut().enumerate().take(n - t) {
-        let d = *x.add(t + j) - mean;
-        *vvj = d.mul_add(d, *vvj);
-    }
-    let inv = 1.0 / (hsum8(vv) * invn + eps).sqrt();
+    let mean = hsum8(sum8_scalar(x, n)) * invn;
+    let inv = 1.0 / (hsum8(dev2_8_scalar(x, n, mean)) * invn + eps).sqrt();
     for i in 0..n {
         let norm = (*x.add(i) - mean) * inv;
         let g = if gamma.is_null() { 1.0 } else { *gamma.add(i) };
@@ -541,22 +707,8 @@ unsafe fn rmsnorm_affine_row_scalar(
     n: usize,
     eps: f32,
 ) {
-    let nb = n / 8;
-    let t = nb * 8;
     let invn = 1.0 / (n as f32);
-    let mut ss = [0.0f32; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for (j, ssj) in ss.iter_mut().enumerate() {
-            let v = *x.add(b + j);
-            *ssj = v.mul_add(v, *ssj);
-        }
-    }
-    for (j, ssj) in ss.iter_mut().enumerate().take(n - t) {
-        let v = *x.add(t + j);
-        *ssj = v.mul_add(v, *ssj);
-    }
-    let inv = 1.0 / (hsum8(ss) * invn + eps).sqrt();
+    let inv = 1.0 / (hsum8(ssq8_scalar(x, n)) * invn + eps).sqrt();
     for i in 0..n {
         let norm = *x.add(i) * inv;
         let g = if gamma.is_null() { 1.0 } else { *gamma.add(i) };
@@ -577,41 +729,34 @@ unsafe fn layernorm_affine_row_avx2(
 ) {
     use std::arch::x86_64::*;
     let invn = 1.0 / (n as f32);
-    // mean (identical to layernorm_row_avx2)
-    let mut sv = _mm256_setzero_ps();
-    let mut i = 0;
-    while i + 8 <= n {
-        sv = _mm256_add_ps(sv, _mm256_loadu_ps(x.add(i)));
-        i += 8;
-    }
-    let mut sm = [0.0f32; 8];
-    _mm256_storeu_ps(sm.as_mut_ptr(), sv);
-    for (j, smj) in sm.iter_mut().enumerate().take(n - i) {
-        *smj += *x.add(i + j);
-    }
-    let mean = hsum8(sm) * invn;
+    // mean / variance — the shared 8-accumulator reductions (identical to layernorm_row_avx2)
+    let mean = hsum8(sum8_avx2(x, n)) * invn;
     let mb = _mm256_set1_ps(mean);
-    // variance
-    let mut vv = _mm256_setzero_ps();
-    i = 0;
-    while i + 8 <= n {
-        let d = _mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb);
-        vv = _mm256_fmadd_ps(d, d, vv);
-        i += 8;
-    }
-    let mut va = [0.0f32; 8];
-    _mm256_storeu_ps(va.as_mut_ptr(), vv);
-    for (j, vaj) in va.iter_mut().enumerate().take(n - i) {
-        let d = *x.add(i + j) - mean;
-        *vaj = d.mul_add(d, *vaj);
-    }
-    let inv = 1.0 / (hsum8(va) * invn + eps).sqrt();
+    let inv = 1.0 / (hsum8(dev2_8_avx2(x, n, mean)) * invn + eps).sqrt();
     let ivb = _mm256_set1_ps(inv);
-    // affine normalize: out = ((x-mean)*inv) * gamma + beta, via fmadd
+    // affine normalize: out = ((x-mean)*inv) * gamma + beta, via fmadd; unrolled x4
     let (g_null, b_null) = (gamma.is_null(), beta.is_null());
     let ones = _mm256_set1_ps(1.0);
     let zeros = _mm256_setzero_ps();
-    i = 0;
+    let mut i = 0;
+    while i + 32 <= n {
+        for t in 0..4 {
+            let k = i + 8 * t;
+            let norm = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x.add(k)), mb), ivb);
+            let g = if g_null {
+                ones
+            } else {
+                _mm256_loadu_ps(gamma.add(k))
+            };
+            let b = if b_null {
+                zeros
+            } else {
+                _mm256_loadu_ps(beta.add(k))
+            };
+            _mm256_storeu_ps(out.add(k), _mm256_fmadd_ps(norm, g, b));
+        }
+        i += 32;
+    }
     while i + 8 <= n {
         let norm = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb), ivb);
         let g = if g_null {
@@ -648,25 +793,30 @@ unsafe fn rmsnorm_affine_row_avx2(
 ) {
     use std::arch::x86_64::*;
     let invn = 1.0 / (n as f32);
-    let mut ssv = _mm256_setzero_ps();
-    let mut i = 0;
-    while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.add(i));
-        ssv = _mm256_fmadd_ps(v, v, ssv);
-        i += 8;
-    }
-    let mut ss = [0.0f32; 8];
-    _mm256_storeu_ps(ss.as_mut_ptr(), ssv);
-    for (j, ssj) in ss.iter_mut().enumerate().take(n - i) {
-        let v = *x.add(i + j);
-        *ssj = v.mul_add(v, *ssj);
-    }
-    let inv = 1.0 / (hsum8(ss) * invn + eps).sqrt();
+    let inv = 1.0 / (hsum8(ssq8_avx2(x, n)) * invn + eps).sqrt();
     let ivb = _mm256_set1_ps(inv);
     let (g_null, b_null) = (gamma.is_null(), beta.is_null());
     let ones = _mm256_set1_ps(1.0);
     let zeros = _mm256_setzero_ps();
-    i = 0;
+    let mut i = 0;
+    while i + 32 <= n {
+        for t in 0..4 {
+            let k = i + 8 * t;
+            let norm = _mm256_mul_ps(_mm256_loadu_ps(x.add(k)), ivb);
+            let g = if g_null {
+                ones
+            } else {
+                _mm256_loadu_ps(gamma.add(k))
+            };
+            let b = if b_null {
+                zeros
+            } else {
+                _mm256_loadu_ps(beta.add(k))
+            };
+            _mm256_storeu_ps(out.add(k), _mm256_fmadd_ps(norm, g, b));
+        }
+        i += 32;
+    }
     while i + 8 <= n {
         let norm = _mm256_mul_ps(_mm256_loadu_ps(x.add(i)), ivb);
         let g = if g_null {
@@ -940,8 +1090,16 @@ mod tests {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             return;
         }
-        // Sizes exercising the 8-lane body, a non-multiple-of-8 tail, and rows shorter than 8.
-        for &n in &[1usize, 3, 7, 8, 9, 15, 16, 17, 31, 64, 100, 257] {
+        // Sizes exercising the 8-lane body, a non-multiple-of-8 tail, and rows shorter than 8 —
+        // plus, since the reduction runs `UNROLL` = 8 accumulators over `BLOCK` = 64 elements and
+        // the writeback unrolls x4 (32 elements), every boundary those two blockings introduce:
+        // just under / on / just over a 64-block (63, 64, 65, 71, 72, 127..129, 191..193), a size
+        // with a full block plus a partial 32-group plus a ragged tail (100, 200), and the 768 the
+        // transformer-row benchmarks actually use.
+        for &n in &[
+            1usize, 3, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 71, 72, 100, 127, 128, 129, 191, 192,
+            193, 200, 257, 512, 768,
+        ] {
             let x = fill(n);
             for &op in &OPS {
                 let mut a = vec![0.0f32; n];
@@ -994,6 +1152,220 @@ mod tests {
     /// `peak = nan_at - 8` puts the peak in the same lane and an earlier chunk, which is the only
     /// arrangement that exposes it: a NaN elsewhere merely poisons a lane that does not hold the row
     /// maximum, and `hmax8` then drops it.
+    /// The lengths every blocking seam in this module lives on: shorter than one 8-lane vector,
+    /// around the `BLOCK` = 64 body, around the x4-unrolled (32-element) writeback groups, and a
+    /// spread of ragged tails. Shared by the twin tests so a new seam is added in one place.
+    const SEAM_LENS: [usize; 25] = [
+        1, 3, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 71, 72, 100, 127, 128, 129, 191, 192, 193, 200,
+        257, 512, 768,
+    ];
+
+    /// Deterministic pathological rows: every value class an f32 reduction can round differently on.
+    /// Each entry is `(name, f(i) -> f32)`; the row is that function over `0..n`, so every length in
+    /// `SEAM_LENS` lands the special values in different lanes, different accumulators and different
+    /// blocks. Sign-alternating patterns are used deliberately: with 8 accumulators, cancellation is
+    /// where a lane-layout desync between the twins would first show.
+    #[allow(clippy::type_complexity)]
+    fn pathological() -> Vec<(&'static str, fn(usize) -> f32)> {
+        vec![
+            ("signed-zero", |i| if i % 2 == 0 { 0.0 } else { -0.0 }),
+            ("zero-and-one", |i| if i % 3 == 0 { -0.0 } else { 1.0 }),
+            ("nan-sparse", |i| if i % 11 == 7 { f32::NAN } else { 1.5 }),
+            ("nan-dense", |i| if i % 2 == 0 { f32::NAN } else { -2.25 }),
+            ("pos-inf", |i| if i % 13 == 5 { f32::INFINITY } else { 0.5 }),
+            ("both-inf", |i| match i % 7 {
+                3 => f32::INFINITY,
+                5 => f32::NEG_INFINITY,
+                _ => 1.0,
+            }),
+            // Subnormals: the smallest positive, the largest subnormal, and their negatives.
+            ("subnormal", |i| match i % 4 {
+                0 => f32::from_bits(1),
+                1 => f32::from_bits(0x007f_ffff),
+                2 => -f32::from_bits(1),
+                _ => -f32::from_bits(0x0040_0000),
+            }),
+            // Subnormals mixed with normals, so `x*x` underflows to zero inside a live accumulator.
+            ("subnormal-mixed", |i| {
+                if i % 5 == 0 {
+                    f32::from_bits(3)
+                } else {
+                    1.0
+                }
+            }),
+            // Round-to-nearest-EVEN ties: 2^24 + 1 is exactly halfway between two f32, and so is
+            // 2^24 + 3. Which way each rounds depends only on the accumulator's current low bit, so a
+            // twin that folded elements into a different lane would diverge here first.
+            ("tie-2p24", |i| if i % 8 == 0 { 16777216.0 } else { 1.0 }),
+            (
+                "tie-2p24-neg",
+                |i| {
+                    if i % 8 == 4 {
+                        -16777216.0
+                    } else {
+                        1.0
+                    }
+                },
+            ),
+            // Squares that overflow to +inf partway through a live accumulator.
+            ("overflow-sq", |i| if i % 9 == 2 { 2.0e19 } else { 3.0 }),
+            // Wide dynamic range: every addend is absorbed by the running total.
+            ("absorbed", |i| if i % 6 == 0 { 1.0e20 } else { 1.0e-20 }),
+            // Exact cancellation to a signed zero in some lanes and not others.
+            ("cancel", |i| if i % 2 == 0 { 1.0e7 } else { -1.0e7 }),
+            // --- patterns that pin the COMBINE TREE, not the value classes -------------------
+            // Every pattern above holds values whose accumulator sums are exact (small integers,
+            // powers of two) or saturated (NaN/inf), so they are insensitive to the order in which
+            // the eight accumulators are folded — a twin that used a different but equally valid
+            // halving tree would pass all of them. These two do not: full random mantissas make
+            // every partial sum inexact, and the second one additionally spreads the accumulators
+            // across 2^56 of dynamic range so that which pair is added first decides what is lost.
+            // Verified by mutation: swapping the AVX2 combine to the (0,1)(2,3)(4,5)(6,7) tree is
+            // bit-invisible to every other pattern here and to `scalar_matches_avx2_bit_for_bit`,
+            // and is caught by these.
+            ("random-mantissa", |i| rand_mantissa(i)),
+            ("mixed-scale", |i| {
+                let t = ((i / 8) % 8) as i32;
+                rand_mantissa(i) * exp2i(4 * t - 14)
+            }),
+        ]
+    }
+
+    /// A full-mantissa f32 in `[1, 2)` from a multiplicative hash of `i` — deterministic, no RNG.
+    /// The point is the 23 significand bits: sums of these round differently under different
+    /// association, which is what pins the accumulator combine tree.
+    fn rand_mantissa(i: usize) -> f32 {
+        f32::from_bits(0x3f80_0000 | ((i as u32).wrapping_mul(2_654_435_761) >> 9))
+    }
+
+    /// `2^k` exactly, for `|k| < 127` — an exact scale, so it moves the exponent without perturbing
+    /// the mantissa the pattern is carrying.
+    fn exp2i(k: i32) -> f32 {
+        f32::from_bits((((k + 127) as u32) & 0xff) << 23)
+    }
+
+    /// The three reductions the multi-accumulator rewrite replaced — `ssq8` (RMSNorm / L2-norm),
+    /// `sum8` (the LayerNorm mean pass) and `dev2_8` (the LayerNorm variance pass) — must agree
+    /// BIT-FOR-BIT between the AVX2 kernel and its scalar twin on every value class an f32 reduction
+    /// can round differently on: NaN, +/-0, +/-inf, subnormals, round-to-even ties, overflow to inf
+    /// and total cancellation. All eight lane accumulators are compared, not the folded scalar: a
+    /// lane-layout desync between the twins can cancel in the horizontal sum and is invisible in the
+    /// final row.
+    ///
+    /// This is the coverage `scalar_matches_avx2_bit_for_bit` does not give (its input is a smooth
+    /// finite sine, and it checks the normalized row rather than the accumulators) and that
+    /// `scalar_matches_avx2_on_nan_rows` does not give either (it exercises only softmax and
+    /// log-softmax, whose max pass these three reductions are not part of).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn reduction_twins_agree_bit_for_bit_on_pathological_rows() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        // Means chosen so `x - mean` itself produces the hard cases: inf - inf = NaN, a NaN mean
+        // poisoning every lane, and an exact subtraction that cancels to zero.
+        let means: [f32; 6] = [
+            0.0,
+            -0.0,
+            1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::from_bits(0x007f_ffff),
+        ];
+        for (name, gen) in pathological() {
+            for &n in &SEAM_LENS {
+                let x: Vec<f32> = (0..n).map(gen).collect();
+                let cmp = |what: &str, a: [f32; 8], b: [f32; 8], extra: String| {
+                    for j in 0..8 {
+                        assert_eq!(
+                            a[j].to_bits(),
+                            b[j].to_bits(),
+                            "{what} scalar != avx2 on '{name}' n={n} lane={j}{extra}: \
+                             {:#010x} ({}) vs {:#010x} ({})",
+                            a[j].to_bits(),
+                            a[j],
+                            b[j].to_bits(),
+                            b[j]
+                        );
+                    }
+                };
+                // SAFETY: both twins read exactly `n` f32 from `x`; AVX2+FMA detected above.
+                unsafe {
+                    cmp(
+                        "ssq8",
+                        ssq8_scalar(x.as_ptr(), n),
+                        ssq8_avx2(x.as_ptr(), n),
+                        String::new(),
+                    );
+                    cmp(
+                        "sum8",
+                        sum8_scalar(x.as_ptr(), n),
+                        sum8_avx2(x.as_ptr(), n),
+                        String::new(),
+                    );
+                    for &m in &means {
+                        cmp(
+                            "dev2_8",
+                            dev2_8_scalar(x.as_ptr(), n, m),
+                            dev2_8_avx2(x.as_ptr(), n, m),
+                            format!(" mean={m}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole row, end to end, on the same pathological inputs: the three ops whose reductions
+    /// the rewrite touched (LayerNorm, RMSNorm, L2-norm) must produce bit-identical output from the
+    /// AVX2 kernel and the scalar twin. This covers the finalize (`1/sqrt`, the mean divide) and the
+    /// writeback, which the accumulator test above deliberately stops short of, and it is where a
+    /// NaN or an inf that survived the reduction has to keep propagating identically.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn norm_rows_agree_bit_for_bit_on_pathological_rows() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for (name, gen) in pathological() {
+            for &n in &SEAM_LENS {
+                let x: Vec<f32> = (0..n).map(gen).collect();
+                for &op in &[NORM_LAYERNORM, NORM_RMSNORM, NORM_L2NORM] {
+                    let mut a = vec![0.0f32; n];
+                    let mut b = vec![0.0f32; n];
+                    // SAFETY: both write exactly `n` f32; AVX2+FMA detected above.
+                    unsafe {
+                        match op {
+                            NORM_LAYERNORM => {
+                                layernorm_row_scalar(x.as_ptr(), a.as_mut_ptr(), n, EPS);
+                                layernorm_row_avx2(x.as_ptr(), b.as_mut_ptr(), n, EPS);
+                            }
+                            NORM_RMSNORM => {
+                                rmsnorm_row_scalar(x.as_ptr(), a.as_mut_ptr(), n, EPS);
+                                rmsnorm_row_avx2(x.as_ptr(), b.as_mut_ptr(), n, EPS);
+                            }
+                            _ => {
+                                l2norm_row_scalar(x.as_ptr(), a.as_mut_ptr(), n, EPS);
+                                l2norm_row_avx2(x.as_ptr(), b.as_mut_ptr(), n, EPS);
+                            }
+                        }
+                    }
+                    for i in 0..n {
+                        assert_eq!(
+                            a[i].to_bits(),
+                            b[i].to_bits(),
+                            "scalar != avx2 on '{name}' n={n} op={op} i={i}: {:#010x} ({}) vs {:#010x} ({})",
+                            a[i].to_bits(),
+                            a[i],
+                            b[i].to_bits(),
+                            b[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_on_nan_rows() {
@@ -1298,7 +1670,12 @@ mod tests {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             return;
         }
-        for &n in &[1usize, 3, 7, 8, 9, 15, 16, 17, 31, 64, 100, 257] {
+        // Same boundary set as the plain twin: the affine kernels share its 8-accumulator
+        // reductions and carry their own x4-unrolled writeback, so both blockings need covering.
+        for &n in &[
+            1usize, 3, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 71, 72, 100, 127, 128, 129, 191, 192,
+            193, 200, 257, 512, 768,
+        ] {
             let x = fill(n);
             let gamma = fill_off(n, 0.5);
             let beta = fill_off(n, 1.3);

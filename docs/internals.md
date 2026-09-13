@@ -732,7 +732,7 @@ skips all **four** places a recognizer is probed from, so every loop nest lowers
 |---|---|
 | `lower_program`, per item | Whole-function interceptions (`matmul_fn`, the `@parallel` kernel probes) |
 | `FnLowerer::lower_for` | The ordered per-loop `match_*` cascade (~40 arms), plus `try_emit_argreduce` |
-| `FnLowerer::lower_block` | Statement **windows**: GEMM + epilogue loop, the multi-pass softmax / LayerNorm / RMSNorm / L2-norm idiom, a flat 1-D scan's `let acc` + `for` |
+| `FnLowerer::lower_block` | Statement **windows**: GEMM + epilogue loop, the multi-pass softmax / LayerNorm / RMSNorm / L2-norm idiom (including the seed-then-normalize-in-place spelling, whose leading `for c { out[c] = x[c] }` is folded into the norm's source operand rather than emitted as its own pass), a flat 1-D scan's `let acc` + `for` |
 | `try_vectorize_for` / `try_vectorize_ranged` | The elementwise probes that open the vectorizer (vmath, velem, vhorner, dequant, the low-precision axpby twins) |
 
 What stays on is everything that compiles the loop the user actually wrote: the autovectorizer,
