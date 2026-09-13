@@ -5,6 +5,25 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### `wukong-bench compile-work`: compile time as a count, not a clock
+
+The 2026-09 evaluation could not state a compile-time position because its two timing harnesses
+disagreed on the same corpus (`-5.98%` against `28-34%` on the optimizer). Reading both shows they
+time the *same* `optimize` call the same way; they disagreed because a laptop's clock state moved
+between sessions, and a best-of-N wall time cannot tell a 6% effect from a 30% one on a machine
+that has been seen to swing 3.5x on identical inputs.
+
+- New `wukong_bench` mode `compile-work`: per stage and per file it counts heap allocations,
+  reallocations and bytes (through a counting `#[global_allocator]` with thread-local counters) and
+  the optimizer's pass invocations, with per-pass allocation attribution through a transparent
+  adapter around the production `PassManager` that must render byte-identical to `optimize`. Each
+  stage is counted three times; steady-state disagreement is disclosed per file, never hidden.
+  Deterministic to the allocation on the 401-file corpus except one sporadic 1520-byte Cranelift
+  allocation (~2 ppm of the backend), which it reports.
+- On that instrument `53e0891` does 31.6% fewer allocations than `d23eefc` to compile the corpus to
+  object (optimizer -37.0%, backend -19.4%, parse and lex unchanged, pass invocations -0.6%).
+  See `docs/sota-campaign-2026-09/FINDING-03-compile-time-is-a-count-not-a-clock.md`.
+
 ### `--emit=exe` never linked a release-profile executable (`LNK1136`)
 
 The AOT gate scored **0/4 in release and 4/4 in debug**, and had done so since the first commit —

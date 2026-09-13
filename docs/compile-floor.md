@@ -67,9 +67,20 @@ compiling equivalent kernels to an object:
 cargo run -p wukong_bench --release -- compile-vs
 ```
 
-Every table these modes print carries a **regime label** (`cold-start / first call` or
-`warm steady-state / best-of-N min`) per the campaign's regime discipline. The floor is a
-warm-steady-state property; cold-start is a separate axis owned by the spawn characterization.
+**`compile-work`** (2026-09) — the same six stages, **counted** instead of timed: heap allocations,
+reallocations and bytes per stage and per file, the optimizer's pass invocations, and a per-pass
+allocation attribution that is checked byte-identical against `optimize`. A count is a pure
+function of (binary, corpus), so it is the mode for comparing two revisions on this host, whose
+wall clock has moved 3.5x on identical inputs from thermal history alone:
+
+```text
+cargo run -p wukong_bench --release -- compile-work tests/run examples tests/run/lib bench/kernels
+```
+
+Every table these modes print carries a **regime label** (`cold-start / first call`,
+`warm steady-state / best-of-N min`, or `COUNTS, clock-invariant`) per the campaign's regime
+discipline. The floor is a warm-steady-state property; cold-start is a separate axis owned by the
+spawn characterization; the counts are the revision-to-revision comparison.
 
 ### Stage-boundary implementation choice
 
