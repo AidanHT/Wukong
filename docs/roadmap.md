@@ -773,7 +773,7 @@ lacks; both of these used to read as either silence or a crash.
   `WUKONG_GPU_EXPLAIN` reads its value, so `=0` is off.
 
 Corpus standing is printed by the gates
-themselves, over every fixture in `tests/run` (371 today — `ls tests/run/*.wk | wc -l`;
+themselves, over every fixture in `tests/run` (373 today — `ls tests/run/*.wk | wc -l`;
 this line has gone stale before): `lower::tests::run_corpus_matches_interp_oracle`
 sweeps each program at `-O0` and `-O3`, requires zero mismatches and zero device faults and non-zero
 coverage, and reports the rest as honest `UNSUPPORTED:` skips; `megakernel::tests::mega_corpus_matches_oracle`

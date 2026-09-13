@@ -246,10 +246,47 @@ unsafe fn velem_span(
     }
 }
 
+/// Compute mode of the monomorphized AVX2 body — the `MODE` const parameter of
+/// [`velem_avx2_mono`]. Every one of these is a *loop-invariant* property of the call (the `op`
+/// bits plus the `a == 1.0 && c == 0.0` affine test), so it is resolved **once** in
+/// [`velem_avx2`] and then travels as a const generic; see that function for why.
+const VE_MODE_HAD: u8 = 0;
+/// `x[i] / y[i]`.
+const VE_MODE_DIV: u8 = 1;
+/// Identity affine (`a == 1`, `c == 0`, `y` unread): the base is `x[i]` with no FMA at all.
+const VE_MODE_ID: u8 = 2;
+/// `a·x[i] + (b·y[i] + c)` — the two-input affine (saxpy and friends).
+const VE_MODE_AFF_Y: u8 = 3;
+/// `a·x[i] + c` — the one-input affine.
+const VE_MODE_AFF: u8 = 4;
+
+/// The 256-bit body, **monomorphized on the mode**: `MODE` (which base expression), `ACT` (0 none /
+/// 1 ReLU / 2 ReLU6) and `NT` (streaming stores) are const generics, so after instantiation every
+/// test on them folds and the ×4 unrolled loop is a straight-line block.
+///
+/// WHY THIS IS A CONST GENERIC AND NOT A RUNTIME FLAG. It used to be five runtime flags read inside
+/// the loop (`had`, `div`, `id_affine`, `use_y`, `act`, plus `nt` at the prefetch and at every
+/// store). LLVM will not unswitch a loop on six independent invariants — the 2^6 code-size budget
+/// blows the threshold — so it kept them as branches, and the ×4 body compiled to **eleven basic
+/// blocks with ten taken branches and ~27 wasted fused uops per 32 elements**, against 12 uops of
+/// real work (4 `vmovups` + 4 `vmaxps` + 4 `vmovups`). Measured directly in the release asm of
+/// `velem_avx2` before this change: for a recognized ReLU (`MODE = ID`, `ACT = 1`, `NT = false`)
+/// each of the four lanes ran `testl $512 / jne`, `testl $1024 / jne`, `testb %sil / jne`,
+/// `cmpl $1 / jne` and an unconditional `jmp` around the cold arms. An x86 front end retires at
+/// most about one taken branch per cycle, so ten of them put a floor of ~10 cycles under a
+/// 32-element step whose memory-side cost is ~15 — the loop was fighting its own dispatch.
+///
+/// The lanes, their order, and every intrinsic are unchanged, so this is a pure code-layout fix:
+/// the stored bits are identical to the pre-change kernel and to the scalar tail (`elem1`), which
+/// is what `velem_tail_matches_lanes` and `velem_matches_scalar` pin.
+///
+/// # Safety
+/// `x`/`out` valid for `n` f32; `y` valid for `n` f32 unless `MODE` is `VE_MODE_ID`/`VE_MODE_AFF`;
+/// AVX2+FMA available.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn velem_avx2(
+unsafe fn velem_avx2_mono<const MODE: u8, const ACT: u8, const NT: bool>(
     x: *const f32,
     y: *const f32,
     out: *mut f32,
@@ -258,7 +295,6 @@ unsafe fn velem_avx2(
     b: f32,
     c: f32,
     op: i64,
-    nt: bool,
 ) {
     use std::arch::x86_64::*;
     let va = _mm256_set1_ps(a);
@@ -266,23 +302,14 @@ unsafe fn velem_avx2(
     let vc = _mm256_set1_ps(c);
     let zero = _mm256_setzero_ps();
     let six = _mm256_set1_ps(6.0);
-    // Binary compute modes (Hadamard `x·y` / quotient `x/y`) read `y` and bypass the affine FMA.
-    let had = op & VE_HADAMARD != 0;
-    let div = op & VE_DIV != 0;
-    let use_y = had || div || op & VE_USE_Y != 0;
-    let act = op & 0xff;
-    // Identity affine (`a == 1`, `c == 0`, no `y`): the FMA degenerates to `x`, so skip it — the case a
-    // bare `relu`/`relu6`/copy hits. Hoisted here so the hot loop branches on a single invariant flag
-    // (matching `elem1`'s scalar fast path), turning a recognized ReLU into gcc's bare `maxps` loop at
-    // true 256-bit width instead of paying a wasted multiply per 8 lanes. (Never set for a binary op.)
-    let id_affine = !use_y && a == 1.0 && c == 0.0;
-    // `nt` (whether to use non-temporal stores) is decided by the caller from the *total* working set
-    // — output + x (+ y when read) — so a serial call and every chunk of a parallel call stream with
-    // the identical store policy (see `velem_streams`/`use_nt`).
+    // Const-folded: the modes that read `y` (Hadamard, quotient, two-input affine). The scalar
+    // prologue/tail below still routes through `elem1(op, ..)`, which makes the same decision from
+    // the same `op` — one contract, two spellings of it, exactly as before.
+    let use_y = MODE == VE_MODE_HAD || MODE == VE_MODE_DIV || MODE == VE_MODE_AFF_Y;
     let mut i = 0usize;
     // For the streaming store, peel a scalar prologue until `out` is 32-byte aligned (vmovntps faults
     // on a misaligned address); after that each 8-lane step keeps it aligned.
-    if nt {
+    if NT {
         while i < n && (out.add(i) as usize) & 31 != 0 {
             let yi = if use_y { *y.add(i) } else { 0.0 };
             *out.add(i) = elem1(op, *x.add(i), yi, a, b, c);
@@ -290,28 +317,25 @@ unsafe fn velem_avx2(
         }
     }
     // One 8-lane result vector for the element at `i + $off`: the affine `a·x (+ b·y) + c` followed by
-    // the optional ReLU/ReLU6 clamp. Factored so the main loop can run four of them with no
-    // inter-vector dependency.
+    // the optional ReLU/ReLU6 clamp. Every arm below is selected by a const generic, so exactly one
+    // survives instantiation and the main loop has no inter-vector dependency and no branch.
     macro_rules! compute {
         ($off:expr) => {{
             let xv = _mm256_loadu_ps(x.add(i + $off));
-            let mut r = if had {
-                _mm256_mul_ps(xv, _mm256_loadu_ps(y.add(i + $off)))
-            } else if div {
-                _mm256_div_ps(xv, _mm256_loadu_ps(y.add(i + $off)))
-            } else if id_affine {
-                xv
-            } else {
-                let inner = if use_y {
-                    _mm256_fmadd_ps(vb, _mm256_loadu_ps(y.add(i + $off)), vc)
-                } else {
-                    vc
-                };
-                _mm256_fmadd_ps(va, xv, inner)
+            let mut r = match MODE {
+                VE_MODE_HAD => _mm256_mul_ps(xv, _mm256_loadu_ps(y.add(i + $off))),
+                VE_MODE_DIV => _mm256_div_ps(xv, _mm256_loadu_ps(y.add(i + $off))),
+                VE_MODE_ID => xv,
+                VE_MODE_AFF_Y => _mm256_fmadd_ps(
+                    va,
+                    xv,
+                    _mm256_fmadd_ps(vb, _mm256_loadu_ps(y.add(i + $off)), vc),
+                ),
+                _ => _mm256_fmadd_ps(va, xv, vc),
             };
-            if act == VE_RELU {
+            if ACT == 1 {
                 r = _mm256_max_ps(r, zero);
-            } else if act == VE_RELU6 {
+            } else if ACT == 2 {
                 r = _mm256_min_ps(_mm256_max_ps(r, zero), six);
             }
             r
@@ -319,7 +343,7 @@ unsafe fn velem_avx2(
     }
     macro_rules! store {
         ($p:expr, $v:expr) => {
-            if nt {
+            if NT {
                 _mm256_stream_ps($p, $v);
             } else {
                 _mm256_storeu_ps($p, $v);
@@ -333,7 +357,7 @@ unsafe fn velem_avx2(
         // Software prefetch only when streaming from DRAM (the non-temporal regime). For an
         // L3-resident map the hardware prefetcher already has the lines, so an explicit `prefetcht0`
         // just burns an issue slot — which is part of why a cache-resident `relu` trailed gcc.
-        if nt {
+        if NT {
             // `wrapping_add`, not `add`: on the final iterations the `PF_AHEAD` lookahead deliberately
             // targets an address past the end of `x`/`y` (that is the constant's whole point — see its
             // doc). `<*const T>::add` requires the result to stay inside the same allocated object, so
@@ -361,13 +385,92 @@ unsafe fn velem_avx2(
         i += 8;
     }
     // The non-temporal stores are weakly ordered; fence before the buffer is read back by anyone.
-    if nt {
+    if NT {
         _mm_sfence();
     }
     while i < n {
         let yi = if use_y { *y.add(i) } else { 0.0 };
         *out.add(i) = elem1(op, *x.add(i), yi, a, b, c);
         i += 1;
+    }
+}
+
+/// Resolve the loop-invariant mode ONCE and hand it to [`velem_avx2_mono`] as const generics.
+///
+/// Everything decided here — which base expression the op wants, which activation clamps it, and
+/// whether the store streams — is fixed for the whole span. Doing it once costs at most three
+/// predictable branches per call; doing it per element cost ten taken branches per 32 elements (see
+/// [`velem_avx2_mono`]). The classification is the *same* test the old inline flags ran, in the same
+/// order (Hadamard, then quotient, then the identity-affine fast path, then the one/two-input
+/// affine), and it mirrors [`elem1`], so no element changes value.
+///
+/// # Safety
+/// `x`/`out` valid for `n` f32; `y` valid for `n` f32 when the op reads it (`VE_USE_Y`/Hadamard/Div);
+/// AVX2+FMA available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn velem_avx2(
+    x: *const f32,
+    y: *const f32,
+    out: *mut f32,
+    n: usize,
+    a: f32,
+    b: f32,
+    c: f32,
+    op: i64,
+    nt: bool,
+) {
+    // Binary compute modes (Hadamard `x·y` / quotient `x/y`) read `y` and bypass the affine FMA.
+    let had = op & VE_HADAMARD != 0;
+    let div = op & VE_DIV != 0;
+    let uses_y = op & VE_USE_Y != 0;
+    // Identity affine (`a == 1`, `c == 0`, no `y`): the FMA degenerates to `x`, so skip it — the case
+    // a bare `relu`/`relu6`/copy hits. For `max(1·x+0, 0)` == `max(x, 0)` bit-for-bit (the FMA's only
+    // observable effect, flipping `-0.0` to `+0.0`, is erased by the following `max`), and a bare copy
+    // preserves the input. `elem1` applies the identical test, so the scalar tail agrees lane-for-lane.
+    let id_affine = !(had || div || uses_y) && a == 1.0 && c == 0.0;
+    let mode = if had {
+        VE_MODE_HAD
+    } else if div {
+        VE_MODE_DIV
+    } else if id_affine {
+        VE_MODE_ID
+    } else if uses_y {
+        VE_MODE_AFF_Y
+    } else {
+        VE_MODE_AFF
+    };
+    // `act1` returns its input for an unrecognized code, so anything but ReLU/ReLU6 is `ACT = 0`.
+    let act: u8 = match op & 0xff {
+        VE_RELU => 1,
+        VE_RELU6 => 2,
+        _ => 0,
+    };
+    macro_rules! by_nt {
+        ($m:expr, $act:expr) => {
+            if nt {
+                velem_avx2_mono::<$m, $act, true>(x, y, out, n, a, b, c, op)
+            } else {
+                velem_avx2_mono::<$m, $act, false>(x, y, out, n, a, b, c, op)
+            }
+        };
+    }
+    macro_rules! by_act {
+        ($m:expr) => {
+            match act {
+                1 => by_nt!($m, 1),
+                2 => by_nt!($m, 2),
+                _ => by_nt!($m, 0),
+            }
+        };
+    }
+    match mode {
+        VE_MODE_HAD => by_act!(VE_MODE_HAD),
+        VE_MODE_DIV => by_act!(VE_MODE_DIV),
+        VE_MODE_ID => by_act!(VE_MODE_ID),
+        VE_MODE_AFF_Y => by_act!(VE_MODE_AFF_Y),
+        _ => by_act!(VE_MODE_AFF),
     }
 }
 
