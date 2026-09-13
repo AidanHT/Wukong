@@ -5,6 +5,30 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### `wukong-bench compile-work`: compile time as a count, not a clock
+
+The 2026-09 evaluation could not state a compile-time position because its two timing harnesses
+disagreed on the same corpus (`-5.98%` against `28-34%` on the optimizer). Reading both shows they
+time the *same* `optimize` call the same way; they disagreed because a laptop's clock state moved
+between sessions, and a best-of-N wall time cannot tell a 6% effect from a 30% one on a machine
+that has been seen to swing 3.5x on identical inputs.
+
+- New `wukong_bench` mode `compile-work`: per stage and per file it counts heap allocations,
+  reallocations and bytes (through a counting `#[global_allocator]` with thread-local counters) and
+  the optimizer's pass invocations, with per-pass allocation attribution through a transparent
+  adapter around the production `PassManager` that must render byte-identical to `optimize`. Each
+  stage is counted three times; steady-state disagreement is disclosed per file, never hidden.
+  Deterministic to the allocation on the 401-file corpus except one sporadic 1520-byte Cranelift
+  allocation (~2 ppm of the backend), which it reports.
+- On that instrument `53e0891` does 31.6% fewer allocations than `d23eefc` to compile the corpus to
+  object (optimizer -37.0%, backend -19.4%, parse and lex unchanged, pass invocations -0.6%).
+  See `docs/sota-campaign-2026-09/FINDING-03-compile-time-is-a-count-not-a-clock.md`.
+- `simplify-phis` no longer clones the cached predecessor map per call or allocates per parameter
+  in `find_trivial`; `simplify-cfg` reads predecessors and reachability from the analysis cache
+  (invalidating after each fold and merge) and skips the constant map when no `cond_br` remains.
+  Optimizer allocations -10.3% on the corpus (`simplify-phis` -56.7%, `simplify-cfg` -19.4%),
+  pass invocations unchanged; `--emit=mir -O2` byte-identical on all 401 corpus files.
+
 ### `tanh` to ≤1 ULP over the whole f32 domain (W13)
 
 The dispatched `tanh` kernel (`wukong_vmath_f32`, `VM_TANH`) was `1 − 2/(e^{2x}+1)`: the subtraction

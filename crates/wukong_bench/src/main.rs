@@ -18,10 +18,11 @@
 //! cargo run -p wukong_bench --release -- tests/run examples bench/kernels
 //! ```
 //!
-//! The default report above is one of five modes; the first CLI argument selects among them
+//! The default report above is one of six modes; the first CLI argument selects among them
 //! (`compile-time`, `compile-profile` and `spawn-overhead` — see the `compile_time` and `profile`
-//! modules — plus `compile-vs`, see `compile_vs`). Anything that is not a mode word is a corpus
-//! directory, and with no arguments at all the corpus defaults to `tests/run`.
+//! modules — `compile-work`, the clock-invariant counting instrument in `compile_work`, plus
+//! `compile-vs`, see `compile_vs`). Anything that is not a mode word is a corpus directory, and
+//! with no arguments at all the corpus defaults to `tests/run`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -30,6 +31,7 @@ use wukong_span::{Interner, SourceId};
 
 mod compile_time;
 mod compile_vs;
+mod compile_work;
 mod profile;
 
 /// Every mode of this harness prints a wall-clock number, and every one of those numbers is
@@ -78,7 +80,13 @@ fn main() {
         args.first().map(String::as_str),
         Some("spawn-overhead" | "spawn")
     );
-    if ctime || profile || spawn {
+    // `compile-work` — the counting instrument: allocations and pass invocations per stage, a pure
+    // function of (binary, corpus), so it needs no `--release`, no cooldown and no best-of-N.
+    let work = matches!(
+        args.first().map(String::as_str),
+        Some("compile-work" | "work")
+    );
+    if ctime || profile || spawn || work {
         args.remove(0);
     }
 
@@ -113,6 +121,10 @@ fn main() {
     }
     if spawn {
         profile::spawn_report(&files);
+        return;
+    }
+    if work {
+        compile_work::report(&files);
         return;
     }
 

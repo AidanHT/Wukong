@@ -74,7 +74,11 @@ can be seen by a load through `p`. The Cranelift backend uses it too.
 `preds`, `rpo`, `idom`, `df`, `children` depend only on the block set and terminator successor
 edges. One cache per function is threaded through every pass and fixpoint iteration. **If a pass
 changes the block set or any successor edge, it must call `cache.invalidate()`** — stale dominators
-silently produce wrong CSE/LICM/mem2reg results the verifier will not catch.
+silently produce wrong CSE/LICM/mem2reg results the verifier will not catch. `simplify-cfg`, the
+one pass that restructures the CFG, invalidates *after each* fold, merge and prune so that it can
+itself read predecessors and reachability from the cache in the steady state; `simplify-phis`
+reads the predecessor slice in place (it borrows the cache, not the function). Both are measured by
+`wukong-bench compile-work`, which counts allocations per pass and per call.
 
 Under `debug_assertions`, `wukong_mir::verify::verify_function` runs after every pass that executed
 and panics naming the culprit.
