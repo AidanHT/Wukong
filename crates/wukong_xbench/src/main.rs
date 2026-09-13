@@ -2765,10 +2765,21 @@ const TRANSPOSE_SHAPES: &[(usize, usize, bool)] = &[
 /// tolerance to invent: `MKL_Somatcopy(alpha = 1)` must move exactly the same bits. A column that
 /// disagrees is computing something else and is dropped rather than printed beside a ratio - the
 /// rule [`relaxed_peer_ok`] and [`cpp_checked`] already follow.
+///
+/// BITS, NOT VALUES. `Vec<f32>` equality compares by VALUE, so `-0.0 == 0.0` and the check would
+/// have passed a column that moved a sign bit — while this doc, and [`cpp_checked`] which it cites
+/// as its model, both say BIT-identical. For a pure permutation the two bars can only differ when
+/// something is wrong, which is exactly when the check has to hold, so it compares `to_bits` the
+/// way `cpp_checked` does. (A NaN payload is the other case the value comparison silently accepts:
+/// `NaN != NaN`, so a value comparison would REJECT two identical NaNs and accept two different
+/// ones. Bits get both right.)
 fn mkl_transpose_exact(wuk: &Option<Measure>, p: Option<Measure>, label: &str) -> Option<Measure> {
     let p = p?;
+    let bitwise_differs = |a: &[f32], b: &[f32]| {
+        a.len() != b.len() || a.iter().zip(b).any(|(x, y)| x.to_bits() != y.to_bits())
+    };
     match wuk {
-        Some(m) if m.out != p.out => {
+        Some(m) if bitwise_differs(&m.out, &p.out) => {
             println!(
                 "  ! transpose: {label} (MKL_Somatcopy) disagrees with Wukong — column dropped"
             );
@@ -7710,21 +7721,37 @@ fn time_wukong(
     })
 }
 
-/// The `wukong_*` runtime-kernel calls in a printed MIR module, as a sorted multiset.
+/// The `wukong_*` runtime-kernel CALL TARGETS in a printed MIR module, as a sorted multiset.
 ///
 /// Same shape as `general::kernel_census` / `model::kernel_calls`, which have printed this for
 /// their own programs since those suites landed. `main.rs` printed nothing, which is why no
 /// campaign-measured row could say whether a movement came from a recognizer firing or from the
 /// JIT: recognized kernels are gate-blind (interp and native both call the same symbol at every
 /// `-O` level), so the dispatch census of the program that was timed is the only evidence there is.
+///
+/// CALL SITES ONLY. This scanned for the bare substring `wukong_` anywhere in the text, which
+/// counts anything the printer might put a kernel name in that is not a dispatch — a `func_addr`
+/// operand (`wukong_mir::print` emits one for every taken function address), a function whose own
+/// name begins `wukong_`, a type or a comment. A census that over-counts is worse than none: the
+/// dispatch line is the only attribution a measured row carries, so it has to name what was
+/// CALLED. `wukong_mir::print::fmt_inst` renders a call as `call <name>(<args>)` and nothing else
+/// in the printer produces that shape, so anchoring on `call ` + name + `(` is exact rather than
+/// heuristic. `kernel_census_counts_real_printed_mir` pins it against real printer output rather
+/// than against a string the test wrote itself.
 fn kernel_census(mir: &str) -> Vec<(String, usize)> {
+    const CALL: &str = "call ";
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for (i, _) in mir.match_indices("wukong_") {
-        let rest = &mir[i..];
+    for (i, _) in mir.match_indices(CALL) {
+        let rest = &mir[i + CALL.len()..];
         let end = rest
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
-        *counts.entry(&rest[..end]).or_insert(0) += 1;
+        let (name, tail) = rest.split_at(end);
+        // `call name(` — the argument list is what separates a call from any other use of the name.
+        if !tail.starts_with('(') || !name.starts_with("wukong_") {
+            continue;
+        }
+        *counts.entry(name).or_insert(0) += 1;
     }
     counts
         .into_iter()
@@ -10758,18 +10785,55 @@ mod tests {
             SRC.len()
         );
         let scan = &SRC[..end];
-        // Helpers that legitimately hold a bare C-ext `bench_external*` call: the pair helpers
-        // (which add the C++ column themselves) and the relaxed-FP column helpers.
-        const HELPERS: &[&str] = &[
+        // Helpers that legitimately hold a bare C-ext `bench_external*` / `build_peer` call: the
+        // PAIR helpers, which add the C++ column themselves, and the relaxed-FP column helpers,
+        // which are a C-only extra column by construction.
+        //
+        // `build_c_cpp` is the build-only half of `bench_c_cpp`, added when six families were
+        // converted to build-every-column-then-rotate; it builds exactly the same two columns and
+        // belongs in the same list. IT WAS MISSING, and this test has been RED on the branch since
+        // that commit — the wave-1 report did not run it and the read-only audit did not either.
+        //
+        // AN EXEMPTION LIST NOBODY CHECKS IS A HOLE. Adding a name here is how this guard would be
+        // silently disabled, so the list is itself asserted below: a pair helper must really build
+        // a `"cpp"` column and a relaxed helper must really be a `_fast` one. Neither exemption can
+        // be granted to a helper that does not earn it.
+        const PAIR_HELPERS: &[&str] = &[
             "bench_c_cpp",
             "bench_c_cpp4",
             "bench_c_cpp_i8",
             "bench_c_cpp_bf16",
             "bench_c_cpp_halfout",
-            "bench_c_fast",
-            "bench_c_fast_idx",
-            "bench_bf16_fast",
+            "build_c_cpp",
         ];
+        const FAST_HELPERS: &[&str] = &["bench_c_fast", "bench_c_fast_idx", "bench_bf16_fast"];
+        let body_of = |name: &str| -> &str {
+            let head = format!("\nfn {name}(");
+            let at = scan
+                .find(&head)
+                .unwrap_or_else(|| panic!("{name} is exempted here but does not exist"));
+            let rest = &scan[at + 1..];
+            let end = rest
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("{name} has no closing brace at column 0"));
+            &rest[..end]
+        };
+        for name in PAIR_HELPERS {
+            let body = body_of(name).replace([' ', '\n'], "");
+            assert!(
+                body.contains("(\"cpp\","),
+                "{name} is exempted from the C/C++ pairing rule as a PAIR helper, but its body \
+                 builds no \"cpp\" column — the exemption is unearned and every caller of it is \
+                 printing a C column with no C++ twin"
+            );
+        }
+        for name in FAST_HELPERS {
+            assert!(
+                name.contains("_fast"),
+                "{name} is exempted as a relaxed-FP C-only column but is not a _fast helper"
+            );
+        }
+        let helpers: Vec<&str> = PAIR_HELPERS.iter().chain(FAST_HELPERS).copied().collect();
         // (byte offset, name) of every top-level `fn …` so an occurrence can be attributed.
         let mut fns: Vec<(usize, &str)> = Vec::new();
         let mut at = 0usize;
@@ -10826,7 +10890,7 @@ mod tests {
                 }
                 c_ext += 1;
                 let f = owner(abs);
-                if HELPERS.contains(&f) {
+                if helpers.contains(&f) {
                     continue;
                 }
                 // The peer name is the 4th argument of BOTH families; `_fast` / `_omp` mark the
@@ -11499,7 +11563,8 @@ mod tests {
         assert!(out.iter().all(|m| m.is_none()));
     }
 
-    /// The six position-balanced families must not contain a compile-and-time call any more.
+    /// The six position-balanced families must not contain a compile-and-time call any more, and
+    /// EVERY timed region in them must be inside a rotation.
     ///
     /// SOURCE-TEXT SCAN, in the style of `every_generated_c_kernel_declares_restrict`, because this
     /// is a drift guard and not an algorithm: `bench_wukong` / `bench_c_cpp` / `bench_external` /
@@ -11507,6 +11572,14 @@ mod tests {
     /// converted body silently puts one column back in a fixed slot with a compiler spawn in front
     /// of the others — the exact defect the conversion removed, and one no differential or
     /// invariance gate can see.
+    ///
+    /// EXISTENCE IS NOT ENOUGH. This used to require only that the string `abba_min_columns(`
+    /// appear SOMEWHERE in the body, so a family with two shape loops of which one was converted
+    /// passed while half its rows stayed biased — and a converted family that later grew a second,
+    /// unrotated loop would pass forever. So the scan also pins that `time_built` (the only way a
+    /// built column reaches the clock) appears exactly once per rotation and that every one of
+    /// those calls is lexically inside the `abba_min_columns(...)` statement, and it forbids the
+    /// direct timing entry points that would bypass the rotation altogether.
     #[test]
     fn position_balanced_families_build_before_they_time() {
         let src = include_str!("main.rs");
@@ -11515,6 +11588,16 @@ mod tests {
             concat!("bench_", "c_cpp("),
             concat!("bench_", "external("),
             concat!("bench_", "c_fast("),
+        ];
+        // Ways to reach the clock that are NOT a rotation. `abba_min(` is the old two-column
+        // A-B-B-A helper: it balances C against C++ and leaves every other column in a fixed slot,
+        // which is precisely the protocol these six families were converted out of.
+        let bypasses_the_rotation = [
+            concat!("time_", "wukong("),
+            concat!("time_", "peer("),
+            concat!("time_", "peer4("),
+            concat!("time_", "ns("),
+            concat!("abba_", "min("),
         ];
         for family in [
             "fn bench_matmul_tn(",
@@ -11533,8 +11616,9 @@ mod tests {
                 .find("\n}\n")
                 .unwrap_or_else(|| panic!("{family} has no closing brace at column 0"));
             let body = &rest[..end];
+            let rotations = body.matches("abba_min_columns(").count();
             assert!(
-                body.contains("abba_min_columns("),
+                rotations >= 1,
                 "{family} no longer times its columns through abba_min_columns: its Wukong column \
                  is back in a fixed slot"
             );
@@ -11545,6 +11629,34 @@ mod tests {
                      forces its column into a fixed slot and puts a compiler spawn between two \
                      timed regions. Use build_wukong/build_c_cpp/build_peer + abba_min_columns."
                 );
+            }
+            for needle in bypasses_the_rotation {
+                assert!(
+                    !body.contains(needle),
+                    "{family} calls `{needle}` — that times a column outside the rotation, so its \
+                     slot is fixed. Put the column in the `Built` array and time it through \
+                     abba_min_columns."
+                );
+            }
+            let timed = body.matches("time_built(").count();
+            assert_eq!(
+                timed, rotations,
+                "{family} has {timed} time_built call(s) against {rotations} abba_min_columns \
+                 rotation(s): one shape loop was converted and another was not, so half this \
+                 family's rows still carry the slot advantage"
+            );
+            // ...and each of them is inside its rotation's own statement, not merely nearby.
+            let mut cursor = 0usize;
+            while let Some(rel) = body[cursor..].find("time_built(") {
+                let at = cursor + rel;
+                let before = &body[..at];
+                let rotation = before.rfind("abba_min_columns(");
+                assert!(
+                    rotation.is_some_and(|r| !before[r..].contains(';')),
+                    "{family}: the `time_built(` at byte {at} of the body is not inside an \
+                     abba_min_columns(...) call, so that column is timed in a fixed slot"
+                );
+                cursor = at + 1;
             }
         }
     }
@@ -11594,6 +11706,12 @@ mod tests {
     /// The dispatch census must actually find the recognized kernels in printed MIR, and must not
     /// invent one where there is none. Recognized kernels are gate-blind, so this line is the only
     /// evidence a measured row carries about WHAT it timed.
+    ///
+    /// A NAME THAT IS NOT A CALL TARGET MUST NOT BE COUNTED. `wukong_mir::print` emits
+    /// `func_addr <name>` for a taken function address and `fn <name>(...)` for every definition;
+    /// the census used to scan for the bare substring `wukong_`, so any of those would have been
+    /// counted as a dispatch and the attribution line on a measured row would have overstated what
+    /// the program called.
     #[test]
     fn kernel_census_counts_recognized_calls() {
         let mir = "v3 = call wukong_colsum_f32(v0, v1)\n\
@@ -11607,6 +11725,62 @@ mod tests {
             ]
         );
         assert!(kernel_census("v0 = fadd v1, v2\n").is_empty());
+        // Every non-call shape the MIR printer can put a `wukong_` name in.
+        assert!(
+            kernel_census(
+                "fn wukong_colsum_f32(v0 ptr) -> void {\n    \
+                 v1 = func_addr wukong_colsum_f32\n    \
+                 v2 = global_addr wukong_colsum_f32\n}\n"
+            )
+            .is_empty(),
+            "a definition, a func_addr and a global_addr are not dispatches"
+        );
+    }
+
+    /// Compile a `.wk` source the way [`build_wukong`] does, up to the printed MIR, with no JIT.
+    fn printed_mir_for(src: &str) -> String {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(!pd.iter().any(|d| d.is_error()), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(!sd.iter().any(|d| d.is_error()), "sema: {sd:?}");
+        let (mut program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(!ld.iter().any(|d| d.is_error()), "lower: {ld:?}");
+        wukong_opt::optimize(&mut program, 3);
+        wukong_mir::print::print_program(&program, &interner)
+    }
+
+    /// The census against REAL printer output, not a string the test wrote itself.
+    ///
+    /// The unit case above validates the scanner in isolation, which is exactly the blindness the
+    /// audit named: a census that disagrees with `wukong_mir::print::print_program` — by counting a
+    /// name the printer emits somewhere other than a call — still passes it. This drives the same
+    /// pipeline `build_wukong` drives, on a generated source the harness actually times, and pins
+    /// the two invariants that matter: every name reported is a call target in that text, and the
+    /// census total is exactly the number of `call wukong_` sites, never more.
+    #[test]
+    fn kernel_census_agrees_with_real_printed_mir() {
+        let mir = printed_mir_for(&wk_colsum(256, 256, false));
+        let census = kernel_census(&mir);
+        assert!(
+            !census.is_empty(),
+            "colsum lowered to no runtime-kernel call at all, so the dispatch line a measured \
+             colsum row carries would be empty. MIR:\n{mir}"
+        );
+        let mut total = 0;
+        for (name, n) in &census {
+            assert_eq!(
+                mir.matches(&format!("call {name}(")).count(),
+                *n,
+                "census counted {name} {n} time(s), which is not its call-site count"
+            );
+            total += *n;
+        }
+        assert_eq!(
+            total,
+            mir.matches("call wukong_").count(),
+            "the census total must be exactly the `call wukong_` sites in the printed MIR"
+        );
     }
 
     /// A generated `.wk` source must always land in the same file, and two different programs must
@@ -11618,6 +11792,64 @@ mod tests {
         assert_eq!(wk_source_name(&a), wk_source_name(&a));
         assert_ne!(wk_source_name(&a), wk_source_name(&b));
         assert!(wk_source_name(&a).starts_with("wk_") && wk_source_name(&a).ends_with(".wk"));
+        // STABLE ACROSS RUNS *AND* ACROSS REVISIONS, which determinism and distinctness alone do
+        // not pin: any hash function whatever satisfies those two, so the audit was right that
+        // there was no realistic mutation of FNV-1a that could fail this test. The name is the
+        // only link between a printed dispatch line and the `.wk` file it names, so a re-spelled
+        // hash silently orphans every source persisted by an earlier run. `af63dc4c8601ec8c` for
+        // "a" is FNV's OWN published 64-bit test vector, so this checks the implementation
+        // against the reference rather than against itself.
+        assert_eq!(wk_source_name("a"), "wk_af63dc4c8601ec8c.wk");
+        assert_eq!(wk_source_name(""), "wk_cbf29ce484222325.wk");
+        assert_eq!(wk_source_name("module bench\n"), "wk_f23e80a4f7082feb.wk");
+    }
+
+    /// The gate a oneMKL transpose column has to survive before it is printed beside a ratio.
+    ///
+    /// The ABI test below proves the binding computes the right values; this proves the SECTION
+    /// path's post-check accepts them and rejects anything else. Its doc claims BIT equality and
+    /// cites `cpp_checked` as its model, and it compared `Vec<f32>` by VALUE - so `-0.0` for `+0.0`
+    /// passed as identical and two identical NaN payloads were REJECTED. A transpose is a
+    /// permutation: neither can happen unless something is wrong, which is exactly when the check
+    /// has to hold. Needs no MKL, so it runs everywhere.
+    #[test]
+    fn a_library_transpose_column_is_held_to_bit_equality() {
+        let m = |v: Vec<f32>| Measure {
+            compile: Duration::ZERO,
+            ns_per_call: 1.0,
+            out: v,
+        };
+        let wuk = Some(m(vec![0.0, 1.0]));
+        assert!(
+            mkl_transpose_exact(&wuk, Some(m(vec![0.0, 1.0])), "t").is_some(),
+            "identical bits must keep the column"
+        );
+        assert!(
+            mkl_transpose_exact(&wuk, Some(m(vec![-0.0, 1.0])), "t").is_none(),
+            "-0.0 for +0.0 is equal by VALUE and different by BITS; a permutation cannot flip a \
+             sign bit, so the column must be dropped"
+        );
+        let nan = Some(m(vec![f32::from_bits(0x7fc0_0001), 1.0]));
+        assert!(
+            mkl_transpose_exact(&nan, Some(m(vec![f32::from_bits(0x7fc0_0001), 1.0])), "t")
+                .is_some(),
+            "two identical NaN payloads are the SAME bits; a value comparison would have dropped \
+             this column"
+        );
+        assert!(
+            mkl_transpose_exact(&nan, Some(m(vec![f32::from_bits(0x7fc0_0002), 1.0])), "t")
+                .is_none(),
+            "two different NaN payloads are a disagreement; a value comparison could not see it"
+        );
+        assert!(
+            mkl_transpose_exact(&wuk, Some(m(vec![0.0])), "t").is_none(),
+            "a length mismatch is a disagreement, not a panic"
+        );
+        assert!(
+            mkl_transpose_exact(&None, Some(m(vec![9.0])), "t").is_some(),
+            "with no Wukong column there is nothing to disagree with"
+        );
+        assert!(mkl_transpose_exact(&wuk, None, "t").is_none());
     }
 
     /// The oneMKL bindings added for the previously unpeered families must compute the right thing.
