@@ -25,8 +25,11 @@
 //!
 //! 1. **Two platform `expf` calls per `(query, key)`** — `2·S²` scalar libm calls, where every
 //!    other softmax in this crate uses the crate's own 8-lane [`crate::vmath::exp8`]. At `S=1024`
-//!    that is 2.1M scalar transcendentals, tens of cycles each; it dominated everything else in the
-//!    kernel by roughly an order of magnitude. Now: `S²` *vectorized* exps (~2 SIMD ops/lane) plus
+//!    that is 2.1M scalar transcendentals at order-ten cycles apiece — the largest single countable
+//!    line item in the kernel. (Order-ten, not measured: the `mat-libm` − `mat-exp8` control delta
+//!    that suggests ~12 cycles per `expf` also contains a scalar-versus-vector max pass and a
+//!    scalar-versus-vector normalize pass, so it is an *upper bound* on the per-`exp` cost and not
+//!    an isolated measurement of it.) Now: `S²` *vectorized* exps (~2 SIMD ops/lane) plus
 //!    one scalar [`crate::vmath::exp1`] per `(query, key-block)` for the rescale factor, and that
 //!    one is skipped outright when the running max did not move.
 //! 2. **One horizontal reduce per `(query, key)`** — a `hsum256` (~9 shuffle/add uops on a serial
@@ -153,8 +156,12 @@ unsafe fn attention_scalar(
                     x += *qi.add(t) * *kj.add(t);
                 }
                 x *= scale;
-                // Online softmax: fold key j in, rescaling the running stats to the new max.
-                let m_new = m.max(x);
+                // Online softmax: fold key j in, rescaling the running stats to the new max. The
+                // fold is spelled `(a > b) ? a : b` with the running max as `a` — `_mm256_max_ps`'s
+                // rule, which [`row_max`] on the AVX2 side uses — and deliberately NOT `f32::max`,
+                // which returns the *non*-NaN operand and would let this twin quietly swallow a NaN
+                // the vector path keeps. (Identical on every ordered input, ties included.)
+                let m_new = if m > x { m } else { x };
                 // `corr` is exactly 1 whenever the max did not move — the common case — so test for
                 // that instead of paying an `exp`. The equality also keeps the `m = m_new = -inf`
                 // corner (a fully masked prefix) out of `exp(NaN)`; on key 0 of a live row
@@ -183,12 +190,19 @@ unsafe fn attention_scalar(
 
 /// Query rows per tile. The block's running stats and its `BR×D` accumulator stay L1-resident and
 /// each key loaded in the inner loop is reused across all `BR` queries.
+///
+/// `cfg`-gated because every reader of it — [`qk_tile`], [`pv8`], [`attention_avx2`] — is x86_64
+/// only, and an ungated `const` that nothing reads is `dead_code`, which CI compiles under
+/// `-D warnings`.
+#[cfg(target_arch = "x86_64")]
 const ATT_BR: usize = 32;
 /// Keys per tile. 64 is the block width the CPU/vector flash-attention literature converges on
 /// (arXiv 2608.18656 tunes to 64×64 against an L1/L2 pair the size of this host's): the score tile
 /// is `BR·BC·4` = 8 KB and the K/V tiles `BC·D·4` = 16 KB each at `D=64`, so the working set of
 /// either inner microkernel sits inside a 48 KB L1D. It is also the rescale period — the
-/// accumulator is corrected once per `BC` keys instead of once per key.
+/// accumulator is corrected once per `BC` keys instead of once per key. `cfg`-gated for the same
+/// reason as [`ATT_BR`].
+#[cfg(target_arch = "x86_64")]
 const ATT_BC: usize = 64;
 
 #[cfg(target_arch = "x86_64")]
@@ -215,10 +229,11 @@ unsafe fn hmax256(v: std::arch::x86_64::__m256) -> f32 {
     _mm_cvtss_f32(c)
 }
 
-/// Reduce **four** accumulators to their four scalar sums in one 5-op tree (3 `vhaddps`, an
-/// `extractf128`, an `addps`), landing them contiguously so the caller stores them with a single
-/// `movups`. That is under 2 uops per dot against `hsum256`'s ~9 — the single biggest reason the
-/// score tile is computed four keys at a time rather than one.
+/// Reduce **four** accumulators to their four scalar sums in one 5-instruction tree (3 `vhaddps`,
+/// an `extractf128`, an `addps`), landing them contiguously so the caller stores them with a single
+/// `movups`. `vhaddps ymm` decodes to 3 uops, so that is 3·3 + 1 + 1 = 11 uops for **four** dots,
+/// ~2.75 each, against `hsum256`'s ~8 for **one** — the single biggest reason the score tile is
+/// computed four keys at a time rather than one.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn red4(
@@ -441,10 +456,14 @@ unsafe fn row_max(row: *const f32, n: usize, init: f32) -> f32 {
     }
     while t < n {
         let x = *row.add(t);
-        // `(x > best) ? x : best` — `_mm256_max_ps`'s rule, not `f32::max`'s.
-        if x > best {
-            best = x;
-        }
+        // `_mm256_max_ps(mv, chunk)` is `(a > b) ? a : b` with the RUNNING max as `a` and the new
+        // element as `b`, so it yields `b` on a tie and on an unordered compare. The tail has to
+        // fold the same way round — `(best > x) ? best : x`, i.e. take `x` unless `best` strictly
+        // wins. `f32::max` differs from that on a NaN, and so does the mirror-image `if x > best`,
+        // which this used to be: with a NaN already in `best` the intrinsic drops it and `if x >
+        // best` keeps it, and with a NaN arriving in `x` they swap. Same value on every ordered
+        // input, so no test moves; the point is that the twin rule now actually holds.
+        best = if best > x { best } else { x };
         t += 1;
     }
     best
@@ -640,8 +659,16 @@ unsafe fn attention_avx2(
     causal: bool,
 ) {
     let dv = d & !7; // largest multiple of 8 <= d
-    let mut sc = vec![0.0f32; ATT_BR * ATT_BC];
-    let mut acc = vec![0.0f32; ATT_BR * d];
+
+    // Scratch is sized to the largest block THIS call will use, not to `ATT_BR`. Sized to `ATT_BR`
+    // the score tile is a flat 8 KB malloc + memset on every call regardless of `s`, which a
+    // decode-shaped call (`s = 1`) or the corpus's own fixture (`tests/run/sdpa.wk` is S=2, D=2,
+    // four output elements) pays in full for nothing, once per head in any per-head loop. Rows keep
+    // the `ATT_BC` stride that `qk_tile` and `pv8` index with; only the row count shrinks, so at
+    // `s >= ATT_BR` this is byte-identical to before.
+    let qbmax = s.min(ATT_BR);
+    let mut sc = vec![0.0f32; qbmax * ATT_BC];
+    let mut acc = vec![0.0f32; qbmax * d];
     let mut m = [f32::NEG_INFINITY; ATT_BR];
     let mut l = [0.0f32; ATT_BR];
     let mut corr = [0.0f32; ATT_BR];
@@ -997,6 +1024,162 @@ mod tests {
         }
     }
 
+    /// The NaN case that `attention_propagates_nan` above **cannot** see, and the only construction
+    /// that isolates [`exp_row`]'s `vblendvps` restore from [`exp_keep_nan`]'s scalar `is_nan`.
+    ///
+    /// In that test the NaN sits in `Q[1][0]`, so every score of row 1 is NaN, so [`row_max`]
+    /// returns NaN, so `corr = exp_keep_nan(m - NaN)` is NaN by the *scalar* guard and poisons `l`
+    /// and `acc` on its own. Delete the `vblendvps` and the row still comes out NaN: the two guards
+    /// mutually mask each other and neither is pinned.
+    ///
+    /// Put the NaN in a **key** instead, in a **non-final 8-lane chunk** of the score row, and the
+    /// masking breaks. `K[3][0] = NaN` makes `score[i][3]` NaN for every `i`; `row_max` folds it
+    /// with `_mm256_max_ps(mv, chunk)`, which returns SRC2 on an unordered compare, so the NaN
+    /// parked in lane 3 of `mv` by chunk 0 is **overwritten** by the finite lane 3 of chunk 1 and
+    /// `row_max` hands back a finite `mn`. `corr = exp_keep_nan(-inf - mn) = +0.0`, also finite. At
+    /// `s = 40, d = 64` non-causal the row is 40 wide, `nv = 40`, so `exp_row` has no scalar tail
+    /// either: the `vblendvps` is the *only* thing left holding the NaN. Without it `exp8` returns
+    /// the clamp saturation 2.406e38 (finite, never `inf` — `vmath_exp_boundary_saturation` pins
+    /// that), `l` is finite, and a diverged head reports confident finite numbers.
+    ///
+    /// Mutation-checked: replacing the `vblendvps` select with a bare `crate::vmath::exp8(a)` makes
+    /// this test fail and leaves `attention_propagates_nan` green.
+    #[test]
+    fn attention_propagates_nan_from_a_mid_row_chunk() {
+        for &(s, d) in &[(40usize, 64usize), (72, 32)] {
+            for &causal in &[false, true] {
+                let scale = 1.0 / (d as f32).sqrt();
+                let q = fill(1, s * d);
+                let mut k = fill(2, s * d);
+                let v = fill(3, s * d);
+                // Key 3: inside chunk 0 of every score row, with chunks 1.. following it.
+                k[3 * d] = f32::NAN;
+                let mut got = vec![0.0f32; s * d];
+                // SAFETY: operand contract of `wukong_attention_f32`; all three are s*d.
+                unsafe {
+                    wukong_attention_f32(
+                        q.as_ptr(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        got.as_mut_ptr(),
+                        s as i64,
+                        d as i64,
+                        scale,
+                        causal as i64,
+                    );
+                }
+                for i in 0..s {
+                    // Under a causal mask rows 0..3 never attend to key 3 and must stay clean;
+                    // every other row must be NaN in every lane.
+                    let poisoned = !causal || i >= 3;
+                    for t in 0..d {
+                        if poisoned {
+                            assert!(
+                                got[i * d + t].is_nan(),
+                                "mid-chunk K NaN lost ({s}x{d}, causal={causal}) at [{i}][{t}]: {}",
+                                got[i * d + t]
+                            );
+                        } else {
+                            assert!(
+                                got[i * d + t].is_finite(),
+                                "row {i} contaminated ({s}x{d}, causal={causal}) lane {t}: {}",
+                                got[i * d + t]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queries and keys with a **large, monotone score spread** — the regime the online-softmax
+    /// recurrence and the clamped `exp` exist for, and the one nothing else in this file reaches.
+    ///
+    /// Every other correctness test here fills `q`/`k` from the same uniform `[-1, 1)` LCG and uses
+    /// `scale = 1/sqrt(d)`, so `|score|` stays around 1, the running max barely moves between key
+    /// blocks, `corr` is within a hair of 1 at every step, and the `if m == mn { 1.0 }`
+    /// short-circuit takes the trivial branch. The move from the platform `expf` to the clamped
+    /// [`crate::vmath::exp1`] / [`crate::vmath::exp8`] (argument clamped to `[-88.376, 88.376]`,
+    /// `EXP_LO` flushing to `+0.0`) changes behaviour only *outside* that band, so the entire suite
+    /// was blind to it.
+    ///
+    /// Here lane 0 of every query is `1.0` and lane 0 of key `j` ramps linearly to `amp`, so
+    /// `score[i][j]` grows monotonically in `j` with a total spread of ~120 across the row. The row
+    /// max therefore moves at **every** key block, `corr = exp(m_old - m_new)` is a genuinely tiny
+    /// number rather than 1, most weights land below `EXP_LO` and flush to zero, and the
+    /// accumulator is rescaled through several orders of magnitude before the final divide. Shapes
+    /// span two to four `ATT_BC = 64` key blocks so the recurrence runs more than once.
+    ///
+    /// The oracle is the same `naive` materialized softmax, which uses libm `exp` and so keeps the
+    /// sub-`EXP_LO` weights as denormals where the kernel flushes them to `+0.0`; both are `<1e-38`
+    /// against a denominator of at least 1, i.e. ~30 orders of magnitude under the existing `1e-4`
+    /// band, which is reused verbatim.
+    #[test]
+    fn attention_matches_naive_over_a_wide_score_spread() {
+        for &(s, d) in &[(72usize, 32usize), (96, 33), (129, 8), (130, 24), (200, 17)] {
+            for &causal in &[false, true] {
+                let scale = 1.0 / (d as f32).sqrt();
+                // Total spread across a full row ~= amp * scale ~= 120: far past `EXP_LO`, so the
+                // clamp is genuinely exercised, and far short of overflowing the dot in f32.
+                let amp = 120.0 * (d as f32).sqrt();
+                let mut q = fill(1, s * d);
+                let mut k = fill(2, s * d);
+                let v = fill(3, s * d);
+                for i in 0..s {
+                    q[i * d] = 1.0;
+                    k[i * d] = amp * i as f32 / s as f32;
+                }
+                let want = naive(&q, &k, &v, s, d, scale, causal);
+                let mut got = vec![0.0f32; s * d];
+                // SAFETY: operand contract of `wukong_attention_f32`; all three are s*d.
+                unsafe {
+                    wukong_attention_f32(
+                        q.as_ptr(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        got.as_mut_ptr(),
+                        s as i64,
+                        d as i64,
+                        scale,
+                        causal as i64,
+                    );
+                }
+                for i in 0..s * d {
+                    assert!(
+                        (got[i] - want[i]).abs() <= 1e-4 + 1e-4 * want[i].abs(),
+                        "wide spread ({s}x{d}, causal={causal}) idx {i}: got {} want {}",
+                        got[i],
+                        want[i]
+                    );
+                }
+                // The same spread through the portable twin, whose recurrence rescales per key
+                // rather than per key block.
+                let mut got = vec![0.0f32; s * d];
+                // SAFETY: as above.
+                unsafe {
+                    attention_scalar(
+                        q.as_ptr(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        got.as_mut_ptr(),
+                        s,
+                        d,
+                        scale,
+                        causal,
+                    );
+                }
+                for i in 0..s * d {
+                    assert!(
+                        (got[i] - want[i]).abs() <= 1e-4 + 1e-4 * want[i].abs(),
+                        "wide spread scalar ({s}x{d}, causal={causal}) idx {i}: got {} want {}",
+                        got[i],
+                        want[i]
+                    );
+                }
+            }
+        }
+    }
+
     /// The pre-P5 AVX2 kernel, verbatim, kept as a second independent implementation: it is the
     /// A/B arm in `attention_throughput` and the peer in `attention_matches_legacy_kernel`. Its
     /// defects are performance-only — two scalar `expf` per (query, key), one `hsum256` per score,
@@ -1150,30 +1333,43 @@ mod tests {
         }
     }
 
-    /// In-place row softmax through the crate's own `exp` — `exp8` where AVX2 is present, `exp1`
-    /// otherwise. This is what makes the strong control in `attention_throughput` honest: it pays
-    /// the same vectorized exps the fused kernel pays, so the two differ only in the
-    /// materialization, not in their transcendental.
-    fn softmax_row_fast(row: &mut [f32]) {
+    /// `row[j] := softmax(scale·row[j])`, in place, through the crate's own `exp` — `exp8` where
+    /// AVX2 is present, `exp1` otherwise. Three passes: **scale-and-max fused into one**, then
+    /// exp-and-sum, then normalize.
+    ///
+    /// Two properties make the materialized control honest, and this branch got the second one
+    /// wrong before the wave-2 audit:
+    ///
+    /// 1. It pays the *same* vectorized exps the fused kernel pays, so the delta against the kernel
+    ///    is the materialization and not the transcendental.
+    /// 2. The `scale` multiply is **fused into the max pass**, which is how the pre-P5 control
+    ///    spelled it (`for r in row { *r *= scale; mx = mx.max(*r); }`). Splitting it into a scale
+    ///    pass and a separate max pass — which this file did between commit 32234c6 and this one —
+    ///    adds a full extra read-modify-write of the `S×S` score matrix to the control and to
+    ///    nothing else: `8·S²` bytes of traffic per iteration, ~8 MB at `S = 1024` against a ~4 ms
+    ///    arm. The fused kernel folds the identical multiply into a register inside [`qk_tile`] and
+    ///    pays nothing for it. A control the candidate has quietly handicapped produces a ratio in
+    ///    the candidate's favour, which is the one direction a measurement may never drift.
+    fn softmax_row_scaled(row: &mut [f32], scale: f32) {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 // SAFETY: features just checked; all accesses are inside `row`.
                 unsafe {
-                    softmax_row_avx2(row);
+                    softmax_row_scaled_avx2(row, scale);
                 }
                 return;
             }
         }
-        softmax_row_scalar(row);
+        softmax_row_scaled_scalar(row, scale);
     }
 
-    fn softmax_row_scalar(row: &mut [f32]) {
+    fn softmax_row_scaled_scalar(row: &mut [f32], scale: f32) {
         let mut mx = f32::NEG_INFINITY;
-        for &x in row.iter() {
-            if x > mx {
-                mx = x;
-            }
+        for x in row.iter_mut() {
+            *x *= scale;
+            // `_mm256_max_ps`'s rule with the running max as `a`, matching `row_max`'s tail.
+            mx = if mx > *x { mx } else { *x };
         }
         let mut sum = 0.0f32;
         for x in row.iter_mut() {
@@ -1188,14 +1384,34 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    unsafe fn softmax_row_avx2(row: &mut [f32]) {
+    unsafe fn softmax_row_scaled_avx2(row: &mut [f32], scale: f32) {
         let n = row.len();
         let p = row.as_mut_ptr();
-        let mx = row_max(p, n, f32::NEG_INFINITY);
+        let nv = n & !7;
+        // Pass 1: scale and max in ONE traversal (see the note on `softmax_row_scaled`).
+        let sv = _mm256_set1_ps(scale);
+        let mut mx = f32::NEG_INFINITY;
+        let mut t = 0;
+        if nv != 0 {
+            let mut mv = _mm256_set1_ps(f32::NEG_INFINITY);
+            while t < nv {
+                let x = _mm256_mul_ps(_mm256_loadu_ps(p.add(t)), sv);
+                _mm256_storeu_ps(p.add(t), x);
+                mv = _mm256_max_ps(mv, x);
+                t += 8;
+            }
+            mx = hmax256(mv);
+        }
+        while t < n {
+            let x = *p.add(t) * scale;
+            *p.add(t) = x;
+            mx = if mx > x { mx } else { x };
+            t += 1;
+        }
+        // Passes 2 and 3: exp-and-sum, then normalize.
         let sum = exp_row(p, n, mx);
         let inv = 1.0 / sum;
         let invv = _mm256_set1_ps(inv);
-        let nv = n & !7;
         let mut t = 0;
         while t < nv {
             _mm256_storeu_ps(p.add(t), _mm256_mul_ps(_mm256_loadu_ps(p.add(t)), invv));
@@ -1204,6 +1420,201 @@ mod tests {
         while t < n {
             *p.add(t) *= inv;
             t += 1;
+        }
+    }
+
+    use crate::{wukong_sgemm, wukong_sgemm_nt};
+
+    /// Two full GEMMs plus a row softmax — the non-causal materialized control, and the thing the
+    /// fused kernel has to beat. Writes through `scores` (`s*s`) and `o` (`s*d`), both caller-owned
+    /// so no allocation is timed.
+    ///
+    /// Hoisted out of `attention_throughput` so a non-`#[ignore]`d test can drive it too: before
+    /// the wave-2 audit the only place the control was ever checked against the kernel was an
+    /// assert *inside* the ignored probe, so it ran in no gate at all. See
+    /// [`attention_matches_materialized_control`].
+    ///
+    /// # Safety
+    /// `scores` valid for `s*s` writes, `o` for `s*d` writes; `q`/`k`/`v` are `s*d` long.
+    unsafe fn materialized(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        scores: *mut f32,
+        o: *mut f32,
+        s: usize,
+        d: usize,
+        scale: f32,
+        libm_exp: bool,
+    ) {
+        wukong_sgemm_nt(
+            q.as_ptr(),
+            k.as_ptr(),
+            scores,
+            s as i64,
+            d as i64,
+            s as i64,
+            0,
+        );
+        for i in 0..s {
+            let row = std::slice::from_raw_parts_mut(scores.add(i * s), s);
+            if libm_exp {
+                // Spelled exactly as the pre-P5 control's inner loop: scale folded into the max
+                // pass, scalar libm `exp`, scalar normalize. This arm exists ONLY so the pre-P5
+                // W15 number stays comparable, so it must not drift from that spelling.
+                let mut mx = f32::NEG_INFINITY;
+                for r in row.iter_mut() {
+                    *r *= scale;
+                    mx = mx.max(*r);
+                }
+                let mut sum = 0.0f32;
+                for r in row.iter_mut() {
+                    *r = (*r - mx).exp();
+                    sum += *r;
+                }
+                let inv = 1.0 / sum;
+                for r in row.iter_mut() {
+                    *r *= inv;
+                }
+            } else {
+                softmax_row_scaled(row, scale);
+            }
+        }
+        wukong_sgemm(scores, v.as_ptr(), o, s as i64, s as i64, d as i64, 0);
+    }
+
+    /// Causal materialized control, panelled so the GEMMs see only the triangle: for a panel of
+    /// `PANEL` query rows starting at `i0`, no query attends past key `i0 + pb - 1`, so the NT
+    /// GEMM's `N` and the second GEMM's `K` are `i0 + pb` rather than `S`. Without this the
+    /// control does 2x the necessary flops and the comparison is vacuous.
+    ///
+    /// # Safety
+    /// As [`materialized`]; `scores` needs `PANEL*s` writes, which `s*s` covers for `s >= PANEL`
+    /// (and below it `pb = s`, so `s*s` again).
+    unsafe fn materialized_causal(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        scores: *mut f32,
+        o: *mut f32,
+        s: usize,
+        d: usize,
+        scale: f32,
+    ) {
+        const PANEL: usize = 64;
+        let mut i0 = 0;
+        while i0 < s {
+            let pb = (s - i0).min(PANEL);
+            let jmax = i0 + pb;
+            wukong_sgemm_nt(
+                q.as_ptr().add(i0 * d),
+                k.as_ptr(),
+                scores,
+                pb as i64,
+                d as i64,
+                jmax as i64,
+                0,
+            );
+            for ii in 0..pb {
+                let row = std::slice::from_raw_parts_mut(scores.add(ii * jmax), jmax);
+                let ke = i0 + ii + 1;
+                softmax_row_scaled(&mut row[..ke], scale);
+                for r in row.iter_mut().skip(ke) {
+                    *r = 0.0;
+                }
+            }
+            wukong_sgemm(
+                scores,
+                v.as_ptr(),
+                o.add(i0 * d),
+                pb as i64,
+                jmax as i64,
+                d as i64,
+                0,
+            );
+            i0 += PANEL;
+        }
+    }
+
+    /// The fused kernel must agree with the materialized control it is benchmarked against — in a
+    /// gate, not only inside the `#[ignore]`d probe.
+    ///
+    /// This is a different oracle from `naive`: it is Wukong's own tuned `wukong_sgemm_nt` /
+    /// `wukong_sgemm` plus the crate's vectorized row softmax, and under a causal mask it is the
+    /// *panelled* form, whose 64-row panel boundaries fall in different places from the kernel's
+    /// `ATT_BR = 32` / `ATT_BC = 64` blocks. A timing comparison against a control that computes a
+    /// different function is worthless, and until now no gate said it did not: the cross-check
+    /// lived inside `attention_throughput`, which is `#[ignore]`d and release-only, so it had never
+    /// run. Same `1e-4` band as every other correctness gate in this file — both sides reassociate,
+    /// so neither can offer an exact match.
+    #[test]
+    fn attention_matches_materialized_control() {
+        // `s >= 64` so the causal control exercises at least one full `PANEL`; `d` straddles the
+        // 8-wide remainder. Kept small enough to stay cheap in a debug build.
+        for &(s, d) in &[
+            (64usize, 64usize),
+            (72, 32),
+            (96, 33),
+            (129, 8),
+            (130, 24),
+            (200, 17),
+        ] {
+            for &causal in &[false, true] {
+                let q = fill(1, s * d);
+                let k = fill(2, s * d);
+                let v = fill(3, s * d);
+                let scale = 1.0 / (d as f32).sqrt();
+                let mut want = vec![0.0f32; s * d];
+                let mut got = vec![0.0f32; s * d];
+                let mut scores = vec![0.0f32; s * s];
+                // SAFETY: `scores` is s*s, `want`/`got` are s*d, `q`/`k`/`v` are s*d — the operand
+                // contracts of `materialized`, `materialized_causal` and `wukong_attention_f32`.
+                unsafe {
+                    if causal {
+                        materialized_causal(
+                            &q,
+                            &k,
+                            &v,
+                            scores.as_mut_ptr(),
+                            want.as_mut_ptr(),
+                            s,
+                            d,
+                            scale,
+                        );
+                    } else {
+                        materialized(
+                            &q,
+                            &k,
+                            &v,
+                            scores.as_mut_ptr(),
+                            want.as_mut_ptr(),
+                            s,
+                            d,
+                            scale,
+                            false,
+                        );
+                    }
+                    wukong_attention_f32(
+                        q.as_ptr(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        got.as_mut_ptr(),
+                        s as i64,
+                        d as i64,
+                        scale,
+                        causal as i64,
+                    );
+                }
+                for i in 0..s * d {
+                    assert!(
+                        (got[i] - want[i]).abs() <= 1e-4 + 1e-4 * want[i].abs(),
+                        "vs materialized control ({s}x{d}, causal={causal}) idx {i}: fused {} \
+                         control {}",
+                        got[i],
+                        want[i]
+                    );
+                }
+            }
         }
     }
 
@@ -1217,6 +1628,22 @@ mod tests {
     ///
     /// * `mat-libm` — Wukong's materialized path with a scalar-`expf` row softmax. This is the
     ///   control the pre-P5 W15 row was measured against, kept so the old number stays comparable.
+    ///   It is **not byte-identical** to the pre-P5 spelling, and every difference is listed here
+    ///   because an undisclosed change to a control is worse than a wrong number — it makes every
+    ///   other number unverifiable. (a) `scores` and `o` are caller-owned and allocated outside the
+    ///   timed region; the pre-P5 probe allocated a zeroed `4·S²`-byte `Vec` and an `S·D` `Vec`
+    ///   inside every timed iteration and freed them again, which at `S = 2048` charged the control
+    ///   ~4096 demand-zero page faults per iteration that the fused kernel (16 KB of scratch) never
+    ///   pays. **This makes the control faster**, i.e. it moves the ratio against the candidate.
+    ///   (b) It writes through pointers instead of returning a `Vec` into `black_box`; neutral to
+    ///   marginally in the control's favour. (c) The pre-P5 `take(jmax)`/`skip(jmax)` causal branch
+    ///   is gone, which changes nothing measured: the pre-P5 probe only ever called this arm with
+    ///   `causal = false`, where `jmax == s`. (d) Between commit 32234c6 and the wave-2 fix pass
+    ///   this arm also **split** the pre-P5 fused `for r in row { *r *= scale; mx = mx.max(*r); }`
+    ///   into a scale pass and a separate max pass, adding one full read-modify-write of the `S×S`
+    ///   scores (`8·S²` bytes, ~8 MB at `S = 1024`) to the control alone. That handicapped the
+    ///   control in the candidate's favour and was **not** disclosed with the ratios published from
+    ///   32234c6; it is reverted here, and those ratios are withdrawn pending a re-measure.
     /// * `mat-exp8` — the same two GEMMs with the crate's *vectorized* row softmax, and, under a
     ///   causal mask, a triangular panel loop that shrinks the NT GEMM's `N` and the second GEMM's
     ///   `K` to `i0 + panel` so it never computes the half it would throw away. **This is the
@@ -1233,114 +1660,7 @@ mod tests {
     #[test]
     #[ignore]
     fn attention_throughput() {
-        use crate::{wukong_sgemm, wukong_sgemm_nt};
         use std::time::Instant;
-
-        /// Two full GEMMs plus a row softmax — the non-causal materialized control. Writes through
-        /// `scores` (`s*s`) and `o` (`s*d`), both caller-owned so no allocation is timed.
-        ///
-        /// # Safety
-        /// `scores` valid for `s*s` writes, `o` for `s*d` writes; `q`/`k`/`v` are `s*d` long.
-        unsafe fn materialized(
-            q: &[f32],
-            k: &[f32],
-            v: &[f32],
-            scores: *mut f32,
-            o: *mut f32,
-            s: usize,
-            d: usize,
-            scale: f32,
-            libm_exp: bool,
-        ) {
-            wukong_sgemm_nt(
-                q.as_ptr(),
-                k.as_ptr(),
-                scores,
-                s as i64,
-                d as i64,
-                s as i64,
-                0,
-            );
-            for i in 0..s {
-                let row = std::slice::from_raw_parts_mut(scores.add(i * s), s);
-                for r in row.iter_mut() {
-                    *r *= scale;
-                }
-                if libm_exp {
-                    let mut mx = f32::NEG_INFINITY;
-                    for &r in row.iter() {
-                        mx = mx.max(r);
-                    }
-                    let mut sum = 0.0f32;
-                    for r in row.iter_mut() {
-                        *r = (*r - mx).exp();
-                        sum += *r;
-                    }
-                    let inv = 1.0 / sum;
-                    for r in row.iter_mut() {
-                        *r *= inv;
-                    }
-                } else {
-                    softmax_row_fast(row);
-                }
-            }
-            wukong_sgemm(scores, v.as_ptr(), o, s as i64, s as i64, d as i64, 0);
-        }
-
-        /// Causal materialized control, panelled so the GEMMs see only the triangle: for a panel of
-        /// `PANEL` query rows starting at `i0`, no query attends past key `i0 + pb - 1`, so the NT
-        /// GEMM's `N` and the second GEMM's `K` are `i0 + pb` rather than `S`. Without this the
-        /// control does 2x the necessary flops and the comparison is vacuous.
-        ///
-        /// # Safety
-        /// As [`materialized`]; `scores` needs `PANEL*s` writes, which `s*s` covers for `s >= PANEL`.
-        unsafe fn materialized_causal(
-            q: &[f32],
-            k: &[f32],
-            v: &[f32],
-            scores: *mut f32,
-            o: *mut f32,
-            s: usize,
-            d: usize,
-            scale: f32,
-        ) {
-            const PANEL: usize = 64;
-            let mut i0 = 0;
-            while i0 < s {
-                let pb = (s - i0).min(PANEL);
-                let jmax = i0 + pb;
-                wukong_sgemm_nt(
-                    q.as_ptr().add(i0 * d),
-                    k.as_ptr(),
-                    scores,
-                    pb as i64,
-                    d as i64,
-                    jmax as i64,
-                    0,
-                );
-                for ii in 0..pb {
-                    let row = std::slice::from_raw_parts_mut(scores.add(ii * jmax), jmax);
-                    let ke = i0 + ii + 1;
-                    for r in row.iter_mut().take(ke) {
-                        *r *= scale;
-                    }
-                    softmax_row_fast(&mut row[..ke]);
-                    for r in row.iter_mut().skip(ke) {
-                        *r = 0.0;
-                    }
-                }
-                wukong_sgemm(
-                    scores,
-                    v.as_ptr(),
-                    o.add(i0 * d),
-                    pb as i64,
-                    jmax as i64,
-                    d as i64,
-                    0,
-                );
-                i0 += PANEL;
-            }
-        }
 
         let bench = |f: &dyn Fn()| {
             for _ in 0..3 {
