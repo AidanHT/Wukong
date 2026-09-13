@@ -8097,6 +8097,10 @@ fn bench_wukong4(
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
+    // Dispatch census + persisted source for the non-3-pointer ABIs too - see
+    // `announce_dispatch`. Recognized kernels are gate-blind, and int8 GEMM, bf16
+    // reductions and the half-output streaming rows are all recognizer-dependent.
+    let _ = announce_dispatch(src, &program, &interner);
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
@@ -8186,6 +8190,10 @@ fn bench_wukong_i8(src: &str, out: &mut [i32], ap: *const u8, bp: *const i8) -> 
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
+    // Dispatch census + persisted source for the non-3-pointer ABIs too - see
+    // `announce_dispatch`. Recognized kernels are gate-blind, and int8 GEMM, bf16
+    // reductions and the half-output streaming rows are all recognizer-dependent.
+    let _ = announce_dispatch(src, &program, &interner);
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
@@ -8279,6 +8287,10 @@ fn bench_wukong_bf16(
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
+    // Dispatch census + persisted source for the non-3-pointer ABIs too - see
+    // `announce_dispatch`. Recognized kernels are gate-blind, and int8 GEMM, bf16
+    // reductions and the half-output streaming rows are all recognizer-dependent.
+    let _ = announce_dispatch(src, &program, &interner);
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
@@ -8372,6 +8384,10 @@ fn bench_wukong_halfout(
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
+    // Dispatch census + persisted source for the non-3-pointer ABIs too - see
+    // `announce_dispatch`. Recognized kernels are gate-blind, and int8 GEMM, bf16
+    // reductions and the half-output streaming rows are all recognizer-dependent.
+    let _ = announce_dispatch(src, &program, &interner);
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
