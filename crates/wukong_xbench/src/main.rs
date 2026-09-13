@@ -6502,12 +6502,31 @@ fn bench_bf16(cc: &str, dir: &Path) {
             // All-positive, well-conditioned reduction → a tight relative tolerance is the right
             // cross-language bar (the three reassociate the f32 sum differently: Wukong 8-lane SIMD
             // vs sequential C/Rust). Report the scalars so any drift is visible.
+            //
+            // C(fast) IS IN THIS LOOP AS OF 2026-09-13, AT ITS OWN BAR. Every bf16 loss in this
+            // section is against C(fast) and nothing else, and it was the one peer whose scalar was
+            // never printed anywhere: `bench_bf16_fast` keeps or drops the column at rel > 1e-2, a
+            // bar ten times looser than the one the three sequential peers are held to, so "C(fast)
+            // printed a column" bounded its answer only to within 1e-2 of Wukong - an error of the
+            // same order the sequential peers' own drift reaches. The section's accuracy ruling was
+            // derived from the three peers Wukong BEATS and said nothing about the one it loses to.
+            // The bar is NOT tightened here (that would delete the peer that wins, which is the
+            // opposite of a fix); the scalar is put on the record so the ruling can be re-derived
+            // against the f64 reference with C(fast) in it.
             if let Some(m) = &wuk {
-                for (lang, other) in [("C", &cm), ("C++", &cm_cpp), ("Rust", &rm)] {
+                for (lang, other, bar) in [
+                    ("C", &cm, 1e-3),
+                    ("C++", &cm_cpp, 1e-3),
+                    ("Rust", &rm, 1e-3),
+                    ("C(fast)", &cfast, 1e-2),
+                ] {
                     if let Some(o2) = other {
                         let (a, b) = (m.out, o2.out);
                         let rel = (a - b).abs() as f64 / (a.abs().max(b.abs()).max(1e-6) as f64);
-                        if rel > 1e-3 {
+                        println!(
+                            "  . {lang} scalar {b} vs Wukong {a} (rel {rel:.2e}, bar {bar:.0e})"
+                        );
+                        if rel > bar {
                             println!("  ! {lang} scalar drift: {b} vs Wukong {a} (rel {rel:.2e})");
                         }
                     }
