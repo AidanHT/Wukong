@@ -1521,12 +1521,30 @@ impl<'a, 'k> Interp<'a, 'k> {
             // source nest has, and — because the oracle's answer is the more plausible one — a
             // differential failure on such an input would name NATIVE as the deviant side.
             //
-            // What keeps that unreachable is the lowering, not this code: `wukong_mir_build`'s
-            // `all_provably_disjoint` declines every kernel whose contract requires disjointness
-            // unless the whole-program analysis in its `alias.rs` proves no call site can hand the
-            // enclosing function the same array twice. The two families that ARE emitted under
-            // possible overlap (the embedding gather and the scatter-add, both routed through
-            // `emit_nonoverlapping_call`) do not marshal — they read live memory, below.
+            // What keeps that unreachable FOR THIS FAMILY is the lowering, not this code:
+            // `wukong_mir_build`'s `all_provably_disjoint` declines the GEMM/GEMV/GEVM, transpose,
+            // pool2d, col/row-reduction and norm-backward emitters unless the whole-program
+            // analysis in its `alias.rs` proves no call site can hand the enclosing function the
+            // same array twice. Three other groups are NOT behind that gate, and the distinction is
+            // worth keeping straight rather than claiming the class is shut:
+            //
+            //  * The embedding gather and the scatter-add are versioned at RUN time instead
+            //    (`emit_nonoverlapping_call`), and their arms below do not marshal at all — they
+            //    read live memory, which is what makes an aliased call mean the source nest.
+            //  * The index-aligned families whose runtime entry explicitly permits `out == x`:
+            //    velem/vmath/axpby, `wukong_cumsum_f32`, `wukong_cum{max,min}_f32`,
+            //    `wukong_cumprod_f32`, `wukong_lrscan_f32`, `wukong_rope_f32`,
+            //    `wukong_xent_bwd_f32`, the norms. In place equals out of place for those, so the
+            //    marshalling here is redundant rather than wrong, and gating them would decline a
+            //    spelling the kernel author certified.
+            //  * A residual set whose runtime entries carry NO disjointness clause in either
+            //    direction and whose emit sites do no disjointness reasoning:
+            //    `wukong_logsumexp_f32`, `wukong_xent_fwd_f32`, `wukong_kldiv_f32`,
+            //    `wukong_entropy_f32`, `wukong_kd_loss_f32` (each writes a `rows`-long `out` while
+            //    reading a `rows*cols` `x` — the same shape as the row reductions that ARE gated)
+            //    and `wukong_dequant_perchan_f32`. For those the copy-in/copy-out divergence
+            //    described above is still reachable in principle. They are named here rather than
+            //    left implied, because the comment this one replaces said the class was closed.
             "wukong_sgemm"
             | "wukong_sgemm_parallel"
             | "wukong_sgemm_nt"
@@ -4077,6 +4095,18 @@ impl<'a, 'k> Interp<'a, 'k> {
             // reassociation to keep in sync with the AVX2 `add_row` (eight independent lane adds),
             // and the `_parallel` kernel splits *output rows* while keeping each row's ascending-`ti`
             // fold, so one implementation serves both symbols.
+            //
+            // TWO PROPERTIES OF THE MARSHALLED FORM ARE KEPT DELIBERATELY, because dropping either
+            // would be a silent behaviour change rather than the fix this arm is:
+            //  * it validated the whole `grad_out[0..t*h]` and `grad_w[0..v*h]` extents BEFORE
+            //    computing anything, so an out-of-arena extent was a diagnostic and not a quietly
+            //    shorter loop. Reading live memory only touches the slots an in-range id reaches, so
+            //    the two range ends are probed up front instead (memory is one flat slot arena, so
+            //    the last slot standing in for the range is exact).
+            //  * it truncated the id with `as i32` before handing it to the kernel, which is what
+            //    NATIVE does — `ids` is an `[i32]` buffer and the kernel's parameter is
+            //    `*const i32`, so a value outside i32 is reinterpreted, not skipped. A well-typed
+            //    program cannot produce one; matching native costs one cast.
             "wukong_scatter_add_f32" | "wukong_scatter_add_f32_parallel" => {
                 let grad_w = ptr(args[0])?;
                 let grad_out = ptr(args[1])?;
@@ -4084,12 +4114,28 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let t = dim!(args[3]);
                 let h = dim!(args[4]);
                 let v = dim!(args[5]);
+                let end = self.memory.len();
+                // Checked throughout: `t`/`h`/`v` are program-supplied dims, so `t*h` is an
+                // attacker-shaped product and a wrap would turn the guard into a pass.
+                let in_arena = |base: usize, n: Option<usize>| {
+                    n.and_then(|n| base.checked_add(n))
+                        .is_some_and(|last| last <= end)
+                };
+                if !in_arena(ids, Some(t)) {
+                    return Err("scatter_add ids out of bounds".into());
+                }
+                if !in_arena(grad_out, t.checked_mul(h)) {
+                    return Err("scatter_add grad_out out of bounds".into());
+                }
+                if !in_arena(grad_w, v.checked_mul(h)) {
+                    return Err("scatter_add grad_w out of bounds".into());
+                }
                 for ti in 0..t {
                     let id = self
                         .memory
                         .get(ids + ti)
                         .ok_or("scatter_add ids out of bounds")?
-                        .as_int();
+                        .as_int() as i32;
                     if id < 0 || (id as usize) >= v {
                         continue;
                     }

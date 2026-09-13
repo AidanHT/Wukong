@@ -1,0 +1,111 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 2
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 3
+// EXPECT-OUT: 11
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+// EXPECT-OUT: 21
+// EXPECT-OUT: 22
+// EXPECT-OUT: 23
+// EXPECT-OUT: 24
+// EXPECT-OUT: 4
+// EXPECT-OUT: 12
+// EXPECT-OUT: 20
+// EXPECT-OUT: 28
+// EXPECT-OUT: 29
+// EXPECT-OUT: 30
+// EXPECT-OUT: 31
+// EXPECT-OUT: 32
+// EXPECT-OUT: 5
+// EXPECT-OUT: 13
+// EXPECT-OUT: 21
+// EXPECT-OUT: 29
+// EXPECT-OUT: 37
+// EXPECT-OUT: 38
+// EXPECT-OUT: 39
+// EXPECT-OUT: 40
+// EXPECT-OUT: 6
+// EXPECT-OUT: 14
+// EXPECT-OUT: 22
+// EXPECT-OUT: 30
+// EXPECT-OUT: 38
+// EXPECT-OUT: 46
+// EXPECT-OUT: 47
+// EXPECT-OUT: 48
+// EXPECT-OUT: 7
+// EXPECT-OUT: 15
+// EXPECT-OUT: 23
+// EXPECT-OUT: 31
+// EXPECT-OUT: 39
+// EXPECT-OUT: 47
+// EXPECT-OUT: 55
+// EXPECT-OUT: 56
+// EXPECT-OUT: 8
+// EXPECT-OUT: 16
+// EXPECT-OUT: 24
+// EXPECT-OUT: 32
+// EXPECT-OUT: 40
+// EXPECT-OUT: 48
+// EXPECT-OUT: 56
+// EXPECT-OUT: 64
+module tests.run.alias_transpose_inplace8
+
+// The 8x8 twin of `alias_transpose_inplace.wk`, and it exists because the 4x4 one is SIZE
+// DEGENERATE.
+//
+// `transpose_rows_f32_avx2` needs eight rows and eight columns to form a tile, so at 4x4 the whole
+// kernel falls back to the same scalar moves `transpose_rows` makes, in the same i-outer/j-inner
+// order the source nest uses. Aliased at 4x4 the native run therefore prints exactly what the nest
+// prints, and all of that fixture's discriminating power lives in the interpreter column: a future
+// defect that reinstated the kernel would still pass it natively.
+//
+// At 8x8 nothing degenerates. One full 8x8 in-register tile fires: eight `_mm256_loadu_ps` read all
+// eight source rows before any store, so with `src == dst` the kernel writes a TRUE transpose
+// (`1 9 17 25 33 41 49 57 ...`), and the interpreter's marshalled copy computes the same true
+// transpose for the same reason. The source nest computes neither. So this fixture fails on BOTH
+// backends if the recognizer ever stops declining an aliased transpose.
+//
+// Expectations are the scalar nest by hand, not a reading from any backend. In place,
+// `o[j*8+i] = a[i*8+j]` with `i` outer writes position (c,r) at step (i=r, j=c) and position (r,c)
+// at step (i=c, j=r); for r < c the first of those precedes the second, so both end up holding the
+// value position (r,c) had before either ran, and the diagonal writes itself. The closed form is
+// therefore `final[r][c] = orig[min(r,c)][max(r,c)]` — the original's UPPER triangle mirrored down,
+// a symmetric matrix — which with `orig[r][c] = r*8+c+1` gives the 64 values above. Pure data
+// movement over exact-in-f32 integers, so they hold at every -O level.
+
+fn tr(a: [f32; 64], mut o: [f32; 64]) {
+    for i in 0..8 {
+        for j in 0..8 {
+            o[j * 8 + i] = a[i * 8 + j];
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 64] = [0.0; 64];
+    for i in 0..64 {
+        x[i] = (i + 1) as f32;
+    }
+    tr(x, x);
+    // Every lane, never a reduction: a partially-correct buffer passes a sum.
+    for i in 0..64 {
+        print(x[i] as i32);
+    }
+    return 0;
+}

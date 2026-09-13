@@ -35,6 +35,14 @@ module tests.run.alias_transpose_inplace
 // Expectations are the scalar nest by hand: `a[j*4+i] = a[i*4+j]` mirrors the UPPER triangle down,
 // because the read of `a[4]` at (i=1, j=0) happens after the write of `a[4]` at (i=0, j=1). Pure
 // data movement, so the values are exact at every -O level.
+//
+// THIS SIZE IS DEGENERATE ON THE NATIVE SIDE, so read it together with
+// `alias_transpose_inplace8.wk`. `transpose_rows_f32_avx2` needs an 8x8 tile; at 4x4 the kernel
+// falls back to the same scalar moves in the same i-outer/j-inner order the nest uses, so the
+// expected bytes above are also what the UNFIXED native backend printed. All of this fixture's
+// discriminating power is therefore in the interpreter column. The 8x8 twin is where the kernel
+// really fires (a true transpose on both backends if the decline ever regresses), and it is the one
+// that fails on both.
 
 fn tr(a: [f32; 16], mut o: [f32; 16]) {
     for i in 0..4 {

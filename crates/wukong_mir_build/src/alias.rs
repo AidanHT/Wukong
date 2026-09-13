@@ -55,20 +55,52 @@
 //! `f(p_i, p_j)`, then `f`'s corresponding params may alias too. Recursion terminates because the
 //! per-function fact is a single monotone bit.
 //!
+//! **The traversal is one exhaustive walk** ([`walk_block`] / [`walk_stmt`] / [`walk_expr`], feeding
+//! a single [`Node`] callback), and both `match`es over `StmtKind` and `ExprKind` are wildcard-free
+//! so a new AST node is a compile error here rather than a silent hole. That is not decoration: the
+//! first cut of this module had two overlapping walkers, one of which handed a block's `tail` only
+//! to the *statement* path, so `fn go(a, b, mut c) { mm(a, b, c) }` — the same call minus its
+//! semicolon — was invisible to the site collector and `mm` stayed "alias free". A `match` arm
+//! guard was invisible for the same reason. An analysis with a hole a formatting choice walks
+//! through is worse than no analysis, because it is trusted.
+//!
+//! # Two names for one buffer INSIDE a function
+//!
+//! The call-site fact above is only half of what `FnLowerer::all_provably_disjoint` needs; the other
+//! half is that two distinct operand *symbols* in one function body are distinct storage. That is
+//! not free either, because a `[]T` / `*T` / `&T` binding is a **view**: `lower_slice_from_source`
+//! stores the source's base pointer into the fat pointer ("no element copy"), so after
+//! `let mut sa: []f32 = a;` the names `sa` and `a` are one buffer, and a recognized nest written
+//! over both would dispatch a disjointness-requiring kernel over overlapping storage — with no call
+//! site aliasing anything, and in `main`, which has no parameters and is therefore *trivially*
+//! alias-free under the call-site fact alone.
+//!
+//! So a function that **publishes a second name** for storage it can already reach is not alias
+//! free either. Three spellings do that, and [`FnInfo::internal_view`] records all three:
+//!
+//! * `let v: []T/&T/*T = <place>;` — the view binding above (also recorded in `views`, because an
+//!   argument spelled with the view's name has to be resolved back to what it views before the
+//!   call-site test can see the aliasing).
+//! * an aggregate literal field initialised from such a place — `Layer { w: sa }` gives `l.w`, which
+//!   `FnLowerer::field_base` records as its own kernel-operand symbol `"<local>.<field>"`.
+//! * an assignment whose value is such a place — `p = &x;`.
+//!
+//! Every other aggregate `let` deep-copies (`emit_copy`, "the local owns its storage (value
+//! semantics)") and publishes nothing, which is why `let b: [f32; 4] = a;` and
+//! `let mut x: []f32 = alloc_f32(n);` leave the function alias free — the latter because
+//! `alloc_f32(n)` is `Fresh`, not a place. The taint is one bit for the whole function rather than
+//! a per-symbol set, for the same reason the call-site fact is (below).
+//!
 //! # Precision, and why the coarseness is affordable
 //!
 //! The fact exposed is one bit per function ([`AliasFacts::alias_free`]), not a pair set: a function
-//! that some call site can hand the same array twice gets no disjointness-requiring kernel *at all*.
-//! That is deliberate. A pair-precise fact would have to survive the trip into an outlined
-//! `@parallel` body (whose recognizers see `env` captures, not parameters) and into the recognizer
-//! probes (which build a `FnLowerer` with no parameter bindings at all), and each of those seams is
-//! a place to get it silently wrong. One bit that rides on `GemmSyms` — the struct whose own doc
-//! says it exists because it "is already threaded to every recognizer and every recognizer probe" —
-//! cannot be lost on the way down.
-//!
-//! The cost is bounded to functions that a call site really does alias, which in the 371-program
-//! corpus is one (`tests/run/embedding_alias_parallel.wk`). Every other function keeps every kernel
-//! it had, byte-for-byte.
+//! that some call site can hand the same array twice — or that names one buffer twice itself — gets
+//! no disjointness-requiring kernel *at all*. That is deliberate. A pair-precise fact would have to
+//! survive the trip into an outlined `@parallel` body (whose recognizers see `env` captures, not
+//! parameters) and into the recognizer probes (which build a `FnLowerer` with no parameter bindings
+//! at all), and each of those seams is a place to get it silently wrong. One bit that rides on
+//! `GemmSyms` — the struct whose own doc says it exists because it "is already threaded to every
+//! recognizer and every recognizer probe" — cannot be lost on the way down.
 //!
 //! # Known limits (all of them pre-existing holes this pass narrows rather than opens)
 //!
@@ -78,6 +110,16 @@
 //!   Kernel operands do not currently arrive that way.
 //! * Two *different constant* indices into one array (`f(m[0], m[1])`) are treated as may-alias,
 //!   because this pass does not evaluate index expressions.
+//! * An aggregate that **carries** a view into a callee is not seen through: with
+//!   `let l = Layer { w: sa };` (where `sa` views `a`), the call `f(l, a)` classifies `l` and `a` as
+//!   two roots, so `f` stays alias free even though `l.w` and `a` are one buffer. The *caller* is
+//!   tainted by the aggregate-literal rule above, so its own recognizers decline; the callee's do
+//!   not. Closing it needs a per-field view map rather than one bit and is not worth that today —
+//!   no corpus, example or bench program writes it — but it is a real hole, stated rather than
+//!   argued away.
+//! * Likewise a function returning an aggregate that contains a view: [`origin_of`] calls such a
+//!   return `Fresh` (the sret buffer really is fresh), and only a *borrowing* projection out of it
+//!   (`make().buf`) is demoted to `Unknown` by [`project`].
 
 use wukong_ast::{self as ast, Block, Expr, ExprKind, ForIter, Module, Stmt, StmtKind};
 use wukong_sema::{DefKind, SemaResult};
@@ -142,10 +184,12 @@ fn origins_may_overlap(a: &Origin, b: &Origin) -> bool {
     }
 }
 
-/// A call whose return value can hand back storage the callee did not create — a `[]T` slice, a raw
-/// pointer or a reference. An aggregate (`[T; N]`, `Tensor[..]`, a struct/tuple) returns through the
-/// sret ABI into a buffer the *caller* just allocated, so that one really is fresh.
-fn ret_is_borrowing(t: &Ty) -> bool {
+/// A type that hands back storage its holder did not create — a `[]T` slice, a raw pointer or a
+/// reference. Used two ways: a *call* whose return type is one of these can be handing back one of
+/// its own arguments, and a *binding* of one of these is a view of whatever it was initialised
+/// from. An aggregate (`[T; N]`, `Tensor[..]`, a struct/tuple) is neither: it returns through the
+/// sret ABI into a buffer the caller just allocated, and it deep-copies on `let`.
+fn ty_is_borrowing(t: &Ty) -> bool {
     matches!(t, Ty::Slice(_) | Ty::Ptr { .. } | Ty::Ref { .. })
 }
 
@@ -156,9 +200,9 @@ fn origin_of(e: &Expr, sema: &SemaResult) -> Origin {
             base: p.first().sym,
             proj: vec![],
         }),
-        ExprKind::Field { base, name } => project(base, Proj::Field(name.sym), sema),
-        ExprKind::TupleField { base, index } => project(base, Proj::Tuple(*index), sema),
-        ExprKind::Index { base, .. } => project(base, Proj::Index, sema),
+        ExprKind::Field { base, name } => project(e, base, Proj::Field(name.sym), sema),
+        ExprKind::TupleField { base, index } => project(e, base, Proj::Tuple(*index), sema),
+        ExprKind::Index { base, .. } => project(e, base, Proj::Index, sema),
         ExprKind::Unary {
             op: ast::UnOp::Ref | ast::UnOp::RefMut | ast::UnOp::Deref,
             expr,
@@ -172,7 +216,7 @@ fn origin_of(e: &Expr, sema: &SemaResult) -> Origin {
         // A call's value is fresh unless the callee's return type is a *borrowing* one, in which
         // case it can be one of the callee's own arguments coming back out.
         ExprKind::Call { .. } => match sema.types.get(&e.id) {
-            Some(t) if ret_is_borrowing(t) => Origin::Unknown,
+            Some(t) if ty_is_borrowing(t) => Origin::Unknown,
             Some(_) => Origin::Fresh,
             None => Origin::Unknown,
         },
@@ -184,12 +228,18 @@ fn origin_of(e: &Expr, sema: &SemaResult) -> Origin {
     }
 }
 
-fn project(base: &Expr, step: Proj, sema: &SemaResult) -> Origin {
+/// Extend the base's origin by one projection step. `whole` is the projected expression itself, and
+/// it is needed for exactly one case: a *borrowing* projection out of a **fresh** aggregate is NOT
+/// fresh. `make().buf` allocates its sret temporary here, but the `[]f32` inside it points at
+/// storage the callee already had, so propagating `Fresh` through the field would classify it as
+/// "storage nobody else holds" — the one answer that can never be walked back.
+fn project(whole: &Expr, base: &Expr, step: Proj, sema: &SemaResult) -> Origin {
     match origin_of(base, sema) {
         Origin::At(mut p) => {
             p.proj.push(step);
             Origin::At(p)
         }
+        Origin::Fresh if sema.types.get(&whole.id).is_some_and(ty_is_borrowing) => Origin::Unknown,
         other => other,
     }
 }
@@ -207,6 +257,11 @@ struct FnInfo {
     buffer_params: Vec<(usize, Symbol)>,
     /// Calls made from this function's body.
     sites: Vec<Site>,
+    /// The body publishes a second name for storage it can already reach — see the module doc's
+    /// "Two names for one buffer INSIDE a function". Kept out of the fixpoint deliberately: it says
+    /// nothing about whether this function's own *parameters* can be one array, which is the only
+    /// thing that forwards to a callee.
+    internal_view: bool,
 }
 
 /// The whole-program answer. See the module doc.
@@ -214,14 +269,18 @@ pub(crate) struct AliasFacts {
     /// Functions for which some call site can bind two DISTINCT buffer parameters to overlapping
     /// storage. Absence is the common case, so the set is normally empty.
     aliasing: HashSet<Symbol>,
+    /// Functions whose own body names one buffer twice. A separate concern from `aliasing`, ORed
+    /// into [`AliasFacts::alias_free`].
+    internal_views: HashSet<Symbol>,
 }
 
 impl AliasFacts {
     /// `true` when no two distinct buffer parameters of `f` can name overlapping storage at any call
-    /// site in the program — i.e. a recognizer inside `f` may rely on two distinct operand symbols
-    /// being distinct storage. Conservative: `false` also covers "could not tell".
+    /// site in the program, AND `f`'s own body does not give one buffer two names — i.e. a
+    /// recognizer inside `f` may rely on two distinct operand symbols being distinct storage.
+    /// Conservative: `false` also covers "could not tell".
     pub(crate) fn alias_free(&self, f: Symbol) -> bool {
-        !self.aliasing.contains(&f)
+        !self.aliasing.contains(&f) && !self.internal_views.contains(&f)
     }
 
     /// Run the analysis over a whole (import-merged, normalized) module.
@@ -256,22 +315,23 @@ impl AliasFacts {
                 .map(|(i, p)| (i, p.name.sym))
                 .collect();
 
-            // A `let` that binds a slice / pointer / reference is a *view* of its initializer's
-            // storage (`lower_slice_from_source` stores the source's base pointer into the fat
-            // pointer — "no element copy"), so an argument spelled with the view's name has to be
-            // resolved back to what it views. Every other aggregate `let` deep-copies
-            // (`emit_copy`, "the local owns its storage (value semantics)") and needs no entry.
-            let mut views: HashMap<Symbol, Place> = HashMap::default();
-            collect_views(body, sema, &mut views);
-
-            let mut sites = Vec::new();
-            collect_sites(body, sema, &views, &mut sites);
+            let (views, internal_view, mut sites) = scan_body(body, sema);
+            // Resolve each argument through the view map AFTER the walk rather than during it. The
+            // analysis is flow-insensitive either way, so a view declared textually below a call
+            // resolves identically — and doing it here is what lets ONE traversal do the job the
+            // first cut of this module needed two for.
+            for site in &mut sites {
+                for a in &mut site.args {
+                    *a = resolve_views(std::mem::replace(a, Origin::Unknown), &views);
+                }
+            }
 
             info.insert(
                 f.name.sym,
                 FnInfo {
                     buffer_params,
                     sites,
+                    internal_view,
                 },
             );
         }
@@ -301,8 +361,105 @@ impl AliasFacts {
                 break;
             }
         }
-        AliasFacts { aliasing }
+        let internal_views = info
+            .iter()
+            .filter(|(_, fi)| fi.internal_view)
+            .map(|(f, _)| *f)
+            .collect();
+        AliasFacts {
+            aliasing,
+            internal_views,
+        }
     }
+}
+
+/// One walk of one function body: the view bindings it introduces, whether it publishes a second
+/// name for storage it can already reach, and every call it makes (arguments unresolved).
+fn scan_body(body: &Block, sema: &SemaResult) -> (HashMap<Symbol, Place>, bool, Vec<Site>) {
+    let mut views: HashMap<Symbol, Place> = HashMap::default();
+    let mut internal_view = false;
+    let mut sites = Vec::new();
+    walk_block(body, &mut |n| match n {
+        Node::Stmt(s) => match &s.kind {
+            StmtKind::Let {
+                pat,
+                ty,
+                init: Some(e),
+                ..
+            } => {
+                let ast::PatKind::Ident(name) = &pat.kind else {
+                    return;
+                };
+                // A `let` binds a view when the BINDING borrows: written down (`let s: []f32 = a;`)
+                // or inferred from the initializer.
+                let annotated_view = ty.as_ref().is_some_and(|t| {
+                    matches!(
+                        &t.kind,
+                        ast::TypeKind::Slice(_)
+                            | ast::TypeKind::Pointer { .. }
+                            | ast::TypeKind::Ref { .. }
+                    )
+                });
+                let inferred_view = sema.types.get(&e.id).is_some_and(ty_is_borrowing);
+                if !(annotated_view || inferred_view) {
+                    return;
+                }
+                if let Origin::At(p) = origin_of(e, sema) {
+                    // Both halves, always together: the map is what lets a CALL SITE spelled with
+                    // the view's name be resolved back onto the storage it views, and the bit is
+                    // what stops a recognizer in THIS function from treating the two names as two
+                    // buffers.
+                    views.insert(*name, p);
+                    internal_view = true;
+                }
+            }
+            // `p = &x;` / `s = a;` — a borrowing place stored into a binding that already exists.
+            // Not recorded in `views` (that map is keyed by the name a `let` introduces, and
+            // resolving an assignment flow-insensitively would be a guess), but it does publish a
+            // second name, so it taints.
+            StmtKind::Assign { value, .. } => {
+                internal_view |= borrowing_place(value, sema);
+            }
+            _ => {}
+        },
+        Node::Expr(e) => match &e.kind {
+            // An aggregate literal that takes a borrowing place as a field value hands that storage
+            // a second name: `Layer { w: sa }` makes `l.w`, which `FnLowerer::field_base` records
+            // as its own kernel-operand symbol.
+            ExprKind::StructLit { fields, rest, .. } => {
+                internal_view |= fields.iter().any(|fi| borrowing_place(&fi.value, sema))
+                    || rest.as_deref().is_some_and(|r| borrowing_place(r, sema));
+            }
+            ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
+                internal_view |= xs.iter().any(|x| borrowing_place(x, sema));
+            }
+            ExprKind::ArrayRepeat { value, .. } => {
+                internal_view |= borrowing_place(value, sema);
+            }
+            ExprKind::Call { callee, args, .. } => {
+                let ExprKind::Path(p) = &callee.kind else {
+                    return;
+                };
+                if !p.is_single() {
+                    return;
+                }
+                sites.push(Site {
+                    callee: p.first().sym,
+                    args: args.iter().map(|a| origin_of(a, sema)).collect(),
+                });
+            }
+            _ => {}
+        },
+    });
+    (views, internal_view, sites)
+}
+
+/// Is `e` a *place* whose type borrows — the thing that, stored anywhere, gives one buffer a second
+/// name? `alloc_f32(n)` has a borrowing type but is not a place (it is `Fresh`), so it is not one,
+/// which is why the whole `alloc_*` corpus keeps its kernels.
+fn borrowing_place(e: &Expr, sema: &SemaResult) -> bool {
+    sema.types.get(&e.id).is_some_and(ty_is_borrowing)
+        && matches!(origin_of(e, sema), Origin::At(_))
 }
 
 /// Does this call site bind two distinct buffer parameters of the callee to overlapping storage?
@@ -337,65 +494,6 @@ fn both_root_at_buffer_params(a: &Origin, b: &Origin, caller: &FnInfo) -> bool {
     is_param(ra) && is_param(rb)
 }
 
-// ---- AST walk -------------------------------------------------------------------------------
-
-fn collect_views(b: &Block, sema: &SemaResult, out: &mut HashMap<Symbol, Place>) {
-    walk_block(b, &mut |s| {
-        if let StmtKind::Let {
-            pat,
-            ty,
-            init: Some(e),
-            ..
-        } = &s.kind
-        {
-            let ast::PatKind::Ident(name) = &pat.kind else {
-                return;
-            };
-            let annotated_view = ty.as_ref().is_some_and(|t| {
-                matches!(
-                    &t.kind,
-                    ast::TypeKind::Slice(_)
-                        | ast::TypeKind::Pointer { .. }
-                        | ast::TypeKind::Ref { .. }
-                )
-            });
-            let inferred_view = sema.types.get(&e.id).is_some_and(ret_is_borrowing);
-            if !(annotated_view || inferred_view) {
-                return;
-            }
-            if let Origin::At(p) = origin_of(e, sema) {
-                out.insert(*name, p);
-            }
-        }
-    });
-}
-
-fn collect_sites(
-    b: &Block,
-    sema: &SemaResult,
-    views: &HashMap<Symbol, Place>,
-    out: &mut Vec<Site>,
-) {
-    walk_block_exprs(b, &mut |e| {
-        let ExprKind::Call { callee, args, .. } = &e.kind else {
-            return;
-        };
-        let ExprKind::Path(p) = &callee.kind else {
-            return;
-        };
-        if !p.is_single() {
-            return;
-        }
-        out.push(Site {
-            callee: p.first().sym,
-            args: args
-                .iter()
-                .map(|a| resolve_views(origin_of(a, sema), views))
-                .collect(),
-        });
-    });
-}
-
 /// Rewrite a place rooted at a slice/pointer view back onto the storage it views, transitively
 /// (bounded, so a `let a = b; let b = a;` cycle the front end would have rejected cannot spin).
 fn resolve_views(o: Origin, views: &HashMap<Symbol, Place>) -> Origin {
@@ -419,182 +517,137 @@ fn resolve_views(o: Origin, views: &HashMap<Symbol, Place>) -> Origin {
     Origin::Unknown
 }
 
-fn walk_block(b: &Block, f: &mut impl FnMut(&Stmt)) {
+// ---- AST walk -------------------------------------------------------------------------------
+//
+// ONE traversal, both node kinds, no wildcard arms over `StmtKind`/`ExprKind`. The predecessor of
+// this walk had two mutually recursive halves — a statement walker and an expression walker — and a
+// block's `tail` reached only the first of them, so a call written without its trailing semicolon
+// was invisible to the site collector. Everything that carries a value out of a block (a `tail`, a
+// non-block `match` arm body, a `match` arm GUARD) is an expression position, and every expression
+// position has to reach the same callback a statement one does, or the fact this module computes is
+// a fact about formatting.
+
+/// One node of the walk. `Stmt` and `Expr` are both delivered because the two consumers want
+/// different halves: view bindings are statements, call sites are expressions.
+enum Node<'a> {
+    Stmt(&'a Stmt),
+    Expr(&'a Expr),
+}
+
+fn walk_block(b: &Block, f: &mut impl FnMut(Node<'_>)) {
     for s in &b.stmts {
-        f(s);
-        match &s.kind {
-            StmtKind::While { body, .. } | StmtKind::For { body, .. } => walk_block(body, f),
-            StmtKind::Let { init: Some(e), .. }
-            | StmtKind::Expr(e)
-            | StmtKind::Return(Some(e))
-            | StmtKind::Break(_, Some(e))
-            | StmtKind::Defer(e) => walk_expr_blocks(e, f),
-            StmtKind::Assign { target, value, .. } => {
-                walk_expr_blocks(target, f);
-                walk_expr_blocks(value, f);
-            }
-            _ => {}
-        }
-        if let StmtKind::For {
-            iter: ForIter::Expr(e),
-            ..
-        } = &s.kind
-        {
-            walk_expr_blocks(e, f);
-        }
+        walk_stmt(s, f);
     }
     if let Some(t) = &b.tail {
-        walk_expr_blocks(t, f);
+        walk_expr(t, f);
     }
 }
 
-/// Reach the blocks nested inside an expression (`if`, `match`, `loop`, a block expression) so a
-/// `let` or a call written there is not missed.
-fn walk_expr_blocks(e: &Expr, f: &mut impl FnMut(&Stmt)) {
+fn walk_stmt(s: &Stmt, f: &mut impl FnMut(Node<'_>)) {
+    f(Node::Stmt(s));
+    match &s.kind {
+        StmtKind::Let { init: opt, .. } | StmtKind::Return(opt) | StmtKind::Break(_, opt) => {
+            if let Some(e) = opt {
+                walk_expr(e, f);
+            }
+        }
+        StmtKind::Assign { target, value, .. } => {
+            walk_expr(target, f);
+            walk_expr(value, f);
+        }
+        StmtKind::Expr(e) | StmtKind::Defer(e) => walk_expr(e, f),
+        StmtKind::Continue(_) => {}
+        StmtKind::While { cond, body, .. } => {
+            walk_expr(cond, f);
+            walk_block(body, f);
+        }
+        StmtKind::For { iter, body, .. } => {
+            match iter {
+                ForIter::Range {
+                    start, end, step, ..
+                } => {
+                    walk_expr(start, f);
+                    if let Some(e) = end {
+                        walk_expr(e, f);
+                    }
+                    if let Some(e) = step {
+                        walk_expr(e, f);
+                    }
+                }
+                ForIter::Expr(e) => walk_expr(e, f),
+            }
+            walk_block(body, f);
+        }
+    }
+}
+
+fn walk_expr(e: &Expr, f: &mut impl FnMut(Node<'_>)) {
+    f(Node::Expr(e));
     match &e.kind {
+        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => walk_expr(expr, f),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            walk_expr(lhs, f);
+            walk_expr(rhs, f);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            walk_expr(callee, f);
+            for a in args {
+                walk_expr(a, f);
+            }
+        }
+        ExprKind::Index { base, indices } => {
+            walk_expr(base, f);
+            for i in indices {
+                walk_expr(i, f);
+            }
+        }
+        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => walk_expr(base, f),
+        ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
+            for x in xs {
+                walk_expr(x, f);
+            }
+        }
+        ExprKind::ArrayRepeat { value, count } => {
+            walk_expr(value, f);
+            walk_expr(count, f);
+        }
+        ExprKind::StructLit { fields, rest, .. } => {
+            for fi in fields {
+                walk_expr(&fi.value, f);
+            }
+            if let Some(r) = rest {
+                walk_expr(r, f);
+            }
+        }
         ExprKind::Block(b) | ExprKind::Loop { body: b, .. } => walk_block(b, f),
         ExprKind::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            walk_expr_blocks(cond, f);
+            walk_expr(cond, f);
             walk_block(then_branch, f);
-            if let Some(e) = else_branch {
-                walk_expr_blocks(e, f);
+            if let Some(x) = else_branch {
+                walk_expr(x, f);
             }
         }
         ExprKind::Match { scrutinee, arms } => {
-            walk_expr_blocks(scrutinee, f);
+            walk_expr(scrutinee, f);
             for a in arms {
-                walk_expr_blocks(&a.body, f);
-            }
-        }
-        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => walk_expr_blocks(expr, f),
-        ExprKind::Binary { lhs, rhs, .. } => {
-            walk_expr_blocks(lhs, f);
-            walk_expr_blocks(rhs, f);
-        }
-        ExprKind::Call { callee, args, .. } => {
-            walk_expr_blocks(callee, f);
-            for a in args {
-                walk_expr_blocks(a, f);
-            }
-        }
-        ExprKind::Index { base, indices } => {
-            walk_expr_blocks(base, f);
-            for i in indices {
-                walk_expr_blocks(i, f);
-            }
-        }
-        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
-            walk_expr_blocks(base, f)
-        }
-        ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
-            for x in xs {
-                walk_expr_blocks(x, f);
-            }
-        }
-        ExprKind::ArrayRepeat { value, count } => {
-            walk_expr_blocks(value, f);
-            walk_expr_blocks(count, f);
-        }
-        ExprKind::StructLit { fields, rest, .. } => {
-            for fi in fields {
-                walk_expr_blocks(&fi.value, f);
-            }
-            if let Some(r) = rest {
-                walk_expr_blocks(r, f);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Visit every expression in a block, including the ones nested in statements and in other
-/// expressions.
-fn walk_block_exprs(b: &Block, f: &mut impl FnMut(&Expr)) {
-    walk_block(b, &mut |s| match &s.kind {
-        StmtKind::Let { init: Some(e), .. }
-        | StmtKind::Expr(e)
-        | StmtKind::Return(Some(e))
-        | StmtKind::Break(_, Some(e))
-        | StmtKind::Defer(e) => walk_exprs(e, f),
-        StmtKind::Assign { target, value, .. } => {
-            walk_exprs(target, f);
-            walk_exprs(value, f);
-        }
-        StmtKind::While { cond, .. } => walk_exprs(cond, f),
-        StmtKind::For { iter, .. } => match iter {
-            ForIter::Range {
-                start, end, step, ..
-            } => {
-                walk_exprs(start, f);
-                if let Some(e) = end {
-                    walk_exprs(e, f);
+                if let Some(g) = &a.guard {
+                    walk_expr(g, f);
                 }
-                if let Some(e) = step {
-                    walk_exprs(e, f);
-                }
-            }
-            ForIter::Expr(e) => walk_exprs(e, f),
-        },
-        _ => {}
-    });
-}
-
-fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
-    f(e);
-    match &e.kind {
-        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => walk_exprs(expr, f),
-        ExprKind::Binary { lhs, rhs, .. } => {
-            walk_exprs(lhs, f);
-            walk_exprs(rhs, f);
-        }
-        ExprKind::Call { callee, args, .. } => {
-            walk_exprs(callee, f);
-            for a in args {
-                walk_exprs(a, f);
+                walk_expr(&a.body, f);
             }
         }
-        ExprKind::Index { base, indices } => {
-            walk_exprs(base, f);
-            for i in indices {
-                walk_exprs(i, f);
-            }
-        }
-        ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => walk_exprs(base, f),
-        ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
-            for x in xs {
-                walk_exprs(x, f);
-            }
-        }
-        ExprKind::ArrayRepeat { value, count } => {
-            walk_exprs(value, f);
-            walk_exprs(count, f);
-        }
-        ExprKind::StructLit { fields, rest, .. } => {
-            for fi in fields {
-                walk_exprs(&fi.value, f);
-            }
-            if let Some(r) = rest {
-                walk_exprs(r, f);
-            }
-        }
-        ExprKind::If {
-            cond, else_branch, ..
-        } => {
-            walk_exprs(cond, f);
-            if let Some(e) = else_branch {
-                walk_exprs(e, f);
-            }
-        }
-        ExprKind::Match { scrutinee, arms } => {
-            walk_exprs(scrutinee, f);
-            for a in arms {
-                walk_exprs(&a.body, f);
-            }
-        }
-        _ => {}
+        // Leaves. Spelled out rather than `_` so a new `ExprKind` is a compile error here.
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Path(_)
+        | ExprKind::SizeOf(_)
+        | ExprKind::AlignOf(_) => {}
     }
 }

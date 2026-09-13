@@ -2841,9 +2841,12 @@ struct GemmSyms {
     /// what `--backend=gpu-native` needs, since `VecKernelCall` carries Win64-ABI bytes no PTX
     /// backend can lower.
     vec_kernels: bool,
-    /// Whole-program answer to "can two DISTINCT buffer parameters of the function being lowered be
-    /// bound to the same storage at some call site?" — `true` means **no**, so two distinct operand
-    /// symbols are provably distinct storage and a kernel that requires disjointness may be emitted.
+    /// Whole-program answer to "can two DISTINCT names for a buffer in the function being lowered
+    /// reach the same storage?" — either because a call site binds two of its buffer parameters to
+    /// one array, or because its own body views one buffer under a second name (a `[]T`/`*T`/`&T`
+    /// `let`, or a borrowing place handed to an aggregate literal). `true` means **no**, so two
+    /// distinct operand symbols are provably distinct storage and a disjointness-requiring kernel
+    /// may be emitted.
     /// Computed once by [`alias::AliasFacts`] and set per function beside the `@generic` switch,
     /// for the reason `recognize` gives above: this struct already reaches every recognizer and
     /// every recognizer probe, so the fact cannot be dropped on the way down. `false` is the safe
@@ -9304,16 +9307,22 @@ impl FnLowerer<'_> {
     /// recognized transpose printed one answer on interp, a second natively and a third with
     /// recognition off. Declining restores the one answer the program actually has.
     ///
-    /// Two facts settle it, and both are needed:
+    /// Three facts settle it, and all three are needed:
     ///
     /// * Inside the function, two operands spelled with the SAME symbol are the same storage. That
-    ///   half was already tested by sixteen recognizers as `out == x`, and it is the weaker half —
-    ///   the guard's own doc at [`Self::emit_nonoverlapping_call`] says a symbol comparison "cannot
-    ///   decide this: two distinct array PARAMETERS can be bound to the same array at the call
-    ///   site."
+    ///   half was already tested by sixteen recognizers as `out == x`, and it is the weakest of the
+    ///   three — the guard's own doc at [`Self::emit_nonoverlapping_call`] says a symbol comparison
+    ///   "cannot decide this: two distinct array PARAMETERS can be bound to the same array at the
+    ///   call site."
     /// * Across functions, whether any call site does exactly that. `GemmSyms::alias_free` carries
     ///   the whole-program answer (see `alias.rs`); when it is `false`, nothing in this function is
     ///   provably disjoint from anything else and every such kernel declines.
+    /// * Inside the function again, whether two DIFFERENT symbols are one buffer. They are whenever
+    ///   the body binds a view — `let mut sa: []f32 = a;` stores `a`'s base pointer into `sa`'s fat
+    ///   pointer with no element copy — or hands a borrowing place to an aggregate literal
+    ///   (`Layer { w: sa }`, whose `l.w` is its own kernel-operand symbol). Without this the fast
+    ///   No-path is unsound in `main`, which has no parameters and so is trivially alias free under
+    ///   the call-site fact alone. `alias.rs` folds it into the same bit.
     ///
     /// Callers that are allowed *one* aliasing pair (a kernel documenting `dx` may alias `dy`) pass
     /// only the pairs that must be disjoint.
@@ -10059,9 +10068,18 @@ impl FnLowerer<'_> {
     /// Emit `wukong_cumsum_f32[_parallel](x, out, rows, cols)` for a recognized per-row prefix sum.
     /// Same `(ptr,ptr,i64,i64)` `sig_vmath` shape; the `_parallel` one maps rows across cores.
     fn emit_cumsum(&mut self, nest: &CumsumNest, parallel: bool) -> bool {
-        // cumsum.rs declares `x`/`out` non-overlapping: the Hillis-Steele row scan rereads
-        // earlier lanes of the row after writing them.
-        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
+        // NOT gated on [`Self::all_provably_disjoint`], and the reason is worth stating because an
+        // earlier revision of this file gated it on the OPPOSITE of what the runtime says.
+        // `wukong_cumsum_f32`'s own contract is "`x` and `out` must each be valid for `rows * cols`
+        // f32; they may be distinct or alias" (cumsum.rs:133-134), and the AVX2 row scan
+        // (`cumsum_row_avx2`) earns that: it loads an 8-lane block, scans it in registers, stores
+        // it, and moves on — it never rereads a lane it has written, and the scalar tail reads
+        // `x[i]` before writing `out[i]`. In place is therefore the same computation as out of
+        // place, exactly as it is for the index-aligned elementwise families (velem, vmath, axpby),
+        // which are not gated either. Only the `_parallel` entry says "non-overlapping", and that
+        // sentence is about the task ROW partition ("each row written by one task"), not about
+        // `x` vs `out`.
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
@@ -10127,8 +10145,12 @@ impl FnLowerer<'_> {
 
     /// Emit `wukong_cum{max,min}_f32[_parallel](x, out, rows, cols)` for a recognized cumulative max/min.
     fn emit_cumminmax(&mut self, nest: &CumMinMaxNest, parallel: bool) -> bool {
-        // cumminmax.rs declares `x`/`out` non-overlapping (same scan shape as cumsum).
-        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
+        // Not gated, for the same reason as `emit_cumsum` above: `wukong_cummax_f32` /
+        // `wukong_cummin_f32` both declare "`x` and `out` must each be valid for `rows * cols` f32;
+        // they may be distinct or alias" (cumminmax.rs:272, :285), and `cummm_row_avx2` has the
+        // same load-scan-store shape that earns it. The "non-overlapping" wording appears only on
+        // the three `_parallel` entries and is about the task row partition.
+        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
@@ -31248,6 +31270,188 @@ fn main() -> i32 {
         assert!(
             prog_calls(&prog, &interner, "wukong_sgemv"),
             "a disjoint GEMV must still dispatch"
+        );
+    }
+
+    /// **A call in TAIL position must be visible to the analysis.** `fn go(a, b, mut c) { mm(a, b,
+    /// c) }` — the same forwarding call minus its trailing semicolon — is stored as the block's
+    /// `tail`, not as a `StmtKind::Expr`. The first cut of `alias.rs` handed a `tail` only to its
+    /// statement walker, so the site was never collected: `mm` stayed "alias free", `emit_sgemm`
+    /// fired over `mm(x, y, x)`, and one keystroke reopened the exact defect the module exists to
+    /// close. Both spellings must give the same answer, or the fact is a fact about formatting.
+    #[test]
+    fn alias_analysis_sees_a_call_in_tail_position() {
+        let tail = format!(
+            "{MATMUL_SRC}fn go(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {{ mm(a, b, c) }}
+fn main() -> i32 {{
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut y: [f32; 16] = [0.0; 16];
+    go(x, y, x);
+    return 0;
+}}
+"
+        );
+        assert!(!alias_free_of(&tail, "go"), "go(x, y, x) aliases go");
+        assert!(
+            !alias_free_of(&tail, "mm"),
+            "go forwards its aliased params to mm through a TAIL call"
+        );
+        let (prog, diags, interner) = lower(&tail);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM reached through an aliased tail call must lower to the scalar nest, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // The identical program with a disjoint third argument must still dispatch, or the
+        // assertion above passes for the wrong reason.
+        let ok = tail.replace(
+            "go(x, y, x);",
+            "let mut z: [f32; 16] = [0.0; 16];\n    go(x, y, z);",
+        );
+        assert!(alias_free_of(&ok, "mm"), "go(x, y, z) binds three buffers");
+        let (prog, _d, interner) = lower(&ok);
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a disjoint tail call must still dispatch"
+        );
+    }
+
+    /// A call in a `match` arm GUARD is an expression position too, and the same two-walker split
+    /// skipped `arm.guard` entirely (it walked `scrutinee` and `arm.body` only).
+    #[test]
+    fn alias_analysis_sees_a_call_in_a_match_guard() {
+        let src = "module m
+fn touch(a: [f32; 4], b: [f32; 4], mut c: [f32; 4]) -> bool { c[0] = a[0] + b[0]; return true; }
+fn main() -> i32 {
+    let mut x: [f32; 4] = [0.0; 4];
+    let mut y: [f32; 4] = [0.0; 4];
+    let mut z: [f32; 4] = [0.0; 4];
+    let k: i32 = 1;
+    let r: i32 = match k { 1 if touch(x, y, ARG) => 1, _ => 0 };
+    return r;
+}
+";
+        assert!(
+            !alias_free_of(&src.replace("ARG", "x"), "touch"),
+            "touch(x, y, x) in a guard aliases params 0 and 2"
+        );
+        assert!(
+            alias_free_of(&src.replace("ARG", "z"), "touch"),
+            "touch(x, y, z) in a guard binds three buffers"
+        );
+    }
+
+    /// **Two DIFFERENT symbols can be one buffer inside one function**, which the call-site fact
+    /// alone cannot see — and `main`, having no parameters, is trivially alias free under it. A
+    /// `[]T` `let` is a view (`lower_slice_from_source` stores the source's base pointer, "no
+    /// element copy"), so a recognized transpose written over the view and its source is the
+    /// aliased transpose in disguise and must decline. The control is the identical nest with a
+    /// freshly allocated destination, which must still dispatch.
+    #[test]
+    fn recognizers_decline_over_a_slice_view_of_their_other_operand() {
+        let src = "module m
+fn main() -> i32 {
+    let r: i64 = 4;
+    let c: i64 = 4;
+    let mut x: []f32 = alloc_f32(r * c);
+    for i in 0..(r * c) { x[i] = (i as f32) + 1.0; }
+    let mut t: []f32 = DEST;
+    for i in 0..r { for j in 0..c { t[j * r + i] = x[i * c + j]; } }
+    for k in 0..(r * c) { print(t[k] as i32); }
+    return 0;
+}
+";
+        let viewed = src.replace("DEST", "x");
+        assert!(
+            !alias_free_of(&viewed, "main"),
+            "`let mut t: []f32 = x` gives one buffer two names"
+        );
+        let (prog, diags, interner) = lower(&viewed);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_transpose_f32"),
+            "a transpose whose destination views its source must lower to the scalar nest, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        let fresh = src.replace("DEST", "alloc_f32(r * c)");
+        assert!(
+            alias_free_of(&fresh, "main"),
+            "`alloc_f32` is fresh storage, not a view, or the whole slice corpus loses its kernels"
+        );
+        let (prog, _d, interner) = lower(&fresh);
+        assert!(
+            prog_calls(&prog, &interner, "wukong_transpose_f32"),
+            "a transpose into a fresh allocation must still dispatch"
+        );
+    }
+
+    /// The aggregate-literal spelling of the same hazard: a borrowing place handed to a struct
+    /// literal gives that storage a second kernel-operand name (`FnLowerer::field_base` records
+    /// `"<local>.<field>"`). A struct built from *values* copies and must not taint, or every
+    /// struct-using program would lose its kernels.
+    #[test]
+    fn a_struct_literal_built_from_a_slice_place_taints_but_one_built_from_values_does_not() {
+        let src = "module m
+struct L { w: []f32 }
+fn main() -> i32 {
+    let mut a: [f32; 4] = [1.0; 4];
+    let sa: []f32 = a;
+    let l: L = L { w: sa };
+    return l.w[0] as i32;
+}
+";
+        assert!(
+            !alias_free_of(src, "main"),
+            "a struct literal taking the slice view `sa` publishes a second name for `a`"
+        );
+
+        let copied = "module m
+struct L { w: [f32; 4] }
+fn main() -> i32 {
+    let a: [f32; 4] = [1.0; 4];
+    let l: L = L { w: a };
+    return l.w[0] as i32;
+}
+";
+        assert!(
+            alias_free_of(copied, "main"),
+            "a fixed-array field deep-copies (`emit_copy`, value semantics)"
+        );
+    }
+
+    /// The scans are NOT gated, and that is a claim about the runtime source, not a grep.
+    /// `wukong_cumsum_f32` and `wukong_cum{max,min}_f32` all document "`x` and `out` ... may be
+    /// distinct or alias", and their AVX2 rows load a block, scan it in registers and store it
+    /// without ever rereading a written lane. An in-place scan is a legitimate spelling and must
+    /// keep its kernel; an earlier revision of this file declined it on the opposite premise.
+    #[test]
+    fn an_in_place_scan_keeps_its_kernel() {
+        let src = "module m
+fn scan(mut x: []f32, mut o: []f32, r: i64, c: i64) {
+    for i in 0..r {
+        let mut acc: f32 = 0.0;
+        for j in 0..c { acc = acc + x[i * c + j]; o[i * c + j] = acc; }
+    }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(8);
+    scan(x, x, 2, 4);
+    return x[0] as i32;
+}
+";
+        assert!(
+            !alias_free_of(src, "scan"),
+            "scan(x, x) does alias, which is exactly the case that must still dispatch"
+        );
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_cumsum_f32"),
+            "cumsum tolerates aliasing by contract and must not be declined, got {:?}",
+            kernel_calls(&prog, &interner)
         );
     }
 }
