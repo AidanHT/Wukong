@@ -562,6 +562,7 @@ impl<'a> Vjp<'a> {
             Some(dc) => dc,
             None => return Ok(()), // output gradient is zero
         };
+        self.reject_inplace_matmul(a, b, c)?;
         let m = self.remap_v(args[3]);
         let k = self.remap_v(args[4]);
         let n = self.remap_v(args[5]);
@@ -604,6 +605,7 @@ impl<'a> Vjp<'a> {
             Some(dc) => dc,
             None => return Ok(()), // output gradient is zero
         };
+        self.reject_inplace_matmul(a, b, c)?;
         let m = self.remap_v(args[3]);
         let k = self.remap_v(args[4]);
         let n = self.remap_v(args[5]);
@@ -667,6 +669,25 @@ impl<'a> Vjp<'a> {
     /// `vmath(x, out, n, op)` computes `out = f(x)` elementwise. Backward `dx = dout (.) f'(x)`,
     /// emitted as one synthesized loop. relu uses the input `x` (`x>0`); the smooth ops reuse the
     /// forward *output* `out` (sigmoid' = y(1-y), tanh' = 1-y^2, exp' = y) so no recompute is needed.
+    ///
+    /// **An in-place activation is refused.** `wukong_vmath_f32` explicitly permits `out == x`
+    /// ("`x` and `out` may alias (the recognizer allows in-place activations)",
+    /// `wukong_runtime/src/vmath.rs`), so `x[i] = log(x[i])` is a legal forward. The buffer tape
+    /// cannot follow it: one forward buffer gets one gradient buffer, so `x` and `out` would have
+    /// to hold the input's adjoint and the output's at once. On top of that, every arm below that
+    /// loads the forward INPUT (log, leakyrelu, hardsigmoid, softsign, the inverse trigs, and the
+    /// fused `wukong_vmath2_f32` backward, which takes `x` as its first operand) would read `f(x)`.
+    ///
+    /// This refusal is a REWORDING, not a new gate, and the honest note matters: the aliased case
+    /// was already unreachable, because `buf_adj[out]` can only have been set by a consumer rule,
+    /// every one of which marks the buffer in `contributed` (or `diff_load` does), so `single(x)`
+    /// below already failed — with "receives multiple gradient contributions; accumulation is not
+    /// yet supported", which points at the wrong thing. Two reasons to state it here instead.
+    /// `single`'s message advertises itself as temporary: the day accumulation lands, the
+    /// coincidental guard evaporates and this becomes the silent wrong gradient it currently only
+    /// looks like. And a user who wrote an in-place activation should be told that, not sent
+    /// looking for a fan-out. (The out-of-place spelling of exactly this shape still
+    /// differentiates — see `kernel_output_read_by_scalar_load`.)
     fn diff_vmath(&mut self, args: &[ValueId]) -> Result<(), String> {
         let (x, out) = (args[0], args[1]);
         let dout = match self.buf_adj.get(&out).copied() {
@@ -679,6 +700,16 @@ impl<'a> Vjp<'a> {
             Some(dx) => dx,
             None => return Ok(()), // input not differentiated
         };
+        // Before `single`, so the aliasing is what gets reported.
+        if out == x {
+            return Err(format!(
+                "autodiff: vmath VJP cannot differentiate an in-place activation (op {op}: \
+                 the output buffer v{} aliases the input); one buffer cannot hold both the \
+                 input and the output adjoint, and every derivative that reads x would read \
+                 f(x) instead",
+                out.0
+            ));
+        }
         self.single(x)?;
         let xn = self.remap_v(x);
         // The smooth activations whose derivative is a transcendental (silu folds a sigmoid, gelu a
@@ -854,13 +885,38 @@ impl<'a> Vjp<'a> {
         Ok(())
     }
 
+    /// Both matmul VJPs read the forward operands back (`dA` reads `B`, `dB` reads `A`), so a GEMM
+    /// whose output buffer aliases either input hands them a buffer the forward has already
+    /// overwritten.
+    ///
+    /// Unlike `vmath` and `norm`, this one is a LIVE silent wrong gradient, not a reworded
+    /// refusal: the matmul rules are the only ones that do not go through `single` — they route
+    /// through `beta_for`, which merely *observes* `contributed` to choose `beta` — so nothing on
+    /// the path fails. With `c == a` the emitted `dA` is `sgemm(dC, B, dA, .., beta = 1)` where
+    /// `dA` and `dC` are the same buffer: a GEMM accumulating into the operand it is reading. Exit
+    /// 0, garbage numbers. Refuse.
+    fn reject_inplace_matmul(&self, a: ValueId, b: ValueId, c: ValueId) -> Result<(), String> {
+        if c == a || c == b {
+            return Err(format!(
+                "autodiff: matmul VJP cannot differentiate an in-place GEMM (output buffer \
+                 v{} aliases an input); both adjoints read the un-overwritten forward operands",
+                c.0
+            ));
+        }
+        Ok(())
+    }
+
     // --- row-wise normalization (softmax) ------------------------------------------------------
 
     /// `norm(x, out, rows, cols, eps_bits, op)` row-normalizes `x` (softmax / LayerNorm / RMSNorm).
     /// All three backward passes are per-row reductions (riding `sreduce`) plus an elementwise
-    /// combine, emitted as nested counted loops (rows x cols). LayerNorm/RMSNorm recompute the row
-    /// statistics from `x` (the forward kernel emits only `y`), so `x` must not be overwritten
-    /// in place by the forward norm.
+    /// combine, emitted as nested counted loops (rows x cols). LayerNorm/RMSNorm/L2-norm recompute
+    /// the row statistics from `x` (the forward kernel emits only `y`), so `x` must not be
+    /// overwritten in place by the forward norm — a requirement this doc comment used to state and
+    /// nothing enforced. It is now a refusal, worded like [`Vjp::diff_vmath`]'s and for the same
+    /// two reasons: the buffer tape has one gradient buffer per forward buffer, and `single`'s
+    /// pre-existing "multiple gradient contributions" message is both misleading here and
+    /// advertised as temporary.
     fn diff_norm(&mut self, args: &[ValueId]) -> Result<(), String> {
         let (x, out) = (args[0], args[1]);
         let op = self.const_i64(args[5])?;
@@ -872,6 +928,15 @@ impl<'a> Vjp<'a> {
             Some(dx) => dx,
             None => return Ok(()),
         };
+        if out == x {
+            return Err(format!(
+                "autodiff: norm VJP cannot differentiate an in-place norm (op {op}: the \
+                 output buffer v{} aliases the input); one buffer cannot hold both the input \
+                 and the output adjoint, and LayerNorm/RMSNorm/L2-norm recompute the row \
+                 statistics from x, which the kernel has already overwritten",
+                out.0
+            ));
+        }
         self.single(x)?;
         let xn = self.remap_v(x);
         let y = self.remap_v(out); // the forward normalized output
@@ -894,7 +959,21 @@ impl<'a> Vjp<'a> {
                 let eps = self.cf32(f32::from_bits(eps_bits) as f64);
                 match op {
                     NORM_LAYERNORM => {
-                        let cols_count = self.const_count(args[3], "norm")?;
+                        // CAPABILITY NARROWING, deliberate and loud: the stable centered variance
+                        // needs a `cols`-wide scratch holding `mu`, and a MIR alloca takes a
+                        // compile-time element count. So a LayerNorm whose `cols` is a symbolic
+                        // generic dim (`f<M,N>`, where `cols` arrives as a hidden i64 PARAM) now
+                        // declines where the old cancelling `E[x^2] - mu^2` form — which needed no
+                        // scratch — differentiated. That form is the defect this branch fixed; a
+                        // named refusal is the correct trade against a silently NaN gradient.
+                        // Lifting it needs a loop-carried accumulator `open_loop` does not have.
+                        let cols_count = self.const_count(args[3], "norm").map_err(|_| {
+                            "autodiff: the LayerNorm backward needs a compile-time-constant \
+                             `cols` — it allocates a cols-wide scratch holding the row mean, \
+                             so the variance is the stable centered form the forward kernel \
+                             evaluated; a symbolic generic row width is not supported"
+                                .to_string()
+                        })?;
                         self.layernorm_back(dy, dx, xn, y, rows, cols, eps, cols_count);
                     }
                     NORM_RMSNORM => {
@@ -936,6 +1015,14 @@ impl<'a> Vjp<'a> {
     /// One synthesized `rows x cols` pass materializes `xhat`, `dy(.)xhat` and `dxhat`; the norm
     /// backward then reuses [`Vjp::layernorm_back`] / [`Vjp::scale_norm_back`] unchanged, so the
     /// affine variant inherits their stable centered variance automatically.
+    ///
+    /// KNOWN LIMIT, recorded rather than assumed away: those three scratches are `rows*cols`
+    /// allocas in ONE frame, plus a `cols` one — a 512x768 residual block is ~4.7 MB of stack.
+    /// The interpreter's slot-indexed memory absorbs that and `--train` is interpreter-only today,
+    /// so it costs nothing now; the moment the backward gets a native path it is a stack overflow,
+    /// and the fix (calling `wukong_layernorm_bwd_f32` / `wukong_rmsnorm_bwd_f32`, which take
+    /// gamma directly and need no scratch at all) is the remaining half of P4.10. Whoever lands
+    /// the native `--train` path owns this.
     fn diff_norm_affine(&mut self, args: &[ValueId]) -> Result<(), String> {
         let (x, out, gamma, beta) = (args[0], args[1], args[2], args[3]);
         let op = self.const_i64(args[7])?;

@@ -395,8 +395,16 @@ impl<'a> Vjp<'a> {
             // A precision cast is the identity on values, so its VJP is the identity on adjoints —
             // routed back through the INVERSE cast so the contribution carries the operand's type
             // (an f32 adjoint added into an f64 adjoint would be a type-mismatched `fadd`, an ICE
-            // in the verifier). This is what makes a mixed-precision loss — the whole point of the
-            // bf16/f16 GEMM family — differentiable: `(x as bf16)` no longer stops the chain.
+            // in the verifier). A precision cast in the loss — `(x as f32)`, and the same MIR
+            // spelling for `(x as bf16)` / `(x as f16)` — therefore no longer stops the chain;
+            // before this arm it was a loud "no VJP rule for `fptrunc`".
+            //
+            // Scope, stated exactly, because the narrow claim is the true one: this differentiates
+            // a CAST. It does not make the bf16/f16 GEMM family differentiable — those kernels are
+            // not in `tape.rs`'s recognized set at all and still decline by name. And routing the
+            // adjoint back through the inverse cast QUANTIZES it to the narrow type (bf16 keeps 8
+            // mantissa bits), which is the arithmetic the forward actually performed, not an
+            // approximation this rule introduces.
             Op::Cast(kind, a, _) if matches!(kind, CastKind::FpTrunc | CastKind::FpExt) => {
                 let sty = self.fwd.value_type(*a).clone();
                 let back = if *kind == CastKind::FpTrunc {
@@ -412,7 +420,26 @@ impl<'a> Vjp<'a> {
             // differentiable when `n` does not const-fold.) The float -> int direction keeps the
             // loud refusal below: its derivative is zero almost everywhere and undefined on the
             // grid, and silently answering zero is the one thing this crate promises never to do.
-            Op::Cast(CastKind::SiToFp | CastKind::UiToFp, ..) => {}
+            //
+            // ...which is why terminating here is CONDITIONAL. A float -> int -> float round trip
+            // (`(x as i64) as f64`) would otherwise end the chain at the `sitofp` and never hand
+            // the `fptosi` an adjoint at all — and `diff_inst` skips any instruction whose adjoint
+            // is absent, so the loud `fptosi` refusal below becomes unreachable and dL/dx comes
+            // back zero at exit 0. Before this arm existed that composition was a loud
+            // "no VJP rule for `sitofp`"; it must stay loud.
+            Op::Cast(CastKind::SiToFp | CastKind::UiToFp, a, _) => {
+                if self.int_derives_from_float(*a) {
+                    return Err(format!(
+                        "autodiff: no VJP rule for a float -> int -> float round trip (v{} \
+                         feeds `{}` through an integer produced by `fptosi`/`fptoui`); \
+                         truncation has a derivative of zero almost everywhere and is \
+                         undefined on the grid, so terminating the adjoint here would \
+                         silently answer zero",
+                        old_r.0,
+                        op_name(&inst.op)
+                    ));
+                }
+            }
             // A constant is a leaf with no inputs: its adjoint terminates here (constants carry no
             // gradient). This is what lets an accumulator seeded `acc = 0.0` then folded with `fma`
             // differentiate cleanly — the seed const simply absorbs the residual adjoint.
@@ -426,6 +453,49 @@ impl<'a> Vjp<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Does the integer value `v` derive, through SSA arithmetic, from a **float -> int** cast?
+    ///
+    /// A depth-first walk over the forward block's defining ops, following the operands of the
+    /// integer forms lowering can put between an `fptosi`/`fptoui` and a later `sitofp` (`Bin`,
+    /// `Cmp`, `Neg`, `Not`, `Select`, `Fma`, a further `Cast`, `Splat`, `ExtractLane`). Anything
+    /// else — a constant, a parameter, a load, a call result — is an integer LEAF and carries no
+    /// gradient.
+    ///
+    /// The one hole this leaves is a value laundered through MEMORY (`store fptosi(x)` then a
+    /// separate `load`), which the straight-line model has no def-use edge for; that composition
+    /// still terminates at zero, and it is stated here rather than silently assumed away.
+    fn int_derives_from_float(&self, v: ValueId) -> bool {
+        let mut stack = vec![v];
+        let mut seen = HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            let Some(op) = self.def_op.get(&cur) else {
+                continue; // a parameter or block parameter: a leaf
+            };
+            match op {
+                Op::Cast(CastKind::FpToSi | CastKind::FpToUi, ..) => return true,
+                Op::Cast(_, a, _)
+                | Op::Neg(a)
+                | Op::Not(a)
+                | Op::Splat(a)
+                | Op::ExtractLane(a, _) => stack.push(*a),
+                Op::Bin(_, a, b) | Op::Cmp(_, a, b) => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                Op::Select(c, a, b) | Op::Fma(a, b, c) => {
+                    stack.push(*a);
+                    stack.push(*b);
+                    stack.push(*c);
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Route the adjoint `g` of a value loaded from a buffer into that buffer's gradient output,
