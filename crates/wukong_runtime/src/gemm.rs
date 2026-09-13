@@ -25,6 +25,33 @@
 //!
 //! The native backend calls this directly; the interpreter marshals its abstract memory into real
 //! buffers and calls the *same* function, so the differential oracle stays bit-for-bit exact.
+//!
+//! # The numeric contract
+//!
+//! `interp == native` holds only because both sides call one function. What that function *computes*
+//! is this, and it is a property of the build, not of the language:
+//!
+//!   * **Order.** For each `(i, j)` independently, K is split by [`select_kc`] into
+//!     `nb = ceil(k / select_kc(k))` blocks. Each block accumulates ascending `p` from a fresh `+0.0`
+//!     with **one rounding per step** (`vfmadd` on the AVX2 path, [`f32::mul_add`] in
+//!     [`sgemm_scalar`]), and is folded into `C` with one further rounding
+//!     (`beta_eff = 1.0` on every block after the first). `MC`, `NC`, the `MR×NR` register tile, the
+//!     packing and every parallel schedule only decide *which core computes which `(i, j)`* — none of
+//!     them touches the order, which is why serial, parallel and the AVX-512 twin are bit-identical.
+//!   * **Consequences.** The result is a function of `KC` (retuning it changes the low bits of every
+//!     GEMM in the project — hence `select_kc_partition_is_pinned`), and it is NOT a function of the
+//!     core count, the scheduler, the env knobs, or whether the AVX2 path or [`sgemm_scalar`] ran.
+//!   * **Error bound.** Every reference test asserts the bound this order earns, against an **f64**
+//!     reference: `|got − exact| ≤ γ_r · (Σ_p |a_ip|·|b_pj| + |β·c_ij|)` with
+//!     `r = kc + nb − 1 (+1 when β ≠ 0)` and `γ_r = r·u/(1−r·u)`, `u = 2⁻²⁴`. The `Σ|a||b|` growth
+//!     factor is netlib's Level-3 BLAS test criterion (`SMMCH` in `sblat3.f`, which normalizes by
+//!     `G(i) = Σ |A(i,k)|·|B(k,j)|`); `γ_r` is Higham, *Accuracy and Stability of Numerical
+//!     Algorithms*, 2nd ed., §3.1 (Lemma 3.1), specialized to this kernel's known rounding count
+//!     instead of netlib's implementation-agnostic `√u`.
+//!   * **The epilogue is exact, not approximate.** `act(α·(A·Bᵀ) + bias)` fused into the final-K-block
+//!     writeback is required to be **bit-identical** to the unfused `{ t = A·Bᵀ; act(α·t + bias) }`
+//!     (`sgemm_nt_epi_matches_reference`), which is what lets the interpreter use the serial fused
+//!     kernel as the oracle for a `@parallel` FFN.
 
 // Register-block tile: 6 rows × 16 cols. 16 cols = two 256-bit lanes, so the kernel keeps 12 `__m256`
 // accumulators live (of 16 ymm regs) — the proven Haswell/Zen sweet spot.
@@ -104,9 +131,17 @@ fn round_up(x: usize, m: usize) -> usize {
 /// thrashes L1 (~30% slower) and KC=256 under-amortizes the B-micropanel loads (and doubles the C
 /// re-stream passes), leaving ~10% on the table at ≥1024³. K is split into the fewest equal-ish blocks
 /// ≤ the cap, so k=512 → 2×256 (even) instead of 384+128 (a thin tail costing ~4%), while large K gets
-/// the full ~384. `kc` only changes how the K reduction is *grouped*: both kernels call this so serial
-/// stays bit-identical to parallel, and the grouping differs from KC=256 only in low f32 bits (within
-/// the √k·ε tolerance the gemm tests assert vs a naive reference). Result ∈ [4, KC].
+/// the full ~384. Result ∈ [4, KC].
+///
+/// **This is part of the kernel's observable result, not just its speed.** `kc` fixes how the K
+/// reduction is *grouped*: each block accumulates from a fresh zero and is folded into C with one
+/// extra rounding (`beta_eff = 1.0`), so retuning `KC` changes the low f32 bits of every GEMM in the
+/// project. Every kernel — serial, parallel, AVX2, [`sgemm_scalar`] — calls this one function, which
+/// is why they agree bit-for-bit; nothing makes one `KC` agree with another. The partition is
+/// therefore pinned BY VALUE in `select_kc_partition_is_pinned` so a retune is a reviewed diff, and
+/// the reference tests assert the bound this grouping actually earns (`γ_r·Σ|a||b|`, see the module
+/// header) — not the `1e-3·√k` absolute slack that stood here until 2026-09-13, which contained no ε
+/// at all and was 131-334× looser than the rounding scale of its own test data.
 #[inline]
 fn select_kc(k: usize) -> usize {
     let nblocks = k.div_ceil(KC).max(1);
@@ -2456,9 +2491,35 @@ unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     });
 }
 
-/// Portable reference: a straight triple loop (`C = A·B`, or `C = A·Bᵀ` when `bt`). Correct for any
-/// target; also the no-AVX fallback. Accumulation order differs from the blocked kernel, so it is
-/// only used where the AVX path is unavailable (the two agree within f32 tolerance in tests).
+/// The portable **bit-exact twin** of [`sgemm_avx2`] (`C = A·B`, or `C = A·Bᵀ` when `bt`) — the
+/// no-AVX fallback, and the ONLY GEMM path on a target without AVX2+FMA, since every non-`x86_64`
+/// build compiles the fast path out entirely.
+///
+/// **It was not a twin until 2026-09-13.** It summed the whole K into one non-fused accumulator with
+/// separate `*` and `+=` (Rust never contracts), while [`sgemm_avx2`] splits K by [`select_kc`] and
+/// uses `vfmadd`; the doc comment here recorded the divergence in a parenthetical ("the two agree
+/// within f32 tolerance in tests") and no test in the crate ever ran the two paths on the same
+/// inputs. That made the single most-used kernel in the project the one exception to the crate's
+/// invariant #1 — a machine without AVX2, or any `aarch64` build, computed a *different* matmul from
+/// the same `.wk` source — and because the interpreter and the native backend both go through the
+/// one dispatcher, no differential or invariance gate in the repo could observe it. It now mirrors
+/// the fast path step for step:
+///
+///   * the same K partition, `kc = (k − pc).min(select_kc(k))`, accumulating each block from a
+///     fresh `+0.0` (the microkernel's `_mm256_setzero_ps()`);
+///   * one rounding per K step: [`f32::mul_add`] is the portable spelling of `vfmadd` (`fmadd` on
+///     aarch64; a correctly-rounded `fmaf` call on an x86-64 build without the `fma` target
+///     feature, measured bit-identical to `_mm256_fmadd_ps` over 2M random accumulator chains on
+///     this host);
+///   * the same writeback rule, `beta_eff = if pc == 0 { beta } else { 1.0 }`, in which any
+///     non-zero `beta` means *accumulate* (it is a flag, never a scale);
+///   * the epilogue applied exactly once, on the final K-block, at the global column `j`.
+///
+/// Pinned by `sgemm_scalar_matches_avx2_bit_for_bit` (`to_bits()` equality across
+/// shape × `bt` × `beta` × epilogue, including two- and three-K-block shapes). The FMA lowers to a
+/// `libm` call on an x86-64 host built without `fma`, which is slow — but such a host has no FMA
+/// unit either, so there is no faster correctly-rounded option, and on any AVX2 box this function is
+/// unreachable outside its tests.
 #[allow(clippy::too_many_arguments)]
 fn sgemm_scalar(
     a: *const f32,
@@ -2474,27 +2535,30 @@ fn sgemm_scalar(
     unsafe {
         for i in 0..m {
             let crow = c.add(i * n);
-            if beta == 0.0 {
-                for j in 0..n {
-                    *crow.add(j) = 0.0;
-                }
-            }
             for j in 0..n {
-                let mut acc = 0.0f32;
-                for p in 0..k {
-                    let bjp = if bt {
-                        *b.add(j * k + p)
-                    } else {
-                        *b.add(p * n + j)
+                let cij = crow.add(j);
+                let mut pc = 0;
+                while pc < k {
+                    let kc = (k - pc).min(select_kc(k));
+                    let mut acc = 0.0f32;
+                    for p in pc..pc + kc {
+                        let bpj = if bt {
+                            *b.add(j * k + p)
+                        } else {
+                            *b.add(p * n + j)
+                        };
+                        acc = (*a.add(i * k + p)).mul_add(bpj, acc);
+                    }
+                    // First K-block honors the caller's beta; later blocks accumulate the partials.
+                    let beta_eff = if pc == 0 { beta } else { 1.0 };
+                    let val = if beta_eff == 0.0 { acc } else { *cij + acc };
+                    // The epilogue applies only once the K reduction is complete (`j` is global).
+                    *cij = match (pc + kc == k, epi) {
+                        (true, Some(e)) => e.apply(val, j),
+                        _ => val,
                     };
-                    acc += *a.add(i * k + p) * bjp;
+                    pc += kc;
                 }
-                let mut val = *crow.add(j) + acc;
-                // No K-blocking here, so the sum is final: fold in the epilogue (j is the global col).
-                if let Some(e) = epi {
-                    val = e.apply(val, j);
-                }
-                *crow.add(j) = val;
             }
         }
     }
@@ -3028,8 +3092,15 @@ unsafe fn micro_6x16(
     // Fused-epilogue fast path: a FULL 6×16 tile on the final K-block. Apply the beta rule, the per-
     // column bias (16 cols = two 256-bit lanes, broadcast identically across the 6 rows), and the
     // activation — all 256-bit, instead of the 96-element scalar spill+writeback below. Bit-identical
-    // to that scalar epilogue: `_mm256_max_ps`==`f32::max`, and `gelu8`/`silu8` mirror `gelu1`/`silu1`
-    // lane-for-lane (the vmath tail-match invariant), so the interpreter's scalar oracle still agrees.
+    // to that scalar epilogue, and `nt_epi_epilogue_is_bit_exact_on_non_finite_data` +
+    // `sgemm_nt_epi_matches_reference` now pin that rather than asserting it. The ReLU step needs
+    // care, because the crate's invariant #2 says `_mm256_max_ps` is NOT `f32::max` in general:
+    // `MAXPS` is `SRC1 > SRC2 ? SRC1 : SRC2`, so it returns SRC2 on a tie or a NaN. Here SRC2 is the
+    // zero vector, and on that one operand pair the two DO coincide for every f32 — `v > 0 ? v : 0`
+    // sends every NaN, every negative and both zeros to `+0.0`, which is exactly what Rust's
+    // `f32::max(v, 0.0)` returns (pinned over the hostile set by
+    // `relu_epilogue_vector_fold_matches_the_scalar_fold`). `gelu8`/`silu8` mirror `gelu1`/`silu1`
+    // lane-for-lane (the vmath tail-match invariant), so the interpreter's scalar oracle agrees.
     // The bias add is *skipped* (not added-as-zero) when null, matching `Epilogue::apply` on ±0.
     if let Some(e) = epi {
         if mr == MR && nr == NR {
@@ -3257,36 +3328,264 @@ mod tests {
         );
     }
 
-    /// Naive reference, distinct from both production paths, for validation.
-    fn naive(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-        let mut c = vec![0.0f32; m * n];
-        for i in 0..m {
-            for p in 0..k {
+    // ---- the numeric contract: an f64 reference and a bound DERIVED from the accumulation order --
+    //
+    // Until 2026-09-13 every vs-reference GEMM assertion in this file was
+    // `|got - want| <= 1e-3*sqrt(k) + 1e-4*|want|` against an **f32** `naive` that accumulated in the
+    // same precision as the thing it checked, so the oracle carried the same order of error as the
+    // kernel; `f32::EPSILON` appeared nowhere in the file and `as f64` appeared only inside two
+    // `#[ignore]`d throughput probes. Measured on the shipped shapes, that tolerance was 131x
+    // (128,256,512) to 334x (100,100,100) looser than the rounding scale of its own test data, and a
+    // GEMM that silently truncated every input to half precision passed it at every shape (0/65536,
+    // 0/1095, 0/10000 failing entries) - see `the_derived_bound_rejects_a_half_precision_gemm`.
+    //
+    // The replacement has two independently citable halves:
+    //
+    //   * the SCALING is netlib's Level-3 BLAS test criterion. `SMMCH` in `sblat3.f` accumulates a
+    //     growth factor `G(I) = G(I) + ABS(A(I,K))*ABS(B(K,J))` and normalizes the error by it. That
+    //     is the only scaling that survives cancellation - `|C|` itself does not, and with the fixed
+    //     `fill` below the C entries now cancel;
+    //   * the CONSTANT is Higham's `gamma_r = r*u/(1-r*u)` (Accuracy and Stability of Numerical
+    //     Algorithms, 2nd ed., Sec. 3.1, Lemma 3.1) with `r` the number of roundings THIS kernel's
+    //     accumulation order actually performs. netlib must use an implementation-agnostic `sqrt(u)`
+    //     because it cannot know the blocking; we do know it, so this bound is ~15x tighter than
+    //     netlib's at k=384 and 60-70x tighter than the constant it replaced.
+
+    /// Unit roundoff for binary32: `u = 2^-24`. (`f32::EPSILON` is `2^-23`, i.e. `2u`.)
+    fn unit_roundoff() -> f64 {
+        f64::from(f32::EPSILON) / 2.0
+    }
+
+    /// Higham's `gamma_r = r*u/(1-r*u)`: the relative bound on a product of `r` roundings.
+    fn gamma(r: usize) -> f64 {
+        let ru = r as f64 * unit_roundoff();
+        assert!(ru < 1.0, "gamma_r is undefined for r = {r} in binary32");
+        ru / (1.0 - ru)
+    }
+
+    /// How many roundings one product `a_ip*b_pj` passes through on its way into `C[i][j]`, read
+    /// straight off the kernel: `select_kc(k)` fused steps inside its own K-block (each `vfmadd` /
+    /// [`f32::mul_add`] rounds once), then one C-readback rounding per later K-block
+    /// (`beta_eff = 1.0`), plus one more when the caller's `beta` is non-zero so block 0 reads C too.
+    /// Retuning `KC` moves this number, which is the point: the bound records the grouping.
+    fn gemm_rounding_steps(k: usize, beta_nonzero: bool) -> usize {
+        let kc = select_kc(k).min(k);
+        let nb = k.div_ceil(kc);
+        kc + (nb - 1) + usize::from(beta_nonzero)
+    }
+
+    /// f64 reference for `C = A*B` (`bt == false`, B is `[k, n]`) or `C = A*B^T` (`bt == true`, B is
+    /// `[n, k]`), returning the result AND netlib `SMMCH`'s growth factor
+    /// `g[i*n+j] = sum_p |a_ip|*|b_pj|`. f64 carries 29 more mantissa bits than f32, so at the `k`
+    /// these tests reach the reference's own error is ~2^-29 of the bound it is used to police.
+    fn reference_f64(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        bt: bool,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut c = vec![0.0f64; m * n];
+        let mut g = vec![0.0f64; m * n];
+        if bt {
+            // Row `j` of B is contiguous: keep `p` innermost so both operand reads are unit-stride.
+            for i in 0..m {
                 for j in 0..n {
-                    c[i * n + j] += a[i * k + p] * b[p * n + j];
+                    let (mut acc, mut gacc) = (0.0f64, 0.0f64);
+                    for p in 0..k {
+                        let (av, bv) = (f64::from(a[i * k + p]), f64::from(b[j * k + p]));
+                        acc += av * bv;
+                        gacc += av.abs() * bv.abs();
+                    }
+                    c[i * n + j] = acc;
+                    g[i * n + j] = gacc;
+                }
+            }
+        } else {
+            // B is `[k, n]`: keep `j` innermost so the B row, `c` and `g` are all unit-stride.
+            for i in 0..m {
+                for p in 0..k {
+                    let av = f64::from(a[i * k + p]);
+                    let aav = av.abs();
+                    for j in 0..n {
+                        let bv = f64::from(b[p * n + j]);
+                        c[i * n + j] += av * bv;
+                        g[i * n + j] += aav * bv.abs();
+                    }
                 }
             }
         }
-        c
+        (c, g)
     }
 
+    /// [`reference_f64`] for `C = A^T*B`: A stored row-major `[k, m]`, B `[k, n]`, C `[m, n]`.
+    fn reference_tn_f64(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut c = vec![0.0f64; m * n];
+        let mut g = vec![0.0f64; m * n];
+        for p in 0..k {
+            for i in 0..m {
+                let av = f64::from(a[p * m + i]);
+                let aav = av.abs();
+                for j in 0..n {
+                    let bv = f64::from(b[p * n + j]);
+                    c[i * n + j] += av * bv;
+                    g[i * n + j] += aav * bv.abs();
+                }
+            }
+        }
+        (c, g)
+    }
+
+    /// The GEMM numeric contract: `|got - exact| <= gamma_r * (sum_p |a_ip||b_pj| + |beta*c_ij|)`.
+    /// `beta_c` is `Some(c_init)` exactly when the call ran with a non-zero `beta`, which both adds a
+    /// rounding and puts the incoming C into the growth factor (netlib scales `G` by
+    /// `ABS(BETA)*ABS(C)` for the same reason). Where the growth factor is zero the bound is zero and
+    /// exact equality is required: an all-zero set of products sums to exactly zero in any order.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_within_derived_bound(
+        got: &[f32],
+        want: &[f64],
+        growth: &[f64],
+        m: usize,
+        k: usize,
+        n: usize,
+        beta_c: Option<&[f32]>,
+        what: &str,
+    ) {
+        let r = gemm_rounding_steps(k, beta_c.is_some());
+        let g = gamma(r);
+        for i in 0..m * n {
+            let growth_i = growth[i] + beta_c.map_or(0.0, |c0| f64::from(c0[i].abs()));
+            let bound = g * growth_i;
+            let err = (f64::from(got[i]) - want[i]).abs();
+            assert!(
+                err <= bound,
+                "{what} ({m}x{k}x{n}) idx {i}: got {} want {} -> |err| {err:e} exceeds the derived \
+                 bound gamma_{r} * (sum|a||b| + |beta*c|) = {g:e} * {growth_i:e} = {bound:e}. \
+                 Either the accumulation order changed, or `gemm_rounding_steps` no longer matches \
+                 `select_kc`.",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    /// The fused epilogue `act(alpha*x + bias[j])`, transcribed independently of
+    /// [`Epilogue::apply`] so the two are a real pair rather than one expression called twice.
+    fn epilogue_ref(x: f32, j: usize, alpha: f32, bias: Option<&[f32]>, act: u32) -> f32 {
+        let mut y = if alpha != 1.0 { alpha * x } else { x };
+        if let Some(bs) = bias {
+            y += bs[j];
+        }
+        match act {
+            ACT_RELU => y.max(0.0),
+            ACT_GELU => crate::vmath::gelu1(y),
+            ACT_SILU => crate::vmath::silu1(y),
+            _ => y,
+        }
+    }
+
+    /// Deterministic pseudo-random values in `[-1, 1)`.
+    ///
+    /// The comment said `[-1, 1)` and the expression produced `[-1, 0)` until 2026-09-13: `s >> 33`
+    /// on a `u64` lies in `[0, 2^31)`, so `(s >> 33) / 2^31 - 1.0` never reached zero (measured over
+    /// 1000 samples: min -0.99923, max -0.00213, 0 of them >= 0). Every A and B entry being negative
+    /// made every product positive and every C entry a large positive sum, with two consequences that
+    /// silently deleted coverage: the fused-epilogue **ReLU was provably the identity** at every
+    /// shipped shape (0 of 65536 entries clamped, worst delta exactly 0.0), so the four activation
+    /// legs were four copies of a passthrough test; and the reduction never once cancelled, a
+    /// same-signed sum being the numerically easiest case there is - the second reason the retired
+    /// `1e-3*sqrt(k)` tolerance never bit. Only the scale changes here (`2^30`), so the same LCG
+    /// stream now spans the documented range.
     fn fill(seed: u64, n: usize) -> Vec<f32> {
-        // Deterministic pseudo-random-ish values in [-1, 1).
         let mut s = seed;
         (0..n)
             .map(|_| {
                 s = s
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
-                ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+                ((s >> 33) as f32 / (1u64 << 30) as f32) - 1.0
             })
             .collect()
+    }
+
+    /// The generator's range is load-bearing for the epilogue and cancellation coverage above, so it
+    /// is pinned rather than trusted to a comment.
+    #[test]
+    fn fill_spans_the_documented_range() {
+        let v = fill(7, 4096);
+        let min = v.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(min >= -1.0, "fill left [-1, 1): min {min}");
+        assert!(max < 1.0, "fill left [-1, 1): max {max}");
+        assert!(min < -0.9, "fill never approaches -1: min {min}");
+        assert!(max > 0.9, "fill never approaches +1: max {max}");
+        let negatives = v.iter().filter(|x| **x < 0.0).count();
+        assert!(
+            negatives > v.len() / 4 && negatives < 3 * v.len() / 4,
+            "fill is not sign-balanced ({negatives} of {} below zero) - the epilogue and \
+             cancellation coverage depend on it",
+            v.len()
+        );
+    }
+
+    /// The K partition is part of the kernel's observable result (see [`select_kc`]), so it is pinned
+    /// BY VALUE: a `KC` retune must show up as a reviewed diff here, not as a silent change to the
+    /// low bits of every GEMM in the project. Before this test the only in-test uses of `select_kc`
+    /// were `assert!(k > select_kc(k))` preconditions, which fail only if `KC` is RAISED.
+    #[test]
+    fn select_kc_partition_is_pinned() {
+        assert_eq!((MR, NR, MC, KC, NC), (6, 16, 144, 384, 4080));
+        for &(k, kc) in &[
+            (1usize, 4usize),
+            (4, 4),
+            (257, 260),
+            (300, 300),
+            (383, 384),
+            (384, 384),
+            (385, 196),
+            (391, 196),
+            (512, 256),
+            (805, 272),
+            (901, 304),
+            (1024, 344),
+        ] {
+            assert_eq!(select_kc(k), kc, "select_kc({k})");
+            assert!(
+                (4..=KC).contains(&select_kc(k)),
+                "select_kc({k}) left [4, KC]"
+            );
+        }
+        // The block count the derived error bound is built from, at the shapes the reference tests
+        // use. `select_kc(k).min(k)` is the real block height (`select_kc(1) == 4 > k`).
+        for &(k, nb) in &[
+            (1usize, 1usize),
+            (300, 1),
+            (384, 1),
+            (385, 2),
+            (391, 2),
+            (805, 3),
+            (901, 3),
+        ] {
+            assert_eq!(
+                k.div_ceil(select_kc(k).min(k)),
+                nb,
+                "K-block count for k={k}"
+            );
+        }
     }
 
     fn check(m: usize, k: usize, n: usize) {
         let a = fill(1, m * k);
         let b = fill(2, k * n);
-        let want = naive(&a, &b, m, k, n);
+        let (want, growth) = reference_f64(&a, &b, m, k, n, false);
         let mut got = vec![0.0f32; m * n];
         unsafe {
             wukong_sgemm(
@@ -3299,21 +3598,18 @@ mod tests {
                 0,
             );
         }
-        // Tolerance scales with K (the number of accumulated products).
-        let tol = 1e-3 * (k as f32).sqrt();
-        for i in 0..m * n {
-            assert!(
-                (got[i] - want[i]).abs() <= tol + 1e-4 * want[i].abs(),
-                "({m}x{k}x{n}) idx {i}: got {} want {}",
-                got[i],
-                want[i]
-            );
-        }
+        assert_within_derived_bound(&got, &want, &growth, m, k, n, None, "sgemm");
     }
 
     #[test]
     fn sgemm_matches_naive_various_sizes() {
-        // Sizes that exercise every MR=6 / NR=16 / MC=72 / KC=256 remainder, incl. 1-wide dims.
+        // Sizes that exercise every MR=6 / NR=16 / MC=144 / KC=384 remainder, incl. 1-wide dims.
+        // The last two are DERIVED from `KC` so a retune cannot vacate them the way the 2026-07 bump
+        // from KC=256 to KC=384 vacated the `k = 300`/`257` "the K loop blocks" claims elsewhere in
+        // this file. Before them, every reference-checked GEMM shape in the crate had k <= 300 < KC,
+        // `select_kc` always returned k, and the multi-K-block accumulation path - the
+        // `beta_eff = 1.0` C readback and the `is_last_k` epilogue gate - was never compared against
+        // anything but itself.
         for &(m, k, n) in &[
             (1, 1, 1),
             (1, 256, 1),
@@ -3327,36 +3623,79 @@ mod tests {
             (100, 100, 100),
             (128, 256, 512),
             (200, 200, 200),
+            (13, KC + 7, 19),      // 2 K-blocks
+            (40, 2 * KC + 37, 48), // 3 K-blocks, over full 6x16 tiles
         ] {
             check(m, k, n);
         }
     }
 
+    /// The derived bound must have teeth. Rounding EVERY A and B element to fp16 (11-bit mantissa)
+    /// before multiplying passed the retired `1e-3*sqrt(k)` tolerance at every shipped shape - 0 of
+    /// 65536 failing entries at (128,256,512), worst |err| 0.00575 against a tolerance of 0.016 -
+    /// i.e. a GEMM that silently truncated all of its inputs to half precision was indistinguishable
+    /// from a correct one. `gamma_r * sum|a||b|` must reject it.
     #[test]
-    fn sgemm_beta_accumulates() {
-        let (m, k, n) = (40, 50, 60);
-        let a = fill(3, m * k);
-        let b = fill(4, k * n);
-        let base = fill(5, m * n);
-        let want: Vec<f32> = {
-            let prod = naive(&a, &b, m, k, n);
-            base.iter().zip(&prod).map(|(x, y)| x + y).collect()
-        };
-        let mut got = base.clone();
+    fn the_derived_bound_rejects_a_half_precision_gemm() {
+        let (m, k, n) = (128usize, 256usize, 512usize);
+        let a = fill(1, m * k);
+        let b = fill(2, k * n);
+        let a_h: Vec<f32> = a.iter().map(|&x| crate::round_f16(x)).collect();
+        let b_h: Vec<f32> = b.iter().map(|&x| crate::round_f16(x)).collect();
+        let (want, growth) = reference_f64(&a, &b, m, k, n, false);
+        let mut got = vec![0.0f32; m * n];
         unsafe {
             wukong_sgemm(
-                a.as_ptr(),
-                b.as_ptr(),
+                a_h.as_ptr(),
+                b_h.as_ptr(),
                 got.as_mut_ptr(),
                 m as i64,
                 k as i64,
                 n as i64,
-                1,
+                0,
             );
         }
-        let tol = 1e-3 * (k as f32).sqrt();
-        for i in 0..m * n {
-            assert!((got[i] - want[i]).abs() <= tol + 1e-4 * want[i].abs());
+        let g = gamma(gemm_rounding_steps(k, false));
+        let rejected = (0..m * n)
+            .filter(|&i| (f64::from(got[i]) - want[i]).abs() > g * growth[i])
+            .count();
+        assert!(
+            rejected > 0,
+            "the derived bound accepted a GEMM whose every input was truncated to fp16 - it has no \
+             more teeth than the tolerance it replaced"
+        );
+    }
+
+    /// `beta != 0` accumulates onto the incoming C (it is a flag, never a scale). The second shape
+    /// is DERIVED from `KC` so the accumulate crosses K blocks - with `beta != 0` the FIRST block
+    /// reads C as well, and every later block re-reads the partial sum it just wrote
+    /// (`beta_eff = 1.0`). That is exactly the `+(nb-1) +1` half of the bound's rounding count, and
+    /// no reference test reached it while every checked shape had k <= 300 < KC = 384.
+    #[test]
+    fn sgemm_beta_accumulates() {
+        for &(m, k, n) in &[(40usize, 50usize, 60usize), (40, 2 * KC + 37, 48)] {
+            let a = fill(3, m * k);
+            let b = fill(4, k * n);
+            let base = fill(5, m * n);
+            let (prod, growth) = reference_f64(&a, &b, m, k, n, false);
+            let want: Vec<f64> = base
+                .iter()
+                .zip(&prod)
+                .map(|(x, y)| f64::from(*x) + y)
+                .collect();
+            let mut got = base.clone();
+            unsafe {
+                wukong_sgemm(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    got.as_mut_ptr(),
+                    m as i64,
+                    k as i64,
+                    n as i64,
+                    1,
+                );
+            }
+            assert_within_derived_bound(&got, &want, &growth, m, k, n, Some(&base), "sgemm beta=1");
         }
     }
 
@@ -3673,33 +4012,22 @@ mod tests {
         }
     }
 
-    /// `naive` for `C = A·Bᵀ` (B is `[n, k]`).
-    fn naive_nt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-        let mut c = vec![0.0f32; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0f32;
-                for p in 0..k {
-                    acc += a[i * k + p] * b[j * k + p];
-                }
-                c[i * n + j] = acc;
-            }
-        }
-        c
-    }
-
+    /// The `A·Bᵀ` (`nn.Linear`) form against the f64 reference at the derived bound, plus the
+    /// standing serial == parallel law. The last shape is DERIVED from `KC` so the K loop really
+    /// blocks; every shape here had k <= 256 < KC = 384 before 2026-09-13.
     #[test]
     fn sgemm_nt_matches_naive() {
         for (m, k, n) in [
-            (1, 1, 1),
+            (1usize, 1usize, 1usize),
             (7, 17, 13),
             (64, 64, 64),
             (100, 130, 96),
             (128, 256, 512),
+            (40, 2 * KC + 37, 48),
         ] {
             let a = fill(11, m * k);
             let b = fill(12, n * k);
-            let want = naive_nt(&a, &b, m, k, n);
+            let (want, growth) = reference_f64(&a, &b, m, k, n, true);
             let mut got = vec![0.0f32; m * n];
             let mut got_par = vec![0.0f32; m * n];
             unsafe {
@@ -3722,49 +4050,28 @@ mod tests {
                     0,
                 );
             }
-            let tol = 1e-3 * (k as f32).sqrt();
-            for i in 0..m * n {
-                assert!(
-                    (got[i] - want[i]).abs() <= tol + 1e-4 * want[i].abs(),
-                    "nt ({m}x{k}x{n}) idx {i}: got {} want {}",
-                    got[i],
-                    want[i]
-                );
-            }
+            assert_within_derived_bound(&got, &want, &growth, m, k, n, None, "sgemm_nt");
             assert_eq!(got, got_par, "nt serial vs parallel ({m}x{k}x{n})");
         }
     }
 
-    /// Naive `C = Aᵀ·B`: A stored row-major `[k, m]`, B `[k, n]`, C `[m, n]`.
-    fn naive_tn(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-        let mut c = vec![0.0f32; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut s = 0.0f32;
-                for p in 0..k {
-                    s += a[p * m + i] * b[p * n + j];
-                }
-                c[i * n + j] = s;
-            }
-        }
-        c
-    }
-
     #[test]
     fn sgemm_tn_matches_naive_and_transposed_nn() {
-        // The last tuple exceeds PAR_MIN_MACS (~74M MACs) so the multicore tn path actually runs;
-        // the rest straddle the MR=6 / NR=16 remainders.
+        // (520,264,540) exceeds PAR_MIN_MACS (~74M MACs) so the multicore tn path actually runs, and
+        // (40, 2*KC+37, 48) is DERIVED from `KC` so the K loop blocks; the rest straddle the MR=6 /
+        // NR=16 remainders.
         for (m, k, n) in [
-            (1, 1, 1),
+            (1usize, 1usize, 1usize),
             (5, 7, 3),
             (64, 64, 64),
             (100, 130, 96),
             (128, 256, 64),
+            (40, 2 * KC + 37, 48),
             (520, 264, 540),
         ] {
             let a = fill(21, k * m); // A stored [k, m]
             let b = fill(22, k * n); // B stored [k, n]
-            let want = naive_tn(&a, &b, m, k, n);
+            let (want, growth) = reference_tn_f64(&a, &b, m, k, n);
             let mut got = vec![0.0f32; m * n];
             let mut got_par = vec![0.0f32; m * n];
             unsafe {
@@ -3787,15 +4094,7 @@ mod tests {
                     0,
                 );
             }
-            let tol = 1e-3 * (k as f32).sqrt();
-            for i in 0..m * n {
-                assert!(
-                    (got[i] - want[i]).abs() <= tol + 1e-4 * want[i].abs(),
-                    "tn ({m}x{k}x{n}) idx {i}: got {} want {}",
-                    got[i],
-                    want[i]
-                );
-            }
+            assert_within_derived_bound(&got, &want, &growth, m, k, n, None, "sgemm_tn");
             // Bit-exact against the NN kernel on a manually-transposed A — proves the only difference
             // from the differential-contract kernel is the (deterministic) transpose prepass.
             let mut at = vec![0.0f32; m * k];
@@ -5185,61 +5484,169 @@ mod tests {
         }
     }
 
-    /// Fused-epilogue `C = act(A·Bᵀ + bias)` matches computing the GEMM then applying the epilogue
-    /// separately, for {identity, ReLU} × {bias, no-bias}. The `k = 300`/`257` sizes exceed `KC=256`
-    /// so the K loop blocks — verifying the epilogue is applied exactly once, on the final K-block,
-    /// not per-block (a per-block bug would add the bias / clamp repeatedly).
+    /// The fused epilogue is **bit-identical** to the unfused sequence, not merely close to it:
+    /// `wukong_sgemm_nt_epi(A, B, bias, act)` must equal `act(wukong_sgemm_nt(A, B) + bias)` to the
+    /// last bit, for {identity, ReLU, GELU, SiLU} x {bias, no-bias}. That is the law the interpreter
+    /// depends on when it uses the serial fused kernel as the oracle for a `@parallel` FFN, and it
+    /// holds by construction: with `beta = 0` the value the final K-block writes back before the
+    /// epilogue is exactly what the plain `nt` kernel stores, so fusing may not perturb it.
+    ///
+    /// It replaces a comparison against an f32 `naive_nt` at `1e-3*sqrt(k)`, which was blind twice
+    /// over. (1) The tolerance could not see the vector epilogue at all: the full-6x16 writeback
+    /// applies `_mm256_max_ps` / `gelu8` / `silu8` where the edge-tile path applies `f32::max` /
+    /// `gelu1` / `silu1`, and a lane-for-lane divergence between those is far below `1e-3*sqrt(k)`.
+    /// (2) With the pre-fix `fill` producing values in `[-1, 0)`, every C entry was a large positive
+    /// sum and ReLU was *provably the identity* at every shape here (min base 2.54 / 9.85 / 63.02 /
+    /// 52.70; 0 of 91, 4096, 1920 and 4000 entries clamped in both the bias and no-bias legs), so
+    /// the four activation legs were four copies of a passthrough test - hence the explicit
+    /// `clamped > 0` guard below.
+    ///
+    /// The `k = 300` / `257` shapes do NOT block the K loop and have not since KC went 256 -> 384
+    /// (`select_kc(300) == 300`, `select_kc(257) == 260`), which silently vacated this test's stated
+    /// purpose; `(40, 2*KC + 37, 48)` is derived from the live constant so a retune cannot vacate it
+    /// again.
     #[test]
     fn sgemm_nt_epi_matches_reference() {
-        for &(m, k, n) in &[(7, 17, 13), (64, 64, 64), (40, 300, 48), (50, 257, 80)] {
+        for &(m, k, n) in &[
+            (7usize, 17usize, 13usize),
+            (64, 64, 64),
+            (40, 300, 48),
+            (50, 257, 80),
+            (40, 2 * KC + 37, 48), // 3 K-blocks: the epilogue must fire on the LAST one only
+        ] {
             let a = fill(11, m * k);
             let b = fill(12, n * k);
             let bias = fill(13, n);
-            let base = naive_nt(&a, &b, m, k, n); // C = A·Bᵀ
+            let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+            // The unfused leg. Its own agreement with an f64 reference is `sgemm_nt_matches_naive`'s
+            // job; the point here is that folding the epilogue into the final-K-block writeback
+            // changes nothing about the sum.
+            let mut base = vec![0.0f32; m * n];
+            unsafe {
+                wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), base.as_mut_ptr(), mi, ki, ni, 0);
+            }
             for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
                 for use_bias in [false, true] {
-                    let mut want = base.clone();
-                    for i in 0..m {
-                        for j in 0..n {
-                            let mut v = want[i * n + j];
-                            if use_bias {
-                                v += bias[j];
-                            }
-                            v = match act {
-                                ACT_RELU => v.max(0.0),
-                                ACT_GELU => crate::vmath::gelu1(v),
-                                ACT_SILU => crate::vmath::silu1(v),
-                                _ => v,
-                            };
-                            want[i * n + j] = v;
-                        }
-                    }
-                    let mut got = vec![0.0f32; m * n];
                     let bias_ptr = if use_bias {
                         bias.as_ptr()
                     } else {
                         std::ptr::null()
                     };
+                    let bias_ref = if use_bias { Some(&bias[..]) } else { None };
+                    let mut got = vec![0.0f32; m * n];
                     unsafe {
                         wukong_sgemm_nt_epi(
                             a.as_ptr(),
                             b.as_ptr(),
                             got.as_mut_ptr(),
-                            m as i64,
-                            k as i64,
-                            n as i64,
+                            mi,
+                            ki,
+                            ni,
                             0,
                             bias_ptr,
                             act as i64,
                         );
                     }
-                    let tol = 1e-3 * (k as f32).sqrt();
-                    for idx in 0..m * n {
-                        assert!(
-                            (got[idx] - want[idx]).abs() <= tol + 1e-4 * want[idx].abs(),
-                            "epi (m{m} k{k} n{n} act{act} bias{use_bias}) idx {idx}: got {} want {}",
+                    let mut clamped = 0usize;
+                    for i in 0..m {
+                        for j in 0..n {
+                            let idx = i * n + j;
+                            let pre = base[idx] + bias_ref.map_or(0.0, |bs| bs[j]);
+                            if pre < 0.0 {
+                                clamped += 1;
+                            }
+                            let want = epilogue_ref(base[idx], j, 1.0, bias_ref, act);
+                            assert_eq!(
+                                got[idx].to_bits(),
+                                want.to_bits(),
+                                "fused != unfused (m{m} k{k} n{n} act{act} bias{use_bias}) idx \
+                                 {idx}: got {} want {want}",
+                                got[idx]
+                            );
+                        }
+                    }
+                    assert!(
+                        clamped > 0,
+                        "no entry of C is negative at (m{m} k{k} n{n} bias{use_bias}) - the ReLU \
+                         leg of this test is the identity and every activation is untested, which \
+                         is exactly the state the `[-1, 0)` `fill` left it in"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fused epilogue on non-finite data, over a 12x32 C so every tile is a FULL 6x16 and the
+    /// 256-bit vector writeback (`_mm256_add_ps` for the bias, `_mm256_max_ps` for the ReLU) is what
+    /// runs - the path no test could reach before, because the generator could not produce a
+    /// non-positive C, let alone a NaN.
+    ///
+    /// Non-finite values live only in A and B, never in `bias`: both legs then compute the SAME
+    /// accumulator bits (same kernel, same inputs), so any NaN reaching the epilogue comes from the
+    /// accumulator and no comparison depends on which operand of an `addps` a payload is taken from.
+    /// Restricted to identity and ReLU on purpose: whether `gelu8`/`silu8` mirror `gelu1`/`silu1` on
+    /// NaN and +/-inf is `vmath`'s tail-match invariant, not this kernel's, and `vmath.rs` is not
+    /// this change's to touch.
+    #[test]
+    fn nt_epi_epilogue_is_bit_exact_on_non_finite_data() {
+        let (m, k, n) = (12usize, 5usize, 32usize);
+        let mut a = fill(301, m * k);
+        let mut b = fill(302, n * k);
+        a[0] = f32::NAN;
+        a[3] = f32::INFINITY;
+        a[k] = f32::NEG_INFINITY;
+        a[2 * k + 1] = -f32::NAN;
+        b[2] = f32::INFINITY;
+        b[k + 1] = f32::NEG_INFINITY;
+        b[3 * k] = f32::NAN;
+        let mut bias = fill(303, n);
+        bias[0] = 0.0;
+        bias[1] = -0.0;
+        bias[2] = f32::MIN_POSITIVE;
+        bias[3] = -f32::MIN_POSITIVE;
+        let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+        let mut base = vec![0.0f32; m * n];
+        unsafe {
+            wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), base.as_mut_ptr(), mi, ki, ni, 0);
+        }
+        assert!(
+            base.iter().any(|v| v.is_nan()) && base.iter().any(|v| v.is_infinite()),
+            "the non-finite operands did not reach C - this test would be vacuous"
+        );
+        for &act in &[ACT_IDENTITY, ACT_RELU] {
+            for use_bias in [false, true] {
+                let bias_ptr = if use_bias {
+                    bias.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                let bias_ref = if use_bias { Some(&bias[..]) } else { None };
+                let mut got = vec![0.0f32; m * n];
+                unsafe {
+                    wukong_sgemm_nt_epi(
+                        a.as_ptr(),
+                        b.as_ptr(),
+                        got.as_mut_ptr(),
+                        mi,
+                        ki,
+                        ni,
+                        0,
+                        bias_ptr,
+                        act as i64,
+                    );
+                }
+                for i in 0..m {
+                    for j in 0..n {
+                        let idx = i * n + j;
+                        let want = epilogue_ref(base[idx], j, 1.0, bias_ref, act);
+                        assert_eq!(
+                            got[idx].to_bits(),
+                            want.to_bits(),
+                            "non-finite fused epilogue (act{act} bias{use_bias}) idx {idx}: got \
+                             {} ({:08x}) want {want} ({:08x})",
                             got[idx],
-                            want[idx]
+                            got[idx].to_bits(),
+                            want.to_bits()
                         );
                     }
                 }
@@ -5247,79 +5654,273 @@ mod tests {
         }
     }
 
-    /// [`sgemm_scalar`] — the portable fallback, and the ONLY GEMM path on a target without
-    /// AVX2+FMA (every non-x86_64 build compiles the whole fast path out) — had no test at all:
-    /// its sole caller is the feature dispatch in [`gemm_dispatch`], which on any AVX2 host takes
-    /// the other branch, so `cargo test -p wukong_runtime` never executed a single line of it.
+    /// The vector epilogue's ReLU is `_mm256_max_ps(v, 0)` while the edge-tile and scalar-twin
+    /// epilogue is `f32::max(v, 0.0)`, and the crate's invariant #2 says those are NOT the same
+    /// function: `MAXPS` is `SRC1 > SRC2 ? SRC1 : SRC2`, so it returns SRC2 on a tie or a NaN, which
+    /// is why `cumminmax.rs` writes its twin `(a > b) ? a : b` rather than `f32::max`. Against the
+    /// one operand pair the GEMM actually uses - SRC2 = `+0.0` - they do coincide for every f32, and
+    /// that is what the fused-vs-unfused law rests on, so it is pinned here over the hostile set
+    /// rather than asserted in a comment.
+    ///
+    /// (`-0.0` is separately unreachable as an epilogue input through any public entry: the
+    /// accumulator starts at `+0.0` and `fma(a, b, +0.0)` cannot return `-0.0`, `x + (+0.0)` is
+    /// never `-0.0`, and `nt_epi` fixes `alpha = 1`. It is checked anyway.)
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn relu_epilogue_vector_fold_matches_the_scalar_fold() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return; // no vector epilogue on this host; the scalar fold is the only one that runs
+        }
+        let epi = Epilogue {
+            bias: std::ptr::null(),
+            act: ACT_RELU,
+            alpha: 1.0,
+        };
+        for &v in &[
+            0.0f32,
+            -0.0,
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.0,
+            -1.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            f32::MAX,
+            f32::MIN,
+        ] {
+            // SAFETY: avx2 just feature-detected; `bias` is null so `apply` dereferences nothing.
+            let (scalar, vector) = unsafe {
+                use std::arch::x86_64::*;
+                let r = _mm256_max_ps(_mm256_set1_ps(v), _mm256_setzero_ps());
+                let mut lanes = [0.0f32; 8];
+                _mm256_storeu_ps(lanes.as_mut_ptr(), r);
+                (epi.apply(v, 0), lanes[0])
+            };
+            assert_eq!(
+                scalar.to_bits(),
+                vector.to_bits(),
+                "relu fold disagrees on {v} ({:08x}): scalar {scalar} ({:08x}) vs _mm256_max_ps \
+                 {vector} ({:08x})",
+                v.to_bits(),
+                scalar.to_bits(),
+                vector.to_bits()
+            );
+        }
+    }
+
+    /// **Invariant #1 for the flagship kernel.** Every other AVX2 family in this crate has a scalar
+    /// twin it agrees with bit-for-bit (`reduce.rs`'s `scalar_matches_avx2_bit_for_bit` asserts
+    /// `to_bits()` equality), and the GEMM was the one exception: [`sgemm_scalar`] summed the whole
+    /// K into a single non-fused accumulator while [`sgemm_avx2`] blocks K by [`select_kc`] and uses
+    /// `vfmadd`, its own doc comment recorded the divergence, and `grep sgemm_scalar` found exactly
+    /// one test - against `naive` at `1e-3*sqrt(k)`, never against the AVX2 path. A machine without
+    /// AVX2, or any `aarch64` build, therefore computed a different matmul from the same `.wk`
+    /// source, and no gate in the repo could see it because interp and native share the dispatcher.
+    ///
+    /// Both kernels are private and take the same argument list, so this drives them directly over
+    /// shape x `bt` x `beta` x epilogue and asserts `to_bits()` equality. The shapes cover a 1x1x1,
+    /// remainder-only tiles, exactly one full 6x16 tile, an `m` past `MC = 144`, and two- and
+    /// three-K-block reductions derived from `KC`. `alpha != 1` is paired only with `beta == 0`, the
+    /// combination the ABI supports.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sgemm_scalar_matches_avx2_bit_for_bit() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return; // nothing to compare against: this host runs `sgemm_scalar` for everything
+        }
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (7, 17, 13), // remainder tiles only
+            (6, 16, 5),  // exactly one FULL 6x16 tile (the vector writeback fast path)
+            (13, 19, 4),
+            (150, 20, 20),         // m past MC = 144
+            (13, KC + 7, 19),      // 2 K-blocks
+            (13, 2 * KC + 37, 19), // 3 K-blocks
+        ] {
+            let a = fill(201, m * k);
+            let b = fill(202, k * n); // same length either way: `bt` reads it as [n, k]
+            let bias = fill(203, n);
+            let c_init = fill(204, m * n);
+            for bt in [false, true] {
+                for &beta in &[0.0f32, 1.0] {
+                    let mut epis: Vec<Option<Epilogue>> = vec![
+                        None,
+                        Some(Epilogue {
+                            bias: std::ptr::null(),
+                            act: ACT_RELU,
+                            alpha: 1.0,
+                        }),
+                        Some(Epilogue {
+                            bias: bias.as_ptr(),
+                            act: ACT_IDENTITY,
+                            alpha: 1.0,
+                        }),
+                        Some(Epilogue {
+                            bias: bias.as_ptr(),
+                            act: ACT_RELU,
+                            alpha: 1.0,
+                        }),
+                        Some(Epilogue {
+                            bias: bias.as_ptr(),
+                            act: ACT_GELU,
+                            alpha: 1.0,
+                        }),
+                        Some(Epilogue {
+                            bias: bias.as_ptr(),
+                            act: ACT_SILU,
+                            alpha: 1.0,
+                        }),
+                    ];
+                    if beta == 0.0 {
+                        // alpha scales the beta-accumulated value, so a non-unit alpha is only
+                        // meaningful with beta == 0 (see the debug_assert in `gemm_dispatch`).
+                        epis.push(Some(Epilogue {
+                            bias: bias.as_ptr(),
+                            act: ACT_RELU,
+                            alpha: -2.5,
+                        }));
+                    }
+                    for epi in epis {
+                        let mut cs = c_init.clone();
+                        let mut cv = c_init.clone();
+                        sgemm_scalar(
+                            a.as_ptr(),
+                            b.as_ptr(),
+                            cs.as_mut_ptr(),
+                            m,
+                            k,
+                            n,
+                            beta,
+                            bt,
+                            epi,
+                        );
+                        // SAFETY: avx2+fma just feature-detected; the buffers are sized m*k, k*n,
+                        // m*n exactly as the kernel contract requires.
+                        unsafe {
+                            sgemm_avx2(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                cv.as_mut_ptr(),
+                                m,
+                                k,
+                                n,
+                                beta,
+                                bt,
+                                epi,
+                            );
+                        }
+                        let (act, has_bias, alpha) = epi.map_or((u32::MAX, false, 1.0), |e| {
+                            (e.act, !e.bias.is_null(), e.alpha)
+                        });
+                        for idx in 0..m * n {
+                            assert_eq!(
+                                cs[idx].to_bits(),
+                                cv[idx].to_bits(),
+                                "scalar twin != avx2 (m{m} k{k} n{n} bt{bt} beta{beta} act{act} \
+                                 bias{has_bias} alpha{alpha}) idx {idx}: scalar {} ({:08x}) vs \
+                                 avx2 {} ({:08x})",
+                                cs[idx],
+                                cs[idx].to_bits(),
+                                cv[idx],
+                                cv[idx].to_bits()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`sgemm_scalar`] - the portable twin, and the ONLY GEMM path on a target without AVX2+FMA
+    /// (every non-`x86_64` build compiles the whole fast path out) - had no test at all before
+    /// 2026-07: its sole caller is the feature dispatch in [`gemm_dispatch`], which on any AVX2 host
+    /// takes the other branch, so `cargo test -p wukong_runtime` never executed a single line of it.
     /// Verified by mutation: transposing the two arms of its `bt` select (`*b.add(j*k+p)` vs
     /// `*b.add(p*n+j)`) left all 197 tests green while every `nn.Linear` off-AVX2 would return
-    /// garbage. This calls the private kernel directly, so it runs on every target.
+    /// garbage. This calls the private kernel directly, so it runs on every target -
+    /// `sgemm_scalar_matches_avx2_bit_for_bit` is the x86-only other half.
     ///
-    /// Covers the whole reachable argument space: `bt` × `beta ∈ {0, 1}` × the four activations ×
-    /// bias/no-bias × `alpha`, at shapes that exercise the 1-wide dims and the MR/NR remainders.
-    /// `alpha != 1` is paired only with `beta == 0`, the combination the ABI supports (see the
-    /// `debug_assert` in [`gemm_dispatch`]).
+    /// Two contracts, checked separately, so that neither needs a fudge factor:
+    ///
+    ///   1. **the sum** - `epi = None` against the f64 reference at the derived
+    ///      `gamma_r * (sum|a||b| + |beta*c|)` bound. What stood here was `1e-3*sqrt(k)` absolute
+    ///      against an f32 `naive`, which contains no epsilon and accepts a GEMM that has truncated
+    ///      every one of its inputs to half precision;
+    ///   2. **the epilogue** - `epi = Some(..)` must be **bit-identical** to applying the same
+    ///      `act(alpha*x + bias[j])` to the `epi = None` result, i.e. applied exactly once, after
+    ///      the full K reduction, at the global column. No tolerance is involved.
+    ///
+    /// Covers the reachable argument space: `bt` x `beta in {0, 1}` x the four activations x
+    /// bias/no-bias x `alpha`, at shapes exercising the 1-wide dims, the MR/NR remainders, and a
+    /// three-K-block reduction derived from `KC` so a retune cannot vacate it. `alpha != 1` is
+    /// paired only with `beta == 0`, the combination the ABI supports (see the `debug_assert` in
+    /// [`gemm_dispatch`]).
     #[test]
     fn sgemm_scalar_fallback_matches_reference() {
-        for &(m, k, n) in &[(1usize, 1usize, 1usize), (7, 17, 13), (64, 64, 64)] {
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (7, 17, 13),
+            (64, 64, 64),
+            (13, 2 * KC + 37, 19),
+        ] {
             let a = fill(81, m * k);
             let b = fill(82, k * n);
             let bias = fill(83, n);
             let c_init = fill(84, m * n);
             for bt in [false, true] {
                 // `bt` reinterprets the same k*n elements as `[n, k]` rather than `[k, n]`.
-                let base = if bt {
-                    naive_nt(&a, &b, m, k, n)
-                } else {
-                    naive(&a, &b, m, k, n)
-                };
+                let (dot, growth) = reference_f64(&a, &b, m, k, n, bt);
                 for &beta in &[0.0f32, 1.0] {
+                    // (1) the sum.
+                    let mut base = c_init.clone();
+                    sgemm_scalar(
+                        a.as_ptr(),
+                        b.as_ptr(),
+                        base.as_mut_ptr(),
+                        m,
+                        k,
+                        n,
+                        beta,
+                        bt,
+                        None,
+                    );
+                    let want: Vec<f64> = if beta == 0.0 {
+                        dot.clone()
+                    } else {
+                        dot.iter()
+                            .zip(&c_init)
+                            .map(|(d, c0)| d + f64::from(*c0))
+                            .collect()
+                    };
+                    let beta_c = if beta == 0.0 { None } else { Some(&c_init[..]) };
+                    assert_within_derived_bound(
+                        &base,
+                        &want,
+                        &growth,
+                        m,
+                        k,
+                        n,
+                        beta_c,
+                        &format!("sgemm_scalar (bt{bt} beta{beta})"),
+                    );
+                    // (2) the epilogue, bit-exactly, on top of that same sum.
                     let alphas: &[f32] = if beta == 0.0 { &[1.0, 0.125] } else { &[1.0] };
                     for &alpha in alphas {
                         for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
                             for use_bias in [false, true] {
-                                let no_epi = act == ACT_IDENTITY && !use_bias && alpha == 1.0;
+                                if act == ACT_IDENTITY && !use_bias && alpha == 1.0 {
+                                    continue; // that IS `epi = None`, already checked as (1)
+                                }
                                 let bias_ptr = if use_bias {
                                     bias.as_ptr()
                                 } else {
                                     std::ptr::null()
                                 };
-                                let epi = if no_epi {
-                                    None
-                                } else {
-                                    Some(Epilogue {
-                                        bias: bias_ptr,
-                                        act,
-                                        alpha,
-                                    })
-                                };
-                                // Reference: the beta rule, then the epilogue on the fully
-                                // reduced sum — `alpha` scales the accumulated value, then the
-                                // bias adds, then the activation (`Epilogue::apply`'s order).
-                                let mut want = vec![0.0f32; m * n];
-                                for i in 0..m {
-                                    for j in 0..n {
-                                        let mut v = base[i * n + j];
-                                        if beta != 0.0 {
-                                            v += c_init[i * n + j];
-                                        }
-                                        if epi.is_some() {
-                                            if alpha != 1.0 {
-                                                v *= alpha;
-                                            }
-                                            if use_bias {
-                                                v += bias[j];
-                                            }
-                                            v = match act {
-                                                ACT_RELU => v.max(0.0),
-                                                ACT_GELU => crate::vmath::gelu1(v),
-                                                ACT_SILU => crate::vmath::silu1(v),
-                                                _ => v,
-                                            };
-                                        }
-                                        want[i * n + j] = v;
-                                    }
-                                }
+                                let bias_ref = if use_bias { Some(&bias[..]) } else { None };
                                 let mut got = c_init.clone();
                                 sgemm_scalar(
                                     a.as_ptr(),
@@ -5330,18 +5931,26 @@ mod tests {
                                     n,
                                     beta,
                                     bt,
-                                    epi,
+                                    Some(Epilogue {
+                                        bias: bias_ptr,
+                                        act,
+                                        alpha,
+                                    }),
                                 );
-                                let tol = 1e-3 * (k as f32).sqrt();
-                                for idx in 0..m * n {
-                                    assert!(
-                                        (got[idx] - want[idx]).abs()
-                                            <= tol + 1e-4 * want[idx].abs(),
-                                        "scalar (m{m} k{k} n{n} bt{bt} beta{beta} alpha{alpha} \
-                                         act{act} bias{use_bias}) idx {idx}: got {} want {}",
-                                        got[idx],
-                                        want[idx]
-                                    );
+                                for i in 0..m {
+                                    for j in 0..n {
+                                        let idx = i * n + j;
+                                        let expect =
+                                            epilogue_ref(base[idx], j, alpha, bias_ref, act);
+                                        assert_eq!(
+                                            got[idx].to_bits(),
+                                            expect.to_bits(),
+                                            "scalar epilogue (m{m} k{k} n{n} bt{bt} beta{beta} \
+                                             alpha{alpha} act{act} bias{use_bias}) idx {idx}: got \
+                                             {} want {expect}",
+                                            got[idx]
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -5354,11 +5963,23 @@ mod tests {
     /// α-scaled `C = alpha·(A·Bᵀ)` must equal the plain `nt` GEMM followed by a scalar `alpha·c` pass
     /// (the α multiply is one exact f32 op on the fully-reduced dot — the *only* difference from the
     /// unscaled kernel), for both `alpha == 1.0` (must be **byte-identical** to `nt`) and a general
-    /// `alpha`; and the serial and parallel α kernels must be bit-for-bit identical. `k = 300` exceeds
-    /// `KC` so the K loop blocks — verifying α is applied once, on the final K-block, not per-block.
+    /// `alpha`; and the serial and parallel α kernels must be bit-for-bit identical.
+    ///
+    /// This doc used to claim `k = 300` "exceeds `KC` so the K loop blocks — verifying α is applied
+    /// once, on the final K-block, not per-block". It has not since KC went 256 -> 384:
+    /// `select_kc(300) == 300`, so `is_last_k` was true on the only iteration and the stated
+    /// property was vacuous - a regression applying α per K-block would have passed. The
+    /// `(40, 2*KC + 37, 48)` shape is derived from the live constant, so a retune cannot vacate it
+    /// again.
     #[test]
     fn sgemm_nt_alpha_matches_scaled_nt_and_parallel() {
-        for &(m, k, n) in &[(7, 17, 13), (64, 64, 64), (40, 300, 48), (520, 300, 400)] {
+        for &(m, k, n) in &[
+            (7usize, 17usize, 13usize),
+            (64, 64, 64),
+            (40, 300, 48),
+            (40, 2 * KC + 37, 48), // 3 K-blocks: α must be applied on the last one only
+            (520, 300, 400),
+        ] {
             let a = fill(61, m * k);
             let b = fill(62, n * k);
             let (mi, ki, ni) = (m as i64, k as i64, n as i64);
