@@ -370,7 +370,7 @@ fn tanh_exp1(x: f32) -> f32 {
 //     1.6e-9 relative = 0.03 ULP; 7.7e-9 = 0.13 ULP once the six coefficients are rounded to f32) —
 //     our own fit, re-checked against f64 in `vmath_tanh_poly_approximation_error`. For |x| < 2^-13
 //     the correction is below half an ULP and the fma returns x itself, subnormals included; ±0 keeps
-//     its sign through the final xor.
+//     its sign through the final copysign.
 //   |x| > TANH_XC:  tanh(x) = 1 − 2/(E+1), E = e^{2|x|} — the exp-form cancellation is benign here
 //     (q = 2/(E+1) < 0.54 at 0.75), but the old kernel still spent three full-magnitude roundings on it
 //     (E, E+1, the quotient) on top of exp's 2-ULP truncation. Here `E = 2^k·M` reuses the 8-bucket
@@ -384,14 +384,22 @@ fn tanh_exp1(x: f32) -> f32 {
 //     relative error (≈1 ULP of itself) reaches the result scaled by q/(1−q) = 2/(E−1) ≤ 0.58 at 0.75.
 //     `min(|x|, 10)` keeps 2^k normal for ±∞ and the whole saturated band: past |x| ≥ 9.0109 the
 //     correctly-rounded value is exactly 1.0 and `1 − q` with q ≤ 2^-25 rounds to it.
-//   NaN takes the polynomial side (the ordered `>` is false), so it propagates x's payload.
+//   NaN takes the polynomial side (`fcmp ogt` on a NaN is false, and that IS specified), so every
+//     operand of the selected branch descends from x and carries x's payload, which the final
+//     quieting preserves. The SIGN, however, must be *set* from x and never *xored* onto whatever
+//     the chain produced. LLVM leaves the sign of a NaN result of `fmul`/`fma` unspecified and uses
+//     that licence: at -O3 InstCombine rewrites `t = ax * ax` (ax = fabs(x)) to `fmul float %x, %x`
+//     by `fabs(X)*fabs(X) -> X*X`, so for x = 0xFFFFFFC0 the poly chain yields a NEGATIVE NaN and an
+//     `xor` with x's sign bit produced +NaN — a release-only wrong answer that -O0, which kept the
+//     fabs, hid. Both endings are therefore `copysign`: mask the magnitude, OR the sign in.
 //
 // Exhaustive over all 2^32 bit patterns in the design sweep of this exact scalar op sequence: max 1
 // ULP against f64 `tanh` rounded to f32 (`vmath_tanh_exhaustive_ulp` repeats it in-tree, lanes and
 // twin included — its first full run is pending); the crossover window with both sides ≤1 ULP is
 // [0.6, 0.8] (2 ULP appears below 0.5 on the exp side and past 0.83 on the polynomial side), so 0.75
-// sits inside it with margin on both sides. Per vector the kernel is 35 SIMD ops with one `vdivps`
-// (the old exp-composed form was 20 with one) — the price of the ≤1-ULP result.
+// sits inside it with margin on both sides. Per vector the kernel is 36 SIMD ops with one `vdivps`
+// (35 before the `xor` ending became a two-op `copysign`; the old exp-composed form was 20 with one)
+// — the price of the ≤1-ULP result.
 const TANH_XC: f32 = 0.75;
 const TANH_EXP_CLAMP: f32 = 10.0;
 /// Degree-5 minimax P(t) with tanh(x) = x + x³·P(x²) on [0, 0.75²], f32-rounded.
@@ -461,7 +469,12 @@ fn tanh1(x: f32) -> f32 {
     let rr = 1.0 / d;
     let y_exp = (-2.0f32).mul_add(rr, 1.0);
     let y = if ax > TANH_XC { y_exp } else { y_poly };
-    f32::from_bits(y.to_bits() ^ sgn)
+    // `copysign(y, x)`, NOT `y ^ sgn`: y is +0-or-greater on every non-NaN input (tanh(|x|) >= 0 on
+    // both branches), so masking the magnitude is a no-op there and the two forms are bit-equal —
+    // but on a NaN the magnitude's sign is whatever the FP chain happened to leave, and an XOR
+    // *flips* it while an OR *sets* it. See the block comment above: `fabs(X)*fabs(X) -> X*X` fires
+    // at -O3 and hands a negative-sign NaN back, which the XOR then flipped to positive.
+    f32::from_bits((y.to_bits() & 0x7FFF_FFFF) | sgn)
 }
 
 /// `sigmoid(x) = 1/(1 + e^{-x})`.
@@ -2059,7 +2072,9 @@ unsafe fn tanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     let y_exp = _mm256_fnmadd_ps(_mm256_set1_ps(2.0), rr, _mm256_set1_ps(1.0));
     let big = _mm256_cmp_ps::<_CMP_GT_OQ>(ax, _mm256_set1_ps(TANH_XC));
     let y = _mm256_blendv_ps(y_poly, y_exp, big);
-    _mm256_xor_ps(y, sgn)
+    // copysign(y, x) — `andnot` reuses the already-live sign_mask, so this costs one op over the
+    // old `xor(y, sgn)` and is sign-correct on a NaN whatever the lanes left in y's sign bit.
+    _mm256_or_ps(_mm256_andnot_ps(sign_mask, y), sgn)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3312,6 +3327,77 @@ mod tests {
         );
         assert_eq!(t(1e6).to_bits(), 1.0f32.to_bits());
         assert_eq!(t(f32::MAX).to_bits(), 1.0f32.to_bits());
+    }
+
+    /// A `|x|`-then-restore-the-sign op must **set** the NaN's sign from the input, never **xor** it
+    /// onto whatever the FP chain left in the magnitude's sign bit.
+    ///
+    /// LLVM does not specify the sign of a NaN result of `fmul`/`fma`, and it spends that licence:
+    /// at `-O3` InstCombine rewrites `t = ax * ax` (`ax = fabs(x)`) into `fmul float %x, %x` via
+    /// `fabs(X)*fabs(X) -> X*X`, so the polynomial chain hands back a NaN that already carries the
+    /// input's sign. `tanh` shipped an `xor` ending, which then flipped it: every one of the
+    /// 8,388,607 **negative** NaNs came back positive, **in the release profile only** — `-O0` keeps
+    /// the `fabs`, so the xor was right there. Nothing but
+    /// `cargo test -p wukong_runtime --release --lib` could see it; that is what gate part 4 is for.
+    /// Both endings are now `copysign` (mask the magnitude, OR the sign in), which LLVM lowers to
+    /// `llvm.copysign`, whose sign behaviour on a NaN *is* specified.
+    ///
+    /// Covers the sign-restoring ops whose chain is NaN-transparent. `asinh` and `cbrt` share the
+    /// structure but not the premise: their `exp1`/`log1` core swallows a NaN outright (`exp1`
+    /// clamps with `min`/`max`, which return the *non*-NaN operand; `log1` reads the exponent field
+    /// as an integer), so they return a finite number for a NaN input — identically in both
+    /// profiles. That is a different defect and is deliberately not pinned here.
+    #[test]
+    fn vmath_sign_restoring_ops_set_the_nan_sign_from_the_input() {
+        // Quiet and signaling, default and non-default payload, each in both signs.
+        let pats: [u32; 8] = [
+            0x7FC0_0000,
+            0xFFC0_0000,
+            0x7FFF_FFC0,
+            0xFFFF_FFC0,
+            0x7FC0_1234,
+            0xFFC0_1234,
+            0x7F80_0001,
+            0xFF80_0001,
+        ];
+        for (name, op) in [("tanh", VM_TANH), ("atan", VM_ATAN)] {
+            // All eight in one 8-lane block (the AVX2 body), then one at a time (the scalar tail).
+            let xs: Vec<f32> = pats.iter().map(|&b| f32::from_bits(b)).collect();
+            let mut lanes = vec![0f32; pats.len()];
+            // SAFETY: both buffers are exactly pats.len() f32 long.
+            unsafe {
+                wukong_vmath_f32(xs.as_ptr(), lanes.as_mut_ptr(), pats.len() as i64, op);
+            }
+            for (i, &b) in pats.iter().enumerate() {
+                let x = f32::from_bits(b);
+                let mut tail = [0f32; 1];
+                // SAFETY: one input element, one output element.
+                unsafe {
+                    wukong_vmath_f32(&x, tail.as_mut_ptr(), 1, op);
+                }
+                let twin = apply1(op, x);
+                assert_eq!(
+                    lanes[i].to_bits(),
+                    twin.to_bits(),
+                    "{name}({b:#010x}): lane {:#010x} vs scalar twin {:#010x}",
+                    lanes[i].to_bits(),
+                    twin.to_bits()
+                );
+                assert_eq!(
+                    tail[0].to_bits(),
+                    twin.to_bits(),
+                    "{name}({b:#010x}): tail {:#010x} vs scalar twin {:#010x}",
+                    tail[0].to_bits(),
+                    twin.to_bits()
+                );
+                assert_eq!(
+                    twin.to_bits(),
+                    b | 0x0040_0000,
+                    "{name}(NaN {b:#010x}) must be that NaN, quieted, sign kept — got {:#010x}",
+                    twin.to_bits()
+                );
+            }
+        }
     }
 
     /// The **exhaustive** proof behind the `VM_TANH` ≤1-ULP bar: every one of the 2^32 bit patterns
