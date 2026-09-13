@@ -1152,6 +1152,220 @@ mod tests {
     /// `peak = nan_at - 8` puts the peak in the same lane and an earlier chunk, which is the only
     /// arrangement that exposes it: a NaN elsewhere merely poisons a lane that does not hold the row
     /// maximum, and `hmax8` then drops it.
+    /// The lengths every blocking seam in this module lives on: shorter than one 8-lane vector,
+    /// around the `BLOCK` = 64 body, around the x4-unrolled (32-element) writeback groups, and a
+    /// spread of ragged tails. Shared by the twin tests so a new seam is added in one place.
+    const SEAM_LENS: [usize; 25] = [
+        1, 3, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 71, 72, 100, 127, 128, 129, 191, 192, 193, 200,
+        257, 512, 768,
+    ];
+
+    /// Deterministic pathological rows: every value class an f32 reduction can round differently on.
+    /// Each entry is `(name, f(i) -> f32)`; the row is that function over `0..n`, so every length in
+    /// `SEAM_LENS` lands the special values in different lanes, different accumulators and different
+    /// blocks. Sign-alternating patterns are used deliberately: with 8 accumulators, cancellation is
+    /// where a lane-layout desync between the twins would first show.
+    #[allow(clippy::type_complexity)]
+    fn pathological() -> Vec<(&'static str, fn(usize) -> f32)> {
+        vec![
+            ("signed-zero", |i| if i % 2 == 0 { 0.0 } else { -0.0 }),
+            ("zero-and-one", |i| if i % 3 == 0 { -0.0 } else { 1.0 }),
+            ("nan-sparse", |i| if i % 11 == 7 { f32::NAN } else { 1.5 }),
+            ("nan-dense", |i| if i % 2 == 0 { f32::NAN } else { -2.25 }),
+            ("pos-inf", |i| if i % 13 == 5 { f32::INFINITY } else { 0.5 }),
+            ("both-inf", |i| match i % 7 {
+                3 => f32::INFINITY,
+                5 => f32::NEG_INFINITY,
+                _ => 1.0,
+            }),
+            // Subnormals: the smallest positive, the largest subnormal, and their negatives.
+            ("subnormal", |i| match i % 4 {
+                0 => f32::from_bits(1),
+                1 => f32::from_bits(0x007f_ffff),
+                2 => -f32::from_bits(1),
+                _ => -f32::from_bits(0x0040_0000),
+            }),
+            // Subnormals mixed with normals, so `x*x` underflows to zero inside a live accumulator.
+            ("subnormal-mixed", |i| {
+                if i % 5 == 0 {
+                    f32::from_bits(3)
+                } else {
+                    1.0
+                }
+            }),
+            // Round-to-nearest-EVEN ties: 2^24 + 1 is exactly halfway between two f32, and so is
+            // 2^24 + 3. Which way each rounds depends only on the accumulator's current low bit, so a
+            // twin that folded elements into a different lane would diverge here first.
+            ("tie-2p24", |i| if i % 8 == 0 { 16777216.0 } else { 1.0 }),
+            (
+                "tie-2p24-neg",
+                |i| {
+                    if i % 8 == 4 {
+                        -16777216.0
+                    } else {
+                        1.0
+                    }
+                },
+            ),
+            // Squares that overflow to +inf partway through a live accumulator.
+            ("overflow-sq", |i| if i % 9 == 2 { 2.0e19 } else { 3.0 }),
+            // Wide dynamic range: every addend is absorbed by the running total.
+            ("absorbed", |i| if i % 6 == 0 { 1.0e20 } else { 1.0e-20 }),
+            // Exact cancellation to a signed zero in some lanes and not others.
+            ("cancel", |i| if i % 2 == 0 { 1.0e7 } else { -1.0e7 }),
+            // --- patterns that pin the COMBINE TREE, not the value classes -------------------
+            // Every pattern above holds values whose accumulator sums are exact (small integers,
+            // powers of two) or saturated (NaN/inf), so they are insensitive to the order in which
+            // the eight accumulators are folded — a twin that used a different but equally valid
+            // halving tree would pass all of them. These two do not: full random mantissas make
+            // every partial sum inexact, and the second one additionally spreads the accumulators
+            // across 2^56 of dynamic range so that which pair is added first decides what is lost.
+            // Verified by mutation: swapping the AVX2 combine to the (0,1)(2,3)(4,5)(6,7) tree is
+            // bit-invisible to every other pattern here and to `scalar_matches_avx2_bit_for_bit`,
+            // and is caught by these.
+            ("random-mantissa", |i| rand_mantissa(i)),
+            ("mixed-scale", |i| {
+                let t = ((i / 8) % 8) as i32;
+                rand_mantissa(i) * exp2i(4 * t - 14)
+            }),
+        ]
+    }
+
+    /// A full-mantissa f32 in `[1, 2)` from a multiplicative hash of `i` — deterministic, no RNG.
+    /// The point is the 23 significand bits: sums of these round differently under different
+    /// association, which is what pins the accumulator combine tree.
+    fn rand_mantissa(i: usize) -> f32 {
+        f32::from_bits(0x3f80_0000 | ((i as u32).wrapping_mul(2_654_435_761) >> 9))
+    }
+
+    /// `2^k` exactly, for `|k| < 127` — an exact scale, so it moves the exponent without perturbing
+    /// the mantissa the pattern is carrying.
+    fn exp2i(k: i32) -> f32 {
+        f32::from_bits((((k + 127) as u32) & 0xff) << 23)
+    }
+
+    /// The three reductions the multi-accumulator rewrite replaced — `ssq8` (RMSNorm / L2-norm),
+    /// `sum8` (the LayerNorm mean pass) and `dev2_8` (the LayerNorm variance pass) — must agree
+    /// BIT-FOR-BIT between the AVX2 kernel and its scalar twin on every value class an f32 reduction
+    /// can round differently on: NaN, +/-0, +/-inf, subnormals, round-to-even ties, overflow to inf
+    /// and total cancellation. All eight lane accumulators are compared, not the folded scalar: a
+    /// lane-layout desync between the twins can cancel in the horizontal sum and is invisible in the
+    /// final row.
+    ///
+    /// This is the coverage `scalar_matches_avx2_bit_for_bit` does not give (its input is a smooth
+    /// finite sine, and it checks the normalized row rather than the accumulators) and that
+    /// `scalar_matches_avx2_on_nan_rows` does not give either (it exercises only softmax and
+    /// log-softmax, whose max pass these three reductions are not part of).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn reduction_twins_agree_bit_for_bit_on_pathological_rows() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        // Means chosen so `x - mean` itself produces the hard cases: inf - inf = NaN, a NaN mean
+        // poisoning every lane, and an exact subtraction that cancels to zero.
+        let means: [f32; 6] = [
+            0.0,
+            -0.0,
+            1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::from_bits(0x007f_ffff),
+        ];
+        for (name, gen) in pathological() {
+            for &n in &SEAM_LENS {
+                let x: Vec<f32> = (0..n).map(gen).collect();
+                let cmp = |what: &str, a: [f32; 8], b: [f32; 8], extra: String| {
+                    for j in 0..8 {
+                        assert_eq!(
+                            a[j].to_bits(),
+                            b[j].to_bits(),
+                            "{what} scalar != avx2 on '{name}' n={n} lane={j}{extra}: \
+                             {:#010x} ({}) vs {:#010x} ({})",
+                            a[j].to_bits(),
+                            a[j],
+                            b[j].to_bits(),
+                            b[j]
+                        );
+                    }
+                };
+                // SAFETY: both twins read exactly `n` f32 from `x`; AVX2+FMA detected above.
+                unsafe {
+                    cmp(
+                        "ssq8",
+                        ssq8_scalar(x.as_ptr(), n),
+                        ssq8_avx2(x.as_ptr(), n),
+                        String::new(),
+                    );
+                    cmp(
+                        "sum8",
+                        sum8_scalar(x.as_ptr(), n),
+                        sum8_avx2(x.as_ptr(), n),
+                        String::new(),
+                    );
+                    for &m in &means {
+                        cmp(
+                            "dev2_8",
+                            dev2_8_scalar(x.as_ptr(), n, m),
+                            dev2_8_avx2(x.as_ptr(), n, m),
+                            format!(" mean={m}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole row, end to end, on the same pathological inputs: the three ops whose reductions
+    /// the rewrite touched (LayerNorm, RMSNorm, L2-norm) must produce bit-identical output from the
+    /// AVX2 kernel and the scalar twin. This covers the finalize (`1/sqrt`, the mean divide) and the
+    /// writeback, which the accumulator test above deliberately stops short of, and it is where a
+    /// NaN or an inf that survived the reduction has to keep propagating identically.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn norm_rows_agree_bit_for_bit_on_pathological_rows() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for (name, gen) in pathological() {
+            for &n in &SEAM_LENS {
+                let x: Vec<f32> = (0..n).map(gen).collect();
+                for &op in &[NORM_LAYERNORM, NORM_RMSNORM, NORM_L2NORM] {
+                    let mut a = vec![0.0f32; n];
+                    let mut b = vec![0.0f32; n];
+                    // SAFETY: both write exactly `n` f32; AVX2+FMA detected above.
+                    unsafe {
+                        match op {
+                            NORM_LAYERNORM => {
+                                layernorm_row_scalar(x.as_ptr(), a.as_mut_ptr(), n, EPS);
+                                layernorm_row_avx2(x.as_ptr(), b.as_mut_ptr(), n, EPS);
+                            }
+                            NORM_RMSNORM => {
+                                rmsnorm_row_scalar(x.as_ptr(), a.as_mut_ptr(), n, EPS);
+                                rmsnorm_row_avx2(x.as_ptr(), b.as_mut_ptr(), n, EPS);
+                            }
+                            _ => {
+                                l2norm_row_scalar(x.as_ptr(), a.as_mut_ptr(), n, EPS);
+                                l2norm_row_avx2(x.as_ptr(), b.as_mut_ptr(), n, EPS);
+                            }
+                        }
+                    }
+                    for i in 0..n {
+                        assert_eq!(
+                            a[i].to_bits(),
+                            b[i].to_bits(),
+                            "scalar != avx2 on '{name}' n={n} op={op} i={i}: {:#010x} ({}) vs {:#010x} ({})",
+                            a[i].to_bits(),
+                            a[i],
+                            b[i].to_bits(),
+                            b[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_on_nan_rows() {
