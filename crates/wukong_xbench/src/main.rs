@@ -643,9 +643,35 @@ fn omp_threads(cc: &str, dir: &Path) -> Option<i32> {
             }
             unsafe {
                 let lib = libloading::Library::new(&dll).ok()?;
-                let f: libloading::Symbol<unsafe extern "C" fn() -> i32> =
-                    lib.get(b"kprobe\0").ok()?;
-                Some(f())
+                let threads = {
+                    let f: libloading::Symbol<unsafe extern "C" fn() -> i32> =
+                        lib.get(b"kprobe\0").ok()?;
+                    f()
+                };
+                // LEAK THIS HANDLE DELIBERATELY. Dropping it runs `FreeLibrary` microseconds
+                // after `GOMP_parallel` returns, which unmaps `libgomp-1.dll` and
+                // `libwinpthread-1.dll` while the region's ~21 workers are still walking their
+                // parking path (`gomp_finish_task`, the dock barrier mutex, then `sem_wait`).
+                // A worker that has not yet reached the kernel wait fetches an instruction from
+                // an unmapped page: an unhandled exception on a non-main thread, so the process
+                // dies with `0xC0000005` and an EMPTY stderr, at whatever point the benchmark had
+                // reached. That is the fault that killed the whole-suite baseline before its first
+                // parallel table and `baseline-recovery-12-transpose` before its first table,
+                // twice in ~40 processes and never on demand.
+                //
+                // Reproduced deterministically outside this tree: LoadLibrary -> kprobe() ->
+                // FreeLibrary in a loop faults with 0xC0000005 inside 200 iterations, 3 runs of 3;
+                // holding 50 ms before the free survives 300 iterations, and never freeing
+                // survives 2000. The probe is memoized behind `PROBE: OnceLock`, so it loads
+                // exactly once per process and the leak can never collide with a rebuild.
+                //
+                // `bench_mm_mkl`'s loader already leaks its handle for the same reason. The
+                // `-fopenmp` PEER libraries in `time_peer` take the same risk and have survived 74
+                // unloads, because they copy a 4-16 MiB output buffer between the last region and
+                // the drop, which is a head start rather than a guarantee; see
+                // docs/sota-campaign-2026-09/FINDING-02-omp-probe-unload-race.md.
+                std::mem::forget(lib);
+                Some(threads)
             }
         };
         match run() {
