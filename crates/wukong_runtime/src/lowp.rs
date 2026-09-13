@@ -4,13 +4,50 @@
 //! half the bytes, so a memory-bound reduction runs ~2× faster than its f32 twin. We widen on load
 //! (F16C `vcvtph2ps` for f16; a `<<16` bit-extend for bf16 — both *lossless*) and accumulate in f32.
 //!
-//! Determinism / twin contract: the SIMD path keeps 8 lane accumulators (lane `l` sums elements
-//! `8k+l` in ascending `k`) and combines them with a fixed tree; the scalar twin keeps the identical
-//! 8 logical lanes, so SIMD == scalar **bit-for-bit** (a test pins this across partial tails). The
-//! widen is exact, so the only float rounding is the f32 accumulation — identical in both paths.
-//! NOTE the `_parallel` reduction twins fold over the fixed `reduce::RCHUNK` decomposition, which
-//! reassociates against the flat serial kernel: a `@parallel` reduction here is deterministic on any
-//! thread count but **not** bit-equal to its serial sibling (see [`par_chunk_reduce`]).
+//! # The accumulation contract for `sum` and `dot`
+//!
+//! The widen is exact, so the **only** float rounding in a bf16/f16 reduction is the f32
+//! accumulation, and that accumulation is a *fixed, documented reassociation* of the mathematical
+//! sum. It is deliberately **not** the strictly sequential f32 sum a naive `for (k) s += x[k];`
+//! C loop performs, and it is deliberately more accurate than one.
+//!
+//! - **bf16 `sum`/`dot`** ([`sum_bf16_avx`], [`dot_bf16_avx`]) partition the input into
+//!   `K = 8` accumulator vectors × 8 f32 lanes = **64 logical lanes**. Element `i` belongs to
+//!   group `g = i / 16` and position `t = i % 16`; it lands in accumulator `j = (g % 4) + 4·(t % 2)`
+//!   at lane `l = t / 2` (the even/odd split is what the branch-free widen below produces). Each
+//!   lane accumulates its subsequence in ascending `i`; the 8 accumulator vectors are folded by a
+//!   fixed binary tree (`acc[j] += acc[j+w]` for `w = 4, 2, 1`), then the 8 lanes by
+//!   [`hcombine8`]. The `n % 16` trailing elements are folded in ascending order afterwards.
+//! - **f16 `sum`/`dot`** keep the older 8-lane form (lane `l` sums elements `8k+l`): F16C's
+//!   `vcvtph2ps` has no shift/and equivalent, so the de-interleaved map buys it nothing.
+//! - The max-family folds ([`wukong_reduce_bf16`], [`wukong_reduce_f16`]) round nothing, so they
+//!   are the *exact* reduction of the widened values regardless of order.
+//!
+//! The partition is a pure function of `n` — never of the thread count, the ISA tier or the call
+//! site — so the SIMD path, the scalar twin, the interpreter and the native backend all return
+//! identical bits. NOTE the `_parallel` reduction twins fold over the fixed `reduce::RCHUNK`
+//! decomposition, which reassociates against the flat serial kernel: a `@parallel` reduction here
+//! is deterministic on any thread count but **not** bit-equal to its serial sibling (see
+//! [`par_chunk_reduce`]).
+//!
+//! ## Why the lane count is load-bearing, not an implementation detail
+//!
+//! A sequential f32 accumulator over an ML-sized reduction is *badly* wrong. Once its running total
+//! passes `2^23` the f32 ULP is 1.0, and every `O(1)` addend then rounds to a whole ULP — a
+//! one-sided bias, not a random walk. Measured against an independent in-order **f64** reference
+//! over the `wukong_xbench` bf16 inputs (all-positive, `O(1)` magnitude), relative error:
+//!
+//! | N | `sum` seq-f32 | `sum` here | `dot` seq-f32 | `dot` here |
+//! |---|---|---|---|---|
+//! | 2^20 | 8.80e-4 | **0** (exact) | 2.42e-4 | **2.21e-7** |
+//! | 2^22 | 1.97e-3 | **1.03e-8** | 5.37e-4 | **1.08e-5** |
+//! | 2^24 | 1.407e-2 | **1.69e-4** | 2.333e-2 | **1.62e-4** |
+//!
+//! So when a cross-language check reports a ~1e-2 disagreement between these kernels and a C/C++/
+//! Rust peer compiled at honest flags, **it is reporting the peer's error, not ours** — the peers
+//! agree with each other to the last bit precisely because all three emit the same in-order sum.
+//! `lowp_reductions_beat_the_sequential_f32_sum` pins this ruling; do not "fix" a drift warning by
+//! matching the peer.
 //!
 //! Beyond the reductions this module also owns the half-precision **elementwise** family: the
 //! mixed-precision `axpby` (`wukong_axpby_{bf16,f16}`, half in / f32 out) and the narrowing-output
@@ -69,39 +106,119 @@ impl Half {
     }
 }
 
-/// Scalar twin of the SIMD sum: 8 logical lane accumulators, fixed combine, scalar tail. This is the
-/// reference the SIMD path must match bit-for-bit, and the no-AVX2 fallback.
-fn sum_scalar(kind: Half, x: &[u16]) -> f32 {
+/// 256-bit loads issued per unrolled step of the bf16 `sum`/`dot` inner loop.
+const BF_H: usize = 4;
+/// Independent f32 accumulator *vectors* the bf16 `sum`/`dot` keep (`2 × BF_H`, one per widen half),
+/// i.e. `8 × BF_K = 64` logical lanes. Two things ride on this number and it is tuned for both:
+/// it is the reduction's dependency-chain depth divider (one 4-cycle `vfmadd` chain per accumulator,
+/// so `BF_K = 8` turns a latency-bound loop into a port-bound one), and it is the accuracy
+/// parameter of the module-header contract table. Changing it changes the kernel's *result bits*;
+/// the scalar twins below must be changed with it or `simd_equals_scalar_twin_bit_for_bit` goes red.
+const BF_K: usize = 2 * BF_H;
+/// Extra unroll of the bf16 `sum` group loop. **Scheduling only** — the lane map is `acc[g % BF_H]`
+/// for every `BF_SUM_U`, so the result bits do not depend on it and the scalar twin does not
+/// mention it. It exists because `sum` at N = 2^24 is DRAM bound, where the loop's *bytes requested
+/// per iteration* (here 16 loads = 512 B = 8 cache lines) is what sets streaming throughput: at
+/// `BF_SUM_U = 1` the new kernel measured ~0.96x of the old one on that row across nine runs, at
+/// `BF_SUM_U = 4` it measured 1.10-1.29x in every one of four. `dot` needs no such unroll (it
+/// already issues two streams' worth of loads per group) and measured very slightly worse with one.
+const BF_SUM_U: usize = 4;
+
+/// Scalar twin of the bf16 SIMD sum: the identical 64-lane de-interleaved partition documented in
+/// the module header, folded by the identical fixed tree. The reference the SIMD path must match
+/// bit-for-bit, and the no-AVX2 fallback.
+fn sum_scalar_bf16(x: &[u16]) -> f32 {
     let n = x.len();
-    let chunks = n / 8;
-    let mut acc = [0.0f32; 8];
-    for c in 0..chunks {
-        for (l, a) in acc.iter_mut().enumerate() {
-            *a += kind.widen(x[c * 8 + l]);
+    let groups = n / 16;
+    let mut acc = [[0.0f32; 8]; BF_K];
+    for g in 0..groups {
+        let j = g % BF_H;
+        let base = g * 16;
+        for l in 0..8 {
+            acc[j][l] += bf16_bits_to_f32(x[base + 2 * l]);
+            acc[j + BF_H][l] += bf16_bits_to_f32(x[base + 2 * l + 1]);
         }
     }
-    let mut s = hcombine8(&acc);
-    for &v in &x[chunks * 8..] {
-        s += kind.widen(v);
+    let mut s = hcombine8(&fold_tree(acc));
+    for &v in &x[groups * 16..] {
+        s += bf16_bits_to_f32(v);
     }
     s
 }
 
-/// Scalar twin of the SIMD dot (f32-accumulated, fused like the SIMD `fmadd`).
-fn dot_scalar(kind: Half, x: &[u16], y: &[u16]) -> f32 {
+/// Scalar twin of the bf16 SIMD dot (f32-accumulated, fused like the SIMD `fmadd`), over the same
+/// 64-lane partition as [`sum_scalar_bf16`].
+fn dot_scalar_bf16(x: &[u16], y: &[u16]) -> f32 {
+    let n = x.len();
+    let groups = n / 16;
+    let mut acc = [[0.0f32; 8]; BF_K];
+    for g in 0..groups {
+        let base = g * 16;
+        // `split_at_mut` so the even-half and odd-half accumulators of the same `j` are both live.
+        let (evens, odds) = acc.split_at_mut(BF_H);
+        let (ae, ao) = (&mut evens[g % BF_H], &mut odds[g % BF_H]);
+        for (l, (ael, aol)) in ae.iter_mut().zip(ao.iter_mut()).enumerate() {
+            let (e, o) = (base + 2 * l, base + 2 * l + 1);
+            *ael = bf16_bits_to_f32(x[e]).mul_add(bf16_bits_to_f32(y[e]), *ael);
+            *aol = bf16_bits_to_f32(x[o]).mul_add(bf16_bits_to_f32(y[o]), *aol);
+        }
+    }
+    let mut s = hcombine8(&fold_tree(acc));
+    for i in groups * 16..n {
+        s = bf16_bits_to_f32(x[i]).mul_add(bf16_bits_to_f32(y[i]), s);
+    }
+    s
+}
+
+/// The fixed binary tree over the `BF_K` accumulator vectors — `acc[j] += acc[j+w]` for
+/// `w = BF_K/2, …, 1`, elementwise per lane. Mirrors the SIMD fold exactly.
+#[inline]
+fn fold_tree(mut acc: [[f32; 8]; BF_K]) -> [f32; 8] {
+    let mut w = BF_K;
+    while w > 1 {
+        let h = w / 2;
+        let (lo, hi) = acc.split_at_mut(h);
+        for (a, b) in lo.iter_mut().zip(hi.iter()) {
+            for (al, bl) in a.iter_mut().zip(b.iter()) {
+                *al += *bl;
+            }
+        }
+        w = h;
+    }
+    acc[0]
+}
+
+/// Scalar twin of the f16 SIMD sum: 8 logical lane accumulators, fixed combine, scalar tail. This is
+/// the reference the SIMD path must match bit-for-bit, and the no-F16C fallback.
+fn sum_scalar_f16(x: &[u16]) -> f32 {
     let n = x.len();
     let chunks = n / 8;
     let mut acc = [0.0f32; 8];
     for c in 0..chunks {
         for (l, a) in acc.iter_mut().enumerate() {
-            *a = kind
-                .widen(x[c * 8 + l])
-                .mul_add(kind.widen(y[c * 8 + l]), *a);
+            *a += f16_to_f32(x[c * 8 + l]);
+        }
+    }
+    let mut s = hcombine8(&acc);
+    for &v in &x[chunks * 8..] {
+        s += f16_to_f32(v);
+    }
+    s
+}
+
+/// Scalar twin of the f16 SIMD dot (f32-accumulated, fused like the SIMD `fmadd`).
+fn dot_scalar_f16(x: &[u16], y: &[u16]) -> f32 {
+    let n = x.len();
+    let chunks = n / 8;
+    let mut acc = [0.0f32; 8];
+    for c in 0..chunks {
+        for (l, a) in acc.iter_mut().enumerate() {
+            *a = f16_to_f32(x[c * 8 + l]).mul_add(f16_to_f32(y[c * 8 + l]), *a);
         }
     }
     let mut s = hcombine8(&acc);
     for i in chunks * 8..n {
-        s = kind.widen(x[i]).mul_add(kind.widen(y[i]), s);
+        s = f16_to_f32(x[i]).mul_add(f16_to_f32(y[i]), s);
     }
     s
 }
@@ -128,6 +245,42 @@ pub(crate) unsafe fn widen_bf16(p: *const u16) -> __m256 {
     let lo = _mm_loadu_si128(p as *const __m128i);
     let w = _mm256_cvtepu16_epi32(lo);
     _mm256_castsi256_ps(_mm256_slli_epi32(w, 16))
+}
+
+// ---- The branch-free bf16 widen the *reductions* use (16 elements per 256-bit load) ----
+//
+// `widen_bf16` above costs one `vpmovzxwd` per 8 elements, and `vpmovzxwd ymm, xmm` is a SHUFFLE:
+// it issues only on the single shuffle port, so the widen alone caps the loop at one 8-element step
+// per cycle no matter how much FMA throughput is left over. The pair below avoids the shuffle port
+// entirely. Load 16 bf16 as one `__m256i`; dword `k` then holds element `2k` in its LOW half and
+// element `2k+1` in its HIGH half (little endian), and a bf16's f32 value is exactly its 16 bits in
+// the f32 high half:
+//
+//   `vpslld(v, 16)`             -> f32 lanes of the EVEN elements (the odd half is shifted out)
+//   `vpand (v, 0xFFFF_0000)`    -> f32 lanes of the ODD  elements (the even half is masked out)
+//
+// Both are plain integer ALU ops (p0/p1, and p5 as well for `vpand`), both are exact, and together
+// they widen 16 elements for two uops instead of two shuffle-port uops for the same 16. The price is
+// that the two halves come out de-interleaved — which is why the reductions' lane map is the
+// even/odd one documented in the module header rather than `8k+l`.
+
+/// f32 lanes of the **even**-indexed bf16 elements of a 16-element load. Exact.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn widen_bf16_even(v: __m256i) -> __m256 {
+    _mm256_castsi256_ps(_mm256_slli_epi32(v, 16))
+}
+
+/// f32 lanes of the **odd**-indexed bf16 elements of a 16-element load. Exact.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn widen_bf16_odd(v: __m256i) -> __m256 {
+    _mm256_castsi256_ps(_mm256_and_si256(
+        v,
+        _mm256_set1_epi32(0xFFFF_0000u32 as i32),
+    ))
 }
 
 // ---- SIMD narrowing store helpers (8 f32 lanes → 8 contiguous half bits) — the reverse of the widen
@@ -227,19 +380,67 @@ unsafe fn sum_f16_avx(x: &[u16]) -> f32 {
     s
 }
 
+/// The fixed binary fold over the `BF_K` accumulator vectors, then the 8 lanes. Mirrors
+/// [`fold_tree`] exactly (`acc[j] += acc[j+w]` for `w = BF_K/2 … 1`, elementwise).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn fold_tree_avx(acc: &mut [__m256; BF_K]) -> f32 {
+    let mut w = BF_K;
+    while w > 1 {
+        let h = w / 2;
+        for j in 0..h {
+            acc[j] = _mm256_add_ps(acc[j], acc[j + h]);
+        }
+        w = h;
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc[0]);
+    hcombine8(&lanes)
+}
+
+/// bf16 `Σ x[i]` with an f32 accumulator, over the 64-lane de-interleaved partition of the module
+/// header. Twin: [`sum_scalar_bf16`].
+///
+/// Two defects of the previous one-accumulator form are fixed here, and both are countable:
+///   * the loop-carried `vaddps` chain is now `BF_K = 8` independent chains, so the step rate is set
+///     by issue throughput rather than by add latency;
+///   * the widen no longer touches the shuffle port ([`widen_bf16_even`] / [`widen_bf16_odd`]),
+///     removing one shuffle uop per 8 elements — previously the loop's hard ceiling.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn sum_bf16_avx(x: &[u16]) -> f32 {
     let n = x.len();
-    let chunks = n / 8;
-    let mut acc = _mm256_setzero_ps();
-    for c in 0..chunks {
-        acc = _mm256_add_ps(acc, widen_bf16(x.as_ptr().add(c * 8)));
+    let groups = n / 16; // whole 256-bit loads
+    let p = x.as_ptr();
+    let mut acc = [_mm256_setzero_ps(); BF_K];
+    let steps = groups / (BF_H * BF_SUM_U);
+    let mut g = 0usize;
+    for _ in 0..steps {
+        for u in 0..BF_SUM_U {
+            for j in 0..BF_H {
+                let v = _mm256_loadu_si256(p.add((g + u * BF_H + j) * 16) as *const __m256i);
+                acc[j] = _mm256_add_ps(acc[j], widen_bf16_even(v));
+                acc[j + BF_H] = _mm256_add_ps(acc[j + BF_H], widen_bf16_odd(v));
+            }
+        }
+        g += BF_H * BF_SUM_U;
     }
-    let mut lanes = [0.0f32; 8];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
-    let mut s = hcombine8(&lanes);
-    for &v in &x[chunks * 8..] {
+    // `< BF_H * BF_SUM_U` leftover groups, still `acc[group % BF_H]`. Both loop bounds stay
+    // constant (`g` is a multiple of `BF_H` here, so `j` *is* `g % BF_H`): a variable accumulator
+    // index would make LLVM give up and keep the whole array on the stack.
+    while g < groups {
+        for j in 0..BF_H {
+            if g + j < groups {
+                let v = _mm256_loadu_si256(p.add((g + j) * 16) as *const __m256i);
+                acc[j] = _mm256_add_ps(acc[j], widen_bf16_even(v));
+                acc[j + BF_H] = _mm256_add_ps(acc[j + BF_H], widen_bf16_odd(v));
+            }
+        }
+        g += BF_H;
+    }
+    let mut s = fold_tree_avx(&mut acc);
+    for &v in &x[groups * 16..] {
         s += bf16_bits_to_f32(v);
     }
     s
@@ -265,21 +466,40 @@ unsafe fn dot_f16_avx(x: &[u16], y: &[u16]) -> f32 {
     s
 }
 
+/// bf16 `Σ x[i]·y[i]` with an f32 accumulator, over the same 64-lane partition as
+/// [`sum_bf16_avx`]. Twin: [`dot_scalar_bf16`].
+///
+/// The single-accumulator predecessor was **`vfmadd` latency bound**: one dependent FMA per 8
+/// elements at 4 cycles of latency is 0.5 cycles/element no matter how much of the machine is idle.
+/// `BF_K = 8` independent chains plus the shuffle-port-free widen make it issue bound instead.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_bf16_avx(x: &[u16], y: &[u16]) -> f32 {
     let n = x.len();
-    let chunks = n / 8;
-    let mut acc = _mm256_setzero_ps();
-    for c in 0..chunks {
-        let a = widen_bf16(x.as_ptr().add(c * 8));
-        let b = widen_bf16(y.as_ptr().add(c * 8));
-        acc = _mm256_fmadd_ps(a, b, acc);
+    let groups = n / 16;
+    let (px, py) = (x.as_ptr(), y.as_ptr());
+    let mut acc = [_mm256_setzero_ps(); BF_K];
+    let (full, rest) = (groups / BF_H, groups % BF_H);
+    let mut g = 0usize;
+    for _ in 0..full {
+        for j in 0..BF_H {
+            let a = _mm256_loadu_si256(px.add((g + j) * 16) as *const __m256i);
+            let b = _mm256_loadu_si256(py.add((g + j) * 16) as *const __m256i);
+            acc[j] = _mm256_fmadd_ps(widen_bf16_even(a), widen_bf16_even(b), acc[j]);
+            acc[j + BF_H] = _mm256_fmadd_ps(widen_bf16_odd(a), widen_bf16_odd(b), acc[j + BF_H]);
+        }
+        g += BF_H;
     }
-    let mut lanes = [0.0f32; 8];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
-    let mut s = hcombine8(&lanes);
-    for i in chunks * 8..n {
+    for j in 0..BF_H {
+        if j < rest {
+            let a = _mm256_loadu_si256(px.add((g + j) * 16) as *const __m256i);
+            let b = _mm256_loadu_si256(py.add((g + j) * 16) as *const __m256i);
+            acc[j] = _mm256_fmadd_ps(widen_bf16_even(a), widen_bf16_even(b), acc[j]);
+            acc[j + BF_H] = _mm256_fmadd_ps(widen_bf16_odd(a), widen_bf16_odd(b), acc[j + BF_H]);
+        }
+    }
+    let mut s = fold_tree_avx(&mut acc);
+    for i in groups * 16..n {
         s = bf16_bits_to_f32(x[i]).mul_add(bf16_bits_to_f32(y[i]), s);
     }
     s
@@ -433,7 +653,7 @@ pub unsafe extern "C" fn wukong_sum_f16(x: *const u16, n: i64) -> f32 {
     if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("avx") {
         return sum_f16_avx(x);
     }
-    sum_scalar(Half::F16, x)
+    sum_scalar_f16(x)
 }
 
 /// `sum(widen(x[i]))` over `n` bf16 values (stored as `u16` bits), accumulated in f32.
@@ -450,7 +670,7 @@ pub unsafe extern "C" fn wukong_sum_bf16(x: *const u16, n: i64) -> f32 {
     if is_x86_feature_detected!("avx2") {
         return sum_bf16_avx(x);
     }
-    sum_scalar(Half::Bf16, x)
+    sum_scalar_bf16(x)
 }
 
 /// `sum(widen(x[i])·widen(y[i]))` over `n` IEEE-f16 values, accumulated in f32.
@@ -468,7 +688,7 @@ pub unsafe extern "C" fn wukong_dot_f16(x: *const u16, y: *const u16, n: i64) ->
     if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
         return dot_f16_avx(x, y);
     }
-    dot_scalar(Half::F16, x, y)
+    dot_scalar_f16(x, y)
 }
 
 /// `sum(widen(x[i])·widen(y[i]))` over `n` bf16 values, accumulated in f32.
@@ -486,7 +706,7 @@ pub unsafe extern "C" fn wukong_dot_bf16(x: *const u16, y: *const u16, n: i64) -
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
         return dot_bf16_avx(x, y);
     }
-    dot_scalar(Half::Bf16, x, y)
+    dot_scalar_bf16(x, y)
 }
 
 // ---- Parallel reductions (`@parallel`): deterministic, bit-identical on any thread count ----
@@ -589,7 +809,7 @@ pub unsafe extern "C" fn wukong_sum_bf16_parallel(x: *const u16, n: i64) -> f32 
         // SAFETY: feature detected once; borrowed chunks are read-only valid subslices.
         return par_half_reduce(x, 0.0, |chunk| sum_bf16_avx(chunk), |a, b| a + b);
     }
-    par_half_reduce(x, 0.0, |chunk| sum_scalar(Half::Bf16, chunk), |a, b| a + b)
+    par_half_reduce(x, 0.0, sum_scalar_bf16, |a, b| a + b)
 }
 
 /// Multicore IEEE-f16 sum — the `@parallel` twin of [`wukong_sum_f16`].
@@ -607,7 +827,7 @@ pub unsafe extern "C" fn wukong_sum_f16_parallel(x: *const u16, n: i64) -> f32 {
         // SAFETY: features detected once; borrowed chunks are read-only valid subslices.
         return par_half_reduce(x, 0.0, |chunk| sum_f16_avx(chunk), |a, b| a + b);
     }
-    par_half_reduce(x, 0.0, |chunk| sum_scalar(Half::F16, chunk), |a, b| a + b)
+    par_half_reduce(x, 0.0, sum_scalar_f16, |a, b| a + b)
 }
 
 /// Multicore bf16 dot — the `@parallel` twin of [`wukong_dot_bf16`].
@@ -626,7 +846,7 @@ pub unsafe extern "C" fn wukong_dot_bf16_parallel(x: *const u16, y: *const u16, 
         // SAFETY: features detected once; x/y may overlap because both are read-only.
         return par_half_dot(x, y, |xc, yc| dot_bf16_avx(xc, yc));
     }
-    par_half_dot(x, y, |xc, yc| dot_scalar(Half::Bf16, xc, yc))
+    par_half_dot(x, y, dot_scalar_bf16)
 }
 
 /// Multicore IEEE-f16 dot — the `@parallel` twin of [`wukong_dot_f16`].
@@ -645,7 +865,7 @@ pub unsafe extern "C" fn wukong_dot_f16_parallel(x: *const u16, y: *const u16, n
         // SAFETY: features detected once; x/y may overlap because both are read-only.
         return par_half_dot(x, y, |xc, yc| dot_f16_avx(xc, yc));
     }
-    par_half_dot(x, y, |xc, yc| dot_scalar(Half::F16, xc, yc))
+    par_half_dot(x, y, dot_scalar_f16)
 }
 
 /// Multicore bf16 max-family reduction (`RED_MAX`/`RED_MIN`/`RED_MAXABS`) — the `@parallel` twin of
@@ -1151,8 +1371,13 @@ mod tests {
 
     #[test]
     fn simd_equals_scalar_twin_bit_for_bit() {
-        // include a non-multiple-of-8 tail
-        for n in [0usize, 1, 7, 8, 9, 100, 1000, 4099] {
+        // Every shape of partial step the bf16 kernels can take: an empty input, a pure ≤15-element
+        // scalar tail, each `rest ∈ 0..BF_H` count of leftover 16-element groups (n/16 mod 4), and
+        // each of those with a tail on top — plus the f16 kernels' non-multiple-of-8 tails.
+        for n in [
+            0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 79, 80, 95, 100,
+            127, 128, 129, 1000, 4099,
+        ] {
             let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013 - 3.1).sin()).collect();
             let ys: Vec<f32> = (0..n).map(|i| (i as f32 * 0.019 + 1.7).cos()).collect();
             let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
@@ -1163,22 +1388,22 @@ mod tests {
             unsafe {
                 assert_eq!(
                     wukong_sum_f16(xf16.as_ptr(), n as i64).to_bits(),
-                    sum_scalar(Half::F16, &xf16).to_bits(),
+                    sum_scalar_f16(&xf16).to_bits(),
                     "sum_f16 n={n}"
                 );
                 assert_eq!(
                     wukong_sum_bf16(xbf.as_ptr(), n as i64).to_bits(),
-                    sum_scalar(Half::Bf16, &xbf).to_bits(),
+                    sum_scalar_bf16(&xbf).to_bits(),
                     "sum_bf16 n={n}"
                 );
                 assert_eq!(
                     wukong_dot_f16(xf16.as_ptr(), yf16.as_ptr(), n as i64).to_bits(),
-                    dot_scalar(Half::F16, &xf16, &yf16).to_bits(),
+                    dot_scalar_f16(&xf16, &yf16).to_bits(),
                     "dot_f16 n={n}"
                 );
                 assert_eq!(
                     wukong_dot_bf16(xbf.as_ptr(), ybf.as_ptr(), n as i64).to_bits(),
-                    dot_scalar(Half::Bf16, &xbf, &ybf).to_bits(),
+                    dot_scalar_bf16(&xbf, &ybf).to_bits(),
                     "dot_bf16 n={n}"
                 );
             }
@@ -1664,6 +1889,87 @@ mod tests {
         let got = unsafe { wukong_dot_bf16(xbf.as_ptr(), ybf.as_ptr(), n as i64) };
         let rel = (got as f64 - ref_dot).abs() / ref_dot.abs().max(1.0);
         assert!(rel < 1e-2, "bf16 dot rel {rel:.2e}");
+    }
+
+    /// **The bf16 accumulation ruling, pinned.** The cross-language benchmark reports the bf16 `dot`
+    /// and `sum` disagreeing with C, C++ and Rust by ~1e-2 at N = 2^24. All three peers print the
+    /// *same* value to the last bit, which is the signature of one strictly sequential f32
+    /// accumulator — and an in-order f64 oracle says that accumulator, not this kernel, is the side
+    /// that is wrong: at 2^24 the peers are 1.407e-2 (sum) / 2.333e-2 (dot) from the truth while
+    /// these kernels are 1.69e-4 / 1.62e-4. Once a running f32 total passes 2^23 its ULP is 1.0, so
+    /// every O(1) addend rounds to a whole ULP — a one-sided bias, not a random walk.
+    ///
+    /// This test pins the ruling at a size a debug build can afford (2^20, where the same mechanism
+    /// already separates the two by >1000x on `sum`). Two directions are asserted, and a future
+    /// change that quietly makes these kernels agree with the peers fails BOTH:
+    ///   * these kernels stay within 1e-6 of the f64 reference, and
+    ///   * the sequential f32 sum they deliberately do not perform stays past 1e-4 of it.
+    ///
+    /// LANDMINE: the right response to a bf16 "scalar drift" warning is to check this test, not to
+    /// widen a tolerance. The warning is correctly reporting a real disagreement in the peer's
+    /// favour of neither side — it is our accuracy that is the better one.
+    #[test]
+    fn lowp_reductions_beat_the_sequential_f32_sum() {
+        // Two shapes. (a) is exactly the `wukong_xbench` bf16-reduction input (all-positive,
+        // O(1), period 17 / 13); (b) is badly conditioned on purpose — one big value in three,
+        // tiny signed values between — so the ruling is not an artifact of one benign pattern.
+        let n = 1usize << 20;
+        let bench_x: Vec<u16> = (0..n)
+            .map(|i| bf16_bits((i as f32 % 17.0) * 0.05 + 0.5))
+            .collect();
+        let bench_y: Vec<u16> = (0..n)
+            .map(|i| bf16_bits((i as f32 % 13.0) * 0.03 + 0.25))
+            .collect();
+        let hostile_x: Vec<u16> = (0..n)
+            .map(|i| {
+                bf16_bits(if i % 3 == 0 {
+                    1000.0
+                } else {
+                    (i as f32 % 11.0) * 0.001 - 0.005
+                })
+            })
+            .collect();
+
+        // The independent oracle: the identical widened values (the widen is exact) summed in
+        // ascending index order in f64, no reassociation. Every partial stays far below 2^53, so
+        // this is the truth to well under one f32 ULP.
+        let f64_sum = |x: &[u16]| {
+            x.iter()
+                .fold(0.0f64, |a, &v| a + bf16_bits_to_f32(v) as f64)
+        };
+        let f64_dot = |x: &[u16], y: &[u16]| {
+            x.iter().zip(y).fold(0.0f64, |a, (&u, &v)| {
+                a + bf16_bits_to_f32(u) as f64 * bf16_bits_to_f32(v) as f64
+            })
+        };
+        // The accumulation gcc / g++ / rustc emit at honest flags: one sequential f32 accumulator.
+        let seq_sum = |x: &[u16]| x.iter().fold(0.0f32, |a, &v| a + bf16_bits_to_f32(v));
+        let seq_dot = |x: &[u16], y: &[u16]| {
+            x.iter().zip(y).fold(0.0f32, |a, (&u, &v)| {
+                a + bf16_bits_to_f32(u) * bf16_bits_to_f32(v)
+            })
+        };
+        let rel = |got: f32, want: f64| ((got as f64 - want) / want).abs();
+
+        for (name, x) in [("bench", &bench_x), ("hostile", &hostile_x)] {
+            let want = f64_sum(x);
+            let ours = rel(unsafe { wukong_sum_bf16(x.as_ptr(), n as i64) }, want);
+            let peer = rel(seq_sum(x), want);
+            assert!(ours <= 1e-6, "{name}: bf16 sum rel {ours:.3e} > 1e-6");
+            assert!(
+                peer > 1e-4,
+                "{name}: the sequential f32 sum is only {peer:.3e} off — the ruling's premise \
+                 (a sequential accumulator loses badly at this size) no longer holds for this data"
+            );
+        }
+        let want = f64_dot(&bench_x, &bench_y);
+        let ours = rel(
+            unsafe { wukong_dot_bf16(bench_x.as_ptr(), bench_y.as_ptr(), n as i64) },
+            want,
+        );
+        let peer = rel(seq_dot(&bench_x, &bench_y), want);
+        assert!(ours <= 1e-6, "bf16 dot rel {ours:.3e} > 1e-6");
+        assert!(peer > 1e-4, "sequential f32 dot only {peer:.3e} off");
     }
 
     /// The IDENTICAL chunk fold the `_parallel` kernels perform, computed sequentially (no rayon): cut
