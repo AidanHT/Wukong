@@ -42,7 +42,10 @@
 //!     GEMM in the project — hence `select_kc_partition_is_pinned`), and it is NOT a function of the
 //!     core count, the scheduler, the env knobs, or whether the AVX2 path or [`sgemm_scalar`] ran.
 //!   * **Error bound.** Every reference test asserts the bound this order earns, against an **f64**
-//!     reference: `|got − exact| ≤ γ_r · (Σ_p |a_ip|·|b_pj| + |β·c_ij|)` with
+//!     reference, via the one helper `assert_within_derived_bound` (the fused and scalar epilogue
+//!     legs assert something STRICTER on top of that — bit-identity with the unfused sum — and no
+//!     test in the file asserts an absolute tolerance):
+//!     `|got − exact| ≤ γ_r · (Σ_p |a_ip|·|b_pj| + |β·c_ij|)` with
 //!     `r = kc + nb − 1 (+1 when β ≠ 0)` and `γ_r = r·u/(1−r·u)`, `u = 2⁻²⁴`. The `Σ|a||b|` growth
 //!     factor is netlib's Level-3 BLAS test criterion (`SMMCH` in `sblat3.f`, which normalizes by
 //!     `G(i) = Σ |A(i,k)|·|B(k,j)|`); `γ_r` is Higham, *Accuracy and Stability of Numerical
@@ -2516,10 +2519,20 @@ unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
 ///   * the epilogue applied exactly once, on the final K-block, at the global column `j`.
 ///
 /// Pinned by `sgemm_scalar_matches_avx2_bit_for_bit` (`to_bits()` equality across
-/// shape × `bt` × `beta` × epilogue, including two- and three-K-block shapes). The FMA lowers to a
-/// `libm` call on an x86-64 host built without `fma`, which is slow — but such a host has no FMA
-/// unit either, so there is no faster correctly-rounded option, and on any AVX2 box this function is
-/// unreachable outside its tests.
+/// shape × `bt` × `beta` × epilogue, including two- and three-K-block shapes).
+///
+/// **The cost, stated plainly, because it is not zero for the population this path exists for.**
+/// [`f32::mul_add`] lowers to a `vfmadd`/`fmadd` instruction only where the target feature is on.
+/// This workspace has no `.cargo/config.toml`, no `build.rs` and no `+fma` in `RUSTFLAGS`, so on a
+/// stock x86-64 build it lowers to a **`fmaf` CALL into `libm`, one per K step**, where the
+/// pre-2026-09-13 body issued two inline FP ops (`mulss` + `addss`) per MAC. On any AVX2 host that
+/// is free — this function is unreachable outside its own tests (the runtime probe in
+/// [`gemm_dispatch`] takes the other branch) — and on `aarch64` it is free as well (`fmadd`). It
+/// is NOT free on a non-AVX2 x86-64 host, which is exactly the host this function is the only GEMM
+/// on. The trade is taken deliberately: a machine with no FMA unit has no faster
+/// correctly-rounded option, and a portable GEMM that computes a different answer from the one
+/// every gate in the repo checks is worse than a slow one. A build that wants both can set
+/// `-C target-feature=+fma`, which turns the call back into one instruction with identical bits.
 #[allow(clippy::too_many_arguments)]
 fn sgemm_scalar(
     a: *const f32,
@@ -3511,9 +3524,29 @@ mod tests {
                 s = s
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
-                ((s >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+                fill_value(s)
             })
             .collect()
+    }
+
+    /// One LCG state -> one sample. Split out of [`fill`] so `[-1, 1)` is a property of the
+    /// FUNCTION, pinnable at its endpoints, rather than of whichever seeds and lengths the suite
+    /// happens to use today.
+    ///
+    /// 24 bits of state, not 31, and the upper endpoint is the reason. `(s >> 33)` reaches
+    /// `2^31 - 1`; f32's ulp at `2^31` is 128, so every numerator `>= 2^31 - 64` rounds UP to `2^31`
+    /// on the `as f32` and the sample is exactly `2^31/2^30 - 1.0 == 1.0` - outside the documented
+    /// half-open range, and a violation of [`fill_spans_the_documented_range`]'s `max < 1.0`. No
+    /// seed in the suite reaches it today, which is exactly what makes it a trap: a shape or seed
+    /// added later would trip an assertion in a test that has nothing to do with the generator.
+    /// Widening the division to f64 does NOT fix it - `1 - 2^-30` is inside a half-ulp of `1.0` in
+    /// f32 and rounds back to `1.0` on the way down. With `s >> 40` the numerator is `< 2^24` and
+    /// therefore EXACT in f32, the division by `2^23` is exact (a power of two), and `u/2^23 - 1.0`
+    /// is exact by Sterbenz, so the closed form of the range is `[-1, 1 - 2^-23]` with no rounding
+    /// step anywhere in it. (The LCG's high bits are also the good ones, so taking 24 of them rather
+    /// than 31 costs nothing but the granularity.)
+    fn fill_value(s: u64) -> f32 {
+        ((s >> 40) as f32 / (1u64 << 23) as f32) - 1.0
     }
 
     /// The generator's range is load-bearing for the epilogue and cancellation coverage above, so it
@@ -3534,12 +3567,41 @@ mod tests {
              cancellation coverage depend on it",
             v.len()
         );
+        // The endpoints, pinned against the FUNCTION and not against the seeds this suite happens
+        // to use: a sampled `max < 1.0` only says today's seeds miss the top of the range. The
+        // retired `(s >> 33) / 2^30` form fails the first line below - it returns exactly `1.0` for
+        // every numerator `>= 2^31 - 64` - and so does the f64-division "fix" for it.
+        for &s in &[
+            u64::MAX,
+            u64::MAX - 1,
+            !0u64 << 40,
+            (!0u64 << 40) | 0xff_ffff_ffff,
+        ] {
+            let x = fill_value(s);
+            assert!(
+                x < 1.0,
+                "fill_value({s:#x}) = {x} reached the open upper bound"
+            );
+            assert!(x >= -1.0, "fill_value({s:#x}) = {x} left [-1, 1)");
+        }
+        assert_eq!(
+            fill_value(0).to_bits(),
+            (-1.0f32).to_bits(),
+            "the closed lower endpoint moved: fill_value(0) = {}",
+            fill_value(0)
+        );
     }
 
     /// The K partition is part of the kernel's observable result (see [`select_kc`]), so it is pinned
     /// BY VALUE: a `KC` retune must show up as a reviewed diff here, not as a silent change to the
     /// low bits of every GEMM in the project. Before this test the only in-test uses of `select_kc`
     /// were `assert!(k > select_kc(k))` preconditions, which fail only if `KC` is RAISED.
+    ///
+    /// Every value below is DERIVED, not recorded from output: all 12 `select_kc` results and all 7
+    /// block counts were recomputed independently from `round_up(k.div_ceil(k.div_ceil(384).max(1)),
+    /// 4)` (twice, by two readers) before being written here. The test can fail - changing the
+    /// `round_up` multiple from 4 to 8 breaks `select_kc(1)`, `select_kc(257)` and `select_kc(300)`,
+    /// and any `KC` retune breaks the first `assert_eq!` on the constants.
     #[test]
     fn select_kc_partition_is_pinned() {
         assert_eq!((MR, NR, MC, KC, NC), (6, 16, 144, 384, 4080));
@@ -3635,7 +3697,18 @@ mod tests {
     /// 65536 failing entries at (128,256,512), worst |err| 0.00575 against a tolerance of 0.016 -
     /// i.e. a GEMM that silently truncated all of its inputs to half precision was indistinguishable
     /// from a correct one. `gamma_r * sum|a||b|` must reject it.
+    ///
+    /// It drives [`assert_within_derived_bound`] itself rather than re-deriving `g * growth[i]`
+    /// inline, and that is the whole point of the `should_panic`: the mutation this test exists to
+    /// catch is a LOOSENING OF THE HELPER (multiply `bound` by 1000 at its comparison, or drop the
+    /// `beta_c` term), and an inline transcription here would stay green under exactly that. The
+    /// helper panics on the first entry it rejects, so "it panicked" is "it rejected at least one",
+    /// and the `expected` string pins the panic to the helper's own message rather than to any
+    /// other way this body could fail. The positive control - the same helper ACCEPTING the
+    /// un-truncated GEMM at this shape - is `sgemm_matches_naive_various_sizes`, whose shape list
+    /// contains `(128, 256, 512)`.
     #[test]
+    #[should_panic(expected = "exceeds the derived bound")]
     fn the_derived_bound_rejects_a_half_precision_gemm() {
         let (m, k, n) = (128usize, 256usize, 512usize);
         let a = fill(1, m * k);
@@ -3655,15 +3728,7 @@ mod tests {
                 0,
             );
         }
-        let g = gamma(gemm_rounding_steps(k, false));
-        let rejected = (0..m * n)
-            .filter(|&i| (f64::from(got[i]) - want[i]).abs() > g * growth[i])
-            .count();
-        assert!(
-            rejected > 0,
-            "the derived bound accepted a GEMM whose every input was truncated to fp16 - it has no \
-             more teeth than the tolerance it replaced"
-        );
+        assert_within_derived_bound(&got, &want, &growth, m, k, n, None, "fp16-truncated sgemm");
     }
 
     /// `beta != 0` accumulates onto the incoming C (it is a flag, never a scale). The second shape
@@ -5518,13 +5583,20 @@ mod tests {
             let b = fill(12, n * k);
             let bias = fill(13, n);
             let (mi, ki, ni) = (m as i64, k as i64, n as i64);
-            // The unfused leg. Its own agreement with an f64 reference is `sgemm_nt_matches_naive`'s
-            // job; the point here is that folding the epilogue into the final-K-block writeback
-            // changes nothing about the sum.
+            // The unfused leg - WITH its own external oracle. Without the bound below, every
+            // assertion in this test compares one kernel to itself: the (identity, no-bias) leg is
+            // then a self-comparison by construction (same kernel, same accumulator, so no
+            // arithmetic defect in the sum can make it fail), and `(40, 300, 48)` and
+            // `(50, 257, 80)` - which appear in no other reference-checked shape list in this crate
+            // - would have no f64 reference anywhere in the repo. `sgemm_nt_matches_naive` does
+            // this job at ITS shapes, not at these. With the bound in, the sum is checked against
+            // f64 and the fusion law is checked against the sum, which is the pair this test needs.
+            let (want_f64, growth) = reference_f64(&a, &b, m, k, n, true);
             let mut base = vec![0.0f32; m * n];
             unsafe {
                 wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), base.as_mut_ptr(), mi, ki, ni, 0);
             }
+            assert_within_derived_bound(&base, &want_f64, &growth, m, k, n, None, "nt_epi base");
             for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
                 for use_bias in [false, true] {
                     let bias_ptr = if use_bias {
@@ -5665,12 +5737,22 @@ mod tests {
     /// (`-0.0` is separately unreachable as an epilogue input through any public entry: the
     /// accumulator starts at `+0.0` and `fma(a, b, +0.0)` cannot return `-0.0`, `x + (+0.0)` is
     /// never `-0.0`, and `nt_epi` fixes `alpha = 1`. It is checked anyway.)
+    ///
+    /// Two parts, because the law alone is not the pin. Part (1) pins the LAW over the hostile set.
+    /// Part (2) pins the CALL SITE by driving [`micro_6x16`] itself - a full `MR x NR` tile through
+    /// the 256-bit `wbe!`/`act8!` writeback against the same packed panels at `mr = MR - 1`, which
+    /// takes the general spill path and ends in [`Epilogue::apply`]. Until 2026-09-13 only part (1)
+    /// existed, and it constructs its own intrinsic call, so an operand-order flip inside `act8!`
+    /// (`_mm256_max_ps(zero, v)`, which returns every NaN unchanged) left this test - the one the
+    /// production comment names as the pin - green.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn relu_epilogue_vector_fold_matches_the_scalar_fold() {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             return; // no vector epilogue on this host; the scalar fold is the only one that runs
         }
+        // (1) The law: over the one operand pair the GEMM uses (SRC2 = +0.0), MAXPS and
+        // `f32::max` agree on every f32, including the two `-0.0` cases part (2) cannot deliver.
         let epi = Epilogue {
             bias: std::ptr::null(),
             act: ACT_RELU,
@@ -5709,6 +5791,107 @@ mod tests {
                 scalar.to_bits(),
                 vector.to_bits()
             );
+        }
+
+        // (2) The PRODUCTION call site, which part (1) cannot see. Part (1) builds its OWN
+        // `_mm256_max_ps`, so flipping the operand order in `micro_6x16`'s `act8!` macro to
+        // `_mm256_max_ps(_mm256_setzero_ps(), $v)` leaves it green while every NaN rides through the
+        // real fused epilogue as a NaN. So drive the kernel instead: one FULL 6x16 tile takes the
+        // 256-bit `wbe!` writeback, and the SAME packed panels with `mr = MR - 1` take the general
+        // spill path that ends in `Epilogue::apply` - the scalar fold. `kstep!` is unconditional
+        // over all six rows and `mr` gates only the writeback, so rows `0..MR-1` hold bit-identical
+        // accumulators in the two calls and the two outputs may not differ by one bit.
+        //
+        // `kc` steps of `a = 1.0` against a B panel that is zero except on the LAST step put the
+        // hostile value itself into lane `j`'s accumulator (`fma(1, 0, acc) = acc`, then
+        // `fma(1, v, +0.0) = v`). `-0.0` is the one member of the set this cannot deliver, because
+        // `fma(a, b, +0.0)` never returns `-0.0` - which is the same reason it is unreachable as an
+        // epilogue input through any public entry, and why part (1) covers it directly.
+        // GELU/SiLU are deliberately out: whether `gelu8`/`silu8` mirror `gelu1`/`silu1` on NaN and
+        // +/-inf is `vmath`'s tail-match invariant, not this kernel's (same restriction as
+        // `nt_epi_epilogue_is_bit_exact_on_non_finite_data`).
+        let hostile: [f32; NR] = [
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            f32::MAX,
+            f32::MIN,
+            3.5,
+            -3.5,
+        ];
+        let bias = fill(97, NR);
+        for kc in [1usize, 3] {
+            let ap = vec![1.0f32; MR * kc];
+            let mut bp = vec![0.0f32; NR * kc];
+            bp[NR * (kc - 1)..].copy_from_slice(&hostile);
+            for use_bias in [false, true] {
+                for &act in &[ACT_IDENTITY, ACT_RELU] {
+                    let e = Epilogue {
+                        bias: if use_bias {
+                            bias.as_ptr()
+                        } else {
+                            std::ptr::null()
+                        },
+                        act,
+                        alpha: 1.0,
+                    };
+                    let mut c_vec = vec![0.0f32; MR * NR];
+                    let mut c_sca = vec![0.0f32; MR * NR];
+                    // SAFETY: avx2+fma feature-detected above; `ap`/`bp` hold the MR-per-step and
+                    // NR-per-step packed panels the kernel's contract requires for `kc` steps, and
+                    // `ldc = NR` matches both MR*NR C buffers. `bias`, when non-null, is NR long.
+                    unsafe {
+                        micro_6x16(
+                            kc,
+                            ap.as_ptr(),
+                            bp.as_ptr(),
+                            c_vec.as_mut_ptr(),
+                            NR,
+                            0.0,
+                            MR,
+                            NR,
+                            Some(e),
+                        );
+                        micro_6x16(
+                            kc,
+                            ap.as_ptr(),
+                            bp.as_ptr(),
+                            c_sca.as_mut_ptr(),
+                            NR,
+                            0.0,
+                            MR - 1,
+                            NR,
+                            Some(e),
+                        );
+                    }
+                    for r in 0..MR - 1 {
+                        for (j, &lane) in hostile.iter().enumerate() {
+                            let idx = r * NR + j;
+                            assert_eq!(
+                                c_vec[idx].to_bits(),
+                                c_sca[idx].to_bits(),
+                                "micro_6x16 vector epilogue != scalar epilogue (kc{kc} act{act} \
+                                 bias{use_bias}) row {r} col {j}: vector {} ({:08x}) vs scalar \
+                                 {} ({:08x}), accumulator lane {}",
+                                c_vec[idx],
+                                c_vec[idx].to_bits(),
+                                c_sca[idx],
+                                c_sca[idx].to_bits(),
+                                lane
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
