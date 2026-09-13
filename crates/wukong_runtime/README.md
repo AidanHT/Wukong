@@ -54,7 +54,7 @@ Kernel A/B timing requires a `--release` build; discard the first warm-up run.
 | path | contents |
 |---|---|
 | [`src/`](src/) | kernel modules + `lib.rs` (re-exports, pool, arena, alloc/I/O) |
-| [`examples/`](examples/) | dev-only GEMM scaling/variance probes (not shipped benches) |
+| [`examples/`](examples/) | dev-only GEMM scaling / variance / measurement-position probes (not shipped benches) |
 
 ## Tests
 
