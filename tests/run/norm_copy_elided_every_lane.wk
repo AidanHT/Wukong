@@ -456,6 +456,106 @@
 // EXPECT-OUT: 200
 // EXPECT-OUT: 100
 // EXPECT-OUT: 100
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
 module tests.run.norm_copy_elided_every_lane
 
 // Every lane of a fused single-row norm written as SEED-THEN-NORMALIZE-IN-PLACE, the spelling whose
@@ -484,9 +584,15 @@ module tests.run.norm_copy_elided_every_lane
 //   * B  layernorm   n=112 = 64 + 6x8 + 0          -> wukong_norm_f32, sum8_* and dev2_8_*
 //   * C  rmsnorm+g   n=72  = 64 + 1x8 + 0          -> wukong_norm_affine_f32, distinct gamma buffer
 //   * D  softmax     n=72                          -> wukong_norm_f32, the max-seed path
+//   * E  l2norm      n=100, over []f32 SLICE PARAMS  -> the fat-pointer resolution
 // D matters on its own: its window seeds the row max from `out[0]`, and after the fold the kernel
 // must take that max over `x` instead. Sourcing it from the poisoned destination would drive the
-// whole row to a single lane.
+// whole row to a single lane. E matters on its own too: a `[]f32` slice is a 16-byte fat pointer,
+// so the fold must resolve BOTH of its new operands through the kernel base-pointer path (load the
+// data pointer) rather than hand the kernel the fat-pointer buffer -- passing the struct instead of
+// the data is the defect that once produced silent zeros on the interpreter and a SIGSEGV natively.
+// Its row width is a runtime `i64` param, so the copy's trip count and the norm's are matched
+// symbolically rather than as literals.
 //
 // WHY THESE EXPECTED VALUES DO NOT DEPEND ON SUMMATION ORDER. The kernel reassociates its
 // reductions across 8 accumulators; the expectations must not turn on that. A, B and C hold small
@@ -550,6 +656,14 @@ fn sm72(x: [f32; 72], mut out: [f32; 72]) {
     for i in 0..72 { out[i] = out[i] * inv; }
 }
 
+fn l2s(x: []f32, mut out: []f32, n: i64) {
+    for c in 0..n { out[c] = x[c]; }
+    let mut s: f32 = 0.0;
+    for i in 0..n { s = s + out[i] * out[i]; }
+    let inv: f32 = 1.0 / sqrt(s + 0.00001);
+    for i in 0..n { out[i] = out[i] * inv; }
+}
+
 fn main() -> i32 {
     // --- A: L2 / unit normalize, 100 = 64 + 4x8 + 4.
     let mut xa: [f32; 100] = [0.0; 100];
@@ -583,6 +697,16 @@ fn main() -> i32 {
     for i in 0..24 { xd[i * 3] = 0.6931472; }
     sm72(xd, od);
     for i in 0..72 { print(round(od[i] * 9600.0) as i32); }
+
+    // --- E: shape A again, but over heap `[]f32` SLICE PARAMS and a runtime row width.
+    let ne: i64 = 100;
+    let mut xe: []f32 = alloc_f32(ne);
+    let mut oe: []f32 = alloc_f32(ne);
+    for i in 0..ne { xe[i] = ((i * 3i64) % 7i64) as f32 + 1.0; }
+    for i in 0..ne { oe[i] = -777.0; }
+    l2s(xe, oe, ne);
+    for i in 0..ne { print(round(oe[i] * 400.0) as i32); }
+    free(xe); free(oe);
 
     return 0;
 }
