@@ -343,11 +343,125 @@ pub(crate) fn log1(x: f32) -> f32 {
     e.mul_add(EXP_C1, r2)
 }
 
-/// `tanh(x) = 1 - 2/(e^{2x}+1)` — the exp-based form (the activation benchmarks and the MIR lowering
-/// both use it). The clamped `exp` keeps it finite and saturating at ±1 for large |x|.
+/// `tanh(x) = 1 - 2/(e^{2x}+1)` — the exp-*composed* form the MIR lowering (`emit_tanh`) inlines, kept
+/// as the building block of the composed activations (`gelu`, `mish`, `tanhshrink`, `tanh_backward`,
+/// `gelu_backward`) so each stays bit-identical to its inlined MIR twin. **Not** the `VM_TANH` kernel:
+/// the `1 − q` subtraction cancels catastrophically for small |x| (the intermediate `q = 2/(e^{2x}+1)`
+/// carries ≈1 ULP-of-1 absolute error, which is ≈1/|x| ULP of the result — 80 ULP at |x| ≈ 0.027,
+/// and `+0.0` for every |x| < 2^-25, sign included), so a dispatched `tanh` loop uses [`tanh1`].
+#[inline]
+fn tanh_exp1(x: f32) -> f32 {
+    1.0 - 2.0 / (exp1(2.0 * x) + 1.0)
+}
+
+// --- tanh: odd polynomial below TANH_XC, exact-sum exp form above ---------------------------------
+//
+// `tanh` is well conditioned everywhere (relative condition number 2x/sinh 2x ≤ 1); every ULP lost in
+// the old kernel was lost by the *formula*, not the function. The ≤1-ULP kernel has two regions, each
+// built so that the result is one exact "big part" plus a small correction, with exactly ONE rounding
+// at the result's magnitude — the same split Cephes `tanhf` (poly below 0.625, exp form above) and
+// fdlibm/musl `tanhf` (expm1 form, split at ln(3)/2) use, with the reconstruction rearranged so the
+// f32 error budget closes without double-float arithmetic:
+//
+//   |x| ≤ TANH_XC:  tanh(x) = x + (x·t)·P(t), t = x² — `fma(x·t, P(t), x)`. The correction x·t·P is
+//     at most 15% of the result at |x| = 0.75 (1 − tanh(x)/x), so P's own ≈3-ULP evaluation error is
+//     attenuated ≈7× before the final fma rounds once. P is a degree-5 minimax polynomial in t on
+//     [0, 0.75²] (Remez, weighted by the result's relative error x³/tanh x; max approximation error
+//     1.6e-9 relative = 0.03 ULP; 7.7e-9 = 0.13 ULP once the six coefficients are rounded to f32) —
+//     our own fit, re-checked against f64 in `vmath_tanh_poly_approximation_error`. For |x| < 2^-13
+//     the correction is below half an ULP and the fma returns x itself, subnormals included; ±0 keeps
+//     its sign through the final xor.
+//   |x| > TANH_XC:  tanh(x) = 1 − 2/(E+1), E = e^{2|x|} — the exp-form cancellation is benign here
+//     (q = 2/(E+1) < 0.54 at 0.75), but the old kernel still spent three full-magnitude roundings on it
+//     (E, E+1, the quotient) on top of exp's 2-ULP truncation. Here `E = 2^k·M` reuses the 8-bucket
+//     table reduction of [`exp1`] with three changes: (1) the cubic e^r becomes a quartic
+//     (r⁵/120 = 1.4e-9 vs the cubic's 1.5e-7 truncation), written as `M = fma(T, e^r − 1, T)` so the
+//     `e^r − 1 = r·q` product rounds at 4% of M and M rounds once; (2) the bucket index is rotated by
+//     4 (`TANH_EXP_MBIAS` carries the +4, `TANH_EXP_T[i] = 2^{(i−4)/8}`), which keeps M in
+//     [0.648, 1.354) so that `E + 1 = fma(M, 2^k, 1)` is EXACT (2^k·M has ULP 2^{k−24} ≤ 1 for k ≤ 24
+//     and the sum never crosses a binade), removing that rounding entirely; (3) the result is
+//     `fnmadd(2, 1/(E+1), 1)` — the reciprocal rounds once, the fma rounds once. The quotient's
+//     relative error (≈1 ULP of itself) reaches the result scaled by q/(1−q) = 2/(E−1) ≤ 0.58 at 0.75.
+//     `min(|x|, 10)` keeps 2^k normal for ±∞ and the whole saturated band: past |x| ≥ 9.0109 the
+//     correctly-rounded value is exactly 1.0 and `1 − q` with q ≤ 2^-25 rounds to it.
+//   NaN takes the polynomial side (the ordered `>` is false), so it propagates x's payload.
+//
+// Exhaustive over all 2^32 bit patterns in the design sweep of this exact scalar op sequence: max 1
+// ULP against f64 `tanh` rounded to f32 (`vmath_tanh_exhaustive_ulp` repeats it in-tree, lanes and
+// twin included — its first full run is pending); the crossover window with both sides ≤1 ULP is
+// [0.6, 0.8] (2 ULP appears below 0.5 on the exp side and past 0.83 on the polynomial side), so 0.75
+// sits inside it with margin on both sides. Per vector the kernel is 35 SIMD ops with one `vdivps`
+// (the old exp-composed form was 20 with one) — the price of the ≤1-ULP result.
+const TANH_XC: f32 = 0.75;
+const TANH_EXP_CLAMP: f32 = 10.0;
+/// Degree-5 minimax P(t) with tanh(x) = x + x³·P(x²) on [0, 0.75²], f32-rounded.
+const TANH_P: [f32; 6] = [
+    -0.333_333_16,
+    0.133_326_95,
+    -0.053_892_724,
+    0.021_452_034,
+    -0.007_657_255_5,
+    0.001_736_935_8,
+];
+/// `bits(EXP_MAGIC) − (127·8 + 4)`: `m = bits(t) − TANH_EXP_MBIAS = n + 1020`, so `m >> 3` is the
+/// biased exponent of 2^k with k = (n + 4) >> 3 and `m & 7 = (j + 4) & 7` indexes the rotated table.
+const TANH_EXP_MBIAS: i32 = 0x4B40_0000 - 1020;
+/// `TANH_EXP_T[i] = 2^{(i−4)/8}`: [`EXP_TBL_T`] rotated by 4 with the top half halved (exact), so the
+/// bucket value times e^r stays inside [0.648, 1.354). Pinned bit-for-bit by
+/// `vmath_tanh_tables_consistent`.
+const TANH_EXP_T: [f32; 8] = [
+    EXP_TBL_T[4] * 0.5,
+    EXP_TBL_T[5] * 0.5,
+    EXP_TBL_T[6] * 0.5,
+    EXP_TBL_T[7] * 0.5,
+    EXP_TBL_T[0],
+    EXP_TBL_T[1],
+    EXP_TBL_T[2],
+    EXP_TBL_T[3],
+];
+const TANH_EXP_Q3: f32 = 1.0 / 6.0;
+const TANH_EXP_Q4: f32 = 1.0 / 24.0;
+
+/// `tanh(x)` to ≤1 ULP over the whole f32 domain (see the block comment above for the design and the
+/// error budget). Mirrors the AVX2 [`tanh8`] op-for-op — every `mul_add` is its `fmadd`/`fnmadd`, the
+/// `min` is its `_mm256_min_ps` (NaN → second operand), the `if` is its `_CMP_GT_OQ` blend, the table
+/// index is its `vpermps` (bits 2..0), the shifts are its `psrad`/`pslld` — so lane == scalar
+/// bit-for-bit on every input, NaN and ±0 included. Both sides are always evaluated, as in the lanes.
 #[inline]
 fn tanh1(x: f32) -> f32 {
-    1.0 - 2.0 / (exp1(2.0 * x) + 1.0)
+    let sgn = x.to_bits() & 0x8000_0000;
+    let ax = f32::from_bits(x.to_bits() & 0x7FFF_FFFF);
+    // |x| ≤ TANH_XC: x + (x·t)·P(t).
+    let t = ax * ax;
+    let p = t.mul_add(TANH_P[5], TANH_P[4]);
+    let p = t.mul_add(p, TANH_P[3]);
+    let p = t.mul_add(p, TANH_P[2]);
+    let p = t.mul_add(p, TANH_P[1]);
+    let p = t.mul_add(p, TANH_P[0]);
+    let w = ax * t;
+    let y_poly = w.mul_add(p, ax);
+    // |x| > TANH_XC: 1 − 2/(E+1), E = 2^k·M from the rotated 8-bucket exp reduction of 2|x|.
+    let axc = ax.min(TANH_EXP_CLAMP);
+    let x2 = axc + axc;
+    let tt = x2.mul_add(EXP_TBL_SCALE, EXP_MAGIC);
+    let n = tt - EXP_MAGIC;
+    let m = (tt.to_bits() as i32).wrapping_sub(TANH_EXP_MBIAS);
+    let r = n.mul_add(-EXP_TBL_C1, x2);
+    let r = n.mul_add(-EXP_TBL_C2, r);
+    let tj = TANH_EXP_T[(m & 7) as usize];
+    // e^r − 1 = r·(1 + r/2 + r²/6 + r³/24), then M = T + T·(e^r − 1) in one rounding.
+    let q = r.mul_add(TANH_EXP_Q4, TANH_EXP_Q3);
+    let q = r.mul_add(q, 0.5);
+    let q = r.mul_add(q, 1.0);
+    let pm1 = r * q;
+    let mm = tj.mul_add(pm1, tj);
+    // 2^k straight from the biased exponent m >> 3 (m ≥ 1020 > 0, so >> matches the vector psrad).
+    let pow2 = f32::from_bits(((m >> 3) as u32) << 23);
+    let d = mm.mul_add(pow2, 1.0);
+    let rr = 1.0 / d;
+    let y_exp = (-2.0f32).mul_add(rr, 1.0);
+    let y = if ax > TANH_XC { y_exp } else { y_poly };
+    f32::from_bits(y.to_bits() ^ sgn)
 }
 
 /// `sigmoid(x) = 1/(1 + e^{-x})`.
@@ -370,7 +484,7 @@ pub(crate) fn silu1(x: f32) -> f32 {
 pub(crate) fn gelu1(x: f32) -> f32 {
     let x3 = x * x * x;
     let inner = GELU_C0 * GELU_C1.mul_add(x3, x);
-    (0.5 * x) * (1.0 + tanh1(inner))
+    (0.5 * x) * (1.0 + tanh_exp1(inner))
 }
 
 /// `elu(x) = x>0 ? x : e^x − 1` (α=1) — the exponential linear unit (smooth, saturating negative
@@ -406,7 +520,7 @@ fn softplus1(x: f32) -> f32 {
 /// `mish(x) = x · tanh(softplus(x))` — the smooth, self-gated activation (YOLOv4 / modern vision).
 #[inline]
 fn mish1(x: f32) -> f32 {
-    x * tanh1(softplus1(x))
+    x * tanh_exp1(softplus1(x))
 }
 
 /// `selu(x) = λ·(x>0 ? x : α·(eˣ−1))` — the scaled ELU of self-normalizing networks (fixed λ, α).
@@ -422,10 +536,10 @@ fn selu1(x: f32) -> f32 {
 }
 
 /// `tanhshrink(x) = x − tanh(x)` — the high-pass-shaped activation (audio/signal models). Reuses the
-/// shared `tanh` (built on `exp`), so the AVX2 [`tanhshrink8`] and tail agree.
+/// exp-composed [`tanh_exp1`] (the inlined MIR form), so the AVX2 [`tanhshrink8`] and tail agree.
 #[inline]
 fn tanhshrink1(x: f32) -> f32 {
-    x - tanh1(x)
+    x - tanh_exp1(x)
 }
 
 /// `softsign(x) = x / (1 + |x|)` — a bounded activation (range (−1, 1)) that saturates polynomially
@@ -1219,7 +1333,7 @@ fn gelu_bwd_2(x: f32, dy: f32) -> f32 {
     let x3 = x2 * x;
     let t = GELU_C1.mul_add(x3, x); // c1·x³ + x  (== gelu1's inner numerator)
     let inner = GELU_C0 * t;
-    let u = tanh1(inner);
+    let u = tanh_exp1(inner);
     let half_onep = 0.5 * (1.0 + u); // ½·(1 + u)
     let sech2 = 1.0 - u * u; // 1 − tanh²(I)
     let di = GELU_C1.mul_add(3.0 * x2, 1.0); // c1·(3x²) + 1 = 1 + 3·c1·x²
@@ -1240,11 +1354,11 @@ fn sigmoid_bwd_2(x: f32, dy: f32) -> f32 {
 }
 
 /// `tanh_backward(x, dy) = dy · tanh'(x) = dy · (1 − tanh²(x))`, the tanh-gate training gradient (RNN /
-/// LSTM cell). Reuses the shared [`tanh1`] (an `expf`), so it agrees with the forward `tanh` dispatch
+/// LSTM cell). Reuses the exp-composed [`tanh_exp1`] (an `expf`), so it agrees with the inlined MIR `tanh`
 /// and is bit-identical across the scalar twin / AVX2 [`tanh_bwd8`] / inlined MIR.
 #[inline]
 fn tanh_bwd_2(x: f32, dy: f32) -> f32 {
-    let t = tanh1(x);
+    let t = tanh_exp1(x);
     let sech2 = 1.0 - t * t;
     dy * sech2
 }
@@ -1408,7 +1522,7 @@ unsafe fn silu_bwd8(
 }
 
 /// `dy · gelu'(x)` (tanh approximation) over 8 lanes — mirrors [`gelu_bwd_2`] op-for-op (and reuses
-/// the same inner `I`/`tanh8` as the forward [`gelu8`]), so dispatched == composed == scalar.
+/// the same inner `I`/`tanh_exp8` as the forward [`gelu8`]), so dispatched == composed == scalar.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn gelu_bwd8(
@@ -1423,7 +1537,7 @@ unsafe fn gelu_bwd8(
     let x3 = _mm256_mul_ps(x2, x);
     let t = _mm256_fmadd_ps(c1, x3, x); // c1·x³ + x  (== gelu8's inner numerator)
     let inner = _mm256_mul_ps(c0, t);
-    let u = tanh8(inner);
+    let u = tanh_exp8(inner);
     let half_onep = _mm256_mul_ps(_mm256_set1_ps(0.5), _mm256_add_ps(one, u)); // ½·(1 + u)
     let sech2 = _mm256_sub_ps(one, _mm256_mul_ps(u, u)); // 1 − u²
     let three_x2 = _mm256_mul_ps(_mm256_set1_ps(3.0), x2);
@@ -1455,7 +1569,7 @@ unsafe fn tanh_bwd8(
     dy: std::arch::x86_64::__m256,
 ) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
-    let t = tanh8(x);
+    let t = tanh_exp8(x);
     let sech2 = _mm256_sub_ps(_mm256_set1_ps(1.0), _mm256_mul_ps(t, t)); // 1 − t²
     _mm256_mul_ps(dy, sech2)
 }
@@ -1889,14 +2003,63 @@ pub(crate) unsafe fn log8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__
     _mm256_fmadd_ps(e, _mm256_set1_ps(EXP_C1), r2)
 }
 
+/// The exp-composed `1 − 2/(e^{2x}+1)` over 8 lanes — mirrors [`tanh_exp1`]; the building block of
+/// the composed activations (`gelu8`/`mish8`/`tanhshrink8`/`tanh_bwd8`/`gelu_bwd8`), NOT the `VM_TANH`
+/// kernel ([`tanh8`]).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn tanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+unsafe fn tanh_exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // 1 - 2/(exp(2x)+1)
     let e = exp8(_mm256_mul_ps(x, _mm256_set1_ps(2.0)));
     let d = _mm256_add_ps(e, _mm256_set1_ps(1.0));
     _mm256_sub_ps(_mm256_set1_ps(1.0), _mm256_div_ps(_mm256_set1_ps(2.0), d))
+}
+
+/// 8-lane `tanh` to ≤1 ULP — mirrors [`tanh1`] op-for-op (see the `TANH_*` block for the design and
+/// the error budget). Both sides are computed for every lane and blended on `|x| > TANH_XC`; the
+/// blend's ordered compare is false on NaN, which therefore takes the polynomial side and keeps its
+/// payload, and the sign is split off first and xor'd back last so ±0 and the NaN sign survive.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let sgn = _mm256_and_ps(x, sign_mask);
+    let ax = _mm256_andnot_ps(sign_mask, x);
+    // |x| ≤ TANH_XC: x + (x·t)·P(t), Horner in t = x².
+    let t = _mm256_mul_ps(ax, ax);
+    let p = _mm256_fmadd_ps(t, _mm256_set1_ps(TANH_P[5]), _mm256_set1_ps(TANH_P[4]));
+    let p = _mm256_fmadd_ps(t, p, _mm256_set1_ps(TANH_P[3]));
+    let p = _mm256_fmadd_ps(t, p, _mm256_set1_ps(TANH_P[2]));
+    let p = _mm256_fmadd_ps(t, p, _mm256_set1_ps(TANH_P[1]));
+    let p = _mm256_fmadd_ps(t, p, _mm256_set1_ps(TANH_P[0]));
+    let w = _mm256_mul_ps(ax, t);
+    let y_poly = _mm256_fmadd_ps(w, p, ax);
+    // |x| > TANH_XC: 1 − 2/(E+1), E = 2^k·M from the rotated 8-bucket exp reduction of 2|x|.
+    let axc = _mm256_min_ps(ax, _mm256_set1_ps(TANH_EXP_CLAMP));
+    let x2 = _mm256_add_ps(axc, axc);
+    let tt = _mm256_fmadd_ps(x2, _mm256_set1_ps(EXP_TBL_SCALE), _mm256_set1_ps(EXP_MAGIC));
+    let n = _mm256_sub_ps(tt, _mm256_set1_ps(EXP_MAGIC));
+    let m = _mm256_sub_epi32(_mm256_castps_si256(tt), _mm256_set1_epi32(TANH_EXP_MBIAS));
+    let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-EXP_TBL_C1), x2);
+    let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-EXP_TBL_C2), r);
+    // vpermps reads bits 2..0 of each index lane — the scalar `& 7` — into the rotated table.
+    let tj = _mm256_permutevar8x32_ps(_mm256_loadu_ps(TANH_EXP_T.as_ptr()), m);
+    // e^r − 1 = r·(1 + r/2 + r²/6 + r³/24), then M = T + T·(e^r − 1) in one rounding.
+    let q = _mm256_fmadd_ps(r, _mm256_set1_ps(TANH_EXP_Q4), _mm256_set1_ps(TANH_EXP_Q3));
+    let q = _mm256_fmadd_ps(r, q, _mm256_set1_ps(0.5));
+    let q = _mm256_fmadd_ps(r, q, _mm256_set1_ps(1.0));
+    let pm1 = _mm256_mul_ps(r, q);
+    let mm = _mm256_fmadd_ps(tj, pm1, tj);
+    // 2^k from the biased exponent m >> 3 (m ≥ 1020, so psrad == the scalar >>); E + 1 is exact.
+    let pow2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_srai_epi32::<3>(m)));
+    let d = _mm256_fmadd_ps(mm, pow2, _mm256_set1_ps(1.0));
+    let rr = _mm256_div_ps(_mm256_set1_ps(1.0), d);
+    let y_exp = _mm256_fnmadd_ps(_mm256_set1_ps(2.0), rr, _mm256_set1_ps(1.0));
+    let big = _mm256_cmp_ps::<_CMP_GT_OQ>(ax, _mm256_set1_ps(TANH_XC));
+    let y = _mm256_blendv_ps(y_poly, y_exp, big);
+    _mm256_xor_ps(y, sgn)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1938,7 +2101,7 @@ pub(crate) unsafe fn gelu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::_
         _mm256_set1_ps(GELU_C0),
         _mm256_fmadd_ps(_mm256_set1_ps(GELU_C1), x3, x),
     );
-    let onep = _mm256_add_ps(_mm256_set1_ps(1.0), tanh8(inner));
+    let onep = _mm256_add_ps(_mm256_set1_ps(1.0), tanh_exp8(inner));
     _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5), x), onep)
 }
 
@@ -1982,7 +2145,7 @@ unsafe fn softplus8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 unsafe fn mish8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // x · tanh(softplus(x)) — mirrors mish1.
-    _mm256_mul_ps(x, tanh8(softplus8(x)))
+    _mm256_mul_ps(x, tanh_exp8(softplus8(x)))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2004,7 +2167,7 @@ unsafe fn selu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 unsafe fn tanhshrink8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // x − tanh(x) — mirrors tanhshrink1.
-    _mm256_sub_ps(x, tanh8(x))
+    _mm256_sub_ps(x, tanh_exp8(x))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2943,6 +3106,329 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `TANH_EXP_T` is `EXP_TBL_T` rotated by four with the top half halved: entry i must be
+    /// 2^{(i−4)/8} rounded once to f32, bit-for-bit (the halving is exact, so it commutes with the
+    /// rounding), and `TANH_EXP_MBIAS` must sit exactly four below `EXP_TBL_MBIAS` — the two facts the
+    /// rotated lookup and the `E + 1` exactness argument rest on.
+    #[test]
+    fn vmath_tanh_tables_consistent() {
+        for (i, &t) in TANH_EXP_T.iter().enumerate() {
+            let want = 2f64.powf((i as f64 - 4.0) / 8.0) as f32;
+            assert_eq!(
+                t.to_bits(),
+                want.to_bits(),
+                "TANH_EXP_T[{i}] = {t:?}, want 2^(({i}-4)/8) = {want:?}"
+            );
+        }
+        assert_eq!(TANH_EXP_MBIAS, EXP_TBL_MBIAS - 4);
+        assert_eq!(TANH_EXP_MBIAS, 0x4B40_0000 - 127 * 8 - 4);
+        // M = T·e^r stays inside [0.648, 1.354) — so E + 1 = 2^k·M + 1 never crosses a binade.
+        let emax = (std::f64::consts::LN_2 / 16.0).exp();
+        assert!(f64::from(TANH_EXP_T[0]) / emax > 0.5);
+        assert!(f64::from(TANH_EXP_T[7]) * emax < 1.5);
+    }
+
+    /// `TANH_P` is a degree-5 approximation of P(t) = (tanh(√t)/√t − 1)/t on [0, TANH_XC²] whose
+    /// *result*-relative error x³·|P − P_true|/tanh(x) stays below 1e-8 (0.17 ULP) — re-checked here
+    /// against an f64 reference on a dense grid so a transposed digit cannot survive. P_true near
+    /// t = 0 comes from the Taylor series (the direct form cancels there), elsewhere from f64 `tanh`.
+    /// The f64 minimax fit itself is 1.6e-9; rounding the six coefficients to f32 (c0's half-ULP
+    /// alone is 1.5e-8 absolute, weighted by x³/tanh x) is what lifts the realized figure to 7.7e-9.
+    #[test]
+    fn vmath_tanh_poly_approximation_error() {
+        let p_true = |t: f64| -> f64 {
+            if t < 1e-3 {
+                -1.0 / 3.0
+                    + t * (2.0 / 15.0
+                        + t * (-17.0 / 315.0
+                            + t * (62.0 / 2835.0
+                                + t * (-1382.0 / 155925.0 + t * (21844.0 / 6081075.0)))))
+            } else {
+                let s = t.sqrt();
+                (s.tanh() / s - 1.0) / t
+            }
+        };
+        let tmax = f64::from(TANH_XC) * f64::from(TANH_XC);
+        let mut worst = 0.0f64;
+        for i in 0..=100_000 {
+            let t = tmax * f64::from(i) / 100_000.0;
+            let mut p = 0.0f64;
+            for &c in TANH_P.iter().rev() {
+                p = p * t + f64::from(c);
+            }
+            let s = t.sqrt();
+            let rel = if t == 0.0 {
+                0.0
+            } else {
+                (t * s * (p - p_true(t)) / s.tanh()).abs()
+            };
+            worst = worst.max(rel);
+        }
+        assert!(
+            worst < 1e-8,
+            "TANH_P approximation error {worst:.3e} exceeds 1e-8"
+        );
+    }
+
+    /// The `VM_TANH` contract, dense (`vmath_tanh_exhaustive_ulp` is the full 2^32): ~2.1M bit
+    /// patterns striding the whole f32 range (both signs, subnormals through ±∞) plus ±64-ULP windows
+    /// around every special point, and (1) the dispatched kernel equals the scalar twin bit-for-bit —
+    /// NaN payload and sign, ±0, the crossover and the saturation edge included — and (2) every
+    /// non-NaN result is within 1 ULP of f64 `tanh` rounded to f32. Pins the specials by bits:
+    /// `tanh(±0) = ±0`, `tanh(±∞) = ±1`, `tanh(NaN)` is a quiet NaN carrying the input's payload and
+    /// sign, subnormals and every |x| < 2^-13 come back unchanged (that IS the correctly rounded
+    /// value), and the saturation edge is exact — the first f32 whose tanh rounds to 1.0 gives 1.0 and
+    /// its predecessor gives 1 − 2^-24.
+    #[test]
+    fn vmath_tanh_accuracy_and_specials() {
+        // Correctly rounded reference: below 2^-13 it is x itself (|x³/3| is under half an ULP of x
+        // for every mantissa), above 16 it is ±1 (1 − tanh(16) ≈ 2.5e-14 ≪ 2^-25).
+        let reference = |x: f32| -> f32 {
+            let ax = x.abs();
+            if ax < 2f32.powi(-13) {
+                x
+            } else if ax > 16.0 {
+                1.0f32.copysign(x)
+            } else {
+                f64::from(x).tanh() as f32
+            }
+        };
+        let ulp = |got: f32, want: f32| {
+            (i64::from(got.to_bits() as i32) - i64::from(want.to_bits() as i32)).abs()
+        };
+        let mut xs: Vec<f32> = Vec::with_capacity(1 << 22);
+        let mut b: u32 = 0;
+        while b <= 0x7F80_0000 {
+            xs.push(f32::from_bits(b));
+            xs.push(f32::from_bits(b | 0x8000_0000));
+            b += 1 << 11;
+        }
+        // The saturation edge, found from the reference itself: the first f32 past 9.0109 whose
+        // correctly rounded tanh is 1.0 (2/(e^{2x}+1) ≤ 2^-25 ⇔ x ≥ ln(2^26 − 1)/2 ≈ 9.0109133).
+        let edge = {
+            let mut e = 9.0108f32;
+            while reference(e) < 1.0 {
+                e = f32::from_bits(e.to_bits() + 1);
+            }
+            e
+        };
+        for c in [
+            0.0f32,
+            2f32.powi(-13),
+            2f32.powi(-12),
+            TANH_XC,
+            edge,
+            TANH_EXP_CLAMP,
+        ] {
+            let cb = c.to_bits();
+            for d in 0..=128u32 {
+                let bb = (cb + d).wrapping_sub(64);
+                xs.push(f32::from_bits(bb));
+                xs.push(f32::from_bits(bb | 0x8000_0000));
+            }
+        }
+        xs.extend_from_slice(&[
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(0x7FC0_1234),
+            f32::from_bits(0xFF80_0001),
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            f32::MAX,
+            f32::MIN,
+        ]);
+        let mut out = vec![0f32; xs.len()];
+        // SAFETY: both buffers are exactly xs.len() f32 long.
+        unsafe {
+            wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, VM_TANH);
+        }
+        let (mut worst, mut at_bound) = (0i64, 0u64);
+        for (i, &x) in xs.iter().enumerate() {
+            let got = out[i];
+            let twin = apply1(VM_TANH, x);
+            assert_eq!(
+                got.to_bits(),
+                twin.to_bits(),
+                "tanh({x:?}) ({:#010x}): kernel {got:?} vs scalar twin {twin:?}",
+                x.to_bits()
+            );
+            if x.is_nan() {
+                assert_eq!(
+                    got.to_bits(),
+                    x.to_bits() | 0x0040_0000,
+                    "tanh(NaN {:#010x}) must be that NaN, quieted, sign kept",
+                    x.to_bits()
+                );
+                continue;
+            }
+            let want = reference(x);
+            let d = ulp(got, want);
+            assert!(d <= 1, "tanh({x:?}) = {got:?}, want {want:?}: {d} ULP");
+            worst = worst.max(d);
+            at_bound += u64::from(d == 1);
+        }
+        assert!(
+            worst == 1 && at_bound > 1000,
+            "the sample must actually reach the 1-ULP bound (worst {worst}, {at_bound} at 1 ULP) — \
+             a sweep that never gets there proves nothing about it"
+        );
+        let t = |x: f32| apply1(VM_TANH, x);
+        assert_eq!(t(0.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(
+            t(-0.0).to_bits(),
+            (-0.0f32).to_bits(),
+            "tanh(-0.0) must be -0.0"
+        );
+        assert_eq!(t(f32::INFINITY).to_bits(), 1.0f32.to_bits());
+        assert_eq!(t(f32::NEG_INFINITY).to_bits(), (-1.0f32).to_bits());
+        for s in [
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            2f32.powi(-14),
+            -2f32.powi(-14),
+        ] {
+            assert_eq!(t(s).to_bits(), s.to_bits(), "tanh({s:?}) must be {s:?}");
+        }
+        assert_eq!(
+            edge.to_bits(),
+            0x4110_2CB4,
+            "saturation edge moved: {edge:?}"
+        );
+        assert_eq!(t(edge).to_bits(), 1.0f32.to_bits());
+        assert_eq!(t(-edge).to_bits(), (-1.0f32).to_bits());
+        let below = f32::from_bits(edge.to_bits() - 1);
+        assert_eq!(
+            t(below).to_bits(),
+            (1.0f32 - 2f32.powi(-24)).to_bits(),
+            "tanh just below the edge must be 1 − 2^-24"
+        );
+        assert_eq!(t(1e6).to_bits(), 1.0f32.to_bits());
+        assert_eq!(t(f32::MAX).to_bits(), 1.0f32.to_bits());
+    }
+
+    /// The **exhaustive** proof behind the `VM_TANH` ≤1-ULP bar: every one of the 2^32 bit patterns
+    /// through the monomorphized lanes, the `WUKONG_VMATH_FNPTR=1` lanes and the scalar twin,
+    /// bit-for-bit equal (NaN payloads, ±0, ±∞, subnormals included), and every non-NaN result within
+    /// 1 ULP of f64 `tanh` correctly rounded to f32 (the reference is x itself below 2^-13 and ±1
+    /// above 16, where those are provably the rounded values). Each flagged case is cross-checked
+    /// against a second f64 formulation (`expm1`-based) and the number of inputs on which the two
+    /// references round differently — the only place an f64 reference could mis-rank a case — is
+    /// reported.
+    ///
+    /// Design-sweep figures 2026-09-13 (the same scalar op sequence, all 2^32 inputs): max 1 ULP over
+    /// 4,278,190,082 non-NaN inputs,
+    /// ~5.2M of them at exactly 1 ULP, 0 at 2, 0 reference disagreements; the pre-change exp-composed
+    /// kernel measured 80 ULP over [0.017, 12.7] and returned +0.0 for every |x| < 2^-25 (2.1e9
+    /// inputs at ≥2 ULP, sign of zero lost).
+    ///
+    /// Run: `cargo test -p wukong_runtime --release vmath_tanh_exhaustive -- --ignored --nocapture`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "exhaustive bit sweep (~8 minutes: the twin's mul_add is a libm call without +fma); run explicitly in --release"]
+    fn vmath_tanh_exhaustive_ulp() {
+        assert!(
+            !cfg!(debug_assertions),
+            "exhaustive sweep — rebuild with --release (cargo test -p wukong_runtime --release \
+             vmath_tanh_exhaustive -- --ignored --nocapture)"
+        );
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            eprintln!("no avx2+fma — the lane paths are unreachable, nothing to sweep");
+            return;
+        }
+        const TANH_ULP_BAR: i64 = 1;
+        const CH: usize = 1 << 16;
+        let reference = |x: f32| -> f64 {
+            let ax = x.abs();
+            if ax < 2f32.powi(-13) {
+                f64::from(x)
+            } else if ax > 16.0 {
+                f64::from(1.0f32.copysign(x))
+            } else {
+                f64::from(x).tanh()
+            }
+        };
+        let reference2 = |x: f32| -> f64 {
+            let ax = f64::from(x.abs());
+            let v = if ax < 0.5 {
+                let e = (2.0 * ax).exp_m1();
+                e / (e + 2.0)
+            } else {
+                1.0 - 2.0 / ((2.0 * ax).exp() + 1.0)
+            };
+            if x < 0.0 {
+                -v
+            } else {
+                v
+            }
+        };
+        let (mut xs, mut a, mut b) = (vec![0f32; CH], vec![0f32; CH], vec![0f32; CH]);
+        let t0 = std::time::Instant::now();
+        let (mut worst, mut worst_at, mut n1, mut disagree, mut total) =
+            (0i64, 0f32, 0u64, 0u64, 0u64);
+        let mut base: u64 = 0;
+        while base < 1u64 << 32 {
+            for (k, x) in xs.iter_mut().enumerate() {
+                *x = f32::from_bits((base + k as u64) as u32);
+            }
+            // SAFETY: avx2+fma detected above; all three buffers are exactly CH f32 long.
+            unsafe {
+                run_mono(xs.as_ptr(), a.as_mut_ptr(), CH, VM_TANH, false);
+                run_fnptr(xs.as_ptr(), b.as_mut_ptr(), CH, VM_TANH, false);
+            }
+            for k in 0..CH {
+                let (got, x) = (a[k], xs[k]);
+                assert_eq!(
+                    got.to_bits(),
+                    b[k].to_bits(),
+                    "tanh x={x:?} ({:#010x}): mono vs fnptr",
+                    x.to_bits()
+                );
+                assert_eq!(
+                    got.to_bits(),
+                    apply1(VM_TANH, x).to_bits(),
+                    "tanh x={x:?} ({:#010x}): mono vs scalar twin",
+                    x.to_bits()
+                );
+                if x.is_nan() {
+                    assert!(got.is_nan(), "tanh(NaN {:#010x}) = {got:?}", x.to_bits());
+                    continue;
+                }
+                total += 1;
+                let want = reference(x);
+                let rounded = want as f32;
+                let d =
+                    (i64::from(got.to_bits() as i32) - i64::from(rounded.to_bits() as i32)).abs();
+                if d >= 1 {
+                    n1 += 1;
+                    if (reference2(x) as f32).to_bits() != rounded.to_bits() {
+                        disagree += 1;
+                    }
+                }
+                if d > worst {
+                    worst = d;
+                    worst_at = x;
+                }
+            }
+            base += CH as u64;
+        }
+        eprintln!(
+            "tanh exhaustive: all 2^32 f32 — mono == fnptr == scalar twin, bit-for-bit; {total} non-NaN \
+             inputs vs f64 tanh: max {worst} ULP at {worst_at:?}, {n1} at ≥1 ULP, {disagree} on which the \
+             two f64 references round differently ({:.1}s)",
+            t0.elapsed().as_secs_f64()
+        );
+        assert!(
+            worst <= TANH_ULP_BAR,
+            "tanh max {worst} ULP at {worst_at:?} exceeds {TANH_ULP_BAR}"
+        );
     }
 
     /// The **exhaustive** sweep behind the shipped exp/log accuracy bars, and the full-domain proof

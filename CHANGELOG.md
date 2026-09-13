@@ -5,6 +5,28 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### `tanh` to ≤1 ULP over the whole f32 domain (W13)
+
+The dispatched `tanh` kernel (`wukong_vmath_f32`, `VM_TANH`) was `1 − 2/(e^{2x}+1)`: the subtraction
+cancels for small |x|, so the 2026-09 evaluation measured 44 ULP on its band against oneMKL VML's 1
+and declined to count the 3.0–4.3× speed lead. Exhaustively the old kernel was worse than that: 80 ULP
+over [0.017, 12.7], and `+0.0` for every |x| < 2^-25 — sign of zero included — because `e^{2x}`
+rounds to exactly 1 there. The kernel is now two regions, each one exact "big part" plus a small
+correction rounded once: an odd degree-5 minimax polynomial in x² below 0.75 (`fma(x·x², P, x)`),
+and above it the exp form rebuilt on the same 8-bucket table with a quartic `e^r − 1`, a rotated
+bucket index that makes `E + 1` exact in f32, and `fnmadd(2, 1/(E+1), 1)`. The design sweep over all 2^32
+bit patterns of the same scalar op sequence read max **1 ULP** against f64 `tanh` rounded to f32 (the
+in-tree `vmath_tanh_exhaustive_ulp` repeats it with the lanes and the twin; its first full run is
+pending on an idle host); every lane == scalar twin bit-for-bit on a 2.1M-point stride of the domain,
+and ±0/±∞/NaN payload/subnormals/the saturation edge
+(0x41102CB4 → 1.0, its predecessor → 1 − 2^-24) pinned by `vmath_tanh_accuracy_and_specials`. The
+composed activations (`gelu`, `mish`, `tanhshrink`, `tanh_backward`, `gelu_backward`) keep the
+exp-composed form (`tanh_exp1`/`tanh_exp8`) so they stay bit-identical to their inlined MIR twins;
+the inlined scalar `emit_tanh` is unchanged. Cost: 35 SIMD ops per vector with one `vdivps` against
+the old 20 with one — an agent-local same-process A/B reads the new kernel at 1.72× the old kernel's
+time (directional only; the campaign instrument re-measures it), which by the evaluation's own
+ratios leaves it 1.8–2.5× ahead of VML at matched accuracy rather than 3.0–4.3× ahead unmatched.
+
 ### `@tile` — the six paths that still discarded a width in silence
 
 W2a made an unsupported *loop form* and a malformed *width* `E0309`, and the docs then said a `@tile`
