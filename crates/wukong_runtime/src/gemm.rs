@@ -113,6 +113,65 @@ fn select_kc(k: usize) -> usize {
     round_up(k.div_ceil(nblocks), 4) // multiple of the ×4 K-unroll; ≤ KC since k/nblocks ≤ KC
 }
 
+/// Usable L2 for one serial GEMM column block. The Redwood Cove P-core on this Meteor Lake part
+/// has a **2 MiB** private L2; this is the whole of it, because the three arrays budgeted against
+/// it in [`select_nc`] (the packed B panel, the packed A block, the live C column strip) are the
+/// only large working set the serial five-loop has in flight, and the B source rows stream through
+/// without reuse. Env-overridable (`WUKONG_GEMM_L2_BYTES`, read once) so the derivation stays
+/// A/B-measurable on a machine with a different L2. Blocking-only: it never changes the bits.
+const L2_BYTES: usize = 2 * 1024 * 1024;
+
+fn l2_bytes() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("WUKONG_GEMM_L2_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v >= 64 * 1024)
+            .unwrap_or(L2_BYTES)
+    })
+}
+
+/// Column-block width (`nc`) for the SERIAL five-loop — [`NC`] except when the row loop has no
+/// reuse to sell.
+///
+/// The packed B panel (`kc × nc`) is written once per `(jc, pc)` and read once per `ic` block.
+/// With several `ic` blocks the classic BLIS choice wins: make `NC` as wide as the L3 allows, so
+/// A is packed once and every extra `ic` pass re-reads an already-resident panel. That is what
+/// `NC = 4080` is for and it stays.
+///
+/// With a **single** `ic` block — `m <= MC`, the skinny/small-M regime — there is no reuse at all:
+/// every byte packed into B is read exactly once, so an L3-resident panel makes the pack a pure
+/// L2→L3→L2 round trip on top of the copy. MEASURED at `m=128, k=768, n=3072` (`kc=384`), where
+/// `nc = 3072` gives a 4.7 MiB panel: capping to `nc = 768` (a 1.18 MiB panel) took the
+/// macro-kernel from 95.5 to 107.7 GF/s and the whole phase sum from 7055 to 6245 us, level with
+/// the other `m=128` shapes instead of 12% below them (AGENT-LOCAL, `gemm_phase_cost`).
+///
+/// The cap solves `4·kc·nc + 4·mc·kc + 4·mc·nc <= L2` for `nc` — B panel, A block and the C column
+/// strip the tile writebacks touch — then splits `n` into the fewest equal-ish blocks under it, the
+/// same "no thin tail" rule [`select_kc`] uses for `k`. Result is a multiple of [`NR`] and `>= NR`.
+///
+/// Blocking-only: `nc` changes which C columns are computed together, never the per-`(i, j)` order
+/// of the K reduction, so every output bit is unchanged and serial stays bit-identical to parallel.
+fn select_nc(m: usize, k: usize, n: usize) -> usize {
+    if m > MC {
+        return NC;
+    }
+    let (mc, kc) = (m.min(MC), select_kc(k));
+    let l2 = l2_bytes();
+    let a_block = 4 * round_up(mc, MR) * kc;
+    // Saturating: a pathological `WUKONG_GEMM_L2_BYTES` smaller than the A block alone must fall
+    // back to one NR-wide panel, not wrap.
+    let cap = l2.saturating_sub(a_block) / (4 * (kc + mc));
+    let cap = (cap & !(NR - 1)).clamp(NR, NC);
+    if n <= cap {
+        return NC; // one block either way; leave the classic path untouched
+    }
+    let nblocks = n.div_ceil(cap);
+    round_up(n.div_ceil(nblocks), NR).clamp(NR, NC)
+}
+
 /// A private rayon pool for the parallel GEMM, sized to the machine's **physical** core count instead
 /// of rayon's default (one worker per *logical* core). A compute-bound AVX2-FMA GEMM already saturates
 /// a core's two FMA pipes with a single thread, so the HyperThread sibling adds only scheduling
@@ -2523,7 +2582,10 @@ unsafe fn sgemm_avx2(
     // back at the end; the body between is panic-free so the buffers are always returned.
     let kc_max = k.min(KC);
     let mc_max = m.min(MC);
-    let nc_max = n.min(NC);
+    // Column-block width: NC except in the single-row-block regime, where the packed B panel has
+    // no ic-loop reuse and must stay in L2 (see `select_nc`).
+    let nc_step = select_nc(m, k, n);
+    let nc_max = n.min(nc_step);
     let ap_cap = round_up(mc_max, MR) * kc_max;
     let bp_cap = round_up(nc_max, NR) * kc_max;
     let (mut ap, mut bp) = PACK_SCRATCH.with(|c| {
@@ -2539,7 +2601,7 @@ unsafe fn sgemm_avx2(
 
     let mut jc = 0;
     while jc < n {
-        let nc = (n - jc).min(NC);
+        let nc = (n - jc).min(nc_step);
         let mut pc = 0;
         while pc < k {
             let kc = (k - pc).min(select_kc(k));
@@ -2573,7 +2635,7 @@ unsafe fn sgemm_avx2(
             }
             pc += kc;
         }
-        jc += NC;
+        jc += nc_step;
     }
 
     // Return the (now larger) buffers to the per-thread cache for the next call to reuse.
@@ -2649,6 +2711,13 @@ unsafe fn pack_b(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut f32) 
 /// `[kc][NR]`-per-panel form the microkernel expects. Reads run *contiguously* down each B row (the
 /// `p` loop is innermost) and scatter into the small, L1-resident packed panel; the naive transpose
 /// order (strided B reads) thrashes cache and dominates runtime, so this order is essential.
+///
+/// The bulk is done eight contraction steps at a time by [`transpose8x8_into`], the standard AVX2
+/// in-register 8x8 transpose (BLIS's and oneDNN's packing kernels are the same shape). The scalar
+/// order below it is retained verbatim as the **twin**: it defines the packed bytes, the vector
+/// path must reproduce them exactly, and `pack_b_trans_panel_simd_matches_scalar_twin` asserts
+/// that bit-for-bit — including on NaN and signed zero, which a pure data movement must carry
+/// through unchanged (no comparison, no arithmetic, so no `_mm256_max_ps`-style tie hazard here).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn pack_b_trans_panel(
@@ -2661,9 +2730,23 @@ unsafe fn pack_b_trans_panel(
 ) {
     let j0 = jp * NR;
     let ncols = (nc - j0).min(NR);
+    // Vector path: full NR-wide panels only, eight contraction steps per iteration. Two 8x8
+    // transposes fill one 8-step slab of the [kc][NR] panel — rows j0..j0+8 into packed lanes
+    // 0..8, rows j0+8..j0+16 into lanes 8..16. This replaces 128 four-byte stores at a 64-byte
+    // stride (which is what the scalar twin below issues, one store per element, never
+    // coalescable) with 16 thirty-two-byte stores, plus 16 loads and 48 shuffles.
+    let mut p0 = 0;
+    if ncols == NR {
+        while p0 + 8 <= kc {
+            transpose8x8_into(b.add(j0 * ldb + p0), ldb, panel.add(p0 * NR));
+            transpose8x8_into(b.add((j0 + 8) * ldb + p0), ldb, panel.add(p0 * NR + 8));
+            p0 += 8;
+        }
+    }
+    // Scalar twin: the contraction tail (`kc % 8`), and every partial (< NR) column panel.
     for r in 0..ncols {
         let src = b.add((j0 + r) * ldb); // row (j0+r) of B, contiguous over the contraction
-        for p in 0..kc {
+        for p in p0..kc {
             *panel.add(p * NR + r) = *src.add(p);
         }
     }
@@ -2672,6 +2755,61 @@ unsafe fn pack_b_trans_panel(
             *panel.add(p * NR + r) = 0.0;
         }
     }
+}
+
+/// Transpose an 8x8 f32 block: read eight rows of eight contraction-contiguous floats at
+/// `src + r*ldb`, write eight packed rows of eight floats at `dst + p*NR`, so that
+/// `dst[p*NR + r] == src[r*ldb + p]`.
+///
+/// The classic AVX2 sequence: 8 `unpack` (pair rows within each 128-bit half), 8 `shuffle`
+/// (quad them), 8 `permute2f128` (swap the halves) — 24 shuffle-port ops for 64 elements. It is
+/// pure lane movement: every output bit is an input bit, so NaN payloads and signed zeros are
+/// carried through unchanged and the result is byte-identical to the element-at-a-time twin.
+///
+/// # Safety
+/// `avx2` (caller has the `target_feature`). `src` must be readable for eight rows of eight f32
+/// at stride `ldb`; `dst` writable for eight rows of eight f32 at stride `NR`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn transpose8x8_into(src: *const f32, ldb: usize, dst: *mut f32) {
+    use std::arch::x86_64::*;
+    let r0 = _mm256_loadu_ps(src);
+    let r1 = _mm256_loadu_ps(src.add(ldb));
+    let r2 = _mm256_loadu_ps(src.add(2 * ldb));
+    let r3 = _mm256_loadu_ps(src.add(3 * ldb));
+    let r4 = _mm256_loadu_ps(src.add(4 * ldb));
+    let r5 = _mm256_loadu_ps(src.add(5 * ldb));
+    let r6 = _mm256_loadu_ps(src.add(6 * ldb));
+    let r7 = _mm256_loadu_ps(src.add(7 * ldb));
+    // Pair adjacent rows inside each 128-bit half.
+    let t0 = _mm256_unpacklo_ps(r0, r1);
+    let t1 = _mm256_unpackhi_ps(r0, r1);
+    let t2 = _mm256_unpacklo_ps(r2, r3);
+    let t3 = _mm256_unpackhi_ps(r2, r3);
+    let t4 = _mm256_unpacklo_ps(r4, r5);
+    let t5 = _mm256_unpackhi_ps(r4, r5);
+    let t6 = _mm256_unpacklo_ps(r6, r7);
+    let t7 = _mm256_unpackhi_ps(r6, r7);
+    // Quad them: 0x44 takes lanes (0,1) of each source, 0xEE takes lanes (2,3).
+    let u0 = _mm256_shuffle_ps::<0x44>(t0, t2);
+    let u1 = _mm256_shuffle_ps::<0xEE>(t0, t2);
+    let u2 = _mm256_shuffle_ps::<0x44>(t1, t3);
+    let u3 = _mm256_shuffle_ps::<0xEE>(t1, t3);
+    let u4 = _mm256_shuffle_ps::<0x44>(t4, t6);
+    let u5 = _mm256_shuffle_ps::<0xEE>(t4, t6);
+    let u6 = _mm256_shuffle_ps::<0x44>(t5, t7);
+    let u7 = _mm256_shuffle_ps::<0xEE>(t5, t7);
+    // Cross the 128-bit halves: 0x20 = (A_lo, B_lo) -> contraction steps 0..4,
+    // 0x31 = (A_hi, B_hi) -> steps 4..8.
+    _mm256_storeu_ps(dst, _mm256_permute2f128_ps::<0x20>(u0, u4));
+    _mm256_storeu_ps(dst.add(NR), _mm256_permute2f128_ps::<0x20>(u1, u5));
+    _mm256_storeu_ps(dst.add(2 * NR), _mm256_permute2f128_ps::<0x20>(u2, u6));
+    _mm256_storeu_ps(dst.add(3 * NR), _mm256_permute2f128_ps::<0x20>(u3, u7));
+    _mm256_storeu_ps(dst.add(4 * NR), _mm256_permute2f128_ps::<0x31>(u0, u4));
+    _mm256_storeu_ps(dst.add(5 * NR), _mm256_permute2f128_ps::<0x31>(u1, u5));
+    _mm256_storeu_ps(dst.add(6 * NR), _mm256_permute2f128_ps::<0x31>(u2, u6));
+    _mm256_storeu_ps(dst.add(7 * NR), _mm256_permute2f128_ps::<0x31>(u3, u7));
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3327,9 +3465,109 @@ mod tests {
             (100, 100, 100),
             (128, 256, 512),
             (200, 200, 200),
+            // Small m with n past the L2 column cap: `select_nc` splits these into several jc
+            // blocks (see the `select_nc_*` tests), a path no other size here reaches.
+            (12, 384, 1400),
+            (6, 384, 1400),
+            (145, 384, 1400), // m just OVER MC: must stay on the classic single-NC-block path
         ] {
             check(m, k, n);
         }
+    }
+
+    /// `select_nc`'s policy, as a pure function: the classic `NC` everywhere except the
+    /// single-row-block regime, and there a multiple of `NR` that keeps the packed B panel, the
+    /// packed A block and the live C column strip inside L2.
+    #[test]
+    fn select_nc_keeps_the_classic_block_outside_the_small_m_regime() {
+        // m > MC: several ic blocks amortise an L3-resident panel - unchanged.
+        for &(m, k, n) in &[
+            (145usize, 384usize, 3072usize),
+            (512, 3072, 3072),
+            (2048, 2048, 2048),
+        ] {
+            assert_eq!(select_nc(m, k, n), NC, "m={m} k={k} n={n}");
+        }
+        // m <= MC but n already inside the cap: still one block, so leave it alone.
+        assert_eq!(select_nc(128, 768, 768), NC);
+        assert_eq!(select_nc(1, 1, 1), NC);
+    }
+
+    #[test]
+    fn select_nc_caps_the_panel_to_l2_when_there_is_one_row_block() {
+        // The measured case: m=128, kc=384, n=3072 -> four 768-wide blocks (1.18 MiB panel)
+        // instead of one 3072-wide one (4.7 MiB, which does not fit a 2 MiB L2).
+        assert_eq!(
+            select_nc(128, 768, 3072),
+            768,
+            "expected the four-block split"
+        );
+        for &(m, k, n) in &[
+            (128usize, 768usize, 3072usize),
+            (128, 3072, 3072),
+            (6, 384, 1400),
+            (144, 4096, 8192),
+            (37, 512, 4000),
+        ] {
+            let nc = select_nc(m, k, n);
+            let (mc, kc) = (m.min(MC), select_kc(k));
+            assert!(
+                nc >= NR && nc.is_multiple_of(NR),
+                "nc={nc} must be a positive NR multiple"
+            );
+            assert!(nc <= NC, "nc={nc} must not exceed NC");
+            // The budget the cap is derived from actually holds.
+            let bytes = 4 * (kc * nc + round_up(mc, MR) * kc + mc * nc);
+            assert!(
+                bytes <= L2_BYTES,
+                "m={m} k={k} n={n}: nc={nc} needs {bytes} B of a {L2_BYTES} B L2"
+            );
+            // No thin tail: the last block is at least half a full one.
+            let last = n - (n.div_ceil(nc) - 1) * nc;
+            assert!(
+                last * 2 >= nc,
+                "m={m} k={k} n={n}: tail block {last} of {nc}"
+            );
+        }
+    }
+
+    /// The column-block split must be **blocking only**. `nc` decides which C columns are
+    /// computed together and nothing else; the per-`(i, j)` K reduction order is untouched, so
+    /// the serial kernel must still equal the parallel one bit-for-bit at a shape that actually
+    /// takes the new multi-jc-block path (`m <= MC`, `n` past the L2 cap). The parallel path does
+    /// its own blocking and this change does not touch it, so it is the independent witness.
+    #[test]
+    fn small_m_wide_n_serial_matches_parallel_bit_for_bit() {
+        let (m, k, n) = (128usize, 384usize, 1400usize);
+        assert!(
+            select_nc(m, k, n) < n,
+            "shape must exercise the multi-block path"
+        );
+        let a = fill(3, m * k);
+        let b = fill(4, n * k);
+        let mut serial = vec![0.0f32; m * n];
+        let mut par = vec![0.0f32; m * n];
+        unsafe {
+            wukong_sgemm_nt(
+                a.as_ptr(),
+                b.as_ptr(),
+                serial.as_mut_ptr(),
+                m as i64,
+                k as i64,
+                n as i64,
+                0,
+            );
+            wukong_sgemm_nt_parallel(
+                a.as_ptr(),
+                b.as_ptr(),
+                par.as_mut_ptr(),
+                m as i64,
+                k as i64,
+                n as i64,
+                0,
+            );
+        }
+        assert_eq!(serial, par, "serial != parallel at {m}x{k}x{n}");
     }
 
     #[test]
@@ -5472,6 +5710,202 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The transposing B-packer's AVX2 8x8 path must be **byte-identical** to the scalar
+    /// element-at-a-time twin it replaced. Packing is pure data movement, so "byte-identical"
+    /// is the whole contract: every packed f32 must carry its exact bit pattern, NaN payloads,
+    /// signed zeros and denormals included, or the microkernel's products change and the
+    /// interpreter-vs-native differential oracle breaks.
+    ///
+    /// The twin here is a literal transcription of the pre-vectorisation loop. Sizes cover the
+    /// vector body (`kc` a multiple of 8), the scalar contraction tail (`kc % 8 != 0`, incl.
+    /// `kc < 8` where the vector path never runs), full `NR`-wide panels and the partial last
+    /// panel (which stays scalar and must still zero-fill lanes `ncols..NR`).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pack_b_trans_panel_simd_matches_scalar_twin() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        /// The pre-vectorisation packer, verbatim.
+        unsafe fn twin(
+            b: *const f32,
+            ldb: usize,
+            kc: usize,
+            nc: usize,
+            jp: usize,
+            panel: *mut f32,
+        ) {
+            let j0 = jp * NR;
+            let ncols = (nc - j0).min(NR);
+            for r in 0..ncols {
+                let src = b.add((j0 + r) * ldb);
+                for p in 0..kc {
+                    *panel.add(p * NR + r) = *src.add(p);
+                }
+            }
+            for r in ncols..NR {
+                for p in 0..kc {
+                    *panel.add(p * NR + r) = 0.0;
+                }
+            }
+        }
+        // Values whose BITS must survive: quiet and signalling NaN with distinct payloads,
+        // both infinities, both zeros, a denormal, and ordinary magnitudes.
+        let specials = [
+            f32::from_bits(0x7FC0_0000), // qNaN
+            f32::from_bits(0x7FC0_DEAD), // qNaN, distinct payload
+            f32::from_bits(0xFFA0_0BAD), // sNaN, sign set
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0f32,
+            -0.0f32,
+            f32::from_bits(0x0000_0001), // smallest denormal
+            -1.5,
+            3.25,
+        ];
+        for &(kc, nc, ldb) in &[
+            (8usize, 16usize, 8usize),
+            (8, 16, 37),
+            (16, 32, 16),
+            (24, 16, 100),
+            (7, 16, 7),   // kc < 8: vector path never runs
+            (13, 16, 64), // 8 vector steps + 5 scalar
+            (32, 16, 32),
+            (32, 20, 40), // partial last panel (ncols = 4)
+            (17, 33, 64), // partial last panel (ncols = 1) + scalar tail
+            (64, 48, 71),
+        ] {
+            let src: Vec<f32> = (0..nc * ldb)
+                .map(|i| {
+                    if i % 5 == 0 {
+                        specials[(i / 5) % specials.len()]
+                    } else {
+                        (i as f32) * 0.5 - 7.0
+                    }
+                })
+                .collect();
+            for jp in 0..nc.div_ceil(NR) {
+                let mut got = vec![f32::from_bits(0xDEAD_BEEF); kc * NR];
+                let mut want = vec![f32::from_bits(0xDEAD_BEEF); kc * NR];
+                unsafe {
+                    pack_b_trans_panel(src.as_ptr(), ldb, kc, nc, jp, got.as_mut_ptr());
+                    twin(src.as_ptr(), ldb, kc, nc, jp, want.as_mut_ptr());
+                }
+                let gb: Vec<u32> = got.iter().map(|x| x.to_bits()).collect();
+                let wb: Vec<u32> = want.iter().map(|x| x.to_bits()).collect();
+                assert_eq!(
+                    gb, wb,
+                    "packed bytes differ (kc={kc} nc={nc} ldb={ldb} jp={jp})"
+                );
+            }
+        }
+    }
+
+    /// **Dev instrument, `#[ignore]`d** — the phase breakdown of the serial NT five-loop at the
+    /// skinny shapes the 2026-09 CPU evaluation lost on. Times the transposing B-pack, the
+    /// A-pack and the macro-kernel separately, at exactly the block sizes `sgemm_avx2` would
+    /// use, so "packing costs X% of this shape" is a measured quantity rather than a model.
+    ///
+    /// The timing thread is pinned to logical CPU 0 (a P-core on this 6P+8E+2LP-E part): an
+    /// unpinned single-thread loop migrates onto a half-FMA-width Crestmont E-core mid-run and
+    /// read the SAME macro-kernel call at 622 us and 727 us in one process before the pin.
+    ///
+    /// Not a correctness gate and not a campaign number: it prints, asserts nothing, and is
+    /// `#[ignore]`d so `cargo test --workspace` never spends time in it. Run it deliberately:
+    /// `cargo test --release -p wukong_runtime --lib -- --ignored --nocapture gemm_phase_cost`
+    #[test]
+    #[ignore = "dev perf instrument; prints a phase breakdown, asserts nothing"]
+    #[cfg(target_arch = "x86_64")]
+    fn gemm_phase_cost() {
+        use std::time::Instant;
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        pin_worker_to_cpu(0);
+        println!("AGENT-LOCAL, DIRECTIONAL ONLY (best-of-5 batches per phase, warm-up discarded)");
+        println!(
+            "  {:<16} {:>4} {:>9} {:>9} {:>9} {:>9} {:>7} {:>9}",
+            "M x K x N", "jcb", "packB us", "packA us", "macro us", "total us", "pack%", "macro GF"
+        );
+        for &(m, k, n, nc_cap) in &[
+            (128usize, 768usize, 768usize, 4080usize),
+            (128, 768, 3072, 4080),
+            (128, 768, 3072, 768), // the L2-capped B-panel variant of the row above
+            (128, 3072, 768, 4080),
+            (512, 768, 768, 4080),
+            (512, 3072, 768, 4080),
+            (1536, 3072, 768, 4080),
+        ] {
+            let a = fill(1, m * k);
+            let b = fill(2, n * k);
+            let mut c = vec![0.0f32; m * n];
+            let kc = select_kc(k);
+            // Equal-ish column blocks under the cap, the way `sgemm_avx2` would walk them.
+            let jcb = n.div_ceil(nc_cap.min(NC));
+            let nc = round_up(n.div_ceil(jcb), NR).min(n);
+            let mc = m.min(MC);
+            let mut ap = vec![0.0f32; round_up(mc, MR) * kc];
+            let mut bp = vec![0.0f32; round_up(nc, NR) * kc];
+            let nkb = k.div_ceil(kc);
+            let nib = m.div_ceil(MC);
+            // Call counts the real five-loop makes: B once per (jc, pc), A and the macro
+            // kernel once per (jc, pc, ic).
+            let (cb, ca) = (jcb * nkb, jcb * nkb * nib);
+
+            let best = |reps: usize, f: &mut dyn FnMut()| -> f64 {
+                f();
+                let mut lo = f64::INFINITY;
+                for _ in 0..5 {
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        f();
+                    }
+                    lo = lo.min(t.elapsed().as_secs_f64() / reps as f64);
+                }
+                lo
+            };
+            let tb = unsafe {
+                best(cb.max(2), &mut || {
+                    pack_b_block(b.as_ptr(), k, n, 0, 0, kc, nc, true, bp.as_mut_ptr())
+                })
+            } * cb as f64;
+            let ta = unsafe {
+                best(ca.max(2), &mut || {
+                    pack_a(a.as_ptr(), k, mc, kc, ap.as_mut_ptr())
+                })
+            } * ca as f64;
+            let tm1 = unsafe {
+                best(ca.max(2), &mut || {
+                    macro_kernel(
+                        mc,
+                        nc,
+                        kc,
+                        ap.as_ptr(),
+                        bp.as_ptr(),
+                        c.as_mut_ptr(),
+                        n,
+                        1.0,
+                        None,
+                    )
+                })
+            };
+            let tm = tm1 * ca as f64;
+            let total = tb + ta + tm;
+            // Macro-kernel throughput on the work it actually issues (mc x nc x kc per call),
+            // NOT on the shape's nominal flops: the last ic block is shorter than `mc`.
+            let macro_gf = 2.0 * mc as f64 * nc as f64 * kc as f64 / tm1 / 1e9;
+            println!(
+                "  {:<16} {jcb:>4} {:9.0} {:9.0} {:9.0} {:9.0} {:6.1}% {macro_gf:9.1}",
+                format!("{m}x{k}x{n}"),
+                tb * 1e6,
+                ta * 1e6,
+                tm * 1e6,
+                total * 1e6,
+                (tb + ta) / total * 100.0,
+            );
         }
     }
 }
