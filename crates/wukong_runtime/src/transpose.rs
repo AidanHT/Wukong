@@ -93,6 +93,37 @@ unsafe fn transpose_rows<T: Copy>(
 /// (own TU, shared library, ABBA, best-of-N, pinned to one P-core): 1024² **7.2x**, 1536² **5.9x**,
 /// 2048² **5.3x**; at the non-colliding 1000² / 1031² where nobody thrashes, **1.42x**.
 ///
+/// TRAVERSAL INSIDE THE BLOCK: **the 8-column j-tile is the OUTER of the two inner loops and the
+/// 8-row i-strip the inner one**, which is the opposite of the obvious nesting and is worth about
+/// 1.09-1.26x on its own. The reason is the burst length of destination store MISSES. Every
+/// destination line is written by two 32-byte stores (`i` and `i+8`), so what matters is how many
+/// *distinct* destination lines are in flight between the two halves:
+///
+///  * i-strip outer: one pass over the block stores into all `B` = 32 destination rows before `i`
+///    advances, so 32 lines are opened back to back, all missing, and only then does the next strip
+///    close them. A burst of 32 concurrent store misses against roughly a dozen L1 fill buffers
+///    stalls the in-order store queue.
+///  * j-tile outer: only the tile's **eight** destination rows are open while all four i-strips of
+///    the block run, so the misses arrive in bursts of 8 — inside the fill-buffer count — and every
+///    second strip hits a line the previous strip already owns.
+///
+/// That this is the burst length and not store *adjacency* was checked directly: a 16-wide-in-`i`
+/// tile that writes each destination line with two ADJACENT `vmovups` while keeping the i-outer
+/// nesting recovers none of it (measured slower than the plain 8x8 at 1031² and 1100x950), while the
+/// loop swap alone recovers all of it.
+///
+/// Prefetching the next j-tile's eight destination rows starts their fill about one tile group
+/// (four 8x8 tiles, roughly a hundred cycles of shuffle work) early, and is worth a further ~1.06x.
+/// The hint asked for is `_MM_HINT_ET0`, the *write* intent, because these lines are about to be
+/// stored to — but this crate is built for baseline x86-64 and only turns on `avx2`, and `PRFCHW`
+/// is a separate feature that Haswell (AVX2, no PRFCHW) does not have, so LLVM lowers it to
+/// **`prefetcht0`** and the release assembly of this function contains 22 `prefetcht0` and zero
+/// `prefetchw`. That is deliberate, not an oversight: emitting `prefetchw` would need its own
+/// `is_x86_feature_detected!("prfchw")` arm or it would be a `#UD` on Haswell, and the plain read
+/// hint measured within noise of the write hint on this part (worth 2-5%, not worth a second
+/// dispatch). The write intent is kept in the source so that a future `prfchw`-gated arm is a
+/// one-line change.
+///
 /// The `rows % 8` trailing rows and `cols % 8` trailing columns of each block fall back to the same
 /// scalar moves [`transpose_rows`] uses.
 ///
@@ -119,10 +150,28 @@ unsafe fn transpose_rows_f32_avx2(
             let jmax = (jb + B).min(cols);
             let i8max = imax.min(r8);
             let j8max = jmax.min(c8);
-            let mut i = ib;
-            while i + 8 <= i8max {
-                let mut j = jb;
-                while j + 8 <= j8max {
+            // Does this block write into the SECOND cache line (byte 64) of a destination row?
+            // Only then is that line worth prefetching, and only then is `ib + 16` inside `dst`.
+            let pf_two_lines = ib + 16 < imax;
+            // The j-tile is the OUTER loop and the i-strip the inner one — see the header: it caps
+            // the concurrent destination store misses at eight instead of `B`.
+            let mut j = jb;
+            while j + 8 <= j8max {
+                // Start the read-for-ownership of the NEXT j-tile's eight destination rows now.
+                if j + 16 <= j8max {
+                    let p = dst.add((j + 8) * rows + ib) as *const i8;
+                    let mut r = 0;
+                    while r < 8 {
+                        let q = p.add(r * rows * 4);
+                        _mm_prefetch::<_MM_HINT_ET0>(q);
+                        if pf_two_lines {
+                            _mm_prefetch::<_MM_HINT_ET0>(q.add(64));
+                        }
+                        r += 1;
+                    }
+                }
+                let mut i = ib;
+                while i + 8 <= i8max {
                     let s = src.add(i * cols + j);
                     let r0 = _mm256_loadu_ps(s);
                     let r1 = _mm256_loadu_ps(s.add(cols));
@@ -160,18 +209,22 @@ unsafe fn transpose_rows_f32_avx2(
                     _mm256_storeu_ps(d.add(5 * rows), _mm256_permute2f128_ps(u1, u5, 0x31));
                     _mm256_storeu_ps(d.add(6 * rows), _mm256_permute2f128_ps(u2, u6, 0x31));
                     _mm256_storeu_ps(d.add(7 * rows), _mm256_permute2f128_ps(u3, u7, 0x31));
-                    j += 8;
+                    i += 8;
                 }
-                // cols % 8 trailing columns of this 8-row strip.
-                while j < jmax {
-                    for ii in i..i + 8 {
-                        *dst.add(j * rows + ii) = *src.add(ii * cols + j);
-                    }
-                    j += 1;
-                }
-                i += 8;
+                j += 8;
             }
-            // rows % 8 trailing rows of this block.
+            // cols % 8 trailing columns of this block, over the rows the 8-row strips covered.
+            while j < jmax {
+                let mut i = ib;
+                while i < i8max {
+                    *dst.add(j * rows + i) = *src.add(i * cols + j);
+                    i += 1;
+                }
+                j += 1;
+            }
+            // rows % 8 trailing rows of this block, full width. `i8max < ib` when the whole block
+            // sits past the last multiple of 8, so clamp rather than start below `ib`.
+            let mut i = i8max.max(ib);
             while i < imax {
                 let srow = src.add(i * cols);
                 for j in jb..jmax {
@@ -386,6 +439,10 @@ mod tests {
             (257, 1),
             (300, 400), // > TRANSPOSE_PAR_MIN so the multicore path runs
             (128, 128), // power-of-two stride: the L1-set-collision shape the 8x8 tile exists for
+            (35, 35),   // a block wholly past the last multiple of 8 (the row-tail clamp)
+            (40, 41),   // a column tail beside two row blocks
+            (72, 72),   // a last column block of exactly one j-tile (no next-tile prefetch)
+            (120, 96),  // many blocks, no tail in either dimension
         ] {
             let src: Vec<f32> = (0..r * c).map(|i| i as f32 * 0.5 - 3.0).collect();
             let want = naive_transpose(&src, r, c);
@@ -471,6 +528,18 @@ mod tests {
             (64, 64),
             (70, 100),
             (128, 128),
+            // The j-tile-outer traversal hoisted both tails out of the strip loop, so pin the
+            // shapes where a hoisted tail can go wrong: a block whose rows are ENTIRELY past the
+            // last multiple of 8 (35, 36 -> the second block is rows 32..35 with no 8-row strip at
+            // all, the `i8max.max(ib)` clamp), a column tail beside several row blocks (40x41,
+            // 48x40), a last column block of exactly one j-tile so the next-tile prefetch is
+            // skipped (72x72), and a many-block shape with no tail anywhere (120x96).
+            (35, 35),
+            (36, 72),
+            (40, 41),
+            (48, 40),
+            (72, 72),
+            (120, 96),
         ] {
             // Raw bit patterns, cycling through the awkward ones. A transpose must not care.
             let pool: [u32; 10] = [

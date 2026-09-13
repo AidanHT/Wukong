@@ -3,8 +3,9 @@
 //! entry pair each: the **sum** `out[j] = Σ_i x[i,j]` (bias gradient `db = Σ_batch dY`, batch sum,
 //! reduce-along-axis-0), **max** / **min** / **maxabs** (per-channel statistics for quantization,
 //! axis-0 max/min pooling), **sumsq**, and the three that add a scalar finalize over the folded column
-//! — **mean** (`/rows`), **l2** (`sqrt`), **rms** (`sqrt(_/rows)`), applied by [`colreduce_finalize`]
-//! per column and so independent of the parallel column split.
+//! — **mean** (`/rows`), **l2** (`sqrt`), **rms** (`sqrt(_/rows)`), applied per column by
+//! [`colreduce_finalize_avx2`] (8 columns per `vdivps`/`vsqrtps`) or its scalar reference
+//! [`colreduce_finalize`], and so independent of the parallel column split.
 //!
 //! The naive spelling `for j { for i { s ⊕= x[i*N+j] } }` reads `x` with stride `N` — a *strided
 //! reduction* gcc/rustc do **not** vectorize (verified: scalar `vaddss`/`vmaxss`, no packed
@@ -72,8 +73,10 @@ const COL_RB: usize = 4;
 
 /// Apply the per-column finalize for the statistics kinds over `out[j0..j1]` (after all rows folded):
 /// `Mean` → `/rows`, `L2` → `sqrt`, `Rms` → `sqrt(_/rows)`. `Sum`/`SumSq`/`Max`/`Min`/`MaxAbs` are
-/// no-ops. Scalar arithmetic only (a divide and/or a `sqrt`), identical in the AVX2 and scalar paths
-/// and independent of the column split, so it does not perturb the serial == parallel bit-equality.
+/// no-ops. **Scalar**, one column per iteration: this is the reference form, the finalize of the
+/// no-AVX2 twin [`colreduce_scalar`], and the tail of the vector form [`colreduce_finalize_avx2`] —
+/// which calls literally this function for its `(j1-j0) % 8` remainder rather than restating the
+/// arithmetic. Independent of the column split, so it does not perturb serial == parallel.
 ///
 /// # Safety
 /// `out` valid for `[j0, j1)` f32; `rows >= 1`.
@@ -99,6 +102,70 @@ unsafe fn colreduce_finalize(out: *mut f32, j0: usize, j1: usize, rows: usize, k
         }
         _ => {}
     }
+}
+
+/// AVX2 form of [`colreduce_finalize`]: eight columns per `vdivps`/`vsqrtps` instead of one per
+/// `vdivss`/`vsqrtss`, with the `(j1-j0) % 8` remainder handed straight to the scalar function.
+///
+/// WHY THIS EXISTS. LLVM does **not** vectorize the scalar finalize even when it is inlined into a
+/// `#[target_feature(enable = "avx2")]` caller: in the release assembly of [`colreduce_avx2`] the
+/// three statistics arms compile to `vmovss / vdivss / vsqrtss / vmovss / incq / cmpq / jne`, one
+/// column per iteration, and the whole function contains **zero** `vsqrtps` and **zero** `vdivps`.
+/// (Verified by `cargo rustc --release -p wukong_runtime --lib -- --emit asm`; the fold loops above
+/// are packed, only the finalize was left scalar.) On this part the ymm divider is pipelined at
+/// about 5 (`vdivps`) and 6 (`vsqrtps`) cycles per instruction against about 3 each for the scalar
+/// forms, so `Rms` costs roughly 6 divider-cycles per column scalar versus 11 per **eight** columns
+/// packed — about 4x on the finalize. It is a small share of a column reduction (about 3% of
+/// `colrms` at 1024x1024, less at more rows, since the finalize is O(cols) against an O(rows*cols)
+/// fold), which is precisely why nothing timed it and the scalar loop survived.
+///
+/// BIT-EXACTNESS. IEEE-754 requires `division` and `squareRoot` to be **correctly rounded**, and
+/// `DIVPS`/`SQRTPS` apply exactly the same correctly-rounded operation lane-wise, under the same
+/// MXCSR rounding mode and DAZ/FTZ state, that `DIVSS`/`SQRTSS` apply to one element — no cross-lane
+/// interaction and no reassociation is possible in a unary/one-divisor map. The NaN payload is
+/// determined here too (unlike the additive folds, whose SRC1 the optimizer may commute): the
+/// operand order `v / rows` is fixed in both forms, and both instructions return the quieted source
+/// NaN. So this is a strict bit-for-bit substitution and is tested as one, on NaN (quiet and
+/// signalling), +/-0, +/-inf, denormals and negative inputs to `sqrt`, at every tail offset —
+/// see `finalize_avx2_matches_scalar_bit_for_bit`.
+///
+/// # Safety
+/// `out` valid for `[j0, j1)` f32; `rows >= 1`; AVX2 available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn colreduce_finalize_avx2(out: *mut f32, j0: usize, j1: usize, rows: usize, kind: ColKind) {
+    use std::arch::x86_64::*;
+    let mut j = j0;
+    // One 8-wide map per statistics kind; the non-statistics kinds leave `j == j0` and fall through
+    // to the scalar no-op below, so there is no separate early return to keep in sync.
+    match kind {
+        ColKind::Mean => {
+            let d = _mm256_set1_ps(rows as f32);
+            while j + 8 <= j1 {
+                let p = out.add(j);
+                _mm256_storeu_ps(p, _mm256_div_ps(_mm256_loadu_ps(p), d));
+                j += 8;
+            }
+        }
+        ColKind::L2 => {
+            while j + 8 <= j1 {
+                let p = out.add(j);
+                _mm256_storeu_ps(p, _mm256_sqrt_ps(_mm256_loadu_ps(p)));
+                j += 8;
+            }
+        }
+        ColKind::Rms => {
+            let d = _mm256_set1_ps(rows as f32);
+            while j + 8 <= j1 {
+                let p = out.add(j);
+                _mm256_storeu_ps(p, _mm256_sqrt_ps(_mm256_div_ps(_mm256_loadu_ps(p), d)));
+                j += 8;
+            }
+        }
+        _ => {}
+    }
+    // The `< 8` remainder, and every non-statistics kind, through the scalar reference itself.
+    colreduce_finalize(out, j, j1, rows, kind);
 }
 
 /// The five per-element folds, as ordinary (non-`target_feature`) `#[inline(always)]` functions so
@@ -349,8 +416,10 @@ unsafe fn colreduce_avx2(
         }
     }
     // Per-column finalize for the statistics kinds (Mean -> /rows, L2 -> sqrt, Rms -> sqrt(/rows));
-    // a no-op for Sum/SumSq/Max/Min/MaxAbs. Identical scalar arithmetic in both paths.
-    colreduce_finalize(out, j0, j1, rows, kind);
+    // a no-op for Sum/SumSq/Max/Min/MaxAbs. Packed here and scalar in the twin, which is a bit-exact
+    // substitution because divide and sqrt are correctly rounded and lane-independent — see
+    // [`colreduce_finalize_avx2`], which LLVM would not produce from the scalar loop on its own.
+    colreduce_finalize_avx2(out, j0, j1, rows, kind);
 }
 
 /// Scalar twin of [`colreduce_avx2`] (the no-AVX2 fallback and the bit-exact reference). Same
@@ -1008,6 +1077,107 @@ mod tests {
                         "scalar != avx2 at rows={rows} cols={cols} kind={}",
                         kind as u8
                     );
+                }
+            }
+        }
+    }
+
+    /// The packed finalize [`colreduce_finalize_avx2`] must equal the scalar reference
+    /// [`colreduce_finalize`] **by raw bits**, on the values where a divide or a square root is
+    /// allowed to be interesting, at every vector/tail offset, and it must not write one byte
+    /// outside `[j0, j1)`.
+    ///
+    /// This is a direct differential on the substitution itself rather than on a whole reduction,
+    /// because a whole reduction cannot *reach* most of these inputs: the fold that feeds the
+    /// finalize is a sum of squares for `L2`/`Rms`, so it can never hand them a negative operand,
+    /// a denormal at the edge of underflow, or a signalling NaN. The claim being tested is the one
+    /// the substitution rests on — `DIVPS`/`SQRTPS` are the same correctly-rounded IEEE operations
+    /// as `DIVSS`/`SQRTSS`, lane by lane, including NaN quieting and payload, `±0`, `±inf`,
+    /// underflow to a denormal and the real-indefinite `sqrt` of a negative — so it is asserted,
+    /// not assumed. The **whole buffer** is compared, so a vector store running past `j1` or before
+    /// `j0` (the obvious way to write this wrong) fails here rather than corrupting a neighbouring
+    /// column stripe in the parallel entry.
+    ///
+    /// `rows` includes `16_777_217`, which is not representable in f32 and rounds to `16_777_216`:
+    /// both paths must round the divisor the same way, which they do because both take it from the
+    /// same `rows as f32`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn finalize_avx2_matches_scalar_bit_for_bit() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Every case the finalize can meet and several it cannot, so the IEEE claim is tested at
+        // full strength: both zeros, both infinities, a quiet NaN, a second quiet payload, a
+        // SIGNALLING NaN (which both forms must quiet identically), a negative NaN, the smallest
+        // normal and the smallest denormal (whose `/rows` underflows further), a mid denormal,
+        // `f32::MAX`, exact and inexact square roots, and negatives (whose `sqrt` is the real
+        // indefinite).
+        let pool: [f32; 20] = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            4.0,
+            3.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0x7fc0_1234),
+            f32::from_bits(0x7f80_0001), // signalling NaN
+            f32::from_bits(0xffc0_5678), // negative quiet NaN
+            f32::MIN_POSITIVE,
+            f32::from_bits(1), // smallest denormal
+            f32::from_bits(0x0000_1234),
+            f32::MAX,
+            -f32::MAX,
+            -3.5,
+            -f32::MIN_POSITIVE,
+            1.0e-30,
+        ];
+        // A sentinel outside `[j0, j1)`: a signalling NaN whose payload no operation here produces.
+        let guard = f32::from_bits(0x7f81_dead);
+        for &j0 in &[0usize, 1, 3, 5, 8, 9] {
+            for len in [
+                0usize, 1, 2, 7, 8, 9, 15, 16, 17, 23, 24, 31, 32, 33, 64, 71,
+            ] {
+                for &rows in &[1usize, 2, 3, 7, 1024, 12345, 16_777_217] {
+                    for kind in [
+                        ColKind::Mean,
+                        ColKind::L2,
+                        ColKind::Rms,
+                        ColKind::Sum,
+                        ColKind::SumSq,
+                        ColKind::Max,
+                    ] {
+                        // Two guard columns past the end as well as the `j0` prefix.
+                        let mut base = vec![guard; j0 + len + 2];
+                        for (k, b) in base.iter_mut().enumerate().skip(j0).take(len) {
+                            // 7 is coprime with the pool length, so each offset sees a rotation of
+                            // the whole pool and every value lands at every lane position.
+                            *b = pool[(k * 7 + j0 * 3 + rows) % pool.len()];
+                        }
+                        let (mut s, mut v) = (base.clone(), base.clone());
+                        unsafe {
+                            colreduce_finalize(s.as_mut_ptr(), j0, j0 + len, rows, kind);
+                            colreduce_finalize_avx2(v.as_mut_ptr(), j0, j0 + len, rows, kind);
+                        }
+                        assert_eq!(
+                            bits(&s),
+                            bits(&v),
+                            "finalize scalar != avx2 at j0={j0} len={len} rows={rows} kind={}",
+                            kind as u8
+                        );
+                        // …and neither form touched anything outside `[j0, j0+len)`.
+                        assert!(
+                            s[..j0].iter().chain(&s[j0 + len..]).all(|f| f.to_bits()
+                                == guard.to_bits())
+                                && v[..j0].iter().chain(&v[j0 + len..]).all(|f| f.to_bits()
+                                    == guard.to_bits()),
+                            "finalize wrote outside [j0, j1) at j0={j0} len={len} rows={rows} kind={}",
+                            kind as u8
+                        );
+                    }
                 }
             }
         }
