@@ -1,0 +1,297 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// relu   out[i] = if x[i] > 0.0 { x[i] } else { 0.0 }
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 12
+// EXPECT-OUT: 14
+// EXPECT-OUT: 16
+// EXPECT-OUT: 18
+// EXPECT-OUT: 20
+// EXPECT-OUT: 22
+// EXPECT-OUT: 24
+// EXPECT-OUT: 26
+// EXPECT-OUT: 28
+// EXPECT-OUT: 30
+// EXPECT-OUT: 32
+// EXPECT-OUT: 34
+// EXPECT-OUT: 36
+// EXPECT-OUT: 38
+// EXPECT-OUT: 40
+// relu6  out[i] = if x[i] < 6.0 { relu(x[i]) } else { 6.0 }
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// EXPECT-OUT: 6
+// affine out[i] = 2.0 * x[i] + 1.0
+// EXPECT-OUT: -79
+// EXPECT-OUT: -75
+// EXPECT-OUT: -71
+// EXPECT-OUT: -67
+// EXPECT-OUT: -63
+// EXPECT-OUT: -59
+// EXPECT-OUT: -55
+// EXPECT-OUT: -51
+// EXPECT-OUT: -47
+// EXPECT-OUT: -43
+// EXPECT-OUT: -39
+// EXPECT-OUT: -35
+// EXPECT-OUT: -31
+// EXPECT-OUT: -27
+// EXPECT-OUT: -23
+// EXPECT-OUT: -19
+// EXPECT-OUT: -15
+// EXPECT-OUT: -11
+// EXPECT-OUT: -7
+// EXPECT-OUT: -3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 9
+// EXPECT-OUT: 13
+// EXPECT-OUT: 17
+// EXPECT-OUT: 21
+// EXPECT-OUT: 25
+// EXPECT-OUT: 29
+// EXPECT-OUT: 33
+// EXPECT-OUT: 37
+// EXPECT-OUT: 41
+// EXPECT-OUT: 45
+// EXPECT-OUT: 49
+// EXPECT-OUT: 53
+// EXPECT-OUT: 57
+// EXPECT-OUT: 61
+// EXPECT-OUT: 65
+// EXPECT-OUT: 69
+// EXPECT-OUT: 73
+// EXPECT-OUT: 77
+// EXPECT-OUT: 81
+// saxpy  out[i] = 2.0 * x[i] + y[i]
+// EXPECT-OUT: -78
+// EXPECT-OUT: -74
+// EXPECT-OUT: -70
+// EXPECT-OUT: -66
+// EXPECT-OUT: -62
+// EXPECT-OUT: -58
+// EXPECT-OUT: -54
+// EXPECT-OUT: -50
+// EXPECT-OUT: -46
+// EXPECT-OUT: -42
+// EXPECT-OUT: -38
+// EXPECT-OUT: -34
+// EXPECT-OUT: -30
+// EXPECT-OUT: -26
+// EXPECT-OUT: -22
+// EXPECT-OUT: -18
+// EXPECT-OUT: -14
+// EXPECT-OUT: -10
+// EXPECT-OUT: -6
+// EXPECT-OUT: -2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 18
+// EXPECT-OUT: 22
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 34
+// EXPECT-OUT: 38
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 50
+// EXPECT-OUT: 54
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 66
+// EXPECT-OUT: 70
+// EXPECT-OUT: 74
+// EXPECT-OUT: 78
+// EXPECT-OUT: 82
+// hadam  out[i] = x[i] * y[i]
+// EXPECT-OUT: -80
+// EXPECT-OUT: -76
+// EXPECT-OUT: -72
+// EXPECT-OUT: -68
+// EXPECT-OUT: -64
+// EXPECT-OUT: -60
+// EXPECT-OUT: -56
+// EXPECT-OUT: -52
+// EXPECT-OUT: -48
+// EXPECT-OUT: -44
+// EXPECT-OUT: -40
+// EXPECT-OUT: -36
+// EXPECT-OUT: -32
+// EXPECT-OUT: -28
+// EXPECT-OUT: -24
+// EXPECT-OUT: -20
+// EXPECT-OUT: -16
+// EXPECT-OUT: -12
+// EXPECT-OUT: -8
+// EXPECT-OUT: -4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 12
+// EXPECT-OUT: 16
+// EXPECT-OUT: 20
+// EXPECT-OUT: 24
+// EXPECT-OUT: 28
+// EXPECT-OUT: 32
+// EXPECT-OUT: 36
+// EXPECT-OUT: 40
+// EXPECT-OUT: 44
+// EXPECT-OUT: 48
+// EXPECT-OUT: 52
+// EXPECT-OUT: 56
+// EXPECT-OUT: 60
+// EXPECT-OUT: 64
+// EXPECT-OUT: 68
+// EXPECT-OUT: 72
+// EXPECT-OUT: 76
+// EXPECT-OUT: 80
+// quot   out[i] = x[i] / y[i]
+// EXPECT-OUT: -20
+// EXPECT-OUT: -19
+// EXPECT-OUT: -18
+// EXPECT-OUT: -17
+// EXPECT-OUT: -16
+// EXPECT-OUT: -15
+// EXPECT-OUT: -14
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -11
+// EXPECT-OUT: -10
+// EXPECT-OUT: -9
+// EXPECT-OUT: -8
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6
+// EXPECT-OUT: -5
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: 19
+// EXPECT-OUT: 20
+module tests.run.velem_modes_every_lane
+
+/// EVERY LANE of each recognized `wukong_velem_f32` compute mode, over a length that crosses all
+/// three code paths of the kernel: the x4 unrolled body (32 elements), the 8-wide tail, and the
+/// scalar tail (41 = 32 + 8 + 1).
+///
+/// Recognized kernels are GATE-BLIND: the recognizer fires identically on interp and native at
+/// every -O level, so neither the differential gate nor the opt-invariance gate can see whether the
+/// kernel fired or whether it computed the right thing. This fixture is the only thing that can.
+/// It exists because `velem_avx2` selects its body by compute MODE (identity-affine / one-input
+/// affine / two-input affine / Hadamard / quotient) and by activation, and a mis-selected mode is
+/// wrong on every lane of one mode while every other mode stays right — invisible to any fixture
+/// that prints a reduction or a single lane.
+///
+/// The expected values are the scalar semantics of each loop, not a recording of compiler output:
+/// x[i] = 2*(i-20) (so -40..40 step 2) and y[i] = 2, chosen so every result is a small exact
+/// integer in f32 and can be read off by hand.
+fn main() -> i32 {
+    let mut x: [f32; 41] = [0.0; 41];
+    for i in 0..41 { x[i] = (i as f32) * 2.0 - 40.0; }
+    let y: [f32; 41] = [2.0; 41];
+    let mut o: [f32; 41] = [0.0; 41];
+
+    for i in 0..41 { o[i] = if x[i] > 0.0 { x[i] } else { 0.0 }; }
+    for k in 0..41 { print(o[k] as i32); }
+
+    for i in 0..41 { o[i] = if x[i] < 6.0 { if x[i] > 0.0 { x[i] } else { 0.0 } } else { 6.0 }; }
+    for k in 0..41 { print(o[k] as i32); }
+
+    for i in 0..41 { o[i] = 2.0 * x[i] + 1.0; }
+    for k in 0..41 { print(o[k] as i32); }
+
+    for i in 0..41 { o[i] = 2.0 * x[i] + y[i]; }
+    for k in 0..41 { print(o[k] as i32); }
+
+    for i in 0..41 { o[i] = x[i] * y[i]; }
+    for k in 0..41 { print(o[k] as i32); }
+
+    for i in 0..41 { o[i] = x[i] / y[i]; }
+    for k in 0..41 { print(o[k] as i32); }
+
+    return 0;
+}
