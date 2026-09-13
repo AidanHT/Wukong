@@ -1166,10 +1166,24 @@ impl<'a> Sema<'a> {
     /// Recursion into a `const`'s initializer does NOT report (that declaration is checked where it
     /// is written); it only decides foldability, and the length site reports against the const name.
     fn array_len_is_const(&mut self, e: &Expr, depth: u32, report: bool) -> bool {
-        // Deep enough to be a cyclic const, which `check_recursive_consts` reports as E0403. Stay
-        // quiet rather than stacking a second diagnostic on the same cycle.
+        // Deeper than any real const chain. Both mirrors stop here and they stop DIFFERENTLY:
+        // `eval_usize_depth` yields 0 (so sema types the annotation `[T; 0]`) while mir_build's
+        // `const_usize_depth` yields `None` (so `mir_ty_of_ann` emits a bare `MirType::Ptr` slot).
+        // That IS the desync this function exists to prevent, so the honest answer is "not
+        // readable" — reporting a second diagnostic on a cyclic `const` that `check_recursive_consts`
+        // already flagged as E0403 is a far smaller cost than a silently uninitialized slot, and a
+        // 65-deep chain that is NOT cyclic gets no other diagnostic at all.
         if depth > 64 {
-            return true;
+            if report {
+                self.error(
+                    e.span,
+                    "E0406",
+                    "array length is nested more than 64 levels deep, past what the compile-time \
+                     folder reads; if these `const`s refer to one another, that cycle is the real \
+                     error",
+                );
+            }
+            return false;
         }
         match &e.kind {
             ExprKind::Int(_) => true,
@@ -1229,10 +1243,38 @@ impl<'a> Sema<'a> {
             // wrote — `[i32; (4 as usize) + 1]` is 1, not 5, and both backends agree on it,
             // which is exactly the shape of defect no differential gate can see. Report each bad
             // operand rather than only the first.
-            ExprKind::Binary { lhs, rhs, .. } => {
+            ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.array_len_is_const(lhs, depth + 1, report);
                 let r = self.array_len_is_const(rhs, depth + 1, report);
-                l && r
+                if !(l && r) {
+                    return false;
+                }
+                // Readable operands are still not a readable LENGTH. `fold_const_len` has no value
+                // for a comparison or a logical operator, nor for checked arithmetic that fails
+                // (`2 - 5`, a division by zero, an operand or result above `MAX_CONST_ARRAY_LEN`)
+                // — and it reports every one of those as the same 0 that a genuine `[T; 2 - 2]`
+                // gives, on BOTH sides of the mirror. So `[i32; 2 - 5]` and `[i32; 4 > 2]` sized a
+                // zero-length array with no diagnostic: a number the source never wrote that both
+                // backends agree on, the gate-blind class. Ask the shared folder directly.
+                let lv = self.eval_usize_depth(lhs, depth + 1);
+                let rv = self.eval_usize_depth(rhs, depth + 1);
+                if op.try_fold_const_len(lv, rv).is_none() {
+                    if report {
+                        let g = op.glyph();
+                        self.error(
+                            e.span,
+                            "E0406",
+                            format!(
+                                "array length `{lv} {g} {rv}` has no compile-time value: `{g}` \
+                                 does not fold to a length (a comparison or a logical operator is \
+                                 never a length, and the arithmetic must stay within \
+                                 0..={MAX_CONST_ARRAY_LEN})"
+                            ),
+                        );
+                    }
+                    return false;
+                }
+                true
             }
             // `[i32; E::V]` — a C-style enum variant's discriminant, the fourth foldable form.
             // A negative discriminant is the 0 fallback in both mirrors, so it is not readable.
@@ -1482,7 +1524,12 @@ impl<'a> Sema<'a> {
         // only for a Tensor/Vector on one side, so an array length, a tuple arity or a struct
         // identity in the return type was never compared against the value's — the callee could
         // declare `-> [i32; 8]` and return a `[i32; 2]`, and every caller then believed the lie.
-        if self.scalar_aggregate_clash(&ret, val_ty) || self.aggregate_type_clash(&ret, val_ty) {
+        // The value's EXPRESSION is passed as well: an array/tuple literal adapts to the declared
+        // return type exactly as it does to a `let` annotation, so `fn g() -> [i8; 2] { return
+        // [127, 0]; }` stays accepted even though the literal's own type is `[i32; 2]`.
+        if self.scalar_aggregate_clash(&ret, val_ty)
+            || self.aggregate_value_clash(&ret, val_ty, val)
+        {
             self.error(
                 span,
                 "E0401",
@@ -1606,11 +1653,21 @@ impl<'a> Sema<'a> {
     /// compiled, and every caller then believed `[i32; 8]`), and let an `if`/`match` arm merge or a
     /// `break` merge two different aggregates into one value.
     ///
-    /// The relation is `compatible` — the same structural equality (plus the single array→slice
-    /// unsizing coercion) that `let` already enforces through `let_compatible`, which is why
-    /// `let r: [i32; 8] = mk()` with `mk() -> [i32; 2]` is rejected today while `return a` was not.
-    /// Merge contexts accept the unsizing in EITHER direction, since which side the checker visits
-    /// first is an accident of the source.
+    /// The relation is `compatible`, the structural half of the rule `let` already applies through
+    /// `let_compatible` — and it is **DIRECTIONAL**, `compatible(place, value)`, not a disjunction
+    /// over both orders. `compatible` encodes the language's one implicit aggregate coercion,
+    /// `[T; N]` unsizing to `[]T`, in a single direction on purpose (a slice carries no static
+    /// length to restore, so there is no slice→array direction). An earlier form of this helper
+    /// asked `!(compatible(a, b) || compatible(b, a))` and threw that intent away, re-opening the
+    /// forbidden direction in the two contexts where direction is not an accident:
+    /// `fn g() -> [f32; 4] { return s; }` for `s: []f32` was accepted, and every caller then read
+    /// the 16-byte fat-pointer header as four f32 elements — both backends printing 0, a value the
+    /// source never wrote. `let r: [f32; 4] = s;` has always been rejected, and `return`/`=` must
+    /// not be weaker than `let`.
+    ///
+    /// This is the TYPE half only. A place-vs-value site must also grant the literal adaptation
+    /// `let` grants — see [`Sema::aggregate_value_clash`] — and a *merge*, where neither side is
+    /// the place, is symmetric — see [`Sema::aggregate_merge_clash`].
     ///
     /// Deliberately narrower than `let`'s rule, because this fires in contexts the fixture corpus
     /// exercises far more thinly: only when both sides are aggregates whose layout is fully
@@ -1618,14 +1675,51 @@ impl<'a> Sema<'a> {
     /// (`array_len`'s "could not fold" sentinel as much as a real `[T; 0]`), a tensor, and
     /// `Unknown`/`Error` all stay lenient, per the crate-wide rule that errors are reserved for
     /// what can be PROVED wrong.
-    fn aggregate_type_clash(&self, a: &Ty, b: &Ty) -> bool {
-        if a.is_unknown() || b.is_unknown() || a.is_error() || b.is_error() {
+    fn aggregate_type_clash(&self, place: &Ty, value: &Ty) -> bool {
+        if place.is_unknown() || value.is_unknown() || place.is_error() || value.is_error() {
             return false;
         }
-        if !self.is_concrete_aggregate(a) || !self.is_concrete_aggregate(b) {
+        if !self.is_concrete_aggregate(place) || !self.is_concrete_aggregate(value) {
             return false;
         }
-        !(compatible(a, b) || compatible(b, a))
+        !compatible(place, value)
+    }
+
+    /// The place-versus-value form, for a `return` and for an assignment: the directional type
+    /// clash above, minus the literal adaptation `let` already grants.
+    ///
+    /// An array/tuple LITERAL of unsuffixed numeric elements takes the annotation's element type
+    /// (`let a: [i8; 2] = [127, 0];` and `let t: (u8, u8) = (200, 1);` are deliberately accepted —
+    /// see the `ArrayLit`/`ArrayRepeat`/`TupleLit` arms of [`Sema::literal_adapts`]), while the
+    /// literal's OWN type is `[i32; 2]` / `(i32, i32)`, because an unsuffixed integer literal
+    /// defaults to i32 and a float literal to f32. Comparing types alone therefore made
+    /// `fn g() -> [i8; 2] { return [127, 0]; }` a hard error at `return`, and `a = [127, 0];` a
+    /// hard error at an assignment, while the identical spelling compiled at a `let` — previously
+    /// valid programs rejected by a check that exists to catch layout LIES, not literals. The
+    /// relation here is exactly `let_compatible`'s, narrowed to concrete aggregates.
+    fn aggregate_value_clash(&self, place: &Ty, value_ty: &Ty, value: &Expr) -> bool {
+        self.aggregate_type_clash(place, value_ty) && !self.literal_adapts(place, value)
+    }
+
+    /// The merge form, for an `if`/`match` arm merge and a `loop`'s `break` values. Here neither
+    /// side is the place — which arm the checker visits first is an accident of the source — so the
+    /// array→slice unsizing counts in EITHER direction, unlike a `return` or an assignment. This is
+    /// the one context in which the symmetric disjunction is the right relation.
+    ///
+    /// `incoming` is the expression that produced `r` — the arm being folded in — so an adapting
+    /// array/tuple literal there is accepted for the same reason it is at a `let`. The literal
+    /// adapts to the type already ESTABLISHED on the left, exactly as it adapts to a `let`'s
+    /// annotation, and `l` really is the established type: `join` returns the left operand for
+    /// every aggregate, so the merge's type is the first arm's. Hence only one direction is
+    /// literal-aware, while the STRUCTURAL half above stays symmetric. A literal in the FIRST arm
+    /// (`if c { [127, 0] } else { a }` for `a: [i8; 2]`) therefore establishes `[i32; 2]` and the
+    /// `[i8; 2]` arm cannot hold it — which is a real element-width lie, not an adaptation, and it
+    /// is rejected by the pre-existing `let` check as well whenever the result is annotated.
+    fn aggregate_merge_clash(&self, l: &Ty, r: &Ty, incoming: Option<&Expr>) -> bool {
+        if !(self.aggregate_type_clash(l, r) && self.aggregate_type_clash(r, l)) {
+            return false;
+        }
+        !incoming.is_some_and(|e| self.literal_adapts(l, merge_arm_value(e)))
     }
 
     /// An aggregate — array, tuple, slice, or a DECLARED nominal type — whose layout is fully
@@ -1662,9 +1756,9 @@ impl<'a> Sema<'a> {
     /// the tensor/vector half; this adds the aggregate half, which had no check at all — a
     /// `let r: A = match k { 0 => a, _ => b }` over two different structs printed `1` on the
     /// interpreter and `1065353216` on native.
-    fn check_merge_shapes(&mut self, l: &Ty, r: &Ty, span: Span) {
+    fn check_merge_shapes(&mut self, l: &Ty, r: &Ty, incoming: Option<&Expr>, span: Span) {
         self.check_binop_shapes(l, r, span);
-        if self.aggregate_type_clash(l, r) {
+        if self.aggregate_merge_clash(l, r, incoming) {
             self.error(
                 span,
                 "E0401",
@@ -2259,8 +2353,12 @@ impl<'a> Sema<'a> {
                 // …and assigning an aggregate into a place of a DIFFERENT aggregate type does
                 // the same reinterpret without changing width: `a = b` between two unrelated
                 // structs printed `1` on the interpreter and `1065353216` on native.
+                // Directional, and literal-aware, for the same reasons `check_return_shape` is:
+                // the place is the target, so a `[]T` slice must NOT satisfy a `[T; N]` place
+                // (`let` has always rejected that direction), while `a = [127, 0];` for
+                // `a: [i8; 2]` is the adapting literal `let` accepts.
                 if self.scalar_aggregate_clash(&target_ty, &value_ty)
-                    || self.aggregate_type_clash(&target_ty, &value_ty)
+                    || self.aggregate_value_clash(&target_ty, &value_ty, value)
                 {
                     self.error(
                         value.span,
@@ -2396,7 +2494,7 @@ impl<'a> Sema<'a> {
                         let joined = match prev {
                             None => vt,
                             Some(p) => {
-                                self.check_merge_shapes(&p, &vt, v.span);
+                                self.check_merge_shapes(&p, &vt, Some(v), v.span);
                                 join(p, vt)
                             }
                         };
@@ -3637,7 +3735,7 @@ impl<'a> Sema<'a> {
                     // divergence); a [2,2]-vs-[2,4] mismatch silently mis-strides the result; a
                     // [1024]-vs-[2] lie turns a statically-valid index into a runtime OOB segfault.
                     // Unify them — the 4th shape-bearing context, the one `check_binop_shapes` missed.
-                    self.check_merge_shapes(&then_ty, &else_ty, else_expr.span);
+                    self.check_merge_shapes(&then_ty, &else_ty, Some(else_expr), else_expr.span);
                     join(then_ty, else_ty)
                 } else {
                     Ty::Unit
@@ -3660,7 +3758,7 @@ impl<'a> Sema<'a> {
                     // agree, exactly as the `if` arms above (see `check_binop_shapes`). Unify each arm
                     // against the running result before `join` folds it in, so a shape-mismatched arm
                     // is an E0502 — not a silently mistyped result that mis-strides or reinterprets.
-                    self.check_merge_shapes(&result, &t, arm.body.span);
+                    self.check_merge_shapes(&result, &t, Some(&arm.body), arm.body.span);
                     result = join(result, t);
                 }
                 // Exhaustiveness: a `match` with no catch-all that provably misses a case is rejected
@@ -3869,6 +3967,24 @@ fn join_scalar(a: Scalar, b: Scalar) -> Scalar {
                 b
             }
         }
+    }
+}
+
+/// The expression a merge arm actually *produces*. An `if` or `match` arm is normally spelled as
+/// a block, and `check_merge_shapes` receives that block — whose `ExprKind` is `Block`, never
+/// `ArrayLit` — so an adapting array/tuple literal written as an arm would look like a plain type
+/// mismatch and be rejected where the identical literal at a `let` is accepted.
+///
+/// Peel to the block's tail expression, and ONLY that: a block with no tail (its value comes from a
+/// `break` or a `return`) is returned unchanged, and no other wrapper is unwrapped. This is used
+/// solely to ask `literal_adapts` a question; it never changes a recorded type.
+fn merge_arm_value(e: &Expr) -> &Expr {
+    match &e.kind {
+        ExprKind::Block(b) => match &b.tail {
+            Some(t) => merge_arm_value(t),
+            None => e,
+        },
+        _ => e,
     }
 }
 
@@ -4293,10 +4409,26 @@ fn malformed_escape(text: &str) -> Option<String> {
             Some('n' | 'r' | 't' | '\\' | '\'' | '"' | '0' | 'x') => {}
             Some('u') => match chars.next() {
                 Some('{') => {
+                    // The closing brace is not optional. Without the flag this loop ran the
+                    // iterator to the end of the literal and returned `None`, and
+                    // `bad_unicode_escape`'s `take_while(|&c| c != '}')` did the same — its
+                    // `map_or(v, ..)` skips the non-hex characters, so `"A\u{41Zoo"` folded to a
+                    // perfectly valid 0x41 and BOTH validators stayed silent while mir_build's
+                    // `decode_escape` deleted the rest of the string. That is the worse half of the
+                    // very finding the `\u`-with-no-brace arm below closes.
+                    let mut closed = false;
                     for c in chars.by_ref() {
                         if c == '}' {
+                            closed = true;
                             break;
                         }
+                    }
+                    if !closed {
+                        return Some(
+                            "unterminated `\\u{…}` escape: the closing `}` is missing, so the \
+                             decoder swallows the rest of the literal — write it as `\\u{1F600}`"
+                                .to_string(),
+                        );
                     }
                 }
                 _ => {
@@ -5463,6 +5595,28 @@ mod tests {
             "the Tensor spelling must stay clean: {:?}",
             errors(ok)
         );
+        // The `[T; 0]` could-not-fold sentinel must NOT cascade to the call sites. `is_concrete_layout`
+        // excludes a zero-length array for exactly this reason (`*len > 0`), and `unify_decl`'s
+        // (Array, Array) arm now carries the same guard: without it every caller of a function whose
+        // length is unreadable ALSO got `E0501: array length mismatch: expected an array of length 0`,
+        // a second and false diagnostic blaming the caller for the callee's declaration.
+        // (The callee must not index with a CONSTANT here: `type_index`'s pre-existing array
+        // bounds check reports its own E0501 against the length-0 sentinel, which is a separate
+        // site and not what this asserts. tests/fail/generic_array_length.wk indexes dynamically
+        // and reports E0406 alone.)
+        let call = "fn sum<N>(a: [f32; N], n: i64) -> i64 { return n; } \
+                    fn main() -> i32 { let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
+                    return sum(x, 4) as i32; }";
+        assert!(
+            errors(call).contains(&"E0406"),
+            "the generic length must still be reported at the declaration: {:?}",
+            errors(call)
+        );
+        assert!(
+            !errors(call).contains(&"E0501"),
+            "the length-0 sentinel must not cascade into a call-site length mismatch: {:?}",
+            errors(call)
+        );
         // A generic ELEMENT type with a literal length is unaffected (tests/run/generic_typed_local.wk).
         let elem = "fn f<T>(x: T) -> T { let a: [T; 2] = [x, x]; return a[0] + a[1]; }";
         assert!(
@@ -5687,6 +5841,170 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_literal_adapts_at_a_return_an_assignment_and_a_merge() {
+        // OVER-REJECTION control for `aggregate_type_clash`. `literal_adapts`'s ArrayLit/TupleLit
+        // arms exist so a typed buffer can be built from bare literals — `let a: [i8; 2] = [127, 0]`
+        // is DELIBERATELY accepted — but an unsuffixed integer literal's own type is i32 and a float
+        // literal's is f32, so the literal's type is `[i32; 2]`. Comparing types alone made the same
+        // spelling a hard E0401 at a `return`, at an assignment and at an arm merge: previously
+        // valid programs rejected by a check whose job is to catch layout LIES.
+        for ok in [
+            "fn g() -> [i8; 2] { return [127, 0]; }",
+            "fn g() -> [f64; 2] { return [1.0, 2.0]; }",
+            "fn g() -> (u8, u8) { return (200, 1); }",
+            "fn g() -> [u8; 3] { return [1; 3]; }",
+            "fn f() { let mut a: [i8; 2] = [1, 2]; a = [127, 0]; }",
+            "fn f() { let mut t: (u8, u8) = (1, 2); t = (200, 1); }",
+            "fn f(k: i32) { let a: [i8; 2] = [1, 2]; let r: [i8; 2] = match k { 0 => a, _ => [127, 0] }; }",
+            "fn f(k: i32) { let a: [i8; 2] = [1, 2]; let r: [i8; 2] = if k == 0 { a } else { [127, 0] }; }",
+            "fn f(k: i32) { let a: [i8; 2] = [1, 2]; \
+             let r: [i8; 2] = loop { if k == 0 { break a; } break [127, 0]; }; }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "an adapting aggregate literal must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+        // …and the lie the same check exists to catch must still be caught, with a literal on the
+        // value side: the LENGTH and the ARITY never adapt, only the element type does.
+        for bad in [
+            "fn g() -> [i8; 2] { return [1, 2, 3]; }",
+            // And the asymmetry is deliberate: `join` returns the LEFT type for an aggregate, so a
+            // literal in the FIRST arm establishes `[i32; 2]` and the `[i8; 2]` arm genuinely
+            // cannot hold it. The literal adapts to the type already established, exactly as it
+            // adapts to a `let` annotation — it does not retroactively set one.
+            "fn f(k: i32, a: [i8; 2]) { let r: [i32; 2] = if k == 0 { [127, 0] } else { a }; }",
+            "fn g() -> (u8, u8) { return (1, 2, 3); }",
+            "fn f() { let mut a: [i8; 2] = [1, 2]; a = [1, 2, 3]; }",
+        ] {
+            assert!(
+                errors(bad).contains(&"E0401"),
+                "a wrong-length literal must still be rejected (`{bad}`): {:?}",
+                errors(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn slice_does_not_satisfy_an_array_place() {
+        // UNDER-REJECTION control. `compatible` encodes `[T; N]` → `[]T` unsizing in ONE direction
+        // on purpose ("there is no slice→array direction (a slice has no static length to
+        // restore)"), and an earlier `aggregate_type_clash` asked
+        // `!(compatible(a, b) || compatible(b, a))`, which threw that intent away exactly where
+        // direction is not an accident. `return s` from `-> [f32; 4]` was accepted and the caller
+        // then read the 16-byte fat-pointer header as four f32 elements — both backends printing 0,
+        // a value the source never wrote. `let r: [f32; 4] = s;` has always been rejected through
+        // `let_compatible`; `return` and `=` must not be weaker than `let`.
+        let ret = "fn g(s: []f32) -> [f32; 4] { return s; }";
+        assert!(
+            errors(ret).contains(&"E0401"),
+            "a slice must not satisfy an array return type: {:?}",
+            errors(ret)
+        );
+        let asg = "fn f(s: []f32) { let mut a: [f32; 4] = [0.0; 4]; a = s; }";
+        assert!(
+            errors(asg).contains(&"E0401"),
+            "a slice must not be assigned into an array place: {:?}",
+            errors(asg)
+        );
+        // The reference point: `let` rejects the same direction, and always has.
+        let lt = "fn f(s: []f32) { let r: [f32; 4] = s; }";
+        assert!(
+            errors(lt).contains(&"E0401"),
+            "the `let` this must match still rejects it: {:?}",
+            errors(lt)
+        );
+        // The LEGAL direction — the one real coercion — must stay accepted at every one of those
+        // sites, and a MERGE stays symmetric, because there neither side is the place.
+        for ok in [
+            "fn g(a: [f32; 4]) -> []f32 { return a; }",
+            "fn f(a: [f32; 4]) { let mut s: []f32 = a; s = a; }",
+            "fn f(k: i32, a: [f32; 4], s: []f32) { let r: []f32 = match k { 0 => a, _ => s }; }",
+            "fn f(k: i32, a: [f32; 4], s: []f32) { let r: []f32 = if k == 0 { s } else { a }; }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "array→slice unsizing must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn array_length_operator_must_fold() {
+        // `array_len_is_const` proved the OPERANDS were readable and stopped there, but
+        // `fold_const_len` has no value for a comparison or a logical operator, and none for
+        // checked arithmetic that fails — and it reports all of them as the same 0 a genuine
+        // `[T; 2 - 2]` gives, on BOTH sides of the two-crate mirror. So the array silently took a
+        // length the source never wrote, with both backends agreeing on it.
+        for len in [
+            "2 - 5",
+            "4 > 2",
+            "1 && 1",
+            "4 / 0",
+            "4 % 0",
+            "4294967295 + 1",
+        ] {
+            let bad = format!("fn f(a: [i32; {len}]) {{ }}");
+            assert!(
+                errors(&bad).contains(&"E0406"),
+                "`[i32; {len}]` does not fold and must be reported: {:?}",
+                errors(&bad)
+            );
+        }
+        // Everything the shared folder really does fold stays accepted, `[T; 0]` included — it is a
+        // legal (if useless) type, and it is also `array_len`'s could-not-fold sentinel, so the
+        // leniency rule keeps it silent.
+        for ok in [
+            "fn f(a: [i32; 2 + 2]) { }",
+            "fn f(a: [i32; 8 - 3]) { }",
+            "fn f(a: [i32; 2 * 3]) { }",
+            "fn f(a: [i32; 8 / 2]) { }",
+            "fn f(a: [i32; 1 << 3]) { }",
+            "fn f(a: [i32; 2 - 2]) { }",
+            "const A: usize = 2; const B: usize = 3; fn f(a: [i32; A * B]) { }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "a folding length must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_const_length_is_not_readable() {
+        // The depth cutoff is where the two mirrors stop, and they stopped DIFFERENTLY: sema's
+        // `eval_usize_depth` yields 0 (type `[T; 0]`) past depth 64 while mir_build's
+        // `const_usize_depth` yields `None` (a bare `MirType::Ptr` slot). `array_len_is_const`
+        // returned `true` there to avoid stacking a diagnostic on a cyclic const, so a NON-cyclic
+        // chain deeper than 64 — which `check_recursive_consts` never reports — kept the exact
+        // desync this whole function exists to remove, silently.
+        let mut deep = String::from("const C0: usize = 4;");
+        for i in 1..=70 {
+            deep.push_str(&format!("const C{i}: usize = C{};", i - 1));
+        }
+        deep.push_str("fn f(a: [i32; C70]) { }");
+        assert!(
+            errors(&deep).contains(&"E0406"),
+            "a const chain deeper than the fold cutoff is not a readable length: {:?}",
+            errors(&deep)
+        );
+        // A chain the folder really does read must stay accepted.
+        let mut shallow = String::from("const D0: usize = 4;");
+        for i in 1..=10 {
+            shallow.push_str(&format!("const D{i}: usize = D{};", i - 1));
+        }
+        shallow.push_str("fn f(a: [i32; D10]) { }");
+        assert!(
+            errors(&shallow).is_empty(),
+            "a chain within the fold cutoff must stay accepted: {:?}",
+            errors(&shallow)
+        );
+    }
+
+    #[test]
     fn array_index_count() {
         // shape.rs's module header promises "a wrong index count is E0501", but only the tensor arm
         // enforced it: the array arm gated its bounds check on `indices.len() == 1` and the
@@ -5777,6 +6095,17 @@ mod tests {
             errors(no_brace).contains(&"E0401"),
             "a `\\u` with no brace must be reported: {:?}",
             errors(no_brace)
+        );
+        // And the worse half of the same mechanism: a brace that is OPENED and never CLOSED runs
+        // the scan to the end of the literal. `malformed_escape`'s loop had no found-brace flag, so
+        // it returned `None`; `bad_unicode_escape`'s `take_while(|&c| c != '}')` ran to the end too
+        // and its `map_or(v, ..)` skipped the non-hex characters, folding `\u{41Zoo` to a perfectly
+        // valid 0x41 — so BOTH validators stayed silent while `decode_escape` deleted `Zoo`.
+        let unclosed = "fn f() { println(\"A\\u{41Zoo\"); }";
+        assert!(
+            errors(unclosed).contains(&"E0401"),
+            "an unterminated `\\u{{` must be reported: {:?}",
+            errors(unclosed)
         );
         let lone = "fn f() -> char { return '\\d'; }";
         assert!(

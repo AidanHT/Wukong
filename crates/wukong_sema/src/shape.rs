@@ -813,7 +813,13 @@ impl Sema<'_> {
                     elem: ae, len: al, ..
                 },
             ) => {
-                if pl != al {
+                // Length 0 doubles as `array_len`'s "could not fold" sentinel — the same reason
+                // `is_concrete_layout` requires `*len > 0` before it will call an array's layout
+                // known. A length the folder could not read has already been reported as E0406 at
+                // the declaration, so comparing the sentinel against a real length here only
+                // stacks a spurious "expected an array of length 0" on top of the real error.
+                // Skip it on either side; a genuine `[T; 0]` is not a value anyone can index.
+                if pl != al && *pl > 0 && *al > 0 {
                     self.error(
                         span,
                         "E0501",

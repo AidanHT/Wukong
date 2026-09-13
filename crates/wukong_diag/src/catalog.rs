@@ -273,13 +273,19 @@ static CATALOG: &[Explanation] = &[
     ),
     entry!(
         "E0501",
-        "tensor rank mismatch",
+        "rank, extent or arity mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \
          example, passing a rank-3 tensor where a rank-2 tensor is expected. This is checked at \
          compile time — it can never become a runtime shape bug.\n\nThis code is also reported \
          when a compile-time-constant index is out of bounds — for a fixed-size array (e.g. \
          `a[5]` on a `[T; 4]`) or for a static tensor dimension (e.g. `a[5, 0]` on a \
-         `Tensor[f32, 2, 2]`): the valid indices are `0..len` on each axis."
+         `Tensor[f32, 2, 2]`): the valid indices are `0..len` on each axis.\n\nThe same code \
+         covers the non-tensor extents, which are checked by the same unifier and mean the same \
+         thing: an ARRAY LENGTH mismatch at a call site (a `[i32; 2]` supplied where `[i32; 8]` is \
+         declared), a TUPLE ARITY mismatch at a call site (a 2-element tuple supplied where a \
+         3-element tuple is declared), and a wrong NUMBER OF INDICES on an array, a slice or a \
+         pointer (`a[i, j]` on a `[i32; 4]`, which is rank 1 — only a tensor takes one index per \
+         axis)."
     ),
     entry!(
         "E0502",
