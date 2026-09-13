@@ -4802,6 +4802,18 @@ impl FnLowerer<'_> {
                 // `let s = 0` — so the two matchers are disjoint (each declines the other's window).
                 // softmax / log-softmax stay in-place only (`dst == arr`): their exp / shift pass rewrites
                 // the data buffer in place, so an out-of-place final write would be an unsound hybrid.
+                // `for c in 0..N { out[c] = x[c]; }` + an in-place norm on `out` is the same
+                // computation as the out-of-place `out = norm(x)` the kernel already runs, so the
+                // seeding copy — a recognized `wukong_velem_f32` identity-affine pass over the whole
+                // row, which at a transformer feature width costs more than the entire fused norm —
+                // is dropped and the kernel reads `x` directly. Probed first: it starts one statement
+                // EARLIER than the plain windows below (at the copy loop, which none of them match),
+                // so it cannot steal a window from them, and if it declines they see the same
+                // statements they always did.
+                if let Some(n) = self.try_fuse_copy_norm(b, i) {
+                    i += n;
+                    continue;
+                }
                 if let Some((n, arr, n_expr)) = self.match_logsoftmax(b, i, None) {
                     if self.emit_norm(arr, arr, None, &n_expr, 0, NORM_LOGSOFTMAX, None, None) {
                         i += n;
@@ -7834,6 +7846,131 @@ impl FnLowerer<'_> {
             args: vec![xv, dstv, gptr, bptr, rows, nval, epsv, opv],
         });
         true
+    }
+
+    /// Recognize `for c in 0..N { dst[c] = src[c]; }` immediately followed by an **in-place** fused
+    /// norm over `dst[0..N]`, and emit the single out-of-place kernel call `norm(src, dst, 1, N, ..)`
+    /// — dropping the copy entirely. Returns the number of statements consumed (`1 + window`), or
+    /// `None` (the copy and the norm then lower separately, exactly as before).
+    ///
+    /// ```text
+    /// for c in 0..N { out[c] = x[c]; }                  //  <- this pass disappears
+    /// let mut s = 0.0;
+    /// for i in 0..N { s = s + out[i] * out[i]; }
+    /// let inv = rsqrt(s / N + eps);
+    /// for i in 0..N { out[i] = out[i] * inv; }          //  => wukong_norm_f32(x, out, 1, N, eps, RMSNORM)
+    /// ```
+    ///
+    /// WHY THIS IS THE SHAPE THAT MATTERS. `out = norm(x)` with `x` preserved is what a residual
+    /// stream, a `[tokens, hidden]` activation pass and every peer benchmark actually compute, and
+    /// the two natural spellings of it are the direct out-of-place one (`out[i] = (x[i]-mean)*inv`,
+    /// already handled by the `dst != arr` arm of the matchers below) and this one: seed the
+    /// destination, then normalize it in place. The second spelling used to cost a whole extra pass
+    /// over the row — a recognized `wukong_velem_f32(x, x, out, N, 1, 0, 0, ..)` identity-affine
+    /// copy — on top of a kernel that already reads `x` and writes `out` through separate pointers.
+    /// The copy is not a hazard to remove: nothing between the two windows observes `out`, the norm
+    /// writes every element of `out[0..N]` unconditionally, and `src` is only ever read.
+    ///
+    /// The transformation is also strictly *better* for autodiff: `diff_norm` recomputes the row
+    /// statistics from the kernel's `x` argument, "so `x` must not be overwritten in place by the
+    /// forward norm" — which is precisely what the copy-then-in-place pair did (`norm(out, out)`)
+    /// and what the fused form does not (`norm(x, out)`).
+    ///
+    /// SOUNDNESS. `src != dst` (a self-copy is not this window) and the copy's trip count is
+    /// structurally the norm's `N`, so the elided pass wrote exactly the elements the kernel now
+    /// sources from `src` instead. Partial overlap between two distinct array symbols is out of
+    /// contract here for the same reason it is for every other recognizer and for the vectorizer
+    /// ("distinct array parameters are assumed not to alias (the usual kernel ABI)") — and note the
+    /// pass being removed, an 8-wide `wukong_velem_f32`, was never faithful to the scalar ascending
+    /// copy under overlap either. An affine `gamma`/`beta` cannot be the destination (the note at
+    /// that point in the body says why), which is the one thing besides overlap that would make
+    /// eliding the copy wrong. A `let` inside the window that rebinds `src` or `dst` is declined,
+    /// since the matchers below compare interned names rather than resolved bindings.
+    fn try_fuse_copy_norm(&mut self, b: &Block, at: usize) -> Option<usize> {
+        let (cv, n_copy, cbody) = self.as_range0_for(&b.stmts[at])?;
+        let cstmt = single_stmt(cbody)?;
+        let StmtKind::Assign {
+            target,
+            op: ast::AssignOp::Assign,
+            value,
+        } = &cstmt.kind
+        else {
+            return None;
+        };
+        let dst = self.index_off(target, cv, None)?;
+        let src = self.index_off(value, cv, None)?;
+        if src == dst {
+            return None;
+        }
+        let (n, op, n_expr, eps, gamma, beta) = self.match_inplace_norm_window(b, at + 1, dst)?;
+        if !exprs_struct_eq(&n_expr, n_copy) {
+            return None;
+        }
+        // No `gamma != dst` / `beta != dst` check is needed, and one here would be unreachable: an
+        // affine factor that IS the data buffer is not accepted as an affine factor at all
+        // (`affine_index` requires `a != x`), and this window is only taken when the norm's write
+        // target is its data buffer, so `gamma`/`beta` are already distinct from `dst`. Were that to
+        // change, eliding the copy WOULD be wrong — the kernel would read the destination the copy
+        // used to fill — so the invariant is stated here rather than left to be rediscovered.
+        // Name-level shadowing guard (the matchers key on interned names, not resolved bindings).
+        let window = &b.stmts[at + 1..at + 1 + n];
+        if window_rebinds(window, src) || window_rebinds(window, dst) {
+            return None;
+        }
+        if !self.emit_norm(src, dst, None, &n_expr, eps, op, gamma, beta) {
+            return None;
+        }
+        Some(1 + n)
+    }
+
+    /// The five fused-norm windows, probed at `b.stmts[at..]` and accepted only when the window is
+    /// **flat** (not batched), reads `arr`, and writes `arr` — i.e. it is in place. Returns
+    /// `(consumed, op, N, eps_bits, gamma, beta)`. Probe order mirrors the statement-window cascade
+    /// (log-softmax before softmax; RMSNorm before L2-norm) so a window folds to the same op it
+    /// would have folded to on its own. Pure.
+    #[allow(clippy::type_complexity)]
+    fn match_inplace_norm_window(
+        &self,
+        b: &Block,
+        at: usize,
+        arr: Symbol,
+    ) -> Option<(usize, i64, Expr, i64, Option<Symbol>, Option<Symbol>)> {
+        // softmax / log-softmax rewrite the buffer in place by construction, so their matchers report
+        // no separate `dst`; the kernel itself reads `x` and writes `out` through distinct pointers in
+        // all of its passes (`softmax_row_avx2`: max over `x`, `exp` from `x` into `out`, then scale
+        // `out` in place), so re-sourcing the reads from `src` is exactly the out-of-place kernel call.
+        // This is NOT the "unsound hybrid" the cascade declines for softmax — that is a *user-written*
+        // window whose exp pass writes `arr` while its final pass writes elsewhere. Here the whole
+        // window is in place on `dst` and only the source of the first read moves.
+        if let Some((n, x, ne)) = self.match_logsoftmax(b, at, None) {
+            if x == arr {
+                return Some((n, NORM_LOGSOFTMAX, ne, 0, None, None));
+            }
+        }
+        if let Some((n, x, ne)) = self
+            .match_softmax(b, at, None)
+            .or_else(|| self.match_softmax_fused(b, at, None))
+        {
+            if x == arr {
+                return Some((n, NORM_SOFTMAX, ne, 0, None, None));
+            }
+        }
+        if let Some((n, x, d, ne, eps, g, be)) = self.match_layernorm(b, at, None) {
+            if x == arr && d == arr {
+                return Some((n, NORM_LAYERNORM, ne, eps, g, be));
+            }
+        }
+        if let Some((n, x, d, ne, eps, g, be)) = self.match_rmsnorm(b, at, None) {
+            if x == arr && d == arr {
+                return Some((n, NORM_RMSNORM, ne, eps, g, be));
+            }
+        }
+        if let Some((n, x, d, ne, eps, _g, _be)) = self.match_l2norm(b, at, None) {
+            if x == arr && d == arr {
+                return Some((n, NORM_L2NORM, ne, eps, None, None));
+            }
+        }
+        None
     }
 
     // ---- LayerNorm / RMSNorm recognition (the per-token transformer normalizations) ----
@@ -21668,6 +21805,27 @@ fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
 }
 
 /// Conservative "does any statement (or the tail) reference `sym`?" — companion to [`expr_mentions`].
+/// Does any top-level `let` in `stmts` bind the name `sym`? The fused-norm matchers compare interned
+/// names, not resolved bindings, so a window that shadows the copy's source or destination would be
+/// matched against a *different* binding than the copy loop used. `try_fuse_copy_norm` declines on
+/// that rather than reason about it.
+fn window_rebinds(stmts: &[Stmt], sym: Symbol) -> bool {
+    stmts.iter().any(|s| match &s.kind {
+        StmtKind::Let { pat, .. } => pat_binds(pat, sym),
+        _ => false,
+    })
+}
+
+/// Does the pattern `p` introduce the name `sym`? Conservative: any pattern shape this does not
+/// destructure returns `true` for safety, so an unfamiliar binder never passes as "binds nothing".
+fn pat_binds(p: &ast::Pattern, sym: Symbol) -> bool {
+    match &p.kind {
+        ast::PatKind::Ident(s) => *s == sym,
+        ast::PatKind::Wildcard | ast::PatKind::Unit => false,
+        _ => true,
+    }
+}
+
 fn block_mentions(stmts: &[Stmt], tail: Option<&Expr>, sym: Symbol) -> bool {
     stmts.iter().any(|s| stmt_mentions(s, sym)) || tail.is_some_and(|e| expr_mentions(e, sym))
 }
@@ -29858,6 +30016,145 @@ fn main() -> i32 { return 0; }
         for f in &prog.funcs {
             assert!(verify_function(f).is_empty(), "verify failed");
         }
+    }
+
+    /// The seed-then-normalize-in-place spelling — `for c { out[c] = x[c]; }` followed by an
+    /// in-place norm over `out` — is the out-of-place `out = norm(x)` the kernel already computes,
+    /// so the seeding copy must not survive as a second kernel call. It used to lower to a
+    /// recognized `wukong_velem_f32(x, x, out, N, 1, 0, 0, ..)` identity-affine pass over the whole
+    /// row *plus* the norm, which at a transformer feature width costs more than the fused norm
+    /// itself. Asserted on the exact call list, so a fold that merely reorders (or that emits a
+    /// third call) fails too.
+    #[test]
+    fn seeding_copy_before_an_inplace_norm_is_elided() {
+        let plain = "module m
+fn f(x: [f32; 128], mut out: [f32; 128]) {
+    for c in 0..128 { out[c] = x[c]; }
+    let mut s: f32 = 0.0;
+    for i in 0..128 { s = s + out[i] * out[i]; }
+    let inv: f32 = rsqrt(s / 128.0 + 0.00001);
+    for i in 0..128 { out[i] = out[i] * inv; }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(plain);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(
+            kernel_calls(&prog, &interner),
+            vec!["wukong_norm_f32"],
+            "the seeding copy must fold into the norm's source operand"
+        );
+
+        // The affine form folds the same way, into the affine kernel, keeping its distinct gamma.
+        let affine = "module m
+fn f(x: [f32; 128], g: [f32; 128], mut out: [f32; 128]) {
+    for c in 0..128 { out[c] = x[c]; }
+    let mut s: f32 = 0.0;
+    for i in 0..128 { s = s + out[i] * out[i]; }
+    let inv: f32 = rsqrt(s / 128.0 + 0.00001);
+    for i in 0..128 { out[i] = out[i] * inv * g[i]; }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(affine);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(
+            kernel_calls(&prog, &interner),
+            vec!["wukong_norm_affine_f32"]
+        );
+
+        // And softmax, whose window seeds its row max from the destination's first element — after
+        // the fold the kernel takes that max over the source instead.
+        let softmax = "module m
+fn f(x: [f32; 128], mut out: [f32; 128]) {
+    for c in 0..128 { out[c] = x[c]; }
+    let mut m: f32 = out[0];
+    for i in 0..128 { m = fmax(m, out[i]); }
+    for i in 0..128 { out[i] = exp(out[i] - m); }
+    let mut s: f32 = 0.0;
+    for i in 0..128 { s = s + out[i]; }
+    let inv: f32 = 1.0 / s;
+    for i in 0..128 { out[i] = out[i] * inv; }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(softmax);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(kernel_calls(&prog, &interner), vec!["wukong_norm_f32"]);
+    }
+
+    /// The shapes the copy elision must DECLINE:
+    ///   * the copy's row is WIDER than the norm's, so the suffix the copy wrote is observable and
+    ///     the fold would drop it;
+    ///   * an affine factor that is the data buffer itself — declined upstream rather than by the
+    ///     fusion, and asserted here because that upstream refusal is exactly what makes a
+    ///     `gamma != dst` check in `try_fuse_copy_norm` unnecessary: `affine_index` requires the
+    ///     affine array to differ from the data array, and in an in-place window the data array IS
+    ///     the destination;
+    ///   * a self-copy `out[c] = out[c]`, which is not this window at all.
+    ///
+    /// In the first two the copy must still be lowered as its own `wukong_velem_f32` pass, so the
+    /// program keeps computing what it computed before.
+    #[test]
+    fn copy_norm_fusion_declines_when_it_would_change_the_result() {
+        // Copy covers 128, norm covers only the first 64: the tail of `out` is written by the copy
+        // and left alone by the norm, and the fold would lose it.
+        let short_norm = "module m
+fn f(x: [f32; 128], mut out: [f32; 128]) {
+    for c in 0..128 { out[c] = x[c]; }
+    let mut s: f32 = 0.0;
+    for i in 0..64 { s = s + out[i] * out[i]; }
+    let inv: f32 = rsqrt(s / 64.0 + 0.00001);
+    for i in 0..64 { out[i] = out[i] * inv; }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(short_norm);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert_eq!(
+            kernel_calls(&prog, &interner),
+            vec!["wukong_velem_f32", "wukong_norm_f32"],
+            "a copy wider than the norm's row must keep its own pass"
+        );
+
+        // An "affine factor" that is the data buffer: `affine_index` refuses it, so the whole norm
+        // window is declined and the copy keeps its own pass. This is the upstream guarantee that
+        // makes a gamma-vs-destination check inside the fusion unnecessary.
+        let gamma_is_dst = "module m
+fn f(x: [f32; 128], mut out: [f32; 128]) {
+    for c in 0..128 { out[c] = x[c]; }
+    let mut s: f32 = 0.0;
+    for i in 0..128 { s = s + out[i] * out[i]; }
+    let inv: f32 = rsqrt(s / 128.0 + 0.00001);
+    for i in 0..128 { out[i] = out[i] * inv * out[i]; }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(gamma_is_dst);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        let calls = kernel_calls(&prog, &interner);
+        assert!(
+            calls.first().map(String::as_str) == Some("wukong_velem_f32"),
+            "gamma == dst must keep the seeding copy, got {calls:?}"
+        );
+
+        // A self-copy is a no-op loop, not a seeding copy; the norm stays in place.
+        let self_copy = "module m
+fn f(mut out: [f32; 128]) {
+    for c in 0..128 { out[c] = out[c]; }
+    let mut s: f32 = 0.0;
+    for i in 0..128 { s = s + out[i] * out[i]; }
+    let inv: f32 = rsqrt(s / 128.0 + 0.00001);
+    for i in 0..128 { out[i] = out[i] * inv; }
+}
+fn main() -> i32 { return 0; }
+";
+        let (prog, diags, interner) = lower(self_copy);
+        assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
+        assert!(
+            kernel_calls(&prog, &interner).contains(&"wukong_norm_f32".to_string()),
+            "the norm itself must still dispatch"
+        );
     }
 
     /// The same normalization on the norm family: an affine RMSNorm whose row base is hoisted must

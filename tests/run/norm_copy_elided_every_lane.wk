@@ -1,0 +1,588 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 63
+// EXPECT-OUT: 27
+// EXPECT-OUT: 54
+// EXPECT-OUT: 18
+// EXPECT-OUT: 45
+// EXPECT-OUT: 9
+// EXPECT-OUT: 36
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 4
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: -1500
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -500
+// EXPECT-OUT: 1000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: 500
+// EXPECT-OUT: 600
+// EXPECT-OUT: 200
+// EXPECT-OUT: 900
+// EXPECT-OUT: 200
+// EXPECT-OUT: 800
+// EXPECT-OUT: 300
+// EXPECT-OUT: 300
+// EXPECT-OUT: 400
+// EXPECT-OUT: 300
+// EXPECT-OUT: 600
+// EXPECT-OUT: 200
+// EXPECT-OUT: 900
+// EXPECT-OUT: 200
+// EXPECT-OUT: 800
+// EXPECT-OUT: 300
+// EXPECT-OUT: 300
+// EXPECT-OUT: 400
+// EXPECT-OUT: 300
+// EXPECT-OUT: 600
+// EXPECT-OUT: 200
+// EXPECT-OUT: 900
+// EXPECT-OUT: 200
+// EXPECT-OUT: 800
+// EXPECT-OUT: 300
+// EXPECT-OUT: 300
+// EXPECT-OUT: 400
+// EXPECT-OUT: 300
+// EXPECT-OUT: 600
+// EXPECT-OUT: 200
+// EXPECT-OUT: 900
+// EXPECT-OUT: 200
+// EXPECT-OUT: 800
+// EXPECT-OUT: 300
+// EXPECT-OUT: 300
+// EXPECT-OUT: 400
+// EXPECT-OUT: 300
+// EXPECT-OUT: 600
+// EXPECT-OUT: 200
+// EXPECT-OUT: 900
+// EXPECT-OUT: 200
+// EXPECT-OUT: 800
+// EXPECT-OUT: 300
+// EXPECT-OUT: 300
+// EXPECT-OUT: 400
+// EXPECT-OUT: 300
+// EXPECT-OUT: 600
+// EXPECT-OUT: 200
+// EXPECT-OUT: 900
+// EXPECT-OUT: 200
+// EXPECT-OUT: 800
+// EXPECT-OUT: 300
+// EXPECT-OUT: 300
+// EXPECT-OUT: 400
+// EXPECT-OUT: 300
+// EXPECT-OUT: 600
+// EXPECT-OUT: 200
+// EXPECT-OUT: 900
+// EXPECT-OUT: 200
+// EXPECT-OUT: 800
+// EXPECT-OUT: 300
+// EXPECT-OUT: 300
+// EXPECT-OUT: 400
+// EXPECT-OUT: 300
+// EXPECT-OUT: 600
+// EXPECT-OUT: 200
+// EXPECT-OUT: 900
+// EXPECT-OUT: 200
+// EXPECT-OUT: 800
+// EXPECT-OUT: 300
+// EXPECT-OUT: 300
+// EXPECT-OUT: 400
+// EXPECT-OUT: 300
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+// EXPECT-OUT: 200
+// EXPECT-OUT: 100
+// EXPECT-OUT: 100
+module tests.run.norm_copy_elided_every_lane
+
+// Every lane of a fused single-row norm written as SEED-THEN-NORMALIZE-IN-PLACE, the spelling whose
+// leading copy `mir_build` now elides.
+//
+// WHY THIS FIXTURE EXISTS. `for c in 0..N { out[c] = x[c]; }` followed by an in-place norm over
+// `out` is the same computation as the out-of-place `out = norm(x)`, so the copy is folded away and
+// the kernel is handed `x` as its source and `out` as its destination
+// (`wukong_norm_f32(x, out, 1, N, eps, op)`), one call where there were two. A recognized kernel is
+// GATE-BLIND -- it fires identically on interp and native at every `-O` level -- so neither the
+// differential gate nor the opt-invariance gate can see whether the fold happened, whether the
+// kernel read the right buffer, or whether the source survived. Only written-down expectations can.
+//
+// EVERY DESTINATION IS POISONED BEFORE THE CALL (`-777.0`, a value no correct result can produce).
+// If the elision were wrong -- if the kernel still sourced its reduction or its writeback from the
+// destination -- it would read the poison, not the data, and every printed lane would move. And
+// shape A prints all 100 lanes of the SOURCE afterwards, because the fold is only sound if the
+// kernel leaves `x` untouched: with the copy gone, `x` is the live input for the whole call.
+//
+// EVERY LANE, NEVER A REDUCTION. A sum over the row passes over a buffer whose lanes are
+// individually wrong but cancel, and over a writeback that skipped the ragged tail.
+//
+// THE FOUR SHAPES cover the four kernel entry points the fold can reach, at lengths that clear the
+// reduction's `BLOCK` = 64 body and land on different seams:
+//   * A  l2norm      n=100 = 64 + 4x8 + 4 ragged   -> wukong_norm_f32, ssq8_*
+//   * B  layernorm   n=112 = 64 + 6x8 + 0          -> wukong_norm_f32, sum8_* and dev2_8_*
+//   * C  rmsnorm+g   n=72  = 64 + 1x8 + 0          -> wukong_norm_affine_f32, distinct gamma buffer
+//   * D  softmax     n=72                          -> wukong_norm_f32, the max-seed path
+// D matters on its own: its window seeds the row max from `out[0]`, and after the fold the kernel
+// must take that max over `x` instead. Sourcing it from the poisoned destination would drive the
+// whole row to a single lane.
+//
+// WHY THESE EXPECTED VALUES DO NOT DEPEND ON SUMMATION ORDER. The kernel reassociates its
+// reductions across 8 accumulators; the expectations must not turn on that. A, B and C hold small
+// integers, so every partial sum is an exact f32 integer whatever the order:
+//   * A: x[i] = ((3i) mod 7) + 1, so x[i] in 1..7 and sum x^2 = 1977 exactly (period 7, coprime with
+//     both the 8-lane vector and the 64-element block, so a group-permuting defect cannot hide).
+//     1e-5 is far below the ulp of 1977, so the scale is 1/sqrt(1977) to the bit and
+//     round(400 * x[i] / sqrt(1977)) = round(8.996147 * x[i]) = 9*x[i] for every x[i] in 1..7.
+//   * B: the same fill over 112 = 16 whole cycles, so sum = 448 and the mean is exactly 4;
+//     deviations are the integers -3..3, sum d^2 = 448, variance exactly 4, scale 1/sqrt(4+1e-5) =
+//     0.49999938, and round(1000 * d * 0.49999938) = 500*d.
+//   * C: a period-9 fill (coprime with 8 and 64) 6,1,3,2,4,1,3,2,1 whose squares sum to 81 per
+//     cycle, so sum x^2 = 648 over 72 and the mean square is exactly 9; scale 1/sqrt(9+1e-5) =
+//     0.33333315, gamma[i] = (i mod 3) + 1, and round(300 * x[i] * gamma[i] * 0.33333315) =
+//     100 * x[i] * gamma[i].
+//   * D: two levels, 0 and ln 2 (24 elements at ln 2, at i = 0 mod 3). After the max shift the
+//     exponentials are 1 and 1/2 exactly, so the row sum is 24 + 48/2 = 48 and every lane is either
+//     1/48 or 1/96; round(9600 * lane) is 200 or 100. The nearest value to a rounding boundary in
+//     any of the four shapes sits 0.473 of a step away, so no printed integer turns on a last ulp
+//     (D tolerates an exp error of 0.25% before a line could move; the kernel's is ~1 ulp).
+// None of these expectations was read back from the compiler: each is the scalar reading of the
+// loops, recomputed independently in f32.
+
+// --- the four seed-then-normalize-in-place windows (the shape `wk_norm` benchmarks) ---
+
+fn l2n100(x: [f32; 100], mut out: [f32; 100]) {
+    for c in 0..100 { out[c] = x[c]; }
+    let mut ss: f32 = 0.0;
+    for i in 0..100 { ss = ss + out[i] * out[i]; }
+    let inv: f32 = 1.0 / sqrt(ss + 0.00001);
+    for i in 0..100 { out[i] = out[i] * inv; }
+}
+
+fn ln112(x: [f32; 112], mut out: [f32; 112]) {
+    for c in 0..112 { out[c] = x[c]; }
+    let mut s: f32 = 0.0;
+    for i in 0..112 { s = s + out[i]; }
+    let mean: f32 = s / 112.0;
+    let mut v: f32 = 0.0;
+    for i in 0..112 { v = v + (out[i] - mean) * (out[i] - mean); }
+    let inv: f32 = rsqrt(v / 112.0 + 0.00001);
+    for i in 0..112 { out[i] = (out[i] - mean) * inv; }
+}
+
+fn rms72(x: [f32; 72], g: [f32; 72], mut out: [f32; 72]) {
+    for c in 0..72 { out[c] = x[c]; }
+    let mut s: f32 = 0.0;
+    for i in 0..72 { s = s + out[i] * out[i]; }
+    let inv: f32 = rsqrt(s / 72.0 + 0.00001);
+    for i in 0..72 { out[i] = out[i] * inv * g[i]; }
+}
+
+fn sm72(x: [f32; 72], mut out: [f32; 72]) {
+    for c in 0..72 { out[c] = x[c]; }
+    let mut m: f32 = out[0];
+    for i in 0..72 { m = fmax(m, out[i]); }
+    for i in 0..72 { out[i] = exp(out[i] - m); }
+    let mut s: f32 = 0.0;
+    for i in 0..72 { s = s + out[i]; }
+    let inv: f32 = 1.0 / s;
+    for i in 0..72 { out[i] = out[i] * inv; }
+}
+
+fn main() -> i32 {
+    // --- A: L2 / unit normalize, 100 = 64 + 4x8 + 4.
+    let mut xa: [f32; 100] = [0.0; 100];
+    let mut oa: [f32; 100] = [-777.0; 100];
+    for i in 0..100 { xa[i] = ((i * 3) % 7) as f32 + 1.0; }
+    l2n100(xa, oa);
+    for i in 0..100 { print(round(oa[i] * 400.0) as i32); }
+    // The source must survive the call: with the copy gone it is the kernel's only input.
+    for i in 0..100 { print(xa[i] as i32); }
+
+    // --- B: LayerNorm, 112 = 64 + 6x8.
+    let mut xb: [f32; 112] = [0.0; 112];
+    let mut ob: [f32; 112] = [-777.0; 112];
+    for i in 0..112 { xb[i] = ((i * 3) % 7) as f32 + 1.0; }
+    ln112(xb, ob);
+    for i in 0..112 { print(round(ob[i] * 1000.0) as i32); }
+
+    // --- C: RMSNorm with a per-column gamma, 72 = 64 + 8.
+    let mut xc: [f32; 72] = [0.0; 72];
+    let mut gc: [f32; 72] = [0.0; 72];
+    let mut oc: [f32; 72] = [-777.0; 72];
+    let cyc: [f32; 9] = [6.0, 1.0, 3.0, 2.0, 4.0, 1.0, 3.0, 2.0, 1.0];
+    for i in 0..72 { xc[i] = cyc[i % 9]; }
+    for i in 0..72 { gc[i] = ((i % 3) + 1) as f32; }
+    rms72(xc, gc, oc);
+    for i in 0..72 { print(round(oc[i] * 300.0) as i32); }
+
+    // --- D: softmax, 72, two levels {0, ln 2}; the max seed comes from the SOURCE row.
+    let mut xd: [f32; 72] = [0.0; 72];
+    let mut od: [f32; 72] = [-777.0; 72];
+    for i in 0..24 { xd[i * 3] = 0.6931472; }
+    sm72(xd, od);
+    for i in 0..72 { print(round(od[i] * 9600.0) as i32); }
+
+    return 0;
+}
