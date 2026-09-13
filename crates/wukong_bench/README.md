@@ -40,9 +40,8 @@ a pure function of (binary, corpus). Each stage is counted three times per file;
 agree (a disagreement is disclosed per file, never hidden), run 1's excess is reported once as
 first-call initialisation, and the per-pass attribution is checked byte-identical against
 `optimize`. `WUKONG_WORK_RUNS=<n>` raises the repetitions. Diff two runs' per-file tables to see
-where work moved. This binary installs a counting `#[global_allocator]` (thread-local `Cell`
-counters, three instructions per allocation) for that mode; the other modes pay that and nothing
-else.
+where work moved. This binary installs a counting `#[global_allocator]` (three thread-local `Cell`
+updates per allocation, no atomics) for that mode; the other modes pay that and nothing else.
 
 ## Testing
 
