@@ -723,7 +723,8 @@ impl<'a> Parser<'a> {
                         self.error(
                             bracket,
                             "E0202",
-                            "an index expression requires at least one index: `a[i]`, or                              `a[i, j]` for a rank-2 tensor",
+                            "an index expression requires at least one index: `a[i]`, or \
+                             `a[i, j]` for a rank-2 tensor",
                         );
                     }
                     self.expect(T::RBracket);

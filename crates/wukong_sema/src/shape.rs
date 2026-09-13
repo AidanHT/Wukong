@@ -818,7 +818,8 @@ impl Sema<'_> {
                         span,
                         "E0501",
                         format!(
-                            "array length mismatch: expected an array of length {pl}, found one                              of length {al}"
+                            "array length mismatch: expected an array of length {pl}, found \
+                             one of length {al}"
                         ),
                     );
                 }
@@ -836,7 +837,8 @@ impl Sema<'_> {
                         span,
                         "E0501",
                         format!(
-                            "tuple arity mismatch: expected a {}-element tuple, found a                              {}-element tuple",
+                            "tuple arity mismatch: expected a {}-element tuple, found a \
+                             {}-element tuple",
                             ps.len(),
                             as_.len()
                         ),
