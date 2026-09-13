@@ -112,10 +112,17 @@ unsafe fn transpose_rows<T: Copy>(
 /// nesting recovers none of it (measured slower than the plain 8x8 at 1031² and 1100x950), while the
 /// loop swap alone recovers all of it.
 ///
-/// The `PREFETCHW` of the next j-tile's eight destination rows starts their read-for-ownership about
-/// one tile group (four 8x8 tiles, roughly a hundred cycles of shuffle work) early, and is worth a
-/// further ~1.06x. `_MM_HINT_ET0` degrades to `prefetcht0` on a target without `PRFCHW`, which
-/// measured within noise of the write hint here, so nothing depends on the feature being enabled.
+/// Prefetching the next j-tile's eight destination rows starts their fill about one tile group
+/// (four 8x8 tiles, roughly a hundred cycles of shuffle work) early, and is worth a further ~1.06x.
+/// The hint asked for is `_MM_HINT_ET0`, the *write* intent, because these lines are about to be
+/// stored to — but this crate is built for baseline x86-64 and only turns on `avx2`, and `PRFCHW`
+/// is a separate feature that Haswell (AVX2, no PRFCHW) does not have, so LLVM lowers it to
+/// **`prefetcht0`** and the release assembly of this function contains 22 `prefetcht0` and zero
+/// `prefetchw`. That is deliberate, not an oversight: emitting `prefetchw` would need its own
+/// `is_x86_feature_detected!("prfchw")` arm or it would be a `#UD` on Haswell, and the plain read
+/// hint measured within noise of the write hint on this part (worth 2-5%, not worth a second
+/// dispatch). The write intent is kept in the source so that a future `prfchw`-gated arm is a
+/// one-line change.
 ///
 /// The `rows % 8` trailing rows and `cols % 8` trailing columns of each block fall back to the same
 /// scalar moves [`transpose_rows`] uses.
