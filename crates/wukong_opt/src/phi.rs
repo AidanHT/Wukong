@@ -48,8 +48,10 @@ impl Pass for SimplifyPhis {
     fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
         // This pass rewires block parameters and edge arguments but never the CFG's successor edges,
         // so the predecessor map stays valid across every removal; compute it once (cached) and hand
-        // it to each scan. Removals mutate `f`, not the (successor-derived) cache.
-        let preds: Vec<Vec<u32>> = cache.predecessors(f).to_vec();
+        // it to each scan. Removals mutate `f`, not the (successor-derived) cache — and the slice
+        // borrows the cache, not `f`, so it is read in place: cloning it cost one allocation per
+        // block on every call, most of which find nothing to do.
+        let preds: &[Vec<u32>] = cache.predecessors(f);
         let entry = f.entry.0;
         let mut changed = false;
         loop {
@@ -77,7 +79,7 @@ impl Pass for SimplifyPhis {
             let mut progress = !dead.is_empty();
             // Trivial phis stay one at a time: `substitute` rewrites uses, which can make another
             // parameter trivial *or* dead, so the batch above has to be recomputed after each one.
-            if let Some((blk, k, v)) = find_trivial(f, &preds, entry) {
+            if let Some((blk, k, v)) = find_trivial(f, preds, entry) {
                 let pv = f.blocks[blk as usize].params[k];
                 substitute(f, pv, v);
                 remove_param(f, blk, k);
@@ -103,16 +105,30 @@ fn find_trivial(f: &Function, preds: &[Vec<u32>], entry: u32) -> Option<(u32, us
             // Gather the incoming arguments at this parameter position — only predecessors of `b`
             // can supply them, so scan `preds[b]` rather than every block. (Byte-identical: a
             // non-predecessor contributes no edge, and predecessors are in ascending block order.)
-            let mut distinct: Vec<ValueId> = Vec::new();
-            for &src in &preds[b.id.0 as usize] {
+            // "All one value" needs only the first value seen and whether a second ever appeared,
+            // so nothing is collected: the previous `Vec` of distinct values cost an allocation per
+            // parameter on every call, and most calls find no trivial parameter at all.
+            let mut single: Option<ValueId> = None;
+            let mut trivial = true;
+            'scan: for &src in &preds[b.id.0 as usize] {
                 for arg in edge_args_to(&f.blocks[src as usize].term, b.id.0, k) {
-                    if arg != p && !distinct.contains(&arg) {
-                        distinct.push(arg);
+                    if arg == p {
+                        continue;
+                    }
+                    match single {
+                        None => single = Some(arg),
+                        Some(v) if v == arg => {}
+                        Some(_) => {
+                            trivial = false;
+                            break 'scan;
+                        }
                     }
                 }
             }
-            if distinct.len() == 1 {
-                return Some((b.id.0, k, distinct[0]));
+            if trivial {
+                if let Some(v) = single {
+                    return Some((b.id.0, k, v));
+                }
             }
         }
     }
@@ -200,14 +216,13 @@ fn live_values(f: &Function) -> FxHashSet<u32> {
     live
 }
 
-/// The argument(s) at position `k` on every edge from `term` to `target`.
-fn edge_args_to(term: &Terminator, target: u32, k: usize) -> Vec<ValueId> {
-    let mut out = Vec::new();
+/// The argument(s) at position `k` on every edge from `term` to `target`, then-arm before else-arm.
+/// At most two exist, so they are returned inline rather than in a `Vec`.
+fn edge_args_to(term: &Terminator, target: u32, k: usize) -> impl Iterator<Item = ValueId> {
+    let mut out = [None, None];
     match term {
         Terminator::Br { target: t, args } if t.0 == target => {
-            if let Some(a) = args.get(k) {
-                out.push(*a);
-            }
+            out[0] = args.get(k).copied();
         }
         Terminator::CondBr {
             then_blk,
@@ -217,19 +232,15 @@ fn edge_args_to(term: &Terminator, target: u32, k: usize) -> Vec<ValueId> {
             ..
         } => {
             if then_blk.0 == target {
-                if let Some(a) = then_args.get(k) {
-                    out.push(*a);
-                }
+                out[0] = then_args.get(k).copied();
             }
             if else_blk.0 == target {
-                if let Some(a) = else_args.get(k) {
-                    out.push(*a);
-                }
+                out[1] = else_args.get(k).copied();
             }
         }
         _ => {}
     }
-    out
+    out.into_iter().flatten()
 }
 
 /// Replace every use of `from` with `to` across the function.

@@ -23,6 +23,11 @@ that has been seen to swing 3.5x on identical inputs.
 - On that instrument `53e0891` does 31.6% fewer allocations than `d23eefc` to compile the corpus to
   object (optimizer -37.0%, backend -19.4%, parse and lex unchanged, pass invocations -0.6%).
   See `docs/sota-campaign-2026-09/FINDING-03-compile-time-is-a-count-not-a-clock.md`.
+- `simplify-phis` no longer clones the cached predecessor map per call or allocates per parameter
+  in `find_trivial`; `simplify-cfg` reads predecessors and reachability from the analysis cache
+  (invalidating after each fold and merge) and skips the constant map when no `cond_br` remains.
+  Optimizer allocations -10.3% on the corpus (`simplify-phis` -56.7%, `simplify-cfg` -19.4%),
+  pass invocations unchanged; `--emit=mir -O2` byte-identical on all 401 corpus files.
 
 ### `--emit=exe` never linked a release-profile executable (`LNK1136`)
 
