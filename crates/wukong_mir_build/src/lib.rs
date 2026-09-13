@@ -26,6 +26,7 @@
 // crate's correctness hangs on.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+mod alias;
 mod canon;
 mod tile;
 mod tindex;
@@ -997,10 +998,18 @@ pub fn lower_program_with(
 
     let mut diags = Vec::new();
     let mut program = Program::new();
+    // Whole-program buffer-parameter aliasing, computed once over the normalized module. A
+    // recognized kernel is equivalent to the nest it replaces only under a disjointness
+    // precondition the recognizer cannot establish from inside one function; this supplies the
+    // missing half. See `alias.rs`.
+    let alias_facts = alias::AliasFacts::analyze(module, sema);
     // Runtime symbols the matmul recognizer lowers a GEMM nest to (interned once, threaded down).
     let gemm = GemmSyms {
         recognize: opts.recognize,
         vec_kernels: opts.vec_kernels,
+        // Overwritten per function, below. The module-level default is the conservative one, so a
+        // recognizer reached through a path that forgot to set it declines rather than miscompiles.
+        alias_free: false,
         mm: interner.intern("wukong_sgemm"),
         mm_par: interner.intern("wukong_sgemm_parallel"),
         print_str: interner.intern("print_str"),
@@ -1233,6 +1242,11 @@ pub fn lower_program_with(
                 // takes, because the switch rides on that struct and it is copied down into every
                 // recognizer and probe from here.
                 let gemm = generic_gemm(gemm, generic_fns.contains(&f.name.sym));
+                // Whole-program aliasing, stamped on beside the `@generic` opt-out: `false` here
+                // means some call site in this program can hand two of this function's buffer
+                // parameters the same array, so no recognizer inside it may emit a kernel whose
+                // contract is "operands disjoint". See `alias.rs` for the decision and its reasons.
+                let gemm = alias_gemm(gemm, alias_facts.alias_free(f.name.sym));
                 // ---- The whole-function kernel interceptions ------------------------------------
                 //
                 // Every arm in this block replaces the function's ordinary lowering with a
@@ -1988,6 +2002,9 @@ pub fn lower_program_with(
         if let Some((f, body)) = fn_decls.get(orig) {
             // A `@generic` template's instances inherit the opt-out (keyed on the ORIGINAL name).
             let gemm = generic_gemm(gemm, generic_fns.contains(orig));
+            // Aliasing is a property of the ORIGINAL function's call sites: every instantiation of
+            // a type-generic template shares them.
+            let gemm = alias_gemm(gemm, alias_facts.alias_free(*orig));
             let func = lower_fn(
                 f,
                 body,
@@ -2025,6 +2042,14 @@ fn has_generic_attr(item: &ast::Item, interner: &Interner) -> bool {
     item.attrs
         .iter()
         .any(|a| interner.resolve(a.name.sym) == "generic")
+}
+
+/// Stamp the whole-program aliasing fact for one function onto its `GemmSyms`. Applied at the same
+/// place as [`generic_gemm`], and for the same reason: this struct is the one thing already threaded
+/// to every recognizer and every recognizer probe, so a fact that rides on it cannot be dropped on
+/// the way down. See `alias.rs`.
+fn alias_gemm(gemm: GemmSyms, alias_free: bool) -> GemmSyms {
+    GemmSyms { alias_free, ..gemm }
 }
 
 /// `gemm` with recognition cleared when the function being lowered is `@generic`. Per-function
@@ -2373,7 +2398,7 @@ fn is_bias_bcast_fn(
 /// Can two DISTINCT parameters of this type name the same storage? True for everything Wukong
 /// passes by base pointer — arrays, tensors, slices, pointers, references, tuples and named
 /// aggregates. A scalar parameter arrives as a copy and can alias nothing.
-fn ty_is_buffer_param(t: &Ty) -> bool {
+pub(crate) fn ty_is_buffer_param(t: &Ty) -> bool {
     matches!(
         t,
         Ty::Array { .. }
@@ -2816,6 +2841,16 @@ struct GemmSyms {
     /// what `--backend=gpu-native` needs, since `VecKernelCall` carries Win64-ABI bytes no PTX
     /// backend can lower.
     vec_kernels: bool,
+    /// Whole-program answer to "can two DISTINCT buffer parameters of the function being lowered be
+    /// bound to the same storage at some call site?" — `true` means **no**, so two distinct operand
+    /// symbols are provably distinct storage and a kernel that requires disjointness may be emitted.
+    /// Computed once by [`alias::AliasFacts`] and set per function beside the `@generic` switch,
+    /// for the reason `recognize` gives above: this struct already reaches every recognizer and
+    /// every recognizer probe, so the fact cannot be dropped on the way down. `false` is the safe
+    /// value, and it is what a probe with no parameter bindings gets.
+    ///
+    /// Read through [`FnLowerer::all_provably_disjoint`], never directly.
+    alias_free: bool,
     mm: Symbol,
     mm_par: Symbol,
     /// Runtime print of a null-terminated string buffer (a `*u8` argument to `print`/`println`),
@@ -6192,10 +6227,29 @@ impl FnLowerer<'_> {
     }
 
     /// Emit `par(args)` when the two f32 buffers `a[0..a_elems)` and `b[0..b_elems)` do not overlap at
-    /// run time, and `ser(args)` when they may — the guard the `_parallel` gather/scatter kernels'
-    /// documented `non-overlapping` precondition needs (`wukong_embedding_f32_parallel`,
-    /// `wukong_scatter_add_f32_parallel`; the serial kernels touch the same rows in the same order as
-    /// the nest, so they hold for any aliasing).
+    /// run time, and `ser(args)` when they may.
+    ///
+    /// **The general rule this is one instance of.** A recognized kernel equals the nest it replaced
+    /// only under a disjointness precondition, because it reorders the loop; threading is one
+    /// consequence of violating that precondition, not the violation. The framing this comment used
+    /// to carry — "the guard the `_parallel` kernels' documented `non-overlapping` precondition
+    /// needs" — reads as though non-`@parallel` code is safe, and it is not: `fn mm(a, b, mut c)`
+    /// called `mm(x, y, x)` and `fn tr(a, mut o)` called `tr(x, x)` are both wrong at one thread,
+    /// at `-O0` and at `-O2`, with no `@parallel` anywhere.
+    ///
+    /// So there are two forms of the fix and this is only the cheaper one:
+    ///
+    /// * **Runtime versioning** (here). Usable when BOTH callees compute the nest and differ only in
+    ///   how much aliasing they tolerate. That is true of exactly two families —
+    ///   `wukong_embedding_f32{,_parallel}` and `wukong_scatter_add_f32{,_parallel}` — whose serial
+    ///   forms touch rows in the same ascending order as the nest and are therefore alias-tolerant
+    ///   whatever their `# Safety` blocks currently say. It is the LLVM `LoopVersioning` /
+    ///   Polly runtime-alias-check shape.
+    /// * **Compile-time decline** ([`FnLowerer::all_provably_disjoint`], used by GEMM, GEMV, GEVM,
+    ///   transpose, pool2d, the col/row reductions, the scans and the norm backwards). For those
+    ///   there IS no alias-tolerant callee to branch to; the only correct may-overlap arm is the
+    ///   scalar nest, and the `emit_*` contract ("bails (false) … the caller then lowers the scalar
+    ///   nest") makes that a compile-time decision. It is the `LoopIdiomRecognize` shape.
     ///
     /// The recognizer's symbol comparison (`out == weight`) cannot decide this: two distinct array
     /// PARAMETERS can be bound to the same array at the call site. `@parallel fn embed(ids, weight, mut
@@ -9238,6 +9292,61 @@ impl FnLowerer<'_> {
         vals.try_into().ok()
     }
 
+    /// **The disjointness precondition of a recognized kernel.** `true` when no two of `syms` can
+    /// name overlapping storage, so a kernel documented `non-overlapping` may replace the nest.
+    ///
+    /// A recognizer is an optimization: the program means what the loop it matched means. A kernel
+    /// like `wukong_sgemm`, `wukong_transpose_f32` or any of the eight `wukong_col*` reductions
+    /// writes its output in a different order from the nest, so it agrees with the nest ONLY on
+    /// disjoint operands — and until this test existed, 35 of the 37 multi-operand emit sites
+    /// dispatched with no disjointness reasoning at all. `fn mm(a, b, mut c)` called `mm(x, y, x)`
+    /// printed `10 10 10 10 …` on **both** backends where the nest says `10 19 36 69 …`; an aliased
+    /// recognized transpose printed one answer on interp, a second natively and a third with
+    /// recognition off. Declining restores the one answer the program actually has.
+    ///
+    /// Two facts settle it, and both are needed:
+    ///
+    /// * Inside the function, two operands spelled with the SAME symbol are the same storage. That
+    ///   half was already tested by sixteen recognizers as `out == x`, and it is the weaker half —
+    ///   the guard's own doc at [`Self::emit_nonoverlapping_call`] says a symbol comparison "cannot
+    ///   decide this: two distinct array PARAMETERS can be bound to the same array at the call
+    ///   site."
+    /// * Across functions, whether any call site does exactly that. `GemmSyms::alias_free` carries
+    ///   the whole-program answer (see `alias.rs`); when it is `false`, nothing in this function is
+    ///   provably disjoint from anything else and every such kernel declines.
+    ///
+    /// Callers that are allowed *one* aliasing pair (a kernel documenting `dx` may alias `dy`) pass
+    /// only the pairs that must be disjoint.
+    fn provably_disjoint(&self, a: Symbol, b: Symbol) -> bool {
+        self.all_provably_disjoint(&[a, b])
+    }
+
+    /// The N-operand form of [`Self::provably_disjoint`]; see there for the whole argument.
+    fn all_provably_disjoint(&self, syms: &[Symbol]) -> bool {
+        if !self.gemm.alias_free {
+            return false;
+        }
+        for (i, a) in syms.iter().enumerate() {
+            if syms[i + 1..].contains(a) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// [`Self::kernel_base_ptrs`] for a kernel whose operands must be mutually disjoint: resolves
+    /// the base pointers only when [`Self::all_provably_disjoint`] holds for all of them, and
+    /// otherwise returns `None`, which every caller turns into "decline, lower the scalar nest".
+    fn kernel_base_ptrs_disjoint<const N: usize>(
+        &mut self,
+        syms: [Symbol; N],
+    ) -> Option<[ValueId; N]> {
+        if !self.all_provably_disjoint(&syms) {
+            return None;
+        }
+        self.kernel_base_ptrs(syms)
+    }
+
     /// The base pointer of a kernel operand written as an *expression* — the `Expr` twin of
     /// [`Self::kernel_base_ptr`], for the builtin calls whose operands are argument exprs rather
     /// than recognized nest symbols. A `[]T` slice argument lowers to its 16-byte fat-pointer
@@ -9261,6 +9370,12 @@ impl FnLowerer<'_> {
     /// then lowers computes `bias + s` / `alpha·s` correctly, so declining is always safe; the α and
     /// bias declines happen after a few dim/GEP instructions have been built, which are simply dead.
     fn emit_sgemm(&mut self, nest: &MatmulNest<'_>, parallel: bool) -> bool {
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). Declining lowers the loop as written, which is what the program means.
+        if !self.provably_disjoint(nest.a, nest.c) || !self.provably_disjoint(nest.b, nest.c) {
+            return false;
+        }
         let (Some(a), Some(b), Some(c)) = (
             self.kernel_base_ptr(nest.a),
             self.kernel_base_ptr(nest.b),
@@ -9421,6 +9536,14 @@ impl FnLowerer<'_> {
         // data and segfault the moment a GEMV ran over slices (e.g. GPT-2's []f32 weight blob LM head);
         // for a fixed `[f32; N]` array `kernel_base_ptr` returns the identical slot address, so recognized
         // fixed-array GEMV MIR is byte-for-byte unchanged.
+        //
+        // `wukong_sgemv`'s own contract (gemv.rs) is "`y` must not overlap `a` or `x`": each row's
+        // dot is folded before the store, and a later row would then read a value the store already
+        // replaced. An aliased `gv(m, v, v)` was a THREE-way split — interp `30 70 110 150`, native
+        // `30 70 1051 1479`, the nest `30 215 2501 40979`. Decline to the nest.
+        if !self.provably_disjoint(nest.a, nest.y) || !self.provably_disjoint(nest.x, nest.y) {
+            return false;
+        }
         let (Some(a), Some(x), Some(y)) = (
             self.kernel_base_ptr(nest.a),
             self.kernel_base_ptr(nest.x),
@@ -9468,6 +9591,11 @@ impl FnLowerer<'_> {
     /// would reassociate per-thread partials). One symbol serves both store forms: the unscaled
     /// nest passes α = 1.0, which the kernel skips (byte-identical to a never-scaled fold).
     fn emit_gevm(&mut self, nest: &GevmNest, parallel: bool) -> bool {
+        // gevm.rs: "`out` must not overlap `w` or `a`" — the column stripes fold ascending `i`
+        // over the whole of `a` while `out` is being written.
+        if !self.provably_disjoint(nest.w, nest.out) || !self.provably_disjoint(nest.a, nest.out) {
+            return false;
+        }
         let Some([w, a, out]) = self.kernel_base_ptrs([nest.w, nest.a, nest.out]) else {
             return false;
         };
@@ -9495,6 +9623,12 @@ impl FnLowerer<'_> {
     /// call site, so the caller lowers the scalar nest. `parallel` selects the multicore kernel (rows
     /// are independent, so it is bit-identical to the serial one the interpreter runs).
     fn emit_i8gemm(&mut self, nest: &I8MatmulNest, parallel: bool) -> bool {
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). Declining lowers the loop as written, which is what the program means.
+        if !self.provably_disjoint(nest.a, nest.c) || !self.provably_disjoint(nest.b, nest.c) {
+            return false;
+        }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
@@ -9524,6 +9658,12 @@ impl FnLowerer<'_> {
     /// is bit-identical to the serial one the interpreter marshals). The widen is lossless, so the
     /// kernel equals the naive nest under the documented matmul reassociation.
     fn emit_lowp_gemm(&mut self, nest: &LowpMatmulNest, parallel: bool) -> bool {
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). Declining lowers the loop as written, which is what the program means.
+        if !self.provably_disjoint(nest.a, nest.c) || !self.provably_disjoint(nest.b, nest.c) {
+            return false;
+        }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
@@ -9563,7 +9703,10 @@ impl FnLowerer<'_> {
     /// cross-channel combine). Max is idempotent and the avg sum order is fixed, so the kernel equals
     /// the scalar nest bit-for-bit (no reassociation exception).
     fn emit_pool2d(&mut self, nest: &Pool2dNest, parallel: bool) -> bool {
-        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
+        // pool2d.rs declares `x`/`out` non-overlapping: the AVX2 window fold reads eight
+        // contiguous input columns per output column, so a store can land on an input the next
+        // window still needs.
+        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
             return false;
         };
         let (Some(channels), Some(h), Some(w)) = (
@@ -9599,7 +9742,13 @@ impl FnLowerer<'_> {
     /// the scalar nest). `parallel` selects the multicore kernel (the row blocks write disjoint `dst`
     /// columns → bit-identical to the serial one, which is a plain permutation the interpreter marshals).
     fn emit_transpose(&mut self, nest: &TransposeNest, parallel: bool) -> bool {
-        let Some([src, dst]) = self.kernel_base_ptrs([nest.src, nest.dst]) else {
+        // transpose.rs declares `src`/`dst` non-overlapping, and this is the family where the
+        // three implementations disagreed outright: an aliased 4x4 `tr(x, x)` printed
+        // `1 5 9 13 2 6 …` on interp and `1 2 3 4 2 6 …` natively, while the nest mirrors the
+        // upper triangle down and the blocked kernel produces a third answer again at >= 16x16.
+        // The recognizer's old test was the symbol compare `sbase == dbase`, which the guard's own
+        // doc says cannot decide the question for two parameters.
+        let Some([src, dst]) = self.kernel_base_ptrs_disjoint([nest.src, nest.dst]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
@@ -9624,7 +9773,10 @@ impl FnLowerer<'_> {
     /// `parallel` selects the multicore kernel (disjoint column stripes → bit-identical to the serial
     /// one, which sums each column in the same i-order the interpreter marshals).
     fn emit_colsum(&mut self, nest: &ColSumNest, parallel: bool) -> bool {
-        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
+        // colreduce.rs declares `x`/`out` non-overlapping on all eight reductions: `out` is `cols`
+        // long and `x` is `rows*cols`, so a store into `out[j]` can overwrite a row-0 element a
+        // later column still reads.
+        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
@@ -9661,6 +9813,13 @@ impl FnLowerer<'_> {
     /// `parallel` selects the multicore kernel (rows across cores → bit-identical to the serial one the
     /// interpreter marshals; rows are independent, no cross-row combine).
     fn emit_softmax_bwd(&mut self, nest: &SoftmaxBwdNest, parallel: bool) -> bool {
+        // softmax_bwd.rs states both halves: "`dx` may alias `dy` (the dot over a row is read
+        // before that row's `dx` is written)" but "`dx` must not overlap `y` (its row is read
+        // during the apply)". Only the second is a precondition, so only it is tested — writing the
+        // input gradient over the upstream gradient is the memory-saving spelling and stays fast.
+        if !self.provably_disjoint(nest.y, nest.dx) {
+            return false;
+        }
         let Some([y, dy, dx]) = self.kernel_base_ptrs([nest.y, nest.dy, nest.dx]) else {
             return false;
         };
@@ -9685,6 +9844,15 @@ impl FnLowerer<'_> {
     /// selects the multicore kernel (rows across cores → bit-identical to the serial one; rows
     /// independent, no cross-row combine).
     fn emit_rmsnorm_bwd(&mut self, nest: &RmsNormBwdNest, parallel: bool) -> bool {
+        // rmsnorm_bwd.rs: "`dx` may alias `dy`" but "`dx` must not overlap `x` (each row's `x` is
+        // read during the apply after the reductions)". `gamma` is read on the same apply. Writing
+        // `dx` over the saved activation `x` is the standard way to halve a backward pass's memory,
+        // so this is a spelling a performance-minded author reaches for; it was well defined in the
+        // oracle (which marshals `x` into a scratch copy) and undefined natively.
+        if !self.provably_disjoint(nest.x, nest.dx) || !self.provably_disjoint(nest.gamma, nest.dx)
+        {
+            return false;
+        }
         let Some([x, dy, gamma, dx]) =
             self.kernel_base_ptrs([nest.x, nest.dy, nest.gamma, nest.dx])
         else {
@@ -9713,6 +9881,14 @@ impl FnLowerer<'_> {
     /// Emit one `wukong_layernorm_bwd_f32[_parallel](x, dy, gamma, dx, rows, cols, eps_bits)` call for
     /// a recognized batched LayerNorm backward. Same shape as `emit_rmsnorm_bwd`.
     fn emit_layernorm_bwd(&mut self, nest: &LayerNormBwdNest, parallel: bool) -> bool {
+        // layernorm_bwd.rs is stricter than its RMSNorm sibling: "`dx` must not overlap `x`/`dy`
+        // (each row reads `x`/`dy` during its apply)" — so unlike softmax/RMSNorm backward, `dy` is
+        // a required-disjoint operand here too.
+        if !self.all_provably_disjoint(&[nest.x, nest.dy, nest.dx])
+            || !self.provably_disjoint(nest.gamma, nest.dx)
+        {
+            return false;
+        }
         let Some([x, dy, gamma, dx]) =
             self.kernel_base_ptrs([nest.x, nest.dy, nest.gamma, nest.dx])
         else {
@@ -9834,7 +10010,9 @@ impl FnLowerer<'_> {
     /// Emit `wukong_colarg{max,min}_i32[_parallel](x, out, rows, cols)` for a recognized per-column arg
     /// nest. Same `(ptr,ptr,i64,i64)` i32-output ABI as `emit_rowarg`; `out` is the per-column row-index.
     fn emit_colarg(&mut self, nest: &ColArgNest, parallel: bool) -> bool {
-        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
+        // colarg.rs declares `x`/`out` non-overlapping (and `out` is i32 over an f32 input, so an
+        // overlap is a type pun as well as a wrong value).
+        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
@@ -9857,7 +10035,8 @@ impl FnLowerer<'_> {
     /// Emit `wukong_rowarg{max,min}_i32[_parallel](x, out, rows, cols)` for a recognized per-row arg nest.
     /// Same `(ptr,ptr,i64,i64)` shape as `wukong_logsumexp_f32`, but `out` is an i32 index buffer.
     fn emit_rowarg(&mut self, nest: &RowArgNest, parallel: bool) -> bool {
-        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
+        // rowarg.rs declares `x`/`out` non-overlapping.
+        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
@@ -9880,7 +10059,9 @@ impl FnLowerer<'_> {
     /// Emit `wukong_cumsum_f32[_parallel](x, out, rows, cols)` for a recognized per-row prefix sum.
     /// Same `(ptr,ptr,i64,i64)` `sig_vmath` shape; the `_parallel` one maps rows across cores.
     fn emit_cumsum(&mut self, nest: &CumsumNest, parallel: bool) -> bool {
-        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
+        // cumsum.rs declares `x`/`out` non-overlapping: the Hillis-Steele row scan rereads
+        // earlier lanes of the row after writing them.
+        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
@@ -9946,7 +10127,8 @@ impl FnLowerer<'_> {
 
     /// Emit `wukong_cum{max,min}_f32[_parallel](x, out, rows, cols)` for a recognized cumulative max/min.
     fn emit_cumminmax(&mut self, nest: &CumMinMaxNest, parallel: bool) -> bool {
-        let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
+        // cumminmax.rs declares `x`/`out` non-overlapping (same scan shape as cumsum).
+        let Some([x, out]) = self.kernel_base_ptrs_disjoint([nest.x, nest.out]) else {
             return false;
         };
         let (Some(rows), Some(cols)) = (self.dim_value(nest.rows), self.dim_value(nest.cols))
@@ -10042,6 +10224,12 @@ impl FnLowerer<'_> {
         bias: Option<Symbol>,
         act: u32,
     ) -> bool {
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). Declining lowers the loop as written, which is what the program means.
+        if !self.provably_disjoint(nest.a, nest.c) || !self.provably_disjoint(nest.b, nest.c) {
+            return false;
+        }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
@@ -10194,6 +10382,12 @@ impl FnLowerer<'_> {
         {
             return false;
         }
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). Declining lowers the loop as written, which is what the program means.
+        if !self.provably_disjoint(nest.a, nest.c) || !self.provably_disjoint(nest.b, nest.c) {
+            return false;
+        }
         let Some([a, b, c]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c]) else {
             return false;
         };
@@ -10264,6 +10458,20 @@ impl FnLowerer<'_> {
         }
         // Buffer operands go through `kernel_base_ptr` (never a raw `lookup`): a `[]T` slice keeps a
         // 16-byte fat pointer in its slot, so the kernel needs the loaded DATA pointer — LANDMINE 1.
+        //
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). Declining lowers the loop as written, which is what the program means.
+        // `x` is the third read operand (the velem pass adds it into `C` afterwards), so it must be
+        // disjoint from `C` too. `x != c` is already this window's matcher precondition — the
+        // `x == c` spelling is the `beta = 1` accumulate and takes a different arm — but a symbol
+        // comparison is not the same statement as a storage one, which is the whole point here.
+        if !self.all_provably_disjoint(&[nest.a, nest.c])
+            || !self.all_provably_disjoint(&[nest.b, nest.c])
+            || !self.all_provably_disjoint(&[x, nest.c])
+        {
+            return false;
+        }
         let Some([a, b, c, xp]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c, x]) else {
             return false;
         };
@@ -10334,6 +10542,19 @@ impl FnLowerer<'_> {
         }
         // Buffer operands through `kernel_base_ptr` — LANDMINE 1 (a `[]T` slice slot holds a fat
         // pointer, and the kernel needs the loaded data word).
+        //
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). Declining lowers the loop as written, which is what the program means.
+        // Two stores, so `C` and `D` must also be disjoint from each other.
+        if !self.all_provably_disjoint(&[nest.a, nest.c])
+            || !self.all_provably_disjoint(&[nest.b, nest.c])
+            || !self.all_provably_disjoint(&[nest.a, d])
+            || !self.all_provably_disjoint(&[nest.b, d])
+            || !self.all_provably_disjoint(&[nest.c, d])
+        {
+            return false;
+        }
         let Some([a, b, c, dp]) = self.kernel_base_ptrs([nest.a, nest.b, nest.c, d]) else {
             return false;
         };
@@ -10436,6 +10657,16 @@ impl FnLowerer<'_> {
         bias: Option<Symbol>,
         act: u32,
     ) -> bool {
+        // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
+        // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
+        // nest). Declining lowers the loop as written, which is what the program means.
+        // The per-channel dequant scale is read on the store, so it must not be the output either.
+        if !self.all_provably_disjoint(&[nest.a, out])
+            || !self.all_provably_disjoint(&[nest.b, out])
+            || !self.all_provably_disjoint(&[scale_b, out])
+        {
+            return false;
+        }
         let Some([a, b, out_v, sb]) = self.kernel_base_ptrs([nest.a, nest.b, out, scale_b]) else {
             return false;
         };
@@ -30788,5 +31019,235 @@ fn main() -> i32 { let mut o: [i32; 100] = [0; 100]; f(o); return 0; }
         assert!(diags.iter().all(|d| !d.is_error()), "{diags:?}");
         let ints = const_ints(&prog);
         assert!(ints.contains(&37) && ints.contains(&41), "widths: {ints:?}");
+    }
+
+    // ---- Aliasing: the whole-program fact and the disjointness precondition it feeds ----------
+    //
+    // See `alias.rs` for the decision these pin: an aliased recognized call means what the SOURCE
+    // NEST means, so a kernel whose contract requires disjointness declines rather than computing a
+    // different program. Every assertion below is paired with its non-aliased control, because a
+    // decline that fires everywhere would be "correct" and useless.
+
+    /// The whole-program answer for one function by name.
+    fn alias_free_of(src: &str, f: &str) -> bool {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let facts = alias::AliasFacts::analyze(&module, &sema);
+        facts.alias_free(interner.intern(f))
+    }
+
+    /// `mm(x, y, x)` at ONE call site is what makes `mm`'s parameters possibly-one-array. Nothing
+    /// else in the program is affected -- the fact is per callee, and the default is "provably
+    /// disjoint", so a corpus with no aliased call site lowers byte-identically.
+    #[test]
+    fn alias_analysis_flags_only_the_functions_a_call_site_aliases() {
+        let src = "module m
+fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) { c[0] = a[0] + b[0]; }
+fn nn(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) { c[0] = a[0] + b[0]; }
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut y: [f32; 16] = [0.0; 16];
+    let mut z: [f32; 16] = [0.0; 16];
+    mm(x, y, x);
+    nn(x, y, z);
+    return 0;
+}
+";
+        assert!(
+            !alias_free_of(src, "mm"),
+            "mm(x, y, x) aliases params 0 and 2"
+        );
+        assert!(
+            alias_free_of(src, "nn"),
+            "nn(x, y, z) binds three distinct locals"
+        );
+        assert!(alias_free_of(src, "main"), "main has no parameters at all");
+    }
+
+    /// A `[]T` slice `let` VIEWS its source (`lower_slice_from_source` stores the source base
+    /// pointer -- "no element copy"), so laundering an argument through one must not hide the
+    /// aliasing. An ordinary aggregate `let` deep-copies and must NOT be treated as a view, or the
+    /// analysis would flag half the corpus.
+    #[test]
+    fn alias_analysis_sees_through_a_slice_view() {
+        let viewed = "module m
+fn f(p: []f32, mut q: []f32, n: i64) { q[0] = p[0] + (n as f32); }
+fn main() -> i32 {
+    let mut a: [f32; 4] = [0.0; 4];
+    let mut s: []f32 = a;
+    f(s, a, 4i64);
+    return 0;
+}
+";
+        assert!(
+            !alias_free_of(viewed, "f"),
+            "`s` is a view of `a`, so f(s, a) aliases"
+        );
+
+        let copied = "module m
+fn f(p: [f32; 4], mut q: [f32; 4]) { q[0] = p[0]; }
+fn main() -> i32 {
+    let mut a: [f32; 4] = [0.0; 4];
+    let mut b: [f32; 4] = a;
+    f(b, a);
+    return 0;
+}
+";
+        assert!(
+            alias_free_of(copied, "f"),
+            "`let b = a` on a fixed array deep-copies, so f(b, a) is two buffers"
+        );
+    }
+
+    /// Two different fields of one struct are two different buffers. This is the spelling every
+    /// transformer weight block uses (`mm(l.wq, l.wk, l.o)`), so a root-symbol-only analysis would
+    /// have declined the whole model.
+    #[test]
+    fn alias_analysis_keeps_distinct_struct_fields_disjoint() {
+        let src = "module m
+struct L { wq: [f32; 4], wk: [f32; 4], o: [f32; 4] }
+fn f(a: [f32; 4], b: [f32; 4], mut c: [f32; 4]) { c[0] = a[0] + b[0]; }
+fn g(a: [f32; 4], b: [f32; 4], mut c: [f32; 4]) { c[0] = a[0] + b[0]; }
+fn main() -> i32 {
+    let mut l: L = L { wq: [1.0; 4], wk: [2.0; 4], o: [0.0; 4] };
+    f(l.wq, l.wk, l.o);
+    g(l.wq, l.wk, l.wq);
+    return 0;
+}
+";
+        assert!(
+            alias_free_of(src, "f"),
+            "three distinct fields are three buffers"
+        );
+        assert!(
+            !alias_free_of(src, "g"),
+            "the same field twice is one buffer"
+        );
+    }
+
+    /// Aliasing forwards along the call graph: if `outer`'s own parameters can be one array, then a
+    /// call inside it that passes two of them to `mm` makes `mm`'s parameters one array too. The
+    /// fixpoint has to reach that on its second round.
+    #[test]
+    fn alias_analysis_propagates_through_a_forwarding_call() {
+        let src = "module m
+fn mm(a: [f32; 4], b: [f32; 4], mut c: [f32; 4]) { c[0] = a[0] + b[0]; }
+fn outer(a: [f32; 4], b: [f32; 4], mut c: [f32; 4]) { mm(a, b, c); }
+fn main() -> i32 {
+    let mut x: [f32; 4] = [0.0; 4];
+    let mut y: [f32; 4] = [0.0; 4];
+    outer(x, y, x);
+    return 0;
+}
+";
+        assert!(
+            !alias_free_of(src, "outer"),
+            "the direct call site aliases outer"
+        );
+        assert!(
+            !alias_free_of(src, "mm"),
+            "outer forwards its aliased params to mm"
+        );
+    }
+
+    /// End to end: the recognized GEMM must vanish when a call site binds `C` to `A`, and must
+    /// still fire when it does not. The wrong answer this prevents is `10 14 5 8 ...` (the
+    /// out-of-place product) where the nest says `10 14 23 32 ...`, printed identically by both
+    /// backends at -O0 and -O2 -- which is why no differential gate could see it.
+    #[test]
+    fn recognizers_decline_when_two_buffer_params_may_alias() {
+        let aliased = format!(
+            "{MATMUL_SRC}fn main() -> i32 {{
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut y: [f32; 16] = [0.0; 16];
+    mm(x, y, x);
+    return 0;
+}}
+"
+        );
+        let (prog, diags, interner) = lower(&aliased);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "an aliased GEMM must lower to the scalar nest, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        let disjoint = format!(
+            "{MATMUL_SRC}fn main() -> i32 {{
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut y: [f32; 16] = [0.0; 16];
+    let mut z: [f32; 16] = [0.0; 16];
+    mm(x, y, z);
+    return 0;
+}}
+"
+        );
+        let (prog, diags, interner) = lower(&disjoint);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a disjoint GEMM must still dispatch, or the assertion above is vacuous"
+        );
+    }
+
+    /// The same for the two families that produced an interp-vs-native divergence rather than
+    /// silent agreement: an aliased transpose (three different answers) and an aliased GEMV (three
+    /// different answers). Both must decline; both must still dispatch when disjoint.
+    #[test]
+    fn aliased_transpose_and_gemv_decline_to_the_scalar_nest() {
+        let tr = "module m
+fn tr(a: [f32; 16], mut o: [f32; 16]) {
+    for i in 0..4 { for j in 0..4 { o[j * 4 + i] = a[i * 4 + j]; } }
+}
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    let mut o: [f32; 16] = [0.0; 16];
+    ALIASCALL
+    return 0;
+}
+";
+        let (prog, _d, interner) = lower(&tr.replace("ALIASCALL", "tr(x, x);"));
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_transpose_f32"),
+            "an aliased transpose must lower to the scalar nest, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        let (prog, _d, interner) = lower(&tr.replace("ALIASCALL", "tr(x, o);"));
+        assert!(
+            prog_calls(&prog, &interner, "wukong_transpose_f32"),
+            "a disjoint transpose must still dispatch"
+        );
+
+        let gv = "module m
+fn gv(a: [f32; 16], x: [f32; 4], mut y: [f32; 4]) {
+    for i in 0..4 {
+        let mut s: f32 = 0.0;
+        for j in 0..4 { s = s + a[i * 4 + j] * x[j]; }
+        y[i] = s;
+    }
+}
+fn main() -> i32 {
+    let mut m: [f32; 16] = [0.0; 16];
+    let mut v: [f32; 4] = [0.0; 4];
+    let mut w: [f32; 4] = [0.0; 4];
+    ALIASCALL
+    return 0;
+}
+";
+        let (prog, _d, interner) = lower(&gv.replace("ALIASCALL", "gv(m, v, v);"));
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemv"),
+            "an aliased GEMV must lower to the scalar nest, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        let (prog, _d, interner) = lower(&gv.replace("ALIASCALL", "gv(m, v, w);"));
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemv"),
+            "a disjoint GEMV must still dispatch"
+        );
     }
 }

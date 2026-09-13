@@ -1,0 +1,73 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+module tests.run.alias_matmul_inplace
+
+// A recognized GEMM whose output parameter is bound to one of its input parameters at the call site.
+//
+// `wukong_sgemm` writes `C` in a tiled order while it is still reading `A`, so it equals the nest
+// only on disjoint operands, and nothing used to check: `emit_sgemm` took three base pointers and
+// emitted the call. `mm(x, y, x)` produced `call wukong_sgemm(v0, v9, v0, ...)` — the alias visible
+// in the MIR as the repeated value id — and printed the OUT-OF-PLACE product `10 14 5 8 26 30 17 20
+// 42 46 29 32 58 62 41 44` on interp AND native, at -O0 and -O2. Both backends agreeing is why no
+// differential, invariance or determinism gate could see it.
+//
+// Recognition is an optimization, so the program means what the loop means. The expectations below
+// are the SCALAR NEST run by hand over the same inputs — each `c[i*4+j]` store lands before the
+// later reads of that row — not a reading taken from any backend. Every one of the sixteen lanes is
+// printed, per the corpus rule for a recognized kernel: a checksum would pass over a buffer that is
+// right in twelve places.
+//
+// Every value here is an exact small integer in f32, so an FMA contraction of `s + a*b` cannot move
+// a result and the expectations hold at every -O level and on both backends.
+
+fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + a[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i + 1) as f32;
+    }
+    // b = [1 0 2 0; 0 1 0 2; 3 0 1 0; 0 3 0 1] — chosen so the aliased and disjoint answers differ
+    // in twelve of sixteen lanes rather than in one.
+    let mut y: [f32; 16] = [0.0; 16];
+    y[0] = 1.0;
+    y[2] = 2.0;
+    y[5] = 1.0;
+    y[7] = 2.0;
+    y[8] = 3.0;
+    y[10] = 1.0;
+    y[13] = 3.0;
+    y[15] = 1.0;
+
+    mm(x, y, x);
+    for i in 0..16 {
+        print(x[i] as i32);
+    }
+    return 0;
+}

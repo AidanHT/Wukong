@@ -1,0 +1,50 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 30
+// EXPECT-OUT: 215
+// EXPECT-OUT: 2501
+// EXPECT-OUT: 40979
+module tests.run.alias_gemv_inplace
+
+// A recognized GEMV whose result vector is the same buffer as its input vector — `y = A·y`, the
+// power-iteration spelling.
+//
+// gemv.rs's own contract is "`y` must not overlap `a` or `x`": each row's dot is folded and stored
+// before the next row is read, so a later row reads values the store has already replaced. Nothing
+// checked. `gv(m, v, v)` was a THREE-way split — interp `30 70 110 150`, native
+// `30 70 1051 1479`, and the nest `30 215 2501 40979` — so the oracle, the fast path and the source
+// each computed a different program, and the interpreter was NOT the side that matched the language.
+//
+// The recognizer now declines when `y` may be `a` or `x`, so all three run the nest. Expectations
+// below are that nest by hand:
+//   y0 = 1*1 + 2*2 + 3*3  + 4*4    = 30
+//   y1 = 5*30 + 6*2 + 7*3 + 8*4    = 215      (y[0] already overwritten)
+//   y2 = 9*30 + 10*215 + 11*3 + 12*4 = 2501
+//   y3 = 13*30 + 14*215 + 15*2501 + 16*4 = 40979
+// All exact in f32 (max 40979 << 2^24), so an FMA contraction cannot move them.
+
+fn gv(a: [f32; 16], x: [f32; 4], mut y: [f32; 4]) {
+    for i in 0..4 {
+        let mut s: f32 = 0.0;
+        for j in 0..4 {
+            s = s + a[i * 4 + j] * x[j];
+        }
+        y[i] = s;
+    }
+}
+
+fn main() -> i32 {
+    let mut m: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        m[i] = (i + 1) as f32;
+    }
+    let mut v: [f32; 4] = [0.0; 4];
+    for i in 0..4 {
+        v[i] = (i + 1) as f32;
+    }
+    gv(m, v, v);
+    for i in 0..4 {
+        print(v[i] as i32);
+    }
+    return 0;
+}

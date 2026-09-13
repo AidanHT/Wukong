@@ -1,0 +1,57 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 3
+// EXPECT-OUT: 7
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 12
+// EXPECT-OUT: 16
+module tests.run.alias_transpose_inplace
+
+// An in-place square transpose — the one aliased spelling a kernel author writes on purpose.
+//
+// This shape had THREE answers. transpose.rs declares `src`/`dst` non-overlapping; the interpreter
+// marshalled all of `src` into a scratch buffer first (its comment claimed "reading all of src first
+// makes any overlap robust") and so computed a TRUE transpose, `1 5 9 13 2 6 10 14 3 7 11 15
+// 4 8 12 16`; native ran the blocked kernel and printed `1 2 3 4 2 6 7 8 3 7 11 12 4 8 12 16`; and
+// at >= 16x16 the blocked kernel diverges from both. That is a live `native_matches_interpreter`
+// failure that no corpus fixture could reach, because none passed one buffer twice.
+//
+// The recognizer's only distinctness test was the symbol compare `sbase == dbase`, which the
+// overlap guard's own doc says cannot decide the question: two distinct array PARAMETERS can be
+// bound to the same array at the call site. It now declines, and all three implementations run the
+// nest.
+//
+// Expectations are the scalar nest by hand: `a[j*4+i] = a[i*4+j]` mirrors the UPPER triangle down,
+// because the read of `a[4]` at (i=1, j=0) happens after the write of `a[4]` at (i=0, j=1). Pure
+// data movement, so the values are exact at every -O level.
+
+fn tr(a: [f32; 16], mut o: [f32; 16]) {
+    for i in 0..4 {
+        for j in 0..4 {
+            o[j * 4 + i] = a[i * 4 + j];
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 16] = [0.0; 16];
+    for i in 0..16 {
+        x[i] = (i + 1) as f32;
+    }
+    tr(x, x);
+    for i in 0..16 {
+        print(x[i] as i32);
+    }
+    return 0;
+}
