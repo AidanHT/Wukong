@@ -194,9 +194,23 @@ impl BinOp {
     /// allocas the low 32 bits) and `[i32; 4294967296 + 4]` folded above the u32 slot width, so a
     /// well-formed program wrote out of bounds on native and trapped in the interpreter.
     pub fn fold_const_len(self, l: u64, r: u64) -> u64 {
+        self.try_fold_const_len(l, r).unwrap_or(0)
+    }
+
+    /// [`BinOp::fold_const_len`] *before* the 0 sentinel is applied: `None` means "this operator,
+    /// on these operands, has no length value at all", which the 0 both consumers actually use
+    /// cannot be told apart from a genuine `[T; 2 - 2]`.
+    ///
+    /// Sema's array-length readability check needs exactly that distinction. Readable OPERANDS are
+    /// not a readable LENGTH: `[i32; 2 - 5]` (checked subtraction fails) and `[i32; 4 > 2]` (a
+    /// comparison is never a length) both have two integer literals for operands, and both folded
+    /// to 0 in sema AND in `mir_build` — the same number the source never wrote on both sides of
+    /// the mirror, so no differential gate could see it. Lowering keeps calling the sentinel form,
+    /// so the two crates still fold identically; only the diagnostic path looks at the `None`.
+    pub fn try_fold_const_len(self, l: u64, r: u64) -> Option<u64> {
         use BinOp::*;
         if l > MAX_CONST_ARRAY_LEN || r > MAX_CONST_ARRAY_LEN {
-            return 0;
+            return None;
         }
         let folded = match self {
             Add => l.checked_add(r),
@@ -223,10 +237,7 @@ impl BinOp {
             BitXor => Some(l ^ r),
             Eq | Ne | Lt | Le | Gt | Ge | And | Or => None,
         };
-        match folded {
-            Some(n) if n <= MAX_CONST_ARRAY_LEN => n,
-            _ => 0,
-        }
+        folded.filter(|n| *n <= MAX_CONST_ARRAY_LEN)
     }
 }
 

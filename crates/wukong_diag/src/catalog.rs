@@ -257,14 +257,35 @@ static CATALOG: &[Explanation] = &[
          arms (`if …`) do not count toward coverage because their guard may be false."
     ),
     entry!(
+        "E0406",
+        "array length is not a compile-time constant",
+        "A fixed-size array's length is part of its type, so it must be readable at compile time: \
+         an integer literal, a `const` (possibly through a chain of consts), a non-negative C-style \
+         enum variant, or arithmetic on those. Anything else — a cast (`[i32; 4 as usize]`), a \
+         `sizeof`/`alignof`, a call, a unary operator, a multi-segment path — cannot be folded, and \
+         was previously accepted in silence: the type checker recorded length 0 while lowering \
+         emitted no array slot at all, just an uninitialized pointer that the program then stored \
+         through. A GENERIC parameter is rejected for the same reason and needs the same fix: \
+         `Ty::Array` carries a plain integer length, with no representation for a symbolic extent, \
+         so `[T; N]` inside `fn f<N>(..)` folded to length 0. Where the extent really is a \
+         per-call-site parameter, spell the value `Tensor[T, N]`, whose dimensions are shape-checked \
+         symbolically and bound at each call; where it is a fixed size, declare a `const`."
+    ),
+    entry!(
         "E0501",
-        "tensor rank mismatch",
+        "rank, extent or arity mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \
          example, passing a rank-3 tensor where a rank-2 tensor is expected. This is checked at \
          compile time — it can never become a runtime shape bug.\n\nThis code is also reported \
          when a compile-time-constant index is out of bounds — for a fixed-size array (e.g. \
          `a[5]` on a `[T; 4]`) or for a static tensor dimension (e.g. `a[5, 0]` on a \
-         `Tensor[f32, 2, 2]`): the valid indices are `0..len` on each axis."
+         `Tensor[f32, 2, 2]`): the valid indices are `0..len` on each axis.\n\nThe same code \
+         covers the non-tensor extents, which are checked by the same unifier and mean the same \
+         thing: an ARRAY LENGTH mismatch at a call site (a `[i32; 2]` supplied where `[i32; 8]` is \
+         declared), a TUPLE ARITY mismatch at a call site (a 2-element tuple supplied where a \
+         3-element tuple is declared), and a wrong NUMBER OF INDICES on an array, a slice or a \
+         pointer (`a[i, j]` on a `[i32; 4]`, which is rank 1 — only a tensor takes one index per \
+         axis)."
     ),
     entry!(
         "E0502",

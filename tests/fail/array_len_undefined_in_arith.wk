@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0301
+module tests.fail.array_len_undefined_in_arith
+
+// The array-length name check only looked at a length that was DIRECTLY a single-segment path, so
+// an undefined identifier inside arithmetic was never resolved and never reported: this compiled
+// and RAN (exit 99), writing 8 elements into the caller's buffer with `BOGUS` bound to nothing.
+// `fold_const_len` treats an unreadable operand as 0 on both sides of the mirror, so the length
+// silently becomes 8 — a number the source never wrote, that both backends agree on.
+fn fill(mut a: [i32; BOGUS + 8]) {
+    let mut i: i64 = 0;
+    while i < 8 {
+        a[i] = 9;
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut buf: [i32; 8] = [0; 8];
+    fill(buf);
+    return buf[7];
+}

@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0300
+module tests.fail.duplicate_enum_variant
+
+// `enum E { A, A }` compiled and RAN, printing 0. Two variants sharing a name give one name two
+// discriminants, which is what `collect_enum_coverage` counts when it decides whether a `match` is
+// exhaustive (E0405) — so a duplicate variant feeds bad input straight into the exhaustiveness
+// reasoning.
+enum E {
+    A,
+    A,
+}
+
+fn main() -> i32 {
+    return E::A as i32;
+}

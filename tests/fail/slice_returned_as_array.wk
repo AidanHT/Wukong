@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0401
+module tests.fail.slice_returned_as_array
+
+// `compatible` encodes the language's ONE implicit aggregate coercion — a fixed-size `[T; N]`
+// unsizes to a `[]T` slice — in a single direction on purpose: a slice carries no static length to
+// restore, so there is no slice→array direction. `let r: [f32; 4] = s;` has always been rejected
+// for that reason. `return` and `=` were not: the first version of the aggregate check asked
+// `!(compatible(a, b) || compatible(b, a))`, and the symmetric form re-opened the forbidden
+// direction in exactly the two contexts where direction is not an accident of the source. The
+// caller then reads the 16-byte fat-pointer header as four f32 elements — BOTH backends print 0, a
+// value the source never wrote, so no differential gate can see it.
+fn head4(s: []f32) -> [f32; 4] {
+    return s;
+}
+
+fn main() -> i32 {
+    let mut buf: []f32 = alloc_f32(8);
+    buf[0] = 1.0;
+    let r: [f32; 4] = head4(buf);
+    println(r[0]);
+    return 0;
+}

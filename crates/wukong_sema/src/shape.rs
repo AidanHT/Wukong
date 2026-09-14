@@ -97,6 +97,24 @@ fn kind_name(t: &Ty) -> &'static str {
     }
 }
 
+/// Whether `t` is a *structural* kind whose layout is fully determined by the type itself — the set
+/// a declared nominal type (`Ty::Named` resolving to a struct/enum) can be reported against. Deliberately
+/// excludes `Ty::Tensor` (the `(Tensor, Named)` pairing has its own arm with its own `E0501` wording),
+/// `Ty::Named` itself (two nominals are compared by name), and `Unknown`/`Error`/`Unit`/`Fn`, which the
+/// crate-wide leniency rule keeps quiet.
+fn is_structural_kind(t: &Ty) -> bool {
+    matches!(
+        t,
+        Ty::Scalar(_)
+            | Ty::Vector { .. }
+            | Ty::Ptr { .. }
+            | Ty::Ref { .. }
+            | Ty::Array { .. }
+            | Ty::Tuple(_)
+            | Ty::Slice(_)
+    )
+}
+
 /// Where a dimension disagreement sits, for the diagnostic that reports it: the 0-based axis, plus
 /// the declared *name* of that axis (`K`) when a shape spells a dimension variable there. The name
 /// is what makes an `E0502` actionable — "expected 512, found 513" leaves the reader counting axes
@@ -774,12 +792,136 @@ impl Sema<'_> {
             | (Ty::Ref { pointee: pp, .. }, Ty::Ref { pointee: ap, .. }) => {
                 self.unify_decl(pp, ap, decl_pointee(decl), dims, span, rigid)
             }
+            // A fixed-size array parameter fed a fixed-size array argument: BOTH the length and
+            // the element type must agree. There was no `(Array, Array)` arm at all, so every such
+            // pair fell to the lenient `_ => {}` below and `fn f(a: [i32; 8])` accepted a `[i32; 2]`
+            // — the interpreter trapped on `a[7]` ("load out of bounds") while native codegen read
+            // 24 bytes past the caller's stack buffer and printed garbage. That is an accepted
+            // program on which the two Executed backends disagree, the one invariant the whole
+            // differential gate exists to protect, and it is memory-unsafe on native. The element
+            // recursion additionally catches `[f32; 4]` fed an `[i32; 4]` (the i32 bit pattern was
+            // being read as an f32: interp 3, native 4.203895e-45). The length error is `E0501`, the
+            // code the array→tensor decay arm above and `type_index`'s array bounds check already
+            // use for a fixed-array extent; the element clash is whatever the recursion reports
+            // (`E0401` for a scalar element). Array→tensor decay is matched EARLIER and unaffected,
+            // and `[T; N]` → `[]T` unsizing is the Slice arm below, also unaffected.
+            (
+                Ty::Array {
+                    elem: pe, len: pl, ..
+                },
+                Ty::Array {
+                    elem: ae, len: al, ..
+                },
+            ) => {
+                // Length 0 doubles as `array_len`'s "could not fold" sentinel — the same reason
+                // `is_concrete_layout` requires `*len > 0` before it will call an array's layout
+                // known. A length the folder could not read has already been reported as E0406 at
+                // the declaration, so comparing the sentinel against a real length here only
+                // stacks a spurious "expected an array of length 0" on top of the real error.
+                // Skip it on either side; a genuine `[T; 0]` is not a value anyone can index.
+                if pl != al && *pl > 0 && *al > 0 {
+                    self.error(
+                        span,
+                        "E0501",
+                        format!(
+                            "array length mismatch: expected an array of length {pl}, found \
+                             one of length {al}"
+                        ),
+                    );
+                }
+                self.unify_decl(pe, ae, decl_pointee(decl), dims, span, rigid);
+            }
+            // A tuple parameter fed a tuple argument: the arity must agree and each element must
+            // unify. There was no `(Tuple, Tuple)` arm either, so `fn f(t: (i32, i32, i32))` fed a
+            // `(i32, i32)` compiled clean and `t.2` read past the caller's buffer — interp trapped,
+            // native printed -1037373571. Element recursion is what also catches `(i32, f32)` fed a
+            // `(i32, i32)` (interp 2, native 2.802597e-45). `apply_subst`/`infer_type_generics`
+            // already walk tuples pairwise, but only to BIND generics — neither ever reported.
+            (Ty::Tuple(ps), Ty::Tuple(as_)) => {
+                if ps.len() != as_.len() {
+                    self.error(
+                        span,
+                        "E0501",
+                        format!(
+                            "tuple arity mismatch: expected a {}-element tuple, found a \
+                             {}-element tuple",
+                            ps.len(),
+                            as_.len()
+                        ),
+                    );
+                } else {
+                    for (p, a) in ps.iter().zip(as_) {
+                        self.unify_decl(p, a, None, dims, span, rigid);
+                    }
+                }
+            }
+            // Two DECLARED nominal types are not interchangeable. `Ty::Named` also spells a bare
+            // generic TYPE variable (`fn f<T>(x: T)`), which must stay lenient, so — exactly like
+            // the `(Tensor, Named)` arm below — only a name that resolves to a declared struct/enum
+            // is reported. Without this arm `struct A { x: i32 }` satisfied a `v: B` parameter for a
+            // differently-laid-out `B`: the callee GEPed the caller's smaller buffer, so interp
+            // trapped ("load out of bounds") while native printed 0 — an out-of-bounds read and a
+            // backend divergence on a clean compile. A value-type generic is substituted by
+            // `apply_subst` before this point, so `f(x)` on `fn f<T>(x: T)` still binds `T`.
+            (Ty::Named(pn), Ty::Named(an))
+                if pn != an && self.is_declared_named_ty(*pn) && self.is_declared_named_ty(*an) =>
+            {
+                self.error(
+                    span,
+                    "E0401",
+                    format!(
+                        "type mismatch: expected `{}`, found `{}`",
+                        self.sym_str(*pn),
+                        self.sym_str(*an)
+                    ),
+                );
+            }
+            // A declared struct/enum versus a structural kind (scalar / vector / pointer / reference
+            // / array / tuple / slice) is the same kind confusion the scalar-vs-aggregate arm below
+            // reports, with the nominal side spelled `Named`. The `(Tensor, Named)` pairing is
+            // matched by its own arm further down and never reaches here. A bare generic type
+            // variable is filtered out by `is_declared_named_ty`, so this cannot fire on `fn f<T>`.
+            (Ty::Named(n), other) | (other, Ty::Named(n))
+                if self.is_declared_named_ty(*n) && is_structural_kind(other) =>
+            {
+                self.error(
+                    span,
+                    "E0401",
+                    format!(
+                        "type mismatch: expected {}, found {}",
+                        kind_name(param),
+                        kind_name(arg)
+                    ),
+                );
+            }
             // A slice parameter `[]T` accepts a slice `[]T` or — via unsizing — a fixed-size array
             // `[T; N]` argument; either way the element types must unify (a slice of a different
             // element type has a different stride, so `s[i]` would read the wrong bytes). The
             // array's static length is intentionally dropped to the slice's runtime length.
             (Ty::Slice(pe), Ty::Slice(ae) | Ty::Array { elem: ae, .. }) => {
                 self.unify_decl(pe, ae, decl_pointee(decl), dims, span, rigid)
+            }
+            // The leftover aggregate cross-kind pairings, once the matching-kind arms above have
+            // had their turn: an array fed a slice or a tuple, a tuple fed an array or a slice, a
+            // slice fed a tuple. Each has a different ABI — a `[]T` is a 16-byte `(ptr, len)` fat
+            // pointer, a `[T; N]` is the buffer itself, a tuple is a padded aggregate — so passing
+            // one for another hands the callee the wrong bytes. `get([]i32)` for an `[i32; 4]`
+            // parameter printed 0 on BOTH backends (the fat-pointer header read as element data), so
+            // no differential gate could see it. Array→slice unsizing is the arm above and stays
+            // accepted; array→tensor decay is matched earlier still.
+            (
+                Ty::Array { .. } | Ty::Tuple(_) | Ty::Slice(_),
+                Ty::Array { .. } | Ty::Tuple(_) | Ty::Slice(_),
+            ) => {
+                self.error(
+                    span,
+                    "E0401",
+                    format!(
+                        "type mismatch: expected {}, found {}",
+                        kind_name(param),
+                        kind_name(arg)
+                    ),
+                );
             }
             (
                 Ty::Vector {
@@ -1080,6 +1222,9 @@ impl Sema<'_> {
             );
             return Ty::Unknown;
         }
+        // Recorded before the `match` consumes `base_ty`: the rank-1 count check below names the
+        // kind it is talking about, and the arm binds the pointee out of the type by value.
+        let base_is_slice = matches!(base_ty, Ty::Slice(_));
         match base_ty {
             Ty::Tensor { elem, shape, .. } => {
                 if indices.len() != shape.rank() {
@@ -1125,31 +1270,70 @@ impl Sema<'_> {
                 Ty::Scalar(elem)
             }
             Ty::Array { elem, len, .. } => {
-                // A constant index known at compile time must be in bounds — the headline
-                // compile-time-safety check applied to fixed-size arrays (an out-of-bounds read is
-                // otherwise undefined: the backends disagree). Only a literal index is checked; a
-                // runtime `a[i]` is unconstrained.
-                if indices.len() == 1 {
-                    if let Some(v) = self.eval_index_const(&indices[0]) {
-                        if v < 0 || v as u64 >= len {
-                            self.error(
-                                span,
-                                "E0501",
-                                format!("index {v} is out of bounds for an array of length {len}"),
-                            );
-                        }
+                // An array is rank 1, so it takes exactly one index. The module header promises
+                // "a wrong index count is E0501", but only the tensor arm enforced it: the bounds
+                // check below was gated on `indices.len() == 1` and every other count returned the
+                // element type unchecked, so `a[i, j]` on a `[i32; 4]` reached mir_build and came
+                // back as `C0001 'multi-dimensional indexing on a non-contiguous or symbolically-
+                // strided tensor'` — a message that tells the user the COMPILER is incomplete when
+                // it is their code that is wrong, and that names nothing they wrote.
+                if indices.len() != 1 {
+                    self.error(
+                        span,
+                        "E0501",
+                        format!(
+                            "this array of length {len} has rank 1 but is indexed with {} {}",
+                            indices.len(),
+                            if indices.len() == 1 {
+                                "index"
+                            } else {
+                                "indices"
+                            }
+                        ),
+                    );
+                } else if let Some(v) = self.eval_index_const(&indices[0]) {
+                    // A constant index known at compile time must be in bounds — the headline
+                    // compile-time-safety check applied to fixed-size arrays (an out-of-bounds read
+                    // is otherwise undefined: the backends disagree). Only a literal index is
+                    // checked; a runtime `a[i]` is unconstrained.
+                    if v < 0 || v as u64 >= len {
+                        self.error(
+                            span,
+                            "E0501",
+                            format!("index {v} is out of bounds for an array of length {len}"),
+                        );
                     }
                 }
                 *elem
             }
-            Ty::Slice(e) | Ty::Ptr { pointee: e, .. } => *e,
+            // A slice and a pointer are both rank-1 element sequences, so they take exactly one
+            // index too. This arm had no count check at all.
+            Ty::Slice(e) | Ty::Ptr { pointee: e, .. } => {
+                if indices.len() != 1 {
+                    let what = if base_is_slice { "slice" } else { "pointer" };
+                    self.error(
+                        span,
+                        "E0501",
+                        format!(
+                            "this {what} has rank 1 but is indexed with {} {}",
+                            indices.len(),
+                            if indices.len() == 1 {
+                                "index"
+                            } else {
+                                "indices"
+                            }
+                        ),
+                    );
+                }
+                *e
+            }
             _ => Ty::Unknown,
         }
     }
 
     /// Whether a `Ty::Named` refers to a DECLARED struct/enum rather than a generic type variable —
     /// both are spelled `Named`, and only the former can be reported as a kind clash.
-    fn is_declared_named_ty(&self, n: Symbol) -> bool {
+    pub(crate) fn is_declared_named_ty(&self, n: Symbol) -> bool {
         matches!(
             self.defs.lookup(n).map(|d| &d.kind),
             Some(DefKind::Struct(_) | DefKind::Enum(_))

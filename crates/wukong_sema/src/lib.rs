@@ -451,6 +451,16 @@ impl<'a> Sema<'a> {
                     self.record_const(c);
                 }
                 ItemKind::Struct(s) => {
+                    self.check_unique_decl_names(
+                        &Self::generic_decl_names(&s.generics),
+                        "generic parameter",
+                    );
+                    let field_names: Vec<(Symbol, Span)> = s
+                        .fields
+                        .iter()
+                        .map(|fl| (fl.name.sym, fl.name.span))
+                        .collect();
+                    self.check_unique_decl_names(&field_names, "struct field");
                     self.generics = generic_names(&s.generics);
                     let fields = s
                         .fields
@@ -461,6 +471,23 @@ impl<'a> Sema<'a> {
                     self.register(s.name, DefKind::Struct(fields), item.span);
                 }
                 ItemKind::Enum(e) => {
+                    self.check_unique_decl_names(
+                        &Self::generic_decl_names(&e.generics),
+                        "generic parameter",
+                    );
+                    let variant_names: Vec<(Symbol, Span)> = e
+                        .variants
+                        .iter()
+                        .map(|v| (v.name.sym, v.name.span))
+                        .collect();
+                    self.check_unique_decl_names(&variant_names, "enum variant");
+                    for v in &e.variants {
+                        if let VariantData::Struct(fields) = &v.data {
+                            let fs: Vec<(Symbol, Span)> =
+                                fields.iter().map(|f| (f.name.sym, f.name.span)).collect();
+                            self.check_unique_decl_names(&fs, "variant field");
+                        }
+                    }
                     // Payload field types are lowered in the enum's generic scope (like struct
                     // fields), so a generic-typed payload resolves its param names.
                     self.generics = generic_names(&e.generics);
@@ -765,6 +792,7 @@ impl<'a> Sema<'a> {
     }
 
     fn collect_fn(&mut self, f: &FnDecl) {
+        self.check_unique_decl_names(&Self::generic_decl_names(&f.generics), "generic parameter");
         self.generics = generic_names(&f.generics);
         let params = f.params.iter().map(|p| self.lower_type(&p.ty)).collect();
         let ret = match &f.ret {
@@ -789,6 +817,44 @@ impl<'a> Sema<'a> {
             }),
             f.name.span,
         );
+    }
+
+    /// Report every repeated name in a declaration list, labelling BOTH sites exactly as `register`
+    /// does for a duplicate top-level definition and `check_fn` does for a duplicate parameter.
+    ///
+    /// Struct fields, enum variants and generic parameter lists had no such pass:
+    /// `struct S { x: i32, x: i32 }` produced no declaration-site error at all (only the literal
+    /// `S { x: 1, x: 2 }` was rejected, so a struct never literal-constructed compiled clean),
+    /// `enum E { A, A }` compiled and RAN, and `fn f<N, N>(..)` compiled and ran. A duplicate enum
+    /// variant makes `collect_enum_coverage` count one name for two discriminants, so it feeds the
+    /// match-exhaustiveness reasoning behind E0405; a duplicate field means the layout carries a
+    /// field no expression can ever name; a duplicate generic makes the positional turbofish zip
+    /// (`FnSig.generics` × `f::<2, 3>`) bind two different arguments to one name.
+    ///
+    /// Order comes from the AST slice, never from a hash set, so the diagnostics are deterministic.
+    fn check_unique_decl_names(&mut self, names: &[(Symbol, Span)], what: &str) {
+        let mut seen: HashMap<Symbol, Span> = HashMap::default();
+        for &(sym, span) in names {
+            if let Some(&first) = seen.get(&sym) {
+                let nm = self.sym_str(sym).to_string();
+                let mut d = Diagnostic::error(format!("duplicate {what} `{nm}`"))
+                    .with_code("E0300")
+                    .primary(span, "redeclared here");
+                if !first.is_dummy() {
+                    d = d.secondary(first, "first declared here");
+                }
+                self.diags.push(d);
+            } else {
+                seen.insert(sym, span);
+            }
+        }
+    }
+
+    /// A declaration's generic parameter list as `(name, span)` pairs, in SOURCE order — the order
+    /// `check_fn_call` zips a turbofish against. `generic_names` returns a `HashSet` and silently
+    /// absorbs a repeat, which is why the duplicate was invisible.
+    fn generic_decl_names(gs: &[GenericParam]) -> Vec<(Symbol, Span)> {
+        gs.iter().map(|g| (generic_param_sym(g), g.span)).collect()
     }
 
     fn register(&mut self, name: Ident, kind: DefKind, span: Span) {
@@ -1047,32 +1113,12 @@ impl<'a> Sema<'a> {
     /// the length expression and are gated on `checking_bodies` exactly like the E0504 dim check, so
     /// a signature re-lowered by `check_fn` is reported once (see the flag's doc-comment).
     fn array_len(&mut self, len: &Expr) -> u64 {
-        // An array length naming an identifier that is neither a declared generic nor a top-level
-        // `const` is a typo, not a length. `fn sum(a: [i32; NOPE])` typed the parameter `[i32; 0]`
-        // and compiled clean — mir_build's `const_usize_expr` returned `None` and lowered a bare
-        // pointer — so every compile-time bounds check on that array was vacuous or nonsensical
-        // (`a[0]` reported "index 0 is out of bounds for an array of length 0", naming neither
-        // `NOPE` nor the real cause). Tensor dimensions already get exactly this check (E0504);
-        // array lengths had no equivalent. Generics are consulted first, like `lower_dim` does, and
-        // the same `checking_bodies` gate applies for the same reason: `collect` registers consts as
-        // it walks, so a const declared after this item is only guaranteed visible in the body pass.
+        // The length expression must be one the compile-time folder can actually READ, and the same
+        // `checking_bodies` gate applies as to the E0504 dim check for the same reason: `collect`
+        // registers consts as it walks, so a const declared after this item is only guaranteed
+        // visible in the body pass. `array_len_is_const` documents what happens when it cannot.
         if self.checking_bodies {
-            if let ExprKind::Path(p) = &len.kind {
-                if p.is_single() {
-                    let sym = p.first().sym;
-                    if !self.generics.contains(&sym) && !self.consts.contains_key(&sym) {
-                        let nm = self.sym_str(sym).to_string();
-                        self.error(
-                            len.span,
-                            "E0301",
-                            format!(
-                                "cannot find `{nm}` in this scope (an array length must be an \
-                                 integer literal, a `const`, or a declared generic parameter)"
-                            ),
-                        );
-                    }
-                }
-            }
+            self.array_len_is_const(len, 0, true);
         }
         let n = self.eval_usize(len);
         if n > u32::MAX as u64 && self.checking_bodies {
@@ -1087,6 +1133,178 @@ impl<'a> Sema<'a> {
             );
         }
         n
+    }
+
+    /// Whether the array-length expression `e` is a form the compile-time folder can READ, reporting
+    /// the first reason it cannot when `report` is set.
+    ///
+    /// This is the guard on the two-crate const-fold mirror. `eval_usize_depth` here and
+    /// `mir_build`'s `const_usize_depth` fold the same four forms — an integer literal, a
+    /// single-segment path naming a `const`, `Binary` arithmetic through the shared
+    /// `BinOp::fold_const_len`, and an enum variant's discriminant — but they DISAGREE on
+    /// everything else: sema ends `_ => 0` and types the annotation `[T; 0]`, while mir_build ends
+    /// `_ => None` and `mir_ty_of_ann`'s Array arm turns that into a bare `MirType::Ptr`. So
+    /// `let mut a: [i32; 4 as usize]` emitted `v0 = alloca ptr` and then STORED THROUGH the
+    /// uninitialized pointer: the interpreter reported `error: expected a pointer` and exited 1
+    /// while `--backend=native` printed a value after writing through a garbage stack address —
+    /// an accepted program on which the two Executed backends disagree, and a memory-safety
+    /// violation on native. `4 as usize` and `sizeof(i64)` are both spellings a user writes without
+    /// thinking twice. Report the unreadable length instead; the `None => MirType::Ptr` arm then
+    /// becomes unreachable for any program that reaches lowering and stays as the recovery path.
+    ///
+    /// Three named cases, so the message says which one was hit:
+    ///  * a **name that resolves to nothing** — the pre-existing `E0301`, now also found inside
+    ///    arithmetic (`fn fill(mut a: [i32; BOGUS + 8])` compiled and RAN, writing 8 elements into
+    ///    the caller's buffer, because the old check only looked at a length that was DIRECTLY a
+    ///    single-segment path);
+    ///  * a **declared generic** — `[T; N]` has no representation (`Ty::Array` carries a `u64`
+    ///    len, unlike `Ty::Tensor`'s `Dim::Var`), so it folded to 0 here and to `MirType::Ptr`
+    ///    there. It was previously exempted from the name check and then silently evaluated to 0;
+    ///  * **any other form** — a cast, `sizeof`/`alignof`, a call, a unary op, a multi-segment
+    ///    path, a struct field, or a `const` whose own initializer is unreadable.
+    ///
+    /// Recursion into a `const`'s initializer does NOT report (that declaration is checked where it
+    /// is written); it only decides foldability, and the length site reports against the const name.
+    fn array_len_is_const(&mut self, e: &Expr, depth: u32, report: bool) -> bool {
+        // Deeper than any real const chain. Both mirrors stop here and they stop DIFFERENTLY:
+        // `eval_usize_depth` yields 0 (so sema types the annotation `[T; 0]`) while mir_build's
+        // `const_usize_depth` yields `None` (so `mir_ty_of_ann` emits a bare `MirType::Ptr` slot).
+        // That IS the desync this function exists to prevent, so the honest answer is "not
+        // readable" — reporting a second diagnostic on a cyclic `const` that `check_recursive_consts`
+        // already flagged as E0403 is a far smaller cost than a silently uninitialized slot, and a
+        // 65-deep chain that is NOT cyclic gets no other diagnostic at all.
+        if depth > 64 {
+            if report {
+                self.error(
+                    e.span,
+                    "E0406",
+                    "array length is nested more than 64 levels deep, past what the compile-time \
+                     folder reads; if these `const`s refer to one another, that cycle is the real \
+                     error",
+                );
+            }
+            return false;
+        }
+        match &e.kind {
+            ExprKind::Int(_) => true,
+            ExprKind::Path(p) if p.is_single() => {
+                let sym = p.first().sym;
+                // `self.consts` holds AST references borrowed from the module, not from `self`, so
+                // the copy here outlives the `&mut self` calls below.
+                if let Some(init) = self.consts.get(&sym).copied() {
+                    if self.array_len_is_const(init, depth + 1, false) {
+                        return true;
+                    }
+                    if report {
+                        let nm = self.sym_str(sym).to_string();
+                        self.error(
+                            e.span,
+                            "E0406",
+                            format!(
+                                "array length `{nm}` is not a compile-time constant: this \
+                                 `const`'s initializer is not an integer literal, another `const`, \
+                                 an enum variant, or arithmetic on those"
+                            ),
+                        );
+                    }
+                    return false;
+                }
+                if self.generics.contains(&sym) {
+                    if report {
+                        let nm = self.sym_str(sym).to_string();
+                        self.error(
+                            e.span,
+                            "E0406",
+                            format!(
+                                "array length `{nm}` is not a compile-time constant: it is a \
+                                 generic parameter, and a fixed-size array's length is part of its \
+                                 type — use `Tensor[T, {nm}]`, whose dimension is bound per \
+                                 call site, or a `const`"
+                            ),
+                        );
+                    }
+                    return false;
+                }
+                if report {
+                    let nm = self.sym_str(sym).to_string();
+                    self.error(
+                        e.span,
+                        "E0301",
+                        format!(
+                            "cannot find `{nm}` in this scope (an array length must be an integer \
+                             literal, a `const`, an enum variant, or arithmetic on those)"
+                        ),
+                    );
+                }
+                false
+            }
+            // Both operands must be readable. `fold_const_len` treats an unreadable operand as 0 on
+            // BOTH sides of the mirror, so the length silently becomes a number the source never
+            // wrote — `[i32; (4 as usize) + 1]` is 1, not 5, and both backends agree on it,
+            // which is exactly the shape of defect no differential gate can see. Report each bad
+            // operand rather than only the first.
+            ExprKind::Binary { op, lhs, rhs } => {
+                let l = self.array_len_is_const(lhs, depth + 1, report);
+                let r = self.array_len_is_const(rhs, depth + 1, report);
+                if !(l && r) {
+                    return false;
+                }
+                // Readable operands are still not a readable LENGTH. `fold_const_len` has no value
+                // for a comparison or a logical operator, nor for checked arithmetic that fails
+                // (`2 - 5`, a division by zero, an operand or result above `MAX_CONST_ARRAY_LEN`)
+                // — and it reports every one of those as the same 0 that a genuine `[T; 2 - 2]`
+                // gives, on BOTH sides of the mirror. So `[i32; 2 - 5]` and `[i32; 4 > 2]` sized a
+                // zero-length array with no diagnostic: a number the source never wrote that both
+                // backends agree on, the gate-blind class. Ask the shared folder directly.
+                let lv = self.eval_usize_depth(lhs, depth + 1);
+                let rv = self.eval_usize_depth(rhs, depth + 1);
+                if op.try_fold_const_len(lv, rv).is_none() {
+                    if report {
+                        let g = op.glyph();
+                        self.error(
+                            e.span,
+                            "E0406",
+                            format!(
+                                "array length `{lv} {g} {rv}` has no compile-time value: `{g}` \
+                                 does not fold to a length (a comparison or a logical operator is \
+                                 never a length, and the arithmetic must stay within \
+                                 0..={MAX_CONST_ARRAY_LEN})"
+                            ),
+                        );
+                    }
+                    return false;
+                }
+                true
+            }
+            // `[i32; E::V]` — a C-style enum variant's discriminant, the fourth foldable form.
+            // A negative discriminant is the 0 fallback in both mirrors, so it is not readable.
+            ExprKind::Field { .. } => {
+                if self.enum_variant_disc(e).is_some_and(|d| d >= 0) {
+                    return true;
+                }
+                if report {
+                    self.error(
+                        e.span,
+                        "E0406",
+                        "an array length must be a compile-time constant (an integer literal, a \
+                         `const`, a non-negative enum variant, or arithmetic on those)",
+                    );
+                }
+                false
+            }
+            _ => {
+                if report {
+                    self.error(
+                        e.span,
+                        "E0406",
+                        "an array length must be a compile-time constant (an integer literal, a \
+                         `const`, an enum variant, or arithmetic on those); a cast, `sizeof`, a \
+                         call or any other expression cannot be folded to a length",
+                    );
+                }
+                false
+            }
+        }
     }
 
     /// If `e` is an enum-variant access `E::V` (a `Field` whose base is a single-segment path naming
@@ -1282,14 +1500,47 @@ impl<'a> Sema<'a> {
         self.generics.clear();
     }
 
-    /// Check a returned value's type against the declared return type `self.ret_ty`. Three checks, in
-    /// order: tensor / vector SHAPE agreement in RIGID mode — a function must not lie about its output
-    /// shape, since callers propagate the declared return shape into downstream shape checks (a single
-    /// wrong return silently poisons every caller); a scalar-vs-pointer/aggregate KIND clash; and
-    /// scalar-type agreement for a non-literal value. An unsuffixed literal still adapts, so this
-    /// never over-fires on e.g. `return 5` from `-> i64`; every other kind stays lenient.
+    /// Check a returned value's type against the declared return type `self.ret_ty`. It first
+    /// ADAPTS an unsuffixed literal to the declared return type (re-stamp + range check, below),
+    /// then runs three checks, in order: tensor / vector SHAPE agreement in RIGID mode — a function
+    /// must not lie about its output shape, since callers propagate the declared return shape into
+    /// downstream shape checks (a single wrong return silently poisons every caller); a
+    /// scalar-vs-pointer/aggregate KIND clash; and scalar-type agreement for a non-literal value.
+    /// An unsuffixed literal still adapts, so this never over-fires on e.g. `return 5` from
+    /// `-> i64`; every other kind stays lenient.
+    ///
+    /// Both return spellings land here — the explicit `return e;` statement and the body's implicit
+    /// TAIL expression — so the adaptation is identical for the two, which it was not before: the
+    /// tail form had no range check at all.
     fn check_return_shape(&mut self, val_ty: &Ty, val: &Expr, span: Span) {
         let ret = self.ret_ty.clone();
+        // ADAPT FIRST, and adapt COMPLETELY. `literal_adapts` is asked twice further down as a
+        // LENIENCY — once inline in the scalar-agreement check, once inside `aggregate_value_clash`
+        // — and it is what makes `return 5` from `-> i64` and `fn g() -> [i8; 2] { return [127, 0]; }` legal
+        // even though the literal's own type is i32 / `[i32; 2]`. Deciding a literal is ACCEPTED
+        // and never recording at what WIDTH it lowers is the silent half of that leniency, which is
+        // why every other adapting site (`let`, `const`, a struct-literal field, an assignment, a
+        // call argument) pairs the predicate with `retype_adapted_literal` and
+        // `range_check_int_literal` — all three, always together:
+        //
+        //   * without the re-stamp, `fn g() -> (f64, f64) { (0.1, 0.2) }` was accepted and then
+        //     lowered as an 8-byte `(f32, f32)` into the caller's 16-byte tuple: `load out of
+        //     bounds` on the interpreter, `0.000000013411048210842936` / `NaN` on native — an
+        //     interp-vs-native divergence on a clean compile. Scalars lied more quietly:
+        //     `fn a() -> f64 { 0.1 }` returned the f32 0.1 widened, `0.10000000149011612`, where
+        //     `let a: f64 = 0.1;` returns `0.1`.
+        //   * without the range check, the re-stamp itself becomes the hazard, because a re-stamped
+        //     literal is materialized as a `ConstInt` OF THE NARROW TYPE instead of an i32 the
+        //     backend truncates. `fn a() -> i8 { 300 }` would emit `ConstInt(300, i8)`: wukong's own
+        //     verifier only checks that the type is integral, the interpreter masks the value to 44,
+        //     and Cranelift's verifier REJECTS it (`iconst_bounds` bounds-masks an `I8` immediate at
+        //     `u8::MAX`) — so the interpreter would run a program native cannot build. The explicit
+        //     `return` spelling has range-checked since before this branch; the implicit TAIL return
+        //     never did, and `fn a() -> i8 { 200 }` silently returned -56.
+        if self.literal_adapts(&ret, val) {
+            self.retype_adapted_literal(val, &ret);
+        }
+        self.range_check_int_literal(val, &ret);
         if matches!(ret, Ty::Tensor { .. } | Ty::Vector { .. })
             || matches!(val_ty, Ty::Tensor { .. } | Ty::Vector { .. })
         {
@@ -1302,7 +1553,16 @@ impl<'a> Sema<'a> {
         // Returning a pointer/aggregate where a scalar is declared (or vice versa) is not a numeric
         // coercion — the native backend builds a mismatched return ABI and ICEs (e.g. `return &a`
         // from `-> i32`), while the interpreter silently adapts: a divergence.
-        if self.scalar_aggregate_clash(&ret, val_ty) {
+        // `aggregate_type_clash` is the second half: `check_return_shape`'s `unify` above runs
+        // only for a Tensor/Vector on one side, so an array length, a tuple arity or a struct
+        // identity in the return type was never compared against the value's — the callee could
+        // declare `-> [i32; 8]` and return a `[i32; 2]`, and every caller then believed the lie.
+        // The value's EXPRESSION is passed as well: an array/tuple literal adapts to the declared
+        // return type exactly as it does to a `let` annotation, so `fn g() -> [i8; 2] { return
+        // [127, 0]; }` stays accepted even though the literal's own type is `[i32; 2]`.
+        if self.scalar_aggregate_clash(&ret, val_ty)
+            || self.aggregate_value_clash(&ret, val_ty, val)
+        {
             self.error(
                 span,
                 "E0401",
@@ -1409,6 +1669,164 @@ impl<'a> Sema<'a> {
                 "E0401",
                 "a condition cannot be `()` (a unit / void value); use a boolean or numeric value"
                     .to_string(),
+            );
+        }
+    }
+
+    /// True when `a` and `b` are two CONCRETE aggregates that cannot be the same layout — the
+    /// byte-reinterpret pairing for which this language has no conversion.
+    ///
+    /// `scalar_aggregate_clash` below catches scalar-versus-aggregate; every AGGREGATE-versus-
+    /// aggregate pairing fell through every body check, because `check_binop_shapes` opens with
+    /// `if matches!((l, r), (Tensor, Tensor) | (Vector, Vector))` and is a no-op otherwise. So
+    /// `a = b` between two unrelated structs was accepted and reinterpreted the bytes: the
+    /// interpreter printed `1` (an `i32` field) where native printed `1065353216` (the bits of
+    /// `1.0f32`) — an interp-vs-native divergence on a clean compile. The same hole let a callee
+    /// LIE about its declared return type (`fn g() -> [i32; 8] { let a: [i32; 2] = [5, 6]; return a; }`
+    /// compiled, and every caller then believed `[i32; 8]`), and let an `if`/`match` arm merge or a
+    /// `break` merge two different aggregates into one value.
+    ///
+    /// The relation is `compatible`, the structural half of the rule `let` already applies through
+    /// `let_compatible` — and it is **DIRECTIONAL**, `compatible(place, value)`, not a disjunction
+    /// over both orders. `compatible` encodes the language's one implicit aggregate coercion,
+    /// `[T; N]` unsizing to `[]T`, in a single direction on purpose (a slice carries no static
+    /// length to restore, so there is no slice→array direction). An earlier form of this helper
+    /// asked `!(compatible(a, b) || compatible(b, a))` and threw that intent away, re-opening the
+    /// forbidden direction in the two contexts where direction is not an accident:
+    /// `fn g() -> [f32; 4] { return s; }` for `s: []f32` was accepted, and every caller then read
+    /// the 16-byte fat-pointer header as four f32 elements — both backends printing 0, a value the
+    /// source never wrote. `let r: [f32; 4] = s;` has always been rejected, and `return`/`=` must
+    /// not be weaker than `let`.
+    ///
+    /// This is the TYPE half only. A place-vs-value site must also grant the literal adaptation
+    /// `let` grants — see [`Sema::aggregate_value_clash`] — and a *merge*, where neither side is
+    /// the place, is symmetric — see [`Sema::aggregate_merge_clash`].
+    ///
+    /// Deliberately narrower than `let`'s rule, because this fires in contexts the fixture corpus
+    /// exercises far more thinly: only when both sides are aggregates whose layout is fully
+    /// determined here (see `is_concrete_layout`). A generic type variable, a zero-length array
+    /// (`array_len`'s "could not fold" sentinel as much as a real `[T; 0]`), a tensor, and
+    /// `Unknown`/`Error` all stay lenient, per the crate-wide rule that errors are reserved for
+    /// what can be PROVED wrong.
+    fn aggregate_type_clash(&self, place: &Ty, value: &Ty) -> bool {
+        if place.is_unknown() || value.is_unknown() || place.is_error() || value.is_error() {
+            return false;
+        }
+        if !self.is_concrete_aggregate(place) || !self.is_concrete_aggregate(value) {
+            return false;
+        }
+        !compatible(place, value)
+    }
+
+    /// The place-versus-value form, for a `return` and for an assignment: the directional type
+    /// clash above, minus the literal adaptation `let` already grants.
+    ///
+    /// An array/tuple LITERAL of unsuffixed numeric elements takes the annotation's element type
+    /// (`let a: [i8; 2] = [127, 0];` and `let t: (u8, u8) = (200, 1);` are deliberately accepted —
+    /// see the `ArrayLit`/`ArrayRepeat`/`TupleLit` arms of [`Sema::literal_adapts`]), while the
+    /// literal's OWN type is `[i32; 2]` / `(i32, i32)`, because an unsuffixed integer literal
+    /// defaults to i32 and a float literal to f32. Comparing types alone therefore made
+    /// `fn g() -> [i8; 2] { return [127, 0]; }` a hard error at `return`, and `a = [127, 0];` a
+    /// hard error at an assignment, while the identical spelling compiled at a `let` — previously
+    /// valid programs rejected by a check that exists to catch layout LIES, not literals. The
+    /// relation here is exactly `let_compatible`'s, narrowed to concrete aggregates.
+    fn aggregate_value_clash(&self, place: &Ty, value_ty: &Ty, value: &Expr) -> bool {
+        self.aggregate_type_clash(place, value_ty) && !self.literal_adapts(place, value)
+    }
+
+    /// The merge form, for an `if`/`match` arm merge and a `loop`'s `break` values. Here neither
+    /// side is the place — which arm the checker visits first is an accident of the source — so the
+    /// array→slice unsizing counts in EITHER direction, unlike a `return` or an assignment. This is
+    /// the one context in which the symmetric disjunction is the right relation.
+    ///
+    /// `incoming` is the expression that produced `r` — the arm being folded in — so an adapting
+    /// array/tuple literal there is accepted for the same reason it is at a `let`. The literal
+    /// adapts to the type already ESTABLISHED on the left, exactly as it adapts to a `let`'s
+    /// annotation, and `l` really is the established type: `join` returns the left operand for
+    /// every aggregate, so the merge's type is the first arm's. Hence only one direction is
+    /// literal-aware, while the STRUCTURAL half above stays symmetric. A literal in the FIRST arm
+    /// (`if c { [127, 0] } else { a }` for `a: [i8; 2]`) therefore establishes `[i32; 2]` and the
+    /// `[i8; 2]` arm cannot hold it — which is a real element-width lie, not an adaptation, and it
+    /// is rejected by the pre-existing `let` check as well whenever the result is annotated.
+    ///
+    /// Takes `&mut self` because GRANTING that leniency and RE-STAMPING the literal at the merged
+    /// width are ONE operation, not two — they are written in the same branch, below, so they
+    /// cannot drift apart. Split across a predicate here and a `retype_adapted_literal` at the call
+    /// site (which is how `let` / assignment / call-argument spell it), the pair is one edit away
+    /// from becoming an acceptance with no width, which is exactly what shipped:
+    /// `let r: (f64, f64) = if c { a } else { (0.1, 0.2) };` compiled, and the `(f32, f32)` arm wrote
+    /// 8 bytes into the 16-byte merge slot — `load out of bounds` on the interpreter,
+    /// `0.000000013411048210842936` / `NaN` on native.
+    fn aggregate_merge_clash(&mut self, l: &Ty, r: &Ty, incoming: Option<&Expr>) -> bool {
+        if !(self.aggregate_type_clash(l, r) && self.aggregate_type_clash(r, l)) {
+            return false;
+        }
+        let Some(arm) = incoming else {
+            return true;
+        };
+        if !self.literal_adapts(l, merge_arm_value(arm)) {
+            return true;
+        }
+        // Adapted: re-stamp the arm at the merged type `l` so lowering stores it at that width, and
+        // range-check it so the re-stamp cannot mint a `ConstInt` too wide for its own type. The
+        // two calls are handed DIFFERENT nodes on purpose. The re-stamp gets the whole ARM, because
+        // the arm is normally a block whose recorded type is its tail's and both have to move
+        // together — `retype_adapted_literal` peels the block itself, exactly as `merge_arm_value`
+        // does. The range check gets the PEELED node, because it dispatches on the expression kind:
+        // a `Block` matches none of its `ArrayLit`/`ArrayRepeat`/`TupleLit` arms, so it falls past
+        // the element-wise recursion and then out at the `Ty::Scalar` guard — and `l` is always an
+        // aggregate here. Handed the arm, it would silently check nothing. Then it is NOT a clash.
+        self.retype_adapted_literal(arm, l);
+        self.range_check_int_literal(merge_arm_value(arm), l);
+        false
+    }
+
+    /// An aggregate — array, tuple, slice, or a DECLARED nominal type — whose layout is fully
+    /// determined by the type alone. A bare generic type variable is also spelled `Ty::Named`, so a
+    /// name that resolves to no declared struct/enum, or that is a generic parameter in scope, is
+    /// not one of these.
+    fn is_concrete_aggregate(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Array { .. } | Ty::Tuple(_) | Ty::Slice(_) => self.is_concrete_layout(t),
+            Ty::Named(n) => self.is_declared_named_ty(*n) && !self.generics.contains(n),
+            _ => false,
+        }
+    }
+
+    /// Whether every leaf of `t` has a layout known here. Tensors are excluded on purpose: their
+    /// agreement is the shape unifier's job (`unify` in rigid mode), which reports the dimension by
+    /// name. `Unit`, `Fn`, `Unknown` and `Error` are excluded by the leniency rule.
+    fn is_concrete_layout(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Scalar(_) | Ty::Vector { .. } => true,
+            Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => self.is_concrete_layout(pointee),
+            Ty::Slice(e) => self.is_concrete_layout(e),
+            Ty::Array { elem, len, .. } => *len > 0 && self.is_concrete_layout(elem),
+            Ty::Tuple(items) => {
+                !items.is_empty() && items.iter().all(|i| self.is_concrete_layout(i))
+            }
+            Ty::Named(n) => self.is_declared_named_ty(*n) && !self.generics.contains(n),
+            _ => false,
+        }
+    }
+
+    /// The RIGID agreement check for a *merge*: an `if`/`match` arm merge or a `loop`'s `break`
+    /// values, where one value has to hold what every branch produced. `check_binop_shapes` covers
+    /// the tensor/vector half; this adds the aggregate half, which had no check at all — a
+    /// `let r: A = match k { 0 => a, _ => b }` over two different structs printed `1` on the
+    /// interpreter and `1065353216` on native.
+    fn check_merge_shapes(&mut self, l: &Ty, r: &Ty, incoming: Option<&Expr>, span: Span) {
+        self.check_binop_shapes(l, r, span);
+        if self.aggregate_merge_clash(l, r, incoming) {
+            self.error(
+                span,
+                "E0401",
+                format!(
+                    "type mismatch: `{}` and `{}` are different aggregate types, so one value \
+                     cannot hold both",
+                    l.display(self.interner),
+                    r.display(self.interner)
+                ),
             );
         }
     }
@@ -1991,7 +2409,16 @@ impl<'a> Sema<'a> {
                 // bits — `x = p` for `x: i32`, `p: *i32` stores a truncated address, which the
                 // interpreter and native backend disagree on. Reject the kind clash; numeric
                 // coercion across scalars stays lenient (handled at lowering, like `let`).
-                if self.scalar_aggregate_clash(&target_ty, &value_ty) {
+                // …and assigning an aggregate into a place of a DIFFERENT aggregate type does
+                // the same reinterpret without changing width: `a = b` between two unrelated
+                // structs printed `1` on the interpreter and `1065353216` on native.
+                // Directional, and literal-aware, for the same reasons `check_return_shape` is:
+                // the place is the target, so a `[]T` slice must NOT satisfy a `[T; N]` place
+                // (`let` has always rejected that direction), while `a = [127, 0];` for
+                // `a: [i8; 2]` is the adapting literal `let` accepts.
+                if self.scalar_aggregate_clash(&target_ty, &value_ty)
+                    || self.aggregate_value_clash(&target_ty, &value_ty, value)
+                {
                     self.error(
                         value.span,
                         "E0401",
@@ -2064,12 +2491,15 @@ impl<'a> Sema<'a> {
                                 ),
                             );
                         }
+                        // Shape / kind / scalar agreement, and the literal adaptation — re-stamp
+                        // and range check included, so an out-of-range integer literal returned
+                        // where a narrower type is declared (`return 9999999999` from `-> i32`,
+                        // once silently truncated to the low bits: exit code 255 from a wrapped
+                        // value) is still rejected. That range check used to live here, which left
+                        // the implicit TAIL return — the other caller of `check_return_shape` —
+                        // without one; it is inside the callee now so both spellings get it exactly
+                        // once.
                         self.check_return_shape(&t, e, e.span);
-                        // An out-of-range integer literal returned where a narrower type is declared
-                        // (`return 9999999999` from `-> i32`) was silently truncated to the low bits
-                        // (exit code 255 from a wrapped value). Range-check it against the return
-                        // type, the same rule `let`/`const` already apply to their annotation.
-                        self.range_check_int_literal(e, &ret);
                     }
                     None => {
                         // A bare `return;` where the signature demands a value: the native return
@@ -2126,7 +2556,7 @@ impl<'a> Sema<'a> {
                         let joined = match prev {
                             None => vt,
                             Some(p) => {
-                                self.check_binop_shapes(&p, &vt, v.span);
+                                self.check_merge_shapes(&p, &vt, Some(v), v.span);
                                 join(p, vt)
                             }
                         };
@@ -2683,6 +3113,16 @@ impl<'a> Sema<'a> {
                     self.retype_adapted_literal(it, t);
                 }
             }
+            // A merge arm is normally spelled as a BLOCK whose tail is the literal, and both nodes
+            // carry the type — the block's recorded type is its tail's. Peel to the tail and
+            // re-stamp it too, mirroring `merge_arm_value`, which is how `literal_adapts` was asked
+            // the question in the first place. Unreachable from every other caller: they all guard
+            // with `literal_adapts`, which has no `Block` arm and so answers `false` for one.
+            (ExprKind::Block(b), _) => {
+                if let Some(tail) = &b.tail {
+                    self.retype_adapted_literal(tail, ann);
+                }
+            }
             _ => {}
         }
     }
@@ -2692,7 +3132,10 @@ impl<'a> Sema<'a> {
     /// only a literal `eval_const_int` can read (incl. a leading `-`) — so a runtime value, a float,
     /// or an `i64`/`u64`/`usize` literal is never flagged. Rust rejects this; without it the value
     /// silently wraps (`200 as i8 == -56`), a quiet footgun in a safety-first language. Call at each
-    /// site a literal adapts to a type (`let`/`const`/argument).
+    /// site a literal adapts to a type — `let`, `const`, a struct-literal field, an argument, an
+    /// assignment, a `return` (both spellings, inside `check_return_shape`) and a merge arm
+    /// (`aggregate_merge_clash`) — right where `retype_adapted_literal` re-stamps it, since the
+    /// re-stamp is what makes an out-of-range literal a constant too wide for its own type.
     fn range_check_int_literal(&mut self, e: &Expr, ty: &Ty) {
         // Aggregate literals recurse element-wise (`[300, 0]: [i8; 2]` flags the `300`), mirroring
         // how `retype_adapted_literal`/`literal_adapts` descend into them.
@@ -2733,10 +3176,23 @@ impl<'a> Sema<'a> {
         }
     }
 
-    /// Reject a `\u{…}` escape that is not a Unicode scalar value, keeping the established split
-    /// (sema validates literals, mir_build decodes them) alongside `int_literal_well_formed` /
-    /// `float_literal_well_formed`.
+    /// Validate a char/string literal's escapes, keeping the established split (sema validates
+    /// literals, mir_build decodes them) alongside `int_literal_well_formed` /
+    /// `float_literal_well_formed`. Two rules:
+    ///
+    ///  * the escape must be one the decoder KNOWS. `decode_escape` ends `Some(c) => c as u32`, so
+    ///    every unknown escape silently became the escaped character itself and `println("A\dB")`
+    ///    printed `AdB` — a value the source never wrote, agreed on by both backends, so no
+    ///    differential gate can see it. C and Rust both reject an unknown escape.
+    ///  * a `\u` must be followed IMMEDIATELY by `{`. The decoder's `\u` arm is
+    ///    `chars.by_ref().skip_while(|&c| c != '{')` over the shared iterator, so a `\u` with no
+    ///    brace consumes the entire remainder of the literal and folds to 0: `println("A\uZZF")`
+    ///    printed `A` and silently deleted the tail. `bad_unicode_escape` below has the identical
+    ///    `skip_while`, which is why it saw code point 0 and reported nothing.
     fn check_unicode_escapes(&mut self, sym: Symbol, span: Span) {
+        if let Some(msg) = malformed_escape(self.sym_str(sym)) {
+            self.error(span, "E0401", msg);
+        }
         if let Some(cp) = bad_unicode_escape(self.sym_str(sym)) {
             self.error(
                 span,
@@ -3354,7 +3810,7 @@ impl<'a> Sema<'a> {
                     // divergence); a [2,2]-vs-[2,4] mismatch silently mis-strides the result; a
                     // [1024]-vs-[2] lie turns a statically-valid index into a runtime OOB segfault.
                     // Unify them — the 4th shape-bearing context, the one `check_binop_shapes` missed.
-                    self.check_binop_shapes(&then_ty, &else_ty, else_expr.span);
+                    self.check_merge_shapes(&then_ty, &else_ty, Some(else_expr), else_expr.span);
                     join(then_ty, else_ty)
                 } else {
                     Ty::Unit
@@ -3377,7 +3833,7 @@ impl<'a> Sema<'a> {
                     // agree, exactly as the `if` arms above (see `check_binop_shapes`). Unify each arm
                     // against the running result before `join` folds it in, so a shape-mismatched arm
                     // is an E0502 — not a silently mistyped result that mis-strides or reinterprets.
-                    self.check_binop_shapes(&result, &t, arm.body.span);
+                    self.check_merge_shapes(&result, &t, Some(&arm.body), arm.body.span);
                     result = join(result, t);
                 }
                 // Exhaustiveness: a `match` with no catch-all that provably misses a case is rejected
@@ -3586,6 +4042,27 @@ fn join_scalar(a: Scalar, b: Scalar) -> Scalar {
                 b
             }
         }
+    }
+}
+
+/// The expression a merge arm actually *produces*. An `if` or `match` arm is normally spelled as
+/// a block, and `check_merge_shapes` receives that block — whose `ExprKind` is `Block`, never
+/// `ArrayLit` — so an adapting array/tuple literal written as an arm would look like a plain type
+/// mismatch and be rejected where the identical literal at a `let` is accepted.
+///
+/// Peel to the block's tail expression, and ONLY that: a block with no tail (its value comes from a
+/// `break` or a `return`) is returned unchanged, and no other wrapper is unwrapped. It answers a
+/// `literal_adapts` question and then names the node `range_check_int_literal` must look at; the
+/// re-stamp that follows an adapting answer is handed the ARM instead, because the block and its
+/// tail both carry the type and both have to move (see `aggregate_merge_clash`). This function
+/// itself is pure — it changes no recorded type.
+fn merge_arm_value(e: &Expr) -> &Expr {
+    match &e.kind {
+        ExprKind::Block(b) => match &b.tail {
+            Some(t) => merge_arm_value(t),
+            None => e,
+        },
+        _ => e,
     }
 }
 
@@ -3989,6 +4466,73 @@ fn float_literal_well_formed(text: &str) -> bool {
         s
     };
     !body.is_empty() && body.parse::<f64>().is_ok()
+}
+
+/// The first malformed escape in a char/string literal's raw source text, as a ready diagnostic
+/// message, or `None` when every escape is one `decode_escape` can read.
+///
+/// The accepted set is exactly `decode_escape`'s: `\n \r \t \\ \' \" \0`, `\xHH`, and
+/// `\u{…}`. The scan consumes the escaped character (so a literal `\\` is not mistaken for the
+/// start of a new escape) and, for a well-formed `\u{…}`, consumes through the closing brace, so
+/// hex digits inside it are never read as source text.
+fn malformed_escape(text: &str) -> Option<String> {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            continue;
+        }
+        match chars.next() {
+            // `\xHH`'s digits are plain characters to this scan; the lexer already bounded the
+            // escape to at most two of them, and a non-hex digit there folds like the decoder does.
+            Some('n' | 'r' | 't' | '\\' | '\'' | '"' | '0' | 'x') => {}
+            Some('u') => match chars.next() {
+                Some('{') => {
+                    // The closing brace is not optional. Without the flag this loop ran the
+                    // iterator to the end of the literal and returned `None`, and
+                    // `bad_unicode_escape`'s `take_while(|&c| c != '}')` did the same — its
+                    // `map_or(v, ..)` skips the non-hex characters, so `"A\u{41Zoo"` folded to a
+                    // perfectly valid 0x41 and BOTH validators stayed silent while mir_build's
+                    // `decode_escape` deleted the rest of the string. That is the worse half of the
+                    // very finding the `\u`-with-no-brace arm below closes.
+                    let mut closed = false;
+                    for c in chars.by_ref() {
+                        if c == '}' {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if !closed {
+                        return Some(
+                            "unterminated `\\u{…}` escape: the closing `}` is missing, so the \
+                             decoder swallows the rest of the literal — write it as `\\u{1F600}`"
+                                .to_string(),
+                        );
+                    }
+                }
+                _ => {
+                    return Some(
+                        "malformed `\\u` escape: `\\u` must be followed immediately by `{`, as in \
+                         `\\u{1F600}` — without the brace the decoder swallows the rest of the \
+                         literal"
+                            .to_string(),
+                    )
+                }
+            },
+            Some(c) => {
+                return Some(format!(
+                    "unknown escape `\\{c}` in a literal (the escapes Wukong decodes are `\\n` \
+                     `\\r` `\\t` `\\\\` `\\'` `\\\"` `\\0` `\\xHH` `\\u{{…}}`); write `\\\\{c}` for a \
+                     backslash followed by `{c}`"
+                ))
+            }
+            None => {
+                return Some(
+                    "a literal ends with a lone `\\`; write `\\\\` for a backslash".to_string(),
+                )
+            }
+        }
+    }
+    None
 }
 
 /// The first `\u{…}` escape in a char/string literal's raw source text that is NOT a Unicode scalar
@@ -5042,6 +5586,688 @@ mod tests {
             !errors(ok).contains(&"E0502"),
             "identical layouts must unify: {:?}",
             errors(ok)
+        );
+    }
+
+    #[test]
+    fn array_len_not_constant() {
+        // sema's `eval_usize_depth` ends `_ => 0` and mir_build's mirrored `const_usize_depth` ends
+        // `_ => None`, which `mir_ty_of_ann` turns into a bare `MirType::Ptr`. So `[i32; 4 as usize]`
+        // typed as `[i32; 0]` here while lowering emitted `alloca ptr` and STORED THROUGH the
+        // uninitialized pointer — interp `error: expected a pointer` (exit 1), native printed a
+        // value after writing to a garbage stack address. The desync is unreachable once the
+        // unreadable length is reported.
+        for len in ["4 as usize", "sizeof(i64)", "alignof(i64)", "-4", "f()"] {
+            let bad = format!("fn f() -> i32 {{ return 4; }} fn g(a: [i32; {len}]) {{ }}");
+            assert!(
+                errors(&bad).contains(&"E0406"),
+                "`[i32; {len}]` must be rejected as unreadable: {:?}",
+                errors(&bad)
+            );
+        }
+        // An undefined name inside ARITHMETIC: the old check only looked at a length that was
+        // DIRECTLY a single-segment path, so `[i32; BOGUS + 8]` compiled and RAN (exit 99), writing
+        // 8 elements into the caller's buffer with `BOGUS` never resolved.
+        let arith = "fn fill(mut a: [i32; BOGUS + 8]) { a[0] = 1; }";
+        assert!(
+            errors(arith).contains(&"E0301"),
+            "an undefined name inside a length must be reported: {:?}",
+            errors(arith)
+        );
+        // A cast inside arithmetic folds to 0 on BOTH sides of the mirror, so `(4 as usize) + 1` is
+        // length 1, not 5, and both backends agree on it — gate-blind. Report it too.
+        let mixed = "fn f(a: [i32; (4 as usize) + 1]) { }";
+        assert!(
+            errors(mixed).contains(&"E0406"),
+            "an unreadable operand must be reported: {:?}",
+            errors(mixed)
+        );
+        // A `const` whose own initializer is unreadable.
+        let bad_const = "const K: usize = 4 as usize; fn f(a: [i32; K]) { }";
+        assert!(
+            errors(bad_const).contains(&"E0406"),
+            "an unreadable const initializer must be reported: {:?}",
+            errors(bad_const)
+        );
+        // Controls — every form the two crates DO fold must stay accepted.
+        for ok in [
+            "fn f(a: [i32; 4]) { }",
+            "fn f(a: [i32; 0x10]) { }",
+            "const N: usize = 4; fn f(a: [i32; N]) { }",
+            "const A: usize = 2; const B: usize = A; fn f(a: [i32; B]) { }",
+            "const A: usize = 2; const B: usize = 3; fn f(a: [i32; A * B]) { }",
+            "fn f(a: [i32; 2 + 2]) { }",
+            "enum Size { Small = 2, Big = 6 } fn f(a: [i32; Size::Big]) { }",
+            "struct S { d: [i32; 4] } fn f(s: S) -> i32 { return s.d[0]; }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "a readable length must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn generic_array_length() {
+        // `Ty::Array` carries a plain `u64` length with no representation for a symbolic extent
+        // (unlike `Ty::Tensor`'s `Dim::Var`), so `[T; N]` was exempted from the name check and then
+        // folded to 0 here while mir_build lowered `MirType::Ptr` — the same two-crate desync.
+        let gen = "fn sum<N>(a: [f32; N], n: i64) -> f32 { return a[0]; }";
+        assert!(
+            errors(gen).contains(&"E0406"),
+            "a generic array length must be reported: {:?}",
+            errors(gen)
+        );
+        // It is still not an unresolved NAME — the distinction the older check drew stands.
+        assert!(
+            !errors(gen).contains(&"E0301"),
+            "a declared generic is not an unknown name: {:?}",
+            errors(gen)
+        );
+        // The spelling the diagnostic points at must itself be clean: a symbolic tensor extent is
+        // bound per call site and shape-checked, which is the whole point of `Tensor[T, N]`.
+        let ok = "fn sum<N>(a: Tensor[f32, N]) -> f32 { return a[0]; }";
+        assert!(
+            errors(ok).is_empty(),
+            "the Tensor spelling must stay clean: {:?}",
+            errors(ok)
+        );
+        // The `[T; 0]` could-not-fold sentinel must NOT cascade to the call sites. `is_concrete_layout`
+        // excludes a zero-length array for exactly this reason (`*len > 0`), and `unify_decl`'s
+        // (Array, Array) arm now carries the same guard: without it every caller of a function whose
+        // length is unreadable ALSO got `E0501: array length mismatch: expected an array of length 0`,
+        // a second and false diagnostic blaming the caller for the callee's declaration.
+        // (The callee must not index with a CONSTANT here: `type_index`'s pre-existing array
+        // bounds check reports its own E0501 against the length-0 sentinel, which is a separate
+        // site and not what this asserts. tests/fail/generic_array_length.wk indexes dynamically
+        // and reports E0406 alone.)
+        let call = "fn sum<N>(a: [f32; N], n: i64) -> i64 { return n; } \
+                    fn main() -> i32 { let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
+                    return sum(x, 4) as i32; }";
+        assert!(
+            errors(call).contains(&"E0406"),
+            "the generic length must still be reported at the declaration: {:?}",
+            errors(call)
+        );
+        assert!(
+            !errors(call).contains(&"E0501"),
+            "the length-0 sentinel must not cascade into a call-site length mismatch: {:?}",
+            errors(call)
+        );
+        // A generic ELEMENT type with a literal length is unaffected (tests/run/generic_typed_local.wk).
+        let elem = "fn f<T>(x: T) -> T { let a: [T; 2] = [x, x]; return a[0] + a[1]; }";
+        assert!(
+            errors(elem).is_empty(),
+            "a generic element type with a literal length must stay clean: {:?}",
+            errors(elem)
+        );
+    }
+
+    #[test]
+    fn array_arg_length_and_element_are_checked() {
+        // `unify_decl` had no (Array, Array) arm at all, so an array argument for an array parameter
+        // fell to the lenient `_ => {}`: `fn f(a: [i32; 8])` fed a `[i32; 2]` compiled clean, interp
+        // trapped `load out of bounds` and native printed 32758 after reading past the caller's
+        // stack buffer — an interp-vs-native divergence AND a memory-safety violation.
+        let short = "fn f(a: [i32; 8]) -> i32 { return a[7]; } \
+                     fn g() -> i32 { let x: [i32; 2] = [1, 2]; return f(x); }";
+        assert!(
+            errors(short).contains(&"E0501"),
+            "a short array argument must be rejected: {:?}",
+            errors(short)
+        );
+        // The element recursion: `[i32; 4]` for `[f32; 4]` read the i32 bit pattern as an f32
+        // (interp 3, native 4.203895e-45).
+        let elem = "fn f(a: [f32; 4]) -> f32 { return a[0]; } \
+                    fn g() -> f32 { let x: [i32; 4] = [1, 2, 3, 4]; return f(x); }";
+        assert!(
+            errors(elem).contains(&"E0401"),
+            "a wrong element type must be rejected: {:?}",
+            errors(elem)
+        );
+        // Nested: the outer lengths agree, the inner ones do not.
+        let nested = "fn f(a: [[i32; 3]; 2]) -> i32 { return a[0][2]; } \
+                      fn g() -> i32 { let x: [[i32; 2]; 2] = [[1, 2], [3, 4]]; return f(x); }";
+        assert!(
+            errors(nested).contains(&"E0501"),
+            "a nested length mismatch must be rejected: {:?}",
+            errors(nested)
+        );
+        // A slice argument for an ARRAY parameter handed the callee the fat-pointer header as data;
+        // both backends printed 0, so no differential gate could see it.
+        let fat = "fn f(a: [i32; 4]) -> i32 { return a[0]; } \
+                   fn g(s: []i32) -> i32 { return f(s); }";
+        assert!(
+            errors(fat).contains(&"E0401"),
+            "a slice argument for an array parameter must be rejected: {:?}",
+            errors(fat)
+        );
+        // Controls: the exact match, array->slice unsizing, and array->tensor decay must all stay
+        // accepted (tests/run/tensor_add.wk feeds a `[f32; 6]` to a `Tensor[f32, 2, 3]`).
+        for ok in [
+            "fn f(a: [i32; 4]) -> i32 { return a[3]; } \
+             fn g() -> i32 { let x: [i32; 4] = [1, 2, 3, 4]; return f(x); }",
+            "fn f(a: []i32) -> i32 { return a[0]; } \
+             fn g() -> i32 { let x: [i32; 4] = [1, 2, 3, 4]; return f(x); }",
+            "fn f(a: Tensor[f32, 2, 3]) -> f32 { return a[1, 2]; } \
+             fn g() -> f32 { let x: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; return f(x); }",
+            "fn f(mut a: [[i32; 2]; 2]) -> i32 { return a[1][1]; } \
+             fn g() -> i32 { let mut x: [[i32; 2]; 2] = [[1, 2], [3, 4]]; return f(x); }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "a well-typed array argument must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn struct_arg_wrong_nominal() {
+        // No (Named, Named) arm: `struct A` satisfied a `B` parameter, the callee GEPed the
+        // caller's differently-laid-out buffer, interp trapped `load out of bounds` and native
+        // printed 0.
+        let bad = "struct A { x: i32 } struct B { y: f32, z: f32 } \
+                   fn f(v: B) -> f32 { return v.z; } \
+                   fn g() -> f32 { let a: A = A { x: 5 }; return f(a); }";
+        assert!(
+            errors(bad).contains(&"E0401"),
+            "a different struct must not satisfy a nominal parameter: {:?}",
+            errors(bad)
+        );
+        // A declared nominal against a structural kind is the same confusion with one side spelled
+        // `Named`.
+        let kind = "struct A { x: i32 } \
+                    fn f(v: A) -> i32 { return v.x; } \
+                    fn g() -> i32 { return f(5); }";
+        assert!(
+            errors(kind).contains(&"E0401"),
+            "a scalar must not satisfy a struct parameter: {:?}",
+            errors(kind)
+        );
+        // Controls: the right struct, and a bare generic TYPE variable, which is ALSO spelled
+        // `Ty::Named` and must stay lenient (that is what `is_declared_named_ty` filters).
+        for ok in [
+            "struct B { y: f32, z: f32 } \
+             fn f(v: B) -> f32 { return v.z; } \
+             fn g() -> f32 { let b: B = B { y: 1.0, z: 2.0 }; return f(b); }",
+            "fn id<T>(x: T) -> T { return x; } fn g() -> i32 { return id(5); }",
+            "struct A { x: i32 } fn id<T>(x: T) -> T { return x; } \
+             fn g() -> i32 { let a: A = A { x: 5 }; let b: A = id(a); return b.x; }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "a well-typed nominal argument must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_arg_arity_and_elements_are_checked() {
+        // No (Tuple, Tuple) arm: `fn f(t: (i32, i32, i32))` fed a `(i32, i32)` compiled clean and
+        // `t.2` read past the caller's buffer (interp trapped, native printed -1037373571).
+        let arity = "fn f(t: (i32, i32, i32)) -> i32 { return t.2; } \
+                     fn g() -> i32 { let p: (i32, i32) = (1, 2); return f(p); }";
+        assert!(
+            errors(arity).contains(&"E0501"),
+            "a tuple of the wrong arity must be rejected: {:?}",
+            errors(arity)
+        );
+        let elem = "fn f(t: (i32, f32)) -> f32 { return t.1; } \
+                    fn g() -> f32 { let p: (i32, i32) = (1, 2); return f(p); }";
+        assert!(
+            errors(elem).contains(&"E0401"),
+            "a tuple element mismatch must be rejected: {:?}",
+            errors(elem)
+        );
+        let ok = "fn f(t: (i32, i32)) -> i32 { return t.1; } \
+                  fn g() -> i32 { let p: (i32, i32) = (1, 2); return f(p); }";
+        assert!(
+            errors(ok).is_empty(),
+            "a matching tuple argument must stay accepted: {:?}",
+            errors(ok)
+        );
+    }
+
+    #[test]
+    fn array_return_length_lie() {
+        // `check_return_shape` ran its `unify` only when one side was a Tensor/Vector, so a callee
+        // could declare `-> [i32; 8]` and return a `[i32; 2]`; every caller then believed the lie
+        // and `r[7]` was interp-trap / native-0.
+        let arr = "fn g() -> [i32; 8] { let a: [i32; 2] = [5, 6]; return a; }";
+        assert!(
+            errors(arr).contains(&"E0401"),
+            "a function must not lie about its array return length: {:?}",
+            errors(arr)
+        );
+        let tup = "fn g() -> (i32, i32) { let t: (i32, i32, i32) = (1, 2, 3); return t; }";
+        assert!(
+            errors(tup).contains(&"E0401"),
+            "a function must not lie about its tuple arity: {:?}",
+            errors(tup)
+        );
+        let nominal = "struct A { x: i32 } struct B { y: i32 } \
+                       fn g() -> B { let a: A = A { x: 1 }; return a; }";
+        assert!(
+            errors(nominal).contains(&"E0401"),
+            "a function must not lie about its struct identity: {:?}",
+            errors(nominal)
+        );
+        for ok in [
+            "fn g() -> [i32; 2] { let a: [i32; 2] = [5, 6]; return a; }",
+            "struct A { x: i32 } fn g() -> A { let a: A = A { x: 1 }; return a; }",
+            "fn g<T>(x: T) -> T { return x; }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "an honest return must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn assign_struct_type_mismatch() {
+        // `check_binop_shapes` opens with `if matches!((l, r), (Tensor, Tensor) | (Vector, Vector))`
+        // and is a no-op otherwise, so `a = b` between two unrelated structs reinterpreted the
+        // bytes: interp printed 1 (the i32 field), native 1065353216 (the bits of 1.0f32).
+        let structs = "struct A { x: i32 } struct B { y: f32, z: f32 } \
+                       fn f() { let mut a: A = A { x: 1 }; let b: B = B { y: 1.0, z: 2.0 }; a = b; }";
+        assert!(
+            errors(structs).contains(&"E0401"),
+            "assigning a different struct must be rejected: {:?}",
+            errors(structs)
+        );
+        let arrays =
+            "fn f() { let mut a: [i32; 2] = [1, 2]; let b: [i32; 4] = [1, 2, 3, 4]; a = b; }";
+        assert!(
+            errors(arrays).contains(&"E0401"),
+            "assigning a different array length must be rejected: {:?}",
+            errors(arrays)
+        );
+        // The same hole in the other three merge contexts `check_binop_shapes` guards.
+        let arm = "struct A { x: i32 } struct B { y: f32 } \
+                   fn f(k: i32) { let a: A = A { x: 1 }; let b: B = B { y: 1.0 }; \
+                                  let r: A = match k { 0 => a, _ => b }; }";
+        assert!(
+            errors(arm).contains(&"E0401"),
+            "a match-arm merge of two structs must be rejected: {:?}",
+            errors(arm)
+        );
+        let brk = "struct A { x: i32 } struct B { y: f32 } \
+                   fn f(k: i32) { let a: A = A { x: 1 }; let b: B = B { y: 1.0 }; \
+                                  let r: A = loop { if k == 0 { break a; } break b; }; }";
+        assert!(
+            errors(brk).contains(&"E0401"),
+            "a break merge of two structs must be rejected: {:?}",
+            errors(brk)
+        );
+        for ok in [
+            "struct A { x: i32 } fn f() { let mut a: A = A { x: 1 }; let b: A = A { x: 2 }; a = b; }",
+            "fn f() { let mut a: [i32; 2] = [1, 2]; let b: [i32; 2] = [3, 4]; a = b; }",
+            "struct A { x: i32 } fn f(k: i32) -> i32 { let a: A = A { x: 1 }; let b: A = A { x: 2 }; \
+             let r: A = match k { 0 => a, _ => b }; return r.x; }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "a same-type assignment/merge must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_literal_adapts_at_a_return_an_assignment_and_a_merge() {
+        // OVER-REJECTION control for `aggregate_type_clash`. `literal_adapts`'s ArrayLit/TupleLit
+        // arms exist so a typed buffer can be built from bare literals — `let a: [i8; 2] = [127, 0]`
+        // is DELIBERATELY accepted — but an unsuffixed integer literal's own type is i32 and a float
+        // literal's is f32, so the literal's type is `[i32; 2]`. Comparing types alone made the same
+        // spelling a hard E0401 at a `return`, at an assignment and at an arm merge: previously
+        // valid programs rejected by a check whose job is to catch layout LIES.
+        for ok in [
+            "fn g() -> [i8; 2] { return [127, 0]; }",
+            "fn g() -> [f64; 2] { return [1.0, 2.0]; }",
+            "fn g() -> (u8, u8) { return (200, 1); }",
+            "fn g() -> [u8; 3] { return [1; 3]; }",
+            "fn f() { let mut a: [i8; 2] = [1, 2]; a = [127, 0]; }",
+            "fn f() { let mut t: (u8, u8) = (1, 2); t = (200, 1); }",
+            "fn f(k: i32) { let a: [i8; 2] = [1, 2]; let r: [i8; 2] = match k { 0 => a, _ => [127, 0] }; }",
+            "fn f(k: i32) { let a: [i8; 2] = [1, 2]; let r: [i8; 2] = if k == 0 { a } else { [127, 0] }; }",
+            "fn f(k: i32) { let a: [i8; 2] = [1, 2]; \
+             let r: [i8; 2] = loop { if k == 0 { break a; } break [127, 0]; }; }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "an adapting aggregate literal must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+        // …and the lie the same check exists to catch must still be caught, with a literal on the
+        // value side: the LENGTH and the ARITY never adapt, only the element type does.
+        for bad in [
+            "fn g() -> [i8; 2] { return [1, 2, 3]; }",
+            // And the asymmetry is deliberate: `join` returns the LEFT type for an aggregate, so a
+            // literal in the FIRST arm establishes `[i32; 2]` and the `[i8; 2]` arm genuinely
+            // cannot hold it. The literal adapts to the type already established, exactly as it
+            // adapts to a `let` annotation — it does not retroactively set one.
+            "fn f(k: i32, a: [i8; 2]) { let r: [i32; 2] = if k == 0 { [127, 0] } else { a }; }",
+            "fn g() -> (u8, u8) { return (1, 2, 3); }",
+            "fn f() { let mut a: [i8; 2] = [1, 2]; a = [1, 2, 3]; }",
+        ] {
+            assert!(
+                errors(bad).contains(&"E0401"),
+                "a wrong-length literal must still be rejected (`{bad}`): {:?}",
+                errors(bad)
+            );
+        }
+    }
+
+    /// Every type this module RECORDED, as display strings. `mir_build` materializes a numeric
+    /// literal as a constant of its recorded type (`lower_expr`'s `Int`/`Float` arms read
+    /// `expr_mir`), so this is the WIDTH half of an adaptation — the half no "does it compile"
+    /// assertion can see, and the half that was missing at a `return` and at a merge.
+    fn recorded_tys(src: &str) -> Vec<String> {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse errors: {pdiags:?}");
+        let (res, diags) = check(&module, &interner);
+        assert!(
+            !diags.iter().any(|d| d.is_error()),
+            "unexpected errors for {src:?}: {diags:?}"
+        );
+        res.types.values().map(|t| t.display(&interner)).collect()
+    }
+
+    #[test]
+    fn adapted_literal_is_restamped_at_the_return_and_the_merge_width() {
+        // The WIDTH half of the leniency the test above proves is granted. An unsuffixed float
+        // literal's own type is f32, so accepting `fn g() -> (f64, f64) { (0.1, 0.2) }` without
+        // re-stamping it left an 8-byte `(f32, f32)` written into the caller's 16-byte tuple: the
+        // interpreter reported `load out of bounds`, native printed
+        // `0.000000013411048210842936` and `NaN`. The scalar form lied quietly instead of loudly —
+        // `fn a() -> f64 { 0.1 }` returned `0.10000000149011612`, the f32 0.1 widened, where
+        // `let a: f64 = 0.1;` returns `0.1`. Assert on the recorded type, because a compile-only
+        // assertion is blind to exactly this.
+        for src in [
+            "fn g() -> f64 { 0.1 }",
+            "fn g() -> f64 { return 0.1; }",
+            "fn g() -> [f64; 2] { [0.1, 0.2] }",
+            "fn g() -> [f64; 2] { return [0.1, 0.2]; }",
+            "fn g() -> (f64, f64) { (0.1, 0.2) }",
+            "fn g() -> (f64, f64) { return (0.1, 0.2); }",
+            "fn g() -> [f64; 3] { [0.1; 3] }",
+            "fn f(k: i32) -> f64 { let a: (f64, f64) = (0.5, 0.25); let r: (f64, f64) = if k == 0 { a } else { (0.1, 0.2) }; return r.0; }",
+            "fn f(k: i32) -> f64 { let a: [f64; 2] = [0.5, 0.25]; let r: [f64; 2] = match k { 0 => a, _ => [0.1, 0.2] }; return r[0]; }",
+        ] {
+            let tys = recorded_tys(src);
+            assert!(
+                !tys.iter().any(|t| t.contains("f32")),
+                "an adapted float literal must be RE-STAMPED at the declared width, not left f32 for lowering to reinterpret or widen (`{src}`): {tys:?}"
+            );
+        }
+        // …and the range check is the rest of that pair. Once a literal is re-stamped it is
+        // materialized as a constant OF THE NARROW TYPE rather than an i32 the backend truncates,
+        // so an out-of-range one has to be a diagnostic: `ConstInt(300, i8)` passes wukong's
+        // verifier (which only checks the type is integral), masks to 44 on the interpreter, and is
+        // REJECTED by Cranelift's `iconst_bounds`. Accepting it would be a program the oracle runs
+        // and native cannot build.
+        for bad in [
+            "fn g() -> i8 { 200 }",
+            "fn g() -> [i8; 2] { [300, 0] }",
+            "fn g() -> (u8, u8) { (300, 1) }",
+            "fn f(k: i32, a: [i8; 2]) -> i8 { let r: [i8; 2] = if k == 0 { a } else { [300, 0] }; return r[0]; }",
+        ] {
+            assert!(
+                errors(bad).contains(&"E0401"),
+                "an out-of-range literal that ADAPTS must be rejected, not re-stamped into a constant too wide for its own type (`{bad}`): {:?}",
+                errors(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn slice_does_not_satisfy_an_array_place() {
+        // UNDER-REJECTION control. `compatible` encodes `[T; N]` → `[]T` unsizing in ONE direction
+        // on purpose ("there is no slice→array direction (a slice has no static length to
+        // restore)"), and an earlier `aggregate_type_clash` asked
+        // `!(compatible(a, b) || compatible(b, a))`, which threw that intent away exactly where
+        // direction is not an accident. `return s` from `-> [f32; 4]` was accepted and the caller
+        // then read the 16-byte fat-pointer header as four f32 elements — both backends printing 0,
+        // a value the source never wrote. `let r: [f32; 4] = s;` has always been rejected through
+        // `let_compatible`; `return` and `=` must not be weaker than `let`.
+        let ret = "fn g(s: []f32) -> [f32; 4] { return s; }";
+        assert!(
+            errors(ret).contains(&"E0401"),
+            "a slice must not satisfy an array return type: {:?}",
+            errors(ret)
+        );
+        let asg = "fn f(s: []f32) { let mut a: [f32; 4] = [0.0; 4]; a = s; }";
+        assert!(
+            errors(asg).contains(&"E0401"),
+            "a slice must not be assigned into an array place: {:?}",
+            errors(asg)
+        );
+        // The reference point: `let` rejects the same direction, and always has.
+        let lt = "fn f(s: []f32) { let r: [f32; 4] = s; }";
+        assert!(
+            errors(lt).contains(&"E0401"),
+            "the `let` this must match still rejects it: {:?}",
+            errors(lt)
+        );
+        // The LEGAL direction — the one real coercion — must stay accepted at every one of those
+        // sites, and a MERGE stays symmetric, because there neither side is the place.
+        for ok in [
+            "fn g(a: [f32; 4]) -> []f32 { return a; }",
+            "fn f(a: [f32; 4]) { let mut s: []f32 = a; s = a; }",
+            "fn f(k: i32, a: [f32; 4], s: []f32) { let r: []f32 = match k { 0 => a, _ => s }; }",
+            "fn f(k: i32, a: [f32; 4], s: []f32) { let r: []f32 = if k == 0 { s } else { a }; }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "array→slice unsizing must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn array_length_operator_must_fold() {
+        // `array_len_is_const` proved the OPERANDS were readable and stopped there, but
+        // `fold_const_len` has no value for a comparison or a logical operator, and none for
+        // checked arithmetic that fails — and it reports all of them as the same 0 a genuine
+        // `[T; 2 - 2]` gives, on BOTH sides of the two-crate mirror. So the array silently took a
+        // length the source never wrote, with both backends agreeing on it.
+        for len in [
+            "2 - 5",
+            "4 > 2",
+            "1 && 1",
+            "4 / 0",
+            "4 % 0",
+            "4294967295 + 1",
+        ] {
+            let bad = format!("fn f(a: [i32; {len}]) {{ }}");
+            assert!(
+                errors(&bad).contains(&"E0406"),
+                "`[i32; {len}]` does not fold and must be reported: {:?}",
+                errors(&bad)
+            );
+        }
+        // Everything the shared folder really does fold stays accepted, `[T; 0]` included — it is a
+        // legal (if useless) type, and it is also `array_len`'s could-not-fold sentinel, so the
+        // leniency rule keeps it silent.
+        for ok in [
+            "fn f(a: [i32; 2 + 2]) { }",
+            "fn f(a: [i32; 8 - 3]) { }",
+            "fn f(a: [i32; 2 * 3]) { }",
+            "fn f(a: [i32; 8 / 2]) { }",
+            "fn f(a: [i32; 1 << 3]) { }",
+            "fn f(a: [i32; 2 - 2]) { }",
+            "const A: usize = 2; const B: usize = 3; fn f(a: [i32; A * B]) { }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "a folding length must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_const_length_is_not_readable() {
+        // The depth cutoff is where the two mirrors stop, and they stopped DIFFERENTLY: sema's
+        // `eval_usize_depth` yields 0 (type `[T; 0]`) past depth 64 while mir_build's
+        // `const_usize_depth` yields `None` (a bare `MirType::Ptr` slot). `array_len_is_const`
+        // returned `true` there to avoid stacking a diagnostic on a cyclic const, so a NON-cyclic
+        // chain deeper than 64 — which `check_recursive_consts` never reports — kept the exact
+        // desync this whole function exists to remove, silently.
+        let mut deep = String::from("const C0: usize = 4;");
+        for i in 1..=70 {
+            deep.push_str(&format!("const C{i}: usize = C{};", i - 1));
+        }
+        deep.push_str("fn f(a: [i32; C70]) { }");
+        assert!(
+            errors(&deep).contains(&"E0406"),
+            "a const chain deeper than the fold cutoff is not a readable length: {:?}",
+            errors(&deep)
+        );
+        // A chain the folder really does read must stay accepted.
+        let mut shallow = String::from("const D0: usize = 4;");
+        for i in 1..=10 {
+            shallow.push_str(&format!("const D{i}: usize = D{};", i - 1));
+        }
+        shallow.push_str("fn f(a: [i32; D10]) { }");
+        assert!(
+            errors(&shallow).is_empty(),
+            "a chain within the fold cutoff must stay accepted: {:?}",
+            errors(&shallow)
+        );
+    }
+
+    #[test]
+    fn array_index_count() {
+        // shape.rs's module header promises "a wrong index count is E0501", but only the tensor arm
+        // enforced it: the array arm gated its bounds check on `indices.len() == 1` and the
+        // slice/pointer arm had no count check at all, so `a[i, j]` on a `[i32; 4]` came back as the
+        // generic `C0001 'expression' is not yet supported by codegen` — the compiler blaming itself
+        // for the user's error.
+        let arr = "fn f(a: [i32; 4]) -> i32 { return a[1, 2]; }";
+        assert!(
+            errors(arr).contains(&"E0501"),
+            "a rank-2 index on an array must be E0501: {:?}",
+            errors(arr)
+        );
+        let slice = "fn f(s: []i32) -> i32 { return s[1, 2]; }";
+        assert!(
+            errors(slice).contains(&"E0501"),
+            "a rank-2 index on a slice must be E0501: {:?}",
+            errors(slice)
+        );
+        let ptr = "fn f(p: *i32) -> i32 { return p[1, 2]; }";
+        assert!(
+            errors(ptr).contains(&"E0501"),
+            "a rank-2 index on a pointer must be E0501: {:?}",
+            errors(ptr)
+        );
+        for ok in [
+            "fn f(a: [i32; 4]) -> i32 { return a[1]; }",
+            "fn f(s: []i32) -> i32 { return s[1]; }",
+            "fn f(p: *i32) -> i32 { return p[1]; }",
+            "fn f(a: Tensor[f32, 2, 2]) -> f32 { return a[1, 1]; }",
+        ] {
+            assert!(
+                errors(ok).is_empty(),
+                "a correct index count must stay accepted (`{ok}`): {:?}",
+                errors(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_struct_field() {
+        // Duplicate PARAMETER names were already E0300; the same discipline was never applied to
+        // struct fields, enum variants or generic lists. `struct S { x: i32, x: i32 }` produced no
+        // declaration-site error, `enum E { A, A }` compiled and ran printing 0, and `fn f<N, N>`
+        // compiled and ran.
+        let field = "struct S { x: i32, x: i32 } fn f(s: S) -> i32 { return s.x; }";
+        assert!(
+            errors(field).contains(&"E0300"),
+            "a duplicate struct field must be reported: {:?}",
+            errors(field)
+        );
+        let variant = "enum E { A, A } fn f() -> i32 { return E::A as i32; }";
+        assert!(
+            errors(variant).contains(&"E0300"),
+            "a duplicate enum variant must be reported: {:?}",
+            errors(variant)
+        );
+        let generic = "fn f<N, N>(a: Tensor[f32, N]) -> f32 { return a[0]; }";
+        assert!(
+            errors(generic).contains(&"E0300"),
+            "a duplicate generic parameter must be reported: {:?}",
+            errors(generic)
+        );
+        let ok = "struct S { x: i32, y: i32 } enum E { A, B } \
+                  fn f<M, N>(a: Tensor[f32, M, N]) -> f32 { return a[0, 0]; }";
+        assert!(
+            errors(ok).is_empty(),
+            "distinct declaration names must stay accepted: {:?}",
+            errors(ok)
+        );
+    }
+
+    #[test]
+    fn unknown_escape() {
+        // mir_build's `decode_escape` ends `Some(c) => c as u32`, so an unknown escape silently
+        // became the escaped character: `println("A\dB")` printed `AdB`, a value the source never
+        // wrote, with both backends agreeing so no differential gate could see it.
+        let unknown = "fn f() { println(\"A\\dB\"); }";
+        assert!(
+            errors(unknown).contains(&"E0401"),
+            "an unknown escape must be reported: {:?}",
+            errors(unknown)
+        );
+        // Worse: the `\u` arm is `skip_while(|&c| c != '{')` over the SHARED iterator, so a `\u`
+        // with no brace eats the whole remainder of the literal and folds to 0 —
+        // `println("AAF")` printed just `A`.
+        let no_brace = "fn f() { println(\"A\\u0041F\"); }";
+        assert!(
+            errors(no_brace).contains(&"E0401"),
+            "a `\\u` with no brace must be reported: {:?}",
+            errors(no_brace)
+        );
+        // And the worse half of the same mechanism: a brace that is OPENED and never CLOSED runs
+        // the scan to the end of the literal. `malformed_escape`'s loop had no found-brace flag, so
+        // it returned `None`; `bad_unicode_escape`'s `take_while(|&c| c != '}')` ran to the end too
+        // and its `map_or(v, ..)` skipped the non-hex characters, folding `\u{41Zoo` to a perfectly
+        // valid 0x41 — so BOTH validators stayed silent while `decode_escape` deleted `Zoo`.
+        let unclosed = "fn f() { println(\"A\\u{41Zoo\"); }";
+        assert!(
+            errors(unclosed).contains(&"E0401"),
+            "an unterminated `\\u{{` must be reported: {:?}",
+            errors(unclosed)
+        );
+        let lone = "fn f() -> char { return '\\d'; }";
+        assert!(
+            errors(lone).contains(&"E0401"),
+            "an unknown escape in a char literal must be reported: {:?}",
+            errors(lone)
+        );
+        // Every escape the decoder really reads must stay accepted, `\\` included (the scan has to
+        // consume the escaped character or a literal backslash starts a phantom escape).
+        let ok = "fn f() { println(\"a\\tb\\nc\\\\d\\\"e\\u{41}\\x41\\0\\r\"); }";
+        assert!(
+            errors(ok).is_empty(),
+            "the decodable escapes must stay accepted: {:?}",
+            errors(ok)
+        );
+        // The pre-existing out-of-range check must still fire, and must not be masked by the new one.
+        let surrogate = "fn f() { println(\"A\\u{D800}B\"); }";
+        assert!(
+            errors(surrogate).contains(&"E0401"),
+            "a surrogate code point must still be reported: {:?}",
+            errors(surrogate)
         );
     }
 

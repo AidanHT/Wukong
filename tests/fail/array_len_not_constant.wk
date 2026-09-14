@@ -1,0 +1,21 @@
+// EXPECT-CODE: E0406
+module tests.fail.array_len_not_constant
+
+// A fixed-size array's length must be readable by the compile-time folder. `4 as usize` is not:
+// sema's `eval_usize_depth` ends `_ => 0` and typed this `[i32; 0]`, while mir_build's mirrored
+// `const_usize_depth` ends `_ => None` and `mir_ty_of_ann`'s Array arm turned that into a bare
+// `MirType::Ptr` — so lowering emitted `v0 = alloca ptr` and the loop below STORED THROUGH the
+// uninitialized pointer. The interpreter reported `error: expected a pointer` and exited 1; the
+// native backend printed 7 after writing through a garbage stack address. An accepted program on
+// which the two Executed backends disagree, and a memory-safety violation on native.
+fn main() -> i32 {
+    let mut a: [i32; 4 as usize];
+    let mut i: i64 = 0;
+    while i < 4 {
+        a[i] = 7;
+        i = i + 1;
+    }
+    let j: i64 = 1;
+    println(a[j]);
+    return 0;
+}

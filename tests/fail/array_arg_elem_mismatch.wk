@@ -1,0 +1,17 @@
+// EXPECT-CODE: E0401
+module tests.fail.array_arg_elem_mismatch
+
+// The element half of the same missing `(Array, Array)` arm: a `[i32; 4]` satisfied a `[f32; 4]`,
+// so the callee read the i32 bit patterns as f32. The interpreter printed 3 (it re-typed the
+// values) and native printed 4.203895e-45 (the raw bits of 1 read as an f32) — again a clean
+// compile on which the two backends disagree. The element types are unified recursively, so this
+// reports the ordinary scalar mismatch.
+fn f(a: [f32; 4]) -> f32 {
+    return a[0] + a[1];
+}
+
+fn main() -> i32 {
+    let x: [i32; 4] = [1, 2, 3, 4];
+    println(f(x) as i32);
+    return 0;
+}
