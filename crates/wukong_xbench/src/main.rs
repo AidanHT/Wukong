@@ -308,6 +308,25 @@ fn bench_c_cpp(
     (c, cpp)
 }
 
+/// The BUILD half of [`bench_c_cpp`]: compile the C and C++ columns and load them, timing nothing.
+///
+/// Sections that time their columns through [`abba_min_columns`] must build every column before
+/// they time any of them, so they cannot use `bench_c_cpp` (which builds and then immediately times
+/// the pair). The C++ column still has to be validated against C, which needs both timings, so the
+/// caller runs [`cpp_checked`] on the two `Measure`s afterwards - the split changes when the check
+/// happens, never whether it happens.
+fn build_c_cpp(
+    label: &str,
+    c_src: &str,
+    dir: &Path,
+    cc: &str,
+    args: &[&str],
+) -> (Option<PeerLib>, Option<PeerLib>) {
+    let cl = build_peer("c", c_src, dir, label, cc, args);
+    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
+    (cl, pl)
+}
+
 /// [`bench_c_cpp`] for the 4-pointer ABI ([`bench_external4`]).
 #[allow(clippy::too_many_arguments)]
 fn bench_c_cpp4(
@@ -742,12 +761,40 @@ fn c_omp_source(name: &str) -> Option<String> {
     Some(c_kernel(body))
 }
 
+/// First line of `<tool> --version` for each peer compiler, on one line.
+///
+/// Best effort: a compiler that is absent or does not answer prints `?`, exactly as its column
+/// later prints `n/a`. This never fails the run.
+fn toolchain_banner(cc: &str) -> String {
+    let first_line = |tool: &str| -> String {
+        match Command::new(tool).arg("--version").output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("?")
+                .trim()
+                .to_string(),
+            _ => "?".to_string(),
+        }
+    };
+    format!(
+        "peer toolchains: CC={} [{}] | CXX={} [{}] | rustc [{}]",
+        cc,
+        first_line(cc),
+        cxx(),
+        first_line(cxx()),
+        first_line("rustc")
+    )
+}
+
 fn main() {
     let cc = std::env::var("CC").unwrap_or_else(|_| "gcc".to_string());
     // `$CXX` (default g++) is resolved once by `cxx()`, which every C++ peer column goes through.
     let cxx = cxx();
     let dir = std::env::temp_dir().join("wukong_xbench");
     let _ = std::fs::create_dir_all(&dir);
+    // Publish it so `announce_dispatch` can write each generated `.wk` beside the peer sources.
+    let _ = XBENCH_DIR.set(dir.clone());
 
     println!(
         "Cross-language kernel benchmark — Wukong (native) vs C (gcc -O3) vs Rust (rustc -Copt-level=3)"
@@ -757,7 +804,14 @@ fn main() {
          -march=native. Lower ns is better."
     );
     // Power state up front: sustained-load timings on battery are not comparable to AC runs.
-    println!("{}\n", model::power_status_line());
+    println!("{}", model::power_status_line());
+    // Toolchain identity, so a stdout log archived months later can name the compilers it timed.
+    // The measured-run manifest records the two executables' SHA256 and (since 2026-09-13) the git
+    // revision, but nothing recorded WHICH gcc/g++/rustc produced the peer columns - and Finding 01
+    // turned entirely on re-reading a log header long after the run.
+    println!("{}", toolchain_banner(&cc));
+    println!("scratch: {}", dir.display());
+    println!();
 
     // Optional substring filter (first CLI arg): run only the kernels/sections whose name contains it,
     // for fast single-kernel iteration. No arg → the full suite, byte-for-byte as before.
@@ -1566,19 +1620,27 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
                 .map(|x| format!("{:.1}", flops / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        let wuk = bench_wukong(&wk_matmul_tn(ns, false), &mut c, ap, bp);
-        let wk_par = bench_wukong(&wk_matmul_tn(ns, true), &mut c, ap, bp);
-        let (cm, cm_cpp) = bench_c_cpp(
+        // POSITION-BALANCED TIMING (2026-09-13) - see `abba_min_columns` and the note in
+        // `bench_colsum`. Build every column first, then time them all in one rotation.
+        let wk1 = build_wukong(&wk_matmul_tn(ns, false), 3);
+        let wkp = build_wukong(&wk_matmul_tn(ns, true), 3);
+        let (cl, pl) = build_c_cpp(
             "matmul_tn",
             &c_matmul_tn(ns),
             dir,
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
-            &mut c,
-            ap,
-            bp,
         );
-        let rm = bench_external(
+        // Reassociation-normalized peer: -ffast-math may vectorize the column-strided reduction.
+        let fl = build_peer(
+            "c",
+            &c_matmul_tn(ns),
+            dir,
+            "matmul_tn_fast",
+            cc,
+            C_FAST_FLAGS,
+        );
+        let rl = build_peer(
             "rs",
             &rust_matmul_tn(ns),
             dir,
@@ -1589,24 +1651,74 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut c,
-            ap,
-            bp,
         );
-        // Reassociation-normalized peer: -ffast-math may vectorize the column-strided reduction.
-        let cfast = bench_c_fast("matmul_tn", &c_matmul_tn(ns), dir, cc, &wuk, &mut c, ap, bp);
+        // LIBRARY-GRADE PEER (2026-09-13). The evaluation listed the TN weight-gradient under
+        // "where Wukong genuinely leads" on a 3.2-6.6x margin over idiomatic C, and this was the one
+        // GEMM family with NO library bar at all - while `cblas_sgemm_64` was already resolved in
+        // this process and needed only `transa = CblasTrans`.
+        let (ar, br) = (&a[..], &b[..]);
+        let mkl_all_threads = mkl().map(|api| api.max_threads);
+        let cols_all = [
+            Built::wk(wk1),
+            Built::wk(wkp),
+            Built::peer(cl),
+            Built::peer(pl),
+            Built::peer(fl),
+            Built::Direct(Box::new(move |o: &mut [f32]| {
+                bench_mm_mkl_tn(ns, ns, ns, 1, ar, br, o)
+            })),
+            match mkl_all_threads {
+                Some(t) => Built::Direct(Box::new(move |o: &mut [f32]| {
+                    bench_mm_mkl_tn(ns, ns, ns, t, ar, br, o)
+                })),
+                None => Built::Missing,
+            },
+            Built::peer(rl),
+        ];
+        let mut timed =
+            abba_min_columns(cols_all.len(), |i| time_built(&cols_all[i], &mut c, ap, bp))
+                .into_iter();
+        let wuk = timed.next().flatten();
+        let wk_par = timed.next().flatten();
+        let cm = timed.next().flatten();
+        let cm_cpp = cpp_checked("matmul_tn", &cm, timed.next().flatten());
+        let cfast = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("matmul_tn", "C(fast)", m, p))
+        });
+        // MKL reassociates its accumulation, so the bar is the harness's magnitude-normalized 1e-2
+        // relaxed bar, the same one C(fast) and C(omp) are held to - not the 1e-3 like-for-like bar.
+        let mkl_1c = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("matmul_tn", "MKL(1c)", m, p))
+        });
+        let mkl_all = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("matmul_tn", "MKL(all)", m, p))
+        });
+        let rm = timed.next().flatten();
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "",
+            "Wuk(1core)",
+            "Wuk(par)",
+            "C (gcc)",
+            "C++ (g++)",
+            "C(fast)",
+            "MKL(1c)",
+            "MKL(all)",
+            "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GFLOP/s",
             gflops(&wuk),
             gflops(&wk_par),
             gflops(&cm),
             gflops(&cm_cpp),
             gflops(&cfast),
+            gflops(&mkl_1c),
+            gflops(&mkl_all),
             gflops(&rm)
         );
         // Absolute GFLOP/s on this laptop swings ~3x with the power state, so the number above is
@@ -1744,19 +1856,18 @@ fn bench_gemv(cc: &str, dir: &Path) {
         println!(
             "=== gemv (y[i] = Sum_j A[i,j]*x[j]) {m}x{n} (A-stream GB/s, higher is better) ==="
         );
-        let wuk = bench_wukong(&wk_gemv(m, n, false), &mut y, ap, xp);
-        let wk_par = bench_wukong(&wk_gemv(m, n, true), &mut y, ap, xp);
-        let (cm, cm_cpp) = bench_c_cpp(
+        // POSITION-BALANCED TIMING (2026-09-13) - see `abba_min_columns` and the note in
+        // `bench_colsum`. Build every column first, then time them all in one rotation.
+        let wk1 = build_wukong(&wk_gemv(m, n, false), 3);
+        let wkp = build_wukong(&wk_gemv(m, n, true), 3);
+        let (cl, pl) = build_c_cpp(
             "gemv",
             &c_gemv(m, n),
             dir,
             cc,
             &["-O3", "-march=native", "-shared"],
-            &mut y,
-            ap,
-            xp,
         );
-        let rm = bench_external(
+        let rl = build_peer(
             "rs",
             &rust_gemv(m, n),
             dir,
@@ -1767,27 +1878,77 @@ fn bench_gemv(cc: &str, dir: &Path) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut y,
-            ap,
-            xp,
         );
         // Reassociation-normalized peer. Wukong's `wukong_sgemv` folds each row across four 8-wide
         // accumulators — it REASSOCIATES the dot — so a plain-flags C column that must keep the sum
         // strictly left-to-right is not the like-for-like comparison. Printed alongside, never
         // instead of, the honest-default C ratio.
-        let cfast = bench_c_fast("gemv", &c_gemv(m, n), dir, cc, &wuk, &mut y, ap, xp);
+        let fl = build_peer("c", &c_gemv(m, n), dir, "gemv_fast", cc, C_FAST_FLAGS);
+        // LIBRARY-GRADE PEER (2026-09-13). `cblas_sgemv_64` is the exact primitive and it resolves
+        // off the handle this process already holds; this family had no library bar at all.
+        let (ar, xr) = (&a[..], &x[..]);
+        let mkl_all_threads = mkl().map(|api| api.max_threads);
+        let cols_all = [
+            Built::wk(wk1),
+            Built::wk(wkp),
+            Built::peer(cl),
+            Built::peer(pl),
+            Built::peer(fl),
+            Built::Direct(Box::new(move |o: &mut [f32]| {
+                bench_gemv_mkl(m, n, 1, ar, xr, o)
+            })),
+            match mkl_all_threads {
+                Some(t) => Built::Direct(Box::new(move |o: &mut [f32]| {
+                    bench_gemv_mkl(m, n, t, ar, xr, o)
+                })),
+                None => Built::Missing,
+            },
+            Built::peer(rl),
+        ];
+        let mut timed =
+            abba_min_columns(cols_all.len(), |i| time_built(&cols_all[i], &mut y, ap, xp))
+                .into_iter();
+        let wuk = timed.next().flatten();
+        let wk_par = timed.next().flatten();
+        let cm = timed.next().flatten();
+        let cm_cpp = cpp_checked("gemv", &cm, timed.next().flatten());
+        let cfast = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("gemv", "C(fast)", m, p))
+        });
+        // MKL reassociates the row dot exactly as Wukong does, so the bar is the harness's
+        // magnitude-normalized 1e-2 relaxed bar rather than the 1e-3 like-for-like one.
+        let mkl_1c = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("gemv", "MKL(1c)", m, p))
+        });
+        let mkl_all = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("gemv", "MKL(all)", m, p))
+        });
+        let rm = timed.next().flatten();
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "",
+            "Wuk(1core)",
+            "Wuk(par)",
+            "C (gcc)",
+            "C++ (g++)",
+            "C(fast)",
+            "MKL(1c)",
+            "MKL(all)",
+            "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GB/s",
             gbps(&wuk),
             gbps(&wk_par),
             gbps(&cm),
             gbps(&cm_cpp),
             gbps(&cfast),
+            gbps(&mkl_1c),
+            gbps(&mkl_all),
             gbps(&rm)
         );
         // The 8-wide row dot reassociates → magnitude-normalized tolerance (max|Δ| / max|C|), not a
@@ -2598,6 +2759,36 @@ const TRANSPOSE_SHAPES: &[(usize, usize, bool)] = &[
 /// The sweep covers BOTH stride regimes — see [`TRANSPOSE_SHAPES`] — and closes with a summary that
 /// geomeans them apart and names the general one, because reporting only the power-of-two rows is
 /// reporting the size at which the peer is worst.
+/// Keep a oneMKL transpose column only if it is BIT-identical to Wukong's.
+///
+/// A transposition is a permutation, so there is no reassociation to excuse a difference and no
+/// tolerance to invent: `MKL_Somatcopy(alpha = 1)` must move exactly the same bits. A column that
+/// disagrees is computing something else and is dropped rather than printed beside a ratio - the
+/// rule [`relaxed_peer_ok`] and [`cpp_checked`] already follow.
+///
+/// BITS, NOT VALUES. `Vec<f32>` equality compares by VALUE, so `-0.0 == 0.0` and the check would
+/// have passed a column that moved a sign bit — while this doc, and [`cpp_checked`] which it cites
+/// as its model, both say BIT-identical. For a pure permutation the two bars can only differ when
+/// something is wrong, which is exactly when the check has to hold, so it compares `to_bits` the
+/// way `cpp_checked` does. (A NaN payload is the other case the value comparison silently accepts:
+/// `NaN != NaN`, so a value comparison would REJECT two identical NaNs and accept two different
+/// ones. Bits get both right.)
+fn mkl_transpose_exact(wuk: &Option<Measure>, p: Option<Measure>, label: &str) -> Option<Measure> {
+    let p = p?;
+    let bitwise_differs = |a: &[f32], b: &[f32]| {
+        a.len() != b.len() || a.iter().zip(b).any(|(x, y)| x.to_bits() != y.to_bits())
+    };
+    match wuk {
+        Some(m) if bitwise_differs(&m.out, &p.out) => {
+            println!(
+                "  ! transpose: {label} (MKL_Somatcopy) disagrees with Wukong — column dropped"
+            );
+            None
+        }
+        _ => Some(p),
+    }
+}
+
 fn bench_transpose(cc: &str, dir: &Path) {
     // (single-core ratio vs blocked C, @parallel ratio vs blocked C), split by regime.
     let (mut alias_1c, mut gen_1c): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
@@ -2622,19 +2813,29 @@ fn bench_transpose(cc: &str, dir: &Path) {
         println!(
             "=== transpose (dst = srcᵀ) {rows}x{cols} [{regime}] (GB/s, higher is better) ==="
         );
-        let wuk = bench_wukong(&wk_transpose(rows, cols, false), &mut dst, sp, yp);
-        let wk_par = bench_wukong(&wk_transpose(rows, cols, true), &mut dst, sp, yp);
-        let (cm, cm_cpp) = bench_c_cpp(
+        // POSITION-BALANCED TIMING (2026-09-13) - see `abba_min_columns` and the note in
+        // `bench_colsum`. Build every column first, then time them all in one rotation.
+        let wk1 = build_wukong(&wk_transpose(rows, cols, false), 3);
+        let wkp = build_wukong(&wk_transpose(rows, cols, true), 3);
+        let (cl, pl) = build_c_cpp(
             "transpose",
             &c_transpose(rows, cols),
             dir,
             cc,
             &["-O3", "-march=native", "-shared"],
-            &mut dst,
-            sp,
-            yp,
         );
-        let rm = bench_external(
+        // Multithreaded C peer: rows across cores (a permutation — no reduction, plain -fopenmp).
+        let ol = omp_threads(cc, dir).and_then(|_| {
+            build_peer(
+                "c",
+                &c_transpose_omp(rows, cols),
+                dir,
+                "transpose_omp",
+                cc,
+                C_OMP_FLAGS,
+            )
+        });
+        let rl = build_peer(
             "rs",
             &rust_transpose(rows, cols),
             dir,
@@ -2645,40 +2846,70 @@ fn bench_transpose(cc: &str, dir: &Path) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut dst,
-            sp,
-            yp,
         );
-        // Multithreaded C peer: rows across cores (a permutation — no reduction, plain -fopenmp).
-        let comp = omp_threads(cc, dir)
-            .and_then(|_| {
-                bench_external(
-                    "c",
-                    &c_transpose_omp(rows, cols),
-                    dir,
-                    "transpose_omp",
-                    cc,
-                    C_OMP_FLAGS,
-                    &mut dst,
-                    sp,
-                    yp,
-                )
-            })
-            .filter(|p| {
-                wuk.as_ref()
-                    .is_some_and(|m| relaxed_peer_ok("transpose", "C(omp)", m, p))
-            });
+        // LIBRARY-GRADE PEER (2026-09-13). `mkl_somatcopy` is the exact primitive this section
+        // benchmarks and it was sitting unloaded in the same process: until now W8 was being tuned
+        // against gcc's blocked nest and nothing else. Beating a hand-written loop is not beating
+        // the state of the art, so the bar here is now Intel's.
+        let mkl_all_threads = mkl().map(|api| api.max_threads);
+        // A shared `&[f32]` (Copy) rather than a borrow of the `Vec`, so both `move` closures can
+        // hold it without either of them taking ownership of `src`.
+        let srcr: &[f32] = &src;
+        let cols_all = [
+            Built::wk(wk1),
+            Built::wk(wkp),
+            Built::peer(cl),
+            Built::peer(pl),
+            Built::Direct(Box::new(move |d: &mut [f32]| {
+                bench_transpose_mkl(rows, cols, 1, srcr, d)
+            })),
+            match mkl_all_threads {
+                Some(t) => Built::Direct(Box::new(move |d: &mut [f32]| {
+                    bench_transpose_mkl(rows, cols, t, srcr, d)
+                })),
+                None => Built::Missing,
+            },
+            Built::peer(ol),
+            Built::peer(rl),
+        ];
+        let mut timed = abba_min_columns(cols_all.len(), |i| {
+            time_built(&cols_all[i], &mut dst, sp, yp)
+        })
+        .into_iter();
+        let wuk = timed.next().flatten();
+        let wk_par = timed.next().flatten();
+        let cm = timed.next().flatten();
+        let cm_cpp = cpp_checked("transpose", &cm, timed.next().flatten());
+        // A transposition is a permutation: the MKL columns are held to BIT equality with Wukong,
+        // the same bar the C and Rust columns already carry, and dropped on any disagreement.
+        let mkl_1c = mkl_transpose_exact(&wuk, timed.next().flatten(), "MKL(1c)");
+        let mkl_all = mkl_transpose_exact(&wuk, timed.next().flatten(), "MKL(all)");
+        let comp = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("transpose", "C(omp)", m, p))
+        });
+        let rm = timed.next().flatten();
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(omp)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "",
+            "Wuk(1core)",
+            "Wuk(par)",
+            "C (gcc)",
+            "C++ (g++)",
+            "MKL(1c)",
+            "MKL(all)",
+            "C(omp)",
+            "Rust"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GB/s",
             gbps(&wuk),
             gbps(&wk_par),
             gbps(&cm),
             gbps(&cm_cpp),
+            gbps(&mkl_1c),
+            gbps(&mkl_all),
             gbps(&comp),
             gbps(&rm)
         );
@@ -2885,19 +3116,36 @@ fn bench_colsum(cc: &str, dir: &Path) {
                 .unwrap_or_else(|| "n/a".into())
         };
         println!("=== colsum (out[j] = Σ_i x[i,j]) {m}x{n} (GB/s, higher is better) ===");
-        let wuk = bench_wukong(&wk_colsum(m, n, false), &mut out, xp, yp);
-        let wk_par = bench_wukong(&wk_colsum(m, n, true), &mut out, xp, yp);
-        let (cm, cm_cpp) = bench_c_cpp(
+        // POSITION-BALANCED TIMING (2026-09-13). Build every column FIRST, then time them all in
+        // one rotation - see `abba_min_columns`. Before this, Wukong was compiled-and-timed in one
+        // call, so it always held slot 1 (the coldest, quietest slot, with no compiler spawn in
+        // front of it) while every peer's timed region sat behind two all-core gcc invocations.
+        // The harness's own byte-identical control measured that slot worth +5.0% and +17.3% on the
+        // two `colsum` rows, and the Wukong-over-peer ratio is the one ratio the campaign states
+        // its targets in.
+        let wk1 = build_wukong(&wk_colsum(m, n, false), 3);
+        let wkp = build_wukong(&wk_colsum(m, n, true), 3);
+        let (cl, pl) = build_c_cpp(
             "colsum",
             &c_colsum(m, n),
             dir,
             cc,
             &["-O3", "-march=native", "-shared"],
-            &mut out,
-            xp,
-            yp,
         );
-        let rm = bench_external(
+        // Reassociation-normalized peer: -ffast-math lets gcc reassociate the strided column fold.
+        let fl = build_peer("c", &c_colsum(m, n), dir, "colsum_fast", cc, C_FAST_FLAGS);
+        // Multithreaded C peer: columns across cores (+ -ffast-math, the reduction-row rule).
+        let ol = omp_threads(cc, dir).and_then(|_| {
+            build_peer(
+                "c",
+                &c_colsum_omp(m, n),
+                dir,
+                "colsum_omp",
+                cc,
+                C_OMP_FAST_FLAGS,
+            )
+        });
+        let rl = build_peer(
             "rs",
             &rust_colsum(m, n),
             dir,
@@ -2908,31 +3156,31 @@ fn bench_colsum(cc: &str, dir: &Path) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut out,
-            xp,
-            yp,
         );
-        // Reassociation-normalized peer: -ffast-math lets gcc reassociate the strided column fold.
-        let cfast = bench_c_fast("colsum", &c_colsum(m, n), dir, cc, &wuk, &mut out, xp, yp);
-        // Multithreaded C peer: columns across cores (+ -ffast-math, the reduction-row rule).
-        let comp = omp_threads(cc, dir)
-            .and_then(|_| {
-                bench_external(
-                    "c",
-                    &c_colsum_omp(m, n),
-                    dir,
-                    "colsum_omp",
-                    cc,
-                    C_OMP_FAST_FLAGS,
-                    &mut out,
-                    xp,
-                    yp,
-                )
-            })
-            .filter(|p| {
-                wuk.as_ref()
-                    .is_some_and(|mm| relaxed_peer_ok("colsum", "C(omp)", mm, p))
-            });
+        let cols = [
+            Built::wk(wk1),
+            Built::wk(wkp),
+            Built::peer(cl),
+            Built::peer(pl),
+            Built::peer(fl),
+            Built::peer(ol),
+            Built::peer(rl),
+        ];
+        let mut timed =
+            abba_min_columns(cols.len(), |i| time_built(&cols[i], &mut out, xp, yp)).into_iter();
+        let wuk = timed.next().flatten();
+        let wk_par = timed.next().flatten();
+        let cm = timed.next().flatten();
+        let cm_cpp = cpp_checked("colsum", &cm, timed.next().flatten());
+        let cfast = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|mm| relaxed_peer_ok("colsum", "C(fast)", mm, p))
+        });
+        let comp = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|mm| relaxed_peer_ok("colsum", "C(omp)", mm, p))
+        });
+        let rm = timed.next().flatten();
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "C(omp)", "Rust"
@@ -3055,19 +3303,18 @@ fn bench_biasadd(cc: &str, dir: &Path) {
                 .unwrap_or_else(|| "n/a".into())
         };
         println!("=== biasadd (out[r,c] = x[r,c] + bias[c]) {r}x{c} (GB/s, higher is better) ===");
-        let wuk = bench_wukong(&wk_biasadd(r, c, false), &mut out, xp, bp);
-        let wk_par = bench_wukong(&wk_biasadd(r, c, true), &mut out, xp, bp);
-        let (cm, cm_cpp) = bench_c_cpp(
+        // POSITION-BALANCED TIMING (2026-09-13) - see `abba_min_columns` and the note in
+        // `bench_colsum`. Build every column first, then time them all in one rotation.
+        let wk1 = build_wukong(&wk_biasadd(r, c, false), 3);
+        let wkp = build_wukong(&wk_biasadd(r, c, true), 3);
+        let (cl, pl) = build_c_cpp(
             "biasadd",
             &c_biasadd(r, c),
             dir,
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
-            &mut out,
-            xp,
-            bp,
         );
-        let rm = bench_external(
+        let rl = build_peer(
             "rs",
             &rust_biasadd(r, c),
             dir,
@@ -3078,10 +3325,21 @@ fn bench_biasadd(cc: &str, dir: &Path) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut out,
-            xp,
-            bp,
         );
+        let cols = [
+            Built::wk(wk1),
+            Built::wk(wkp),
+            Built::peer(cl),
+            Built::peer(pl),
+            Built::peer(rl),
+        ];
+        let mut timed =
+            abba_min_columns(cols.len(), |i| time_built(&cols[i], &mut out, xp, bp)).into_iter();
+        let wuk = timed.next().flatten();
+        let wk_par = timed.next().flatten();
+        let cm = timed.next().flatten();
+        let cm_cpp = cpp_checked("biasadd", &cm, timed.next().flatten());
+        let rm = timed.next().flatten();
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "Rust"
@@ -4444,19 +4702,27 @@ fn bench_colstat(cc: &str, dir: &Path) {
             };
             let desc = if opc == 0 { "x[i,j]" } else { "x[i,j]²" };
             println!("=== {label} (out[j] = {sym}_i {desc}) {m}x{n} (GB/s, higher is better) ===");
-            let wuk = bench_wukong(&wk_colstat(m, n, false, opc), &mut out, xp, yp);
-            let wk_par = bench_wukong(&wk_colstat(m, n, true, opc), &mut out, xp, yp);
-            let (cm, cm_cpp) = bench_c_cpp(
+            // POSITION-BALANCED TIMING (2026-09-13) - see `abba_min_columns` and the note in
+            // `bench_colsum`. Build every column first, then time them all in one rotation.
+            let wk1 = build_wukong(&wk_colstat(m, n, false, opc), 3);
+            let wkp = build_wukong(&wk_colstat(m, n, true, opc), 3);
+            let (cl, pl) = build_c_cpp(
                 label,
                 &c_colstat(m, n, opc),
                 dir,
                 cc,
                 &["-O3", "-march=native", "-shared"],
-                &mut out,
-                xp,
-                yp,
             );
-            let rm = bench_external(
+            // Reassociation-normalized peer: -ffast-math lets gcc reassociate the strided fold.
+            let fl = build_peer(
+                "c",
+                &c_colstat(m, n, opc),
+                dir,
+                &format!("{label}_fast"),
+                cc,
+                C_FAST_FLAGS,
+            );
+            let rl = build_peer(
                 "rs",
                 &rust_colstat(m, n, opc),
                 dir,
@@ -4467,21 +4733,27 @@ fn bench_colstat(cc: &str, dir: &Path) {
                     "-Ctarget-cpu=native",
                     "--crate-type=cdylib",
                 ],
-                &mut out,
-                xp,
-                yp,
             );
-            // Reassociation-normalized peer: -ffast-math lets gcc reassociate the strided fold.
-            let cfast = bench_c_fast(
-                label,
-                &c_colstat(m, n, opc),
-                dir,
-                cc,
-                &wuk,
-                &mut out,
-                xp,
-                yp,
-            );
+            let cols = [
+                Built::wk(wk1),
+                Built::wk(wkp),
+                Built::peer(cl),
+                Built::peer(pl),
+                Built::peer(fl),
+                Built::peer(rl),
+            ];
+            let mut timed =
+                abba_min_columns(cols.len(), |i| time_built(&cols[i], &mut out, xp, yp))
+                    .into_iter();
+            let wuk = timed.next().flatten();
+            let wk_par = timed.next().flatten();
+            let cm = timed.next().flatten();
+            let cm_cpp = cpp_checked(label, &cm, timed.next().flatten());
+            let cfast = timed.next().flatten().filter(|p| {
+                wuk.as_ref()
+                    .is_some_and(|mm| relaxed_peer_ok(label, "C(fast)", mm, p))
+            });
+            let rm = timed.next().flatten();
             println!(
                 "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -6241,12 +6513,31 @@ fn bench_bf16(cc: &str, dir: &Path) {
             // All-positive, well-conditioned reduction → a tight relative tolerance is the right
             // cross-language bar (the three reassociate the f32 sum differently: Wukong 8-lane SIMD
             // vs sequential C/Rust). Report the scalars so any drift is visible.
+            //
+            // C(fast) IS IN THIS LOOP AS OF 2026-09-13, AT ITS OWN BAR. Every bf16 loss in this
+            // section is against C(fast) and nothing else, and it was the one peer whose scalar was
+            // never printed anywhere: `bench_bf16_fast` keeps or drops the column at rel > 1e-2, a
+            // bar ten times looser than the one the three sequential peers are held to, so "C(fast)
+            // printed a column" bounded its answer only to within 1e-2 of Wukong - an error of the
+            // same order the sequential peers' own drift reaches. The section's accuracy ruling was
+            // derived from the three peers Wukong BEATS and said nothing about the one it loses to.
+            // The bar is NOT tightened here (that would delete the peer that wins, which is the
+            // opposite of a fix); the scalar is put on the record so the ruling can be re-derived
+            // against the f64 reference with C(fast) in it.
             if let Some(m) = &wuk {
-                for (lang, other) in [("C", &cm), ("C++", &cm_cpp), ("Rust", &rm)] {
+                for (lang, other, bar) in [
+                    ("C", &cm, 1e-3),
+                    ("C++", &cm_cpp, 1e-3),
+                    ("Rust", &rm, 1e-3),
+                    ("C(fast)", &cfast, 1e-2),
+                ] {
                     if let Some(o2) = other {
                         let (a, b) = (m.out, o2.out);
                         let rel = (a - b).abs() as f64 / (a.abs().max(b.abs()).max(1e-6) as f64);
-                        if rel > 1e-3 {
+                        println!(
+                            "  . {lang} scalar {b} vs Wukong {a} (rel {rel:.2e}, bar {bar:.0e})"
+                        );
+                        if rel > bar {
                             println!("  ! {lang} scalar drift: {b} vs Wukong {a} (rel {rel:.2e})");
                         }
                     }
@@ -6665,9 +6956,21 @@ fn rust_conv(cin: usize, h: usize, cout: usize, k: usize) -> String {
 /// their honest defaults (no `-ffast-math`) auto-vectorize the elementwise passes but keep the float
 /// reductions strictly sequential — and call scalar libm `expf` for softmax — so this is the same
 /// reduction-vectorization + transcendental story as the `dot`/`exp` kernels, now fused. All three
-/// languages copy `x`→`out` then normalize `out` in place (identical work), so the cross-language
-/// full-buffer check sees the same result. One row = one token's hidden vector; a real `[tokens,
-/// hidden]` batch maps the identical kernel per row.
+/// languages are WRITTEN the same way — copy `x`→`out`, then normalize `out` in place — so the
+/// cross-language full-buffer check sees the same result. One row = one token's hidden vector; a
+/// real `[tokens, hidden]` batch maps the identical kernel per row.
+///
+/// THEY NO LONGER DO THE SAME WORK, and this comment used to claim they did ("identical work").
+/// `wukong_mir_build::try_fuse_copy_norm` folds the copy into the kernel's source operand, so the
+/// Wukong program that gets timed here is ONE call over ONE pass while the C/C++/Rust peers still
+/// make two passes over the buffer. That is a legitimate compiler win — gcc declined a fusion
+/// Wukong performed on the same spelling — and it is exactly why the ratio is what it is; but it
+/// is a *compiler* result, not an equal-work kernel comparison, and this is the campaign's largest
+/// predicted movement. Publishing that swing under a stale "identical work" claim is the class of
+/// error the evaluation's own instrument-failure table exists to catalogue. The dispatch census
+/// printed above each table names the kernels the timed program actually called.
+/// (`bench_norm_batched` is unaffected: `match_inplace_norm_window` accepts only a FLAT window, so
+/// the batched program still copies, and its comment is still true.)
 fn bench_norm(cc: &str, dir: &Path) {
     for &cols in &[768usize, 4096] {
         let x: Vec<f32> = (0..cols).map(|i| (i % 17) as f32 * 0.5 + 1.0).collect();
@@ -7327,6 +7630,37 @@ fn kbench_abi_ok(
 /// all-zeros against all-zeros and pass vacuously. Deriving `op` from `out` keeps the kernel's
 /// writes *based on* the parameter, which is exactly what `noalias` permits.
 fn bench_wukong(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32) -> Option<Measure> {
+    let jit = build_wukong(src, 3)?;
+    time_wukong(&jit, out, xp, yp)
+}
+
+/// A Wukong kernel COMPILED and JIT-loaded but **not yet timed** - the Wukong-side twin of
+/// [`build_peer`], and the thing that makes [`abba_min_columns`] possible.
+///
+/// Until 2026-09-13 the Wukong column of every family was compiled and timed in one call, which
+/// forced it to be the FIRST timed region of its section (nothing else was built yet) and left
+/// every peer's timed region preceded by all-core compiler spawns that Wukong's had never paid.
+/// The harness's own control experiment (see [`abba_min`]) measured that slot to be worth up to
+/// +17.3% on `colsum`. Splitting build from time is what lets a section build every column first
+/// and then time them in a position-balanced rotation, exactly as [`bench_c_cpp`] already did for
+/// the C-vs-C++ pair and never did for the Wukong-vs-peer pair the checklist states its targets in.
+struct WukongJit {
+    /// Wall time the whole front end + optimizer + Cranelift JIT took.
+    compile: Duration,
+    /// `kbench`'s entry point. Valid only while `_handle` is alive, which is why the two travel
+    /// together in one value.
+    ptr: *const u8,
+    /// The dispatch census line - kept so a caller can re-print it beside a table if it wants to.
+    #[allow(dead_code)]
+    dispatch: String,
+    _handle: wukong_codegen_cranelift::JitModuleHandle,
+}
+
+/// Compile `src` through the whole Wukong pipeline at `-O3` and JIT it, checking that the lowered
+/// `kbench` really takes `ptr_params` pointers and returns void before anything transmutes it.
+///
+/// Also records the dispatch census and persists the generated source - see [`announce_dispatch`].
+fn build_wukong(src: &str, ptr_params: usize) -> Option<WukongJit> {
     let t = Instant::now();
     let mut interner = Interner::new();
     let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
@@ -7345,6 +7679,7 @@ fn bench_wukong(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32) -> O
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
+    let dispatch = announce_dispatch(src, &program, &interner);
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
@@ -7353,26 +7688,137 @@ fn bench_wukong(src: &str, out: &mut [f32], xp: *const f32, yp: *const f32) -> O
         }
     };
     let sym = interner.intern("kbench");
-    if !kbench_abi_ok(&program, sym, 3) {
+    if !kbench_abi_ok(&program, sym, ptr_params) {
         return None;
     }
     let ptr = handle.func_ptr(sym)?;
-    let compile = t.elapsed();
-    // SAFETY: `kbench_abi_ok` just checked the lowered `kbench` is (ptr, ptr, ptr) -> void,
-    // which is exactly `KernelFn`; `handle` is kept alive across the call below.
-    let f: KernelFn = unsafe { std::mem::transmute(ptr) };
+    Some(WukongJit {
+        compile: t.elapsed(),
+        ptr,
+        dispatch,
+        _handle: handle,
+    })
+}
 
+/// Time an already-built Wukong kernel over the 3-pointer ABI. Derives the kernel's output pointer
+/// from `out` - see the one-live-pointer law on [`bench_wukong`].
+fn time_wukong(
+    jit: &WukongJit,
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+) -> Option<Measure> {
+    // SAFETY: `build_wukong` checked the lowered `kbench` is (ptr, ptr, ptr) -> void, which is
+    // exactly `KernelFn`; `jit` owns the JIT module and outlives this call.
+    let f: KernelFn = unsafe { std::mem::transmute(jit.ptr) };
     out.iter_mut().for_each(|v| *v = 0.0);
     let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
     let ns = time_ns(|| unsafe { f(xp, yp, op) });
-    let snapshot = out.to_vec();
-    drop(handle); // keep alive through timing
     Some(Measure {
-        compile,
+        compile: jit.compile,
         ns_per_call: ns,
-        out: snapshot,
+        out: out.to_vec(),
     })
 }
+
+/// The `wukong_*` runtime-kernel CALL TARGETS in a printed MIR module, as a sorted multiset.
+///
+/// Same shape as `general::kernel_census` / `model::kernel_calls`, which have printed this for
+/// their own programs since those suites landed. `main.rs` printed nothing, which is why no
+/// campaign-measured row could say whether a movement came from a recognizer firing or from the
+/// JIT: recognized kernels are gate-blind (interp and native both call the same symbol at every
+/// `-O` level), so the dispatch census of the program that was timed is the only evidence there is.
+///
+/// CALL SITES ONLY. This scanned for the bare substring `wukong_` anywhere in the text, which
+/// counts anything the printer might put a kernel name in that is not a dispatch — a `func_addr`
+/// operand (`wukong_mir::print` emits one for every taken function address), a function whose own
+/// name begins `wukong_`, a type or a comment. A census that over-counts is worse than none: the
+/// dispatch line is the only attribution a measured row carries, so it has to name what was
+/// CALLED. `wukong_mir::print::fmt_inst` renders a call as `call <name>(<args>)` and nothing else
+/// in the printer produces that shape, so anchoring on `call ` + name + `(` is exact rather than
+/// heuristic. `kernel_census_counts_real_printed_mir` pins it against real printer output rather
+/// than against a string the test wrote itself.
+fn kernel_census(mir: &str) -> Vec<(String, usize)> {
+    const CALL: &str = "call ";
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for (i, _) in mir.match_indices(CALL) {
+        let rest = &mir[i + CALL.len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let (name, tail) = rest.split_at(end);
+        // `call name(` — the argument list is what separates a call from any other use of the name.
+        if !tail.starts_with('(') || !name.starts_with("wukong_") {
+            continue;
+        }
+        *counts.entry(name).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+}
+
+/// A content-addressed file name for a generated `.wk` program, so the same source always lands in
+/// the same file and a log line names a file a reader can actually open.
+fn wk_source_name(src: &str) -> String {
+    // FNV-1a 64. Not cryptographic and does not need to be: it only has to be stable across runs
+    // and collision-free over the ~100 generated programs one run produces.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in src.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("wk_{h:016x}.wk")
+}
+
+/// Print the dispatch census for a just-optimized program, write its source next to the peer
+/// sources, and return the line.
+///
+/// TWO defects this closes, both from the 2026-09-13 instrument sweep. (1) No campaign row recorded
+/// which recognizer fired, so a measured movement could not be attributed to a dispatch change
+/// rather than a codegen change - and 10 of the 21 measured families are recognizer-dependent.
+/// (2) The `wk_*` programs were `format!` strings parsed in-process and never persisted, so a
+/// measured row could not be re-fed to `wukongc --emit=mir -O2` to check it. The peer sources have
+/// been written to this same directory since [`build_peer`] existed; now the Wukong source is too.
+///
+/// The line is prefixed `  . ` - the harness's existing informational-note marker, which
+/// `docs/cpu-evaluation-probes/extract-kernels.py` skips rather than mistaking for a table row.
+fn announce_dispatch(src: &str, program: &wukong_mir::Program, interner: &Interner) -> String {
+    let census = kernel_census(&wukong_mir::print::print_program(program, interner));
+    let name = wk_source_name(src);
+    if let Some(dir) = XBENCH_DIR.get() {
+        let _ = std::fs::write(dir.join(&name), src);
+    }
+    let par = if src.contains("@parallel") {
+        " [@parallel]"
+    } else {
+        ""
+    };
+    let body = if census.is_empty() {
+        "NONE - every loop stays generic Cranelift code".to_string()
+    } else {
+        census
+            .iter()
+            .map(|(k, n)| {
+                if *n == 1 {
+                    k.clone()
+                } else {
+                    format!("{k}x{n}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let line = format!("{name}{par} -> {body}");
+    println!("  . dispatch {line}");
+    line
+}
+
+/// The scratch directory the peer sources are written to, published once by `main` so
+/// [`announce_dispatch`] can drop the generated `.wk` beside them without threading a `&Path`
+/// through 40 `bench_*` signatures - the same reasoning [`cxx`] records for `$CXX`.
+static XBENCH_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// A built-and-loaded peer library, plus the wall time its compiler process took.
 ///
@@ -7522,6 +7968,91 @@ fn abba_min<M: Timed>(
     (faster(a1, a2), faster(b1, b2))
 }
 
+/// One column of a section, BUILT but not yet timed.
+///
+/// A column that could not be built stays in the list as [`Built::Missing`] rather than being
+/// dropped, so the *positions* the surviving columns occupy do not shift when a toolchain is
+/// absent. It times to `None` in every slot.
+/// A library peer already resident in the process: given the output buffer, it performs exactly
+/// the timed call and returns the measurement.
+type DirectColumn<'a> = Box<dyn Fn(&mut [f32]) -> Option<Measure> + 'a>;
+
+enum Built<'a> {
+    /// A JIT-compiled Wukong kernel. Boxed because `JitModuleHandle` is large and would otherwise
+    /// set the size of every variant of this enum, including `Missing`.
+    Wukong(Box<WukongJit>),
+    /// A compiled-and-loaded C / C++ / Rust peer DLL.
+    Peer(PeerLib),
+    /// A library peer already resident in this process (oneMKL). Nothing to build.
+    Direct(DirectColumn<'a>),
+    /// Toolchain missing, compile failed, or the column does not apply to this section.
+    Missing,
+}
+
+impl Built<'_> {
+    fn wk(j: Option<WukongJit>) -> Self {
+        j.map_or(Built::Missing, |j| Built::Wukong(Box::new(j)))
+    }
+    fn peer(p: Option<PeerLib>) -> Self {
+        p.map_or(Built::Missing, Built::Peer)
+    }
+}
+
+/// Time one already-built column over the 3-pointer ABI.
+fn time_built(b: &Built, out: &mut [f32], xp: *const f32, yp: *const f32) -> Option<Measure> {
+    match b {
+        Built::Wukong(j) => time_wukong(j, out, xp, yp),
+        Built::Peer((c, l)) => time_peer(l, *c, out, xp, yp),
+        Built::Direct(f) => f(out),
+        Built::Missing => None,
+    }
+}
+
+/// [`abba_min`] generalized from a PAIR to N columns: visit them `0 1 .. n-1` and then
+/// `n-1 .. 1 0`, keeping each column's own fastest sample.
+///
+/// **This is the fix for the one ratio the harness never balanced.** [`abba_min`] removed the
+/// position bias from the C-vs-C++ pair in 2026-08-05 and measured, on byte-identical sources, that
+/// the second slot cost **+5.0% and +17.3%** on the two `colsum` rows. It was wired into
+/// `bench_c_cpp*` only. The Wukong column stayed the FIRST timed region of every section - the
+/// coldest, quietest slot - and the Wukong-over-peer ratio is precisely the ratio the campaign
+/// checklist states every target in. A 17.3% positional advantage is larger than the entire deficit
+/// on more than twenty of the sixty-seven recorded losses, so those starting values were not
+/// established and the true gaps are LARGER than they were reported to be, not smaller. The bias
+/// pointed our way, which is the only reason it survived a year of reading.
+///
+/// The schedule is [`round_order`]`(n, 0)` then [`round_order`]`(n, 1)` - a forward pass and its
+/// exact reverse. Column `i` therefore sits at position `i` in one pass and `n-1-i` in the other, so
+/// every column's positions sum to exactly `n-1`: the balance is arithmetic, not statistical, and is
+/// pinned by `round_order_balances_positions_exactly_over_each_pair`. This is the counterbalanced
+/// (reversal / Williams-design) ordering that experimental design uses to cancel a monotone
+/// carry-over effect, and it is the same remedy Mytkowicz et al. prescribe for measurement bias in
+/// ASPLOS 2009 "Producing Wrong Data Without Doing Anything Obviously Wrong!" - randomize or
+/// counterbalance the dimension you cannot hold fixed. Here that dimension is the slot.
+///
+/// EVERY column gets exactly two slots, deliberately. Giving Wukong two and a peer one would trade
+/// one bias for a worse one: a minimum over two samples is systematically below a minimum over one.
+///
+/// The caller must BUILD every column before calling this. That is the second half of the same
+/// defect: `bench_wukong` used to compile-and-time in one call, so Wukong's timed region never had a
+/// gcc process in front of it while every peer's did - the exact hazard [`build_peer`]'s doc says
+/// the build/time split exists to prevent.
+fn abba_min_columns<M: Timed>(
+    n: usize,
+    mut time: impl FnMut(usize) -> Option<M>,
+) -> Vec<Option<M>> {
+    let mut best: Vec<Option<M>> = Vec::with_capacity(n);
+    best.resize_with(n, || None);
+    for round in 0..2 {
+        for i in round_order(n, round) {
+            let sample = time(i);
+            let previous = best[i].take();
+            best[i] = faster(previous, sample);
+        }
+    }
+    best
+}
+
 /// Time an already-loaded 3-pointer peer. Derives the kernel's output pointer from `out` — see the
 /// one-live-pointer law on [`bench_wukong`].
 fn time_peer(
@@ -7593,6 +8124,10 @@ fn bench_wukong4(
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
+    // Dispatch census + persisted source for the non-3-pointer ABIs too - see
+    // `announce_dispatch`. Recognized kernels are gate-blind, and int8 GEMM, bf16
+    // reductions and the half-output streaming rows are all recognizer-dependent.
+    let _ = announce_dispatch(src, &program, &interner);
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
@@ -7682,6 +8217,10 @@ fn bench_wukong_i8(src: &str, out: &mut [i32], ap: *const u8, bp: *const i8) -> 
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
+    // Dispatch census + persisted source for the non-3-pointer ABIs too - see
+    // `announce_dispatch`. Recognized kernels are gate-blind, and int8 GEMM, bf16
+    // reductions and the half-output streaming rows are all recognizer-dependent.
+    let _ = announce_dispatch(src, &program, &interner);
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
@@ -7775,6 +8314,10 @@ fn bench_wukong_bf16(
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
+    // Dispatch census + persisted source for the non-3-pointer ABIs too - see
+    // `announce_dispatch`. Recognized kernels are gate-blind, and int8 GEMM, bf16
+    // reductions and the half-output streaming rows are all recognizer-dependent.
+    let _ = announce_dispatch(src, &program, &interner);
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
@@ -7868,6 +8411,10 @@ fn bench_wukong_halfout(
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
+    // Dispatch census + persisted source for the non-3-pointer ABIs too - see
+    // `announce_dispatch`. Recognized kernels are gate-blind, and int8 GEMM, bf16
+    // reductions and the half-output streaming rows are all recognizer-dependent.
+    let _ = announce_dispatch(src, &program, &interner);
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
@@ -8056,6 +8603,42 @@ type MklGetMaxThreadsFn = unsafe extern "C" fn() -> i32;
 // ABI mismatch (garbage output) by reporting a large rel error, in which case the column is dropped.
 type VmlUnaryFn = unsafe extern "C" fn(i64, *const f32, *mut f32);
 
+// ILP64 GEMV `cblas_sgemv_64(layout, trans, m, n, alpha, a, lda, x, incx, beta, y, incy)`. Same
+// interface-layer reasoning as `cblas_sgemm_64` above: the enums stay 32-bit `int`, the dimensions
+// and strides are 64-bit `MKL_INT`, and resolving the `_64` spelling sidesteps mkl_rt's default
+// interface layer (which is ILP64 on this Anaconda build - the plain `cblas_sgemv` would be misread).
+type CblasSgemvFn = unsafe extern "C" fn(
+    i32,
+    i32,
+    i64,
+    i64,
+    f32,
+    *const f32,
+    i64,
+    *const f32,
+    i64,
+    f32,
+    *mut f32,
+    i64,
+);
+
+// Out-of-place matrix transposition `MKL_Somatcopy(ordering, trans, rows, cols, alpha, a, lda, b,
+// ldb)`. Two spelling traps here, both measured against the installed mkl_rt.2.dll rather than
+// guessed, and the first one is a hard crash:
+//
+//  * CAMELCASE, BY VALUE. The lowercase `mkl_somatcopy` is the Fortran BY-REFERENCE binding, so
+//    calling it by value makes it dereference `alpha` as a pointer: it faults reading
+//    0x000000003F800000, which is the bit pattern of 1.0f. That is exactly the trap already
+//    recorded above for `mkl_set_num_threads` vs `MKL_Set_Num_Threads`. It cost one narrow test
+//    (STATUS_ACCESS_VIOLATION 0xC0000005) instead of a measured round.
+//  * NO `_64` SPELLING EXISTS, and none is needed. oneMKL declares the ?omatcopy family with
+//    `size_t` extents, so the widths are 64-bit on x64 whichever interface layer mkl_rt selects -
+//    unlike CBLAS, where the `_64` symbol is mandatory on this build.
+//
+// `ordering`/`trans` are C `char`s: 'R' row-major, 'T' transpose.
+type MklSomatcopyFn =
+    unsafe extern "C" fn(i8, i8, usize, usize, f32, *const f32, usize, *mut f32, usize);
+
 /// Resolved oneMKL entry points. Function pointers are `Copy + Send + Sync`; the backing library is
 /// leaked (`mem::forget`) so the pointers stay valid for the whole process. The VML ops are optional
 /// (`None` if the symbol is absent) — they peer Wukong's vectorized transcendentals against Intel's
@@ -8067,6 +8650,10 @@ struct MklApi {
     vs_exp: Option<VmlUnaryFn>,
     vs_ln: Option<VmlUnaryFn>,
     vs_tanh: Option<VmlUnaryFn>,
+    /// `cblas_sgemv_64` - the library bar for the `gemv` family, which had none.
+    sgemv: Option<CblasSgemvFn>,
+    /// `mkl_somatcopy` - the library bar for the `transpose` family, which had none.
+    somatcopy: Option<MklSomatcopyFn>,
     path: PathBuf,
 }
 
@@ -8144,6 +8731,19 @@ fn mkl() -> Option<&'static MklApi> {
             let vs_exp = vml(b"vsExp\0");
             let vs_ln = vml(b"vsLn\0");
             let vs_tanh = vml(b"vsTanh\0");
+            // Optional, exactly like the VML ops: an older MKL or a stripped redist may omit them,
+            // and the column then reads `n/a` the same way a missing toolchain does. Added
+            // 2026-09-13 because 143 of the 155 measured sections had NO library-grade peer at all
+            // while the DLL that ships the exact primitive was already resident in this process -
+            // a win over a hand-written gcc loop is not a win over the state of the art.
+            let sgemv = lib
+                .get::<CblasSgemvFn>(b"cblas_sgemv_64\0")
+                .ok()
+                .map(|s| *s);
+            let somatcopy = lib
+                .get::<MklSomatcopyFn>(b"MKL_Somatcopy\0")
+                .ok()
+                .map(|s| *s);
             MklApi {
                 sgemm,
                 set_threads,
@@ -8151,6 +8751,8 @@ fn mkl() -> Option<&'static MklApi> {
                 vs_exp,
                 vs_ln,
                 vs_tanh,
+                sgemv,
+                somatcopy,
                 path,
             }
         };
@@ -8216,6 +8818,134 @@ fn bench_mm_mkl_rect(
             0.0,
             c.as_mut_ptr(),
             ldc,
+        );
+    });
+    Some(Measure {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: c.to_vec(),
+    })
+}
+
+/// Time oneMKL's `cblas_sgemv` for `y[M] = A[M,N].x[N]`, row-major, pinned to `threads` MKL threads.
+/// `None` when MKL is absent or the symbol did not resolve - the column then prints `n/a`.
+fn bench_gemv_mkl(
+    m: usize,
+    n: usize,
+    threads: i32,
+    a: &[f32],
+    x: &[f32],
+    y: &mut [f32],
+) -> Option<Measure> {
+    let api = mkl()?;
+    let sgemv = api.sgemv?;
+    let (mi, ni) = (m as i64, n as i64);
+    unsafe {
+        (api.set_threads)(threads.max(1));
+    }
+    y.iter_mut().for_each(|v| *v = 0.0);
+    let yp = y.as_mut_ptr();
+    let ns_per_call = time_ns(|| unsafe {
+        sgemv(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            mi,
+            ni,
+            1.0,
+            a.as_ptr(),
+            ni,
+            x.as_ptr(),
+            1,
+            0.0,
+            yp,
+            1,
+        );
+    });
+    Some(Measure {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: y.to_vec(),
+    })
+}
+
+/// Time oneMKL's `MKL_Somatcopy` for `dst = src^T`, row-major, pinned to `threads` MKL threads.
+///
+/// `src` is `[rows, cols]` with `lda = cols`; `dst` is `[cols, rows]` with `ldb = rows`, which is
+/// exactly the layout every peer in `bench_transpose` writes (`d[j*rows + i] = s[i*cols + j]`).
+/// A transposition is a permutation, so the caller checks this column for BIT equality like the
+/// others and drops it on any disagreement.
+fn bench_transpose_mkl(
+    rows: usize,
+    cols: usize,
+    threads: i32,
+    src: &[f32],
+    dst: &mut [f32],
+) -> Option<Measure> {
+    let api = mkl()?;
+    let somatcopy = api.somatcopy?;
+    unsafe {
+        (api.set_threads)(threads.max(1));
+    }
+    dst.iter_mut().for_each(|v| *v = 0.0);
+    let dp = dst.as_mut_ptr();
+    let ns_per_call = time_ns(|| unsafe {
+        somatcopy(
+            b'R' as i8,
+            b'T' as i8,
+            rows,
+            cols,
+            1.0,
+            src.as_ptr(),
+            cols,
+            dp,
+            rows,
+        );
+    });
+    Some(Measure {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: dst.to_vec(),
+    })
+}
+
+/// Time oneMKL's `cblas_sgemm` for the weight-gradient shape `C[M,N] = A^T . B`, with A stored
+/// `[K, M]` and B stored `[K, N]` row-major - the layout `bench_matmul_tn` uses.
+///
+/// [`bench_mm_mkl_rect`] hardcodes `CBLAS_NO_TRANS` for A and only parameterises `transb`, so the
+/// TN shape needs its own wrapper rather than an enum swap. Same resolved `cblas_sgemm_64`, so
+/// there is no new symbol and no new ABI risk.
+fn bench_mm_mkl_tn(
+    m: usize,
+    k: usize,
+    n: usize,
+    threads: i32,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) -> Option<Measure> {
+    let api = mkl()?;
+    let (mi, ni, ki) = (m as i64, n as i64, k as i64);
+    unsafe {
+        (api.set_threads)(threads.max(1));
+    }
+    c.iter_mut().for_each(|v| *v = 0.0);
+    let cp = c.as_mut_ptr();
+    let ns_per_call = time_ns(|| unsafe {
+        (api.sgemm)(
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            mi,
+            ni,
+            ki,
+            1.0,
+            a.as_ptr(),
+            mi, // A is [K, M] row-major: its leading dimension is M
+            b.as_ptr(),
+            ni, // B is [K, N] row-major
+            0.0,
+            cp,
+            ni,
         );
     });
     Some(Measure {
@@ -10055,18 +10785,55 @@ mod tests {
             SRC.len()
         );
         let scan = &SRC[..end];
-        // Helpers that legitimately hold a bare C-ext `bench_external*` call: the pair helpers
-        // (which add the C++ column themselves) and the relaxed-FP column helpers.
-        const HELPERS: &[&str] = &[
+        // Helpers that legitimately hold a bare C-ext `bench_external*` / `build_peer` call: the
+        // PAIR helpers, which add the C++ column themselves, and the relaxed-FP column helpers,
+        // which are a C-only extra column by construction.
+        //
+        // `build_c_cpp` is the build-only half of `bench_c_cpp`, added when six families were
+        // converted to build-every-column-then-rotate; it builds exactly the same two columns and
+        // belongs in the same list. IT WAS MISSING, and this test has been RED on the branch since
+        // that commit — the wave-1 report did not run it and the read-only audit did not either.
+        //
+        // AN EXEMPTION LIST NOBODY CHECKS IS A HOLE. Adding a name here is how this guard would be
+        // silently disabled, so the list is itself asserted below: a pair helper must really build
+        // a `"cpp"` column and a relaxed helper must really be a `_fast` one. Neither exemption can
+        // be granted to a helper that does not earn it.
+        const PAIR_HELPERS: &[&str] = &[
             "bench_c_cpp",
             "bench_c_cpp4",
             "bench_c_cpp_i8",
             "bench_c_cpp_bf16",
             "bench_c_cpp_halfout",
-            "bench_c_fast",
-            "bench_c_fast_idx",
-            "bench_bf16_fast",
+            "build_c_cpp",
         ];
+        const FAST_HELPERS: &[&str] = &["bench_c_fast", "bench_c_fast_idx", "bench_bf16_fast"];
+        let body_of = |name: &str| -> &str {
+            let head = format!("\nfn {name}(");
+            let at = scan
+                .find(&head)
+                .unwrap_or_else(|| panic!("{name} is exempted here but does not exist"));
+            let rest = &scan[at + 1..];
+            let end = rest
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("{name} has no closing brace at column 0"));
+            &rest[..end]
+        };
+        for name in PAIR_HELPERS {
+            let body = body_of(name).replace([' ', '\n'], "");
+            assert!(
+                body.contains("(\"cpp\","),
+                "{name} is exempted from the C/C++ pairing rule as a PAIR helper, but its body \
+                 builds no \"cpp\" column — the exemption is unearned and every caller of it is \
+                 printing a C column with no C++ twin"
+            );
+        }
+        for name in FAST_HELPERS {
+            assert!(
+                name.contains("_fast"),
+                "{name} is exempted as a relaxed-FP C-only column but is not a _fast helper"
+            );
+        }
+        let helpers: Vec<&str> = PAIR_HELPERS.iter().chain(FAST_HELPERS).copied().collect();
         // (byte offset, name) of every top-level `fn …` so an occurrence can be attributed.
         let mut fns: Vec<(usize, &str)> = Vec::new();
         let mut at = 0usize;
@@ -10123,7 +10890,7 @@ mod tests {
                 }
                 c_ext += 1;
                 let f = owner(abs);
-                if HELPERS.contains(&f) {
+                if helpers.contains(&f) {
                     continue;
                 }
                 // The peer name is the 4th argument of BOTH families; `_fast` / `_omp` mark the
@@ -10686,5 +11453,456 @@ mod tests {
             .abs()
                 < 1e-12
         );
+    }
+    // ------------------------------------------------------------------------------------------
+    // P6 instrument-honesty tests (2026-09-13). Every one of these pins a property the harness
+    // silently violated until this commit; none of them time anything.
+    // ------------------------------------------------------------------------------------------
+
+    /// A `Timed` stand-in so the schedule can be tested without running a kernel.
+    #[derive(Clone, Copy, Debug)]
+    struct FakeTimed(f64);
+    impl Timed for FakeTimed {
+        fn ns(&self) -> f64 {
+            self.0
+        }
+    }
+
+    /// `abba_min_columns` must give EVERY column the same two slots, and those slots must sum to
+    /// `n-1` for every column — the arithmetic balance `round_order` proves, now enforced at the
+    /// level a `bench_*` section actually uses.
+    ///
+    /// This is the property whose absence made every published Wukong-over-peer ratio optimistic:
+    /// Wukong was compiled-and-timed in one call, so it always occupied slot 0, and the harness's
+    /// own byte-identical control measured slot 0 worth up to 17.3% on `colsum`.
+    #[test]
+    fn abba_min_columns_gives_every_column_the_same_two_slots() {
+        for n in 1..=12usize {
+            let mut visits: Vec<Vec<usize>> = vec![Vec::new(); n];
+            let mut slot = 0usize;
+            let _ = abba_min_columns(n, |i| {
+                visits[i].push(slot % n);
+                slot += 1;
+                Some(FakeTimed(1.0))
+            });
+            for (col, seen) in visits.iter().enumerate() {
+                assert_eq!(
+                    seen.len(),
+                    2,
+                    "n={n}: column {col} was timed {} time(s), not twice — an unequal slot count \
+                     biases the minimum toward whichever column got more samples",
+                    seen.len()
+                );
+                assert_eq!(
+                    seen[0] + seen[1],
+                    n - 1,
+                    "n={n}: column {col} held slots {seen:?}, which sum to {} rather than {}",
+                    seen[0] + seen[1],
+                    n - 1
+                );
+            }
+        }
+    }
+
+    /// Each column keeps its OWN fastest sample, never another column's, and a column that fails to
+    /// produce a sample stays `None` rather than inheriting a neighbour's.
+    #[test]
+    fn abba_min_columns_keeps_each_column_its_own_minimum() {
+        // Column i reads `10*i + 5` on the forward pass and `10*i + 2` on the reverse one, except
+        // column 2, which never produces a sample at all.
+        let mut pass = 0usize;
+        let mut seen = 0usize;
+        let out = abba_min_columns(4, |i| {
+            if seen == 4 {
+                pass = 1;
+            }
+            seen += 1;
+            if i == 2 {
+                return None;
+            }
+            Some(FakeTimed(
+                10.0 * i as f64 + if pass == 0 { 5.0 } else { 2.0 },
+            ))
+        });
+        assert_eq!(out.len(), 4);
+        for (i, m) in out.iter().enumerate() {
+            if i == 2 {
+                assert!(m.is_none(), "an absent column must stay absent, got {m:?}");
+                continue;
+            }
+            let got = m.expect("present column").0;
+            assert!(
+                (got - (10.0 * i as f64 + 2.0)).abs() < 1e-12,
+                "column {i} kept {got}, not its own minimum {}",
+                10.0 * i as f64 + 2.0
+            );
+        }
+    }
+
+    /// A `Missing` column must consume its position rather than collapsing the rotation, so an
+    /// absent toolchain cannot silently re-bias the columns that DID build.
+    #[test]
+    fn a_missing_column_still_consumes_its_position() {
+        let cols = [
+            Built::Missing,
+            Built::Missing,
+            Built::Missing,
+            Built::Missing,
+        ];
+        let mut order = Vec::new();
+        // `impl Trait` in argument position forbids a turbofish, so the element type is pinned by
+        // the binding instead.
+        let out: Vec<Option<Measure>> = abba_min_columns(cols.len(), |i| {
+            order.push(i);
+            match &cols[i] {
+                Built::Missing => None,
+                _ => unreachable!(),
+            }
+        });
+        assert_eq!(order, vec![0, 1, 2, 3, 3, 2, 1, 0]);
+        assert!(out.iter().all(|m| m.is_none()));
+    }
+
+    /// The six position-balanced families must not contain a compile-and-time call any more, and
+    /// EVERY timed region in them must be inside a rotation.
+    ///
+    /// SOURCE-TEXT SCAN, in the style of `every_generated_c_kernel_declares_restrict`, because this
+    /// is a drift guard and not an algorithm: `bench_wukong` / `bench_c_cpp` / `bench_external` /
+    /// `bench_c_fast` all build AND time in one call, so a single one of them reappearing inside a
+    /// converted body silently puts one column back in a fixed slot with a compiler spawn in front
+    /// of the others — the exact defect the conversion removed, and one no differential or
+    /// invariance gate can see.
+    ///
+    /// EXISTENCE IS NOT ENOUGH. This used to require only that the string `abba_min_columns(`
+    /// appear SOMEWHERE in the body, so a family with two shape loops of which one was converted
+    /// passed while half its rows stayed biased — and a converted family that later grew a second,
+    /// unrotated loop would pass forever. So the scan also pins that `time_built` (the only way a
+    /// built column reaches the clock) appears exactly once per rotation and that every one of
+    /// those calls is lexically inside the `abba_min_columns(...)` statement, and it forbids the
+    /// direct timing entry points that would bypass the rotation altogether.
+    #[test]
+    fn position_balanced_families_build_before_they_time() {
+        let src = include_str!("main.rs");
+        let compile_and_time = [
+            concat!("bench_", "wukong("),
+            concat!("bench_", "c_cpp("),
+            concat!("bench_", "external("),
+            concat!("bench_", "c_fast("),
+        ];
+        // Ways to reach the clock that are NOT a rotation. `abba_min(` is the old two-column
+        // A-B-B-A helper: it balances C against C++ and leaves every other column in a fixed slot,
+        // which is precisely the protocol these six families were converted out of.
+        let bypasses_the_rotation = [
+            concat!("time_", "wukong("),
+            concat!("time_", "peer("),
+            concat!("time_", "peer4("),
+            concat!("time_", "ns("),
+            concat!("abba_", "min("),
+        ];
+        for family in [
+            "fn bench_matmul_tn(",
+            "fn bench_gemv(",
+            "fn bench_transpose(",
+            "fn bench_colsum(",
+            "fn bench_biasadd(",
+            "fn bench_colstat(",
+        ] {
+            let start = src
+                .find(family)
+                .unwrap_or_else(|| panic!("{family} not found in main.rs"));
+            // A top-level `fn` body ends at the next line that is exactly `}`.
+            let rest = &src[start..];
+            let end = rest
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("{family} has no closing brace at column 0"));
+            let body = &rest[..end];
+            let rotations = body.matches("abba_min_columns(").count();
+            assert!(
+                rotations >= 1,
+                "{family} no longer times its columns through abba_min_columns: its Wukong column \
+                 is back in a fixed slot"
+            );
+            for needle in compile_and_time {
+                assert!(
+                    !body.contains(needle),
+                    "{family} calls `{needle}` — that helper compiles AND times in one call, which \
+                     forces its column into a fixed slot and puts a compiler spawn between two \
+                     timed regions. Use build_wukong/build_c_cpp/build_peer + abba_min_columns."
+                );
+            }
+            for needle in bypasses_the_rotation {
+                assert!(
+                    !body.contains(needle),
+                    "{family} calls `{needle}` — that times a column outside the rotation, so its \
+                     slot is fixed. Put the column in the `Built` array and time it through \
+                     abba_min_columns."
+                );
+            }
+            let timed = body.matches("time_built(").count();
+            assert_eq!(
+                timed, rotations,
+                "{family} has {timed} time_built call(s) against {rotations} abba_min_columns \
+                 rotation(s): one shape loop was converted and another was not, so half this \
+                 family's rows still carry the slot advantage"
+            );
+            // ...and each of them is inside its rotation's own statement, not merely nearby.
+            let mut cursor = 0usize;
+            while let Some(rel) = body[cursor..].find("time_built(") {
+                let at = cursor + rel;
+                let before = &body[..at];
+                let rotation = before.rfind("abba_min_columns(");
+                assert!(
+                    rotation.is_some_and(|r| !before[r..].contains(';')),
+                    "{family}: the `time_built(` at byte {at} of the body is not inside an \
+                     abba_min_columns(...) call, so that column is timed in a fixed slot"
+                );
+                cursor = at + 1;
+            }
+        }
+    }
+
+    /// An in-process library column (oneMKL) must go through the SAME rotation as a JIT'd or
+    /// DLL-loaded one. It is the column most easily left out: it needs no build step, so the
+    /// obvious place to put it is at the end of the section, in the worst slot - which biases the
+    /// row in Wukong's favour, the exact direction this workstream exists to remove.
+    #[test]
+    fn a_direct_library_column_is_timed_in_the_rotation_like_any_other() {
+        // Returns a falling time on each visit, so "kept its own minimum" is checkable.
+        let visits = std::cell::Cell::new(0u32);
+        let cols = [
+            Built::Direct(Box::new(|out: &mut [f32]| {
+                visits.set(visits.get() + 1);
+                out[0] = visits.get() as f32;
+                Some(Measure {
+                    compile: Duration::ZERO,
+                    ns_per_call: 100.0 - visits.get() as f64,
+                    out: out.to_vec(),
+                })
+            })),
+            Built::Missing,
+        ];
+        let mut buf = vec![0.0f32; 1];
+        let timed = abba_min_columns(cols.len(), |i| {
+            // SAFETY-adjacent: a Direct column never reads the two input pointers, and this test
+            // exists to pin that. `time_built` hands them straight to the closure's ABI-free path.
+            time_built(&cols[i], &mut buf, std::ptr::null(), std::ptr::null())
+        });
+        assert_eq!(
+            visits.get(),
+            2,
+            "the library column must get exactly two slots"
+        );
+        let m = timed[0]
+            .as_ref()
+            .expect("a Direct column produces a measurement");
+        assert!(
+            (m.ns_per_call - 98.0).abs() < 1e-12,
+            "kept {} rather than its own minimum 98.0",
+            m.ns_per_call
+        );
+        assert!(timed[1].is_none());
+    }
+
+    /// The dispatch census must actually find the recognized kernels in printed MIR, and must not
+    /// invent one where there is none. Recognized kernels are gate-blind, so this line is the only
+    /// evidence a measured row carries about WHAT it timed.
+    ///
+    /// A NAME THAT IS NOT A CALL TARGET MUST NOT BE COUNTED. `wukong_mir::print` emits
+    /// `func_addr <name>` for a taken function address and `fn <name>(...)` for every definition;
+    /// the census used to scan for the bare substring `wukong_`, so any of those would have been
+    /// counted as a dispatch and the attribution line on a measured row would have overstated what
+    /// the program called.
+    #[test]
+    fn kernel_census_counts_recognized_calls() {
+        let mir = "v3 = call wukong_colsum_f32(v0, v1)\n\
+                   v4 = call wukong_colsum_f32(v0, v2)\n\
+                   v5 = call wukong_parallel_for(v4)\n";
+        assert_eq!(
+            kernel_census(mir),
+            vec![
+                ("wukong_colsum_f32".to_string(), 2),
+                ("wukong_parallel_for".to_string(), 1)
+            ]
+        );
+        assert!(kernel_census("v0 = fadd v1, v2\n").is_empty());
+        // Every non-call shape the MIR printer can put a `wukong_` name in.
+        assert!(
+            kernel_census(
+                "fn wukong_colsum_f32(v0 ptr) -> void {\n    \
+                 v1 = func_addr wukong_colsum_f32\n    \
+                 v2 = global_addr wukong_colsum_f32\n}\n"
+            )
+            .is_empty(),
+            "a definition, a func_addr and a global_addr are not dispatches"
+        );
+    }
+
+    /// Compile a `.wk` source the way [`build_wukong`] does, up to the printed MIR, with no JIT.
+    fn printed_mir_for(src: &str) -> String {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(!pd.iter().any(|d| d.is_error()), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(!sd.iter().any(|d| d.is_error()), "sema: {sd:?}");
+        let (mut program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(!ld.iter().any(|d| d.is_error()), "lower: {ld:?}");
+        wukong_opt::optimize(&mut program, 3);
+        wukong_mir::print::print_program(&program, &interner)
+    }
+
+    /// The census against REAL printer output, not a string the test wrote itself.
+    ///
+    /// The unit case above validates the scanner in isolation, which is exactly the blindness the
+    /// audit named: a census that disagrees with `wukong_mir::print::print_program` — by counting a
+    /// name the printer emits somewhere other than a call — still passes it. This drives the same
+    /// pipeline `build_wukong` drives, on a generated source the harness actually times, and pins
+    /// the two invariants that matter: every name reported is a call target in that text, and the
+    /// census total is exactly the number of `call wukong_` sites, never more.
+    #[test]
+    fn kernel_census_agrees_with_real_printed_mir() {
+        let mir = printed_mir_for(&wk_colsum(256, 256, false));
+        let census = kernel_census(&mir);
+        assert!(
+            !census.is_empty(),
+            "colsum lowered to no runtime-kernel call at all, so the dispatch line a measured \
+             colsum row carries would be empty. MIR:\n{mir}"
+        );
+        let mut total = 0;
+        for (name, n) in &census {
+            assert_eq!(
+                mir.matches(&format!("call {name}(")).count(),
+                *n,
+                "census counted {name} {n} time(s), which is not its call-site count"
+            );
+            total += *n;
+        }
+        assert_eq!(
+            total,
+            mir.matches("call wukong_").count(),
+            "the census total must be exactly the `call wukong_` sites in the printed MIR"
+        );
+    }
+
+    /// A generated `.wk` source must always land in the same file, and two different programs must
+    /// not collide onto one — otherwise the persisted source does not identify the timed row.
+    #[test]
+    fn wk_source_names_are_stable_and_distinct() {
+        let a = wk_colsum(1024, 1024, false);
+        let b = wk_colsum(1024, 1024, true);
+        assert_eq!(wk_source_name(&a), wk_source_name(&a));
+        assert_ne!(wk_source_name(&a), wk_source_name(&b));
+        assert!(wk_source_name(&a).starts_with("wk_") && wk_source_name(&a).ends_with(".wk"));
+        // STABLE ACROSS RUNS *AND* ACROSS REVISIONS, which determinism and distinctness alone do
+        // not pin: any hash function whatever satisfies those two, so the audit was right that
+        // there was no realistic mutation of FNV-1a that could fail this test. The name is the
+        // only link between a printed dispatch line and the `.wk` file it names, so a re-spelled
+        // hash silently orphans every source persisted by an earlier run. `af63dc4c8601ec8c` for
+        // "a" is FNV's OWN published 64-bit test vector, so this checks the implementation
+        // against the reference rather than against itself.
+        assert_eq!(wk_source_name("a"), "wk_af63dc4c8601ec8c.wk");
+        assert_eq!(wk_source_name(""), "wk_cbf29ce484222325.wk");
+        assert_eq!(wk_source_name("module bench\n"), "wk_f23e80a4f7082feb.wk");
+    }
+
+    /// The gate a oneMKL transpose column has to survive before it is printed beside a ratio.
+    ///
+    /// The ABI test below proves the binding computes the right values; this proves the SECTION
+    /// path's post-check accepts them and rejects anything else. Its doc claims BIT equality and
+    /// cites `cpp_checked` as its model, and it compared `Vec<f32>` by VALUE - so `-0.0` for `+0.0`
+    /// passed as identical and two identical NaN payloads were REJECTED. A transpose is a
+    /// permutation: neither can happen unless something is wrong, which is exactly when the check
+    /// has to hold. Needs no MKL, so it runs everywhere.
+    #[test]
+    fn a_library_transpose_column_is_held_to_bit_equality() {
+        let m = |v: Vec<f32>| Measure {
+            compile: Duration::ZERO,
+            ns_per_call: 1.0,
+            out: v,
+        };
+        let wuk = Some(m(vec![0.0, 1.0]));
+        assert!(
+            mkl_transpose_exact(&wuk, Some(m(vec![0.0, 1.0])), "t").is_some(),
+            "identical bits must keep the column"
+        );
+        assert!(
+            mkl_transpose_exact(&wuk, Some(m(vec![-0.0, 1.0])), "t").is_none(),
+            "-0.0 for +0.0 is equal by VALUE and different by BITS; a permutation cannot flip a \
+             sign bit, so the column must be dropped"
+        );
+        let nan = Some(m(vec![f32::from_bits(0x7fc0_0001), 1.0]));
+        assert!(
+            mkl_transpose_exact(&nan, Some(m(vec![f32::from_bits(0x7fc0_0001), 1.0])), "t")
+                .is_some(),
+            "two identical NaN payloads are the SAME bits; a value comparison would have dropped \
+             this column"
+        );
+        assert!(
+            mkl_transpose_exact(&nan, Some(m(vec![f32::from_bits(0x7fc0_0002), 1.0])), "t")
+                .is_none(),
+            "two different NaN payloads are a disagreement; a value comparison could not see it"
+        );
+        assert!(
+            mkl_transpose_exact(&wuk, Some(m(vec![0.0])), "t").is_none(),
+            "a length mismatch is a disagreement, not a panic"
+        );
+        assert!(
+            mkl_transpose_exact(&None, Some(m(vec![9.0])), "t").is_some(),
+            "with no Wukong column there is nothing to disagree with"
+        );
+        assert!(mkl_transpose_exact(&wuk, None, "t").is_none());
+    }
+
+    /// The oneMKL bindings added for the previously unpeered families must compute the right thing.
+    ///
+    /// This is an ABI test, not a timing test: mkl_rt on this host defaults to ILP64, so a
+    /// mis-sized dimension is a segfault or garbage rather than a slow number. `mkl_somatcopy` is
+    /// additionally NOT interface-layer dependent (oneMKL declares the ?omatcopy family with
+    /// `size_t`), which is why it is bound without a `_64` suffix — the installed mkl_rt exports no
+    /// `mkl_somatcopy_64` at all. Skips cleanly when MKL is absent, exactly as the columns do.
+    #[test]
+    fn mkl_library_peers_compute_the_right_thing() {
+        let Some(api) = mkl() else {
+            eprintln!("oneMKL not present on this host — skipping the ABI check");
+            return;
+        };
+
+        if api.somatcopy.is_some() {
+            // 2x3 -> 3x2, then a non-square 3x4 so a rows/cols mix-up cannot pass. Every value is
+            // exact in f32, so the bar is bit equality.
+            let src: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+            let mut dst = vec![0.0f32; 6];
+            let m = bench_transpose_mkl(2, 3, 1, &src, &mut dst).expect("MKL_Somatcopy resolved");
+            assert_eq!(m.out, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+            let src: Vec<f32> = (0..12).map(|i| i as f32).collect();
+            let mut dst = vec![0.0f32; 12];
+            let m = bench_transpose_mkl(3, 4, 1, &src, &mut dst).expect("MKL_Somatcopy resolved");
+            assert_eq!(
+                m.out,
+                vec![0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0]
+            );
+        } else {
+            eprintln!("MKL_Somatcopy absent — transpose MKL column will read n/a");
+        }
+
+        if api.sgemv.is_some() {
+            // y = A x, A = [[1,2],[3,4]], x = [1,1]  =>  y = [3, 7]
+            let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+            let x: Vec<f32> = vec![1.0, 1.0];
+            let mut y = vec![0.0f32; 2];
+            let m = bench_gemv_mkl(2, 2, 1, &a, &x, &mut y).expect("sgemv resolved");
+            assert_eq!(m.out, vec![3.0, 7.0]);
+        } else {
+            eprintln!("cblas_sgemv_64 absent — gemv MKL column will read n/a");
+        }
+
+        // C = A^T . B with A stored [K, M] and B stored [K, N], K = M = N = 2.
+        // A = [[1,2],[3,4]] as [K][M]  => A^T = [[1,3],[2,4]]
+        // B = [[5,6],[7,8]] as [K][N]
+        // A^T . B = [[1*5+3*7, 1*6+3*8],[2*5+4*7, 2*6+4*8]] = [[26,30],[38,44]]
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let b: Vec<f32> = vec![5.0, 6.0, 7.0, 8.0];
+        let mut c = vec![0.0f32; 4];
+        let m = bench_mm_mkl_tn(2, 2, 2, 1, &a, &b, &mut c).expect("cblas_sgemm_64 resolved");
+        assert_eq!(m.out, vec![26.0, 30.0, 38.0, 44.0]);
     }
 }
