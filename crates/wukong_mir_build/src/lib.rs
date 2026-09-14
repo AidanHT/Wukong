@@ -32168,6 +32168,215 @@ fn main() -> i32 {
         );
     }
 
+    /// **Every republishing site must taint on an initializer it cannot classify, not skip it.**
+    ///
+    /// `Origin` answers a three-way question and five sites in `alias.rs` read one arm of it with
+    /// an `if let Origin::At(p)`. That silently treats BOTH other arms as "nothing to record", and
+    /// only one of them is: `Fresh` really is nothing, while `Unknown` is *cannot tell*. At a call
+    /// site `Unknown` aliases everything, which is the conservative direction; at a republishing
+    /// site it meant "record nothing, taint nothing, and never enter the name in `view_names`", so
+    /// the name silently became its own root. Opposite directions, one value.
+    ///
+    /// The six spellings below were written as `.wk` programs over the same 4x4 nest as
+    /// `tests/run/alias_matmul_inplace.wk`, compiled and run on the binary before the fix: each
+    /// dispatched `wukong_sgemm` over its own output, identically on interp and native at -O0 and
+    /// -O2. Five printed the out-of-place product `10 14 5 8 …` where the scalar nest says
+    /// `10 14 23 32 …`; the `ArrayRepeat` one printed a different wrong row because its nest runs
+    /// twice over the one buffer. `tests/run/alias_unknown_republish.wk` carries two of them with
+    /// every lane checked.
+    ///
+    /// All five sites now go through `republish_of` and match it exhaustively. Each spelling here
+    /// carries its control, and the controls are of two kinds: the same shape over a buffer nothing
+    /// else names must keep its kernel, and `alloc_f32` — the one `Unknown` producer mapped to
+    /// `Republish::Nothing` on purpose — must keep it too, or every `alloc_*` program in the corpus
+    /// loses its kernels.
+    #[test]
+    fn every_republishing_site_taints_on_an_unclassifiable_initializer() {
+        // Each entry is one site: the program, then [SRC, SPELL, DEST] for the unclassifiable
+        // form and for the control that must still dispatch. Tokens a program does not contain
+        // simply do not substitute.
+        let cases: [(&str, &str, [&str; 3], [&str; 3]); 6] = [
+            (
+                "the struct-COPY arm",
+                "module m
+struct L { w: []f32 }
+fn mm(b: []f32, mut c: []f32, d: []f32, flag: bool) {
+    let s: []f32 = SRC;
+    let l: L = L { w: s };
+    let l2: L = SPELL;
+    for i in 0..4 { for j in 0..4 {
+        let mut t: f32 = 0.0;
+        for k in 0..4 { t = t + l2.w[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = t;
+    } }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut w: []f32 = alloc_f32(16);
+    mm(y, x, w, true);
+    return 0;
+}
+",
+                ["c", "if flag { l } else { l }", "c"],
+                ["d", "l", "c"],
+            ),
+            (
+                "a struct LITERAL's field value",
+                "module m
+struct L { w: []f32 }
+fn mm(b: []f32, mut c: []f32, d: []f32, flag: bool) {
+    let l: L = L { w: SPELL };
+    for i in 0..4 { for j in 0..4 {
+        let mut t: f32 = 0.0;
+        for k in 0..4 { t = t + l.w[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = t;
+    } }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut w: []f32 = alloc_f32(16);
+    mm(y, x, w, true);
+    return 0;
+}
+",
+                ["c", "if flag { c } else { c }", "c"],
+                ["c", "d", "c"],
+            ),
+            (
+                "a destructuring `let`'s initializer",
+                "module m
+fn mm(t: ([]f32, []f32), b: []f32, flag: bool) {
+    let (p, q) = SPELL;
+    let (r, u) = t;
+    for i in 0..4 { for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + p[i*4+k] * b[k*4+j]; }
+        DEST[i*4+j] = s;
+    } }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    mm((x, y), y, true);
+    return 0;
+}
+",
+                ["c", "if flag { t } else { t }", "r"],
+                // The control keeps the SECOND destructuring and only moves the write off `t.0`,
+                // so it proves the `Proj::Tuple` precision rather than the absence of a rule:
+                // `p` is `t.0` and `u` is `t.1`, which `places_may_overlap` separates.
+                ["c", "t", "u"],
+            ),
+            (
+                "an ASSIGNMENT's value",
+                "module m
+fn mm(b: []f32, mut c: []f32, d: []f32, flag: bool) {
+    let mut v: []f32 = d;
+    v = SPELL;
+    for i in 0..4 { for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + v[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = s;
+    } }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut w: []f32 = alloc_f32(16);
+    mm(y, x, w, true);
+    return 0;
+}
+",
+                ["c", "if flag { c } else { c }", "c"],
+                ["c", "alloc_f32(16)", "c"],
+            ),
+            (
+                "an ARRAY LITERAL's element",
+                "module m
+fn mm(b: []f32, mut c: []f32, d: []f32, flag: bool) {
+    let ws: [[]f32; 1] = [SPELL];
+    for w in ws {
+        for i in 0..4 { for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 { s = s + w[i*4+k] * b[k*4+j]; }
+            c[i*4+j] = s;
+        } }
+    }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut w: []f32 = alloc_f32(16);
+    mm(y, x, w, true);
+    return 0;
+}
+",
+                ["c", "if flag { c } else { c }", "c"],
+                ["c", "alloc_f32(16)", "c"],
+            ),
+            (
+                "an ARRAY REPEAT's value",
+                "module m
+fn mm(b: []f32, mut c: []f32, d: []f32, flag: bool) {
+    let ws: [[]f32; 2] = [SPELL; 2];
+    for w in ws {
+        for i in 0..4 { for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 { s = s + w[i*4+k] * b[k*4+j]; }
+            c[i*4+j] = s;
+        } }
+    }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut w: []f32 = alloc_f32(16);
+    mm(y, x, w, true);
+    return 0;
+}
+",
+                ["c", "if flag { c } else { c }", "c"],
+                ["c", "alloc_f32(16)", "c"],
+            ),
+        ];
+
+        let fill = |program: &str, t: [&str; 3]| {
+            program
+                .replace("SRC", t[0])
+                .replace("SPELL", t[1])
+                .replace("DEST", t[2])
+        };
+        for (site, program, aliased_t, control_t) in cases {
+            let aliased = fill(program, aliased_t);
+            assert!(
+                !alias_free_of(&aliased, "mm"),
+                "{site}: an initializer this pass cannot classify may reach the output"
+            );
+            let (prog, diags, interner) = lower(&aliased);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                !prog_calls(&prog, &interner, "wukong_sgemm"),
+                "a GEMM reached through {site} the pass cannot classify must decline, got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+
+            let ok = fill(program, control_t);
+            assert!(
+                alias_free_of(&ok, "mm"),
+                "{site}: the control names no buffer the nest writes"
+            );
+            let (prog, diags, interner) = lower(&ok);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                prog_calls(&prog, &interner, "wukong_sgemm"),
+                "the control for {site} must still dispatch, got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+        }
+    }
+
     /// The scans are NOT gated, and that is a claim about the runtime source, not a grep.
     /// `wukong_cumsum_f32` and `wukong_cum{max,min}_f32` all document "`x` and `out` ... may be
     /// distinct or alias", and their AVX2 rows load a block, scan it in registers and store it

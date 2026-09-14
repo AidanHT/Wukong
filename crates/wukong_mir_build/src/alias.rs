@@ -118,7 +118,11 @@
 //! * an assignment whose value is such a place (`p = &x;`), an array or tuple literal built from
 //!   one, a struct functional update (`Layer { ..other }`), or a struct literal no `let` binds to a
 //!   name. None of those can be attributed to a NAME flow-insensitively, so each taints the
-//!   function outright — the coarse answer, kept for the shapes that have no precise one.
+//!   function outright — the coarse answer, kept for the shapes that have no precise one. Their
+//!   shared gate is [`republishing_value`], and "such a place" is not all of it: a value this pass
+//!   cannot classify at all counts too, because `Republish::Taint` means *cannot tell*. Reading it
+//!   as "no" made `s = if flag { c } else { c };` and `let ws: [[]f32; 1] = [if flag { c } else
+//!   { c }];` dispatch a GEMM over their own output, measured on both backends at -O0 and -O2.
 //! * a name given a view meaning TWICE (`let s: []f32 = c; … let s: []f32 = d;`). Both maps are
 //!   keyed by NAME and last-writer-wins, so the second binding silently re-points every spelling of
 //!   `s` — including the ones textually above it — at the wrong buffer. That taints too, and it
@@ -230,14 +234,32 @@
 //!   c> }` dispatched `wukong_sgemm` with A and C one buffer — `10 14 5 8 …` where the scalar nest
 //!   says `10 14 23 32 …`, on interp and native at -O0 and -O2, in all four spellings (`if`, an
 //!   UN-annotated `match` whose arms are the slice so that `inferred_view` fires alone, a bare
-//!   `{ c }` block, and `loop { break c; }`). A view binding whose initializer is `Unknown` now
-//!   TAINTS unless that `Unknown` came from a CALL, which is the one producer the CALL bullet below
-//!   keeps open deliberately; `origin_unknown_is_a_call` is that distinction. Cost, measured over
-//!   the four-root census: 412 programs unchanged, 0 changed, and `block_d_struct.wk` keeps all
-//!   nine of its GEMMs. This is the same asymmetry the CALL bullet already named one frame down
-//!   ("At a CALL SITE it is still conservative — so it is only the in-body operand test that lets it
-//!   through") and did not generalise to the other `Unknown` producer, which is how the sixth
-//!   instance of this class survived five passes.
+//!   `{ c }` block, and `loop { break c; }`).
+//!
+//!   The view binding was not the only site reading `Unknown` that way. FOUR more did, and every
+//!   one was the same `if let Origin::At(p)` falling through: the struct-COPY arm
+//!   (`let l2: L = if flag { l } else { l };`), a struct LITERAL's field value
+//!   (`L { w: if flag { c } else { c } }`), a destructuring `let`'s initializer
+//!   (`let (p, q) = if flag { t } else { t };`), and [`republishing_value`], which gates the
+//!   `Assign` statement and the four aggregate-literal expression arms — so
+//!   `s = if flag { c } else { c };`, `[if flag { c } else { c }]` and
+//!   `[if flag { c } else { c }; 2]` all escaped. All six of those spellings were RUN, and each
+//!   dispatched `wukong_sgemm` over its own output, identically on interp and native at -O0 and
+//!   -O2. Five printed the out-of-place row above; the `ArrayRepeat` one printed a different wrong
+//!   row, because its nest runs twice over the one buffer.
+//!
+//!   Those five sites, and the for-each iterand added in the same revision, now go through ONE
+//!   three-way classifier, [`republish_of`], and match it exhaustively, so "record nothing" and
+//!   "cannot tell" are separate arms with separate names rather than one `else`. Only a CALL is
+//!   mapped to `Nothing`, because `alloc_f32(n)` is one and the CALL bullet below keeps it open
+//!   deliberately. Cost, measured over the four-root census: 412 programs unchanged, 0 changed,
+//!   and `block_d_struct.wk` keeps all nine of its GEMMs.
+//!
+//!   This is the same asymmetry the CALL bullet already named one frame down ("At a CALL SITE it is
+//!   still conservative — so it is only the in-body operand test that lets it through") and did not
+//!   generalise to the other `Unknown` producer, which is how the sixth instance of this class
+//!   survived five passes — and then how four more SITES of it were found in one sweep, by asking
+//!   the same question at every other consumer of an [`Origin`] in this file.
 //! * CONSERVATIVE. A for-each loop this pass cannot attribute element-by-element taints whenever
 //!   its element could be a buffer: an iterand whose sema type is neither `[T; N]` nor `[]T`
 //!   (`lower_for_array` declines those to an `unsupported` diagnostic today, so no binding exists
@@ -467,12 +489,12 @@ fn project(whole: &Expr, base: &Expr, step: Proj, sema: &SemaResult) -> Origin {
 /// Did this expression's [`Origin::Unknown`] come out of [`origin_of`]'s **call** arm -- i.e. is
 /// it a call whose return type borrows?
 ///
-/// `Unknown` has two producers, and they need opposite treatments in exactly one place: the view
-/// binding in [`scan_body`]. A call is the producer the `# Known limits` CALL bullet deliberately
-/// keeps open, because `alloc_f32(n)` is one and tainting it would taint every `alloc_*` program in
-/// the corpus. Every OTHER producer -- an `if`/`match`/`loop`/block value, a borrowing projection
-/// out of a `Fresh` aggregate -- carries no such cost and must taint. See the `Origin::Unknown` arm
-/// there for what it cost not to.
+/// `Unknown` has two producers, and a REPUBLISHING site needs opposite treatments for them. A call
+/// is the producer the `# Known limits` CALL bullet deliberately keeps open, because `alloc_f32(n)`
+/// is one and tainting it would taint every `alloc_*` program in the corpus. Every OTHER producer
+/// -- an `if`/`match`/`loop`/block value, a borrowing projection out of a `Fresh` aggregate --
+/// carries no such cost and must taint. [`republish_of`] is the one caller, and its doc says what
+/// it cost not to draw this line.
 ///
 /// [`origin_of`] peels `Cast` and the three borrow/deref `Unary` operators BEFORE it classifies, so
 /// this peels the same three; peeling a different set would answer about a different expression
@@ -486,6 +508,50 @@ fn origin_unknown_is_a_call(e: &Expr) -> bool {
             expr,
         } => origin_unknown_is_a_call(expr),
         _ => false,
+    }
+}
+
+/// What a REPUBLISHING site must do with an initializer, as opposed to what a CALL SITE must do
+/// with an argument.
+///
+/// [`Origin`] answers a three-way question, and every republishing consumer in this file used to
+/// read one arm of it with an `if let Origin::At(p)`. That silently treats BOTH other arms as
+/// "nothing to record" -- and only one of them is. `Fresh` really is nothing: the initializer built
+/// the storage itself. `Unknown` is *cannot tell*, and at a call site it aliases everything, which
+/// is the conservative direction; at a republishing site the same value meant "record nothing,
+/// taint nothing, and never enter the name in `view_names`", so the name silently became its own
+/// root. That is the OPPOSITE direction, and it shipped at FIVE separate sites: the `let` view
+/// binding, the struct-COPY arm, a struct literal's field value, a destructuring `let`'s
+/// initializer, and [`republishing_value`], which gates the `Assign` statement and the four
+/// aggregate-literal expression arms. Every one of the five was executed on the binary as a live
+/// wrong answer -- a recognized GEMM dispatched over an output aliasing its own A operand, on
+/// interp and native alike at -O0 and -O2. The sixth consumer, the for-each iterand, already took
+/// the coarse answer and is routed here so that there is one rule rather than five plus a habit.
+///
+/// This enum exists so that mistake cannot be respelled: a site matches it exhaustively, and the
+/// arm it must not forget has a name.
+enum Republish {
+    /// The initializer names storage reachable from this place. Record the view.
+    At(Place),
+    /// Storage nobody else holds, or a call. Record nothing, taint nothing.
+    Nothing,
+    /// Cannot tell. Taint.
+    Taint,
+}
+
+/// The one classifier every republishing site in this file uses.
+///
+/// A CALL is the single `Unknown` producer mapped to `Nothing` rather than `Taint`, and it is
+/// deliberate: `alloc_f32(n)` returns `[]f32`, so [`origin_of`] classifies it `Unknown` through the
+/// call arm, and tainting it would cost every `alloc_*` program in the corpus its kernels. That
+/// exemption is the `# Known limits` CALL bullet, and [`origin_unknown_is_a_call`] is where it
+/// lives.
+fn republish_of(e: &Expr, sema: &SemaResult) -> Republish {
+    match origin_of(e, sema) {
+        Origin::At(p) => Republish::At(p),
+        Origin::Fresh => Republish::Nothing,
+        Origin::Unknown if origin_unknown_is_a_call(e) => Republish::Nothing,
+        Origin::Unknown => Republish::Taint,
     }
 }
 
@@ -897,8 +963,9 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                     // initializer is a buffer-shaped place rather than falling through silently the
                     // way the `let else` this replaced did.
                     _ => {
-                        out.opaque_republish |= matches!(origin_of(e, sema), Origin::At(_))
-                            && sema.types.get(&e.id).is_some_and(ty_is_buffer_param);
+                        out.opaque_republish |=
+                            !matches!(republish_of(e, sema), Republish::Nothing)
+                                && sema.types.get(&e.id).is_some_and(ty_is_buffer_param);
                         return;
                     }
                 };
@@ -914,18 +981,18 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                 });
                 let inferred_view = sema.types.get(&e.id).is_some_and(ty_is_borrowing);
                 if annotated_view || inferred_view {
-                    match origin_of(e, sema) {
+                    match republish_of(e, sema) {
                         // The map serves both tests: a CALL SITE spelled with the view's name
                         // resolves back onto the storage it views, and so does an OPERAND spelled
                         // with it.
-                        Origin::At(p) => {
+                        Republish::At(p) => {
                             let rebinding = out.republished.note_view(*name, p);
                             out.opaque_republish |= rebinding;
                         }
                         // Storage the initializer built itself -- an aggregate literal, or an
                         // aggregate return arriving through the sret ABI. Nobody else holds it, so
                         // the binding publishes no second name and there is nothing to record.
-                        Origin::Fresh => {}
+                        Republish::Nothing => {}
                         // `Unknown` means the OPPOSITE thing HERE that it means on the argument
                         // path, and that asymmetry was a live wrong answer. At a call site
                         // `Unknown` aliases everything, which is conservative. In a view binding it
@@ -951,7 +1018,7 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                         // taint would cost the corpus, because `alloc_f32(n)` is one
                         // (`# Known limits`, the CALL bullet). Everything else taints, and the
                         // four-root census measures that at zero programs changed.
-                        Origin::Unknown => out.opaque_republish |= !origin_unknown_is_a_call(e),
+                        Republish::Taint => out.opaque_republish = true,
                     }
                     return;
                 }
@@ -965,20 +1032,33 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                 // field, exactly like the literal below, so `l2.w -> l.w -> sa -> c` is one chain
                 // the resolver already walks.
                 if let Some(Ty::Named(sname)) = sema.types.get(&e.id) {
-                    if let Origin::At(p) = origin_of(e, sema) {
-                        let mut publishes = false;
-                        for (fname, fty) in struct_fields(*sname, sema) {
-                            if !ty_is_borrowing(fty) {
-                                continue;
+                    match republish_of(e, sema) {
+                        Republish::At(p) => {
+                            let mut publishes = false;
+                            for (fname, fty) in struct_fields(*sname, sema) {
+                                if !ty_is_borrowing(fty) {
+                                    continue;
+                                }
+                                let mut q = p.clone();
+                                q.proj.push(Proj::Field(*fname));
+                                out.republished.note_field_view(*name, *fname, q);
+                                publishes = true;
                             }
-                            let mut q = p.clone();
-                            q.proj.push(Proj::Field(*fname));
-                            out.republished.note_field_view(*name, *fname, q);
-                            publishes = true;
+                            if publishes {
+                                let rebinding = out.republished.note_struct_local(*name);
+                                out.opaque_republish |= rebinding;
+                            }
                         }
-                        if publishes {
-                            let rebinding = out.republished.note_struct_local(*name);
-                            out.opaque_republish |= rebinding;
+                        Republish::Nothing => {}
+                        // Only a struct with a BORROWING field can republish anything through a
+                        // copy, so a value-only struct copied out of an unclassifiable expression
+                        // still costs nothing. Measured before this arm existed:
+                        // `let l2: L = if flag { l } else { l };` over a nest spelling `l2.w`
+                        // dispatched `wukong_sgemm` with A and C one buffer.
+                        Republish::Taint => {
+                            out.opaque_republish |= struct_fields(*sname, sema)
+                                .iter()
+                                .any(|(_, t)| ty_is_borrowing(t));
                         }
                     }
                 }
@@ -996,11 +1076,20 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                 attributed.insert(e.id);
                 let mut publishes = false;
                 for fi in fields {
-                    if sema.types.get(&fi.value.id).is_some_and(ty_is_borrowing) {
-                        if let Origin::At(p) = origin_of(&fi.value, sema) {
+                    if !sema.types.get(&fi.value.id).is_some_and(ty_is_borrowing) {
+                        continue;
+                    }
+                    match republish_of(&fi.value, sema) {
+                        Republish::At(p) => {
                             out.republished.note_field_view(*name, fi.name.sym, p);
                             publishes = true;
                         }
+                        Republish::Nothing => {}
+                        // `let l: L = L { w: if flag { c } else { c } };` -- the field really does
+                        // view `c`, and `attributed` has already told the generic `StructLit`
+                        // expression arm below not to look at this literal, so nothing else would
+                        // catch it. Measured: it dispatched over a nest spelling `l.w`.
+                        Republish::Taint => out.opaque_republish = true,
                     }
                 }
                 // Once per `let`, not once per field: one literal names one local, and registering
@@ -1024,7 +1113,7 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
             // WHICH name now reaches that storage is a flow-sensitive question this pass does not
             // answer, so it taints outright rather than guessing.
             StmtKind::Assign { value, .. } => {
-                out.opaque_republish |= borrowing_place(value, sema);
+                out.opaque_republish |= republishing_value(value, sema);
             }
             _ => {}
         },
@@ -1042,14 +1131,14 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                 if attributed.contains(&e.id) {
                     return;
                 }
-                out.opaque_republish |= fields.iter().any(|fi| borrowing_place(&fi.value, sema))
-                    || rest.as_deref().is_some_and(|r| borrowing_place(r, sema));
+                out.opaque_republish |= fields.iter().any(|fi| republishing_value(&fi.value, sema))
+                    || rest.as_deref().is_some_and(|r| republishing_value(r, sema));
             }
             ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
-                out.opaque_republish |= xs.iter().any(|x| borrowing_place(x, sema));
+                out.opaque_republish |= xs.iter().any(|x| republishing_value(x, sema));
             }
             ExprKind::ArrayRepeat { value, .. } => {
-                out.opaque_republish |= borrowing_place(value, sema);
+                out.opaque_republish |= republishing_value(value, sema);
             }
             // A `match` arm PATTERN binds a name onto storage INSIDE the scrutinee -- an enum
             // payload (`E::V(p)`), a tuple element -- and when that storage borrows, the binding is
@@ -1171,11 +1260,24 @@ fn struct_fields(name: Symbol, sema: &SemaResult) -> &[(Symbol, Ty)] {
 /// while `let (p, q) = t; let (r, u) = t;` publishes `p` and `r` onto one place — which is what
 /// dispatched a GEMM over an output aliasing its own A operand with no call site aliasing anything.
 fn note_tuple_pattern(out: &mut BodyScan, pats: &[ast::Pattern], init: &Expr, sema: &SemaResult) {
-    let Origin::At(p) = origin_of(init, sema) else {
-        // A tuple LITERAL is `Fresh` and is tainted by the expression arm if it carries a borrowing
-        // place; a call returning a tuple is `Fresh` too and is a stated hole. Neither is a place,
-        // so neither has a field to name.
-        return;
+    let p = match republish_of(init, sema) {
+        Republish::At(p) => p,
+        // A tuple LITERAL is `Fresh` and is tainted by the expression arm if it carries a
+        // republishing element; a call returning a tuple is `Fresh` too and is a stated hole.
+        // Neither is a place, so neither has a field to name.
+        Republish::Nothing => return,
+        // `let (p, q) = if flag { t } else { t };` -- destructuring something this pass cannot
+        // classify. Gated on the type actually being able to carry a borrowing leaf, so a
+        // `(i32, i32)` destructured out of an `if` still costs nothing. Measured before this arm
+        // existed: it dispatched `wukong_sgemm` over `p` and a second destructuring of the same
+        // tuple.
+        Republish::Taint => {
+            out.opaque_republish |= sema
+                .types
+                .get(&init.id)
+                .is_some_and(|t| ty_contains_borrowing(t, sema, 0));
+            return;
+        }
     };
     let Some(Ty::Tuple(elems)) = sema.types.get(&init.id) else {
         // A destructuring whose element types this pass cannot see: it cannot tell a fat-pointer
@@ -1240,13 +1342,17 @@ fn note_for_each_pattern(out: &mut BodyScan, pat: &ast::Pattern, iter: &Expr, se
         out.opaque_republish |= pattern_binds(pat);
         return;
     };
-    let Origin::At(mut p) = origin_of(iter, sema) else {
-        // Iterating something that is not a place. `Fresh` does NOT mean the elements are fresh —
-        // that is the same "a value carrying borrowed storage is classified by the expression that
-        // produced it" root the `# Known limits` holes are named after — so the coarse answer is
-        // the honest one here.
-        out.opaque_republish = true;
-        return;
+    let mut p = match republish_of(iter, sema) {
+        Republish::At(p) => p,
+        // Iterating something this pass cannot name. `Nothing` does NOT mean the ELEMENTS are
+        // fresh — that is the same "a value carrying borrowed storage is classified by the
+        // expression that produced it" root the `# Known limits` holes are named after — so both
+        // remaining arms take the coarse answer, which is the honest one for an element type that
+        // reached this far.
+        Republish::Nothing | Republish::Taint => {
+            out.opaque_republish = true;
+            return;
+        }
     };
     p.proj.push(Proj::Index);
     let rebinding = out.republished.note_view(*name, p);
@@ -1284,12 +1390,22 @@ fn body_names_one_buffer_twice(scan: &BodyScan) -> bool {
     false
 }
 
-/// Is `e` a *place* whose type borrows — the thing that, stored anywhere, gives one buffer a second
-/// name? `alloc_f32(n)` has a borrowing type but is not a place (it is `Fresh`), so it is not one,
-/// which is why the whole `alloc_*` corpus keeps its kernels.
-fn borrowing_place(e: &Expr, sema: &SemaResult) -> bool {
+/// Is `e` a value that, stored anywhere, gives one buffer a second name? The gate on every coarse
+/// taint: the `Assign` statement and the four aggregate-literal expression arms.
+///
+/// Its type must borrow, and it must be able to reach storage someone else holds. A PLACE (`a`,
+/// `l.w`, `t.0`) does. So does a value this pass cannot classify: `Republish::Taint` means *cannot
+/// tell*, and this predicate used to read it as "no" — `s = if flag { c } else { c };` and
+/// `let ws: [[]f32; 1] = [if flag { c } else { c }];` both dispatched a GEMM over their own output
+/// on interp and native at -O0 and -O2, measured.
+///
+/// `alloc_f32(n)` is the one exemption and it is not the `Fresh` one an earlier version of this
+/// comment claimed: its return type is `[]f32`, which borrows, so [`origin_of`] classifies it
+/// `Unknown` through the CALL arm (the [`Origin::Fresh`] doc says exactly this). [`republish_of`]
+/// maps a call to `Nothing`, which is why the whole `alloc_*` corpus keeps its kernels.
+fn republishing_value(e: &Expr, sema: &SemaResult) -> bool {
     sema.types.get(&e.id).is_some_and(ty_is_borrowing)
-        && matches!(origin_of(e, sema), Origin::At(_))
+        && !matches!(republish_of(e, sema), Republish::Nothing)
 }
 
 /// Does this call site bind two distinct buffer parameters of the callee to overlapping storage?
