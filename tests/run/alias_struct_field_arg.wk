@@ -1,0 +1,136 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+module tests.run.alias_struct_field_arg
+
+// A recognized GEMM whose A ARGUMENT reaches its own C argument through a struct field.
+//
+// `alias.rs` has two resolution paths — an in-body kernel OPERAND and a call-site ARGUMENT — and
+// two maps that record a second name for one buffer: `views` for `let v: []f32 = c;` and
+// `field_views` for `let l = L { w: s };`. Four consecutive revisions of the module each taught one
+// of those paths about one of those maps, and the cell left behind here was the argument path's
+// `field_views` half:
+//
+//     fn go(b, mut c) { let s: []f32 = c; let l: L = L { w: s }; mm(l.w, b, c); }
+//
+// `go` indexes nothing, so its operand set is EMPTY and the in-body test has nothing to compare;
+// the argument path resolved `l.w` through `views` (which does not hold `l`), found the root `l`,
+// read it as a third distinct buffer, left `mm` alias free and dispatched `wukong_sgemm` with
+// A and C one buffer. Both spellings of the chain `l.w -> s -> c` are here: the field read directly,
+// and a second view taken of it (`let v: []f32 = l.w;`), which needs the same resolver to alternate
+// both maps a second time.
+//
+// The expectations are the SCALAR NEST run by hand over these inputs — each `c[i*4+j]` store lands
+// before the later reads of that row — and are the same sixteen values `alias_matmul_inplace.wk`
+// derives for the same `a`/`b`, printed once per spelling. Every lane is printed, per the corpus
+// rule for a recognized kernel: a checksum passes over a buffer that is right in twelve places.
+// Every value is an exact small integer in f32, so an FMA contraction of `s + a*b` cannot move a
+// result and the expectations hold at every -O level and on both backends.
+
+struct L {
+    w: []f32,
+}
+
+fn mm_field(a: []f32, b: []f32, mut c: []f32) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + a[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+// The same nest under a second name, so each spelling below is proved on its own `alias_free` bit:
+// the fact is one bit per FUNCTION, so a single shared callee would let either call site's taint
+// cover for the other.
+fn mm_view(a: []f32, b: []f32, mut c: []f32) {
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + a[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn go_field(b: []f32, mut c: []f32) {
+    let s: []f32 = c;
+    let l: L = L { w: s };
+    mm_field(l.w, b, c);
+}
+
+fn go_view(b: []f32, mut c: []f32) {
+    let s: []f32 = c;
+    let l: L = L { w: s };
+    let v: []f32 = l.w;
+    mm_view(v, b, c);
+}
+
+fn main() -> i32 {
+    let mut x1: []f32 = alloc_f32(16);
+    let mut x2: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        x1[i] = (i + 1) as f32;
+        x2[i] = (i + 1) as f32;
+    }
+    // b = [1 0 2 0; 0 1 0 2; 3 0 1 0; 0 3 0 1] — chosen so the aliased and disjoint answers differ
+    // in twelve of sixteen lanes rather than in one.
+    let mut y: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        y[i] = 0.0;
+    }
+    y[0] = 1.0;
+    y[2] = 2.0;
+    y[5] = 1.0;
+    y[7] = 2.0;
+    y[8] = 3.0;
+    y[10] = 1.0;
+    y[13] = 3.0;
+    y[15] = 1.0;
+
+    go_field(y, x1);
+    for i in 0..16 {
+        print(x1[i] as i32);
+    }
+    go_view(y, x2);
+    for i in 0..16 {
+        print(x2[i] as i32);
+    }
+    return 0;
+}

@@ -80,13 +80,24 @@
 //!
 //! The republishing spellings are:
 //!
-//! * `let v: []T/&T/*T = <place>;` — the view binding above, recorded in `views`. It is used twice
-//!   over: an ARGUMENT spelled `v` must resolve back to `<place>` before the call-site test can see
-//!   the aliasing, and an OPERAND spelled `v` must resolve back to it before the body test can.
+//! * `let v: []T/&T/*T = <place>;` — the view binding above, recorded in `views`. It serves both
+//!   tests: an ARGUMENT spelled `v` must resolve back to `<place>` before the call-site test can
+//!   see the aliasing, and an OPERAND spelled `v` must resolve back to it before the body test can.
+//!   Both go through one function, for the reason the next section gives.
 //! * an aggregate literal field initialised from such a place and bound by a `let`:
 //!   `let l = Layer { wq: swq };` publishes the operand `l.wq`, which `FnLowerer::field_base` names
 //!   with the synthetic symbol `"<local>.<field>"`. `field_views` maps `(l, wq)` onto what `swq`
 //!   views.
+//! * `let l2: Layer = <place>;` — copying a whole struct is NOT covered by the value-semantics
+//!   paragraph below. `emit_copy` walks the fields and sends a `[]T` one to
+//!   `copy_slice_fat_ptr` — the 16-byte view, no element copy — so every borrowing field of the
+//!   source gets a second operand name and each is recorded in `field_views` just as a literal's
+//!   is. The value fields really do deep-copy, and nothing is recorded for them.
+//! * `let (p, q) = <place>;` — a destructuring `let` copies each element, and a borrowing element
+//!   copies as a fat pointer, so `p` is a second name for `t.0`. Recorded in `views` with a
+//!   `Proj::Tuple` step, which keeps it precise: `t.0` and `t.1` cannot overlap, so the ordinary
+//!   spelling publishes two names that do not collide, while destructuring one tuple TWICE
+//!   publishes two that do.
 //! * an assignment whose value is such a place (`p = &x;`), an array or tuple literal built from
 //!   one, a struct functional update (`Layer { ..other }`), or a struct literal no `let` binds to a
 //!   name. None of those can be attributed to a NAME flow-insensitively, so each taints the
@@ -94,8 +105,8 @@
 //! * a name given a view meaning TWICE (`let s: []f32 = c; … let s: []f32 = d;`). Both maps are
 //!   keyed by NAME and last-writer-wins, so the second binding silently re-points every spelling of
 //!   `s` — including the ones textually above it — at the wrong buffer. That taints too, and it
-//!   poisons the name for the call-site half as well ([`BodyScan::note_view_name`]); a name-keyed
-//!   flow-insensitive map has no sound precise answer here.
+//!   poisons the name for the call-site half as well (`republish::ViewMaps::register`); a
+//!   name-keyed flow-insensitive map has no sound precise answer here.
 //!
 //! The other half is the operand vocabulary. A recognizer names a buffer operand in exactly one
 //! syntactic position — the BASE OF AN INDEX — and resolves it with one of two functions:
@@ -108,11 +119,32 @@
 //! every index base, so it is a superset of what any recognizer can name; the function is tainted
 //! only when two DISTINCT operands resolve onto overlapping storage.
 //!
-//! Resolving an operand is a BOUNDED FIXPOINT over the two maps ([`resolve_operand`]), not one pass
-//! over each, because a view can sit on top of a field view: `let v: []f32 = l.wq;` needs the whole
-//! chain `v -> l.wq -> swq -> wq`. Stopping short of it answers `l` — a root no other operand
-//! shares — and that is exactly how a GEMM came to be dispatched over an output aliasing its own A
-//! operand, on both backends, at every `-O` level, after the operand test above was already in.
+//! # One resolver, and why it is a wall rather than a convention
+//!
+//! Resolving a name — an OPERAND or a call-site ARGUMENT, and there is no difference between them
+//! — is a BOUNDED FIXPOINT over BOTH maps (`republish::ViewMaps::resolve`), not one pass over each
+//! and not one map per path. A view can sit on top of a field view (`let v: []f32 = l.wq;` needs
+//! the whole chain `v -> l.wq -> swq -> wq`; stopping short answers `l`, a root no other operand
+//! shares) and a field view can sit on top of a view, so the two must alternate until neither
+//! applies.
+//!
+//! That is a structural claim, and it is the fifth revision of it. There are two resolution PATHS
+//! through this module and two republishing MAPS, and four consecutive revisions each fixed one
+//! cell of that 2x2 and shipped the other three: the operand path walked `views` once; then `views`
+//! to a fixpoint; then `field_views` was added to the operand path and the ARGUMENT path was found
+//! and given `views` alone — the identical omission one frame up, which left
+//! `let s: []f32 = c; let l: L = L { w: s }; let v: []f32 = l.w; mm(v, b, c)` dispatching
+//! `wukong_sgemm` with A and C one buffer. Every surviving cell was that same defect: bit-identical
+//! on interp and native at every `-O` level, which no differential, invariance or determinism gate
+//! in the tree can see.
+//!
+//! A 2x2 has four places for a fifth mistake to live, so the 2x2 is deleted rather than patched.
+//! Both maps are PRIVATE FIELDS of `republish::ViewMaps`; Rust privacy is per-module and a parent
+//! module is not a descendant of its child, so nothing else in this file can read either map and
+//! `republish::ViewMaps::resolve` is the only way to turn a name into a buffer identity. A new
+//! consumer cannot resolve one map and forget the other, because it cannot reach a map at all —
+//! and `tests::the_two_republishing_maps_are_read_in_exactly_one_place` reads this file back and
+//! fails if either map's name appears in code outside the wall.
 //!
 //! That last distinction is not refinement for its own sake. The first cut of this test tainted on
 //! the mere PRESENCE of a view, and the cost landed squarely on the shape the field vocabulary was
@@ -124,10 +156,14 @@
 //! in the ten-part gate compiles that directory. Under the operand test each of those ten names has
 //! exactly ONE operand spelling, nothing overlaps, and the nine GEMMs stand.
 //!
-//! Every other aggregate `let` deep-copies (`emit_copy`, "the local owns its storage (value
-//! semantics)") and publishes nothing, which is why `let b: [f32; 4] = a;` leaves the function
-//! alone. The taint stays one bit for the whole function rather than a per-operand set, for the
-//! same reason the call-site fact is (below).
+//! Every aggregate `let` NOT in the list above deep-copies (`emit_copy`, "the local owns its
+//! storage (value semantics)") and publishes nothing, which is why `let b: [f32; 4] = a;` leaves
+//! the function alone — an `[f32; N]` element really is copied element by element. This sentence
+//! used to read "every OTHER aggregate `let`", full stop, and that was wrong about the one case
+//! `emit_copy` exempts: it sends a `Ty::Slice` field to `copy_slice_fat_ptr`, which moves the
+//! 16-byte view and no elements, so `let l2: Layer = l;` publishes every borrowing field. Measured
+//! as a live wrong answer before the third bullet above existed. The taint stays one bit for the
+//! whole function rather than a per-operand set, for the same reason the call-site fact is (below).
 //!
 //! # Precision, and why the coarseness is affordable
 //!
@@ -150,31 +186,76 @@
 //! them, and that is a weaker claim than "pre-existing holes this pass narrows rather than opens",
 //! which is what this heading used to assert.
 //!
+//! **Every HOLE below was executed, not reasoned about.** Each was written as a `.wk` program over
+//! the same 4x4 nest `tests/run/alias_matmul_inplace.wk` uses and run on the binary this revision
+//! builds; each dispatched `wukong_sgemm` and printed the out-of-place product
+//! `10 14 5 8 …` where the scalar nest says `10 14 23 32 …`, on interp and native at -O0 and -O2.
+//! A bullet that says "cannot arrive that way" without that test is how the previous revision came
+//! to reassure a reader about a spelling that does arrive: `match e { E::V(p) => … }` over
+//! `enum E { V([]f32) }` was listed as a hole nothing reaches, and it reached it. It is now closed
+//! (the CONSERVATIVE `match`-binding bullet below), and the rule for this list is: measure, or do
+//! not claim.
+//!
 //! * CONSERVATIVE. A buffer reaching a call through a `match`/`if`/`loop` **expression** value is
 //!   `Unknown`, so it aliases everything — sound, occasionally pessimistic.
-//! * HOLE. A binding introduced by a `match` arm pattern over an aggregate is treated as its own
-//!   storage. Kernel operands do not currently arrive that way.
+//! * CONSERVATIVE. A `match` whose SCRUTINEE type can hold a `[]T`/`*T`/`&T` leaf anywhere inside
+//!   it, and any of whose arm patterns binds a name, taints the function outright. A pattern
+//!   binding reaches into the scrutinee's storage, and the scrutinee itself is `Fresh` (a variant
+//!   constructor's type is the enum, which does not borrow), so there is no chain back to what the
+//!   payload was built from and no precise answer to give. Gated on the declared type, so every
+//!   `match` over a scalar or a C-style enum — which is every `match` in the corpus — costs nothing.
 //! * CONSERVATIVE. Two *different constant* indices into one array (`f(m[0], m[1])`) are treated as
 //!   may-alias, because this pass does not evaluate index expressions.
+//! * CONSERVATIVE. A `let` whose pattern this pass cannot attribute field-by-field taints when its
+//!   initializer is a buffer-shaped place. `Ident` and `Tuple` are attributed precisely and
+//!   `Wildcard`/`Unit` bind nothing, so what reaches the coarse arm today is only the refutable
+//!   patterns a well-formed `let` is never spelled with — two of which (`Or`, `Variant`) do bind
+//!   names where they are legal — plus any future binding pattern, which must never be answered
+//!   "its own storage" by default.
 //! * HOLE. A borrowing binding initialised from a CALL is not treated as a view. `let v: []f32 =
 //!   alloc_f32(n)` is fresh storage and `let v: []f32 = pass_through(a)` is `a`, and this pass
 //!   cannot tell them apart; tainting on the second would taint every `alloc_*` program in the
 //!   corpus, so both are left as their own storage and the slice-returning user function is a
 //!   stated hole. At a CALL SITE it is still conservative — [`origin_of`] classifies such a call
 //!   `Unknown`, which aliases everything — so it is only the in-body operand test that lets it
-//!   through.
-//! * HOLE. An aggregate that **carries** a view into a callee is not seen through: with
-//!   `let l = Layer { w: sa };` (where `sa` views `a`), the call `f(l, a)` classifies `l` and `a` as
-//!   two roots, so `f` stays alias free even though `l.w` and `a` are one buffer. Inside the CALLER
-//!   `field_views` does see it — `l.w` and `a` resolve onto one place, and the caller's own
-//!   recognizers decline — but the fact that crosses the call edge is one bit, which cannot carry
-//!   a per-field map. A real hole, stated rather than argued away.
+//!   through. Measured: `fn mm(b, mut c) { let v: []f32 = pass_through(c); <nest over v and b
+//!   writing c> }` dispatches.
+//! * HOLE. An aggregate passed WHOLE into a callee carries its view across the call edge unseen.
+//!   With `let l = Layer { w: sa };` (where `sa` views `a`), the call `f(l, a)` classifies `l` and
+//!   `a` as two roots, so `f` stays alias free while `l.w` and `a` are one buffer, and a nest inside
+//!   `f` over `x.w` and `y` gets its kernel. The tuple spelling is the same hole: `f((x, y), x)` —
+//!   an argument that is an aggregate LITERAL is `Fresh`, so a callee that destructures it with
+//!   `let (p, q) = t;` reads `p` and `x` as two buffers. Both measured. The fact that crosses a call
+//!   edge is one bit per function, and one bit cannot carry a per-field map.
+//!
+//!   This bullet used to add that inside the caller `field_views` sees it and "the caller's own
+//!   recognizers decline". That sentence is FALSE for exactly the caller that escapes, and it is
+//!   deleted rather than softened. The in-body test compares the operands the caller SPELLS, so a
+//!   caller that indexes nothing — `fn go(a) { let sa: []f32 = a; let l = Layer { w: sa }; f(l, a); }`
+//!   — has an empty operand set, nothing to compare, and declines nothing. A reassurance that holds
+//!   everywhere except the escaping case is worse than no reassurance, because it stops the next
+//!   reader looking.
+//!
+//!   What is closed, and was not before this revision, is the same hazard spelled as an ARGUMENT:
+//!   `f(l.w, a)`, and `f(v, a)` after `let v: []f32 = l.w;`, both resolve through `field_views` now,
+//!   because the argument path and the operand path are one function.
 //! * HOLE. A struct local built by a CALL rather than by a literal (`let l: Layer = make(a);`) has
 //!   no `field_views` entry, so `l.w` is treated as its own storage even if `make` stored one of its
-//!   arguments there. Same root cause as the bullet above.
+//!   arguments there. Measured. Same root cause as the bullet above, and the same root cause as the
+//!   next one: storage crossing a boundary this pass answers `Fresh` at.
 //! * HOLE. Likewise a function returning an aggregate that contains a view: [`origin_of`] calls such
 //!   a return `Fresh` (the sret buffer really is fresh), and only a *borrowing* projection out of it
 //!   (`make().buf`) is demoted to `Unknown` by [`project`].
+//!
+//! Those four holes are ONE root, stated plainly because the next reader deserves the shape rather
+//! than four anecdotes: **a value that carries borrowed storage inside it is classified by the
+//! expression that produced it, and a call or an aggregate literal produces `Fresh`.** Closing them
+//! needs something this pass does not have — either a per-field summary crossing the call edge
+//! (today it is one bit, deliberately, so it cannot be lost at the `@parallel`/probe seams) or an
+//! inter-procedural "which argument does this return borrow from" fact. Neither is a refinement of
+//! what is here; both are a different analysis. Until one exists, these four spellings dispatch a
+//! disjointness-requiring kernel over overlapping storage, exactly as the whole compiler did for
+//! every aliased spelling before this module was written.
 
 use wukong_ast::{self as ast, Block, Expr, ExprKind, ForIter, Module, Stmt, StmtKind};
 use wukong_sema::{DefKind, SemaResult};
@@ -182,6 +263,7 @@ use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Symbol};
 use wukong_types::Ty;
 
 use crate::ty_is_buffer_param;
+use republish::ViewMaps;
 
 /// One step of a place projection. `Index` is deliberately index-value-blind: two indices into one
 /// array are assumed to meet.
@@ -385,15 +467,15 @@ impl AliasFacts {
             //
             // First: can two DIFFERENT operand names in this body reach one buffer?
             let internal_view = scan.opaque_republish || body_names_one_buffer_twice(&scan);
-            // Second: an argument spelled with a view's name has to resolve back onto the storage
-            // it views before the call-site test can see the aliasing.
+            // Second: an argument spelled with a republished name has to resolve back onto the
+            // storage it names before the call-site test can see the aliasing. The SAME function as
+            // the operand path above -- see the wall's own comment for why that is load-bearing and
+            // not tidiness.
             for site in &mut scan.sites {
                 for a in &mut site.args {
-                    *a = resolve_views(
-                        std::mem::replace(a, Origin::Unknown),
-                        &scan.views,
-                        &scan.rebound,
-                    );
+                    *a = scan
+                        .republished
+                        .resolve(std::mem::replace(a, Origin::Unknown));
                 }
             }
 
@@ -462,6 +544,24 @@ enum Operand {
 /// `interner.get`, so an `l.f` whose symbol was never minted comes back `None` there and `Some`
 /// here. Wide is the sound direction: an operand recorded here that no recognizer can name costs at
 /// most a decline, while one missed here is a kernel emitted over storage it does not own.
+impl Operand {
+    /// The syntactic place this spelling names, BEFORE any republishing is resolved. Turning it
+    /// into the storage it really reaches is [`republish::ViewMaps::resolve`]'s job and nothing
+    /// else's.
+    fn place(self) -> Place {
+        match self {
+            Operand::Name(s) => Place {
+                base: s,
+                proj: Vec::new(),
+            },
+            Operand::Field(b, f) => Place {
+                base: b,
+                proj: vec![Proj::Field(f)],
+            },
+        }
+    }
+}
+
 fn operand_of(e: &Expr) -> Option<Operand> {
     match &e.kind {
         ExprKind::Path(p) if p.is_single() => Some(Operand::Name(p.first().sym)),
@@ -473,50 +573,181 @@ fn operand_of(e: &Expr) -> Option<Operand> {
     }
 }
 
+// ---- THE REPUBLISHING WALL -------------------------------------------------------------------
+//
+// This module holds the two maps that record a second name for one buffer, and the ONE function
+// that reads them. It exists to make a specific mistake UNSPELLABLE rather than merely absent.
+//
+// There are two resolution PATHS through this file -- the in-body operand test
+// (`body_names_one_buffer_twice`) and the call-site argument test (`AliasFacts::analyze`) -- and two
+// republishing MAPS (`views` for `let v: []T = <place>;`, `field_views` for
+// `let l = L { w: <place> };`). That is a 2x2, and four consecutive revisions of this module each
+// fixed ONE CELL of it and shipped the other three: the operand path walked `views` once; then
+// `views` to a fixpoint; then the ARGUMENT path was found and given `views` alone, which is the
+// identical omission one frame up. Every cell left behind was the same observable defect -- a
+// recognized GEMM dispatched over an output aliasing its own A operand, bit-identical on interp and
+// native at every `-O` level, which no differential, invariance or determinism gate in the tree can
+// see.
+//
+// A 2x2 has four places for a fifth mistake to live, so the 2x2 is deleted rather than patched.
+// Both maps are PRIVATE FIELDS of `republish::ViewMaps`; Rust privacy is per-module and a parent
+// module is NOT a descendant of its child, so nothing in the rest of `alias.rs` can read either map,
+// and `republish::ViewMaps::resolve` is the only way to turn a spelled name into a buffer identity.
+// A new consumer cannot resolve one map and forget the other, because it cannot reach a map at all.
+// `crate::tests::the_two_republishing_maps_are_read_in_exactly_one_place` additionally reads this
+// file back and fails if either map's name appears in code outside this wall, so the wall cannot be
+// widened by accident either.
+mod republish {
+    use super::{Origin, Place, Proj};
+    use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet, Symbol};
+
+    /// How many links [`ViewMaps::resolve`] will rewrite before giving up. Chains in real code are
+    /// two or three (`v -> l.wq -> swq -> wq` is the deepest this tree spells); the cap exists so a
+    /// `let a = b; let b = a;` cycle the front end would have rejected cannot spin. Exhausting it
+    /// answers `Unknown`, which aliases everything, so the cap errs in the safe direction.
+    const RESOLVE_STEPS: usize = 16;
+
+    /// The republishing facts of one function body: which names are a second spelling of storage
+    /// something else can already reach.
+    ///
+    /// Both maps are keyed by NAME and this pass is flow-insensitive, so both are last-writer-wins;
+    /// `rebound` is what keeps that honest. The fields are private ON PURPOSE -- see the wall
+    /// comment above this module.
+    #[derive(Default)]
+    pub(super) struct ViewMaps {
+        /// `let v: []T/&T/*T = <place>;` -- `v` reaches whatever `<place>` reaches.
+        views: HashMap<Symbol, Place>,
+        /// `let l = Layer { wq: <place>, ... };` -- the operand `l.wq` reaches `<place>`.
+        field_views: HashMap<(Symbol, Symbol), Place>,
+        /// Every name that has been given a view meaning, whether through `views` or as the local of
+        /// a `field_views` entry. Only used to detect the SECOND one -- see [`ViewMaps::register`].
+        view_names: HashSet<Symbol>,
+        /// Names that acquired a view meaning twice; nothing rooted at one of them resolves soundly.
+        rebound: HashSet<Symbol>,
+    }
+
+    impl ViewMaps {
+        /// **The one function in this file that turns a spelled name into a buffer identity.**
+        /// Every consumer goes through it -- the in-body operand test and the call-site argument
+        /// test alike -- and any new consumer must too. That is not a convention: the maps it walks
+        /// are private to this module precisely so that no caller can walk one of them and forget
+        /// the other, which is the mistake four consecutive revisions of this file shipped.
+        ///
+        /// One flat bounded fixpoint over BOTH maps, not a pass over each. A view can sit on top of
+        /// a field view -- `let v: []f32 = l.w;` needs the whole chain `v -> l.w -> sa -> c`, and
+        /// stopping short answers `l`, a root no other operand shares -- and a field view can sit on
+        /// top of a view, so the two have to alternate until neither applies. Each round rewrites
+        /// exactly one link.
+        ///
+        /// `Fresh` and `Unknown` pass through unchanged: neither is a place, so neither has a name
+        /// to resolve.
+        pub(super) fn resolve(&self, o: Origin) -> Origin {
+            let Origin::At(mut p) = o else {
+                return o;
+            };
+            for _ in 0..RESOLVE_STEPS {
+                // A rebound root has no resolution this pass can trust -- the map kept one of the
+                // name's two bindings and which one is a flow-sensitive question -- so it answers
+                // `Unknown`, which aliases everything. That is what keeps BOTH paths honest:
+                // `let s: []f32 = c; mm(s, c); let s: []f32 = d;` would otherwise resolve the
+                // argument `s` to `d`, see two distinct roots, and leave `mm` alias free while both
+                // of its arguments are one array.
+                if self.rebound.contains(&p.base) {
+                    return Origin::Unknown;
+                }
+                if let Some(src) = self.views.get(&p.base) {
+                    if src.base != p.base {
+                        let mut proj = src.proj.clone();
+                        proj.extend(p.proj);
+                        p = Place {
+                            base: src.base,
+                            proj,
+                        };
+                        continue;
+                    }
+                }
+                // Is what we now hold a field this body republished? `field_views` is keyed by the
+                // one-level `(local, field)` pair `buffer_base` can name, so only a LEADING `Field`
+                // step can match it; anything below that step rides along unchanged.
+                if let Some(Proj::Field(f)) = p.proj.first() {
+                    if let Some(src) = self.field_views.get(&(p.base, *f)) {
+                        let mut proj = src.proj.clone();
+                        proj.extend(p.proj.iter().skip(1).cloned());
+                        p = Place {
+                            base: src.base,
+                            proj,
+                        };
+                        continue;
+                    }
+                }
+                return Origin::At(p);
+            }
+            Origin::Unknown
+        }
+
+        /// Record `let v: []T/&T/*T = <src>;`. Returns `true` when `v` already had a view meaning,
+        /// which the caller turns into a taint -- see [`ViewMaps::register`].
+        pub(super) fn note_view(&mut self, name: Symbol, src: Place) -> bool {
+            let rebound = self.register(name);
+            self.views.insert(name, src);
+            rebound
+        }
+
+        /// Record one borrowing field of a struct local: the operand `l.wq` reaches `<src>`.
+        /// Both spellings use it -- the literal `let l = Layer { wq: <src>, ... };` and the copy
+        /// `let l2: Layer = <place>;`, whose borrowing fields keep the source's base pointer.
+        /// Registering the LOCAL is [`ViewMaps::note_struct_local`]'s job, once per `let` rather
+        /// than once per field.
+        pub(super) fn note_field_view(&mut self, local: Symbol, field: Symbol, src: Place) {
+            self.field_views.insert((local, field), src);
+        }
+
+        /// Register the local of a struct `let` -- literal or copy -- that published at least one
+        /// borrowing field. ONCE per `let`, however many it published: counting per field would read
+        /// `Layer { wq: swq, wk: swk }` as a rebinding of `l` and cost `block_d_struct.wk` -- ten
+        /// weights packed into one `Layer` -- every kernel it has. Returns `true` on a rebinding.
+        pub(super) fn note_struct_local(&mut self, local: Symbol) -> bool {
+            self.register(local)
+        }
+
+        /// Note that `name` now has a view meaning, and report whether it already had one.
+        ///
+        /// Both maps are keyed by NAME and this pass is flow-insensitive, so a second binding of a
+        /// name overwrites the first in `views` (and merges into the same local's entries in
+        /// `field_views`); every operand or argument spelled with that name -- including the ones
+        /// textually ABOVE the rebinding -- then resolves onto the wrong buffer.
+        /// `fn mm(b, mut c, d) { let s: []f32 = c; <nest over s and b writing c>; let s: []f32 = d; }`
+        /// resolved the nest's `s` to `d`, found two distinct roots, and dispatched a GEMM writing
+        /// its own A operand. There is no sound precise answer for a name-keyed map here, so the
+        /// coarse one is the honest answer: the caller taints the function, and `rebound`
+        /// additionally poisons the name inside [`ViewMaps::resolve`], so nothing spelled with it
+        /// can resolve into a false disjointness on either path.
+        fn register(&mut self, name: Symbol) -> bool {
+            if self.view_names.insert(name) {
+                return false;
+            }
+            self.rebound.insert(name);
+            true
+        }
+    }
+}
+// ---- END OF THE REPUBLISHING WALL ------------------------------------------------------------
+
 /// Everything one walk of one function body produces.
 #[derive(Default)]
 struct BodyScan {
-    /// `let v: []T/&T/*T = <place>;` — `v` reaches whatever `<place>` reaches.
-    views: HashMap<Symbol, Place>,
-    /// `let l = Layer { wq: <place>, … };` — the operand `l.wq` reaches `<place>`.
-    field_views: HashMap<(Symbol, Symbol), Place>,
-    /// Every name that has been given a view meaning, whether through `views` or as the local of a
-    /// `field_views` entry. Only used to detect the SECOND one — see [`BodyScan::note_view_name`].
-    view_names: HashSet<Symbol>,
-    /// Names that acquired a view meaning twice. Both maps are keyed by NAME and last-writer-wins,
-    /// so nothing spelled with one of these resolves soundly: [`resolve_views`] answers `Unknown`
-    /// for it (which aliases everything) rather than answering the surviving binding.
-    rebound: HashSet<Symbol>,
+    /// The two republishing maps, behind the wall above: the only way to ask what a name reaches is
+    /// `republish::ViewMaps::resolve`, and this field is why no other way exists.
+    republished: ViewMaps,
     /// The base of every `Index` in the body, in [`Operand`]'s vocabulary: exactly the names a
     /// recognizer can hand [`crate::FnLowerer::all_provably_disjoint`], and therefore the only
     /// names two of which can be one nest's operands.
     operands: HashSet<Operand>,
     /// The body republishes storage in a shape this pass cannot attribute to a NAME. Taints the
-    /// function outright — see the module doc.
+    /// function outright -- see the module doc.
     opaque_republish: bool,
     /// Calls made from this body, arguments unresolved.
     sites: Vec<Site>,
-}
-
-impl BodyScan {
-    /// Record that `name` now has a view meaning, and taint the function if it already had one.
-    ///
-    /// `views` and `field_views` are keyed by NAME and this pass is flow-insensitive, so a second
-    /// binding of a name overwrites the first in `views` (and merges into the same local's entries
-    /// in `field_views`); every operand or argument spelled with that name — including the ones
-    /// textually ABOVE the rebinding — then resolves onto the wrong buffer.
-    /// `fn mm(b, mut c, d) { let s: []f32 = c; <nest over s and b writing c>; let s: []f32 = d; }`
-    /// resolved the nest's `s` to `d`, found two distinct roots, and dispatched a GEMM writing its
-    /// own A operand. There is no sound precise answer for a name-keyed map here, so the coarse one
-    /// is the honest answer: the function is tainted, and `rebound` additionally poisons the name so
-    /// a CALL ARGUMENT spelled with it cannot resolve into a false disjointness either
-    /// (`let s: []f32 = c; mm(s, c); let s: []f32 = d;` is the same defect one frame up).
-    fn note_view_name(&mut self, name: Symbol) {
-        if !self.view_names.insert(name) {
-            self.opaque_republish = true;
-            self.rebound.insert(name);
-        }
-    }
 }
 
 /// One walk of one function body. See [`BodyScan`].
@@ -535,8 +766,34 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                 init: Some(e),
                 ..
             } => {
-                let ast::PatKind::Ident(name) = &pat.kind else {
-                    return;
+                let name = match &pat.kind {
+                    ast::PatKind::Ident(n) => n,
+                    // `let (p, q) = <place>;` -- a destructuring `let` copies each element, and a
+                    // BORROWING element copies as a fat pointer, so `p` is a second name for
+                    // `t.0`. Attributable precisely, because `Proj::Tuple` already distinguishes
+                    // `t.0` from `t.1`: `let (p, q) = t;` publishes two names that do NOT overlap
+                    // each other, while destructuring one tuple TWICE publishes two that do -- and
+                    // that second shape dispatched a GEMM over an output aliasing its own A
+                    // operand, in a function no call site aliases anything in.
+                    ast::PatKind::Tuple(pats) => {
+                        note_tuple_pattern(&mut out, pats, e, sema);
+                        return;
+                    }
+                    // Binds nothing, so there is nothing to republish.
+                    ast::PatKind::Wildcard | ast::PatKind::Unit => return,
+                    // The remaining arms are `Int`, `Char`, `Bool`, `Path`, `Range`, `Or` and
+                    // `Variant`. All seven are REFUTABLE, so a `let` should not be spelled with
+                    // one -- but two of them (`Or`, `Variant`) do bind names where they are legal,
+                    // `wukong_sema::bind_pattern` binds them, and a future binding pattern (struct
+                    // destructuring, say) would land here too. This pass must never answer "its own
+                    // storage" for a name it has not seen bound, so the arm taints whenever the
+                    // initializer is a buffer-shaped place rather than falling through silently the
+                    // way the `let else` this replaced did.
+                    _ => {
+                        out.opaque_republish |= matches!(origin_of(e, sema), Origin::At(_))
+                            && sema.types.get(&e.id).is_some_and(ty_is_buffer_param);
+                        return;
+                    }
                 };
                 // A `let` binds a view when the BINDING borrows: written down (`let s: []f32 = a;`)
                 // or inferred from the initializer.
@@ -553,12 +810,39 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                     // The map serves both tests: a CALL SITE spelled with the view's name resolves
                     // back onto the storage it views, and so does an OPERAND spelled with it.
                     if let Origin::At(p) = origin_of(e, sema) {
-                        out.note_view_name(*name);
-                        out.views.insert(*name, p);
+                        let rebinding = out.republished.note_view(*name, p);
+                        out.opaque_republish |= rebinding;
                     }
                     return;
                 }
-                // An aggregate `let` deep-copies every field EXCEPT the borrowing ones: a
+                // `let l2: Layer = <place>;` -- copying a whole struct is NOT covered by the
+                // "value semantics" paragraph in the module doc. `emit_copy` walks the
+                // fields and sends a `[]T` one to `copy_slice_fat_ptr`, which moves the 16-byte
+                // view and not one element, so every borrowing field of the source gets a second
+                // operand name. Measured: `let l: L = L { w: sa }; let l2: L = l;` over a nest
+                // spelling `l2.w` dispatched `wukong_sgemm` with A and C one buffer and printed the
+                // out-of-place product on both backends at -O0 and -O2. Recorded per borrowing
+                // field, exactly like the literal below, so `l2.w -> l.w -> sa -> c` is one chain
+                // the resolver already walks.
+                if let Some(Ty::Named(sname)) = sema.types.get(&e.id) {
+                    if let Origin::At(p) = origin_of(e, sema) {
+                        let mut publishes = false;
+                        for (fname, fty) in struct_fields(*sname, sema) {
+                            if !ty_is_borrowing(fty) {
+                                continue;
+                            }
+                            let mut q = p.clone();
+                            q.proj.push(Proj::Field(*fname));
+                            out.republished.note_field_view(*name, *fname, q);
+                            publishes = true;
+                        }
+                        if publishes {
+                            let rebinding = out.republished.note_struct_local(*name);
+                            out.opaque_republish |= rebinding;
+                        }
+                    }
+                }
+                // An aggregate LITERAL deep-copies every field EXCEPT the borrowing ones: a
                 // `[]T`/`*T`/`&T` field keeps the source's base pointer, so `l.wq` becomes a second
                 // name for it. A functional update (`..other`) publishes fields this pass cannot
                 // enumerate, and a synthesized literal has no id to attribute, so both fall through
@@ -574,7 +858,7 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                 for fi in fields {
                     if sema.types.get(&fi.value.id).is_some_and(ty_is_borrowing) {
                         if let Origin::At(p) = origin_of(&fi.value, sema) {
-                            out.field_views.insert((*name, fi.name.sym), p);
+                            out.republished.note_field_view(*name, fi.name.sym, p);
                             publishes = true;
                         }
                     }
@@ -583,7 +867,8 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                 // it per field would report the second field of `Layer { wq: swq, wk: swk }` as a
                 // rebinding and cost `block_d_struct.wk` every kernel it has.
                 if publishes {
-                    out.note_view_name(*name);
+                    let rebinding = out.republished.note_struct_local(*name);
+                    out.opaque_republish |= rebinding;
                 }
             }
             // `p = &x;` / `s = a;` — a borrowing place stored into a binding that already exists.
@@ -617,6 +902,30 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
             ExprKind::ArrayRepeat { value, .. } => {
                 out.opaque_republish |= borrowing_place(value, sema);
             }
+            // A `match` arm PATTERN binds a name onto storage INSIDE the scrutinee -- an enum
+            // payload (`E::V(p)`), a tuple element -- and when that storage borrows, the binding is
+            // a second name for whatever the payload was built from. `origin_of` calls the variant
+            // constructor `E::V(c)` `Fresh` (its type is the enum, which does not borrow), so there
+            // is no chain from `p` back to `c` to record and the coarse answer is the only honest
+            // one. Measured before this arm existed: `enum E { V([]f32) }` with
+            // `let e: E = E::V(c); match e { E::V(p) => <nest over p and b writing c> }` dispatched
+            // `wukong_sgemm` with A and C one buffer and printed the out-of-place product on interp
+            // and native alike. The module doc used to state this as a hole that "kernel operands do
+            // not currently arrive [through]"; they do.
+            //
+            // Gated on the scrutinee's DECLARED type so the ordinary `match` over a scalar or a
+            // C-style enum -- every `match` in the corpus -- costs nothing: only a type that can
+            // carry a `[]T`/`*T`/`&T` leaf, destructured by a pattern that actually binds, taints.
+            ExprKind::Match { scrutinee, arms } => {
+                if arms.iter().any(|a| pattern_binds(&a.pat))
+                    && sema
+                        .types
+                        .get(&scrutinee.id)
+                        .is_some_and(|t| ty_contains_borrowing(t, sema, 0))
+                {
+                    out.opaque_republish = true;
+                }
+            }
             ExprKind::Call { callee, args, .. } => {
                 let ExprKind::Path(p) = &callee.kind else {
                     return;
@@ -633,6 +942,116 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
         },
     });
     out
+}
+
+/// Does this pattern bind at least one NAME? A literal, a range, a unit-variant path and `_` test
+/// the scrutinee's value and bind nothing, so they republish nothing.
+///
+/// Wildcard-free over `PatKind`, like the two `match`es in the walk below, so a new pattern form is
+/// a compile error here rather than a silent "binds nothing".
+fn pattern_binds(p: &ast::Pattern) -> bool {
+    match &p.kind {
+        ast::PatKind::Ident(_) => true,
+        ast::PatKind::Tuple(subs) | ast::PatKind::Or(subs) => subs.iter().any(pattern_binds),
+        ast::PatKind::Variant { fields, .. } => match fields {
+            ast::VariantPat::Tuple(subs) => subs.iter().any(pattern_binds),
+            ast::VariantPat::Struct(fs) => fs.iter().any(|f| pattern_binds(&f.pat)),
+        },
+        ast::PatKind::Range { lo, hi, .. } => pattern_binds(lo) || pattern_binds(hi),
+        ast::PatKind::Wildcard
+        | ast::PatKind::Unit
+        | ast::PatKind::Int { .. }
+        | ast::PatKind::Char(_)
+        | ast::PatKind::Bool(_)
+        | ast::PatKind::Path(_) => false,
+    }
+}
+
+/// Can a value of this type hold a `[]T`/`*T`/`&T` leaf anywhere inside it — i.e. can destructuring
+/// it hand one of its parts a second name for storage someone else owns?
+///
+/// [`ty_is_borrowing`] answers that for the value ITSELF; this walks into arrays, tuples, struct
+/// fields and enum payloads. The depth cap answers "cannot tell", which here means "taints", so it
+/// errs in the safe direction; Wukong types cannot be recursive by value, so it is insurance rather
+/// than a real bound.
+fn ty_contains_borrowing(t: &Ty, sema: &SemaResult, depth: u32) -> bool {
+    if depth > 8 {
+        return true;
+    }
+    match t {
+        Ty::Slice(_) | Ty::Ptr { .. } | Ty::Ref { .. } => true,
+        Ty::Tuple(elems) => elems
+            .iter()
+            .any(|e| ty_contains_borrowing(e, sema, depth + 1)),
+        Ty::Array { elem, .. } => ty_contains_borrowing(elem, sema, depth + 1),
+        Ty::Named(n) => match sema.defs.lookup(*n).map(|d| &d.kind) {
+            Some(DefKind::Struct(fields)) => fields
+                .iter()
+                .any(|(_, ft)| ty_contains_borrowing(ft, sema, depth + 1)),
+            Some(DefKind::Enum(variants)) => variants.iter().any(|v| {
+                v.payload
+                    .field_tys()
+                    .iter()
+                    .any(|ft| ty_contains_borrowing(ft, sema, depth + 1))
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The declared fields of a named STRUCT, in declaration order. Empty for an enum, for a name
+/// with no resolved definition, and for anything else — all three mean "publishes no field this
+/// pass can attribute", which is what the caller does with an empty list.
+fn struct_fields(name: Symbol, sema: &SemaResult) -> &[(Symbol, Ty)] {
+    match sema.defs.lookup(name).map(|d| &d.kind) {
+        Some(DefKind::Struct(fields)) => fields,
+        _ => &[],
+    }
+}
+
+/// `let (p, q) = <init>;` — record each destructured BORROWING element as a view of its tuple
+/// field.
+///
+/// The value elements are skipped on purpose: `emit_copy` deep-copies an array or a scalar, so such
+/// a binding owns its storage and recording it would cost a dispatch for nothing. A borrowing
+/// element copies as a fat pointer, so it does not.
+///
+/// `Proj::Tuple` makes this PRECISE rather than a taint: `places_may_overlap` separates `t.0` from
+/// `t.1`, so the ordinary `let (p, q) = t;` publishes two names that cannot overlap each other,
+/// while `let (p, q) = t; let (r, u) = t;` publishes `p` and `r` onto one place — which is what
+/// dispatched a GEMM over an output aliasing its own A operand with no call site aliasing anything.
+fn note_tuple_pattern(out: &mut BodyScan, pats: &[ast::Pattern], init: &Expr, sema: &SemaResult) {
+    let Origin::At(p) = origin_of(init, sema) else {
+        // A tuple LITERAL is `Fresh` and is tainted by the expression arm if it carries a borrowing
+        // place; a call returning a tuple is `Fresh` too and is a stated hole. Neither is a place,
+        // so neither has a field to name.
+        return;
+    };
+    let Some(Ty::Tuple(elems)) = sema.types.get(&init.id) else {
+        // A destructuring whose element types this pass cannot see: it cannot tell a fat-pointer
+        // copy from a deep one, so it takes the coarse answer.
+        out.opaque_republish = true;
+        return;
+    };
+    for (i, sub) in pats.iter().enumerate() {
+        let ast::PatKind::Ident(n) = &sub.kind else {
+            // A nested or wildcard sub-pattern. A wildcard binds nothing; anything else binds a
+            // name this pass cannot attribute to one tuple field, so it taints if that field could
+            // be a buffer.
+            if !matches!(sub.kind, ast::PatKind::Wildcard) {
+                out.opaque_republish |= elems.get(i).is_some_and(ty_is_buffer_param);
+            }
+            continue;
+        };
+        if !elems.get(i).is_some_and(ty_is_borrowing) {
+            continue;
+        }
+        let mut q = p.clone();
+        q.proj.push(Proj::Tuple(i as u32));
+        let rebinding = out.republished.note_view(*n, q);
+        out.opaque_republish |= rebinding;
+    }
 }
 
 /// Can two DIFFERENT kernel-operand names in this body reach the same storage?
@@ -654,7 +1073,7 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
 fn body_names_one_buffer_twice(scan: &BodyScan) -> bool {
     let mut by_root: HashMap<Symbol, Vec<Place>> = HashMap::default();
     for op in &scan.operands {
-        let Some(p) = resolve_operand(*op, scan) else {
+        let Origin::At(p) = scan.republished.resolve(Origin::At(op.place())) else {
             return true; // an unresolvable chain is "cannot tell", which is "may overlap"
         };
         let group = by_root.entry(p.base).or_default();
@@ -664,53 +1083,6 @@ fn body_names_one_buffer_twice(scan: &BodyScan) -> bool {
         group.push(p);
     }
     false
-}
-
-/// Walk one operand spelling down to the storage it really names, alternating the two view maps to
-/// a **bounded fixpoint** (capped like [`resolve_views`]; an exhausted cap is `None`, which the
-/// caller reads as "may overlap").
-///
-/// One pass over each map is not enough, and the shortfall is not theoretical: a view OF a struct
-/// field, `let v: []f32 = l.w;`, puts a `views` entry on top of a `field_views` entry. Resolving
-/// `v` through `views` alone yields `l.w`, whose root `l` is a local no other operand shares, so
-/// the chain `v -> l.w -> sa -> c` stopped short and a recognized GEMM was dispatched over an
-/// output that aliased its own A operand — the same wrong answer on both backends at every `-O`
-/// level, which is the one thing this module exists to prevent. Each round resolves views to their
-/// own fixpoint and then takes at most one `field_views` step, so a chain with k `field_views`
-/// links costs k + 1 rounds.
-fn resolve_operand(op: Operand, scan: &BodyScan) -> Option<Place> {
-    let mut p = match op {
-        Operand::Name(s) => Place {
-            base: s,
-            proj: Vec::new(),
-        },
-        Operand::Field(b, f) => Place {
-            base: b,
-            proj: vec![Proj::Field(f)],
-        },
-    };
-    for _ in 0..8 {
-        let Origin::At(q) = resolve_views(Origin::At(p), &scan.views, &scan.rebound) else {
-            return None;
-        };
-        p = q;
-        // Is what we now hold a field this body republished? `field_views` is keyed by the
-        // one-level `(local, field)` pair `buffer_base` can name, so only a LEADING `Field` step
-        // can match it; anything below that step rides along unchanged.
-        let Some(Proj::Field(f)) = p.proj.first() else {
-            return Some(p);
-        };
-        let Some(src) = scan.field_views.get(&(p.base, *f)) else {
-            return Some(p);
-        };
-        let mut proj = src.proj.clone();
-        proj.extend(p.proj.iter().skip(1).cloned());
-        p = Place {
-            base: src.base,
-            proj,
-        };
-    }
-    None
 }
 
 /// Is `e` a *place* whose type borrows — the thing that, stored anywhere, gives one buffer a second
@@ -751,38 +1123,6 @@ fn both_root_at_buffer_params(a: &Origin, b: &Origin, caller: &FnInfo) -> bool {
     };
     let is_param = |s: Symbol| caller.buffer_params.iter().any(|(_, n)| *n == s);
     is_param(ra) && is_param(rb)
-}
-
-/// Rewrite a place rooted at a slice/pointer view back onto the storage it views, transitively
-/// (bounded, so a `let a = b; let b = a;` cycle the front end would have rejected cannot spin).
-///
-/// A root in `rebound` has no resolution this pass can trust — the map kept one of its two bindings
-/// and which one is a flow-sensitive question — so it answers `Unknown`, which aliases everything.
-/// That is what keeps the CALL-SITE half honest: `let s: []f32 = c; mm(s, c); let s: []f32 = d;`
-/// would otherwise resolve the argument `s` to `d`, see two distinct roots, and leave `mm` alias
-/// free while both of its arguments are one array.
-fn resolve_views(o: Origin, views: &HashMap<Symbol, Place>, rebound: &HashSet<Symbol>) -> Origin {
-    let Origin::At(mut p) = o else {
-        return o;
-    };
-    for _ in 0..8 {
-        if rebound.contains(&p.base) {
-            return Origin::Unknown;
-        }
-        let Some(src) = views.get(&p.base) else {
-            return Origin::At(p);
-        };
-        if src.base == p.base {
-            return Origin::At(p);
-        }
-        let mut proj = src.proj.clone();
-        proj.extend(p.proj);
-        p = Place {
-            base: src.base,
-            proj,
-        };
-    }
-    Origin::Unknown
 }
 
 // ---- AST walk -------------------------------------------------------------------------------

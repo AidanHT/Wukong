@@ -31398,6 +31398,54 @@ fn main() -> i32 {
         );
     }
 
+    /// **The two republishing maps must be read in exactly ONE place**, and that has to be a
+    /// property of the FILE, not of what today's code happens to do.
+    ///
+    /// `alias.rs` has two resolution paths (an in-body operand, a call-site argument) and two maps
+    /// (`views`, `field_views`). Four consecutive revisions of it each fixed one cell of that 2x2
+    /// and shipped the other three, and every surviving cell was the same wrong answer: a
+    /// recognized GEMM dispatched over an output aliasing its own A operand, bit-identical on
+    /// interp and native at every `-O` level, invisible to every differential, invariance and
+    /// determinism gate in the tree. The fix was not to patch the fourth cell but to put both maps
+    /// behind a module wall with a single reader, so "resolved one map but not the other, on one
+    /// path but not the other" stops being expressible.
+    ///
+    /// Rust's own privacy enforces most of that: a parent module is not a descendant of its child,
+    /// so nothing outside `mod republish` can touch a private field. This test covers what privacy
+    /// does not \u2014 someone widening the wall (`pub(super) views`, an accessor, a second copy of a
+    /// map on `BodyScan`) to make a new consumer compile. An invariant nobody checks is the next
+    /// pass's defect.
+    #[test]
+    fn the_two_republishing_maps_are_read_in_exactly_one_place() {
+        let src = include_str!("alias.rs");
+        let open = src
+            .find("mod republish {")
+            .expect("alias.rs must still declare the republishing wall as `mod republish`");
+        let close = src[open..]
+            .find("// ---- END OF THE REPUBLISHING WALL")
+            .map(|i| i + open)
+            .expect("the republishing wall must still be closed by its END marker");
+        // The prose outside the wall names both maps on purpose \u2014 the module doc is where the 2x2
+        // is explained \u2014 so only CODE counts. `alias.rs` holds no string literal containing `//`,
+        // so truncating each line at the first one is exact.
+        let outside: String = src[..open]
+            .lines()
+            .chain(src[close..].lines())
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in ["field_views", "view_names", "rebound", ".views"] {
+            assert!(
+                !outside.contains(needle),
+                "`{needle}` appears in alias.rs CODE outside the republishing wall. Both maps and \
+                 the rebound-name set are private to `mod republish` so that every consumer has to \
+                 go through `ViewMaps::resolve`, which walks BOTH maps to a fixpoint; a consumer \
+                 that can reach one map directly can forget the other, and that exact omission \
+                 shipped four times on this module."
+            );
+        }
+    }
+
     /// The aggregate-literal spelling of the same hazard, and the precision line the analysis has
     /// to hold — which is where the first cut of this test was wrong.
     ///
@@ -31671,6 +31719,247 @@ fn main() -> i32 {
         assert!(
             prog_calls(&prog, &interner, "wukong_sgemm"),
             "a disjoint call through a view must still dispatch, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // FIFTH and SIXTH variants: the struct-field view spelled as a call ARGUMENT. The two
+        // resolution paths in `alias.rs` -- in-body operand and call-site argument -- and the two
+        // maps -- `views`, `field_views` -- form a 2x2, and the pass that gave the operand path its
+        // `field_views` fixpoint gave the argument path `views` alone, which is the identical
+        // omission one frame up. `go` holds no nest of its own, so its operand set is EMPTY and the
+        // in-body test has nothing to compare: nothing but the argument path can catch this.
+        //
+        //   fn go(b, mut c, d) { let s: []f32 = c; let l: L = L { w: s }; mm(l.w, b, c); }
+        //
+        // dispatched `wukong_sgemm` with A and C one buffer, and so did the same call with the
+        // field re-viewed as `let v: []f32 = l.w; mm(v, b, c)`. Both are the chain
+        // `l.w -> s -> c`, which only a resolver that alternates BOTH maps walks to the end.
+        let field_arg = "module m
+struct L { w: []f32 }
+fn mm(a: []f32, b: []f32, mut c: []f32) {
+    for i in 0..4 { for j in 0..4 {
+        let mut t: f32 = 0.0;
+        for k in 0..4 { t = t + a[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = t;
+    } }
+}
+fn go(b: []f32, mut c: []f32, d: []f32) {
+    let s: []f32 = c;
+    let l: L = L { w: s };
+    ARG
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut w: []f32 = alloc_f32(16);
+    go(y, x, w);
+    return x[0] as i32;
+}
+";
+        // Each of the two spellings, with its own positive control: `mm(.., b, d)` binds three
+        // distinct buffers and MUST keep its kernel, or "declines" is bought by declining
+        // everything.
+        for (spelling, arg, ok_arg) in [
+            ("l.w", "mm(l.w, b, c);", "mm(l.w, b, d);"),
+            (
+                "a view of l.w",
+                "let v: []f32 = l.w;\n    mm(v, b, c);",
+                "let v: []f32 = l.w;\n    mm(v, b, d);",
+            ),
+        ] {
+            let aliased_arg = field_arg.replace("ARG", arg);
+            assert!(
+                !alias_free_of(&aliased_arg, "mm"),
+                "`mm({spelling}, b, c)` hands one buffer twice: {spelling} -> s -> c"
+            );
+            let (prog, diags, interner) = lower(&aliased_arg);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                !prog_calls(&prog, &interner, "wukong_sgemm"),
+                "a GEMM whose A argument is {spelling} over its own output must decline, got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+
+            let ok = field_arg.replace("ARG", ok_arg);
+            assert!(
+                alias_free_of(&ok, "mm"),
+                "`mm({spelling}, b, d)` binds three distinct buffers"
+            );
+            let (prog, diags, interner) = lower(&ok);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                prog_calls(&prog, &interner, "wukong_sgemm"),
+                "a disjoint call through {spelling} must still dispatch, got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+        }
+    }
+
+    /// **Three more republishing spellings, each found by deliberately trying to escape the pass
+    /// and each measured as a live wrong answer on the binary before the arm that closes it.**
+    ///
+    /// The fifth pass's brief was to stop patching cells of a 2x2 and delete it. That done, the
+    /// remaining question is what the republishing VOCABULARY still misses, so each of these was
+    /// written as a `.wk` program over the same 4x4 nest as `tests/run/alias_matmul_inplace.wk`,
+    /// compiled and run: all three dispatched `wukong_sgemm` and printed the out-of-place product
+    /// `10 14 5 8 …` where the scalar nest says `10 14 23 32 …`, identically on interp and native
+    /// at -O0 and -O2.
+    ///
+    /// Every one carries a control that must KEEP its kernel, and the controls are the point: each
+    /// is the same spelling one token away from the aliased form, so "declines" cannot be bought by
+    /// declining the shape.
+    #[test]
+    fn a_struct_copy_a_destructuring_let_and_a_match_binding_republish_too() {
+        // (a) COPYING A STRUCT is not the value-semantics escape the rest of the aggregate rule
+        // relies on. `emit_copy` sends a `Ty::Slice` field to `copy_slice_fat_ptr` — "the 16-byte
+        // view, no element copy" — so `l2.w` is a second name for `l.w`, and both are one-level
+        // operands `buffer_base` can name.
+        let copy = "module m
+struct L { w: []f32 }
+fn mm(a: []f32, b: []f32, mut c: []f32) {
+    let sa: []f32 = SRC;
+    let l: L = L { w: sa };
+    let l2: L = l;
+    for i in 0..4 { for j in 0..4 {
+        let mut t: f32 = 0.0;
+        for k in 0..4 { t = t + l2.w[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = t;
+    } }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut z: []f32 = alloc_f32(16);
+    mm(x, y, z);
+    return 0;
+}
+";
+        let aliased = copy.replace("SRC", "c");
+        assert!(
+            !alias_free_of(&aliased, "mm"),
+            "`l2.w` -> `l.w` -> `sa` -> `c`, which the nest writes"
+        );
+        let (prog, diags, interner) = lower(&aliased);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM over a COPIED struct's view of its own output must decline, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        // One token different: the same four-link chain onto a parameter spelled nowhere else.
+        let ok = copy.replace("SRC", "a");
+        assert!(
+            alias_free_of(&ok, "mm"),
+            "`l2.w` -> `l.w` -> `sa` -> `a`, and `a` is spelled nowhere else"
+        );
+        let (prog, diags, interner) = lower(&ok);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM over a COPIED struct's view of a disjoint parameter must dispatch, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // (b) A DESTRUCTURING `let` recorded nothing at all, so destructuring one tuple TWICE gave
+        // one buffer two operand names — with no call site aliasing anything. The control keeps the
+        // second destructure and only moves the write, so it proves the `Proj::Tuple` precision:
+        // `t.0` and `t.1` cannot overlap, and the ordinary spelling must not lose its kernel.
+        let destructure = "module m
+fn mm(t: ([]f32, []f32), b: []f32) {
+    let (p, q) = t;
+    let (r, u) = t;
+    for i in 0..4 { for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + p[i*4+k] * b[k*4+j]; }
+        DEST[i*4+j] = s;
+    } }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut z: []f32 = alloc_f32(16);
+    mm((x, y), z);
+    return 0;
+}
+";
+        let aliased = destructure.replace("DEST", "r");
+        assert!(
+            !alias_free_of(&aliased, "mm"),
+            "`p` and `r` are both `t.0` — one buffer, two names"
+        );
+        let (prog, diags, interner) = lower(&aliased);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM writing a second destructuring of its own A operand must decline, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        let ok = destructure.replace("DEST", "u");
+        assert!(
+            alias_free_of(&ok, "mm"),
+            "`p` is `t.0` and `u` is `t.1`, which `places_may_overlap` separates"
+        );
+        let (prog, diags, interner) = lower(&ok);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM over two DIFFERENT tuple fields must still dispatch, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // (c) A `match` ARM PATTERN binds a name onto storage inside the scrutinee. The module doc
+        // listed this as a hole that "kernel operands do not currently arrive [through]"; they do,
+        // and a reassurance that is false for the case it covers is worse than none. The control is
+        // the identical program over a SCALAR payload: the rule is gated on the scrutinee's
+        // declared type, so every `match` in the corpus must cost nothing.
+        let matched = "module m
+enum E { V(PAYLOAD), Nil }
+fn mm(a: []f32, b: []f32, mut c: []f32) {
+    let e: E = E::V(MAKE);
+    match e {
+        E::V(p) => {
+            for i in 0..4 { for j in 0..4 {
+                let mut t: f32 = 0.0;
+                for k in 0..4 { t = t + a[i*4+k] * b[k*4+j]; }
+                c[i*4+j] = t;
+            } }
+        }
+        E::Nil => { }
+    }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut z: []f32 = alloc_f32(16);
+    mm(x, y, z);
+    return 0;
+}
+";
+        // The nest here reads `a` and `b` and writes `c` — three distinct parameters — so the ONLY
+        // thing that can decline it is the payload binding, which makes this a clean one-variable
+        // test of the rule rather than of the chain.
+        let borrows = matched.replace("PAYLOAD", "[]f32").replace("MAKE", "c");
+        assert!(
+            !alias_free_of(&borrows, "mm"),
+            "a `match` binding reaches into the scrutinee's storage, and this payload borrows"
+        );
+        let (prog, diags, interner) = lower(&borrows);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a function binding a BORROWING enum payload must decline, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        let scalar = matched.replace("PAYLOAD", "i32").replace("MAKE", "7");
+        assert!(
+            alias_free_of(&scalar, "mm"),
+            "an i32 payload cannot carry a second name for anything"
+        );
+        let (prog, diags, interner) = lower(&scalar);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "binding a SCALAR enum payload must cost no kernel, got {:?}",
             kernel_calls(&prog, &interner)
         );
     }
