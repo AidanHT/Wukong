@@ -2362,11 +2362,8 @@ fn kernel_output_read_by_scalar_load() {
         g[0].iter().any(|v| v.abs() > 1e-3),
         "dL/dw is all zeros — the kernel's output adjoint was never seeded"
     );
-    for (name, got, want) in [
-        ("dw", &g[0], &want_dw),
-        ("dh", &g[1], &want_dh),
-        ("dV", &g[2], &want_dv),
-    ] {
+    // `dw` and `dV` both carry an f32 `exp`, so they get the 3e-3 closed-form band.
+    for (name, got, want) in [("dw", &g[0], &want_dw), ("dV", &g[2], &want_dv)] {
         for (j, (&a, &c)) in got.iter().zip(want.iter()).enumerate() {
             assert!(
                 (a - c).abs() <= 3e-3 + 3e-3 * c.abs(),
@@ -2374,6 +2371,11 @@ fn kernel_output_read_by_scalar_load() {
             );
         }
     }
+    // `dL/dh` is not an approximation of anything: the adjoint of `h[i]` IS the coefficient `V[i]`
+    // the loss loaded, so it must come back exact. Hold it to `assert_close`'s 1e-9 band — the band
+    // wave 1 held it to — and not to the f32-transcendental band above, which on a want of 0.75 is
+    // 5.25e-3 wide and would pass a seeded adjoint off by most of a percent (mutation-checked).
+    assert_close(&g[1], &want_dh, "dL/dh");
 
     // ...and the finite difference over both real inputs (w and V) agrees.
     let fd = fd_grad_f32(&prog, &fwd, &inputs, &[0, 2], 5e-3, &it);
@@ -3234,10 +3236,17 @@ fn loss_sink_in_wrt_still_differentiates() {
 /// Build `vmath(w, w, n, op); s = w[0] + w[1]; out[0] = s` — the activation run IN PLACE, with the
 /// loss reading the result back through scalar loads.
 ///
-/// The scalar-load spelling is what makes the hazard reachable. A kernel-to-kernel tape would trip
-/// the `single()` multi-contribution guard first (the consumer of `out` and the producer's input are
-/// the same buffer, so both claim it), but `diff_load` seeds `buf_adj` WITHOUT claiming a
-/// contribution — so this shape walks straight into the aliased read.
+/// The scalar-load spelling is the cheapest way to REACH the guard — it is not a way past it.
+/// `diff_vmath` returns `Ok(())` and emits nothing unless `buf_adj[out]` is already seeded, so the
+/// forward needs some consumer of `out`, and two scalar loads are the smallest one. They do not
+/// smuggle the aliasing through. `diff_load` seeds `buf_adj` through `grad_target` AND marks the
+/// buffer in `contributed` (the `self.contributed.insert(param)` that closes it in `lib.rs`) — the
+/// same pairing every kernel consumer rule keeps, whether it marks by calling `single()` or, in the
+/// two matmul rules, with a direct `contributed.insert` after the emit. A `buf_adj` seed with no
+/// `contributed` mark on the same buffer does not exist, and that is the invariant the refutation
+/// on the test below rests on. With the in-place guard deleted this shape does NOT read a clobbered
+/// `x`: it fails one line later in `single(x)`, naming the wrong cause. See
+/// `vmath_inplace_activation_declines_loudly` for why the guard is still worth having.
 fn build_vmath_inplace(it: &mut Interner, n: usize, op: i64) -> Fwd {
     let vmath = it.intern("wukong_vmath_f32");
     let mut b = Builder::new(it.intern("vminpl"), MirType::Void);
