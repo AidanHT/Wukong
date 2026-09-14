@@ -1768,10 +1768,14 @@ impl<'a> Sema<'a> {
             return true;
         }
         // Adapted: re-stamp the arm at the merged type `l` so lowering stores it at that width, and
-        // range-check it so the re-stamp cannot mint a `ConstInt` too wide for its own type. Pass
-        // the ARM, not `merge_arm_value(arm)`: the arm is normally a block, whose recorded type is
-        // its tail's, and both have to move together — `retype_adapted_literal` peels the block
-        // exactly as `merge_arm_value` does. Then it is NOT a clash.
+        // range-check it so the re-stamp cannot mint a `ConstInt` too wide for its own type. The
+        // two calls are handed DIFFERENT nodes on purpose. The re-stamp gets the whole ARM, because
+        // the arm is normally a block whose recorded type is its tail's and both have to move
+        // together — `retype_adapted_literal` peels the block itself, exactly as `merge_arm_value`
+        // does. The range check gets the PEELED node, because it dispatches on the expression kind:
+        // a `Block` matches none of its `ArrayLit`/`ArrayRepeat`/`TupleLit` arms, so it falls past
+        // the element-wise recursion and then out at the `Ty::Scalar` guard — and `l` is always an
+        // aggregate here. Handed the arm, it would silently check nothing. Then it is NOT a clash.
         self.retype_adapted_literal(arm, l);
         self.range_check_int_literal(merge_arm_value(arm), l);
         false
