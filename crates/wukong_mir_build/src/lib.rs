@@ -31964,6 +31964,210 @@ fn main() -> i32 {
         );
     }
 
+    /// **Two more republishing spellings, each executed as a live wrong answer on the binary before
+    /// the arm that closes it, and each the exact counterpart of a rule already in the file.**
+    ///
+    /// (d) A view binding whose initializer is a BLOCK-VALUED expression. `let v: []f32 = if flag
+    /// { c } else { c };` IS a view — `let_is_slice` is tested BEFORE the aggregate deep-copy arm,
+    /// so the binding goes to `lower_slice_from_source` and is a genuine fat pointer at `c`'s base
+    /// — but an `if` is not a place, so `origin_of` answered `Unknown`, the `let` arm's
+    /// `if let Origin::At(p)` failed, and the arm returned having recorded nothing, tainted
+    /// nothing, and never entered `v` in `view_names`. `Unknown` therefore meant the OPPOSITE thing
+    /// here that it means at a call site, where it aliases everything. All four spellings are
+    /// tested, and the `match` one is deliberately UN-annotated so that `inferred_view` fires
+    /// alone.
+    ///
+    /// (e) The for-each element binding. `lower_for_array` binds an aggregate element BY POINTER
+    /// into the iterated buffer (`bind_slice(name, elem_ptr, …)`), and a `[]T` element arrives
+    /// there too because a slice's `elem_mir` is its fat pointer, whose MIR shape is an `Array`.
+    /// `scan_body`'s statement arm matched only `Let` and `Assign`, so iterating one array TWICE
+    /// published two operand names for `ws[…]` with nothing recorded — the destructuring `let` one
+    /// vocabulary away.
+    ///
+    /// Both were written as `.wk` programs over the same 4x4 nest as
+    /// `tests/run/alias_matmul_inplace.wk`, compiled and run: both dispatched `wukong_sgemm` and
+    /// printed the out-of-place product `10 14 5 8 …` where the scalar nest says `10 14 23 32 …`,
+    /// identically on interp and native at -O0 and -O2. `tests/run/alias_view_binding_block_value.wk`
+    /// and `tests/run/alias_for_each_element.wk` are those programs.
+    ///
+    /// The controls are the point, and (d)'s are of two kinds, because (d) is a CONSERVATIVE rule
+    /// rather than a precise one: no `if`-valued view binding keeps its kernel, so the controls
+    /// prove instead that the taint is NARROW — a call initializer is exempt (it is the one
+    /// `Unknown` producer the `# Known limits` CALL bullet keeps open, because `alloc_f32` is one),
+    /// an ordinary place view still resolves, and a SCALAR `if` binding costs nothing. (e) IS
+    /// precise, so its controls are the ordinary spellings that must survive it: one loop, two
+    /// loops over two DIFFERENT arrays, and a for-each over a scalar array.
+    #[test]
+    fn a_block_valued_view_binding_and_a_for_each_element_republish_too() {
+        // (d) ---------------------------------------------------------------------------------
+        let blockish = "module m
+fn mm(b: []f32, mut c: []f32, d: []f32, flag: bool) {
+    BIND
+    for i in 0..4 { for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + v[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = s;
+    } }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut w: []f32 = alloc_f32(16);
+    mm(y, x, w, true);
+    return 0;
+}
+";
+        for (what, bind) in [
+            ("an `if`", "let v: []f32 = if flag { c } else { c };"),
+            // No annotation: the binding is a view by the initializer's inferred type alone, which
+            // is the other half of the `annotated_view || inferred_view` test.
+            ("a `match`", "let v = match flag { true => c, _ => c };"),
+            ("a block", "let v: []f32 = { c };"),
+            ("a `loop`", "let v: []f32 = loop { break c; };"),
+        ] {
+            let aliased = blockish.replace("BIND", bind);
+            assert!(
+                !alias_free_of(&aliased, "mm"),
+                "{what}-valued view binding of `c` is a second name for `c`"
+            );
+            let (prog, diags, interner) = lower(&aliased);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                !prog_calls(&prog, &interner, "wukong_sgemm"),
+                "a GEMM over {what}-valued view of its own output must decline, got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+        }
+
+        // The taint must be NARROW. A CALL initializer is the one `Unknown` producer left open on
+        // purpose: `alloc_f32(n)` is one, and tainting it would cost every `alloc_*` program in the
+        // corpus its kernels. An ordinary place view must still resolve. And a SCALAR `if` binding
+        // must cost nothing at all, because the rule is gated on the BINDING borrowing.
+        for (what, bind) in [
+            ("a call", "let v: []f32 = alloc_f32(16);"),
+            ("a place", "let v: []f32 = d;"),
+            (
+                "a scalar `if`",
+                "let n: i32 = if flag { 4 } else { 4 }; print(n); let v: []f32 = d;",
+            ),
+        ] {
+            let ok = blockish.replace("BIND", bind);
+            assert!(
+                alias_free_of(&ok, "mm"),
+                "{what} initializer must not taint: three distinct buffers"
+            );
+            let (prog, diags, interner) = lower(&ok);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                prog_calls(&prog, &interner, "wukong_sgemm"),
+                "a GEMM over a view bound from {what} must still dispatch, got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+        }
+
+        // (e) ---------------------------------------------------------------------------------
+        let foreach = "module m
+fn mm(ws: [[]f32; 1], vs: [[]f32; 1], b: []f32, mut c: []f32) {
+    for w in ws {
+        INNER
+    }
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut z: []f32 = alloc_f32(16);
+    let mut q: []f32 = alloc_f32(16);
+    let ws: [[]f32; 1] = [x];
+    let vs: [[]f32; 1] = [z];
+    mm(ws, vs, y, q);
+    return 0;
+}
+";
+        let nest = |dest: &str| {
+            format!(
+                "for i in 0..4 {{ for j in 0..4 {{
+            let mut s: f32 = 0.0;
+            for k in 0..4 {{ s = s + w[i*4+k] * b[k*4+j]; }}
+            {dest}[i*4+j] = s;
+        }} }}"
+            )
+        };
+
+        // `w` and `u` are both `ws[…]`, which `Proj::Index` cannot separate.
+        let aliased = foreach.replace(
+            "INNER",
+            &format!("for u in ws {{\n            {}\n        }}", nest("u")),
+        );
+        assert!(
+            !alias_free_of(&aliased, "mm"),
+            "`w` and `u` are both `ws[…]` — one buffer, two names"
+        );
+        let (prog, diags, interner) = lower(&aliased);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM writing a second for-each binding of its own A operand must decline, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // The three ordinary spellings, which the `Proj::Index` precision is there to keep. Two
+        // loops over two DIFFERENT arrays is the one that separates "records the element" from
+        // "taints any function with two for-each loops in it".
+        for (what, inner) in [
+            ("one loop", nest("c")),
+            (
+                "two loops over different arrays",
+                format!("for u in vs {{\n            {}\n        }}", nest("u")),
+            ),
+        ] {
+            let ok = foreach.replace("INNER", &inner);
+            assert!(
+                alias_free_of(&ok, "mm"),
+                "{what}: nothing else resolves onto the destination"
+            );
+            let (prog, diags, interner) = lower(&ok);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                prog_calls(&prog, &interner, "wukong_sgemm"),
+                "a GEMM under {what} must still dispatch, got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+        }
+
+        // A for-each over a SCALAR array is the spelling the corpus is full of. The element loads
+        // into a fresh slot — `lower_for_array`'s own "the faithful `let x = a[i]`" — so it owns
+        // its storage and must cost nothing.
+        let scalar_elem = "module m
+fn mm(xs: [f32; 4], a: []f32, b: []f32, mut c: []f32) {
+    for x in xs { print(x as i32); }
+    for i in 0..4 { for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + a[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = s;
+    } }
+}
+fn main() -> i32 {
+    let mut p: []f32 = alloc_f32(16);
+    let mut q: []f32 = alloc_f32(16);
+    let mut r: []f32 = alloc_f32(16);
+    let xs: [f32; 4] = [1.0; 4];
+    mm(xs, p, q, r);
+    return 0;
+}
+";
+        assert!(
+            alias_free_of(scalar_elem, "mm"),
+            "a scalar for-each element is a copy, not a view"
+        );
+        let (prog, diags, interner) = lower(scalar_elem);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a for-each over a scalar array must cost no kernel, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+    }
+
     /// The scans are NOT gated, and that is a claim about the runtime source, not a grep.
     /// `wukong_cumsum_f32` and `wukong_cum{max,min}_f32` all document "`x` and `out` ... may be
     /// distinct or alias", and their AVX2 rows load a block, scan it in registers and store it

@@ -41,8 +41,11 @@
 //! any function is lowered. Wukong is a whole-program compiler: imports are merged before sema,
 //! there are no globals (`ItemKind` has `Const` but no `static`), and a call resolves only through
 //! a single-segment `Path` that names a `DefKind::Fn` — so there are no indirect calls and every
-//! caller of every function is visible. That makes "no call site aliases two of `f`'s buffer
-//! params" a checkable whole-program property rather than an assumption.
+//! caller of every function *in the module* is visible. That makes "no call site aliases two of
+//! `f`'s buffer params" a checkable whole-program property rather than an assumption — for a
+//! program compiled from one root, which is what `--run` and `--emit=exe` build. It is NOT true of
+//! a function entered from OUTSIDE the module, and that boundary is stated as the PREMISE bullet
+//! under `# Known limits` rather than left implied.
 //!
 //! For each call `f(e0, …, en)` the pass classifies each argument's [`Origin`] and asks whether two
 //! of them can be the same storage. A **place** (`x`, `x[i]`, `s.w`, `&x`) carries its root symbol
@@ -98,6 +101,20 @@
 //!   `Proj::Tuple` step, which keeps it precise: `t.0` and `t.1` cannot overlap, so the ordinary
 //!   spelling publishes two names that do not collide, while destructuring one tuple TWICE
 //!   publishes two that do.
+//! * `for w in ws { … }` — the for-each element binding, which is the destructuring `let` one
+//!   vocabulary away. `lower_for_array` binds an AGGREGATE element BY POINTER into the iterated
+//!   buffer (`bind_slice(name, elem_ptr, …)`), and a `[]T` element arrives there too because a
+//!   slice's `elem_mir` is its fat pointer, whose MIR shape is an `Array`; only a SCALAR element
+//!   loads into a fresh slot and owns its storage. Recorded in `views` with a `Proj::Index` step,
+//!   which keeps it precise the same way: ONE loop over `ws` publishes one name and costs nothing
+//!   (`tests/run/for_each_array_of_slices.wk`), while `for w in ws { for u in ws { … } }`
+//!   publishes two names that DO collide. `scan_body`'s `Node::Stmt` arm matched only `Let` and
+//!   `Assign`, so this was a spelling the pass had no word for, and the double loop dispatched
+//!   `wukong_sgemm` with A and C one buffer in a function no call site aliases anything in.
+//!   Measured on the binary before this arm existed. Because `views` is keyed by NAME, a loop
+//!   variable reused for a SECOND borrowing-element loop (`for w in ws { … } for w in vs { … }`)
+//!   registers `w` twice and therefore taints, exactly as a rebound `let` view does — measured, one
+//!   GEMM down to none, and it occurs nowhere in the four-root census.
 //! * an assignment whose value is such a place (`p = &x;`), an array or tuple literal built from
 //!   one, a struct functional update (`Layer { ..other }`), or a struct literal no `let` binds to a
 //!   name. None of those can be attributed to a NAME flow-insensitively, so each taints the
@@ -178,13 +195,15 @@
 //!
 //! # Known limits
 //!
-//! Two kinds, and a reader must not take the list as uniformly safe. The ones marked CONSERVATIVE
+//! Three kinds, and a reader must not take the list as uniformly safe. The ones marked CONSERVATIVE
 //! are places the pass cannot tell and therefore taints: they cost a dispatch and nothing else. The
 //! ones marked HOLE are spellings that DO reach one buffer twice and are still answered "disjoint".
 //! Every hole listed is one the compiler already had before this module existed — it dispatched
 //! every aliased spelling — so none of them is made reachable here; but this module does not close
 //! them, and that is a weaker claim than "pre-existing holes this pass narrows rather than opens",
-//! which is what this heading used to assert.
+//! which is what this heading used to assert. The last entry is marked PREMISE: not a spelling the
+//! pass mishandles, but a boundary on the sentence the whole analysis rests on. It is listed last
+//! because it is the only limit here a reader cannot find by reading this file.
 //!
 //! **Every HOLE below was executed, not reasoned about.** Each was written as a `.wk` program over
 //! the same 4x4 nest `tests/run/alias_matmul_inplace.wk` uses and run on the binary this revision
@@ -196,8 +215,42 @@
 //! (the CONSERVATIVE `match`-binding bullet below), and the rule for this list is: measure, or do
 //! not claim.
 //!
-//! * CONSERVATIVE. A buffer reaching a call through a `match`/`if`/`loop` **expression** value is
-//!   `Unknown`, so it aliases everything — sound, occasionally pessimistic.
+//! * CONSERVATIVE, and it reads in two directions that used to disagree. A buffer reaching a call
+//!   through a `match`/`if`/`loop`/block **expression** value is `Unknown`. On the ARGUMENT path
+//!   `Unknown` aliases everything, which is sound and occasionally pessimistic, and that is all
+//!   this bullet used to say. On the in-body VIEW-BINDING path `Unknown` did the OPPOSITE until
+//!   this revision, and that was a live wrong answer rather than a pessimism.
+//!   `let v: []f32 = if flag { c } else { c };` IS a view: `let_is_slice` is tested BEFORE the
+//!   aggregate deep-copy arm, so the binding goes to `lower_slice_from_source` and is a genuine
+//!   fat-pointer view of whichever arm the merge produced. But an `if` is not a place and its type
+//!   is a buffer param, so `origin_of` fell to its `_` arm and answered `Unknown`, the `let` arm's
+//!   `if let Origin::At(p)` failed, and the arm returned having recorded nothing, tainted nothing
+//!   and never entered `v` in `view_names`. `v` became its own root, and
+//!   `fn mm(b, mut c, flag) { let v: []f32 = if flag { c } else { c }; <nest over v and b writing
+//!   c> }` dispatched `wukong_sgemm` with A and C one buffer — `10 14 5 8 …` where the scalar nest
+//!   says `10 14 23 32 …`, on interp and native at -O0 and -O2, in all four spellings (`if`, an
+//!   UN-annotated `match` whose arms are the slice so that `inferred_view` fires alone, a bare
+//!   `{ c }` block, and `loop { break c; }`). A view binding whose initializer is `Unknown` now
+//!   TAINTS unless that `Unknown` came from a CALL, which is the one producer the CALL bullet below
+//!   keeps open deliberately; `origin_unknown_is_a_call` is that distinction. Cost, measured over
+//!   the four-root census: 412 programs unchanged, 0 changed, and `block_d_struct.wk` keeps all
+//!   nine of its GEMMs. This is the same asymmetry the CALL bullet already named one frame down
+//!   ("At a CALL SITE it is still conservative — so it is only the in-body operand test that lets it
+//!   through") and did not generalise to the other `Unknown` producer, which is how the sixth
+//!   instance of this class survived five passes.
+//! * CONSERVATIVE. A for-each loop this pass cannot attribute element-by-element taints whenever
+//!   its element could be a buffer: an iterand whose sema type is neither `[T; N]` nor `[]T`
+//!   (`lower_for_array` declines those to an `unsupported` diagnostic today, so no binding exists
+//!   — but a widening there must not make the hole silent again), an iterand that is not a PLACE
+//!   (`Fresh` says the aggregate is fresh, never that its elements are), and any binding pattern
+//!   other than `Ident` or `_`. One more, which is a cost this rule ADDS rather than one it
+//!   inherits: `views` is keyed by name, so reusing one loop variable for two borrowing-element
+//!   loops registers it twice and taints the function the same way a rebound `let` view does. Only
+//!   that last one is executed (one GEMM down to none); the three above it are read off their own
+//!   arms rather than run, which for a CONSERVATIVE entry is the direction that cannot produce a
+//!   wrong answer. None of the four occurs in the four-root census. The precise case, which is
+//!   the one the corpus spells, is recorded in `views` with a `Proj::Index` step — see the
+//!   republishing list above.
 //! * CONSERVATIVE. A `match` whose SCRUTINEE type can hold a `[]T`/`*T`/`&T` leaf anywhere inside
 //!   it, and any of whose arm patterns binds a name, taints the function outright. A pattern
 //!   binding reaches into the scrutinee's storage, and the scrutinee itself is `Fresh` (a variant
@@ -245,7 +298,10 @@
 //!   next one: storage crossing a boundary this pass answers `Fresh` at.
 //! * HOLE. Likewise a function returning an aggregate that contains a view: [`origin_of`] calls such
 //!   a return `Fresh` (the sret buffer really is fresh), and only a *borrowing* projection out of it
-//!   (`make().buf`) is demoted to `Unknown` by [`project`].
+//!   (`make().buf`) is demoted to `Unknown` by [`project`]. Since this revision that demotion also
+//!   taints a view BINDING of it (`let v: []f32 = make().buf;` is `Unknown` and is not a call), so
+//!   what is left open here is the operand `l.w` after `let l: Layer = make(a);`, which is `Fresh`
+//!   and never demoted at all.
 //!
 //! Those four holes are ONE root, stated plainly because the next reader deserves the shape rather
 //! than four anecdotes: **a value that carries borrowed storage inside it is classified by the
@@ -256,6 +312,27 @@
 //! what is here; both are a different analysis. Until one exists, these four spellings dispatch a
 //! disjointness-requiring kernel over overlapping storage, exactly as the whole compiler did for
 //! every aliased spelling before this module was written.
+//!
+//! * PREMISE. "Every caller of every function is visible" (`# What the analysis is`) is true of a
+//!   program compiled from ONE root — `--run`, `--emit=exe` — where `load_imports` merges every
+//!   module before sema and no call is indirect. It is FALSE the moment a lowered function is
+//!   entered from outside the module, and this tree has two such doors. `--emit=obj` writes a
+//!   relocatable object whose exported functions anything may link against and call, with no call
+//!   site in the `.wk` source at all. And `wukong_xbench` JIT-compiles each peer `.wk` with
+//!   `jit_module`, pulls `kbench` out by symbol and calls it through a raw `extern "C"` fn pointer
+//!   from Rust — all seven peer sources DECLARE `kbench` and none of them calls it, so `aliasing`
+//!   never names it and every one is alias free BY DEFAULT rather than by proof (the C, C++ and
+//!   Rust peers beside them are entered the same way, `dlopen`'d through `libloading`).
+//!
+//!   Nothing is wrong today, and that is measured rather than assumed: `call_block` derives its 27
+//!   pointers from 27 distinct `Vec`s, so no two arguments of any peer `kbench` are one buffer. But
+//!   "alias free" for such a function means "no call site IN THIS MODULE aliases it", which is a
+//!   strictly weaker claim than the one the rest of this file makes, and a reader who takes
+//!   `AliasFacts::alias_free`'s doc at face value will not find that out here. Closing it needs
+//!   either a declared contract on the entry point or a pessimistic default for functions nothing
+//!   in the module calls — and the second would decline all nine of `block_d_struct.wk`'s GEMMs
+//!   and every kernel in every `--emit=obj` module in the tree, which is why the boundary is stated
+//!   rather than taken.
 
 use wukong_ast::{self as ast, Block, Expr, ExprKind, ForIter, Module, Stmt, StmtKind};
 use wukong_sema::{DefKind, SemaResult};
@@ -387,6 +464,31 @@ fn project(whole: &Expr, base: &Expr, step: Proj, sema: &SemaResult) -> Origin {
     }
 }
 
+/// Did this expression's [`Origin::Unknown`] come out of [`origin_of`]'s **call** arm -- i.e. is
+/// it a call whose return type borrows?
+///
+/// `Unknown` has two producers, and they need opposite treatments in exactly one place: the view
+/// binding in [`scan_body`]. A call is the producer the `# Known limits` CALL bullet deliberately
+/// keeps open, because `alloc_f32(n)` is one and tainting it would taint every `alloc_*` program in
+/// the corpus. Every OTHER producer -- an `if`/`match`/`loop`/block value, a borrowing projection
+/// out of a `Fresh` aggregate -- carries no such cost and must taint. See the `Origin::Unknown` arm
+/// there for what it cost not to.
+///
+/// [`origin_of`] peels `Cast` and the three borrow/deref `Unary` operators BEFORE it classifies, so
+/// this peels the same three; peeling a different set would answer about a different expression
+/// than the one that was classified.
+fn origin_unknown_is_a_call(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Call { .. } => true,
+        ExprKind::Cast { expr, .. }
+        | ExprKind::Unary {
+            op: ast::UnOp::Ref | ast::UnOp::RefMut | ast::UnOp::Deref,
+            expr,
+        } => origin_unknown_is_a_call(expr),
+        _ => false,
+    }
+}
+
 /// One resolved call site: which function, and where each argument's storage came from.
 struct Site {
     callee: Symbol,
@@ -423,6 +525,11 @@ impl AliasFacts {
     /// site in the program, AND `f`'s own body does not give one buffer two names — i.e. a
     /// recognizer inside `f` may rely on two distinct operand symbols being distinct storage.
     /// Conservative: `false` also covers "could not tell".
+    ///
+    /// "At any call site in the program" means at any call site IN THIS MODULE. A function entered
+    /// from outside it -- an `--emit=obj` export, or an `xbench` peer's `kbench` reached through a
+    /// raw fn pointer -- has no call site here at all and is therefore answered `true` by DEFAULT
+    /// rather than by proof. See the PREMISE bullet in the module doc.
     pub(crate) fn alias_free(&self, f: Symbol) -> bool {
         !self.aliasing.contains(&f) && !self.internal_views.contains(&f)
     }
@@ -807,11 +914,44 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                 });
                 let inferred_view = sema.types.get(&e.id).is_some_and(ty_is_borrowing);
                 if annotated_view || inferred_view {
-                    // The map serves both tests: a CALL SITE spelled with the view's name resolves
-                    // back onto the storage it views, and so does an OPERAND spelled with it.
-                    if let Origin::At(p) = origin_of(e, sema) {
-                        let rebinding = out.republished.note_view(*name, p);
-                        out.opaque_republish |= rebinding;
+                    match origin_of(e, sema) {
+                        // The map serves both tests: a CALL SITE spelled with the view's name
+                        // resolves back onto the storage it views, and so does an OPERAND spelled
+                        // with it.
+                        Origin::At(p) => {
+                            let rebinding = out.republished.note_view(*name, p);
+                            out.opaque_republish |= rebinding;
+                        }
+                        // Storage the initializer built itself -- an aggregate literal, or an
+                        // aggregate return arriving through the sret ABI. Nobody else holds it, so
+                        // the binding publishes no second name and there is nothing to record.
+                        Origin::Fresh => {}
+                        // `Unknown` means the OPPOSITE thing HERE that it means on the argument
+                        // path, and that asymmetry was a live wrong answer. At a call site
+                        // `Unknown` aliases everything, which is conservative. In a view binding it
+                        // used to mean "record nothing and taint nothing": the `if let
+                        // Origin::At(p)` this replaced just fell out of the arm, so the name never
+                        // entered `view_names` either and silently became its own root.
+                        //
+                        // `let v: []f32 = if flag { c } else { c };` IS a view. `let_is_slice` is
+                        // tested BEFORE the aggregate deep-copy arm, so the binding goes to
+                        // `lower_slice_from_source` and is a genuine fat-pointer view of whichever
+                        // arm the merge produced. But an `If` is not a place and its type is a
+                        // buffer param, so `origin_of` falls to its `_` arm and answers `Unknown` --
+                        // and `fn mm(b, mut c, flag) { let v: []f32 = if flag { c } else { c };
+                        // <nest over v and b writing c> }` then resolved {v, b, c} onto three
+                        // distinct roots, left `mm` alias free and dispatched `wukong_sgemm` with A
+                        // and C one buffer. Measured on the binary before this arm existed:
+                        // `10 14 5 8 ...` where the scalar nest says `10 14 23 32 ...`, on interp
+                        // and native at -O0 and -O2, in all four spellings -- `if`, an UN-annotated
+                        // `match` whose arms are the slice (so `inferred_view` fires alone), a bare
+                        // `{ c }` block, and `loop { break c; }`.
+                        //
+                        // A CALL is exempt, and only a call: it is the one `Unknown` producer whose
+                        // taint would cost the corpus, because `alloc_f32(n)` is one
+                        // (`# Known limits`, the CALL bullet). Everything else taints, and the
+                        // four-root census measures that at zero programs changed.
+                        Origin::Unknown => out.opaque_republish |= !origin_unknown_is_a_call(e),
                     }
                     return;
                 }
@@ -871,6 +1011,15 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                     out.opaque_republish |= rebinding;
                 }
             }
+            // `for w in ws { ... }` -- the element binding is a VIEW of `ws[...]`, not a copy,
+            // for every element type Wukong does not pass by value. See
+            // [`note_for_each_pattern`]; `scan_body` matched only `Let` and `Assign` here, so a
+            // `for` that binds a name was a republishing spelling this pass had no word for.
+            StmtKind::For {
+                pat,
+                iter: ForIter::Expr(e),
+                ..
+            } => note_for_each_pattern(&mut out, pat, e, sema),
             // `p = &x;` / `s = a;` — a borrowing place stored into a binding that already exists.
             // WHICH name now reaches that storage is a flow-sensitive question this pass does not
             // answer, so it taints outright rather than guessing.
@@ -1052,6 +1201,56 @@ fn note_tuple_pattern(out: &mut BodyScan, pats: &[ast::Pattern], init: &Expr, se
         let rebinding = out.republished.note_view(*n, q);
         out.opaque_republish |= rebinding;
     }
+}
+
+/// `for w in ws { … }` — record the element binding as a view of `ws[…]`.
+///
+/// `lower_for_array` binds an **aggregate** element BY POINTER into the iterated buffer
+/// (`bind_slice(name, elem_ptr, …)`, "exactly as the `a[i]` aggregate read arm does"), and a `[]T`
+/// element arrives there too, because a slice's `elem_mir` is its fat pointer, whose MIR shape is an
+/// `Array`. Only a SCALAR element takes the other branch — "loads into a fresh slot … the faithful
+/// `let x = a[i]`" — and owns its storage. [`ty_is_buffer_param`] is the AST-level spelling of that
+/// split, and it is the WIDE side of it: it additionally covers a `*T`/`&T` element, which the
+/// scalar branch copies by VALUE and which is a second name for the pointee all the same.
+///
+/// `Proj::Index` is deliberately index-blind ([`Proj`]), and that is what makes this precise rather
+/// than a taint: ONE loop over `ws` publishes one name, nothing else resolves onto `ws[…]`, and the
+/// kernel stands — `tests/run/for_each_array_of_slices.wk` is exactly that shape. Iterating one
+/// array TWICE publishes two names that DO overlap, and that shape dispatched `wukong_sgemm` with A
+/// and C one buffer in a function no call site aliases anything in:
+/// `fn mm(ws: [[]f32; 1], b) { for w in ws { for u in ws { <nest over w and b writing u> } } }`
+/// printed the out-of-place product `10 14 5 8 …` where the scalar nest says `10 14 23 32 …`, on
+/// interp and native at -O0 and -O2. It is the destructuring `let` one vocabulary away: `let (p, q)
+/// = t; let (r, u) = t;` publishes two names for `t.0`, and two `for` loops over one array publish
+/// two names for `ws[…]`.
+fn note_for_each_pattern(out: &mut BodyScan, pat: &ast::Pattern, iter: &Expr, sema: &SemaResult) {
+    let (Some(Ty::Array { elem, .. }) | Some(Ty::Slice(elem))) = sema.types.get(&iter.id) else {
+        // `lower_for_array` accepts only those two and declines everything else to the
+        // `unsupported` diagnostic, so no binding is produced today — but this pass must not rest
+        // on that, because a widening there would make the hole silent again.
+        out.opaque_republish |= pattern_binds(pat);
+        return;
+    };
+    if !ty_is_buffer_param(elem) {
+        // A scalar element is a copy: the loop variable is an ordinary mutable local.
+        return;
+    }
+    let ast::PatKind::Ident(name) = &pat.kind else {
+        // `_` binds nothing; anything else binds a name this pass cannot attribute to one element.
+        out.opaque_republish |= pattern_binds(pat);
+        return;
+    };
+    let Origin::At(mut p) = origin_of(iter, sema) else {
+        // Iterating something that is not a place. `Fresh` does NOT mean the elements are fresh —
+        // that is the same "a value carrying borrowed storage is classified by the expression that
+        // produced it" root the `# Known limits` holes are named after — so the coarse answer is
+        // the honest one here.
+        out.opaque_republish = true;
+        return;
+    };
+    p.proj.push(Proj::Index);
+    let rebinding = out.republished.note_view(*name, p);
+    out.opaque_republish |= rebinding;
 }
 
 /// Can two DIFFERENT kernel-operand names in this body reach the same storage?

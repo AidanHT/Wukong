@@ -1,0 +1,201 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+module tests.run.alias_view_binding_block_value
+
+// A view binding whose initializer is a BLOCK-VALUED expression -- `if`, `match`, `{ … }`,
+// `loop`/`break` -- is still a view, and the aliasing pass used to record nothing for it.
+//
+// `let v: []f32 = if flag { c } else { c };` lowers through `lower_slice_from_source`: `let_is_slice`
+// is tested BEFORE the aggregate deep-copy arm, so `v` is a genuine fat pointer at `c`'s base, not a
+// copy. But `alias::origin_of` has no place to give for an `if` -- it is not a path, a field or an
+// index -- so it answered `Unknown`, the `let` arm's `if let Origin::At(p)` failed, and the arm
+// returned having recorded nothing, tainted nothing, and never entered `v` in `view_names`. The
+// operands {v, b, c} then resolved to three distinct roots, `mm` was alias free, and `wukong_sgemm`
+// dispatched with A and C one buffer: it printed the OUT-OF-PLACE product
+// `10 14 5 8 26 30 17 20 42 46 29 32 58 62 41 44` on interp AND native, at -O0 and -O2. Both
+// backends agreeing is why no differential, invariance or determinism gate could see it.
+//
+// All four spellings are here, each in its own function, because the fact is one bit per FUNCTION
+// and a single shared callee would let one spelling's taint cover for another. The `match` arm is
+// deliberately UN-annotated, so that the binding is recognized as a view by the initializer's
+// inferred type alone.
+//
+// The expectations are the SCALAR NEST run by hand over these inputs -- each `c[i*4+j]` store lands
+// before the later reads of that row -- and are the same sixteen values `alias_matmul_inplace.wk`
+// derives for the same `a`/`b`, printed once per spelling. Every lane is printed, per the corpus
+// rule for a recognized kernel: a checksum passes over a buffer that is right in twelve places.
+// Every value is an exact small integer in f32, so an FMA contraction of `s + a*b` cannot move a
+// result and the expectations hold at every -O level and on both backends.
+
+fn mm_if(b: []f32, mut c: []f32, flag: bool) {
+    let v: []f32 = if flag { c } else { c };
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + v[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn mm_match(b: []f32, mut c: []f32, flag: bool) {
+    let v = match flag {
+        true => c,
+        _ => c,
+    };
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + v[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn mm_block(b: []f32, mut c: []f32, flag: bool) {
+    let v: []f32 = { c };
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + v[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn mm_loop(b: []f32, mut c: []f32, flag: bool) {
+    let v: []f32 = loop {
+        break c;
+    };
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + v[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut y: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        y[i] = 0.0;
+    }
+    y[0] = 1.0;
+    y[2] = 2.0;
+    y[5] = 1.0;
+    y[7] = 2.0;
+    y[8] = 3.0;
+    y[10] = 1.0;
+    y[13] = 3.0;
+    y[15] = 1.0;
+
+    let mut x1: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        x1[i] = (i + 1) as f32;
+    }
+    mm_if(y, x1, true);
+    for i in 0..16 {
+        print(x1[i] as i32);
+    }
+
+    let mut x2: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        x2[i] = (i + 1) as f32;
+    }
+    mm_match(y, x2, true);
+    for i in 0..16 {
+        print(x2[i] as i32);
+    }
+
+    let mut x3: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        x3[i] = (i + 1) as f32;
+    }
+    mm_block(y, x3, true);
+    for i in 0..16 {
+        print(x3[i] as i32);
+    }
+
+    let mut x4: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        x4[i] = (i + 1) as f32;
+    }
+    mm_loop(y, x4, true);
+    for i in 0..16 {
+        print(x4[i] as i32);
+    }
+    return 0;
+}

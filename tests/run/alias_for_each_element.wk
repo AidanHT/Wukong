@@ -1,0 +1,129 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 5
+// EXPECT-OUT: 8
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 17
+// EXPECT-OUT: 20
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 29
+// EXPECT-OUT: 32
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 41
+// EXPECT-OUT: 44
+module tests.run.alias_for_each_element
+
+// Iterating ONE array of slices TWICE gives one buffer two kernel-operand names.
+//
+// `lower_for_array` binds an aggregate element BY POINTER into the iterated buffer
+// (`bind_slice(name, elem_ptr, …)`), and a `[]T` element arrives there too, because a slice's
+// `elem_mir` is its fat pointer, whose MIR shape is an `Array`. So `w` and `u` below are both
+// `ws[0]` -- one buffer, two names -- exactly as `let (p, q) = t; let (r, u) = t;` publishes two
+// names for `t.0`. `alias::scan_body`'s statement arm matched only `Let` and `Assign`, so a `for`
+// that binds a name was a republishing spelling the pass had no word for: the operands {w, b, u}
+// resolved to three distinct roots, `mm` was alias free, and `wukong_sgemm` dispatched with A and C
+// one buffer. It printed the OUT-OF-PLACE product `10 14 5 8 26 30 17 20 42 46 29 32 58 62 41 44`
+// on interp AND native, at -O0 and -O2. No call site in this program aliases anything.
+//
+// `mm2` is the control and it must KEEP its kernel: ONE loop over `ws`, whose element is the only
+// name reaching `ws[…]`, writing a buffer nothing else names. Without it, "declines" could be
+// bought by tainting every `for`-each loop -- and the element binding is recorded precisely, with a
+// `Proj::Index` step, for exactly that reason.
+//
+// The expectations are the SCALAR NEST run by hand over these inputs -- each store lands before the
+// later reads of that row -- and are the same sixteen values `alias_matmul_inplace.wk` derives for
+// the same `a`/`b`. Every lane is printed, per the corpus rule for a recognized kernel. Every value
+// is an exact small integer in f32, so an FMA contraction of `s + a*b` cannot move a result and the
+// expectations hold at every -O level and on both backends.
+
+fn mm(ws: [[]f32; 1], b: []f32) {
+    for w in ws {
+        for u in ws {
+            for i in 0..4 {
+                for j in 0..4 {
+                    let mut s: f32 = 0.0;
+                    for k in 0..4 {
+                        s = s + w[i * 4 + k] * b[k * 4 + j];
+                    }
+                    u[i * 4 + j] = s;
+                }
+            }
+        }
+    }
+}
+
+// The control: one loop, one name on `ws[…]`, a destination nothing else reaches.
+fn mm2(ws: [[]f32; 1], b: []f32, mut o: []f32) {
+    for w in ws {
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut s: f32 = 0.0;
+                for k in 0..4 {
+                    s = s + w[i * 4 + k] * b[k * 4 + j];
+                }
+                o[i * 4 + j] = s;
+            }
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut y: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        y[i] = 0.0;
+    }
+    y[0] = 1.0;
+    y[2] = 2.0;
+    y[5] = 1.0;
+    y[7] = 2.0;
+    y[8] = 3.0;
+    y[10] = 1.0;
+    y[13] = 3.0;
+    y[15] = 1.0;
+
+    let mut x: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        x[i] = (i + 1) as f32;
+    }
+    let ws: [[]f32; 1] = [x];
+    mm(ws, y);
+    for i in 0..16 {
+        print(x[i] as i32);
+    }
+
+    // The control runs too, so a decline that swallowed it would fail this fixture rather than
+    // pass it quietly: `o` must hold the OUT-OF-PLACE product of the ORIGINAL `x`, which `mm`
+    // has already overwritten, so the values are re-established first.
+    let mut z: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        z[i] = (i + 1) as f32;
+    }
+    let mut o: []f32 = alloc_f32(16);
+    let zs: [[]f32; 1] = [z];
+    mm2(zs, y, o);
+    for i in 0..16 {
+        print(o[i] as i32);
+    }
+    return 0;
+}
