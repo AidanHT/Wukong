@@ -1,0 +1,130 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+// EXPECT-OUT: 10
+// EXPECT-OUT: 14
+// EXPECT-OUT: 23
+// EXPECT-OUT: 32
+// EXPECT-OUT: 26
+// EXPECT-OUT: 30
+// EXPECT-OUT: 59
+// EXPECT-OUT: 68
+// EXPECT-OUT: 42
+// EXPECT-OUT: 46
+// EXPECT-OUT: 95
+// EXPECT-OUT: 104
+// EXPECT-OUT: 58
+// EXPECT-OUT: 62
+// EXPECT-OUT: 131
+// EXPECT-OUT: 140
+module tests.run.alias_unknown_republish
+
+// A republishing site handed an initializer the aliasing pass cannot CLASSIFY.
+//
+// `alias::origin_of` answers a three-way question, and five sites in `alias.rs` read one arm of it
+// with an `if let Origin::At(p)`. That treats BOTH other arms as "nothing to record", and only one
+// of them is: `Fresh` really is nothing, while `Unknown` means CANNOT TELL. At a call site
+// `Unknown` aliases everything, which is conservative; at a republishing site the same value meant
+// "record nothing, taint nothing, and never enter the name in `view_names`", so the name silently
+// became its own root and the pass answered "disjoint" over one buffer named twice.
+//
+// Two of the five sites are here. `mm_assign` stores an `if`-valued slice into an existing binding
+// (`republishing_value` gates that taint and required a PLACE), and `mm_field` gives a struct
+// literal an `if`-valued borrowing field (the field arm required a place too, and the literal is
+// already `attributed`, so the blanket expression taint below it does not look). Both dispatched
+// `wukong_sgemm` with A and C one buffer and printed the OUT-OF-PLACE product
+// `10 14 5 8 26 30 17 20 42 46 29 32 58 62 41 44` on interp AND native, at -O0 and -O2. Both
+// backends agreeing is why no differential, invariance or determinism gate could see it.
+//
+// Each is in its own function, because the fact is one bit per FUNCTION and a shared callee would
+// let one spelling's taint cover for the other. The expectations are the SCALAR NEST run by hand
+// over these inputs -- each `c[i*4+j]` store lands before the later reads of that row -- and are the
+// same sixteen values `alias_matmul_inplace.wk` derives for the same `a`/`b`, printed once per
+// spelling. Every lane is printed, per the corpus rule for a recognized kernel: a checksum passes
+// over a buffer that is right in twelve places. Every value is an exact small integer in f32, so an
+// FMA contraction of `s + a*b` cannot move a result and the expectations hold at every -O level and
+// on both backends.
+
+struct L {
+    w: []f32,
+}
+
+fn mm_assign(b: []f32, mut c: []f32, d: []f32, flag: bool) {
+    let mut v: []f32 = d;
+    v = if flag { c } else { c };
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + v[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn mm_field(b: []f32, mut c: []f32, flag: bool) {
+    let l: L = L { w: if flag { c } else { c } };
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut s: f32 = 0.0;
+            for k in 0..4 {
+                s = s + l.w[i * 4 + k] * b[k * 4 + j];
+            }
+            c[i * 4 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    // b = [1 0 2 0; 0 1 0 2; 3 0 1 0; 0 3 0 1] -- chosen so the aliased and disjoint answers differ
+    // in twelve of sixteen lanes rather than in one.
+    let mut y: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        y[i] = 0.0;
+    }
+    y[0] = 1.0;
+    y[2] = 2.0;
+    y[5] = 1.0;
+    y[7] = 2.0;
+    y[8] = 3.0;
+    y[10] = 1.0;
+    y[13] = 3.0;
+    y[15] = 1.0;
+
+    let mut x1: []f32 = alloc_f32(16);
+    let mut z: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        x1[i] = (i + 1) as f32;
+        z[i] = 0.0;
+    }
+    mm_assign(y, x1, z, true);
+    for i in 0..16 {
+        print(x1[i] as i32);
+    }
+
+    let mut x2: []f32 = alloc_f32(16);
+    for i in 0..16 {
+        x2[i] = (i + 1) as f32;
+    }
+    mm_field(y, x2, true);
+    for i in 0..16 {
+        print(x2[i] as i32);
+    }
+    return 0;
+}

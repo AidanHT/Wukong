@@ -1510,9 +1510,64 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `wukong_sgemm(a, b, c, m, k, n, beta)` (and the parallel / transposed `nn.Linear`
             // variants) — the GEMM microkernels the compiler lowers a matmul nest to. The interpreter
             // marshals its abstract (tagged-`Value`) memory into real f32 buffers and calls the
-            // *identical* runtime kernel the native backend calls, then marshals the result back, so
-            // the differential oracle stays bit-for-bit exact. The serial kernel is used for both
-            // serial and parallel names (numerically identical).
+            // *identical* runtime kernel the native backend calls, then marshals the result back. The
+            // serial kernel is used for both serial and parallel names (numerically identical).
+            //
+            // THE MARSHALLING CONTRACT, stated exactly, because the comment that used to sit here
+            // said "so the differential oracle stays bit-for-bit exact" and that is only true on
+            // DISJOINT operands. Copying each operand into a private `Vec` and writing the result
+            // back is copy-in/copy-out: it de-aliases the call. On overlapping operands the
+            // interpreter therefore computes a program that neither the native backend nor the
+            // source nest has, and — because the oracle's answer is the more plausible one — a
+            // differential failure on such an input would name NATIVE as the deviant side.
+            //
+            // What keeps that unreachable FOR THIS FAMILY is the lowering, not this code:
+            // `wukong_mir_build`'s `all_provably_disjoint` declines the GEMM/GEMV/GEVM, transpose,
+            // pool2d, col/row-reduction and norm-backward emitters unless the whole-program
+            // analysis in its `alias.rs` proves no call site can hand the enclosing function the
+            // same array twice. Three other groups are NOT behind that gate, and the distinction is
+            // worth keeping straight rather than claiming the class is shut:
+            //
+            //  * The embedding gather and the scatter-add are versioned at RUN time instead
+            //    (`emit_nonoverlapping_call`), and their arms below do not marshal at all — they
+            //    read live memory, which is what makes an aliased call mean the source nest.
+            //  * The index-aligned families whose runtime entry explicitly permits `out == x`.
+            //    Each is quoted from its own doc or `# Safety` line, because the last version of
+            //    this list was assembled from a symbol grep and got a family wrong:
+            //    `wukong_velem_f32` ("`x`/`y`/`out` may alias"), `wukong_vmath_f32` ("`x` and `out`
+            //    may alias"), `wukong_cumsum_f32` / `wukong_cum{max,min}_f32` ("they may be
+            //    distinct or alias"), `wukong_cumprod_f32` ("`out` may alias `x`"),
+            //    `wukong_lrscan_f32` ("`out` may be distinct from or alias `a`/`b`"),
+            //    `wukong_rope_f32` ("`out` may alias `x` but must not otherwise overlap it"),
+            //    `wukong_xent_bwd_f32` ("`dx` … may alias `x`"), `wukong_norm_f32` /
+            //    `wukong_norm_affine_f32` ("`x`/`out` may alias for in-place"), and
+            //    `wukong_logsoftmax_f32`, which no recognizer reaches at all (a recognized
+            //    log-softmax is emitted as `wukong_norm_f32(.., NORM_LOGSOFTMAX)`). In place equals
+            //    out of place for those, so the marshalling here is redundant rather than wrong,
+            //    and gating them would decline a spelling the kernel author certified.
+            //
+            //    NOT in that group, though it is the same kind of streaming elementwise kernel and
+            //    an earlier draft of this comment listed it there: the half-precision
+            //    `wukong_axpby_{bf16,f16}` family and its narrowing `_out` twins. Nothing in
+            //    `lowp.rs` says `out` may alias `x` or `y`, and `wukong_axpby_bf16_out` /
+            //    `wukong_axpby_f16_out` build `&[u16]` AND `&mut [u16]` over the caller's pointers
+            //    before the feature dispatch, so an aliased call there is UB rather than merely a
+            //    different answer. The emitters are not gated (they are index-aligned, and the
+            //    values come out right by construction of the op, which is why nothing has caught
+            //    it) and this branch does NOT close it: it is the one open UNSOUNDNESS in the set
+            //    and it needs a `wukong_runtime` owner.
+            //  * A residual set whose runtime entries carry NO disjointness clause in either
+            //    direction and whose emit sites do no disjointness reasoning. Five of them write a
+            //    `rows`-long `out` while reading a `rows*cols` input — the same shape as the row
+            //    reductions that ARE gated: `wukong_logsumexp_f32` and `wukong_entropy_f32` (one
+            //    shared marshalling arm below), `wukong_xent_fwd_f32`, `wukong_kldiv_f32` and
+            //    `wukong_kd_loss_f32`. Two more pair an elementwise buffer with a `cols`-long one
+            //    that is re-read on every row: `wukong_dequant_perchan_f32`'s `scale`, and
+            //    `wukong_norm_affine_f32`'s `gamma`/`beta` — that entry permits `x`/`out` to alias
+            //    and says nothing about either affine operand, and `emit_norm` tests neither. For
+            //    all of those the copy-in/copy-out divergence described above is still reachable in
+            //    principle. They are named here rather than left implied, because the comment this
+            //    one replaces said the class was closed.
             "wukong_sgemm"
             | "wukong_sgemm_parallel"
             | "wukong_sgemm_nt"
@@ -2163,7 +2218,16 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `wukong_transpose_f32[_parallel](src, dst, rows, cols)` — the cache-blocked transpose a
             // recognized `dst[j,i] = src[i,j]` nest lowers to. Marshal the `rows*cols` f32 out of src,
             // call the *serial* runtime kernel (a permutation, so serial == parallel bit-for-bit), write
-            // the `cols*rows` result to dst. Reading all of src first makes any overlap robust.
+            // the `cols*rows` result to dst.
+            //
+            // Reading all of src first does NOT make overlap robust — it makes overlap compute a
+            // fourth thing. transpose.rs declares `src`/`dst` non-overlapping; an aliased 4x4
+            // `tr(x, x)` printed `1 5 9 13 2 6 10 14 …` here (a true transpose, because of this
+            // copy), `1 2 3 4 2 6 7 8 …` natively, and the scalar nest mirrors the upper triangle
+            // down — three answers, and at >= 16x16 the blocked kernel adds a fourth. The recognizer
+            // now declines an aliased transpose (`kernel_base_ptrs_disjoint` in wukong_mir_build), so
+            // this arm is reached only for provably disjoint buffers and the copy is pure
+            // marshalling.
             "wukong_transpose_f32" | "wukong_transpose_f32_parallel" => {
                 let src = ptr(args[0])?;
                 let dst = ptr(args[1])?;
@@ -2430,7 +2494,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `wukong_softmax_bwd_f32[_parallel](y, dy, dx, rows, cols)` — the fused softmax-backward
             // (`dx = y·(dy − Σ y·dy)`) a recognized batched nest lowers to. Marshal `rows*cols` f32 from
             // y AND dy, call the *serial* runtime kernel (bit-identical to the parallel one — rows are
-            // independent), write `dx`. Read both inputs first (in-place-safe with dy).
+            // independent), write `dx`. Read both inputs first, which makes the `dx == dy` aliasing
+            // softmax_bwd.rs explicitly ALLOWS safe here too. It does NOT make the aliasing that file
+            // FORBIDS safe: "`dx` must not overlap `y` (its row is read during the apply)". Under
+            // `dx == y` this arm computes an out-of-place result and native computes something else,
+            // so the recognizer declines that case at lowering (`provably_disjoint(nest.y, nest.dx)`)
+            // and only the permitted aliasing reaches here.
             "wukong_softmax_bwd_f32" | "wukong_softmax_bwd_f32_parallel" => {
                 let y = ptr(args[0])?;
                 let dy = ptr(args[1])?;
@@ -2523,7 +2592,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             // RMSNorm input-gradient (`dx = r·(g − x·r²·Σg·x/C)`, `g = dy·γ`) a recognized batched nest
             // lowers to. Marshal `rows*cols` f32 from x AND dy plus the `cols`-long gamma, call the
             // *serial* runtime kernel (bit-identical to the parallel one — rows are independent), write
-            // `dx`. Read all inputs first (so the in-place `dx==dy` aliasing the kernel allows is safe).
+            // `dx`. Read all inputs first, which makes the in-place `dx == dy` aliasing the kernel
+            // explicitly allows safe. The aliasing it FORBIDS is `dx` over `x` (rmsnorm_bwd.rs: "each
+            // row's `x` is read during the apply after the reductions"; layernorm_bwd.rs forbids `dx`
+            // over `dy` as well) — the standard way to halve a backward pass's memory, well defined
+            // here because of this copy and undefined natively. The recognizer declines it at
+            // lowering, so only the permitted aliasing reaches this arm.
             // The recognizer always binds a real gamma, but a null (`Value::Int(0)`) is still handled by
             // variant, mirroring the affine-norm convention.
             // LayerNorm backward shares the identical 7-arg ABI and marshalling; the kernel fn is
@@ -4024,10 +4098,38 @@ impl<'a, 'k> Interp<'a, 'k> {
                 Ok(Value::Unit)
             }
             // `wukong_scatter_add_f32[_parallel](grad_w, grad_out, ids, t, h, v)` — the embedding-gradient
-            // backward `grad_w[ids[t], :] += grad_out[t, :]` (the gather's dual). Marshal the `t` i32 ids,
-            // the `t*h` upstream gradient, AND grad_w's CURRENT `v*h` contents (the kernel accumulates in
-            // place, so we start from the program's zeroed accumulator, not zeros), call the *serial* kernel
-            // (bit-identical to the parallel one — output-row split, ascending-`ti` fold), write grad_w back.
+            // backward `grad_w[ids[t], :] += grad_out[t, :]` (the gather's dual).
+            //
+            // Like the gather above, this runs **straight against `self.memory`** rather than
+            // marshalling its operands into scratch Vecs, and for the same reason. The marshalled
+            // form snapshotted `grad_out` before the first accumulation, so when `grad_w` and
+            // `grad_out` are the same buffer — which `tests/run/embedding_alias_parallel.wk` calls
+            // as `scatter(ids, acc, acc)`, and which the runtime guard at
+            // `wukong_mir_build`'s `emit_nonoverlapping_call` deliberately allows through to the
+            // serial kernel — the oracle folded a stale copy and answered **49120** where the
+            // source nest and the native run both answer **49121**. That was a live interp-vs-native
+            // divergence shipping in the corpus, invisible only because the fixture computed the
+            // value and declined to print it.
+            //
+            // The order below is exactly `scatter.rs::scatter_rows` with `r0 = 0, r1 = v`: scan all
+            // `t` tokens in ascending `ti`, skip an id outside `[0, v)`, and accumulate the row
+            // element-wise. That is also exactly the source nest, so all three implementations now
+            // agree on every input, aliased or not. Element-wise f32 accumulation has no
+            // reassociation to keep in sync with the AVX2 `add_row` (eight independent lane adds),
+            // and the `_parallel` kernel splits *output rows* while keeping each row's ascending-`ti`
+            // fold, so one implementation serves both symbols.
+            //
+            // TWO PROPERTIES OF THE MARSHALLED FORM ARE KEPT DELIBERATELY, because dropping either
+            // would be a silent behaviour change rather than the fix this arm is:
+            //  * it validated the whole `grad_out[0..t*h]` and `grad_w[0..v*h]` extents BEFORE
+            //    computing anything, so an out-of-arena extent was a diagnostic and not a quietly
+            //    shorter loop. Reading live memory only touches the slots an in-range id reaches, so
+            //    the two range ends are probed up front instead (memory is one flat slot arena, so
+            //    the last slot standing in for the range is exact).
+            //  * it truncated the id with `as i32` before handing it to the kernel, which is what
+            //    NATIVE does — `ids` is an `[i32]` buffer and the kernel's parameter is
+            //    `*const i32`, so a value outside i32 is reinterpreted, not skipped. A well-typed
+            //    program cannot produce one; matching native costs one cast.
             "wukong_scatter_add_f32" | "wukong_scatter_add_f32_parallel" => {
                 let grad_w = ptr(args[0])?;
                 let grad_out = ptr(args[1])?;
@@ -4035,52 +4137,45 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let t = dim!(args[3]);
                 let h = dim!(args[4]);
                 let v = dim!(args[5]);
-                let mut idbuf = Vec::with_capacity(t);
-                for r in 0..t {
-                    idbuf.push(
-                        self.memory
-                            .get(ids + r)
-                            .ok_or("scatter_add ids out of bounds")?
-                            .as_int() as i32,
-                    );
+                let end = self.memory.len();
+                // Checked throughout: `t`/`h`/`v` are program-supplied dims, so `t*h` is an
+                // attacker-shaped product and a wrap would turn the guard into a pass.
+                let in_arena = |base: usize, n: Option<usize>| {
+                    n.and_then(|n| base.checked_add(n))
+                        .is_some_and(|last| last <= end)
+                };
+                if !in_arena(ids, Some(t)) {
+                    return Err("scatter_add ids out of bounds".into());
                 }
-                let gon = t * h;
-                let mut gobuf = Vec::with_capacity(gon);
-                for i in 0..gon {
-                    gobuf.push(
-                        self.memory
-                            .get(grad_out + i)
-                            .ok_or("scatter_add grad_out out of bounds")?
-                            .as_float() as f32,
-                    );
+                if !in_arena(grad_out, t.checked_mul(h)) {
+                    return Err("scatter_add grad_out out of bounds".into());
                 }
-                let gwn = v * h;
-                let mut gwbuf = Vec::with_capacity(gwn);
-                for i in 0..gwn {
-                    gwbuf.push(
-                        self.memory
-                            .get(grad_w + i)
-                            .ok_or("scatter_add grad_w out of bounds")?
-                            .as_float() as f32,
-                    );
+                if !in_arena(grad_w, v.checked_mul(h)) {
+                    return Err("scatter_add grad_w out of bounds".into());
                 }
-                // SAFETY: gwbuf is v*h f32, gobuf is t*h f32, idbuf is t i32 — the kernel's contract.
-                unsafe {
-                    wukong_runtime::wukong_scatter_add_f32(
-                        gwbuf.as_mut_ptr(),
-                        gobuf.as_ptr(),
-                        idbuf.as_ptr(),
-                        t,
-                        h,
-                        v,
-                    );
-                }
-                for (i, &val) in gwbuf.iter().enumerate() {
-                    *self
+                for ti in 0..t {
+                    let id = self
                         .memory
-                        .get_mut(grad_w + i)
-                        .ok_or("scatter_add grad_w output out of bounds")? =
-                        Value::Float(val as f64);
+                        .get(ids + ti)
+                        .ok_or("scatter_add ids out of bounds")?
+                        .as_int() as i32;
+                    if id < 0 || (id as usize) >= v {
+                        continue;
+                    }
+                    let row = id as usize * h;
+                    for j in 0..h {
+                        let g = self
+                            .memory
+                            .get(grad_out + ti * h + j)
+                            .ok_or("scatter_add grad_out out of bounds")?
+                            .as_float() as f32;
+                        let slot = self
+                            .memory
+                            .get_mut(grad_w + row + j)
+                            .ok_or("scatter_add grad_w out of bounds")?;
+                        let acc = slot.as_float() as f32;
+                        *slot = Value::Float((acc + g) as f64);
+                    }
                 }
                 Ok(Value::Unit)
             }
@@ -4774,6 +4869,89 @@ mod tests {
             100,
             "negative S must leave the attention output untouched"
         );
+    }
+
+    /// Every `wukong_*` symbol the lowered program calls. Kernel arms are gate-blind — a fixture
+    /// that stopped dispatching would still print the right answer, and the test below would pass
+    /// while proving nothing — so an aliasing test has to assert the dispatch as well as the value.
+    fn kernel_calls_of(src: &str) -> Vec<String> {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (program, _ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        let mut out = Vec::new();
+        for f in &program.funcs {
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let wukong_mir::Op::Call { func, .. } = &i.op {
+                        let n = interner.resolve(*func);
+                        if n.starts_with("wukong_") && n != "wukong_parallel_for" {
+                            out.push(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The scatter-add half of the aliasing story, and the one quantified interp-vs-native
+    /// divergence that was shipping in the corpus.
+    ///
+    /// `wukong_scatter_add_f32` accumulates `grad_w[ids[t], :] += grad_out[t, :]` scanning `t`
+    /// ascending. The interpreter used to marshal `grad_out` into a scratch `Vec` before calling
+    /// the kernel, so when the two buffers are the SAME array it folded a pre-call SNAPSHOT: over
+    /// `tests/run/embedding_alias_parallel.wk`'s own inputs it answered 49120 where the nest and
+    /// the native run both answer 49121. That fixture states the divergence in its header and then
+    /// declines to print the value, so `native_matches_interpreter` stayed green over it.
+    ///
+    /// 49121 is the hand reference: the nest `grad_w[ids[t]*4+d] += grad_out[t*4+d]` run over
+    /// `ids[t] = (3t+1) % 8` and `acc[i] = 0.5i - 3.0` in f32, in ascending `t`, reading live
+    /// memory — identical to `scatter.rs::scatter_rows` with `r0 = 0, r1 = v`. It is NOT a reading
+    /// taken from another backend. The snapshot answer 49120 is asserted against explicitly so a
+    /// regression to marshalling fails loudly rather than drifting.
+    #[test]
+    fn scatter_add_reads_live_memory_when_grad_w_aliases_grad_out() {
+        let src = "fn scatter(ids: [i32;80], grad_out: [f32;320], mut grad_w: [f32;320]) { \
+                     for t in 0..80 { for d in 0..4 { \
+                       grad_w[ids[t]*4+d] += grad_out[t*4+d]; } } } \
+                   fn main() -> i32 { let mut ids: [i32; 80] = [0; 80]; \
+                     let mut acc: [f32; 320] = [0.0; 320]; \
+                     for i in 0..80 { ids[i] = ((i * 3 + 1) % 8) as i32; } \
+                     for i in 0..320 { acc[i] = (i as f32) * 0.5 - 3.0; } \
+                     scatter(ids, acc, acc); \
+                     let mut s: f32 = 0.0; for i in 0..320 { s = s + acc[i]; } \
+                     return s as i32; }";
+        let calls = kernel_calls_of(src);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("wukong_scatter_add_f32")),
+            "the scatter recognizer must fire, or this test is vacuous: {calls:?}"
+        );
+        let got = run_main(src);
+        assert_ne!(
+            got, 49120,
+            "the oracle folded a pre-call snapshot of grad_out"
+        );
+        assert_eq!(got, 49121);
+
+        // The ordinary disjoint scatter must be unchanged: every token's row lands once into a
+        // zeroed accumulator, so the total is the sum of all 320 gradient elements = 24560.
+        let disjoint = "fn scatter(ids: [i32;80], grad_out: [f32;320], mut grad_w: [f32;320]) { \
+                          for t in 0..80 { for d in 0..4 { \
+                            grad_w[ids[t]*4+d] += grad_out[t*4+d]; } } } \
+                        fn main() -> i32 { let mut ids: [i32; 80] = [0; 80]; \
+                          let mut g: [f32; 320] = [0.0; 320]; \
+                          let mut gw: [f32; 320] = [0.0; 320]; \
+                          for i in 0..80 { ids[i] = ((i * 3 + 1) % 8) as i32; } \
+                          for i in 0..320 { g[i] = (i as f32) * 0.5 - 3.0; } \
+                          scatter(ids, g, gw); \
+                          let mut s: f32 = 0.0; for i in 0..320 { s = s + gw[i]; } \
+                          return s as i32; }";
+        assert_eq!(run_main(disjoint), 24560);
     }
 
     /// An in-place embedding gather (`out` and `weight` are the *same* buffer) must reproduce the
