@@ -1531,20 +1531,43 @@ impl<'a, 'k> Interp<'a, 'k> {
             //  * The embedding gather and the scatter-add are versioned at RUN time instead
             //    (`emit_nonoverlapping_call`), and their arms below do not marshal at all — they
             //    read live memory, which is what makes an aliased call mean the source nest.
-            //  * The index-aligned families whose runtime entry explicitly permits `out == x`:
-            //    velem/vmath/axpby, `wukong_cumsum_f32`, `wukong_cum{max,min}_f32`,
-            //    `wukong_cumprod_f32`, `wukong_lrscan_f32`, `wukong_rope_f32`,
-            //    `wukong_xent_bwd_f32`, the norms. In place equals out of place for those, so the
-            //    marshalling here is redundant rather than wrong, and gating them would decline a
-            //    spelling the kernel author certified.
+            //  * The index-aligned families whose runtime entry explicitly permits `out == x`.
+            //    Each is quoted from its own doc or `# Safety` line, because the last version of
+            //    this list was assembled from a symbol grep and got a family wrong:
+            //    `wukong_velem_f32` ("`x`/`y`/`out` may alias"), `wukong_vmath_f32` ("`x` and `out`
+            //    may alias"), `wukong_cumsum_f32` / `wukong_cum{max,min}_f32` ("they may be
+            //    distinct or alias"), `wukong_cumprod_f32` ("`out` may alias `x`"),
+            //    `wukong_lrscan_f32` ("`out` may be distinct from or alias `a`/`b`"),
+            //    `wukong_rope_f32` ("`out` may alias `x` but must not otherwise overlap it"),
+            //    `wukong_xent_bwd_f32` ("`dx` … may alias `x`"), `wukong_norm_f32` /
+            //    `wukong_norm_affine_f32` ("`x`/`out` may alias for in-place"), and
+            //    `wukong_logsoftmax_f32`, which no recognizer reaches at all (a recognized
+            //    log-softmax is emitted as `wukong_norm_f32(.., NORM_LOGSOFTMAX)`). In place equals
+            //    out of place for those, so the marshalling here is redundant rather than wrong,
+            //    and gating them would decline a spelling the kernel author certified.
+            //
+            //    NOT in that group, though it is the same kind of streaming elementwise kernel and
+            //    an earlier draft of this comment listed it there: the half-precision
+            //    `wukong_axpby_{bf16,f16}` family and its narrowing `_out` twins. Nothing in
+            //    `lowp.rs` says `out` may alias `x` or `y`, and `wukong_axpby_bf16_out` /
+            //    `wukong_axpby_f16_out` build `&[u16]` AND `&mut [u16]` over the caller's pointers
+            //    before the feature dispatch, so an aliased call there is UB rather than merely a
+            //    different answer. The emitters are not gated (they are index-aligned, and the
+            //    values come out right by construction of the op, which is why nothing has caught
+            //    it) and this branch does NOT close it: it is the one open UNSOUNDNESS in the set
+            //    and it needs a `wukong_runtime` owner.
             //  * A residual set whose runtime entries carry NO disjointness clause in either
-            //    direction and whose emit sites do no disjointness reasoning:
-            //    `wukong_logsumexp_f32`, `wukong_xent_fwd_f32`, `wukong_kldiv_f32`,
-            //    `wukong_entropy_f32`, `wukong_kd_loss_f32` (each writes a `rows`-long `out` while
-            //    reading a `rows*cols` `x` — the same shape as the row reductions that ARE gated)
-            //    and `wukong_dequant_perchan_f32`. For those the copy-in/copy-out divergence
-            //    described above is still reachable in principle. They are named here rather than
-            //    left implied, because the comment this one replaces said the class was closed.
+            //    direction and whose emit sites do no disjointness reasoning. Five of them write a
+            //    `rows`-long `out` while reading a `rows*cols` input — the same shape as the row
+            //    reductions that ARE gated: `wukong_logsumexp_f32` and `wukong_entropy_f32` (one
+            //    shared marshalling arm below), `wukong_xent_fwd_f32`, `wukong_kldiv_f32` and
+            //    `wukong_kd_loss_f32`. Two more pair an elementwise buffer with a `cols`-long one
+            //    that is re-read on every row: `wukong_dequant_perchan_f32`'s `scale`, and
+            //    `wukong_norm_affine_f32`'s `gamma`/`beta` — that entry permits `x`/`out` to alias
+            //    and says nothing about either affine operand, and `emit_norm` tests neither. For
+            //    all of those the copy-in/copy-out divergence described above is still reachable in
+            //    principle. They are named here rather than left implied, because the comment this
+            //    one replaces said the class was closed.
             "wukong_sgemm"
             | "wukong_sgemm_parallel"
             | "wukong_sgemm_nt"

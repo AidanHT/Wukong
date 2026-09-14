@@ -2843,10 +2843,10 @@ struct GemmSyms {
     vec_kernels: bool,
     /// Whole-program answer to "can two DISTINCT names for a buffer in the function being lowered
     /// reach the same storage?" — either because a call site binds two of its buffer parameters to
-    /// one array, or because its own body views one buffer under a second name (a `[]T`/`*T`/`&T`
-    /// `let`, or a borrowing place handed to an aggregate literal). `true` means **no**, so two
-    /// distinct operand symbols are provably distinct storage and a disjointness-requiring kernel
-    /// may be emitted.
+    /// one array, or because two operand names in its own body resolve onto one buffer (a
+    /// `[]T`/`*T`/`&T` `let` views its source, and a borrowing place handed to an aggregate literal
+    /// makes `l.w` a second name for it). `true` means **no**, so two distinct operand symbols are
+    /// provably distinct storage and a disjointness-requiring kernel may be emitted.
     /// Computed once by [`alias::AliasFacts`] and set per function beside the `@generic` switch,
     /// for the reason `recognize` gives above: this struct already reaches every recognizer and
     /// every recognizer probe, so the fact cannot be dropped on the way down. `false` is the safe
@@ -9317,12 +9317,15 @@ impl FnLowerer<'_> {
     /// * Across functions, whether any call site does exactly that. `GemmSyms::alias_free` carries
     ///   the whole-program answer (see `alias.rs`); when it is `false`, nothing in this function is
     ///   provably disjoint from anything else and every such kernel declines.
-    /// * Inside the function again, whether two DIFFERENT symbols are one buffer. They are whenever
-    ///   the body binds a view — `let mut sa: []f32 = a;` stores `a`'s base pointer into `sa`'s fat
-    ///   pointer with no element copy — or hands a borrowing place to an aggregate literal
-    ///   (`Layer { w: sa }`, whose `l.w` is its own kernel-operand symbol). Without this the fast
-    ///   No-path is unsound in `main`, which has no parameters and so is trivially alias free under
-    ///   the call-site fact alone. `alias.rs` folds it into the same bit.
+    /// * Inside the function again, whether two DIFFERENT symbols are one buffer. A `[]T`/`*T`/`&T`
+    ///   `let` is a view — `let mut sa: []f32 = a;` stores `a`'s base pointer into `sa`'s fat
+    ///   pointer with no element copy — and a borrowing place handed to an aggregate literal makes
+    ///   `l.w` a second name for it. Without this the fast No-path is unsound in `main`, which has
+    ///   no parameters and so is trivially alias free under the call-site fact alone. `alias.rs`
+    ///   folds it into the same bit, and it asks whether two names that are ACTUALLY SPELLED as
+    ///   operands resolve onto one buffer rather than whether a view exists at all — the difference
+    ///   between declining a nest that needs to decline and declining every kernel in a program
+    ///   that merely holds its weights in a struct.
     ///
     /// Callers that are allowed *one* aliasing pair (a kernel documenting `dx` may alias `dy`) pass
     /// only the pairs that must be disjoint.
@@ -10075,10 +10078,17 @@ impl FnLowerer<'_> {
         // (`cumsum_row_avx2`) earns that: it loads an 8-lane block, scans it in registers, stores
         // it, and moves on — it never rereads a lane it has written, and the scalar tail reads
         // `x[i]` before writing `out[i]`. In place is therefore the same computation as out of
-        // place, exactly as it is for the index-aligned elementwise families (velem, vmath, axpby),
-        // which are not gated either. Only the `_parallel` entry says "non-overlapping", and that
-        // sentence is about the task ROW partition ("each row written by one task"), not about
-        // `x` vs `out`.
+        // place, exactly as `wukong_velem_f32` ("`x`/`y`/`out` may alias") and `wukong_vmath_f32`
+        // ("`x` and `out` may alias") say of themselves, and those are not gated either. Only the
+        // `_parallel` entry says "non-overlapping", and that sentence is about the task ROW
+        // partition ("each row written by one task"), not about `x` vs `out`.
+        //
+        // Do NOT read the ungated `wukong_axpby_{bf16,f16}[_out]` emitters as a third member of
+        // that list, which is how an earlier revision of this comment had it. Nothing in `lowp.rs`
+        // permits `out` to alias `x`/`y`, and the narrowing `_out` pair builds `&[u16]` and
+        // `&mut [u16]` over the caller's pointers before dispatching, so an aliased call there is
+        // UB, not a documented spelling. They are ungated because nobody has gated them, which is
+        // a different fact from cumsum's.
         let Some([x, out]) = self.kernel_base_ptrs([nest.x, nest.out]) else {
             return false;
         };
@@ -31379,7 +31389,7 @@ fn main() -> i32 {
         let fresh = src.replace("DEST", "alloc_f32(r * c)");
         assert!(
             alias_free_of(&fresh, "main"),
-            "`alloc_f32` is fresh storage, not a view, or the whole slice corpus loses its kernels"
+            "`alloc_f32` is not a PLACE, so it publishes no second name (see `Origin::Fresh`)"
         );
         let (prog, _d, interner) = lower(&fresh);
         assert!(
@@ -31388,26 +31398,73 @@ fn main() -> i32 {
         );
     }
 
-    /// The aggregate-literal spelling of the same hazard: a borrowing place handed to a struct
-    /// literal gives that storage a second kernel-operand name (`FnLowerer::field_base` records
-    /// `"<local>.<field>"`). A struct built from *values* copies and must not taint, or every
-    /// struct-using program would lose its kernels.
+    /// The aggregate-literal spelling of the same hazard, and the precision line the analysis has
+    /// to hold — which is where the first cut of this test was wrong.
+    ///
+    /// A borrowing place handed to a struct literal gives that storage a second kernel-operand name
+    /// (`FnLowerer::field_base` records `"<local>.<field>"`), so a nest that spells BOTH names must
+    /// decline. But a function that packs its parameters into a struct and then reads them ONLY
+    /// through the fields has one name per buffer and must keep every kernel. That second half is
+    /// not hypothetical: it is `crates/wukong_xbench/wk/general/block_d_struct.wk`, the benchmark
+    /// peer written the way a real model holds its weights, and an earlier revision of this pass
+    /// tainted on the mere PRESENCE of the view and silently cost it all nine of its GEMM
+    /// dispatches while the bare-parameter twin beside it kept them. Nothing in the ten-part gate
+    /// compiles that directory, so only a test here can see it.
     #[test]
-    fn a_struct_literal_built_from_a_slice_place_taints_but_one_built_from_values_does_not() {
+    fn a_struct_field_view_taints_only_when_its_source_is_spelled_too() {
         let src = "module m
 struct L { w: []f32 }
-fn main() -> i32 {
-    let mut a: [f32; 4] = [1.0; 4];
-    let sa: []f32 = a;
+fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
+    let sa: []f32 = SRC;
     let l: L = L { w: sa };
-    return l.w[0] as i32;
+    for i in 0..4 { for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + l.w[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = s;
+    } }
+}
+fn main() -> i32 {
+    let mut x: [f32; 16] = [1.0; 16];
+    let mut y: [f32; 16] = [2.0; 16];
+    let mut z: [f32; 16] = [0.0; 16];
+    mm(x, y, z);
+    return z[0] as i32;
 }
 ";
+        // `a` is spelled exactly once, in the view binding, so `l.w` is the only name that reaches
+        // it. The `block_d_struct.wk` shape: every kernel must survive it.
+        let packed = src.replace("SRC", "a");
         assert!(
-            !alias_free_of(src, "main"),
-            "a struct literal taking the slice view `sa` publishes a second name for `a`"
+            alias_free_of(&packed, "mm"),
+            "packing a parameter into a struct field is not two names for it"
+        );
+        let (prog, diags, interner) = lower(&packed);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM whose A operand is a struct-held parameter must still dispatch, got {:?}",
+            kernel_calls(&prog, &interner)
         );
 
+        // The same program with one token changed: `l.w` and `c` are now one buffer and both are
+        // spelled, so the GEMM would be writing its own A operand and must lower to the nest. The
+        // symbol comparison sixteen recognizers do (`out == x`) cannot see this — `l.w` and `c`
+        // are two different symbols.
+        let aliased = src.replace("SRC", "c");
+        assert!(
+            !alias_free_of(&aliased, "mm"),
+            "`l.w` and `c` are one buffer once both are spelled"
+        );
+        let (prog, diags, interner) = lower(&aliased);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM over a struct-field view of its own output must decline, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // A struct built from VALUES copies (`emit_copy`, value semantics) and must not taint, or
+        // every struct-using program would lose its kernels.
         let copied = "module m
 struct L { w: [f32; 4] }
 fn main() -> i32 {
