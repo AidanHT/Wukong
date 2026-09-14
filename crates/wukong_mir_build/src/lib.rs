@@ -31410,6 +31410,12 @@ fn main() -> i32 {
     /// tainted on the mere PRESENCE of the view and silently cost it all nine of its GEMM
     /// dispatches while the bare-parameter twin beside it kept them. Nothing in the ten-part gate
     /// compiles that directory, so only a test here can see it.
+    ///
+    /// Two further variants sit under those two, and each shipped as a live wrong answer AFTER the
+    /// half above it was already in place: a view OF a struct field (`let v: []f32 = l.w;`), which
+    /// needs the operand resolution to be a fixpoint over both maps rather than one pass over each,
+    /// and a REBOUND view name, which a name-keyed flow-insensitive map cannot resolve at all. Each
+    /// carries its own positive control, because "declines" is free if the rule declines everything.
     #[test]
     fn a_struct_field_view_taints_only_when_its_source_is_spelled_too() {
         let src = "module m
@@ -31476,6 +31482,196 @@ fn main() -> i32 {
         assert!(
             alias_free_of(copied, "main"),
             "a fixed-array field deep-copies (`emit_copy`, value semantics)"
+        );
+
+        // THIRD variant: a view OF the struct field. `let v: []f32 = l.w;` puts a `views` entry on
+        // top of the `field_views` entry, so an operand spelled `v` has to walk BOTH maps to reach
+        // `c`. Resolving each map once stopped at `l.w`, whose root `l` is a local no other operand
+        // shares -- and this program then emitted `1 wukong_sgemm` and printed
+        // `10 14 5 8 26 30 17 20 ...` where the scalar nest says `10 14 23 32 26 30 59 68 ...`,
+        // identically on interp and native at -O0, -O1, -O2 and -O3 (measured, all eight columns),
+        // so no differential, invariance or determinism gate in the tree could see it.
+        let view_of_field = |src: &str| {
+            src.replace(
+                "let l: L = L { w: sa };",
+                "let l: L = L { w: sa };\n    let v: []f32 = l.w;",
+            )
+            .replace("l.w[i*4+k]", "v[i*4+k]")
+        };
+
+        // The control first: the same two-link chain onto a parameter that is spelled nowhere else
+        // must keep its kernel, exactly as `l.w` does. Without this half, "declines" below could be
+        // bought by tainting every chain.
+        let packed_v = view_of_field(&packed);
+        assert!(
+            alias_free_of(&packed_v, "mm"),
+            "`v` -> `l.w` -> `sa` -> `a`, and `a` is spelled nowhere else"
+        );
+        let (prog, diags, interner) = lower(&packed_v);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM over a VIEW OF a struct-held parameter must still dispatch, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        let aliased_v = view_of_field(&aliased);
+        assert!(
+            !alias_free_of(&aliased_v, "mm"),
+            "`v` -> `l.w` -> `sa` -> `c`, which the nest writes"
+        );
+        let (prog, diags, interner) = lower(&aliased_v);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM over a VIEW OF a struct-field view of its own output must decline, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // A struct literal names ONE local once per `let`, however many borrowing fields it has, and
+        // the registration that detects a rebound name has to count it that way. Counting it per
+        // field would read `Layer { wq: swq, wk: swk }` as a rebinding of `l` and taint every
+        // struct-held weight block in the tree -- `block_d_struct.wk` packs TEN fields into one
+        // `Layer`, and nothing in the ten-part gate compiles that directory.
+        let two_fields = "module m
+struct L2 { w: []f32, u: []f32 }
+fn mm2(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
+    let sa: []f32 = a;
+    let sb: []f32 = b;
+    let l: L2 = L2 { w: sa, u: sb };
+    for i in 0..4 { for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + l.w[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = s;
+    } }
+}
+fn main() -> i32 {
+    let mut x: [f32; 16] = [1.0; 16];
+    let mut y: [f32; 16] = [2.0; 16];
+    let mut z: [f32; 16] = [0.0; 16];
+    mm2(x, y, z);
+    return z[0] as i32;
+}
+";
+        assert!(
+            alias_free_of(two_fields, "mm2"),
+            "two borrowing fields in one literal are one `let`, not a rebinding"
+        );
+        let (prog, diags, interner) = lower(two_fields);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a two-field weight struct must keep its GEMM, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // FOURTH variant, and it needs no struct at all: `views` is keyed by NAME and is
+        // last-writer-wins, so REBINDING a view name anywhere in the body re-points the nest's own
+        // operand at the wrong buffer. `s` is `c` where the nest reads it and `d` in the map, which
+        // read as two distinct roots and dispatched a GEMM writing its own A operand.
+        let shadowed = "module m
+fn mm(b: [f32; 16], mut c: [f32; 16], d: [f32; 16]) {
+    let s: []f32 = FIRST;
+    for i in 0..4 { for j in 0..4 {
+        let mut t: f32 = 0.0;
+        for k in 0..4 { t = t + s[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = t;
+    } }
+    REBIND
+}
+fn main() -> i32 {
+    let mut p: [f32; 16] = [1.0; 16];
+    let mut q: [f32; 16] = [2.0; 16];
+    let mut r: [f32; 16] = [3.0; 16];
+    mm(p, q, r);
+    return q[0] as i32;
+}
+";
+        let rebound = shadowed
+            .replace("FIRST", "c")
+            .replace("REBIND", "let s: []f32 = d;\n    print(s[0] as i32);");
+        assert!(
+            !alias_free_of(&rebound, "mm"),
+            "a name given a view meaning twice cannot be resolved by a name-keyed map"
+        );
+        let (prog, diags, interner) = lower(&rebound);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM whose A operand is a REBOUND view of its own output must decline, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // Bound once, onto a buffer the nest does not write: there is nothing to resolve wrongly and
+        // the kernel must survive, or the rule above is just "any view declines" wearing a hat.
+        let single = shadowed.replace("FIRST", "d").replace("REBIND", "");
+        assert!(
+            alias_free_of(&single, "mm"),
+            "one view binding, three distinct buffers"
+        );
+        let (prog, _d, interner) = lower(&single);
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM over a singly-bound view of a disjoint parameter must dispatch, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // The same rebinding one frame up, where the taint on the rebinding function does NOT help:
+        // `go` holds no nest of its own, so tainting `go` costs nothing and `mm` is what matters.
+        // The argument `s` is `c`, the map says `d`, and `mm(s, b, c)` therefore read as three
+        // distinct buffers and kept its kernel -- printing `10 14 5 8 ...` where the nest says
+        // `10 14 23 32 ...`, on interp and native alike. What closes it is that a rebound name has
+        // no resolution at all (`BodyScan::rebound` -> `Origin::Unknown`), not that its function is
+        // tainted.
+        let callsite = "module m
+fn mm(a: []f32, b: []f32, mut c: []f32) {
+    for i in 0..4 { for j in 0..4 {
+        let mut t: f32 = 0.0;
+        for k in 0..4 { t = t + a[i*4+k] * b[k*4+j]; }
+        c[i*4+j] = t;
+    } }
+}
+fn go(b: []f32, mut c: []f32, d: []f32) {
+    let s: []f32 = c;
+    mm(s, b, c);
+    REBIND
+}
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(16);
+    let mut y: []f32 = alloc_f32(16);
+    let mut w: []f32 = alloc_f32(16);
+    go(y, x, w);
+    return x[0] as i32;
+}
+";
+        let rebound_arg = callsite.replace("REBIND", "let s: []f32 = d;\n    print(s[0] as i32);");
+        assert!(
+            !alias_free_of(&rebound_arg, "mm"),
+            "`mm(s, b, c)` where `s` is a REBOUND view of `c` binds one buffer twice"
+        );
+        let (prog, diags, interner) = lower(&rebound_arg);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        assert!(
+            !prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a GEMM reached through an argument spelled with a rebound view must decline, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+
+        // Without the rebinding the very same call site is already aliased through the ORDINARY
+        // view resolution, so this control proves only that the program shape dispatches at all --
+        // which it must, or the assertion above is vacuous. Hence the disjoint third argument.
+        let clean = callsite
+            .replace("mm(s, b, c);", "mm(s, b, d);")
+            .replace("REBIND", "");
+        assert!(
+            alias_free_of(&clean, "mm"),
+            "`mm(s, b, d)` with `s` viewing `c` binds three distinct buffers"
+        );
+        let (prog, _d, interner) = lower(&clean);
+        assert!(
+            prog_calls(&prog, &interner, "wukong_sgemm"),
+            "a disjoint call through a view must still dispatch, got {:?}",
+            kernel_calls(&prog, &interner)
         );
     }
 
