@@ -499,13 +499,43 @@ const VM_SILU: i64 = 5;
 const VM_GELU: i64 = 6;
 const VM_ELU: i64 = 7;
 const VM_SOFTPLUS: i64 = 9;
+const VM_LOG: i64 = 1;
+const VM_LEAKYRELU: i64 = 8;
+const VM_SELU: i64 = 11;
+const VM_TANHSHRINK: i64 = 12;
+const VM_HARDSIGMOID: i64 = 13;
+const VM_HARDSWISH: i64 = 14;
+const VM_MISH: i64 = 10;
+const VM_EXP2: i64 = 18;
+const VM_LOG2: i64 = 19;
+const VM_SINH: i64 = 20;
+const VM_ASINH: i64 = 22;
+const VM_ACOSH: i64 = 23;
+const VM_ATANH: i64 = 24;
+const VM_ATAN: i64 = 25;
+const VM_EXPM1: i64 = 26;
+const VM_LOG1P: i64 = 27;
+const VM_EXP10: i64 = 28;
+const VM_LOG10: i64 = 29;
+const VM_SOFTSIGN: i64 = 30;
+const VM_TAN: i64 = 32;
+const VM_ASIN: i64 = 33;
+const VM_ACOS: i64 = 34;
+const VM_CBRT: i64 = 35;
 const RED_SUM: i64 = 2;
 const RED_SSD: i64 = 1;
+const RED_SUMABS: i64 = 9;
+const RED_ABSDIFF: i64 = 10;
 const VE_ID: i64 = 0;
+const VE_RELU: i64 = 1;
 const VE_USE_Y: i64 = 256;
 // velem *compute modes* — they live above the low activation byte, so `op & 0xff` does not see them.
 const VE_HADAMARD: i64 = 512;
 const VE_DIV: i64 = 1024;
+/// Not a real runtime mode: a high bit no rule claims, to pin that the dispatch fails closed.
+const VE_UNKNOWN_MODE: i64 = 1 << 12;
+/// `wukong_runtime::bias::BIAS_ACT_NONE` — the pure broadcast add, no fused activation.
+const BIAS_ACT_NONE: i64 = -1;
 
 fn ci(b: &mut Builder, x: i64) -> ValueId {
     b.build(MirType::I64, Op::ConstInt(x as i128, MirType::I64))
@@ -1039,6 +1069,8 @@ fn linear_softplus_sum_vjp() {
 const NORM_SOFTMAX: i64 = 0;
 const NORM_LAYERNORM: i64 = 1;
 const NORM_RMSNORM: i64 = 2;
+const NORM_LOGSOFTMAX: i64 = 3;
+const NORM_L2NORM: i64 = 4;
 const RED_DOT: i64 = 0;
 
 /// Build `y = norm(x); loss = sum_i C[i]*y[i]` — a coefficient-weighted norm (so dy = C is
@@ -1134,16 +1166,10 @@ fn softmax_dot_vjp() {
     tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
 }
 
-#[test]
-fn layernorm_dot_vjp() {
-    let (rows, cols) = (3, 5);
-    let eps = 1e-5f32;
-    let mut it = Interner::default();
-    let fwd = build_norm_dot(&mut it, rows, cols, NORM_LAYERNORM, eps.to_bits() as i64);
-    let mut seed = 0x1A4Eu64;
-    let xb = rand_vec(&mut seed, rows * cols);
-    let cb = rand_vec(&mut seed, rows * cols);
-    // y = (x - mu)/sigma per row; dy = C; dx = (1/sigma)(dy - mean(dy) - y*mean(dy*y)).
+/// f64 reference for `d/dx Σ C·layernorm(x)`: `y = (x - mu)/sigma` per row, `dy = C`,
+/// `dx = (1/sigma)(dy - mean(dy) - y·mean(dy·y))`. The variance is the **stable centered** form —
+/// the one the forward kernel computes, and the one the emitted backward must agree with.
+fn layernorm_dx_ref(xb: &[f32], cb: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f64> {
     let mut dx = vec![0.0; rows * cols];
     for r in 0..rows {
         let row = &xb[r * cols..(r + 1) * cols];
@@ -1162,6 +1188,49 @@ fn layernorm_dot_vjp() {
                 (1.0 / sigma) * (cb[r * cols + j] as f64 - mean_dy - y[j] * mean_dyy);
         }
     }
+    dx
+}
+
+#[test]
+fn layernorm_dot_vjp() {
+    let (rows, cols) = (3, 5);
+    let eps = 1e-5f32;
+    let mut it = Interner::default();
+    let fwd = build_norm_dot(&mut it, rows, cols, NORM_LAYERNORM, eps.to_bits() as i64);
+    let mut seed = 0x1A4Eu64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let cb = rand_vec(&mut seed, rows * cols);
+    let dx = layernorm_dx_ref(&xb, &cb, rows, cols, eps);
+    let inputs = vec![xb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
+/// The same LayerNorm VJP on rows with a large **offset mean** — the regime `layernorm_dot_vjp`
+/// above never enters, because `rand_vec` is centred on ~0.
+///
+/// The backward used to recover the row variance as `E[x²] - mu²` (a SUM and a SUMSQ), while the
+/// forward computes the mean first and then `Σ(x - mu)²`
+/// (`wukong_runtime::norm::layernorm_row_scalar` -> `dev2_8_scalar`, and the runtime's own
+/// `layernorm_bwd.rs` "matching the forward variance discipline"). That difference of two nearly
+/// equal large numbers is the textbook catastrophic cancellation: its f32 relative error grows like
+/// `eps·(mu/sigma)²`, so it is invisible at `mu ≈ 0` and dominant on real residual-stream
+/// activations. Here `mu/sigma ≈ 700`: with 8 columns of `x ≈ 200 ± 0.5`, `Σx² ≈ 3.2e5` has an f32
+/// spacing of ~3e-2 while the true variance is ~0.08, so the cancelling formula loses the variance
+/// entirely (it can even go negative and make `Sqrt` return NaN). The centered two-pass form this
+/// now emits keeps ~4 correct digits at the same inputs.
+#[test]
+fn layernorm_dot_vjp_offset_mean() {
+    let (rows, cols) = (3, 8);
+    let eps = 1e-5f32;
+    let mut it = Interner::default();
+    let fwd = build_norm_dot(&mut it, rows, cols, NORM_LAYERNORM, eps.to_bits() as i64);
+    let mut seed = 0x0FF5u64;
+    let xb: Vec<f32> = rand_vec(&mut seed, rows * cols)
+        .iter()
+        .map(|&v| 200.0 + v)
+        .collect();
+    let cb = rand_vec(&mut seed, rows * cols);
+    let dx = layernorm_dx_ref(&xb, &cb, rows, cols, eps);
     let inputs = vec![xb, cb, vec![0.0]];
     tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
 }
@@ -1980,15 +2049,24 @@ fn veckernel_declines_loudly() {
     );
 }
 
-/// Build `t = velem(x, y, n, op); loss = Σ t` — the tape mir_build's `match_velem_binary` emits for
-/// `t[i] = x[i] * y[i]` (op = `VE_HADAMARD|VE_USE_Y`) or `x[i] / y[i]` (op = `VE_DIV|VE_USE_Y`).
-/// Params: X, Y, out; intermediate: t (alloca).
-fn build_velem_sum(it: &mut Interner, n: usize, op: i64) -> Fwd {
+/// Build `t = velem(x, y, n, op); loss = Σ_i C[i]·t[i]` — the tape mir_build's `match_velem_binary`
+/// emits for `t[i] = x[i] * y[i]` (op = `VE_HADAMARD|VE_USE_Y`) or `x[i] / y[i]`
+/// (op = `VE_DIV|VE_USE_Y`), closed with a COEFFICIENT-WEIGHTED reduction.
+///
+/// The weighting is the point. A plain `RED_SUM` loss makes the upstream adjoint `dout` equal to
+/// 1.0 at every element, and a rule that dropped the upstream factor *entirely* — returning the
+/// bare local derivative — passes such a test exactly. `RED_DOT` against a non-uniform `C` gives
+/// `dout = C`, so the factor is observable. (This is the `build_norm_dot` idiom, which the norm,
+/// matmul and bias tests already used; it simply had not been carried over here.)
+///
+/// Params: X, Y, C, out; intermediate: t (alloca).
+fn build_velem_dot(it: &mut Interner, n: usize, op: i64) -> Fwd {
     let velem = it.intern("wukong_velem_f32");
     let sreduce = it.intern("wukong_sreduce_f32");
-    let mut b = Builder::new(it.intern("velem_sum"), MirType::Void);
+    let mut b = Builder::new(it.intern("velem_dot"), MirType::Void);
     let x = b.add_param(PTR);
     let y = b.add_param(PTR);
+    let c = b.add_param(PTR);
     let out = b.add_param(PTR);
     let t = b.alloca(arr(n));
     let nv = ci(&mut b, n as i64);
@@ -1998,12 +2076,844 @@ fn build_velem_sum(it: &mut Interner, n: usize, op: i64) -> Fwd {
         func: velem,
         args: vec![x, y, t, nv, a_c, b_c, c_c, opv],
     });
-    let sumop = ci(&mut b, RED_SUM);
+    let dotop = ci(&mut b, RED_DOT);
     let loss = b.build(
         MirType::F32,
         Op::Call {
             func: sreduce,
-            args: vec![t, t, nv, sumop],
+            args: vec![c, t, nv, dotop],
+        },
+    );
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    Fwd {
+        func: b.finish(),
+        lens: vec![n, n, n, 1],
+        loss_out: 3,
+    }
+}
+
+/// A deterministic, non-uniform, strictly-positive coefficient vector for the `*_dot` losses. Every
+/// entry differs from 1.0, so a dropped upstream-adjoint factor changes the answer at every lane.
+fn coef_vec(n: usize) -> Vec<f32> {
+    (0..n).map(|i| 0.75 + 0.5 * i as f32).collect()
+}
+
+/// A velem *compute mode* (`VE_HADAMARD` = 512, `VE_DIV` = 1024) lives ABOVE the activation byte, so
+/// an `op & 0xff != VE_ID` gate would let it through and apply the AFFINE VJP `dx = a·dout` to a
+/// nonlinear kernel: for `loss = Σ x[i]·y[i]` that emitted a gradient of 1.0 everywhere instead of
+/// `y[i]`, with no diagnostic. Hadamard and quotient now have their own real rules (gated by
+/// [`velem_hadamard_vjp`] / [`velem_div_vjp`], which would fail loudly if the affine rule were ever
+/// applied to them again), so what this pins is the remaining half of the contract: the dispatch
+/// splits the activation byte from the compute mode and **fails closed** on everything it does not
+/// have a rule for — a fused activation on either form, and any unknown high-bit mode.
+#[test]
+fn velem_compute_modes_decline_loudly() {
+    for (op, needle) in [
+        // A fused activation on the affine form: `relu(a·x + b·y + c)` needs a masked loop.
+        (VE_RELU | VE_USE_Y, "activation"),
+        // ...and on the Hadamard form: `relu(x · y)`.
+        (VE_RELU | VE_HADAMARD, "activation"),
+        // An unknown compute mode above the activation byte must NOT fall into any existing rule.
+        (VE_UNKNOWN_MODE | VE_USE_Y, "compute mode"),
+    ] {
+        let mut it = Interner::default();
+        let fwd = build_velem_dot(&mut it, 8, op);
+        let err = grad(&fwd.func, &[0, 1], &mut it)
+            .expect_err("an unmodelled velem op spelling must not take some other rule");
+        assert!(
+            err.contains("velem VJP") && err.contains(needle),
+            "op {op} must decline naming what blocked it, got: {err}"
+        );
+    }
+}
+
+/// The Hadamard product `out = x (.) y` — the gate in every SwiGLU/GeGLU MLP, every attention mask
+/// and every dropout mask, and the single most common tensor op after add. For
+/// `loss = Σ_i C[i]·x[i]·y[i]` the VJP is `dx = C (.) y`, `dy = C (.) x`; the affine rule that used
+/// to reach this op answered 1.0 everywhere, so the closed form here is exactly the discriminating
+/// check. `C` is non-uniform, so it also catches a rule that dropped the upstream adjoint entirely.
+#[test]
+fn velem_hadamard_vjp() {
+    let n = 8;
+    let mut it = Interner::default();
+    let fwd = build_velem_dot(&mut it, n, VE_HADAMARD | VE_USE_Y);
+    let mut seed = 0x4AD0u64;
+    let xb = rand_vec(&mut seed, n);
+    let yb = rand_vec(&mut seed, n);
+    let cb = coef_vec(n);
+    let dx: Vec<f64> = cb
+        .iter()
+        .zip(&yb)
+        .map(|(&c, &v)| c as f64 * v as f64)
+        .collect();
+    let dy: Vec<f64> = cb
+        .iter()
+        .zip(&xb)
+        .map(|(&c, &v)| c as f64 * v as f64)
+        .collect();
+    let inputs = vec![xb, yb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1], &inputs, &[dx, dy], &mut it);
+}
+
+/// `out = x (.) x` is ONE op with a repeated operand, not two contributions: `dx = 2·dout(.)x`.
+/// Without the special case the two-buffer path calls `single(x)` twice and always errors — the
+/// same shape that broke the self-dot sum-of-squares loss (see [`self_dot_sumsq_vjp`]).
+/// The loss is coefficient-weighted, so the factor of 2 is not the only thing under test: a rule
+/// that dropped `dout` would answer `2x` where the truth is `2·C(.)x`.
+#[test]
+fn velem_hadamard_self_vjp() {
+    let n = 8;
+    let mut it = Interner::default();
+    let velem = sym(&mut it, "wukong_velem_f32");
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "had_self"), MirType::Void);
+    let x = b.add_param(PTR);
+    let c = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let t = b.alloca(arr(n));
+    let nv = ci(&mut b, n as i64);
+    let (a_c, b_c, c_c) = (cf(&mut b, 1.0), cf(&mut b, 1.0), cf(&mut b, 0.0));
+    let opv = ci(&mut b, VE_HADAMARD | VE_USE_Y);
+    b.build_void(Op::Call {
+        func: velem,
+        args: vec![x, x, t, nv, a_c, b_c, c_c, opv],
+    });
+    let dotop = ci(&mut b, RED_DOT);
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![c, t, nv, dotop],
+        },
+    );
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![n, n, 1],
+        loss_out: 2,
+    };
+    let mut seed = 0x5E1Fu64;
+    let xb = rand_vec(&mut seed, n);
+    let cb = coef_vec(n);
+    let dx: Vec<f64> = cb
+        .iter()
+        .zip(&xb)
+        .map(|(&c, &v)| 2.0 * c as f64 * v as f64)
+        .collect();
+    let inputs = vec![xb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
+/// The elementwise quotient `out = x / y`: `dx = C/y`, `dy = -C·x/y²` for
+/// `loss = Σ_i C[i]·x[i]/y[i]`. `y` is held away from zero so the central difference is well
+/// conditioned, and `C` is non-uniform so a dropped upstream adjoint is visible.
+#[test]
+fn velem_div_vjp() {
+    let n = 8;
+    let mut it = Interner::default();
+    let fwd = build_velem_dot(&mut it, n, VE_DIV | VE_USE_Y);
+    let mut seed = 0xD1D0u64;
+    let xb = rand_vec(&mut seed, n);
+    // y in [1.0, 2.0): far from the pole, so 1/y and x/y² are both well scaled.
+    let yb: Vec<f32> = (0..n).map(|_| 1.5 + lcg(&mut seed) as f32).collect();
+    let cb = coef_vec(n);
+    let dx: Vec<f64> = cb
+        .iter()
+        .zip(&yb)
+        .map(|(&c, &v)| c as f64 / v as f64)
+        .collect();
+    let dy: Vec<f64> = cb
+        .iter()
+        .zip(xb.iter().zip(&yb))
+        .map(|(&c, (&xv, &yv))| -(c as f64) * (xv as f64) / (yv as f64 * yv as f64))
+        .collect();
+    let inputs = vec![xb, yb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1], &inputs, &[dx, dy], &mut it);
+}
+
+/// The two spellings the affine rule IS valid for must keep differentiating: the whitelist gate must
+/// not have narrowed the accepted set. `loss = Σ_i C[i]·(a·x[i] + b·y[i])` -> `dx = a·C`,
+/// `dy = b·C` per element, with `a = b = 1` here. The weighting matters even for the linear rule:
+/// under the old `RED_SUM` loss the expectation was the constant vector `1.0`, which the correct
+/// `dx = a·dout` and a hypothetical `dx = a` produce alike.
+#[test]
+fn velem_affine_still_differentiates() {
+    let n = 8;
+    let mut it = Interner::default();
+    let fwd = build_velem_dot(&mut it, n, VE_ID | VE_USE_Y);
+    let mut seed = 0xBE1Eu64;
+    let xb = rand_vec(&mut seed, n);
+    let yb = rand_vec(&mut seed, n);
+    let cb = coef_vec(n);
+    let want: Vec<f64> = cb.iter().map(|&c| c as f64).collect();
+    let inputs = vec![xb, yb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1], &inputs, &[want.clone(), want], &mut it);
+}
+
+// ---------------------------------------------------------------------------------------------
+// P4.4 — the silent zero gradient: a scalar load of a recognized kernel's OUTPUT buffer.
+// ---------------------------------------------------------------------------------------------
+
+/// Build `vmath(w -> h); s = V[0]·h[0] + V[1]·h[1]; out[0] = s; return s`, with `h` a buffer
+/// PARAMETER that a recognized kernel writes and the loss then reads back through two scalar loads.
+///
+/// `V` does two jobs. It makes the adjoint arriving at the kernel's output NON-UNIFORM
+/// (`dL/dh = [V0, V1, 0, 0]` rather than `[1, 1, 0, 0]`), so a rule that dropped the upstream factor
+/// is visible; and it gives the finite difference a second differentiated input that is a genuine
+/// forward INPUT. `h` cannot be finite-differenced at all — it is a forward output, so perturbing
+/// it is overwritten before it is read — which used to leave FD covering only `w`.
+/// Params: W, H, V, out.
+fn build_kernel_out_scalar_load(it: &mut Interner, n: usize, op: i64) -> Fwd {
+    let vmath = it.intern("wukong_vmath_f32");
+    let mut b = Builder::new(it.intern("kout"), MirType::Void);
+    let w = b.add_param(PTR);
+    let h = b.add_param(PTR);
+    let v = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let (nv, opv) = (ci(&mut b, n as i64), ci(&mut b, op));
+    b.build_void(Op::Call {
+        func: vmath,
+        args: vec![w, h, nv, opv],
+    });
+    let i1 = ci(&mut b, 1);
+    let h0 = b.build(MirType::F32, Op::Load(h, MirType::F32));
+    let hp = b.build(
+        PTR,
+        Op::Gep {
+            ptr: h,
+            index: i1,
+            elem: MirType::F32,
+        },
+    );
+    let h1 = b.build(MirType::F32, Op::Load(hp, MirType::F32));
+    let v0 = b.build(MirType::F32, Op::Load(v, MirType::F32));
+    let vp = b.build(
+        PTR,
+        Op::Gep {
+            ptr: v,
+            index: i1,
+            elem: MirType::F32,
+        },
+    );
+    let v1 = b.build(MirType::F32, Op::Load(vp, MirType::F32));
+    let p0 = b.build(MirType::F32, Op::Bin(BinOp::FMul, h0, v0));
+    let p1 = b.build(MirType::F32, Op::Bin(BinOp::FMul, h1, v1));
+    let s = b.build(MirType::F32, Op::Bin(BinOp::FAdd, p0, p1));
+    b.build_void(Op::Store { ptr: out, value: s });
+    b.ret(Some(s));
+    Fwd {
+        func: b.finish(),
+        lens: vec![n, n, n, 1],
+        loss_out: 3,
+    }
+}
+
+/// The one thing this crate promises never to do, and did: an **all-zero gradient at exit 0**.
+///
+/// `diff_load` routed a scalar load's adjoint straight into `grad_buf[param]` and never touched
+/// `buf_adj`. Every producer rule in `tape.rs` gates on `buf_adj[out]` and returns `Ok(())` —
+/// emitting nothing — when it is absent. So for `k(w -> h); s = h[0] + h[1]`, with `h` a `wrt`
+/// buffer parameter, the two loads wrote into h's gradient, the vmath rule then found no output
+/// adjoint for `h` and emitted nothing at all, and `dL/dw` came back all zeros with no diagnostic.
+/// docs/roadmap.md described exactly this case in prose; nothing in the code or the tests guarded
+/// it. `diff_load` now goes through `grad_target`, which seeds `buf_adj`.
+///
+/// Note the gate cannot be the finite difference over `h`: `h` is a forward OUTPUT, so perturbing
+/// it is overwritten before it is read. That is a property of the shape, not a gap that can be
+/// closed — so the FD arm covers the two real inputs, `w` AND the coefficient vector `V`, and the
+/// f64 closed form covers all three gradients including `dL/dh`.
+#[test]
+fn kernel_output_read_by_scalar_load() {
+    const N: usize = 4;
+    let mut it = Interner::default();
+    let fwd = build_kernel_out_scalar_load(&mut it, N, VM_EXP);
+    let mut seed = 0x4004u64;
+    let wb = rand_vec(&mut seed, N);
+    let vb = coef_vec(N);
+    let inputs = vec![wb.clone(), vec![0.0f32; N], vb.clone(), vec![0.0]];
+    let (prog, gname) = build(&fwd.func, &[0, 1, 2], &mut it);
+    let g = analytic_grad_f32(&prog, gname, &fwd, &inputs, &[0, 1, 2], &it);
+
+    // dL/dh = [V0, V1, 0, 0] and h = exp(w), so dL/dw[i] = V[i]·exp(w[i]) and dL/dV[i] = h[i].
+    let want_dw: Vec<f64> = (0..N)
+        .map(|i| {
+            if i < 2 {
+                vb[i] as f64 * (wb[i] as f64).exp()
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let want_dh: Vec<f64> = (0..N)
+        .map(|i| if i < 2 { vb[i] as f64 } else { 0.0 })
+        .collect();
+    let want_dv: Vec<f64> = (0..N)
+        .map(|i| if i < 2 { (wb[i] as f64).exp() } else { 0.0 })
+        .collect();
+    assert!(
+        g[0].iter().any(|v| v.abs() > 1e-3),
+        "dL/dw is all zeros — the kernel's output adjoint was never seeded"
+    );
+    // `dw` and `dV` both carry an f32 `exp`, so they get the 3e-3 closed-form band.
+    for (name, got, want) in [("dw", &g[0], &want_dw), ("dV", &g[2], &want_dv)] {
+        for (j, (&a, &c)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (a - c).abs() <= 3e-3 + 3e-3 * c.abs(),
+                "{name}[{j}]: analytic {a} vs closed form {c}"
+            );
+        }
+    }
+    // `dL/dh` is not an approximation of anything: the adjoint of `h[i]` IS the coefficient `V[i]`
+    // the loss loaded, so it must come back exact. Hold it to `assert_close`'s 1e-9 band — the band
+    // wave 1 held it to — and not to the f32-transcendental band above, which on a want of 0.75 is
+    // 5.25e-3 wide and would pass a seeded adjoint off by most of a percent (mutation-checked).
+    assert_close(&g[1], &want_dh, "dL/dh");
+
+    // ...and the finite difference over both real inputs (w and V) agrees.
+    let fd = fd_grad_f32(&prog, &fwd, &inputs, &[0, 2], 5e-3, &it);
+    for (gi, (name, got)) in [("dw", &g[0]), ("dV", &g[2])].iter().enumerate() {
+        for (j, (&a, &f)) in got.iter().zip(&fd[gi]).enumerate() {
+            assert!(
+                (a - f).abs() <= 5e-3 + 3e-2 * f.abs(),
+                "{name}[{j}]: analytic {a} vs finite-diff {f}"
+            );
+        }
+    }
+}
+
+/// The sibling shape: the kernel's output buffer is a parameter that is NOT in the differentiated
+/// set. `diff_load` then has nowhere to put the adjoint, and a parameter carries no element count
+/// to size a scratch gradient from — so dropping it silently zeroes the kernel's inputs, exactly as
+/// above. It must refuse instead, naming the buffer and the fix.
+#[test]
+fn kernel_output_scalar_load_without_wrt_declines_loudly() {
+    const N: usize = 4;
+    let mut it = Interner::default();
+    let fwd = build_kernel_out_scalar_load(&mut it, N, VM_EXP);
+    let err = grad(&fwd.func, &[0], &mut it)
+        .expect_err("a dropped kernel-output adjoint must not silently zero the gradient");
+    assert!(
+        err.contains("recognized kernel") && err.contains("wrt"),
+        "the decline must name the cause and the fix, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// P4.2 — the plain matmul and the broadcast bias: `y = act(x.W^T + b)` is the most common construct
+// in machine learning, and spelled WITH the bias it used to be undifferentiable.
+// ---------------------------------------------------------------------------------------------
+
+/// `loss = sum_ij G[i,j]*(A.B)[i,j]` — a coefficient-weighted plain (non-transposed) matmul, so the
+/// output adjoint `dC = G` is non-trivial and a transposed index would be caught.
+#[test]
+fn matmul_nn_vjp() {
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let sgemm = sym(&mut it, "wukong_sgemm");
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "mmnn"), MirType::Void);
+    let pa = b.add_param(PTR); // A: m x k
+    let pb = b.add_param(PTR); // B: k x n
+    let pg = b.add_param(PTR); // G: m x n coefficients
+    let out = b.add_param(PTR);
+    let c = b.alloca(arr(m * n));
+    let (mv, kv, nv, beta) = (
+        ci(&mut b, m as i64),
+        ci(&mut b, k as i64),
+        ci(&mut b, n as i64),
+        ci(&mut b, 0),
+    );
+    b.build_void(Op::Call {
+        func: sgemm,
+        args: vec![pa, pb, c, mv, kv, nv, beta],
+    });
+    let (mn, dotop) = (ci(&mut b, (m * n) as i64), ci(&mut b, RED_DOT));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![pg, c, mn, dotop],
+        },
+    );
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![m * k, k * n, m * n, 1],
+        loss_out: 3,
+    };
+
+    let mut seed = 0x3EEDu64;
+    let ab = rand_vec(&mut seed, m * k);
+    let bb = rand_vec(&mut seed, k * n);
+    let gb = rand_vec(&mut seed, m * n);
+    // dA[i,p] = sum_j G[i,j]*B[p,j];  dB[p,j] = sum_i A[i,p]*G[i,j].
+    let mut da = vec![0.0; m * k];
+    let mut db = vec![0.0; k * n];
+    for i in 0..m {
+        for j in 0..n {
+            let g = gb[i * n + j] as f64;
+            for p in 0..k {
+                da[i * k + p] += g * bb[p * n + j] as f64;
+                db[p * n + j] += g * ab[i * k + p] as f64;
+            }
+        }
+    }
+    let inputs = vec![ab, bb, gb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1], &inputs, &[da, db], &mut it);
+}
+
+/// Build `p = X.W^T; q = p + b (broadcast over rows); loss = sum_ij G[i,j]*q[i,j]`.
+/// Params: X, W, b, G, out.
+fn build_linear_bias(it: &mut Interner, m: usize, k: usize, n: usize, bias_op: i64) -> Fwd {
+    let sgemm_nt = it.intern("wukong_sgemm_nt");
+    let bias = it.intern("wukong_bias_bcast_f32");
+    let sreduce = it.intern("wukong_sreduce_f32");
+    let mut b = Builder::new(it.intern("linbias"), MirType::Void);
+    let x = b.add_param(PTR);
+    let w = b.add_param(PTR);
+    let bv = b.add_param(PTR);
+    let gp = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let p = b.alloca(arr(m * n));
+    let q = b.alloca(arr(m * n));
+    let (mv, kv, nv, beta) = (
+        ci(&mut b, m as i64),
+        ci(&mut b, k as i64),
+        ci(&mut b, n as i64),
+        ci(&mut b, 0),
+    );
+    b.build_void(Op::Call {
+        func: sgemm_nt,
+        args: vec![x, w, p, mv, kv, nv, beta],
+    });
+    let bop = ci(&mut b, bias_op);
+    b.build_void(Op::Call {
+        func: bias,
+        args: vec![p, bv, q, mv, nv, bop],
+    });
+    let (mn, dotop) = (ci(&mut b, (m * n) as i64), ci(&mut b, RED_DOT));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![gp, q, mn, dotop],
+        },
+    );
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    Fwd {
+        func: b.finish(),
+        lens: vec![m * k, n * k, n, m * n, 1],
+        loss_out: 4,
+    }
+}
+
+/// The linear layer WITH a bias: `dx`/`dW` are the matmul adjoints of `dq = G`, and
+/// `db[j] = sum_i G[i,j]` — the column reduction `wukong_colsum_f32` already implements. Before
+/// this rule the bias was load-bearing on whether the model could be differentiated at all: the
+/// same layer spelled without it worked.
+#[test]
+fn linear_bias_sum_vjp() {
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear_bias(&mut it, m, k, n, BIAS_ACT_NONE);
+    let mut seed = 0xB1A5u64;
+    let xb = rand_vec(&mut seed, m * k);
+    let wb = rand_vec(&mut seed, n * k);
+    let bb = rand_vec(&mut seed, n);
+    let gb = rand_vec(&mut seed, m * n);
+    let dp: Vec<f64> = gb.iter().map(|&v| v as f64).collect();
+    let (dx, dw) = matmul_nt_backward(&dp, &xb, &wb, m, k, n);
+    let db: Vec<f64> = (0..n)
+        .map(|j| (0..m).map(|i| gb[i * n + j] as f64).sum())
+        .collect();
+    let inputs = vec![xb, wb, bb, gb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1, 2], &inputs, &[dx, dw, db], &mut it);
+}
+
+/// A *fused* activation inside the bias kernel (the `act(x.W^T + b)` epilogue the recognizer folds)
+/// has no rule: the masked derivative is not what `dx = dout` computes. It must refuse rather than
+/// let a performance fusion silently change the gradient.
+#[test]
+fn bias_fused_activation_declines_loudly() {
+    let (m, k, n) = (3, 4, 2);
+    let mut it = Interner::default();
+    let fwd = build_linear_bias(&mut it, m, k, n, VM_RELU);
+    let err = grad(&fwd.func, &[0, 1, 2], &mut it)
+        .expect_err("a fused bias activation must not take the pure-add VJP");
+    assert!(
+        err.contains("wukong_bias_bcast_f32") && err.contains("fused activation"),
+        "the decline must name the kernel and the fused activation, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// P4.1 — log-softmax and L2-norm (the classification loss path and the unit-norm projection), and
+// the affine norm with a learned gamma/beta (the shipped transformer LayerNorm).
+// ---------------------------------------------------------------------------------------------
+
+/// log-softmax: `dx = dy - softmax(x)*sum_j dy_j` per row — the same form PyTorch's
+/// `_log_softmax_backward_data` computes as `grad - exp(output)*grad.sum(dim)`. Without it there is
+/// no numerically stable classification training path at all.
+#[test]
+fn logsoftmax_dot_vjp() {
+    let (rows, cols) = (3, 4);
+    let mut it = Interner::default();
+    let fwd = build_norm_dot(&mut it, rows, cols, NORM_LOGSOFTMAX, 0);
+    let mut seed = 0x109Au64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let cb = rand_vec(&mut seed, rows * cols);
+    let p = softmax_f64(&xb, rows, cols);
+    let mut dx = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let s: f64 = (0..cols).map(|j| cb[r * cols + j] as f64).sum();
+        for j in 0..cols {
+            let idx = r * cols + j;
+            dx[idx] = cb[idx] as f64 - p[idx] * s;
+        }
+    }
+    let inputs = vec![xb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
+/// L2 (unit-norm) projection: `y = x/r`, `r = sqrt(sum x^2 + eps)`, so
+/// `dx = (1/r)(dy - y*<dy, y>)` — RMSNorm's backward with the `1/n` divisor set to 1. This is the
+/// `torch.nn.functional.normalize` gradient (cosine similarity, normalized embeddings, retrieval).
+#[test]
+fn l2norm_dot_vjp() {
+    let (rows, cols) = (3, 5);
+    let eps = 1e-5f32;
+    let mut it = Interner::default();
+    let fwd = build_norm_dot(&mut it, rows, cols, NORM_L2NORM, eps.to_bits() as i64);
+    let mut seed = 0x1207u64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let cb = rand_vec(&mut seed, rows * cols);
+    let mut dx = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let row = &xb[r * cols..(r + 1) * cols];
+        let ss = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>();
+        let rr = (ss + eps as f64).sqrt();
+        let y: Vec<f64> = row.iter().map(|&v| v as f64 / rr).collect();
+        let dot: f64 = (0..cols).map(|j| cb[r * cols + j] as f64 * y[j]).sum();
+        for j in 0..cols {
+            dx[r * cols + j] = (1.0 / rr) * (cb[r * cols + j] as f64 - y[j] * dot);
+        }
+    }
+    let inputs = vec![xb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+}
+
+/// Build `y = norm_affine(x, gamma, beta); loss = sum_i C[i]*y[i]`, with `beta` optionally absent (a
+/// `Ptr`-typed `ConstInt(0)`, exactly how lowering spells a null operand). Params:
+/// X, GAMMA, [BETA], C, out.
+fn build_norm_affine_dot(
+    it: &mut Interner,
+    rows: usize,
+    cols: usize,
+    op: i64,
+    eps_bits: i64,
+    with_beta: bool,
+) -> Fwd {
+    let norm = it.intern("wukong_norm_affine_f32");
+    let sreduce = it.intern("wukong_sreduce_f32");
+    let mut b = Builder::new(it.intern("naffdot"), MirType::Void);
+    let x = b.add_param(PTR);
+    let gamma = b.add_param(PTR);
+    let beta_p = if with_beta {
+        Some(b.add_param(PTR))
+    } else {
+        None
+    };
+    let c = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let y = b.alloca(arr(rows * cols));
+    let beta = match beta_p {
+        Some(p) => p,
+        None => b.build(PTR, Op::ConstInt(0, PTR)),
+    };
+    let (rv, cv, epsv, opv) = (
+        ci(&mut b, rows as i64),
+        ci(&mut b, cols as i64),
+        ci(&mut b, eps_bits),
+        ci(&mut b, op),
+    );
+    b.build_void(Op::Call {
+        func: norm,
+        args: vec![x, y, gamma, beta, rv, cv, epsv, opv],
+    });
+    let (rc, dotop) = (ci(&mut b, (rows * cols) as i64), ci(&mut b, RED_DOT));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![c, y, rc, dotop],
+        },
+    );
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    let lens = if with_beta {
+        vec![rows * cols, cols, cols, rows * cols, 1]
+    } else {
+        vec![rows * cols, cols, rows * cols, 1]
+    };
+    let loss_out = lens.len() - 1;
+    Fwd {
+        func: b.finish(),
+        lens,
+        loss_out,
+    }
+}
+
+/// f64 reference for the affine norm backward. Returns `(dx, dgamma, dbeta)` for
+/// `y[i,j] = xhat[i,j]*gamma[j] + beta[j]` and `dy = C`, where `xhat` is LayerNorm's
+/// `(x - mu)/sigma` (`layernorm = true`) or RMSNorm's `x/sqrt(mean(x^2) + eps)`.
+fn norm_affine_ref(
+    xb: &[f32],
+    gb: &[f32],
+    cb: &[f32],
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    layernorm: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let nf = cols as f64;
+    let mut dx = vec![0.0; rows * cols];
+    let mut dgamma = vec![0.0; cols];
+    let mut dbeta = vec![0.0; cols];
+    for r in 0..rows {
+        let row = &xb[r * cols..(r + 1) * cols];
+        let (mu, inv) = if layernorm {
+            let mu = row.iter().map(|&v| v as f64).sum::<f64>() / nf;
+            let var = row.iter().map(|&v| (v as f64 - mu).powi(2)).sum::<f64>() / nf;
+            (mu, 1.0 / (var + eps as f64).sqrt())
+        } else {
+            let ms = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / nf;
+            (0.0, 1.0 / (ms + eps as f64).sqrt())
+        };
+        let xhat: Vec<f64> = row.iter().map(|&v| (v as f64 - mu) * inv).collect();
+        let dyr: Vec<f64> = (0..cols).map(|j| cb[r * cols + j] as f64).collect();
+        for j in 0..cols {
+            dgamma[j] += dyr[j] * xhat[j];
+            dbeta[j] += dyr[j];
+        }
+        // dx is the UNSCALED norm backward run on dxhat = dy*gamma.
+        let dxhat: Vec<f64> = (0..cols).map(|j| dyr[j] * gb[j] as f64).collect();
+        let mean_dxhat = if layernorm {
+            dxhat.iter().sum::<f64>() / nf
+        } else {
+            0.0
+        };
+        let mean_dxx = (0..cols).map(|j| dxhat[j] * xhat[j]).sum::<f64>() / nf;
+        for j in 0..cols {
+            dx[r * cols + j] = inv * (dxhat[j] - mean_dxhat - xhat[j] * mean_dxx);
+        }
+    }
+    (dx, dgamma, dbeta)
+}
+
+/// **LayerNorm with a learned gamma and beta — the shipped transformer norm.** `emit_norm` picks
+/// `wukong_norm_affine_f32` the moment a gamma appears, and that symbol was absent from `is_kernel`
+/// entirely, so it took the generic buffer-writing-call refusal: the differentiable norm rules
+/// covered the toy spelling and not the one real models lower to. All three gradients are gated
+/// here against the f64 closed form.
+#[test]
+fn norm_affine_dot_vjp() {
+    let (rows, cols) = (3, 5);
+    let eps = 1e-5f32;
+    let mut it = Interner::default();
+    let fwd = build_norm_affine_dot(
+        &mut it,
+        rows,
+        cols,
+        NORM_LAYERNORM,
+        eps.to_bits() as i64,
+        true,
+    );
+    let mut seed = 0xA771u64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let gb: Vec<f32> = rand_vec(&mut seed, cols).iter().map(|v| 1.0 + v).collect();
+    let bb = rand_vec(&mut seed, cols);
+    let cb = rand_vec(&mut seed, rows * cols);
+    let (dx, dgamma, dbeta) = norm_affine_ref(&xb, &gb, &cb, rows, cols, eps, true);
+    let inputs = vec![xb, gb, bb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1, 2], &inputs, &[dx, dgamma, dbeta], &mut it);
+}
+
+/// The RMSNorm half of the affine family, with `beta` ABSENT — the Llama-style norm, and the case
+/// where the operand is a `Ptr`-typed `ConstInt(0)` rather than a buffer, so the rule must read the
+/// null at compile time instead of trying to size a gradient for it.
+#[test]
+fn norm_affine_rmsnorm_no_beta_vjp() {
+    let (rows, cols) = (3, 5);
+    let eps = 1e-5f32;
+    let mut it = Interner::default();
+    let fwd = build_norm_affine_dot(
+        &mut it,
+        rows,
+        cols,
+        NORM_RMSNORM,
+        eps.to_bits() as i64,
+        false,
+    );
+    let mut seed = 0x8113u64;
+    let xb = rand_vec(&mut seed, rows * cols);
+    let gb: Vec<f32> = rand_vec(&mut seed, cols).iter().map(|v| 1.0 + v).collect();
+    let cb = rand_vec(&mut seed, rows * cols);
+    let (dx, dgamma, _) = norm_affine_ref(&xb, &gb, &cb, rows, cols, eps, false);
+    let inputs = vec![xb, gb, cb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1], &inputs, &[dx, dgamma], &mut it);
+}
+
+// ---------------------------------------------------------------------------------------------
+// P4.12 — the L1 (SUMABS) and MAE (ABSDIFF) reductions, both of which mir_build emits from source.
+// ---------------------------------------------------------------------------------------------
+
+/// Build `loss = SCALE · sreduce(x, y, n, op)` (y ignored for the unary ops, per the kernel's
+/// `y == x` convention). Params: X, Y, out.
+///
+/// `SCALE` is not decoration. A reduction's upstream adjoint is the SCALAR `g = adj[loss]`, and
+/// with the bare `loss = sreduce(..)` spelling that is exactly 1.0 — so a rule that computed the
+/// local subgradient and never multiplied by `g` produced the same numbers as the correct one.
+/// A scale of 2.5 makes the factor observable.
+fn build_reduce2(it: &mut Interner, n: usize, op: i64, unary: bool, scale: f64) -> Fwd {
+    let sreduce = it.intern("wukong_sreduce_f32");
+    let mut b = Builder::new(it.intern("red2"), MirType::Void);
+    let x = b.add_param(PTR);
+    let y = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let (nv, opv) = (ci(&mut b, n as i64), ci(&mut b, op));
+    let second = if unary { x } else { y };
+    let red = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![x, second, nv, opv],
+        },
+    );
+    let k = cf(&mut b, scale);
+    let loss = b.build(MirType::F32, Op::Bin(BinOp::FMul, k, red));
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    Fwd {
+        func: b.finish(),
+        lens: vec![n, n, 1],
+        loss_out: 2,
+    }
+}
+
+/// The three-way sign: `sgn(v) = +1 / -1 / 0`, with the zero case included.
+///
+/// `sign_fill` emits `Select(v > 0, coef, Select(v < 0, -coef, 0))` precisely so that `sgn(0) = 0`
+/// — the subgradient convention for `|.|` at the kink, and the value PyTorch's `torch.sign` and
+/// `abs`'s backward both return. The earlier reference here was the two-way `if v > 0 {1} else
+/// {-1}`, which is simply WRONG at 0, and no element of the data was zero, so the middle arm of
+/// that three-way select was never evaluated and collapsing it to a two-way sign would have passed.
+fn sgn_f64(v: f64) -> f64 {
+    if v > 0.0 {
+        1.0
+    } else if v < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// `loss = k·Σ|x|` (the L1 regularizer) -> `dx = k·sgn(x)`, and `loss = k·Σ|x - y|` (mean absolute
+/// error) -> `dx = k·sgn(x-y)`, `dy = -k·sgn(x-y)`. Both reductions are one recognizer away from
+/// ordinary `.wk` source (`wukong_mir_build` returns RED_SUMABS / RED_ABSDIFF from the L1-norm and
+/// MAE recognizers), and neither could be trained. The data straddles zero — the sign function is
+/// exactly where a wrong rule hides — and now INCLUDES zero: `x[2] = 0` for L1 and `x[3] - y[3] = 0`
+/// exactly for MAE, so the `sgn(0) = 0` arm the rule is written around is actually executed. Every
+/// other point stays clear of the kink by far more than the 5e-3 finite-difference step, and at the
+/// zero point the central difference is `(|+e| - |-e|)/2e = 0`, which agrees.
+#[test]
+fn sumabs_and_absdiff_vjp() {
+    let n = 6;
+    const K: f64 = 2.5;
+    // x[2] is EXACTLY zero (the L1 kink); x[3] - y[3] is exactly zero (the MAE kink).
+    let xs: Vec<f32> = vec![-1.7, -0.6, 0.0, 0.3, 0.9, 2.1];
+    let ys: Vec<f32> = vec![0.4, -1.1, 0.5, 0.3, 0.2, 1.3];
+
+    // L1: dx = k·sgn(x)
+    {
+        let mut it = Interner::default();
+        let fwd = build_reduce2(&mut it, n, RED_SUMABS, true, K);
+        let dx: Vec<f64> = xs.iter().map(|&v| K * sgn_f64(v as f64)).collect();
+        let inputs = vec![xs.clone(), xs.clone(), vec![0.0]];
+        let g = tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
+        // The kink itself, pinned exactly rather than within the gate's 3e-3: a two-way sign would
+        // answer +/-2.5 here, which is 833x the tolerance, but state the intent as an equality.
+        assert_close(&g[0][2..3], &[0.0], "L1 dx at x = 0 (sgn(0) must be 0)");
+    }
+    // MAE: dx = k·sgn(x-y), dy = -k·sgn(x-y)
+    {
+        let mut it = Interner::default();
+        let fwd = build_reduce2(&mut it, n, RED_ABSDIFF, false, K);
+        let dx: Vec<f64> = xs
+            .iter()
+            .zip(&ys)
+            .map(|(&a, &b)| K * sgn_f64(a as f64 - b as f64))
+            .collect();
+        let dy: Vec<f64> = dx.iter().map(|&v| -v).collect();
+        let inputs = vec![xs.clone(), ys.clone(), vec![0.0]];
+        let g = tape_gate(&fwd, &[0, 1], &inputs, &[dx, dy], &mut it);
+        assert_close(&g[0][3..4], &[0.0], "MAE dx at x - y = 0");
+        assert_close(&g[1][3..4], &[0.0], "MAE dy at x - y = 0");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// P4.8 — the algebraic activation derivatives. Coverage was 8 of the runtime's 36 vmath op codes;
+// every op below is a closed form in the input x or the forward output y, so it needs no new
+// kernel. Each is finite-difference gated on data chosen for its domain and away from any kink.
+// ---------------------------------------------------------------------------------------------
+
+/// Build `h = vmath(x, op); loss = Σ_i C[i]·h[i]`, so `dL/dx[i] = C[i]·act'(x[i])` exactly.
+///
+/// The coefficient weighting (`RED_DOT`, not `RED_SUM`) is deliberate: a plain sum makes the
+/// upstream adjoint 1.0 at every element, and an `activation_backward` arm that computed `f'(x)`
+/// but never multiplied by `dout` would pass such a test at every op. Params: X, C, out;
+/// intermediate: h (alloca).
+fn build_vmath_dot(it: &mut Interner, n: usize, op: i64) -> Fwd {
+    let vmath = it.intern("wukong_vmath_f32");
+    let sreduce = it.intern("wukong_sreduce_f32");
+    let mut b = Builder::new(it.intern("vmdot"), MirType::Void);
+    let x = b.add_param(PTR);
+    let c = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let h = b.alloca(arr(n));
+    let (nv, opv) = (ci(&mut b, n as i64), ci(&mut b, op));
+    b.build_void(Op::Call {
+        func: vmath,
+        args: vec![x, h, nv, opv],
+    });
+    let dotop = ci(&mut b, RED_DOT);
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![c, h, nv, dotop],
         },
     );
     b.build_void(Op::Store {
@@ -2018,45 +2928,597 @@ fn build_velem_sum(it: &mut Interner, n: usize, op: i64) -> Fwd {
     }
 }
 
-/// A velem *compute mode* (`VE_HADAMARD` = 512, `VE_DIV` = 1024) lives ABOVE the activation byte, so
-/// the old `op & 0xff != VE_ID` gate let it through and applied the AFFINE VJP `dx = a·dout` to a
-/// nonlinear kernel: for `loss = Σ x[i]·y[i]` the emitted gradient was 1.0 everywhere instead of
-/// `y[i]`, with no diagnostic. The gate is now a whitelist of the two affine spellings, so both
-/// modes decline loudly. (The real Hadamard/quotient VJP can be added later; the refusal is what
-/// stops the wrong answer.)
+/// The f64 reference derivative of every algebraic activation the tape has a rule for.
+///
+/// Written from each activation's OWN DEFINITION — the conventional 0.01 leaky slope, the published
+/// SELU constants, the exact 1/6 hard-sigmoid scale — and NOT from `tape.rs`'s mirrored copies. That
+/// is the whole point: those copies exist to be kept in step with `wukong_runtime::vmath`, and the
+/// only failure mode that matters is drift. A reference that imported the same constant would move
+/// with the drift and see nothing.
+fn activation_derivative_f64(op: i64, x: f64) -> f64 {
+    const LEAKY_ALPHA: f64 = 0.01;
+    const SELU_LAMBDA: f64 = 1.050_701;
+    const SELU_ALPHA: f64 = 1.673_263_2;
+    const INV6: f64 = 1.0 / 6.0;
+    match op {
+        VM_LOG => 1.0 / x,
+        VM_LEAKYRELU => {
+            if x > 0.0 {
+                1.0
+            } else {
+                LEAKY_ALPHA
+            }
+        }
+        VM_SELU => {
+            if x > 0.0 {
+                SELU_LAMBDA
+            } else {
+                SELU_LAMBDA * SELU_ALPHA * x.exp()
+            }
+        }
+        // y = x - tanh(x)  =>  y' = 1 - (1 - tanh^2 x) = tanh^2 x
+        VM_TANHSHRINK => x.tanh() * x.tanh(),
+        VM_SOFTSIGN => {
+            let d = 1.0 + x.abs();
+            1.0 / (d * d)
+        }
+        // clamp(x + 3, 0, 6)/6: slope 1/6 strictly inside (-3, 3), flat outside.
+        VM_HARDSIGMOID => {
+            if x > -3.0 && x < 3.0 {
+                INV6
+            } else {
+                0.0
+            }
+        }
+        // x·hardsigmoid(x): 0 below -3, 1 above 3, (2x + 3)/6 in between.
+        VM_HARDSWISH => {
+            if x <= -3.0 {
+                0.0
+            } else if x >= 3.0 {
+                1.0
+            } else {
+                (2.0 * x + 3.0) * INV6
+            }
+        }
+        VM_EXP2 => x.exp2() * std::f64::consts::LN_2,
+        VM_EXP10 => 10f64.powf(x) * std::f64::consts::LN_10,
+        VM_LOG2 => 1.0 / (x * std::f64::consts::LN_2),
+        VM_LOG10 => 1.0 / (x * std::f64::consts::LN_10),
+        VM_EXPM1 => x.exp(),
+        VM_LOG1P => 1.0 / (1.0 + x),
+        VM_ATAN => 1.0 / (1.0 + x * x),
+        VM_ATANH => 1.0 / (1.0 - x * x),
+        VM_TAN => 1.0 + x.tan() * x.tan(),
+        VM_ASINH => 1.0 / (1.0 + x * x).sqrt(),
+        VM_ACOSH => 1.0 / (x * x - 1.0).sqrt(),
+        VM_ASIN => 1.0 / (1.0 - x * x).sqrt(),
+        VM_ACOS => -1.0 / (1.0 - x * x).sqrt(),
+        VM_SINH => x.cosh(),
+        VM_CBRT => 1.0 / (3.0 * x.cbrt() * x.cbrt()),
+        other => panic!("no f64 reference derivative for vmath op {other}"),
+    }
+}
+
 #[test]
-fn velem_compute_modes_decline_loudly() {
-    for (op, needle) in [
-        (VE_HADAMARD | VE_USE_Y, "Hadamard"),
-        (VE_DIV | VE_USE_Y, "division"),
+fn vmath_algebraic_activation_vjps() {
+    // (op code, name, sample points). Domains: log/log2/log10 need x > 0, acosh x > 1,
+    // asin/acos/atanh |x| < 1, log1p x > -1, tan away from +-pi/2. leakyrelu / selu / hardsigmoid /
+    // hardswish are piecewise, so the points sit clear of their kinks (0, +-3) by far more than the
+    // 5e-3 finite-difference step.
+    //
+    // For the piecewise ops the points are ORDERED so the discriminating ones land on the largest
+    // coefficients. The finite difference alone cannot see a wrong leaky slope — at x < 0 the true
+    // derivative is 0.01 and the FD tolerance `1e-2 + 4e-2·|fd|` is ~1.04e-2, so `alpha = 0`
+    // (plain relu) passes it — and the same holds for the saturated hardsigmoid/hardswish points,
+    // where the derivative is 0 or 1 and any rule that clamps agrees. The f64 closed form below is
+    // what actually pins those constants; the ordering just widens its margin.
+    let cases: &[(i64, &str, &[f32])] = &[
+        (VM_LOG, "log", &[0.4, 0.9, 1.7, 2.8]),
+        (VM_LEAKYRELU, "leakyrelu", &[0.6, 2.1, -1.7, -0.4]),
+        (VM_SELU, "selu", &[0.7, 1.9, -1.3, -0.35]),
+        (VM_TANHSHRINK, "tanhshrink", &[-2.0, -1.2, 1.1, 2.3]),
+        (VM_SOFTSIGN, "softsign", &[-1.4, -0.3, 0.5, 2.2]),
+        (VM_HARDSIGMOID, "hardsigmoid", &[-4.0, 4.0, -1.5, 0.8]),
+        (VM_HARDSWISH, "hardswish", &[-4.0, 4.0, -1.0, 1.0]),
+        (VM_EXP2, "exp2", &[-1.5, -0.2, 0.6, 1.4]),
+        (VM_EXP10, "exp10", &[-0.8, -0.1, 0.3, 0.9]),
+        (VM_LOG2, "log2", &[0.4, 0.9, 1.7, 2.8]),
+        (VM_LOG10, "log10", &[0.4, 0.9, 1.7, 2.8]),
+        (VM_EXPM1, "expm1", &[-1.2, -0.3, 0.4, 1.3]),
+        (VM_LOG1P, "log1p", &[-0.6, -0.1, 0.7, 2.4]),
+        (VM_ATAN, "atan", &[-2.0, -0.4, 0.5, 1.8]),
+        (VM_ATANH, "atanh", &[-0.7, -0.2, 0.3, 0.65]),
+        (VM_TAN, "tan", &[-0.9, -0.3, 0.4, 1.0]),
+        (VM_ASINH, "asinh", &[-1.8, -0.4, 0.6, 2.2]),
+        (VM_ACOSH, "acosh", &[1.3, 1.8, 2.5, 3.4]),
+        (VM_ASIN, "asin", &[-0.7, -0.25, 0.35, 0.75]),
+        (VM_ACOS, "acos", &[-0.7, -0.25, 0.35, 0.75]),
+        (VM_SINH, "sinh", &[-1.5, -0.5, 0.4, 1.6]),
+        (VM_CBRT, "cbrt", &[-2.0, -0.6, 0.7, 2.5]),
+    ];
+    for &(op, name, xs) in cases {
+        let mut it = Interner::default();
+        let n = xs.len();
+        let fwd = build_vmath_dot(&mut it, n, op);
+        let cb = coef_vec(n);
+        // dL/dx[i] = C[i]·act'(x[i]) — the coefficient makes the upstream factor observable.
+        let want: Vec<f64> = (0..n)
+            .map(|i| cb[i] as f64 * activation_derivative_f64(op, xs[i] as f64))
+            .collect();
+        let inputs = vec![xs.to_vec(), cb, vec![0.0]];
+        let (prog, gname) = build(&fwd.func, &[0], &mut it);
+        let analytic = analytic_grad_f32(&prog, gname, &fwd, &inputs, &[0], &it);
+        let fd = fd_grad_f32(&prog, &fwd, &inputs, &[0], 5e-3, &it);
+        // Guard against a silently-zero gradient passing the FD check vacuously.
+        assert!(
+            analytic[0].iter().any(|&v| v.abs() > 1e-3),
+            "{name}: gradient is trivially zero — likely a missing VJP route"
+        );
+        for (j, (&a, &f)) in analytic[0].iter().zip(&fd[0]).enumerate() {
+            let tol = 1e-2 + 4e-2 * f.abs();
+            assert!(
+                (a - f).abs() <= tol,
+                "{name}[{j}] (x={}): analytic {a} vs finite-diff {f} (|d|={:.3e} > {:.3e})",
+                xs[j],
+                (a - f).abs(),
+                tol
+            );
+        }
+        // ...and against the f64 closed form, at `tape_gate`'s closed-form tolerance (a byte copy
+        // of the constant at the top of this file). This is the arm the FD cannot supply: it is
+        // ~3e-3, three times tighter than 0.01·C at the smallest coefficient, so a leaky slope of
+        // 0 fails it at both negative points.
+        for (j, (&a, &w)) in analytic[0].iter().zip(&want).enumerate() {
+            let tol = 3e-3 + 3e-3 * w.abs();
+            assert!(
+                (a - w).abs() <= tol,
+                "{name}[{j}] (x={}): analytic {a} vs closed form {w} (|d|={:.3e} > {:.3e})",
+                xs[j],
+                (a - w).abs(),
+                tol
+            );
+        }
+    }
+}
+
+/// The activations whose derivative needs a transcendental no closed form in `x` or `y` supplies
+/// (mish, erf, sin/cos, cosh, logsigmoid) must still DECLINE, naming the op — a guessed rule for
+/// one of those is exactly the wrong-but-plausible gradient this crate exists to prevent.
+#[test]
+fn transcendental_activation_backward_declines_loudly() {
+    let mut it = Interner::default();
+    let fwd = build_vmath_dot(&mut it, 4, VM_MISH);
+    let err = grad(&fwd.func, &[0], &mut it)
+        .expect_err("an activation with no closed-form derivative must not be guessed");
+    assert!(
+        err.contains("no VJP for vmath op") && err.contains(&VM_MISH.to_string()),
+        "the decline must name the op code, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// P4.6 (the Cast half) and P4.15 (the second-order boundary).
+// ---------------------------------------------------------------------------------------------
+
+/// An int -> float cast reads an INTEGER operand, which carries no gradient, so its adjoint must
+/// terminate exactly like a constant's. There was no `Op::Cast` arm at all, so `x / (n as f64)`
+/// failed with "no VJP rule for `sitofp`" whenever `n` did not const-fold.
+#[test]
+fn cast_sitofp_terminates_adjoint() {
+    let mut it = Interner::default();
+    let mut b = Builder::new(sym(&mut it, "idiv"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let x0 = load_elem(&mut b, x, 0);
+    let four_i = b.build(MirType::I64, Op::ConstInt(4, MirType::I64));
+    let four_f = b.build(F64, Op::Cast(wukong_mir::CastKind::SiToFp, four_i, F64));
+    let l = b.build(F64, Op::Bin(BinOp::FDiv, x0, four_f));
+    b.build_void(Op::Store { ptr: out, value: l });
+    b.ret(Some(l));
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![1, 1],
+        loss_out: 1,
+    };
+    let inputs = vec![vec![3.0], vec![0.0]];
+    let g = gate(&fwd, &[0], &inputs, &mut it);
+    assert_close(&g[0], &[0.25], "d(x/4)/dx");
+}
+
+/// A precision cast is the identity on values, so its VJP is the identity on adjoints — routed back
+/// through the INVERSE cast so the contribution carries the operand's type. `x` is a power of two
+/// with a very small magnitude, so the f32 round trip is exact and the central difference over a
+/// `1e-6` step is not swallowed by f32 quantization.
+#[test]
+fn cast_precision_round_trip_propagates() {
+    let mut it = Interner::default();
+    let mut b = Builder::new(sym(&mut it, "pcast"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let x0 = load_elem(&mut b, x, 0);
+    let t = b.build(
+        MirType::F32,
+        Op::Cast(wukong_mir::CastKind::FpTrunc, x0, MirType::F32),
+    );
+    let u = b.build(F64, Op::Cast(wukong_mir::CastKind::FpExt, t, F64));
+    let l = b.build(F64, Op::Bin(BinOp::FMul, u, u));
+    b.build_void(Op::Store { ptr: out, value: l });
+    b.ret(Some(l));
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![1, 1],
+        loss_out: 1,
+    };
+    let xv = 2.0f64.powi(-20); // exact in f32; 1e-6 is ~10^7 f32 ulps away, so FD is clean
+    let inputs = vec![vec![xv], vec![0.0]];
+    let g = gate(&fwd, &[0], &inputs, &mut it);
+    assert_close(&g[0], &[2.0 * xv], "d((f32)x)^2/dx");
+}
+
+/// Second-order gradients are a clean capability boundary — the emitted backward returns `Void` and
+/// is multi-block, so it satisfies neither half of `grad`'s contract — but nothing said so: feeding
+/// a `*_grad` function back in produced the generic "has N blocks" message, which points at the
+/// wrong thing. It must name the reason.
+#[test]
+fn grad_of_grad_declines_by_name() {
+    let mut it = Interner::default();
+    let mut b = Builder::new(sym(&mut it, "sq2"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let x0 = load_elem(&mut b, x, 0);
+    let sq = b.build(F64, Op::Bin(BinOp::FMul, x0, x0));
+    b.build_void(Op::Store {
+        ptr: out,
+        value: sq,
+    });
+    b.ret(Some(sq));
+    let fwd = b.finish();
+    let g = grad(&fwd, &[0], &mut it).expect("first-order grad must succeed");
+    let err = grad(&g, &[0], &mut it).expect_err("grad of a grad must decline");
+    assert!(
+        err.contains("second-order") && err.contains("sq2_grad"),
+        "the decline must name the boundary and the function, got: {err}"
+    );
+}
+
+/// `diff_load` now seeds `buf_adj` for every `wrt` buffer it routes an adjoint into (the P4.4 fix).
+/// That interacts with the `Op::Store` guard, which refuses a non-constant store into a buffer whose
+/// gradient is live — so this pins the shape the driver's DEFAULT `--grad-wrt` produces, where the
+/// loss-sink output buffer IS in the differentiated set: `out` must still take the skip (nothing
+/// reads it, so its gradient never goes live), and its gradient must come back zero.
+///
+/// Both spellings the driver reaches are covered: the pure scalar loss, and a recognized-kernel tape.
+#[test]
+fn loss_sink_in_wrt_still_differentiates() {
+    // (a) the scalar shape: loss = x[0]^2, wrt = [x, out].
+    {
+        let mut it = Interner::default();
+        let mut b = Builder::new(sym(&mut it, "sink_scalar"), MirType::Void);
+        let x = b.add_param(PTR);
+        let out = b.add_param(PTR);
+        let x0 = load_elem(&mut b, x, 0);
+        let l = b.build(F64, Op::Bin(BinOp::FMul, x0, x0));
+        b.build_void(Op::Store { ptr: out, value: l });
+        b.ret(Some(l));
+        let fwd = Fwd {
+            func: b.finish(),
+            lens: vec![1, 1],
+            loss_out: 1,
+        };
+        let inputs = vec![vec![1.3], vec![0.0]];
+        let g = gate(&fwd, &[0, 1], &inputs, &mut it);
+        assert_close(&g[0], &[2.6], "dL/dx = 2x");
+        assert_close(&g[1], &[0.0], "dL/d(out) = 0");
+    }
+    // (b) the kernel-tape shape: loss = sum(X . W^T), wrt = [X, W, out].
+    {
+        let (m, k, n) = (3, 4, 2);
+        let mut it = Interner::default();
+        let fwd = build_linear(&mut it, m, k, n, None, false);
+        let mut seed = 0x51A6u64;
+        let xb = rand_vec(&mut seed, m * k);
+        let wb = rand_vec(&mut seed, n * k);
+        let dp = vec![1.0; m * n];
+        let (dx, dw) = matmul_nt_backward(&dp, &xb, &wb, m, k, n);
+        let inputs = vec![xb, wb, vec![0.0]];
+        tape_gate(&fwd, &[0, 1, 2], &inputs, &[dx, dw, vec![0.0]], &mut it);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// IN-PLACE KERNELS. `wukong_vmath_f32`'s contract says "`x` and `out` may alias (the recognizer
+// allows in-place activations)" (wukong_runtime/src/vmath.rs), so `x[i] = log(x[i])` is a legal
+// forward. Every backward rule that reads the forward INPUT then reads a buffer the kernel has
+// already overwritten, and answers a wrong number at exit 0. These pin the refusal — and, just as
+// importantly, pin that the arms which read only the OUTPUT are NOT refused.
+// ---------------------------------------------------------------------------------------------
+
+/// Build `vmath(w, w, n, op); s = w[0] + w[1]; out[0] = s` — the activation run IN PLACE, with the
+/// loss reading the result back through scalar loads.
+///
+/// The scalar-load spelling is the cheapest way to REACH the guard — it is not a way past it.
+/// `diff_vmath` returns `Ok(())` and emits nothing unless `buf_adj[out]` is already seeded, so the
+/// forward needs some consumer of `out`, and two scalar loads are the smallest one. They do not
+/// smuggle the aliasing through. `diff_load` seeds `buf_adj` through `grad_target` AND marks the
+/// buffer in `contributed` (the `self.contributed.insert(param)` that closes it in `lib.rs`) — the
+/// same pairing every kernel consumer rule keeps, whether it marks by calling `single()` or, in the
+/// two matmul rules, with a direct `contributed.insert` after the emit. A `buf_adj` seed with no
+/// `contributed` mark on the same buffer does not exist, and that is the invariant the refutation
+/// on the test below rests on. With the in-place guard deleted this shape does NOT read a clobbered
+/// `x`: it fails one line later in `single(x)`, naming the wrong cause. See
+/// `vmath_inplace_activation_declines_loudly` for why the guard is still worth having.
+fn build_vmath_inplace(it: &mut Interner, n: usize, op: i64) -> Fwd {
+    let vmath = it.intern("wukong_vmath_f32");
+    let mut b = Builder::new(it.intern("vminpl"), MirType::Void);
+    let w = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let (nv, opv) = (ci(&mut b, n as i64), ci(&mut b, op));
+    b.build_void(Op::Call {
+        func: vmath,
+        args: vec![w, w, nv, opv],
+    });
+    let w0 = b.build(MirType::F32, Op::Load(w, MirType::F32));
+    let i1 = ci(&mut b, 1);
+    let wp = b.build(
+        PTR,
+        Op::Gep {
+            ptr: w,
+            index: i1,
+            elem: MirType::F32,
+        },
+    );
+    let w1 = b.build(MirType::F32, Op::Load(wp, MirType::F32));
+    let s = b.build(MirType::F32, Op::Bin(BinOp::FAdd, w0, w1));
+    b.build_void(Op::Store { ptr: out, value: s });
+    b.ret(Some(s));
+    Fwd {
+        func: b.finish(),
+        lens: vec![n, 1],
+        loss_out: 1,
+    }
+}
+
+/// An in-place activation must DECLINE, naming the aliasing.
+///
+/// What this pins is the MESSAGE, and that is deliberate. Deleting the guard does not make this
+/// shape produce a wrong gradient: it makes it fail one line later in `single()` with "buffer v0
+/// receives multiple gradient contributions; accumulation is not yet supported for this op",
+/// because `buf_adj[out]` can only have been seeded by a consumer that also marked the buffer in
+/// `contributed`. So the aliased read was never reachable — but `single`'s message names the wrong
+/// cause and says in its own words that it is temporary, and the day accumulation lands it stops
+/// firing at all. The guard is what survives that.
+///
+/// All the routes through `diff_vmath` are covered: the synthesized-loop arms that load `x`
+/// directly (log, hardsigmoid, leakyrelu) and the fused `wukong_vmath2_f32` arm, whose kernel takes
+/// `x` as its first operand (silu) and which returns before the loop is ever built.
+#[test]
+fn vmath_inplace_activation_declines_loudly() {
+    for (op, name) in [
+        (VM_LOG, "log"),
+        (VM_HARDSIGMOID, "hardsigmoid"),
+        (VM_LEAKYRELU, "leakyrelu"),
+        (VM_SILU, "silu"),
     ] {
         let mut it = Interner::default();
-        let fwd = build_velem_sum(&mut it, 8, op);
-        let err = grad(&fwd.func, &[0, 1], &mut it)
-            .expect_err("a non-affine velem compute mode must not take the affine VJP");
+        let fwd = build_vmath_inplace(&mut it, 4, op);
+        let err = grad(&fwd.func, &[0], &mut it)
+            .expect_err("an in-place activation whose derivative reads x must not be guessed");
         assert!(
-            err.contains("velem VJP") && err.contains(needle),
-            "op {op} must decline naming the compute mode, got: {err}"
+            err.contains("in-place") && err.contains("vmath"),
+            "{name}: the decline must name the aliasing, got: {err}"
         );
     }
 }
 
-/// The two spellings the affine rule IS valid for must keep differentiating: the whitelist gate must
-/// not have narrowed the accepted set. `loss = Σ (a·x + b·y)` -> `dx = a`, `dy = b` per element.
+// The over-refusal control is `kernel_output_read_by_scalar_load`: the same loss, the same
+// `wukong_vmath_f32(.., VM_EXP)`, the same scalar-load read-back — with a DISTINCT output buffer.
+// It differentiates and matches its closed form, so the refusal above is keyed on the aliasing and
+// not on the shape.
+
+/// The same hazard for `wukong_norm_f32`: LayerNorm/RMSNorm/L2-norm recompute the row statistics
+/// from `x`, which the module doc has always said must not be overwritten — and which nothing
+/// enforced. Softmax and log-softmax read only `y` and are unaffected.
 #[test]
-fn velem_affine_still_differentiates() {
-    let n = 8;
+fn norm_inplace_layernorm_declines_loudly() {
+    let (rows, cols) = (2usize, 4usize);
     let mut it = Interner::default();
-    let fwd = build_velem_sum(&mut it, n, VE_ID | VE_USE_Y);
-    let mut seed = 0xBE1Eu64;
-    let xb = rand_vec(&mut seed, n);
-    let yb = rand_vec(&mut seed, n);
-    let inputs = vec![xb, yb, vec![0.0]];
-    tape_gate(
-        &fwd,
-        &[0, 1],
-        &inputs,
-        &[vec![1.0; n], vec![1.0; n]],
-        &mut it,
+    let norm = sym(&mut it, "wukong_norm_f32");
+    let mut b = Builder::new(sym(&mut it, "norminpl"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let (rv, cv, epsv, opv) = (
+        ci(&mut b, rows as i64),
+        ci(&mut b, cols as i64),
+        ci(&mut b, 0),
+        ci(&mut b, NORM_LAYERNORM),
     );
+    b.build_void(Op::Call {
+        func: norm,
+        args: vec![x, x, rv, cv, epsv, opv],
+    });
+    let x0 = b.build(MirType::F32, Op::Load(x, MirType::F32));
+    b.build_void(Op::Store {
+        ptr: out,
+        value: x0,
+    });
+    b.ret(Some(x0));
+    let fwd = b.finish();
+    let err = grad(&fwd, &[0], &mut it)
+        .expect_err("an in-place norm must not be differentiated against a clobbered x");
+    assert!(
+        err.contains("in-place") && err.contains("norm"),
+        "the decline must name the aliasing, got: {err}"
+    );
+}
+
+/// ...and for the matmuls, where — unlike vmath and norm — nothing else catches it.
+///
+/// This is the real silent wrong gradient in the family. The matmul rules are the only ones that
+/// never call `single`: they call `beta_for`, which reads `contributed` to pick `beta` and never
+/// fails. So with `c == a` the transform happily emits `sgemm(dC, B, dA, .., beta = 1)` with `dA`
+/// and `dC` the SAME buffer — a GEMM accumulating into the operand it is reading — plus a `dB`
+/// that reads an `A` the forward has overwritten. Exit 0, no diagnostic. Mutation-checked: with
+/// `reject_inplace_matmul` deleted, `grad` returns Ok and this `expect_err` panics, which is the
+/// whole point — nothing else on the path objects.
+#[test]
+fn matmul_inplace_output_declines_loudly() {
+    let (m, k, n) = (2usize, 2usize, 2usize);
+    let mut it = Interner::default();
+    let sgemm = sym(&mut it, "wukong_sgemm");
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "gemminpl"), MirType::Void);
+    let a = b.add_param(PTR);
+    let w = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let (mv, kv, nv) = (
+        ci(&mut b, m as i64),
+        ci(&mut b, k as i64),
+        ci(&mut b, n as i64),
+    );
+    let beta = ci(&mut b, 0);
+    b.build_void(Op::Call {
+        func: sgemm,
+        args: vec![a, w, a, mv, kv, nv, beta],
+    });
+    let (mn, sumop) = (ci(&mut b, (m * n) as i64), ci(&mut b, RED_SUM));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![a, a, mn, sumop],
+        },
+    );
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    let fwd = b.finish();
+    let err = grad(&fwd, &[0, 1], &mut it)
+        .expect_err("an in-place GEMM must not be differentiated against clobbered operands");
+    assert!(
+        err.contains("in-place GEMM"),
+        "the decline must name the aliasing, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Boundaries that must stay LOUD: the LayerNorm scratch's constant-`cols` requirement, and the
+// float -> int -> float round trip.
+// ---------------------------------------------------------------------------------------------
+
+/// The stable centered variance needs a `cols`-wide scratch holding the row mean, and a MIR alloca
+/// takes a compile-time element count — so a LayerNorm whose `cols` is a symbolic generic dim
+/// (arriving as a hidden `i64` parameter) no longer differentiates, where the old cancelling
+/// `E[x^2] - mu^2` form did. That is a deliberate narrowing traded against a gradient that went NaN
+/// on residual-stream activations, and this pins that it is a NAMED refusal rather than a generic
+/// "kernel operand must be a compile-time constant".
+#[test]
+fn layernorm_symbolic_cols_declines_loudly() {
+    let (rows, cols) = (2usize, 4usize);
+    let mut it = Interner::default();
+    let norm = sym(&mut it, "wukong_norm_f32");
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "lnsym"), MirType::Void);
+    let x = b.add_param(PTR);
+    let c = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    // The hidden dim parameter a symbolic-generic `f<M,N>` lowers to: an i64 the caller supplies.
+    let cv = b.add_param(MirType::I64);
+    let y = b.alloca(arr(rows * cols));
+    let (rv, epsv, opv) = (
+        ci(&mut b, rows as i64),
+        ci(&mut b, 0),
+        ci(&mut b, NORM_LAYERNORM),
+    );
+    b.build_void(Op::Call {
+        func: norm,
+        args: vec![x, y, rv, cv, epsv, opv],
+    });
+    let (rc, dotop) = (ci(&mut b, (rows * cols) as i64), ci(&mut b, RED_DOT));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![c, y, rc, dotop],
+        },
+    );
+    b.build_void(Op::Store {
+        ptr: out,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    let fwd = b.finish();
+    let err = grad(&fwd, &[0], &mut it).expect_err("a symbolic LayerNorm width must decline");
+    assert!(
+        err.contains("compile-time-constant") && err.contains("cols"),
+        "the decline must name the requirement, got: {err}"
+    );
+}
+
+/// A float -> int -> float round trip must stay a LOUD refusal.
+///
+/// The `Op::Cast(SiToFp | UiToFp, ..)` arm terminates the adjoint, which is right for a genuine
+/// integer leaf (`x / (n as f64)`) and wrong for `(x as i64) as f64`: terminating there means the
+/// `fptosi` instruction is never handed an adjoint, `diff_inst` skips any instruction whose adjoint
+/// is absent, and the loud `fptosi` refusal becomes unreachable — dL/dx comes back 0 at exit 0.
+/// Before the `Cast` arm existed this composition was a loud "no VJP rule for `sitofp`"; the arm
+/// must not have turned it into a silent zero.
+#[test]
+fn cast_float_int_round_trip_declines_loudly() {
+    let mut it = Interner::default();
+    let mut b = Builder::new(sym(&mut it, "rtrip"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let x0 = load_elem(&mut b, x, 0);
+    let i = b.build(
+        MirType::I64,
+        Op::Cast(wukong_mir::CastKind::FpToSi, x0, MirType::I64),
+    );
+    // ...and through one more integer op, so the walk is not just a one-hop check.
+    let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+    let j = b.build(MirType::I64, Op::Bin(BinOp::Add, i, one));
+    let l = b.build(F64, Op::Cast(wukong_mir::CastKind::SiToFp, j, F64));
+    b.build_void(Op::Store { ptr: out, value: l });
+    b.ret(Some(l));
+    let fwd = b.finish();
+    let err = grad(&fwd, &[0], &mut it)
+        .expect_err("a float -> int -> float round trip must not terminate the adjoint at zero");
+    assert!(
+        err.contains("round trip") && err.contains("fptosi"),
+        "the decline must name the round trip, got: {err}"
+    );
+}
+
+/// The precision-cast rule on a NARROWING cast to `bf16`, not just f64 <-> f32.
+///
+/// `cast_precision_round_trip_propagates` only ever exercised f64 <-> f32, so nothing showed the
+/// arm working on the half formats it is written for: the inverse cast it emits is
+/// `Cast(FpExt, <bf16 adjoint>, f64)`, a spelling no test produced. `x` is a power of two, exact in
+/// bf16 (8 significant bits) and with a bf16 ulp ~4e3 times smaller than the 1e-6 difference step,
+/// so both the value and the round-tripped adjoint are exact and the closed form is tight.
+#[test]
+fn cast_bf16_round_trip_propagates() {
+    let mut it = Interner::default();
+    let mut b = Builder::new(sym(&mut it, "bcast"), MirType::Void);
+    let x = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let x0 = load_elem(&mut b, x, 0);
+    let t = b.build(
+        MirType::BF16,
+        Op::Cast(wukong_mir::CastKind::FpTrunc, x0, MirType::BF16),
+    );
+    let u = b.build(F64, Op::Cast(wukong_mir::CastKind::FpExt, t, F64));
+    let l = b.build(F64, Op::Bin(BinOp::FMul, u, u));
+    b.build_void(Op::Store { ptr: out, value: l });
+    b.ret(Some(l));
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![1, 1],
+        loss_out: 1,
+    };
+    let xv = 2.0f64.powi(-20); // exact in bf16; the adjoint 2x = 2^-19 is exact too
+    let inputs = vec![vec![xv], vec![0.0]];
+    let g = gate(&fwd, &[0], &inputs, &mut it);
+    assert_close(&g[0], &[2.0 * xv], "d((bf16)x)^2/dx");
 }
