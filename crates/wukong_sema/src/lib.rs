@@ -1500,14 +1500,47 @@ impl<'a> Sema<'a> {
         self.generics.clear();
     }
 
-    /// Check a returned value's type against the declared return type `self.ret_ty`. Three checks, in
-    /// order: tensor / vector SHAPE agreement in RIGID mode — a function must not lie about its output
-    /// shape, since callers propagate the declared return shape into downstream shape checks (a single
-    /// wrong return silently poisons every caller); a scalar-vs-pointer/aggregate KIND clash; and
-    /// scalar-type agreement for a non-literal value. An unsuffixed literal still adapts, so this
-    /// never over-fires on e.g. `return 5` from `-> i64`; every other kind stays lenient.
+    /// Check a returned value's type against the declared return type `self.ret_ty`. It first
+    /// ADAPTS an unsuffixed literal to the declared return type (re-stamp + range check, below),
+    /// then runs three checks, in order: tensor / vector SHAPE agreement in RIGID mode — a function
+    /// must not lie about its output shape, since callers propagate the declared return shape into
+    /// downstream shape checks (a single wrong return silently poisons every caller); a
+    /// scalar-vs-pointer/aggregate KIND clash; and scalar-type agreement for a non-literal value.
+    /// An unsuffixed literal still adapts, so this never over-fires on e.g. `return 5` from
+    /// `-> i64`; every other kind stays lenient.
+    ///
+    /// Both return spellings land here — the explicit `return e;` statement and the body's implicit
+    /// TAIL expression — so the adaptation is identical for the two, which it was not before: the
+    /// tail form had no range check at all.
     fn check_return_shape(&mut self, val_ty: &Ty, val: &Expr, span: Span) {
         let ret = self.ret_ty.clone();
+        // ADAPT FIRST, and adapt COMPLETELY. `literal_adapts` is asked twice further down as a
+        // LENIENCY — once inline in the scalar-agreement check, once inside `aggregate_value_clash`
+        // — and it is what makes `return 5` from `-> i64` and `fn g() -> [i8; 2] { return [127, 0]; }` legal
+        // even though the literal's own type is i32 / `[i32; 2]`. Deciding a literal is ACCEPTED
+        // and never recording at what WIDTH it lowers is the silent half of that leniency, which is
+        // why every other adapting site (`let`, `const`, a struct-literal field, an assignment, a
+        // call argument) pairs the predicate with `retype_adapted_literal` and
+        // `range_check_int_literal` — all three, always together:
+        //
+        //   * without the re-stamp, `fn g() -> (f64, f64) { (0.1, 0.2) }` was accepted and then
+        //     lowered as an 8-byte `(f32, f32)` into the caller's 16-byte tuple: `load out of
+        //     bounds` on the interpreter, `0.000000013411048210842936` / `NaN` on native — an
+        //     interp-vs-native divergence on a clean compile. Scalars lied more quietly:
+        //     `fn a() -> f64 { 0.1 }` returned the f32 0.1 widened, `0.10000000149011612`, where
+        //     `let a: f64 = 0.1;` returns `0.1`.
+        //   * without the range check, the re-stamp itself becomes the hazard, because a re-stamped
+        //     literal is materialized as a `ConstInt` OF THE NARROW TYPE instead of an i32 the
+        //     backend truncates. `fn a() -> i8 { 300 }` would emit `ConstInt(300, i8)`: wukong's own
+        //     verifier only checks that the type is integral, the interpreter masks the value to 44,
+        //     and Cranelift's verifier REJECTS it (`iconst_bounds` bounds-masks an `I8` immediate at
+        //     `u8::MAX`) — so the interpreter would run a program native cannot build. The explicit
+        //     `return` spelling has range-checked since before this branch; the implicit TAIL return
+        //     never did, and `fn a() -> i8 { 200 }` silently returned -56.
+        if self.literal_adapts(&ret, val) {
+            self.retype_adapted_literal(val, &ret);
+        }
+        self.range_check_int_literal(val, &ret);
         if matches!(ret, Ty::Tensor { .. } | Ty::Vector { .. })
             || matches!(val_ty, Ty::Tensor { .. } | Ty::Vector { .. })
         {
@@ -1715,11 +1748,33 @@ impl<'a> Sema<'a> {
     /// (`if c { [127, 0] } else { a }` for `a: [i8; 2]`) therefore establishes `[i32; 2]` and the
     /// `[i8; 2]` arm cannot hold it — which is a real element-width lie, not an adaptation, and it
     /// is rejected by the pre-existing `let` check as well whenever the result is annotated.
-    fn aggregate_merge_clash(&self, l: &Ty, r: &Ty, incoming: Option<&Expr>) -> bool {
+    ///
+    /// Takes `&mut self` because GRANTING that leniency and RE-STAMPING the literal at the merged
+    /// width are ONE operation, not two — they are written in the same branch, below, so they
+    /// cannot drift apart. Split across a predicate here and a `retype_adapted_literal` at the call
+    /// site (which is how `let` / assignment / call-argument spell it), the pair is one edit away
+    /// from becoming an acceptance with no width, which is exactly what shipped:
+    /// `let r: (f64, f64) = if c { a } else { (0.1, 0.2) };` compiled, and the `(f32, f32)` arm wrote
+    /// 8 bytes into the 16-byte merge slot — `load out of bounds` on the interpreter,
+    /// `0.000000013411048210842936` / `NaN` on native.
+    fn aggregate_merge_clash(&mut self, l: &Ty, r: &Ty, incoming: Option<&Expr>) -> bool {
         if !(self.aggregate_type_clash(l, r) && self.aggregate_type_clash(r, l)) {
             return false;
         }
-        !incoming.is_some_and(|e| self.literal_adapts(l, merge_arm_value(e)))
+        let Some(arm) = incoming else {
+            return true;
+        };
+        if !self.literal_adapts(l, merge_arm_value(arm)) {
+            return true;
+        }
+        // Adapted: re-stamp the arm at the merged type `l` so lowering stores it at that width, and
+        // range-check it so the re-stamp cannot mint a `ConstInt` too wide for its own type. Pass
+        // the ARM, not `merge_arm_value(arm)`: the arm is normally a block, whose recorded type is
+        // its tail's, and both have to move together — `retype_adapted_literal` peels the block
+        // exactly as `merge_arm_value` does. Then it is NOT a clash.
+        self.retype_adapted_literal(arm, l);
+        self.range_check_int_literal(merge_arm_value(arm), l);
+        false
     }
 
     /// An aggregate — array, tuple, slice, or a DECLARED nominal type — whose layout is fully
@@ -2432,12 +2487,15 @@ impl<'a> Sema<'a> {
                                 ),
                             );
                         }
+                        // Shape / kind / scalar agreement, and the literal adaptation — re-stamp
+                        // and range check included, so an out-of-range integer literal returned
+                        // where a narrower type is declared (`return 9999999999` from `-> i32`,
+                        // once silently truncated to the low bits: exit code 255 from a wrapped
+                        // value) is still rejected. That range check used to live here, which left
+                        // the implicit TAIL return — the other caller of `check_return_shape` —
+                        // without one; it is inside the callee now so both spellings get it exactly
+                        // once.
                         self.check_return_shape(&t, e, e.span);
-                        // An out-of-range integer literal returned where a narrower type is declared
-                        // (`return 9999999999` from `-> i32`) was silently truncated to the low bits
-                        // (exit code 255 from a wrapped value). Range-check it against the return
-                        // type, the same rule `let`/`const` already apply to their annotation.
-                        self.range_check_int_literal(e, &ret);
                     }
                     None => {
                         // A bare `return;` where the signature demands a value: the native return
@@ -3051,6 +3109,16 @@ impl<'a> Sema<'a> {
                     self.retype_adapted_literal(it, t);
                 }
             }
+            // A merge arm is normally spelled as a BLOCK whose tail is the literal, and both nodes
+            // carry the type — the block's recorded type is its tail's. Peel to the tail and
+            // re-stamp it too, mirroring `merge_arm_value`, which is how `literal_adapts` was asked
+            // the question in the first place. Unreachable from every other caller: they all guard
+            // with `literal_adapts`, which has no `Block` arm and so answers `false` for one.
+            (ExprKind::Block(b), _) => {
+                if let Some(tail) = &b.tail {
+                    self.retype_adapted_literal(tail, ann);
+                }
+            }
             _ => {}
         }
     }
@@ -3060,7 +3128,10 @@ impl<'a> Sema<'a> {
     /// only a literal `eval_const_int` can read (incl. a leading `-`) — so a runtime value, a float,
     /// or an `i64`/`u64`/`usize` literal is never flagged. Rust rejects this; without it the value
     /// silently wraps (`200 as i8 == -56`), a quiet footgun in a safety-first language. Call at each
-    /// site a literal adapts to a type (`let`/`const`/argument).
+    /// site a literal adapts to a type — `let`, `const`, a struct-literal field, an argument, an
+    /// assignment, a `return` (both spellings, inside `check_return_shape`) and a merge arm
+    /// (`aggregate_merge_clash`) — right where `retype_adapted_literal` re-stamps it, since the
+    /// re-stamp is what makes an out-of-range literal a constant too wide for its own type.
     fn range_check_int_literal(&mut self, e: &Expr, ty: &Ty) {
         // Aggregate literals recurse element-wise (`[300, 0]: [i8; 2]` flags the `300`), mirroring
         // how `retype_adapted_literal`/`literal_adapts` descend into them.
@@ -3976,8 +4047,11 @@ fn join_scalar(a: Scalar, b: Scalar) -> Scalar {
 /// mismatch and be rejected where the identical literal at a `let` is accepted.
 ///
 /// Peel to the block's tail expression, and ONLY that: a block with no tail (its value comes from a
-/// `break` or a `return`) is returned unchanged, and no other wrapper is unwrapped. This is used
-/// solely to ask `literal_adapts` a question; it never changes a recorded type.
+/// `break` or a `return`) is returned unchanged, and no other wrapper is unwrapped. It answers a
+/// `literal_adapts` question and then names the node `range_check_int_literal` must look at; the
+/// re-stamp that follows an adapting answer is handed the ARM instead, because the block and its
+/// tail both carry the type and both have to move (see `aggregate_merge_clash`). This function
+/// itself is pure — it changes no recorded type.
 fn merge_arm_value(e: &Expr) -> &Expr {
     match &e.kind {
         ExprKind::Block(b) => match &b.tail {
@@ -5881,6 +5955,69 @@ mod tests {
             assert!(
                 errors(bad).contains(&"E0401"),
                 "a wrong-length literal must still be rejected (`{bad}`): {:?}",
+                errors(bad)
+            );
+        }
+    }
+
+    /// Every type this module RECORDED, as display strings. `mir_build` materializes a numeric
+    /// literal as a constant of its recorded type (`lower_expr`'s `Int`/`Float` arms read
+    /// `expr_mir`), so this is the WIDTH half of an adaptation — the half no "does it compile"
+    /// assertion can see, and the half that was missing at a `return` and at a merge.
+    fn recorded_tys(src: &str) -> Vec<String> {
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse errors: {pdiags:?}");
+        let (res, diags) = check(&module, &interner);
+        assert!(
+            !diags.iter().any(|d| d.is_error()),
+            "unexpected errors for {src:?}: {diags:?}"
+        );
+        res.types.values().map(|t| t.display(&interner)).collect()
+    }
+
+    #[test]
+    fn adapted_literal_is_restamped_at_the_return_and_the_merge_width() {
+        // The WIDTH half of the leniency the test above proves is granted. An unsuffixed float
+        // literal's own type is f32, so accepting `fn g() -> (f64, f64) { (0.1, 0.2) }` without
+        // re-stamping it left an 8-byte `(f32, f32)` written into the caller's 16-byte tuple: the
+        // interpreter reported `load out of bounds`, native printed
+        // `0.000000013411048210842936` and `NaN`. The scalar form lied quietly instead of loudly —
+        // `fn a() -> f64 { 0.1 }` returned `0.10000000149011612`, the f32 0.1 widened, where
+        // `let a: f64 = 0.1;` returns `0.1`. Assert on the recorded type, because a compile-only
+        // assertion is blind to exactly this.
+        for src in [
+            "fn g() -> f64 { 0.1 }",
+            "fn g() -> f64 { return 0.1; }",
+            "fn g() -> [f64; 2] { [0.1, 0.2] }",
+            "fn g() -> [f64; 2] { return [0.1, 0.2]; }",
+            "fn g() -> (f64, f64) { (0.1, 0.2) }",
+            "fn g() -> (f64, f64) { return (0.1, 0.2); }",
+            "fn g() -> [f64; 3] { [0.1; 3] }",
+            "fn f(k: i32) -> f64 { let a: (f64, f64) = (0.5, 0.25); let r: (f64, f64) = if k == 0 { a } else { (0.1, 0.2) }; return r.0; }",
+            "fn f(k: i32) -> f64 { let a: [f64; 2] = [0.5, 0.25]; let r: [f64; 2] = match k { 0 => a, _ => [0.1, 0.2] }; return r[0]; }",
+        ] {
+            let tys = recorded_tys(src);
+            assert!(
+                !tys.iter().any(|t| t.contains("f32")),
+                "an adapted float literal must be RE-STAMPED at the declared width, not left f32 for lowering to reinterpret or widen (`{src}`): {tys:?}"
+            );
+        }
+        // …and the range check is the rest of that pair. Once a literal is re-stamped it is
+        // materialized as a constant OF THE NARROW TYPE rather than an i32 the backend truncates,
+        // so an out-of-range one has to be a diagnostic: `ConstInt(300, i8)` passes wukong's
+        // verifier (which only checks the type is integral), masks to 44 on the interpreter, and is
+        // REJECTED by Cranelift's `iconst_bounds`. Accepting it would be a program the oracle runs
+        // and native cannot build.
+        for bad in [
+            "fn g() -> i8 { 200 }",
+            "fn g() -> [i8; 2] { [300, 0] }",
+            "fn g() -> (u8, u8) { (300, 1) }",
+            "fn f(k: i32, a: [i8; 2]) -> i8 { let r: [i8; 2] = if k == 0 { a } else { [300, 0] }; return r[0]; }",
+        ] {
+            assert!(
+                errors(bad).contains(&"E0401"),
+                "an out-of-range literal that ADAPTS must be rejected, not re-stamped into a constant too wide for its own type (`{bad}`): {:?}",
                 errors(bad)
             );
         }

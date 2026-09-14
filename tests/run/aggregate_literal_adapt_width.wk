@@ -1,0 +1,95 @@
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0.1
+// EXPECT-OUT: 0.2
+// EXPECT-OUT: 0.3
+// EXPECT-OUT: 0.4
+// EXPECT-OUT: 0.5
+// EXPECT-OUT: 0.6
+// EXPECT-OUT: 0.7
+// EXPECT-OUT: 0.7
+// EXPECT-OUT: 0.9
+// EXPECT-OUT: 0.1
+// EXPECT-OUT: 0.2
+// EXPECT-OUT: 0.25
+// EXPECT-OUT: 0.75
+// EXPECT-OUT: 127
+// EXPECT-OUT: -128
+module tests.run.aggregate_literal_adapt_width
+
+// The WIDTH half of tests/run/aggregate_literal_adapt.wk. An array/tuple literal adapts to a
+// declared return type and to a merge arm's established type exactly as it adapts to a `let`
+// annotation — but an unsuffixed float literal's own type is f32, so ACCEPTING the program is only
+// half the job: sema must also re-stamp the literal at the declared width before mir_build
+// materializes it. Granting the leniency without the re-stamp wrote an 8-byte `(f32, f32)` into the
+// caller's 16-byte tuple: `error: load out of bounds` on the interpreter and
+// `0.000000013411048210842936` / `NaN` on native — an interp-vs-native divergence on a clean
+// compile — while the scalar form lied quietly, `fn scalar_tail() -> f64 { 0.9 }` returning the f32
+// 0.9 widened (`0.8999999761581421`).
+//
+// Every value below is the f64 nearest the decimal literal as WRITTEN, which the shortest-
+// round-trip printer renders back as that same decimal; an f32 that reached an f64 slot prints its
+// full widened expansion instead, so each line is its own oracle. A "compiles without error"
+// assertion cannot see any of this, which is why the fixture prints every element rather than a sum.
+//
+// A bare ARRAY literal as a tail expression (`fn f() -> [f64; 2] { [0.5, 0.6] }`, no `return`) is a
+// separate, pre-existing `C0001 expression is not yet supported by codegen` and is deliberately not
+// spelled here; the tuple tail return below covers the implicit-return path.
+
+fn tuple_tail() -> (f64, f64) {
+    (0.1, 0.2)
+}
+
+fn tuple_ret() -> (f64, f64) {
+    return (0.3, 0.4);
+}
+
+fn array_ret() -> [f64; 2] {
+    return [0.5, 0.6];
+}
+
+fn array_repeat_ret() -> [f64; 2] {
+    return [0.7; 2];
+}
+
+fn scalar_tail() -> f64 {
+    0.9
+}
+
+// The merge arm: `join` returns the LEFT type for an aggregate, so `a` establishes `(f64, f64)` and
+// the literal arm adapts to it. Both arms must therefore be 16 bytes wide.
+fn merge_arm(k: i32) -> (f64, f64) {
+    let a: (f64, f64) = (0.25, 0.75);
+    let r: (f64, f64) = if k == 0 { a } else { (0.1, 0.2) };
+    return r;
+}
+
+// Narrowing still narrows: i8's extremes survive the re-stamp exactly.
+fn narrow_ret() -> [i8; 2] {
+    return [127, -128];
+}
+
+fn main() -> i32 {
+    let t: (f64, f64) = tuple_tail();
+    print(t.0);                 // 0.1
+    print(t.1);                 // 0.2
+    let u: (f64, f64) = tuple_ret();
+    print(u.0);                 // 0.3
+    print(u.1);                 // 0.4
+    let a: [f64; 2] = array_ret();
+    print(a[0]);                // 0.5
+    print(a[1]);                // 0.6
+    let b: [f64; 2] = array_repeat_ret();
+    print(b[0]);                // 0.7
+    print(b[1]);                // 0.7
+    print(scalar_tail());       // 0.9
+    let m: (f64, f64) = merge_arm(1);
+    print(m.0);                 // 0.1  (the literal arm)
+    print(m.1);                 // 0.2
+    let n: (f64, f64) = merge_arm(0);
+    print(n.0);                 // 0.25 (the established arm)
+    print(n.1);                 // 0.75
+    let w: [i8; 2] = narrow_ret();
+    print(w[0] as i32);         // 127
+    print(w[1] as i32);         // -128
+    return 0;
+}
