@@ -3654,6 +3654,34 @@ impl FnLowerer<'_> {
         None
     }
 
+    /// The type-checked initializer of the top-level `const` named `sym`, **or `None` when any
+    /// in-scope binding shadows it**.
+    ///
+    /// This is the one place the const-vs-local precedence rule is written for a kernel emit site,
+    /// and every emitter that wants a `const`'s value must come through here rather than reading
+    /// `self.sema.consts` itself. The rule mirrors `lower_expr`'s `ExprKind::Path` arm, which tries
+    /// `lookup` first and only then inlines a const initializer: a kernel operand materialized from
+    /// a const's literal while a runtime local of that name is live would be a wrong answer both
+    /// backends produce identically, which no differential or opt-invariance gate can see.
+    ///
+    /// Three emitters route here — [`Self::eps_lit_bits`] (the fused-norm `eps`),
+    /// [`Self::alpha_value`] (a peeled GEMM scale) and [`Self::dim_value`] (every kernel extent).
+    /// `dim_value` was the cell of that 3x1 table that had no const arm at all, so naming a shape
+    /// (`const D: usize = 768;`) silently declined every dimension-carrying kernel.
+    ///
+    /// LIMIT, stated because a reassuring sentence here would be false: `lookup` sees only bindings
+    /// **already installed**. A recognizer analysing a nested body can run before an enclosing
+    /// `let`/loop binding of the same name is pushed, so a local that shadows a module-level const
+    /// *and* has not been bound yet resolves to the const here. That needs a deliberate name
+    /// collision; the pre-existing `eps_lit_bits` and `alpha_value` arms have carried exactly the
+    /// same limit since they were written.
+    fn unshadowed_const_init(&self, sym: Symbol) -> Option<&Expr> {
+        if self.lookup(sym).is_some() {
+            return None;
+        }
+        self.sema.consts.get(&sym)
+    }
+
     // ---- type helpers ----
 
     /// Fold an array annotation with sema's u64 operands and length-specific zero fallback.
@@ -4284,6 +4312,19 @@ impl FnLowerer<'_> {
     /// **array** source stores the array's base pointer at offset 0 and its static length at offset 8
     /// (the array→slice "unsizing" coercion); a **slice** source (or any other 16-byte view) copies
     /// the fat pointer field-wise. The slice then views the source's storage — no element copy.
+    ///
+    /// **This is the ONE function that decides how a `[]T` destination is filled from a source
+    /// expression**, and every site that initializes one must route through it: the slice `let`
+    /// (`lower_stmt`), the call-argument unsizing coercion ([`Self::lower_arg_coerced`]), and the
+    /// shared aggregate-initializer primitive [`Self::init_field`] — which is itself the struct
+    /// field, tuple element, array element, enum payload, whole-buffer assignment and sret-return
+    /// path. Before that last one routed here it fell through to [`Self::emit_copy`], whose
+    /// `Ty::Slice` arm copies a fat pointer **out of the source**: for `L { w: c }` with
+    /// `c: [f32; 16]` that read `c`'s first eight bytes (`1.0f32 | 2.0f32`) as the data pointer, so
+    /// the first `l.w[i]` failed `expected a pointer` on interp and took a SIGSEGV natively. Note
+    /// `emit_copy`'s `Ty::Slice` arm is still right for what it does — copying a slice *field* out of
+    /// an aggregate whose buffer really does hold a fat pointer — so the distinction is the SOURCE,
+    /// which only this function inspects.
     fn lower_slice_from_source(&mut self, dst: ValueId, src: &Expr) {
         if let Ty::Array { len, .. } = self.expr_ty(src) {
             let base = self.lower_expr(src);
@@ -4339,14 +4380,18 @@ impl FnLowerer<'_> {
     /// fat-pointer temporary `{ data = &arr, len = N }` and pass *its* address, so the callee's slice
     /// reads (`s[i]`, `s.len()`, `for x in s`) resolve. Any other argument — including one already a
     /// slice (a 16-byte buffer whose base pointer IS the fat pointer) — lowers verbatim.
+    ///
+    /// The fat pointer itself is built by [`Self::lower_slice_from_source`], the single function that
+    /// decides how a `[]T` destination is filled, so this site cannot drift from the slice `let` and
+    /// the aggregate-field path. The `Ty::Array` guard is what selects that function's unsizing
+    /// branch; a non-array argument is passed verbatim below and never reaches it.
     fn lower_arg_coerced(&mut self, arg: &Expr, param_ty: Option<&Ty>) -> ValueId {
         if let Some(Ty::Slice(_)) = param_ty {
-            if let Ty::Array { len, .. } = self.expr_ty(arg) {
-                let base = self.lower_expr(arg);
+            if matches!(self.expr_ty(arg), Ty::Array { .. }) {
                 let sbuf = self
                     .builder
                     .alloca(MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32));
-                self.store_slice_fat_ptr(sbuf, base, len);
+                self.lower_slice_from_source(sbuf, arg);
                 return sbuf;
             }
         }
@@ -4502,9 +4547,10 @@ impl FnLowerer<'_> {
 
     /// Initialize the location `dst` (a pointer into an aggregate buffer) of semantic type `fty` from
     /// initializer `value`. A nested struct/tuple/array literal recurses *directly* into `dst` (no
-    /// temporary buffer + copy); a non-literal aggregate value is deep-copied from its buffer; a
-    /// scalar is coerced to the field type and stored. The one initializer primitive shared by struct,
-    /// tuple, and (aggregate-element) array lowering.
+    /// temporary buffer + copy); a `[]T` destination is built by [`Self::lower_slice_from_source`];
+    /// any other non-literal aggregate value is deep-copied from its buffer; a scalar is coerced to
+    /// the field type and stored. The one initializer primitive shared by struct-literal field, tuple
+    /// element, aggregate array element, enum payload field, whole-buffer assignment and sret return.
     fn init_field(&mut self, dst: ValueId, fty: &Ty, value: &Expr) {
         match (&value.kind, fty) {
             // A struct literal recurses directly into `dst`. A data-carrying enum's `E::V { .. }`
@@ -4522,6 +4568,22 @@ impl FnLowerer<'_> {
                 let emir = self.mir_ty_of(elem);
                 self.lower_array_init(dst, &emir, *len as u32, value);
             }
+            // A `[]T` destination is a 16-byte fat pointer whose contents depend on the SOURCE:
+            // sema's one implicit conversion unsizes a `[T; N]` (`{ &arr[0], N }`), while a slice
+            // source has its two fields copied. `lower_slice_from_source` is the single function that
+            // makes that choice, and this arm is what puts the aggregate-initializer path on it —
+            // exactly as the slice `let` and the call-argument coercion already were.
+            //
+            // Falling through to the `_` arm instead reached `emit_copy`, which for `Ty::Slice`
+            // copies a fat pointer *out of the source buffer*. For an ARRAY source there is no fat
+            // pointer there to copy: `struct L { w: []f32 }` with `let l = L { w: c }`,
+            // `c: [f32; 16]`, read `c`'s bytes 0..8 (`1.0f32 | 2.0f32`) as the data pointer and
+            // bytes 8..16 as the length, so the first `l.w[i]` failed `error: expected a pointer` on
+            // interp and took a SIGSEGV (exit 139) natively. Reaching this one arm fixes the struct
+            // field, the tuple element, the aggregate array element, the enum payload field, the
+            // whole-buffer assignment (`l.w = c`) and the sret aggregate return together, because
+            // all six are `init_field` callers.
+            (_, Ty::Slice(_)) => self.lower_slice_from_source(dst, value),
             _ => {
                 let fmty = self.mir_ty_of(fty);
                 if matches!(fmty, MirType::Array(..)) {
@@ -4723,8 +4785,19 @@ impl FnLowerer<'_> {
     }
 
     /// The length-based runtime ABI has signed i64 counts. Narrow integer counters fit after
-    /// promotion with their comparison signedness. For i64 counters, zero-based signed ranges
-    /// are also representable; other domains retain ordinary loop lowering until proved safe.
+    /// promotion with their comparison signedness. For i64 counters, zero-based ranges are
+    /// representable when the endpoint is in the signed domain — always for a signed counter, and
+    /// for an unsigned one exactly when [`Self::end_fits_signed_i64`] proves it; other domains
+    /// retain ordinary loop lowering until proved safe.
+    ///
+    /// The unsigned-64 arm is what lets a `usize` counter dispatch at all. Every 1-D recognizer
+    /// (vmath, vmath2, velem, vhorner, dequant, argreduce, the parallel reduction, the four lowp
+    /// arms) and the 256-bit recipe block inside `try_vectorize_ranged` are gated on this predicate,
+    /// so before it existed `const D: usize = 3; for i in 0..D { … }` — a `usize` const dim, the
+    /// shape-safe spelling the language leads with — emitted no kernel and no 256-bit vector op at
+    /// all. A `usize` counter is not a different loop from an `i64` one over the same trip count;
+    /// only the *width of the count* is at issue, which is why the narrow unsigned counters
+    /// (`mir_byte_size < 8`) have always been accepted without a value proof.
     fn kernel_range_supported(&self, start: &Expr, end: &Expr) -> bool {
         let (ity, signed) = self.range_counter_type(start, end);
         // Sema assigns the iterator the start's signedness. A signed-start/unsigned-end
@@ -4744,7 +4817,28 @@ impl FnLowerer<'_> {
             && self.expr_mir(end).is_int()
             && ity.is_int()
             && (mir_byte_size(&ity) < 8
-                || (ity == MirType::I64 && signed && as_int_lit(start, self.interner) == Some(0)))
+                || (ity == MirType::I64
+                    && as_int_lit(start, self.interner) == Some(0)
+                    && (signed || self.end_fits_signed_i64(end))))
+    }
+
+    /// Does a 64-bit **unsigned** range endpoint provably fit the kernel ABI's signed i64 count?
+    ///
+    /// Every kernel takes its extent as a signed i64, and every recognizer computes it as
+    /// `end - start` with `start == 0`, so an endpoint above `i64::MAX` would reach the kernel as a
+    /// negative count — which every kernel entry treats as "nothing to do" while the loop as written
+    /// would iterate. That is the whole reason the unsigned 64-bit domain is not accepted outright,
+    /// and the proof is therefore about the VALUE, not about the declared signedness.
+    ///
+    /// [`Self::const_runtime_u64_expr`] is the prover: literals, literal arithmetic with checked
+    /// operators, and an unshadowed top-level `const`, each required to carry a matching concrete
+    /// integer type. Anything it cannot fold — a symbolic tensor dim threaded in as a hidden `usize`
+    /// parameter, `s.len()`, a runtime `usize` — declines here and keeps the ordinary loop lowering.
+    /// Closing those needs a runtime `end >= 0` test on the dispatch, which is a different change:
+    /// this predicate is consulted before any MIR is built and cannot introduce a branch.
+    fn end_fits_signed_i64(&self, end: &Expr) -> bool {
+        self.const_runtime_u64_expr(end)
+            .is_some_and(|v| v <= i64::MAX as u64)
     }
 
     /// Convert through the scalar loop's common type before widening to the kernel ABI. This
@@ -8084,13 +8178,11 @@ impl FnLowerer<'_> {
         // A top-level `const EPS: f32 = <literal>` — the near-universal transformer spelling. A `const`
         // is immutable and always in scope (no `prior` dependency), and its checked initializer lives in
         // `sema.consts`, so resolving its literal bits here is exactly as sound as an inline literal.
-        // Guarded by `lookup(sym).is_none()` — a local/param binding of the same name shadows the const
-        // (mirroring the `Path` value-lowering precedence), so a runtime `eps` never resolves to a
-        // const's value. Without this, `rsqrt(ss/N + EPS)` dropped the whole norm to `velem` + a reduction.
-        if self.lookup(sym).is_none() {
-            if let Some(init) = self.sema.consts.get(&sym) {
-                return self.float_lit_bits(init);
-            }
+        // `unshadowed_const_init` carries the shadowing rule (a local/param binding of the same name
+        // wins, mirroring `Path` value lowering) so a runtime `eps` never resolves to a const's value.
+        // Without this, `rsqrt(ss/N + EPS)` dropped the whole norm to `velem` + a reduction.
+        if let Some(init) = self.unshadowed_const_init(sym) {
+            return self.float_lit_bits(init);
         }
         None
     }
@@ -9510,9 +9602,9 @@ impl FnLowerer<'_> {
 
     /// Materialize a peeled α scale as an f32 value: a literal builds a `ConstFloat`; a symbol loads
     /// its slot — or, when it names no local at all, resolves a top-level `const SCALE: f32 =
-    /// <literal>` through `sema.consts` (the same shadowing rule as `eps_lit_bits` and the `Path`
-    /// value lowering: an in-scope local always wins). `None` — the caller falls back to the scalar
-    /// nest — if the symbol is neither (e.g. the nest-internal accumulator, out of scope here).
+    /// <literal>` through [`Self::unshadowed_const_init`] (the shared shadowing rule: an in-scope
+    /// local always wins). `None` — the caller falls back to the scalar nest — if the symbol is
+    /// neither (e.g. the nest-internal accumulator, out of scope here).
     fn alpha_value(&mut self, alpha: AlphaScale) -> Option<ValueId> {
         match alpha {
             AlphaScale::Lit(f) => Some(
@@ -9523,7 +9615,7 @@ impl FnLowerer<'_> {
                 if let Some((slot, ty)) = self.lookup(s) {
                     return Some(self.builder.build(ty.clone(), Op::Load(slot, ty)));
                 }
-                let init = self.sema.consts.get(&s)?;
+                let init = self.unshadowed_const_init(s)?;
                 let bits = self.float_lit_bits(init)? as u32;
                 Some(self.builder.build(
                     MirType::F32,
@@ -10775,8 +10867,26 @@ impl FnLowerer<'_> {
         )
     }
 
-    /// Materialize a matmul dimension as an `i64` MIR value: a constant for a literal, or a load
-    /// (coerced to i64) of the runtime dimension variable.
+    /// Materialize a kernel dimension as an `i64` MIR value: a constant for a literal, a load
+    /// (coerced to i64) of a runtime dimension variable (a parameter, a local, or a symbolic
+    /// tensor dim threaded in by [`Self::bind_dim_params`]), or — when the name is bound to no local
+    /// at all — the folded value of a top-level `const D: usize = 768;`.
+    ///
+    /// That last arm is why this exists as more than a `lookup`. `as_dim` maps a const identifier to
+    /// `Dim::Var` (it is not an `ExprKind::Int`, so `as_int_lit` declines), the stride-consistency
+    /// checks then pass symbolically, and this function is the last step before the `Op::Call` —
+    /// so a `lookup` miss here declined the kernel *after* the whole nest had been recognized, for
+    /// every one of the ~60 `dim_value` call sites (GEMM, GEMV/GEVM, transpose, pool2d, embedding,
+    /// scatter, the col*/row* families, the norm backwards, xent, RoPE, the lowp and i8 GEMMs). The
+    /// sibling scalar resolvers [`Self::alpha_value`] and [`Self::eps_lit_bits`] had carried the
+    /// const arm for some time; this one did not, so naming your shapes — the normal way to write a
+    /// model — turned off every dimension-carrying kernel with no diagnostic.
+    ///
+    /// The fold is [`Self::const_runtime_u64_expr`], the same non-speculative prover the `sdpa`
+    /// extent check uses: it admits only matching concrete integer types with no overflow, narrowing
+    /// or fallback, so an unfoldable or out-of-range initializer declines to the scalar nest rather
+    /// than inventing an extent. `i64::try_from` is the kernel ABI's own bound (every extent is a
+    /// signed i64 count), not a second opinion about the value.
     fn dim_value(&mut self, dim: Dim) -> Option<ValueId> {
         match dim {
             Dim::Lit(v) => Some(
@@ -10784,11 +10894,26 @@ impl FnLowerer<'_> {
                     .build(MirType::I64, Op::ConstInt(v as i128, MirType::I64)),
             ),
             Dim::Var(sym) => {
-                let (slot, ty) = self.lookup(sym)?;
-                let v = self.builder.build(ty.clone(), Op::Load(slot, ty.clone()));
-                Some(self.coerce_to(v, &ty, &MirType::I64, true))
+                if let Some((slot, ty)) = self.lookup(sym) {
+                    let v = self.builder.build(ty.clone(), Op::Load(slot, ty.clone()));
+                    return Some(self.coerce_to(v, &ty, &MirType::I64, true));
+                }
+                let v = self.const_dim_value(sym)?;
+                Some(
+                    self.builder
+                        .build(MirType::I64, Op::ConstInt(v as i128, MirType::I64)),
+                )
             }
         }
+    }
+
+    /// The value of a kernel extent named by an unshadowed top-level `const`, as the kernel ABI's
+    /// signed i64 count. `None` when the name is not such a const, when its initializer does not
+    /// fold to a provable nonnegative integer, or when the value does not fit i64 — each of which
+    /// makes the caller decline to the loop as written.
+    fn const_dim_value(&self, sym: Symbol) -> Option<i64> {
+        let init = self.unshadowed_const_init(sym)?;
+        i64::try_from(self.const_runtime_u64_expr(init)?).ok()
     }
 
     /// Recognize a kernel-dispatchable reduction body over the loop variable `k`: an additive fold
@@ -32408,5 +32533,320 @@ fn main() -> i32 {
             "cumsum tolerates aliasing by contract and must not be declined, got {:?}",
             kernel_calls(&prog, &interner)
         );
+    }
+
+    // ---- P12: slice destinations, const dimensions, unsigned kernel ranges -------------------
+    //
+    // These share one property worth stating once: each asserts something the project's
+    // differential, opt-invariance and determinism gates are BLIND to by construction. A
+    // recognizer fires identically on interp and native at every `-O` level, and the
+    // slice-unsizing defect below produced the SAME failure on both backends, so "the two
+    // backends agree" proves nothing about any of it. `tests/run/slice_destination_spellings.wk`
+    // carries the value half; these carry the structural half.
+    mod p12 {
+        use super::*;
+        use std::collections::HashSet as StdHashSet;
+
+        /// The `alloca` of every `[N x f32]` buffer in `f`, plus every value GEP'd from one,
+        /// transitively. These are exactly the values that name float data.
+        fn f32_buffer_cone(f: &Function) -> StdHashSet<ValueId> {
+            let mut cone: StdHashSet<ValueId> = StdHashSet::new();
+            for b in &f.blocks {
+                for i in &b.insts {
+                    match (&i.op, i.result) {
+                        (
+                            Op::Alloca {
+                                ty: MirType::Array(e, _),
+                                ..
+                            },
+                            Some(r),
+                        ) if **e == MirType::F32 => {
+                            cone.insert(r);
+                        }
+                        (Op::Gep { ptr, .. }, Some(r)) if cone.contains(ptr) => {
+                            cone.insert(r);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            cone
+        }
+
+        /// Does `f` read a POINTER out of a float buffer itself? That is the signature of the
+        /// defect: a `[T; N]` used to initialize a `[]T` location was byte-copied as if it already
+        /// held a fat pointer, so the first eight bytes of float data became the data pointer.
+        fn loads_a_pointer_out_of_the_f32_buffer(f: &Function) -> bool {
+            let cone = f32_buffer_cone(f);
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(&i.op, Op::Load(p, MirType::Ptr) if cone.contains(p)))
+            })
+        }
+
+        /// Is the i64 constant `k` STORED anywhere in `f`? A loop bound of the same value is
+        /// compared, not stored, so this does not confuse the array's own extent with the slice
+        /// length the unsizing writes at `SLICE_LEN_OFF`.
+        fn stores_the_constant(f: &Function, k: i128) -> bool {
+            let mut consts: StdHashSet<ValueId> = StdHashSet::new();
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let (Op::ConstInt(v, MirType::I64), Some(r)) = (&i.op, i.result) {
+                        if *v == k {
+                            consts.insert(r);
+                        }
+                    }
+                }
+            }
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(&i.op, Op::Store { value, .. } if consts.contains(value)))
+            })
+        }
+
+        /// Every spelling sema accepts for "initialize a `[]T` location from a `[T; N]` array",
+        /// as a COMPLETE program each, so a row proves only its own spelling.
+        ///
+        /// The point of the table is the collapse it checks: all six route through
+        /// `FnLowerer::lower_slice_from_source`, so a seventh initializer path that does not fails
+        /// here rather than at run time.
+        ///
+        /// The first four reach it through `init_field` and every one of them was broken - each
+        /// verified against the real binary on the campaign base as `error: expected a pointer`
+        /// (exit 1, interp) and SIGSEGV (exit 139, native). The last two were already correct and
+        /// are here because the fix's claim is about all six, not about the four.
+        ///
+        /// A tuple element (`let t: ([]f32, i32) = (c, 1);`) and an array element
+        /// (`let xs: [[]f32; 1] = [c];`) are deliberately absent: sema's unsizing is top-level
+        /// only, so both are rejected E0401 before lowering ever sees them.
+        const SLICE_DESTINATIONS: &[(&str, &str)] = &[
+            (
+                "struct-literal field",
+                "module m
+struct L { w: []f32 }
+fn show(s: []f32) { print(s[0] as i32); }
+fn main() -> i32 { let c: [f32; 16] = [1.0; 16]; let l: L = L { w: c }; show(l.w); return 0; }
+",
+            ),
+            (
+                "assignment into a slice field",
+                "module m
+struct L { w: []f32 }
+fn show(s: []f32) { print(s[0] as i32); }
+fn main() -> i32 {
+    let c: [f32; 16] = [1.0; 16];
+    let z: [f32; 16] = [0.0; 16];
+    let mut m: L = L { w: z };
+    m.w = c;
+    show(m.w);
+    return 0;
+}
+",
+            ),
+            (
+                "enum payload field",
+                "module m
+enum E { V([]f32), N }
+fn show(s: []f32) { print(s[0] as i32); }
+fn main() -> i32 {
+    let c: [f32; 16] = [1.0; 16];
+    let e: E = E::V(c);
+    match e { E::V(p) => { show(p); } E::N => { print(0); } }
+    return 0;
+}
+",
+            ),
+            (
+                "sret `[]f32` return",
+                "module m
+fn show(s: []f32) { print(s[0] as i32); }
+fn slice_ret(a: [f32; 16]) -> []f32 { return a; }
+fn main() -> i32 { let c: [f32; 16] = [1.0; 16]; show(slice_ret(c)); return 0; }
+",
+            ),
+            (
+                "slice `let` binding",
+                "module m
+fn show(s: []f32) { print(s[0] as i32); }
+fn main() -> i32 { let c: [f32; 16] = [1.0; 16]; let s: []f32 = c; show(s); return 0; }
+",
+            ),
+            (
+                "call-argument coercion",
+                "module m
+fn show(s: []f32) { print(s[0] as i32); }
+fn main() -> i32 { let c: [f32; 16] = [1.0; 16]; show(c); return 0; }
+",
+            ),
+        ];
+
+        /// Every slice destination must build a fat pointer `{ &c[0], 16 }`, so none may read a
+        /// pointer out of `c`'s float bytes.
+        #[test]
+        fn every_slice_destination_unsizes_rather_than_byte_copying() {
+            for (what, src) in SLICE_DESTINATIONS {
+                let (prog, diags, _) = lower(src);
+                assert!(
+                    diags.iter().all(|d| !d.is_error()),
+                    "{what}: lower: {diags:?}"
+                );
+                for f in &prog.funcs {
+                    assert!(
+                        !loads_a_pointer_out_of_the_f32_buffer(f),
+                        "{what}: read a fat pointer out of the `[f32; 16]` buffer - \
+                         the array->slice unsizing did not happen"
+                    );
+                }
+            }
+        }
+
+        /// The other half of the same law: the fat pointer must actually be BUILT, so the
+        /// destination carries the array's static length. Without this the test above would pass
+        /// over a lowering that stored nothing at all.
+        #[test]
+        fn every_slice_destination_stores_the_static_length() {
+            for (what, src) in SLICE_DESTINATIONS {
+                let (prog, _, _) = lower(src);
+                let stored = prog.funcs.iter().any(|f| stores_the_constant(f, 16));
+                assert!(
+                    stored,
+                    "{what}: no `store const.i64 16` - the unsizing never wrote the slice length"
+                );
+            }
+        }
+
+        /// The alias consequence of the fix above, and why it had to land in the same commit.
+        /// `L { w: c }` makes `l.w` a SECOND NAME for `c`; a GEMM whose output is `c` and whose B
+        /// operand is spelled `l.w` therefore writes its own input while reading it, so the
+        /// recognizer must decline and let the scalar nest lower. `main` has no parameters, so the
+        /// call-site half of the alias analysis is trivially satisfied here - only the body's
+        /// republishing map can see this.
+        #[test]
+        fn a_slice_field_unsized_from_an_array_aliases_that_array() {
+            let src = "module m
+struct L { w: []f32 }
+fn main() -> i32 {
+    let b: [f32; 16] = [1.0; 16];
+    let mut c: [f32; 16] = [2.0; 16];
+    let l: L = L { w: c };
+    for i in 0..4 { for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + b[i*4+k] * l.w[k*4+j]; }
+        c[i*4+j] = s;
+    } }
+    print(c[0] as i32);
+    return 0;
+}
+";
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                !prog_calls(&prog, &interner, "wukong_sgemm"),
+                "dispatched a GEMM whose B operand `l.w` IS its output `c`; got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+        }
+
+        /// A control for the test above: the same nest with `l.w` unsized from a DIFFERENT array
+        /// must still dispatch. Without it the alias arm could be "decline whenever a struct holds
+        /// a slice", which would pass the test above while costing every real
+        /// weights-in-a-struct program its kernels.
+        #[test]
+        fn a_slice_field_over_a_disjoint_array_still_dispatches() {
+            let src = "module m
+struct L { w: []f32 }
+fn main() -> i32 {
+    let b: [f32; 16] = [1.0; 16];
+    let w: [f32; 16] = [3.0; 16];
+    let mut c: [f32; 16] = [2.0; 16];
+    let l: L = L { w: w };
+    for i in 0..4 { for j in 0..4 {
+        let mut s: f32 = 0.0;
+        for k in 0..4 { s = s + b[i*4+k] * l.w[k*4+j]; }
+        c[i*4+j] = s;
+    } }
+    print(c[0] as i32);
+    return 0;
+}
+";
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                prog_calls(&prog, &interner, "wukong_sgemm"),
+                "a disjoint slice field must keep its kernel; got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+        }
+
+        /// `dim_value`'s const arm. Naming the shape - `const N: i32 = 4;` - used to decline every
+        /// dimension-carrying kernel, because `as_dim` maps a const identifier to `Dim::Var` and
+        /// `dim_value` resolved `Dim::Var` through `lookup` alone. The sibling emit-site resolvers
+        /// `alpha_value` and `eps_lit_bits` already consulted `sema.consts`; this was the empty
+        /// cell of that table.
+        #[test]
+        fn a_const_dimension_dispatches_the_gemm() {
+            let src = "module m
+const N: i32 = 4;
+fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
+    for i in 0..N { for j in 0..N {
+        let mut s: f32 = 0.0;
+        for k in 0..N { s = s + a[i*N+k] * b[k*N+j]; }
+        c[i*N+j] = s;
+    } }
+}
+";
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                prog_calls(&prog, &interner, "wukong_sgemm"),
+                "a `const`-dimensioned nest must dispatch; got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+        }
+
+        /// `kernel_range_supported`'s unsigned-64 arm. A `usize` counter is the shape-safe
+        /// spelling the language leads with, and it disabled all eleven range-gated recognizers
+        /// plus the 256-bit recipe block, because the kernel ABI's count is a signed i64 and
+        /// nothing proved the endpoint fit. A `const D: usize` endpoint folds, so now it does.
+        #[test]
+        fn a_usize_const_bound_dispatches_the_vmath_kernel() {
+            let src = "module m
+const D: usize = 4096;
+fn act(mut a: [f32; 4096], x: [f32; 4096]) {
+    for i in 0..D { a[i] = gelu(x[i]); }
+}
+";
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                prog_calls(&prog, &interner, "wukong_vmath_f32"),
+                "a `usize` const loop bound must dispatch; got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+        }
+
+        /// The decline side of the same predicate, and its honest limit: a `usize` endpoint whose
+        /// value is NOT provable - here a runtime parameter - still keeps the ordinary loop
+        /// lowering, because an endpoint above `i64::MAX` would reach the kernel as a negative
+        /// count and every kernel entry treats that as "nothing to do" while the loop as written
+        /// iterates. Proving it needs a runtime test on the dispatch, which this predicate cannot
+        /// emit: it runs before any MIR is built.
+        #[test]
+        fn an_unprovable_usize_bound_still_declines() {
+            let src = "module m
+fn act(mut a: [f32; 4096], x: [f32; 4096], n: usize) {
+    for i in 0..n { a[i] = gelu(x[i]); }
+}
+";
+            let (prog, diags, interner) = lower(src);
+            assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+            assert!(
+                !prog_calls(&prog, &interner, "wukong_vmath_f32"),
+                "an unprovable unsigned 64-bit endpoint must not dispatch; got {:?}",
+                kernel_calls(&prog, &interner)
+            );
+        }
     }
 }

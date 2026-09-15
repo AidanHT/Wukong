@@ -1,0 +1,129 @@
+// RUN: --run
+// A `[T; N]` array initializing a `[]T` LOCATION is sema's one implicit conversion — the array to
+// slice "unsizing" (`wukong_sema::compatible`). Four locations reach it through `init_field`, the
+// shared aggregate-initializer primitive, and all four used to reach `emit_copy` instead: that arm
+// copies a fat pointer OUT OF the source buffer, so `a`'s first eight float bytes (10.0f32 |
+// 20.0f32) became the slice's data pointer. Every one of the four then died the same way —
+// `error: expected a pointer`, exit 1 on interp, and SIGSEGV exit 139 on native. IDENTICALLY on
+// both backends at every `-O` level, which is exactly why no differential, opt-invariance or
+// determinism gate could see it. It needed a fixture.
+//
+// Each spelling prints the slice's runtime length and then EVERY lane, never a sum: a wrong base
+// pointer or a wrong length shows as a wrong lane, and a partially correct view would pass a
+// reduction. The expected values are the source array's own elements, read off the literal below
+// and not recorded from compiler output.
+//
+// The fifth and sixth spellings (`let s: []f32 = a;` and passing `a` to a `[]f32` parameter) were
+// already correct; they are here because the point of the fix is that all six now go through one
+// function, `FnLowerer::lower_slice_from_source`.
+//
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 50
+// EXPECT-OUT: 60
+// EXPECT-OUT: 70
+// EXPECT-OUT: 80
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 50
+// EXPECT-OUT: 60
+// EXPECT-OUT: 70
+// EXPECT-OUT: 80
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 50
+// EXPECT-OUT: 60
+// EXPECT-OUT: 70
+// EXPECT-OUT: 80
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 50
+// EXPECT-OUT: 60
+// EXPECT-OUT: 70
+// EXPECT-OUT: 80
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 50
+// EXPECT-OUT: 60
+// EXPECT-OUT: 70
+// EXPECT-OUT: 80
+// EXPECT-OUT: 8
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-OUT: 30
+// EXPECT-OUT: 40
+// EXPECT-OUT: 50
+// EXPECT-OUT: 60
+// EXPECT-OUT: 70
+// EXPECT-OUT: 80
+
+struct L { w: []f32 }
+
+enum E { V([]f32), N }
+
+// `while`, not `for`, so nothing here is a recognizer's business: this fixture is about the
+// lowering of the slice, not about a kernel.
+fn show(s: []f32) {
+    print(s.len());
+    let mut i: i64 = 0;
+    while i < 8 {
+        print(s[i] as i32);
+        i = i + 1;
+    }
+}
+
+// The sret aggregate return: the returned `[]f32` views the CALLER's array, which is live for the
+// whole call, so this is a real view and not a dangling one.
+fn slice_ret(a: [f32; 8]) -> []f32 {
+    return a;
+}
+
+fn main() -> i32 {
+    let a: [f32; 8] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+    let z: [f32; 8] = [0.0; 8];
+
+    // 1. struct-literal field
+    let l: L = L { w: a };
+    show(l.w);
+
+    // 2. whole-buffer assignment into an existing slice field
+    let mut m: L = L { w: z };
+    m.w = a;
+    show(m.w);
+
+    // 3. data-carrying enum payload field
+    let e: E = E::V(a);
+    match e {
+        E::V(p) => { show(p); }
+        E::N => { print(0); }
+    }
+
+    // 4. sret return of a `[]f32`
+    let r: []f32 = slice_ret(a);
+    show(r);
+
+    // 5. the slice `let` binding (already correct)
+    let s: []f32 = a;
+    show(s);
+
+    // 6. the call-argument unsizing coercion (already correct)
+    show(a);
+
+    return 0;
+}

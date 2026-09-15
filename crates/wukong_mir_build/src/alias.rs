@@ -123,6 +123,16 @@
 //!   cannot classify at all counts too, because `Republish::Taint` means *cannot tell*. Reading it
 //!   as "no" made `s = if flag { c } else { c };` and `let ws: [[]f32; 1] = [if flag { c } else
 //!   { c }];` dispatch a GEMM over their own output, measured on both backends at -O0 and -O2.
+//! * **an ARRAY initializing a `[]T` location** — `let l = L { w: c };` with `struct L { w: []f32 }`
+//!   and `c: [f32; 16]`, and the same shape for an assignment `l.w = c;`. Sema's one implicit
+//!   conversion unsizes the array, and `FnLowerer::init_field` then routes it to
+//!   `lower_slice_from_source`, which stores `c`'s base pointer with no element copy — so `l.w` is
+//!   a second name for `c` even though `c`'s own type borrows nothing. Every question of this kind
+//!   goes through [`init_publishes_view`], which reads BOTH the destination's declared type and the
+//!   value's; reading only the value's is what made this spelling invisible. It was invisible
+//!   harmlessly until the same commit gave `init_field` its slice arm: before that the lowering
+//!   read a fat pointer out of `c`'s float bytes and the program died rather than aliasing
+//!   anything (`expected a pointer` on interp, exit 139 natively).
 //! * a name given a view meaning TWICE (`let s: []f32 = c; … let s: []f32 = d;`). Both maps are
 //!   keyed by NAME and last-writer-wins, so the second binding silently re-points every spelling of
 //!   `s` — including the ones textually above it — at the wrong buffer. That taints too, and it
@@ -1074,9 +1084,17 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                     return;
                 }
                 attributed.insert(e.id);
+                let lit_struct = match sema.types.get(&e.id) {
+                    Some(Ty::Named(s)) => Some(*s),
+                    _ => None,
+                };
                 let mut publishes = false;
                 for fi in fields {
-                    if !sema.types.get(&fi.value.id).is_some_and(ty_is_borrowing) {
+                    // The FIELD's declared type is half the question: `L { w: c }` with
+                    // `w: []f32` and `c: [f32; 16]` unsizes, so `l.w` views `c` even though `c`'s
+                    // own type borrows nothing. See `init_publishes_view`.
+                    let fty = struct_field_ty(lit_struct, fi.name.sym, sema);
+                    if !init_publishes_view(fty, &fi.value, sema) {
                         continue;
                     }
                     match republish_of(&fi.value, sema) {
@@ -1109,11 +1127,13 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                 iter: ForIter::Expr(e),
                 ..
             } => note_for_each_pattern(&mut out, pat, e, sema),
-            // `p = &x;` / `s = a;` — a borrowing place stored into a binding that already exists.
-            // WHICH name now reaches that storage is a flow-sensitive question this pass does not
-            // answer, so it taints outright rather than guessing.
-            StmtKind::Assign { value, .. } => {
-                out.opaque_republish |= republishing_value(value, sema);
+            // `p = &x;` / `s = a;` / `l.w = c;` — a place stored into a location that already
+            // exists, where the store publishes a view. WHICH name now reaches that storage is a
+            // flow-sensitive question this pass does not answer, so it taints outright rather than
+            // guessing. The TARGET's declared type is what catches `l.w = c;`, whose right-hand
+            // side is an array and would otherwise read as a deep copy.
+            StmtKind::Assign { target, value, .. } => {
+                out.opaque_republish |= republishing_value(sema.types.get(&target.id), value, sema);
             }
             _ => {}
         },
@@ -1131,14 +1151,26 @@ fn scan_body(body: &Block, sema: &SemaResult) -> BodyScan {
                 if attributed.contains(&e.id) {
                     return;
                 }
-                out.opaque_republish |= fields.iter().any(|fi| republishing_value(&fi.value, sema))
-                    || rest.as_deref().is_some_and(|r| republishing_value(r, sema));
+                let sname = match sema.types.get(&e.id) {
+                    Some(Ty::Named(s)) => Some(*s),
+                    _ => None,
+                };
+                out.opaque_republish |= fields.iter().any(|fi| {
+                    republishing_value(struct_field_ty(sname, fi.name.sym, sema), &fi.value, sema)
+                }) || rest
+                    .as_deref()
+                    .is_some_and(|r| republishing_value(None, r, sema));
             }
             ExprKind::ArrayLit(xs) | ExprKind::TupleLit(xs) => {
-                out.opaque_republish |= xs.iter().any(|x| republishing_value(x, sema));
+                let agg = sema.types.get(&e.id);
+                out.opaque_republish |= xs
+                    .iter()
+                    .enumerate()
+                    .any(|(i, x)| republishing_value(aggregate_elem_ty(agg, i), x, sema));
             }
             ExprKind::ArrayRepeat { value, .. } => {
-                out.opaque_republish |= republishing_value(value, sema);
+                let agg = sema.types.get(&e.id);
+                out.opaque_republish |= republishing_value(aggregate_elem_ty(agg, 0), value, sema);
             }
             // A `match` arm PATTERN binds a name onto storage INSIDE the scrutinee -- an enum
             // payload (`E::V(p)`), a tuple element -- and when that storage borrows, the binding is
@@ -1403,9 +1435,58 @@ fn body_names_one_buffer_twice(scan: &BodyScan) -> bool {
 /// comment claimed: its return type is `[]f32`, which borrows, so [`origin_of`] classifies it
 /// `Unknown` through the CALL arm (the [`Origin::Fresh`] doc says exactly this). [`republish_of`]
 /// maps a call to `Nothing`, which is why the whole `alloc_*` corpus keeps its kernels.
-fn republishing_value(e: &Expr, sema: &SemaResult) -> bool {
-    sema.types.get(&e.id).is_some_and(ty_is_borrowing)
-        && !matches!(republish_of(e, sema), Republish::Nothing)
+/// `dst` is the DECLARED type of the location being initialized (a struct field, an array or tuple
+/// element, an assignment target), or `None` where the caller genuinely has no destination.
+fn republishing_value(dst: Option<&Ty>, e: &Expr, sema: &SemaResult) -> bool {
+    init_publishes_view(dst, e, sema) && !matches!(republish_of(e, sema), Republish::Nothing)
+}
+
+/// **THE test for "this initializer produces a VIEW of its source rather than a copy."** Every site
+/// in this pass that asks the question asks it here, and no site may ask it any other way.
+///
+/// Both types matter, and reading only one of them is a wrong answer:
+///
+/// * The VALUE's type borrows (`let l = Layer { wq: swq };` with `swq: []f32`) — the fat pointer is
+///   copied, so the field is a second name for what `swq` views.
+/// * The DESTINATION's type borrows while the value's does not. This is sema's one implicit
+///   conversion, `[T; N]` -> `[]T` unsizing (`wukong_sema::compatible`), and after it
+///   `FnLowerer::init_field` sends the initializer to `lower_slice_from_source`, which stores the
+///   ARRAY's base pointer into the field — "the slice then views the source's storage — no element
+///   copy". So `struct L { w: []f32 }` with `let l = L { w: c };`, `c: [f32; 16]`, makes `l.w` a
+///   second name for `c` even though `c`'s own type is an array and borrows nothing.
+///
+/// The second case is new: before `init_field` had a slice arm it reached `emit_copy`, which read a
+/// fat pointer out of `c`'s float bytes, so the program died (`expected a pointer` on interp, exit
+/// 139 natively) rather than aliasing anything. Making that spelling WORK is what makes its alias
+/// real, which is why this predicate had to change in the same commit — a fix that only corrected
+/// the lowering would have handed `wukong_sgemm` an output aliasing its own operand, silently and
+/// identically on both backends at every `-O` level.
+///
+/// `None` for `dst` means the caller has no declared destination to offer and the value's type
+/// alone decides. Prefer passing the destination: it is what makes the unsizing case visible.
+fn init_publishes_view(dst: Option<&Ty>, e: &Expr, sema: &SemaResult) -> bool {
+    dst.is_some_and(ty_is_borrowing) || sema.types.get(&e.id).is_some_and(ty_is_borrowing)
+}
+
+/// The declared type of field `fname` of struct `sname`, for [`init_publishes_view`]'s `dst`.
+/// `None` when the name is not a struct or has no such field, which leaves the value's own type to
+/// decide — the conservative direction only in the sense that it is the pre-unsizing answer, so a
+/// caller that can resolve the struct must.
+fn struct_field_ty(sname: Option<Symbol>, fname: Symbol, sema: &SemaResult) -> Option<&Ty> {
+    struct_fields(sname?, sema)
+        .iter()
+        .find(|(n, _)| *n == fname)
+        .map(|(_, t)| t)
+}
+
+/// The declared ELEMENT type of an array/tuple literal's slot `i`, for [`init_publishes_view`]'s
+/// `dst`. An array yields its one element type for every slot; a tuple yields the `i`-th.
+fn aggregate_elem_ty(agg: Option<&Ty>, i: usize) -> Option<&Ty> {
+    match agg? {
+        Ty::Array { elem, .. } => Some(elem),
+        Ty::Tuple(elems) => elems.get(i),
+        _ => None,
+    }
 }
 
 /// Does this call site bind two distinct buffer parameters of the callee to overlapping storage?
