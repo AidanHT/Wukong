@@ -1,12 +1,29 @@
 // RUN: --run
 // EXPECT-EXIT: 0
 // EXPECT-OUT: -5
+// EXPECT-OUT: 40
+// EXPECT-OUT: -50
 // EXPECT-OUT: 130
 module tests.run.linear_f32
 
 /// nn.Linear `C[2,2] = A[2,3]·B[2,3]ᵀ`, written the idiomatic `ijk` dot-product way. The compiler
 /// recognizes it as a transposed-B matmul and dispatches to `wukong_sgemm_nt`; `--run` executes the
 /// same kernel via the interpreter. Each `C[i,j]` is the dot product of A's row i and B's row j.
+///
+/// It used to print `c[0]` and `c[3]` — the two DIAGONAL entries of a 2x2 — so a transposed store,
+/// the most likely defect class for an NT kernel, swapped `c[1]` with `c[2]` and changed nothing
+/// observable. It is a recognizer fixture, so no differential, invariance or determinism gate can
+/// see that either: `wukong_sgemm_nt` runs on both backends at every `-O` level and is wrong
+/// identically on both. All four lanes are printed now, and they are four distinct values.
+///
+/// WHERE THE EXPECTED VALUES COME FROM (scalar semantics, never a compiler run). A's rows are
+/// [0, 0.5, 1.0] and [1.5, 2.0, 2.5]; B's rows are [-2, -1, 0] and [1, 2, 3]. Every input is a
+/// multiple of 0.5 against an integer, so every product and partial sum is exact in f32 and the
+/// scale-by-10 print is an exact integer with no rounding at all:
+///   C[0,0] = 0·(-2) + 0.5·(-1) + 1.0·0   =  -0.5  -> -5
+///   C[0,1] = 0·1    + 0.5·2    + 1.0·3   =   4.0  -> 40
+///   C[1,0] = 1.5·(-2) + 2.0·(-1) + 2.5·0 =  -5.0  -> -50
+///   C[1,1] = 1.5·1  + 2.0·2    + 2.5·3   =  13.0  -> 130
 fn main() -> i32 {
     let mut a: [f32; 6] = [0.0; 6];
     let mut b: [f32; 6] = [0.0; 6];
@@ -25,6 +42,8 @@ fn main() -> i32 {
     }
 
     print((c[0] * 10.0) as i32);
+    print((c[1] * 10.0) as i32);
+    print((c[2] * 10.0) as i32);
     print((c[3] * 10.0) as i32);
     return 0;
 }

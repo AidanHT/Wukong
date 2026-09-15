@@ -1,17 +1,17 @@
 // RUN: --run
 // EXPECT-EXIT: 0
-// EXPECT-OUT: 36
-// EXPECT-OUT: 72
-// EXPECT-OUT: 41
-// EXPECT-OUT: 82
-// EXPECT-OUT: 160
-// EXPECT-OUT: 320
-// EXPECT-OUT: 636
-// EXPECT-OUT: 1272
-// EXPECT-OUT: 640
-// EXPECT-OUT: 1280
-// EXPECT-OUT: 641
-// EXPECT-OUT: 1282
+// EXPECT-OUT: 57
+// EXPECT-OUT: 166
+// EXPECT-OUT: 62
+// EXPECT-OUT: 174
+// EXPECT-OUT: 253
+// EXPECT-OUT: 745
+// EXPECT-OUT: 1014
+// EXPECT-OUT: 3041
+// EXPECT-OUT: 1018
+// EXPECT-OUT: 3045
+// EXPECT-OUT: 1023
+// EXPECT-OUT: 3055
 module tests.run.reduce_bf16_shapes
 
 // Every partial-step shape of the bf16 mixed-precision reductions (wukong_sum_bf16 /
@@ -23,99 +23,131 @@ module tests.run.reduce_bf16_shapes
 // whether it fired or whether the kernel walked off the end of a partial block — so this fixture is
 // the corpus-level proof that every shape still reduces the whole array and nothing else.
 //
-// The elements cycle 1, 2, 3, 4 and y is all 2: every value and every partial sum is a small
-// integer, exactly representable in bf16 AND in f32, so the expected numbers below are the plain
-// scalar semantics of the loop and are independent of the order the kernel accumulates in. (The
-// *order*-sensitive proof — that the SIMD lane partition matches its scalar twin bit-for-bit, and
-// that it beats a sequential f32 accumulator against an f64 reference — lives in wukong_runtime's
-// `simd_equals_scalar_twin_bit_for_bit` and `lowp_reductions_beat_the_sequential_f32_sum`, because
-// an inexact expectation here would have no order-independent right answer to record.)
+// THE DATA, AND WHY ITS PERIODS ARE 7 AND 5 (changed 2026-09; W9b).
 //
-// Σ over n = 4q + r elements is 10q + r(r+1)/2; the dot against the all-2 vector is twice that.
+// x cycled 1,2,3,4 and y was uniformly 2.0. Both choices made whole classes of defect invisible,
+// and the second made half the fixture carry no information at all:
+//
+//   * 4 divides 16, so EVERY full 16-element group of x summed to exactly 40. A kernel that
+//     skipped a group and processed another one twice — a wrong base, a wrong stride, a duplicated
+//     or dropped block, an off-by-one window — produced the identical total at n = 64, 255, 256 and
+//     257. Measured: with the old data the four multi-block sizes are all blind to that mutation;
+//     with x[i] = (i % 7) + 1 they are all sensitive, because 16 mod 7 = 2 and gcd(2,7) = 1, so the
+//     successive 16-block sums cycle 59, 63, 67, 64, 61, 65, 69 rather than repeating 40.
+//   * y was uniform, so every dot was exactly twice its sum: wukong_dot_bf16 could ignore its y
+//     pointer, read y at any stride, from any base, in any order, and all six dot lines still held.
+//     y[i] = (i % 5) + 1 makes the two streams' alignment observable — a relative shift of one
+//     element between x and y changes every one of the six dot values.
+//
+// WHAT IS STILL NOT PROVEN HERE, stated rather than implied. A sum is permutation-invariant by
+// construction: a kernel that consumes exactly the right multiset of elements in a different ORDER
+// cannot be caught by any expectation in this file, and blocks whose index differs by a multiple of
+// 7 still have equal sums, so swapping exactly those two is invisible too. The order-sensitive
+// proof — that the SIMD lane partition matches its scalar twin bit-for-bit, and that it beats a
+// sequential f32 accumulator against an f64 reference — lives in wukong_runtime's
+// `simd_equals_scalar_twin_bit_for_bit` and `lowp_reductions_beat_the_sequential_f32_sum`. What
+// this fixture now proves is the multiset: the kernel consumes each element exactly once, paired
+// with the right element of y.
+//
+// WHERE THE EXPECTED VALUES COME FROM — closed forms, never a compiler run. x ∈ {1..7} and
+// y ∈ {1..5} are small integers, exactly representable in bf16; every product is at most 35 and
+// every partial sum at most 3055, far inside f32's exact-integer range, so the answers do not
+// depend on the order the kernel accumulates in.
+//
+//   Σ x over n = 7q + r elements is 28q + r(r+1)/2:
+//     n=15 -> 28·2+1  = 57     n=17 -> 28·2+6  = 62     n=64  -> 28·9+1  = 253
+//     n=255-> 28·36+6 = 1014   n=256-> 28·36+10= 1018   n=257 -> 28·36+15= 1023
+//
+//   Σ x·y has period lcm(7,5) = 35, and by CRT each (a,b) ∈ {1..7}×{1..5} occurs exactly once per
+//   period, so one period sums to (Σa)(Σb) = 28·15 = 420. With n = 35d + t:
+//     n=15 -> 420·0 + 166 = 166        n=17  -> 420·0 + 174  = 174
+//     n=64 -> 420·1 + 325 = 745        n=255 -> 420·7 + 101  = 3041
+//     n=256-> 420·7 + 105 = 3045       n=257 -> 420·7 + 115  = 3055
+//   where the t-element tail sums are Σ_{i<t} ((i%7)+1)((i%5)+1).
 
 fn run15(x: [bf16; 15], y: [bf16; 15]) {
     let mut s: f32 = 0.0;
     for k in 0..15 { s = s + (x[k] as f32); }
-    print(s as i32); // 10*3 + 6 = 36
+    print(s as i32); // 28*2 + 1 = 57
     let mut d: f32 = 0.0;
     for k in 0..15 { d = d + (x[k] as f32) * (y[k] as f32); }
-    print(d as i32); // 72
+    print(d as i32); // 166
 }
 
 fn run17(x: [bf16; 17], y: [bf16; 17]) {
     let mut s: f32 = 0.0;
     for k in 0..17 { s = s + (x[k] as f32); }
-    print(s as i32); // 10*4 + 1 = 41
+    print(s as i32); // 28*2 + 6 = 62
     let mut d: f32 = 0.0;
     for k in 0..17 { d = d + (x[k] as f32) * (y[k] as f32); }
-    print(d as i32); // 82
+    print(d as i32); // 174
 }
 
 fn run64(x: [bf16; 64], y: [bf16; 64]) {
     let mut s: f32 = 0.0;
     for k in 0..64 { s = s + (x[k] as f32); }
-    print(s as i32); // 10*16 = 160
+    print(s as i32); // 28*9 + 1 = 253
     let mut d: f32 = 0.0;
     for k in 0..64 { d = d + (x[k] as f32) * (y[k] as f32); }
-    print(d as i32); // 320
+    print(d as i32); // 420 + 325 = 745
 }
 
 fn run255(x: [bf16; 255], y: [bf16; 255]) {
     let mut s: f32 = 0.0;
     for k in 0..255 { s = s + (x[k] as f32); }
-    print(s as i32); // 10*63 + 6 = 636
+    print(s as i32); // 28*36 + 6 = 1014
     let mut d: f32 = 0.0;
     for k in 0..255 { d = d + (x[k] as f32) * (y[k] as f32); }
-    print(d as i32); // 1272
+    print(d as i32); // 420*7 + 101 = 3041
 }
 
 fn run256(x: [bf16; 256], y: [bf16; 256]) {
     let mut s: f32 = 0.0;
     for k in 0..256 { s = s + (x[k] as f32); }
-    print(s as i32); // 10*64 = 640
+    print(s as i32); // 28*36 + 10 = 1018
     let mut d: f32 = 0.0;
     for k in 0..256 { d = d + (x[k] as f32) * (y[k] as f32); }
-    print(d as i32); // 1280
+    print(d as i32); // 420*7 + 105 = 3045
 }
 
 fn run257(x: [bf16; 257], y: [bf16; 257]) {
     let mut s: f32 = 0.0;
     for k in 0..257 { s = s + (x[k] as f32); }
-    print(s as i32); // 10*64 + 1 = 641
+    print(s as i32); // 28*36 + 15 = 1023
     let mut d: f32 = 0.0;
     for k in 0..257 { d = d + (x[k] as f32) * (y[k] as f32); }
-    print(d as i32); // 1282
+    print(d as i32); // 420*7 + 115 = 3055
 }
 
 fn main() -> i32 {
     let mut x15: [bf16; 15] = [0.0 as bf16; 15];
     let mut y15: [bf16; 15] = [0.0 as bf16; 15];
-    for i in 0..15 { x15[i] = ((i % 4 + 1) as f32) as bf16; y15[i] = 2.0 as bf16; }
+    for i in 0..15 { x15[i] = ((i % 7 + 1) as f32) as bf16; y15[i] = ((i % 5 + 1) as f32) as bf16; }
     run15(x15, y15);
 
     let mut x17: [bf16; 17] = [0.0 as bf16; 17];
     let mut y17: [bf16; 17] = [0.0 as bf16; 17];
-    for i in 0..17 { x17[i] = ((i % 4 + 1) as f32) as bf16; y17[i] = 2.0 as bf16; }
+    for i in 0..17 { x17[i] = ((i % 7 + 1) as f32) as bf16; y17[i] = ((i % 5 + 1) as f32) as bf16; }
     run17(x17, y17);
 
     let mut x64: [bf16; 64] = [0.0 as bf16; 64];
     let mut y64: [bf16; 64] = [0.0 as bf16; 64];
-    for i in 0..64 { x64[i] = ((i % 4 + 1) as f32) as bf16; y64[i] = 2.0 as bf16; }
+    for i in 0..64 { x64[i] = ((i % 7 + 1) as f32) as bf16; y64[i] = ((i % 5 + 1) as f32) as bf16; }
     run64(x64, y64);
 
     let mut x255: [bf16; 255] = [0.0 as bf16; 255];
     let mut y255: [bf16; 255] = [0.0 as bf16; 255];
-    for i in 0..255 { x255[i] = ((i % 4 + 1) as f32) as bf16; y255[i] = 2.0 as bf16; }
+    for i in 0..255 { x255[i] = ((i % 7 + 1) as f32) as bf16; y255[i] = ((i % 5 + 1) as f32) as bf16; }
     run255(x255, y255);
 
     let mut x256: [bf16; 256] = [0.0 as bf16; 256];
     let mut y256: [bf16; 256] = [0.0 as bf16; 256];
-    for i in 0..256 { x256[i] = ((i % 4 + 1) as f32) as bf16; y256[i] = 2.0 as bf16; }
+    for i in 0..256 { x256[i] = ((i % 7 + 1) as f32) as bf16; y256[i] = ((i % 5 + 1) as f32) as bf16; }
     run256(x256, y256);
 
     let mut x257: [bf16; 257] = [0.0 as bf16; 257];
     let mut y257: [bf16; 257] = [0.0 as bf16; 257];
-    for i in 0..257 { x257[i] = ((i % 4 + 1) as f32) as bf16; y257[i] = 2.0 as bf16; }
+    for i in 0..257 { x257[i] = ((i % 7 + 1) as f32) as bf16; y257[i] = ((i % 5 + 1) as f32) as bf16; }
     run257(x257, y257);
     return 0;
 }

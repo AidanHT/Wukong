@@ -8,6 +8,38 @@ module tests.run.transcendental_kernel
 // symbol on both backends — the differential gate is bit-exact). It also exercises `--emit=exe`
 // linking the `wukong_runtime` kernels: this program links to a runnable executable whose output
 // matches `--run` (see the `exe.rs` gate).
+//
+// WHAT THE TWO EXPECTATIONS ABOVE ACTUALLY ARE — read this before changing them.
+//
+// They are a BIT-EXACT SNAPSHOT of this kernel's current output, not a derived value.
+// 1.6487213373184204 is the f64 widening of f32 bits 0x3FD3094D. The true exp(0.5) is
+// 1.6487212707001282 and the correctly-rounded f32 is 0x3FD3094C = 1.6487212181091309, so the
+// pinned value is +0.559 ULP from the truth while the correctly-rounded one is -0.441 ULP: the
+// snapshot is one ULP high, and it was recorded from compiler output in violation of this corpus's
+// own rule 2. (The sibling full-precision fixture activation_backward_int_args.wk was not: its
+// three 17-digit values are bit-identical to the correctly-rounded f32.)
+//
+// The lines are kept because a bit-exact snapshot is a legitimate CHANGE DETECTOR for a kernel
+// whose polynomial nobody intends to move quietly, and because weakening a passing assertion to
+// make a defect report go away is worse than the defect. But the snapshot must not be read as a
+// statement that this is the right answer, and the recovery from a future failure here is NOT to
+// re-paste the new output. If the exp kernel's accuracy changes, replace these two lines with the
+// new bit pattern AND state in the commit body what the new ULP error against true exp(0.5) is —
+// the reference is 1.6487212707001282, which is where every number in this paragraph comes from.
+//
+// WHAT THIS FIXTURE DOES NOT PROVE, stated because the root CLAUDE.md cites it as the model
+// recognizer fixture and its shape gets copied. x is the constant [0.5; 16] and only lanes 0 and 15
+// are printed, which are equal. On that shape the kernel could compute exp once and broadcast,
+// permute lanes arbitrarily, read the wrong stride, or process only the first of the two 8-lane
+// groups, and both printed values would still be exp(0.5); n = 16 is two full groups with no
+// scalar tail, so the tail path is untouched. The lane-distinct, tail-straddling, every-lane,
+// independently-derived version of this test is tests/run/vmath_exp_every_lane.wk. The exp
+// polynomial's own oracle is wukong_runtime's `vmath_exp_log_exhaustive_ulp`, which sweeps every
+// f32 in [-87, 88.37626] against f64.
+//
+// This file's remaining unique jobs are (a) the `--emit=exe` AOT link of a runtime kernel
+// (exe.rs:139) and (b) being recognize.rs's named witness that the elementwise probe inside the
+// vectorizer still answers to WUKONG_NO_RECOGNIZE.
 fn main() -> i32 {
     let n: i32 = 16;
     let x = [0.5; 16];
