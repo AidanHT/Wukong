@@ -613,15 +613,52 @@ fn scratch_path(scratch: Option<&ScratchDir>, name: String) -> PathBuf {
     }
 }
 
+/// Where the Cranelift object goes. **One decision, one function**, so the `--emit=obj` artifact and
+/// the `--emit=exe` intermediate cannot drift apart again.
+///
+/// `--emit=obj`: the object *is* the artifact the user asked for. It goes to `-o` or to `<stem>.o` in
+/// the invocation directory, and it stays there.
+///
+/// `--emit=exe`: the object is a link intermediate, exactly like the generated Rust shim and the
+/// generated C runtime, so it goes into the per-pid [`ScratchDir`] and is removed with it. It used to
+/// be a bare relative `<stem>.o` written into the process's *current* directory and never deleted -
+/// the very defect [`ScratchDir`] was introduced for, fixed there for the shim and the C runtime and
+/// missed for the object. Two consequences. The first is observed: eight stray `.o` files sit in
+/// this repository's root, invisible because `.gitignore` lists `*.o` twice. The second follows from
+/// the code rather than from a sighting - two concurrent `wukongc --emit=exe foo.wk` runs from one
+/// directory write the same relative `foo.o` between the write and the linker's read, so the loser
+/// links the winner's object, which is a wrong-object link rather than an error.
+///
+/// `output` is deliberately ignored when `!is_obj`: with `--emit=exe`, `-o` names the *executable*
+/// (see [`emit_native`]'s `out`), never the object.
+///
+/// When [`ScratchDir::new`] failed there is no scratch directory to put it in and the historical
+/// relative path is the fallback, exactly as in [`scratch_path`].
+fn object_path(
+    is_obj: bool,
+    output: Option<&Path>,
+    stem: &str,
+    scratch: Option<&ScratchDir>,
+) -> PathBuf {
+    if is_obj {
+        return output
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("{stem}.o")));
+    }
+    scratch_path(scratch, format!("{stem}.o"))
+}
+
 /// Emit a native object via Cranelift (no LLVM) and, for `--emit=exe`, link it into an executable.
 ///
 /// The link is attempted in one order: [`rustc_link`] first (rustc as the *link driver*, which pulls
 /// in the `wukong_runtime` rlib plus the generated [`WUKONG_RT_SHIM`]), and only on
-/// [`LinkOutcome::Unavailable`] (no rustc on PATH, or no rlib next to `current_exe()`) the `$CC` /
+/// [`LinkOutcome::Unavailable`] (rustc could not be spawned, or no rlib next to `current_exe()`)
+/// the `$CC` /
 /// `cc` fallback with the generated C runtime shim [`WUKONG_RT_C`]. A [`LinkOutcome::Failed`] — rustc
 /// ran and the link itself failed — is a real error and exits [`exit::COMPILE_ERROR`] without falling
-/// back. If the `cc` fallback cannot even be spawned, the object file has already been written, so the
-/// driver says where it is and exits [`exit::UNIMPLEMENTED`] (2).
+/// back. If the `cc` fallback cannot even be spawned, the object is copied out of the scratch
+/// directory to `<stem>.o` so that it survives, and the driver reports whichever path is actually
+/// there - that copy is best effort - and exits [`exit::UNIMPLEMENTED`] (2).
 fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Options) -> i32 {
     use std::process::Command;
 
@@ -640,13 +677,11 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         .unwrap_or_else(|| "out".to_string());
 
     let is_obj = opts.emit == EmitStage::Obj;
-    let obj_path = if is_obj {
-        opts.output
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(format!("{stem}.o")))
-    } else {
-        PathBuf::from(format!("{stem}.o"))
-    };
+    // The scratch directory has to exist BEFORE the object is written, because under `--emit=exe` the
+    // object is one of the link intermediates that lives in it (see [`object_path`]). `--emit=obj`
+    // writes the user's artifact instead and needs no scratch directory at all.
+    let scratch = if is_obj { None } else { ScratchDir::new(&stem) };
+    let obj_path = object_path(is_obj, opts.output.as_deref(), &stem, scratch.as_ref());
     if let Err(e) = std::fs::write(&obj_path, &obj) {
         eprintln!("error: could not write `{}`: {e}", obj_path.display());
         return exit::IO_ERROR;
@@ -666,10 +701,6 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         .output
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{stem}{}", std::env::consts::EXE_SUFFIX)));
-
-    // The generated link inputs are compiler intermediates, not user artifacts — keep them out of
-    // the directory the user invoked us in (see [`ScratchDir`]).
-    let scratch = ScratchDir::new(&stem);
 
     // Prefer the **rustc-driven link**: `rustc` invokes the object's *native* platform linker and
     // links `wukong_runtime` (the AVX2 kernels) as a real dependency, so a recognized-kernel program
@@ -705,19 +736,45 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
             exit::OK
         }
         Ok(_) => {
+            // The object path is NOT named here: it is a scratch intermediate that `scratch` deletes
+            // on the way out, so printing it would send the reader to a file that no longer exists.
+            // `cc` inherited this process's stderr, so its own diagnostics are directly above.
             eprintln!(
-                "error: `{cc}` failed to link the native object `{}`",
-                obj_path.display()
+                "error: `{cc}` failed to link the native object for `{}` (its diagnostics are above)",
+                opts.input.display()
             );
             exit::COMPILE_ERROR
         }
         Err(_) => {
-            eprintln!(
-                "error: could not run `{cc}` to link.\n\
-                 note: the native object was written to `{}`.\n\
-                 help: install a C compiler (gcc/clang/cc) or set CC, or use `--run` to execute.",
-                obj_path.display()
-            );
+            // This branch exists to hand the user the object when no linker can be run, so the
+            // object must survive `scratch`'s `Drop`: copy it out under the historical `<stem>.o`
+            // name in the invocation directory and report whichever path is actually there
+            // afterwards. When `ScratchDir::new` failed, `obj_path` IS that path already, and
+            // `fs::copy` of a file onto itself is not a guaranteed no-op - std documents the
+            // same-file case as likely to truncate - so the equality check is load-bearing.
+            let kept = PathBuf::from(format!("{stem}.o"));
+            let kept = if obj_path == kept {
+                Some(kept)
+            } else {
+                std::fs::copy(&obj_path, &kept).ok().map(|_| kept)
+            };
+            match kept {
+                Some(p) => eprintln!(
+                    "error: could not run `{cc}` to link.\n\
+                     note: the native object was written to `{}`.\n\
+                     help: install a C compiler (gcc/clang/cc) or set CC, or use `--run` to execute.",
+                    p.display()
+                ),
+                None => eprintln!(
+                    "error: could not run `{cc}` to link.\n\
+                     note: the native object could not be kept (`{}` is not writable).\n\
+                     help: install a C compiler (gcc/clang/cc) or set CC, or use `--run` to \
+                     execute; `--emit=obj -o <path>` writes the object wherever you choose.",
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .display()
+                ),
+            }
             exit::UNIMPLEMENTED
         }
     }
@@ -832,20 +889,87 @@ pub extern "C" fn wukong_rt_fmod_f32(a: f32, b: f32) -> f32 {
 /// built the runtime at all, however the compiler was built.
 ///
 /// A `deps/` directory can hold several hash-suffixed rlibs (a metadata hash changes when the
-/// profile or a dependency does, and cargo does not garbage-collect the old ones), so the newest by
-/// mtime wins — the one cargo just linked everything else against. Ties break on the path so the
-/// choice is deterministic.
+/// profile or a dependency does, and cargo does not garbage-collect the old ones), and the uplifted
+/// copy can itself be a *leftover* of an older `cargo build`. So **both places feed one candidate
+/// list and one comparator**, rather than the uplifted copy short-circuiting the scan: the newest by
+/// mtime wins, and the uplifted copy wins only a tie. See [`runtime_rlib_candidates`] for why
+/// "newest" is the right key and why it is safe.
 pub fn runtime_rlib_in(dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<RlibCandidate> = None;
+    for c in runtime_rlib_candidates(dir) {
+        let better = match &best {
+            None => true,
+            // `(mtime, uplifted, path)`, maximised. `false < true`, so at equal mtime the uplifted
+            // copy beats a `deps/` entry BY CONSTRUCTION rather than by an accident of path
+            // ordering - which matters because cargo uplifts by hard link where the filesystem
+            // allows it, so the healthy case is a tie between two names for one inode (verified on
+            // this checkout: link count 2, identical mtime). The path is the final tie-break and
+            // exists only to make the choice deterministic across two distinct files.
+            Some(b) => (c.mtime, c.uplifted, &c.path) > (b.mtime, b.uplifted, &b.path),
+        };
+        if better {
+            best = Some(c);
+        }
+    }
+    best.map(|c| c.path)
+}
+
+/// One `wukong_runtime` rlib that could be linked, with the two facts [`runtime_rlib_in`] ranks on.
+struct RlibCandidate {
+    path: PathBuf,
+    /// `target/<profile>/libwukong_runtime.rlib` - cargo's uplifted copy - rather than a
+    /// hash-suffixed entry under `target/<profile>/deps/`.
+    uplifted: bool,
+    /// `UNIX_EPOCH` when the metadata cannot be read, which ranks the candidate last.
+    mtime: std::time::SystemTime,
+}
+
+/// **Every** rlib this compiler could link, from both places cargo puts one, as a single list.
+///
+/// Collapsing the two sources into one list is the point. The previous shape was a 2x2 - {uplifted,
+/// `deps/`} x {fresh, stale} - in which only the `deps/` column was ranked and the uplifted copy
+/// returned unconditionally from a `is_file()` test placed before the scan. That made one cell
+/// unreachable by construction: a STALE uplifted copy beat a fresh `deps/` rlib. It is not
+/// hypothetical. Recorded as campaign row W1b: on this repository's own long-lived checkout the
+/// top-level copy was six weeks old and the release AOT link failed `E0514` until
+/// `cargo build --release -p wukong_runtime` refreshed it. That particular staleness has since been
+/// rebuilt away, but the mispick is still live there in miniature - the uplifted copy is 15 seconds
+/// older than the newest `deps/` rlib, and the older one is what the previous rule returned. With
+/// one list and one comparator that cell cannot be expressed at all.
+///
+/// **Why "newest" is the right key, and why it is safe.** The link does not need a *particular*
+/// build unit of `wukong_runtime`: [`WUKONG_RT_SHIM`] names it only as `extern crate
+/// wukong_runtime;`, whose entire job is to drag the `#[no_mangle] extern "C"` microkernels into the
+/// link. No Rust item crosses the boundary, so a differing `-C metadata` hash is immaterial. What is
+/// *not* immaterial is the rustc that produced the rlib: a mismatch there is `E0514`, a hard error.
+/// The newest rlib is the one the toolchain most recently in use produced, so maximising mtime
+/// maximises the chance of a version match - which is exactly the failure being fixed.
+///
+/// The trailing `-` in the `deps/` prefix is load-bearing: it keeps a hypothetical
+/// `libwukong_runtime_foo` crate out.
+fn runtime_rlib_candidates(dir: &Path) -> Vec<RlibCandidate> {
+    fn mtime_of(path: &Path) -> std::time::SystemTime {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    }
+
+    let mut out: Vec<RlibCandidate> = Vec::new();
     // The uplifted name: what `cargo build` (and an installed target layout) leaves next to the
-    // binary. Preferred, because it is unambiguous.
+    // binary.
     let uplifted = dir.join("libwukong_runtime.rlib");
     if uplifted.is_file() {
-        return Some(uplifted);
+        out.push(RlibCandidate {
+            mtime: mtime_of(&uplifted),
+            path: uplifted,
+            uplifted: true,
+        });
     }
-    // `deps/libwukong_runtime-<metadata hash>.rlib` — where cargo *always* writes it. The trailing
-    // `-` in the prefix is load-bearing: it keeps a hypothetical `libwukong_runtime_foo` crate out.
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(dir.join("deps")).ok()?.flatten() {
+    // `deps/libwukong_runtime-<metadata hash>.rlib` - where cargo *always* writes it.
+    let Ok(entries) = std::fs::read_dir(dir.join("deps")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("rlib") {
             continue;
@@ -861,15 +985,13 @@ pub fn runtime_rlib_in(dir: &Path) -> Option<PathBuf> {
             .metadata()
             .and_then(|m| m.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let better = match &best {
-            None => true,
-            Some((t, p)) => (mtime, &path) > (*t, p),
-        };
-        if better {
-            best = Some((mtime, path));
-        }
+        out.push(RlibCandidate {
+            path,
+            uplifted: false,
+            mtime,
+        });
     }
-    best.map(|(_, p)| p)
+    out
 }
 
 /// The LLVM bitcode magic, `'B' 'C' 0xC0 0xDE`, as it appears at offset 0 of a raw `.bc` module.
@@ -1008,7 +1130,8 @@ fn rustc_link(
     // built under, so the kernels land in the exe exactly as that profile compiled them.
     let bitcode_rlib = rlib_holds_bitcode_members(&rlib);
 
-    let mut cmd = Command::new("rustc");
+    let rustc = link_rustc();
+    let mut cmd = Command::new(&rustc);
     cmd.arg(&shim_path)
         .arg("--edition")
         .arg("2021")
@@ -1023,7 +1146,13 @@ fn rustc_link(
     if bitcode_rlib {
         cmd.arg("-C").arg("lto=thin").arg("-C").arg("opt-level=3");
     }
-    let status = cmd
+    // `.output()`, not `.status()`, for one reason: the E0514 note below has to READ rustc's
+    // diagnostics to know whether to print itself. Everything rustc writes still reaches the same
+    // descriptor, forwarded immediately after it exits - but two things about the SHAPE change. It
+    // arrives as one block at the end rather than streaming, and rustc now sees a pipe instead of a
+    // terminal, so its diagnostics come through UNCOLOURED. The link is a single short-lived child
+    // at the end of compilation, so neither is something the user can act on.
+    let run = cmd
         .arg("--extern")
         .arg(format!("wukong_runtime={}", rlib.display()))
         .arg("-L")
@@ -1032,26 +1161,78 @@ fn rustc_link(
         .arg(format!("link-arg={}", obj_path.display()))
         .arg("-o")
         .arg(&out_arg)
-        .status();
+        .output();
     let _ = std::fs::remove_file(&shim_path);
 
-    match status {
-        Ok(s) if s.success() => LinkOutcome::Linked,
-        Ok(_) => LinkOutcome::Failed(format!(
-            "`rustc` failed to link the native object `{}`{}",
-            obj_path.display(),
-            if bitcode_rlib {
-                format!(
-                    "\nnote: `{}` holds LLVM bitcode members (an LTO-profile rlib), so the link was \
-                     run with `-C lto=thin -C opt-level=3`",
-                    rlib.display()
-                )
-            } else {
-                String::new()
-            }
-        )),
-        // rustc not on PATH: fall back to the C-runtime `cc` link (scalar, no-data programs only).
-        Err(_) => LinkOutcome::Unavailable,
+    let produced = match run {
+        Ok(o) => o,
+        // rustc could not be spawned: fall back to the C-runtime `cc` link (scalar, no-data
+        // programs only).
+        Err(_) => return LinkOutcome::Unavailable,
+    };
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(&produced.stdout);
+        let _ = std::io::stderr().write_all(&produced.stderr);
+    }
+    if produced.status.success() {
+        return LinkOutcome::Linked;
+    }
+
+    // The object path is deliberately not named: it is a scratch intermediate that `emit_native`'s
+    // `ScratchDir` deletes on the way out (see [`object_path`]).
+    let mut msg = format!(
+        "`rustc` failed to link the native object for `{stem}` (its diagnostics are above)"
+    );
+    if bitcode_rlib {
+        msg.push_str(&format!(
+            "\nnote: `{}` holds LLVM bitcode members (an LTO-profile rlib), so the link was run \
+             with `-C lto=thin -C opt-level=3`",
+            rlib.display()
+        ));
+    }
+    // E0514 is "found crate `wukong_runtime` compiled by an incompatible version of rustc". It is
+    // raised by the rustc invoked HERE about the rlib picked by [`runtime_rlib_in`], so naming both
+    // is the whole diagnosis; without it the message reads as a Wukong bug. Matching on the bare
+    // code rather than the prose keeps it stable across rustc's wording changes.
+    if String::from_utf8_lossy(&produced.stderr).contains("E0514") {
+        msg.push_str(&format!(
+            "\nnote: E0514 means `{}` was built by a DIFFERENT rustc than the one that ran this \
+             link (`{}`).\n\
+             help: rebuild the runtime with the toolchain that will link it \
+             (`cargo build -p wukong_runtime`, adding `--release` if this compiler is a release \
+             build), or put that toolchain's `rustc` first on PATH.",
+            rlib.display(),
+            rustc.display()
+        ));
+    }
+    LinkOutcome::Failed(msg)
+}
+
+/// The `rustc` that drives the `--emit=exe` link.
+///
+/// **Not a bare name looked up on `PATH`.** A spawned child inherits the caller's working directory,
+/// and under rustup the `PATH` entry is a shim that resolves a toolchain from *that* directory - a
+/// `rust-toolchain.toml` beside it, or a `rustup override` on it - which has nothing to do with the
+/// toolchain that built the `wukong_runtime` rlib being linked. When the two differ, rustc rejects
+/// the rlib with `E0514: found crate wukong_runtime compiled by an incompatible version of rustc`,
+/// which reads like a Wukong bug and is a toolchain-resolution one. Running `wukongc --emit=exe`
+/// from any directory outside this workspace is enough to reach it.
+///
+/// `build.rs` records cargo's own `RUSTC`. In a rustup setup that is an absolute path to the
+/// toolchain binary itself and *not* the rustup shim (measured on this host,
+/// `.../.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/rustc.exe`), so it is immune
+/// to directory-based resolution - and it is the compiler cargo used to build THIS binary. It is
+/// not guaranteed to be the one that built the rlib the link picks: a `target/` tree accumulates
+/// rlibs from every toolchain it has ever seen, which is why [`runtime_rlib_in`] takes the newest
+/// and why the E0514 note still has to exist. The `PATH` fallback keeps a relocated or installed
+/// binary working; the
+/// E0514 note in [`rustc_link`] names the resolved path either way, so the failure is legible in
+/// both worlds.
+fn link_rustc() -> PathBuf {
+    match option_env!("WUKONG_BUILD_RUSTC") {
+        Some(p) if !p.is_empty() && Path::new(p).is_file() => PathBuf::from(p),
+        _ => PathBuf::from("rustc"),
     }
 }
 
@@ -2247,6 +2428,115 @@ mod native_link_tests {
         );
     }
 
+    /// The `--emit=exe` OBJECT is a link intermediate too, and from `ScratchDir`'s introduction
+    /// until now it was the one such input `ScratchDir` did not cover: a bare relative `<stem>.o`
+    /// written into the invocation directory and never deleted. Eight of those leftovers are sitting
+    /// in this repository's root, unseen behind `.gitignore`'s `*.o`; and by construction, not by a
+    /// recorded sighting, two concurrent `wukongc --emit=exe foo.wk` runs from one directory write
+    /// the same relative path between the write and the linker's read, so the loser links the
+    /// winner's object - a wrong-object link rather than an error.
+    ///
+    /// `--emit=obj` is the other half of the same decision and must keep writing where the user
+    /// asked, because there the object IS the artifact.
+    #[test]
+    fn the_exe_objects_intermediate_lands_in_the_scratch_directory() {
+        let scratch = ScratchDir::new("objpath_probe").expect("scratch dir");
+
+        let exe_obj = object_path(false, None, "prog", Some(&scratch));
+        assert!(
+            exe_obj.starts_with(&scratch.path),
+            "the `--emit=exe` object must be a scratch intermediate, got `{}`",
+            exe_obj.display()
+        );
+
+        // `-o` names the EXECUTABLE under `--emit=exe`, never the object, so it must not divert it.
+        let exe_obj_with_o = object_path(
+            false,
+            Some(Path::new("elsewhere/prog.exe")),
+            "prog",
+            Some(&scratch),
+        );
+        assert_eq!(
+            exe_obj, exe_obj_with_o,
+            "`-o` must not move the `--emit=exe` object: it names the executable"
+        );
+
+        // `--emit=obj`: the user's artifact, at the user's path (or `<stem>.o` beside them).
+        assert_eq!(
+            object_path(true, Some(Path::new("out/thing.o")), "prog", Some(&scratch)),
+            PathBuf::from("out/thing.o"),
+            "`--emit=obj -o <path>` must write exactly there"
+        );
+        assert_eq!(
+            object_path(true, None, "prog", Some(&scratch)),
+            PathBuf::from("prog.o"),
+            "`--emit=obj` without `-o` must keep the historical `<stem>.o`"
+        );
+
+        // No scratch directory could be created: the historical relative path is the fallback, the
+        // same one `scratch_path` uses, so the link still works.
+        assert_eq!(
+            object_path(false, None, "prog", None),
+            PathBuf::from("prog.o"),
+            "with no scratch directory the object falls back to `<stem>.o`"
+        );
+    }
+
+    /// **A structural invariant, not a behavioural one.** The `--emit=exe` link must resolve its
+    /// `rustc` in exactly one place - [`link_rustc`] - because a second spawn site is how the defect
+    /// this closes comes back: a child spawned by bare name inherits the caller's working directory,
+    /// and rustup's `PATH` shim resolves a toolchain from *that* directory rather than from the one
+    /// that built the rlib being linked, which is `E0514`.
+    ///
+    /// The scan reads this file's own text, so a future editor who writes the bare spelling ANYWHERE
+    /// in it - including inside a comment or a string - fails this test. That is deliberate: a
+    /// tripwire that also fires on prose is cheaper than one that misses the next real call site.
+    #[test]
+    fn the_link_toolchain_is_resolved_in_exactly_one_place() {
+        let this_file = include_str!("lib.rs");
+        let bare = [
+            "Command::new(\"rustc\")",
+            "Command::new(\"rustc\".to_string())",
+        ];
+        for needle in bare {
+            assert!(
+                !this_file.contains(needle),
+                "`{needle}` spawns whatever `PATH` resolves, which is the E0514 mechanism; the AOT link must go through `link_rustc()`. (If this fired on a COMMENT rather than on code, reword the comment - the scan is textual on purpose.)"
+            );
+        }
+        // The needle is assembled rather than written out, because the scan reads THIS file: a
+        // verbatim literal would match itself and make the count 2. It guards the scan above from
+        // passing vacuously - if the resolver is deleted and its body inlined at a new spawn site
+        // under a different spelling, the `Command::new` scan alone might not notice.
+        assert_eq!(
+            this_file.matches(concat!("fn ", "link_rustc()")).count(),
+            1,
+            "there must be exactly one link-toolchain resolver"
+        );
+    }
+
+    /// [`link_rustc`] must name something runnable. When `build.rs` recorded cargo's `RUSTC` and
+    /// that file is still there, it is used; otherwise the historical `PATH` lookup is the fallback,
+    /// so a relocated or installed `wukongc` keeps linking.
+    #[test]
+    fn the_link_toolchain_is_a_real_file_or_the_path_fallback() {
+        let rustc = link_rustc();
+        assert!(
+            rustc.is_file() || rustc == Path::new("rustc"),
+            "`link_rustc()` must return an existing binary or the bare `PATH` fallback, got `{}`",
+            rustc.display()
+        );
+        if let Some(recorded) = option_env!("WUKONG_BUILD_RUSTC") {
+            if Path::new(recorded).is_file() {
+                assert_eq!(
+                    rustc,
+                    Path::new(recorded),
+                    "a recorded, existing `RUSTC` must be preferred over the `PATH` lookup"
+                );
+            }
+        }
+    }
+
     /// The `cc` fallback must link `libm`. `WUKONG_RT_C` always defines `wukong_rt_fmod_*` over
     /// `fmod`/`fmodf`, which glibc keeps in `libm` and `cc` does not link by default — so the whole
     /// fallback path failed to link *every* program on Linux with `undefined reference to 'fmod'`.
@@ -2277,6 +2567,12 @@ mod native_link_tests {
     /// **`build`**, so after `cargo test --workspace` (what CI runs) or `cargo run -p wukongc` the
     /// uplifted copy does not exist and only `deps/` has it — and `--emit=exe` silently degraded to
     /// the `cc` fallback, which cannot resolve `wukong_*` at all.
+    ///
+    /// And when BOTH exist the newest wins, uplifted or not. This half of the assertion was the
+    /// opposite until W1b: the uplifted copy was returned from an `is_file()` test placed before the
+    /// `deps/` scan, so a six-week-old leftover of some earlier `cargo build` beat the rlib cargo
+    /// had just written. The uplifted copy still wins a TIE, which is the case that matters in a
+    /// healthy tree because cargo hard-links the uplift.
     #[test]
     fn the_runtime_rlib_is_found_in_the_deps_directory() {
         let dir = std::env::temp_dir().join(format!("wukong_rlib_probe-{}", std::process::id()));
@@ -2301,23 +2597,70 @@ mod native_link_tests {
 
         // The cargo-test / cargo-run layout: hash-suffixed, in `deps/` only.
         let hashed = deps.join("libwukong_runtime-4444444444444444.rlib");
-        std::fs::write(&hashed, b"x").expect("write hashed rlib");
+        write_rlib_at(&hashed, secs(1_700_000_100));
         assert_eq!(
             runtime_rlib_in(&dir),
-            Some(hashed),
+            Some(hashed.clone()),
             "the hash-suffixed rlib in `deps/` must be found"
         );
 
-        // The `cargo build` layout wins when both exist: it is the unambiguous one.
+        // A FRESH uplifted copy still wins: it is what a plain `cargo build` just produced.
         let uplifted = dir.join("libwukong_runtime.rlib");
-        std::fs::write(&uplifted, b"x").expect("write uplifted rlib");
+        write_rlib_at(&uplifted, secs(1_700_000_200));
         assert_eq!(
             runtime_rlib_in(&dir),
-            Some(uplifted),
-            "the uplifted rlib must take precedence"
+            Some(uplifted.clone()),
+            "a newer uplifted rlib must win"
+        );
+
+        // A TIE goes to the uplifted copy, and the tie is the normal case rather than a curiosity:
+        // cargo hard-links the uplift, so the two paths are usually one inode with one mtime.
+        write_rlib_at(&uplifted, secs(1_700_000_100));
+        assert_eq!(
+            runtime_rlib_in(&dir),
+            Some(uplifted.clone()),
+            "at equal mtime the uplifted rlib must win"
+        );
+
+        // THE DEFECT, W1b: a STALE uplifted copy used to short-circuit the `deps/` scan and be
+        // returned unconditionally. On this repository's own checkout the top-level copy was six
+        // weeks old and the release AOT link failed `E0514` until `cargo build --release -p
+        // wukong_runtime` refreshed it. The newest rlib must win whichever of the two places it
+        // is in.
+        write_rlib_at(&uplifted, secs(1_700_000_050));
+        assert_eq!(
+            runtime_rlib_in(&dir),
+            Some(hashed),
+            "a STALE uplifted rlib must lose to a newer one in `deps/`"
+        );
+
+        // Among several `deps/` entries - cargo garbage-collects none of them - the newest wins.
+        let newer = deps.join("libwukong_runtime-5555555555555555.rlib");
+        write_rlib_at(&newer, secs(1_700_000_300));
+        assert_eq!(
+            runtime_rlib_in(&dir),
+            Some(newer),
+            "the newest `deps/` rlib must win"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `SystemTime` from a fixed epoch offset, so the ordering under test is set explicitly rather
+    /// than inferred from how fast the test happens to write files.
+    fn secs(n: u64) -> std::time::SystemTime {
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(n)
+    }
+
+    /// Write a stand-in rlib with an exact modification time.
+    fn write_rlib_at(path: &Path, mtime: std::time::SystemTime) {
+        std::fs::write(path, b"x").expect("write rlib");
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open rlib")
+            .set_modified(mtime)
+            .expect("set rlib mtime");
     }
 
     /// Assemble a `!<arch>` archive from `(name, data)` members, so the bitcode probe can be tested
