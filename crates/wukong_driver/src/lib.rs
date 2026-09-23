@@ -581,7 +581,8 @@ __attribute__((constructor)) static void wukong_rt_init(void) { _setmode(_fileno
 void wukong_rt_print_i64(long long x) { printf(\"%lld\\n\", x); }\n\
 void wukong_rt_print_u64(unsigned long long x) { printf(\"%llu\\n\", x); }\n\
 void wukong_rt_print_f64(double x) { printf(\"%g\\n\", x); }\n\
-void wukong_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(101); } }\n\
+void wukong_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(1); } }\n\
+long long wukong_rt_assert_failed(void) { return 0; }\n\
 double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }\n\
 float wukong_rt_fmod_f32(float a, float b) { return fmodf(a, b); }\n\
 /* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract — and\n\
@@ -871,9 +872,11 @@ pub extern "C" fn wukong_rt_print_str(p: *const u8) {
 pub extern "C" fn wukong_rt_assert(c: i64) {
     if c == 0 {
         eprintln!("assertion failed");
-        std::process::exit(101);
+        std::process::exit(1);
     }
 }
+#[no_mangle]
+pub extern "C" fn wukong_rt_assert_failed() -> i64 { 0 }
 #[no_mangle]
 pub extern "C" fn wukong_rt_fmod_f64(a: f64, b: f64) -> f64 {
     a % b
@@ -2468,6 +2471,9 @@ mod verify_gate_tests {
 }
 
 /// The `--emit=exe` link path's generated inputs (the Rust shim, the C fallback runtime).
+#[cfg(test)]
+mod assertion_link_tests;
+
 #[cfg(test)]
 mod native_link_tests {
     use super::*;
