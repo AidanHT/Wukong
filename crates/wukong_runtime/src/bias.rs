@@ -161,10 +161,12 @@ fn use_nt(n: usize) -> bool {
 /// add (`b` a `cols`-long vector added across every row), with an optional fused activation `act`
 /// selected by `op` (a `crate::vmath::VM_*` code, or [`BIAS_ACT_NONE`] for a pure add). Uses the 256-bit
 /// AVX2/FMA kernel when available (8 columns/step + a scalar tail), else a scalar fallback. `x` and
-/// `out` may alias (in-place bias-add).
+/// `out` may be identical (in-place bias-add).
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows*cols` `f32`; `b` for `cols` `f32`.
+/// The `x` and `out` ranges must be identical or disjoint; shifted overlap is unsupported.
+/// The `b` range must be disjoint from the written `out` range.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_bias_bcast_f32(
     x: *const f32,
@@ -192,11 +194,15 @@ pub unsafe extern "C" fn wukong_bias_bcast_f32(
 }
 
 /// Multicore broadcast-bias — the `@parallel` twin of [`wukong_bias_bcast_f32`]. Rows are independent,
-/// so disjoint row bands run on separate cores with no cross-row combine; the per-row routine is the
-/// serial kernel, so the result is **bit-identical** to serial on any core count (interp == native).
+/// so disjoint row bands run on separate cores with no cross-row combine. The bias vector is shared
+/// read-only and must not overlap any output band; exact in-place input remains local to each band.
+/// The per-row routine is the serial kernel, so the result is **bit-identical** to serial on any core
+/// count (interp == native).
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows*cols` `f32`; `b` for `cols` `f32`.
+/// The `x` and `out` ranges must be identical or disjoint; shifted overlap is unsupported.
+/// The `b` range must be disjoint from the entire written `out` range, including other row bands.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_bias_bcast_f32_parallel(
     x: *const f32,
@@ -231,7 +237,8 @@ pub unsafe extern "C" fn wukong_bias_bcast_f32_parallel(
         let r1 = ((band + 1) * RBAND).min(rows_u);
         let off = r0 * cols_u;
         // SAFETY: disjoint row band [r0, r1); each pointer valid for the band's rows by contract, and
-        // `b` (read-only, shared) valid for `cols`. Bands never overlap, so the writes don't race.
+        // `b` (read-only, shared) valid for `cols` and disjoint from every output band. The input
+        // is identical to the output or disjoint from it, so writes cannot race another band's reads.
         unsafe {
             wukong_bias_bcast_f32(
                 (xa as *const f32).add(off),
