@@ -1051,12 +1051,30 @@ pub unsafe extern "C" fn wukong_axpby_f16(
 
 /// Scalar twin / no-AVX2 fallback: `out[i] = narrow(b·yw + a·xw)`, the same op order (`t = a·xw` then
 /// `fma(b, yw, t)`) and narrowing shim as the AVX2 path, so SIMD == scalar bit-for-bit.
-fn axpby_narrow_scalar(kind: Half, x: &[u16], y: &[u16], out: &mut [u16], a: f32, b: f32) {
-    for i in 0..out.len() {
-        let xw = kind.widen(x[i]);
-        let yw = kind.widen(y[i]);
-        out[i] = kind.narrow(b.mul_add(yw, a * xw));
+unsafe fn axpby_narrow_scalar(
+    kind: Half,
+    x: *const u16,
+    y: *const u16,
+    out: *mut u16,
+    n: usize,
+    a: f32,
+    b: f32,
+) {
+    for i in 0..n {
+        let xw = kind.widen(*x.add(i));
+        let yw = kind.widen(*y.add(i));
+        *out.add(i) = kind.narrow(b.mul_add(yw, a * xw));
     }
+}
+
+/// Exact in-place inputs have no cross-element dependency. Shifted overlap must retain
+/// ascending scalar reads/writes; a vector load would otherwise snapshot future inputs.
+fn axpby_narrow_shifted_overlap(x: *const u16, y: *const u16, out: *mut u16, n: usize) -> bool {
+    let bytes = n.saturating_mul(std::mem::size_of::<u16>());
+    [x, y].into_iter().any(|p| {
+        let distance = (p as usize).abs_diff(out as usize);
+        distance != 0 && distance < bytes
+    })
 }
 
 /// Total half traffic of the all-half axpby is `6·n` bytes (read x,y bf16 = 4·n + write out = 2·n).
@@ -1136,21 +1154,28 @@ macro_rules! stream_narrow {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn axpby_narrow_bf16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b: f32) {
+unsafe fn axpby_narrow_bf16_avx(
+    xp: *const u16,
+    yp: *const u16,
+    out: *mut u16,
+    n: usize,
+    a: f32,
+    b: f32,
+) {
     let (av, bv) = (_mm256_set1_ps(a), _mm256_set1_ps(b));
-    let (xp, yp) = (x.as_ptr(), y.as_ptr());
     // 8-lane axpby `b·widen(y) + a·widen(x)` (same op order / FMA as the scalar tail).
     stream_narrow!(
-        out.as_mut_ptr(),
-        out.len(),
+        out,
+        n,
         |i: usize| _mm256_fmadd_ps(
             bv,
             widen_bf16(yp.add(i)),
             _mm256_mul_ps(av, widen_bf16(xp.add(i)))
         ),
-        |i: usize| crate::f32_to_bf16_bits(
-            b.mul_add(bf16_bits_to_f32(y[i]), a * bf16_bits_to_f32(x[i]))
-        ),
+        |i: usize| crate::f32_to_bf16_bits(b.mul_add(
+            bf16_bits_to_f32(*yp.add(i)),
+            a * bf16_bits_to_f32(*xp.add(i))
+        )),
         |i: usize| {
             _mm_prefetch(
                 xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8,
@@ -1168,18 +1193,26 @@ unsafe fn axpby_narrow_bf16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
-unsafe fn axpby_narrow_f16_avx(x: &[u16], y: &[u16], out: &mut [u16], a: f32, b: f32) {
+unsafe fn axpby_narrow_f16_avx(
+    xp: *const u16,
+    yp: *const u16,
+    out: *mut u16,
+    n: usize,
+    a: f32,
+    b: f32,
+) {
     let (av, bv) = (_mm256_set1_ps(a), _mm256_set1_ps(b));
-    let (xp, yp) = (x.as_ptr(), y.as_ptr());
     stream_narrow!(
-        out.as_mut_ptr(),
-        out.len(),
+        out,
+        n,
         |i: usize| _mm256_fmadd_ps(
             bv,
             widen_f16(yp.add(i)),
             _mm256_mul_ps(av, widen_f16(xp.add(i)))
         ),
-        |i: usize| crate::f32_to_f16_bits(b.mul_add(f16_to_f32(y[i]), a * f16_to_f32(x[i]))),
+        |i: usize| crate::f32_to_f16_bits(
+            b.mul_add(f16_to_f32(*yp.add(i)), a * f16_to_f32(*xp.add(i)))
+        ),
         |i: usize| {
             _mm_prefetch(
                 xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8,
@@ -1249,6 +1282,7 @@ unsafe fn vmath_narrow_f16_avx(x: &[u16], out: &mut [u16], op: i64) {
 /// `out[i] = round_bf16(a·widen(x[i]) + b·widen(y[i]))` over `n` **bf16** inputs with a **bf16 output**
 /// — the all-half streaming axpby. 6 bytes/elem vs an all-f32 axpby's 12; the compute is f32 (lossless
 /// widen) and the store rounds through the shared `f32_to_bf16_bits` shim, so interp == native.
+/// Overlap is supported with ascending element-order semantics, including exact in-place output.
 ///
 /// # Safety
 /// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `u16`.
@@ -1265,18 +1299,19 @@ pub unsafe extern "C" fn wukong_axpby_bf16_out(
         return;
     }
     let n = n as usize;
-    let x = std::slice::from_raw_parts(x, n);
-    let y = std::slice::from_raw_parts(y, n);
-    let out = std::slice::from_raw_parts_mut(out, n);
+    if axpby_narrow_shifted_overlap(x, y, out, n) {
+        return axpby_narrow_scalar(Half::Bf16, x, y, out, n, a, b);
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return axpby_narrow_bf16_avx(x, y, out, a, b);
+        return axpby_narrow_bf16_avx(x, y, out, n, a, b);
     }
-    axpby_narrow_scalar(Half::Bf16, x, y, out, a, b);
+    axpby_narrow_scalar(Half::Bf16, x, y, out, n, a, b);
 }
 
 /// `out[i] = round_f16(a·widen(x[i]) + b·widen(y[i]))` over `n` **f16** inputs with an **f16 output** —
 /// the F16C twin of [`wukong_axpby_bf16_out`] (widen `vcvtph2ps`, narrow `vcvtps2ph`). 6 bytes/elem.
+/// Overlap is supported with ascending element-order semantics, including exact in-place output.
 ///
 /// # Safety
 /// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `u16`.
@@ -1293,17 +1328,17 @@ pub unsafe extern "C" fn wukong_axpby_f16_out(
         return;
     }
     let n = n as usize;
-    let x = std::slice::from_raw_parts(x, n);
-    let y = std::slice::from_raw_parts(y, n);
-    let out = std::slice::from_raw_parts_mut(out, n);
+    if axpby_narrow_shifted_overlap(x, y, out, n) {
+        return axpby_narrow_scalar(Half::F16, x, y, out, n, a, b);
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("f16c")
         && is_x86_feature_detected!("avx2")
         && is_x86_feature_detected!("fma")
     {
-        return axpby_narrow_f16_avx(x, y, out, a, b);
+        return axpby_narrow_f16_avx(x, y, out, n, a, b);
     }
-    axpby_narrow_scalar(Half::F16, x, y, out, a, b);
+    axpby_narrow_scalar(Half::F16, x, y, out, n, a, b);
 }
 
 /// `out[i] = round_bf16(act(widen(x[i])))` over `n` **bf16** inputs with a **bf16 output** (`op` a
@@ -1625,11 +1660,111 @@ mod tests {
                     }
                 }
                 let mut want = vec![0u16; n];
-                axpby_narrow_scalar(kind, &xb, &yb, &mut want, a, b);
+                unsafe {
+                    axpby_narrow_scalar(kind, xb.as_ptr(), yb.as_ptr(), want.as_mut_ptr(), n, a, b);
+                }
                 for i in 0..n {
                     assert_eq!(got[i], want[i], "narrow axpby n={n} i={i}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn axpby_narrow_overlap_preserves_ascending_reads_and_writes() {
+        for kind in [Half::Bf16, Half::F16] {
+            let kernel = match kind {
+                Half::Bf16 => wukong_axpby_bf16_out,
+                Half::F16 => wukong_axpby_f16_out,
+            };
+            for n in [0usize, 1, 7, 8, 9, 16, 17, 33, 65] {
+                // Disjoint, x in-place, y in-place, all equal, then shifted overlap
+                // in each direction with both one and two overlapping input ranges.
+                for (xi, yi, oi) in [
+                    (0, n + 4, 2 * n + 8),
+                    (0, n + 4, 0),
+                    (0, n + 4, n + 4),
+                    (0, 0, 0),
+                    (0, n + 4, 1),
+                    (1, n + 4, 0),
+                    (n + 4, 0, 1),
+                    (n + 4, 1, 0),
+                    (0, 2, 1),
+                ] {
+                    let mut got: Vec<u16> = (0..3 * n + 16)
+                        .map(|i| kind.narrow((i % 9) as f32 / 8.0))
+                        .collect();
+                    let mut want = got.clone();
+                    for i in 0..n {
+                        // These dyadic inputs and coefficients are exact in f64 and f32;
+                        // narrow after each write so subsequent overlapping reads see it.
+                        let x = kind.widen(want[xi + i]) as f64;
+                        let y = kind.widen(want[yi + i]) as f64;
+                        want[oi + i] = kind.narrow((0.5 * x + 0.25 * y) as f32);
+                    }
+                    let p = got.as_mut_ptr();
+                    unsafe { kernel(p.add(xi), p.add(yi), p.add(oi), n as i64, 0.5, 0.25) };
+                    assert_eq!(got, want, "n={n}, offsets=({xi},{yi},{oi})");
+                }
+            }
+            unsafe {
+                kernel(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    -1,
+                    1.0,
+                    1.0,
+                )
+            };
+        }
+    }
+
+    #[test]
+    fn axpby_narrow_in_place_streaming_and_special_values() {
+        for kind in [Half::Bf16, Half::F16] {
+            let kernel = match kind {
+                Half::Bf16 => wukong_axpby_bf16_out,
+                Half::F16 => wukong_axpby_f16_out,
+            };
+            // Cross the non-temporal threshold with a scalar prologue and tail.
+            let n = HALFOUT_NT_MIN_BYTES / 6 + 35;
+            let mut got = vec![kind.narrow(0.5); n + 1];
+            let base = if got.as_ptr() as usize & 31 == 0 {
+                1
+            } else {
+                0
+            };
+            let p = unsafe { got.as_mut_ptr().add(base) };
+            unsafe { kernel(p, p, p, n as i64, 0.5, 0.25) };
+            assert!(got[base..base + n].iter().all(|&v| v == kind.narrow(0.375)));
+
+            let values = [
+                0.0,
+                -0.0,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NAN,
+                -f32::NAN,
+                1.0,
+                -1.0,
+            ];
+            let mut got: Vec<u16> = values
+                .into_iter()
+                .cycle()
+                .take(33)
+                .map(|v| kind.narrow(v))
+                .collect();
+            let want: Vec<u16> = got
+                .iter()
+                .map(|&v| {
+                    let v = kind.widen(v);
+                    kind.narrow(1.0f32.mul_add(v, v))
+                })
+                .collect();
+            let p = got.as_mut_ptr();
+            unsafe { kernel(p, p, p, got.len() as i64, 1.0, 1.0) };
+            assert_eq!(got, want);
         }
     }
 

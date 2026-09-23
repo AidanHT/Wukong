@@ -20,6 +20,11 @@
 //! the AVX2 path only when `cols < 2^24` and hands wider rows to the exact-integer scalar twin (the
 //! column-axis sibling of the bound `colarg_range` applies to its rows).
 //!
+//! NaNs follow the ascending source scan: a NaN at column zero pins the result to zero;
+//! later NaNs are ignored. Equal infinities and signed zeros retain the lowest index.
+//! If an initial SIMD lane is NaN, the scalar scan preserves this rule rather than letting
+//! that lane discard every later value at the same column modulo eight.
+//!
 //! Rows are independent, so `_parallel` just maps the per-row routine across rows (each writes a
 //! disjoint `out[r]`): serial == parallel bit-for-bit, no cross-row combine, the same play as the
 //! per-row norms and the column reductions.
@@ -80,6 +85,9 @@ unsafe fn rowarg_avx2(row: *const f32, cols: usize, is_max: bool) -> i32 {
     // ±∞) means every lane already holds a valid candidate, so the strict-compare updates below need
     // no "is this lane still empty?" special-casing — exactly the ascending-scan seed of the scalar.
     let mut best_val = _mm256_loadu_ps(row);
+    if _mm256_movemask_ps(_mm256_cmp_ps(best_val, best_val, _CMP_UNORD_Q)) != 0 {
+        return rowarg_scalar(row, cols, is_max);
+    }
     // Lane indices as f32: 0,1,..,7, advanced by +8.0 per step. Integers are exact in f32 only below
     // `2^24`, which `rowarg_one` guarantees by routing wider rows to the scalar twin — so within this
     // function the index bookkeeping is exact.
@@ -455,6 +463,71 @@ mod tests {
                 let s = unsafe { rowarg_scalar(x.as_ptr(), cols, is_max) };
                 let v = unsafe { rowarg_avx2(x.as_ptr(), cols, is_max) };
                 assert_eq!(s, v, "scalar != avx2 at cols={cols} is_max={is_max}");
+            }
+        }
+    }
+
+    #[test]
+    fn nan_and_degenerate_rows_match_source_scan() {
+        for cols in [1usize, 7, 8, 9, 16, 17, 31, 32, 33, 64] {
+            let mut cases = vec![
+                vec![f32::NEG_INFINITY; cols],
+                vec![f32::INFINITY; cols],
+                vec![f32::NAN; cols],
+                (0..cols)
+                    .map(|i| if i % 2 == 0 { -0.0 } else { 0.0 })
+                    .collect(),
+            ];
+            // Seed, later vector steps and scalar-tail NaNs, with an extremum in
+            // the same SIMD lane on the next step: the poisoned-lane reproducer.
+            for nan_col in 0..cols {
+                for sign in [-1.0, 1.0] {
+                    let mut row = vec![0.0; cols];
+                    row[(nan_col + 8) % cols] = sign * 10.0;
+                    row[nan_col] = f32::from_bits(0x7f80_0001);
+                    cases.push(row);
+                }
+            }
+            for rows in [
+                1usize,
+                ROWARG_PAR_MIN - 1,
+                ROWARG_PAR_MIN,
+                ROWARG_PAR_MIN + 1,
+            ] {
+                let x: Vec<f32> = cases.iter().cycle().take(rows).flatten().copied().collect();
+                for is_max in [true, false] {
+                    let want = naive(&x, rows, cols, is_max);
+                    let mut serial = vec![-1; rows];
+                    let mut parallel = vec![-1; rows];
+                    unsafe {
+                        rowarg_serial(
+                            x.as_ptr(),
+                            serial.as_mut_ptr(),
+                            rows as i64,
+                            cols as i64,
+                            is_max,
+                        );
+                        rowarg_par(
+                            x.as_ptr(),
+                            parallel.as_mut_ptr(),
+                            rows as i64,
+                            cols as i64,
+                            is_max,
+                        );
+                    }
+                    assert_eq!(serial, want, "rows={rows}, cols={cols}, max={is_max}");
+                    assert_eq!(parallel, want);
+                }
+            }
+            for row in cases {
+                for is_max in [true, false] {
+                    let want = naive(&row, 1, cols, is_max)[0];
+                    assert_eq!(unsafe { rowarg_scalar(row.as_ptr(), cols, is_max) }, want);
+                    #[cfg(target_arch = "x86_64")]
+                    if is_x86_feature_detected!("avx2") {
+                        assert_eq!(unsafe { rowarg_avx2(row.as_ptr(), cols, is_max) }, want);
+                    }
+                }
             }
         }
     }
