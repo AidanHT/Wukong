@@ -46,6 +46,9 @@ mod simplify;
 mod simplify_cfg;
 mod unroll;
 mod vectorize;
+mod verify_each;
+
+pub use verify_each::{verify_program_stage, VerificationFailure};
 
 pub use alias::{type_bytes, AliasInfo, Prov};
 pub use cache::CfgAnalyses;
@@ -201,10 +204,32 @@ impl PassManager {
         }
     }
 
+    /// Run with fallible verification in every build profile. Check each pass that actually ran,
+    /// including one reporting no mutation, and whole-program call signatures at the boundaries.
+    pub fn run_verified(&self, program: &mut Program) -> Result<(), VerificationFailure> {
+        verify_program_stage(program, "pipeline input")?;
+        for f in &mut program.funcs {
+            self.run_function_checked(f, None, true)?;
+        }
+        verify_program_stage(program, "pipeline output")
+    }
+
     /// The fixpoint driver. `timings` is `None` on the production path (zero overhead); the bench
     /// harness passes `Some(..)` to accumulate per-pass wall time. The `timings` branch does not
     /// change which passes run or in what order, so the resulting MIR is identical either way.
-    fn run_function(&self, f: &mut wukong_mir::Function, mut timings: Option<&mut Timings>) {
+    fn run_function(&self, f: &mut wukong_mir::Function, timings: Option<&mut Timings>) {
+        // Preserve the legacy library API's debug assertion, while the fallible API below is
+        // available to release callers and never turns a verifier error into a panic.
+        self.run_function_checked(f, timings, cfg!(debug_assertions))
+            .unwrap_or_else(|failure| panic!("{failure}"));
+    }
+
+    fn run_function_checked(
+        &self,
+        f: &mut wukong_mir::Function,
+        mut timings: Option<&mut Timings>,
+        verify_each: bool,
+    ) -> Result<(), VerificationFailure> {
         // One analysis cache per function, shared across every pass and every fixpoint iteration.
         // It is invalidated by the passes that restructure the CFG (see their `run_function`), so it
         // stays valid — and reused — across the long tail of the fixpoint where only instructions
@@ -243,16 +268,8 @@ impl PassManager {
                 } else {
                     clean[i] = true;
                 }
-                // verify-each: in debug builds (tests, CI) confirm every pass *that ran* leaves the
-                // MIR well-formed, naming the culprit immediately. Compiled out of release builds.
-                #[cfg(debug_assertions)]
-                {
-                    let errs = wukong_mir::verify::verify_function(f);
-                    assert!(
-                        errs.is_empty(),
-                        "pass `{}` produced invalid MIR: {errs:?}",
-                        p.name()
-                    );
+                if verify_each {
+                    verify_each::verify_function_stage(f, p.name())?;
                 }
             }
             iterations += 1;
@@ -263,6 +280,7 @@ impl PassManager {
         if let Some(t) = timings {
             t.max_iterations = t.max_iterations.max(iterations);
         }
+        Ok(())
     }
 }
 
@@ -294,6 +312,29 @@ pub fn optimize(program: &mut Program, opt_level: u8) {
             }
         }
     }
+}
+
+/// Optimize with per-pass verification enabled in both debug and release builds. Errors identify
+/// the responsible pass/stage and function; no later pass runs after a verifier failure. This
+/// reports invalid MIR, not arbitrary panics inside a transform. External runtime signatures are
+/// outside MIR and cannot be cross-checked by the program verifier.
+pub fn optimize_verified(program: &mut Program, opt_level: u8) -> Result<(), VerificationFailure> {
+    // O0 still validates its input; a malformed lowering must not reach even the first transform.
+    verify_program_stage(program, "optimization input")?;
+    if opt_level >= 2 {
+        inline_program(program);
+        verify_program_stage(program, "inline")?;
+    }
+    PassManager::standard(opt_level).run_verified(program)?;
+    if opt_level >= 2 {
+        let changed = unroll_program(program);
+        verify_program_stage(program, "unroll")?;
+        let cleanup = PassManager::unroll_cleanup();
+        for i in changed {
+            cleanup.run_function_checked(&mut program.funcs[i], None, true)?;
+        }
+    }
+    verify_program_stage(program, "optimization output")
 }
 
 /// Like [`optimize`], but returns an in-process [`Timings`] breakdown (whole-optimizer total,

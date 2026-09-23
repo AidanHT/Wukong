@@ -3,10 +3,9 @@
 //!
 //! It runs before every backend entry and before printing MIR (`wukong_driver::verify_or_ice`, which
 //! gates `--run` and `--emit=llvm-ir`/`obj`/`exe`, plus `emit_mir` after the dump so a broken program
-//! still shows why), and after each optimization pass that ran — but that per-pass "verify-each" is a
-//! `#[cfg(debug_assertions)]` block inside `wukong_opt::optimize`, **not** a CLI flag: there is no
-//! `--verify-each` option and the check is compiled out of release, so a release-only invalid form can
-//! slip past it.
+//! still shows why). `--verify-each` additionally checks each optimizer pass that ran, input/output,
+//! and whole-program inlining/unrolling boundaries, including in release builds. The optimizer's
+//! fallible checked API returns pass/function context; its legacy API retains debug assertions.
 //!
 //! Checks: every value is defined exactly once, inside the value arena, and
 //! before — in the dominance order — every use of it; the entry block matches the function's
@@ -34,7 +33,8 @@ type FnSigs = HashMap<Symbol, (Vec<MirType>, MirType)>;
 /// which needs the whole program in hand.
 ///
 /// `wukong_driver::verify_or_ice` uses this whole-program check before backend entry. The
-/// optimizer's debug-only per-pass check uses [`verify_function`] because it holds one function.
+/// optimizer's per-pass check uses [`verify_function`] because it holds one function, with this
+/// whole-program check at its checked pipeline's input/output and interprocedural boundaries.
 pub fn verify_program(p: &Program) -> Vec<String> {
     let mut sigs: FnSigs = HashMap::new();
     for f in &p.funcs {
@@ -57,7 +57,7 @@ pub fn verify_program(p: &Program) -> Vec<String> {
     errors
 }
 
-/// Verify a single function. `wukong_opt`'s debug-only per-pass check uses this entry point.
+/// Verify a single function. `wukong_opt`'s per-pass check uses this entry point.
 /// Calls are checked for
 /// operand definition only — cross-checking a call against its callee needs [`verify_program`].
 pub fn verify_function(f: &Function) -> Vec<String> {

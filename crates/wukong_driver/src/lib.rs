@@ -108,6 +108,8 @@ pub struct Options {
     pub emit: EmitStage,
     pub run: bool,
     pub opt_level: u8,
+    /// Validate MIR after each optimizer pass, including in release builds (`--verify-each`).
+    pub verify_each: bool,
     pub color: bool,
     pub error_format: ErrorFormat,
     /// Which backend to run/emit with. `--run` defaults to the interpreter (the reference oracle);
@@ -172,6 +174,7 @@ impl Default for Options {
             emit: EmitStage::Exe,
             run: false,
             opt_level: 0,
+            verify_each: false,
             color: true,
             error_format: ErrorFormat::Human,
             backend: BackendKind::Interp,
@@ -407,7 +410,19 @@ pub fn compile(opts: &Options) -> i32 {
     } else {
         opts.opt_level
     };
-    wukong_opt::optimize(&mut program, opt_level);
+    if opts.verify_each {
+        if let Err(failure) = wukong_opt::optimize_verified(&mut program, opt_level) {
+            emit_diag(
+                &optimization_failure_diag(&failure, &interner),
+                opts.error_format,
+                &renderer,
+                &SourceMap::new(),
+            );
+            return exit::COMPILE_ERROR;
+        }
+    } else {
+        wukong_opt::optimize(&mut program, opt_level);
+    }
 
     // --- Autodiff CLI surface (additive; runs after optimization, before any backend) ---
     if opts.grad.train {
@@ -1329,6 +1344,14 @@ fn build_grad(
     })?;
     let wrt = grad_wrt(func, &opts.grad.wrt, opts.grad.train)?;
     let gradfn = wukong_autodiff::grad(func, &wrt, interner)?;
+    if opts.verify_each {
+        // Autodiff synthesizes MIR after optimization. Preserve the complete callee set when
+        // checking its output so calls are checked against the same definitions as the input.
+        let mut checked = program.clone();
+        checked.funcs.push(gradfn.clone());
+        wukong_opt::verify_program_stage(&checked, "autodiff")
+            .map_err(|failure| failure.to_string())?;
+    }
     Ok((func.clone(), gradfn))
 }
 
@@ -1561,6 +1584,10 @@ fn train_loop(
         level: program.level,
         statics: program.statics.clone(),
     };
+    if opts.verify_each {
+        wukong_opt::verify_program_stage(&train_prog, "training kernels")
+            .map_err(|failure| failure.to_string())?;
+    }
 
     // Deterministic buffer init; the loss output is zeroed, moment state starts at zero.
     let mut seed = opts.grad.train_seed;
@@ -1674,6 +1701,25 @@ fn print_artifact(s: &str) {
 fn eprint_line(s: &str) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "{s}");
+}
+
+/// Preserve optimizer failure context in the existing structured diagnostic format.
+fn optimization_failure_diag(
+    failure: &wukong_opt::VerificationFailure,
+    interner: &Interner,
+) -> Diagnostic {
+    let context = failure
+        .function
+        .map(|name| format!(" in function `{}`", interner.resolve(name)))
+        .unwrap_or_default();
+    let mut diagnostic = Diagnostic::bug(format!(
+        "MIR verification failed after `{}`{context}",
+        failure.pass
+    ));
+    for error in &failure.errors {
+        diagnostic = diagnostic.note(error);
+    }
+    diagnostic
 }
 
 /// Emit a single diagnostic to stderr in the requested format.
@@ -1805,6 +1851,59 @@ mod grad_cli_tests {
     use super::*;
     use wukong_mir::{MirLevel, Program};
     use wukong_span::{SourceMap, Symbol};
+
+    #[test]
+    fn verify_each_failure_preserves_pass_function_and_errors_in_both_formats() {
+        let mut interner = Interner::new();
+        let failure = wukong_opt::VerificationFailure {
+            pass: "broken-pass",
+            function: Some(interner.intern("the_function")),
+            errors: vec!["undefined value v99".into(), "wrong return type".into()],
+        };
+        let diagnostic = optimization_failure_diag(&failure, &interner);
+        assert_eq!(diagnostic.severity, wukong_diag::Severity::Bug);
+        assert!(
+            diagnostic.code.is_none(),
+            "internal pass failures are not source error codes"
+        );
+        let sources = SourceMap::new();
+        let human = Renderer::new(false).render(&diagnostic, &sources);
+        let json = wukong_diag::to_json(&diagnostic, &sources);
+        assert!(json.contains("\"severity\":\"bug\""));
+        for text in [&human, &json] {
+            for detail in [
+                "broken-pass",
+                "the_function",
+                "undefined value v99",
+                "wrong return type",
+            ] {
+                assert!(text.contains(detail), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn verify_each_checks_autodiff_and_training_synthesis() {
+        let (program, mut interner) = compile_o1(
+            "fn loss(x: [f32; 1], mut out: [f32; 1]) -> f32 { \
+             let y: f32 = x[0] * x[0]; out[0] = y; return y; }",
+        );
+        for train_opt in [TrainOpt::Sgd, TrainOpt::AdamW] {
+            let mut opts = Options {
+                verify_each: true,
+                ..Options::default()
+            };
+            opts.grad.train = true;
+            opts.grad.train_steps = 1;
+            opts.grad.train_opt = train_opt;
+            build_grad(&program, &mut interner, &opts).unwrap();
+            let checked = train_loop(&program, &mut interner, &opts, &[1, 1]).unwrap();
+            opts.verify_each = false;
+            let ordinary = train_loop(&program, &mut interner, &opts, &[1, 1]).unwrap();
+            assert_eq!(checked, ordinary);
+            assert_eq!(checked.len(), 2);
+        }
+    }
 
     /// Lex → parse → sema → mir_build → opt(1). Panics with the offending stage's diagnostics.
     fn compile_o1(src: &str) -> (Program, Interner) {

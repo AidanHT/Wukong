@@ -55,7 +55,8 @@ per-op typing including cast kinds and widths, terminator correctness, `VecKerne
 and result presence, and every registered recipe's operand indices and reduction shape.
 
 `verify_program` additionally cross-checks each `Call` against callee signatures at the driver
-boundary. The optimizer's debug `verify-each` checks individual functions.
+boundary. The optimizer's `--verify-each` checks individual functions after each executed pass and
+whole programs at input/output and interprocedural boundaries, in debug and release builds.
 
 ## `VecKernel`
 
@@ -75,7 +76,8 @@ truth source.
   a correct fix needs a dedicated `IsNull` op or reserving address 0 in the interpreter.
 - **Recipe buffer capacity** — opaque pointer operands do not carry lengths; verification checks
   recipe indices but does not prove that call-site pointer/scalar buffers are large enough.
-- **`verify-each` is `#[cfg(debug_assertions)]`** — no `--verify-each` CLI flag; release can slip past.
+- **Release verification is opt-in per pass** — use `--verify-each`; default release compilation
+  retains the existing backend boundary checks without the cost of checking each optimizer pass.
 
 ## Testing
 

@@ -9,8 +9,9 @@
 //!
 //! The MIR verifier is *not* a producer: `wukong_mir` does not depend on this crate and reports
 //! malformed IR as plain strings, which `wukong_driver::verify_or_ice` prints as
-//! `internal compiler error (MIR verify): …` before stopping the pipeline. Nothing outside this
-//! crate constructs [`Severity::Bug`] either.
+//! `internal compiler error (MIR verify): …` before stopping the pipeline. With `--verify-each`, the
+//! driver wraps structured optimizer failures in [`Severity::Bug`] diagnostics so pass/function
+//! context and verifier notes also appear in the selected human or JSON format.
 
 mod catalog;
 mod json;
