@@ -118,8 +118,9 @@ const INV_2P23: f32 = 1.0 / 8_388_608.0; // 2^-23 (exact)
 // underflow to +0.0 (exp(EXP_LO) = +0.0 bit-for-bit as before; the old kernel's n = −126 band
 // produced denormals down to x ≈ −87.68, the table split flushes from x ≈ −87.38 — everything
 // in that band is < 2^−126, out of every gate's domain). Overflow saturation at the EXP_HI
-// clamp is bit-identical to the old kernel (0x7F3504A4 ≈ 2.406e38, no +∞), NaN still funnels
-// through the same min-then-max clamp order, and exp(0) = 1.0 exactly (n = 0, r = 0, T[0] = 1,
+// clamp for finite inputs is bit-identical to the old kernel (0x7F3504A4 ≈ 2.406e38).
+// W16/FINDING-05 corrects the former nonfinite saturation: +∞ returns +∞, -∞ returns +0,
+// and input NaNs retain their payload/sign and become quiet. exp(0) = 1.0 exactly (n = 0, r = 0, T[0] = 1,
 // poly = 1). Max relative error vs f64 exp, **exhaustive** over every one of the 2,237,579,431
 // f32 in [−87, EXP_HI]: 1.625e-7 (≈1.4 ULP), worst at x ≈ 0.2166; max 2 ULP — see
 // `vmath_exp_log_exhaustive_ulp`. (`vmath_exp_dense_sweep` samples 4M points of the same band and
@@ -173,9 +174,9 @@ const EXP_TBL_P3: f32 = 1.0 / 6.0;
 // (the whole domain of the contract, not just the historically quoted [0.25, 4)): 6.924e-7, worst
 // at x ≈ 1.0157 where ln(x) ≈ 0.0156 — 12 ULP of that small a result, one figure seen two ways.
 // See `vmath_exp_log_exhaustive_ulp`; `vmath_log_dense_sweep` samples the same domain. The
-// domain contract is unchanged (x > 0 normal; no guards): x = +0 (→ −127·ln2 ≈ −88.03), x = +∞ and
-// NaN produce bit-identical values to the old kernel; denormals stay same-class garbage; only the
-// x < 0 garbage values differ (out of every gate's domain).
+// positive-normal polynomial is unchanged. Positive subnormals are normalized by an exact 2^23
+// scale before reduction, with 23 subtracted from k. Class guards return -∞ for either zero,
+// +∞ for +∞, a quiet NaN for negative inputs, and preserve the sign/payload of input NaNs.
 const LOG_OFF: i32 = 0x3F32_0000; // z-range split point: z ∈ [0.6953125, 1.390625)
                                   // R[j] = 1/mid_j of bucket j rounded once to f32 (bucket 4 pinned to exactly 1.0 — see above);
                                   // L[j] = −ln(R[j]) computed in f64 *from the rounded-f32 R* and rounded once to f32. The
@@ -271,8 +272,16 @@ const ATAN_P: [f32; 4] = [
 /// dispatched `exp` and the differential oracle stays bit-for-bit exact.
 #[inline]
 pub(crate) fn exp1(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let magnitude = bits & 0x7fff_ffff;
+    if magnitude > 0x7f80_0000 {
+        return f32::from_bits(bits | 0x0040_0000);
+    }
+    if magnitude == 0x7f80_0000 {
+        return if bits == 0x7f80_0000 { x } else { 0.0 };
+    }
     // `min` then `max`, not `clamp`: this mirrors the AVX2 `_mm256_min_ps`/`_mm256_max_ps` order
-    // lane-for-lane (incl. their NaN behavior), which is what keeps the scalar tail bit-identical.
+    // lane-for-lane on the remaining finite inputs.
     #[allow(clippy::manual_clamp)]
     let x = x.min(EXP_HI).max(EXP_LO);
     let t = x.mul_add(EXP_TBL_SCALE, EXP_MAGIC);
@@ -309,17 +318,35 @@ pub(crate) fn exp1(x: f32) -> f32 {
 /// log-softmax kernel (`norm.rs`) can take the log of its row sum through the identical scalar log.
 #[inline]
 pub(crate) fn log1(x: f32) -> f32 {
+    let original_bits = x.to_bits();
+    let magnitude = original_bits & 0x7fff_ffff;
+    if magnitude > 0x7f80_0000 {
+        return f32::from_bits(original_bits | 0x0040_0000);
+    }
+    if magnitude == 0 {
+        return f32::NEG_INFINITY;
+    }
+    if original_bits & 0x8000_0000 != 0 {
+        return f32::NAN;
+    }
+    if magnitude == 0x7f80_0000 {
+        return f32::INFINITY;
+    }
+    // Every positive subnormal becomes normal under this exact scale, including 2^-149.
+    // Correct k before the split-ln2 reconstruction, avoiding a second rounded logarithm sum.
+    let subnormal = magnitude < 0x0080_0000;
+    let x = if subnormal { x * 8_388_608.0 } else { x };
     let bits = x.to_bits() as i32;
     // Split at the bit pattern LOG_OFF (≈ bits of 0.695): everything above the low 23 bits of `tmp`
     // is k·2^23; subtracting it back off `bits` renormalizes x to z = x·2^-k ∈ [0.6953125, 1.390625).
-    // `wrapping_sub` = the AVX2 `vpsubd` (only garbage inputs — sign bit set — ever wrap).
+    // `wrapping_sub` = the AVX2 `vpsubd`.
     let tmp = bits.wrapping_sub(LOG_OFF);
     let kbits = tmp & 0xFF80_0000u32 as i32;
     let iz = bits.wrapping_sub(kbits);
     let z = f32::from_bits(iz as u32);
     // k as f32, shift-free: kbits = k·2^23 is exact in f32 (≤9 significant bits, sign included via
     // the signed convert), and the 2^-23 scale is a power of two — both steps exact.
-    let e = (kbits as f32) * INV_2P23;
+    let e = (kbits as f32) * INV_2P23 - if subnormal { 23.0 } else { 0.0 };
     // Bucket = bits 22..20 of tmp — the top 3 mantissa bits of (z's offset from LOG_OFF). The `& 7`
     // is the scalar spelling of vpermps consuming only bits 2..0 of each index lane.
     let j = (((tmp as u32) >> 20) & 7) as usize;
@@ -792,7 +819,7 @@ fn acos1(x: f32) -> f32 {
 
 /// `cbrt(x) = copysign(e^{ln|x|/3}, x)` — the all-real cube root (LAB color, variance-stabilizing
 /// transforms, physics). Evaluating on `|x|` and restoring the sign keeps `log` in its domain;
-/// the `|x| == 0 → 0` guard avoids `log(0)`'s garbage feeding `exp`. Reuses [`exp1`]/[`log1`], with
+/// the `|x| == 0 → 0` guard pins the zero result explicitly. Reuses [`exp1`]/[`log1`], with
 /// the abs/sign as bit masks, so [`cbrt8`] and the tail agree bit-for-bit (the ±0 sign mirrors the
 /// `asinh` precedent: copysign restores it).
 #[inline]
@@ -811,6 +838,13 @@ fn cbrt1(x: f32) -> f32 {
 #[inline]
 fn expm1_1(x: f32) -> f32 {
     let u = exp1(x);
+    // Kahan's correction is undefined at u=0 and u=+infinity; use its limiting value.
+    if u == 0.0 {
+        return -1.0;
+    }
+    if u == f32::INFINITY {
+        return u;
+    }
     let um1 = u - 1.0;
     let val = um1 * (x / log1(u));
     if u == 1.0 {
@@ -826,6 +860,9 @@ fn expm1_1(x: f32) -> f32 {
 /// and inlined MIR.
 #[inline]
 fn log1p_1(x: f32) -> f32 {
+    if x == f32::INFINITY {
+        return x;
+    }
     let u = 1.0 + x;
     let d = u - 1.0;
     let val = log1(u) * (x / d);
@@ -1957,6 +1994,16 @@ unsafe fn vmath_f16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
 #[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
+    let magnitude = _mm256_and_si256(_mm256_castps_si256(x), _mm256_set1_epi32(0x7fff_ffff));
+    let nonfinite = _mm256_cmpgt_epi32(magnitude, _mm256_set1_epi32(0x7f7f_ffff));
+    if _mm256_movemask_ps(_mm256_castsi256_ps(nonfinite)) != 0 {
+        let mut lanes = [0.0; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), x);
+        for lane in &mut lanes {
+            *lane = exp1(*lane);
+        }
+        return _mm256_loadu_ps(lanes.as_ptr());
+    }
     // The 8-bucket table reduction, mirroring `exp1` op-for-op (see the constants block + `exp1`
     // for the algorithm and error analysis). vs the old full-range degree-5 Estrin body this
     // trades 8 poly FP ops for a 3-FMA cubic plus one in-register `vpermps` lookup (the T table
@@ -1990,6 +2037,21 @@ pub(crate) unsafe fn exp8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__
 #[target_feature(enable = "avx2,fma")]
 pub(crate) unsafe fn log8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
+    // Normal positive lanes retain the table fast path. Rare exceptional/subnormal blocks use
+    // the scalar twin, including its NaN payload rule and subnormal exponent correction.
+    let bits = _mm256_castps_si256(x);
+    let normal = _mm256_and_si256(
+        _mm256_cmpgt_epi32(bits, _mm256_set1_epi32(0x007f_ffff)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(0x7f80_0000), bits),
+    );
+    if _mm256_movemask_ps(_mm256_castsi256_ps(normal)) != 0xff {
+        let mut lanes = [0.0; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), x);
+        for lane in &mut lanes {
+            *lane = log1(*lane);
+        }
+        return _mm256_loadu_ps(lanes.as_ptr());
+    }
     // The 8-bucket table reduction, mirroring `log1` op-for-op (see the constants block + `log1` for
     // the algorithm and error analysis). vs the old full-range degree-8 poly this trades the 9-FMA
     // Estrin body + compare/blend range split for: 3 cheap integer ops, two 1-op in-register
@@ -2091,7 +2153,8 @@ unsafe fn tanh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 unsafe fn sigmoid8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // 1/(1+exp(-x))
-    let e = exp8(_mm256_sub_ps(_mm256_setzero_ps(), x));
+    // Unary negation flips the sign bit even for NaNs; 0-x does not.
+    let e = exp8(_mm256_xor_ps(x, _mm256_set1_ps(-0.0)));
     let d = _mm256_add_ps(_mm256_set1_ps(1.0), e);
     _mm256_div_ps(_mm256_set1_ps(1.0), d)
 }
@@ -2157,7 +2220,7 @@ unsafe fn softplus8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     // max(x,0) + log(1 + exp(-|x|)) — the stable softplus, mirroring softplus1. `|x|` clears the sign
     // bit (== f32::abs), matching the scalar twin bit-for-bit.
     let absx = _mm256_and_ps(x, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF)));
-    let nabs = _mm256_sub_ps(_mm256_setzero_ps(), absx);
+    let nabs = _mm256_xor_ps(absx, _mm256_set1_ps(-0.0));
     let e = exp8(nabs);
     let l = log8(_mm256_add_ps(_mm256_set1_ps(1.0), e));
     let relu = _mm256_max_ps(x, _mm256_setzero_ps());
@@ -2208,8 +2271,8 @@ unsafe fn softsign8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 unsafe fn logsigmoid8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // −softplus(−x) — mirrors logsigmoid1; reuses softplus8 so the stable form (and the tail) agree.
-    let nx = _mm256_sub_ps(_mm256_setzero_ps(), x);
-    _mm256_sub_ps(_mm256_setzero_ps(), softplus8(nx))
+    let nx = _mm256_xor_ps(x, _mm256_set1_ps(-0.0));
+    _mm256_xor_ps(softplus8(nx), _mm256_set1_ps(-0.0))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2493,7 +2556,11 @@ unsafe fn expm1_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     let um1 = _mm256_sub_ps(u, one);
     let val = _mm256_mul_ps(um1, _mm256_div_ps(x, log8(u)));
     let is1 = _mm256_cmp_ps::<_CMP_EQ_OQ>(u, one);
-    _mm256_blendv_ps(val, x, is1)
+    let val = _mm256_blendv_ps(val, x, is1);
+    let is0 = _mm256_cmp_ps::<_CMP_EQ_OQ>(u, _mm256_setzero_ps());
+    let val = _mm256_blendv_ps(val, _mm256_set1_ps(-1.0), is0);
+    let isinf = _mm256_cmp_ps::<_CMP_EQ_OQ>(u, _mm256_set1_ps(f32::INFINITY));
+    _mm256_blendv_ps(val, u, isinf)
 }
 
 /// 8-lane `log1p(x) = log(u)·x/(u−1)`, `u = 1+x`, guard `u==1 → x` — mirrors [`log1p_1`].
@@ -2506,7 +2573,9 @@ unsafe fn log1p_8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     let d = _mm256_sub_ps(u, one);
     let val = _mm256_mul_ps(log8(u), _mm256_div_ps(x, d));
     let is1 = _mm256_cmp_ps::<_CMP_EQ_OQ>(u, one);
-    _mm256_blendv_ps(val, x, is1)
+    let val = _mm256_blendv_ps(val, x, is1);
+    let isinf = _mm256_cmp_ps::<_CMP_EQ_OQ>(x, _mm256_set1_ps(f32::INFINITY));
+    _mm256_blendv_ps(val, x, isinf)
 }
 
 #[cfg(test)]
@@ -2953,6 +3022,135 @@ mod tests {
         );
     }
 
+    /// Independent expected classes/bits, with each exceptional value in every SIMD position
+    /// and in the scalar tail. A scalar/SIMD comparison alone previously hid FINDING-05.
+    #[test]
+    fn vmath_exp_log_exceptional_classes() {
+        let nan_bits = [0x7fc0_0000, 0xffc0_1234, 0x7f80_0001, 0xffbf_ffff];
+        for op in [VM_EXP, VM_LOG] {
+            let mut cases = if op == VM_EXP {
+                vec![
+                    (0.0, 1.0f32.to_bits()),
+                    (-0.0, 1.0f32.to_bits()),
+                    (f32::INFINITY, f32::INFINITY.to_bits()),
+                    (f32::NEG_INFINITY, 0),
+                    (f32::MAX, 0x7f35_04a4),
+                    (f32::MIN, 0),
+                ]
+            } else {
+                vec![
+                    (0.0, f32::NEG_INFINITY.to_bits()),
+                    (-0.0, f32::NEG_INFINITY.to_bits()),
+                    (f32::INFINITY, f32::INFINITY.to_bits()),
+                    (f32::NEG_INFINITY, f32::NAN.to_bits()),
+                    (-1.0, f32::NAN.to_bits()),
+                    (-f32::from_bits(1), f32::NAN.to_bits()),
+                    (1.0, 0),
+                ]
+            };
+            cases.extend(nan_bits.map(|b| (f32::from_bits(b), b | 0x0040_0000)));
+            for (x, expected) in cases {
+                assert_eq!(apply1(op, x).to_bits(), expected, "op={op} x={x:?}");
+                for at in 0..8 {
+                    let mut xs = [1.0; 17];
+                    xs[at] = x;
+                    xs[16] = x;
+                    let mut out = [0.0; 17];
+                    unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), 17, op) };
+                    assert_eq!(out[at].to_bits(), expected, "op={op} lane={at} x={x:?}");
+                    assert_eq!(out[16].to_bits(), expected, "op={op} tail x={x:?}");
+                    for (input, actual) in xs.into_iter().zip(out) {
+                        assert_eq!(actual.to_bits(), apply1(op, input).to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vmath_log_subnormal_accuracy_and_parity() {
+        let mut bits: Vec<u32> = (1..0x0080_0000).step_by(4093).collect();
+        for exponent in 0..23 {
+            let center = 1u32 << exponent;
+            bits.extend(center.saturating_sub(3).max(1)..=center + 3);
+        }
+        bits.extend(0x007f_ffe0..=0x0080_0020);
+        let xs: Vec<f32> = bits.into_iter().map(f32::from_bits).collect();
+        let mut out = vec![0.0; xs.len()];
+        unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, VM_LOG) };
+        for (&x, &actual) in xs.iter().zip(&out) {
+            let expected = f64::from(x).ln();
+            assert!(actual.is_finite());
+            // Reuse the existing vmath_log_dense_sweep relative-error gate, unchanged.
+            assert!(
+                ((f64::from(actual) - expected) / expected).abs() < 1e-6,
+                "log({x:e}) = {actual}, expected {expected}"
+            );
+            assert_eq!(actual.to_bits(), log1(x).to_bits(), "log({x:e}) lane/tail");
+        }
+        assert!(log1(f32::from_bits(1)) < -100.0);
+        assert!(log1(1e-40) < -90.0);
+    }
+
+    #[test]
+    fn vmath_exp_log_dependent_exceptional_classes() {
+        for op in [
+            VM_SIGMOID,
+            VM_ELU,
+            VM_SOFTPLUS,
+            VM_MISH,
+            VM_SELU,
+            VM_LOGSIGMOID,
+            VM_EXP2,
+            VM_EXP10,
+            VM_LOG2,
+            VM_LOG10,
+            VM_SINH,
+            VM_COSH,
+            VM_ASINH,
+            VM_ACOSH,
+            VM_ATANH,
+            VM_CBRT,
+            VM_EXPM1,
+            VM_LOG1P,
+        ] {
+            for bits in [0x7fc0_1234, 0xffc0_4321, 0x7f80_0001, 0xff80_0001] {
+                let x = f32::from_bits(bits);
+                let xs = [x; 9];
+                let mut out = [0.0; 9];
+                unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), 9, op) };
+                for actual in out {
+                    assert!(actual.is_nan(), "op={op} lost NaN {bits:#x}: {actual}");
+                    assert_eq!(
+                        actual.to_bits(),
+                        apply1(op, x).to_bits(),
+                        "op={op} lane/tail"
+                    );
+                }
+            }
+        }
+        for (op, x, expected) in [
+            (VM_EXPM1, f32::NEG_INFINITY, -1.0),
+            (VM_EXPM1, -100.0, -1.0),
+            (VM_EXPM1, f32::INFINITY, f32::INFINITY),
+            (VM_LOG1P, f32::INFINITY, f32::INFINITY),
+            (VM_LOG1P, -1.0, f32::NEG_INFINITY),
+            (VM_ATANH, 1.0, f32::INFINITY),
+            (VM_ATANH, -1.0, f32::NEG_INFINITY),
+            (VM_CBRT, f32::INFINITY, f32::INFINITY),
+            (VM_CBRT, f32::NEG_INFINITY, f32::NEG_INFINITY),
+            (VM_LOGSIGMOID, f32::INFINITY, -0.0),
+            (VM_LOGSIGMOID, 100.0, -0.0),
+        ] {
+            let xs = [x; 9];
+            let mut out = [0.0; 9];
+            unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), 9, op) };
+            for actual in out {
+                assert_eq!(actual.to_bits(), expected.to_bits(), "op={op} x={x}");
+            }
+        }
+    }
+
     /// Monotonicity across the 8-bucket boundaries: scan consecutive f32s (±256 ULPs) around every
     /// bucket edge — including the two k-transition edges where z wraps — and require ln to never
     /// decrease. The shipped tables measure zero violations (a table/poly mismatch at an edge would
@@ -3084,9 +3282,8 @@ mod tests {
 
     /// Clamp/saturation semantics of the table exp, pinned bit-for-bit: everything at or below
     /// EXP_LO (including −∞) flushes to +0.0 — the `max(m, 0)` route; everything at or above
-    /// EXP_HI (including +∞ — and NaN, which the min-then-max clamp order has always funneled to
-    /// the HI path) saturates to the same finite value the old full-range-poly kernel produced
-    /// (0x7F3504A4 ≈ 2.406e38 — never +∞); exp(0) == 1.0 exactly; and exp is monotone
+    /// EXP_HI and finite saturates to the same finite value the old full-range-poly kernel produced
+    /// (0x7F3504A4 ≈ 2.406e38); exp(0) == 1.0 exactly; and exp is monotone
     /// non-decreasing through the n-increment boundaries x ≈ (n+½)·ln2/8, where the bucket j and
     /// (every 8th) the exponent e both step — ±256 consecutive f32s scanned in value order around
     /// each, zero violations measured.
@@ -3098,13 +3295,17 @@ mod tests {
         let sat = exp1(EXP_HI);
         assert!(sat.is_finite());
         assert_eq!(sat.to_bits(), 0x7F35_04A4, "HI saturation value drifted");
-        for x in [88.4, 1e6, f32::INFINITY, f32::NAN] {
+        for x in [88.4, 1e6] {
             assert_eq!(
                 exp1(x).to_bits(),
                 sat.to_bits(),
                 "exp({x}) must saturate to exp(EXP_HI)"
             );
         }
+        // W16/FINDING-05 contract correction: the former +infinity/NaN finite-saturation
+        // expectations concealed exceptional inputs. Finite saturation above remains unchanged.
+        assert_eq!(exp1(f32::INFINITY).to_bits(), f32::INFINITY.to_bits());
+        assert_eq!(exp1(f32::NAN).to_bits(), f32::NAN.to_bits());
         assert_eq!(
             exp1(0.0).to_bits(),
             1.0f32.to_bits(),
@@ -3351,11 +3552,8 @@ mod tests {
     /// Both endings are now `copysign` (mask the magnitude, OR the sign in), which LLVM lowers to
     /// `llvm.copysign`, whose sign behaviour on a NaN *is* specified.
     ///
-    /// Covers the sign-restoring ops whose chain is NaN-transparent. `asinh` and `cbrt` share the
-    /// structure but not the premise: their `exp1`/`log1` core swallows a NaN outright (`exp1`
-    /// clamps with `min`/`max`, which return the *non*-NaN operand; `log1` reads the exponent field
-    /// as an integer), so they return a finite number for a NaN input — identically in both
-    /// profiles. That is a different defect and is deliberately not pinned here.
+    /// Covers the sign-restoring ops whose chain is NaN-transparent, including `asinh` and
+    /// `cbrt` now that W16/FINDING-05 corrected their shared exp/log exceptional handling.
     #[test]
     fn vmath_sign_restoring_ops_set_the_nan_sign_from_the_input() {
         // Quiet and signaling, default and non-default payload, each in both signs.
@@ -3369,7 +3567,12 @@ mod tests {
             0x7F80_0001,
             0xFF80_0001,
         ];
-        for (name, op) in [("tanh", VM_TANH), ("atan", VM_ATAN)] {
+        for (name, op) in [
+            ("tanh", VM_TANH),
+            ("atan", VM_ATAN),
+            ("asinh", VM_ASINH),
+            ("cbrt", VM_CBRT),
+        ] {
             // All eight in one 8-lane block (the AVX2 body), then one at a time (the scalar tail).
             let xs: Vec<f32> = pats.iter().map(|&b| f32::from_bits(b)).collect();
             let mut lanes = vec![0f32; pats.len()];
