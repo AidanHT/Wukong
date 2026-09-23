@@ -12,6 +12,7 @@ USAGE:
     wukongc [OPTIONS] <input.wk>
 
 OPTIONS:
+    --verify-each     Verify MIR after every optimizer pass (also in release builds)
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
                        tokens, ast, mir-high, mir, grad, llvm-ir, obj, exe  (default: exe)
                        (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
@@ -118,6 +119,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 return Ok(None);
             }
             "--run" => opts.run = true,
+            "--verify-each" => opts.verify_each = true,
             _ if arg.starts_with("--backend=") => {
                 let b = &arg["--backend=".len()..];
                 opts.backend = match b {
@@ -268,4 +270,28 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     }
 
     Ok(Some(opts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_each_flag_survives_all_optimization_levels_and_training() {
+        for level in ["-O0", "-O1", "-O2", "-O3"] {
+            for mode in ["--run", "--emit=mir", "--emit=grad", "--train"] {
+                let args = ["--verify-each", level, mode, "input.wk"].map(str::to_owned);
+                let opts = parse_args(&args).unwrap().unwrap();
+                assert!(opts.verify_each);
+                assert_eq!(opts.opt_level, level[2..].parse::<u8>().unwrap());
+            }
+        }
+        assert!(
+            !parse_args(&["input.wk".to_owned()])
+                .unwrap()
+                .unwrap()
+                .verify_each
+        );
+        assert!(USAGE.contains("--verify-each"));
+    }
 }
