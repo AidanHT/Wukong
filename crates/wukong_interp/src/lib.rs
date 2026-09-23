@@ -1546,16 +1546,14 @@ impl<'a, 'k> Interp<'a, 'k> {
             //    out of place for those, so the marshalling here is redundant rather than wrong,
             //    and gating them would decline a spelling the kernel author certified.
             //
-            //    NOT in that group, though it is the same kind of streaming elementwise kernel and
-            //    an earlier draft of this comment listed it there: the half-precision
-            //    `wukong_axpby_{bf16,f16}` family and its narrowing `_out` twins. Nothing in
-            //    `lowp.rs` says `out` may alias `x` or `y`, and `wukong_axpby_bf16_out` /
-            //    `wukong_axpby_f16_out` build `&[u16]` AND `&mut [u16]` over the caller's pointers
-            //    before the feature dispatch, so an aliased call there is UB rather than merely a
-            //    different answer. The emitters are not gated (they are index-aligned, and the
-            //    values come out right by construction of the op, which is why nothing has caught
-            //    it) and this branch does NOT close it: it is the one open UNSOUNDNESS in the set
-            //    and it needs a `wukong_runtime` owner.
+            //    The half-precision axpby/vmath families now use raw pointers for half-output
+            //    aliases and detect mixed-width overlap before creating Rust slices. Their former
+            //    overlapping-reference UB is fixed, as is the bias scalar fallback's exact in-place
+            //    case. Bias requires x/out identical or disjoint and b/out disjoint. Exact half-output
+            //    in-place maps agree with snapshots, but shifted and mixed-width overlap use live
+            //    ascending reads/writes in the runtime. Private copies here do NOT model those byte
+            //    dependencies; removing runtime UB does not establish language-level oracle parity
+            //    for such overlap or prove that all emitted calls meet the bias contract.
             //  * A residual set whose runtime entries carry NO disjointness clause in either
             //    direction and whose emit sites do no disjointness reasoning. Five of them write a
             //    `rows`-long `out` while reading a `rows*cols` input — the same shape as the row
@@ -3718,11 +3716,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interpretation differs), so the marshalling is identical; only the runtime fn called
             // differs. Reconstruct the exact stored 16 bits of each input via `f32_to_{bf16,f16}_bits`
             // (idempotent on an already-rounded value, so the buffer is bit-identical to the native
-            // backend's 2-byte storage — same as the bf16/f16 reductions/axpby), hand the kernel a
-            // ZEROED f32 `c` buffer rather than reading C back as `wukong_sgemm_nt` does — the
-            // recognizer pins `beta = 0` on every lowp arm (`emit_lowp_gemm`/`emit_lowp_gemm_epi`),
-            // i.e. the overwrite form, so there is no prior C to accumulate onto; a future `beta != 0`
-            // lowp arm would have to marshal C in — and call the *serial* runtime kernel for BOTH the
+            // backend's 2-byte storage — same as the bf16/f16 reductions/axpby). A nonzero beta is
+            // the runtime's accumulate flag, so marshal the incoming C as well; zero beta keeps
+            // a fresh output buffer. This must hold even though current recognizers emit beta=0.
+            // Call the *serial* runtime kernel for BOTH the
             // serial and `_parallel` names: the runtime pins serial == parallel == interpreter
             // bit-for-bit, and the interpreter is the oracle, so the differential gate stays exact
             // despite the kernel's wider/reassociated accumulation.
@@ -3768,6 +3765,15 @@ impl<'a, 'k> Interp<'a, 'k> {
                     bbuf.push(bits(b, t)?);
                 }
                 let mut cbuf = vec![0.0f32; m * n];
+                if beta != 0 {
+                    for (t, value) in cbuf.iter_mut().enumerate() {
+                        *value = self
+                            .memory
+                            .get(c + t)
+                            .ok_or("lowp sgemm output out of bounds")?
+                            .as_float() as f32;
+                    }
+                }
                 let (ai, ki, ni) = (m as i64, k as i64, n as i64);
                 let (ap, bp, cp) = (abuf.as_ptr(), bbuf.as_ptr(), cbuf.as_mut_ptr());
                 // SAFETY: abuf is m*k, bbuf is n*k u16; cbuf is m*n f32 — the kernels' contract.
@@ -3846,6 +3852,17 @@ impl<'a, 'k> Interp<'a, 'k> {
                     bbuf.push(bits(b, t)?);
                 }
                 let mut cbuf = vec![0.0f32; m * n];
+                // The epilogue acts after accumulation: act(C_old + A.B + bias).
+                // Starting from zero here silently dropped C whenever beta was nonzero.
+                if beta != 0 {
+                    for (t, value) in cbuf.iter_mut().enumerate() {
+                        *value = self
+                            .memory
+                            .get(c + t)
+                            .ok_or("lowp sgemm_epi output out of bounds")?
+                            .as_float() as f32;
+                    }
+                }
                 // The bias is f32 (the epilogue domain), read straight as f32 like `nt_epi`.
                 let biasbuf = match bias_idx {
                     Some(base) => {
@@ -4866,6 +4883,87 @@ mod tests {
             100,
             "negative S must leave the attention output untouched"
         );
+    }
+
+    #[test]
+    fn lowp_gemm_preserves_existing_c_for_nonzero_beta() {
+        // A = [[1,2,3],[-1,0,2]], B = [[4,2],[-2,3],[1,-1]].
+        // The exact integer product is [[3,5],[-2,-4]], independently of
+        // half format, NT/TN storage, or the kernel used by the interpreter.
+        let program = Program::default();
+        let interner = Interner::new();
+        for half in ["bf16", "f16"] {
+            for layout in ["nt", "tn", "nt_epi"] {
+                for suffix in ["", "_parallel"] {
+                    for beta in [0, 1, -1, 2] {
+                        let name = format!("wukong_sgemm_{half}_{layout}{suffix}");
+                        let a = if layout == "tn" {
+                            [1.0, -1.0, 2.0, 0.0, 3.0, 2.0]
+                        } else {
+                            [1.0, 2.0, 3.0, -1.0, 0.0, 2.0]
+                        };
+                        let b = if layout == "tn" {
+                            [4.0, 2.0, -2.0, 3.0, 1.0, -1.0]
+                        } else {
+                            [4.0, -2.0, 1.0, 2.0, 3.0, -1.0]
+                        };
+                        for act in if layout == "nt_epi" { 0..2 } else { 0..1 } {
+                            let c = [10.0, -20.0, 30.0, -40.0];
+                            let mut interp = Interp {
+                                program: &program,
+                                interner: &interner,
+                                memory: a
+                                    .into_iter()
+                                    .chain(b)
+                                    .chain(c)
+                                    .chain([-4.0, 6.0])
+                                    .map(Value::Float)
+                                    .collect(),
+                                stdout: Vec::new(),
+                                frames: Vec::new(),
+                                call_args: Vec::new(),
+                                scratch: Vec::new(),
+                                vecs: Vec::new(),
+                                data_addrs: HashMap::new(),
+                                function_indices: None,
+                                static_indices: None,
+                                accel: None,
+                                depth: 0,
+                            };
+                            let mut args = vec![
+                                Value::Ptr(0),
+                                Value::Ptr(6),
+                                Value::Ptr(12),
+                                Value::Int(2),
+                                Value::Int(3),
+                                Value::Int(2),
+                                Value::Int(beta),
+                            ];
+                            if layout == "nt_epi" {
+                                args.extend([Value::Ptr(16), Value::Int(act)]);
+                            }
+                            interp.intrinsic(&name, &args).unwrap();
+                            let product = [3.0f32, 5.0, -2.0, -4.0];
+                            for (i, dot) in product.into_iter().enumerate() {
+                                // beta is a flag, not a multiplier; every nonzero value adds C.
+                                let mut expected = dot + if beta == 0 { 0.0 } else { c[i] as f32 };
+                                if layout == "nt_epi" {
+                                    expected += [-4.0, 6.0][i % 2];
+                                    if act == 1 {
+                                        expected = expected.max(0.0);
+                                    }
+                                }
+                                assert_eq!(
+                                    (interp.memory[12 + i].as_float() as f32).to_bits(),
+                                    expected.to_bits(),
+                                    "{name}, beta={beta}, act={act}, lane={i}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Every `wukong_*` symbol the lowered program calls. Kernel arms are gate-blind — a fixture
