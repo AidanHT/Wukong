@@ -401,6 +401,15 @@ pub fn compile(opts: &Options) -> i32 {
         return exit::COMPILE_ERROR;
     }
 
+    // Resolve selected autodiff entry points before optimization can remove unreferenced callees.
+    let roots = match autodiff_roots(&program, &mut interner, opts) {
+        Ok(roots) => roots,
+        Err(message) => {
+            eprintln!("error: autodiff: {message}");
+            return exit::COMPILE_ERROR;
+        }
+    };
+
     // --- Optimization ---
     // The autodiff transform (`--emit=grad` / `--train`) consumes single-block SSA, so it forces at
     // least `-O1` (mem2reg + simplify-cfg) regardless of the requested level. Every other path honors
@@ -411,7 +420,9 @@ pub fn compile(opts: &Options) -> i32 {
         opts.opt_level
     };
     if opts.verify_each {
-        if let Err(failure) = wukong_opt::optimize_verified(&mut program, opt_level) {
+        if let Err(failure) =
+            wukong_opt::optimize_verified_preserving(&mut program, opt_level, &roots)
+        {
             emit_diag(
                 &optimization_failure_diag(&failure, &interner),
                 opts.error_format,
@@ -421,7 +432,7 @@ pub fn compile(opts: &Options) -> i32 {
             return exit::COMPILE_ERROR;
         }
     } else {
-        wukong_opt::optimize(&mut program, opt_level);
+        wukong_opt::optimize_preserving(&mut program, opt_level, &roots);
     }
 
     // --- Autodiff CLI surface (additive; runs after optimization, before any backend) ---
@@ -1330,6 +1341,31 @@ fn emit_grad(program: &wukong_mir::Program, interner: &mut Interner, opts: &Opti
     }
 }
 
+/// Resolve the CLI-selected entry point before whole-program optimization. Normal compilation has
+/// no extra roots; selecting a gradient must not disable inlining or downgrade the requested level.
+fn autodiff_roots(
+    program: &wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+) -> Result<Vec<wukong_span::Symbol>, String> {
+    if opts.emit != EmitStage::Grad && !opts.grad.train {
+        return Ok(Vec::new());
+    }
+    let name = opts.grad.of.as_deref().unwrap_or("loss");
+    let symbol = interner.intern(name);
+    if program.function(symbol).is_none() {
+        return Err(missing_grad_target(name));
+    }
+    Ok(vec![symbol])
+}
+
+fn missing_grad_target(name: &str) -> String {
+    format!(
+        "autodiff target `{name}` is not a defined function; select an existing loss function \
+             with --grad-of=<fn> (the default is `loss`)"
+    )
+}
+
 /// Shared core of `--emit=grad` and `--train`: resolve the target loss function and its `wrt` list
 /// from `opts`, run the autodiff transform, and return `(forward_clone, gradient_function)`.
 fn build_grad(
@@ -1339,9 +1375,9 @@ fn build_grad(
 ) -> Result<(wukong_mir::Function, wukong_mir::Function), String> {
     let name = opts.grad.of.clone().unwrap_or_else(|| "loss".to_string());
     let sym = interner.intern(&name);
-    let func = program.function(sym).ok_or_else(|| {
-        format!("no function `{name}` in the module (choose the target with --grad-of=<fn>)")
-    })?;
+    let func = program
+        .function(sym)
+        .ok_or_else(|| missing_grad_target(&name))?;
     let wrt = grad_wrt(func, &opts.grad.wrt, opts.grad.train)?;
     let gradfn = wukong_autodiff::grad(func, &wrt, interner)?;
     if opts.verify_each {
@@ -1441,7 +1477,7 @@ fn loss_param_lens(
     let def = sema
         .defs
         .lookup(sym)
-        .ok_or_else(|| format!("no function `{name}` in the module"))?;
+        .ok_or_else(|| missing_grad_target(&name))?;
     let sig = match &def.kind {
         wukong_sema::DefKind::Fn(sig) => sig,
         _ => return Err(format!("`{name}` is not a function")),
@@ -1905,8 +1941,119 @@ mod grad_cli_tests {
         }
     }
 
+    #[test]
+    fn autodiff_target_survives_every_optimization_level() {
+        // Calling the loss from main used to make the O2/O3 inliner delete its definition.
+        for target in ["loss", "objective"] {
+            let source = format!(
+                "fn {target}(x: [f32; 1], mut out: [f32; 1]) -> f32 {{ \
+                 let y: f32 = x[0] * x[0]; out[0] = y; return y; }} \
+                 fn main() -> i32 {{ let x: [f32; 1] = [2.0]; \
+                 let mut out: [f32; 1] = [0.0]; {target}(x, out); return 0; }}"
+            );
+            // Establish that the fixture actually triggers deletion without an external root.
+            let (mut unrooted, mut names) = compile_high(&source);
+            wukong_opt::optimize(&mut unrooted, 2);
+            assert!(unrooted.function(names.intern(target)).is_none());
+            for level in 0..=3 {
+                for verified in [false, true] {
+                    for training in [false, true] {
+                        let (mut program, mut interner) = compile_high(&source);
+                        let mut opts = Options {
+                            emit: if training {
+                                EmitStage::Mir
+                            } else {
+                                EmitStage::Grad
+                            },
+                            opt_level: level,
+                            verify_each: verified,
+                            ..Options::default()
+                        };
+                        opts.grad.of = (target != "loss").then(|| target.to_string());
+                        opts.grad.wrt = vec![0];
+                        opts.grad.train = training;
+                        opts.grad.train_steps = 1;
+                        opts.grad.train_opt = TrainOpt::Sgd;
+                        opts.grad.train_lr = 0.25;
+                        let roots = autodiff_roots(&program, &mut interner, &opts).unwrap();
+                        if verified {
+                            wukong_opt::optimize_verified_preserving(
+                                &mut program,
+                                level.max(1),
+                                &roots,
+                            )
+                            .unwrap();
+                        } else {
+                            wukong_opt::optimize_preserving(&mut program, level.max(1), &roots);
+                        }
+                        let fsym = interner.intern(target);
+                        assert!(
+                            program.function(fsym).is_some(),
+                            "lost {target} at O{level}"
+                        );
+                        if level >= 2 {
+                            let main = program.function(interner.intern("main")).unwrap();
+                            assert!(!main.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                                matches!(i.op, wukong_mir::Op::Call { func, .. } if func == fsym)
+                            }), "preservation must not disable inlining");
+                        }
+                        let (_, gradient) = build_grad(&program, &mut interner, &opts).unwrap();
+                        let gradient_name = gradient.name;
+                        program.funcs.push(gradient);
+                        let mut buffers = vec![vec![2.0], vec![0.0], vec![0.0]];
+                        run_f32(&program, gradient_name, &mut buffers, &interner);
+                        assert_eq!(buffers[1], vec![4.0]);
+                        assert_eq!(buffers[2], vec![4.0]);
+                        program.funcs.pop();
+                        if training {
+                            let trajectory =
+                                train_loop(&program, &mut interner, &opts, &[1, 1]).unwrap();
+                            let mut seed = opts.grad.train_seed;
+                            let x = train_rand(&mut seed, 1)[0];
+                            // One SGD step for x squared at lr=1/4 gives x/2 exactly.
+                            assert_eq!(trajectory, vec![x * x, (x * 0.5) * (x * 0.5)]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn autodiff_missing_target_names_requested_entry_before_optimization() {
+        let (program, mut interner) = compile_high("fn main() -> i32 { return 0; }");
+        for training in [false, true] {
+            let mut opts = Options {
+                emit: EmitStage::Grad,
+                ..Options::default()
+            };
+            opts.grad.train = training;
+            opts.grad.of = Some("missing_objective".into());
+            let error = autodiff_roots(&program, &mut interner, &opts).unwrap_err();
+            assert!(
+                error.contains("autodiff target `missing_objective`"),
+                "{error}"
+            );
+            assert!(error.contains("--grad-of=<fn>"), "{error}");
+            assert_eq!(
+                build_grad(&program, &mut interner, &opts).unwrap_err(),
+                error
+            );
+        }
+        let opts = Options::default();
+        assert!(autodiff_roots(&program, &mut interner, &opts)
+            .unwrap()
+            .is_empty());
+    }
+
     /// Lex → parse → sema → mir_build → opt(1). Panics with the offending stage's diagnostics.
     fn compile_o1(src: &str) -> (Program, Interner) {
+        let (mut program, interner) = compile_high(src);
+        wukong_opt::optimize(&mut program, 1);
+        (program, interner)
+    }
+
+    fn compile_high(src: &str) -> (Program, Interner) {
         let mut sm = SourceMap::new();
         let id = sm.add("grad_test.wk".to_string(), src.to_string());
         let (tokens, ld) = wukong_lexer::tokenize(sm.source(id), id);
@@ -1917,9 +2064,8 @@ mod grad_cli_tests {
         assert!(!pd.iter().any(|d| d.is_error()), "parse errors");
         let (sema, sd) = wukong_sema::check(&module, &interner);
         assert!(!sd.iter().any(|d| d.is_error()), "sema errors: {sd:?}");
-        let (mut program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        let (program, md) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
         assert!(!md.iter().any(|d| d.is_error()), "mir_build errors: {md:?}");
-        wukong_opt::optimize(&mut program, 1);
         (program, interner)
     }
 
