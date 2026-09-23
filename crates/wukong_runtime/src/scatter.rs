@@ -42,14 +42,9 @@
 //! identically in the AVX2, scalar, and parallel paths. In-range ids — the only case a well-typed program
 //! produces — accumulate exactly.
 //!
-//! **Extent ABI — LANDMINE, and the exception to the crate rule.** Both entries declare `t`/`h`/`v` as
-//! **`usize`**, not the `i64` every sibling kernel takes, and their only guard is `t == 0 || h == 0 ||
-//! v == 0`. Cranelift still hands them a 64-bit value (`coerce_to_i64` on the MIR operand), so a
-//! *negative* extent arrives as a near-`usize::MAX` magnitude, passes the `== 0` test, and the `0..t`
-//! scan walks off `ids`/`grad_out` — exactly the failure `embedding.rs` documents having fixed by
-//! switching to signed extents. The interpreter does not reproduce it either: its `dim!` macro returns
-//! early on any `<= 0`, so a negative extent silently no-ops on one backend and runs off the end on the
-//! other. Nothing in the compiler is known to emit a negative here, and no test covers it.
+//! **Extent ABI.** Like the sibling kernels and MIR runtime-call ABI, both entries take signed
+//! `i64` extents. Any non-positive extent makes the call a no-op before pointer access, unsigned
+//! conversion, or parallel scheduling, matching the interpreter's `dim!` contract.
 
 /// Accumulate one gradient row into one weight-gradient row: `grad_w_row[0..h] += grad_out_row[0..h]`,
 /// 8 f32 per step with a scalar tail. AVX2 when available, else the scalar twin — both perform the
@@ -151,19 +146,21 @@ const SCATTER_PAR_MIN: usize = 64;
 ///
 /// # Safety
 /// `grad_w` valid for `v*h` f32 (readable+writable), `grad_out` valid for `t*h` f32, `ids` valid for `t`
-/// `i32`, non-overlapping `grad_w`/`grad_out`.
+/// `i32`, non-overlapping `grad_w`/`grad_out`, when all extents are positive. No pointer is accessed
+/// when any extent is non-positive, so null pointers are permitted in that case.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_scatter_add_f32(
     grad_w: *mut f32,
     grad_out: *const f32,
     ids: *const i32,
-    t: usize,
-    h: usize,
-    v: usize,
+    t: i64,
+    h: i64,
+    v: i64,
 ) {
-    if t == 0 || h == 0 || v == 0 {
+    if t <= 0 || h <= 0 || v <= 0 {
         return;
     }
+    let (t, h, v) = (t as usize, h as usize, v as usize);
     // Serial owns the whole table: the `[0, v)` filter is exactly the `0 <= id < v` guard.
     scatter_rows(grad_w, grad_out, ids, t, h, 0, v);
 }
@@ -183,13 +180,14 @@ pub unsafe extern "C" fn wukong_scatter_add_f32_parallel(
     grad_w: *mut f32,
     grad_out: *const f32,
     ids: *const i32,
-    t: usize,
-    h: usize,
-    v: usize,
+    t: i64,
+    h: i64,
+    v: i64,
 ) {
-    if t == 0 || h == 0 || v == 0 {
+    if t <= 0 || h <= 0 || v <= 0 {
         return;
     }
+    let (t, h, v) = (t as usize, h as usize, v as usize);
     if v < SCATTER_PAR_MIN {
         scatter_rows(grad_w, grad_out, ids, t, h, 0, v);
         return;
@@ -284,14 +282,21 @@ mod tests {
             let mut got = vec![0.0f32; v * h];
             let mut got_par = vec![0.0f32; v * h];
             unsafe {
-                wukong_scatter_add_f32(got.as_mut_ptr(), grad_out.as_ptr(), ids.as_ptr(), t, h, v);
+                wukong_scatter_add_f32(
+                    got.as_mut_ptr(),
+                    grad_out.as_ptr(),
+                    ids.as_ptr(),
+                    t as i64,
+                    h as i64,
+                    v as i64,
+                );
                 wukong_scatter_add_f32_parallel(
                     got_par.as_mut_ptr(),
                     grad_out.as_ptr(),
                     ids.as_ptr(),
-                    t,
-                    h,
-                    v,
+                    t as i64,
+                    h as i64,
+                    v as i64,
                 );
             }
             assert_eq!(got, want, "scatter {t}x{h} v={v} vs naive");
@@ -335,14 +340,21 @@ mod tests {
             let mut got = vec![0.0f32; v * h];
             let mut got_par = vec![0.0f32; v * h];
             unsafe {
-                wukong_scatter_add_f32(got.as_mut_ptr(), grad_out.as_ptr(), ids.as_ptr(), t, h, v);
+                wukong_scatter_add_f32(
+                    got.as_mut_ptr(),
+                    grad_out.as_ptr(),
+                    ids.as_ptr(),
+                    t as i64,
+                    h as i64,
+                    v as i64,
+                );
                 wukong_scatter_add_f32_parallel(
                     got_par.as_mut_ptr(),
                     grad_out.as_ptr(),
                     ids.as_ptr(),
-                    t,
-                    h,
-                    v,
+                    t as i64,
+                    h as i64,
+                    v as i64,
                 );
             }
             assert_eq!(got, want, "collision scatter vs naive");
@@ -365,14 +377,21 @@ mod tests {
         let mut got = vec![0.0f32; v * h];
         let mut got_par = vec![0.0f32; v * h];
         unsafe {
-            wukong_scatter_add_f32(got.as_mut_ptr(), grad_out.as_ptr(), ids.as_ptr(), t, h, v);
+            wukong_scatter_add_f32(
+                got.as_mut_ptr(),
+                grad_out.as_ptr(),
+                ids.as_ptr(),
+                t as i64,
+                h as i64,
+                v as i64,
+            );
             wukong_scatter_add_f32_parallel(
                 got_par.as_mut_ptr(),
                 grad_out.as_ptr(),
                 ids.as_ptr(),
-                t,
-                h,
-                v,
+                t as i64,
+                h as i64,
+                v as i64,
             );
         }
         assert_eq!(got, want, "out-of-range scatter vs naive");
@@ -430,5 +449,39 @@ mod tests {
             grad_w.iter().all(|&x| x == 42.0),
             "no-op must not write grad_w"
         );
+    }
+
+    #[test]
+    fn nonpositive_extents_do_not_access_memory() {
+        for kernel in [wukong_scatter_add_f32, wukong_scatter_add_f32_parallel] {
+            for axis in 0..3 {
+                for extent in [0, -1, i64::MIN] {
+                    let mut dims = [i64::MAX; 3];
+                    dims[axis] = extent;
+                    let mut output = [42.0f32; 8];
+                    // The other dimensions deliberately cannot describe these buffers. The
+                    // non-positive dimension must short-circuit before reads, products, or work.
+                    unsafe {
+                        kernel(
+                            output.as_mut_ptr(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            dims[0],
+                            dims[1],
+                            dims[2],
+                        );
+                        kernel(
+                            std::ptr::null_mut(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            dims[0],
+                            dims[1],
+                            dims[2],
+                        );
+                    }
+                    assert_eq!(output, [42.0; 8], "dimensions {dims:?}");
+                }
+            }
+        }
     }
 }
