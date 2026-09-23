@@ -642,7 +642,7 @@ builtins.
 `f32` (scalar or in a loop), each a ≈1-ULP minimax polynomial built from primitive ops:
 
 - `sqrt(x)` / `rsqrt(x)` — hardware square root (and its reciprocal); `cbrt(x)` — the all-real cube root.
-- `abs(x)` — `|x|` (as `max(x, −x)`); vectorizes, and a `fmax(m, abs(x[k]))` loop is the per-tensor
+- `abs(x)` — `|x|` (clearing the float sign bit); vectorizes, and a `fmax(m, abs(x[k]))` loop is the per-tensor
   absmax dynamic symmetric int8 quantization uses for its scale.
 - `round(x)` / `floor(x)` / `ceil(x)` / `trunc(x)` — round to an integral value (one hardware
   `roundss`/`roundps` each; vectorizes). `round` is round-to-nearest-ties-to-**even** (so `2.5 → 2`,
@@ -674,6 +674,15 @@ identity), while `sqrt` and the transcendentals promote an integer operand to `f
 preserving one: `fmax`/`fmin`, `pow`, `atan2`, `hypot` and the six `*_backward` intrinsics coerce
 *both* operands to the float result type, so `fmax(3, 5)` is the `f32` value `5.0`, not an integer max
 (`tests/run/activation_backward_int_args.wk`).
+
+`exp` and `log` preserve NaNs. `exp(+∞) = +∞` and `exp(−∞) = +0`; finite inputs
+above the polynomial's upper bound still saturate to its historical finite value (about
+`2.406e38`), and sufficiently negative finite inputs flush to zero. `log(±0) = −∞`,
+`log(+∞) = +∞`, and negative arguments produce NaN. Positive subnormals are normalized
+before logarithm evaluation. The composed `expm1` and `log1p` handle their infinite
+endpoints explicitly. These rules apply to runtime kernels and inlined scalar/SIMD formulas;
+they do not establish full libm accuracy or full f64 precision. A softmax row containing NaN,
+positive infinity, or only negative infinities propagates NaNs through its ordinary arithmetic.
 
 When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, **any of the 35**
 transcendentals (`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/the inverse trig/the hyperbolic family/…)

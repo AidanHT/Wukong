@@ -20541,20 +20541,73 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// `abs(x) = max(x, −x)` as a compare + select — the same form `emit_softplus` uses for `|x|`, so
-    /// the two agree. Lane-type-agnostic (f32 or f64) and built only from primitives (`FSub`/`Cmp`/
-    /// `Select`), so it vectorizes and is bit-identical across backends. Differs from the reduction
-    /// kernel's bit-clear abs only at ±0 (a `−0` here yields `+0`, harmless and never compared against
-    /// the kernel — a `@parallel` absmax dispatches to the kernel, a scalar/sequential one uses this).
+    /// Absolute value clears the sign bit, including on NaNs and negative zero, matching the
+    /// runtime's scalar and SIMD forms. Arithmetic comparisons cannot implement this for NaNs.
     fn emit_abs(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let zero = self.splat_const_f(0.0, rty);
-        let negx = self
+        if matches!(rty.lane_type(), MirType::F16 | MirType::BF16) {
+            // Native half values use f32 registers; the interpreter also has no half/i16
+            // bitcast representation. Promote before manipulating bits, then round back.
+            let wide = float_ty_like(rty, MirType::F32);
+            let x = self
+                .builder
+                .build(wide.clone(), Op::Cast(CastKind::FpExt, x, wide.clone()));
+            let result = self.emit_abs(x, &wide);
+            return self.builder.build(
+                rty.clone(),
+                Op::Cast(CastKind::FpTrunc, result, rty.clone()),
+            );
+        }
+        let (lane, mask) = match rty.lane_type() {
+            MirType::F64 => (MirType::I64, 0x7fff_ffff_ffff_ffff),
+            _ => (MirType::I32, 0x7fff_ffff),
+        };
+        let ity = float_ty_like(rty, lane);
+        let bits = self
             .builder
-            .build(rty.clone(), Op::Bin(BinOp::FSub, zero, x));
-        let gtm = self
+            .build(ity.clone(), Op::Cast(CastKind::Bitcast, x, ity.clone()));
+        let mask = self.splat_const_i(mask, &ity);
+        let bits = self.builder.build(ity, Op::Bin(BinOp::And, bits, mask));
+        self.builder
+            .build(rty.clone(), Op::Cast(CastKind::Bitcast, bits, rty.clone()))
+    }
+
+    /// Copy the sign bit without a floating comparison, retaining negative zero and NaN signs.
+    fn emit_copysign(&mut self, magnitude: ValueId, sign: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F16 | MirType::BF16) {
+            let wide = float_ty_like(rty, MirType::F32);
+            let magnitude = self.builder.build(
+                wide.clone(),
+                Op::Cast(CastKind::FpExt, magnitude, wide.clone()),
+            );
+            let sign = self
+                .builder
+                .build(wide.clone(), Op::Cast(CastKind::FpExt, sign, wide.clone()));
+            let result = self.emit_copysign(magnitude, sign, &wide);
+            return self.builder.build(
+                rty.clone(),
+                Op::Cast(CastKind::FpTrunc, result, rty.clone()),
+            );
+        }
+        let (lane, mask) = match rty.lane_type() {
+            MirType::F64 => (MirType::I64, 0x8000_0000_0000_0000),
+            _ => (MirType::I32, 0x8000_0000),
+        };
+        let ity = float_ty_like(rty, lane);
+        let magnitude = self.emit_abs(magnitude, rty);
+        let mag = self.builder.build(
+            ity.clone(),
+            Op::Cast(CastKind::Bitcast, magnitude, ity.clone()),
+        );
+        let sign = self
             .builder
-            .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, negx));
-        self.builder.build(rty.clone(), Op::Select(gtm, x, negx))
+            .build(ity.clone(), Op::Cast(CastKind::Bitcast, sign, ity.clone()));
+        let mask = self.splat_const_i(mask, &ity);
+        let sign = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::And, sign, mask));
+        let bits = self.builder.build(ity, Op::Bin(BinOp::Or, mag, sign));
+        self.builder
+            .build(rty.clone(), Op::Cast(CastKind::Bitcast, bits, rty.clone()))
     }
 
     /// Integer absolute value: `select(x < 0, 0 - x, x)`. Wraps for `INT_MIN` (like C/Rust's
@@ -20606,10 +20659,7 @@ impl FnLowerer<'_> {
     /// `sigmoid(x) = 1 / (1 + exp(-x))`, built on the exp polynomial. Works on a scalar or a SIMD
     /// vector; bit-identical across backends because every step is (see `emit_exp`).
     fn emit_sigmoid(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let neg1 = self.splat_const_f(-1.0, rty);
-        let negx = self
-            .builder
-            .build(rty.clone(), Op::Bin(BinOp::FMul, x, neg1));
+        let negx = self.builder.build(rty.clone(), Op::Neg(x));
         let e = self.emit_exp(negx, rty);
         let one = self.splat_const_f(1.0, rty);
         let denom = self
@@ -20810,21 +20860,12 @@ impl FnLowerer<'_> {
     }
 
     /// `softplus(x) = ln(1 + e^x)`, the smooth ReLU, in the stable form `max(x,0) + ln(1 + e^{−|x|})`
-    /// (the `exp` never overflows). `|x|` is `max(x, −x)` here (vs the kernel's bit-clear abs — the two
-    /// differ only at ±0, which is washed out by the following `exp`, and a loop dispatches to the
-    /// kernel regardless). Reuses `emit_exp`/`emit_log`, so it is bit-identical across backends.
+    /// (the `exp` never overflows). Bitwise absolute value and exact negation match the runtime
+    /// even for NaNs and signed zero. Reuses `emit_exp`/`emit_log`.
     fn emit_softplus(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let zero = self.splat_const_f(0.0, rty);
-        let negx = self
-            .builder
-            .build(rty.clone(), Op::Bin(BinOp::FSub, zero, x));
-        let gtm = self
-            .builder
-            .build(mask_ty(rty), Op::Cmp(CmpOp::Fogt, x, negx));
-        let absx = self.builder.build(rty.clone(), Op::Select(gtm, x, negx));
-        let nabs = self
-            .builder
-            .build(rty.clone(), Op::Bin(BinOp::FSub, zero, absx));
+        let absx = self.emit_abs(x, rty);
+        let nabs = self.builder.build(rty.clone(), Op::Neg(absx));
         let e = self.emit_exp(nabs, rty);
         let one = self.splat_const_f(1.0, rty);
         let onepe = self
@@ -20864,13 +20905,9 @@ impl FnLowerer<'_> {
     /// (itself the stable `max(t,0)+ln(1+e^{−|t|})`), so it is bit-identical to `logsigmoid8` and to
     /// the scalar twin; the two negations are exact.
     fn emit_logsigmoid(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let zero = self.splat_const_f(0.0, rty);
-        let nx = self
-            .builder
-            .build(rty.clone(), Op::Bin(BinOp::FSub, zero, x));
+        let nx = self.builder.build(rty.clone(), Op::Neg(x));
         let sp = self.emit_softplus(nx, rty);
-        self.builder
-            .build(rty.clone(), Op::Bin(BinOp::FSub, zero, sp))
+        self.builder.build(rty.clone(), Op::Neg(sp))
     }
 
     /// `selu(x) = λ·(x>0 ? x : α·(eˣ−1))`, the scaled ELU of self-normalizing networks. Mirrors `selu8`
@@ -21046,16 +21083,7 @@ impl FnLowerer<'_> {
         let s = self.builder.build(rty.clone(), Op::Sqrt(inner));
         let sum = self.builder.build(rty.clone(), Op::Bin(BinOp::FAdd, ax, s));
         let t = self.emit_log(sum, rty);
-        // copysign(t, x) via select (t ≥ 0): x < 0 ? −t : t.
-        let neg1 = self.splat_const_f(-1.0, rty);
-        let negt = self
-            .builder
-            .build(rty.clone(), Op::Bin(BinOp::FMul, t, neg1));
-        let zero = self.splat_const_f(0.0, rty);
-        let isneg = self
-            .builder
-            .build(mask_ty(rty), Op::Cmp(CmpOp::Folt, x, zero));
-        self.builder.build(rty.clone(), Op::Select(isneg, negt, t))
+        self.emit_copysign(t, x, rty)
     }
 
     /// `acosh(x) = log(x + √(x²−1))` for `x ≥ 1` (`√` of a negative → `NaN` below, matching `libm`).
@@ -21107,7 +21135,22 @@ impl FnLowerer<'_> {
         let is1 = self
             .builder
             .build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, u, one));
-        self.builder.build(rty.clone(), Op::Select(is1, x, val))
+        let result = self.builder.build(rty.clone(), Op::Select(is1, x, val));
+        // log(0) is now -inf: the correction formula needs its exp-underflow endpoint.
+        let zero = self.splat_const_f(0.0, rty);
+        let is0 = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, u, zero));
+        let minus_one = self.splat_const_f(-1.0, rty);
+        let result = self
+            .builder
+            .build(rty.clone(), Op::Select(is0, minus_one, result));
+        let inf = self.splat_const_f(f64::INFINITY, rty);
+        let is_inf = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, u, inf));
+        self.builder
+            .build(rty.clone(), Op::Select(is_inf, inf, result))
     }
 
     /// `log1p(x) = ln(1+x)` via Kahan's stable correction `log(u)·x/(u−1)`, `u = 1+x`, guarding `u==1 → x`.
@@ -21128,7 +21171,13 @@ impl FnLowerer<'_> {
         let is1 = self
             .builder
             .build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, u, one));
-        self.builder.build(rty.clone(), Op::Select(is1, x, val))
+        let result = self.builder.build(rty.clone(), Op::Select(is1, x, val));
+        let inf = self.splat_const_f(f64::INFINITY, rty);
+        let is_inf = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, x, inf));
+        self.builder
+            .build(rty.clone(), Op::Select(is_inf, inf, result))
     }
 
     /// `sin(x)` (`is_cos == false`) or `cos(x)` (`true`) as a fast, deterministic polynomial. Always
@@ -21361,8 +21410,8 @@ impl FnLowerer<'_> {
     }
 
     /// `cbrt(x) = copysign(e^{ln|x|/3}, x)` with the `|x|==0 → 0` guard — mirrors `cbrt1`/`cbrt8`,
-    /// reusing `emit_exp`/`emit_log`. The ±0 sign follows the `emit_asinh` precedent (select-based
-    /// copysign). Works scalar or vector; bit-identical to the dispatched kernel.
+    /// reusing `emit_exp`/`emit_log`. Bitwise copysign retains negative zero and NaN signs.
+    /// Works scalar or vector; bit-identical to the dispatched kernel.
     fn emit_cbrt(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let ax = self.emit_abs(x, rty);
         let lx = self.emit_log(ax, rty);
@@ -21378,16 +21427,7 @@ impl FnLowerer<'_> {
         let mag = self
             .builder
             .build(rty.clone(), Op::Select(iszero, zero, mag));
-        // copysign(mag, x) via select (mag ≥ 0): x < 0 ? −mag : mag.
-        let neg1 = self.splat_const_f(-1.0, rty);
-        let negmag = self
-            .builder
-            .build(rty.clone(), Op::Bin(BinOp::FMul, mag, neg1));
-        let isneg = self
-            .builder
-            .build(mask_ty(rty), Op::Cmp(CmpOp::Folt, x, zero));
-        self.builder
-            .build(rty.clone(), Op::Select(isneg, negmag, mag))
+        self.emit_copysign(mag, x, rty)
     }
 
     /// `atan2(y, x)` — the full-circle angle of `(x, y)` (geometry, robotics, complex argument, RoPE-style
@@ -21462,6 +21502,7 @@ impl FnLowerer<'_> {
     /// overflows). Every step is a primitive op both backends agree on bit-for-bit, so `exp`
     /// does too.
     fn emit_exp_f32(&mut self, x: ValueId, fty: &MirType) -> ValueId {
+        let input = x;
         let lanes = match fty {
             MirType::Vec(_, n) => Some(*n),
             _ => None,
@@ -21570,8 +21611,19 @@ impl FnLowerer<'_> {
 
         // T[j]·p first (both near 1), the exact power-of-two scale last — the kernel's order.
         let tp = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, tj, p));
-        self.builder
-            .build(fty.clone(), Op::Bin(BinOp::FMul, tp, pow2))
+        let finite = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, tp, pow2));
+        // W16: finite overflow keeps its historical saturation, but infinity and NaN must
+        // retain their exceptional classes, just like runtime exp1/exp8.
+        let inf = self.splat_const_f(f64::INFINITY, fty);
+        let is_inf = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Foeq, input, inf));
+        let result = self
+            .builder
+            .build(fty.clone(), Op::Select(is_inf, inf, finite));
+        self.emit_quiet_nan_f32(input, result, fty, &ity)
     }
 
     /// `log(x)` (natural log) as a fast, deterministic polynomial (≈1 ULP of the true `log`). Always
@@ -21607,9 +21659,10 @@ impl FnLowerer<'_> {
     /// is what the promise requires (and what lets a dispatched loop and a composed/scalar use
     /// agree exactly). Then `ln(x) = k·ln2 + L[j] + poly(s)`, `s = fma(z, R[j], −1)`, the same
     /// degree-5 tail and hi/lo `ln2` reconstruction as the kernel, op-for-op. Every step is a
-    /// primitive op both backends agree on bit-for-bit, so `log` does too. Assumes `x > 0` (like
-    /// the rest of the kernels, no domain guard).
+    /// primitive op both backends agree on bit-for-bit, so `log` does too. Positive subnormals
+    /// are normalized exactly by 2^23; domain and exceptional values mirror runtime log1/log8.
     fn emit_log_f32(&mut self, x: ValueId, fty: &MirType) -> ValueId {
+        let input = x;
         let lanes = match fty {
             MirType::Vec(_, n) => Some(*n),
             _ => None,
@@ -21619,6 +21672,25 @@ impl FnLowerer<'_> {
             None => MirType::I32,
         };
         let mty = mask_ty(fty);
+
+        let zero = self.splat_const_f(0.0, fty);
+        let min_normal = self.splat_const_f(f32::MIN_POSITIVE as f64, fty);
+        let positive = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Fogt, x, zero));
+        let small = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Folt, x, min_normal));
+        let subnormal = self
+            .builder
+            .build(mty.clone(), Op::Bin(BinOp::And, positive, small));
+        let scale = self.splat_const_f(8_388_608.0, fty);
+        let scaled = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, x, scale));
+        let x = self
+            .builder
+            .build(fty.clone(), Op::Select(subnormal, scaled, x));
 
         let bits = self
             .builder
@@ -21648,6 +21720,13 @@ impl FnLowerer<'_> {
         let e = self
             .builder
             .build(fty.clone(), Op::Bin(BinOp::FMul, kf, inv));
+        let correction = self.splat_const_f(23.0, fty);
+        let corrected = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, e, correction));
+        let e = self
+            .builder
+            .build(fty.clone(), Op::Select(subnormal, corrected, e));
 
         // The three bucket-index bits of tmp (b0 = bit 20 … b2 = bit 22), each as a `!= 0` mask.
         let zero_i = self.splat_const_i(0, &ity);
@@ -21710,7 +21789,53 @@ impl FnLowerer<'_> {
         let y = self.builder.build(fty.clone(), Op::Fma(e, c2, t));
         let r2 = self.builder.build(fty.clone(), Op::Bin(BinOp::FAdd, s, y));
         let c1 = self.splat_const_f(EXP_C1, fty);
-        self.builder.build(fty.clone(), Op::Fma(e, c1, r2))
+        let finite = self.builder.build(fty.clone(), Op::Fma(e, c1, r2));
+        let negative = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Folt, input, zero));
+        let domain_nan = self.splat_const_f(f32::from_bits(0x7fc0_0000) as f64, fty);
+        let result = self
+            .builder
+            .build(fty.clone(), Op::Select(negative, domain_nan, finite));
+        let is_zero = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Foeq, input, zero));
+        let neg_inf = self.splat_const_f(f64::NEG_INFINITY, fty);
+        let result = self
+            .builder
+            .build(fty.clone(), Op::Select(is_zero, neg_inf, result));
+        let inf = self.splat_const_f(f64::INFINITY, fty);
+        let is_inf = self.builder.build(mty, Op::Cmp(CmpOp::Foeq, input, inf));
+        let result = self
+            .builder
+            .build(fty.clone(), Op::Select(is_inf, inf, result));
+        self.emit_quiet_nan_f32(input, result, fty, &ity)
+    }
+
+    /// Select a quieted input NaN using integer bits so its sign and payload do not depend
+    /// on which operand a backend chooses for an otherwise unobserved floating operation.
+    fn emit_quiet_nan_f32(
+        &mut self,
+        input: ValueId,
+        ordinary: ValueId,
+        fty: &MirType,
+        ity: &MirType,
+    ) -> ValueId {
+        let bits = self
+            .builder
+            .build(ity.clone(), Op::Cast(CastKind::Bitcast, input, ity.clone()));
+        let quiet_bit = self.splat_const_i(0x0040_0000, ity);
+        let quiet = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Or, bits, quiet_bit));
+        let quiet = self
+            .builder
+            .build(fty.clone(), Op::Cast(CastKind::Bitcast, quiet, fty.clone()));
+        let is_nan = self
+            .builder
+            .build(mask_ty(fty), Op::Cmp(CmpOp::Fone, input, input));
+        self.builder
+            .build(fty.clone(), Op::Select(is_nan, quiet, ordinary))
     }
 
     /// Build a float constant of type `fty` — a scalar `ConstFloat`, or one splatted to a vector.
