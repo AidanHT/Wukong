@@ -5338,9 +5338,9 @@ fn float_to_i1_saturates_at_32_bits_before_low_bit() {
     );
 }
 
-/// Compact I1 vector casts have defined MIR lane values but no supported native storage mapping.
+/// Every compact boolean cast previously declined by native must now execute its defined lanes.
 #[test]
-fn vector_float_to_i1_has_explicit_native_diagnostic() {
+fn vector_float_to_i1_executes_defined_lanes() {
     use wukong_mir::{Builder, CastKind, MirType, Op, Program};
     let cases = [
         (128.0, 0, 0),
@@ -5404,17 +5404,19 @@ fn vector_float_to_i1_has_explicit_native_diagnostic() {
                 program.funcs.push(b.finish());
                 let errors = wukong_mir::verify::verify_program(&program);
                 assert!(errors.is_empty(), "{errors:?}");
-                let interpreted = wukong_interp::run_with_output(&program, main, &interner)
-                    .expect("defined MIR lanes");
-                assert_eq!(interpreted, (0, expected.into_bytes()));
-                // These calls must return diagnostics directly; a backend panic fails this test.
-                let jit_error = crate::jit_run(&program, main, &interner).unwrap_err();
-                let object_error = crate::emit_object(&program, &interner).unwrap_err();
-                for error in [jit_error, object_error] {
-                    assert!(
-                        error.contains("unsupported vector float-to-i1 cast"),
-                        "{error}"
-                    );
+                let expected = (0, expected.into_bytes());
+                for opt in [0, 2] {
+                    let mut optimized = program.clone();
+                    wukong_opt::optimize(&mut optimized, opt);
+                    assert!(wukong_mir::verify::verify_program(&optimized).is_empty());
+                    let interpreted = wukong_interp::run_with_output(&optimized, main, &interner)
+                        .expect("defined MIR lanes");
+                    assert_eq!(interpreted, expected);
+                    let native = crate::jit_run(&optimized, main, &interner).expect("native lanes");
+                    assert_eq!(native, expected, "{from:?}/{lanes}/{kind:?}/O{opt}");
+                    assert!(!crate::emit_object(&optimized, &interner)
+                        .unwrap()
+                        .is_empty());
                 }
             }
         }

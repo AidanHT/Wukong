@@ -33,6 +33,7 @@ use wukong_mir::{BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Termina
 use wukong_span::{Interner, Symbol};
 
 mod backend;
+mod bool_vectors;
 pub use backend::CraneliftBackend;
 
 // P4: raw-AVX2 emitter for the general vectorizer's 256-bit path (Cranelift caps CLIF vectors at
@@ -967,6 +968,11 @@ impl<'a> FnTranslator<'a> {
             };
         }
         let (a, b) = (self.val(l), self.val(r));
+        if *res_ty == MirType::I1 && matches!(op, Shl | LShr | AShr) {
+            // MIR masks shift counts by the declared width minus one. Every I1 shift
+            // therefore shifts by zero, although its native register is an I8.
+            return a;
+        }
         match op {
             Add => self.builder.ins().iadd(a, b),
             Sub => self.builder.ins().isub(a, b),
@@ -2405,26 +2411,9 @@ fn populate_module<M: Module>(
     interner: &Interner,
     parallel: bool,
 ) -> Result<HashMap<Symbol, FuncId>, String> {
+    let legalized = bool_vectors::legalize(program, interner)?;
+    let program = legalized.as_ref();
     let asserting = asserting_functions(program, interner)?;
-    // Compact MIR boolean vectors map to i8 lanes, but the native SIMD backend
-    // cannot represent the narrower result of f32x4 -> i8x4 / f64x2 -> i8x2.
-    // Reject before declaring signatures or translating any instruction: otherwise
-    // an unsupported shape can reach Cranelift's lowering assertions. Ordinary
-    // vector comparisons use full-width masks and do not take this cast path.
-    for function in &program.funcs {
-        for inst in function.blocks.iter().flat_map(|block| &block.insts) {
-            if let Op::Cast(CastKind::FpToSi | CastKind::FpToUi, _, MirType::Vec(lane, _)) =
-                &inst.op
-            {
-                if **lane == MirType::I1 {
-                    return Err(format!(
-                        "unsupported vector float-to-i1 cast in `{}`: native compact boolean vector storage is not implemented",
-                        interner.resolve(function.name)
-                    ));
-                }
-            }
-        }
-    }
     let ptr_ty = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
 
