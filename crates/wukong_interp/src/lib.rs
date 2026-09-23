@@ -4741,12 +4741,9 @@ mod tests {
         assert_eq!(out[0], 20000.0);
     }
 
-    /// MIR the verifier accepts must never panic the interpreter. `wukong_mir::verify`'s
-    /// `Op::Cast` arm checks only the *result* type, so `%r: <4 x i32> = cast sext %s` with a
-    /// scalar `%s` verifies clean; the vector cast arm then indexed a one-element lane list and
-    /// raised a raw `index out of bounds: the len is 1 but the index is 1`. It must be an
-    /// `Err(String)`, which the driver renders through its normal `error: {e}` path. (The durable
-    /// fix is an operand-lane-count check in the verifier — see the handoff.)
+    /// Scalar-to-vector casts must be rejected by the verifier. Direct interpreter callers
+    /// can still supply unverified MIR, so retain the runtime error guard as well: this used
+    /// to index a one-element lane list and panic instead of returning a diagnostic.
     #[test]
     fn vector_op_with_a_scalar_operand_is_an_error_not_a_panic() {
         use wukong_mir::{
@@ -4786,8 +4783,8 @@ mod tests {
         program.funcs.push(f);
         program.level = MirLevel::Low;
         assert!(
-            wukong_mir::verify::verify_program(&program).is_empty(),
-            "the verifier accepts this MIR today; that is the point of the test"
+            !wukong_mir::verify::verify_program(&program).is_empty(),
+            "the verifier must reject a scalar-to-vector extension"
         );
         let err = run(&program, name, &interner).unwrap_err();
         assert!(err.contains("not a 4-lane vector"), "got: {err}");

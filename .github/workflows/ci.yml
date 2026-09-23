@@ -72,10 +72,14 @@ jobs:
 
       - name: Verify emitted LLVM corpus
         if: runner.os == 'Linux'
+        env:
+          WUKONG_LLVM_SEMANTICS_OUTPUT: ${{ github.workspace }}/target/llvm-semantics
         run: |
           python -m pip install llvmlite==0.44.0
           cargo build -p wukongc --locked
           python tools/verify_llvm_corpus.py --compiler target/debug/wukongc --report target/llvm-corpus-verification.json
+          cargo test -p wukong_codegen_llvm --locked --lib semantic_tests::
+          python crates/wukong_codegen_llvm/tools/verify_semantics.py target/llvm-semantics
 
       - name: Upload LLVM verification results
         if: always() && runner.os == 'Linux'

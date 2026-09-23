@@ -12,7 +12,7 @@ step this crate never performs.
 
 ```
 MIR (post-opt)
-  → emit_llvm_ir(program, interner) → textual .ll module on stdout
+  → try_emit_llvm_ir(program, interner) → textual .ll module on stdout
 ```
 
 ## Design choices
@@ -23,7 +23,7 @@ MIR (post-opt)
 - **Phi bridging** — Wukong MIR uses block-parameter SSA (Cranelift/MLIR style); LLVM uses phi
   nodes. The emitter maps each non-entry block parameter to a `phi` fed by predecessor edge args.
 - **`LlvmBackend`** — implements the `wukong_backend::Backend` seam, but the live dispatch path is
-  `emit_llvm_ir`, not `Backend::compile`.
+  `try_emit_llvm_ir`, not `Backend::compile`.
 
 External calls carry declarations inferred from their MIR signatures. Conflicting signatures for
 one symbol are rejected because a faithful ABI adapter is not yet implemented. Declarations do
