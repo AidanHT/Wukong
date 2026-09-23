@@ -5239,6 +5239,105 @@ fn float_to_int_saturation_matches_native() {
     assert_eq!(String::from_utf8(native.1).unwrap(), "2147483647\n0\n");
 }
 
+/// Direct MIR float-to-I1 casts saturate at 32 bits before taking parity. Source `as bool`
+/// uses a truthiness comparison instead, so its fixtures cannot exercise this valid MIR path.
+#[test]
+fn float_to_i1_saturates_at_32_bits_before_low_bit() {
+    use wukong_mir::{Builder, CastKind, MirType, Op, Program};
+    let mut interner = Interner::new();
+    let mut program = Program::new();
+    let main_name = interner.intern("main");
+    let print = interner.intern("print");
+    let mut main = Builder::new(main_name, MirType::I32);
+    let mut expected = String::new();
+    // Explicit i32/u32 saturation followed by parity. All boundary integers here
+    // are exactly representable in f32 as well as f64.
+    let cases = [
+        (0.0, 0, 0),
+        (-0.0, 0, 0),
+        (1.9, 1, 1),
+        (-1.9, 1, 0),
+        (2.0, 0, 0),
+        (127.0, 1, 1),
+        (128.0, 0, 0),
+        (129.0, 1, 1),
+        (255.0, 1, 1),
+        (256.0, 0, 0),
+        (257.0, 1, 1),
+        (-128.0, 0, 0),
+        (-129.0, 1, 0),
+        (65536.0, 0, 0),
+        (2147483392.0, 0, 0),
+        (2147483648.0, 1, 0),
+        (2147483904.0, 1, 0),
+        (4294967040.0, 1, 0),
+        (4294967296.0, 1, 1),
+        (-2147483648.0, 0, 0),
+        (-2147483904.0, 0, 0),
+        (f64::NAN, 0, 0),
+        (f64::INFINITY, 1, 1),
+        (f64::NEG_INFINITY, 0, 0),
+    ];
+    for (name, from) in [("f32", MirType::F32), ("f64", MirType::F64)] {
+        for (signed, kind) in [(true, CastKind::FpToSi), (false, CastKind::FpToUi)] {
+            let function = interner.intern(&format!("cast_{name}_{signed}"));
+            let mut helper = Builder::new(function, MirType::I1);
+            let input = helper.add_param(from.clone());
+            let result = helper.build(MirType::I1, Op::Cast(kind, input, MirType::I1));
+            helper.ret(Some(result));
+            program.funcs.push(helper.finish());
+            for &(input, signed_expected, unsigned_expected) in &cases {
+                let value = main.build(from.clone(), Op::ConstFloat(input, from.clone()));
+                let result = main.build(
+                    MirType::I1,
+                    Op::Call {
+                        func: function,
+                        args: vec![value],
+                    },
+                );
+                let integer =
+                    main.build(MirType::I32, Op::Cast(CastKind::ZExt, result, MirType::I32));
+                main.build_void(Op::Call {
+                    func: print,
+                    args: vec![integer],
+                });
+                expected.push_str(
+                    if (if signed {
+                        signed_expected
+                    } else {
+                        unsigned_expected
+                    }) == 0
+                    {
+                        "0\n"
+                    } else {
+                        "1\n"
+                    },
+                );
+            }
+        }
+    }
+    let zero = main.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+    main.ret(Some(zero));
+    program.funcs.push(main.finish());
+    let errors = wukong_mir::verify::verify_program(&program);
+    assert!(
+        errors.is_empty(),
+        "direct fp-to-i1 MIR must be valid: {errors:?}"
+    );
+    let native = crate::jit_run(&program, main_name, &interner).expect("jit");
+    let interpreted =
+        wukong_interp::run_with_output(&program, main_name, &interner).expect("interpreter");
+    assert_eq!(
+        native, interpreted,
+        "native fp-to-i1 differs from interpreter"
+    );
+    assert_eq!(
+        native,
+        (0, expected.into_bytes()),
+        "fp-to-i1 saturation/parity contract"
+    );
+}
+
 /// Hand-built SIMD MIR (vector load + splat + vector `fadd` + vector store) must execute
 /// identically on the interpreter (lane-wise over its side arena) and the native backend (real
 /// SSE vectors). This is the contract the loop vectorizer relies on.
