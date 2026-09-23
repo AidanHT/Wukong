@@ -614,6 +614,11 @@ impl<'a> FnTranslator<'a> {
             let mb = &func.blocks[bi as usize];
             for inst in &mb.insts {
                 self.lower_inst(inst);
+                if self.layout_err.is_some() {
+                    // Failed value-producing calls do not populate vmap. Stop before any use
+                    // (including the terminator) can obscure the diagnostic with a panic.
+                    return;
+                }
             }
             self.lower_term(&mb.term);
         }
@@ -1871,14 +1876,15 @@ impl<'a> FnTranslator<'a> {
         }
         // Everything above dispatches a runtime kernel on (name, arity). `rt_ids` holds exactly
         // the runtime symbols this function is responsible for, so reaching here with one of them
-        // means a recognizer emitted an arity no arm accepts. Without this guard `?` below returns
+        // means a recognizer emitted an arity no arm accepts. Unknown `wukong_` names must also
+        // fail: the interpreter dispatches some kernel families by prefix. Without this guard `?` below returns
         // `None`, `Op::Call` lowers to *nothing*, and the call is silently deleted: a void kernel
         // (`wukong_sgemm`, `wukong_norm_f32`) leaves the destination buffer holding whatever it
         // held before — a silent wrong answer that the interpreter, which dispatches on the symbol
         // name alone with no arity check, does not reproduce — and a value-returning kernel never
         // enters `vmap`, so the first use panics with `MIR value used before definition`. Record it
         // as a lowering error instead; `build_function_clif` aborts before the function is defined.
-        if self.rt_ids.contains_key(name) {
+        if self.rt_ids.contains_key(name) || name.starts_with("wukong_") {
             if self.layout_err.is_none() {
                 self.layout_err = Some(format!(
                     "internal compiler error: runtime kernel `{name}` reached codegen with {} \
@@ -1892,7 +1898,14 @@ impl<'a> FnTranslator<'a> {
             .first()
             .map(|a| self.ty_of(*a).is_float())
             .unwrap_or(false);
-        let intr = classify_intrinsic(name, arg_is_float)?;
+        let Some(intr) = classify_intrinsic(name, arg_is_float) else {
+            if self.layout_err.is_none() {
+                self.layout_err = Some(format!(
+                    "unsupported external call `{name}`: native codegen has no declared ABI or symbol binding"
+                ));
+            }
+            return None;
+        };
         match intr {
             Intrinsic::PrintInt => {
                 if let Some(&a) = args.first() {

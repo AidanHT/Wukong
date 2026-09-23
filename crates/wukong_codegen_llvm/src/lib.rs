@@ -19,7 +19,7 @@
 
 use std::fmt::Write as _;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use wukong_backend::{Artifact, Backend};
 use wukong_mir::{
     BasicBlock, BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
@@ -28,7 +28,7 @@ use wukong_span::{Interner, Symbol};
 
 /// For each block, the incoming edges as `(predecessor block id, arguments passed)`. Used to build
 /// phi nodes for block parameters.
-type EdgeArgs = HashMap<u32, Vec<(u32, Vec<ValueId>)>>;
+type EdgeArgs = HashMap<u32, Vec<(String, Vec<ValueId>)>>;
 
 /// Collect, per target block, the arguments each predecessor passes along its edge.
 fn edge_args(f: &Function) -> EdgeArgs {
@@ -38,7 +38,7 @@ fn edge_args(f: &Function) -> EdgeArgs {
             Terminator::Br { target, args } => {
                 map.entry(target.0)
                     .or_default()
-                    .push((b.id.0, args.clone()));
+                    .push((format!("bb{}", b.id.0), args.clone()));
             }
             Terminator::CondBr {
                 then_blk,
@@ -49,14 +49,17 @@ fn edge_args(f: &Function) -> EdgeArgs {
             } => {
                 map.entry(then_blk.0)
                     .or_default()
-                    .push((b.id.0, then_args.clone()));
-                // A conditional branch with both arms to the same block is one LLVM predecessor;
-                // don't record a second, conflicting phi entry for it.
-                if else_blk.0 != then_blk.0 {
-                    map.entry(else_blk.0)
-                        .or_default()
-                        .push((b.id.0, else_args.clone()));
-                }
+                    .push((format!("bb{}", b.id.0), then_args.clone()));
+                // Split a duplicate successor edge, so distinct edge arguments have distinct
+                // predecessor labels in LLVM's phi representation.
+                let pred = if else_blk == then_blk {
+                    format!("bb{}.else", b.id.0)
+                } else {
+                    format!("bb{}", b.id.0)
+                };
+                map.entry(else_blk.0)
+                    .or_default()
+                    .push((pred, else_args.clone()));
             }
             Terminator::Ret(_) | Terminator::Unreachable => {}
         }
@@ -79,16 +82,36 @@ impl Backend for LlvmBackend {
         interner: &Interner,
     ) -> Result<Artifact, String> {
         Ok(Artifact::Emitted {
-            llvm_ir: Some(emit_llvm_ir(program, interner)),
+            llvm_ir: Some(try_emit_llvm_ir(program, interner)?),
             object: None,
         })
     }
 }
 
 /// Lower a whole program to a textual LLVM IR module.
+/// Panics for unsupported MIR. Diagnostic-producing callers should use [`try_emit_llvm_ir`].
 pub fn emit_llvm_ir(program: &Program, interner: &Interner) -> String {
+    try_emit_llvm_ir(program, interner).expect("unsupported MIR in textual LLVM emission")
+}
+
+/// Emit an inspection module, declining constructs whose ABI cannot be inferred faithfully.
+/// External declarations describe MIR call sites; their implementations must still be linked.
+pub fn try_emit_llvm_ir(program: &Program, interner: &Interner) -> Result<String, String> {
+    let overloads = print_overloads(program, interner);
+    let declarations = declarations(program, interner, &overloads)?;
     let mut out = String::new();
     out.push_str("; Wukong -> LLVM IR\n\n");
+    for (name, (ret, args)) in &declarations {
+        if program
+            .funcs
+            .iter()
+            .any(|f| interner.resolve(f.name) == name)
+        {
+            continue;
+        }
+        let _ = writeln!(out, "declare {ret} @{name}({})", args.join(", "));
+    }
+    out.push('\n');
     // Read-only string literals live as private constants; `Op::GlobalAddr(@name)` GEPs off them.
     for s in &program.statics {
         let mut bytes = String::new();
@@ -110,13 +133,240 @@ pub fn emit_llvm_ir(program: &Program, interner: &Interner) -> String {
         out.push('\n');
     }
     for f in &program.funcs {
-        emit_function(&mut out, f, interner);
+        emit_function(&mut out, f, interner, &overloads, &declarations);
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
-fn emit_function(out: &mut String, f: &Function, interner: &Interner) {
+type Signature = (String, Vec<String>);
+
+fn print_overloads(program: &Program, interner: &Interner) -> HashSet<Symbol> {
+    let mut seen: HashMap<Symbol, Vec<MirType>> = HashMap::new();
+    let mut overloaded = HashSet::new();
+    for f in &program.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Op::Call { func, args } = &inst.op {
+                    if matches!(interner.resolve(*func), "print" | "println")
+                        && !program.funcs.iter().any(|f| f.name == *func)
+                    {
+                        let types = args
+                            .iter()
+                            .map(|a| f.value_type(*a).clone())
+                            .collect::<Vec<_>>();
+                        if seen.get(func).is_some_and(|old| old != &types) {
+                            overloaded.insert(*func);
+                        }
+                        seen.insert(*func, types);
+                    }
+                }
+            }
+        }
+    }
+    overloaded
+}
+
+fn call_name(
+    f: &Function,
+    func: Symbol,
+    args: &[ValueId],
+    interner: &Interner,
+    overloads: &HashSet<Symbol>,
+) -> String {
+    let name = interner.resolve(func);
+    if overloads.contains(&func) {
+        let suffix = args
+            .iter()
+            .map(|a| llvm_ty(f.value_type(*a)))
+            .collect::<Vec<_>>()
+            .join(".");
+        format!("__wukong_{name}.{suffix}")
+    } else {
+        name.to_owned()
+    }
+}
+
+fn declarations(
+    program: &Program,
+    interner: &Interner,
+    overloads: &HashSet<Symbol>,
+) -> Result<BTreeMap<String, Signature>, String> {
+    let mut signatures: BTreeMap<String, Signature> = BTreeMap::new();
+    // Optional runtime pointers are sometimes represented as integer zero in MIR. Infer the
+    // pointer ABI only when every non-pointer use at that position is a literal zero.
+    let mut nullable: HashMap<(String, usize), bool> = HashMap::new();
+    for f in &program.funcs {
+        let zeros: HashSet<ValueId> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|ins| matches!(ins.op, Op::ConstInt(0, _)))
+            .filter_map(|ins| ins.result)
+            .collect();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Op::Call { func, args } = &inst.op {
+                    let name = interner.resolve(*func);
+                    if name.starts_with("wukong_") {
+                        for (k, a) in args.iter().enumerate() {
+                            let valid = f.value_type(*a) == &MirType::Ptr
+                                || (f.value_type(*a).is_int() && zeros.contains(a));
+                            *nullable.entry((name.to_owned(), k)).or_insert(true) &= valid;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for f in &program.funcs {
+        signatures.insert(
+            interner.resolve(f.name).to_owned(),
+            (
+                llvm_ty(&f.ret),
+                f.params.iter().map(|v| llvm_ty(f.value_type(*v))).collect(),
+            ),
+        );
+    }
+    let defined = signatures.clone();
+    for f in &program.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Op::Cast(_, value, to) = &inst.op {
+                    let from = f.value_type(*value);
+                    if from != to
+                        && to.is_vector()
+                        && matches!(to.lane_type(), MirType::F16 | MirType::BF16)
+                        && matches!(
+                            from.lane_type(),
+                            MirType::F16 | MirType::BF16 | MirType::F64
+                        )
+                    {
+                        return Err(
+                            "LLVM emission: vector low-precision casts require an f32 lane adapter"
+                                .into(),
+                        );
+                    }
+                }
+                let call = match &inst.op {
+                    Op::Call { func, args } => Some((
+                        call_name(f, *func, args, interner, overloads),
+                        (
+                            inst.result
+                                .map(|r| llvm_ty(f.value_type(r)))
+                                .unwrap_or_else(|| {
+                                    defined
+                                        .get(interner.resolve(*func))
+                                        .map(|s| s.0.clone())
+                                        .unwrap_or_else(|| "void".into())
+                                }),
+                            args.iter().map(|v| llvm_ty(f.value_type(*v))).collect(),
+                        ),
+                    )),
+                    Op::Sqrt(v) | Op::Round(_, v) => {
+                        let ty = f.value_type(*v);
+                        let name = math_intrinsic(&inst.op, ty)?;
+                        Some((name, (llvm_ty(ty), vec![llvm_ty(ty)])))
+                    }
+                    Op::VecKernelCall { kernel, n, .. } => Some((
+                        format!("__wukong_veckernel_{}_{}", interner.resolve(f.name), kernel),
+                        (
+                            inst.result
+                                .map(|r| llvm_ty(f.value_type(r)))
+                                .unwrap_or_else(|| "void".into()),
+                            vec!["ptr".into(), "ptr".into(), llvm_ty(f.value_type(*n))],
+                        ),
+                    )),
+                    _ => None,
+                };
+                if let Some((name, sig)) = call {
+                    if let Some(previous) = signatures.get_mut(&name) {
+                        if !defined.contains_key(&name)
+                            && previous.0 == sig.0
+                            && previous.1.len() == sig.1.len()
+                        {
+                            let mut merged = previous.1.clone();
+                            for (k, (old, new)) in merged.iter_mut().zip(&sig.1).enumerate() {
+                                if old != new
+                                    && (old == "ptr" || new == "ptr")
+                                    && nullable.get(&(name.clone(), k)) == Some(&true)
+                                {
+                                    *old = "ptr".into();
+                                }
+                            }
+                            if merged
+                                .iter()
+                                .zip(&sig.1)
+                                .enumerate()
+                                .all(|(k, (old, new))| {
+                                    old == new
+                                        || (old == "ptr"
+                                            && nullable.get(&(name.clone(), k)) == Some(&true))
+                                })
+                            {
+                                previous.1 = merged;
+                                continue;
+                            }
+                        }
+                        if previous != &sig {
+                            return Err(format!("LLVM emission: incompatible call signatures for `{name}`: {previous:?} and {sig:?}; an explicit ABI adapter is required"));
+                        }
+                    } else {
+                        signatures.insert(name, sig);
+                    }
+                }
+            }
+        }
+    }
+    for f in &program.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Op::FuncAddr(sym) = inst.op {
+                    if !signatures.contains_key(interner.resolve(sym)) {
+                        return Err(format!(
+                            "LLVM emission: cannot infer signature of external function `{}`",
+                            interner.resolve(sym)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(signatures)
+}
+
+fn math_intrinsic(op: &Op, ty: &MirType) -> Result<String, String> {
+    let suffix = match ty.lane_type() {
+        MirType::F16 => "f16",
+        MirType::BF16 => "bf16",
+        MirType::F32 => "f32",
+        MirType::F64 => "f64",
+        _ => return Err(format!("LLVM emission: floating intrinsic on {ty:?}")),
+    };
+    let suffix = match ty {
+        MirType::Vec(_, n) => format!("v{n}{suffix}"),
+        _ => suffix.to_owned(),
+    };
+    let name = match op {
+        Op::Sqrt(_) => "sqrt",
+        Op::Round(mode, _) => match mode {
+            wukong_mir::RoundMode::Nearest => "roundeven",
+            wukong_mir::RoundMode::Floor => "floor",
+            wukong_mir::RoundMode::Ceil => "ceil",
+            wukong_mir::RoundMode::Trunc => "trunc",
+        },
+        _ => unreachable!(),
+    };
+    Ok(format!("llvm.{name}.{suffix}"))
+}
+
+fn emit_function(
+    out: &mut String,
+    f: &Function,
+    interner: &Interner,
+    overloads: &HashSet<Symbol>,
+    declarations: &BTreeMap<String, Signature>,
+) {
     // Inline constants: map const-producing values to literal operand strings.
     let mut consts: HashMap<u32, String> = HashMap::new();
     for b in &f.blocks {
@@ -126,8 +376,8 @@ fn emit_function(out: &mut String, f: &Function, interner: &Interner) {
                     Op::ConstInt(v, _) => {
                         consts.insert(r.0, v.to_string());
                     }
-                    Op::ConstFloat(v, _) => {
-                        consts.insert(r.0, fmt_float(*v));
+                    Op::ConstFloat(v, ty) => {
+                        consts.insert(r.0, fmt_float(*v, ty));
                     }
                     _ => {}
                 }
@@ -154,6 +404,8 @@ fn emit_function(out: &mut String, f: &Function, interner: &Interner) {
         interner,
         consts: &consts,
         edges: &edges,
+        overloads,
+        declarations,
     };
     for b in &f.blocks {
         e.emit_block(out, b);
@@ -166,6 +418,8 @@ struct Emitter<'a> {
     interner: &'a Interner,
     consts: &'a HashMap<u32, String>,
     edges: &'a EdgeArgs,
+    overloads: &'a HashSet<Symbol>,
+    declarations: &'a BTreeMap<String, Signature>,
 }
 
 impl Emitter<'_> {
@@ -194,7 +448,7 @@ impl Emitter<'_> {
             }
             self.emit_inst(out, inst);
         }
-        self.emit_term(out, &b.term);
+        self.emit_term(out, b);
     }
 
     fn emit_phis(&self, out: &mut String, b: &BasicBlock) {
@@ -208,7 +462,7 @@ impl Emitter<'_> {
             if let Some(preds) = preds {
                 for (pred, args) in preds {
                     if let Some(arg) = args.get(k) {
-                        entries.push(format!("[ {}, %bb{} ]", self.operand(*arg), pred));
+                        entries.push(format!("[ {}, %{} ]", self.operand(*arg), pred));
                     }
                 }
             }
@@ -225,6 +479,37 @@ impl Emitter<'_> {
             Op::ConstInt(..) | Op::ConstFloat(..) | Op::Barrier => return,
             Op::Bin(op, l, r) => {
                 let ty = self.ty(inst.result.unwrap());
+                let value = inst.result.unwrap();
+                let mir_ty = self.f.value_type(value);
+                if matches!(op, BinOp::Shl | BinOp::LShr | BinOp::AShr) {
+                    let width = match mir_ty.lane_type() {
+                        MirType::I1 => 1,
+                        MirType::I8 => 8,
+                        MirType::I16 => 16,
+                        MirType::I32 => 32,
+                        MirType::I64 => 64,
+                        _ => unreachable!("integer shift type"),
+                    };
+                    let mask = int_literal(mir_ty, width - 1);
+                    let _ = writeln!(
+                        out,
+                        "  %v{}.shift = and {ty} {}, {mask}",
+                        value.0,
+                        self.operand(*r)
+                    );
+                    let _ = writeln!(
+                        out,
+                        "  {res}{} {ty} {}, %v{}.shift",
+                        bin_name(*op),
+                        self.operand(*l),
+                        value.0
+                    );
+                    return;
+                }
+                if matches!(op, BinOp::SDiv | BinOp::UDiv | BinOp::SRem | BinOp::URem) {
+                    self.emit_integer_div(out, value, *op, *l, *r);
+                    return;
+                }
                 format!(
                     "{res}{} {ty} {}, {}",
                     bin_name(*op),
@@ -236,6 +521,23 @@ impl Emitter<'_> {
             Op::Cmp(op, l, r) => {
                 let opty = self.ty(*l);
                 let (instr, pred) = cmp_instr(*op);
+                let result = inst.result.unwrap();
+                if let MirType::Vec(lane, n) = self.f.value_type(result) {
+                    if **lane != MirType::I1 {
+                        let ty = self.ty(result);
+                        return {
+                            let _ = writeln!(
+                                out,
+                                "  %v{}.mask = {instr} {pred} {opty} {}, {}",
+                                result.0,
+                                self.operand(*l),
+                                self.operand(*r)
+                            );
+                            let _ =
+                                writeln!(out, "  {res}sext <{n} x i1> %v{}.mask to {ty}", result.0);
+                        };
+                    }
+                }
                 format!(
                     "{res}{instr} {pred} {opty} {}, {}",
                     self.operand(*l),
@@ -244,18 +546,58 @@ impl Emitter<'_> {
             }
             Op::Neg(v) => {
                 let ty = self.ty(inst.result.unwrap());
-                if self.f.value_type(inst.result.unwrap()).is_float() {
+                if self
+                    .f
+                    .value_type(inst.result.unwrap())
+                    .lane_type()
+                    .is_float()
+                {
                     format!("{res}fneg {ty} {}", self.operand(*v))
                 } else {
-                    format!("{res}sub {ty} 0, {}", self.operand(*v))
+                    format!("{res}sub {ty} zeroinitializer, {}", self.operand(*v))
                 }
             }
             Op::Not(v) => {
                 let ty = self.ty(inst.result.unwrap());
-                format!("{res}xor {ty} {}, -1", self.operand(*v))
+                let ones = match self.f.value_type(inst.result.unwrap()) {
+                    MirType::Vec(lane, n) => format!(
+                        "<{}>",
+                        vec![format!("{} -1", llvm_ty(lane)); *n as usize].join(", ")
+                    ),
+                    _ => "-1".into(),
+                };
+                format!("{res}xor {ty} {}, {ones}", self.operand(*v))
             }
             Op::Cast(kind, v, to) => {
                 let from = self.ty(*v);
+                if self.f.value_type(*v) == to {
+                    // A typed identity SSA binding, including half/bfloat and opaque pointers.
+                    let value = self.operand(*v);
+                    let _ = writeln!(out, "  {res}select i1 true, {from} {value}, {from} {value}");
+                    return;
+                }
+                if matches!(to, MirType::F16 | MirType::BF16)
+                    && matches!(
+                        self.f.value_type(*v),
+                        MirType::F16 | MirType::BF16 | MirType::F64
+                    )
+                {
+                    // MIR lowp observations round through f32; half and bfloat also cannot be
+                    // converted with LLVM's same-width fptrunc/fpext.
+                    let r = inst.result.unwrap().0;
+                    let via = if self.f.value_type(*v) == &MirType::F64 {
+                        "fptrunc"
+                    } else {
+                        "fpext"
+                    };
+                    let _ = writeln!(
+                        out,
+                        "  %v{r}.wide = {via} {from} {} to float",
+                        self.operand(*v)
+                    );
+                    let _ = writeln!(out, "  {res}fptrunc float %v{r}.wide to {}", llvm_ty(to));
+                    return;
+                }
                 format!(
                     "{res}{} {from} {} to {}",
                     cast_name(*kind),
@@ -265,8 +607,32 @@ impl Emitter<'_> {
             }
             Op::Select(c, a, b) => {
                 let ty = self.ty(inst.result.unwrap());
+                if let MirType::Vec(lane, n) = self.f.value_type(*c) {
+                    if **lane != MirType::I1 {
+                        let r = inst.result.unwrap().0;
+                        let compare = if lane.is_float() {
+                            "fcmp une"
+                        } else {
+                            "icmp ne"
+                        };
+                        let _ = writeln!(
+                            out,
+                            "  %v{r}.cond = {compare} {} {}, zeroinitializer",
+                            self.ty(*c),
+                            self.operand(*c)
+                        );
+                        let _ = writeln!(
+                            out,
+                            "  {res}select <{n} x i1> %v{r}.cond, {ty} {}, {ty} {}",
+                            self.operand(*a),
+                            self.operand(*b)
+                        );
+                        return;
+                    }
+                }
                 format!(
-                    "{res}select i1 {}, {ty} {}, {ty} {}",
+                    "{res}select {} {}, {ty} {}, {ty} {}",
+                    self.ty(*c),
                     self.operand(*c),
                     self.operand(*a),
                     self.operand(*b)
@@ -294,17 +660,28 @@ impl Emitter<'_> {
                 // A void call (e.g. the `print` intrinsic) has no result value to type.
                 let ret_ty = match inst.result {
                     Some(r) => self.ty(r),
-                    None => "void".to_string(),
+                    None => self
+                        .declarations
+                        .get(self.interner.resolve(*func))
+                        .map(|s| s.0.clone())
+                        .unwrap_or_else(|| "void".to_string()),
                 };
+                let name = call_name(self.f, *func, args, self.interner, self.overloads);
+                let signature = self.declarations.get(&name);
                 let argstr: Vec<String> = args
                     .iter()
-                    .map(|a| format!("{} {}", self.ty(*a), self.operand(*a)))
+                    .enumerate()
+                    .map(|(k, a)| {
+                        if signature.is_some_and(|s| s.1[k] == "ptr")
+                            && self.f.value_type(*a).is_int()
+                        {
+                            "ptr null".into()
+                        } else {
+                            format!("{} {}", self.ty(*a), self.operand(*a))
+                        }
+                    })
                     .collect();
-                format!(
-                    "{res}call {ret_ty} @{}({})",
-                    self.interner.resolve(*func),
-                    argstr.join(", ")
-                )
+                format!("{res}call {ret_ty} @{}({})", name, argstr.join(", "))
             }
             Op::FuncAddr(func) => {
                 // The address of a function as a `ptr` (an identity GEP keeps it valid IR).
@@ -370,51 +747,12 @@ impl Emitter<'_> {
                     self.operand(*c),
                 )
             }
-            Op::Sqrt(a) => {
-                // `@llvm.sqrt` is the canonical square root; this text path is not the differential
-                // oracle (Cranelift is) and is not assembled here, so the matching intrinsic
-                // `declare` is left to an out-of-process step.
+            Op::Sqrt(a) | Op::Round(_, a) => {
                 let r = inst.result.unwrap();
                 let ty = self.ty(r);
-                let suffix = match self.f.value_type(r) {
-                    MirType::F64 => "f64".to_string(),
-                    MirType::Vec(lane, n) => {
-                        let ls = if matches!(**lane, MirType::F64) {
-                            "f64"
-                        } else {
-                            "f32"
-                        };
-                        format!("v{n}{ls}")
-                    }
-                    _ => "f32".to_string(),
-                };
-                format!("call {ty} @llvm.sqrt.{suffix}({ty} {})", self.operand(*a))
-            }
-            Op::Round(mode, a) => {
-                // Map each mode to its LLVM intrinsic (`roundeven` is round-to-nearest-ties-even,
-                // matching Cranelift `nearest` / `round_ties_even`). Same caveat as `sqrt`: this text
-                // path is not the oracle and not assembled here.
-                let r = inst.result.unwrap();
-                let ty = self.ty(r);
-                let suffix = match self.f.value_type(r) {
-                    MirType::F64 => "f64".to_string(),
-                    MirType::Vec(lane, n) => {
-                        let ls = if matches!(**lane, MirType::F64) {
-                            "f64"
-                        } else {
-                            "f32"
-                        };
-                        format!("v{n}{ls}")
-                    }
-                    _ => "f32".to_string(),
-                };
-                let intr = match mode {
-                    wukong_mir::RoundMode::Nearest => "roundeven",
-                    wukong_mir::RoundMode::Floor => "floor",
-                    wukong_mir::RoundMode::Ceil => "ceil",
-                    wukong_mir::RoundMode::Trunc => "trunc",
-                };
-                format!("call {ty} @llvm.{intr}.{suffix}({ty} {})", self.operand(*a))
+                let name = math_intrinsic(&inst.op, self.f.value_type(r))
+                    .expect("intrinsic types checked before emission");
+                format!("{res}call {ty} @{name}({ty} {})", self.operand(*a))
             }
             Op::VecKernelCall {
                 kernel,
@@ -427,7 +765,11 @@ impl Emitter<'_> {
                 // differential oracle and is not assembled here — the AVX2 body lives only in the
                 // Cranelift backend — so a well-formed, round-trippable call is the faithful form.
                 format!(
-                    "call void @__wukong_veckernel_{kernel}(ptr {}, ptr {}, {} {})",
+                    "{res}call {} @__wukong_veckernel_{}_{kernel}(ptr {}, ptr {}, {} {})",
+                    inst.result
+                        .map(|r| self.ty(r))
+                        .unwrap_or_else(|| "void".into()),
+                    self.interner.resolve(self.f.name),
                     self.operand(*ptrs),
                     self.operand(*scalars),
                     self.ty(*n),
@@ -438,8 +780,61 @@ impl Emitter<'_> {
         let _ = writeln!(out, "  {line}");
     }
 
-    fn emit_term(&self, out: &mut String, t: &Terminator) {
-        let line = match t {
+    fn emit_integer_div(
+        &self,
+        out: &mut String,
+        result: ValueId,
+        op: BinOp,
+        l: ValueId,
+        r: ValueId,
+    ) {
+        let id = result.0;
+        let mir_ty = self.f.value_type(result);
+        let ty = llvm_ty(mir_ty);
+        let bool_ty = match mir_ty {
+            MirType::Vec(_, n) => format!("<{n} x i1>"),
+            _ => "i1".into(),
+        };
+        let one = int_literal(mir_ty, 1);
+        let neg1 = int_literal(mir_ty, -1);
+        let lhs = self.operand(l);
+        let rhs = self.operand(r);
+        let _ = writeln!(out, "  %v{id}.zero = icmp eq {ty} {rhs}, zeroinitializer");
+        let signed = matches!(op, BinOp::SDiv | BinOp::SRem);
+        let danger = if signed {
+            let _ = writeln!(out, "  %v{id}.neg1 = icmp eq {ty} {rhs}, {neg1}");
+            let _ = writeln!(
+                out,
+                "  %v{id}.danger = or {bool_ty} %v{id}.zero, %v{id}.neg1"
+            );
+            format!("%v{id}.danger")
+        } else {
+            format!("%v{id}.zero")
+        };
+        let _ = writeln!(
+            out,
+            "  %v{id}.safe = select {bool_ty} {danger}, {ty} {one}, {ty} {rhs}"
+        );
+        let _ = writeln!(
+            out,
+            "  %v{id}.quot = {} {ty} {lhs}, %v{id}.safe",
+            bin_name(op)
+        );
+        let quotient = if op == BinOp::SDiv {
+            let _ = writeln!(out, "  %v{id}.neg = sub {ty} zeroinitializer, {lhs}");
+            let _ = writeln!(out, "  %v{id}.wrapped = select {bool_ty} %v{id}.neg1, {ty} %v{id}.neg, {ty} %v{id}.quot");
+            format!("%v{id}.wrapped")
+        } else {
+            format!("%v{id}.quot")
+        };
+        let _ = writeln!(
+            out,
+            "  %v{id} = select {bool_ty} %v{id}.zero, {ty} zeroinitializer, {ty} {quotient}"
+        );
+    }
+
+    fn emit_term(&self, out: &mut String, block: &BasicBlock) {
+        let line = match &block.term {
             Terminator::Ret(None) => "ret void".to_string(),
             Terminator::Ret(Some(v)) => format!("ret {} {}", self.ty(*v), self.operand(*v)),
             Terminator::Br { target, .. } => format!("br label %bb{}", target.0),
@@ -448,12 +843,22 @@ impl Emitter<'_> {
                 then_blk,
                 else_blk,
                 ..
-            } => format!(
-                "br i1 {}, label %bb{}, label %bb{}",
-                self.operand(*cond),
-                then_blk.0,
-                else_blk.0
-            ),
+            } => {
+                let else_label = if then_blk == else_blk {
+                    format!("bb{}.else", block.id.0)
+                } else {
+                    format!("bb{}", else_blk.0)
+                };
+                let mut line = format!(
+                    "br i1 {}, label %bb{}, label %{else_label}",
+                    self.operand(*cond),
+                    then_blk.0
+                );
+                if then_blk == else_blk {
+                    let _ = write!(line, "\n{else_label}:\n  br label %bb{}", else_blk.0);
+                }
+                line
+            }
             Terminator::Unreachable => "unreachable".to_string(),
         };
         let _ = writeln!(out, "  {line}");
@@ -516,7 +921,7 @@ fn cmp_instr(op: CmpOp) -> (&'static str, &'static str) {
         Ugt => ("icmp", "ugt"),
         Uge => ("icmp", "uge"),
         Foeq => ("fcmp", "oeq"),
-        Fone => ("fcmp", "one"),
+        Fone => ("fcmp", "une"),
         Folt => ("fcmp", "olt"),
         Fole => ("fcmp", "ole"),
         Fogt => ("fcmp", "ogt"),
@@ -542,13 +947,31 @@ fn cast_name(kind: CastKind) -> &'static str {
     }
 }
 
-fn fmt_float(v: f64) -> String {
-    if v == v.trunc() && v.is_finite() {
-        format!("{v:.1}")
-    } else {
-        format!("{v:?}")
+// LLVM's hexadecimal float spelling uses the bits of an exactly widened double for f32.
+// This handles tiny values, signed zero, infinities and NaNs without decimal representability
+// restrictions. Low-precision literals share the runtime's rounding contract.
+fn int_literal(ty: &MirType, value: i64) -> String {
+    match ty {
+        MirType::Vec(lane, n) => format!(
+            "<{}>",
+            vec![format!("{} {value}", llvm_ty(lane)); *n as usize].join(", ")
+        ),
+        _ => value.to_string(),
     }
 }
+
+fn fmt_float(v: f64, ty: &MirType) -> String {
+    match ty {
+        MirType::F16 => format!("0xH{:04X}", wukong_runtime::f32_to_f16_bits(v as f32)),
+        MirType::BF16 => format!("0xR{:04X}", wukong_runtime::f32_to_bf16_bits(v as f32)),
+        MirType::F32 => format!("0x{:016X}", (v as f32 as f64).to_bits()),
+        MirType::F64 => format!("0x{:016X}", v.to_bits()),
+        _ => unreachable!("floating constant has non-floating type"),
+    }
+}
+
+#[cfg(test)]
+mod closeout_tests;
 
 #[cfg(test)]
 mod tests {

@@ -11,6 +11,7 @@ rust-version.workspace = true
 wukong_span = { workspace = true }
 wukong_mir = { workspace = true }
 wukong_backend = { workspace = true }
+wukong_runtime = { workspace = true }
 
 [dev-dependencies]
 wukong_parser = { workspace = true }
