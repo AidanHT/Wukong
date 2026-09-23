@@ -839,15 +839,12 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   no trip-count requirement for an elementwise body; only a float *reduction* needs a
   compile-time-known trip ≥ 2048; the recognized kernels get 256-bit AVX2 via the
   runtime microkernels.)
-- **Attributes** other than `@parallel`, `@generic`, and `@tile`: **parsed but not consumed.**
-  `@simd`/`@align`/`@extern`/`@export` are shaped by the parser and then ignored — there is no
-  name check, so an unknown or misspelled attribute (`@bogus(nonsense = 3)`, `@align(3)`) compiles
-  clean with no diagnostic, and no crate reads them (`wukong_sema` never inspects `.attrs`). The single
-  consumer in the tree is `mir_build`'s `has_parallel_attr`, a name test for `"parallel"`; even
-  `@parallel`'s own arguments (e.g. `grain = …`) are parsed and discarded. `E0207` fires only for a
-  malformed argument such as a missing value after `=`. (`@parallel` itself executes — see above.)
-  `@tile` is consumed as loop strip-mining, and a `@tile` that cannot be applied is `E0309` rather
-  than a silent drop; `@generic` opts out of recognizers (see above).
+- **Attributes:** sema validates the closed set `@parallel`, `@generic`, `@tile`, `@extern`,
+  `@inline`, `@simd`, `@align`, and `@export`; unknown names and restricted-placement violations
+  report `E0306`. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
+  behavior and C ABI interop remain incomplete. `@parallel` executes, though its scheduling
+  arguments are not consumed; `@generic` opts out of recognizers. `@tile` performs loop
+  strip-mining and reports `E0309` when it cannot apply. Malformed attribute syntax reports `E0207`.
 - **Non-contiguous tensor layouts** `.col_major` / `.strided` / `.tiled(N, M)`: they parse (an unknown
   layout name is `E0204`), they are part of the tensor type, and they are enforced across a call
   boundary — passing a `.col_major` tensor to a `Contiguous`-typed parameter is `E0502`. **`.col_major`

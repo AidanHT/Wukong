@@ -88,9 +88,9 @@ not duplicate them. In summary, Wukong:
   `--backend=gpu-native` can compile an eligible whole program into a cooperative megakernel. These
   recognizers are invisible to the user — you still write the loop nest in `.wk`.
 - **Interop (planned).** A clean C ABI (`@extern("C")` / `@export`) is designed to call into
-  BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. The attributes parse today but are
-  neither validated nor consumed (an unknown attribute name is accepted silently); symbol
-  export/import is not yet wired (see the roadmap).
+  BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. Attribute names are validated against
+  the closed language set; unknown names report `E0306`. General C ABI symbol export/import
+  remains planned (see the roadmap).
 
 ## Runs the real GPT-2 124M end-to-end
 

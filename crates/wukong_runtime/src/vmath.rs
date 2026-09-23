@@ -8,8 +8,9 @@
 //! transcendental ones are *compute*-bound (a ~20-flop minimax polynomial per element, more for the
 //! composed ones), so doubling the SIMD width nearly doubles throughput. The transcendental
 //! activations all build on the shared `exp`/`log` polynomials (e.g. `silu = x·sigmoid`,
-//! `softplus = ln(1+eˣ)`, `mish = x·tanh(softplus)`, `selu` = scaled `elu`), so one ≈1-ULP `exp` keeps
-//! the family accurate; the piecewise ones (`relu`, `leaky_relu`, `hardsigmoid`, `hardswish`) use
+//! `softplus = ln(1+eˣ)`, `mish = x·tanh(softplus)`, `selu` = scaled `elu`). Accuracy is operation-
+//! and range-specific: the recorded finite sweeps bound exp at 2 ULP and positive-normal log at
+//! 12 ULP; composed operations need their own error checks. The piecewise operations use
 //! min/max whose scalar twins match the AVX2 `max_ps`/`min_ps` bit-for-bit (incl. NaN/±0). All are
 //! bit-identical across backends.
 //!
