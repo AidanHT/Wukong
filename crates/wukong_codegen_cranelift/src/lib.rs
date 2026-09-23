@@ -1015,6 +1015,14 @@ impl<'a> FnTranslator<'a> {
         let from_ty = self.dfg_ty(x);
         let to_ty = cl_type(to, self.ptr_ty).unwrap_or(self.ptr_ty);
         use CastKind::*;
+        if matches!(to, MirType::I1) && matches!(kind, FpToSi | FpToUi) {
+            // MIR's boolean fp-cast contract saturates at i32/u32 width, then keeps
+            // the low bit. I1 uses an I8 register, but clamping at I8/U8 would change
+            // parity above 127/255 (128.0 and 256.0 must both become false).
+            let wide = self.fcvt_to_int_sat(x, types::I32, kind == FpToSi);
+            // lower_inst applies the ordinary I1 low-bit normalization afterwards.
+            return self.builder.ins().ireduce(to_ty, wide);
+        }
         match kind {
             SExt => self.resize_int(x, from_ty, to_ty, true),
             ZExt | Trunc => self.resize_int(x, from_ty, to_ty, false),
