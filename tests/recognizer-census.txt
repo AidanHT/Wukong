@@ -276,7 +276,7 @@ parallel_reduce.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*3
 parallel_reduce_elem_bf16.wk:
 parallel_reduce_lowp.wk: wukong_dot_bf16_parallel wukong_reduce_bf16_parallel wukong_reduce_f16_parallel wukong_sum_bf16_parallel wukong_sum_bf16_parallel*2 wukong_sum_f16_parallel
 parallel_reduce_minmax.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*2
-parallel_region_alias.wk: veckernel*1
+parallel_region_alias.wk:
 parallel_region_decline.wk: wukong_velem_f32_parallel
 parallel_region_reassigned_local.wk: veckernel*2
 pointer.wk:
