@@ -16669,14 +16669,38 @@ impl FnLowerer<'_> {
         Some((r, value, None))
     }
 
+    /// Prepare the reduction's logical eight-lane partition independently of the selected ISA.
+    /// Register pressure can reduce U, so both widths must consume this exact recipe/plan.
+    fn prepare_reduction<'b>(
+        &self,
+        addend: &'b Expr,
+        j: Symbol,
+        redop: RedOp,
+    ) -> Option<(VecRecipe<'b>, VecKernel)> {
+        let op = match redop {
+            RedOp::Add => VecRedOp::Add,
+            RedOp::Fmax => VecRedOp::Fmax,
+            RedOp::Fmin => VecRedOp::Fmin,
+        };
+        let (recipe, value, fma) = self.build_reduce_recipe(addend, j, redop == RedOp::Add)?;
+        let kern = VecKernel {
+            name: self.builder.func_name(),
+            streams: recipe.streams.len() as u32,
+            scalars: recipe.scalars.len() as u32,
+            ops: recipe.ops.clone(),
+            unroll: VEC_UNROLL,
+            reduce: Some(VecReduce { op, value, fma }),
+        };
+        kern.reduction_fits().then_some((recipe, kern))
+    }
+
     /// Emit the 256-bit AVX2 reduction path for `s <fold>= addend` over `[s0, end)`: fold the addend
     /// across 8-wide lane accumulators (kernel), combine with the initial `s`, then a scalar tail.
-    /// Returns false (emitting nothing) if the addend can't be an f32 reduction kernel that fits — the
-    /// caller then keeps the 128-bit reduction. The reassociated form is the oracle (both backends run
-    /// `eval_reduction`'s exact grouping); the initial-`s` combine and the tail reuse the same
-    /// `fold` the 128-bit path uses, so all three of interp/native and -O0/-O3 agree.
+    /// The caller has prepared a fitting recipe shared with the portable partition. Both backends run
+    /// `eval_reduction`'s exact grouping; the initial-`s` combine and the tail reuse the same
+    /// `fold` the 128-bit path uses, preserving the arithmetic across widths and backends.
     #[allow(clippy::too_many_arguments)]
-    fn try_emit_reduction_256(
+    fn emit_reduction_256(
         &mut self,
         j: Symbol,
         s0: ValueId,
@@ -16685,32 +16709,9 @@ impl FnLowerer<'_> {
         s_sym: Symbol,
         addend: &Expr,
         redop: RedOp,
-    ) -> bool {
-        let vred = match redop {
-            RedOp::Add => VecRedOp::Add,
-            RedOp::Fmax => VecRedOp::Fmax,
-            RedOp::Fmin => VecRedOp::Fmin,
-        };
-        // Only a sum fuses a product into its accumulate (`vfmadd`); max/min have no fused form.
-        let fuse_mul = matches!(redop, RedOp::Add);
-        let Some((recipe, value, fma)) = self.build_reduce_recipe(addend, j, fuse_mul) else {
-            return false;
-        };
-        let kern = VecKernel {
-            name: self.builder.func_name(),
-            streams: recipe.streams.len() as u32,
-            scalars: recipe.scalars.len() as u32,
-            ops: recipe.ops.clone(),
-            unroll: VEC_UNROLL,
-            reduce: Some(VecReduce {
-                op: vred,
-                value,
-                fma,
-            }),
-        };
-        if !kern.reduction_fits() {
-            return false;
-        }
+        recipe: VecRecipe<'_>,
+        kern: VecKernel,
+    ) {
         let kidx = self.builder.add_vec_kernel(kern);
 
         // n = largest multiple of 8 ≤ trip count (0 if under 8 / negative), like the elementwise path.
@@ -16835,6 +16836,12 @@ impl FnLowerer<'_> {
             .builder
             .build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
         let combined = self.reduce_combine_scalar(redop, &s_ty, s_init, r);
+        // With no complete vector group there is no reduction result to combine. Folding the
+        // identity first can change a signed-zero or NaN seed before the scalar-only tail.
+        let no_groups = self.builder.build(MirType::I1, Op::Cmp(CmpOp::Eq, n, zero));
+        let combined = self
+            .builder
+            .build(s_ty.clone(), Op::Select(no_groups, s_init, combined));
         self.builder.build_void(Op::Store {
             ptr: s_slot,
             value: combined,
@@ -16853,14 +16860,13 @@ impl FnLowerer<'_> {
         self.emit_reduction_tail(j, tslot, end_v, ity, s_sym, addend, redop);
 
         self.pop_scope();
-        true
     }
 
-    /// Emit a vectorized float reduction over `[s0, end)`: `VEC_UNROLL` independent vector-lane
-    /// accumulators summed in an unrolled main loop, a single-vector cleanup loop, then a horizontal
-    /// reduce of the lanes into `s`, then a scalar remainder. This reassociates the sum (vs strict
-    /// left-to-right), which is sound for a reduction and is what makes it fast — `w` lanes × unroll
-    /// independent FMA chains instead of one serial dependency.
+    /// Emit a vectorized float reduction over `[s0, end)`. Fitting f32 recipes use the same
+    /// pressure-limited eight-lane accumulator partition at both widths, followed by one seed fold
+    /// and a scalar remainder. Other reductions retain their existing lane-width/unroll policy.
+    /// This permitted reassociation creates independent accumulator chains; it does not promise
+    /// the result of a strict left-to-right scalar fold.
     #[allow(clippy::too_many_arguments)]
     fn emit_reduction(
         &mut self,
@@ -16875,25 +16881,29 @@ impl FnLowerer<'_> {
         redop: RedOp,
         known_trip: Option<u64>,
     ) {
-        // First try the 256-bit AVX2 reduction kernel (f32 sum/max/min): fold the addend across
-        // 8-wide lane accumulators and return the horizontal result, with a scalar tail. The
-        // reassociation is the oracle (both backends run the identical `eval_reduction` order). Falls
-        // through to the 128-bit CLIF reduction below when the addend isn't an f32 recipe or won't fit,
-        // or when the trip isn't known to be large enough to amortize the out-of-line call (the 256-bit
-        // path loses to the inlined 128-bit reduction on small arrays — see `VEC256_REDUCTION_MIN_TRIP`).
-        // `host_supports_vec_kernels()` mirrors the elementwise gate above: the recipe is only worth
-        // building where `avx2::assemble_kernel` can turn it into bytes, otherwise the whole compile
-        // hard-fails in `populate_module` instead of falling back. Single-sourced in `wukong_mir`.
+        // Choose the arithmetic partition before the ISA/ABI/trip/kill-switch gate. Portable CLIF
+        // represents each logical eight-lane accumulator with two four-lane vectors; it must also
+        // match the pressure-limited U, cleanup groups and final fold order of the raw wide kernel.
+        let prepared = if *lane == MirType::F32 && w == 4 {
+            self.prepare_reduction(addend, j, redop)
+        } else {
+            None
+        };
+        let logical_unroll = prepared.as_ref().map(|(_, kern)| kern.reduction_unroll());
         let trip_ok = known_trip.is_some_and(|t| t >= VEC256_REDUCTION_MIN_TRIP);
         if trip_ok
             && *lane == MirType::F32
             && self.gemm.vec_kernels
             && host_supports_vec_kernels()
             && std::env::var_os("WUKONG_P4_NO_256").is_none()
-            && self.try_emit_reduction_256(j, s0, end_v, ity, s_sym, addend, redop)
         {
-            return;
+            if let Some((recipe, kern)) = prepared {
+                self.emit_reduction_256(j, s0, end_v, ity, s_sym, addend, redop, recipe, kern);
+                return;
+            }
         }
+        let halves = if logical_unroll.is_some() { 2 } else { 1 };
+        let unroll = logical_unroll.unwrap_or(VEC_UNROLL) * halves;
         let vty = MirType::Vec(Box::new(lane.clone()), w);
         let slot = self.builder.alloca(ity.clone());
         self.builder.build_void(Op::Store {
@@ -16902,7 +16912,7 @@ impl FnLowerer<'_> {
         });
         let jtmp = self.builder.alloca(ity.clone());
 
-        // `VEC_UNROLL` accumulators, each `w` contiguous lanes (an `Array` slot so the vector
+        // `unroll` physical accumulators, each `w` contiguous lanes (an `Array` slot so the vector
         // store/load address `w` real elements), initialised to the fold's identity before the
         // loop: 0 for a sum, -inf for `fmax`, +inf for `fmin` (so empty tail lanes never win).
         let vid = match redop {
@@ -16913,7 +16923,7 @@ impl FnLowerer<'_> {
             RedOp::Fmax => self.splat_const_f(f64::NEG_INFINITY, &vty),
             RedOp::Fmin => self.splat_const_f(f64::INFINITY, &vty),
         };
-        let accs: Vec<ValueId> = (0..VEC_UNROLL)
+        let accs: Vec<ValueId> = (0..unroll)
             .map(|_| {
                 let a = self
                     .builder
@@ -16927,7 +16937,7 @@ impl FnLowerer<'_> {
         self.bind(j, slot, ity.clone());
 
         self.emit_reduction_strip(
-            j, slot, jtmp, end_v, ity, lane, &vty, w, VEC_UNROLL, &accs, addend, redop,
+            j, slot, jtmp, end_v, ity, lane, &vty, w, unroll, &accs, addend, redop,
         );
         self.emit_reduction_strip(
             j,
@@ -16938,11 +16948,18 @@ impl FnLowerer<'_> {
             lane,
             &vty,
             w,
-            1,
-            &accs[..1],
+            halves,
+            &accs[..halves as usize],
             addend,
             redop,
         );
+
+        if halves == 2 {
+            self.finish_portable_reduction_256(&accs, slot, s0, ity, s_sym, lane, &vty, redop);
+            self.emit_reduction_tail(j, slot, end_v, ity, s_sym, addend, redop);
+            self.pop_scope();
+            return;
+        }
 
         // Combine the accumulators, then horizontally reduce the lanes into `s` with the same fold
         // (sum / max / min) the loop body used.
@@ -16988,6 +17005,88 @@ impl FnLowerer<'_> {
 
         self.emit_reduction_tail(j, slot, end_v, ity, s_sym, addend, redop);
         self.pop_scope();
+    }
+
+    /// Reconstruct the wide kernel's final fold without changing its operation/operand order.
+    /// Pair 2u/2u+1 holds logical accumulator u's low/high halves. Combine corresponding halves
+    /// across u first, then fold lanes 0..7, then fold that result into the original scalar seed.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_portable_reduction_256(
+        &mut self,
+        accs: &[ValueId],
+        index_slot: ValueId,
+        start: ValueId,
+        ity: &MirType,
+        s_sym: Symbol,
+        lane: &MirType,
+        vty: &MirType,
+        redop: RedOp,
+    ) {
+        let scratch = self
+            .builder
+            .alloca(MirType::Array(Box::new(lane.clone()), 8));
+        for half in 0..2 {
+            let mut total = self
+                .builder
+                .build(vty.clone(), Op::Load(accs[half], vty.clone()));
+            for &slot in accs.iter().skip(half + 2).step_by(2) {
+                let next = self.builder.build(vty.clone(), Op::Load(slot, vty.clone()));
+                total = self.reduce_combine_vec(redop, lane, vty, 4, total, next);
+            }
+            let offset = self
+                .builder
+                .build(MirType::I64, Op::ConstInt((half * 4) as i128, MirType::I64));
+            let addr = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: scratch,
+                    index: offset,
+                    elem: lane.clone(),
+                },
+            );
+            self.builder.build_void(Op::Store {
+                ptr: addr,
+                value: total,
+            });
+        }
+        let mut result = self
+            .builder
+            .build(lane.clone(), Op::Load(scratch, lane.clone()));
+        for k in 1..8 {
+            let offset = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(k, MirType::I64));
+            let addr = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: scratch,
+                    index: offset,
+                    elem: lane.clone(),
+                },
+            );
+            let next = self
+                .builder
+                .build(lane.clone(), Op::Load(addr, lane.clone()));
+            result = self.reduce_combine_scalar(redop, lane, result, next);
+        }
+        let (s_slot, s_ty) = self.lookup(s_sym).expect("reduction var in scope");
+        let seed = self
+            .builder
+            .build(s_ty.clone(), Op::Load(s_slot, s_ty.clone()));
+        let combined = self.reduce_combine_scalar(redop, &s_ty, seed, result);
+        let end = self
+            .builder
+            .build(ity.clone(), Op::Load(index_slot, ity.clone()));
+        let no_groups = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Eq, start, end));
+        let selected = self
+            .builder
+            .build(s_ty.clone(), Op::Select(no_groups, seed, combined));
+        self.builder.build_void(Op::Store {
+            ptr: s_slot,
+            value: selected,
+        });
     }
 
     /// One strip of the reduction main loop: while a full `unroll*W` block fits, fold `unroll`

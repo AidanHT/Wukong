@@ -916,14 +916,14 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   **platform-gated**: `wukong_mir::host_supports_vec_kernels()` requires x86-64 **Windows** with
   runtime AVX2 + FMA3, because the Win64 argument registers (rcx/rdx/r8) are literal in the emitted
   bytes and there is no in-kernel dispatch. Both ends consult that one predicate — the vectorizer
-  declines to build the recipe off-gate (so the loop stays 128-bit, and everything still compiles and
+  declines to emit a kernel call off-gate (so the loop stays 128-bit, and everything still compiles and
   runs), and `assemble_kernel` refuses as a backstop rather than emit non-executable code.
-  `WUKONG_P4_NO_256=1` forces the 128-bit CLIF path and is **result-identical** — the 256-bit recipe contracts `x + y*z` into one FMA exactly like
-  its scalar tail, so the knob changes instruction selection and never the answer (pinned by
-  `p4_kill_switch_is_result_identical`). Below that
-  threshold an out-of-line 256-bit reduction call would lose to the inlined 128-bit path, so small or
-  runtime-unknown *reduction* trips stay 128-bit + 4× unrolling; there compute-bound kernels use 2×
-  the FMA ports they could, but the vectorized **transcendentals still beat scalar `libm` ~2.5–3×**.
+  `WUKONG_P4_NO_256=1` forces the 128-bit CLIF path and is **result-identical** for the supported
+  recipes. Elementwise FMA contraction is pinned by `p4_kill_switch_is_result_identical`; reductions
+  use the same pressure-limited logical eight-lane partition at both widths, pinned by
+  `reduction_partition_is_independent_of_width_and_threshold` with cancellation and exceptional-value
+  oracles. Below the call threshold, small or runtime-unknown reduction trips use paired four-lane
+  vectors to reproduce that partition. The portable register/MIR cost remains unmeasured.
   The AST loop vectorizer requires a disjointness proof for differently named buffers paired
   with a write. Potentially aliased parameters retain scalar execution; named parameters alone
   do not imply non-aliasing. `parallel_dependence.wk` checks the shifted in-place recurrence
