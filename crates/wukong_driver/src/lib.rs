@@ -1004,7 +1004,17 @@ fn try_runtime_rlibs(
 ) -> std::io::Result<Option<(PathBuf, std::process::Output)>> {
     let mut last = None;
     for candidate in candidates {
-        let output = attempt(&candidate.path)?;
+        let output = match attempt(&candidate.path) {
+            Ok(output) => output,
+            // Once rustc has rejected an archive, the link has a real compiler failure.
+            // A later spawn/I/O error must not erase that diagnostic and enable the C fallback.
+            Err(error) => {
+                return match last {
+                    Some(previous) => Ok(Some(previous)),
+                    None => Err(error),
+                }
+            }
+        };
         let retry = !output.status.success() && incompatible_runtime_metadata(&output.stderr);
         last = Some((candidate.path, output));
         if !retry {
@@ -2423,6 +2433,61 @@ mod verify_gate_tests {
 #[cfg(test)]
 mod native_link_tests {
     use super::*;
+
+    #[test]
+    fn runtime_archive_selection_preserves_metadata_failure_when_retry_cannot_spawn() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        let candidates = || {
+            ["first", "second"]
+                .into_iter()
+                .map(|name| RlibCandidate {
+                    path: PathBuf::from(name),
+                    uplifted: false,
+                    mtime: secs(1),
+                })
+                .collect()
+        };
+        let mut attempts = 0;
+        let diagnostic = b"error[E0514]: incompatible runtime compiler version\n";
+        let (path, failure) = try_runtime_rlibs(candidates(), |_| {
+            attempts += 1;
+            if attempts == 1 {
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(256),
+                    stdout: Vec::new(),
+                    stderr: diagnostic.to_vec(),
+                })
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "rustc removed during retry",
+                ))
+            }
+        })
+        .expect("a previous rustc rejection must remain a compiler failure")
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(path, PathBuf::from("first"));
+        assert!(!failure.status.success());
+        assert_eq!(failure.stderr, diagnostic);
+
+        // Before rustc produces any diagnostic, inability to start it still permits fallback.
+        let mut attempts = 0;
+        let unavailable = try_runtime_rlibs(candidates(), |_| {
+            attempts += 1;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "rustc unavailable",
+            ))
+        })
+        .expect_err("initial spawn failure must remain unavailable");
+        assert_eq!(attempts, 1);
+        assert_eq!(unavailable.kind(), std::io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn runtime_archive_selection_retries_a_newer_incompatible_compiler() {
