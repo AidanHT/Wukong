@@ -4731,6 +4731,45 @@ fn matmul_nest_lowers_to_sgemm() {
 /// The mutation below is exactly the drift the guard exists for: a recognizer in `mir_build`
 /// changing a kernel's operand list without updating the matching arm here.
 #[test]
+fn unknown_runtime_symbol_fails_the_compile() {
+    use wukong_mir::{Builder, MirType, Op, Program};
+    let mut interner = Interner::new();
+    let main = interner.intern("main");
+    let unknown = interner.intern("wukong_not_a_real_kernel");
+    let mut builder = Builder::new(main, MirType::I32);
+    builder.build_void(Op::Call { func: unknown, args: vec![] });
+    let zero = builder.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+    builder.ret(Some(zero));
+    let mut program = Program::new();
+    program.funcs.push(builder.finish());
+    let err = crate::jit_compile(&program, main, &interner).err()
+        .expect("an unknown runtime call must not disappear from native code");
+    assert!(err.contains("wukong_not_a_real_kernel"), "{err}");
+    let err = crate::emit_object(&program, &interner).err()
+        .expect("object code must also reject an unknown runtime call");
+    assert!(err.contains("wukong_not_a_real_kernel"), "{err}");
+}
+
+#[test]
+fn unknown_external_symbol_fails_the_compile() {
+    use wukong_mir::{Builder, MirType, Op, Program};
+    let mut interner = Interner::new();
+    let main = interner.intern("main");
+    let unknown = interner.intern("unbound_foreign_function");
+    let mut builder = Builder::new(main, MirType::I32);
+    let value = builder.build(MirType::I32, Op::Call { func: unknown, args: vec![] });
+    builder.ret(Some(value));
+    let mut program = Program::new();
+    program.funcs.push(builder.finish());
+    let err = crate::jit_compile(&program, main, &interner).err()
+        .expect("an unbound external call must not disappear from native code");
+    assert!(err.contains("unsupported external call `unbound_foreign_function`"), "{err}");
+    let err = crate::emit_object(&program, &interner).err()
+        .expect("object code must also reject an unbound external call");
+    assert!(err.contains("unbound_foreign_function"), "{err}");
+}
+
+#[test]
 fn runtime_kernel_with_unhandled_arity_fails_the_compile() {
     let src = "module m\nfn mm(a:[f32;64],b:[f32;64],mut c:[f32;64]) { \
                for i in 0..8 { for k in 0..8 { let aik: f32 = a[i*8+k]; \
