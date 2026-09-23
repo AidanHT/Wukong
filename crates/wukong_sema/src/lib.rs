@@ -17,7 +17,8 @@
 //! belongs to the driver's import loader.
 //!
 //! [`check`] is the sole entry point, and its stage order is load-bearing: `collect` (register every
-//! top-level definition with its signature lowered) → `check_recursive_types` →
+//! top-level definition with its signature lowered) → `refresh_collected_types` (resolve forward
+//! extents) → `check_recursive_types` →
 //! `check_recursive_consts` → set `checking_bodies` → `recheck_item_signatures` → `check_bodies`.
 //! Several diagnostics are gated on the `checking_bodies` flag so they fire only once every generic
 //! and `const` is registered.
@@ -345,6 +346,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     // module whose bodies do not resolve.
     attrs::check(module, interner, &mut s.diags);
     s.collect(module);
+    s.refresh_collected_types(module);
     s.check_recursive_types(module);
     s.check_recursive_consts(module);
     // The undeclared-tensor-dimension check (`lower_dim`) fires only from here on: by the body pass
@@ -568,6 +570,86 @@ impl<'a> Sema<'a> {
                 }
                 ItemKind::Import(_) => {}
             }
+        }
+    }
+
+    /// Resolve declaration types again after every const and enum is registered. In the first
+    /// collection pass a forward extent is unresolved; it must not remain a recovery type in a
+    /// callable signature or a field. Diagnostics still belong to the existing body/recheck passes.
+    fn refresh_collected_types(&mut self, module: &Module) {
+        let before = self.diags.len();
+        // Consts can refer to enums declared after them; discard folds from partial collection.
+        self.const_lengths.get_mut().clear();
+        for item in &module.items {
+            let replacement = match &item.kind {
+                ItemKind::Fn(f) => Some((f.name.sym, DefKind::Fn(self.resolved_fn_sig(f)))),
+                ItemKind::Const(c) => Some((c.name.sym, DefKind::Const(self.lower_type(&c.ty)))),
+                ItemKind::Struct(s) => {
+                    self.generics = generic_names(&s.generics);
+                    let fields = s
+                        .fields
+                        .iter()
+                        .map(|f| (f.name.sym, self.lower_type(&f.ty)))
+                        .collect();
+                    self.generics.clear();
+                    Some((s.name.sym, DefKind::Struct(fields)))
+                }
+                ItemKind::Enum(e) => {
+                    let Some(DefKind::Enum(mut variants)) =
+                        self.defs.lookup(e.name.sym).map(|d| d.kind.clone())
+                    else {
+                        continue;
+                    };
+                    self.generics = generic_names(&e.generics);
+                    for (variant, decl) in variants.iter_mut().zip(&e.variants) {
+                        variant.payload = match &decl.data {
+                            VariantData::Unit => VariantPayload::Unit,
+                            VariantData::Tuple(ts) => VariantPayload::Tuple(
+                                ts.iter().map(|t| self.lower_type(t)).collect(),
+                            ),
+                            VariantData::Struct(fs) => VariantPayload::Struct(
+                                fs.iter()
+                                    .map(|f| (f.name.sym, self.lower_type(&f.ty)))
+                                    .collect(),
+                            ),
+                        };
+                    }
+                    self.generics.clear();
+                    Some((e.name.sym, DefKind::Enum(variants)))
+                }
+                ItemKind::Extern(block) => {
+                    for f in &block.items {
+                        let sig = self.resolved_fn_sig(f);
+                        if let Some(&index) = self.defs.by_name.get(&f.name.sym) {
+                            self.defs.defs[index].kind = DefKind::Fn(sig);
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some((name, kind)) = replacement {
+                if let Some(&index) = self.defs.by_name.get(&name) {
+                    self.defs.defs[index].kind = kind;
+                }
+            }
+        }
+        self.diags.truncate(before);
+    }
+
+    fn resolved_fn_sig(&mut self, f: &FnDecl) -> FnSig {
+        self.generics = generic_names(&f.generics);
+        let params = f.params.iter().map(|p| self.lower_type(&p.ty)).collect();
+        let ret = f
+            .ret
+            .as_ref()
+            .map(|t| self.lower_type(t))
+            .unwrap_or(Ty::Unit);
+        self.generics.clear();
+        FnSig {
+            generics: f.generics.iter().map(generic_param_sym).collect(),
+            params,
+            ret,
         }
     }
 
@@ -947,9 +1029,12 @@ impl<'a> Sema<'a> {
             TypeKind::Slice(e) => Ty::Slice(Box::new(self.lower_type(e))),
             TypeKind::Array { elem, len, shared } => {
                 let elem = Box::new(self.lower_type(elem));
+                let Some(len) = self.array_len(len) else {
+                    return Ty::Error;
+                };
                 Ty::Array {
                     elem,
-                    len: self.array_len(len),
+                    len,
                     shared: *shared,
                 }
             }
@@ -1105,20 +1190,20 @@ impl<'a> Sema<'a> {
         self.const_lengths.get_mut().clear();
     }
 
-    /// A fixed-size array's compile-time length, with the two diagnostics `eval_usize` cannot report
-    /// (it is `&self`, and every caller wants a number): an unresolvable length NAME, and a length
-    /// beyond what lowering can represent. MIR array extents are u32; lowering now folds the same
+    /// A fixed-size array's compile-time length, or `None` for an unreadable/out-of-range extent.
+    /// A valid zero extent is `Some(0)`; callers use `Ty::Error` for recovery, never a fake length.
+    /// MIR array extents are u32; lowering now folds the same
     /// u64 operands and checks the final conversion. Historically, `[i32; 0x1_0000_0001]` was bounds
     /// checked here against 4294967297 while the emitted slot held 1 element. Both point at
     /// the length expression and are gated on `checking_bodies` exactly like the E0504 dim check, so
     /// a signature re-lowered by `check_fn` is reported once (see the flag's doc-comment).
-    fn array_len(&mut self, len: &Expr) -> u64 {
+    fn array_len(&mut self, len: &Expr) -> Option<u64> {
         // The length expression must be one the compile-time folder can actually READ, and the same
         // `checking_bodies` gate applies as to the E0504 dim check for the same reason: `collect`
         // registers consts as it walks, so a const declared after this item is only guaranteed
         // visible in the body pass. `array_len_is_const` documents what happens when it cannot.
-        if self.checking_bodies {
-            self.array_len_is_const(len, 0, true);
+        if !self.array_len_is_const(len, 0, self.checking_bodies) {
+            return None;
         }
         let n = self.eval_usize(len);
         if n > u32::MAX as u64 && self.checking_bodies {
@@ -1132,7 +1217,7 @@ impl<'a> Sema<'a> {
                 ),
             );
         }
-        n
+        (n <= u32::MAX as u64).then_some(n)
     }
 
     /// Whether the array-length expression `e` is a form the compile-time folder can READ, reporting
@@ -1191,7 +1276,14 @@ impl<'a> Sema<'a> {
                 let sym = p.first().sym;
                 // `self.consts` holds AST references borrowed from the module, not from `self`, so
                 // the copy here outlives the `&mut self` calls below.
-                if let Some(init) = self.consts.get(&sym).copied() {
+                // A generic shadows a top-level const, just as in lower_dim. Its unreadable
+                // extent must not accidentally become that const's (possibly zero) length.
+                if let Some(init) = self
+                    .consts
+                    .get(&sym)
+                    .copied()
+                    .filter(|_| !self.generics.contains(&sym))
+                {
                     if self.array_len_is_const(init, depth + 1, false) {
                         return true;
                     }
@@ -1221,6 +1313,17 @@ impl<'a> Sema<'a> {
                                  type — use `Tensor[T, {nm}]`, whose dimension is bound per \
                                  call site, or a `const`"
                             ),
+                        );
+                    }
+                    return false;
+                }
+                if self.lookup_local(sym).is_some() {
+                    if report {
+                        let nm = self.sym_str(sym).to_string();
+                        self.error(
+                            e.span,
+                            "E0406",
+                            format!("array length `{nm}` is a runtime value, not a compile-time constant"),
                         );
                     }
                     return false;
@@ -1704,13 +1807,17 @@ impl<'a> Sema<'a> {
     ///
     /// Deliberately narrower than `let`'s rule, because this fires in contexts the fixture corpus
     /// exercises far more thinly: only when both sides are aggregates whose layout is fully
-    /// determined here (see `is_concrete_layout`). A generic type variable, a zero-length array
-    /// (`array_len`'s "could not fold" sentinel as much as a real `[T; 0]`), a tensor, and
+    /// determined here (see `is_concrete_layout`). A generic type variable, a tensor, and
     /// `Unknown`/`Error` all stay lenient, per the crate-wide rule that errors are reserved for
     /// what can be PROVED wrong.
     fn aggregate_type_clash(&self, place: &Ty, value: &Ty) -> bool {
         if place.is_unknown() || value.is_unknown() || place.is_error() || value.is_error() {
             return false;
+        }
+        // A fixed extent/arity is known even when a leaf element is a generic type variable.
+        // In particular [T; 0] cannot become [T; 1] while checking a generic function body.
+        if fixed_aggregate_shape_clash(place, value) {
+            return true;
         }
         if !self.is_concrete_aggregate(place) || !self.is_concrete_aggregate(value) {
             return false;
@@ -1795,16 +1902,16 @@ impl<'a> Sema<'a> {
 
     /// Whether every leaf of `t` has a layout known here. Tensors are excluded on purpose: their
     /// agreement is the shape unifier's job (`unify` in rigid mode), which reports the dimension by
-    /// name. `Unit`, `Fn`, `Unknown` and `Error` are excluded by the leniency rule.
+    /// name. `Fn`, `Unknown` and `Error` are excluded by the leniency rule. A zero extent is real:
+    /// unreadable extents are `Ty::Error`, never a numeric sentinel. Empty literals have an unknown
+    /// element type but a known zero-byte layout, so their extent must still agree.
     fn is_concrete_layout(&self, t: &Ty) -> bool {
         match t {
-            Ty::Scalar(_) | Ty::Vector { .. } => true,
+            Ty::Unit | Ty::Scalar(_) | Ty::Vector { .. } => true,
             Ty::Ptr { pointee, .. } | Ty::Ref { pointee, .. } => self.is_concrete_layout(pointee),
             Ty::Slice(e) => self.is_concrete_layout(e),
-            Ty::Array { elem, len, .. } => *len > 0 && self.is_concrete_layout(elem),
-            Ty::Tuple(items) => {
-                !items.is_empty() && items.iter().all(|i| self.is_concrete_layout(i))
-            }
+            Ty::Array { elem, len, .. } => *len == 0 || self.is_concrete_layout(elem),
+            Ty::Tuple(items) => items.iter().all(|i| self.is_concrete_layout(i)),
             Ty::Named(n) => self.is_declared_named_ty(*n) && !self.generics.contains(n),
             _ => false,
         }
@@ -3777,8 +3884,10 @@ impl<'a> Sema<'a> {
             }
             ExprKind::ArrayRepeat { value, count } => {
                 let elem = self.type_expr(value);
-                let len = self.eval_usize(count);
                 self.type_expr(count);
+                let Some(len) = self.array_len(count) else {
+                    return Ty::Error;
+                };
                 Ty::Array {
                     elem: Box::new(elem),
                     len,
@@ -4069,10 +4178,7 @@ fn merge_arm_value(e: &Expr) -> &Expr {
 /// Loose compatibility used only where we are confident enough to diagnose (e.g. `let`
 /// annotation vs initializer). Unknown/Error are compatible with anything.
 fn compatible(a: &Ty, b: &Ty) -> bool {
-    if a.is_unknown() || b.is_unknown() || a.is_error() || b.is_error() {
-        return true;
-    }
-    if a == b {
+    if same_stored_type(a, b) {
         return true;
     }
     // Unsizing: a fixed-size array `[T; N]` coerces to a slice `[]T` of the same element type — the
@@ -4082,6 +4188,54 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
         (Ty::Slice(ea), Ty::Slice(eb)) | (Ty::Slice(ea), Ty::Array { elem: eb, .. }) => {
             compatible(ea, eb)
+        }
+        _ => false,
+    }
+}
+
+/// An empty literal has no element from which to infer a type. Match stored aggregate types
+/// recursively so it can acquire that type inside tuples/arrays or a first merge arm. Every
+/// extent/arity must agree. Unlike `compatible`, this does not grant implicit array-to-slice
+/// conversion to a nested field: that would require new storage for the slice header.
+fn same_stored_type(a: &Ty, b: &Ty) -> bool {
+    if a == b || a.is_unknown() || b.is_unknown() || a.is_error() || b.is_error() {
+        return true;
+    }
+    match (a, b) {
+        (
+            Ty::Array {
+                elem: ea,
+                len: la,
+                shared: sa,
+            },
+            Ty::Array {
+                elem: eb,
+                len: lb,
+                shared: sb,
+            },
+        ) if la == lb && sa == sb => same_stored_type(ea, eb),
+        (Ty::Tuple(a), Ty::Tuple(b)) if a.len() == b.len() => {
+            a.iter().zip(b).all(|(a, b)| same_stored_type(a, b))
+        }
+        _ => false,
+    }
+}
+
+fn fixed_aggregate_shape_clash(a: &Ty, b: &Ty) -> bool {
+    match (a, b) {
+        (
+            Ty::Array {
+                elem: ea, len: la, ..
+            },
+            Ty::Array {
+                elem: eb, len: lb, ..
+            },
+        ) => la != lb || fixed_aggregate_shape_clash(ea, eb),
+        (Ty::Tuple(a), Ty::Tuple(b)) => {
+            a.len() != b.len()
+                || a.iter()
+                    .zip(b)
+                    .any(|(a, b)| fixed_aggregate_shape_clash(a, b))
         }
         _ => false,
     }
@@ -5673,15 +5827,8 @@ mod tests {
             "the Tensor spelling must stay clean: {:?}",
             errors(ok)
         );
-        // The `[T; 0]` could-not-fold sentinel must NOT cascade to the call sites. `is_concrete_layout`
-        // excludes a zero-length array for exactly this reason (`*len > 0`), and `unify_decl`'s
-        // (Array, Array) arm now carries the same guard: without it every caller of a function whose
-        // length is unreadable ALSO got `E0501: array length mismatch: expected an array of length 0`,
-        // a second and false diagnostic blaming the caller for the callee's declaration.
-        // (The callee must not index with a CONSTANT here: `type_index`'s pre-existing array
-        // bounds check reports its own E0501 against the length-0 sentinel, which is a separate
-        // site and not what this asserts. tests/fail/generic_array_length.wk indexes dynamically
-        // and reports E0406 alone.)
+        // Recovery must NOT cascade to call sites. An unreadable extent is now Ty::Error;
+        // treating it as zero would report a false array-length mismatch against the caller.
         let call = "fn sum<N>(a: [f32; N], n: i64) -> i64 { return n; } \
                     fn main() -> i32 { let x: [f32; 4] = [1.0, 2.0, 3.0, 4.0]; \
                     return sum(x, 4) as i32; }";
@@ -5692,7 +5839,7 @@ mod tests {
         );
         assert!(
             !errors(call).contains(&"E0501"),
-            "the length-0 sentinel must not cascade into a call-site length mismatch: {:?}",
+            "an unreadable extent must not cascade into a call-site length mismatch: {:?}",
             errors(call)
         );
         // A generic ELEMENT type with a literal length is unaffected (tests/run/generic_typed_local.wk).
@@ -5702,6 +5849,158 @@ mod tests {
             "a generic element type with a literal length must stay clean: {:?}",
             errors(elem)
         );
+    }
+
+    #[test]
+    fn zero_extent_call_mismatch() {
+        let src = "fn get(a: [i32; 1]) -> i32 { return a[0]; } \
+                   fn bad(a: [i32; 0]) -> i32 { return get(a); }";
+        assert_message_has(src, "E0501", &["expected an array of length 1", "length 0"]);
+    }
+
+    #[test]
+    fn zero_extent_return_mismatch() {
+        let src = "fn bad(a: [i32; 0]) -> [i32; 1] { return a; }";
+        assert!(errors(src).contains(&"E0401"), "{:?}", analyze(src).0);
+    }
+
+    #[test]
+    fn zero_extent_assignment_mismatch() {
+        let src = "fn bad(mut a: [i32; 1], b: [i32; 0]) { a = b; }";
+        assert!(errors(src).contains(&"E0401"), "{:?}", analyze(src).0);
+    }
+
+    #[test]
+    fn zero_extent_nested_calls_and_merges() {
+        for src in [
+            "fn get(a: ([i32; 1], i32)) {} fn bad(a: ([i32; 0], i32)) { get(a); }",
+            "fn get(a: [[i32; 1]; 2]) {} fn bad(a: [[i32; 0]; 2]) { get(a); }",
+            "fn get(a: [i32; 0]) {} fn bad(a: [i32; 1]) { get(a); }",
+        ] {
+            assert!(
+                errors(src).contains(&"E0501"),
+                "{src}: {:?}",
+                analyze(src).0
+            );
+        }
+        for src in [
+            "fn f(k: i32, a: [i32; 1], b: [i32; 0]) { let r = if k { a } else { b }; }",
+            "fn f(k: i32, a: [i32; 0], b: [i32; 1]) { let r = match k { 0 => a, _ => b }; }",
+            "fn f(k: i32, a: [i32; 1], b: [i32; 0]) { let r = loop { if k { break a; } break b; }; }",
+            "fn f(a: ([i32; 0], i32)) -> ([i32; 1], i32) { return a; }",
+            "fn f() -> [i32; 1] { return []; }",
+            "fn f(mut a: [i32; 1]) { a = []; }",
+            "fn f(a: [i32; 1]) -> [i32; 0] { return a; }",
+            "fn f(a: ([i32; 0], i32)) -> ([f32; 0], i32) { return a; }",
+            "fn f(a: [[i32; 0]; 1]) -> [[]i32; 1] { return a; }",
+            "fn f<T>(a: [T; 0]) -> [T; 1] { return a; }",
+            "fn f<T>(mut a: [T; 1], b: [T; 0]) { a = b; }",
+            "fn f<T>(k: i32, a: [T; 1], b: [T; 0]) { let r = if k { a } else { b }; }",
+        ] {
+            assert!(errors(src).contains(&"E0401"), "{src}: {:?}", analyze(src).0);
+        }
+    }
+
+    #[test]
+    fn zero_extent_valid_empty_values_and_forward_extents() {
+        for src in [
+            "fn id(a: [i32; 0]) -> [i32; 0] { return a; } \
+             fn f() { let mut a: [i32; 0] = []; a = [0; 0]; let b = id(a); let t = (); }",
+            "fn f(k: i32, a: [i32; 0]) -> [i32; 0] { return if k { a } else { [] }; }",
+            "fn f(k: i32, a: [i32; 0]) -> [i32; 0] { return if k { [] } else { a }; }",
+            "fn f(k: i32, a: [i32; 0]) { let r = match k { 0 => [], _ => a }; }",
+            "fn f(k: i32, a: [i32; 0]) { let r = loop { if k { break []; } break a; }; }",
+            "fn f() -> [i32; 0] { let a = []; return a; }",
+            "fn f() -> ([i32; 0], i32) { let t = ([], 1); return t; }",
+            "fn f() -> [[i32; 0]; 2] { let a = [[], []]; return a; }",
+            "fn id(t: ([i32; 0], i32)) -> ([i32; 0], i32) { return t; }",
+            "fn id(t: ((), i32)) -> ((), i32) { return t; }",
+            "fn get(a: [i32; N]) -> i32 { return a[0]; } \
+             fn f(a: [i32; 1]) -> i32 { return get(a); } const N: usize = 1;",
+            "fn id(a: [i32; N]) -> [i32; N] { return a; } \
+             fn f(a: [i32; 0]) -> [i32; 0] { return id(a); } const N: usize = 0;",
+            "fn get(a: [i32; Size::N]) {} fn f(a: [i32; 1]) { get(a); } enum Size { N = 1 }",
+        ] {
+            assert!(errors(src).is_empty(), "{src}: {:?}", analyze(src).0);
+        }
+    }
+
+    #[test]
+    fn zero_extent_forward_declarations_cannot_hide_mismatches() {
+        for src in [
+            "fn get(a: [i32; N]) {} fn bad(a: [i32; 0]) { get(a); } const N: usize = 1;",
+            "extern { fn get(a: [i32; N]); } fn bad(a: [i32; 0]) { get(a); } const N: usize = 1;",
+            "struct S { a: [i32; N] } fn get(a: [i32; 1]) {} \
+             fn bad(s: S) { get(s.a); } const N: usize = 0;",
+            "fn get(a: [i32; Size::N]) {} fn bad(a: [i32; 0]) { get(a); } enum Size { N = 1 }",
+        ] {
+            assert!(
+                errors(src).contains(&"E0501"),
+                "{src}: {:?}",
+                analyze(src).0
+            );
+        }
+    }
+
+    #[test]
+    fn zero_extent_recovery_remains_distinct_from_empty_arrays() {
+        for (src, code) in [
+            (
+                "fn get<N>(a: [i32; N]) {} fn f(a: [i32; 1]) { get(a); }",
+                "E0406",
+            ),
+            ("const N: usize = 0; fn get<N>(a: [i32; N]) {}", "E0406"),
+            (
+                "fn get(a: [i32; MISSING]) {} fn f(a: [i32; 1]) { get(a); }",
+                "E0301",
+            ),
+            (
+                "fn get(a: [i32; 4 as usize]) {} fn f(a: [i32; 1]) { get(a); }",
+                "E0406",
+            ),
+            ("fn f(n: usize) -> [i32; 0] { return [1; n]; }", "E0406"),
+        ] {
+            assert_eq!(errors(src), vec![code], "{src}: {:?}", analyze(src).0);
+        }
+    }
+
+    #[test]
+    fn zero_extent_refresh_records_real_types_in_every_declaration() {
+        let src = "fn id(a: [i32; N]) -> [i32; N] { return a; } \
+                   struct S { a: [i32; N] } \
+                   enum E { A([i32; N]), B { a: [i32; N] } } \
+                   extern { fn ext(a: [i32; N]); } \
+                   const A: [i32; N] = [1, 2]; const N: usize = 2;";
+        let mut interner = Interner::new();
+        let (module, parse_diags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(parse_diags.is_empty(), "{parse_diags:?}");
+        let (result, diags) = check(&module, &interner);
+        assert!(diags.is_empty(), "{diags:?}");
+        let expected = Ty::Array {
+            elem: Box::new(Ty::Scalar(Scalar::I32)),
+            len: 2,
+            shared: false,
+        };
+        for def in &result.defs.defs {
+            match &def.kind {
+                DefKind::Fn(sig) => {
+                    assert_eq!(sig.params, vec![expected.clone()]);
+                    if interner.resolve(def.name) == "id" {
+                        assert_eq!(sig.ret, expected);
+                    }
+                }
+                DefKind::Struct(fields) => assert_eq!(fields[0].1, expected),
+                DefKind::Enum(variants) => {
+                    for variant in variants {
+                        assert_eq!(variant.payload.field_tys(), vec![expected.clone()]);
+                    }
+                }
+                DefKind::Const(ty) if interner.resolve(def.name) == "A" => {
+                    assert_eq!(*ty, expected)
+                }
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -6094,9 +6393,7 @@ mod tests {
                 errors(&bad)
             );
         }
-        // Everything the shared folder really does fold stays accepted, `[T; 0]` included — it is a
-        // legal (if useless) type, and it is also `array_len`'s could-not-fold sentinel, so the
-        // leniency rule keeps it silent.
+        // Everything the shared folder really does fold stays accepted, including a real `[T; 0]`.
         for ok in [
             "fn f(a: [i32; 2 + 2]) { }",
             "fn f(a: [i32; 8 - 3]) { }",
