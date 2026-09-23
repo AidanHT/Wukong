@@ -140,12 +140,20 @@ fn no_recognize_keeps_the_program_correct_on_both_backends() {
         "softmax.wk",
         "scan_1d.wk",
         "linear_bias_relu.wk",
+        "alias_matmul_inplace.wk",
+        "alias_gemv_inplace.wk",
+        "alias_transpose_inplace.wk",
+        "alias_transpose_inplace8.wk",
+        "embedding_alias_parallel.wk",
+        "parallel_dependence.wk",
     ] {
         let p = fixture(name);
         for opt in ["-O0", "-O2"] {
             for backend in ["--backend=interp", "--backend=native"] {
                 let on = wukongc(&["--run", opt, backend], &p, false);
                 let off = wukongc(&["--run", opt, backend], &p, true);
+                assert_eq!(on.0, Some(0), "{name} {opt} {backend}: {}", on.2);
+                assert_eq!(off.0, Some(0), "{name} {opt} {backend}: {}", off.2);
                 assert_eq!(
                     (on.0, &on.1),
                     (off.0, &off.1),

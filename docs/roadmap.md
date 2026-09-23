@@ -924,25 +924,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   threshold an out-of-line 256-bit reduction call would lose to the inlined 128-bit path, so small or
   runtime-unknown *reduction* trips stay 128-bit + 4× unrolling; there compute-bound kernels use 2×
   the FMA ports they could, but the vectorized **transcendentals still beat scalar `libm` ~2.5–3×**.
-  The AST loop vectorizer assumes distinct array parameters do not alias. **That assumption is
-  informal and unchecked, and it is not the language's rule** — nothing rejects `f(a, a)`, and there
-  is no `restrict`/`&mut` annotation to carry the promise. The MIR alias analysis
-  (`wukong_opt::alias`, see `docs/internals.md`) deliberately does *not* adopt it: `may_alias` answers
-  "may alias" for two distinct pointer parameters, and `tests/run/alias_slice_params.wk` pins a
-  program whose answer depends on it. Making the promise real is a **language** decision — an opt-in
-  parameter annotation, or a rule that a `mut` aggregate parameter may not alias another parameter —
-  not something an analysis can derive. Until then the analysis exploits only what *is* guaranteed:
-  distinct stack slots, a local slot versus a parameter, non-escaping slots versus everything, and
-  disjoint constant offsets.
-  An attempt to turn the assumption into an actual wrong answer did **not** succeed, and the negative
-  result is recorded so the next person does not repeat it: `fn f(src: []f32, mut dst: []f32)` doing
-  `dst[i] = src[i-1] + 1.0` — a cascade when the caller passes one buffer twice, and a different
-  answer if lanes are widened — returns the correct scalar values at `-O0`/`-O2` on both backends,
-  because the AST vectorizer **declines slice-parameter loops outright** (`--emit=mir -O2` shows no
-  `<N x f32>` for either that loop or the safe same-index `dst[i] = src[i] * 2.0`, with a constant
-  4096 trip count). So the assumption is currently unreachable through `[]T` parameters rather than
-  proven harmless — it is *not* evidence that adopting a no-alias rule would be safe, and a fixed-size
-  array parameter or a future MIR vectorizer may well reach it.
+  The AST loop vectorizer requires a disjointness proof for differently named buffers paired
+  with a write. Potentially aliased parameters retain scalar execution; named parameters alone
+  do not imply non-aliasing. `parallel_dependence.wk` checks the shifted in-place recurrence
+  that previously returned the same wrong answer on both backends after unsafe SIMD lowering.
+  Whole-function parallel outlining uses the shared region dependence proof as well.
+  The MIR alias analysis remains conservative for parameters. Distinct local allocations and
+  call-site proofs can establish disjointness; the language has no general `restrict` promise.
+  This repair does not establish safe dispatch for every runtime recognizer. Remaining family
+  coverage and oracle-marshalling gaps are listed in the
+  [closeout checklist](sota-campaign-2026-09/CLOSEOUT-CHECKLIST.md).
 - Array *length* in a type may be an integer literal or a top-level `const` (resolved through
   const-to-const chains; `tests/run/const_array_length.wk`). It may also be **arithmetic over those** —
   `[i32; 2 + 2]`, or a `const N: i32 = 2 + 2` used as a length — because sema's `eval_usize` and
