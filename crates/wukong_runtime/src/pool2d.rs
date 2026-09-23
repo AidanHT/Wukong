@@ -27,14 +27,11 @@
 //! (`h`/`w`/`kh`/`kw`/`sh`/`sw`) *and* a window that does not fit (`kh > h`, `kw > w`), returning `None`
 //! so the kernel writes nothing; `channels <= 0` is likewise a no-op.
 //!
-//! **Bit-exactness.** Max is idempotent, and on finite data order-independent, so any window-traversal
-//! order (and any serial/parallel channel split) agrees. LANDMINE: that is *finite* data only, and the
-//! two paths do not spell the fold the same way — the AVX2 band folds `_mm256_max_ps(acc, v)` (returns
-//! the freshly loaded `v` when the compare is unordered) while `pool_window_scalar` folds
-//! `if v > m { m = v }` (keeps the accumulator). So a window containing a NaN can pool to different bits
-//! on the two paths, in either direction, and no test covers it — unlike `cumminmax.rs`/`norm.rs`, which
-//! align their scalar twins to the `maxps` operand order deliberately. The average **sum order is
-//! fixed** — the window is folded in
+//! **Bit-exactness.** Max retains the first cell on ties or unordered comparisons:
+//! the AVX2 band folds `_mm256_max_ps(v, acc)`, matching the scalar `if v > m { m = v }`.
+//! A NaN seed is preserved, later NaNs are ignored, and signed-zero ties keep the seed's sign.
+//! Tests pin both SIMD strides and scalar tails, including signalling NaN payloads.
+//! The average **sum order is fixed** — the window is folded in
 //! `(dy, dx)` ascending order in *both* the scalar twin and the AVX2 path (the 8-wide path accumulates
 //! into eight independent lanes in the same `(dy, dx)` sequence, so lane `l` receives exactly the
 //! scalar fold for output column `ox+l`), then a single divide by `kh·kw` — so the SIMD path equals the
@@ -44,7 +41,7 @@
 //! exact.
 
 /// Which pooling fold: `Max` seeds the window's first cell `x[…dy=0, dx=0]` and folds the rest by
-/// `max` (idempotent — equivalent to seeding `-∞`); `Avg` seeds `0`, folds by `+` in `(dy, dx)`
+/// strict `>` (preserving a NaN seed and the first signed zero); `Avg` seeds `0`, folds by `+` in `(dy, dx)`
 /// ascending order, then divides by the full window count `kh·kw`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PoolKind {
@@ -101,7 +98,7 @@ unsafe fn pool_channel_avx2_sw1(
                     // 8 windows, columns [ox, ox+8): input columns [ox+dx, ox+dx+8) — contiguous.
                     let v = _mm256_loadu_ps(rowp.add(ox + dx));
                     acc = match kind {
-                        PoolKind::Max => _mm256_max_ps(acc, v),
+                        PoolKind::Max => _mm256_max_ps(v, acc),
                         PoolKind::Avg => _mm256_add_ps(acc, v),
                     };
                 }
@@ -209,7 +206,7 @@ unsafe fn pool_channel_avx2_sw2(
                     let v1 = _mm256_loadu_ps(rowp.add(off + 8));
                     let v = deinterleave_even_sw2(v0, v1);
                     acc = match kind {
-                        PoolKind::Max => _mm256_max_ps(acc, v),
+                        PoolKind::Max => _mm256_max_ps(v, acc),
                         PoolKind::Avg => _mm256_add_ps(acc, v),
                     };
                 }
@@ -608,6 +605,107 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn maxpool_nan_signed_zero_and_ties_match_scalar_bits() {
+        let values = [
+            f32::from_bits(0x7fc0_0123),
+            f32::from_bits(0x7f80_0123),
+            f32::from_bits(0xffc0_0123),
+            -0.0,
+            0.0,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            3.0,
+        ];
+        let bits = |v: &[f32]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for sw in [1usize, 2, 3] {
+            for (kh, kw) in [(1usize, 1usize), (2, 2), (3, 3)] {
+                let (channels, h, w, sh) = (POOL_PAR_MIN, 5, 39, 1);
+                let (oh, ow) = ((h - kh) / sh + 1, (w - kw) / sw + 1);
+                // Every exceptional value appears as seed, later cell, and tail cell.
+                for phase in 0..values.len() {
+                    let x: Vec<f32> = (0..channels * h * w)
+                        .map(|i| values[(i + phase) % values.len()])
+                        .collect();
+                    let want = naive(&x, channels, h, w, kh, kw, sh, sw, PoolKind::Max);
+                    let mut scalar = vec![0.0; want.len()];
+                    let mut vector = scalar.clone();
+                    let mut parallel = scalar.clone();
+                    unsafe {
+                        for c in 0..channels {
+                            pool_channel_scalar(
+                                x.as_ptr().add(c * h * w),
+                                scalar.as_mut_ptr().add(c * oh * ow),
+                                w,
+                                oh,
+                                ow,
+                                kh,
+                                kw,
+                                sh,
+                                sw,
+                                PoolKind::Max,
+                            );
+                            #[cfg(target_arch = "x86_64")]
+                            if is_x86_feature_detected!("avx2") && sw <= 2 {
+                                let f = if sw == 1 {
+                                    pool_channel_avx2_sw1
+                                } else {
+                                    pool_channel_avx2_sw2
+                                };
+                                f(
+                                    x.as_ptr().add(c * h * w),
+                                    vector.as_mut_ptr().add(c * oh * ow),
+                                    w,
+                                    oh,
+                                    ow,
+                                    kh,
+                                    kw,
+                                    sh,
+                                    PoolKind::Max,
+                                );
+                                assert_eq!(
+                                    bits(&vector[c * oh * ow..(c + 1) * oh * ow]),
+                                    bits(&want[c * oh * ow..(c + 1) * oh * ow])
+                                );
+                            }
+                        }
+                        pool2d_serial(
+                            x.as_ptr(),
+                            vector.as_mut_ptr(),
+                            channels as i64,
+                            h as i64,
+                            w as i64,
+                            kh as i64,
+                            kw as i64,
+                            sh as i64,
+                            sw as i64,
+                            PoolKind::Max,
+                        );
+                        pool2d_parallel(
+                            x.as_ptr(),
+                            parallel.as_mut_ptr(),
+                            channels as i64,
+                            h as i64,
+                            w as i64,
+                            kh as i64,
+                            kw as i64,
+                            sh as i64,
+                            sw as i64,
+                            PoolKind::Max,
+                        );
+                    }
+                    assert_eq!(bits(&scalar), bits(&want));
+                    assert_eq!(
+                        bits(&vector),
+                        bits(&want),
+                        "sw={sw}, window={kh}x{kw}, phase={phase}"
+                    );
+                    assert_eq!(bits(&parallel), bits(&want));
+                }
+            }
+        }
     }
 
     /// Max/avg pooling (AVX2 `sw==1` serial, the scalar `sw>1` path, and the multicore channel split)
