@@ -36,6 +36,18 @@ diagnostics. To export the narrow test modules for an independent LLVM verifier,
 `WUKONG_LLVM_TEST_OUTPUT` to an output directory before running
 `cargo test -p wukong_codegen_llvm --lib closeout_tests::`.
 
+Floating-to-integer conversions use LLVM's saturating intrinsics (NaN becomes zero and
+out-of-range values clamp), and f32/f64 FMA uses `llvm.fma` to require a single rounding.
+Low-precision FMA currently returns an unsupported diagnostic because its MIR f32 register
+semantics require promoted SSA values rather than immediate half/bfloat rounding.
+
+For independent scalar/vector conversion and exact-FMA execution checks, set
+`WUKONG_LLVM_SEMANTICS_OUTPUT` to a dedicated directory, run
+`cargo test -p wukong_codegen_llvm --lib semantic_tests::`, then run
+`python crates/wukong_codegen_llvm/tools/verify_semantics.py <directory>`.
+The script requires an already installed llvmlite and checks actual LLVM JIT results,
+including cancellation that distinguishes FMA from separate multiply/add instructions.
+
 ## Dependencies
 
 | crate | role |

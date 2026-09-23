@@ -268,6 +268,27 @@ fn declarations(
                         let name = math_intrinsic(&inst.op, ty)?;
                         Some((name, (llvm_ty(ty), vec![llvm_ty(ty)])))
                     }
+                    Op::Fma(a, _, _) => {
+                        let ty = f.value_type(*a);
+                        if !matches!(ty.lane_type(), MirType::F32 | MirType::F64) {
+                            return Err(
+                                "LLVM emission: low-precision FMA requires promoted f32 SSA values"
+                                    .into(),
+                            );
+                        }
+                        Some((
+                            math_intrinsic(&inst.op, ty)?,
+                            (llvm_ty(ty), vec![llvm_ty(ty); 3]),
+                        ))
+                    }
+                    Op::Cast(kind @ (CastKind::FpToSi | CastKind::FpToUi), v, to) => {
+                        let from = f.value_type(*v);
+                        let target = saturating_target(to);
+                        Some((
+                            saturating_cast_name(*kind, from, &target),
+                            (llvm_ty(&target), vec![llvm_ty(from)]),
+                        ))
+                    }
                     Op::VecKernelCall { kernel, n, .. } => Some((
                         format!("__wukong_veckernel_{}_{}", interner.resolve(f.name), kernel),
                         (
@@ -348,6 +369,7 @@ fn math_intrinsic(op: &Op, ty: &MirType) -> Result<String, String> {
         _ => suffix.to_owned(),
     };
     let name = match op {
+        Op::Fma(..) => "fma",
         Op::Sqrt(_) => "sqrt",
         Op::Round(mode, _) => match mode {
             wukong_mir::RoundMode::Nearest => "roundeven",
@@ -358,6 +380,35 @@ fn math_intrinsic(op: &Op, ty: &MirType) -> Result<String, String> {
         _ => unreachable!(),
     };
     Ok(format!("llvm.{name}.{suffix}"))
+}
+
+fn intrinsic_type_suffix(ty: &MirType) -> String {
+    match ty {
+        MirType::Vec(lane, n) => format!("v{n}{}", intrinsic_type_suffix(lane)),
+        MirType::F16 => "f16".into(),
+        MirType::BF16 => "bf16".into(),
+        MirType::F32 => "f32".into(),
+        MirType::F64 => "f64".into(),
+        _ => llvm_ty(ty),
+    }
+}
+
+fn saturating_target(to: &MirType) -> MirType {
+    // The interpreter's boolean fallback saturates at i32 width, then keeps the low bit.
+    match to {
+        MirType::I1 => MirType::I32,
+        MirType::Vec(lane, n) if **lane == MirType::I1 => MirType::Vec(Box::new(MirType::I32), *n),
+        _ => to.clone(),
+    }
+}
+
+fn saturating_cast_name(kind: CastKind, from: &MirType, to: &MirType) -> String {
+    format!(
+        "llvm.{}.sat.{}.{}",
+        cast_name(kind),
+        intrinsic_type_suffix(to),
+        intrinsic_type_suffix(from)
+    )
 }
 
 fn emit_function(
@@ -570,6 +621,28 @@ impl Emitter<'_> {
             }
             Op::Cast(kind, v, to) => {
                 let from = self.ty(*v);
+                if matches!(kind, CastKind::FpToSi | CastKind::FpToUi) {
+                    let target = saturating_target(to);
+                    let name = saturating_cast_name(*kind, self.f.value_type(*v), &target);
+                    let target_ty = llvm_ty(&target);
+                    if &target == to {
+                        let _ = writeln!(
+                            out,
+                            "  {res}call {target_ty} @{name}({from} {})",
+                            self.operand(*v)
+                        );
+                    } else {
+                        let r = inst.result.unwrap().0;
+                        let _ = writeln!(
+                            out,
+                            "  %v{r}.sat = call {target_ty} @{name}({from} {})",
+                            self.operand(*v)
+                        );
+                        let _ =
+                            writeln!(out, "  {res}trunc {target_ty} %v{r}.sat to {}", llvm_ty(to));
+                    }
+                    return;
+                }
                 if self.f.value_type(*v) == to {
                     // A typed identity SSA binding, including half/bfloat and opaque pointers.
                     let value = self.operand(*v);
@@ -733,15 +806,12 @@ impl Emitter<'_> {
                 format!("{res}add {vty} zeroinitializer, <{}>", items.join(", "))
             }
             Op::Fma(a, b, c) => {
-                // `a*b + c`. Emitted as a `contract`-flagged mul/add pair so llc fuses it into a
-                // hardware FMA under `-ffp-contract=fast` — no module-level intrinsic `declare`
-                // needed. (This text-IR path is not the differential oracle; Cranelift is.)
                 let r = inst.result.unwrap();
                 let ty = self.ty(r);
+                let name =
+                    math_intrinsic(&inst.op, self.f.value_type(r)).expect("validated FMA type");
                 format!(
-                    "%v{0}.m = fmul contract {ty} {1}, {2}\n  \
-                     {res}fadd contract {ty} %v{0}.m, {3}",
-                    r.0,
+                    "{res}call {ty} @{name}({ty} {}, {ty} {}, {ty} {})",
                     self.operand(*a),
                     self.operand(*b),
                     self.operand(*c),
@@ -972,6 +1042,9 @@ fn fmt_float(v: f64, ty: &MirType) -> String {
 
 #[cfg(test)]
 mod closeout_tests;
+
+#[cfg(test)]
+mod semantic_tests;
 
 #[cfg(test)]
 mod tests {
