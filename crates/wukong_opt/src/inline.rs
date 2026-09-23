@@ -78,6 +78,11 @@ const MAX_SPLICES: u32 = 400;
 
 /// Inline throughout the program, bottom-up over the call graph. Returns whether anything changed.
 pub fn inline_program(program: &mut Program) -> bool {
+    inline_program_preserving(program, &[])
+}
+
+/// Inline normally, retaining named entry points even after their last call is inlined.
+pub(crate) fn inline_program_preserving(program: &mut Program, roots: &[Symbol]) -> bool {
     let n = program.funcs.len();
     if n == 0 {
         return false;
@@ -223,9 +228,11 @@ pub fn inline_program(program: &mut Program) -> bool {
                 }
             }
         }
-        program
-            .funcs
-            .retain(|f| !inlined.contains(&f.name) || still_referenced.contains(&f.name));
+        program.funcs.retain(|f| {
+            roots.contains(&f.name)
+                || !inlined.contains(&f.name)
+                || still_referenced.contains(&f.name)
+        });
     }
     changed
 }

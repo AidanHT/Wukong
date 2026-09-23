@@ -800,26 +800,36 @@ program can no longer cascade into ~100 false failures across both gates.
 
 ## Automatic differentiation (`wukong_autodiff`)
 
-Reverse-mode autodiff runs as a **MIR→MIR transform**: given a forward function computing a scalar
-loss, it emits a new function that also accumulates the gradient w.r.t. designated input buffers (the
-vector-Jacobian product). Matmul adjoints ride the same tuned GEMM kernels, and a fused AdamW step is
-emitted as one kernel. Every VJP rule is **finite-difference-gated** (forward + backward run in f64)
-against a closed-form reference. It is reachable from `wukongc`: `--emit=grad` dumps the backward MIR
-of a loss function, and `--train` runs a fwd→bwd→optimizer loop (`--grad-of`/`--grad-wrt` select the
-loss and parameters; `--train-opt=sgd|adamw` the optimizer). The envelope is deliberately narrow and
-every hole outside it is a **loud refusal, never a zeroed gradient**. The forward function must be a
-single basic block in SSA terminated by `ret <float scalar>`. Five kernel families have rules —
-`wukong_sreduce_f32` (SUM / DOT / SSD, including the self-dot `Σ x²`), `wukong_sgemm_nt`,
-`wukong_vmath_f32` (relu/sigmoid/tanh/exp differentiated as a synthesized loop; silu/gelu/elu/softplus
-as one fused `wukong_vmath2_f32` backward call), `wukong_velem_f32` (**identity-affine only** — the
-Hadamard `x⊙y` and division compute modes are refused by name), and `wukong_norm_f32` (softmax /
-LayerNorm / RMSNorm) — each with its `@parallel` twin. A norm with learned γ/β
-(`wukong_norm_affine_f32`), a mid-function `@parallel` region, an autovectorized `VecKernelCall`, and
-any buffer that would need accumulation from two non-matmul contributions all decline with a message
-naming the construct. One known gap is documented rather than fixed: when a loss reads a kernel-written
-buffer with a scalar load instead of through another recognized kernel, that kernel's output adjoint is
-never seeded. Both `--emit=grad` and `--train` force `-O1` or higher, since the transform needs
-single-block SSA (mem2reg + simplify-cfg).
+Reverse-mode autodiff transforms MIR for a single-block forward function returning a floating-point
+scalar loss. `--emit=grad` prints its forward and backward MIR; `--train` runs the forward, backward
+and optimizer through the **interpreter only**, including when a native backend is requested.
+Native/AOT training and generated-backward performance comparisons remain open. `--grad-of` selects
+the loss and `--grad-wrt` its differentiated buffers. Autodiff requires at least `-O1` for SSA
+construction; `-O2`/`-O3` retain the selected loss while still inlining calls and optimizing its body.
+Generated gradients are not themselves optimized. `--verify-each` checks the synthesized backward
+and training kernels; gradient MIR emission also verifies its output.
+
+Eight kernel families have VJP rules, including their parallel spellings: `sgemm`, `sgemm_nt`,
+`bias` without a fused activation, `sreduce_f32` (SUM, DOT, SSD, SUMABS, ABSDIFF), `velem_f32`
+(affine, product and quotient), `vmath_f32` (30 of 36 activation codes), `norm_f32` (softmax,
+log-softmax, LayerNorm, RMSNorm and L2-norm), and `norm_affine_f32` (LayerNorm/RMSNorm with learned
+scale/bias). Norm scratch allocation has constant-shape requirements, and unsupported in-place
+cases are refused. Kernel-output scalar loads now seed their supported buffer adjoints or report
+an unrouteable gradient. LayerNorm backward computes centered variance.
+
+Float precision casts propagate adjoints, and integer-to-float casts terminate integer leaves;
+float-to-integer-to-float paths decline. User-function calls need to inline into the forward
+function: there is no general interprocedural VJP. Fused GEMM epilogues, GEMV/TN forward calls, six
+activation codes, six reduction codes, mid-function parallel regions and synthesized
+`VecKernelCall` recipes remain unsupported. Unsupported differentiable operations report a
+diagnostic. Second-order (grad-of-grad) differentiation is unsupported and reports that boundary
+explicitly.
+
+Matmul adjoints and four activation derivatives call runtime kernels. Norm backward and the NT
+weight-gradient transpose still use synthesized loops; sigmoid/tanh do not yet use their fused
+runtime backward kernels. `--train-opt=sgd|adamw` selects the optimizer, but AdamW currently has
+weight decay fixed to zero with no CLI setting. Source-driven in-crate gradient tests exist;
+successful end-to-end CLI fixtures and generated-autodiff benchmarks remain coverage gaps.
 
 A loss whose buffers are **raw `*T` / `*mut T` parameters** now differentiates. It previously could
 not: the front end gives a pointer parameter an `alloca ptr` + `store`, so its base reached autodiff

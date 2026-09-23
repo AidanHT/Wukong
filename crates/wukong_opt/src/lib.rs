@@ -292,10 +292,16 @@ impl Default for PassManager {
 
 /// Optimize a whole program at the given level.
 pub fn optimize(program: &mut Program, opt_level: u8) {
+    optimize_preserving(program, opt_level, &[]);
+}
+
+/// Optimize normally while retaining externally selected function entry points. Calls to these
+/// functions may still inline, and their bodies receive the full requested optimization pipeline.
+pub fn optimize_preserving(program: &mut Program, opt_level: u8, roots: &[wukong_span::Symbol]) {
     // Inlining is a whole-program transform (it needs callee bodies), so it runs before the
     // function-level pipeline — which then optimizes the spliced-in code in context.
     if opt_level >= 2 {
-        inline_program(program);
+        inline::inline_program_preserving(program, roots);
     }
     let pm = PassManager::standard(opt_level);
     pm.run(program);
@@ -319,10 +325,19 @@ pub fn optimize(program: &mut Program, opt_level: u8) {
 /// reports invalid MIR, not arbitrary panics inside a transform. External runtime signatures are
 /// outside MIR and cannot be cross-checked by the program verifier.
 pub fn optimize_verified(program: &mut Program, opt_level: u8) -> Result<(), VerificationFailure> {
+    optimize_verified_preserving(program, opt_level, &[])
+}
+
+/// Like [`optimize_verified`], retaining the selected entry points as in [`optimize_preserving`].
+pub fn optimize_verified_preserving(
+    program: &mut Program,
+    opt_level: u8,
+    roots: &[wukong_span::Symbol],
+) -> Result<(), VerificationFailure> {
     // O0 still validates its input; a malformed lowering must not reach even the first transform.
     verify_program_stage(program, "optimization input")?;
     if opt_level >= 2 {
-        inline_program(program);
+        inline::inline_program_preserving(program, roots);
         verify_program_stage(program, "inline")?;
     }
     PassManager::standard(opt_level).run_verified(program)?;
