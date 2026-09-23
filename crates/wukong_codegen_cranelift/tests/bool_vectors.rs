@@ -567,3 +567,73 @@ fn scalar_boolean_shifts_mask_counts_at_declared_width() {
             .is_empty());
     }
 }
+
+#[test]
+fn raw_boolean_storage_loads_observe_low_bits() {
+    let mut it = Interner::new();
+    let name = it.intern("observe_boolean_storage");
+    let mut b = Builder::new(name, MirType::Void);
+    let bytes = b.add_param(MirType::Ptr);
+    let floats = b.add_param(MirType::Ptr);
+    let output = b.add_param(MirType::Ptr);
+    let bools = MirType::Vec(Box::new(MirType::I1), 5);
+    let fvec = MirType::Vec(Box::new(MirType::F32), 5);
+    let ivec = MirType::Vec(Box::new(MirType::I32), 5);
+    let raw_mask = b.build(bools.clone(), Op::Load(bytes, bools.clone()));
+    let floats = b.build(fvec.clone(), Op::Load(floats, fvec));
+    // This observable cast enables scalarization without normalizing raw_mask by arithmetic.
+    let typed_mask = b.build(bools.clone(), Op::Cast(CastKind::FpToSi, floats, bools));
+    let yes = b.build(MirType::I32, Op::ConstInt(11, MirType::I32));
+    let no = b.build(MirType::I32, Op::ConstInt(22, MirType::I32));
+    for k in 0..5 {
+        let ptr = gep(&mut b, bytes, k, MirType::I1);
+        let bit = b.build(MirType::I1, Op::Load(ptr, MirType::I1));
+        let selected = b.build(MirType::I32, Op::Select(bit, yes, no));
+        let ptr = gep(&mut b, output, k, MirType::I32);
+        b.build_void(Op::Store {
+            ptr,
+            value: selected,
+        });
+    }
+    let yes = b.build(ivec.clone(), Op::Splat(yes));
+    let no = b.build(ivec.clone(), Op::Splat(no));
+    for (offset, mask) in [(5, raw_mask), (10, typed_mask)] {
+        let selected = b.build(ivec.clone(), Op::Select(mask, yes, no));
+        let ptr = gep(&mut b, output, offset, MirType::I32);
+        b.build_void(Op::Store {
+            ptr,
+            value: selected,
+        });
+    }
+    b.ret(None);
+    let mut p = Program::new();
+    p.funcs.push(b.finish());
+    for opt in [0, 2] {
+        let mut optimized = p.clone();
+        wukong_opt::optimize(&mut optimized, opt);
+        assert!(wukong_mir::verify::verify_program(&optimized).is_empty());
+        let module = wukong_codegen_cranelift::jit_module(&optimized, &it).unwrap();
+        let mut observed = [0x7777i32; 17];
+        unsafe {
+            let call: extern "C" fn(*const u8, *const f32, *mut i32) =
+                std::mem::transmute(module.func_ptr(name).unwrap());
+            call(
+                [0u8, 1, 2, 3, 255].as_ptr(),
+                [0.0f32, 1.0, 2.0, 3.0, 255.0].as_ptr(),
+                observed.as_mut_ptr().add(1),
+            );
+        }
+        assert_eq!(observed[0], 0x7777);
+        assert_eq!(observed[16], 0x7777);
+        for result in observed[1..16].chunks_exact(5) {
+            assert_eq!(
+                result,
+                [22, 11, 22, 11, 11],
+                "scalar/raw-vector/typed-vector at O{opt}"
+            );
+        }
+        assert!(!wukong_codegen_cranelift::emit_object(&optimized, &it)
+            .unwrap()
+            .is_empty());
+    }
+}
