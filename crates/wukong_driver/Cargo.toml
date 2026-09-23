@@ -7,6 +7,12 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+# Opt in to the workspace `-D warnings` policy (see the workspace `Cargo.toml`), so a warning in
+# this crate fails a plain `cargo build`/`cargo clippy -p wukong_driver` locally and not only under
+# CI's `RUSTFLAGS`.
+[lints]
+workspace = true
+
 [dependencies]
 wukong_span = { workspace = true }
 wukong_diag = { workspace = true }

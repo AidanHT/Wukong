@@ -1,8 +1,17 @@
 name: CI
 
+# WHAT THIS DOES NOT FIX, stated because the obvious reading is wrong. Adding `sota/**` does not
+# make CI cover the campaign branches: `pull_request:` already carries no branch filter, so a PR
+# into any base - `sota/campaign-2026-09` included - has always run the full matrix. The binding
+# reason no campaign branch has ever been built is that nothing is PUSHED. `git branch -r` lists one
+# ref, `origin/main`, and HEAD is several hundred commits ahead of it; the off-main model is
+# deliberate (AGENT-PROTOCOL.md "Base and branches"). This entry is the half that is in the file's
+# power: it makes the run happen the moment a campaign branch IS pushed, instead of requiring
+# whoever pushes to remember to open a PR first. The other half is a push, and no workflow file can
+# perform it.
 on:
   push:
-    branches: [main]
+    branches: [main, 'sota/**']
   pull_request:
 
 env:
@@ -37,11 +46,23 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      # `--locked` on every command that resolves dependencies, here and below. Without it a fresh
+      # runner (or any `cargo` invocation after a registry update) may silently re-resolve a caret
+      # range - `cranelift-* = "0.124"`, `rayon = "1"`, `half = "2"`, `matrixmultiply = "0.3"` - and
+      # a `cranelift-codegen` patch release can change the machine code this compiler emits.
+      #
+      # Note what that does and does not break, because the obvious claim is wrong: `determinism.rs`
+      # compares three FRESH PROCESSES OF ONE BINARY, so a dependency bump cannot fail it. What a
+      # silent re-resolution invalidates is comparability ACROSS builds - a measured A/B whose two
+      # arms resolved differently, or a baseline captured before the bump - and `matrixmultiply` is
+      # worse in kind, because it is a published peer BAR whose version moves the bar without moving
+      # the report. With `--locked` a lockfile change is a visible diff and a loud failure instead of
+      # an invisible re-resolution.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --locked
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # THE PROFILE IS THE POINT OF THIS STEP. `cargo test` above builds everything at -O0, so
       # `wukong_runtime` -- the crate whose first invariant is that each AVX2 kernel agrees with its
@@ -60,18 +81,42 @@ jobs:
       # codegen decision that provokes this is per-target, not universal. `--lib` keeps it to the
       # unit tests and off the `examples/` measurement instruments.
       - name: Test (release) - wukong_runtime bit-exactness
-        run: cargo test -p wukong_runtime --release --lib
+        run: cargo test -p wukong_runtime --release --locked --lib
+
+      # THE PROFILE IS THE POINT OF THIS STEP TOO, for a different reason than the one above. The
+      # AOT link path (`--emit=exe`) is profile-specific by construction: the workspace
+      # `[profile.release]` sets `lto = "thin"`, so cargo compiles `wukong_runtime` with
+      # `-C linker-plugin-lto` and its rlib holds LLVM bitcode members rather than native objects.
+      # MSVC `link.exe` answers `LNK1136: invalid or corrupt file` on those, and in its wake every
+      # `wukong_*` symbol reads as unresolved. `exe_matches_run` was 0/4 in release for the
+      # project's whole history while passing 4/4 in debug, and the debug run cannot see it - the
+      # profiles hand the linker archives of different shapes.
+      #
+      # The fix (`rlib_holds_bitcode_members` -> `-C lto=thin -C opt-level=3` in
+      # `wukong_driver::rustc_link`) was verified once, by hand, and by no gate anywhere: neither
+      # this workflow nor the local ten-part gate ran a release `wukongc` test, so a release AOT
+      # regression re-enters silently and the next person to notice is whoever ships a binary.
+      #
+      # Cost, stated in job order rather than optimistically: at this point only `wukong_runtime`
+      # has been built in release (the step above). This step builds the rest of the release graph -
+      # cranelift, interp, mir_build, opt, driver, autodiff, codegen_llvm, wukongc - and the
+      # `wukong_bench --release` step below then REUSES most of it, so the marginal cost across the
+      # whole job is the driver/autodiff/codegen_llvm/wukongc layer plus the four fixture links. The
+      # links are the slow part: under `[profile.release]`'s `lto = "thin"` the driver re-runs LTO
+      # over the runtime for each one.
+      - name: Test (release) - wukongc AOT link (--emit=exe)
+        run: cargo test -p wukongc --release --locked --test exe
 
       - name: Smoke-run examples
         run: |
-          cargo run -p wukongc -- --run examples/fib.wk
-          cargo run -p wukongc -- --run examples/dot.wk
-          cargo run -p wukongc -- --run examples/saxpy_array.wk
+          cargo run -p wukongc --locked -- --run examples/fib.wk
+          cargo run -p wukongc --locked -- --run examples/dot.wk
+          cargo run -p wukongc --locked -- --run examples/saxpy_array.wk
 
       - name: Optimizer effectiveness + equivalence gate
         # Release build so the heavy kernels run quickly; the harness exits non-zero if any program
         # that lowers cleanly disagrees between -O0 and -O3, so this also guards optimizer soundness.
-        run: cargo run -p wukong_bench --release -- tests/run examples bench/kernels
+        run: cargo run -p wukong_bench --release --locked -- tests/run examples bench/kernels
 
   # `cargo test --workspace` above NEVER builds the `gpu` feature, so every line of
   # `crates/wukong_codegen_gpu` (and the `gpu`-gated arms of `wukong_driver`/`wukongc`) was invisible
@@ -104,7 +149,7 @@ jobs:
           key: ${{ runner.os }}-cargo-gpu-${{ hashFiles('**/Cargo.lock') }}
 
       - name: GPU type-check
-        run: cargo check --features gpu --all-targets
+        run: cargo check --features gpu --all-targets --locked
 
       # THE LINT SURFACE IS THE POINT OF THIS STEP. The `test` job's `cargo clippy --workspace
       # --all-targets` runs WITHOUT `--features gpu`, and without that flag `wukong_codegen_gpu`
@@ -129,7 +174,7 @@ jobs:
       # them dark. Ubuntu-only is sufficient here: unlike `wukong_runtime`, this crate has no
       # `cfg(windows)`/`cfg(unix)` code, so there is no per-OS arm for a second runner to reach.
       - name: GPU clippy
-        run: cargo clippy --features gpu --all-targets
+        run: cargo clippy --features gpu --all-targets --locked
 
       # THE LAWS ARE THE POINT OF THIS STEP, and until it existed nothing anywhere ran them.
       # `wukong_driver`'s `gpu` feature carries the driver-side half of the GPU dispatch: which route a
@@ -154,4 +199,42 @@ jobs:
       # real device (part 4); this step exists for the package that no gate part names. `--lib` keeps it
       # to the unit tests, matching the release step above.
       - name: GPU device-free laws (wukong_driver dispatch rules)
-        run: cargo test -p wukong_driver --features gpu --lib
+        run: cargo test -p wukong_driver --features gpu --locked --lib
+
+  # `rust-version = "1.94"` in the workspace `Cargo.toml` is inherited by all 21 crate manifests and
+  # was, until this job, a promise nothing checked: `rust-toolchain.toml` pins `channel = "stable"`
+  # (not 1.94), both jobs above install `@stable`, and the local toolchain is newer still. The first
+  # consumer on 1.94 would be the one to find out.
+  #
+  # IF THIS JOB IS RED, THE PROMISE IS FALSE AND THE FIX IS TO RAISE `rust-version` IN `Cargo.toml`
+  # TO THE TRUE FLOOR - not to delete, skip or `continue-on-error` this job. A failure here is the
+  # job working: it is reporting that the manifests claim a compiler the code does not build on.
+  #
+  # `check`, not `test`: the promise is that the crates COMPILE on 1.94, and `check` answers exactly
+  # that at a fraction of the cost. `RUSTFLAGS` is emptied for this job alone, deliberately and
+  # narrowly: the workflow-level `-D warnings` would turn a lint that an OLDER rustc happens to emit
+  # into an MSRV failure, which is a false signal about a different question. The `-D warnings` gate
+  # itself is untouched - it still runs, on current stable, in the `test` and `gpu-check` jobs.
+  msrv:
+    name: MSRV 1.94 compiles (rust-version promise)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the declared MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.94
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Its own key: a 1.94 `target/` holds artifacts no other job's toolchain can reuse.
+          key: ${{ runner.os }}-cargo-msrv194-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check the workspace on the declared MSRV
+        run: cargo check --workspace --locked

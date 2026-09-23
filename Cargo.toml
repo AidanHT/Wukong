@@ -38,6 +38,26 @@ wukong_codegen_gpu = { path = "crates/wukong_codegen_gpu" }
 wukong_runtime = { path = "crates/wukong_runtime" }
 wukong_autodiff = { path = "crates/wukong_autodiff" }
 
+# The `-D warnings` policy, in the one place every invocation sees it.
+#
+# It used to live ONLY in `.github/workflows/ci.yml`'s workflow-level `RUSTFLAGS` and in the clippy
+# lane of `run-sota-gates.ps1`. CLAUDE.md's gate part 2 is written as
+# `cargo clippy --workspace --all-targets   # 2   -D warnings`: the annotation says deny, the command
+# is warn-only, and that gap is the recorded mechanism behind "a clippy-clean local sweep still
+# turned all 3 CI jobs red" - locally the command exits 0 on warnings, in CI it exits 1. A lint table
+# in the manifest travels with the source, so `cargo build`, `cargo check`, `cargo clippy` and a bare
+# `rustc` through cargo all agree without an environment variable, and the gate lanes stop splitting
+# cargo's fingerprint three ways over three different `RUSTFLAGS` values.
+#
+# SCOPE, so nobody reads this as more than it is: a `[workspace.lints]` table is a TEMPLATE. It binds
+# only the crates that opt in with `[lints] workspace = true`, and at the time of writing exactly one
+# does - `crates/wukong_driver`. The other twenty manifests are unchanged and still rely on CI's
+# `RUSTFLAGS`, which is therefore NOT removed from `ci.yml`. It could only be removed once every
+# manifest has opted in, and even then `RUSTFLAGS: -D warnings` covers clippy's own lints during a
+# clippy run while `[lints.rust]` does not - they are not interchangeable.
+[workspace.lints.rust]
+warnings = "deny"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
