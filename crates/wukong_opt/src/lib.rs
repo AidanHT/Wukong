@@ -545,7 +545,10 @@ mod tests {
         assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
         let shifted = program.function(interner.intern("shifted")).unwrap();
         assert!(
-            shifted.value_types.iter().any(wukong_mir::MirType::is_vector),
+            shifted
+                .value_types
+                .iter()
+                .any(wukong_mir::MirType::is_vector),
             "proven-disjoint shifted arrays should retain AST SIMD"
         );
         for level in [0, 2] {
