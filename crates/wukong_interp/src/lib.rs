@@ -4894,6 +4894,45 @@ mod tests {
     }
 
     #[test]
+    fn empty_inner_reductions_match_the_source_with_recognition_on_and_off() {
+        let source =
+            include_str!("../../wukong_mir_build/tests/fixtures/zero_inner_recognition.wk");
+        let expected = source
+            .lines()
+            .filter_map(|line| line.strip_prefix("// EXPECT-OUT: "))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        for recognize in [false, true] {
+            let mut interner = Interner::new();
+            let (module, diagnostics) =
+                wukong_parser::parse_module(source, SourceId(0), &mut interner);
+            assert!(diagnostics.iter().all(|d| !d.is_error()), "{diagnostics:?}");
+            let (sema, diagnostics) = wukong_sema::check(&module, &interner);
+            assert!(diagnostics.iter().all(|d| !d.is_error()), "{diagnostics:?}");
+            let (program, diagnostics) = wukong_mir_build::lower_program_with(
+                &module,
+                &sema,
+                &mut interner,
+                wukong_mir_build::LowerOptions {
+                    recognize,
+                    ..Default::default()
+                },
+            );
+            assert!(diagnostics.iter().all(|d| !d.is_error()), "{diagnostics:?}");
+            let errors = wukong_mir::verify::verify_program(&program);
+            assert!(errors.is_empty(), "{errors:?}");
+            let entry = interner.intern("main");
+            let (code, output) = run_with_output(&program, entry, &interner).unwrap();
+            assert_eq!(code, 0);
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                expected,
+                "recognize={recognize}"
+            );
+        }
+    }
+
+    #[test]
     fn i1_loads_use_the_low_bit_for_scalar_and_vector_masks() {
         use wukong_mir::Builder;
 

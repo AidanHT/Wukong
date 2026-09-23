@@ -12224,6 +12224,56 @@ impl FnLowerer<'_> {
         false
     }
 
+    /// Kernels treat a nonpositive reduction extent as a no-op, but the source
+    /// nest can still write its seed/finalizer. Keep the kernel for positive
+    /// extents and lower the original loop otherwise, without changing that ABI.
+    fn emit_nonempty_reduction_loop(
+        &mut self,
+        reduction: Dim,
+        source: (Option<Symbol>, &Pattern, &ForIter, &Block),
+        emit: impl FnOnce(&mut Self) -> bool,
+    ) -> bool {
+        let known = match reduction {
+            Dim::Lit(n) => Some(n),
+            Dim::Var(sym) if self.lookup(sym).is_none() => self.const_dim_value(sym),
+            Dim::Var(_) => None,
+        };
+        if known.is_some_and(|n| n > 0) {
+            return emit(self);
+        }
+        let Some(extent) = self.dim_value(reduction) else {
+            return false;
+        };
+        let zero = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let positive = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Sgt, extent, zero));
+        let kernel = self.builder.new_block();
+        let scalar = self.builder.new_block();
+        let join = self.builder.new_block();
+        self.builder
+            .cond_br(positive, kernel, vec![], scalar, vec![]);
+        self.builder.switch_to(kernel);
+        // A later shape/alias check can still decline. Its emitted setup is pure;
+        // route that case to the same original loop even for a positive extent.
+        let dispatched = emit(self);
+        self.builder
+            .br(if dispatched { join } else { scalar }, vec![]);
+        self.builder.switch_to(scalar);
+        let recognize = self.gemm.recognize;
+        self.gemm.recognize = false;
+        self.lower_for(source.0, source.1, source.2, source.3, &[]);
+        self.gemm.recognize = recognize;
+        if !self.terminated {
+            self.builder.br(join, vec![]);
+        }
+        self.builder.switch_to(join);
+        self.terminated = false;
+        true
+    }
+
     fn lower_for(
         &mut self,
         label: Option<Symbol>,
@@ -12267,7 +12317,9 @@ impl FnLowerer<'_> {
             // bit-identical to serial (fixed chunking), so the differential gate is unaffected. The
             // whole-function single-statement form is still intercepted earlier in `lower_program`.
             if let Some(nest) = recognize_matmul(pat, iter, body, self.sema, self.interner) {
-                if self.emit_sgemm(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.k, (label, pat, iter, body), |me| {
+                    me.emit_sgemm(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12372,7 +12424,9 @@ impl FnLowerer<'_> {
             // `@parallel` function). The strided naive form gcc leaves scalar; the kernel streams row-major
             // + 8-wide. Bit-exact (i-ascending per column, same order as the scalar nest).
             if let Some(nest) = match_colsum(pat, iter, body, self.sema, self.interner) {
-                if self.emit_colsum(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.rows, (label, pat, iter, body), |me| {
+                    me.emit_colsum(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -26052,8 +26106,9 @@ fn matmul_fn<'a>(
     recognize_matmul(pat, iter, lb, sema, interner)
 }
 
-/// Lower a recognized matmul function to a thin wrapper that binds its array params to base
-/// pointers and tail-calls `wukong_sgemm`/`wukong_sgemm_parallel`. `None` when `emit_sgemm` declines
+/// Lower a recognized matmul function to a wrapper that binds its array params to base
+/// pointers and calls `wukong_sgemm`/`wukong_sgemm_parallel`. A possibly empty contraction
+/// retains the source loop behind a runtime guard. `None` when an unguarded `emit_sgemm` declines
 /// the shape (it has no kernel for a fused bias or an α on a non-NT store, nor for `Aᵀ·Bᵀ`) — the
 /// caller must then lower the function normally, because the half-built wrapper computes nothing.
 #[allow(clippy::too_many_arguments)]
@@ -26129,7 +26184,19 @@ fn lower_matmul_fn(
             fl.bind_slice(p.name.sym, slot, mty, is_slice);
         }
     }
-    if !fl.emit_sgemm(nest, parallel) {
+    let StmtKind::For {
+        label,
+        pat,
+        iter,
+        body,
+        ..
+    } = &f.body.as_ref()?.stmts.first()?.kind
+    else {
+        return None;
+    };
+    if !fl.emit_nonempty_reduction_loop(nest.k, (label.map(|l| l.sym), pat, iter, body), |me| {
+        me.emit_sgemm(nest, parallel)
+    }) {
         return None;
     }
     if !fl.terminated {
@@ -29886,6 +29953,59 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
     } }
 }
 ";
+
+    #[test]
+    fn possibly_empty_reductions_keep_positive_kernel_paths() {
+        let source = include_str!("../tests/fixtures/zero_inner_recognition.wk");
+        let (program, diagnostics, interner) = lower(source);
+        assert!(diagnostics.iter().all(|d| !d.is_error()), "{diagnostics:?}");
+        let errors = wukong_mir::verify::verify_program(&program);
+        assert!(errors.is_empty(), "{errors:?}");
+        for (function, kernel) in [
+            ("mm", "wukong_sgemm"),
+            ("mm_statement", "wukong_sgemm"),
+            ("colsum", "wukong_colsum_f32"),
+            ("colmax", "wukong_colmax_f32"),
+            ("colmean", "wukong_colmean_f32"),
+        ] {
+            let f = program
+                .funcs
+                .iter()
+                .find(|f| interner.resolve(f.name) == function)
+                .unwrap();
+            assert!(
+                fn_calls(f, &interner, kernel),
+                "{function} lost its positive-extent kernel"
+            );
+            assert!(
+                f.blocks.iter().any(|block| block
+                    .insts
+                    .iter()
+                    .any(|inst| { matches!(inst.op, Op::Cmp(CmpOp::Sgt, _, _)) })),
+                "{function} must guard its runtime reduction extent"
+            );
+        }
+        let aliased = program
+            .funcs
+            .iter()
+            .find(|f| interner.resolve(f.name) == "mm_alias")
+            .unwrap();
+        assert!(
+            !fn_calls(aliased, &interner, "wukong_sgemm"),
+            "a positive extent must not bypass the alias-based kernel decline"
+        );
+        let (generic, diagnostics, interner) = lower_with(
+            source,
+            LowerOptions {
+                recognize: false,
+                ..LowerOptions::default()
+            },
+        );
+        assert!(diagnostics.iter().all(|d| !d.is_error()), "{diagnostics:?}");
+        assert!(kernel_calls(&generic, &interner).is_empty());
+        let errors = wukong_mir::verify::verify_program(&generic);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
 
     /// `LowerOptions::recognize` is the measurement instrument (`WUKONG_NO_RECOGNIZE`, `@generic`):
     /// with it cleared, a nest every recognizer claims must lower to no kernel call at all, and the
