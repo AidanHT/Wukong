@@ -203,6 +203,18 @@ it is an `E0401` that names the fix (`a < b && b < c`); the equality form `a == 
 same way whenever the third operand is not itself a `bool` (an all-`bool` chain still parses as
 `(a == b) == c`). Compound assignment (`+=`, `*=`, `<<=`, `>>=`, …) is supported.
 
+Integer arithmetic wraps at the declared width. Division and remainder by zero return zero;
+signed minimum divided by `-1` wraps to signed minimum, with remainder zero. Shift counts are
+masked to the operand width: `1i32 << 32` is `1`, and `1i32 << 33` is `2`. Right shift fills
+with the sign bit for signed integers and with zero for unsigned integers. These are the
+interpreter and native backend contracts, including optimized execution.
+
+Float-to-integer `as` casts truncate toward zero and saturate at the destination range; NaN
+becomes zero, and negative values cast to unsigned integers become zero. Basic `f64` arithmetic
+uses double precision, but the current transcendental lowering (`exp`, `log`, `sin`, `cos`,
+`erf`, `atan`, and functions built from them) computes through `f32`. An `f64` result from those
+functions does **not** provide double-precision transcendental accuracy.
+
 ## Control flow ✅
 
 ```wukong

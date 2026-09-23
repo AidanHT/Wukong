@@ -43,7 +43,7 @@
 //! ui-test suite and LLVM's FileCheck tests; the deliberate failure on rewrite is the local
 //! addition, because a snapshot tool that silently succeeds is a way to make a red gate green.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -78,20 +78,49 @@ fn run_dir() -> PathBuf {
 }
 
 fn census_path() -> PathBuf {
-    common::repo_root().join("tests").join("recognizer-census.txt")
+    common::repo_root()
+        .join("tests")
+        .join("recognizer-census.txt")
 }
 
-/// Every `wukong_*` symbol named by a `call` in this MIR, deduplicated and sorted.
+/// Runtime symbols plus multiplicity witnesses and the number of inline vector-recipe calls.
+/// Keep bare symbols so the original symbol/fixture floors retain their meaning.
 fn kernel_calls(mir: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
+    let mut counts = BTreeMap::<String, usize>::new();
     for (idx, _) in mir.match_indices("call wukong_") {
         let rest = &mir[idx + "call ".len()..];
         let end = rest
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
-        out.insert(rest[..end].to_string());
+        *counts.entry(rest[..end].to_string()).or_default() += 1;
+    }
+    for (symbol, count) in counts {
+        out.insert(symbol.clone());
+        if count > 1 {
+            out.insert(format!("{symbol}*{count}"));
+        }
+    }
+    let recipes = mir.matches("veckernel #").count();
+    if recipes != 0 {
+        out.insert(format!("veckernel*{recipes}"));
     }
     out
+}
+
+#[test]
+fn census_detects_removed_duplicate_calls_and_vector_recipes() {
+    let one = "call wukong_norm_f32(%1)\n";
+    let two = format!("{one}{one}");
+    assert_ne!(kernel_calls(one), kernel_calls(&two));
+    let recipe = "veckernel #0(ptrs=%1, scalars=%2, n=%3)\n";
+    assert_ne!(kernel_calls(""), kernel_calls(recipe));
+    assert_ne!(
+        kernel_calls(recipe),
+        kernel_calls(&format!("{recipe}{recipe}"))
+    );
+    assert!(kernel_calls(&two).contains("wukong_norm_f32"));
+    assert!(kernel_calls(&two).contains("wukong_norm_f32*2"));
 }
 
 /// Compile one fixture to MIR at -O2 and return its dispatched symbols.
@@ -162,6 +191,7 @@ fn render(rows: &[(String, BTreeSet<String>)]) -> String {
     s.push_str(
         "# Recognizer dispatch census: every `call wukong_*` symbol each tests/run fixture emits\n\
          # at `--emit=mir -O2`, one line per fixture, symbols sorted.\n\
+         # `symbol*N` additionally pins repeated calls; `veckernel*N` pins inline AVX2 recipe calls.\n\
          #\n\
          # GENERATED. Regenerate with:\n\
          #   WUKONG_UPDATE_CENSUS=1 cargo test -p wukongc --test recognizer_census\n\
@@ -206,12 +236,12 @@ fn recognizer_dispatch_matches_the_census() {
 
     let dispatching = rows
         .iter()
-        .filter(|(_, s)| !s.is_empty() && !s.contains(COMPILE_FAILED))
+        .filter(|(_, s)| s.iter().any(|name| name.starts_with("wukong_")))
         .count();
     let distinct: BTreeSet<&String> = rows
         .iter()
         .flat_map(|(_, s)| s.iter())
-        .filter(|s| s.as_str() != COMPILE_FAILED)
+        .filter(|s| s.starts_with("wukong_") && !s.contains('*'))
         .collect();
     let failed: Vec<&str> = rows
         .iter()

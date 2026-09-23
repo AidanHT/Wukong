@@ -55,7 +55,9 @@ const DECLARED_TOLERANCES: &[(&str, &str)] = &[(
 /// fixtures with `extension == \"wk\"`, so `foo.wk.bak` is silently not a fixture: renaming is the
 /// cheapest way in the repo to remove a program from `run_suite`, both invariance gates and the
 /// native differential at once, with no failure anywhere.
-const STRAY_SUFFIXES: &[&str] = &[".wk.bak", ".wk.orig", ".wk.txt", ".wk.old", ".wk.rej", ".wk~"];
+const STRAY_SUFFIXES: &[&str] = &[
+    ".wk.bak", ".wk.orig", ".wk.txt", ".wk.old", ".wk.rej", ".wk~",
+];
 
 fn run_dir() -> PathBuf {
     repo_root().join("tests").join("run")
@@ -238,7 +240,9 @@ fn gates_that_hardcode_a_fixture_name_still_find_it() {
         for lit in string_literals_ending_in_wk(&src) {
             checked += 1;
             if !run_dir().join(&lit).exists() {
-                problems.push(format!("{gate} names tests/run/{lit}, which does not exist"));
+                problems.push(format!(
+                    "{gate} names tests/run/{lit}, which does not exist"
+                ));
             }
         }
     }
@@ -280,7 +284,9 @@ fn every_fail_fixture_pins_exactly_one_code() {
             .filter(|l| l.trim_start().starts_with("// EXPECT-CODE:"))
             .count();
         if n != 1 {
-            problems.push(format!("{name}: {n} `// EXPECT-CODE:` directive(s), expected 1"));
+            problems.push(format!(
+                "{name}: {n} `// EXPECT-CODE:` directive(s), expected 1"
+            ));
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
@@ -402,10 +408,10 @@ fn prose_that_merely_starts_with_the_word_expect_is_not_a_directive() {
 #[test]
 fn an_approx_tolerance_that_asserts_nothing_is_rejected() {
     for bad in [
-        "// EXPECT-OUT-APPROX: 1.0 1.0\n",  // rel >= 1 accepts any same-sign value
-        "// EXPECT-OUT-APPROX: 1.0 0\n",    // not a tolerance
-        "// EXPECT-OUT-APPROX: 1.0 -1e-7\n",// sign typo
-        "// EXPECT-OUT-APPROX: 1.0\n",      // missing the tolerance entirely
+        "// EXPECT-OUT-APPROX: 1.0 1.0\n", // rel >= 1 accepts any same-sign value
+        "// EXPECT-OUT-APPROX: 1.0 0\n",   // not a tolerance
+        "// EXPECT-OUT-APPROX: 1.0 -1e-7\n", // sign typo
+        "// EXPECT-OUT-APPROX: 1.0\n",     // missing the tolerance entirely
     ] {
         assert!(
             parse_directives(bad, "<inline>").is_err(),
@@ -429,7 +435,10 @@ fn a_mutated_expectation_is_rejected() {
         ("-7\n42\n", "the two lines permuted"),
         ("42\n", "a line missing"),
         ("42\n-7\n0\n", "an extra line"),
-        ("", "no output at all — the shape a crashed or non-compiling program has"),
+        (
+            "",
+            "no output at all — the shape a crashed or non-compiling program has",
+        ),
     ];
     for (actual, what) in must_fail {
         assert!(
@@ -443,6 +452,25 @@ fn a_mutated_expectation_is_rejected() {
     assert!(check_stdout("42\n-7", &d).is_ok());
 }
 
+#[test]
+fn contradictory_and_overwritten_expectations_are_rejected() {
+    for line in ["// EXPECT-OUT: 42", "// EXPECT-OUT-APPROX: 1.0 1.625e-7"] {
+        for source in [
+            format!("// EXPECT-OUT-NONE\n{line}\n"),
+            format!("{line}\n// EXPECT-OUT-NONE\n"),
+        ] {
+            assert!(parse_directives(&source, "<inline>").is_err());
+        }
+    }
+    for exit in [0, 1] {
+        let source = format!("// EXPECT-EXIT: 0\n// EXPECT-EXIT: {exit}\n");
+        assert!(parse_directives(&source, "<inline>").is_err());
+    }
+    let valid = parse("// EXPECT-EXIT: 0\n// EXPECT-OUT-NONE\n");
+    assert!(check_stdout("", &valid).is_ok());
+    assert!(check_stdout("42\n", &valid).is_err());
+}
+
 /// The APPROX comparator's three sharp edges, each asserted in both directions.
 #[test]
 fn approx_comparison_is_two_sided_and_rejects_nan() {
@@ -450,7 +478,7 @@ fn approx_comparison_is_two_sided_and_rejects_nan() {
     // Inside the band on both sides.
     assert!(check_stdout("1.6487213373184204\n", &d).is_ok()); // +0.56 ULP, the shipped kernel
     assert!(check_stdout("1.6487212181091309\n", &d).is_ok()); // -0.44 ULP, correctly rounded
-    // Outside it on both sides: 1e-6 relative is ~6x the declared band.
+                                                               // Outside it on both sides: 1e-6 relative is ~6x the declared band.
     assert!(check_stdout("1.6487229194214800\n", &d).is_err());
     assert!(check_stdout("1.6487196219788000\n", &d).is_err());
     // NaN is not "close to" anything, and must never pass.

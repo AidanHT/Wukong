@@ -64,6 +64,27 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Install Python for LLVM verification
+        if: runner.os == 'Linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify emitted LLVM corpus
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install llvmlite==0.44.0
+          cargo build -p wukongc --locked
+          python tools/verify_llvm_corpus.py --compiler target/debug/wukongc --report target/llvm-corpus-verification.json
+
+      - name: Upload LLVM verification results
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-corpus-verification
+          path: target/llvm-corpus-verification.json
+          if-no-files-found: error
+
       # THE PROFILE IS THE POINT OF THIS STEP. `cargo test` above builds everything at -O0, so
       # `wukong_runtime` -- the crate whose first invariant is that each AVX2 kernel agrees with its
       # scalar twin BIT-for-bit -- was only ever verified in the profile where LLVM does the least,

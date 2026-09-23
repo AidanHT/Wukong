@@ -30,7 +30,7 @@ mod common;
 /// this suite, both invariance gates and the native differential with no failure anywhere. That is
 /// the cheapest way in the repo to turn a red gate green. Adding fixtures never trips this; only
 /// losing one does. **Raise it in the same commit that adds fixtures.**
-const MIN_FIXTURES: usize = 388;
+const MIN_FIXTURES: usize = 390;
 
 /// Monotonic counter handing every spawned `wukongc` a distinct scratch directory.
 static WORK_SEQ: AtomicU64 = AtomicU64::new(0);

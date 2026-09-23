@@ -474,8 +474,22 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- LLVM backend ---
     if opts.emit == EmitStage::LlvmIr {
-        print_artifact(&wukong_codegen_llvm::emit_llvm_ir(&program, &interner));
-        return exit::OK;
+        return match wukong_codegen_llvm::try_emit_llvm_ir(&program, &interner) {
+            Ok(ir) => {
+                print_artifact(&ir);
+                exit::OK
+            }
+            Err(message) => {
+                emit_diag(
+                    &Diagnostic::error(message).with_code("C0001"),
+                    opts.error_format,
+                    &renderer,
+                    // Backend errors have no source labels; frontend sources were released.
+                    &SourceMap::new(),
+                );
+                exit::UNIMPLEMENTED
+            }
+        };
     }
     if matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
         return emit_native(&program, &interner, opts);
@@ -1595,17 +1609,15 @@ fn emit_mir(program: &wukong_mir::Program, interner: &Interner) -> bool {
     verify_failed
 }
 
-/// Run the MIR verifier over every function, reporting each violation as an
+/// Run the MIR verifier over the program, including internal call signatures, reporting each violation as an
 /// `internal compiler error (MIR verify)` line. Returns `true` if anything failed. A failure is a
 /// bug in a compiler pass, not in the user's program, so it is reported and the process stops —
 /// never handed on to a backend.
 fn verify_or_ice(program: &wukong_mir::Program) -> bool {
     let mut verify_failed = false;
-    for f in &program.funcs {
-        for ice in wukong_mir::verify::verify_function(f) {
-            eprint_line(&format!("internal compiler error (MIR verify): {ice}"));
-            verify_failed = true;
-        }
+    for ice in wukong_mir::verify::verify_program(program) {
+        eprint_line(&format!("internal compiler error (MIR verify): {ice}"));
+        verify_failed = true;
     }
     verify_failed
 }
@@ -2373,6 +2385,32 @@ mod verify_gate_tests {
             verify_or_ice(&invalid_program(&mut interner)),
             "a `ret` of an undefined value must be reported"
         );
+    }
+
+    #[test]
+    fn verify_or_ice_checks_cross_function_signatures() {
+        use wukong_mir::{Builder, Op};
+        let mut interner = Interner::new();
+        let callee_name = interner.intern("callee");
+        let mut callee = Builder::new(callee_name, MirType::Void);
+        callee.add_param(MirType::Ptr);
+        callee.ret(None);
+        let mut caller = Builder::new(interner.intern("main"), MirType::Void);
+        caller.build_void(Op::Call {
+            func: callee_name,
+            args: vec![],
+        });
+        caller.ret(None);
+        let program = Program {
+            funcs: vec![callee.finish(), caller.finish()],
+            statics: vec![],
+            level: wukong_mir::MirLevel::Low,
+        };
+        assert!(program
+            .funcs
+            .iter()
+            .all(|f| wukong_mir::verify::verify_function(f).is_empty()));
+        assert!(verify_or_ice(&program));
     }
 
     /// And it must stay quiet on well-formed MIR, or every AOT compile would start failing.

@@ -944,6 +944,7 @@ dependencies = [
  "wukong_mir_build",
  "wukong_opt",
  "wukong_parser",
+ "wukong_runtime",
  "wukong_sema",
  "wukong_span",
 ]

@@ -102,6 +102,9 @@ pub fn parse_directives(src: &str, name: &str) -> Result<Directives, String> {
         if let Some(rest) = body.strip_prefix("RUN:") {
             run_args = rest.split_whitespace().map(|s| s.to_string()).collect();
         } else if let Some(rest) = body.strip_prefix("EXPECT-EXIT:") {
+            if exit.is_some() {
+                return Err(format!("{name}:{lineno}: duplicate EXPECT-EXIT directive"));
+            }
             let t = rest.trim();
             exit = Some(t.parse::<i32>().map_err(|e| {
                 format!("{name}:{lineno}: EXPECT-EXIT must be an integer, got {t:?} ({e})")
@@ -131,6 +134,11 @@ pub fn parse_directives(src: &str, name: &str) -> Result<Directives, String> {
         }
     }
 
+    if expect_no_stdout && !out.is_empty() {
+        return Err(format!(
+            "{name}: EXPECT-OUT-NONE cannot be combined with EXPECT-OUT or EXPECT-OUT-APPROX"
+        ));
+    }
     Ok(Directives {
         run_args,
         exit,
