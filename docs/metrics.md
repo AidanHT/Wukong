@@ -1,5 +1,7 @@
 # Metrics that matter — and Wukong's honest standing
 
+**CPU status, 2026-09-23:** the [September evaluation](cpu-evaluation-2026-09.md) and [current closeout tracker](sota-campaign-2026-09/CLOSEOUT-CHECKLIST.md) take precedence over overlapping historical ratios below. Withdrawn and noise-limited rows are not established losses or wins. Recent correctness fixes have no fresh matched-peer performance result.
+
 This document defines, from first principles, the metrics an ML/DL kernel language and its
 compiler must win at, and records Wukong's current standing on each — including the losses.
 It is the north star for optimization work: a change that doesn't move one of these metrics
@@ -188,9 +190,7 @@ Current standing (recorded):
   come near the floor, and even there only log clears it (1.48–1.66×) while exp straddles it
   (1.37–1.54×) — and that is Wukong's non-temporal store regime rather than its core. The earlier numbers were against VML's **default HA mode at
   ~0.5 ULP** — a strictly more accurate peer, so not a like-for-like comparison, and the
-  mismatch was disclosed only in a source comment. **tanh is the one real win: 2.85–3.24× vs
-  VML's fastest mode** (3.93–4.91× vs HA), bought with accuracy — Wukong's tanh is 44 ULP /
-  3.5e-6 relative against VML's ≤1 ULP in every mode. The n = 2¹² row is withdrawn outright:
+  mismatch was disclosed only in a source comment. **The historical tanh comparison is superseded:** the current two-region kernel targets ≤1 ULP; its speed against an accuracy-matched VML peer needs fresh measurement. The n = 2¹² row is withdrawn outright:
   at 16 KiB/array every arm's best-of-40 minimum is 0.5–1.4 µs against a **measured** 100 ns
   `Instant` granularity, so its "ratios" were ratios of 5-to-14 clock ticks and came out as
   exact small fractions.

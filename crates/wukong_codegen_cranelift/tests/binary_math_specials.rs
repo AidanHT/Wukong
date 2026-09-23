@@ -86,7 +86,7 @@ fn binary_math_endpoints_across_lowering_and_backends() {
         }
         cases.extend([(0.75, 1.25, None), (2.0, 3.0, None)]);
         // Keep a scalar tail, placing an exceptional pair there as well.
-        while cases.len() % 8 != 0 {
+        while !cases.len().is_multiple_of(8) {
             cases.push((1.0, 1.0, None));
         }
         cases.push((nan, 0.0, Some(if op == VM2_POW { 1.0 } else { nan })));

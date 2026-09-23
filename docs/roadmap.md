@@ -941,12 +941,12 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   the allocated slot and the compile-time bounds check cannot disagree (`a[9]` on such a length-4 array
   is still `E0501`). Radix prefixes, `_` separators and integer suffixes all decode (`[i32; 0x10]` is
   16). The ceiling is `MAX_CONST_ARRAY_LEN = u32::MAX`: a longer literal length is `E0401`, and the
-  shared folder declines (yielding the invalid-length sentinel 0) whenever an operand or the result
-  exceeds it or the arithmetic would wrap — deliberately, because sema folds in `u64` while mir_build
-  narrows the slot to `u32`. A length naming something that is neither a `const` nor a declared generic
-  is `E0301` rather than a silent length 0. A **symbolic** length (a generic `N`) still has no
-  compile-time value: an array *parameter* `[i32; N]` is just a base pointer and runs, but a *local*
-  `let a: [i32; N]` types as `[T; 0]` and is rejected `E0401`. matmul *dimensions* may be runtime
+  shared folder declines whenever an operand or result exceeds it or arithmetic would wrap.
+  Unfoldable lengths report `E0406`; unknown names report `E0301`. Invalid lengths use an error
+  type, separate from a genuine zero-length array. Calls, returns, assignments and nested aggregate
+  agreement check zero extents too, while preserving compatible inferred empty literals.
+  A **symbolic** array length (a generic `N`) has no fixed-array representation and reports `E0406`
+  in both parameters and locals; use `Tensor[T, N]` for generic dimensions. Matmul *dimensions* may be runtime
   values — a runtime-dimension matmul still dispatches to the GEMM kernel.
 - Ordered comparison (`< <= > >=`) is not defined on `bool`, so a **chained comparison** `a < b < c`
   (which parses left-associatively as `(a < b) < c`) is a compile error (`E0401`) rather than a silent
