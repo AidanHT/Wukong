@@ -15,7 +15,7 @@ import llvmlite.binding as llvm
 
 root = Path(sys.argv[1])
 paths = sorted(root.glob("*.ll"))
-assert len(paths) == 40, f"expected exactly 40 semantic regression modules, got {len(paths)}"
+assert len(paths) == 44, f"expected exactly 44 semantic regression modules, got {len(paths)}"
 llvm.initialize()
 llvm.initialize_native_target()
 llvm.initialize_native_asmprinter()
@@ -65,6 +65,16 @@ def aligned_array(ctype, values):
     return backing, array
 
 
+def adjacent(value, upward, source):
+    """The immediate floating neighbor, with no f64 intermediate step for f32."""
+    if source == "f64":
+        return math.nextafter(value, math.inf if upward else -math.inf)
+    assert value != 0.0 and math.isfinite(value)
+    bits = struct.unpack("!I", struct.pack("!f", value))[0]
+    bits += 1 if (value > 0.0) == upward else -1
+    return struct.unpack("!f", struct.pack("!I", bits))[0]
+
+
 cast_checks = 0
 for source, ft in float_types.items():
     for sign in ["i", "u"]:
@@ -77,13 +87,19 @@ for source, ft in float_types.items():
                 for offset in [-1, 0, 1]:
                     value = float((1 << n) + offset)
                     samples.extend([value, -value])
+                # Integer +/-1 collapses at large floating powers of two. Explicit neighbors
+                # exercise the last representable in-range value and first out-of-range value.
+                for boundary in [ft(2.0 ** n).value, ft(-(2.0 ** n)).value]:
+                    below = adjacent(boundary, False, source)
+                    above = adjacent(boundary, True, source)
+                    assert below < boundary < above
+                    assert ft(below).value == below and ft(above).value == above
+                    samples.extend([below, boundary, above])
             rounded = [ft(x).value for x in samples]
             for value in rounded:
                 actual, want = fn(value), saturation(value, sign, width)
                 assert actual == want, (name, value, actual, want)
                 cast_checks += 1
-            if width == 1:
-                continue
             vector = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)(
                 engine.get_function_address(f"sat_vec_{source}_{sign}{width}")
             )
@@ -100,6 +116,7 @@ for source, ft in float_types.items():
 
 def same_float(actual, expected, source):
     if math.isnan(expected):
+        # NaN classification is the contract here; payload bits are intentionally not compared.
         return math.isnan(actual)
     fmt = "f" if source == "f32" else "d"
     return struct.pack(fmt, actual) == struct.pack(fmt, expected)

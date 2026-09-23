@@ -52,7 +52,6 @@ fn saturating_conversion_modules() {
                 );
                 if bits == 1 {
                     assert!(text.contains("trunc i32 %v1.sat to i1"), "{text}");
-                    continue;
                 }
 
                 // Pointer wrappers avoid a platform-specific vector calling convention in JIT tests.
@@ -66,19 +65,35 @@ fn saturating_conversion_modules() {
                 let output = b.add_param(MirType::Ptr);
                 let x = b.build(vf.clone(), Op::Load(input, vf));
                 let r = b.build(vt.clone(), Op::Cast(kind, x, vt));
+                // Store boolean lanes as bytes so the C ABI oracle does not interpret LLVM's
+                // packed <4 x i1> memory representation as four independent bytes.
+                let stored = if bits == 1 {
+                    let bytes = MirType::Vec(Box::new(MirType::I8), 4);
+                    b.build(bytes.clone(), Op::Cast(CastKind::ZExt, r, bytes))
+                } else {
+                    r
+                };
                 b.build_void(Op::Store {
                     ptr: output,
-                    value: r,
+                    value: stored,
                 });
                 b.ret(None);
                 let text = emit(b.finish(), &i);
                 assert!(
                     text.contains(&format!(
-                        "@llvm.{}.sat.v4i{bits}.v4{from_name}",
-                        cast_name(kind)
+                        "@llvm.{}.sat.v4i{}.v4{from_name}",
+                        cast_name(kind),
+                        if bits == 1 { 32 } else { bits }
                     )),
                     "{text}"
                 );
+                if bits == 1 {
+                    assert!(
+                        text.contains("trunc <4 x i32> %v3.sat to <4 x i1>"),
+                        "{text}"
+                    );
+                    assert!(text.contains("zext <4 x i1> %v3 to <4 x i8>"), "{text}");
+                }
             }
         }
     }
