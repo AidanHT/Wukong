@@ -1,6 +1,6 @@
 // RUN: --run
 // EXPECT-EXIT: 0
-// EXPECT-OUT: 72
+// EXPECT-OUT: 99
 // EXPECT-OUT: 36
 module tests.run.reduce_bf16
 
@@ -9,20 +9,34 @@ module tests.run.reduce_bf16
 // accumulate — the standard ML contract). The values here are bf16-exact small integers, so the
 // fused kernel and a naive sum agree exactly; the wukong_bench gate proves the interpreter and the
 // native backend agree bit-for-bit (both call the identical kernel).
+//
+// y was uniformly 2.0 until 2026-09, which made the dot exactly twice the sum — so the dot line
+// asserted nothing the sum line did not already assert, and wukong_dot_bf16 could have ignored its
+// y pointer entirely, or read y at any stride or from any base, and still passed. y[i] = (i%5)+1
+// makes the pairing of the two streams observable: a relative shift of one element between x and y
+// changes the printed dot.
+//
+// WHERE THE EXPECTED VALUES COME FROM (scalar semantics, never a compiler run). x[i] = i+1 over
+// i in 0..8 and y[i] = (i%5)+1, so the per-term products are
+//   1·1, 2·2, 3·3, 4·4, 5·5, 6·1, 7·2, 8·3  =  1, 4, 9, 16, 25, 6, 14, 24
+// summing to 99, and Σ x = 1+2+…+8 = 36. Every value is a small integer, exact in bf16 and in f32,
+// so neither answer depends on the accumulation order. n = 8 is below the kernel's 16-element
+// vector step, so this fixture covers the scalar tail path; the vector-step shapes live in
+// reduce_bf16_shapes.wk.
 fn main() -> i32 {
     let mut x: [bf16; 8] = [0.0 as bf16; 8];
     let mut y: [bf16; 8] = [0.0 as bf16; 8];
     for i in 0..8 {
-        x[i] = ((i + 1) as f32) as bf16; // 1, 2, ..., 8
-        y[i] = 2.0 as bf16; // all 2
+        x[i] = ((i + 1) as f32) as bf16;       // 1, 2, ..., 8
+        y[i] = ((i % 5 + 1) as f32) as bf16;   // 1, 2, 3, 4, 5, 1, 2, 3
     }
 
-    // dot = Σ x[k]·y[k] = 2·(1+2+…+8) = 144? no: 2·36 = 72.
+    // dot = Σ x[k]·y[k] = 1+4+9+16+25+6+14+24 = 99.
     let mut d: f32 = 0.0;
     for k in 0..8 {
         d = d + (x[k] as f32) * (y[k] as f32);
     }
-    print(d as i32); // 72
+    print(d as i32); // 99
 
     // sum = Σ x[k] = 36.
     let mut s: f32 = 0.0;

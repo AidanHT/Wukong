@@ -1,17 +1,36 @@
 //! End-to-end CLI tests: compile and run each `tests/run/*.wk` program through the real
 //! `wukongc` binary and check its stdout and exit code against directives embedded in the file.
 //!
-//! Directive syntax (in leading `//` comments):
-//!   `// RUN: <extra cli args>`     extra flags passed to wukongc (default: `--run`)
-//!   `// EXPECT-EXIT: <n>`          required process exit code
-//!   `// EXPECT-OUT: <line>`        one expected stdout line, in order
+//! The directive grammar and the stdout comparator live in `common/mod.rs`, shared with
+//! `corpus_lint.rs`, so there is exactly one reader of a fixture's expectations. See that file
+//! for the grammar table.
 //!
-//! This exercises the entire pipeline (lex → parse → sema → MIR → opt → interpret) exactly as a
-//! user would, with zero external dependencies.
+//! This exercises the entire pipeline (lex -> parse -> sema -> MIR -> opt -> interpret) exactly as
+//! a user would, with zero external dependencies.
+//!
+//! ## The floor, and why it exists
+//!
+//! `check_program` **requires** every fixture to declare `EXPECT-EXIT` and to say something about
+//! stdout. Both checks used to be conditional on their directive being present, so a fixture that
+//! declared neither was executed and asserted against nothing:
+//! `tests/run/gemm_fused_bias_slice.wk` printed 36 unchecked numbers for its whole life and was
+//! counted as coverage. `tests/CLAUDE.md` rule 6 already called that vacuous; nothing enforced it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "common/mod.rs"]
+mod common;
+
+/// Floor on the number of collected fixtures.
+///
+/// `collect_programs` used to assert only `!programs.is_empty()`, so renaming a fixture to
+/// `foo.wk.bak` — or moving it into `lib/`, which is deliberately never scanned — removed it from
+/// this suite, both invariance gates and the native differential with no failure anywhere. That is
+/// the cheapest way in the repo to turn a red gate green. Adding fixtures never trips this; only
+/// losing one does. **Raise it in the same commit that adds fixtures.**
+const MIN_FIXTURES: usize = 388;
 
 /// Monotonic counter handing every spawned `wukongc` a distinct scratch directory.
 static WORK_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -42,45 +61,29 @@ impl Drop for ScratchDir {
     }
 }
 
-struct Expect {
-    run_args: Vec<String>,
-    exit: Option<i32>,
-    out_lines: Vec<String>,
-}
-
-fn parse_directives(src: &str) -> Expect {
-    let mut run_args = vec!["--run".to_string()];
-    let mut exit = None;
-    let mut out_lines = Vec::new();
-    for line in src.lines() {
-        let line = line.trim_start();
-        if let Some(rest) = line.strip_prefix("// RUN:") {
-            run_args = rest.split_whitespace().map(|s| s.to_string()).collect();
-        } else if let Some(rest) = line.strip_prefix("// EXPECT-EXIT:") {
-            exit = Some(rest.trim().parse().expect("EXPECT-EXIT must be an integer"));
-        } else if let Some(rest) = line.strip_prefix("// EXPECT-OUT:") {
-            out_lines.push(rest.trim().to_string());
-        }
-    }
-    Expect {
-        run_args,
-        exit,
-        out_lines,
-    }
-}
-
 fn run_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR = crates/wukongc; the suite lives at <repo>/tests/run.
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("tests")
-        .join("run")
+    common::repo_root().join("tests").join("run")
 }
 
 fn check_program(path: &Path) {
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
     let src = std::fs::read_to_string(path).unwrap();
-    let expect = parse_directives(&src);
+    let expect = common::parse_directives(&src, &name).unwrap_or_else(|e| panic!("{e}"));
+
+    // The floor. A fixture that declares neither directive is executed and asserted against
+    // nothing, which reads as coverage and is not.
+    assert!(
+        expect.exit.is_some(),
+        "{name}: no `// EXPECT-EXIT:` directive. Every fixture must pin its exit code; without \
+         one the exit check is skipped entirely and a compile failure looks like a pass."
+    );
+    assert!(
+        expect.constrains_stdout(),
+        "{name}: declares no `// EXPECT-OUT:` / `// EXPECT-OUT-APPROX:` and no \
+         `// EXPECT-OUT-NONE`. Without one of those the stdout check is skipped entirely and the \
+         fixture asserts nothing about what it printed."
+    );
 
     let scratch = ScratchDir::new();
     let output = Command::new(env!("CARGO_BIN_EXE_wukongc"))
@@ -90,42 +93,40 @@ fn check_program(path: &Path) {
         .output()
         .expect("failed to spawn wukongc");
 
-    let name = path.file_name().unwrap().to_string_lossy();
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
     if let Some(code) = expect.exit {
         let actual = output.status.code();
         assert_eq!(
             actual,
             Some(code),
-            "{name}: exit code mismatch (stderr: {})",
-            String::from_utf8_lossy(&output.stderr)
+            "{name}: exit code mismatch (stderr: {stderr})"
         );
     }
 
-    if !expect.out_lines.is_empty() {
-        let actual: Vec<&str> = stdout.lines().collect();
-        assert_eq!(
-            actual,
-            expect.out_lines,
-            "{name}: stdout mismatch\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&output.stderr)
+    if let Err(report) = common::check_stdout(&stdout, &expect) {
+        panic!("{name}: {report}\n--- stderr ---\n{stderr}");
+    }
+
+    for want in &expect.stderr_contains {
+        assert!(
+            stderr.contains(want.as_str()),
+            "{name}: stderr does not contain {want:?}\n--- stderr ---\n{stderr}"
         );
     }
 }
 
 fn collect_programs() -> Vec<PathBuf> {
     let dir = run_dir();
-    let mut programs: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "wk").unwrap_or(false))
-        .collect();
-    programs.sort();
+    let programs = common::collect_wk(&dir);
     assert!(
-        !programs.is_empty(),
-        "no .wk programs found in {}",
-        dir.display()
+        programs.len() >= MIN_FIXTURES,
+        "{} holds {} .wk fixture(s), floor is {MIN_FIXTURES}. A fixture leaves every gate in this \
+         file by being renamed or moved, with no other signal; if the removal was deliberate, \
+         lower MIN_FIXTURES in the same commit and say why.",
+        dir.display(),
+        programs.len()
     );
     programs
 }
@@ -141,6 +142,10 @@ fn run_suite() {
 
 /// Differential hardening: optimization must never change observable behavior. For every program,
 /// running at -O0 and at -O1/-O2/-O3 must produce identical stdout and exit code.
+///
+/// `-O3` is currently byte-identical to `-O2` (`wukong_opt` gates passes on `>= 1` and `>= 2`
+/// only), so that arm cannot fail today. It is kept as forward insurance for the first pass that
+/// tests `>= 3`: the arm that cannot fail now is the arm that catches that pass.
 #[test]
 fn optimization_is_observationally_invariant() {
     for p in &collect_programs() {
@@ -186,6 +191,12 @@ fn run_backend(path: &Path, opt: &str, backend: Option<&str>) -> (Option<i32>, S
 /// the differential oracle, and `optimization_is_observationally_invariant` above only re-runs the
 /// *interpreter* across opt levels — so this is the guard that the *native* path never silently
 /// diverges from the oracle. (All mismatches are collected so one failure reports the full set.)
+///
+/// It is blind to a recognized kernel by construction: both backends call the same
+/// `wukong_runtime` symbol, so a wrong kernel is wrong identically on both sides. What can see a
+/// recognizer is `recognize.rs` (did it fire) and `recognizer_census.rs` (did the set of fired
+/// kernels change); what can see a wrong *value* is only a fixture's own hand-derived
+/// expectations.
 #[test]
 fn native_matches_interpreter() {
     let mut mismatches = Vec::new();

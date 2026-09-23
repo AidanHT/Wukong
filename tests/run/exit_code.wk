@@ -1,8 +1,12 @@
 // RUN: --run
 // EXPECT-EXIT: 7
+// EXPECT-OUT-NONE
 module tests.run.exit_code
 
 /// The value returned from `main` becomes the process exit code.
+///
+/// `EXPECT-OUT-NONE` states the other half of that claim: this program must print nothing. It
+/// used to declare no stdout directive at all, which made the stdout check skip rather than pass.
 fn main() -> i32 {
     return 3 + 4;
 }

@@ -1,8 +1,22 @@
 // RUN: --run
 // EXPECT-EXIT: 1
+// EXPECT-OUT-NONE
+// EXPECT-STDERR: assertion failed
 module tests.run.assert_fail
 
 /// A failing assertion traps with a nonzero exit code and no stdout.
+///
+/// WHY THE STDERR DIRECTIVE IS LOAD-BEARING. `EXPECT-EXIT: 1` alone did not witness anything:
+/// `wukongc`'s COMPILE_ERROR exit code is also 1 and diagnostics also go to stderr, so a fixture
+/// that stopped compiling produced byte-identically the asserted outcome — exit 1, empty stdout —
+/// and this, the corpus's only proof that a failing `assert` traps at all, was green. The stderr
+/// substring separates the two: a compile error says `error[Ennnn]`, a trapped assert says
+/// `assertion failed` (`wukong_interp/src/lib.rs:1229` and `wukong_driver/src/lib.rs:802`; the
+/// Cranelift JIT raises the same string at `wukong_codegen_cranelift/src/lib.rs:3656`).
+///
+/// `EXPECT-OUT-NONE` pins the other half the docstring claimed and nothing checked: stdout empty.
+/// It is a positive assertion, not the absence of a directive — the absence used to mean the
+/// stdout check was skipped entirely.
 fn main() -> i32 {
     assert(1 > 2);
     return 0;

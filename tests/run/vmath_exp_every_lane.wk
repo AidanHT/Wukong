@@ -1,0 +1,86 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-APPROX: 0.36787944117144233 1.625e-7
+// EXPECT-OUT-APPROX: 0.41686201967850839 1.625e-7
+// EXPECT-OUT-APPROX: 0.47236655274101469 1.625e-7
+// EXPECT-OUT-APPROX: 0.53526142851899028 1.625e-7
+// EXPECT-OUT-APPROX: 0.60653065971263342 1.625e-7
+// EXPECT-OUT-APPROX: 0.68728927879097224 1.625e-7
+// EXPECT-OUT-APPROX: 0.77880078307140488 1.625e-7
+// EXPECT-OUT-APPROX: 0.88249690258459546 1.625e-7
+// EXPECT-OUT-APPROX: 1 1.625e-7
+// EXPECT-OUT-APPROX: 1.1331484530668263 1.625e-7
+// EXPECT-OUT-APPROX: 1.2840254166877414 1.625e-7
+// EXPECT-OUT-APPROX: 1.4549914146182013 1.625e-7
+// EXPECT-OUT-APPROX: 1.6487212707001282 1.625e-7
+// EXPECT-OUT-APPROX: 1.8682459574322223 1.625e-7
+// EXPECT-OUT-APPROX: 2.1170000166126748 1.625e-7
+// EXPECT-OUT-APPROX: 2.3988752939670981 1.625e-7
+// EXPECT-OUT-APPROX: 2.7182818284590451 1.625e-7
+// EXPECT-OUT-APPROX: 3.080216848918031 1.625e-7
+// EXPECT-OUT-APPROX: 3.4903429574618414 1.625e-7
+module tests.run.vmath_exp_every_lane
+
+// The derived accuracy contract for `exp` dispatched to wukong_vmath_f32, every lane, at a length
+// that straddles the 8-wide AVX2 boundary.
+//
+// WHY THIS FIXTURE EXISTS. `transcendental_kernel.wk` — the fixture the root CLAUDE.md holds up as
+// THE recognizer proof — feeds a constant [0.5; 16] and prints lanes 0 and 15, which are equal. On
+// that shape the kernel could compute exp once and broadcast it, permute lanes arbitrarily, read
+// the wrong stride, or process only the first 8-lane group, and both printed values would still be
+// exp(0.5). Its two expectations are also the kernel's own 17-digit output, pasted: 1.6487213373
+// 184204 is f32 0x3FD3094D, which is +0.559 ULP from the true exp(0.5) = 1.6487212707001282 (the
+// correctly-rounded f32 is 0x3FD3094C, -0.441 ULP). That is a snapshot, not a derivation, and it
+// cannot be widened into a statement about accuracy.
+//
+// So this file does the other job: 19 DISTINCT inputs — two full 8-lane groups plus a 3-element
+// scalar tail — with every output lane printed RAW and compared against the true e^x computed
+// independently in f64, inside a tolerance that is the kernel's own published error bound.
+//
+// THE TOLERANCE IS NOT INVENTED. 1.625e-7 is the maximum relative error of this exp against f64
+// `exp`, measured EXHAUSTIVELY over every f32 in [-87, 88.37626] by `vmath_exp_log_exhaustive_ulp`
+// and documented at wukong_runtime/src/vmath.rs:124 and :261 (about 1.4 ULP; max 2 ULP). Every one
+// of the 19 inputs is inside that domain. Two consequences worth stating plainly:
+//   * the band is two-sided, with a half-width of 1.4 to 2.7 ULP depending where in its binade a
+//     value sits, so it admits the shipped kernel AND a correctly-rounded exp — a future accuracy
+//     improvement will not break it;
+//   * it is between 1800x and 17000x TIGHTER than the `(y * 1000.0) as i32` idiom the rest of the
+//     corpus uses for transcendentals. That idiom's truncation grants an undeclared ONE-SIDED
+//     tolerance of one whole 1e-3 step, which across these outputs (0.37 to 3.49) is 2.9e-4 to
+//     2.7e-3 relative.
+// `corpus_lint.rs::every_declared_tolerance_has_a_cited_source` refuses any tolerance token that
+// does not have that provenance written down, so this number cannot be quietly relaxed.
+//
+// THE BAND IS NOT A RUBBER STAMP. Measured over these 19 lanes, the shipped kernel's worst
+// relative error is 1.0374e-7 (1.12 ULP, at x = 0.25) — 64% of the declared budget, i.e. 1.57x of
+// headroom. An exp whose error grew by more than about 1.6x would fail this fixture. Two of the 19
+// lanes exceed one ULP of error (x = -0.25 at 1.04 ULP, x = 0.25 at 1.12 ULP) and five exceed half
+// an ULP, so this is a live assertion on the polynomial rather than a formality.
+//
+// WHERE THE EXPECTED VALUES COME FROM (never a compiler run). x[i] = i·0.125 - 1.0 for i in 0..19,
+// i.e. -1.0, -0.875, ..., 1.25 — all exact in f32, being multiples of 1/8. The expectations are
+// e^x evaluated in f64 by an independent reference (Python's math.exp, correctly rounded to f64,
+// which is ~2^29 times finer than the f32 result being checked). Lane 8 is x = 0 where the kernel
+// pins its table entry T[0] to exactly 1.0, so that lane is exact rather than approximate; it is
+// written as an APPROX line anyway so the block reads uniformly, and the comparator's zero-and-
+// infinity rules do not apply at 1.0.
+//
+// GATE-BLINDNESS. This is a recognizer fixture: `wukong_vmath_f32` is called on the interpreter and
+// on native at every -O level, so native_matches_interpreter and both invariance gates would pass a
+// wrong kernel. The dispatch itself is pinned by tests/recognizer-census.txt; the values are pinned
+// only by the lines above.
+fn main() -> i32 {
+    let n: i32 = 19;
+    let mut x: [f32; 19] = [0.0; 19];
+    for i in 0..n {
+        x[i] = (i as f32) * 0.125 - 1.0;
+    }
+    let mut y: [f32; 19] = [0.0; 19];
+    for i in 0..n {
+        y[i] = exp(x[i]);
+    }
+    for i in 0..n {
+        print(y[i]);
+    }
+    return 0;
+}
