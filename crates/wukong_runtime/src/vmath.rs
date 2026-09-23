@@ -1825,6 +1825,8 @@ where
 /// C/Rust on) moves 6 bytes/elem here (2 in + 4 out) vs the f32 kernel's 8, so it runs ~1.3× faster;
 /// an *expensive* transcendental was already a big win (C/Rust can't vectorize a libm call), and bf16
 /// input makes C's gap wider still since it also can't vectorize the bf16→f32 widen.
+/// Overlap follows ascending element order: read one half value, then write one f32 result.
+/// A widening store may overwrite subsequent input bytes; no snapshot is taken.
 ///
 /// # Safety
 /// `x` must be valid for `n` `u16` (bf16 bits); `out` for `n` `f32`.
@@ -1834,6 +1836,9 @@ pub unsafe extern "C" fn wukong_vmath_bf16(x: *const u16, out: *mut f32, n: i64,
         return;
     }
     let n = n as usize;
+    if crate::lowp::half_input_overlaps_f32_output(x, out, n) {
+        return vmath_bf16_scalar(x, out, n, op);
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -1883,6 +1888,7 @@ unsafe fn vmath_bf16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
 /// reading f16 (widened with F16C `vcvtph2ps`, lossless) and writing f32. Equals
 /// `wukong_vmath_f32(widen(x), …)` bit-for-bit (the widen is exact and `f` is the same kernel), so
 /// the interpreter marshals through this kernel and interp == native.
+/// Overlap follows the same ascending read-before-write semantics as [`wukong_vmath_bf16`].
 ///
 /// # Safety
 /// `x` must be valid for `n` `u16` (f16 bits); `out` for `n` `f32`.
@@ -1892,6 +1898,9 @@ pub unsafe extern "C" fn wukong_vmath_f16(x: *const u16, out: *mut f32, n: i64, 
         return;
     }
     let n = n as usize;
+    if crate::lowp::half_input_overlaps_f32_output(x, out, n) {
+        return vmath_f16_scalar(x, out, n, op);
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("f16c")

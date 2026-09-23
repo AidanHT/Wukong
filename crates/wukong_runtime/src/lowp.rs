@@ -937,6 +937,35 @@ fn axpby_bf16_scalar(kind: Half, x: &[u16], y: &[u16], out: &mut [f32], a: f32, 
     }
 }
 
+/// Compare the differently sized byte ranges without forming references or end pointers.
+/// Even equal input/output addresses have a cross-element dependency when stores widen.
+pub(crate) fn half_input_overlaps_f32_output(x: *const u16, out: *mut f32, n: usize) -> bool {
+    let (input, output) = (x as usize, out as usize);
+    if input <= output {
+        output - input < n.saturating_mul(std::mem::size_of::<u16>())
+    } else {
+        input - output < n.saturating_mul(std::mem::size_of::<f32>())
+    }
+}
+
+/// Read both current half values before the widening store, then advance one element.
+/// Later reads deliberately observe bytes overwritten by earlier stores on overlap.
+unsafe fn axpby_widen_overlapping(
+    kind: Half,
+    x: *const u16,
+    y: *const u16,
+    out: *mut f32,
+    n: usize,
+    a: f32,
+    b: f32,
+) {
+    for i in 0..n {
+        let xw = kind.widen(*x.add(i));
+        let yw = kind.widen(*y.add(i));
+        *out.add(i) = b.mul_add(yw, a * xw);
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn axpby_bf16_avx(x: &[u16], y: &[u16], out: &mut [f32], a: f32, b: f32) {
@@ -963,6 +992,8 @@ unsafe fn axpby_bf16_avx(x: &[u16], y: &[u16], out: &mut [f32], a: f32, b: f32) 
 /// `wukong_velem_f32`. bf16 in + f32 out streams 8 bytes/elem vs the f32 kernel's 12, so on a
 /// memory-bound elementwise it runs ~1.5× faster. Compute is f32 (widen is lossless), so the only
 /// rounding is the f32 math — identical in the AVX2 and scalar paths (twin-tested).
+/// Overlapping output follows ascending element order: each step reads both half values before
+/// writing its f32 result. Widening stores may overwrite subsequent inputs; no snapshot is taken.
 ///
 /// # Safety
 /// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `f32`.
@@ -979,6 +1010,9 @@ pub unsafe extern "C" fn wukong_axpby_bf16(
         return;
     }
     let n = n as usize;
+    if half_input_overlaps_f32_output(x, out, n) || half_input_overlaps_f32_output(y, out, n) {
+        return axpby_widen_overlapping(Half::Bf16, x, y, out, n, a, b);
+    }
     let x = std::slice::from_raw_parts(x, n);
     let y = std::slice::from_raw_parts(y, n);
     let out = std::slice::from_raw_parts_mut(out, n);
@@ -1013,6 +1047,7 @@ unsafe fn axpby_f16_avx(x: &[u16], y: &[u16], out: &mut [f32], a: f32, b: f32) {
 /// `out[i] = a·widen(x[i]) + b·widen(y[i])` over `n` **IEEE-f16** inputs with an **f32 output** — the
 /// F16C twin of [`wukong_axpby_bf16`] (widens with `vcvtph2ps`). 8 bytes/elem vs an all-f32 axpby's
 /// 12; the only rounding is the f32 math, identical in the AVX2 and scalar paths (twin-tested).
+/// Overlap follows the same ascending read-before-write semantics as [`wukong_axpby_bf16`].
 ///
 /// # Safety
 /// `x`/`y` must point to `n` readable `u16`; `out` to `n` writable `f32`.
@@ -1029,6 +1064,9 @@ pub unsafe extern "C" fn wukong_axpby_f16(
         return;
     }
     let n = n as usize;
+    if half_input_overlaps_f32_output(x, out, n) || half_input_overlaps_f32_output(y, out, n) {
+        return axpby_widen_overlapping(Half::F16, x, y, out, n, a, b);
+    }
     let x = std::slice::from_raw_parts(x, n);
     let y = std::slice::from_raw_parts(y, n);
     let out = std::slice::from_raw_parts_mut(out, n);
@@ -1537,6 +1575,119 @@ mod tests {
                 axpby_bf16_scalar(kind, &xb, &yb, &mut want, a, b);
                 for i in 0..n {
                     assert_eq!(got[i].to_bits(), want[i].to_bits(), "axpby n={n} i={i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_width_overlap_matches_live_byte_reference() {
+        for kind in [Half::Bf16, Half::F16] {
+            for n in [0usize, 1, 7, 8, 9, 16, 17, 33] {
+                // Byte offsets: identical starts, shifted in each direction, y-only overlap,
+                // both inputs overlapping, and adjacency beyond the wider output range.
+                for (xi, yi, oi) in [
+                    (0, 8 * n + 8, 0),
+                    (0, 8 * n + 8, 4),
+                    (4, 8 * n + 8, 0),
+                    (8 * n + 8, 0, 0),
+                    (8 * n + 8, 2, 0),
+                    (0, 2, 4),
+                    (2 * n, 2 * n + 2, 0),
+                    (4 * n, 4 * n + 2, 0),
+                ] {
+                    for op in [
+                        None,
+                        Some(crate::vmath::VM_RELU),
+                        Some(crate::vmath::VM_SIGMOID),
+                        Some(-1),
+                    ] {
+                        // u32 storage gives every f32 store its required alignment. Both u16
+                        // and f32 accept every initialized bit pattern, including rewritten input.
+                        let mut got: Vec<u32> = (0..3 * n + 16)
+                            .map(|i| {
+                                let lo = kind.narrow((i % 5) as f32 / 4.0);
+                                let hi = kind.narrow((i % 7) as f32 / 4.0);
+                                let [a, b] = lo.to_ne_bytes();
+                                let [c, d] = hi.to_ne_bytes();
+                                u32::from_ne_bytes([a, b, c, d])
+                            })
+                            .collect();
+                        let mut want: Vec<u8> = got.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                        for i in 0..n {
+                            let x = kind.widen(u16::from_ne_bytes([
+                                want[xi + 2 * i],
+                                want[xi + 2 * i + 1],
+                            ]));
+                            let value = if let Some(op) = op {
+                                crate::vmath::apply1(op, x)
+                            } else {
+                                let y = kind.widen(u16::from_ne_bytes([
+                                    want[yi + 2 * i],
+                                    want[yi + 2 * i + 1],
+                                ]));
+                                0.25f32.mul_add(y, 0.5 * x)
+                            };
+                            want[oi + 4 * i..oi + 4 * i + 4].copy_from_slice(&value.to_ne_bytes());
+                        }
+                        let p = got.as_mut_ptr().cast::<u8>();
+                        unsafe {
+                            let x = p.add(xi).cast::<u16>();
+                            let y = p.add(yi).cast::<u16>();
+                            let out = p.add(oi).cast::<f32>();
+                            match (kind, op) {
+                                (Half::Bf16, None) => {
+                                    wukong_axpby_bf16(x, y, out, n as i64, 0.5, 0.25)
+                                }
+                                (Half::F16, None) => {
+                                    wukong_axpby_f16(x, y, out, n as i64, 0.5, 0.25)
+                                }
+                                (Half::Bf16, Some(op)) => {
+                                    crate::wukong_vmath_bf16(x, out, n as i64, op)
+                                }
+                                (Half::F16, Some(op)) => {
+                                    crate::wukong_vmath_f16(x, out, n as i64, op)
+                                }
+                            }
+                        }
+                        let got: Vec<u8> = got.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                        assert_eq!(got, want, "n={n}, offsets=({xi},{yi},{oi}), op={op:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_width_disjoint_output_allows_shared_read_only_inputs() {
+        for kind in [Half::Bf16, Half::F16] {
+            for n in [0usize, 1, 7, 8, 9, 16, 17, 33] {
+                let input: Vec<u16> = (0..n + 1)
+                    .map(|i| kind.narrow((i % 13) as f32 / 4.0 - 1.0))
+                    .collect();
+                for offset in [0usize, 1] {
+                    let mut got = vec![0.0f32; n];
+                    unsafe {
+                        let kernel = match kind {
+                            Half::Bf16 => wukong_axpby_bf16,
+                            Half::F16 => wukong_axpby_f16,
+                        };
+                        kernel(
+                            input.as_ptr(),
+                            input.as_ptr().add(offset),
+                            got.as_mut_ptr(),
+                            n as i64,
+                            0.5,
+                            0.25,
+                        );
+                    }
+                    for i in 0..n {
+                        // Dyadic inputs/coefficient arithmetic is exact in both f64 and f32.
+                        let want = (0.5 * kind.widen(input[i]) as f64
+                            + 0.25 * kind.widen(input[i + offset]) as f64)
+                            as f32;
+                        assert_eq!(got[i].to_bits(), want.to_bits());
+                    }
                 }
             }
         }
