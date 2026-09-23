@@ -4479,8 +4479,13 @@ impl Drop for JitModuleHandle {
 }
 
 /// JIT-compile every function in `program`, returning a handle for fetching their code pointers.
+/// Programs containing assertions require the guarded `JitProgram` invocation API instead.
 pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHandle, String> {
     use cranelift_jit::{JITBuilder, JITModule};
+
+    if !asserting_functions(program, interner)?.is_empty() {
+        return Err("raw JIT function pointers do not support assertion-capable programs; use jit_compile and JitProgram::run or JitProgram::call".into());
+    }
 
     let isa = make_isa(false)?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());

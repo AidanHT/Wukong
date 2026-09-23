@@ -68,6 +68,10 @@ transitively call `assert` require status polling. This uses ordinary generated 
 unwinding through an `extern "C"` frame. `run()` retains its `Err("assertion failed")` contract;
 the timing-only `call()` returns exit code 1 and resets failure state for each invocation.
 
+The raw `jit_module` API rejects any program containing assertion-capable functions: raw code
+pointers cannot provide the invocation lock, failure reset, and error reporting of `JitProgram`.
+Assertion-free programs retain raw pointer access.
+
 Assertion-capable functions cannot currently be taken as callback addresses: native compilation
 rejects them with a cancellation-ABI diagnostic. This includes parallel callbacks; a shared flag
 alone cannot stop effects already running on another worker. AOT Rust/C shims terminate at failure

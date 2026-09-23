@@ -137,3 +137,30 @@ fn assertion_propagation_only_marks_transitively_asserting_functions() {
     );
     assert!(asserting_functions(&safe, &interner).unwrap().is_empty());
 }
+
+#[test]
+fn raw_jit_declines_assertions_and_preserves_assertion_free_calls() {
+    let (bad, bad_interner, bad_main) = lower("fn main() -> i32 { assert(false); return 0; }", 0);
+    let bad = jit_compile(&bad, bad_main, &bad_interner).unwrap();
+    assert_eq!(bad.run(), Err("assertion failed".to_owned()));
+
+    // A raw entry cannot reset or inspect the previous failure flag. Even this passing
+    // assertion would return a dummy zero from its caller under the stale flag.
+    let (good, interner, _) = lower(
+        "fn leaf() -> i32 { assert(true); return 42; }
+         fn main() -> i32 { return leaf(); }",
+        0,
+    );
+    let error = jit_module(&good, &interner)
+        .err()
+        .expect("raw assertion API must decline");
+    assert!(error.contains("raw JIT function pointers"), "{error}");
+    assert!(error.contains("JitProgram::run"), "{error}");
+
+    // An assertion-free raw entry has no status polls and remains valid even after failure.
+    let (safe, interner, main) = lower("fn main() -> i32 { return 42; }", 0);
+    let module = jit_module(&safe, &interner).unwrap();
+    let entry: unsafe extern "C" fn() -> i32 =
+        unsafe { std::mem::transmute(module.func_ptr(main).unwrap()) };
+    assert_eq!(unsafe { entry() }, 42);
+}
