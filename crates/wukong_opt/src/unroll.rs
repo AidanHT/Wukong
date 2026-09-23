@@ -814,6 +814,37 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_folds_the_constant_bound_guard_and_preserves_the_sum() {
+        let mut f = counted_loop_const_bound(4096);
+        assert!(unroll_function(&mut f));
+        assert!(f.blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(i.op, Op::Select(..))));
+        let blocks = f.blocks.len();
+        crate::PassManager::unroll_cleanup().run_function(&mut f, None);
+        assert!(f.blocks[0]
+            .insts
+            .iter()
+            .all(|i| matches!(i.op, Op::ConstInt(..))));
+        assert!(f.blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(i.op, Op::ConstInt(4093, MirType::I64))));
+        // The remainder's condition depends on exit block parameters. Local folding does not
+        // prove their values, so this regression must not claim the remainder disappears.
+        assert_eq!(f.blocks.len(), blocks);
+        assert!(wukong_mir::verify::verify_function(&f).is_empty());
+        let name = f.name;
+        let mut program = wukong_mir::Program::default();
+        program.funcs.push(f);
+        assert_eq!(
+            wukong_interp::run(&program, name, &Interner::new()).unwrap(),
+            8_386_560
+        );
+    }
+
+    #[test]
     fn refuses_a_negative_step() {
         let mut f = counted_loop(-1);
         assert!(!unroll_function(&mut f));
