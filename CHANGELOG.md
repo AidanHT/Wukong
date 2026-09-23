@@ -24,6 +24,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
   remaining findings and performance obligations. These changes do not establish
   new benchmark wins or full SOTA closeout.
 
+### Norm-copy fusion and low-precision reduction order
+
+`try_fuse_copy_norm` can substitute the source of an identity copy directly into a following
+normalization kernel when its matching and alias checks permit it. Dispatch census and recognition
+on/off checks cover this transformation; it is not a new performance measurement.
+
+The bf16 sum/dot kernels use 64 logical f32 accumulation lanes with a fixed fold order. Their
+numeric result intentionally differs from sequential f32 accumulation; f16 retains its distinct
+eight-lane order. `lowp_reductions_beat_the_sequential_f32_sum` checks the accuracy ruling against
+an independent f64 reference on the benchmark inputs. Parallel reductions use fixed chunks and
+need not equal the serial sibling bit for bit. See `wukong_runtime/src/lowp.rs` for the exact order.
+
 ### `wukong-bench compile-work`: compile time as a count, not a clock
 
 The 2026-09 evaluation could not state a compile-time position because its two timing harnesses

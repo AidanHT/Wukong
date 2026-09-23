@@ -1,5 +1,12 @@
 # The compile-time floor — code → object at its principled minimum
 
+> **Current scope, 2026-09-23:** the timing tables below describe their dated compiler and
+> corpus. They predate the MIR `LoopCanon` and `Vectorize` passes and do not attribute those
+> passes' cost. Neither total times nor stage shares establish a current compile-time floor.
+> See the [current pass list](internals.md) and
+> [allocation-count study](sota-campaign-2026-09/FINDING-04-compile-time-is-a-count-not-a-clock.md)
+> for later implementation evidence; fresh timing requires a controlled matched run.
+
 > **STATUS: measured (2026-07-11 central run); partially re-measured 2026-07-30.** The method and
 > floor model below are populated by an authoritative AC, release, warm best-of-N run over the
 > **296-file** corpus: §4–§6 carry real numbers (168.1 ms front→object, the per-stage split, the

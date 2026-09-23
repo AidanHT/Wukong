@@ -95,7 +95,7 @@ what one of them pays for.
 |---|---|---|
 | G1 backend agreement | interp == native (== GPU within `c·√K·ε`) bit-for-bit on the differential suite | `cargo test` differential tests; `wukong_bench` equivalence gate |
 | G2 opt invariance | `-O0` == `-O1/2/3` observable behavior (stdout + exit) on every run fixture | `optimization_is_observationally_invariant` |
-| G3 numerical trust | vmath/norm kernels within documented tolerance of an f64 reference (33/36 vmath ops covered) | `vmath_kernels_match_f64_reference`, `norm.rs` f64 gates |
+| G3 numerical trust | Operation-specific numerical references and special-value contracts; complete 36-op independent f64 coverage is not established | `vmath_matches_libm`, `vmath2_finite_extremes_match_f64_reference`, tanh accuracy tests, `norm.rs` reference gates; see the current closeout tracker for coverage limits |
 | G4 deterministic parallelism | `@parallel` == serial bit-for-bit (fixed chunking, ordered folds) | differential `@parallel` tests |
 | G5 benchmark honesty | measured path = the real pipeline (parse→sema→MIR→opt→Cranelift JIT); recognizers structural, never workload-keyed; strongest-reasonable peer flags; same-run interleaved A/B | fairness audits; cross-checks inside `wukong_xbench` |
 

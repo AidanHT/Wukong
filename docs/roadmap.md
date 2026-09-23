@@ -848,8 +848,8 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 - **Non-contiguous tensor layouts** `.col_major` / `.strided` / `.tiled(N, M)`: they parse (an unknown
   layout name is `E0204`), they are part of the tensor type, and they are enforced across a call
   boundary — passing a `.col_major` tensor to a `Contiguous`-typed parameter is `E0502`. **`.col_major`
-  indexing executes** (`a[i, j]` is byte-identical to `a[i + j*M]` on constant-shape tensors; branch
-  `lang/p3-coalesce`). `.strided` / `.tiled(…)` indexing remains `C0001`. Only the default row-major
+  indexing executes** (`a[i, j]` is byte-identical to `a[i + j*M]` on constant-shape tensors).
+  `.strided` / `.tiled(…)` indexing remains `C0001`. Only the default row-major
   `.contiguous` layout was the sole executing non-symbolic layout before Phase 3.
 - **Coalesced vector global `ld`/`st` on gpu-native: analyzed, not emitted.**
   `wukong_opt::coalesce` classifies each innermost-loop access by IV element stride and marks
@@ -872,7 +872,7 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   itself a strong ML/DL kernel language — generic gpu-native lowering, consuming
   `@tile` / `@generic` / `shared`, explicit vendor kernels rather than silent
   rewrites — lives in [`docs/LANGUAGE_DIRECTION.md`](LANGUAGE_DIRECTION.md). Phase 2 (`@tile`,
-  `shared`, `sync_block`) is on branch `lang/p2-tile-shared` (not merged to `main`); see roadmap
+  `shared`, `sync_block`) is integrated; see roadmap
   "Works end to end" for what runs today. The sequenced
   language mission (including AI-editor / vibe-coding) lives in
   [`docs/WUKONG_MASTER_PLAN.md`](WUKONG_MASTER_PLAN.md).
