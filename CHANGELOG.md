@@ -5,6 +5,25 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### CPU closeout correctness and verification, 2026-09-23
+
+- Runtime and inlined f32 math now agree on `atan2` axis/infinity cases, `hypot`
+  infinity precedence, and `pow` identities involving NaNs. General negative-base
+  `pow` and full f64 transcendental accuracy remain open.
+- `--verify-each` checks MIR during optimization in release builds and reports
+  compiler diagnostics with the failing pass and function.
+- Native compact float-to-boolean vector casts use a bounded scalarization path;
+  vector ABI and unsupported shapes still decline explicitly. Interpreter scalar
+  and vector boolean loads now observe the stored low bit, matching native execution.
+- Interpreter bf16/f16 GEMM preserves existing output for nonzero beta. Genuine
+  zero-length arrays now receive aggregate agreement checks, separately from invalid
+  length recovery; compatible inferred nested empty aggregates remain accepted.
+- Aliased scatter regression coverage now checks every output lane with recognition
+  enabled and disabled. Benchmark manifests record tool paths, versions and hashes.
+  The [closeout tracker](docs/sota-campaign-2026-09/CLOSEOUT-CHECKLIST.md) records
+  remaining findings and performance obligations. These changes do not establish
+  new benchmark wins or full SOTA closeout.
+
 ### `wukong-bench compile-work`: compile time as a count, not a clock
 
 The 2026-09 evaluation could not state a compile-time position because its two timing harnesses
@@ -22,7 +41,7 @@ that has been seen to swing 3.5x on identical inputs.
   allocation (~2 ppm of the backend), which it reports.
 - On that instrument `53e0891` does 31.6% fewer allocations than `d23eefc` to compile the corpus to
   object (optimizer -37.0%, backend -19.4%, parse and lex unchanged, pass invocations -0.6%).
-  See `docs/sota-campaign-2026-09/FINDING-03-compile-time-is-a-count-not-a-clock.md`.
+  See `docs/sota-campaign-2026-09/FINDING-04-compile-time-is-a-count-not-a-clock.md`.
 - `simplify-phis` no longer clones the cached predecessor map per call or allocates per parameter
   in `find_trivial`; `simplify-cfg` reads predecessors and reachability from the analysis cache
   (invalidating after each fold and merge) and skips the constant map when no `cond_br` remains.
@@ -46,7 +65,7 @@ and ±0/±∞/NaN payload/subnormals/the saturation edge
 (0x41102CB4 → 1.0, its predecessor → 1 − 2^-24) pinned by `vmath_tanh_accuracy_and_specials`. The
 composed activations (`gelu`, `mish`, `tanhshrink`, `tanh_backward`, `gelu_backward`) keep the
 exp-composed form (`tanh_exp1`/`tanh_exp8`) so they stay bit-identical to their inlined MIR twins;
-the inlined scalar `emit_tanh` is unchanged. Cost: 35 SIMD ops per vector with one `vdivps` against
+the inlined scalar `emit_tanh` is unchanged. Cost: 36 SIMD ops per vector with one `vdivps` against
 the old 20 with one — an agent-local same-process A/B reads the new kernel at 1.72× the old kernel's
 time (directional only; the campaign instrument re-measures it), which by the evaluation's own
 ratios leaves it 1.8–2.5× ahead of VML at matched accuracy rather than 3.0–4.3× ahead unmatched.
