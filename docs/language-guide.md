@@ -639,7 +639,8 @@ builtins.
 
 ### Math intrinsics ✅
 
-`f32` (scalar or in a loop), each a ≈1-ULP minimax polynomial built from primitive ops:
+`f32` (scalar or in a loop), using hardware operations and polynomial approximations.
+Accuracy depends on the operation and input range; this suite has no uniform 1-ULP guarantee:
 
 - `sqrt(x)` / `rsqrt(x)` — hardware square root (and its reciprocal); `cbrt(x)` — the all-real cube root.
 - `abs(x)` — `|x|` (clearing the float sign bit); vectorizes, and a `fmax(m, abs(x[k]))` loop is the per-tensor
@@ -683,6 +684,14 @@ before logarithm evaluation. The composed `expm1` and `log1p` handle their infin
 endpoints explicitly. These rules apply to runtime kernels and inlined scalar/SIMD formulas;
 they do not establish full libm accuracy or full f64 precision. A softmax row containing NaN,
 positive infinity, or only negative infinities propagates NaNs through its ordinary arithmetic.
+
+`atan2` handles all signed-zero axes and infinite diagonals, including `atan2(-0, -0) = -π`.
+`hypot` returns positive infinity if either input is infinite, even if the other is NaN;
+otherwise NaNs propagate and two zero inputs produce positive zero. `pow(x, ±0) = 1` and
+`pow(1, y) = 1` take precedence over NaNs. General negative-base powers remain outside the
+positive-base approximation contract, and finite overflow retains the exp core's saturation.
+These endpoint rules are shared by the runtime and inlined formulas; they do not imply correctly
+rounded results for other inputs.
 
 When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, **any of the 35**
 transcendentals (`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/the inverse trig/the hyperbolic family/…)

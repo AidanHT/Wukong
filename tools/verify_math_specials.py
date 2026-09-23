@@ -55,16 +55,39 @@ def main():
     }
     for values in cases.values():
         values.extend([(nan, nan), (-nan, nan)])
+    # Uniform (input tuple, expected) representation also covers binary intrinsics.
+    cases = {name: [((x,), expected) for x, expected in values]
+             for name, values in cases.items()}
+    axes = (0.0, -0.0, 1.0, -1.0, inf, -inf, nan, -nan)
+    cases["atan2"] = [((y, x), math.atan2(y, x)) for y in axes for x in axes]
+    tiny = struct.unpack("<f", struct.pack("<I", 1))[0]
+    largest = struct.unpack("<f", struct.pack("<I", 0x7F7FFFFF))[0]
+    cases["atan2"].extend([((-tiny, largest), -0.0), ((tiny, largest), 0.0)])
+    cases["hypot"] = [((a, b), inf if math.isinf(a) or math.isinf(b)
+                       else nan if math.isnan(a) or math.isnan(b) else 0.0)
+                      for a in (0.0, -0.0, inf, -inf, nan, -nan)
+                      for b in (0.0, -0.0, inf, -inf, nan, -nan)]
+    cases["hypot"].extend([((3.0, 4.0), 5.0), ((largest, 0.0), largest), ((tiny, 0.0), tiny)])
+    cases["pow"] = [((x, y), 1.0) for x in axes for y in (0.0, -0.0)]
+    cases["pow"].extend([((1.0, y), 1.0) for y in axes])
+    cases["pow"].extend([((nan, 2.0), nan), ((2.0, nan), nan), ((inf, 2.0), inf),
+                         ((inf, -2.0), 0.0), ((0.0, 2.0), 0.0), ((0.0, -2.0), inf)])
     n = 17  # Four SIMD groups and a scalar tail.
     source = []
-    for name in cases:
-        source.append(f"fn s_{name}(x:f32)->f32 {{ return {name}(x); }}")
-        source.append(f"@generic fn v_{name}(x:[f32;{n}], mut out:[f32;{n}]) {{ "
-                      f"for i in 0..{n} {{ out[i] = {name}(x[i]); }} }}")
+    arities = {name: len(values[0][0]) for name, values in cases.items()}
+    for name, arity in arities.items():
+        names = ["x", "y"][:arity]
+        scalar_params = ",".join(f"{x}:f32" for x in names)
+        vector_params = ",".join(f"{x}:[f32;{n}]" for x in names)
+        vector_args = ",".join(f"{x}[i]" for x in names)
+        source.append(f"fn s_{name}({scalar_params})->f32 {{ return {name}({','.join(names)}); }}")
+        source.append(f"@generic fn v_{name}({vector_params}, mut out:[f32;{n}]) {{ "
+                      f"for i in 0..{n} {{ out[i] = {name}({vector_args}); }} }}")
     # Explicit disjoint call sites provide the frontend's alias proof. Never executed by the JIT.
     source.append(f"fn prove_disjoint() {{ let x:[f32;{n}]=[1.0;{n}]; "
-                  f"let mut out:[f32;{n}]=[0.0;{n}]; "
-                  + " ".join(f"v_{name}(x,out);" for name in cases) + " }")
+                  f"let y:[f32;{n}]=[2.0;{n}]; let mut out:[f32;{n}]=[0.0;{n}]; "
+                  + " ".join(f"v_{name}({'x,y' if arity == 2 else 'x'},out);"
+                             for name, arity in arities.items()) + " }")
     source_path = output / "math_specials.wk"
     source_path.write_text("\n".join(source), encoding="utf-8")
     env = os.environ.copy()
@@ -93,17 +116,19 @@ def main():
             scalar_address = engine.get_function_address(f"s_{name}")
             vector_address = engine.get_function_address(f"v_{name}")
             assert scalar_address and vector_address, name
-            scalar = ctypes.CFUNCTYPE(ctypes.c_float, ctypes.c_float)(scalar_address)
-            vector = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)(vector_address)
-            for x, expected in values:
-                actual = scalar(x)
-                assert matches(actual, expected), (opt, name, x, actual, expected)
+            arity = arities[name]
+            scalar = ctypes.CFUNCTYPE(ctypes.c_float, *([ctypes.c_float] * arity))(scalar_address)
+            vector = ctypes.CFUNCTYPE(None, *([ctypes.c_void_p] * (arity + 1)))(vector_address)
+            for inputs, expected in values:
+                actual = scalar(*inputs)
+                assert matches(actual, expected), (opt, name, inputs, actual, expected)
                 checks += 1
             for shift in range(len(values)):
                 rotated = [values[(i + shift) % len(values)] for i in range(n)]
-                inputs = (ctypes.c_float * n)(*(x for x, _ in rotated))
+                inputs = [(ctypes.c_float * n)(*(xs[j] for xs, _ in rotated))
+                          for j in range(arity)]
                 outputs = (ctypes.c_float * n)()
-                vector(inputs, outputs)
+                vector(*inputs, outputs)
                 for actual, (x, expected) in zip(outputs, rotated):
                     assert matches(actual, expected), (opt, name, "vector/tail", x, actual, expected)
                     checks += 1

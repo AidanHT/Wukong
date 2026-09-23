@@ -17569,9 +17569,7 @@ impl FnLowerer<'_> {
                 Some(MathIntrinsic::Pow) => {
                     let x = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
                     let y = self.vec_lower_value(&args[1], j, lane, vty, w, vlocals);
-                    let lx = self.emit_log_f32(x, vty);
-                    let ylx = self.builder.build(vty.clone(), Op::Bin(BinOp::FMul, y, lx));
-                    self.emit_exp_f32(ylx, vty)
+                    self.emit_pow(x, y, vty)
                 }
                 Some(MathIntrinsic::Atan2) => {
                     let y = self.vec_lower_value(&args[0], j, lane, vty, w, vlocals);
@@ -20358,9 +20356,7 @@ impl FnLowerer<'_> {
                 }
                 let x = self.lower_math_arg(&args[0], &rty);
                 let y = self.lower_math_arg(&args[1], &rty);
-                let lx = self.emit_log(x, &rty);
-                let ylx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, y, lx));
-                Some(self.emit_exp(ylx, &rty))
+                Some(self.emit_pow(x, y, &rty))
             }
             MathIntrinsic::Atan2 => {
                 if args.len() != 2 {
@@ -21317,7 +21313,7 @@ impl FnLowerer<'_> {
 
     /// The Cephes `atan` poly in `f32` (`fty` is `f32` or a `Vec` of `f32`) — mirrors `atan1`/`atan8`
     /// op-for-op: `|x|`, the two breakpoint masks, both reduced candidates blended in (`big` overrides
-    /// `mid`), a degree-3 odd FMA poly, the `π/4`/`π/2` offset, and a sign restore by select. For finite
+    /// `mid`), a degree-3 odd FMA poly, the `π/4`/`π/2` offset, and a bitwise sign restore. For finite
     /// `x` this equals the dispatched 256-bit kernel bit-for-bit (abs/copysign agree with the kernel's
     /// bit-mask forms on finite inputs), so dispatched and composed `atan` agree.
     fn emit_atan_f32(&mut self, x: ValueId, fty: &MirType) -> ValueId {
@@ -21373,13 +21369,7 @@ impl FnLowerer<'_> {
         let yf = self
             .builder
             .build(fty.clone(), Op::Bin(BinOp::FAdd, y, res));
-        // copysign(yf, x) via select (yf ≥ 0): x < 0 ? −yf : yf.
-        let negyf = self
-            .builder
-            .build(fty.clone(), Op::Bin(BinOp::FMul, yf, neg1));
-        let isneg = self.builder.build(mty, Op::Cmp(CmpOp::Folt, x, zero));
-        self.builder
-            .build(fty.clone(), Op::Select(isneg, negyf, yf))
+        self.emit_copysign(yf, x, fty)
     }
 
     /// `tan(x) = sin(x)/cos(x)` — reuses `emit_trig` (which mirrors `sincos1`/`sin8`), so the composed
@@ -21433,31 +21423,90 @@ impl FnLowerer<'_> {
         self.emit_copysign(mag, x, rty)
     }
 
-    /// `atan2(y, x)` — the full-circle angle of `(x, y)` (geometry, robotics, complex argument, RoPE-style
-    /// angle recovery). `atan(y/x)` then a quadrant fix: when `x < 0`, add `+π` (for `y ≥ 0`) or `−π`
-    /// (for `y < 0`). `x = 0` falls out (`y/x = ±∞`, `atan(±∞) = ±π/2`, no fix since `x` is not `< 0`).
-    /// Built only from `emit_atan` + primitives, so it vectorizes and is bit-identical across backends;
-    /// matches libm except at the `(0,0)` origin (→ `NaN` here vs libm's `0`). Works scalar or vector.
+    /// Positive-base power with exact x^0 and 1^y identities, before NaN handling.
+    /// Other inputs retain the runtime's exp(y * log(x)) approximation contract.
+    fn emit_pow(&mut self, x: ValueId, y: ValueId, rty: &MirType) -> ValueId {
+        let lx = self.emit_log(x, rty);
+        let ylx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, y, lx));
+        let ordinary = self.emit_exp(ylx, rty);
+        let result = self.emit_quiet_nan(y, ordinary, rty);
+        let result = self.emit_quiet_nan(x, result, rty);
+        let zero = self.splat_const_f(0.0, rty);
+        let one = self.splat_const_f(1.0, rty);
+        let yzero = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, y, zero));
+        let xone = self
+            .builder
+            .build(mask_ty(rty), Op::Cmp(CmpOp::Foeq, x, one));
+        let identity = self
+            .builder
+            .build(mask_ty(rty), Op::Bin(BinOp::Or, yzero, xone));
+        self.builder
+            .build(rty.clone(), Op::Select(identity, one, result))
+    }
+
+    /// Full-circle angle, including signed-zero axes and infinite diagonals.
+    /// Ordinary finite nonzero inputs retain atan(y/x) and the runtime quadrant correction.
     fn emit_atan2(&mut self, y: ValueId, x: ValueId, rty: &MirType) -> ValueId {
         let mty = mask_ty(rty);
         let q = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, y, x));
-        let a = self.emit_atan(q, rty);
+        let angle = self.emit_atan(q, rty);
         let zero = self.splat_const_f(0.0, rty);
+        let one = self.splat_const_f(1.0, rty);
         let pi = self.splat_const_f(std::f64::consts::PI, rty);
-        let neg_pi = self.splat_const_f(-std::f64::consts::PI, rty);
-        // copysign(π, y) via select: y < 0 → −π, else +π.
-        let yneg = self
+        let half_pi = self.splat_const_f(std::f64::consts::FRAC_PI_2, rty);
+        let quarter_pi = self.splat_const_f(std::f64::consts::FRAC_PI_4, rty);
+        let three_quarter_pi = self.splat_const_f(3.0 * std::f64::consts::FRAC_PI_4, rty);
+        let infinity = self.splat_const_f(f64::INFINITY, rty);
+        let sign_x = self.emit_copysign(one, x, rty);
+        let xneg = self
             .builder
-            .build(mty.clone(), Op::Cmp(CmpOp::Folt, y, zero));
-        let pi_signed = self
+            .build(mty.clone(), Op::Cmp(CmpOp::Folt, sign_x, zero));
+        let pi_signed = self.emit_copysign(pi, y, rty);
+        let adjusted = self
             .builder
-            .build(rty.clone(), Op::Select(yneg, neg_pi, pi));
-        let xneg = self.builder.build(mty, Op::Cmp(CmpOp::Folt, x, zero));
-        let adj = self
+            .build(rty.clone(), Op::Bin(BinOp::FAdd, angle, pi_signed));
+        // Selecting the unadjusted angle retains -0 when a finite ratio underflows.
+        let ordinary = self
             .builder
-            .build(rty.clone(), Op::Select(xneg, pi_signed, zero));
-        self.builder
-            .build(rty.clone(), Op::Bin(BinOp::FAdd, a, adj))
+            .build(rty.clone(), Op::Select(xneg, adjusted, angle));
+        let axis_mag = self.builder.build(rty.clone(), Op::Select(xneg, pi, zero));
+        let axis = self.emit_copysign(axis_mag, y, rty);
+        let vertical = self.emit_copysign(half_pi, y, rty);
+        let diagonal_mag = self
+            .builder
+            .build(rty.clone(), Op::Select(xneg, three_quarter_pi, quarter_pi));
+        let diagonal = self.emit_copysign(diagonal_mag, y, rty);
+        let ax = self.emit_abs(x, rty);
+        let ay = self.emit_abs(y, rty);
+        let xinf = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Foeq, ax, infinity));
+        let yinf = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Foeq, ay, infinity));
+        let xzero = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Foeq, x, zero));
+        let yzero = self.builder.build(mty, Op::Cmp(CmpOp::Foeq, y, zero));
+        let infinite_y = self
+            .builder
+            .build(rty.clone(), Op::Select(xinf, diagonal, vertical));
+        let result = self
+            .builder
+            .build(rty.clone(), Op::Select(xinf, axis, ordinary));
+        let result = self
+            .builder
+            .build(rty.clone(), Op::Select(yinf, infinite_y, result));
+        let result = self
+            .builder
+            .build(rty.clone(), Op::Select(xzero, vertical, result));
+        let result = self
+            .builder
+            .build(rty.clone(), Op::Select(yzero, axis, result));
+        let result = self.emit_quiet_nan(x, result, rty);
+        self.emit_quiet_nan(y, result, rty)
     }
 
     /// `hypot(a, b) = √(a² + b²)`, the overflow-safe 2-norm/magnitude (gradient norms, complex modulus,
@@ -21483,9 +21532,25 @@ impl FnLowerer<'_> {
             .builder
             .build(rty.clone(), Op::Bin(BinOp::FMul, m, root));
         let zero = self.splat_const_f(0.0, rty);
-        let mzero = self.builder.build(mty, Op::Cmp(CmpOp::Foeq, m, zero));
+        let mzero = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Foeq, m, zero));
+        let ordinary = self
+            .builder
+            .build(rty.clone(), Op::Select(mzero, zero, scaled));
+        let result = self.emit_quiet_nan(b, ordinary, rty);
+        let result = self.emit_quiet_nan(a, result, rty);
+        // Infinity takes precedence even over a NaN in the other argument.
+        let infinity = self.splat_const_f(f64::INFINITY, rty);
+        let ainf = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Foeq, aa, infinity));
+        let binf = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Foeq, bb, infinity));
+        let any_inf = self.builder.build(mty, Op::Bin(BinOp::Or, ainf, binf));
         self.builder
-            .build(rty.clone(), Op::Select(mzero, zero, scaled))
+            .build(rty.clone(), Op::Select(any_inf, infinity, result))
     }
 
     /// The exp core in `f32` (`fty` is `f32` or a `Vec` of `f32`): the 8-bucket table reduction,
