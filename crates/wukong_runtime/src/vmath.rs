@@ -515,6 +515,11 @@ fn sigmoid1(x: f32) -> f32 {
 /// would, keeping a fused `silu(x·Wᵀ+b)` bit-equal to the unfused `{ t = x·Wᵀ+b; silu(t) }`.
 #[inline]
 pub(crate) fn silu1(x: f32) -> f32 {
+    // x and sigmoid(x)'s negated exponential can carry opposite NaN signs. Commutation in an
+    // optimized multiply may choose either; explicitly retain the quieted input instead.
+    if x.is_nan() {
+        return f32::from_bits(x.to_bits() | 0x0040_0000);
+    }
     x * sigmoid1(x)
 }
 
@@ -560,6 +565,11 @@ fn softplus1(x: f32) -> f32 {
 /// `mish(x) = x · tanh(softplus(x))` — the smooth, self-gated activation (YOLOv4 / modern vision).
 #[inline]
 fn mish1(x: f32) -> f32 {
+    // softplus's exp(-abs(x)) carries a negative NaN, unlike a positive NaN input. Do not let
+    // optimized multiplication order choose which sign/payload becomes observable.
+    if x.is_nan() {
+        return f32::from_bits(x.to_bits() | 0x0040_0000);
+    }
     x * tanh_exp1(softplus1(x))
 }
 
@@ -724,17 +734,26 @@ fn log10_1(x: f32) -> f32 {
     log1(x) * LOG10_E
 }
 
-/// `sinh(x) = (e^x − e^{−x})/2`. Reuses [`exp1`]; overflows like `libm` for large |x|.
+/// `sinh(x) = (e^x − e^{−x})/2`. Reuses [`exp1`]'s finite saturation; infinite arguments
+/// return signed infinity, and NaNs retain the input sign and payload with the quiet bit set.
 #[allow(clippy::neg_multiply)] // `* -1.0` matches the AVX2 twin's mulps — see `erf1`.
 #[inline]
 fn sinh1(x: f32) -> f32 {
+    if x.is_nan() {
+        return f32::from_bits(x.to_bits() | 0x0040_0000);
+    }
     (exp1(x) - exp1(x * -1.0)) * 0.5
 }
 
-/// `cosh(x) = (e^x + e^{−x})/2`. Reuses [`exp1`]; overflows like `libm` for large |x|.
+/// `cosh(x) = (e^x + e^{−x})/2`. Reuses [`exp1`]'s finite saturation; either infinity returns
+/// positive infinity, and NaNs retain the input sign and payload with the quiet bit set.
 #[allow(clippy::neg_multiply)] // `* -1.0` matches the AVX2 twin's mulps — see `erf1`.
 #[inline]
 fn cosh1(x: f32) -> f32 {
+    // The two exponentials may carry opposite NaN signs after optimization of x * -1.
+    if x.is_nan() {
+        return f32::from_bits(x.to_bits() | 0x0040_0000);
+    }
     (exp1(x) + exp1(x * -1.0)) * 0.5
 }
 
@@ -2174,7 +2193,21 @@ unsafe fn relu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 pub(crate) unsafe fn silu8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // x * sigmoid(x)
-    _mm256_mul_ps(x, sigmoid8(x))
+    preserve_input_nan8(x, _mm256_mul_ps(x, sigmoid8(x)))
+}
+
+/// Pin NaN selection after a composed expression with multiple NaN operands. Their arithmetic
+/// propagation order is not stable under optimization, whereas this bitwise choice is explicit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn preserve_input_nan8(
+    x: std::arch::x86_64::__m256,
+    result: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let quiet = _mm256_or_ps(x, _mm256_castsi256_ps(_mm256_set1_epi32(0x0040_0000)));
+    let nan = _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x);
+    _mm256_blendv_ps(result, quiet, nan)
 }
 
 /// `pub(crate)` for the GEMM fused epilogue (see [`silu8`]); `gelu8` mirrors `gelu1` bit-for-bit.
@@ -2232,7 +2265,7 @@ unsafe fn softplus8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 unsafe fn mish8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     // x · tanh(softplus(x)) — mirrors mish1.
-    _mm256_mul_ps(x, tanh_exp8(softplus8(x)))
+    preserve_input_nan8(x, _mm256_mul_ps(x, tanh_exp8(softplus8(x))))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2421,7 +2454,10 @@ unsafe fn sinh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let ex = exp8(x);
     let enx = exp8(_mm256_mul_ps(x, _mm256_set1_ps(-1.0)));
-    _mm256_mul_ps(_mm256_sub_ps(ex, enx), _mm256_set1_ps(0.5))
+    preserve_input_nan8(
+        x,
+        _mm256_mul_ps(_mm256_sub_ps(ex, enx), _mm256_set1_ps(0.5)),
+    )
 }
 
 /// 8-lane `cosh(x) = (e^x + e^{−x})·0.5` — mirrors [`cosh1`].
@@ -2431,7 +2467,10 @@ unsafe fn cosh8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     let ex = exp8(x);
     let enx = exp8(_mm256_mul_ps(x, _mm256_set1_ps(-1.0)));
-    _mm256_mul_ps(_mm256_add_ps(ex, enx), _mm256_set1_ps(0.5))
+    preserve_input_nan8(
+        x,
+        _mm256_mul_ps(_mm256_add_ps(ex, enx), _mm256_set1_ps(0.5)),
+    )
 }
 
 /// 8-lane `asinh(x) = copysign(log(|x| + √(x²+1)), x)` — mirrors [`asinh1`] (bit-mask abs / sqrt /
@@ -3096,6 +3135,10 @@ mod tests {
     fn vmath_exp_log_dependent_exceptional_classes() {
         for op in [
             VM_SIGMOID,
+            VM_SILU,
+            VM_GELU,
+            VM_TANHSHRINK,
+            VM_ERF,
             VM_ELU,
             VM_SOFTPLUS,
             VM_MISH,
@@ -3116,6 +3159,13 @@ mod tests {
         ] {
             for bits in [0x7fc0_1234, 0xffc0_4321, 0x7f80_0001, 0xff80_0001] {
                 let x = f32::from_bits(bits);
+                if matches!(op, VM_SILU | VM_MISH | VM_SINH | VM_COSH) {
+                    assert_eq!(
+                        apply1(op, x).to_bits(),
+                        bits | 0x0040_0000,
+                        "op={op} must retain the quieted input NaN"
+                    );
+                }
                 let xs = [x; 9];
                 let mut out = [0.0; 9];
                 unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), 9, op) };
