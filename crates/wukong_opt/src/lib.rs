@@ -919,12 +919,15 @@ mod tests {
 
     #[test]
     fn mem2reg_leaves_arrays_and_address_taken_in_memory() {
-        // Array locals are addressed by gep, so they must NOT be promoted; the program is still
-        // correct and the array alloca remains.
+        // Array locals are addressed by gep, so Mem2Reg must NOT promote them. Check that pass
+        // directly: the full pipeline may forward every load, then DSE/DCE legitimately remove
+        // the unread array. Keeping a dead alloca is not part of Mem2Reg's safety contract.
         let src = "fn main() -> i32 { let mut xs: [i32; 3] = [1, 2, 3]; \
                    xs[1] = xs[0] + xs[2]; return xs[1]; }";
         let (mut prog, mut interner) = lower(src);
-        optimize(&mut prog, 2);
+        for f in &mut prog.funcs {
+            mem2reg::Mem2Reg.run_function(f, &mut CfgAnalyses::default());
+        }
         assert!(
             count_allocas(&prog.funcs[0]) >= 1,
             "array slot must stay in memory"
@@ -934,6 +937,15 @@ mod tests {
         }
         let main = interner.intern("main");
         assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 4);
+        // Keep full-pipeline coverage too, with the same exact observable result. Here every
+        // index/value is constant, so load forwarding makes the array entirely unobservable.
+        optimize(&mut prog, 2);
+        assert_eq!(count_allocas(&prog.funcs[0]), 0);
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 4);
+        assert_eq!(run_main_opt(src, 0), 4);
     }
 
     #[test]
@@ -1294,14 +1306,17 @@ mod tests {
         // A pointer slot first written *outside* the entry block can be read before it is written
         // on some path. Promotion would have to materialize an "undefined" pointer, and there is no
         // sound one: `inttoptr 0` is null natively but a valid, addressable slot in the interpreter.
-        // Such a slot must stay in memory. Here `p`'s store is inside the loop body, so the entry
-        // block never initializes it.
+        // Mem2Reg must leave such a slot in memory. Here `p`'s store is inside the loop body, so
+        // the entry block never initializes it. Later CSE can forward the body-local load from
+        // that store and DSE/DCE can remove the unread slot without inventing a pointer value.
         let src = "fn main() -> i32 { let mut a: i32 = 5; let mut t: i32 = 0; \
                    let mut i: i32 = 0; \
                    while i < 3 { let p: *mut i32 = &mut a; t = t + *p; i = i + 1; } \
                    return t; }";
         let (mut prog, mut interner) = lower(src);
-        optimize(&mut prog, 2);
+        for f in &mut prog.funcs {
+            mem2reg::Mem2Reg.run_function(f, &mut CfgAnalyses::default());
+        }
         let (slots, _) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main"));
         assert_eq!(
             slots, 1,
@@ -1311,6 +1326,17 @@ mod tests {
             assert!(wukong_mir::verify::verify_function(f).is_empty());
         }
         let main = interner.intern("main");
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
+        // Retain the full-pipeline semantic check separately from the promotion invariant.
+        optimize(&mut prog, 2);
+        assert_eq!(
+            count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main")),
+            (0, 0),
+            "forwarded pointer stores and reloads should become dead"
+        );
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
         assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
         assert_eq!(run_main_opt(src, 0), 15);
     }
