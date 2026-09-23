@@ -865,15 +865,20 @@ impl<'a, 'k> Interp<'a, 'k> {
             // load reads one. Both `gep` to the element address first.
             Op::Load(p, ty) => {
                 let idx = ptr(reg(regs, *p))?;
-                if let MirType::Vec(_, n) = ty {
+                if let MirType::Vec(lane, n) = ty {
                     let mut lanes = Vec::with_capacity(*n as usize);
                     for i in 0..*n as usize {
-                        lanes.push(
-                            *self
-                                .memory
-                                .get(idx + i)
-                                .ok_or("vector load out of bounds")?,
-                        );
+                        let value = *self
+                            .memory
+                            .get(idx + i)
+                            .ok_or("vector load out of bounds")?;
+                        // I1 occupies one byte natively but represents only its low bit.
+                        // Normalize before Select/branches observe a noncanonical stored byte.
+                        lanes.push(if **lane == MirType::I1 {
+                            mask_lane(value, lane)
+                        } else {
+                            value
+                        });
                     }
                     self.push_vec(lanes)
                 } else {
@@ -881,6 +886,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                     // `[bf16; N]`/`[f16; N]` storage holds reduced precision: round on read (the native
                     // backend stores the rounded 16 bits, so a load there observes the same value).
                     match (ty, v) {
+                        // Keep the general integer-load exemption used by bytewise aggregate
+                        // copies, but match native's unconditional I1 result normalization.
+                        (MirType::I1, Value::Int(i)) => Value::Int(i & 1),
                         (MirType::BF16, Value::Float(f)) => {
                             Value::Float(wukong_runtime::round_bf16(f as f32) as f64)
                         }
@@ -4883,6 +4891,68 @@ mod tests {
             100,
             "negative S must leave the attention output untouched"
         );
+    }
+
+    #[test]
+    fn i1_loads_use_the_low_bit_for_scalar_and_vector_masks() {
+        use wukong_mir::Builder;
+
+        for storage in [MirType::I8, MirType::I1] {
+            for vector in [false, true] {
+                for (lane, expected) in [22, 11, 22, 11, 11].into_iter().enumerate() {
+                    let mut interner = Interner::new();
+                    let name = interner.intern("main");
+                    let mut b = Builder::new(name, MirType::I32);
+                    let buffer = b.alloca(MirType::Array(Box::new(storage.clone()), 5));
+                    let mut pointers = Vec::new();
+                    for (i, byte) in [0, 1, 2, 3, 255].into_iter().enumerate() {
+                        let index = b.build(MirType::I64, Op::ConstInt(i as i128, MirType::I64));
+                        let ptr = b.build(
+                            MirType::Ptr,
+                            Op::Gep {
+                                ptr: buffer,
+                                index,
+                                elem: storage.clone(),
+                            },
+                        );
+                        // The I1 control uses canonical typed stores; I8 stores retain raw bytes.
+                        let value = if storage == MirType::I1 {
+                            byte & 1
+                        } else {
+                            byte
+                        };
+                        let value = b.build(storage.clone(), Op::ConstInt(value, storage.clone()));
+                        b.build_void(Op::Store { ptr, value });
+                        pointers.push(ptr);
+                    }
+                    let yes = b.build(MirType::I32, Op::ConstInt(11, MirType::I32));
+                    let no = b.build(MirType::I32, Op::ConstInt(22, MirType::I32));
+                    let result = if vector {
+                        let mask_ty = MirType::Vec(Box::new(MirType::I1), 5);
+                        let values_ty = MirType::Vec(Box::new(MirType::I32), 5);
+                        let mask = b.build(mask_ty.clone(), Op::Load(buffer, mask_ty));
+                        let yes = b.build(values_ty.clone(), Op::Splat(yes));
+                        let no = b.build(values_ty.clone(), Op::Splat(no));
+                        let selected = b.build(values_ty, Op::Select(mask, yes, no));
+                        b.build(MirType::I32, Op::ExtractLane(selected, lane as u32))
+                    } else {
+                        let mask = b.build(MirType::I1, Op::Load(pointers[lane], MirType::I1));
+                        b.build(MirType::I32, Op::Select(mask, yes, no))
+                    };
+                    b.ret(Some(result));
+                    let program = Program {
+                        funcs: vec![b.finish()],
+                        ..Program::default()
+                    };
+                    assert!(wukong_mir::verify::verify_program(&program).is_empty());
+                    assert_eq!(
+                        run(&program, name, &interner).unwrap(),
+                        expected,
+                        "storage={storage:?}, vector={vector}, lane={lane}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
