@@ -20692,7 +20692,8 @@ impl FnLowerer<'_> {
     /// dispatches to the fused AVX2 kernel instead. Bit-identical across backends (see `emit_exp`).
     fn emit_silu(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let s = self.emit_sigmoid(x, rty);
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, s))
+        let result = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, s));
+        self.emit_quiet_nan(x, result, rty)
     }
 
     /// `gelu(x)` (tanh approximation): `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`. Mirrors the
@@ -20884,13 +20885,12 @@ impl FnLowerer<'_> {
     fn emit_mish(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let sp = self.emit_softplus(x, rty);
         let th = self.emit_tanh(sp, rty);
-        self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, th))
+        let result = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, th));
+        self.emit_quiet_nan(x, result, rty)
     }
 
-    /// `softsign(x) = x / (1 + |x|)`, the bounded polynomial activation. `|x|` is `max(x, −x)` here
-    /// (vs the kernel's bit-clear abs — differing only at ±0, which the `x/(1+|x|)` then washes out:
-    /// the result is ±0 either way). No transcendental, so it vectorizes and is bit-identical across
-    /// backends; a loop dispatches to `softsign8` regardless.
+    /// `softsign(x) = x / (1 + |x|)`, the bounded polynomial activation. Bitwise absolute value
+    /// matches the runtime, including signed zero and NaNs. A loop dispatches to `softsign8`.
     fn emit_softsign(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let ax = self.emit_abs(x, rty);
         let one = self.splat_const_f(1.0, rty);
@@ -21048,7 +21048,8 @@ impl FnLowerer<'_> {
 
     /// `sinh(x)` (`is_cosh == false`) or `cosh(x)` (`true`) = `(eˣ ∓ e⁻ˣ)·0.5`, composed from the
     /// shared `exp` so it vectorizes and stays bit-identical across backends; the dispatched
-    /// `sinh8`/`cosh8` kernel mirrors this op-for-op (`-x` via `·-1` to match). Overflows like libm.
+    /// `sinh8`/`cosh8` kernel mirrors this op-for-op (`-x` via `·-1` to match). Finite extremes
+    /// inherit exp's saturation; input NaNs are explicitly preserved and quieted.
     fn emit_sinh_cosh(&mut self, x: ValueId, rty: &MirType, is_cosh: bool) -> ValueId {
         let neg1 = self.splat_const_f(-1.0, rty);
         let nx = self
@@ -21064,8 +21065,10 @@ impl FnLowerer<'_> {
                 .build(rty.clone(), Op::Bin(BinOp::FSub, ex, enx))
         };
         let half = self.splat_const_f(0.5, rty);
-        self.builder
-            .build(rty.clone(), Op::Bin(BinOp::FMul, combined, half))
+        let result = self
+            .builder
+            .build(rty.clone(), Op::Bin(BinOp::FMul, combined, half));
+        self.emit_quiet_nan(x, result, rty)
     }
 
     /// `asinh(x) = sign(x)·log(|x| + √(x²+1))` — the sign-stable inverse hyperbolic sine (evaluating
@@ -21623,7 +21626,7 @@ impl FnLowerer<'_> {
         let result = self
             .builder
             .build(fty.clone(), Op::Select(is_inf, inf, finite));
-        self.emit_quiet_nan_f32(input, result, fty, &ity)
+        self.emit_quiet_nan(input, result, fty)
     }
 
     /// `log(x)` (natural log) as a fast, deterministic polynomial (≈1 ULP of the true `log`). Always
@@ -21809,22 +21812,36 @@ impl FnLowerer<'_> {
         let result = self
             .builder
             .build(fty.clone(), Op::Select(is_inf, inf, result));
-        self.emit_quiet_nan_f32(input, result, fty, &ity)
+        self.emit_quiet_nan(input, result, fty)
     }
 
     /// Select a quieted input NaN using integer bits so its sign and payload do not depend
     /// on which operand a backend chooses for an otherwise unobserved floating operation.
-    fn emit_quiet_nan_f32(
-        &mut self,
-        input: ValueId,
-        ordinary: ValueId,
-        fty: &MirType,
-        ity: &MirType,
-    ) -> ValueId {
+    fn emit_quiet_nan(&mut self, input: ValueId, ordinary: ValueId, fty: &MirType) -> ValueId {
+        if matches!(fty.lane_type(), MirType::F16 | MirType::BF16) {
+            let wide = float_ty_like(fty, MirType::F32);
+            let input = self
+                .builder
+                .build(wide.clone(), Op::Cast(CastKind::FpExt, input, wide.clone()));
+            let ordinary = self.builder.build(
+                wide.clone(),
+                Op::Cast(CastKind::FpExt, ordinary, wide.clone()),
+            );
+            let result = self.emit_quiet_nan(input, ordinary, &wide);
+            return self.builder.build(
+                fty.clone(),
+                Op::Cast(CastKind::FpTrunc, result, fty.clone()),
+            );
+        }
+        let (lane, quiet_mask) = match fty.lane_type() {
+            MirType::F64 => (MirType::I64, 0x0008_0000_0000_0000),
+            _ => (MirType::I32, 0x0040_0000),
+        };
+        let ity = float_ty_like(fty, lane);
         let bits = self
             .builder
             .build(ity.clone(), Op::Cast(CastKind::Bitcast, input, ity.clone()));
-        let quiet_bit = self.splat_const_i(0x0040_0000, ity);
+        let quiet_bit = self.splat_const_i(quiet_mask, &ity);
         let quiet = self
             .builder
             .build(ity.clone(), Op::Bin(BinOp::Or, bits, quiet_bit));

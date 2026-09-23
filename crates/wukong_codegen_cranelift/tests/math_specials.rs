@@ -94,8 +94,8 @@ fn half_abs_promotes_before_bit_manipulation() {
 #[test]
 fn inlined_math_specials_match_runtime_and_explicit_endpoints() {
     use wukong_runtime::{
-        VM_ASINH, VM_CBRT, VM_EXP, VM_EXPM1, VM_LOG, VM_LOG1P, VM_LOGSIGMOID, VM_SIGMOID,
-        VM_SOFTPLUS,
+        VM_ASINH, VM_CBRT, VM_COSH, VM_EXP, VM_EXPM1, VM_LOG, VM_LOG1P, VM_LOGSIGMOID, VM_MISH,
+        VM_SIGMOID, VM_SILU, VM_SINH, VM_SOFTPLUS,
     };
     let cases = [
         f32::INFINITY,
@@ -143,6 +143,10 @@ fn inlined_math_specials_match_runtime_and_explicit_endpoints() {
         ("logsigmoid", VM_LOGSIGMOID),
         ("asinh", VM_ASINH),
         ("cbrt", VM_CBRT),
+        ("mish", VM_MISH),
+        ("silu", VM_SILU),
+        ("sinh", VM_SINH),
+        ("cosh", VM_COSH),
     ] {
         let mut expected = vec![0.0; n];
         unsafe {
@@ -194,6 +198,13 @@ fn inlined_math_specials_match_runtime_and_explicit_endpoints() {
             }
             VM_SIGMOID | VM_SOFTPLUS => assert_eq!(expected[1].to_bits(), 0),
             VM_LOGSIGMOID => assert_eq!(expected[1], f32::NEG_INFINITY),
+            VM_SINH => assert_eq!(expected[1], f32::NEG_INFINITY),
+            VM_COSH => assert_eq!(expected[1], f32::INFINITY),
+            VM_MISH | VM_SILU => {
+                assert!(expected[1].is_nan());
+                assert_eq!(expected[4].to_bits(), 0);
+                assert_eq!(expected[5].to_bits(), 0x8000_0000);
+            }
             _ => unreachable!(),
         }
         let source = format!(
@@ -291,6 +302,13 @@ fn inlined_math_specials_match_runtime_and_explicit_endpoints() {
             let mut kernel = 0.0f32;
             unsafe {
                 wukong_runtime::wukong_vmath_f32(&x, &mut kernel, 1, op);
+            }
+            if matches!(op, VM_MISH | VM_SILU | VM_SINH | VM_COSH) {
+                assert_eq!(
+                    kernel.to_bits(),
+                    input | 0x0040_0000,
+                    "{name} quiet input NaN"
+                );
             }
             assert_eq!(
                 unsafe { scalar_call(x) }.to_bits(),
