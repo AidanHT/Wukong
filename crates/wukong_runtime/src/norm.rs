@@ -34,6 +34,11 @@
 //! `tests/run/norm_blocked_every_lane.wk`, which prints every lane of a dispatched 100- and
 //! 112-element row against expectations derived from the scalar reading of the loop).
 
+//! Softmax and log-softmax use ordinary exceptional arithmetic: a row containing NaN or +∞,
+//! or a fully masked row of -∞, yields NaNs. In particular, -∞ - -∞ is NaN and exp propagates
+//! it (W16/FINDING-05); there is no special fully masked-row policy. A row with one finite
+//! element and otherwise -∞ gives exactly one/zero probabilities and zero/-∞ log-probabilities.
+
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
 use crate::vmath::{exp1, log1};
@@ -72,8 +77,8 @@ fn hmax8(a: [f32; 8]) -> f32 {
 /// `f32::max`, so it mirrors the AVX2 `_mm256_max_ps` chain bit-for-bit on NaN rows too and not only on
 /// finite data (its ragged tail *does* use `f32::max`, but so does the AVX2 tail — same fold both
 /// sides, and [`hmax8`] likewise; pinned by
-/// `scalar_matches_avx2_on_nan_rows`; `exp1`/`exp8` saturate NaN rather than propagating it, so a
-/// divergent row max would survive into the output).
+/// `scalar_matches_avx2_on_nan_rows`). The reduction order remains shared even though NaNs
+/// now propagate through `exp1`/`exp8` into the normalized row.
 #[inline(always)]
 fn maxps(a: f32, b: f32) -> f32 {
     if a > b {
@@ -1085,6 +1090,61 @@ mod tests {
     }
 
     #[test]
+    fn softmax_exp_log_exceptional_rows() {
+        for n in [1usize, 7, 8, 9, 31, 32, 33, 65] {
+            for op in [NORM_SOFTMAX, NORM_LOGSOFTMAX] {
+                // Independent expected classes: every fully masked row is undefined, including
+                // n=1, which formerly returned approximately one through exp(NaN) saturation.
+                for special in [
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                    f32::from_bits(0x7fc0_1234),
+                ] {
+                    let x = vec![special; n];
+                    let mut scalar = vec![0.0; n];
+                    unsafe {
+                        if op == NORM_SOFTMAX {
+                            softmax_row_scalar(x.as_ptr(), scalar.as_mut_ptr(), n);
+                        } else {
+                            logsoftmax_row_scalar(x.as_ptr(), scalar.as_mut_ptr(), n);
+                        }
+                    }
+                    assert!(
+                        scalar.iter().all(|x| x.is_nan()),
+                        "op={op} n={n} x={special}"
+                    );
+                    #[cfg(target_arch = "x86_64")]
+                    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                        let mut lanes = vec![0.0; n];
+                        unsafe {
+                            if op == NORM_SOFTMAX {
+                                softmax_row_avx2(x.as_ptr(), lanes.as_mut_ptr(), n);
+                            } else {
+                                logsoftmax_row_avx2(x.as_ptr(), lanes.as_mut_ptr(), n);
+                            }
+                        }
+                        for (a, b) in scalar.iter().zip(lanes) {
+                            assert_eq!(a.to_bits(), b.to_bits(), "op={op} n={n} x={special}");
+                        }
+                    }
+                }
+                let mut x = vec![f32::NEG_INFINITY; n];
+                x[n / 2] = 3.0;
+                let mut out = vec![0.0; n];
+                unsafe { wukong_norm_f32(x.as_ptr(), out.as_mut_ptr(), 1, n as i64, 0, op) };
+                for (i, actual) in out.into_iter().enumerate() {
+                    let expected: f32 = match (op, i == n / 2) {
+                        (NORM_SOFTMAX, true) => 1.0,
+                        (NORM_SOFTMAX, false) | (NORM_LOGSOFTMAX, true) => 0.0,
+                        _ => f32::NEG_INFINITY,
+                    };
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "op={op} n={n} i={i}");
+                }
+            }
+        }
+    }
+
+    #[test]
     #[cfg(target_arch = "x86_64")]
     fn scalar_matches_avx2_bit_for_bit() {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
@@ -1143,11 +1203,9 @@ mod tests {
 
     /// A row whose maximum shares an 8-lane slot with a later NaN. The AVX2 body folds the max with
     /// `_mm256_max_ps` (= `a > b ? a : b`, so a NaN in the freshly *loaded* operand wins and poisons
-    /// the lane), the scalar twin folds with `f32::max` (= `maxNum`, which always drops the NaN and
-    /// keeps the peak) — so the two paths pick a different row max `m`. `exp1`/`exp8` saturate NaN to
-    /// `exp(EXP_HI)` instead of propagating it, so the divergent `m` survives into the output rather
-    /// than washing the row out to all-NaN. The module contract at the top of this file claims the two
-    /// paths agree bit-for-bit with no finiteness caveat, so this must hold.
+    /// the lane). The scalar twin uses the same maxps rule; its former f32::max rule kept the peak
+    /// and picked a different row maximum. Both paths must retain the same reduction order,
+    /// including now that exp propagates NaNs into the output.
     ///
     /// `peak = nan_at - 8` puts the peak in the same lane and an earlier chunk, which is the only
     /// arrangement that exposes it: a NaN elsewhere merely poisons a lane that does not hold the row
