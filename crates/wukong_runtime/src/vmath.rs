@@ -1333,32 +1333,86 @@ pub const VM2_GELU_GATE: i64 = 10;
 pub const VM2_SIGMOID_GATE: i64 = 11; // sigmoid_gate(a, b) = sigmoid(a) · b — the classic GLU gate
 
 /// `pow(x, y) = e^{y·ln x}` (x > 0) — mirrors `emit_pow` via the shared exp/log.
+/// The exact identities x^0 = 1 and 1^y = 1 take precedence over NaNs. Otherwise the first
+/// NaN argument wins, with its original sign/payload quieted. Finite exp saturation remains.
 #[inline]
 fn pow2_1(x: f32, y: f32) -> f32 {
+    if y == 0.0 || x == 1.0 {
+        return 1.0;
+    }
+    if x.is_nan() {
+        return f32::from_bits(x.to_bits() | 0x0040_0000);
+    }
+    if y.is_nan() {
+        return f32::from_bits(y.to_bits() | 0x0040_0000);
+    }
     exp1(y * log1(x))
 }
 
-/// `atan2(y, x)` — `atan(y/x)` + the quadrant fix (`x<0` adds `copysign(π, y)`; `x=0` falls out via
-/// `atan(±∞)=±π/2`). Mirrors `emit_atan2`.
+/// `atan2(y, x)` uses `atan(y/x)` plus the quadrant fix for finite nonzero inputs. Signed
+/// zeros and infinities select their angles explicitly; the first NaN argument wins, quieted.
+/// Returning `atan(y/x)` directly for positive x retains a negative zero from ratio underflow.
 #[inline]
 fn atan2_1(y: f32, x: f32) -> f32 {
-    let a = atan1(y / x);
-    let adj = if x < 0.0 {
-        if y < 0.0 {
-            -std::f32::consts::PI
-        } else {
+    if y.is_nan() {
+        return f32::from_bits(y.to_bits() | 0x0040_0000);
+    }
+    if x.is_nan() {
+        return f32::from_bits(x.to_bits() | 0x0040_0000);
+    }
+    if y == 0.0 {
+        return if x.is_sign_negative() {
             std::f32::consts::PI
+        } else {
+            0.0
         }
+        .copysign(y);
+    }
+    if x == 0.0 {
+        return std::f32::consts::FRAC_PI_2.copysign(y);
+    }
+    if y.is_infinite() {
+        let angle = if x.is_infinite() {
+            if x.is_sign_negative() {
+                3.0 * std::f32::consts::FRAC_PI_4
+            } else {
+                std::f32::consts::FRAC_PI_4
+            }
+        } else {
+            std::f32::consts::FRAC_PI_2
+        };
+        return angle.copysign(y);
+    }
+    if x.is_infinite() {
+        return if x.is_sign_negative() {
+            std::f32::consts::PI
+        } else {
+            0.0
+        }
+        .copysign(y);
+    }
+    let a = atan1(y / x);
+    if x < 0.0 {
+        a + std::f32::consts::PI.copysign(y)
     } else {
-        0.0
-    };
-    a + adj
+        a
+    }
 }
 
 /// `hypot(a, b) = m·√((a/m)²+(b/m)²)`, `m = max(|a|,|b|)`, guarded `m==0 → 0`. Mirrors `emit_hypot`
 /// (the `fma(rb,rb,ra²)` order matches; abs clears the sign bit).
 #[inline]
 fn hypot_1(a: f32, b: f32) -> f32 {
+    // Infinity takes precedence even over NaN. Otherwise preserve the first NaN's payload.
+    if a.is_infinite() || b.is_infinite() {
+        return f32::INFINITY;
+    }
+    if a.is_nan() {
+        return f32::from_bits(a.to_bits() | 0x0040_0000);
+    }
+    if b.is_nan() {
+        return f32::from_bits(b.to_bits() | 0x0040_0000);
+    }
     let aa = f32::from_bits(a.to_bits() & 0x7FFF_FFFF);
     let bb = f32::from_bits(b.to_bits() & 0x7FFF_FFFF);
     let m = if aa > bb { aa } else { bb };
@@ -1494,11 +1548,51 @@ fn apply2_1(op: i64, x: f32, y: f32) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+unsafe fn map_scalar2_8(
+    x: std::arch::x86_64::__m256,
+    y: std::arch::x86_64::__m256,
+    f: fn(f32, f32) -> f32,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let mut xs = [0.0; 8];
+    let mut ys = [0.0; 8];
+    _mm256_storeu_ps(xs.as_mut_ptr(), x);
+    _mm256_storeu_ps(ys.as_mut_ptr(), y);
+    for (x, y) in xs.iter_mut().zip(ys) {
+        *x = f(*x, y);
+    }
+    _mm256_loadu_ps(xs.as_ptr())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn nonfinite2_8(
+    x: std::arch::x86_64::__m256,
+    y: std::arch::x86_64::__m256,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let abs = _mm256_set1_epi32(0x7fff_ffff);
+    let max_finite = _mm256_set1_epi32(0x7f7f_ffff);
+    _mm256_castsi256_ps(_mm256_or_si256(
+        _mm256_cmpgt_epi32(_mm256_and_si256(_mm256_castps_si256(x), abs), max_finite),
+        _mm256_cmpgt_epi32(_mm256_and_si256(_mm256_castps_si256(y), abs), max_finite),
+    ))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn pow2_8(
     x: std::arch::x86_64::__m256,
     y: std::arch::x86_64::__m256,
 ) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
+    let identity = _mm256_or_ps(
+        _mm256_cmp_ps::<_CMP_EQ_OQ>(x, _mm256_set1_ps(1.0)),
+        _mm256_cmp_ps::<_CMP_EQ_OQ>(y, _mm256_setzero_ps()),
+    );
+    if _mm256_movemask_ps(_mm256_or_ps(identity, nonfinite2_8(x, y))) != 0 {
+        return map_scalar2_8(x, y, pow2_1);
+    }
     exp8(_mm256_mul_ps(y, log8(x)))
 }
 
@@ -1509,18 +1603,21 @@ unsafe fn atan2_8(
     x: std::arch::x86_64::__m256,
 ) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
-    let a = atan8(_mm256_div_ps(y, x));
     let zero = _mm256_setzero_ps();
-    let yneg = _mm256_cmp_ps::<_CMP_LT_OQ>(y, zero);
-    // yneg ? −π : π
-    let pi_signed = _mm256_blendv_ps(
+    let iszero = _mm256_or_ps(
+        _mm256_cmp_ps::<_CMP_EQ_OQ>(x, zero),
+        _mm256_cmp_ps::<_CMP_EQ_OQ>(y, zero),
+    );
+    if _mm256_movemask_ps(_mm256_or_ps(iszero, nonfinite2_8(y, x))) != 0 {
+        return map_scalar2_8(y, x, atan2_1);
+    }
+    let a = atan8(_mm256_div_ps(y, x));
+    let pi_signed = _mm256_or_ps(
         _mm256_set1_ps(std::f32::consts::PI),
-        _mm256_set1_ps(-std::f32::consts::PI),
-        yneg,
+        _mm256_and_ps(y, _mm256_set1_ps(-0.0)),
     );
     let xneg = _mm256_cmp_ps::<_CMP_LT_OQ>(x, zero);
-    let adj = _mm256_blendv_ps(zero, pi_signed, xneg); // xneg ? pi_signed : 0
-    _mm256_add_ps(a, adj)
+    _mm256_blendv_ps(a, _mm256_add_ps(a, pi_signed), xneg)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1530,6 +1627,9 @@ unsafe fn hypot8_2(
     b: std::arch::x86_64::__m256,
 ) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
+    if _mm256_movemask_ps(nonfinite2_8(a, b)) != 0 {
+        return map_scalar2_8(a, b, hypot_1);
+    }
     let absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
     let aa = _mm256_and_ps(a, absmask);
     let bb = _mm256_and_ps(b, absmask);
@@ -2869,6 +2969,151 @@ mod tests {
         let xa: Vec<f32> = (0..n).map(|i| (i as f32 - 499.0) * 0.011).collect();
         check(VM2_ATAN2, &ya, &xa, |y, x| y.atan2(x), 5e-5);
         check(VM2_HYPOT, &ya, &xa, |a, b| a.hypot(b), 5e-5);
+    }
+
+    fn check_vmath2_special_bits(op: i64, x: f32, y: f32, expected: u32) {
+        assert_eq!(
+            apply2_1(op, x, y).to_bits(),
+            expected,
+            "op={op} ({x:?}, {y:?})"
+        );
+        // Mixed ordinary/exceptional lanes, every SIMD position, and a scalar tail in one call.
+        for at in 0..8 {
+            let mut xs = [1.5; 17];
+            let mut ys = [2.0; 17];
+            xs[at] = x;
+            ys[at] = y;
+            xs[16] = x;
+            ys[16] = y;
+            let mut out = [0.0; 17];
+            unsafe { wukong_vmath2_f32(xs.as_ptr(), ys.as_ptr(), out.as_mut_ptr(), 17, op) };
+            assert_eq!(
+                out[at].to_bits(),
+                expected,
+                "op={op} lane={at} ({x:?}, {y:?})"
+            );
+            assert_eq!(out[16].to_bits(), expected, "op={op} tail ({x:?}, {y:?})");
+            for ((a, b), actual) in xs.into_iter().zip(ys).zip(out) {
+                assert_eq!(actual.to_bits(), apply2_1(op, a, b).to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn vmath2_atan2_signed_axes_infinities_and_nans() {
+        let values = [0.0, -0.0, 1.0, -1.0, f32::INFINITY, f32::NEG_INFINITY];
+        for y in values {
+            for x in values {
+                // These are the exact axis/diagonal endpoints, independently supplied by f64 libm.
+                let expected = f64::from(y).atan2(f64::from(x)) as f32;
+                check_vmath2_special_bits(VM2_ATAN2, y, x, expected.to_bits());
+            }
+        }
+        for bits in [0x7fc0_1234, 0xffc0_4321, 0x7f80_0001, 0xff80_0001] {
+            let nan = f32::from_bits(bits);
+            for ordinary in values {
+                check_vmath2_special_bits(VM2_ATAN2, nan, ordinary, bits | 0x0040_0000);
+                check_vmath2_special_bits(VM2_ATAN2, ordinary, nan, bits | 0x0040_0000);
+            }
+            check_vmath2_special_bits(VM2_ATAN2, nan, -nan, bits | 0x0040_0000);
+        }
+        // A finite nonzero quotient can underflow; adding an unnecessary +0 erased its sign.
+        check_vmath2_special_bits(VM2_ATAN2, -f32::from_bits(1), f32::MAX, (-0.0f32).to_bits());
+    }
+
+    #[test]
+    fn vmath2_hypot_infinity_precedence_and_nan_payloads() {
+        let nan_a = f32::from_bits(0x7f80_0123);
+        let nan_b = f32::from_bits(0xffc0_4567);
+        for inf in [f32::INFINITY, f32::NEG_INFINITY] {
+            for other in [0.0, -0.0, 1.0, f32::MAX, inf, -inf, nan_a, nan_b] {
+                check_vmath2_special_bits(VM2_HYPOT, inf, other, f32::INFINITY.to_bits());
+                check_vmath2_special_bits(VM2_HYPOT, other, inf, f32::INFINITY.to_bits());
+            }
+        }
+        for (a, b, expected) in [
+            (nan_a, 0.0, nan_a.to_bits() | 0x0040_0000),
+            (0.0, nan_b, nan_b.to_bits() | 0x0040_0000),
+            (nan_a, nan_b, nan_a.to_bits() | 0x0040_0000),
+            (nan_b, nan_a, nan_b.to_bits() | 0x0040_0000),
+            (f32::MAX, 0.0, f32::MAX.to_bits()),
+            (f32::MAX, f32::MAX, f32::INFINITY.to_bits()),
+            (-0.0, -0.0, 0),
+            (f32::from_bits(3), f32::from_bits(4), 5),
+        ] {
+            check_vmath2_special_bits(VM2_HYPOT, a, b, expected);
+        }
+    }
+
+    #[test]
+    fn vmath2_pow_identities_and_nan_precedence() {
+        for x in [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7f80_0123),
+            f32::from_bits(0xffc0_4567),
+        ] {
+            for zero in [0.0, -0.0] {
+                check_vmath2_special_bits(VM2_POW, x, zero, 1.0f32.to_bits());
+            }
+            check_vmath2_special_bits(VM2_POW, 1.0, x, 1.0f32.to_bits());
+        }
+        for bits in [0x7fc0_1234, 0xffc0_4321, 0x7f80_0001, 0xff80_0001] {
+            let nan = f32::from_bits(bits);
+            check_vmath2_special_bits(VM2_POW, nan, 2.0, bits | 0x0040_0000);
+            check_vmath2_special_bits(VM2_POW, 2.0, nan, bits | 0x0040_0000);
+            check_vmath2_special_bits(VM2_POW, nan, -nan, bits | 0x0040_0000);
+        }
+        for (x, y, expected) in [
+            (f32::INFINITY, 2.0, f32::INFINITY),
+            (f32::INFINITY, -2.0, 0.0),
+            (2.0, f32::INFINITY, f32::INFINITY),
+            (2.0, f32::NEG_INFINITY, 0.0),
+            (0.5, f32::INFINITY, 0.0),
+            (0.5, f32::NEG_INFINITY, f32::INFINITY),
+        ] {
+            check_vmath2_special_bits(VM2_POW, x, y, expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn vmath2_finite_extremes_match_f64_reference() {
+        let values = [
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            1e-20,
+            1.0,
+            1e20,
+            f32::MAX,
+        ];
+        for a in values {
+            for b in values {
+                for op in [VM2_ATAN2, VM2_HYPOT] {
+                    for (x, y) in [(a, b), (-a, b), (a, -b), (-a, -b)] {
+                        let want = if op == VM2_ATAN2 {
+                            f64::from(x).atan2(f64::from(y))
+                        } else {
+                            f64::from(x).hypot(f64::from(y))
+                        } as f32;
+                        let actual = apply2_1(op, x, y);
+                        if want.is_infinite() || want == 0.0 {
+                            assert_eq!(actual.to_bits(), want.to_bits(), "op={op} ({x}, {y})");
+                        } else {
+                            // Unchanged combined error gate from vmath2_matches_libm.
+                            assert!(
+                                (actual - want).abs() <= 5e-5 + 5e-5 * want.abs(),
+                                "op={op} ({x}, {y}): {actual} vs {want}"
+                            );
+                        }
+                        check_vmath2_special_bits(op, x, y, actual.to_bits());
+                    }
+                }
+            }
+        }
     }
 
     /// expm1/log1p vs `std`, including the **small-x relative** check the Kahan correction exists for:
