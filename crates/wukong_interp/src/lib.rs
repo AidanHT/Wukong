@@ -1587,20 +1587,32 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let k = dim!(args[4]);
                 let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
-                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
-                    let mut v = Vec::with_capacity(len);
-                    for t in 0..len {
-                        v.push(
-                            mem.get(base + t)
-                                .ok_or("sgemm operand out of bounds")?
-                                .as_float() as f32,
-                        );
-                    }
-                    Ok(v)
+                let matrix = |base: usize, rows: usize, cols: usize| -> Result<&[Value], String> {
+                    let len = rows
+                        .checked_mul(cols)
+                        .ok_or("sgemm operand extent overflow")?;
+                    let end = base.checked_add(len).ok_or("sgemm operand out of bounds")?;
+                    self.memory
+                        .get(base..end)
+                        .ok_or_else(|| "sgemm operand out of bounds".into())
                 };
-                let abuf = read(&self.memory, a, m * k)?;
-                let bbuf = read(&self.memory, b, k * n)?;
-                let mut cbuf = read(&self.memory, c, m * n)?;
+                // Validate every product and arena range before any scratch allocation. These
+                // are arena bounds, not object provenance: a range spanning adjacent allocations
+                // is still indistinguishable in the current memory model.
+                let av = matrix(a, m, k)?;
+                let bv = matrix(b, k, n)?;
+                let cv = matrix(c, m, n)?;
+                let read = |values: &[Value]| -> Result<Vec<f32>, String> {
+                    let mut buffer = Vec::new();
+                    buffer
+                        .try_reserve_exact(values.len())
+                        .map_err(|_| "sgemm operand allocation failed")?;
+                    buffer.extend(values.iter().map(|value| value.as_float() as f32));
+                    Ok(buffer)
+                };
+                let abuf = read(av)?;
+                let bbuf = read(bv)?;
+                let mut cbuf = read(cv)?;
                 let transposed = name.contains("_nt");
                 // `_tn` is `C = Aᵀ·B` (A stored `[k,m]`, B `[k,n]`); element counts m*k / k*n / m*n
                 // match the plain/`_nt` reads above, so only the kernel differs. The kernel handles
@@ -4891,6 +4903,99 @@ mod tests {
             100,
             "negative S must leave the attention output untouched"
         );
+    }
+
+    #[test]
+    fn sgemm_checks_extents_before_allocating_scratch() {
+        let program = Program::default();
+        let interner = Interner::new();
+        let mut interp = Interp {
+            program: &program,
+            interner: &interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            call_args: Vec::new(),
+            scratch: Vec::new(),
+            vecs: Vec::new(),
+            data_addrs: HashMap::new(),
+            function_indices: None,
+            static_indices: None,
+            accel: None,
+            depth: 0,
+        };
+        for layout in ["", "_nt", "_tn"] {
+            for suffix in ["", "_parallel"] {
+                let name = format!("wukong_sgemm{layout}{suffix}");
+                let a = if layout == "_tn" {
+                    [1.0, 3.0, 2.0, 4.0]
+                } else {
+                    [1.0, 2.0, 3.0, 4.0]
+                };
+                let b = if layout == "_nt" {
+                    [5.0, 7.0, 6.0, 8.0]
+                } else {
+                    [5.0, 6.0, 7.0, 8.0]
+                };
+                let initial: Vec<Value> = [99.0]
+                    .into_iter()
+                    .chain(a)
+                    .chain(b)
+                    .chain([1.0, 2.0, 3.0, 4.0, 77.0])
+                    .map(Value::Float)
+                    .collect();
+                for (m, k, n, ap, bp, cp, error) in [
+                    (i64::MAX, 4, 1, 1, 5, 9, "sgemm operand extent overflow"),
+                    (1, i64::MAX, 1, 1, 5, 9, "sgemm operand out of bounds"),
+                    (2, 2, 2, usize::MAX, 5, 9, "sgemm operand out of bounds"),
+                    (2, 2, 2, 1, 13, 9, "sgemm operand out of bounds"),
+                    (2, 2, 2, 1, 5, 13, "sgemm operand out of bounds"),
+                ] {
+                    interp.memory.clone_from(&initial);
+                    let args = [
+                        Value::Ptr(ap),
+                        Value::Ptr(bp),
+                        Value::Ptr(cp),
+                        Value::Int(m as i128),
+                        Value::Int(k as i128),
+                        Value::Int(n as i128),
+                        Value::Int(1),
+                    ];
+                    // These requests are rejected against a fourteen-slot arena before reserving
+                    // scratch. No test relies on an allocator trying an enormous request.
+                    assert_eq!(interp.intrinsic(&name, &args).unwrap_err(), error, "{name}");
+                    assert_eq!(
+                        interp.memory, initial,
+                        "a failed range check must not write memory"
+                    );
+                }
+                for beta in [0, 1] {
+                    interp.memory.clone_from(&initial);
+                    let args = [
+                        Value::Ptr(1),
+                        Value::Ptr(5),
+                        Value::Ptr(9),
+                        Value::Int(2),
+                        Value::Int(2),
+                        Value::Int(2),
+                        Value::Int(beta),
+                    ];
+                    interp.intrinsic(&name, &args).unwrap();
+                    let expected = if beta == 0 {
+                        [19.0, 22.0, 43.0, 50.0]
+                    } else {
+                        [20.0, 24.0, 46.0, 54.0]
+                    };
+                    assert_eq!(
+                        &interp.memory[9..13],
+                        &expected.map(Value::Float),
+                        "{name}, beta={beta}"
+                    );
+                    assert_eq!(&interp.memory[..9], &initial[..9]);
+                    assert_eq!(interp.memory[13], initial[13]);
+                }
+            }
+        }
     }
 
     #[test]
