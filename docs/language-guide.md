@@ -675,7 +675,7 @@ preserving one: `fmax`/`fmin`, `pow`, `atan2`, `hypot` and the six `*_backward` 
 *both* operands to the float result type, so `fmax(3, 5)` is the `f32` value `5.0`, not an integer max
 (`tests/run/activation_backward_int_args.wk`).
 
-`exp` and `log` preserve NaNs. `exp(+∞) = +∞` and `exp(−∞) = +0`; finite inputs
+In the f32 math core, `exp` and `log` preserve NaNs. `exp(+∞) = +∞` and `exp(−∞) = +0`; finite inputs
 above the polynomial's upper bound still saturate to its historical finite value (about
 `2.406e38`), and sufficiently negative finite inputs flush to zero. `log(±0) = −∞`,
 `log(+∞) = +∞`, and negative arguments produce NaN. Positive subnormals are normalized
@@ -687,9 +687,11 @@ positive infinity, or only negative infinities propagates NaNs through its ordin
 When written as a pure `for i { out[i] = f(x[i]) }` loop over `f32` arrays, **any of the 35**
 transcendentals (`exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/the inverse trig/the hyperbolic family/…)
 are **dispatched to a tuned 256-bit
-AVX2/FMA kernel** (`wukong_vmath_f32`) — the same domain-aware lowering as matmul→GEMM — so the
-activation family runs ~2–13× faster than C's scalar `libm`, and ~28× across cores under
-`@parallel`. `erf`, `sin` and `cos` are among those 35 and dispatch too (this is what a RoPE
+AVX2/FMA kernel** (`wukong_vmath_f32`) through domain-aware lowering like matmul→GEMM.
+Historical measurements reported ~2–13× over C's scalar `libm`, and ~28× across cores under
+`@parallel`. Those measurements predate the exceptional-value repairs recorded in the
+[September closeout report](sota-campaign-2026-09/CLOSEOUT-2026-09-23.md); current throughput
+requires fresh matched-peer measurements. `erf`, `sin` and `cos` are among those 35 and dispatch too (this is what a RoPE
 `sin`/`cos` loop and an exact erf-GELU loop compile to). What does *not* dispatch is a **composed or
 scalar** use — an intrinsic inside a larger expression, or a single call outside an elementwise `for` —
 which instead auto-vectorizes the inlined polynomial at 128-bit; `sqrt`/`rsqrt` also stay inline, being

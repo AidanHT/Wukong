@@ -80,13 +80,16 @@ jobs:
           python tools/verify_llvm_corpus.py --compiler target/debug/wukongc --report target/llvm-corpus-verification.json
           cargo test -p wukong_codegen_llvm --locked --lib semantic_tests::
           python crates/wukong_codegen_llvm/tools/verify_semantics.py target/llvm-semantics
+          python tools/verify_math_specials.py --compiler target/debug/wukongc --output target/llvm-math-specials
 
       - name: Upload LLVM verification results
         if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: llvm-corpus-verification
-          path: target/llvm-corpus-verification.json
+          path: |
+            target/llvm-corpus-verification.json
+            target/llvm-math-specials/
           if-no-files-found: error
 
       # THE PROFILE IS THE POINT OF THIS STEP. `cargo test` above builds everything at -O0, so

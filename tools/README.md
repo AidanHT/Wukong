@@ -8,6 +8,7 @@ thesis** — the thesis is user-written `.wk` in [`examples/`](../examples/) and
 | `export_gpt2.py` | Downloads GPT-2 weights, writes `data/gpt2/`, regenerates `examples/gpt2_config.wk` |
 | `verify_gpt2.py` | Cross-checks `gpt2_infer.wk` logits against HuggingFace reference |
 | `verify_llvm_corpus.py` | Compiles every run fixture at `-O0`/`-O2`, verifies the emitted modules with LLVM, and writes a JSON report with the compiler hash; requires `llvm-as` or `llvmlite` |
+| `verify_math_specials.py` | Compiles 13 source math operations at `-O0`/`-O2`, executes scalar/SIMD endpoints through llvmlite independently of the runtime, and preserves source, IR and a compiler-hash report under `--output` |
 | `bench_gpt2_torch.py` | PyTorch reference timing for GPT-2 (peer, not a Wukong program) |
 | `fa2_sdpa_peer.py` | FlashAttention SDPA peer helper |
 | `measure_gpt2.ps1` | Windows timing wrapper for GPT-2 benches |
