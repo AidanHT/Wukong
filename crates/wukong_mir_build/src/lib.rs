@@ -13709,8 +13709,8 @@ impl FnLowerer<'_> {
     // (splat), no written array is touched at a second index (no loop-carried dependence), the body
     // is branch/call-free, and all lanes share one 32/64-bit scalar type. Lane `k` of the vector
     // loop then computes exactly what scalar iteration `base+k` would, so the result is identical.
-    // Distinct array parameters are assumed not to alias (the usual kernel ABI). On any failure it
-    // returns `false` and the caller falls back to the scalar lowering.
+    // Distinct array names require the same whole-program disjointness proof as kernel operands:
+    // callers may bind two parameters to one buffer. On failure, retain scalar lowering.
 
     /// If `e` is `arr[j]` — a single-segment array path indexed by exactly the loop variable `j`
     /// (unit stride, zero offset) — return the array's symbol. The shape the vmath kernel needs.
@@ -15727,15 +15727,21 @@ impl FnLowerer<'_> {
             }
         }
 
-        // No array that is written may be accessed at a second (different) index: that would be a
-        // loop-carried dependence the lane-parallel form would break.
-        for &(base, idx, _unit, is_w) in &acc {
-            if is_w || acc.iter().any(|a| a.0 == base && a.3) {
-                // `base` is written somewhere; every access to it must be the identical index.
-                if acc
-                    .iter()
-                    .any(|a| a.0 == base && !exprs_struct_eq(a.1, idx))
-                {
+        // A vector load snapshots several scalar iterations before their stores. Check every
+        // access against each written buffer, not just accesses with the same spelling:
+        // `out[i + 1] = x[i] + 1` is a recurrence when a caller passes one array as x and out.
+        // Unproved distinct bases can also be shifted views, so even equal index expressions
+        // are insufficient for them. Leave those loops for scalar lowering / guarded MIR SIMD.
+        for &(base, idx, _, is_write) in &acc {
+            if !is_write {
+                continue;
+            }
+            for &(other, other_idx, _, _) in &acc {
+                if base == other {
+                    if !exprs_struct_eq(idx, other_idx) {
+                        return None;
+                    }
+                } else if !self.provably_disjoint(base, other) {
                     return None;
                 }
             }

@@ -495,6 +495,69 @@ mod tests {
     use super::*;
     use wukong_span::{Interner, SourceId};
 
+    #[test]
+    fn aliased_recurrence_preserves_scalar_iterations_at_o0_and_o2() {
+        let src = include_str!("../../../tests/run/parallel_dependence.wk");
+        let mut interner = Interner::new();
+        let (module, parse) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(parse.iter().all(|d| !d.is_error()), "{parse:?}");
+        let (sema, check) = wukong_sema::check(&module, &interner);
+        assert!(check.iter().all(|d| !d.is_error()), "{check:?}");
+        let (program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
+        let recurrence = program.function(interner.intern("recurrence")).unwrap();
+        assert!(
+            recurrence.value_types.iter().all(|ty| !ty.is_vector()),
+            "unguarded AST SIMD must not snapshot the aliased recurrence"
+        );
+        let expected = [4096, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            .iter()
+            .map(|v| format!("{v}\n"))
+            .collect::<String>();
+        for level in [0, 2] {
+            let mut optimized = program.clone();
+            optimize(&mut optimized, level);
+            assert!(wukong_mir::verify::verify_program(&optimized).is_empty());
+            assert!(!optimized.funcs.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts)
+                .any(|inst| matches!(inst.op, Op::Call { func, .. } if interner.resolve(func) == "wukong_parallel_for")),
+                "dependent iterations were threaded at O{level}");
+            let (exit, stdout) =
+                wukong_interp::run_with_output(&optimized, interner.intern("main"), &interner)
+                    .unwrap();
+            assert_eq!(exit, 0);
+            assert_eq!(stdout, expected.as_bytes(), "O{level}");
+        }
+    }
+
+    #[test]
+    fn aliased_recurrence_fix_keeps_disjoint_shifted_simd() {
+        let src = "module m\n@generic\n\
+            fn shifted(x: [i32; 9], mut out: [i32; 9]) {\n\
+                for i in 0..8 { out[i + 1] = x[i] + 1; }\n}\n\
+            fn main() -> i32 { let x: [i32; 9] = [1; 9];\n\
+                let mut out: [i32; 9] = [0; 9]; shifted(x, out); return out[8]; }";
+        let mut interner = Interner::new();
+        let (module, parse) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(parse.iter().all(|d| !d.is_error()), "{parse:?}");
+        let (sema, check) = wukong_sema::check(&module, &interner);
+        assert!(check.iter().all(|d| !d.is_error()), "{check:?}");
+        let (program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
+        let shifted = program.function(interner.intern("shifted")).unwrap();
+        assert!(
+            shifted.value_types.iter().any(wukong_mir::MirType::is_vector),
+            "proven-disjoint shifted arrays should retain AST SIMD"
+        );
+        for level in [0, 2] {
+            let mut optimized = program.clone();
+            optimize(&mut optimized, level);
+            assert_eq!(
+                wukong_interp::run(&optimized, interner.intern("main"), &interner).unwrap(),
+                2
+            );
+        }
+    }
+
     fn run_main_opt(src: &str, opt: u8) -> i64 {
         let mut interner = Interner::new();
         let (module, _) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
