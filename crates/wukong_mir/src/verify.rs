@@ -111,7 +111,9 @@ fn cast_bits(ty: &MirType) -> Option<u64> {
         MirType::I16 | MirType::F16 | MirType::BF16 => 16,
         MirType::I32 | MirType::F32 => 32,
         MirType::I64 | MirType::F64 => 64,
-        MirType::Vec(elem, lanes) if *lanes != 0 => cast_bits(elem)? * u64::from(*lanes),
+        MirType::Vec(elem, lanes) if *lanes != 0 => {
+            cast_bits(elem)?.checked_mul(u64::from(*lanes))?
+        }
         _ => return None,
     })
 }
@@ -879,6 +881,19 @@ mod tests {
     #[test]
     fn detects_a_bitcast_between_different_widths() {
         let errors = cast_errors(CastKind::Bitcast, MirType::I32, MirType::I64);
+        assert!(
+            errors.iter().any(|e| e.contains("invalid bitcast")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_vector_bitcasts_are_reported_without_width_overflow() {
+        let nested = MirType::Vec(
+            Box::new(MirType::Vec(Box::new(MirType::I64), u32::MAX)),
+            u32::MAX,
+        );
+        let errors = cast_errors(CastKind::Bitcast, nested.clone(), nested);
         assert!(
             errors.iter().any(|e| e.contains("invalid bitcast")),
             "{errors:?}"
