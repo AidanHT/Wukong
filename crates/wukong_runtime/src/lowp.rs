@@ -1230,25 +1230,24 @@ unsafe fn axpby_narrow_f16_avx(
 
 /// Scalar twin / no-AVX2 fallback for the half-output activation: `out[i] = narrow(act(widen(x[i])))`,
 /// the same shared `apply1` activation and narrowing shim as the AVX2 lanes, so SIMD == scalar.
-fn vmath_narrow_scalar(kind: Half, x: &[u16], out: &mut [u16], op: i64) {
-    for i in 0..out.len() {
-        out[i] = kind.narrow(crate::vmath::apply1(op, kind.widen(x[i])));
+unsafe fn vmath_narrow_scalar(kind: Half, x: *const u16, out: *mut u16, n: usize, op: i64) {
+    for i in 0..n {
+        *out.add(i) = kind.narrow(crate::vmath::apply1(op, kind.widen(*x.add(i))));
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn vmath_narrow_bf16_avx(x: &[u16], out: &mut [u16], op: i64) {
+unsafe fn vmath_narrow_bf16_avx(xp: *const u16, out: *mut u16, n: usize, op: i64) {
     // The 8-lane activation twin of `apply1` (or scalar-only op → the scalar path for every element).
     let Some(f) = crate::vmath::vmath8_for(op) else {
-        return vmath_narrow_scalar(Half::Bf16, x, out, op);
+        return vmath_narrow_scalar(Half::Bf16, xp, out, n, op);
     };
-    let xp = x.as_ptr();
     stream_narrow!(
-        out.as_mut_ptr(),
-        out.len(),
+        out,
+        n,
         |i: usize| f(widen_bf16(xp.add(i))),
-        |i: usize| crate::f32_to_bf16_bits(crate::vmath::apply1(op, bf16_bits_to_f32(x[i]))),
+        |i: usize| crate::f32_to_bf16_bits(crate::vmath::apply1(op, bf16_bits_to_f32(*xp.add(i)))),
         |i: usize| _mm_prefetch(
             xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8,
             _MM_HINT_T0
@@ -1260,16 +1259,15 @@ unsafe fn vmath_narrow_bf16_avx(x: &[u16], out: &mut [u16], op: i64) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
-unsafe fn vmath_narrow_f16_avx(x: &[u16], out: &mut [u16], op: i64) {
+unsafe fn vmath_narrow_f16_avx(xp: *const u16, out: *mut u16, n: usize, op: i64) {
     let Some(f) = crate::vmath::vmath8_for(op) else {
-        return vmath_narrow_scalar(Half::F16, x, out, op);
+        return vmath_narrow_scalar(Half::F16, xp, out, n, op);
     };
-    let xp = x.as_ptr();
     stream_narrow!(
-        out.as_mut_ptr(),
-        out.len(),
+        out,
+        n,
         |i: usize| f(widen_f16(xp.add(i))),
-        |i: usize| crate::f32_to_f16_bits(crate::vmath::apply1(op, f16_to_f32(x[i]))),
+        |i: usize| crate::f32_to_f16_bits(crate::vmath::apply1(op, f16_to_f32(*xp.add(i)))),
         |i: usize| _mm_prefetch(
             xp.wrapping_add(i + HALFOUT_PF_AHEAD) as *const i8,
             _MM_HINT_T0
@@ -1348,6 +1346,7 @@ pub unsafe extern "C" fn wukong_axpby_f16_out(
 /// narrowing store is the bandwidth win (the >L3 non-temporal path via [`stream_narrow`]). `act` is the
 /// shared `vmath` kernel and the store the shared `f32_to_bf16_bits` shim, so it equals a scalar
 /// `apply1` + narrow lane-for-lane — interp == native, `-O0` == `-O2`.
+/// Overlap is supported with ascending element-order semantics, including exact in-place output.
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16` (bf16 bits); `out` to `n` writable `u16`.
@@ -1357,17 +1356,19 @@ pub unsafe extern "C" fn wukong_vmath_bf16_out(x: *const u16, out: *mut u16, n: 
         return;
     }
     let n = n as usize;
-    let x = std::slice::from_raw_parts(x, n);
-    let out = std::slice::from_raw_parts_mut(out, n);
+    if axpby_narrow_shifted_overlap(x, x, out, n) {
+        return vmath_narrow_scalar(Half::Bf16, x, out, n, op);
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return vmath_narrow_bf16_avx(x, out, op);
+        return vmath_narrow_bf16_avx(x, out, n, op);
     }
-    vmath_narrow_scalar(Half::Bf16, x, out, op);
+    vmath_narrow_scalar(Half::Bf16, x, out, n, op);
 }
 
 /// `out[i] = round_f16(act(widen(x[i])))` over `n` **f16** inputs with an **f16 output** — the F16C twin
 /// of [`wukong_vmath_bf16_out`] (widen `vcvtph2ps`, narrow `vcvtps2ph`). 4 bytes/elem.
+/// Overlap is supported with ascending element-order semantics, including exact in-place output.
 ///
 /// # Safety
 /// `x` must point to `n` readable `u16` (f16 bits); `out` to `n` writable `u16`.
@@ -1377,16 +1378,17 @@ pub unsafe extern "C" fn wukong_vmath_f16_out(x: *const u16, out: *mut u16, n: i
         return;
     }
     let n = n as usize;
-    let x = std::slice::from_raw_parts(x, n);
-    let out = std::slice::from_raw_parts_mut(out, n);
+    if axpby_narrow_shifted_overlap(x, x, out, n) {
+        return vmath_narrow_scalar(Half::F16, x, out, n, op);
+    }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("f16c")
         && is_x86_feature_detected!("avx2")
         && is_x86_feature_detected!("fma")
     {
-        return vmath_narrow_f16_avx(x, out, op);
+        return vmath_narrow_f16_avx(x, out, n, op);
     }
-    vmath_narrow_scalar(Half::F16, x, out, op);
+    vmath_narrow_scalar(Half::F16, x, out, n, op);
 }
 
 #[cfg(test)]
@@ -1768,6 +1770,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vmath_narrow_overlap_preserves_ascending_reads_and_writes() {
+        use crate::vmath::{VM_RELU, VM_SIGMOID, VM_TANH};
+        for kind in [Half::Bf16, Half::F16] {
+            let kernel = match kind {
+                Half::Bf16 => wukong_vmath_bf16_out,
+                Half::F16 => wukong_vmath_f16_out,
+            };
+            for op in [VM_RELU, VM_SIGMOID, VM_TANH, -1] {
+                for n in [0usize, 1, 7, 8, 9, 16, 17, 33, 65] {
+                    for (xi, oi) in [(0, n + 1), (0, 0), (0, 1), (1, 0)] {
+                        let mut got: Vec<u16> = (0..2 * n + 2)
+                            .map(|i| kind.narrow((i % 13) as f32 / 4.0 - 1.5))
+                            .collect();
+                        let mut want = got.clone();
+                        for i in 0..n {
+                            want[oi + i] =
+                                kind.narrow(crate::vmath::apply1(op, kind.widen(want[xi + i])));
+                        }
+                        let p = got.as_mut_ptr();
+                        unsafe {
+                            kernel(p.add(xi), p.add(oi), n as i64, op);
+                        }
+                        assert_eq!(got, want, "op={op}, n={n}, offsets=({xi},{oi})");
+                    }
+                }
+            }
+            unsafe {
+                kernel(std::ptr::null(), std::ptr::null_mut(), -1, VM_RELU);
+            }
+        }
+    }
+
+    #[test]
+    fn vmath_narrow_in_place_streaming_and_special_values() {
+        use crate::vmath::{VM_RELU, VM_TANH};
+        for kind in [Half::Bf16, Half::F16] {
+            let kernel = match kind {
+                Half::Bf16 => wukong_vmath_bf16_out,
+                Half::F16 => wukong_vmath_f16_out,
+            };
+            let n = HALFOUT_NT_MIN_BYTES / 6 + 35;
+            let mut got = vec![kind.narrow(-0.5); n + 1];
+            let base = if got.as_ptr() as usize & 31 == 0 {
+                1
+            } else {
+                0
+            };
+            let p = unsafe { got.as_mut_ptr().add(base) };
+            unsafe {
+                kernel(p, p, n as i64, VM_RELU);
+            }
+            assert!(got[base..base + n].iter().all(|&v| v == kind.narrow(0.0)));
+            for op in [VM_RELU, VM_TANH, -1] {
+                let values = [
+                    0.0,
+                    -0.0,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NAN,
+                    -f32::NAN,
+                    1.0,
+                    -1.0,
+                ];
+                let mut got: Vec<u16> = values
+                    .into_iter()
+                    .cycle()
+                    .take(33)
+                    .map(|v| kind.narrow(v))
+                    .collect();
+                let mut want = vec![0; got.len()];
+                unsafe {
+                    vmath_narrow_scalar(kind, got.as_ptr(), want.as_mut_ptr(), got.len(), op);
+                }
+                let p = got.as_mut_ptr();
+                unsafe {
+                    kernel(p, p, got.len() as i64, op);
+                }
+                assert_eq!(got, want, "op={op}");
+            }
+        }
+    }
+
     /// The half-**output** activation (`wukong_vmath_{bf16,f16}_out`) SIMD path must equal its scalar
     /// twin bit-for-bit across activations and tail sizes — the vector activation is the twin of
     /// `apply1` and the narrowing store the shared shim, so it agrees lane-for-lane (this is the gate
@@ -1801,7 +1886,9 @@ mod tests {
                         }
                     }
                     let mut want = vec![0u16; n];
-                    vmath_narrow_scalar(kind, &xb, &mut want, op);
+                    unsafe {
+                        vmath_narrow_scalar(kind, xb.as_ptr(), want.as_mut_ptr(), n, op);
+                    }
                     for i in 0..n {
                         assert_eq!(got[i], want[i], "narrow vmath op={op} n={n} i={i}");
                     }

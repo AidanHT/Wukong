@@ -45,11 +45,18 @@ fn bias1(op: i64, x: f32, b: f32) -> f32 {
 
 /// Scalar reference / no-AVX2 fallback: `out[i*C+j] = act(x[i*C+j] + b[j])`. The row loop reloads the
 /// cache-resident `b`; the per-element op is exactly [`bias1`], so it matches the AVX2 lanes.
-fn bias_scalar(x: &[f32], b: &[f32], out: &mut [f32], rows: usize, cols: usize, op: i64) {
+unsafe fn bias_scalar(
+    x: *const f32,
+    b: *const f32,
+    out: *mut f32,
+    rows: usize,
+    cols: usize,
+    op: i64,
+) {
     for i in 0..rows {
         let row = i * cols;
         for j in 0..cols {
-            out[row + j] = bias1(op, x[row + j], b[j]);
+            *out.add(row + j) = bias1(op, *x.add(row + j), *b.add(j));
         }
     }
 }
@@ -179,11 +186,9 @@ pub unsafe extern "C" fn wukong_bias_bcast_f32(
             return;
         }
     }
-    let n = rows * cols;
-    let xs = std::slice::from_raw_parts(x, n);
-    let bs = std::slice::from_raw_parts(b, cols);
-    let os = std::slice::from_raw_parts_mut(out, n);
-    bias_scalar(xs, bs, os, rows, cols, op);
+    // Keep raw pointers through the fallback: x == out is an explicitly supported
+    // in-place operation and cannot be represented by overlapping Rust slices.
+    bias_scalar(x, b, out, rows, cols, op);
 }
 
 /// Multicore broadcast-bias — the `@parallel` twin of [`wukong_bias_bcast_f32`]. Rows are independent,
@@ -245,6 +250,53 @@ mod tests {
     use super::*;
     use crate::vmath::{VM_GELU, VM_RELU, VM_SILU};
 
+    #[test]
+    fn bias_exact_in_place_matches_scalar_and_parallel() {
+        for (rows, cols) in [(1usize, 1usize), (3, 7), (9, 8), (17, 33)] {
+            let b: Vec<f32> = (0..cols).map(|j| (j % 5) as f32 / 4.0).collect();
+            let x: Vec<f32> = (0..rows * cols)
+                .map(|i| (i % 17) as f32 / 4.0 - 2.0)
+                .collect();
+            for op in [BIAS_ACT_NONE, VM_RELU, VM_GELU, VM_SILU] {
+                let want: Vec<u32> = x
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| bias1(op, v, b[i % cols]).to_bits())
+                    .collect();
+                for path in 0..3 {
+                    let mut got = x.clone();
+                    let p = got.as_mut_ptr();
+                    unsafe {
+                        match path {
+                            0 => bias_scalar(p, b.as_ptr(), p, rows, cols, op),
+                            1 => wukong_bias_bcast_f32(
+                                p,
+                                b.as_ptr(),
+                                p,
+                                rows as i64,
+                                cols as i64,
+                                op,
+                            ),
+                            _ => wukong_bias_bcast_f32_parallel(
+                                p,
+                                b.as_ptr(),
+                                p,
+                                rows as i64,
+                                cols as i64,
+                                op,
+                            ),
+                        }
+                    }
+                    assert_eq!(
+                        got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        want,
+                        "path={path}, shape={rows}x{cols}, op={op}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The AVX2 lanes and the scalar tail/fallback must agree element-for-element — across several
     /// activations, a `cols` that is not a multiple of 8 (forcing a tail), and a size large enough to
     /// cross the non-temporal-store threshold (so the `vmovntps` alignment prologue, the streaming
@@ -282,7 +334,9 @@ mod tests {
                     );
                 }
                 let mut want = vec![0.0f32; n];
-                bias_scalar(&x, &b, &mut want, rows, cols, op);
+                unsafe {
+                    bias_scalar(x.as_ptr(), b.as_ptr(), want.as_mut_ptr(), rows, cols, op);
+                }
                 for k in 0..n {
                     assert_eq!(
                         got[k].to_bits(),
