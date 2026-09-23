@@ -1,4 +1,4 @@
-//! Dead-store elimination (intra-block).
+//! Dead-store elimination for overwritten stores and unread private stack slots.
 //!
 //! The dual of CSE's load forwarding: a `store p, v1` is dead if a later `store p, v2` in the same
 //! block overwrites it with no intervening read that could observe it. We track, per location, the
@@ -13,12 +13,18 @@
 //! on any other load or store, so a `[]T` element write, which goes through a pointer loaded out of
 //! the slice header, was never a candidate.
 //!
-//! Pending stores that survive to the end of the block are kept: a successor block may read them.
+//! A whole-function scan also removes in-bounds stores to local allocas whose addresses never
+//! escape and which have no loads anywhere in the function, including through derived pointers.
+//! This needs neither postdominance nor speculation: no execution can observe those bytes. Other
+//! pending stores that survive to the end of the block are kept: a successor may read them.
+//! Address observations count as escapes. Shared storage and functions with barriers are excluded
+//! from lifetime elimination; MIR currently has no volatile load/store variant. DCE can subsequently
+//! remove unused allocas and addresses, but this pass does not delete empty initialization loops.
 
-use crate::alias::{type_bytes, AliasInfo};
+use crate::alias::{type_bytes, AliasInfo, Prov};
 use crate::fxhash::FxHashMap;
 
-use wukong_mir::{Function, MirType, Op, ValueId};
+use wukong_mir::{AddrSpace, Function, MirType, Op, ValueId};
 
 use crate::{CfgAnalyses, Pass};
 
@@ -32,6 +38,35 @@ struct StoreKey {
     ty: MirType,
 }
 
+/// Indexed by alloca result, not by individual address: even a read from a disjoint offset keeps
+/// the entire slot live. Unknown pointers cannot reach a private slot; any publication of its
+/// address (including pointer tables passed to VecKernelCall) already disqualifies it in AliasInfo.
+fn unread_private_slots(f: &Function, alias: &AliasInfo) -> Vec<bool> {
+    let mut unread = vec![false; f.value_types.len()];
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        match inst.op {
+            Op::Alloca {
+                space: AddrSpace::Local,
+                ..
+            } => {
+                if let Some(v) = inst.result {
+                    unread[v.0 as usize] = alias.is_private_stack(v);
+                }
+            }
+            Op::Barrier => return vec![false; f.value_types.len()],
+            _ => {}
+        }
+    }
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let Op::Load(ptr, _) = inst.op {
+            if let Prov::Alloca(a) = alias.prov(ptr) {
+                unread[a.0 as usize] = false;
+            }
+        }
+    }
+    unread
+}
+
 impl Pass for Dse {
     fn name(&self) -> &'static str {
         "dse"
@@ -39,6 +74,7 @@ impl Pass for Dse {
 
     fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
         let alias = AliasInfo::analyze(f);
+        let unread = unread_private_slots(f, &alias);
 
         let mut changed = false;
         // Reuse deletion storage between blocks. The bitmap is allocated only after
@@ -52,6 +88,18 @@ impl Pass for Dse {
             for (i, inst) in b.insts.iter().enumerate() {
                 match &inst.op {
                     Op::Store { ptr, value } => {
+                        if matches!(alias.prov(*ptr), Prov::Alloca(a) if unread[a.0 as usize])
+                            && type_bytes(&f.value_types[value.0 as usize])
+                                .is_some_and(|bytes| alias.is_dereferenceable(*ptr, bytes))
+                        {
+                            // Keep potentially invalid or dynamically indexed stores: deletion
+                            // must not hide a memory fault just because the slot has no reader.
+                            if dead.is_empty() {
+                                dead.resize(b.insts.len().div_ceil(64), 0);
+                            }
+                            dead[i / 64] |= 1u64 << (i % 64);
+                            continue;
+                        }
                         // A store never *reads*, so it cannot make another store observable; it can
                         // only fully overwrite one, which needs the identical byte range.
                         let key = StoreKey {
@@ -81,6 +129,7 @@ impl Pass for Dse {
                         // from one — but never a stack slot of this function that never escaped.
                         pending.retain(|k, _| alias.is_private_stack(ValueId(k.addr)));
                     }
+                    Op::Barrier => pending.clear(),
                     _ => {}
                 }
             }
@@ -217,12 +266,312 @@ mod tests {
         assert_eq!(count_stores(&f), 4);
         let mut cache = CfgAnalyses::default();
         assert!(Dse.run_function(&mut f, &mut cache));
-        // Only the private slot's first store dies; the parameter's survives the call.
+        // Both private stores now die: no instruction ever reads the slot. The parameter's
+        // first store still survives the call, and its final store remains caller-observable.
         assert_eq!(
             count_stores(&f),
-            3,
+            2,
             "{}",
             wukong_mir::print::print_function(&f, &it)
         );
+    }
+
+    fn verify(f: &Function) {
+        let errors = wukong_mir::verify::verify_function(f);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    fn run(f: &Function, it: &Interner) -> i64 {
+        let mut p = wukong_mir::Program::new();
+        p.funcs.push(f.clone());
+        wukong_interp::run(&p, f.name, it).unwrap()
+    }
+
+    #[test]
+    fn unread_private_array_stores_die_across_branches_but_read_slot_survives() {
+        for take_left in [false, true] {
+            let mut it = Interner::new();
+            let mut b = Builder::new(it.intern("main"), MirType::I64);
+            let dead = b.alloca(MirType::Array(Box::new(MirType::I64), 2));
+            let live = b.alloca(MirType::I64);
+            let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+            let tail = b.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: dead,
+                    index: one,
+                    elem: MirType::I64,
+                },
+            );
+            let a = b.build(MirType::I64, Op::ConstInt(23, MirType::I64));
+            let c = b.build(MirType::I64, Op::ConstInt(41, MirType::I64));
+            let cond = b.build(
+                MirType::I1,
+                Op::ConstInt(i128::from(take_left), MirType::I1),
+            );
+            b.build_void(Op::Store {
+                ptr: dead,
+                value: one,
+            });
+            let left = b.new_block();
+            let right = b.new_block();
+            let exit = b.new_block();
+            b.cond_br(cond, left, vec![], right, vec![]);
+            b.switch_to(left);
+            b.build_void(Op::Store {
+                ptr: tail,
+                value: a,
+            });
+            b.build_void(Op::Store {
+                ptr: live,
+                value: a,
+            });
+            b.br(exit, vec![]);
+            b.switch_to(right);
+            b.build_void(Op::Store {
+                ptr: tail,
+                value: c,
+            });
+            b.build_void(Op::Store {
+                ptr: live,
+                value: c,
+            });
+            b.br(exit, vec![]);
+            b.switch_to(exit);
+            let answer = b.build(MirType::I64, Op::Load(live, MirType::I64));
+            b.ret(Some(answer));
+            let mut f = b.finish();
+            verify(&f);
+            assert_eq!(run(&f, &it), if take_left { 23 } else { 41 });
+            assert_eq!(count_stores(&f), 5);
+            let mut cache = CfgAnalyses::default();
+            assert!(Dse.run_function(&mut f, &mut cache));
+            assert_eq!(count_stores(&f), 2);
+            verify(&f);
+            assert_eq!(run(&f, &it), if take_left { 23 } else { 41 });
+            assert!(crate::dce::Dce.run_function(&mut f, &mut cache));
+            assert!(!f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.result == Some(dead)));
+            verify(&f);
+            assert_eq!(run(&f, &it), if take_left { 23 } else { 41 });
+        }
+    }
+
+    #[test]
+    fn successor_read_through_distinct_gep_keeps_the_store() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("main"), MirType::I64);
+        let slot = b.alloca(MirType::Array(Box::new(MirType::I64), 2));
+        let index = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let p = b.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: slot,
+                index,
+                elem: MirType::I64,
+            },
+        );
+        let value = b.build(MirType::I64, Op::ConstInt(73, MirType::I64));
+        b.build_void(Op::Store { ptr: p, value });
+        let next = b.new_block();
+        b.br(next, vec![]);
+        b.switch_to(next);
+        let q = b.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: slot,
+                index,
+                elem: MirType::I64,
+            },
+        );
+        let read = b.build(MirType::I64, Op::Load(q, MirType::I64));
+        b.ret(Some(read));
+        let mut f = b.finish();
+        verify(&f);
+        assert_eq!(run(&f, &it), 73);
+        assert!(!Dse.run_function(&mut f, &mut CfgAnalyses::default()));
+        assert_eq!(count_stores(&f), 1);
+        verify(&f);
+        assert_eq!(run(&f, &it), 73);
+    }
+
+    #[test]
+    fn published_or_observed_addresses_keep_unread_stores() {
+        for observer in ["call", "stored", "ptrtoint", "return", "edge"] {
+            let mut it = Interner::new();
+            let ret = if observer == "return" {
+                MirType::Ptr
+            } else {
+                MirType::Void
+            };
+            let mut b = Builder::new(it.intern("f"), ret);
+            let out = b.add_param(MirType::Ptr);
+            let slot = b.alloca(MirType::I64);
+            let value = b.build(MirType::I64, Op::ConstInt(73, MirType::I64));
+            b.build_void(Op::Store { ptr: slot, value });
+            match observer {
+                "call" => b.build_void(Op::Call {
+                    func: it.intern("sink"),
+                    args: vec![slot],
+                }),
+                "stored" => b.build_void(Op::Store {
+                    ptr: out,
+                    value: slot,
+                }),
+                "ptrtoint" => {
+                    let addr = b.build(
+                        MirType::I64,
+                        Op::Cast(wukong_mir::CastKind::PtrToInt, slot, MirType::I64),
+                    );
+                    b.build_void(Op::Store {
+                        ptr: out,
+                        value: addr,
+                    });
+                }
+                "edge" => {
+                    let next = b.new_block();
+                    let _ = b.block_param(next, MirType::Ptr);
+                    b.br(next, vec![slot]);
+                    b.switch_to(next);
+                }
+                "return" => {}
+                _ => unreachable!(),
+            }
+            b.ret((observer == "return").then_some(slot));
+            let mut f = b.finish();
+            verify(&f);
+            let before = count_stores(&f);
+            assert!(
+                !Dse.run_function(&mut f, &mut CfgAnalyses::default()),
+                "{observer}"
+            );
+            assert_eq!(count_stores(&f), before, "{observer}");
+            verify(&f);
+        }
+    }
+
+    #[test]
+    fn vector_kernel_pointer_table_and_scalar_arguments_keep_stores() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("main"), MirType::I64);
+        let data = b.alloca(MirType::Array(Box::new(MirType::F32), 8));
+        let ptrs = b.alloca(MirType::Ptr);
+        let scalars = b.alloca(MirType::F32);
+        let value = b.build(MirType::F32, Op::ConstFloat(7.0, MirType::F32));
+        // The kernel ABI processes complete eight-lane groups; initialize every lane.
+        for lane in 0..8 {
+            let index = b.build(MirType::I64, Op::ConstInt(lane, MirType::I64));
+            let ptr = b.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: data,
+                    index,
+                    elem: MirType::F32,
+                },
+            );
+            b.build_void(Op::Store { ptr, value });
+        }
+        b.build_void(Op::Store {
+            ptr: ptrs,
+            value: data,
+        });
+        b.build_void(Op::Store {
+            ptr: scalars,
+            value,
+        });
+        let n = b.build(MirType::I64, Op::ConstInt(8, MirType::I64));
+        let kernel = b.add_vec_kernel(wukong_mir::VecKernel {
+            name: it.intern("kernel"),
+            streams: 1,
+            scalars: 1,
+            unroll: 1,
+            ops: vec![
+                wukong_mir::VecOp::Load { stream: 0 },
+                wukong_mir::VecOp::Splat { scalar: 0 },
+                wukong_mir::VecOp::Bin {
+                    op: wukong_mir::VecBin::Add,
+                    a: 0,
+                    b: 1,
+                },
+            ],
+            reduce: Some(wukong_mir::VecReduce {
+                op: wukong_mir::VecRedOp::Add,
+                value: 2,
+                fma: None,
+            }),
+        });
+        let result = b.build(
+            MirType::F32,
+            Op::VecKernelCall {
+                kernel,
+                ptrs,
+                scalars,
+                n,
+            },
+        );
+        let answer = b.build(
+            MirType::I64,
+            Op::Cast(wukong_mir::CastKind::FpToSi, result, MirType::I64),
+        );
+        b.ret(Some(answer));
+        let mut f = b.finish();
+        verify(&f);
+        assert_eq!(run(&f, &it), 8 * (7 + 7));
+        assert!(!Dse.run_function(&mut f, &mut CfgAnalyses::default()));
+        assert_eq!(count_stores(&f), 10);
+        verify(&f);
+        assert_eq!(run(&f, &it), 8 * (7 + 7));
+    }
+
+    #[test]
+    fn barriers_keep_stores_and_block_local_overwrite_elimination() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("f"), MirType::Void);
+        let slot = b.alloca(MirType::I64);
+        let value = b.build(MirType::I64, Op::ConstInt(3, MirType::I64));
+        b.build_void(Op::Store { ptr: slot, value });
+        b.barrier();
+        b.build_void(Op::Store { ptr: slot, value });
+        b.ret(None);
+        let mut f = b.finish();
+        verify(&f);
+        assert!(!Dse.run_function(&mut f, &mut CfgAnalyses::default()));
+        assert_eq!(count_stores(&f), 2);
+        verify(&f);
+    }
+
+    #[test]
+    fn unproven_store_extents_are_retained() {
+        for offset in [None, Some(-1), Some(1)] {
+            let mut it = Interner::new();
+            let mut b = Builder::new(it.intern("f"), MirType::Void);
+            let index = match offset {
+                None => b.add_param(MirType::I64),
+                Some(v) => b.build(MirType::I64, Op::ConstInt(v, MirType::I64)),
+            };
+            let slot = b.alloca(MirType::I64);
+            let p = b.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: slot,
+                    index,
+                    elem: MirType::I64,
+                },
+            );
+            let value = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+            b.build_void(Op::Store { ptr: p, value });
+            b.ret(None);
+            let mut f = b.finish();
+            verify(&f);
+            assert!(
+                !Dse.run_function(&mut f, &mut CfgAnalyses::default()),
+                "{offset:?}"
+            );
+            assert_eq!(count_stores(&f), 1);
+            verify(&f);
+        }
     }
 }
