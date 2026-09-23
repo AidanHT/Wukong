@@ -906,26 +906,14 @@ pub extern "C" fn wukong_rt_fmod_f32(a: f32, b: f32) -> f32 {
 /// profile or a dependency does, and cargo does not garbage-collect the old ones), and the uplifted
 /// copy can itself be a *leftover* of an older `cargo build`. So **both places feed one candidate
 /// list and one comparator**, rather than the uplifted copy short-circuiting the scan: the newest by
-/// mtime wins, and the uplifted copy wins only a tie. See [`runtime_rlib_candidates`] for why
-/// "newest" is the right key and why it is safe.
+/// mtime is tried first, and the uplifted copy wins only a tie. This lookup reports a preferred
+/// candidate, not proof of toolchain compatibility: [`rustc_link`] retries the remaining
+/// candidates when the pinned compiler rejects an archive's metadata.
 pub fn runtime_rlib_in(dir: &Path) -> Option<PathBuf> {
-    let mut best: Option<RlibCandidate> = None;
-    for c in runtime_rlib_candidates(dir) {
-        let better = match &best {
-            None => true,
-            // `(mtime, uplifted, path)`, maximised. `false < true`, so at equal mtime the uplifted
-            // copy beats a `deps/` entry BY CONSTRUCTION rather than by an accident of path
-            // ordering - which matters because cargo uplifts by hard link where the filesystem
-            // allows it, so the healthy case is a tie between two names for one inode (verified on
-            // this checkout: link count 2, identical mtime). The path is the final tie-break and
-            // exists only to make the choice deterministic across two distinct files.
-            Some(b) => (c.mtime, c.uplifted, &c.path) > (b.mtime, b.uplifted, &b.path),
-        };
-        if better {
-            best = Some(c);
-        }
-    }
-    best.map(|c| c.path)
+    runtime_rlib_candidates(dir)
+        .into_iter()
+        .next()
+        .map(|c| c.path)
 }
 
 /// One `wukong_runtime` rlib that could be linked, with the two facts [`runtime_rlib_in`] ranks on.
@@ -951,13 +939,14 @@ struct RlibCandidate {
 /// older than the newest `deps/` rlib, and the older one is what the previous rule returned. With
 /// one list and one comparator that cell cannot be expressed at all.
 ///
-/// **Why "newest" is the right key, and why it is safe.** The link does not need a *particular*
+/// **Freshness orders attempts; it does not establish compatibility.** The link does not need a *particular*
 /// build unit of `wukong_runtime`: [`WUKONG_RT_SHIM`] names it only as `extern crate
 /// wukong_runtime;`, whose entire job is to drag the `#[no_mangle] extern "C"` microkernels into the
 /// link. No Rust item crosses the boundary, so a differing `-C metadata` hash is immaterial. What is
 /// *not* immaterial is the rustc that produced the rlib: a mismatch there is `E0514`, a hard error.
-/// The newest rlib is the one the toolchain most recently in use produced, so maximising mtime
-/// maximises the chance of a version match - which is exactly the failure being fixed.
+/// A newer archive can have been built by another compiler while an older compatible archive
+/// remains available. Let the selected rustc validate candidates in deterministic descending
+/// `(mtime, uplifted, path)` order; never assume the first file belongs to the pinned toolchain.
 ///
 /// The trailing `-` in the `deps/` prefix is load-bearing: it keeps a hypothetical
 /// `libwukong_runtime_foo` crate out.
@@ -985,7 +974,7 @@ fn runtime_rlib_candidates(dir: &Path) -> Vec<RlibCandidate> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rlib") {
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("rlib") {
             continue;
         }
         let matches = path
@@ -1005,7 +994,38 @@ fn runtime_rlib_candidates(dir: &Path) -> Vec<RlibCandidate> {
             mtime,
         });
     }
+    out.sort_by(|a, b| (b.mtime, b.uplifted, &b.path).cmp(&(a.mtime, a.uplifted, &a.path)));
     out
+}
+
+/// Only crate-loading failures justify trying an older runtime. A genuine object/linker error
+/// must remain an error, rather than silently changing which runtime implementation is linked.
+fn incompatible_runtime_metadata(stderr: &[u8]) -> bool {
+    let diagnostics = String::from_utf8_lossy(stderr);
+    [
+        "error[E0514]",
+        "error[E0786]",
+        "error[E0460]",
+        "error[E0463]",
+    ]
+    .iter()
+    .any(|code| diagnostics.contains(code))
+}
+
+fn try_runtime_rlibs(
+    candidates: Vec<RlibCandidate>,
+    mut attempt: impl FnMut(&Path) -> std::io::Result<std::process::Output>,
+) -> std::io::Result<Option<(PathBuf, std::process::Output)>> {
+    let mut last = None;
+    for candidate in candidates {
+        let output = attempt(&candidate.path)?;
+        let retry = !output.status.success() && incompatible_runtime_metadata(&output.stderr);
+        last = Some((candidate.path, output));
+        if !retry {
+            break;
+        }
+    }
+    Ok(last)
 }
 
 /// The LLVM bitcode magic, `'B' 'C' 0xC0 0xDE`, as it appears at offset 0 of a raw `.bc` module.
@@ -1112,11 +1132,11 @@ fn rustc_link(
         None => return LinkOutcome::Unavailable,
     };
     let deps = dir.join("deps");
-    let rlib = match runtime_rlib_in(&dir) {
-        Some(p) => p,
+    let candidates = runtime_rlib_candidates(&dir);
+    if candidates.is_empty() {
         // Not a cargo target layout (e.g. an installed binary without the rlib) — use the cc path.
-        None => return LinkOutcome::Unavailable,
-    };
+        return LinkOutcome::Unavailable;
+    }
 
     let shim_path = scratch_path(scratch, format!("{stem}_shim.rs"));
     if let Err(e) = std::fs::write(&shim_path, WUKONG_RT_SHIM) {
@@ -1142,44 +1162,45 @@ fn rustc_link(
     // `vfmadd231ps (%rdx,%r11,1),%ymm2,%ymm0` — a correct but deoptimized runtime in every AOT
     // binary. `lto=thin` + `opt-level=3` mirrors the workspace `[profile.release]` the rlib was
     // built under, so the kernels land in the exe exactly as that profile compiled them.
-    let bitcode_rlib = rlib_holds_bitcode_members(&rlib);
-
     let rustc = link_rustc();
-    let mut cmd = Command::new(&rustc);
-    cmd.arg(&shim_path)
-        .arg("--edition")
-        .arg("2021")
-        // The rlib we link against is built by this workspace, whose `[profile.release]` sets
-        // `panic = "abort"`. rustc defaults the shim to `unwind`, and a strategy mismatch is a hard
-        // metadata error ("the crate `wukong_runtime` requires panic strategy `abort` which is
-        // incompatible with this crate's strategy of `unwind`") that rejected every release-profile
-        // link before it ever reached the linker. An abort-strategy crate may link unwind-built
-        // dependencies, so this is equally correct against a debug-profile rlib.
-        .arg("-C")
-        .arg("panic=abort");
-    if bitcode_rlib {
-        cmd.arg("-C").arg("lto=thin").arg("-C").arg("opt-level=3");
-    }
-    // `.output()`, not `.status()`, for one reason: the E0514 note below has to READ rustc's
-    // diagnostics to know whether to print itself. Everything rustc writes still reaches the same
-    // descriptor, forwarded immediately after it exits - but two things about the SHAPE change. It
-    // arrives as one block at the end rather than streaming, and rustc now sees a pipe instead of a
-    // terminal, so its diagnostics come through UNCOLOURED. The link is a single short-lived child
-    // at the end of compilation, so neither is something the user can act on.
-    let run = cmd
-        .arg("--extern")
-        .arg(format!("wukong_runtime={}", rlib.display()))
-        .arg("-L")
-        .arg(format!("dependency={}", deps.display()))
-        .arg("-C")
-        .arg(format!("link-arg={}", obj_path.display()))
-        .arg("-o")
-        .arg(&out_arg)
-        .output();
+    let run = try_runtime_rlibs(candidates, |rlib| {
+        let bitcode_rlib = rlib_holds_bitcode_members(rlib);
+        let mut cmd = Command::new(&rustc);
+        cmd.arg(&shim_path)
+            .arg("--edition")
+            .arg("2021")
+            // The rlib we link against is built by this workspace, whose `[profile.release]` sets
+            // `panic = "abort"`. rustc defaults the shim to `unwind`, and a strategy mismatch is a hard
+            // metadata error ("the crate `wukong_runtime` requires panic strategy `abort` which is
+            // incompatible with this crate's strategy of `unwind`") that rejected every release-profile
+            // link before it ever reached the linker. An abort-strategy crate may link unwind-built
+            // dependencies, so this is equally correct against a debug-profile rlib.
+            .arg("-C")
+            .arg("panic=abort");
+        if bitcode_rlib {
+            cmd.arg("-C").arg("lto=thin").arg("-C").arg("opt-level=3");
+        }
+        // `.output()`, not `.status()`, for one reason: the E0514 note below has to READ rustc's
+        // diagnostics to know whether to print itself. Everything rustc writes still reaches the same
+        // descriptor, forwarded immediately after it exits - but two things about the SHAPE change. It
+        // arrives as one block at the end rather than streaming, and rustc now sees a pipe instead of a
+        // terminal, so its diagnostics come through UNCOLOURED. The link is a single short-lived child
+        // at the end of compilation, so neither is something the user can act on.
+        cmd.arg("--extern")
+            .arg(format!("wukong_runtime={}", rlib.display()))
+            .arg("-L")
+            .arg(format!("dependency={}", deps.display()))
+            .arg("-C")
+            .arg(format!("link-arg={}", obj_path.display()))
+            .arg("-o")
+            .arg(&out_arg)
+            .output()
+    });
     let _ = std::fs::remove_file(&shim_path);
 
-    let produced = match run {
-        Ok(o) => o,
+    let (rlib, produced) = match run {
+        Ok(Some(o)) => o,
+        Ok(None) => return LinkOutcome::Unavailable,
         // rustc could not be spawned: fall back to the C-runtime `cc` link (scalar, no-data
         // programs only).
         Err(_) => return LinkOutcome::Unavailable,
@@ -1192,6 +1213,7 @@ fn rustc_link(
     if produced.status.success() {
         return LinkOutcome::Linked;
     }
+    let bitcode_rlib = rlib_holds_bitcode_members(&rlib);
 
     // The object path is deliberately not named: it is a scratch intermediate that `emit_native`'s
     // `ScratchDir` deletes on the way out (see [`object_path`]).
@@ -1209,15 +1231,14 @@ fn rustc_link(
     // raised by the rustc invoked HERE about the rlib picked by [`runtime_rlib_in`], so naming both
     // is the whole diagnosis; without it the message reads as a Wukong bug. Matching on the bare
     // code rather than the prose keeps it stable across rustc's wording changes.
-    if String::from_utf8_lossy(&produced.stderr).contains("E0514") {
+    if incompatible_runtime_metadata(&produced.stderr) {
         msg.push_str(&format!(
-            "\nnote: E0514 means `{}` was built by a DIFFERENT rustc than the one that ran this \
-             link (`{}`).\n\
-             help: rebuild the runtime with the toolchain that will link it \
-             (`cargo build -p wukong_runtime`, adding `--release` if this compiler is a release \
-             build), or put that toolchain's `rustc` first on PATH.",
+            "\nnote: no available runtime archive could be loaded by `{}`; the last archive tried \
+             was `{}`.\n\
+             help: rebuild wukong_runtime with that compiler (set RUSTC to the displayed path \
+             for `cargo build -p wukong_runtime`, adding `--release` for a release compiler).",
+            rustc.display(),
             rlib.display(),
-            rustc.display()
         ));
     }
     LinkOutcome::Failed(msg)
@@ -1238,8 +1259,8 @@ fn rustc_link(
 /// `.../.rustup/toolchains/stable-x86_64-pc-windows-msvc/bin/rustc.exe`), so it is immune
 /// to directory-based resolution - and it is the compiler cargo used to build THIS binary. It is
 /// not guaranteed to be the one that built the rlib the link picks: a `target/` tree accumulates
-/// rlibs from every toolchain it has ever seen, which is why [`runtime_rlib_in`] takes the newest
-/// and why the E0514 note still has to exist. The `PATH` fallback keeps a relocated or installed
+/// rlibs from every toolchain it has ever seen, which is why [`rustc_link`] tries candidates in
+/// freshness order until one passes crate loading. The `PATH` fallback keeps a relocated or installed
 /// binary working; the
 /// E0514 note in [`rustc_link`] names the resolved path either way, so the failure is legible in
 /// both worlds.
@@ -2440,6 +2461,165 @@ mod verify_gate_tests {
 #[cfg(test)]
 mod native_link_tests {
     use super::*;
+
+    #[test]
+    fn runtime_archive_selection_retries_a_newer_incompatible_compiler() {
+        use std::process::Command;
+        let scratch = ScratchDir::new("rlib_compatibility").expect("scratch directory");
+        let dir = &scratch.path;
+        let deps = dir.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let source = dir.join("runtime.rs");
+        std::fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let good = dir.join("libwukong_runtime.rlib");
+        let rustc = link_rustc();
+        let built = Command::new(&rustc)
+            .args([
+                "--crate-name",
+                "wukong_runtime",
+                "--crate-type",
+                "rlib",
+                "--edition",
+                "2021",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&good)
+            .output()
+            .unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        // Change only rustc's embedded version text in a real archive, retaining its structure.
+        // This produces a real E0514 from the pinned compiler without installing a second one.
+        let mut obsolete = std::fs::read(&good).unwrap();
+        let version_offsets: Vec<usize> = obsolete
+            .windows(6)
+            .enumerate()
+            .filter_map(|(i, bytes)| (bytes == b"rustc ").then_some(i + 6))
+            .collect();
+        assert!(
+            !version_offsets.is_empty(),
+            "archive has no compiler version metadata"
+        );
+        for offset in version_offsets {
+            obsolete[offset] = b'0';
+        }
+        let bad = deps.join("libwukong_runtime-incompatible.rlib");
+        std::fs::write(&bad, &obsolete).unwrap();
+        for (path, when) in [(&good, secs(1_700_000_100)), (&bad, secs(1_700_000_200))] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(when))
+                .unwrap();
+        }
+        assert_eq!(
+            runtime_rlib_in(dir),
+            Some(bad.clone()),
+            "newer archive must be attempted first"
+        );
+        let probe = dir.join("probe.rs");
+        std::fs::write(
+            &probe,
+            "extern crate wukong_runtime; pub fn answer() -> u32 { wukong_runtime::answer() }\n",
+        )
+        .unwrap();
+        let mut attempted = Vec::new();
+        let (selected, output) = try_runtime_rlibs(runtime_rlib_candidates(dir), |rlib| {
+            attempted.push(rlib.to_path_buf());
+            let output = Command::new(&rustc)
+                .args([
+                    "--crate-type",
+                    "rlib",
+                    "--emit",
+                    "metadata",
+                    "--edition",
+                    "2021",
+                ])
+                .arg(&probe)
+                .arg("--extern")
+                .arg(format!("wukong_runtime={}", rlib.display()))
+                .arg("-o")
+                .arg(dir.join("probe.rmeta"))
+                .output()?;
+            if rlib == bad {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("error[E0514]"),
+                    "expected actual rustc version rejection: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(output)
+        })
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(selected, good);
+        assert_eq!(attempted, [bad.clone(), good.clone()]);
+
+        // Exhaustion returns a real failure; it cannot become the C-runtime fallback or success.
+        std::fs::write(&good, &obsolete).unwrap();
+        let mut attempts = 0;
+        let (_, failed) = try_runtime_rlibs(runtime_rlib_candidates(dir), |rlib| {
+            attempts += 1;
+            Command::new(&rustc)
+                .args(["--crate-type", "rlib", "--emit", "metadata"])
+                .arg(&probe)
+                .arg("--extern")
+                .arg(format!("wukong_runtime={}", rlib.display()))
+                .arg("-o")
+                .arg(dir.join("probe.rmeta"))
+                .output()
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert!(!failed.status.success());
+        assert!(incompatible_runtime_metadata(&failed.stderr));
+    }
+
+    #[test]
+    fn runtime_archive_selection_preserves_non_metadata_errors() {
+        let scratch = ScratchDir::new("rlib_error").expect("scratch directory");
+        let source = scratch.path.join("broken.rs");
+        std::fs::write(&source, "pub fn unfinished( {\n").unwrap();
+        let candidates = ["first", "second"]
+            .into_iter()
+            .map(|name| RlibCandidate {
+                path: PathBuf::from(name),
+                uplifted: false,
+                mtime: secs(1),
+            })
+            .collect();
+        let mut attempts = 0;
+        let (selected, output) = try_runtime_rlibs(candidates, |_| {
+            attempts += 1;
+            std::process::Command::new(link_rustc())
+                .args(["--crate-type", "rlib", "--emit", "metadata"])
+                .arg(&source)
+                .arg("-o")
+                .arg(scratch.path.join("broken.rmeta"))
+                .output()
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            attempts, 1,
+            "a genuine compilation error must not select an older runtime"
+        );
+        assert_eq!(selected, PathBuf::from("first"));
+        assert!(!incompatible_runtime_metadata(&output.stderr));
+    }
 
     /// They must never be generated in the directory the user invoked the compiler from:
     /// `{stem}_shim.rs` was written there and then unconditionally deleted, so an `--emit=exe` run
