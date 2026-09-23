@@ -1,0 +1,47 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 4096
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+// EXPECT-OUT: 8
+// EXPECT-OUT: 9
+// A parallel annotation must not race repeated destinations or reads through aliased parameters.
+// Expected values follow the forward scalar loops: 4096 visits to bin zero, then 1..9.
+module parallel_dependence
+
+@generic @parallel
+fn histogram(x: [i32; 4096], mut out: [i32; 8]) {
+    for i in 0..4096 {
+        out[x[i] % 8] = out[x[i] % 8] + 1;
+    }
+}
+
+@generic @parallel
+fn recurrence(x: [i32; 9], mut out: [i32; 9]) {
+    for i in 0..8 {
+        out[i + 1] = x[i] + 1;
+    }
+}
+
+fn main() -> i32 {
+    let x: [i32; 4096] = [0; 4096];
+    let mut bins: [i32; 8] = [0; 8];
+    histogram(x, bins);
+    for i in 0..8 { print(bins[i]); }
+    let mut chain: [i32; 9] = [1; 9];
+    recurrence(chain, chain);
+    for i in 0..9 { print(chain[i]); }
+    return 0;
+}

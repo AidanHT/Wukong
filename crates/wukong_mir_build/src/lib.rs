@@ -1929,7 +1929,8 @@ pub fn lower_program_with(
                   // body becomes a separate ranged function, and the original becomes a thin wrapper
                   // that hands chunks to `wukong_parallel_for`.
                 if has_parallel_attr(item, interner) {
-                    if let Some((idx, hi, loop_body)) = parallel_spec(f, body, sema, interner) {
+                    if let Some((idx, hi, loop_body)) = parallel_spec(f, body, sema, interner, gemm)
+                    {
                         let base = interner.resolve(f.name.sym).to_string();
                         let par_sym = interner.intern(&format!("{base}$par"));
                         let pfor_sym = interner.intern("wukong_parallel_for");
@@ -2205,6 +2206,7 @@ fn parallel_spec<'a>(
     body: &'a Block,
     sema: &SemaResult,
     interner: &Interner,
+    gemm: GemmSyms,
 ) -> Option<(Symbol, &'a Expr, &'a Block)> {
     // Captures are exactly the parameters, so they must all be arrays (passed by pointer).
     let param_tys: Vec<Ty> = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
@@ -2285,6 +2287,45 @@ fn parallel_spec<'a>(
     let ast::PatKind::Ident(name) = &pat.kind else {
         return None;
     };
+    // Chunking changes iteration order. The syntactic checks above cannot prove that writes
+    // from different chunks are independent (histograms and recurrences satisfy all of them).
+    // Reuse the region outliner's proof, including its union of potentially aliased parameter
+    // accesses. A throwaway lowerer models the real parameter ABI; it emits no program code.
+    let mut proof_diags = Vec::new();
+    let mut proof = FnLowerer {
+        builder: Builder::new(f.name.sym, MirType::Void),
+        preserve_aggregate_blocks: false,
+        const_lengths: RefCell::default(),
+        sema,
+        interner,
+        diags: &mut proof_diags,
+        scopes: vec![HashMap::default()],
+        field_bases: vec![HashMap::default()],
+        terminated: false,
+        loops: Vec::new(),
+        gemm,
+        parallel_fn: false,
+        vec_loads: HashMap::default(),
+        slice_slots: HashSet::default(),
+        sret: None,
+        subst: HashMap::default(),
+        mono: None,
+        par: None,
+        tile_queue: vec![],
+        param_arrays: vec![],
+    };
+    for (p, ty) in f.params.iter().zip(&param_tys) {
+        let base = proof.builder.add_param(MirType::Ptr);
+        proof.param_arrays.push((base, ty.clone()));
+        proof.bind(p.name.sym, base, mir_ty(ty));
+    }
+    // The mixed-radix proof needs a known iteration domain. An unknown bound conservatively
+    // retains serial execution; it must never be guessed from the array's storage extent.
+    let n = proof.const_usize_expr(end)? as i128;
+    if n < 2 {
+        return None;
+    }
+    proof.match_parallel_region(*name, n, lb)?;
     Some((*name, end, lb))
 }
 
@@ -29718,6 +29759,54 @@ fn mm(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
 }}
 "
         )
+    }
+
+    #[test]
+    fn parallel_whole_function_requires_iteration_independence() {
+        for body in [
+            "out[x[i] % 16] = out[x[i] % 16] + 1;",
+            "out[0] = out[0] + x[i];",
+            "out[i + 1] = out[i] + x[i];",
+            // x and out may be the same caller buffer, even though their names differ.
+            "out[i + 1] = x[i];",
+            // Output order is observable even when the memory accesses are independent.
+            "out[i] = x[i]; print(x[i]);",
+        ] {
+            let src = format!(
+                "module m\n@generic @parallel\n\
+                 fn kernel(x: [i32; 32], mut out: [i32; 32]) {{\n\
+                 for i in 0..16 {{ {body} }}\n}}"
+            );
+            let (prog, diags, interner) = lower(&src);
+            assert!(diags.iter().all(|d| !d.is_error()), "{body}: {diags:?}");
+            assert!(
+                !prog_calls(&prog, &interner, "wukong_parallel_for"),
+                "unsafe whole-function loop was threaded: {body}"
+            );
+            for f in &prog.funcs {
+                assert!(wukong_mir::verify::verify_function(f).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_whole_function_keeps_independent_and_in_place_loops() {
+        for body in ["out[i] = x[i] + 1;", "out[i] = out[i] + x[i];"] {
+            let src = format!(
+                "module m\n@generic @parallel\n\
+                 fn kernel(x: [i32; 32], mut out: [i32; 32]) {{\n\
+                 for i in 0..32 {{ {body} }}\n}}"
+            );
+            let (prog, diags, interner) = lower(&src);
+            assert!(diags.iter().all(|d| !d.is_error()), "{body}: {diags:?}");
+            assert!(
+                prog_calls(&prog, &interner, "wukong_parallel_for"),
+                "independent whole-function loop lost threading: {body}"
+            );
+            for f in &prog.funcs {
+                assert!(wukong_mir::verify::verify_function(f).is_empty());
+            }
+        }
     }
 
     #[test]
