@@ -77,3 +77,13 @@ rejects them with a cancellation-ABI diagnostic. This includes parallel callback
 alone cannot stop effects already running on another worker. AOT Rust/C shims terminate at failure
 with diagnostic `assertion failed` and exit 1. Previously emitted AOT output remains visible;
 the existing `--run` error API discards captured output.
+
+Compact float-to-boolean vector casts use scalar lane legalization inside their containing
+function. This preserves one-byte boolean storage, block arguments, load/store/extract,
+lane arithmetic, masks, and single-round FMA while saturating to i32/u32 before taking the
+low bit. This bounded fallback accepts 1 through 16 integer/f32/f64 lanes and scalarizes
+all vector SSA in the affected function. Functions without these casts retain their SIMD lowering.
+Vector function ABIs, vector-valued calls, lane-repacking bitcasts, and noninteger
+comparison-result masks still
+receive explicit diagnostics in this legalization path. This is a correctness fallback,
+not a SIMD throughput improvement.
