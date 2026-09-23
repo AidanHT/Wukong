@@ -61,3 +61,15 @@ Generated code calls:
 
 `cargo test -p wukong_codegen_cranelift --lib` — JIT correctness, interpreter-vs-native differential,
 optimization invariance, kernel fuzzing (`fuzz.rs`, `fuzz_grammar.rs`).
+
+Failed assertions stop the current JIT function immediately and propagate through direct callers
+before they can observe a return value or execute subsequent side effects. Only functions that
+transitively call `assert` require status polling. This uses ordinary generated returns rather than
+unwinding through an `extern "C"` frame. `run()` retains its `Err("assertion failed")` contract;
+the timing-only `call()` returns exit code 1 and resets failure state for each invocation.
+
+Assertion-capable functions cannot currently be taken as callback addresses: native compilation
+rejects them with a cancellation-ABI diagnostic. This includes parallel callbacks; a shared flag
+alone cannot stop effects already running on another worker. AOT Rust/C shims terminate at failure
+with diagnostic `assertion failed` and exit 1. Previously emitted AOT output remains visible;
+the existing `--run` error API discards captured output.

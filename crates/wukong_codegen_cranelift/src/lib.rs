@@ -16,7 +16,7 @@
 //! calls an `rt_fmod_*` shim (Cranelift has no `frem`), and f16/bf16 are rounded at the value —
 //! inline for bf16, through the runtime's `half`-crate shims for f16.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -96,6 +96,10 @@ extern "C" fn rt_assert(cond: i64) {
     }
 }
 
+extern "C" fn rt_assert_failed() -> i64 {
+    i64::from(ASSERT_FAILED.load(Ordering::SeqCst))
+}
+
 // Float remainder. Cranelift has no `frem`; the interpreter uses Rust `%` (true fmod), so the native
 // backend calls these to stay bit-identical instead of the lossy `a - trunc(a/b)*b` identity (which
 // drifts once `a/b` exceeds the float's integer-precision range, e.g. `1e18 % 3`).
@@ -115,6 +119,7 @@ const RT_PRINT_U64: &str = "wukong_rt_print_u64";
 const RT_PRINT_F64: &str = "wukong_rt_print_f64";
 const RT_PRINT_STR: &str = "wukong_rt_print_str";
 const RT_ASSERT: &str = "wukong_rt_assert";
+const RT_ASSERT_FAILED: &str = "wukong_rt_assert_failed";
 // The heap builtins: zeroed allocation (count, elem_size, elem_is_float) -> ptr, and its release.
 const RT_ALLOC: &str = "wukong_rt_alloc";
 const RT_FREE: &str = "wukong_rt_free";
@@ -1213,7 +1218,14 @@ impl<'a> FnTranslator<'a> {
                 self.call_args.push(value);
             }
             let call = self.builder.ins().call(fref, self.call_args);
-            return self.builder.inst_results(call).first().copied();
+            let result = self.builder.inst_results(call).first().copied();
+            if self.decls.asserting.contains(&func) {
+                let status = self.runtime_ref(RT_ASSERT_FAILED);
+                let check = self.builder.ins().call(status, &[]);
+                let failed = self.builder.inst_results(check)[0];
+                self.return_on_assert_failure(failed, false);
+            }
+            return result;
         }
         let name = self.interner.resolve(func);
         // The parallel-for runtime entry: wukong_parallel_for(n, body_ptr, env_ptr).
@@ -1948,14 +1960,63 @@ impl<'a> FnTranslator<'a> {
                 }
             }
             Intrinsic::Assert => {
-                if let Some(&a) = args.first() {
-                    let v = self.coerce_to_i64(a);
-                    let fref = self.runtime_ref(RT_ASSERT);
-                    self.builder.ins().call(fref, &[v]);
-                }
+                let failed = if let Some(&a) = args.first() {
+                    let value = self.val(a);
+                    let ty = self.dfg_ty(value);
+                    if ty == types::F32 {
+                        let zero = self.builder.ins().f32const(0.0);
+                        self.builder.ins().fcmp(FloatCC::Equal, value, zero)
+                    } else if ty == types::F64 {
+                        let zero = self.builder.ins().f64const(0.0);
+                        self.builder.ins().fcmp(FloatCC::Equal, value, zero)
+                    } else if ty.is_vector() {
+                        self.builder.ins().iconst(types::I8, 1)
+                    } else {
+                        self.builder.ins().icmp_imm(IntCC::Equal, value, 0)
+                    }
+                } else {
+                    self.builder.ins().iconst(types::I8, 1)
+                };
+                self.return_on_assert_failure(failed, true);
             }
         }
         None
+    }
+
+    /// Return normally through generated callers; never unwind Rust through an extern-C frame.
+    /// A caller checks the shared failure flag before it can observe the dummy return value.
+    fn return_on_assert_failure(&mut self, failed: Value, record: bool) {
+        let stop = self.builder.create_block();
+        let resume = self.builder.create_block();
+        self.builder.ins().brif(failed, stop, &[], resume, &[]);
+        self.builder.switch_to_block(stop);
+        if record {
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            let assert = self.runtime_ref(RT_ASSERT);
+            self.builder.ins().call(assert, &[zero]);
+        }
+        match cl_type(&self.func.ret, self.ptr_ty) {
+            None => {
+                self.builder.ins().return_(&[]);
+            }
+            Some(ty) => {
+                let lane = ty.lane_type();
+                let zero = if lane == types::F32 {
+                    self.builder.ins().f32const(0.0)
+                } else if lane == types::F64 {
+                    self.builder.ins().f64const(0.0)
+                } else {
+                    self.builder.ins().iconst(lane, 0)
+                };
+                let zero = if ty.is_vector() {
+                    self.builder.ins().splat(ty, zero)
+                } else {
+                    zero
+                };
+                self.builder.ins().return_(&[zero]);
+            }
+        }
+        self.builder.switch_to_block(resume);
     }
 
     fn coerce_to_i64(&mut self, v: ValueId) -> Value {
@@ -2045,6 +2106,7 @@ struct RtFuncs {
     print_f64: FuncId,
     print_str: FuncId,
     assert: FuncId,
+    assert_failed: FuncId,
     rt_alloc: FuncId,
     rt_free: FuncId,
     rt_read_f32: FuncId,
@@ -2295,6 +2357,47 @@ fn make_isa_verify(
         .map_err(|e| e.to_string())
 }
 
+/// Direct-call failure propagation is only needed along paths that can reach a builtin assert.
+fn asserting_functions(program: &Program, interner: &Interner) -> Result<HashSet<Symbol>, String> {
+    let defined: HashSet<Symbol> = program.funcs.iter().map(|f| f.name).collect();
+    let mut asserting = HashSet::new();
+    loop {
+        let mut changed = false;
+        for f in &program.funcs {
+            if asserting.contains(&f.name) {
+                continue;
+            }
+            let can_fail = f.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+                if let Op::Call { func, .. } = inst.op {
+                    asserting.contains(&func)
+                        || (!defined.contains(&func) && interner.resolve(func) == "assert")
+                } else {
+                    false
+                }
+            });
+            if can_fail {
+                changed |= asserting.insert(f.name);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for f in &program.funcs {
+        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+            if let Op::FuncAddr(func) = inst.op {
+                if asserting.contains(&func) {
+                    return Err(format!(
+                        "unsupported assertion-capable callback `{}`: immediate assertion termination through foreign or parallel callbacks requires a cancellation ABI",
+                        interner.resolve(func)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(asserting)
+}
+
 /// Declare every user function and the runtime imports into `module`, then define each body.
 fn populate_module<M: Module>(
     module: &mut M,
@@ -2302,6 +2405,7 @@ fn populate_module<M: Module>(
     interner: &Interner,
     parallel: bool,
 ) -> Result<HashMap<Symbol, FuncId>, String> {
+    let asserting = asserting_functions(program, interner)?;
     // Compact MIR boolean vectors map to i8 lanes, but the native SIMD backend
     // cannot represent the narrower result of f32x4 -> i8x4 / f64x2 -> i8x2.
     // Reject before declaring signatures or translating any instruction: otherwise
@@ -2588,6 +2692,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         assert: module
             .declare_function(RT_ASSERT, Linkage::Import, &sig_i)
+            .map_err(|e| e.to_string())?,
+        assert_failed: module
+            .declare_function(RT_ASSERT_FAILED, Linkage::Import, &sig_now_ns)
             .map_err(|e| e.to_string())?,
         rt_alloc: module
             .declare_function(RT_ALLOC, Linkage::Import, &sig_rt_alloc)
@@ -3092,6 +3199,7 @@ fn populate_module<M: Module>(
         (RT_PRINT_STR, rt.print_str),
         (RT_PRINT_F64, rt.print_f64),
         (RT_ASSERT, rt.assert),
+        (RT_ASSERT_FAILED, rt.assert_failed),
         (RT_ALLOC, rt.rt_alloc),
         (RT_FREE, rt.rt_free),
         (RT_READ_F32, rt.rt_read_f32),
@@ -3333,6 +3441,7 @@ fn populate_module<M: Module>(
             &ids,
             &data_ids,
             &kernel_ids,
+            &asserting,
         )?;
     } else {
         define_functions_serial(
@@ -3345,6 +3454,7 @@ fn populate_module<M: Module>(
             &ids,
             &data_ids,
             &kernel_ids,
+            &asserting,
         )?;
     }
     Ok(ids)
@@ -3463,6 +3573,7 @@ fn build_function_clif(
 /// across the rayon workers in [`define_functions_parallel`].
 struct Decls<'a> {
     d: &'a cranelift_module::ModuleDeclarations,
+    asserting: &'a HashSet<Symbol>,
 }
 
 impl Decls<'_> {
@@ -3523,6 +3634,7 @@ fn define_functions_serial<M: Module>(
     ids: &HashMap<Symbol, FuncId>,
     data_ids: &HashMap<Symbol, DataId>,
     kernel_ids: &[Vec<FuncId>],
+    asserting: &HashSet<Symbol>,
 ) -> Result<(), String> {
     let mut ctx = module.make_context();
     let mut fbctx = FunctionBuilderContext::new();
@@ -3531,6 +3643,7 @@ fn define_functions_serial<M: Module>(
         {
             let decls = Decls {
                 d: module.declarations(),
+                asserting,
             };
             build_function_clif(
                 &decls,
@@ -3573,6 +3686,7 @@ fn define_functions_parallel<M: Module>(
     ids: &HashMap<Symbol, FuncId>,
     data_ids: &HashMap<Symbol, DataId>,
     kernel_ids: &[Vec<FuncId>],
+    asserting: &HashSet<Symbol>,
 ) -> Result<(), String> {
     use cranelift_module::ModuleReloc;
     use rayon::prelude::*;
@@ -3583,6 +3697,7 @@ fn define_functions_parallel<M: Module>(
     let compiled: Vec<(FuncId, u64, Vec<u8>, Vec<ModuleReloc>)> = {
         let decls = Decls {
             d: module.declarations(),
+            asserting,
         };
         let isa = module.isa();
         program
@@ -3699,7 +3814,7 @@ impl JitProgram {
     }
 
     /// Run once for timing: clears (but does not clone) the capture buffer so repeated prints don't
-    /// grow memory, and returns just the exit code.
+    /// grow memory, and returns just the exit code (1 on assertion failure).
     ///
     /// **Stack contract — differs from [`JitProgram::run`].** This runs the JIT'd entry on the
     /// *caller's* stack, deliberately: spawning a thread per iteration would land inside the
@@ -3712,7 +3827,13 @@ impl JitProgram {
     pub fn call(&self) -> i64 {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        unsafe { self.invoke() }
+        ASSERT_FAILED.store(false, Ordering::SeqCst);
+        let result = unsafe { self.invoke() };
+        if ASSERT_FAILED.load(Ordering::SeqCst) {
+            1
+        } else {
+            result
+        }
     }
 }
 
@@ -3801,6 +3922,7 @@ pub fn jit_compile(
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
+    builder.symbol(RT_ASSERT_FAILED, rt_assert_failed as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);
     builder.symbol(RT_FREE, wukong_runtime::wukong_rt_free as *const u8);
     builder.symbol(RT_READ_F32, wukong_runtime::wukong_rt_read_f32 as *const u8);
@@ -4367,6 +4489,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
+    builder.symbol(RT_ASSERT_FAILED, rt_assert_failed as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);
     builder.symbol(RT_FREE, wukong_runtime::wukong_rt_free as *const u8);
     builder.symbol(RT_READ_F32, wukong_runtime::wukong_rt_read_f32 as *const u8);
@@ -4963,6 +5086,9 @@ fn emit_object_ex(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod assertion_tests;
 
 #[cfg(test)]
 mod fuzz;
