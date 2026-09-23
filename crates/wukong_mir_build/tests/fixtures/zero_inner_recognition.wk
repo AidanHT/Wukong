@@ -1,0 +1,130 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 22
+// EXPECT-OUT: 28
+// EXPECT-OUT: 49
+// EXPECT-OUT: 64
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 22
+// EXPECT-OUT: 28
+// EXPECT-OUT: 49
+// EXPECT-OUT: 64
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 9
+// EXPECT-OUT: 12
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 11
+module tests.run.zero_inner_recognition
+
+// Empty inner loops still execute the outer stores. These expectations come
+// from the source nest, independently of either backend or the kernel API.
+fn mm(a: [f32;6], b: [f32;6], mut c: [f32;4], k: i64) {
+    for i in 0..2 { for j in 0..2 {
+        let mut s: f32 = 0.0;
+        for p in 0..k { s = s + a[i*k+p] * b[p*2+j]; }
+        c[i*2+j] = s;
+    } }
+}
+
+fn mm_statement(a: [f32;6], b: [f32;6], mut c: [f32;4], k: i64) {
+    let outside: i32 = 1; // bypass the whole-function GEMM shortcut
+    for i in 0..2 { for j in 0..2 {
+        let mut s: f32 = 0.0;
+        for p in 0..k { s = s + a[i*k+p] * b[p*2+j]; }
+        c[i*2+j] = s;
+    } }
+}
+
+fn colsum(x: [f32;6], mut out: [f32;2], rows: i64) {
+    for j in 0..2 {
+        let mut s: f32 = 0.0;
+        for i in 0..rows { s = s + x[i*2+j]; }
+        out[j] = s;
+    }
+}
+
+fn colmax(x: [f32;6], mut out: [f32;2], rows: i64) {
+    for j in 0..2 {
+        let mut s: f32 = x[j];
+        for i in 1..rows { s = fmax(s, x[i*2+j]); }
+        out[j] = s;
+    }
+}
+
+fn colmean(x: [f32;6], mut out: [f32;2], rows: i64) {
+    for j in 0..2 {
+        let mut s: f32 = 0.0;
+        for i in 0..rows { s = s + x[i*2+j]; }
+        out[j] = s / (rows as f32);
+    }
+}
+
+fn mm_alias(a: [f32;4], b: [f32;4], mut c: [f32;4], k: i64) {
+    for i in 0..2 { for j in 0..2 {
+        let mut s: f32 = 0.0;
+        for p in 0..k { s = s + a[i*k+p] * b[p*2+j]; }
+        c[i*2+j] = s;
+    } }
+}
+
+fn main() -> i32 {
+    let a: [f32;6] = [1.0,2.0,3.0,4.0,5.0,6.0];
+    let b: [f32;6] = [1.0,2.0,3.0,4.0,5.0,6.0];
+    let mut c: [f32;4] = [7.0;4];
+    mm(a,b,c,0); for j in 0..4 { print(c[j] as i32); c[j] = 7.0; }
+    mm(a,b,c,-1); for j in 0..4 { print(c[j] as i32); c[j] = 7.0; }
+    mm(a,b,c,3); for j in 0..4 { print(c[j] as i32); c[j] = 7.0; }
+    mm_statement(a,b,c,0); for j in 0..4 { print(c[j] as i32); c[j] = 7.0; }
+    mm_statement(a,b,c,-1); for j in 0..4 { print(c[j] as i32); c[j] = 7.0; }
+    mm_statement(a,b,c,3); for j in 0..4 { print(c[j] as i32); }
+    let mut out: [f32;2] = [7.0;2];
+    colsum(a,out,0); for j in 0..2 { print(out[j] as i32); out[j] = 7.0; }
+    colsum(a,out,-1); for j in 0..2 { print(out[j] as i32); out[j] = 7.0; }
+    colsum(a,out,3); for j in 0..2 { print(out[j] as i32); out[j] = 7.0; }
+    colmax(a,out,0); for j in 0..2 { print(out[j] as i32); out[j] = 7.0; }
+    colmax(a,out,-1); for j in 0..2 { print(out[j] as i32); out[j] = 7.0; }
+    colmax(a,out,3); for j in 0..2 { print(out[j] as i32); out[j] = 7.0; }
+    colmean(a,out,0); for j in 0..2 { print((out[j] != out[j]) as i32); }
+    colmean(a,out,3); for j in 0..2 { print(out[j] as i32); }
+    // +0 divided by a negative empty extent is -0; its reciprocal is -infinity.
+    colmean(a,out,-1); for j in 0..2 { print((1.0 / out[j] < 0.0) as i32); }
+    // A positive runtime extent can still decline the kernel due to aliasing.
+    // Source-order writes change later reads: [1,2,3,4] -> [3,5,7,11].
+    let mut shared: [f32;4] = [1.0,2.0,3.0,4.0];
+    let ones: [f32;4] = [1.0;4];
+    mm_alias(shared,ones,shared,2);
+    for j in 0..4 { print(shared[j] as i32); }
+    return 0;
+}
