@@ -2302,6 +2302,25 @@ fn populate_module<M: Module>(
     interner: &Interner,
     parallel: bool,
 ) -> Result<HashMap<Symbol, FuncId>, String> {
+    // Compact MIR boolean vectors map to i8 lanes, but the native SIMD backend
+    // cannot represent the narrower result of f32x4 -> i8x4 / f64x2 -> i8x2.
+    // Reject before declaring signatures or translating any instruction: otherwise
+    // an unsupported shape can reach Cranelift's lowering assertions. Ordinary
+    // vector comparisons use full-width masks and do not take this cast path.
+    for function in &program.funcs {
+        for inst in function.blocks.iter().flat_map(|block| &block.insts) {
+            if let Op::Cast(CastKind::FpToSi | CastKind::FpToUi, _, MirType::Vec(lane, _)) =
+                &inst.op
+            {
+                if **lane == MirType::I1 {
+                    return Err(format!(
+                        "unsupported vector float-to-i1 cast in `{}`: native compact boolean vector storage is not implemented",
+                        interner.resolve(function.name)
+                    ));
+                }
+            }
+        }
+    }
     let ptr_ty = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
 

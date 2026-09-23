@@ -5338,6 +5338,89 @@ fn float_to_i1_saturates_at_32_bits_before_low_bit() {
     );
 }
 
+/// Compact I1 vector casts have defined MIR lane values but no supported native storage mapping.
+#[test]
+fn vector_float_to_i1_has_explicit_native_diagnostic() {
+    use wukong_mir::{Builder, CastKind, MirType, Op, Program};
+    let cases = [
+        (128.0, 0, 0),
+        (256.0, 0, 0),
+        (f64::NAN, 0, 0),
+        (129.0, 1, 1),
+        (257.0, 1, 1),
+        (-129.0, 1, 0),
+        (f64::INFINITY, 1, 1),
+        (f64::NEG_INFINITY, 0, 0),
+    ];
+    for from in [MirType::F32, MirType::F64] {
+        for lanes in [2u32, 4, 16] {
+            for kind in [CastKind::FpToSi, CastKind::FpToUi] {
+                let mut interner = Interner::new();
+                let main = interner.intern("main");
+                let print = interner.intern("print");
+                let mut b = Builder::new(main, MirType::I32);
+                let mut expected = String::new();
+                // Multiple batches exercise every case even for the native f64x2 input shape.
+                for start in (0..cases.len()).step_by(lanes as usize) {
+                    let array = b.alloca(MirType::Array(Box::new(from.clone()), lanes));
+                    for lane in 0..lanes {
+                        let (input, signed, unsigned) =
+                            cases[(start + lane as usize) % cases.len()];
+                        let index = b.build(MirType::I64, Op::ConstInt(lane as i128, MirType::I64));
+                        let ptr = b.build(
+                            MirType::Ptr,
+                            Op::Gep {
+                                ptr: array,
+                                index,
+                                elem: from.clone(),
+                            },
+                        );
+                        let value = b.build(from.clone(), Op::ConstFloat(input, from.clone()));
+                        b.build_void(Op::Store { ptr, value });
+                        let want = if kind == CastKind::FpToSi {
+                            signed
+                        } else {
+                            unsigned
+                        };
+                        expected.push_str(if want == 0 { "0\n" } else { "1\n" });
+                    }
+                    let source = MirType::Vec(Box::new(from.clone()), lanes);
+                    let target = MirType::Vec(Box::new(MirType::I1), lanes);
+                    let values = b.build(source.clone(), Op::Load(array, source));
+                    let converted = b.build(target.clone(), Op::Cast(kind, values, target));
+                    for lane in 0..lanes {
+                        let value = b.build(MirType::I1, Op::ExtractLane(converted, lane));
+                        let integer =
+                            b.build(MirType::I32, Op::Cast(CastKind::ZExt, value, MirType::I32));
+                        b.build_void(Op::Call {
+                            func: print,
+                            args: vec![integer],
+                        });
+                    }
+                }
+                let zero = b.build(MirType::I32, Op::ConstInt(0, MirType::I32));
+                b.ret(Some(zero));
+                let mut program = Program::new();
+                program.funcs.push(b.finish());
+                let errors = wukong_mir::verify::verify_program(&program);
+                assert!(errors.is_empty(), "{errors:?}");
+                let interpreted = wukong_interp::run_with_output(&program, main, &interner)
+                    .expect("defined MIR lanes");
+                assert_eq!(interpreted, (0, expected.into_bytes()));
+                // These calls must return diagnostics directly; a backend panic fails this test.
+                let jit_error = crate::jit_run(&program, main, &interner).unwrap_err();
+                let object_error = crate::emit_object(&program, &interner).unwrap_err();
+                for error in [jit_error, object_error] {
+                    assert!(
+                        error.contains("unsupported vector float-to-i1 cast"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Hand-built SIMD MIR (vector load + splat + vector `fadd` + vector store) must execute
 /// identically on the interpreter (lane-wise over its side arena) and the native backend (real
 /// SSE vectors). This is the contract the loop vectorizer relies on.
