@@ -28,6 +28,7 @@ enum Act {
     Not(ValueId),
     Cast(CastKind, ValueId),
     Gep(ValueId, ValueId),
+    Select(ValueId, ValueId, ValueId),
 }
 
 impl Pass for Simplify {
@@ -78,10 +79,31 @@ impl Pass for Simplify {
                     Op::Not(v) => Act::Not(*v),
                     Op::Cast(k, v, _) => Act::Cast(*k, *v),
                     Op::Gep { ptr, index, .. } => Act::Gep(*ptr, *index),
+                    Op::Select(c, a, b) => Act::Select(*c, *a, *b),
                     _ => continue,
                 };
 
                 match act {
+                    Act::Select(c, a, b) => {
+                        // Substitute the selected value itself: this preserves NaN payloads,
+                        // signed zero, pointers and vectors without materializing a new constant.
+                        // A vector mask is not a scalar truth value; identical arms still fold.
+                        let taken = if a == b {
+                            Some(a)
+                        } else if f.value_types[c.0 as usize] == MirType::I1 {
+                            match consts.get(&c.0) {
+                                Some(CV::Int(0)) => Some(b),
+                                Some(CV::Int(1)) => Some(a),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(v) = taken {
+                            subst.insert(res.0, v);
+                            changed = true;
+                        }
+                    }
                     Act::Bin(b, l, r) => {
                         let lc = consts.get(&l.0).copied();
                         let rc = consts.get(&r.0).copied();
@@ -543,6 +565,74 @@ mod tests {
     use super::*;
     use wukong_mir::CastKind::*;
     use wukong_span::{Interner, SourceId};
+
+    #[test]
+    fn select_with_a_constant_condition_folds_to_its_taken_arm() {
+        use wukong_mir::{Builder, Terminator};
+        for condition in [0, 1] {
+            let mut interner = Interner::new();
+            let mut b = Builder::new(interner.intern("f"), MirType::F64);
+            let c = b.build(MirType::I1, Op::ConstInt(condition, MirType::I1));
+            let a = b.build(MirType::F64, Op::ConstFloat(-0.0, MirType::F64));
+            let other = b.build(
+                MirType::F64,
+                Op::ConstFloat(f64::from_bits(0x7ff8000000000042), MirType::F64),
+            );
+            let selected = b.build(MirType::F64, Op::Select(c, a, other));
+            b.ret(Some(selected));
+            let mut f = b.finish();
+            assert!(Simplify.run_function(&mut f, &mut CfgAnalyses::default()));
+            let Terminator::Ret(Some(ret)) = f.blocks[0].term else {
+                panic!("missing return")
+            };
+            assert_eq!(ret, if condition == 1 { a } else { other });
+            assert!(wukong_mir::verify::verify_function(&f).is_empty());
+        }
+    }
+
+    #[test]
+    fn select_identical_vector_arms_fold_but_a_varying_mask_does_not() {
+        use wukong_mir::{Builder, Terminator};
+        for identical in [false, true] {
+            let mut interner = Interner::new();
+            let ty = MirType::Vec(Box::new(MirType::F32), 4);
+            let mut b = Builder::new(interner.intern("f"), ty.clone());
+            let mask = b.add_param(MirType::Vec(Box::new(MirType::I32), 4));
+            let a = b.add_param(ty.clone());
+            let other = b.add_param(ty.clone());
+            let selected = b.build(ty, Op::Select(mask, a, if identical { a } else { other }));
+            b.ret(Some(selected));
+            let mut f = b.finish();
+            assert_eq!(
+                Simplify.run_function(&mut f, &mut CfgAnalyses::default()),
+                identical
+            );
+            let Terminator::Ret(Some(ret)) = f.blocks[0].term else {
+                panic!("missing return")
+            };
+            assert_eq!(ret, if identical { a } else { selected });
+            assert!(wukong_mir::verify::verify_function(&f).is_empty());
+        }
+    }
+
+    #[test]
+    fn select_folding_exposes_dependent_constant_arithmetic() {
+        use wukong_mir::Builder;
+        let mut interner = Interner::new();
+        let mut b = Builder::new(interner.intern("f"), MirType::I64);
+        let c = b.build(MirType::I1, Op::ConstInt(0, MirType::I1));
+        let a = b.build(MirType::I64, Op::ConstInt(17, MirType::I64));
+        let other = b.build(MirType::I64, Op::ConstInt(42, MirType::I64));
+        let selected = b.build(MirType::I64, Op::Select(c, a, other));
+        let diff = b.build(MirType::I64, Op::Bin(BinOp::Sub, other, selected));
+        b.ret(Some(diff));
+        let mut f = b.finish();
+        assert!(Simplify.run_function(&mut f, &mut CfgAnalyses::default()));
+        assert!(f.blocks[0]
+            .insts
+            .iter()
+            .any(|i| i.result == Some(diff) && matches!(i.op, Op::ConstInt(0, MirType::I64))));
+    }
 
     /// Compile, optimize at `opt`, and run `main` in the interpreter — the language spec.
     fn run(src: &str, opt: u8) -> i64 {

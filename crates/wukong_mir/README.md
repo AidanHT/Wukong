@@ -16,7 +16,7 @@ Dependencies: `wukong_span`, `wukong_types::Scalar` only.
 wukong_mir_build → wukong_opt → wukong_interp | wukong_codegen_cranelift | wukong_codegen_gpu | wukong_codegen_llvm
 ```
 
-`wukong_driver::verify_or_ice` calls `verify_function` before every backend entry. `--emit=mir` /
+`wukong_driver::verify_or_ice` calls `verify_program` before every backend entry. `--emit=mir` /
 `--emit=mir-high` print via `print_program` (`src/print.rs`). Note: `--emit=mir-high` means
 *pre-optimization* MIR, not `MirLevel::High`.
 
@@ -36,7 +36,7 @@ wukong_mir_build → wukong_opt → wukong_interp | wukong_codegen_cranelift | w
 | `MirLevel` (inert) | `src/lib.rs:173` | enum exists; nothing branches on `Program::level` |
 | program container | `src/lib.rs:197` | `Program { funcs, statics, level }` |
 | per-function verify | `src/verify.rs` | `verify_function` — wired into pipeline |
-| whole-program verify | `src/verify.rs:41` | `verify_program` — call-vs-callee cross-check; **tests only** |
+| whole-program verify | `src/verify.rs` | `verify_program` — call-vs-callee cross-check at the driver boundary |
 | vec kernel ABI | `src/vec_kernel.rs` | `VecKernel`, `eval_lane`, `VEC_LANES = 8` |
 
 ## Core types
@@ -51,11 +51,11 @@ wukong_mir_build → wukong_opt → wukong_interp | wukong_codegen_cranelift | w
 
 `verify_function(f) -> Vec<String>` — empty = ok. Failure is an **ICE** (bug in a pass), not a user
 diagnostic. Enforces: single-definition SSA, dominance, entry-block param match, block-id indexing,
-per-op typing, terminator correctness, `VecKernelCall` index range and result presence.
+per-op typing including cast kinds and widths, terminator correctness, `VecKernelCall` index range
+and result presence, and every registered recipe's operand indices and reduction shape.
 
-`verify_program` additionally cross-checks each `Call` against callee signatures — but only
-`verify_function` is wired into `wukong_driver` and `wukong_opt` (debug `verify-each`). Change a
-callee's MIR signature and run the differential gate by hand.
+`verify_program` additionally cross-checks each `Call` against callee signatures at the driver
+boundary. The optimizer's debug `verify-each` checks individual functions.
 
 ## `VecKernel`
 
@@ -73,8 +73,8 @@ truth source.
   valid). A `PtrToInt(p) != 0` lowering was tried in `mir_build` and reverted (`lib.rs:16443`): it
   traded a loud verifier ICE for silent interp/native divergence. No shared null test exists today —
   a correct fix needs a dedicated `IsNull` op or reserving address 0 in the interpreter.
-- **`verify_program` not in pipeline** — call-vs-callee signature desync is an interp/native
-  divergence with silent zero on the oracle side.
+- **Recipe buffer capacity** — opaque pointer operands do not carry lengths; verification checks
+  recipe indices but does not prove that call-site pointer/scalar buffers are large enough.
 - **`verify-each` is `#[cfg(debug_assertions)]`** — no `--verify-each` CLI flag; release can slip past.
 
 ## Testing

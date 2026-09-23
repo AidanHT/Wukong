@@ -183,14 +183,13 @@ impl PassManager {
     /// four-fold address arithmetic and the dead-code removal that follows it. It does not need
     /// `Mem2Reg` (the pass refuses to duplicate a header or body containing an `Alloca`, so there is
     /// no new stack slot to promote), `Dse`, or `Licm` (LICM already ran over this same body, and
-    /// every instruction the copies add depends on the induction variable); `Simplify`,
-    /// `SimplifyCfg` and `SimplifyPhis` have almost nothing to do to a block that was merely
-    /// quadrupled. Measured in-process over the 331-program corpus, the whole unrolling stage is
-    /// 23% of optimizer time with these two passes and 33-39% with all five, against 11% with none,
-    /// so this is where the curve bends. Dropping passes can only leave code less optimized, never
-    /// wrong, so no gate depends on this list.
+    /// every instruction the copies add depends on the induction variable). The synthesized
+    /// wrap-safe preheader guard, however, contains new arithmetic and a select that Simplify
+    /// must fold when the bound is constant. Keep cleanup local to values: proving a remainder
+    /// loop empty through the main loop's exit parameters needs separate exit-value analysis.
     fn unroll_cleanup() -> PassManager {
         let mut pm = PassManager::new();
+        pm.add(Box::new(Simplify));
         pm.add(Box::new(Cse));
         pm.add(Box::new(Dce));
         pm

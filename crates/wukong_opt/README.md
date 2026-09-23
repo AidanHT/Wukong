@@ -64,7 +64,7 @@ load-bearing.
   connected components. Recursive callees are excluded; per-site budgets account for sole callers,
   loops and constant arguments, with absolute growth, relative growth and splice-count limits.
 - `unroll_program` — runs *after* the pipeline; changed functions get a reduced cleanup pass
-  (`cse` → `dce`).
+  (`simplify` → `cse` → `dce`), folding the synthesized constant-bound guard as well as the body.
 
 `cse`, `dse`, and `licm` consult `alias` — provenance analysis answering whether a store through `q`
 can be seen by a load through `p`. The Cranelift backend uses it too.

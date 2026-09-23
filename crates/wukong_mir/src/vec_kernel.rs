@@ -156,6 +156,71 @@ pub struct VecKernelScratch {
 }
 
 impl VecKernel {
+    /// Check the recipe's SSA indices and ABI-independent invariants before evaluation or lowering.
+    /// Unused recipes are checked too: backends may assemble every registered recipe.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let value_exists = |v: u32, end: usize| {
+            (v as usize) < end
+                && self
+                    .ops
+                    .get(v as usize)
+                    .is_some_and(|o| !matches!(o, VecOp::Store { .. }))
+        };
+        if self.unroll == 0 {
+            errors.push("unroll must be positive".into());
+        }
+        for (i, op) in self.ops.iter().enumerate() {
+            match *op {
+                VecOp::Load { stream } | VecOp::Store { stream, .. } if stream >= self.streams => {
+                    errors.push(format!("op {i} stream {stream} is out of range"));
+                }
+                VecOp::Splat { scalar } if scalar >= self.scalars => {
+                    errors.push(format!("op {i} scalar {scalar} is out of range"));
+                }
+                _ => {}
+            }
+            let operands = match *op {
+                VecOp::Load { .. } | VecOp::Splat { .. } | VecOp::Const { .. } => [None; 3],
+                VecOp::Bin { a, b, .. } | VecOp::Cmp { a, b, .. } => [Some(a), Some(b), None],
+                VecOp::Fma { a, b, c } => [Some(a), Some(b), Some(c)],
+                VecOp::Select { mask, a, b } => [Some(mask), Some(a), Some(b)],
+                VecOp::Sqrt { a } | VecOp::Neg { a } => [Some(a), None, None],
+                VecOp::Store { val, .. } => [Some(val), None, None],
+            };
+            for operand in operands.into_iter().flatten() {
+                if !value_exists(operand, i) {
+                    errors.push(format!("op {i} operand {operand} is not an earlier value"));
+                }
+            }
+            if let VecOp::Select { mask, .. } = *op {
+                if !matches!(self.ops.get(mask as usize), Some(VecOp::Cmp { .. })) {
+                    errors.push(format!("op {i} select mask must be a compare result"));
+                }
+            }
+            if self.reduce.is_some() && matches!(op, VecOp::Store { .. }) {
+                errors.push(format!("reduction contains store at op {i}"));
+            }
+        }
+        if let Some(red) = self.reduce {
+            let operands = match red.fma {
+                Some((a, b)) => {
+                    if red.op != VecRedOp::Add {
+                        errors.push("fused reduction must use Add".into());
+                    }
+                    [Some(a), Some(b)]
+                }
+                None => [Some(red.value), None],
+            };
+            for operand in operands.into_iter().flatten() {
+                if !value_exists(operand, self.ops.len()) {
+                    errors.push(format!("reduction operand {operand} is not a value"));
+                }
+            }
+        }
+        errors
+    }
+
     /// Evaluate the body for one lane and write its stores. `load(stream)` yields that stream's
     /// current element, `scalar(k)` the k-th invariant, `store(stream, v)` writes an output. This is
     /// the reference semantics the AVX2 assembler reproduces per lane and the interpreter marshals
@@ -353,6 +418,9 @@ impl VecKernel {
     /// body fits — a mismatch would turn a fallback-eligible body into a hard `assemble_kernel`
     /// error. Pure over the op list.
     pub fn pressure(&self) -> Option<VecPressure> {
+        if !self.validate().is_empty() {
+            return None;
+        }
         if self.streams == 0 || self.streams > VEC_MAX_STREAMS {
             return None;
         }

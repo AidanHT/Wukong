@@ -14,12 +14,13 @@
 //! line up across edges; per-operation operand/result types are consistent; a `veckernel` index is in
 //! range and its result presence matches the recipe's kind; and terminators are type-correct
 //! (including the function return type). Given a whole [`Program`], [`verify_program`] additionally
-//! checks each call against its callee's declared signature — but only [`verify_function`] is wired
-//! into the pipeline, so that call-vs-callee cross-check runs in tests only (see its doc).
+//! checks each call against its callee's declared signature at the driver's verification boundary.
+//! Cast kinds must agree with source/destination categories and widths, and every registered
+//! vector recipe is checked for valid SSA operands, stream/scalar indices and reduction shape.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{BinOp, Function, MirType, Op, Program, Terminator, ValueId};
+use crate::{BinOp, CastKind, Function, MirType, Op, Program, Terminator, ValueId};
 use wukong_span::Symbol;
 
 /// Declared signatures (parameter types, return type) of the functions defined in a program, so a
@@ -32,12 +33,8 @@ type FnSigs = HashMap<Symbol, (Vec<MirType>, MirType)>;
 /// Unlike [`verify_function`] this also cross-checks each call against its callee's signature,
 /// which needs the whole program in hand.
 ///
-/// LANDMINE: no compiler path calls this. `wukong_driver::verify_or_ice` and `wukong_opt`'s
-/// debug-only per-pass check both loop over the functions calling [`verify_function`], so the
-/// call-vs-callee signature cross-check exists only in this crate's `mod tests` and one
-/// `wukong_interp` test. Change a callee's MIR signature and nothing in the pipeline objects — the
-/// symptom is an interp/native divergence with a silent zero on the oracle side, so run the
-/// differential gate by hand.
+/// `wukong_driver::verify_or_ice` uses this whole-program check before backend entry. The
+/// optimizer's debug-only per-pass check uses [`verify_function`] because it holds one function.
 pub fn verify_program(p: &Program) -> Vec<String> {
     let mut sigs: FnSigs = HashMap::new();
     for f in &p.funcs {
@@ -60,8 +57,8 @@ pub fn verify_program(p: &Program) -> Vec<String> {
     errors
 }
 
-/// Verify a single function. This is the entry point the pipeline uses (`wukong_driver::verify_or_ice`
-/// and `wukong_opt`'s debug-only per-pass check both call it per function). Calls are checked for
+/// Verify a single function. `wukong_opt`'s debug-only per-pass check uses this entry point.
+/// Calls are checked for
 /// operand definition only — cross-checking a call against its callee needs [`verify_program`].
 pub fn verify_function(f: &Function) -> Vec<String> {
     verify(f, None)
@@ -107,6 +104,46 @@ fn successors(t: &Terminator) -> [Option<u32>; 2] {
 /// Sentinel for "no immediate dominator yet" in the Cooper–Harvey–Kennedy fixpoint below.
 const NO_IDOM: u32 = u32::MAX;
 
+fn cast_bits(ty: &MirType) -> Option<u64> {
+    Some(match ty {
+        MirType::I1 => 1,
+        MirType::I8 => 8,
+        MirType::I16 | MirType::F16 | MirType::BF16 => 16,
+        MirType::I32 | MirType::F32 => 32,
+        MirType::I64 | MirType::F64 => 64,
+        MirType::Vec(elem, lanes) if *lanes != 0 => {
+            cast_bits(elem)?.checked_mul(u64::from(*lanes))?
+        }
+        _ => return None,
+    })
+}
+
+fn valid_cast(kind: CastKind, from: &MirType, to: &MirType) -> bool {
+    use CastKind::*;
+    if kind == Bitcast {
+        return (from == &MirType::Ptr && to == &MirType::Ptr)
+            || cast_bits(from).is_some_and(|bits| Some(bits) == cast_bits(to));
+    }
+    let (from, to) = match (from, to) {
+        (MirType::Vec(a, n), MirType::Vec(b, m)) if n == m && *n != 0 => (&**a, &**b),
+        (MirType::Vec(..), _) | (_, MirType::Vec(..)) => return false,
+        _ => (from, to),
+    };
+    match kind {
+        SExt | ZExt => from.is_int() && to.is_int() && cast_bits(from) < cast_bits(to),
+        // Lowering also uses equal-width truncation for representation-preserving integer casts.
+        Trunc => from.is_int() && to.is_int() && cast_bits(from) >= cast_bits(to),
+        FpToSi | FpToUi => from.is_float() && to.is_int(),
+        SiToFp | UiToFp => from.is_int() && to.is_float(),
+        // Same-width half casts explicitly round values; AD reverses them into FpExt.
+        FpExt => from.is_float() && to.is_float() && cast_bits(from) <= cast_bits(to),
+        FpTrunc => from.is_float() && to.is_float() && cast_bits(from) >= cast_bits(to),
+        IntToPtr => from.is_int() && to == &MirType::Ptr,
+        PtrToInt => from == &MirType::Ptr && to.is_int(),
+        Bitcast => unreachable!(),
+    }
+}
+
 /// Walk up the partially built dominator tree from two nodes until they meet.
 fn intersect(mut a: u32, mut b: u32, idom: &[u32], rpo_num: &[usize]) -> u32 {
     while a != b {
@@ -128,6 +165,11 @@ impl Verifier<'_> {
     fn run(&mut self) {
         let f = self.f;
         let nblocks = f.blocks.len() as u32;
+        for (index, kernel) in f.vec_kernels.iter().enumerate() {
+            for error in kernel.validate() {
+                self.err(format!("veckernel #{index}: {error}"));
+            }
+        }
 
         // Collect all defined values (block params + instruction results), checking as we go that
         // each is defined exactly once and lies inside the value arena. Both are load-bearing:
@@ -464,8 +506,19 @@ impl Verifier<'_> {
                     }
                 }
             }
-            Op::Cast(_, v, to) => {
-                self.use_val(*v);
+            Op::Cast(kind, v, to) => {
+                if self.use_val(*v) {
+                    if let Some(from) = self.ty(*v) {
+                        if !valid_cast(*kind, from, to) {
+                            self.err(format!(
+                                "invalid {} cast from {} to {}",
+                                kind.name(),
+                                from.display(),
+                                to.display()
+                            ));
+                        }
+                    }
+                }
                 self.check_result_is(result, to);
             }
             Op::Select(c, a, b) => {
@@ -815,6 +868,215 @@ mod tests {
     use super::*;
     use crate::{BinOp, Builder, MirType, Op};
     use wukong_span::Interner;
+
+    fn cast_errors(kind: CastKind, from: MirType, to: MirType) -> Vec<String> {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("cast"), to.clone());
+        let x = b.add_param(from);
+        let result = b.build(to.clone(), Op::Cast(kind, x, to));
+        b.ret(Some(result));
+        verify_function(&b.finish())
+    }
+
+    #[test]
+    fn detects_a_bitcast_between_different_widths() {
+        let errors = cast_errors(CastKind::Bitcast, MirType::I32, MirType::I64);
+        assert!(
+            errors.iter().any(|e| e.contains("invalid bitcast")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_vector_bitcasts_are_reported_without_width_overflow() {
+        let nested = MirType::Vec(
+            Box::new(MirType::Vec(Box::new(MirType::I64), u32::MAX)),
+            u32::MAX,
+        );
+        let errors = cast_errors(CastKind::Bitcast, nested.clone(), nested);
+        assert!(
+            errors.iter().any(|e| e.contains("invalid bitcast")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn cast_kinds_enforce_categories_widths_and_vector_shapes() {
+        use CastKind::*;
+        use MirType::*;
+        let v4i = Vec(Box::new(I32), 4);
+        let v4f = Vec(Box::new(F32), 4);
+        let v8f = Vec(Box::new(F32), 8);
+        for (kind, from, to) in [
+            (Trunc, I32, I64),
+            (SExt, F32, I64),
+            (ZExt, I64, I32),
+            (FpExt, F64, F32),
+            (FpTrunc, F32, F64),
+            (FpToSi, I32, I64),
+            (SiToFp, F32, F64),
+            (IntToPtr, F32, Ptr),
+            (PtrToInt, I64, I64),
+            (Bitcast, Ptr, I64),
+            (Bitcast, Void, Void),
+            (SiToFp, v4i.clone(), v8f),
+            (SiToFp, I32, v4f.clone()),
+        ] {
+            let errors = cast_errors(kind, from.clone(), to.clone());
+            assert!(
+                errors.iter().any(|e| e.contains("invalid ")),
+                "{kind:?} {from:?} -> {to:?}: {errors:?}"
+            );
+        }
+        for (kind, from, to) in [
+            (SExt, I8, I64),
+            (ZExt, I1, I32),
+            (Trunc, I64, I32),
+            (Trunc, I32, I32),
+            (FpToSi, F32, I32),
+            (FpToUi, F64, I64),
+            (SiToFp, I64, F32),
+            (UiToFp, I32, F64),
+            (FpExt, BF16, F64),
+            (FpTrunc, F64, F16),
+            // Half rounding and its AD reverse are deliberately same-width operations.
+            (FpTrunc, BF16, BF16),
+            (FpExt, BF16, BF16),
+            (FpTrunc, F16, BF16),
+            (Bitcast, F32, I32),
+            (Bitcast, Ptr, Ptr),
+            (IntToPtr, I64, Ptr),
+            (PtrToInt, Ptr, I64),
+            (SiToFp, v4i.clone(), v4f.clone()),
+            (Bitcast, v4f, v4i),
+        ] {
+            let errors = cast_errors(kind, from.clone(), to.clone());
+            assert!(errors.is_empty(), "{kind:?} {from:?} -> {to:?}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_veckernel_recipes_are_reported_before_pressure_analysis() {
+        use crate::{VecBin, VecKernel, VecOp, VecRedOp, VecReduce};
+        let mut i = Interner::new();
+        let template = VecKernel {
+            name: i.intern("kernel"),
+            streams: 1,
+            scalars: 1,
+            unroll: 1,
+            ops: vec![
+                VecOp::Load { stream: 0 },
+                VecOp::Splat { scalar: 0 },
+                VecOp::Bin {
+                    op: VecBin::Add,
+                    a: 0,
+                    b: 1,
+                },
+                VecOp::Store { stream: 0, val: 2 },
+            ],
+            reduce: None,
+        };
+        assert!(template.validate().is_empty());
+        assert!(template.pressure().is_some());
+        let mut cases = std::vec::Vec::new();
+        for (index, op, expected) in [
+            (0, VecOp::Load { stream: 1 }, "stream"),
+            (1, VecOp::Splat { scalar: 1 }, "scalar"),
+            (2, VecOp::Neg { a: 99 }, "earlier value"),
+            (2, VecOp::Neg { a: 2 }, "earlier value"),
+            (3, VecOp::Store { stream: 1, val: 2 }, "stream"),
+            (
+                3,
+                VecOp::Select {
+                    mask: 0,
+                    a: 0,
+                    b: 1,
+                },
+                "compare result",
+            ),
+        ] {
+            let mut kernel = template.clone();
+            kernel.ops[index] = op;
+            cases.push((kernel, expected));
+        }
+        let mut store_result = template.clone();
+        store_result.ops.push(VecOp::Neg { a: 3 });
+        cases.push((store_result, "earlier value"));
+        let mut reduction_store = template.clone();
+        reduction_store.reduce = Some(VecReduce {
+            op: VecRedOp::Add,
+            value: 2,
+            fma: None,
+        });
+        cases.push((reduction_store, "reduction contains store"));
+        let mut reduction = template.clone();
+        reduction.ops.pop();
+        reduction.reduce = Some(VecReduce {
+            op: VecRedOp::Add,
+            value: 99,
+            fma: None,
+        });
+        cases.push((reduction, "reduction operand"));
+        let mut fused = template.clone();
+        fused.ops.pop();
+        fused.reduce = Some(VecReduce {
+            op: VecRedOp::Fmax,
+            value: 0,
+            fma: Some((0, 99)),
+        });
+        cases.push((fused, "fused reduction"));
+        let mut zero_unroll = template.clone();
+        zero_unroll.unroll = 0;
+        cases.push((zero_unroll, "unroll"));
+        for (kernel, expected) in cases {
+            let mut b = Builder::new(i.intern("f"), MirType::Void);
+            b.add_vec_kernel(kernel.clone());
+            b.ret(None);
+            // Even an uncalled registered kernel is assembled by some backends.
+            let errors = verify_function(&b.finish());
+            assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
+            assert!(kernel.pressure().is_none(), "malformed recipe was accepted");
+        }
+    }
+
+    #[test]
+    fn valid_veckernel_masks_and_fused_reductions_verify() {
+        use crate::{VecCmp, VecKernel, VecOp, VecRedOp, VecReduce};
+        let mut i = Interner::new();
+        let mut kernel = VecKernel {
+            name: i.intern("k"),
+            streams: 1,
+            scalars: 1,
+            unroll: 2,
+            ops: vec![
+                VecOp::Load { stream: 0 },
+                VecOp::Splat { scalar: 0 },
+                VecOp::Cmp {
+                    pred: VecCmp::Lt,
+                    a: 0,
+                    b: 1,
+                },
+                VecOp::Select {
+                    mask: 2,
+                    a: 0,
+                    b: 1,
+                },
+                VecOp::Store { stream: 0, val: 3 },
+            ],
+            reduce: None,
+        };
+        assert!(kernel.validate().is_empty());
+        assert!(kernel.pressure().is_some());
+        kernel.ops.truncate(2);
+        // The unused value field is not an operand when a fused product feeds the reduction.
+        kernel.reduce = Some(VecReduce {
+            op: VecRedOp::Add,
+            value: u32::MAX,
+            fma: Some((0, 1)),
+        });
+        assert!(kernel.validate().is_empty());
+        assert!(kernel.pressure().is_some());
+    }
 
     #[test]
     fn valid_function_verifies() {
