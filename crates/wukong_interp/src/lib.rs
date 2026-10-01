@@ -27,7 +27,7 @@ pub enum Value {
     /// and `Copy`). Produced by `Splat`, a vector `Load`, and every lane-wise arm of `eval`
     /// (`Bin`/`Cmp`/`Neg`/`Not`/`Cast`/`Select`/`Fma`/`Sqrt`/`Round`); consumed by a vector `Store`
     /// and by `vec_lanes` on the way into those arms.
-    VecRef(u32),
+    VecRef(usize),
     Unit,
 }
 
@@ -52,6 +52,21 @@ impl Value {
     fn truthy(self) -> bool {
         self.as_int() != 0
     }
+}
+
+/// Allocate an exact scalar-lane result without invoking the allocator's abort-on-OOM path.
+fn collect_lanes(values: impl ExactSizeIterator<Item = Value>) -> Result<Vec<Value>, String> {
+    let mut lanes = Vec::new();
+    lanes
+        .try_reserve_exact(values.len())
+        .map_err(|_| "SIMD lane allocation failed")?;
+    for value in values {
+        if matches!(value, Value::VecRef(_)) {
+            return Err("SIMD lanes must be scalar; nested vectors are unsupported".into());
+        }
+        lanes.push(value);
+    }
+    Ok(lanes)
 }
 
 /// Pointers at or above this value encode a function index (`FUNC_TAG + idx`) rather than a memory
@@ -200,6 +215,8 @@ pub fn run_with_output(
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
+            #[cfg(test)]
+            vector_peak: 0,
             data_addrs: HashMap::new(),
             function_indices: None,
             static_indices: None,
@@ -290,6 +307,8 @@ pub fn run_with_output_accel(
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
+            #[cfg(test)]
+            vector_peak: 0,
             data_addrs: HashMap::new(),
             function_indices: None,
             static_indices: None,
@@ -367,6 +386,8 @@ fn run_kernel_f32_inner(
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
+            #[cfg(test)]
+            vector_peak: 0,
             data_addrs: HashMap::new(),
             function_indices: None,
             static_indices: None,
@@ -434,6 +455,8 @@ pub fn run_kernel_f64(
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
+            #[cfg(test)]
+            vector_peak: 0,
             data_addrs: HashMap::new(),
             function_indices: None,
             static_indices: None,
@@ -496,6 +519,8 @@ pub fn run_kernel_i8(
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
             vecs: Vec::new(),
+            #[cfg(test)]
+            vector_peak: 0,
             data_addrs: HashMap::new(),
             function_indices: None,
             static_indices: None,
@@ -542,9 +567,13 @@ struct Interp<'a, 'k> {
     call_args: Vec<Vec<Value>>,
     /// Scratch buffer reused when passing block-parameter arguments across an edge.
     scratch: Vec<Value>,
-    /// Backing store for SIMD vector values; `Value::VecRef(i)` indexes this. Vectors only live in
-    /// registers (never in `memory`, which stays scalar), so this grows but is never aliased.
+    /// Immutable scalar-lane vectors, addressed by handles that may alias across registers.
+    /// Each active call owns a suffix; block boundaries compact that suffix and remap its registers.
+    /// Caller handles stay below the callee watermark. Nested vector lanes are rejected so handles
+    /// cannot escape through scalar memory or through another vector's lanes.
     vecs: Vec<Vec<Value>>,
+    #[cfg(test)]
+    vector_peak: usize,
     /// Optional accelerator the recognized kernel calls offload to (the GPU backend). `None` for the
     /// reference oracle and every plain run, so their numerics are untouched.
     accel: Option<&'k mut (dyn Accelerator + 'k)>,
@@ -657,16 +686,46 @@ impl<'a, 'k> Interp<'a, 'k> {
         for (p, &a) in func.params.iter().zip(args) {
             regs[p.0 as usize] = a;
         }
-        let result = self.exec(func, &mut regs);
+        let base = self.vecs.len();
+        let result = self.exec(func, &mut regs, base);
+        // A callee may return either a borrowed caller handle or one of its own vectors. Move
+        // the latter out before reclaiming the suffix, then promote exactly one owned result.
+        let mut returned_lanes = None;
+        let result = match result {
+            Ok(Value::VecRef(index)) if index >= base => match self.vecs.get_mut(index) {
+                Some(lanes) => {
+                    returned_lanes = Some(std::mem::take(lanes));
+                    Ok(Value::Unit)
+                }
+                None => Err("invalid SIMD vector handle on return".into()),
+            },
+            other => other,
+        };
+        self.vecs.truncate(base);
+        self.scratch.clear();
+        regs.clear();
         self.frames.push(regs);
         self.depth -= 1;
-        result
+        match returned_lanes {
+            Some(lanes) => self.push_vec(lanes),
+            None => result,
+        }
     }
 
-    fn exec(&mut self, func: &Function, regs: &mut [Value]) -> Result<Value, String> {
+    fn exec(
+        &mut self,
+        func: &Function,
+        regs: &mut [Value],
+        vector_base: usize,
+    ) -> Result<Value, String> {
         let mut cur = func.entry;
         let mut steps = 0u64;
+        let mut remap = Vec::new();
         loop {
+            // No eval/call/edge argument snapshot is pending at this safe point. Keeping every
+            // register (including stale SSA slots) is conservative and bounded by function size.
+            self.compact_vectors(vector_base, regs, &mut remap)?;
+            self.scratch.clear();
             steps += 1;
             if steps > 100_000_000 {
                 return Err("interpreter step limit exceeded (likely an infinite loop)".into());
@@ -740,6 +799,24 @@ impl<'a, 'k> Interp<'a, 'k> {
         regs: &[Value],
         rty: Option<&MirType>,
     ) -> Result<Value, String> {
+        if let Some(ty @ MirType::Vec(..)) = rty {
+            if matches!(
+                op,
+                Op::Bin(..)
+                    | Op::Cmp(..)
+                    | Op::Neg(..)
+                    | Op::Not(..)
+                    | Op::Cast(..)
+                    | Op::Select(..)
+                    | Op::Splat(..)
+                    | Op::Iota(..)
+                    | Op::Fma(..)
+                    | Op::Sqrt(..)
+                    | Op::Round(..)
+            ) {
+                return self.eval_vector(op, func, regs, ty);
+            }
+        }
         Ok(match op {
             Op::ConstInt(v, ty) => Value::Int(mask(*v, ty)),
             Op::ConstFloat(v, ty) => Value::Float(match ty {
@@ -752,102 +829,19 @@ impl<'a, 'k> Interp<'a, 'k> {
             }),
             // Vector arithmetic is lane-wise, each lane rounded to the lane type (so `<n x f32>`
             // ops round at f32, matching the native backend). Scalar bins go the fast path.
-            Op::Bin(b, l, r) => {
-                if let Some(MirType::Vec(lane, n)) = rty {
-                    let av = self.vec_lanes(reg(regs, *l), *n as usize)?;
-                    let bv = self.vec_lanes(reg(regs, *r), *n as usize)?;
-                    let lane = (**lane).clone();
-                    let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| mask_lane(apply_bin(*b, av[i], bv[i], Some(&lane)), &lane))
-                        .collect();
-                    self.push_vec(lanes)
-                } else {
-                    apply_bin(*b, reg(regs, *l), reg(regs, *r), rty)
-                }
-            }
-            Op::Cmp(c, l, r) => {
-                if let Some(MirType::Vec(_, n)) = rty {
-                    // Lane-wise compare → a mask vector of 1/0 lanes.
-                    let av = self.vec_lanes(reg(regs, *l), *n as usize)?;
-                    let bv = self.vec_lanes(reg(regs, *r), *n as usize)?;
-                    let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| Value::Int(apply_cmp(*c, av[i], bv[i]) as i128))
-                        .collect();
-                    self.push_vec(lanes)
-                } else {
-                    Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128)
-                }
-            }
-            Op::Neg(v) => {
-                if let Some(MirType::Vec(lane, n)) = rty {
-                    // Lane-wise negate (the autovectorized `-x[k]`). Without this arm a `VecRef`
-                    // operand falls into the scalar path below, where `as_int()` yields 0, so every
-                    // lane is silently zeroed — a miscompile the native backend does not share.
-                    let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
-                    let is_float = lane.is_float();
-                    let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| {
-                            if is_float {
-                                Value::Float(-xs[i].as_float())
-                            } else {
-                                // Wrap at the lane width: negating `i32::MIN` is `i32::MIN`.
-                                mask_lane(Value::Int(-xs[i].as_int()), lane)
-                            }
-                        })
-                        .collect();
-                    self.push_vec(lanes)
-                } else {
-                    match reg(regs, *v) {
-                        Value::Float(f) => Value::Float(-f),
-                        other => Value::Int(-other.as_int()),
-                    }
-                }
-            }
-            Op::Not(v) => {
-                if let Some(MirType::Vec(lane, n)) = rty {
-                    // Lane-wise bitwise complement, truncated to the lane width. Latent today (the
-                    // vectorizer does not yet emit a vector `Not`), but mirror `Neg` so it can
-                    // never silently zero lanes or carry `i128` bits the backend does not have.
-                    let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
-                    let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| mask_lane(Value::Int(!xs[i].as_int()), lane))
-                        .collect();
-                    self.push_vec(lanes)
-                } else {
-                    match reg(regs, *v) {
-                        Value::Int(i) => Value::Int(!i),
-                        other => Value::Int(!other.as_int()),
-                    }
-                }
-            }
-            Op::Cast(kind, v, to) => {
-                if let Some(MirType::Vec(to_lane, n)) = rty {
-                    // Lane-wise cast (e.g. the vectorized exp's f32->i32 and i32->f32 bitcast).
-                    let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
-                    let from_lane = match func.value_type(*v) {
-                        MirType::Vec(l, _) => (**l).clone(),
-                        other => other.clone(),
-                    };
-                    let to_lane = (**to_lane).clone();
-                    let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| apply_cast(*kind, xs[i], &from_lane, &to_lane))
-                        .collect();
-                    self.push_vec(lanes)
-                } else {
-                    apply_cast(*kind, reg(regs, *v), func.value_type(*v), to)
-                }
-            }
+            Op::Bin(b, l, r) => apply_bin(*b, reg(regs, *l), reg(regs, *r), rty),
+            Op::Cmp(c, l, r) => Value::Int(apply_cmp(*c, reg(regs, *l), reg(regs, *r)) as i128),
+            Op::Neg(v) => match reg(regs, *v) {
+                Value::Float(f) => Value::Float(-f),
+                other => Value::Int(-other.as_int()),
+            },
+            Op::Not(v) => match reg(regs, *v) {
+                Value::Int(i) => Value::Int(!i),
+                other => Value::Int(!other.as_int()),
+            },
+            Op::Cast(kind, v, to) => apply_cast(*kind, reg(regs, *v), func.value_type(*v), to),
             Op::Select(c, a, b) => {
-                if let Some(MirType::Vec(_, n)) = rty {
-                    // Lane-wise blend by a mask vector.
-                    let m = self.vec_lanes(reg(regs, *c), *n as usize)?;
-                    let av = self.vec_lanes(reg(regs, *a), *n as usize)?;
-                    let bv = self.vec_lanes(reg(regs, *b), *n as usize)?;
-                    let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| if m[i].truthy() { av[i] } else { bv[i] })
-                        .collect();
-                    self.push_vec(lanes)
-                } else if reg(regs, *c).truthy() {
+                if reg(regs, *c).truthy() {
                     reg(regs, *a)
                 } else {
                     reg(regs, *b)
@@ -866,7 +860,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             Op::Load(p, ty) => {
                 let idx = ptr(reg(regs, *p))?;
                 if let MirType::Vec(lane, n) = ty {
-                    let mut lanes = Vec::with_capacity(*n as usize);
+                    let mut lanes = Vec::new();
+                    lanes
+                        .try_reserve_exact(*n as usize)
+                        .map_err(|_| "SIMD lane allocation failed")?;
                     for i in 0..*n as usize {
                         let value = *self
                             .memory
@@ -880,7 +877,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                             value
                         });
                     }
-                    self.push_vec(lanes)
+                    self.push_vec(lanes)?
                 } else {
                     let v = *self.memory.get(idx).ok_or("load out of bounds")?;
                     // `[bf16; N]`/`[f16; N]` storage holds reduced precision: round on read (the native
@@ -904,7 +901,10 @@ impl<'a, 'k> Interp<'a, 'k> {
                 match reg(regs, *value) {
                     // A vector store scatters its lanes across contiguous scalar slots.
                     Value::VecRef(vi) => {
-                        let lanes = &self.vecs[vi as usize];
+                        let lanes = self
+                            .vecs
+                            .get(vi)
+                            .ok_or("invalid SIMD vector handle in store")?;
                         for (i, lane) in lanes.iter().enumerate() {
                             *self
                                 .memory
@@ -1067,14 +1067,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                 }
             }
             // Broadcast a scalar to every lane.
-            Op::Splat(v) => {
-                let n = match rty {
-                    Some(MirType::Vec(_, n)) => *n as usize,
-                    _ => 1,
-                };
-                let s = reg(regs, *v);
-                self.push_vec(vec![s; n])
-            }
+            Op::Splat(_) => return Err("SIMD operation requires a vector result".into()),
             // One lane out of a vector, by constant index — the inverse of `Splat`, and the only
             // way back to scalar form. The lane count comes from the *operand's* type, not the
             // result's (the result is the lane type). Both the index and the vector-ness of the
@@ -1099,63 +1092,205 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `i128` per lane, exactly as `Op::ConstInt` does) — every consumer of a narrow integer
             // lane masks to its own width, and `n` is at most 16, so no lane can exceed any lane
             // type this op accepts.
-            Op::Iota(ty) => {
-                let n = match ty {
-                    MirType::Vec(_, n) => *n as usize,
-                    other => return Err(format!("iota type is {}, not a vector", other.display())),
-                };
-                self.push_vec((0..n).map(|k| Value::Int(k as i128)).collect())
-            }
+            Op::Iota(_) => return Err("SIMD operation requires a vector result".into()),
             // Fused multiply-add `a*b + c`, single-rounded via `mul_add` so it stays bit-identical
             // to the native `fma`. Lane-wise for vectors, each lane rounded to its lane type.
-            Op::Fma(a, b, c) => {
-                if let Some(MirType::Vec(lane, n)) = rty {
-                    let av = self.vec_lanes(reg(regs, *a), *n as usize)?;
-                    let bv = self.vec_lanes(reg(regs, *b), *n as usize)?;
-                    let cv = self.vec_lanes(reg(regs, *c), *n as usize)?;
-                    let lane = (**lane).clone();
-                    let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| apply_fma(av[i], bv[i], cv[i], Some(&lane)))
-                        .collect();
-                    self.push_vec(lanes)
-                } else {
-                    apply_fma(reg(regs, *a), reg(regs, *b), reg(regs, *c), rty)
-                }
-            }
+            Op::Fma(a, b, c) => apply_fma(reg(regs, *a), reg(regs, *b), reg(regs, *c), rty),
             // Square root, lane-wise for vectors; each lane rounded to its lane type so an `f32`
             // sqrt stays bit-identical to the native `fsqrt`.
+            Op::Sqrt(v) => apply_sqrt(reg(regs, *v), rty),
+            Op::Round(mode, v) => apply_round(*mode, reg(regs, *v), rty),
+        })
+    }
+
+    /// Keep SIMD lane temporaries off scalar call frames: the interpreter's recursion ceiling
+    /// also protects programs that never evaluate a vector operation.
+    fn eval_vector(
+        &mut self,
+        op: &Op,
+        func: &Function,
+        regs: &[Value],
+        ty: &MirType,
+    ) -> Result<Value, String> {
+        let MirType::Vec(lane, n) = ty else {
+            return Err("SIMD operation requires a vector result".into());
+        };
+        Ok(match op {
+            Op::Bin(b, l, r) => {
+                let av = self.vec_lanes(reg(regs, *l), *n as usize)?;
+                let bv = self.vec_lanes(reg(regs, *r), *n as usize)?;
+                let lane = (**lane).clone();
+                let lanes = collect_lanes(
+                    (0..*n as usize)
+                        .map(|i| mask_lane(apply_bin(*b, av[i], bv[i], Some(&lane)), &lane)),
+                )?;
+                self.push_vec(lanes)?
+            }
+            Op::Cmp(c, l, r) => {
+                // Lane-wise compare → a mask vector of 1/0 lanes.
+                let av = self.vec_lanes(reg(regs, *l), *n as usize)?;
+                let bv = self.vec_lanes(reg(regs, *r), *n as usize)?;
+                let lanes = collect_lanes(
+                    (0..*n as usize).map(|i| Value::Int(apply_cmp(*c, av[i], bv[i]) as i128)),
+                )?;
+                self.push_vec(lanes)?
+            }
+            Op::Neg(v) => {
+                // Lane-wise negate (the autovectorized `-x[k]`). Without this arm a `VecRef`
+                // operand falls into the scalar path below, where `as_int()` yields 0, so every
+                // lane is silently zeroed — a miscompile the native backend does not share.
+                let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
+                let is_float = lane.is_float();
+                let lanes = collect_lanes((0..*n as usize).map(|i| {
+                    if is_float {
+                        Value::Float(-xs[i].as_float())
+                    } else {
+                        // Wrap at the lane width: negating `i32::MIN` is `i32::MIN`.
+                        mask_lane(Value::Int(-xs[i].as_int()), lane)
+                    }
+                }))?;
+                self.push_vec(lanes)?
+            }
+            Op::Not(v) => {
+                // Lane-wise bitwise complement, truncated to the lane width. Latent today (the
+                // vectorizer does not yet emit a vector `Not`), but mirror `Neg` so it can
+                // never silently zero lanes or carry `i128` bits the backend does not have.
+                let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
+                let lanes = collect_lanes(
+                    (0..*n as usize).map(|i| mask_lane(Value::Int(!xs[i].as_int()), lane)),
+                )?;
+                self.push_vec(lanes)?
+            }
+            Op::Cast(kind, v, _) => {
+                // Lane-wise cast (e.g. the vectorized exp's f32->i32 and i32->f32 bitcast).
+                let xs = self.vec_lanes(reg(regs, *v), *n as usize)?;
+                let from_lane = match func.value_type(*v) {
+                    MirType::Vec(l, _) => (**l).clone(),
+                    other => other.clone(),
+                };
+                let to_lane = (**lane).clone();
+                let lanes = collect_lanes(
+                    (0..*n as usize).map(|i| apply_cast(*kind, xs[i], &from_lane, &to_lane)),
+                )?;
+                self.push_vec(lanes)?
+            }
+            Op::Select(c, a, b) => {
+                // Lane-wise blend by a mask vector.
+                let m = self.vec_lanes(reg(regs, *c), *n as usize)?;
+                let av = self.vec_lanes(reg(regs, *a), *n as usize)?;
+                let bv = self.vec_lanes(reg(regs, *b), *n as usize)?;
+                let lanes =
+                    collect_lanes((0..*n as usize).map(
+                        |i| {
+                            if m[i].truthy() {
+                                av[i]
+                            } else {
+                                bv[i]
+                            }
+                        },
+                    ))?;
+                self.push_vec(lanes)?
+            }
+            Op::Fma(a, b, c) => {
+                let av = self.vec_lanes(reg(regs, *a), *n as usize)?;
+                let bv = self.vec_lanes(reg(regs, *b), *n as usize)?;
+                let cv = self.vec_lanes(reg(regs, *c), *n as usize)?;
+                let lane = (**lane).clone();
+                let lanes = collect_lanes(
+                    (0..*n as usize).map(|i| apply_fma(av[i], bv[i], cv[i], Some(&lane))),
+                )?;
+                self.push_vec(lanes)?
+            }
             Op::Sqrt(v) => {
-                if let Some(MirType::Vec(lane, n)) = rty {
-                    let xv = self.vec_lanes(reg(regs, *v), *n as usize)?;
-                    let lane = (**lane).clone();
-                    let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| apply_sqrt(xv[i], Some(&lane)))
-                        .collect();
-                    self.push_vec(lanes)
-                } else {
-                    apply_sqrt(reg(regs, *v), rty)
-                }
+                let xv = self.vec_lanes(reg(regs, *v), *n as usize)?;
+                let lane = (**lane).clone();
+                let lanes =
+                    collect_lanes((0..*n as usize).map(|i| apply_sqrt(xv[i], Some(&lane))))?;
+                self.push_vec(lanes)?
             }
             Op::Round(mode, v) => {
-                if let Some(MirType::Vec(lane, n)) = rty {
-                    let xv = self.vec_lanes(reg(regs, *v), *n as usize)?;
-                    let lane = (**lane).clone();
-                    let lanes: Vec<Value> = (0..*n as usize)
-                        .map(|i| apply_round(*mode, xv[i], Some(&lane)))
-                        .collect();
-                    self.push_vec(lanes)
-                } else {
-                    apply_round(*mode, reg(regs, *v), rty)
-                }
+                let xv = self.vec_lanes(reg(regs, *v), *n as usize)?;
+                let lane = (**lane).clone();
+                let lanes = collect_lanes(
+                    (0..*n as usize).map(|i| apply_round(*mode, xv[i], Some(&lane))),
+                )?;
+                self.push_vec(lanes)?
             }
+            Op::Splat(v) => self.push_vec(collect_lanes(std::iter::repeat_n(
+                reg(regs, *v),
+                *n as usize,
+            ))?)?,
+            Op::Iota(_) => self.push_vec(collect_lanes(
+                (0..*n as usize).map(|k| Value::Int(k as i128)),
+            )?)?,
+            _ => return Err("unsupported SIMD operation".into()),
         })
     }
 
     /// Intern a freshly-computed vector value into the side arena, returning its handle.
-    fn push_vec(&mut self, lanes: Vec<Value>) -> Value {
-        let i = self.vecs.len() as u32;
+    fn push_vec(&mut self, lanes: Vec<Value>) -> Result<Value, String> {
+        if lanes.iter().any(|v| matches!(v, Value::VecRef(_))) {
+            return Err("SIMD lanes must be scalar; nested vectors are unsupported".into());
+        }
+        self.vecs
+            .try_reserve(1)
+            .map_err(|_| "SIMD arena allocation failed")?;
+        let index = self.vecs.len();
         self.vecs.push(lanes);
-        Value::VecRef(i)
+        #[cfg(test)]
+        {
+            self.vector_peak = self.vector_peak.max(self.vecs.len());
+        }
+        Ok(Value::VecRef(index))
+    }
+
+    /// Compact only this call's suffix. Aliases share one retained vector and one remapped handle.
+    /// Suspended caller registers and argument buffers only contain handles below `base`.
+    fn compact_vectors(
+        &mut self,
+        base: usize,
+        regs: &mut [Value],
+        remap: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        let count = self
+            .vecs
+            .len()
+            .checked_sub(base)
+            .ok_or("invalid SIMD frame watermark")?;
+        if count == 0 {
+            return Ok(());
+        }
+        remap.clear();
+        remap
+            .try_reserve(count)
+            .map_err(|_| "SIMD compaction allocation failed")?;
+        remap.resize(count, usize::MAX);
+        for value in regs.iter() {
+            if let Value::VecRef(index) = *value {
+                if index >= base {
+                    *remap
+                        .get_mut(index - base)
+                        .ok_or("invalid SIMD vector handle in register")? = 0;
+                }
+            }
+        }
+        let mut retained = 0;
+        for (offset, destination) in remap.iter_mut().enumerate() {
+            if *destination != usize::MAX {
+                *destination = base + retained;
+                self.vecs.swap(base + offset, *destination);
+                retained += 1;
+            }
+        }
+        self.vecs.truncate(base + retained);
+        for value in regs {
+            if let Value::VecRef(index) = value {
+                if *index >= base {
+                    *index = remap[*index - base];
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Borrow the `n` immutable lanes behind a `VecRef`. Callers compute their result before
@@ -1170,7 +1305,9 @@ impl<'a, 'k> Interp<'a, 'k> {
     /// would hide the lowering bug; the durable fix is an operand check in `wukong_mir::verify`.
     fn vec_lanes(&self, v: Value, n: usize) -> Result<&[Value], String> {
         match v {
-            Value::VecRef(i) if self.vecs[i as usize].len() == n => Ok(&self.vecs[i as usize]),
+            Value::VecRef(i) if self.vecs.get(i).is_some_and(|lanes| lanes.len() == n) => {
+                Ok(&self.vecs[i])
+            }
             _ => Err(format!(
                 "vector op operand is not a {n}-lane vector (MIR invariant violation)"
             )),
@@ -4918,6 +5055,8 @@ mod tests {
             call_args: Vec::new(),
             scratch: Vec::new(),
             vecs: Vec::new(),
+            #[cfg(test)]
+            vector_peak: 0,
             data_addrs: HashMap::new(),
             function_indices: None,
             static_indices: None,
@@ -5138,6 +5277,8 @@ mod tests {
                                 call_args: Vec::new(),
                                 scratch: Vec::new(),
                                 vecs: Vec::new(),
+                                #[cfg(test)]
+                                vector_peak: 0,
                                 data_addrs: HashMap::new(),
                                 function_indices: None,
                                 static_indices: None,
@@ -5472,3 +5613,6 @@ mod tests {
         assert!(run(&program, main, &interner).is_err());
     }
 }
+
+#[cfg(test)]
+mod vector_arena_tests;
