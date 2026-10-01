@@ -715,9 +715,10 @@ requires fresh matched-peer measurements. `erf`, `sin` and `cos` are among those
 `sin`/`cos` loop and an exact erf-GELU loop compile to). What does *not* dispatch is a **composed or
 scalar** use — an intrinsic inside a larger expression, or a single call outside an elementwise `for` —
 which instead auto-vectorizes the inlined polynomial at 128-bit; `sqrt`/`rsqrt` also stay inline, being
-hardware instructions. Either way the inlined form is built from the same primitives as the kernel, so
-a dispatched loop and a composed expression agree bit-for-bit, and every form is bit-identical across
-the interpreter and native backends.
+hardware instructions. A recognized standalone `tanh` loop uses the runtime's piecewise approximation.
+Scalar or composed `tanh` uses `1 - 2/(exp(2*x) + 1)`; these paths can differ in finite results and
+the sign of zero. Backend agreement for a fixed lowering path does not imply bitwise equality between
+dispatched and inlined spellings. Composed activations such as GELU retain the exp-based tanh formula.
 
 ## Memory and parallelism
 

@@ -5,6 +5,102 @@
 // EXPECT-OUT: 19000
 // EXPECT-OUT: 0
 // EXPECT-OUT: 1762
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -45
+// EXPECT-OUT: -154
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -45
+// EXPECT-OUT: -154
+// EXPECT-OUT: 841
+// EXPECT-OUT: 2485
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 5500
+// EXPECT-OUT: 0
+// EXPECT-OUT: -1
+// EXPECT-OUT: -45
+// EXPECT-OUT: -154
+// EXPECT-OUT: 841
+// EXPECT-OUT: 2485
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 5500
+// EXPECT-OUT: 7000
+// EXPECT-OUT: 8500
+// EXPECT-OUT: 10000
+// EXPECT-OUT: 11500
+// EXPECT-OUT: 841
+// EXPECT-OUT: 2485
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 5500
+// EXPECT-OUT: 7000
+// EXPECT-OUT: 8500
+// EXPECT-OUT: 10000
+// EXPECT-OUT: 11500
+// EXPECT-OUT: 13000
+// EXPECT-OUT: 14500
+// EXPECT-OUT: 16000
+// EXPECT-OUT: 17500
+// EXPECT-OUT: 7000
+// EXPECT-OUT: 8500
+// EXPECT-OUT: 10000
+// EXPECT-OUT: 11500
+// EXPECT-OUT: 13000
+// EXPECT-OUT: 14500
+// EXPECT-OUT: 16000
+// EXPECT-OUT: 17500
+// EXPECT-OUT: 19000
+// EXPECT-OUT: 20500
+// EXPECT-OUT: 22000
+// EXPECT-OUT: 23500
+// EXPECT-OUT: 13000
+// EXPECT-OUT: 14500
+// EXPECT-OUT: 16000
+// EXPECT-OUT: 17500
+// EXPECT-OUT: 19000
+// EXPECT-OUT: 20500
+// EXPECT-OUT: 22000
+// EXPECT-OUT: 23500
+// EXPECT-OUT: 25000
+// EXPECT-OUT: 26500
+// EXPECT-OUT: 28000
+// EXPECT-OUT: 29500
+// EXPECT-OUT: 19000
+// EXPECT-OUT: 20500
+// EXPECT-OUT: 22000
+// EXPECT-OUT: 23500
+// EXPECT-OUT: 25000
+// EXPECT-OUT: 26500
+// EXPECT-OUT: 28000
+// EXPECT-OUT: 29500
+// EXPECT-OUT: 31000
+// EXPECT-OUT: 32500
+// EXPECT-OUT: 34000
+// EXPECT-OUT: 35500
 module tests.run.bias_bcast
 
 // Broadcast-bias add `out[i*C + j] = act(x[i*C + j] + b[j])` — a `cols`-long bias `b` added across
@@ -79,10 +175,13 @@ fn main() -> i32 {
             outg[i * 12 + j] = gelu(x[i * 12 + j] + b[j]);
         }
     }
-    // silu(2.0) = 2*sigmoid(2) ≈ 1.7616 — a stable anchor for the shared activation family; the GELU
-    // dispatch itself is pinned bit-for-bit by the differential gate (interp == native, -O0 == -O3).
-    let g0: f32 = outg[0]; // keep the GELU dispatch live (used).
-    if g0 > 1.0e30 { print(1); } // never taken — guards against DCE of outg.
+    // Retain the historical SiLU anchor, then inspect every GELU lane and each row tail.
     print(round(silu(2.0) * 1000.0) as i32); // 1762
+    // Expectations independently evaluate 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
+    // in f64, then round to the existing integer output scale. This is not a ULP bound.
+    for g in 0..96 {
+        if outg[g] != outg[g] { return 1; } // NaN must not hide behind float-to-int conversion.
+        print(round(outg[g] * 1000.0) as i32);
+    }
     return 0;
 }
