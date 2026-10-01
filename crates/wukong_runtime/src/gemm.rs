@@ -151,6 +151,8 @@ fn select_kc(k: usize) -> usize {
     round_up(k.div_ceil(nblocks), 4) // multiple of the ×4 K-unroll; ≤ KC since k/nblocks ≤ KC
 }
 
+static GEMM_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+
 /// A private rayon pool for the parallel GEMM, sized to the machine's **physical** core count instead
 /// of rayon's default (one worker per *logical* core). A compute-bound AVX2-FMA GEMM already saturates
 /// a core's two FMA pipes with a single thread, so the HyperThread sibling adds only scheduling
@@ -169,33 +171,32 @@ fn select_kc(k: usize) -> usize {
 /// all chunk independently of worker count (fixed-chunk velem/reductions, per-row norms,
 /// per-index regions), so the striping caveat above is moot for them — bits never change.
 pub(crate) fn gemm_pool() -> Option<&'static rayon::ThreadPool> {
-    use std::sync::OnceLock;
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        // Configure the global pool FIRST: `current_num_threads()` below instantiates the default
-        // registry if none exists, and it must come up with the runtime's required configuration
-        // (16 MiB stacks, RAYON_NUM_THREADS honored) rather than rayon's bare defaults.
-        crate::ensure_global_pool();
-        let physical = num_cpus::get_physical().max(1);
-        if physical >= rayon::current_num_threads() {
-            return None; // no HyperThreads to shed (or single pool already this small)
-        }
-        let mut b = rayon::ThreadPoolBuilder::new()
-            .num_threads(physical)
-            .stack_size(16 * 1024 * 1024)
-            .thread_name(|i| format!("wukong-gemm-{i}"));
-        // A/B probe (`WUKONG_GEMM_AFFINITY=1`): pin worker i to one logical CPU — i<6 to the
-        // P-cores' primary siblings (logical 2i on this 6P+8E+2LPE part), the rest to the E/LP-E
-        // CPUs (6+i). MEASURED 25–35% SLOWER than free migration (ABBA adjacent runs, stable
-        // serial baseline): Windows' scheduler + Thread Director places better than static pins
-        // on this hybrid. Kept, off by default, purely as the recorded instrument so the negative
-        // stays reproducible — do not flip this on expecting an MKL-style KMP_AFFINITY win.
-        if std::env::var("WUKONG_GEMM_AFFINITY").is_ok_and(|v| v == "1") {
-            b = b.start_handler(|i| pin_worker_to_cpu(if i < 6 { 2 * i } else { 6 + i }));
-        }
-        b.build().ok()
-    })
-    .as_ref()
+    GEMM_POOL
+        .get_or_init(|| {
+            // Configure the global pool FIRST: `current_num_threads()` below instantiates the default
+            // registry if none exists, and it must come up with the runtime's required configuration
+            // (16 MiB stacks, RAYON_NUM_THREADS honored) rather than rayon's bare defaults.
+            crate::ensure_global_pool();
+            let physical = num_cpus::get_physical().max(1);
+            if physical >= rayon::current_num_threads() {
+                return None; // no HyperThreads to shed (or single pool already this small)
+            }
+            let mut b = rayon::ThreadPoolBuilder::new()
+                .num_threads(physical)
+                .stack_size(16 * 1024 * 1024)
+                .thread_name(|i| format!("wukong-gemm-{i}"));
+            // A/B probe (`WUKONG_GEMM_AFFINITY=1`): pin worker i to one logical CPU — i<6 to the
+            // P-cores' primary siblings (logical 2i on this 6P+8E+2LPE part), the rest to the E/LP-E
+            // CPUs (6+i). MEASURED 25–35% SLOWER than free migration (ABBA adjacent runs, stable
+            // serial baseline): Windows' scheduler + Thread Director places better than static pins
+            // on this hybrid. Kept, off by default, purely as the recorded instrument so the negative
+            // stays reproducible — do not flip this on expecting an MKL-style KMP_AFFINITY win.
+            if std::env::var("WUKONG_GEMM_AFFINITY").is_ok_and(|v| v == "1") {
+                b = b.start_handler(|i| pin_worker_to_cpu(if i < 6 { 2 * i } else { 6 + i }));
+            }
+            b.build().ok()
+        })
+        .as_ref()
 }
 
 /// Pin the calling worker thread to one logical CPU (Windows; no-op elsewhere). Scheduling-only:
@@ -691,7 +692,10 @@ unsafe fn gemm_dispatch(
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: features just checked; dims validated by the caller contract.
             unsafe {
-                match (par, gemm_pool()) {
+                // Serial calls, including parallel entries below the work threshold, must not
+                // initialize either worker pool merely to select the serial kernel.
+                let pool = if par { gemm_pool() } else { None };
+                match (par, pool) {
                     // Parallel: the DEFAULT is the BLIS-style 2D block-parallel path with
                     // PER-BLOCK packing at every size — see `gemm_2d_shared` for the measured
                     // basis (the 2026-07-09 shared-pack small band did not survive pool
@@ -3303,6 +3307,90 @@ unsafe fn micro_6x16_avx512(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_gemm_does_not_initialize_pool() {
+        const CHILD: &str = "WUKONG_TEST_SERIAL_GEMM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Other runtime tests deliberately initialize pools. A fresh process makes the
+            // absence of initialization observable regardless of test order or thread count.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gemm::tests::serial_gemm_does_not_initialize_pool",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("WUKONG_GEMM_PAR_MIN_MACS", PAR_MIN_MACS.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cold serial GEMM failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        assert!(GEMM_POOL.get().is_none());
+        let a = [1.0, 2.0, 3.0, 4.0];
+        let b = [5.0, 6.0, 7.0, 8.0];
+        for parallel in [false, true] {
+            for transposed in [false, true] {
+                for beta in [0, 1] {
+                    let mut c = [1.0; 4];
+                    // SAFETY: all buffers contain the four elements required by 2x2 matrices.
+                    unsafe {
+                        match (parallel, transposed) {
+                            (false, false) => {
+                                wukong_sgemm(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), 2, 2, 2, beta)
+                            }
+                            (false, true) => wukong_sgemm_nt(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                c.as_mut_ptr(),
+                                2,
+                                2,
+                                2,
+                                beta,
+                            ),
+                            (true, false) => wukong_sgemm_parallel(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                c.as_mut_ptr(),
+                                2,
+                                2,
+                                2,
+                                beta,
+                            ),
+                            (true, true) => wukong_sgemm_nt_parallel(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                c.as_mut_ptr(),
+                                2,
+                                2,
+                                2,
+                                beta,
+                            ),
+                        }
+                    }
+                    let product = if transposed {
+                        [17.0, 23.0, 39.0, 53.0]
+                    } else {
+                        [19.0, 22.0, 43.0, 50.0]
+                    };
+                    assert_eq!(c, product.map(|x| x + beta as f32));
+                    assert!(
+                        GEMM_POOL.get().is_none(),
+                        "serial work initialized pools (parallel={parallel}, transposed={transposed}, beta={beta})"
+                    );
+                }
+            }
+        }
+    }
 
     /// The two GEMM env knobs whose raw value reaches arithmetic that can trap. Both crashed a
     /// compiled program before this gate, from inside an `extern "C"` runtime kernel:
