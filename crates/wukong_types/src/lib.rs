@@ -224,7 +224,7 @@ impl Ty {
         }
     }
 
-    /// Size in bytes for sized types; `None` for slices/tensors/unsized or unknown types.
+    /// Size in bytes; `None` for an overflowing layout or an unsized/unknown type.
     pub fn size_of(&self) -> Option<u64> {
         match self {
             Ty::Scalar(s) => Some(s.size()),
@@ -235,25 +235,24 @@ impl Ty {
             // aggregate (8-byte pointer + 8-byte length), even though the *pointee* is unsized. This
             // is what lets a slice be a struct/tuple field and be passed/returned by value.
             Ty::Slice(_) => Some(16),
-            Ty::Array { elem, len, .. } => Some(elem.size_of()? * len),
+            Ty::Array { elem, len, .. } => elem.size_of()?.checked_mul(*len),
             Ty::Tuple(fields) => {
                 let mut size = 0u64;
                 let mut align = 1u64;
                 for f in fields {
                     let fa = f.align_of()?;
                     let fs = f.size_of()?;
-                    size = round_up(size, fa) + fs;
+                    size = round_up(size, fa)?.checked_add(fs)?;
                     align = align.max(fa);
                 }
-                Some(round_up(size, align))
+                round_up(size, align)
             }
             _ => None,
         }
     }
 
-    /// Alignment in bytes for sized types; `None` for the same cases as [`size_of`](Ty::size_of).
-    /// Every value returned is a power of two — `wukong_mir_build`'s mirrored `round_up` is the
-    /// bitmask form and is only correct under that precondition.
+    /// Alignment in bytes for sized types; `None` for unsized or unknown types.
+    /// Size overflow does not affect alignment. Every returned alignment is a power of two.
     pub fn align_of(&self) -> Option<u64> {
         match self {
             Ty::Scalar(s) => Some(s.align()),
@@ -275,7 +274,8 @@ impl Ty {
 
     /// The padded byte offset and type of each field of a `Tuple`, in declaration order — the
     /// reference definition of aggregate layout (the same `round_up` accumulation as
-    /// [`size_of`](Ty::size_of)). `None` for a non-tuple or a tuple with an unsized field.
+    /// [`size_of`](Ty::size_of)). `None` for a non-tuple, an unsized field, or an overflowing
+    /// complete layout.
     ///
     /// It has **no caller in the workspace**: `wukong_mir_build`'s `FnLowerer::aggregate_layout`
     /// repeats this accumulation because it must resolve `Ty::Named` struct/enum fields through the
@@ -288,10 +288,12 @@ impl Ty {
         let mut out = Vec::with_capacity(fields.len());
         let mut off = 0u64;
         for f in fields {
-            off = round_up(off, f.align_of()?);
+            off = round_up(off, f.align_of()?)?;
             out.push((off, f.clone()));
-            off += f.size_of()?;
+            off = off.checked_add(f.size_of()?)?;
         }
+        // Tail padding is part of the layout even when every field offset fits.
+        round_up(off, self.align_of()?)?;
         Some(out)
     }
 
@@ -354,17 +356,63 @@ fn dim_str(d: Dim, interner: &Interner) -> String {
     }
 }
 
-fn round_up(x: u64, align: u64) -> u64 {
-    if align == 0 {
-        x
+fn round_up(x: u64, align: u64) -> Option<u64> {
+    if align <= 1 {
+        Some(x)
     } else {
-        x.div_ceil(align) * align
+        x.div_ceil(align).checked_mul(align)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_layout_overflow_declines() {
+        fn array(elem: Ty, len: u64) -> Ty {
+            Ty::Array {
+                elem: Box::new(elem),
+                len,
+                shared: false,
+            }
+        }
+        let nested = array(array(Ty::Scalar(Scalar::I64), 4_000_000_000), 4_000_000_000);
+        assert_eq!(nested.size_of(), None);
+        assert_eq!(
+            Ty::Tuple(vec![nested, Ty::Scalar(Scalar::I32)]).tuple_offsets(),
+            None
+        );
+        let full = array(Ty::Scalar(Scalar::U8), u64::MAX);
+        // Addition, field padding, and tail padding each overflow independently.
+        for fields in [
+            vec![full.clone(), Ty::Scalar(Scalar::U8)],
+            vec![full.clone(), Ty::Scalar(Scalar::I64)],
+            vec![
+                array(Ty::Scalar(Scalar::I64), u64::MAX / 8),
+                array(Ty::Scalar(Scalar::U8), 7),
+            ],
+        ] {
+            let tuple = Ty::Tuple(fields);
+            assert_eq!(tuple.size_of(), None);
+            assert_eq!(tuple.tuple_offsets(), None);
+        }
+        assert_eq!(full.size_of(), Some(u64::MAX));
+        assert_eq!(array(Ty::Unit, u64::MAX).size_of(), Some(0));
+        assert_eq!(
+            array(array(Ty::Scalar(Scalar::I64), 0), u64::MAX).size_of(),
+            Some(0)
+        );
+        assert_eq!(
+            Ty::Tuple(vec![Ty::Scalar(Scalar::U8), Ty::Scalar(Scalar::I64)]).size_of(),
+            Some(16)
+        );
+        assert_eq!(Ty::Unknown.size_of(), None);
+        assert_eq!(
+            Ty::Slice(Box::new(Ty::Scalar(Scalar::I32))).size_of(),
+            Some(16)
+        );
+    }
 
     #[test]
     fn scalar_sizes() {
@@ -451,7 +499,11 @@ mod tests {
         for t in &tys {
             let a = t.align_of().unwrap();
             for x in 0u64..64 {
-                assert_eq!(round_up(x, a), bitmask_round_up(x, a), "round_up({x}, {a})");
+                assert_eq!(
+                    round_up(x, a),
+                    Some(bitmask_round_up(x, a)),
+                    "round_up({x}, {a})"
+                );
             }
         }
     }
