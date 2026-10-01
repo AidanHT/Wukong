@@ -102,14 +102,10 @@ pub unsafe extern "C" fn wukong_attention_f32(
 /// `exp` through the crate's own kernel — the same one `norm.rs`'s fused softmax and a dispatched
 /// `exp` loop use — but **NaN-transparent**.
 ///
-/// [`crate::vmath::exp1`] opens with `x.min(EXP_HI).max(EXP_LO)`, and IEEE `minNum`/`maxNum` return
-/// *the other operand* for a NaN, so a NaN is silently replaced by the clamp bound and `exp(NaN)`
-/// comes back as roughly 2.4e38 (the crate-wide behaviour recorded as W16, unfixed, and
-/// deliberately not touched from inside this file). Attention has always propagated NaN — the old
-/// kernel called the platform `expf`, which does — and a diverged attention head that quietly
-/// returns confident finite numbers is exactly the failure this crate's NaN discipline exists to
-/// prevent. So the NaN is restored here, at the one call site, rather than by changing the shared
-/// transcendental. [`exp_row`] does the same thing with a `vcmpps`/`vblendvps` pair, lane-for-lane.
+/// This local guard predates the shared exp NaN repair. The shared kernel now quiets and
+/// propagates NaNs itself; this wrapper retains the attention path's original input-NaN behavior.
+/// [`exp_row`] retains the corresponding lane-wise guard. Neither wrapper establishes an
+/// independent accuracy bound for the complete attention recurrence.
 #[inline]
 fn exp_keep_nan(x: f32) -> f32 {
     if x.is_nan() {
@@ -1647,8 +1643,9 @@ mod tests {
     /// * `mat-exp8` — the same two GEMMs with the crate's *vectorized* row softmax, and, under a
     ///   causal mask, a triangular panel loop that shrinks the NT GEMM's `N` and the second GEMM's
     ///   `K` to `i0 + panel` so it never computes the half it would throw away. **This is the
-    ///   strong control**: same exp, same GEMM microkernels, same triangular saving, so the delta
-    ///   against it is purely the materialization.
+    ///   strong control**: it shares the exp approximation and avoids upper-triangular work.
+    ///   Its packed GEMM microkernels differ from the fused path's `qk_tile`/`pv8`, so the timing
+    ///   delta also includes arithmetic scheduling and packing; it does not isolate materialization.
     /// * `legacy` — the pre-P5 fused kernel, for a same-process A/B of the rewrite itself.
     /// * `fused` — the kernel in this file.
     ///

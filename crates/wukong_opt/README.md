@@ -50,7 +50,8 @@ load-bearing.
 - **cse** — dominator-tree value numbering plus load forwarding within blocks and across
   single-predecessor edges; joins and loop headers discard incoming memory facts. Keys recognize
   commuted integer arithmetic and distinguish vector splat widths; float operand order is retained.
-- **dse** — intra-block dead-store elimination.
+- **dse** — eliminate overwritten stores within a block and in-bounds stores to unread,
+  unescaped private stack slots across the function. Empty initialization loops are not deleted.
 - **loop-canon** — one shape per loop: preheader, single latch, one exit-test polarity. LICM hoists
   only into an existing preheader.
 - **licm** — hoist loop-invariant non-trapping ops into that preheader.

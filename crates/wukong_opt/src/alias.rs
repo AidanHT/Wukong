@@ -36,10 +36,9 @@
 //!
 //! **Two distinct pointer/slice/tensor parameters MAY alias.** Wukong does not promise otherwise:
 //! nothing rejects `f(a, a)`, and there is no `restrict`/`&mut` annotation to carry the promise. So
-//! [`AliasInfo::may_alias`] answers `true` for `Param(i)` vs `Param(j)`. (`docs/roadmap.md` notes
-//! that the AST loop vectorizer *assumes* distinct array parameters do not alias — that assumption
-//! is informal and unchecked, and this module deliberately does not adopt it. Making it real needs a
-//! language-level promise, not an analysis.)
+//! [`AliasInfo::may_alias`] answers `true` for `Param(i)` vs `Param(j)`. The AST vectorizer separately
+//! requires disjointness and recurrence checks before widening source loops; it does not grant a
+//! language-wide no-alias promise. Introducing such a promise would require a language contract.
 //!
 //! # Deliberate conservatism
 //!

@@ -2727,8 +2727,8 @@ mod tests {
 
     use super::*;
 
-    /// The dispatched kernel is ≈1 ULP of `libm` for exp/log/tanh/sigmoid over a representative
-    /// range — the accuracy the cross-language checksum and the activation tests rely on.
+    /// Sampled agreement with `libm` under each operation's explicit mixed error tolerance.
+    /// This test is not a uniform one-ULP bound or an exhaustive domain sweep.
     // (op code, libm reference, tolerance) — a small table, so allow the tuple type.
     #[test]
     #[allow(clippy::type_complexity)]
@@ -4033,8 +4033,8 @@ mod tests {
     ///    included. This is what makes "monomorphizing the dispatch is bits-invisible" a proof.
     /// 2. **exp worst-case error**: every f32 in [−87, EXP_HI] — the whole clamp range above the
     ///    denormal-output band — against f64 `exp`, reported as max relative error *and* max ULP.
-    /// 3. **log worst-case error**: every positive *normal* f32 (2.13e9 values, the entire domain of
-    ///    the contract) against f64 `ln`, same two statistics. The historical bar was quoted over
+    /// 3. **log worst-case error**: every positive *normal* f32 (2.13e9 values) against f64 `ln`.
+    ///    This pass excludes subnormals; their separate sampled test is not exhaustive. The historical bar was quoted over
     ///    [0.25, 4) only; this widens it and reports [0.25, 4) separately so the two are comparable.
     ///
     /// Measured 2026-08-06 (this machine, `--release`, stride 1):
