@@ -32,6 +32,10 @@
 //!  * a callee that **contains a loop** earns a bonus: inlining it hands a whole loop nest to the
 //!    caller's LICM/CSE/unroller, which is worth far more than the call overhead alone;
 //!  * a call whose **arguments are all constants** earns a bonus, since the body will likely fold.
+//! An otherwise rejected small callee can also be reconsidered after integer arguments fold a
+//! conditional branch. Only that call's clone is specialized; its reduced body must fit the same
+//! budgets. This keeps constant-shape kernel wrappers inlineable when they gain an empty-shape
+//! fallback, without duplicating that fallback into positive-shape callers.
 //!
 //! Growth is bounded three ways so compile time — one of this compiler's few genuine strengths —
 //! cannot regress: no caller may exceed [`GROWTH_LIMIT`] instructions, no caller may more than
@@ -50,7 +54,9 @@ use crate::fxhash::{FxHashMap, FxHashSet};
 use wukong_mir::{BasicBlock, BlockId, Function, Inst, Op, Program, Terminator, ValueId};
 use wukong_span::Symbol;
 
-use crate::{cfg, map_op_uses};
+use crate::{
+    cfg, map_op_uses, map_term_uses, CfgAnalyses, Dce, Mem2Reg, Pass, Simplify, SimplifyCfg,
+};
 
 /// Baseline budget (in callee instructions) for a call site with nothing else going for it. This is
 /// the old unconditional `SIZE_LIMIT`, kept as the floor so no site that used to be inlined stops
@@ -155,6 +161,7 @@ pub(crate) fn inline_program_preserving(program: &mut Program, roots: &[Symbol])
     let mut bodies: FxHashMap<Symbol, Function> = FxHashMap::default();
     // Whether each callee's own body contains a loop — a cost-model input, computed once.
     let mut has_loop: FxHashMap<Symbol, bool> = FxHashMap::default();
+    let mut specializations = FxHashMap::default();
 
     let mut changed = false;
     let mut inlined: FxHashSet<Symbol> = FxHashSet::default();
@@ -181,6 +188,7 @@ pub(crate) fn inline_program_preserving(program: &mut Program, roots: &[Symbol])
                     &site_count,
                     &mut bodies,
                     &mut has_loop,
+                    &mut specializations,
                     program_ref(program),
                     size_cap,
                 ) else {
@@ -190,10 +198,12 @@ pub(crate) fn inline_program_preserving(program: &mut Program, roots: &[Symbol])
                 if site.callee == program.funcs[ci].name {
                     break;
                 }
-                let callee = bodies
-                    .get(&site.callee)
-                    .expect("pick_site caches the callee body")
-                    .clone();
+                let callee = site.specialized.unwrap_or_else(|| {
+                    bodies
+                        .get(&site.callee)
+                        .expect("pick_site caches the callee body")
+                        .clone()
+                });
                 let site_in_loop = in_loop[site.block];
                 let added = callee.blocks.len() + 1; // callee blocks plus the continuation
                 inline_call_site(&mut program.funcs[ci], &callee, site.block, site.inst);
@@ -248,7 +258,10 @@ struct Site {
     block: usize,
     inst: usize,
     callee: Symbol,
+    specialized: Option<Function>,
 }
+
+type Specializations = FxHashMap<(Symbol, Vec<Option<i128>>), Option<Function>>;
 
 /// The first call site in `f` that the cost model approves, caching the callee's body and
 /// loop-shape as it goes.
@@ -261,16 +274,21 @@ fn pick_site(
     site_count: &FxHashMap<Symbol, u32>,
     bodies: &mut FxHashMap<Symbol, Function>,
     has_loop: &mut FxHashMap<Symbol, bool>,
+    specializations: &mut Specializations,
     funcs: &[Function],
     size_cap: usize,
 ) -> Option<Site> {
     // Values the caller defines as compile-time constants, for the all-constant-args bonus. Built
     // once per scan, which costs the same asymptotically as the scan itself.
     let mut consts: FxHashSet<u32> = FxHashSet::default();
+    let mut ints = FxHashMap::default();
     for b in &f.blocks {
         for inst in &b.insts {
             if let (Some(r), Op::ConstInt(..) | Op::ConstFloat(..)) = (inst.result, &inst.op) {
                 consts.insert(r.0);
+                if let Op::ConstInt(n, _) = &inst.op {
+                    ints.insert(r.0, *n);
+                }
             }
         }
     }
@@ -294,26 +312,112 @@ fn pick_site(
             let callee_loops = *has_loop
                 .entry(*func)
                 .or_insert_with(|| !loop_blocks(&funcs[idx as usize]).iter().all(|x| !x));
-            if caller_size + callee_size > size_cap {
-                continue;
-            }
-            let approved = should_inline(
-                callee_size,
-                site_count.get(func).copied().unwrap_or(1),
-                in_loop.get(bi).copied().unwrap_or(false),
-                callee_loops,
-                !args.is_empty() && args.iter().all(|a| consts.contains(&a.0)),
-            );
-            if approved {
+            let approved = |size, loops| {
+                caller_size + size <= size_cap
+                    && should_inline(
+                        size,
+                        site_count.get(func).copied().unwrap_or(1),
+                        in_loop.get(bi).copied().unwrap_or(false),
+                        loops,
+                        !args.is_empty() && args.iter().all(|a| consts.contains(&a.0)),
+                    )
+            };
+            if approved(callee_size, callee_loops) {
                 return Some(Site {
                     block: bi,
                     inst: ii,
                     callee: *func,
+                    specialized: None,
                 });
+            }
+            // A constant dimension can make a large fallback unreachable. Score that
+            // smaller body without raising any budget or changing already-approved sites.
+            // Trial bodies and cleanup rounds are bounded; cache failures as well as wins.
+            if callee_size > SOLE_SITE_LIMIT || args.len() != body.params.len() {
+                continue;
+            }
+            let constants: Vec<_> = args.iter().map(|v| ints.get(&v.0).copied()).collect();
+            if constants.iter().all(Option::is_none) {
+                continue;
+            }
+            let specialized = specializations
+                .entry((*func, constants.clone()))
+                .or_insert_with(|| specialize_integer_guard(body, &constants));
+            if let Some(specialized) = specialized {
+                let loops = loop_blocks(specialized).iter().any(|x| *x);
+                if approved(func_insts(specialized), loops) {
+                    return Some(Site {
+                        block: bi,
+                        inst: ii,
+                        callee: *func,
+                        specialized: Some(specialized.clone()),
+                    });
+                }
             }
         }
     }
     None
+}
+
+/// Keep the original ABI and parameter definitions; only uses in this call's clone
+/// become constants. Entry has no predecessors in valid MIR, so these definitions
+/// dominate every substituted use. Dynamic calls keep the original function.
+fn specialize_integer_guard(body: &Function, constants: &[Option<i128>]) -> Option<Function> {
+    let mut specialized = body.clone();
+    let mut substitutions = FxHashMap::default();
+    let mut definitions = Vec::new();
+    for (&param, constant) in body.params.iter().zip(constants) {
+        let Some(n) = constant else { continue };
+        let ty = body.value_type(param).clone();
+        if !ty.is_int() {
+            continue;
+        }
+        let value = ValueId(specialized.value_types.len() as u32);
+        specialized.value_types.push(ty.clone());
+        definitions.push(Inst {
+            result: Some(value),
+            op: Op::ConstInt(*n, ty),
+        });
+        substitutions.insert(param, value);
+    }
+    if substitutions.is_empty() {
+        return None;
+    }
+    for block in &mut specialized.blocks {
+        let replace = |v| substitutions.get(&v).copied().unwrap_or(v);
+        for inst in &mut block.insts {
+            map_op_uses(&mut inst.op, replace);
+        }
+        map_term_uses(&mut block.term, replace);
+    }
+    specialized.blocks[specialized.entry.0 as usize]
+        .insts
+        .splice(0..0, definitions);
+    let mut cache = CfgAnalyses::default();
+    Mem2Reg.run_function(&mut specialized, &mut cache);
+    let mut folded_branch = false;
+    for _ in 0..4 {
+        let mut changed = Simplify.run_function(&mut specialized, &mut cache);
+        let conditions: FxHashSet<_> = specialized
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|inst| match (&inst.op, inst.result) {
+                (Op::ConstInt(0 | 1, wukong_mir::MirType::I1), Some(v)) => Some(v),
+                _ => None,
+            })
+            .collect();
+        folded_branch |= specialized.blocks.iter().any(
+            |b| matches!(&b.term, Terminator::CondBr { cond, .. } if conditions.contains(cond)),
+        );
+        changed |= SimplifyCfg.run_function(&mut specialized, &mut cache);
+        changed |= Dce.run_function(&mut specialized, &mut cache);
+        if !changed {
+            break;
+        }
+    }
+    // Straight-line merging and dead arithmetic alone do not authorize a retry.
+    folded_branch.then_some(specialized)
 }
 
 /// The cost model: is a callee of `callee_size` instructions worth splicing at this site?
@@ -563,6 +667,129 @@ fn remap_term(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wukong_mir::{BinOp, Builder, CmpOp, MirType};
+    use wukong_span::Interner;
+
+    fn guarded_body(name: Symbol, guarded: bool) -> Function {
+        let mut b = Builder::new(name, MirType::I64);
+        let n = b.add_param(MirType::I64);
+        let out = b.add_param(MirType::Ptr);
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let arms = if guarded {
+            let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+            let cond = b.build(MirType::I1, Op::Cmp(CmpOp::Sgt, n, zero));
+            let yes = b.new_block();
+            let no = b.new_block();
+            b.cond_br(cond, yes, vec![], no, vec![]);
+            vec![(yes, BinOp::Add), (no, BinOp::Sub)]
+        } else {
+            vec![(b.entry(), BinOp::Add)]
+        };
+        for (block, op) in arms {
+            b.switch_to(block);
+            let mut value = n;
+            for _ in 0..80 {
+                value = b.build(MirType::I64, Op::Bin(op, value, one));
+            }
+            b.build_void(Op::Store { ptr: out, value });
+            b.ret(Some(n)); // Parameter use in a terminator must also be rewritten.
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn integer_guard_specialization_preserves_both_sides_effects_and_dynamic_calls() {
+        let mut names = Interner::new();
+        let guarded = names.intern("guarded");
+        let main = names.intern("main");
+        let print = names.intern("print");
+        let body = guarded_body(guarded, true);
+        assert!(func_insts(&body) > BASE_LIMIT);
+        assert!(func_insts(&body) <= SOLE_SITE_LIMIT);
+        let original = format!("{body:?}");
+        for n in [2, -2] {
+            let specialized = specialize_integer_guard(&body, &[Some(n), None]).unwrap();
+            assert_eq!(specialized.params, body.params);
+            assert_eq!(specialized.block(specialized.entry).params, body.params);
+            assert!(specialized
+                .blocks
+                .iter()
+                .all(|b| !matches!(b.term, Terminator::CondBr { .. })));
+            let mut p = Program::new();
+            p.funcs.push(specialized);
+            assert!(wukong_mir::verify::verify_program(&p).is_empty());
+        }
+        let mut b = Builder::new(main, MirType::I64);
+        let output = b.alloca(MirType::I64);
+        let input = b.alloca(MirType::I64);
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        b.build_void(Op::Store {
+            ptr: input,
+            value: zero,
+        });
+        let dynamic = b.build(MirType::I64, Op::Load(input, MirType::I64));
+        let yes = b.build(MirType::I64, Op::ConstInt(2, MirType::I64));
+        let no = b.build(MirType::I64, Op::ConstInt(-2, MirType::I64));
+        let mut sum = zero;
+        for arg in [yes, no, dynamic] {
+            let result = b.build(
+                MirType::I64,
+                Op::Call {
+                    func: guarded,
+                    args: vec![arg, output],
+                },
+            );
+            let stored = b.build(MirType::I64, Op::Load(output, MirType::I64));
+            for value in [result, stored] {
+                b.build_void(Op::Call {
+                    func: print,
+                    args: vec![value],
+                });
+            }
+            sum = b.build(MirType::I64, Op::Bin(BinOp::Add, sum, result));
+            sum = b.build(MirType::I64, Op::Bin(BinOp::Add, sum, stored));
+        }
+        b.ret(Some(sum));
+        let mut p = Program::new();
+        p.funcs = vec![body, b.finish()];
+        assert!(wukong_mir::verify::verify_program(&p).is_empty());
+        let expected = (-80, b"2\n82\n-2\n-82\n0\n-80\n".to_vec());
+        assert_eq!(
+            wukong_interp::run_with_output(&p, main, &names).unwrap(),
+            expected
+        );
+        assert!(inline_program(&mut p));
+        assert!(wukong_mir::verify::verify_program(&p).is_empty());
+        assert_eq!(
+            wukong_interp::run_with_output(&p, main, &names).unwrap(),
+            expected
+        );
+        assert_eq!(format!("{:?}", p.function(guarded).unwrap()), original);
+        assert_eq!(
+            p.function(main)
+                .unwrap()
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| matches!(i.op, Op::Call { func, .. } if func == guarded))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn integer_guard_specialization_rejects_straight_line_and_unknown_guards() {
+        let mut names = Interner::new();
+        let name = names.intern("guarded");
+        assert!(specialize_integer_guard(&guarded_body(name, false), &[Some(2), None]).is_none());
+        assert!(specialize_integer_guard(&guarded_body(name, true), &[None, None]).is_none());
+        let mut body = guarded_body(name, true);
+        let unused = ValueId(body.value_types.len() as u32);
+        body.value_types.push(MirType::I64);
+        body.params.push(unused);
+        body.blocks[body.entry.0 as usize].params.push(unused);
+        assert!(specialize_integer_guard(&body, &[None, None, Some(1)]).is_none());
+    }
 
     #[test]
     fn scc_emits_callees_before_callers() {
