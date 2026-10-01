@@ -23,6 +23,7 @@ wukong_codegen_cranelift = { workspace = true }
 # bit-exact agreement with the Cranelift JIT (the differential gate, in-benchmark).
 wukong_interp = { workspace = true }
 libloading = "0.8"
-# A pure-Rust, cache-tiled, SIMD sgemm (the engine behind ndarray) — the tuned-library baseline that
-# proves Wukong's GEMM is SOTA-parity, not merely beating naive C/Rust nests. No external toolchain.
+# A pure-Rust, cache-tiled, SIMD sgemm (the engine behind ndarray), providing a tuned-library
+# comparison beyond naive C/Rust nests. Including this peer does not establish current parity
+# or general SOTA superiority; those claims require matched-peer measurements. No external toolchain.
 matrixmultiply = "0.3"
