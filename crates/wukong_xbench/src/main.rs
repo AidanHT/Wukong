@@ -327,28 +327,6 @@ fn build_c_cpp(
     (cl, pl)
 }
 
-/// [`bench_c_cpp`] for the 4-pointer ABI ([`bench_external4`]).
-#[allow(clippy::too_many_arguments)]
-fn bench_c_cpp4(
-    label: &str,
-    c_src: &str,
-    dir: &Path,
-    cc: &str,
-    args: &[&str],
-    out: &mut [f32],
-    p0: *const f32,
-    p1: *const f32,
-    p2: *const f32,
-) -> (Option<Measure>, Option<Measure>) {
-    let cl = build_peer("c", c_src, dir, label, cc, args);
-    let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
-    let (c, cpp) = abba_min(&cl, &pl, |lib, compile| {
-        time_peer4(lib, compile, &mut *out, p0, p1, p2)
-    });
-    let cpp = cpp_checked(label, &c, cpp);
-    (c, cpp)
-}
-
 /// [`bench_c_cpp`] for the int8 ABI ([`bench_external_i8`]). Integer arithmetic, so the C++ column is
 /// held to EXACT equality with C — a tolerance would be meaningless over an `i32` accumulator.
 #[allow(clippy::too_many_arguments)]
@@ -5032,20 +5010,17 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
                 .unwrap_or_else(|| "n/a".into())
         };
         println!("=== rmsnorm_bwd (dx = r·(g − x·r²·Σg·x/C)) {r}x{c} (GB/s, higher is better) ===");
-        let wuk = bench_wukong4(&wk_rmsnorm_bwd(r, c, false), &mut dx, xp, dyp, gp);
-        let wk_par = bench_wukong4(&wk_rmsnorm_bwd(r, c, true), &mut dx, xp, dyp, gp);
-        let (cm, cm_cpp) = bench_c_cpp4(
+        // Prepare every four-pointer column before entering the shared schedule.
+        let wk = build_wukong(&wk_rmsnorm_bwd(r, c, false), 4);
+        let wkp = build_wukong(&wk_rmsnorm_bwd(r, c, true), 4);
+        let (cl, pl) = build_c_cpp(
             "rmsnorm_bwd",
             &c_rmsnorm_bwd(r, c),
             dir,
             cc,
             &["-O3", "-march=native", "-shared"],
-            &mut dx,
-            xp,
-            dyp,
-            gp,
         );
-        let rm = bench_external4(
+        let rl = build_peer(
             "rs",
             &rust_rmsnorm_bwd(r, c),
             dir,
@@ -5056,28 +5031,35 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut dx,
-            xp,
-            dyp,
-            gp,
         );
-        // Reassociation-normalized peer: -ffast-math lets gcc reassociate the two per-row reductions.
-        let cfast = bench_external4(
+        let fl = build_peer(
             "c",
             &c_rmsnorm_bwd(r, c),
             dir,
             "rmsnorm_bwd_fast",
             cc,
             C_FAST_FLAGS,
-            &mut dx,
-            xp,
-            dyp,
-            gp,
-        )
-        .filter(|cf| {
+        );
+        let columns = [
+            built_wukong4(wk, xp, dyp, gp),
+            built_wukong4(wkp, xp, dyp, gp),
+            built_peer4(cl, xp, dyp, gp),
+            built_peer4(pl, xp, dyp, gp),
+            built_peer4(fl, xp, dyp, gp),
+            built_peer4(rl, xp, dyp, gp),
+        ];
+        let mut timed =
+            abba_min_columns(columns.len(), |i| time_built(&columns[i], &mut dx, xp, dyp))
+                .into_iter();
+        let wuk = timed.next().flatten();
+        let wk_par = timed.next().flatten();
+        let cm = timed.next().flatten();
+        let cm_cpp = cpp_checked("rmsnorm_bwd", &cm, timed.next().flatten());
+        let cfast = timed.next().flatten().filter(|cf| {
             wuk.as_ref()
                 .is_some_and(|m| relaxed_peer_ok("rmsnorm_bwd", "C(fast)", m, cf))
         });
+        let rm = timed.next().flatten();
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -5189,20 +5171,17 @@ fn bench_layernorm_bwd(cc: &str, dir: &Path) {
                 .unwrap_or_else(|| "n/a".into())
         };
         println!("=== layernorm_bwd (dx = rstd·(g − mean(g) − xhat·mean(g·xhat))) {r}x{c} ===");
-        let wuk = bench_wukong4(&wk_layernorm_bwd(r, c, false), &mut dx, xp, dyp, gp);
-        let wk_par = bench_wukong4(&wk_layernorm_bwd(r, c, true), &mut dx, xp, dyp, gp);
-        let (cm, cm_cpp) = bench_c_cpp4(
+        // Prepare every four-pointer column before entering the shared schedule.
+        let wk = build_wukong(&wk_layernorm_bwd(r, c, false), 4);
+        let wkp = build_wukong(&wk_layernorm_bwd(r, c, true), 4);
+        let (cl, pl) = build_c_cpp(
             "layernorm_bwd",
             &c_layernorm_bwd(r, c),
             dir,
             cc,
             &["-O3", "-march=native", "-shared"],
-            &mut dx,
-            xp,
-            dyp,
-            gp,
         );
-        let rm = bench_external4(
+        let rl = build_peer(
             "rs",
             &rust_layernorm_bwd(r, c),
             dir,
@@ -5213,28 +5192,35 @@ fn bench_layernorm_bwd(cc: &str, dir: &Path) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut dx,
-            xp,
-            dyp,
-            gp,
         );
-        // Reassociation-normalized peer: -ffast-math lets gcc reassociate the four per-row reductions.
-        let cfast = bench_external4(
+        let fl = build_peer(
             "c",
             &c_layernorm_bwd(r, c),
             dir,
             "layernorm_bwd_fast",
             cc,
             C_FAST_FLAGS,
-            &mut dx,
-            xp,
-            dyp,
-            gp,
-        )
-        .filter(|cf| {
+        );
+        let columns = [
+            built_wukong4(wk, xp, dyp, gp),
+            built_wukong4(wkp, xp, dyp, gp),
+            built_peer4(cl, xp, dyp, gp),
+            built_peer4(pl, xp, dyp, gp),
+            built_peer4(fl, xp, dyp, gp),
+            built_peer4(rl, xp, dyp, gp),
+        ];
+        let mut timed =
+            abba_min_columns(columns.len(), |i| time_built(&columns[i], &mut dx, xp, dyp))
+                .into_iter();
+        let wuk = timed.next().flatten();
+        let wk_par = timed.next().flatten();
+        let cm = timed.next().flatten();
+        let cm_cpp = cpp_checked("layernorm_bwd", &cm, timed.next().flatten());
+        let cfast = timed.next().flatten().filter(|cf| {
             wuk.as_ref()
                 .is_some_and(|m| relaxed_peer_ok("layernorm_bwd", "C(fast)", m, cf))
         });
+        let rm = timed.next().flatten();
         report_ratio(
             "layernorm_bwd",
             &wuk,
@@ -7003,18 +6989,17 @@ fn bench_norm(cc: &str, dir: &Path) {
             "layernorm_affine",
             "rmsnorm_affine",
         ] {
-            let wuk = bench_wukong(&wk_norm(cols, op), &mut out, xp, yp);
-            let (c, c_cpp) = bench_c_cpp(
+            // Build all columns first, then time a shared forward/reverse schedule.
+            // Missing peers retain fixed slots through Built::Missing.
+            let wk = build_wukong(&wk_norm(cols, op), 3);
+            let (cl, pl) = build_c_cpp(
                 &format!("norm_{op}"),
                 &c_norm(cols, op),
                 dir,
                 cc,
                 &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
-                &mut out,
-                xp,
-                yp,
             );
-            let rust = bench_external(
+            let rl = build_peer(
                 "rs",
                 &rust_norm(cols, op),
                 dir,
@@ -7025,22 +7010,34 @@ fn bench_norm(cc: &str, dir: &Path) {
                     "-Ctarget-cpu=native",
                     "--crate-type=cdylib",
                 ],
-                &mut out,
-                xp,
-                yp,
             );
-            // Reassociation-normalized peer: with -ffast-math gcc may reassociate the norm's
-            // reductions (and vectorize expf via its own fast paths). Loose-checked inside.
-            let cfast = bench_c_fast(
-                &format!("norm_{op}"),
+            let fl = build_peer(
+                "c",
                 &c_norm(cols, op),
                 dir,
+                &format!("norm_{op}_fast"),
                 cc,
-                &wuk,
-                &mut out,
-                xp,
-                yp,
+                C_FAST_FLAGS,
             );
+            let columns = [
+                Built::wk(wk),
+                Built::peer(cl),
+                Built::peer(pl),
+                Built::peer(fl),
+                Built::peer(rl),
+            ];
+            let mut timed =
+                abba_min_columns(columns.len(), |i| time_built(&columns[i], &mut out, xp, yp))
+                    .into_iter();
+            let wuk = timed.next().flatten();
+            let c = timed.next().flatten();
+            let c_cpp = cpp_checked(&format!("norm_{op}"), &c, timed.next().flatten());
+            // Preserve the fast peer's numerical gate against the serial Wukong row.
+            let cfast = timed.next().flatten().filter(|cf| {
+                wuk.as_ref()
+                    .is_some_and(|m| relaxed_peer_ok(&format!("norm_{op}"), "C(fast)", m, cf))
+            });
+            let rust = timed.next().flatten();
             let ns = |m: &Option<Measure>| {
                 m.as_ref()
                     .map(|x| format!("{:.0}", x.ns_per_call))
@@ -7078,6 +7075,15 @@ fn bench_norm(cc: &str, dir: &Path) {
                     println!(
                         "  ! {op} full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
                         m.out[at], c.out[at], rel
+                    );
+                }
+            }
+            if let (Some(m), Some(rust)) = (&wuk, &rust) {
+                let (rel, at) = max_rel_err(&m.out, &rust.out);
+                if rel > 1e-3 {
+                    println!(
+                        "  ! {op} full-buffer mismatch vs Rust at [{at}]: Wukong={} Rust={} (rel {:.2e})",
+                        m.out[at], rust.out[at], rel
                     );
                 }
             }
@@ -7287,19 +7293,18 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
             "vs C(fast)"
         );
         for op in ["rmsnorm", "layernorm", "softmax"] {
-            // C/Rust baselines are single-threaded per-row norms — the same for both Wukong rows
-            // (serial + @parallel), so time once per op.
-            let (c, c_cpp) = bench_c_cpp(
+            // Build all columns first, then time a shared forward/reverse schedule.
+            // Missing peers retain fixed slots through Built::Missing.
+            let wk = build_wukong(&wk_norm_batched(rows, cols, op, false), 3);
+            let wkp = build_wukong(&wk_norm_batched(rows, cols, op, true), 3);
+            let (cl, pl) = build_c_cpp(
                 "bnorm",
                 &c_norm_batched(rows, cols, op),
                 dir,
                 cc,
                 &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
-                &mut out,
-                xp,
-                yp,
             );
-            let rust = bench_external(
+            let rl = build_peer(
                 "rs",
                 &rust_norm_batched(rows, cols, op),
                 dir,
@@ -7310,33 +7315,38 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                     "-Ctarget-cpu=native",
                     "--crate-type=cdylib",
                 ],
-                &mut out,
-                xp,
-                yp,
             );
-            // Reassociation-normalized peer, also once per op (single-threaded like the C column);
-            // loose-checked against the serial Wukong row below before the column is shown.
-            let mut cfast_raw = bench_external(
+            let fl = build_peer(
                 "c",
                 &c_norm_batched(rows, cols, op),
                 dir,
                 "bnorm_fast",
                 cc,
                 C_FAST_FLAGS,
-                &mut out,
-                xp,
-                yp,
             );
-            let mut cfast: Option<Measure> = None;
-            for (suffix, par) in [("", false), ("@parallel", true)] {
+            let columns = [
+                Built::wk(wk),
+                Built::wk(wkp),
+                Built::peer(cl),
+                Built::peer(pl),
+                Built::peer(fl),
+                Built::peer(rl),
+            ];
+            let mut timed =
+                abba_min_columns(columns.len(), |i| time_built(&columns[i], &mut out, xp, yp))
+                    .into_iter();
+            let wuk = timed.next().flatten();
+            let wuk_par = timed.next().flatten();
+            let c = timed.next().flatten();
+            let c_cpp = cpp_checked("bnorm", &c, timed.next().flatten());
+            // Preserve the fast peer's numerical gate against the serial Wukong row.
+            let cfast = timed.next().flatten().filter(|cf| {
+                wuk.as_ref()
+                    .is_some_and(|m| relaxed_peer_ok(op, "C(fast)", m, cf))
+            });
+            let rust = timed.next().flatten();
+            for (suffix, wuk) in [("", wuk), ("@parallel", wuk_par)] {
                 let label = format!("{op}{suffix}");
-                let wuk = bench_wukong(&wk_norm_batched(rows, cols, op, par), &mut out, xp, yp);
-                if !par {
-                    cfast = cfast_raw.take().filter(|cf| {
-                        wuk.as_ref()
-                            .is_some_and(|m| relaxed_peer_ok(&label, "C(fast)", m, cf))
-                    });
-                }
                 let ns = |m: &Option<Measure>| {
                     m.as_ref()
                         .map(|x| format!("{:.0}", x.ns_per_call))
@@ -7373,6 +7383,15 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                         println!(
                             "  ! {label} full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
                             m.out[at], c.out[at], rel
+                        );
+                    }
+                }
+                if let (Some(m), Some(rust)) = (&wuk, &rust) {
+                    let (rel, at) = max_rel_err(&m.out, &rust.out);
+                    if rel > 1e-3 {
+                        println!(
+                            "  ! {label} full-buffer mismatch vs Rust at [{at}]: Wukong={} Rust={} (rel {:.2e})",
+                            m.out[at], rust.out[at], rel
                         );
                     }
                 }
@@ -8098,83 +8117,54 @@ fn bench_external(
 /// `KernelFn`. Same timing/snapshot protocol as [`bench_wukong`]/[`bench_external`].
 type KernelFn4 = unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32);
 
-/// 4-pointer twin of [`bench_wukong`] (same one-live-pointer law).
-fn bench_wukong4(
-    src: &str,
+/// Time an already-built four-pointer JIT; its owning handle stays alive throughout.
+fn time_wukong4(
+    jit: &WukongJit,
     out: &mut [f32],
     p0: *const f32,
     p1: *const f32,
     p2: *const f32,
 ) -> Option<Measure> {
-    let t = Instant::now();
-    let mut interner = Interner::new();
-    let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
-    if pd.iter().any(|d| d.is_error()) {
-        eprintln!("wukong parse error");
-        return None;
-    }
-    let (sema, sd) = wukong_sema::check(&module, &interner);
-    if sd.iter().any(|d| d.is_error()) {
-        eprintln!("wukong sema error: {sd:?}");
-        return None;
-    }
-    let (mut program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
-    if ld.iter().any(|d| d.is_error()) {
-        eprintln!("wukong lower error: {ld:?}");
-        return None;
-    }
-    wukong_opt::optimize(&mut program, 3);
-    // Dispatch census + persisted source for the non-3-pointer ABIs too - see
-    // `announce_dispatch`. Recognized kernels are gate-blind, and int8 GEMM, bf16
-    // reductions and the half-output streaming rows are all recognizer-dependent.
-    let _ = announce_dispatch(src, &program, &interner);
-    let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("wukong codegen error: {e}");
-            return None;
-        }
-    };
-    let sym = interner.intern("kbench");
-    if !kbench_abi_ok(&program, sym, 4) {
-        return None;
-    }
-    let ptr = handle.func_ptr(sym)?;
-    let compile = t.elapsed();
-    // SAFETY: `kbench_abi_ok` just checked the lowered `kbench` is (ptr, ptr, ptr, ptr) -> void,
-    // which is exactly `KernelFn4`; `handle` is kept alive across the call below.
-    let f: KernelFn4 = unsafe { std::mem::transmute(ptr) };
+    // SAFETY: callers build this JIT with ptr_params=4, matching KernelFn4.
+    let f: KernelFn4 = unsafe { std::mem::transmute(jit.ptr) };
     out.iter_mut().for_each(|v| *v = 0.0);
     let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
     let ns = time_ns(|| unsafe { f(p0, p1, p2, op) });
-    let snapshot = out.to_vec();
-    drop(handle);
     Some(Measure {
-        compile,
+        compile: jit.compile,
         ns_per_call: ns,
-        out: snapshot,
+        out: out.to_vec(),
     })
 }
 
-/// 4-pointer twin of [`bench_external`].
-#[allow(clippy::too_many_arguments)]
-fn bench_external4(
-    ext: &str,
-    src: &str,
-    dir: &Path,
-    name: &str,
-    compiler: &str,
-    args: &[&str],
-    out: &mut [f32],
+/// Own a four-pointer norm JIT and its input pointers until the schedule finishes.
+/// The caller must have used build_wukong(src, 4) and keep all inputs alive.
+fn built_wukong4(
+    jit: Option<WukongJit>,
     p0: *const f32,
     p1: *const f32,
     p2: *const f32,
-) -> Option<Measure> {
-    let (compile, lib) = build_peer(ext, src, dir, name, compiler, args)?;
-    time_peer4(&lib, compile, out, p0, p1, p2)
+) -> Built<'static> {
+    jit.map_or(Built::Missing, |jit| {
+        Built::Direct(Box::new(move |out| time_wukong4(&jit, out, p0, p1, p2)))
+    })
 }
 
-/// Time an already-loaded 4-pointer peer (the [`abba_min`] half of [`bench_external4`]).
+/// Own a four-pointer norm peer library; absent peers retain their schedule slot.
+fn built_peer4(
+    peer: Option<PeerLib>,
+    p0: *const f32,
+    p1: *const f32,
+    p2: *const f32,
+) -> Built<'static> {
+    peer.map_or(Built::Missing, |(compile, lib)| {
+        Built::Direct(Box::new(move |out| {
+            time_peer4(&lib, compile, out, p0, p1, p2)
+        }))
+    })
+}
+
+/// Time an already-loaded four-pointer peer using the existing timing/snapshot protocol.
 fn time_peer4(
     lib: &libloading::Library,
     compile: Duration,
@@ -11563,7 +11553,64 @@ mod tests {
         assert!(out.iter().all(|m| m.is_none()));
     }
 
-    /// The six position-balanced families must not contain a compile-and-time call any more, and
+    #[test]
+    fn norm_four_pointer_missing_columns_do_not_touch_buffers() {
+        let null = std::ptr::null();
+        let columns = [
+            built_wukong4(None, null, null, null),
+            built_peer4(None, null, null, null),
+        ];
+        let mut output = [17.0];
+        let measured = abba_min_columns(columns.len(), |i| {
+            time_built(&columns[i], &mut output, null, null)
+        });
+        assert!(measured.iter().all(Option::is_none));
+        assert_eq!(output, [17.0]);
+    }
+
+    /// Norm rows have five columns, or six with both batched Wukong variants.
+    /// Exercise every absent-peer combination without a compiler, clock, or kernel.
+    #[test]
+    fn norm_column_slots_preserve_results_with_missing_peers() {
+        for n in [5usize, 6] {
+            for missing in 0..(1usize << n) {
+                let columns: Vec<Built> = (0..n)
+                    .map(|i| {
+                        if missing & (1 << i) != 0 {
+                            Built::Missing
+                        } else {
+                            Built::Direct(Box::new(move |out| {
+                                out[0] = i as f32;
+                                Some(Measure {
+                                    compile: Duration::ZERO,
+                                    ns_per_call: (i + 1) as f64,
+                                    out: out.to_vec(),
+                                })
+                            }))
+                        }
+                    })
+                    .collect();
+                let mut visits = Vec::new();
+                let mut output = [0.0];
+                let measured = abba_min_columns(n, |i| {
+                    visits.push(i);
+                    time_built(&columns[i], &mut output, std::ptr::null(), std::ptr::null())
+                });
+                assert_eq!(visits, (0..n).chain((0..n).rev()).collect::<Vec<_>>());
+                for (i, value) in measured.iter().enumerate() {
+                    if missing & (1 << i) != 0 {
+                        assert!(value.is_none());
+                    } else {
+                        let value = value.as_ref().unwrap();
+                        assert_eq!(value.out, [i as f32]);
+                        assert_eq!(value.ns_per_call, (i + 1) as f64);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The position-balanced families must not contain a compile-and-time call any more, and
     /// EVERY timed region in them must be inside a rotation.
     ///
     /// SOURCE-TEXT SCAN, in the style of `every_generated_c_kernel_declares_restrict`, because this
@@ -11588,10 +11635,13 @@ mod tests {
             concat!("bench_", "c_cpp("),
             concat!("bench_", "external("),
             concat!("bench_", "c_fast("),
+            concat!("bench_", "wukong4("),
+            concat!("bench_", "c_cpp4("),
+            concat!("bench_", "external4("),
         ];
         // Ways to reach the clock that are NOT a rotation. `abba_min(` is the old two-column
         // A-B-B-A helper: it balances C against C++ and leaves every other column in a fixed slot,
-        // which is precisely the protocol these six families were converted out of.
+        // which is precisely the protocol these families were converted out of.
         let bypasses_the_rotation = [
             concat!("time_", "wukong("),
             concat!("time_", "peer("),
@@ -11606,6 +11656,10 @@ mod tests {
             "fn bench_colsum(",
             "fn bench_biasadd(",
             "fn bench_colstat(",
+            "fn bench_norm(",
+            "fn bench_norm_batched(",
+            "fn bench_rmsnorm_bwd(",
+            "fn bench_layernorm_bwd(",
         ] {
             let start = src
                 .find(family)
@@ -11637,6 +11691,18 @@ mod tests {
                      slot is fixed. Put the column in the `Built` array and time it through \
                      abba_min_columns."
                 );
+            }
+            let timing_start = body.find("abba_min_columns(").unwrap();
+            // Each shape loop must finish preparation before its timing statement.
+            // Other converted families may have multiple shape loops, so enforce this
+            // stronger single-schedule rule on the four norm bodies.
+            if family.contains("norm") {
+                for build in ["build_wukong(", "build_c_cpp(", "build_peer("] {
+                    assert!(
+                        !body[timing_start..].contains(build),
+                        "{family}: build after timing began"
+                    );
+                }
             }
             let timed = body.matches("time_built(").count();
             assert_eq!(
