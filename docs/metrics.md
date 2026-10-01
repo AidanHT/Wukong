@@ -314,7 +314,9 @@ bit/tolerance-exact.
 
 Stable diagnostic codes with `--explain`; single-binary toolchain (no LLVM needed to build,
 test, or run natively); reproducible benches (`wukong_xbench`, `wukong_bench`) with
-in-harness cross-checks that can only *fail* Wukong, never inflate it.
+in-harness numerical cross-checks. Some xbench mismatches remain warnings and do not suppress
+timing ratios. A printed ratio therefore requires review of its numerical checks and the
+campaign's comparison rules before it can support a performance claim.
 
 ## Current top improvement targets (ranked by user impact × measured gap)
 
