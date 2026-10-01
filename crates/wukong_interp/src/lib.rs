@@ -4,7 +4,9 @@
 //! the oracle differential tests compare the **native** (Cranelift) backend against — the textual
 //! LLVM emitter is never assembled or run, so it is not what the gate judges. It walks the CFG block
 //! by block, keeping a per-call register file and a shared flat memory for
-//! `alloca`/`load`/`store`/`gep` — **one slot per scalar leaf, not bytes** (see `slot_count`). It
+//! `alloca`/`load`/`store`/`gep`. Scalar MIR arrays use one `Value` slot per element. Source
+//! aggregates lowered to byte buffers use one slot per layout byte, including padding; fields
+//! occupy their starting byte's slot, not packed host bytes (see `slot_count`). It
 //! does depend on the workspace's `wukong_runtime`, so a recognized kernel call runs the *identical*
 //! microkernel the native backend links.
 
@@ -16,8 +18,8 @@ use wukong_mir::{
 use wukong_span::{Interner, Symbol};
 
 /// A runtime value. Integers are stored width-agnostically in an `i128` and masked per result
-/// type; pointers are **slot** indices into the interpreter's flat memory (one slot per scalar
-/// leaf, not a byte address).
+/// type; pointers are **slot** indices into flat memory, not host byte addresses. Scalar arrays
+/// use one slot per element; lowered aggregate byte buffers use one slot per layout byte.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Value {
     Int(i128),

@@ -32,6 +32,7 @@
 //!  * a callee that **contains a loop** earns a bonus: inlining it hands a whole loop nest to the
 //!    caller's LICM/CSE/unroller, which is worth far more than the call overhead alone;
 //!  * a call whose **arguments are all constants** earns a bonus, since the body will likely fold.
+//!
 //! An otherwise rejected small callee can also be reconsidered after integer arguments fold a
 //! conditional branch. Only that call's clone is specialized; its reduced body must fit the same
 //! budgets. This keeps constant-shape kernel wrappers inlineable when they gain an empty-shape

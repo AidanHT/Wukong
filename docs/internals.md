@@ -432,25 +432,31 @@ heavy transformer/GEMM kernels)** and runs ~1.5–2.5x faster than -O0 under the
 `wukong_interp` is a from-scratch CFG walker over MIR that adds no external crate of its own — it
 depends only on `wukong_span`, `wukong_mir`, `wukong_backend` and `wukong_runtime`, the last so a
 recognized-kernel call executes the *identical* microkernel the native backend links. `Value` is
-`Int(i128) | Float(f64) | Ptr(usize) | VecRef(u32) | Unit`.
+`Int(i128) | Float(f64) | Ptr(usize) | VecRef(usize) | Unit`.
 
-Memory is a single flat `Vec<Value>` with **one typed slot per scalar leaf** (not bytes): an `alloca`
-— or a heap `alloc_<T>(n)` — pushes a typed zero per leaf slot and yields the first slot's index as its
-`Ptr`, so a read before any write observes exactly the zero native's zeroed bytes decode to. `Gep`
-strides by `slot_count(elem)`, which recurses through arrays of aggregates so element `i` lands where
-native's `size_of(elem)` scaling puts it. The arena is run-scoped and never reclaimed, so a `.rodata`
-address or a heap pointer stays valid after its defining frame is gone and `free` is a no-op. Vectors
-never enter memory: they live in the `vecs` side arena (`VecRef` indexes it, keeping `Value` `Copy`),
-and SIMD is executed lane-wise there.
+Memory is a single flat `Vec<Value>`. Scalar MIR arrays use one typed slot per element. Source
+structs and tuples lower to byte buffers, which use **one slot per layout byte**, including padding;
+a field value occupies the slot at its starting byte offset. For example, an eight-byte aggregate
+buffer consumes eight `Value` slots, while `[i64; 1]` consumes one. These slots are not packed host
+bytes. `alloca` initializes the MIR storage with typed zeros and returns its first slot index.
+`Gep` strides by `slot_count(elem)`, recursively counting array elements, including aggregate byte
+buffers. The scalar memory arena is run-scoped and never reclaimed; `free` is a no-op.
+
+SIMD vectors live in the `vecs` side arena, and vector stores scatter scalar lanes into memory.
+Each call owns a suffix of that arena. Block boundaries retain register-referenced vectors and
+remap their handles; returns preserve caller-owned handles or promote a newly created vector.
+Errors reclaim the frame's vectors. Nested vector handles are rejected at runtime, preventing
+their escape through scalar storage. This bounds SIMD retention by active frames and MIR size;
+it does not reclaim the separate scalar memory arena or establish SIMD throughput.
 
 A 100M-step guard bounds runaway loops *within one frame*, and because that counter is local to a
 single `exec` invocation, a separate call-depth counter bounds recursion: `MAX_CALL_DEPTH` is 300_000
 in release (the measured ceiling) and 40_000 in debug, and exceeding it returns the diagnostic
 "interpreter call-depth limit exceeded (likely unbounded recursion)". Every public entry point runs the
 walk on a scoped 512 MiB-stack worker thread, since a host stack overflow is uncatchable and would
-abort the oracle; heap exhaustion likewise goes through `try_reserve` and returns an error instead of
-reaching Rust's abort-on-allocation-failure handler. The rule is that the interpreter reports resource
-exhaustion as a diagnostic (stderr, exit 1), never as a process abort.
+abort the oracle. SIMD lane/arena allocation and several other growth paths use `try_reserve` to
+report allocation errors. Some remaining paths still allocate infallibly; a diagnostic for every
+possible resource-exhaustion case is not established.
 
 `run_with_output` returns `(exit_code, stdout)`; intrinsics like `print` format into the captured
 stdout buffer. `f32` ops are computed in `f32` (single rounding), and an `int → f32` cast rounds
