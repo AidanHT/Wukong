@@ -8178,6 +8178,12 @@ impl FnLowerer<'_> {
         if src == dst {
             return None;
         }
+        if self.expr_ty(value) == Ty::Scalar(wukong_types::Scalar::F32)
+            && self.expr_ty(target) == Ty::Scalar(wukong_types::Scalar::F32)
+            && self.try_fuse_copy_batched_norm(b, at + 1, src, dst, n_copy)
+        {
+            return Some(2);
+        }
         let (n, op, n_expr, eps, gamma, beta) = self.match_inplace_norm_window(b, at + 1, dst)?;
         if !exprs_struct_eq(&n_expr, n_copy) {
             return None;
@@ -8197,6 +8203,147 @@ impl FnLowerer<'_> {
             return None;
         }
         Some(1 + n)
+    }
+
+    /// Remove a whole-buffer copy immediately before a complete in-place batched norm.
+    /// Unlike a per-row copy, this pass traverses the entire matrix before normalization,
+    /// writing and rereading `4 * rows * cols` bytes that the out-of-place kernel need not copy.
+    /// Keep the original loops unless positive numeric extents prove identical coverage and
+    /// the alias analysis proves all captured buffers disjoint. Distinct names alone are not
+    /// that proof. Requiring even read-only affine operands to differ is conservative.
+    fn try_fuse_copy_batched_norm(
+        &mut self,
+        b: &Block,
+        at: usize,
+        src: Symbol,
+        dst: Symbol,
+        n_copy: &Expr,
+    ) -> bool {
+        let Some(stmt) = b.stmts.get(at) else {
+            return false;
+        };
+        let StmtKind::For {
+            pat, iter, body, ..
+        } = &stmt.kind
+        else {
+            return false;
+        };
+        let Some((_, rows, _)) = self.as_range0_for(stmt) else {
+            return false;
+        };
+        let Some((x, out, cols, eps, op, gamma, beta)) = self.match_batched_norm(pat, iter, body)
+        else {
+            return false;
+        };
+        if x != dst || out != dst {
+            return false;
+        }
+        // These probes deliberately reject named paths: the row body has not installed
+        // its bindings, so a named constant could be shadowed there. They also reject
+        // negative values, overflow in the source integer type, and narrowing casts.
+        let (Some(r), Some(c), Some(n)) = (
+            self.const_usize_expr(rows),
+            self.const_usize_expr(&cols),
+            self.const_usize_expr(n_copy),
+        ) else {
+            return false;
+        };
+        let Some(total) = u64::from(r).checked_mul(u64::from(c)) else {
+            return false;
+        };
+        if r == 0
+            || c == 0
+            || total != u64::from(n)
+            || i64::try_from(total).is_err()
+            || usize::try_from(total).is_err()
+        {
+            return false;
+        }
+        let mut buffers = vec![src, dst];
+        buffers.extend(gamma);
+        buffers.extend(beta);
+        if !self.all_provably_disjoint(&buffers) {
+            return false;
+        }
+        if buffers
+            .iter()
+            .any(|&sym| pat_binds(pat, sym) || norm_window_rebinds(&body.stmts, sym))
+            || !self.norm_integer_domain_fits(&b.stmts[at - 1..=at], total)
+        {
+            return false;
+        }
+        self.emit_norm(src, dst, Some(rows), &cols, eps, op, gamma, beta)
+    }
+
+    /// Conservative width proof for a structurally matched norm window. Its indices are
+    /// `row * cols + column`, so its variable terms fit the positive full extent. Numeric
+    /// subexpressions must independently evaluate without overflow in their actual types.
+    /// Check before and after casts, and include loop endpoints rather than only the last
+    /// index. A narrow counter or intermediate must not wrap into a different row. This
+    /// intentionally also declines harmless narrow integer literals elsewhere in the window.
+    fn norm_integer_domain_fits(&self, stmts: &[Stmt], extent: u64) -> bool {
+        fn numeric(expr: &Expr) -> bool {
+            match &expr.kind {
+                ExprKind::Int(_) => true,
+                ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => numeric(expr),
+                ExprKind::Binary { lhs, rhs, .. } => numeric(lhs) && numeric(rhs),
+                _ => false,
+            }
+        }
+        fn expr_fits(me: &FnLowerer<'_>, expr: &Expr, extent: u64) -> bool {
+            match me.expr_ty(expr) {
+                Ty::Scalar(scalar) if scalar.is_int() => {
+                    let bits = scalar.size() * 8;
+                    let max = if scalar.is_signed() {
+                        (1u64 << (bits - 1)) - 1
+                    } else {
+                        u64::MAX >> (64 - bits)
+                    };
+                    if extent > max || (numeric(expr) && me.const_usize_expr(expr).is_none()) {
+                        return false;
+                    }
+                }
+                Ty::Unknown => return false,
+                _ => {}
+            }
+            match &expr.kind {
+                ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Path(_) => true,
+                ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
+                    expr_fits(me, expr, extent)
+                }
+                ExprKind::Binary { lhs, rhs, .. } => {
+                    expr_fits(me, lhs, extent) && expr_fits(me, rhs, extent)
+                }
+                ExprKind::Index { base, indices } => {
+                    expr_fits(me, base, extent) && indices.iter().all(|e| expr_fits(me, e, extent))
+                }
+                ExprKind::Call { args, .. } => args.iter().all(|e| expr_fits(me, e, extent)),
+                _ => false,
+            }
+        }
+        stmts.iter().all(|stmt| match &stmt.kind {
+            StmtKind::Let { init: Some(e), .. } => expr_fits(self, e, extent),
+            StmtKind::Assign { target, value, .. } => {
+                expr_fits(self, target, extent) && expr_fits(self, value, extent)
+            }
+            StmtKind::For { iter, body, .. } => {
+                let ForIter::Range {
+                    start,
+                    end: Some(end),
+                    inclusive: false,
+                    step: None,
+                } = iter
+                else {
+                    return false;
+                };
+                self.kernel_range_supported(start, end)
+                    && expr_fits(self, start, extent)
+                    && expr_fits(self, end, extent)
+                    && body.tail.is_none()
+                    && self.norm_integer_domain_fits(&body.stmts, extent)
+            }
+            _ => false,
+        })
     }
 
     /// The five fused-norm windows, probed at `b.stmts[at..]` and accepted only when the window is
@@ -12231,7 +12378,7 @@ impl FnLowerer<'_> {
     )> {
         let ForIter::Range {
             start,
-            end: Some(_),
+            end: Some(end),
             inclusive: false,
             step: None,
         } = iter
@@ -12251,33 +12398,48 @@ impl FnLowerer<'_> {
         // The body must be exactly one norm window (offset-indexed by `r*C`), nothing else. softmax
         // (7 stmts, fmax/exp), LayerNorm (7 stmts, mean/variance), and RMSNorm (4 stmts) are pairwise
         // structurally disjoint, so probe order is immaterial.
-        if body.tail.is_some() {
+        if body.tail.is_some() || norm_window_rebinds(&body.stmts, *r) {
             return None;
         }
+        // A statically known matrix must also fit the source index arithmetic. In particular,
+        // `r * 8u8 + i` wraps at row32 even though the widened kernel counts fit i64. Keep this
+        // check in the shared matcher so a declined copy fusion cannot redispatch that same
+        // wrapping matrix as an in-place batched norm. Symbolic extents retain their existing
+        // recognition behavior; the copy-elision path separately requires concrete extents.
+        let indices_fit =
+            |cols: &Expr| match (self.const_usize_expr(end), self.const_usize_expr(cols)) {
+                (Some(rows), Some(cols)) if rows > 0 && cols > 0 => u64::from(rows)
+                    .checked_mul(u64::from(cols))
+                    .is_some_and(|extent| {
+                        self.kernel_range_supported(start, end)
+                            && self.norm_integer_domain_fits(&body.stmts, extent)
+                    }),
+                _ => true,
+            };
         if let Some((consumed, x, cols)) = self
             .match_softmax(body, 0, Some(*r))
             .or_else(|| self.match_softmax_fused(body, 0, Some(*r)))
         {
-            if consumed == body.stmts.len() {
+            if consumed == body.stmts.len() && indices_fit(&cols) {
                 return Some((x, x, cols, 0, NORM_SOFTMAX, None, None));
             }
         }
         if let Some((consumed, x, dst, cols, eps, gamma, beta)) =
             self.match_layernorm(body, 0, Some(*r))
         {
-            if consumed == body.stmts.len() {
+            if consumed == body.stmts.len() && indices_fit(&cols) {
                 return Some((x, dst, cols, eps, NORM_LAYERNORM, gamma, beta));
             }
         }
         if let Some((consumed, x, dst, cols, eps, gamma, beta)) =
             self.match_rmsnorm(body, 0, Some(*r))
         {
-            if consumed == body.stmts.len() {
+            if consumed == body.stmts.len() && indices_fit(&cols) {
                 return Some((x, dst, cols, eps, NORM_RMSNORM, gamma, beta));
             }
         }
         if let Some((consumed, x, dst, cols, eps, _g, _b)) = self.match_l2norm(body, 0, Some(*r)) {
-            if consumed == body.stmts.len() {
+            if consumed == body.stmts.len() && indices_fit(&cols) {
                 return Some((x, dst, cols, eps, NORM_L2NORM, None, None));
             }
         }
@@ -22723,6 +22885,19 @@ fn expr_mentions(e: &Expr, sym: Symbol) -> bool {
 fn window_rebinds(stmts: &[Stmt], sym: Symbol) -> bool {
     stmts.iter().any(|s| match &s.kind {
         StmtKind::Let { pat, .. } => pat_binds(pat, sym),
+        _ => false,
+    })
+}
+
+/// A matched norm contains only lets, assignments and range loops. Its name-based
+/// index matching requires both captured buffers and the outer row binding to remain
+/// stable through every nested loop: `for r { for r { x[r*C+r] } }` has no row offset.
+fn norm_window_rebinds(stmts: &[Stmt], sym: Symbol) -> bool {
+    stmts.iter().any(|stmt| match &stmt.kind {
+        StmtKind::Let { pat, .. } => pat_binds(pat, sym),
+        StmtKind::For { pat, body, .. } => {
+            pat_binds(pat, sym) || norm_window_rebinds(&body.stmts, sym)
+        }
         _ => false,
     })
 }
