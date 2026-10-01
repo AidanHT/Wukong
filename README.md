@@ -198,8 +198,9 @@ MIR
 The front-end, optimizer, the from-scratch **MIR interpreter**, *and* the **Cranelift native
 backend** build and test with plain `cargo test` on any machine — no LLVM, no toolchain. The native
 backend JIT-compiles in-process (and emits host objects) and is differentially tested against the
-interpreter bit-for-bit; the interpreter links the same `wukong_runtime` microkernels the native
-backend calls, which is what keeps the two bit-exact. One platform caveat, and it is a *performance*
+interpreter on the covered programs. Both backends share `wukong_runtime` microkernels, so kernel
+correctness also requires independent references or recognition-on/off checks; aliasing and
+interpreter marshalling coverage remain incomplete. One platform caveat, and it is a *performance*
 one only: the raw 256-bit AVX2 vec-kernel emitter hardcodes the Win64 argument registers and VEX.256
 AVX2+FMA encodings, so it requires an **x86-64 Windows host with AVX2 + FMA**
 (`wukong_mir::host_supports_vec_kernels`, which `avx2::host_supports_kernels` delegates to). On any

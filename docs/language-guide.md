@@ -387,7 +387,10 @@ the message names the ranks, the shapes, or the layout instead. The same text re
 verbatim as the `message` field of `--error-format=json`, alongside the unchanged `code`.
 
 Run `wukongc --explain E0502` for a worked example. Dimensions may be integer literals, a declared
-symbolic generic name, the name of a top-level `const`, or `?` for a runtime dimension. A `const` dim
+symbolic generic name, the name of a top-level `const`, or `?` for an unknown dimension. `?` does not
+carry a queryable runtime extent: there is no tensor `.dim()` accessor, and indexing that requires
+an unknown interior stride declines during lowering. Use a symbolic generic dimension when
+executable extents are needed. A `const` dim
 resolves to its integer **value**, so it is a fixed dimension like a literal — `const D: usize = 3;
 Tensor[f32, 2, D]` really is 3 wide, and `a[1, 3]` on it is `E0501`. A declared generic shadows a
 same-named `const`. Any other name is `E0504` rather than a silently-introduced new symbolic dimension.

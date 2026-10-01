@@ -21,10 +21,11 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 
 ## Works end to end (interpreter `--run`, **and native code** `--backend=native`)
 
-Two CPU execution backends now run the full language and agree bit-for-bit (a differential gate proves
-it across opt levels): the zero-dependency tree-walking interpreter (the reference oracle) and a
-from-scratch **Cranelift native backend** (JIT for `--run --backend=native`, object/exe via
-`--emit=obj|exe`) — **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
+The MIR interpreter and **Cranelift native backend** execute the supported language subset.
+Corpus differential tests compare outputs across optimization levels. Unsupported constructs,
+assertion-output differences, and C-link fallback output remain documented limitations.
+Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
+`--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
 - **Multi-file modules**: `import a.b` loads `a/b.wk` (resolved against the *root* source file's
   directory) and splices its items into one merged flat namespace, so cross-file fns/consts/structs
