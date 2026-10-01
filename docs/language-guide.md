@@ -508,6 +508,17 @@ result is always correct — the fallback is the ordinary scalar/vectorized loop
 speedup is silently absent, so check with `wukongc --emit=mir -O2 f.wk | grep wukong_parallel_for`.
 Fixtures: `tests/run/parallel_control_flow.wk`, `parallel_region_reassigned_local.wk`.
 
+Sequential vectorized **f32 reductions** that fit the wide arithmetic recipe use one logical
+eight-lane partition on both the 128-bit and 256-bit paths. The recipe's register pressure fixes
+the number of independent accumulators; complete groups are combined in accumulator order, then
+lanes 0 through 7 are folded in order, then the original scalar seed is combined once, followed
+by the scalar tail. With no complete eight-element group, the scalar tail starts from the original
+seed unchanged. The host ISA, the 2,048-element width threshold, `WUKONG_P4_NO_256`, and the portable
+lowering option therefore do not change this reduction's arithmetic order. This is a reassociated
+order, not strict source-order summation, and the recipe/partition is a compiler-build contract:
+it is not promised stable across releases or equivalent to a different recognized runtime kernel.
+Other element types and expressions outside the wide recipe keep their ordinary portable lowering.
+
 Separately, loop **auto-vectorization, FMA contraction, and elementwise fusion run automatically**
 (✅) — a plain `for i in 0..n { out[i] = a*x[i] + y[i] }` is vectorized, fused with an adjacent loop,
 and FMA-contracted with no annotation. A **reduction** in a `@parallel` function — `let mut s = 0.0;

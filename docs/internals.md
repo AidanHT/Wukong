@@ -573,11 +573,20 @@ Two refinements target the dominant ML arithmetic. A float `x + y*z` **contracts
 multiply-add** (`Op::Fma`, one rounding, a hardware `vfmadd`) in both the scalar and vector lowering
 paths; the interpreter mirrors it with `mul_add`, so the two backends stay bit-identical. And a
 **float reduction** `for k in .. { s = s + x[k]*y[k] }` (or `s += ..`) is recognised and lowered to
-`VEC_UNROLL` independent vector-lane accumulators (each an FMA chain), a single-vector cleanup loop,
-a horizontal reduce of the lanes into `s`, and a scalar remainder. This reassociates the sum (the
-standard reduction optimization) — sound because both backends execute the same reassociated MIR, so
-the differential oracle still holds bit-for-bit. Reductions vectorize only on the sequential path,
-never the `@parallel` one (folding into a shared accumulator across threads would race).
+independent vector-lane accumulators (each an FMA chain), a cleanup loop, a horizontal fold, and a
+scalar remainder. For f32 expressions representable by a fitting wide recipe, `prepare_reduction`
+fixes the logical partition before the ISA, ABI, trip-count, or kill-switch gate. Its U comes from
+the recipe's register-pressure calculation. The portable path uses 2U four-lane vectors to represent
+the same U eight-lane accumulators: main stride 8U, cleanup stride 8 into accumulator zero, sequential
+cross-U combination, then a sequential lane-0..7 fold. The scalar seed is combined once afterward;
+without a complete group it is preserved unchanged before the scalar tail. The raw wide emitter's
+ABI and positive-group arithmetic are unchanged. `reduction_partition_is_independent_of_width_and_threshold`
+checks both flags, backends and O0/O2 against explicit cancellation, seed and exceptional-value
+oracles, including pressure-limited U and dynamic bounds. Portable MIR and register pressure can
+increase; the performance cost has not been measured. Other types and recipe-ineligible expressions
+retain their existing portable partition. Reductions vectorize only on the sequential path, never
+the `@parallel` one (folding into a shared accumulator across threads would race). Reassociation is
+a build contract, not a promise of strict source-order summation or stability across compiler releases.
 
 ## Spelling canonicalization before recognition
 
