@@ -114,7 +114,7 @@ pub use layernorm_bwd::{wukong_layernorm_bwd_f32, wukong_layernorm_bwd_f32_paral
 
 mod pool2d;
 pub use pool2d::{
-    wukong_avgpool2d_f32, wukong_avgpool2d_f32_parallel, wukong_maxpool2d_f32,
+    pool2d_output_dims, wukong_avgpool2d_f32, wukong_avgpool2d_f32_parallel, wukong_maxpool2d_f32,
     wukong_maxpool2d_f32_parallel,
 };
 

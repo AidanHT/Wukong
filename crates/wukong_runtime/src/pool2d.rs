@@ -23,7 +23,7 @@
 //! `_mm256_permutevar8x32_ps` with index `{0,2,4,6,0,2,4,6}` on each, then blend the 128-bit halves) to
 //! get exactly `{v0[0],v0[2],v0[4],v0[6], v1[0],v1[2],v1[4],v1[6]}` = the eight strided-by-2 columns.
 //! For any other `sw` (> 2) the per-window reads are strided, so a clean scalar path streams each
-//! window contiguously. `sw == 0` never gets that far: `out_dims` rejects every non-positive extent
+//! window contiguously. `sw == 0` never gets that far: `pool2d_output_dims` rejects every non-positive extent
 //! (`h`/`w`/`kh`/`kw`/`sh`/`sw`) *and* a window that does not fit (`kh > h`, `kw > w`), returning `None`
 //! so the kernel writes nothing; `channels <= 0` is likewise a no-op.
 //!
@@ -340,16 +340,25 @@ unsafe fn pool_channel(
 /// Compute the output spatial dims `(oh, ow)` for the no-padding pooling, or `None` if the window does
 /// not fit (`kh > h` or `kw > w`, or any non-positive dim) — in which case the kernel writes nothing.
 #[inline]
-fn out_dims(h: i64, w: i64, kh: i64, kw: i64, sh: i64, sw: i64) -> Option<(usize, usize)> {
-    if h <= 0 || w <= 0 || kh <= 0 || kw <= 0 || sh <= 0 || sw <= 0 || kh > h || kw > w {
+pub fn pool2d_output_dims(
+    h: i64,
+    w: i64,
+    kh: i64,
+    kw: i64,
+    sh: i64,
+    sw: i64,
+) -> Option<(usize, usize)> {
+    if h <= 0 || w <= 0 || kh <= 0 || kw <= 0 || sh <= 0 || sw <= 0 {
         return None;
     }
-    let oh = (h - kh) / sh + 1;
-    let ow = (w - kw) / sw + 1;
-    if oh <= 0 || ow <= 0 {
-        return None;
-    }
-    Some((oh as usize, ow as usize))
+    // Every spatial extent must fit the kernel's pointer-index type. Storage products
+    // and channel counts remain the caller's responsibility.
+    let [h, w, kh, kw, sh, sw] = [h, w, kh, kw, sh, sw].map(usize::try_from);
+    let (h, w, kh, kw, sh, sw) = (h.ok()?, w.ok()?, kh.ok()?, kw.ok()?, sh.ok()?, sw.ok()?);
+    Some((
+        h.checked_sub(kh)?.checked_div(sh)?.checked_add(1)?,
+        w.checked_sub(kw)?.checked_div(sw)?.checked_add(1)?,
+    ))
 }
 
 /// Serial pooling over all `channels` planes: `out[c, oy, ox] = ⊕ window`.
@@ -369,7 +378,7 @@ unsafe fn pool2d_serial(
     sw: i64,
     kind: PoolKind,
 ) {
-    let Some((oh, ow)) = out_dims(h, w, kh, kw, sh, sw) else {
+    let Some((oh, ow)) = pool2d_output_dims(h, w, kh, kw, sh, sw) else {
         return;
     };
     if channels <= 0 {
@@ -418,7 +427,7 @@ unsafe fn pool2d_parallel(
     sw: i64,
     kind: PoolKind,
 ) {
-    let Some((oh, ow)) = out_dims(h, w, kh, kw, sh, sw) else {
+    let Some((oh, ow)) = pool2d_output_dims(h, w, kh, kw, sh, sw) else {
         return;
     };
     if channels <= 0 {
@@ -551,6 +560,85 @@ pub unsafe extern "C" fn wukong_avgpool2d_f32_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool2d_shared_shape_checked_spatial_extents() {
+        assert_eq!(pool2d_output_dims(5, 8, 2, 3, 2, 3), Some((2, 2)));
+        assert_eq!(pool2d_output_dims(4, 6, 4, 6, 99, 99), Some((1, 1)));
+        assert_eq!(pool2d_output_dims(2, 3, 3, 1, 1, 1), None);
+        assert_eq!(pool2d_output_dims(2, 3, 1, 4, 1, 1), None);
+        for index in 0..6 {
+            for invalid in [0, -1, i64::MIN] {
+                let mut dims = [4, 6, 2, 3, 1, 2];
+                dims[index] = invalid;
+                let [h, w, kh, kw, sh, sw] = dims;
+                assert_eq!(pool2d_output_dims(h, w, kh, kw, sh, sw), None);
+            }
+        }
+        assert_eq!(
+            pool2d_output_dims(i64::MAX, 1, 1, 1, 1, 1),
+            usize::try_from(i64::MAX).ok().map(|h| (h, 1)),
+        );
+    }
+
+    #[test]
+    fn pool2d_shared_shape_kernel_outputs_and_empty_channels() {
+        for (index, kernel) in [
+            wukong_maxpool2d_f32,
+            wukong_maxpool2d_f32_parallel,
+            wukong_avgpool2d_f32,
+            wukong_avgpool2d_f32_parallel,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let input: Vec<f32> = (0..4)
+                .flat_map(|c| (1..=12).map(move |v| (100 * c + v) as f32))
+                .collect();
+            let mut output = [77.0; 18];
+            // Four channels exercises the parallel entry's channel threshold.
+            unsafe {
+                kernel(
+                    input.as_ptr(),
+                    output.as_mut_ptr().add(1),
+                    4,
+                    3,
+                    4,
+                    2,
+                    2,
+                    1,
+                    2,
+                );
+            }
+            let avg = index >= 2;
+            let expected = if avg {
+                [3.5, 5.5, 7.5, 9.5]
+            } else {
+                [6.0, 8.0, 10.0, 12.0]
+            };
+            for c in 0..4 {
+                for d in 0..4 {
+                    assert_eq!(output[1 + c * 4 + d], expected[d] + (100 * c) as f32);
+                }
+            }
+            assert_eq!(output[0], 77.0);
+            assert_eq!(output[17], 77.0);
+            for dims in [
+                [0, 3, 4, 2, 2, 1, 2],
+                [-1, 3, 4, 2, 2, 1, 2],
+                [4, 3, 4, 4, 2, 1, 2],
+                [4, 3, 4, 2, 2, 0, 2],
+            ] {
+                let mut canary = 19.0;
+                let [c, h, w, kh, kw, sh, sw] = dims;
+                // Invalid shapes must not touch either pointer.
+                unsafe {
+                    kernel(std::ptr::null(), &mut canary, c, h, w, kh, kw, sh, sw);
+                }
+                assert_eq!(canary, 19.0);
+            }
+        }
+    }
 
     /// Naive 4-deep nested reference in the **same** `(dy, dx)` ascending window fold order the kernels
     /// use — so equality is literal (max idempotent, avg's fixed sum order), pinning AVX2 == scalar and
