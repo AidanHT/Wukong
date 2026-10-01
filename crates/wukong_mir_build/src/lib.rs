@@ -10147,6 +10147,13 @@ impl FnLowerer<'_> {
     /// batched cross-entropy loss. Bails (false) if an operand/dim is unbound. `parallel` selects the
     /// multicore kernel (rows independent → bit-identical to serial).
     fn emit_xent(&mut self, nest: &XentNest, parallel: bool) -> bool {
+        // Different parameter/view names can reach the same storage. In particular, loss[r]
+        // can overwrite logits another row still reads, invalidating parallel row independence;
+        // the interpreter's private input copies also erase source-order dependencies. Decline
+        // both entry points unless the existing whole-program alias facts prove disjointness.
+        if !self.all_provably_disjoint(&[nest.x, nest.target, nest.loss]) {
+            return false;
+        }
         let Some([x, target, loss]) = self.kernel_base_ptrs([nest.x, nest.target, nest.loss])
         else {
             return false;
@@ -10170,6 +10177,12 @@ impl FnLowerer<'_> {
     /// Emit one `wukong_xent_bwd_f32[_parallel](x, target, dx, rows, cols)` call for a recognized
     /// cross-entropy backward nest. Bails (false) if an operand/dim is unbound.
     fn emit_xent_bwd(&mut self, nest: &XentBwdNest, parallel: bool) -> bool {
+        // The runtime supports exact in-place x == dx, but the alias fact cannot distinguish
+        // that case from partial overlap. Keep the source loop whenever disjointness is unknown,
+        // just as the matcher already does when x and dx have the very same source symbol.
+        if !self.all_provably_disjoint(&[nest.x, nest.target, nest.dx]) {
+            return false;
+        }
         let Some([x, target, dx]) = self.kernel_base_ptrs([nest.x, nest.target, nest.dx]) else {
             return false;
         };
