@@ -2422,8 +2422,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             // max/avg pooling over a [channels, h, w] row-major input (no padding) a recognized pooling
             // nest lowers to. Marshal `channels*h*w` f32 from x, call the *serial* runtime kernel
             // (bit-identical to the parallel one — channels independent, max idempotent, avg sum order
-            // fixed), write the `channels*oh*ow` result to out (`oh=(h-kh)/sh+1`, `ow=(w-kw)/sw+1`; a
-            // window that doesn't fit writes nothing, so the output buffer is pre-zeroed). Read all of x
+            // fixed), size the output through the shared runtime shape helper. Invalid windows
+            // and nonpositive dimensions write nothing. Read all of x
             // first so any overlap is robust.
             "wukong_maxpool2d_f32"
             | "wukong_maxpool2d_f32_parallel"
@@ -2431,45 +2431,48 @@ impl<'a, 'k> Interp<'a, 'k> {
             | "wukong_avgpool2d_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let out = ptr(args[1])?;
-                let channels = args[2].as_int() as i64;
-                let h = args[3].as_int() as i64;
-                let w = args[4].as_int() as i64;
-                let kh = args[5].as_int() as i64;
-                let kw = args[6].as_int() as i64;
-                let sh = args[7].as_int() as i64;
-                let sw = args[8].as_int() as i64;
-                let n_in = (channels.max(0) * h.max(0) * w.max(0)) as usize;
-                let mut xbuf = Vec::with_capacity(n_in);
-                for t in 0..n_in {
-                    xbuf.push(
-                        self.memory
-                            .get(x + t)
-                            .ok_or("pool2d operand out of bounds")?
-                            .as_float() as f32,
-                    );
+                // Empty/invalid dimensions are no-ops, including zero channels. Check
+                // before narrowing: interpreter integers are wider than the runtime ABI.
+                if args[2..9].iter().any(|v| v.as_int() <= 0) {
+                    return Ok(Value::Unit);
                 }
-                // Output length: channels*oh*ow when the window fits, else 0 (the kernel writes nothing).
-                let out_len = if channels > 0
-                    && h > 0
-                    && w > 0
-                    && kh > 0
-                    && kw > 0
-                    && sh > 0
-                    && sw > 0
-                    && kh <= h
-                    && kw <= w
-                {
-                    let oh = (h - kh) / sh + 1;
-                    let ow = (w - kw) / sw + 1;
-                    if oh > 0 && ow > 0 {
-                        (channels * oh * ow) as usize
-                    } else {
-                        0
-                    }
-                } else {
-                    0
+                let mut dims = [0i64; 7];
+                for (dim, arg) in dims.iter_mut().zip(&args[2..9]) {
+                    *dim = i64::try_from(arg.as_int()).map_err(|_| "pool2d extent exceeds i64")?;
+                }
+                let [channels, h, w, kh, kw, sh, sw] = dims;
+                let Some((oh, ow)) = wukong_runtime::pool2d_output_dims(h, w, kh, kw, sh, sw)
+                else {
+                    return Ok(Value::Unit);
                 };
-                let mut obuf = vec![0.0f32; out_len];
+                let c = usize::try_from(channels).map_err(|_| "pool2d channel extent overflow")?;
+                let n_in = c
+                    .checked_mul(h as usize)
+                    .and_then(|n| n.checked_mul(w as usize))
+                    .ok_or("pool2d operand extent overflow")?;
+                let out_len = c
+                    .checked_mul(oh)
+                    .and_then(|n| n.checked_mul(ow))
+                    .ok_or("pool2d output extent overflow")?;
+                let x_end = x.checked_add(n_in).ok_or("pool2d operand out of bounds")?;
+                let input = self
+                    .memory
+                    .get(x..x_end)
+                    .ok_or("pool2d operand out of bounds")?;
+                let out_end = out
+                    .checked_add(out_len)
+                    .ok_or("pool2d output out of bounds")?;
+                self.memory
+                    .get(out..out_end)
+                    .ok_or("pool2d output out of bounds")?;
+                let mut xbuf = Vec::new();
+                xbuf.try_reserve_exact(n_in)
+                    .map_err(|_| "pool2d scratch allocation failed")?;
+                xbuf.extend(input.iter().map(|v| v.as_float() as f32));
+                let mut obuf = Vec::new();
+                obuf.try_reserve_exact(out_len)
+                    .map_err(|_| "pool2d scratch allocation failed")?;
+                obuf.resize(out_len, 0.0f32);
                 let kernel: unsafe extern "C" fn(
                     *const f32,
                     *mut f32,
@@ -5042,6 +5045,119 @@ mod tests {
             100,
             "negative S must leave the attention output untouched"
         );
+    }
+
+    #[test]
+    fn pool2d_shared_shape_marshalling_and_checked_extents() {
+        let program = Program::default();
+        let interner = Interner::new();
+        let mut interp = Interp {
+            program: &program,
+            interner: &interner,
+            memory: Vec::new(),
+            stdout: Vec::new(),
+            frames: Vec::new(),
+            call_args: Vec::new(),
+            scratch: Vec::new(),
+            vecs: Vec::new(),
+            #[cfg(test)]
+            vector_peak: 0,
+            data_addrs: HashMap::new(),
+            function_indices: None,
+            static_indices: None,
+            accel: None,
+            depth: 0,
+        };
+        for name in [
+            "wukong_maxpool2d_f32",
+            "wukong_maxpool2d_f32_parallel",
+            "wukong_avgpool2d_f32",
+            "wukong_avgpool2d_f32_parallel",
+        ] {
+            let initial: Vec<Value> = [77.0]
+                .into_iter()
+                .chain((1..=12).map(f64::from))
+                .chain([19.0; 5])
+                .map(Value::Float)
+                .collect();
+            let args = |x, out, dims: [i128; 7]| {
+                let mut args = vec![Value::Ptr(x), Value::Ptr(out)];
+                args.extend(dims.map(Value::Int));
+                args
+            };
+            interp.memory.clone_from(&initial);
+            interp
+                .intrinsic(name, &args(1, 13, [1, 3, 4, 2, 2, 1, 2]))
+                .unwrap();
+            let expected = if name.contains("avg") {
+                [3.5, 5.5, 7.5, 9.5]
+            } else {
+                [6.0, 8.0, 10.0, 12.0]
+            };
+            assert_eq!(
+                &interp.memory[13..17],
+                &expected.map(Value::Float),
+                "{name}"
+            );
+            assert_eq!(&interp.memory[..13], &initial[..13]);
+            assert_eq!(interp.memory[17], initial[17]);
+            for index in 0..7 {
+                for invalid in [0, -1, i128::MIN] {
+                    interp.memory.clone_from(&initial);
+                    let mut dims = [1, 3, 4, 2, 2, 1, 2];
+                    dims[index] = invalid;
+                    interp
+                        .intrinsic(name, &args(usize::MAX, usize::MAX, dims))
+                        .unwrap();
+                    assert_eq!(interp.memory, initial);
+                }
+                let mut dims = [1, 3, 4, 2, 2, 1, 2];
+                dims[index] = i128::from(i64::MAX) + 1;
+                assert_eq!(
+                    interp.intrinsic(name, &args(1, 13, dims)).unwrap_err(),
+                    "pool2d extent exceeds i64"
+                );
+                assert_eq!(interp.memory, initial);
+            }
+            for dims in [
+                [1, 3, 4, 4, 2, 1, 2],
+                [1, 3, 4, 2, 5, 1, 2],
+                [0, i128::MAX, 4, 2, 2, 1, 2],
+            ] {
+                interp
+                    .intrinsic(name, &args(usize::MAX, usize::MAX, dims))
+                    .unwrap();
+                assert_eq!(interp.memory, initial);
+            }
+            for (x, out, dims, error) in [
+                (
+                    1,
+                    13,
+                    [i128::from(i64::MAX), 3, 4, 2, 2, 1, 2],
+                    "pool2d operand extent overflow",
+                ),
+                (
+                    usize::MAX,
+                    13,
+                    [1, 3, 4, 2, 2, 1, 2],
+                    "pool2d operand out of bounds",
+                ),
+                (
+                    1,
+                    usize::MAX,
+                    [1, 3, 4, 2, 2, 1, 2],
+                    "pool2d output out of bounds",
+                ),
+                (1, 15, [1, 3, 4, 2, 2, 1, 2], "pool2d output out of bounds"),
+            ] {
+                assert_eq!(
+                    interp.intrinsic(name, &args(x, out, dims)).unwrap_err(),
+                    error,
+                    "{name}"
+                );
+                assert_eq!(interp.memory, initial);
+            }
+        }
     }
 
     #[test]
