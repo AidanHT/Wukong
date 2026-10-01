@@ -3998,12 +3998,11 @@ impl FnLowerer<'_> {
                 Some(n) => self.array_storage(self.mir_ty_of_ann(elem), n),
                 None => MirType::Ptr,
             },
-            Tuple(fields) => {
-                // A padded byte buffer sized from the element MIR types — the same layout the
-                // with-initializer path derives via `mir_ty_of(Ty::Tuple(..))`/`ty_size`.
-                let elems: Vec<MirType> = fields.iter().map(|f| self.mir_ty_of_ann(f)).collect();
-                // Sema rejects unrepresentable concrete layouts. Keep recovery checked too.
-                let size = self.byte_buffer_len(mir_tuple_byte_size(&elems));
+            Tuple(_) => {
+                // Keep nested fields semantic until the complete layout is known. Flattening a
+                // child aggregate to [i8; N] first loses its alignment and underallocates parents.
+                let ty = self.annotation_storage_ty(t);
+                let size = self.byte_buffer_len(self.ty_size(&ty));
                 MirType::Array(Box::new(MirType::I8), size)
             }
             // A slice annotation resolves to its 16-byte fat-pointer buffer (not a thin `Ptr`).
@@ -4012,6 +4011,56 @@ impl FnLowerer<'_> {
             Vector { elem, lanes } => MirType::Vec(Box::new(self.mir_ty_of_ann(elem)), *lanes),
             Unit => MirType::Void,
             _ => MirType::I32,
+        }
+    }
+
+    /// Retain annotation field structure for the shared semantic aggregate layout. This describes
+    /// storage, not type checking: tensors keep their existing pointer representation and array
+    /// extents use the same constant evaluator as `mir_ty_of_ann`. Generic leaves are substituted
+    /// before layout, including tuples/arrays nested inside the concrete instantiation.
+    fn annotation_storage_ty(&self, t: &ast::TypeExpr) -> Ty {
+        use ast::TypeKind::*;
+        let pointer = || Ty::Ptr {
+            mutable: false,
+            pointee: Box::new(Ty::Unknown),
+        };
+        match &t.kind {
+            Path(p) => {
+                let sym = p.segments.last().unwrap().sym;
+                if let Some(concrete) = self.subst.get(&sym) {
+                    return subst_ty(concrete, &self.subst);
+                }
+                if let Some(scalar) = wukong_types::Scalar::from_name(self.interner.resolve(sym)) {
+                    Ty::Scalar(scalar)
+                } else {
+                    Ty::Named(sym)
+                }
+            }
+            Array { elem, len, shared } => match self.const_array_len_expr(len) {
+                Some(len) => Ty::Array {
+                    elem: Box::new(self.annotation_storage_ty(elem)),
+                    len: u64::from(len),
+                    shared: *shared,
+                },
+                None => pointer(),
+            },
+            Tuple(fields) => Ty::Tuple(
+                fields
+                    .iter()
+                    .map(|field| self.annotation_storage_ty(field))
+                    .collect(),
+            ),
+            Slice(_) => Ty::Slice(Box::new(Ty::Unknown)),
+            Pointer { .. } | Ref { .. } | Tensor { .. } => pointer(),
+            Vector { elem, lanes } => match self.annotation_storage_ty(elem) {
+                Ty::Scalar(elem) => Ty::Vector {
+                    elem,
+                    lanes: *lanes,
+                },
+                _ => Ty::Error,
+            },
+            Unit => Ty::Unit,
+            Int(_) => Ty::Error,
         }
     }
 
@@ -22264,9 +22313,8 @@ fn round_up(x: u64, align: u64) -> Option<u64> {
     }
 }
 
-/// Byte size of a MIR type (scalars by width, an array/vector as count × element). Used to size a
-/// no-init tuple's byte buffer from its element MIR types (`mir_ty_of_ann`). Matches `Ty::size_of`'s
-/// scalar widths so the buffer is identical to the with-initializer path's `ty_size`.
+/// Byte size of an already-lowered MIR type (scalars by width, arrays/vectors as count × element).
+/// Aggregate layout uses semantic fields via `ty_size` before flattening loses their alignment.
 fn mir_byte_size(t: &MirType) -> u64 {
     // Width comparisons also use this helper; overflow must never look like a small type.
     checked_mir_byte_size(t).unwrap_or(u64::MAX)
@@ -22285,6 +22333,7 @@ fn checked_mir_byte_size(t: &MirType) -> Option<u64> {
     })
 }
 
+#[cfg(test)]
 fn mir_tuple_byte_size(elems: &[MirType]) -> Option<u64> {
     let (mut size, mut align) = (0u64, 1u64);
     for elem in elems {
@@ -22296,7 +22345,8 @@ fn mir_tuple_byte_size(elems: &[MirType]) -> Option<u64> {
 }
 
 /// Alignment of a MIR type: a scalar aligns to its size, an array/vector to its element. Companion
-/// to [`mir_byte_size`] for padding a no-init tuple's byte buffer.
+/// to [`mir_byte_size`] for the synthetic MIR overflow tests. Source tuples retain semantic fields.
+#[cfg(test)]
 fn mir_byte_align(t: &MirType) -> u64 {
     match t {
         MirType::Vec(e, _) | MirType::Array(e, _) => mir_byte_align(e),
