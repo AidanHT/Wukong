@@ -25,6 +25,7 @@
 
 mod attrs;
 mod dependency;
+mod layout;
 mod shape;
 
 use std::cell::RefCell;
@@ -338,6 +339,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         loop_ctx: Vec::new(),
         consts: HashMap::default(),
         const_lengths: RefCell::new(HashMap::default()),
+        layout_cache: layout::Cache::default(),
         checking_bodies: false,
         parallel_fn: false,
     };
@@ -354,6 +356,12 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     // per function, so an unknown dim name can be told from a declared generic / a `const` with no
     // forward-reference false positive (and a function signature, re-lowered here, is reported once).
     s.checking_bodies = true;
+    s.layout_cache.prepare(&s.defs);
+    for def in s.defs.defs.clone() {
+        if matches!(def.kind, DefKind::Struct(_) | DefKind::Enum(_)) {
+            s.check_layout(&Ty::Named(def.name), def.span);
+        }
+    }
     s.recheck_item_signatures(module);
     s.check_bodies(module);
     let result = SemaResult {
@@ -410,6 +418,8 @@ struct Sema<'a> {
     /// unknown dim name is distinguished from a declared generic / a `const` with no forward-reference
     /// false positive, and a function signature (re-lowered in `check_fn`) is reported exactly once.
     checking_bodies: bool,
+    /// Named layouts are queried only after collection, when definitions are stable.
+    layout_cache: layout::Cache,
     /// True while checking a `@parallel` function body (`sync_block()` is legal only here).
     parallel_fn: bool,
 }
@@ -1004,8 +1014,20 @@ impl<'a> Sema<'a> {
 
     // ---- Type lowering: AST type syntax -> semantic Ty ----
 
+    fn check_layout(&mut self, ty: &Ty, span: Span) {
+        if self.checking_bodies {
+            if let Err(limit) = self.layout_cache.extent(ty, &self.defs) {
+                self.error(
+                    span,
+                    "E0401",
+                    format!("type layout is too large to represent: exceeds {limit}"),
+                );
+            }
+        }
+    }
+
     fn lower_type(&mut self, t: &TypeExpr) -> Ty {
-        match &t.kind {
+        let ty = match &t.kind {
             TypeKind::Path(p) => {
                 let name = p.segments.last().unwrap().sym;
                 let s = self.sym_str(name);
@@ -1080,7 +1102,9 @@ impl<'a> Sema<'a> {
                     layout,
                 }
             }
-        }
+        };
+        self.check_layout(&ty, t.span);
+        ty
     }
 
     fn lower_dim(&mut self, d: &wukong_ast::Dim) -> Dim {
@@ -3314,6 +3338,7 @@ impl<'a> Sema<'a> {
 
     fn type_expr(&mut self, e: &Expr) -> Ty {
         let ty = self.type_expr_inner(e);
+        self.check_layout(&ty, e.span);
         self.types.insert(e.id, ty.clone());
         ty
     }
@@ -4837,6 +4862,53 @@ mod tests {
             msgs.iter().any(|m| needles.iter().all(|n| m.contains(n))),
             "no {code} message contains {needles:?}; got {msgs:?} for {src:?}"
         );
+    }
+
+    #[test]
+    fn aggregate_layout_overflow_diagnostics() {
+        for src in [
+            "fn f() { let t: ([[i64;4000000000];4000000000], i32); }",
+            "fn f() { let s: shared [[i64;4000000000];4000000000]; }",
+            "fn f() { let t: ([u8;4294967295], u8); }",
+            "fn f() { let t: ([u8;4294967293], i16); }",
+            "struct S { a: [u8;4294967295], b: u8 }",
+            "enum E { A([u8;4294967295]), B }",
+            "struct Outer { a: [Inner;4000000000] } struct Inner { x: i64 }",
+            "fn f(a: [i64;4000000000]) { let t = (a, 1); }",
+        ] {
+            assert_message_has(src, "E0401", &["layout is too large to represent", "byte"]);
+        }
+    }
+
+    #[test]
+    fn aggregate_layout_overflow_named_dependency_controls() {
+        for src in ["struct S { x: S }", "enum E { A(S) } struct S { e: E }"] {
+            let diags = errors(src);
+            assert!(diags.contains(&"E0402"), "{src}: {diags:?}");
+            assert!(!diags.contains(&"E0401"), "{src}: {diags:?}");
+        }
+        let mut source = String::from("struct S0 { x: i32 }");
+        for i in 1..2048 {
+            source.push_str(&format!("struct S{i} {{ x: S{} }}", i - 1));
+        }
+        let (diags, _) = analyze(&source);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn aggregate_layout_overflow_controls() {
+        for src in [
+            "fn f(a: [i64;4000000000]) {}",
+            "fn f(a: *[i64;4000000000]) {}",
+            "fn f() { let t: ([[i64;0];4000000000], i32); }",
+            "fn f() { let t: ([();4000000000], i32); }",
+            "fn f(a: []i32, b: Tensor[f32, ?]) { let t: ([]i32, i32) = (a, 7); }",
+            "struct S { a: u8, b: i64 } enum E { A(S), B } fn f() { let s: (S, [u8;0]); }",
+            "fn f() { let t: ([u8;4294967295], ()); }",
+        ] {
+            let (diags, _) = analyze(src);
+            assert!(diags.is_empty(), "{src}: {diags:?}");
+        }
     }
 
     #[test]

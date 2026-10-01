@@ -31,7 +31,7 @@ mod canon;
 mod tile;
 mod tindex;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use wukong_span::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -2296,6 +2296,7 @@ fn parallel_spec<'a>(
         builder: Builder::new(f.name.sym, MirType::Void),
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
+        layout_error: Cell::new(false),
         sema,
         interner,
         diags: &mut proof_diags,
@@ -2360,6 +2361,7 @@ fn is_batched_norm_fn(
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
+        layout_error: Cell::new(false),
         sema,
         interner,
         diags: &mut diags,
@@ -2413,6 +2415,7 @@ fn is_bias_bcast_fn(
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
+        layout_error: Cell::new(false),
         sema,
         interner,
         diags: &mut diags,
@@ -2492,6 +2495,7 @@ fn lower_fn(
         builder: Builder::new(name, ret_mir.clone()),
         preserve_aggregate_blocks: ret_mir.is_float(),
         const_lengths: RefCell::default(),
+        layout_error: Cell::new(false),
         sema,
         interner,
         diags,
@@ -2614,7 +2618,7 @@ fn lower_fn(
         &fl.tile_queue,
         "this function has fewer loops `@tile` can strip-mine than widths were given",
     );
-    fl.builder.finish()
+    fl.finish()
 }
 
 /// True if `ty` is an aggregate (struct/tuple/array) the ABI passes/returns by pointer — the same
@@ -2706,6 +2710,7 @@ fn lower_parallel(
             builder: Builder::new(par_sym, MirType::Void),
             preserve_aggregate_blocks: false,
             const_lengths: RefCell::default(),
+            layout_error: Cell::new(false),
             sema,
             interner,
             diags: &mut *diags,
@@ -2767,7 +2772,7 @@ fn lower_parallel(
         if !fl.terminated {
             fl.builder.ret(None);
         }
-        fl.builder.finish()
+        fl.finish()
     };
 
     // ---- wrapper: f.name(params…) ----
@@ -2776,6 +2781,7 @@ fn lower_parallel(
             builder: Builder::new(f.name.sym, ret_mir.clone()),
             preserve_aggregate_blocks: ret_mir.is_float(),
             const_lengths: RefCell::default(),
+            layout_error: Cell::new(false),
             sema,
             interner,
             diags: &mut *diags,
@@ -2838,7 +2844,7 @@ fn lower_parallel(
                 }
             }
         }
-        fl.builder.finish()
+        fl.finish()
     };
 
     (outlined, wrapper)
@@ -3466,6 +3472,8 @@ const NORM_L2NORM: i64 = 4; // out = x / sqrt(sum(x^2) + eps) — L2 / unit norm
 
 struct FnLowerer<'a> {
     builder: Builder,
+    /// Layout failure discovered only after generic substitution; reported before publishing MIR.
+    layout_error: Cell<bool>,
     /// Autodiff currently accepts only single-block functions returning a float scalar. Keep
     /// aggregate operations unrolled in every such function so introducing copy/zero loops does
     /// not remove an existing gradient candidate, including callers of the public grad API.
@@ -3553,6 +3561,34 @@ struct FnLowerer<'a> {
 }
 
 impl FnLowerer<'_> {
+    fn finish(self) -> Function {
+        if self.layout_error.get() {
+            self.diags.push(Diagnostic::error(
+                "instantiated aggregate layout is too large or unresolved: exceeds the 64-bit byte size or 32-bit byte-buffer representation"
+            ).with_code("E0401"));
+        }
+        self.builder.finish()
+    }
+
+    fn array_storage(&self, elem: MirType, len: u32) -> MirType {
+        let ty = MirType::Array(Box::new(elem), len);
+        if checked_mir_byte_size(&ty).is_none() {
+            self.layout_error.set(true);
+            return MirType::Array(Box::new(MirType::I8), 0);
+        }
+        ty
+    }
+
+    fn byte_buffer_len(&self, size: Option<u64>) -> u32 {
+        match size.and_then(|n| u32::try_from(n).ok()) {
+            Some(n) => n,
+            None => {
+                self.layout_error.set(true);
+                0
+            }
+        }
+    }
+
     fn unsupported(&mut self, span: Span, what: &str) {
         // A construct codegen cannot lower yields incomplete/invalid MIR, so this is a hard error:
         // the compiler refuses to emit a broken program rather than silently producing one. The
@@ -3900,18 +3936,19 @@ impl FnLowerer<'_> {
             // (all-unit) enum falls through to `mir_ty` = its i32 discriminant scalar.
             Ty::Named(sym) if self.enum_is_data_carrying(*sym) => {
                 let size = self.enum_layout(*sym).map(|(s, _, _)| s).unwrap_or(4);
-                MirType::Array(Box::new(MirType::I8), size as u32)
+                MirType::Array(Box::new(MirType::I8), self.byte_buffer_len(Some(size)))
             }
             Ty::Named(sym) => match self.struct_size(*sym) {
-                Some(size) => MirType::Array(Box::new(MirType::I8), size as u32),
+                Some(size) => {
+                    MirType::Array(Box::new(MirType::I8), self.byte_buffer_len(Some(size)))
+                }
                 None => mir_ty(ty),
             },
-            Ty::Array { elem, len, .. } => {
-                MirType::Array(Box::new(self.mir_ty_of(elem)), *len as u32)
-            }
-            Ty::Tuple(_) => {
-                MirType::Array(Box::new(MirType::I8), self.ty_size(ty).unwrap_or(0) as u32)
-            }
+            Ty::Array { elem, len, .. } => self.array_storage(self.mir_ty_of(elem), *len as u32),
+            Ty::Tuple(_) => MirType::Array(
+                Box::new(MirType::I8),
+                self.byte_buffer_len(self.ty_size(ty)),
+            ),
             // A slice is a fat-pointer aggregate `{ data: *T @ 0, len: i64 @ 8 }` — a 16-byte byte
             // buffer addressed by base pointer, like a 2-field struct.
             Ty::Slice(_) => MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32),
@@ -3958,22 +3995,16 @@ impl FnLowerer<'_> {
                 }
             }
             Array { elem, len, .. } => match self.const_array_len_expr(len) {
-                Some(n) => MirType::Array(Box::new(self.mir_ty_of_ann(elem)), n),
+                Some(n) => self.array_storage(self.mir_ty_of_ann(elem), n),
                 None => MirType::Ptr,
             },
             Tuple(fields) => {
                 // A padded byte buffer sized from the element MIR types — the same layout the
                 // with-initializer path derives via `mir_ty_of(Ty::Tuple(..))`/`ty_size`.
                 let elems: Vec<MirType> = fields.iter().map(|f| self.mir_ty_of_ann(f)).collect();
-                let mut size = 0u64;
-                let mut align = 1u64;
-                for e in &elems {
-                    let a = mir_byte_align(e);
-                    size = round_up(size, a);
-                    size += mir_byte_size(e);
-                    align = align.max(a);
-                }
-                MirType::Array(Box::new(MirType::I8), round_up(size, align) as u32)
+                // Sema rejects unrepresentable concrete layouts. Keep recovery checked too.
+                let size = self.byte_buffer_len(mir_tuple_byte_size(&elems));
+                MirType::Array(Box::new(MirType::I8), size)
             }
             // A slice annotation resolves to its 16-byte fat-pointer buffer (not a thin `Ptr`).
             Slice(_) => MirType::Array(Box::new(MirType::I8), SLICE_SIZE as u32),
@@ -4077,7 +4108,7 @@ impl FnLowerer<'_> {
                 self.enum_layout(*sym).map(|(size, _, _)| size)
             }
             Ty::Named(sym) => self.struct_size(*sym),
-            Ty::Array { elem, len, .. } => Some(self.ty_size(elem)? * len),
+            Ty::Array { elem, len, .. } => self.ty_size(elem)?.checked_mul(*len),
             Ty::Tuple(fields) => self.aggregate_extent(fields, |_| {}).map(|(size, _)| size),
             _ => ty.size_of(),
         }
@@ -4131,12 +4162,12 @@ impl FnLowerer<'_> {
         for f in fields {
             let fa = self.ty_align(f)?;
             let fs = self.ty_size(f)?;
-            size = round_up(size, fa);
+            size = round_up(size, fa)?;
             field_offset(size);
-            size += fs;
+            size = size.checked_add(fs)?;
             align = align.max(fa);
         }
-        Some((round_up(size, align), align))
+        Some((round_up(size, align)?, align))
     }
 
     /// The field layout of a declared struct: `(field name, byte offset, field MIR type)` in
@@ -4273,8 +4304,8 @@ impl FnLowerer<'_> {
         }
         let disc = 4u64; // the i32 discriminant
         let align = disc.max(union_align);
-        let payload_offset = round_up(disc, union_align);
-        let size = round_up(payload_offset + union_size, align);
+        let payload_offset = round_up(disc, union_align)?;
+        let size = round_up(payload_offset.checked_add(union_size)?, align)?;
         Some((size, align, payload_offset))
     }
 
@@ -4448,9 +4479,10 @@ impl FnLowerer<'_> {
         payload: VariantCtor,
     ) -> ValueId {
         let size = self.enum_layout(enum_sym).map(|(s, _, _)| s).unwrap_or(4);
-        let buf = self
-            .builder
-            .alloca(MirType::Array(Box::new(MirType::I8), size as u32));
+        let buf = self.builder.alloca(MirType::Array(
+            Box::new(MirType::I8),
+            self.byte_buffer_len(Some(size)),
+        ));
         self.construct_enum_into(buf, enum_sym, vname, payload);
         buf
     }
@@ -4467,7 +4499,10 @@ impl FnLowerer<'_> {
         payload: VariantCtor,
     ) {
         let size = self.enum_layout(enum_sym).map(|(s, _, _)| s).unwrap_or(4);
-        self.zero_init(dst, &MirType::Array(Box::new(MirType::I8), size as u32));
+        self.zero_init(
+            dst,
+            &MirType::Array(Box::new(MirType::I8), self.byte_buffer_len(Some(size))),
+        );
         if let Some(disc) = self.variant_disc(enum_sym, vname) {
             let p = self.field_ptr(dst, 0);
             let c = self
@@ -13541,6 +13576,7 @@ impl FnLowerer<'_> {
                 builder: Builder::new(par_sym, MirType::Void),
                 preserve_aggregate_blocks: false,
                 const_lengths: RefCell::default(),
+                layout_error: Cell::new(false),
                 sema: self.sema,
                 interner: self.interner,
                 diags: &mut tmp_diags,
@@ -13585,7 +13621,7 @@ impl FnLowerer<'_> {
             if !fl.terminated {
                 fl.builder.ret(None);
             }
-            fl.builder.finish()
+            fl.finish()
         };
         self.diags.extend(tmp_diags);
         self.par
@@ -18818,7 +18854,7 @@ impl FnLowerer<'_> {
             // array value follows.
             ExprKind::TupleLit(items) => {
                 let tty = self.expr_ty(e);
-                let size = self.ty_size(&tty).unwrap_or(0) as u32;
+                let size = self.byte_buffer_len(self.ty_size(&tty));
                 let buf = self
                     .builder
                     .alloca(MirType::Array(Box::new(MirType::I8), size));
@@ -22220,11 +22256,11 @@ fn param_abi_ty(ty: &Ty) -> MirType {
 /// Round `x` up to the next multiple of `align` (a power of two) — field-offset padding, mirroring
 /// the private `round_up` in `wukong_types` (the registry-aware aggregate layout reimplements the
 /// same accumulation here because it must resolve named-struct field sizes the leaf crate can't).
-fn round_up(x: u64, align: u64) -> u64 {
+fn round_up(x: u64, align: u64) -> Option<u64> {
     if align <= 1 {
-        x
+        Some(x)
     } else {
-        (x + align - 1) & !(align - 1)
+        x.div_ceil(align).checked_mul(align)
     }
 }
 
@@ -22232,14 +22268,31 @@ fn round_up(x: u64, align: u64) -> u64 {
 /// no-init tuple's byte buffer from its element MIR types (`mir_ty_of_ann`). Matches `Ty::size_of`'s
 /// scalar widths so the buffer is identical to the with-initializer path's `ty_size`.
 fn mir_byte_size(t: &MirType) -> u64 {
-    match t {
+    // Width comparisons also use this helper; overflow must never look like a small type.
+    checked_mir_byte_size(t).unwrap_or(u64::MAX)
+}
+
+fn checked_mir_byte_size(t: &MirType) -> Option<u64> {
+    Some(match t {
         MirType::I1 | MirType::I8 => 1,
         MirType::I16 | MirType::F16 | MirType::BF16 => 2,
         MirType::I32 | MirType::F32 => 4,
         MirType::I64 | MirType::F64 | MirType::Ptr => 8,
-        MirType::Vec(e, n) | MirType::Array(e, n) => mir_byte_size(e) * (*n as u64),
+        MirType::Vec(e, n) | MirType::Array(e, n) => {
+            checked_mir_byte_size(e)?.checked_mul(*n as u64)?
+        }
         MirType::Void => 0,
+    })
+}
+
+fn mir_tuple_byte_size(elems: &[MirType]) -> Option<u64> {
+    let (mut size, mut align) = (0u64, 1u64);
+    for elem in elems {
+        let a = mir_byte_align(elem);
+        size = round_up(size, a)?.checked_add(checked_mir_byte_size(elem)?)?;
+        align = align.max(a);
     }
+    round_up(size, align)
 }
 
 /// Alignment of a MIR type: a scalar aligns to its size, an array/vector to its element. Companion
@@ -26229,6 +26282,7 @@ fn lower_matmul_fn(
         builder: Builder::new(f.name.sym, ret_mir.clone()),
         preserve_aggregate_blocks: ret_mir.is_float(),
         const_lengths: RefCell::default(),
+        layout_error: Cell::new(false),
         sema,
         interner,
         diags,
@@ -26307,7 +26361,7 @@ fn lower_matmul_fn(
             }
         }
     }
-    Some(fl.builder.finish())
+    Some(fl.finish())
 }
 
 /// Recognize a function whose entire body is an int8 matmul nest (`{ for i in 0..M { … } }`) — the
@@ -27940,6 +27994,7 @@ fn xent_bwd_fn(
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
+        layout_error: Cell::new(false),
         sema,
         interner,
         diags: &mut diags,
@@ -27988,6 +28043,7 @@ fn xent_fn(
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
+        layout_error: Cell::new(false),
         sema,
         interner,
         diags: &mut diags,
@@ -28044,6 +28100,7 @@ fn logsumexp_fn(
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
+        layout_error: Cell::new(false),
         sema,
         interner,
         diags: &mut diags,
@@ -28188,6 +28245,7 @@ fn probe_single_for(
         builder: Builder::new(f.name.sym, MirType::I64),
         preserve_aggregate_blocks: false,
         const_lengths: RefCell::default(),
+        layout_error: Cell::new(false),
         sema,
         interner,
         diags: &mut diags,
@@ -29219,6 +29277,7 @@ fn lower_i8matmul_fn(
         builder: Builder::new(f.name.sym, ret_mir.clone()),
         preserve_aggregate_blocks: ret_mir.is_float(),
         const_lengths: RefCell::default(),
+        layout_error: Cell::new(false),
         sema,
         interner,
         diags,
@@ -29275,7 +29334,7 @@ fn lower_i8matmul_fn(
             }
         }
     }
-    Some(fl.builder.finish())
+    Some(fl.finish())
 }
 
 /// A captured recipe for the 256-bit AVX2 vectorizer (`build_vec_recipe`): the flat op body plus the
@@ -29997,6 +30056,47 @@ mod tests {
         assert!(sdiags.iter().all(|d| !d.is_error()), "sema: {sdiags:?}");
         let (prog, diags) = lower_program(&module, &sema, &mut interner);
         (prog, diags, interner)
+    }
+
+    #[test]
+    fn aggregate_layout_overflow_after_generic_substitution() {
+        for source in [
+            "fn make<T>(a: T) { let t: (T, i32); } fn f(a: [i64;4000000000]) { make(a); }",
+            "fn make<T>(a: T) { let t: [[T;4000000000];4000000000]; } fn f(a: i64) { make(a); }",
+        ] {
+            let (_, diags, _) = lower(source);
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| d.code == Some("E0401") && d.message.contains("aggregate layout")),
+                "{source}: {diags:?}"
+            );
+        }
+        let (program, diags, _) =
+            lower("fn make<T>(a: T) { let t: (T, i32); } fn f(a: [i64;0]) { make(a); }");
+        assert!(diags.is_empty(), "{diags:?}");
+        for function in &program.funcs {
+            assert!(verify_function(function).is_empty());
+        }
+    }
+
+    #[test]
+    fn aggregate_layout_overflow_checked_mir_sizes() {
+        let inner = MirType::Array(Box::new(MirType::I64), 4_000_000_000);
+        let huge = MirType::Array(Box::new(inner), 4_000_000_000);
+        assert_eq!(checked_mir_byte_size(&huge), None);
+        assert_eq!(mir_byte_size(&huge), u64::MAX);
+        assert_eq!(mir_tuple_byte_size(&[huge, MirType::I32]), None);
+        assert_eq!(round_up(u64::MAX, 8), None);
+        assert_eq!(round_up(u64::MAX - 7, 8), Some(u64::MAX - 7));
+        let zero = MirType::Array(
+            Box::new(MirType::Array(Box::new(MirType::I64), 0)),
+            u32::MAX,
+        );
+        assert_eq!(checked_mir_byte_size(&zero), Some(0));
+        // A zero-sized i64 array still gives the tuple 8-byte alignment.
+        assert_eq!(mir_tuple_byte_size(&[zero, MirType::I32]), Some(8));
+        assert_eq!(mir_tuple_byte_size(&[MirType::I8, MirType::I64]), Some(16));
     }
 
     /// Does function `f` contain a call to a function named `callee`?
