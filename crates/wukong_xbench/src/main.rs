@@ -10790,7 +10790,6 @@ mod tests {
         // be granted to a helper that does not earn it.
         const PAIR_HELPERS: &[&str] = &[
             "bench_c_cpp",
-            "bench_c_cpp4",
             "bench_c_cpp_i8",
             "bench_c_cpp_bf16",
             "bench_c_cpp_halfout",
@@ -10845,7 +10844,7 @@ mod tests {
         // Split so the base names are not present contiguously in the text being scanned. (Belt and
         // braces — the `#[cfg(test)]` cut above already excludes this module.)
         let bases = [concat!("bench_", "external"), concat!("build_", "peer")];
-        let (mut defs, mut calls, mut c_ext, mut exempt) = (0usize, 0usize, 0usize, Vec::new());
+        let (mut defs, mut calls, mut c_ext, mut exempt) = (Vec::new(), 0usize, 0usize, Vec::new());
         let mut unpaired: Vec<String> = Vec::new();
         for base in bases {
             let mut pos = 0usize;
@@ -10868,7 +10867,7 @@ mod tests {
                     continue; // a doc-comment mention or a bare fn-item reference, not a call
                 }
                 if scan[..abs].ends_with("fn ") {
-                    defs += 1;
+                    defs.push(name);
                     continue;
                 }
                 calls += 1;
@@ -10900,14 +10899,21 @@ mod tests {
             "these benches take a C column WITHOUT a C++ twin — use bench_c_cpp*(…) instead:\n{}",
             unpaired.join("\n")
         );
-        // Floors, so that renaming/deleting the things being scanned cannot make the assertion
-        // above pass by finding nothing. 6 definitions (5 `bench_external*` ABI families plus
-        // `build_peer`), 65 calls, 16 of them C-ext and 8 of those exempt (5 `_omp` + 3 `_fast`)
-        // at the time of writing.
+        // Pin the live definition names, not just their count: removing the obsolete
+        // four-pointer compile-and-time wrapper must not hide any other ABI family.
+        defs.sort_unstable();
         assert_eq!(
-            defs, 6,
-            "expected the 5 bench_external* ABI families plus build_peer, found {defs} definitions"
+            defs,
+            [
+                "bench_external",
+                "bench_external_bf16",
+                "bench_external_halfout",
+                "bench_external_i8",
+                "build_peer"
+            ],
+            "peer builder inventory changed; inspect every ABI family"
         );
+        // Floors prevent a scan that matches nothing from passing vacuously.
         assert!(
             calls >= 58,
             "only {calls} peer call sites — did the scan stop matching?"
@@ -10925,7 +10931,7 @@ mod tests {
         );
         // …and a floor on the pairs themselves, so deleting every pair call is loud too.
         let pairs = SRC.matches(concat!("bench_c_cpp", "(")).count()
-            + SRC.matches(concat!("bench_c_cpp", "4(")).count()
+            + SRC.matches(concat!("build_c_cpp", "(")).count()
             + SRC.matches(concat!("bench_c_cpp", "_i8(")).count()
             + SRC.matches(concat!("bench_c_cpp", "_bf16(")).count()
             + SRC.matches(concat!("bench_c_cpp", "_halfout(")).count();
