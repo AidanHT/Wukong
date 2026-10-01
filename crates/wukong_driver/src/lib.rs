@@ -137,6 +137,8 @@ pub struct GradOptions {
     pub train_steps: usize,
     /// Learning rate for the training loop (`--train-lr=<f>`).
     pub train_lr: f32,
+    /// Decoupled weight decay for AdamW (`--train-weight-decay=<f>`).
+    pub train_weight_decay: f32,
     /// Which optimizer the training loop uses (`--train-opt=sgd|adamw`).
     pub train_opt: TrainOpt,
     /// Seed for the deterministic buffer initialization the training loop uses (`--train-seed=<u64>`).
@@ -151,6 +153,7 @@ impl Default for GradOptions {
             train: false,
             train_steps: 100,
             train_lr: 0.01,
+            train_weight_decay: 0.0,
             train_opt: TrainOpt::Sgd,
             train_seed: 0x5EED_1234,
         }
@@ -1531,8 +1534,13 @@ fn run_train(
                 TrainOpt::Sgd => "sgd",
                 TrainOpt::AdamW => "adamw",
             };
+            let decay = if opts.grad.train_weight_decay == 0.0 {
+                String::new()
+            } else {
+                format!(", weight_decay={}", opts.grad.train_weight_decay)
+            };
             out.push_str(&format!(
-                "train: {} step(s), lr={}, optimizer={opt}\n",
+                "train: {} step(s), lr={}, optimizer={opt}{decay}\n",
                 traj.len().saturating_sub(1),
                 opts.grad.train_lr
             ));
@@ -1570,6 +1578,14 @@ fn train_loop(
 ) -> Result<Vec<f32>, String> {
     use wukong_autodiff::optim::{self, hp};
     use wukong_mir::Program;
+
+    let weight_decay = opts.grad.train_weight_decay;
+    if !weight_decay.is_finite() || weight_decay < 0.0 {
+        return Err("--train-weight-decay must be finite and non-negative".into());
+    }
+    if weight_decay != 0.0 && opts.grad.train_opt != TrainOpt::AdamW {
+        return Err("nonzero --train-weight-decay requires --train-opt=adamw".into());
+    }
 
     let name = opts.grad.of.clone().unwrap_or_else(|| "loss".to_string());
     let fsym = interner.intern(&name);
@@ -1670,7 +1686,7 @@ fn train_loop(
                 hpbuf[hp::BETA1] = beta1 as f32;
                 hpbuf[hp::BETA2] = beta2 as f32;
                 hpbuf[hp::EPS] = eps as f32;
-                hpbuf[hp::WD] = 0.0;
+                hpbuf[hp::WD] = weight_decay;
                 hpbuf[hp::BC1] = (1.0 - beta1.powi(t)) as f32;
                 hpbuf[hp::BC2] = (1.0 - beta2.powi(t)) as f32;
                 for (i, &wi) in wrt.iter().enumerate() {
@@ -2455,6 +2471,7 @@ mod grad_cli_tests {
                 train: true,
                 train_steps: steps,
                 train_lr: lr,
+                train_weight_decay: 0.0,
                 train_opt: opt,
                 train_seed: seed,
             },

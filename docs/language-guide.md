@@ -854,6 +854,7 @@ wukongc [OPTIONS] <input.wk>
 --train-lr=<f>        learning rate                                        (default: 0.01)
 --train-opt=<o>       sgd | adamw                                          (default: sgd)
 --train-seed=<n>      seed for the deterministic buffer initialization      (default: 0x5EED1234)
+--train-weight-decay=<f>  AdamW decoupled decay; finite, non-negative       (default: 0)
 -O0|-O1|-O2|-O3       optimization level (default: -O0; -O3 currently runs the -O2 pipeline)
 -o <path>             write the artifact to <path> — only with --emit=obj or --emit=exe (default:
                       <stem>.o for objects; executables get <stem>.exe on Windows and plain <stem>

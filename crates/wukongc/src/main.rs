@@ -23,6 +23,7 @@ OPTIONS:
     --train            Run a fwd->bwd->optimizer loop on the loss fn and print the loss trajectory
     --train-steps=<n>  Number of training steps  (default: 100)
     --train-lr=<f>     Learning rate  (default: 0.01)
+    --train-weight-decay=<f>  AdamW decoupled weight decay, finite and >= 0 (default: 0)
     --train-opt=<o>    Optimizer: sgd, adamw  (default: sgd)
     --train-seed=<n>   Seed for deterministic buffer initialization
     --run              Compile and run (interpreter by default; see --backend)
@@ -179,6 +180,15 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 opts.grad.train_lr = v
                     .parse()
                     .map_err(|_| format!("--train-lr expects a float, got `{v}`"))?;
+            }
+            _ if arg.starts_with("--train-weight-decay=") => {
+                let v = &arg["--train-weight-decay=".len()..];
+                opts.grad.train_weight_decay = v
+                    .parse()
+                    .map_err(|_| format!("--train-weight-decay expects a float, got `{v}`"))?;
+                if !opts.grad.train_weight_decay.is_finite() || opts.grad.train_weight_decay < 0.0 {
+                    return Err("--train-weight-decay must be finite and non-negative".into());
+                }
             }
             _ if arg.starts_with("--train-opt=") => {
                 let v = &arg["--train-opt=".len()..];
