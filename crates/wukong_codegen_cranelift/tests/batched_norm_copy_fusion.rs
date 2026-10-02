@@ -529,3 +529,118 @@ fn a_shadowed_row_binding_keeps_the_actual_access_pattern() {
         }
     }
 }
+
+#[test]
+fn affine_struct_fields_preserve_dispatch_and_exact_lanes() {
+    for slice in [false, true] {
+        for copy in [false, true] {
+            for parallel in [false, true] {
+                let gamma_type = if slice { "[]f32" } else { "[f32; 4]" };
+                let view = if slice { "let view: []f32 = g;" } else { "" };
+                let gamma_value = if slice { "view" } else { "g" };
+                let attribute = if parallel { "@parallel" } else { "" };
+                let copy_loop = if copy {
+                    "for c in 0..8 { out[c] = input[c]; }"
+                } else {
+                    ""
+                };
+                let source = format!(
+                    "struct Weights {{ gamma: {gamma_type} }}
+                     {attribute} fn entry(input: [f32; 8], mut out: [f32; 8]) {{
+                        let g: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+                        {view}
+                        let weights: Weights = Weights {{ gamma: {gamma_value} }};
+                        {copy_loop}
+                        for r in 0..2 {{
+                            let mut s: f32 = 0.0;
+                            for i in 0..4 {{ s = s + out[r*4+i] * out[r*4+i]; }}
+                            let inv: f32 = rsqrt(s / 4.0 + 0.0);
+                            for i in 0..4 {{ out[r*4+i] = out[r*4+i] * inv * weights.gamma[i]; }}
+                        }}
+                     }}"
+                );
+                // Both rows have sum of squares16 and RMS2. Gamma is [1,2,3,4].
+                let initial = vec![2.0f32, 2.0, 2.0, 2.0, 4.0, 0.0, 0.0, 0.0];
+                let expected = [1.0f32, 2.0, 3.0, 4.0, 2.0, 0.0, 0.0, 0.0];
+                for recognize in [false, true] {
+                    let label = format!(
+                        "slice={slice} copy={copy} parallel={parallel} recognize={recognize}"
+                    );
+                    let (program, mut interner) = lower(&source, recognize);
+                    let entry = interner.intern("entry");
+                    let calls: Vec<_> = program
+                        .funcs
+                        .iter()
+                        .flat_map(|f| &f.blocks)
+                        .flat_map(|b| &b.insts)
+                        .filter_map(|inst| {
+                            if let Op::Call { func, args } = &inst.op {
+                                let name = interner.resolve(*func);
+                                name.starts_with("wukong_norm_").then_some((name, args))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if recognize {
+                        assert_eq!(
+                            calls.len(),
+                            1,
+                            "{label}: field access must not lose dispatch"
+                        );
+                        assert_eq!(
+                            calls[0].0,
+                            if parallel {
+                                "wukong_norm_affine_f32_parallel"
+                            } else {
+                                "wukong_norm_affine_f32"
+                            },
+                            "{label}"
+                        );
+                        assert_eq!(calls[0].1[0] != calls[0].1[1], copy, "{label}: copy fusion");
+                    } else {
+                        assert!(calls.is_empty(), "{label}");
+                    }
+                    for level in [0, 2] {
+                        let mut optimized = program.clone();
+                        wukong_opt::optimize_verified(&mut optimized, level).unwrap();
+                        let mut interpreted_input = initial.clone();
+                        let mut interpreted = if copy { vec![-9.0; 8] } else { initial.clone() };
+                        wukong_interp::run_kernel_f32(
+                            &optimized,
+                            entry,
+                            &mut [&mut interpreted_input, &mut interpreted],
+                            &interner,
+                        )
+                        .unwrap();
+                        let module =
+                            wukong_codegen_cranelift::jit_module(&optimized, &interner).unwrap();
+                        let function: unsafe extern "C" fn(*const f32, *mut f32) =
+                            unsafe { std::mem::transmute(module.func_ptr(entry).unwrap()) };
+                        let native_input = initial.clone();
+                        let mut native = if copy { vec![-9.0; 8] } else { initial.clone() };
+                        unsafe { function(native_input.as_ptr(), native.as_mut_ptr()) };
+                        for (backend, actual, preserved) in [
+                            ("interpreter", interpreted, interpreted_input),
+                            ("native", native, native_input),
+                        ] {
+                            for (lane, (actual, expected)) in
+                                actual.iter().zip(&expected).enumerate()
+                            {
+                                assert_eq!(
+                                    actual.to_bits(),
+                                    expected.to_bits(),
+                                    "{label} O{level} {backend} lane{lane}"
+                                );
+                            }
+                            assert_eq!(
+                                preserved, initial,
+                                "{label} O{level} {backend}: source changed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
