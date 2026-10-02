@@ -8317,6 +8317,11 @@ impl FnLowerer<'_> {
                 ExprKind::Index { base, indices } => {
                     expr_fits(me, base, extent) && indices.iter().all(|e| expr_fits(me, e, extent))
                 }
+                // Affine weights may live in aggregate fields. A projection adds no
+                // row-index arithmetic; still inspect its base and the type check above.
+                ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+                    expr_fits(me, base, extent)
+                }
                 ExprKind::Call { args, .. } => args.iter().all(|e| expr_fits(me, e, extent)),
                 _ => false,
             }
