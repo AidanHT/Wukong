@@ -177,7 +177,7 @@ io_roundtrip_i8.wk: wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_f
 io_roundtrip_u8.wk: wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2 wukong_rt_read_u8 wukong_rt_write_u8
 kd_loss.wk: wukong_kd_loss_f32
 kldiv.wk: wukong_kldiv_f32
-l2norm.wk: wukong_norm_f32 wukong_norm_f32*2 wukong_velem_f32
+l2norm.wk: wukong_norm_f32 wukong_norm_f32*2
 labeled_loop.wk:
 lang_generic_copy.wk: veckernel*1 wukong_velem_f32
 lang_generic_naive_gemm.wk: wukong_sgemm
