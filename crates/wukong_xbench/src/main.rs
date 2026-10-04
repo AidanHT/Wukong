@@ -373,7 +373,16 @@ fn bench_c_cpp_bf16(
     let (c, cpp) = abba_min(&cl, &pl, |lib, compile| {
         time_peer_bf16(lib, compile, &mut *out, xp, yp)
     });
-    let cpp = cpp.and_then(|p| match &c {
+    let cpp = cpp_checked_bf16(label, &c, cpp);
+    (c, cpp)
+}
+
+fn cpp_checked_bf16(
+    label: &str,
+    c: &Option<MeasureBf16>,
+    cpp: Option<MeasureBf16>,
+) -> Option<MeasureBf16> {
+    cpp.and_then(|p| match c {
         Some(cm) => {
             let rel = ((cm.out - p.out).abs() / cm.out.abs().max(1e-6)) as f64;
             if rel > 1e-3 {
@@ -384,8 +393,7 @@ fn bench_c_cpp_bf16(
             }
         }
         None => Some(p),
-    });
-    (c, cpp)
+    })
 }
 
 /// [`bench_c_cpp`] for the all-half streaming ABI ([`bench_external_halfout`]). The snapshot is the
@@ -488,6 +496,10 @@ fn bench_bf16_fast(
         xp,
         yp,
     )?;
+    bf16_fast_checked(label, m, cf)
+}
+
+fn bf16_fast_checked(label: &str, m: &MeasureBf16, cf: MeasureBf16) -> Option<MeasureBf16> {
     let rel = ((m.out - cf.out).abs() / cf.out.abs().max(1e-6)) as f64;
     if rel > 1e-2 {
         println!(
@@ -824,66 +836,8 @@ fn main() {
         let mut out: Vec<f32> = vec![0.0; N];
         let (xp, yp): (*const f32, *const f32) = (x.as_ptr(), y.as_mut_ptr());
 
-        let wukong = bench_wukong(&k.wuk, &mut out, xp, yp);
-        let (c, cpp) = bench_c_cpp(
-            k.name,
-            &k.c,
-            &dir,
-            &cc,
-            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
-            &mut out,
-            xp,
-            yp,
-        );
-        let rust = bench_external(
-            "rs",
-            &k.rust,
-            &dir,
-            k.name,
-            "rustc",
-            &[
-                "-Copt-level=3",
-                "-Ctarget-cpu=native",
-                "--crate-type=cdylib",
-            ],
-            &mut out,
-            xp,
-            yp,
-        );
-        // The relaxed-FP C(fast) peer (same C source, -ffast-math) runs only for the
-        // reduction-bearing rows — the ones whose honest-flags C column is IEEE-serial and therefore
-        // inflated (see the fairness notes). Cross-checked at the loose 1e-2 bar inside.
-        let cfast = if is_reduction_kernel(k.name) {
-            bench_c_fast(k.name, &k.c, &dir, &cc, &wukong, &mut out, xp, yp)
-        } else {
-            None
-        };
-        // The multithreaded C(omp) peer for the @parallel rows: the same kernel under
-        // `#pragma omp parallel for` (probed once; skipped with a note when this gcc/loader can't
-        // run OpenMP DLLs). Reduction rows also get -ffast-math — an OpenMP reduction clause
-        // already reassociates, so the label stays C(omp). Loose-checked like C(fast).
-        let comp = c_omp_source(k.name).and_then(|src| {
-            omp_threads(&cc, &dir)?;
-            let flags = if is_reduction_kernel(k.name) {
-                C_OMP_FAST_FLAGS
-            } else {
-                C_OMP_FLAGS
-            };
-            let cm = bench_external(
-                "c",
-                &src,
-                &dir,
-                &format!("{}_omp", k.name),
-                &cc,
-                flags,
-                &mut out,
-                xp,
-                yp,
-            )?;
-            wukong
-                .as_ref()
-                .and_then(|m| relaxed_peer_ok(k.name, "C(omp)", m, &cm).then_some(cm))
-        });
+        let (wukong, c, cpp, rust, cfast, comp, vml) =
+            bench_table_kernel(k, &cc, &dir, &mut out, xp, yp);
 
         println!("=== {} ({}) ===", k.name, k.note);
         report(k, &wukong, &c, &cpp, &rust, &cfast, &comp);
@@ -891,14 +845,7 @@ fn main() {
         // of the GEMM-vs-cblas comparison. Wukong's hand-AVX2 vmath vs Intel's hand-tuned VML, both
         // single-thread, same buffer. Cross-checked against Wukong's output (a large rel error would
         // expose a VML ABI mismatch — then the column is dishonest, so it is dropped with a note).
-        let vml_fn = match k.name {
-            "exp" => mkl().and_then(|a| a.vs_exp),
-            "log" => mkl().and_then(|a| a.vs_ln),
-            "tanh" => mkl().and_then(|a| a.vs_tanh),
-            _ => None,
-        };
-        if let (Some(f), Some(m)) = (vml_fn, &wukong) {
-            let v = bench_vml(f, xp, &mut out);
+        if let (Some(v), Some(m)) = (vml, &wukong) {
             let (rel, at) = max_rel_err(&m.out, &v.out);
             if rel > 1e-3 {
                 println!(
@@ -919,8 +866,8 @@ fn main() {
                 // re-runs the peer through `vmlSetMode(VML_LA)` — measured at 2 ULP exp / 4 ULP log,
                 // where Wukong measures 2 and 4 — and at that matched accuracy exp and log come out
                 // a TIE (2026-08-06). This row has NOT been re-measured that way, and it also times
-                // each arm in its own tight rep-block rather than rotating them, so it is a
-                // different cache regime as well. Treat it as an upper bound, not a standing.
+                // each arm in its own tight rep-block, so it is a different cache regime from the
+                // in-crate matched-accuracy probe. Treat it as an upper bound, not a standing.
                 println!(
                     "     (VML here runs in its DEFAULT ~0.5-ULP HA mode — NOT accuracy-matched \
                      against Wukong's ≤2 ULP exp / ≤12 ULP log / ≤1 ULP tanh. At matched accuracy \
@@ -1137,6 +1084,104 @@ fn main() {
     }
 }
 
+/// Build all table peers, including optional VML, before rotating their fixed slots.
+/// The shared scratch pointer has the same provenance as the original table runner.
+#[allow(clippy::type_complexity)]
+fn bench_table_kernel(
+    k: &Kernel,
+    cc: &str,
+    dir: &Path,
+    out: &mut [f32],
+    xp: *const f32,
+    yp: *const f32,
+) -> (
+    Option<Measure>,
+    Option<Measure>,
+    Option<Measure>,
+    Option<Measure>,
+    Option<Measure>,
+    Option<Measure>,
+    Option<Measure>,
+) {
+    let wk = build_wukong(&k.wuk, 3);
+    let (cl, pl) = build_c_cpp(
+        k.name,
+        &k.c,
+        dir,
+        cc,
+        &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+    );
+    let rl = build_peer(
+        "rs",
+        &k.rust,
+        dir,
+        k.name,
+        "rustc",
+        &[
+            "-Copt-level=3",
+            "-Ctarget-cpu=native",
+            "--crate-type=cdylib",
+        ],
+    );
+    let fl = if is_reduction_kernel(k.name) {
+        build_peer(
+            "c",
+            &k.c,
+            dir,
+            &format!("{}_fast", k.name),
+            cc,
+            C_FAST_FLAGS,
+        )
+    } else {
+        None
+    };
+    let ol = c_omp_source(k.name).and_then(|src| {
+        omp_threads(cc, dir)?;
+        let flags = if is_reduction_kernel(k.name) {
+            C_OMP_FAST_FLAGS
+        } else {
+            C_OMP_FLAGS
+        };
+        build_peer("c", &src, dir, &format!("{}_omp", k.name), cc, flags)
+    });
+    let vml_fn = match k.name {
+        "exp" => mkl().and_then(|a| a.vs_exp),
+        "log" => mkl().and_then(|a| a.vs_ln),
+        "tanh" => mkl().and_then(|a| a.vs_tanh),
+        _ => None,
+    };
+    let columns = [
+        Built::wk(wk),
+        Built::peer(cl),
+        Built::peer(pl),
+        Built::peer(rl),
+        Built::peer(fl),
+        Built::peer(ol),
+        match vml_fn {
+            Some(f) => Built::Direct(Box::new(move |o| Some(bench_vml(f, xp, o)))),
+            None => Built::Missing,
+        },
+    ];
+    let mut timed =
+        abba_min_columns(columns.len(), |i| time_built(&columns[i], out, xp, yp)).into_iter();
+    let wukong = timed.next().flatten();
+    let c = timed.next().flatten();
+    let cpp = cpp_checked(k.name, &c, timed.next().flatten());
+    let rust = timed.next().flatten();
+    let cfast = timed.next().flatten().filter(|p| {
+        wukong
+            .as_ref()
+            .is_some_and(|m| relaxed_peer_ok(k.name, "C(fast)", m, p))
+    });
+    let comp = timed.next().flatten().filter(|p| {
+        wukong
+            .as_ref()
+            .is_some_and(|m| relaxed_peer_ok(k.name, "C(omp)", m, p))
+    });
+    let vml = timed.next().flatten();
+    (wukong, c, cpp, rust, cfast, comp, vml)
+}
+
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
 /// regime where a tensor compiler should genuinely beat idiomatic scalar-source code. We benchmark
 /// an `ikj`-ordered C = A·B (the cache-friendly idiom that auto-vectorizes well) written the same
@@ -1189,10 +1234,8 @@ fn bench_matmul(cc: &str, dir: &Path, roof: f64) {
 /// missing C++ column, one table over. They are naive `ijk` NT nests ([`c_linear_rect`]), the exact
 /// spelling the square section uses, so the two tables' C columns mean the same thing.
 ///
-/// Thermal order follows the standing law: the single-core group first (Wuk(1c), MKL(1c) adjacent,
-/// then the naive C/C++/Rust peers at its TAIL — the same placement `bench_matmul_size` uses, so
-/// their long scalar runs pollute no library number), then MKL(all), then Wuk(par) LAST — residual
-/// heat lands on Wukong, never the peer.
+/// Build every column first, then rotate all peers through forward/reverse positions.
+/// Missing optional peers retain their slots.
 fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
     for (m, k, n) in [
         (128usize, 768usize, 768usize),
@@ -1215,20 +1258,25 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
         println!(
             "=== matmul_skinny {m}x{k} · ({n}x{k})ᵀ (nn.Linear NT; GFLOP/s, higher is better) ==="
         );
-        let wuk = bench_wukong(&wk_linear_rect(m, k, n, false), &mut c, ap, bp);
-        let mkl_1c = bench_mm_mkl_rect(m, k, n, true, 1, &a, &b, &mut c);
-        // Naive single-core peers, at the tail of the single-core group.
-        let (cm, cm_cpp) = bench_c_cpp(
+        // Build every column before the shared position-balanced rotation.
+        let wk1 = build_wukong(&wk_linear_rect(m, k, n, false), 3);
+        let wkp = build_wukong(&wk_linear_rect(m, k, n, true), 3);
+        let (cl, pl) = build_c_cpp(
             "linear_rect",
             &c_linear_rect(m, k, n),
             dir,
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
-            &mut c,
-            ap,
-            bp,
         );
-        let rm = bench_external(
+        let fl = build_peer(
+            "c",
+            &c_linear_rect(m, k, n),
+            dir,
+            "linear_rect_fast",
+            cc,
+            C_FAST_FLAGS,
+        );
+        let rl = build_peer(
             "rs",
             &rust_linear_rect(m, k, n),
             dir,
@@ -1239,27 +1287,40 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut c,
-            ap,
-            bp,
         );
-        // The reassociation-normalized C column: the inner K-dot is an IEEE-serial float reduction at
-        // honest flags, and Wukong's tiled kernel accumulates it in a blocked (reassociated) order —
-        // the same disclosure the square GEMM sections carry.
-        let cfast = bench_c_fast(
-            "linear_rect",
-            &c_linear_rect(m, k, n),
-            dir,
-            cc,
-            &wuk,
-            &mut c,
-            ap,
-            bp,
-        );
-        let mkl_all = mkl()
-            .map(|api| api.max_threads)
-            .and_then(|t| bench_mm_mkl_rect(m, k, n, true, t, &a, &b, &mut c));
-        let wk_par = bench_wukong(&wk_linear_rect(m, k, n, true), &mut c, ap, bp);
+        let (ar, br) = (&a[..], &b[..]);
+        let mkl_all_threads = mkl().map(|api| api.max_threads);
+        let columns = [
+            Built::wk(wk1),
+            Built::wk(wkp),
+            Built::peer(cl),
+            Built::peer(pl),
+            Built::peer(fl),
+            Built::peer(rl),
+            Built::Direct(Box::new(move |o| {
+                bench_mm_mkl_rect(m, k, n, true, 1, ar, br, o)
+            })),
+            match mkl_all_threads {
+                Some(t) => Built::Direct(Box::new(move |o| {
+                    bench_mm_mkl_rect(m, k, n, true, t, ar, br, o)
+                })),
+                None => Built::Missing,
+            },
+        ];
+        let mut timed =
+            abba_min_columns(columns.len(), |i| time_built(&columns[i], &mut c, ap, bp))
+                .into_iter();
+        let wuk = timed.next().flatten();
+        let wk_par = timed.next().flatten();
+        let cm = timed.next().flatten();
+        let cm_cpp = cpp_checked("linear_rect", &cm, timed.next().flatten());
+        let cfast = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("linear_rect", "C(fast)", m, p))
+        });
+        let rm = timed.next().flatten();
+        let mkl_1c = timed.next().flatten();
+        let mkl_all = timed.next().flatten();
         println!(
             "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
             "",
@@ -1350,49 +1411,24 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
             .unwrap_or_else(|| "n/a".into())
     };
 
-    // Measurement ordering is thermal hygiene (the honesty law). On this hybrid laptop a multi-second
-    // all-core run heat-throttles the chip for ~seconds after it, so WHO RUNS BEFORE WHOM decides
-    // whether a peer ratio is fair. Two groups, coolest-first:
-    //  (1) the single-core group — Wuk(1c), MKL(1c), tuned, then the naive C/Rust/C(fast) nests —
-    //      each internally warmed and single-threaded (one core barely heats the package even at
-    //      2048³), so every single-core peer is measured in the same near-cold state. Wuk(1c) and
-    //      MKL(1c) stay ADJACENT at the head (the documented MKL(1c) protection: the old order once
-    //      ran MKL(1c) *last*, after the all-core burst + naive nests, throttling it to a bogus
-    //      32 GFLOP/s at 4096³). The naive nests were previously measured dead-LAST — *after* the
-    //      all-core Wuk(par)/MKL(all) bursts — so they could run heat-throttled, which understated
-    //      them and overstated Wukong's ratio (the fairness-audit finding). They now close out the
-    //      single-core group: measured in the same thermal group as Wuk(1c), before any all-core
-    //      burst, and after the library peers so their long scalar runs pollute no library number.
-    //      They are still skipped at ≥2048³ where a single call is tens of seconds (their loss is
-    //      already overwhelming and widening at ≤1024³; set XBENCH_NAIVE_HUGE to force them) — there
-    //      correctness is cross-checked against MKL instead of C.
-    //  (2) the all-core group — MKL(all), then C(omp), then Wuk(par) LAST. Wuk(1c)/tuned/naive use
-    //      serial kernels that never touch rayon, so rayon's global pool is still DORMANT when
-    //      MKL(all) runs: otherwise-idle cores, no rival thread pool, the coolest available all-core
-    //      state (its documented protection — the only heat before it is single-core heat). Wuk(par)
-    //      runs after every peer, inheriting whatever residual heat exists, so the Wuk/MKL and
-    //      Wuk/C(omp) all-core ratios are CONSERVATIVE lower bounds on Wukong — we throttle
-    //      ourselves, never the competitor, the honest direction when two all-core runs cannot both
-    //      be cool. (An earlier interleaved A/B timer was reproducibility-fragile: alternating two
-    //      live thread pools thrashes the OS scheduler and MKL's OpenMP workers park between blocks,
-    //      reading a bogus sub-1-thread number.)
-    let wuk = bench_wukong(&wk_matmul(ns, false), &mut c, ap, bp);
-    let mkl_1c = bench_mm_mkl(ns, false, 1, &a, &b, &mut c);
-    let tuned = bench_mm_tuned(ns, false, &a, &b, &mut c);
+    // Slot balance does not establish thermal equivalence: an earlier interleaved GEMM
+    // timer suffered rival Rayon/OpenMP pool scheduling and residual all-core heat. Retain
+    // the campaign's idle, AC-powered measurement gate and MKL(all) withdrawal until a
+    // controlled rerun establishes comparability; reversal alone cannot remove carry-over.
+    // Build every column before the shared position-balanced rotation.
+    let wk1 = build_wukong(&wk_matmul(ns, false), 3);
+    let wkp = build_wukong(&wk_matmul(ns, true), 3);
     let run_naive = ns < 2048 || std::env::var("XBENCH_NAIVE_HUGE").is_ok();
-    // Naive single-core peers — the tail of the single-core group (see the ordering comment).
-    let (cm, cm_cpp, rm, cfast) = if run_naive {
-        let (cm, cm_cpp) = bench_c_cpp(
+    let (cl, pl, fl, rl) = if run_naive {
+        let (cl, pl) = build_c_cpp(
             "matmul",
             &c_matmul(ns),
             dir,
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
-            &mut c,
-            ap,
-            bp,
         );
-        let rm = bench_external(
+        let fl = build_peer("c", &c_matmul(ns), dir, "matmul_fast", cc, C_FAST_FLAGS);
+        let rl = build_peer(
             "rs",
             &rust_matmul(ns),
             dir,
@@ -1403,49 +1439,57 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut c,
-            ap,
-            bp,
         );
-        // The reassociation-normalized C peer: the same naive source at -ffast-math (gcc may
-        // reassociate/vectorize more aggressively). Loose-checked vs Wukong inside; the column is
-        // skipped (None) when the fast output can't meet the 1e-2 bar.
-        let cfast = bench_c_fast("matmul", &c_matmul(ns), dir, cc, &wuk, &mut c, ap, bp);
-        (cm, cm_cpp, rm, cfast)
+        (cl, pl, fl, rl)
     } else {
         (None, None, None, None)
     };
-    // The all-core group: MKL(all) first (coolest), then C(omp), then Wuk(par) last.
-    let mkl_all = mkl()
-        .map(|api| api.max_threads)
-        .and_then(|t| bench_mm_mkl(ns, false, t, &a, &b, &mut c));
-    // All-core C(omp) peer (the naive ikj source + `#pragma omp parallel for` on the row loop):
-    // measured inside the all-core group and BEFORE Wuk(par), so any residual heat lands on
-    // Wukong, never the peer. Gated like the other naive-source peers (multi-second at ≥2048³).
-    let comp = if run_naive {
+    let ol = if run_naive {
         omp_threads(cc, dir)
-            .and_then(|_| {
-                bench_external(
-                    "c",
-                    &c_matmul_omp(ns),
-                    dir,
-                    "matmul_omp",
-                    cc,
-                    C_OMP_FLAGS,
-                    &mut c,
-                    ap,
-                    bp,
-                )
-            })
-            .filter(|p| {
-                wuk.as_ref()
-                    .is_some_and(|m| relaxed_peer_ok("matmul", "C(omp)", m, p))
-            })
+            .and_then(|_| build_peer("c", &c_matmul_omp(ns), dir, "matmul_omp", cc, C_OMP_FLAGS))
     } else {
         None
     };
-    let wk_par = bench_wukong(&wk_matmul(ns, true), &mut c, ap, bp);
-
+    let (ar, br) = (&a[..], &b[..]);
+    let mkl_all_threads = mkl().map(|api| api.max_threads);
+    let columns = [
+        Built::wk(wk1),
+        Built::wk(wkp),
+        Built::peer(cl),
+        Built::peer(pl),
+        Built::peer(fl),
+        Built::peer(rl),
+        Built::peer(ol),
+        Built::Direct(Box::new(move |o| bench_mm_mkl(ns, false, 1, ar, br, o))),
+        match mkl_all_threads {
+            Some(t) => Built::Direct(Box::new(move |o| bench_mm_mkl(ns, false, t, ar, br, o))),
+            None => Built::Missing,
+        },
+        Built::Direct(Box::new(move |o| {
+            Some(bench_mm_tuned(ns, false, ar, br, o))
+        })),
+    ];
+    let mut timed =
+        abba_min_columns(columns.len(), |i| time_built(&columns[i], &mut c, ap, bp)).into_iter();
+    let wuk = timed.next().flatten();
+    let wk_par = timed.next().flatten();
+    let cm = timed.next().flatten();
+    let cm_cpp = cpp_checked("matmul", &cm, timed.next().flatten());
+    let cfast = timed.next().flatten().filter(|p| {
+        wuk.as_ref()
+            .is_some_and(|m| relaxed_peer_ok("matmul", "C(fast)", m, p))
+    });
+    let rm = timed.next().flatten();
+    let comp = timed.next().flatten().filter(|p| {
+        wuk.as_ref()
+            .is_some_and(|m| relaxed_peer_ok("matmul", "C(omp)", m, p))
+    });
+    let mkl_1c = timed.next().flatten();
+    let mkl_all = timed.next().flatten();
+    let tuned = timed
+        .next()
+        .flatten()
+        .expect("the in-process tuned GEMM column always returns a measure");
     println!(
         "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "",
@@ -1482,9 +1526,7 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
         );
     }
     // Cross-language correctness: Wukong's C must match the C/gcc reference element-by-element. Uses
-    // the single-core `wuk` (which carries an output snapshot) — the interleaved all-core pair skips
-    // the snapshot (its kernel is proven bit-identical to serial by the runtime unit test, and serial
-    // is the cross-checked `wuk` here), so we validate the serial output and trust the equivalence.
+    // the single-core `wuk`; every timed column also retains its own output snapshot.
     if let (Some(m), Some(c)) = (&wuk, &cm) {
         let (rel, at) = max_rel_err(&m.out, &c.out);
         if rel > 1e-3 {
@@ -2181,25 +2223,18 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
                 .unwrap_or_else(|| "n/a".into())
         };
         println!("=== linear (nn.Linear C=A·Bᵀ) {ns}x{ns} (GFLOP/s, higher is better) ===");
-        // Single-core group, coolest-first (thermal hygiene, mirrors bench_matmul_size): Wuk(1c) and
-        // MKL(1c) adjacent at the head, then tuned, then the naive C/Rust/C(fast) nests. The all-core
-        // group (MKL(all), C(omp), Wuk(par)) runs last so any residual heat lands on Wukong, never a
-        // peer. nn.Linear (C=A·Bᵀ) is the shape that dominates a transformer, so it is now measured
-        // against real oneMKL — the true SOTA bar — not only the naive C nests and the tuned(mm) crate.
-        let wuk = bench_wukong(&wk_linear(ns, false), &mut c, ap, bp);
-        let mkl_1c = bench_mm_mkl(ns, true, 1, &a, &b, &mut c);
-        let tuned = bench_mm_tuned(ns, true, &a, &b, &mut c);
-        let (cm, cm_cpp) = bench_c_cpp(
+        // Build every column before the shared position-balanced rotation.
+        let wk1 = build_wukong(&wk_linear(ns, false), 3);
+        let wkp = build_wukong(&wk_linear(ns, true), 3);
+        let (cl, pl) = build_c_cpp(
             "linear",
             &c_linear(ns),
             dir,
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
-            &mut c,
-            ap,
-            bp,
         );
-        let rm = bench_external(
+        let fl = build_peer("c", &c_linear(ns), dir, "linear_fast", cc, C_FAST_FLAGS);
+        let rl = build_peer(
             "rs",
             &rust_linear(ns),
             dir,
@@ -2210,37 +2245,56 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut c,
-            ap,
-            bp,
         );
-        // Reassociation-normalized peer: with -ffast-math gcc may reassociate + vectorize the
-        // ijk dot-product reduction that the honest-flags column keeps serial.
-        let cfast = bench_c_fast("linear", &c_linear(ns), dir, cc, &wuk, &mut c, ap, bp);
-        // All-core group: MKL(all) first (coolest — rayon still dormant), then C(omp), then Wuk(par) last.
-        let mkl_all = mkl()
-            .map(|api| api.max_threads)
-            .and_then(|t| bench_mm_mkl(ns, true, t, &a, &b, &mut c));
-        // Multithreaded C peer: rows across cores + -ffast-math (the reduction row rule).
-        let comp = omp_threads(cc, dir)
-            .and_then(|_| {
-                bench_external(
-                    "c",
-                    &c_linear_omp(ns),
-                    dir,
-                    "linear_omp",
-                    cc,
-                    C_OMP_FAST_FLAGS,
-                    &mut c,
-                    ap,
-                    bp,
-                )
-            })
-            .filter(|p| {
-                wuk.as_ref()
-                    .is_some_and(|m| relaxed_peer_ok("linear", "C(omp)", m, p))
-            });
-        let wk_par = bench_wukong(&wk_linear(ns, true), &mut c, ap, bp);
+        let ol = omp_threads(cc, dir).and_then(|_| {
+            build_peer(
+                "c",
+                &c_linear_omp(ns),
+                dir,
+                "linear_omp",
+                cc,
+                C_OMP_FAST_FLAGS,
+            )
+        });
+        let (ar, br) = (&a[..], &b[..]);
+        let mkl_all_threads = mkl().map(|api| api.max_threads);
+        let columns = [
+            Built::wk(wk1),
+            Built::wk(wkp),
+            Built::peer(cl),
+            Built::peer(pl),
+            Built::peer(fl),
+            Built::peer(rl),
+            Built::peer(ol),
+            Built::Direct(Box::new(move |o| bench_mm_mkl(ns, true, 1, ar, br, o))),
+            match mkl_all_threads {
+                Some(t) => Built::Direct(Box::new(move |o| bench_mm_mkl(ns, true, t, ar, br, o))),
+                None => Built::Missing,
+            },
+            Built::Direct(Box::new(move |o| Some(bench_mm_tuned(ns, true, ar, br, o)))),
+        ];
+        let mut timed =
+            abba_min_columns(columns.len(), |i| time_built(&columns[i], &mut c, ap, bp))
+                .into_iter();
+        let wuk = timed.next().flatten();
+        let wk_par = timed.next().flatten();
+        let cm = timed.next().flatten();
+        let cm_cpp = cpp_checked("linear", &cm, timed.next().flatten());
+        let cfast = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("linear", "C(fast)", m, p))
+        });
+        let rm = timed.next().flatten();
+        let comp = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("linear", "C(omp)", m, p))
+        });
+        let mkl_1c = timed.next().flatten();
+        let mkl_all = timed.next().flatten();
+        let tuned = timed
+            .next()
+            .flatten()
+            .expect("the in-process tuned GEMM column always returns a measure");
         println!(
             "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
             "",
@@ -4866,19 +4920,25 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
                 .unwrap_or_else(|| "n/a".into())
         };
         println!("=== softmax_bwd (dx = y·(dy − Σ y·dy)) {r}x{c} (GB/s, higher is better) ===");
-        let wuk = bench_wukong(&wk_softmax_bwd(r, c, false), &mut dx, yp, dyp);
-        let wk_par = bench_wukong(&wk_softmax_bwd(r, c, true), &mut dx, yp, dyp);
-        let (cm, cm_cpp) = bench_c_cpp(
+        // Build every column before the shared position-balanced rotation.
+        let wk1 = build_wukong(&wk_softmax_bwd(r, c, false), 3);
+        let wkp = build_wukong(&wk_softmax_bwd(r, c, true), 3);
+        let (cl, pl) = build_c_cpp(
             "softmax_bwd",
             &c_softmax_bwd(r, c),
             dir,
             cc,
             &["-O3", "-march=native", "-shared"],
-            &mut dx,
-            yp,
-            dyp,
         );
-        let rm = bench_external(
+        let fl = build_peer(
+            "c",
+            &c_softmax_bwd(r, c),
+            dir,
+            "softmax_bwd_fast",
+            cc,
+            C_FAST_FLAGS,
+        );
+        let rl = build_peer(
             "rs",
             &rust_softmax_bwd(r, c),
             dir,
@@ -4889,21 +4949,27 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
                 "-Ctarget-cpu=native",
                 "--crate-type=cdylib",
             ],
-            &mut dx,
-            yp,
-            dyp,
         );
-        // Reassociation-normalized peer: -ffast-math lets gcc reassociate the per-row dot.
-        let cfast = bench_c_fast(
-            "softmax_bwd",
-            &c_softmax_bwd(r, c),
-            dir,
-            cc,
-            &wuk,
-            &mut dx,
-            yp,
-            dyp,
-        );
+        let columns = [
+            Built::wk(wk1),
+            Built::wk(wkp),
+            Built::peer(cl),
+            Built::peer(pl),
+            Built::peer(fl),
+            Built::peer(rl),
+        ];
+        let mut timed =
+            abba_min_columns(columns.len(), |i| time_built(&columns[i], &mut dx, yp, dyp))
+                .into_iter();
+        let wuk = timed.next().flatten();
+        let wk_par = timed.next().flatten();
+        let cm = timed.next().flatten();
+        let cm_cpp = cpp_checked("softmax_bwd", &cm, timed.next().flatten());
+        let cfast = timed.next().flatten().filter(|p| {
+            wuk.as_ref()
+                .is_some_and(|m| relaxed_peer_ok("softmax_bwd", "C(fast)", m, p))
+        });
+        let rm = timed.next().flatten();
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -6453,18 +6519,17 @@ fn bench_bf16(cc: &str, dir: &Path) {
                     .map(|x| format!("{:.1}", bytes / x.ns_per_call)) // bytes/ns == GB/s
                     .unwrap_or_else(|| "n/a".into())
             };
-            let wuk = bench_wukong_bf16(&wk_bf16(n, is_dot), &mut o, xp, yp);
-            let (cm, cm_cpp) = bench_c_cpp_bf16(
+            // Compile all five columns before visiting any timing slot.
+            let wk = build_wukong(&wk_bf16(n, is_dot), 3);
+            let (cl, pl) = build_c_cpp(
                 "bf16",
                 &c_bf16(n, is_dot),
                 dir,
                 cc,
                 &["-O3", "-march=native", "-shared"],
-                &mut o,
-                xp,
-                yp,
             );
-            let rm = bench_external_bf16(
+            let fl = build_peer("c", &c_bf16(n, is_dot), dir, "bf16_fast", cc, C_FAST_FLAGS);
+            let rl = build_peer(
                 "rs",
                 &rust_bf16(n, is_dot),
                 dir,
@@ -6475,14 +6540,26 @@ fn bench_bf16(cc: &str, dir: &Path) {
                     "-Ctarget-cpu=native",
                     "--crate-type=cdylib",
                 ],
-                &mut o,
-                xp,
-                yp,
             );
-            // Reassociation-normalized peer: this row IS a float reduction (bf16 in, f32
-            // accumulate) and Wukong folds it 8 lanes wide, so the honest-flags C column is the
-            // in-order sum and C(fast) is the like-for-like one.
-            let cfast = bench_bf16_fast("bf16", &c_bf16(n, is_dot), dir, cc, &wuk, &mut o, xp, yp);
+            let columns = [
+                BuiltBf16::Wukong(wk.map(Box::new)),
+                BuiltBf16::Peer(cl),
+                BuiltBf16::Peer(pl),
+                BuiltBf16::Peer(fl),
+                BuiltBf16::Peer(rl),
+            ];
+            let mut timed = abba_min_columns(columns.len(), |i| {
+                time_built_bf16(&columns[i], &mut o, xp, yp)
+            })
+            .into_iter();
+            let wuk = timed.next().flatten();
+            let cm = timed.next().flatten();
+            let cm_cpp = cpp_checked_bf16("bf16", &cm, timed.next().flatten());
+            let cfast = timed
+                .next()
+                .flatten()
+                .and_then(|cf| bf16_fast_checked("bf16", wuk.as_ref()?, cf));
+            let rm = timed.next().flatten();
             println!(
                 "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
                 kind, "Wukong", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -8286,55 +8363,49 @@ fn bench_wukong_bf16(
     xp: *const u16,
     yp: *const u16,
 ) -> Option<MeasureBf16> {
-    let t = Instant::now();
-    let mut interner = Interner::new();
-    let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
-    if pd.iter().any(|d| d.is_error()) {
-        eprintln!("wukong parse error");
-        return None;
-    }
-    let (sema, sd) = wukong_sema::check(&module, &interner);
-    if sd.iter().any(|d| d.is_error()) {
-        eprintln!("wukong sema error: {sd:?}");
-        return None;
-    }
-    let (mut program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
-    if ld.iter().any(|d| d.is_error()) {
-        eprintln!("wukong lower error: {ld:?}");
-        return None;
-    }
-    wukong_opt::optimize(&mut program, 3);
-    // Dispatch census + persisted source for the non-3-pointer ABIs too - see
-    // `announce_dispatch`. Recognized kernels are gate-blind, and int8 GEMM, bf16
-    // reductions and the half-output streaming rows are all recognizer-dependent.
-    let _ = announce_dispatch(src, &program, &interner);
-    let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("wukong codegen error: {e}");
-            return None;
-        }
-    };
-    let sym = interner.intern("kbench");
-    if !kbench_abi_ok(&program, sym, 3) {
-        return None;
-    }
-    let ptr = handle.func_ptr(sym)?;
-    let compile = t.elapsed();
-    // SAFETY: `kbench_abi_ok` just checked the lowered `kbench` is (ptr, ptr, ptr) -> void,
-    // which is exactly `Bf16KernelFn`; `handle` is kept alive across the call below.
-    let f: Bf16KernelFn = unsafe { std::mem::transmute(ptr) };
+    let jit = build_wukong(src, 3)?;
+    time_wukong_bf16(&jit, out, xp, yp)
+}
 
+/// Time a built bf16-input/f32-output JIT using its checked three-pointer ABI.
+fn time_wukong_bf16(
+    jit: &WukongJit,
+    out: &mut [f32],
+    xp: *const u16,
+    yp: *const u16,
+) -> Option<MeasureBf16> {
+    // SAFETY: build_wukong checked three pointer parameters and void return; the generated
+    // bf16 source establishes the pointee types, and jit owns the code throughout timing.
+    let f: Bf16KernelFn = unsafe { std::mem::transmute(jit.ptr) };
     out[0] = 0.0;
-    let op = out.as_mut_ptr(); // the ONE live pointer to `out` while the kernel runs
+    let op = out.as_mut_ptr();
     let ns = time_ns(|| unsafe { f(xp, yp, op) });
-    let snapshot = out[0];
-    drop(handle); // keep alive through timing
     Some(MeasureBf16 {
-        compile,
+        compile: jit.compile,
         ns_per_call: ns,
-        out: snapshot,
+        out: out[0],
     })
+}
+
+/// Typed scalar-output columns keep unavailable bf16 peers in their original slots.
+enum BuiltBf16 {
+    Wukong(Option<Box<WukongJit>>),
+    Peer(Option<PeerLib>),
+}
+
+fn time_built_bf16(
+    column: &BuiltBf16,
+    out: &mut [f32],
+    xp: *const u16,
+    yp: *const u16,
+) -> Option<MeasureBf16> {
+    match column {
+        BuiltBf16::Wukong(jit) => time_wukong_bf16(jit.as_ref()?, out, xp, yp),
+        BuiltBf16::Peer(peer) => {
+            let (compile, lib) = peer.as_ref()?;
+            time_peer_bf16(lib, *compile, out, xp, yp)
+        }
+    }
 }
 
 /// The bf16 twin of [`bench_external_i8`]: compile a C/Rust bf16 reduction to a shared lib and time it.
@@ -11574,11 +11645,11 @@ mod tests {
         assert_eq!(output, [17.0]);
     }
 
-    /// Norm rows have five columns, or six with both batched Wukong variants.
+    /// Cover norm, bf16, table, skinny GEMM, and square GEMM column counts.
     /// Exercise every absent-peer combination without a compiler, clock, or kernel.
     #[test]
-    fn norm_column_slots_preserve_results_with_missing_peers() {
-        for n in [5usize, 6] {
+    fn position_balanced_column_slots_preserve_results_with_missing_peers() {
+        for n in [5usize, 6, 7, 8, 10] {
             for missing in 0..(1usize << n) {
                 let columns: Vec<Built> = (0..n)
                     .map(|i| {
@@ -11644,6 +11715,10 @@ mod tests {
             concat!("bench_", "wukong4("),
             concat!("bench_", "c_cpp4("),
             concat!("bench_", "external4("),
+            concat!("bench_", "wukong_bf16("),
+            concat!("bench_", "c_cpp_bf16("),
+            concat!("bench_", "external_bf16("),
+            concat!("bench_", "bf16_fast("),
         ];
         // Ways to reach the clock that are NOT a rotation. `abba_min(` is the old two-column
         // A-B-B-A helper: it balances C against C++ and leaves every other column in a fixed slot,
@@ -11652,11 +11727,19 @@ mod tests {
             concat!("time_", "wukong("),
             concat!("time_", "peer("),
             concat!("time_", "peer4("),
+            concat!("time_", "wukong_bf16("),
+            concat!("time_", "peer_bf16("),
             concat!("time_", "ns("),
             concat!("abba_", "min("),
         ];
         for family in [
             "fn bench_matmul_tn(",
+            "fn bench_matmul_size(",
+            "fn bench_matmul_skinny(",
+            "fn bench_linear(",
+            "fn bench_softmax_bwd(",
+            "fn bench_table_kernel(",
+            "fn bench_bf16(",
             "fn bench_gemv(",
             "fn bench_transpose(",
             "fn bench_colsum(",
@@ -11699,10 +11782,18 @@ mod tests {
                 );
             }
             let timing_start = body.find("abba_min_columns(").unwrap();
-            // Each shape loop must finish preparation before its timing statement.
-            // Other converted families may have multiple shape loops, so enforce this
-            // stronger single-schedule rule on the four norm bodies.
-            if family.contains("norm") {
+            // Each newly converted shape loop finishes all preparation before timing.
+            if family.contains("norm")
+                || matches!(
+                    family,
+                    "fn bench_matmul_size("
+                        | "fn bench_matmul_skinny("
+                        | "fn bench_linear("
+                        | "fn bench_softmax_bwd("
+                        | "fn bench_table_kernel("
+                        | "fn bench_bf16("
+                )
+            {
                 for build in ["build_wukong(", "build_c_cpp(", "build_peer("] {
                     assert!(
                         !body[timing_start..].contains(build),
@@ -11710,7 +11801,12 @@ mod tests {
                     );
                 }
             }
-            let timed = body.matches("time_built(").count();
+            let timer = if family == "fn bench_bf16(" {
+                "time_built_bf16("
+            } else {
+                "time_built("
+            };
+            let timed = body.matches(timer).count();
             assert_eq!(
                 timed, rotations,
                 "{family} has {timed} time_built call(s) against {rotations} abba_min_columns \
@@ -11719,7 +11815,7 @@ mod tests {
             );
             // ...and each of them is inside its rotation's own statement, not merely nearby.
             let mut cursor = 0usize;
-            while let Some(rel) = body[cursor..].find("time_built(") {
+            while let Some(rel) = body[cursor..].find(timer) {
                 let at = cursor + rel;
                 let before = &body[..at];
                 let rotation = before.rfind("abba_min_columns(");
@@ -11731,6 +11827,46 @@ mod tests {
                 cursor = at + 1;
             }
         }
+    }
+
+    #[test]
+    fn position_balanced_bf16_missing_slots_and_scalar_gates() {
+        let columns = [
+            BuiltBf16::Wukong(None),
+            BuiltBf16::Peer(None),
+            BuiltBf16::Peer(None),
+            BuiltBf16::Peer(None),
+            BuiltBf16::Peer(None),
+        ];
+        let mut visits = Vec::new();
+        let mut out = [17.0];
+        let measured = abba_min_columns(columns.len(), |i| {
+            visits.push(i);
+            time_built_bf16(&columns[i], &mut out, std::ptr::null(), std::ptr::null())
+        });
+        assert_eq!(visits, [0, 1, 2, 3, 4, 4, 3, 2, 1, 0]);
+        assert!(measured.iter().all(Option::is_none));
+        assert_eq!(out, [17.0]);
+        let scalar = |value| MeasureBf16 {
+            compile: Duration::ZERO,
+            ns_per_call: 1.0,
+            out: value,
+        };
+        assert!(cpp_checked_bf16("fixture", &Some(scalar(1.0)), Some(scalar(1.0005))).is_some());
+        assert!(cpp_checked_bf16("fixture", &Some(scalar(1.0)), Some(scalar(1.002))).is_none());
+        assert!(bf16_fast_checked("fixture", &scalar(1.005), scalar(1.0)).is_some());
+        assert!(bf16_fast_checked("fixture", &scalar(1.02), scalar(1.0)).is_none());
+    }
+
+    #[test]
+    fn position_balanced_table_caller_uses_rotated_vml() {
+        let src = include_str!("main.rs");
+        let start = src.find("fn main(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("bench_table_kernel(k,"));
+        assert!(!body.contains(concat!("bench_", "vml(")));
+        assert!(!body.contains(concat!("bench_", "wukong(")));
+        assert!(body.contains("(vml, &wukong)"));
     }
 
     /// An in-process library column (oneMKL) must go through the SAME rotation as a JIT'd or
