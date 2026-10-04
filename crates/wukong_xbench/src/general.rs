@@ -564,6 +564,46 @@ fn pin_for_section() -> PinGuard {
 // The round-interleaved measurement core, shared by all three programs
 // ---------------------------------------------------------------------------------------------
 
+/// Assign live IDs once while retaining a position for every attempted column build.
+/// Reports keep their original live-only layout; this map controls timing positions only.
+fn keep_column_slots<T>(columns: Vec<Option<T>>) -> (Vec<T>, Vec<Option<usize>>) {
+    let mut live = Vec::new();
+    let slots = columns
+        .into_iter()
+        .map(|column| {
+            column.map(|column| {
+                let id = live.len();
+                live.push(column);
+                id
+            })
+        })
+        .collect();
+    (live, slots)
+}
+
+fn sample_column_slot(
+    slot: Option<usize>,
+    round: usize,
+    visit: &mut impl FnMut(usize, usize) -> f64,
+) -> f64 {
+    slot.map_or(f64::NAN, |live| visit(live, round))
+}
+
+/// Slot IDs are assigned monotonically by keep_column_slots; removing absent sample
+/// vectors after timing therefore restores the unchanged live-column reporting indices.
+fn live_column_samples(slots: &[Option<usize>], samples: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+    assert_eq!(
+        slots.len(),
+        samples.len(),
+        "sample matrix lost an intended column slot"
+    );
+    samples
+        .into_iter()
+        .zip(slots)
+        .filter_map(|(sample, slot)| slot.map(|_| sample))
+        .collect()
+}
+
 /// Every column's per-round timing, plus what the machine was doing during each round.
 ///
 /// A section builds ALL its columns first (compiling and loading is not timed and must not sit
@@ -593,6 +633,21 @@ struct Rounds {
 }
 
 impl Rounds {
+    /// Preserve the intended positions even when a column failed to build. Missing slots
+    /// perform no work; project to live-column indices only after all rounds are complete,
+    /// so absent samples cannot enter best times, ratios, correctness checks or reporting.
+    fn run_slots(
+        slots: &[Option<usize>],
+        rounds: usize,
+        mut visit: impl FnMut(usize, usize) -> f64,
+    ) -> Rounds {
+        let mut sampled = Self::run(slots.len(), rounds, |slot, round| {
+            sample_column_slot(slots[slot], round, &mut visit)
+        });
+        sampled.ns = live_column_samples(slots, sampled.ns);
+        sampled
+    }
+
     /// Time `n` columns over `rounds` rounds. `visit(i, r)` takes exactly one round-local sample of
     /// column `i` in round `r` and returns its ns; the caller is responsible for snapshotting that
     /// column's output buffer on round 0, because only it knows which buffer that is.
@@ -1160,7 +1215,7 @@ unsafe fn build_peer_cols<F: Copy>(
     dir: &Path,
     cc: &str,
     cxx: &str,
-) -> Vec<Col<F>> {
+) -> Vec<Option<Col<F>>> {
     let mut out = Vec::new();
     for spec in &PEER_SPECS {
         let name = format!("{stem}{}", spec.suffix);
@@ -1176,15 +1231,18 @@ unsafe fn build_peer_cols<F: Copy>(
             )
         };
         match built {
-            Some((f, lib, compile)) => out.push(Col {
+            Some((f, lib, compile)) => out.push(Some(Col {
                 label: spec.label.to_string(),
                 note: spec.note().to_string(),
                 census: "-".to_string(),
                 compile,
                 f,
                 _keep: Keep::Dll(lib),
-            }),
-            None => println!("  ! {} peer unavailable — column dropped", spec.label),
+            })),
+            None => {
+                println!("  ! {} peer unavailable — column dropped", spec.label);
+                out.push(None);
+            }
         }
     }
     out
@@ -1512,17 +1570,20 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
     // ran last (always Rust), and the Wukong columns always got the earliest, coolest slots — a bias
     // in Wukong's own favour, in Wukong's own benchmark. Building everything first and putting all
     // ten columns into ONE rotating round schedule removes both.
-    let mut cols: Vec<Col<BlockFn>> = Vec::new();
+    let mut cols: Vec<Option<Col<BlockFn>>> = Vec::new();
     for (label, src, note) in VARIANTS {
         let text = subst(src, m);
         // Dump the exact compiled source so `wukongc --emit=mir -O2 <file>` reproduces the census.
         let _ = std::fs::write(dir.join(format!("general_block_{label}.wk")), &text);
         match build_wukong_col(&text, label, note) {
-            Some(c) => cols.push(c),
-            None => println!("  ! {label}: did not compile — row dropped"),
+            Some(c) => cols.push(Some(c)),
+            None => {
+                println!("  ! {label}: did not compile — row dropped");
+                cols.push(None);
+            }
         }
     }
-    let n_wuk = cols.len();
+    let n_wuk = cols.iter().filter(|column| column.is_some()).count();
 
     let c_src = subst(PEER_C, m);
     let rs_src = subst(PEER_RS, m);
@@ -1532,6 +1593,7 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
     cols.extend(unsafe {
         build_peer_cols::<BlockFn>("general_block", &c_src, &rs_src, dir, cc, cxx)
     });
+    let (cols, slots) = keep_column_slots(cols);
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
         return;
@@ -1541,7 +1603,7 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
     // ---- PHASE 2: ROUNDS. Every column once per round, rotating and alternating direction. ----
     let rounds = crate::gen_rounds();
     let mut outs: Vec<Vec<f32>> = vec![Vec::new(); cols.len()];
-    let rr = Rounds::run(cols.len(), rounds, |i, r| {
+    let rr = Rounds::run_slots(&slots, rounds, |i, r| {
         let f = cols[i].f;
         bufs.scr[OUT_IX].iter_mut().for_each(|v| *v = 0.0);
         // SAFETY: `f` came from `build_wukong_col` (arity-checked) or `peer_col` over a source that
@@ -2049,7 +2111,7 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
     // the two-pass alternation added at 17ab8d0 removed the *ordering* bias but still could not
     // report how far the two passes had disagreed. Everything is built first now and all six
     // columns go into ONE rotating round schedule, so every ratio is formed inside a single round.
-    let mut cols: Vec<Col<LossFn>> = Vec::new();
+    let mut cols: Vec<Option<Col<LossFn>>> = Vec::new();
     let wk_src = subst_loss(LOSS_WK, m);
     let path = dir.join("general_loss_focal.wk");
     let _ = std::fs::write(&path, &wk_src);
@@ -2058,18 +2120,21 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
             // SAFETY: `block_abi_ok` proved the lowered `kbench` is 6 pointers -> void = `LossFn`;
             // the handle is moved into `Keep` and outlives every call.
             let f: LossFn = unsafe { std::mem::transmute(blk.ptr) };
-            cols.push(Col {
+            cols.push(Some(Col {
                 label: "Wukong".to_string(),
                 note: "the .wk source, through the real pipeline".to_string(),
                 census: census_line(&blk.census),
                 compile: blk.compile,
                 f,
                 _keep: Keep::Jit(blk.handle),
-            });
+            }));
         }
-        None => println!("  ! Wukong loss did not compile — row dropped"),
+        None => {
+            println!("  ! Wukong loss did not compile — row dropped");
+            cols.push(None);
+        }
     }
-    let n_wuk = cols.len();
+    let n_wuk = cols.iter().filter(|column| column.is_some()).count();
 
     let c_src = subst_loss(LOSS_C, m);
     let rs_src = subst_loss(LOSS_RS, m);
@@ -2078,6 +2143,7 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
     cols.extend(unsafe {
         build_peer_cols::<LossFn>("general_loss", &c_src, &rs_src, dir, cc, cxx)
     });
+    let (cols, slots) = keep_column_slots(cols);
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
         return;
@@ -2089,7 +2155,7 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
     // (dz deviation, its lane, loss deviation) — recorded on round 0; every column here is
     // deterministic, so the later rounds cannot change them.
     let mut devs = vec![(0.0f64, 0usize, 0.0f64); cols.len()];
-    let rr = Rounds::run(cols.len(), rounds, |i, r| {
+    let rr = Rounds::run_slots(&slots, rounds, |i, r| {
         let f = cols[i].f;
         b.dz.iter_mut().for_each(|v| *v = 0.0);
         // SAFETY: `f` is the 6-pointer `kbench` of column `i`; `b` was built by `LossBufs::new(m)`,
@@ -2530,7 +2596,7 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
     );
 
     // ---- PHASE 1: BUILD every column. Nothing is timed here. ----
-    let mut cols: Vec<Col<ScanFn>> = Vec::new();
+    let mut cols: Vec<Option<Col<ScanFn>>> = Vec::new();
     let wk_src = subst_scan(SCAN_WK, m);
     let path = dir.join("general_scan_s6.wk");
     let _ = std::fs::write(&path, &wk_src);
@@ -2539,18 +2605,21 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
             // SAFETY: `block_abi_ok` proved the lowered `kbench` is 8 pointers -> void = `ScanFn`;
             // the handle is moved into `Keep` and outlives every call.
             let f: ScanFn = unsafe { std::mem::transmute(blk.ptr) };
-            cols.push(Col {
+            cols.push(Some(Col {
                 label: "Wukong".to_string(),
                 note: "the .wk source, through the real pipeline".to_string(),
                 census: census_line(&blk.census),
                 compile: blk.compile,
                 f,
                 _keep: Keep::Jit(blk.handle),
-            });
+            }));
         }
-        None => println!("  ! Wukong scan did not compile — row dropped"),
+        None => {
+            println!("  ! Wukong scan did not compile — row dropped");
+            cols.push(None);
+        }
     }
-    let n_wuk = cols.len();
+    let n_wuk = cols.iter().filter(|column| column.is_some()).count();
 
     let c_src = subst_scan(SCAN_C, m);
     let rs_src = subst_scan(SCAN_RS, m);
@@ -2559,6 +2628,7 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
     cols.extend(unsafe {
         build_peer_cols::<ScanFn>("general_scan", &c_src, &rs_src, dir, cc, cxx)
     });
+    let (cols, slots) = keep_column_slots(cols);
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
         return;
@@ -2568,7 +2638,7 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
     // ---- PHASE 2: ROUNDS ----
     let rounds = crate::gen_rounds();
     let mut devs = vec![(0.0f64, 0usize); cols.len()];
-    let rr = Rounds::run(cols.len(), rounds, |i, r| {
+    let rr = Rounds::run_slots(&slots, rounds, |i, r| {
         let f = cols[i].f;
         b.y.iter_mut().for_each(|v| *v = 0.0);
         // SAFETY: `f` is the 8-pointer `kbench` of column `i`; `b` was built by `ScanBufs::new(m)`,
@@ -2634,6 +2704,154 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_slots_keep_every_missing_pattern_in_its_original_positions() {
+        // 10 intended block columns; 6 intended loss/scan columns. Include every
+        // missing Wukong, C, C++, twin, fast and Rust combination, including all absent.
+        for n in [10usize, 6] {
+            for missing in 0..1usize << n {
+                let attempted = (0..n)
+                    .map(|slot| (missing & (1 << slot) == 0).then_some(slot))
+                    .collect();
+                let (live, slots) = keep_column_slots(attempted);
+                assert_eq!(slots.len(), n);
+                let mut samples = vec![vec![f64::NAN; 4]; n];
+                let mut positions = vec![Vec::new(); live.len()];
+                for round in 0..4 {
+                    for (position, slot) in crate::round_order(n, round).into_iter().enumerate() {
+                        samples[slot][round] =
+                            sample_column_slot(slots[slot], round, &mut |id, seen_round| {
+                                assert_eq!(seen_round, round);
+                                assert_eq!(live[id], slot);
+                                positions[id].push(position);
+                                (100 * slot + round + 1) as f64
+                            });
+                        if slots[slot].is_none() {
+                            assert!(samples[slot][round].is_nan());
+                        }
+                    }
+                }
+                let projected = live_column_samples(&slots, samples);
+                assert_eq!(projected.len(), live.len());
+                for (id, &slot) in live.iter().enumerate() {
+                    assert_eq!(
+                        projected[id],
+                        (0..4)
+                            .map(|round| (100 * slot + round + 1) as f64)
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(positions[id].len(), 4);
+                    assert_eq!(positions[id][0] + positions[id][1], n - 1);
+                    assert_eq!(positions[id][2] + positions[id][3], n - 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_slots_project_only_live_labels_and_reference_samples() {
+        let attempted = vec![
+            Some("a"),
+            None,
+            Some("c"),
+            None,
+            Some("e"),
+            None,
+            Some("C(twin)"),
+            Some("C(fast)"),
+            None,
+            Some("Rust"),
+        ];
+        let n_wuk = attempted[..5]
+            .iter()
+            .filter(|column| column.is_some())
+            .count();
+        let (live, slots) = keep_column_slots(attempted);
+        assert_eq!(n_wuk, 3);
+        assert_eq!(&live[..n_wuk], ["a", "c", "e"]);
+        let labels: Vec<String> = live.iter().map(|label| label.to_string()).collect();
+        assert_eq!(ix_of(&labels, "C"), None);
+        assert_eq!(ix_of(&labels, "C++"), None);
+        assert_eq!(ix_of(&labels, "b-natural"), None);
+        assert_eq!(ix_of(&labels, "C(twin)"), Some(3));
+        let samples = slots
+            .iter()
+            .map(|slot| match slot {
+                Some(id) => vec![(*id + 1) as f64; 2],
+                None => vec![f64::NAN; 2],
+            })
+            .collect();
+        let rr = Rounds {
+            rounds: 2,
+            ns: live_column_samples(&slots, samples),
+            power: Vec::new(),
+            pct: Vec::new(),
+            clock: Vec::new(),
+        };
+        assert!(
+            twin_ratio(&labels, &rr).is_none(),
+            "missing C cannot produce a control ratio"
+        );
+        for i in 0..live.len() {
+            assert_eq!(rr.best(i), (i + 1) as f64);
+        }
+        let (none, none_slots) = keep_column_slots::<usize>(vec![None; 6]);
+        assert!(
+            none.is_empty(),
+            "all-missing sections keep their existing skip condition"
+        );
+        assert_eq!(none_slots, vec![None; 6]);
+    }
+
+    #[test]
+    fn fixed_slots_families_build_before_their_full_schedule() {
+        assert_eq!(VARIANTS.len() + PEER_SPECS.len(), 10);
+        assert_eq!(1 + PEER_SPECS.len(), 6);
+        let src = include_str!("general.rs");
+        let body = |head: &str| {
+            let tail = &src[src.find(head).expect("missing function")..];
+            &tail[..tail.find("\n}\n").expect("missing closing brace")]
+        };
+        let run = &src[src.find("    fn run_slots(").unwrap()..];
+        let run = &run[..run.find("\n    }\n").unwrap()];
+        assert!(run.contains("Self::run(slots.len(), rounds,"));
+        assert!(run.contains("sample_column_slot(slots[slot], round, &mut visit)"));
+        assert!(run.find("Self::run(").unwrap() < run.find("live_column_samples(").unwrap());
+        let peers = body("unsafe fn build_peer_cols");
+        assert!(peers.contains("Vec<Option<Col<F>>>"));
+        assert!(peers.contains("for spec in &PEER_SPECS"));
+        assert!(peers.contains("out.push(None)"));
+        assert!(!peers.contains("filter_map"));
+        assert!(!peers.contains("time_round("));
+        for family in [
+            "fn bench_structure_tax(",
+            "fn bench_focal_loss(",
+            "fn bench_scan(",
+        ] {
+            let section = body(family);
+            let timing = section
+                .find("Rounds::run_slots(&slots,")
+                .expect("family lost its fixed-slot schedule");
+            assert_eq!(section.matches("Rounds::run_slots(").count(), 1);
+            assert!(!section.contains("Rounds::run("));
+            assert!(section[..timing].contains("cols.push(None)"));
+            let split = section
+                .find("keep_column_slots(cols)")
+                .expect("missing live/slot projection");
+            assert!(split < timing);
+            assert!(section[split..timing].contains("if cols.is_empty()"));
+            assert!(
+                section[..split].contains("cols.iter().filter(|column| column.is_some()).count()")
+            );
+            for build in ["build_wukong_col(", "compile_block(", "build_peer_cols::<"] {
+                assert!(
+                    !section[timing..].contains(build),
+                    "{family}: build after timing started"
+                );
+            }
+        }
+    }
 
     /// Every `$TOKEN$` in every corpus source must be one this module knows how to substitute —
     /// an unsubstituted token reaches the parser as a syntax error at benchmark time, which
