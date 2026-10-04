@@ -7,6 +7,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Full-range f32 trig and benchmark scheduling, 2026-10-04
 
+- Corpus fixtures can use `EXPECT-OUT-VALUES` for a list of exact successive
+  stdout lines. Existing comparison rules, tolerances and fixture expectations
+  are unchanged.
+- The dispatch comparison tool retains both compilers' actual call counts and
+  reports candidate coverage against the lowering table's literal kernel
+  inventory, including missing and unexpected symbols. Compilation and inventory
+  errors now return failure; coverage gaps remain explicit information.
 - `sin`, `cos` and `tan` use the existing bounded polynomial for ordinary inputs
   and a shared platform-libm fallback for large finite inputs. Runtime SIMD and
   generic vector lowering preserve a fast polynomial path, explicit signed zero,
@@ -16,9 +23,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - Interpreter f32 host buffers preserve untouched signaling-NaN bits during
   marshalling. Arithmetic still quiets signaling NaNs.
 - Timed families in the main and general CPU benchmark modules now build before
-  timing and rotate fixed peer slots. Remaining model/Torch scheduling obligations
-  and performance measurements are tracked in the closeout checklist; these
-  changes do not establish a speedup or SOTA superiority.
+  timing and rotate fixed peer slots. The model suite also prepares eleven fixed
+  slots, retains native owners and uses a persistent correlated Torch worker that
+  rejects deferred compilation during timing. Focused fake-worker tests pass;
+  actual Torch validation and performance measurements remain open. These changes
+  do not establish a speedup or SOTA superiority.
 
 ### CPU closeout correctness and verification, 2026-09-23
 
