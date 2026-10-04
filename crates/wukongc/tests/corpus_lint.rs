@@ -316,6 +316,97 @@ fn parse(src: &str) -> common::Directives {
 }
 
 #[test]
+fn multi_value_expands_exact_tokens_in_mixed_directive_order() {
+    let d = parse(
+        "// EXPECT-EXIT: 0\n\
+         // EXPECT-OUT: leading words\n\
+         //EXPECT-OUT-VALUES: 1\t-2  0.25\n\
+         // EXPECT-OUT-APPROX: 1.5 1e-7\n\
+         // EXPECT-OUT-VALUES: true tail\n\
+         // EXPECT-OUT:\n",
+    );
+    let expanded = parse(
+        "// EXPECT-EXIT: 0\n\
+         // EXPECT-OUT: leading words\n\
+         // EXPECT-OUT: 1\n\
+         // EXPECT-OUT: -2\n\
+         // EXPECT-OUT: 0.25\n\
+         // EXPECT-OUT-APPROX: 1.5 1e-7\n\
+         // EXPECT-OUT: true\n\
+         // EXPECT-OUT: tail\n\
+         // EXPECT-OUT:\n",
+    );
+    assert_eq!(d.out, expanded.out);
+    assert_eq!(d.exit, Some(0));
+    assert!(d.constrains_stdout());
+    check_stdout("leading words\n1\n-2\n0.25\n1.5\ntrue\ntail\n\n", &d).unwrap();
+}
+
+#[test]
+fn multi_value_rejects_every_mutated_missing_extra_or_reordered_lane() {
+    let values = ["1", "-2", "0.25", "false", "last"];
+    let d = parse("// EXPECT-OUT-VALUES: 1 -2 0.25 false last\n");
+    let stdout = |lines: &[&str]| format!("{}\n", lines.join("\n"));
+    check_stdout(&stdout(&values), &d).unwrap();
+    for lane in 0..values.len() {
+        let mut mutated = values.to_vec();
+        mutated[lane] = "WRONG";
+        assert!(check_stdout(&stdout(&mutated), &d).is_err(), "lane {lane}");
+        let mut missing = values.to_vec();
+        missing.remove(lane);
+        assert!(check_stdout(&stdout(&missing), &d).is_err(), "lane {lane}");
+    }
+    for at in 0..=values.len() {
+        let mut extra = values.to_vec();
+        extra.insert(at, "EXTRA");
+        assert!(check_stdout(&stdout(&extra), &d).is_err(), "position {at}");
+    }
+    for lane in 1..values.len() {
+        let mut reordered = values.to_vec();
+        reordered.swap(0, lane);
+        assert!(
+            check_stdout(&stdout(&reordered), &d).is_err(),
+            "lane {lane}"
+        );
+    }
+}
+
+#[test]
+fn multi_value_keeps_exact_physical_line_semantics() {
+    let d = parse("// EXPECT-OUT-VALUES: 1.0 -0 001\n");
+    check_stdout("1.0\n-0\n001\n", &d).unwrap();
+    for actual in [
+        "1\n-0\n001\n",
+        "1.0\n0\n001\n",
+        "1.0\n-0\n1\n",
+        "1.0 -0 001\n",
+        " 1.0\n-0\n001\n",
+        "1.0\n-0\n001 \n",
+    ] {
+        assert!(check_stdout(actual, &d).is_err(), "{actual:?}");
+    }
+}
+
+#[test]
+fn multi_value_rejects_empty_misspelled_and_conflicting_declarations() {
+    for source in [
+        "// EXPECT-OUT-VALUES:",
+        "// EXPECT-OUT-VALUES: \t ",
+        "// EXPECT-OUT-VALUE: 1 2",
+        "// EXPECT-OUT-VALUES : 1 2",
+        "// EXPECT-OUT-VALUES-APPROX: 1 2",
+        "// EXPECT-OUT-NONE\n// EXPECT-OUT-VALUES: 1 2",
+        "// EXPECT-OUT-VALUES: 1 2\n// EXPECT-OUT-NONE",
+        "// EXPECT-EXIT: 0\n// EXPECT-OUT-VALUES: 1\n// EXPECT-EXIT: 0",
+    ] {
+        assert!(parse_directives(source, "<inline>").is_err(), "{source}");
+    }
+    let error = parse_directives("// prose\n// EXPECT-OUT-VALUES:", "values.wk").unwrap_err();
+    assert!(error.contains("values.wk:2:"), "{error}");
+    assert!(error.contains("at least one exact token"), "{error}");
+}
+
+#[test]
 fn parse_directives_reads_each_form() {
     let d = parse(
         "// RUN: --run --backend=native\n\

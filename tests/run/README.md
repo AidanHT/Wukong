@@ -33,22 +33,31 @@ the executing gate and the lint.
 | `// RUN: <args>` | **replaces** the whole arg list (default `--run`). Only `run_suite` honours it; the differential gates build their own args |
 | `// EXPECT-EXIT: <n>` | **required on every fixture.** `run_suite` panics without it |
 | `// EXPECT-OUT: <line>` | one expected stdout line, exact string, in order |
+| `// EXPECT-OUT-VALUES: <token> ...` | one or more whitespace-separated exact tokens, each expecting a successive stdout line |
 | `// EXPECT-OUT-APPROX: <value> <rel-tol>` | one expected stdout line, compared numerically inside a declared two-sided relative tolerance |
 | `// EXPECT-OUT-NONE` | stdout must be empty — a positive assertion, for a fixture that prints nothing |
 | `// EXPECT-STDERR: <substring>` | stderr must contain this substring (`run_suite` only) |
 
-**Every fixture must declare `EXPECT-EXIT` and one of `EXPECT-OUT` / `EXPECT-OUT-APPROX` /
+**Every fixture must declare `EXPECT-EXIT` and one of `EXPECT-OUT` / `EXPECT-OUT-VALUES` / `EXPECT-OUT-APPROX` /
 `EXPECT-OUT-NONE`.** Both of `run_suite`'s checks used to be conditional on their directive being
 present, so a fixture declaring neither ran and asserted nothing — which is how
 `gemm_fused_bias_slice.wk` printed 36 unchecked numbers for its whole life, and how `assert_fail.wk`
 stayed green for a program that had stopped compiling (`COMPILE_ERROR` is also exit 1 with empty
 stdout).
 
+`// EXPECT-OUT-VALUES: 1 -2 0.25` is shorthand for three `EXPECT-OUT` directives,
+expecting `1`, `-2`, and `0.25` on three successive stdout lines. Multiple directives
+append expectations in source order and can mix with `EXPECT-OUT` and `EXPECT-OUT-APPROX`.
+The tokens are exact strings: `1.0` does not match `1`, and actual stdout is not split
+into tokens. Use `EXPECT-OUT` for an empty line or a line containing whitespace.
+There is no quoting or escaping syntax in `EXPECT-OUT-VALUES`; an empty token list is
+an error, as is combining any output expectation with `EXPECT-OUT-NONE`.
+
 ## Floats: exactly two legal forms
 
 A float assertion is either **exact** or **declared**. Nothing else.
 
-- **Exact** — `EXPECT-OUT` against a raw `print(x)` whose value is exactly representable in f32
+- **Exact** — `EXPECT-OUT` (or its `EXPECT-OUT-VALUES` shorthand) against a raw `print(x)` whose value is exactly representable in f32
   (integers, halves, quarters, 0.25, -0.5, 100.0) and order-independent. Preferred: it has no
   tolerance at all.
 - **Declared** — `EXPECT-OUT-APPROX` with a written relative tolerance, for a value the scalar
