@@ -593,9 +593,10 @@ fn run_on_gpu_lower(
 /// The C runtime linked into native executables by the **`cc` fallback** path: it backs the
 /// `print`/`assert`/`fmod` and heap intrinsics that the Cranelift object leaves as undefined imports.
 /// The JIT path binds those same symbols to Rust functions instead. It is deliberately *not* a full
-/// mirror — there is no `wukong_rt_print_str` here and `printf("%g")` is under-precise for floats —
-/// which is why this path is for scalar, no-string programs only; [`WUKONG_RT_SHIM`] on the preferred
-/// [`rustc_link`] path is the one whose output is byte-identical to the interpreter oracle.
+/// mirror: string printing and runtime kernels are not provided. Float printing is rejected by
+/// [`cc_float_print_requirement`] before linking because C's `%g` does not match Rust `Display`.
+/// The float symbol remains as a fatal guard for COFF objects that declare even unused imports;
+/// it must never print an approximation. [`WUKONG_RT_SHIM`] provides the full print implementation.
 const WUKONG_RT_C: &str = "#include <stdio.h>\n\
 #include <stdlib.h>\n\
 #include <math.h>\n\
@@ -609,7 +610,11 @@ __attribute__((constructor)) static void wukong_rt_init(void) { _setmode(_fileno
 #endif\n\
 void wukong_rt_print_i64(long long x) { printf(\"%lld\\n\", x); }\n\
 void wukong_rt_print_u64(unsigned long long x) { printf(\"%llu\\n\", x); }\n\
-void wukong_rt_print_f64(double x) { printf(\"%g\\n\", x); }\n\
+void wukong_rt_print_f64(double x) {\n\
+    (void)x;\n\
+    fputs(\"error: floating-point printing requires the Rust runtime link; C fallback cannot preserve output\\n\", stderr);\n\
+    exit(2);\n\
+}\n\
 void wukong_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(1); } }\n\
 long long wukong_rt_assert_failed(void) { return 0; }\n\
 double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }\n\
@@ -757,8 +762,6 @@ fn object_path(
 /// directory to `<stem>.o` so that it survives, and the driver reports whichever path is actually
 /// there - that copy is best effort - and exits [`exit::UNIMPLEMENTED`] (2).
 fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Options) -> i32 {
-    use std::process::Command;
-
     let obj = match wukong_codegen_cranelift::emit_object(program, interner) {
         Ok(b) => b,
         Err(e) => {
@@ -817,15 +820,84 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         LinkOutcome::Unavailable => { /* fall through to the C-runtime `cc` link */ }
     }
 
+    cc_link(
+        program,
+        interner,
+        opts,
+        scratch.as_ref(),
+        &stem,
+        &obj_path,
+        &out,
+    )
+}
+
+/// Identify float-print intrinsics in the emitted MIR, including calls in helper functions.
+/// Match Cranelift's call resolution: a program-defined function wins over an intrinsic with the
+/// same name. Check the actual first argument type, including f16/bf16's f32 promotion, rather than
+/// banning floating-point computation or guessing which constants C could print faithfully.
+fn cc_float_print_requirement(
+    program: &wukong_mir::Program,
+    interner: &Interner,
+) -> Option<String> {
+    for function in &program.funcs {
+        for block in &function.blocks {
+            for inst in &block.insts {
+                let wukong_mir::Op::Call { func, args } = &inst.op else {
+                    continue;
+                };
+                if !matches!(interner.resolve(*func), "print" | "println")
+                    || program.function(*func).is_some()
+                {
+                    continue;
+                }
+                if let Some(&arg) = args.first() {
+                    let ty = function.value_type(arg);
+                    if ty.is_float() {
+                        return Some(format!(
+                            "{}({}) in `{}`",
+                            interner.resolve(*func),
+                            ty.display(),
+                            interner.resolve(function.name)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Called only after the preferred Rust link is unavailable. Keep the capability check inside
+/// this boundary so a forced C-path test exercises the same refusal as native executable emission.
+fn cc_link(
+    program: &wukong_mir::Program,
+    interner: &Interner,
+    opts: &Options,
+    scratch: Option<&ScratchDir>,
+    stem: &str,
+    obj_path: &Path,
+    out: &Path,
+) -> i32 {
+    use std::process::Command;
+
+    if let Some(requirement) = cc_float_print_requirement(program, interner) {
+        eprint_line(&format!(
+            "error: C fallback cannot preserve floating-point print output: {requirement}.\n\
+             help: restore rustc and a compatible wukong_runtime rlib beside wukongc (or in deps/), \
+             or use --run; --emit=obj remains available."
+        ));
+        return exit::UNIMPLEMENTED;
+    }
+
     // exe (fallback): emit the C runtime into the scratch dir and link it with the system C compiler.
-    let rt_path = scratch_path(scratch.as_ref(), format!("{stem}_rt.c"));
+    let rt_path = scratch_path(scratch, format!("{stem}_rt.c"));
     if let Err(e) = std::fs::write(&rt_path, c_runtime_source()) {
         eprintln!("error: could not write `{}`: {e}", rt_path.display());
         return exit::IO_ERROR;
     }
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let status = Command::new(&cc)
-        .args(cc_link_args(&obj_path, &rt_path, &out))
+        .args(cc_link_args(obj_path, &rt_path, out))
         .status();
     match status {
         Ok(s) if s.success() => {
@@ -853,7 +925,7 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
             let kept = if obj_path == kept {
                 Some(kept)
             } else {
-                std::fs::copy(&obj_path, &kept).ok().map(|_| kept)
+                std::fs::copy(obj_path, &kept).ok().map(|_| kept)
             };
             match kept {
                 Some(p) => eprintln!(
@@ -911,7 +983,7 @@ enum LinkOutcome {
 /// The Rust link shim generated for the rustc-driven `--emit=exe` link. It provides the `wukong_rt_*`
 /// runtime the Cranelift object calls (formatting through Rust's stdout, so output is byte-identical
 /// to the interpreter/JIT oracle — raw LF on Windows, and floats via `Display` like the interp's
-/// `format!("{f}")`, unlike the C runtime's under-precise `printf("%g")`), and `extern crate
+/// `format!("{f}")`; the C fallback explicitly rejects float printing), and `extern crate
 /// wukong_runtime` pulls the AVX2 microkernels into the link so a recognized-kernel program resolves
 /// its `wukong_*` symbols. `#![no_main]` leaves the Cranelift object's own `main` as the CRT entry.
 const WUKONG_RT_SHIM: &str = r##"#![no_main]
@@ -983,9 +1055,9 @@ pub extern "C" fn wukong_rt_fmod_f32(a: f32, b: f32) -> f32 {
 /// `wukong_runtime` a dependency rather than a selected member. A tree that has the uplifted copy
 /// has it as a *leftover* of some earlier `cargo build`, which is why this looked fine locally and
 /// broke on every clean checkout: CI runs `cargo test --workspace`, never `cargo build`, so the
-/// preferred link path silently degraded to the `cc` fallback — whose output is knowingly *not*
-/// byte-identical to the oracle (no `wukong_rt_print_str`, no `wukong_*` kernels, under-precise
-/// `printf("%g")` floats). Searching `deps/` too makes the preferred path available whenever cargo
+/// preferred link path degraded to the `cc` fallback with reduced capabilities: no
+/// `wukong_rt_print_str` or `wukong_*` kernels, and float printing now explicitly refused.
+/// Searching `deps/` too makes the preferred path available whenever cargo
 /// built the runtime at all, however the compiler was built.
 ///
 /// A `deps/` directory can hold several hash-suffixed rlibs (a metadata hash changes when the
@@ -2789,6 +2861,9 @@ mod verify_gate_tests {
 /// The `--emit=exe` link path's generated inputs (the Rust shim, the C fallback runtime).
 #[cfg(test)]
 mod assertion_link_tests;
+
+#[cfg(test)]
+mod cc_print_tests;
 
 #[cfg(test)]
 mod native_link_tests {
