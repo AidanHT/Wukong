@@ -80,6 +80,58 @@ fn default_grad_verifies_the_complete_callee_set() {
 }
 
 #[test]
+fn default_grad_checks_calls_introduced_only_by_the_backward() {
+    let mut interner = Interner::new();
+    let reduce = interner.intern("wukong_sreduce_f32");
+    let velem = interner.intern("wukong_velem_f32");
+    let mut b = Builder::new(interner.intern("loss"), MirType::F32);
+    let input = b.add_param(MirType::Ptr);
+    let output = b.add_param(MirType::Ptr);
+    let count = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+    let sum = b.build(MirType::I64, Op::ConstInt(2, MirType::I64));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: reduce,
+            args: vec![input, input, count, sum],
+        },
+    );
+    b.build_void(Op::Store {
+        ptr: output,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    // Only the backward calls velem, to fill the gradient with ones. This unused definition
+    // is valid MIR, but its zero-parameter signature conflicts with that generated call.
+    let mut callee = Builder::new(velem, MirType::Void);
+    callee.ret(None);
+    let mut program = Program::new();
+    program.funcs = vec![b.finish(), callee.finish()];
+    assert!(wukong_mir::verify::verify_program(&program).is_empty());
+    let raw = wukong_autodiff::grad(&program.funcs[0], &[0], &mut interner).unwrap();
+    assert!(raw.blocks.iter().flat_map(|block| &block.insts).any(
+        |inst| matches!(&inst.op, Op::Call { func, args } if *func == velem && args.len() == 8)
+    ));
+    assert!(wukong_mir::verify::verify_function(&raw).is_empty());
+    let mut generated = program.clone();
+    generated.funcs.push(raw);
+    assert!(!wukong_mir::verify::verify_program(&generated).is_empty());
+    for verify_each in [false, true] {
+        let opts = Options {
+            verify_each,
+            grad: GradOptions {
+                wrt: vec![0],
+                ..GradOptions::default()
+            },
+            ..Options::default()
+        };
+        let error = build_grad(&program, &mut interner, &opts).unwrap_err();
+        assert!(error.contains("after `autodiff`"), "{error}");
+        assert!(error.contains("call"), "{error}");
+    }
+}
+
+#[test]
 fn default_training_checks_newly_defined_adamw_signature_before_execution() {
     let mut interner = Interner::new();
     let adamw = interner.intern("adamw_step_1");
