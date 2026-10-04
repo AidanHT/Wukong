@@ -10,7 +10,7 @@
 //!
 //! Every test here spawns a *fresh process per compile* (each gets a distinct hash seed) and
 //! asserts the bytes are identical. Three seeds per run; CI re-runs accumulate many more over time.
-//! The three axes are covered separately because a leak can enter at any of them:
+//! The corpus axes are covered separately because a leak can enter at any of them:
 //!
 //! * [`mir_emission_is_deterministic_across_processes`] — `--emit=mir -O2`, the whole optimizer
 //!   including LICM, the pass whose loop-body iteration order was the one place this actually bit.
@@ -23,6 +23,11 @@
 //!   compile-fail corpus. A `HashMap<Symbol, _>` in name resolution or the renderer would reorder
 //!   the errors a multi-error program reports; `fail.rs` only asserts that ONE expected code is
 //!   present somewhere, so it cannot see the ordering.
+//!
+//! Representative AST, textual LLVM IR, and gradient cases additionally cover those artifact
+//! paths, requiring successful, nonempty output from every process. They are not corpus sweeps.
+//! Source, flags, compiler/target, and inherited ambient configuration are inputs held fixed for
+//! each comparison; these checks do not establish independence from environment configuration.
 //!
 //! CAVEAT worth stating so a pass is not over-read: the "three independent hash seeds" mechanism
 //! only bites std `HashMap`/`HashSet`. The optimizer's `FxHash*` maps have a FIXED seed and are
@@ -119,6 +124,111 @@ fn emit_diagnostics(path: &Path) -> Vec<u8> {
         .output()
         .expect("failed to spawn wukongc");
     out.stderr
+}
+
+/// Compare successful textual artifacts, never treating repeated failure or silence as agreement.
+fn assert_representative_text_determinism(path: &Path, args: &[&str]) -> Vec<u8> {
+    let mut baseline = Vec::new();
+    for run in 0..3 {
+        let out = Command::new(env!("CARGO_BIN_EXE_wukongc"))
+            .args(args)
+            .arg("--color=never")
+            .arg(path)
+            .output()
+            .expect("failed to spawn wukongc");
+        assert!(
+            out.status.success(),
+            "{} {args:?}, process {run}: status {}; stderr: {}",
+            path.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.stdout.is_empty(),
+            "{} {args:?}, process {run}: empty artifact; stderr: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if run == 0 {
+            baseline = out.stdout;
+        } else {
+            assert!(
+                baseline == out.stdout,
+                "{} {args:?}: artifact bytes differ in fresh process {run}",
+                path.display()
+            );
+        }
+    }
+    eprintln!(
+        "representative determinism: {} {args:?}, {} artifact bytes x3 fresh processes",
+        path.display(),
+        baseline.len()
+    );
+    baseline
+}
+
+#[test]
+fn representative_ast_emission_is_deterministic_across_processes() {
+    // Declaration/field ordering, match patterns, and generic syntax in the root-file AST.
+    for name in ["enum_payload_struct.wk", "generics_monomorphization.wk"] {
+        assert_representative_text_determinism(&repo_dir("run").join(name), &["--emit=ast"]);
+    }
+}
+
+#[test]
+fn representative_llvm_ir_emission_is_deterministic_across_processes() {
+    // O0 preserves specialized functions and aggregate accesses; O2 also covers their optimized
+    // emission, even when constant folding and inlining remove the original structure.
+    for name in ["generics_monomorphization.wk", "struct_fn.wk"] {
+        assert_representative_text_determinism(
+            &repo_dir("run").join(name),
+            &["--emit=llvm-ir", "-O2"],
+        );
+        let artifact = assert_representative_text_determinism(
+            &repo_dir("run").join(name),
+            &["--emit=llvm-ir", "-O0"],
+        );
+        let text = std::str::from_utf8(&artifact).expect("LLVM IR must be UTF-8");
+        let markers: &[&str] = if name == "generics_monomorphization.wk" {
+            &["define float @id$f32(", "define i32 @id$i32("]
+        } else {
+            &["define i32 @byval(ptr ", "load i32, ptr ", "getelementptr "]
+        };
+        for marker in markers {
+            assert!(
+                text.contains(marker),
+                "{name} O0 LLVM IR must retain {marker:?}: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn representative_grad_emission_is_deterministic_across_processes() {
+    let scratch = ScratchDir::new("grad");
+    let source = scratch.0.join("cubic.wk");
+    // Same cubic buffer loss as the driver's finite-difference correctness gate. Here the
+    // property under test is emitted forward/backward byte order, not gradient numerics.
+    std::fs::write(
+        &source,
+        "module m\nfn loss(x: [f32; 1], mut out: [f32; 1]) -> f32 {\n\
+         let a: f32 = x[0]; let l: f32 = a*a*a; out[0] = l; return l; }\n",
+    )
+    .expect("write gradient determinism fixture");
+    let artifact = assert_representative_text_determinism(
+        &source,
+        &["--emit=grad", "-O2", "--grad-of=loss", "--grad-wrt=0"],
+    );
+    let text = std::str::from_utf8(&artifact).expect("gradient MIR must be UTF-8");
+    let (_, backward) = text
+        .split_once("fn loss_grad(")
+        .expect("artifact must contain the generated backward function");
+    for op in ["fmul ", "fadd ", "store "] {
+        assert!(
+            backward.contains(op),
+            "cubic backward must contain {op:?}: {backward}"
+        );
+    }
 }
 
 #[test]
