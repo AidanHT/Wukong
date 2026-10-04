@@ -18,12 +18,13 @@
 //! | `// RUN: <args>` | **replaces** the whole argv (default `--run`). Honoured by `run_suite` only |
 //! | `// EXPECT-EXIT: <n>` | required process exit code. Mandatory for every fixture |
 //! | `// EXPECT-OUT: <line>` | one expected stdout line, compared as an exact string |
+//! | `// EXPECT-OUT-VALUES: <token> ...` | one or more whitespace-separated exact tokens, each expecting a successive stdout line |
 //! | `// EXPECT-OUT-APPROX: <value> <rel>` | one expected stdout line, compared as a number within a **declared** relative tolerance |
 //! | `// EXPECT-OUT-NONE` | stdout must be empty. Mandatory for a fixture that prints nothing |
 //! | `// EXPECT-STDERR: <substring>` | stderr must contain this substring (`run_suite` only) |
 //!
 //! Every fixture must carry `EXPECT-EXIT` and at least one of `EXPECT-OUT` /
-//! `EXPECT-OUT-APPROX` / `EXPECT-OUT-NONE`; `run.rs::check_program` panics otherwise. Before that
+//! `EXPECT-OUT-VALUES` / `EXPECT-OUT-APPROX` / `EXPECT-OUT-NONE`; `run.rs::check_program` panics otherwise. Before that
 //! floor existed, `run.rs`'s two checks were each guarded on the directive being present, so
 //! `gemm_fused_bias_slice.wk` printed 36 unchecked numbers for its whole life.
 //!
@@ -111,6 +112,14 @@ pub fn parse_directives(src: &str, name: &str) -> Result<Directives, String> {
             })?);
         } else if let Some(rest) = body.strip_prefix("EXPECT-OUT-APPROX:") {
             out.push(parse_approx(rest, name, lineno)?);
+        } else if let Some(rest) = body.strip_prefix("EXPECT-OUT-VALUES:") {
+            let mut tokens = rest.split_whitespace().peekable();
+            if tokens.peek().is_none() {
+                return Err(format!(
+                    "{name}:{lineno}: EXPECT-OUT-VALUES requires at least one exact token"
+                ));
+            }
+            out.extend(tokens.map(|token| Expectation::Exact(token.to_string())));
         } else if let Some(rest) = body.strip_prefix("EXPECT-OUT-NONE") {
             if !rest.trim().is_empty() {
                 return Err(format!(
@@ -127,7 +136,7 @@ pub fn parse_directives(src: &str, name: &str) -> Result<Directives, String> {
             return Err(format!(
                 "{name}:{lineno}: unrecognized directive {:?}. A directive this harness does not \
                  understand used to be discarded silently, which is zero assertions wearing the \
-                 costume of a check. Known: RUN:, EXPECT-EXIT:, EXPECT-OUT:, EXPECT-OUT-APPROX:, \
+                 costume of a check. Known: RUN:, EXPECT-EXIT:, EXPECT-OUT:, EXPECT-OUT-VALUES:, EXPECT-OUT-APPROX:, \
                  EXPECT-OUT-NONE, EXPECT-STDERR:",
                 body.trim_end()
             ));
@@ -136,7 +145,7 @@ pub fn parse_directives(src: &str, name: &str) -> Result<Directives, String> {
 
     if expect_no_stdout && !out.is_empty() {
         return Err(format!(
-            "{name}: EXPECT-OUT-NONE cannot be combined with EXPECT-OUT or EXPECT-OUT-APPROX"
+            "{name}: EXPECT-OUT-NONE cannot be combined with EXPECT-OUT, EXPECT-OUT-VALUES or EXPECT-OUT-APPROX"
         ));
     }
     Ok(Directives {
