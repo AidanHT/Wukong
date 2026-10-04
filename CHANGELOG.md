@@ -7,6 +7,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Full-range f32 trig and benchmark scheduling, 2026-10-04
 
+- The C executable fallback rejects unsupported float printing with an explicit
+  capability error. The preferred Rust link path, object emission, and supported
+  integer-printing C programs retain their behavior.
+- GPT-2 measurement scripts reject failed builds, invalid repetitions, stale
+  output files and failed peer validation. Numerical checks retain the existing
+  float32 error calculation; controlled measurement eligibility remains separate.
+- Focused fresh-process checks cover AST, LLVM IR and gradient artifact
+  determinism under fixed source, flags, toolchain and environment inputs.
 - Corpus fixtures can use `EXPECT-OUT-VALUES` for a list of exact successive
   stdout lines. Existing comparison rules, tolerances and fixture expectations
   are unchanged.

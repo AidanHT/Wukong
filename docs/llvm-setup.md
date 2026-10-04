@@ -11,16 +11,17 @@ platform's native linker and links `wukong_runtime`), falling back to the system
 `cargo build` uplifts) nor a hash-suffixed `deps/libwukong_runtime-*.rlib` (what a `cargo test` or
 `cargo run -p wukongc` tree has instead, since cargo uplifts a library only for a `build`): if rustc
 runs and the link *fails*, that is reported as an error (exit 1) and is
-deliberately *not* retried with `cc`, so a real link bug is never swallowed. If neither linker can be
-run it exits with code 2 (`UNIMPLEMENTED`) but still writes the object; a linker that runs and fails
-to link exits 1.
+deliberately *not* retried with `cc`, so a real link bug is never swallowed. For a program supported
+by the C fallback, inability to run either linker produces exit 2 (`UNIMPLEMENTED`) and attempts
+to preserve the object. A linker that runs and fails to link produces exit 1.
 
-The `cc` fallback is a reduced path, not an equivalent one: the small generated C runtime resolves
-only the `wukong_rt_*` intrinsics (print/assert/fmod/heap/scalar trigonometry), so a program that dispatches any
-recognized `wukong_*` microkernel — or that needs MSVC-object data relocations — cannot be linked
-that way, and it prints floats via `printf("%g")` so its stdout is not byte-identical to `--run`. The
-rustc path formats through Rust's `Display` and links `wukong_runtime`, which is why it is preferred;
-treat `cc` as scalar-program-only. To run with zero external toolchain at all, use the interpreter:
+The `cc` fallback provides integer/bool printing, assertions, float remainder, heap operations and
+scalar trigonometry. Float printing requires the Rust link path: when that path is unavailable,
+the driver rejects float-printing programs with exit 2 before invoking the C linker. Float
+computation that prints integer results remains supported, and `--emit=obj` remains available.
+The C runtime has no string printer or recognized `wukong_*` microkernels, and MSVC-object data
+relocations can also prevent linking. The preferred rustc path formats floats through Rust's
+`Display` and links `wukong_runtime`. To run with zero external toolchain, use the interpreter:
 `wukongc --run program.wk`.
 
 Scalar sine/cosine use the same bounded polynomial and explicit FMA operations in the Rust and
