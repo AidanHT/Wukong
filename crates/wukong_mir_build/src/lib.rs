@@ -1033,6 +1033,7 @@ pub fn lower_program_with(
         vmath: interner.intern("wukong_vmath_f32"),
         vmath_par: interner.intern("wukong_vmath_f32_parallel"),
         vmath2: interner.intern("wukong_vmath2_f32"),
+        trig_f32: interner.intern("wukong_rt_trig_f32"),
         vmath_bf16: interner.intern("wukong_vmath_bf16"),
         vmath_f16: interner.intern("wukong_vmath_f16"),
         velem: interner.intern("wukong_velem_f32"),
@@ -2970,6 +2971,8 @@ struct GemmSyms {
     /// The 256-bit AVX2 elementwise-math kernel (`wukong_vmath_f32(x, out, n, op)`): an
     /// `out[i] = f(x[i])` transcendental loop lowers to this (the width Cranelift can't emit).
     vmath: Symbol,
+    /// Value-returning scalar trig, also the exceptional-lane fallback for vector MIR.
+    trig_f32: Symbol,
     /// The **two-input** twin (`wukong_vmath2_f32(x, y, out, n, op)`): an `out[i] = f(x[i], y[i])`
     /// loop for `pow`/`atan2`/`hypot` lowers to this — the 256-bit kernel, vs the inlined 128-bit poly.
     vmath2: Symbol,
@@ -21618,12 +21621,97 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// The sin/cos polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Reduces `x` to
+    /// Standalone scalar trig stays a single SSA call so it remains differentiable. Vector
+    /// expressions retain the inlined SIMD polynomial on ordinary inputs; only a block containing
+    /// an out-of-range/nonfinite lane takes the scalar runtime fallback. Recognition controls
+    /// array-kernel fusion, not the implementation of a scalar math operation.
+    fn emit_trig_f32(&mut self, x: ValueId, fty: &MirType, is_cos: bool) -> ValueId {
+        let MirType::Vec(_, lanes) = fty else {
+            return self.emit_trig_scalar_call(x, is_cos);
+        };
+        let lanes = *lanes;
+        let mty = mask_ty(fty);
+        let lower = self.splat_const_f(-TRIG_FAST_LIMIT, fty);
+        let upper = self.splat_const_f(TRIG_FAST_LIMIT, fty);
+        let above = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Fogt, x, lower));
+        let below = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Folt, x, upper));
+        let mask = self.builder.build(mty, Op::Bin(BinOp::And, above, below));
+        let mut all = self.builder.build(MirType::I32, Op::ExtractLane(mask, 0));
+        for lane in 1..lanes {
+            let part = self
+                .builder
+                .build(MirType::I32, Op::ExtractLane(mask, lane));
+            all = self
+                .builder
+                .build(MirType::I32, Op::Bin(BinOp::And, all, part));
+        }
+        let zero = self
+            .builder
+            .build(MirType::I32, Op::ConstInt(0, MirType::I32));
+        let small = self
+            .builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Ne, all, zero));
+        let fast = self.builder.new_block();
+        let slow = self.builder.new_block();
+        let merge = self.builder.new_block();
+        let result = self.builder.block_param(merge, fty.clone());
+        self.builder.cond_br(small, fast, vec![], slow, vec![]);
+        self.builder.switch_to(fast);
+        let polynomial = self.emit_trig_poly_f32(x, fty, is_cos);
+        self.builder.br(merge, vec![polynomial]);
+        self.builder.switch_to(slow);
+        let storage = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::F32), lanes));
+        for lane in 0..lanes {
+            let input = self.builder.build(MirType::F32, Op::ExtractLane(x, lane));
+            // Small lanes still use the identical polynomial inside the scalar helper.
+            let output = self.emit_trig_scalar_call(input, is_cos);
+            let index = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(lane as i128, MirType::I64));
+            let ptr = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: storage,
+                    index,
+                    elem: MirType::F32,
+                },
+            );
+            self.builder.build_void(Op::Store { ptr, value: output });
+        }
+        let repaired = self
+            .builder
+            .build(fty.clone(), Op::Load(storage, fty.clone()));
+        self.builder.br(merge, vec![repaired]);
+        self.builder.switch_to(merge);
+        result
+    }
+
+    fn emit_trig_scalar_call(&mut self, x: ValueId, is_cos: bool) -> ValueId {
+        let op = if is_cos { VMATH_COS } else { VMATH_SIN };
+        let opcode = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        self.builder.build(
+            MirType::F32,
+            Op::Call {
+                func: self.gemm.trig_f32,
+                args: vec![x, opcode],
+            },
+        )
+    }
+
+    /// The bounded sin/cos polynomial in `f32` (`fty` is `f32` or a `Vec` of `f32`). Reduces `x` to
     /// `r ∈ [-π/4, π/4]` by `q = round(x·2/π)` quadrants (round-to-nearest via the add-magic trick),
     /// evaluates the Cephes `sinf`/`cosf` minimax polynomials on `r`, and selects ±sin/±cos by
     /// `q mod 4`. The quadrant is reduced to an exact small float so every blend uses a float-compare
     /// mask (the proven `select` path), and every step is a primitive op, so both backends agree.
-    fn emit_trig_f32(&mut self, x: ValueId, fty: &MirType, is_cos: bool) -> ValueId {
+    fn emit_trig_poly_f32(&mut self, x: ValueId, fty: &MirType, is_cos: bool) -> ValueId {
         let ity = match fty {
             MirType::Vec(_, n) => MirType::Vec(Box::new(MirType::I32), *n),
             _ => MirType::I32,
@@ -21706,7 +21794,17 @@ impl FnLowerer<'_> {
         let eq2 = self.builder.build(mty, Op::Cmp(CmpOp::Foeq, quad, k2));
         let sel23 = self.builder.build(fty.clone(), Op::Select(eq2, a2, a3));
         let sel123 = self.builder.build(fty.clone(), Op::Select(eq1, a1, sel23));
-        self.builder.build(fty.clone(), Op::Select(eq0, a0, sel123))
+        let result = self.builder.build(fty.clone(), Op::Select(eq0, a0, sel123));
+        if is_cos {
+            result
+        } else {
+            let zero = self.splat_const_f(0.0, fty);
+            let is_zero = self
+                .builder
+                .build(mask_ty(fty), Op::Cmp(CmpOp::Foeq, x, zero));
+            self.builder
+                .build(fty.clone(), Op::Select(is_zero, x, result))
+        }
     }
 
     /// `atan(x)`, computed in `f32` (demote/promote an `f64` result like `exp`). Works on a scalar or
@@ -30105,6 +30203,9 @@ const ERF_A: [f64; 5] = [
 // Cephes π/4 `DP` constants doubled) so the cancellation stays accurate. `q mod 4` picks ±sin/±cos of
 // the reduced angle. All primitive ops + the proven round-to-nearest magic, so both backends agree.
 const TWO_OVER_PI: f64 = std::f64::consts::FRAC_2_PI; // 2/π — quadrant count = round(x·2/π)
+
+// Keep synchronized with runtime/vmath.rs; accuracy is checked on both sides of this cutoff.
+const TRIG_FAST_LIMIT: f64 = 4096.0;
 const PIO2_1: f64 = 1.5703125; // π/2 high (2 × Cephes DP1 = 2 × 0.78515625)
 const PIO2_2: f64 = 4.837_512_969_970_703e-4; // π/2 mid  (2 × DP2)
 const PIO2_3: f64 = 7.549_789_954_891_88e-8; // π/2 low  (2 × DP3)

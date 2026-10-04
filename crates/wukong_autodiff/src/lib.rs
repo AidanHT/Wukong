@@ -328,6 +328,45 @@ impl<'a> Vjp<'a> {
         let ty = self.fwd.value_type(old_r).clone();
 
         match &inst.op {
+            // Scalar trig is a value-returning operation, not a buffer-tape kernel. Its
+            // runtime branch must not force a formerly straight-line loss into CFG/scratch
+            // memory the current AD model cannot differentiate. Differentiate the function
+            // itself, including large finite arguments, using its paired trig operation.
+            Op::Call { func, args } if self.it.resolve(*func) == "wukong_rt_trig_f32" => {
+                if args.len() != 2
+                    || ty != MirType::F32
+                    || self.fwd.value_type(args[0]) != &MirType::F32
+                {
+                    return Err("autodiff: invalid scalar trig ABI".into());
+                }
+                let Some(Op::ConstInt(op, MirType::I64)) = self.def_op.get(&args[1]).copied()
+                else {
+                    return Err("autodiff: scalar trig operation must be a constant i64".into());
+                };
+                let op = *op as i64;
+                // Public runtime op codes: sin=15, cos=16; other codes are identity.
+                if !matches!(op, 15 | 16) {
+                    self.accum(args[0], g);
+                } else {
+                    let paired = self.b.build(
+                        MirType::I64,
+                        Op::ConstInt(if op == 15 { 16 } else { 15 }, MirType::I64),
+                    );
+                    let x = self.remap(args[0]);
+                    let mut derivative = self.b.build(
+                        MirType::F32,
+                        Op::Call {
+                            func: *func,
+                            args: vec![x, paired],
+                        },
+                    );
+                    if op == 16 {
+                        derivative = self.neg(derivative, &ty);
+                    }
+                    let contribution = self.fmul(g, derivative, &ty);
+                    self.accum(args[0], contribution);
+                }
+            }
             // d(a + b) = (g, g)
             Op::Bin(BinOp::FAdd, a, b) => {
                 self.accum(*a, g);

@@ -37,6 +37,8 @@ rayon = "1"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
 
 [dev-dependencies]
+wukong_autodiff = { workspace = true }
+wukong_codegen_llvm = { workspace = true }
 wukong_parser = { workspace = true }
 wukong_sema = { workspace = true }
 wukong_mir_build = { workspace = true }

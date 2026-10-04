@@ -5,6 +5,21 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Full-range f32 trig and benchmark scheduling, 2026-10-04
+
+- `sin`, `cos` and `tan` use the existing bounded polynomial for ordinary inputs
+  and a shared platform-libm fallback for large finite inputs. Runtime SIMD and
+  generic vector lowering preserve a fast polynomial path, explicit signed zero,
+  and NaN behavior. Scalar autodiff and the reduced C link fallback support the
+  new scalar helper. These operations retain the existing f32 precision boundary
+  when called with f64 values.
+- Interpreter f32 host buffers preserve untouched signaling-NaN bits during
+  marshalling. Arithmetic still quiets signaling NaNs.
+- All timed families in the main CPU benchmark harness now build before timing
+  and rotate fixed peer slots. Remaining general/model scheduling obligations
+  and performance measurements are tracked in the closeout checklist; these
+  changes do not establish a speedup or SOTA superiority.
+
 ### CPU closeout correctness and verification, 2026-09-23
 
 - Runtime and inlined f32 math now agree on `atan2` axis/infinity cases, `hypot`

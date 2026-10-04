@@ -171,6 +171,7 @@ const RT_SGEMM_BF16_NT_EPI_PAR: &str = "wukong_sgemm_bf16_nt_epi_parallel";
 const RT_SGEMM_F16_NT_EPI: &str = "wukong_sgemm_f16_nt_epi";
 const RT_SGEMM_F16_NT_EPI_PAR: &str = "wukong_sgemm_f16_nt_epi_parallel";
 const RT_VMATH: &str = "wukong_vmath_f32";
+const RT_TRIG_F32: &str = "wukong_rt_trig_f32";
 const RT_VMATH_PARALLEL: &str = "wukong_vmath_f32_parallel";
 const RT_VMATH2: &str = "wukong_vmath2_f32";
 const RT_SOFTMAX_BWD: &str = "wukong_softmax_bwd_f32";
@@ -1349,6 +1350,13 @@ impl<'a> FnTranslator<'a> {
                 .call(fref, &[a, b, c, m, k, n, beta, alpha]);
             return None;
         }
+        if name == RT_TRIG_F32 && args.len() == 2 {
+            let x = self.val(args[0]);
+            let op = self.coerce_to_i64(args[1]);
+            let fref = self.runtime_ref(RT_TRIG_F32);
+            let call = self.builder.ins().call(fref, &[x, op]);
+            return Some(self.builder.inst_results(call)[0]);
+        }
         // The vectorized elementwise transcendental: wukong_vmath_f32(x, out, n, op) — two pointers
         // and two i64 (element count, op code). The 256-bit AVX2 kernel an `out[i]=f(x[i])` loop
         // lowers to.
@@ -2158,6 +2166,7 @@ struct RtFuncs {
     sgemm_f16_nt_epi: FuncId,
     sgemm_f16_nt_epi_par: FuncId,
     vmath: FuncId,
+    trig_f32: FuncId,
     vmath_par: FuncId,
     vmath2: FuncId,
     softmax_bwd: FuncId,
@@ -2478,6 +2487,10 @@ fn populate_module<M: Module>(
     sig_vmath.params.push(AbiParam::new(ptr_ty));
     sig_vmath.params.push(AbiParam::new(types::I64));
     sig_vmath.params.push(AbiParam::new(types::I64));
+    let mut sig_trig = Signature::new(call_conv);
+    sig_trig.params.push(AbiParam::new(types::F32));
+    sig_trig.params.push(AbiParam::new(types::I64));
+    sig_trig.returns.push(AbiParam::new(types::F32));
     // wukong_vmath2_f32(x, y, out: ptr, n: i64, op: i64) — two-input transcendental (pow/atan2/hypot).
     let mut sig_vmath2 = Signature::new(call_conv);
     sig_vmath2.params.push(AbiParam::new(ptr_ty));
@@ -2819,6 +2832,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         vmath: module
             .declare_function(RT_VMATH, Linkage::Import, &sig_vmath)
+            .map_err(|e| e.to_string())?,
+        trig_f32: module
+            .declare_function(RT_TRIG_F32, Linkage::Import, &sig_trig)
             .map_err(|e| e.to_string())?,
         vmath_par: module
             .declare_function(RT_VMATH_PARALLEL, Linkage::Import, &sig_vmath)
@@ -3234,6 +3250,7 @@ fn populate_module<M: Module>(
         (RT_SGEMM_F16_NT_EPI, rt.sgemm_f16_nt_epi),
         (RT_SGEMM_F16_NT_EPI_PAR, rt.sgemm_f16_nt_epi_par),
         (RT_VMATH, rt.vmath),
+        (RT_TRIG_F32, rt.trig_f32),
         (RT_VMATH_PARALLEL, rt.vmath_par),
         (RT_VMATH2, rt.vmath2),
         (RT_SOFTMAX_BWD, rt.softmax_bwd),
@@ -4041,6 +4058,7 @@ pub fn jit_compile(
         wukong_runtime::wukong_sgemm_f16_nt_epi_parallel as *const u8,
     );
     builder.symbol(RT_VMATH, wukong_runtime::wukong_vmath_f32 as *const u8);
+    builder.symbol(RT_TRIG_F32, wukong_runtime::wukong_rt_trig_f32 as *const u8);
     builder.symbol(
         RT_VMATH_PARALLEL,
         wukong_runtime::wukong_vmath_f32_parallel as *const u8,
@@ -4613,6 +4631,7 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
         wukong_runtime::wukong_sgemm_f16_nt_epi_parallel as *const u8,
     );
     builder.symbol(RT_VMATH, wukong_runtime::wukong_vmath_f32 as *const u8);
+    builder.symbol(RT_TRIG_F32, wukong_runtime::wukong_rt_trig_f32 as *const u8);
     builder.symbol(
         RT_VMATH_PARALLEL,
         wukong_runtime::wukong_vmath_f32_parallel as *const u8,
