@@ -16,12 +16,18 @@ run it exits with code 2 (`UNIMPLEMENTED`) but still writes the object; a linker
 to link exits 1.
 
 The `cc` fallback is a reduced path, not an equivalent one: the small generated C runtime resolves
-only the `wukong_rt_*` intrinsics (print/assert/fmod/heap), so a program that dispatches any
+only the `wukong_rt_*` intrinsics (print/assert/fmod/heap/scalar trigonometry), so a program that dispatches any
 recognized `wukong_*` microkernel — or that needs MSVC-object data relocations — cannot be linked
 that way, and it prints floats via `printf("%g")` so its stdout is not byte-identical to `--run`. The
 rustc path formats through Rust's `Display` and links `wukong_runtime`, which is why it is preferred;
 treat `cc` as scalar-program-only. To run with zero external toolchain at all, use the interpreter:
 `wukongc --run program.wk`.
+
+Scalar sine/cosine use the same bounded polynomial and explicit FMA operations in the Rust and
+C runtimes; arguments with magnitude at least 4096 use the platform's full-range `sinf`/`cosf`.
+The C link command disables implicit FP contraction so the polynomial's separate operations
+retain their rounding. Tangent remains the quotient of the shared sine and cosine. This does
+not change the C fallback's float-printing limitation described above.
 
 LLVM enters **only** through `--emit=llvm-ir`, which prints **textual LLVM IR** for inspection — and
 even that needs no LLVM installed (it is just text on stdout):

@@ -209,7 +209,7 @@ const LOG_C2: f32 = 0.333_333_34; // (1/3) rounded to f32
 const LOG_C3: f32 = -0.25;
 const LOG_C4: f32 = 0.2;
 
-// --- sin/cos and erf constants (mirror wukong_mir_build's inlined `emit_trig_f32`/`emit_erf_f32`
+// --- sin/cos and erf constants (mirror wukong_mir_build's inlined `emit_trig_poly_f32`/`emit_erf_f32`
 // poly constants, so a dispatched `sin`/`cos`/`erf` loop agrees with a composed/scalar one) ---------
 // The `f64 as f32` casts reproduce exactly what `splat_const_f` does to the matching f64 literals
 // there, keeping the dispatched kernel bit-identical to the inlined form.
@@ -217,6 +217,13 @@ const TWO_OVER_PI: f32 = std::f64::consts::FRAC_2_PI as f32; // 2/π — quadran
 const PIO2_1: f32 = 1.5703125_f64 as f32; // π/2 high (2 × Cephes DP1)
 const PIO2_2: f32 = 4.837_512_969_970_703e-4_f64 as f32; // π/2 mid (2 × DP2)
 const PIO2_3: f32 = 7.549_789_954_891_88e-8_f64 as f32; // π/2 low (2 × DP3)
+
+// Keep the three-part reduction below the conservative ±4096 Cephes range. This is
+// not the much larger float-to-i32 conversion limit: reduction accuracy fails first.
+// Our nearest-quadrant/FMA spelling is checked independently at the cutoff below.
+// https://netlib.org/cephes/singldoc.html#sinf
+// Must match mir_build's TRIG_FAST_LIMIT.
+const TRIG_FAST_LIMIT: f32 = 4096.0;
 const SIN_P: [f32; 3] = [
     -1.9515295891e-4_f64 as f32,
     8.3321608736e-3_f64 as f32,
@@ -634,12 +641,26 @@ fn hardswish1(x: f32) -> f32 {
 
 /// `sin(x)` (`is_cos == false`) or `cos(x)` (`true`), the Cephes single-precision algorithm: reduce
 /// `x` to `r ∈ [−π/4, π/4]` by `q = round(x·2/π)` quadrants (the add-magic round-to-nearest), evaluate
-/// the `sinf`/`cosf` minimax polys on `r`, and pick ±sin/±cos by `q mod 4`. Mirrors `emit_trig_f32`
+/// the `sinf`/`cosf` minimax polys on `r`, and pick ±sin/±cos by `q mod 4`. Mirrors `emit_trig_poly_f32`
 /// op-for-op (same constants, same FMA structure, the quadrant blended with float-eq masks), so a
-/// dispatched `sin(x)` loop agrees with a composed/scalar one. Accurate to ≈1 ULP for the |x| where the
-/// 3-part π/2 split holds (RoPE angles, ≲ a few thousand); large |x| loses the reduction, as with libm.
+/// dispatched `sin(x)` loop agrees with a composed/scalar one. The three-part reduction is used
+/// only for |x| < 4096; larger finite inputs use libm's full-range reduction. NaNs retain their
+/// sign/payload and are quieted; infinities produce a canonical NaN. Sine preserves signed zero.
 #[inline]
 pub(crate) fn sincos1(x: f32, is_cos: bool) -> f32 {
+    if !x.is_finite() {
+        return if x.is_nan() {
+            f32::from_bits(x.to_bits() | 0x0040_0000)
+        } else {
+            f32::NAN
+        };
+    }
+    if x.abs() >= TRIG_FAST_LIMIT {
+        return if is_cos { x.cos() } else { x.sin() };
+    }
+    if x == 0.0 {
+        return if is_cos { 1.0 } else { x };
+    }
     let tt = x.mul_add(TWO_OVER_PI, EXP_MAGIC);
     let qf = tt - EXP_MAGIC;
     let r = qf.mul_add(-PIO2_1, x);
@@ -678,6 +699,18 @@ pub(crate) fn sincos1(x: f32, is_cos: bool) -> f32 {
         a0
     } else {
         sel123
+    }
+}
+
+/// Scalar trigonometry used by standalone MIR expressions and exceptional SIMD lanes.
+/// Keeping this value-returning ABI separate from array kernels preserves scalar autodiff.
+/// `VM_SIN` and `VM_COS` select sine/cosine; an unknown operation is identity, like vmath.
+#[no_mangle]
+pub extern "C" fn wukong_rt_trig_f32(x: f32, op: i64) -> f32 {
+    match op {
+        VM_SIN => sincos1(x, false),
+        VM_COS => sincos1(x, true),
+        _ => x,
     }
 }
 
@@ -2437,6 +2470,13 @@ pub(crate) unsafe fn sincos8(
     is_cos: bool,
 ) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
+    let original = x;
+    let abs = _mm256_andnot_ps(_mm256_set1_ps(-0.0), x);
+    let in_range = _mm256_cmp_ps::<_CMP_LT_OQ>(abs, _mm256_set1_ps(TRIG_FAST_LIMIT));
+    let in_range_bits = _mm256_movemask_ps(in_range);
+    // Invalid/large lanes never enter the reduction or its float-to-i32 conversion.
+    // Repair only those lanes below, leaving every ordinary lane's polynomial unchanged.
+    let x = _mm256_blendv_ps(_mm256_setzero_ps(), x, in_range);
     let magic = _mm256_set1_ps(EXP_MAGIC);
     let tt = _mm256_fmadd_ps(x, _mm256_set1_ps(TWO_OVER_PI), magic);
     let qf = _mm256_sub_ps(tt, magic);
@@ -2458,7 +2498,7 @@ pub(crate) unsafe fn sincos8(
     let cz2 = _mm256_mul_ps(c, z2);
     let hz = _mm256_fmadd_ps(_mm256_set1_ps(-0.5), z, _mm256_set1_ps(1.0));
     let cos_p = _mm256_add_ps(hz, cz2);
-    // quad = (int)qf & 3, back to float for the float-eq masks (mirrors the scalar truncating cast).
+    // The guarded qf fits i32, so truncation agrees with the scalar cast.
     let quad_i = _mm256_and_si256(_mm256_cvttps_epi32(qf), _mm256_set1_epi32(3));
     let quad = _mm256_cvtepi32_ps(quad_i);
     let neg1 = _mm256_set1_ps(-1.0);
@@ -2475,7 +2515,24 @@ pub(crate) unsafe fn sincos8(
     let eq2 = _mm256_cmp_ps::<_CMP_EQ_OQ>(quad, _mm256_set1_ps(2.0));
     let sel23 = _mm256_blendv_ps(a3, a2, eq2);
     let sel123 = _mm256_blendv_ps(sel23, a1, eq1);
-    _mm256_blendv_ps(sel123, a0, eq0)
+    let mut result = _mm256_blendv_ps(sel123, a0, eq0);
+    if !is_cos {
+        let zero = _mm256_cmp_ps::<_CMP_EQ_OQ>(original, _mm256_setzero_ps());
+        result = _mm256_blendv_ps(result, original, zero);
+    }
+    if in_range_bits != 0xff {
+        let mut inputs = [0.0; 8];
+        let mut outputs = [0.0; 8];
+        _mm256_storeu_ps(inputs.as_mut_ptr(), original);
+        _mm256_storeu_ps(outputs.as_mut_ptr(), result);
+        for lane in 0..8 {
+            if in_range_bits & (1 << lane) == 0 {
+                outputs[lane] = sincos1(inputs[lane], is_cos);
+            }
+        }
+        result = _mm256_loadu_ps(outputs.as_ptr());
+    }
+    result
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -623,6 +623,59 @@ void* wukong_rt_alloc(long long count, long long elem_size, long long elem_is_fl
 }\n\
 void wukong_rt_free(void* p) { free(p); }\n";
 
+// Scalar-only C link fallback. Keep operations/constants in lockstep with runtime/vmath.rs,
+// including explicit fmaf and nonfinite bits; plain sinf/cosf for every input would differ
+// from the bounded polynomial used by the interpreter. cc_link_args disables contraction
+// of the deliberately separate multiplies/adds. Large inputs use the platform libm in both.
+const WUKONG_TRIG_C: &str = r#"
+#include <stdint.h>
+#include <string.h>
+float wukong_rt_trig_f32(float x, long long op) {
+    if (op != 15 && op != 16) return x;
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+    if ((bits & UINT32_C(0x7fffffff)) >= UINT32_C(0x7f800000)) {
+        bits = (bits & UINT32_C(0x007fffff))
+            ? bits | UINT32_C(0x00400000) : UINT32_C(0x7fc00000);
+        memcpy(&x, &bits, sizeof(x));
+        return x;
+    }
+    if (fabsf(x) >= 4096.0f) return op == 16 ? cosf(x) : sinf(x);
+    if (x == 0.0f) return op == 16 ? 1.0f : x;
+    float tt = fmaf(x, 0.63661977236758134308f, 12582912.0f);
+    float qf = tt - 12582912.0f;
+    float r = fmaf(qf, -1.5703125f, x);
+    r = fmaf(qf, -4.837512969970703e-4f, r);
+    r = fmaf(qf, -7.54978995489188e-8f, r);
+    float z = r * r;
+    float s = fmaf(-1.9515295891e-4f, z, 8.3321608736e-3f);
+    s = fmaf(s, z, -1.6666654611e-1f);
+    float sz = s * z;
+    float sin_p = fmaf(sz, r, r);
+    float c = fmaf(2.443315711809948e-5f, z, -1.388731625493765e-3f);
+    c = fmaf(c, z, 4.166664568298827e-2f);
+    float z2 = z * z;
+    float cz2 = c * z2;
+    float hz = fmaf(-0.5f, z, 1.0f);
+    float cos_p = hz + cz2;
+    int quad = ((int32_t)qf) & 3;
+    if (op == 16) {
+        if (quad == 0) return cos_p;
+        if (quad == 1) return sin_p * -1.0f;
+        if (quad == 2) return cos_p * -1.0f;
+        return sin_p;
+    }
+    if (quad == 0) return sin_p;
+    if (quad == 1) return cos_p;
+    if (quad == 2) return sin_p * -1.0f;
+    return cos_p * -1.0f;
+}
+"#;
+
+fn c_runtime_source() -> String {
+    format!("{WUKONG_RT_C}\n{WUKONG_TRIG_C}")
+}
+
 /// A per-invocation scratch directory for the generated `--emit=exe` link inputs (the Rust link
 /// shim and the C fallback runtime). They used to be written into the process's *current* directory
 /// as `{stem}_shim.rs` / `{stem}_rt.c`, where the shim overwrote — and then unconditionally deleted
@@ -766,7 +819,7 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
 
     // exe (fallback): emit the C runtime into the scratch dir and link it with the system C compiler.
     let rt_path = scratch_path(scratch.as_ref(), format!("{stem}_rt.c"));
-    if let Err(e) = std::fs::write(&rt_path, WUKONG_RT_C) {
+    if let Err(e) = std::fs::write(&rt_path, c_runtime_source()) {
         eprintln!("error: could not write `{}`: {e}", rt_path.display());
         return exit::IO_ERROR;
     }
@@ -840,6 +893,7 @@ fn cc_link_args(obj_path: &Path, rt_path: &Path, out: &Path) -> Vec<std::ffi::Os
         "-o".into(),
         out.into(),
         "-O2".into(),
+        "-ffp-contract=off".into(),
         "-lm".into(),
     ]
 }
@@ -3110,6 +3164,10 @@ mod native_link_tests {
         assert!(
             lm > rt,
             "`-lm` must follow `prog_rt.c` (GNU ld resolves left to right): {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "-ffp-contract=off"),
+            "the scalar trig mirror requires explicit FMA boundaries: {args:?}"
         );
     }
 

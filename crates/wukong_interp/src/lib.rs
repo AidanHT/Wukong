@@ -357,6 +357,35 @@ pub fn run_kernel_f32_accel(
     run_kernel_f32_inner(program, entry, bufs, interner, Some(accel))
 }
 
+// Host-buffer marshalling is a bit-preserving transfer, not floating-point arithmetic.
+// Numeric casts quiet signaling NaNs on some targets even when the kernel never writes
+// the input. Preserve their sign/payload explicitly at this boundary only.
+fn widen_buffer_f32(value: f32) -> f64 {
+    if value.is_nan() {
+        let bits = value.to_bits();
+        f64::from_bits(
+            (u64::from(bits & 0x8000_0000) << 32)
+                | 0x7ff0_0000_0000_0000
+                | (u64::from(bits & 0x007f_ffff) << 29),
+        )
+    } else {
+        value as f64
+    }
+}
+
+fn narrow_buffer_f32(value: f64) -> f32 {
+    if value.is_nan() {
+        let bits = value.to_bits();
+        let payload = ((bits & 0x000f_ffff_ffff_ffff) >> 29) as u32;
+        // A NaN produced in f64 may carry only low payload bits; truncation must
+        // not turn that NaN into infinity.
+        let payload = if payload == 0 { 0x0040_0000 } else { payload };
+        f32::from_bits(((bits >> 32) as u32 & 0x8000_0000) | 0x7f80_0000 | payload)
+    } else {
+        value as f32
+    }
+}
+
 fn run_kernel_f32_inner(
     program: &Program,
     entry: Symbol,
@@ -405,7 +434,7 @@ fn run_kernel_f32_inner(
             bases.push(interp.memory.len());
             interp
                 .memory
-                .extend(buf.iter().map(|&v| Value::Float(v as f64)));
+                .extend(buf.iter().map(|&v| Value::Float(widen_buffer_f32(v))));
         }
         let args: Vec<Value> = bases.iter().map(|&b| Value::Ptr(b)).collect();
         interp.run_function(func, &args)?;
@@ -413,7 +442,7 @@ fn run_kernel_f32_inner(
         for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
             for (i, slot) in buf.iter_mut().enumerate() {
                 *slot = match interp.memory[base + i] {
-                    Value::Float(f) => f as f32,
+                    Value::Float(f) => narrow_buffer_f32(f),
                     Value::Int(n) => n as f32,
                     _ => 0.0,
                 };
@@ -2605,6 +2634,16 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .ok_or("colreduce output out of bounds")? = Value::Float(val as f64);
                 }
                 Ok(Value::Unit)
+            }
+            // Scalar math ABI: shared full-range trig, including exceptional SIMD lanes.
+            "wukong_rt_trig_f32" => {
+                if args.len() != 2 {
+                    return Err("wukong_rt_trig_f32 expects two arguments".into());
+                }
+                Ok(Value::Float(wukong_runtime::wukong_rt_trig_f32(
+                    args[0].as_float() as f32,
+                    args[1].as_int() as i64,
+                ) as f64))
             }
             // `wukong_vmath2_f32(x, y, out, n, op)` — the two-input 256-bit kernel (pow/atan2/hypot)
             // an `out[i] = f(x[i], y[i])` loop lowers to. Marshal `n` f32 from x AND y, call the
