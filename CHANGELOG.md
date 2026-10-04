@@ -15,8 +15,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   when called with f64 values.
 - Interpreter f32 host buffers preserve untouched signaling-NaN bits during
   marshalling. Arithmetic still quiets signaling NaNs.
-- All timed families in the main CPU benchmark harness now build before timing
-  and rotate fixed peer slots. Remaining general/model scheduling obligations
+- Timed families in the main and general CPU benchmark modules now build before
+  timing and rotate fixed peer slots. Remaining model/Torch scheduling obligations
   and performance measurements are tracked in the closeout checklist; these
   changes do not establish a speedup or SOTA superiority.
 

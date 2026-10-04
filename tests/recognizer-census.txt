@@ -300,7 +300,7 @@ rmsnorm_const_eps.wk: wukong_norm_f32
 rmsnorm_no_eps.wk: wukong_norm_f32
 rope.wk: wukong_rope_f32
 rope_bwd.wk: wukong_rope_bwd_f32
-rope_elem_f64.wk:
+rope_elem_f64.wk: wukong_rt_trig_f32 wukong_rt_trig_f32*2
 rounding.wk:
 rowarg_elem_nonf32.wk:
 rowargmax.wk: wukong_rowargmax_i32 wukong_rowargmin_i32
@@ -360,8 +360,8 @@ transpose.wk:
 transpose_bf16.wk: wukong_transpose_u16
 transpose_f32.wk: wukong_transpose_f32
 transpose_f32_blocked.wk: wukong_transpose_f32
-trig.wk: wukong_vmath_f32 wukong_vmath_f32*3
-trig_inverse.wk: wukong_vmath_f32
+trig.wk: wukong_rt_trig_f32 wukong_rt_trig_f32*6 wukong_vmath_f32 wukong_vmath_f32*3
+trig_inverse.wk: wukong_rt_trig_f32 wukong_rt_trig_f32*2 wukong_vmath_f32
 tuple.wk:
 u64_literal.wk:
 uninit_zero.wk:
