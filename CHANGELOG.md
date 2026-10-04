@@ -5,6 +5,12 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### October 4 generated-MIR verification and AVX2 coverage
+
+- Verify synthesized gradients and complete training programs by default before use. Four new verifier tests and 16 existing gradient CLI tests pass.
+- Protect raw AVX2 test buffers, check untouched tails and detect deliberate guard corruption. All 18 focused tests pass.
+- Combined integration checks remain pending; these changes do not establish performance gains.
+
 ### Full-range f32 trig and benchmark scheduling, 2026-10-04
 
 - The C executable fallback rejects unsupported float printing with an explicit

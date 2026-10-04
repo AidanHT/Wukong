@@ -807,8 +807,9 @@ and optimizer through the **interpreter only**, including when a native backend 
 Native/AOT training and generated-backward performance comparisons remain open. `--grad-of` selects
 the loss and `--grad-wrt` its differentiated buffers. Autodiff requires at least `-O1` for SSA
 construction; `-O2`/`-O3` retain the selected loss while still inlining calls and optimizing its body.
-Generated gradients are not themselves optimized. `--verify-each` checks the synthesized backward
-and training kernels; gradient MIR emission also verifies its output.
+Generated gradients are not themselves optimized. The driver verifies synthesized backward MIR
+and the complete training program by default, before execution. `--verify-each` additionally
+checks each optimization pass; gradient MIR emission also verifies its output.
 
 Eight kernel families have VJP rules, including their parallel spellings: `sgemm`, `sgemm_nt`,
 `bias` without a fused activation, `sreduce_f32` (SUM, DOT, SSD, SUMABS, ABSDIFF), `velem_f32`
