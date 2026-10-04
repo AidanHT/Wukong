@@ -1,6 +1,6 @@
 //! Compile-fail tests: each `tests/fail/*.wk` program must be rejected with a specific stable
 //! error code. We drive the real binary with `--error-format=json --emit=mir` (which runs sema)
-//! and assert the expected `"code":"E…"` appears and the process exits non-zero.
+//! and assert the first diagnostic is an error with the expected code and the process exits non-zero.
 //!
 //! This is the end-to-end guard for Wukong's compile-time checks — most importantly the shape
 //! checker (`E0501` rank, `E0502` dimension).
@@ -47,6 +47,56 @@ fn compile_json(path: &Path) -> (bool, String) {
     )
 }
 
+/// Read the first diagnostic's code using the renderer's pinned JSON-lines prefix.
+/// This is deliberately not a search: an earlier unrelated error, a code-less error,
+/// or non-diagnostic stderr must not be hidden by a matching later diagnostic.
+/// `wukong_diag::to_json` fixes severity/code/message order and colon spacing.
+fn first_error_code(stderr: &str) -> Option<&str> {
+    let line = stderr.lines().next()?;
+    let fields = line.strip_prefix("{\"severity\":\"error\",\"code\":\"")?;
+    let (code, rest) = fields.split_once('"')?;
+    (rest.starts_with(",\"message\":") && line.ends_with('}')).then_some(code)
+}
+
+#[test]
+fn compile_fail_code_check_rejects_secondary_only_matches() {
+    let wanted = r#"{"severity":"error","code":"E0502","message":"dimension mismatch","spans":[],"notes":[]}"#;
+    let unrelated =
+        r#"{"severity":"error","code":"E0401","message":"unrelated error","spans":[],"notes":[]}"#;
+    assert_eq!(first_error_code(wanted), Some("E0502"));
+    assert_eq!(
+        first_error_code(&format!("{wanted}\n{unrelated}\n")),
+        Some("E0502")
+    );
+    // The old contains check accepted this stream even though its first error changed.
+    let secondary_only = format!("{unrelated}\n{wanted}\n");
+    assert!(secondary_only.contains("\"code\":\"E0502\""));
+    assert_eq!(first_error_code(&secondary_only), Some("E0401"));
+
+    for prefix in [
+        "",
+        "compiler crashed\n",
+        "\n",
+        r#"{"severity":"error","message":"missing code","spans":[],"notes":[]}"#,
+        r#"{"severity":"warning","code":"E0502","message":"warning","spans":[],"notes":[]}"#,
+        r#"{"severity":"error","code":null,"message":"missing code","spans":[],"notes":[]}"#,
+    ] {
+        assert_eq!(first_error_code(prefix), None, "prefix: {prefix:?}");
+        if !prefix.is_empty() {
+            assert_ne!(
+                first_error_code(&format!("{prefix}\n{wanted}")),
+                Some("E0502"),
+                "a later diagnostic hid this prefix: {prefix:?}"
+            );
+        }
+    }
+    let message_only = r#"{"severity":"error","code":"E0401","message":"text mentions \"code\":\"E0502\"","spans":[],"notes":[]}"#;
+    assert_eq!(first_error_code(message_only), Some("E0401"));
+    let similar =
+        r#"{"severity":"error","code":"E05020","message":"different code","spans":[],"notes":[]}"#;
+    assert_ne!(first_error_code(similar), Some("E0502"));
+}
+
 #[test]
 fn compile_fail_suite() {
     let dir = fail_dir();
@@ -65,9 +115,10 @@ fn compile_fail_suite() {
 
         let name = p.file_name().unwrap().to_string_lossy();
         assert!(!ok, "{name}: expected a compile error but it succeeded");
-        assert!(
-            stderr.contains(&format!("\"code\":\"{want}\"")),
-            "{name}: expected error code {want}, got:\n{stderr}"
+        assert_eq!(
+            first_error_code(&stderr),
+            Some(want.as_str()),
+            "{name}: expected first diagnostic to be error {want}, got:\n{stderr}"
         );
         // A pinned code that is not in the catalogue is a code `wukongc --explain` cannot describe.
         assert!(
@@ -151,9 +202,10 @@ fn lexer_and_parser_diagnostics_are_reachable() {
             !ok,
             "{code}: the probe source compiled successfully:\n{src}"
         );
-        assert!(
-            stderr.contains(&format!("\"code\":\"{code}\"")),
-            "{code}: the probe source no longer reaches this diagnostic. Source:\n{src}\nGot:\n{stderr}"
+        assert_eq!(
+            first_error_code(&stderr),
+            Some(*code),
+            "{code}: the probe source no longer starts with this error. Source:\n{src}\nGot:\n{stderr}"
         );
         assert!(
             wukong_driver::explain(code).is_some(),
@@ -228,7 +280,7 @@ const NAMED_DIM_MESSAGES: &[(&str, &str, &[&str])] = &[
         &["tensor rank mismatch: expected rank 2 [M, N], found rank 3 [4, 4, 4]"],
     ),
     // `a[5, 5]` on a square tensor raises one diagnostic per axis; only the axis tells them apart.
-    // The `find` below takes the first, which is axis 0.
+    // The first diagnostic must be axis 0.
     (
         "tensor_index_oob.wk",
         "E0501",
@@ -237,7 +289,7 @@ const NAMED_DIM_MESSAGES: &[(&str, &str, &[&str])] = &[
 ];
 
 /// The dimension a shape error is about must reach a tool through the JSON stream: the stable
-/// `code` field (unchanged, and still the exact `"code":"Ennnn"` substring the suite greps) plus a
+/// `code` field on the first error (using the renderer's pinned field order) plus a
 /// `message` field that names the dim and both extents.
 #[test]
 fn shape_diagnostics_name_the_dim_in_json() {
@@ -245,10 +297,15 @@ fn shape_diagnostics_name_the_dim_in_json() {
         let p = fail_dir().join(fixture);
         let (ok, stderr) = compile_json(&p);
         assert!(!ok, "{fixture}: expected a compile error");
+        assert_eq!(
+            first_error_code(&stderr),
+            Some(*code),
+            "{fixture}: {stderr}"
+        );
         let line = stderr
             .lines()
-            .find(|l| l.contains(&format!("\"code\":\"{code}\"")))
-            .unwrap_or_else(|| panic!("{fixture}: no {code} diagnostic in stderr:\n{stderr}"));
+            .next()
+            .expect("the first error assertion established a diagnostic line");
         // One JSON object per line, still parseable as such.
         assert!(
             line.starts_with('{') && line.ends_with('}'),
@@ -277,10 +334,11 @@ fn imported_file_diagnostics_carry_their_own_path() {
     let p = fail_dir().join("import_type_error.wk");
     let (ok, stderr) = compile_json(&p);
     assert!(!ok, "expected a compile error");
+    assert_eq!(first_error_code(&stderr), Some("E0401"), "{stderr}");
     let line = stderr
         .lines()
-        .find(|l| l.contains("\"code\":\"E0401\""))
-        .unwrap_or_else(|| panic!("no E0401 diagnostic in stderr:\n{stderr}"));
+        .next()
+        .expect("the first error assertion established a diagnostic line");
     assert!(
         line.contains("badlib.wk"),
         "the E0401 span must point into the imported file (lib/badlib.wk):\n{line}"

@@ -12,7 +12,7 @@ module tests.fail.my_fixture
 
 - Exactly **one** `// EXPECT-CODE:` per file; the first match wins.
 - A fixture without it panics the whole suite.
-- Harness runs `--error-format=json --emit=mir` and checks stderr for `"code":"<code>"`.
+- Harness runs `--error-format=json --emit=mir` and requires the first diagnostic to be an error with the pinned code. A later matching code cannot hide an unrelated first error, a code-less diagnostic or leading non-diagnostic stderr.
 
 Codes are permanently stable — never renumber or recycle. `E0001` is retired.
 

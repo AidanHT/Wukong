@@ -2,9 +2,9 @@
 //! `--error-format=json`. Tooling (editors, CI) can parse these without scraping the terminal
 //! renderer's output. Hand-written to keep `wukong_diag` dependency-free.
 //!
-//! CONTRACT: `crates/wukongc/tests/fail.rs` — the whole compile-fail suite — greps stderr for the
-//! exact substring `"code":"Ennnn"`, so `field_str`'s lack of whitespace around `:`, and the fact
-//! that the code is emitted as a quoted string, are load-bearing, not cosmetic.
+//! CONTRACT: `crates/wukongc/tests/fail.rs` requires the first diagnostic to be an error and pins its code using the
+//! severity/code/message field order below. That order, `field_str`'s lack of whitespace
+//! around `:`, and string-valued codes are load-bearing for the compile-fail gate.
 
 use crate::{Diagnostic, NoteKind, Severity};
 use wukong_span::SourceMap;
