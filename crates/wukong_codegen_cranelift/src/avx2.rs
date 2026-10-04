@@ -534,6 +534,86 @@ mod tests {
     use cranelift_jit::{JITBuilder, JITModule};
     use cranelift_module::{Linkage, Module};
 
+    // Include both sides of the eight-lane and four-vector unroll boundaries.
+    const BOUNDARY_LENGTHS: [usize; 17] = [
+        0, 1, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33, 63, 64, 65,
+    ];
+
+    /// Writable redzones detect stray stores, not overreads. Keep a full four-vector group on
+    /// either side, including for empty streams. Compare raw bits so NaN payloads and signed zero
+    /// cannot hide corruption; the payload itself also has to match through the untouched tail.
+    struct GuardedStream {
+        storage: Vec<f32>,
+        len: usize,
+    }
+
+    impl GuardedStream {
+        const GUARD: usize = 32;
+
+        fn canary(index: usize) -> u32 {
+            0x7fc0_5a00 | index as u32
+        }
+
+        fn new(values: &[f32]) -> Self {
+            let mut storage: Vec<f32> = (0..values.len() + 2 * Self::GUARD)
+                .map(|i| f32::from_bits(Self::canary(i)))
+                .collect();
+            storage[Self::GUARD..Self::GUARD + values.len()].copy_from_slice(values);
+            Self {
+                storage,
+                len: values.len(),
+            }
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut f32 {
+            self.storage.as_mut_ptr().wrapping_add(Self::GUARD)
+        }
+
+        fn payload(&self) -> &[f32] {
+            &self.storage[Self::GUARD..Self::GUARD + self.len]
+        }
+
+        fn assert_matches(&self, expected: &[f32], label: &str) {
+            assert_eq!(self.len, expected.len());
+            for (i, value) in self.storage.iter().enumerate() {
+                if i < Self::GUARD || i >= Self::GUARD + self.len {
+                    assert_eq!(value.to_bits(), Self::canary(i), "{label}: guard word {i}");
+                }
+            }
+            for (i, (got, want)) in self.payload().iter().zip(expected).enumerate() {
+                assert_eq!(got.to_bits(), want.to_bits(), "{label}: payload lane {i}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "guard word")]
+    fn guarded_stream_detects_understore() {
+        let mut stream = GuardedStream::new(&[1.0; 8]);
+        stream.storage[GuardedStream::GUARD - 1] =
+            f32::from_bits(GuardedStream::canary(GuardedStream::GUARD - 1) ^ 1);
+        stream.assert_matches(&[1.0; 8], "injected understore");
+    }
+
+    #[test]
+    #[should_panic(expected = "guard word")]
+    fn guarded_stream_detects_overstore() {
+        let mut stream = GuardedStream::new(&[1.0; 8]);
+        let end = GuardedStream::GUARD + stream.len;
+        stream.storage[end] = f32::from_bits(GuardedStream::canary(end) ^ 1);
+        stream.assert_matches(&[1.0; 8], "injected overstore");
+    }
+
+    #[test]
+    #[should_panic(expected = "payload lane 8")]
+    fn guarded_stream_detects_tail_write() {
+        let mut expected = vec![1.0; 9];
+        expected[8] = -0.0;
+        let mut stream = GuardedStream::new(&expected);
+        stream.storage[GuardedStream::GUARD + 8] = 0.0;
+        stream.assert_matches(&expected, "injected tail write");
+    }
+
     /// Phase A: assemble the saxpy kernel, install its raw bytes via `define_function_bytes`, call
     /// it, and check it computed `a*x + y` in true 256-bit strides. This is the whole raw-AVX2 seam.
     #[test]
@@ -541,6 +621,7 @@ mod tests {
         if !host_supports_kernels() {
             return; // these bytes are not executable here — see `host_supports_kernels`
         }
+        eprintln!("raw AVX2 execution enabled: Win64 + AVX2 + FMA host gate passed");
         let bytes = assemble_saxpy_probe().expect("assemble");
         assert!(!bytes.is_empty());
         if std::env::var("P4_DUMP").is_ok() {
@@ -571,28 +652,44 @@ mod tests {
         let kernel: extern "C" fn(*const *mut f32, *const f32, u64) =
             unsafe { std::mem::transmute(code) };
 
-        const N: usize = 24; // multiple of 8
-        let mut x = [0f32; N];
-        let mut y = [0f32; N];
-        let mut out = [0f32; N];
-        for i in 0..N {
-            x[i] = i as f32;
-            y[i] = (2 * i) as f32;
-        }
-        let a_scalar = [3.0f32];
-        let ptrs = [x.as_mut_ptr(), y.as_mut_ptr(), out.as_mut_ptr()];
-        kernel(ptrs.as_ptr(), a_scalar.as_ptr(), N as u64);
+        for n in BOUNDARY_LENGTHS {
+            let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            let y: Vec<f32> = (0..n).map(|i| (2 * i) as f32).collect();
+            let initial_out = vec![f32::from_bits(0xffc0_1234); n];
+            let mut guarded_x = GuardedStream::new(&x);
+            let mut guarded_y = GuardedStream::new(&y);
+            let mut out = GuardedStream::new(&initial_out);
+            let mut a_scalar = GuardedStream::new(&[3.0]);
+            let ptrs = [
+                guarded_x.as_mut_ptr(),
+                guarded_y.as_mut_ptr(),
+                out.as_mut_ptr(),
+            ];
+            kernel(ptrs.as_ptr(), a_scalar.as_mut_ptr(), n as u64);
 
-        for i in 0..N {
-            let want = 3.0 * x[i] + y[i];
-            assert_eq!(out[i], want, "lane {i}: got {}, want {want}", out[i]);
+            let mut expected = initial_out;
+            for i in 0..n / 8 * 8 {
+                let want = 3.0 * x[i] + y[i];
+                assert_eq!(
+                    out.payload()[i],
+                    want,
+                    "lane {i}: got {}, want {want}",
+                    out.payload()[i]
+                );
+                expected[i] = want;
+            }
+            out.assert_matches(&expected, "saxpy output");
+            guarded_x.assert_matches(&x, "saxpy x");
+            guarded_y.assert_matches(&y, "saxpy y");
+            a_scalar.assert_matches(&[3.0], "saxpy scalar");
         }
         unsafe { module.free_memory() };
     }
 
     /// Assemble `k`, run it on `init` streams / `scalars` over `n` elements, and assert it matches
     /// the `VecKernel::eval_lane` reference **bit-for-bit** on every full-vector lane `[0, n/8*8)`.
-    /// Inputs may alias outputs (in-place); the reference mutates its own copy the same way.
+    /// Also assert every remaining lane and both redzones are untouched. Inputs may alias outputs
+    /// (in-place); the reference mutates its own copy the same way.
     fn check(k: &VecKernel, init: &[Vec<f32>], scalars: &[f32], n: usize) {
         if !host_supports_kernels() {
             return; // these bytes are not executable here — see `host_supports_kernels`
@@ -613,7 +710,8 @@ mod tests {
         }
 
         // Native: install the raw bytes and call on a fresh mutable copy.
-        let mut got: Vec<Vec<f32>> = init.to_vec();
+        let mut got: Vec<GuardedStream> = init.iter().map(|v| GuardedStream::new(v)).collect();
+        let mut guarded_scalars = GuardedStream::new(scalars);
         let isa = crate::make_isa(false).expect("isa");
         let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         let mut module = JITModule::new(builder);
@@ -630,19 +728,21 @@ mod tests {
         let kernel: extern "C" fn(*const *mut f32, *const f32, u64) =
             unsafe { std::mem::transmute(code) };
         let ptrs: Vec<*mut f32> = got.iter_mut().map(|v| v.as_mut_ptr()).collect();
-        kernel(ptrs.as_ptr(), scalars.as_ptr(), n as u64);
+        kernel(ptrs.as_ptr(), guarded_scalars.as_mut_ptr(), n as u64);
 
         for s in 0..k.streams as usize {
             for i in 0..vlen {
                 assert_eq!(
-                    got[s][i].to_bits(),
+                    got[s].payload()[i].to_bits(),
                     refs[s][i].to_bits(),
                     "kernel vs eval_lane mismatch: stream {s} lane {i} (got {}, want {})",
-                    got[s][i],
+                    got[s].payload()[i],
                     refs[s][i]
                 );
             }
+            got[s].assert_matches(&refs[s], &format!("stream {s}, n={n}"));
         }
+        guarded_scalars.assert_matches(scalars, "scalars");
         unsafe { module.free_memory() };
     }
 
@@ -676,8 +776,18 @@ mod tests {
         let code = module.get_finalized_function(fid);
         let kernel: extern "C" fn(*const *const f32, *const f32, u64) -> f32 =
             unsafe { std::mem::transmute(code) };
-        let ptrs: Vec<*const f32> = streams.iter().map(|v| v.as_ptr()).collect();
-        let got = kernel(ptrs.as_ptr(), scalars.as_ptr(), vlen as u64);
+        let mut guarded: Vec<GuardedStream> =
+            streams.iter().map(|v| GuardedStream::new(v)).collect();
+        let mut guarded_scalars = GuardedStream::new(scalars);
+        let ptrs: Vec<*const f32> = guarded
+            .iter_mut()
+            .map(|v| v.as_mut_ptr().cast_const())
+            .collect();
+        let got = kernel(ptrs.as_ptr(), guarded_scalars.as_mut_ptr(), vlen as u64);
+        for (s, (stream, original)) in guarded.iter().zip(streams).enumerate() {
+            stream.assert_matches(original, &format!("reduction stream {s}, n={n}"));
+        }
+        guarded_scalars.assert_matches(scalars, "reduction scalars");
         assert_eq!(
             got.to_bits(),
             want.to_bits(),
@@ -728,7 +838,10 @@ mod tests {
                 },
             ],
         };
-        for n in [8usize, 16, 24, 32, 64, 128, 256, 512] {
+        for n in [8usize, 16, 24, 32, 64, 128, 256, 512]
+            .into_iter()
+            .chain(BOUNDARY_LENGTHS)
+        {
             check_reduce(&sum, &[ramp(n, 0.0)], &[], n);
             check_reduce(&dot, &[ramp(n, 0.0), ramp(n, 1.0)], &[], n);
         }
@@ -877,7 +990,10 @@ mod tests {
                 VecOp::Store { stream: 2, val: 3 },
             ],
         };
-        for n in [8usize, 16, 24, 32, 40, 64, 80, 100] {
+        for n in [8usize, 16, 24, 32, 40, 64, 80, 100]
+            .into_iter()
+            .chain(BOUNDARY_LENGTHS)
+        {
             check(&k, &[ramp(n, 0.0), ramp(n, 1.0), vec![0.0; n]], &[2.5], n);
         }
     }
