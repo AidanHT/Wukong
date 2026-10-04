@@ -303,7 +303,7 @@ impl Bufs {
 
 /// Call a block through the 27-pointer ABI.
 ///
-/// ONE-LIVE-POINTER LAW (the same law [`crate::bench_wukong`] documents). Every pointer handed to
+/// ONE-LIVE-POINTER LAW (the same law [`crate::time_wukong`] documents). Every pointer handed to
 /// the callee is derived HERE, from the owning `Vec`s, inside the same borrow that is live across
 /// the call. A caller that hoisted the `as_mut_ptr()`s and then also passed `&mut` to the same
 /// buffers would be telling the optimizer they are `noalias` while an opaque callee writes through
