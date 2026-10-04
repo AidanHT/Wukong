@@ -2718,8 +2718,8 @@ mod tests {
                 assert_eq!(slots.len(), n);
                 let mut samples = vec![vec![f64::NAN; 4]; n];
                 let mut positions = vec![Vec::new(); live.len()];
-                for round in 0..4 {
-                    for (position, slot) in crate::round_order(n, round).into_iter().enumerate() {
+                for (round, order) in (0..4).map(|round| crate::round_order(n, round)).enumerate() {
+                    for (position, slot) in order.into_iter().enumerate() {
                         samples[slot][round] =
                             sample_column_slot(slots[slot], round, &mut |id, seen_round| {
                                 assert_eq!(seen_round, round);
