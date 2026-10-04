@@ -55,10 +55,10 @@
 //!   is one bare forward — no per-iteration allocation/IO beyond what torch does inside the
 //!   forward), at `torch.set_num_threads(1)` and at the default all-threads. The compile
 //!   wall-clock is a cold-start cost, printed separately (the `compile ms` row) and never mixed
-//!   into a per-forward number. Torch runs in the same bench invocation immediately after the
-//!   Wukong columns (same-run adjacency); both compiled variants are built first (untimed), then
-//!   timing runs coolest-first — T1 eager → T1 compiled → Tn eager → Tn compiled — so multicore
-//!   heat pollutes no single-thread torch number. Both the eager-SDPA and the compiled outputs are
+//!   into a per-forward number. All native peers and Torch variants are prepared before timing.
+//!   A persistent Torch worker joins the same eleven fixed slots as the native peers, visited
+//!   forward then in reverse. Missing columns retain their positions; minima keep their own
+//!   visit's medians. This balances positions, not thermal state. Eager-SDPA and compiled outputs are
 //!   cross-checked against Wukong's with the suite's magnitude-normalized metric at the same 1e-3
 //!   tolerance (the GELU flavor matches exactly, so no loosening is needed), plus a
 //!   compiled-vs-eager max|Δ| line — a fast-but-wrong compiled path fails loudly and reports no
@@ -116,12 +116,17 @@ use std::cell::Cell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use wukong_span::{Interner, SourceId};
 
 use crate::max_rel_err;
+
+#[path = "model_worker.rs"]
+mod model_worker;
+use model_worker::{Variant, Worker};
 
 /// GPT-2 124M stacks 12 identical decoder blocks.
 const LAYERS: usize = 12;
@@ -1162,7 +1167,7 @@ unsafe fn run_forward_mer(
 /// inline stack probes), which does not fit the host main thread's default ~1 MiB Windows stack.
 /// The serial column runs the whole frame on this one thread; the `@parallel` column's region
 /// bodies run on the runtime pool's own 16 MiB-stack workers. The spawn sits OUTSIDE the timed
-/// region (one spawn per measured column, not per iteration), so the instrument is unchanged.
+/// region (one spawn per scheduled Wukong visit, not per iteration), so the instrument is unchanged.
 fn on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|s| {
         let handle = std::thread::Builder::new()
@@ -1211,6 +1216,102 @@ struct MeasureModel {
     compile: Duration,
     ns_per_fwd: f64,
     out: Vec<f32>,
+}
+
+/// Keep the median and native output from the SAME winning visit as the minimum.
+/// Torch keeps its existing preparation-reference output policy, not a timed output dump.
+struct ModelVisit {
+    measure: MeasureModel,
+    median: Option<f64>,
+}
+
+impl crate::Timed for ModelVisit {
+    fn ns(&self) -> f64 {
+        self.measure.ns_per_fwd
+    }
+}
+
+struct PreparedWuk {
+    _block: WukModule,
+    _lnf: Rc<WukModule>,
+    block_fn: WukBlockFn,
+    ln_fn: LnFn,
+    compile: Duration,
+}
+
+enum PreparedNative {
+    Wukong(Box<PreparedWuk>),
+    Peer(CModel),
+}
+
+struct ModelInputs<'a> {
+    weights: &'a [LayerW],
+    x0: &'a [f32],
+    lnf_g: &'a [f32],
+    lnf_b: &'a [f32],
+}
+
+struct ModelScratch {
+    sc: Scratch,
+    xa: Vec<f32>,
+    xb: Vec<f32>,
+    y: Vec<f32>,
+}
+
+fn time_prepared(
+    prepared: &PreparedNative,
+    input: &ModelInputs<'_>,
+    scratch: &mut ModelScratch,
+) -> ModelVisit {
+    let (compile, ns) = match prepared {
+        PreparedNative::Wukong(p) => {
+            // Copy only the typed entry points into the scoped worker. Their owning JIT
+            // modules stay alive in `prepared` until every scheduled visit finishes.
+            let (block, lnf) = (p.block_fn, p.ln_fn);
+            let ns = on_big_stack(|| {
+                time_forward(|| unsafe {
+                    run_forward_mer(
+                        block,
+                        lnf,
+                        input.weights,
+                        &mut scratch.sc,
+                        input.x0,
+                        &mut scratch.xa,
+                        &mut scratch.xb,
+                        input.lnf_g,
+                        input.lnf_b,
+                        &mut scratch.y,
+                    )
+                })
+            });
+            (p.compile, ns)
+        }
+        PreparedNative::Peer(p) => {
+            let ns = time_forward(|| unsafe {
+                run_forward(
+                    p.block,
+                    p.lnf,
+                    input.weights,
+                    &mut scratch.sc,
+                    input.x0,
+                    &mut scratch.xa,
+                    &mut scratch.xb,
+                    input.lnf_g,
+                    input.lnf_b,
+                    &mut scratch.y,
+                )
+            });
+            (p.compile, ns)
+        }
+    };
+    ModelVisit {
+        measure: MeasureModel {
+            compile,
+            ns_per_fwd: ns,
+            out: scratch.y.clone(),
+        },
+        median: None,
+    }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1399,7 +1500,14 @@ fn peer_command(ctx: &TorchCtx, script: &Path) -> Command {
             cmd.env("LIB", libs);
         }
     }
-    cmd
+    utf8_peer_command(cmd)
+}
+
+fn utf8_peer_command(mut command: Command) -> Command {
+    // Apply after the captured MSVC environment replaces inherited variables. Redirected
+    // Python stdout otherwise follows the Windows locale, including compiler disclosures.
+    command.env("PYTHONIOENCODING", "utf-8");
+    command
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1543,8 +1651,8 @@ fn dump_f32_le(path: &Path, parts: &[&[f32]]) -> std::io::Result<()> {
 /// Timed regimes: **eager** (`TORCH1`/`TORCH1M`/`TORCHN`) and, when `try_compile` (MSVC present),
 /// **`torch.compile(..., mode="max-autotune", fullgraph=True)`** (`TORCH1C`/`TORCHNC`) — the whole
 /// 12-layer SDPA forward + final LayerNorm as one Inductor-fused, autotuned graph. Both compiled
-/// variants are built first (untimed; compile wall printed separately as `*_COMPILE`), then timing
-/// runs coolest-first (T1 eager → T1 compiled → Tn eager → Tn compiled). The compiled output is
+/// variants are built first (initial compile and final cache re-preparation walls disclosed
+/// separately), then the worker joins the native columns' fixed-slot rotation. The compiled output is
 /// cross-checked against the eager reference (`TORCH_COMPILED_VS_EAGER_*`); if it diverges the
 /// variant is marked `TORCH_COMPILED_BAD_*` and NOT timed. Compile failures fall through a
 /// disclosed retry ladder (each tier printing `TORCH_COMPILE_DISCLOSE`): stock max-autotune
@@ -1770,23 +1878,71 @@ with torch.inference_mode():
     else:
         print("TORCH_COMPILE_SKIP msvc-not-found", flush=True)
 
-    # --- timing phase, coolest-first: T1 eager -> T1 compiled -> Tn eager -> Tn compiled ---
-    torch.set_num_threads(1)
-    mn, med = bench_call(lambda: forward(False))
-    print("TORCH1 %.3f %.3f" % (mn, med), flush=True)
-    mn, med = bench_call(lambda: forward(True))
-    print("TORCH1M %.3f %.3f" % (mn, med), flush=True)
-    if comp1 is not None:
-        mn, med = bench_call(comp1)
-        print("TORCH1C %.3f %.3f" % (mn, med), flush=True)
-    # All-core variants LAST so their heat pollutes no single-thread torch number.
-    torch.set_num_threads(DEFAULT_THREADS)
-    mn, med = bench_call(lambda: forward(False))
-    print("TORCHN %.3f %.3f" % (mn, med), flush=True)
-    if compN is not None:
-        mn, med = bench_call(compN)
-        print("TORCHNC %.3f %.3f" % (mn, med), flush=True)
-print("TORCH_OK", flush=True)
+    # A later retry can reset Dynamo's GLOBAL cache, invalidating an earlier callable.
+    # Re-establish both thread-specialized variants after every reset/retry has finished.
+    # This extra cold-start work is reported separately and added to the compile row.
+    variants = {{"TORCH1": (1, lambda: forward(False), False),
+                "TORCH1M": (1, lambda: forward(True), False),
+                "TORCHN": (DEFAULT_THREADS, lambda: forward(False), False)}}
+    compiled = (("1T", "1C", "TORCH1C", 1, comp1),
+                ("NT", "NC", "TORCHNC", DEFAULT_THREADS, compN))
+    for tag, wall_tag, variant, nth, fn in compiled:
+        if fn is None:
+            continue
+        torch.set_num_threads(nth)
+        t0 = time.perf_counter()
+        out = fn()
+        reprepare_ms = (time.perf_counter() - t0) * 1e3
+        for _ in range(CWARMUP):
+            fn()
+        delta = (out - y).abs().max().item() / scale
+        print("TORCH%s_REPREP %.1f" % (wall_tag, reprepare_ms), flush=True)
+        print("TORCH_REPREP_DISCLOSE %s added %.1f ms after all retry/reset phases; delta=%.3e"
+              % (tag, reprepare_ms, delta), flush=True)
+        if not delta <= CTOL:
+            raise RuntimeError("prepared %s violates unchanged CTOL: %s" % (tag, delta))
+        if tag == "1T":
+            dump(out, COUT_PATH)
+        variants[variant] = (nth, fn, True)
+
+    # fail_on_recompile raises even on an empty cache, rather than compiling on a miss.
+    # It keeps the usual guards; no unsafe guard elision or eager fallback is permitted.
+    # Verify thread transitions before READY, then enforce the same rule around EVERY
+    # compiled bench_call (including its warmups), after setting its requested thread count.
+    for variant in ("TORCH1C", "TORCHNC"):
+        if variant in variants:
+            nth, fn, _ = variants[variant]
+            torch.set_num_threads(nth)
+            with torch.compiler.set_stance("fail_on_recompile"):
+                fn()
+    order = ("TORCH1", "TORCH1M", "TORCH1C", "TORCHN", "TORCHNC")
+    print("MODEL READY " + "".join("1" if v in variants else "0" for v in order), flush=True)
+    last_id = 0
+    for request in sys.stdin:
+        fields = request.split()
+        if len(fields) not in (2, 3):
+            raise RuntimeError("malformed model request")
+        request_id = int(fields[1])
+        if request_id <= last_id:
+            raise RuntimeError("duplicate or stale model request")
+        last_id = request_id
+        if fields[0] == "STOP" and len(fields) == 2:
+            print("MODEL STOPPED %d" % request_id, flush=True)
+            break
+        if fields[0] != "TIME" or len(fields) != 3 or fields[2] not in variants:
+            raise RuntimeError("unknown model timing request")
+        variant = fields[2]
+        nth, fn, is_compiled = variants[variant]
+        torch.set_num_threads(nth)
+        if is_compiled:
+            with torch.compiler.set_stance("fail_on_recompile"):
+                mn, med = bench_call(fn)
+        else:
+            mn, med = bench_call(fn)
+        print("MODEL RESULT %d %s %.3f %.3f" % (request_id, variant, mn, med), flush=True)
+    else:
+        raise RuntimeError("model parent closed stdin without STOP")
+
 "#,
         s = s,
         d = d,
@@ -1824,8 +1980,89 @@ struct TorchMeasure {
     disclosures: Vec<String>,
 }
 
-/// Dump the shared buffers, generate + run the peer script, parse its machine-readable lines.
-fn bench_torch(
+struct PreparedTorch {
+    worker: Worker,
+    available: [bool; 5],
+    measure: TorchMeasure,
+    failed: bool,
+}
+
+impl PreparedTorch {
+    fn time(&mut self, slot: usize) -> Option<ModelVisit> {
+        if self.failed || !self.available[slot] {
+            return None;
+        }
+        let (min, median) = match self.worker.time(Variant::ALL[slot]) {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("model: Torch worker failed; all its timings are invalid: {error}");
+                self.failed = true;
+                return None;
+            }
+        };
+        let (compile, out) = match slot {
+            0 => (Duration::ZERO, self.measure.out.clone()),
+            2 => (
+                compiled_duration(self.measure.compile_ms_1t),
+                self.measure.comp_out.clone(),
+            ),
+            4 => (compiled_duration(self.measure.compile_ms_nt), Vec::new()),
+            _ => (Duration::ZERO, Vec::new()),
+        };
+        Some(ModelVisit {
+            measure: MeasureModel {
+                compile,
+                ns_per_fwd: min,
+                out,
+            },
+            median: Some(median),
+        })
+    }
+
+    fn finish(&mut self) -> bool {
+        if self.failed {
+            return false;
+        }
+        if let Err(error) = self.worker.finish() {
+            eprintln!("model: Torch shutdown failed; all its timings are invalid: {error}");
+            self.failed = true;
+        }
+        !self.failed
+    }
+}
+
+fn compiled_duration(ms: Option<f64>) -> Duration {
+    Duration::from_secs_f64((ms.unwrap_or(0.0) / 1e3).max(1e-9))
+}
+
+fn visit_pair(visit: &Option<ModelVisit>) -> Option<(f64, f64)> {
+    visit
+        .as_ref()
+        .and_then(|v| v.median.map(|median| (v.measure.ns_per_fwd, median)))
+}
+
+fn finish_torch(
+    prepared: Option<PreparedTorch>,
+    best: &mut [Option<ModelVisit>],
+) -> Option<TorchMeasure> {
+    prepared.and_then(|mut p| {
+        if !p.finish() {
+            for result in &mut best[6..] {
+                *result = None;
+            }
+            return None;
+        }
+        p.measure.sdpa_1t = visit_pair(&best[6]);
+        p.measure.manual_1t = visit_pair(&best[7]);
+        p.measure.comp_1t = visit_pair(&best[8]);
+        p.measure.sdpa_nt = visit_pair(&best[9]);
+        p.measure.comp_nt = visit_pair(&best[10]);
+        Some(p.measure)
+    })
+}
+
+/// Dump shared buffers and prepare the persistent peer through READY, without timing a variant.
+fn prepare_torch(
     ctx: &TorchCtx,
     dir: &Path,
     cfg: Cfg,
@@ -1833,7 +2070,7 @@ fn bench_torch(
     x0: &[f32],
     lnf_g: &[f32],
     lnf_b: &[f32],
-) -> Option<TorchMeasure> {
+) -> Option<PreparedTorch> {
     // The 12-layer weights are config-invariant in this bench (same d/dff/LAYERS, and the
     // 0x0D15EA5E seed is consumed identically before x0 at every S), so the ~324 MiB blob is
     // dumped once per run; the small per-config blob carries lnf gamma/beta + the input.
@@ -1867,6 +2104,7 @@ fn bench_torch(
     // the compiled columns degrade to `n/a (MSVC not found)`.
     let try_compile = vcvars_env().is_some();
     // Stale outputs from a previous run must not masquerade as this run's results.
+    let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&cout_path);
     std::fs::write(
         &script_path,
@@ -1875,26 +2113,17 @@ fn bench_torch(
     .ok()?;
     // Spawn under the captured MSVC environment (with <base_prefix>\libs on LIB) so TorchInductor
     // can compile + link its CPU kernels; falls back to the inherited env when MSVC is absent.
-    let run = peer_command(ctx, &script_path).output().ok()?;
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    if !run.status.success() || !stdout.contains("TORCH_OK") {
-        eprintln!(
-            "model: torch peer script failed:\n{}",
-            String::from_utf8_lossy(&run.stderr)
-        );
-        return None;
-    }
-    let grab = |tag: &str| -> Option<(f64, f64)> {
-        for l in stdout.lines() {
-            let mut it = l.split_whitespace();
-            if it.next() == Some(tag) {
-                let mn: f64 = it.next()?.parse().ok()?;
-                let md: f64 = it.next()?.parse().ok()?;
-                return Some((mn * 1e6, md * 1e6)); // ms -> ns
-            }
+    let (worker, mut available, metadata) = match Worker::start(
+        &mut peer_command(ctx, &script_path),
+        Duration::from_secs(30 * 60),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("model: torch preparation failed: {error}");
+            return None;
         }
-        None
     };
+    let stdout = metadata.join("\n");
     let grab1 = |tag: &str| -> Option<f64> {
         stdout
             .lines()
@@ -1910,6 +2139,7 @@ fn bench_torch(
                 || l.starts_with("TORCH_COMPILE_FAIL")
                 || l.starts_with("TORCH_COMPILE_SKIP")
                 || l.starts_with("TORCH_COMPILED_BAD")
+                || l.starts_with("TORCH_REPREP_DISCLOSE")
         })
         .map(|l| l.to_string())
         .collect();
@@ -1942,20 +2172,33 @@ fn bench_torch(
     } else {
         Vec::new()
     };
-    Some(TorchMeasure {
-        sdpa_1t: grab("TORCH1"),
-        manual_1t: grab("TORCH1M"),
-        sdpa_nt: grab("TORCHN"),
-        comp_1t: grab("TORCH1C"),
-        comp_nt: grab("TORCHNC"),
-        compile_ms_1t: grab1("TORCH1C_COMPILE "),
-        compile_ms_nt: grab1("TORCHNC_COMPILE "),
-        compiled_vs_eager_1t: grab1("TORCH_COMPILED_VS_EAGER_1T "),
-        compiled_vs_eager_nt: grab1("TORCH_COMPILED_VS_EAGER_NT "),
-        manual_vs_sdpa,
-        out,
-        comp_out,
-        disclosures,
+    if available[2] && comp_out.is_empty() {
+        eprintln!("model: T1(comp) SUPPRESSED — compiled output was not available for cross-check");
+        available[2] = false;
+    }
+    let compile_total = |initial, reprepare| match (grab1(initial), grab1(reprepare)) {
+        (Some(a), Some(b)) => Some(a + b),
+        (a, _) => a,
+    };
+    Some(PreparedTorch {
+        worker,
+        available,
+        failed: false,
+        measure: TorchMeasure {
+            sdpa_1t: None,
+            manual_1t: None,
+            sdpa_nt: None,
+            comp_1t: None,
+            comp_nt: None,
+            compile_ms_1t: compile_total("TORCH1C_COMPILE ", "TORCH1C_REPREP "),
+            compile_ms_nt: compile_total("TORCHNC_COMPILE ", "TORCHNC_REPREP "),
+            compiled_vs_eager_1t: grab1("TORCH_COMPILED_VS_EAGER_1T "),
+            compiled_vs_eager_nt: grab1("TORCH_COMPILED_VS_EAGER_NT "),
+            manual_vs_sdpa,
+            out,
+            comp_out,
+            disclosures,
+        },
     })
 }
 
@@ -2272,9 +2515,18 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     let x0 = fill(sd, 0.25, 0.0, &mut seed);
     let lnf_g = fill(cfg.d, 0.1, 1.0, &mut seed);
     let lnf_b = fill(cfg.d, 0.02, 0.0, &mut seed);
-    let mut sc = Scratch::new(cfg);
-    let (mut xa, mut xb) = (vec![0.0f32; sd], vec![0.0f32; sd]);
-    let mut y = vec![0.0f32; sd];
+    let mut scratch = ModelScratch {
+        sc: Scratch::new(cfg),
+        xa: vec![0.0; sd],
+        xb: vec![0.0; sd],
+        y: vec![0.0; sd],
+    };
+    let inputs = ModelInputs {
+        weights: &weights,
+        x0: &x0,
+        lnf_g: &lnf_g,
+        lnf_b: &lnf_b,
+    };
 
     // Sweep knobs (both purely additive; default behaviour unchanged):
     //  * XBENCH_MODEL_WUK_ONLY skips every external peer (C, C(fast), PyTorch) — a dev iterating on
@@ -2293,10 +2545,10 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     } else {
         (
             compile_wukong(&wk_block(cfg, false), &mut interner),
-            compile_wukong(&wk_final_ln(cfg), &mut interner),
+            compile_wukong(&wk_final_ln(cfg), &mut interner).map(Rc::new),
         )
     };
-    let wk_m = match (&wuk, &lnf_mod) {
+    let wk_prepared = match (wuk, &lnf_mod) {
         (Some(m), Some(l)) => {
             // Mechanism transparency: print exactly which recognized kernels the block dispatches.
             let calls = kernel_calls(&m.mir);
@@ -2336,22 +2588,14 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             );
             let block_fn: WukBlockFn = unsafe { std::mem::transmute(bp) };
             let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
-            // Big stack: the per-head scratch is loop-body-local in the Wukong block, so the
-            // serial column runs the whole ~1.5 MiB (at S=512) frame on the calling thread.
-            let ns = on_big_stack(|| {
-                let mut run = || unsafe {
-                    run_forward_mer(
-                        block_fn, ln_fn, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
-                        &mut y,
-                    )
-                };
-                time_forward(&mut run)
-            });
-            Some(MeasureModel {
-                compile: m.compile + l.compile,
-                ns_per_fwd: ns,
-                out: y.clone(),
-            })
+            let compile = m.compile + l.compile;
+            Some(PreparedNative::Wukong(Box::new(PreparedWuk {
+                _block: m,
+                _lnf: Rc::clone(l),
+                block_fn,
+                ln_fn,
+                compile,
+            })))
         }
         _ => None,
     };
@@ -2363,7 +2607,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     let no_c = wk_only || torch_only;
     let run_c_slow = !no_c && (cfg.s <= 128 || std::env::var("XBENCH_MODEL_NAIVE").is_ok());
     let c_src = c_model(cfg);
-    let c_m = if run_c_slow {
+    let c_prepared = if run_c_slow {
         compile_c_model(
             &c_src,
             dir,
@@ -2374,20 +2618,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             "void kbench(",
             "void kfinal(",
         )
-        .map(|cm| {
-            let mut run = || unsafe {
-                run_forward(
-                    cm.block, cm.lnf, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
-                    &mut y,
-                )
-            };
-            let ns = time_forward(&mut run);
-            MeasureModel {
-                compile: cm.compile,
-                ns_per_fwd: ns,
-                out: y.clone(),
-            }
-        })
+        .map(PreparedNative::Peer)
     } else {
         // Only explain the naive-dot omission when C would otherwise have run; under WUK_ONLY /
         // TORCH_ONLY the C columns are dropped on purpose and need no per-size note.
@@ -2406,7 +2637,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // row had no C++ number at all and BENCHMARKS.md asserted that the C ratio stood for C++; the
     // point of this column is that the assertion can now be wrong out loud. `cpp_from_c` prepends
     // `extern "C"` to BOTH exports (`kbench` and `kfinal`), which is all a numeric TU needs.
-    let cpp_m = if run_c_slow {
+    let cpp_prepared = if run_c_slow {
         compile_c_model(
             &crate::cpp_from_c(&c_src),
             dir,
@@ -2417,20 +2648,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             "void kbench(",
             "void kfinal(",
         )
-        .map(|cm| {
-            let mut run = || unsafe {
-                run_forward(
-                    cm.block, cm.lnf, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
-                    &mut y,
-                )
-            };
-            let ns = time_forward(&mut run);
-            MeasureModel {
-                compile: cm.compile,
-                ns_per_fwd: ns,
-                out: y.clone(),
-            }
-        })
+        .map(PreparedNative::Peer)
     } else {
         None
     };
@@ -2439,7 +2657,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     // naive-forward gate as the C column (its `linear_nt` is the same serial-dot nest, so it is just
     // as slow at S=512). `rust_model` slices the foreign pointers once, which is both the idiomatic
     // spelling and the one that gives LLVM the `noalias` the C peer gets from `__restrict__`.
-    let rust_m = if run_c_slow {
+    let rust_prepared = if run_c_slow {
         compile_c_model(
             &rust_model(cfg),
             dir,
@@ -2454,26 +2672,13 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             "fn kbench(",
             "fn kfinal(",
         )
-        .map(|cm| {
-            let mut run = || unsafe {
-                run_forward(
-                    cm.block, cm.lnf, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
-                    &mut y,
-                )
-            };
-            let ns = time_forward(&mut run);
-            MeasureModel {
-                compile: cm.compile,
-                ns_per_fwd: ns,
-                out: y.clone(),
-            }
-        })
+        .map(PreparedNative::Peer)
     } else {
         None
     };
 
     // --- C(fast): identical source, -ffast-math ---
-    let cfast_m = if no_c {
+    let cfast_prepared = if no_c {
         None
     } else {
         compile_c_model(
@@ -2486,29 +2691,16 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             "void kbench(",
             "void kfinal(",
         )
-        .map(|cm| {
-            let mut run = || unsafe {
-                run_forward(
-                    cm.block, cm.lnf, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
-                    &mut y,
-                )
-            };
-            let ns = time_forward(&mut run);
-            MeasureModel {
-                compile: cm.compile,
-                ns_per_fwd: ns,
-                out: y.clone(),
-            }
-        })
+        .map(PreparedNative::Peer)
     };
 
-    // --- Wukong @parallel, measured LAST so its all-core heat pollutes no single-core column ---
+    // --- Prepare Wukong @parallel before any timing slot ---
     let wk_par_compiled = if torch_only {
         None
     } else {
         compile_wukong(&wk_block(cfg, true), &mut interner)
     };
-    let wk_par_m = wk_par_compiled.and_then(|m| {
+    let wk_par_prepared = wk_par_compiled.and_then(|m| {
         // Same mechanism transparency as the serial column: print the @parallel dispatch set and
         // warn if the embedded GEMMs regressed to serial (they would still be *correct*, so only
         // this scan would catch it).
@@ -2572,38 +2764,54 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
         );
         let block_fn: WukBlockFn = unsafe { std::mem::transmute(bp) };
         let ln_fn: LnFn = unsafe { std::mem::transmute(lp) };
-        let ns = on_big_stack(|| {
-            let mut run = || unsafe {
-                run_forward_mer(
-                    block_fn, ln_fn, &weights, &mut sc, &x0, &mut xa, &mut xb, &lnf_g, &lnf_b,
-                    &mut y,
-                )
-            };
-            time_forward(&mut run)
-        });
-        Some(MeasureModel {
-            compile: m.compile,
-            ns_per_fwd: ns,
-            out: y.clone(),
-        })
+        let compile = m.compile;
+        Some(PreparedNative::Wukong(Box::new(PreparedWuk {
+            _block: m,
+            _lnf: Rc::clone(lnf),
+            block_fn,
+            ln_fn,
+            compile,
+        })))
     });
 
-    // --- PyTorch CPU eager peer, timed immediately after the Wukong columns in the SAME bench
-    // invocation (same-run adjacency). It runs in its own process over the just-dumped identical
-    // buffers; inside the script the single-thread variants run first and the all-core variant
-    // last, so multicore heat pollutes no single-thread torch number. The blob writes + torch
-    // import + its own warmups sit between Wuk(par)'s all-core burst and the first timed torch
-    // iteration.
-    let torch_m = if wk_only { None } else { torch }.and_then(|t| {
+    // Native compilation/loading and Torch preparation finish before the first slot.
+    // Failed or inapplicable columns retain their original positions in both passes.
+    let prepared = [
+        wk_prepared,
+        wk_par_prepared,
+        c_prepared,
+        cpp_prepared,
+        rust_prepared,
+        cfast_prepared,
+    ];
+    let mut torch_prepared = if wk_only { None } else { torch }.and_then(|t| {
         println!(
-            "  running PyTorch peer (torch {}, f32 inference_mode; eager + torch.compile \
-             max-autotune; timed 10 per variant)...",
+            "  preparing PyTorch peer (torch {}, eager + compiled variants)...",
             t.version
         );
-        bench_torch(t, dir, cfg, &weights, &x0, &lnf_g, &lnf_b)
+        prepare_torch(t, dir, cfg, &weights, &x0, &lnf_g, &lnf_b)
     });
-    // Same-run Wuk(1c) vs Wuk(par) scaling — the reliable multicore instrument on this hybrid laptop
-    // (both measured adjacently, same thermal state). Printed always; it's the number to move.
+    println!("  schedule: 11 fixed slots, forward then reverse; all preparation precedes timing");
+    let mut best = crate::abba_min_columns(11, |slot| {
+        if slot < prepared.len() {
+            prepared[slot]
+                .as_ref()
+                .map(|p| time_prepared(p, &inputs, &mut scratch))
+        } else {
+            torch_prepared
+                .as_mut()
+                .and_then(|p| p.time(slot - prepared.len()))
+        }
+    });
+    // A later protocol/process failure invalidates earlier winners from that worker too.
+    let torch_m = finish_torch(torch_prepared, &mut best);
+    let wk_m = best[0].take().map(|v| v.measure);
+    let wk_par_m = best[1].take().map(|v| v.measure);
+    let c_m = best[2].take().map(|v| v.measure);
+    let cpp_m = best[3].take().map(|v| v.measure);
+    let rust_m = best[4].take().map(|v| v.measure);
+    let cfast_m = best[5].take().map(|v| v.measure);
+    // Counterbalanced positions reduce ordering bias; they do not prove thermal equivalence.
     if let (Some(s), Some(p)) = (&wk_m, &wk_par_m) {
         println!(
             "  Wuk scaling: 1c {:.1} ms -> par {:.1} ms = {:.2}x",
@@ -2639,7 +2847,7 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
     };
     // The compiled 1-thread variant is the one whose output is dumped for the vs-Wukong
     // cross-check. If that output did not land, its timing is SUPPRESSED rather than printed
-    // beside an uncheckable column — the invariant `bench_torch` documents, now enforced on this
+    // beside an uncheckable column — the invariant `prepare_torch` documents, now enforced on this
     // side too instead of only assumed of the peer script. (`Tn(comp)`, `T1(man)` and `Tn(sdpa)`
     // dump no output by design; they are timing-only columns and are never cross-checked.)
     if let Some(t) = &torch_m {
@@ -2963,6 +3171,221 @@ fn bench_model_size(cc: &str, dir: &Path, cfg: Cfg, torch: Option<&TorchCtx>) {
             cfg.s,
             unpassed.join("; ")
         );
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    fn visit(min: f64, median: f64, snapshot: f32) -> ModelVisit {
+        ModelVisit {
+            measure: MeasureModel {
+                compile: Duration::from_millis(9),
+                ns_per_fwd: min,
+                out: vec![snapshot],
+            },
+            median: Some(median),
+        }
+    }
+
+    fn empty_measure() -> TorchMeasure {
+        TorchMeasure {
+            sdpa_1t: None,
+            manual_1t: None,
+            sdpa_nt: None,
+            comp_1t: None,
+            comp_nt: None,
+            compile_ms_1t: None,
+            compile_ms_nt: None,
+            compiled_vs_eager_1t: None,
+            compiled_vs_eager_nt: None,
+            manual_vs_sdpa: None,
+            out: vec![1.0],
+            comp_out: vec![2.0],
+            disclosures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn python_transport_encoding_overrides_captured_locale_after_env_setup() {
+        let mut command = Command::new("unused-python");
+        command.env_clear().env("PYTHONIOENCODING", "cp1252");
+        let command = utf8_peer_command(command);
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "PYTHONIOENCODING")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("utf-8"))
+        );
+        let source = include_str!("model.rs");
+        let body = source
+            .split("fn peer_command(")
+            .nth(1)
+            .unwrap()
+            .split("fn utf8_peer_command(")
+            .next()
+            .unwrap();
+        assert!(
+            body.find("cmd.env_clear()").unwrap() < body.find("utf8_peer_command(cmd)").unwrap()
+        );
+    }
+
+    #[test]
+    fn eleven_fixed_slots_keep_missing_positions_and_winning_payloads() {
+        let mut seen = Vec::new();
+        let mut visits = [0; 11];
+        let best = crate::abba_min_columns(11, |slot| {
+            seen.push(slot);
+            visits[slot] += 1;
+            if [2, 7, 10].contains(&slot) {
+                return None;
+            }
+            if visits[slot] == 1 {
+                Some(visit(10.0, 90.0, 1.0))
+            } else {
+                Some(visit(5.0, 100.0, 2.0))
+            }
+        });
+        assert_eq!(seen, (0..11).chain((0..11).rev()).collect::<Vec<_>>());
+        assert_eq!(visits, [2; 11]);
+        for (slot, sample) in best.iter().enumerate() {
+            if [2, 7, 10].contains(&slot) {
+                assert!(sample.is_none());
+            } else {
+                assert_eq!(visit_pair(sample), Some((5.0, 100.0)));
+                assert_eq!(sample.as_ref().unwrap().measure.out, [2.0]);
+            }
+        }
+        let tied = crate::faster(Some(visit(5.0, 9.0, 1.0)), Some(visit(5.0, 6.0, 2.0))).unwrap();
+        assert_eq!(tied.median, Some(9.0));
+        assert_eq!(tied.measure.out, [1.0]);
+    }
+
+    #[test]
+    fn late_worker_failure_erases_all_torch_winners_but_keeps_native() {
+        let mut prepared = PreparedTorch {
+            worker: model_worker::fake_for_test("duplicate"),
+            available: [true; 5],
+            measure: empty_measure(),
+            failed: false,
+        };
+        let mut best: Vec<_> = (0..11).map(|_| Some(visit(1.0, 2.0, 3.0))).collect();
+        best[6] = prepared.time(0);
+        assert!(best[6].is_some(), "first correlated reply should succeed");
+        assert!(finish_torch(Some(prepared), &mut best).is_none());
+        assert!(best[..6].iter().all(Option::is_some));
+        assert!(best[6..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn successful_worker_preserves_same_visit_median_in_every_torch_slot() {
+        let prepared = PreparedTorch {
+            worker: model_worker::fake_for_test("normal"),
+            available: [true; 5],
+            measure: empty_measure(),
+            failed: false,
+        };
+        let mut best: Vec<_> = (0..11)
+            .map(|i| Some(visit(i as f64 + 1.0, i as f64 + 20.0, i as f32)))
+            .collect();
+        let measure = finish_torch(Some(prepared), &mut best).unwrap();
+        assert_eq!(measure.sdpa_1t, Some((7.0, 26.0)));
+        assert_eq!(measure.manual_1t, Some((8.0, 27.0)));
+        assert_eq!(measure.comp_1t, Some((9.0, 28.0)));
+        assert_eq!(measure.sdpa_nt, Some((10.0, 29.0)));
+        assert_eq!(measure.comp_nt, Some((11.0, 30.0)));
+        assert_eq!(measure.out, [1.0]);
+        assert_eq!(measure.comp_out, [2.0]);
+    }
+
+    #[test]
+    fn model_caller_builds_every_column_before_the_only_rotation() {
+        let source = include_str!("model.rs");
+        let start = source.find("fn bench_model_size(").unwrap();
+        let end = source[start..].find("#[cfg(test)]").unwrap() + start;
+        let body = &source[start..end];
+        let rotation = body.find("crate::abba_min_columns(11,").unwrap();
+        assert_eq!(body.matches("crate::abba_min_columns(").count(), 1);
+        for name in [
+            "let wk_prepared",
+            "let wk_par_prepared",
+            "let c_prepared",
+            "let cpp_prepared",
+            "let rust_prepared",
+            "let cfast_prepared",
+            "prepare_torch(",
+        ] {
+            assert!(
+                body.find(name).unwrap() < rotation,
+                "{name} was not prepared first"
+            );
+        }
+        for compile in ["compile_wukong(", "compile_c_model(", "prepare_torch("] {
+            assert!(
+                !body[rotation..].contains(compile),
+                "preparation inside timing: {compile}"
+            );
+        }
+        assert!(!body.contains("time_forward("));
+        assert_eq!(body.matches("time_prepared(").count(), 1);
+        let prepared = body.find("let prepared = [").unwrap();
+        assert!(body[prepared..rotation].contains("wk_prepared,\n        wk_par_prepared,"));
+        assert!(body.contains("finish_torch(torch_prepared, &mut best)"));
+        assert!(body.contains("let wk_m = best[0].take().map(|v| v.measure)"));
+    }
+
+    #[test]
+    fn torch_script_keeps_inner_timer_and_seals_compilation_before_ready() {
+        let p = Path::new("unused.bin");
+        let source = torch_script(
+            Cfg {
+                s: 16,
+                d: 64,
+                h: 4,
+                dff: 256,
+            },
+            p,
+            p,
+            p,
+            p,
+            true,
+        );
+        let timer = source
+            .split("def bench_call(fn):\n")
+            .nth(1)
+            .unwrap()
+            .split("\ndef try_build(")
+            .next()
+            .unwrap();
+        assert_eq!(timer.trim(), "for _ in range(WARMUP):\n        fn()\n    ts = [0.0] * ITERS\n    for i in range(ITERS):\n        t0 = time.perf_counter()\n        fn()\n        ts[i] = time.perf_counter() - t0\n    return min(ts) * 1e3, statistics.median(ts) * 1e3");
+        for invariant in [
+            "WARMUP = 3",
+            "ITERS = 10",
+            "CWARMUP = 6",
+            "CTOL = 1e-3",
+            "mode=\"max-autotune\", fullgraph=fullgraph",
+            "max_autotune_gemm_backends = \"ATEN\"",
+            "ws[2:5] = [torch.cat(ws[2:5], dim=0)]",
+            "q, k, v = F.linear(nrm, wqkv).split(D, dim=1)",
+        ] {
+            assert!(source.contains(invariant), "lost {invariant}");
+        }
+        let ready = source.find("print(\"MODEL READY ").unwrap();
+        assert!(source[..ready].contains("TORCH_REPREP_DISCLOSE"));
+        assert!(source[..ready].contains(
+            "with torch.compiler.set_stance(\"fail_on_recompile\"):\n                fn()"
+        ));
+        let serving = &source[ready..];
+        assert!(!serving.contains("torch._dynamo.reset()"));
+        assert!(!serving.contains("torch.compile("));
+        assert!(serving.contains("torch.set_num_threads(nth)\n        if is_compiled:\n            with torch.compiler.set_stance(\"fail_on_recompile\"):\n                mn, med = bench_call(fn)"));
+        assert!(serving.contains("request_id <= last_id"));
+        if let Some(dir) = std::env::var_os("WUKONG_MODEL_ARTIFACT_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(PathBuf::from(dir).join("model-peer.py"), source).unwrap();
+        }
     }
 }
 
