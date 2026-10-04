@@ -1,0 +1,259 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// 75 columns: sum, in column order.
+// EXPECT-OUT-VALUES: -0.5 -1 -1.5 -2 -2.5 -3 -3.5 -4 -4.5 -5
+// EXPECT-OUT-VALUES: -5.5 -6 -6.5 -7 -7.5 -8 -8.5 -9 -9.5 -10
+// EXPECT-OUT-VALUES: -10.5 -11 -11.5 -12 -12.5 -13 -13.5 -14 -14.5 -15
+// EXPECT-OUT-VALUES: -15.5 -16 -16.5 -17 -17.5 -18 -18.5 -19 -19.5 -20
+// EXPECT-OUT-VALUES: -20.5 -21 -21.5 -22 -22.5 -23 -23.5 -24 -24.5 -25
+// EXPECT-OUT-VALUES: -25.5 -26 -26.5 -27 -27.5 -28 -28.5 -29 -29.5 -30
+// EXPECT-OUT-VALUES: -30.5 -31 -31.5 -32 -32.5 -33 -33.5 -34 -34.5 -35
+// EXPECT-OUT-VALUES: -35.5 -36 -36.5 -37 -37.5
+// 75 columns: max, in column order.
+// EXPECT-OUT-VALUES: 1.25 2.5 3.75 5 6.25 7.5 8.75 10 11.25 12.5
+// EXPECT-OUT-VALUES: 13.75 15 16.25 17.5 18.75 20 21.25 22.5 23.75 25
+// EXPECT-OUT-VALUES: 26.25 27.5 28.75 30 31.25 32.5 33.75 35 36.25 37.5
+// EXPECT-OUT-VALUES: 38.75 40 41.25 42.5 43.75 45 46.25 47.5 48.75 50
+// EXPECT-OUT-VALUES: 51.25 52.5 53.75 55 56.25 57.5 58.75 60 61.25 62.5
+// EXPECT-OUT-VALUES: 63.75 65 66.25 67.5 68.75 70 71.25 72.5 73.75 75
+// EXPECT-OUT-VALUES: 76.25 77.5 78.75 80 81.25 82.5 83.75 85 86.25 87.5
+// EXPECT-OUT-VALUES: 88.75 90 91.25 92.5 93.75
+// 75 columns: min, in column order.
+// EXPECT-OUT-VALUES: -1.5 -3 -4.5 -6 -7.5 -9 -10.5 -12 -13.5 -15
+// EXPECT-OUT-VALUES: -16.5 -18 -19.5 -21 -22.5 -24 -25.5 -27 -28.5 -30
+// EXPECT-OUT-VALUES: -31.5 -33 -34.5 -36 -37.5 -39 -40.5 -42 -43.5 -45
+// EXPECT-OUT-VALUES: -46.5 -48 -49.5 -51 -52.5 -54 -55.5 -57 -58.5 -60
+// EXPECT-OUT-VALUES: -61.5 -63 -64.5 -66 -67.5 -69 -70.5 -72 -73.5 -75
+// EXPECT-OUT-VALUES: -76.5 -78 -79.5 -81 -82.5 -84 -85.5 -87 -88.5 -90
+// EXPECT-OUT-VALUES: -91.5 -93 -94.5 -96 -97.5 -99 -100.5 -102 -103.5 -105
+// EXPECT-OUT-VALUES: -106.5 -108 -109.5 -111 -112.5
+// 75 columns: maxabs, in column order.
+// EXPECT-OUT-VALUES: 1.5 3 4.5 6 7.5 9 10.5 12 13.5 15
+// EXPECT-OUT-VALUES: 16.5 18 19.5 21 22.5 24 25.5 27 28.5 30
+// EXPECT-OUT-VALUES: 31.5 33 34.5 36 37.5 39 40.5 42 43.5 45
+// EXPECT-OUT-VALUES: 46.5 48 49.5 51 52.5 54 55.5 57 58.5 60
+// EXPECT-OUT-VALUES: 61.5 63 64.5 66 67.5 69 70.5 72 73.5 75
+// EXPECT-OUT-VALUES: 76.5 78 79.5 81 82.5 84 85.5 87 88.5 90
+// EXPECT-OUT-VALUES: 91.5 93 94.5 96 97.5 99 100.5 102 103.5 105
+// EXPECT-OUT-VALUES: 106.5 108 109.5 111 112.5
+// 75 columns: sumsq, in column order.
+// EXPECT-OUT-VALUES: 9.75 39 87.75 156 243.75 351 477.75 624 789.75 975
+// EXPECT-OUT-VALUES: 1179.75 1404 1647.75 1911 2193.75 2496 2817.75 3159 3519.75 3900
+// EXPECT-OUT-VALUES: 4299.75 4719 5157.75 5616 6093.75 6591 7107.75 7644 8199.75 8775
+// EXPECT-OUT-VALUES: 9369.75 9984 10617.75 11271 11943.75 12636 13347.75 14079 14829.75 15600
+// EXPECT-OUT-VALUES: 16389.75 17199 18027.75 18876 19743.75 20631 21537.75 22464 23409.75 24375
+// EXPECT-OUT-VALUES: 25359.75 26364 27387.75 28431 29493.75 30576 31677.75 32799 33939.75 35100
+// EXPECT-OUT-VALUES: 36279.75 37479 38697.75 39936 41193.75 42471 43767.75 45084 46419.75 47775
+// EXPECT-OUT-VALUES: 49149.75 50544 51957.75 53391 54843.75
+// 75 columns: argmax, in column order.
+// EXPECT-OUT-VALUES: 3 2 1 0 2 1 0 6 5 4
+// EXPECT-OUT-VALUES: 3 2 1 0 2 1 0 6 5 4
+// EXPECT-OUT-VALUES: 3 2 1 0 2 1 0 6 5 4
+// EXPECT-OUT-VALUES: 3 2 1 0 2 1 0 6 5 4
+// EXPECT-OUT-VALUES: 3 2 1 0 2 1 0 6 5 4
+// EXPECT-OUT-VALUES: 3 2 1 0 2 1 0 6 5 4
+// EXPECT-OUT-VALUES: 3 2 1 0 2 1 0 6 5 4
+// EXPECT-OUT-VALUES: 3 2 1 0 2
+// 75 columns: argmin, in column order.
+// EXPECT-OUT-VALUES: 4 3 2 1 0 2 1 0 6 5
+// EXPECT-OUT-VALUES: 4 3 2 1 0 2 1 0 6 5
+// EXPECT-OUT-VALUES: 4 3 2 1 0 2 1 0 6 5
+// EXPECT-OUT-VALUES: 4 3 2 1 0 2 1 0 6 5
+// EXPECT-OUT-VALUES: 4 3 2 1 0 2 1 0 6 5
+// EXPECT-OUT-VALUES: 4 3 2 1 0 2 1 0 6 5
+// EXPECT-OUT-VALUES: 4 3 2 1 0 2 1 0 6 5
+// EXPECT-OUT-VALUES: 4 3 2 1 0
+// 11 columns: sum, in column order.
+// EXPECT-OUT-VALUES: -0.5 -1 -1.5 -2 -2.5 -3 -3.5 -4 -4.5 -5
+// EXPECT-OUT-VALUES: -5.5
+// 11 columns: max, in column order.
+// EXPECT-OUT-VALUES: 1.25 2.5 3.75 5 6.25 7.5 8.75 10 11.25 12.5
+// EXPECT-OUT-VALUES: 13.75
+// 11 columns: min, in column order.
+// EXPECT-OUT-VALUES: -1.5 -3 -4.5 -6 -7.5 -9 -10.5 -12 -13.5 -15
+// EXPECT-OUT-VALUES: -16.5
+// 11 columns: maxabs, in column order.
+// EXPECT-OUT-VALUES: 1.5 3 4.5 6 7.5 9 10.5 12 13.5 15
+// EXPECT-OUT-VALUES: 16.5
+// 11 columns: sumsq, in column order.
+// EXPECT-OUT-VALUES: 8.5 34 76.5 136 212.5 306 416.5 544 688.5 850
+// EXPECT-OUT-VALUES: 1028.5
+// 11 columns: argmax, in column order.
+// EXPECT-OUT-VALUES: 3 2 1 0 9 8 7 6 5 4
+// EXPECT-OUT-VALUES: 3
+// 11 columns: argmin, in column order.
+// EXPECT-OUT-VALUES: 4 3 2 1 0 9 8 7 6 5
+// EXPECT-OUT-VALUES: 4
+module tests.run.colreduce_wide
+
+// Independent oracle: q = [-4,3,-2,5,-6,1,5,-6,2,0], t=(j+1)/4,
+// x[i,j]=q[(i+j)%10]*t. Each column rotates all ten coefficients:
+// sum(q)=-2, sum(q*q)=156, max(q)=5, min(q)=-6, max(abs(q))=6.
+// Thus sum=-2t, max=5t, min=-6t, maxabs=6t, sumsq=156t*t at width 75.
+// Width 11 changes q[6]=4 and q[7]=-5: sum=-2, squares=136, extrema 5/-6.
+// Its extrema are unique, so argmax=(3-j) mod 10 and argmin=(4-j) mod 10;
+// columns 4 and 5 respectively require row 9, catching a dropped final row.
+// At width 75 the first winning rows are min((3-j) mod 10,(6-j) mod 10) for argmax
+// and min((4-j) mod 10,(7-j) mod 10) for argmin (nonnegative residues).
+// These are exact binary fractions throughout; print floats directly, with no casts.
+// 75 columns cover two 32-column colreduce tiles, one 8-vector, and 3 tails;
+// they also cover the current 64-column colarg tile, one 8-vector, and 3 tails.
+// 11 columns cover one 8-vector and 3 tails. Ten rows cross the four-row block:
+// additive folds use 4+4+2 rows; first-row-seeded folds use 4+4+1 more rows.
+// Every output starts with nonuniform poison. The narrow CLI gate proves all seven
+// wukong_col{sum,max,min,maxabs,sumsq}_f32 / colarg{max,min}_i32 dispatches
+// and checks all 602 lanes against this oracle with recognition on and off.
+
+fn wide_75() {
+    let q: [f32; 10] = [-4.0, 3.0, -2.0, 5.0, -6.0, 1.0, 5.0, -6.0, 2.0, 0.0];
+    let mut x: [f32; 750] = [0.0; 750];
+    for i in 0..10 {
+        for j in 0..75 {
+            x[i * 75 + j] = q[(i + j) % 10] * ((j + 1) as f32 * 0.25);
+        }
+    }
+    let mut sum_out: [f32; 75] = [0.0; 75];
+    let mut max_out: [f32; 75] = [0.0; 75];
+    let mut min_out: [f32; 75] = [0.0; 75];
+    let mut maxabs_out: [f32; 75] = [0.0; 75];
+    let mut sumsq_out: [f32; 75] = [0.0; 75];
+    let mut argmax_out: [i32; 75] = [0; 75];
+    let mut argmin_out: [i32; 75] = [0; 75];
+    for j in 0..75 {
+        sum_out[j] = -1000.0 - j as f32 * 0.5;
+        max_out[j] = -1100.0 - j as f32 * 0.5;
+        min_out[j] = -1200.0 - j as f32 * 0.5;
+        maxabs_out[j] = -1300.0 - j as f32 * 0.5;
+        sumsq_out[j] = -1400.0 - j as f32 * 0.5;
+        argmax_out[j] = -1500 - j;
+        argmin_out[j] = -1600 - j;
+    }
+    for j in 0..75 {
+        let mut s: f32 = 0.0;
+        for i in 0..10 { s = s + x[i * 75 + j]; }
+        sum_out[j] = s;
+    }
+    for j in 0..75 {
+        let mut s: f32 = x[j];
+        for i in 1..10 { s = fmax(s, x[i * 75 + j]); }
+        max_out[j] = s;
+    }
+    for j in 0..75 {
+        let mut s: f32 = x[j];
+        for i in 1..10 { s = fmin(s, x[i * 75 + j]); }
+        min_out[j] = s;
+    }
+    for j in 0..75 {
+        let mut s: f32 = abs(x[j]);
+        for i in 1..10 { s = fmax(s, abs(x[i * 75 + j])); }
+        maxabs_out[j] = s;
+    }
+    for j in 0..75 {
+        let mut s: f32 = 0.0;
+        for i in 0..10 { s = s + x[i * 75 + j] * x[i * 75 + j]; }
+        sumsq_out[j] = s;
+    }
+    for j in 0..75 {
+        let mut bv: f32 = x[j];
+        let mut bi: i32 = 0;
+        for i in 1..10 {
+            if x[i * 75 + j] > bv { bv = x[i * 75 + j]; bi = i; }
+        }
+        argmax_out[j] = bi;
+    }
+    for j in 0..75 {
+        let mut bv: f32 = x[j];
+        let mut bi: i32 = 0;
+        for i in 1..10 {
+            if x[i * 75 + j] < bv { bv = x[i * 75 + j]; bi = i; }
+        }
+        argmin_out[j] = bi;
+    }
+    for j in 0..75 { print(sum_out[j]); }
+    for j in 0..75 { print(max_out[j]); }
+    for j in 0..75 { print(min_out[j]); }
+    for j in 0..75 { print(maxabs_out[j]); }
+    for j in 0..75 { print(sumsq_out[j]); }
+    for j in 0..75 { print(argmax_out[j]); }
+    for j in 0..75 { print(argmin_out[j]); }
+}
+
+fn wide_11() {
+    let q: [f32; 10] = [-4.0, 3.0, -2.0, 5.0, -6.0, 1.0, 4.0, -5.0, 2.0, 0.0];
+    let mut x: [f32; 110] = [0.0; 110];
+    for i in 0..10 {
+        for j in 0..11 {
+            x[i * 11 + j] = q[(i + j) % 10] * ((j + 1) as f32 * 0.25);
+        }
+    }
+    let mut sum_out: [f32; 11] = [0.0; 11];
+    let mut max_out: [f32; 11] = [0.0; 11];
+    let mut min_out: [f32; 11] = [0.0; 11];
+    let mut maxabs_out: [f32; 11] = [0.0; 11];
+    let mut sumsq_out: [f32; 11] = [0.0; 11];
+    let mut argmax_out: [i32; 11] = [0; 11];
+    let mut argmin_out: [i32; 11] = [0; 11];
+    for j in 0..11 {
+        sum_out[j] = -1000.0 - j as f32 * 0.5;
+        max_out[j] = -1100.0 - j as f32 * 0.5;
+        min_out[j] = -1200.0 - j as f32 * 0.5;
+        maxabs_out[j] = -1300.0 - j as f32 * 0.5;
+        sumsq_out[j] = -1400.0 - j as f32 * 0.5;
+        argmax_out[j] = -1500 - j;
+        argmin_out[j] = -1600 - j;
+    }
+    for j in 0..11 {
+        let mut s: f32 = 0.0;
+        for i in 0..10 { s = s + x[i * 11 + j]; }
+        sum_out[j] = s;
+    }
+    for j in 0..11 {
+        let mut s: f32 = x[j];
+        for i in 1..10 { s = fmax(s, x[i * 11 + j]); }
+        max_out[j] = s;
+    }
+    for j in 0..11 {
+        let mut s: f32 = x[j];
+        for i in 1..10 { s = fmin(s, x[i * 11 + j]); }
+        min_out[j] = s;
+    }
+    for j in 0..11 {
+        let mut s: f32 = abs(x[j]);
+        for i in 1..10 { s = fmax(s, abs(x[i * 11 + j])); }
+        maxabs_out[j] = s;
+    }
+    for j in 0..11 {
+        let mut s: f32 = 0.0;
+        for i in 0..10 { s = s + x[i * 11 + j] * x[i * 11 + j]; }
+        sumsq_out[j] = s;
+    }
+    for j in 0..11 {
+        let mut bv: f32 = x[j];
+        let mut bi: i32 = 0;
+        for i in 1..10 {
+            if x[i * 11 + j] > bv { bv = x[i * 11 + j]; bi = i; }
+        }
+        argmax_out[j] = bi;
+    }
+    for j in 0..11 {
+        let mut bv: f32 = x[j];
+        let mut bi: i32 = 0;
+        for i in 1..10 {
+            if x[i * 11 + j] < bv { bv = x[i * 11 + j]; bi = i; }
+        }
+        argmin_out[j] = bi;
+    }
+    for j in 0..11 { print(sum_out[j]); }
+    for j in 0..11 { print(max_out[j]); }
+    for j in 0..11 { print(min_out[j]); }
+    for j in 0..11 { print(maxabs_out[j]); }
+    for j in 0..11 { print(sumsq_out[j]); }
+    for j in 0..11 { print(argmax_out[j]); }
+    for j in 0..11 { print(argmin_out[j]); }
+}
+
+fn main() -> i32 {
+    wide_75();
+    wide_11();
+    return 0;
+}
