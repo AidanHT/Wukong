@@ -1509,14 +1509,13 @@ fn build_grad(
         .ok_or_else(|| missing_grad_target(&name))?;
     let wrt = grad_wrt(func, &opts.grad.wrt, opts.grad.train)?;
     let gradfn = wukong_autodiff::grad(func, &wrt, interner)?;
-    if opts.verify_each {
-        // Autodiff synthesizes MIR after optimization. Preserve the complete callee set when
-        // checking its output so calls are checked against the same definitions as the input.
-        let mut checked = program.clone();
-        checked.funcs.push(gradfn.clone());
-        wukong_opt::verify_program_stage(&checked, "autodiff")
-            .map_err(|failure| failure.to_string())?;
-    }
+    // Autodiff synthesizes MIR after optimization, so its output needs a verifier boundary even
+    // without --verify-each. Keep every callee definition available for signature checks before
+    // this function can hand generated MIR to emission or training.
+    let mut checked = program.clone();
+    checked.funcs.push(gradfn.clone());
+    wukong_opt::verify_program_stage(&checked, "autodiff")
+        .map_err(|failure| failure.to_string())?;
     Ok((func.clone(), gradfn))
 }
 
@@ -1762,10 +1761,10 @@ fn train_loop(
         level: program.level,
         statics: program.statics.clone(),
     };
-    if opts.verify_each {
-        wukong_opt::verify_program_stage(&train_prog, "training kernels")
-            .map_err(|failure| failure.to_string())?;
-    }
+    // AdamW adds more generated MIR after build_grad's gate. Validate the exact execution program
+    // unconditionally, before allocating buffers or entering the interpreter.
+    wukong_opt::verify_program_stage(&train_prog, "training kernels")
+        .map_err(|failure| failure.to_string())?;
 
     // Deterministic buffer init; the loss output is zeroed, moment state starts at zero.
     let mut seed = opts.grad.train_seed;
@@ -2861,6 +2860,9 @@ mod verify_gate_tests {
 /// The `--emit=exe` link path's generated inputs (the Rust shim, the C fallback runtime).
 #[cfg(test)]
 mod assertion_link_tests;
+
+#[cfg(test)]
+mod generated_verify_tests;
 
 #[cfg(test)]
 mod cc_print_tests;
