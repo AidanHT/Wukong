@@ -1,6 +1,6 @@
 # `tests/fail/` — compile-fail fixtures
 
-**112** user-written `.wk` programs that must be **rejected at compile time** with a pinned diagnostic
+**140** user-written `.wk` programs that must be **rejected at compile time** with a pinned diagnostic
 code. Directory name is `tests/fail` — **not** `tests/compile-fail`.
 
 ## Format
