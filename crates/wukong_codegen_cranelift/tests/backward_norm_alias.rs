@@ -1,0 +1,383 @@
+use std::fmt::Write;
+use wukong_mir::{Op, Program};
+use wukong_span::{Interner, SourceId};
+
+const ROWS: usize = 2;
+const COLS: usize = 8;
+const CAPACITY: usize = ROWS * COLS + 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    Softmax,
+    RmsNorm,
+    LayerNorm,
+}
+
+impl Family {
+    fn kernel(self) -> &'static str {
+        match self {
+            Self::Softmax => "wukong_softmax_bwd_f32",
+            Self::RmsNorm => "wukong_rmsnorm_bwd_f32",
+            Self::LayerNorm => "wukong_layernorm_bwd_f32",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Alias {
+    None,
+    Activation,
+    Gradient,
+    Gamma,
+}
+
+fn input(family: Family, operand: Alias) -> Vec<f32> {
+    (0..CAPACITY)
+        .map(|lane| match operand {
+            Alias::Activation if family == Family::Softmax => 0.125,
+            Alias::Activation => {
+                if lane % 2 == 0 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            }
+            Alias::Gradient => (lane % 4 + 1) as f32,
+            Alias::Gamma => [1.0, 2.0, 1.0, 2.0, 2.0, 1.0, 2.0, 1.0][lane % COLS],
+            Alias::None => (100 + lane) as f32,
+        })
+        .collect()
+}
+
+/// Independent source-order evaluation, including writes through shared backing storage.
+/// The norm inputs have mean 0 and variance/mean-square 1, so eps=0 gives rstd=rinv=1.
+/// Every intermediate is a small dyadic rational: reassociation and FMA do not round differently.
+/// No compiler/runtime output or runtime kernel is used to construct these expectations.
+fn expected(family: Family, alias: Alias, freeze_gamma: bool) -> Vec<f32> {
+    let activation = input(family, Alias::Activation);
+    let gradient = input(family, Alias::Gradient);
+    let gamma = input(family, Alias::Gamma);
+    let mut output = input(family, alias);
+    for row in 0..ROWS {
+        let read = |operand, lane| {
+            if alias == operand && !(operand == Alias::Gamma && freeze_gamma) {
+                output[lane]
+            } else {
+                match operand {
+                    Alias::Activation => activation[lane],
+                    Alias::Gradient => gradient[lane],
+                    Alias::Gamma => gamma[lane],
+                    Alias::None => unreachable!(),
+                }
+            }
+        };
+        let mut dot = 0.0;
+        let mut sum = 0.0;
+        for col in 0..COLS {
+            let lane = row * COLS + col;
+            let x = read(Alias::Activation, lane);
+            let dy = read(Alias::Gradient, lane);
+            let g = if family == Family::Softmax {
+                dy
+            } else {
+                dy * read(Alias::Gamma, col)
+            };
+            dot += g * x;
+            sum += g;
+        }
+        for col in 0..COLS {
+            let lane = row * COLS + col;
+            // Read afresh for each store: gamma aliases row zero of output, so later rows
+            // observe row zero's completed gradient, not gamma's initial values.
+            let x = if alias == Alias::Activation {
+                output[lane]
+            } else {
+                activation[lane]
+            };
+            let dy = if alias == Alias::Gradient {
+                output[lane]
+            } else {
+                gradient[lane]
+            };
+            let scale = if alias == Alias::Gamma && !freeze_gamma {
+                output[col]
+            } else {
+                gamma[col]
+            };
+            output[lane] = match family {
+                Family::Softmax => x * (dy - dot),
+                Family::RmsNorm => dy * scale - x * (dot / COLS as f32),
+                Family::LayerNorm => dy * scale - sum / COLS as f32 - x * (dot / COLS as f32),
+            };
+        }
+    }
+    output
+}
+
+fn nest(family: Family) -> String {
+    let body = match family {
+        Family::Softmax => "
+            let mut s: f32 = 0.0;
+            for i in 0..COLS { s = s + x[r * COLS + i] * dy[r * COLS + i]; }
+            for i in 0..COLS { output[r * COLS + i] = x[r * COLS + i] * (dy[r * COLS + i] - s); }",
+        Family::RmsNorm => "
+            let mut ms: f32 = 0.0;
+            for i in 0..COLS { ms = ms + x[r * COLS + i] * x[r * COLS + i]; }
+            let rinv: f32 = 1.0 / sqrt(ms / WIDTH + 0.0);
+            let mut sg: f32 = 0.0;
+            for i in 0..COLS { sg = sg + dy[r * COLS + i] * gamma[i] * x[r * COLS + i]; }
+            let coef: f32 = rinv * rinv * sg / WIDTH;
+            for i in 0..COLS { output[r * COLS + i] = rinv * (dy[r * COLS + i] * gamma[i] - x[r * COLS + i] * coef); }",
+        Family::LayerNorm => "
+            let mut sm: f32 = 0.0;
+            for i in 0..COLS { sm = sm + x[r * COLS + i]; }
+            let mean: f32 = sm / WIDTH;
+            let mut vv: f32 = 0.0;
+            for i in 0..COLS { vv = vv + (x[r * COLS + i] - mean) * (x[r * COLS + i] - mean); }
+            let rstd: f32 = 1.0 / sqrt(vv / WIDTH + 0.0);
+            let mut s1: f32 = 0.0;
+            for i in 0..COLS { s1 = s1 + dy[r * COLS + i] * gamma[i]; }
+            let mut s2: f32 = 0.0;
+            for i in 0..COLS { s2 = s2 + dy[r * COLS + i] * gamma[i] * ((x[r * COLS + i] - mean) * rstd); }
+            let m1: f32 = s1 / WIDTH;
+            let m2: f32 = s2 / WIDTH;
+            for i in 0..COLS { output[r * COLS + i] = rstd * (dy[r * COLS + i] * gamma[i] - m1 - ((x[r * COLS + i] - mean) * rstd) * m2); }",
+    };
+    format!("for r in 0..{ROWS} {{ {body} }}")
+        .replace("COLS", &COLS.to_string())
+        .replace("WIDTH", &format!("{COLS}.0"))
+}
+
+fn source(family: Family, alias: Alias, local_view: bool, parallel: bool) -> String {
+    let attribute = if parallel { "@parallel" } else { "" };
+    let mut bindings = String::new();
+    let mut parameters = Vec::new();
+    let mut arguments = Vec::new();
+    for (name, operand) in [
+        ("x", Alias::Activation),
+        ("dy", Alias::Gradient),
+        ("gamma", Alias::Gamma),
+    ] {
+        if family == Family::Softmax && operand == Alias::Gamma {
+            continue;
+        }
+        parameters.push(format!("{name}: [f32; {CAPACITY}]"));
+        if alias == operand {
+            arguments.push("output");
+            if local_view {
+                writeln!(bindings, "let {name}: []f32 = output;").unwrap();
+            }
+        } else {
+            arguments.push(name);
+            let values = input(family, operand)
+                .iter()
+                .map(|v| format!("{v:.3}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(bindings, "let {name}: [f32; {CAPACITY}] = [{values}];").unwrap();
+        }
+    }
+    let nest = nest(family);
+    if local_view {
+        format!("{attribute} fn entry(mut output: [f32; {CAPACITY}]) {{ {bindings} {nest} }}")
+    } else {
+        let parameters = parameters.join(", ");
+        let arguments = arguments.join(", ");
+        format!("{attribute} fn backward({parameters}, mut output: [f32; {CAPACITY}]) {{ {nest} }}
+            fn entry(mut output: [f32; {CAPACITY}]) {{ {bindings} backward({arguments}, output); }}")
+    }
+}
+
+fn lower(source: &str, recognize: bool) -> (Program, Interner) {
+    let mut interner = Interner::new();
+    let (ast, diagnostics) = wukong_parser::parse_module(source, SourceId(0), &mut interner);
+    assert!(diagnostics.is_empty(), "parse: {diagnostics:?}");
+    let (sema, diagnostics) = wukong_sema::check(&ast, &interner);
+    assert!(diagnostics.is_empty(), "sema: {diagnostics:?}");
+    let (program, diagnostics) = wukong_mir_build::lower_program_with(
+        &ast,
+        &sema,
+        &mut interner,
+        wukong_mir_build::LowerOptions {
+            recognize,
+            vec_kernels: false,
+        },
+    );
+    assert!(diagnostics.is_empty(), "lower: {diagnostics:?}");
+    (program, interner)
+}
+
+fn dispatches(program: &Program, interner: &Interner) -> Vec<String> {
+    program
+        .funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .filter_map(|inst| match &inst.op {
+            Op::Call { func, .. } => {
+                let name = interner.resolve(*func);
+                [Family::Softmax, Family::RmsNorm, Family::LayerNorm]
+                    .iter()
+                    .any(|family| name.starts_with(family.kernel()))
+                    .then(|| name.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_gamma_rows_stay_sequential(program: &Program, interner: &Interner, label: &str) {
+    for function in &program.funcs {
+        for inst in function.blocks.iter().flat_map(|block| &block.insts) {
+            let Op::Call { func, args } = &inst.op else {
+                continue;
+            };
+            if interner.resolve(*func) != "wukong_parallel_for" {
+                continue;
+            }
+            let extent = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .find_map(|definition| {
+                    if definition.result == Some(args[0]) {
+                        if let Op::ConstInt(value, _) = &definition.op {
+                            return Some(*value);
+                        }
+                    }
+                    None
+                });
+            // gamma[i] aliases output[i]: row zero must finish before row one reads it.
+            // An inner apply over the eight independent columns is safe; outlining the
+            // two dependent rows is not. Pin the actual region extent before execution.
+            assert_eq!(
+                extent,
+                Some(COLS as i128),
+                "{label}: gamma alias outlined dependent rows"
+            );
+        }
+    }
+}
+
+fn check(family: Family, local_view: bool) {
+    let aliases: &[Alias] = if family == Family::Softmax {
+        &[Alias::None, Alias::Activation, Alias::Gradient]
+    } else {
+        &[
+            Alias::None,
+            Alias::Activation,
+            Alias::Gradient,
+            Alias::Gamma,
+        ]
+    };
+    for &alias in aliases {
+        let expected = expected(family, alias, false);
+        if alias == Alias::Gamma {
+            let frozen = self::expected(family, alias, true);
+            assert_ne!(
+                expected[COLS..ROWS * COLS],
+                frozen[COLS..ROWS * COLS],
+                "the gamma fixture must expose live writes across rows"
+            );
+        }
+        for parallel in [false, true] {
+            let source = source(family, alias, local_view, parallel);
+            for recognize in [true, false] {
+                let label = format!("{family:?} alias={alias:?} local_view={local_view} parallel={parallel} recognize={recognize}");
+                let (program, mut interner) = lower(&source, recognize);
+                if alias == Alias::Gamma {
+                    assert_gamma_rows_stay_sequential(&program, &interner, &label);
+                }
+                let calls = dispatches(&program, &interner);
+                if recognize && alias == Alias::None {
+                    let suffix = if parallel { "_parallel" } else { "" };
+                    assert_eq!(calls, [format!("{}{suffix}", family.kernel())], "{label}");
+                } else {
+                    // Whole-program alias facts conservatively decline all these aliases,
+                    // including softmax/RMSNorm dy aliases tolerated by the runtime's exact
+                    // in-place ABI. Prove fallback before executing a potentially racing kernel.
+                    assert!(calls.is_empty(), "{label}: unexpected dispatch {calls:?}");
+                }
+                let entry = interner.intern("entry");
+                for level in [0, 2] {
+                    let mut optimized = program.clone();
+                    wukong_opt::optimize_verified(&mut optimized, level).unwrap();
+                    if alias == Alias::Gamma {
+                        assert_gamma_rows_stay_sequential(
+                            &optimized,
+                            &interner,
+                            &format!("{label} O{level}"),
+                        );
+                    }
+                    let optimized_calls = dispatches(&optimized, &interner);
+                    // Inlining can duplicate dispatch while keeping the original function.
+                    assert_eq!(
+                        optimized_calls.is_empty(),
+                        calls.is_empty(),
+                        "{label} O{level}"
+                    );
+                    assert!(
+                        optimized_calls.iter().all(|call| calls.contains(call)),
+                        "{label} O{level}: unexpected dispatch {optimized_calls:?}"
+                    );
+                    let mut interpreted = input(family, alias);
+                    wukong_interp::run_kernel_f32(
+                        &optimized,
+                        entry,
+                        &mut [&mut interpreted],
+                        &interner,
+                    )
+                    .unwrap();
+                    let module =
+                        wukong_codegen_cranelift::jit_module(&optimized, &interner).unwrap();
+                    // entry has one fixed f32 array parameter (pointer ABI) and no return.
+                    let function: unsafe extern "C" fn(*mut f32) = unsafe {
+                        std::mem::transmute(module.func_ptr(entry).expect("entry remains present"))
+                    };
+                    let mut native = input(family, alias);
+                    unsafe { function(native.as_mut_ptr()) };
+                    for (backend, actual) in [("interpreter", interpreted), ("native", native)] {
+                        assert_eq!(actual.len(), expected.len(), "{label} O{level} {backend}");
+                        for (lane, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                            assert_eq!(
+                                actual.to_bits(),
+                                expected.to_bits(),
+                                "{label} O{level} {backend} lane {lane}: {actual} != {expected}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn softmax_call_site_aliases_and_disjoint_control() {
+    check(Family::Softmax, false);
+}
+
+#[test]
+fn softmax_local_views_and_disjoint_control() {
+    check(Family::Softmax, true);
+}
+
+#[test]
+fn rmsnorm_call_site_aliases_and_disjoint_control() {
+    check(Family::RmsNorm, false);
+}
+
+#[test]
+fn rmsnorm_local_views_and_disjoint_control() {
+    check(Family::RmsNorm, true);
+}
+
+#[test]
+fn layernorm_call_site_aliases_and_disjoint_control() {
+    check(Family::LayerNorm, false);
+}
+
+#[test]
+fn layernorm_local_views_and_disjoint_control() {
+    check(Family::LayerNorm, true);
+}
