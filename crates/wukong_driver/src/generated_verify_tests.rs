@@ -199,3 +199,218 @@ fn default_verification_preserves_gradient_and_training_values() {
         }
     }
 }
+
+#[test]
+fn generated_backward_is_optimized_without_changing_the_input_program() {
+    let mut interner = Interner::new();
+    let mut b = Builder::new(interner.intern("loss"), MirType::F32);
+    let input = b.add_param(MirType::Ptr);
+    let output = b.add_param(MirType::Ptr);
+    let x = b.build(MirType::F32, Op::Load(input, MirType::F32));
+    let scale = b.build(MirType::F32, Op::ConstFloat(3.0, MirType::F32));
+    let loss = b.build(MirType::F32, Op::Bin(BinOp::FMul, x, scale));
+    b.build_void(Op::Store {
+        ptr: output,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    let mut program = Program::new();
+    program.funcs.push(b.finish());
+    let before = wukong_mir::print::print_program(&program, &interner);
+    let raw = wukong_autodiff::grad(&program.funcs[0], &[0], &mut interner).unwrap();
+    let multiplies = |f: &wukong_mir::Function| {
+        f.blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter(|inst| matches!(inst.op, Op::Bin(BinOp::FMul, ..)))
+            .count()
+    };
+    // Autodiff emits both product-rule contributions, including the unused adjoint of 3.
+    assert_eq!(multiplies(&raw), 3);
+    for opt_level in 0..=3 {
+        let mut baseline_mir = None;
+        for verify_each in [false, true] {
+            let opts = Options {
+                opt_level,
+                verify_each,
+                grad: GradOptions {
+                    wrt: vec![0],
+                    ..GradOptions::default()
+                },
+                ..Options::default()
+            };
+            let (forward, backward) = build_grad(&program, &mut interner, &opts).unwrap();
+            assert_eq!(backward.name, raw.name);
+            assert_eq!(backward.params.len(), raw.params.len());
+            // Constant folding and DCE remove the generated multiplies, leaving the forward one.
+            // The O1 autodiff floor applies even when the CLI selected O0.
+            assert_eq!(
+                multiplies(&backward),
+                1,
+                "O{opt_level}, checked={verify_each}"
+            );
+            let mut generated = program.clone();
+            generated.funcs = vec![forward, backward];
+            assert!(wukong_mir::verify::verify_program(&generated).is_empty());
+            assert_eq!(
+                wukong_mir::print::print_program(&program, &interner),
+                before
+            );
+            let mut forward_only = program.clone();
+            forward_only.funcs = vec![generated.funcs[0].clone()];
+            assert_eq!(
+                wukong_mir::print::print_program(&forward_only, &interner),
+                before
+            );
+            let mir = wukong_mir::print::print_program(&generated, &interner);
+            if let Some(expected) = &baseline_mir {
+                assert_eq!(&mir, expected);
+            } else {
+                baseline_mir = Some(mir);
+            }
+            for x in [-2.0f32, -0.0, 0.0, 0.5, 2.0] {
+                let mut input = [x];
+                let mut loss = [0.0];
+                let mut gradient = [0.0];
+                wukong_interp::run_kernel_f32(
+                    &generated,
+                    raw.name,
+                    &mut [&mut input, &mut loss, &mut gradient],
+                    &interner,
+                )
+                .unwrap();
+                assert_eq!(loss[0].to_bits(), (3.0 * x).to_bits());
+                assert_eq!(gradient[0].to_bits(), 3.0f32.to_bits());
+            }
+        }
+    }
+}
+
+#[test]
+fn optimized_backward_preserves_exact_training_across_levels_and_verification_modes() {
+    let mut interner = Interner::new();
+    let program = loss_program(&mut interner, false, None);
+    for (train_opt, train_weight_decay) in [
+        (TrainOpt::Sgd, 0.0),
+        (TrainOpt::AdamW, 0.0),
+        (TrainOpt::AdamW, 0.125),
+    ] {
+        let mut baseline = None;
+        for opt_level in 0..=3 {
+            for verify_each in [false, true] {
+                let opts = Options {
+                    opt_level,
+                    verify_each,
+                    grad: GradOptions {
+                        train: true,
+                        train_steps: 4,
+                        train_lr: 0.25,
+                        train_opt,
+                        train_weight_decay,
+                        ..GradOptions::default()
+                    },
+                    ..Options::default()
+                };
+                let trajectory = train_loop(&program, &mut interner, &opts, &[1, 1]).unwrap();
+                assert_eq!(trajectory.len(), 5);
+                let bits: Vec<_> = trajectory.iter().map(|value| value.to_bits()).collect();
+                if let Some(expected) = &baseline {
+                    assert_eq!(&bits, expected, "O{opt_level}, checked={verify_each}");
+                } else {
+                    baseline = Some(bits.clone());
+                }
+                if train_opt == TrainOpt::Sgd {
+                    let mut seed = opts.grad.train_seed;
+                    let mut x = train_rand(&mut seed, 1)[0];
+                    for actual in bits {
+                        assert_eq!(actual, (x * x).to_bits());
+                        x *= 0.5;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn generated_backward_loop_preserves_every_gradient_lane_at_all_levels() {
+    let mut interner = Interner::new();
+    let reduce = interner.intern("wukong_sreduce_f32");
+    let mut b = Builder::new(interner.intern("loss"), MirType::F32);
+    let input = b.add_param(MirType::Ptr);
+    let output = b.add_param(MirType::Ptr);
+    let count = b.build(MirType::I64, Op::ConstInt(9, MirType::I64));
+    let sumabs = b.build(MirType::I64, Op::ConstInt(9, MirType::I64));
+    let loss = b.build(
+        MirType::F32,
+        Op::Call {
+            func: reduce,
+            args: vec![input, input, count, sumabs],
+        },
+    );
+    b.build_void(Op::Store {
+        ptr: output,
+        value: loss,
+    });
+    b.ret(Some(loss));
+    let mut program = Program::new();
+    program.funcs.push(b.finish());
+    let raw = wukong_autodiff::grad(&program.funcs[0], &[0], &mut interner).unwrap();
+    assert!(
+        raw.blocks.len() > 1,
+        "the fixture must generate a backward loop"
+    );
+    let entry = raw.name;
+    let mut raw_program = program.clone();
+    raw_program.funcs.push(raw);
+    let run = |program: &Program| {
+        // Nine elements exercises a vector-width boundary and includes both signed zeros.
+        let mut input = [-4.0, -2.0, -1.0, -0.0, 0.0, 0.5, 1.0, 2.0, 4.0];
+        let mut loss = [0.0];
+        let mut gradient = [0.0; 9];
+        wukong_interp::run_kernel_f32(
+            program,
+            entry,
+            &mut [&mut input, &mut loss, &mut gradient],
+            &interner,
+        )
+        .unwrap();
+        (loss[0].to_bits(), gradient.map(f32::to_bits))
+    };
+    let expected = (
+        14.5f32.to_bits(),
+        [-1.0f32, -1.0, -1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0].map(f32::to_bits),
+    );
+    assert_eq!(run(&raw_program), expected);
+    for opt_level in 0..=3 {
+        for verify_each in [false, true] {
+            let opts = Options {
+                opt_level,
+                verify_each,
+                grad: GradOptions {
+                    wrt: vec![0],
+                    ..GradOptions::default()
+                },
+                ..Options::default()
+            };
+            let (forward, backward) = build_grad(&program, &mut interner, &opts).unwrap();
+            let mut generated = program.clone();
+            generated.funcs = vec![forward, backward];
+            let mut input = [-4.0, -2.0, -1.0, -0.0, 0.0, 0.5, 1.0, 2.0, 4.0];
+            let mut loss = [0.0];
+            let mut gradient = [0.0; 9];
+            wukong_interp::run_kernel_f32(
+                &generated,
+                entry,
+                &mut [&mut input, &mut loss, &mut gradient],
+                &interner,
+            )
+            .unwrap();
+            assert_eq!(
+                (loss[0].to_bits(), gradient.map(f32::to_bits)),
+                expected,
+                "O{opt_level}, checked={verify_each}"
+            );
+        }
+    }
+}

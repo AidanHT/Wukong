@@ -1496,7 +1496,7 @@ fn missing_grad_target(name: &str) -> String {
 }
 
 /// Shared core of `--emit=grad` and `--train`: resolve the target loss function and its `wrt` list
-/// from `opts`, run the autodiff transform, and return `(forward_clone, gradient_function)`.
+/// from `opts`, differentiate and optimize the backward, and return `(forward_clone, gradient_function)`.
 fn build_grad(
     program: &wukong_mir::Program,
     interner: &mut Interner,
@@ -1515,6 +1515,33 @@ fn build_grad(
     let mut checked = program.clone();
     checked.funcs.push(gradfn.clone());
     wukong_opt::verify_program_stage(&checked, "autodiff")
+        .map_err(|failure| failure.to_string())?;
+    // Optimize only newly generated MIR: rerunning the pipeline over the input program could
+    // change the forward or inline/delete its callees after the caller has selected them. The
+    // backward still gets the requested local passes and unrolling, with the same O1 floor used
+    // to prepare the forward for autodiff. Preserve its externally invoked entry point explicitly.
+    let grad_name = gradfn.name;
+    let mut generated = wukong_mir::Program {
+        funcs: vec![gradfn],
+        level: program.level,
+        statics: program.statics.clone(),
+    };
+    let level = opts.opt_level.max(1);
+    if opts.verify_each {
+        wukong_opt::optimize_verified_preserving(&mut generated, level, &[grad_name])
+            .map_err(|failure| failure.to_string())?;
+    } else {
+        wukong_opt::optimize_preserving(&mut generated, level, &[grad_name]);
+    }
+    let gradfn = generated
+        .funcs
+        .pop()
+        .ok_or_else(|| "internal: optimization removed the gradient entry point".to_string())?;
+    checked.funcs.pop();
+    checked.funcs.push(gradfn.clone());
+    // The isolated optimizer cannot check calls against the original callee definitions. Restore
+    // that complete context at the output boundary, even when per-pass verification is disabled.
+    wukong_opt::verify_program_stage(&checked, "autodiff optimization")
         .map_err(|failure| failure.to_string())?;
     Ok((func.clone(), gradfn))
 }
