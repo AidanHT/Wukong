@@ -595,3 +595,166 @@ fn unary_modes_do_not_validate_unused_second_inputs() {
         F(2.0)
     );
 }
+
+fn fused_gemm_cases() -> impl Iterator<Item = (&'static str, Vec<Value>)> {
+    [
+        "wukong_sgemm_nt_epi",
+        "wukong_sgemm_nt_epi_parallel",
+        "wukong_sgemm_nt_alpha",
+        "wukong_sgemm_nt_alpha_parallel",
+    ]
+    .into_iter()
+    .map(|name| {
+        let mut args = vec![P(0), P(2), P(6), I(1), I(2), I(2), I(0)];
+        if name.contains("_epi") {
+            args.extend([P(8), I(0)]);
+        } else {
+            args.push(F(1.0));
+        }
+        (name, args)
+    })
+}
+
+#[test]
+fn fused_gemm_rejects_huge_extents_before_allocation() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let mut interp = interpreter(&program, &interner);
+    for (name, args) in fused_gemm_cases() {
+        for (m, k, n, diagnostic) in [
+            (i64::MAX, 4, 1, "extent overflow"),
+            (1, i64::MAX, 1, "out of bounds"),
+            (1, 1, i64::MAX, "out of bounds"),
+        ] {
+            interp.memory = vec![F(2.0); 10];
+            let before = interp.memory.clone();
+            let mut args = args.clone();
+            args[3..6].copy_from_slice(&[I(m.into()), I(k.into()), I(n.into())]);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                interp.intrinsic(name, &args)
+            }));
+            let error = result
+                .expect("fused GEMM must diagnose, not panic")
+                .unwrap_err();
+            assert!(error.contains(diagnostic), "{name}: {error}");
+            assert_eq!(interp.memory, before, "{name}");
+        }
+    }
+}
+
+#[test]
+fn fused_gemm_validates_all_ranges_before_marshalling() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let mut interp = interpreter(&program, &interner);
+    for (name, args) in fused_gemm_cases() {
+        let pointers: &[usize] = if name.contains("_epi") {
+            &[0, 1, 2, 7]
+        } else {
+            &[0, 1, 2]
+        };
+        for &arg in pointers {
+            for base in [9, usize::MAX] {
+                interp.memory = vec![Value::Unit; 10];
+                let before = interp.memory.clone();
+                let mut args = args.clone();
+                args[arg] = P(base);
+                let error = interp.intrinsic(name, &args).unwrap_err();
+                assert!(error.contains("out of bounds"), "{name} arg {arg}: {error}");
+                assert_eq!(interp.memory, before, "{name} arg {arg}");
+            }
+        }
+    }
+}
+
+#[test]
+fn fused_gemm_preserves_numeric_types_bias_and_unread_output() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let mut interp = interpreter(&program, &interner);
+    for (name, args) in fused_gemm_cases() {
+        let epi = name.contains("_epi");
+        for beta in [0, 1] {
+            let mut args = args.clone();
+            args[6] = I(beta);
+            interp.memory = vec![
+                F(2.0),
+                I(3),
+                F(4.0),
+                I(5),
+                F(6.0),
+                I(7),
+                F(1.0),
+                F(2.0),
+                F(2.0),
+                I(3),
+            ];
+            let baseline = interp.memory.clone();
+            let reads: &[usize] = if epi { &[0, 2, 6, 8] } else { &[0, 2, 6] };
+            for &slot in reads {
+                for bad in [P(0), Value::VecRef(0), Value::Unit] {
+                    interp.memory = baseline.clone();
+                    interp.memory[slot] = bad;
+                    let before = interp.memory.clone();
+                    let result = interp.intrinsic(name, &args);
+                    if slot == 6 && beta == 0 {
+                        result.unwrap();
+                        let expected = if epi {
+                            [F(25.0), F(36.0)]
+                        } else {
+                            [F(23.0), F(33.0)]
+                        };
+                        assert_eq!(&interp.memory[6..8], &expected, "{name}");
+                    } else {
+                        let error = result.unwrap_err();
+                        assert!(
+                            error.contains(name) && error.contains("floating buffer contains"),
+                            "{error}"
+                        );
+                        assert_eq!(interp.memory, before, "{name}");
+                    }
+                }
+            }
+            interp.memory = baseline;
+            interp.intrinsic(name, &args).unwrap();
+            let expected = if epi {
+                [25.0 + beta as f64, 36.0 + 2.0 * beta as f64]
+            } else {
+                [23.0 + beta as f64, 33.0 + 2.0 * beta as f64]
+            };
+            assert_eq!(&interp.memory[6..8], &expected.map(F), "{name}");
+        }
+        // Slot zero is a real bias pointer; null is an integer. All inputs are snapshotted
+        // before output writes, including overlapping A, C, and optional bias.
+        for bias in [I(0), P(0)] {
+            let mut args = args.clone();
+            args[2] = P(0);
+            if epi {
+                args[7] = bias;
+            } else {
+                args[7] = F(0.5);
+            }
+            interp.memory = vec![
+                F(2.0),
+                F(3.0),
+                F(4.0),
+                F(5.0),
+                F(6.0),
+                F(7.0),
+                Value::Unit,
+                Value::Unit,
+                F(2.0),
+                F(3.0),
+            ];
+            interp.intrinsic(name, &args).unwrap();
+            let expected = if !epi {
+                [F(11.5), F(16.5)]
+            } else if matches!(bias, P(_)) {
+                [F(25.0), F(36.0)]
+            } else {
+                [F(23.0), F(33.0)]
+            };
+            assert_eq!(&interp.memory[..2], &expected, "{name}");
+        }
+    }
+}
