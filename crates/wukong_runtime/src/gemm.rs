@@ -564,6 +564,8 @@ pub unsafe extern "C" fn wukong_sgemm_nt(
 ///
 /// # Safety
 /// `a`, `b`, `c` valid for `m*k`, `n*k`, `m*n` `f32`; `bias` null or valid for `n` `f32`.
+/// When non-null, the `n`-element bias range must be disjoint from the `m*n`-element
+/// output range; rows may read bias while other output elements are written.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_nt_epi(
     a: *const f32,
@@ -819,6 +821,8 @@ pub unsafe extern "C" fn wukong_sgemm_nt_parallel(
 ///
 /// # Safety
 /// `a`, `b`, `c` valid for `m*k`, `n*k`, `m*n` `f32`; `bias` null or valid for `n` `f32`.
+/// When non-null, the `n`-element bias range must be disjoint from the `m*n`-element
+/// output range; rows may read bias while other output elements are written.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemm_nt_epi_parallel(
     a: *const f32,
@@ -1099,6 +1103,8 @@ unsafe fn gemm_lowp_nt_epi(
 ///
 /// # Safety
 /// `a`/`b` valid for `m*k`/`n*k` `bf16` (`u16`); `c` for `m*n` `f32`; `bias` null or valid for `n` `f32`.
+/// When non-null, the `n`-element bias range must be disjoint from the `m*n`-element
+/// output range; rows may read bias while other output elements are written.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi(
@@ -1130,7 +1136,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi(
 /// Multi-threaded fused-epilogue `C = act(A·Bᵀ + bias)` with `bf16` inputs.
 ///
 /// # Safety
-/// Operand-size contract of [`wukong_sgemm_bf16_nt_epi`].
+/// Operand-size and non-overlap contracts of [`wukong_sgemm_bf16_nt_epi`].
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi_parallel(
@@ -1163,6 +1169,8 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi_parallel(
 ///
 /// # Safety
 /// `a`/`b` valid for `m*k`/`n*k` `f16` (`u16`); `c` for `m*n` `f32`; `bias` null or valid for `n` `f32`.
+/// When non-null, the `n`-element bias range must be disjoint from the `m*n`-element
+/// output range; rows may read bias while other output elements are written.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi(
@@ -1194,7 +1202,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi(
 /// Multi-threaded fused-epilogue `C = act(A·Bᵀ + bias)` with `f16` inputs.
 ///
 /// # Safety
-/// Operand-size contract of [`wukong_sgemm_f16_nt_epi`].
+/// Operand-size and non-overlap contracts of [`wukong_sgemm_f16_nt_epi`].
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi_parallel(

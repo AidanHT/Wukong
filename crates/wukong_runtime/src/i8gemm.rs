@@ -578,6 +578,8 @@ unsafe fn dequant_row(
 /// # Safety
 /// `a` valid for `m*k` u8, `b` for `n*k` i8, `out` for `m*n` f32, `scale_b` for `n` f32, `bias` null or
 /// `n` f32.
+/// When non-null, the `n`-element bias range must be disjoint from the `m*n`-element
+/// output range; rows may read bias while other output elements are written.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn wukong_i8gemm_nt_deq(
