@@ -12554,6 +12554,19 @@ impl FnLowerer<'_> {
         // region outliner parallelize columns with potentially shifted aliases.
         // This also applies when kernel recognition is disabled.
         if self.parallel_fn {
+            // Per-channel scales are likewise reread by every row. A declined
+            // dequant kernel must not leave its inner loop eligible for outlining,
+            // including when recognition is disabled.
+            if let Some(nest) = self.match_dequant_perchan(pat, iter, body) {
+                if !self.provably_disjoint(nest.out, nest.scale)
+                    || !self.provably_disjoint(nest.out, nest.q)
+                {
+                    self.parallel_fn = false;
+                    self.lower_for(label, pat, iter, body, stmt_attrs);
+                    self.parallel_fn = true;
+                    return;
+                }
+            }
             if let Some((out, x, b, ..)) = self.match_bias_bcast(pat, iter, body) {
                 if !self.provably_disjoint(out, b) || (x != out && !self.provably_disjoint(out, x))
                 {
@@ -12668,7 +12681,9 @@ impl FnLowerer<'_> {
             // (structurally disjoint anyway — matmul's outer body is another `for`, GEMV's is the reduction).
             // Rows independent → serial == parallel bit-for-bit (the interpreter marshals the serial form).
             if let Some(nest) = match_gemv(pat, iter, body, self.sema, self.interner) {
-                if self.emit_gemv(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.n, (label, pat, iter, body), |me| {
+                    me.emit_gemv(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12680,7 +12695,9 @@ impl FnLowerer<'_> {
             // Structurally disjoint from GEMV above (`a`'s index is `inner*N + outer`, not `outer*N +
             // inner`) and from the column reductions (the fold addend is a product, not a bare element).
             if let Some(nest) = match_gevm(pat, iter, body, self.sema, self.interner) {
-                if self.emit_gevm(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.rows, (label, pat, iter, body), |me| {
+                    me.emit_gevm(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -15520,6 +15537,14 @@ impl FnLowerer<'_> {
     /// maps independent rows across cores, bit-equal to serial). Returns false (fall through) if a base
     /// or dim cannot be resolved.
     fn emit_dequant_perchan(&mut self, nest: &DequantPerchanNest, parallel: bool) -> bool {
+        // The interpreter snapshots both inputs, and parallel rows read scale
+        // while writing out. Preserve live source reads by declining any output
+        // overlap; read/read q/scale overlap needs no restriction.
+        if !self.provably_disjoint(nest.out, nest.scale)
+            || !self.provably_disjoint(nest.out, nest.q)
+        {
+            return false;
+        }
         let Some([q, out, scale]) = self.kernel_base_ptrs([nest.q, nest.out, nest.scale]) else {
             return false;
         };
