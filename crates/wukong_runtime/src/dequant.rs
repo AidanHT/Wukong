@@ -473,6 +473,8 @@ unsafe fn perchan_row_avx2(
 ///
 /// # Safety
 /// `q`/`out` valid for `rows*cols` elements; `scale` for `cols` `f32`.
+/// The output byte range must not overlap either input. In particular, writing
+/// into `scale` would change later rows and race with parallel readers.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_dequant_perchan_f32(
     q: *const u8,
