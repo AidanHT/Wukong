@@ -1134,22 +1134,12 @@ pub(crate) fn vmath8_for(
     with_vmath8_table!(table)
 }
 
-/// Total streamed bytes (all live arrays) at/above which the output store goes non-temporal. Mirrors
-/// the `velem`/`vhorner` streaming gate exactly (same ~10 MiB ≈ this machine's L3): a `vmovntps` skips
-/// the **read-for-ownership** a cacheable store pays, and that only wins once the working set spills L3.
-/// Below the threshold a normal store keeps the write-once output hot (a later re-read stays in cache),
-/// above it streaming the array out saves the RFO traffic. The gate keys on the *total* bytes touched
-/// (input + output), not the length, so the one-input activation (2 streams) crosses it at the same
-/// working-set size velem's 2-stream map does — the >L3 activation-tensor sizes the exp/log dispatch hits.
-const NT_MIN_BYTES: usize = 10 * 1024 * 1024;
-
 /// Whether a kernel touching `streams` arrays of `n` f32 each should stream its stores — true once the
-/// working set spills L3 (see [`NT_MIN_BYTES`]). `streams` counts every live array (the output plus
-/// each input read), since they all compete for cache residency. Copied verbatim from `velem::use_nt`
-/// so the two kernels make the identical crossover decision.
+/// traffic reaches [`crate::nt_policy::nt_min_bytes`]. `streams` counts every live array (the output plus
+/// each input read). The shared policy owns the crossover; this function owns traffic accounting.
 #[inline]
 fn use_nt(n: usize, streams: usize) -> bool {
-    streams.saturating_mul(n).saturating_mul(4) >= NT_MIN_BYTES
+    streams.saturating_mul(n).saturating_mul(4) >= crate::nt_policy::nt_min_bytes()
 }
 
 /// Unroll-factor A/B knob for the elementwise dispatch loop below. Default (unset / anything but
@@ -2792,7 +2782,7 @@ mod tests {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             return;
         }
-        let n = NT_MIN_BYTES / 8 + 35;
+        let n = crate::nt_policy::test_min_bytes() / 8 + 35;
         let x = vec![2.0; n];
         assert!(use_nt(n, 2));
         crate::velem::check_nt_output(n, -99.0, 2.0, |out| unsafe {
@@ -4796,8 +4786,8 @@ mod tests {
     /// non-multiple-of-8 tail, and the prologue peels to alignment regardless of the allocation's base.
     #[test]
     fn vmath_nt_tail_matches_lanes() {
-        let n = 1_500_001usize; // 2-stream = 12 MiB > NT_MIN_BYTES: forces NT + prologue + tail
-                                // Kept > 0 so log/log-based ops stay in domain; a short period spans the poly's regions.
+        let n = crate::nt_policy::test_len(8, 1_500_001);
+        // Kept > 0 so log/log-based ops stay in domain; a short period spans the poly's regions.
         let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.1 + 0.05).collect();
         for op in [VM_EXP, VM_LOG, VM_TANH, VM_GELU, VM_SIN, VM_ERF, VM_RELU] {
             let mut got = vec![0.0f32; n];
@@ -4818,11 +4808,9 @@ mod tests {
     /// kernel "regardless of thread count" — the equality the interpreter oracle rests on, since the
     /// oracle marshals the *serial* form for both symbols.
     ///
-    /// The 1_500_001 row is the one that matters: 2 streams × 6 MB = 12 MiB is over `NT_MIN_BYTES`, so
-    /// the serial call takes the non-temporal path — scalar alignment peel, `vmovntps`, `sfence` —
-    /// while every 16 Ki parallel chunk re-evaluates `use_nt` on 64 KiB and takes the ordinary
-    /// cacheable path. The two arms therefore run *different store paths over the same data*, and this
-    /// pins that the bits do not move.
+    /// The final span grows with the shared NT policy so the serial call takes the NT path.
+    /// Each parallel chunk re-evaluates that same policy; at the default threshold it remains
+    /// cacheable. A low override may make both arms stream, but the numerical oracle is unchanged.
     ///
     /// Caveat: on a width-1 pool the parallel entry delegates to the serial kernel, and the comparison
     /// is serial-vs-serial. That is the sibling tests' behaviour too; it under-tests rather than
@@ -4835,7 +4823,10 @@ mod tests {
             (16_384, all),     // == VMATH_PAR_MIN: exactly one chunk
             (16_385, all),     // one full chunk plus a 1-element chunk
             (40_961, all),     // two full chunks plus a ragged final one
-            (1_500_001, &[VM_EXP, VM_GELU][..]), // serial goes non-temporal, the chunks do not
+            (
+                crate::nt_policy::test_len(8, 1_500_001),
+                &[VM_EXP, VM_GELU][..],
+            ),
         ] {
             // Kept > 0 so the log family stays in domain; a short period spans the poly's regions.
             let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.1 + 0.05).collect();
@@ -4903,7 +4894,7 @@ mod tests {
         // Non-temporal regime: the ×6 body then runs after the scalar alignment peel and issues six
         // `vmovntps`, which is where a transposed store offset is most likely and least visible. One op
         // is enough — the store offsets do not depend on `f`.
-        let n = 1_500_001usize;
+        let n = crate::nt_policy::test_len(8, 1_500_001);
         assert!(use_nt(n, 2), "length no longer selects the NT store path");
         let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.1 + 0.05).collect();
         let (mut x4, mut x6) = (vec![0.0f32; n], vec![0.0f32; n]);
@@ -5644,7 +5635,7 @@ mod tests {
         // Non-temporal regime (>L3 two-stream working set): prologue peel + ×4 body + remainder +
         // fence + tail, where a store-offset slip would live. exp and log are the two the standing
         // vs oneMKL VML rests on.
-        let n = 1_500_001usize;
+        let n = crate::nt_policy::test_len(8, 1_500_001);
         assert!(use_nt(n, 2), "length no longer selects the NT store path");
         let xs: Vec<f32> = (0..n).map(|i| 0.05 + (i % 97) as f32 * 0.1).collect();
         for op in [VM_EXP, VM_LOG] {
@@ -5752,7 +5743,7 @@ mod tests {
         }
         // Non-temporal regime (>L3 three-stream working set): prologue peel + ×4 body + remainder +
         // fence + tail — where a store-offset slip would live.
-        let n = 1_500_001usize;
+        let n = crate::nt_policy::test_len(8, 1_500_001);
         assert!(use_nt(n, 3), "length no longer selects the NT store path");
         let xs: Vec<f32> = (0..n).map(|i| 0.05 + (i % 97) as f32 * 0.1).collect();
         let ys: Vec<f32> = (0..n).map(|i| ((i % 29) as f32 - 14.0) * 0.11).collect();
@@ -5783,7 +5774,7 @@ mod tests {
     /// (again NT vs cacheable stores write identical bits). `pow` keeps its base > 0.
     #[test]
     fn vmath2_nt_tail_matches_lanes() {
-        let n = 1_500_001usize; // 3-stream = 18 MiB > NT_MIN_BYTES: forces NT + prologue + tail
+        let n = crate::nt_policy::test_len(8, 1_500_001);
         let xs: Vec<f32> = (0..n).map(|i| (i % 89) as f32 * 0.05 + 0.1).collect();
         let ys: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
         for op in [

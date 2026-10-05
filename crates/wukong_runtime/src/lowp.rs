@@ -1115,15 +1115,10 @@ fn axpby_narrow_shifted_overlap(x: *const u16, y: *const u16, out: *mut u16, n: 
     })
 }
 
-/// Total half traffic of the all-half axpby is `6·n` bytes (read x,y bf16 = 4·n + write out = 2·n).
-/// At/above this the narrowing store goes **non-temporal** (`vmovntdq`): once the working set spills
-/// L3, streaming the 2·n-byte output skips the write-allocate read-for-ownership that would otherwise
-/// double the write traffic and erase the whole point of the narrowing store (~10 MiB ≈ this L3).
-const HALFOUT_NT_MIN_BYTES: usize = 10 * 1024 * 1024;
-
+/// Preserve the all-half traffic model: x/y reads plus output write total six bytes per element.
 #[inline]
 fn use_nt_halfout(n: usize) -> bool {
-    n.saturating_mul(6) >= HALFOUT_NT_MIN_BYTES
+    n.saturating_mul(6) >= crate::nt_policy::nt_min_bytes()
 }
 
 /// Elements ahead to software-prefetch the `x`/`y` reads in the streaming path. The output is
@@ -1449,7 +1444,7 @@ mod tests {
         {
             return;
         }
-        let n = HALFOUT_NT_MIN_BYTES / 6 + 35;
+        let n = crate::nt_policy::test_min_bytes() / 6 + 35;
         assert!(use_nt_halfout(n));
         for (kernel, value) in [
             (
@@ -1805,11 +1800,21 @@ mod tests {
     /// agree lane-for-lane (and it is the no-AVX2 fallback).
     #[test]
     fn axpby_narrow_out_simd_equals_scalar_twin() {
-        // The large sizes (> HALFOUT_NT_MIN_BYTES/6 ≈ 1.75M elems) drive the non-temporal 256-bit
-        // streaming path — its scalar alignment prologue, 16-lane packs, and tail — not just the small
-        // cacheable path. 1_749_000 straddles the NT threshold; the +3 keeps a non-mult-of-16 tail.
+        // Keep the existing sizes and grow the largest NT case with the shared policy.
+        // Its mod-32 residue retains the alignment prologue, packed stores and scalar tail.
         for n in [
-            0usize, 1, 7, 8, 9, 16, 17, 100, 1000, 4099, 1_749_000, 2_000_003,
+            0usize,
+            1,
+            7,
+            8,
+            9,
+            16,
+            17,
+            100,
+            1000,
+            4099,
+            1_749_000,
+            crate::nt_policy::test_len(6, 2_000_003),
         ] {
             let xs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.011 - 2.3).sin()).collect();
             let ys: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017 + 0.9).cos()).collect();
@@ -1910,7 +1915,7 @@ mod tests {
                 Half::F16 => wukong_axpby_f16_out,
             };
             // Cross the non-temporal threshold with a scalar prologue and tail.
-            let n = HALFOUT_NT_MIN_BYTES / 6 + 35;
+            let n = crate::nt_policy::test_len(6, 1_747_661);
             let mut got = vec![kind.narrow(0.5); n + 1];
             let base = if got.as_ptr() as usize & 31 == 0 {
                 1
@@ -1991,7 +1996,7 @@ mod tests {
                 Half::Bf16 => wukong_vmath_bf16_out,
                 Half::F16 => wukong_vmath_f16_out,
             };
-            let n = HALFOUT_NT_MIN_BYTES / 6 + 35;
+            let n = crate::nt_policy::test_len(6, 1_747_661);
             let mut got = vec![kind.narrow(-0.5); n + 1];
             let base = if got.as_ptr() as usize & 31 == 0 {
                 1
@@ -2044,7 +2049,19 @@ mod tests {
         for op in [
             VM_RELU, VM_SILU, VM_GELU, VM_EXP, VM_SIGMOID, VM_TANH, VM_ERF,
         ] {
-            for n in [0usize, 1, 7, 8, 9, 16, 17, 100, 1000, 4099, 1_749_000] {
+            for n in [
+                0usize,
+                1,
+                7,
+                8,
+                9,
+                16,
+                17,
+                100,
+                1000,
+                4099,
+                crate::nt_policy::test_len(6, 1_749_000),
+            ] {
                 // A spread over sign/magnitude (activations bend near 0 and saturate for large |x|).
                 let xs: Vec<f32> = (0..n)
                     .map(|i| (i as f32 * 0.011 - 3.7).sin() * 4.0)

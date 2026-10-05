@@ -53,12 +53,6 @@ pub const DQ_I32: i64 = 2 << 8;
 /// Mask isolating the input-width field.
 const DQ_WIDTH_MASK: i64 = 0xff << 8;
 
-/// Total streamed bytes (input + output) at/above which the store goes non-temporal. Mirrors the
-/// crossover `velem` uses: below it a cacheable store keeps the output hot (a per-core `@parallel` chunk
-/// may be re-read); above it `vmovntps` streams the array out once and skips the read-for-ownership the
-/// cacheable store pays. ~10 MiB ≈ this machine's L3.
-const NT_MIN_BYTES: usize = 10 * 1024 * 1024;
-
 /// Scalar activation, mirroring the AVX2 `maxps` semantics exactly: `maxps(v,0)` is `(v > 0) ? v : 0`
 /// (returns the second operand for `±0`/NaN), so the `if` form agrees lane-for-lane; GELU/SiLU are the
 /// shared `vmath` scalar twins the fused kernel applies per lane. `act` is the pre-masked activation byte.
@@ -115,10 +109,10 @@ unsafe fn dequant_scalar(q: *const u8, out: *mut f32, n: usize, scale: f32, op: 
 }
 
 /// Whether an `n`-element dequant whose input element is `in_bytes` wide should use non-temporal stores
-/// — true once input + output spill L3 (see [`NT_MIN_BYTES`]).
+/// — true once input + output spill L3 (see [`crate::nt_policy::nt_min_bytes`]).
 #[inline]
 fn use_nt(n: usize, in_bytes: usize) -> bool {
-    n.saturating_mul(in_bytes + 4) >= NT_MIN_BYTES
+    n.saturating_mul(in_bytes + 4) >= crate::nt_policy::nt_min_bytes()
 }
 
 /// Widen eight input elements at `q.add(i)` to an `__m256i` of eight `i32`, per the width field. Used by
@@ -581,14 +575,14 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        let n = NT_MIN_BYTES / 8 + 35;
+        let n = crate::nt_policy::test_min_bytes() / 8 + 35;
         let q = vec![6i32; n];
         assert!(use_nt(n, 4));
         crate::velem::check_nt_output(n, -99.0, 3.0, |out| unsafe {
             wukong_dequant_f32(q.as_ptr().cast(), out, n as i64, 0.5, DQ_I32 | DQ_ID);
         });
         let cols = 101usize;
-        let rows = NT_MIN_BYTES / (8 * cols) + 1;
+        let rows = (crate::nt_policy::test_min_bytes() / (8 * cols) + 1).max(8);
         let n = rows * cols;
         let q = vec![6i32; n];
         let scale = vec![0.5; cols];
@@ -634,10 +628,10 @@ mod tests {
     /// **bit-for-bit** for every width, activation, and a length that crosses the NT prologue + tail.
     #[test]
     fn simd_equals_scalar_twin() {
-        // 1<<21 i32 elements → 8 MiB in + 8 MiB out = 16 MiB > NT_MIN_BYTES: forces NT + prologue; the
-        // odd remainder forces a scalar tail. i8/u8 at the same length are 5 MiB total (no NT) — so both
-        // store regimes are covered across the width sweep.
-        let n = 2_097_155usize;
+        // Preserve the original span and grow it if needed so even one-byte inputs cross
+        // the shared NT threshold. The odd remainder retains the scalar tail.
+        let n = crate::nt_policy::test_len(5, 2_097_155);
+        assert!(use_nt(n, 1));
         let qi8 = fill_i8(n);
         let qu8 = fill_u8(n);
         let qi32 = fill_i32(n);
