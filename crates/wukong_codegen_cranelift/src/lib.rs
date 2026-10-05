@@ -3919,6 +3919,17 @@ pub fn jit_compile(
     entry: Symbol,
     interner: &Interner,
 ) -> Result<JitProgram, String> {
+    jit_compile_entry(program, entry, interner, false)
+}
+
+// The parameterized handle remains private inside JitBufferKernel: exposing it as JitProgram
+// would let the safe no-argument run API invoke a function with the wrong ABI.
+fn jit_compile_entry(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    buffer_dispatch: bool,
+) -> Result<JitProgram, String> {
     use cranelift_jit::{JITBuilder, JITModule};
 
     let isa = make_isa(false)?;
@@ -4438,9 +4449,22 @@ pub fn jit_compile(
     let entry_fn = program
         .function(entry)
         .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
-    if !entry_fn.params.is_empty() {
+    let valid_entry = if buffer_dispatch {
+        entry_fn.ret == MirType::Void
+            && entry_fn.params.len() == 2
+            && entry_fn.value_type(entry_fn.params[0]) == &MirType::Ptr
+            && entry_fn.value_type(entry_fn.params[1]) == &MirType::I64
+    } else {
+        entry_fn.params.is_empty()
+    };
+    if !valid_entry {
         unsafe { module.free_memory() };
-        return Err("native entry point must take no parameters".into());
+        return Err(if buffer_dispatch {
+            "native buffer dispatcher must have signature (Ptr, I64) -> Void"
+        } else {
+            "native entry point must take no parameters"
+        }
+        .into());
     }
     let entry_id = ids[&entry];
     let code = module.get_finalized_function(entry_id);
@@ -5108,3 +5132,6 @@ mod fuzz;
 
 #[cfg(test)]
 mod fuzz_grammar;
+
+mod guarded_kernel;
+pub use guarded_kernel::{jit_compile_buffer_kernel, JitBufferKernel};

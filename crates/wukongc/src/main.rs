@@ -21,6 +21,7 @@ OPTIONS:
                        buffer parameters of the loss function). For --train, these are the
                        trainable weights; other buffers are fixed data; the last param is the loss.
     --train            Run a fwd->bwd->optimizer loop on the loss fn and print the loss trajectory
+                       (interp or native JIT; concrete f32 buffers; incompatible with --emit/-o)
     --train-steps=<n>  Number of training steps  (default: 100)
     --train-lr=<f>     Learning rate  (default: 0.01)
     --train-weight-decay=<f>  AdamW decoupled weight decay, finite and >= 0 (default: 0)
@@ -251,6 +252,13 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // and `--run --emit=tokens|ast|mir-high|grad` prints the artifact and never runs. Reject the
     // combination rather than report success for work that was not done. (`emit_explicit` exists
     // precisely for this check; it used to be discarded at the end of `parse_args`.)
+    if opts.grad.train && (emit_explicit || opts.output.is_some()) {
+        return Err(
+            "`--train` cannot be combined with explicit `--emit=<stage>` or `-o`: \
+                    training executes immediately and emits no compiled artifact"
+                .into(),
+        );
+    }
     if opts.run && emit_explicit {
         return Err(
             "`--run` cannot be combined with `--emit=<stage>`: the compiler honours exactly one of \
