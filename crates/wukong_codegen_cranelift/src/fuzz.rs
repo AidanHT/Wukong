@@ -685,6 +685,85 @@ fn fuzz_full_buffer_i8_interp_vs_native() {
     assert!(runs > 100, "i8 fuzzer ran too few cases: {runs}");
 }
 
+/// ReLU has an exact independent reference: retain positive x, otherwise return positive zero.
+/// This also specifies the bounded activation's intended NaN behavior; it is not IEEE maximum.
+/// Keep this corpus separate from the f64 table so adding coverage cannot shift its RNG stream.
+#[test]
+fn vmath_relu_matches_exact_reference() {
+    // Explicit encodings retain both zero signs and quiet/signaling NaN payloads. Neither the
+    // reference nor the expected bits calls a runtime helper or floating-point max intrinsic.
+    const INPUT_BITS: &[u32] = &[
+        0x0000_0000,
+        0x8000_0000, // +/- zero
+        0x3f80_0000,
+        0xbf80_0000, // +/- one
+        0x3e00_0000,
+        0xbe00_0000, // +/- 0.125
+        0x0000_0001,
+        0x8000_0001, // smallest +/- subnormal
+        0x007f_ffff,
+        0x807f_ffff, // largest +/- subnormal
+        0x0080_0000,
+        0x8080_0000, // smallest +/- normal
+        0x7f7f_ffff,
+        0xff7f_ffff, // largest finite magnitudes
+        0x7f80_0000,
+        0xff80_0000, // +/- infinity
+        0x7fc0_1234,
+        0xffc0_5678, // signed quiet NaNs
+        0x7f80_0001,
+        0xff80_0123, // signed signaling NaNs
+    ];
+    // Short lengths exercise scalar-only and vector/tail boundaries. 16,385 exceeds the current
+    // parallel threshold (16,384) and spans two chunks when the runtime pool has multiple workers.
+    // The test still checks both entry points on a width-one pool or a non-AVX host; it never skips.
+    const LENGTHS: &[usize] = &[0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 48, 49, 16_385];
+    type Kernel = unsafe extern "C" fn(*const f32, *mut f32, i64, i64);
+    let kernels: [(&str, Kernel); 2] = [
+        ("serial", wukong_runtime::wukong_vmath_f32),
+        ("parallel", wukong_runtime::wukong_vmath_f32_parallel),
+    ];
+    const SENTINEL: u32 = 0xc2f6_0000; // -123, distinct from every valid ReLU output
+    for &n in LENGTHS {
+        // Rotate every input class through every lane and scalar-tail position, even at n=1.
+        for offset in 0..INPUT_BITS.len() {
+            let input: Vec<f32> = (0..n)
+                .map(|i| f32::from_bits(INPUT_BITS[(i + offset) % INPUT_BITS.len()]))
+                .collect();
+            let expected: Vec<u32> = input
+                .iter()
+                .map(|&x| {
+                    let x = f64::from(x);
+                    (if x > 0.0 { x } else { 0.0 } as f32).to_bits()
+                })
+                .collect();
+            for &(name, kernel) in &kernels {
+                let mut output = vec![f32::from_bits(SENTINEL); n + 2];
+                // SAFETY: input has n elements; the output interior has n writable elements and
+                // is disjoint. Both guards remain outside the runtime's declared output range.
+                unsafe {
+                    kernel(
+                        input.as_ptr(),
+                        output.as_mut_ptr().add(1),
+                        n as i64,
+                        wukong_runtime::VM_RELU,
+                    );
+                }
+                assert_eq!(output[0].to_bits(), SENTINEL, "{name} n={n} prefix");
+                assert_eq!(output[n + 1].to_bits(), SENTINEL, "{name} n={n} suffix");
+                for i in 0..n {
+                    assert_eq!(
+                        output[i + 1].to_bits(),
+                        expected[i],
+                        "{name} n={n} offset={offset} lane={i} input={:#010x}",
+                        input[i].to_bits()
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Verify the *value* of the shared transcendental kernels against an independent `f64` reference
 /// within a tight relative tolerance — this catches the case both backends are wrong the *same*
 /// way (a bug in the shared `wukong_vmath_f32` kernel that interp-vs-native equality cannot see).
@@ -697,6 +776,8 @@ fn fuzz_full_buffer_i8_interp_vs_native() {
 /// bf16/f16 these activations usually feed. The bound documents that reality and catches gross errors.
 #[test]
 fn vmath_kernels_match_f64_reference() {
+    // Coverage: 32 distinct VM_* operations plus hardware sqrt (not a VM_* operation).
+    // ReLU has a separate exact reference above; elu, tanhshrink and tan remain omitted here.
     // (name, true-function f64 reference, input regime, max relative error).
     #[allow(clippy::type_complexity)] // the row IS that 4-tuple; naming it would obscure the table
     let cases: &[(&str, fn(f64) -> f64, Regime, f64)] = &[
