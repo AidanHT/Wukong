@@ -7,9 +7,10 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### October 4 generated-MIR verification and AVX2 coverage
 
-- Verify synthesized gradients and complete training programs by default before use. Four new verifier tests and 16 existing gradient CLI tests pass.
+- Verify synthesized gradients and complete training programs by default before use. Five verifier tests and 16 existing gradient CLI tests pass.
 - Protect raw AVX2 test buffers, check untouched tails and detect deliberate guard corruption. All 18 focused tests pass.
-- Combined integration checks remain pending; these changes do not establish performance gains.
+- Add independent every-lane checks for seven column-reduction families across tiled/vector/tail paths, including ties and final-row extrema.
+- Integrated validation passes 45 driver tests, 18 AVX2 tests, the column gate and 20 corpus checks, plus formatting, Clippy and Rust 1.94 compatibility. These changes do not establish performance gains.
 
 ### Full-range f32 trig and benchmark scheduling, 2026-10-04
 
