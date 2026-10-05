@@ -2305,27 +2305,42 @@ impl<'a, 'k> Interp<'a, 'k> {
                     _ => None,
                 };
                 let act = args[8].as_int() as i64;
-                let read = |mem: &[Value],
-                            base: usize,
-                            len: usize,
-                            input: bool|
-                 -> Result<Vec<f32>, String> {
-                    let mut v = Vec::with_capacity(len);
-                    for t in 0..len {
-                        let value = mem.get(base + t).ok_or("sgemm_epi operand out of bounds")?;
-                        v.push(if input {
+                let matrix = |base: usize, rows: usize, cols: usize| -> Result<&[Value], String> {
+                    let len = rows
+                        .checked_mul(cols)
+                        .ok_or("sgemm_epi operand extent overflow")?;
+                    let end = base
+                        .checked_add(len)
+                        .ok_or("sgemm_epi operand out of bounds")?;
+                    self.memory
+                        .get(base..end)
+                        .ok_or_else(|| "sgemm_epi operand out of bounds".into())
+                };
+                // Check every arena range before allocating scratch, including unread beta-zero
+                // output. This validates arena bounds, not individual allocation provenance.
+                let av = matrix(a, m, k)?;
+                let bv = matrix(b, n, k)?;
+                let cv = matrix(c, m, n)?;
+                let biasv = bias_idx.map(|base| matrix(base, 1, n)).transpose()?;
+                let read = |values: &[Value], input: bool| -> Result<Vec<f32>, String> {
+                    let mut buffer = Vec::new();
+                    buffer
+                        .try_reserve_exact(values.len())
+                        .map_err(|_| "sgemm_epi operand allocation failed")?;
+                    for value in values {
+                        buffer.push(if input {
                             value.kernel_float(name)? as f32
                         } else {
                             0.0
                         });
                     }
-                    Ok(v)
+                    Ok(buffer)
                 };
-                let abuf = read(&self.memory, a, m * k, true)?;
-                let bbuf = read(&self.memory, b, n * k, true)?;
-                let mut cbuf = read(&self.memory, c, m * n, beta != 0)?;
-                let biasbuf = match bias_idx {
-                    Some(base) => read(&self.memory, base, n, true)?,
+                let abuf = read(av, true)?;
+                let bbuf = read(bv, true)?;
+                let mut cbuf = read(cv, beta != 0)?;
+                let biasbuf = match biasv {
+                    Some(values) => read(values, true)?,
                     None => Vec::new(),
                 };
                 let bias_ptr = if bias_idx.is_some() {
@@ -2380,27 +2395,39 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 let alpha = args[7].as_float() as f32;
-                let read = |mem: &[Value],
-                            base: usize,
-                            len: usize,
-                            input: bool|
-                 -> Result<Vec<f32>, String> {
-                    let mut v = Vec::with_capacity(len);
-                    for t in 0..len {
-                        let value = mem
-                            .get(base + t)
-                            .ok_or("sgemm_alpha operand out of bounds")?;
-                        v.push(if input {
+                let matrix = |base: usize, rows: usize, cols: usize| -> Result<&[Value], String> {
+                    let len = rows
+                        .checked_mul(cols)
+                        .ok_or("sgemm_alpha operand extent overflow")?;
+                    let end = base
+                        .checked_add(len)
+                        .ok_or("sgemm_alpha operand out of bounds")?;
+                    self.memory
+                        .get(base..end)
+                        .ok_or_else(|| "sgemm_alpha operand out of bounds".into())
+                };
+                // Check every arena range before allocating scratch, including unread beta-zero
+                // output. This validates arena bounds, not individual allocation provenance.
+                let av = matrix(a, m, k)?;
+                let bv = matrix(b, n, k)?;
+                let cv = matrix(c, m, n)?;
+                let read = |values: &[Value], input: bool| -> Result<Vec<f32>, String> {
+                    let mut buffer = Vec::new();
+                    buffer
+                        .try_reserve_exact(values.len())
+                        .map_err(|_| "sgemm_alpha operand allocation failed")?;
+                    for value in values {
+                        buffer.push(if input {
                             value.kernel_float(name)? as f32
                         } else {
                             0.0
                         });
                     }
-                    Ok(v)
+                    Ok(buffer)
                 };
-                let abuf = read(&self.memory, a, m * k, true)?;
-                let bbuf = read(&self.memory, b, n * k, true)?;
-                let mut cbuf = read(&self.memory, c, m * n, beta != 0)?;
+                let abuf = read(av, true)?;
+                let bbuf = read(bv, true)?;
+                let mut cbuf = read(cv, beta != 0)?;
                 // SAFETY: buffers are exactly m*k, n*k, m*n long — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_sgemm_nt_alpha(
