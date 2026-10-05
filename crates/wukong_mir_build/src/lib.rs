@@ -10716,7 +10716,9 @@ impl FnLowerer<'_> {
         }
         let (bias, act) =
             match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner, self.sema)?;
-        if self.emit_lowp_gemm_epi(&nest, bias, act) {
+        if self.emit_nonempty_reduction_stmts(nest.k, &stmts[..2], |me| {
+            me.emit_lowp_gemm_epi(&nest, bias, act)
+        }) {
             Some(2)
         } else {
             None
@@ -10772,7 +10774,9 @@ impl FnLowerer<'_> {
         }
         let (bias, act) =
             match_bias_act_epilogue(&stmts[1], nest.m, nest.n, nest.c, self.interner, self.sema)?;
-        if self.emit_sgemm_epi(&nest, bias, act) {
+        if self.emit_nonempty_reduction_stmts(nest.k, &stmts[..2], |me| {
+            me.emit_sgemm_epi(&nest, bias, act)
+        }) {
             Some(2)
         } else {
             None
@@ -11049,7 +11053,9 @@ impl FnLowerer<'_> {
         {
             return None;
         }
-        if self.emit_i8gemm_deq(&nest, out, scale_a, scale_b, bias, act) {
+        if self.emit_nonempty_reduction_stmts(nest.k, &b.stmts[i..i + 2], |me| {
+            me.emit_i8gemm_deq(&nest, out, scale_a, scale_b, bias, act)
+        }) {
             Some(2)
         } else {
             None
@@ -12500,6 +12506,36 @@ impl FnLowerer<'_> {
         source: (Option<Symbol>, &Pattern, &ForIter, &Block),
         emit: impl FnOnce(&mut Self) -> bool,
     ) -> bool {
+        self.emit_nonempty_reduction(reduction, emit, |me| {
+            me.lower_for(source.0, source.1, source.2, source.3, &[]);
+        })
+    }
+
+    /// A fused kernel consumes the reduction AND its following epilogue. The
+    /// empty-extent fallback must execute the entire source window, including
+    /// its seed stores, bias, activation, and any intermediate accumulator.
+    fn emit_nonempty_reduction_stmts(
+        &mut self,
+        reduction: Dim,
+        source: &[Stmt],
+        emit: impl FnOnce(&mut Self) -> bool,
+    ) -> bool {
+        self.emit_nonempty_reduction(reduction, emit, |me| {
+            for stmt in source {
+                if me.terminated {
+                    break;
+                }
+                me.lower_stmt(stmt);
+            }
+        })
+    }
+
+    fn emit_nonempty_reduction(
+        &mut self,
+        reduction: Dim,
+        emit: impl FnOnce(&mut Self) -> bool,
+        lower_source: impl FnOnce(&mut Self),
+    ) -> bool {
         let known = match reduction {
             Dim::Lit(n) => Some(n),
             Dim::Var(sym) if self.lookup(sym).is_none() => self.const_dim_value(sym),
@@ -12524,14 +12560,14 @@ impl FnLowerer<'_> {
             .cond_br(positive, kernel, vec![], scalar, vec![]);
         self.builder.switch_to(kernel);
         // A later shape/alias check can still decline. Its emitted setup is pure;
-        // route that case to the same original loop even for a positive extent.
+        // route that case to the original source even for a positive extent.
         let dispatched = emit(self);
         self.builder
             .br(if dispatched { join } else { scalar }, vec![]);
         self.builder.switch_to(scalar);
         let recognize = self.gemm.recognize;
         self.gemm.recognize = false;
-        self.lower_for(source.0, source.1, source.2, source.3, &[]);
+        lower_source(self);
         self.gemm.recognize = recognize;
         if !self.terminated {
             self.builder.br(join, vec![]);
@@ -12627,7 +12663,9 @@ impl FnLowerer<'_> {
             if let Some((nest, bias, act)) =
                 match_matmul_residual(pat, iter, body, self.sema, self.interner)
             {
-                if self.emit_sgemm_epi(&nest, bias, act) {
+                if self.emit_nonempty_reduction_loop(nest.k, (label, pat, iter, body), |me| {
+                    me.emit_sgemm_epi(&nest, bias, act)
+                }) {
                     return;
                 }
             }
@@ -12640,7 +12678,9 @@ impl FnLowerer<'_> {
             if let Some((nest, x)) =
                 match_matmul_residual_src(pat, iter, body, self.sema, self.interner)
             {
-                if self.emit_sgemm_residual_src(&nest, x) {
+                if self.emit_nonempty_reduction_loop(nest.k, (label, pat, iter, body), |me| {
+                    me.emit_sgemm_residual_src(&nest, x)
+                }) {
                     return;
                 }
             }
@@ -12653,7 +12693,9 @@ impl FnLowerer<'_> {
             if let Some((nest, d, op)) =
                 match_matmul_dual_store(pat, iter, body, self.sema, self.interner)
             {
-                if self.emit_sgemm_dual_store(&nest, d, op) {
+                if self.emit_nonempty_reduction_loop(nest.k, (label, pat, iter, body), |me| {
+                    me.emit_sgemm_dual_store(&nest, d, op)
+                }) {
                     return;
                 }
             }
@@ -12661,7 +12703,9 @@ impl FnLowerer<'_> {
             // arithmetic, so the kernel equals the scalar nest bit-for-bit; in a `@parallel` function the
             // multicore kernel is used (rows independent → deterministic, so the gate stays exact).
             if let Some(nest) = match_matmul_i8_nt(pat, iter, body, self.sema, self.interner) {
-                if self.emit_i8gemm(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.k, (label, pat, iter, body), |me| {
+                    me.emit_i8gemm(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12670,7 +12714,9 @@ impl FnLowerer<'_> {
             // microkernel. The widen is lossless, so the kernel equals the scalar nest under the matmul
             // reassociation; in a `@parallel` function the multicore kernel runs (rows independent).
             if let Some(nest) = match_matmul_lowp(pat, iter, body, self.sema, self.interner) {
-                if self.emit_lowp_gemm(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.k, (label, pat, iter, body), |me| {
+                    me.emit_lowp_gemm(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -29711,7 +29757,19 @@ fn lower_i8matmul_fn(
             fl.bind_slice(p.name.sym, slot, mty, is_slice);
         }
     }
-    if !fl.emit_i8gemm(nest, parallel) {
+    let StmtKind::For {
+        label,
+        pat,
+        iter,
+        body,
+        ..
+    } = &f.body.as_ref()?.stmts.first()?.kind
+    else {
+        return None;
+    };
+    if !fl.emit_nonempty_reduction_loop(nest.k, (label.map(|l| l.sym), pat, iter, body), |me| {
+        me.emit_i8gemm(nest, parallel)
+    }) {
         return None;
     }
     if !fl.terminated {
