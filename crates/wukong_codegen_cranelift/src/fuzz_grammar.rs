@@ -970,3 +970,415 @@ fn fuzz_grammar_differential() {
          errored, so the corpus or the runner is broken, not the programs"
     );
 }
+
+// Keep the original grammar and seed stream above stable. This complementary grammar guarantees
+// the numeric families and runtime operands that its deliberately small type set cannot generate.
+#[derive(Clone, Copy)]
+struct NumericInt {
+    name: &'static str,
+    bits: u32,
+    signed: bool,
+}
+
+const NUMERIC_INTS: [NumericInt; 8] = [
+    NumericInt {
+        name: "i8",
+        bits: 8,
+        signed: true,
+    },
+    NumericInt {
+        name: "i16",
+        bits: 16,
+        signed: true,
+    },
+    NumericInt {
+        name: "i32",
+        bits: 32,
+        signed: true,
+    },
+    NumericInt {
+        name: "i64",
+        bits: 64,
+        signed: true,
+    },
+    NumericInt {
+        name: "u8",
+        bits: 8,
+        signed: false,
+    },
+    NumericInt {
+        name: "u16",
+        bits: 16,
+        signed: false,
+    },
+    NumericInt {
+        name: "u32",
+        bits: 32,
+        signed: false,
+    },
+    NumericInt {
+        name: "u64",
+        bits: 64,
+        signed: false,
+    },
+];
+
+impl NumericInt {
+    fn mask(self) -> u128 {
+        (1u128 << self.bits) - 1
+    }
+
+    fn signed_value(self, bits: u128) -> i128 {
+        let bits = bits & self.mask();
+        if self.signed && bits & (1u128 << (self.bits - 1)) != 0 {
+            bits as i128 - (1i128 << self.bits)
+        } else {
+            bits as i128
+        }
+    }
+
+    fn text(self, bits: u128) -> String {
+        self.signed_value(bits).to_string()
+    }
+
+    // This oracle uses a wider integer domain and explicit width reduction; it calls neither
+    // backend's arithmetic helper and never invokes Rust's narrow overflowing division/shift.
+    fn expected(self, x: u128, y: u128, shift: u128) -> [String; 7] {
+        let shift = (shift & u128::from(self.bits - 1)) as u32;
+        let (div, rem, right) = if self.signed {
+            let (a, b) = (self.signed_value(x), self.signed_value(y));
+            let (q, r) = if b == 0 { (0, 0) } else { (a / b, a % b) };
+            (q as u128, r as u128, (a >> shift) as u128)
+        } else {
+            let (q, r) = if y == 0 { (0, 0) } else { (x / y, x % y) };
+            (q, r, x >> shift)
+        };
+        [x + y, x.wrapping_sub(y), x * y, div, rem, x << shift, right]
+            .map(|bits| self.text(bits & self.mask()))
+    }
+}
+
+#[derive(Debug)]
+enum NumericExpected {
+    Integer(String),
+    Float(u64),
+}
+
+// All half inputs/intermediates in this grammar are finite normal numbers near unity or zero.
+// Round using the format's binary quantum, independently of the compiler/runtime half helpers.
+fn round_numeric_float(value: f64, fraction_bits: u32) -> f64 {
+    if fraction_bits == 52 || value == 0.0 {
+        return value;
+    }
+    assert!(value.is_finite() && value.abs() >= 0.25 && value.abs() <= 16.0);
+    let exponent = value.abs().log2().floor() as i32;
+    let quantum = 2.0f64.powi(exponent - fraction_bits as i32);
+    (value / quantum).round_ties_even() * quantum
+}
+
+fn numeric_program(seed: u64) -> (String, Vec<NumericExpected>) {
+    const N: usize = 12;
+    let mut rng = Rng(seed);
+    let mut helpers = String::new();
+    let mut main = String::from("fn main() -> i32 {\n");
+    let mut expected = Vec::new();
+    for ty in NUMERIC_INTS {
+        let sign = 1u128 << (ty.bits - 1);
+        let mask = ty.mask();
+        let width = u128::from(ty.bits);
+        // Mandatory cases precede random rows: zero divisors, signed MIN/-1, unsigned high bits,
+        // zero/width/above-width/negative counts. No seed can omit a boundary.
+        let mut rows = vec![
+            (mask, 0, 0),
+            (sign, mask, width),
+            (mask, 1, width + 1),
+            (sign - 1, 2, width - 1),
+            (sign + 1, sign, 2 * width + 3),
+            (0, 0, mask),
+            (3, mask - 1, 1),
+            (mask - 1, sign - 1, width + 3),
+        ];
+        for _ in rows.len()..N {
+            rows.push((
+                u128::from(rng.next_u64()) & mask,
+                u128::from(rng.next_u64()) & mask,
+                u128::from(rng.next_u64()) & mask,
+            ));
+        }
+        let arrays: [String; 3] = std::array::from_fn(|column| {
+            rows.iter()
+                .map(|&(x, y, s)| ty.text([x, y, s][column] & mask))
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        let name = ty.name;
+        helpers.push_str(&format!(
+            "fn numeric_{name}(xs: [{name}; {N}], ys: [{name}; {N}], shifts: [{name}; {N}]) {{\n\
+             for i in 0..{N} {{ let x: {name} = xs[i]; let y: {name} = ys[i]; let s: {name} = shifts[i];\n\
+             print(x + y); print(x - y); print(x * y); print(x / y); print(x % y);\n\
+             print(x << s); print(x >> s); }} }}\n"));
+        main.push_str(&format!(
+            "let xs_{name}: [{name}; {N}] = [{}];\n\
+            let ys_{name}: [{name}; {N}] = [{}]; let shifts_{name}: [{name}; {N}] = [{}];\n\
+            numeric_{name}(xs_{name}, ys_{name}, shifts_{name});\n",
+            arrays[0], arrays[1], arrays[2]
+        ));
+        for (x, y, shift) in rows {
+            expected.extend(ty.expected(x, y, shift).map(NumericExpected::Integer));
+        }
+    }
+    for (name, fraction_bits) in [("f64", 52), ("bf16", 7), ("f16", 10)] {
+        let mut rows = if fraction_bits == 52 {
+            vec![
+                (-0.0, -0.0),
+                (0.0, 0.0),
+                (16777217.0, 0.25),
+                (134217728.25, 0.5),
+                (-134217728.25, -0.5),
+                (1.0000000000000002, 1.0),
+                (1.5, 2.25),
+                (-1.5, -2.25),
+            ]
+        } else {
+            let ulp = 2.0f64.powi(-(fraction_bits as i32));
+            vec![
+                (-0.0, -0.0),
+                (0.0, 0.0),
+                (1.0 + 0.5 * ulp, 1.0),
+                (1.0 + 1.5 * ulp, 1.0),
+                (-1.0 - 0.5 * ulp, -1.0),
+                (-1.0 - 1.5 * ulp, -1.0),
+                (1.5, 2.25),
+                (-1.5, -2.25),
+            ]
+        };
+        for _ in rows.len()..N {
+            rows.push((
+                1.0 + rng.below(129) as f64 / 256.0,
+                1.0 + rng.below(129) as f64 / 256.0,
+            ));
+        }
+        let xs = rows
+            .iter()
+            .map(|(x, _)| format!("{x:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ys = rows
+            .iter()
+            .map(|(_, y)| format!("{y:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        helpers.push_str(&format!(
+            "fn numeric_{name}(xs: [f64; {N}], ys: [f64; {N}]) {{\n\
+             let mut saved: [{name}; {N}] = [0.0 as {name}; {N}];\n\
+             for i in 0..{N} {{ let x: {name} = xs[i] as {name}; let y: {name} = ys[i] as {name};\n\
+             saved[i] = x + y; let z: {name} = saved[i] * x;\n\
+             print(x as f64); print(y as f64); print(saved[i] as f64); print(z as f64); }} }}\n"
+        ));
+        main.push_str(&format!(
+            "let xs_{name}: [f64; {N}] = [{xs}];\n\
+            let ys_{name}: [f64; {N}] = [{ys}]; numeric_{name}(xs_{name}, ys_{name});\n"
+        ));
+        for (x, y) in rows {
+            let x = round_numeric_float(x, fraction_bits);
+            let y = round_numeric_float(y, fraction_bits);
+            let sum = round_numeric_float(x + y, fraction_bits);
+            let product = round_numeric_float(sum * x, fraction_bits);
+            expected.extend([x, y, sum, product].map(|v| NumericExpected::Float(v.to_bits())));
+        }
+    }
+    main.push_str("return 0; }\n");
+    (
+        format!("module fuzz.numeric{seed}\n{helpers}{main}"),
+        expected,
+    )
+}
+
+fn numeric_compile(src: &str, opt: u8) -> (wukong_mir::Program, Interner) {
+    let mut interner = Interner::new();
+    let (module, diagnostics) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+    assert!(
+        !diagnostics.iter().any(|d| d.is_error()),
+        "parse: {diagnostics:?}"
+    );
+    let (sema, diagnostics) = wukong_sema::check(&module, &interner);
+    assert!(
+        !diagnostics.iter().any(|d| d.is_error()),
+        "sema: {diagnostics:?}"
+    );
+    let (mut program, diagnostics) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    assert!(
+        !diagnostics.iter().any(|d| d.is_error()),
+        "lowering: {diagnostics:?}"
+    );
+    numeric_runtime_coverage(&program, &interner, opt, true);
+    wukong_opt::optimize(&mut program, opt);
+    let errors = wukong_mir::verify::verify_program(&program);
+    assert!(errors.is_empty(), "MIR at -O{opt}: {errors:?}");
+    numeric_runtime_coverage(&program, &interner, opt, false);
+    (program, interner)
+}
+
+// Before optimization, attribute every obligation to its own typed helper. After
+// normal optimization may inline/remove helpers, require the dynamic operations
+// to survive in the executable program; exact per-type outputs check semantics.
+fn numeric_runtime_coverage(
+    program: &wukong_mir::Program,
+    interner: &Interner,
+    opt: u8,
+    scoped: bool,
+) {
+    use wukong_mir::{BinOp, MirType, Op};
+    for ty in NUMERIC_INTS {
+        let width = match ty.bits {
+            8 => MirType::I8,
+            16 => MirType::I16,
+            32 => MirType::I32,
+            64 => MirType::I64,
+            _ => unreachable!(),
+        };
+        let ops = if ty.signed {
+            [BinOp::SDiv, BinOp::SRem, BinOp::Shl, BinOp::AShr]
+        } else {
+            [BinOp::UDiv, BinOp::URem, BinOp::Shl, BinOp::LShr]
+        };
+        for wanted in ops {
+            let present =
+                program.funcs.iter().any(|func| {
+                    if scoped && interner.resolve(func.name) != format!("numeric_{}", ty.name) {
+                        return false;
+                    }
+                    func.blocks
+                        .iter()
+                        .flat_map(|block| &block.insts)
+                        .any(|inst| {
+                            let Op::Bin(op, lhs, rhs) = inst.op else {
+                                return false;
+                            };
+                            op == wanted
+                                && *func.value_type(lhs) == width
+                                && func.blocks.iter().flat_map(|block| &block.insts).any(
+                                    |definition| {
+                                        definition.result == Some(rhs)
+                                            && matches!(definition.op, Op::Load(..))
+                                    },
+                                )
+                        })
+                });
+            assert!(
+                present,
+                "-O{opt} lost runtime-loaded {} {wanted:?}",
+                ty.name
+            );
+        }
+    }
+    for (name, width) in [
+        ("f64", MirType::F64),
+        ("bf16", MirType::BF16),
+        ("f16", MirType::F16),
+    ] {
+        for wanted in [BinOp::FAdd, BinOp::FMul] {
+            assert!(program.funcs.iter().filter(|func| !scoped || interner.resolve(func.name) == format!("numeric_{name}")).any(|func| func.blocks.iter().flat_map(|block| &block.insts).any(|inst| {
+                matches!(inst.op,Op::Bin(op,lhs,_) if op == wanted && *func.value_type(lhs) == width)
+            })), "-O{opt} lost {width:?} {wanted:?}");
+        }
+    }
+}
+
+fn numeric_assert_output(got: &(i64, Vec<u8>), expected: &[NumericExpected]) {
+    assert_eq!(got.0, 0);
+    let output = std::str::from_utf8(&got.1).unwrap();
+    let lines: Vec<_> = output.lines().collect();
+    assert_eq!(lines.len(), expected.len(), "numeric output count");
+    for (index, (line, want)) in lines.iter().zip(expected).enumerate() {
+        match want {
+            NumericExpected::Integer(value) => {
+                assert_eq!(*line, value, "integer observation {index}")
+            }
+            NumericExpected::Float(bits) => assert_eq!(
+                line.parse::<f64>().unwrap().to_bits(),
+                *bits,
+                "float observation {index}: {line}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn fuzz_grammar_numeric_differential() {
+    let programs = std::env::var("WUKONG_FUZZ_NUMERIC_PROGRAMS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4);
+    let mut compared = 0;
+    for index in 0..programs {
+        let seed = 0x4e55_4d45_5249_4331 ^ index.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let (src, expected) = numeric_program(seed);
+        // Emit source before execution so even a backend panic has an exact reproducer.
+        eprintln!("numeric grammar seed {seed}, program {index}\n{src}");
+        let mut golden = None;
+        let mut executions = 0;
+        for opt in [0, 2, 3] {
+            let (program, mut interner) = numeric_compile(&src, opt);
+            let main = interner.intern("main");
+            let interpreted = wukong_interp::run_with_output(&program, main, &interner)
+                .unwrap_or_else(|e| panic!("numeric seed {seed} interp -O{opt}: {e}"));
+            numeric_assert_output(&interpreted, &expected);
+            if let Some(ref previous) = golden {
+                assert_eq!(&interpreted, previous, "numeric seed {seed} -O{opt}");
+            } else {
+                golden = Some(interpreted.clone());
+            }
+            executions += 1;
+            if opt != 2 {
+                let native = crate::jit_run(&program, main, &interner)
+                    .unwrap_or_else(|e| panic!("numeric seed {seed} native -O{opt}: {e}"));
+                numeric_assert_output(&native, &expected);
+                assert_eq!(native, interpreted, "numeric seed {seed} native -O{opt}");
+                executions += 1;
+            }
+        }
+        assert_eq!(executions, 5, "numeric seed {seed} execution coverage");
+        compared += 1;
+    }
+    assert_eq!(
+        compared, programs,
+        "numeric grammar must execute every generated program"
+    );
+}
+
+#[test]
+fn fuzz_grammar_numeric_oracles_pin_critical_boundaries() {
+    let i8_ty = NUMERIC_INTS[0];
+    assert_eq!(
+        i8_ty.expected(128, 255, 8),
+        ["127", "-127", "-128", "-128", "0", "-128", "-128"].map(str::to_owned)
+    );
+    let u64_ty = NUMERIC_INTS[7];
+    let max = u128::from(u64::MAX);
+    let expected = u64_ty.expected(max, 0, 64);
+    assert_eq!(
+        &expected[3..],
+        &["0", "0", "18446744073709551615", "18446744073709551615"]
+    );
+    for precision in [7, 10] {
+        let ulp = 2.0f64.powi(-(precision as i32));
+        assert_eq!(
+            round_numeric_float(1.0 + ulp / 2.0, precision).to_bits(),
+            1.0f64.to_bits()
+        );
+        assert_eq!(
+            round_numeric_float(1.0 + 1.5 * ulp, precision).to_bits(),
+            (1.0 + 2.0 * ulp).to_bits()
+        );
+        assert_eq!(
+            round_numeric_float(-1.0 - ulp / 2.0, precision).to_bits(),
+            (-1.0f64).to_bits()
+        );
+        assert_eq!(
+            round_numeric_float(-0.0, precision).to_bits(),
+            (-0.0f64).to_bits()
+        );
+    }
+}
