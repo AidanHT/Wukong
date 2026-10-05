@@ -12549,6 +12549,21 @@ impl FnLowerer<'_> {
         body: &Block,
         stmt_attrs: &[ast::Attr],
     ) {
+        // An alias-uncertain bias nest must remain ordered all the way through
+        // its inner loop: declining the outer kernel alone still lets the
+        // region outliner parallelize columns with potentially shifted aliases.
+        // This also applies when kernel recognition is disabled.
+        if self.parallel_fn {
+            if let Some((out, x, b, ..)) = self.match_bias_bcast(pat, iter, body) {
+                if !self.provably_disjoint(out, b) || (x != out && !self.provably_disjoint(out, x))
+                {
+                    self.parallel_fn = false;
+                    self.lower_for(label, pat, iter, body, stmt_attrs);
+                    self.parallel_fn = true;
+                    return;
+                }
+            }
+        }
         // `@tile` is consumed only by a loop the strip-miner can actually rewrite, and the loop FORM
         // is settled first. `take_tile_size` used to pop the function-item `@tile(BM, BN, …)` queue
         // before anything looked at the loop: a form other than an exclusive step-less range then
@@ -12571,8 +12586,8 @@ impl FnLowerer<'_> {
         //
         // Order is load-bearing (each comment below says why its arm is tried where it is), and the
         // whole block is what `LowerOptions::recognize` / `@generic` turn off: with recognition
-        // disabled no `match_*` runs, so the nest reaches the autovectorizer and the ordinary CFG
-        // lowering below and runs exactly as written. The autovectorizer, the `@parallel` region
+        // disabled no kernel-substitution matcher in this cascade runs, so the nest reaches the
+        // autovectorizer and ordinary CFG lowering below. The autovectorizer, the `@parallel` region
         // outliner and the plain loop lowering are NOT in here — they are how the loop the user
         // wrote is compiled, not a kernel substituted for it.
         if self.gemm.recognize {
@@ -14655,6 +14670,14 @@ impl FnLowerer<'_> {
         let Some((out, x, b, rows, cols, op)) = self.match_bias_bcast(pat, iter, body) else {
             return false;
         };
+        // Every row rereads b, so writing any part of it changes later rows. The
+        // kernel and interpreter's private bias copy require b/out disjointness.
+        // x == out is safe only for the exact same row/column indexing matched
+        // above; distinct symbols may instead be shifted views of one buffer.
+        // Read/read x/b overlap needs no additional restriction.
+        if !self.provably_disjoint(out, b) || (x != out && !self.provably_disjoint(out, x)) {
+            return false;
+        }
         let Some([outv, xv, bv]) = self.kernel_base_ptrs([out, x, b]) else {
             return false;
         };
