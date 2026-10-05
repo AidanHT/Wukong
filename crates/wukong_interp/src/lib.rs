@@ -87,6 +87,47 @@ fn collect_lanes(values: impl ExactSizeIterator<Item = Value>) -> Result<Vec<Val
     Ok(lanes)
 }
 
+/// Validate a whole kernel operand before allocating scratch. Bounds describe the flat arena,
+/// not individual allocation provenance. Callers validate every used operand before marshalling.
+fn kernel_values<'a>(
+    memory: &'a [Value],
+    base: usize,
+    rows: usize,
+    cols: usize,
+    context: &str,
+) -> Result<&'a [Value], String> {
+    let len = rows
+        .checked_mul(cols)
+        .ok_or_else(|| format!("{context}: operand extent overflow"))?;
+    let end = base
+        .checked_add(len)
+        .ok_or_else(|| format!("{context}: operand out of bounds"))?;
+    memory
+        .get(base..end)
+        .ok_or_else(|| format!("{context}: operand out of bounds"))
+}
+
+/// Reserve fallibly before any push/extend, including byte reconstruction and output-only buffers.
+fn kernel_scratch<T>(len: usize, context: &str) -> Result<Vec<T>, String> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(len)
+        .map_err(|_| format!("{context}: operand allocation failed"))?;
+    Ok(buffer)
+}
+
+fn kernel_buffer<T>(
+    values: &[Value],
+    context: &str,
+    mut convert: impl FnMut(Value) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    let mut buffer = kernel_scratch(values.len(), context)?;
+    for &value in values {
+        buffer.push(convert(value)?);
+    }
+    Ok(buffer)
+}
+
 /// Pointers at or above this value encode a function index (`FUNC_TAG + idx`) rather than a memory
 /// address — how `Op::FuncAddr` is represented for `parallel_for` to call back. Real `alloca`
 /// memory never grows near it.
@@ -1914,20 +1955,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let y = ptr(args[2])?;
                 let m = dim!(args[3]);
                 let n = dim!(args[4]);
-                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
-                    let mut v = Vec::with_capacity(len);
-                    for t in 0..len {
-                        v.push(
-                            mem.get(base + t)
-                                .ok_or("sgemv operand out of bounds")?
-                                .kernel_float(name)? as f32,
-                        );
-                    }
-                    Ok(v)
-                };
-                let abuf = read(&self.memory, a, m * n)?;
-                let xbuf = read(&self.memory, x, n)?;
-                let mut ybuf = vec![0.0f32; m];
+                let av = kernel_values(&self.memory, a, m, n, name)?;
+                let xv = kernel_values(&self.memory, x, 1, n, name)?;
+                let yv = kernel_values(&self.memory, y, 1, m, name)?;
+                let abuf = kernel_buffer(av, name, |v| Ok(v.kernel_float(name)? as f32))?;
+                let xbuf = kernel_buffer(xv, name, |v| Ok(v.kernel_float(name)? as f32))?;
+                let mut ybuf = kernel_buffer(yv, name, |_| Ok(0.0f32))?;
                 // SAFETY: buffers are exactly m*n, n, m long — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_sgemv(
@@ -1957,20 +1990,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let m = dim!(args[3]);
                 let n = dim!(args[4]);
                 let alpha = args[5].as_float() as f32;
-                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
-                    let mut v = Vec::with_capacity(len);
-                    for t in 0..len {
-                        v.push(
-                            mem.get(base + t)
-                                .ok_or("sgemv_alpha operand out of bounds")?
-                                .kernel_float(name)? as f32,
-                        );
-                    }
-                    Ok(v)
-                };
-                let abuf = read(&self.memory, a, m * n)?;
-                let xbuf = read(&self.memory, x, n)?;
-                let mut ybuf = vec![0.0f32; m];
+                let av = kernel_values(&self.memory, a, m, n, name)?;
+                let xv = kernel_values(&self.memory, x, 1, n, name)?;
+                let yv = kernel_values(&self.memory, y, 1, m, name)?;
+                let abuf = kernel_buffer(av, name, |v| Ok(v.kernel_float(name)? as f32))?;
+                let xbuf = kernel_buffer(xv, name, |v| Ok(v.kernel_float(name)? as f32))?;
+                let mut ybuf = kernel_buffer(yv, name, |_| Ok(0.0f32))?;
                 // SAFETY: buffers are exactly m*n, n, m long — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_sgemv_alpha(
@@ -2001,20 +2026,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let rows = dim!(args[3]);
                 let cols = dim!(args[4]);
                 let alpha = args[5].as_float() as f32;
-                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
-                    let mut v = Vec::with_capacity(len);
-                    for t in 0..len {
-                        v.push(
-                            mem.get(base + t)
-                                .ok_or("sgevm operand out of bounds")?
-                                .kernel_float(name)? as f32,
-                        );
-                    }
-                    Ok(v)
-                };
-                let wbuf = read(&self.memory, w, rows)?;
-                let abuf = read(&self.memory, a, rows * cols)?;
-                let mut obuf = vec![0.0f32; cols];
+                let av = kernel_values(&self.memory, a, rows, cols, name)?;
+                let xv = kernel_values(&self.memory, w, 1, rows, name)?;
+                let yv = kernel_values(&self.memory, out, 1, cols, name)?;
+                let abuf = kernel_buffer(av, name, |v| Ok(v.kernel_float(name)? as f32))?;
+                let wbuf = kernel_buffer(xv, name, |v| Ok(v.kernel_float(name)? as f32))?;
+                let mut obuf = kernel_buffer(yv, name, |_| Ok(0.0f32))?;
                 // SAFETY: buffers are exactly rows, rows*cols, cols long — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_sgevm_f32(
@@ -2047,25 +2064,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let m = dim!(args[3]);
                 let k = dim!(args[4]);
                 let n = dim!(args[5]);
-                let mut abuf: Vec<u8> = Vec::with_capacity(m * k);
-                for t in 0..m * k {
-                    abuf.push(
-                        self.memory
-                            .get(a + t)
-                            .ok_or("i8gemm a out of bounds")?
-                            .as_int() as u8,
-                    );
-                }
-                let mut bbuf: Vec<i8> = Vec::with_capacity(n * k);
-                for t in 0..n * k {
-                    bbuf.push(
-                        self.memory
-                            .get(b + t)
-                            .ok_or("i8gemm b out of bounds")?
-                            .as_int() as i8,
-                    );
-                }
-                let mut cbuf = vec![0i32; m * n];
+                let av = kernel_values(&self.memory, a, m, k, name)?;
+                let bv = kernel_values(&self.memory, b, n, k, name)?;
+                let cv = kernel_values(&self.memory, c, m, n, name)?;
+                let abuf = kernel_buffer(av, name, |v| Ok(v.as_int() as u8))?;
+                let bbuf = kernel_buffer(bv, name, |v| Ok(v.as_int() as i8))?;
+                let mut cbuf = kernel_buffer(cv, name, |_| Ok(0i32))?;
                 // SAFETY: buffers are exactly m*k, n*k, m*n long — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_i8gemm_nt(
@@ -2109,50 +2113,25 @@ impl<'a, 'k> Interp<'a, 'k> {
                     _ => None,
                 };
                 let act = args[9].as_int() as i64;
-                let mut abuf: Vec<u8> = Vec::with_capacity(m * k);
-                for t in 0..m * k {
-                    abuf.push(
-                        self.memory
-                            .get(a + t)
-                            .ok_or("i8gemm_deq a out of bounds")?
-                            .as_int() as u8,
-                    );
-                }
-                let mut bbuf: Vec<i8> = Vec::with_capacity(n * k);
-                for t in 0..n * k {
-                    bbuf.push(
-                        self.memory
-                            .get(b + t)
-                            .ok_or("i8gemm_deq b out of bounds")?
-                            .as_int() as i8,
-                    );
-                }
-                let mut sbbuf: Vec<f32> = Vec::with_capacity(n);
-                for t in 0..n {
-                    sbbuf.push(
-                        self.memory
-                            .get(scale_b_idx + t)
-                            .ok_or("i8gemm_deq scale_b out of bounds")?
-                            .kernel_float(name)? as f32,
-                    );
-                }
-                let mut biasbuf: Vec<f32> = Vec::new();
-                if let Some(bi) = bias_idx {
-                    for t in 0..n {
-                        biasbuf.push(
-                            self.memory
-                                .get(bi + t)
-                                .ok_or("i8gemm_deq bias out of bounds")?
-                                .kernel_float(name)? as f32,
-                        );
-                    }
-                }
+                let av = kernel_values(&self.memory, a, m, k, name)?;
+                let bv = kernel_values(&self.memory, b, n, k, name)?;
+                let cv = kernel_values(&self.memory, out, m, n, name)?;
+                let sbv = kernel_values(&self.memory, scale_b_idx, 1, n, name)?;
+                let biasv = bias_idx
+                    .map(|base| kernel_values(&self.memory, base, 1, n, name))
+                    .transpose()?;
+                let abuf = kernel_buffer(av, name, |v| Ok(v.as_int() as u8))?;
+                let bbuf = kernel_buffer(bv, name, |v| Ok(v.as_int() as i8))?;
+                let sbbuf = kernel_buffer(sbv, name, |v| Ok(v.kernel_float(name)? as f32))?;
+                let biasbuf = kernel_buffer(biasv.unwrap_or(&[]), name, |v| {
+                    Ok(v.kernel_float(name)? as f32)
+                })?;
                 let bias_ptr = if bias_idx.is_some() {
                     biasbuf.as_ptr()
                 } else {
                     std::ptr::null()
                 };
-                let mut obuf = vec![0.0f32; m * n];
+                let mut obuf = kernel_buffer(cv, name, |_| Ok(0.0f32))?;
                 // SAFETY: abuf/bbuf/obuf are exactly m*k, n*k, m*n long; scale_b (and bias when present)
                 // are n long — the kernel's contract.
                 unsafe {
@@ -2192,26 +2171,46 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let scale = args[3].as_float() as f32;
                 let op = args[4].as_int() as i64;
                 let width = op & (0xff << 8);
-                let mut qbytes: Vec<u8> = Vec::with_capacity(n * 4);
-                for t in 0..n {
-                    let v = self
-                        .memory
-                        .get(q + t)
-                        .ok_or("dequant q out of bounds")?
-                        .as_int();
+                let byte_width = if width == wukong_runtime::DQ_I32 {
+                    4
+                } else {
+                    1
+                };
+                let byte_len = n
+                    .checked_mul(byte_width)
+                    .ok_or("dequant byte extent overflow")?;
+                let qv = kernel_values(&self.memory, q, 1, n, name)?;
+                let ov = kernel_values(&self.memory, out, 1, n, name)?;
+                // DQ_I32 scalar/tail loads dereference *const i32 in the runtime. A Vec<u8>
+                // does not guarantee that alignment, so keep reconstructed words in typed storage.
+                let qwords = if width == wukong_runtime::DQ_I32 {
+                    kernel_buffer(qv, name, |v| Ok(v.as_int() as i32))?
+                } else {
+                    Vec::new()
+                };
+                let mut qbytes = kernel_scratch(
                     if width == wukong_runtime::DQ_I32 {
-                        qbytes.extend_from_slice(&(v as i32).to_ne_bytes());
-                    } else if width == wukong_runtime::DQ_U8 {
-                        qbytes.push(v as u8);
+                        0
                     } else {
-                        qbytes.push(v as i8 as u8); // DQ_I8
+                        byte_len
+                    },
+                    name,
+                )?;
+                if width != wukong_runtime::DQ_I32 {
+                    for value in qv {
+                        qbytes.push(value.as_int() as u8);
                     }
                 }
-                let mut obuf = vec![0.0f32; n];
-                // SAFETY: qbytes matches the width `op` selects; obuf is n long — the kernel's contract.
+                let qptr = if width == wukong_runtime::DQ_I32 {
+                    qwords.as_ptr().cast::<u8>()
+                } else {
+                    qbytes.as_ptr()
+                };
+                let mut obuf = kernel_buffer(ov, name, |_| Ok(0.0f32))?;
+                // SAFETY: qptr references n width-matched, aligned elements; obuf is n long.
                 unsafe {
                     wukong_runtime::wukong_dequant_f32(
-                        qbytes.as_ptr(),
+                        qptr,
                         obuf.as_mut_ptr(),
                         n as i64,
                         scale,
@@ -2239,36 +2238,51 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let scale_idx = ptr(args[4])?;
                 let op = args[5].as_int() as i64;
                 let width = op & (0xff << 8);
-                let n = rows * cols;
-                let mut qbytes: Vec<u8> = Vec::with_capacity(n * 4);
-                for t in 0..n {
-                    let v = self
-                        .memory
-                        .get(q + t)
-                        .ok_or("dequant_perchan q out of bounds")?
-                        .as_int();
+                let n = rows
+                    .checked_mul(cols)
+                    .ok_or("dequant_perchan operand extent overflow")?;
+                let byte_width = if width == wukong_runtime::DQ_I32 {
+                    4
+                } else {
+                    1
+                };
+                let byte_len = n
+                    .checked_mul(byte_width)
+                    .ok_or("dequant byte extent overflow")?;
+                let qv = kernel_values(&self.memory, q, 1, n, name)?;
+                let ov = kernel_values(&self.memory, out, 1, n, name)?;
+                let sv = kernel_values(&self.memory, scale_idx, 1, cols, name)?;
+                // DQ_I32 scalar/tail loads dereference *const i32 in the runtime. A Vec<u8>
+                // does not guarantee that alignment, so keep reconstructed words in typed storage.
+                let qwords = if width == wukong_runtime::DQ_I32 {
+                    kernel_buffer(qv, name, |v| Ok(v.as_int() as i32))?
+                } else {
+                    Vec::new()
+                };
+                let mut qbytes = kernel_scratch(
                     if width == wukong_runtime::DQ_I32 {
-                        qbytes.extend_from_slice(&(v as i32).to_ne_bytes());
-                    } else if width == wukong_runtime::DQ_U8 {
-                        qbytes.push(v as u8);
+                        0
                     } else {
-                        qbytes.push(v as i8 as u8); // DQ_I8
+                        byte_len
+                    },
+                    name,
+                )?;
+                if width != wukong_runtime::DQ_I32 {
+                    for value in qv {
+                        qbytes.push(value.as_int() as u8);
                     }
                 }
-                let mut sbuf: Vec<f32> = Vec::with_capacity(cols);
-                for t in 0..cols {
-                    sbuf.push(
-                        self.memory
-                            .get(scale_idx + t)
-                            .ok_or("dequant_perchan scale out of bounds")?
-                            .kernel_float(name)? as f32,
-                    );
-                }
-                let mut obuf = vec![0.0f32; n];
-                // SAFETY: qbytes width-matched, obuf n long, sbuf cols long — the kernel's contract.
+                let qptr = if width == wukong_runtime::DQ_I32 {
+                    qwords.as_ptr().cast::<u8>()
+                } else {
+                    qbytes.as_ptr()
+                };
+                let sbuf = kernel_buffer(sv, name, |v| Ok(v.kernel_float(name)? as f32))?;
+                let mut obuf = kernel_buffer(ov, name, |_| Ok(0.0f32))?;
+                // SAFETY: qptr references n width-matched, aligned elements; obuf is n and sbuf cols long.
                 unsafe {
                     wukong_runtime::wukong_dequant_perchan_f32(
-                        qbytes.as_ptr(),
+                        qptr,
                         obuf.as_mut_ptr(),
                         rows as i64,
                         cols as i64,
@@ -4048,40 +4062,28 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let k = dim!(args[4]);
                 let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
-                // Read a `[bf16]`/`[f16]` element (stored as the rounded f32 value) back to its exact
-                // 16 stored bits — the same technique the bf16/f16 reductions and axpby use. The bf16
-                // and f16 kernels differ ONLY in which runtime function widens these raw bits, so we
-                // store the bits identically here and branch on the call below.
-                let bits = |idx: usize, t: usize| -> Result<u16, String> {
-                    let f = self
-                        .memory
-                        .get(idx + t)
-                        .ok_or("lowp sgemm operand out of bounds")?
-                        .kernel_float(name)? as f32;
+                let av = kernel_values(&self.memory, a, m, k, name)?;
+                let bv = kernel_values(&self.memory, b, n, k, name)?;
+                let cv = kernel_values(&self.memory, c, m, n, name)?;
+                // Reconstruct the exact half bits after validating every operand range.
+                let bits = |value: Value| -> Result<u16, String> {
+                    let f = value.kernel_float(name)? as f32;
                     Ok(if is_f16 {
                         wukong_runtime::f32_to_f16_bits(f)
                     } else {
                         wukong_runtime::f32_to_bf16_bits(f)
                     })
                 };
-                let mut abuf = Vec::with_capacity(m * k);
-                for t in 0..m * k {
-                    abuf.push(bits(a, t)?);
-                }
-                let mut bbuf = Vec::with_capacity(n * k);
-                for t in 0..n * k {
-                    bbuf.push(bits(b, t)?);
-                }
-                let mut cbuf = vec![0.0f32; m * n];
-                if beta != 0 {
-                    for (t, value) in cbuf.iter_mut().enumerate() {
-                        *value = self
-                            .memory
-                            .get(c + t)
-                            .ok_or("lowp sgemm output out of bounds")?
-                            .kernel_float(name)? as f32;
-                    }
-                }
+                let abuf = kernel_buffer(av, name, bits)?;
+                let bbuf = kernel_buffer(bv, name, bits)?;
+                // Beta zero requires valid output storage but does not read its prior values.
+                let mut cbuf = kernel_buffer(cv, name, |v| {
+                    Ok(if beta != 0 {
+                        v.kernel_float(name)? as f32
+                    } else {
+                        0.0
+                    })
+                })?;
                 let (ai, ki, ni) = (m as i64, k as i64, n as i64);
                 let (ap, bp, cp) = (abuf.as_ptr(), bbuf.as_ptr(), cbuf.as_mut_ptr());
                 // SAFETY: abuf is m*k, bbuf is n*k u16; cbuf is m*n f32 — the kernels' contract.
@@ -4137,56 +4139,34 @@ impl<'a, 'k> Interp<'a, 'k> {
                     _ => None,
                 };
                 let act = args[8].as_int() as i64;
-                // Read a `[bf16]`/`[f16]` element (stored as its rounded f32 value) back to its exact 16
-                // stored bits — the same technique the bf16/f16 GEMM and reductions use.
-                let bits = |idx: usize, t: usize| -> Result<u16, String> {
-                    let f = self
-                        .memory
-                        .get(idx + t)
-                        .ok_or("lowp sgemm_epi operand out of bounds")?
-                        .kernel_float(name)? as f32;
+                let av = kernel_values(&self.memory, a, m, k, name)?;
+                let bv = kernel_values(&self.memory, b, n, k, name)?;
+                let cv = kernel_values(&self.memory, c, m, n, name)?;
+                let biasv = bias_idx
+                    .map(|base| kernel_values(&self.memory, base, 1, n, name))
+                    .transpose()?;
+                // Reconstruct the exact half bits after validating every operand range.
+                let bits = |value: Value| -> Result<u16, String> {
+                    let f = value.kernel_float(name)? as f32;
                     Ok(if is_f16 {
                         wukong_runtime::f32_to_f16_bits(f)
                     } else {
                         wukong_runtime::f32_to_bf16_bits(f)
                     })
                 };
-                let mut abuf = Vec::with_capacity(m * k);
-                for t in 0..m * k {
-                    abuf.push(bits(a, t)?);
-                }
-                let mut bbuf = Vec::with_capacity(n * k);
-                for t in 0..n * k {
-                    bbuf.push(bits(b, t)?);
-                }
-                let mut cbuf = vec![0.0f32; m * n];
-                // The epilogue acts after accumulation: act(C_old + A.B + bias).
-                // Starting from zero here silently dropped C whenever beta was nonzero.
-                if beta != 0 {
-                    for (t, value) in cbuf.iter_mut().enumerate() {
-                        *value = self
-                            .memory
-                            .get(c + t)
-                            .ok_or("lowp sgemm_epi output out of bounds")?
-                            .kernel_float(name)? as f32;
-                    }
-                }
-                // The bias is f32 (the epilogue domain), read straight as f32 like `nt_epi`.
-                let biasbuf = match bias_idx {
-                    Some(base) => {
-                        let mut v = Vec::with_capacity(n);
-                        for t in 0..n {
-                            v.push(
-                                self.memory
-                                    .get(base + t)
-                                    .ok_or("lowp sgemm_epi bias out of bounds")?
-                                    .kernel_float(name)? as f32,
-                            );
-                        }
-                        v
-                    }
-                    None => Vec::new(),
-                };
+                let abuf = kernel_buffer(av, name, bits)?;
+                let bbuf = kernel_buffer(bv, name, bits)?;
+                // Beta zero requires valid output storage but does not read its prior values.
+                let mut cbuf = kernel_buffer(cv, name, |v| {
+                    Ok(if beta != 0 {
+                        v.kernel_float(name)? as f32
+                    } else {
+                        0.0
+                    })
+                })?;
+                let biasbuf = kernel_buffer(biasv.unwrap_or(&[]), name, |v| {
+                    Ok(v.kernel_float(name)? as f32)
+                })?;
                 let bias_ptr = if bias_idx.is_some() {
                     biasbuf.as_ptr()
                 } else {
@@ -5883,3 +5863,6 @@ mod vector_arena_tests;
 
 #[cfg(test)]
 mod kernel_marshalling_tests;
+
+#[cfg(test)]
+mod kernel_extent_marshalling_tests;
