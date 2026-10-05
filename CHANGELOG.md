@@ -5,6 +5,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### October 5 alias and extent corrections
+
+- Guard per-channel dequantization output aliases and keep nested fallback loops ordered.
+- Preserve GEMV/GEVM accumulator and scaled finalizer stores for empty contractions.
+- Validate fused epilogue/alpha GEMM interpreter extents and ranges before fallible scratch
+  allocation, preserving unread beta-zero outputs and optional bias semantics.
+
 ### October 4 generated-gradient optimization and runtime boundaries
 
 - Optimize generated backward MIR with its entry retained and whole-program verification before
