@@ -5,6 +5,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### October 5 contraction semantics and coverage
+
+- Preserve empty lowp/integer GEMM, residual, dual-store and fused-window source stores;
+  two-statement fallbacks execute both original loops.
+- Validate GEMV/GEVM, integer/dequant and lowp GEMM interpreter operands before scratch
+  allocation; reconstruct i32 dequant inputs in aligned typed storage.
+- Require disjoint GEMM bias/output operands and keep dependent source loops ordered
+  through whole-function and nested outlining, including recognition-disabled fallback.
+- Add exact independent ReLU reference coverage without changing the existing numerical
+  table, tolerances or RNG stream; retain the three declared table exclusions.
+
 ### October 5 alias and extent corrections
 
 - Guard per-channel dequantization output aliases and keep nested fallback loops ordered.
