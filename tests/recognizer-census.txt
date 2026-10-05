@@ -71,6 +71,7 @@ colmax.wk: wukong_colmax_f32
 colmaxabs.wk: wukong_colmaxabs_f32
 colmean.wk: wukong_colmean_f32
 colmin.wk: wukong_colmin_f32
+colreduce_wide.wk: wukong_colargmax_i32 wukong_colargmax_i32*2 wukong_colargmin_i32 wukong_colargmin_i32*2 wukong_colmax_f32 wukong_colmax_f32*2 wukong_colmaxabs_f32 wukong_colmaxabs_f32*2 wukong_colmin_f32 wukong_colmin_f32*2 wukong_colsum_f32 wukong_colsum_f32*2 wukong_colsumsq_f32 wukong_colsumsq_f32*2
 colrms.wk: wukong_colrms_f32
 colstats_wide.wk: wukong_coll2_f32 wukong_colmean_f32 wukong_colrms_f32
 colsum.wk: wukong_colsum_f32
