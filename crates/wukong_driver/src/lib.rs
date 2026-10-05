@@ -1603,21 +1603,36 @@ fn grad_wrt(
     Ok(requested.to_vec())
 }
 
-/// The number of `f32` leaf elements in a buffer parameter's semantic type — the count the
-/// interpreter's `run_kernel_f32` ABI expects (one slot per scalar leaf). `Array` multiplies by its
-/// concrete length, `Tensor` by the product of its (fully-const) dims. `None` for a param whose size
-/// is not statically known (a symbolic tensor dim, a slice) — `--train` needs a concrete size.
-fn ty_elem_count(ty: &wukong_types::Ty) -> Option<u64> {
-    use wukong_types::{Dim, Ty};
-    match ty {
-        Ty::Scalar(_) => Some(1),
-        Ty::Array { elem, len, .. } => Some(ty_elem_count(elem)? * len),
-        Ty::Tensor { shape, .. } => shape.0.iter().try_fold(1u64, |acc, d| match d {
-            Dim::Const(n) => Some(acc * n),
+/// Count concrete f32 leaves with checked arithmetic. A top-level scalar is not a buffer.
+fn ty_elem_count(ty: &wukong_types::Ty) -> Option<usize> {
+    use wukong_types::{Dim, Layout, Scalar, Ty};
+    fn leaves(ty: &Ty) -> Option<u64> {
+        match ty {
+            Ty::Scalar(Scalar::F32) => Some(1),
+            Ty::Array { elem, len, .. } => leaves(elem)?.checked_mul(*len),
+            Ty::Tensor {
+                elem: Scalar::F32,
+                shape,
+                layout: Layout::Contiguous | Layout::ColMajor,
+            } => shape.0.iter().try_fold(1u64, |acc, d| match d {
+                Dim::Const(n) => acc.checked_mul(*n),
+                _ => None,
+            }),
             _ => None,
-        }),
-        _ => None,
+        }
     }
+    if !matches!(ty, Ty::Array { .. } | Ty::Tensor { .. }) {
+        return None;
+    }
+    let count = usize::try_from(leaves(ty)?).ok()?;
+    valid_train_extent(count).then_some(count)
+}
+
+// Vec allocations and native pointer offsets must fit isize, not merely usize.
+fn valid_train_extent(count: usize) -> bool {
+    count
+        .checked_mul(std::mem::size_of::<f32>())
+        .is_some_and(|bytes| bytes <= isize::MAX as usize)
 }
 
 /// Recover the element count of each parameter of the `--train` / `--grad-of` loss function from the
@@ -1641,10 +1656,10 @@ fn loss_param_lens(
         .iter()
         .enumerate()
         .map(|(i, ty)| {
-            ty_elem_count(ty).map(|n| n as usize).ok_or_else(|| {
+            ty_elem_count(ty).ok_or_else(|| {
                 format!(
-                    "parameter {i} of `{name}` has no statically-known element count \
-                     (a symbolic tensor dim or slice); --train needs concrete buffer sizes"
+                    "parameter {i} of `{name}` must be a concrete f32 array or dense tensor \
+                     with a representable byte extent; --train needs concrete buffer sizes"
                 )
             })
         })
@@ -1728,9 +1743,24 @@ fn train_loop(
     opts: &Options,
     lens: &[usize],
 ) -> Result<Vec<f32>, String> {
+    train_loop_with_buffers(program, interner, opts, lens).map(|(trajectory, _)| trajectory)
+}
+
+fn train_loop_with_buffers(
+    program: &wukong_mir::Program,
+    interner: &mut Interner,
+    opts: &Options,
+    lens: &[usize],
+) -> Result<(Vec<f32>, Vec<Vec<f32>>), String> {
     use wukong_autodiff::optim::{self, hp};
     use wukong_mir::Program;
 
+    if !matches!(opts.backend, BackendKind::Interp | BackendKind::Native) {
+        return Err("--train supports only --backend=interp or --backend=native".into());
+    }
+    if lens.iter().any(|&n| !valid_train_extent(n)) {
+        return Err("training buffer byte extent is not representable".into());
+    }
     let weight_decay = opts.grad.train_weight_decay;
     if !weight_decay.is_finite() || weight_decay < 0.0 {
         return Err("--train-weight-decay must be finite and non-negative".into());
@@ -1745,6 +1775,14 @@ fn train_loop(
         let loss_fn = program
             .function(fsym)
             .ok_or_else(|| format!("no function `{name}` in the module"))?;
+        if loss_fn.params.is_empty()
+            || loss_fn
+                .params
+                .iter()
+                .any(|&p| loss_fn.value_type(p) != &wukong_mir::MirType::Ptr)
+        {
+            return Err("--train requires every loss parameter to be a buffer (MIR Ptr)".into());
+        }
         (
             loss_fn.params.len(),
             grad_wrt(loss_fn, &opts.grad.wrt, true)?,
@@ -1783,7 +1821,7 @@ fn train_loop(
             funcs.push(f);
         }
     }
-    let train_prog = Program {
+    let mut train_prog = Program {
         funcs,
         level: program.level,
         statics: program.statics.clone(),
@@ -1792,6 +1830,17 @@ fn train_loop(
     // unconditionally, before allocating buffers or entering the interpreter.
     wukong_opt::verify_program_stage(&train_prog, "training kernels")
         .map_err(|failure| failure.to_string())?;
+
+    let mut grad_lens = lens.to_vec();
+    grad_lens.extend(wrt.iter().map(|&wi| lens[wi]));
+    let mut entries = vec![(fwd_name, lens.to_vec()), (gname, grad_lens)];
+    let mut adamw_sizes: Vec<_> = adamw.keys().copied().collect();
+    adamw_sizes.sort_unstable();
+    for n in adamw_sizes {
+        entries.push((adamw[&n], vec![n, n, n, n, hp::LEN]));
+    }
+    let executor =
+        training_native::TrainingExecutor::new(&mut train_prog, interner, opts.backend, entries)?;
 
     // Deterministic buffer init; the loss output is zeroed, moment state starts at zero.
     let mut seed = opts.grad.train_seed;
@@ -1808,9 +1857,8 @@ fn train_loop(
     // text with no diagnostic. `usize::MAX` additionally wrapped `+ 1` to a zero reservation.
     let mut traj = Vec::new();
 
-    let run = |prog: &Program, entry, bufs: &mut [Vec<f32>], it: &Interner| -> Result<(), String> {
-        let mut views: Vec<&mut [f32]> = bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
-        wukong_interp::run_kernel_f32(prog, entry, &mut views, it)
+    let run = |prog: &Program, entry, bufs: &mut [Vec<f32>], it: &Interner| {
+        executor.run(prog, entry, bufs, it)
     };
 
     for step in 0..opts.grad.train_steps {
@@ -1861,7 +1909,7 @@ fn train_loop(
     // One final forward to report the loss after the last update.
     run(&train_prog, fwd_name, &mut bufs, interner)?;
     traj.push(bufs[loss_out][0]);
-    Ok(traj)
+    Ok((traj, bufs))
 }
 
 /// Print the MIR for `program`, running the verifier first. Any verifier failure is emitted as an
@@ -4491,3 +4539,7 @@ mod gpu_e2e_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod native_training_tests;
+mod training_native;
