@@ -803,13 +803,17 @@ program can no longer cascade into ~100 false failures across both gates.
 
 Reverse-mode autodiff transforms MIR for a single-block forward function returning a floating-point
 scalar loss. `--emit=grad` prints its forward and backward MIR; `--train` runs the forward, backward
-and optimizer through the **interpreter only**, including when a native backend is requested.
-Native/AOT training and generated-backward performance comparisons remain open. `--grad-of` selects
+and optimizer on the selected **interpreter or native Cranelift JIT** backend. The native path
+compiles one owning dispatcher and reuses it for forward, backward and generated AdamW calls.
+Training requires concrete f32 arrays or dense tensors with checked byte extents. AOT training
+and generated-backward performance comparisons remain open. `--grad-of` selects
 the loss and `--grad-wrt` its differentiated buffers. Autodiff requires at least `-O1` for SSA
 construction; `-O2`/`-O3` retain the selected loss while still inlining calls and optimizing its body.
-Generated gradients are not themselves optimized. The driver verifies synthesized backward MIR
-and the complete training program by default, before execution. `--verify-each` additionally
-checks each optimization pass; gradient MIR emission also verifies its output.
+Generated gradients receive the existing optimizer with an O1 minimum, matching forward
+preparation for autodiff. The backward entry is preserved; the original forward and its callees
+are unchanged by this second optimization stage. The driver verifies the whole program before
+and after backward optimization and verifies the complete training program before execution.
+`--verify-each` additionally checks each optimization pass; gradient MIR emission also verifies its output.
 
 Eight kernel families have VJP rules, including their parallel spellings: `sgemm`, `sgemm_nt`,
 `bias` without a fused activation, `sreduce_f32` (SUM, DOT, SSD, SUMABS, ABSDIFF), `velem_f32`
@@ -829,9 +833,10 @@ explicitly.
 
 Matmul adjoints and four activation derivatives call runtime kernels. Norm backward and the NT
 weight-gradient transpose still use synthesized loops; sigmoid/tanh do not yet use their fused
-runtime backward kernels. `--train-opt=sgd|adamw` selects the optimizer, but AdamW currently has
-weight decay fixed to zero with no CLI setting. Source-driven in-crate gradient tests exist;
-successful end-to-end CLI fixtures and generated-autodiff benchmarks remain coverage gaps.
+runtime backward kernels. `--train-opt=sgd|adamw` selects the optimizer;
+`--train-weight-decay` accepts finite nonnegative AdamW decay (default zero) and rejects nonzero
+decay with SGD. Source-driven in-crate gradient tests and the real-CLI `training_options` test
+cover selected losses across O0–O3. Generated-autodiff performance benchmarks remain absent.
 
 A loss whose buffers are **raw `*T` / `*mut T` parameters** now differentiates. It previously could
 not: the front end gives a pointer parameter an `alloca ptr` + `store`, so its base reached autodiff

@@ -25,7 +25,8 @@ loop nest the compiler may recognize and lower. On CPU that means tuned `wukong_
 microkernels behind the scenes; on GPU, `--backend=gpu` offloads five recognized kernel hooks
 (`sgemm_nt`, `vmath`, `norm`, `sreduce`, `sgemm_nt_epi` on `wukong_interp::Accelerator` /
 `GpuAccel` in `wukong_driver`), while `--backend=gpu-native` lowers MIR→PTX for a growing subset of
-programs (257/363 `tests/run` fixtures today — naive helpers, no tensor cores). Flash attention,
+programs using naive helpers without tensor cores. GPU corpus coverage must be established by a
+fresh device run; the CPU closeout does not validate it. Flash attention,
 conv, and serving benchmarks in the tree are Rust launchers, not `.wk` programs.
 
 ```sh
@@ -103,17 +104,19 @@ prompt's token ids read via `read_i32`, and runs the full forward pass in Wukong
 learned positional embedding, 12 pre-LayerNorm decoder blocks (biased QKV, 12-head causal attention,
 tanh-GELU MLP, residuals), the final LayerNorm, and the tied LM head → logits `[5, 50257]`.
 
-**It matches HuggingFace numerically.** The next-token logits agree with HuggingFace's reference to a
-**relative max error of 1.87×10⁻⁶** (`max|Δ| = 2.44×10⁻⁴` against `max|ref| = 130.28`), and the argmax
-next token is **1757 (" John")** for the prompt *"Hello, my name is"* — matching HuggingFace exactly.
-This is checked by [`tools/verify_gpt2.py`](tools/verify_gpt2.py).
+**Numerical verification is per run.** [`tools/verify_gpt2.py`](tools/verify_gpt2.py) compares all
+logits with the exported HuggingFace reference and reports `max|Δ| / max|ref|`. Its existing gate
+requires relative error at most `1e-3` and both last-position argmaxes to equal **1757 (" John")**
+for *"Hello, my name is"*. Earlier documentation quoted conflicting relative errors without a
+shared run receipt; those figures are withdrawn. The current CPU closeout has not rerun the full
+model, so it establishes no fresh GPT-2 numerical result.
 
 Reproduce it — one export, one run, one check — from the repo root:
 
 ```sh
 python tools/export_gpt2.py                             # HF GPT-2 → data/gpt2/*.bin (+ reference logits)
 wukongc --run --backend=native examples/gpt2_infer.wk   # runs the model, writes logits to disk
-python tools/verify_gpt2.py                             # rel 1.87e-6, argmax 1757 → "GPT2 VERIFY PASS"
+python tools/verify_gpt2.py                             # reports this run's error and argmax; exits nonzero on failure
 ```
 
 The export directory is resolved as `$GPT2_DATA_DIR`, then an explicit directory argument, then
@@ -125,7 +128,7 @@ artifact's **age** as part of its verdict (`--max-age-seconds`, default 3600) so
 re-assert a result for a run that never happened; pass `--no-age-check` to re-verify an archived
 artifact.
 
-**Honest scope.** This is a **numerical-correctness and capability** result, not a speed claim — **no
+**Scope.** This workflow checks **numerical correctness and capability**; **no
 throughput comparison against PyTorch was measured**, and none is made here. It is **inference, not
 training**. **Tokenization is external**: the `.wk` program consumes integer token ids produced by the
 HuggingFace tokenizer; it does not tokenize text itself. The full 124M run is **native-only** — the
@@ -220,7 +223,9 @@ contraction, loop fusion, and `@parallel` multicore execution over fixed-size-ar
 `--backend=gpu-native`) runs a growing subset of `.wk` programs on NVIDIA hardware. **Reverse-mode
 autodiff**
 (`wukong_autodiff`, driven from the CLI via `--emit=grad` / `--train`) emits the training backward
-pass and runs a fwd→bwd→optimizer (SGD/AdamW) loop — both gated against the interpreter oracle.
+pass and runs a fwd→bwd→optimizer (SGD/AdamW) loop on the interpreter or native Cranelift JIT.
+Training accepts concrete f32 arrays and dense tensors; AOT training and measured training speedups
+remain open. See the [training CLI contract](docs/language-guide.md#command-line-interface).
 Tuples and structs (incl. nested struct-in-struct, **by-value parameters and `-> Struct` returns** via
 an sret ABI, nested tuple fields `t.0.1`, and whole-aggregate assignment), pointers/references
 (`&mut`/`*p`), and `loop`/`while`/`for` with `break`/`continue` (incl. **labeled loops** `'outer: …`

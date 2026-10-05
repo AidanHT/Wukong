@@ -5,6 +5,32 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### October 4 generated-gradient optimization and runtime boundaries
+
+- Optimize generated backward MIR with its entry retained and whole-program verification before
+  and after; preserve the original forward and callees. Exact focused gradient/training checks pass.
+- Reject invalid floating kernel buffer slots in the interpreter while preserving empty operations,
+  overwritten outputs, unused operands, live aliases and signaling-NaN copy-back behavior.
+- Assert 32-byte alignment before every 256-bit non-temporal store in debug builds; focused tests
+  demonstrate actual streaming execution and safe detection before a misaligned intrinsic call.
+- Replace stale rolling corpus counts with a reproducible inventory command and withdraw conflicting
+  unproven GPT-2 relative-error headlines. Historical compile-time denominators remain dated;
+  these changes establish no new model or performance result.
+- Reconcile CPU benchmark tables to original same-run ratios and explicitly identify all twelve
+  withdrawn September MKL(all) observations; historical results establish no current peer win.
+- Qualify CPU compiled-PyTorch claims with the MSVC prerequisite and conditional GEMM/fullgraph
+  retry ladder; unavailable peers and historical measurements establish no fresh peer result.
+- Extend deterministic grammar checks to every integer width/signedness and f64/f16/bf16,
+  with independent exact outputs and runtime division/shift boundaries; retain the original corpus.
+- Centralize the unchanged 10 MiB streaming-store threshold and expose a validated process-level
+  override. Required-path tests retain numerical cases and prove actual streaming execution.
+- Guard broadcast-bias output aliases and retain ordered inner-loop fallback; serial/parallel
+  dispatch and independent every-lane tests pass after fixing a test-discovered outlining gap.
+- Register the new column-reduction fixture in the dispatch census, preserving all existing entries.
+- Honor native CPU training through a retained, guarded JIT dispatcher; verify exact SGD/AdamW
+  trajectories, final weights and fixed inputs. Reject unsupported training buffer types/extents and
+  explicit artifact options. AOT training and measured training performance remain open.
+
 ### October 4 generated-MIR verification and AVX2 coverage
 
 - Verify synthesized gradients and complete training programs by default before use. Five verifier tests and 16 existing gradient CLI tests pass.

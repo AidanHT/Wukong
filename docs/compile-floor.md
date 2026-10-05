@@ -14,9 +14,11 @@
 > the clock-invariant stage **shares/ratios** are the portable figures. The earlier battery-state
 > provisional shares are retained (clearly labeled) only where they corroborate the central run.
 >
-> **Corpus drift — read before comparing to a fresh run.** The corpus has since grown from 296 to
-> **354 files** (332 `tests/run` + 17 `examples` + 5 `bench/kernels`), almost entirely small hardening
-> fixtures. So the 2026-07-11 *totals* and *per-file* figures are not directly comparable to a new
+> **Corpus drift — historical denominators.** The 2026-07-30 run recorded **354 files**
+> (332 `tests/run` + 17 `examples` + 5 `bench/kernels`), up from 296 in the 2026-07-11 run.
+> These are dated inventories; count the current checkout with the
+> [corpus count command](internals.md#testing-strategy). The 2026-07-11 *totals* and *per-file*
+> figures are not directly comparable to a new
 > run, while the *shares* remain the portable comparison. Re-measured on 2026-07-30 over the
 > 354-file corpus: the **optimizer share of front→O2 is 61.3%** and the per-pass ranking has changed
 > (§4a). The full-pipeline stage table (§4) and the spawn table (§6) were **not** re-measured on

@@ -77,6 +77,10 @@ MinGW/UCRT gcc, whose ABI does not match.
 
 ## The everyday native path (no LLVM)
 
+`--train --backend=native` also uses the in-process Cranelift JIT and needs no LLVM. It executes
+training immediately; combining `--train` with explicit `--emit` or `-o` is rejected. Emitting a
+standalone training executable is not supported.
+
 ```sh
 wukongc --emit=exe -O2 examples/fib.wk   # -> fib.exe, via Cranelift + the rustc/cc link
 ./fib.exe                                   # prints 55 (main returns 0)

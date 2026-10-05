@@ -255,8 +255,9 @@ cargo run -p wukong_xbench --release      # CC=gcc by default; set CC to overrid
   oneMKL via `mkl_rt.2.dll` (Anaconda, 16 threads max); **PyTorch 2.12.1+cpu** (16 threads) as of the
   2026-07-30 round — note the harness's `detect_torch` selects the *newest* torch among `python` on
   `PATH` and `tools/torch-venv`, so the peer can change without the benchmark changing; the
-  `torch.compile` columns are pinned to the ATEN/MKL GEMM backend because Inductor's CPP FP32 GEMM
-  template is broken on Windows/MSVC (disclosed in-run by the harness).
+  compiled CPU columns require a captured `vcvars64` MSVC environment. The harness first tries
+  stock max-autotune, then disclosed ATEN/MKL GEMM and non-fullgraph retries; see the
+  [compiled CPU peer provenance](#compiled-cpu-peer-provenance).
 - **Second machine, GPU only (added 2026-08-11).** The
   [H100 section](#gpu-backend-nvidia-h100-80gb-hbm3-sm_90a) was measured on an **NVIDIA H100 80GB
   HBM3** (Hopper, `sm_90a`, 132 SMs, 50 MiB L2, kmd driver 580.95.05, CUDA driver API 13.0) in a
@@ -325,7 +326,7 @@ quality, not just beating textbook code:
 - **End-to-end: a 12-layer GPT-2-class transformer stack (768/12/3072, S=128/512) runs ~19–21×
   faster than idiomatic C and 3.6–4.9× faster than `-ffast-math` C single-core** (three independent
   same-day rounds — see the [End-to-end model](#end-to-end-model--a-12-layer-gpt-2-class-transformer-stack-cpu-inference)
-  section), and **beats compiled PyTorch** (`torch.compile` Inductor max-autotune, fullgraph, warmed):
+  section), and **beats compiled PyTorch** (historical compiled configuration; [MSVC prerequisite and retry tiers](#compiled-cpu-peer-provenance)):
   single-thread it beats compiled-torch-1T at **both** shapes, and — since the `@parallel` head-loop
   region shipped (2026-07-10) — it runs **1.39–1.81× faster than all-threads compiled torch at S=512
   and 1.07–1.43× faster at S=128** (three rounds; it also beats torch's strongest eager config
@@ -445,7 +446,7 @@ negative results**, live in [`prompts/results/`](prompts/results/).
 |---|---|---|---|
 | CPU GEMM | oneMKL | **Historical ratios; current parity unestablished** ([scope](#cpu-parallel-gemm-evidence-scope)). 1-core **~80–104% of MKL-1c across sizes**, at/above parity (≥100%) at 2048³/4096³ (2026-07-10 C-tile microkernel prefetch closed the writeback-miss tail; the `WUKONG_GEMM_PF_C=0` kill-switch reproduces the old 86–88%); `@parallel` via the **size-keyed 2D block-parallel dispatch** (per-block packing mid/large — it beat the shared-cooperative-pack design in both ABBA orderings — shared-pack small band above the 2²³-MAC gate): **~98–99% @512³, ~104% @1024³** of MKL-all, **91% @2048³ / 93% @4096³ vs a healthy peer** (176–186% vs MKL's degraded rounds), **~94–110% @256³** (engaged at 1.7–2× over serial; was deliberately serial at ~39–52%) | Historical MKL-all comparisons swing ~1.4–2× with power state. They do not establish a current parallel-grain deficit or parity; the twelve campaign observations are individually withdrawn below, and fresh controlled measurement remains pending |
 | CPU vmath | oneMKL VML | **The engineering stands; the "caught VML" headline is RETRACTED (2026-08-06).** The defect was real and is fixed: the elementwise loop reached its 8-lane kernel through a *function pointer*, and because this crate is built without crate-wide AVX a `__m256` cannot cross a real call in a register — every 8 lanes paid a 32-byte argument spill, a `vzeroupper`, an indirect `call` and a 32-byte reload, and the poly constants could not stay in ymm across the loop (read out of the emitted asm, not inferred). Monomorphizing the op dispatch (one `match` outside the loop, kernel inlined) is **bit-identical on all 2³² f32** and is worth **1.20–1.78×** — typically ~1.4–1.5×, lowest (1.20–1.36×) for exp at 2²³ where the pass is memory-bound. Same binary, `WUKONG_VMATH_FNPTR=1` kill-switch, six rounds; **that is the only number in this row that is not a cross-library ratio, and it is the result.** The two-input kernel (`wukong_vmath2_f32`: activation backward, SwiGLU/GeGLU gates, pow/atan2/hypot), which spilled **two** `__m256` per call, took the identical fix for 1.09–1.48× (internal A/B only — VML has no `silu'`/`gelu'` entry to peer against; that range is carried from the first rounds and was not re-run on AC, but a battery re-check at 2²⁰ reads 1.19–1.41× inside it). **Against VML, at matched accuracy, exp and log are a TIE.** VML's default is HA at ~0.5 ULP while Wukong ships ≤2 ULP exp and ≤12 ULP log, so the default column is *not* like-for-like; re-run through `vmlSetMode(VML_LA)` — which the probe measures at 2 ULP exp / 4 ULP log on the timed band, exactly where Wukong measures 2 / 4 — the accuracy-matched reading over five rounds (AC+charging 68–76%, best-of-40, ABBA, one process, nothing else running) is **exp 1.09–1.20× SLOWER at 2¹⁶ and 2²⁰** and **log between 1.09× slower and 1.07× faster** — a tie, or a shade behind. Only at n = 2²³ does either come near the noise floor at all, and even there only log clears it (1.48–1.66×) while exp straddles it (1.37–1.54×) — and that is Wukong's non-temporal store regime, not its core. **The historical tanh speed/accuracy comparison is superseded.** The shipped two-region kernel targets ≤1 ULP; the old exp-based kernel’s ratios do not measure this implementation. Fresh accuracy-matched timing is pending. Accuracy itself was re-swept **exhaustively** and did not move: exp 1.625e-7 / ≤2 ULP over all 2.24e9 f32 in [−87, 88.376], log 6.924e-7 / ≤12 ULP over all 2.13e9 positive normals, and all 2³² f32 bit-identical between the monomorphized dispatch, the function-pointer dispatch and the scalar twin | **What was withdrawn, and why.** (1) *"exp 1.08–1.25× faster at 2¹²"* — does not reproduce; against the accuracy-matched peer exp is behind at that size. (2) *The whole n = 2¹² row* — at 16 KiB/array every arm's best-of-40 minimum is 0.5–1.4 µs against a **measured 100 ns `Instant` granularity**, i.e. 5–14 ticks, which is why its ratios came out as exact small fractions (1.000, 8/7, 3/2, 8/5, 4.2 = 42/10). The probe now measures that granularity itself and prints `TIMER-QUANTIZED` whenever the fastest arm is under 100 ticks. (3) *"log 1.17–1.46× faster at every size"* — that was against HA; against LA it is a tie at every size but 2²³, and even the HA reading (1.21–1.55×) mostly sits at or below this machine's floor. **The floor is measured, not assumed:** the probe carries two controls whose true ratio is exactly 1.000 — the shipped entry against the `mono` twin it dispatches to, and VML-HA against a second VML-HA arm — and they read 1.06–1.23× at 2²⁰ and, in one round at 2¹⁶ **with no power-state change and nothing else running, 2.303×** (the same function timed at 27.4 µs and 11.9 µs; that round's `mono vs fnptr` even inverted to 1.60× *slower*). That round is excluded from every range above and is the reason nothing under ~1.4× is published here — it is the in-instrument twin of `wukong_xbench`'s C(twin) column, which once read a byte-identical binary as 1.31× faster than itself. **Still open:** at matched accuracy VML's LA exp/log core is a shade ahead of ours at n ≤ 2²⁰ — that is the real residual, now measured rather than asserted, and it is smaller than the pre-2026-08-06 loss but not gone. The four *arithmetic* levers remain superseded-but-recorded: 8-bucket in-register LUTs (which did close a real ~1.7–2× loss), Estrin scheduling, the ×4/×6 ILP unroll, and a bit-identical ldexp exp tail that measured a ~10–15% LOSS and was reverted. `wukong-xbench exp`'s **own** VML peer prints much larger ratios (2.59× new / 1.59× old at 2²⁰, where this probe reads a tie) — it runs in default **HA** mode too, times each arm in its own tight rep-block rather than rotating them, and has **not** been re-measured against LA; treat its row as carrying the same accuracy mismatch and the same floor. The bf16/f16-input dispatchers still use the function-pointer table (bandwidth-bound; 36 more monomorphizations each is a code-size trade that was not measured) |
-| CPU end-to-end model (12-layer GPT-2-class) | PyTorch CPU compiled (`torch.compile` max-autotune, fullgraph) + eager + gcc C | **~19–21× C(gcc), 3.6–4.9× C(-ffast-math)** 1-core; vs compiled-torch-1T it wins at **both** shapes; multicore, since the `@parallel` head-loop region (2026-07-10): **1.39–1.81× FASTER than all-threads compiled torch @S=512 and 1.07–1.43× @S=128** (three rounds, roofline-validated; also 1.07–1.37× vs torch's strongest eager config @S=512), scaling to **default 4.44× / best 5.22× (T=16 4.70×)**, **~61–69× C(gcc)** multicore; interp gate bit-exact three ways (interp == native == @parallel), serial==@parallel bit-exact, outputs cross-checked <2e-6 vs C and torch | The older 91–93% of MKL-all at 2048³/4096³ and parity interpretation at 512³–1024³ are historical, not an established current optimization target ([scope](#cpu-parallel-gemm-evidence-scope)) |
+| CPU end-to-end model (12-layer GPT-2-class) | PyTorch CPU compiled ([MSVC prerequisite and retry tiers](#compiled-cpu-peer-provenance)) + eager + gcc C | **~19–21× C(gcc), 3.6–4.9× C(-ffast-math)** 1-core; vs compiled-torch-1T it wins at **both** shapes; multicore, since the `@parallel` head-loop region (2026-07-10): **1.39–1.81× FASTER than all-threads compiled torch @S=512 and 1.07–1.43× @S=128** (three rounds, roofline-validated; also 1.07–1.37× vs torch's strongest eager config @S=512), scaling to **default 4.44× / best 5.22× (T=16 4.70×)**, **~61–69× C(gcc)** multicore; interp gate bit-exact three ways (interp == native == @parallel), serial==@parallel bit-exact, outputs cross-checked <2e-6 vs C and torch | The older 91–93% of MKL-all at 2048³/4096³ and parity interpretation at 512³–1024³ are historical, not an established current optimization target ([scope](#cpu-parallel-gemm-evidence-scope)) |
 | fp16/bf16 GEMM | cuBLAS | **~101%** ≤1024³, **~87–90% of cuBLAS-f16** @2048³; @4096³ the **v2cs streaming epilogue** shipped (+2.7%): **76.8% of cuBLAS-f16 / 80.4% of the honest f32-out peer** (new peer column — the f16-out peer hides ~half of Wukong's f32 C-write traffic) | 4096³ residual is SASS-level; 3-stage pipe, raster re-tunes, launch-bounds, and 2048³ epilogue variants all measured losses (kept bench-only) |
 | int8/fp8 GEMM | cuBLAS IMMA / cuBLASLt | int8 **96–105%** @2048³ (**beats IMMA**), 86–88% @1024³; **fused GEMM+dequant 1.1–2.2×** the cuBLAS chain; fp8 82–151% of cuBLASLt | int8 ~70% @4096³ (HBM-bound) |
 | Attention | cuDNN / cutlass fused fMHA | fused-RoPE **1.8–5.7×** & causal D=64 **1.03–1.16×** (beats both) @S≤512; D=128 ldmatrix beats cutlass @S≤1024 — the production D=128 dispatch; **FA2-style warp-specialized kernels (2-warp named-barrier anti-phase + 3-stage ring) built, gated, and default-routed at S≥4096 where they win 4–6%** (clock-cancelled median-of-9; tie @2048, lose @≤1024 — pins keep the losing regimes unroutable) | non-causal long-S (≥2048) 0.37–0.66× cuDNN stands — warp specialization was the last scheduling lever and moved only the S=4096 point; the loss is structural (SFU/serial-softmax on 20 SMs) |
@@ -993,11 +994,32 @@ naive-dot forward is tens of seconds per call at S=512, so all three are skipped
 > numbers below are an **upper bound** on Wukong's advantage until the next full round re-measures
 > them; the C++ and Rust columns have no numbers here at all yet.
 
-**PyTorch peer (the industry baseline).** When `python` + `torch` import (probed gracefully; a
-printed note + `n/a` columns otherwise), the bench adds **PyTorch CPU** — both **eager**
-(MKL/oneDNN-backed; `T1`/`Tn`) **and `torch.compile` max-autotune fullgraph** (`T1(comp)`/`Tn(comp)`),
-run same-run at `set_num_threads(1)` and all-threads; the **compiled** columns are the honest bar
-(ATEN-pinned because Inductor's Windows CPP FP32 GEMM template is broken, disclosed). The harness dumps the *exact* weight and
+### Compiled CPU peer provenance
+
+The CPU model harness in `crates/wukong_xbench/src/model.rs` probes PyTorch separately
+from compilation support. Eager columns require an importable PyTorch installation;
+`T1(comp)`/`Tn(comp)` additionally require a captured **MSVC `vcvars64` environment**.
+Without it the compiled columns are **`n/a`**, with an explicit disclosure. They are
+not zero-time measurements, and an eager result does not establish a compiled-peer win.
+
+Compilation first attempts `torch.compile(mode="max-autotune", fullgraph=True)`. On
+failure it attempts to pin only the GEMM autotuning backend to ATEN/MKL and retries;
+if fullgraph still fails, it reports the available graph-break count (or `None`) and retries
+`fullgraph=False`.
+A successful GEMM pin persists for later variants in the same worker. It does not turn
+the whole model into eager execution: Inductor can still generate pointwise/fused code.
+A final compile or numerical-validation failure suppresses that variant's timing.
+The `TORCH_COMPILE_DISCLOSE`/failure lines, Torch version and requested thread count
+must accompany a comparison. A generic compiled-column label alone does not prove that
+stock GEMM autotuning or fullgraph succeeded.
+
+The historical model ratios below remain observations of their recorded configuration;
+they establish no current best-peer result. No fresh Torch execution or peer-provenance
+validation was performed for this documentation correction.
+
+**PyTorch peer.** When available, the bench includes eager CPU (`T1`/`Tn`) and the
+compiled variants described above (`T1(comp)`/`Tn(comp)`), at one and all threads.
+The harness dumps the *exact* weight and
 input buffers every other column reads as little-endian f32 blobs (the config-invariant 12-layer
 weights once per run, the per-config input/final-LN blob per S) and generates a self-contained
 Python script that rebuilds the identical forward: `F.linear` computes `x·Wᵀ` over the *same*
@@ -1038,7 +1060,8 @@ Wukong-vs-C / Wukong-vs-torch outputs agree to `max|Δ|/max|out|` ≈ 1–2×10�
 
 *Single-core*, the 12-layer stack runs **~19–21× idiomatic C(gcc)** and **3.6–4.9× C(-ffast-math)**,
 and **beats compiled PyTorch single-thread at both shapes** — Wukong-1c is faster than
-compiled-torch-1T (`torch.compile` max-autotune fullgraph) at S=128 and S=512.
+compiled-torch-1T at S=128 and S=512 in those historical rounds; the [MSVC prerequisite and
+retry tiers](#compiled-cpu-peer-provenance) qualify that label.
 
 *Multicore*, the campaign's closing move was the **`@parallel` head-loop region** (2026-07-10): an
 independent-iteration `for` loop with body-local scratch inside an `@parallel` fn now outlines into a

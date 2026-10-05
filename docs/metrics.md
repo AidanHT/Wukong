@@ -228,8 +228,10 @@ to recognized kernels; GPU-resident 12-layer decode runs under CUDA-graph captur
 Standing (2026-07-11, three independent same-day rounds — all cross-checks ≤1e-6 rel,
 serial==@parallel bit-exact, interp gate bit-exact): the 12-layer GPT-2-class stack runs
 **~19–21× idiomatic C and 3.6–4.9× `-ffast-math` C single-core**. The honest PyTorch bar is
-**`torch.compile` (TorchInductor max-autotune, fullgraph, warmed; eager does NOT count)**, run
-same-run at both `set_num_threads(1)` and all-threads. Single-thread, Wukong **beats
+**compiled PyTorch**, with the [MSVC prerequisite, disclosed GEMM/fullgraph retries and
+per-run provenance](../BENCHMARKS.md#compiled-cpu-peer-provenance) made explicit; eager does
+not establish a compiled-peer win. Historical comparisons ran at both `set_num_threads(1)`
+and all threads; they are not fresh current-peer validation. Single-thread, Wukong **beats
 compiled-torch-1T at both S=128 and S=512**. Multicore — after the **`@parallel` head-loop region**
 (2026-07-10: an independent-iteration `for` loop with body-local scratch inside an `@parallel` fn
 outlines into a `wukong_parallel_for` region; conservative affine-disjointness legality, serial

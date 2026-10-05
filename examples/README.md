@@ -1,6 +1,7 @@
 # Wukong examples
 
-**17** user-written `.wk` programs — the language product surface alongside [`tests/run/`](../tests/run/).
+Example `.wk` programs and support modules for the language surface alongside [`tests/run/`](../tests/run/).
+For a current file inventory, use the [corpus count command](../docs/internals.md#testing-strategy).
 These are programs authors write and run with `wukongc`, not Rust measurement launchers (`bench/gpu/`,
 `tools/cloud/`) or harness scripts.
 
@@ -19,6 +20,12 @@ cargo run -p wukongc -- --emit=mir -O3 examples/dot.wk
 
 `--run` and an explicit `--emit=<stage>` are mutually exclusive: the compiler honours exactly one of
 them, so the combination is rejected rather than silently discarding half the work.
+
+For a loss function with concrete f32 buffers, `--train --backend=native --train-opt=adamw`
+selects the CPU JIT trainer; `--backend=interp` selects the interpreter. Training prints a loss
+trajectory and rejects explicit `--emit` or `-o`. See the
+[training CLI contract](../docs/language-guide.md#command-line-interface) for supported types
+and the [autodiff roadmap](../docs/roadmap.md#automatic-differentiation-wukong_autodiff) for remaining limits.
 
 ## Idiomatic kernel loops (few-shot)
 
@@ -50,13 +57,15 @@ the benchmark harness live in [`../bench/kernels`](../bench/kernels).
 
 ## GPT-2 124M end-to-end inference
 
-The real pretrained OpenAI GPT-2 124M, run as a Wukong program and verified numerically against
-HuggingFace. This is a **correctness / capability** result — inference only, external tokenization, no
-speed claim (see [../README.md](../README.md) and [../BENCHMARKS.md](../BENCHMARKS.md)).
+The real pretrained OpenAI GPT-2 124M can run as a Wukong program. The
+[verification workflow](../README.md#runs-the-real-gpt-2-124m-end-to-end) checks each run against
+HuggingFace. Earlier conflicting error figures are withdrawn; the current CPU closeout has not
+rerun the full model. This is an inference capability with external tokenization; no fresh numerical
+or speed result is claimed here (see also [BENCHMARKS.md](../BENCHMARKS.md)).
 
 | File | What it shows | How to run |
 |------|---------------|------------|
-| `gpt2_infer.wk` | Full GPT-2 124M forward: loads the **real pretrained weights** (124,439,808 params) + prompt token ids from disk via the `read_f32` / `read_i32` file-I/O intrinsics, runs embed → 12 pre-LayerNorm blocks (biased QKV, 12-head causal attention, tanh-GELU MLP, residuals) → final LayerNorm → tied LM head → logits `[5, 50257]`, writes them back to `data/gpt2/gpt2_wuk_logits.bin`, and prints four integers — the argmax of the last position (**1757 " John"** for *"Hello, my name is"*), then three signature values: the top logit ×1000, `logits[0,0]` ×1000, and the element count written. **Native-only** — the interpreter cannot hold 124M params. | export the weights (below), then `wukongc --run --backend=native examples/gpt2_infer.wk` from the repo root; check with `python tools/verify_gpt2.py` (rel 2.05e-6) |
+| `gpt2_infer.wk` | Full GPT-2 124M forward: loads the **real pretrained weights** (124,439,808 params) + prompt token ids from disk via the `read_f32` / `read_i32` file-I/O intrinsics, runs embed → 12 pre-LayerNorm blocks (biased QKV, 12-head causal attention, tanh-GELU MLP, residuals) → final LayerNorm → tied LM head → logits `[5, 50257]`, writes them back to `data/gpt2/gpt2_wuk_logits.bin`, and prints four integers — the argmax of the last position (**1757 " John"** for *"Hello, my name is"*), then three signature values: the top logit ×1000, `logits[0,0]` ×1000, and the element count written. **Native-only** — the interpreter cannot hold 124M params. | export the weights (below), then `wukongc --run --backend=native examples/gpt2_infer.wk` from the repo root; check that run with `python tools/verify_gpt2.py` |
 | `gpt2_infer_small.wk` | The **same** forward pass at a reduced, interpreter-runnable config (D=64, H=4, DFF=256, SEQ=8, LAYERS=2) with synthetic in-loop weights and no file I/O — the differential gate that runs **bit-identically on interpreter and native**. Like `gpt2_infer.wk` it uses bare const dims. That used to dispatch **no** recognized kernel at all; since `wukong_mir_build::canon` folds an integer const into its uses before recognition, it now dispatches its projections (measured: 1 `sgemm_nt`, 4 `sgemm_nt_epi`; `gpt2_infer.wk` gains 1 + 6 alongside its 2 `velem_f32`) and gates the scalar *pipeline around them* — the norm/softmax/gelu/LM-head forms stay scalar here and are gated by `gpt2_forward_bench_small.wk`. Its printed logits and argmax are unchanged by that gain. | `cargo run -p wukongc -- --run examples/gpt2_infer_small.wk` |
 | `gpt2_forward_bench_small.wk` | The same config again, but spelled in the **recognized dispatch forms** (local `let` dims, per-head repack, `gelu()`, gathered γ/β, bare-index LM-head GEMV) — measured: 6 `sgemm_nt_epi`, 3 `norm_affine_f32`, 2 `velem_f32`, 1 each of `sgemm_nt_alpha` / `sgemm_nt` / `norm_f32` / `vmath_f32` / `sgemv`, the identical set `gpt2_forward_bench.wk` emits. This is the differential fixture for the **kernel-call lowering seam**; its output cross-checks against the all-scalar `gpt2_infer_small.wk` (argmax 15, −14352, 9521). | `cargo run -p wukongc -- --run examples/gpt2_forward_bench_small.wk` |
 | `gpt2_forward_bench.wk` | The same 124M forward as `gpt2_infer.wk`, at `s_len = 512` with deterministic in-program token ids and a warmup + min-of-K timing loop, respelled in the **recognized dispatch forms** (model dims bound to local `let`s, per-head repack, `gelu()`, gathered γ/β, bare-index LM-head GEMV) — measured at `-O2`: 6 `sgemm_nt_epi`, 3 `norm_affine_f32`, 2 `velem_f32`, 1 each of `sgemm_nt_alpha` / `sgemm_nt` / `norm_f32` / `vmath_f32` / `sgemv`, the identical set `gpt2_forward_bench_small.wk` emits. Writes the last-position logit row to `data/gpt2/gpt2_bench_lastrow.bin` and prints three integers: the argmax of that row, the min forward time in microseconds, and the repetition count. **Native-only**; it probes the blob with a one-element read first, so with `data/gpt2/` unreachable it prints `-1` and exits 1 identically on both backends. | export the weights (below), then `wukongc --run --backend=native examples/gpt2_forward_bench.wk` from the repo root |

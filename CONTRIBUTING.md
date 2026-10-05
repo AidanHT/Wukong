@@ -230,6 +230,12 @@ constants-only module), and the three GPT-2 programs that early-return when the 
 absent (`DataGuarded`). Prefer `tests/run/` for a feature fixture and `examples/` only for a
 showcase program.
 
+Training changes need focused driver and real-CLI coverage: `native_training_tests` checks exact
+trajectories, final weights and fixed inputs on both CPU backends, while `native_training` checks
+backend selection and invalid buffer/artifact options. Changes to the native buffer dispatcher
+also require the `guarded_kernel` ownership, signature and assertion tests. Training performance
+requires separate measurements; these are correctness gates.
+
 Update `docs/language-guide.md` and its maturity legend.
 
 **A new attribute is four edits, not one.** `@name` parses today whatever it means, so the name must

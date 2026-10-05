@@ -779,8 +779,41 @@ Two rules about it:
 `crates/wukongc/tests/recognize.rs` gates all of this: one witness fixture per cascade head (its
 kernel is dispatched by default and gone with the variable set — the first half matters, or the
 second is vacuous), no `call wukong_` at all survives for `tensor_matmul.wk`, the program still prints
-the same bytes on both backends at `-O0` and `-O2`, and autodiff is refused. All 361 `tests/run`
-fixtures were swept on/off for byte-identical stdout when the switch landed.
+the same bytes on both backends at `-O0` and `-O2`, and autodiff is refused. The 361 `tests/run`
+fixtures present when the switch landed were swept on/off for byte-identical stdout; that historical
+sweep does not establish recognition-on/off agreement for the current corpus.
+
+## CPU training execution
+
+`--train` validates concrete dense f32 buffer types and checked byte extents before allocating
+training storage. The interpreter remains the default; `--backend=native` builds one verified
+`(Ptr, I64) -> Void` dispatcher for forward, backward and the distinct AdamW sizes. Its owning
+`JitBufferKernel` retains executable memory across steps. Each call rebuilds the pointer table
+from exclusively borrowed buffers, since optimizer updates can replace their allocations.
+
+Native calls share the JIT run lock, output capture, assertion state and scoped large-stack worker.
+The public buffer-kernel invocation is unsafe: callers must establish storage type, extent,
+alignment, aliasing and lifetime; validating MIR and the dispatcher signature alone cannot do so.
+The trainer supplies these obligations for its f32 buffers. General helper-call differentiation,
+AOT training and measured training performance remain separate gaps.
+
+## CPU streaming-store policy
+
+The bias, dequantization, low-precision, vector-elementwise and vector-math kernels share
+`crates/wukong_runtime/src/nt_policy.rs`. Their existing saturated byte-traffic formulas
+select non-temporal stores at a default **10 MiB** threshold. This value is a historical
+default, not a detected cache size or a measured optimum for the current host.
+
+Set `WUKONG_NT_MIN_BYTES` before starting the process to override the threshold in bytes.
+It accepts a positive ASCII decimal integer that fits `usize`, including leading zeroes.
+Absent, non-Unicode, empty, signed, whitespace-containing, zero and overflowing values
+fall back to 10 MiB. The first use caches the value for the process lifetime.
+
+Tests that require streaming execution derive their sizes from the actual policy, retain
+existing numerical cases/tail residues, and count executed non-temporal stores. Their
+allocation guard rejects thresholds above 64 MiB with an explicit failure; production
+accepts every positive `usize` value. Debug builds check 32-byte alignment immediately
+before each 256-bit streaming store. This does not establish bounds safety or a speedup.
 
 ## GPU backend
 
@@ -1105,16 +1138,25 @@ device only through `gpu_accel`'s five hooks and `lower.rs`.
 
 ## Testing strategy
 
+The corpus is the set of top-level `.wk` files in each harness directory. Count the current
+checkout from the repository root; imported support files in subdirectories are excluded:
+
+```sh
+python -c "from pathlib import Path; dirs=('tests/run','tests/fail','examples','bench/kernels'); pattern='*.wk'; print('\n'.join(f'{d}: {sum(p.is_file() for p in Path(d).glob(pattern))}' for d in dirs))"
+```
+
+A file count is an inventory, not a count of passing tests or supported backend cases. Dated
+measurement reports retain the corpus sizes used for those runs.
+
 - **Unit tests** per crate (lexer, parser, sema, MIR verifier, opt passes, interpreter, vectorizer).
-- **End-to-end** (`tests/run/*.wk`, 357 fixtures — count it with `ls tests/run/*.wk | wc -l` rather
-  than trusting this line, which has gone stale before): the real `wukongc` binary compiles and runs each
+- **End-to-end** (`tests/run/*.wk`): the real `wukongc` binary compiles and runs each
   program; stdout/exit are checked against the `// EXPECT-EXIT:` / `// EXPECT-OUT:` directives embedded
   in the file, and a `// RUN:` directive replaces the default `--run` argument list (a fixture that must
   pin the *native* side carries `// RUN: --run --backend=native`). Placement rule: everything here must
   lower end to end — a separate gate requires every run-suite program to succeed at `--emit=mir-high`,
   `--emit=mir` and `--emit=llvm-ir`, at -O0 and -O2 — so a program whose purpose is to be **rejected**
   belongs in `tests/fail` instead.
-- **Compile-fail** (`tests/fail/*.wk`, 110 fixtures, driven by `crates/wukongc/tests/fail.rs`): each
+- **Compile-fail** (`tests/fail/*.wk`, driven by `crates/wukongc/tests/fail.rs`): each
   program must be *rejected*, and with the exact stable code its `// EXPECT-CODE:` directive names; the
   harness drives the real binary with `--error-format=json --emit=mir`. Eleven lexer/parser codes that
   no committed `.wk` file can hold cleanly (unterminated string, unterminated block comment, …) are
@@ -1136,6 +1178,10 @@ device only through `gpu_accel`'s five hooks and `lower.rs`.
   and -O0 == -O2 == -O3 on (exit, stdout). Both use a seeded PRNG, so a failure reproduces exactly from
   the seed it prints; `WUKONG_FUZZ_PROGRAMS=N` deepens the grammar run and an unusable value falls back
   to the default rather than silently disabling the gate.
+  A complementary numeric grammar adds exact width-aware integer and binary floating oracles,
+  runtime divisor/shift boundaries, f64/f16/bf16 samples and MIR non-vacuity checks.
+  `WUKONG_FUZZ_NUMERIC_PROGRAMS=N` selects its seed count (default four; zero or invalid values
+  restore the default). Its finite normal/signed-zero samples are not exhaustive float coverage.
 - **Determinism** (`crates/wukongc/tests/determinism.rs`): the compiler must be a pure function of its
   input. Three *fresh processes* per compile (each with its own `HashMap` hash seed) must agree
   byte-for-byte on `--emit=mir -O2`, on `--emit=obj -O2` (and the `WUKONG_PAR_CODEGEN=0` serial object

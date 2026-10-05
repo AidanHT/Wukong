@@ -854,6 +854,7 @@ wukongc [OPTIONS] <input.wk>
                       the scalar loss output). An index that is out of range, not a buffer
                       (pointer) parameter, or repeated is an error.
 --train               run a fwd→bwd→optimizer loop and print the loss trajectory
+                      interp or native JIT; concrete f32 buffers; incompatible with --emit/-o
 --train-steps=<n>     training steps                                       (default: 100)
 --train-lr=<f>        learning rate                                        (default: 0.01)
 --train-opt=<o>       sgd | adamw                                          (default: sgd)
@@ -880,7 +881,16 @@ Reverse-mode autodiff is CLI-driven too: `wukongc --emit=grad --grad-of=loss mod
 backward MIR of a loss function, and `wukongc --train --train-opt=adamw model.wk` runs its
 fwd→bwd→optimizer training loop. Both flags force at least `-O1` no matter what level you pass — the
 autodiff transform consumes single-block SSA (mem2reg + simplify-cfg) — so `--emit=grad -O0` still
-prints optimized MIR. And `--train` wins over the other two dispatches: it is handled before both
-`--run` and `--emit=grad`, so `--run --train` trains and never runs the program, and
-`--train --emit=grad` trains and never prints the backward MIR. Unlike `--run` with `--emit=<stage>`,
-these combinations are accepted rather than rejected — pass `--train` on its own.
+prints optimized MIR. Generated backward MIR is also optimized with that minimum and verified
+before execution.
+
+**✅ CPU training:** `--train` honors `--backend=interp` (the default) and `--backend=native`.
+Every loss parameter must be a concrete f32 array (including nested arrays) or a dense f32 tensor
+(contiguous or column-major); slices, raw pointers, scalar parameters, other element types and unrepresentable byte extents are
+rejected. The last buffer must contain exactly one f32 for the scalar loss output. SGD and AdamW use deterministic initialization;
+AdamW accepts finite nonnegative `--train-weight-decay`, while SGD rejects nonzero decay.
+
+`--train --run` trains the selected loss without calling `main`. Combining `--train` with any
+explicit `--emit=<stage>` or `-o` is a usage error (exit 2). GPU training selectors are unsupported
+by this CPU trainer. AOT training remains unavailable, and no training speedup is established by
+the correctness checks.
