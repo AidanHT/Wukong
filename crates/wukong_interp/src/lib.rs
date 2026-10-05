@@ -51,6 +51,22 @@ impl Value {
         }
     }
 
+    /// Kernel buffers contain numeric scalar slots. Keep ordinary scalar evaluation permissive,
+    /// but never hide type-confused or undefined buffer memory by manufacturing a zero.
+    fn kernel_float(self, context: &str) -> Result<f64, String> {
+        match self {
+            Value::Float(f) => Ok(f),
+            Value::Int(i) => Ok(i as f64),
+            Value::Ptr(_) => Err(format!(
+                "{context}: floating buffer contains a pointer slot"
+            )),
+            Value::VecRef(_) => Err(format!("{context}: floating buffer contains a vector slot")),
+            Value::Unit => Err(format!(
+                "{context}: floating buffer contains an uninitialized slot"
+            )),
+        }
+    }
+
     fn truthy(self) -> bool {
         self.as_int() != 0
     }
@@ -444,7 +460,7 @@ fn run_kernel_f32_inner(
                 *slot = match interp.memory[base + i] {
                     Value::Float(f) => narrow_buffer_f32(f),
                     Value::Int(n) => n as f32,
-                    _ => 0.0,
+                    value => value.kernel_float("kernel f32 copy-back")? as f32,
                 };
             }
         }
@@ -503,11 +519,7 @@ pub fn run_kernel_f64(
         interp.run_function(func, &args)?;
         for (buf, &base) in bufs.iter_mut().zip(bases.iter()) {
             for (i, slot) in buf.iter_mut().enumerate() {
-                *slot = match interp.memory[base + i] {
-                    Value::Float(f) => f,
-                    Value::Int(n) => n as f64,
-                    _ => 0.0,
-                };
+                *slot = interp.memory[base + i].kernel_float("kernel f64 copy-back")?;
             }
         }
         Ok(())
@@ -995,6 +1007,29 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let ptrs_base = ptr(reg(regs, *ptrs))?;
                 let scalars_base = ptr(reg(regs, *scalars))?;
                 let count = reg(regs, *n).as_int().max(0) as usize;
+                // Output-only streams need not contain initialized numeric values. Only recipe
+                // loads read memory; scalar tails beyond count remain untouched and unchecked.
+                let mut read_streams = vec![false; kern.streams as usize];
+                let mut read_scalars = vec![false; kern.scalars as usize];
+                for (index, op) in kern.ops.iter().enumerate() {
+                    if let wukong_mir::VecOp::Splat { scalar } = op {
+                        *read_scalars
+                            .get_mut(*scalar as usize)
+                            .ok_or("veckernel scalar index out of bounds")? = true;
+                    }
+                    if let wukong_mir::VecOp::Load { stream } = op {
+                        let reads = read_streams
+                            .get_mut(*stream as usize)
+                            .ok_or("veckernel load stream out of bounds")?;
+                        // eval_lane forwards a preceding store of this stream; that load never
+                        // consumes the original destination slot, which may be undefined.
+                        if !kern.ops[..index].iter().any(|previous| {
+                            matches!(previous, wukong_mir::VecOp::Store { stream: written, .. } if written == stream)
+                        }) {
+                            *reads = true;
+                        }
+                    }
+                }
                 // Resolve the stream base slots and the invariant scalars once.
                 let mut stream_bases: Vec<usize> = Vec::with_capacity(kern.streams as usize);
                 for s in 0..kern.streams as usize {
@@ -1004,24 +1039,38 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .ok_or("veckernel ptrs out of bounds")?)?);
                 }
                 let mut scalar_vals: Vec<f32> = Vec::with_capacity(kern.scalars as usize);
-                for k in 0..kern.scalars as usize {
-                    scalar_vals.push(
+                for (k, &read) in read_scalars.iter().enumerate() {
+                    scalar_vals.push(if read {
                         self.memory
                             .get(scalars_base + k)
                             .ok_or("veckernel scalars out of bounds")?
-                            .as_float() as f32,
-                    );
+                            .kernel_float("veckernel scalar")? as f32
+                    } else {
+                        0.0
+                    });
                 }
                 if kern.reduce.is_some() {
                     // Reduction kernel: fold every lane's addend and return the horizontal result as
                     // an f32 (the caller combines the initial accumulator and folds the scalar tail).
                     // Reads only — no stores. Same reassociation `eval_reduction` pins for both
                     // backends, so this equals the native kernel's return bit-for-bit.
-                    for &b in &stream_bases {
-                        if b + count > self.memory.len() {
-                            return Err("veckernel reduction load out of bounds".into());
+                    for (s, &b) in stream_bases.iter().enumerate() {
+                        if read_streams[s] {
+                            let end = b
+                                .checked_add(count)
+                                .ok_or("veckernel reduction load out of bounds")?;
+                            let values = self
+                                .memory
+                                .get(b..end)
+                                .ok_or("veckernel reduction load out of bounds")?;
+                            // The reduction evaluator ignores a partial eight-lane suffix.
+                            for value in &values[..count / 8 * 8] {
+                                value.kernel_float("veckernel reduction")?;
+                            }
                         }
                     }
+                    // eval_reduction's callbacks cannot fail. Every numeric load above was checked,
+                    // and the read-only fold cannot change the validated values before conversion.
                     let mem = &self.memory;
                     let r = kern.eval_reduction(
                         count,
@@ -1039,13 +1088,16 @@ impl<'a, 'k> Interp<'a, 'k> {
                     let mut scratch = wukong_mir::vec_kernel::VecKernelScratch::default();
                     for i in 0..count {
                         loads.clear();
-                        for &b in &stream_bases {
-                            loads.push(
+                        for (s, &b) in stream_bases.iter().enumerate() {
+                            loads.push(if read_streams[s] {
                                 self.memory
                                     .get(b + i)
                                     .ok_or("veckernel load out of bounds")?
-                                    .as_float() as f32,
-                            );
+                                    .kernel_float("veckernel load")?
+                                    as f32
+                            } else {
+                                0.0
+                            });
                         }
                         stores.clear();
                         kern.eval_lane_with_scratch(
@@ -1770,17 +1822,23 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let av = matrix(a, m, k)?;
                 let bv = matrix(b, k, n)?;
                 let cv = matrix(c, m, n)?;
-                let read = |values: &[Value]| -> Result<Vec<f32>, String> {
+                let read = |values: &[Value], input: bool| -> Result<Vec<f32>, String> {
                     let mut buffer = Vec::new();
                     buffer
                         .try_reserve_exact(values.len())
                         .map_err(|_| "sgemm operand allocation failed")?;
-                    buffer.extend(values.iter().map(|value| value.as_float() as f32));
+                    for value in values {
+                        buffer.push(if input {
+                            value.kernel_float(name)? as f32
+                        } else {
+                            0.0
+                        });
+                    }
                     Ok(buffer)
                 };
-                let abuf = read(av)?;
-                let bbuf = read(bv)?;
-                let mut cbuf = read(cv)?;
+                let abuf = read(av, true)?;
+                let bbuf = read(bv, true)?;
+                let mut cbuf = read(cv, beta != 0)?;
                 let transposed = name.contains("_nt");
                 // `_tn` is `C = Aᵀ·B` (A stored `[k,m]`, B `[k,n]`); element counts m*k / k*n / m*n
                 // match the plain/`_nt` reads above, so only the kernel differs. The kernel handles
@@ -1862,7 +1920,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         v.push(
                             mem.get(base + t)
                                 .ok_or("sgemv operand out of bounds")?
-                                .as_float() as f32,
+                                .kernel_float(name)? as f32,
                         );
                     }
                     Ok(v)
@@ -1905,7 +1963,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         v.push(
                             mem.get(base + t)
                                 .ok_or("sgemv_alpha operand out of bounds")?
-                                .as_float() as f32,
+                                .kernel_float(name)? as f32,
                         );
                     }
                     Ok(v)
@@ -1949,7 +2007,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         v.push(
                             mem.get(base + t)
                                 .ok_or("sgevm operand out of bounds")?
-                                .as_float() as f32,
+                                .kernel_float(name)? as f32,
                         );
                     }
                     Ok(v)
@@ -2075,7 +2133,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(scale_b_idx + t)
                             .ok_or("i8gemm_deq scale_b out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut biasbuf: Vec<f32> = Vec::new();
@@ -2085,7 +2143,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                             self.memory
                                 .get(bi + t)
                                 .ok_or("i8gemm_deq bias out of bounds")?
-                                .as_float() as f32,
+                                .kernel_float(name)? as f32,
                         );
                     }
                 }
@@ -2203,7 +2261,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(scale_idx + t)
                             .ok_or("dequant_perchan scale out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -2247,22 +2305,27 @@ impl<'a, 'k> Interp<'a, 'k> {
                     _ => None,
                 };
                 let act = args[8].as_int() as i64;
-                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
+                let read = |mem: &[Value],
+                            base: usize,
+                            len: usize,
+                            input: bool|
+                 -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
                     for t in 0..len {
-                        v.push(
-                            mem.get(base + t)
-                                .ok_or("sgemm_epi operand out of bounds")?
-                                .as_float() as f32,
-                        );
+                        let value = mem.get(base + t).ok_or("sgemm_epi operand out of bounds")?;
+                        v.push(if input {
+                            value.kernel_float(name)? as f32
+                        } else {
+                            0.0
+                        });
                     }
                     Ok(v)
                 };
-                let abuf = read(&self.memory, a, m * k)?;
-                let bbuf = read(&self.memory, b, n * k)?;
-                let mut cbuf = read(&self.memory, c, m * n)?;
+                let abuf = read(&self.memory, a, m * k, true)?;
+                let bbuf = read(&self.memory, b, n * k, true)?;
+                let mut cbuf = read(&self.memory, c, m * n, beta != 0)?;
                 let biasbuf = match bias_idx {
-                    Some(base) => read(&self.memory, base, n)?,
+                    Some(base) => read(&self.memory, base, n, true)?,
                     None => Vec::new(),
                 };
                 let bias_ptr = if bias_idx.is_some() {
@@ -2317,20 +2380,27 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let n = dim!(args[5]);
                 let beta = args[6].as_int() as i64;
                 let alpha = args[7].as_float() as f32;
-                let read = |mem: &[Value], base: usize, len: usize| -> Result<Vec<f32>, String> {
+                let read = |mem: &[Value],
+                            base: usize,
+                            len: usize,
+                            input: bool|
+                 -> Result<Vec<f32>, String> {
                     let mut v = Vec::with_capacity(len);
                     for t in 0..len {
-                        v.push(
-                            mem.get(base + t)
-                                .ok_or("sgemm_alpha operand out of bounds")?
-                                .as_float() as f32,
-                        );
+                        let value = mem
+                            .get(base + t)
+                            .ok_or("sgemm_alpha operand out of bounds")?;
+                        v.push(if input {
+                            value.kernel_float(name)? as f32
+                        } else {
+                            0.0
+                        });
                     }
                     Ok(v)
                 };
-                let abuf = read(&self.memory, a, m * k)?;
-                let bbuf = read(&self.memory, b, n * k)?;
-                let mut cbuf = read(&self.memory, c, m * n)?;
+                let abuf = read(&self.memory, a, m * k, true)?;
+                let bbuf = read(&self.memory, b, n * k, true)?;
+                let mut cbuf = read(&self.memory, c, m * n, beta != 0)?;
                 // SAFETY: buffers are exactly m*k, n*k, m*n long — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_sgemm_nt_alpha(
@@ -2370,7 +2440,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("vmath operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -2426,7 +2496,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(src + t)
                             .ok_or("transpose operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut dbuf = vec![0.0f32; n];
@@ -2497,7 +2567,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let mut xbuf = Vec::new();
                 xbuf.try_reserve_exact(n_in)
                     .map_err(|_| "pool2d scratch allocation failed")?;
-                xbuf.extend(input.iter().map(|v| v.as_float() as f32));
+                for value in input {
+                    xbuf.push(value.kernel_float(name)? as f32);
+                }
                 let mut obuf = Vec::new();
                 obuf.try_reserve_exact(out_len)
                     .map_err(|_| "pool2d scratch allocation failed")?;
@@ -2551,12 +2623,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let cols = dim!(args[3]);
                 let mut buf = Vec::with_capacity(rows * cols);
                 for t in 0..rows * cols {
-                    buf.push(
-                        *self
-                            .memory
-                            .get(src + t)
-                            .ok_or("transpose operand out of bounds")?,
-                    );
+                    let value = *self
+                        .memory
+                        .get(src + t)
+                        .ok_or("transpose operand out of bounds")?;
+                    value.kernel_float(name)?;
+                    buf.push(value);
                 }
                 for i in 0..rows {
                     for j in 0..cols {
@@ -2600,7 +2672,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("colreduce operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; cols];
@@ -2662,13 +2734,13 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("vmath2 operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                     ybuf.push(
                         self.memory
                             .get(y + t)
                             .ok_or("vmath2 operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -2713,13 +2785,13 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(y + t)
                             .ok_or("softmax_bwd operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                     dybuf.push(
                         self.memory
                             .get(dy + t)
                             .ok_or("softmax_bwd operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut dxbuf = vec![0.0f32; n];
@@ -2759,13 +2831,13 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(a + t)
                             .ok_or("lrscan operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                     bbuf.push(
                         self.memory
                             .get(b + t)
                             .ok_or("lrscan operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut outbuf = vec![0.0f32; n];
@@ -2824,13 +2896,13 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("rmsnorm_bwd operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                     dybuf.push(
                         self.memory
                             .get(dy + t)
                             .ok_or("rmsnorm_bwd operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut gbuf = Vec::new();
@@ -2840,7 +2912,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                             self.memory
                                 .get(g + t)
                                 .ok_or("rmsnorm_bwd gamma out of bounds")?
-                                .as_float() as f32,
+                                .kernel_float(name)? as f32,
                         );
                     }
                 }
@@ -2894,7 +2966,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("xent operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut tbuf = Vec::with_capacity(rows);
@@ -2941,7 +3013,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("xent_bwd operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut tbuf = Vec::with_capacity(rows);
@@ -2989,7 +3061,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("rope operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut fbuf = Vec::with_capacity(half);
@@ -2998,7 +3070,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(inv_freq + t)
                             .ok_or("rope inv_freq out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -3035,7 +3107,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(g + t)
                             .ok_or("rope_bwd operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut fbuf = Vec::with_capacity(half);
@@ -3044,7 +3116,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(inv_freq + t)
                             .ok_or("rope_bwd inv_freq out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -3087,7 +3159,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("logsumexp operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; rows];
@@ -3134,7 +3206,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("rowarg operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let is_col = name.contains("colarg");
@@ -3186,7 +3258,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("cumscan operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -3230,13 +3302,13 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(a + t)
                             .ok_or("kldiv operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                     bbuf.push(
                         self.memory
                             .get(b + t)
                             .ok_or("kldiv operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; rows];
@@ -3279,7 +3351,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("vmath bf16 operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     ));
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -3313,7 +3385,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("vmath f16 operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     ));
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -3351,7 +3423,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .memory
                         .get(x + t)
                         .ok_or("vmath-out operand out of bounds")?
-                        .as_float() as f32;
+                        .kernel_float(name)? as f32;
                     xbuf.push(if is_f16 {
                         wukong_runtime::f32_to_f16_bits(f)
                     } else {
@@ -3397,8 +3469,8 @@ impl<'a, 'k> Interp<'a, 'k> {
             // `@parallel`, since the map is elementwise), write the result back — so the differential
             // oracle stays exact despite the wider lanes / non-temporal stores (which write the same
             // bits). Reading all of x/y before writing out makes the in-place (x == out) case correct.
-            // When `y` is unused the recognizer passes the x pointer for it (never dereferenced by the
-            // kernel), so marshalling y unconditionally is harmless.
+            // An unused y contributes no data: do not type-check or dereference its memory.
+            // The scratch buffer still supplies valid storage to every runtime implementation.
             "wukong_velem_f32" | "wukong_velem_f32_parallel" => {
                 let x = ptr(args[0])?;
                 let y = ptr(args[1])?;
@@ -3408,6 +3480,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let b = args[5].as_float() as f32;
                 let c = args[6].as_float() as f32;
                 let op = args[7].as_int() as i64;
+                // 512/1024 are the runtime Hadamard/division flags.
+                let reads_y = op & (wukong_runtime::VE_USE_Y | 512 | 1024) != 0;
                 let mut xbuf = Vec::with_capacity(n);
                 let mut ybuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -3415,14 +3489,16 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("velem operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
-                    ybuf.push(
+                    ybuf.push(if reads_y {
                         self.memory
                             .get(y + t)
                             .ok_or("velem operand out of bounds")?
-                            .as_float() as f32,
-                    );
+                            .kernel_float(name)? as f32
+                    } else {
+                        0.0
+                    });
                 }
                 let mut obuf = vec![0.0f32; n];
                 // SAFETY: xbuf/ybuf/obuf are exactly n f32 long — the kernel's contract.
@@ -3467,7 +3543,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("bias_bcast operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut bbuf = Vec::with_capacity(cols);
@@ -3476,7 +3552,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(b + t)
                             .ok_or("bias_bcast bias out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -3515,7 +3591,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("vhorner operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut cbuf = Vec::with_capacity(ncoeff);
@@ -3524,7 +3600,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(coeffs + t)
                             .ok_or("vhorner coeff out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -3556,6 +3632,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let y = ptr(args[1])?;
                 let n = args[2].as_int().max(0) as usize;
                 let op = args[3].as_int() as i64;
+                // Reduction opcode 10 is the runtime binary absolute-difference fold.
+                let reads_y = matches!(op, wukong_runtime::RED_DOT | wukong_runtime::RED_SSD | 10);
                 let mut xbuf = Vec::with_capacity(n);
                 let mut ybuf = Vec::with_capacity(n);
                 for t in 0..n {
@@ -3563,14 +3641,16 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("reduce operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
-                    ybuf.push(
+                    ybuf.push(if reads_y {
                         self.memory
                             .get(y + t)
                             .ok_or("reduce operand out of bounds")?
-                            .as_float() as f32,
-                    );
+                            .kernel_float(name)? as f32
+                    } else {
+                        0.0
+                    });
                 }
                 // Offload the reduction to the accelerator (GPU) when it covers this op; otherwise
                 // (or with no accelerator) call the serial CPU kernel.
@@ -3608,7 +3688,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("argreduce operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 // SAFETY: xbuf is exactly n f32 long — the kernel's contract.
@@ -3644,7 +3724,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(idx + t)
                             .ok_or("bf16 reduce operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     ))
                 };
                 let mut xbuf = Vec::with_capacity(n);
@@ -3689,7 +3769,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("bf16 reduce operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     ));
                 }
                 // SAFETY: xbuf is exactly n u16 long — the kernel's contract.
@@ -3723,7 +3803,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(idx + t)
                             .ok_or("f16 reduce operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     ))
                 };
                 let mut xbuf = Vec::with_capacity(n);
@@ -3765,7 +3845,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("f16 reduce operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     ));
                 }
                 // SAFETY: xbuf is exactly n u16 long — the kernel's contract.
@@ -3795,7 +3875,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .memory
                         .get(idx + t)
                         .ok_or("lowp axpby operand out of bounds")?
-                        .as_float() as f32;
+                        .kernel_float(name)? as f32;
                     Ok(if is_f16 {
                         wukong_runtime::f32_to_f16_bits(f)
                     } else {
@@ -3859,7 +3939,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .memory
                         .get(idx + t)
                         .ok_or("lowp axpby-out operand out of bounds")?
-                        .as_float() as f32;
+                        .kernel_float(name)? as f32;
                     Ok(if is_f16 {
                         wukong_runtime::f32_to_f16_bits(f)
                     } else {
@@ -3950,7 +4030,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .memory
                         .get(idx + t)
                         .ok_or("lowp sgemm operand out of bounds")?
-                        .as_float() as f32;
+                        .kernel_float(name)? as f32;
                     Ok(if is_f16 {
                         wukong_runtime::f32_to_f16_bits(f)
                     } else {
@@ -3972,7 +4052,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                             .memory
                             .get(c + t)
                             .ok_or("lowp sgemm output out of bounds")?
-                            .as_float() as f32;
+                            .kernel_float(name)? as f32;
                     }
                 }
                 let (ai, ki, ni) = (m as i64, k as i64, n as i64);
@@ -4037,7 +4117,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         .memory
                         .get(idx + t)
                         .ok_or("lowp sgemm_epi operand out of bounds")?
-                        .as_float() as f32;
+                        .kernel_float(name)? as f32;
                     Ok(if is_f16 {
                         wukong_runtime::f32_to_f16_bits(f)
                     } else {
@@ -4061,7 +4141,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                             .memory
                             .get(c + t)
                             .ok_or("lowp sgemm_epi output out of bounds")?
-                            .as_float() as f32;
+                            .kernel_float(name)? as f32;
                     }
                 }
                 // The bias is f32 (the epilogue domain), read straight as f32 like `nt_epi`.
@@ -4073,7 +4153,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                                 self.memory
                                     .get(base + t)
                                     .ok_or("lowp sgemm_epi bias out of bounds")?
-                                    .as_float() as f32,
+                                    .kernel_float(name)? as f32,
                             );
                         }
                         v
@@ -4141,7 +4221,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("norm operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut obuf = vec![0.0f32; n];
@@ -4208,7 +4288,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         self.memory
                             .get(x + t)
                             .ok_or("norm operand out of bounds")?
-                            .as_float() as f32,
+                            .kernel_float(name)? as f32,
                     );
                 }
                 let mut gbuf = Vec::new();
@@ -4218,7 +4298,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                             self.memory
                                 .get(g + t)
                                 .ok_or("norm gamma out of bounds")?
-                                .as_float() as f32,
+                                .kernel_float(name)? as f32,
                         );
                     }
                 }
@@ -4229,7 +4309,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                             self.memory
                                 .get(bb + t)
                                 .ok_or("norm beta out of bounds")?
-                                .as_float() as f32,
+                                .kernel_float(name)? as f32,
                         );
                     }
                 }
@@ -4310,7 +4390,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                             .memory
                             .get_mut(out + r * h + d)
                             .ok_or("embedding output out of bounds")? =
-                            Value::Float(val.as_float() as f32 as f64);
+                            Value::Float(val.kernel_float(name)? as f32 as f64);
                     }
                 }
                 Ok(Value::Unit)
@@ -4386,12 +4466,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                             .memory
                             .get(grad_out + ti * h + j)
                             .ok_or("scatter_add grad_out out of bounds")?
-                            .as_float() as f32;
+                            .kernel_float(name)? as f32;
                         let slot = self
                             .memory
                             .get_mut(grad_w + row + j)
                             .ok_or("scatter_add grad_w out of bounds")?;
-                        let acc = slot.as_float() as f32;
+                        let acc = slot.kernel_float(name)? as f32;
                         *slot = Value::Float((acc + g) as f64);
                     }
                 }
@@ -4417,7 +4497,7 @@ impl<'a, 'k> Interp<'a, 'k> {
                         buf.push(
                             mem.get(base + t)
                                 .ok_or("attention operand out of bounds")?
-                                .as_float() as f32,
+                                .kernel_float(name)? as f32,
                         );
                     }
                     Ok(buf)
@@ -5773,3 +5853,6 @@ mod tests {
 
 #[cfg(test)]
 mod vector_arena_tests;
+
+#[cfg(test)]
+mod kernel_marshalling_tests;
