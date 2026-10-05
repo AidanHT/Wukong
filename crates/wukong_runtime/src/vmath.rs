@@ -1275,6 +1275,7 @@ where
     macro_rules! store {
         ($p:expr, $v:expr) => {
             if nt {
+                crate::velem::assert_nt_aligned($p);
                 _mm256_stream_ps($p, $v);
             } else {
                 _mm256_storeu_ps($p, $v);
@@ -1961,6 +1962,7 @@ where
     macro_rules! store {
         ($p:expr, $v:expr) => {
             if nt {
+                crate::velem::assert_nt_aligned($p);
                 _mm256_stream_ps($p, $v);
             } else {
                 _mm256_storeu_ps($p, $v);
@@ -2783,6 +2785,26 @@ mod tests {
     #![allow(clippy::assertions_on_constants)]
 
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nt_alignment_unary_and_binary_peels() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let n = NT_MIN_BYTES / 8 + 35;
+        let x = vec![2.0; n];
+        assert!(use_nt(n, 2));
+        crate::velem::check_nt_output(n, -99.0, 2.0, |out| unsafe {
+            wukong_vmath_f32(x.as_ptr(), out, n as i64, VM_RELU);
+        });
+        assert!(use_nt(n, 3));
+        let y = vec![0.0; n];
+        // pow's explicit x^0 identity is exact in both scalar and vector paths.
+        crate::velem::check_nt_output(n, -99.0, 1.0, |out| unsafe {
+            wukong_vmath2_f32(x.as_ptr(), y.as_ptr(), out, n as i64, VM2_POW);
+        });
+    }
 
     /// Sampled agreement with `libm` under each operation's explicit mixed error tolerance.
     /// This test is not a uniform one-ULP bound or an exhaustive domain sweep.

@@ -54,6 +54,45 @@ pub const VE_HADAMARD: i64 = 512;
 /// [`VE_HADAMARD`]; `_mm256_div_ps` lane == scalar `f32 / f32`, both correctly rounded.
 pub const VE_DIV: i64 = 1024;
 
+/// Check the peel invariant immediately before a 256-bit non-temporal store.
+/// This diagnoses alignment regressions in debug builds; it does not validate pointer bounds.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn assert_nt_aligned<T>(p: *mut T) {
+    debug_assert_eq!((p as usize) & 31, 0, "NT store needs 32-byte alignment");
+    #[cfg(test)]
+    NT_STORE_CHECKS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+thread_local! {
+    static NT_STORE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn check_nt_output<T: Copy + PartialEq + std::fmt::Debug>(
+    n: usize,
+    sentinel: T,
+    expected: T,
+    run: impl FnOnce(*mut T),
+) {
+    let mut out = vec![sentinel; n + 64];
+    let base = out.as_mut_ptr();
+    // Deliberately start one element past a 32-byte boundary, within the allocation.
+    let offset = ((32 - (base as usize & 31)) & 31) / std::mem::size_of::<T>() + 1;
+    let p = unsafe { base.add(offset) };
+    assert_ne!(p as usize & 31, 0);
+    NT_STORE_CHECKS.with(|count| count.set(0));
+    run(p);
+    NT_STORE_CHECKS.with(|count| {
+        assert!(count.get() > 0, "NT stores were not exercised");
+        eprintln!("NT alignment: {n} elements, {} checked stores", count.get());
+    });
+    assert!(out[..offset].iter().all(|v| *v == sentinel));
+    assert!(out[offset..offset + n].iter().all(|v| *v == expected));
+    assert!(out[offset + n..].iter().all(|v| *v == sentinel));
+}
+
 /// Total streamed bytes (all live arrays) at/above which the store goes non-temporal. Non-temporal
 /// stores pay off only once the working set spills L3: below it a normal cacheable store keeps the
 /// output hot — C/Rust win there, and a per-core `@parallel` chunk may be re-read — while above it
@@ -344,6 +383,7 @@ unsafe fn velem_avx2_mono<const MODE: u8, const ACT: u8, const NT: bool>(
     macro_rules! store {
         ($p:expr, $v:expr) => {
             if NT {
+                crate::velem::assert_nt_aligned($p);
                 _mm256_stream_ps($p, $v);
             } else {
                 _mm256_storeu_ps($p, $v);
@@ -635,6 +675,7 @@ unsafe fn vhorner_avx2(x: *const f32, out: *mut f32, n: usize, coeffs: &[f32]) {
     macro_rules! store {
         ($p:expr, $v:expr) => {
             if nt {
+                crate::velem::assert_nt_aligned($p);
                 _mm256_stream_ps($p, $v);
             } else {
                 _mm256_storeu_ps($p, $v);
@@ -695,6 +736,43 @@ unsafe fn vhorner_avx2(x: *const f32, out: *mut f32, n: usize, coeffs: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_arch = "x86_64", debug_assertions))]
+    #[test]
+    fn nt_alignment_rejects_misaligned_pointer_before_store() {
+        #[repr(align(32))]
+        struct Aligned([f32; 16]);
+        let mut buffer = Aligned([0.0; 16]);
+        let p = buffer.0.as_mut_ptr();
+        assert_nt_aligned(p);
+        // Invoke the same pre-store check directly through Rust's unwindable ABI.
+        // No intrinsic or extern-C function is called with the misaligned pointer.
+        let result = std::panic::catch_unwind(|| assert_nt_aligned(unsafe { p.add(1) }));
+        let payload = result.expect_err("misalignment must fail before the intrinsic");
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("assertion diagnostic");
+        assert!(message.contains("NT store needs 32-byte alignment"));
+        assert_eq!(buffer.0, [0.0; 16]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nt_alignment_elementwise_and_horner_peels() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let n = NT_MIN_BYTES / 8 + 35;
+        let x = vec![2.0; n];
+        assert!(use_nt(n, 2));
+        check_nt_output(n, -99.0, 3.0, |out| unsafe {
+            wukong_velem_f32(x.as_ptr(), x.as_ptr(), out, n as i64, 1.0, 0.0, 1.0, VE_ID);
+        });
+        let coeffs = [1.0, 1.0];
+        check_nt_output(n, -99.0, 3.0, |out| unsafe {
+            wukong_vhorner_f32(x.as_ptr(), out, n as i64, coeffs.as_ptr(), 2);
+        });
+    }
 
     /// The AVX2 lanes and the scalar tail/fallback must agree element-for-element, so a length that is
     /// not a multiple of 8 (and that crosses the NT alignment prologue) produces a consistent result.

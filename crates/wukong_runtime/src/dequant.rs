@@ -202,9 +202,13 @@ unsafe fn dequant_avx2(q: *const u8, out: *mut f32, n: usize, scale: f32, op: i6
                     d3 = _mm256_max_ps(d3, zero);
                 }
                 if nt {
+                    crate::velem::assert_nt_aligned(out.add(i));
                     _mm256_stream_ps(out.add(i), d0);
+                    crate::velem::assert_nt_aligned(out.add(i + 8));
                     _mm256_stream_ps(out.add(i + 8), d1);
+                    crate::velem::assert_nt_aligned(out.add(i + 16));
                     _mm256_stream_ps(out.add(i + 16), d2);
+                    crate::velem::assert_nt_aligned(out.add(i + 24));
                     _mm256_stream_ps(out.add(i + 24), d3);
                 } else {
                     _mm256_storeu_ps(out.add(i), d0);
@@ -220,6 +224,7 @@ unsafe fn dequant_avx2(q: *const u8, out: *mut f32, n: usize, scale: f32, op: i6
                     d = _mm256_max_ps(d, zero);
                 }
                 if nt {
+                    crate::velem::assert_nt_aligned(out.add(i));
                     _mm256_stream_ps(out.add(i), d);
                 } else {
                     _mm256_storeu_ps(out.add(i), d);
@@ -420,6 +425,7 @@ unsafe fn perchan_row_avx2(
                     d = _mm256_max_ps(d, zero);
                 }
                 if nt {
+                    crate::velem::assert_nt_aligned(out.add(j));
                     _mm256_stream_ps(out.add(j), d);
                 } else {
                     _mm256_storeu_ps(out.add(j), d);
@@ -568,6 +574,36 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nt_alignment_flat_and_row_peels() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let n = NT_MIN_BYTES / 8 + 35;
+        let q = vec![6i32; n];
+        assert!(use_nt(n, 4));
+        crate::velem::check_nt_output(n, -99.0, 3.0, |out| unsafe {
+            wukong_dequant_f32(q.as_ptr().cast(), out, n as i64, 0.5, DQ_I32 | DQ_ID);
+        });
+        let cols = 101usize;
+        let rows = NT_MIN_BYTES / (8 * cols) + 1;
+        let n = rows * cols;
+        let q = vec![6i32; n];
+        let scale = vec![0.5; cols];
+        assert!(use_nt(n, 4));
+        crate::velem::check_nt_output(n, -99.0, 3.0, |out| unsafe {
+            wukong_dequant_perchan_f32(
+                q.as_ptr().cast(),
+                out,
+                rows as i64,
+                cols as i64,
+                scale.as_ptr(),
+                DQ_I32 | DQ_ID,
+            );
+        });
+    }
 
     // Deterministic, varied fills (no RNG). i8 spans the full signed range; u8 the full unsigned range;
     // i32 includes magnitudes past 2^24 so the `i32 → f32` rounding path (round-to-nearest-even) is

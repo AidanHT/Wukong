@@ -84,6 +84,7 @@ unsafe fn bias_avx2(
     macro_rules! store {
         ($p:expr, $v:expr) => {
             if nt {
+                crate::velem::assert_nt_aligned($p);
                 _mm256_stream_ps($p, $v);
             } else {
                 _mm256_storeu_ps($p, $v);
@@ -255,6 +256,31 @@ pub unsafe extern "C" fn wukong_bias_bcast_f32_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nt_alignment_row_peels() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let cols = 101usize;
+        let rows = NT_MIN_BYTES / (8 * cols) + 1;
+        let n = rows * cols;
+        assert!(use_nt(n));
+        let x = vec![2.0; n];
+        let b = vec![1.0; cols];
+        crate::velem::check_nt_output(n, -99.0, 3.0, |out| unsafe {
+            wukong_bias_bcast_f32(
+                x.as_ptr(),
+                b.as_ptr(),
+                out,
+                rows as i64,
+                cols as i64,
+                BIAS_ACT_NONE,
+            );
+        });
+    }
+
     use crate::vmath::{VM_GELU, VM_RELU, VM_SILU};
 
     #[test]
