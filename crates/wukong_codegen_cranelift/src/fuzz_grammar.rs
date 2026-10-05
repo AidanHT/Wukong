@@ -1050,7 +1050,7 @@ impl NumericInt {
             let (q, r) = if b == 0 { (0, 0) } else { (a / b, a % b) };
             (q as u128, r as u128, (a >> shift) as u128)
         } else {
-            let (q, r) = if y == 0 { (0, 0) } else { (x / y, x % y) };
+            let (q, r) = (x.checked_div(y).unwrap_or(0), x.checked_rem(y).unwrap_or(0));
             (q, r, x >> shift)
         };
         [x + y, x.wrapping_sub(y), x * y, div, rem, x << shift, right]
