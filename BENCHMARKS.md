@@ -41,7 +41,8 @@ Accuracy is operation- and range-specific: source reference sweeps record exp �
 | **general code — everything outside the recognizer dialect** | **SUPERSEDED 2026-08-06, with no replacement published.** Both columns moved out from under the tables: the dispatch census is stale (the recognizers widened), and the timing columns were taken by an instrument with no control in it — with the `C(twin)` control carried and the timing thread pinned, the "spread across five spellings" headline reads *below the run's own noise floor*. Run the suite and read its `DISPATCH CENSUS` block for census facts; there are no current timing figures for this section. |
 | `tanh` | **NEEDS RE-MEASUREMENT.** The current two-region kernel targets ≤1 ULP; the old exp-based kernel’s ratios and 44-ULP result do not describe it. No adjusted historical ratio is a fresh measurement. |
 | the `torch.compile` CPU columns | **STANDS as measured**, with one standing hazard disclosed rather than fixed: the harness's `detect_torch` selects the *newest* torch among `python` on `PATH` and `tools/torch-venv`, so the peer can change without the benchmark changing. Record the version with the round. |
-| every absolute GFLOP/s, `% of roofline` and scaling factor | **round-local by construction**, never comparable across rounds — this laptop is three different machines by power state, a fourth by thermal history, and a fifth by which core class the scheduler parks a single-threaded row on. |
+| parallel CPU GEMM vs MKL(all) | **Twelve campaign observations WITHDRAWN; parity unestablished.** Older July ratios have distinct provenance and are historical only; see the [individual mapping](#cpu-parallel-gemm-evidence-scope). |
+| CPU throughput results | **Peer ratios only in this presentation.** Absolute throughput readings remain in historical raw logs, not these result tables. `% of roofline` and scaling factors remain **round-local**, never comparable across rounds — this laptop is three different machines by power state, a fourth by thermal history, and a fifth by which core class the scheduler parks a single-threaded row on. |
 
 ### GPU — two devices now, and they do not mix
 
@@ -276,12 +277,12 @@ but the *ratios* (who wins, by roughly how much) are stable.
 **Three instrument axes, not one** (learned the hard way on 2026-07-30; each has bitten a round):
 
 1. **Power state** — battery / AC+charging / AC+full are three different machines. The harness reads
-   it and labels every run; on battery the measured single-core roofline fell to **105 GFLOP/s** vs
-   **131–142** on AC, so *nothing* is reportable there, not even single-core. While charging, all-core
+   it and labels every run; the battery-state single-core roofline was below the AC readings,
+   so *nothing* is reportable there, not even single-core. While charging, all-core
    is capped ~25% (GEMM `@parallel` read **52% of MKL-all @512³** charging vs **97%** at AC+full —
    same binary, same shape) while single-core is unaffected.
 2. **Thermal / recent-load history** — independent of (1). The measured roofline is *instantaneous
-   boost headroom*: ~138–142 after an idle period, but 91–111 across ten back-to-back probes, and 78
+   boost headroom*: it fell across ten back-to-back probes and fell further
    when probed immediately after a heavy elementwise battery. So the roofline reading is a valid
    *round-validity gate only if the probe starts from a comparable idle state*, and a `% of measured
    roofline` figure inherits that denominator's noise.
@@ -292,17 +293,17 @@ but the *ratios* (who wins, by roughly how much) are stable.
    single-core column (notably `@parallel` scaling) inherits the problem.
 
 The practical rule this yields, and the one the tables below follow: **report same-run adjacent
-peer ratios**; treat absolute GFLOP/s, `% of roofline`, and scaling factors as round-local.
+peer ratios**; retain absolute throughput only in raw logs. Treat `% of roofline` and scaling
+factors as round-local instrument context, not transferable performance claims.
 
 ## Headline results
 
 The numbers that matter most are the ones where the *baseline is hard* — so the win reflects real
 quality, not just beating textbook code:
 
-- **GEMM is near the silicon limit *and* ahead of a tuned library.** The single-core f32 GEMM holds
-  **~104–117 GFLOP/s ≈ 90% of one P-core's AVX2-FMA roofline**, and is **1.1–1.3× faster than the
-  tuned `matrixmultiply` Rust crate** — a real hand-optimized peer, not a strawman (`117 vs 89`,
-  `115 vs 91`, `104 vs 96` GFLOP/s across 256²–1024²) — with **no LLVM**.
+- **Historical single-core GEMM comparison:** **1.1–1.3× faster than the tuned
+  `matrixmultiply` Rust crate** across 256²–1024², with **no LLVM**. This preserves the recorded
+  peer ratio; it is not a fresh measurement of the current branch.
 - **Compile time leads decisively, every build.** The headline *compiler-to-compiler* figure is the
   **both-subprocess `compile-vs`** comparison (`cargo run -p wukong_bench --release -- compile-vs`:
   `wukongc --emit=obj -O2` vs `gcc/g++/rustc` compiling bare equivalent kernels to objects, all as
@@ -315,7 +316,7 @@ quality, not just beating textbook code:
   harness prints over the **29 single-threaded rows**, with the 9 `@parallel` rows kept in a separate
   accumulator (they are all-core-vs-1-thread and must never be pooled into a figure printed under a
   single-threaded heading). Two same-day rounds read **3.76×** and **4.39×**. Reported as a range
-  deliberately: the two rounds' measured single-core rooflines were 131 and 78 GFLOP/s, and the
+  deliberately: the two rounds had substantially different measured single-core rooflines, and the
   geomean moved *with* that — so even a ratio of two same-run single-threaded columns is not fully
   clock-invariant here, because Wukong's vectorized kernels and gcc's scalar ones lose throughput at
   different rates as the machine heats. The previously recorded **4.86×** (marked "derivation not
@@ -442,14 +443,50 @@ negative results**, live in [`prompts/results/`](prompts/results/).
 
 | Slice | Peer | Standing | Honest residual gap |
 |---|---|---|---|
-| CPU GEMM | oneMKL | 1-core **~80–104% of MKL-1c across sizes**, at/above parity (≥100%) at 2048³/4096³ (2026-07-10 C-tile microkernel prefetch closed the writeback-miss tail; the `WUKONG_GEMM_PF_C=0` kill-switch reproduces the old 86–88%); `@parallel` via the **size-keyed 2D block-parallel dispatch** (per-block packing mid/large — it beat the shared-cooperative-pack design in both ABBA orderings — shared-pack small band above the 2²³-MAC gate): **~98–99% @512³, ~104% @1024³** of MKL-all, **91% @2048³ / 93% @4096³ vs a healthy peer** (176–186% vs MKL's degraded rounds), **~94–110% @256³** (engaged at 1.7–2× over serial; was deliberately serial at ~39–52%) | large-size `@parallel` a touch behind MKL-all's parallel grain @2048³ (91%; 512³–1024³ at/above parity — MKL-all swings ~1.4–2× with power state, ratios same-run, reported as ranges); Wukong's parallel path holds flat wall-time across power states while peers ride them (sync/serial-fraction bound — head-loop parallelism is the open lever) |
+| CPU GEMM | oneMKL | **Historical ratios; current parity unestablished** ([scope](#cpu-parallel-gemm-evidence-scope)). 1-core **~80–104% of MKL-1c across sizes**, at/above parity (≥100%) at 2048³/4096³ (2026-07-10 C-tile microkernel prefetch closed the writeback-miss tail; the `WUKONG_GEMM_PF_C=0` kill-switch reproduces the old 86–88%); `@parallel` via the **size-keyed 2D block-parallel dispatch** (per-block packing mid/large — it beat the shared-cooperative-pack design in both ABBA orderings — shared-pack small band above the 2²³-MAC gate): **~98–99% @512³, ~104% @1024³** of MKL-all, **91% @2048³ / 93% @4096³ vs a healthy peer** (176–186% vs MKL's degraded rounds), **~94–110% @256³** (engaged at 1.7–2× over serial; was deliberately serial at ~39–52%) | Historical MKL-all comparisons swing ~1.4–2× with power state. They do not establish a current parallel-grain deficit or parity; the twelve campaign observations are individually withdrawn below, and fresh controlled measurement remains pending |
 | CPU vmath | oneMKL VML | **The engineering stands; the "caught VML" headline is RETRACTED (2026-08-06).** The defect was real and is fixed: the elementwise loop reached its 8-lane kernel through a *function pointer*, and because this crate is built without crate-wide AVX a `__m256` cannot cross a real call in a register — every 8 lanes paid a 32-byte argument spill, a `vzeroupper`, an indirect `call` and a 32-byte reload, and the poly constants could not stay in ymm across the loop (read out of the emitted asm, not inferred). Monomorphizing the op dispatch (one `match` outside the loop, kernel inlined) is **bit-identical on all 2³² f32** and is worth **1.20–1.78×** — typically ~1.4–1.5×, lowest (1.20–1.36×) for exp at 2²³ where the pass is memory-bound. Same binary, `WUKONG_VMATH_FNPTR=1` kill-switch, six rounds; **that is the only number in this row that is not a cross-library ratio, and it is the result.** The two-input kernel (`wukong_vmath2_f32`: activation backward, SwiGLU/GeGLU gates, pow/atan2/hypot), which spilled **two** `__m256` per call, took the identical fix for 1.09–1.48× (internal A/B only — VML has no `silu'`/`gelu'` entry to peer against; that range is carried from the first rounds and was not re-run on AC, but a battery re-check at 2²⁰ reads 1.19–1.41× inside it). **Against VML, at matched accuracy, exp and log are a TIE.** VML's default is HA at ~0.5 ULP while Wukong ships ≤2 ULP exp and ≤12 ULP log, so the default column is *not* like-for-like; re-run through `vmlSetMode(VML_LA)` — which the probe measures at 2 ULP exp / 4 ULP log on the timed band, exactly where Wukong measures 2 / 4 — the accuracy-matched reading over five rounds (AC+charging 68–76%, best-of-40, ABBA, one process, nothing else running) is **exp 1.09–1.20× SLOWER at 2¹⁶ and 2²⁰** and **log between 1.09× slower and 1.07× faster** — a tie, or a shade behind. Only at n = 2²³ does either come near the noise floor at all, and even there only log clears it (1.48–1.66×) while exp straddles it (1.37–1.54×) — and that is Wukong's non-temporal store regime, not its core. **The historical tanh speed/accuracy comparison is superseded.** The shipped two-region kernel targets ≤1 ULP; the old exp-based kernel’s ratios do not measure this implementation. Fresh accuracy-matched timing is pending. Accuracy itself was re-swept **exhaustively** and did not move: exp 1.625e-7 / ≤2 ULP over all 2.24e9 f32 in [−87, 88.376], log 6.924e-7 / ≤12 ULP over all 2.13e9 positive normals, and all 2³² f32 bit-identical between the monomorphized dispatch, the function-pointer dispatch and the scalar twin | **What was withdrawn, and why.** (1) *"exp 1.08–1.25× faster at 2¹²"* — does not reproduce; against the accuracy-matched peer exp is behind at that size. (2) *The whole n = 2¹² row* — at 16 KiB/array every arm's best-of-40 minimum is 0.5–1.4 µs against a **measured 100 ns `Instant` granularity**, i.e. 5–14 ticks, which is why its ratios came out as exact small fractions (1.000, 8/7, 3/2, 8/5, 4.2 = 42/10). The probe now measures that granularity itself and prints `TIMER-QUANTIZED` whenever the fastest arm is under 100 ticks. (3) *"log 1.17–1.46× faster at every size"* — that was against HA; against LA it is a tie at every size but 2²³, and even the HA reading (1.21–1.55×) mostly sits at or below this machine's floor. **The floor is measured, not assumed:** the probe carries two controls whose true ratio is exactly 1.000 — the shipped entry against the `mono` twin it dispatches to, and VML-HA against a second VML-HA arm — and they read 1.06–1.23× at 2²⁰ and, in one round at 2¹⁶ **with no power-state change and nothing else running, 2.303×** (the same function timed at 27.4 µs and 11.9 µs; that round's `mono vs fnptr` even inverted to 1.60× *slower*). That round is excluded from every range above and is the reason nothing under ~1.4× is published here — it is the in-instrument twin of `wukong_xbench`'s C(twin) column, which once read a byte-identical binary as 1.31× faster than itself. **Still open:** at matched accuracy VML's LA exp/log core is a shade ahead of ours at n ≤ 2²⁰ — that is the real residual, now measured rather than asserted, and it is smaller than the pre-2026-08-06 loss but not gone. The four *arithmetic* levers remain superseded-but-recorded: 8-bucket in-register LUTs (which did close a real ~1.7–2× loss), Estrin scheduling, the ×4/×6 ILP unroll, and a bit-identical ldexp exp tail that measured a ~10–15% LOSS and was reverted. `wukong-xbench exp`'s **own** VML peer prints much larger ratios (2.59× new / 1.59× old at 2²⁰, where this probe reads a tie) — it runs in default **HA** mode too, times each arm in its own tight rep-block rather than rotating them, and has **not** been re-measured against LA; treat its row as carrying the same accuracy mismatch and the same floor. The bf16/f16-input dispatchers still use the function-pointer table (bandwidth-bound; 36 more monomorphizations each is a code-size trade that was not measured) |
-| CPU end-to-end model (12-layer GPT-2-class) | PyTorch CPU compiled (`torch.compile` max-autotune, fullgraph) + eager + gcc C | **~19–21× C(gcc), 3.6–4.9× C(-ffast-math)** 1-core; vs compiled-torch-1T it wins at **both** shapes; multicore, since the `@parallel` head-loop region (2026-07-10): **1.39–1.81× FASTER than all-threads compiled torch @S=512 and 1.07–1.43× @S=128** (three rounds, roofline-validated; also 1.07–1.37× vs torch's strongest eager config @S=512), scaling to **default 4.44× / best 5.22× (T=16 4.70×)**, **~61–69× C(gcc)** multicore; interp gate bit-exact three ways (interp == native == @parallel), serial==@parallel bit-exact, outputs cross-checked <2e-6 vs C and torch | residual scaling headroom vs 16 physical cores is the parallel-GEMM grain at 2048³/4096³ (91–93% of MKL-all; 512³–1024³ at/above parity) — the open lever |
+| CPU end-to-end model (12-layer GPT-2-class) | PyTorch CPU compiled (`torch.compile` max-autotune, fullgraph) + eager + gcc C | **~19–21× C(gcc), 3.6–4.9× C(-ffast-math)** 1-core; vs compiled-torch-1T it wins at **both** shapes; multicore, since the `@parallel` head-loop region (2026-07-10): **1.39–1.81× FASTER than all-threads compiled torch @S=512 and 1.07–1.43× @S=128** (three rounds, roofline-validated; also 1.07–1.37× vs torch's strongest eager config @S=512), scaling to **default 4.44× / best 5.22× (T=16 4.70×)**, **~61–69× C(gcc)** multicore; interp gate bit-exact three ways (interp == native == @parallel), serial==@parallel bit-exact, outputs cross-checked <2e-6 vs C and torch | The older 91–93% of MKL-all at 2048³/4096³ and parity interpretation at 512³–1024³ are historical, not an established current optimization target ([scope](#cpu-parallel-gemm-evidence-scope)) |
 | fp16/bf16 GEMM | cuBLAS | **~101%** ≤1024³, **~87–90% of cuBLAS-f16** @2048³; @4096³ the **v2cs streaming epilogue** shipped (+2.7%): **76.8% of cuBLAS-f16 / 80.4% of the honest f32-out peer** (new peer column — the f16-out peer hides ~half of Wukong's f32 C-write traffic) | 4096³ residual is SASS-level; 3-stage pipe, raster re-tunes, launch-bounds, and 2048³ epilogue variants all measured losses (kept bench-only) |
 | int8/fp8 GEMM | cuBLAS IMMA / cuBLASLt | int8 **96–105%** @2048³ (**beats IMMA**), 86–88% @1024³; **fused GEMM+dequant 1.1–2.2×** the cuBLAS chain; fp8 82–151% of cuBLASLt | int8 ~70% @4096³ (HBM-bound) |
 | Attention | cuDNN / cutlass fused fMHA | fused-RoPE **1.8–5.7×** & causal D=64 **1.03–1.16×** (beats both) @S≤512; D=128 ldmatrix beats cutlass @S≤1024 — the production D=128 dispatch; **FA2-style warp-specialized kernels (2-warp named-barrier anti-phase + 3-stage ring) built, gated, and default-routed at S≥4096 where they win 4–6%** (clock-cancelled median-of-9; tie @2048, lose @≤1024 — pins keep the losing regimes unroutable) | non-causal long-S (≥2048) 0.37–0.66× cuDNN stands — warp specialization was the last scheduling lever and moved only the S=4096 point; the loss is structural (SFU/serial-softmax on 20 SMs) |
 | Conv | cuDNN-9 | 1×1 **3.5–5.6×**, 3×3/5×5 deep-channel **0.93–1.21×**, Winograd F(4×4,3×3) **1.2–2.2×** over implicit-GEMM | Winograd loses at low channel count; depthwise/dilated not yet covered |
 | Serving | (no vLLM/TRT-LLM installable — vs Wukong's own eager + an honest static-batching peer) | **85.6× continuous-batching goodput** vs fill=1 @Bcap=256 (2026-07-10 Bcap parameterization; 33.1k tok/s full-fill, same-clock interleaved; the old 39× was the Bcap=64 ceiling, reproduced at 38.2×), graph-driven scheduler drain 27.5k tok/s = **1.14–1.27× vs static batching** (bit-identical outputs; the batching-vs-scheduling decomposition disclosed); decode CUDA graph 1.07–1.35×; int8 KV **3.88× smaller cache than f32** (1.94× than f16), the opt-in int8-KV storage path | multi-GPU collective (NCCL) unmeasured on one device |
+
+## CPU parallel-GEMM evidence scope
+
+**Documentation reconciliation, 2026-10-04; no new measurements.**
+[Finding 01](docs/sota-campaign-2026-09/FINDING-01-parallel-gemm-gap-is-instrument.md)
+withdraws exactly twelve September campaign observations as performance targets. Their log was
+marked `DIRECTIONAL ONLY` under AC+charging, and the timing order placed Wukong last. The finding
+also corrects the pool comparison: GEMM used a private **16-worker** pool against **16 MKL threads**,
+not the 22-worker global Rayon banner. Withdrawal establishes neither parity nor a current win.
+
+The mapping below reconciles the [master checklist](docs/sota-campaign-2026-09/CHECKLIST.md)
+with its itemized reconstruction, `target/cpu-evaluation-logs/candidate-peer-losses-itemized-20261001.json`
+(67 observations, twelve withdrawals), and the [group audit](docs/sota-campaign-2026-09/AUDIT-2026-10-04.md).
+Ratios are the recorded Wukong speed over **MKL(all)**, rounded to four decimal places.
+
+| Ledger group | Historical comparison | Ratio | Status |
+|---|---|---:|---|
+| B07 | matmul 256x256 | 0.7262× | **WITHDRAWN; parity unestablished** |
+| B08 | matmul 512x512 | 0.7267× | **WITHDRAWN; parity unestablished** |
+| B12 | matmul 1024x1024 | 0.7816× | **WITHDRAWN; parity unestablished** |
+| B16 | matmul 2048x2048 | 0.8427× | **WITHDRAWN; parity unestablished** |
+| B10 | matmul_skinny 128x768 · (768x768)ᵀ | 0.7554× | **WITHDRAWN; parity unestablished** |
+| B05 | matmul_skinny 128x768 · (3072x768)ᵀ | 0.9573× | **WITHDRAWN; parity unestablished** |
+| B04 | matmul_skinny 128x3072 · (768x3072)ᵀ | 0.6899× | **WITHDRAWN; parity unestablished** |
+| B09 | matmul_skinny 512x768 · (768x768)ᵀ | 0.7529× | **WITHDRAWN; parity unestablished** |
+| B18 | matmul_skinny 512x768 · (3072x768)ᵀ | 0.8891× | **WITHDRAWN; parity unestablished** |
+| B14 | matmul_skinny 512x3072 · (768x3072)ᵀ | 0.8002× | **WITHDRAWN; parity unestablished** |
+| B17 | linear (nn.Linear C=A·Bᵀ) 512x512 | 0.8456× | **WITHDRAWN; parity unestablished** |
+| B13 | linear (nn.Linear C=A·Bᵀ) 1024x1024 | 0.7987× | **WITHDRAWN; parity unestablished** |
+
+The older July percentages in the library table, model discussion and metrics page are **different
+observations**. Finding 01 did not withdraw those measurements. They remain recorded historical,
+directional context, not evidence of current parity or a current parallel-GEMM bottleneck. In
+particular, the July 4096³ percentage is not one of the twelve withdrawn September rows. The
+MKL(1c) comparisons are also outside this withdrawal. A fresh controlled round is needed before
+ranking current parallel-GEMM work or asserting a win; no such round was run for this correction.
 
 ## Scoreboard
 
@@ -612,8 +649,8 @@ GB/s and GFLOP/s are not comparable across pairs.
 **single-core rows are valid and every all-core row is directional only** (AC+charging caps all-core
 at roughly 25%). The single-core rows are where the corrections live, so this does not soften the
 conclusion; the `@parallel` columns below should be read as "which side of 1.0", not as a magnitude.
-The measured single-core AVX2-FMA roofline drifted 43–120 GFLOP/s across the session, which is the
-usual thermal spread and is why nothing here is quoted as an absolute.
+The measured single-core AVX2-FMA roofline drifted substantially across the session.
+That instrument variation is why only peer ratios are presented here.
 
 Sign convention: **a positive multiple means Wukong is faster**; "slower" is spelled out.
 
@@ -841,7 +878,7 @@ within the session's run-to-run noise.
   cache — a single size could be a fluke, so a sweep is shown.
 - **`nn.Linear` (`C = A·Bᵀ`)** is written the idiomatic way in all three languages: the `ijk`
   dot-product form (`for i,j { s=0; for k s+=a[i,k]*b[j,k]; c=s }`), where A and B are both read
-  contiguously. gcc/rustc leave that f32 reduction strictly serial (latency-bound, ~1.5 GFLOP/s),
+  contiguously. gcc/rustc leave that f32 reduction strictly serial (latency-bound),
   while Wukong dispatches to its GEMM. The large ratio is real and is *caused by C's serial
   reduction*; it is not a strided-access strawman.
 - **Correctness:** the native backend and the interpreter run the *identical* GEMM kernel (the
@@ -993,8 +1030,8 @@ residual is the same reassociation/poly-vs-libm class — no loosening needed), 
 reports its manual-attention-vs-SDPA agreement.
 
 **Measured standings (2026-07-11 — three independent same-day rounds for the compiled-torch bar; the earlier 2026-07-09/10 eager campaign ran five valid full-peer rounds).** Absolute ms
-swings ~3× with this laptop's clock state (the valid rounds read roofline 130–141 GFLOP/s; a sixth
-round at roofline 61 — 1 a.m. system activity plus a fresh-binary cache scan — was caught by the
+swings ~3× with this laptop's clock state (a sixth round with a degraded roofline —
+1 a.m. system activity plus a fresh-binary cache scan — was caught by the
 validity protocol and discarded), so the **ratios are the metric**, not raw ms. All four correctness
 gates passed every round: interp == native bit-exact, serial == `@parallel` bit-exact, and
 Wukong-vs-C / Wukong-vs-torch outputs agree to `max|Δ|/max|out|` ≈ 1–2×10⁻⁶ (tolerance 10⁻³).
@@ -1020,9 +1057,9 @@ Before the region, three mid-session rounds had Wukong `@parallel` scaling 2.2�
 power-state swing (eager torch-Tn ran 443→271 ms across rounds while Wukong `@parallel` held ~440 ms in
 every round). That exposed the structural finding the region then addressed: Wukong's parallel path
 does **not** ride the clock upside peers do, consistent with a sync/serial-fraction bound rather than
-a clock bound. The residual multicore headroom vs 16 physical cores now concentrates in the large-size
-parallel-GEMM grain (2048³/4096³ 91–93% of MKL-all; 512³–1024³ at/above parity — see the library table above), the one
-honestly-open lever. Compiling the whole block takes Wukong **~3–12 ms vs gcc's ~0.4–0.9 s** for the
+a clock bound. The older parallel-GEMM interpretation (2048³/4096³ 91–93% of MKL-all;
+512³–1024³ at/above parity in those rounds) does not establish a current gap or parity.
+See [CPU parallel-GEMM evidence scope](#cpu-parallel-gemm-evidence-scope). Compiling the whole block takes Wukong **~3–12 ms vs gcc's ~0.4–0.9 s** for the
 equivalent TU; tokens/sec = S ÷ ms/forward.
 
 **2026-07-30 re-measurement — two rounds, and a methodological caveat that limits what they prove.**
@@ -1034,11 +1071,11 @@ dispatch set printed from the optimized MIR is **identical to the one documented
 `@parallel` set contains the `wukong_parallel_for` head-loop region — so no recognizer regressed.
 
 The timings, however, exposed a hybrid-CPU effect that the existing protocol does not control for.
-Round 1 (AC+charging, measured roofline 131) read Wuk(1c) **277.8 ms** at S=128; Round 2 (AC+full,
-roofline probe 78) read **617.6 ms** for the same work — 2.2× slower *on the healthier power state*.
+Round 1 (AC+charging) read Wuk(1c) **277.8 ms** at S=128; Round 2 (AC+full,
+degraded roofline probe) read **617.6 ms** for the same work — 2.2× slower *on the healthier power state*.
 On this 6 P-core + 8 E-core + 2 LP-E part a single-threaded measurement is at the mercy of which core
-type the scheduler picks, and nothing in the harness pins it (the note above that "pinned to a P-core
-it reaches a stable ~117–126" is the same effect seen from the other side). Consequences, stated
+type the scheduler picks, and nothing in the harness pins it (the reduced variance when pinned to a P-core
+is the same effect seen from the other side). Consequences, stated
 rather than papered over:
 
 - **Single-core rows are only comparable within a round**, and a round's `Wuk(1c)` column should be
@@ -1049,7 +1086,8 @@ rather than papered over:
 - Peer ratios that do not involve Wukong's own 1c column are the robust ones. At AC+full, Wukong
   `@parallel` measured **1.60× (S=128) and 3.98× (S=512) faster than all-threads compiled torch**,
   and GEMM `@parallel` measured **99% / 97% / 114% / 128% of MKL-all** at 256³/512³/1024³/2048³ —
-  at or above the standing band, one round, warm machine.
+  one historical round on a warm machine, not current parity
+  ([evidence scope](#cpu-parallel-gemm-evidence-scope)).
 - Single-thread vs compiled-torch-1T came out **1.07× and 1.28× faster** (S=128/S=512) in Round 1 but
   **1.20× slower** at S=128 in Round 2, tracking that round's degraded 1c. The recorded claim is left
   as it stands; one round cannot overturn it, and one round cannot confirm it either.
@@ -1064,29 +1102,23 @@ site now passes the function's `@parallel` flag (`emit_sgemm(&nest, self.paralle
 the velem-parallel residual-add dispatch and the head-loop region above, the whole block is genuinely
 multicore. The parallel GEMM is bit-identical to serial, so the differential gate was never at risk.
 
-GFLOP/s (higher is better), naive `ikj` nest in each language. Measurement ordering is thermal
+Recorded same-run speed ratios against the naive `ikj` C nest (higher is better). Measurement ordering is thermal
 hygiene: the naive C/Rust (and `C(fast)`) nests are measured in the **same single-core thermal group
 as Wuk(1c)** — after the library peers, before any all-core burst — so they are never read
 heat-throttled (they previously ran dead-last, after the all-core `Wuk(par)`/`MKL(all)` bursts, which
 could understate them); `Wuk(par)` still runs last of all (we throttle ourselves, never a peer).
 
-| size | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
-|------|-----------|---------------|---------|------|-------------|---------------|
-| 256³ | 80–100 | 86–99 † | 21–41 | 21–42 | **~2.8–4.3×** | **~3.4–4.1×** |
-| 512³ | 110–126 | 328–462 | 30–41 | 38–45 | **~3.0–3.1×** | **~9×** |
-| 1024³| 102–119 | 437–522 | 22–30 | 25–32 | **~3.4–3.6×** | **~14–18×** |
+| size | 1-core vs C | parallel vs C |
+| ------ | ------------- | --------------- |
+| 256³ † | **~2.8–4.3×** | **~3.4–4.1×** |
+| 512³ | **~3.0–3.1×** | **~9×** |
+| 1024³ | **~3.4–3.6×** | **~14–18×** |
 
-The single-core kernel now holds **~110–120 GFLOP/s** at 512³–1024³ — ≈90% of one P-core's AVX2-FMA
-peak (pinned to a P-core it reaches a stable ~117–126) — while gcc's naive nest falls from ~40 to ~22
-GFLOP/s as 1024² spills out of cache, so the **single-thread lead widens with size**. Crucially, that
-single-core kernel also **beats the tuned `matrixmultiply` Rust crate by ~1.1–1.3×** (117 vs 89, 115
-vs 91, 104 vs 96 GFLOP/s at 256²–1024²) — so Wukong is not merely beating naive C; it edges a
-dedicated hand-optimized GEMM library while sitting at ~90% of the AVX2-FMA roofline. The parallel
-kernel's absolute throughput swings ~3× with power state, so its standing is the **same-run vs-MKL
-ratio** in the library table above rather than a fixed GFLOP/s (the pre-2D-path ~437–522 @1024³ /
-~690 @2048³ figures predate the current default parallel path); the `MC=144` cache-block widening cut
-the B-panel's L3 re-streaming, and the pack-scratch is reused across blocks rather than re-allocated
-per K-block.
+The recorded single-thread lead over naive C widens with size. The same kernel also
+**beats the tuned `matrixmultiply` Rust crate by ~1.1–1.3×** at 256²–1024² in those historical
+runs. The `MC=144` cache-block widening cut the B-panel's L3 re-streaming, and pack scratch is
+reused across blocks rather than re-allocated per K-block. For the historical parallel MKL
+ratios and their limits, see [CPU parallel-GEMM evidence scope](#cpu-parallel-gemm-evidence-scope).
 
 † At 256³ the parallel kernel deliberately falls back to the serial one: ~17M MACs is below the
 work threshold where cross-core wake/sync pays off on this P+E hybrid, so "@parallel" ≈ single-core
@@ -1094,8 +1126,8 @@ there (a measured fix — naive threading at that size was a net *loss*).
 
 *2026-07-08 note*: the `Wuk @parallel` ranges above predate the **2D block-parallel path** (now the
 default), which A/B-measured **1.65× @512³ and 1.26× @1024³** over the path that produced them —
-absolute GFLOP/s swing ~3× with this laptop's power state, so the ranges are not re-baselined from a
-throttled day; the same-run vs-MKL ratios in the library table above are the current standing.
+throughput swings ~3× with this laptop's power state, so these historical ratios are not
+re-baselined from a throttled day. They do not establish current standing against MKL.
 *2026-07-10 update*: that path is now **size-keyed** — per-block packing at mid/large (it beat the
 shared-cooperative-pack design in both ABBA orderings — each worker warming its own L2 is the win),
 a shared-pack + 1 Mi-MAC-task small band, and the parallel gate lowered 2²⁶→2²³ MACs so 256³ engages
@@ -1107,16 +1139,17 @@ and the per-block blocks are now handed out by an **atomic claim queue** instead
 range-split (`WUKONG_GEMM_DYN=0` opts back) — on this hybrid the OS intermittently strands a worker
 for 100–500 ms stretches, and block-granular self-scheduling halves that episode damage (512³ solo
 CoV 14→8%, floor +28%) while winning or washing every measured shape (skinny NT table:
-75–112% of MKL-all, was 70–96%). See the library table above for current same-run standings.
+75–112% of MKL-all, was 70–96%). These are historical observations, not current standings;
+see [CPU parallel-GEMM evidence scope](#cpu-parallel-gemm-evidence-scope).
 
 ### `nn.Linear` `C = A·Bᵀ` — Wukong dispatches to GEMM; naive C is latency-bound
 
-| size | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
-|------|-----------|---------------|---------|------|-------------|---------------|
-| 512² | 81–112 | 251–348 | ~4.0–4.8 | ~3.4–4.5 | **~19–25×** | **~52–76×** |
-| 1024²| 88–108 | 258–457 | ~3.5–4.4 | ~3.4–4.3 | **~22–26×** | **~67–104×** |
+| size | 1-core vs C | parallel vs C |
+| ------ | ------------- | --------------- |
+| 512² | **~19–25×** | **~52–76×** |
+| 1024² | **~22–26×** | **~67–104×** |
 
-C/Rust leave the idiomatic `ijk` dot-product reduction strictly serial (~4–5 GFLOP/s, latency-bound),
+C/Rust leave the idiomatic `ijk` dot-product reduction strictly serial (latency-bound),
 while Wukong recognizes `C = A·Bᵀ` and dispatches to the same packed GEMM — hence the order-of-
 magnitude gap (caused by C's serial reduction, not a strided-access strawman; see Fairness notes).
 *IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison, and
@@ -1139,10 +1172,10 @@ activation is computed in-register on the GEMM's C-tile writeback, so C is writt
 C/Rust do the GEMM, then a *second* full pass that reads C back and applies silu with scalar libm
 `expf` (which they cannot vectorize).
 
-| size  | Wuk 1-core | Wuk @parallel | C (gcc) | 1-core vs C | parallel vs C |
-|-------|-----------|---------------|---------|-------------|---------------|
-| 512²  | ~115 | ~227 | ~4.8 | **~24×** | **~48×** |
-| 1024² | ~107 | ~389 | ~4.1 | **~26×** | **~95×** |
+| size | 1-core vs C | parallel vs C |
+| ------- | ------------- | --------------- |
+| 512² | **~24×** | **~48×** |
+| 1024² | **~26×** | **~95×** |
 
 Honest accounting: the **bulk** of this ratio is the same serial-reduction-vs-tiled GEMM gap as the
 `nn.Linear` row above (~22–26×); the fused vectorized silu is the *incremental* win over C's separate
@@ -1166,7 +1199,7 @@ operands, so A is stored `[k,m]`. Wukong recognizes `a[k*M+i]·b[k*N+j]` and dis
 > `c[i*NS+·]` contiguously — exactly what the same file's untransposed `c_matmul` already did.
 > Isolated at `-O3 -march=native`, kernels in their own translation unit, 512³: **176.6 ms `ijk` →
 > 20.25 ms `ijk` + `restrict` → 9.70 ms `kij` + `restrict`, an 18.2× total handicap.**
-> The prose below also used to claim a hand-transposed C would recover only ~4–5 GFLOP/s and leave a
+> The prose below also used to claim a hand-transposed C would recover little throughput and leave a
 > "durable ~10×"; the measured `kij` peer does substantially better than that, and the durable win is
 > 2.6–9.2× (two independent rounds).
 
@@ -1197,7 +1230,7 @@ nest** (the loop everyone writes by hand).
 > published **~6–7×**. The direct-convolution peer accumulates into a scalar `s` and then stores to
 > `output`; without `restrict` gcc must assume that store may alias `input`/`weight`, which forces a
 > reload of the whole inner nest's operands on every output pixel. Adding `__restrict__` — changing
-> nothing else about the loop — took the C peer from **4.9 to 21.1 GFLOP/s, a 4.3× peer speedup**,
+> nothing else about the loop — gave the C peer a **4.3× speedup**,
 > and the published multiple from 5.90× to **1.55×**. With the (new) `-ffast-math` column the direct
 > conv is **faster than Wukong** (1.12×).
 
@@ -1419,12 +1452,12 @@ but without `-ffast-math` they keep the f32 reduction **sequential** — the sam
 kernel. All-positive inputs keep the reduction well-conditioned, so the cross-language scalar result
 agrees within a tight tolerance (the three reassociate the f32 sum differently).
 
-GB/s (higher is better) — input traffic over `[bf16; N]` arrays:
+Historical Wukong/C speed ratios over `[bf16; N]` arrays (higher is better):
 
-| op | N=2²⁰ Wuk · C · Rust | N=2²⁴ Wuk · C · Rust | Wukong vs C |
-|----|----------------------|----------------------|--------------|
-| dot Σx·y | **10.2** · 3.4 · 3.2 | **10.2** · 2.9 · 3.0 | **~3.0× → 3.5×** |
-| sum Σx   | **12.3** · 1.5 · 1.7 | **10.5** · 1.7 · 1.7 | **~8.3× → 6.1×** |
+| op | Wukong vs C, N=2²⁰ → N=2²⁴ |
+| ---- | -------------- |
+| dot Σx·y | **~3.0× → 3.5×** |
+| sum Σx | **~8.3× → 6.1×** |
 
 > **Corrected 2026-08-04 — this family is a LOSS on a like-for-like basis.** This bench had **no
 > `C(fast)` column at all** until the peer audit, even though the whole point of its Wukong kernel is
@@ -1444,8 +1477,7 @@ GB/s (higher is better) — input traffic over `[bf16; N]` arrays:
 
 The **dot** win (~3×) tracks the f32 `dot` — Wukong vectorizes the reduction while C/Rust stay serial.
 The **sum** win is larger (~6–8×) because C's unary f32 sum is a single dependency chain (pure
-latency, no product to fill the pipeline) at ~1.5 GB/s, while Wukong's 8-lane SIMD sum reaches
-~12 GB/s. The **dot** lead **widens from 2²⁰ to 2²⁴** as the working set spills L3 and the halved byte count
+latency, no product to fill the pipeline), while Wukong uses an 8-lane SIMD sum. The **dot** lead **widens from 2²⁰ to 2²⁴** as the working set spills L3 and the halved byte count
 (bf16 vs f32) starts to dominate — the bandwidth payoff of mixed precision (the sum lead, already
 bandwidth-bound, instead narrows ~8.3→6.1× across the same range). Correctness: bf16 storage
 is bit-exact across the interpreter and native backends (`round_to_bf16` emits the identical integer
@@ -1471,30 +1503,28 @@ Wukong recognizes the half-precision dot-product nest (`s += (a[..] as f32) * (b
 lossless widen prepass (O(m·k + n·k), ~1/n of the GEMM) feeding the *identical* tuned AVX2 f32 GEMM.
 C and Rust store bf16 as `uint16_t` and widen each element inline inside the triple loop.
 
-| size  | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
-|-------|-----------|---------------|---------|------|-------------|---------------|
-| 512²  | ~52–53 | ~98–103 | ~2.1 | ~2.2 | **~24–25×** | **~47×** |
-| 1024² | ~50–55 | ~208–219 | ~2.0 | ~2.1 | **~25×** | **~98–109×** |
+| size | 1-core vs C | parallel vs C |
+| ------- | ------------- | --------------- |
+| 512² | **~24–25×** | **~47×** |
+| 1024² | **~25×** | **~98–109×** |
 
 *IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized comparison.*
 
 > **Corrected 2026-08-04.** The `C(fast)` column was missing here too; with it present the durable
 > figure is **4.59× (512²) and 5.62× (1024²)**, against **22.70× / 27.52×** vs the plain-flags peer.
 > The paragraph below used to *estimate* the durable win at "~10× even against optimized bf16 C" from
-> a hand-argued ~4–5 GFLOP/s baseline; that estimate was never measured, and the measured
+> an estimated scalar baseline; that estimate was never measured, and the measured
 > reassociation-normalized answer is 4.6–5.6×.
 
-Two effects compound here and honesty requires separating them. The idiomatic bf16 C falls to ~2–3.4
-GFLOP/s because the inline `bf16→f32` widen won't vectorize **and** the dot-product reduction stays
-serial (no `-ffast-math`). Allowing gcc the reassociation — the `C(fast)` column — lifts it to ~16
-GFLOP/s, and the durable domain-lowering win over that is the measured **4.6–5.6×**; the ~23–28×
-headline is versus the code a person actually writes at honest default flags. Wukong's single-core ~52 GFLOP/s is ~73% of the measured AVX2-FMA roofline —
-the f32 GEMM efficiency, since after the widen it *is* the f32 kernel. Without this dispatch the half
+Two effects compound here. The idiomatic bf16 C cannot vectorize the inline `bf16→f32`
+widen and keeps the dot-product reduction serial without `-ffast-math`. Allowing gcc the
+reassociation gives the measured **4.6–5.6×** domain-lowering ratio; the **~23–28×** headline
+is against the default-flags peer. After the lossless widen, Wukong uses its f32 GEMM kernel.
+Without this dispatch the half
 nest would fall to a scalar widening loop (the `as f32` casts block the f32 matmul recognizer). The
 widen is lossless, so the kernel equals the nest under the documented matmul reassociation, bit-for-bit
 across backends (`tests/run/linear_{bf16,f16}.wk`; the runtime twin test pins bf16/f16 == f32-on-
-widened-operands and serial == parallel). Single-run, clock-sensitive absolute GFLOP/s; the ratio is
-the stable part.
+widened-operands and serial == parallel). These are historical same-run ratios.
 
 **Fused FFN epilogue (`C = act(A·Bᵀ + bias)`) — bias + activation for free.** The mixed-precision
 transformer FFN projection — the half matmul immediately followed by its bias-add and an
@@ -1658,12 +1688,12 @@ nest to **`wukong_softmax_bwd_f32`**, which delegates the dot to the proven bit-
 `y·(dy − s)` 8-wide. This is a **different gap** from the column reductions (the per-row dot, not a
 strided access), so the win is more modest — gcc already vectorizes the apply:
 
-| size | Wuk 1-core | Wuk @parallel | C (gcc) | Rust | 1-core vs C | parallel vs C |
-|------|-----------|---------------|---------|------|-------------|---------------|
-| 1024×1024 | ~45–49 | ~110–124 | ~24 | ~23 | **~1.9–2.0×** | **~4.5–5.2×** |
-| 4096×512 | ~22–26 | ~133–135 | ~21–22 | ~21 | **~1.0–1.2×** | **~6.1×** |
+| size | 1-core vs C | parallel vs C |
+| ------ | ------------- | --------------- |
+| 1024×1024 | **~1.9–2.0×** | **~4.5–5.2×** |
+| 4096×512 | **~1.0–1.2×** | **~6.1×** |
 
-(GB/s = `3·R·C·4` — the two reads + one write; higher is better. *IEEE-serial C baseline; see the
+(Traffic is `3·R·C·4` bytes per call — two reads + one write. *IEEE-serial C baseline; see the
 `C(fast)` column for the reassociation-normalized comparison.*) Single-core is a modest win-to-tie
 (only the dot's accumulation is recovered); `@parallel` (rows across cores) scales to **~5–6×** on top.
 The dot reassociates (lane accumulators vs the C baseline's serial chain — the documented
@@ -1791,7 +1821,7 @@ to serial. `tests/run/{cumsum,cummax}.wk`.
 **Linear-recurrence / selective scan (SSM / Mamba).** A first-order recurrence `h_t = a_t·h_{t-1} + b_t`
 — the state-space step at the heart of Mamba / S4 / RWKV linear attention, and the EMA — is also
 loop-carried, so gcc `-O3 -march=native` and rustc emit **one serial `mul`+`add` chain per row**:
-*latency-bound* at a few GB/s, far below DRAM. But the **rows are independent**, so Wukong's
+*latency-bound*, far below DRAM bandwidth. But the **rows are independent**, so Wukong's
 `wukong_lrscan_f32` scans **4 rows interleaved**, keeping four chains in flight to fill the ports the
 single chain leaves idle (plain `mul`+`add`, deliberately *not* `f32::mul_add` — on a build without the
 `fma` target feature the latter lowers to a libm `fmaf` **call** that re-serializes the chain and erases
@@ -1871,13 +1901,13 @@ single-threaded C:
 
 | kernel | Wukong vs single-threaded C |
 |--------|------------------------------|
-| saxpy@parallel | **~2.4–2.7×** (~132 GB/s, near the chip's memory-bandwidth ceiling) |
+| saxpy@parallel | **~2.4–2.7×** |
 | poly@parallel  | **~2.2–2.4×** |
 | relu6@parallel | **~6.7–8.0×** (nested branch defeats gcc's vectorizer; Wukong if-converts + parallelizes) |
-| dot@parallel   | **~7.9×** (~135 GB/s) — reduction across cores; C/Rust keep it serial & latency-bound |
-| ssd@parallel   | **~8.6×** (~144 GB/s) — L2-loss reduction across cores |
-| max@parallel   | **~25–26×** (~85 GB/s) — per-tensor max (int8-quant range / softmax stability) across cores; C's single-stream float-max chain is especially latency-bound (~3 GB/s) without `-ffast-math` |
-| absmax@parallel | **~25×** (~80 GB/s) — per-tensor max\|x\| (symmetric int8-quant scale) across cores; `abs` is free (a bitwise op) so C stays latency-bound like `max` (~3 GB/s) |
+| dot@parallel   | **~7.9×** — reduction across cores; C/Rust keep it serial & latency-bound |
+| ssd@parallel   | **~8.6×** — L2-loss reduction across cores |
+| max@parallel   | **~25–26×** — per-tensor max (int8-quant range / softmax stability) across cores; C's single-stream float-max chain is especially latency-bound without `-ffast-math` |
+| absmax@parallel | **~25×** — per-tensor max\|x\| (symmetric int8-quant scale) across cores; `abs` is free (a bitwise op) so C stays latency-bound like `max` |
 
 *All rows compare Wukong-multicore to single-threaded C (disclosed); see the `C(omp)` column for the
 multithreaded-C comparison, and — on the reduction rows (dot/ssd/max/absmax/argmax) — the `C(fast)`
@@ -3157,9 +3187,9 @@ proves the full-scale native run executes the pipeline correctly. Reproduce (rep
   run; the metric that dominates ML iteration.
 - **Matmul / nn.Linear (the flagship ML kernels):** Wukong **wins single-thread (~3–26×) and
   dominates parallel (~9–104×)**, and the lead **grows with matrix size** — the compiler tiles,
-  packs, and register-blocks where gcc/rustc leave the naive nest. The single-core GEMM holds
-  **~110–120 GFLOP/s** (≈90% of one P-core's AVX2-FMA peak); the parallel path holds **91–104% of
-  oneMKL-all across 512³–2048³** same-run (a fixed GFLOP/s is meaningless at this ~3× clock swing).
+  packs, and register-blocks where gcc/rustc leave the naive nest. The historical parallel path recorded **91–104% of
+  oneMKL-all across 512³–2048³** same-run; this is not current parity or a current win
+  (see [evidence scope](#cpu-parallel-gemm-evidence-scope)).
   This is a reversal of the previous honest loss (single-core matmul used to be ~3×
   *behind*). The dispatch also fires on **runtime dimensions**, so the win applies to general matmul
   functions, not only fixed-size kernels.
@@ -3200,8 +3230,8 @@ proves the full-scale native run executes the pipeline correctly. Reproduce (rep
   **~1.55× faster** than the hand-written direct-convolution nest in C, and **1.12× slower** than the
   same nest at `-ffast-math` — the matmul recognizer accelerates conv for free, but only modestly.
   *(Corrected 2026-08-04: the published ~6–7× was measured against a peer with no `restrict`, which
-  forced gcc to reload the accumulation operands on every output pixel; adding it took the C peer
-  from 4.9 to 21.1 GFLOP/s.)*
+  forced gcc to reload the accumulation operands on every output pixel; adding it gave the C peer
+  a recorded 4.3× speedup.)*
 - **Reductions:** ~2.6–2.9× faster (lane-accumulator reassociation), incl. `fmax`/`fmin` (softmax's
   row-max). IEEE-serial C baseline; see the `C(fast)` column for the reassociation-normalized
   comparison.

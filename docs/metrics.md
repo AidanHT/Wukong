@@ -115,12 +115,16 @@ Current standing (recorded):
   Multicore is **size-keyed 2D block-parallel** with **per-BLOCK packing** (each worker's
   "redundant" packing warms its own L2 — it beat the shared-cooperative-pack design in every ABBA
   ordering, the session's headline refutation) and **dynamic block-claiming the 2026-07-11 default**
-  (halved the mid-size straggler variance). Standing vs MKL-all, same-run: **512³ ~98–99%, 1024³
+  (halved the mid-size straggler variance). **Historical July ratios vs MKL-all**, same-run: **512³ ~98–99%, 1024³
   ~104%, 2048³ 91%, 4096³ 93%, 256³ ~94–110%** (the dynamic-claiming default closed the old
   70–83% mid-size gap; against MKL's power-degraded rounds the ratios read far higher — threaded MKL
   itself swings ~1.4–2× with power state, so only same-run ranges are quoted). Skinny transformer
-  NT shapes **75–112% of MKL-all** (4/6 at or above parity; worst 128×768·768ᵀ 75–80%,
-  overhead-bound at 151 MFLOP). int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
+  NT shapes **75–112% of MKL-all** (4/6 at or above parity in those historical rounds; worst 128×768·768ᵀ 75–80%,
+  overhead-bound at 151 MFLOP). **These older observations do not establish current parity or a
+  current win.** Finding 01 withdrew a different set of twelve September campaign observations;
+  see the [individual ledger mapping and scope](../BENCHMARKS.md#cpu-parallel-gemm-evidence-scope).
+  All twelve remain withdrawn, with parity unestablished. The MKL-1c ratios above are outside
+  that withdrawal. int8 GEMM (VNNI) 1.5–2.5× gcc's own `vpdpbusd` auto-vec.
 - *Compute-bound, GPU (H100 80GB HBM3, `sm_90a`, 2026-08-11 — **iteration-grade**: container round,
   clocks unlockable, plan §6.3)*: the `wgmma` + TMA GEMM measures
   **95.3% / 88.6% / 92.3% of cuBLAS f16 (f32 out) at 2048³ / 4096³ / 8192³**, **97.3%** on the GPT
@@ -323,7 +327,8 @@ campaign's comparison rules before it can support a performance claim.
 Closed in the 2026-07-09/10 round (see M1/M2 for the numbers and
 `prompts/results/perf-sota-session3.md` for the full ledger): the large-GEMM single-core
 tail (C-tile prefetch, 2048³ now at/above MKL-1c parity, see M1), the 256³ deliberate-serial standing
-(now engaged at ~94–110% of MKL-all under the dynamic-claiming default), the serving goodput ceiling
+(historically engaged at ~94–110% of MKL-all under the dynamic-claiming default;
+[current parity unestablished](../BENCHMARKS.md#cpu-parallel-gemm-evidence-scope)), the serving goodput ceiling
 (Bcap=256, 85.6× + honest static peer), the S=128 model regime (1.5–1.9× behind eager at campaign
 start → now 1.07–1.43× AHEAD of *compiled* torch, see M2), and the honest-instrument holes (f32-out cuBLAS peer column; exp/log/model ranges
 re-based on multi-state measurement). Measured-and-bounded
@@ -335,13 +340,14 @@ measurement the same day put exp and log at a **TIE** with VML's `VML_LA` core r
 it, so the gap is *smaller and now measured*, not closed (see M1).
 Remaining, ranked:
 
-1. Multicore parallel-GEMM grain — the head-loop region + dynamic block-claiming landed (model
-   @parallel now beats all-threads *compiled* torch at both S=128 and S=512; scaling 4.44–4.70× on
-   16 cores). Dynamic claiming closed most of the old mid-size MKL-all gap (512³/1024³ now
-   ~98–104%, was 70–83%); the residual is the smallest overhead-bound skinny shape (128×768·768ᵀ
-   75–80%) and a clean verified-AC full-cube table (the 2026-07-11 attempt hit battery mid-run).
-   Shared-pack, mid-pool, persistent-region, and fork-join alternatives are all measured/refuted
-   in gemm.rs — a genuinely new decomposition idea is required for further mid-size gain.
+1. **Re-establish the multicore parallel-GEMM comparison before ranking a kernel gap.**
+   The historical head-loop/dynamic-claiming results recorded model scaling of 4.44–4.70× on
+   16 cores, MKL-all ratios of ~98–104% at 512³/1024³ (previously 70–83%), and 75–80% on the
+   smallest skinny shape (128×768·768ᵀ). These July results do not establish a current bottleneck.
+   The twelve September campaign comparisons are **WITHDRAWN; parity unestablished**; the
+   [individual ledger mapping](../BENCHMARKS.md#cpu-parallel-gemm-evidence-scope) distinguishes
+   them from those older observations. A controlled fresh comparison is pending. No current
+   parity, win, or optimization priority is inferred from withdrawal.
 2. **The H100 GEMM epilogue and wave overhead** — the measured Hopper gap, and the only one whose
    location is *partly* isolated. **Scope the diagnostic to where it ran:** the store-elided arm
    exists at exactly three shapes — sq2048 / sq4096 / sq8192, at 114.0 / 101.1 / 101.8% of cuBLAS —
