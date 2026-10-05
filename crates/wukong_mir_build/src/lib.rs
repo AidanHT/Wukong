@@ -2209,6 +2209,17 @@ fn parallel_spec<'a>(
     interner: &Interner,
     gemm: GemmSyms,
 ) -> Option<(Symbol, &'a Expr, &'a Block)> {
+    // A nested GEMM epilogue can reread output as its per-column bias. Reject
+    // chunking before the outlined worker hides the enclosing source order.
+    if (GemmBiasAlias {
+        sema,
+        interner,
+        alias_free: gemm.alias_free,
+    })
+    .block(body)
+    {
+        return None;
+    }
     // Captures are exactly the parameters, so they must all be arrays (passed by pointer).
     let param_tys: Vec<Ty> = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
         Some(DefKind::Fn(sig)) => sig.params.clone(),
@@ -5016,6 +5027,30 @@ impl FnLowerer<'_> {
         while i < b.stmts.len() {
             if self.terminated {
                 break;
+            }
+            // Keep both consumed statements in source order when the epilogue
+            // rereads output as bias, even with recognition disabled. Declining
+            // fusion alone would still allow an inner loop to be outlined.
+            if (GemmBiasAlias {
+                sema: self.sema,
+                interner: self.interner,
+                alias_free: self.gemm.alias_free,
+            })
+            .window(&b.stmts[i..])
+            {
+                let (parallel, recognize) = (self.parallel_fn, self.gemm.recognize);
+                self.parallel_fn = false;
+                self.gemm.recognize = false;
+                for stmt in &b.stmts[i..i + 2] {
+                    if self.terminated {
+                        break;
+                    }
+                    self.lower_stmt(stmt);
+                }
+                self.parallel_fn = parallel;
+                self.gemm.recognize = recognize;
+                i += 2;
+                continue;
             }
             // ---- Statement-WINDOW kernel recognizers ---------------------------------------
             //
@@ -9754,6 +9789,13 @@ impl FnLowerer<'_> {
     /// then lowers computes `bias + s` / `alpha·s` correctly, so declining is always safe; the α and
     /// bias declines happen after a few dim/GEP instructions have been built, which are simply dead.
     fn emit_sgemm(&mut self, nest: &MatmulNest<'_>, parallel: bool) -> bool {
+        if nest
+            .bias
+            .as_ref()
+            .is_some_and(|(bias, _)| !self.provably_disjoint(nest.c, *bias))
+        {
+            return false;
+        }
         // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
         // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
         // nest). Declining lowers the loop as written, which is what the program means.
@@ -10641,6 +10683,9 @@ impl FnLowerer<'_> {
         bias: Option<Symbol>,
         act: u32,
     ) -> bool {
+        if bias.is_some_and(|bias| !self.provably_disjoint(nest.c, bias)) {
+            return false;
+        }
         // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
         // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
         // nest). Declining lowers the loop as written, which is what the program means.
@@ -10787,6 +10832,9 @@ impl FnLowerer<'_> {
     /// Linear+epilogue. Bails (false) if any operand/dim is somehow unbound at the call site, so the
     /// caller falls back to lowering the matmul and the epilogue loop separately.
     fn emit_sgemm_epi(&mut self, nest: &MatmulNest<'_>, bias: Option<Symbol>, act: u32) -> bool {
+        if bias.is_some_and(|bias| !self.provably_disjoint(nest.c, bias)) {
+            return false;
+        }
         // This emitter reads neither `nest.alpha` nor `nest.bias` (the kernel has no α parameter, and
         // the `bias` argument comes from the *epilogue* loop), and `wukong_sgemm_nt_epi` reads A
         // row-major — so it cannot honour a peeled scale, a peeled store bias, or a transposed A, and
@@ -11080,6 +11128,9 @@ impl FnLowerer<'_> {
         bias: Option<Symbol>,
         act: u32,
     ) -> bool {
+        if bias.is_some_and(|bias| !self.provably_disjoint(out, bias)) {
+            return false;
+        }
         // The kernel writes `C` in tiled order while `A`/`B` are still being read, so it equals the
         // nest only when `C` is disjoint from both. `A` and `B` may be one buffer (`A·Aᵀ` is a real
         // nest). Declining lowers the loop as written, which is what the program means.
@@ -12585,6 +12636,22 @@ impl FnLowerer<'_> {
         body: &Block,
         stmt_attrs: &[ast::Attr],
     ) {
+        if (self.parallel_fn || self.gemm.recognize)
+            && (GemmBiasAlias {
+                sema: self.sema,
+                interner: self.interner,
+                alias_free: self.gemm.alias_free,
+            })
+            .loop_or_body(pat, iter, body)
+        {
+            let (parallel, recognize) = (self.parallel_fn, self.gemm.recognize);
+            self.parallel_fn = false;
+            self.gemm.recognize = false;
+            self.lower_for(label, pat, iter, body, stmt_attrs);
+            self.parallel_fn = parallel;
+            self.gemm.recognize = recognize;
+            return;
+        }
         // An alias-uncertain bias nest must remain ordered all the way through
         // its inner loop: declining the outer kernel alone still lets the
         // region outliner parallelize columns with potentially shifted aliases.
@@ -24538,6 +24605,138 @@ fn recognize_matmul<'a>(
     match_matmul(pat, iter, body, sema, interner)
         .or_else(|| match_matmul_ijk(pat, iter, body, sema, interner))
         .or_else(|| match_matmul_ijk_memacc(pat, iter, body, sema, interner))
+}
+
+/// Source-only preflight for a recognized GEMM whose bias can overlap its output.
+/// Visit enclosing blocks too: outlining a batch first would hide the dependency
+/// from the inner loop's decline. This is not a general alias/dependence analysis.
+struct GemmBiasAlias<'a> {
+    sema: &'a SemaResult,
+    interner: &'a Interner,
+    alias_free: bool,
+}
+
+impl GemmBiasAlias<'_> {
+    fn overlaps(&self, out: Symbol, bias: Option<Symbol>) -> bool {
+        bias.is_some_and(|bias| out == bias || !self.alias_free)
+    }
+
+    fn loop_or_body(&self, pat: &Pattern, iter: &ForIter, body: &Block) -> bool {
+        recognize_matmul(pat, iter, body, self.sema, self.interner)
+            .is_some_and(|nest| self.overlaps(nest.c, nest.bias.as_ref().map(|(base, _)| *base)))
+            || match_matmul_residual(pat, iter, body, self.sema, self.interner)
+                .is_some_and(|(nest, bias, _)| self.overlaps(nest.c, bias))
+            || self.block(body)
+    }
+
+    fn window(&self, stmts: &[Stmt]) -> bool {
+        if stmts.len() < 2 {
+            return false;
+        }
+        let StmtKind::For {
+            pat, iter, body, ..
+        } = &stmts[0].kind
+        else {
+            return false;
+        };
+        // Match only the GEMM + epilogue dependency; no MIR or scope state is
+        // changed. Being conservative about other fusion eligibility is safe:
+        // these two source loops still require ordered bias reads.
+        let shape = recognize_matmul(pat, iter, body, self.sema, self.interner)
+            .map(|n| (n.m, n.n, n.c))
+            .or_else(|| {
+                match_matmul_lowp(pat, iter, body, self.sema, self.interner)
+                    .map(|n| (n.m, n.n, n.c))
+            });
+        if let Some((m, n, c)) = shape {
+            if match_bias_act_epilogue(&stmts[1], m, n, c, self.interner, self.sema)
+                .is_some_and(|(bias, _)| self.overlaps(c, bias))
+            {
+                return true;
+            }
+        }
+        match_matmul_i8_nt(pat, iter, body, self.sema, self.interner)
+            .and_then(|nest| match_i8_dequant_epilogue(&stmts[1], &nest, self.sema, self.interner))
+            .is_some_and(|(out, _, _, bias, _)| self.overlaps(out, bias))
+    }
+
+    fn block(&self, block: &Block) -> bool {
+        block.stmts.windows(2).any(|s| self.window(s))
+            || block.stmts.iter().any(|s| self.stmt(s))
+            || block.tail.as_ref().is_some_and(|e| self.expr(e))
+    }
+
+    fn stmt(&self, stmt: &Stmt) -> bool {
+        match &stmt.kind {
+            StmtKind::For {
+                pat, iter, body, ..
+            } => {
+                let bounds = match iter {
+                    ForIter::Range {
+                        start, end, step, ..
+                    } => {
+                        self.expr(start)
+                            || end.as_ref().is_some_and(|e| self.expr(e))
+                            || step.as_ref().is_some_and(|e| self.expr(e))
+                    }
+                    ForIter::Expr(e) => self.expr(e),
+                };
+                bounds || self.loop_or_body(pat, iter, body)
+            }
+            StmtKind::While { cond, body, .. } => self.expr(cond) || self.block(body),
+            StmtKind::Let { init, .. } => init.as_ref().is_some_and(|e| self.expr(e)),
+            StmtKind::Assign { target, value, .. } => self.expr(target) || self.expr(value),
+            StmtKind::Expr(e) | StmtKind::Defer(e) => self.expr(e),
+            StmtKind::Return(e) | StmtKind::Break(_, e) => e.as_ref().is_some_and(|e| self.expr(e)),
+            StmtKind::Continue(_) => false,
+        }
+    }
+
+    fn expr(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Path(_)
+            | ExprKind::SizeOf(_)
+            | ExprKind::AlignOf(_) => false,
+            ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => self.expr(expr),
+            ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => self.expr(base),
+            ExprKind::Binary { lhs, rhs, .. } => self.expr(lhs) || self.expr(rhs),
+            ExprKind::Call { callee, args, .. } => {
+                self.expr(callee) || args.iter().any(|e| self.expr(e))
+            }
+            ExprKind::Index { base, indices } => {
+                self.expr(base) || indices.iter().any(|e| self.expr(e))
+            }
+            ExprKind::StructLit { fields, rest, .. } => {
+                fields.iter().any(|f| self.expr(&f.value))
+                    || rest.as_ref().is_some_and(|e| self.expr(e))
+            }
+            ExprKind::ArrayLit(items) | ExprKind::TupleLit(items) => {
+                items.iter().any(|e| self.expr(e))
+            }
+            ExprKind::ArrayRepeat { value, count } => self.expr(value) || self.expr(count),
+            ExprKind::Block(b) | ExprKind::Loop { body: b, .. } => self.block(b),
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.expr(cond)
+                    || self.block(then_branch)
+                    || else_branch.as_ref().is_some_and(|e| self.expr(e))
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.expr(scrutinee)
+                    || arms.iter().any(|arm| {
+                        arm.guard.as_ref().is_some_and(|e| self.expr(e)) || self.expr(&arm.body)
+                    })
+            }
+        }
+    }
 }
 
 // Fused-epilogue activation codes — must match `wukong_runtime`'s gemm kernel
