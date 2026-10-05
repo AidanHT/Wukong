@@ -731,13 +731,13 @@ mod tests {
         kernel(ptrs.as_ptr(), guarded_scalars.as_mut_ptr(), n as u64);
 
         for s in 0..k.streams as usize {
-            for i in 0..vlen {
+            for (i, expected) in refs[s][..vlen].iter().enumerate() {
                 assert_eq!(
                     got[s].payload()[i].to_bits(),
-                    refs[s][i].to_bits(),
+                    expected.to_bits(),
                     "kernel vs eval_lane mismatch: stream {s} lane {i} (got {}, want {})",
                     got[s].payload()[i],
-                    refs[s][i]
+                    expected
                 );
             }
             got[s].assert_matches(&refs[s], &format!("stream {s}, n={n}"));
