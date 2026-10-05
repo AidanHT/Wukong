@@ -10,8 +10,8 @@
 //!  1. **256-bit width.** Cranelift's generic vectorizer is stuck at 128-bit SSE (`f32x8` does not
 //!     legalize), so a Wukong saxpy ran ~15% *behind* gcc's 256-bit AVX2. This kernel restores the
 //!     width parity, the same play as `vmath`/`gemm`.
-//!  2. **Non-temporal (streaming) stores.** Once the working set spills L3 (≥ [`NT_MIN_BYTES`] across
-//!     all live arrays) the store goes out `vmovntps`, which skips the **read-for-ownership** every
+//!  2. **Non-temporal (streaming) stores.** Once total traffic reaches the shared
+//!     [`crate::nt_policy::nt_min_bytes`] threshold, `vmovntps` skips the **read-for-ownership** every
 //!     cacheable store pays (the CPU must pull the target line into cache before overwriting it).
 //!     gcc/rustc cannot emit this automatically — they can't prove the array is large and write-once —
 //!     but Wukong's domain-aware lowering *knows* the loop streams a whole tensor. The threshold is on
@@ -93,22 +93,12 @@ pub(crate) fn check_nt_output<T: Copy + PartialEq + std::fmt::Debug>(
     assert!(out[offset + n..].iter().all(|v| *v == sentinel));
 }
 
-/// Total streamed bytes (all live arrays) at/above which the store goes non-temporal. Non-temporal
-/// stores pay off only once the working set spills L3: below it a normal cacheable store keeps the
-/// output hot — C/Rust win there, and a per-core `@parallel` chunk may be re-read — while above it
-/// `vmovntps` streams the array out once and skips the read-for-ownership traffic the cacheable store
-/// pays. The crossover is the **total** bytes touched, not the element count: a 2-stream map
-/// (`x → out`) at 1<<20 is 8 MiB and fits L3, but a 3-stream map (`x, y → out`) at the *same* length
-/// is 12 MiB and spills it — so the two want opposite store policies at one length (measured: relu
-/// regressed under non-temporal stores at 1<<20 where saxpy gained). ~10 MiB ≈ this machine's L3.
-const NT_MIN_BYTES: usize = 10 * 1024 * 1024;
-
 /// Whether a kernel touching `streams` arrays of `n` f32 each should use non-temporal stores — true
-/// once the working set spills L3 (see [`NT_MIN_BYTES`]). `streams` counts every live array (the
+/// once the traffic reaches [`crate::nt_policy::nt_min_bytes`]. `streams` counts every live array (the
 /// output plus each input read), since they all compete for cache residency.
 #[inline]
 fn use_nt(n: usize, streams: usize) -> bool {
-    streams.saturating_mul(n).saturating_mul(4) >= NT_MIN_BYTES
+    streams.saturating_mul(n).saturating_mul(4) >= crate::nt_policy::nt_min_bytes()
 }
 
 /// The number of live f32 streams a call touches — the output and `x`, plus `y` when the op reads it
@@ -762,7 +752,7 @@ mod tests {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             return;
         }
-        let n = NT_MIN_BYTES / 8 + 35;
+        let n = crate::nt_policy::test_min_bytes() / 8 + 35;
         let x = vec![2.0; n];
         assert!(use_nt(n, 2));
         check_nt_output(n, -99.0, 3.0, |out| unsafe {
@@ -778,7 +768,8 @@ mod tests {
     /// not a multiple of 8 (and that crosses the NT alignment prologue) produces a consistent result.
     #[test]
     fn velem_tail_matches_lanes() {
-        let n = 1_500_003usize; // 2-stream case is 12 MiB > NT_MIN_BYTES: forces NT, a tail, a prologue
+        let n = crate::nt_policy::test_len(8, 1_500_003);
+        assert!(use_nt(n, 2));
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 19.0) - 7.0).collect();
         let y: Vec<f32> = (0..n).map(|i| (i as f32 % 11.0) * 0.5 - 2.0).collect();
         let cases: &[(i64, f32, f32, f32)] = &[
@@ -853,7 +844,8 @@ mod tests {
     /// boundary and a misaligned tail, for several degrees (incl. the degenerate constant `ncoeff=1`).
     #[test]
     fn vhorner_tail_matches_lanes() {
-        let n = 1_500_005usize; // 12 MiB (2 streams) > NT_MIN_BYTES: forces NT, prologue, mult-of-8 tail
+        let n = crate::nt_policy::test_len(8, 1_500_005);
+        assert!(use_nt(n, 2));
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 23.0) * 0.1 - 1.1).collect();
         for coeffs in [
             vec![3.0f32],                          // constant
@@ -911,7 +903,8 @@ mod tests {
     /// but that is not the point being pinned here). Crosses the NT boundary + a non-mult-of-8 tail.
     #[test]
     fn velem_div_matches_lanes() {
-        let n = 1_500_001usize; // 3-stream (x,y,out) = 18 MiB > NT_MIN_BYTES: NT + prologue + tail
+        let n = crate::nt_policy::test_len(12, 1_500_001);
+        assert!(use_nt(n, 3));
         let x: Vec<f32> = (0..n).map(|i| (i as f32 % 17.0) - 8.0).collect();
         let y: Vec<f32> = (0..n).map(|i| (i as f32 % 13.0) + 1.5).collect(); // 1.5..=13.5, never 0
         let mut got = vec![0.0f32; n];
@@ -955,12 +948,19 @@ mod tests {
             (VE_RELU | VE_HADAMARD, 1.0, 1.0, 0.0), // relu(x*y)
             (VE_DIV, 1.0, 1.0, 0.0),                // quotient x/y
         ];
-        // Sizes: below the ~256 Ki gate (serial fallback), then above it — 300 003 is past the gate
-        // but under NT for both stream counts; 900 001 crosses NT for 3-stream ops (10.8 MiB) but not
-        // 2-stream (7.2 MiB); 1 500 001 crosses NT for both. Odd sizes force ragged tails and partial
-        // final chunks; the divisor never hits 0 (y is kept ≥ 1.5).
+        // Sizes cross the parallel gate and retain the default NT split: 900_001 streams
+        // with three arrays but not two at 10 MiB. The final span grows with the NT policy
+        // so both stream counts cross it. Odd sizes retain ragged tails and partial chunks;
+        // the divisor never hits zero (y is kept >= 1.5).
         for &n in &[
-            1_000usize, 8_195, 65_537, 262_144, 262_151, 300_003, 900_001, 1_500_001,
+            1_000usize,
+            8_195,
+            65_537,
+            262_144,
+            262_151,
+            300_003,
+            900_001,
+            crate::nt_policy::test_len(8, 1_500_001),
         ] {
             let x: Vec<f32> = (0..n).map(|i| (i as f32 % 19.0) - 7.0).collect();
             let y: Vec<f32> = (0..n).map(|i| (i as f32 % 13.0) + 1.5).collect(); // 1.5..=14.5

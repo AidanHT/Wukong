@@ -147,15 +147,10 @@ unsafe fn bias_avx2(
     }
 }
 
-/// Total streamed bytes (the `x` read + the `out` write; `b` is cache-resident and negligible) at/above
-/// which the store goes non-temporal — once the working set spills L3, `vmovntps` skips the
-/// read-for-ownership traffic a cacheable store pays. Keys on the **total** bytes touched, not the
-/// element count (the streaming-kernel rule). ~10 MiB ≈ this machine's L3; 2 streams (x, out) of f32.
-const NT_MIN_BYTES: usize = 10 * 1024 * 1024;
-
+/// The x read and output write total eight bytes per element; bias is cache-resident.
 #[inline]
 fn use_nt(n: usize) -> bool {
-    n.saturating_mul(2).saturating_mul(4) >= NT_MIN_BYTES
+    n.saturating_mul(2).saturating_mul(4) >= crate::nt_policy::nt_min_bytes()
 }
 
 /// `out[i*cols + j] = act(x[i*cols + j] + b[j])` for `i in 0..rows`, `j in 0..cols` — the broadcast-bias
@@ -264,7 +259,7 @@ mod tests {
             return;
         }
         let cols = 101usize;
-        let rows = NT_MIN_BYTES / (8 * cols) + 1;
+        let rows = (crate::nt_policy::test_min_bytes() / (8 * cols) + 1).max(8);
         let n = rows * cols;
         assert!(use_nt(n));
         let x = vec![2.0; n];
@@ -337,9 +332,8 @@ mod tests {
     /// this test fault, which it did not before the last shape was added).
     #[test]
     fn bias_scalar_matches_avx() {
-        // The last shape is the only one that crosses `NT_MIN_BYTES`: `use_nt` needs
-        // rows*cols >= 1_310_720 elements, so (700, 1500) = 1_050_000 (8.0 MiB of traffic) still
-        // takes the cacheable-store path and (1400, 1501) = 2_101_400 (16.0 MiB) takes the NT one.
+        // The final shape preserves its original minimum and grows with the shared NT
+        // policy. Smaller fixed shapes retain their numerical coverage under any override.
         // 1501 is not a multiple of 8 (forcing the scalar tail) and the row stride 1501*4 = 6004
         // bytes is not a multiple of 32, so successive rows start at different mod-32 offsets and
         // the `vmovntps` alignment prologue peels a different amount on each row.
@@ -349,7 +343,10 @@ mod tests {
             (4, 13),
             (2, 64),
             (700, 1500),
-            (1400, 1501),
+            (
+                crate::nt_policy::test_len(8, 1400 * 1501).div_ceil(1501),
+                1501,
+            ),
         ] {
             let n = rows * cols;
             let x: Vec<f32> = (0..n).map(|i| (i as f32 % 37.0) * 0.1 - 1.8).collect();

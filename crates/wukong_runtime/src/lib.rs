@@ -21,6 +21,7 @@
 
 mod attention;
 mod gemm;
+mod nt_policy;
 pub use attention::wukong_attention_f32;
 pub use gemm::{
     wukong_sgemm, wukong_sgemm_bf16_nt, wukong_sgemm_bf16_nt_epi,
