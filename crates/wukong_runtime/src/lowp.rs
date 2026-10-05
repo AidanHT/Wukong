@@ -1164,11 +1164,14 @@ macro_rules! stream_narrow {
                 pf(i);
                 let p0 = $pack(op8(i), op8(i + 8));
                 let p1 = $pack(op8(i + 16), op8(i + 24));
+                crate::velem::assert_nt_aligned(outp.add(i) as *mut __m256i);
                 _mm256_stream_si256(outp.add(i) as *mut __m256i, p0);
+                crate::velem::assert_nt_aligned(outp.add(i + 16) as *mut __m256i);
                 _mm256_stream_si256(outp.add(i + 16) as *mut __m256i, p1);
                 i += 32;
             }
             while i + 16 <= n {
+                crate::velem::assert_nt_aligned(outp.add(i) as *mut __m256i);
                 _mm256_stream_si256(outp.add(i) as *mut __m256i, $pack(op8(i), op8(i + 8)));
                 i += 16;
             }
@@ -1436,6 +1439,32 @@ mod tests {
     #![allow(clippy::assertions_on_constants)]
 
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nt_alignment_narrow_peel() {
+        if !(is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c"))
+        {
+            return;
+        }
+        let n = HALFOUT_NT_MIN_BYTES / 6 + 35;
+        assert!(use_nt_halfout(n));
+        for (kernel, value) in [
+            (
+                wukong_axpby_bf16_out
+                    as unsafe extern "C" fn(*const u16, *const u16, *mut u16, i64, f32, f32),
+                bf16_bits(2.0),
+            ),
+            (wukong_axpby_f16_out, f16_bits(2.0)),
+        ] {
+            let x = vec![value; n];
+            crate::velem::check_nt_output(n, 0xdead, value, |out| unsafe {
+                kernel(x.as_ptr(), x.as_ptr(), out, n as i64, 0.5, 0.5);
+            });
+        }
+    }
 
     fn bf16_bits(x: f32) -> u16 {
         crate::f32_to_bf16_bits(x)
