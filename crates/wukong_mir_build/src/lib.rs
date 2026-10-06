@@ -12847,7 +12847,9 @@ impl FnLowerer<'_> {
             // (the `_parallel` one in a `@parallel` fn). The strided column-outer (value,index) scan gcc/rustc
             // keep scalar; the kernel streams row-major tracking 8 column lanes via blend.
             if let Some(nest) = match_colarg(pat, iter, body, self.sema, self.interner) {
-                if self.emit_colarg(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.rows, (label, pat, iter, body), |me| {
+                    me.emit_colarg(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12879,14 +12881,18 @@ impl FnLowerer<'_> {
             // → `wukong_xent_fwd_f32` (the `_parallel` one in a `@parallel` function). The expf/logf
             // reduction gcc keeps scalar; the kernel folds it 8-wide and gathers the target logit.
             if let Some(nest) = self.match_xent(pat, iter, body) {
-                if self.emit_xent(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.cols, (label, pat, iter, body), |me| {
+                    me.emit_xent(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
             // Batched cross-entropy backward `for r { softmax(x) into dx; dx[target[r]] -= 1 }`
             // → `wukong_xent_bwd_f32` (the `_parallel` one in a `@parallel` function).
             if let Some(nest) = self.match_xent_bwd(pat, iter, body) {
-                if self.emit_xent_bwd(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.cols, (label, pat, iter, body), |me| {
+                    me.emit_xent_bwd(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12903,7 +12909,9 @@ impl FnLowerer<'_> {
             // A batched log-sum-exp `for r { max; Σexp; out[r] = m + log(s) }` → `wukong_logsumexp_f32`
             // (the `_parallel` one in a `@parallel` function). The expf reduction gcc keeps scalar.
             if let Some(nest) = self.match_logsumexp(pat, iter, body) {
-                if self.emit_logsumexp(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.cols, (label, pat, iter, body), |me| {
+                    me.emit_logsumexp(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12911,17 +12919,23 @@ impl FnLowerer<'_> {
             // fused log/exp-bound kernels (the `_parallel` ones in a `@parallel` function). C keeps the
             // logf/expf reductions scalar.
             if let Some(nest) = self.match_kldiv(pat, iter, body) {
-                if self.emit_kldiv(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.cols, (label, pat, iter, body), |me| {
+                    me.emit_kldiv(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
             if let Some(nest) = self.match_entropy(pat, iter, body) {
-                if self.emit_entropy(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.cols, (label, pat, iter, body), |me| {
+                    me.emit_entropy(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
             if let Some(nest) = self.match_kd_loss(pat, iter, body) {
-                if self.emit_kd_loss(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.cols, (label, pat, iter, body), |me| {
+                    me.emit_kd_loss(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -12939,7 +12953,9 @@ impl FnLowerer<'_> {
             // `wukong_rowarg{max,min}_i32` (`_parallel` in a `@parallel` fn). The (value,index) bookkeeping
             // keeps gcc/rustc scalar; the AVX2 kernel tracks 8 lanes of (value,index) via blend.
             if let Some(nest) = self.match_rowarg(pat, iter, body) {
-                if self.emit_rowarg(&nest, self.parallel_fn) {
+                if self.emit_nonempty_reduction_loop(nest.cols, (label, pat, iter, body), |me| {
+                    me.emit_rowarg(&nest, me.parallel_fn)
+                }) {
                     return;
                 }
             }
@@ -27411,7 +27427,9 @@ fn match_pool2d(
     else {
         return None;
     };
-    if lsh <= 0 || lsw <= 0 || lkh > lh || lkw > lw {
+    // Empty windows still execute the source seed/finalizer and output store,
+    // while the runtime rejects nonpositive window dimensions as a no-op.
+    if lsh <= 0 || lsw <= 0 || lkh <= 0 || lkw <= 0 || lkh > lh || lkw > lw {
         return None;
     }
     if loh != (lh - lkh) / lsh + 1 || low != (lw - lkw) / lsw + 1 {
