@@ -128,6 +128,125 @@ fn kernel_buffer<T>(
     Ok(buffer)
 }
 
+/// Reconstruct read paths without infallible growth, retaining low-byte and lossy-UTF-8 semantics.
+fn file_read_path(memory: &[Value], base: usize) -> Result<String, String> {
+    let values = memory.get(base..).unwrap_or(&[]);
+    let len = values
+        .iter()
+        .position(|v| v.as_int() as u8 == 0)
+        .unwrap_or(values.len());
+    let bytes = kernel_buffer(
+        &values[..len],
+        "file-io read path",
+        |v| Ok(v.as_int() as u8),
+    )?;
+    let len = bytes.utf8_chunks().try_fold(0usize, |len, chunk| {
+        len.checked_add(chunk.valid().len())
+            .and_then(|len| len.checked_add(if chunk.invalid().is_empty() { 0 } else { 3 }))
+            .ok_or("file-io read: path extent overflow")
+    })?;
+    let mut path = String::new();
+    path.try_reserve_exact(len)
+        .map_err(|_| "file-io read: path allocation failed")?;
+    for chunk in bytes.utf8_chunks() {
+        path.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            path.push('\u{fffd}');
+        }
+    }
+    Ok(path)
+}
+
+/// Decode only after the complete actual destination is validated. A read error leaves the arena
+/// untouched; a short file is already clamped by the caller's metadata check. For malformed
+/// destinations, the range diagnostic now takes precedence over a simultaneous read failure.
+fn read_file_elements(
+    memory: &mut [Value],
+    reader: &mut impl std::io::Read,
+    data_base: usize,
+    n: usize,
+    elem: usize,
+    name: &str,
+) -> Result<Value, String> {
+    if n > 0 {
+        let end = data_base
+            .checked_add(n)
+            .ok_or("file-io read: data out of bounds")?;
+        memory
+            .get(data_base..end)
+            .ok_or("file-io read: data out of bounds")?;
+        let byte_len = n
+            .checked_mul(elem)
+            .ok_or("file-io read: byte extent overflow")?;
+        let mut bytes = kernel_scratch(byte_len, "file-io read")?;
+        bytes.resize(byte_len, 0u8);
+        if reader.read_exact(&mut bytes).is_err() {
+            return Ok(Value::Int(-2));
+        }
+        for k in 0..n {
+            let off = k * elem;
+            let slot = data_base + k;
+            if slot >= memory.len() {
+                return Err("file-io read: data out of bounds".into());
+            }
+            memory[slot] = match name {
+                "wukong_rt_read_f32" => {
+                    let x = f32::from_le_bytes([
+                        bytes[off],
+                        bytes[off + 1],
+                        bytes[off + 2],
+                        bytes[off + 3],
+                    ]);
+                    Value::Float(x as f64)
+                }
+                "wukong_rt_read_i32" => {
+                    let x = i32::from_le_bytes([
+                        bytes[off],
+                        bytes[off + 1],
+                        bytes[off + 2],
+                        bytes[off + 3],
+                    ]);
+                    Value::Int(x as i128)
+                }
+                "wukong_rt_read_i64" => {
+                    let x = i64::from_le_bytes([
+                        bytes[off],
+                        bytes[off + 1],
+                        bytes[off + 2],
+                        bytes[off + 3],
+                        bytes[off + 4],
+                        bytes[off + 5],
+                        bytes[off + 6],
+                        bytes[off + 7],
+                    ]);
+                    Value::Int(x as i128)
+                }
+                "wukong_rt_read_f64" => {
+                    let x = f64::from_le_bytes([
+                        bytes[off],
+                        bytes[off + 1],
+                        bytes[off + 2],
+                        bytes[off + 3],
+                        bytes[off + 4],
+                        bytes[off + 5],
+                        bytes[off + 6],
+                        bytes[off + 7],
+                    ]);
+                    Value::Float(x)
+                }
+                "wukong_rt_read_i8" => {
+                    // i8 is signed: reinterpret the byte's bit pattern then sign-extend.
+                    let x = bytes[off] as i8;
+                    Value::Int(x as i128)
+                }
+                // wukong_rt_read_u8
+                _ => Value::Int(bytes[off] as i128),
+            };
+        }
+    }
+    Ok(Value::Int(n as i128))
+}
+
 /// Pointers at or above this value encode a function index (`FUNC_TAG + idx`) rather than a memory
 /// address — how `Op::FuncAddr` is represented for `parallel_for` to call back. Real `alloca`
 /// memory never grows near it.
@@ -1576,23 +1695,12 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interp==native differential gate holds.
             "wukong_rt_read_f32" | "wukong_rt_read_i32" | "wukong_rt_read_i64"
             | "wukong_rt_read_u8" | "wukong_rt_read_f64" | "wukong_rt_read_i8" => {
-                use std::io::Read;
                 // `path` is a NUL-terminated `*u8`: walk `memory` collecting low bytes until NUL.
                 let path_base = match args.first().copied() {
                     Some(Value::Ptr(base)) => base,
                     _ => return Err("file-io read: path is not a pointer".into()),
                 };
-                let mut path_bytes = Vec::new();
-                let mut i = path_base;
-                while i < self.memory.len() {
-                    let b = self.memory[i].as_int() as u8;
-                    if b == 0 {
-                        break;
-                    }
-                    path_bytes.push(b);
-                    i += 1;
-                }
-                let path = String::from_utf8_lossy(&path_bytes).into_owned();
+                let path = file_read_path(&self.memory, path_base)?;
                 let data_base = match args.get(1).copied() {
                     Some(Value::Ptr(base)) => base,
                     _ => return Err("file-io read: data is not a pointer".into()),
@@ -1614,74 +1722,9 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let avail = file_len / elem as i128;
                 // n = min(len, avail), clamped to >= 0 (guards a non-positive len — 0 => read nothing).
                 let n = len.min(avail);
-                let n = if n < 0 { 0 } else { n as usize };
-                if n > 0 {
-                    let mut bytes = vec![0u8; n * elem];
-                    if file.read_exact(&mut bytes).is_err() {
-                        return Ok(Value::Int(-2));
-                    }
-                    for k in 0..n {
-                        let off = k * elem;
-                        let slot = data_base + k;
-                        if slot >= self.memory.len() {
-                            return Err("file-io read: data out of bounds".into());
-                        }
-                        self.memory[slot] = match name {
-                            "wukong_rt_read_f32" => {
-                                let x = f32::from_le_bytes([
-                                    bytes[off],
-                                    bytes[off + 1],
-                                    bytes[off + 2],
-                                    bytes[off + 3],
-                                ]);
-                                Value::Float(x as f64)
-                            }
-                            "wukong_rt_read_i32" => {
-                                let x = i32::from_le_bytes([
-                                    bytes[off],
-                                    bytes[off + 1],
-                                    bytes[off + 2],
-                                    bytes[off + 3],
-                                ]);
-                                Value::Int(x as i128)
-                            }
-                            "wukong_rt_read_i64" => {
-                                let x = i64::from_le_bytes([
-                                    bytes[off],
-                                    bytes[off + 1],
-                                    bytes[off + 2],
-                                    bytes[off + 3],
-                                    bytes[off + 4],
-                                    bytes[off + 5],
-                                    bytes[off + 6],
-                                    bytes[off + 7],
-                                ]);
-                                Value::Int(x as i128)
-                            }
-                            "wukong_rt_read_f64" => {
-                                let x = f64::from_le_bytes([
-                                    bytes[off],
-                                    bytes[off + 1],
-                                    bytes[off + 2],
-                                    bytes[off + 3],
-                                    bytes[off + 4],
-                                    bytes[off + 5],
-                                    bytes[off + 6],
-                                    bytes[off + 7],
-                                ]);
-                                Value::Float(x)
-                            }
-                            "wukong_rt_read_i8" => {
-                                // i8 is signed: reinterpret the byte's bit pattern then sign-extend.
-                                let x = bytes[off] as i8;
-                                Value::Int(x as i128)
-                            }
-                            // wukong_rt_read_u8
-                            _ => Value::Int(bytes[off] as i128),
-                        };
-                    }
-                }
-                Ok(Value::Int(n as i128))
+                let n = usize::try_from(n.max(0))
+                    .map_err(|_| "file-io read: element extent overflow")?;
+                read_file_elements(&mut self.memory, &mut file, data_base, n, elem, name)
             }
             // `wukong_rt_write_{f32,i32,i64,u8,f64,i8}(path: *u8, data: *T, len: i64) -> i64` — the write
             // half of the file-I/O family. Reconstruct the NUL-terminated `path` (as `print_str`),
@@ -2530,17 +2573,10 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let dst = ptr(args[1])?;
                 let rows = dim!(args[2]);
                 let cols = dim!(args[3]);
-                let n = rows * cols;
-                let mut sbuf = Vec::with_capacity(n);
-                for t in 0..n {
-                    sbuf.push(
-                        self.memory
-                            .get(src + t)
-                            .ok_or("transpose operand out of bounds")?
-                            .kernel_float(name)? as f32,
-                    );
-                }
-                let mut dbuf = vec![0.0f32; n];
+                let input = kernel_values(&self.memory, src, rows, cols, name)?;
+                let output = kernel_values(&self.memory, dst, rows, cols, name)?;
+                let sbuf = kernel_buffer(input, name, |v| Ok(v.kernel_float(name)? as f32))?;
+                let mut dbuf = kernel_buffer(output, name, |_| Ok(0.0f32))?;
                 // SAFETY: sbuf is rows*cols, dbuf is cols*rows = rows*cols f32 — the kernel's contract.
                 unsafe {
                     wukong_runtime::wukong_transpose_f32(
@@ -2662,15 +2698,12 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let dst = ptr(args[1])?;
                 let rows = dim!(args[2]);
                 let cols = dim!(args[3]);
-                let mut buf = Vec::with_capacity(rows * cols);
-                for t in 0..rows * cols {
-                    let value = *self
-                        .memory
-                        .get(src + t)
-                        .ok_or("transpose operand out of bounds")?;
+                let input = kernel_values(&self.memory, src, rows, cols, name)?;
+                kernel_values(&self.memory, dst, rows, cols, name)?;
+                let buf = kernel_buffer(input, name, |value| {
                     value.kernel_float(name)?;
-                    buf.push(value);
-                }
+                    Ok(value)
+                })?;
                 for i in 0..rows {
                     for j in 0..cols {
                         *self
@@ -4375,19 +4408,33 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let t = dim!(args[3]);
                 let h = dim!(args[4]);
                 let v = args[5].as_int().max(0) as usize;
+                // Prove IDs/output addresses before writes, but never snapshot either input:
+                // an earlier output can change a later ID or weight in the live gather contract.
+                // Each selected row is bounds-checked before its first lane; earlier rows remain
+                // written on a later bounds error. Type errors retain earlier lanes too.
+                kernel_values(&self.memory, ids, 1, t, name)?;
+                kernel_values(&self.memory, out, t, h, name)?;
                 for r in 0..t {
                     let id = self
                         .memory
                         .get(ids + r)
                         .ok_or("embedding ids out of bounds")?
                         .as_int();
+                    let row = if id >= 0 && (id as usize) < v {
+                        let offset = (id as usize)
+                            .checked_mul(h)
+                            .ok_or("embedding weight extent overflow")?;
+                        let base = weight
+                            .checked_add(offset)
+                            .ok_or("embedding weight out of bounds")?;
+                        kernel_values(&self.memory, base, 1, h, "embedding weight")?;
+                        Some(base)
+                    } else {
+                        None
+                    };
                     for d in 0..h {
-                        let val = if id >= 0 && (id as usize) < v {
-                            let src = weight + id as usize * h + d;
-                            *self
-                                .memory
-                                .get(src)
-                                .ok_or("embedding weight out of bounds")?
+                        let val = if let Some(base) = row {
+                            self.memory[base + d]
                         } else {
                             Value::Float(0.0)
                         };
@@ -5866,3 +5913,6 @@ mod kernel_marshalling_tests;
 
 #[cfg(test)]
 mod kernel_extent_marshalling_tests;
+
+#[cfg(test)]
+mod transfer_bounds_tests;
