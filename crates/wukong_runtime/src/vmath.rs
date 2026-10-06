@@ -937,7 +937,14 @@ pub(crate) fn apply1(op: i64, x: f32) -> f32 {
         VM_LOG => log1(x),
         VM_TANH => tanh1(x),
         VM_SIGMOID => sigmoid1(x),
-        VM_RELU => x.max(0.0),
+        // MAXPS returns its second operand (+0) on either zero or NaN.
+        VM_RELU => {
+            if x > 0.0 {
+                x
+            } else {
+                0.0
+            }
+        }
         VM_SILU => silu1(x),
         VM_GELU => gelu1(x),
         VM_ELU => elu1(x),
@@ -5793,6 +5800,72 @@ mod tests {
                     apply2_1(op, xs[i], ys[i]).to_bits(),
                     "op {op} i {i}"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod relu_zero_contract_tests {
+    use super::*;
+    // Input bits and independently specified MAXPS(x, +0) result bits.
+    const CASES: [(u32, u32); 12] = [
+        (0x0000_0000, 0),
+        (0x8000_0000, 0),
+        (0x7fc1_2345, 0),
+        (0xffc1_2345, 0),
+        (0x7f80_0001, 0),
+        (0xff80_0001, 0),
+        (0x7f80_0000, 0x7f80_0000),
+        (0xff80_0000, 0),
+        (0x0000_0001, 0x0000_0001),
+        (0x8000_0001, 0),
+        (0x3fc0_0000, 0x3fc0_0000),
+        (0xbfc0_0000, 0),
+    ];
+
+    #[test]
+    fn relu_zero_contract_scalar_vectors_and_tails() {
+        for (input, expected) in CASES {
+            assert_eq!(apply1(VM_RELU, f32::from_bits(input)).to_bits(), expected);
+        }
+        for offset in 0..CASES.len() {
+            for n in [1, 7, 8, 9, 15, 16, 17, 65] {
+                let x: Vec<_> = (0..n)
+                    .map(|i| f32::from_bits(CASES[(i + offset) % CASES.len()].0))
+                    .collect();
+                let expected: Vec<_> = (0..n)
+                    .map(|i| CASES[(i + offset) % CASES.len()].1)
+                    .collect();
+                let mut out = vec![-99.0; n];
+                unsafe {
+                    vmath_scalar(x.as_ptr(), out.as_mut_ptr(), n, VM_RELU);
+                }
+                assert_eq!(
+                    out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected
+                );
+                out.fill(-99.0);
+                unsafe {
+                    wukong_vmath_f32(x.as_ptr(), out.as_mut_ptr(), n as i64, VM_RELU);
+                }
+                assert_eq!(
+                    out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected
+                );
+                #[cfg(target_arch = "x86_64")]
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                    for unroll6 in [false, true] {
+                        out.fill(-99.0);
+                        unsafe {
+                            vmath_avx2(x.as_ptr(), out.as_mut_ptr(), n, VM_RELU, unroll6);
+                        }
+                        assert_eq!(
+                            out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            expected
+                        );
+                    }
+                }
             }
         }
     }

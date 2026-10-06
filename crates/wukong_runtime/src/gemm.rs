@@ -495,7 +495,8 @@ impl Epilogue {
         // unfused `{ t = x·Wᵀ+b; act(t) }`. The epilogue is applied scalar in the (always-taken-when-
         // present) general writeback path, so one scalar call per active C element is the whole cost.
         match self.act {
-            ACT_RELU => y = y.max(0.0),
+            // Match vector MAXPS: either zero and NaN select the +0 bound.
+            ACT_RELU => y = if y > 0.0 { y } else { 0.0 },
             ACT_GELU => y = crate::vmath::gelu1(y),
             ACT_SILU => y = crate::vmath::silu1(y),
             _ => {}
@@ -6372,6 +6373,47 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod relu_zero_contract_tests {
+    use super::*;
+    // Input bits and independently specified MAXPS(x, +0) result bits.
+    const CASES: [(u32, u32); 12] = [
+        (0x0000_0000, 0),
+        (0x8000_0000, 0),
+        (0x7fc1_2345, 0),
+        (0xffc1_2345, 0),
+        (0x7f80_0001, 0),
+        (0xff80_0001, 0),
+        (0x7f80_0000, 0x7f80_0000),
+        (0xff80_0000, 0),
+        (0x0000_0001, 0x0000_0001),
+        (0x8000_0001, 0),
+        (0x3fc0_0000, 0x3fc0_0000),
+        (0xbfc0_0000, 0),
+    ];
+
+    #[test]
+    fn relu_zero_contract_direct_epilogue() {
+        // Direct application keeps -0 intact: a GEMM dot starting at +0 could erase it.
+        let bias = [-0.0f32];
+        for bias_ptr in [std::ptr::null(), bias.as_ptr()] {
+            let epi = Epilogue {
+                bias: bias_ptr,
+                act: ACT_RELU,
+                alpha: 1.0,
+            };
+            for (input, expected) in CASES {
+                assert_eq!(
+                    unsafe { epi.apply(f32::from_bits(input), 0) }.to_bits(),
+                    expected
+                );
+            }
+            let scaled = Epilogue { alpha: 2.0, ..epi };
+            assert_eq!(unsafe { scaled.apply(-0.0, 0) }.to_bits(), 0);
         }
     }
 }

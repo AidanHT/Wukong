@@ -441,3 +441,95 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod relu_zero_contract_tests {
+    use super::*;
+    use crate::vmath::VM_RELU;
+    // Input bits and independently specified MAXPS(x, +0) result bits.
+    const CASES: [(u32, u32); 12] = [
+        (0x0000_0000, 0),
+        (0x8000_0000, 0),
+        (0x7fc1_2345, 0),
+        (0xffc1_2345, 0),
+        (0x7f80_0001, 0),
+        (0xff80_0001, 0),
+        (0x7f80_0000, 0x7f80_0000),
+        (0xff80_0000, 0),
+        (0x0000_0001, 0x0000_0001),
+        (0x8000_0001, 0),
+        (0x3fc0_0000, 0x3fc0_0000),
+        (0xbfc0_0000, 0),
+    ];
+
+    #[test]
+    fn relu_zero_contract_bias_scalar_simd_and_public() {
+        // Seventeen rows force multiple public parallel bands; seventeen columns exercise
+        // two SIMD vectors and a scalar tail. -0 + -0 preserves -0 before activation.
+        let (rows, cols) = (17usize, 17usize);
+        let bias = vec![-0.0f32; cols];
+        for offset in 0..CASES.len() {
+            let x: Vec<_> = (0..rows * cols)
+                .map(|i| f32::from_bits(CASES[(i + offset) % CASES.len()].0))
+                .collect();
+            let expected: Vec<_> = (0..rows * cols)
+                .map(|i| CASES[(i + offset) % CASES.len()].1)
+                .collect();
+            let mut out = vec![-99.0; rows * cols];
+            unsafe {
+                bias_scalar(
+                    x.as_ptr(),
+                    bias.as_ptr(),
+                    out.as_mut_ptr(),
+                    rows,
+                    cols,
+                    VM_RELU,
+                );
+            }
+            assert_eq!(
+                out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected
+            );
+            for parallel in [false, true] {
+                out.fill(-99.0);
+                let kernel = if parallel {
+                    wukong_bias_bcast_f32_parallel
+                } else {
+                    wukong_bias_bcast_f32
+                };
+                unsafe {
+                    kernel(
+                        x.as_ptr(),
+                        bias.as_ptr(),
+                        out.as_mut_ptr(),
+                        rows as i64,
+                        cols as i64,
+                        VM_RELU,
+                    );
+                }
+                assert_eq!(
+                    out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                out.fill(-99.0);
+                unsafe {
+                    bias_avx2(
+                        x.as_ptr(),
+                        bias.as_ptr(),
+                        out.as_mut_ptr(),
+                        rows,
+                        cols,
+                        VM_RELU,
+                    );
+                }
+                assert_eq!(
+                    out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+}
