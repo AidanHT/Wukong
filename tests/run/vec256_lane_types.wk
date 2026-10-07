@@ -1,0 +1,171 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 0.25
+// EXPECT-OUT: 6.5
+// EXPECT-OUT: 24.75
+// EXPECT-OUT: 61
+// EXPECT-OUT: 121.25
+// EXPECT-OUT: 211.5
+// EXPECT-OUT: 337.75
+// EXPECT-OUT: 506
+// EXPECT-OUT: 722.25
+// EXPECT-OUT: 992.5
+// EXPECT-OUT: 1322.75
+// EXPECT-OUT: 1719
+// EXPECT-OUT: 126007
+// EXPECT-OUT: 90007
+// EXPECT-OUT: 60007
+// EXPECT-OUT: 36007
+// EXPECT-OUT: 18007
+// EXPECT-OUT: 6007
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 6007
+// EXPECT-OUT: 18007
+// EXPECT-OUT: 36007
+// EXPECT-OUT: 60007
+// EXPECT-OUT: -294967289
+// EXPECT-OUT: 20
+// EXPECT-OUT: 17
+// EXPECT-OUT: 14
+// EXPECT-OUT: 11
+// EXPECT-OUT: 8
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 3000
+// EXPECT-OUT: 4000
+// EXPECT-OUT: 5000
+// EXPECT-OUT: 2000000000
+// EXPECT-OUT: 6000000000
+// EXPECT-OUT: 4999999993
+// EXPECT-OUT: 3999999986
+// EXPECT-OUT: 2999999979
+// EXPECT-OUT: 1999999972
+// EXPECT-OUT: 999999965
+// EXPECT-OUT: 16999999958
+// EXPECT-OUT: 17999999951
+// EXPECT-OUT: 18999999944
+// EXPECT-OUT: 19999999937
+// EXPECT-OUT: 20999999930
+// EXPECT-OUT: 21999999923
+// EXPECT-OUT: 22999999916
+// EXPECT-OUT: 3000000000
+// EXPECT-OUT: 3000000001
+// EXPECT-OUT: 3000000002
+// EXPECT-OUT: 3000000003
+// EXPECT-OUT: 3000000004
+// EXPECT-OUT: 3000000005
+// EXPECT-OUT: 3000000006
+// EXPECT-OUT: 3000000007
+// EXPECT-OUT: 3000000008
+// EXPECT-OUT: 3000000009
+// EXPECT-OUT: 3000000010
+// EXPECT-OUT: 3000000011
+// EXPECT-OUT: 3000000012
+module tests.run.vec256_lane_types
+
+// The 256-bit AVX2 recipe path covers four lane types: f32 (8 lanes), f64 (4), and the wrapping
+// integer lanes i32 (8) and i64 (4). Before it did, every f64 and integer loop was capped at the
+// 128-bit CLIF strips — half the machine width, a quarter for f64 against the f32 path. Each kernel
+// below runs 13 elements, so the vector part and the scalar tail split inside the expectations:
+// f64 and i64 are three 4-lane groups plus one tail element, i32 one 8-lane group plus five.
+//
+// GATE-BLIND: interp and native both run the same recipe, so no differential gate can see whether
+// the 256-bit form was taken. On an AVX2 Win64 host, `--emit=mir -O2` on this file shows one
+// `veckernel #` call in each of `f64_lanes`, `i32_lanes` and `i64_lanes` (and none in
+// `u32_max_lanes`, which must stay scalar — see there). Every expected value below is the scalar
+// semantics of the loop, derived by hand (exact small integers and quarters, two's-complement
+// wrapping for the integer lanes), never recorded from compiler output. Every lane is printed.
+
+// f64: a fused multiply-add (`a*b + a/4` contracts exactly as the scalar tail does), a division
+// and a square root. With a = i and b = i*i every intermediate is exact: o = i^3 + i/4 - i.
+@generic
+fn f64_lanes(a: [f64; 13], b: [f64; 13], mut o: [f64; 13]) {
+    for i in 0..13 {
+        o[i] = a[i] * b[i] + a[i] / 4.0 - sqrt(b[i]);
+    }
+}
+
+// i32: a wrapping multiply (`vpmulld` keeps the low 32 bits, like the scalar `imul`), and a signed
+// compare-select with an integer negation. Lane 12 wraps: 2000000000 * 3 = 6000000000, which is
+// 1705032704 mod 2^32; minus 2000000000 plus 7 is -294967289.
+@generic
+fn i32_lanes(a: [i32; 13], b: [i32; 13], mut o: [i32; 13], mut m: [i32; 13]) {
+    for i in 0..13 {
+        o[i] = a[i] * b[i] - a[i] + 7;
+        m[i] = if a[i] > b[i] { a[i] } else { -b[i] };
+    }
+}
+
+// i64: add, subtract and a signed compare-select over values past 2^32, with a 64-bit invariant.
+// a = i * 10^9 and b = 6 * 10^9 - 7i, so a < b exactly for i <= 5.
+@generic
+fn i64_lanes(a: [i64; 13], b: [i64; 13], mut o: [i64; 13]) {
+    for i in 0..13 {
+        o[i] = if a[i] < b[i] { b[i] - a[i] } else { a[i] + b[i] + 5000000000 };
+    }
+}
+
+// u32: every vector lowering compares integer lanes SIGNED (AVX2 has only `vpcmpgt*`, and the
+// 128-bit strips use the signed predicate too), so an ordered compare of unsigned operands must
+// keep the loop scalar. Here every a[i] is at least 3000000000 — negative as an i32 — and every
+// b[i] is small, so the unsigned answer is a[i] in every lane, where a signed vector compare would
+// have picked b[i] in the vector lanes and a[i] in the scalar tail.
+@generic
+fn u32_max_lanes(a: [u32; 13], b: [u32; 13], mut o: [u32; 13]) {
+    for i in 0..13 {
+        o[i] = if a[i] > b[i] { a[i] } else { b[i] };
+    }
+}
+
+fn main() -> i32 {
+    let mut fa: [f64; 13] = [0.0; 13];
+    let mut fb: [f64; 13] = [0.0; 13];
+    let mut fo: [f64; 13] = [0.0; 13];
+    let mut ia: [i32; 13] = [0; 13];
+    let mut ib: [i32; 13] = [0; 13];
+    let mut io: [i32; 13] = [0; 13];
+    let mut im: [i32; 13] = [0; 13];
+    let mut la: [i64; 13] = [0; 13];
+    let mut lb: [i64; 13] = [0; 13];
+    let mut lo: [i64; 13] = [0; 13];
+    let mut ua: [u32; 13] = [0; 13];
+    let mut ub: [u32; 13] = [0; 13];
+    let mut uo: [u32; 13] = [0; 13];
+    for i in 0..13 {
+        fa[i] = i as f64;
+        fb[i] = (i * i) as f64;
+        ia[i] = (i as i32) * 1000 - 6000;
+        ib[i] = (i as i32) * 3 - 20;
+        la[i] = (i as i64) * 1000000000;
+        lb[i] = 6000000000 - (i as i64) * 7;
+        ua[i] = 3000000000u32 + (i as u32);
+        ub[i] = (i as u32) * 1000;
+    }
+    ia[12] = 2000000000;
+    ib[12] = 3;
+
+    f64_lanes(fa, fb, fo);
+    for i in 0..13 {
+        print(fo[i]);
+    }
+    i32_lanes(ia, ib, io, im);
+    for i in 0..13 {
+        print(io[i]);
+    }
+    for i in 0..13 {
+        print(im[i]);
+    }
+    i64_lanes(la, lb, lo);
+    for i in 0..13 {
+        print(lo[i]);
+    }
+    u32_max_lanes(ua, ub, uo);
+    for i in 0..13 {
+        print(uo[i]);
+    }
+    return 0;
+}

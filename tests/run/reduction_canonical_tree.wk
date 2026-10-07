@@ -1,0 +1,128 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10875232
+// EXPECT-OUT: 9874090
+// EXPECT-OUT: 12907159
+// EXPECT-OUT: 14134689
+// EXPECT-OUT: 8476380
+// EXPECT-OUT: 13549056
+// EXPECT-OUT: 5838595231198180
+// EXPECT-OUT: 5301112061384022
+// EXPECT-OUT: 7588502837395457
+module tests.run.reduction_canonical_tree
+
+// A vectorized float reduction regroups its addends, and the grouping decides the low bits. That
+// grouping is the language's — the canonical tree documented in `docs/internals.md` and in
+// `wukong_mir::vec_kernel` — and NOT a property of how the loop happened to be compiled: the host
+// ISA, `WUKONG_P4_NO_256`, whether the trip is a literal (`0..100`) or a run-time value (`0..n`),
+// and the addend's register pressure each choose only the instruction form. With L lanes per
+// 256-bit register (8 for f32, 4 for f64):
+//
+//   1. four accumulators of L lanes, all +0.0;
+//   2. element i + u*L + l of each 4L block folds into accumulator u, lane l;
+//   3. each remaining full L group folds into accumulator 0;
+//   4. accumulators 1, 2, 3 fold into accumulator 0 lane-wise, in that order;
+//   5. lanes 0..L of accumulator 0 fold left to right into r;
+//   6. if any group ran, the seed s becomes s + r;
+//   7. the < L remaining elements fold into s one at a time.
+//
+// Every EXPECT-OUT value below is that tree evaluated by hand (an independent scalar model with
+// IEEE single/double rounding at every `+`), never recorded from compiler output. On these inexact
+// addends every line but the first (a tail-only trip) differs from a strict left fold, from the
+// old 4-accumulator x 4-lane f32 tree, or from both — at n = 100 the old tree gives 517.3571166…
+// against 517.3571777…, at n = 2056 211704.03125 against 211704, and the f64 n = 2100 sum differs
+// from both alternatives — so a lowering that drifts from the tree changes a printed line. Each
+// value is printed as `s * 2^k` truncated to an integer, with 2^k chosen so the product carries
+// every mantissa bit of s exactly.
+//
+// The accumulator is written `s = s + a[i] + b[i]`, the left-associated spelling that used to
+// compile fully scalar while `s += a[i] + b[i]` was vectorized: it is the reduction
+// `s += (a[i] + b[i])`, one rounding for each element's pair and one for its fold, in the vector
+// part and the scalar tail alike.
+//
+// Inputs: a[i] = f32(i) * f32(0.1) and b[i] = 1 / (i % 5 + 3), rounded in the element type.
+// The run-time trips are 5 (tail only), 37 (one 32-element block and a 5-element tail), 61 (one
+// block, three 8-element groups, a 5-element tail) and 2100 (above the 2048 crossover, where an
+// AVX2 host takes the 256-bit kernel after its run-time trip test); the literal trips are 100
+// (always the portable form) and 2056 (statically the kernel on an AVX2 host).
+
+@generic
+fn chain(a: []f32, b: []f32, n: i64) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..n {
+        s = s + a[i] + b[i];
+    }
+    return s;
+}
+
+@generic
+fn chain100(a: [f32; 100], b: [f32; 100]) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..100 {
+        s = s + a[i] + b[i];
+    }
+    return s;
+}
+
+@generic
+fn chain2056(a: [f32; 2056], b: [f32; 2056]) -> f32 {
+    let mut s: f32 = 0.5;
+    for i in 0..2056 {
+        s = s + a[i] + b[i];
+    }
+    return s;
+}
+
+@generic
+fn chain64(a: []f64, b: []f64, n: i64) -> f64 {
+    let mut s: f64 = 0.5;
+    for i in 0..n {
+        s = s + a[i] + b[i];
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    let mut a: []f32 = alloc_f32(2100);
+    let mut b: []f32 = alloc_f32(2100);
+    let mut a64: []f64 = alloc_f64(2100);
+    let mut b64: []f64 = alloc_f64(2100);
+    let mut i: i64 = 0;
+    while i < 2100 {
+        a[i] = (i as f32) * 0.1;
+        b[i] = 1.0 / (((i % 5) as f32) + 3.0);
+        a64[i] = (i as f64) * 0.1;
+        b64[i] = 1.0 / (((i % 5) as f64) + 3.0);
+        i = i + 1;
+    }
+    let mut fa: [f32; 100] = [0.0; 100];
+    let mut fb: [f32; 100] = [0.0; 100];
+    let mut ga: [f32; 2056] = [0.0; 2056];
+    let mut gb: [f32; 2056] = [0.0; 2056];
+    i = 0;
+    while i < 2056 {
+        ga[i] = a[i];
+        gb[i] = b[i];
+        if i < 100 {
+            fa[i] = a[i];
+            fb[i] = b[i];
+        }
+        i = i + 1;
+    }
+
+    print((chain(a, b, 5) * 4194304.0) as i64); // 2^22
+    print((chain(a, b, 37) * 131072.0) as i64); // 2^17
+    print((chain(a, b, 61) * 65536.0) as i64); // 2^16
+    print((chain(a, b, 2100) * 64.0) as i64); // 2^6
+    print((chain100(fa, fb) * 16384.0) as i64); // 2^14
+    print((chain2056(ga, gb) * 64.0) as i64); // 2^6
+    print((chain64(a64, b64, 5) * 2251799813685248.0) as i64); // 2^51
+    print((chain64(a64, b64, 37) * 70368744177664.0) as i64); // 2^46
+    print((chain64(a64, b64, 2100) * 34359738368.0) as i64); // 2^35
+
+    free(a);
+    free(b);
+    free(a64);
+    free(b64);
+    return 0;
+}
