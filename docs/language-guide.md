@@ -642,8 +642,14 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
   not concatenated), and a `()` value — from an `else`-less `if`, or a `match` with statement arms —
   is `E0401`.
 - `println(x)` — alias of `print` (both already append the newline).
-- `assert(cond)` — trap with a nonzero exit code if `cond` is false (zero); a no-op otherwise. Exactly
+- `assert(cond)` — stop the program at once if `cond` is false (zero); a no-op otherwise. Exactly
   one argument (`E0503` otherwise). A float condition means `cond != 0.0`, so `assert(0.5)` passes.
+  A failed assertion means the same thing on every execution path: no statement after it runs (in
+  the failing function or any caller), everything printed before it stays on stdout, `assertion
+  failed` goes to stderr and the exit status is `1` — under `wukongc --run` on the interpreter and
+  on `--backend=native`, and in an `--emit=exe` executable. Inside a `@parallel` region the run
+  reports the failure of the earliest iteration that fails, as the in-order interpreter does. A
+  slice index out of bounds stops the program the same way.
 - `now_ns()` — a zero-argument monotonic nanosecond clock returning `i64`, for in-process timing
   (`let t1 = now_ns(); … let dt = now_ns() - t1;`). Any argument is `E0503`. Only *differences* between
   reads are meaningful, so a program's stdout stays backend-identical.

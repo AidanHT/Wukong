@@ -60,6 +60,20 @@ fn failed_assert_stops_side_effects_in_current_and_nested_functions() {
                 wukong_interp::run_with_output(&program, main, &interner),
                 expected
             );
+            // The capturing APIs `wukongc --run` uses keep exactly the output printed before the
+            // failure, on both backends -- what a linked executable leaves on stdout too.
+            let failed: Result<i64, String> = Err("assertion failed".to_owned());
+            let printed = before.as_bytes().to_vec();
+            assert_eq!(
+                native.run_capturing(),
+                (failed.clone(), printed.clone()),
+                "opt={opt}: {src}"
+            );
+            assert_eq!(
+                wukong_interp::run_capturing(&program, main, &interner),
+                (failed, printed),
+                "opt={opt}: {src}"
+            );
             assert_eq!(native.call(), 1);
         }
     }
@@ -85,29 +99,86 @@ fn successful_assertions_and_subsequent_runs_keep_working() {
 }
 
 #[test]
-fn assertion_capable_callbacks_decline_before_native_execution() {
-    let (mut program, mut interner, main) = lower(
-        "fn leaf() { assert(false); }
-         fn callback() { leaf(); }
-         fn main() -> i32 { return 0; }",
+fn a_failing_parallel_region_reports_its_first_failing_iteration_and_stops_its_caller() {
+    // `body` is a parallel-region body in the runtime's `(start, end, env)` ABI, and `drive` --
+    // built by hand below, since no `.wk` spelling reaches `func_addr` with a failure-capable body
+    // today -- runs it over [0, 64) through `wukong_parallel_for`. `get(a, i)` fails its bounds
+    // check for every i >= 40 against the 40-element array, so natively several spans fail at
+    // once, in any order. The interpreter runs the range in order and stops at i = 40, so the
+    // cancellation ABI must report exactly that failure on every run (not whichever span's thread
+    // got there first), and nothing after the region may run: stdout is "7\n", never "99".
+    let src = "fn get(s: []i32, i: i64) -> i32 { return s[i]; }
+               fn body(start: i64, end: i64, env: *mut u8) {
+                   let a: [i32; 40] = [1; 40];
+                   let mut i: i64 = start;
+                   let mut t: i32 = 0;
+                   while i < end { t = t + get(a, i); i = i + 1; }
+               }
+               fn drive() { }
+               fn main() -> i32 { print(7); drive(); print(99); return 0; }";
+    for opt in [0, 2] {
+        let (mut program, mut interner, main) = lower(src, 0);
+        let drive = interner.intern("drive");
+        let mut region = Builder::new(drive, MirType::Void);
+        let n = region.build(MirType::I64, Op::ConstInt(64, MirType::I64));
+        let body = region.build(MirType::Ptr, Op::FuncAddr(interner.intern("body")));
+        let env = region.alloca(MirType::I64);
+        region.build_void(Op::Call {
+            func: interner.intern("wukong_parallel_for"),
+            args: vec![n, body, env],
+        });
+        region.ret(None);
+        let placeholder = program.funcs.iter_mut().find(|f| f.name == drive).unwrap();
+        *placeholder = region.finish();
+        wukong_opt::optimize(&mut program, opt);
+        assert!(wukong_mir::verify::verify_program(&program).is_empty());
+
+        let failed: Result<i64, String> =
+            Err("index out of bounds: the len is 40 but the index is 40".to_owned());
+        let printed = b"7\n".to_vec();
+        assert_eq!(
+            wukong_interp::run_capturing(&program, main, &interner),
+            (failed.clone(), printed.clone()),
+            "opt={opt}"
+        );
+        let native = jit_compile(&program, main, &interner).unwrap();
+        for _ in 0..16 {
+            assert_eq!(
+                native.run_capturing(),
+                (failed.clone(), printed.clone()),
+                "opt={opt}"
+            );
+        }
+        assert_eq!(native.call(), 1, "opt={opt}");
+        // A linked executable exits at the failure itself, so the region needs no propagation
+        // there and the object is emitted like any other.
+        emit_object(&program, &interner).expect("a failure-capable region body emits an object");
+    }
+}
+
+#[test]
+fn a_region_body_that_cannot_fail_adds_no_failure_status_to_its_caller() {
+    // The propagation set grows through a region only when its body can fail: `safe` cannot, so
+    // neither can `drive`, and `main` keeps no status poll.
+    let (mut program, mut interner, _) = lower(
+        "fn safe(start: i64, end: i64, env: *mut u8) { }
+         fn drive() { }
+         fn main() -> i32 { drive(); return 0; }",
         0,
     );
-    let callback = interner.intern("callback");
-    let mut address = Builder::new(interner.intern("address"), MirType::Ptr);
-    let value = address.build(MirType::Ptr, Op::FuncAddr(callback));
-    address.ret(Some(value));
-    program.funcs.push(address.finish());
-    assert!(wukong_mir::verify::verify_program(&program).is_empty());
-    for error in [
-        jit_compile(&program, main, &interner).err().unwrap(),
-        emit_object(&program, &interner).unwrap_err(),
-    ] {
-        assert!(
-            error.contains("assertion-capable callback `callback`"),
-            "{error}"
-        );
-        assert!(error.contains("cancellation ABI"), "{error}");
-    }
+    let drive = interner.intern("drive");
+    let mut region = Builder::new(drive, MirType::Void);
+    let n = region.build(MirType::I64, Op::ConstInt(8, MirType::I64));
+    let body = region.build(MirType::Ptr, Op::FuncAddr(interner.intern("safe")));
+    let env = region.alloca(MirType::I64);
+    region.build_void(Op::Call {
+        func: interner.intern("wukong_parallel_for"),
+        args: vec![n, body, env],
+    });
+    region.ret(None);
+    let placeholder = program.funcs.iter_mut().find(|f| f.name == drive).unwrap();
+    *placeholder = region.finish();
+    assert!(asserting_functions(&program, &interner).is_empty());
 }
 
 #[test]
@@ -119,7 +190,7 @@ fn assertion_propagation_only_marks_transitively_asserting_functions() {
          fn main() -> i32 { middle(); return safe(2); }",
         0,
     );
-    let actual = asserting_functions(&program, &interner).unwrap();
+    let actual = asserting_functions(&program, &interner);
     let expected = [
         interner.intern("leaf"),
         interner.intern("middle"),
@@ -135,27 +206,28 @@ fn assertion_propagation_only_marks_transitively_asserting_functions() {
         "fn f() -> i32 { return 2; } fn main() -> i32 { return f(); }",
         0,
     );
-    assert!(asserting_functions(&safe, &interner).unwrap().is_empty());
+    assert!(asserting_functions(&safe, &interner).is_empty());
 }
 
 #[test]
-fn raw_jit_declines_assertions_and_preserves_assertion_free_calls() {
+fn raw_jit_accepts_assertions_and_never_reads_a_guarded_runs_failure() {
     let (bad, bad_interner, bad_main) = lower("fn main() -> i32 { assert(false); return 0; }", 0);
     let bad = jit_compile(&bad, bad_main, &bad_interner).unwrap();
     assert_eq!(bad.run(), Err("assertion failed".to_owned()));
 
-    // A raw entry cannot reset or inspect the previous failure flag. Even this passing
-    // assertion would return a dummy zero from its caller under the stale flag.
-    let (good, interner, _) = lower(
+    // A raw entry cannot reset or inspect a guarded run's failure flag -- the run above may have
+    // left it raised -- so raw code never reads it: its status poll is bound to "not failed" and a
+    // failed assertion aborts instead. A passing assertion therefore returns the real value, not
+    // the dummy zero a stale flag would force out of `leaf`'s caller.
+    let (good, interner, main) = lower(
         "fn leaf() -> i32 { assert(true); return 42; }
          fn main() -> i32 { return leaf(); }",
         0,
     );
-    let error = jit_module(&good, &interner)
-        .err()
-        .expect("raw assertion API must decline");
-    assert!(error.contains("raw JIT function pointers"), "{error}");
-    assert!(error.contains("JitProgram::run"), "{error}");
+    let module = jit_module(&good, &interner).expect("raw modules accept assertions");
+    let entry: unsafe extern "C" fn() -> i32 =
+        unsafe { std::mem::transmute(module.func_ptr(main).unwrap()) };
+    assert_eq!(unsafe { entry() }, 42);
 
     // An assertion-free raw entry has no status polls and remains valid even after failure.
     let (safe, interner, main) = lower("fn main() -> i32 { return 42; }", 0);
@@ -199,8 +271,7 @@ fn slice_bounds_failure_stops_like_an_assert_and_reports_the_shared_message() {
 
 #[test]
 fn raw_jit_accepts_bounds_checked_code_and_runs_it_in_range() {
-    // A bounds check alone does not make a program assertion-capable for the raw API: a raw
-    // caller gets the checked code with an abort-on-failure binding. In range it just runs.
+    // A raw caller gets bounds-checked code with an abort-on-failure binding. In range it runs.
     let (program, mut interner, _) = lower(
         "fn get(s: []i32, i: i64) -> i32 { return s[i] * 10; }
          fn main() -> i32 { return 0; }",

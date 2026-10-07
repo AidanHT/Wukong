@@ -1,0 +1,38 @@
+// RUN: --run
+// EXPECT-EXIT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 10
+// EXPECT-OUT: 20
+// EXPECT-STDERR: assertion failed
+module tests.run.assert_fail_trailing_output
+
+// A failed `assert` stops the program at the assertion — on the interpreter, the native JIT and a
+// linked executable alike — and everything printed BEFORE it stays printed, exactly as a linked
+// executable's stdout keeps it. `assert_fail.wk` cannot tell those apart: it prints nothing and has
+// nothing after its assertion. This fixture has output on both sides of a failure inside a callee:
+//
+// * `print(1)` runs.
+// * `check(10)`: 10 < 15 holds, so it prints 10 and returns 20, which `main` prints.
+// * `check(20)`: 20 < 15 fails before the callee's `print`, so neither `20` from the callee, nor
+//   `main`'s `print(b)`, nor the `print(99)` after it may appear, and the exit status is 1.
+//
+// Stdout is therefore exactly 1, 10, 20 (derived from the statement order above). `wukongc --run`
+// used to discard all stdout when a run failed, so it disagreed with the linked executable on every
+// failing program and could not see whether the JIT stopped at the assertion or ran on past it.
+// `exe.rs` compares this fixture's linked executable against `--run` byte for byte.
+
+fn check(x: i32) -> i32 {
+    assert(x < 15);
+    print(x);
+    return x * 2;
+}
+
+fn main() -> i32 {
+    print(1);
+    let a: i32 = check(10);
+    print(a);
+    let b: i32 = check(20);
+    print(b);
+    print(99);
+    return 0;
+}

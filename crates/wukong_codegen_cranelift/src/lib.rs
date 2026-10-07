@@ -16,6 +16,7 @@
 //! calls an `rt_fmod_*` shim (Cranelift has no `frem`), and f16/bf16 are rounded at the value —
 //! inline for bf16, through the runtime's `half`-crate shims for f16.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -55,12 +56,39 @@ static ASSERT_FAILED: AtomicBool = AtomicBool::new(false);
 static FAILURE_MESSAGE: Mutex<Option<String>> = Mutex::new(None);
 static RUN_LOCK: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    /// The failure state of the `@parallel` region span this thread is running, if it is running
+    /// one: `None` outside every span, `Some(None)` inside a span that has not failed, and
+    /// `Some(Some(message))` once it has. A span's failure stays off the shared run state until
+    /// [`rt_parallel_for`] picks the region's failure by iteration order — so which span's thread
+    /// happened to fail first can neither change the reported diagnostic nor stop another span
+    /// early. Saved and restored around every span, so a span nested inside another (a work-stealing
+    /// worker running a second region while it waits) keeps its own state.
+    static SPAN_FAILURE: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
+}
+
 /// Record `message` as the run's failure unless an earlier one is already recorded, and raise the
-/// shared failure flag the generated code polls.
+/// failure flag the generated code polls — the shared run flag, or, inside a parallel-region span,
+/// that span's own (see [`SPAN_FAILURE`]).
 fn record_failure(message: impl FnOnce() -> String) {
-    if let Ok(mut m) = FAILURE_MESSAGE.lock() {
-        if m.is_none() {
-            *m = Some(message());
+    let mut message = Some(message);
+    let in_span = SPAN_FAILURE.with(|span| match span.borrow_mut().as_mut() {
+        Some(slot) => {
+            if slot.is_none() {
+                *slot = message.take().map(|m| m());
+            }
+            true
+        }
+        None => false,
+    });
+    if in_span {
+        return;
+    }
+    if let Some(message) = message {
+        if let Ok(mut m) = FAILURE_MESSAGE.lock() {
+            if m.is_none() {
+                *m = Some(message());
+            }
         }
     }
     ASSERT_FAILED.store(true, Ordering::SeqCst);
@@ -152,15 +180,100 @@ extern "C" fn rt_bounds_fail_abort(index: i64, len: i64, site: *const u8) {
     std::process::abort();
 }
 
-// The raw-mode binding of `wukong_rt_assert_failed`. A raw module contains no `assert` (declined by
-// `jit_module`) and aborts on a bounds failure, so no failure can ever be pending in it — and
-// reading the shared flag would let an unrelated guarded run on another thread stop raw code.
+// The raw-function-pointer (`jit_module`) binding of `wukong_rt_assert`. Like a bounds failure
+// there, a failed assertion is fatal (Rust's `panic = "abort"`): a raw caller has no run handle a
+// failure could be reported through, and returning a dummy value would be a silent wrong answer.
+// The assertion lowering only calls this on its failure edge, so `cond` is always 0 in practice.
+extern "C" fn rt_assert_abort(cond: i64) {
+    if cond == 0 {
+        eprintln!("error: assertion failed");
+        std::process::abort();
+    }
+}
+
+// The raw-mode binding of `wukong_rt_assert_failed`. A raw module aborts on any failure (an
+// `assert`, a bounds check), so no failure can ever be pending in it — and reading the shared flag
+// would let an unrelated guarded run on another thread stop raw code.
 extern "C" fn rt_assert_never_failed() -> i64 {
     0
 }
 
+// The poll the generated code makes after every call that can fail: has the run failed? Inside a
+// parallel-region span only that span's own failure counts (see `SPAN_FAILURE`).
 extern "C" fn rt_assert_failed() -> i64 {
-    i64::from(ASSERT_FAILED.load(Ordering::SeqCst))
+    let span = SPAN_FAILURE.with(|span| span.borrow().as_ref().map(Option::is_some));
+    i64::from(span.unwrap_or_else(|| ASSERT_FAILED.load(Ordering::SeqCst)))
+}
+
+/// One `@parallel` region in flight under [`rt_parallel_for`]: the outlined body and its captured
+/// environment, and the failure of the lowest-starting span that has failed so far.
+struct ParallelRegion {
+    body: extern "C" fn(i64, i64, *const u8),
+    env: *const u8,
+    first: Mutex<Option<(i64, String)>>,
+}
+
+// The guarded JIT's binding of `wukong_parallel_for` — the cancellation ABI for failure-capable
+// region bodies. The runtime splits `[0, n)` into contiguous spans and runs them concurrently, so
+// a body that fails (an `assert`, a slice bounds check) can fail on several spans at once, in any
+// order. Each span runs under `rt_parallel_span`, which returns early once the span fails and
+// keeps its diagnostic off the shared run state; the region then reports the failure of the
+// LOWEST-starting failed span. That is exactly the failure the interpreter reports, which runs
+// the range in order: by the data-parallel contract every iteration behaves as it does serially,
+// so no span before the first failing iteration fails, and the span holding it stops there. The
+// chosen failure is recorded on the calling thread — the run's state, or the enclosing span's when
+// regions nest — and the caller, which is failure-capable itself, polls and returns at once.
+// Spans that start after an already-recorded failure are skipped: serially they never run.
+//
+// A linked executable binds `wukong_parallel_for` to the runtime directly: there a failure exits
+// the process at its source, so nothing propagates and no span outlives it.
+extern "C" fn rt_parallel_for(n: i64, body: extern "C" fn(i64, i64, *const u8), env: *const u8) {
+    let region = ParallelRegion {
+        body,
+        env,
+        first: Mutex::new(None),
+    };
+    // SAFETY: `wukong_parallel_for` returns only after every span has completed, so `region`
+    // outlives every `rt_parallel_span` call that reads it, and the spans share it only through
+    // `&` (its mutable part is behind the mutex). `body`/`env` are forwarded unchanged.
+    unsafe {
+        wukong_runtime::wukong_parallel_for(
+            n,
+            rt_parallel_span,
+            &region as *const ParallelRegion as *const u8,
+        );
+    }
+    let first = region.first.into_inner().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, message)) = first {
+        record_failure(|| message);
+    }
+}
+
+// One span `[start, end)` of a region run by `rt_parallel_for` (see there).
+extern "C" fn rt_parallel_span(start: i64, end: i64, region: *const u8) {
+    // SAFETY: `region` is the `ParallelRegion` `rt_parallel_for` passed, alive for this call.
+    let region = unsafe { &*(region as *const ParallelRegion) };
+    let earlier_failed = region
+        .first
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(failed_at, _)| *failed_at < start);
+    if earlier_failed {
+        return;
+    }
+    let outer = SPAN_FAILURE.with(|span| span.replace(Some(None)));
+    (region.body)(start, end, region.env);
+    let failure = SPAN_FAILURE.with(|span| span.replace(outer)).flatten();
+    if let Some(message) = failure {
+        let mut first = region.first.lock().unwrap_or_else(|e| e.into_inner());
+        if first
+            .as_ref()
+            .is_none_or(|(failed_at, _)| start < *failed_at)
+        {
+            *first = Some((start, message));
+        }
+    }
 }
 
 // Float remainder. Cranelift has no `frem`; the interpreter uses Rust `%` (true fmod), so the native
@@ -1306,6 +1419,15 @@ impl<'a> FnTranslator<'a> {
             let env = self.val(args[2]);
             let fref = self.runtime_ref(RT_PARALLEL_FOR);
             self.builder.ins().call(fref, &[n, body, env]);
+            // A failure-capable region body hands its failure back through the JIT's
+            // `rt_parallel_for`, so a failure-capable caller polls here exactly as it does after
+            // an asserting user call. (Polling where the body cannot fail reads a clear flag.)
+            if self.decls.asserting.contains(&self.func.name) {
+                let status = self.runtime_ref(RT_ASSERT_FAILED);
+                let check = self.builder.ins().call(status, &[]);
+                let failed = self.builder.inst_results(check)[0];
+                self.return_on_assert_failure(failed, false);
+            }
             return None;
         }
         // The GEMM microkernel: wukong_sgemm(a, b, c, m, k, n, beta) and its parallel / transposed
@@ -2457,23 +2579,12 @@ fn is_failure_intrinsic(func: Symbol, interner: &Interner) -> bool {
     matches!(interner.resolve(func), "assert" | RT_BOUNDS_FAIL)
 }
 
-/// Does any function call the builtin `assert` directly? (The raw `jit_module` API declines those:
-/// a raw caller could neither reset nor read the failure an `assert` reports.)
-fn calls_builtin_assert(program: &Program, interner: &Interner) -> bool {
-    let defined: HashSet<Symbol> = program.funcs.iter().map(|f| f.name).collect();
-    program
-        .funcs
-        .iter()
-        .flat_map(|f| f.blocks.iter().flat_map(|b| &b.insts))
-        .any(|inst| {
-            matches!(inst.op, Op::Call { func, .. }
-                if !defined.contains(&func) && interner.resolve(func) == "assert")
-        })
-}
-
-/// Direct-call failure propagation is only needed along paths that can reach a builtin assert or a
-/// slice bounds failure.
-fn asserting_functions(program: &Program, interner: &Interner) -> Result<HashSet<Symbol>, String> {
+/// The functions that can stop the run and so must be polled after every call to them: one that
+/// calls a runtime failure intrinsic (a builtin `assert`, a slice bounds failure), calls such a
+/// function, or runs a parallel region whose body is one. A region body's failure comes back
+/// through the JIT's `rt_parallel_for` (the cancellation ABI, see there) to the caller of
+/// `wukong_parallel_for`; in a linked executable it exits the process where it happens.
+fn asserting_functions(program: &Program, interner: &Interner) -> HashSet<Symbol> {
     let defined: HashSet<Symbol> = program.funcs.iter().map(|f| f.name).collect();
     let mut asserting = HashSet::new();
     loop {
@@ -2483,12 +2594,20 @@ fn asserting_functions(program: &Program, interner: &Interner) -> Result<HashSet
                 continue;
             }
             let can_fail = f.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
-                if let Op::Call { func, .. } = inst.op {
-                    asserting.contains(&func)
-                        || (!defined.contains(&func) && is_failure_intrinsic(func, interner))
-                } else {
-                    false
+                let Op::Call { func, args } = &inst.op else {
+                    return false;
+                };
+                if asserting.contains(func) {
+                    return true;
                 }
+                if defined.contains(func) {
+                    return false;
+                }
+                is_failure_intrinsic(*func, interner)
+                    || (interner.resolve(*func) == RT_PARALLEL_FOR
+                        && args
+                            .get(1)
+                            .is_some_and(|&body| callback_can_fail(f, body, &asserting)))
             });
             if can_fail {
                 changed |= asserting.insert(f.name);
@@ -2498,19 +2617,21 @@ fn asserting_functions(program: &Program, interner: &Interner) -> Result<HashSet
             break;
         }
     }
-    for f in &program.funcs {
-        for inst in f.blocks.iter().flat_map(|b| &b.insts) {
-            if let Op::FuncAddr(func) = inst.op {
-                if asserting.contains(&func) {
-                    return Err(format!(
-                        "unsupported assertion-capable callback `{}`: immediate assertion termination through foreign or parallel callbacks requires a cancellation ABI",
-                        interner.resolve(func)
-                    ));
-                }
-            }
-        }
+    asserting
+}
+
+/// Can the callback whose address `f` passes as `body` fail? A direct `func_addr g` can exactly
+/// when `g` is failure-capable; a body of any other provenance is assumed to.
+fn callback_can_fail(f: &Function, body: ValueId, asserting: &HashSet<Symbol>) -> bool {
+    let def = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find(|inst| inst.result == Some(body));
+    match def.map(|inst| &inst.op) {
+        Some(Op::FuncAddr(g)) => asserting.contains(g),
+        _ => true,
     }
-    Ok(asserting)
 }
 
 /// Declare every user function and the runtime imports into `module`, then define each body.
@@ -2522,7 +2643,7 @@ fn populate_module<M: Module>(
 ) -> Result<HashMap<Symbol, FuncId>, String> {
     let legalized = bool_vectors::legalize(program, interner)?;
     let program = legalized.as_ref();
-    let asserting = asserting_functions(program, interner)?;
+    let asserting = asserting_functions(program, interner);
     let ptr_ty = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
 
@@ -3907,6 +4028,15 @@ impl JitProgram {
     /// Run once, returning the exit code and captured stdout (the native counterpart to the
     /// interpreter's `run_with_output`).
     pub fn run(&self) -> Result<(i64, Vec<u8>), String> {
+        let (result, out) = self.run_capturing();
+        result.map(|code| (code, out))
+    }
+
+    /// Run once, returning the exit code or the run's failure **together with the stdout captured
+    /// before the run stopped** — the native counterpart to the interpreter's `run_capturing`. A
+    /// failed `assert` or slice bounds check returns at once through every generated caller, so the
+    /// output is exactly what the program printed before the failing statement.
+    pub fn run_capturing(&self) -> (Result<i64, String>, Vec<u8>) {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
         reset_failure();
@@ -3922,10 +4052,10 @@ impl JitProgram {
         let ret = self.ret.clone();
         let exit_code = run_on_big_stack(move || unsafe { invoke_code(code, &ret) });
         let out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(failure) = take_failure() {
-            return Err(failure);
+        match take_failure() {
+            Some(failure) => (Err(failure), out),
+            None => (Ok(exit_code), out),
         }
-        Ok((exit_code, out))
     }
 
     /// Run once for timing: clears (but does not clone) the capture buffer so repeated prints don't
@@ -4077,10 +4207,9 @@ fn jit_compile_entry(
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
-    builder.symbol(
-        RT_PARALLEL_FOR,
-        wukong_runtime::wukong_parallel_for as *const u8,
-    );
+    // The guarded run's parallel-for: the runtime's, wrapped in the cancellation ABI that brings a
+    // failing region body's diagnostic back to its caller in iteration order (`rt_parallel_for`).
+    builder.symbol(RT_PARALLEL_FOR, rt_parallel_for as *const u8);
     builder.symbol(RT_SGEMM, wukong_runtime::wukong_sgemm as *const u8);
     builder.symbol(
         RT_SGEMM_PARALLEL,
@@ -4595,6 +4724,19 @@ pub fn jit_run(
     jit_compile(program, entry, interner)?.run()
 }
 
+/// JIT-compile and execute `entry`, returning its exit code or failure together with the stdout
+/// printed before it stopped (see [`JitProgram::run_capturing`]). A compile error has no output.
+pub fn jit_run_capturing(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> (Result<i64, String>, Vec<u8>) {
+    match jit_compile(program, entry, interner) {
+        Ok(native) => native.run_capturing(),
+        Err(e) => (Err(e), Vec::new()),
+    }
+}
+
 /// A JIT-compiled module exposing raw pointers to any of its functions, for callers that know a
 /// function's ABI and want to invoke it directly (e.g. timing a kernel `(*const f32, …)`).
 pub struct JitModuleHandle {
@@ -4620,19 +4762,14 @@ impl Drop for JitModuleHandle {
 }
 
 /// JIT-compile every function in `program`, returning a handle for fetching their code pointers.
-/// Programs containing assertions require the guarded `JitProgram` invocation API instead.
 ///
-/// A slice bounds check is accepted here, with a raw-mode meaning: a raw caller has no run handle
-/// to report a failure through, so an out-of-bounds slice access aborts the process with the shared
-/// `index out of bounds` diagnostic rather than returning a silently wrong value.
+/// Runtime failures have a raw-mode meaning here. A raw caller has no run handle a failure could be
+/// reported through, and returning a dummy value would be a silently wrong answer, so a failed
+/// `assert` or an out-of-bounds slice access **aborts the process** with the shared diagnostic —
+/// Rust's `panic = "abort"`, and what a linked executable does (exit 1). A run that must survive a
+/// failure and report it uses the guarded [`jit_compile`] + [`JitProgram::run`] API instead.
 pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHandle, String> {
     use cranelift_jit::{JITBuilder, JITModule};
-
-    // Still reject assertion-capable callbacks with no cancellation path.
-    asserting_functions(program, interner)?;
-    if calls_builtin_assert(program, interner) {
-        return Err("raw JIT function pointers do not support assertion-capable programs; use jit_compile and JitProgram::run or JitProgram::call".into());
-    }
 
     let isa = make_isa(false)?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -4640,9 +4777,9 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_PRINT_U64, rt_print_u64 as *const u8);
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
-    builder.symbol(RT_ASSERT, rt_assert as *const u8);
-    // Raw mode: no `assert` reaches here (declined above), a bounds failure aborts, and so no
-    // failure is ever pending — never read the flag a concurrent guarded run may have raised.
+    builder.symbol(RT_ASSERT, rt_assert_abort as *const u8);
+    // Raw mode: every failure aborts where it happens, so none is ever pending — never read the
+    // flag a concurrent guarded run may have raised.
     builder.symbol(RT_ASSERT_FAILED, rt_assert_never_failed as *const u8);
     builder.symbol(RT_BOUNDS_FAIL, rt_bounds_fail_abort as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);

@@ -62,21 +62,25 @@ Generated code calls:
 `cargo test -p wukong_codegen_cranelift --lib` — JIT correctness, interpreter-vs-native differential,
 optimization invariance, kernel fuzzing (`fuzz.rs`, `fuzz_grammar.rs`).
 
-Failed assertions stop the current JIT function immediately and propagate through direct callers
-before they can observe a return value or execute subsequent side effects. Only functions that
-transitively call `assert` require status polling. This uses ordinary generated returns rather than
-unwinding through an `extern "C"` frame. `run()` retains its `Err("assertion failed")` contract;
-the timing-only `call()` returns exit code 1 and resets failure state for each invocation.
+Failed assertions and slice bounds failures stop the current JIT function immediately and
+propagate through direct callers before they can observe a return value or execute subsequent side
+effects. Only functions that can transitively reach a failure require status polling. This uses
+ordinary generated returns rather than unwinding through an `extern "C"` frame. `run()` reports the
+failure's diagnostic (`assertion failed`, `index out of bounds: ...`); `run_capturing()` returns it
+together with the stdout printed before the failure, which is what `wukongc --run` prints; the
+timing-only `call()` returns exit code 1 and resets failure state for each invocation.
 
-The raw `jit_module` API rejects any program containing assertion-capable functions: raw code
-pointers cannot provide the invocation lock, failure reset, and error reporting of `JitProgram`.
-Assertion-free programs retain raw pointer access.
+Failure-capable `@parallel` region bodies are supported through a cancellation ABI: the guarded JIT
+binds `wukong_parallel_for` to `rt_parallel_for`, which runs every span under a per-thread span
+failure slot, skips spans that start after an already-failed one, and reports the failure of the
+lowest-starting failed span -- the failure the interpreter, which runs the range in order, reports.
+The caller polls after the region like after any failure-capable call.
 
-Assertion-capable functions cannot currently be taken as callback addresses: native compilation
-rejects them with a cancellation-ABI diagnostic. This includes parallel callbacks; a shared flag
-alone cannot stop effects already running on another worker. AOT Rust/C shims terminate at failure
-with diagnostic `assertion failed` and exit 1. Previously emitted AOT output remains visible;
-the existing `--run` error API discards captured output.
+The raw `jit_module` API accepts every program, with raw-mode failure semantics: raw code pointers
+have no invocation lock, failure reset or error reporting, so a failed assertion or bounds check
+aborts the process with its diagnostic (and the status poll is bound to a constant "not failed").
+AOT Rust/C shims terminate at the failure with the diagnostic and exit 1; output printed before it
+remains visible, as it does under `wukongc --run`.
 
 Compact float-to-boolean vector casts use scalar lane legalization inside their containing
 function. This preserves one-byte boolean storage, block arguments, load/store/extract,

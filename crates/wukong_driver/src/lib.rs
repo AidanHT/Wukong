@@ -472,18 +472,29 @@ pub fn compile(opts: &Options) -> i32 {
             return exit::COMPILE_ERROR;
         }
         let main = interner.intern("main");
-        let result = match opts.backend {
-            BackendKind::Interp => wukong_interp::run_with_output(&program, main, &interner),
-            BackendKind::Native => wukong_codegen_cranelift::jit_run(&program, main, &interner),
-            BackendKind::Gpu => run_on_gpu(&program, main, &interner),
-            BackendKind::GpuLower => run_on_gpu_lower(&program, main, &interner),
+        // The CPU paths report what the program printed *before* a runtime failure (a failed
+        // `assert`, a slice index out of bounds) along with the failure, so `--run` shows the same
+        // stdout a linked executable does — the output is printed, then `error: …`, exit 1.
+        let split = |r: Result<(i64, Vec<u8>), String>| match r {
+            Ok((code, out)) => (Ok(code), out),
+            Err(e) => (Err(e), Vec::new()),
         };
-        return match result {
-            Ok((exit_code, stdout)) => {
-                use std::io::Write;
-                let _ = std::io::stdout().write_all(&stdout);
-                exit_code as i32
+        let (result, stdout) = match opts.backend {
+            BackendKind::Interp => wukong_interp::run_capturing(&program, main, &interner),
+            BackendKind::Native => {
+                wukong_codegen_cranelift::jit_run_capturing(&program, main, &interner)
             }
+            BackendKind::Gpu => split(run_on_gpu(&program, main, &interner)),
+            BackendKind::GpuLower => split(run_on_gpu_lower(&program, main, &interner)),
+        };
+        {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&stdout);
+            let _ = out.flush();
+        }
+        return match result {
+            Ok(exit_code) => exit_code as i32,
             Err(e) => {
                 eprintln!("error: {e}");
                 exit::COMPILE_ERROR

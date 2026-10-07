@@ -22,8 +22,11 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 ## Works end to end (interpreter `--run`, **and native code** `--backend=native`)
 
 The MIR interpreter and **Cranelift native backend** execute the supported language subset.
-Corpus differential tests compare outputs across optimization levels. Unsupported constructs,
-assertion-output differences, and C-link fallback output remain documented limitations.
+Corpus differential tests compare outputs across optimization levels. Unsupported constructs and
+C-link fallback output remain documented limitations. A runtime failure (a failed `assert`, a slice
+index out of bounds) stops the program at the same statement on every path — interpreter, JIT,
+linked executable, and inside a `@parallel` region (the earliest failing iteration is reported) —
+keeping the output printed before it, with exit status 1 (`tests/run/assert_fail_trailing_output.wk`).
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
@@ -131,8 +134,8 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   call site (`let s: []T = arr` / `f(arr)`). A write through the slice aliases the backing array. The
   16-byte fat pointer is a by-pointer aggregate the two backends address identically, so interp ==
   native bit-for-bit and -O0 == -O3 (`tests/run/slice_basics.wk`). The element types must match on
-  the unsizing coercion, and a scalar passed where a slice is expected is E0401; slice indexing is a
-  runtime-length view (unchecked, like a pointer — a slice has no static length to bounds-check).
+  the unsizing coercion, and a scalar passed where a slice is expected is E0401; slice indexing is
+  checked against the runtime length in the fat pointer (see *Slice accesses are bounds-checked*).
 - **Heap allocation (v1)** — `alloc_<T>(n) -> []T` and `free(s)`: the first *runtime-sized* buffers
   (every other buffer is a fixed-size stack array). The surface is the typed per-scalar family
   `alloc_f32`/`f64`/`i32`/`i64`/`i8`/`u8`/`f16`/`bf16` (chosen over a generic `alloc<T>` — sema types

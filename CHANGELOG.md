@@ -7,6 +7,19 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Language safety (gap/lang-safety)
 
+- **A runtime failure means one thing on every execution path.** `wukongc --run` now prints the
+  stdout a program produced before a failed `assert` or slice bounds check (then `error: …`, exit 1)
+  instead of discarding it, so it agrees with a linked executable, and the differential gate now
+  compares that output across the interpreter and the JIT (`wukong_interp::run_capturing`,
+  `JitProgram::run_capturing`, `jit_run_capturing`). Failure-capable `@parallel` region bodies are
+  no longer a native compile error ("assertion-capable callback … requires a cancellation ABI"):
+  the guarded JIT binds `wukong_parallel_for` to `rt_parallel_for`, which keeps each span's
+  failure in a per-thread slot, skips spans after an already-failed one, and reports the failure of
+  the lowest-starting failed span — the failure the in-order interpreter reports — to a caller that
+  then returns at once. The raw `jit_module` API accepts assertions with abort-on-failure semantics,
+  as it already did for bounds checks. `tests/run/assert_fail_trailing_output.wk`, added with
+  `slice_bounds_oob.wk` to the `exe.rs` AOT gate.
+
 - **Bounds-check elimination (`wukong_opt::bce`, `-O2`).** An innermost counted loop whose slice
   checks are provable is versioned on a preheader guard: `start < end`, then per check
   `lo <=u hi && hi <u len` at the two ends of an index of the form `±iv + invariant` (sound under

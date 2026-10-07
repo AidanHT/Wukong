@@ -397,6 +397,20 @@ pub fn run_with_output(
     entry: Symbol,
     interner: &Interner,
 ) -> Result<(i64, Vec<u8>), String> {
+    let (result, stdout) = run_capturing(program, entry, interner);
+    result.map(|code| (code, stdout))
+}
+
+/// Run `entry` and return its exit code or its run error **together with everything it printed
+/// before it stopped** — also when it stopped on a runtime failure (a failed `assert`, a slice
+/// bounds failure). A linked executable has always kept that output (its prints reach stdout as
+/// they happen); `wukongc --run` prints it before the error so all three execution paths show the
+/// same thing, and the differential gate compares it.
+pub fn run_capturing(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+) -> (Result<i64, String>, Vec<u8>) {
     // The tree-walker recurses on the *host* call stack — one host frame per Wukong call — so a
     // deeply recursive Wukong program would overflow the default main-thread stack and **abort**
     // the process (a stack overflow is uncatchable). The interpreter is the correctness oracle; an
@@ -406,9 +420,12 @@ pub fn run_with_output(
     // reports a diagnostic instead of overflowing even 512 MiB. Every other public entry point
     // does the same — they are all the same tree-walker.
     with_big_stack(|| {
-        let func = program
-            .function(entry)
-            .ok_or_else(|| format!("no entry function `{}`", interner.resolve(entry)))?;
+        let Some(func) = program.function(entry) else {
+            return (
+                Err(format!("no entry function `{}`", interner.resolve(entry))),
+                Vec::new(),
+            );
+        };
         let mut interp = Interp {
             program,
             interner,
@@ -426,8 +443,8 @@ pub fn run_with_output(
             accel: None,
             depth: 0,
         };
-        let result = interp.run_function(func, &[])?;
-        Ok((result.as_int() as i64, interp.stdout))
+        let result = interp.run_function(func, &[]).map(|v| v.as_int() as i64);
+        (result, interp.stdout)
     })
 }
 

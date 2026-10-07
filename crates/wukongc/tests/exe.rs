@@ -139,6 +139,10 @@ fn exe_matches_run() {
         "transcendental_kernel.wk", // `wukong_vmath_f32` linked into the exe
         "tensor_matmul.wk",         // `wukong_sgemm` linked into the exe
         "heap_alloc.wk",            // `wukong_rt_alloc`/`wukong_rt_free` linked into the exe
+        // A failing run: the exe exits 1 at the failure with the output printed before it, which
+        // `--run` must match on both counts (stdout before the failure, exit 1).
+        "assert_fail_trailing_output.wk", // a failed `assert` in a callee, output on both sides
+        "slice_bounds_oob.wk",            // `wukong_rt_bounds_fail` linked into the exe
     ];
 
     let path = probe_link_path();
