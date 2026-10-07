@@ -5,6 +5,28 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Diagnostic surface: suggestions, JSON v1, `--emit=check`, color env, `--explain` examples (`gap2/diag-surface`)
+
+- **Structured suggestions.** `wukong_diag` gains `Suggestion { span, replacement, message,
+  applicability }` and `Applicability`, with `Diagnostic::suggest`/`suggest_with`, plus a shared
+  `did_you_mean`/`levenshtein`. Suggestions render as a `help:` line and are emitted in JSON.
+- **JSON schema v1.** Each span now carries `line_end`, `col_end`, `byte_start`, `byte_end`; each
+  diagnostic gains `suggestions`, `children`, a `rendered` (plain-text) field and a top-level
+  `"version":1`. The v0 prefix (`severity`, `code`, `message`, `spans`, `notes`) is unchanged, so
+  the compile-fail gate keeps parsing. Nine driver `eprintln!("error: …")` sites that bypassed the
+  JSON stream now emit real diagnostics through `--error-format`.
+- **Renderer.** A secondary label in another file gets a `::: file:line:col` header instead of
+  showing a bare line number under the root file's arrow; carets are padded by display width so they
+  stay aligned under CJK/wide characters; diagnostics are separated by a blank line and followed by
+  an "aborting due to N previous errors" summary; `--error-limit=<n>` caps printed errors.
+- **`--emit=check`.** Runs lex, parse, import resolution and sema, reports diagnostics, and stops
+  before MIR lowering — a fast editor check loop with no `C0001` lowering limits in the way.
+- **Color.** `--color=auto` now honors `NO_COLOR`, `CLICOLOR_FORCE` and `TERM=dumb`, and enables
+  Windows VT processing (falling back to no color when stderr is not a configurable console).
+- **`--explain`.** `entry!` gains optional `bad:`/`good:` worked examples; `crates/wukongc/tests/explain.rs`
+  compiles each (`bad` must produce exactly its code, `good` must check clean) so an example cannot
+  drift from its rule. A bare `--explain` now lists every code with its title.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

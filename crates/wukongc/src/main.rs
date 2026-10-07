@@ -14,8 +14,9 @@ USAGE:
 OPTIONS:
     --verify-each     Verify MIR after every optimizer pass (also in release builds)
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
-                       tokens, ast, mir-high, mir, grad, llvm-ir, obj, exe  (default: exe)
+                       tokens, ast, check, mir-high, mir, grad, llvm-ir, obj, exe  (default: exe)
                        (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
+                       (check = run lex/parse/imports/sema only, report diagnostics, no lowering)
     --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss)
     --grad-wrt=<i,..>  Comma-separated parameter indices to differentiate w.r.t. (default: all
                        buffer parameters of the loss function). For --train, these are the
@@ -35,8 +36,10 @@ OPTIONS:
                        file; every other stage prints its artifact on stdout.
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
+                       auto honors NO_COLOR, CLICOLOR_FORCE and TERM=dumb, and enables Windows VT
     --error-format=<f> Diagnostic output format: human, json  (default: human)
-    --explain <CODE>   Print the extended explanation for an error code, then exit
+    --error-limit=<n>  Print at most n errors before suppressing the rest (0 = unlimited; default)
+    --explain [CODE]   Print the extended explanation for an error code (no code: list all codes)
     -h, --help         Print this help
     -V, --version      Print version
 
@@ -78,6 +81,100 @@ fn run_compile(opts: Options) -> i32 {
         .unwrap_or(wukong_driver::exit::COMPILE_ERROR)
 }
 
+/// How the user asked diagnostics to be colored (`--color=<when>`), resolved to a concrete on/off
+/// decision by [`resolve_color`] once the whole environment has been read.
+#[derive(Clone, Copy)]
+enum ColorChoice {
+    Always,
+    Never,
+    Auto,
+}
+
+/// Resolve a [`ColorChoice`] to a concrete on/off decision, honoring the standard environment
+/// overrides and (on Windows) enabling VT processing so the ANSI escapes the renderer emits are
+/// actually interpreted rather than printed literally.
+///
+/// `auto` precedence matches the de-facto contract shared by `cargo`, `ls` and rustc:
+/// `CLICOLOR_FORCE` (non-empty, not `0`) forces color on; otherwise `NO_COLOR` (non-empty) or
+/// `TERM=dumb` forces it off; otherwise color follows whether stderr is a terminal. `always` and
+/// `never` ignore the environment.
+///
+/// `always` forces color on and only *tries* to switch the console into VT mode (best effort),
+/// matching rustc: the user has explicitly accepted escape codes, including down a pipe or into a
+/// file where no console mode applies. For `auto`, VT setup that fails turns color back off, because
+/// raw escape codes in an interactive console that cannot interpret them are worse than plain text.
+fn resolve_color(when: ColorChoice) -> bool {
+    match when {
+        ColorChoice::Always => {
+            let _ = enable_vt_processing();
+            true
+        }
+        ColorChoice::Never => false,
+        ColorChoice::Auto => auto_color() && enable_vt_processing(),
+    }
+}
+
+fn auto_color() -> bool {
+    use std::env;
+    let nonempty = |k: &str| env::var_os(k).is_some_and(|v| !v.is_empty());
+    // CLICOLOR_FORCE wins when set to anything other than "0".
+    if env::var_os("CLICOLOR_FORCE").is_some_and(|v| !v.is_empty() && v != "0") {
+        return true;
+    }
+    if nonempty("NO_COLOR") {
+        return false;
+    }
+    if env::var_os("TERM").is_some_and(|v| v == "dumb") {
+        return false;
+    }
+    std::io::IsTerminal::is_terminal(&std::io::stderr())
+}
+
+/// Enable ANSI VT processing on the stderr console (Windows). Returns whether color should be used:
+/// `true` when the escapes will render (already a VT-capable console, or we switched it on), `false`
+/// when stderr is not a console we can configure. On non-Windows platforms this is always `true`.
+#[cfg(windows)]
+fn enable_vt_processing() -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::raw::HANDLE;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    // The two kernel32 entry points keep their Windows PascalCase names (they are the link symbols).
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn GetConsoleMode(handle: HANDLE, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: HANDLE, mode: u32) -> i32;
+    }
+    // `RawHandle` is `*mut c_void` i.e. `HANDLE`; no cast is needed.
+    let handle: HANDLE = std::io::stderr().as_raw_handle();
+    // SAFETY: `handle` is the process's live stderr handle; both calls only read/write a mode flag.
+    unsafe {
+        let mut mode: u32 = 0;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            // stderr is redirected to a file or pipe: there is no console to interpret escapes.
+            return false;
+        }
+        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+            return true;
+        }
+        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_vt_processing() -> bool {
+    true
+}
+
+/// List every diagnostic code with its one-line title (`--explain` with no code).
+fn list_all_codes() {
+    println!(
+        "Wukong diagnostic codes (run `wukongc --explain <CODE>` for the full explanation):\n"
+    );
+    for e in wukong_driver::all_explanations() {
+        println!("  {:<6}{}", e.code, e.title);
+    }
+}
+
 /// Print the extended explanation for an error code to stdout.
 fn print_explanation(code: &str) -> Result<(), String> {
     match wukong_driver::explain(code) {
@@ -99,6 +196,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut opts = Options::default();
     let mut input: Option<PathBuf> = None;
     let mut emit_explicit = false;
+    let mut color_choice = ColorChoice::Auto;
 
     let mut i = 0;
     while i < args.len() {
@@ -113,11 +211,14 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 return Ok(None);
             }
             "--explain" => {
-                i += 1;
-                let code = args
-                    .get(i)
-                    .ok_or("`--explain` requires an error code, e.g. E0502")?;
-                print_explanation(code)?;
+                // `--explain <CODE>` explains one code; a bare `--explain` lists every code.
+                match args.get(i + 1) {
+                    Some(code) if !code.starts_with('-') => {
+                        i += 1;
+                        print_explanation(code)?;
+                    }
+                    _ => list_all_codes(),
+                }
                 return Ok(None);
             }
             "--run" => opts.run = true,
@@ -217,12 +318,20 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             }
             _ if arg.starts_with("--color=") => {
                 let when = &arg["--color=".len()..];
-                opts.color = match when {
-                    "always" => true,
-                    "never" => false,
-                    "auto" => std::io::IsTerminal::is_terminal(&std::io::stderr()),
+                color_choice = match when {
+                    "always" => ColorChoice::Always,
+                    "never" => ColorChoice::Never,
+                    "auto" => ColorChoice::Auto,
                     other => return Err(format!("unknown --color value `{other}`")),
                 };
+            }
+            _ if arg.starts_with("--error-limit=") => {
+                let v = &arg["--error-limit=".len()..];
+                let n: usize = v.parse().map_err(|_| {
+                    format!("--error-limit expects a non-negative integer, got `{v}`")
+                })?;
+                // 0 means "no limit", matching rustc.
+                opts.error_limit = if n == 0 { None } else { Some(n) };
             }
             _ if arg.starts_with('-') && arg != "-" => {
                 return Err(format!("unknown option `{arg}`"));
@@ -237,10 +346,9 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         i += 1;
     }
 
-    // Default color decision when not explicitly set: respect TTY.
-    if !args.iter().any(|a| a.starts_with("--color=")) {
-        opts.color = std::io::IsTerminal::is_terminal(&std::io::stderr());
-    }
+    // Resolve color once the whole environment is known: `--color` (or its `auto` default) plus the
+    // NO_COLOR / CLICOLOR_FORCE / TERM conventions, and VT setup on Windows.
+    opts.color = resolve_color(color_choice);
 
     let input = input.ok_or("no input file given")?;
     opts.input = input;
@@ -311,5 +419,33 @@ mod tests {
                 .verify_each
         );
         assert!(USAGE.contains("--verify-each"));
+    }
+
+    #[test]
+    fn error_limit_parses_and_zero_means_unlimited() {
+        let o = parse_args(&["--error-limit=5".to_owned(), "p.wk".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.error_limit, Some(5));
+        let z = parse_args(&["--error-limit=0".to_owned(), "p.wk".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(z.error_limit, None);
+        assert!(parse_args(&["--error-limit=x".to_owned(), "p.wk".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn emit_check_is_a_stage() {
+        let o = parse_args(&["--emit=check".to_owned(), "p.wk".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.emit, EmitStage::Check);
+        assert!(USAGE.contains("check ="));
+    }
+
+    #[test]
+    fn explain_with_no_code_is_accepted() {
+        // A bare `--explain` lists all codes and exits successfully (Ok(None)).
+        assert!(parse_args(&["--explain".to_owned()]).unwrap().is_none());
     }
 }

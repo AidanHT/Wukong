@@ -17,11 +17,19 @@
 //! `E0001` (was "malformed type syntax"; no stage ever emitted it — the parser reports malformed
 //! types as `E0203`/`E0204`).
 
-/// One catalog entry: a stable code, a one-line title, and a longer explanation (Markdown-ish).
+/// One catalog entry: a stable code, a one-line title, a longer explanation (Markdown-ish), and an
+/// optional worked example pair.
 pub struct Explanation {
     pub code: &'static str,
     pub title: &'static str,
     pub body: &'static str,
+    /// A complete, erroneous `.wk` program whose *first* diagnostic is exactly `code`. Compiled by
+    /// `crates/wukongc/tests/explain.rs` (via `--emit=check`), so a catalogue example can never
+    /// silently drift away from the rule it documents. `None` where no example has been written yet.
+    pub bad: Option<&'static str>,
+    /// The corrected counterpart of [`bad`](Self::bad): the same program, fixed, which must compile
+    /// clean under `--emit=check`.
+    pub good: Option<&'static str>,
 }
 
 /// Look up the extended explanation for an error code (case-insensitive).
@@ -41,6 +49,17 @@ macro_rules! entry {
             code: $code,
             title: $title,
             body: $body,
+            bad: None,
+            good: None,
+        }
+    };
+    ($code:literal, $title:literal, $body:literal, bad: $bad:literal, good: $good:literal) => {
+        Explanation {
+            code: $code,
+            title: $title,
+            body: $body,
+            bad: Some($bad),
+            good: Some($good),
         }
     };
 }
@@ -151,7 +170,9 @@ static CATALOG: &[Explanation] = &[
         "`break`/`continue` outside of a loop",
         "A `break` or `continue` statement appeared outside of any enclosing `while`, `for`, or \
          `loop`. These statements only have meaning inside a loop body. Remove it, or wrap the code \
-         in a loop."
+         in a loop.",
+        bad: "module ex.e0303\nfn main() -> i32 {\n    break;\n    return 0;\n}\n",
+        good: "module ex.e0303\nfn main() -> i32 {\n    let i: i32 = 0;\n    while i < 1 {\n        break;\n    }\n    return 0;\n}\n"
     ),
     entry!(
         "E0304",
@@ -163,7 +184,9 @@ static CATALOG: &[Explanation] = &[
          *aggregate parameter* is NOT: an aggregate parameter is passed by reference, so \
          `fn f(p: S) { p.a = 9; }` would write into the caller's value — add `mut` to the parameter \
          (`fn f(mut p: S)`). Writing through a pointer parameter (`*p = …`) needs no `mut`, because \
-         the pointer itself is not being reassigned."
+         the pointer itself is not being reassigned.",
+        bad: "module ex.e0304\nfn main() -> i32 {\n    let x: i32 = 5;\n    x = 10;\n    return x;\n}\n",
+        good: "module ex.e0304\nfn main() -> i32 {\n    let mut x: i32 = 5;\n    x = 10;\n    return x;\n}\n"
     ),
     entry!(
         "E0305",
@@ -254,7 +277,9 @@ static CATALOG: &[Explanation] = &[
          falls through to `Unreachable`, which the interpreter traps but the native backend hits as \
          an illegal instruction. Add a `_ => …` arm (or, for an `enum`, an arm for every remaining \
          variant; for a `bool`, both `true` and `false`) so the match is total, as in Rust. Guarded \
-         arms (`if …`) do not count toward coverage because their guard may be false."
+         arms (`if …`) do not count toward coverage because their guard may be false.",
+        bad: "module ex.e0405\nenum Color { Red, Green, Blue }\nfn name(c: Color) -> i32 {\n    return match c {\n        Color::Red => 1,\n        Color::Green => 2,\n    };\n}\nfn main() -> i32 {\n    return name(Color::Blue);\n}\n",
+        good: "module ex.e0405\nenum Color { Red, Green, Blue }\nfn name(c: Color) -> i32 {\n    return match c {\n        Color::Red => 1,\n        Color::Green => 2,\n        Color::Blue => 3,\n    };\n}\nfn main() -> i32 {\n    return name(Color::Blue);\n}\n"
     ),
     entry!(
         "E0406",
@@ -338,5 +363,25 @@ mod tests {
             assert!(!e.title.is_empty());
             assert!(e.body.len() > 20, "{} has a thin explanation", e.code);
         }
+    }
+
+    #[test]
+    fn examples_come_in_pairs_and_some_exist() {
+        let mut with_examples = 0;
+        for e in all() {
+            assert_eq!(
+                e.bad.is_some(),
+                e.good.is_some(),
+                "{} has only one of bad/good; an example needs both",
+                e.code
+            );
+            if e.bad.is_some() {
+                with_examples += 1;
+            }
+        }
+        assert!(
+            with_examples >= 3,
+            "expected at least a few worked examples; found {with_examples}"
+        );
     }
 }
