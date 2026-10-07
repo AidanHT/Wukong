@@ -116,10 +116,13 @@
 //! build and compile speed is one of this compiler's few genuine strengths.
 //! `WUKONG_NO_UNROLL=1` turns it off (bisecting a miscompile, or A/B measurement).
 //!
-//! Autodiff is unaffected even though `wukong_driver` runs it after `optimize`: `wukong_autodiff::grad`
-//! refuses any function with more than one basic block and differentiates calls by callee *symbol*,
-//! never by re-entering a callee's body — so a function it accepts has no loop for this pass to
-//! touch, and a function this pass touches was already rejected.
+//! Autodiff runs after `optimize` in `wukong_driver`, and `wukong_autodiff::grad` refuses any
+//! function with more than one basic block. Partial unrolling never changes which functions that
+//! admits (the loop is still there). Complete unrolling can: once the cleanup merges the copies into
+//! the preheader, a loss function whose only loop was a short constant-trip one is straight-line at
+//! `-O2` and is accepted there, while `-O1` (no unrolling) still rejects it. That is a capability
+//! gain, not a semantic change — the copies compute the original values in the original order, so
+//! the forward value and its derivative are those of the loop.
 //!
 //! # What it buys, measured
 //!
@@ -1161,7 +1164,13 @@ mod tests {
             .insts
             .iter()
             .any(|i| matches!(i.op, Op::Select(..))));
-        crate::PassManager::unroll_cleanup().run_function(&mut f, None, None);
+        let mut program = wukong_mir::Program::default();
+        program.funcs.push(f);
+        crate::PassManager::unroll_cleanup().run_subset(&mut program, &[0]);
+        let f = program
+            .funcs
+            .pop()
+            .expect("the function survives its cleanup");
         assert!(f.blocks[0]
             .insts
             .iter()

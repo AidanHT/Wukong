@@ -358,7 +358,10 @@ greatest fixpoint, so recursion is fine), no barrier or shared slot or element-w
 and no pointer return, pointer compare or `ptrtoint` unless the pointer was handed in or names static
 data. The summary records whether it reads caller-visible memory, whether it always returns (no
 loop, recursion or `unreachable`), and whether it is speculatable (always returns, reads nothing, no
-integer division). External `print`/`wukong_*` symbols are never summarized.
+integer division, and no load or store outside a known in-bounds offset of its own frame — exactly
+what LICM would speculate itself). External `print`/`wukong_*` symbols are never summarized. The
+post-unroll cleanup (`PassManager::run_subset`) re-summarizes the whole program from its unrolled
+bodies first, so a callee whose short loop was unrolled away now counts as always returning.
 
 One splice detail generalizes to every MIR pass: `Op::VecKernelCall.kernel` is a **function-local**
 index, not a `ValueId`, so value renaming neither sees nor fixes it, and `inline_call_site` must carry

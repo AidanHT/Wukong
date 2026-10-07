@@ -23,9 +23,12 @@
 //!
 //! On top of that, a summary records whether the function **reads** memory its caller can observe
 //! (a load not provably from its own frame or from read-only static data), whether it **always
-//! returns** (no loop, no recursion, no `unreachable`, only callees that always return), and whether
-//! it is **speculatable** — always returns, reads nothing, and contains no integer division, which
-//! is the one operation LICM refuses to speculate.
+//! returns** (no loop, no recursion, no `unreachable`, no store that may fall outside its slot —
+//! the store `dse` refuses to delete for the same reason — and only callees that always return),
+//! and whether it is **speculatable** — always returns, reads nothing, and holds nothing LICM would
+//! refuse to speculate in its own loop: no integer division, and no load or store outside a known
+//! in-bounds offset of its own frame (a frame slot indexed by an argument may fault for arguments a
+//! zero-trip loop never passes).
 //!
 //! Recursion is handled the standard way for a property only a write can break: the members of one
 //! call-graph SCC are assumed side-effect free while their calls to one another are examined (the
@@ -47,7 +50,7 @@
 //! its summary — is preserved by every later transform, which is what makes it sound to use the
 //! table while other functions are still being optimized.
 
-use wukong_mir::{AddrSpace, BinOp, CastKind, Function, MirType, Op, Program, Terminator};
+use wukong_mir::{AddrSpace, BinOp, CastKind, Function, MirType, Op, Program, Terminator, ValueId};
 use wukong_span::Symbol;
 
 use crate::alias::{AliasInfo, Prov};
@@ -74,6 +77,18 @@ pub(crate) struct CallEffects {
 }
 
 impl CallEffects {
+    /// Summarize every function of `program` from its body as it stands now, callees first. The
+    /// pass manager builds its table incrementally instead, as each SCC finishes optimizing; this
+    /// is for a pass over functions whose callees are already done (the post-unroll cleanup).
+    pub(crate) fn of(program: &Program) -> CallEffects {
+        let graph = CallGraph::of(program);
+        let mut table = CallEffects::default();
+        for scc in 0..graph.sccs.len() {
+            graph.summarize(program, scc, &mut table);
+        }
+        table
+    }
+
     pub(crate) fn get(&self, func: Symbol) -> Option<CallEffect> {
         self.map.get(&func).copied()
     }
@@ -215,6 +230,12 @@ fn classify(f: &Function, table: &CallEffects, scc: &[Symbol]) -> Option<Local> 
     // A pointer handed in, or the address of static data: the same on every call with these
     // arguments, unlike anything in the frame.
     let stable = |prov: Prov| matches!(prov, Prov::Param(_) | Prov::Global(_));
+    // Could this access fault where the program would not have made it? Only an access LICM itself
+    // would speculate — inside this function's own slot at a known in-bounds offset — is safe to
+    // run from a preheader on a zero-trip entry; a frame slot indexed by an argument is not.
+    let in_bounds = |alias: &AliasInfo, ptr: ValueId, op: &Op| {
+        AliasInfo::access_bytes(f, op).is_some_and(|bytes| alias.is_dereferenceable(ptr, bytes))
+    };
     for b in &f.blocks {
         if matches!(b.term, Terminator::Unreachable) {
             local.returns = false;
@@ -222,15 +243,23 @@ fn classify(f: &Function, table: &CallEffects, scc: &[Symbol]) -> Option<Local> 
         for inst in &b.insts {
             match &inst.op {
                 Op::Store { ptr, .. } => {
-                    let alias = facts.get_or_insert_with(|| AliasInfo::analyze(f));
+                    let alias: &AliasInfo = facts.get_or_insert_with(|| AliasInfo::analyze(f));
                     if !matches!(alias.prov(*ptr), Prov::Alloca(_)) {
                         return None;
                     }
+                    // A store `dse` would keep for the same reason: at an argument-chosen offset
+                    // it may fault, and deleting the call must not hide that.
+                    if !in_bounds(alias, *ptr, &inst.op) {
+                        local.returns = false;
+                    }
                 }
                 Op::Load(ptr, _) => {
-                    let alias = facts.get_or_insert_with(|| AliasInfo::analyze(f));
+                    let alias: &AliasInfo = facts.get_or_insert_with(|| AliasInfo::analyze(f));
                     if !matches!(alias.prov(*ptr), Prov::Alloca(_) | Prov::Global(_)) {
                         local.reads = true;
+                    }
+                    if !in_bounds(alias, *ptr, &inst.op) {
+                        local.speculatable = false;
                     }
                 }
                 Op::Cast(CastKind::PtrToInt, v, _) => {
@@ -284,18 +313,10 @@ mod tests {
     use wukong_mir::Builder;
     use wukong_span::Interner;
 
-    fn summarize_all(program: &Program) -> CallEffects {
-        let graph = CallGraph::of(program);
-        let mut table = CallEffects::default();
-        for scc in 0..graph.sccs.len() {
-            graph.summarize(program, scc, &mut table);
-        }
-        table
-    }
-
     /// `leaf(x) = x * x` (pure), `reader(p) = *p` (reads), `writer(p) = { *p = 1 }` (impure),
-    /// `looper(n)` (pure, but may not return), `printer(x)` (calls an external symbol), plus a
-    /// caller of each so every one is summarized.
+    /// `looper(n)` (pure, but may not return), `printer(x)` (calls an external symbol), `scratch`
+    /// and `indexer` (frame slots, at a fixed and at an argument-chosen position), plus a caller of
+    /// each so every one is summarized.
     fn zoo(it: &mut Interner) -> Program {
         let mut funcs = Vec::new();
         let mut leaf = Builder::new(it.intern("leaf"), MirType::I64);
@@ -361,6 +382,23 @@ mod tests {
         scratch.ret(Some(call));
         funcs.push(scratch.finish());
 
+        // A frame slot read at a position the argument picks: invisible to the caller like
+        // `scratch`, but an out-of-range argument may fault, so not something to speculate.
+        let mut indexer = Builder::new(it.intern("indexer"), MirType::I64);
+        let i = indexer.add_param(MirType::I64);
+        let table = indexer.alloca(MirType::Array(Box::new(MirType::I64), 4));
+        let at = indexer.build(
+            MirType::Ptr,
+            Op::Gep {
+                ptr: table,
+                index: i,
+                elem: MirType::I64,
+            },
+        );
+        let got = indexer.build(MirType::I64, Op::Load(at, MirType::I64));
+        indexer.ret(Some(got));
+        funcs.push(indexer.finish());
+
         let mut main = Builder::new(it.intern("main"), MirType::I64);
         let slot = main.alloca(MirType::I64);
         let k = main.build(MirType::I64, Op::ConstInt(3, MirType::I64));
@@ -371,6 +409,7 @@ mod tests {
             ("looper", vec![k]),
             ("printer", vec![k]),
             ("scratch", vec![k]),
+            ("indexer", vec![k]),
         ] {
             main.build_void(Op::Call {
                 func: it.intern(name),
@@ -389,7 +428,7 @@ mod tests {
     fn summaries_separate_pure_reading_looping_and_effectful_functions() {
         let mut it = Interner::new();
         let program = zoo(&mut it);
-        let table = summarize_all(&program);
+        let table = CallEffects::of(&program);
         let mut get = |name: &str| table.get(it.intern(name));
         let pure = CallEffect {
             reads_memory: false,
@@ -401,6 +440,15 @@ mod tests {
             get("scratch"),
             Some(pure),
             "frame-local memory is invisible"
+        );
+        assert_eq!(
+            get("indexer"),
+            Some(CallEffect {
+                reads_memory: false,
+                will_return: true,
+                speculatable: false,
+            }),
+            "an argument-indexed frame access is invisible but may fault"
         );
         assert_eq!(
             get("reader"),
@@ -461,7 +509,7 @@ mod tests {
         funcs.push(main.finish());
         let mut program = Program::new();
         program.funcs = funcs;
-        let table = summarize_all(&program);
+        let table = CallEffects::of(&program);
         for name in [even, odd] {
             assert_eq!(
                 table.get(name),

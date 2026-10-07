@@ -1655,11 +1655,7 @@ mod tests {
         Dce.run_function(&mut opaque, &mut cache);
         assert_eq!(calls(&opaque), 3);
 
-        let graph = crate::effects::CallGraph::of(&program);
-        let mut table = crate::effects::CallEffects::default();
-        for scc in 0..graph.sccs.len() {
-            graph.summarize(&program, scc, &mut table);
-        }
+        let table = crate::effects::CallEffects::of(&program);
         let mut cache = CfgAnalyses::managed(Some(std::rc::Rc::new(table)));
         let f = &mut program.funcs[1];
         assert!(Cse.run_function(f, &mut cache));

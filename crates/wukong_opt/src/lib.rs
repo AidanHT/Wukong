@@ -202,7 +202,10 @@ impl PassManager {
     /// header parameters into the entry values, `Simplify` then folds every copy's induction
     /// variable into a constant, and `SimplifyPhis` drops what is left of the parameters. (A
     /// constant trip count needs no remainder loop at all — the unroller knows it exactly.)
-    fn unroll_cleanup() -> PassManager {
+    ///
+    /// Public, with [`PassManager::run_subset`], so that a measurement replica of [`optimize`] can
+    /// wrap exactly these passes and drive them exactly as `optimize` does.
+    pub fn unroll_cleanup() -> PassManager {
         let mut pm = PassManager::new();
         pm.add(Box::new(Simplify));
         pm.add(Box::new(SimplifyCfg));
@@ -222,34 +225,56 @@ impl PassManager {
     /// Run with fallible verification in every build profile. Check each pass that actually ran,
     /// including one reporting no mutation, and whole-program call signatures at the boundaries.
     pub fn run_verified(&self, program: &mut Program) -> Result<(), VerificationFailure> {
-        self.run_verified_program(program).map(|_| ())
+        verify_program_stage(program, "pipeline input")?;
+        self.run_program(program, None, true)?;
+        verify_program_stage(program, "pipeline output")
     }
 
-    fn run_verified_program(
+    /// Run the pipeline over just the functions at `funcs`, in that order — what [`optimize`] does
+    /// to the functions loop unrolling changed. Every function's passes see the call effects of the
+    /// whole program *as it stands*, summarized afresh, so a callee whose loop was just unrolled
+    /// away is judged by its new body. Public so a measurement replica that wraps these passes runs
+    /// the identical sequence (`wukong_bench compile-work` checks it byte for byte).
+    pub fn run_subset(&self, program: &mut Program, funcs: &[usize]) {
+        self.run_subset_checked(program, funcs, cfg!(debug_assertions))
+            .unwrap_or_else(|failure| panic!("{failure}"));
+    }
+
+    fn run_subset_checked(
         &self,
         program: &mut Program,
-    ) -> Result<Rc<CallEffects>, VerificationFailure> {
-        verify_program_stage(program, "pipeline input")?;
-        let effects = self.run_program(program, None, true)?;
-        verify_program_stage(program, "pipeline output")?;
-        Ok(effects)
+        funcs: &[usize],
+        verify_each: bool,
+    ) -> Result<(), VerificationFailure> {
+        if funcs.is_empty() || self.passes.is_empty() {
+            return Ok(());
+        }
+        let effects = Rc::new(CallEffects::of(program));
+        for &i in funcs {
+            self.run_function_checked(
+                &mut program.funcs[i],
+                None,
+                verify_each,
+                Some(Rc::clone(&effects)),
+            )?;
+        }
+        Ok(())
     }
 
     /// Run the pipeline over every function, callees before callers, summarizing each call-graph
     /// SCC as soon as its members are optimized so that their callers — processed later — can treat
-    /// side-effect-free calls like instructions. Returns the final summary table, which the
-    /// post-unroll cleanup reuses. The order is a pure function of the program, so the output is as
-    /// deterministic as before; only which function is optimized first changed.
+    /// side-effect-free calls like instructions. The order is a pure function of the program, so
+    /// the output is as deterministic as before; only which function is optimized first changed.
     fn run_program(
         &self,
         program: &mut Program,
         mut timings: Option<&mut Timings>,
         verify_each: bool,
-    ) -> Result<Rc<CallEffects>, VerificationFailure> {
-        let mut effects = Rc::new(CallEffects::default());
+    ) -> Result<(), VerificationFailure> {
         if self.passes.is_empty() {
-            return Ok(effects);
+            return Ok(());
         }
+        let mut effects = Rc::new(CallEffects::default());
         let graph = CallGraph::of(program);
         for (scc, members) in graph.sccs.iter().enumerate() {
             for &i in members {
@@ -264,22 +289,12 @@ impl PassManager {
             // the table in place.
             graph.summarize(program, scc, Rc::make_mut(&mut effects));
         }
-        Ok(effects)
+        Ok(())
     }
 
     /// The fixpoint driver. `timings` is `None` on the production path (zero overhead); the bench
     /// harness passes `Some(..)` to accumulate per-pass wall time. The `timings` branch does not
     /// change which passes run or in what order, so the resulting MIR is identical either way.
-    fn run_function(
-        &self,
-        f: &mut wukong_mir::Function,
-        timings: Option<&mut Timings>,
-        effects: Option<Rc<CallEffects>>,
-    ) {
-        self.run_function_checked(f, timings, cfg!(debug_assertions), effects)
-            .unwrap_or_else(|failure| panic!("{failure}"));
-    }
-
     fn run_function_checked(
         &self,
         f: &mut wukong_mir::Function,
@@ -364,22 +379,14 @@ pub fn optimize_preserving(program: &mut Program, opt_level: u8, roots: &[wukong
     if opt_level >= 2 {
         inline::inline_program_preserving(program, roots);
     }
-    let pm = PassManager::standard(opt_level);
-    let effects = pm
-        .run_program(program, None, cfg!(debug_assertions))
-        .unwrap_or_else(|failure| panic!("{failure}"));
+    PassManager::standard(opt_level).run(program);
     // Unrolling runs after the pipeline, not inside its fixpoint: it needs the canonical two-block
     // counted loop that mem2reg/simplify-cfg produce, and re-running it on its own output would
     // unroll the same loop again every sweep. Only the functions it touched are re-optimized, so a
     // program with no unrollable loop pays one scan and nothing more.
     if opt_level >= 2 {
         let changed = unroll_program(program);
-        if !changed.is_empty() {
-            let cleanup = PassManager::unroll_cleanup();
-            for i in changed {
-                cleanup.run_function(&mut program.funcs[i], None, Some(Rc::clone(&effects)));
-            }
-        }
+        PassManager::unroll_cleanup().run_subset(program, &changed);
     }
 }
 
@@ -403,19 +410,11 @@ pub fn optimize_verified_preserving(
         inline::inline_program_preserving(program, roots);
         verify_program_stage(program, "inline")?;
     }
-    let effects = PassManager::standard(opt_level).run_verified_program(program)?;
+    PassManager::standard(opt_level).run_verified(program)?;
     if opt_level >= 2 {
         let changed = unroll_program(program);
         verify_program_stage(program, "unroll")?;
-        let cleanup = PassManager::unroll_cleanup();
-        for i in changed {
-            cleanup.run_function_checked(
-                &mut program.funcs[i],
-                None,
-                true,
-                Some(Rc::clone(&effects)),
-            )?;
-        }
+        PassManager::unroll_cleanup().run_subset_checked(program, &changed, true)?;
     }
     verify_program_stage(program, "optimization output")
 }
@@ -432,8 +431,7 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         inline_program(program);
         t.inline = i0.elapsed();
     }
-    let pm = PassManager::standard(opt_level);
-    let effects = pm
+    PassManager::standard(opt_level)
         .run_program(program, Some(&mut t), cfg!(debug_assertions))
         .unwrap_or_else(|failure| panic!("{failure}"));
     if opt_level >= 2 {
@@ -444,12 +442,7 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         // differently).
         let u0 = Instant::now();
         let changed = unroll_program(program);
-        if !changed.is_empty() {
-            let cleanup = PassManager::unroll_cleanup();
-            for i in changed {
-                cleanup.run_function(&mut program.funcs[i], None, Some(Rc::clone(&effects)));
-            }
-        }
+        PassManager::unroll_cleanup().run_subset(program, &changed);
         t.unroll = u0.elapsed();
     }
     t.total = start.elapsed();
