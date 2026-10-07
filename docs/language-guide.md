@@ -472,8 +472,8 @@ Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern`, `
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
 *discarded* attribute on a statement or loop is dropped there too:
 `@parallel` must sit on the function, and the mid-function parallel region is derived from the enclosing function's
-attribute, not from one written on the loop. `@generic` in that position is an error, not a silent
-drop.
+attribute, not from one written on the loop. `@generic` on a `for` or `while` loop is honored (next
+section); on any other statement it is an error, not a silent drop.
 
 ### `@generic` — “I meant this loop” ✅
 
@@ -497,11 +497,33 @@ gate, so `@generic` is how you write the loop you want measured (`tests/run/lang
 exactly one kernel call). Second, control: it is the escape hatch when a nest merely *looks* like a
 GEMM and you want your own arithmetic order.
 
-It must sit on the `fn`. `@generic` on a statement or a loop is **`E0306`** — the attribute is read
-from the function item, so accepting it there would promise a per-loop opt-out that does not exist
+It may also sit on a **loop**: `@generic` on a `for` or `while` statement suppresses recognition for
+that loop and every loop nested in it, while its siblings in the same function still dispatch:
+
+```wukong
+fn two(x: [f32; 64], mut o: [f32; 64], mut p: [f32; 64]) {
+    for i in 0..64 { o[i] = exp(x[i]); }   // wukong_vmath_f32
+    @generic
+    for i in 0..64 { p[i] = exp(x[i]); }   // stays a loop
+}
+```
+
+The rule is that no recognizer replaces code containing a `@generic` loop: a statement window that
+would include it (a GEMM + epilogue pair, a multi-pass norm) is not formed across it, a loop that
+encloses it is not matched as a whole nest (an outer `for i { for j { … @generic for k … } }`
+stays loops, while the enclosing loop's other inner loops still dispatch), and a function holding
+one is never claimed whole by a function-level interception (`tests/run/generic_loop_optout.wk`).
+Anywhere else — a `let`, a
+parameter, a non-`fn` item — `@generic` is **`E0306`**, because nothing reads it there
 (`tests/fail/generic_on_stmt.wk`). For a whole-program opt-out during measurement there is the
 `WUKONG_NO_RECOGNIZE` environment instrument, documented in `docs/internals.md`; it is not a CLI flag
 and not a user feature.
+
+To see what was dispatched, compile with **`--remarks=dispatch`**: every statement whose lowering
+became a recognized runtime kernel call gets one `note` on stderr naming the kernel symbol(s) — at the
+innermost such statement, never again at its enclosing loops — and a function replaced wholesale by a
+function-level interception is reported at its name. The remark is pure observation: the MIR, every
+artifact and the program's output are identical with and without it.
 
 `@parallel` **declines and lowers serially, with no diagnostic**, when the loop cannot be split into
 independent chunks: a labelled loop, a plain `break` out of the parallelized loop, a `return` out of
@@ -868,6 +890,8 @@ wukongc [OPTIONS] <input.wk>
 --error-format=<f>    human | json   (default: human)
 --explain <CODE>      print an extended explanation for an error code
 --color=<when>        auto | always | never   (default: auto — colour when stderr is a terminal)
+--remarks=dispatch    print a note (stderr) at every statement — or function — the compiler replaced
+                      with a recognized runtime kernel call, naming the kernel; output is unchanged
 -h, --help            print the usage text and exit 0
 -V, --version         print the version and exit 0
 ```

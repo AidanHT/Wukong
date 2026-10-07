@@ -28,6 +28,9 @@
 
 mod alias;
 mod canon;
+#[cfg(test)]
+mod coverage_tests;
+mod dispatch;
 mod tile;
 mod tindex;
 
@@ -907,7 +910,8 @@ pub struct LowerOptions {
     /// whether it fired at all. Turning it off is how a claim about the *language* ("this loop is
     /// fast because of how it was compiled, not because a pattern matcher swapped in a hand-written
     /// kernel") becomes measurable. `wukong_driver` sets it from `WUKONG_NO_RECOGNIZE`, and
-    /// `@generic` on a function turns it off for that function alone.
+    /// `@generic` on a function turns it off for that function alone (on a `for`/`while` loop, for
+    /// that loop alone — see `dispatch.rs`).
     pub recognize: bool,
 
     /// Build the 256-bit raw-AVX2 `Op::VecKernelCall` recipes (`true`, the default and the shipped
@@ -969,6 +973,30 @@ pub fn lower_program_with(
     interner: &mut Interner,
     opts: LowerOptions,
 ) -> (Program, Vec<Diagnostic>) {
+    lower_program_impl(module, sema, interner, opts, false)
+}
+
+/// [`lower_program_with`], plus one `note` diagnostic per recognized kernel dispatch: at each
+/// statement whose lowering became a `wukong_*` runtime kernel call (the innermost such statement),
+/// or at a function's name when a whole-function interception replaced it, naming the kernel
+/// symbols. This is `wukongc --remarks=dispatch`. The returned [`Program`] is identical to
+/// [`lower_program_with`]'s for the same input; only the diagnostics differ.
+pub fn lower_program_reporting_dispatch(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    opts: LowerOptions,
+) -> (Program, Vec<Diagnostic>) {
+    lower_program_impl(module, sema, interner, opts, true)
+}
+
+fn lower_program_impl(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    opts: LowerOptions,
+    report: bool,
+) -> (Program, Vec<Diagnostic>) {
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
     //
@@ -1010,6 +1038,8 @@ pub fn lower_program_with(
         // Overwritten per function, below. The module-level default is the conservative one, so a
         // recognizer reached through a path that forgot to set it declines rather than miscompiles.
         alias_free: false,
+        report,
+        resume: false,
         mm: interner.intern("wukong_sgemm"),
         mm_par: interner.intern("wukong_sgemm_parallel"),
         print_str: interner.intern("print_str"),
@@ -1228,7 +1258,21 @@ pub fn lower_program_with(
             _ => None,
         })
         .collect();
+    // `--remarks=dispatch`: the function item lowered last, as (index of the first function it
+    // produced, diagnostic count before it, its name's span), flushed once the item is done. A
+    // whole-function interception lowers no statement, so it is reported here, at the name.
+    let mut pending_report: Option<(usize, usize, Span)> = None;
     for item in &module.items {
+        if let Some((from, diags_from, span)) = pending_report.take() {
+            dispatch::flush_function_dispatch(
+                &program.funcs,
+                from,
+                &mut diags,
+                diags_from,
+                span,
+                interner,
+            );
+        }
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
                 // A type-generic function (`fn id<T>(x: T)`) is lowered once per concrete
@@ -1236,6 +1280,9 @@ pub fn lower_program_with(
                 // (`fn f<N>(a: Tensor[f32, N])`) are not type-generic and lower normally here.
                 if !mono.tg(f.name.sym).is_empty() {
                     continue;
+                }
+                if gemm.report {
+                    pending_report = Some((program.funcs.len(), diags.len(), f.name.span));
                 }
                 // `@generic` on this function is the user saying "I meant this loop": clear the
                 // recognition switch for this function alone, which is the same skip
@@ -1257,7 +1304,12 @@ pub fn lower_program_with(
                 // disabled, control falls through to the `@parallel` outliner and the plain
                 // `lower_fn` below, and the nest runs as written. `@parallel` outlining itself is
                 // NOT a recognizer — it is the user asking for threads — so it stays outside.
-                if gemm.recognize {
+                //
+                // A `@generic` LOOP anywhere in the body also keeps every arm here off: each one
+                // replaces a loop wholesale, and the statement-level cascade honors the attribute
+                // per loop (`dispatch.rs`), so the function's other loops still dispatch there.
+                let loop_opt_out = dispatch::body_has_generic_loop(body, interner);
+                if gemm.recognize && !loop_opt_out {
                     // Whole-function matmul: lower the entire nest to a single (optionally parallel)
                     // `wukong_sgemm` call — the tuned 256-bit AVX2/FMA microkernel. `emit_sgemm` declines
                     // shapes it has no kernel for (a fused bias or an α on a non-NT store, `Aᵀ·Bᵀ`), so the
@@ -1935,6 +1987,9 @@ pub fn lower_program_with(
                         let base = interner.resolve(f.name.sym).to_string();
                         let par_sym = interner.intern(&format!("{base}$par"));
                         let pfor_sym = interner.intern("wukong_parallel_for");
+                        // The outlined chunk body is the one loop's body: a `@generic` on that loop
+                        // opts the whole chunk out of recognition.
+                        let gemm = generic_gemm(gemm, loop_opt_out);
                         let (outlined, wrapper) = lower_parallel(
                             f, par_sym, pfor_sym, idx, hi, loop_body, sema, interner, gemm,
                             &mut diags,
@@ -1990,6 +2045,16 @@ pub fn lower_program_with(
             }
         }
     }
+    if let Some((from, diags_from, span)) = pending_report.take() {
+        dispatch::flush_function_dispatch(
+            &program.funcs,
+            from,
+            &mut diags,
+            diags_from,
+            span,
+            interner,
+        );
+    }
     // Emit one specialized copy of each type-generic function per concrete instantiation collected
     // above. Iterated in discovery order (a `Vec`) so the emitted MIR is deterministic across runs.
     let fn_decls: HashMap<Symbol, (&FnDecl, &Block)> = module
@@ -2038,8 +2103,8 @@ fn has_parallel_attr(item: &ast::Item, interner: &Interner) -> bool {
 }
 
 /// Does this item carry a `@generic` attribute — "lower the loops I wrote, do not recognize them"?
-/// `wukong_sema::attrs` has already rejected the attribute anywhere but a `fn` item, so this only
-/// ever fires where it means something.
+/// `wukong_sema::attrs` has already rejected the attribute anywhere but a `fn` item or a loop; this
+/// reads the item form (the loop form is `dispatch.rs`'s).
 fn has_generic_attr(item: &ast::Item, interner: &Interner) -> bool {
     item.attrs
         .iter()
@@ -2913,6 +2978,15 @@ struct GemmSyms {
     ///
     /// Read through [`FnLowerer::all_provably_disjoint`], never directly.
     alias_free: bool,
+    /// Report every recognized kernel dispatch as a `note` diagnostic (`--remarks=dispatch`,
+    /// [`lower_program_reporting_dispatch`]). Pure observation — see `dispatch.rs`. Rides here for
+    /// the same reason `recognize` does: this struct reaches every lowerer.
+    report: bool,
+    /// A pending hand-back of recognition: set (with `recognize` cleared) while a loop that encloses
+    /// a `@generic` loop runs its own probes, and consumed by the first block lowered for it — its
+    /// body — which turns `recognize` back on for the body's statements. See `dispatch.rs`
+    /// (`FnLowerer::with_loop_attrs`). Rides here so an outlined region of that loop inherits it.
+    resume: bool,
     mm: Symbol,
     mm_par: Symbol,
     /// Runtime print of a null-terminated string buffer (a `*u8` argument to `print`/`println`),
@@ -5022,12 +5096,21 @@ impl FnLowerer<'_> {
     // ---- blocks & statements ----
 
     fn lower_block(&mut self, b: &Block) -> Option<ValueId> {
+        // The body of a loop that encloses a `@generic` loop gets recognition back for its own
+        // statements (`dispatch.rs`); `any_generic` gates the per-position window check below.
+        let resumed = self.resume_recognition();
+        let any_generic = dispatch::body_has_generic_loop(b, self.interner);
         self.push_scope();
         let mut i = 0;
+        // `--remarks=dispatch`: what the statement(s) starting at `i` emitted, reported once they
+        // are lowered — every exit from an iteration below comes back through the loop head.
+        let mut report: Option<dispatch::DispatchMark> = None;
         while i < b.stmts.len() {
+            self.flush_dispatch(report.take());
             if self.terminated {
                 break;
             }
+            report = self.dispatch_mark(b.stmts[i].span);
             // Keep both consumed statements in source order when the epilogue
             // rereads output as bias, even with recognition disabled. Declining
             // fusion alone would still allow an inner loop to be outlined.
@@ -5064,7 +5147,13 @@ impl FnLowerer<'_> {
             // `try_fuse_run` below is deliberately NOT in here: fusing adjacent same-range loops is
             // an optimization of the loops the user wrote (it emits vector MIR, not a `wukong_*`
             // call), which is exactly what the recognition-off baseline is supposed to include.
-            if self.gemm.recognize {
+            //
+            // A statement holding a `@generic` loop that a window could swallow keeps every window
+            // (and the fusion run, whose fused body is probed by the elementwise recognizers) off at
+            // this position; each statement then lowers on its own, under `with_loop_attrs`.
+            let generic_window =
+                any_generic && dispatch::window_has_generic(&b.stmts[i..], self.interner);
+            if self.gemm.recognize && !generic_window {
                 // Epilogue fusion: a `nn.Linear` matmul immediately followed by its bias-add / ReLU loop
                 // folds into one GEMM call with the epilogue applied in the C writeback (no separate pass
                 // over C). Checked before the elementwise fusion below — they match disjoint shapes.
@@ -5183,7 +5272,12 @@ impl FnLowerer<'_> {
               // Operator fusion: a run of adjacent same-range elementwise `for` loops whose *fused*
               // body the vectorizer accepts is lowered as one loop (CSE/DSE then forward any
               // intermediate array through registers, cutting its memory traffic).
-            match self.try_fuse_run(&b.stmts[i..]) {
+            let fused = if generic_window {
+                None
+            } else {
+                self.try_fuse_run(&b.stmts[i..])
+            };
+            match fused {
                 Some(n) => i += n,
                 None => {
                     self.lower_stmt(&b.stmts[i]);
@@ -5191,11 +5285,13 @@ impl FnLowerer<'_> {
                 }
             }
         }
+        self.flush_dispatch(report.take());
         let tail = match &b.tail {
             Some(e) if !self.terminated => Some(self.lower_expr(e)),
             _ => None,
         };
         self.pop_scope();
+        self.end_resumed_recognition(resumed);
         tail
     }
 
@@ -9348,16 +9444,22 @@ impl FnLowerer<'_> {
                 }
                 self.terminated = true;
             }
+            // `@generic` on a loop turns recognition off for that loop and everything inside it; a
+            // loop that only encloses one keeps its own probes off (`dispatch.rs`).
             StmtKind::While {
                 cond, body, label, ..
-            } => self.lower_while(label.map(|l| l.sym), cond, body),
+            } => self.with_loop_attrs(&s.attrs, body, |me| {
+                me.lower_while(label.map(|l| l.sym), cond, body)
+            }),
             StmtKind::For {
                 pat,
                 iter,
                 body,
                 label,
                 ..
-            } => self.lower_for(label.map(|l| l.sym), pat, iter, body, &s.attrs),
+            } => self.with_loop_attrs(&s.attrs, body, |me| {
+                me.lower_for(label.map(|l| l.sym), pat, iter, body, &s.attrs)
+            }),
             StmtKind::Break(label, value) => {
                 if let Some((_, _, brk)) = self.find_loop(label.as_ref().map(|l| l.sym)) {
                     // A value loop's break target (its exit/merge block) carries a typed param;

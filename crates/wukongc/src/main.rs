@@ -34,6 +34,9 @@ OPTIONS:
     -o <path>          Write the artifact to <path>. Only --emit=obj and --emit=exe write a
                        file; every other stage prints its artifact on stdout.
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
+    --remarks=dispatch Print a note at every loop (or function) the compiler replaced with a
+                       recognized runtime kernel call, naming the kernel symbol(s). The output is
+                       unchanged; `@generic` on a loop or fn opts it out of recognition.
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
     --error-format=<f> Diagnostic output format: human, json  (default: human)
     --explain <CODE>   Print the extended explanation for an error code, then exit
@@ -122,6 +125,17 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--run" => opts.run = true,
             "--verify-each" => opts.verify_each = true,
+            _ if arg.starts_with("--remarks=") => {
+                let kind = &arg["--remarks=".len()..];
+                match kind {
+                    "dispatch" => opts.remarks_dispatch = true,
+                    other => {
+                        return Err(format!(
+                            "unknown --remarks value `{other}` (expected dispatch)"
+                        ))
+                    }
+                }
+            }
             _ if arg.starts_with("--backend=") => {
                 let b = &arg["--backend=".len()..];
                 opts.backend = match b {
@@ -311,5 +325,23 @@ mod tests {
                 .verify_each
         );
         assert!(USAGE.contains("--verify-each"));
+    }
+
+    /// `--remarks=dispatch` is opt-in, documented, and the only `--remarks` kind: an unknown kind
+    /// is a usage error rather than a flag that silently does nothing.
+    #[test]
+    fn remarks_dispatch_is_opt_in_and_closed() {
+        let on = parse_args(&["--remarks=dispatch", "--run", "input.wk"].map(str::to_owned))
+            .unwrap()
+            .unwrap();
+        assert!(on.remarks_dispatch);
+        assert!(
+            !parse_args(&["--run".to_owned(), "input.wk".to_owned()])
+                .unwrap()
+                .unwrap()
+                .remarks_dispatch
+        );
+        assert!(parse_args(&["--remarks=all", "input.wk"].map(str::to_owned)).is_err());
+        assert!(USAGE.contains("--remarks=dispatch"));
     }
 }

@@ -437,7 +437,7 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   `tile_never_applied.wk`, `tile_on_parallel_fn.wk`, `tile_on_recognized_kernel.wk`,
   `tile_second_on_stmt.wk`).   `@tile` is accepted only where something reads it — a `fn` item or the `for` statement it schedules
   — and is **`E0306`** on a `struct`, a parameter, a `let` or a `while`, the same placement code
-  `@generic` carries off a `fn` item (`tests/fail/tile_on_while.wk`).
+  `@generic` carries off a `fn` item or a loop (`tests/fail/tile_on_while.wk`).
 - **`shared [T; N]`** and **`sync_block()`**: shared address space on `alloca`; cooperative barrier
   inside `@parallel` only (`E0308` otherwise). Static shared size above 48 KiB is `E0307`. CPU:
   shared = stack `alloca`, barrier = no-op/fence. gpu-native: PTX `.shared` + `bar.sync` in
@@ -464,9 +464,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   four probe sites (whole-function interception, the per-loop `match_*` cascade, `lower_block`'s
   statement windows, the vectorizer's elementwise probes) fire inside it, so its loops compile as
   written — while auto-vectorization, loop fusion, FMA contraction, `@parallel` outlining and the
-  optimizer all still apply, as do the builtins you call by name. It is per function, not per module
+  optimizer all still apply, as do the builtins you call by name. It is per function or per loop (on a
+  `for`/`while` it covers that loop and everything nested in it, `tests/run/generic_loop_optout.wk`),
+  not per module
   (`tests/run/lang_generic_saxpy.wk`, `lang_generic_naive_gemm.wk` each hold the same body twice and
-  the MIR then holds exactly one kernel call), and it is `E0306` anywhere but a `fn` item. The
+  the MIR then holds exactly one kernel call), and it is `E0306` anywhere but a `fn` item or a loop.
+  `wukongc --remarks=dispatch` prints, at each statement a recognizer replaced, the kernel symbol it
+  became, so dispatch is no longer visible only through `--emit=mir | grep wukong_`. The
   whole-program equivalent, `WUKONG_NO_RECOGNIZE`, is a **measurement instrument** rather than a user
   feature (see `docs/internals.md`): recognizers are otherwise gate-blind, so this is the only way to
   compile and time the honest generic lowering of the same program. Autodiff refuses to run under the

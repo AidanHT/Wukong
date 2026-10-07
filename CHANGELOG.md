@@ -5,6 +5,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Recognizer spelling coverage and dispatch control (`gap/recognizer-coverage`)
+
+- **`@generic` on a `for`/`while` loop** opts that loop (and everything in it) out of kernel
+  recognition; it was legal on a `fn` item only. No recognizer replaces code containing one: a
+  window is not formed over it, an enclosing loop is not matched as a whole nest (its other inner
+  loops still dispatch), and a function holding one is not intercepted whole. On any other
+  statement it stays `E0306`.
+- **`--remarks=dispatch`** prints a `note` at every statement (or function) replaced by a recognized
+  runtime kernel, naming the kernel symbol. The MIR is unchanged by it.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

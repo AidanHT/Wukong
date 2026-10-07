@@ -1,0 +1,74 @@
+// RUN: --run --remarks=dispatch
+// EXPECT-EXIT: 0
+// EXPECT-STDERR: recognized kernel dispatch: `wukong_velem_f32`
+// EXPECT-OUT: -7
+// EXPECT-OUT: -5
+// EXPECT-OUT: -3
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: -7
+// EXPECT-OUT: -5
+// EXPECT-OUT: -3
+// EXPECT-OUT: -1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 3
+// EXPECT-OUT: 5
+// EXPECT-OUT: 7
+// EXPECT-OUT: 4
+// EXPECT-OUT: 5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 7
+module tests.run.generic_loop_optout
+
+// `@generic` on a LOOP (P12.14): that loop - and everything nested in it - is lowered as written,
+// while its sibling in the same function still dispatches its kernel. Before, `@generic` was legal
+// only on a function item, so the two could not be told apart. Run with `--remarks=dispatch`, which
+// prints (on stderr) one note per statement that became a runtime kernel call - the EXPECT-STDERR
+// line pins the note for the un-annotated map - while stdout and every value are unchanged by it.
+//
+// x[i] = i - 4: both maps compute 2*x + 1 = 2*i - 7, exactly; the `@generic while` adds 4 to the
+// first four lanes of w in place.
+
+fn two_maps(x: [f32; 8], mut o: [f32; 8], mut p: [f32; 8]) {
+    for i in 0..8 {
+        o[i] = 2.0 * x[i] + 1.0;
+    }
+    @generic
+    for i in 0..8 {
+        p[i] = 2.0 * x[i] + 1.0;
+    }
+}
+
+fn bump(mut w: [f32; 4]) {
+    let mut k: i64 = 0;
+    @generic
+    while k < 4 {
+        w[k] = w[k] + 4.0;
+        k = k + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 8] = [0.0; 8];
+    for i in 0..8 {
+        x[i] = (i as f32) - 4.0;
+    }
+    let mut o: [f32; 8] = [0.0; 8];
+    let mut p: [f32; 8] = [0.0; 8];
+    two_maps(x, o, p);
+    let mut w: [f32; 4] = [0.0, 1.0, 2.0, 3.0];
+    bump(w);
+    for i in 0..8 {
+        print(o[i] as i32);
+    }
+    for i in 0..8 {
+        print(p[i] as i32);
+    }
+    for i in 0..4 {
+        print(w[i] as i32);
+    }
+    return 0;
+}

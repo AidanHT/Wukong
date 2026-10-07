@@ -770,8 +770,14 @@ cargo run -q -p wukongc -- --emit=mir -O2 tests/run/tensor_matmul.wk       # no 
 Two rules about it:
 
 - **It is an instrument, not a user feature**, which is why it is an environment variable in the
-  style of `WUKONG_GPU_NO_MEGA` and not a CLI flag (nothing in `USAGE` mentions it). The supported,
-  per-function surface for "lower the loop I wrote" is the `@generic` attribute.
+  style of `WUKONG_GPU_NO_MEGA` and not a CLI flag (nothing in `USAGE` mentions it). The supported
+  surface for "lower the loop I wrote" is the `@generic` attribute, on a function or on a single
+  `for`/`while` loop (`wukong_mir_build::dispatch`).
+- **The per-site view is `--remarks=dispatch`** (`wukong_mir_build::lower_program_reporting_dispatch`):
+  a `note` at each statement `lower_block` lowered into a recognized `wukong_*` call (the innermost
+  one; an enclosing statement that only contains it is skipped), and at a function's name when a
+  whole-function interception replaced it. It observes the builder, never steers it, so the MIR is
+  byte-identical with it on or off.
 - **Autodiff refuses to run under it**, by name: `--train` and `--emit=grad` exit 1 as soon as the
   variable is set, because `wukong_autodiff`'s VJP rules are keyed on the recognized kernel calls. A
   named refusal, never a silently zero gradient.
