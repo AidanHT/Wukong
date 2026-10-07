@@ -1,0 +1,350 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 6375
+// EXPECT-OUT: 125
+// EXPECT-OUT: -2625
+// EXPECT-OUT: 625
+// EXPECT-OUT: 4250
+// EXPECT-OUT: 1125
+// EXPECT-OUT: -1625
+// EXPECT-OUT: 1625
+// EXPECT-OUT: -1125
+// EXPECT-OUT: 2250
+// EXPECT-OUT: -625
+// EXPECT-OUT: 2625
+// EXPECT-OUT: -125
+// EXPECT-OUT: -3375
+// EXPECT-OUT: 250
+// EXPECT-OUT: -2875
+// EXPECT-OUT: 875
+// EXPECT-OUT: -2375
+// EXPECT-OUT: 1375
+// EXPECT-OUT: -1750
+// EXPECT-OUT: 1875
+// EXPECT-OUT: -1375
+// EXPECT-OUT: 2375
+// EXPECT-OUT: -875
+// EXPECT-OUT: 2750
+// EXPECT-OUT: -375
+// EXPECT-OUT: -3125
+// EXPECT-OUT: 125
+// EXPECT-OUT: -2625
+// EXPECT-OUT: 750
+// EXPECT-OUT: -2125
+// EXPECT-OUT: 1125
+// EXPECT-OUT: -1625
+// EXPECT-OUT: 1625
+// EXPECT-OUT: -1250
+// EXPECT-OUT: 2125
+// EXPECT-OUT: -625
+// EXPECT-OUT: 2625
+// EXPECT-OUT: -125
+// EXPECT-OUT: -3250
+// EXPECT-OUT: 375
+// EXPECT-OUT: -2875
+// EXPECT-OUT: 875
+// EXPECT-OUT: -2375
+// EXPECT-OUT: 1250
+// EXPECT-OUT: -1875
+// EXPECT-OUT: 1875
+// EXPECT-OUT: -1375
+// EXPECT-OUT: 2250
+// EXPECT-OUT: -750
+// EXPECT-OUT: 2875
+// EXPECT-OUT: -375
+// EXPECT-OUT: -3125
+// EXPECT-OUT: 250
+// EXPECT-OUT: -2750
+// EXPECT-OUT: 625
+// EXPECT-OUT: -2125
+// EXPECT-OUT: 1125
+// EXPECT-OUT: -1750
+// EXPECT-OUT: 1750
+// EXPECT-OUT: -1125
+// EXPECT-OUT: 2125
+// EXPECT-OUT: -625
+// EXPECT-OUT: 2750
+// EXPECT-OUT: -1875
+// EXPECT-OUT: -8125
+// EXPECT-OUT: 26250
+// EXPECT-OUT: 2375
+// EXPECT-OUT: -875
+// EXPECT-OUT: 2875
+// EXPECT-OUT: -375
+// EXPECT-OUT: -3250
+// EXPECT-OUT: 125
+// EXPECT-OUT: -2625
+// EXPECT-OUT: 625
+// EXPECT-OUT: -2125
+// EXPECT-OUT: 1250
+// EXPECT-OUT: -1625
+// EXPECT-OUT: 1625
+// EXPECT-OUT: -1125
+// EXPECT-OUT: 2125
+// EXPECT-OUT: -750
+// EXPECT-OUT: 2625
+// EXPECT-OUT: -125
+// EXPECT-OUT: -3375
+// EXPECT-OUT: 375
+// EXPECT-OUT: -2750
+// EXPECT-OUT: 875
+// EXPECT-OUT: -2375
+// EXPECT-OUT: 1375
+// EXPECT-OUT: -1875
+// EXPECT-OUT: 1750
+// EXPECT-OUT: -1375
+// EXPECT-OUT: 2375
+// EXPECT-OUT: -875
+// EXPECT-OUT: 2875
+// EXPECT-OUT: -250
+// EXPECT-OUT: -3125
+// EXPECT-OUT: 125
+// EXPECT-OUT: -2625
+// EXPECT-OUT: 625
+// EXPECT-OUT: -2250
+// EXPECT-OUT: 1125
+// EXPECT-OUT: -1625
+// EXPECT-OUT: 1625
+// EXPECT-OUT: -1125
+// EXPECT-OUT: 2250
+// EXPECT-OUT: -625
+// EXPECT-OUT: 2625
+// EXPECT-OUT: -125
+// EXPECT-OUT: -3375
+// EXPECT-OUT: 250
+// EXPECT-OUT: -2875
+// EXPECT-OUT: 875
+// EXPECT-OUT: -2375
+// EXPECT-OUT: 1250
+// EXPECT-OUT: -1750
+// EXPECT-OUT: 1875
+// EXPECT-OUT: -1375
+// EXPECT-OUT: 2375
+// EXPECT-OUT: -750
+// EXPECT-OUT: 2750
+// EXPECT-OUT: -375
+// EXPECT-OUT: -3125
+// EXPECT-OUT: 125
+// EXPECT-OUT: -2750
+// EXPECT-OUT: 750
+// EXPECT-OUT: -2125
+// EXPECT-OUT: 21750
+// EXPECT-OUT: -125
+// EXPECT-OUT: -250
+// EXPECT-OUT: -3125
+// EXPECT-OUT: 125
+// EXPECT-OUT: -2625
+// EXPECT-OUT: 625
+// EXPECT-OUT: -2250
+// EXPECT-OUT: 1125
+// EXPECT-OUT: -1625
+// EXPECT-OUT: 1625
+// EXPECT-OUT: -1125
+// EXPECT-OUT: 2250
+// EXPECT-OUT: -625
+// EXPECT-OUT: 2625
+// EXPECT-OUT: -125
+// EXPECT-OUT: -3375
+// EXPECT-OUT: 250
+// EXPECT-OUT: -2875
+// EXPECT-OUT: 875
+// EXPECT-OUT: -2375
+// EXPECT-OUT: 1375
+// EXPECT-OUT: -1750
+// EXPECT-OUT: 1875
+// EXPECT-OUT: -1375
+// EXPECT-OUT: 2375
+// EXPECT-OUT: -875
+// EXPECT-OUT: 2750
+// EXPECT-OUT: -375
+// EXPECT-OUT: -3125
+// EXPECT-OUT: 125
+// EXPECT-OUT: -2625
+// EXPECT-OUT: 750
+// EXPECT-OUT: -2125
+// EXPECT-OUT: 1125
+// EXPECT-OUT: -1625
+// EXPECT-OUT: 1625
+// EXPECT-OUT: -1250
+// EXPECT-OUT: 2125
+// EXPECT-OUT: -625
+// EXPECT-OUT: 2625
+// EXPECT-OUT: -125
+// EXPECT-OUT: -3250
+// EXPECT-OUT: 375
+// EXPECT-OUT: -2875
+// EXPECT-OUT: 875
+// EXPECT-OUT: -2375
+// EXPECT-OUT: 1250
+// EXPECT-OUT: -1875
+// EXPECT-OUT: 1875
+// EXPECT-OUT: -1375
+// EXPECT-OUT: 2375
+// EXPECT-OUT: -750
+// EXPECT-OUT: 2875
+// EXPECT-OUT: -375
+// EXPECT-OUT: -3125
+// EXPECT-OUT: 125
+// EXPECT-OUT: -2750
+// EXPECT-OUT: 625
+// EXPECT-OUT: -2250
+// EXPECT-OUT: 1125
+// EXPECT-OUT: -1625
+// EXPECT-OUT: 1750
+// EXPECT-OUT: -1125
+// EXPECT-OUT: 2250
+// EXPECT-OUT: -625
+// EXPECT-OUT: 2625
+// EXPECT-OUT: -250
+// EXPECT-OUT: -3375
+// EXPECT-OUT: 250
+// EXPECT-OUT: -2875
+// EXPECT-OUT: 875
+module tests.run.layernorm_bwd_blocked_every_lane
+
+// LayerNorm backward over rows WIDE ENOUGH to reach the blocked reduction body.
+//
+// `wukong_layernorm_bwd_f32` walks each row with UNROLL = 4 independent accumulator chains over
+// BLOCK = 32-element steps, then a single-accumulator 8-element remainder loop, then a ragged scalar
+// tail. `tests/run/layernorm_bwd.wk` normalizes rows of 4, so it exercises the ragged tail ONLY:
+// the blocked body and the remainder loop had no corpus coverage at all, and a recognized kernel is
+// gate-blind — interp and native both call this same function at every -O level, so no differential
+// or invariance gate can see a wrong reduction. The first nest is [2 x 64] (two blocked steps, no
+// remainder); the second is [1 x 72] (two blocked steps plus the 8-element remainder loop).
+//
+// **Every lane is printed**, never a row sum — a sum passes over a buffer that is only partly
+// correct. The expectations are the mathematical `dx = rstd*(g - mean(g) - xhat*mean(g*xhat))` of
+// the loop below, and they are EXACT rather than rounded, because the data is built so that every
+// intermediate is a binary fraction:
+//
+//   * `x[j] = 2 + d[j]` with `d` in {0, +0.5, -0.5} and as many `+0.5` as `-0.5`, so `SUM x = 2C`
+//     and `mean = 2.0` exactly (an exact quotient is an exact f32 divide);
+//   * three quarters of the lanes are nonzero, so `var = SUM d^2 / C = 3/16` exactly, and with
+//     `eps = 0.0625` the radicand is `0.25`, giving `rstd = 2.0` and `xhat` in {0, +1, -1} exactly;
+//   * `gamma` in {0.5, 1, 2} and `dy` a multiple of 0.25, so `g` is a multiple of 0.125, and two
+//     `dy` entries are set so that `SUM g = C/8` and `SUM g*xhat = -C/16` — hence `m1 = 0.125` and
+//     `m2 = -0.0625` exactly.
+//
+// So `dx = 2*(g - 0.125 + 0.0625*xhat)` is a multiple of 0.125 and `dx*1000` is an exact integer.
+// Every partial sum is exact too, so the printed values do not depend on the accumulator layout —
+// which is the point: they pin the *values*, not one particular blocking, while a dropped
+// accumulator chain, a skipped block or a misindexed apply all change them.
+//
+// The deviation pattern, `dy` and `gamma` use three different strides against the lane index, so no
+// 8-, 32- or 64-element group repeats and no group of lanes shares a common sum.
+fn main() -> i32 {
+    let x1: [f32; 128] = [
+        2.5, 1.5, 2.5, 1.5, 2.0, 1.5, 2.5, 1.5,
+        2.5, 2.0, 2.5, 1.5, 2.5, 1.5, 2.0, 1.5,
+        2.5, 1.5, 2.5, 2.0, 2.5, 1.5, 2.5, 1.5,
+        2.0, 1.5, 2.5, 1.5, 2.5, 2.0, 2.5, 1.5,
+        2.5, 1.5, 2.0, 1.5, 2.5, 1.5, 2.5, 2.0,
+        2.5, 1.5, 2.5, 1.5, 2.0, 1.5, 2.5, 1.5,
+        2.0, 2.0, 2.5, 1.5, 2.5, 2.0, 2.0, 1.5,
+        2.5, 1.5, 2.0, 2.0, 2.5, 1.5, 2.5, 2.0,
+        1.5, 2.5, 2.0, 2.5, 1.5, 2.5, 1.5, 2.0,
+        1.5, 2.5, 1.5, 2.5, 2.0, 2.5, 1.5, 2.5,
+        1.5, 2.0, 1.5, 2.5, 1.5, 2.5, 2.0, 2.5,
+        1.5, 2.5, 1.5, 2.0, 1.5, 2.5, 1.5, 2.5,
+        2.0, 2.5, 1.5, 2.5, 1.5, 2.0, 1.5, 2.5,
+        1.5, 2.5, 2.0, 2.5, 1.5, 2.5, 1.5, 2.0,
+        1.5, 2.5, 1.5, 2.0, 2.0, 2.5, 1.5, 2.5,
+        2.0, 2.0, 1.5, 2.5, 1.5, 2.0, 2.0, 2.5,
+    ];
+    let dy1: [f32; 128] = [
+        3.25, 0.25, -1.25, 0.5, 2.25, 0.75, -0.75, 1.0,
+        -0.5, 1.25, -0.25, 1.5, 0.0, -1.5, 0.25, -1.25,
+        0.5, -1.0, 0.75, -0.75, 1.0, -0.5, 1.25, -0.25,
+        1.5, 0.0, -1.5, 0.25, -1.25, 0.5, -1.0, 0.75,
+        -0.75, 1.0, -0.5, 1.25, -0.25, 1.5, 0.0, -1.5,
+        0.25, -1.25, 0.5, -1.0, 0.75, -0.75, 1.0, -0.5,
+        1.25, -0.25, 1.5, 0.0, -1.5, 0.25, -1.25, 0.5,
+        -1.0, 0.75, -0.75, 1.0, -0.5, 1.25, -0.25, 1.5,
+        -0.75, -4.0, 13.25, 1.25, -0.25, 1.5, 0.0, -1.5,
+        0.25, -1.25, 0.5, -1.0, 0.75, -0.75, 1.0, -0.5,
+        1.25, -0.25, 1.5, 0.0, -1.5, 0.25, -1.25, 0.5,
+        -1.0, 0.75, -0.75, 1.0, -0.5, 1.25, -0.25, 1.5,
+        0.0, -1.5, 0.25, -1.25, 0.5, -1.0, 0.75, -0.75,
+        1.0, -0.5, 1.25, -0.25, 1.5, 0.0, -1.5, 0.25,
+        -1.25, 0.5, -1.0, 0.75, -0.75, 1.0, -0.5, 1.25,
+        -0.25, 1.5, 0.0, -1.5, 0.25, -1.25, 0.5, -1.0,
+    ];
+    let gamma1: [f32; 64] = [
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    ];
+    let mut dx1: [f32; 128] = [0.0; 128];
+    for r in 0..2 {
+        let mut sm: f32 = 0.0;
+        for i in 0..64 { sm = sm + x1[r * 64 + i]; }
+        let mean: f32 = sm / 64.0;
+        let mut vv: f32 = 0.0;
+        for i in 0..64 { vv = vv + (x1[r * 64 + i] - mean) * (x1[r * 64 + i] - mean); }
+        let rstd: f32 = 1.0 / sqrt(vv / 64.0 + 0.0625);
+        let mut s1: f32 = 0.0;
+        for i in 0..64 { s1 = s1 + dy1[r * 64 + i] * gamma1[i]; }
+        let mut s2: f32 = 0.0;
+        for i in 0..64 { s2 = s2 + dy1[r * 64 + i] * gamma1[i] * ((x1[r * 64 + i] - mean) * rstd); }
+        let m1: f32 = s1 / 64.0;
+        let m2: f32 = s2 / 64.0;
+        for i in 0..64 { dx1[r * 64 + i] = rstd * (dy1[r * 64 + i] * gamma1[i] - m1 - ((x1[r * 64 + i] - mean) * rstd) * m2); }
+    }
+    for k in 0..128 { print((dx1[k] * 1000.0) as i32); }
+    let x2: [f32; 72] = [
+        2.0, 2.5, 2.0, 2.5, 1.5, 2.5, 1.5, 2.0,
+        1.5, 2.5, 1.5, 2.5, 2.0, 2.5, 1.5, 2.5,
+        1.5, 2.0, 1.5, 2.5, 1.5, 2.5, 2.0, 2.5,
+        1.5, 2.5, 1.5, 2.0, 1.5, 2.5, 1.5, 2.5,
+        2.0, 2.5, 1.5, 2.5, 1.5, 2.0, 1.5, 2.5,
+        1.5, 2.5, 2.0, 2.5, 1.5, 2.5, 1.5, 2.0,
+        1.5, 2.5, 1.5, 2.5, 2.0, 2.5, 1.5, 2.5,
+        1.5, 2.0, 1.5, 2.0, 1.5, 2.5, 2.0, 2.5,
+        2.0, 2.5, 1.5, 2.0, 1.5, 2.0, 1.5, 2.5,
+    ];
+    let dy2: [f32; 72] = [
+        11.0, 0.0, 0.0, -1.5, 0.25, -1.25, 0.5, -1.0,
+        0.75, -0.75, 1.0, -0.5, 1.25, -0.25, 1.5, 0.0,
+        -1.5, 0.25, -1.25, 0.5, -1.0, 0.75, -0.75, 1.0,
+        -0.5, 1.25, -0.25, 1.5, 0.0, -1.5, 0.25, -1.25,
+        0.5, -1.0, 0.75, -0.75, 1.0, -0.5, 1.25, -0.25,
+        1.5, 0.0, -1.5, 0.25, -1.25, 0.5, -1.0, 0.75,
+        -0.75, 1.0, -0.5, 1.25, -0.25, 1.5, 0.0, -1.5,
+        0.25, -1.25, 0.5, -1.0, 0.75, -0.75, 1.0, -0.5,
+        1.25, -0.25, 1.5, 0.0, -1.5, 0.25, -1.25, 0.5,
+    ];
+    let gamma2: [f32; 72] = [
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    ];
+    let mut dx2: [f32; 72] = [0.0; 72];
+    for r in 0..1 {
+        let mut sm: f32 = 0.0;
+        for i in 0..72 { sm = sm + x2[r * 72 + i]; }
+        let mean: f32 = sm / 72.0;
+        let mut vv: f32 = 0.0;
+        for i in 0..72 { vv = vv + (x2[r * 72 + i] - mean) * (x2[r * 72 + i] - mean); }
+        let rstd: f32 = 1.0 / sqrt(vv / 72.0 + 0.0625);
+        let mut s1: f32 = 0.0;
+        for i in 0..72 { s1 = s1 + dy2[r * 72 + i] * gamma2[i]; }
+        let mut s2: f32 = 0.0;
+        for i in 0..72 { s2 = s2 + dy2[r * 72 + i] * gamma2[i] * ((x2[r * 72 + i] - mean) * rstd); }
+        let m1: f32 = s1 / 72.0;
+        let m2: f32 = s2 / 72.0;
+        for i in 0..72 { dx2[r * 72 + i] = rstd * (dy2[r * 72 + i] * gamma2[i] - m1 - ((x2[r * 72 + i] - mean) * rstd) * m2); }
+    }
+    for k in 0..72 { print((dx2[k] * 1000.0) as i32); }
+    return 0;
+}

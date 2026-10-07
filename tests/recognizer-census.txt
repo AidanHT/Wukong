@@ -191,6 +191,7 @@ lang_tile_saxpy.wk:
 lang_tiled_transpose.wk: wukong_parallel_for wukong_parallel_for*4
 layernorm.wk: wukong_norm_f32
 layernorm_bwd.wk: wukong_layernorm_bwd_f32
+layernorm_bwd_blocked_every_lane.wk: wukong_layernorm_bwd_f32 wukong_layernorm_bwd_f32*2
 leaky_relu.wk: wukong_vmath_f32
 let_destructure.wk:
 linear_bf16.wk: wukong_sgemm_bf16_nt
