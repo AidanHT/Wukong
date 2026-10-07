@@ -46,6 +46,10 @@ mod loader;
 pub enum EmitStage {
     Tokens,
     Ast,
+    /// Run the front end only — lex, parse, import resolution and sema — and stop before MIR
+    /// lowering (`--emit=check`). Reports every diagnostic sema produces and exits 0 when clean,
+    /// with no lowering (`C0001`) limits in the way. The fast check loop an editor drives.
+    Check,
     MirHigh,
     Mir,
     /// The **backward** MIR of a designated loss function (reverse-mode autodiff): the forward
@@ -63,6 +67,7 @@ impl EmitStage {
         Some(match s {
             "tokens" => EmitStage::Tokens,
             "ast" => EmitStage::Ast,
+            "check" => EmitStage::Check,
             "mir-high" => EmitStage::MirHigh,
             "mir" | "mir-low" => EmitStage::Mir,
             "grad" => EmitStage::Grad,
@@ -112,6 +117,10 @@ pub struct Options {
     pub verify_each: bool,
     pub color: bool,
     pub error_format: ErrorFormat,
+    /// Cap on how many error-severity diagnostics are printed before the rest are suppressed
+    /// (`--error-limit=<n>`). `None` is unlimited (the default). A warning after the cap is still
+    /// shown; only errors are counted against it, matching rustc's `--error-limit`.
+    pub error_limit: Option<usize>,
     /// Which backend to run/emit with. `--run` defaults to the interpreter (the reference oracle);
     /// native object/exe emission always uses Cranelift.
     pub backend: BackendKind,
@@ -180,6 +189,7 @@ impl Default for Options {
             verify_each: false,
             color: true,
             error_format: ErrorFormat::Human,
+            error_limit: None,
             backend: BackendKind::Interp,
             grad: GradOptions::default(),
         }
@@ -267,7 +277,10 @@ pub fn compile(opts: &Options) -> i32 {
     let src = match std::fs::read_to_string(&opts.input) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: could not read `{}`: {}", opts.input.display(), e);
+            emit_driver_error(
+                opts,
+                format!("could not read `{}`: {}", opts.input.display(), e),
+            );
             return exit::IO_ERROR;
         }
     };
@@ -284,7 +297,7 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     if opts.emit == EmitStage::Tokens {
-        render_all(opts.error_format, &renderer, &sink, &sm);
+        render_all(opts, &renderer, &sink, &sm);
         print_artifact(&wukong_lexer::dump(&tokens, sm.source(id)));
         return if sink.has_errors() {
             exit::COMPILE_ERROR
@@ -308,7 +321,7 @@ pub fn compile(opts: &Options) -> i32 {
     // are not loaded or spliced here. The merged multi-file program is what every later stage
     // (`--emit=mir-high` onward, `--run`) sees.
     if opts.emit == EmitStage::Ast {
-        render_all(opts.error_format, &renderer, &sink, &sm);
+        render_all(opts, &renderer, &sink, &sm);
         print_artifact(&wukong_ast::print::print_module(&module, &interner));
         return if sink.has_errors() {
             exit::COMPILE_ERROR
@@ -318,7 +331,7 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     if sink.has_errors() {
-        render_all(opts.error_format, &renderer, &sink, &sm);
+        render_all(opts, &renderer, &sink, &sm);
         return exit::COMPILE_ERROR;
     }
 
@@ -336,7 +349,7 @@ pub fn compile(opts: &Options) -> i32 {
         &mut sink,
         &mut next_node,
     );
-    render_all(opts.error_format, &renderer, &sink, &sm);
+    render_all(opts, &renderer, &sink, &sm);
     if sink.has_errors() {
         return exit::COMPILE_ERROR;
     }
@@ -344,13 +357,19 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Semantic analysis (name resolution, type checking, shape checking) ---
     let (sema, sema_diags) = wukong_sema::check(&module, &interner);
-    for d in &sema_diags {
-        emit_diag(d, opts.error_format, &renderer, &sm);
-    }
-    if sema_diags.iter().any(|d| d.is_error()) {
+    let sema_errors = emit_diags(&sema_diags, opts, &renderer, &sm);
+    if sema_errors > 0 {
+        emit_summary(sema_errors, opts, &renderer);
         return exit::COMPILE_ERROR;
     }
     drop(sema_diags);
+
+    // `--emit=check`: lex, parse, import resolution and sema have all run and reported clean (any
+    // error would have returned above). Stop before MIR lowering — the fast typo loop an editor
+    // wants, with no C0001 lowering limits in the way.
+    if opts.emit == EmitStage::Check {
+        return exit::OK;
+    }
 
     // For `--train`, recover the loss function's buffer element counts from the semantic types now,
     // while the `[f32; N]` / `Tensor[..]` annotations are still available (they are lost once the
@@ -359,7 +378,7 @@ pub fn compile(opts: &Options) -> i32 {
         match loss_param_lens(&sema, &mut interner, opts) {
             Ok(l) => Some(l),
             Err(e) => {
-                eprintln!("error: --train: {e}");
+                emit_driver_error(opts, format!("--train: {e}"));
                 return exit::COMPILE_ERROR;
             }
         }
@@ -378,11 +397,9 @@ pub fn compile(opts: &Options) -> i32 {
     // artifacts before optimization and codegen allocate their working sets.
     drop(module);
     drop(sema);
-    for d in &lower_diags {
-        emit_diag(d, opts.error_format, &renderer, &sm);
-    }
+    let lower_errors = emit_diags(&lower_diags, opts, &renderer, &sm);
     drop(sm);
-    let lowering_failed = lower_diags.iter().any(|d| d.is_error());
+    let lowering_failed = lower_errors > 0;
     drop(lower_diags);
 
     // High MIR is the pre-optimization form. It is still dumped for debugging even when lowering
@@ -401,6 +418,7 @@ pub fn compile(opts: &Options) -> i32 {
     // A construct codegen could not lower leaves the MIR invalid, so do not optimize, run, or hand
     // it to a backend — that would crash or miscompile. Stop with a clear error instead.
     if lowering_failed {
+        emit_summary(lower_errors, opts, &renderer);
         return exit::COMPILE_ERROR;
     }
 
@@ -408,7 +426,7 @@ pub fn compile(opts: &Options) -> i32 {
     let roots = match autodiff_roots(&program, &mut interner, opts) {
         Ok(roots) => roots,
         Err(message) => {
-            eprintln!("error: autodiff: {message}");
+            emit_driver_error(opts, format!("autodiff: {message}"));
             return exit::COMPILE_ERROR;
         }
     };
@@ -471,7 +489,7 @@ pub fn compile(opts: &Options) -> i32 {
                 exit_code as i32
             }
             Err(e) => {
-                eprintln!("error: {e}");
+                emit_driver_error(opts, e);
                 exit::COMPILE_ERROR
             }
         };
@@ -783,7 +801,10 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
     let scratch = if is_obj { None } else { ScratchDir::new(&stem) };
     let obj_path = object_path(is_obj, opts.output.as_deref(), &stem, scratch.as_ref());
     if let Err(e) = std::fs::write(&obj_path, &obj) {
-        eprintln!("error: could not write `{}`: {e}", obj_path.display());
+        emit_driver_error(
+            opts,
+            format!("could not write `{}`: {e}", obj_path.display()),
+        );
         return exit::IO_ERROR;
     }
     // Linkers consume the file; the serialized copy need not stay resident while they run.
@@ -814,7 +835,7 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
             return exit::OK;
         }
         LinkOutcome::Failed(msg) => {
-            eprintln!("error: {msg}");
+            emit_driver_error(opts, msg);
             return exit::COMPILE_ERROR;
         }
         LinkOutcome::Unavailable => { /* fall through to the C-runtime `cc` link */ }
@@ -892,7 +913,10 @@ fn cc_link(
     // exe (fallback): emit the C runtime into the scratch dir and link it with the system C compiler.
     let rt_path = scratch_path(scratch, format!("{stem}_rt.c"));
     if let Err(e) = std::fs::write(&rt_path, c_runtime_source()) {
-        eprintln!("error: could not write `{}`: {e}", rt_path.display());
+        emit_driver_error(
+            opts,
+            format!("could not write `{}`: {e}", rt_path.display()),
+        );
         return exit::IO_ERROR;
     }
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
@@ -1452,7 +1476,7 @@ fn emit_grad(program: &wukong_mir::Program, interner: &mut Interner, opts: &Opti
     let (fwd, gradfn) = match build_grad(program, interner, opts) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("error: --emit=grad: {e}");
+            emit_driver_error(opts, format!("--emit=grad: {e}"));
             return exit::COMPILE_ERROR;
         }
     };
@@ -1728,7 +1752,7 @@ fn run_train(
             exit::OK
         }
         Err(e) => {
-            eprintln!("error: --train: {e}");
+            emit_driver_error(opts, format!("--train: {e}"));
             exit::COMPILE_ERROR
         }
     }
@@ -1982,10 +2006,65 @@ fn emit_diag(d: &Diagnostic, fmt: ErrorFormat, renderer: &Renderer, sm: &SourceM
     }
 }
 
-fn render_all(fmt: ErrorFormat, renderer: &Renderer, sink: &DiagnosticSink, sm: &SourceMap) {
-    for d in sink.diagnostics() {
-        emit_diag(d, fmt, renderer, sm);
+/// Emit a driver-level error (an IO, CLI, autodiff or training failure that has no source span)
+/// honoring `--error-format`. These were raw `eprintln!("error: …")` lines that bypassed the JSON
+/// stream entirely, so a `--error-format=json` consumer saw unparseable text interleaved with the
+/// machine-readable diagnostics. Routed through the renderer, a human run is byte-identical to the
+/// old `error: <msg>` line, and a JSON run now gets a well-formed object.
+fn emit_driver_error(opts: &Options, message: impl Into<String>) {
+    let d = Diagnostic::error(message);
+    let sm = SourceMap::new();
+    match opts.error_format {
+        ErrorFormat::Human => eprint_line(&Renderer::new(opts.color).render(&d, &sm)),
+        ErrorFormat::Json => eprint_line(&wukong_diag::to_json(&d, &sm)),
     }
+}
+
+/// Emit a batch of diagnostics, honoring `--error-limit` and separating consecutive diagnostics
+/// with a blank line in human output (JSON stays one object per line). Returns the number of
+/// error-severity diagnostics in the batch — counted even when suppressed by the limit — so the
+/// caller's "aborting due to N errors" summary stays accurate.
+fn emit_diags(diags: &[Diagnostic], opts: &Options, renderer: &Renderer, sm: &SourceMap) -> usize {
+    let human = opts.error_format == ErrorFormat::Human;
+    let mut printed = 0usize;
+    let mut errors = 0usize;
+    let mut suppressed = false;
+    for d in diags {
+        if d.is_error() {
+            errors += 1;
+        }
+        // Once more errors than the limit have been seen, stop printing anything further.
+        if let Some(n) = opts.error_limit {
+            if errors > n {
+                suppressed = true;
+            }
+        }
+        if suppressed {
+            continue;
+        }
+        if printed > 0 && human {
+            eprint_line("");
+        }
+        emit_diag(d, opts.error_format, renderer, sm);
+        printed += 1;
+    }
+    errors
+}
+
+/// Print rustc's "aborting due to N previous error(s)" trailer in human format. JSON consumers count
+/// the stream themselves, so it is suppressed there.
+fn emit_summary(errors: usize, opts: &Options, renderer: &Renderer) {
+    if errors == 0 || opts.error_format != ErrorFormat::Human {
+        return;
+    }
+    let plural = if errors == 1 { "" } else { "s" };
+    let d = Diagnostic::error(format!("aborting due to {errors} previous error{plural}"));
+    eprint_line(&renderer.render(&d, &SourceMap::new()));
+}
+
+fn render_all(opts: &Options, renderer: &Renderer, sink: &DiagnosticSink, sm: &SourceMap) {
+    let errors = emit_diags(sink.diagnostics(), opts, renderer, sm);
+    emit_summary(errors, opts, renderer);
 }
 
 /// The `--emit=grad` CLI surface, end to end from `.wk` source: compile → optimize → differentiate
