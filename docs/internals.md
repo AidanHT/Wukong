@@ -170,7 +170,11 @@ greps for the literal substring `"code":"Ennnn"`, so key order and the absence o
 
 A `Function` owns a value arena (`ValueId -> MirType`), a list of `BasicBlock`s, and an entry block.
 Each block has typed parameters, a straight-line list of `Inst { result: Option<ValueId>, op: Op }`,
-and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Unreachable`). `Op` has 24 variants: constants
+and exactly one `Terminator` (`Ret`, `Br`, `CondBr`, `Switch`, `Unreachable`). `Switch` is a multi-way
+branch on an `i8`..`i64` scrutinee whose case values are stored canonically (sign-extended from the
+type's width) and pairwise distinct; only `wukong_opt`'s late switch formation creates one, and the
+verifier, interpreter, Cranelift (`cranelift_frontend::Switch`), textual LLVM (`switch`) and every
+terminator visitor handle it (the `gpu-native` lowering declines it). `Op` has 24 variants: constants
 (`ConstInt`/`ConstFloat`), `Bin`/`Cmp`/`Cast`, the unary `Neg`/`Not`, `Select`, memory
 (`Alloca`/`Load`/`Store`/`Gep`), `Call`, `Barrier` (cooperative thread-block fence from
 `sync_block()`), the float/SIMD primitives
@@ -309,7 +313,7 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 | `inline_program`| -O2   | inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
 | `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot only when it is provably written before it is read — see below) |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
-| `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
+| `SimplifyCfg` | -O1   | constant-branch folding (including a constant or degenerate `switch`), straight-line block merging, and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
 | `Dce`         | -O1   | remove pure instructions whose results are unused, and dead allocas |
 | `Cse`         | -O2   | dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table) plus **intra-block** load forwarding keyed on `(address value, accessed type)`, with `alias` deciding which entries a store or call invalidates |
@@ -318,6 +322,7 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 | `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load**, when `alias` proves nothing in the body writes it *and* the access is dereferenceable |
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
 | `unroll_program`| -O2 | unroll a counted two-block loop 4x, with a wrap-safe guard and a remainder loop; runs **after** the function pipeline, and the functions it changed get a reduced cse+dce cleanup sweep |
+| `FormSwitches` | -O2 | once, after unrolling: turn a chain of four or more `cmp.eq`/`cmp.ne` tests of one integer scrutinee against constants into one `switch` terminator, hoisting the pure link compares into the head; a trapping (`unreachable`) fall-through stays the default, because sema's exhaustiveness check is lenient and that block can be reached (`src/switch_form.rs`) |
 
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
 (`PassManager::standard` adds passes at `-O1` and `-O2` only).

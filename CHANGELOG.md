@@ -5,6 +5,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### CFG and loop transforms (`gap2/cfg-and-loop-transforms`)
+
+- **MIR `switch` terminator, formed from compare chains at `-O2`.** `Terminator::Switch` is a
+  multi-way branch on an `i8`..`i64` scrutinee with canonical (sign-extended), pairwise-distinct
+  case values, checked by the verifier and executed by the interpreter, Cranelift
+  (`cranelift_frontend::Switch`: jump table, bit tests or search tree) and the textual LLVM emitter;
+  `gpu-native` declines it. `wukong_opt::switch_form` turns a chain of four or more `cmp.eq`/`cmp.ne`
+  tests of one scrutinee into one `switch` once, after every loop transform, and `simplify-cfg`
+  folds a constant or degenerate `switch`. An `unreachable` fall-through is kept as the default:
+  sema's exhaustiveness check is lenient, so that block can be reached, and the interpreter stops
+  there (`tests/run/match_dense_enum_switch.wk`).
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

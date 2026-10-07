@@ -227,6 +227,7 @@ loop_counter_wider_bound.wk:
 loop_i64_bound.wk:
 loop_unroll.wk: wukong_rt_alloc wukong_rt_free
 lrscan.wk: veckernel*1 wukong_lrscan_f32
+match_dense_enum_switch.wk:
 match_enum_mixed_coverage.wk:
 match_exhaustive_enum.wk:
 match_expr.wk:

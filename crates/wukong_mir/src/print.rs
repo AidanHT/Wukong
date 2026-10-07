@@ -141,6 +141,25 @@ fn fmt_term(t: &Terminator) -> String {
             else_blk.0,
             fmt_args(else_args)
         ),
+        // `switch v3, bb7(v2) [0: bb2(v1), -1: bb4]` -- LLVM's order: scrutinee, default, cases.
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default,
+            default_args,
+        } => {
+            let arms: Vec<String> = cases
+                .iter()
+                .map(|c| format!("{}: bb{}{}", c.value, c.target.0, fmt_args(&c.args)))
+                .collect();
+            format!(
+                "switch {}, bb{}{} [{}]",
+                val(*scrutinee),
+                default.0,
+                fmt_args(default_args),
+                arms.join(", ")
+            )
+        }
         Terminator::Unreachable => "unreachable".to_string(),
     }
 }

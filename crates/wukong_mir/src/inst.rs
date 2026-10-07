@@ -311,5 +311,142 @@ pub enum Terminator {
         else_blk: BlockId,
         else_args: Vec<ValueId>,
     },
+    /// A multi-way branch on an integer: control goes to the case whose `value` equals the
+    /// scrutinee, or to `default` when none does. The scrutinee is a scalar `i8`/`i16`/`i32`/`i64`
+    /// (never `i1`, never a vector), every case value is in canonical form for that type (see
+    /// [`switch_case_value`]) and no two cases share a value — the verifier checks all three. Two
+    /// cases, or a case and the default, may name the same target; each is its own edge with its
+    /// own arguments.
+    ///
+    /// The semantics are exactly a chain of `cond_br (cmp.eq scrutinee, value)` tested in case
+    /// order, which is what `wukong_opt`'s switch formation builds it from: the interpreter compares
+    /// the scrutinee's integer value against each case, the Cranelift backend hands the cases to
+    /// `cranelift_frontend::Switch` (a jump table, bit tests or a search tree), and the textual-LLVM
+    /// emitter prints an LLVM `switch`. Nothing in `mir_build` emits one.
+    Switch {
+        scrutinee: ValueId,
+        cases: Vec<SwitchCase>,
+        default: BlockId,
+        default_args: Vec<ValueId>,
+    },
     Unreachable,
+}
+
+/// One arm of a [`Terminator::Switch`]: when the scrutinee equals `value`, branch to `target`,
+/// passing `args` to its parameters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitchCase {
+    /// The case value in **canonical form**: the scrutinee type's bit pattern sign-extended from
+    /// its width, so an `i8` case lies in `-128..=127` and the byte `0xFF` is spelled `-1`. That is
+    /// how the interpreter holds every integer of that type, so a case matches exactly when
+    /// `cmp.eq scrutinee, value` would. [`switch_case_value`] produces it.
+    pub value: i128,
+    pub target: BlockId,
+    pub args: Vec<ValueId>,
+}
+
+/// The canonical [`SwitchCase::value`] of the integer `value` for a scrutinee of type `ty`: its
+/// low `ty`-width bits, sign-extended. `None` when `ty` cannot be a switch scrutinee — anything but
+/// a scalar `i8`, `i16`, `i32` or `i64`.
+pub fn switch_case_value(value: i128, ty: &MirType) -> Option<i128> {
+    let bits: u32 = match ty {
+        MirType::I8 => 8,
+        MirType::I16 => 16,
+        MirType::I32 => 32,
+        MirType::I64 => 64,
+        _ => return None,
+    };
+    let shift = 128 - bits;
+    Some((value << shift) >> shift)
+}
+
+impl Terminator {
+    /// How many outgoing edges this terminator has. A target reached along two edges (both arms
+    /// of a `cond_br`, or two switch cases) counts once per edge.
+    pub fn edge_count(&self) -> usize {
+        match self {
+            Terminator::Ret(_) | Terminator::Unreachable => 0,
+            Terminator::Br { .. } => 1,
+            Terminator::CondBr { .. } => 2,
+            Terminator::Switch { cases, .. } => cases.len() + 1,
+        }
+    }
+
+    /// The target of outgoing edge `i` in **edge order** — a `cond_br`'s then-edge before its
+    /// else-edge, a `switch`'s cases in order and then its default — or `None` past the last edge.
+    pub fn edge_target(&self, i: usize) -> Option<BlockId> {
+        match self {
+            Terminator::Ret(_) | Terminator::Unreachable => None,
+            Terminator::Br { target, .. } => (i == 0).then_some(*target),
+            Terminator::CondBr {
+                then_blk, else_blk, ..
+            } => match i {
+                0 => Some(*then_blk),
+                1 => Some(*else_blk),
+                _ => None,
+            },
+            Terminator::Switch { cases, default, .. } => match cases.get(i) {
+                Some(c) => Some(c.target),
+                None => (i == cases.len()).then_some(*default),
+            },
+        }
+    }
+
+    /// Visit every outgoing edge as `(target, args)`, in edge order.
+    pub fn for_each_edge(&self, mut f: impl FnMut(BlockId, &[ValueId])) {
+        match self {
+            Terminator::Ret(_) | Terminator::Unreachable => {}
+            Terminator::Br { target, args } => f(*target, args),
+            Terminator::CondBr {
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+                ..
+            } => {
+                f(*then_blk, then_args);
+                f(*else_blk, else_args);
+            }
+            Terminator::Switch {
+                cases,
+                default,
+                default_args,
+                ..
+            } => {
+                for c in cases {
+                    f(c.target, &c.args);
+                }
+                f(*default, default_args);
+            }
+        }
+    }
+
+    /// Visit every outgoing edge mutably, in edge order: retarget it, or edit its arguments.
+    pub fn for_each_edge_mut(&mut self, mut f: impl FnMut(&mut BlockId, &mut Vec<ValueId>)) {
+        match self {
+            Terminator::Ret(_) | Terminator::Unreachable => {}
+            Terminator::Br { target, args } => f(target, args),
+            Terminator::CondBr {
+                then_blk,
+                then_args,
+                else_blk,
+                else_args,
+                ..
+            } => {
+                f(then_blk, then_args);
+                f(else_blk, else_args);
+            }
+            Terminator::Switch {
+                cases,
+                default,
+                default_args,
+                ..
+            } => {
+                for c in cases {
+                    f(&mut c.target, &mut c.args);
+                }
+                f(default, default_args);
+            }
+        }
+    }
 }

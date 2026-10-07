@@ -112,8 +112,10 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   `_` patterns, **or-patterns** `1 | 2 | 3`, half-open `0..10` / inclusive `0..=10` **range** patterns,
   **enum-variant** patterns `Color::Red` (matched by discriminant), and **tuple** patterns `(0, _)`
   (per-field tests + bindings, nesting and composition like `(0 | 1, y)`), each with an optional `if`
-  guard. The scrutinee is evaluated once and the whole `match` lowers to an if-else chain
-  (`tests/run/{match_expr,match_patterns,match_tuple}.wk`).
+  guard. The scrutinee is evaluated once and the whole `match` lowers to an if-else chain; at `-O2`
+  four or more equality tests on one integer scrutinee become one MIR `switch` (a Cranelift jump
+  table or search tree; the `gpu-native` backend declines it)
+  (`tests/run/{match_expr,match_patterns,match_tuple,match_dense_enum_switch}.wk`).
 - **C-style enums** `enum Code { Ok = 10, Err }` — explicit or auto-incrementing discriminants; a
   variant *is* its integer discriminant, usable in `let`, `==`, `as i32`, and as a `match` pattern
   (`tests/run/enum_cstyle.wk`).

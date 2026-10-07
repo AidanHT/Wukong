@@ -2630,6 +2630,16 @@ fn retarget(t: &mut Terminator, from: BlockId, to: BlockId) {
                 *else_blk = to;
             }
         }
+        Terminator::Switch { cases, default, .. } => {
+            for c in cases.iter_mut() {
+                if c.target == from {
+                    c.target = to;
+                }
+            }
+            if *default == from {
+                *default = to;
+            }
+        }
         Terminator::Ret(_) | Terminator::Unreachable => {}
     }
 }

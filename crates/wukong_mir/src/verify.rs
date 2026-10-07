@@ -90,17 +90,6 @@ struct Verifier<'a> {
     dom_check: bool,
 }
 
-/// The at-most-two blocks a terminator can transfer control to.
-fn successors(t: &Terminator) -> [Option<u32>; 2] {
-    match t {
-        Terminator::Br { target, .. } => [Some(target.0), None],
-        Terminator::CondBr {
-            then_blk, else_blk, ..
-        } => [Some(then_blk.0), Some(else_blk.0)],
-        Terminator::Ret(_) | Terminator::Unreachable => [None, None],
-    }
-}
-
 /// Sentinel for "no immediate dominator yet" in the Cooper–Harvey–Kennedy fixpoint below.
 const NO_IDOM: u32 = u32::MAX;
 
@@ -236,13 +225,14 @@ impl Verifier<'_> {
         let mut stack: Vec<(u32, usize)> = vec![(entry as u32, 0)];
         visited[entry] = true;
         while let Some(&mut (b, i)) = stack.last_mut() {
-            if i >= 2 {
+            let term = &f.blocks[b as usize].term;
+            if i >= term.edge_count() {
                 post.push(b);
                 stack.pop();
                 continue;
             }
             stack.last_mut().expect("stack is non-empty here").1 += 1;
-            if let Some(s) = successors(&f.blocks[b as usize].term)[i] {
+            if let Some(s) = term.edge_target(i).map(|s| s.0) {
                 if (s as usize) < n && !visited[s as usize] {
                     visited[s as usize] = true;
                     stack.push((s, 0));
@@ -254,11 +244,11 @@ impl Verifier<'_> {
             if !visited[b] {
                 continue;
             }
-            for s in successors(&blk.term).into_iter().flatten() {
-                if (s as usize) < n {
-                    preds[s as usize].push(b as u32);
+            blk.term.for_each_edge(|s, _| {
+                if (s.0 as usize) < n {
+                    preds[s.0 as usize].push(b as u32);
                 }
-            }
+            });
         }
         // `Builder::alloca` parks stack slots in the entry block because it runs exactly once, and
         // mem2reg never places a merge parameter there only because nothing branches back to it.
@@ -827,7 +817,53 @@ impl Verifier<'_> {
                 self.check_edge(*then_blk, then_args, nblocks);
                 self.check_edge(*else_blk, else_args, nblocks);
             }
+            Terminator::Switch {
+                scrutinee,
+                cases,
+                default,
+                default_args,
+            } => {
+                if self.use_val(*scrutinee) {
+                    self.check_switch_cases(*scrutinee, cases);
+                }
+                for c in cases {
+                    self.check_edge(c.target, &c.args, nblocks);
+                }
+                self.check_edge(*default, default_args, nblocks);
+            }
             Terminator::Unreachable => {}
+        }
+    }
+
+    /// A switch scrutinee is a scalar `i8`..`i64`, and its case values are canonical for that type
+    /// and pairwise distinct (a duplicate could never be taken, and the Cranelift lowering rejects
+    /// one outright).
+    fn check_switch_cases(&mut self, scrutinee: ValueId, cases: &[crate::SwitchCase]) {
+        let Some(ty) = self.ty(scrutinee).cloned() else {
+            return;
+        };
+        if crate::switch_case_value(0, &ty).is_none() {
+            self.err(format!(
+                "switch scrutinee {scrutinee:?} has type {}, but must be i8, i16, i32 or i64",
+                ty.display()
+            ));
+            return;
+        }
+        let mut seen: HashSet<i128> = HashSet::new();
+        for c in cases {
+            if crate::switch_case_value(c.value, &ty) != Some(c.value) {
+                self.err(format!(
+                    "switch case value {} is not a canonical {} (sign-extended from its width)",
+                    c.value,
+                    ty.display()
+                ));
+            }
+            if !seen.insert(c.value) {
+                self.err(format!(
+                    "switch case value {} appears more than once",
+                    c.value
+                ));
+            }
         }
     }
 
@@ -1456,5 +1492,83 @@ mod tests {
         b.ret(Some(z));
         let p = program_of(vec![callee, answer, b.finish()]);
         assert!(verify_program(&p).is_empty(), "{:?}", verify_program(&p));
+    }
+
+    /// A switch on `x: i8` with cases `values`, each case and the default returning a distinct
+    /// constant; the default passes `x` to a parameter, so edge arguments are checked too.
+    fn switch_fn(scrut_ty: MirType, values: &[i128]) -> crate::Function {
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("sw"), MirType::I64);
+        let x = b.add_param(scrut_ty.clone());
+        let mut cases = Vec::new();
+        let mut arms = Vec::new();
+        for &v in values {
+            let blk = b.new_block();
+            cases.push(crate::SwitchCase {
+                value: v,
+                target: blk,
+                args: vec![],
+            });
+            arms.push((blk, v));
+        }
+        let dflt = b.new_block();
+        let p = b.block_param(dflt, scrut_ty);
+        b.switch(x, cases, dflt, vec![x]);
+        for (blk, v) in arms {
+            b.switch_to(blk);
+            let r = b.build(MirType::I64, Op::ConstInt(v, MirType::I64));
+            b.ret(Some(r));
+        }
+        b.switch_to(dflt);
+        let r = b.build(MirType::I64, Op::ConstInt(99, MirType::I64));
+        let _ = p;
+        b.ret(Some(r));
+        b.finish()
+    }
+
+    #[test]
+    fn accepts_a_well_formed_switch() {
+        let f = switch_fn(MirType::I8, &[0, 1, -1, 127, -128]);
+        assert!(verify_function(&f).is_empty(), "{:?}", verify_function(&f));
+    }
+
+    #[test]
+    fn detects_non_canonical_and_duplicate_switch_cases() {
+        // 255 is the byte -1 spelled unsigned: not canonical for i8.
+        let errs = verify_function(&switch_fn(MirType::I8, &[0, 255]));
+        assert!(errs.iter().any(|e| e.contains("canonical")), "{errs:?}");
+        let errs = verify_function(&switch_fn(MirType::I32, &[3, 7, 3]));
+        assert!(
+            errs.iter().any(|e| e.contains("more than once")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn detects_a_switch_on_a_non_integer_scrutinee() {
+        for ty in [MirType::I1, MirType::F32, MirType::Ptr] {
+            let errs = verify_function(&switch_fn(ty, &[0]));
+            assert!(
+                errs.iter().any(|e| e.contains("switch scrutinee")),
+                "{errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn switch_edges_are_dominance_and_arity_checked() {
+        let mut f = switch_fn(MirType::I64, &[1, 2]);
+        // The default edge loses its argument: an arity error on that edge alone.
+        if let Terminator::Switch { default_args, .. } = &mut f.blocks[0].term {
+            default_args.clear();
+        }
+        let errs = verify_function(&f);
+        assert!(errs.iter().any(|e| e.contains("parameters")), "{errs:?}");
+        // Every case target is reachable through the switch, so it is dominance-checked: the
+        // printer and the walk agree on the edge order.
+        let f = switch_fn(MirType::I64, &[1, 2]);
+        assert_eq!(f.blocks[0].term.edge_count(), 3);
+        assert_eq!(f.blocks[0].term.edge_target(2), Some(crate::BlockId(3)));
+        assert_eq!(f.blocks[0].term.edge_target(3), None);
     }
 }

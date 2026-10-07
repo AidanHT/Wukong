@@ -4,7 +4,7 @@
 //!  1. **Constant branch folding** — a `cond_br` whose condition is a known constant (after
 //!     const-folding upstream) becomes an unconditional `br` to the taken side, carrying that
 //!     side's block arguments. A `cond_br` whose two targets *and* arguments are identical also
-//!     collapses to a `br`.
+//!     collapses to a `br`, and so does a constant or degenerate `switch` (`switch_form`).
 //!  2. **Straight-line merging** — when a block ends in an unconditional `br` to a block whose
 //!     only predecessor it is, the two are fused into one. This collapses the forwarding chains
 //!     that branch folding and mem2reg leave behind and, by enlarging basic blocks, gives the
@@ -34,6 +34,8 @@ impl Pass for SimplifyCfg {
         // what lets the steady-state call, where nothing folds, merges or dies, read predecessors
         // and reachability from the cache instead of recomputing both from scratch.
         let mut changed = fold_constant_branches(f);
+        // A constant or degenerate `switch` (`switch_form`).
+        changed |= crate::switch_form::fold_switches(f);
         if changed {
             cache.invalidate(); // successor edges changed
         }

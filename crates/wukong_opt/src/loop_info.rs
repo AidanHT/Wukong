@@ -2003,6 +2003,20 @@ fn args_to(t: &Terminator, target: BlockId) -> Option<&[ValueId]> {
             (false, true) => Some(else_args),
             (false, false) => None,
         },
+        Terminator::Switch {
+            cases,
+            default,
+            default_args,
+            ..
+        } => {
+            let mut into = cases
+                .iter()
+                .filter(|c| c.target == target)
+                .map(|c| c.args.as_slice())
+                .chain((*default == target).then_some(default_args.as_slice()));
+            let first = into.next()?;
+            into.all(|args| args == first).then_some(first)
+        }
         _ => None,
     }
 }

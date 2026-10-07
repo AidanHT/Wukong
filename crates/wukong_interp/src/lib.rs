@@ -990,6 +990,23 @@ impl<'a, 'k> Interp<'a, 'k> {
                     pass_args(regs, &mut self.scratch, func.block(tgt), bargs);
                     cur = tgt;
                 }
+                // Exactly a `cmp.eq` chain in case order: the scrutinee's integer value (held
+                // sign-extended, which is the canonical form every case value is stored in) against
+                // each case, falling back to the default.
+                Terminator::Switch {
+                    scrutinee,
+                    cases,
+                    default,
+                    default_args,
+                } => {
+                    let x = reg(regs, *scrutinee).as_int();
+                    let (tgt, bargs) = match cases.iter().find(|c| c.value == x) {
+                        Some(c) => (c.target, &c.args),
+                        None => (*default, default_args),
+                    };
+                    pass_args(regs, &mut self.scratch, func.block(tgt), bargs);
+                    cur = tgt;
+                }
                 Terminator::Unreachable => return Err("execution reached `unreachable`".into()),
             }
         }

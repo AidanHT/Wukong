@@ -263,7 +263,9 @@ fn classify(n: i32) -> i32 {
 }
 ```
 
-`match` evaluates its scrutinee once and lowers to an if-else chain over the arms. Patterns are
+`match` evaluates its scrutinee once and lowers to an if-else chain over the arms (at `-O2`, a run
+of four or more equality tests on one integer scrutinee becomes a single `switch`, which the native
+backend emits as a jump table or a search tree; the semantics are the chain's). Patterns are
 integer/bool **literals**, **or-patterns** `A | B | C`, half-open `lo..hi` / inclusive `lo..=hi`
 **ranges** whose bounds are integer or char **literals** (a `const` bound such as `0..N` parses but
 does not lower — it reports `C0001` at the pattern; inline the literal), **enum-variant** patterns

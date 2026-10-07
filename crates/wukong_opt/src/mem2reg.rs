@@ -262,11 +262,13 @@ fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut Cf
         append_then: FxHashMap::default(),
         append_else: FxHashMap::default(),
         append_br: FxHashMap::default(),
+        append_switch: FxHashMap::default(),
         zero_for: FxHashMap::default(),
         new_consts: Vec::new(),
         next_value: f.value_types.len() as u32,
     };
     r.visit(f, f.entry.0);
+    let append_switch = std::mem::take(&mut r.append_switch);
     let Rename {
         replace,
         delete,
@@ -296,6 +298,21 @@ fn promote(f: &mut Function, promotable: &BTreeMap<u32, MirType>, cache: &mut Cf
                 }
                 if let Some(extra) = append_else.get(&b.id.0) {
                     else_args.extend(extra.iter().copied());
+                }
+            }
+            Terminator::Switch {
+                cases,
+                default_args,
+                ..
+            } => {
+                // One list per case, then one for the default (see `Rename::append_switch`).
+                if let Some(extra) = append_switch.get(&b.id.0) {
+                    for (c, more) in cases.iter_mut().zip(extra) {
+                        c.args.extend(more.iter().copied());
+                    }
+                    if let Some(more) = extra.get(cases.len()) {
+                        default_args.extend(more.iter().copied());
+                    }
                 }
             }
             _ => {}
@@ -371,6 +388,8 @@ struct Rename<'a> {
     append_then: FxHashMap<u32, Vec<ValueId>>,
     append_else: FxHashMap<u32, Vec<ValueId>>,
     append_br: FxHashMap<u32, Vec<ValueId>>,
+    /// a `switch`'s edges, keyed by source block: one list per case in order, then the default's.
+    append_switch: FxHashMap<u32, Vec<Vec<ValueId>>>,
     /// cached zero constant per type (for read-before-write).
     zero_for: FxHashMap<MirType, ValueId>,
     /// freshly allocated (value id, type) zero constants to materialize later.
@@ -483,6 +502,16 @@ impl Rename<'_> {
                 let ve = self.phi_args_for(else_blk.0);
                 if !ve.is_empty() {
                     self.append_else.insert(block, ve);
+                }
+            }
+            Terminator::Switch { cases, default, .. } => {
+                let mut lists: Vec<Vec<ValueId>> = Vec::with_capacity(cases.len() + 1);
+                for c in cases {
+                    lists.push(self.phi_args_for(c.target.0));
+                }
+                lists.push(self.phi_args_for(default.0));
+                if lists.iter().any(|l| !l.is_empty()) {
+                    self.append_switch.insert(block, lists);
                 }
             }
             _ => {}

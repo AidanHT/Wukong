@@ -24,7 +24,9 @@
 //! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
 //! per-function pipeline, and partial loop unrolling ([`unroll_program`]) runs once *after* it — the
 //! pipeline is then re-run over the functions unrolling changed, so the duplicated bodies get the
-//! same cse/simplify/dce treatment as everything else. `-O3` adds nothing to any of it — see
+//! same cse/simplify/dce treatment as everything else. Last of all, [`FormSwitches`] turns each
+//! chain of equality tests on one scrutinee into a single `switch` terminator (once, after every
+//! loop transform — see `switch_form`). `-O3` adds nothing to any of it — see
 //! [`PassManager::standard`].
 
 pub mod alias;
@@ -48,6 +50,8 @@ mod unroll;
 mod vectorize;
 mod verify_each;
 
+mod switch_form;
+
 pub use verify_each::{verify_program_stage, VerificationFailure};
 
 pub use alias::{type_bytes, AliasInfo, Prov};
@@ -67,6 +71,8 @@ pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
 pub use unroll::unroll_program;
 pub use vectorize::Vectorize;
+
+pub use switch_form::FormSwitches;
 
 use std::time::{Duration, Instant};
 
@@ -317,6 +323,8 @@ pub fn optimize_preserving(program: &mut Program, opt_level: u8, roots: &[wukong
                 cleanup.run_function(&mut program.funcs[i], None);
             }
         }
+        // Last, and outside the fixpoint: a multi-way branch must not reach the loop passes.
+        switch_form::form_switches(program);
     }
 }
 
@@ -348,6 +356,8 @@ pub fn optimize_verified_preserving(
         for i in changed {
             cleanup.run_function_checked(&mut program.funcs[i], None, true)?;
         }
+        switch_form::form_switches(program);
+        verify_program_stage(program, "form-switches")?;
     }
     verify_program_stage(program, "optimization output")
 }
@@ -383,6 +393,8 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
             }
         }
         t.unroll = u0.elapsed();
+        // Counted in `total` only: one scan per function, and a cleanup only where one formed.
+        switch_form::form_switches(program);
     }
     t.total = start.elapsed();
     t
@@ -465,6 +477,20 @@ pub(crate) fn map_term_uses(t: &mut Terminator, mut f: impl FnMut(ValueId) -> Va
                 *a = f(*a);
             }
         }
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default_args,
+            ..
+        } => {
+            *scrutinee = f(*scrutinee);
+            for a in cases.iter_mut().flat_map(|c| c.args.iter_mut()) {
+                *a = f(*a);
+            }
+            for a in default_args {
+                *a = f(*a);
+            }
+        }
         Terminator::Ret(None) | Terminator::Unreachable => {}
     }
 }
@@ -533,6 +559,16 @@ pub(crate) fn each_term_use(t: &Terminator, f: &mut impl FnMut(ValueId)) {
             f(*cond);
             then_args.iter().for_each(|a| f(*a));
             else_args.iter().for_each(|a| f(*a));
+        }
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default_args,
+            ..
+        } => {
+            f(*scrutinee);
+            cases.iter().flat_map(|c| &c.args).for_each(|a| f(*a));
+            default_args.iter().for_each(|a| f(*a));
         }
         Terminator::Ret(None) | Terminator::Unreachable => {}
     }

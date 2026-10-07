@@ -661,6 +661,24 @@ fn remap_term(
             else_blk: bmap(*else_blk),
             else_args: margs(else_args),
         },
+        Terminator::Switch {
+            scrutinee,
+            cases,
+            default,
+            default_args,
+        } => Terminator::Switch {
+            scrutinee: mapv(*scrutinee),
+            cases: cases
+                .iter()
+                .map(|c| wukong_mir::SwitchCase {
+                    value: c.value,
+                    target: bmap(c.target),
+                    args: margs(&c.args),
+                })
+                .collect(),
+            default: bmap(*default),
+            default_args: margs(default_args),
+        },
         Terminator::Unreachable => Terminator::Unreachable,
     }
 }
