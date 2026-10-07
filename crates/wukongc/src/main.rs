@@ -16,7 +16,8 @@ OPTIONS:
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
                        tokens, ast, mir-high, mir, grad, llvm-ir, obj, exe  (default: exe)
                        (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
-    --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss)
+    --grad-of=<fn>     Function to differentiate for --emit=grad / --train  (default: loss).
+                       With --emit=obj, the object also exports the gradient as <fn>_grad
     --grad-wrt=<i,..>  Comma-separated parameter indices to differentiate w.r.t. (default: all
                        buffer parameters of the loss function). For --train, these are the
                        trainable weights; other buffers are fixed data; the last param is the loss.
