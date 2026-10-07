@@ -312,6 +312,41 @@ static CATALOG: &[Explanation] = &[
          typo, or use an integer / `?`."
     ),
     entry!(
+        "E0505",
+        "dimension expression has no extent",
+        "A tensor dimension may be arithmetic on dimensions — `Tensor[f32, 3*D]`, \
+         `Tensor[f32, S, H*HD]`, `Tensor[f32, (L - K)/S + 1]` — using `+ - * / %` (`/` is floor \
+         division, `%` the matching non-negative remainder) on integer literals, generic \
+         dimensions and `const`s. Such an expression must denote an extent: it may not fold to a \
+         negative constant (`2 - 5`), divide by zero or by a negative constant, or overflow the \
+         64-bit extent range; and a `?` dimension cannot be an operand, since it has no value to \
+         compute with (name the dimension with a generic parameter instead). The same rule applies \
+         at a call: `fn shrink<N>(a: Tensor[f32, N]) -> Tensor[f32, N - 4]` called with a length-2 \
+         tensor has no result shape."
+    ),
+    entry!(
+        "E0506",
+        "reshape changes the element count",
+        "`x as Tensor[T, d0, d1, ...]` views a contiguous buffer (a tensor, or a fixed-size array \
+         of scalars) under a new shape without copying, so the new shape must hold exactly the \
+         same number of elements — PROVABLY, for every value of the dimensions. `x as \
+         Tensor[f32, S, H, HD]` from `Tensor[f32, S, H*HD]` is accepted (`S*H*HD` both ways); from \
+         `Tensor[f32, S, D]` it is rejected, because `D` is not provably `H*HD` — write the \
+         source's shape with the factor spelled out. A `?` dimension has no compile-time extent, so \
+         a reshape involving one cannot be proved and is rejected too."
+    ),
+    entry!(
+        "E0507",
+        "invalid tensor view or extent query",
+        "Indexing a tensor with fewer indices than its rank selects a VIEW of the remaining axes \
+         (`a[i]` on `Tensor[f32, M, N]` is the row, a `Tensor[f32, N]` naming part of `a`'s \
+         buffer). Only a contiguous (row-major) tensor has such views — the rows of a \
+         `.col_major`, `.strided` or `.tiled` tensor are not contiguous. A view is not a place a \
+         value can be assigned to (`a[i] = ...` would have to copy a whole row): assign its \
+         elements with one index per axis. The axis of `t.dim(k)` must be a compile-time \
+         constant, because each axis of a shape-typed value has its own extent."
+    ),
+    entry!(
         "C0001",
         "unsupported in codegen",
         "A construct parsed and type-checked but is not yet supported by MIR lowering or the \

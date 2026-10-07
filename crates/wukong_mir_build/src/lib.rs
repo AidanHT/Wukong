@@ -28,6 +28,7 @@
 
 mod alias;
 mod canon;
+mod shape_ops;
 mod tile;
 mod tindex;
 
@@ -2326,6 +2327,7 @@ fn parallel_spec<'a>(
         par: None,
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     for (p, ty) in f.params.iter().zip(&param_tys) {
         let base = proof.builder.add_param(MirType::Ptr);
@@ -2392,6 +2394,7 @@ fn is_batched_norm_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     probe.match_batched_norm(pat, iter, lb).is_some()
 }
@@ -2446,6 +2449,7 @@ fn is_bias_bcast_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     probe.match_bias_bcast(pat, iter, lb).is_some()
 }
@@ -2525,6 +2529,7 @@ fn lower_fn(
         par,
         tile_queue,
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
 
     // The sret pointer is parameter 0 — declared before the real params so the call site can prepend
@@ -2538,8 +2543,9 @@ fn lower_fn(
     // Tensor[f32, M, N])`): each symbolic dim is threaded in as a leading `i64` param and bound
     // under its symbol name, so the body's index strides / matmul dims / value uses resolve it at
     // runtime. Placed right after any sret pointer, before the real params — matching the argument
-    // order `lower_call` prepends. A no-op for a non-generic function.
-    fl.bind_dim_params(&param_tys);
+    // order `lower_call` prepends. A no-op for a non-generic function. The `?`-axis extents that
+    // follow them are attached to their parameter's binding below.
+    let dyn_params = fl.bind_dim_params(&param_tys);
 
     // Declare all parameters first (so their value ids are contiguous), then materialize each.
     // Arrays AND aggregates (tuples/structs) are passed by base pointer (ABI type `Ptr`); scalars by
@@ -2551,7 +2557,7 @@ fn lower_fn(
         .iter()
         .map(|abi| fl.builder.add_param(abi.clone()))
         .collect();
-    for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
+    for (pi, ((p, pty), val)) in f.params.iter().zip(&param_tys).zip(param_vals).enumerate() {
         if ty_is_buffer_param(pty) {
             fl.param_arrays.push((val, pty.clone()));
         }
@@ -2573,6 +2579,7 @@ fn lower_fn(
             // A struct parameter arrives as its buffer pointer, so its buffer fields are addressable
             // right here: record them so `l.wq[…]` is a kernel operand like a bare `wq[…]`.
             fl.bind_field_bases(p.name.sym, val, pty);
+            fl.record_param_extents(&dyn_params, pi, val, p.name.sym, body);
         } else {
             let slot = fl.builder.alloca(mty.clone());
             fl.builder.build_void(Op::Store {
@@ -2580,6 +2587,7 @@ fn lower_fn(
                 value: val,
             });
             fl.bind_slice(p.name.sym, slot, mty, is_slice);
+            fl.record_param_extents(&dyn_params, pi, slot, p.name.sym, body);
         }
     }
 
@@ -2743,6 +2751,7 @@ fn lower_parallel(
 
             tile_queue: vec![],
             param_arrays: vec![],
+            dyn_extents: HashMap::default(),
         };
         let start = fl.builder.add_param(MirType::I64);
         let end = fl.builder.add_param(MirType::I64);
@@ -2814,6 +2823,7 @@ fn lower_parallel(
 
             tile_queue: vec![],
             param_arrays: vec![],
+            dyn_extents: HashMap::default(),
         };
         let param_vals: Vec<ValueId> = param_tys
             .iter()
@@ -3572,6 +3582,12 @@ struct FnLowerer<'a> {
     /// the fail-closed form of LANDMINE 1. Stacked in lockstep with `scopes` (`push_scope` /
     /// `pop_scope`) so a shadowing `let l: Other` in an inner block does not outlive its scope.
     field_bases: Vec<HashMap<Symbol, (Symbol, ValueId, ValueId, MirType)>>,
+    /// The run-time extent of each `?` axis of a tensor PARAMETER (and of an immutable view of
+    /// one): `(binding slot, axis)` -> the slot holding the hidden `i64` extent the caller passed
+    /// (`shape_ops::dynamic_extent_params`). Keyed by the binding's slot value, which is unique in a
+    /// function, so a shadowing binding of the same name is simply absent. Read by
+    /// `tensor_axis_extent` for `t.dim(k)`, an interior `?` stride and a `for` over a `?` tensor.
+    dyn_extents: HashMap<(ValueId, usize), ValueId>,
 }
 
 impl FnLowerer<'_> {
@@ -4138,8 +4154,13 @@ impl FnLowerer<'_> {
     /// order and contents come from [`symbolic_dim_params`] — identical to what [`lower_call`]
     /// prepends at the call site, so the ABI matches by construction. Called after any sret pointer
     /// and before the real params, so the hidden dims occupy the leading (post-sret) parameter slots.
-    /// A no-op for a non-generic function (returns `0`), keeping every existing ABI byte-identical.
-    fn bind_dim_params(&mut self, param_tys: &[Ty]) -> usize {
+    ///
+    /// After the symbolic dims come the hidden extents of the `?` axes
+    /// ([`shape_ops::dynamic_extent_params`]): one `i64` per `?` axis of each tensor parameter, each
+    /// spilled to a slot and returned as `(parameter index, axis, slot)` so the caller can attach it
+    /// to the parameter's binding once that exists (`record_param_extents`). A no-op for a
+    /// signature with neither, keeping every existing ABI byte-identical.
+    fn bind_dim_params(&mut self, param_tys: &[Ty]) -> Vec<(usize, usize, ValueId)> {
         let dims = symbolic_dim_params(param_tys);
         for &sym in &dims {
             let val = self.builder.add_param(MirType::I64);
@@ -4150,7 +4171,17 @@ impl FnLowerer<'_> {
             });
             self.bind(sym, slot, MirType::I64);
         }
-        dims.len()
+        let mut dynamic = Vec::new();
+        for (pi, axis) in shape_ops::dynamic_extent_params(param_tys) {
+            let val = self.builder.add_param(MirType::I64);
+            let slot = self.builder.alloca(MirType::I64);
+            self.builder.build_void(Op::Store {
+                ptr: slot,
+                value: val,
+            });
+            dynamic.push((pi, axis, slot));
+        }
+        dynamic
     }
 
     /// Size in bytes of `ty`, resolving named structs through the sema registry — the registry-aware
@@ -9103,7 +9134,12 @@ impl FnLowerer<'_> {
 
     fn lower_stmt(&mut self, s: &Stmt) {
         match &s.kind {
-            StmtKind::Let { pat, ty, init, .. } => {
+            StmtKind::Let {
+                pat,
+                ty,
+                init,
+                mutable,
+            } => {
                 let mty = match (ty, init) {
                     // An aggregate (struct/tuple) initializer — a literal OR a value (a call that
                     // returns a struct/tuple by value, or an aggregate variable) — sizes its slot
@@ -9239,6 +9275,10 @@ impl FnLowerer<'_> {
                 match &pat.kind {
                     ast::PatKind::Ident(name) => {
                         self.bind_slice(*name, slot, mty, is_slice);
+                        // An immutable tensor view keeps the run-time `?` extents of what it views.
+                        if let (Some(e), false) = (init, *mutable) {
+                            self.inherit_dyn_extents(e, slot);
+                        }
                         // `let l: Layer = Layer { … }` — record the struct's buffer fields so a
                         // kernel nest over `l.wq[…]` resolves its base like a bare local's. The
                         // slot is this `let`'s own storage, so the field addresses stay valid for
@@ -13991,6 +14031,7 @@ impl FnLowerer<'_> {
                 par: None,
                 tile_queue: vec![],
                 param_arrays: vec![],
+                dyn_extents: HashMap::default(),
             };
             let start = fl.builder.add_param(MirType::I64);
             let end = fl.builder.add_param(MirType::I64);
@@ -14054,6 +14095,8 @@ impl FnLowerer<'_> {
         let (elem, is_slice) = match self.expr_ty(e) {
             Ty::Array { elem, .. } => (*elem, false),
             Ty::Slice(elem) => (*elem, true),
+            // A tensor iterates its leading axis — elements, or row views (`shape_ops`).
+            Ty::Tensor { .. } => return self.lower_for_tensor(label, pat, e, body),
             _ => return false,
         };
         let elem_mir = self.mir_ty_of(&elem);
@@ -18936,20 +18979,19 @@ impl FnLowerer<'_> {
     }
 
     /// Materialize a tensor shape dimension as an `i64` MIR value: a `Const` directly, a symbolic
-    /// `Var` loaded from its bound hidden dim param (coerced to `i64`), or `None` for a runtime `?`
-    /// (`Dynamic`) that has no threaded value. The shape-index companion of the matmul recognizer's
-    /// [`dim_value`] (which materializes the recognizer's own `Dim` enum the same way).
-    fn tensor_dim_value(&mut self, d: wukong_types::Dim) -> Option<ValueId> {
+    /// `Var` loaded from its bound hidden dim param (coerced to `i64`), a derived extent (`2*N`)
+    /// computed from those (`shape_ops::emit_dim_poly`), or `None` for a runtime `?` (`Dynamic`),
+    /// whose value is not a property of the shape (see `tensor_axis_extent`). The shape-index
+    /// companion of the matmul recognizer's [`dim_value`] (which materializes the recognizer's own
+    /// `Dim` enum the same way).
+    fn tensor_dim_value(&mut self, d: &wukong_types::Dim) -> Option<ValueId> {
         match d {
             wukong_types::Dim::Const(n) => Some(
                 self.builder
-                    .build(MirType::I64, Op::ConstInt(n as i128, MirType::I64)),
+                    .build(MirType::I64, Op::ConstInt(*n as i128, MirType::I64)),
             ),
-            wukong_types::Dim::Var(sym) => {
-                let (slot, ty) = self.lookup(sym)?;
-                let v = self.builder.build(ty.clone(), Op::Load(slot, ty.clone()));
-                Some(self.coerce_to(v, &ty, &MirType::I64, true))
-            }
+            wukong_types::Dim::Var(sym) => self.dim_var_value(*sym),
+            wukong_types::Dim::Expr(p) => self.emit_dim_poly(p, &|me, s| me.dim_var_value(s)),
             wukong_types::Dim::Dynamic => None,
         }
     }
@@ -18983,7 +19025,7 @@ impl FnLowerer<'_> {
         ) {
             return None;
         }
-        let dims = shape.0; // owned (`Dim` is `Copy`)
+        let dims = shape.0;
         let rank = dims.len();
         if rank == 0 || rank != indices.len() {
             return None;
@@ -18993,7 +19035,7 @@ impl FnLowerer<'_> {
         let mut strides: Vec<Option<ValueId>> = vec![None; rank];
         if matches!(layout, wukong_types::Layout::ColMajor) {
             for k in 1..rank {
-                let prev = self.tensor_dim_value(dims[k - 1])?;
+                let prev = self.tensor_axis_extent(base, &dims, k - 1)?;
                 strides[k] = Some(match strides[k - 1] {
                     None => prev,
                     Some(s_prev) => self
@@ -19003,7 +19045,7 @@ impl FnLowerer<'_> {
             }
         } else {
             for k in (0..rank.saturating_sub(1)).rev() {
-                let next = self.tensor_dim_value(dims[k + 1])?;
+                let next = self.tensor_axis_extent(base, &dims, k + 1)?;
                 strides[k] = Some(match strides[k + 1] {
                     None => next,
                     Some(s_next) => self
@@ -20253,12 +20295,18 @@ impl FnLowerer<'_> {
     /// caller pins the sizes; then (b) the **argument shapes** — a const dim passes its constant, a
     /// symbolic dim its caller-side hidden-param value (`lookup`), and a decaying array its length —
     /// so a generic caller forwarding its own symbolic tensor (`fn g<P,Q>(a: Tensor[f32,P,Q]){ f(a) }`)
-    /// threads `P, Q` through. A dimension that neither source determines is a hard `C0001` compile
-    /// error (a placeholder `0` keeps the MIR well-formed) — better a clean error than a miscompiled
-    /// stride; the fix is an explicit turbofish.
+    /// threads `P, Q` through; then (c) **sema's solved binding** for the call
+    /// (`SemaResult::call_dims`), which is how a dimension that appears only inside a derived extent
+    /// (`Tensor[f32, 2*N]` fed 8 elements, `N = 4`) gets its value. A dimension that none of them
+    /// determines is a hard `C0001` compile error (a placeholder `0` keeps the MIR well-formed) —
+    /// better a clean error than a miscompiled stride; the fix is an explicit turbofish.
+    ///
+    /// After the dims come the extents of the callee's `?` axes
+    /// ([`shape_ops::dynamic_extent_params`]), each read off the argument (`arg_axis_extent`).
     fn call_dim_args(
         &mut self,
         name: Symbol,
+        callee_id: ast::NodeId,
         generic_args: &[ast::TypeExpr],
         args: &[Expr],
         span: Span,
@@ -20268,7 +20316,8 @@ impl FnLowerer<'_> {
             _ => return Vec::new(),
         };
         let hidden = symbolic_dim_params(&params);
-        if hidden.is_empty() {
+        let dynamic = shape_ops::dynamic_extent_params(&params);
+        if hidden.is_empty() && dynamic.is_empty() {
             return Vec::new();
         }
         let mut dim_map: HashMap<Symbol, ValueId> = HashMap::default();
@@ -20287,7 +20336,18 @@ impl FnLowerer<'_> {
             let aty = self.expr_ty(arg);
             self.collect_call_dims(pty, &aty, &hidden, &mut dim_map);
         }
-        let mut out = Vec::with_capacity(hidden.len());
+        // (c) Sema's binding, in the caller's terms, for a dim no argument shape spells directly.
+        let sema = self.sema;
+        if let Some(bound) = sema.call_dims.get(&callee_id) {
+            for (g, d) in bound {
+                if hidden.contains(g) && !dim_map.contains_key(g) {
+                    if let Some(v) = self.tensor_dim_value(d) {
+                        dim_map.insert(*g, v);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(hidden.len() + dynamic.len());
         let mut missing = false;
         for g in &hidden {
             match dim_map.get(g) {
@@ -20306,6 +20366,31 @@ impl FnLowerer<'_> {
                 span,
                 "call to a symbolic-generic tensor function whose dimensions cannot be inferred \
                  from the arguments (supply an explicit turbofish, e.g. `f::<2, 3>(…)`)",
+            );
+        }
+        let mut missing_extent = false;
+        for &(pi, axis) in &dynamic {
+            let v = match (params.get(pi), args.get(pi)) {
+                (Some(pty), Some(arg)) => self.arg_axis_extent(pty, arg, axis, &dim_map),
+                _ => None,
+            };
+            match v {
+                Some(v) => out.push(v),
+                None => {
+                    missing_extent = true;
+                    out.push(
+                        self.builder
+                            .build(MirType::I64, Op::ConstInt(0, MirType::I64)),
+                    );
+                }
+            }
+        }
+        if missing_extent {
+            self.unsupported(
+                span,
+                "call passing a tensor whose run-time `?` extent is not known here (pass a tensor \
+                 with a fixed or generic extent on that axis, a fixed-size array, or a `?` \
+                 parameter of the caller)",
             );
         }
         out
@@ -20348,12 +20433,10 @@ impl FnLowerer<'_> {
     ) {
         match (pty, aty) {
             (Ty::Tensor { shape: ps, .. }, Ty::Tensor { shape: as_, .. }) => {
-                let pd = ps.0.clone();
-                let ad = as_.0.clone();
-                for (p, a) in pd.iter().zip(&ad) {
+                for (p, a) in ps.0.iter().zip(&as_.0) {
                     if let wukong_types::Dim::Var(g) = p {
                         if hidden.contains(g) && !dim_map.contains_key(g) {
-                            if let Some(v) = self.tensor_dim_value(*a) {
+                            if let Some(v) = self.tensor_dim_value(a) {
                                 dim_map.insert(*g, v);
                             }
                         }
@@ -20364,7 +20447,8 @@ impl FnLowerer<'_> {
             // (the same rank-1 length binding sema's `unify` performs).
             (Ty::Tensor { shape: ps, .. }, Ty::Array { len, .. }) => {
                 if ps.0.len() == 1 {
-                    if let wukong_types::Dim::Var(g) = ps.0[0] {
+                    if let wukong_types::Dim::Var(g) = &ps.0[0] {
+                        let g = *g;
                         if hidden.contains(&g) && !dim_map.contains_key(&g) {
                             let v = self
                                 .builder
@@ -20394,6 +20478,10 @@ impl FnLowerer<'_> {
         if let ExprKind::Field { base, name } = &callee.kind {
             if let Some(enum_sym) = self.field_base_data_enum(base, name.sym) {
                 return self.lower_enum_value(enum_sym, name.sym, VariantCtor::Tuple(args));
+            }
+            // `t.dim(k)` / `t.len()` on a tensor or a fixed-size array — the extent of one axis.
+            if let Some(v) = self.lower_extent_method(base, name.sym, args) {
+                return v;
             }
             // `s.len()` on a slice — the element count, loaded from the fat pointer's offset 8.
             if args.is_empty()
@@ -20436,7 +20524,7 @@ impl FnLowerer<'_> {
                     // in the same ABI order `lower_fn`/`lower_matmul_fn` declare the hidden params.
                     // Empty for every non-generic-tensor callee, so those call sites stay byte-
                     // identical. They lead the real args, after any sret pointer.
-                    let dim_args = self.call_dim_args(name, generic_args, args, e.span);
+                    let dim_args = self.call_dim_args(name, callee.id, generic_args, args, e.span);
                     if matches!(ret, MirType::Array(..)) {
                         // The callee returns an aggregate by value (sret ABI): allocate the
                         // destination buffer here, pass it as the hidden leading argument, and yield
@@ -22645,6 +22733,11 @@ impl FnLowerer<'_> {
 
     fn lower_cast(&mut self, operand: &Expr, e: &Expr) -> ValueId {
         let v = self.lower_expr(operand);
+        // `x as Tensor[T, …]` is a reshape: the same contiguous buffer under a new shape (sema proved
+        // the element count unchanged), so the value is the operand's base pointer — no copy.
+        if matches!(self.expr_ty(e), Ty::Tensor { .. }) {
+            return v;
+        }
         let from = self.expr_mir(operand);
         let to = self.expr_mir(e);
         if from == to {
@@ -24133,7 +24226,9 @@ fn tensor_inner_stride(base: &Expr, sema: &SemaResult) -> Option<Dim> {
     match &shape.0[1] {
         wukong_types::Dim::Const(v) => Some(Dim::Lit(*v as i64)),
         wukong_types::Dim::Var(s) => Some(Dim::Var(*s)),
-        wukong_types::Dim::Dynamic => None,
+        // A derived inner extent (`2*K`) has no recognizer `Dim`; the access lowers through the
+        // general strided path instead.
+        wukong_types::Dim::Dynamic | wukong_types::Dim::Expr(_) => None,
     }
 }
 
@@ -26951,6 +27046,7 @@ fn lower_matmul_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     // A symbolic-generic matmul (`fn matmul<M, N, K>(a: Tensor[f32, M, K], …)`) reaches this
     // whole-function path too. Bind its hidden runtime-dim params first (leading, before the real
@@ -28665,6 +28761,7 @@ fn xent_bwd_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     probe.match_xent_bwd(pat, iter, lb).is_some()
 }
@@ -28714,6 +28811,7 @@ fn xent_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     probe.match_xent(pat, iter, lb).is_some()
 }
@@ -28771,6 +28869,7 @@ fn logsumexp_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     probe.match_logsumexp(pat, iter, lb).is_some()
 }
@@ -28916,6 +29015,7 @@ fn probe_single_for(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
     check(&probe, pat, iter, lb)
 }
@@ -29948,7 +30048,12 @@ fn lower_i8matmul_fn(
 
         tile_queue: vec![],
         param_arrays: vec![],
+        dyn_extents: HashMap::default(),
     };
+    // The hidden runtime-dim / `?`-extent parameters lead the real ones exactly as `lower_fn` and
+    // `lower_matmul_fn` declare them, so a caller's `call_dim_args` matches this wrapper's ABI too.
+    // A no-op for a constant-shape signature.
+    fl.bind_dim_params(&param_tys);
     let param_vals: Vec<ValueId> = param_tys
         .iter()
         .map(|pty| fl.builder.add_param(param_abi_ty(pty)))

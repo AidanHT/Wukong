@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0502
+module tests.fail.dim_solve_no_integer
+
+// The parameter holds `2*N` elements, so a call solves `N` from the argument's length. Seven
+// elements are not `2*N` for any whole `N`: the call is rejected instead of rounding `N` down to 3
+// and silently ignoring the last element (or up to 4 and reading past it).
+fn pairs<N>(a: Tensor[f32, 2*N]) -> f32 {
+    return a[0];
+}
+
+fn main() -> i32 {
+    let x: [f32; 7] = [0.0; 7];
+    return pairs(x) as i32;
+}
