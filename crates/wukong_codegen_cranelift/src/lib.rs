@@ -330,6 +330,47 @@ fn mem_flags() -> MemFlags {
 /// here, and no untracked pointer can name it. Every *other* access keeps `None`.
 const PRIVATE_STACK_REGION: AliasRegion = AliasRegion::Vmctx;
 
+/// The phrase every oversized-layout failure carries ([`FnTranslator::size_of_or_err`]); the anchor
+/// [`classify_error`] keys [`NativeErrorKind::LayoutTooLarge`] on.
+const LAYOUT_TOO_LARGE: &str = "is too large to lay out";
+
+/// Message prefixes of the failures this backend raises *by design* for a well-typed program it
+/// does not lower (an external call with no ABI, an assertion inside a foreign callback, an entry
+/// point with parameters, a target CPU it cannot serve).
+const UNSUPPORTED_PREFIXES: &[&str] = &[
+    "unsupported ",
+    "native entry point",
+    "native buffer dispatcher",
+    "no entry function",
+    "raw JIT function pointers",
+];
+
+/// What a native-backend failure means to the user. Every Cranelift entry point reports failure as
+/// a `String`; this is how the driver turns one into a catalogued diagnostic (a stable code,
+/// `--error-format=json`, `--explain`) instead of printing it bare. The phrases it keys on are
+/// produced in this crate, next to this function, so the two cannot drift apart unnoticed (pinned
+/// by `error_tests`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NativeErrorKind {
+    /// An array, vector or aggregate whose byte size exceeds the backend's 32-bit layout (`C0002`).
+    LayoutTooLarge,
+    /// A construct the native backend declines by design (`C0001`).
+    Unsupported,
+    /// A failure inside the backend itself — an internal compiler error, not the user's program.
+    Internal,
+}
+
+/// Classify a failure returned by [`jit_compile`], [`jit_run`] or [`emit_object`].
+pub fn classify_error(message: &str) -> NativeErrorKind {
+    if message.contains(LAYOUT_TOO_LARGE) {
+        NativeErrorKind::LayoutTooLarge
+    } else if UNSUPPORTED_PREFIXES.iter().any(|p| message.starts_with(p)) {
+        NativeErrorKind::Unsupported
+    } else {
+        NativeErrorKind::Internal
+    }
+}
+
 /// The runtime function an intrinsic call lowers to.
 #[derive(Clone, Copy)]
 enum Intrinsic {
@@ -543,8 +584,9 @@ impl<'a> FnTranslator<'a> {
             None => {
                 if self.layout_err.is_none() {
                     self.layout_err = Some(format!(
-                        "type `{}` is too large to lay out: byte size exceeds 2^32 (4 GiB)",
-                        ty.display()
+                        "type `{}` in function `{}` {LAYOUT_TOO_LARGE}: its byte size exceeds                          2^32 (4 GiB), the native backend's addressing limit",
+                        ty.display(),
+                        self.interner.resolve(self.func.name)
                     ));
                 }
                 1
@@ -5126,6 +5168,9 @@ mod tests;
 
 #[cfg(test)]
 mod assertion_tests;
+
+#[cfg(test)]
+mod error_tests;
 
 #[cfg(test)]
 mod fuzz;

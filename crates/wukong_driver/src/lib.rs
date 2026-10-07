@@ -460,7 +460,23 @@ pub fn compile(opts: &Options) -> i32 {
         let main = interner.intern("main");
         let result = match opts.backend {
             BackendKind::Interp => wukong_interp::run_with_output(&program, main, &interner),
-            BackendKind::Native => wukong_codegen_cranelift::jit_run(&program, main, &interner),
+            // Compile and run are separate steps so a *compile* failure is rendered as a
+            // catalogued diagnostic (honouring `--error-format=json`), while a *run-time* failure
+            // (an assertion) keeps the interpreter's `error: <message>` form below.
+            BackendKind::Native => {
+                match wukong_codegen_cranelift::jit_compile(&program, main, &interner) {
+                    Ok(compiled) => compiled.run(),
+                    Err(message) => {
+                        emit_diag(
+                            &native_failure_diag(&message, &opts.input),
+                            opts.error_format,
+                            &renderer,
+                            &SourceMap::new(),
+                        );
+                        return exit::COMPILE_ERROR;
+                    }
+                }
+            }
             BackendKind::Gpu => run_on_gpu(&program, main, &interner),
             BackendKind::GpuLower => run_on_gpu_lower(&program, main, &interner),
         };
@@ -765,7 +781,12 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
     let obj = match wukong_codegen_cranelift::emit_object(program, interner) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("error: cranelift codegen failed: {e}");
+            emit_diag(
+                &native_failure_diag(&e, &opts.input),
+                opts.error_format,
+                &Renderer::new(opts.color),
+                &SourceMap::new(),
+            );
             return exit::COMPILE_ERROR;
         }
     };
@@ -829,6 +850,32 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         &obj_path,
         &out,
     )
+}
+
+/// A native-backend (Cranelift) failure as a diagnostic, so it reaches `--error-format=json` and
+/// `--explain` like every front-end error instead of escaping as a bare `error:` line. MIR carries no
+/// source spans, so the diagnostic names the program and — for a layout failure — the offending type
+/// and the function that declares it (the backend puts both in the message).
+fn native_failure_diag(message: &str, input: &Path) -> Diagnostic {
+    use wukong_codegen_cranelift::NativeErrorKind;
+    let program = format!(
+        "while compiling `{}` for the native backend",
+        input.display()
+    );
+    match wukong_codegen_cranelift::classify_error(message) {
+        NativeErrorKind::LayoutTooLarge => Diagnostic::error(message)
+            .with_code("C0002")
+            .note(program)
+            .help(
+                "allocate the buffer on the heap (`alloc_f32(n)` and its siblings) or split it;                  `--run` (the interpreter) has no byte-layout limit",
+            ),
+        NativeErrorKind::Unsupported => Diagnostic::error(message)
+            .with_code("C0001")
+            .note(program),
+        NativeErrorKind::Internal => {
+            Diagnostic::bug(format!("native code generation failed: {message}")).note(program)
+        }
+    }
 }
 
 /// Identify float-print intrinsics in the emitted MIR, including calls in helper functions.

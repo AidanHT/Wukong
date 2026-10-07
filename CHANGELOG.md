@@ -15,6 +15,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   leaves undefined in the upper half); the vectorizer's synthesized kernels are defined in the
   module from their recipe instead of being undefined symbols; the module names its target
   triple. Vector low-precision casts and low-precision FMA no longer decline.
+- **Native-backend failures are catalogued diagnostics.** A Cranelift failure under
+  `--run --backend=native`, `--emit=obj` or `--emit=exe` used to be a bare `error:` line that
+  `--error-format=json` never saw. It is now classified (`wukong_codegen_cranelift::classify_error`)
+  and rendered through the diagnostic renderer: an oversized layout is the new **`C0002`** (naming
+  the type and its function; fixture `tests/fail/native_layout_too_large.wk`, reached through the new
+  `// EMIT: <stage>` fail-fixture directive), a by-design decline is `C0001`, and anything else is an
+  internal-compiler-error diagnostic.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
