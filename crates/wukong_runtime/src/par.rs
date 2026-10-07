@@ -167,6 +167,34 @@ where
     });
 }
 
+/// Kernel claim-queue instrument (`WUKONG_KERNEL_DYN=1`, read once, **default OFF**): route the
+/// row-mapped kernels that call [`for_each_row`] (today the fused-norm pair) through
+/// [`claim_chunks`] instead of rayon's adaptive per-row split. The claim queue A/B-won for the GEMM's
+/// coarse, heterogeneous 2D blocks and for `@parallel` regions; whether it also wins on uniform rows,
+/// where rayon's splitter already balances, is unmeasured — so it ships as the adjacent-run A/B knob,
+/// not as the default. Scheduling-only: which worker normalizes a row never changes its bits.
+fn kernel_dyn() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("WUKONG_KERNEL_DYN").is_ok_and(|v| v == "1"))
+}
+
+/// Map `row(i)` over `i in 0..rows` on the unified kernel pool, each index exactly once, returning
+/// when all have run: rayon's per-index split by default, the claim queue under
+/// `WUKONG_KERNEL_DYN=1`. The caller has already decided to fork ([`fork_rows`]).
+pub(crate) fn for_each_row<F>(rows: usize, row: F)
+where
+    F: Fn(usize) + Sync + Send,
+{
+    if kernel_dyn() {
+        claim_chunks(rows, 1, true, |lo, hi| (lo..hi).for_each(&row));
+    } else {
+        crate::run_on_wuk_pool(|| {
+            use rayon::prelude::*;
+            (0..rows).into_par_iter().for_each(&row);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +298,19 @@ mod tests {
         }
         // n == 0 never calls the body.
         claim_chunks(0, 1, true, |_, _| panic!("empty range ran a span"));
+    }
+
+    #[test]
+    fn for_each_row_visits_every_row_once() {
+        for rows in [0usize, 1, 2, 7, 1000] {
+            let hits: Vec<AtomicUsize> = (0..rows).map(|_| AtomicUsize::new(0)).collect();
+            for_each_row(rows, |r| {
+                hits[r].fetch_add(1, Ordering::Relaxed);
+            });
+            assert!(
+                hits.iter().all(|h| h.load(Ordering::Relaxed) == 1),
+                "rows={rows}"
+            );
+        }
     }
 }

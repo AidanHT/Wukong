@@ -42,7 +42,6 @@
 #[cfg(target_arch = "x86_64")]
 use crate::vmath::exp8;
 use crate::vmath::{exp1, log1};
-use rayon::prelude::*;
 
 // Norm op codes (shared with the recognizer in `wukong_mir_build`).
 pub const NORM_SOFTMAX: i64 = 0; // out = softmax(x) over the row (numerically stable)
@@ -971,22 +970,21 @@ pub unsafe extern "C" fn wukong_norm_f32_parallel(
     let (rows, cols) = (rows as usize, cols as usize);
     let eps = f32::from_bits(eps_bits as u32);
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/reduce);
-    // each row is a disjoint sub-slice. Forks on the unified kernel pool (`run_on_wuk_pool`) —
-    // per-row work is self-contained, so the pool choice never touches the bits.
+    // each row is a disjoint sub-slice. Rows are mapped on the unified kernel pool by
+    // `par::for_each_row` (rayon's per-row split, or the claim queue under `WUKONG_KERNEL_DYN=1`) —
+    // per-row work is self-contained, so neither the pool nor the schedule touches the bits.
     let (xa, oa) = (x as usize, out as usize);
-    crate::run_on_wuk_pool(move || {
-        (0..rows).into_par_iter().for_each(|r| {
-            // SAFETY: disjoint row; pointers valid for rows*cols by contract.
-            unsafe {
-                norm_row(
-                    (xa as *const f32).add(r * cols),
-                    (oa as *mut f32).add(r * cols),
-                    cols,
-                    eps,
-                    op,
-                )
-            };
-        });
+    crate::par::for_each_row(rows, move |r| {
+        // SAFETY: disjoint row; pointers valid for rows*cols by contract.
+        unsafe {
+            norm_row(
+                (xa as *const f32).add(r * cols),
+                (oa as *mut f32).add(r * cols),
+                cols,
+                eps,
+                op,
+            )
+        };
     });
 }
 
@@ -1058,24 +1056,22 @@ pub unsafe extern "C" fn wukong_norm_affine_f32_parallel(
     let (rows, cols) = (rows as usize, cols as usize);
     let eps = f32::from_bits(eps_bits as u32);
     // Pointers cross the rayon boundary as integers (null round-trips through 0); rows are disjoint,
-    // gamma/beta are shared read-only. Forks on the unified kernel pool (`run_on_wuk_pool`) —
-    // per-row work is self-contained, so the pool choice never touches the bits.
+    // gamma/beta are shared read-only. Rows are mapped on the unified kernel pool by
+    // `par::for_each_row`, as in `wukong_norm_f32_parallel`.
     let (xa, oa, ga, ba) = (x as usize, out as usize, gamma as usize, beta as usize);
-    crate::run_on_wuk_pool(move || {
-        (0..rows).into_par_iter().for_each(|r| {
-            // SAFETY: disjoint row; gamma/beta valid for cols by contract.
-            unsafe {
-                norm_affine_row(
-                    (xa as *const f32).add(r * cols),
-                    (oa as *mut f32).add(r * cols),
-                    ga as *const f32,
-                    ba as *const f32,
-                    cols,
-                    eps,
-                    op,
-                )
-            };
-        });
+    crate::par::for_each_row(rows, move |r| {
+        // SAFETY: disjoint row; gamma/beta valid for cols by contract.
+        unsafe {
+            norm_affine_row(
+                (xa as *const f32).add(r * cols),
+                (oa as *mut f32).add(r * cols),
+                ga as *const f32,
+                ba as *const f32,
+                cols,
+                eps,
+                op,
+            )
+        };
     });
 }
 
