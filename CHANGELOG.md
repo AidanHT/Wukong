@@ -5,6 +5,22 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Runtime GEMM: single-sweep B packing, masked edge tiles, copy-free `Aᵀ·B`, blocked int8
+
+- **f32 GEMM.** A macro-block whose B panel is swept by one row block (serial `m ≤ MC`, every 2D
+  block) packs B a micropanel at a time with the next micropanel's source prefetched under the FMAs
+  (`WUKONG_GEMM_FUSED_PACK=0` restores the whole-panel pack); the A packer is vectorized; edge tiles
+  run row-trimmed K loops and a 256-bit masked writeback (fused epilogue included); `C = Aᵀ·B`
+  packs A straight from its `[k, m]` storage instead of transposing an `m·k` scratch copy; bf16/f16
+  inputs widen with SIMD into reused per-thread scratch. Every result bit is unchanged.
+- **int8 GEMM.** Column-blocked so B stays L2-resident across all A rows; the `_parallel` entries
+  use a (row block × column block) task grid, so a single-token decode GEMM fills the pool.
+- **Numeric contract.** `docs/language-guide.md` ("What a matmul computes") and `docs/internals.md`
+  now state the recognized matmul's accumulation order, what does and does not change it, its
+  error bound, and how it relates to an unrecognized nest; new fixtures
+  `tests/run/gemm_blocked_every_lane.wk` (three K-blocks, full and edge tiles, NN/NT/TN, every
+  lane) and `tests/run/lang_generic_gemm_fma_order.wk` (generic vs recognized, bit-exact FMA chain).
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

@@ -135,6 +135,7 @@ gate_backward.wk: wukong_vmath2_f32 wukong_vmath2_f32*2
 gcd.wk:
 gelu.wk:
 gelu_backward.wk: wukong_vmath2_f32
+gemm_blocked_every_lane.wk: wukong_sgemm wukong_sgemm_nt wukong_sgemm_tn
 gemm_fused_bias_slice.wk: wukong_rt_alloc wukong_rt_alloc*4 wukong_rt_free wukong_rt_free*4 wukong_sgemm_nt_epi wukong_sgemm_nt_epi*2
 gemv_f32.wk: wukong_sgemv
 gemv_parallel.wk: wukong_sgemv_parallel
@@ -181,6 +182,7 @@ kldiv.wk: wukong_kldiv_f32
 l2norm.wk: wukong_norm_f32 wukong_norm_f32*2
 labeled_loop.wk:
 lang_generic_copy.wk: veckernel*1 wukong_velem_f32
+lang_generic_gemm_fma_order.wk: wukong_sgemm
 lang_generic_naive_gemm.wk: wukong_sgemm
 lang_generic_saxpy.wk: veckernel*1 wukong_velem_f32
 lang_parallel_int_regions.wk: wukong_parallel_for wukong_parallel_for*2

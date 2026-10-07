@@ -1,0 +1,95 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT-VALUES: 82208168 85300888 125178592 127636560
+// EXPECT-OUT-VALUES: 82208168 85300888 125178592 127636560
+module tests.run.lang_generic_gemm_fma_order
+
+// What a matmul COMPUTES, recognized or not, at a size where the two can be compared bit for bit.
+// P3.8 of the 2026-09 SOTA sweep: `lang_generic_naive_gemm.wk` pairs a `@generic` nest with its
+// recognized twin, but at K = 2 on small integers, which every evaluation order reproduces exactly,
+// so it can never observe an arithmetic difference. This fixture pairs the same two bodies on
+// non-dyadic data where ONE rounding per multiply-add (FMA) and TWO (round the product, then the
+// sum) give different bits in every lane, and pins that both forms compute the FMA chain.
+//
+// The contract this pins (docs/language-guide.md "What a matmul computes"):
+//   * the recognized kernel (`mm_recognized` -> one `wukong_sgemm`) accumulates each C[i,j] from +0.0
+//     over ascending k with one rounding per step (`vfmadd` / `f32::mul_add`), in K-blocks of at most
+//     KC = 384 — one block here;
+//   * the `@generic` nest (`mm_generic`) is the loop as written: `s + a*b` contracts to one FMA, and
+//     with K = 3 neither reduction partition the compiler uses (4-lane or 8-lane groups) has a
+//     complete group, so the reduction is the sequential chain from the seed.
+// At K < 4 the two orders are therefore the same chain and must agree to the last bit. Past that the
+// generic reduction may be partitioned across vector lanes and the kernel groups K by `select_kc`, so
+// the two are NOT promised to agree; both are documented, neither is "the exact answer".
+//
+// WHERE THE EXPECTED VALUES COME FROM. Every operand is x/4096 with a 13-bit odd x (exact as a decimal
+// literal and in f32). An independent script evaluated, for each lane, s = fma(a[i,k], b[k,j], s) for
+// k = 0..3 from s = +0.0 with exact rational arithmetic and one round-to-nearest-even to f32 per step
+// (never recorded from compiler output). Every C value lies in [4, 8), so `c * 2^24` is an exact
+// integer and the printed i64 carries every bit of the f32. The same script's unfused chain gives
+//     82208176 85300880 125178584 127636568
+// — one ulp (8 units of 2^-24) away in ALL FOUR lanes — so a lowering that stopped contracting `s + a*b`
+// in the generic nest, or a kernel that stopped fusing, fails here on every lane.
+//
+// Gate note: `recognize.rs` runs every recognizer-dependent fixture again under WUKONG_NO_RECOGNIZE,
+// where `mm_recognized` becomes a generic nest too; both lines must then print the same values, which
+// is this file's claim restated.
+@generic
+fn mm_generic(a: [f32; 6], b: [f32; 6], mut c: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..3 {
+                s = s + a[i * 3 + k] * b[k * 2 + j];
+            }
+            c[i * 2 + j] = s;
+        }
+    }
+}
+
+fn mm_recognized(a: [f32; 6], b: [f32; 6], mut c: [f32; 4]) {
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut s: f32 = 0.0;
+            for k in 0..3 {
+                s = s + a[i * 3 + k] * b[k * 2 + j];
+            }
+            c[i * 2 + j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    // A is 2x3, B is 3x2, both row-major.
+    let a: [f32; 6] = [
+        1.213134765625,
+        1.172119140625,
+        1.211669921875,
+        1.814697265625,
+        1.901611328125,
+        1.674072265625,
+    ];
+    let b: [f32; 6] = [
+        1.058349609375,
+        1.481689453125,
+        1.929931640625,
+        1.338623046875,
+        1.117431640625,
+        1.417724609375,
+    ];
+
+    let mut g: [f32; 4] = [0.0; 4];
+    mm_generic(a, b, g);
+    print((g[0] * 16777216.0) as i64);
+    print((g[1] * 16777216.0) as i64);
+    print((g[2] * 16777216.0) as i64);
+    print((g[3] * 16777216.0) as i64);
+
+    let mut r: [f32; 4] = [0.0; 4];
+    mm_recognized(a, b, r);
+    print((r[0] * 16777216.0) as i64);
+    print((r[1] * 16777216.0) as i64);
+    print((r[2] * 16777216.0) as i64);
+    print((r[3] * 16777216.0) as i64);
+    return 0;
+}
