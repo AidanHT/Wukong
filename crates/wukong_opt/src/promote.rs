@@ -237,17 +237,22 @@ fn plan_loop(
                 .iter()
                 .any(|&k| all[k].0 == spec.header && (!store_only || all[k].4))
         };
-        let stored_every_iteration = members.iter().any(|&k| {
-            all[k].4 && (all[k].0 == spec.header || spec.every_iteration.contains(&all[k].0))
-        });
+        let every_iteration =
+            |k: usize| all[k].0 == spec.header || spec.every_iteration.contains(&all[k].0);
+        let stored_every_iteration = members.iter().any(|&k| all[k].4 && every_iteration(k));
+        let accessed_every_iteration = members.iter().any(|&k| every_iteration(k));
         let private = alias.is_private_stack(addr);
         let guardable = spec.first_test.is_some() && !matches!(alias.prov(addr), Prov::Alloca(_));
-        // The preheader load is safe un-guarded for a stack slot or a location the header reads;
-        // the exit store, for a slot nobody else sees or a location the header writes. Otherwise
-        // both go through the first-iteration guard, which needs a store on every iteration: it
-        // proves the location is both read-safe and written whenever the loop runs at all.
-        let plain_load = alias.is_dereferenceable(addr, bytes) || in_header(false);
-        let plain_store = private || in_header(true);
+        // The preheader load is safe un-guarded for a stack slot, a location the header reads, or
+        // one every iteration reads when the body provably runs; the exit store, for a slot nobody
+        // else sees, a location the header writes, or one every iteration writes when the body
+        // provably runs. Otherwise both go through the first-iteration guard, which needs a store
+        // on every iteration: it proves the location is both read-safe and written whenever the
+        // loop runs at all.
+        let plain_load = alias.is_dereferenceable(addr, bytes)
+            || in_header(false)
+            || (spec.runs_once && accessed_every_iteration);
+        let plain_store = private || in_header(true) || (spec.runs_once && stored_every_iteration);
         let guarded = if plain_load && plain_store {
             false
         } else if guardable && stored_every_iteration {
@@ -614,5 +619,76 @@ mod tests {
             "a private slot needs no guard"
         );
         assert_eq!(run1(&f), 729);
+    }
+
+    /// `for i in 0..4 { out[0] = out[0] + i }`: the first test `0 < 4` is a true constant, so the
+    /// body provably runs and a parameter location written on every iteration is promoted with a
+    /// plain preheader load and exit store — no guard, no dummy slot.
+    #[test]
+    fn a_constant_trip_loop_promotes_without_a_guard() {
+        let mut it = Interner::new();
+        let fname = it.intern("f");
+        let mut b = Builder::new(fname, MirType::Void);
+        let out = b.add_param(MirType::Ptr);
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let four = b.build(MirType::I64, Op::ConstInt(4, MirType::I64));
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let header = b.new_block();
+        let body = b.new_block();
+        let exit = b.new_block();
+        let i = b.block_param(header, MirType::I64);
+        b.br(header, vec![zero]);
+        b.switch_to(header);
+        let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, four));
+        b.cond_br(c, body, vec![], exit, vec![]);
+        b.switch_to(body);
+        let old = b.build(MirType::I64, Op::Load(out, MirType::I64));
+        let new = b.build(MirType::I64, Op::Bin(BinOp::Add, old, i));
+        b.build_void(Op::Store {
+            ptr: out,
+            value: new,
+        });
+        let next = b.build(MirType::I64, Op::Bin(BinOp::Add, i, one));
+        b.br(header, vec![next]);
+        b.switch_to(exit);
+        b.ret(None);
+        let mut f = b.finish();
+
+        let mut m = Builder::new(it.intern("main"), MirType::I64);
+        let a = m.alloca(MirType::I64);
+        let hundred = m.build(MirType::I64, Op::ConstInt(100, MirType::I64));
+        m.build_void(Op::Store {
+            ptr: a,
+            value: hundred,
+        });
+        m.build_void(Op::Call {
+            func: fname,
+            args: vec![a],
+        });
+        let r = m.build(MirType::I64, Op::Load(a, MirType::I64));
+        m.ret(Some(r));
+        let main = m.finish();
+
+        // 100 + 0 + 1 + 2 + 3.
+        assert_eq!(run(&main, &f, &it), 106);
+        assert!(Promote.run_function(&mut f, &mut CfgAnalyses::default()));
+        let body_traffic = f.blocks[body.0 as usize]
+            .insts
+            .iter()
+            .filter(|i| {
+                matches!(&i.op, Op::Load(p, _) if *p == out)
+                    || matches!(&i.op, Op::Store { ptr, .. } if *ptr == out)
+            })
+            .count();
+        assert_eq!(body_traffic, 0);
+        assert!(
+            !f.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i.op, Op::Select(..))),
+            "a loop that provably runs needs no guard: {}",
+            wukong_mir::print::print_function(&f, &it)
+        );
+        assert_eq!(run(&main, &f, &it), 106);
     }
 }

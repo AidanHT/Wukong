@@ -162,6 +162,10 @@ pub(crate) struct Spec {
     /// The header's continue test recomputed on the values the preheader passes in, when it can be:
     /// `(predicate, lhs, rhs)`, all available at the end of the preheader.
     pub(crate) first_test: Option<(CmpOp, ValueId, ValueId)>,
+    /// The first test is a comparison of two integer constants that holds (`for k in 0..64`): the
+    /// body provably runs at least once whenever the loop is entered, so an access that runs on
+    /// every iteration is not speculative in the preheader and needs no guard.
+    pub(crate) runs_once: bool,
 }
 
 impl Spec {
@@ -171,6 +175,7 @@ impl Spec {
             header,
             every_iteration: FxHashSet::default(),
             first_test: None,
+            runs_once: false,
         };
         let single_test = l.exits.len() == 1
             && l.exits[0].0 == l.header
@@ -189,8 +194,73 @@ impl Spec {
             }
         }
         spec.first_test = first_test(f, l, body, preheader.0);
+        spec.runs_once = spec.first_test.is_some_and(|(pred, a, b)| {
+            let (Some((x, xt)), Some((y, yt))) = (
+                const_before(f, a, preheader.0, idom),
+                const_before(f, b, preheader.0, idom),
+            ) else {
+                return false;
+            };
+            xt == yt && eval_int_cmp(pred, x, y, xt) == Some(true)
+        });
         spec
     }
+}
+
+/// The integer constant `v` is, when its definition lies in `from` or a block dominating it (the
+/// only places a value available at the end of `from` can be defined).
+fn const_before<'f>(
+    f: &'f Function,
+    v: ValueId,
+    from: u32,
+    idom: &[u32],
+) -> Option<(i128, &'f MirType)> {
+    let mut b = from;
+    loop {
+        for inst in &f.blocks[b as usize].insts {
+            if inst.result == Some(v) {
+                return match &inst.op {
+                    Op::ConstInt(k, ty) => Some((*k, ty)),
+                    _ => None,
+                };
+            }
+        }
+        let up = *idom.get(b as usize)?;
+        if up == b || up == u32::MAX {
+            return None;
+        }
+        b = up;
+    }
+}
+
+/// An integer comparison of two constants of type `ty`, read the way the backends read them:
+/// masked to the width, sign-extended for a signed predicate.
+fn eval_int_cmp(pred: CmpOp, a: i128, b: i128, ty: &MirType) -> Option<bool> {
+    use CmpOp::*;
+    let bits: u32 = match ty {
+        MirType::I8 => 8,
+        MirType::I16 => 16,
+        MirType::I32 => 32,
+        MirType::I64 => 64,
+        _ => return None,
+    };
+    let shift = 128 - bits;
+    let (sa, sb) = ((a << shift) >> shift, (b << shift) >> shift);
+    let mask = (1i128 << bits) - 1;
+    let (ua, ub) = (a & mask, b & mask);
+    Some(match pred {
+        Eq => ua == ub,
+        Ne => ua != ub,
+        Slt => sa < sb,
+        Sle => sa <= sb,
+        Sgt => sa > sb,
+        Sge => sa >= sb,
+        Ult => ua < ub,
+        Ule => ua <= ub,
+        Ugt => ua > ub,
+        Uge => ua >= ub,
+        Foeq | Fone | Folt | Fole | Fogt | Foge => return None,
+    })
 }
 
 /// The header's exit test as it evaluates on the first visit, expressed on values available at the
@@ -294,7 +364,10 @@ fn load_hoist(
     if mem.may_write(alias, ptr, bytes) {
         return None;
     }
-    if alias.is_dereferenceable(ptr, bytes) || blk == spec.header {
+    if alias.is_dereferenceable(ptr, bytes)
+        || blk == spec.header
+        || (spec.runs_once && spec.every_iteration.contains(&blk))
+    {
         return Some(Hoist::Plain);
     }
     let guardable = spec.every_iteration.contains(&blk)
@@ -721,6 +794,50 @@ mod tests {
         assert!(Licm.run_function(&mut f, &mut CfgAnalyses::default()));
         assert_eq!(loads_in(&f, body.0 as usize), 0);
         assert_eq!(run(&f), 2100);
+    }
+
+    /// `for i in 0..8 { s = s + w[0] }`: the first test `0 < 8` is a true constant, so the body
+    /// provably runs and the parameter load moves to the preheader as it is — no guard.
+    #[test]
+    fn a_constant_trip_loop_hoists_a_parameter_load_without_a_guard() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("c"), MirType::I64);
+        let w = b.add_param(MirType::Ptr);
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let eight = b.build(MirType::I64, Op::ConstInt(8, MirType::I64));
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let header = b.new_block();
+        let body = b.new_block();
+        let exit = b.new_block();
+        let i = b.block_param(header, MirType::I64);
+        let s = b.block_param(header, MirType::I64);
+        let out = b.block_param(exit, MirType::I64);
+        b.br(header, vec![zero, zero]);
+        b.switch_to(header);
+        let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, eight));
+        b.cond_br(c, body, vec![], exit, vec![s]);
+        b.switch_to(body);
+        let w0 = b.build(MirType::I64, Op::Load(w, MirType::I64));
+        let s2 = b.build(MirType::I64, Op::Bin(BinOp::Add, s, w0));
+        let next = b.build(MirType::I64, Op::Bin(BinOp::Add, i, one));
+        b.br(header, vec![next, s2]);
+        b.switch_to(exit);
+        b.ret(Some(out));
+        let mut f = b.finish();
+        assert!(Licm.run_function(&mut f, &mut CfgAnalyses::default()));
+        let shown = wukong_mir::print::print_function(&f, &it);
+        assert!(
+            wukong_mir::verify::verify_function(&f).is_empty(),
+            "{shown}"
+        );
+        assert_eq!(loads_in(&f, body.0 as usize), 0, "{shown}");
+        assert!(
+            !f.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i.op, Op::Select(..) | Op::Alloca { .. })),
+            "{shown}"
+        );
     }
 
     /// A store in the loop that may alias the slot keeps its load inside.
