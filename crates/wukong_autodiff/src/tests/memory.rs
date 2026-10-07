@@ -417,3 +417,49 @@ fn effect_only_calls_do_not_block_the_gradient() {
         "the decline must name the callee, got: {err}"
     );
 }
+
+/// A kernel writing a SUB-SLICE of a buffer whose gradient is live: `h[2..4] = exp(x)` through
+/// `gep(h, 2)`, then `loss = Σ C·h` over the whole of `h`. The tape keys one gradient per whole
+/// buffer, so the vmath rule found no adjoint under the sub-slice pointer and emitted nothing —
+/// `dL/dx` silently zero at exit 0, where the truth is `C[2..4]·exp(x)`. It must refuse by name.
+#[test]
+fn kernel_writing_a_live_sub_slice_declines_loudly() {
+    let mut it = Interner::default();
+    let vmath = sym(&mut it, "wukong_vmath_f32");
+    let sreduce = sym(&mut it, "wukong_sreduce_f32");
+    let mut b = Builder::new(sym(&mut it, "subslice"), MirType::Void);
+    let x = b.add_param(PTR);
+    let c = b.add_param(PTR);
+    let out = b.add_param(PTR);
+    let h = b.alloca(arr(4));
+    let two = ci(&mut b, 2);
+    let tail = b.build(
+        PTR,
+        Op::Gep {
+            ptr: h,
+            index: two,
+            elem: MirType::F32,
+        },
+    );
+    let expop = ci(&mut b, VM_EXP);
+    b.build_void(Op::Call {
+        func: vmath,
+        args: vec![x, tail, two, expop],
+    });
+    let (four, dotop) = (ci(&mut b, 4), ci(&mut b, RED_DOT));
+    let l = b.build(
+        MirType::F32,
+        Op::Call {
+            func: sreduce,
+            args: vec![c, h, four, dotop],
+        },
+    );
+    b.build_void(Op::Store { ptr: out, value: l });
+    b.ret(Some(l));
+    let fwd = b.finish();
+    let err = grad(&fwd, &[0], &mut it).expect_err("a live sub-slice output must not be dropped");
+    assert!(
+        err.contains("wukong_vmath_f32") && err.contains("sub-slice"),
+        "the decline must name the kernel and the cause, got: {err}"
+    );
+}

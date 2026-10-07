@@ -526,6 +526,7 @@ impl<'a> Vjp<'a> {
             *arg = self.canon(raw);
         }
         let args = &normalized[..want];
+        self.reject_live_sub_slice_output(func, kind, args)?;
         match kind {
             Kernel::Sreduce => self.diff_sreduce(args, result)?,
             Kernel::Sgemm => self.diff_sgemm(args, par)?,
@@ -554,6 +555,36 @@ impl<'a> Vjp<'a> {
             Kernel::Embedding => self.diff_embedding(args, par)?,
         }
         self.kill_overwritten(kind, args);
+        Ok(())
+    }
+
+    /// A kernel whose output operand is a SUB-SLICE (`gep(buf, off)`, `off != 0`) of a buffer whose
+    /// gradient is live cannot be differentiated: the tape keys one gradient per whole buffer, so
+    /// every rule looks up `buf_adj[gep]`, finds nothing (a sub-slice never gets its own gradient)
+    /// and returns as if the output were unused — while a load of `buf[off + i]` (or a whole-buffer
+    /// consumer of `buf`) has put the real adjoint under `buf`. The kernel's inputs would come back
+    /// with a silently ZERO gradient at exit 0. Refuse, naming the kernel.
+    fn reject_live_sub_slice_output(
+        &self,
+        func: Symbol,
+        kind: Kernel,
+        args: &[ValueId],
+    ) -> Result<(), String> {
+        let Some(oi) = kind.out_index() else {
+            return Ok(());
+        };
+        let out = args[oi];
+        let base = self.store_base(out);
+        if base != out && self.buf_adj.contains_key(&base) {
+            return Err(format!(
+                "autodiff: `{}` writes a sub-slice (v{}) of buffer v{}, whose gradient is live; \
+                 the buffer tape keeps one gradient per whole buffer, so the kernel's output \
+                 adjoint cannot be routed to it — differentiate a whole-buffer spelling",
+                self.it.resolve(func),
+                out.0,
+                base.0
+            ));
+        }
         Ok(())
     }
 
@@ -592,7 +623,19 @@ impl<'a> Vjp<'a> {
             return false;
         };
         let out = args[oi];
-        if args.iter().enumerate().any(|(i, &a)| i != oi && a == out) {
+        // A velem whose op reads no `y` (no USE_Y and neither non-affine compute mode) may name the
+        // output as the placeholder `y`; that operand is never read, so it is not an in-place read
+        // (treating it as one would skip the kill and hand an earlier writer this kernel's adjoint).
+        let y_unread = kind == Kernel::Velem
+            && matches!(
+                self.const_i64(args[7]),
+                Ok(op) if op & (VE_USE_Y | VE_HADAMARD | VE_DIV) == 0
+            );
+        if args
+            .iter()
+            .enumerate()
+            .any(|(i, &a)| i != oi && !(y_unread && i == 1) && a == out)
+        {
             return true;
         }
         kind.has_beta() && !matches!(self.const_i64(args[6]), Ok(0))
