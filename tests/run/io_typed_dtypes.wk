@@ -1,0 +1,184 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 10
+// EXPECT-OUT: 5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1
+// EXPECT-OUT: 32768
+// EXPECT-OUT: 65535
+// EXPECT-OUT: 4660
+// EXPECT-OUT: 3
+// EXPECT-OUT: 32768
+// EXPECT-OUT: 65535
+// EXPECT-OUT: 4660
+// EXPECT-OUT: 7
+// EXPECT-OUT: 0
+// EXPECT-OUT: -2
+// EXPECT-OUT: -1
+// EXPECT-OUT: 6
+// EXPECT-OUT: 4
+// EXPECT-OUT: -32768
+// EXPECT-OUT: 32767
+// EXPECT-OUT: 5
+// EXPECT-OUT: -6
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4
+// EXPECT-OUT: 4294967295
+// EXPECT-OUT: 2147483648
+// EXPECT-OUT: 305419896
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 18446744073709551615
+// EXPECT-OUT: 9223372036854775808
+// EXPECT-OUT: 3
+// EXPECT-OUT: 6
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1500
+// EXPECT-OUT: -375
+// EXPECT-OUT: 96000
+// EXPECT-OUT: 3
+// EXPECT-OUT: 16320
+// EXPECT-OUT: 48832
+// EXPECT-OUT: 17088
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 14336
+// EXPECT-OUT: 64511
+// EXPECT-OUT: 3
+// EXPECT-OUT: 3
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+// EXPECT-OUT: 1
+module tests.run.io_typed_dtypes
+
+// The typed raw file-I/O family beyond the original six element types, every lane printed:
+//  * u16 with the high bit set, `file_size`, and `read_<T>_at` byte-offset reads into a fixed
+//    array: 10 bytes from offset 4 hold 3 whole u16s (the 4th lane keeps its 7); an offset at the
+//    end reads 0 elements, a negative offset is -2, and a missing file's size is -1;
+//  * an offset read into a shape-typed `Tensor[i16, 2, 2]` parameter (elements 2..6 of the file,
+//    the i16 extremes sign-extended);
+//  * u32 through a symbolic-generic `Tensor[u32, R, C]` (the element count R*C is a runtime
+//    product) and u64 through slices, both printed unsigned;
+//  * bf16 and f16: values written, read back, and — the on-disk contract — the same bytes re-read
+//    as raw u16 bits: bf16(1.5) = 0x3FC0 = 16320, bf16(-0.375) = 0xBEC0 = 48832, bf16(96) = 0x42C0
+//    = 17088; f16(0.5) = 0x3800 = 14336, f16(-65504) = 0xFBFF = 64511;
+//  * a u8 read from a file compares exactly like the same byte stored by the program: 200 == 200,
+//    200 > 150 (unsigned), and 255 == 255. (The interpreter used to decode a read u8 zero-extended
+//    while every other u8 slot is sign-extended, so all three printed 0 there and 1 natively.)
+
+fn load_rows(path: *u8, off: i64, mut t: Tensor[i16, 2, 2]) -> i64 {
+    return read_i16_at(path, off, t);
+}
+
+fn load_tile<R, C>(path: *u8, mut t: Tensor[u32, R, C]) -> i64 {
+    return read_u32(path, t);
+}
+
+fn main() -> i32 {
+    let p16: *u8 = "io_test_typed_u16.bin";
+    let mut a: []u16 = alloc_u16(5);
+    a[0] = 0;
+    a[1] = 1;
+    a[2] = 32768;
+    a[3] = 65535;
+    a[4] = 4660;
+    print(write_u16(p16, a));
+    print(file_size(p16));
+    let mut b: []u16 = alloc_u16(5);
+    print(read_u16(p16, b));
+    for i in 0..5 {
+        print(b[i]);
+    }
+    let mut c: [u16; 4] = [7; 4];
+    print(read_u16_at(p16, 4, c));
+    for i in 0..4 {
+        print(c[i]);
+    }
+    print(read_u16_at(p16, 10, c));
+    print(read_u16_at(p16, -2, c));
+    print(file_size("io_test_typed_absent_zz.bin"));
+
+    let pi16: *u8 = "io_test_typed_i16.bin";
+    let s: [i16; 6] = [100, -1, -32768, 32767, 5, -6];
+    print(write_i16(pi16, s));
+    let mut t: [i16; 4] = [0; 4];
+    print(load_rows(pi16, 4, t));
+    for i in 0..4 {
+        print(t[i]);
+    }
+
+    let p32: *u8 = "io_test_typed_u32.bin";
+    let w: [u32; 4] = [4294967295, 2147483648, 305419896, 0];
+    print(write_u32(p32, w));
+    let mut r: [u32; 4] = [1; 4];
+    print(load_tile::<2, 2>(p32, r));
+    for i in 0..4 {
+        print(r[i]);
+    }
+
+    let p64: *u8 = "io_test_typed_u64.bin";
+    let mut q: []u64 = alloc_u64(2);
+    q[0] = 18446744073709551615;
+    q[1] = 9223372036854775808;
+    print(write_u64(p64, q));
+    let mut q2: []u64 = alloc_u64(2);
+    print(read_u64(p64, q2));
+    print(q2[0]);
+    print(q2[1]);
+
+    let pbf: *u8 = "io_test_typed_bf16.bin";
+    let hb: [bf16; 3] = [1.5 as bf16, -0.375 as bf16, 96.0 as bf16];
+    print(write_bf16(pbf, hb));
+    print(file_size(pbf));
+    let mut hb2: []bf16 = alloc_bf16(3);
+    print(read_bf16(pbf, hb2));
+    for i in 0..3 {
+        print((hb2[i] as f32 * 1000.0) as i32);
+    }
+    let mut bits: [u16; 3] = [0; 3];
+    print(read_u16(pbf, bits));
+    for i in 0..3 {
+        print(bits[i]);
+    }
+
+    let pf16: *u8 = "io_test_typed_f16.bin";
+    let mut hf: []f16 = alloc_f16(2);
+    hf[0] = 0.5 as f16;
+    hf[1] = -65504.0 as f16;
+    print(write_f16(pf16, hf));
+    let mut hbits: [u16; 2] = [0; 2];
+    print(read_u16(pf16, hbits));
+    print(hbits[0]);
+    print(hbits[1]);
+
+    let pu8: *u8 = "io_test_typed_u8.bin";
+    let ub: [u8; 3] = [200, 7, 255];
+    print(write_u8(pu8, ub));
+    let mut rb: [u8; 3] = [0; 3];
+    print(read_u8(pu8, rb));
+    if rb[0] == 200 {
+        print(1);
+    } else {
+        print(0);
+    }
+    if rb[0] > 150 {
+        print(1);
+    } else {
+        print(0);
+    }
+    if rb[2] == ub[2] {
+        print(1);
+    } else {
+        print(0);
+    }
+
+    free(a);
+    free(b);
+    free(q);
+    free(q2);
+    free(hb2);
+    free(hf);
+    return 0;
+}

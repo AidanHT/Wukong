@@ -155,18 +155,33 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   emits `wukong_vmath_f32`, and velem / GEMM / reduction nests over slices dispatch too. What still
   declines on a slice base is the *general* auto-vectorizer — the same loop written over slices emits
   no vector ops where the fixed-array form does (a future perf lever, correctness unaffected).
-- **Typed file I/O** — `read_<T>(path, buf) -> i64` and `write_<T>(path, buf) -> i64` over the dtypes
-  {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`}, where `path` is a `*u8` string literal and `buf` a `[]T`
-  slice (typically from `alloc_<T>`). The on-disk format is frozen and **headerless: raw contiguous
-  little-endian elements**, no magic and no length prefix, encoded with `to_le_bytes`/`from_le_bytes`
-  regardless of host endianness, so a blob written by one backend is byte-identical to the other's.
-  Contract: the open is attempted **first**, so a missing or unopenable path is `-1` even for
-  `len <= 0`; a read then transfers `n = min(len, file_size / sizeof)` elements (a trailing partial
-  element is ignored, `buf[n..]` left as allocated) and returns `n`, or `-2` on a mid-read I/O error;
-  a write creates/truncates and returns `len` (`-1` create failed, `-2` write error). Lowered to
-  opaque `wukong_rt_{read,write}_<T>` runtime calls — **no new MIR op** — and the interpreter
-  implements the identical contract, so interp == native
-  (`tests/run/io_roundtrip_{f32,f64,i32,i64,i8,u8}.wk`, `io_missing_file.wk`, `io_partial_read.wk`).
+- **Typed file I/O** — `read_<T>(path, buf) -> i64`, `write_<T>(path, buf) -> i64`,
+  `read_<T>_at(path, byte_off, buf) -> i64` and `file_size(path) -> i64` over **every fixed-width
+  numeric dtype** (`f32 f64 f16 bf16 i8 i16 i32 i64 u8 u16 u32 u64`), where `path` is a `*u8` and
+  `buf` a `[]T` slice, a `[T; N]` array or a contiguous `Tensor[T, …]` with no `?` dimension (writing a
+  non-`mut` aggregate parameter is E0304, like `p[i] = …`). The on-disk format is frozen and
+  **headerless: raw contiguous little-endian elements**, no magic and no length prefix, so a blob
+  written by one backend is byte-identical to the other's. Contract: the open is attempted **first**,
+  so a missing or unopenable path is `-1` even for `len <= 0`; a read then transfers
+  `n = min(len, (file_size - byte_off) / sizeof)` elements (a trailing partial element is ignored,
+  `buf[n..]` left as allocated; a negative offset is `-2`) and returns `n`, or `-2` on a mid-read I/O
+  error; a write creates/truncates and returns `len` (`-1` create failed, `-2` write error). Native
+  reads land **straight in the destination** (the original reader staged a second full-size copy).
+  The six original dtypes keep their `wukong_rt_{read,write}_<T>` symbols; every other dtype and every
+  offset read lowers to the dtype-coded `wukong_rt_{read,write}_dt` — **no new MIR op** — and the
+  interpreter runs the same planning code (`wukong_runtime::fileio`), so interp == native
+  (`tests/run/io_roundtrip_{f32,f64,i32,i64,i8,u8}.wk`, `io_missing_file.wk`, `io_partial_read.wk`,
+  `io_typed_dtypes.wk`). A `u8` read from a file now decodes to the same canonical slot value as a
+  stored `u8` in the interpreter (it was zero-extended there, so `b == 200` printed 0 under the
+  interpreter and 1 natively).
+- **Checkpoint readers** — `st_read_<T>(path, name, buf)` (safetensors) and `npy_read_<T>(path, buf)`
+  (NumPy `.npy` v1–v3) parse the header in the runtime (strict JSON / Python-literal parsers, no new
+  dependency) and check the stored tensor against the destination **at load time**: dtype (a
+  `BF16`/`F16` payload widens exactly into `f32`), a `Tensor` destination's rank and every dimension,
+  the exact element count, Fortran order refused. Codes `-1` open, `-2` I/O, `-3` dtype, `-4` shape,
+  `-5` name, `-6` malformed header; the destination is untouched on every one but `-2`. Runtime unit
+  tests cover the parsers and every code; `tests/run/io_safetensors.wk` and `io_npy.wk` assemble files
+  byte by byte and print every lane.
 - **Radix & char literals**: hex `0xFF` / octal `0o17` / binary `0b1010` integer literals with `_`
   digit separators and type suffixes (`tests/run/radix_literals.wk`), and char literals `'A'` (the
   one-character / `\xHH` / `\u{…}` escapes) typed `char` — a 32-bit Unicode scalar value,
@@ -907,6 +922,11 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   reverse-mode autodiff already ships as the `wukong_autodiff` crate — both above).
 
 ## Known limitations / sharp edges
+
+- **ML I/O gaps.** No memory-mapped load yet (`map_<T>`: every checkpoint load copies
+  once, straight into the destination), no GGUF reader and no quantized block types; `.npy` reads
+  little-endian arrays only.
+  None of these is measured yet.
 
 - **A view local read before it is assigned is undefined, and the language has no rule that says so.**
   *(Table measured 2026-08-23 on `lang/w2e-recognizer-gate`; sema still has no definite-assignment

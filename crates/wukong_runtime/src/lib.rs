@@ -175,6 +175,15 @@ pub use lrscan::{wukong_lrscan_f32, wukong_lrscan_f32_parallel};
 mod scatter;
 pub use scatter::{wukong_scatter_add_f32, wukong_scatter_add_f32_parallel};
 
+// The ML builtins' runtime: one module per family (see each module's docs). Public, because the
+// interpreter calls their pure helpers directly.
+pub mod fileio;
+pub use fileio::{wukong_rt_file_size, wukong_rt_read_dt, wukong_rt_write_dt};
+pub mod npy;
+pub use npy::wukong_rt_npy_read;
+pub mod safetensors;
+pub use safetensors::wukong_rt_st_read;
+
 mod cumprod;
 pub use cumprod::{wukong_cumprod_f32, wukong_cumprod_f32_parallel};
 
@@ -644,13 +653,15 @@ unsafe fn rt_path(path: *const u8) -> Option<std::path::PathBuf> {
     cstr.to_str().ok().map(std::path::PathBuf::from)
 }
 
-/// Defines one `read`/`write` pair of file-I/O intrinsics for element type `$T`, following the
-/// frozen contract: **headerless, raw contiguous little-endian** elements (no magic, no length
-/// prefix). Both backends (native here, interpreter elsewhere) MUST produce byte-identical files
-/// and identical `-1` / `-2` / `n` return codes, so every element is (de)serialized with
-/// `from_le_bytes` / `to_le_bytes` regardless of host endianness.
+/// Defines one `read`/`write` pair of the six original per-dtype file-I/O intrinsics for element
+/// type `$T` (dtype code `$dt`). The on-disk format is the frozen one — **headerless, raw contiguous
+/// little-endian** elements (no magic, no length prefix) — and both backends (native here, the
+/// interpreter elsewhere) must produce byte-identical files and identical `-1` / `-2` / `n` return
+/// codes. Each entry is a thin wrapper over the dtype-coded [`fileio::wukong_rt_read_dt`] /
+/// [`fileio::wukong_rt_write_dt`], so the contract has exactly one native implementation, and that
+/// implementation reads straight into the destination instead of staging a second full-size copy.
 macro_rules! rt_file_io {
-    ($read:ident, $write:ident, $T:ty) => {
+    ($read:ident, $write:ident, $T:ty, $dt:expr) => {
         /// Read up to `len` little-endian `
         #[doc = stringify!($T)]
         /// ` elements from `path` into `data`.
@@ -659,7 +670,7 @@ macro_rules! rt_file_io {
         /// reads `n = min(len, file_size / sizeof)` elements — the file's trailing partial element,
         /// if any, is ignored. `data[0..n]` receives the decoded values; `data[n..]` is left as the
         /// caller allocated it (`alloc_*` pre-zeroes). Returns `n` on success and `-2` on a
-        /// mid-read I/O error.
+        /// mid-read I/O error, after which `data[0..n]` is unspecified (the read lands in place).
         ///
         /// **Ordering is part of the contract**: the open is attempted FIRST, so a missing or
         /// unopenable path is `-1` even when `len <= 0`. The interpreter — the semantic oracle for
@@ -675,40 +686,8 @@ macro_rules! rt_file_io {
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         #[no_mangle]
         pub extern "C" fn $read(path: *const u8, data: *mut $T, len: i64) -> i64 {
-            use std::io::Read;
-            const SZ: usize = std::mem::size_of::<$T>();
             // SAFETY: forwarded from this function's own safety contract.
-            let Some(path) = (unsafe { rt_path(path) }) else {
-                return -1;
-            };
-            let mut file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(_) => return -1,
-            };
-            let avail = match file.metadata() {
-                Ok(m) => (m.len() / SZ as u64) as usize,
-                Err(_) => return -2,
-            };
-            // `min(len, avail)` clamped at zero — the interpreter's exact expression, so a
-            // non-positive `len` reads nothing on an openable path instead of casting negative.
-            let n = if len <= 0 {
-                0
-            } else {
-                (len as usize).min(avail)
-            };
-            if n == 0 {
-                return 0;
-            }
-            let mut bytes = vec![0u8; n * SZ];
-            if file.read_exact(&mut bytes).is_err() {
-                return -2;
-            }
-            for (i, chunk) in bytes.chunks_exact(SZ).enumerate() {
-                let v = <$T>::from_le_bytes(chunk.try_into().unwrap());
-                // SAFETY: `i < n <= len` and the caller guarantees `len` writable slots at `data`.
-                unsafe { *data.add(i) = v };
-            }
-            n as i64
+            unsafe { fileio::wukong_rt_read_dt(path, 0, data as *mut u8, len, $dt) }
         }
 
         /// Write all `len` `
@@ -726,36 +705,18 @@ macro_rules! rt_file_io {
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         #[no_mangle]
         pub extern "C" fn $write(path: *const u8, data: *const $T, len: i64) -> i64 {
-            use std::io::Write;
             // SAFETY: forwarded from this function's own safety contract.
-            let Some(path) = (unsafe { rt_path(path) }) else {
-                return -1;
-            };
-            let mut file = match std::fs::File::create(&path) {
-                Ok(f) => f,
-                Err(_) => return -1,
-            };
-            let count = len.max(0) as usize;
-            let mut bytes = Vec::with_capacity(count * std::mem::size_of::<$T>());
-            for i in 0..count {
-                // SAFETY: `i < count == len` and the caller guarantees `len` readable slots.
-                let v = unsafe { *data.add(i) };
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            if file.write_all(&bytes).is_err() {
-                return -2;
-            }
-            len.max(0)
+            unsafe { fileio::wukong_rt_write_dt(path, data as *const u8, len, $dt) }
         }
     };
 }
 
-rt_file_io!(wukong_rt_read_f32, wukong_rt_write_f32, f32);
-rt_file_io!(wukong_rt_read_f64, wukong_rt_write_f64, f64);
-rt_file_io!(wukong_rt_read_i32, wukong_rt_write_i32, i32);
-rt_file_io!(wukong_rt_read_i64, wukong_rt_write_i64, i64);
-rt_file_io!(wukong_rt_read_i8, wukong_rt_write_i8, i8);
-rt_file_io!(wukong_rt_read_u8, wukong_rt_write_u8, u8);
+rt_file_io!(wukong_rt_read_f32, wukong_rt_write_f32, f32, fileio::DT_F32);
+rt_file_io!(wukong_rt_read_f64, wukong_rt_write_f64, f64, fileio::DT_F64);
+rt_file_io!(wukong_rt_read_i32, wukong_rt_write_i32, i32, fileio::DT_I32);
+rt_file_io!(wukong_rt_read_i64, wukong_rt_write_i64, i64, fileio::DT_I64);
+rt_file_io!(wukong_rt_read_i8, wukong_rt_write_i8, i8, fileio::DT_I8);
+rt_file_io!(wukong_rt_read_u8, wukong_rt_write_u8, u8, fileio::DT_U8);
 
 /// `wukong_now_ns() -> i64` — a monotonic, process-lifetime nanosecond clock, backing the `now_ns()`
 /// timing intrinsic used to benchmark Wukong programs in-process (`let t0 = now_ns(); … let t1 =

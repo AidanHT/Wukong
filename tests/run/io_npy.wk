@@ -1,0 +1,141 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 136
+// EXPECT-OUT: 4
+// EXPECT-OUT: 150
+// EXPECT-OUT: -200
+// EXPECT-OUT: 25
+// EXPECT-OUT: 800
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: -4
+// EXPECT-OUT: 7
+// EXPECT-OUT: -4
+// EXPECT-OUT: -3
+// EXPECT-OUT: 144
+// EXPECT-OUT: -4
+// EXPECT-OUT: 134
+// EXPECT-OUT: 3
+// EXPECT-OUT: 65535
+// EXPECT-OUT: 1
+// EXPECT-OUT: 32768
+// EXPECT-OUT: 16
+// EXPECT-OUT: -6
+// EXPECT-OUT: -1
+module tests.run.io_npy
+
+// `npy_read_<T>(path, buf)` loads the array of a NumPy `.npy` file: the magic `\x93NUMPY`, version
+// 1.0, a little-endian u16 header length, a Python-dict header padded (as numpy pads it) so the
+// whole preamble is 128 bytes and ends in a newline, then the raw array. Each file is assembled
+// byte by byte here, so every expected value is the payload's definition:
+//  1. '<f2' (2, 2) = half bits 3E00 C000 3400 4800 = 1.5 -2.0 0.25 8.0 (136 bytes): into a
+//     `Tensor[f32, 2, 2]` it WIDENS exactly (printed times 100); verbatim into `[f16; 4]` (the
+//     last lane is 8); into a `Tensor[f32, 4, 1]` it is -4 even though the count matches, leaving
+//     the destination untouched (7 stays 7); into 3 floats -4 (count); into i16 -3 (dtype).
+//  2. '<i4' (2, 2) with `fortran_order: True` (144 bytes): a row-major destination would receive
+//     the transpose, so it is refused, -4.
+//  3. '<u2' (3,) = 65535 1 32768 (134 bytes): into a `[]u16` slice, printed unsigned.
+//  4. A 16-byte file with no magic -6; a missing file -1.
+
+fn put_str(mut buf: []u8, at: i64, s: *u8) -> i64 {
+    let mut i: i64 = 0;
+    while s[i] != 0 {
+        buf[at + i] = s[i];
+        i = i + 1;
+    }
+    return i;
+}
+
+fn put_le(mut buf: []u8, at: i64, v: i64, n: i64) {
+    let mut x: i64 = v;
+    let mut k: i64 = 0;
+    while k < n {
+        buf[at + k] = (x & 255) as u8;
+        x = x >> 8;
+        k = k + 1;
+    }
+}
+
+// A version-1.0 preamble holding dict text `d`, space-padded to 128 bytes with a final newline.
+// Returns the payload offset.
+fn put_npy_header(mut buf: []u8, d: *u8) -> i64 {
+    buf[0] = 147;
+    put_str(buf, 1, "NUMPY");
+    buf[6] = 1;
+    buf[7] = 0;
+    put_le(buf, 8, 118, 2);
+    let mut k: i64 = 10 + put_str(buf, 10, d);
+    while k < 127 {
+        buf[k] = 32;
+        k = k + 1;
+    }
+    buf[127] = 10;
+    return 128;
+}
+
+fn load_2x2(path: *u8, mut t: Tensor[f32, 2, 2]) -> i64 {
+    return npy_read_f32(path, t);
+}
+
+fn load_4x1(path: *u8, mut t: Tensor[f32, 4, 1]) -> i64 {
+    return npy_read_f32(path, t);
+}
+
+fn main() -> i32 {
+    let half: *u8 = "io_test_npy_f2.bin";
+    let mut f: []u8 = alloc_u8(136);
+    let at: i64 = put_npy_header(f, "{'descr': '<f2', 'fortran_order': False, 'shape': (2, 2), }");
+    put_le(f, at, 0x3E00, 2);
+    put_le(f, at + 2, 0xC000, 2);
+    put_le(f, at + 4, 0x3400, 2);
+    put_le(f, at + 6, 0x4800, 2);
+    print(write_u8(half, f));
+
+    let mut m: [f32; 4] = [0.0; 4];
+    print(load_2x2(half, m));
+    for i in 0..4 {
+        print((m[i] * 100.0) as i32);
+    }
+    let mut h: [f16; 4] = [0.0 as f16; 4];
+    print(npy_read_f16(half, h));
+    print((h[3] as f32) as i32);
+    let mut col: [f32; 4] = [7.0; 4];
+    print(load_4x1(half, col));
+    print(col[0] as i32);
+    let mut three: [f32; 3] = [0.0; 3];
+    print(npy_read_f32(half, three));
+    let mut ints: [i16; 4] = [0; 4];
+    print(npy_read_i16(half, ints));
+
+    let fort: *u8 = "io_test_npy_fortran.bin";
+    let mut g: []u8 = alloc_u8(144);
+    put_npy_header(g, "{'descr': '<i4', 'fortran_order': True, 'shape': (2, 2), }");
+    print(write_u8(fort, g));
+    let mut gi: [i32; 4] = [0; 4];
+    print(npy_read_i32(fort, gi));
+
+    let uns: *u8 = "io_test_npy_u2.bin";
+    let mut u: []u8 = alloc_u8(134);
+    let uat: i64 = put_npy_header(u, "{'descr': '<u2', 'fortran_order': False, 'shape': (3,), }");
+    put_le(u, uat, 65535, 2);
+    put_le(u, uat + 2, 1, 2);
+    put_le(u, uat + 4, 32768, 2);
+    print(write_u8(uns, u));
+    let mut us: []u16 = alloc_u16(3);
+    print(npy_read_u16(uns, us));
+    for i in 0..3 {
+        print(us[i]);
+    }
+
+    let mut junk: []u8 = alloc_u8(16);
+    print(write_u8("io_test_npy_junk.bin", junk));
+    print(npy_read_f32("io_test_npy_junk.bin", m));
+    print(npy_read_f32("io_test_npy_absent_zz.bin", m));
+
+    free(f);
+    free(g);
+    free(u);
+    free(us);
+    free(junk);
+    return 0;
+}

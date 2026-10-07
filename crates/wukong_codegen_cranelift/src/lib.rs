@@ -40,6 +40,9 @@ pub use backend::CraneliftBackend;
 // 128-bit). Owned by this session; additive.
 mod avx2;
 
+// The runtime entries of the ML builtins, declared, JIT-bound and called from one table.
+mod ml_rt;
+
 // --- The minimal runtime the generated code calls back into ---------------------------------
 //
 // `print`/`println`/`assert` lower to calls to these symbols. For the JIT they are real Rust
@@ -1908,6 +1911,10 @@ impl<'a> FnTranslator<'a> {
                 .call(fref, &[q, out, rows, cols, scale, op]);
             return None;
         }
+        // The ML builtins' entries (the `ml_rt` table).
+        if let Some(result) = self.lower_ml_rt_call(name, args) {
+            return result;
+        }
         // Everything above dispatches a runtime kernel on (name, arity). `rt_ids` holds exactly
         // the runtime symbols this function is responsible for, so reaching here with one of them
         // means a recognizer emitted an arity no arm accepts. Unknown `wukong_` names must also
@@ -3198,7 +3205,7 @@ fn populate_module<M: Module>(
 
     // Module-wide symbol membership is also the arity-error guard. Per-function
     // signature imports are created lazily by FnTranslator::runtime_ref.
-    let rt_ids: HashMap<&'static str, FuncId> = HashMap::from([
+    let mut rt_ids: HashMap<&'static str, FuncId> = HashMap::from([
         (RT_PRINT_I64, rt.print_i64),
         (RT_PRINT_U64, rt.print_u64),
         (RT_PRINT_STR, rt.print_str),
@@ -3368,6 +3375,7 @@ fn populate_module<M: Module>(
         (RT_FMOD_F64, rt.fmod_f64),
         (RT_FMOD_F32, rt.fmod_f32),
     ]);
+    ml_rt::declare(module, ptr_ty, call_conv, &mut rt_ids)?;
 
     // Declare all user functions first so calls resolve regardless of definition order.
     let mut ids: HashMap<Symbol, FuncId> = HashMap::new();
@@ -3966,6 +3974,8 @@ fn jit_compile_entry(
     );
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
+    // The ML builtins' entries (the `ml_rt` table).
+    ml_rt::bind_jit(&mut builder);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
@@ -4552,6 +4562,8 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     );
     builder.symbol(RT_WRITE_I8, wukong_runtime::wukong_rt_write_i8 as *const u8);
     builder.symbol(RT_WRITE_U8, wukong_runtime::wukong_rt_write_u8 as *const u8);
+    // The ML builtins' entries (the `ml_rt` table).
+    ml_rt::bind_jit(&mut builder);
     builder.symbol(RT_NOW_NS, wukong_runtime::wukong_now_ns as *const u8);
     builder.symbol(
         RT_PARALLEL_FOR,
