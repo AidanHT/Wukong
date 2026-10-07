@@ -83,8 +83,9 @@ fn vector_neg_not_and_identity_casts() {
     assert!(text.contains("fneg <4 x float>"), "{text}");
     // Pointer and integer same-type casts are identities. A same-type f16/bf16 `fptrunc` is not:
     // the interpreter rounds the f32 register onto the grid, so it is a narrowing round trip.
-    assert!(text.contains("fptrunc float %v2 to half"), "{text}");
-    assert!(text.contains("fptrunc float %v3 to bfloat"), "{text}");
+    // Values: a=%v0, x=%v1, the three ops %v2..%v4, then each param/cast pair from %v5.
+    assert!(text.contains("fptrunc float %v5 to half"), "{text}");
+    assert!(text.contains("fptrunc float %v7 to bfloat"), "{text}");
     assert!(
         !text.contains("fptrunc half") && !text.contains("fptrunc bfloat"),
         "{text}"
