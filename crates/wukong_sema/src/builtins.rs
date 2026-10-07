@@ -1071,7 +1071,7 @@ impl Sema<'_> {
                     continue;
                 }
                 let len = *len;
-                if len % prod != 0 {
+                if !len.is_multiple_of(prod) {
                     self.error(
                         args[i].span,
                         "E0501",
