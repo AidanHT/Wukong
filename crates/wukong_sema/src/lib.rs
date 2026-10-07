@@ -23,6 +23,9 @@
 //! Several diagnostics are gated on the `checking_bodies` flag so they fire only once every generic
 //! and `const` is registered.
 
+/// The lint pass (`W0xxx` warnings), which the driver runs after a clean [`check`].
+pub mod lints;
+
 mod attrs;
 mod dependency;
 mod layout;

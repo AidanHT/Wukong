@@ -167,6 +167,21 @@ opener of a missing closer (then drops it, so the next failure labels the next o
 over the lexer's `Error` tokens first — `Parser::error` likewise drops a complaint about an `Error`
 token, which the lexer has already reported.
 
+Warnings (`W0xxx`) come from `wukong_sema::lints`, a pass separate from `wukong_sema::check` so
+that `check`'s result — and every test pinning its exact diagnostics — is unchanged. The driver
+calls `lints::run` only after a clean `check`, then `lints::apply_levels`, which resolves each
+finding's level (the lint's default, then the command line's `-A/-W/-D`, then the innermost
+`@allow/@warn/@deny` whose item, parameter or statement span contains the finding) and drops,
+keeps or promotes it. A denied lint stops the build before lowering; warnings are held back and
+rendered after lowering's diagnostics, so a failed build's first diagnostic is always an error.
+The pass does its own scope-faithful name resolution over the AST and reads only `SemaResult`'s
+node types and def map. Each lint errs toward silence — `unreachable_code` reuses sema's
+definite-return rule for divergence (a `match` diverges only with a catch-all arm) so the user can
+always delete what it reports. `dead_code` roots come from the driver (`lint_options_for`: `main`,
+the autodiff root, everything under `--emit=obj|llvm-ir`). Lint codes are catalogued like errors;
+`catalog_coverage.rs` scans `"Wnnnn"` literals too, and a `tests/warn` fixture (the whole stream,
+in order, is compared by `warn.rs`) exercises each one.
+
 The terminal renderer is rustc-style (carets, gutters, `--> file:line:col`). Two rendering rules are
 contractual: a caret run is as wide as the span's *rendered* width, never the column difference, and
 both the echoed source line and the caret padding expand tabs at a fixed `TAB_WIDTH = 4` — so carets

@@ -16,6 +16,7 @@ use wukong_diag::{Diagnostic, DiagnosticSink, Renderer};
 use wukong_span::{Interner, SourceMap};
 
 pub use wukong_diag::{all_explanations, explain, Explanation};
+pub use wukong_sema::lints::{LintLevel, LintLevels, LINTS};
 
 /// The GPU offloading bridge (`--backend=gpu`), compiled only with the `gpu` feature.
 #[cfg(feature = "gpu")]
@@ -110,6 +111,10 @@ pub struct Options {
     pub opt_level: u8,
     /// Validate MIR after each optimizer pass, including in release builds (`--verify-each`).
     pub verify_each: bool,
+    /// Lint levels from the command line (`-A/-W/-D <lint>`, `-D warnings`), applied on top of each
+    /// lint's default; `@allow/@warn/@deny` attributes in the source refine them per item. See
+    /// `wukong_sema::lints`.
+    pub lint_levels: LintLevels,
     pub color: bool,
     pub error_format: ErrorFormat,
     /// Which backend to run/emit with. `--run` defaults to the interpreter (the reference oracle);
@@ -178,6 +183,7 @@ impl Default for Options {
             run: false,
             opt_level: 0,
             verify_each: false,
+            lint_levels: LintLevels::default(),
             color: true,
             error_format: ErrorFormat::Human,
             backend: BackendKind::Interp,
@@ -352,6 +358,26 @@ pub fn compile(opts: &Options) -> i32 {
     }
     drop(sema_diags);
 
+    // --- Lints (`W0xxx`; see `wukong_sema::lints`) ---
+    // Only a program that checks clean is linted. Levels (`-A/-W/-D`, `@allow/@warn/@deny`) are
+    // resolved now, while the AST is alive, and a denied lint stops the build here as an error.
+    // Warnings are held back and printed after lowering's diagnostics, so a failed build always
+    // leads with an error — the contract `tests/fail` pins on the first diagnostic.
+    let lint_diags = wukong_sema::lints::apply_levels(
+        wukong_sema::lints::run(&module, &sema, &interner, &lint_options_for(opts)),
+        &module,
+        &interner,
+        &opts.lint_levels,
+    );
+    if lint_diags.iter().any(Diagnostic::is_error) {
+        let (denied, warned): (Vec<&Diagnostic>, Vec<&Diagnostic>) =
+            lint_diags.iter().partition(|d| d.is_error());
+        for d in denied.into_iter().chain(warned) {
+            emit_diag(d, opts.error_format, &renderer, &sm);
+        }
+        return exit::COMPILE_ERROR;
+    }
+
     // For `--train`, recover the loss function's buffer element counts from the semantic types now,
     // while the `[f32; N]` / `Tensor[..]` annotations are still available (they are lost once the
     // params lower to `Ptr`).
@@ -381,6 +407,11 @@ pub fn compile(opts: &Options) -> i32 {
     for d in &lower_diags {
         emit_diag(d, opts.error_format, &renderer, &sm);
     }
+    // The held-back lint warnings, after any lowering error (see the lint stage above).
+    for d in &lint_diags {
+        emit_diag(d, opts.error_format, &renderer, &sm);
+    }
+    drop(lint_diags);
     drop(sm);
     let lowering_failed = lower_diags.iter().any(|d| d.is_error());
     drop(lower_diags);
@@ -1985,6 +2016,22 @@ fn emit_diag(d: &Diagnostic, fmt: ErrorFormat, renderer: &Renderer, sm: &SourceM
 fn render_all(fmt: ErrorFormat, renderer: &Renderer, sink: &DiagnosticSink, sm: &SourceMap) {
     for d in sink.diagnostics() {
         emit_diag(d, fmt, renderer, sm);
+    }
+}
+
+/// What the lint pass must know about how this build's artifact is used: which functions besides
+/// `main` an outside caller enters (`dead_code`'s roots). Under `--emit=grad`/`--train` the driver
+/// itself calls the `--grad-of` function by name; an `--emit=obj`/`--emit=llvm-ir` artifact is
+/// linked by a host that may call any of its exported functions.
+fn lint_options_for(opts: &Options) -> wukong_sema::lints::LintOptions {
+    let grad = opts.grad.train || opts.emit == EmitStage::Grad;
+    wukong_sema::lints::LintOptions {
+        roots: if grad {
+            vec![opts.grad.of.clone().unwrap_or_else(|| "loss".to_string())]
+        } else {
+            Vec::new()
+        },
+        library: !opts.run && !grad && matches!(opts.emit, EmitStage::Obj | EmitStage::LlvmIr),
     }
 }
 

@@ -11,6 +11,8 @@
 //!   * `E03xx` — name resolution
 //!   * `E04xx` — type checking
 //!   * `E05xx` — shape checking (Wukong's headline analysis)
+//!   * `W00xx` — warnings (lints; `W0001`–`W0019` from `wukong_sema::lints`, `W003x` from the
+//!     parser), each also named for `-A/-W/-D` and `@allow/@warn/@deny`
 //!   * `C0xxx` — codegen / lowering limitations
 //!
 //! Codes are stable: never renumber one, and never reuse a retired number for a new rule. Retired:
@@ -332,6 +334,73 @@ static CATALOG: &[Explanation] = &[
          share `K`); it is now an error. Declare the dimension in the generic list (`<KK>`), fix the \
          typo, or use an integer / `?`."
     ),
+    // ---- Warnings (lints). Each has a name for `-A/-W/-D <name>` and `@allow/@warn/@deny(name)`;
+    // `-D warnings` makes every warning an error. Lints run only on a program that checks clean.
+    entry!(
+        "W0001",
+        "unused variable (`unused_variables`)",
+        "A `let` binding, a parameter, a `for` variable or a `match` binding is never read. A \
+         variable that is only assigned to (`acc += x` with `acc` never read afterwards) counts as \
+         unused too: the values computed into it go nowhere, which in a kernel usually means the \
+         result is written to the wrong place. Use the value, delete the binding, or prefix the \
+         name with an underscore (`_x`) to say the binding is intentionally unused."
+    ),
+    entry!(
+        "W0002",
+        "variable does not need to be mutable (`unused_mut`)",
+        "A scalar or pointer binding is declared `mut` but is never reassigned, compound-assigned or \
+         borrowed. Writing through a pointer (`*p = v`) changes the pointee, not the pointer, so it \
+         does not need `mut` on the pointer binding. Remove the `mut`. (An aggregate `let` is not \
+         judged: element stores need no `mut` there.)"
+    ),
+    entry!(
+        "W0003",
+        "unreachable code (`unreachable_code`)",
+        "A statement or expression follows a `return`, `break` or `continue`, or a construct that \
+         diverges on every path — an `if`/`else` whose both branches diverge, a `match` with a \
+         catch-all arm whose every arm diverges, or a `loop` with no `break` — so it never runs. \
+         Divergence is judged exactly as sema's definite-return check judges it, so deleting the \
+         reported code never makes a `return` necessary. Delete the code, or move it before the \
+         diverging statement if it was meant to run."
+    ),
+    entry!(
+        "W0004",
+        "unused result (`unused_result`)",
+        "An expression statement computes a value with no effect and throws it away: a comparison, \
+         an arithmetic or logical operation, a cast, a literal or a plain name. The classic case is \
+         `out[i] == a[i] + b[i];` — a comparison written where the assignment `out[i] = a[i] + b[i];` \
+         was meant, which leaves `out` unwritten and compiles silently otherwise. A call, an index \
+         (its bounds check is observable), a dereference and any block, `if`, `match` or `loop` are \
+         never reported."
+    ),
+    entry!(
+        "W0005",
+        "function is never used (`dead_code`)",
+        "A function of the compiled file cannot be reached from any entry point. The entry points \
+         are `main`, the `--grad-of` function under `--emit=grad`/`--train`, every `pub` function, \
+         every `@export`/`@extern` function, and any function a `const` initializer names; a \
+         function only called by itself is still unreachable. A file with no `main`, and \
+         `--emit=obj`/`--emit=llvm-ir` (whose artifact a host may call into anywhere), report \
+         nothing. Functions of imported files are not reported. Call the function, make it `pub`, \
+         or delete it."
+    ),
+    entry!(
+        "W0006",
+        "output parameter is never written (`unwritten_output`)",
+        "A `mut` aggregate parameter — an array, slice, tensor, tuple or struct, passed by reference \
+         so that the caller sees the stores — is read but never stored to, assigned, passed on or \
+         borrowed. `mut` declares the parameter an output buffer, so a kernel that never writes it \
+         computes nothing the caller can see: usually a typo (`out[i] == …`, or the store went to \
+         another buffer). Store the result through it, or drop `mut` if the function only reads it."
+    ),
+    entry!(
+        "W0007",
+        "unknown lint (`unknown_lints`)",
+        "An `@allow(..)`, `@warn(..)` or `@deny(..)` attribute names something that is not a lint, \
+         or has no argument at all, so it silences or promotes nothing. The arguments are lint names \
+         (`unused_variables`), lint codes (`W0001`) or `warnings` (every lint). `wukongc --explain \
+         W0001` and its neighbours describe each lint."
+    ),
     entry!(
         "C0001",
         "unsupported in codegen",
@@ -355,7 +424,16 @@ mod tests {
     #[test]
     fn every_entry_has_a_code_and_body() {
         for e in all() {
-            assert!(e.code.starts_with('E') || e.code.starts_with('C'));
+            assert!(
+                e.code.starts_with('E') || e.code.starts_with('C') || e.code.starts_with('W'),
+                "{} is in no code range",
+                e.code
+            );
+            assert!(
+                e.code.len() == 5 && e.code[1..].bytes().all(|b| b.is_ascii_digit()),
+                "{} is not a letter and four digits",
+                e.code
+            );
             assert!(!e.title.is_empty());
             assert!(e.body.len() > 20, "{} has a thin explanation", e.code);
         }

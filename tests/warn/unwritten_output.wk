@@ -1,0 +1,18 @@
+// EXPECT-WARN: W0006
+module tests.warn.unwritten_output
+
+// `y = a*x + y` stored into the wrong buffer: `x` is written, the declared output `y` is only
+// read, so the caller's `y` never changes.
+fn axpy(a: f32, mut x: [f32; 4], mut y: [f32; 4]) {
+    for i in 0..4 {
+        x[i] = a * x[i] + y[i];
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    let mut y: [f32; 4] = [10.0, 20.0, 30.0, 40.0];
+    axpy(2.0, x, y);
+    print(y[0]);
+    return 0;
+}

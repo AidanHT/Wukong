@@ -1,0 +1,8 @@
+// EXPECT-WARN: W0007
+module tests.warn.unknown_lints
+
+// A misspelled lint name would silence nothing; it is reported instead of ignored.
+@allow(unused_varaibles)
+fn main() -> i32 {
+    return 0;
+}

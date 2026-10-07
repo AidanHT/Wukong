@@ -845,6 +845,45 @@ round-trip is **differentially
 tested to agree bit-for-bit** across the interpreter and the native Cranelift backend, exactly as the
 ✅ maturity legend requires.
 
+## Warnings (lints) ✅
+
+A program that type- and shape-checks clean is linted: the compiler warns about code that compiles
+but is probably not what was meant. A warning never changes what a program computes and never
+stops a build unless its level says so. Each lint has a stable code (`wukongc --explain W0001`)
+and a name:
+
+| Code | Name | Reports |
+|---|---|---|
+| `W0001` | `unused_variables` | a `let`, parameter, `for` variable or `match` binding never read — including an accumulator that is only ever assigned (`acc += x` with `acc` never read) |
+| `W0002` | `unused_mut` | a scalar or pointer binding declared `mut` that is never reassigned or borrowed (`*p = v` writes the pointee, not `p`) |
+| `W0003` | `unreachable_code` | code after a `return`/`break`/`continue` or after a construct that diverges on every path, judged exactly as the definite-return check judges it |
+| `W0004` | `unused_result` | an expression statement whose value is thrown away with no effect — above all `out[i] == a[i] + b[i];` written for `=` |
+| `W0005` | `dead_code` | a function of the compiled file no entry point reaches (`main`, the `--grad-of` function under `--emit=grad`/`--train`, `pub`, `@export`/`@extern`); nothing under `--emit=obj`/`llvm-ir` or in a file with no `main` |
+| `W0006` | `unwritten_output` | a `mut` array/slice/tensor/tuple/struct parameter — an output buffer — that is never stored to, assigned, passed on or borrowed |
+| `W0007` | `unknown_lints` | an `@allow`/`@warn`/`@deny` argument that names no lint |
+
+A name prefixed with `_` (`_scratch`) is never reported as unused. Levels: **allow** (silent),
+**warn** (the default for every lint) and **deny** (an error; the build fails). Set them on the
+command line — `-A <lint>`, `-W <lint>`, `-D <lint>`, where `<lint>` is a name, a code or
+`warnings` (every lint), so `-D warnings` fails the build on any warning — or in source, on a
+function, a parameter or a statement:
+
+```wukong
+@allow(dead_code)
+fn kept_for_later() -> i32 { return 1; }
+
+fn main() -> i32 {
+    @allow(unused_variables)
+    let scratch: i32 = 7;
+    return 0;
+}
+```
+
+The innermost attribute wins over an outer one and over the command line; `-D warnings` applies to
+every lint still at warning level, so it does not resurrect an allowed one. Warnings are printed
+after any error, and never on a program that fails sema. The fixtures in `tests/warn/` pin each
+lint's exact output.
+
 ## Command-line interface
 
 ```
@@ -878,6 +917,10 @@ wukongc [OPTIONS] <input.wk>
                       on unix). Rejected with --run and with every other stage, which print their
                       artifact on stdout — redirect instead.
 --error-format=<f>    human | json   (default: human)
+-A|-W|-D <lint>       allow / warn on / deny (report as an error) a lint; <lint> is a name
+                      (unused_variables), its code (W0001) or `warnings` (every lint):
+                      `-D warnings` fails the build on any warning. Repeatable; `-Dwarnings`
+                      works too; an unknown lint is a usage error (exit 2). See "Warnings (lints)"
 --explain <CODE>      print an extended explanation for an error code
 --color=<when>        auto | always | never   (default: auto — colour when stderr is a terminal)
 -h, --help            print the usage text and exit 0

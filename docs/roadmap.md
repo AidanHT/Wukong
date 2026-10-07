@@ -490,6 +490,16 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   already rejected never draws a second parser error. Not yet: rustc's indentation-based "this
   delimiter might not be properly closed" guess, and resynchronizing at the next statement after a
   bad one (the parser still recovers token by token).
+- **Warnings (lints).** The compiler's first warnings (`wukong_sema::lints`, run after a clean
+  sema): `W0001 unused_variables`, `W0002 unused_mut`, `W0003 unreachable_code` (divergence judged
+  exactly as the definite-return check judges it), `W0004 unused_result` (`out[i] == x;` written
+  for `=`), `W0005 dead_code`, `W0006 unwritten_output` (a `mut` aggregate parameter never stored
+  to) and `W0007 unknown_lints`. Levels come from rustc-style `-A/-W/-D <lint>` (`-D warnings`) and
+  `@allow/@warn/@deny(<lint>)` on a function, parameter or statement, innermost first. Warnings
+  print after errors, so `tests/fail`'s first-diagnostic contract holds; `tests/warn/` pins each
+  lint's exact output (`crates/wukongc/tests/warn.rs`). Not yet: `unused_imports` (waits for the
+  module-scoped resolver), the corpus held to zero warnings (the census test is `#[ignore]`d until a
+  first full run blesses `tests/run` and `examples/`), and machine-applicable suggestions.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup

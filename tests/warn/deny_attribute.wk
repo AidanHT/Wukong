@@ -1,0 +1,10 @@
+// EXPECT-ERROR: W0002
+module tests.warn.deny_attribute
+
+// `@deny` promotes a lint to an error for the function it is written on: the build fails.
+@deny(unused_mut)
+fn main() -> i32 {
+    let mut steps: i32 = 3;
+    print(steps);
+    return 0;
+}

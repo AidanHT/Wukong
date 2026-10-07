@@ -220,8 +220,9 @@ fn lexer_and_parser_diagnostics_are_reachable() {
 }
 
 /// The reverse direction of the catalogue check: every code the catalogue advertises must be
-/// exercised by *something* here. A catalogue entry nothing reaches is documentation for a
-/// diagnostic that may already have been renumbered away.
+/// exercised by *something* here — or, for a warning (`W` code), by a `tests/warn` fixture. A
+/// catalogue entry nothing reaches is documentation for a diagnostic that may already have been
+/// renumbered away.
 #[test]
 fn every_catalogued_code_is_exercised() {
     let dir = fail_dir();
@@ -232,6 +233,22 @@ fn every_catalogued_code_is_exercised() {
         .map(|p| expected_code(&std::fs::read_to_string(&p).unwrap()))
         .collect();
     covered.extend(LEXER_PARSER_PROBES.iter().map(|(c, _)| c.to_string()));
+    // Warnings compile, so a lint code is exercised by a `tests/warn` fixture instead, whose every
+    // `EXPECT-WARN`/`EXPECT-ERROR` line `warn.rs` proves is emitted.
+    let warn_dir = fail_dir().join("..").join("warn");
+    for p in std::fs::read_dir(&warn_dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", warn_dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x == "wk").unwrap_or(false))
+    {
+        let src = std::fs::read_to_string(&p).unwrap();
+        covered.extend(src.lines().filter_map(|l| {
+            let l = l.trim_start();
+            l.strip_prefix("// EXPECT-WARN:")
+                .or_else(|| l.strip_prefix("// EXPECT-ERROR:"))
+                .map(|c| c.trim().to_string())
+        }));
+    }
     covered.sort();
     covered.dedup();
 

@@ -36,6 +36,12 @@ OPTIONS:
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
     --error-format=<f> Diagnostic output format: human, json  (default: human)
+    -A|-W|-D <lint>    Allow, warn on, or deny (report as an error) a lint; `warnings` names
+                       every lint, so `-D warnings` fails the build on any warning. A lint is
+                       named or coded: unused_variables (W0001), unused_mut (W0002),
+                       unreachable_code (W0003), unused_result (W0004), dead_code (W0005),
+                       unwritten_output (W0006), unknown_lints (W0007). Repeatable; `-Dwarnings`
+                       also works. In source: @allow(<lint>), @warn(..), @deny(..)
     --explain <CODE>   Print the extended explanation for an error code, then exit
     -h, --help         Print this help
     -V, --version      Print version
@@ -90,6 +96,22 @@ fn print_explanation(code: &str) -> Result<(), String> {
             "unknown error code `{code}`. Run `wukongc --explain E0502` for an example."
         )),
     }
+}
+
+/// Record one `-A/-W/-D <lint>` flag (`flag` is the two-character switch).
+fn set_lint_level(
+    levels: &mut wukong_driver::LintLevels,
+    flag: &str,
+    lint: &str,
+) -> Result<(), String> {
+    let level = match flag {
+        "-A" => wukong_driver::LintLevel::Allow,
+        "-W" => wukong_driver::LintLevel::Warn,
+        _ => wukong_driver::LintLevel::Deny,
+    };
+    levels
+        .set(lint, level)
+        .map_err(|e| format!("`{flag} {lint}`: {e}"))
 }
 
 /// Parse CLI arguments. `Ok(None)` means a help / version / `--explain` message was already printed
@@ -224,6 +246,16 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                     other => return Err(format!("unknown --color value `{other}`")),
                 };
             }
+            "-A" | "-W" | "-D" => {
+                i += 1;
+                let lint = args.get(i).ok_or_else(|| {
+                    format!("`{arg}` requires a lint name, e.g. `{arg} warnings`")
+                })?;
+                set_lint_level(&mut opts.lint_levels, arg, lint)?;
+            }
+            _ if arg.len() > 2 && ["-A", "-W", "-D"].iter().any(|f| arg.starts_with(f)) => {
+                set_lint_level(&mut opts.lint_levels, &arg[..2], &arg[2..])?;
+            }
             _ if arg.starts_with('-') && arg != "-" => {
                 return Err(format!("unknown option `{arg}`"));
             }
@@ -293,6 +325,31 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-A/-W/-D <lint>` (and the glued `-Dwarnings`) accept a lint name, its dashed spelling, its
+    /// code or `warnings`; an unknown lint or a missing name is a usage error, not a silent no-op.
+    /// USAGE lists every lint, so the help cannot fall behind the lint table.
+    #[test]
+    fn lint_level_flags_parse_and_reject_unknown_lints() {
+        let parse = |a: &[&str]| parse_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        for ok in [
+            &["-D", "warnings", "in.wk"][..],
+            &["-Dwarnings", "-A", "dead_code", "-W", "unused-mut", "in.wk"][..],
+            &["-A", "W0001", "in.wk"][..],
+        ] {
+            assert!(parse(ok).unwrap().is_some(), "{ok:?}");
+        }
+        let err = parse(&["-D", "unused_varaibles", "in.wk"]).unwrap_err();
+        assert!(err.contains("unknown lint"), "{err}");
+        assert!(
+            parse(&["in.wk", "-D"]).is_err(),
+            "a level flag needs a lint"
+        );
+        for lint in wukong_driver::LINTS {
+            assert!(USAGE.contains(lint.name), "USAGE must list {}", lint.name);
+            assert!(USAGE.contains(lint.code), "USAGE must list {}", lint.code);
+        }
+    }
 
     #[test]
     fn verify_each_flag_survives_all_optimization_levels_and_training() {
