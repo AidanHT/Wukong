@@ -654,8 +654,9 @@ impl Epilogue {
             y += *self.bias.add(j);
         }
         // GELU/SiLU reuse `vmath`'s scalar form so a fused `act(x·Wᵀ+b)` is bit-identical to the
-        // unfused `{ t = x·Wᵀ+b; act(t) }`. The epilogue is applied scalar in the (always-taken-when-
-        // present) general writeback path, so one scalar call per active C element is the whole cost.
+        // unfused `{ t = x·Wᵀ+b; act(t) }`. This is the scalar epilogue: the portable twin's
+        // (`sgemm_scalar`), and the reference the AVX2 writebacks (full-tile and masked edge-tile,
+        // both 256-bit since 2026-10) are pinned against lane for lane.
         match self.act {
             // Match vector MAXPS: either zero and NaN select the +0 bound.
             ACT_RELU => y = if y > 0.0 { y } else { 0.0 },
@@ -3504,10 +3505,11 @@ unsafe fn macro_kernel_packb(
     }
 }
 
-/// The `6×16` AVX2/FMA microkernel: 12 live `__m256` accumulators, 12 FMAs per K step. Computes the
-/// full 6×16 tile (packed panels are zero-padded), then writes back the valid `mr×nr` corner with
-/// the `beta` rule. `pf` is a software-prefetch walk issued one line per four-step K iteration
-/// ([`PfWalk`]; [`PfWalk::NONE`] for none) — a hint that never changes a result bit.
+/// The `6×16` AVX2/FMA microkernel: 12 live `__m256` accumulators, 12 FMAs per K step. Accumulates
+/// the tile's `mr` valid rows over all 16 columns (packed panels are zero-padded), then writes back
+/// the valid `mr×nr` corner with the `beta` rule — 256-bit throughout, masked at a column edge.
+/// `pf` is a software-prefetch walk issued one line per four-step K iteration ([`PfWalk`];
+/// [`PfWalk::NONE`] for none) — a hint that never changes a result bit.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -3554,31 +3556,20 @@ unsafe fn micro_6x16(
 
     let mut ap = ap;
     let mut bp = bp;
-    // One K-step: load the 16-wide B row (two 256-bit lanes), then for each of the 6 A rows
-    // load-broadcast it straight from the packed panel (`vbroadcastss [mem]`, 1 uop — frees the
-    // shuffle/ALU ports for the FMAs) and FMA into the two lanes. 12 FMAs, 12 live accumulators.
+    // One K-step over the listed rows: load the 16-wide B row (two 256-bit lanes), then for each
+    // listed A row load-broadcast it straight from the packed panel (`vbroadcastss [mem]`, 1 uop —
+    // frees the shuffle/ALU ports for the FMAs) and FMA into that row's two accumulators. The full
+    // tile lists all six rows: 12 FMAs, 12 live accumulators. The packed A panel keeps its `MR`
+    // stride whichever rows are listed.
     macro_rules! kstep {
-        () => {{
+        ($($r:tt => $lo:ident, $hi:ident);+) => {{
             let b0 = _mm256_loadu_ps(bp);
             let b1 = _mm256_loadu_ps(bp.add(8));
-            let a0 = _mm256_broadcast_ss(&*ap);
-            c0 = _mm256_fmadd_ps(a0, b0, c0);
-            c1 = _mm256_fmadd_ps(a0, b1, c1);
-            let a1 = _mm256_broadcast_ss(&*ap.add(1));
-            c2 = _mm256_fmadd_ps(a1, b0, c2);
-            c3 = _mm256_fmadd_ps(a1, b1, c3);
-            let a2 = _mm256_broadcast_ss(&*ap.add(2));
-            c4 = _mm256_fmadd_ps(a2, b0, c4);
-            c5 = _mm256_fmadd_ps(a2, b1, c5);
-            let a3 = _mm256_broadcast_ss(&*ap.add(3));
-            c6 = _mm256_fmadd_ps(a3, b0, c6);
-            c7 = _mm256_fmadd_ps(a3, b1, c7);
-            let a4 = _mm256_broadcast_ss(&*ap.add(4));
-            c8 = _mm256_fmadd_ps(a4, b0, c8);
-            c9 = _mm256_fmadd_ps(a4, b1, c9);
-            let a5 = _mm256_broadcast_ss(&*ap.add(5));
-            c10 = _mm256_fmadd_ps(a5, b0, c10);
-            c11 = _mm256_fmadd_ps(a5, b1, c11);
+            $(
+                let a = _mm256_broadcast_ss(&*ap.add($r));
+                $lo = _mm256_fmadd_ps(a, b0, $lo);
+                $hi = _mm256_fmadd_ps(a, b1, $hi);
+            )+
             ap = ap.add(MR);
             bp = bp.add(NR);
         }};
@@ -3600,35 +3591,57 @@ unsafe fn micro_6x16(
     // The `pf` walk rides the same cadence: at most one `PREFETCHT1` per four K steps, so a caller's
     // look-ahead (the next B micropanel's source, see `macro_kernel_packb`) trickles into L2 under
     // the FMAs instead of arriving as a burst. `NONE` costs one predictable compare per iteration.
-    let mut pf = pf;
-    let mut pf_line = 0usize;
-    let mut p = 0;
-    while p + 4 <= kc {
-        _mm_prefetch::<_MM_HINT_T0>(bp.wrapping_add(NR * 8) as *const i8);
-        if pf.rows != 0 {
-            _mm_prefetch::<_MM_HINT_T1>(pf.ptr.wrapping_add(pf_line * 16) as *const i8);
-            pf_line += 1;
-            if pf_line == pf.lines {
-                pf_line = 0;
-                pf.ptr = pf.ptr.wrapping_add(pf.row_stride);
-                pf.rows -= 1;
+    macro_rules! kloop {
+        ($($rows:tt)+) => {{
+            let mut pf = pf;
+            let mut pf_line = 0usize;
+            let mut p = 0;
+            while p + 4 <= kc {
+                _mm_prefetch::<_MM_HINT_T0>(bp.wrapping_add(NR * 8) as *const i8);
+                if pf.rows != 0 {
+                    _mm_prefetch::<_MM_HINT_T1>(pf.ptr.wrapping_add(pf_line * 16) as *const i8);
+                    pf_line += 1;
+                    if pf_line == pf.lines {
+                        pf_line = 0;
+                        pf.ptr = pf.ptr.wrapping_add(pf.row_stride);
+                        pf.rows -= 1;
+                    }
+                }
+                kstep!($($rows)+);
+                kstep!($($rows)+);
+                kstep!($($rows)+);
+                kstep!($($rows)+);
+                p += 4;
             }
-        }
-        kstep!();
-        kstep!();
-        kstep!();
-        kstep!();
-        p += 4;
+            while p < kc {
+                kstep!($($rows)+);
+                p += 1;
+            }
+        }};
     }
-    while p < kc {
-        kstep!();
-        p += 1;
+    // Row-trimmed K loops (P9.20): a tile with `mr < MR` valid rows accumulates only those rows.
+    // Until 2026-10 every edge tile ran all six — at m = 128 (21 full row panels + one 2-row panel
+    // per column panel) that is 4 of every 132 FMA rows computed and thrown away. Each listed row's
+    // accumulator sees exactly the products, in exactly the ascending-`p` order, that the full
+    // loop gives it (the rows never interact), so the valid rows are bit-identical either way; the
+    // unlisted accumulators stay zero and are never written back. With ≤ 4 rows the loop is bound
+    // by FMA latency (≤ 8 independent chains) rather than the two FMA ports, so the trimmed loop
+    // costs ~4 cycles per step against the full tile's ~6, not mr/6 of it.
+    match mr {
+        1 => kloop!(0 => c0, c1),
+        2 => kloop!(0 => c0, c1; 1 => c2, c3),
+        3 => kloop!(0 => c0, c1; 1 => c2, c3; 2 => c4, c5),
+        4 => kloop!(0 => c0, c1; 1 => c2, c3; 2 => c4, c5; 3 => c6, c7),
+        5 => kloop!(0 => c0, c1; 1 => c2, c3; 2 => c4, c5; 3 => c6, c7; 4 => c8, c9),
+        _ => kloop!(
+            0 => c0, c1; 1 => c2, c3; 2 => c4, c5; 3 => c6, c7; 4 => c8, c9; 5 => c10, c11
+        ),
     }
 
     // Fast path: a full 6×16 tile with no fused epilogue — store the 12 accumulators straight to C
-    // (two 256-bit stores per row) with the beta rule, skipping the tmp spill + 96-element scalar
-    // copy. The K loop dominates only at large K; at the small K of conv/attention (and the n=256
-    // GEMM) the writeback is a real fraction, so this is a measurable win there and free elsewhere.
+    // (two 256-bit stores per row) with the beta rule and no mask or row test. The K loop
+    // dominates only at large K; at the small K of conv/attention (and the n=256 GEMM) the
+    // writeback is a real fraction, so this is a measurable win there and free elsewhere.
     if epi.is_none() && mr == MR && nr == NR {
         macro_rules! wb {
             ($lo:expr, $hi:expr, $r:expr) => {{
@@ -3653,8 +3666,9 @@ unsafe fn micro_6x16(
 
     // Fused-epilogue fast path: a FULL 6×16 tile on the final K-block. Apply the beta rule, the per-
     // column bias (16 cols = two 256-bit lanes, broadcast identically across the 6 rows), and the
-    // activation — all 256-bit, instead of the 96-element scalar spill+writeback below. Bit-identical
-    // to that scalar epilogue, and `nt_epi_epilogue_is_bit_exact_on_non_finite_data` +
+    // activation — all 256-bit (the edge-tile writeback below is the masked form of this same
+    // sequence). Bit-identical to the scalar `Epilogue::apply`, and
+    // `nt_epi_epilogue_is_bit_exact_on_non_finite_data` +
     // `sgemm_nt_epi_matches_reference` now pin that rather than asserting it. The ReLU step needs
     // care, because the crate's invariant #2 says `_mm256_max_ps` is NOT `f32::max` in general:
     // `MAXPS` is `SRC1 > SRC2 ? SRC1 : SRC2`, so it returns SRC2 on a tie or a NaN. Here SRC2 is the
@@ -3721,34 +3735,116 @@ unsafe fn micro_6x16(
         }
     }
 
-    // General path (partial edge tiles + the fused epilogue): spill the tile, then write back the
-    // valid corner with the beta rule (and, on the final K-block, the fused bias+activation).
-    let mut tmp = [0.0f32; MR * NR];
-    _mm256_storeu_ps(tmp.as_mut_ptr(), c0);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(8), c1);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(16), c2);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(24), c3);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(32), c4);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(40), c5);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(48), c6);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(56), c7);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(64), c8);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(72), c9);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(80), c10);
-    _mm256_storeu_ps(tmp.as_mut_ptr().add(88), c11);
-    for r in 0..mr {
-        for j in 0..nr {
-            let cp = c.add(r * ldc + j);
-            let v = tmp[r * NR + j];
-            let acc = if beta == 0.0 { v } else { *cp + v };
-            // On the final K-block (epi present) fold bias + activation into this single store,
-            // so C is never read back for a separate epilogue pass. `j` is the tile-local column.
-            *cp = match epi {
-                Some(e) => e.apply(acc, j),
-                None => acc,
-            };
-        }
+    // Edge tiles — `mr < MR` rows or `nr < NR` columns, with or without the epilogue (P9.20). Until
+    // 2026-10 these spilled all twelve accumulators to a stack tile and wrote the valid corner
+    // back one element at a time — a scalar load, add, `Epilogue::apply` (with its per-element
+    // `match` on the activation) and store per C element — so every tile of a matrix whose M is
+    // not a multiple of 6 or whose N is not a multiple of 16, and EVERY fused-epilogue edge tile,
+    // ran a scalar writeback while the full tiles above ran 256-bit. Now each valid row takes the
+    // full-tile path's own vector sequence — beta add, α, bias, activation, in that order and with
+    // the same operand order — straight from the accumulator registers, and the column edge is a
+    // lane mask: `vmaskmovps` loads (C on the beta path, the bias) read nothing at or past column
+    // `nr`, and masked stores write nothing there, so no byte outside the `mr×nr` corner is touched
+    // (masked-out lanes cannot fault). A full 8-lane half keeps the plain load/store. Lane for
+    // lane this is the full-tile writeback, which `Epilogue::apply` and the scalar twin match
+    // (`relu_epilogue_vector_fold_matches_the_scalar_fold`, `sgemm_scalar_matches_avx2_bit_for_bit`).
+    let zero = _mm256_setzero_ps();
+    let lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let (full_lo, has_hi, full_hi) = (nr >= 8, nr > 8, nr == NR);
+    let mask_lo = _mm256_cmpgt_epi32(_mm256_set1_epi32(nr.min(8) as i32), lane);
+    let mask_hi = _mm256_cmpgt_epi32(_mm256_set1_epi32(nr.saturating_sub(8) as i32), lane);
+    macro_rules! ld {
+        ($p:expr, $full:expr, $mask:expr) => {
+            if $full {
+                _mm256_loadu_ps($p)
+            } else {
+                _mm256_maskload_ps($p, $mask)
+            }
+        };
     }
+    macro_rules! st {
+        ($p:expr, $full:expr, $mask:expr, $v:expr) => {
+            if $full {
+                _mm256_storeu_ps($p, $v)
+            } else {
+                _mm256_maskstore_ps($p, $mask, $v)
+            }
+        };
+    }
+    // The epilogue's per-tile constants, hoisted out of the rows exactly as the full-tile path
+    // hoists them. No bias lane at or past column `nr` is loaded (the hi half only when `nr > 8`).
+    let (has_bias, bias_lo, bias_hi, apply_alpha, alpha8, act) = match epi {
+        Some(e) => {
+            let has_bias = !e.bias.is_null();
+            let bias_lo = if has_bias {
+                ld!(e.bias, full_lo, mask_lo)
+            } else {
+                zero
+            };
+            let bias_hi = if has_bias && has_hi {
+                ld!(e.bias.add(8), full_hi, mask_hi)
+            } else {
+                zero
+            };
+            let alpha8 = _mm256_set1_ps(e.alpha);
+            (
+                has_bias,
+                bias_lo,
+                bias_hi,
+                e.alpha != 1.0,
+                alpha8,
+                Some(e.act),
+            )
+        }
+        None => (false, zero, zero, false, zero, None),
+    };
+    macro_rules! act8 {
+        ($v:expr) => {
+            match act {
+                Some(ACT_RELU) => _mm256_max_ps($v, zero),
+                Some(ACT_GELU) => crate::vmath::gelu8($v),
+                Some(ACT_SILU) => crate::vmath::silu8($v),
+                _ => $v,
+            }
+        };
+    }
+    // One 8-lane half of a C row: the beta rule, then the epilogue when present, then the store.
+    macro_rules! half {
+        ($p:expr, $acc:expr, $full:expr, $mask:expr, $bias:expr) => {{
+            let mut v = if beta == 0.0 {
+                $acc
+            } else {
+                _mm256_add_ps(ld!($p, $full, $mask), $acc)
+            };
+            if act.is_some() {
+                if apply_alpha {
+                    v = _mm256_mul_ps(v, alpha8);
+                }
+                if has_bias {
+                    v = _mm256_add_ps(v, $bias);
+                }
+                v = act8!(v);
+            }
+            st!($p, $full, $mask, v);
+        }};
+    }
+    macro_rules! wb_edge {
+        ($lo:expr, $hi:expr, $r:expr) => {{
+            if $r < mr {
+                let row = c.add($r * ldc);
+                half!(row, $lo, full_lo, mask_lo, bias_lo);
+                if has_hi {
+                    half!(row.add(8), $hi, full_hi, mask_hi, bias_hi);
+                }
+            }
+        }};
+    }
+    wb_edge!(c0, c1, 0);
+    wb_edge!(c2, c3, 1);
+    wb_edge!(c4, c5, 2);
+    wb_edge!(c6, c7, 3);
+    wb_edge!(c8, c9, 4);
+    wb_edge!(c10, c11, 5);
 }
 
 /// The **AVX-512 twin** of [`micro_6x16`]'s K-accumulation + plain (no-epilogue) full-tile writeback.
@@ -6490,7 +6586,8 @@ mod tests {
     /// The fused epilogue on non-finite data, over a 12x32 C so every tile is a FULL 6x16 and the
     /// 256-bit vector writeback (`_mm256_add_ps` for the bias, `_mm256_max_ps` for the ReLU) is what
     /// runs - the path no test could reach before, because the generator could not produce a
-    /// non-positive C, let alone a NaN.
+    /// non-positive C, let alone a NaN - and over a 13x37 C whose row, column and corner edge tiles
+    /// take the masked vector writeback (a 1-row tile, a 5-column `vmaskmovps` half, and both).
     ///
     /// Non-finite values live only in A and B, never in `bias`: both legs then compute the SAME
     /// accumulator bits (same kernel, same inputs), so any NaN reaching the epilogue comes from the
@@ -6500,7 +6597,12 @@ mod tests {
     /// this change's to touch.
     #[test]
     fn nt_epi_epilogue_is_bit_exact_on_non_finite_data() {
-        let (m, k, n) = (12usize, 5usize, 32usize);
+        for (m, k, n) in [(12usize, 5usize, 32usize), (13, 5, 37)] {
+            nt_epi_non_finite_case(m, k, n);
+        }
+    }
+
+    fn nt_epi_non_finite_case(m: usize, k: usize, n: usize) {
         let mut a = fill(301, m * k);
         let mut b = fill(302, n * k);
         a[0] = f32::NAN;
@@ -6565,9 +6667,9 @@ mod tests {
         }
     }
 
-    /// The vector epilogue's ReLU is `_mm256_max_ps(v, 0)` while the edge-tile and scalar-twin
-    /// epilogue is `f32::max(v, 0.0)`, and the crate's invariant #2 says those are NOT the same
-    /// function: `MAXPS` is `SRC1 > SRC2 ? SRC1 : SRC2`, so it returns SRC2 on a tie or a NaN, which
+    /// The vector epilogue's ReLU is `_mm256_max_ps(v, 0)` while the scalar-twin epilogue
+    /// (`Epilogue::apply`) is `v > 0 ? v : 0`, and the crate's invariant #2 says `MAXPS` is not
+    /// `f32::max` in general: it is `SRC1 > SRC2 ? SRC1 : SRC2`, returning SRC2 on a tie or a NaN, which
     /// is why `cumminmax.rs` writes its twin `(a > b) ? a : b` rather than `f32::max`. Against the
     /// one operand pair the GEMM actually uses - SRC2 = `+0.0` - they do coincide for every f32, and
     /// that is what the fused-vs-unfused law rests on, so it is pinned here over the hostile set
@@ -6578,10 +6680,10 @@ mod tests {
     /// never `-0.0`, and `nt_epi` fixes `alpha = 1`. It is checked anyway.)
     ///
     /// Two parts, because the law alone is not the pin. Part (1) pins the LAW over the hostile set.
-    /// Part (2) pins the CALL SITE by driving [`micro_6x16`] itself - a full `MR x NR` tile through
-    /// the 256-bit `wbe!`/`act8!` writeback against the same packed panels at `mr = MR - 1`, which
-    /// takes the general spill path and ends in [`Epilogue::apply`]. Until 2026-09-13 only part (1)
-    /// existed, and it constructs its own intrinsic call, so an operand-order flip inside `act8!`
+    /// Part (2) pins the CALL SITES by driving [`micro_6x16`] itself - the full-tile `wbe!` and the
+    /// masked edge-tile writeback - against [`Epilogue::apply`] on the kernel's own accumulator
+    /// bits. Until 2026-09-13 only part (1) existed, and it constructs its own intrinsic call, so
+    /// an operand-order flip inside `act8!`
     /// (`_mm256_max_ps(zero, v)`, which returns every NaN unchanged) left this test - the one the
     /// production comment names as the pin - green.
     #[test]
@@ -6632,14 +6734,19 @@ mod tests {
             );
         }
 
-        // (2) The PRODUCTION call site, which part (1) cannot see. Part (1) builds its OWN
-        // `_mm256_max_ps`, so flipping the operand order in `micro_6x16`'s `act8!` macro to
+        // (2) The PRODUCTION call sites, which part (1) cannot see. Part (1) builds its OWN
+        // `_mm256_max_ps`, so flipping the operand order in `micro_6x16`'s `act8!` macros to
         // `_mm256_max_ps(_mm256_setzero_ps(), $v)` leaves it green while every NaN rides through the
-        // real fused epilogue as a NaN. So drive the kernel instead: one FULL 6x16 tile takes the
-        // 256-bit `wbe!` writeback, and the SAME packed panels with `mr = MR - 1` take the general
-        // spill path that ends in `Epilogue::apply` - the scalar fold. `kstep!` is unconditional
-        // over all six rows and `mr` gates only the writeback, so rows `0..MR-1` hold bit-identical
-        // accumulators in the two calls and the two outputs may not differ by one bit.
+        // real fused epilogue as a NaN. So drive the kernel instead. `c_raw` holds the accumulators
+        // themselves (no epilogue, beta = 0, a full tile: the plain vector store). Then every
+        // writeback the kernel has must equal `Epilogue::apply` - the scalar fold - applied to those
+        // accumulator bits: the full-tile 256-bit `wbe!` (mr = MR, nr = NR) and the masked edge-tile
+        // writeback on a row edge (mr = MR - 1), a column edge that masks the hi half (nr = NR - 3)
+        // and a corner that masks the lo half and skips hi (mr = 2, nr = 5). Since 2026-10 the edge
+        // tiles are 256-bit as well, so `apply` is computed here explicitly rather than taken from an
+        // edge-tile call. A sentinel C pins that the masked stores write nothing outside the
+        // `mr x nr` corner. Row-trimmed K loops leave each valid row's accumulator bit-identical to
+        // the full tile's, which `c_raw` relies on.
         //
         // `kc` steps of `a = 1.0` against a B panel that is zero except on the LAST step put the
         // hostile value itself into lane `j`'s accumulator (`fma(1, 0, acc) = acc`, then
@@ -6667,11 +6774,30 @@ mod tests {
             3.5,
             -3.5,
         ];
+        const SENTINEL: u32 = 0x7FBA_D0D0; // a signalling-NaN pattern no writeback can produce
         let bias = fill(97, NR);
-        for kc in [1usize, 3] {
+        for kc in [1usize, 3, 9] {
             let ap = vec![1.0f32; MR * kc];
             let mut bp = vec![0.0f32; NR * kc];
             bp[NR * (kc - 1)..].copy_from_slice(&hostile);
+            let mut c_raw = vec![0.0f32; MR * NR];
+            // SAFETY: avx2+fma feature-detected above; `ap`/`bp` hold the MR-per-step and NR-per-step
+            // packed panels the kernel's contract requires for `kc` steps, and `ldc = NR` matches
+            // the MR*NR C buffer.
+            unsafe {
+                micro_6x16(
+                    kc,
+                    ap.as_ptr(),
+                    bp.as_ptr(),
+                    c_raw.as_mut_ptr(),
+                    NR,
+                    0.0,
+                    MR,
+                    NR,
+                    None,
+                    PfWalk::NONE,
+                );
+            }
             for use_bias in [false, true] {
                 for &act in &[ACT_IDENTITY, ACT_RELU] {
                     let e = Epilogue {
@@ -6683,52 +6809,44 @@ mod tests {
                         act,
                         alpha: 1.0,
                     };
-                    let mut c_vec = vec![0.0f32; MR * NR];
-                    let mut c_sca = vec![0.0f32; MR * NR];
-                    // SAFETY: avx2+fma feature-detected above; `ap`/`bp` hold the MR-per-step and
-                    // NR-per-step packed panels the kernel's contract requires for `kc` steps, and
-                    // `ldc = NR` matches both MR*NR C buffers. `bias`, when non-null, is NR long.
-                    unsafe {
-                        micro_6x16(
-                            kc,
-                            ap.as_ptr(),
-                            bp.as_ptr(),
-                            c_vec.as_mut_ptr(),
-                            NR,
-                            0.0,
-                            MR,
-                            NR,
-                            Some(e),
-                            PfWalk::NONE,
-                        );
-                        micro_6x16(
-                            kc,
-                            ap.as_ptr(),
-                            bp.as_ptr(),
-                            c_sca.as_mut_ptr(),
-                            NR,
-                            0.0,
-                            MR - 1,
-                            NR,
-                            Some(e),
-                            PfWalk::NONE,
-                        );
-                    }
-                    for r in 0..MR - 1 {
-                        for (j, &lane) in hostile.iter().enumerate() {
-                            let idx = r * NR + j;
-                            assert_eq!(
-                                c_vec[idx].to_bits(),
-                                c_sca[idx].to_bits(),
-                                "micro_6x16 vector epilogue != scalar epilogue (kc{kc} act{act} \
-                                 bias{use_bias}) row {r} col {j}: vector {} ({:08x}) vs scalar \
-                                 {} ({:08x}), accumulator lane {}",
-                                c_vec[idx],
-                                c_vec[idx].to_bits(),
-                                c_sca[idx],
-                                c_sca[idx].to_bits(),
-                                lane
+                    for &(mr, nr) in &[(MR, NR), (MR - 1, NR), (MR, NR - 3), (2, 5)] {
+                        let mut c = vec![f32::from_bits(SENTINEL); MR * NR];
+                        // SAFETY: as above; `bias`, when non-null, is NR long.
+                        unsafe {
+                            micro_6x16(
+                                kc,
+                                ap.as_ptr(),
+                                bp.as_ptr(),
+                                c.as_mut_ptr(),
+                                NR,
+                                0.0,
+                                mr,
+                                nr,
+                                Some(e),
+                                PfWalk::NONE,
                             );
+                        }
+                        for r in 0..MR {
+                            for j in 0..NR {
+                                let idx = r * NR + j;
+                                let want = if r < mr && j < nr {
+                                    // SAFETY: `j < NR` indexes the NR-long bias when non-null.
+                                    unsafe { e.apply(c_raw[idx], j) }.to_bits()
+                                } else {
+                                    SENTINEL
+                                };
+                                assert_eq!(
+                                    c[idx].to_bits(),
+                                    want,
+                                    "micro_6x16 writeback (mr{mr} nr{nr} kc{kc} act{act} \
+                                     bias{use_bias}) row {r} col {j}: got {} ({:08x}), want \
+                                     {want:08x}; accumulator {} from hostile lane {}",
+                                    c[idx],
+                                    c[idx].to_bits(),
+                                    c_raw[idx],
+                                    hostile[j]
+                                );
+                            }
                         }
                     }
                 }
