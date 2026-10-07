@@ -98,6 +98,33 @@ the runtime kernels the compiler's own recognizers emit, and a user function of 
 hijack kernel dispatch silently. The restriction applies to function names only — a `let`, `const`,
 `struct` or `enum` may still be named `wukong_*`.
 
+### Function-typed parameters ✅
+
+A parameter may have a **function type**, `fn(A, B) -> R` (`fn(A)` for `()`), and every call binds it
+to a function **named at compile time** — a non-generic top-level function, or the caller's own
+function-typed parameter passed along:
+
+```wukong
+fn square(x: f32) -> f32 { return x * x; }
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 { return f(x); }
+fn twice(f: fn(f32) -> f32, x: f32) -> f32 { return apply(f, apply(f, x)); }
+
+fn main() -> i32 {
+    print(twice(square, 3.0));             // 81
+    return 0;
+}
+```
+
+There are no function pointers at run time: the callee is **specialized per bound function** exactly
+like a type-generic function is per type (`apply$square`), the function parameter carries no value,
+and a call through it is a direct call — inlinable, and visible to every kernel recognizer. A
+type-generic higher-order function binds its type parameters from the function argument too
+(`fn fold3<T>(op: fn(T, T) -> T, a: T, b: T, c: T) -> T`). The rules (`E0411` otherwise): a function
+type is only a parameter's type (not a local, field, element, return type or `extern` parameter); a
+function cannot be bound to a `let` or passed to a non-function parameter; the argument must name a
+function, not compute one; and a function-typed parameter is neither `mut` nor named after a builtin
+(`gelu`, `print`, …). A wrong signature is the ordinary `E0401` type mismatch. `tests/run/fn_params.wk`.
+
 ## Bindings ✅
 
 ```wukong
@@ -318,6 +345,63 @@ no aggregate ever rides in a register and the two backends agree (`tests/run/{st
 Because a by-reference parameter aliases the caller's storage, mutating an aggregate parameter
 requires `mut` on it (see *Functions* above) — a non-`mut` aggregate parameter is effectively
 read-only, and a `mut` one is the in-place output buffer a kernel writes.
+
+## Methods and `impl` blocks ✅
+
+```wukong
+struct Vec2 { x: f32, y: f32 }
+
+impl Vec2 {
+    fn new(x: f32, y: f32) -> Self { return Self { x: x, y: y }; }   // associated function
+    fn dot(self, o: Vec2) -> f32 { return self.x * o.x + self.y * o.y; }
+    fn scale(&mut self, k: f32) { self.x = self.x * k; self.y = self.y * k; }
+}
+
+fn main() -> i32 {
+    let mut v = Vec2::new(3.0, 4.0);
+    v.scale(2.0);                          // mutates `v` in place
+    print(v.dot(v));                       // 100
+    return 0;
+}
+```
+
+An `impl` block adds functions to a struct or an enum. A function whose first parameter is the
+receiver is a **method**, called `x.m(..)`; one without is an **associated function**, called
+`Type::m(..)`. Inside the block `Self` names the type. Receivers follow the parameter rules above —
+an aggregate is passed by reference, so `self` and `&self` read the caller's value and `mut self` /
+`&mut self` may write it in place — and a receiver reached through a reference or pointer
+(`p.dot(q)` with `p: &Vec2`) is dereferenced automatically. Dispatch is **static**: each method is
+the ordinary function `Type.method`, and `x.m(a)` is exactly the call `Type.m(x, a)`, so methods
+inline, specialize and alias-check like any call. A misspelled method, an associated function called
+with method syntax, or an `impl` of something that is not a struct or enum is `E0315`.
+`tests/run/methods_impl.wk`.
+
+## Traits ✅
+
+```wukong
+trait Shape {
+    fn area(self) -> f32;
+    fn unit() -> Self;
+}
+
+impl Shape for Rect {
+    fn area(self) -> f32 { return self.w * self.h; }
+    fn unit() -> Self { return Rect { w: 1.0, h: 1.0 }; }
+}
+
+fn total<T: Shape>(a: T, b: T) -> f32 { return a.area() + b.area(); }   // or `where T: Shape`
+```
+
+A trait is a set of method signatures (`Self` is the implementing type). `impl Trait for Type` must
+define exactly those methods with exactly those signatures — a missing, extra or mismatched method is
+`E0410`, and so is a default method body, which traits do not have. A type parameter bounded by
+traits (`<T: Shape + Named>`, or a `where` clause) may call their methods on its values (`a.area()`)
+and their associated functions on itself (`T::unit()`, when `T` is the type of a parameter). Dispatch
+is **static, by monomorphization**: each call instantiates `total` at a concrete type and the
+instance calls that type's `impl` directly — no vtable, no indirect call — so a call at a type with
+no `impl Shape` is rejected at the call (`E0410`). Not supported yet: generic traits or trait
+methods, default methods, two traits on one type that define the same method name (both are the
+function `Type.method`), and generic structs/enums (`Buf<T>`). `tests/run/traits_static_dispatch.wk`.
 
 ## Enums ✅
 

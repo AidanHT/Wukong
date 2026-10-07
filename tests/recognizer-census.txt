@@ -122,6 +122,7 @@ float_const_fold.wk:
 float_literal_suffix.wk:
 float_underscore.wk:
 fmax_int.wk:
+fn_params.wk:
 for_array.wk:
 for_continue.wk:
 for_each_array_of_slices.wk: wukong_rt_alloc wukong_rt_alloc*3 wukong_velem_f32
@@ -246,6 +247,7 @@ matmul_fn_declined_shape.wk:
 matmul_memacc.wk: wukong_sgemm wukong_sgemm_nt
 matmul_tn.wk: wukong_sgemm_tn wukong_sgemm_tn*2
 maxpool.wk: wukong_maxpool2d_f32
+methods_impl.wk:
 mish.wk: wukong_vmath_f32
 mixed_sign_compare_highbit.wk:
 mixed_sign_compare_ok.wk:
@@ -355,6 +357,7 @@ tensor_matmul.wk: wukong_sgemm
 tensor_param_surfaces.wk: wukong_sreduce_f32_parallel wukong_sreduce_f32_parallel*2
 tensor_whole_assign.wk:
 top_level_const.wk:
+traits_static_dispatch.wk:
 transcendental.wk:
 transcendental_kernel.wk: wukong_vmath_f32
 transcendental_sweep.wk: wukong_vmath_f32 wukong_vmath_f32*3 wukong_vmath_f32_parallel wukong_vmath_f32_parallel*2

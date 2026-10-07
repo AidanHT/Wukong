@@ -5,6 +5,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Methods, traits and function-typed parameters
+
+- **Added: `impl` blocks** — methods and associated functions on structs and enums, `Self`, the four
+  receiver forms, auto-deref through a reference; each method is the function `Type.method`.
+- **Added: traits with static dispatch** — `trait`, `impl Trait for Type` (conformance checked),
+  bounds `<T: Trait>` and `where` clauses (previously parsed and dropped), resolved per
+  monomorphized instance. New codes `E0315` (unresolved method / trait / impl target) and `E0410`
+  (trait implementation or bound not satisfied).
+- **Added: function-typed parameters** `fn(A) -> R`, bound to a named function at each call and
+  specialized per function (no function pointers). New code `E0411`.
+
 ### Named kernel builtins and an `sdpa` shape signature
 
 - **Added: shape-checked kernel builtins callable by name** — `matmul`, `matmul_nt`, `matmul_tn`,

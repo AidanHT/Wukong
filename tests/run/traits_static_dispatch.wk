@@ -1,0 +1,118 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 10
+// EXPECT-OUT: 11
+// EXPECT-OUT: 24
+// EXPECT-OUT: 4
+// EXPECT-OUT: 33
+// EXPECT-OUT: 44
+// EXPECT-OUT: 14
+module tests.run.traits_static_dispatch
+
+// Traits with static dispatch. A generic function bounded by a trait (`<T: Shape>`, or the
+// equivalent `where S: Shape`) calls the trait methods on its type parameter; each call site
+// instantiates it at a concrete type, and the instance calls that type's `impl` directly — no
+// vtable, no indirect call. A receiver-less trait function returning `Self` is reached as
+// `T::unit()`. Expectations by hand:
+//   Rect 2x3 + Rect 1x4: 6 + 4 = 10;  Tri b4 h3 + Tri b2 h5: 6 + 5 = 11
+//   grow_and_measure(r, 2): r grows in place to 4x6 (an aggregate `mut` parameter is passed by
+//   reference, so the caller's `r` changes) -> area 24, and r.w is then 4
+//   corners: sides*10 + sides -> Tri 33, Rect 44
+//   unit_like(r): Rect::unit().weight() + r.weight() = 7 + 7 = 14
+
+trait Shape {
+    fn area(self) -> f32;
+    fn sides(self) -> i32;
+    fn grow(mut self, k: f32);
+}
+
+trait Unit {
+    fn unit() -> Self;
+    fn weight(self) -> i32;
+}
+
+struct Rect {
+    w: f32,
+    h: f32,
+}
+
+struct Tri {
+    b: f32,
+    h: f32,
+}
+
+impl Shape for Rect {
+    fn area(self) -> f32 {
+        return self.w * self.h;
+    }
+
+    fn sides(self) -> i32 {
+        return 4;
+    }
+
+    fn grow(mut self, k: f32) {
+        self.w = self.w * k;
+        self.h = self.h * k;
+    }
+}
+
+impl Shape for Tri {
+    fn area(self) -> f32 {
+        return 0.5 * self.b * self.h;
+    }
+
+    fn sides(self) -> i32 {
+        return 3;
+    }
+
+    fn grow(mut self, k: f32) {
+        self.b = self.b * k;
+        self.h = self.h * k;
+    }
+}
+
+impl Unit for Rect {
+    fn unit() -> Self {
+        return Rect { w: 1.0, h: 1.0 };
+    }
+
+    fn weight(self) -> i32 {
+        return 7;
+    }
+}
+
+fn total_area<T: Shape>(a: T, b: T) -> f32 {
+    return a.area() + b.area();
+}
+
+fn grow_and_measure<S>(mut s: S, k: f32) -> f32
+where
+    S: Shape,
+{
+    s.grow(k);
+    return s.area();
+}
+
+fn corners<T: Shape>(x: T) -> i32 {
+    return x.sides() * 10 + x.sides();
+}
+
+fn unit_like<T: Unit>(probe: T) -> i32 {
+    let u = T::unit();
+    return u.weight() + probe.weight();
+}
+
+fn main() -> i32 {
+    let r = Rect { w: 2.0, h: 3.0 };
+    let r2 = Rect { w: 1.0, h: 4.0 };
+    print(total_area(r, r2));
+    let t = Tri { b: 4.0, h: 3.0 };
+    let t2 = Tri { b: 2.0, h: 5.0 };
+    print(total_area(t, t2));
+    print(grow_and_measure(r, 2.0));
+    print(r.w);
+    print(corners(t));
+    print(corners(r));
+    print(unit_like(r));
+    return 0;
+}

@@ -43,6 +43,14 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   overlaps an input computes through scratch (value semantics), and an empty contraction is the zero
   matrix (`tests/run/builtin_*.wk`, `tests/run/sdpa_blocks.wk`). `sdpa` gained its shape signature
   here; it used to be checked only at lowering, as `C0001`. See the guide's "Kernel builtins".
+- **Methods, traits and function-typed parameters — all static dispatch.** `impl Type { .. }`
+  methods (`x.m(a)`, `Type::m(a)`, `self`/`&self`/`&mut self`/`mut self`, `Self`, auto-deref through a
+  reference) lower to the plain function `Type.method`; `trait` + `impl Trait for Type` are checked
+  for conformance (`E0410`), and a bounded type parameter (`<T: Shape>` / `where T: Shape`) calls
+  trait methods through monomorphization; a `fn(A) -> R` parameter is specialized per bound
+  function (`apply$square`), so no function pointer exists at run time (`E0411` outside a parameter).
+  Calls such a specialization makes are invisible to the alias analysis, so every function they can
+  reach forgoes disjointness-requiring kernels (`tests/run/{methods_impl,traits_static_dispatch,fn_params}.wk`).
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger

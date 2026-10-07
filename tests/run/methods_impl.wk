@@ -1,0 +1,125 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 25
+// EXPECT-OUT: -5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 2
+// EXPECT-OUT: 2
+// EXPECT-OUT: 1
+// EXPECT-OUT: 5
+// EXPECT-OUT: 2
+// EXPECT-OUT: 0
+// EXPECT-OUT: 15
+// EXPECT-OUT: 500
+module tests.run.methods_impl
+
+// `impl` blocks: associated functions (`Vec2::new`), methods (`a.dot(b)`), the receiver forms
+// `self` / `&self` / `&mut self` / `mut self`, `Self` inside the block, methods on a C-style enum,
+// a method chain on an enum value, and a method called through a reference (the receiver
+// auto-dereferences). Dispatch is static: each method is the function `Type.method`, and every call
+// below lowers to a direct call of it on both backends. Expectations by hand:
+//   a = (3, 4): a.len2() = 9 + 16 = 25;  b = (1, -2): a.dot(b) = 3 - 8 = -5
+//   c = a.add(b) = (4, 2); c.scale(0.5) mutates c in place (an aggregate receiver is passed by
+//   reference, and `&mut self` opts into the caller-visible write) -> (2, 1); |c|^2 through a
+//   reference = 4 + 1 = 5
+//   North.turn().turn() = South -> code 2;  West.turn() = North -> code 0
+//   acc.push(3), push(4), push(8): total 15, mean*100 = 1500 / 3 = 500
+
+struct Vec2 {
+    x: f32,
+    y: f32,
+}
+
+impl Vec2 {
+    fn new(x: f32, y: f32) -> Self {
+        return Self { x: x, y: y };
+    }
+
+    fn dot(self, o: Vec2) -> f32 {
+        return self.x * o.x + self.y * o.y;
+    }
+
+    fn len2(&self) -> f32 {
+        return self.dot(self);
+    }
+
+    fn scale(&mut self, k: f32) {
+        self.x = self.x * k;
+        self.y = self.y * k;
+    }
+
+    fn add(self, o: Self) -> Self {
+        return Vec2::new(self.x + o.x, self.y + o.y);
+    }
+}
+
+enum Dir {
+    North,
+    East,
+    South,
+    West,
+}
+
+impl Dir {
+    fn turn(self) -> Dir {
+        return match self {
+            Dir::North => Dir::East,
+            Dir::East => Dir::South,
+            Dir::South => Dir::West,
+            Dir::West => Dir::North,
+        };
+    }
+
+    fn code(self) -> i32 {
+        return match self {
+            Dir::North => 0,
+            Dir::East => 1,
+            Dir::South => 2,
+            Dir::West => 3,
+        };
+    }
+}
+
+struct Acc {
+    total: i32,
+    count: i32,
+}
+
+impl Acc {
+    fn push(mut self, v: i32) {
+        self.total = self.total + v;
+        self.count = self.count + 1;
+    }
+
+    fn mean_x100(self) -> i32 {
+        return self.total * 100 / self.count;
+    }
+}
+
+fn len2_through_ref(p: &Vec2) -> f32 {
+    return p.len2();
+}
+
+fn main() -> i32 {
+    let a = Vec2::new(3.0, 4.0);
+    print(a.len2());
+    let b = Vec2::new(1.0, -2.0);
+    print(a.dot(b));
+    let mut c = a.add(b);
+    print(c.x);
+    print(c.y);
+    c.scale(0.5);
+    print(c.x);
+    print(c.y);
+    print(len2_through_ref(&c));
+    let d = Dir::North.turn().turn();
+    print(d.code());
+    print(Dir::West.turn().code());
+    let mut acc = Acc { total: 0, count: 0 };
+    acc.push(3);
+    acc.push(4);
+    acc.push(8);
+    print(acc.total);
+    print(acc.mean_x100());
+    return 0;
+}
