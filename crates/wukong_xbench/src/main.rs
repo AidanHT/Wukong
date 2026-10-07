@@ -54,6 +54,7 @@ use wukong_span::{Interner, SourceId};
 #[macro_use]
 mod numerics;
 mod compare;
+mod dispersion;
 mod general;
 mod model;
 mod sota;
@@ -265,6 +266,15 @@ fn build_c_cpp(
     let cl = build_peer("c", c_src, dir, label, cc, args);
     let pl = build_peer("cpp", &cpp_from_c(c_src), dir, label, cxx(), args);
     (cl, pl)
+}
+
+/// Build the `C(twin)` control for a main-suite section: the IDENTICAL C source, through the
+/// IDENTICAL compiler at the IDENTICAL flags, written to a second DLL (`<label>_twin`). Its true
+/// ratio against `C` is exactly 1.00, so whatever the rotation reads away from 1.00 is the run's own
+/// single-thread resolution for that section - see `dispersion::twin_control`, which prints it and
+/// qualifies every single-threaded standing inside it (P6.3). Build ONLY, like [`build_c_cpp`].
+fn build_c_twin(label: &str, c_src: &str, dir: &Path, cc: &str, args: &[&str]) -> Option<PeerLib> {
+    build_peer("c", c_src, dir, &format!("{label}_twin"), cc, args)
 }
 
 /// Integer outputs must agree exactly before a C++ column is reported.
@@ -629,6 +639,9 @@ fn main() {
     // revision, but nothing recorded WHICH gcc/g++/rustc produced the peer columns - and Finding 01
     // turned entirely on re-reading a log header long after the run.
     println!("{}", toolchain_banner(&cc));
+    // Which statistic every `ns_per_call` below is (P6.10): the minimum unless overridden, so a log
+    // taken under `XBENCH_ESTIMATOR=last` can never be read as a best-of-N log.
+    println!("timing estimator: {}", dispersion::estimator().label());
     println!("scratch: {}", dir.display());
     println!();
 
@@ -697,6 +710,11 @@ fn main() {
         // lowered twice: what the pattern matcher dispatches, and what the compiler compiles. Both
         // are built before anything is timed and both sit in the one position-balanced rotation with
         // every peer - see [`bench_table_kernel`].
+        //
+        // The heading opens FIRST, before anything is built or timed, so the row's own build
+        // diagnostics, dispatch census, dispersion line and C(twin) control land under it - and
+        // the C(twin) floor is recorded in this row's numerics scope, not the previous row's.
+        section!("=== {} ({}) ===", k.name, k.note);
         let TableRow {
             wukong,
             wukgen,
@@ -709,8 +727,6 @@ fn main() {
             comp,
             vml,
         } = bench_table_kernel(k, &cc, &dir, &mut out, xp, yp);
-
-        section!("=== {} ({}) ===", k.name, k.note);
         report(k, &wukong, &c, &cpp, &rust, &cfast, &comp);
         // oneMKL VML peer for the transcendentals MKL ships a vector op for: the elementwise analogue
         // of the GEMM-vs-cblas comparison. Wukong's hand-AVX2 vmath vs Intel's hand-tuned VML, both
@@ -1117,6 +1133,13 @@ fn bench_table_kernel(
         cc,
         &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
     );
+    let tl = build_c_twin(
+        k.name,
+        &k.c,
+        dir,
+        cc,
+        &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+    );
     let rl = build_peer(
         "rs",
         &k.rust,
@@ -1160,6 +1183,7 @@ fn bench_table_kernel(
         Built::wk(wk),
         Built::wk(wk_gen),
         Built::peer(cl),
+        Built::peer(tl),
         Built::peer(pl),
         Built::peer(rl),
         Built::peer(fl),
@@ -1194,6 +1218,9 @@ fn bench_table_kernel(
     let wukong = timed.next().flatten();
     let wukgen = timed.next().flatten();
     let c = timed.next().flatten();
+    let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
+                                // The caller opened this row's section before building it, so the floor lands in its scope.
+    dispersion::twin_control(2, 3);
     let cpp = cpp_checked(k.name, &c, timed.next().flatten());
     let rust = timed.next().flatten();
     let cfast = timed.next().flatten().filter(|p| {
@@ -1307,6 +1334,13 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
         );
+        let tl = build_c_twin(
+            "linear_rect",
+            &c_linear_rect(m, k, n),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+        );
         let fl = build_peer(
             "c",
             &c_linear_rect(m, k, n),
@@ -1333,6 +1367,7 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
             Built::wk(wk1),
             Built::wk(wkp),
             Built::peer(cl),
+            Built::peer(tl),
             Built::peer(pl),
             Built::peer(fl),
             Built::peer(rl),
@@ -1352,6 +1387,7 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
         let wuk = timed.next().flatten();
         let wk_par = timed.next().flatten();
         let cm = timed.next().flatten();
+        let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
         let cm_cpp = cpp_checked("linear_rect", &cm, timed.next().flatten());
         let cfast = timed.next().flatten().filter(|p| {
             wuk.as_ref()
@@ -1384,6 +1420,7 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
             gflops(&cfast),
             gflops(&rm),
         );
+        dispersion::twin_control(2, 3);
         if roof > 0.0 {
             if let Some(w) = &wuk {
                 standing!(
@@ -1459,8 +1496,15 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     let wk1 = build_wukong(&wk_matmul(ns, false), 3);
     let wkp = build_wukong(&wk_matmul(ns, true), 3);
     let run_naive = ns < 2048 || std::env::var("XBENCH_NAIVE_HUGE").is_ok();
-    let (cl, pl, fl, rl) = if run_naive {
+    let (cl, pl, fl, rl, tl) = if run_naive {
         let (cl, pl) = build_c_cpp(
+            "matmul",
+            &c_matmul(ns),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+        );
+        let tl = build_c_twin(
             "matmul",
             &c_matmul(ns),
             dir,
@@ -1480,9 +1524,9 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
                 "--crate-type=cdylib",
             ],
         );
-        (cl, pl, fl, rl)
+        (cl, pl, fl, rl, tl)
     } else {
-        (None, None, None, None)
+        (None, None, None, None, None)
     };
     let ol = if run_naive {
         omp_threads(cc, dir)
@@ -1496,6 +1540,7 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
         Built::wk(wk1),
         Built::wk(wkp),
         Built::peer(cl),
+        Built::peer(tl),
         Built::peer(pl),
         Built::peer(fl),
         Built::peer(rl),
@@ -1514,6 +1559,7 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     let wuk = timed.next().flatten();
     let wk_par = timed.next().flatten();
     let cm = timed.next().flatten();
+    let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
     let cm_cpp = cpp_checked("matmul", &cm, timed.next().flatten());
     let cfast = timed.next().flatten().filter(|p| {
         wuk.as_ref()
@@ -1558,6 +1604,7 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
         gflops(&comp),
         gflops(&rm)
     );
+    dispersion::twin_control(2, 3);
     report_gemm_standing(&wuk, &tuned, roof, flops);
     report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
     if !run_naive {
@@ -1693,6 +1740,13 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
         );
+        let tl = build_c_twin(
+            "matmul_tn",
+            &c_matmul_tn(ns),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+        );
         // Reassociation-normalized peer: -ffast-math may vectorize the column-strided reduction.
         let fl = build_peer(
             "c",
@@ -1724,6 +1778,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
             Built::wk(wk1),
             Built::wk(wkp),
             Built::peer(cl),
+            Built::peer(tl),
             Built::peer(pl),
             Built::peer(fl),
             Built::Direct(Box::new(move |o: &mut [f32]| {
@@ -1743,6 +1798,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
         let wuk = timed.next().flatten();
         let wk_par = timed.next().flatten();
         let cm = timed.next().flatten();
+        let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
         let cm_cpp = cpp_checked("matmul_tn", &cm, timed.next().flatten());
         let cfast = timed.next().flatten().filter(|p| {
             wuk.as_ref()
@@ -1783,6 +1839,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
             gflops(&mkl_all),
             gflops(&rm)
         );
+        dispersion::twin_control(2, 3);
         // Absolute GFLOP/s on this laptop swings ~3x with the power state, so the number above is
         // only comparable within a run. The clock-invariant denominator is the roofline measured by
         // the SAME process (`measure_fma_roofline`) — print the percentage next to the table, as
@@ -2291,6 +2348,13 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
         );
+        let tl = build_c_twin(
+            "linear",
+            &c_linear(ns),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+        );
         let fl = build_peer("c", &c_linear(ns), dir, "linear_fast", cc, C_FAST_FLAGS);
         let rl = build_peer(
             "rs",
@@ -2320,6 +2384,7 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
             Built::wk(wk1),
             Built::wk(wkp),
             Built::peer(cl),
+            Built::peer(tl),
             Built::peer(pl),
             Built::peer(fl),
             Built::peer(rl),
@@ -2337,6 +2402,7 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
         let wuk = timed.next().flatten();
         let wk_par = timed.next().flatten();
         let cm = timed.next().flatten();
+        let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
         let cm_cpp = cpp_checked("linear", &cm, timed.next().flatten());
         let cfast = timed.next().flatten().filter(|p| {
             wuk.as_ref()
@@ -2381,6 +2447,7 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
             gflops(&comp),
             gflops(&rm)
         );
+        dispersion::twin_control(2, 3);
         report_gemm_standing(&wuk, &tuned, roof, flops);
         report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
         if let (Some(mp), Some(c)) = (&wk_par, &cm) {
@@ -2956,6 +3023,13 @@ fn bench_transpose(cc: &str, dir: &Path) {
             cc,
             &["-O3", "-march=native", "-shared"],
         );
+        let tl = build_c_twin(
+            "transpose",
+            &c_transpose(rows, cols),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-shared"],
+        );
         // Multithreaded C peer: rows across cores (a permutation — no reduction, plain -fopenmp).
         let ol = omp_threads(cc, dir).and_then(|_| {
             build_peer(
@@ -2991,6 +3065,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
             Built::wk(wk1),
             Built::wk(wkp),
             Built::peer(cl),
+            Built::peer(tl),
             Built::peer(pl),
             Built::Direct(Box::new(move |d: &mut [f32]| {
                 bench_transpose_mkl(rows, cols, 1, srcr, d)
@@ -3011,6 +3086,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
         let wuk = timed.next().flatten();
         let wk_par = timed.next().flatten();
         let cm = timed.next().flatten();
+        let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
         let cm_cpp = cpp_checked("transpose", &cm, timed.next().flatten());
         // A transposition is a permutation: the MKL columns are held to BIT equality with Wukong,
         // the same bar the C and Rust columns already carry, and dropped on any disagreement.
@@ -3045,6 +3121,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
             gbps(&comp),
             gbps(&rm)
         );
+        dispersion::twin_control(2, 3);
         // Transpose is a permutation — exact, so the full-buffer cross-check is bit equality.
         // BOTH peers are checked: a peer whose spelling changed (blocked, sliced) could in principle
         // get "faster" by not doing the work, and an unchecked column would never say so. This is
@@ -3264,6 +3341,13 @@ fn bench_colsum(cc: &str, dir: &Path) {
             cc,
             &["-O3", "-march=native", "-shared"],
         );
+        let tl = build_c_twin(
+            "colsum",
+            &c_colsum(m, n),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-shared"],
+        );
         // Reassociation-normalized peer: -ffast-math lets gcc reassociate the strided column fold.
         let fl = build_peer("c", &c_colsum(m, n), dir, "colsum_fast", cc, C_FAST_FLAGS);
         // Multithreaded C peer: columns across cores (+ -ffast-math, the reduction-row rule).
@@ -3293,6 +3377,7 @@ fn bench_colsum(cc: &str, dir: &Path) {
             Built::wk(wk1),
             Built::wk(wkp),
             Built::peer(cl),
+            Built::peer(tl),
             Built::peer(pl),
             Built::peer(fl),
             Built::peer(ol),
@@ -3303,6 +3388,7 @@ fn bench_colsum(cc: &str, dir: &Path) {
         let wuk = timed.next().flatten();
         let wk_par = timed.next().flatten();
         let cm = timed.next().flatten();
+        let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
         let cm_cpp = cpp_checked("colsum", &cm, timed.next().flatten());
         let cfast = timed.next().flatten().filter(|p| {
             wuk.as_ref()
@@ -3328,6 +3414,7 @@ fn bench_colsum(cc: &str, dir: &Path) {
             gbps(&comp),
             gbps(&rm)
         );
+        dispersion::twin_control(2, 3);
         // Both sum each column in i-ascending order, so the full-buffer cross-check is bit equality.
         if let (Some(a), Some(c2)) = (&wuk, &cm) {
             if a.out != c2.out {
@@ -3446,6 +3533,13 @@ fn bench_biasadd(cc: &str, dir: &Path) {
             cc,
             &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
         );
+        let tl = build_c_twin(
+            "biasadd",
+            &c_biasadd(r, c),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+        );
         let rl = build_peer(
             "rs",
             &rust_biasadd(r, c),
@@ -3462,6 +3556,7 @@ fn bench_biasadd(cc: &str, dir: &Path) {
             Built::wk(wk1),
             Built::wk(wkp),
             Built::peer(cl),
+            Built::peer(tl),
             Built::peer(pl),
             Built::peer(rl),
         ];
@@ -3470,6 +3565,7 @@ fn bench_biasadd(cc: &str, dir: &Path) {
         let wuk = timed.next().flatten();
         let wk_par = timed.next().flatten();
         let cm = timed.next().flatten();
+        let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
         let cm_cpp = cpp_checked("biasadd", &cm, timed.next().flatten());
         let rm = timed.next().flatten();
         println!(
@@ -3485,6 +3581,7 @@ fn bench_biasadd(cc: &str, dir: &Path) {
             gbps(&cm_cpp),
             gbps(&rm)
         );
+        dispersion::twin_control(2, 3);
         if let (Some(a), Some(c2)) = (&wuk, &cm) {
             if a.out != c2.out {
                 mismatch!("  ! biasadd output mismatch vs C");
@@ -4962,6 +5059,13 @@ fn bench_colstat(cc: &str, dir: &Path) {
                 cc,
                 &["-O3", "-march=native", "-shared"],
             );
+            let tl = build_c_twin(
+                label,
+                &c_colstat(m, n, opc),
+                dir,
+                cc,
+                &["-O3", "-march=native", "-shared"],
+            );
             // Reassociation-normalized peer: -ffast-math lets gcc reassociate the strided fold.
             let fl = build_peer(
                 "c",
@@ -4987,6 +5091,7 @@ fn bench_colstat(cc: &str, dir: &Path) {
                 Built::wk(wk1),
                 Built::wk(wkp),
                 Built::peer(cl),
+                Built::peer(tl),
                 Built::peer(pl),
                 Built::peer(fl),
                 Built::peer(rl),
@@ -4997,6 +5102,7 @@ fn bench_colstat(cc: &str, dir: &Path) {
             let wuk = timed.next().flatten();
             let wk_par = timed.next().flatten();
             let cm = timed.next().flatten();
+            let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
             let cm_cpp = cpp_checked(label, &cm, timed.next().flatten());
             let cfast = timed.next().flatten().filter(|p| {
                 wuk.as_ref()
@@ -5017,6 +5123,7 @@ fn bench_colstat(cc: &str, dir: &Path) {
                 gbps(&cfast),
                 gbps(&rm)
             );
+            dispersion::twin_control(2, 3);
             // Both fold each column i-ascending and finalize with correctly-rounded /M and sqrt, so the
             // full-buffer cross-check is bit equality.
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
@@ -5147,6 +5254,13 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
             cc,
             &["-O3", "-march=native", "-shared"],
         );
+        let tl = build_c_twin(
+            "softmax_bwd",
+            &c_softmax_bwd(r, c),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-shared"],
+        );
         let fl = build_peer(
             "c",
             &c_softmax_bwd(r, c),
@@ -5171,6 +5285,7 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
             Built::wk(wk1),
             Built::wk(wkp),
             Built::peer(cl),
+            Built::peer(tl),
             Built::peer(pl),
             Built::peer(fl),
             Built::peer(rl),
@@ -5181,6 +5296,7 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
         let wuk = timed.next().flatten();
         let wk_par = timed.next().flatten();
         let cm = timed.next().flatten();
+        let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
         let cm_cpp = cpp_checked("softmax_bwd", &cm, timed.next().flatten());
         let cfast = timed.next().flatten().filter(|p| {
             wuk.as_ref()
@@ -5201,6 +5317,7 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
             gbps(&cfast),
             gbps(&rm)
         );
+        dispersion::twin_control(2, 3);
         // The dot reassociates (lane accumulators vs C's serial chain), so check a tolerance. Softmax
         // backward sums to ~0 per row, so individual dx are catastrophic-cancellation zeros where a
         // *per-element* relative error is meaningless — normalize the max abs error by the max output
@@ -5303,6 +5420,13 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
             cc,
             &["-O3", "-march=native", "-shared"],
         );
+        let tl = build_c_twin(
+            "rmsnorm_bwd",
+            &c_rmsnorm_bwd(r, c),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-shared"],
+        );
         let rl = build_peer(
             "rs",
             &rust_rmsnorm_bwd(r, c),
@@ -5327,6 +5451,7 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
             built_wukong4(wk, xp, dyp, gp),
             built_wukong4(wkp, xp, dyp, gp),
             built_peer4(cl, xp, dyp, gp),
+            built_peer4(tl, xp, dyp, gp),
             built_peer4(pl, xp, dyp, gp),
             built_peer4(fl, xp, dyp, gp),
             built_peer4(rl, xp, dyp, gp),
@@ -5337,12 +5462,14 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
         let wuk = timed.next().flatten();
         let wk_par = timed.next().flatten();
         let cm = timed.next().flatten();
+        let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
         let cm_cpp = cpp_checked("rmsnorm_bwd", &cm, timed.next().flatten());
         let cfast = timed.next().flatten().filter(|cf| {
             wuk.as_ref()
                 .is_some_and(|m| relaxed_peer_ok("rmsnorm_bwd", "C(fast)", m, cf))
         });
         let rm = timed.next().flatten();
+        dispersion::twin_control(2, 3);
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "C(fast)", "Rust"
@@ -5464,6 +5591,13 @@ fn bench_layernorm_bwd(cc: &str, dir: &Path) {
             cc,
             &["-O3", "-march=native", "-shared"],
         );
+        let tl = build_c_twin(
+            "layernorm_bwd",
+            &c_layernorm_bwd(r, c),
+            dir,
+            cc,
+            &["-O3", "-march=native", "-shared"],
+        );
         let rl = build_peer(
             "rs",
             &rust_layernorm_bwd(r, c),
@@ -5488,6 +5622,7 @@ fn bench_layernorm_bwd(cc: &str, dir: &Path) {
             built_wukong4(wk, xp, dyp, gp),
             built_wukong4(wkp, xp, dyp, gp),
             built_peer4(cl, xp, dyp, gp),
+            built_peer4(tl, xp, dyp, gp),
             built_peer4(pl, xp, dyp, gp),
             built_peer4(fl, xp, dyp, gp),
             built_peer4(rl, xp, dyp, gp),
@@ -5498,12 +5633,14 @@ fn bench_layernorm_bwd(cc: &str, dir: &Path) {
         let wuk = timed.next().flatten();
         let wk_par = timed.next().flatten();
         let cm = timed.next().flatten();
+        let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
         let cm_cpp = cpp_checked("layernorm_bwd", &cm, timed.next().flatten());
         let cfast = timed.next().flatten().filter(|cf| {
             wuk.as_ref()
                 .is_some_and(|m| relaxed_peer_ok("layernorm_bwd", "C(fast)", m, cf))
         });
         let rm = timed.next().flatten();
+        dispersion::twin_control(2, 3);
         report_ratio(
             "layernorm_bwd",
             &wuk,
@@ -6858,6 +6995,13 @@ fn bench_bf16(cc: &str, dir: &Path) {
                 cc,
                 &["-O3", "-march=native", "-shared"],
             );
+            let tl = build_c_twin(
+                "bf16",
+                &c_bf16(n, is_dot),
+                dir,
+                cc,
+                &["-O3", "-march=native", "-shared"],
+            );
             let fl = build_peer("c", &c_bf16(n, is_dot), dir, "bf16_fast", cc, C_FAST_FLAGS);
             let rl = build_peer(
                 "rs",
@@ -6874,6 +7018,7 @@ fn bench_bf16(cc: &str, dir: &Path) {
             let columns = [
                 BuiltBf16::Wukong(wk.map(Box::new)),
                 BuiltBf16::Peer(cl),
+                BuiltBf16::Peer(tl),
                 BuiltBf16::Peer(pl),
                 BuiltBf16::Peer(fl),
                 BuiltBf16::Peer(rl),
@@ -6884,6 +7029,7 @@ fn bench_bf16(cc: &str, dir: &Path) {
             .into_iter();
             let wuk = timed.next().flatten();
             let cm = timed.next().flatten();
+            let _c_twin = timed.next(); // slot 2: read through `dispersion::twin_control(1, 2)`
             let cm_cpp = cpp_checked_bf16("bf16", &cm, timed.next().flatten());
             let cfast = timed
                 .next()
@@ -6903,6 +7049,7 @@ fn bench_bf16(cc: &str, dir: &Path) {
                 gbps(&cfast),
                 gbps(&rm)
             );
+            dispersion::twin_control(1, 2);
             // All-positive, well-conditioned reduction → a tight relative tolerance is the right
             // cross-language bar (the three reassociate the f32 sum differently: Wukong 8-lane SIMD
             // vs sequential C/Rust). Report the scalars so any drift is visible.
@@ -7437,6 +7584,13 @@ fn bench_norm(cc: &str, dir: &Path) {
                 cc,
                 &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
             );
+            let tl = build_c_twin(
+                &format!("norm_{op}"),
+                &c_norm(cols, op),
+                dir,
+                cc,
+                &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            );
             let rl = build_peer(
                 "rs",
                 &rust_norm(cols, op),
@@ -7460,6 +7614,7 @@ fn bench_norm(cc: &str, dir: &Path) {
             let columns = [
                 Built::wk(wk),
                 Built::peer(cl),
+                Built::peer(tl),
                 Built::peer(pl),
                 Built::peer(fl),
                 Built::peer(rl),
@@ -7469,6 +7624,8 @@ fn bench_norm(cc: &str, dir: &Path) {
                     .into_iter();
             let wuk = timed.next().flatten();
             let c = timed.next().flatten();
+            let _c_twin = timed.next(); // slot 2: read through `dispersion::twin_control(1, 2)`
+            let floor = dispersion::twin_control(1, 2);
             let c_cpp = cpp_checked(&format!("norm_{op}"), &c, timed.next().flatten());
             // Preserve the fast peer's numerical gate against the serial Wukong row.
             let cfast = timed.next().flatten().filter(|cf| {
@@ -7487,17 +7644,13 @@ fn bench_norm(cc: &str, dir: &Path) {
             // a row that fails the check prints SUSPECT there instead of a clean "1.31x faster"
             // (the numerics gate, P8.3).
             let failures = norm_row_failures(op, &wuk, &c, &rust);
+            // Every column here is single-threaded, so the `C(twin)` floor qualifies every cell.
             let standing_vs = |peer: &Option<Measure>| {
                 if !failures.is_empty() {
                     return "SUSPECT".to_string();
                 }
                 if let (Some(m), Some(p)) = (&wuk, peer) {
-                    let r = p.ns_per_call / m.ns_per_call;
-                    format!(
-                        "{:.2}x {}",
-                        if r >= 1.0 { r } else { 1.0 / r },
-                        if r >= 1.0 { "faster" } else { "slower" }
-                    )
+                    dispersion::ratio_cell(p.ns_per_call, m.ns_per_call, floor)
                 } else {
                     "n/a".into()
                 }
@@ -7759,6 +7912,13 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                 cc,
                 &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
             );
+            let tl = build_c_twin(
+                "bnorm",
+                &c_norm_batched(rows, cols, op),
+                dir,
+                cc,
+                &["-O3", "-march=native", "-ffp-contract=fast", "-shared"],
+            );
             let rl = build_peer(
                 "rs",
                 &rust_norm_batched(rows, cols, op),
@@ -7783,6 +7943,7 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                 Built::wk(wk),
                 Built::wk(wkp),
                 Built::peer(cl),
+                Built::peer(tl),
                 Built::peer(pl),
                 Built::peer(fl),
                 Built::peer(rl),
@@ -7793,6 +7954,8 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
             let wuk = timed.next().flatten();
             let wuk_par = timed.next().flatten();
             let c = timed.next().flatten();
+            let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
+            let twin_floor = dispersion::twin_control(2, 3);
             let c_cpp = cpp_checked("bnorm", &c, timed.next().flatten());
             // Preserve the fast peer's numerical gate against the serial Wukong row.
             let cfast = timed.next().flatten().filter(|cf| {
@@ -7811,17 +7974,14 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                 // reductions), BEFORE the row prints - see `bench_norm`: a failing row prints
                 // SUSPECT in its ratio cells rather than a clean ratio.
                 let failures = norm_row_failures(&label, &wuk, &c, &rust);
+                // The single-threaded `C(twin)` floor qualifies the single-threaded row only.
+                let floor = if suffix.is_empty() { twin_floor } else { None };
                 let standing_vs = |peer: &Option<Measure>| {
                     if !failures.is_empty() {
                         return "SUSPECT".to_string();
                     }
                     if let (Some(m), Some(p)) = (&wuk, peer) {
-                        let r = p.ns_per_call / m.ns_per_call;
-                        format!(
-                            "{:.2}x {}",
-                            if r >= 1.0 { r } else { 1.0 / r },
-                            if r >= 1.0 { "faster" } else { "slower" }
-                        )
+                        dispersion::ratio_cell(p.ns_per_call, m.ns_per_call, floor)
                     } else {
                         "n/a".into()
                     }
@@ -8497,19 +8657,37 @@ fn time_built(b: &Built, out: &mut [f32], xp: *const f32, yp: *const f32) -> Opt
 /// defect: `bench_wukong` used to compile-and-time in one call, so Wukong's timed region never had a
 /// gcc process in front of it while every peer's did - the exact hazard [`build_peer`]'s doc says
 /// the build/time split exists to prevent.
+///
+/// Both passes of every column are also KEPT (P6.10): the rotation prints one `. dispersion` line -
+/// each slot's pass-to-pass spread, median/min, max/min and cold/min - and leaves the per-pass
+/// estimates behind for [`dispersion::twin_control`]. See `dispersion.rs`.
 fn abba_min_columns<M: Timed>(
     n: usize,
     mut time: impl FnMut(usize) -> Option<M>,
 ) -> Vec<Option<M>> {
     let mut best: Vec<Option<M>> = Vec::with_capacity(n);
     best.resize_with(n, || None);
-    for round in 0..2 {
-        for i in round_order(n, round) {
+    let mut visits = vec![dispersion::ColumnVisits::default(); n];
+    for pass in 0..2usize {
+        for i in round_order(n, pass) {
+            // Discard anything a previous measurement left behind, so a column that produced no
+            // timing (missing, or timed by something other than `time_ns`) reports none.
+            let _ = dispersion::take_timing();
             let sample = time(i);
+            let stats = dispersion::take_timing();
+            if let Some(ns) = sample
+                .as_ref()
+                .map(|m| m.ns())
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                visits[i].by_pass[pass] = Some(ns);
+                visits[i].stats.extend(stats);
+            }
             let previous = best[i].take();
             best[i] = faster(previous, sample);
         }
     }
+    dispersion::finish_rotation(&visits);
     best
 }
 
@@ -8832,13 +9010,23 @@ fn time_peer_halfout(
 /// Best-of-many-batches timing: warm up, grow the batch until ~50 ms, then take the fastest of many
 /// batches. On a busy multicore box the *minimum* batch is the least-interfered estimate (the run
 /// that suffered the least scheduler/thermal noise), so more samples tighten the result.
+///
+/// Every sample is KEPT, not just the fastest (P6.10): the full [`dispersion::TimingStats`] - the
+/// cold first call, min, median, max and last - is handed to the enclosing rotation, which prints
+/// it, and the value returned is [`dispersion::estimator`]'s pick: the minimum unless the operator
+/// set `XBENCH_ESTIMATOR=median|last`. The call sequence is unchanged; the first warm-up is now
+/// timed, which is what makes the cold start visible.
 fn time_ns(mut run: impl FnMut()) -> f64 {
     // Warm up twice, then probe one call to size the sampling. A kernel whose *single* call already
-    // exceeds the 50 ms target (the large GEMMs, 2048³/4096³) is sampled best-of-6 single calls
-    // instead of best-of-14 rep-blocks, so a multi-second GEMM benches in seconds, not minutes —
-    // identical "best observed" methodology, just fewer samples. Sub-target kernels are unchanged:
-    // 5 warmups total, reps scaled until a block ≥ 50 ms, then best-of-14.
-    run();
+    // exceeds the 50 ms target (the large GEMMs, 2048³/4096³) is sampled as 7 single calls (the
+    // probe plus 6) instead of 15 rep-blocks, so a multi-second GEMM benches in seconds, not minutes —
+    // identical methodology, just fewer samples. Sub-target kernels are unchanged: 5 warmups total,
+    // reps scaled until a block ≥ 50 ms, then that block plus 14 more.
+    let cold = {
+        let t = Instant::now();
+        run();
+        t.elapsed()
+    };
     run();
     let probe = {
         let t = Instant::now();
@@ -8846,42 +9034,46 @@ fn time_ns(mut run: impl FnMut()) -> f64 {
         t.elapsed()
     };
     let target = Duration::from_millis(50);
+    let mut samples: Vec<f64> = Vec::with_capacity(15);
     if probe >= target {
-        let mut best = probe;
+        samples.push(probe.as_secs_f64() * 1e9);
         for _ in 0..6 {
             let t = Instant::now();
             run();
+            samples.push(t.elapsed().as_secs_f64() * 1e9);
+        }
+    } else {
+        run();
+        run();
+        let mut reps = 1u64;
+        loop {
+            let t = Instant::now();
+            for _ in 0..reps {
+                run();
+            }
             let e = t.elapsed();
-            if e < best {
-                best = e;
+            if e >= target || reps >= (1 << 26) {
+                let per_call = |d: Duration| d.as_secs_f64() * 1e9 / reps as f64;
+                samples.push(per_call(e));
+                for _ in 0..14 {
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        run();
+                    }
+                    samples.push(per_call(t.elapsed()));
+                }
+                break;
             }
+            reps = reps.saturating_mul(2);
         }
-        return best.as_secs_f64() * 1e9;
     }
-    run();
-    run();
-    let mut reps = 1u64;
-    loop {
-        let t = Instant::now();
-        for _ in 0..reps {
-            run();
-        }
-        let e = t.elapsed();
-        if e >= target || reps >= (1 << 26) {
-            let mut best = e;
-            for _ in 0..14 {
-                let t = Instant::now();
-                for _ in 0..reps {
-                    run();
-                }
-                let e2 = t.elapsed();
-                if e2 < best {
-                    best = e2;
-                }
-            }
-            return best.as_secs_f64() * 1e9 / reps as f64;
-        }
-        reps = reps.saturating_mul(2);
+    let stats = dispersion::TimingStats::from_samples(cold.as_secs_f64() * 1e9, &samples);
+    dispersion::record_timing(stats);
+    match stats {
+        Some(s) => dispersion::estimator().pick(&s),
+        // Unreachable with a monotonic clock (at least one finite sample is always taken), but the
+        // historical minimum is the honest fallback, never a fabricated zero.
+        None => samples.iter().copied().fold(f64::INFINITY, f64::min),
     }
 }
 
@@ -11459,6 +11651,10 @@ mod tests {
         // be granted to a helper that does not earn it.
         const PAIR_HELPERS: &[&str] = &["build_c_cpp"];
         const FAST_HELPERS: &[&str] = &[];
+        // The `C(twin)` CONTROL is C-only by construction: it is the C column itself, built a
+        // second time into its own DLL, and has no language content for a C++ column to mirror.
+        // Earned below like the others: the helper must really name its library `_twin`.
+        const TWIN_HELPERS: &[&str] = &["build_c_twin"];
         let body_of = |name: &str| -> &str {
             let head = format!("\nfn {name}(");
             let at = scan
@@ -11485,7 +11681,19 @@ mod tests {
                 "{name} is exempted as a relaxed-FP C-only column but is not a _fast helper"
             );
         }
-        let helpers: Vec<&str> = PAIR_HELPERS.iter().chain(FAST_HELPERS).copied().collect();
+        for name in TWIN_HELPERS {
+            let body = body_of(name).replace([' ', '\n'], "");
+            assert!(
+                body.contains("_twin\")") && body.contains("build_peer(\"c\","),
+                "{name} is exempted as the C(twin) control but does not build a `_twin` C library"
+            );
+        }
+        let helpers: Vec<&str> = PAIR_HELPERS
+            .iter()
+            .chain(FAST_HELPERS)
+            .chain(TWIN_HELPERS)
+            .copied()
+            .collect();
         // (byte offset, name) of every top-level `fn …` so an occurrence can be attributed.
         let mut fns: Vec<(usize, &str)> = Vec::new();
         let mut at = 0usize;

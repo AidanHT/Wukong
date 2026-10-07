@@ -53,6 +53,21 @@ the elementwise summary geomeans exclude SUSPECT rows by name. The run ends with
 peer column *dropped* for disagreeing (C++ vs C, a relaxed C(fast)/C(omp), an MKL ABI mismatch)
 prints no ratio, so it is not a mismatch.
 
+**Dispersion, cold start and the main-suite control (`src/dispersion.rs`).** `time_ns` keeps every
+sample it takes (the cold first call, min, median, max, last), and each position-balanced rotation
+prints one `. dispersion` line: per slot, the pass-to-pass spread (the same binary in two positions),
+median/min (within-run jitter), max/min (the worst block - the only tail this harness sees),
+cold/min (first-call cost) and the sample count, plus the rotation's within-run resolution.
+`XBENCH_ESTIMATOR=median|last` changes which statistic becomes `ns_per_call` (`last` is sustained
+throughput after the turbo window); the default is the historical minimum and the banner names the
+estimator in force. The campaign's target families (the elementwise table, colsum, colstat,
+biasadd, transpose, softmax_bwd, the two norm tables, rmsnorm_bwd, layernorm_bwd, matmul,
+matmul_skinny, matmul_tn, linear, bf16) carry a **`C(twin)` control** - the identical C source,
+compiler and flags in a second DLL, true ratio 1.00 - printed as a `. control C(twin)` line with the
+section's single-thread floor. Every single-threaded standing no larger than that floor is tagged
+`[BELOW C(twin) FLOOR …: not established]`, and the norm tables print `BELOW FLOOR` in the cell.
+All-core standings are never tagged by it: the control is single-threaded.
+
 Optional first CLI argument is a substring filter over kernel/section names (e.g. `saxpy`).
 
 ## Sections

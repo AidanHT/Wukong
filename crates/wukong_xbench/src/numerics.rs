@@ -47,6 +47,8 @@ pub(crate) struct Ledger {
     clean_standings: usize,
     /// Every heading that went SUSPECT, in order, without duplicates.
     suspect_sections: Vec<String>,
+    /// The open scope's `C(twin)` single-thread floor (see `dispersion::twin_control`), if one ran.
+    twin_floor: Option<f64>,
 }
 
 impl Ledger {
@@ -56,6 +58,7 @@ impl Ledger {
             suspect: false,
             clean_standings: 0,
             suspect_sections: Vec::new(),
+            twin_floor: None,
         }
     }
 
@@ -64,7 +67,16 @@ impl Ledger {
         self.section = heading.trim().to_string();
         self.suspect = false;
         self.clean_standings = 0;
+        self.twin_floor = None;
         vec![heading.to_string()]
+    }
+
+    /// Record a `C(twin)` floor for the open scope. Several controls in one scope keep the widest:
+    /// a floor is a statement of what the run could NOT resolve, so the conservative merge is max.
+    pub(crate) fn record_twin_floor(&mut self, floor: f64) {
+        if floor.is_finite() && floor >= 1.0 {
+            self.twin_floor = Some(self.twin_floor.map_or(floor, |f| f.max(floor)));
+        }
     }
 
     /// Record a numerical mismatch. Returns the lines to print: the mismatch itself, plus a
@@ -103,7 +115,20 @@ impl Ledger {
             ];
         }
         self.clean_standings += 1;
-        vec![line.to_string()]
+        let mut out = line.to_string();
+        // A single-threaded standing no larger than the section's own zero-difference control is
+        // not a measured difference. It is still printed - the reader is owed the number - but it
+        // carries the qualification on its own line, where neither a skimming human nor the
+        // extractor can separate the two. All-core standings are never tagged: the control is a
+        // single-threaded column and says nothing about where the scheduler put 16 workers.
+        if let (Some(floor), Some(ratio)) = (self.twin_floor, standing_ratio(line)) {
+            if ratio <= floor && is_single_threaded_standing(line) {
+                out.push_str(&format!(
+                    "  [BELOW C(twin) FLOOR {floor:.3}x: not established]"
+                ));
+            }
+        }
+        vec![out]
     }
 
     /// Whether the open scope has reported a numerical mismatch. Summaries consult this so a
@@ -150,6 +175,41 @@ impl Ledger {
     }
 }
 
+/// The factor a standing states - `N.NN` in `N.NNx faster` / `N.NNx slower` - or `None` when the line
+/// states no such factor (a %-of-roofline line, for one).
+pub(crate) fn standing_ratio(line: &str) -> Option<f64> {
+    ["x faster", "x slower"].iter().find_map(|word| {
+        let head = &line[..line.find(word)?];
+        let start = head
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_ascii_digit() || *c == '.')
+            .last()
+            .map(|(i, _)| i)?;
+        head[start..].parse::<f64>().ok().filter(|r| r.is_finite())
+    })
+}
+
+/// Markers of a standing that involves an all-core column on either side.
+const MULTICORE_MARKERS: [&str; 9] = [
+    "@parallel",
+    "all cores",
+    "all-core",
+    "all threads",
+    "MKL(all)",
+    "C(omp)",
+    "openmp",
+    "multicore",
+    "Tn(",
+];
+
+/// Whether both sides of a standing are single-threaded, read from the words the harness prints.
+/// Conservative in the direction that matters: an unrecognised all-core spelling is merely left
+/// untagged by a single-thread floor that never applied to it anyway.
+pub(crate) fn is_single_threaded_standing(line: &str) -> bool {
+    !MULTICORE_MARKERS.iter().any(|m| line.contains(m))
+}
+
 static LEDGER: Mutex<Ledger> = Mutex::new(Ledger::new());
 
 fn with_ledger<T>(f: impl FnOnce(&mut Ledger) -> T) -> T {
@@ -174,6 +234,11 @@ pub(crate) fn report_mismatch(line: &str) {
 
 pub(crate) fn report_standing(line: &str) {
     emit(with_ledger(|l| l.standing(line)));
+}
+
+/// Record the open section's `C(twin)` floor (see [`Ledger::record_twin_floor`]).
+pub(crate) fn record_twin_floor(floor: f64) {
+    with_ledger(|l| l.record_twin_floor(floor));
 }
 
 /// Whether the open section has reported a numerical mismatch (see [`Ledger::is_suspect`]).
@@ -250,6 +315,78 @@ mod tests {
         assert!(l.is_suspect());
         l.begin("=== b ===");
         assert!(!l.is_suspect(), "a new heading must open a clean scope");
+    }
+
+    #[test]
+    fn standing_ratio_reads_the_printed_factor_and_nothing_else() {
+        assert_eq!(
+            standing_ratio("  -> Wukong single-core is 1.31x faster than idiomatic C"),
+            Some(1.31)
+        );
+        assert_eq!(
+            standing_ratio("  -> Wukong @parallel is 12.40x slower than MKL(all)"),
+            Some(12.4)
+        );
+        assert_eq!(
+            standing_ratio("  -> Wukong single-core = 85% of measured roofline"),
+            None
+        );
+        assert_eq!(standing_ratio("x faster"), None);
+    }
+
+    #[test]
+    fn a_single_threaded_standing_inside_the_twin_floor_is_tagged_not_hidden() {
+        let mut l = Ledger::new();
+        l.begin("=== colsum 1024x1024 ===");
+        l.record_twin_floor(1.03);
+        let inside = l.standing("  -> Wukong single-core is 1.02x slower than idiomatic C");
+        assert_eq!(inside.len(), 1);
+        assert!(
+            inside[0].starts_with("  -> Wukong single-core is 1.02x slower"),
+            "{inside:?}"
+        );
+        assert!(
+            inside[0].contains("[BELOW C(twin) FLOOR 1.030x"),
+            "{inside:?}"
+        );
+        let outside = l.standing("  -> Wukong single-core is 1.31x faster than idiomatic C");
+        assert!(!outside[0].contains("FLOOR"), "{outside:?}");
+        // The control is single-threaded; it never qualifies an all-core standing.
+        let par = l.standing("  -> Wukong @parallel is 1.01x faster than idiomatic C");
+        assert!(!par[0].contains("FLOOR"), "{par:?}");
+    }
+
+    #[test]
+    fn the_twin_floor_is_scoped_and_merges_conservatively() {
+        let mut l = Ledger::new();
+        l.begin("=== a ===");
+        l.record_twin_floor(1.02);
+        l.record_twin_floor(1.05);
+        l.record_twin_floor(1.01);
+        l.record_twin_floor(f64::NAN);
+        let s = l.standing("  -> Wukong single-core is 1.04x faster than C");
+        assert!(s[0].contains("FLOOR 1.050x"), "{s:?}");
+        l.begin("=== b ===");
+        let s = l.standing("  -> Wukong single-core is 1.04x faster than C");
+        assert!(
+            !s[0].contains("FLOOR"),
+            "a new heading must drop the previous floor: {s:?}"
+        );
+    }
+
+    #[test]
+    fn multicore_markers_cover_every_all_core_spelling_the_harness_prints() {
+        for line in [
+            "  -> Wukong @parallel is 1.10x faster than idiomatic single-threaded C",
+            "  -> Wukong single-core is 1.10x slower than C(omp) [-fopenmp -ffast-math, all cores]",
+            "  -> Wukong 1-core is 1.10x slower than MKL(all)",
+            "  -> Wukong (1 core) is 1.10x faster than PyTorch eager SDPA (all threads)",
+        ] {
+            assert!(!is_single_threaded_standing(line), "{line}");
+        }
+        assert!(is_single_threaded_standing(
+            "  -> Wukong single-core is 1.10x faster than oneMKL(1 thread)"
+        ));
     }
 
     #[test]
