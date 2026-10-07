@@ -40,8 +40,9 @@ OPTIONS:
                        every lint, so `-D warnings` fails the build on any warning. A lint is
                        named or coded: unused_variables (W0001), unused_mut (W0002),
                        unreachable_code (W0003), unused_result (W0004), dead_code (W0005),
-                       unwritten_output (W0006), unknown_lints (W0007). Repeatable; `-Dwarnings`
-                       also works. In source: @allow(<lint>), @warn(..), @deny(..)
+                       unwritten_output (W0006), unknown_lints (W0007), missing_semicolon
+                       (W0030), ambiguous_continuation (W0031). Repeatable; `-Dwarnings` also
+                       works. In source: @allow(<lint>), @warn(..), @deny(..)
     --explain <CODE>   Print the extended explanation for an error code, then exit
     -h, --help         Print this help
     -V, --version      Print version

@@ -1,0 +1,22 @@
+// EXPECT-WARN: W0031
+// EXPECT-WARN: W0031
+module tests.warn.ambiguous_continuation
+
+// With `;` optional, a line that starts with `(`, or with a `-` touching its operand, continues
+// the expression above it: `f` then `(2)` is the call `f(2)`, and `x` then `-1` is `x - 1`, though
+// each pair reads as two statements. A `- y` with a space is the ordinary continued subtraction
+// and is not reported.
+fn f(v: i32) -> i32 {
+    return v + 1;
+}
+
+fn main() -> i32 {
+    let x: i32 = f
+    (2);
+    let y: i32 = x
+    -1;
+    let z: i32 = x * 10
+        - y;
+    print(x + y + z);
+    return 0;
+}

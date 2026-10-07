@@ -1,0 +1,17 @@
+// EXPECT-WARN: W0030
+// EXPECT-WARN: W0030
+module tests.warn.missing_semicolon
+
+// A statement ends with `;`. It may be left out only after a block-like statement (`if`,
+// `match`, `loop`, `while`, `for`, `{ }`) and, for any statement but a `let`, before the closing
+// `}`. Here the `let` and the `print` call are missing theirs; the `if` and the final `return`
+// are fine.
+fn main() -> i32 {
+    let a: i32 = 3
+    let b: i32 = a * 2;
+    print(b)
+    if b > 4 {
+        print(1);
+    }
+    return 0
+}

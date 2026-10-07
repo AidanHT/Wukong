@@ -402,6 +402,28 @@ static CATALOG: &[Explanation] = &[
          W0001` and its neighbours describe each lint."
     ),
     entry!(
+        "W0030",
+        "missing `;` (`missing_semicolon`)",
+        "A statement is not terminated by `;`. A statement ends with `;`; it may be left out only \
+         after a block-like statement (`if`, `match`, `loop`, `while`, `for`, a `{ … }` block) and, \
+         for any statement but a `let`, right before the `}` that closes the block — Rust's rule. \
+         The parse is the same either way, but an optional terminator is what lets a `(`, `[` or \
+         `-` on the next line silently continue the statement (see W0031), so write the `;`. Not \
+         reported for a statement that already has a parse error, or that a rejected character cut \
+         short. Reserved: E0210, should a missing `;` ever become an error."
+    ),
+    entry!(
+        "W0031",
+        "line-leading continuation (`ambiguous_continuation`)",
+        "A `(` or `[` at the start of a line, or a `-` that starts a line and touches its operand \
+         (`-1`), continues the expression on the line above: `acc = a[i]` followed by `(b + c)` on \
+         the next line is the call `a[i](b + c)`, and `x` followed by `-1` is `x - 1` — although each \
+         pair reads as two statements. Reported only where a new statement could begin (inside \
+         `( )` or `[ ]` nothing is ambiguous), and not for `- y` with a space, the ordinary \
+         continued-subtraction style. If a new statement starts there, end the previous one with \
+         `;`; if the continuation is meant, move the token to the end of the line above."
+    ),
+    entry!(
         "C0001",
         "unsupported in codegen",
         "A construct parsed and type-checked but is not yet supported by MIR lowering or the \

@@ -861,6 +861,8 @@ and a name:
 | `W0005` | `dead_code` | a function of the compiled file no entry point reaches (`main`, the `--grad-of` function under `--emit=grad`/`--train`, `pub`, `@export`/`@extern`); nothing under `--emit=obj`/`llvm-ir` or in a file with no `main` |
 | `W0006` | `unwritten_output` | a `mut` array/slice/tensor/tuple/struct parameter — an output buffer — that is never stored to, assigned, passed on or borrowed |
 | `W0007` | `unknown_lints` | an `@allow`/`@warn`/`@deny` argument that names no lint |
+| `W0030` | `missing_semicolon` | a statement without its `;` (see below) |
+| `W0031` | `ambiguous_continuation` | a `(` or `[`, or a `-` touching its operand, at the start of a line, continuing the expression above it |
 
 A name prefixed with `_` (`_scratch`) is never reported as unused. Levels: **allow** (silent),
 **warn** (the default for every lint) and **deny** (an error; the build fails). Set them on the
@@ -881,8 +883,19 @@ fn main() -> i32 {
 
 The innermost attribute wins over an outer one and over the command line; `-D warnings` applies to
 every lint still at warning level, so it does not resurrect an allowed one. Warnings are printed
-after any error, and never on a program that fails sema. The fixtures in `tests/warn/` pin each
-lint's exact output.
+after any error. The lints that need types run only on a program that checks clean; the parser's
+two (`W0030`, `W0031`) are reported for the compiled file even when a later stage fails, since a
+line that silently continued the one above is often why it failed. The fixtures in `tests/warn/`
+pin each lint's exact output.
+
+**Statements end with `;`.** It may be left out only after a block-like statement — `if`,
+`match`, `loop`, `while`, `for`, a `{ … }` block — and, for any statement but a `let`, right
+before the `}` that closes the block (Rust's rule). Leaving it out elsewhere still parses the same
+(`W0030` is a warning, not yet an error), but it is what makes the next hazard possible: a `(`
+or `[` that starts a line is a call or an index of the expression on the line above, and so is a
+`-` that starts a line and touches its operand (`-1`). `acc = a[i]` followed by `(b + c)` on the
+next line is `acc = a[i](b + c)`; `W0031` reports it. A `- y` with a space is the ordinary way to
+continue a long subtraction and is not reported.
 
 ## Command-line interface
 

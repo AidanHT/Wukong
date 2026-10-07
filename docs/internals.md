@@ -182,6 +182,16 @@ the autodiff root, everything under `--emit=obj|llvm-ir`). Lint codes are catalo
 `catalog_coverage.rs` scans `"Wnnnn"` literals too, and a `tests/warn` fixture (the whole stream,
 in order, is compared by `warn.rs`) exercises each one.
 
+The parser contributes two lints of its own, `W0030` (a statement's missing `;`) and `W0031` (a
+line-leading `(`, `[` or touching `-` that continues the expression above), into a separate
+`Parser::lints` list. Only `parse_module_tokens_with_lints` returns it (as `ParseOutput::lints`);
+every other entry point drops it, so the many callers that assert a parse produced no diagnostic
+are untouched by a warning. `W0030` stays quiet for a statement that pushed an error or contains a
+lexer `Error` token (its `;` is not what is missing); `W0031` fires only when the innermost open
+delimiter is a `{`, i.e. where a statement could have begun. The driver keeps the root file's
+parser lints until the lint stage and resolves them with the sema lints in one `apply_levels`
+call; on any earlier failure it renders them after the errors (`render_lints`).
+
 The terminal renderer is rustc-style (carets, gutters, `--> file:line:col`). Two rendering rules are
 contractual: a caret run is as wide as the span's *rendered* width, never the column difference, and
 both the echoed source line and the caret padding expand tabs at a fixed `TAB_WIDTH = 4` — so carets

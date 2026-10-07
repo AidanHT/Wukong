@@ -93,6 +93,18 @@ pub const LINTS: &[Lint] = &[
         code: "W0007",
         default: LintLevel::Warn,
     },
+    // The parser's statement-terminator lints (`wukong_parser::ParseOutput::lints`); `E0210` is
+    // reserved for the day a missing `;` becomes an error.
+    Lint {
+        name: "missing_semicolon",
+        code: "W0030",
+        default: LintLevel::Warn,
+    },
+    Lint {
+        name: "ambiguous_continuation",
+        code: "W0031",
+        default: LintLevel::Warn,
+    },
 ];
 
 /// The three attributes that set a lint level in source (`@allow(unused_variables)`).

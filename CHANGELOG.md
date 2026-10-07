@@ -40,6 +40,11 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `-A/-W/-D <lint>` (`-D warnings`) and `@allow/@warn/@deny(<lint>)` on a function, parameter or
   statement. Warnings print after errors; `tests/warn/` + `crates/wukongc/tests/warn.rs` pin each
   lint's full output, and the catalogue-coverage gates now include `W` codes.
+- **Statement terminators.** A missing `;` is `W0030 missing_semicolon` (Rust's exemptions: after
+  a block-like statement, and before `}` for anything but a `let`); a `(`, `[` or touching `-` at
+  the start of a line that continues the expression above (`acc = a[i]` then `(b + c)` parses as
+  a call) is `W0031 ambiguous_continuation`. The parse itself is unchanged; `E0210` is reserved for
+  promoting a missing `;` to an error.
 
 ### October 5 contraction semantics and coverage
 

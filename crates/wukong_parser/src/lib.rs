@@ -15,7 +15,10 @@ use wukong_span::{Interner, SourceId, Span, Symbol};
 use TokenKind as T;
 
 mod items;
-pub use items::{parse_module, parse_module_tokens, parse_module_tokens_from};
+pub use items::{
+    parse_module, parse_module_tokens, parse_module_tokens_from, parse_module_tokens_with_lints,
+    ParseOutput,
+};
 
 /// Parse a standalone expression (for tests and a future REPL).
 pub fn parse_expr_str(
@@ -74,6 +77,10 @@ pub(crate) struct Parser<'a> {
     /// [`Parser::bump`]). A failed `expect` reports them with its own token as the set the parser
     /// would have accepted — "expected one of `,` or `)`" — rather than naming only the last one.
     expected: Vec<TokenKind>,
+    /// Lint findings (`W0030` missing `;`, `W0031` ambiguous line continuation): warnings, kept
+    /// apart from `diags` so a caller that asserts a clean parse is not failed by a warning. Only
+    /// [`parse_module_tokens_with_lints`] hands them out; the driver resolves their levels.
+    pub(crate) lints: Vec<Diagnostic>,
 }
 
 impl<'a> Parser<'a> {
@@ -90,6 +97,7 @@ impl<'a> Parser<'a> {
             depth_exceeded: false,
             delims: Vec::new(),
             expected: Vec::new(),
+            lints: Vec::new(),
         }
     }
 
@@ -272,6 +280,79 @@ impl<'a> Parser<'a> {
         }
         self.diags
             .push(Diagnostic::error(msg).with_code(code).primary(span, ""));
+    }
+
+    // ---- Statement-terminator lints (`W0030`, `W0031`) ----
+
+    /// End a statement: consume its `;`, or record `W0030` (see [`Parser::missing_semi`]).
+    fn end_stmt(&mut self, start: usize, mark: usize, what: &str, before_brace_ok: bool) {
+        if !self.eat(T::Semi) {
+            self.missing_semi(start, mark, what, before_brace_ok);
+        }
+    }
+
+    /// `W0030`: the statement that began at token `start` is not followed by `;`. Not reported
+    /// before the block's closing `}` when `before_brace_ok` (every statement but a `let`, as in
+    /// Rust), at end of file (the block's missing `}` is the error there), or for a statement that
+    /// is already broken: one that pushed an error since `mark` (the error count when it began), or
+    /// that a character rejected by the lexer cut short — its `;` is not what is missing.
+    fn missing_semi(&mut self, start: usize, mark: usize, what: &str, before_brace_ok: bool) {
+        if (before_brace_ok && self.at(T::RBrace))
+            || self.at(T::Eof)
+            || self.at(T::Error)
+            || self.diags.len() > mark
+            || self.tokens[start..self.pos]
+                .iter()
+                .any(|t| t.kind == T::Error)
+        {
+            return;
+        }
+        let mut d = Diagnostic::warning(format!("missing `;` after {what}"))
+            .with_code("W0030")
+            .primary(self.prev_span().shrink_to_hi(), "expected `;` here");
+        if !self.on_new_line() {
+            d = d.secondary(self.span(), "the next statement starts on the same line");
+        }
+        self.lints.push(d.help(
+            "end the statement with `;`. It may be left out only after a block-like statement \
+             (`if`, `match`, `loop`, `while`, `for`, `{ … }`) and, for any statement but a `let`, \
+             before the `}` that closes the block",
+        ));
+    }
+
+    /// `W0031`: the current token — a `(` or `[` about to be parsed as a call or index of the
+    /// expression before it, or a binary `-` — starts a new line, so the expression on the line
+    /// above continues into this one although the two read as separate statements (`acc = a[i]`
+    /// then `(b + c)` on the next line parse as the call `a[i](b + c)`). Reported only in statement
+    /// context — the innermost open delimiter is a `{` — where a new statement could have begun;
+    /// inside `(…)` or `[…]` none can, so nothing is ambiguous.
+    fn ambiguous_continuation(&mut self, reads_as: &str) {
+        let statement_context = matches!(self.delims.last(), Some((T::LBrace, _)));
+        if !(statement_context && self.on_new_line()) {
+            return;
+        }
+        let glyph = self.kind().glyph().unwrap_or("token");
+        let d = Diagnostic::warning(format!(
+            "`{glyph}` at the start of a line continues the expression on the line above"
+        ))
+        .with_code("W0031")
+        .primary(self.span(), format!("this `{glyph}` {reads_as}"))
+        .secondary(self.prev_span(), "the expression it continues ends here")
+        .help(
+            "if a new statement starts here, end the previous one with `;`; if the continuation is \
+             meant, move this token to the end of the line above",
+        );
+        self.lints.push(d);
+    }
+
+    /// Whether the current `-` (about to be read as a binary minus) starts a line and touches the
+    /// operand after it — `x` then `-1` on the next line, which reads as a negated new statement.
+    /// A `- y` with a space keeps the usual continued-subtraction style silent.
+    fn minus_reads_as_prefix(&self) -> bool {
+        let minus = self.span();
+        self.tokens
+            .get(self.pos + 1)
+            .is_some_and(|next| next.span.lo == minus.hi)
     }
 
     /// Maximum nesting depth of the recursive grammar productions before the parser bails with
@@ -678,6 +759,9 @@ impl<'a> Parser<'a> {
                 self.too_deep(sp);
                 break;
             }
+            if op == BinOp::Sub && self.minus_reads_as_prefix() {
+                self.ambiguous_continuation("subtracts from the expression above, not negates");
+            }
             self.bump();
             let rhs = self.parse_expr_bp(bp + 1);
             let span = lhs.span.to(rhs.span);
@@ -798,6 +882,7 @@ impl<'a> Parser<'a> {
             }
             match self.kind() {
                 T::LParen => {
+                    self.ambiguous_continuation("calls the expression above");
                     let args = self.parse_args();
                     lhs = self.finish_expr(
                         start,
@@ -809,6 +894,7 @@ impl<'a> Parser<'a> {
                     );
                 }
                 T::LBracket => {
+                    self.ambiguous_continuation("indexes the expression above");
                     let bracket = self.span();
                     self.bump();
                     let mut indices = Vec::new();
@@ -1334,11 +1420,15 @@ impl<'a> Parser<'a> {
         let mut tail = None;
         while !self.at(T::RBrace) && !self.at(T::Eof) {
             let before = self.pos;
+            // The error count when this statement began: `missing_semi` stays quiet about a
+            // statement that has already been reported as broken.
+            let mark = self.diags.len();
             let stmt_start = self.span();
             let attrs = self.parse_attrs();
             match self.kind() {
                 T::Let => {
                     let k = self.parse_let();
+                    self.end_stmt(before, mark, "a `let` statement", false);
                     stmts.push(self.mk_stmt(attrs, k, stmt_start));
                 }
                 T::Const => {
@@ -1354,7 +1444,7 @@ impl<'a> Parser<'a> {
                     let ty = Some(self.parse_type());
                     self.expect(T::Eq);
                     let init = Some(self.parse_expr());
-                    self.eat(T::Semi);
+                    self.end_stmt(before, mark, "a `const` statement", false);
                     let k = StmtKind::Let {
                         pat,
                         mutable: false,
@@ -1370,7 +1460,7 @@ impl<'a> Parser<'a> {
                     } else {
                         Some(self.parse_expr())
                     };
-                    self.eat(T::Semi);
+                    self.end_stmt(before, mark, "`return`", true);
                     stmts.push(self.mk_stmt(attrs, StmtKind::Return(e), stmt_start));
                 }
                 T::Break => {
@@ -1388,7 +1478,7 @@ impl<'a> Parser<'a> {
                     } else {
                         Some(self.parse_expr())
                     };
-                    self.eat(T::Semi);
+                    self.end_stmt(before, mark, "`break`", true);
                     stmts.push(self.mk_stmt(attrs, StmtKind::Break(label, value), stmt_start));
                 }
                 T::Continue => {
@@ -1398,7 +1488,7 @@ impl<'a> Parser<'a> {
                     } else {
                         None
                     };
-                    self.eat(T::Semi);
+                    self.end_stmt(before, mark, "`continue`", true);
                     stmts.push(self.mk_stmt(attrs, StmtKind::Continue(label), stmt_start));
                 }
                 T::Defer => {
@@ -1441,7 +1531,7 @@ impl<'a> Parser<'a> {
                     if let Some(op) = cur_assign_op(self.kind()) {
                         self.bump();
                         let value = self.parse_expr();
-                        self.eat(T::Semi);
+                        self.end_stmt(before, mark, "an assignment", true);
                         stmts.push(self.mk_stmt(
                             attrs,
                             StmtKind::Assign {
@@ -1457,6 +1547,10 @@ impl<'a> Parser<'a> {
                         tail = Some(Box::new(e));
                         break;
                     } else {
+                        // A block-like expression ends its own statement (Rust's rule).
+                        if !is_block_like(&e) {
+                            self.missing_semi(before, mark, "an expression statement", true);
+                        }
                         stmts.push(self.mk_stmt(attrs, StmtKind::Expr(e), stmt_start));
                     }
                 }
@@ -1502,7 +1596,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.eat(T::Semi);
+        // The terminating `;` is the caller's (`parse_block`'s `end_stmt`).
         StmtKind::Let {
             pat,
             mutable,
@@ -1998,6 +2092,15 @@ fn binop_bp(op: BinOp) -> u8 {
         Add | Sub => 8,
         Mul | Div | Rem => 9,
     }
+}
+
+/// An expression that ends its own statement, as in Rust: a `{ … }` block, `if`, `match` or
+/// `loop`. Statement position needs no `;` after one.
+fn is_block_like(e: &Expr) -> bool {
+    matches!(
+        e.kind,
+        ExprKind::Block(_) | ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::Loop { .. }
+    )
 }
 
 /// The opening delimiter a closing one matches (`)` → `(`), or `None` for any other token.
@@ -2543,5 +2646,109 @@ mod tests {
             d.is_empty(),
             "wide shallow block should parse cleanly, got {d:?}"
         );
+    }
+
+    /// Parse `src` as a module through the driver's entry point; return the error codes and the
+    /// lint codes separately.
+    fn lint_codes(src: &str) -> (Vec<&'static str>, Vec<&'static str>) {
+        let mut i = Interner::new();
+        let (tokens, lexed) = wukong_lexer::tokenize(src, SourceId(0));
+        let out = parse_module_tokens_with_lints(&tokens, src, &mut i, 0);
+        let errors = lexed
+            .iter()
+            .chain(&out.diags)
+            .filter_map(|d| d.code)
+            .collect();
+        assert!(out
+            .lints
+            .iter()
+            .all(|d| d.severity == wukong_diag::Severity::Warning));
+        (errors, out.lints.iter().filter_map(|d| d.code).collect())
+    }
+
+    /// `W0030`: a statement's missing `;` is a warning (the parse is unchanged), anchored just
+    /// after the statement; the Rust exemptions hold — no `;` is needed after a block-like
+    /// statement, nor before the closing `}` for anything but a `let`.
+    #[test]
+    fn missing_semicolon_is_w0030_with_rust_exemptions() {
+        let src =
+            "fn main() -> i32 {\n    let a: i32 = 3\n    print(a)\n    a = 4\n    return a\n}\n";
+        let (errors, lints) = lint_codes(src);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            lints,
+            vec!["W0030", "W0030", "W0030"],
+            "let, print(a), a = 4"
+        );
+        let mut i = Interner::new();
+        let (tokens, _) = wukong_lexer::tokenize(src, SourceId(0));
+        let out = parse_module_tokens_with_lints(&tokens, src, &mut i, 0);
+        let after_three = (src.find("3\n").unwrap() + 1) as u32;
+        let at = out.lints[0].primary_span().unwrap();
+        assert_eq!((at.lo, at.hi), (after_three, after_three));
+        // Block-like statements, statements before `}`, and the old terminated forms are clean.
+        let clean = "fn main() -> i32 {\n    let x: i32 = 1;\n    if x > 0 { print(x); }\n    \
+                     loop { break }\n    match x { _ => { } }\n    while x < 0 { }\n    { print(2) }\n    \
+                     return x\n}\n";
+        assert_eq!(lint_codes(clean), (Vec::<&str>::new(), Vec::<&str>::new()));
+        // A `let` needs its `;` even before `}`.
+        assert_eq!(lint_codes("fn f() { let y: i32 = 2 }").1, vec!["W0030"]);
+        // Two statements on one line: still a missing `;`.
+        assert_eq!(
+            lint_codes("fn f() { let y: i32 = 2 let z: i32 = 3; }").1,
+            vec!["W0030"]
+        );
+    }
+
+    /// A statement that is already broken — a parse error inside it, or a character the lexer
+    /// rejected — is not also reported as missing its `;`.
+    #[test]
+    fn broken_statement_draws_no_w0030() {
+        let (errors, lints) =
+            lint_codes("fn main() -> i32 {\n    let x: i32 = 1 $ 2;\n    return x;\n}\n");
+        assert_eq!(errors, vec!["E0101"]);
+        assert_eq!(lints, Vec::<&str>::new());
+        let (errors, lints) =
+            lint_codes("fn main() -> i32 {\n    let x: i32 = f(1, 2\n    return x;\n}\n");
+        assert_eq!(errors, vec!["E0200"]);
+        assert_eq!(lints, Vec::<&str>::new());
+    }
+
+    /// `W0031`: a `(`, `[` or touching `-` that starts a line continues the expression above it.
+    /// Inside `(…)`/`[…]` no statement can begin, so nothing is reported there; a `- y` with a space
+    /// is the ordinary continued-subtraction style.
+    #[test]
+    fn line_leading_continuation_is_w0031() {
+        let src = "fn main() -> i32 {\n    let x: i32 = f\n    (2);\n    let y: i32 = a\n    [0];\n    \
+                   let z: i32 = x\n    -1;\n    let w: i32 = x * 10\n        - y;\n    return 0;\n}\n";
+        let (errors, lints) = lint_codes(src);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(lints, vec!["W0031", "W0031", "W0031"], "`(`, `[`, `-1`");
+        // The call still parses as a call: the lint changes no parse.
+        let mut i = Interner::new();
+        let (m, _) = parse_module(src, SourceId(0), &mut i);
+        let ItemKind::Fn(f) = &m.items[0].kind else {
+            panic!("expected a fn item")
+        };
+        let StmtKind::Let {
+            init: Some(init), ..
+        } = &f.body.as_ref().unwrap().stmts[0].kind
+        else {
+            panic!("expected `let x = …`")
+        };
+        assert!(matches!(init.kind, ExprKind::Call { .. }), "{init:?}");
+        // Inside parentheses a line-leading `(` or `-1` is unambiguous.
+        let inside =
+            "fn main() -> i32 {\n    let x: i32 = g(f\n        (2),\n        3\n        -1);\n    \
+                      return x;\n}\n";
+        assert_eq!(lint_codes(inside), (Vec::<&str>::new(), Vec::<&str>::new()));
+    }
+
+    /// The entry points other than `parse_module_tokens_with_lints` never report a lint.
+    #[test]
+    fn plain_entry_points_drop_lints() {
+        let mut i = Interner::new();
+        let (_m, d) = parse_module("fn f() { let y: i32 = 2 }", SourceId(0), &mut i);
+        assert!(d.is_empty(), "{d:?}");
     }
 }

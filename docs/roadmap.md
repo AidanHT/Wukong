@@ -500,6 +500,15 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   lint's exact output (`crates/wukongc/tests/warn.rs`). Not yet: `unused_imports` (waits for the
   module-scoped resolver), the corpus held to zero warnings (the census test is `#[ignore]`d until a
   first full run blesses `tests/run` and `examples/`), and machine-applicable suggestions.
+- **Statement terminators.** `;` stays optional where it always was, but leaving it out is now
+  **`W0030 missing_semicolon`** (Rust's exemptions: after a block-like statement, and before the
+  closing `}` for anything but a `let`), and a `(`/`[` — or a `-` touching its operand — at the
+  start of a line, which silently continues the expression above (`acc = a[i]` then `(b + c)` is
+  a call), is **`W0031 ambiguous_continuation`** (only where a statement could begin; `- y` with a
+  space stays silent). The parser hands both out on a separate channel
+  (`parse_module_tokens_with_lints`), so no caller asserting a clean parse changes. `E0210` is
+  reserved for making a missing `;` an error. Not yet: imported files' parser lints (the loader
+  still uses the lint-free entry point), and `defer` statements' terminator.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup

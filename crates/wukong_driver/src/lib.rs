@@ -301,8 +301,14 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Parsing ---
     let mut interner = Interner::new();
-    let (mut module, parse_diags, mut next_node) =
-        wukong_parser::parse_module_tokens_from(&tokens, sm.source(id), &mut interner, 0);
+    // The root file's parser lints (`W0030`/`W0031`) wait for the lint stage below, where every
+    // lint's level is resolved together; imported files are parsed by the loader without them.
+    let wukong_parser::ParseOutput {
+        mut module,
+        diags: parse_diags,
+        mut next_node,
+        lints: parse_lints,
+    } = wukong_parser::parse_module_tokens_with_lints(&tokens, sm.source(id), &mut interner, 0);
     // The AST owns its data; keep root tokens out of the import/sema/backend memory peak.
     drop(tokens);
     for d in parse_diags {
@@ -315,8 +321,9 @@ pub fn compile(opts: &Options) -> i32 {
     // (`--emit=mir-high` onward, `--run`) sees.
     if opts.emit == EmitStage::Ast {
         render_all(opts.error_format, &renderer, &sink, &sm);
+        let denied = render_lints(parse_lints, &module, &interner, opts, &renderer, &sm);
         print_artifact(&wukong_ast::print::print_module(&module, &interner));
-        return if sink.has_errors() {
+        return if sink.has_errors() || denied {
             exit::COMPILE_ERROR
         } else {
             exit::OK
@@ -325,6 +332,7 @@ pub fn compile(opts: &Options) -> i32 {
 
     if sink.has_errors() {
         render_all(opts.error_format, &renderer, &sink, &sm);
+        render_lints(parse_lints, &module, &interner, opts, &renderer, &sm);
         return exit::COMPILE_ERROR;
     }
 
@@ -344,6 +352,7 @@ pub fn compile(opts: &Options) -> i32 {
     );
     render_all(opts.error_format, &renderer, &sink, &sm);
     if sink.has_errors() {
+        render_lints(parse_lints, &module, &interner, opts, &renderer, &sm);
         return exit::COMPILE_ERROR;
     }
     drop(sink);
@@ -354,6 +363,9 @@ pub fn compile(opts: &Options) -> i32 {
         emit_diag(d, opts.error_format, &renderer, &sm);
     }
     if sema_diags.iter().any(|d| d.is_error()) {
+        // The parser's lints still print — after the errors — when sema fails: a `(` that
+        // continued the line above (`W0031`) is often why a call does not type-check.
+        render_lints(parse_lints, &module, &interner, opts, &renderer, &sm);
         return exit::COMPILE_ERROR;
     }
     drop(sema_diags);
@@ -363,12 +375,14 @@ pub fn compile(opts: &Options) -> i32 {
     // resolved now, while the AST is alive, and a denied lint stops the build here as an error.
     // Warnings are held back and printed after lowering's diagnostics, so a failed build always
     // leads with an error — the contract `tests/fail` pins on the first diagnostic.
-    let lint_diags = wukong_sema::lints::apply_levels(
-        wukong_sema::lints::run(&module, &sema, &interner, &lint_options_for(opts)),
+    let mut found = parse_lints;
+    found.extend(wukong_sema::lints::run(
         &module,
+        &sema,
         &interner,
-        &opts.lint_levels,
-    );
+        &lint_options_for(opts),
+    ));
+    let lint_diags = wukong_sema::lints::apply_levels(found, &module, &interner, &opts.lint_levels);
     if lint_diags.iter().any(Diagnostic::is_error) {
         let (denied, warned): (Vec<&Diagnostic>, Vec<&Diagnostic>) =
             lint_diags.iter().partition(|d| d.is_error());
@@ -2017,6 +2031,24 @@ fn render_all(fmt: ErrorFormat, renderer: &Renderer, sink: &DiagnosticSink, sm: 
     for d in sink.diagnostics() {
         emit_diag(d, fmt, renderer, sm);
     }
+}
+
+/// Resolve the levels of `lints` (the parser's, on a build that stops before the lint stage)
+/// against `module` and render them, after whatever was rendered before. Returns whether any was
+/// denied, i.e. is now an error.
+fn render_lints(
+    lints: Vec<Diagnostic>,
+    module: &wukong_ast::Module,
+    interner: &Interner,
+    opts: &Options,
+    renderer: &Renderer,
+    sm: &SourceMap,
+) -> bool {
+    let lints = wukong_sema::lints::apply_levels(lints, module, interner, &opts.lint_levels);
+    for d in &lints {
+        emit_diag(d, opts.error_format, renderer, sm);
+    }
+    lints.iter().any(Diagnostic::is_error)
 }
 
 /// What the lint pass must know about how this build's artifact is used: which functions besides

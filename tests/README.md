@@ -16,7 +16,7 @@ harnesses that consume them live in `crates/wukongc/tests/` and reach this direc
 | `run/lib/` | 2 (`mathlib.wk`, `deep.wk`) | Support modules for `run/import_multi.wk`. **Not fixtures** — harnesses use non-recursive `read_dir`. |
 | `fail/` | **113** top-level `*.wk` | Must be **rejected at compile time** with a specific stable diagnostic code. Directory is `tests/fail`, **not** `tests/compile-fail`. |
 | `fail/lib/` | 2 (`badlib.wk`, `dup.wk`) | Support for import fixtures. **Not fixtures.** |
-| `warn/` | 10 top-level `*.wk` | Must **compile** and produce exactly the warnings (lints) their `// EXPECT-WARN:` / `// EXPECT-ERROR:` / `// EXPECT-NONE` lines list, in order. |
+| `warn/` | 12 top-level `*.wk` | Must **compile** and produce exactly the warnings (lints) their `// EXPECT-WARN:` / `// EXPECT-ERROR:` / `// EXPECT-NONE` lines list, in order. |
 | `imports/` | 6 | Flat import-graph fixtures consumed **only** by `crates/wukong_driver/src/loader.rs` unit tests. E2e harnesses ignore this directory. |
 
 See each subdirectory's `README.md` for format details and landmines.
