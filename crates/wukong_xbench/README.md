@@ -25,6 +25,14 @@ loop over the same buffers:
 
 Reports compile time and ns/call per column. A missing toolchain prints `n/a` and continues.
 
+**Library-grade peers (oneMKL, resolved at runtime from `mkl_rt`; `n/a` when absent).** GEMM
+(`cblas_sgemm_64`: NN, NT, TN), GEMV (`cblas_sgemv_64`), transpose (`MKL_Somatcopy`), int8 GEMM
+(`cblas_gemm_s8u8s32_64`, held to bit equality like every int8 column), `vsMul` for the Hadamard
+row, `cblas_sdot_64` for the dot row, and fifteen VML transcendentals (exp, log, tanh, sin, cos,
+erf, exp2, log2, sinh, cosh, asinh, acosh, atan, expm1, log1p) - each in VML's default HA mode
+*and* at `VML_LA` through the explicit-mode `vms*` entry points, the accuracy-matched bar. Every
+library column is cross-checked against Wukong and dropped with a note when it disagrees.
+
 Every battery row additionally reports a **`wk(gen)` recognition-off line** (master plan §7.2): the
 same source lowered with every kernel recognizer skipped (`LowerOptions::recognize = false`, the
 `WUKONG_NO_RECOGNIZE` / `@generic` lowering), its ratio vs C and vs the recognizer-on column, and

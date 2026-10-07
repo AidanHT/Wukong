@@ -726,18 +726,52 @@ fn main() {
             cfast,
             comp,
             vml,
+            vml_la,
+            lib_label,
         } = bench_table_kernel(k, &cc, &dir, &mut out, xp, yp);
         report(k, &wukong, &c, &cpp, &rust, &cfast, &comp);
         // oneMKL VML peer for the transcendentals MKL ships a vector op for: the elementwise analogue
         // of the GEMM-vs-cblas comparison. Wukong's hand-AVX2 vmath vs Intel's hand-tuned VML, both
         // single-thread, same buffer. Cross-checked against Wukong's output (a large rel error would
         // expose a VML ABI mismatch — then the column is dishonest, so it is dropped with a note).
+        // The library columns are held to the row's own bar: the relaxed 1e-2 for a reduction (a
+        // library dot reassociates like C(fast) does), 1e-3 otherwise.
+        let lib_bar = if is_reduction_kernel(k.name) {
+            1e-2
+        } else {
+            1e-3
+        };
+        if let (Some(v), Some(m)) = (vml_la, &wukong) {
+            let (rel, at) = max_rel_err(&m.out, &v.out);
+            if rel > lib_bar {
+                println!(
+                    "  -> {lib_label} disagrees with Wukong at [{at}] in VML_LA mode (rel {rel:.1e}) \
+                     — VML_LA column dropped"
+                );
+            } else {
+                let r = v.ns_per_call / m.ns_per_call; // >1 ⇒ Wukong faster
+                standing!(
+                    "  -> Wukong vmath is {:.2}x {} than {lib_label} at VML_LA (the accuracy-matched \
+                     library bar), 1 thread",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" },
+                );
+            }
+        }
         if let (Some(v), Some(m)) = (vml, &wukong) {
             let (rel, at) = max_rel_err(&m.out, &v.out);
-            if rel > 1e-3 {
+            if rel > lib_bar {
                 println!(
-                    "  -> oneMKL VML disagrees with Wukong at [{at}] (rel {rel:.1e}) — likely an ABI \
-                     mismatch on this MKL build; VML column dropped"
+                    "  -> {lib_label} disagrees with Wukong at [{at}] (rel {rel:.1e}) — likely an ABI \
+                     mismatch on this MKL build; library column dropped"
+                );
+            } else if lib_label != "oneMKL VML" || k.name == "hadamard" {
+                // `vsMul` and `cblas_sdot` are exact-semantics primitives: no accuracy mode to match.
+                let r = v.ns_per_call / m.ns_per_call; // >1 ⇒ Wukong faster
+                standing!(
+                    "  -> Wukong is {:.2}x {} than {lib_label} (library primitive), 1 thread",
+                    if r >= 1.0 { r } else { 1.0 / r },
+                    if r >= 1.0 { "faster" } else { "slower" },
                 );
             } else {
                 let r = v.ns_per_call / m.ns_per_call; // >1 ⇒ Wukong faster
@@ -757,9 +791,9 @@ fn main() {
                 // in-crate matched-accuracy probe. Treat it as an upper bound, not a standing.
                 println!(
                     "     (VML here runs in its DEFAULT ~0.5-ULP HA mode — NOT accuracy-matched \
-                     against Wukong's ≤2 ULP exp / ≤12 ULP log / ≤1 ULP tanh. At matched accuracy \
-                     (VML_LA) the in-crate probe reads exp and log as a TIE. Upper bound, not a \
-                     standing.)"
+                     against Wukong's kernels (e.g. ≤2 ULP exp / ≤12 ULP log / ≤1 ULP tanh). The \
+                     VML_LA line, where printed, is the matched-accuracy bar; this one is an upper \
+                     bound, not a standing.)"
                 );
             }
         }
@@ -1106,7 +1140,12 @@ struct TableRow {
     rust: Option<Measure>,
     cfast: Option<Measure>,
     comp: Option<Measure>,
+    /// The single-threaded oneMKL column (`lib_label` names it): VML at its default HA accuracy,
+    /// `vsMul`, or `cblas_sdot`.
     vml: Option<Measure>,
+    /// The same VML op at `VML_LA` - the accuracy-matched library bar for a transcendental row.
+    vml_la: Option<Measure>,
+    lib_label: &'static str,
 }
 
 /// Build all table peers, including optional VML, before rotating their fixed slots.
@@ -1173,11 +1212,35 @@ fn bench_table_kernel(
         };
         build_peer("c", &src, dir, &format!("{}_omp", k.name), cc, flags)
     });
-    let vml_fn = match k.name {
-        "exp" => mkl().and_then(|a| a.vs_exp),
-        "log" => mkl().and_then(|a| a.vs_ln),
-        "tanh" => mkl().and_then(|a| a.vs_tanh),
-        _ => None,
+    // LIBRARY-GRADE PEERS for every row oneMKL ships the exact primitive for (P6.2): the fifteen
+    // VML transcendentals in [`VML_UNARY`], `vsMul` for the Hadamard product and `cblas_sdot` for
+    // the dot reduction. All single-threaded, like the Wukong column they are read against. The
+    // transcendentals carry a SECOND library column, the same VML op at `VML_LA`: the default mode
+    // is HA (~0.5-1 ULP, stricter than Wukong's kernels), so the HA column is an upper bound on the
+    // peer's cost and the LA column is the bar at matched accuracy. Absent symbols leave the slot
+    // `Missing` - the column reads `n/a`, never a stand-in.
+    let api = mkl();
+    let vml_op = api.and_then(|a| a.vml_for(k.name));
+    let lib_label = match (k.name, vml_op) {
+        (_, Some(_)) | ("hadamard", None) => "oneMKL VML",
+        ("dot", None) => "oneMKL cblas_sdot",
+        _ => "oneMKL",
+    };
+    let lib = match (k.name, vml_op) {
+        (_, Some((ha, _))) => Built::Direct(Box::new(move |o| Some(bench_vml(ha, xp, o)))),
+        ("hadamard", None) => match api.and_then(|a| a.vs_mul) {
+            Some(f) => Built::Direct(Box::new(move |o| Some(bench_vml_binary(f, xp, yp, o)))),
+            None => Built::Missing,
+        },
+        ("dot", None) => match api.and_then(|a| a.sdot) {
+            Some(f) => Built::Direct(Box::new(move |o| Some(bench_sdot(f, xp, yp, o)))),
+            None => Built::Missing,
+        },
+        _ => Built::Missing,
+    };
+    let lib_la = match vml_op.and_then(|(_, la)| la) {
+        Some(f) => Built::Direct(Box::new(move |o| Some(bench_vml_mode(f, VML_LA, xp, o)))),
+        None => Built::Missing,
     };
     let columns = [
         Built::wk(wk),
@@ -1188,10 +1251,8 @@ fn bench_table_kernel(
         Built::peer(rl),
         Built::peer(fl),
         Built::peer(ol),
-        match vml_fn {
-            Some(f) => Built::Direct(Box::new(move |o| Some(bench_vml(f, xp, o)))),
-            None => Built::Missing,
-        },
+        lib,
+        lib_la,
     ];
     // Each column's first sample, then the spread its second sample makes with it.
     let mut first: Vec<Option<f64>> = vec![None; columns.len()];
@@ -1218,8 +1279,9 @@ fn bench_table_kernel(
     let wukong = timed.next().flatten();
     let wukgen = timed.next().flatten();
     let c = timed.next().flatten();
-    let _c_twin = timed.next(); // slot 3: read through `dispersion::twin_control(2, 3)`
-                                // The caller opened this row's section before building it, so the floor lands in its scope.
+    // Slot 3 is C(twin), read through `dispersion::twin_control(2, 3)`. The caller opened this
+    // row's section before building it, so the floor lands in this row's scope.
+    let _c_twin = timed.next();
     dispersion::twin_control(2, 3);
     let cpp = cpp_checked(k.name, &c, timed.next().flatten());
     let rust = timed.next().flatten();
@@ -1234,6 +1296,7 @@ fn bench_table_kernel(
             .is_some_and(|m| relaxed_peer_ok(k.name, "C(omp)", m, p))
     });
     let vml = timed.next().flatten();
+    let vml_la = timed.next().flatten();
     TableRow {
         wukong,
         wukgen,
@@ -1245,6 +1308,8 @@ fn bench_table_kernel(
         cfast,
         comp,
         vml,
+        vml_la,
+        lib_label,
     }
 }
 
@@ -6800,12 +6865,27 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
             ],
         );
         // Every compiled column keeps its slot, including unavailable peers.
+        // LIBRARY-GRADE PEER (P6.2): oneMKL's integer GEMM, the exact primitive this family
+        // benchmarks, at one thread and at all of MKL's threads. Absent MKL or symbol: `n/a`.
+        let mkl_threads = mkl().map_or(1, |api| api.max_threads);
         let columns = [
             BuiltI8::Wukong(built_wuk.map(Box::new)),
             BuiltI8::Wukong(built_wk_par.map(Box::new)),
             BuiltI8::Peer(built_cm),
             BuiltI8::Peer(built_cm_cpp),
             BuiltI8::Peer(built_rm),
+            BuiltI8::Mkl {
+                m: ns,
+                n: ns,
+                k: ns,
+                threads: 1,
+            },
+            BuiltI8::Mkl {
+                m: ns,
+                n: ns,
+                k: ns,
+                threads: mkl_threads,
+            },
         ];
         let mut timed = abba_min_columns(columns.len(), |i| {
             time_built_i8(&columns[i], &mut c, ap, bp)
@@ -6816,19 +6896,23 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
         let cm = timed.next().flatten();
         let cm_cpp = cpp_checked_i8("i8gemm", &cm, timed.next().flatten());
         let rm = timed.next().flatten();
+        let mkl_1c = mkl_i8_exact(&wuk, timed.next().flatten(), "MKL(1c)");
+        let mkl_all = mkl_i8_exact(&wuk, timed.next().flatten(), "MKL(all)");
 
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
-            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "Rust"
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "", "Wuk(1core)", "Wuk(par)", "C (gcc)", "C++ (g++)", "Rust", "MKL(1c)", "MKL(all)"
         );
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "GOP/s",
             gops(&wuk),
             gops(&wk_par),
             gops(&cm),
             gops(&cm_cpp),
-            gops(&rm)
+            gops(&rm),
+            gops(&mkl_1c),
+            gops(&mkl_all)
         );
         // Compile time (Wukong front-end + JIT vs gcc/rustc to a shared lib) — Wukong is far cheaper.
         let cms = |m: &Option<MeasureI8>| {
@@ -6837,13 +6921,15 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
                 .unwrap_or_else(|| "n/a".into())
         };
         println!(
-            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11}",
+            "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
             "compile ms",
             cms(&wuk),
             cms(&wk_par),
             cms(&cm),
             cms(&cm_cpp),
-            cms(&rm)
+            cms(&rm),
+            cms(&mkl_1c),
+            cms(&mkl_all)
         );
         // Integer arithmetic → exact equality is the correct cross-language bar. Every available
         // result must match the single-core Wukong reference exactly; a mismatch is a real bug.
@@ -6899,6 +6985,23 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
         if let (Some(mp), Some(c2)) = (&wk_par, &cm_cpp) {
             let r = c2.ns_per_call / mp.ns_per_call;
             par_standing("idiomatic single-threaded C++ (g++)", r);
+        }
+        // The library bar: like-for-like threading on both lines.
+        if let (Some(m), Some(p)) = (&wuk, &mkl_1c) {
+            let r = p.ns_per_call / m.ns_per_call;
+            standing!(
+                "  -> Wukong (1 core) is {:.2}x {} than oneMKL cblas_gemm_s8u8s32 (1 thread)",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
+        }
+        if let (Some(mp), Some(p)) = (&wk_par, &mkl_all) {
+            let r = p.ns_per_call / mp.ns_per_call;
+            standing!(
+                "  -> Wukong @parallel is {:.2}x {} than oneMKL cblas_gemm_s8u8s32 (MKL(all), all threads)",
+                if r >= 1.0 { r } else { 1.0 / r },
+                if r >= 1.0 { "faster" } else { "slower" }
+            );
         }
         println!();
     }
@@ -8832,6 +8935,13 @@ fn time_peer_i8(
 enum BuiltI8 {
     Wukong(Option<Box<WukongJit>>),
     Peer(Option<PeerLib>),
+    /// oneMKL's `cblas_gemm_s8u8s32` over the `i8gemm` shape, at `threads` MKL threads.
+    Mkl {
+        m: usize,
+        n: usize,
+        k: usize,
+        threads: i32,
+    },
 }
 
 fn time_built_i8(
@@ -8846,6 +8956,30 @@ fn time_built_i8(
             let (compile, lib) = peer.as_ref()?;
             time_peer_i8(lib, *compile, out, ap, bp)
         }
+        BuiltI8::Mkl { m, n, k, threads } => bench_i8gemm_mkl(*m, *n, *k, *threads, ap, bp, out),
+    }
+}
+
+/// Hold a oneMKL int8 column to BIT equality with Wukong, as every int8 column is; drop it with a
+/// note on any disagreement rather than publish a ratio against a different answer.
+fn mkl_i8_exact(wuk: &Option<MeasureI8>, p: Option<MeasureI8>, label: &str) -> Option<MeasureI8> {
+    let p = p?;
+    match wuk {
+        Some(m) if m.out != p.out => {
+            let at = m
+                .out
+                .iter()
+                .zip(&p.out)
+                .position(|(x, y)| x != y)
+                .unwrap_or(0);
+            println!(
+                "  ! i8gemm: {label} (cblas_gemm_s8u8s32) disagrees with Wukong at [{at}]: {} vs \
+                 {} — column dropped (an AVX2 path without VNNI may saturate 16-bit pair sums)",
+                p.out[at], m.out[at]
+            );
+            None
+        }
+        _ => Some(p),
     }
 }
 
@@ -9144,6 +9278,64 @@ type MklGetMaxThreadsFn = unsafe extern "C" fn() -> i32;
 // ABI mismatch (garbage output) by reporting a large rel error, in which case the column is dropped.
 type VmlUnaryFn = unsafe extern "C" fn(i64, *const f32, *mut f32);
 
+// The same VML op with an explicit per-call accuracy mode: `vmsExp(n, a, y, mode)`, `mode` a 64-bit
+// `MKL_INT64`. Passing the mode per call leaves the process-global `vmlSetMode` untouched, so no
+// other column can inherit it. `VML_LA` is `0x1` in `mkl_vml_defines.h` (HA is `0x2`, EP `0x3`).
+type VmlModeUnaryFn = unsafe extern "C" fn(i64, *const f32, *mut f32, i64);
+const VML_LA: i64 = 0x1;
+// `vsMul(n, a, b, y)` => `y[i] = a[i]*b[i]`, correctly rounded in every mode.
+type VmlBinaryFn = unsafe extern "C" fn(i64, *const f32, *const f32, *mut f32);
+// ILP64 `cblas_sdot_64(n, x, incx, y, incy) -> float`.
+type CblasSdotFn = unsafe extern "C" fn(i64, *const f32, i64, *const f32, i64) -> f32;
+// ILP64 integer GEMM `cblas_gemm_s8u8s32_64(layout, transa, transb, offsetc, m, n, k, alpha, a,
+// lda, ao, b, ldb, bo, beta, c, ldc, co)`: `a` is SIGNED int8, `b` UNSIGNED int8, `c` int32, the
+// offsets `ao`/`bo` are `MKL_INT8`, and `co` points at the int32 C offset(s). Only the `_64`
+// spelling is resolved - the interface-layer trap recorded on `cblas_sgemm_64` applies here too.
+type CblasGemmS8u8s32Fn = unsafe extern "C" fn(
+    i32,
+    i32,
+    i32,
+    i32,
+    i64,
+    i64,
+    i64,
+    f32,
+    *const i8,
+    i64,
+    i8,
+    *const u8,
+    i64,
+    i8,
+    f32,
+    *mut i32,
+    i64,
+    *const i32,
+);
+const CBLAS_COL_MAJOR: i32 = 102;
+/// `CblasFixOffset`: one scalar C offset (`*co`) for the whole matrix.
+const CBLAS_FIX_OFFSET: i32 = 173;
+
+/// Elementwise-table rows with an exact oneMKL VML twin: `(row name, vs* symbol, vms* symbol)`.
+/// Every row here computes `out[i] = f(x[i])` over the shared buffer, which is exactly the VML
+/// contract; the buffer is `[1, 9]`, inside every listed op's domain (acosh included).
+const VML_UNARY: [(&str, &[u8], &[u8]); 15] = [
+    ("exp", b"vsExp\0", b"vmsExp\0"),
+    ("log", b"vsLn\0", b"vmsLn\0"),
+    ("tanh", b"vsTanh\0", b"vmsTanh\0"),
+    ("sin", b"vsSin\0", b"vmsSin\0"),
+    ("cos", b"vsCos\0", b"vmsCos\0"),
+    ("erf", b"vsErf\0", b"vmsErf\0"),
+    ("exp2", b"vsExp2\0", b"vmsExp2\0"),
+    ("log2", b"vsLog2\0", b"vmsLog2\0"),
+    ("sinh", b"vsSinh\0", b"vmsSinh\0"),
+    ("cosh", b"vsCosh\0", b"vmsCosh\0"),
+    ("asinh", b"vsAsinh\0", b"vmsAsinh\0"),
+    ("acosh", b"vsAcosh\0", b"vmsAcosh\0"),
+    ("atan", b"vsAtan\0", b"vmsAtan\0"),
+    ("expm1", b"vsExpm1\0", b"vmsExpm1\0"),
+    ("log1p", b"vsLog1p\0", b"vmsLog1p\0"),
+];
+
 // ILP64 GEMV `cblas_sgemv_64(layout, trans, m, n, alpha, a, lda, x, incx, beta, y, incy)`. Same
 // interface-layer reasoning as `cblas_sgemm_64` above: the enums stay 32-bit `int`, the dimensions
 // and strides are 64-bit `MKL_INT`, and resolving the `_64` spelling sidesteps mkl_rt's default
@@ -9188,14 +9380,29 @@ struct MklApi {
     sgemm: CblasSgemmFn,
     set_threads: MklSetNumThreadsFn,
     max_threads: i32,
-    vs_exp: Option<VmlUnaryFn>,
-    vs_ln: Option<VmlUnaryFn>,
-    vs_tanh: Option<VmlUnaryFn>,
+    /// The resolved [`VML_UNARY`] rows: `(row name, vs* at default HA, vms* for an explicit mode)`.
+    vml: Vec<(&'static str, VmlUnaryFn, Option<VmlModeUnaryFn>)>,
+    /// `vsMul` - the library bar for the `hadamard` row.
+    vs_mul: Option<VmlBinaryFn>,
+    /// `cblas_sdot_64` - the library bar for the `dot` row.
+    sdot: Option<CblasSdotFn>,
+    /// `cblas_gemm_s8u8s32_64` - the library bar for the `i8gemm` family, which had none.
+    gemm_s8u8s32: Option<CblasGemmS8u8s32Fn>,
     /// `cblas_sgemv_64` - the library bar for the `gemv` family, which had none.
     sgemv: Option<CblasSgemvFn>,
     /// `mkl_somatcopy` - the library bar for the `transpose` family, which had none.
     somatcopy: Option<MklSomatcopyFn>,
     path: PathBuf,
+}
+
+impl MklApi {
+    /// The VML twin of an elementwise-table row, if MKL ships one and it resolved.
+    fn vml_for(&self, kernel: &str) -> Option<(VmlUnaryFn, Option<VmlModeUnaryFn>)> {
+        self.vml
+            .iter()
+            .find(|(name, _, _)| *name == kernel)
+            .map(|&(_, ha, la)| (ha, la))
+    }
 }
 
 /// Best-effort discovery of `mkl_rt.dll`: an explicit `WUKONG_MKL_DLL` override first, then the
@@ -9268,10 +9475,22 @@ fn mkl() -> Option<&'static MklApi> {
                 .get::<MklGetMaxThreadsFn>(b"MKL_Get_Max_Threads\0")
                 .ok()?;
             // VML transcendentals are optional (older MKL builds, or a stripped redist, may omit them).
-            let vml = |sym: &[u8]| lib.get::<VmlUnaryFn>(sym).ok().map(|s| *s);
-            let vs_exp = vml(b"vsExp\0");
-            let vs_ln = vml(b"vsLn\0");
-            let vs_tanh = vml(b"vsTanh\0");
+            // A row whose default-mode `vs*` symbol is absent gets no library column at all; its
+            // explicit-mode `vms*` twin is optional on top of that.
+            let vml: Vec<(&'static str, VmlUnaryFn, Option<VmlModeUnaryFn>)> = VML_UNARY
+                .iter()
+                .filter_map(|&(kernel, ha, la)| {
+                    let ha = *lib.get::<VmlUnaryFn>(ha).ok()?;
+                    let la = lib.get::<VmlModeUnaryFn>(la).ok().map(|s| *s);
+                    Some((kernel, ha, la))
+                })
+                .collect();
+            let vs_mul = lib.get::<VmlBinaryFn>(b"vsMul\0").ok().map(|s| *s);
+            let sdot = lib.get::<CblasSdotFn>(b"cblas_sdot_64\0").ok().map(|s| *s);
+            let gemm_s8u8s32 = lib
+                .get::<CblasGemmS8u8s32Fn>(b"cblas_gemm_s8u8s32_64\0")
+                .ok()
+                .map(|s| *s);
             // Optional, exactly like the VML ops: an older MKL or a stripped redist may omit them,
             // and the column then reads `n/a` the same way a missing toolchain does. Added
             // 2026-09-13 because 143 of the 155 measured sections had NO library-grade peer at all
@@ -9289,9 +9508,10 @@ fn mkl() -> Option<&'static MklApi> {
                 sgemm,
                 set_threads,
                 max_threads: get_max(),
-                vs_exp,
-                vs_ln,
-                vs_tanh,
+                vml,
+                vs_mul,
+                sdot,
+                gemm_s8u8s32,
                 sgemv,
                 somatcopy,
                 path,
@@ -9493,6 +9713,112 @@ fn bench_mm_mkl_tn(
         compile: Duration::ZERO,
         ns_per_call,
         out: c.to_vec(),
+    })
+}
+
+/// Time a oneMKL VML unary op at an explicit accuracy `mode` (`vmsXxx`), single-threaded - the
+/// accuracy-matched twin of [`bench_vml`].
+fn bench_vml_mode(f: VmlModeUnaryFn, mode: i64, x: *const f32, out: &mut [f32]) -> Measure {
+    if let Some(api) = mkl() {
+        unsafe { (api.set_threads)(1) };
+    }
+    let nn = out.len() as i64;
+    let op = out.as_mut_ptr();
+    let ns_per_call = time_ns(|| unsafe { f(nn, x, op, mode) });
+    Measure {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: out.to_vec(),
+    }
+}
+
+/// Time oneMKL's `vsMul` (`out = x*y`), single-threaded.
+fn bench_vml_binary(f: VmlBinaryFn, x: *const f32, y: *const f32, out: &mut [f32]) -> Measure {
+    if let Some(api) = mkl() {
+        unsafe { (api.set_threads)(1) };
+    }
+    let nn = out.len() as i64;
+    let op = out.as_mut_ptr();
+    let ns_per_call = time_ns(|| unsafe { f(nn, x, y, op) });
+    Measure {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: out.to_vec(),
+    }
+}
+
+/// Time oneMKL's `cblas_sdot` over the whole buffer, single-threaded, writing the result to
+/// `out[0]` inside the timed call - exactly the store the `dot` row's Wukong/C/Rust kernels make -
+/// over an otherwise zeroed buffer, so the full-buffer cross-check compares like with like.
+fn bench_sdot(f: CblasSdotFn, x: *const f32, y: *const f32, out: &mut [f32]) -> Measure {
+    if let Some(api) = mkl() {
+        unsafe { (api.set_threads)(1) };
+    }
+    out.iter_mut().for_each(|v| *v = 0.0);
+    let nn = out.len() as i64;
+    let op = out.as_mut_ptr();
+    let ns_per_call = time_ns(|| unsafe { *op = f(nn, x, 1, y, 1) });
+    Measure {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: out.to_vec(),
+    }
+}
+
+/// Time oneMKL's `cblas_gemm_s8u8s32` for the `i8gemm` family's `C[M,N] = A[M,K] . B[N,K]^T`, `A`
+/// unsigned, `B` signed, row-major, `C` int32, pinned to `threads` MKL threads.
+///
+/// MKL's operand order is the other way round - its FIRST operand is the signed one - so the call
+/// computes the column-major transpose: `C^T (N x M, ldc = N) = B (N x K) . A^T (K x M)`. Row-major
+/// `B[N,K]` is the column-major `K x N` matrix with `lda = K`, taken with `transa = Trans`; row-major
+/// `A[M,K]` is the column-major `K x M` matrix with `ldb = K`, taken as is. Zero offsets, `alpha =
+/// 1`, `beta = 0`. Integer arithmetic, so the caller holds the column to BIT equality and drops it on
+/// any disagreement (an AVX2 path without VNNI may saturate MKL's 16-bit pair sums).
+#[allow(clippy::too_many_arguments)]
+fn bench_i8gemm_mkl(
+    m: usize,
+    n: usize,
+    k: usize,
+    threads: i32,
+    a: *const u8,
+    b: *const i8,
+    out: &mut [i32],
+) -> Option<MeasureI8> {
+    let api = mkl()?;
+    let gemm = api.gemm_s8u8s32?;
+    let (mi, ni, ki) = (m as i64, n as i64, k as i64);
+    unsafe {
+        (api.set_threads)(threads.max(1));
+    }
+    out.iter_mut().for_each(|v| *v = 0);
+    let cp = out.as_mut_ptr();
+    let co: i32 = 0;
+    let ns_per_call = time_ns(|| unsafe {
+        gemm(
+            CBLAS_COL_MAJOR,
+            CBLAS_TRANS,
+            CBLAS_NO_TRANS,
+            CBLAS_FIX_OFFSET,
+            ni,
+            mi,
+            ki,
+            1.0,
+            b,
+            ki,
+            0,
+            a,
+            ki,
+            0,
+            0.0,
+            cp,
+            ni,
+            &co,
+        );
+    });
+    Some(MeasureI8 {
+        compile: Duration::ZERO,
+        ns_per_call,
+        out: out.to_vec(),
     })
 }
 
@@ -12590,6 +12916,10 @@ mod tests {
             "bench_transpose_mkl",
             "bench_mm_mkl_tn",
             "bench_vml",
+            "bench_vml_mode",
+            "bench_vml_binary",
+            "bench_sdot",
+            "bench_i8gemm_mkl",
             "bench_mm_tuned",
         ];
         let production = src.split("#[cfg(test)]\nmod tests").next().unwrap();
@@ -13083,5 +13413,109 @@ mod tests {
         let mut c = vec![0.0f32; 4];
         let m = bench_mm_mkl_tn(2, 2, 2, 1, &a, &b, &mut c).expect("cblas_sgemm_64 resolved");
         assert_eq!(m.out, vec![26.0, 30.0, 38.0, 44.0]);
+
+        // The int8 NT GEMM through MKL's operand-swapped, column-major call. M = 2, N = 3, K = 2:
+        // A (u8, [M,K]) = [[1,2],[3,250]], B (i8, [N,K]) = [[1,-1],[2,3],[-125,4]].
+        // C[i][j] = sum_k A[i][k]*B[j][k]:
+        //   row 0: 1-2 = -1, 2+6 = 8, -125+8 = -117
+        //   row 1: 3-250 = -247, 6+750 = 756, -375+1000 = 625
+        if api.gemm_s8u8s32.is_some() {
+            let a: Vec<u8> = vec![1, 2, 3, 250];
+            let b: Vec<i8> = vec![1, -1, 2, 3, -125, 4];
+            let mut c = vec![0i32; 6];
+            let m = bench_i8gemm_mkl(2, 3, 2, 1, a.as_ptr(), b.as_ptr(), &mut c)
+                .expect("cblas_gemm_s8u8s32_64 resolved");
+            assert_eq!(m.out, vec![-1, 8, -117, -247, 756, 625]);
+        } else {
+            eprintln!("cblas_gemm_s8u8s32_64 absent — i8gemm MKL columns will read n/a");
+        }
+
+        // vsMul and cblas_sdot on exact small values: products and sums of small integers.
+        let x: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let y: Vec<f32> = vec![5.0, 6.0, 7.0, 8.0];
+        if let Some(f) = api.vs_mul {
+            let mut o = vec![0.0f32; 4];
+            let m = bench_vml_binary(f, x.as_ptr(), y.as_ptr(), &mut o);
+            assert_eq!(m.out, vec![5.0, 12.0, 21.0, 32.0]);
+        }
+        if let Some(f) = api.sdot {
+            // 5 + 12 + 21 + 32 = 70, written to lane 0 of an otherwise zero buffer.
+            let mut o = vec![9.0f32; 4];
+            let m = bench_sdot(f, x.as_ptr(), y.as_ptr(), &mut o);
+            assert_eq!(m.out, vec![70.0, 0.0, 0.0, 0.0]);
+        }
+        // Every resolved VML op, both modes, against the f64 value at two points well inside every
+        // listed domain, called DIRECTLY (untimed - thirty timed calls would cost the suite half a
+        // minute for no extra coverage of the ABI). The bar is loose on purpose (1e-5 relative,
+        // ~80 ULP): this proves the ABI and the row-to-symbol mapping, not the accuracy mode.
+        let pts: [f32; 2] = [1.5, 2.5];
+        // erf has no std implementation; these are erf(1.5) and erf(2.5) to f64 precision.
+        let erf_ref: [f64; 2] = [0.9661051464753108, 0.999593047982555];
+        let reference = |name: &str, i: usize| -> f64 {
+            let v = pts[i] as f64;
+            match name {
+                "exp" => v.exp(),
+                "log" => v.ln(),
+                "tanh" => v.tanh(),
+                "sin" => v.sin(),
+                "cos" => v.cos(),
+                "erf" => erf_ref[i],
+                "exp2" => v.exp2(),
+                "log2" => v.log2(),
+                "sinh" => v.sinh(),
+                "cosh" => v.cosh(),
+                "asinh" => v.asinh(),
+                "acosh" => v.acosh(),
+                "atan" => v.atan(),
+                "expm1" => v.exp_m1(),
+                "log1p" => v.ln_1p(),
+                other => panic!("VML_UNARY row {other} has no reference here"),
+            }
+        };
+        for &(name, ha, la) in &api.vml {
+            let mut runs: Vec<[f32; 2]> = Vec::new();
+            let mut o = [0.0f32; 2];
+            // SAFETY: two-element input and output buffers, n = 2, the vs*/vms* ABI.
+            unsafe { ha(2, pts.as_ptr(), o.as_mut_ptr()) };
+            runs.push(o);
+            if let Some(f) = la {
+                let mut o = [0.0f32; 2];
+                unsafe { f(2, pts.as_ptr(), o.as_mut_ptr(), VML_LA) };
+                runs.push(o);
+            }
+            for out in runs {
+                for (i, got) in out.iter().enumerate() {
+                    let want = reference(name, i);
+                    let rel = ((*got as f64) - want).abs() / want.abs();
+                    assert!(rel < 1e-5, "{name}({}) = {got}, want {want}", pts[i]);
+                }
+            }
+        }
+    }
+
+    /// Every VML row name must be a real elementwise-table row, or its library column silently
+    /// never appears.
+    #[test]
+    fn every_vml_row_names_a_table_kernel() {
+        let names: Vec<&str> = kernels().iter().map(|k| k.name).collect();
+        for (name, ha, la) in VML_UNARY {
+            assert!(
+                names.contains(&name),
+                "VML_UNARY row `{name}` is not a kernel row"
+            );
+            assert!(
+                ha.starts_with(b"vs") && ha.ends_with(b"\0"),
+                "{name}: bad vs* symbol"
+            );
+            assert!(
+                la.starts_with(b"vms") && la.ends_with(b"\0"),
+                "{name}: bad vms* symbol"
+            );
+            assert_eq!(
+                &ha[2..],
+                &la[3..],
+                "{name}: the two modes must name the same op"
+            );
+        }
     }
 }
