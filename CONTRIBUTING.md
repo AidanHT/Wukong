@@ -340,3 +340,11 @@ $env:WUKONG_NO_RECOGNIZE='1'; cargo run -q -p wukongc -- --emit=mir -O2 tests/ru
 
 The exception is an **explicit builtin** the user calls by name (`alloc_f32`, `read_f32`, `sdpa`,
 `now_ns`): those are not guesses about intent and keep their runtime call in every mode.
+
+The same rule holds for floating-point value changes. `@strict_fp` / `--fp=strict` clear `recognize`
+and set `GemmSyms::strict_fp`, and every place the lowering fuses `x + y*z` into an `Fma` or
+reassociates a float reduction checks that flag: `try_contract_fma`, `vec_try_fma`, the 256-bit
+recipe's `Add` arm, `vec_accumulate` / `scalar_accumulate`, and the float-reduction gate in
+`try_vectorize_for`. A new contraction or reassociation site must check `self.gemm.strict_fp` too, or
+a strict function silently goes back to fast-mode bits. Pin it with a case in
+`crates/wukong_mir_build/src/fp_contract_tests.rs`.
