@@ -884,7 +884,8 @@ fn native_failure_diag(message: &str, input: &Path) -> Diagnostic {
             .with_code("C0002")
             .note(program)
             .help(
-                "allocate the buffer on the heap (`alloc_f32(n)` and its siblings) or split it;                  `--run` (the interpreter) has no byte-layout limit",
+                "allocate the buffer on the heap (`alloc_f32(n)` and its siblings) or split it; \
+                 `--run` (the interpreter) has no byte-layout limit",
             ),
         NativeErrorKind::Unsupported => Diagnostic::error(message)
             .with_code("C0001")

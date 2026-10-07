@@ -588,7 +588,8 @@ impl<'a> FnTranslator<'a> {
             None => {
                 if self.layout_err.is_none() {
                     self.layout_err = Some(format!(
-                        "type `{}` in function `{}` {LAYOUT_TOO_LARGE}: its byte size exceeds                          2^32 (4 GiB), the native backend's addressing limit",
+                        "type `{}` in function `{}` {LAYOUT_TOO_LARGE}: its byte size exceeds \
+                         2^32 (4 GiB), the native backend's addressing limit",
                         ty.display(),
                         self.interner.resolve(self.func.name)
                     ));
