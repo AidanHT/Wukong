@@ -90,7 +90,11 @@ static CATALOG: &[Explanation] = &[
         "E0200",
         "expected a specific token",
         "The parser needed a particular token (for example a closing `)` or `}`) but found \
-         something else. Check for a missing delimiter or separator."
+         something else. Check for a missing delimiter or separator. The message lists every \
+         token the parser would have accepted at that point (`expected one of `,` or `)``). When \
+         the parser had already moved on to the next line, the error points just after the last \
+         token of the previous line, where the missing token belongs; a missing closer also \
+         labels the opening delimiter that was never closed."
     ),
     entry!(
         "E0201",

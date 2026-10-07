@@ -158,6 +158,15 @@ token, skip it as whitespace, or (for a quote, which cannot open a literal) an e
 parse after a pasted `−` is the parse of `-`. A table test pins that every token replacement is
 spelled exactly like the token it produces.
 
+The parser's recovery state is two small stacks on `Parser`, both maintained by `bump`: `delims`,
+the open `(`/`[`/`{` not yet closed (a closer pops its innermost matching opener and anything
+unmatched above it), and `expected`, every token an `eat` tried and failed to find since the last
+consumed token. A failed `expect` reports `expected one of <expected ∪ wanted>`, anchors at
+`prev_span().shrink_to_hi()` when the token found is on a later line, labels the innermost matching
+opener of a missing closer (then drops it, so the next failure labels the next opener out), and steps
+over the lexer's `Error` tokens first — `Parser::error` likewise drops a complaint about an `Error`
+token, which the lexer has already reported.
+
 The terminal renderer is rustc-style (carets, gutters, `--> file:line:col`). Two rendering rules are
 contractual: a caret run is as wide as the span's *rendered* width, never the column difference, and
 both the echoed source line and the caret padding expand tabs at a fixed `TAB_WIDTH = 4` — so carets

@@ -100,7 +100,7 @@ impl Parser<'_> {
                     "E0208",
                     format!(
                         "expected an item (fn, struct, enum, const, import, extern), found {}",
-                        self.kind().describe()
+                        self.found()
                     ),
                 );
                 self.recover_item();

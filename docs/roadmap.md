@@ -483,6 +483,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   cascade. Any other non-ASCII character stays `E0101`, now naming the code point (`α` (U+03B1))
   instead of `\u{3b1}`, with a spelled-out suggestion for Greek letters. Identifiers stay ASCII:
   Unicode (XID) identifiers need a symbol-mangling decision because PTX must be ASCII.
+- **Parser recovery.** A failed `E0200` names the whole set of tokens the parser tried ("expected one
+  of `,` or `)`"), is anchored just after the previous token when the parser had already moved on to
+  the next line (where the missing `)` or `;` goes), and labels the unclosed opener of a missing
+  `)`/`]`/`}` from a delimiter stack kept in step with every consumed token. A token the lexer
+  already rejected never draws a second parser error. Not yet: rustc's indentation-based "this
+  delimiter might not be properly closed" guess, and resynchronizing at the next statement after a
+  bad one (the parser still recovers token by token).
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup

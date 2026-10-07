@@ -65,6 +65,15 @@ pub(crate) struct Parser<'a> {
     /// [`Parser::error`]) silences the follow-on recovery cascade — the unmatched `)`/`]` and
     /// "expected …" errors that unwinding a half-parsed monster construct would otherwise spew.
     depth_exceeded: bool,
+    /// The open delimiters consumed so far and not yet closed (innermost last), kept in step with
+    /// [`Parser::bump`]. A failed `expect` of a closer labels its opener ("this `(` is not
+    /// closed"), which for an unclosed `{` is the only pointer back to where the problem is: the
+    /// failure itself is reported at end of file.
+    delims: Vec<(TokenKind, Span)>,
+    /// The tokens an `eat` has tried, and failed to find, at the current position (cleared by every
+    /// [`Parser::bump`]). A failed `expect` reports them with its own token as the set the parser
+    /// would have accepted — "expected one of `,` or `)`" — rather than naming only the last one.
+    expected: Vec<TokenKind>,
 }
 
 impl<'a> Parser<'a> {
@@ -79,6 +88,8 @@ impl<'a> Parser<'a> {
             no_struct_lit: false,
             depth: 0,
             depth_exceeded: false,
+            delims: Vec::new(),
+            expected: Vec::new(),
         }
     }
 
@@ -132,8 +143,28 @@ impl<'a> Parser<'a> {
         let t = self.tok();
         if t.kind != T::Eof {
             self.pos += 1;
+            self.track_delim(t);
         }
+        self.expected.clear();
         t
+    }
+
+    /// Keep [`Parser::delims`] in step with the token just consumed. A closer pops its innermost
+    /// matching opener together with any unmatched openers above it — a recovery bump past a stray
+    /// closer must not leave a stale opener for a later error to point at; a closer with no
+    /// matching opener changes nothing.
+    fn track_delim(&mut self, t: Token) {
+        match t.kind {
+            T::LParen | T::LBracket | T::LBrace => self.delims.push((t.kind, t.span)),
+            T::RParen | T::RBracket | T::RBrace => {
+                if let Some(open) = opener_of(t.kind) {
+                    if let Some(i) = self.delims.iter().rposition(|(k, _)| *k == open) {
+                        self.delims.truncate(i);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn eat(&mut self, k: TokenKind) -> bool {
@@ -141,21 +172,89 @@ impl<'a> Parser<'a> {
             self.bump();
             true
         } else {
+            if !self.expected.contains(&k) {
+                self.expected.push(k);
+            }
             false
         }
     }
 
+    /// The current token as the "found …" of a diagnostic: a keyword or punctuation in backticks
+    /// (`` `;` ``), an identifier with its name (`` identifier `b` ``), any other category as its
+    /// noun ("integer literal", "end of file").
+    fn found(&self) -> String {
+        let k = self.kind();
+        match k.glyph() {
+            Some(g) => format!("`{g}`"),
+            None if k == T::Ident => {
+                let sp = self.span();
+                format!("identifier `{}`", &self.src[sp.lo as usize..sp.hi as usize])
+            }
+            None => k.describe().to_string(),
+        }
+    }
+
+    /// Whether the current token starts on a later line than the previous token ends: the parser
+    /// has already moved on to the next line, which is where a missing `;`/`)` leaves it.
+    fn on_new_line(&self) -> bool {
+        if self.pos == 0 {
+            return false;
+        }
+        let (prev, cur) = (self.prev_span(), self.span());
+        prev.hi <= cur.lo
+            && self
+                .src
+                .get(prev.hi as usize..cur.lo as usize)
+                .is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// Consume `k`, or report `E0200` without consuming anything. The message names every token
+    /// the parser tried at this position ("expected one of `,` or `)`"). When the token found sits
+    /// on a later line, the error is anchored just after the previous token — where the missing
+    /// token goes — with the token it ran into as a secondary label, instead of on the next line's
+    /// first token. A missing closer also labels its unclosed opener.
     fn expect(&mut self, k: TokenKind) -> bool {
+        // The lexer has already reported an invalid token. Step over it (and any run of them) so
+        // the token wanted here is still found right after it: `g(1 $)` costs the lexer's one
+        // error, not that plus "expected `)`, found invalid token" plus a stray-`)` cascade.
+        while self.at(T::Error) {
+            self.bump();
+        }
         if self.at(k) {
             self.bump();
-            true
-        } else {
-            let found = self.kind().describe();
-            let want = k.glyph().unwrap_or_else(|| k.describe());
-            let sp = self.span();
-            self.error(sp, "E0200", format!("expected `{want}`, found {found}"));
-            false
+            return true;
         }
+        // Past the nesting limit every recovery diagnostic is suppressed (see `error`).
+        if self.depth_exceeded {
+            return false;
+        }
+        let mut want = std::mem::take(&mut self.expected);
+        if !want.contains(&k) {
+            want.push(k);
+        }
+        let want = describe_set(&want);
+        let found = self.found();
+        let cur = self.span();
+        let mut d = Diagnostic::error(format!("expected {want}, found {found}")).with_code("E0200");
+        d = if self.on_new_line() {
+            d.primary(
+                self.prev_span().shrink_to_hi(),
+                format!("expected {want} here"),
+            )
+            .secondary(cur, format!("unexpected {found}"))
+        } else {
+            d.primary(cur, format!("expected {want}"))
+        };
+        if let Some(open) = opener_of(k) {
+            if let Some(i) = self.delims.iter().rposition(|(o, _)| *o == open) {
+                let glyph = open.glyph().unwrap_or("delimiter");
+                d = d.secondary(self.delims[i].1, format!("this `{glyph}` is not closed"));
+                // Reported once: the next failed closer labels the next opener out.
+                self.delims.truncate(i);
+            }
+        }
+        self.diags.push(d);
+        false
     }
 
     fn error(&mut self, span: Span, code: &'static str, msg: impl Into<String>) {
@@ -163,6 +262,12 @@ impl<'a> Parser<'a> {
         // diagnostic (the unmatched delimiters and "expected …" errors produced while unwinding the
         // over-deep construct) is suppressed, keeping the output to one clean error.
         if self.depth_exceeded {
+            return;
+        }
+        // A complaint about the current token when that token is the lexer's `Error` token: the
+        // lexer already reported the character (E0101/E0105), so "expected …, found invalid token"
+        // here would be a second error for one stray character.
+        if self.at(T::Error) && span == self.span() {
             return;
         }
         self.diags
@@ -216,7 +321,7 @@ impl<'a> Parser<'a> {
             self.error(
                 span,
                 "E0201",
-                format!("expected identifier, found {}", self.kind().describe()),
+                format!("expected identifier, found {}", self.found()),
             );
             Ident {
                 sym: self.interner.intern("«error»"),
@@ -360,7 +465,7 @@ impl<'a> Parser<'a> {
                 self.error(
                     sp,
                     "E0203",
-                    format!("expected type, found {}", self.kind().describe()),
+                    format!("expected type, found {}", self.found()),
                 );
                 self.bump();
                 TypeKind::Unit
@@ -1047,7 +1152,7 @@ impl<'a> Parser<'a> {
                 self.error(
                     sp,
                     "E0202",
-                    format!("expected an expression, found {}", self.kind().describe()),
+                    format!("expected an expression, found {}", self.found()),
                 );
                 self.bump();
                 self.finish_expr(start, ExprKind::TupleLit(Vec::new()))
@@ -1660,10 +1765,7 @@ impl<'a> Parser<'a> {
                     self.error(
                         start,
                         "E0206",
-                        format!(
-                            "expected an integer after `-`, found {}",
-                            self.kind().describe()
-                        ),
+                        format!("expected an integer after `-`, found {}", self.found()),
                     );
                     PatKind::Wildcard
                 }
@@ -1680,7 +1782,7 @@ impl<'a> Parser<'a> {
                 self.error(
                     start,
                     "E0206",
-                    format!("expected a pattern, found {}", self.kind().describe()),
+                    format!("expected a pattern, found {}", self.found()),
                 );
                 self.bump();
                 PatKind::Wildcard
@@ -1895,6 +1997,34 @@ fn binop_bp(op: BinOp) -> u8 {
         Shl | Shr => 7,
         Add | Sub => 8,
         Mul | Div | Rem => 9,
+    }
+}
+
+/// The opening delimiter a closing one matches (`)` → `(`), or `None` for any other token.
+fn opener_of(k: TokenKind) -> Option<TokenKind> {
+    Some(match k {
+        T::RParen => T::LParen,
+        T::RBracket => T::LBracket,
+        T::RBrace => T::LBrace,
+        _ => return None,
+    })
+}
+
+/// "`)`", "one of `,` or `)`", "one of `,`, `.` or `)`" — a set of tokens for an "expected …"
+/// message, in the order the parser tried them. A lexical category reads as its noun
+/// ("identifier"), a fixed token as its glyph in backticks.
+fn describe_set(kinds: &[TokenKind]) -> String {
+    let names: Vec<String> = kinds
+        .iter()
+        .map(|k| match k.glyph() {
+            Some(g) => format!("`{g}`"),
+            None => k.describe().to_string(),
+        })
+        .collect();
+    match names.as_slice() {
+        [] => "a token".to_string(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("one of {} or {last}", init.join(", ")),
     }
 }
 
@@ -2256,6 +2386,100 @@ mod tests {
             .expect("spawn parser thread")
             .join()
             .expect("the parser must not overflow its stack on deeply nested structural input");
+    }
+
+    /// A failed `expect` names every token the parser tried at that position, not just the last.
+    #[test]
+    fn expected_token_sets_name_every_alternative() {
+        let first = |src: &str| -> String {
+            let mut i = Interner::new();
+            let (_e, d) = parse_expr_str(src, SourceId(0), &mut i);
+            assert_eq!(d[0].code, Some("E0200"), "{src}: {d:?}");
+            d[0].message.clone()
+        };
+        assert_eq!(
+            first("f(a b)"),
+            "expected one of `,` or `)`, found identifier `b`"
+        );
+        assert_eq!(
+            first("[1, 2 3]"),
+            "expected one of `,` or `]`, found integer literal"
+        );
+        assert_eq!(
+            first("(1, 2 3)"),
+            "expected one of `,` or `)`, found integer literal"
+        );
+        // A lone requirement still reads as one token.
+        assert_eq!(first("(1 + 2;"), "expected `)`, found `;`");
+    }
+
+    /// A missing closer at the end of a line is reported where it is missing — just after the last
+    /// token of that line — not on the first token of the next line, which is what the parser had
+    /// moved on to. The token it ran into and the unclosed opener are secondary labels.
+    #[test]
+    fn missing_closer_is_anchored_after_the_previous_line() {
+        let src = "fn main() -> i32 {\n    let x: i32 = f(1, 2\n    return x;\n}\n";
+        let mut i = Interner::new();
+        let (_m, d) = parse_module(src, SourceId(0), &mut i);
+        let e = &d[0];
+        assert_eq!(e.code, Some("E0200"), "{d:?}");
+        assert_eq!(e.message, "expected one of `,` or `)`, found `return`");
+        let after_two = (src.find("2\n").unwrap() + 1) as u32;
+        let primary = e.primary_span().unwrap();
+        assert_eq!((primary.lo, primary.hi), (after_two, after_two));
+        let at = |needle: &str| src.find(needle).unwrap() as u32;
+        let secondary: Vec<u32> = e
+            .labels
+            .iter()
+            .filter(|l| !l.primary)
+            .map(|l| l.span.lo)
+            .collect();
+        assert!(secondary.contains(&at("return")), "{e:?}");
+        assert!(
+            secondary.contains(&at("(1, 2")),
+            "the opener must be labelled: {e:?}"
+        );
+    }
+
+    /// An unclosed `{` used to be "expected `}`, found end of file" pointing at the end of the
+    /// file and nowhere else; the brace that was never closed is now labelled.
+    #[test]
+    fn unclosed_brace_labels_its_opener() {
+        let src = "fn main() -> i32 {\n    if true {\n        return 1;\n    }\n    return 0;\n";
+        let mut i = Interner::new();
+        let (_m, d) = parse_module(src, SourceId(0), &mut i);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "expected `}`, found end of file");
+        let opener = src.find('{').unwrap() as u32;
+        assert!(
+            d[0].labels
+                .iter()
+                .any(|l| !l.primary && l.span.lo == opener && l.message.contains("not closed")),
+            "{:?}",
+            d[0]
+        );
+    }
+
+    /// A character the lexer rejects costs exactly one diagnostic: the parser no longer adds
+    /// "expected an expression, found invalid token" (or a type / item / pattern variant of it) at
+    /// the same place.
+    #[test]
+    fn a_stray_character_costs_one_diagnostic() {
+        for src in [
+            "fn main() -> i32 {\n    let x: i32 = 1 $ 2;\n    return x;\n}\n",
+            "fn f(x: $) {}\n",
+            "$\nfn f() {}\n",
+            "fn f() -> i32 { match 1 { $ => 0, _ => 1 } }\n",
+            "fn f() -> i32 { return g(1 $); }\n",
+        ] {
+            let mut i = Interner::new();
+            let (_m, d) = parse_module(src, SourceId(0), &mut i);
+            assert_eq!(
+                d.iter().map(|x| x.code).collect::<Vec<_>>(),
+                vec![Some("E0101")],
+                "{src}"
+            );
+        }
     }
 
     /// Moderately nested but entirely realistic input stays well under the limit and parses cleanly.
