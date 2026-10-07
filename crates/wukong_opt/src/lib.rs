@@ -2,6 +2,8 @@
 //!
 //! Passes run to a fixpoint at `-O1` and above, in this order. The pipeline first promotes stack
 //! slots to SSA registers, which is what makes the value-based transforms bite:
+//!  * **sroa** — split an aggregate slot whose every access is at a constant position into one
+//!    scalar slot per accessed leaf, for mem2reg to promote in the same sweep (`-O2`).
 //!  * **mem2reg** — promote scalar and pointer `alloca`/`load`/`store` to block-parameter SSA.
 //!  * **simplify** — constant folding and algebraic identities (`x+0`, `x*1`, `x*0`, ...).
 //!  * **simplify-cfg** — fold constant branches, merge straight-line blocks, prune dead blocks.
@@ -44,6 +46,7 @@ mod mem2reg;
 mod phi;
 mod simplify;
 mod simplify_cfg;
+mod sroa;
 mod unroll;
 mod vectorize;
 mod verify_each;
@@ -65,6 +68,7 @@ pub use mem2reg::Mem2Reg;
 pub use phi::SimplifyPhis;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
+pub use sroa::Sroa;
 pub use unroll::unroll_program;
 pub use vectorize::Vectorize;
 
@@ -154,7 +158,12 @@ impl PassManager {
         let mut pm = PassManager::new();
         if opt_level >= 1 {
             // Promotion comes first: every later pass is far more effective on SSA values than on
-            // memory traffic. The whole list then runs to a fixpoint.
+            // memory traffic. The whole list then runs to a fixpoint. At `-O2` scalar replacement
+            // runs just ahead of mem2reg, so an aggregate it splits is promoted in the same sweep.
+            // `-O1` keeps the plain promotion shape the autodiff transform is built against.
+            if opt_level >= 2 {
+                pm.add(Box::new(Sroa));
+            }
             pm.add(Box::new(Mem2Reg));
             pm.add(Box::new(Simplify));
             pm.add(Box::new(SimplifyCfg));
@@ -1002,6 +1011,59 @@ mod tests {
         }
         assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 4);
         assert_eq!(run_main_opt(src, 0), 4);
+    }
+
+    #[test]
+    fn sroa_keeps_a_register_blocked_accumulator_out_of_memory() {
+        // The canonical hand-blocked reduction: four partial sums in a `[f32; 4]`, each updated at a
+        // constant index every iteration. Every access is at a constant position, so at -O2 the slot
+        // is split into four scalar slots that mem2reg promotes — no `[4 x f32]` slot survives
+        // anywhere in the program, and the sums are carried in registers.
+        //
+        // x[k] = k, so acc[j] = sum over i in 0..4 of (4i + j) = 24 + 4j = [24, 28, 32, 36], and
+        // 24 + 2*28 + 3*32 + 4*36 = 320.
+        let src = "fn blocked(x: [f32; 16]) -> f32 { \
+                     let mut acc: [f32; 4] = [0.0; 4]; let mut i: i64 = 0; \
+                     while i < 4 { \
+                       acc[0] = acc[0] + x[4 * i]; acc[1] = acc[1] + x[4 * i + 1]; \
+                       acc[2] = acc[2] + x[4 * i + 2]; acc[3] = acc[3] + x[4 * i + 3]; \
+                       i = i + 1; } \
+                     return acc[0] + acc[1] * 2.0 + acc[2] * 3.0 + acc[3] * 4.0; } \
+                   fn main() -> i32 { let mut x: [f32; 16] = [0.0; 16]; let mut k: i64 = 0; \
+                     while k < 16 { x[k] = k as f32; k = k + 1; } \
+                     return blocked(x) as i32; }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 320, "level {lvl}");
+        }
+        let blocks_of_four = |p: &wukong_mir::Program| {
+            p.funcs
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.insts)
+                .filter(|i| {
+                    matches!(
+                        &i.op,
+                        Op::Alloca { ty: wukong_mir::MirType::Array(e, 4), .. }
+                            if **e == wukong_mir::MirType::F32
+                    )
+                })
+                .count()
+        };
+        let (mut prog, _) = lower(src);
+        assert_eq!(
+            blocks_of_four(&prog),
+            1,
+            "the front end gives `acc` one slot"
+        );
+        optimize(&mut prog, 2);
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        assert_eq!(
+            blocks_of_four(&prog),
+            0,
+            "the accumulator slot must be split and promoted at -O2"
+        );
     }
 
     #[test]
