@@ -1924,21 +1924,27 @@ impl<'a> Vjp<'a> {
     }
 }
 
-/// What the reverse walk does at a call to one of the ML I/O and randomness runtime entries that is
-/// not a tensor kernel with a VJP. The decision is explicit per entry so a new one is a choice, not a
-/// fall-through. The typed reads (`wukong_rt_read_*`, `wukong_rt_st_read`, `wukong_rt_npy_read`)
-/// return an `i64` and are left to the scalar path: the file data they produce is constant with
-/// respect to every input, so it carries no gradient.
+/// What the reverse walk does at a call to one of the ML I/O and randomness runtime entries, none of
+/// which is a tensor kernel with a VJP. The decision is explicit per entry so a new one is a choice,
+/// not a fall-through:
+/// * the typed reads (`wukong_rt_read_*`, `wukong_rt_st_read`, `wukong_rt_npy_read`), `argsort` and
+///   `sample_categorical` return an `i64` and are left to the scalar path: what they produce — file
+///   data, integer indices — is constant with respect to every input, so it carries no gradient;
 /// * [`MlCallGradient::Constant`]: `wukong_rand_fill_f32` writes counter-based random numbers that
-///   depend on no input — skipped exactly like a constant store (`[0.0; N]`), never refused.
+///   depend on no input — skipped exactly like a constant store (`[0.0; N]`), never refused;
+/// * [`MlCallGradient::Refuse`]: `wukong_topk_f32` writes `vals`, a differentiable function of `x`
+///   (`torch.topk` scatters the gradient back to the selected indices), and it has no VJP rule yet —
+///   so differentiating through it is an error rather than a silently dropped gradient.
 pub(crate) enum MlCallGradient {
     Constant,
+    Refuse,
 }
 
 /// The [`MlCallGradient`] of the runtime entry `name`, or `None` for any other callee.
 pub(crate) fn ml_call_gradient(name: &str) -> Option<MlCallGradient> {
     match name {
         "wukong_rand_fill_f32" => Some(MlCallGradient::Constant),
+        "wukong_topk_f32" => Some(MlCallGradient::Refuse),
         _ => None,
     }
 }

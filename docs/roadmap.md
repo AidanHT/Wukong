@@ -190,6 +190,10 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   runtime kernel. The runtime reference (`wukong_runtime::random`) is checked against all three
   Random123 `philox4x32_10` known-answer vectors, and an interpreter test checks the MIR lowering
   against it over seeds and counters that exercise both 32-bit halves (`tests/run/rand_philox.wk`).
+- **Sampling kernels** — `topk_f32(x, vals, idx)`, stable `argsort_f32` / `argsort_desc_f32(x, idx)`
+  and `sample_categorical(probs, u)` (inverse CDF over positive, finite weights), each defined by one
+  total order (NaN largest, ties to the lower index) so the answer is unique; the interpreter calls the
+  same safe runtime functions (`tests/run/topk_sampling.wk`).
 - **Radix & char literals**: hex `0xFF` / octal `0o17` / binary `0b1010` integer literals with `_`
   digit separators and type suffixes (`tests/run/radix_literals.wk`), and char literals `'A'` (the
   one-character / `\xHH` / `\u{…}` escapes) typed `char` — a 32-bit Unicode scalar value,
@@ -937,6 +941,7 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   A fill loop `for i { out[i] = rand_f32(seed, base + i) }` is not recognized into `rand_fill_f32`,
   and the loop vectorizer declines it (mixed 32/64-bit widths), so the scalar builtins run one
   element at a time; `randn_f32` has no fill kernel.
+  `topk_f32` has no VJP (autodiff refuses it rather than drop the gradient).
   None of these is measured yet.
 
 - **A view local read before it is assigned is undefined, and the language has no rule that says so.**

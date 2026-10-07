@@ -876,7 +876,7 @@ little-endian `f2 f4 f8 i1 i2 i4 i8 u1 u2 u4 u8` descrs (`.npy`); `BOOL`, the fp
 big-endian array and a structured dtype parse and then report `-3`. A memory-mapped, zero-copy load
 (`map_<T>`) is not implemented yet: every load copies once, straight into the destination.
 
-## Random numbers ✅
+## Random numbers and sampling ✅
 
 Wukong's random numbers are **counter-based** — Philox4x32-10, the generator of Random123, cuRAND and
 Triton's `tl.rand`: each value is a pure function of a `seed` and a `counter`, so there is no
@@ -904,6 +904,23 @@ let keep: bool = rand_f32(seed, step * n + i) >= p;    // a dropout mask is a co
 The scalar builtins lower to plain integer MIR (a 32×32→64 multiply, shifts, xors), so they need no
 runtime call and are accepted inside a `@parallel` region. To autodiff they are constants:
 `rand_fill_f32` contributes no gradient, like a constant store.
+
+**Sampling kernels** (✅), each defined by one total order so the result is unique whatever the
+algorithm or backend:
+
+- **`topk_f32(x, vals, idx) -> i64`** — the `k = min(len(x), len(vals), len(idx))` largest elements
+  of the `f32` buffer `x`, in descending order, into `vals` (values) and the `i64` buffer `idx`
+  (indices); returns `k`. **NaN ranks largest** and ties (including `-0.0` against `0.0`) go to the
+  **lower index** — `torch.topk`'s order. An output may alias `x`. It has no gradient rule yet, so
+  autodiff refuses it rather than drop the gradient.
+- **`argsort_f32(x, idx) -> i64`** / **`argsort_desc_f32(x, idx) -> i64`** — a **stable** argsort (ties
+  keep index order; NaN last ascending, first descending) of `x` into `idx`; a shorter `idx` receives
+  the prefix of the order. Returns `min(len(x), len(idx))`.
+- **`sample_categorical(probs, u) -> i64`** — one draw from the unnormalized weights `probs` by inverse
+  CDF at the float `u`: the first index whose running mass exceeds `u · total`, where only positive,
+  finite weights have mass; `u` is clamped to `[0, 1]`; `-1` when no weight has mass. With
+  `u = rand_f32(seed, step)` the draw is a pure function of `(probs, seed, step)`, so temperature,
+  top-k and top-p sampling are a few lines over these three kernels.
 
 ## Command-line interface
 

@@ -1,6 +1,6 @@
 //! The runtime entry points of the ML I/O and randomness builtins — dtype-coded file I/O,
-//! `file_size`, the safetensors / `.npy` readers and the Philox fill — declared, JIT-bound and
-//! called from **one table**.
+//! `file_size`, the safetensors / `.npy` readers, the Philox fill and the top-k / argsort /
+//! categorical-sampling kernels — declared, JIT-bound and called from **one table**.
 //!
 //! Every other runtime family in this crate is spelled out four times: a name constant, a
 //! `Signature` built by hand in `populate_module`, an `rt_ids` row, and a `builder.symbol` line in
@@ -26,6 +26,8 @@ pub(crate) enum Abi {
     Ptr,
     /// A 64-bit integer; any MIR integer argument is widened to it (sign-extending).
     I64,
+    /// An `f32`; an `f64` argument is demoted to it.
+    F32,
 }
 
 impl Abi {
@@ -33,6 +35,7 @@ impl Abi {
         match self {
             Abi::Ptr => ptr_ty,
             Abi::I64 => types::I64,
+            Abi::F32 => types::F32,
         }
     }
 }
@@ -48,8 +51,8 @@ pub(crate) struct Entry {
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 6] {
-    use Abi::{Ptr, I64};
+pub(crate) fn entries() -> [Entry; 9] {
+    use Abi::{Ptr, F32, I64};
     [
         // (path, byte_off, data, len, dtype) -> i64: `read_<T>` outside the frozen six, and every
         // `read_<T>_at`.
@@ -93,6 +96,27 @@ pub(crate) fn entries() -> [Entry; 6] {
             params: &[Ptr, I64, I64, I64],
             ret: None,
             addr: wukong_runtime::wukong_rand_fill_f32 as *const u8,
+        },
+        // (x, n, vals, nv, idx, ni) -> i64: `topk_f32`.
+        Entry {
+            name: "wukong_topk_f32",
+            params: &[Ptr, I64, Ptr, I64, Ptr, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_topk_f32 as *const u8,
+        },
+        // (x, n, idx, ni, descending) -> i64: `argsort_f32` / `argsort_desc_f32`.
+        Entry {
+            name: "wukong_argsort_f32",
+            params: &[Ptr, I64, Ptr, I64, I64],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_argsort_f32 as *const u8,
+        },
+        // (p, n, u) -> i64: `sample_categorical`.
+        Entry {
+            name: "wukong_sample_categorical_f32",
+            params: &[Ptr, I64, F32],
+            ret: Some(I64),
+            addr: wukong_runtime::wukong_sample_categorical_f32 as *const u8,
         },
     ]
 }
@@ -145,6 +169,7 @@ impl FnTranslator<'_> {
             vals.push(match p {
                 Abi::Ptr => self.val(a),
                 Abi::I64 => self.coerce_to_i64(a),
+                Abi::F32 => self.coerce_to_f32(a),
             });
         }
         let fref = self.runtime_ref(e.name);

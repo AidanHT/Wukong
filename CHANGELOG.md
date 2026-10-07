@@ -16,6 +16,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   rank, dims and count checks, and exact `bf16`/`f16` → `f32` widening.
 - **Counter-based RNG** `rand_u32` / `rand_f32` / `randn_f32(seed, ctr)` (Philox4x32-10, lowered to
   integer MIR, checked against the Random123 known answers) and the `rand_fill_f32` kernel.
+- **Sampling kernels** `topk_f32`, `argsort_f32` / `argsort_desc_f32` and `sample_categorical`, each
+  defined by one total order (NaN largest, ties to the lower index).
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 

@@ -185,6 +185,8 @@ pub mod random;
 pub use random::wukong_rand_fill_f32;
 pub mod safetensors;
 pub use safetensors::wukong_rt_st_read;
+pub mod topk;
+pub use topk::{wukong_argsort_f32, wukong_sample_categorical_f32, wukong_topk_f32};
 
 mod cumprod;
 pub use cumprod::{wukong_cumprod_f32, wukong_cumprod_f32_parallel};

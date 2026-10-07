@@ -264,10 +264,15 @@ impl<'a> Vjp<'a> {
                 return self.diff_kernel_call(*func, args, inst.result);
             }
             // The ML I/O and randomness entries carry an explicit decision (see `tape.rs`).
-            if let Some(tape::MlCallGradient::Constant) =
-                tape::ml_call_gradient(self.it.resolve(*func))
-            {
-                return Ok(());
+            match tape::ml_call_gradient(self.it.resolve(*func)) {
+                Some(tape::MlCallGradient::Constant) => return Ok(()),
+                Some(tape::MlCallGradient::Refuse) => {
+                    return Err(format!(
+                        "autodiff: no VJP rule for buffer-writing call `{}`",
+                        self.it.resolve(*func)
+                    ))
+                }
+                None => {}
             }
             // An unrecognized call that writes buffers (void result) could feed a downstream
             // gradient; we cannot prove its contribution is zero, so refuse rather than silently

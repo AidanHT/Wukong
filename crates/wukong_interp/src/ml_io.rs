@@ -1,13 +1,14 @@
 //! The interpreter twins of the ML I/O and randomness runtime entries: dtype-coded file I/O,
-//! `file_size`, the safetensors / `.npy` container readers, and the Philox fill.
+//! `file_size`, the safetensors / `.npy` container readers, the Philox fill, and the top-k /
+//! argsort / categorical-sampling kernels.
 //!
 //! Every arm here mirrors one `wukong_runtime` entry and shares that entry's *pure* code — the
-//! transfer plan and the container parsers in `wukong_runtime::fileio`, and the generator in
-//! `wukong_runtime::random` — so the return code,
+//! transfer plan and the container parsers in `wukong_runtime::fileio`, the generator in
+//! `wukong_runtime::random`, the selection functions in `wukong_runtime::topk` — so the return code,
 //! the element count and every value cannot drift between the two backends; only the destination
 //! differs. Native memory holds raw element bytes; this interpreter's memory holds one typed
 //! [`Value`] per scalar slot, so a read decodes each element into its slot's canonical value, a
-//! write encodes each slot back to bytes.
+//! write encodes each slot back to bytes, and a kernel marshals slots through a host buffer.
 //!
 //! **Canonical integer slots.** The interpreter stores every integer sign-extended from its own
 //! width — the value `exec` produces when it masks a result to its MIR type — and a `Load` returns
@@ -25,7 +26,7 @@ use wukong_runtime::fileio::{
     DT_F64, DT_I16, DT_I32, DT_I8, DT_U16, DT_U32, DT_U8, IO_ERROR, IO_OPEN_FAILED,
 };
 
-use crate::{file_read_path, kernel_scratch, kernel_values, Interp, Value};
+use crate::{file_read_path, kernel_buffer, kernel_scratch, kernel_values, Interp, Value};
 
 /// Decode one little-endian element of dtype `dt` from `b` (exactly `dtype_size(dt)` bytes) into the
 /// canonical slot value: floats as their exact `f64` image (half precision widened exactly), integers
@@ -114,6 +115,9 @@ impl Interp<'_, '_> {
             "wukong_rt_st_read" => self.ml_container_read(args, true),
             "wukong_rt_npy_read" => self.ml_container_read(args, false),
             "wukong_rand_fill_f32" => self.ml_rand_fill(args),
+            "wukong_topk_f32" => self.ml_topk(args),
+            "wukong_argsort_f32" => self.ml_argsort(args),
+            "wukong_sample_categorical_f32" => self.ml_sample_categorical(args),
             _ => return None,
         })
     }
@@ -289,6 +293,12 @@ impl Interp<'_, '_> {
         )
     }
 
+    /// `n` `f32` slots from `base`, marshalled for a host kernel.
+    fn ml_f32_buffer(&self, base: usize, n: usize, ctx: &str) -> Result<Vec<f32>, String> {
+        let vals = kernel_values(&self.memory, base, 1, n, ctx)?;
+        kernel_buffer(vals, ctx, |v| v.kernel_float(ctx).map(|f| f as f32))
+    }
+
     /// `wukong_rand_fill_f32(out, n, seed, ctr0)`: the runtime's own [`wukong_runtime::random::rand_f32`]
     /// per slot, the counter wrapping like the native kernel's.
     fn ml_rand_fill(&mut self, args: &[Value]) -> Result<Value, String> {
@@ -306,6 +316,63 @@ impl Interp<'_, '_> {
             *slot = Value::Float(x as f64);
         }
         Ok(Value::Unit)
+    }
+
+    /// `wukong_topk_f32(x, n, vals, nv, idx, ni) -> i64`: the input is copied in whole before any
+    /// output is written, matching the native entry's overlap rule.
+    fn ml_topk(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "topk_f32";
+        let n = count(arg_i64(args, 1));
+        let k = n.min(count(arg_i64(args, 3))).min(count(arg_i64(args, 5)));
+        let xs = self.ml_f32_buffer(ptr_arg(args, 0, CTX, "x")?, n, CTX)?;
+        if k == 0 {
+            return Ok(Value::Int(0));
+        }
+        let vals_base = ptr_arg(args, 2, CTX, "vals")?;
+        let idx_base = ptr_arg(args, 4, CTX, "idx")?;
+        self.ml_check_extent(vals_base, k, CTX)?;
+        self.ml_check_extent(idx_base, k, CTX)?;
+        let mut vals = vec![0f32; k];
+        let mut idx = vec![0i64; k];
+        let got = wukong_runtime::topk::topk(&xs, &mut vals, &mut idx);
+        for (j, v) in vals.into_iter().enumerate() {
+            self.memory[vals_base + j] = Value::Float(v as f64);
+        }
+        for (j, i) in idx.into_iter().enumerate() {
+            self.memory[idx_base + j] = Value::Int(i as i128);
+        }
+        Ok(Value::Int(got as i128))
+    }
+
+    /// `wukong_argsort_f32(x, n, idx, ni, descending) -> i64`.
+    fn ml_argsort(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "argsort_f32";
+        let n = count(arg_i64(args, 1));
+        let m = n.min(count(arg_i64(args, 3)));
+        let descending = arg_i64(args, 4) != 0;
+        let xs = self.ml_f32_buffer(ptr_arg(args, 0, CTX, "x")?, n, CTX)?;
+        if m == 0 {
+            return Ok(Value::Int(0));
+        }
+        let idx_base = ptr_arg(args, 2, CTX, "idx")?;
+        self.ml_check_extent(idx_base, m, CTX)?;
+        let mut idx = vec![0i64; m];
+        let got = wukong_runtime::topk::argsort(&xs, &mut idx, descending);
+        for (j, i) in idx.into_iter().enumerate() {
+            self.memory[idx_base + j] = Value::Int(i as i128);
+        }
+        Ok(Value::Int(got as i128))
+    }
+
+    /// `wukong_sample_categorical_f32(p, n, u) -> i64`.
+    fn ml_sample_categorical(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "sample_categorical";
+        let n = count(arg_i64(args, 1));
+        let p = self.ml_f32_buffer(ptr_arg(args, 0, CTX, "probs")?, n, CTX)?;
+        let u = args.get(2).map(|v| v.as_float() as f32).unwrap_or(0.0);
+        Ok(Value::Int(
+            wukong_runtime::topk::sample_categorical(&p, u) as i128
+        ))
     }
 }
 

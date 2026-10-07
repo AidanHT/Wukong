@@ -1,6 +1,6 @@
 //! Typing for the ML I/O and randomness builtins: the typed file-I/O family over every element type
 //! (whole-file and byte-offset reads, writes, `file_size`), the safetensors / `.npy` container
-//! readers, and the Philox counter-based RNG.
+//! readers, the Philox counter-based RNG, and the top-k / argsort / categorical-sampling kernels.
 //!
 //! Like the heap and timing builtins, these are typed nominally here — the call's result is a
 //! concrete type, so `let n = read_bf16_at(p, off, w)` composes in arithmetic — and every misuse is
@@ -51,6 +51,15 @@ pub enum MlBuiltin {
     RandnF32,
     /// `rand_fill_f32(buf, seed: int, ctr0: int)` — `buf[i] = rand_f32(seed, ctr0 + i)`.
     RandFill,
+    /// `topk_f32(x, vals, idx) -> i64` — the largest `k` values and their indices.
+    TopK,
+    /// `argsort_f32(x, idx) -> i64` / `argsort_desc_f32(x, idx) -> i64` — a stable argsort.
+    Argsort {
+        /// `argsort_desc_f32`.
+        descending: bool,
+    },
+    /// `sample_categorical(probs, u: float) -> i64` — an inverse-CDF draw.
+    SampleCategorical,
 }
 
 /// The element type a file-I/O name suffix denotes (`f32`, `bf16`, `u64`, …), or `None`. The twelve
@@ -118,6 +127,10 @@ pub fn ml_builtin(name: &str) -> Option<MlBuiltin> {
         "rand_f32" => MlBuiltin::RandF32,
         "randn_f32" => MlBuiltin::RandnF32,
         "rand_fill_f32" => MlBuiltin::RandFill,
+        "topk_f32" => MlBuiltin::TopK,
+        "argsort_f32" => MlBuiltin::Argsort { descending: false },
+        "argsort_desc_f32" => MlBuiltin::Argsort { descending: true },
+        "sample_categorical" => MlBuiltin::SampleCategorical,
         _ => return None,
     })
 }
@@ -144,6 +157,8 @@ enum Arg {
     Str(&'static str),
     /// An integer (`i64` ABI).
     Int(&'static str),
+    /// A floating-point scalar (`f32` ABI).
+    Float(&'static str),
     /// A buffer of this element type; `true` when the builtin writes it.
     Buf(Scalar, bool),
 }
@@ -167,7 +182,7 @@ impl Sema<'_> {
         arg_tys: &mut [Ty],
         span: Span,
     ) -> Option<Ty> {
-        use Arg::{Buf, Int, Str};
+        use Arg::{Buf, Float, Int, Str};
         let b = ml_builtin(name)?;
         let i64_ty = Ty::Scalar(Scalar::I64);
         let f32_ty = Ty::Scalar(Scalar::F32);
@@ -183,6 +198,22 @@ impl Sema<'_> {
                 vec![Buf(Scalar::F32, true), Int("seed"), Int("counter")],
                 Ty::Unit,
             ),
+            MlBuiltin::TopK => (
+                vec![
+                    Buf(Scalar::F32, false),
+                    Buf(Scalar::F32, true),
+                    Buf(Scalar::I64, true),
+                ],
+                i64_ty,
+            ),
+            MlBuiltin::Argsort { .. } => (
+                vec![Buf(Scalar::F32, false), Buf(Scalar::I64, true)],
+                i64_ty,
+            ),
+            MlBuiltin::SampleCategorical => (
+                vec![Buf(Scalar::F32, false), Float("uniform variate")],
+                i64_ty,
+            ),
         };
         if args.len() != sig.len() {
             let want: Vec<String> = sig
@@ -190,6 +221,7 @@ impl Sema<'_> {
                 .map(|a| match a {
                     Str(what) => format!("a `*u8` {what}"),
                     Int(what) => format!("an integer {what}"),
+                    Float(what) => format!("a float {what}"),
                     Buf(t, _) => format!("a {} buffer", buffer_desc(*t)),
                 })
                 .collect();
@@ -210,6 +242,7 @@ impl Sema<'_> {
             match *a {
                 Str(what) => self.ml_str_arg(name, &args[i], &arg_tys[i], i, what),
                 Int(what) => self.ml_scalar_arg(name, &args[i], &mut arg_tys[i], false, what),
+                Float(what) => self.ml_scalar_arg(name, &args[i], &mut arg_tys[i], true, what),
                 Buf(t, written) => self.ml_buffer_arg(name, &args[i], &arg_tys[i], t, i, written),
             }
         }
@@ -499,6 +532,40 @@ mod tests {
             // The fill writes its buffer.
             ("fn f(w: [f32; 4]) { rand_fill_f32(w, 1, 2); }", "E0304"),
             ("fn f() -> f32 { return randn_f32(1); }", "E0503"),
+        ]);
+    }
+
+    #[test]
+    fn sampling_kernels_are_named_and_typed() {
+        assert_eq!(
+            ml_builtin("argsort_desc_f32"),
+            Some(MlBuiltin::Argsort { descending: true })
+        );
+        assert_eq!(ml_builtin("topk"), None);
+        let ok = "fn f(x: []f32, mut v: []f32, mut i: []i64, w: [f32; 8]) -> i64 { \
+                  let u: f64 = 0.5; \
+                  return topk_f32(x, v, i) + argsort_f32(x, i) + argsort_desc_f32(w, i) \
+                      + sample_categorical(x, 0.5) + sample_categorical(w, u); }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        assert_rejected(&[
+            // `vals` is written, so a non-`mut` slice parameter there is rejected; `x` is only read.
+            (
+                "fn f(x: []f32, v: []f32, mut i: []i64) -> i64 { return topk_f32(x, v, i); }",
+                "E0304",
+            ),
+            // The variate is a float, the index buffer i64.
+            (
+                "fn f(p: []f32) -> i64 { return sample_categorical(p, 1); }",
+                "E0401",
+            ),
+            (
+                "fn f(x: []f32, mut i: []i32) -> i64 { return argsort_f32(x, i); }",
+                "E0401",
+            ),
+            (
+                "fn f(p: []f32) -> i64 { return sample_categorical(p); }",
+                "E0503",
+            ),
         ]);
     }
 }

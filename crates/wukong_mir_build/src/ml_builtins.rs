@@ -1,10 +1,10 @@
 //! Lowering of the ML I/O and randomness builtins that `wukong_sema::ml_builtins` types: typed file
-//! I/O over every element type, the safetensors / `.npy` container readers, and the Philox4x32-10
-//! counter-based RNG.
+//! I/O over every element type, the safetensors / `.npy` container readers, the Philox4x32-10
+//! counter-based RNG, and the top-k / argsort / categorical-sampling kernels.
 //!
 //! **Calls.** Every builtin but the RNG scalars lowers to one opaque `Op::Call` of a
-//! `wukong_runtime` entry. Integer operands are widened to `i64` (by their own signedness), and a
-//! buffer operand — a `[]T` slice, a `[T; N]` array or a contiguous
+//! `wukong_runtime` entry. Integer operands are widened to `i64` (by their own signedness), float
+//! operands to `f32`, and a buffer operand — a `[]T` slice, a `[T; N]` array or a contiguous
 //! `Tensor[T, …]` — becomes its data pointer plus its `i64` element count (the slice's fat-pointer
 //! fields, the array's length, the product of the tensor's dims). A container read into a tensor
 //! also passes the tensor's dims (an `[i64; rank]` stack buffer and the rank) so the runtime can
@@ -50,6 +50,9 @@ pub(crate) struct MlSyms {
     st_read: Symbol,
     npy_read: Symbol,
     rand_fill: Symbol,
+    topk: Symbol,
+    argsort: Symbol,
+    sample_categorical: Symbol,
 }
 
 impl MlSyms {
@@ -61,6 +64,9 @@ impl MlSyms {
             st_read: interner.intern("wukong_rt_st_read"),
             npy_read: interner.intern("wukong_rt_npy_read"),
             rand_fill: interner.intern("wukong_rand_fill_f32"),
+            topk: interner.intern("wukong_topk_f32"),
+            argsort: interner.intern("wukong_argsort_f32"),
+            sample_categorical: interner.intern("wukong_sample_categorical_f32"),
         }
     }
 }
@@ -177,6 +183,35 @@ impl FnLowerer<'_> {
                 });
                 Some(self.const_zero(MirType::I32))
             }
+            MlBuiltin::TopK => {
+                if args.len() != 3 {
+                    return None;
+                }
+                let x = self.ml_buffer(&args[0])?;
+                let vals = self.ml_buffer(&args[1])?;
+                let idx = self.ml_buffer(&args[2])?;
+                Some(self.ml_call(
+                    syms.topk,
+                    vec![x.data, x.len, vals.data, vals.len, idx.data, idx.len],
+                ))
+            }
+            MlBuiltin::Argsort { descending } => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let x = self.ml_buffer(&args[0])?;
+                let idx = self.ml_buffer(&args[1])?;
+                let desc = self.ml_i64_const(descending as i64);
+                Some(self.ml_call(syms.argsort, vec![x.data, x.len, idx.data, idx.len, desc]))
+            }
+            MlBuiltin::SampleCategorical => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let p = self.ml_buffer(&args[0])?;
+                let u = self.ml_f32_arg(&args[1]);
+                Some(self.ml_call(syms.sample_categorical, vec![p.data, p.len, u]))
+            }
         }
     }
 
@@ -217,6 +252,14 @@ impl FnLowerer<'_> {
         let signed = self.signed(e);
         let v = self.lower_expr(e);
         self.coerce_to(v, &from, &MirType::I64, signed)
+    }
+
+    /// A float operand converted to `f32`.
+    fn ml_f32_arg(&mut self, e: &Expr) -> ValueId {
+        let from = self.expr_mir(e);
+        let signed = self.signed(e);
+        let v = self.lower_expr(e);
+        self.coerce_to(v, &from, &MirType::F32, signed)
     }
 
     /// Lower a buffer operand (a slice, an array or a contiguous tensor) to its data pointer and
