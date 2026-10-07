@@ -221,12 +221,12 @@ mod tests {
             .map(|&blk| b.block_param(blk, MirType::I64))
             .collect();
         b.br(blocks[links - 1], vec![x]);
-        for k in (0..links).rev() {
-            b.switch_to(blocks[k]);
+        for (k, (&blk, &p)) in blocks.iter().zip(&params).enumerate().rev() {
+            b.switch_to(blk);
             let next = if k % 2 == 0 {
-                b.build(MirType::I64, Op::Bin(BinOp::Add, params[k], one))
+                b.build(MirType::I64, Op::Bin(BinOp::Add, p, one))
             } else {
-                params[k]
+                p
             };
             if k == 0 {
                 b.ret(Some(next));

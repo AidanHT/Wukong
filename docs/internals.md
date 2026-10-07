@@ -287,7 +287,9 @@ the operand's defining line for its type.
 `wukong_opt::optimize` first runs a whole-program **inliner** (`-O2`), then `PassManager` runs a
 list of function-level `Pass`es to a per-function fixpoint (capped at 100 sweeps), then a
 whole-program **loop unroller** (`-O2`) with a reduced cleanup sweep over just the functions it
-changed. The fixpoint uses
+changed. Functions are optimized **callees first** (call-graph SCCs in Tarjan order), and each SCC is
+summarized as soon as it is done (`src/effects.rs`), so a caller's passes know which of its calls
+have no side effect. The fixpoint uses
 per-pass **clean-tracking**: a pass is a deterministic function of the MIR, so one that reported "no
 change" cannot fire again until some *other* pass mutates the function; clean passes are skipped and
 any mutation re-dirties all of them. That changes only how often a pass runs, never the sequence of
@@ -304,6 +306,11 @@ mem2reg/CSE/LICM results the verifier does not catch. Passes that only touch ins
 parameters or edge arguments leave the cache alone, and the prune-first passes (`mem2reg`, `cse`,
 `licm`) use the free `all_reachable` test to skip their reachability DFS in the steady state.
 
+The pass manager's cache is *managed*: it also holds the function's `AliasInfo`, shared by `cse`,
+`dse` and `licm` while nothing mutates and dropped as soon as any pass reports a change or the CFG is
+invalidated, and the call-effect table for the callees optimized so far. A cache built by hand (tests,
+`inline`'s specialization) is unmanaged and recomputes alias facts on every request.
+
 | Pass            | Level | What it does |
 |-----------------|-------|--------------|
 | `inline_program`| -O2   | inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
@@ -311,13 +318,13 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
 | `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
-| `Dce`         | -O1   | remove pure instructions whose results are unused, and dead allocas |
-| `Cse`         | -O2   | dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table) plus **intra-block** load forwarding keyed on `(address value, accessed type)`, with `alias` deciding which entries a store or call invalidates |
+| `Dce`         | -O1   | remove pure instructions whose results are unused, dead allocas, and unused calls to callees summarized as side-effect free and always returning |
+| `Cse`         | -O2   | global value numbering: dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table); load forwarding keyed on `(address value, accessed type)` along single-predecessor edges and **through joins** (the intersection of the predecessors' exit states — a location every edge knows with different values becomes a lazily created block parameter); block-parameter numbering (trivial and duplicate parameters); a phi for an expression every arm of a join computed; and calls to side-effect-free callees numbered (read nothing) or forwarded like loads (read memory). `alias` decides which entries a store or opaque call invalidates. Loop headers start with an empty memory table |
 | `Dse`         | -O2   | dead-store elimination (a store fully overwritten by a later one with no intervening read that `alias` says could observe it) |
 | `LoopCanon`   | -O2   | canonicalize loop entry/latch structure before loop-invariant code motion |
-| `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load**, when `alias` proves nothing in the body writes it *and* the access is dereferenceable |
+| `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load**, when `alias` proves nothing in the body writes it *and* the access is dereferenceable, and a call to a callee summarized as speculatable |
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
-| `unroll_program`| -O2 | unroll a counted two-block loop 4x, with a wrap-safe guard and a remainder loop; runs **after** the function pipeline, and the functions it changed get a reduced cse+dce cleanup sweep |
+| `unroll_program`| -O2 | unroll a counted two-block loop: **completely** when its exact trip count is at most 32 and the copies total at most 128 instructions; otherwise 4x (body up to 16 instructions) or 2x (up to 32), with a wrap-safe guard and a remainder that is a loop for an unknown trip count, nothing when the factor divides a known one, and straight-line copies for a known leftover; runs **after** the function pipeline, and the functions it changed get a reduced simplify + simplify-cfg + simplify-phis + cse + dce cleanup sweep |
 
 `-O3` currently runs the same pass pipeline as `-O2`: there are no `-O3`-exclusive passes yet
 (`PassManager::standard` adds passes at `-O1` and `-O2` only).
@@ -336,6 +343,22 @@ within 3 of the bottom of its type, the preheader computes it as
 and a wrapped limit sends every iteration to the remainder loop instead of running the body past the
 end of the range. `tests/run/loop_unroll.wk` pins that guard, the `trip mod 4` remainder, and the
 zero-trip case. `WUKONG_NO_UNROLL=1` disables the pass.
+
+A **known trip count** is computed in the induction variable's own width and predicate, and only
+when the final increment does not wrap (an `i8` loop stepping by 2 to `127` never ends, so its
+closed-form count is not its behavior and it is treated as unknown). With it the unroller replaces a
+short loop by its iterations — the header keeps its instructions as iteration 0's test, every body
+copy feeds the next header copy, a final header copy produces the exit values — and gives a partially
+unrolled loop no remainder loop at all: none when the factor divides the count, straight-line copies
+for the leftover otherwise.
+
+**Call effects** (`src/effects.rs`). A user function is summarized only when calling it has no side
+effect: every store targets its own frame, every call is to a summarized callee or its own SCC (the
+greatest fixpoint, so recursion is fine), no barrier or shared slot or element-wise vector kernel,
+and no pointer return, pointer compare or `ptrtoint` unless the pointer was handed in or names static
+data. The summary records whether it reads caller-visible memory, whether it always returns (no
+loop, recursion or `unreachable`), and whether it is speculatable (always returns, reads nothing, no
+integer division). External `print`/`wukong_*` symbols are never summarized.
 
 One splice detail generalizes to every MIR pass: `Op::VecKernelCall.kernel` is a **function-local**
 index, not a `ValueId`, so value renaming neither sees nor fixes it, and `inline_call_site` must carry
@@ -379,8 +402,8 @@ below).
 `Cse`/`Dse` still handle the residual memory (load forwarding and its dual) for the slots that stay
 in memory. `Licm` uses the dominator
 analysis to find natural loops and only hoists into loops that already have a preheader, so it is
-always legal; stores, calls, vector-kernel calls, allocas, and integer division/remainder (which can
-trap on a zero divisor) are never moved. Float predicates are never folded on self-comparison
+always legal; stores, vector-kernel calls, allocas, integer division/remainder (which can trap on a
+zero divisor) and calls other than to a speculatable side-effect-free callee are never moved. Float predicates are never folded on self-comparison
 (NaN != NaN).
 
 ### Alias analysis (`wukong_opt::alias`)
