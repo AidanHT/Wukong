@@ -21,6 +21,11 @@
 | `alias.rs` | `AliasInfo`, `Prov` — provenance for load/store disambiguation |
 | `loop_info.rs` | Natural-loop analysis (induction vars, trip counts, dependences) |
 | `fxhash.rs` | `FxHashMap`/`FxHashSet` — crate-internal fixed-seed hasher |
+| `branch_fold.rs` | jump threading of constant edge arguments and folding a branch into a predecessor with the same destination (`and`/`or`), both run inside `SimplifyCfg` |
+| `tre.rs` | `Tre` — tail-recursion elimination (plain and integer-accumulator), plus `pre_inline` so a fully tail-recursive function becomes inlinable |
+| `fuse.rs` | `LoopFuse` — fusion of adjacent innermost counted loops over the same range, with an affine/alias legality proof |
+| `unswitch.rs` | `LoopUnswitch` — induction-variable range splitting and non-trivial unswitching of innermost loops |
+| `switch_form.rs` | `FormSwitches` / `form_switches` — late `switch` formation from equality chains; constant/degenerate switch folding |
 
 ## Cross-cutting helpers in `lib.rs`
 

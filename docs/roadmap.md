@@ -488,7 +488,8 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   one `and`/`or` branch, **tail-recursion elimination** (plain and integer-accumulator, `-O1`+; a
   fully tail-recursive function becomes inlinable at `-O2`), a late **`switch` formation** from
   equality chains, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
-  forwarding, DSE, **loop-invariant code motion**, **loop unswitching** and **induction-variable
+  forwarding, DSE, **loop-invariant code motion**, **MIR loop fusion** of adjacent same-range loops
+  after inlining (`-O2`), **loop unswitching** and **induction-variable
   range splitting** of guarded loop bodies (`-O2`), and **partial loop unrolling** (4×, with a
   wrap-safe guard and a remainder loop; it never reassociates, so a float reduction keeps its exact
   serial accumulate — measured 28% on an integer reduction, 10% on an elementwise store loop, 4% on a

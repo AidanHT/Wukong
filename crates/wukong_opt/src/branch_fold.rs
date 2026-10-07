@@ -287,7 +287,7 @@ fn plan_threads(
             // (edge, decided successor, the edge's arguments, the predecessor's other successor)
             let found = match &f.blocks[p].term {
                 Terminator::Br { target, args } if target.0 as usize == m => {
-                    decide(args).map(|t| (EdgeSel::Br, t, args.as_slice(), None))
+                    decide(args.as_slice()).map(|t| (EdgeSel::Br, t, args.as_slice(), None))
                 }
                 Terminator::CondBr {
                     then_blk: pt,
@@ -297,9 +297,11 @@ fn plan_threads(
                     ..
                 } if pt != pe => {
                     if pt.0 as usize == m {
-                        decide(pta).map(|t| (EdgeSel::Then, t, pta.as_slice(), Some(*pe)))
+                        decide(pta.as_slice())
+                            .map(|t| (EdgeSel::Then, t, pta.as_slice(), Some(*pe)))
                     } else if pe.0 as usize == m {
-                        decide(pea).map(|t| (EdgeSel::Else, t, pea.as_slice(), Some(*pt)))
+                        decide(pea.as_slice())
+                            .map(|t| (EdgeSel::Else, t, pea.as_slice(), Some(*pt)))
                     } else {
                         None
                     }

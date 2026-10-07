@@ -132,6 +132,7 @@ for_step.wk:
 for_step_gemm.wk: veckernel*4
 frem.wk:
 fuse_if_relu.wk: wukong_velem_f32 wukong_velem_f32*3
+fused_helper_chain.wk:
 gate.wk: wukong_vmath2_f32 wukong_vmath2_f32*2
 gate_backward.wk: wukong_vmath2_f32 wukong_vmath2_f32*2
 gcd.wk:

@@ -43,6 +43,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   most 128 instructions per loop and 4096 per function (`wukong_opt::unswitch`,
   `tests/run/causal_mask_split.wk`). The bench's `compile-work` attribution replica mirrors the new
   pipeline stages.
+- **MIR loop fusion (`-O2`, after loop canonicalization).** Two adjacent innermost two-block counted
+  loops with the same start, end, predicate and induction type merge into one when the second
+  reads nothing the first defines, the second's preheader is pure and reached only from the first,
+  and every cross-loop pair of accesses with a write is either the identical affine index on one
+  object (nonzero constant stride) or proved disjoint by the alias analysis. A widenable loop is
+  never fused with one the vectorizer would refuse, and widenable loops fuse only at one access
+  width. This is what fuses a helper-call chain after inlining, which the AST-level fusion in
+  `mir_build` cannot see (`wukong_opt::fuse`, `tests/run/fused_helper_chain.wk`).
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 

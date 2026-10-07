@@ -160,11 +160,13 @@ thread_local! {
 }
 
 /// Slots of the stages added after the original layout (kept after it, so its numbering is
-/// unchanged): `tre` and `unswitch` in the standard pipeline, and the late `switch` formation.
+/// unchanged): `tre`, `unswitch` and `fuse` in the standard pipeline, and the late `switch`
+/// formation.
 const SLOT_TRE: usize = SLOTS;
 const SLOT_UNSWITCH: usize = SLOTS + 1;
 const SLOT_SWITCHES: usize = SLOTS + 2;
-const SLOTS_ALL: usize = SLOTS + 3;
+const SLOT_FUSE: usize = SLOTS + 3;
+const SLOTS_ALL: usize = SLOTS + 4;
 
 /// A transparent counting adapter around a real pass. Forwards `name` and `run_function`
 /// unchanged, so the production `PassManager` sees exactly the pass it would have run; the only
@@ -223,6 +225,7 @@ fn attributed_standard() -> wukong_opt::PassManager {
     pm.add(counted_pass(5, Box::new(Cse)));
     pm.add(counted_pass(6, Box::new(Dse)));
     pm.add(counted_pass(7, Box::new(LoopCanon)));
+    pm.add(counted_pass(SLOT_FUSE, Box::new(LoopFuse)));
     pm.add(counted_pass(8, Box::new(Licm)));
     pm.add(counted_pass(SLOT_UNSWITCH, Box::new(LoopUnswitch)));
     pm.add(counted_pass(9, Box::new(Vectorize::default())));
@@ -497,6 +500,7 @@ pub fn report(files: &[PathBuf]) {
     let sum_calls: u64 = agg[..10]
         .iter()
         .chain(&agg[SLOT_TRE..=SLOT_UNSWITCH])
+        .chain(std::iter::once(&agg[SLOT_FUSE]))
         .map(|p| p.calls)
         .sum();
     println!(
@@ -550,6 +554,7 @@ pub fn report(files: &[PathBuf]) {
         let calls: u64 = r.passes[..10]
             .iter()
             .chain(&r.passes[SLOT_TRE..=SLOT_UNSWITCH])
+            .chain(std::iter::once(&r.passes[SLOT_FUSE]))
             .map(|p| p.calls)
             .sum();
         println!(

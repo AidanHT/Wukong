@@ -24,7 +24,9 @@
 //! From `-O1` the fixpoint also runs **tre** ([`Tre`]): a function's tail calls to itself (and
 //! integer accumulator recursion such as `n * fact(n - 1)`) become a loop. At `-O2`, between
 //! `licm` and `vectorize`, **unswitch** ([`LoopUnswitch`]) splits a counted loop at the iteration
-//! where a guard on its induction variable changes, or unswitches a branch on an invariant.
+//! where a guard on its induction variable changes, or unswitches a branch on an invariant; and
+//! between `loop-canon` and `licm`, **fuse** ([`LoopFuse`]) merges two adjacent counted loops over
+//! the same range when no dependence crosses them.
 //!
 //! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
 //! per-function pipeline, and partial loop unrolling ([`unroll_program`]) runs once *after* it — the
@@ -56,6 +58,7 @@ mod vectorize;
 mod verify_each;
 
 mod branch_fold;
+mod fuse;
 mod switch_form;
 mod tre;
 mod unswitch;
@@ -80,6 +83,7 @@ pub use simplify_cfg::SimplifyCfg;
 pub use unroll::unroll_program;
 pub use vectorize::Vectorize;
 
+pub use fuse::LoopFuse;
 pub use switch_form::{form_switches, FormSwitches};
 pub use tre::Tre;
 pub use unswitch::LoopUnswitch;
@@ -186,6 +190,9 @@ impl PassManager {
             // Put every loop into one shape before LICM runs: LICM hoists only into a preheader
             // that already exists, so a loop given one here becomes hoistable in the same sweep.
             pm.add(Box::new(LoopCanon));
+            // Fuse adjacent counted loops over the same range once they are canonical, before LICM
+            // fills the second loop's preheader with loads (`fuse`).
+            pm.add(Box::new(LoopFuse));
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
