@@ -208,6 +208,7 @@ linear_nt_every_lane.wk: wukong_sgemm_nt
 linear_nt_j_outer_every_lane.wk: wukong_sgemm_nt
 linear_nt_memacc_every_lane.wk: wukong_sgemm_nt
 linear_nt_while_k_every_lane.wk: wukong_sgemm_nt
+linear_nt_wide_panel_every_lane.wk: wukong_sgemm_nt
 linear_residual.wk: wukong_sgemm_nt_epi
 linear_residual_relu.wk: wukong_sgemm_nt_epi
 linear_residual_src.wk: wukong_sgemm_nt wukong_sgemm_nt*2 wukong_velem_f32 wukong_velem_f32*2

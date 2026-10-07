@@ -1,0 +1,133 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 135
+// EXPECT-OUT: 95
+// EXPECT-OUT: -219
+// EXPECT-OUT: -117
+// EXPECT-OUT: 263
+// EXPECT-OUT: -91
+// EXPECT-OUT: -167
+// EXPECT-OUT: -34
+// EXPECT-OUT: 124
+// EXPECT-OUT: 77
+// EXPECT-OUT: 147
+// EXPECT-OUT: -218
+// EXPECT-OUT: 109
+// EXPECT-OUT: 208
+// EXPECT-OUT: -174
+// EXPECT-OUT: -278
+// EXPECT-OUT: -12
+// EXPECT-OUT: 72
+// EXPECT-OUT: 158
+// EXPECT-OUT: -99
+// EXPECT-OUT: 139
+// EXPECT-OUT: -70
+// EXPECT-OUT: -65
+// EXPECT-OUT: 108
+// EXPECT-OUT: -195
+// EXPECT-OUT: -123
+// EXPECT-OUT: -136
+// EXPECT-OUT: 318
+// EXPECT-OUT: 158
+// EXPECT-OUT: 51
+// EXPECT-OUT: -26
+// EXPECT-OUT: 42
+// EXPECT-OUT: -159
+// EXPECT-OUT: 61
+// EXPECT-OUT: 219
+// EXPECT-OUT: 269
+// EXPECT-OUT: -111
+// EXPECT-OUT: -24
+// EXPECT-OUT: 24
+// EXPECT-OUT: -36
+// EXPECT-OUT: 49
+// EXPECT-OUT: 140
+// EXPECT-OUT: 147
+// EXPECT-OUT: 70
+// EXPECT-OUT: 70
+// EXPECT-OUT: -14
+// EXPECT-OUT: -21
+// EXPECT-OUT: 49
+// EXPECT-OUT: 35
+// EXPECT-OUT: -63
+// EXPECT-OUT: -84
+// EXPECT-OUT: -28
+// EXPECT-OUT: 105
+// EXPECT-OUT: -7
+// EXPECT-OUT: 119
+// EXPECT-OUT: 0
+// EXPECT-OUT: -42
+// EXPECT-OUT: -7
+// EXPECT-OUT: -56
+// EXPECT-OUT: 1260
+module tests.run.linear_nt_wide_panel_every_lane
+
+// `Y = X.Wt` at a shape that reaches the TRANSPOSING B-PACKER'S VECTOR PATH, printing every lane.
+//
+// WHY THIS EXISTS. `linear_nt_every_lane.wk` already prints every lane of a recognized `A.Bt`, but
+// its N=6 is narrower than the packed panel width NR=16, so `wukong_runtime`'s `pack_b_trans_panel`
+// takes only its scalar edge path there. The AVX2 8x8 in-register transpose that packs the bulk of
+// a real NT GEMM was therefore reachable by no corpus program at all. This shape reaches all four
+// of the packer's cases in one call (kc = 20, nc = 20, so two panels):
+//   * panel 0, ncols == NR == 16      -> the vector path, two 8-contraction-step slabs (k 0..16);
+//   * the same panel's k tail          -> the scalar twin, k 16..20 (kc % 8 == 4);
+//   * panel 1, ncols == 4 < NR         -> the scalar twin for a partial column panel;
+//   * panel 1's lanes 4..16            -> the zero-fill.
+//
+// RECOGNIZED KERNELS ARE GATE-BLIND: interp and native both call the same `wukong_sgemm_nt` at
+// every -O level, so `native_matches_interpreter` and both invariance gates are blind to a wrong
+// kernel. The EXPECT-OUT block is the whole proof and it is the whole output buffer.
+//
+// PROOF THE RECOGNIZER FIRES (by hand after touching the recognizer or the kernel; no gate can):
+//     cargo run -q -p wukongc -- --emit=mir -O2 tests/run/linear_nt_wide_panel_every_lane.wk | grep wukong_
+// prints `call wukong_sgemm_nt(...)`.
+//
+// WHERE THE EXPECTED VALUES COME FROM. The scalar semantics of the nest below, evaluated in exact
+// integer arithmetic by an independent scalar reference, never recorded from compiler output:
+//     x[i,k] = ((3*i*i + 7*k + 5*i*k + 3) mod 17) - 8      in [-8, 8]
+//     w[j,k] = ((2*j*j + 5*k + 7*j*k + 11) mod 23) - 11    in [-11, 11]
+//     y[i,j] = sum over k in 0..20 of x[i,k]*w[j,k]        in [-278, 1260]
+// Every value and partial sum is a small integer, exact in f32 on both backends.
+//
+// WHY THIS DATA AND NOT A RAMP. The defect a transposing packer actually has is a PERMUTATION: a
+// mis-ordered 8x8 register transpose reorders k inside an 8-block, and a mis-selected `permute2f128`
+// swaps packed lanes. A dot product is order-invariant, so operands that are constant or affine in
+// k can absorb a k-permutation and still print the right answer. These two quadratic-residue fills
+// do not: over 200 random permutations of k inside one 8-block, at worst 26 of the 60 lanes were
+// left unchanged, so at least 34 lanes move on any such defect; a swap of two packed j-lanes moves
+// 4. 55 of the 60 lanes are distinct and both signs appear in every row.
+fn linear(x: Tensor[f32, 3, 20], w: Tensor[f32, 20, 20], mut y: Tensor[f32, 3, 20]) {
+    for i in 0..3 {
+        for j in 0..20 {
+            let mut s: f32 = 0.0;
+            for k in 0..20 {
+                s = s + x[i, k] * w[j, k];
+            }
+            y[i, j] = s;
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 60] = [0.0; 60];
+    let mut w: [f32; 400] = [0.0; 400];
+    let mut y: [f32; 60] = [0.0; 60];
+
+    for i in 0..3 {
+        for k in 0..20 {
+            x[i * 20 + k] = (((3 * i * i + 7 * k + 5 * i * k + 3) % 17 - 8) as f32);
+        }
+    }
+    for j in 0..20 {
+        for k in 0..20 {
+            w[j * 20 + k] = (((2 * j * j + 5 * k + 7 * j * k + 11) % 23 - 11) as f32);
+        }
+    }
+
+    linear(x, w, y);
+
+    for t in 0..60 {
+        print(y[t] as i32);
+    }
+    return 0;
+}
