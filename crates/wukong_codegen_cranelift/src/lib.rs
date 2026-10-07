@@ -330,6 +330,26 @@ fn mem_flags() -> MemFlags {
 /// here, and no untracked pointer can name it. Every *other* access keeps `None`.
 const PRIVATE_STACK_REGION: AliasRegion = AliasRegion::Vmctx;
 
+/// The alias region of every access to **`@noalias` parameter storage this function writes** and
+/// reaches only through pointers the MIR analysis tracks
+/// ([`wukong_opt::AliasInfo::promised_storage`] answering `Written`): the parameter's elements, and
+/// for a slice its fat pointer too.
+///
+/// SOUNDNESS, by the same argument as [`PRIVATE_STACK_REGION`]: nothing derived from the parameter
+/// escapes, so no untracked pointer of this function was derived from it, and the `@noalias`
+/// promise excludes every pointer *not* derived from it — so every access that can touch this
+/// storage is one of the accesses tagged here. A store to it therefore no longer clobbers a load
+/// tagged `None` (an unpromised input) or [`PROMISED_READONLY_REGION`]. Calls stay full fences in
+/// Cranelift's analysis, so nothing a callee does is affected. Two written promised parameters
+/// share this one category, which only costs precision between them.
+const PROMISED_WRITTEN_REGION: AliasRegion = AliasRegion::Heap;
+
+/// The alias region of every access to **`@noalias` parameter storage this function never
+/// writes** (`promised_storage` answering `ReadOnly`). No store at all carries this category, so a
+/// load tagged with it is clobbered by nothing but a call: a re-read of a promised input is
+/// forwarded across every store in the function.
+const PROMISED_READONLY_REGION: AliasRegion = AliasRegion::Table;
+
 /// The runtime function an intrinsic call lowers to.
 #[derive(Clone, Copy)]
 enum Intrinsic {
@@ -557,14 +577,37 @@ impl<'a> FnTranslator<'a> {
     }
 
     /// [`mem_flags`] plus the alias region for an access through `ptr`. See
-    /// [`PRIVATE_STACK_REGION`] for why only a never-escaping stack slot gets one, and why that is
-    /// sound.
+    /// [`PRIVATE_STACK_REGION`] and [`PROMISED_WRITTEN_REGION`] for the two classes that get one —
+    /// a never-escaping stack slot, and never-escaping `@noalias` parameter storage — and why that
+    /// is sound. Every other access keeps `None`.
     fn mem_flags_for(&self, ptr: ValueId) -> MemFlags {
         let mut fl = mem_flags();
         if self.alias.is_private_stack(ptr) {
             fl.set_alias_region(Some(PRIVATE_STACK_REGION));
+        } else if let Some(s) = self.alias.promised_storage(ptr) {
+            fl.set_alias_region(Some(match s {
+                wukong_opt::alias::PromisedStorage::Written => PROMISED_WRITTEN_REGION,
+                wukong_opt::alias::PromisedStorage::ReadOnly => PROMISED_READONLY_REGION,
+            }));
         }
         fl
+    }
+
+    /// [`Self::mem_flags_for`] for a load of `ty` through `ptr`. A load from the fat pointer of a
+    /// `@noalias` slice that nothing in this function writes or publishes
+    /// ([`wukong_opt::AliasInfo::is_invariant_slice_header`]) is additionally `readonly` +
+    /// `can_move`: the header holds one value for the whole call and is a live 16-byte object the
+    /// caller keeps, so the load can neither fault nor observe a change wherever it runs. Cranelift
+    /// then treats it as a pure node — GVN merges the per-subscript re-reads of the data pointer
+    /// and its LICM lifts them out of the loop.
+    fn load_flags_for(&self, ptr: ValueId, ty: &MirType) -> MemFlags {
+        let fl = self.mem_flags_for(ptr);
+        match size_of(ty) {
+            Some(bytes) if self.alias.is_invariant_slice_header(ptr, bytes) => {
+                fl.with_readonly().with_can_move()
+            }
+            _ => fl,
+        }
     }
 
     fn dfg_ty(&self, v: Value) -> Type {
@@ -751,7 +794,7 @@ impl<'a> FnTranslator<'a> {
             }
             Op::Load(p, ty) => {
                 let addr = self.val(*p);
-                let flags = self.mem_flags_for(*p);
+                let flags = self.load_flags_for(*p, ty);
                 if matches!(ty, MirType::BF16) {
                     // bf16 storage is 2 bytes; load the 16 bits and widen to f32 exactly (the bits
                     // become the top half of the f32). Register type is f32 (see `cl_type`).
