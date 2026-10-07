@@ -75,10 +75,10 @@ wukong_sema      name resolution + type checking + SHAPE checking
 wukong_mir       MIR data, builder, pretty-printer, verifier, `VecKernel` (the 256-bit AVX2
                   recipe). `MirLevel` lives here too but is inert — see Design bet 2.
 wukong_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
-wukong_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
-                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm,
-                  loop unrolling) plus the `alias` provenance analysis every memory
-                  transform queries
+wukong_opt       pass manager + analyses (cfg, dominators) + transforms (inlining, sroa,
+                  mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse,
+                  loop-delete, licm, promote, loop unrolling) plus the `alias` provenance
+                  analysis every memory transform queries
 wukong_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
                   rules, fused AdamW; finite-difference-gated) — the training backward path (driven by --emit=grad / --train)
 wukong_backend   `Backend` trait + `Artifact`
@@ -216,7 +216,9 @@ SSA registers (see below), which is what makes the value-based passes effective.
 There is **no dedicated aggregate MIR type**. A tuple or struct is a flat, padded byte buffer whose
 local value *is* its base pointer (the convention arrays already follow); `t.0` / `s.f` is a typed
 `load`/`store` at the field's byte offset, and `mem2reg` leaves the aggregate slot in memory (its
-address is taken by every `gep`). Nested aggregates
+address is taken by every `gep`) — unless, at `-O2`, `sroa` has split it first: when every access
+reaches it through constant-index `gep`s, each accessed leaf becomes its own scalar slot that
+`mem2reg` then promotes. Nested aggregates
 (a struct/tuple field that is itself a struct, or an array of structs) lay out recursively — the
 registry-aware layout helpers resolve a named-struct field that the leaf type crate marks unsized — and
 an aggregate field initialized from a *non-literal* value is a leaf-precise deep copy, not a flat
@@ -307,15 +309,18 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 | Pass            | Level | What it does |
 |-----------------|-------|--------------|
 | `inline_program`| -O2   | inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
+| `Sroa`          | -O2   | scalar replacement of aggregates, ahead of `Mem2Reg`: split a local `Array` slot whose every access is a load/store through a constant-index `gep` chain into one scalar slot per accessed leaf. Each access carries its interpreter slot *and* native byte offset; one cell must be one byte range of one type, distinct cells disjoint, so the split preserves both memory models; a leaf whose fresh default differs from the byte it replaces needs a must-be-written proof |
 | `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot only when it is provably written before it is read — see below) |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
 | `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
 | `Dce`         | -O1   | remove pure instructions whose results are unused, and dead allocas |
 | `Cse`         | -O2   | dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table) plus **intra-block** load forwarding keyed on `(address value, accessed type)`, with `alias` deciding which entries a store or call invalidates |
-| `Dse`         | -O2   | dead-store elimination (a store fully overwritten by a later one with no intervening read that `alias` says could observe it) |
+| `Dse`         | -O2   | dead-store elimination: a store overwritten at the same must-alias location (same base and constant offset, not just the same SSA value) before any read in its block, or on **every path** out of it for a stable location (a constant in-bounds offset of an entry-block slot, or of a parameter), or retired by the end of the function for a slot no callee can name; plus every store into a never-read private slot that is provably in bounds — a constant offset, or a loop induction variable over a constant range inside the slot in both memory models |
 | `LoopCanon`   | -O2   | canonicalize loop entry/latch structure before loop-invariant code motion |
-| `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load**, when `alias` proves nothing in the body writes it *and* the access is dereferenceable |
+| `LoopDelete`  | -O2   | bypass a loop with a preheader, one exit edge and no side effect whose values nobody outside uses, when it provably terminates (constant trip, or a unit-step strict bound) — what removes an initialization loop `Dse` emptied |
+| `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load** nothing in the body may write, when it is dereferenceable, sits in the header (which runs on every entry), or runs on every iteration of a single-exit loop, in which case it reads through `select(first_test, addr, dummy)` so a zero-trip entry reads a private dummy slot |
+| `Promote`     | -O2   | scalar promotion: a loop-invariant location the loop both reads and writes, with no other possibly aliasing access, is loaded once in the preheader, accessed through a fresh slot (which `Mem2Reg` turns into a loop-carried value next sweep) and stored back on every dedicated exit, with the same speculation rules as `Licm` and a store-safety rule (private slot, or a store that runs whenever the loop does) |
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
 | `unroll_program`| -O2 | unroll a counted two-block loop 4x, with a wrap-safe guard and a remainder loop; runs **after** the function pipeline, and the functions it changed get a reduced cse+dce cleanup sweep |
 
@@ -372,9 +377,11 @@ by a branch keeps its slot.
 
 A `[]T` **slice** parameter is *not* covered: a slice is a 16-byte `{ data, len }` fat pointer passed
 by address, so its base comes from `load ptr (gep <param>, 0)` — caller-owned memory, not a local
-slot. Hoisting that needs loop-invariant load motion, and `licm` performs that only for a
-**dereferenceable** access, which a pointer into caller-owned memory is not (see the alias analysis
-below).
+slot. Hoisting that needs loop-invariant load motion: `licm` hoists such a load when it runs on every
+iteration (behind a first-iteration guard) **and** no store in the loop may alias it — and every write
+through a slice goes through a pointer loaded the same way, of unknown provenance, so a slice loop
+that writes anything still reloads (the vectorizer hoists those bases under its own runtime guard).
+Removing the rest needs a `noalias` fact.
 
 `Cse`/`Dse` still handle the residual memory (load forwarding and its dual) for the slots that stay
 in memory. `Licm` uses the dominator
@@ -411,7 +418,9 @@ analysis one — see the roadmap.
 this access run on a path the program might not have taken? It is true only for a known in-bounds
 offset into an `alloca` of this function, which is live for the whole function and default-initialized
 by both backends. That is what lets `Licm` hoist a loop-invariant load out of a possibly-zero-trip
-loop for a local `[]T`/struct/tuple, and what stops it doing the same through a parameter.
+loop for a local `[]T`/struct/tuple unconditionally. Through a parameter it needs more: the load must
+run on every iteration, and it is then read through `select(first_test, addr, dummy)` so the
+preheader never touches the parameter's memory on an entry that would not have.
 
 Two more folds are refused for the same `-O0` ≡ `-O{1,2,3}` reason. A bf16/f16 constant is never
 folded — arithmetic or comparison — because the folder rounds to the f32 grid while the backends round

@@ -5,6 +5,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Optimizer memory passes: SROA, path DSE, loop deletion, guarded LICM, scalar promotion (`gap/opt-memory`)
+
+- **SROA** (`-O2`, ahead of mem2reg): an array/struct/tuple local whose every access is at a constant
+  position is split into scalar leaf slots that mem2reg promotes, checked against both the
+  interpreter's slot layout and native byte layout (P10.1).
+- **DSE** matches overwrites must-alias (base + constant offset), proves stores dead along every path
+  and at the end of a private slot's lifetime, and deletes loop-bounded stores into never-read slots;
+  the new **loop-delete** pass removes the loops it empties (P10.4).
+- **LICM** hoists a load that runs on every iteration of a single-exit loop through a parameter,
+  reading through `select(first_test, addr, dummy)` so zero-trip entries never touch it (P10.3); the
+  new **promote** pass keeps a loop-invariant location the loop reads and writes in a register (P10.2).
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

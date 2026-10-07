@@ -1045,14 +1045,19 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   block into the middle of a caller block. A pointer local whose `alloca` and initializing store are
   separated by a branch keeps its slot: promoting it would need a typed "undefined" pointer for the
   read-before-write path, and there is no sound one (`inttoptr 0` is a genuine null natively but a
-  *valid, addressable* slot in the interpreter). Arrays, vectors, address-taken locals of any type,
-  and any slot accessed at a width other than its own stay in memory (the interpreter and `cse`/`dse`
-  handle those directly).
+  *valid, addressable* slot in the interpreter). At `-O2`, `sroa` first splits an array, struct or
+  tuple local whose every access is at a constant position into scalar leaf slots, which mem2reg then
+  promotes. Arrays indexed by a computed index, vectors, address-taken locals of any type, and any
+  slot accessed at a width other than its own stay in memory (the interpreter and `cse`/`dse` handle
+  those directly); a loop-invariant cell of one that a loop both reads and writes is still carried in
+  a register by `promote` when nothing else in the loop may alias it.
 - A **`[]T` slice parameter still re-loads its data pointer at every element access.** A slice is a
   16-byte `{ data, len }` fat pointer passed *by address*, so the base comes from
   `load ptr (gep <param>, 0)` — a load out of caller-owned memory, not out of a local slot — and
-  `mem2reg` has nothing to promote. Removing it needs loop-invariant load motion (or a `noalias`
-  fact about the fat pointer), not slot promotion; `licm` does not hoist loads today.
+  `mem2reg` has nothing to promote. `licm` now hoists a loop-invariant load through a parameter when
+  it runs on every iteration (behind a first-iteration guard) and no store in the loop may alias it,
+  so a read-only slice loop reads its base once; a loop that writes through any other loaded pointer
+  still reloads, and removing that needs a `noalias` fact about the fat pointer.
 - **String literals live in a read-only static-data section** (`.rodata`), referenced by address via
   `Op::GlobalAddr` and deduped by content (one blob per unique literal). So **returning or threading a
   `*u8`** that points at a literal created inside a callee is valid — the pointer outlives the frame,
