@@ -55,7 +55,39 @@
 //! form skips whole key blocks above the diagonal, where a dense two-GEMM control computes and
 //! softmaxes the full `S²` and throws half of it away. `attention_throughput` below measures
 //! against both a scalar-exp control and a same-exp, triangular-blocked strong control so the
-//! difference between those two statements stays visible.
+//! difference between those two statements stays visible — and against a third control built from
+//! THIS kernel's own score and `P·V` microkernels, the only one whose delta is the fusion alone.
+//!
+//! # Numeric contract
+//!
+//! * **The exponential is the crate's own**, [`crate::vmath::exp8`] / [`crate::vmath::exp1`] — the
+//!   same function `wukong_norm_f32(NORM_SOFTMAX)` and a dispatched `exp` loop evaluate (≤ 2 ULP on
+//!   `[-87, 88.38]`, arguments at or below `-88.38` flushing to `+0.0`). No platform `expf` is
+//!   called, so the output is a pure function of the inputs on every host with AVX2+FMA, independent
+//!   of the C runtime. Every exponent argument is `score - running_max ≤ 0`, so the upper clamp is
+//!   never reached and a weight below `e^-88.38` is exactly `+0.0`.
+//! * **What is reassociated.** Each score `q_i·k_j` is an 8-lane FMA split over `D` closed by a
+//!   fixed horizontal tree; the softmax denominator is summed per 64-key block (8 lanes + tree) and
+//!   carried across blocks by the online recurrence `l = l·corr + Σ_block`; `P·V` accumulates in
+//!   key order within a block with one `corr` rescale per block; the output is `acc / l` once at
+//!   the end. Each score carries the rounding of a `D`-term dot whose error grows like
+//!   `(D/8 + 3)·u·Σ|q_t·k_t|` (eight lanes, then a three-level tree) rather than a sequential
+//!   `D·u`; each weight one ≤ 2-ULP `exp`; each block boundary one more (`corr`) plus the rescale
+//!   multiply. Every test here holds the kernel to a `1e-4` mixed band against both the naive
+//!   materialized reference and Wukong's own materialized GEMM+softmax control — including the
+//!   wide-spread inputs where the running max moves at every block and most weights flush to zero.
+//! * **Exceptional values** follow ordinary IEEE propagation, matching `norm.rs`'s softmax: a NaN in
+//!   any `Q`/`K`/`V` element a row attends to makes that row NaN where it reaches (all of it for a
+//!   score NaN, the affected columns for a `V` NaN); a `+∞` score makes its row NaN (`∞ - ∞`); a
+//!   `-∞` score is a zero weight, and a row whose every attended score is `-∞` is NaN (`-∞ - -∞`),
+//!   as `norm.rs`'s fully masked softmax row is. Under a causal mask a row never reads `K` or `V`
+//!   rows above the diagonal — not even through a zero weight, so a non-finite `V` row at a future
+//!   position cannot reach an earlier query
+//!   (`causal_mask_hides_future_v_rows_even_when_they_are_not_finite`).
+//! * **Twin relation.** [`attention_scalar`] (the no-AVX2 fallback) runs the same recurrence one key
+//!   at a time and sums each dot sequentially, so it agrees with the AVX2 path to the band above,
+//!   not bit-for-bit — the one documented exception to the crate's twin rule. Interpreter and native
+//!   call this same function on one host, so the differential oracle is exact regardless.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -96,22 +128,6 @@ pub unsafe extern "C" fn wukong_attention_f32(
     // SAFETY: dims validated above; the operand-size contract is this entry point's caller's.
     unsafe {
         attention_scalar(q, k, v, o, s, d, scale, causal);
-    }
-}
-
-/// `exp` through the crate's own kernel — the same one `norm.rs`'s fused softmax and a dispatched
-/// `exp` loop use — but **NaN-transparent**.
-///
-/// This local guard predates the shared exp NaN repair. The shared kernel now quiets and
-/// propagates NaNs itself; this wrapper retains the attention path's original input-NaN behavior.
-/// [`exp_row`] retains the corresponding lane-wise guard. Neither wrapper establishes an
-/// independent accuracy bound for the complete attention recurrence.
-#[inline]
-fn exp_keep_nan(x: f32) -> f32 {
-    if x.is_nan() {
-        x
-    } else {
-        crate::vmath::exp1(x)
     }
 }
 
@@ -165,9 +181,9 @@ unsafe fn attention_scalar(
                 let corr = if m == m_new {
                     1.0
                 } else {
-                    exp_keep_nan(m - m_new)
+                    crate::vmath::exp1(m - m_new)
                 };
-                let p = exp_keep_nan(x - m_new);
+                let p = crate::vmath::exp1(x - m_new);
                 l = l * corr + p;
                 let vj = v.add(j * d);
                 for t in 0..d {
@@ -379,13 +395,15 @@ unsafe fn dot2x4(
     (ra, rb)
 }
 
-/// Fill one `qb x kb` score tile with `scale * q_i.k_j`, rows strided by [`ATT_BC`].
+/// Fill one `qb x kb` score tile with `scale * q_i.k_j`, rows strided by `ld` ([`ATT_BC`] for the
+/// fused kernel's own tile; the full row length when a test control materializes `S×S` through it).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn qk_tile(
     q: *const f32,
     k: *const f32,
     sc: *mut f32,
+    ld: usize,
     i0: usize,
     j0: usize,
     qb: usize,
@@ -400,8 +418,8 @@ unsafe fn qk_tile(
     while ii + 2 <= qb {
         let qa = q.add((i0 + ii) * d);
         let qc = q.add((i0 + ii + 1) * d);
-        let ra = sc.add(ii * ATT_BC);
-        let rc = sc.add((ii + 1) * ATT_BC);
+        let ra = sc.add(ii * ld);
+        let rc = sc.add((ii + 1) * ld);
         let mut jj = 0;
         while jj < kb4 {
             let kp = k.add((j0 + jj) * d);
@@ -420,7 +438,7 @@ unsafe fn qk_tile(
     }
     if ii < qb {
         let qa = q.add((i0 + ii) * d);
-        let ra = sc.add(ii * ATT_BC);
+        let ra = sc.add(ii * ld);
         let mut jj = 0;
         while jj < kb4 {
             let kp = k.add((j0 + jj) * d);
@@ -470,6 +488,13 @@ unsafe fn row_max(row: *const f32, n: usize, init: f32) -> f32 {
 /// This is the fix for the kernel's dominant cost. It is the crate's own 8-lane exp — the very same
 /// [`crate::vmath::exp8`] `norm.rs`'s fused softmax and a dispatched `exp` loop call — at ~16 SIMD
 /// ops per 8 lanes, replacing two platform `expf` calls per `(query, key)`.
+///
+/// It no longer wraps `exp8` in a NaN-restoring `vcmpps`/`vblendvps` pair. That guard dated from
+/// when the crate's `exp` clamped a NaN to a finite `EXP_HI`; the shared kernel now quiets and
+/// propagates a NaN itself (W16 / FINDING-05), and every argument here is the result of a
+/// subtraction — already a quiet NaN — so the guard selected the exact bits `exp8` now returns. Two
+/// uops per eight lanes went with it, and `attention_propagates_nan_from_a_mid_row_chunk` is now the
+/// gate on `exp8`'s own propagation.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn exp_row(row: *mut f32, n: usize, mn: f32) -> f32 {
@@ -478,22 +503,14 @@ unsafe fn exp_row(row: *mut f32, n: usize, mn: f32) -> f32 {
     let mut sumv = _mm256_setzero_ps();
     let mut t = 0;
     while t < nv {
-        let a = _mm256_sub_ps(_mm256_loadu_ps(row.add(t)), mnv);
-        // NaN transparency, lane-for-lane with `exp_keep_nan`: `exp8` clamps a NaN to `EXP_HI`
-        // (crate-wide, W16), so select the original NaN back — payload and sign intact — instead of
-        // letting a diverged head return a confident finite number.
-        let p = _mm256_blendv_ps(
-            crate::vmath::exp8(a),
-            a,
-            _mm256_cmp_ps::<_CMP_UNORD_Q>(a, a),
-        );
+        let p = crate::vmath::exp8(_mm256_sub_ps(_mm256_loadu_ps(row.add(t)), mnv));
         _mm256_storeu_ps(row.add(t), p);
         sumv = _mm256_add_ps(sumv, p);
         t += 8;
     }
     let mut rs = if nv != 0 { hsum256(sumv) } else { 0.0 };
     while t < n {
-        let p = exp_keep_nan(*row.add(t) - mn);
+        let p = crate::vmath::exp1(*row.add(t) - mn);
         *row.add(t) = p;
         rs += p;
         t += 1;
@@ -501,14 +518,54 @@ unsafe fn exp_row(row: *mut f32, n: usize, mn: f32) -> f32 {
     rs
 }
 
-/// `acc[r] := acc[r]*corr[r] + sum_j P[r][j]*V[j]` for **eight** query rows at once, 8 lanes of `D`
-/// at a time.
+/// The online-softmax rescale factors of a key block, eight query rows per vector:
+/// `corr[r] = (m[r] == mn[r]) ? 1 : exp(m[r] - mn[r])` for `r < qb`, the ordered `==` taken before
+/// the `exp` exactly as the scalar recurrence spells it (so `m = mn = -inf`, a row with nothing seen
+/// yet, is `1` and never `exp(NaN)`). [`crate::vmath::exp8`] lanes are bit-identical to
+/// [`crate::vmath::exp1`], so this equals the per-row scalar form it replaced, for 1/8 of the
+/// transcendental work: one 8-lane `exp` per eight rows instead of up to eight scalar ones.
+///
+/// # Safety
+/// `m`, `mn` readable and `corr` writable for `qb` f32; AVX2+FMA available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn rescale_factors(m: *const f32, mn: *const f32, corr: *mut f32, qb: usize) {
+    let one = _mm256_set1_ps(1.0);
+    let mut r = 0;
+    while r + 8 <= qb {
+        let mo = _mm256_loadu_ps(m.add(r));
+        let mv = _mm256_loadu_ps(mn.add(r));
+        let e = crate::vmath::exp8(_mm256_sub_ps(mo, mv));
+        let same = _mm256_cmp_ps::<_CMP_EQ_OQ>(mo, mv);
+        _mm256_storeu_ps(corr.add(r), _mm256_blendv_ps(e, one, same));
+        r += 8;
+    }
+    while r < qb {
+        let (mo, mv) = (*m.add(r), *mn.add(r));
+        *corr.add(r) = if mo == mv {
+            1.0
+        } else {
+            crate::vmath::exp1(mo - mv)
+        };
+        r += 1;
+    }
+}
+
+/// `acc[r] := acc[r]*corr[r] + sum_{j < ke[r]} P[r][j]*V[j]` for **eight** query rows at once, 8
+/// lanes of `D` at a time, `P` rows strided by `ld`.
 ///
 /// The accumulator is loaded once, rescaled while it is already in the register, driven through the
 /// whole key block, and stored once — so the per-key `D`-wide load/multiply/FMA/store round trip
 /// that dominated the old kernel's store port becomes one round trip per `BC` keys. Eight rows (not
 /// four) because eight independent chains are what it takes to keep both FMA ports busy at 4-cycle
 /// latency; the cost is 8 `vbroadcastss` per shared `V` load, which the three load ports absorb.
+///
+/// `ke[r]` is row `r`'s number of live keys in the block (`kb` everywhere but a causal diagonal
+/// block). The keys every row takes run densely; the ragged causal triangle `[min ke, max ke)` runs
+/// with a per-row test, and nothing past `max ke` is touched. The kernel used to run the whole block
+/// densely with the masked weights zeroed — which leaks: `0 · NaN` and `0 · ∞` are NaN, so a
+/// non-finite `V` row at a FUTURE position reached every earlier row of the diagonal block. Skipping
+/// a finite masked term changes no bit (the accumulator is never `-0.0`, so `a + (±0)` is `a`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::needless_range_loop)]
@@ -517,11 +574,14 @@ unsafe fn pv8(
     p: *const f32,
     acc: *mut f32,
     c: *const f32,
+    ke: [usize; 8],
     j0: usize,
-    kb: usize,
     d: usize,
     dv: usize,
+    ld: usize,
 ) {
+    let kmin = ke.iter().copied().min().unwrap_or(0);
+    let kmax = ke.iter().copied().max().unwrap_or(0);
     let mut t = 0;
     while t < dv {
         let mut a0 = _mm256_mul_ps(_mm256_loadu_ps(acc.add(t)), _mm256_set1_ps(*c));
@@ -551,16 +611,45 @@ unsafe fn pv8(
             _mm256_set1_ps(*c.add(7)),
         );
         let mut jj = 0;
-        while jj < kb {
+        while jj < kmin {
             let vv = _mm256_loadu_ps(v.add((j0 + jj) * d + t));
             a0 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(jj)), vv, a0);
-            a1 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(ATT_BC + jj)), vv, a1);
-            a2 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(2 * ATT_BC + jj)), vv, a2);
-            a3 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(3 * ATT_BC + jj)), vv, a3);
-            a4 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(4 * ATT_BC + jj)), vv, a4);
-            a5 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(5 * ATT_BC + jj)), vv, a5);
-            a6 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(6 * ATT_BC + jj)), vv, a6);
-            a7 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(7 * ATT_BC + jj)), vv, a7);
+            a1 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(ld + jj)), vv, a1);
+            a2 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(2 * ld + jj)), vv, a2);
+            a3 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(3 * ld + jj)), vv, a3);
+            a4 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(4 * ld + jj)), vv, a4);
+            a5 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(5 * ld + jj)), vv, a5);
+            a6 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(6 * ld + jj)), vv, a6);
+            a7 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(7 * ld + jj)), vv, a7);
+            jj += 1;
+        }
+        // The causal triangle: row r takes key jj only while jj < ke[r].
+        while jj < kmax {
+            let vv = _mm256_loadu_ps(v.add((j0 + jj) * d + t));
+            if jj < ke[0] {
+                a0 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(jj)), vv, a0);
+            }
+            if jj < ke[1] {
+                a1 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(ld + jj)), vv, a1);
+            }
+            if jj < ke[2] {
+                a2 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(2 * ld + jj)), vv, a2);
+            }
+            if jj < ke[3] {
+                a3 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(3 * ld + jj)), vv, a3);
+            }
+            if jj < ke[4] {
+                a4 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(4 * ld + jj)), vv, a4);
+            }
+            if jj < ke[5] {
+                a5 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(5 * ld + jj)), vv, a5);
+            }
+            if jj < ke[6] {
+                a6 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(6 * ld + jj)), vv, a6);
+            }
+            if jj < ke[7] {
+                a7 = _mm256_fmadd_ps(_mm256_set1_ps(*p.add(7 * ld + jj)), vv, a7);
+            }
             jj += 1;
         }
         _mm256_storeu_ps(acc.add(t), a0);
@@ -579,10 +668,12 @@ unsafe fn pv8(
             sums[r] = *acc.add(r * d + t) * *c.add(r);
         }
         let mut jj = 0;
-        while jj < kb {
+        while jj < kmax {
             let vx = *v.add((j0 + jj) * d + t);
             for r in 0..8 {
-                sums[r] += *p.add(r * ATT_BC + jj) * vx;
+                if jj < ke[r] {
+                    sums[r] += *p.add(r * ld + jj) * vx;
+                }
             }
             jj += 1;
         }
@@ -593,7 +684,7 @@ unsafe fn pv8(
     }
 }
 
-/// The `qb % 8` edge of [`pv8`], one query row.
+/// The `qb % 8` edge of [`pv8`], one query row over its `ke` live keys.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn pv1(
@@ -601,8 +692,8 @@ unsafe fn pv1(
     p: *const f32,
     acc: *mut f32,
     c: f32,
+    ke: usize,
     j0: usize,
-    kb: usize,
     d: usize,
     dv: usize,
 ) {
@@ -611,7 +702,7 @@ unsafe fn pv1(
     while t < dv {
         let mut a = _mm256_mul_ps(_mm256_loadu_ps(acc.add(t)), cv);
         let mut jj = 0;
-        while jj < kb {
+        while jj < ke {
             a = _mm256_fmadd_ps(
                 _mm256_set1_ps(*p.add(jj)),
                 _mm256_loadu_ps(v.add((j0 + jj) * d + t)),
@@ -625,7 +716,7 @@ unsafe fn pv1(
     while t < d {
         let mut a = *acc.add(t) * c;
         let mut jj = 0;
-        while jj < kb {
+        while jj < ke {
             a += *p.add(jj) * *v.add((j0 + jj) * d + t);
             jj += 1;
         }
@@ -637,8 +728,10 @@ unsafe fn pv1(
 /// AVX2/FMA path: FlashAttention-2's two-level block loop (Dao 2023, Alg. 1) — queries outer, keys
 /// inner, running `(m, l)` per query row, the un-normalized accumulator divided by `l` once at the
 /// very end rather than per block, and whole key blocks above the diagonal skipped under a causal
-/// mask. Inside a block it is three straight-line microkernels: [`qk_tile`], the row softmax
-/// ([`row_max`] + [`exp_row`]), and [`pv8`].
+/// mask. Inside a block it is straight-line microkernels: [`qk_tile`], the row maxima
+/// ([`row_max`]), the rescale factors eight rows per vector ([`rescale_factors`]), the row
+/// exponentials ([`exp_row`]), and [`pv8`], which folds the rescale into its accumulator load and
+/// stops each row at its causal limit.
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_attention_f32`].
@@ -666,8 +759,10 @@ unsafe fn attention_avx2(
     let mut sc = vec![0.0f32; qbmax * ATT_BC];
     let mut acc = vec![0.0f32; qbmax * d];
     let mut m = [f32::NEG_INFINITY; ATT_BR];
+    let mut mn = [f32::NEG_INFINITY; ATT_BR];
     let mut l = [0.0f32; ATT_BR];
     let mut corr = [0.0f32; ATT_BR];
+    let mut ke = [0usize; ATT_BR];
 
     let mut i0 = 0;
     while i0 < s {
@@ -681,48 +776,48 @@ unsafe fn attention_avx2(
         let mut j0 = 0;
         while j0 < jhi {
             let kb = (jhi - j0).min(ATT_BC);
-            qk_tile(q, k, sc.as_mut_ptr(), i0, j0, qb, kb, d, dv, scale);
+            qk_tile(q, k, sc.as_mut_ptr(), ATT_BC, i0, j0, qb, kb, d, dv, scale);
+            // Per-row causal limit inside the tile, and the block's new running max. Scores past a
+            // row's limit are never read again: not by the max, the exp, or `pv8`/`pv1`.
             for ii in 0..qb {
-                let row = sc.as_mut_ptr().add(ii * ATT_BC);
-                // Per-row causal limit inside the tile. Everything past it is zeroed rather than
-                // masked to -inf, so `pv8` below can run the block densely and `exp` never sees an
-                // infinity it would have to special-case.
-                let ke = if causal {
+                ke[ii] = if causal {
                     (i0 + ii + 1).saturating_sub(j0).min(kb)
                 } else {
                     kb
                 };
-                let mut z = ke;
-                while z < kb {
-                    *row.add(z) = 0.0;
-                    z += 1;
-                }
-                if ke == 0 {
-                    // Whole row above the diagonal in this block: stats and accumulator unchanged.
+                mn[ii] = if ke[ii] == 0 {
+                    m[ii]
+                } else {
+                    row_max(sc.as_ptr().add(ii * ATT_BC), ke[ii], m[ii])
+                };
+            }
+            rescale_factors(m.as_ptr(), mn.as_ptr(), corr.as_mut_ptr(), qb);
+            for ii in 0..qb {
+                if ke[ii] == 0 {
+                    // Whole row above the diagonal in this block: stats and accumulator unchanged
+                    // (`corr = 1` even if the row's running max is already NaN).
                     corr[ii] = 1.0;
                     continue;
                 }
-                let mn = row_max(row, ke, m[ii]);
-                corr[ii] = if m[ii] == mn {
-                    1.0
-                } else {
-                    exp_keep_nan(m[ii] - mn)
-                };
-                l[ii] = l[ii] * corr[ii] + exp_row(row, ke, mn);
-                m[ii] = mn;
+                let row = sc.as_mut_ptr().add(ii * ATT_BC);
+                l[ii] = l[ii] * corr[ii] + exp_row(row, ke[ii], mn[ii]);
+                m[ii] = mn[ii];
             }
             // One accumulator rescale and one P*V pass for the whole key block.
             let mut ii = 0;
             while ii + 8 <= qb {
+                let mut kr = [0usize; 8];
+                kr.copy_from_slice(&ke[ii..ii + 8]);
                 pv8(
                     v,
                     sc.as_ptr().add(ii * ATT_BC),
                     acc.as_mut_ptr().add(ii * d),
                     corr.as_ptr().add(ii),
+                    kr,
                     j0,
-                    kb,
                     d,
                     dv,
+                    ATT_BC,
                 );
                 ii += 8;
             }
@@ -732,8 +827,8 @@ unsafe fn attention_avx2(
                     sc.as_ptr().add(ii * ATT_BC),
                     acc.as_mut_ptr().add(ii * d),
                     corr[ii],
+                    ke[ii],
                     j0,
-                    kb,
                     d,
                     dv,
                 );
@@ -919,8 +1014,8 @@ mod tests {
     }
 
     /// A NaN in an operand must reach the output. The old kernel got this for free from the
-    /// platform `expf`; the crate's own `exp` clamps a NaN to a finite `EXP_HI` (W16), so both the
-    /// vector body and the scalar tail restore it explicitly and this pins that they do.
+    /// platform `expf`; the crate's own `exp` once clamped a NaN to a finite `EXP_HI`, and since the
+    /// W16 repair quiets and propagates it — this pins that the path from operand to output keeps it.
     ///
     /// Both probes are chosen so the answer does not depend on which of `f32::max` /
     /// `_mm256_max_ps` the running max uses on a NaN:
@@ -1020,26 +1115,23 @@ mod tests {
         }
     }
 
-    /// The NaN case that `attention_propagates_nan` above **cannot** see, and the only construction
-    /// that isolates [`exp_row`]'s `vblendvps` restore from [`exp_keep_nan`]'s scalar `is_nan`.
+    /// The NaN case that `attention_propagates_nan` above **cannot** see: the only construction in
+    /// which nothing but [`exp_row`]'s 8-lane `exp` stands between a NaN score and a finite output.
     ///
     /// In that test the NaN sits in `Q[1][0]`, so every score of row 1 is NaN, so [`row_max`]
-    /// returns NaN, so `corr = exp_keep_nan(m - NaN)` is NaN by the *scalar* guard and poisons `l`
-    /// and `acc` on its own. Delete the `vblendvps` and the row still comes out NaN: the two guards
-    /// mutually mask each other and neither is pinned.
+    /// returns NaN, so the rescale factor `exp(m - NaN)` is NaN and poisons `l` and `acc` on its own
+    /// — a lane `exp` that dropped the NaN would go unseen.
     ///
-    /// Put the NaN in a **key** instead, in a **non-final 8-lane chunk** of the score row, and the
-    /// masking breaks. `K[3][0] = NaN` makes `score[i][3]` NaN for every `i`; `row_max` folds it
-    /// with `_mm256_max_ps(mv, chunk)`, which returns SRC2 on an unordered compare, so the NaN
-    /// parked in lane 3 of `mv` by chunk 0 is **overwritten** by the finite lane 3 of chunk 1 and
-    /// `row_max` hands back a finite `mn`. `corr = exp_keep_nan(-inf - mn) = +0.0`, also finite. At
-    /// `s = 40, d = 64` non-causal the row is 40 wide, `nv = 40`, so `exp_row` has no scalar tail
-    /// either: the `vblendvps` is the *only* thing left holding the NaN. Without it `exp8` returns
-    /// the clamp saturation 2.406e38 (finite, never `inf` — `vmath_exp_boundary_saturation` pins
-    /// that), `l` is finite, and a diverged head reports confident finite numbers.
-    ///
-    /// Mutation-checked: replacing the `vblendvps` select with a bare `crate::vmath::exp8(a)` makes
-    /// this test fail and leaves `attention_propagates_nan` green.
+    /// Put the NaN in a **key** instead, in a **non-final 8-lane chunk** of the score row.
+    /// `K[3][0] = NaN` makes `score[i][3]` NaN for every `i`; `row_max` folds it with
+    /// `_mm256_max_ps(mv, chunk)`, which returns SRC2 on an unordered compare, so the NaN parked in
+    /// lane 3 of `mv` by chunk 0 is **overwritten** by the finite lane 3 of chunk 1 and `row_max`
+    /// hands back a finite `mn`. The rescale factor `exp(-inf - mn) = +0.0` is finite too. At
+    /// `s = 40, d = 64` non-causal the row is 40 wide, so `exp_row` has no scalar tail either: the
+    /// 8-lane [`crate::vmath::exp8`] is the *only* thing left holding the NaN. Before the W16 repair
+    /// it returned the clamp saturation 2.406e38 here and this kernel needed a local `vblendvps`
+    /// restore; that guard is gone because `exp8` now quiets and propagates the NaN itself, and this
+    /// test is the gate that would see that property regress.
     #[test]
     fn attention_propagates_nan_from_a_mid_row_chunk() {
         for &(s, d) in &[(40usize, 64usize), (72, 32)] {
@@ -1082,6 +1174,87 @@ mod tests {
                                 got[i * d + t]
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Under a causal mask query `i` must not depend on `V` rows `j > i` — not even through a zero
+    /// weight. The `P·V` microkernel used to run the diagonal key block densely with the masked
+    /// weights set to `0.0`, so a non-finite `V` row above the diagonal reached every earlier row of
+    /// that block as `0·NaN = NaN` / `0·∞ = NaN`: a decode buffer holding garbage (or a NaN pad) at a
+    /// future position poisoned the past. Poison one `V` row — the last key, a mid-block key, and one
+    /// past a 64-key block boundary — and demand that every row BEFORE it is bit-for-bit the clean
+    /// run's output, on the AVX2 kernel and the portable twin alike.
+    #[test]
+    fn causal_mask_hides_future_v_rows_even_when_they_are_not_finite() {
+        for &(s, d) in &[
+            (8usize, 8usize),
+            (40, 64),
+            (70, 16),
+            (96, 33),
+            (130, 24),
+            (200, 17),
+        ] {
+            let q = fill(1, s * d);
+            let k = fill(2, s * d);
+            let v = fill(3, s * d);
+            let scale = 1.0 / (d as f32).sqrt();
+            let run = |vv: &[f32], portable: bool| {
+                let mut o = vec![0.0f32; s * d];
+                // SAFETY: q/k/vv are s*d long and readable, o is s*d long and writable.
+                unsafe {
+                    if portable {
+                        attention_scalar(
+                            q.as_ptr(),
+                            k.as_ptr(),
+                            vv.as_ptr(),
+                            o.as_mut_ptr(),
+                            s,
+                            d,
+                            scale,
+                            true,
+                        );
+                    } else {
+                        wukong_attention_f32(
+                            q.as_ptr(),
+                            k.as_ptr(),
+                            vv.as_ptr(),
+                            o.as_mut_ptr(),
+                            s as i64,
+                            d as i64,
+                            scale,
+                            1,
+                        );
+                    }
+                }
+                o
+            };
+            for portable in [false, true] {
+                let clean = run(&v, portable);
+                for &(row, val) in &[
+                    (s - 1, f32::NAN),
+                    (s / 2, f32::INFINITY),
+                    ((s / 2 + 1).min(s - 1), f32::NEG_INFINITY),
+                    (65.min(s - 1), f32::NAN),
+                ] {
+                    let mut vp = v.clone();
+                    for t in 0..d {
+                        vp[row * d + t] = val;
+                    }
+                    let got = run(&vp, portable);
+                    for i in 0..row * d {
+                        assert_eq!(
+                            got[i].to_bits(),
+                            clean[i].to_bits(),
+                            "future V row {row} = {val} leaked into [{}][{}] ({s}x{d}, \
+                             portable={portable}): {} vs {}",
+                            i / d,
+                            i % d,
+                            got[i],
+                            clean[i]
+                        );
                     }
                 }
             }
@@ -1369,7 +1542,7 @@ mod tests {
         }
         let mut sum = 0.0f32;
         for x in row.iter_mut() {
-            *x = exp_keep_nan(*x - mx);
+            *x = crate::vmath::exp1(*x - mx);
             sum += *x;
         }
         let inv = 1.0 / sum;
@@ -1532,6 +1705,169 @@ mod tests {
         }
     }
 
+    /// The materialized control built from the FUSED kernel's own microkernels — the arm that makes
+    /// `attention_throughput` able to answer the question W15 asks (P9.17). The other two controls
+    /// run the packed BLIS GEMM microkernels, so their delta against the fused kernel mixes the
+    /// fusion with a different score/`P·V` microkernel, different packing and a different exp count.
+    /// This one runs the identical [`qk_tile`] (written straight into the full `S×S` score matrix),
+    /// the identical [`row_max`] / [`exp_row`] / normalize per row, and the identical [`pv8`] /
+    /// [`pv1`] with every rescale factor `1` and the same per-row causal limits — so the only
+    /// differences left are the fusion's own: the `S×S` intermediate's memory traffic (write, two
+    /// softmax passes, re-read for `P·V`) against the online rescale (one `exp` per row per key
+    /// block plus the `corr` multiply folded into each accumulator load).
+    ///
+    /// # Safety
+    /// `scores` valid for `s*s` writes, `o` for `s*d` writes; `q`/`k`/`v` valid for `s*d` reads;
+    /// AVX2+FMA available.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn materialized_tiles(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        scores: *mut f32,
+        o: *mut f32,
+        s: usize,
+        d: usize,
+        scale: f32,
+        causal: bool,
+    ) {
+        let dv = d & !7;
+        let ones = [1.0f32; 8];
+        let mut i0 = 0;
+        while i0 < s {
+            let qb = (s - i0).min(ATT_BR);
+            let jhi = if causal { i0 + qb } else { s };
+            let panel = scores.add(i0 * s);
+            // 1) The score panel, through the fused kernel's own score microkernel.
+            let mut j0 = 0;
+            while j0 < jhi {
+                let kb = (jhi - j0).min(ATT_BC);
+                qk_tile(q, k, panel.add(j0), s, i0, j0, qb, kb, d, dv, scale);
+                j0 += ATT_BC;
+            }
+            // 2) A materialized row softmax over each row's causal extent.
+            let mut n_live = [0usize; ATT_BR];
+            for (ii, nl) in n_live.iter_mut().enumerate().take(qb) {
+                let row = panel.add(ii * s);
+                let n = if causal { i0 + ii + 1 } else { s };
+                *nl = n;
+                let mx = row_max(row, n, f32::NEG_INFINITY);
+                let inv = 1.0 / exp_row(row, n, mx);
+                let invv = _mm256_set1_ps(inv);
+                let mut t = 0;
+                while t + 8 <= n {
+                    _mm256_storeu_ps(row.add(t), _mm256_mul_ps(_mm256_loadu_ps(row.add(t)), invv));
+                    t += 8;
+                }
+                while t < n {
+                    *row.add(t) *= inv;
+                    t += 1;
+                }
+            }
+            // 3) O = P·V through the fused kernel's own P·V microkernels, every rescale factor 1.
+            std::ptr::write_bytes(o.add(i0 * d), 0, qb * d);
+            let mut j0 = 0;
+            while j0 < jhi {
+                let kb = (jhi - j0).min(ATT_BC);
+                let mut ii = 0;
+                while ii + 8 <= qb {
+                    let mut kr = [0usize; 8];
+                    for (r, kr_r) in kr.iter_mut().enumerate() {
+                        *kr_r = n_live[ii + r].saturating_sub(j0).min(kb);
+                    }
+                    pv8(
+                        v,
+                        panel.add(ii * s + j0),
+                        o.add((i0 + ii) * d),
+                        ones.as_ptr(),
+                        kr,
+                        j0,
+                        d,
+                        dv,
+                        s,
+                    );
+                    ii += 8;
+                }
+                while ii < qb {
+                    pv1(
+                        v,
+                        panel.add(ii * s + j0),
+                        o.add((i0 + ii) * d),
+                        1.0,
+                        n_live[ii].saturating_sub(j0).min(kb),
+                        j0,
+                        d,
+                        dv,
+                    );
+                    ii += 1;
+                }
+                j0 += ATT_BC;
+            }
+            i0 += ATT_BR;
+        }
+    }
+
+    /// The same-microkernel materialized control must compute the same function as the fused
+    /// kernel and the naive reference, or the timing column it feeds compares two programs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn same_kernel_materialized_control_matches_naive_and_fused() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for &(s, d) in SHAPES {
+            for &causal in &[false, true] {
+                let q = fill(1, s * d);
+                let k = fill(2, s * d);
+                let v = fill(3, s * d);
+                let scale = 1.0 / (d as f32).sqrt();
+                let want = naive(&q, &k, &v, s, d, scale, causal);
+                let mut ctl = vec![0.0f32; s * d];
+                let mut fused = vec![0.0f32; s * d];
+                let mut scores = vec![0.0f32; s * s];
+                // SAFETY: avx2+fma checked; scores is s*s, ctl/fused are s*d, q/k/v are s*d.
+                unsafe {
+                    materialized_tiles(
+                        q.as_ptr(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        scores.as_mut_ptr(),
+                        ctl.as_mut_ptr(),
+                        s,
+                        d,
+                        scale,
+                        causal,
+                    );
+                    wukong_attention_f32(
+                        q.as_ptr(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        fused.as_mut_ptr(),
+                        s as i64,
+                        d as i64,
+                        scale,
+                        causal as i64,
+                    );
+                }
+                for i in 0..s * d {
+                    assert!(
+                        (ctl[i] - want[i]).abs() <= 1e-4 + 1e-4 * want[i].abs(),
+                        "same-kernel control vs naive ({s}x{d}, causal={causal}) idx {i}: {} vs {}",
+                        ctl[i],
+                        want[i]
+                    );
+                    assert!(
+                        (ctl[i] - fused[i]).abs() <= 1e-4 + 1e-4 * fused[i].abs(),
+                        "same-kernel control vs fused ({s}x{d}, causal={causal}) idx {i}: {} vs {}",
+                        ctl[i],
+                        fused[i]
+                    );
+                }
+            }
+        }
+    }
+
     /// The fused kernel must agree with the materialized control it is benchmarked against — in a
     /// gate, not only inside the `#[ignore]`d probe.
     ///
@@ -1646,8 +1982,20 @@ mod tests {
     ///   strong control**: it shares the exp approximation and avoids upper-triangular work.
     ///   Its packed GEMM microkernels differ from the fused path's `qk_tile`/`pv8`, so the timing
     ///   delta also includes arithmetic scheduling and packing; it does not isolate materialization.
+    /// * `mat-tile` — the materialized control built from THIS kernel's own microkernels
+    ///   ([`materialized_tiles`]): identical score microkernel, identical row exp, identical `P·V`
+    ///   microkernel, identical causal limits. **This is the only column whose delta against `fused`
+    ///   is the fusion alone** — the `S×S` round trip against the online rescale — and so the one a
+    ///   W15 verdict ("fusion does / does not pay on this CPU") may rest on. `vs-tile > 1` means
+    ///   fusion pays here.
     /// * `legacy` — the pre-P5 fused kernel, for a same-process A/B of the rewrite itself.
     /// * `fused` — the kernel in this file.
+    ///
+    /// Exponentials per arm, printed per shape so the confound stays visible: `mat-libm` pays one
+    /// scalar libm `expf` per attended score; `mat-exp8` and `mat-tile` one `exp8` lane per attended
+    /// score; `fused` the same lanes plus at most one rescale `exp` per query row per 64-key block
+    /// (evaluated eight rows per `exp8`, and a factor of exactly 1 whenever the running max does not
+    /// move).
     ///
     /// Every buffer, the `S x S` score matrix included, is allocated **outside** the timed region.
     /// The pre-P5 probe allocated and freed a `4·S²`-byte zeroed `Vec` inside each timed iteration,
@@ -1658,6 +2006,8 @@ mod tests {
     #[ignore]
     fn attention_throughput() {
         use std::time::Instant;
+        // The key-block width the fused kernel rescales on (`ATT_BC` is x86_64-only).
+        const ATT_BC_PROBE: usize = 64;
 
         let bench = |f: &dyn Fn()| {
             for _ in 0..3 {
@@ -1730,6 +2080,18 @@ mod tests {
                 } else {
                     f64::NAN
                 };
+                let mat_tile = if avx {
+                    bench(&|| {
+                        #[cfg(target_arch = "x86_64")]
+                        // SAFETY: avx2+fma checked; scores is s*s, oc is s*d, q/k/v are s*d.
+                        unsafe {
+                            materialized_tiles(qp, kp, vp, scp, ocp, s, d, scale, causal);
+                        }
+                        std::hint::black_box(ocp);
+                    })
+                } else {
+                    f64::NAN
+                };
                 let fused = bench(&|| unsafe {
                     wukong_attention_f32(qp, kp, vp, op, s as i64, d as i64, scale, causal as i64);
                 });
@@ -1747,12 +2109,22 @@ mod tests {
                     );
                 }
 
+                // Attended scores (one exp lane each in every arm) and the fused kernel's ceiling
+                // on rescale exps (one per query row per 64-key block it visits).
+                let attended = if causal { s * (s + 1) / 2 } else { s * s };
+                let rescale_max = if causal {
+                    (0..s).map(|i| i / ATT_BC_PROBE + 1).sum::<usize>()
+                } else {
+                    s * s.div_ceil(ATT_BC_PROBE)
+                };
                 println!(
-                    "S={s:<5} D={d}: mat-libm {mat_libm:8.3} | mat-exp8 {mat_v8:8.3} | legacy \
-                     {legacy:8.3} | fused {fused:8.3} || vs-libm {:5.2}x  vs-exp8 {:5.2}x  \
-                     vs-legacy {:5.2}x",
+                    "S={s:<5} D={d}: mat-libm {mat_libm:8.3} | mat-exp8 {mat_v8:8.3} | mat-tile \
+                     {mat_tile:8.3} | legacy {legacy:8.3} | fused {fused:8.3} || vs-libm {:5.2}x  \
+                     vs-exp8 {:5.2}x  vs-tile {:5.2}x  vs-legacy {:5.2}x  [exps: {attended} lanes \
+                     each; fused + <= {rescale_max} rescale]",
                     mat_libm / fused,
                     mat_v8 / fused,
+                    mat_tile / fused,
                     legacy / fused
                 );
             }
