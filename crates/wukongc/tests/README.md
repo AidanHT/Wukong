@@ -11,7 +11,7 @@ prove the compiler works as a user would invoke it — zero mocked stages.
 | `fail.rs` | `tests/fail/*.wk` rejected with pinned `// EXPECT-CODE:`; catalogue coverage both directions |
 | `determinism.rs` | compiler is a pure function across fresh processes — MIR bytes, object bytes, JSON diagnostic order |
 | `exe.rs` | `--emit=exe` AOT path matches `--run` (linked exe vs interpreter oracle) |
-| `recognize.rs` | the recognizers are **switchable**: one witness per cascade head loses its kernel under `WUKONG_NO_RECOGNIZE`, `@generic` removes it for one function only (a MIR count over the `lang_generic_*` twin pairs), the program still prints the same bytes on both backends, and autodiff refuses to run under the instrument |
+| `recognize.rs` | the recognizers are **switchable**: one witness per cascade head loses its kernel under `WUKONG_NO_RECOGNIZE`, `@generic` removes it for one function only (a MIR count over the `lang_generic_*` twin pairs), the program still prints the same bytes on both backends, autodiff refuses to run under the instrument, and a **corpus sweep** holds every `tests/run` program that loses a `wukong_*` call under the instrument to its generic lowering (`-O2` interp, `-O2` native, `-O0` interp), with the dependent-program and distinct-kernel counts pinned as floors |
 
 Focused gate for lowering/optimizer/backend work:
 

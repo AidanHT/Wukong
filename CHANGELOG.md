@@ -5,6 +5,22 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
+
+- **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**
+  `crates/wukongc/tests/recognize.rs` now walks all of `tests/run`, derives which programs lose a
+  `wukong_*` call under `WUKONG_NO_RECOGNIZE` (184 of 371 when the gate was written, reaching 91
+  distinct kernels), and compares recognition on against recognition off at `-O2` interp, `-O2`
+  native and `-O0` interp. Both counts are pinned as floors so a recognizer that silently stops
+  firing becomes a named failure. The branch withheld the native axis of
+  `embedding_alias_parallel.wk` for the whole-function `@parallel` race (D27); that defect is closed
+  on the integrated line (`89ba3103`, whole-function outlining now uses the region independence
+  proof), so the program runs on every axis and the withheld list is empty.
+- **Gate added: a `Tensor` local that runs.** `tests/run/tensor_local_assign.wk` declares a view
+  local, assigns it later and prints every lane. Reading such a local *before* any assignment is
+  still accepted with no definite-assignment rule; that hazard is recorded under **Known
+  limitations / sharp edges** in `docs/roadmap.md`.
+
 ### October 5 contraction semantics and coverage
 
 - Preserve empty lowp/integer GEMM, residual, dual-store and fused-window source stores;

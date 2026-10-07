@@ -908,6 +908,34 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 
 ## Known limitations / sharp edges
 
+- **A view local read before it is assigned is undefined, and the language has no rule that says so.**
+  *(Table measured 2026-08-23 on `lang/w2e-recognizer-gate`; sema still has no definite-assignment
+  rule as of 2026-10-06, but the table has not been re-measured.)*
+  A `Tensor[T, …]` local is a view: its slot holds a base pointer, not storage. Declaring one and
+  assigning it later is legal and works (`tests/run/tensor_local_assign.wk`), and declaring one
+  *without* ever assigning it is load-bearing in the shape-check fixtures, which never reach a
+  backend. But there is no definite-assignment analysis, so **reading one first is accepted and then
+  does three different things**:
+
+  ```wukong
+  fn main() -> i32 { let y: Tensor[f32, 4]; y[0] = 1.0; print(y[0] as i32); return 0; }
+  ```
+
+  | backend | `-O0` | `-O2` |
+  |---|---|---|
+  | interp | exit 1, `error: expected a pointer` (no source location) | exit 0, prints `1` |
+  | native | exit 139 (SIGSEGV, no diagnostic) | exit 139 |
+
+  The MIR shows the cause directly: `v0 = alloca ptr` then `v2 = load ptr v0` — a load of a slot
+  nothing ever stored. The interpreter's own `-O0`/`-O2` disagreement is an opt-invariance violation
+  the gate cannot see, because until now no corpus program used a `Tensor` local at all.
+  **Null-initializing the slot is not the fix** — interpreter address 0 is a valid address (reverted
+  `PtrToInt(p) != 0` attempt, `0900352`), so a null handle is undetectable there and would trade a crash for a
+  silent wrong answer. Giving the local backing storage is not the fix either: whole-value assignment
+  to a view rebinds the handle, and a buffer-typed slot would have to copy. The fix is a
+  **definite-assignment rule** for pointer-backed locals, which is a language feature and belongs
+  with the Phase 7 work, not a patch at the lowering.
+
 - `bf16` **and** `f16` are both real 2-byte storage (round-to-nearest-even), f32 compute, with a full
   symmetric mixed-precision op suite (reductions, max-family, axpby, activations — see above) **and a
   mixed-precision GEMM**: a bf16/f16 `C = A·Bᵀ` `nn.Linear` nest dispatches to `wukong_sgemm_{bf16,
