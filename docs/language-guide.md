@@ -48,19 +48,43 @@ import lib.mathlib
 
 A module path is dotted, and `import` makes a program **multi-file**: `import a.b` — in any file of
 the program — loads `a/b.wk`, resolved relative to the directory of the **root** source file passed
-to `wukongc`, and splices its items into one merged **flat namespace**. Cross-file calls, consts,
-structs, and enums then just work, with no qualification (`tests/run/import_multi.wk`). Each file is
-loaded exactly once, by canonical path: an import **cycle** (`a` imports `b` imports `a`) or diamond
-is not an error, and every item still lands exactly once. A top-level name defined in two files is
-the ordinary duplicate-name error (E0300), pointing at **both** definitions; an import that resolves
-to no file is **E0305** (`wukongc --explain E0305`). A diagnostic inside an imported file renders
-with that file's own path and line.
+to `wukongc`. Each file is loaded exactly once, by canonical path: an import **cycle** (`a` imports
+`b` imports `a`) or diamond is not an error. An import that resolves to no file is **E0305**
+(`wukongc --explain E0305`), and a diagnostic inside an imported file renders with that file's own
+path and line.
 
-The `module` header itself remains informational — it does not participate in resolution and need
-not match the path a file was imported under. `import x as y` aliases and `import x.{a, b}` item
-lists parse but neither rename nor restrict anything yet (v1 is a flat namespace) 🟡. Note that
-`--emit=tokens|ast` dump the **root file only**; every later stage — and `--run` on either backend —
-sees the merged multi-file program.
+**Every file is a module with its own namespace** ✅. Its top-level items (`fn`, `struct`, `enum`,
+`const`, and the functions of an `extern` block) are **private** unless declared `pub`, and a file
+sees only its own items plus what *its own* imports bring in — imports are not transitive. Three
+import forms:
+
+```wukong
+import lib.mathlib;          // every `pub` item of lib/mathlib.wk, unqualified — and `mathlib::item`
+import lib.geom as g;        // only the qualifier: g::norm1(v), g::Vec2 { .. }, g::Axis::Y, g::SCALE
+import lib.stats.{bump};     // exactly `bump`, unqualified
+```
+
+A qualified name works in every position: calls and values (`g::norm1(v)`), struct literals
+(`g::Vec2 { x: 1, y: 2 }`), enum variants and patterns (`g::Axis::Y`), and types (`fn f(v: g::Vec2)`,
+or the item-level spelling `g.Vec2`). Two modules may each define a private `helper` — or both export
+`norm1` — without colliding (`tests/run/import_namespaces.wk`). The rules:
+
+- naming a **private** item of another module — by `import m.{x}`, by `m::x`, or by expecting a plain
+  `import m;` to bring it in — is **E0312**;
+- a definition in the file itself, or an explicit `import m.{x}`, **shadows** a plain import; two
+  plain imports that both export a name make an unqualified **use** of it ambiguous (**E0313**), never
+  a silent choice — qualify it, select it explicitly, or rename an import with `as`;
+- an explicit `import m.{x}` of a name the file also defines, or one `as` name bound to two modules,
+  is the ordinary duplicate-name error (**E0300**);
+- local variables, parameters and generic parameters shadow imported items exactly as they shadow
+  local ones.
+
+Field-level `pub` (`pub x: i32` inside a struct) is accepted but not yet enforced 🟡: a struct's
+fields are readable wherever the struct is. An imported item keeps its source name in every
+diagnostic, prefixed by its module path (`lib.geom.Vec2`). The `module` header itself remains
+informational — it does not participate in resolution and need not match the path a file was
+imported under. Note that `--emit=tokens|ast` dump the **root file only**; every later stage — and
+`--run` on either backend — sees the whole resolved program.
 
 ## Functions ✅
 
@@ -757,9 +781,43 @@ index 0 is an ordinary live slot — so it reports `interpreter heap exhausted a
 a diagnostic and exits 1 instead of returning a null slice. A program must therefore not branch on
 allocation success and expect backend-identical behaviour.
 
-No garbage collector and no hidden allocations beyond what you `alloc_*`: *named* allocator
-selection (`System`, `Arena`, `Scratch`, `Pool` — 🔵) and cleanup via `defer` (🔵) are still being
-wired to the surface. **`@parallel` functions
+No garbage collector and no hidden allocations beyond what you `alloc_*`; cleanup pairs with
+`defer` (✅, below), and *named* allocator selection (`System`, `Arena`, `Scratch`, `Pool` — 🔵) is
+still being wired to the surface.
+
+### Scope-exit cleanup: `defer` ✅
+
+`defer <expr>;` runs `<expr>` when control leaves the enclosing block — however it leaves:
+
+```wukong
+fn sum_scratch(n: i64) -> i32 {
+    let mut buf: []f32 = alloc_f32(n);
+    defer free(buf);                 // runs on every exit below
+    if n == 0i64 {
+        return 0;                    // runs free(buf), then returns
+    }
+    // ... fill and sum buf ...
+    return s as i32;                 // `s as i32` is computed FIRST, then free(buf) runs
+}
+```
+
+- **Every exit**: falling off the end of the block, `return` (all pending defers of the function),
+  and `break`/`continue` (the defers of every block inside the targeted loop — so a `defer` in a
+  loop body runs once per iteration).
+- **LIFO**: several defers run in reverse order of registration, innermost block first.
+- **Values first**: a returned value, a `break` value, and a block's tail value are computed *before*
+  the defers run, so `defer n += 1; return n;` returns the old `n`.
+- `<expr>` may be any expression, including a block, and `defer x += 1;` defers an assignment.
+- **E0314**: a deferred expression may not leave itself (`return`, or `break`/`continue` to a loop
+  outside it), and a name it uses may not be rebound (`let`, `for`, a match binding) while it is
+  pending — its copies at the exits would silently read the new binding.
+- A failed `assert` aborts without running defers.
+
+`defer` runs on every backend (`tests/run/defer_scope_exit.wk`): it is lowered by copying the
+deferred expression onto each exit before any other lowering, so the interpreter, the native JIT,
+`--emit=exe`, the LLVM emitter, the kernel recognizers and autodiff all see ordinary statements.
+
+**`@parallel` functions
 execute today** (✅): the native backend outlines the loop body into its own function and dispatches it
 across CPU cores through the `wukong_runtime` rayon-backed C-ABI entry point
 `wukong_parallel_for(n, body, env)`, which hands each worker a contiguous chunk of `[0, n)` and returns
@@ -769,8 +827,9 @@ SIMD). The interpreter runs the same range sequentially, so results stay differe
 The whole-function vehicle fires on a narrow shape: **every** parameter must be a fixed-size array
 (`[T; N]`) — a `[]T` slice, a `Tensor[..]`, a pointer or a scalar parameter declines — the body must be
 exactly one unlabelled `for i in 0..hi { … }` over a half-open, unit-step range starting at literal `0`,
-and the body must not `return`, `defer`, or `break`/`continue` out of that loop (a `break`/`continue`
-inside an *inner* loop is fine). Anything the recognizer cannot prove declines **silently to the
+and the body must not `return` or `break`/`continue` out of that loop (a `break`/`continue`
+inside an *inner* loop is fine; a `defer` is lowered to ordinary statements first, so a body holding
+one is no longer a lone `for` and declines). Anything the recognizer cannot prove declines **silently to the
 ordinary serial lowering**: the program is still correct, it just does not use more than one core. A
 `@parallel` function whose body is instead a recognized kernel nest (a matmul, GEMV, batched norm,
 transpose, elementwise activation, …) is intercepted *before* the outliner and dispatches the multicore
@@ -790,6 +849,44 @@ captured scalar), a non-affine or offset index, a local bound to a slice/pointer
 alias a capture), a call other than a pure math intrinsic (`print` would reorder output), a
 `match`/`loop` expression in the body, a `return`/`defer`, and a labelled or loop-level
 `break`/`continue`. At most 32 such regions are outlined per program; further ones stay serial.
+
+## Calling C: `extern "C"` ✅
+
+```wukong
+extern "C" {
+    fn ldexp(x: f64, e: i32) -> f64;
+    fn llabs(x: i64) -> i64;
+    pub fn fmodf(x: f32, y: f32) -> f32;   // `pub` exports the declaration to importing modules
+}
+
+fn main() -> i32 {
+    print(ldexp(3.0, 4) as i64);   // 48
+    return 0;
+}
+```
+
+An `extern "C"` block declares C functions by their C symbol names; calls type-check against the
+declared signature like any other call (`tests/run/extern_c_libm.wk`). A signature may use integers
+(signedness is honored for narrow ones), `bool`, `f32`, `f64`, and raw pointers / references; anything
+without a C mapping — a slice, array, tuple, struct, enum, tensor, SIMD vector, `f16`/`bf16`, or a
+generic signature — is **C0001** at the declaration (pass `*T` plus a length instead). Variadic C
+functions (`printf`) cannot be declared.
+
+- **Native** (`--backend=native`, `--emit=obj|exe`): the symbol is imported with the C ABI. The JIT
+  binds it from the running process — the C runtime and libm, plus anything already loaded (on
+  Windows the Universal CRT is loaded on demand, so all of C99's libm is reachable) — and an
+  unresolvable symbol is a clean error; an object file leaves it to the linker.
+- **Interpreter**: calls the **same host symbol** through a scalar marshaller, so the two backends run
+  identical machine code and stay bit-exact even for a libm function whose last bit differs between
+  C runtimes. It supports up to 4 parameters, each an integer, `bool`, `f32` or `f64`, and a `void`,
+  integer, `f32` or `f64` result. A pointer signature (the interpreter's memory is slots, not bytes)
+  or an unresolvable symbol is refused **before the run** with C0001 — use `--backend=native`.
+- **LLVM text** (`--emit=llvm-ir`): a `declare` with `signext`/`zeroext` on narrow integers.
+- `--backend=gpu-native` declines a program that calls C (the usual UNSUPPORTED skip).
+
+The same C function declared identically in several modules is one symbol (the duplicates merge);
+an `extern` named after a builtin's lowering symbol (`print`, `print_u`, …) is E0300, and the
+`wukong_` prefix stays reserved.
 
 ## File I/O ✅
 

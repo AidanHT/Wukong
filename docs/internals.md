@@ -105,7 +105,9 @@ backends sit behind the `Backend` trait in `wukong_backend`.
 source
   → lexer        (wukong_lexer::tokenize)
   → parser       (wukong_parser::parse_module_tokens_from)  -> AST (NodeId watermark threaded)
-  → loader       (wukong_driver::loader::load_imports)  splice `import`ed files -> one flat module
+  → loader       (wukong_driver::loader::load_imports)  load `import`ed files, resolve each file's
+                 names in its own module scope (pub / as / {x, y}), rename imported items to unique
+                 `<module>.<name>` symbols, splice -> one module
   → sema         (wukong_sema::check)                  name res, types, SHAPE check
   → mir_build    (wukong_mir_build::lower_program)     -> MIR (scalar SSA; always MirLevel::Low)
   → opt          (wukong_opt::optimize)                fixpoint passes
@@ -262,8 +264,9 @@ range for the owning function's `vec_kernels` and its result matches the recipe 
 yields an `f32`, an elementwise one yields nothing); and terminators are type-correct, including
 branch-argument arity/types and the function return type. Blocks unreachable from the entry keep their
 type checks with the dominance rule switched off. Given a whole `Program`, `verify_program`
-additionally cross-checks every call against the callee's declared signature — external symbols
-(`print`, the `wukong_*` kernels) are exempt.
+additionally cross-checks every call against the callee's declared signature, including the
+`extern "C"` imports in `Program::externs` — compiler-owned external symbols (`print`, the
+`wukong_*` kernels) are exempt.
 
 It runs before every backend entry — `--run` and `--emit=llvm-ir|obj|exe` all go through
 `wukong_driver::verify_or_ice` — and inside `--emit=mir`/`--emit=mir-high`, where the dump is printed
@@ -644,7 +647,8 @@ initializer's (which is what rejects a narrowing annotation like `let ib: i32 = 
 `i: i64` silently becoming full-width arithmetic). `/` and `%` are excluded from the pure set
 because they can trap and a trap must not be re-sited under a branch that may not be taken; calls,
 indexing and field access are excluded because their value depends on memory a later statement may
-have written. A function containing a `defer` declines outright, and a local or parameter that
+have written. (`defer` never reaches this pass: `defer.rs` copies every deferred expression onto
+its block's exits as the first normalization of `lower_program_with`.) A local or parameter that
 shadows a const keeps that const unfolded in that function. The pass answers "nothing to do" from a
 read-only feasibility scan, so a program it cannot help never pays for the AST copy.
 

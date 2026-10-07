@@ -88,10 +88,12 @@ not duplicate them. In summary, Wukong:
   tensor ops is still planned **as a CPU MIR pass**; on GPU, `wukong_codegen_gpu`'s fusion planner and
   `--backend=gpu-native` can compile an eligible whole program into a cooperative megakernel. These
   recognizers are invisible to the user — you still write the loop nest in `.wk`.
-- **Interop (planned).** A clean C ABI (`@extern("C")` / `@export`) is designed to call into
-  BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. Attribute names are validated against
-  the closed language set; unknown names report `E0306`. General C ABI symbol export/import
-  remains planned (see the roadmap).
+- **Interop.** Calling C runs today: an `extern "C" { fn ldexp(x: f64, e: i32) -> f64; }` block
+  is imported by the native backend (JIT-bound from the host process, or left to the linker for
+  `--emit=exe`), and the interpreter calls the same host symbol for scalar signatures, so the two
+  stay bit-exact (`tests/run/extern_c_libm.wk`). Exporting Wukong kernels under a stable C name
+  (`@export`) and the `@extern("C")` attribute spelling remain planned; attribute names are
+  validated against the closed language set (unknown names report `E0306`).
 
 ## Runs the real GPT-2 124M end-to-end
 

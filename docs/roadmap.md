@@ -27,13 +27,29 @@ assertion-output differences, and C-link fallback output remain documented limit
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 
-- **Multi-file modules**: `import a.b` loads `a/b.wk` (resolved against the *root* source file's
-  directory) and splices its items into one merged flat namespace, so cross-file fns/consts/structs
-  just work on both backends (`tests/run/import_multi.wk`). Files load once each — an import cycle
-  or diamond dedups by canonical path, never errors. An unresolvable import is `E0305`; a cross-file
-  duplicate name is the ordinary `E0300`, pointing at both definitions with each file's own
-  path/line. (`import … as …` / `import x.{a,b}` parse but don't rename/restrict yet;
-  `--emit=tokens|ast` stay root-file-only by design.)
+- **Multi-file modules with real namespaces**: `import a.b` loads `a/b.wk` (resolved against the
+  *root* source file's directory); files load once each — an import cycle or diamond dedups by
+  canonical path, never errors — and an unresolvable import is `E0305`. Every file is its own
+  module: items are private unless `pub` (`E0312` otherwise), imports are per file and not
+  transitive, `import a.b;` brings `b`'s `pub` items in unqualified plus the `b::` qualifier,
+  `import a.b as c;` binds only `c::`, and `import a.b.{x, y};` selects. Two modules may define the
+  same private name; two plain imports exporting one name make an unqualified *use* ambiguous
+  (`E0313`). Qualified names work in calls, values, struct literals, enum variants/patterns and types
+  (`tests/run/import_namespaces.wk`, `tests/run/import_multi.wk`). Resolution is a loader pass that
+  renames each imported item to the unique symbol `<module>.<name>`, so sema, MIR and every backend
+  are unchanged. (Field-level `pub` is accepted, not enforced; `--emit=tokens|ast` stay
+  root-file-only by design.)
+- **`defer`** runs at every exit of its block — fallthrough, `return`, `break`/`continue` — LIFO,
+  innermost block first, with returned/broken/tail values computed before the defers
+  (`tests/run/defer_scope_exit.wk`). It is a first AST normalization in `mir_build`, so every backend,
+  recognizer and autodiff sees plain statements; control flow out of a deferred expression or
+  rebinding a name a pending defer uses is `E0314`.
+- **C FFI**: `extern "C"` declarations become `Program::externs` imports. Native binds the host C
+  symbol (JIT) or leaves it to the linker (`--emit=obj|exe`); the interpreter calls the *same* symbol
+  for scalar signatures (≤ 4 int/`bool`/`f32`/`f64` args) and refuses a pointer signature or an
+  unresolvable symbol before the run (`C0001`); the LLVM emitter declares it with
+  `signext`/`zeroext`. Types without a C mapping are `C0001` at the declaration
+  (`tests/run/extern_c_libm.wk`).
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger
@@ -859,7 +875,8 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 - **Attributes:** sema validates the closed set `@parallel`, `@generic`, `@tile`, `@extern`,
   `@inline`, `@simd`, `@align`, and `@export`; unknown names and restricted-placement violations
   report `E0306`. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
-  behavior and C ABI interop remain incomplete. `@parallel` executes, though its scheduling
+  behavior remains incomplete, and the attribute spelling of C interop (`@extern("C")`) is still
+  discarded — calling C goes through an `extern "C" { … }` block, which does execute. `@parallel` executes, though its scheduling
   arguments are not consumed; `@generic` opts out of recognizers. `@tile` performs loop
   strip-mining and reports `E0309` when it cannot apply. Malformed attribute syntax reports `E0207`.
 - **Non-contiguous tensor layouts** `.col_major` / `.strided` / `.tiled(N, M)`: they parse (an unknown
@@ -900,7 +917,8 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   not yet executed" above). The *general loop* vectorizer already reaches true 256-bit AVX2 for large
   trips via a raw machine-code emitter (see "Works end to end" and "Known limitations"); it is
   *source-level* `f32x8` values that still do not execute.
-- A minimal stdlib of reusable functions/collections. (The language surface once grouped here —
+- A minimal stdlib of reusable functions/collections — the module system it needs (private items,
+  `pub`, per-file namespaces, `as` / `{x, y}` imports) now exists. (The language surface once grouped here —
   structs, enums including data-carrying tagged unions, slices, and multi-dimensional indexing
   `a[i, j]` — now runs end to end; see "Works end to end" above.)
 - AMDGPU/ROCm device codegen (the NVIDIA PTX path already ships behind `--features gpu`, and
