@@ -190,14 +190,15 @@ impl wukong_opt::Pass for Counted {
     }
 }
 
-/// Slot layout of the attribution table: the ten standard `-O2` passes in pipeline order, then the
-/// two whole-program stages, then the cleanup pipeline's two passes (kept separate because they run
-/// under a different driver instance and belong to the unrolling stage's cost).
-const SLOT_INLINE: usize = 10;
-const SLOT_UNROLL: usize = 11;
-const SLOT_CLEANUP_CSE: usize = 12;
-const SLOT_CLEANUP_DCE: usize = 13;
-const SLOTS: usize = 14;
+/// Slot layout of the attribution table: the thirteen standard `-O2` passes in pipeline order, then
+/// the two whole-program stages, then the cleanup pipeline's two passes (kept separate because they
+/// run under a different driver instance and belong to the unrolling stage's cost).
+const STANDARD: usize = 13;
+const SLOT_INLINE: usize = STANDARD;
+const SLOT_UNROLL: usize = STANDARD + 1;
+const SLOT_CLEANUP_CSE: usize = STANDARD + 2;
+const SLOT_CLEANUP_DCE: usize = STANDARD + 3;
+const SLOTS: usize = STANDARD + 4;
 
 fn counted_pass(slot: usize, p: Box<dyn wukong_opt::Pass>) -> Box<dyn wukong_opt::Pass> {
     Box::new(Counted { inner: p, slot })
@@ -207,16 +208,19 @@ fn counted_pass(slot: usize, p: Box<dyn wukong_opt::Pass>) -> Box<dyn wukong_opt
 fn attributed_standard() -> wukong_opt::PassManager {
     use wukong_opt::*;
     let mut pm = PassManager::new();
-    pm.add(counted_pass(0, Box::new(Mem2Reg)));
-    pm.add(counted_pass(1, Box::new(Simplify)));
-    pm.add(counted_pass(2, Box::new(SimplifyCfg)));
-    pm.add(counted_pass(3, Box::new(SimplifyPhis)));
-    pm.add(counted_pass(4, Box::new(Dce)));
-    pm.add(counted_pass(5, Box::new(Cse)));
-    pm.add(counted_pass(6, Box::new(Dse)));
-    pm.add(counted_pass(7, Box::new(LoopCanon)));
-    pm.add(counted_pass(8, Box::new(Licm)));
-    pm.add(counted_pass(9, Box::new(Vectorize::default())));
+    pm.add(counted_pass(0, Box::new(Sroa)));
+    pm.add(counted_pass(1, Box::new(Mem2Reg)));
+    pm.add(counted_pass(2, Box::new(Simplify)));
+    pm.add(counted_pass(3, Box::new(SimplifyCfg)));
+    pm.add(counted_pass(4, Box::new(SimplifyPhis)));
+    pm.add(counted_pass(5, Box::new(Dce)));
+    pm.add(counted_pass(6, Box::new(Cse)));
+    pm.add(counted_pass(7, Box::new(Dse)));
+    pm.add(counted_pass(8, Box::new(LoopCanon)));
+    pm.add(counted_pass(9, Box::new(LoopDelete)));
+    pm.add(counted_pass(10, Box::new(Licm)));
+    pm.add(counted_pass(11, Box::new(Promote)));
+    pm.add(counted_pass(12, Box::new(Vectorize::default())));
     pm
 }
 
@@ -479,7 +483,7 @@ pub fn report(files: &[PathBuf]) {
     let opt = stage_tot[4];
     let residual = opt.since(attributed);
     let max_iter = rows.iter().map(|r| r.max_iterations).max().unwrap_or(0);
-    let sum_calls: u64 = agg[..10].iter().map(|p| p.calls).sum();
+    let sum_calls: u64 = agg[..STANDARD].iter().map(|p| p.calls).sum();
     println!(
         "\noptimizer attribution (summed over corpus; counting adapters around the production \
          PassManager, byte-identical to `optimize`):\n  {:<14} {:>9} {:>12} {:>14} {:>8}",
@@ -528,7 +532,7 @@ pub fn report(files: &[PathBuf]) {
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     for r in &rows {
         let bytes: u64 = r.stage.iter().map(|w| w.bytes).sum();
-        let calls: u64 = r.passes[..10].iter().map(|p| p.calls).sum();
+        let calls: u64 = r.passes[..STANDARD].iter().map(|p| p.calls).sum();
         println!(
             "{:<28} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>10} {:>7} {:>7}",
             trunc(&r.name, 28),
