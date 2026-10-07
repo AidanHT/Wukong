@@ -5,6 +5,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+- **Autodiff (`gap/autodiff`):** every kernel `wukong_mir_build` emits now has a VJP or a named
+  refusal (enforced by a recognizer↔autodiff coupling test) — the whole f32 GEMM family incl. the
+  fused bias/activation epilogue, GEMV/GEVM, bias, transpose, column reductions, all 36 activations,
+  the `vmath2` family, cross-entropy, log-sum-exp, entropy, KL, RoPE and embedding; the backward
+  rides the tuned kernels (`*_bwd_f32` norms, `sgemm_tn`, fused `vmath2` backward codes, `@parallel`
+  spellings) with heap scratch and gradient accumulation; helper-function losses differentiate at
+  every `-O` level; `grad_dot`/`hvp` give Hessian-vector products; `--emit=obj --grad-of=<fn>`
+  exports `<fn>_grad`.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

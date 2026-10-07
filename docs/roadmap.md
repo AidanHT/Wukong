@@ -805,8 +805,8 @@ Reverse-mode autodiff transforms MIR for a single-block forward function returni
 scalar loss. `--emit=grad` prints its forward and backward MIR; `--train` runs the forward, backward
 and optimizer on the selected **interpreter or native Cranelift JIT** backend. The native path
 compiles one owning dispatcher and reuses it for forward, backward and generated AdamW calls.
-Training requires concrete f32 arrays or dense tensors with checked byte extents. AOT training
-and generated-backward performance comparisons remain open. `--grad-of` selects
+Training requires concrete f32 arrays or dense tensors with checked byte extents. An AOT training
+loop and generated-backward performance comparisons remain open. `--grad-of` selects
 the loss and `--grad-wrt` its differentiated buffers. Autodiff requires at least `-O1` for SSA
 construction; `-O2`/`-O3` retain the selected loss while still inlining calls and optimizing its body.
 Generated gradients receive the existing optimizer with an O1 minimum, matching forward
@@ -815,28 +815,61 @@ are unchanged by this second optimization stage. The driver verifies the whole p
 and after backward optimization and verifies the complete training program before execution.
 `--verify-each` additionally checks each optimization pass; gradient MIR emission also verifies its output.
 
-Eight kernel families have VJP rules, including their parallel spellings: `sgemm`, `sgemm_nt`,
-`bias` without a fused activation, `sreduce_f32` (SUM, DOT, SSD, SUMABS, ABSDIFF), `velem_f32`
-(affine, product and quotient), `vmath_f32` (30 of 36 activation codes), `norm_f32` (softmax,
-log-softmax, LayerNorm, RMSNorm and L2-norm), and `norm_affine_f32` (LayerNorm/RMSNorm with learned
-scale/bias). Norm scratch allocation has constant-shape requirements, and unsupported in-place
-cases are refused. Kernel-output scalar loads now seed their supported buffer adjoints or report
-an unrouteable gradient. LayerNorm backward computes centered variance.
+**Kernel coverage.** Every runtime symbol `wukong_mir_build` can emit has an explicit autodiff
+disposition, enforced by `every_emitted_kernel_symbol_is_differentiable_or_declined_by_name`: 49
+forward symbols (25 kernel families, serial and `@parallel`) have VJP rules, and the rest are
+listed with the reason a decline reports (index-valued arg-reductions, half-precision storage,
+quantized operands, scans, pooling, the fused attention kernel, the training-backward kernels
+themselves, I/O). The differentiable families: the whole f32 GEMM family — plain `A·B`, `nn.Linear`
+`A·Bᵀ`, the weight-gradient `Aᵀ·B`, the α-scaled attention-score GEMM and the fused
+`act(A·Bᵀ + bias)` epilogue (identity / ReLU / GELU / SiLU) — GEMV and GEVM (plain and α-scaled), the
+broadcast bias (pure add or any fused activation, in place or not), transpose, column sum / mean /
+sum-of-squares, `sreduce_f32` (SUM, DOT, SSD, SUMSQ, MAX, MIN, MAXABS — ties split evenly — SUMABS,
+ABSDIFF), `velem_f32` (affine, product and quotient, with identity / ReLU / ReLU6), all 36
+`vmath_f32` activation codes, the two-input `vmath2_f32` family (pow, atan2, hypot and the SwiGLU /
+GeGLU / GLU gates), `norm_f32` (softmax, log-softmax, LayerNorm, RMSNorm, L2-norm), `norm_affine_f32`,
+softmax cross-entropy, log-sum-exp, entropy, KL divergence, rotary position embedding (including a
+trainable frequency table) and the embedding gather.
+
+**The backward rides the tuned kernels.** The GEMM adjoints are the runtime's own transposed GEMM
+spellings (no synthesized transpose); softmax / LayerNorm / RMSNorm backward are the runtime's
+fused `wukong_{softmax,layernorm,rmsnorm}_bwd_f32` (so a symbolic-generic row width differentiates);
+sigmoid, tanh, SiLU, GELU, ELU and softplus ride the fused `wukong_vmath2_f32` backward codes;
+cross-entropy, RoPE and the embedding ride `wukong_xent_bwd_f32`, `wukong_rope_bwd_f32` and
+`wukong_scatter_add_f32`; and a `@parallel` forward selects the `@parallel` backward spelling.
+Gradient scratch is zeroed heap (`wukong_rt_alloc`, released before the gradient returns), so a
+native backward puts no activation-sized buffers on the stack.
+
+**Memory model.** Gradients accumulate across fan-out (a residual connection, a shared weight, a
+buffer the loss also reads as a scalar). The in-place spellings the recognizers emit differentiate:
+`x = softmax(x)` / log-softmax, `h += r`, `h = act(h + b)` with a pure add or ReLU. A float store
+into a buffer whose gradient is live is differentiated as a memory write, scalar reads of local
+arrays route to their gradients, and a kernel that overwrites a buffer another kernel (or a
+non-constant scalar store) wrote zeroes the earlier writer's adjoint instead of passing it the later
+one. In-place LayerNorm / RMSNorm /
+L2-norm, in-place activations and in-place products/quotients refuse by name.
 
 Float precision casts propagate adjoints, and integer-to-float casts terminate integer leaves;
-float-to-integer-to-float paths decline. User-function calls need to inline into the forward
-function: there is no general interprocedural VJP. Fused GEMM epilogues, GEMV/TN forward calls, six
-activation codes, six reduction codes, mid-function parallel regions and synthesized
-`VecKernelCall` recipes remain unsupported. Unsupported differentiable operations report a
-diagnostic. Second-order (grad-of-grad) differentiation is unsupported and reports that boundary
-explicitly.
+float-to-integer-to-float paths decline. **User-function calls differentiate at every `-O` level**:
+straight-line helpers are spliced into the loss before the reverse pass
+(`wukong_autodiff::inline_calls`); a multi-block or recursive helper on the gradient path refuses,
+naming the callee. Mid-function parallel regions and synthesized `VecKernelCall` recipes remain
+unsupported, and every unsupported differentiable operation reports a diagnostic. **Second order**
+is supported for scalar-path losses: `wukong_autodiff::grad_dot` emits the single-block directional
+derivative `<v, ∇L>` and `hvp` its gradient, the Hessian-vector product; second order through
+recognized tensor kernels, and differentiating the emitted void `*_grad` itself, decline by name.
+There is no CLI flag for second order yet.
 
-Matmul adjoints and four activation derivatives call runtime kernels. Norm backward and the NT
-weight-gradient transpose still use synthesized loops; sigmoid/tanh do not yet use their fused
-runtime backward kernels. `--train-opt=sgd|adamw` selects the optimizer;
+**Ahead of time.** `--emit=obj --grad-of=<fn>` exports `<fn>_grad` next to the forward in the
+object (C ABI: the loss's parameters, then one caller-zeroed gradient buffer per `--grad-wrt`
+entry), so a host training loop links the backward with no compiler at run time. An AOT
+*training loop* (`--train --emit=exe`) is still open. `--train-opt=sgd|adamw` selects the optimizer;
 `--train-weight-decay` accepts finite nonnegative AdamW decay (default zero) and rejects nonzero
-decay with SGD. Source-driven in-crate gradient tests and the real-CLI `training_options` test
-cover selected losses across O0–O3. Generated-autodiff performance benchmarks remain absent.
+decay with SGD. Source-driven gradient tests (helper functions at O0–O3, the fused linear-bias-ReLU
+layer, the cross-entropy head, a fanned-out reduction), the real-CLI `training_options` and
+`autodiff_cli` tests (the latter trains a GEMM + bias model on the interpreter and the native JIT and
+requires byte-identical trajectories at O0–O3) and the hand-derived `tests/run/autodiff_train_*.wk`
+trajectories cover the CLI. Generated-autodiff performance benchmarks remain absent.
 
 A loss whose buffers are **raw `*T` / `*mut T` parameters** now differentiates. It previously could
 not: the front end gives a pointer parameter an `alloca ptr` + `store`, so its base reached autodiff
