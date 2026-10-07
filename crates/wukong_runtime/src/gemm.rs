@@ -470,6 +470,97 @@ fn gemm_pf_c() -> bool {
     *V.get_or_init(|| !std::env::var("WUKONG_GEMM_PF_C").is_ok_and(|v| v == "0"))
 }
 
+/// Fused B micropanel packing (**default ON**; `WUKONG_GEMM_FUSED_PACK=0` opts out, read once).
+///
+/// The classic five-loop packs a whole `kc×nc` B panel, then sweeps it once per `ic` row block.
+/// When there is exactly ONE row-block sweep — the serial kernel's `m <= MC` regime, and every 2D
+/// block-parallel block, whose height never exceeds one sweep — every packed byte is written to
+/// the panel, evicted toward L2, and read back exactly once: the pack buys unit stride and
+/// nothing else, and its source reads (the one unavoidable B traffic) run as a burst with no
+/// compute to hide behind. P9.6 measured that burst at ~11% of the m=128 `nn.Linear` shapes
+/// (`gemm_phase_cost`: packB 698 us against a 5608 us macro-kernel at 128×768·(3072×768)ᵀ).
+///
+/// [`macro_kernel_packb`] instead packs each `KC×NR` micropanel into a 24 KB L1-resident buffer
+/// immediately before the row-panel sweep that consumes it, and threads a [`PfWalk`] through that
+/// sweep's FMA loops so the NEXT micropanel's source lines arrive in L2 under the current one's
+/// compute (BLIS's `b_next` prefetch). The packed bytes, the micro-tile calls and every
+/// per-`(i, j)` K order are identical — it changes where the panel lives and when its source is
+/// fetched, never a result bit (pinned by `fused_b_pack_is_bit_identical_to_the_classic_pack`).
+/// UNMEASURED at landing (the build was deferred); the knob keeps the classic panel one
+/// adjacent-run A/B away, the same instrument discipline as the path gates above.
+#[cfg(target_arch = "x86_64")]
+fn gemm_fused_pack() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !std::env::var("WUKONG_GEMM_FUSED_PACK").is_ok_and(|v| v == "0"))
+}
+
+/// A software-prefetch schedule [`micro_6x16`] walks inside its K loop: one `PREFETCHT1` per
+/// four-step iteration, over `rows` source rows `row_stride` floats apart, `lines` 64-byte lines
+/// each, starting at `ptr`. [`macro_kernel_packb`] hands each row-panel call one slice of the NEXT
+/// B micropanel's source ([`PfWalk::for_b_panel`]), so that source is L2-resident by the time it is
+/// packed. Issuing at the FMA loop's own cadence (one line per ~24 cycles) rather than as a burst
+/// before each call keeps the prefetches from occupying every L1 fill buffer at once while the
+/// micro-tile streams its A panel from L2.
+///
+/// Architecturally a hint: the address is formed with `wrapping_add` and never dereferenced, so a
+/// walk may run past the end of B (its last line can) without UB or a fault, and no result bit
+/// depends on it. [`PfWalk::NONE`] is the no-prefetch walk every other caller passes. Not threaded
+/// into the AVX-512 twin: on that path the walk is simply skipped.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct PfWalk {
+    ptr: *const f32,
+    row_stride: usize,
+    lines: usize,
+    rows: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl PfWalk {
+    /// No prefetch.
+    const NONE: PfWalk = PfWalk {
+        ptr: std::ptr::null(),
+        row_stride: 0,
+        lines: 0,
+        rows: 0,
+    };
+
+    /// Slice `part` of `nparts` of the source rows that packing B micropanel `jp` of the `kc×nc`
+    /// slice at `b_src` (leading dimension `ldb`; the [`b_origin`] of this K/column block) reads.
+    /// With `bt` (B stored `[n, k]`) the micropanel's source is `ncols` rows of `kc` contiguous
+    /// floats, `ldb` apart; otherwise (B stored `[k, n]`) it is `kc` rows of `ncols` floats. The
+    /// parts partition the rows (`rows·part/nparts .. rows·(part+1)/nparts`), so every source row is
+    /// assigned to exactly one row-panel call; a row of `row_floats` floats at an arbitrary
+    /// alignment spans at most `ceil(4·row_floats / 64) + 1` lines.
+    #[allow(clippy::too_many_arguments)]
+    fn for_b_panel(
+        b_src: *const f32,
+        ldb: usize,
+        bt: bool,
+        kc: usize,
+        nc: usize,
+        jp: usize,
+        part: usize,
+        nparts: usize,
+    ) -> PfWalk {
+        let j0 = jp * NR;
+        let ncols = (nc - j0).min(NR);
+        let (rows, row_floats, first_row) = if bt {
+            (ncols, kc, b_src.wrapping_add(j0 * ldb))
+        } else {
+            (kc, ncols, b_src.wrapping_add(j0))
+        };
+        let (lo, hi) = (rows * part / nparts, rows * (part + 1) / nparts);
+        PfWalk {
+            ptr: first_row.wrapping_add(lo * ldb),
+            row_stride: ldb,
+            lines: (row_floats * 4).div_ceil(64) + 1,
+            rows: hi - lo,
+        }
+    }
+}
+
 /// Send-able bundle of the raw-pointer GEMM arguments, so they can cross into [`gemm_pool`]'s worker
 /// (`ThreadPool::install` requires `Send`). Sound: `install` runs the closure to completion before it
 /// returns, so the pointers outlive the call — identical to the lifetime discipline of the kernel's
@@ -1520,6 +1611,7 @@ unsafe fn sgemm_avx2_parallel(
                             mrv,
                             nrv,
                             tile_epi,
+                            PfWalk::NONE,
                         );
                     }
                 }
@@ -1772,6 +1864,7 @@ unsafe fn gemm_region_worker(rg: &GemmRegion, widx: usize) {
                         mrv,
                         nrv,
                         tile_epi,
+                        PfWalk::NONE,
                     );
                 }
             }
@@ -1966,10 +2059,18 @@ unsafe fn sgemm_2d_blocks(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     let target = blocks_target_from(macs, gemm_task_macs(), 3 * nworkers.max(1));
     let (bm, bn) = select_2d_block_shape(m, n, target);
     let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
+    // Every block is one row-block sweep, so its B slice is packed a micropanel at a time unless
+    // the fused pack is switched off (`gemm_fused_pack`); read once per call, not per block.
+    let fused = gemm_fused_pack();
     // Per-worker scratch caps: one block's A/B slices (not whole-matrix panels), rounded up to
-    // full micropanels exactly as the other kernels size their scratch.
+    // full micropanels exactly as the other kernels size their scratch — the B half shrinks to one
+    // `kc×NR` micropanel under the fused pack.
     let ap_cap = round_up(bm.min(m), MR) * k.min(KC);
-    let bp_cap = round_up(bn.min(n), NR) * k.min(KC);
+    let bp_cap = if fused {
+        NR * k.min(KC)
+    } else {
+        round_up(bn.min(n), NR) * k.min(KC)
+    };
     // Send-safe scalar captures — the same raw-pointer-as-usize idiom `sgemm_avx2_parallel` and
     // `pack_ab_par` already use (the closure outlives nothing: `install`/`for_each` join before
     // this frame returns).
@@ -2018,6 +2119,7 @@ unsafe fn sgemm_2d_blocks(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
                     (n - j0).min(bn),
                     ap.as_mut_ptr(),
                     bp.as_mut_ptr(),
+                    fused,
                 );
             }
             PACK_SCRATCH_2D.with(|s| {
@@ -2037,12 +2139,15 @@ unsafe fn sgemm_2d_blocks(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
 /// slices (offset to the block's row/col origin `i0`/`j0`), then [`macro_kernel`] into the block's
 /// C region with `ldc = n`. `beta` on the first K-block, accumulate after, epilogue (shifted to
 /// the block's global column origin) on the final K-block only — the serial kernel's exact rules,
-/// so per-(i,j) accumulation is bit-identical (see [`sgemm_2d_blocks`]).
+/// so per-(i,j) accumulation is bit-identical (see [`sgemm_2d_blocks`]). A block is always one
+/// row-block sweep, so with `fused` its B slice is packed a micropanel at a time
+/// ([`macro_kernel_packb`]) — the same bytes and the same micro-tile calls.
 ///
 /// # Safety
 /// `a`/`b` valid per the [`wukong_sgemm`]/[`wukong_sgemm_nt`] contract with `k`/`n` the full
 /// matrix dims; `[i0, i0+bm) × [j0, j0+bn)` in range of C; `ap`/`bp` sized for
-/// `round_up(bm,MR)·min(k,KC)` / `round_up(bn,NR)·min(k,KC)` f32; avx2+fma available.
+/// `round_up(bm,MR)·min(k,KC)` / `round_up(bn,NR)·min(k,KC)` f32 (`bp`: `NR·min(k,KC)` when
+/// `fused`); avx2+fma available.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -2061,6 +2166,7 @@ unsafe fn sgemm_2d_block(
     bn: usize,
     ap: *mut f32,
     bp: *mut f32,
+    fused: bool,
 ) {
     let mut pc = 0;
     while pc < k {
@@ -2081,18 +2187,36 @@ unsafe fn sgemm_2d_block(
         // than m/n only shortens their row/col loops. Same source values, same panel layout, same
         // matrix-edge-only zero padding ⇒ byte-identical micropanels.
         pack_a(a.add(i0 * k + pc), k, bm, kc, ap);
-        pack_b_block(b, k, n, pc, j0, kc, bn, bt, bp);
-        macro_kernel(
-            bm,
-            bn,
-            kc,
-            ap,
-            bp,
-            c.add(i0 * n + j0),
-            n,
-            beta_eff,
-            block_epi,
-        );
+        if fused {
+            let (b_src, ldb) = b_origin(b, k, n, bt, pc, j0);
+            macro_kernel_packb(
+                bm,
+                bn,
+                kc,
+                ap,
+                b_src,
+                ldb,
+                bt,
+                bp,
+                c.add(i0 * n + j0),
+                n,
+                beta_eff,
+                block_epi,
+            );
+        } else {
+            pack_b_block(b, k, n, pc, j0, kc, bn, bt, bp);
+            macro_kernel(
+                bm,
+                bn,
+                kc,
+                ap,
+                bp,
+                c.add(i0 * n + j0),
+                n,
+                beta_eff,
+                block_epi,
+            );
+        }
         pc += kc;
     }
 }
@@ -2108,7 +2232,9 @@ unsafe fn sgemm_2d_block(
 /// # Safety
 /// `ap_shared` valid packed-A for the whole `chunks` walk (`round_up(m,MR)·k` f32, fully packed
 /// before this call — the pack phase's join); `b` per the [`wukong_sgemm_nt`] contract;
-/// `[0, m) × [j0, j0+bn)` in range of C; `bp` sized `round_up(bn,NR)·min(k,KC)` f32; avx2+fma.
+/// `[0, m) × [j0, j0+bn)` in range of C; `bp` sized `round_up(bn,NR)·min(k,KC)` f32
+/// (`NR·min(k,KC)` when `fused`, which packs B a micropanel at a time as [`sgemm_2d_block`]
+/// does); avx2+fma.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -2126,6 +2252,7 @@ unsafe fn sgemm_2d_block_shared_a(
     m: usize,
     bn: usize,
     bp: *mut f32,
+    fused: bool,
 ) {
     for &(pc, kc, off) in chunks {
         let beta_eff = if pc == 0 { beta } else { 1.0 };
@@ -2134,18 +2261,36 @@ unsafe fn sgemm_2d_block_shared_a(
         } else {
             None
         };
-        pack_b_block(b, k, n, pc, j0, kc, bn, bt, bp);
-        macro_kernel(
-            m,
-            bn,
-            kc,
-            ap_shared.add(off),
-            bp,
-            c.add(j0),
-            n,
-            beta_eff,
-            block_epi,
-        );
+        if fused {
+            let (b_src, ldb) = b_origin(b, k, n, bt, pc, j0);
+            macro_kernel_packb(
+                m,
+                bn,
+                kc,
+                ap_shared.add(off),
+                b_src,
+                ldb,
+                bt,
+                bp,
+                c.add(j0),
+                n,
+                beta_eff,
+                block_epi,
+            );
+        } else {
+            pack_b_block(b, k, n, pc, j0, kc, bn, bt, bp);
+            macro_kernel(
+                m,
+                bn,
+                kc,
+                ap_shared.add(off),
+                bp,
+                c.add(j0),
+                n,
+                beta_eff,
+                block_epi,
+            );
+        }
     }
 }
 
@@ -2241,8 +2386,15 @@ unsafe fn sgemm_2d_blocks_dyn(
     let (bm, bn) = select_2d_block_shape(m, n, target);
     let (nbi, nbj) = (m.div_ceil(bm), n.div_ceil(bn));
     let nblocks = nbi * nbj;
+    // Same fused-pack choice as the static path (read once per call); the B scratch is one
+    // `kc×NR` micropanel under it.
+    let fused = gemm_fused_pack();
     let ap_cap = round_up(bm.min(m), MR) * k.min(KC);
-    let bp_cap = round_up(bn.min(n), NR) * k.min(KC);
+    let bp_cap = if fused {
+        NR * k.min(KC)
+    } else {
+        round_up(bn.min(n), NR) * k.min(KC)
+    };
     // Skinny shared-A regime (INSTRUMENT, default OFF — refuted as a win; see the measured
     // basis at [`gemm_skinny_a`]): ONE block row ⇒ every block's A slice is the same whole-A
     // rows, so per-block packing is redundant traffic — pack A once per call instead of once per
@@ -2389,6 +2541,7 @@ unsafe fn sgemm_2d_blocks_dyn(
                             m,
                             (n - j0).min(bn),
                             bp.as_mut_ptr(),
+                            fused,
                         );
                     } else {
                         sgemm_2d_block(
@@ -2406,6 +2559,7 @@ unsafe fn sgemm_2d_blocks_dyn(
                             (n - j0).min(bn),
                             ap.as_mut_ptr(),
                             bp.as_mut_ptr(),
+                            fused,
                         );
                     }
                 }
@@ -2678,6 +2832,26 @@ unsafe fn sgemm_avx2(
     bt: bool,
     epi: Option<Epilogue>,
 ) {
+    sgemm_avx2_impl(a, b, c, m, k, n, beta, bt, epi, gemm_fused_pack());
+}
+
+/// [`sgemm_avx2`] with the [`gemm_fused_pack`] choice explicit, so the bit-identity of the two B
+/// packing schedules is testable regardless of the process env.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sgemm_avx2_impl(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+    beta: f32,
+    bt: bool,
+    epi: Option<Epilogue>,
+    fused: bool,
+) {
     // Pack scratch, sized to the actual blocks needed (never larger than the cache-block caps).
     // Reused across calls via a per-thread buffer (see PACK_SCRATCH): the packers overwrite every
     // element they read back (data + edge padding), so no re-zeroing is needed, and we avoid a
@@ -2689,8 +2863,16 @@ unsafe fn sgemm_avx2(
     // no ic-loop reuse and must stay in L2 (see `select_nc`).
     let nc_step = select_nc(m, k, n);
     let nc_max = n.min(nc_step);
+    // One `ic` block (`m <= MC`): every packed B byte would be read by exactly one row sweep, so
+    // pack it one micropanel at a time instead (see `gemm_fused_pack`); the B scratch is then a
+    // single `kc×NR` micropanel.
+    let fuse_b = fused && m <= MC;
     let ap_cap = round_up(mc_max, MR) * kc_max;
-    let bp_cap = round_up(nc_max, NR) * kc_max;
+    let bp_cap = if fuse_b {
+        NR * kc_max
+    } else {
+        round_up(nc_max, NR) * kc_max
+    };
     let (mut ap, mut bp) = PACK_SCRATCH.with(|c| {
         let mut g = c.borrow_mut();
         (std::mem::take(&mut g.0), std::mem::take(&mut g.1))
@@ -2718,6 +2900,28 @@ unsafe fn sgemm_avx2(
             } else {
                 None
             };
+            if fuse_b {
+                // The single row block (ic = 0, mc = m): the same A pack, then the micropanel-at-a-
+                // time B pack interleaved with the sweeps that consume it.
+                pack_a(a.add(pc), k, m, kc, ap.as_mut_ptr());
+                let (b_src, ldb) = b_origin(b, k, n, bt, pc, jc);
+                macro_kernel_packb(
+                    m,
+                    nc,
+                    kc,
+                    ap.as_ptr(),
+                    b_src,
+                    ldb,
+                    bt,
+                    bp.as_mut_ptr(),
+                    c.add(jc),
+                    n,
+                    beta_eff,
+                    block_epi,
+                );
+                pc += kc;
+                continue;
+            }
             pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp.as_mut_ptr());
             let mut ic = 0;
             while ic < m {
@@ -2747,6 +2951,30 @@ unsafe fn sgemm_avx2(
         g.0 = ap;
         g.1 = bp;
     });
+}
+
+/// The stored location of the B slice whose logical origin is contraction step `pc`, column `jc`,
+/// and the stored leading dimension: B is `[n, k]` when `bt` (column `j` of `Bᵀ` is row `j` of B),
+/// `[k, n]` otherwise — exactly the base `pack_b_block` hands its whole-panel packers, so a
+/// micropanel packed from this origin holds the same bytes as that panel's slice.
+///
+/// # Safety
+/// `(pc, jc)` must address an element of B (`pc < k`, `jc < n`).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn b_origin(
+    b: *const f32,
+    k: usize,
+    n: usize,
+    bt: bool,
+    pc: usize,
+    jc: usize,
+) -> (*const f32, usize) {
+    if bt {
+        (b.add(jc * k + pc), k)
+    } else {
+        (b.add(pc * n + jc), n)
+    }
 }
 
 /// Pack the B panel for cache block `(pc, jc)` into `bp`, honoring the `C = A·Bᵀ` layout when `bt`.
@@ -2924,11 +3152,71 @@ unsafe fn pack_b_trans(b: *const f32, ldb: usize, kc: usize, nc: usize, bp: *mut
     }
 }
 
+/// Transpose a 6x8 f32 block — six A rows of eight contraction-contiguous floats at `src + r*lda`
+/// — into eight packed `MR`-float rows at `dst + p*MR`, so that `dst[p*MR + r] == src[r*lda + p]`.
+///
+/// The [`transpose8x8_into`] network with rows 6 and 7 fixed at zero: output vector `p` holds
+/// `[r0[p] .. r5[p], 0, 0]`, and it is stored as eight floats at `dst + p*MR`, so its two zero lanes
+/// land on `dst[(p+1)*MR]`, `dst[(p+1)*MR + 1]`. The stores run in ascending `p`, each overwriting
+/// the previous one's overhang, which leaves exactly two floats written past the slab, at the
+/// start of contraction row `p + 8` — the caller ([`pack_a_panel`]) guarantees that row exists and
+/// is rewritten later. Pure lane movement: every packed bit is an input bit.
+///
+/// # Safety
+/// `avx2`; `src` readable for six rows of eight f32 at stride `lda`; `dst` writable for
+/// `8*MR + 2` f32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn transpose6x8_into(src: *const f32, lda: usize, dst: *mut f32) {
+    use std::arch::x86_64::*;
+    let z = _mm256_setzero_ps();
+    let r0 = _mm256_loadu_ps(src);
+    let r1 = _mm256_loadu_ps(src.add(lda));
+    let r2 = _mm256_loadu_ps(src.add(2 * lda));
+    let r3 = _mm256_loadu_ps(src.add(3 * lda));
+    let r4 = _mm256_loadu_ps(src.add(4 * lda));
+    let r5 = _mm256_loadu_ps(src.add(5 * lda));
+    let t0 = _mm256_unpacklo_ps(r0, r1);
+    let t1 = _mm256_unpackhi_ps(r0, r1);
+    let t2 = _mm256_unpacklo_ps(r2, r3);
+    let t3 = _mm256_unpackhi_ps(r2, r3);
+    let t4 = _mm256_unpacklo_ps(r4, r5);
+    let t5 = _mm256_unpackhi_ps(r4, r5);
+    // The 8x8 network's t6/t7 are unpacks of the two zero rows, i.e. zero.
+    let u0 = _mm256_shuffle_ps::<0x44>(t0, t2);
+    let u1 = _mm256_shuffle_ps::<0xEE>(t0, t2);
+    let u2 = _mm256_shuffle_ps::<0x44>(t1, t3);
+    let u3 = _mm256_shuffle_ps::<0xEE>(t1, t3);
+    let u4 = _mm256_shuffle_ps::<0x44>(t4, z);
+    let u5 = _mm256_shuffle_ps::<0xEE>(t4, z);
+    let u6 = _mm256_shuffle_ps::<0x44>(t5, z);
+    let u7 = _mm256_shuffle_ps::<0xEE>(t5, z);
+    // Ascending `p`: each store's two-lane overhang is overwritten by the next.
+    _mm256_storeu_ps(dst, _mm256_permute2f128_ps::<0x20>(u0, u4));
+    _mm256_storeu_ps(dst.add(MR), _mm256_permute2f128_ps::<0x20>(u1, u5));
+    _mm256_storeu_ps(dst.add(2 * MR), _mm256_permute2f128_ps::<0x20>(u2, u6));
+    _mm256_storeu_ps(dst.add(3 * MR), _mm256_permute2f128_ps::<0x20>(u3, u7));
+    _mm256_storeu_ps(dst.add(4 * MR), _mm256_permute2f128_ps::<0x31>(u0, u4));
+    _mm256_storeu_ps(dst.add(5 * MR), _mm256_permute2f128_ps::<0x31>(u1, u5));
+    _mm256_storeu_ps(dst.add(6 * MR), _mm256_permute2f128_ps::<0x31>(u2, u6));
+    _mm256_storeu_ps(dst.add(7 * MR), _mm256_permute2f128_ps::<0x31>(u3, u7));
+}
+
 /// Pack an `MC×KC` slice of A (row-major, leading dim `lda`) into `MR`-wide row panels: panel `ip`
 /// is `[kc][MR]` contiguous (so the microkernel broadcasts each row with unit stride), zero-padded.
 /// Reads each A row *contiguously* over the contraction (`p` innermost) and scatters into the small
 /// L1-resident panel; the transposed order (strided A reads, one cache line per element) thrashes
 /// cache, so this order matters as much as it does for `pack_b_trans`.
+///
+/// Full panels go eight contraction steps at a time through [`transpose6x8_into`] (the
+/// `pack_b_trans_panel` 8x8 network with two zero rows), replacing 48 four-byte stores at a
+/// 24-byte stride per slab with eight 32-byte stores. Its stores overhang each slab by two floats
+/// into the next contraction row, so the vector loop stops while a following row still exists to
+/// absorb them; that row and the `kc % 8` tail, plus every partial (`< MR`-row) panel, take the
+/// scalar order below, which is retained verbatim as the **twin** that defines the packed bytes
+/// (`pack_a_panel_simd_matches_scalar_twin` asserts them bit-for-bit, NaN payloads and signed
+/// zeros included — pure data movement, so no comparison or arithmetic is involved).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn pack_a_panel(
@@ -2941,9 +3229,19 @@ unsafe fn pack_a_panel(
 ) {
     let i0 = ip * MR;
     let nrows = (mc - i0).min(MR);
+    let mut p0 = 0;
+    if nrows == MR {
+        // `p0 + 8 < kc`, not `<=`: row `p0 + 8` must exist to take the two-float overhang, and it
+        // is always rewritten afterwards (by the next slab, or by the scalar tail below, which
+        // writes all MR lanes of every row from the final `p0` on).
+        while p0 + 8 < kc {
+            transpose6x8_into(a.add(i0 * lda + p0), lda, panel.add(p0 * MR));
+            p0 += 8;
+        }
+    }
     for r in 0..nrows {
         let src = a.add((i0 + r) * lda); // row (i0+r) of A, contiguous over the contraction
-        for p in 0..kc {
+        for p in p0..kc {
             *panel.add(p * MR + r) = *src.add(p);
         }
     }
@@ -3131,6 +3429,76 @@ unsafe fn macro_kernel(
                 mrv,
                 nrv,
                 panel_epi,
+                PfWalk::NONE,
+            );
+        }
+    }
+}
+
+/// [`macro_kernel`] for a macro-block whose packed B panel would be swept exactly once (see
+/// [`gemm_fused_pack`]): instead of reading a pre-packed `kc×nc` panel, it packs B micropanel `jp`
+/// from the source slice at `b_src` (leading dimension `ldb`, the [`b_origin`] of this K/column
+/// block) into the `kc×NR` buffer `bpanel` right before the `mpanels` micro-tiles that consume it,
+/// and hands each of those micro-tiles one [`PfWalk`] slice of micropanel `jp + 1`'s source.
+///
+/// Bit-identical to `pack_b_block` + [`macro_kernel`] by construction: the same panel function
+/// (`pack_b_trans_panel` / `pack_b_panel`) on the same source and `jp` writes the same `[kc][NR]`
+/// bytes the whole-panel pack places at `bp + jp·kc·NR`; the micro-tiles then run in the same
+/// order with the same `(kc, A panel, C tile, ldc, beta, mr, nr, epilogue shift)` arguments.
+///
+/// # Safety
+/// `ap` holds the packed `mc×kc` A block; `b_src`/`ldb` address the `kc×nc` B slice in the layout
+/// `bt` names; `bpanel` is writable for `kc·NR` f32 and disjoint from every operand; `c` is the
+/// macro-block's C origin with leading dimension `ldc`; avx2+fma available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn macro_kernel_packb(
+    mc: usize,
+    nc: usize,
+    kc: usize,
+    ap: *const f32,
+    b_src: *const f32,
+    ldb: usize,
+    bt: bool,
+    bpanel: *mut f32,
+    c: *mut f32,
+    ldc: usize,
+    beta: f32,
+    epi: Option<Epilogue>,
+) {
+    let mpanels = mc.div_ceil(MR);
+    let npanels = nc.div_ceil(NR);
+    for jp in 0..npanels {
+        let j0 = jp * NR;
+        let nrv = (nc - j0).min(NR);
+        if bt {
+            pack_b_trans_panel(b_src, ldb, kc, nc, jp, bpanel);
+        } else {
+            pack_b_panel(b_src, ldb, kc, nc, jp, bpanel);
+        }
+        // Each column panel's bias starts `j0` columns into this macro-block's epilogue.
+        let panel_epi = epi.map(|e| e.shift(j0));
+        let has_next = jp + 1 < npanels;
+        for ip in 0..mpanels {
+            let i0 = ip * MR;
+            let mrv = (mc - i0).min(MR);
+            let pf = if has_next {
+                PfWalk::for_b_panel(b_src, ldb, bt, kc, nc, jp + 1, ip, mpanels)
+            } else {
+                PfWalk::NONE
+            };
+            micro_6x16(
+                kc,
+                ap.add(ip * kc * MR),
+                bpanel,
+                c.add(i0 * ldc + j0),
+                ldc,
+                beta,
+                mrv,
+                nrv,
+                panel_epi,
+                pf,
             );
         }
     }
@@ -3138,7 +3506,8 @@ unsafe fn macro_kernel(
 
 /// The `6×16` AVX2/FMA microkernel: 12 live `__m256` accumulators, 12 FMAs per K step. Computes the
 /// full 6×16 tile (packed panels are zero-padded), then writes back the valid `mr×nr` corner with
-/// the `beta` rule.
+/// the `beta` rule. `pf` is a software-prefetch walk issued one line per four-step K iteration
+/// ([`PfWalk`]; [`PfWalk::NONE`] for none) — a hint that never changes a result bit.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(clippy::too_many_arguments)]
@@ -3152,6 +3521,7 @@ unsafe fn micro_6x16(
     mr: usize,
     nr: usize,
     epi: Option<Epilogue>,
+    pf: PfWalk,
 ) {
     use std::arch::x86_64::*;
     // Prefetch the C tile this call's writeback will read/modify: `mr` rows of `nr` f32, rows
@@ -3226,9 +3596,24 @@ unsafe fn micro_6x16(
     // the prefetch itself is architecturally a hint that issues no load and faults on nothing.
     // `wrapping_add` carries no such precondition and lowers to the same `lea`, so the emitted
     // address and every computed bit are unchanged.
+    //
+    // The `pf` walk rides the same cadence: at most one `PREFETCHT1` per four K steps, so a caller's
+    // look-ahead (the next B micropanel's source, see `macro_kernel_packb`) trickles into L2 under
+    // the FMAs instead of arriving as a burst. `NONE` costs one predictable compare per iteration.
+    let mut pf = pf;
+    let mut pf_line = 0usize;
     let mut p = 0;
     while p + 4 <= kc {
         _mm_prefetch::<_MM_HINT_T0>(bp.wrapping_add(NR * 8) as *const i8);
+        if pf.rows != 0 {
+            _mm_prefetch::<_MM_HINT_T1>(pf.ptr.wrapping_add(pf_line * 16) as *const i8);
+            pf_line += 1;
+            if pf_line == pf.lines {
+                pf_line = 0;
+                pf.ptr = pf.ptr.wrapping_add(pf.row_stride);
+                pf.rows -= 1;
+            }
+        }
         kstep!();
         kstep!();
         kstep!();
@@ -4510,6 +4895,7 @@ mod tests {
                         MR,
                         NR,
                         None,
+                        PfWalk::NONE,
                     );
                     micro_6x16_avx512(kc, ap.as_ptr(), bp.as_ptr(), c_512.as_mut_ptr(), NR, beta);
                 }
@@ -6313,6 +6699,7 @@ mod tests {
                             MR,
                             NR,
                             Some(e),
+                            PfWalk::NONE,
                         );
                         micro_6x16(
                             kc,
@@ -6324,6 +6711,7 @@ mod tests {
                             MR - 1,
                             NR,
                             Some(e),
+                            PfWalk::NONE,
                         );
                     }
                     for r in 0..MR - 1 {
@@ -6823,6 +7211,295 @@ mod tests {
         }
     }
 
+    /// The A-packer's AVX2 6x8 path must be **byte-identical** to the scalar element-at-a-time
+    /// twin it replaced — a literal transcription of the pre-vectorisation loop — over NaN
+    /// payloads, signed zeros, infinities and a denormal. Each slab's stores overhang two floats
+    /// into the next contraction row, so the panel buffer is pre-filled with a sentinel and
+    /// extended eight rows past the packed region: a lane the packer forgot to write, or an
+    /// overhang that escaped the panel, both show up as a byte difference against the twin.
+    /// Sizes cover `kc < 8` (no slab), `kc == 8` and `kc == 16` (the last slab has no following row,
+    /// so it must stay scalar), slabs plus a tail, and partial (`< MR`-row) panels.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pack_a_panel_simd_matches_scalar_twin() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        /// The pre-vectorisation packer, verbatim.
+        unsafe fn twin(
+            a: *const f32,
+            lda: usize,
+            mc: usize,
+            kc: usize,
+            ip: usize,
+            panel: *mut f32,
+        ) {
+            let i0 = ip * MR;
+            let nrows = (mc - i0).min(MR);
+            for r in 0..nrows {
+                let src = a.add((i0 + r) * lda);
+                for p in 0..kc {
+                    *panel.add(p * MR + r) = *src.add(p);
+                }
+            }
+            for r in nrows..MR {
+                for p in 0..kc {
+                    *panel.add(p * MR + r) = 0.0;
+                }
+            }
+        }
+        let specials = [
+            f32::from_bits(0x7FC0_0000), // qNaN
+            f32::from_bits(0x7FC0_DEAD), // qNaN, distinct payload
+            f32::from_bits(0xFFA0_0BAD), // sNaN, sign set
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0f32,
+            -0.0f32,
+            f32::from_bits(0x0000_0001), // smallest denormal
+            -1.5,
+            3.25,
+        ];
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+        for &(kc, mc, lda) in &[
+            (1usize, 6usize, 1usize),
+            (7, 6, 7),    // kc < 8: no slab at all
+            (8, 6, 8),    // one slab fits but has no following row: scalar only
+            (9, 6, 9),    // one slab + a one-row tail that absorbs the overhang
+            (16, 6, 19),  // two slabs fit; the second has no following row
+            (17, 12, 40), // two slabs + tail, two full panels
+            (24, 13, 24), // full panels + a one-row partial panel
+            (33, 11, 50), // a five-row partial panel
+            (64, 6, 71),
+            (384, 18, 400),
+        ] {
+            let src: Vec<f32> = (0..mc * lda)
+                .map(|i| {
+                    if i % 5 == 0 {
+                        specials[(i / 5) % specials.len()]
+                    } else {
+                        (i as f32) * 0.25 - 9.0
+                    }
+                })
+                .collect();
+            for ip in 0..mc.div_ceil(MR) {
+                let mut got = vec![f32::from_bits(SENTINEL); (kc + 8) * MR];
+                let mut want = vec![f32::from_bits(SENTINEL); (kc + 8) * MR];
+                unsafe {
+                    pack_a_panel(src.as_ptr(), lda, mc, kc, ip, got.as_mut_ptr());
+                    twin(src.as_ptr(), lda, mc, kc, ip, want.as_mut_ptr());
+                }
+                let gb: Vec<u32> = got.iter().map(|x| x.to_bits()).collect();
+                let wb: Vec<u32> = want.iter().map(|x| x.to_bits()).collect();
+                assert_eq!(
+                    gb, wb,
+                    "packed A bytes differ (kc={kc} mc={mc} lda={lda} ip={ip})"
+                );
+                assert!(
+                    gb[kc * MR..].iter().all(|&x| x == SENTINEL),
+                    "the A pack wrote past its panel (kc={kc} mc={mc} ip={ip})"
+                );
+            }
+        }
+    }
+
+    /// The fused micropanel-at-a-time B pack ([`macro_kernel_packb`], the default) must be
+    /// **bit-identical** to the classic whole-panel pack, through every body that can take it: the
+    /// serial kernel's single-row-block regime — both `bt` layouts, both `beta` rules, plain /
+    /// bias+ReLU / bias-free GELU / α-scaled epilogues, one-, two- and three-K-block shapes, one and
+    /// several `jc` blocks — and the 2D block body on an interior block. Both schedules are driven
+    /// explicitly, so this does not depend on `WUKONG_GEMM_FUSED_PACK`. The `m > MC` shape is the
+    /// control: the serial kernel never fuses there, so the two calls run identical code.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn fused_b_pack_is_bit_identical_to_the_classic_pack() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (5, 17, 13),
+            (MR, KC + 7, 2 * NR),
+            (2 * MR + 1, 2 * KC + 37, 3 * NR + 5),
+            (2 * MR + 1, KC, 1400), // one row block, several `select_nc` column blocks
+            (MC, 9, 40),            // the fused regime's upper edge, m == MC
+            (MC + 1, 40, 70),
+        ] {
+            let a = fill(501, m * k);
+            let b = fill(502, k * n); // same length either way: `bt` reads it as [n, k]
+            let bias = fill(503, n);
+            let c_init = fill(504, m * n);
+            for bt in [false, true] {
+                for &beta in &[0.0f32, 1.0] {
+                    let mut epis = vec![
+                        None,
+                        Some(Epilogue {
+                            bias: bias.as_ptr(),
+                            act: ACT_RELU,
+                            alpha: 1.0,
+                        }),
+                        Some(Epilogue {
+                            bias: std::ptr::null(),
+                            act: ACT_GELU,
+                            alpha: 1.0,
+                        }),
+                    ];
+                    if beta == 0.0 {
+                        epis.push(Some(Epilogue {
+                            bias: std::ptr::null(),
+                            act: ACT_IDENTITY,
+                            alpha: 0.125,
+                        }));
+                    }
+                    for epi in epis {
+                        let (mut fused, mut classic) = (c_init.clone(), c_init.clone());
+                        // SAFETY: avx2+fma detected above; buffers sized m*k, k*n, m*n, bias n.
+                        unsafe {
+                            sgemm_avx2_impl(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                fused.as_mut_ptr(),
+                                m,
+                                k,
+                                n,
+                                beta,
+                                bt,
+                                epi,
+                                true,
+                            );
+                            sgemm_avx2_impl(
+                                a.as_ptr(),
+                                b.as_ptr(),
+                                classic.as_mut_ptr(),
+                                m,
+                                k,
+                                n,
+                                beta,
+                                bt,
+                                epi,
+                                false,
+                            );
+                        }
+                        assert_eq!(
+                            bits(&fused),
+                            bits(&classic),
+                            "fused != classic B pack (m{m} k{k} n{n} bt{bt} beta{beta} epi{})",
+                            epi.is_some()
+                        );
+                    }
+                }
+            }
+        }
+        // The 2D block body on an interior block — nonzero row AND column origin, ragged extents,
+        // two K-blocks — fused against classic, with everything outside the block untouched.
+        let (m, k, n) = (40usize, KC + 9, 100usize);
+        let (i0, j0, bm, bn) = (2 * MR, 2 * NR, 3 * MR + 2, 3 * NR + 2);
+        let a = fill(505, m * k);
+        let b = fill(506, k * n);
+        let bias = fill(507, n);
+        let c_init = fill(508, m * n);
+        let epi = Some(Epilogue {
+            bias: bias.as_ptr(),
+            act: ACT_SILU,
+            alpha: 1.0,
+        });
+        for bt in [false, true] {
+            let mut ap = vec![0.0f32; round_up(bm, MR) * k.min(KC)];
+            let mut bp = vec![0.0f32; round_up(bn, NR) * k.min(KC)];
+            let (mut fused, mut classic) = (c_init.clone(), c_init.clone());
+            for (out, flag) in [(&mut fused, true), (&mut classic, false)] {
+                // SAFETY: avx2+fma detected above; the block lies inside the m×n C; `ap`/`bp`
+                // are sized for the classic (larger) schedule.
+                unsafe {
+                    sgemm_2d_block(
+                        a.as_ptr(),
+                        b.as_ptr(),
+                        out.as_mut_ptr(),
+                        k,
+                        n,
+                        1.0,
+                        bt,
+                        epi,
+                        i0,
+                        j0,
+                        bm,
+                        bn,
+                        ap.as_mut_ptr(),
+                        bp.as_mut_ptr(),
+                        flag,
+                    );
+                }
+            }
+            assert_eq!(
+                bits(&fused),
+                bits(&classic),
+                "2D block: fused != classic B pack (bt{bt})"
+            );
+        }
+    }
+
+    /// [`PfWalk::for_b_panel`]'s parts must partition, in order, exactly the source rows the
+    /// packer reads for that micropanel, and each row's walk must cover the row's whole byte span
+    /// at any alignment. A wrong walk cannot change a result — it is a prefetch — which is exactly
+    /// why no other test would ever notice one; this pins the address arithmetic directly. No
+    /// address here is dereferenced.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pf_walk_partitions_the_packed_source() {
+        let buf = [0.0f32; 4];
+        let base = buf.as_ptr().wrapping_add(3); // deliberately not 64-byte aligned
+        for &(bt, kc, nc, ldb) in &[
+            (true, 384usize, 50usize, 768usize),
+            (true, 7, 16, 9),
+            (false, 384, 50, 3072),
+            (false, 13, 33, 33),
+        ] {
+            for jp in 0..nc.div_ceil(NR) {
+                let j0 = jp * NR;
+                let ncols = (nc - j0).min(NR);
+                let (want, row_bytes): (Vec<usize>, usize) = if bt {
+                    (
+                        (0..ncols)
+                            .map(|r| base.wrapping_add((j0 + r) * ldb) as usize)
+                            .collect(),
+                        4 * kc,
+                    )
+                } else {
+                    (
+                        (0..kc)
+                            .map(|p| base.wrapping_add(p * ldb + j0) as usize)
+                            .collect(),
+                        4 * ncols,
+                    )
+                };
+                for nparts in [1usize, 3, 22, 1000] {
+                    let mut got: Vec<usize> = Vec::new();
+                    for part in 0..nparts {
+                        let w = PfWalk::for_b_panel(base, ldb, bt, kc, nc, jp, part, nparts);
+                        assert_eq!(w.row_stride, ldb);
+                        for r in 0..w.rows {
+                            let row = w.ptr.wrapping_add(r * w.row_stride) as usize;
+                            let (first_line, last_line) = (row / 64, (row + row_bytes - 1) / 64);
+                            assert!(
+                                last_line - first_line < w.lines,
+                                "walk of {} lines misses the tail of a {row_bytes}-byte row \
+                                 (bt{bt} kc{kc} nc{nc} jp{jp})",
+                                w.lines
+                            );
+                            got.push(row);
+                        }
+                    }
+                    assert_eq!(
+                        got, want,
+                        "walk parts do not partition the packed rows (bt{bt} kc{kc} nc{nc} jp{jp} \
+                         nparts{nparts})"
+                    );
+                }
+            }
+        }
+    }
+
     /// **Dev instrument, `#[ignore]`d** — the phase breakdown of the serial NT five-loop at the
     /// skinny shapes the 2026-09 CPU evaluation lost on. Times the transposing B-pack, the
     /// A-pack and the macro-kernel separately, at exactly the block sizes `sgemm_avx2` would
@@ -6831,6 +7508,11 @@ mod tests {
     /// The timing thread is pinned to logical CPU 0 (a P-core on this 6P+8E+2LP-E part): an
     /// unpinned single-thread loop migrates onto a half-FMA-width Crestmont E-core mid-run and
     /// read the SAME macro-kernel call at 622 us and 727 us in one process before the pin.
+    ///
+    /// The `fused us` column is the `WUKONG_GEMM_FUSED_PACK` A/B in one process: packA plus the
+    /// micropanel-at-a-time schedule ([`macro_kernel_packb`], B packed just before the sweep that
+    /// consumes it, the next micropanel's source prefetched under it), directly comparable with
+    /// `total us`; `-` where `m > MC`, where the serial kernel never fuses.
     ///
     /// Not a correctness gate and not a campaign number: it prints, asserts nothing, and is
     /// `#[ignore]`d so `cargo test --workspace` never spends time in it. Run it deliberately:
@@ -6846,8 +7528,16 @@ mod tests {
         pin_worker_to_cpu(0);
         println!("AGENT-LOCAL, DIRECTIONAL ONLY (best-of-5 batches per phase, warm-up discarded)");
         println!(
-            "  {:<16} {:>4} {:>9} {:>9} {:>9} {:>9} {:>7} {:>9}",
-            "M x K x N", "jcb", "packB us", "packA us", "macro us", "total us", "pack%", "macro GF"
+            "  {:<16} {:>4} {:>9} {:>9} {:>9} {:>9} {:>7} {:>9} {:>9}",
+            "M x K x N",
+            "jcb",
+            "packB us",
+            "packA us",
+            "macro us",
+            "total us",
+            "pack%",
+            "macro GF",
+            "fused us"
         );
         for &(m, k, n, nc_cap) in &[
             (128usize, 768usize, 768usize, 4080usize),
@@ -6916,8 +7606,33 @@ mod tests {
             // Macro-kernel throughput on the work it actually issues (mc x nc x kc per call),
             // NOT on the shape's nominal flops: the last ic block is shorter than `mc`.
             let macro_gf = 2.0 * mc as f64 * nc as f64 * kc as f64 / tm1 / 1e9;
+            let fused = if m <= MC {
+                let mut bpanel = vec![0.0f32; NR * kc];
+                let (b_src, ldb) = unsafe { b_origin(b.as_ptr(), k, n, true, 0, 0) };
+                let tf1 = unsafe {
+                    best(ca.max(2), &mut || {
+                        macro_kernel_packb(
+                            mc,
+                            nc,
+                            kc,
+                            ap.as_ptr(),
+                            b_src,
+                            ldb,
+                            true,
+                            bpanel.as_mut_ptr(),
+                            c.as_mut_ptr(),
+                            n,
+                            1.0,
+                            None,
+                        )
+                    })
+                };
+                format!("{:9.0}", (tf1 * ca as f64 + ta) * 1e6)
+            } else {
+                format!("{:>9}", "-")
+            };
             println!(
-                "  {:<16} {jcb:>4} {:9.0} {:9.0} {:9.0} {:9.0} {:6.1}% {macro_gf:9.1}",
+                "  {:<16} {jcb:>4} {:9.0} {:9.0} {:9.0} {:9.0} {:6.1}% {macro_gf:9.1} {fused}",
                 format!("{m}x{k}x{n}"),
                 tb * 1e6,
                 ta * 1e6,
