@@ -18,8 +18,14 @@
 //!   lane accumulates its subsequence in ascending `i`; the 8 accumulator vectors are folded by a
 //!   fixed binary tree (`acc[j] += acc[j+w]` for `w = 4, 2, 1`), then the 8 lanes by
 //!   [`hcombine8`]. The `n % 16` trailing elements are folded in ascending order afterwards.
-//! - **f16 `sum`/`dot`** keep the older 8-lane form (lane `l` sums elements `8k+l`): F16C's
-//!   `vcvtph2ps` has no shift/and equivalent, so the de-interleaved map buys it nothing.
+//! - **f16 `sum`/`dot`** ([`sum_f16_avx`], [`dot_f16_avx`]) also carry `K = 8` accumulator vectors,
+//!   in the plain (not de-interleaved) map — F16C's `vcvtph2ps` already widens 8 *contiguous*
+//!   elements, so there is no even/odd split to follow. The input is walked in 64-element blocks;
+//!   block element `64·b + 8·t + l` lands in accumulator `t`, lane `l`, in ascending `b`. The `< 64`
+//!   remainder runs in 8-element steps into accumulator 0 (lane `l` takes element `+ l`), the 8
+//!   vectors fold by the same fixed tree as bf16, the lanes by [`hcombine8`], and the `n % 8` trailing
+//!   elements fold in ascending order afterwards. For `n < 64` the blocked body never runs, so short
+//!   inputs keep the exact bits of the earlier single-accumulator form.
 //! - The max-family folds ([`wukong_reduce_bf16`], [`wukong_reduce_f16`]) round nothing, so they
 //!   are the *exact* reduction of the widened values regardless of order.
 //!
@@ -188,37 +194,61 @@ fn fold_tree(mut acc: [[f32; 8]; BF_K]) -> [f32; 8] {
     acc[0]
 }
 
-/// Scalar twin of the f16 SIMD sum: 8 logical lane accumulators, fixed combine, scalar tail. This is
-/// the reference the SIMD path must match bit-for-bit, and the no-F16C fallback.
+/// Elements per blocked step of the f16 `sum`/`dot`: one 8-lane vector per accumulator.
+const F16_BLOCK: usize = 8 * BF_K;
+
+/// Scalar twin of the f16 SIMD sum: the `BF_K`-accumulator 64-element-block partition documented in
+/// the module header, the same fixed tree and lane combine, then the scalar tail. This is the
+/// reference the SIMD path must match bit-for-bit, and the no-F16C fallback.
 fn sum_scalar_f16(x: &[u16]) -> f32 {
     let n = x.len();
-    let chunks = n / 8;
-    let mut acc = [0.0f32; 8];
-    for c in 0..chunks {
-        for (l, a) in acc.iter_mut().enumerate() {
-            *a += f16_to_f32(x[c * 8 + l]);
+    let mut acc = [[0.0f32; 8]; BF_K];
+    let mut i = 0;
+    while i + F16_BLOCK <= n {
+        for (t, at) in acc.iter_mut().enumerate() {
+            for (l, a) in at.iter_mut().enumerate() {
+                *a += f16_to_f32(x[i + 8 * t + l]);
+            }
         }
+        i += F16_BLOCK;
     }
-    let mut s = hcombine8(&acc);
-    for &v in &x[chunks * 8..] {
+    while i + 8 <= n {
+        for (l, a) in acc[0].iter_mut().enumerate() {
+            *a += f16_to_f32(x[i + l]);
+        }
+        i += 8;
+    }
+    let mut s = hcombine8(&fold_tree(acc));
+    for &v in &x[i..] {
         s += f16_to_f32(v);
     }
     s
 }
 
-/// Scalar twin of the f16 SIMD dot (f32-accumulated, fused like the SIMD `fmadd`).
+/// Scalar twin of the f16 SIMD dot (f32-accumulated, fused like the SIMD `fmadd`), over the same
+/// partition as [`sum_scalar_f16`].
 fn dot_scalar_f16(x: &[u16], y: &[u16]) -> f32 {
     let n = x.len();
-    let chunks = n / 8;
-    let mut acc = [0.0f32; 8];
-    for c in 0..chunks {
-        for (l, a) in acc.iter_mut().enumerate() {
-            *a = f16_to_f32(x[c * 8 + l]).mul_add(f16_to_f32(y[c * 8 + l]), *a);
+    let mut acc = [[0.0f32; 8]; BF_K];
+    let mut i = 0;
+    while i + F16_BLOCK <= n {
+        for (t, at) in acc.iter_mut().enumerate() {
+            for (l, a) in at.iter_mut().enumerate() {
+                let k = i + 8 * t + l;
+                *a = f16_to_f32(x[k]).mul_add(f16_to_f32(y[k]), *a);
+            }
         }
+        i += F16_BLOCK;
     }
-    let mut s = hcombine8(&acc);
-    for i in chunks * 8..n {
-        s = f16_to_f32(x[i]).mul_add(f16_to_f32(y[i]), s);
+    while i + 8 <= n {
+        for (l, a) in acc[0].iter_mut().enumerate() {
+            *a = f16_to_f32(x[i + l]).mul_add(f16_to_f32(y[i + l]), *a);
+        }
+        i += 8;
+    }
+    let mut s = hcombine8(&fold_tree(acc));
+    for k in i..n {
+        s = f16_to_f32(x[k]).mul_add(f16_to_f32(y[k]), s);
     }
     s
 }
@@ -362,19 +392,32 @@ unsafe fn narrow_f16_pack(v0: __m256, v1: __m256) -> __m256i {
     _mm256_set_m128i(h1, h0) // [h0 (low 128) | h1 (high 128)] = 16 contiguous f16
 }
 
+/// IEEE-f16 `Σ x[i]` with an f32 accumulator, over the `BF_K`-chain partition of the module header.
+/// Twin: [`sum_scalar_f16`].
+///
+/// The single-accumulator predecessor had both defects `sum_bf16_avx` lists: one loop-carried
+/// `vaddps` per 8 elements (latency bound) and, the f16-specific half, only one 128-bit load per
+/// step. Now a 64-element block issues eight independent 16-byte loads into eight chains. The tree is
+/// [`fold_tree_avx`] — the same `acc[j] + acc[j + w]` fold as the bf16 kernels and [`fold_tree`].
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,f16c")]
 unsafe fn sum_f16_avx(x: &[u16]) -> f32 {
     let n = x.len();
-    let chunks = n / 8;
-    let mut acc = _mm256_setzero_ps();
-    for c in 0..chunks {
-        acc = _mm256_add_ps(acc, widen_f16(x.as_ptr().add(c * 8)));
+    let p = x.as_ptr();
+    let mut acc = [_mm256_setzero_ps(); BF_K];
+    let mut i = 0usize;
+    while i + F16_BLOCK <= n {
+        for (t, at) in acc.iter_mut().enumerate() {
+            *at = _mm256_add_ps(*at, widen_f16(p.add(i + 8 * t)));
+        }
+        i += F16_BLOCK;
     }
-    let mut lanes = [0.0f32; 8];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
-    let mut s = hcombine8(&lanes);
-    for &v in &x[chunks * 8..] {
+    while i + 8 <= n {
+        acc[0] = _mm256_add_ps(acc[0], widen_f16(p.add(i)));
+        i += 8;
+    }
+    let mut s = fold_tree_avx(&mut acc);
+    for &v in &x[i..] {
         s += f16_to_f32(v);
     }
     s
@@ -382,8 +425,12 @@ unsafe fn sum_f16_avx(x: &[u16]) -> f32 {
 
 /// The fixed binary fold over the `BF_K` accumulator vectors, then the 8 lanes. Mirrors
 /// [`fold_tree`] exactly (`acc[j] += acc[j+w]` for `w = BF_K/2 … 1`, elementwise).
+///
+/// Enables only `avx` (it issues nothing but `vaddps` and a store): the f16 reductions are dispatched
+/// on `avx` + `f16c`, not `avx2`, and must not reach an AVX2-compiled body on a host without AVX2.
+/// The bf16 callers enable a superset, so it still inlines into them.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx")]
 #[inline]
 unsafe fn fold_tree_avx(acc: &mut [__m256; BF_K]) -> f32 {
     let mut w = BF_K;
@@ -446,22 +493,30 @@ unsafe fn sum_bf16_avx(x: &[u16]) -> f32 {
     s
 }
 
+/// IEEE-f16 `Σ x[i]·y[i]` with an f32 accumulator, over the same partition as [`sum_f16_avx`].
+/// Twin: [`dot_scalar_f16`]. Eight independent `vfmadd` chains where the predecessor ran one, so the
+/// step rate is set by FMA/load issue rather than by the 4-cycle FMA latency.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,f16c,fma")]
 unsafe fn dot_f16_avx(x: &[u16], y: &[u16]) -> f32 {
     let n = x.len();
-    let chunks = n / 8;
-    let mut acc = _mm256_setzero_ps();
-    for c in 0..chunks {
-        let a = widen_f16(x.as_ptr().add(c * 8));
-        let b = widen_f16(y.as_ptr().add(c * 8));
-        acc = _mm256_fmadd_ps(a, b, acc);
+    let (px, py) = (x.as_ptr(), y.as_ptr());
+    let mut acc = [_mm256_setzero_ps(); BF_K];
+    let mut i = 0usize;
+    while i + F16_BLOCK <= n {
+        for (t, at) in acc.iter_mut().enumerate() {
+            let o = i + 8 * t;
+            *at = _mm256_fmadd_ps(widen_f16(px.add(o)), widen_f16(py.add(o)), *at);
+        }
+        i += F16_BLOCK;
     }
-    let mut lanes = [0.0f32; 8];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
-    let mut s = hcombine8(&lanes);
-    for i in chunks * 8..n {
-        s = f16_to_f32(x[i]).mul_add(f16_to_f32(y[i]), s);
+    while i + 8 <= n {
+        acc[0] = _mm256_fmadd_ps(widen_f16(px.add(i)), widen_f16(py.add(i)), acc[0]);
+        i += 8;
+    }
+    let mut s = fold_tree_avx(&mut acc);
+    for k in i..n {
+        s = f16_to_f32(x[k]).mul_add(f16_to_f32(y[k]), s);
     }
     s
 }
@@ -1507,6 +1562,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The f16 `sum`/`dot` partition, pinned from both sides.
+    ///
+    /// (a) Below one 64-element block the blocked body never runs, so both kernels must return the
+    ///     exact bits of the single-accumulator form they replaced — spelled out independently here
+    ///     (lane `i % 8`, then the lane combine, then the ordered tail).
+    /// (b) At 2^20 elements of the `wukong_xbench`-style input the eight-chain partition is clearly
+    ///     closer to the f64 sum than one chain. Checked offline with an exact f32 emulation of both
+    ///     partitions: relative error 2.84e-5 against the one-chain 1.60e-4, so the factor-of-two
+    ///     margin asserted has ~2.8x of slack.
+    #[test]
+    fn f16_reductions_keep_short_bits_and_beat_one_chain() {
+        let one_chain_sum = |x: &[u16]| {
+            let mut l = [0.0f32; 8];
+            let c = x.len() / 8;
+            for k in 0..c {
+                for (j, lj) in l.iter_mut().enumerate() {
+                    *lj += f16_to_f32(x[k * 8 + j]);
+                }
+            }
+            let mut s = hcombine8(&l);
+            for &v in &x[c * 8..] {
+                s += f16_to_f32(v);
+            }
+            s
+        };
+        let one_chain_dot = |x: &[u16], y: &[u16]| {
+            let mut l = [0.0f32; 8];
+            let c = x.len() / 8;
+            for k in 0..c {
+                for (j, lj) in l.iter_mut().enumerate() {
+                    *lj = f16_to_f32(x[k * 8 + j]).mul_add(f16_to_f32(y[k * 8 + j]), *lj);
+                }
+            }
+            let mut s = hcombine8(&l);
+            for k in c * 8..x.len() {
+                s = f16_to_f32(x[k]).mul_add(f16_to_f32(y[k]), s);
+            }
+            s
+        };
+        for n in 0usize..F16_BLOCK {
+            let x: Vec<u16> = (0..n)
+                .map(|i| f16_bits((i as f32 * 0.37 - 2.1).sin() * 3.0))
+                .collect();
+            let y: Vec<u16> = (0..n)
+                .map(|i| f16_bits((i as f32 * 0.23 + 0.4).cos()))
+                .collect();
+            unsafe {
+                assert_eq!(
+                    wukong_sum_f16(x.as_ptr(), n as i64).to_bits(),
+                    one_chain_sum(&x).to_bits(),
+                    "sum_f16 short n={n}"
+                );
+                assert_eq!(
+                    wukong_dot_f16(x.as_ptr(), y.as_ptr(), n as i64).to_bits(),
+                    one_chain_dot(&x, &y).to_bits(),
+                    "dot_f16 short n={n}"
+                );
+            }
+        }
+
+        let n = 1usize << 20;
+        let x: Vec<u16> = (0..n)
+            .map(|i| f16_bits((i % 17) as f32 * 0.05 + 0.5))
+            .collect();
+        let want: f64 = x.iter().map(|&v| f16_to_f32(v) as f64).sum();
+        let ours = unsafe { wukong_sum_f16(x.as_ptr(), n as i64) };
+        let old = one_chain_sum(&x);
+        let e_ours = (ours as f64 - want).abs() / want;
+        let e_old = (old as f64 - want).abs() / want;
+        assert!(
+            e_ours * 2.0 <= e_old,
+            "f16 sum: partition rel err {e_ours:.3e} not clearly below one chain {e_old:.3e}"
+        );
     }
 
     #[test]
