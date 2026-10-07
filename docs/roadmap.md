@@ -61,7 +61,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   with cheap inline bit-math (it's the top 16 bits of an `f32`); f16's IEEE-half layout has no such
   shortcut and Cranelift x64 has no f16 convert lowering, so f16 cast/load/store call shared `half`-crate
   shims (`wukong_f32_to_f16_bits`/`wukong_f16_bits_to_f32`) the interpreter uses too — bit-exact by
-  construction. `f64` is full. (The GPU adds tensor-core fp16/bf16/fp8 GEMM on top.)
+  construction. `f64` is full: arithmetic in double precision, and every transcendental on an
+  `f64` operand (the whole `exp`/`log`/trig/inverse-trig/hyperbolic/`erf`/`cbrt`/`pow`/`hypot` set
+  and the activations composed from them) is one call into the runtime's pure-Rust double-precision
+  library `wukong_runtime::math64` — ≤1 ULP for the core, Payne–Hanek trig reduction for every
+  finite argument, C23 special values, identical bits on the interpreter, the JIT and the AOT link
+  (it used to be the f32 polynomial behind a demote/promote pair; `tests/run/transcendental_f64.wk`
+  prints twelve digits of each). (The GPU adds tensor-core fp16/bf16/fp8 GEMM on top.)
 - **Mixed-precision (bf16 *and* f16) CPU suite → SIMD dispatch**: low-precision `[bf16]`/`[f16]` arrays
   read through an `as f32` widening cast (lossless: `<<16` for bf16, F16C `vcvtph2ps` for f16) with
   **f32 accumulate/compute** — the standard ML contract — are recognized and lowered to half-precision

@@ -1,0 +1,143 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 2718281828459
+// EXPECT-OUT: 1250152866386
+// EXPECT-OUT: 693147180559
+// EXPECT-OUT: 6907755278982
+// EXPECT-OUT: -6907755278982
+// EXPECT-OUT: 841470984807
+// EXPECT-OUT: 540302305868
+// EXPECT-OUT: -852200849767
+// EXPECT-OUT: 523214785395
+// EXPECT-OUT: 1557407724654
+// EXPECT-OUT: 523598775598
+// EXPECT-OUT: 1047197551196
+// EXPECT-OUT: 785398163397
+// EXPECT-OUT: 463647609000
+// EXPECT-OUT: 1175201193643
+// EXPECT-OUT: 1543080634815
+// EXPECT-OUT: 604367777117
+// EXPECT-OUT: 881373587019
+// EXPECT-OUT: 1316957896924
+// EXPECT-OUT: 549306144334
+// EXPECT-OUT: 520499877813
+// EXPECT-OUT: 1259921049894
+// EXPECT-OUT: 1051709180756
+// EXPECT-OUT: 953101798043
+// EXPECT-OUT: 1414213562373
+// EXPECT-OUT: 3321928094887
+// EXPECT-OUT: 3162277660168
+// EXPECT-OUT: 3010299956639
+// EXPECT-OUT: 1414213562373
+// EXPECT-OUT: 2755675960631
+// EXPECT-OUT: 2236067977499
+// EXPECT-OUT: 7310585786300
+// EXPECT-OUT: -2689414213699
+// EXPECT-OUT: 841191990607
+// EXPECT-OUT: 1313261687518
+// EXPECT-OUT: 865098388267
+// EXPECT-OUT: -632120558828
+// EXPECT-OUT: 786447732965
+// EXPECT-OUT: -2126928011042
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2718281828459
+// EXPECT-OUT: 1000000000000
+// EXPECT-OUT: 367879441171
+module tests.run.transcendental_f64
+
+// Every transcendental on an `f64` operand is double precision (P15.2). Until this fixture, an
+// `f64` `exp`/`log`/`sin`/`cos`/`erf`/`atan` — and every activation built on them — was demoted
+// to the f32 polynomial and promoted back, so `exp(1.0f64) * 1e8 as i64` printed 271828174 (the
+// f32 value of e) where the true value is 271828182. The corpus could not see it: every f64
+// fixture printed at most five significant digits.
+//
+// Each line prints a scaled truncation with 12–13 significant digits — far beyond f32's seven,
+// well inside f64's sixteen. EVERY EXPECTED VALUE IS THE TRUE VALUE OF THE PRINTED EXPRESSION,
+// computed with mpmath at 200 bits and scaled/truncated by hand; none is a recording of compiler
+// output. (For `gelu` that is the tanh-form GELU with the lowering's own literal constant
+// `0.7978845608`, not √(2/π) — the two differ in the 13th digit.) The scale of each line was
+// chosen so the scaled true value sits at least 0.027 from an integer (`logsigmoid(-2)` is the
+// tightest), so a result within a few ULP — under 0.01 at these scales — can never flip the digit.
+//
+// Special coverage: `sin(1e22)`/`cos(1e22)` need the Payne–Hanek reduction (a Cody–Waite
+// reduction prints garbage there); `log(1e300)`/`log(1e-300)` reach the exponent extremes;
+// `tanh(-1e-9) < 0` pins the sign of a tiny negative result; the elementwise loop at the end
+// shows the scalar-call path inside a `for` (an f64 loop has no kernel to dispatch to).
+fn main() -> i32 {
+    let s10: f64 = 10000000000.0;
+    let s12: f64 = 1000000000000.0;
+    let s13: f64 = 10000000000000.0;
+    let s21: f64 = 1.0e21;
+    let one: f64 = 1.0;
+    let neg_one: f64 = -1.0;
+    let half: f64 = 0.5;
+    let two: f64 = 2.0;
+    let ten: f64 = 10.0;
+    let tenth: f64 = 0.1;
+    let big: f64 = 1.0e22;
+    let huge: f64 = 1.0e300;
+    let tiny: f64 = 1.0e-300;
+
+    print((exp(one) * s12) as i64);
+    let m205: f64 = -20.5;
+    print((exp(m205) * s21) as i64);
+    print((log(two) * s12) as i64);
+    print((log(huge) * s10) as i64);
+    print((log(tiny) * s10) as i64);
+    print((sin(one) * s12) as i64);
+    print((cos(one) * s12) as i64);
+    print((sin(big) * s12) as i64);
+    print((cos(big) * s12) as i64);
+    print((tan(one) * s12) as i64);
+    print((asin(half) * s12) as i64);
+    print((acos(half) * s12) as i64);
+    print((atan(one) * s12) as i64);
+    print((atan2(one, two) * s12) as i64);
+    print((sinh(one) * s12) as i64);
+    print((cosh(one) * s12) as i64);
+    let p7: f64 = 0.7;
+    print((tanh(p7) * s12) as i64);
+    print((asinh(one) * s12) as i64);
+    print((acosh(two) * s12) as i64);
+    print((atanh(half) * s12) as i64);
+    print((erf(half) * s12) as i64);
+    print((cbrt(two) * s12) as i64);
+    print((expm1(tenth) * s13) as i64);
+    print((log1p(tenth) * s13) as i64);
+    print((exp2(half) * s12) as i64);
+    print((log2(ten) * s12) as i64);
+    print((exp10(half) * s12) as i64);
+    print((log10(two) * s13) as i64);
+    print((pow(two, half) * s12) as i64);
+    let p15: f64 = 1.5;
+    let p25: f64 = 2.5;
+    print((pow(p15, p25) * s12) as i64);
+    print((hypot(one, two) * s12) as i64);
+    // The activations compose these calls in MIR, so they are double precision too.
+    print((sigmoid(one) * s13) as i64);
+    print((silu(neg_one) * s13) as i64);
+    print((gelu(one) * s12) as i64);
+    print((softplus(one) * s12) as i64);
+    print((mish(one) * s12) as i64);
+    print((elu(neg_one) * s12) as i64);
+    print((tanh_backward(half, one) * s12) as i64);
+    let m2: f64 = -2.0;
+    print((logsigmoid(m2) * s12) as i64);
+    // tanh(-1e-9) is -1e-9 to the last bit: negative, never a flushed +0.
+    let m: f64 = -1.0e-9;
+    if tanh(m) < 0.0 {
+        print(1);
+    } else {
+        print(0);
+    }
+    // An f64 elementwise loop: one runtime call per element, every lane printed.
+    let xs: [f64; 3] = [1.0, 0.0, -1.0];
+    let mut out: [f64; 3] = [0.0; 3];
+    for i in 0..3 {
+        out[i] = exp(xs[i]);
+    }
+    for i in 0..3 {
+        print((out[i] * s12) as i64);
+    }
+    return 0;
+}

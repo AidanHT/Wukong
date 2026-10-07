@@ -210,10 +210,21 @@ with the sign bit for signed integers and with zero for unsigned integers. These
 interpreter and native backend contracts, including optimized execution.
 
 Float-to-integer `as` casts truncate toward zero and saturate at the destination range; NaN
-becomes zero, and negative values cast to unsigned integers become zero. Basic `f64` arithmetic
-uses double precision, but the current transcendental lowering (`exp`, `log`, `sin`, `cos`,
-`erf`, `atan`, and functions built from them) computes through `f32`. An `f64` result from those
-functions does **not** provide double-precision transcendental accuracy.
+becomes zero, and negative values cast to unsigned integers become zero. `f64` is double
+precision throughout: arithmetic, and every transcendental on an `f64` operand — `exp`, `log`,
+`exp2`/`log2`/`exp10`/`log10`, `expm1`/`log1p`, `sin`/`cos`/`tan`, `asin`/`acos`/`atan`/`atan2`,
+`sinh`/`cosh`/`tanh`, `asinh`/`acosh`/`atanh`, `erf`, `cbrt`, `pow`, `hypot`, and the activations
+built on them — is one call into the runtime's pure-Rust double-precision library
+(`wukong_runtime::math64`: the fdlibm/musl algorithms, no platform libm, no FMA), so the
+interpreter, the native JIT and the AOT executable return the same bits on every host. The core
+(`exp`, `log`, the base-2/base-10 family, `expm1`, `log1p`, `pow`, `hypot`, `sin`/`cos`/`tan` on
+**every** finite argument via Payne–Hanek reduction, the inverse trig, `erf`, `cbrt`) is within
+**1 ULP** of the correctly rounded value; the hyperbolics `sinh`/`cosh`/`tanh`/`asinh`/`acosh`/
+`atanh` within 2 ULP; `exp10` within 3. The C23 special values hold (`exp(−∞) = +0`,
+`log(±0) = −∞`, `sin(±∞) = NaN`, `atan2`'s full quadrant table, `pow(x, ±0) = pow(1, y) = 1` even
+for NaN, odd functions return `−0` for `−0`, and every function is exactly `x` below its linear
+threshold, sign included). `tests/run/transcendental_f64.wk` prints twelve significant digits of
+each.
 
 ## Control flow ✅
 

@@ -1034,6 +1034,8 @@ pub fn lower_program_with(
         vmath_par: interner.intern("wukong_vmath_f32_parallel"),
         vmath2: interner.intern("wukong_vmath2_f32"),
         trig_f32: interner.intern("wukong_rt_trig_f32"),
+        math_f64: interner.intern("wukong_rt_math_f64"),
+        math2_f64: interner.intern("wukong_rt_math2_f64"),
         vmath_bf16: interner.intern("wukong_vmath_bf16"),
         vmath_f16: interner.intern("wukong_vmath_f16"),
         velem: interner.intern("wukong_velem_f32"),
@@ -2984,6 +2986,14 @@ struct GemmSyms {
     vmath: Symbol,
     /// Value-returning scalar trig, also the exceptional-lane fallback for vector MIR.
     trig_f32: Symbol,
+    /// The double-precision transcendental library (`wukong_rt_math_f64(x, op)`, `op` a `VMATH_*`
+    /// code): every `f64` `exp`/`log`/`sin`/… lowers to one call of it, on every backend, instead
+    /// of the f32 polynomial it used to be demoted to. Pure Rust in `wukong_runtime::math64`, so
+    /// the interpreter and native agree bit-for-bit (see `emit_math_f64`).
+    math_f64: Symbol,
+    /// The two-argument twin (`wukong_rt_math2_f64(a, b, op)`, `op` a `VMATH2_*` code) for the
+    /// `f64` `pow`/`atan2`/`hypot`.
+    math2_f64: Symbol,
     /// The **two-input** twin (`wukong_vmath2_f32(x, y, out, n, op)`): an `out[i] = f(x[i], y[i])`
     /// loop for `pow`/`atan2`/`hypot` lowers to this — the 256-bit kernel, vs the inlined 128-bit poly.
     vmath2: Symbol,
@@ -20880,9 +20890,14 @@ impl FnLowerer<'_> {
             }
             // exp2(x)=exp(x·ln2), log2(x)=log(x)·log2(e), sinh/cosh=(eˣ∓e⁻ˣ)/2 — composed from the
             // shared exp/log so they vectorize and stay bit-exact across backends; the dispatched
-            // 256-bit kernel mirrors this op-for-op.
+            // 256-bit kernel mirrors this op-for-op. In `f64` the composition would lose
+            // `|x|·ε` relative accuracy in the `x·ln2` product, so each base-2/base-10 function is
+            // its own < 1 ULP runtime routine instead.
             MathIntrinsic::Exp2 => {
                 let x = self.lower_math_arg(args.first()?, &rty);
+                if matches!(rty.lane_type(), MirType::F64) {
+                    return Some(self.emit_math_f64(x, VMATH_EXP2, &rty));
+                }
                 let ln2 = self.splat_const_f(std::f64::consts::LN_2, &rty);
                 let xl = self
                     .builder
@@ -20891,6 +20906,9 @@ impl FnLowerer<'_> {
             }
             MathIntrinsic::Log2 => {
                 let x = self.lower_math_arg(args.first()?, &rty);
+                if matches!(rty.lane_type(), MirType::F64) {
+                    return Some(self.emit_math_f64(x, VMATH_LOG2, &rty));
+                }
                 let lx = self.emit_log(x, &rty);
                 let log2e = self.splat_const_f(std::f64::consts::LOG2_E, &rty);
                 Some(
@@ -20900,6 +20918,9 @@ impl FnLowerer<'_> {
             }
             MathIntrinsic::Exp10 => {
                 let x = self.lower_math_arg(args.first()?, &rty);
+                if matches!(rty.lane_type(), MirType::F64) {
+                    return Some(self.emit_math_f64(x, VMATH_EXP10, &rty));
+                }
                 let ln10 = self.splat_const_f(std::f64::consts::LN_10, &rty);
                 let xl = self
                     .builder
@@ -20908,6 +20929,9 @@ impl FnLowerer<'_> {
             }
             MathIntrinsic::Log10 => {
                 let x = self.lower_math_arg(args.first()?, &rty);
+                if matches!(rty.lane_type(), MirType::F64) {
+                    return Some(self.emit_math_f64(x, VMATH_LOG10, &rty));
+                }
                 let lx = self.emit_log(x, &rty);
                 let log10e = self.splat_const_f(std::f64::consts::LOG10_E, &rty);
                 Some(
@@ -21229,25 +21253,99 @@ impl FnLowerer<'_> {
         self.coerce_to(v, &from, rty, signed)
     }
 
-    /// `exp(x)` as a fast, deterministic polynomial (≈1 ULP of the true `exp`). Always computed in
-    /// `f32`; for an `f64` result the argument is demoted and the result promoted (exact in both
-    /// backends). Works on a scalar or a SIMD-vector `f32`.
+    /// `exp(x)`: for `f32` the fast, deterministic 8-bucket polynomial (≈1 ULP of the true `exp`,
+    /// scalar or SIMD vector, mirroring the runtime kernel value-for-value); for `f64` one call into
+    /// the runtime's double-precision library (see [`Self::emit_math_f64`]) — full double precision,
+    /// not the f32 polynomial behind a demote/promote pair that an `f64` `exp` used to be.
     fn emit_exp(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let want_f64 = matches!(rty.lane_type(), MirType::F64);
-        let f32ty = float_ty_like(rty, MirType::F32);
-        let xf = if want_f64 {
-            self.builder
-                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
-        } else {
-            x
-        };
-        let r = self.emit_exp_f32(xf, &f32ty);
-        if want_f64 {
-            self.builder
-                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
-        } else {
-            r
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_EXP, rty);
         }
+        let f32ty = float_ty_like(rty, MirType::F32);
+        self.emit_exp_f32(x, &f32ty)
+    }
+
+    /// An `f64` transcendental as one call of `wukong_rt_math_f64(x, op)` (`op` a `VMATH_*` code),
+    /// the runtime's pure-Rust double-precision library (`wukong_runtime::math64`: fdlibm/musl
+    /// algorithms, ≤1 ULP for the core, Payne–Hanek trig reduction, every special value). The
+    /// interpreter calls the same Rust function the JIT binds and the AOT link resolves, so the
+    /// three backends agree bit-for-bit; the textual-LLVM emitter declares the symbol from the
+    /// call site. A `Vec` of `f64` is handled lane by lane (the autovectorizer never vectorizes an
+    /// f64 transcendental, so this is the robustness path, not a hot one).
+    fn emit_math_f64(&mut self, x: ValueId, op: u32, rty: &MirType) -> ValueId {
+        let opcode = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        let func = self.gemm.math_f64;
+        self.emit_f64_lanewise(rty, &[x], move |this, lanes| {
+            this.builder.build(
+                MirType::F64,
+                Op::Call {
+                    func,
+                    args: vec![lanes[0], opcode],
+                },
+            )
+        })
+    }
+
+    /// The two-argument twin of [`Self::emit_math_f64`]: `wukong_rt_math2_f64(a, b, op)` with a
+    /// `VMATH2_*` code (`pow`, `atan2`, `hypot`).
+    fn emit_math2_f64(&mut self, a: ValueId, b: ValueId, op: u32, rty: &MirType) -> ValueId {
+        let opcode = self
+            .builder
+            .build(MirType::I64, Op::ConstInt(op as i128, MirType::I64));
+        let func = self.gemm.math2_f64;
+        self.emit_f64_lanewise(rty, &[a, b], move |this, lanes| {
+            this.builder.build(
+                MirType::F64,
+                Op::Call {
+                    func,
+                    args: vec![lanes[0], lanes[1], opcode],
+                },
+            )
+        })
+    }
+
+    /// Apply the scalar `f64` operation `scalar_op` to `inputs` (every one of type `rty`):
+    /// directly when `rty` is the scalar `f64`, or lane by lane through a stack array when it is a
+    /// `Vec` of `f64` — the same extract/store/load route `emit_trig_f32`'s exceptional-lane path
+    /// uses, so the result is an ordinary vector value.
+    fn emit_f64_lanewise(
+        &mut self,
+        rty: &MirType,
+        inputs: &[ValueId],
+        scalar_op: impl Fn(&mut Self, &[ValueId]) -> ValueId,
+    ) -> ValueId {
+        let MirType::Vec(_, lanes) = rty else {
+            return scalar_op(self, inputs);
+        };
+        let lanes = *lanes;
+        let storage = self
+            .builder
+            .alloca(MirType::Array(Box::new(MirType::F64), lanes));
+        let mut lane_inputs = Vec::with_capacity(inputs.len());
+        for lane in 0..lanes {
+            lane_inputs.clear();
+            for &v in inputs {
+                let value = self.builder.build(MirType::F64, Op::ExtractLane(v, lane));
+                lane_inputs.push(value);
+            }
+            let output = scalar_op(self, &lane_inputs);
+            let index = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(lane as i128, MirType::I64));
+            let ptr = self.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: storage,
+                    index,
+                    elem: MirType::F64,
+                },
+            );
+            self.builder.build_void(Op::Store { ptr, value: output });
+        }
+        self.builder
+            .build(rty.clone(), Op::Load(storage, rty.clone()))
     }
 
     /// `sigmoid(x) = 1 / (1 + exp(-x))`, built on the exp polynomial. Works on a scalar or a SIMD
@@ -21264,8 +21362,12 @@ impl FnLowerer<'_> {
     }
 
     /// `tanh(x) = 1 - 2 / (exp(2x) + 1)`, built on the exp polynomial (same identity the GELU tanh
-    /// approximation uses). Works on a scalar or a SIMD vector; bit-identical across backends.
+    /// approximation uses). Works on a scalar or a SIMD vector; bit-identical across backends. For
+    /// `f64` it is one call of the runtime's double-precision `tanh`.
     fn emit_tanh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_TANH, rty);
+        }
         let two = self.splat_const_f(2.0, rty);
         let twox = self
             .builder
@@ -21566,25 +21668,15 @@ impl FnLowerer<'_> {
         self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, hs))
     }
 
-    /// `erf(x)` (the Gauss error function — `exact` GELU is `0.5·x·(1 + erf(x/√2))`). Always computed
-    /// in `f32`; an `f64` result is demoted/promoted like `exp`/`log`. Works on a scalar or a SIMD
-    /// vector; bit-identical across backends because every step is a primitive op (see `emit_erf_f32`).
+    /// `erf(x)` (the Gauss error function — `exact` GELU is `0.5·x·(1 + erf(x/√2))`). In `f32` the
+    /// Abramowitz–Stegun fit below (scalar or SIMD vector; bit-identical across backends because
+    /// every step is a primitive op); in `f64` the runtime's < 1 ULP fdlibm `erf`.
     fn emit_erf(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let want_f64 = matches!(rty.lane_type(), MirType::F64);
-        let f32ty = float_ty_like(rty, MirType::F32);
-        let xf = if want_f64 {
-            self.builder
-                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
-        } else {
-            x
-        };
-        let r = self.emit_erf_f32(xf, &f32ty);
-        if want_f64 {
-            self.builder
-                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
-        } else {
-            r
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ERF, rty);
         }
+        let f32ty = float_ty_like(rty, MirType::F32);
+        self.emit_erf_f32(x, &f32ty)
     }
 
     /// The erf approximation in `f32` (Abramowitz–Stegun 7.1.26, ~1.5e-7 error). `|x|` and the
@@ -21645,6 +21737,10 @@ impl FnLowerer<'_> {
     /// `sinh8`/`cosh8` kernel mirrors this op-for-op (`-x` via `·-1` to match). Finite extremes
     /// inherit exp's saturation; input NaNs are explicitly preserved and quieted.
     fn emit_sinh_cosh(&mut self, x: ValueId, rty: &MirType, is_cosh: bool) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            let op = if is_cosh { VMATH_COSH } else { VMATH_SINH };
+            return self.emit_math_f64(x, op, rty);
+        }
         let neg1 = self.splat_const_f(-1.0, rty);
         let nx = self
             .builder
@@ -21669,6 +21765,9 @@ impl FnLowerer<'_> {
     /// `log` on `|x|+√(…) ≥ 1` dodges the `x+√(x²+1)` cancellation for large negative `x`). Reuses
     /// `emit_abs`/`emit_log`; works on a scalar or a SIMD vector, bit-identical across backends.
     fn emit_asinh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ASINH, rty);
+        }
         let ax = self.emit_abs(x, rty);
         let x2 = self
             .builder
@@ -21686,6 +21785,9 @@ impl FnLowerer<'_> {
     /// `acosh(x) = log(x + √(x²−1))` for `x ≥ 1` (`√` of a negative → `NaN` below, matching `libm`).
     /// Reuses `emit_log`; works on a scalar or a SIMD vector, bit-identical across backends.
     fn emit_acosh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ACOSH, rty);
+        }
         let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, x));
         let one = self.splat_const_f(1.0, rty);
         let inner = self
@@ -21699,6 +21801,9 @@ impl FnLowerer<'_> {
     /// `atanh(x) = ½·log((1+x)/(1−x))` for `|x| < 1` (the Fisher z-transform). Reuses `emit_log`;
     /// works on a scalar or a SIMD vector, bit-identical across backends.
     fn emit_atanh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ATANH, rty);
+        }
         let one = self.splat_const_f(1.0, rty);
         let num = self
             .builder
@@ -21719,6 +21824,9 @@ impl FnLowerer<'_> {
     /// (the `0·∞` otherwise). Reuses `emit_exp`/`emit_log`; mirrors `expm1_1`/`expm1_8` op-for-op, so for
     /// finite `x` the inlined form equals the dispatched kernel. Scalar or SIMD; bit-identical backends.
     fn emit_expm1(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_EXPM1, rty);
+        }
         let u = self.emit_exp(x, rty);
         let one = self.splat_const_f(1.0, rty);
         let um1 = self
@@ -21753,6 +21861,9 @@ impl FnLowerer<'_> {
     /// `log1p(x) = ln(1+x)` via Kahan's stable correction `log(u)·x/(u−1)`, `u = 1+x`, guarding `u==1 → x`.
     /// Reuses `emit_log`; mirrors `log1p_1`/`log1p_8` op-for-op. Scalar or SIMD; bit-identical backends.
     fn emit_log1p(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_LOG1P, rty);
+        }
         let one = self.splat_const_f(1.0, rty);
         let u = self
             .builder
@@ -21777,25 +21888,17 @@ impl FnLowerer<'_> {
             .build(rty.clone(), Op::Select(is_inf, inf, result))
     }
 
-    /// `sin(x)` (`is_cos == false`) or `cos(x)` (`true`) as a fast, deterministic polynomial. Always
-    /// computed in `f32`; an `f64` result is demoted/promoted like `exp`. Works on a scalar or a SIMD
-    /// vector; bit-identical across backends. Enables rotary position embeddings (RoPE).
+    /// `sin(x)` (`is_cos == false`) or `cos(x)` (`true`): in `f32` the fast, deterministic
+    /// polynomial (scalar or SIMD vector, bit-identical across backends; enables rotary position
+    /// embeddings); in `f64` the runtime's fdlibm `sin`/`cos` with Payne–Hanek reduction, < 1 ULP
+    /// for every finite argument.
     fn emit_trig(&mut self, x: ValueId, rty: &MirType, is_cos: bool) -> ValueId {
-        let want_f64 = matches!(rty.lane_type(), MirType::F64);
-        let f32ty = float_ty_like(rty, MirType::F32);
-        let xf = if want_f64 {
-            self.builder
-                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
-        } else {
-            x
-        };
-        let r = self.emit_trig_f32(xf, &f32ty, is_cos);
-        if want_f64 {
-            self.builder
-                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
-        } else {
-            r
+        if matches!(rty.lane_type(), MirType::F64) {
+            let op = if is_cos { VMATH_COS } else { VMATH_SIN };
+            return self.emit_math_f64(x, op, rty);
         }
+        let f32ty = float_ty_like(rty, MirType::F32);
+        self.emit_trig_f32(x, &f32ty, is_cos)
     }
 
     /// Standalone scalar trig stays a single SSA call so it remains differentiable. Vector
@@ -21984,24 +22087,15 @@ impl FnLowerer<'_> {
         }
     }
 
-    /// `atan(x)`, computed in `f32` (demote/promote an `f64` result like `exp`). Works on a scalar or
-    /// a SIMD vector; bit-identical across backends. Enables angle/geometry ops and `atan2`-style schemes.
+    /// `atan(x)`: in `f32` the Cephes polynomial (scalar or SIMD vector; bit-identical across
+    /// backends); in `f64` the runtime's < 1 ULP fdlibm `atan`. Enables angle/geometry ops and
+    /// `atan2`-style schemes.
     fn emit_atan(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let want_f64 = matches!(rty.lane_type(), MirType::F64);
-        let f32ty = float_ty_like(rty, MirType::F32);
-        let xf = if want_f64 {
-            self.builder
-                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
-        } else {
-            x
-        };
-        let r = self.emit_atan_f32(xf, &f32ty);
-        if want_f64 {
-            self.builder
-                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
-        } else {
-            r
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ATAN, rty);
         }
+        let f32ty = float_ty_like(rty, MirType::F32);
+        self.emit_atan_f32(x, &f32ty)
     }
 
     /// The Cephes `atan` poly in `f32` (`fty` is `f32` or a `Vec` of `f32`) — mirrors `atan1`/`atan8`
@@ -22068,6 +22162,9 @@ impl FnLowerer<'_> {
     /// `tan(x) = sin(x)/cos(x)` — reuses `emit_trig` (which mirrors `sincos1`/`sin8`), so the composed
     /// and dispatched forms agree. Works on a scalar or a SIMD vector.
     fn emit_tan(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_TAN, rty);
+        }
         let s = self.emit_trig(x, rty, false);
         let c = self.emit_trig(x, rty, true);
         self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, s, c))
@@ -22076,6 +22173,9 @@ impl FnLowerer<'_> {
     /// `asin(x) = atan(x/√(1−x²))` over `[−1, 1]` — mirrors `asin1`/`asin8` op-for-op (`x²`, `1−x²`,
     /// `Op::Sqrt`, divide, then `emit_atan`), so dispatched and composed agree bit-for-bit on `f32`.
     fn emit_asin(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ASIN, rty);
+        }
         let x2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, x));
         let one = self.splat_const_f(1.0, rty);
         let om = self
@@ -22089,6 +22189,9 @@ impl FnLowerer<'_> {
     /// `acos(x) = π/2 − asin(x)` over `[−1, 1]` — mirrors `acos1`/`acos8`. The π/2 constant is the same
     /// `FRAC_PI_2 as f32` the kernel uses, so it matches bit-for-bit.
     fn emit_acos(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_ACOS, rty);
+        }
         let asin = self.emit_asin(x, rty);
         let pio2 = self.splat_const_f(ATAN_PIO2, rty);
         self.builder
@@ -22099,6 +22202,9 @@ impl FnLowerer<'_> {
     /// reusing `emit_exp`/`emit_log`. Bitwise copysign retains negative zero and NaN signs.
     /// Works scalar or vector; bit-identical to the dispatched kernel.
     fn emit_cbrt(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_CBRT, rty);
+        }
         let ax = self.emit_abs(x, rty);
         let lx = self.emit_log(ax, rty);
         let third = self.splat_const_f(1.0 / 3.0, rty);
@@ -22119,6 +22225,11 @@ impl FnLowerer<'_> {
     /// Positive-base power with exact x^0 and 1^y identities, before NaN handling.
     /// Other inputs retain the runtime's exp(y * log(x)) approximation contract.
     fn emit_pow(&mut self, x: ValueId, y: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            // The runtime's fdlibm `pow`: the same `x^0 = 1` / `1^y = 1` identities (NaN included),
+            // plus the full negative-base and integer-exponent contract, < 1 ULP.
+            return self.emit_math2_f64(x, y, VMATH2_POW, rty);
+        }
         let lx = self.emit_log(x, rty);
         let ylx = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, y, lx));
         let ordinary = self.emit_exp(ylx, rty);
@@ -22142,6 +22253,11 @@ impl FnLowerer<'_> {
     /// Full-circle angle, including signed-zero axes and infinite diagonals.
     /// Ordinary finite nonzero inputs retain atan(y/x) and the runtime quadrant correction.
     fn emit_atan2(&mut self, y: ValueId, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            // The runtime's fdlibm `atan2`: the same signed-zero axis / infinite-diagonal table
+            // the inline form spells out below, at < 1 ULP.
+            return self.emit_math2_f64(y, x, VMATH2_ATAN2, rty);
+        }
         let mty = mask_ty(rty);
         let q = self.builder.build(rty.clone(), Op::Bin(BinOp::FDiv, y, x));
         let angle = self.emit_atan(q, rty);
@@ -22205,8 +22321,13 @@ impl FnLowerer<'_> {
     /// `hypot(a, b) = √(a² + b²)`, the overflow-safe 2-norm/magnitude (gradient norms, complex modulus,
     /// 2-D distance). Scaled by `m = max(|a|, |b|)` so `(a/m)² + (b/m)² ≤ 2` never overflows; the `m = 0`
     /// case (both zero) is guarded to `0` (else `0/0 = NaN`). All primitive ops, so it vectorizes and is
-    /// bit-identical across backends. Works scalar or vector.
+    /// bit-identical across backends. Works scalar or vector. In `f64` it is the runtime's < 1 ULP musl
+    /// `hypot` (exact double-double squares, scaled against over/underflow, the same `±∞`-beats-NaN
+    /// table the inline form spells out below).
     fn emit_hypot(&mut self, a: ValueId, b: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math2_f64(a, b, VMATH2_HYPOT, rty);
+        }
         let mty = mask_ty(rty);
         let aa = self.emit_abs(a, rty);
         let bb = self.emit_abs(b, rty);
@@ -22387,25 +22508,15 @@ impl FnLowerer<'_> {
         self.emit_quiet_nan(input, result, fty)
     }
 
-    /// `log(x)` (natural log) as a fast, deterministic polynomial (≈1 ULP of the true `log`). Always
-    /// computed in `f32`; for an `f64` result the argument is demoted and the result promoted (the
-    /// same f32-precision model `exp` uses). Works on a scalar or a SIMD-vector `f32`.
+    /// `log(x)` (natural log): for `f32` the fast, deterministic 8-bucket polynomial (≈1 ULP of
+    /// the true `log`, scalar or SIMD vector, mirroring the runtime kernel value-for-value); for
+    /// `f64` one call into the runtime's double-precision library, like `emit_exp`.
     fn emit_log(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let want_f64 = matches!(rty.lane_type(), MirType::F64);
-        let f32ty = float_ty_like(rty, MirType::F32);
-        let xf = if want_f64 {
-            self.builder
-                .build(f32ty.clone(), Op::Cast(CastKind::FpTrunc, x, f32ty.clone()))
-        } else {
-            x
-        };
-        let r = self.emit_log_f32(xf, &f32ty);
-        if want_f64 {
-            self.builder
-                .build(rty.clone(), Op::Cast(CastKind::FpExt, r, rty.clone()))
-        } else {
-            r
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_LOG, rty);
         }
+        let f32ty = float_ty_like(rty, MirType::F32);
+        self.emit_log_f32(x, &f32ty)
     }
 
     /// The natural log in `f32` (`fty` is `f32` or a `Vec` of `f32`): the 8-bucket table reduction,

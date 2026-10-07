@@ -173,6 +173,14 @@ pub(crate) struct Syms {
     /// `wukong_colsum_f32(x, out, rows, cols)` — `out[j] = Σ_i x[i·cols + j]`. Emit-only: it is the
     /// bias gradient (`db = colsum(dout)`) and the learned-`gamma`/`beta` gradients.
     pub colsum: Symbol,
+    /// `wukong_rt_math_f64(x, op)` — the value-returning f64 transcendental library an `f64`
+    /// `exp`/`log`/`sin`/… lowers to. **Not** a kernel (it writes no buffer): it is differentiated
+    /// on the scalar path in `lib.rs` (`diff_inst`), where its derivative is a closed form in `x`
+    /// and the forward result, emitted as further calls of this symbol. Recorded here so the VJP
+    /// can emit those calls without a mutable interner.
+    pub math_f64: Symbol,
+    /// `wukong_rt_math2_f64(a, b, op)` — the two-argument twin (`pow`/`atan2`/`hypot`); same rule.
+    pub math2_f64: Symbol,
 }
 
 impl Syms {
@@ -197,6 +205,8 @@ impl Syms {
             bias: it.intern("wukong_bias_bcast_f32"),
             bias_parallel: it.intern("wukong_bias_bcast_f32_parallel"),
             colsum: it.intern("wukong_colsum_f32"),
+            math_f64: it.intern("wukong_rt_math_f64"),
+            math2_f64: it.intern("wukong_rt_math2_f64"),
         }
     }
 }

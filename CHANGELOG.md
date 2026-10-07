@@ -5,6 +5,24 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Double-precision transcendentals (`gap/f64-math`, P15.2)
+
+- **Every `f64` transcendental is now double precision.** `exp`, `log`, `exp2`/`log2`/`exp10`/
+  `log10`, `expm1`/`log1p`, `sin`/`cos`/`tan`, `asin`/`acos`/`atan`/`atan2`, `sinh`/`cosh`/`tanh`,
+  `asinh`/`acosh`/`atanh`, `erf`, `cbrt`, `pow`, `hypot` — and the activations composed from them
+  (`sigmoid`, `silu`, `gelu`, `softplus`, `mish`, `elu`, `selu`, `logsigmoid`, the `*_backward`
+  family) — lower on an `f64` operand to one call of the new runtime library
+  `wukong_runtime::math64` (`wukong_rt_math_f64` / `wukong_rt_math2_f64`): pure Rust, no platform
+  libm, no FMA, the fdlibm/musl algorithms with Payne–Hanek trig reduction, ≤1 ULP for the core
+  (≤2 for the hyperbolics, ≤3 for `exp10`), C23 special values, identical bits on the interpreter,
+  the native JIT and the AOT link, declared from the call site by the textual-LLVM emitter. Before,
+  every one of them was demoted to the f32 polynomial and promoted back (`exp(1.0f64)` printed the
+  f32 value of e), and no corpus fixture printed enough digits to see it. The scalar autodiff
+  differentiates every code in closed form (`exp' = exp`, `tanh' = 1 − tanh²`, `∂pow/∂b = ln a·aᵇ`,
+  …). Gates: `math64`'s mpmath reference tables with per-function ULP bounds and the special-value
+  table, `wukong_codegen_cranelift`'s `math_f64.rs` (interp == native == library on both opt levels,
+  LLVM/object imports, AD), `tests/run/transcendental_f64.wk` (twelve digits of each).
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**
