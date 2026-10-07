@@ -137,21 +137,24 @@ fn exact_fma_modules() {
 }
 
 #[test]
-fn lowp_fma_declines_until_promoted_ssa_is_available() {
+fn lowp_fma_computes_on_f32_registers() {
+    // f16/bf16 values live in f32 registers (the interpreter's model), so a low-precision FMA is
+    // the single-rounded f32 FMA the interpreter and Cranelift both evaluate.
     let mut i = Interner::new();
-    for ty in [
-        MirType::F16,
-        MirType::BF16,
-        MirType::Vec(Box::new(MirType::F16), 4),
+    for (ty, intrinsic) in [
+        (MirType::F16, "@llvm.fma.f32(float"),
+        (MirType::BF16, "@llvm.fma.f32(float"),
+        (
+            MirType::Vec(Box::new(MirType::F16), 4),
+            "@llvm.fma.v4f32(<4 x float>",
+        ),
     ] {
         let mut b = Builder::new(i.intern("lowp_fma"), ty.clone());
         let a = b.add_param(ty.clone());
         let r = b.build(ty, Op::Fma(a, a, a));
         b.ret(Some(r));
-        let mut p = Program::new();
-        p.funcs.push(b.finish());
-        assert!(try_emit_llvm_ir(&p, &i)
-            .unwrap_err()
-            .contains("promoted f32 SSA"));
+        let text = emit(b.finish(), &i);
+        assert!(text.contains(intrinsic), "{text}");
+        assert!(!text.contains("half") && !text.contains("bfloat"), "{text}");
     }
 }

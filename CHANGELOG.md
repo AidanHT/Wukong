@@ -5,6 +5,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Toolchain backends: textual LLVM, native diagnostics, target CPU, AOT runtime and gate
+
+- **`--emit=llvm-ir` now implements the oracle's language and links against the AOT runtime.**
+  `f16`/`bf16` compute in `float` registers and round only at constants, casts, loads and stores
+  (the interpreter's model — the module used to round every intermediate to the half grid);
+  booleans are bytes in memory; `print`/`assert` lower to the `wukong_rt_*` ABI and runtime kernels
+  get the runtime's `i64` integer ABI (they used to be called with `i32` arguments the C ABI
+  leaves undefined in the upper half); the vectorizer's synthesized kernels are defined in the
+  module from their recipe instead of being undefined symbols; the module names its target
+  triple. Vector low-precision casts and low-precision FMA no longer decline.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

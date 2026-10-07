@@ -41,6 +41,33 @@ The only reason to install LLVM is to take that emitted textual IR and compile i
 external `clang`/`llc`, or to build a future in-process `inkwell` backend. Neither is required for
 `--run`, `--backend=native`, `--emit=obj`, or `--emit=exe`.
 
+### What the emitted module means
+
+The module implements the interpreter's language, not LLVM's defaults:
+
+- float `!=` is the unordered `fcmp une` (NaN `!=` NaN is true); integer division and remainder by
+  zero produce 0 and `INT_MIN / -1` wraps; shift counts are masked to the operand width — each is
+  an explicit guard, because LLVM makes all three poison;
+- `f16`/`bf16` values are computed in `float` registers and rounded onto the half/bfloat grid only
+  at constants, `fpext`/`fptrunc`, loads and stores (the interpreter's round-at-store/cast/load
+  model) — so `half`/`bfloat` appear only as memory types;
+- booleans occupy a byte in memory (`i8` storage, low bit significant), never LLVM's bit-packed
+  `<n x i1>`;
+- float literals are spelled in LLVM's exact hexadecimal form, so infinities, NaNs, tiny values and
+  decimals that are inexact in `float` are all valid IR.
+
+It names the host `target triple` (the layout is left to the consuming tool, which installs the
+target's own `datalayout`). Every external symbol it references is one the `--emit=exe` link already
+provides: `print`/`println`/`assert` lower to the same `wukong_rt_print_{i64,u64,f64,str}` /
+`wukong_rt_assert` ABI the Cranelift object calls (with the same argument widening), recognized
+kernels are called through the `wukong_runtime` C ABI (every integer argument widened to `i64`, an
+absent optional pointer passed as `ptr null`), and the general vectorizer's synthesized kernels — raw
+AVX2 bytes inside the Cranelift backend — are **defined in the module** from their backend-agnostic
+recipe, with the interpreter's exact element order and reduction reassociation. A construct that
+cannot be expressed faithfully (a `print` of a vector value, a bitcast to or from `f16`/`bf16`, two
+incompatible signatures for one external symbol) is refused with `C0001` and exit 2 rather than
+emitted wrong.
+
 ## Why textual IR (and not inkwell in-process)
 
 The original LLVM plan targeted `inkwell` (the in-process libLLVM API). On Windows that path is
