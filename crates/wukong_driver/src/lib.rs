@@ -250,11 +250,14 @@ pub fn compile(opts: &Options) -> i32 {
     // so a taped program built without them meets buffer-writing loops it has no rule for. The
     // failure mode this prevents is the repo's standing rule for autodiff holes — a named refusal,
     // never a silently zero gradient.
-    if no_recognize() && (opts.grad.train || opts.emit == EmitStage::Grad) {
+    if no_recognize() && (opts.grad.train || opts.emit == EmitStage::Grad || exports_gradient(opts))
+    {
         let what = if opts.grad.train {
             "--train"
-        } else {
+        } else if opts.emit == EmitStage::Grad {
             "--emit=grad"
+        } else {
+            "--grad-of (with --emit=obj)"
         };
         eprintln!(
             "error: {what}: {NO_RECOGNIZE_ENV} is set, and autodiff is not supported with kernel \
