@@ -31,8 +31,10 @@ mod canon;
 #[cfg(test)]
 mod coverage_tests;
 mod dispatch;
+mod elementwise;
 mod tile;
 mod tindex;
+mod ucount;
 
 use std::cell::{Cell, RefCell};
 
@@ -5046,9 +5048,10 @@ impl FnLowerer<'_> {
     /// [`Self::const_runtime_u64_expr`] is the prover: literals, literal arithmetic with checked
     /// operators, and an unshadowed top-level `const`, each required to carry a matching concrete
     /// integer type. Anything it cannot fold — a symbolic tensor dim threaded in as a hidden `usize`
-    /// parameter, `s.len()`, a runtime `usize` — declines here and keeps the ordinary loop lowering.
-    /// Closing those needs a runtime `end >= 0` test on the dispatch, which is a different change:
-    /// this predicate is consulted before any MIR is built and cannot introduce a branch.
+    /// parameter, `s.len()`, a runtime `usize` — declines here, because this predicate is consulted
+    /// before any MIR is built and cannot introduce a branch. Those endpoints are taken instead by
+    /// `ucount.rs`, which dispatches behind a run-time `end >= 0` test with the loop as written as
+    /// the fallback.
     fn end_fits_signed_i64(&self, end: &Expr) -> bool {
         self.const_runtime_u64_expr(end)
             .is_some_and(|v| v <= i64::MAX as u64)
@@ -13215,6 +13218,15 @@ impl FnLowerer<'_> {
         if !inclusive && step.is_none() && self.try_vectorize_for(pat, start, end, body) {
             return;
         }
+        // A `usize` / symbolic-tensor-dim counter: the kernels and the vector loop above both need
+        // the signed domain, so prove it (statically, or with a run-time `end >= 0` test and the
+        // loop as written as the fallback). See `ucount.rs`.
+        if !inclusive
+            && step.is_none()
+            && self.try_unsigned_range_fast_path(label, pat, iter, start, end, body)
+        {
+            return;
+        }
 
         // Mid-function independent-iteration loop in a `@parallel` fn (the transformer per-head
         // attention loop is the canonical shape) → outline it into a `wukong_parallel_for` region:
@@ -14465,6 +14477,13 @@ impl FnLowerer<'_> {
                 }
             }
         }
+        // The tanh-approximation GELU written out by hand (HF `gelu_new`'s formula) dispatches to
+        // the same `VMATH_GELU` the `gelu()` call does — but only in the one association that is
+        // the kernel's own arithmetic, so the substitution changes no bit. See
+        // `match_gelu_tanh_expansion` for what is accepted and what is (deliberately) not.
+        if let Some(x_sym) = self.match_gelu_tanh_expansion(value, j, batch) {
+            return Some((out_sym, x_sym, VMATH_GELU, MirType::F32));
+        }
         let ExprKind::Call { callee, args, .. } = &value.kind else {
             return None;
         };
@@ -14697,7 +14716,10 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
-        let Some(calls) = self.match_vmath_body(*jvar, inner, Some((*r, cols))) else {
+        let Some(calls) = self
+            .match_vmath_body(*jvar, inner, Some((*r, cols)))
+            .or_else(|| self.batched_vmath_on_value_view(*jvar, inner, (*r, cols)))
+        else {
             return false;
         };
         // Flat range `[0, R*C)`: each base GEPs from element 0, length `R*C`.
@@ -16045,6 +16067,12 @@ impl FnLowerer<'_> {
             if self.try_dequant_for(j, start, end, body) {
                 return true;
             }
+            // The same five probes over the body with its hoisted value bindings inlined
+            // (`let v = x[j]; o[j] = gelu(v);`), tried only once every probe declined the body as
+            // written — see `canon::inline_value_lets` for why the view is the same loop.
+            if self.try_elementwise_kernels_on_value_view(j, start, end, body) {
+                return true;
+            }
         } // ---- end of the recognizer-gated elementwise kernel probes ----------------------------
           // Pure analyses first (emit no MIR). A reduction (`s += elementwise`) has a body shape
           // disjoint from the elementwise *store* loops, so try it first. Reductions are vectorized
@@ -16263,6 +16291,10 @@ impl FnLowerer<'_> {
                 if self.emit_vhorner(s, e, out_base, x_base, &coeffs) {
                     return true;
                 }
+            }
+            // A chunk whose body names its loaded value first (`let v = x[j]; o[j] = gelu(v);`).
+            if self.try_ranged_kernels_on_value_view(j, start_val, end_val, ity, body) {
+                return true;
             }
         } // ---- end of the recognizer-gated per-chunk kernel probes ------------------------------
         let Some((lane, w)) = self.vectorizable(body, j) else {
@@ -34217,14 +34249,14 @@ fn act(mut a: [f32; 4096], x: [f32; 4096]) {
             );
         }
 
-        /// The decline side of the same predicate, and its honest limit: a `usize` endpoint whose
-        /// value is NOT provable - here a runtime parameter - still keeps the ordinary loop
-        /// lowering, because an endpoint above `i64::MAX` would reach the kernel as a negative
-        /// count and every kernel entry treats that as "nothing to do" while the loop as written
-        /// iterates. Proving it needs a runtime test on the dispatch, which this predicate cannot
-        /// emit: it runs before any MIR is built.
+        /// The other half of the same story: a `usize` endpoint whose value is NOT provable - here
+        /// a runtime parameter - cannot be handed to the kernel unconditionally, because an
+        /// endpoint above `i64::MAX` would reach it as a negative count while the loop as written
+        /// iterates. `ucount.rs` therefore dispatches under a run-time `end >= 0` test (`cmp.sge`)
+        /// and keeps the loop as written as the fallback, so the kernel is reachable AND the
+        /// fallback is still there.
         #[test]
-        fn an_unprovable_usize_bound_still_declines() {
+        fn an_unprovable_usize_bound_dispatches_under_a_runtime_guard() {
             let src = "module m
 fn act(mut a: [f32; 4096], x: [f32; 4096], n: usize) {
     for i in 0..n { a[i] = gelu(x[i]); }
@@ -34233,10 +34265,25 @@ fn act(mut a: [f32; 4096], x: [f32; 4096], n: usize) {
             let (prog, diags, interner) = lower(src);
             assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
             assert!(
-                !prog_calls(&prog, &interner, "wukong_vmath_f32"),
-                "an unprovable unsigned 64-bit endpoint must not dispatch; got {:?}",
+                prog_calls(&prog, &interner, "wukong_vmath_f32"),
+                "an unprovable unsigned 64-bit endpoint must dispatch under a guard; got {:?}",
                 kernel_calls(&prog, &interner)
             );
+            let f = prog
+                .funcs
+                .iter()
+                .find(|f| interner.resolve(f.name) == "act")
+                .expect("act lowered");
+            let guarded = f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(&i.op, Op::Cmp(CmpOp::Sge, ..)))
+            });
+            assert!(
+                guarded,
+                "the dispatch must sit behind the signed-domain test"
+            );
+            assert!(verify_function(f).is_empty(), "verify failed");
         }
     }
 }
