@@ -6,6 +6,8 @@
 // EXPECT-OUT: 16
 // EXPECT-OUT: 60
 // EXPECT-OUT: 80
+// EXPECT-OUT: 140
+// EXPECT-OUT: 160
 module tests.run.maxpool
 
 // 2D max-pooling over a [C=2, H=4, W=4] row-major input, 2x2 window, stride 2x2, no padding →
@@ -47,5 +49,7 @@ fn main() -> i32 {
     print(out[3] as i32); // plane0 [1,1] = max(11,12,15,16) = 16
     print(out[4] as i32); // plane1 [0,0] = max(10,20,50,60) = 60
     print(out[5] as i32); // plane1 [0,1] = max(30,40,70,80) = 80
+    print(out[6] as i32); // plane1 [1,0] = max(90,100,130,140) = 140
+    print(out[7] as i32); // plane1 [1,1] = max(110,120,150,160) = 160
     return 0;
 }
