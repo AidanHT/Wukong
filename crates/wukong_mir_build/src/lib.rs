@@ -29,6 +29,7 @@
 mod alias;
 mod builtins;
 mod canon;
+mod methods;
 mod tile;
 mod tindex;
 
@@ -79,6 +80,9 @@ struct Mono {
     /// Instances to lower, in discovery order (deterministic): (instance symbol, original symbol,
     /// substitution).
     instances: Vec<(Symbol, Symbol, HashMap<Symbol, Ty>)>,
+    /// Each function's function-typed parameters: (parameter index, pseudo-generic key). Those keys
+    /// are also in `type_generics`, bound to `Ty::Named(<function>)` (see `methods.rs`).
+    fn_value_keys: HashMap<Symbol, Vec<(usize, Symbol)>>,
     /// Module string table: decoded UTF-8 bytes (with the trailing NUL) -> the `.rodata` blob's
     /// symbol. Built by [`collect_static_strings`] and read by the `ExprKind::Str` lowering to emit
     /// `Op::GlobalAddr(sym)`. Threaded to the real function lowerer via the already-passed `&Mono`,
@@ -256,6 +260,23 @@ fn mono_type_name(ty: &Ty, interner: &Interner) -> String {
 /// Bind the value-type generics `tg` by matching a parameter type against a concrete argument type.
 fn bind_generics(param_ty: &Ty, arg_ty: &Ty, tg: &[Symbol], subst: &mut HashMap<Symbol, Ty>) {
     match (param_ty, arg_ty) {
+        // A function-typed parameter binds the type generics of its signature from the bound
+        // function's (`fn map<T>(f: fn(T) -> T, x: T)` with `square: fn(f32) -> f32`).
+        (
+            Ty::Fn {
+                params: ps,
+                ret: pr,
+            },
+            Ty::Fn {
+                params: as_,
+                ret: ar,
+            },
+        ) => {
+            for (p, a) in ps.iter().zip(as_) {
+                bind_generics(p, a, tg, subst);
+            }
+            bind_generics(pr, ar, tg, subst);
+        }
         (Ty::Named(g), a) if tg.contains(g) => {
             if !ty_has_generic(a, tg) {
                 subst.entry(*g).or_insert_with(|| a.clone());
@@ -298,6 +319,7 @@ struct MonoCollector<'a> {
     sema: &'a SemaResult,
     interner: &'a mut Interner,
     type_generics: HashMap<Symbol, Vec<Symbol>>,
+    fn_value_keys: HashMap<Symbol, Vec<(usize, Symbol)>>,
     fn_bodies: HashMap<Symbol, &'a Block>,
     instance_of: HashMap<(Symbol, String), Symbol>,
     instances: Vec<(Symbol, Symbol, HashMap<Symbol, Ty>)>,
@@ -315,7 +337,14 @@ impl MonoCollector<'_> {
         if !p.is_single() {
             return;
         }
-        let name = p.first().sym;
+        // A call through a function-typed parameter is a call of the function this instance binds.
+        let name =
+            methods::bound_fn(p.first().sym, outer, self.interner).unwrap_or_else(|| p.first().sym);
+        self.handle_named_call(name, args, outer);
+    }
+
+    /// [`Self::handle_call`] once the callee is resolved to the function `name`.
+    fn handle_named_call(&mut self, name: Symbol, args: &[Expr], outer: &HashMap<Symbol, Ty>) {
         let tg = match self.type_generics.get(&name) {
             Some(g) if !g.is_empty() => g,
             _ => return,
@@ -338,6 +367,17 @@ impl MonoCollector<'_> {
                 &resolved
             };
             bind_generics(pty, aty, tg, &mut subst);
+        }
+        // Each function-typed parameter binds to the function its argument names.
+        if let Some(keys) = self.fn_value_keys.get(&name) {
+            for &(i, key) in keys {
+                if let Some(f) = args
+                    .get(i)
+                    .and_then(|a| methods::fn_value_of(a, outer, self.sema, self.interner))
+                {
+                    subst.insert(key, Ty::Named(f));
+                }
+            }
         }
         let Some(canon) = canon_type_args(tg, &subst, self.interner) else {
             return;
@@ -431,7 +471,11 @@ impl MonoCollector<'_> {
                 for a in args {
                     self.walk_expr(a, subst);
                 }
-                self.handle_call(callee, args, subst);
+                // A call through a trait bound reaches the instantiated type's method.
+                match methods::dispatch_in_instance(e, callee, args, subst, self.sema) {
+                    Some((target, full)) => self.handle_named_call(target, &full, subst),
+                    None => self.handle_call(callee, args, subst),
+                }
             }
             ExprKind::Index { base, indices } => {
                 self.walk_expr(base, subst);
@@ -491,13 +535,20 @@ impl MonoCollector<'_> {
 /// so instance names can be interned (needs `&mut interner`).
 fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> Mono {
     let mut type_generics: HashMap<Symbol, Vec<Symbol>> = HashMap::default();
+    let mut fn_value_keys: HashMap<Symbol, Vec<(usize, Symbol)>> = HashMap::default();
     let mut fn_bodies: HashMap<Symbol, &Block> = HashMap::default();
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
                 fn_bodies.insert(f.name.sym, body);
                 if let Some(DefKind::Fn(sig)) = sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
-                    let tg = fn_type_generics(sig);
+                    let mut tg = fn_type_generics(sig);
+                    // A function-typed parameter specializes like a type generic (`methods.rs`).
+                    let keys = methods::fn_value_keys(f, sig, interner);
+                    tg.extend(keys.iter().map(|&(_, k)| k));
+                    if !keys.is_empty() {
+                        fn_value_keys.insert(f.name.sym, keys);
+                    }
                     if !tg.is_empty() {
                         type_generics.insert(f.name.sym, tg);
                     }
@@ -514,6 +565,7 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
         sema,
         interner,
         type_generics,
+        fn_value_keys,
         fn_bodies,
         instance_of: HashMap::default(),
         instances: Vec::new(),
@@ -542,6 +594,7 @@ fn collect_mono(module: &Module, sema: &SemaResult, interner: &mut Interner) -> 
         instance_of: c.instance_of,
         type_generics: c.type_generics,
         instances: c.instances,
+        fn_value_keys: c.fn_value_keys,
         // Populated separately by the caller (`lower_program`) via `collect_static_strings`, which
         // also needs `&mut interner`; kept out of the generic-collection walk to avoid coupling.
         strings: HashMap::default(),
@@ -970,6 +1023,18 @@ pub fn lower_program_with(
     interner: &mut Interner,
     opts: LowerOptions,
 ) -> (Program, Vec<Diagnostic>) {
+    // First of all, before the two normalizations below: every method call whose target sema
+    // resolved becomes the plain call of its function, so everything below sees an ordinary call
+    // (`methods.rs`).
+    let desugared = methods::desugar_module(module, sema);
+    let desugared_sema = desugared.as_ref().map(|(_, extra)| {
+        let mut s = sema.clone();
+        s.types.extend(extra.iter().map(|(id, t)| (*id, t.clone())));
+        s
+    });
+    let module: &Module = desugared.as_ref().map(|(m, _)| m).unwrap_or(module);
+    let sema: &SemaResult = desugared_sema.as_ref().unwrap_or(sema);
+
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
     //
@@ -1004,6 +1069,9 @@ pub fn lower_program_with(
     // precondition the recognizer cannot establish from inside one function; this supplies the
     // missing half. See `alias.rs`.
     let alias_facts = alias::AliasFacts::analyze(module, sema);
+    // Functions a trait-bound call or a function-typed parameter can reach: calls `alias.rs` cannot
+    // see, so none of them may claim provably disjoint buffer parameters.
+    let dispatch_taint = methods::dispatch_taint(module, sema);
     // Runtime symbols the matmul recognizer lowers a GEMM nest to (interned once, threaded down).
     let gemm = GemmSyms {
         recognize: opts.recognize,
@@ -1250,7 +1318,10 @@ pub fn lower_program_with(
                 // means some call site in this program can hand two of this function's buffer
                 // parameters the same array, so no recognizer inside it may emit a kernel whose
                 // contract is "operands disjoint". See `alias.rs` for the decision and its reasons.
-                let gemm = alias_gemm(gemm, alias_facts.alias_free(f.name.sym));
+                let gemm = alias_gemm(
+                    gemm,
+                    alias_facts.alias_free(f.name.sym) && !dispatch_taint.contains(&f.name.sym),
+                );
                 // ---- The whole-function kernel interceptions ------------------------------------
                 //
                 // Every arm in this block replaces the function's ordinary lowering with a
@@ -2009,7 +2080,10 @@ pub fn lower_program_with(
             let gemm = generic_gemm(gemm, generic_fns.contains(orig));
             // Aliasing is a property of the ORIGINAL function's call sites: every instantiation of
             // a type-generic template shares them.
-            let gemm = alias_gemm(gemm, alias_facts.alias_free(*orig));
+            let gemm = alias_gemm(
+                gemm,
+                alias_facts.alias_free(*orig) && !dispatch_taint.contains(orig),
+            );
             let func = lower_fn(
                 f,
                 body,
@@ -2549,12 +2623,20 @@ fn lower_fn(
     // value. `mir_ty_of` (registry-aware) resolves a named-struct param to its byte-buffer `Array`
     // type — the free `mir_ty` falls back to `I32`, which mistyped a struct param as a scalar (the
     // root of the by-value-struct miscompile and the `mem2reg` panic that promoted that bogus slot).
-    let param_abis: Vec<MirType> = param_tys.iter().map(|pty| fl.param_abi(pty)).collect();
-    let param_vals: Vec<ValueId> = param_abis
+    // A function-typed parameter has no runtime value (it is specialized away, `methods.rs`), so
+    // it declares no MIR parameter.
+    let param_abis: Vec<Option<MirType>> = param_tys
         .iter()
-        .map(|abi| fl.builder.add_param(abi.clone()))
+        .map(|pty| methods::param_has_value(pty).then(|| fl.param_abi(pty)))
+        .collect();
+    let param_vals: Vec<Option<ValueId>> = param_abis
+        .iter()
+        .map(|abi| abi.as_ref().map(|abi| fl.builder.add_param(abi.clone())))
         .collect();
     for ((p, pty), val) in f.params.iter().zip(&param_tys).zip(param_vals) {
+        let Some(val) = val else {
+            continue;
+        };
         if ty_is_buffer_param(pty) {
             fl.param_arrays.push((val, pty.clone()));
         }
@@ -4081,7 +4163,8 @@ impl FnLowerer<'_> {
                 _ => Ty::Error,
             },
             Unit => Ty::Unit,
-            Int(_) => Ty::Error,
+            // A function type is never a local's annotation (sema: E0411).
+            Int(_) | Fn { .. } => Ty::Error,
         }
     }
 
@@ -20244,6 +20327,13 @@ impl FnLowerer<'_> {
                             bind_generics(pty, &self.expr_ty(a), tg, &mut subst);
                         }
                     }
+                    for &(i, key) in mono.fn_value_keys.get(&name).map_or(&[][..], |v| &v[..]) {
+                        if let Some(f) = args.get(i).and_then(|a| {
+                            methods::fn_value_of(a, &self.subst, self.sema, self.interner)
+                        }) {
+                            subst.insert(key, Ty::Named(f));
+                        }
+                    }
                     if let Some(canon) = canon_type_args(tg, &subst, self.interner) {
                         if let Some(&inst) = mono.instance_of.get(&(name, canon)) {
                             let ret_mir = self.mir_ty_of(&subst_ty(&ret_ty, &subst));
@@ -20399,6 +20489,10 @@ impl FnLowerer<'_> {
         args: &[Expr],
         e: &Expr,
     ) -> ValueId {
+        // A call through a function-typed parameter or a trait bound (`methods.rs`).
+        if let Some(v) = self.lower_dispatched_call(callee, generic_args, args, e) {
+            return v;
+        }
         // `Enum::Variant(args)` constructing a data-carrying tuple-payload variant: build its buffer
         // (a value in call-syntax, not a function call). `callee` is `Field { Path(Enum), Variant }`.
         if let ExprKind::Field { base, name } = &callee.kind {
@@ -20434,6 +20528,7 @@ impl FnLowerer<'_> {
                     let argvals: Vec<ValueId> = args
                         .iter()
                         .enumerate()
+                        .filter(|(i, _)| param_tys.get(*i).is_none_or(methods::param_has_value))
                         .map(|(i, a)| self.lower_arg_coerced(a, param_tys.get(i)))
                         .collect();
                     // A call to a type-generic function is redirected to its monomorphized instance

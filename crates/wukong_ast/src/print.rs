@@ -133,6 +133,13 @@ impl AstPrinter<'_> {
                 };
                 format!("Tensor[{}{}]", parts.join(", "), lay)
             }
+            TypeKind::Fn { params, ret } => {
+                let parts: Vec<_> = params.iter().map(|t| self.type_str(t)).collect();
+                match ret {
+                    Some(r) => format!("fn({}) -> {}", parts.join(", "), self.type_str(r)),
+                    None => format!("fn({})", parts.join(", ")),
+                }
+            }
         }
     }
 
@@ -318,6 +325,40 @@ impl AstPrinter<'_> {
                     }
                 });
             }
+            ItemKind::Trait(t) => {
+                let vis = if t.is_pub { "pub " } else { "" };
+                self.line(format!("trait {}{}", vis, self.sym(t.name.sym)));
+                self.indented(|p| {
+                    for f in &t.methods {
+                        let body = if f.body.is_some() {
+                            " (default body)"
+                        } else {
+                            ""
+                        };
+                        p.line(format!("{}{}", p.fn_sig_str(f), body));
+                    }
+                });
+            }
+            ItemKind::Impl(i) => {
+                let head = match &i.trait_ref {
+                    Some(t) => format!(
+                        "impl {} for {}",
+                        self.path_str(t, "."),
+                        self.path_str(&i.self_ty, ".")
+                    ),
+                    None => format!("impl {}", self.path_str(&i.self_ty, ".")),
+                };
+                self.line(head);
+                self.indented(|p| {
+                    for m in &i.methods {
+                        p.line(format!(
+                            "method {} = fn {}",
+                            p.sym(m.name.sym),
+                            p.sym(m.fn_name)
+                        ));
+                    }
+                });
+            }
         }
     }
 
@@ -329,6 +370,15 @@ impl AstPrinter<'_> {
         self.indented(|p| {
             for g in gs {
                 match &g.kind {
+                    GenericParamKind::Type(id) if !g.bounds.is_empty() => {
+                        let bounds: Vec<String> =
+                            g.bounds.iter().map(|b| p.path_str(b, ".")).collect();
+                        p.line(format!(
+                            "type-param {}: {}",
+                            p.sym(id.sym),
+                            bounds.join(" + ")
+                        ))
+                    }
                     GenericParamKind::Type(id) => p.line(format!("type-param {}", p.sym(id.sym))),
                     GenericParamKind::Const { name, ty } => p.line(format!(
                         "const-param {}: {}",
