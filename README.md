@@ -92,6 +92,13 @@ not duplicate them. In summary, Wukong:
   BLAS/cuBLAS and embed Wukong kernels in C/C++/CUDA stacks. Attribute names are validated against
   the closed language set; unknown names report `E0306`. General C ABI symbol export/import
   remains planned (see the roadmap).
+- **Warnings for kernels that compile but compute nothing.** A program that checks clean is linted
+  (`W0001`–`W0007`, `W0030`/`W0031`): an unused variable or an accumulator that is never read, a
+  `mut` output buffer that is never written, `out[i] == a[i] + b[i];` written for `=`, unreachable
+  code, an unreachable function, a missing `;`, and a `(`/`[`/`-` at the start of a line that
+  silently continues the expression above. Levels come from `-A/-W/-D <lint>` (`-D warnings`) and
+  `@allow/@warn/@deny(<lint>)`; see `docs/language-guide.md`. A Unicode lookalike of ASCII
+  punctuation (`−` U+2212 for `-`) is `E0105`, naming the character it imitates.
 
 ## Runs the real GPT-2 124M end-to-end
 
