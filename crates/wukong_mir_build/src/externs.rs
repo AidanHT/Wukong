@@ -62,7 +62,10 @@ pub(crate) fn lower_externs(
             if out.iter().any(|e| e.name == f.name.sym) {
                 continue;
             }
-            if RESERVED.contains(&name) {
+            // The `wukong_` prefix names the runtime kernels the recognizers and the builtins lower
+            // to (`wukong_sgemm`, `wukong_rt_alloc`, ...): an `extern` of one would redeclare it
+            // under a second signature (native) or shadow the interpreter's kernel (oracle).
+            if RESERVED.contains(&name) || name.starts_with("wukong_") {
                 diags.push(
                     Diagnostic::error(format!(
                         "`{name}` is a Wukong builtin and cannot be declared `extern`"
