@@ -813,9 +813,13 @@ The versioning contexts cover every cascade: the per-loop recognizers (`emit_ver
 dequant — their overlapping arm is the loop with recognition off, which the generic vectorizer then
 lowers only with its own disjointness proof, or scalar), and the statement windows
 (`emit_versioned_stmts`: the fused norms, the copy-then-norm fold, the flat 1-D scans — their
-overlapping arm is the window's own statements). A recognizer reached with no context — a
-whole-function interception, a probe, an outlined `@parallel` chunk — declines on `MayAlias`, as every
-recognizer did before versioning. An elementwise dispatch that becomes several full-range passes
+overlapping arm is the window's own statements). The whole-function GEMM and int8 interceptions
+(`lower_matmul_fn`, `lower_i8matmul_fn`) go through `emit_nonempty_reduction_loop` too, so they version the
+same way with the function's one loop on the overlapping arm. A recognizer reached with no context — a
+probe, an outlined `@parallel` chunk — declines on `MayAlias`, as every recognizer did before
+versioning. A coefficient an elementwise kernel HOISTS (`s[0]`, `*p` in `out[j] = s[0] * x[j]`) is a
+scalar the range test cannot see, so it is checked at compile time instead (`hoisted_reads_disjoint`):
+a read that may come from a buffer the kernel writes keeps the loop. An elementwise dispatch that becomes several full-range passes
 (one per statement of a fused body) is guarded over every operand of every pass, because loop
 fission is itself an alias-sensitive transformation.
 
