@@ -5179,6 +5179,16 @@ pub fn emit_object_timed(
     emit_object_ex(program, interner, EmitOptions::production())
 }
 
+/// As [`emit_object_timed`], with an explicit backend configuration — what `wukongc
+/// --time-passes` uses, so the timed object is the one the requested `-O` level produces.
+pub fn emit_object_timed_with(
+    program: &Program,
+    interner: &Interner,
+    backend: BackendOpt,
+) -> Result<(Vec<u8>, ObjTimings), String> {
+    emit_object_full(program, interner, EmitOptions::production(), backend)
+}
+
 fn emit_object_ex(
     program: &Program,
     interner: &Interner,

@@ -44,6 +44,9 @@ mod loader;
 /// Whole-program reachability pruning ahead of optimization (`--run`, `--emit=exe`).
 mod prune;
 
+/// `--time-passes` / `--time-trace` stage timing and `--depfile` dependency files.
+mod report;
+
 /// Which intermediate (or final) artifact the user asked to produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EmitStage {
@@ -113,6 +116,14 @@ pub struct Options {
     pub opt_level: u8,
     /// Validate MIR after each optimizer pass, including in release builds (`--verify-each`).
     pub verify_each: bool,
+    /// Print a per-stage compile-time breakdown — with per-optimizer-pass and codegen splits and a
+    /// MIR size summary — to stderr when the compile ends (`--time-passes`).
+    pub time_passes: bool,
+    /// Write the same timings as a Chrome trace-event JSON file (`--time-trace=<path>`).
+    pub time_trace: Option<PathBuf>,
+    /// Write a Make-syntax dependency file naming every source file the compile read, root and
+    /// imports (`--depfile=<path>`).
+    pub depfile: Option<PathBuf>,
     pub color: bool,
     pub error_format: ErrorFormat,
     /// Which backend to run/emit with. `--run` defaults to the interpreter (the reference oracle);
@@ -181,6 +192,9 @@ impl Default for Options {
             run: false,
             opt_level: 0,
             verify_each: false,
+            time_passes: false,
+            time_trace: None,
+            depfile: None,
             color: true,
             error_format: ErrorFormat::Human,
             backend: BackendKind::Interp,
@@ -270,6 +284,9 @@ pub fn compile(opts: &Options) -> i32 {
         return exit::COMPILE_ERROR;
     }
 
+    // Declared before every other local so it reports last, on every exit path (see `report`).
+    let mut timer = report::PassTimer::new(opts);
+    timer.begin("read");
     let src = match std::fs::read_to_string(&opts.input) {
         Ok(s) => s,
         Err(e) => {
@@ -284,6 +301,7 @@ pub fn compile(opts: &Options) -> i32 {
     let mut sink = DiagnosticSink::new();
 
     // --- Lexing ---
+    timer.begin("lex");
     let (tokens, lex_diags) = wukong_lexer::tokenize(sm.source(id), id);
     for d in lex_diags {
         sink.emit(d);
@@ -300,6 +318,7 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     // --- Parsing ---
+    timer.begin("parse");
     let mut interner = Interner::new();
     let (mut module, parse_diags, mut next_node) =
         wukong_parser::parse_module_tokens_from(&tokens, sm.source(id), &mut interner, 0);
@@ -334,6 +353,7 @@ pub fn compile(opts: &Options) -> i32 {
     // is checked and lowered as ONE merged flat namespace. Lex/parse diagnostics from imported
     // files — and E0305 for an unresolvable import — land in the same sink and render with their
     // own file's path/line through the shared SourceMap.
+    timer.begin("imports");
     loader::load_imports(
         &mut module,
         &opts.input,
@@ -347,8 +367,17 @@ pub fn compile(opts: &Options) -> i32 {
         return exit::COMPILE_ERROR;
     }
     drop(sink);
+    // Every file the compile reads is in the SourceMap by now: the root and each import, once.
+    if let Some(depfile) = &opts.depfile {
+        let target = report::depfile_target(opts, depfile);
+        if let Err(e) = std::fs::write(depfile, report::depfile_contents(&target, &sm)) {
+            eprintln!("error: could not write `{}`: {e}", depfile.display());
+            return exit::IO_ERROR;
+        }
+    }
 
     // --- Semantic analysis (name resolution, type checking, shape checking) ---
+    timer.begin("sema");
     let (sema, sema_diags) = wukong_sema::check(&module, &interner);
     for d in &sema_diags {
         emit_diag(d, opts.error_format, &renderer, &sm);
@@ -377,6 +406,7 @@ pub fn compile(opts: &Options) -> i32 {
     // Both switches that change *what the MIR contains* are values chosen by the pipeline, not
     // environment reads inside a recognizer; `lower_options_for` is where that choice lives and why
     // the requested backend is part of it.
+    timer.begin("lower");
     let lower_opts = lower_options_for(opts);
     let (mut program, lower_diags) =
         wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lower_opts);
@@ -429,7 +459,10 @@ pub fn compile(opts: &Options) -> i32 {
     let single_entry = opts.run || opts.emit == EmitStage::Exe;
     if single_entry && !opts.grad.train && opts.backend != BackendKind::GpuLower {
         let main = interner.intern("main");
-        prune::retain_reachable(&mut program, &[main]);
+        let pruned = prune::retain_reachable(&mut program, &[main]);
+        if pruned > 0 {
+            timer.note(|| format!("pruned {pruned} function(s) unreachable from `main`"));
+        }
     }
 
     // --- Optimization ---
@@ -441,6 +474,7 @@ pub fn compile(opts: &Options) -> i32 {
     } else {
         opts.opt_level
     };
+    timer.begin("optimize");
     if opts.verify_each {
         if let Err(failure) =
             wukong_opt::optimize_verified_preserving(&mut program, opt_level, &roots)
@@ -453,16 +487,24 @@ pub fn compile(opts: &Options) -> i32 {
             );
             return exit::COMPILE_ERROR;
         }
+    } else if timer.enabled() && roots.is_empty() {
+        // The timed optimizer runs the identical pipeline (byte-identical MIR) with a clock around
+        // each pass; with no extra roots it is exactly `optimize_preserving(.., &[])`.
+        let timings = wukong_opt::optimize_timed(&mut program, opt_level);
+        timer.optimizer_passes(&timings);
     } else {
         wukong_opt::optimize_preserving(&mut program, opt_level, &roots);
     }
+    timer.mir_summary(&program, &interner);
 
     // --- Autodiff CLI surface (additive; runs after optimization, before any backend) ---
     if opts.grad.train {
+        timer.begin("train");
         let lens = train_lens.expect("train_lens computed when --train is set");
         return run_train(&program, &mut interner, opts, &lens);
     }
     if opts.emit == EmitStage::Grad {
+        timer.begin("autodiff");
         return emit_grad(&program, &mut interner, opts);
     }
 
@@ -473,18 +515,29 @@ pub fn compile(opts: &Options) -> i32 {
         // the backend unchecked — and the native -O0 JIT codegens it into a SIGSEGV rather than the
         // clean ICE that `--emit=mir` and the optimizer already report. Verifying here makes a
         // lowering bug a diagnosable internal-compiler-error instead of a crash or miscompile.
+        timer.begin("verify");
         if verify_or_ice(&program) {
             return exit::COMPILE_ERROR;
         }
         let main = interner.intern("main");
+        timer.begin(if opts.backend == BackendKind::Native {
+            "jit-compile"
+        } else {
+            "run"
+        });
         let result = match opts.backend {
             BackendKind::Interp => wukong_interp::run_with_output(&program, main, &interner),
-            BackendKind::Native => wukong_codegen_cranelift::jit_run_with(
-                &program,
-                main,
-                &interner,
-                wukong_codegen_cranelift::BackendOpt::for_level(opt_level),
-            ),
+            BackendKind::Native => {
+                let backend = wukong_codegen_cranelift::BackendOpt::for_level(opt_level);
+                match wukong_codegen_cranelift::jit_compile_with(&program, main, &interner, backend)
+                {
+                    Ok(compiled) => {
+                        timer.begin("run");
+                        compiled.run()
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             BackendKind::Gpu => run_on_gpu(&program, main, &interner),
             BackendKind::GpuLower => run_on_gpu_lower(&program, main, &interner),
         };
@@ -502,6 +555,7 @@ pub fn compile(opts: &Options) -> i32 {
     }
 
     if opts.emit == EmitStage::Mir {
+        timer.begin("emit-mir");
         // A verifier failure means we just printed an internal-compiler-error; never report success.
         return if emit_mir(&program, &interner) {
             exit::COMPILE_ERROR
@@ -517,6 +571,7 @@ pub fn compile(opts: &Options) -> i32 {
     // silently miscompiled artifact instead of a diagnosable ICE. (`--emit=mir`/`mir-high` are
     // deliberately *not* gated here: they verify inside `emit_mir` after dumping, so a broken program
     // still prints the MIR that shows why.)
+    timer.begin("verify");
     if matches!(
         opts.emit,
         EmitStage::LlvmIr | EmitStage::Obj | EmitStage::Exe
@@ -527,6 +582,7 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- LLVM backend ---
     if opts.emit == EmitStage::LlvmIr {
+        timer.begin("llvm-ir");
         return match wukong_codegen_llvm::try_emit_llvm_ir(&program, &interner) {
             Ok(ir) => {
                 print_artifact(&ir);
@@ -545,7 +601,7 @@ pub fn compile(opts: &Options) -> i32 {
         };
     }
     if matches!(opts.emit, EmitStage::Obj | EmitStage::Exe) {
-        return emit_native(&program, &interner, opts);
+        return emit_native(&program, &interner, opts, &mut timer);
     }
 
     exit::OK
@@ -785,9 +841,25 @@ fn object_path(
 /// back. If the `cc` fallback cannot even be spawned, the object is copied out of the scratch
 /// directory to `<stem>.o` so that it survives, and the driver reports whichever path is actually
 /// there - that copy is best effort - and exits [`exit::UNIMPLEMENTED`] (2).
-fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Options) -> i32 {
+fn emit_native(
+    program: &wukong_mir::Program,
+    interner: &Interner,
+    opts: &Options,
+    timer: &mut report::PassTimer,
+) -> i32 {
+    timer.begin("codegen");
     let backend = wukong_codegen_cranelift::BackendOpt::for_level(opts.opt_level);
-    let obj = match wukong_codegen_cranelift::emit_object_with(program, interner, backend) {
+    let emitted = if timer.enabled() {
+        wukong_codegen_cranelift::emit_object_timed_with(program, interner, backend).map(
+            |(bytes, split)| {
+                timer.object_split(&split);
+                bytes
+            },
+        )
+    } else {
+        wukong_codegen_cranelift::emit_object_with(program, interner, backend)
+    };
+    let obj = match emitted {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: cranelift codegen failed: {e}");
@@ -833,6 +905,7 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
     // `cc` path below can neither (it crashes on the MSVC object's data relocations and can't consume
     // the Rust runtime staticlib). Output is bit-identical to `--run`. Falls back to `cc` only when
     // rustc or the runtime rlib is unavailable (a scalar, no-data, no-kernel program still links).
+    timer.begin("link");
     match rustc_link(scratch.as_ref(), &stem, &obj_path, &out) {
         LinkOutcome::Linked => {
             eprintln!("wrote {}", out.display());

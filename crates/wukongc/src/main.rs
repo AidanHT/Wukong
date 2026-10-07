@@ -13,6 +13,13 @@ USAGE:
 
 OPTIONS:
     --verify-each     Verify MIR after every optimizer pass (also in release builds)
+    --time-passes      Print per-stage compile times (with per-optimizer-pass and codegen
+                       splits and a MIR size summary) to stderr when the compile ends
+    --time-trace=<f>   Write the same timings to <f> as Chrome trace-event JSON
+                       (chrome://tracing, Perfetto, speedscope)
+    --depfile=<f>      Write a Make-syntax dependency file to <f> naming every source file
+                       read (the root and each import); its target is the -o artifact for
+                       --emit=obj/exe, otherwise <f> itself (not with --emit=tokens/ast)
     --emit=<stage>     Emit an intermediate artifact and stop. One of:
                        tokens, ast, mir-high, mir, grad, llvm-ir, obj, exe  (default: exe)
                        (grad = reverse-mode backward MIR of a loss fn; see --grad-of/--grad-wrt)
@@ -122,6 +129,21 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--run" => opts.run = true,
             "--verify-each" => opts.verify_each = true,
+            "--time-passes" => opts.time_passes = true,
+            _ if arg.starts_with("--time-trace=") => {
+                let path = &arg["--time-trace=".len()..];
+                if path.is_empty() {
+                    return Err("`--time-trace=` requires a file path".into());
+                }
+                opts.time_trace = Some(PathBuf::from(path));
+            }
+            _ if arg.starts_with("--depfile=") => {
+                let path = &arg["--depfile=".len()..];
+                if path.is_empty() {
+                    return Err("`--depfile=` requires a file path".into());
+                }
+                opts.depfile = Some(PathBuf::from(path));
+            }
             _ if arg.starts_with("--backend=") => {
                 let b = &arg["--backend=".len()..];
                 opts.backend = match b {
@@ -287,12 +309,55 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         }
     }
 
+    // The dependency set is the import graph, and these two stages stop before imports are loaded:
+    // a depfile written there would silently omit every imported file.
+    if opts.depfile.is_some() && matches!(opts.emit, EmitStage::Tokens | EmitStage::Ast) {
+        return Err(
+            "`--depfile` needs the import graph, which `--emit=tokens` and `--emit=ast` stop \
+             before loading"
+                .to_string(),
+        );
+    }
+
     Ok(Some(opts))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compile_time_reporting_flags_parse() {
+        let parse = |extra: &[&str]| {
+            let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+            args.push("input.wk".to_owned());
+            parse_args(&args)
+        };
+        let plain = parse(&[]).unwrap().unwrap();
+        assert!(!plain.time_passes && plain.time_trace.is_none() && plain.depfile.is_none());
+        let opts = parse(&[
+            "--run",
+            "--time-passes",
+            "--time-trace=t.json",
+            "--depfile=p.d",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(opts.time_passes && opts.run);
+        assert_eq!(opts.time_trace, Some(PathBuf::from("t.json")));
+        assert_eq!(opts.depfile, Some(PathBuf::from("p.d")));
+        assert!(parse(&["--time-trace="]).is_err());
+        assert!(parse(&["--depfile="]).is_err());
+        for early in ["--emit=tokens", "--emit=ast"] {
+            assert!(parse(&[early, "--depfile=p.d"]).is_err(), "{early}");
+        }
+        assert!(parse(&["--emit=mir-high", "--depfile=p.d"])
+            .unwrap()
+            .is_some());
+        for flag in ["--time-passes", "--time-trace=<f>", "--depfile=<f>"] {
+            assert!(USAGE.contains(flag), "USAGE must document {flag}");
+        }
+    }
 
     #[test]
     fn verify_each_flag_survives_all_optimization_levels_and_training() {

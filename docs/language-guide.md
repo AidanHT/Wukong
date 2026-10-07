@@ -865,6 +865,15 @@ wukongc [OPTIONS] <input.wk>
                       <stem>.o for objects; executables get <stem>.exe on Windows and plain <stem>
                       on unix). Rejected with --run and with every other stage, which print their
                       artifact on stdout — redirect instead.
+--verify-each         verify MIR after every optimizer pass (also in release builds)
+--time-passes         print per-stage compile times to stderr when the compile ends, with the
+                      optimizer's per-pass and Cranelift's codegen/object-write splits and a MIR
+                      size summary (heaviest functions); one JSON line under --error-format=json
+--time-trace=<f>      write the same timings to <f> as Chrome trace-event JSON
+                      (chrome://tracing, Perfetto, speedscope)
+--depfile=<f>         write a Make-syntax dependency file (root + every import, plus an empty rule
+                      per import as gcc -MP does); target = the -o artifact for --emit=obj/exe,
+                      otherwise <f> itself. Rejected with --emit=tokens/ast (they stop before imports)
 --error-format=<f>    human | json   (default: human)
 --explain <CODE>      print an extended explanation for an error code
 --color=<when>        auto | always | never   (default: auto — colour when stderr is a terminal)

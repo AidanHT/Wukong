@@ -5,7 +5,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
-### Compile time: bounded aggregate lowering (`gap2/compile-time`)
+### Compile time: bounded lowering, a real `-O0` backend, self-reporting (`gap2/compile-time`)
 
 - **Fixed: `[agg; n]` evaluated its initializer once per element.** An array repeat whose element is
   a struct, tuple, enum or nested array re-lowered the initializer for every slot, so `[make(); 3]`
@@ -15,6 +15,25 @@ All notable changes to Wukong are documented here. The format is loosely based o
   straight-line in every `f32`/`f64` function for autodiff's single-block rule, so IR size grew with
   array length. The unroll is now bounded (1 KiB per operation) and applies only when `--emit=grad`
   or `--train` asks for a gradient (`LowerOptions::unroll_for_autodiff`).
+- **`-O0` native code is built at Cranelift `opt_level=none`.** The backend ran its full `speed`
+  mid-end at every level, including the default `-O0` whose MIR is all allocas; it now follows the
+  source level (`BackendOpt`). The JIT compiles functions in parallel like the object path
+  (`WUKONG_PAR_CODEGEN=0` serializes), and assert-capable functions are found with one worklist over
+  the reverse call graph instead of a sweep per call-chain level.
+- **`--run` and `--emit=exe` compile only what `main` reaches.** Functions no call or function address
+  reaches from `main` are dropped after lowering, so an imported library is no longer optimized and
+  compiled in full for one call. Sema still checks every item; `--emit=obj`, the MIR dumps, the
+  autodiff stages and `--backend=gpu-native` keep the whole program.
+- **Same-range loop fusion is planned in one pass.** A run of adjacent same-range loops no longer
+  clones and re-checks every candidate prefix at every statement position; only the chosen run is
+  cloned. The fused output is unchanged.
+- **New: `--time-passes`, `--time-trace=<file>`, `--depfile=<file>`.** `--time-passes` prints a
+  per-stage table to stderr (read, lex, parse, imports, sema, lower, optimize with its per-pass
+  breakdown, codegen with its isel/object-write split, link, run) plus the heaviest MIR functions;
+  under `--error-format=json` it is one JSON line. `--time-trace` writes the same intervals as Chrome
+  trace-event JSON. `--depfile` writes a Make rule naming the root and every imported file, with an
+  empty rule per import (gcc `-MP`); its target is the `-o` artifact for `--emit=obj|exe`, otherwise
+  the depfile itself. None of the three changes stdout, the exit code or the emitted object.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
