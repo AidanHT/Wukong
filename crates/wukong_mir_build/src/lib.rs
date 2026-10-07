@@ -12327,6 +12327,11 @@ impl FnLowerer<'_> {
         let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, *k) else {
             return false;
         };
+        // The coefficients are evaluated once, ahead of the call (see `hoisted_reads_disjoint`).
+        let coeffs: Vec<&Expr> = [a_expr, b_expr].into_iter().flatten().collect();
+        if !self.hoisted_reads_disjoint(&coeffs, &[out]) {
+            return false;
+        }
         let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) else {
             return false;
         };
@@ -12409,6 +12414,11 @@ impl FnLowerer<'_> {
         else {
             return false;
         };
+        // The coefficients are evaluated once, ahead of the call (see `hoisted_reads_disjoint`).
+        let coeffs: Vec<&Expr> = [a_expr, b_expr].into_iter().flatten().collect();
+        if !self.hoisted_reads_disjoint(&coeffs, &[out]) {
+            return false;
+        }
         let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) else {
             return false;
         };
@@ -15683,6 +15693,12 @@ impl FnLowerer<'_> {
     /// unset), so the `x` pointer is reused for the unused `y` argument (a valid, never-dereferenced
     /// pointer — no need for a Ptr-typed null const, which is invalid MIR).
     fn emit_velem_call(&mut self, s: ValueId, e: ValueId, plan: &VElemPlan) -> bool {
+        // The coefficients are evaluated once, ahead of the call: one read from a buffer the map
+        // writes (`out[j] = out[0] * x[j]`) is no operand the overlap guard can range.
+        let coeffs: Vec<&Expr> = [plan.a, plan.b, plan.c].into_iter().flatten().collect();
+        if !self.hoisted_reads_disjoint(&coeffs, &[plan.out]) {
+            return false;
+        }
         let n = self.builder.build(MirType::I64, Op::Bin(BinOp::Sub, e, s));
         // Resolve each operand's base pointer (loading it out of the slot for a `Tensor[..]`/pointer
         // param; a no-op for an array operand). The matcher validated every symbol, so this resolves.
@@ -15896,6 +15912,10 @@ impl FnLowerer<'_> {
     /// sequential and the `@parallel`-chunk paths (the outliner supplies the threading, so each chunk is
     /// one serial call — bit-equal to the whole-range interpreter marshal, like velem).
     fn emit_dequant_call(&mut self, s: ValueId, e: ValueId, plan: &DequantPlan) -> bool {
+        // The scale is evaluated once, ahead of the call (see `hoisted_reads_disjoint`).
+        if !self.hoisted_reads_disjoint(&[plan.scale], &[plan.out]) {
+            return false;
+        }
         let Some([q_base, out_base]) = self.kernel_base_ptrs([plan.q, plan.out]) else {
             return false;
         };
@@ -16256,6 +16276,10 @@ impl FnLowerer<'_> {
         x_sym: Symbol,
         coeffs: &[&Expr],
     ) -> bool {
+        // The coefficients are evaluated once, into the table below (see `hoisted_reads_disjoint`).
+        if !self.hoisted_reads_disjoint(coeffs, &[out_sym]) {
+            return false;
+        }
         let Some([out_base, x_base]) = self.kernel_base_ptrs([out_sym, x_sym]) else {
             return false;
         };
@@ -16544,7 +16568,15 @@ impl FnLowerer<'_> {
             // mixed-precision residual-add / saxpy runs multicore (the bandwidth payoff is largest here,
             // ≫ L3). Each chunk GEPs the half-width inputs and f32 output by `s`; elementwise, so the
             // per-chunk passes agree with the interpreter's whole-range marshal of the same kernel.
-            if let Some((out, x, y, a_expr, b_expr, is_f16)) = self.match_lowp_axpby(body, j) {
+            if let Some((out, x, y, a_expr, b_expr, is_f16)) = self
+                .match_lowp_axpby(body, j)
+                .filter(|&(out, _, _, a_expr, b_expr, _)| {
+                    // The coefficients are evaluated once per chunk, ahead of the call (see
+                    // `hoisted_reads_disjoint`).
+                    let coeffs: Vec<&Expr> = [a_expr, b_expr].into_iter().flatten().collect();
+                    self.hoisted_reads_disjoint(&coeffs, &[out])
+                })
+            {
                 if let Some([outv, xv, yv]) = self.kernel_base_ptrs([out, x, y]) {
                     let s = self.coerce_to(start_val, ity, &MirType::I64, true);
                     let e = self.coerce_to(end_val, ity, &MirType::I64, true);
@@ -33577,6 +33609,48 @@ fn main() -> i32 { return 0; }
                 Op::Select(c, _, _) if matches!(defs.get(c), Some(Op::Cmp(CmpOp::Sgt, _, _)))
             )),
             "the combined accumulator must be selected on a non-empty range"
+        );
+        for f in &prog.funcs {
+            let errs = verify_function(f);
+            assert!(errs.is_empty(), "{}: {errs:?}", interner.resolve(f.name));
+        }
+    }
+
+    /// A coefficient the elementwise kernels HOIST — `out[0]` in `out[j] = out[0] * x[j]` — is read
+    /// once, ahead of the call, where the source loop re-reads it after `out[0]`'s own store. It is
+    /// a scalar operand, so no buffer-range guard can see it: the dispatch must decline whenever the
+    /// read's storage may be a buffer the kernel writes, and stay when it provably is not.
+    #[test]
+    fn a_hoisted_coefficient_read_from_the_output_declines_the_elementwise_kernel() {
+        let src = "module m
+fn head(x: [f32; 64], mut out: [f32; 64]) {
+    for j in 0..64 { out[j] = out[0] * x[j]; }
+}
+fn other(s: [f32; 64], x: [f32; 64], mut out: [f32; 64]) {
+    for j in 0..64 { out[j] = s[0] * x[j]; }
+}
+fn main() -> i32 {
+    let mut a: [f32; 64] = [1.0; 64];
+    let mut b: [f32; 64] = [2.0; 64];
+    let mut c: [f32; 64] = [0.0; 64];
+    head(a, b);
+    other(a, b, c);
+    return 0;
+}
+";
+        let (prog, diags, interner) = lower(src);
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let head = func_named(&prog, &interner, "head");
+        assert!(
+            !fn_calls(head, &interner, "wukong_velem_f32"),
+            "a coefficient read from the output must keep the loop, got {:?}",
+            kernel_calls(&prog, &interner)
+        );
+        let other = func_named(&prog, &interner, "other");
+        assert!(
+            fn_calls(other, &interner, "wukong_velem_f32"),
+            "a coefficient read from provably disjoint storage keeps the kernel, got {:?}",
+            kernel_calls(&prog, &interner)
         );
         for f in &prog.funcs {
             let errs = verify_function(f);

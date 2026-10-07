@@ -47,12 +47,12 @@
 //! as every emitter did before, so no caller is ever handed a half-built branch it does not know how
 //! to finish.
 
-use wukong_ast::{Block, ForIter, Pattern, Stmt, StmtKind};
+use wukong_ast::{Block, Expr, ExprKind, ForIter, Pattern, Stmt, StmtKind, UnOp};
 use wukong_mir::{BinOp, BlockId, CastKind, CmpOp, MirType, Op, ValueId};
 use wukong_span::Symbol;
 
 use crate::alias::{plan_kernel_alias, KernelAliasPlan, OperandPair, PairContract};
-use crate::{Dim, FnLowerer, LowpMatmulNest, Pool2dNest};
+use crate::{buffer_base, single_path, Dim, FnLowerer, LowpMatmulNest, Pool2dNest};
 
 /// The alias-versioning state of the dispatch currently being emitted. Rides on `GemmSyms` beside
 /// the `recognize` switch, for the reason that struct's doc gives: it is already threaded to every
@@ -329,6 +329,65 @@ impl FnLowerer<'_> {
                 OperandPair::disjoint(2, 3),
             ],
         )
+    }
+
+    /// Are the memory reads an elementwise recognizer HOISTS out of its loop — a coefficient
+    /// `s[0]` or `*p`, evaluated ONCE before the kernel call where the source loop re-reads it on
+    /// every iteration — from storage provably disjoint from every buffer the kernel writes
+    /// (`outs`)?
+    ///
+    /// The run-time guard ranges only the kernel's BUFFER operands. A hoisted coefficient reaches
+    /// the kernel as a scalar, so it is in no range: an `out` that overlaps the element it was read
+    /// from changes what the source loop reads after the first store, while the kernel keeps the
+    /// pre-loop value. `out[j] = out[0] * x[j]` is the same-symbol spelling (the source chains each
+    /// store into `out[0]`'s later reads; the kernel scales every lane by the old `out[0]`), and
+    /// `fn f(s: []f32, x: []f32, mut out: []f32)` called `f(buf, x, buf)` is the two-name one.
+    /// Neither is visible to the differential gates: the interpreter marshals the same hoisted
+    /// scalar. A read whose base this cannot name answers `false`. Pure; the caller declines
+    /// BEFORE opening any guard, and the loop then lowers with the generic vectorizer's own
+    /// dependence test, or scalar.
+    pub(super) fn hoisted_reads_disjoint(&self, exprs: &[&Expr], outs: &[Symbol]) -> bool {
+        exprs.iter().all(|e| self.hoisted_read_disjoint(e, outs))
+    }
+
+    fn hoisted_read_disjoint(&self, e: &Expr, outs: &[Symbol]) -> bool {
+        let base_disjoint = |base: Option<Symbol>| {
+            base.is_some_and(|b| outs.iter().all(|&o| self.provably_disjoint(b, o)))
+        };
+        match &e.kind {
+            ExprKind::Index { base, indices } => {
+                base_disjoint(buffer_base(base, self.interner))
+                    && indices.iter().all(|i| self.hoisted_read_disjoint(i, outs))
+            }
+            ExprKind::Unary {
+                op: UnOp::Deref,
+                expr,
+            } => base_disjoint(single_path(expr)),
+            ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => {
+                self.hoisted_read_disjoint(expr, outs)
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.hoisted_read_disjoint(lhs, outs) && self.hoisted_read_disjoint(rhs, outs)
+            }
+            ExprKind::Field { base, .. } | ExprKind::TupleField { base, .. } => {
+                self.hoisted_read_disjoint(base, outs)
+            }
+            ExprKind::ArrayLit(items) => items.iter().all(|i| self.hoisted_read_disjoint(i, outs)),
+            ExprKind::ArrayRepeat { value, count } => {
+                self.hoisted_read_disjoint(value, outs) && self.hoisted_read_disjoint(count, outs)
+            }
+            ExprKind::Call { args, .. } => args.iter().all(|a| self.hoisted_read_disjoint(a, outs)),
+            // A path or a literal reads no buffer element. Every other form is refused by
+            // `coeff_is_hoistable` before a coefficient gets here; answering `false` keeps a future
+            // widening of that list from becoming a silent hole.
+            ExprKind::Path(_)
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_) => true,
+            _ => false,
+        }
     }
 
     /// `[ptrtoint(base), ptrtoint(gep(base, elems)))` for operand `i`, built once per operand.
