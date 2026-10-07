@@ -29,6 +29,7 @@
 mod alias;
 mod canon;
 mod defer;
+mod externs;
 mod tile;
 mod tindex;
 
@@ -1197,6 +1198,9 @@ pub fn lower_program_with(
     let (str_table, statics) = collect_static_strings(module, sema, interner);
     mono.strings = str_table;
     program.statics = statics;
+    // `extern "C"` declarations become the program's import table (see `externs.rs`): the one
+    // place every backend resolves a call to a C function's signature and symbol.
+    program.externs = externs::lower_externs(module, sema, interner, &mut diags);
     // Mint the synthetic `"<local>.<field>"` names for every struct-field buffer base the module
     // indexes, so a recognizer holding only `&Interner` can name `l.wq` as an operand and
     // `kernel_base_ptr` can resolve it. Must run before any recognizer probe looks at the tree.

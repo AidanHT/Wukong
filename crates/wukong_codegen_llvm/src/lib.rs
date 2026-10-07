@@ -353,7 +353,34 @@ fn declarations(
             }
         }
     }
+    // An `extern "C"` declaration is authoritative over the call-site inference above: it carries
+    // the C signedness a narrow integer needs (`signext`/`zeroext`), and it declares even a C
+    // function no call site reaches.
+    for e in &program.externs {
+        signatures.insert(
+            interner.resolve(e.name).to_owned(),
+            (
+                extern_abi(&e.ret, true),
+                e.params.iter().map(|p| extern_abi(p, false)).collect(),
+            ),
+        );
+    }
     Ok(signatures)
+}
+
+/// One `extern "C"` parameter or result as an LLVM type, with the `signext`/`zeroext` attribute a
+/// sub-32-bit integer needs under the C ABI (written after a parameter type, before a result type).
+fn extern_abi(p: &wukong_mir::ExternParam, is_ret: bool) -> String {
+    let ty = llvm_ty(&p.ty);
+    if !matches!(p.ty, MirType::I1 | MirType::I8 | MirType::I16) {
+        return ty;
+    }
+    let attr = if p.signed { "signext" } else { "zeroext" };
+    if is_ret {
+        format!("{attr} {ty}")
+    } else {
+        format!("{ty} {attr}")
+    }
 }
 
 fn math_intrinsic(op: &Op, ty: &MirType) -> Result<String, String> {

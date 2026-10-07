@@ -1,0 +1,13 @@
+// An `extern "C"` declaration whose signature has no C ABI mapping — here a `[]f32` slice, a
+// Wukong fat pointer — is refused at the declaration (C0001), instead of being called with a
+// layout the C side cannot read. Pass a pointer (`*f32`) and a length instead.
+// EXPECT-CODE: C0001
+module extern_non_c_abi
+
+extern "C" {
+    fn consume(xs: []f32) -> i32;
+}
+
+fn main() -> i32 {
+    return 0;
+}

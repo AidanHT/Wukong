@@ -23,9 +23,9 @@ use crate::{BinOp, CastKind, Function, MirType, Op, Program, Terminator, ValueId
 use wukong_span::Symbol;
 
 /// Declared signatures (parameter types, return type) of the functions defined in a program, so a
-/// call can be checked against the function it names. Only callees with a MIR body are in here:
-/// `print` and the `wukong_*` runtime kernels are external symbols whose signatures live outside
-/// the IR, and a call to one is left unchecked.
+/// call can be checked against the function it names: every callee with a MIR body, plus every
+/// `extern "C"` declaration (`Program::externs`). `print` and the `wukong_*` runtime kernels are
+/// external symbols whose signatures live outside the IR, and a call to one is left unchecked.
 type FnSigs = HashMap<Symbol, (Vec<MirType>, MirType)>;
 
 /// Verify every function in a program. Returns a list of human-readable problems (empty = ok).
@@ -49,6 +49,10 @@ pub fn verify_program(p: &Program) -> Vec<String> {
             // `Program::function` resolves a name to the FIRST function carrying it; mirror that.
             sigs.entry(f.name).or_insert((params, f.ret.clone()));
         }
+    }
+    for e in &p.externs {
+        let params = e.params.iter().map(|q| q.ty.clone()).collect();
+        sigs.entry(e.name).or_insert((params, e.ret.ty.clone()));
     }
     let mut errors = Vec::new();
     for f in &p.funcs {
@@ -1372,6 +1376,7 @@ mod tests {
         Program {
             funcs,
             statics: Vec::new(),
+            externs: Vec::new(),
             level: crate::MirLevel::Low,
         }
     }

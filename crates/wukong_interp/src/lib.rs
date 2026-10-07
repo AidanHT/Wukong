@@ -1139,6 +1139,8 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let result = if let Some(index) = self.function_index(*func) {
                     let callee = &self.program.funcs[index];
                     self.run_function(callee, &argv)
+                } else if let Some(ext) = self.program.extern_fn(*func) {
+                    call_extern(ext, &argv, self.interner)
                 } else {
                     let name = self.interner.resolve(*func);
                     self.intrinsic(name, &argv)
@@ -4586,6 +4588,114 @@ impl<'a, 'k> Interp<'a, 'k> {
     }
 }
 
+/// The result class the interpreter reads an `extern "C"` function's return value as, or why it
+/// cannot call the function at all. The interpreter's memory is slot-indexed, not machine memory,
+/// so only scalar signatures cross (see `wukong_runtime::cffi`): integers, `bool`, `f32` and `f64`
+/// parameters — at most `MAX_SCALAR_ARGS` of them — and a `void`, integer or float result.
+fn extern_ret_class(ext: &wukong_mir::ExternFn) -> Result<wukong_runtime::cffi::CRet, String> {
+    use wukong_runtime::cffi::{CRet, MAX_SCALAR_ARGS};
+    if ext.params.len() > MAX_SCALAR_ARGS {
+        return Err(format!(
+            "it takes {} parameters and the interpreter marshals at most {MAX_SCALAR_ARGS}",
+            ext.params.len()
+        ));
+    }
+    for p in &ext.params {
+        if !(p.ty.is_int() || matches!(p.ty, MirType::F32 | MirType::F64)) {
+            return Err(format!(
+                "a `{}` parameter cannot leave the interpreter's slot memory",
+                p.ty.display()
+            ));
+        }
+    }
+    Ok(match &ext.ret.ty {
+        MirType::Void => CRet::Void,
+        MirType::F32 => CRet::F32,
+        MirType::F64 => CRet::F64,
+        MirType::I64 => CRet::Int64,
+        MirType::I1 | MirType::I8 | MirType::I16 | MirType::I32 => CRet::Int32,
+        other => {
+            return Err(format!(
+                "a `{}` result cannot enter the interpreter's slot memory",
+                other.display()
+            ))
+        }
+    })
+}
+
+/// Every `extern "C"` function of `program` the interpreter cannot call, one message each: a
+/// non-scalar signature, or a symbol no C library loaded into this process defines. The driver
+/// checks this before an interpreted run so the refusal is a compile-time diagnostic, not a
+/// failure halfway through the program's output.
+pub fn unsupported_externs(program: &Program, interner: &Interner) -> Vec<String> {
+    let mut out = Vec::new();
+    for ext in &program.externs {
+        let name = interner.resolve(ext.name);
+        if let Err(why) = extern_ret_class(ext) {
+            out.push(format!(
+                "extern \"C\" function `{name}` cannot run on the interpreter: {why} (use \
+                 --backend=native)"
+            ));
+        } else if wukong_runtime::cffi::resolve_c_symbol(name).is_none() {
+            out.push(format!(
+                "unresolved external symbol `{name}`: no C library loaded into this process \
+                 defines it"
+            ));
+        }
+    }
+    out
+}
+
+/// Call an `extern "C"` function: the host symbol `wukong_runtime::cffi` resolves — the very
+/// address the native JIT binds — through the scalar marshaller, so interp and native run the same
+/// machine code. Integer arguments are extended to 64 bits per their declared signedness (the
+/// interpreter keeps every integer sign-extended at its width); an integer result is re-normalized
+/// to the declared width.
+fn call_extern(
+    ext: &wukong_mir::ExternFn,
+    args: &[Value],
+    interner: &Interner,
+) -> Result<Value, String> {
+    use wukong_runtime::cffi::{call_scalar, resolve_c_symbol, CArg, CValue};
+    let name = interner.resolve(ext.name);
+    let ret = extern_ret_class(ext).map_err(|why| {
+        format!("extern \"C\" function `{name}` cannot run on the interpreter: {why}")
+    })?;
+    let addr = resolve_c_symbol(name).ok_or_else(|| {
+        format!(
+            "unresolved external symbol `{name}`: no C library loaded into this process defines it"
+        )
+    })?;
+    let mut cargs = Vec::with_capacity(ext.params.len());
+    for (p, v) in ext.params.iter().zip(args) {
+        cargs.push(match &p.ty {
+            MirType::F32 => CArg::F32(v.as_float() as f32),
+            MirType::F64 => CArg::F64(v.as_float()),
+            ty => {
+                let raw = v.as_int();
+                let wide = if p.signed {
+                    mask(raw, ty)
+                } else {
+                    uval(raw, int_bits(ty)) as i128
+                };
+                CArg::Int(wide as i64)
+            }
+        });
+    }
+    // SAFETY: `addr` is the C symbol the program declared with exactly this signature (sema typed
+    // every call against it and the MIR verifier checked the arity and types), each argument is
+    // marshalled in its declared register class, and `ret` is the declared result's class. A
+    // declaration that lies about the C function is undefined behavior, as in C itself.
+    let out = unsafe { call_scalar(addr, &cargs, ret) }
+        .ok_or_else(|| format!("extern \"C\" function `{name}`: unsupported signature shape"))?;
+    Ok(match out {
+        CValue::Void => Value::Unit,
+        CValue::Int(i) => Value::Int(mask(i128::from(i), &ext.ret.ty)),
+        CValue::F32(x) => Value::Float(f64::from(x)),
+        CValue::F64(x) => Value::Float(x),
+    })
+}
+
 fn reg(regs: &[Value], v: ValueId) -> Value {
     regs[v.0 as usize]
 }
@@ -5743,6 +5853,62 @@ mod tests {
         let main = interner.intern("main");
         let err = run(&program, main, &interner).unwrap_err();
         assert!(err.contains("interpreter heap exhausted"), "got: {err}");
+    }
+
+    /// An `extern "C"` function runs on the oracle by calling the same host C symbol the native JIT
+    /// binds, through every scalar register class (f64, int, f32, i64). Every expected value is
+    /// exact by hand: ldexp(3, 4) = 3 * 2^4 = 48; fmod(17.5, 5) = 2.5; fmodf(7.5, 2) = 1.5;
+    /// llabs(-9e9) = 9e9; toupper('a' = 97) = 'A' = 65.
+    #[test]
+    fn extern_c_functions_call_the_host_c_library() {
+        let out = run_main_stdout(
+            "extern \"C\" {\n\
+                 fn ldexp(x: f64, e: i32) -> f64;\n\
+                 fn fmod(x: f64, y: f64) -> f64;\n\
+                 fn fmodf(x: f32, y: f32) -> f32;\n\
+                 fn llabs(x: i64) -> i64;\n\
+                 fn toupper(c: i32) -> i32;\n\
+             }\n\
+             fn main() -> i32 {\n\
+                 print(ldexp(3.0, 4) as i64);\n\
+                 print((fmod(17.5, 5.0) * 10.0) as i64);\n\
+                 print((fmodf(7.5, 2.0) * 10.0) as i32);\n\
+                 print(llabs(-9000000000));\n\
+                 print(toupper(97));\n\
+                 return 0;\n\
+             }\n",
+        );
+        assert_eq!(out, "48\n25\n15\n9000000000\n65\n");
+    }
+
+    /// What the oracle cannot call is named before anything runs: a pointer parameter (its memory
+    /// is slots, not bytes) and a symbol no loaded C library defines.
+    #[test]
+    fn externs_the_interpreter_cannot_call_are_reported_up_front() {
+        let src = "extern \"C\" {\n\
+                       fn strlen(s: *u8) -> i64;\n\
+                       fn zz_no_such_c_symbol_anywhere(x: i32) -> i32;\n\
+                       fn toupper(c: i32) -> i32;\n\
+                   }\n\
+                   fn main() -> i32 { return 0; }\n";
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+        assert_eq!(program.externs.len(), 3);
+        let refused = unsupported_externs(&program, &interner);
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(
+            refused[0].contains("strlen") && refused[0].contains("ptr"),
+            "{refused:?}"
+        );
+        assert!(
+            refused[1].contains("zz_no_such_c_symbol_anywhere"),
+            "{refused:?}"
+        );
     }
 
     #[test]

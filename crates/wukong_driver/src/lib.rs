@@ -38,7 +38,8 @@ mod gpu_e2e_bench;
 mod lang_bench;
 
 /// The multi-file front end: resolves `import`s to files, loads each once (depth-first,
-/// cycle-safe), and splices their items into the root module — one merged flat namespace.
+/// cycle-safe), resolves every name against its own file's module scope (`pub`, `as`, `{x, y}`),
+/// and splices the items into the root module under program-unique symbols.
 mod loader;
 
 /// Which intermediate (or final) artifact the user asked to produce.
@@ -458,6 +459,24 @@ pub fn compile(opts: &Options) -> i32 {
         // lowering bug a diagnosable internal-compiler-error instead of a crash or miscompile.
         if verify_or_ice(&program) {
             return exit::COMPILE_ERROR;
+        }
+        // The interpreter (and the GPU offload path, which runs on it) calls an `extern "C"`
+        // function through the same host symbol the JIT binds, but only for a scalar signature whose
+        // symbol resolves. Refuse anything else up front as a diagnostic, not midway through the
+        // program's output.
+        if matches!(opts.backend, BackendKind::Interp | BackendKind::Gpu) {
+            let refused = wukong_interp::unsupported_externs(&program, &interner);
+            if !refused.is_empty() {
+                for msg in refused {
+                    emit_diag(
+                        &Diagnostic::error(msg).with_code("C0001"),
+                        opts.error_format,
+                        &renderer,
+                        &SourceMap::new(),
+                    );
+                }
+                return exit::COMPILE_ERROR;
+            }
         }
         let main = interner.intern("main");
         let result = match opts.backend {
@@ -1462,6 +1481,7 @@ fn emit_grad(program: &wukong_mir::Program, interner: &mut Interner, opts: &Opti
         funcs: vec![fwd, gradfn],
         level: program.level,
         statics: program.statics.clone(),
+        externs: program.externs.clone(),
     };
     // A verifier failure means we just printed an internal-compiler-error; never report success —
     // the same mapping the `--emit=mir` / `--emit=mir-high` callers already apply.
@@ -1527,6 +1547,7 @@ fn build_grad(
         funcs: vec![gradfn],
         level: program.level,
         statics: program.statics.clone(),
+        externs: program.externs.clone(),
     };
     let level = opts.opt_level.max(1);
     if opts.verify_each {
@@ -1827,6 +1848,7 @@ fn train_loop_with_buffers(
         funcs,
         level: program.level,
         statics: program.statics.clone(),
+        externs: program.externs.clone(),
     };
     // AdamW adds more generated MIR after build_grad's gate. Validate the exact execution program
     // unconditionally, before allocating buffers or entering the interpreter.
@@ -2317,6 +2339,7 @@ mod grad_cli_tests {
             funcs: vec![fwd, g],
             level: MirLevel::Low,
             statics: program.statics.clone(),
+            externs: program.externs.clone(),
         };
         (prog, fname, gname, resolved, interner)
     }
@@ -2869,6 +2892,7 @@ mod verify_gate_tests {
         Program {
             funcs: vec![f],
             statics: Vec::new(),
+            externs: Vec::new(),
             level: wukong_mir::MirLevel::Low,
         }
     }
@@ -2902,6 +2926,7 @@ mod verify_gate_tests {
         let program = Program {
             funcs: vec![callee.finish(), caller.finish()],
             statics: vec![],
+            externs: Vec::new(),
             level: wukong_mir::MirLevel::Low,
         };
         assert!(program
