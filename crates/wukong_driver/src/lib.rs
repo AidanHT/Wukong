@@ -463,7 +463,12 @@ pub fn compile(opts: &Options) -> i32 {
         let main = interner.intern("main");
         let result = match opts.backend {
             BackendKind::Interp => wukong_interp::run_with_output(&program, main, &interner),
-            BackendKind::Native => wukong_codegen_cranelift::jit_run(&program, main, &interner),
+            BackendKind::Native => wukong_codegen_cranelift::jit_run_with(
+                &program,
+                main,
+                &interner,
+                wukong_codegen_cranelift::BackendOpt::for_level(opt_level),
+            ),
             BackendKind::Gpu => run_on_gpu(&program, main, &interner),
             BackendKind::GpuLower => run_on_gpu_lower(&program, main, &interner),
         };
@@ -765,7 +770,8 @@ fn object_path(
 /// directory to `<stem>.o` so that it survives, and the driver reports whichever path is actually
 /// there - that copy is best effort - and exits [`exit::UNIMPLEMENTED`] (2).
 fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Options) -> i32 {
-    let obj = match wukong_codegen_cranelift::emit_object(program, interner) {
+    let backend = wukong_codegen_cranelift::BackendOpt::for_level(opts.opt_level);
+    let obj = match wukong_codegen_cranelift::emit_object_with(program, interner, backend) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: cranelift codegen failed: {e}");
