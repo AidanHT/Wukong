@@ -22,6 +22,8 @@
 mod attention;
 mod gemm;
 mod nt_policy;
+mod par;
+mod topology;
 pub use attention::wukong_attention_f32;
 pub use gemm::{
     wukong_sgemm, wukong_sgemm_bf16_nt, wukong_sgemm_bf16_nt_epi,
@@ -32,6 +34,7 @@ pub use gemm::{
     wukong_sgemm_nt_alpha_parallel, wukong_sgemm_nt_epi, wukong_sgemm_nt_epi_parallel,
     wukong_sgemm_nt_parallel, wukong_sgemm_parallel, wukong_sgemm_tn, wukong_sgemm_tn_parallel,
 };
+pub use topology::{host_topology, HostTopology};
 
 mod gemv;
 pub use gemv::{
@@ -343,7 +346,9 @@ unsafe impl Sync for EnvAddr {}
 /// allocas — an outlined `@parallel` head-attention region privatizes ~1.5 MiB of qh/kh/vt/scores
 /// buffers at S=512 — which does not fit reliably in rayon's default 2 MiB stacks; Cranelift
 /// emits inline stack probes, so a big frame is safe exactly when the reserve is big enough) and
-/// `RAYON_NUM_THREADS` honored explicitly (the core-count sweep instrument).
+/// the requested thread count honored explicitly — `WUKONG_NUM_THREADS` (what `wukongc --threads`
+/// sets), else `RAYON_NUM_THREADS` (the core-count sweep instrument); see
+/// `topology::requested_threads`.
 ///
 /// Calling this before the process's FIRST rayon touch is what makes the *global* pool carry that
 /// configuration: the pre-2026-07-10 code initialized only inside `wukong_parallel_for`, but in
@@ -359,11 +364,7 @@ pub(crate) fn ensure_global_pool() {
     static POOL_INIT: Once = Once::new();
     POOL_INIT.call_once(|| {
         let mut b = rayon::ThreadPoolBuilder::new().stack_size(16 * 1024 * 1024);
-        if let Some(t) = std::env::var("RAYON_NUM_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&t| t > 0)
-        {
+        if let Some(t) = topology::requested_threads() {
             b = b.num_threads(t);
         }
         // `Once` publishes this store to every later `call_once` caller, so `Relaxed` suffices.
@@ -386,19 +387,21 @@ static GLOBAL_POOL_IS_OURS: std::sync::atomic::AtomicBool =
 /// `WUKONG_POOL_UNIFY=0`). Without it that path forks a region body onto rayon's ~2 MiB default
 /// stacks and Cranelift's inline stack probes fault — reproduced as STATUS_STACK_OVERFLOW from a
 /// 4 MiB body run after a bare `into_par_iter()`, and not reproducible when the race is won.
-/// Built lazily, so a process that wins the race never pays for it. Width is left to rayon's
-/// builder default, which reads `RAYON_NUM_THREADS` the same way [`ensure_global_pool`] does, so
+/// Built lazily, so a process that wins the race never pays for it. Width follows the same
+/// requested thread count [`ensure_global_pool`] applies (rayon's builder default otherwise), so
 /// the worker count — and hence `wukong_parallel_for`'s chunking — matches the global pool it
 /// stands in for.
 fn region_pool() -> Option<&'static rayon::ThreadPool> {
     use std::sync::OnceLock;
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
+        let mut b = rayon::ThreadPoolBuilder::new()
             .stack_size(16 * 1024 * 1024)
-            .thread_name(|i| format!("wukong-region-{i}"))
-            .build()
-            .ok()
+            .thread_name(|i| format!("wukong-region-{i}"));
+        if let Some(t) = topology::requested_threads() {
+            b = b.num_threads(t);
+        }
+        b.build().ok()
     })
     .as_ref()
 }
@@ -425,15 +428,16 @@ pub(crate) fn pool_unify() -> bool {
 /// the same pool run inline (rayon's `install` semantics) — safe for kernels invoked inside an
 /// outlined region body.
 ///
-/// KNOWN GAP — the trailing `f()` is **not** on a 16 MiB stack. It is reached when `gemm_pool()` is
-/// unavailable *and* the global registry is ours, which is exactly what a width-1 configuration
-/// gives (`gemm_pool()` returns None once `physical >= current_num_threads()`). `f` then runs
-/// inline on whatever thread called in, so an outlined region body — which `wuk_pool_width`'s doc
-/// requires to stay on a pool worker stack — privatizes its multi-hundred-KB frame on the caller's
-/// stack instead. Under `RAYON_NUM_THREADS=1` this aborts with STATUS_STACK_OVERFLOW rather than
-/// failing gracefully. Closing it means routing through [`region_pool`] whenever the caller is not
-/// already a pool worker (`rayon::current_thread_index().is_none()`), which is a routing change
-/// this crate's throughput law wants measured first.
+/// The last branch is reached when `gemm_pool()` is unavailable — the usable cores carry no SMT
+/// siblings to shed (a non-SMT host, an affinity mask or quota leaving one thread per core,
+/// `RAYON_NUM_THREADS=1`), or `WUKONG_POOL_UNIFY=0` — *and* the global registry is ours. It used to
+/// run `f()` inline on whatever thread called in, so an outlined region body privatized its
+/// multi-hundred-KB frame on the caller's stack (STATUS_STACK_OVERFLOW under
+/// `RAYON_NUM_THREADS=1`), and on a non-SMT host every top-level fork started on the caller. Now a
+/// caller that is not already a pool worker is moved onto a global worker first
+/// (`rayon::scope` injects the closure and blocks), so `f` always runs on a 16 MiB worker stack.
+/// That costs exactly the one injection the first split inside `f` used to pay anyway; a caller
+/// that is already a worker of any pool (a nested call from a region body) still runs `f` inline.
 ///
 /// The stack size is the load-bearing property (region bodies privatize ~1.5 MiB frames); which of
 /// the two pools serves the fallback is throughput-only, because every kernel routed here chunks
@@ -453,7 +457,50 @@ pub(crate) fn run_on_wuk_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
             return p.install(f);
         }
     }
+    if rayon::current_thread_index().is_none() {
+        // Not on any pool's worker: hop onto a global worker (16 MiB stacks — the global registry
+        // is ours on this branch) instead of running on the caller's stack.
+        return rayon::scope(move |_| f());
+    }
     f()
+}
+
+/// One line naming the pool the `_parallel` kernels and `@parallel` regions run on, with the probed
+/// host topology — for benchmark banners and bug reports, so a measurement records which scheduling
+/// configuration it was taken in (the private physical-core pool exists only on hosts whose usable
+/// cores carry SMT siblings).
+pub fn kernel_pool_summary() -> String {
+    ensure_global_pool();
+    let t = host_topology();
+    let kib = |b: Option<usize>| b.map_or("?".to_string(), |v| format!("{}K", v / 1024));
+    let host = format!(
+        "{} logical / {} physical usable (machine {} physical), L1D {} L2 {} L3 {} via {}",
+        t.logical_available,
+        t.physical_available,
+        t.physical_total,
+        kib(t.l1d_bytes),
+        kib(t.l2_bytes),
+        kib(t.l3_bytes),
+        t.cache_source
+    );
+    #[cfg(target_arch = "x86_64")]
+    if pool_unify() {
+        if let Some(p) = crate::gemm::gemm_pool() {
+            return format!(
+                "kernel pool: private physical-core pool, {} workers; {host}",
+                p.current_num_threads()
+            );
+        }
+    }
+    let which = if GLOBAL_POOL_IS_OURS.load(std::sync::atomic::Ordering::Relaxed) {
+        "global pool"
+    } else {
+        "region backstop pool (global registry built elsewhere)"
+    };
+    format!(
+        "kernel pool: {which}, {} workers; {host}",
+        rayon::current_num_threads()
+    )
 }
 
 /// Worker count of the unified kernel pool ([`run_on_wuk_pool`]'s target) as seen from the calling
@@ -462,9 +509,10 @@ pub(crate) fn run_on_wuk_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
 /// the parallel schedule's per-chunk/per-block overheads (measured 0.62–0.80× of the serial kernel
 /// at `RAYON_NUM_THREADS=1`). Throughput-only dispatch: every substituted serial sibling is
 /// bit-identical to its parallel form by the standing gate-pinned law, so the bits cannot change.
-/// NOT used by `wukong_parallel_for`: outlined region bodies carry multi-hundred-KB frames that
-/// must stay on the pool's 16 MiB worker stacks, and its width-1 shape (one par_iter job) is
-/// already minimal.
+/// Consulted through `par::fork_units`, which every row/column-batched `_parallel` entry calls.
+/// `wukong_parallel_for` takes its width-1 path inside `par::claim_chunks` instead, *after*
+/// [`run_on_wuk_pool`] has put it on a 16 MiB worker stack — outlined region bodies carry
+/// multi-hundred-KB frames that must never run on the caller's stack.
 pub(crate) fn wuk_pool_width() -> usize {
     ensure_global_pool();
     #[cfg(target_arch = "x86_64")]
@@ -495,7 +543,14 @@ pub(crate) fn wuk_pool_width() -> usize {
 /// next one instead of idling while E-cores straggle — the same self-scheduling shape as the
 /// GEMM's `WUKONG_GEMM_DYN` claim queue, at one `fetch_add` per granule. When `n ≤ workers`
 /// dynamic and static degenerate to the same one-granule-per-worker shape, so the knob only
-/// matters when there is imbalance to absorb.
+/// matters when there is imbalance to absorb. The loop is `par::claim_chunks`, shared with the
+/// kernels that adopted the same schedule.
+///
+/// **Serial fast path.** With one worker in the pool, or a range that fits one granule (`n == 1`),
+/// `body(0, n, env)` runs once with no fork — still on a 16 MiB pool-worker stack. A user grain
+/// (`@parallel(grain = G)`) reaches this entry pre-applied: the compiler hands it `ceil(n / G)`
+/// chunk indices and the outlined body expands each into `G` iterations, so a range of at most
+/// `G` iterations is a one-index call that takes this path.
 ///
 /// # Safety
 /// `body` must be a valid `extern "C" fn(i64, i64, *const u8)` and `env` valid for the call.
@@ -505,51 +560,12 @@ pub unsafe extern "C" fn wukong_parallel_for(
     body: extern "C" fn(i64, i64, *const u8),
     env: *const u8,
 ) {
-    use rayon::prelude::*;
     if n <= 0 {
         return;
     }
-    let n = n as usize;
     let env = EnvAddr(env as usize);
-    run_on_wuk_pool(move || {
-        // Read the worker count INSIDE the installed context so it reflects the pool actually
-        // running the chunks (the private physical-core pool under unification).
-        let workers = rayon::current_num_threads().max(1).min(n);
-        if pfor_dyn() && workers > 1 {
-            // Dynamic claim queue: granules small enough to absorb P/E-core speed asymmetry,
-            // big enough that the per-granule fetch_add is noise even for huge n. The counter is
-            // cache-line-isolated (128 B: line + adjacent-line-prefetch pair) so the one shared
-            // write bounces only for the claims themselves.
-            #[repr(align(128))]
-            struct Claims(std::sync::atomic::AtomicUsize);
-            let g = n.div_ceil(workers * 8).max(1);
-            let ntasks = n.div_ceil(g);
-            let claims = Claims(std::sync::atomic::AtomicUsize::new(0));
-            let claims_ref = &claims;
-            (0..workers).into_par_iter().for_each(|_| loop {
-                // Relaxed suffices: the counter only hands out unique granules; the fork-join's
-                // join publishes every write the body made.
-                let c = claims_ref
-                    .0
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if c >= ntasks {
-                    break;
-                }
-                let start = c * g;
-                let end = (start + g).min(n);
-                body(start as i64, end as i64, env.0 as *const u8);
-            });
-        } else {
-            let chunk = n.div_ceil(workers);
-            (0..workers).into_par_iter().for_each(|w| {
-                let start = w * chunk;
-                if start >= n {
-                    return;
-                }
-                let end = (start + chunk).min(n);
-                body(start as i64, end as i64, env.0 as *const u8);
-            });
-        }
+    par::claim_chunks(n as usize, 1, pfor_dyn(), move |start, end| {
+        body(start as i64, end as i64, env.0 as *const u8)
     });
 }
 
@@ -837,23 +853,13 @@ mod tests {
         // End-to-end: before the `region_pool` backstop this died with STATUS_STACK_OVERFLOW
         // (exit 0xc00000fd) under `WUKONG_POOL_UNIFY=0`, where `gemm_pool()` is bypassed and the
         // fallback fork went to the 2 MiB default registry the bare fork above had installed.
-        // Only meaningful where `run_on_wuk_pool` actually *forks*. At width 1 it reaches its
-        // trailing `f()` and runs the body INLINE on the caller — here the libtest thread, whose
-        // stack is nowhere near 16 MiB — so a 4 MiB frame aborts the whole test binary with
-        // STATUS_STACK_OVERFLOW (0xc00000fd) instead of failing an assertion. Reproduced
-        // deterministically, debug and release, with `RAYON_NUM_THREADS=1 cargo test -p
-        // wukong_runtime --lib`: `gemm_pool()` returns None once `physical >=
-        // current_num_threads()`, and `GLOBAL_POOL_IS_OURS` is then true, so both pool branches are
-        // skipped. Guarding keeps a core-count sweep from taking the suite down with it.
-        //
-        // The inline fallthrough is a real gap, not just a test artifact: `wuk_pool_width`'s doc
-        // records that region bodies "must stay on the pool's 16 MiB worker stacks", and at width 1
-        // they do not. Closing it means routing through `region_pool` when the caller is not
-        // already a pool worker — a production routing change with no adjacent A/B behind it, so it
-        // is reported as an open finding rather than landed here.
-        if wuk_pool_width() <= 1 {
-            return;
-        }
+        // This used to be guarded to widths > 1: at width 1 `run_on_wuk_pool` reached its trailing
+        // `f()` and ran the body INLINE on the caller (the libtest thread, nowhere near 16 MiB), so
+        // the 4 MiB frame aborted the whole binary with STATUS_STACK_OVERFLOW under
+        // `RAYON_NUM_THREADS=1`. That fallthrough is closed: `run_on_wuk_pool` now moves a caller
+        // that is not a pool worker onto a global worker (`rayon::scope`) first, and
+        // `wukong_parallel_for`'s width-1 path runs inside that context. So this runs at EVERY
+        // width, and `RAYON_NUM_THREADS=1 cargo test -p wukong_runtime --lib` is its gate.
         let mut v = vec![0u64; 32];
         // SAFETY: `big_frame_region_body` has the required `extern "C" fn(i64, i64, *const u8)`
         // shape and `v` outlives this blocking call, which is `wukong_parallel_for`'s contract.

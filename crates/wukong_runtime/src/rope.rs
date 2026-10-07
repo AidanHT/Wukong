@@ -159,9 +159,6 @@ pub unsafe extern "C" fn wukong_rope_f32(
     }
 }
 
-/// Row count below which the parallel RoPE just runs serially (the rayon fan-out isn't worth it).
-const ROPE_PAR_MIN: usize = 8;
-
 /// Multi-threaded RoPE: rows are mapped across cores, each computed by the identical per-row routine —
 /// so the result is **bit-identical to [`wukong_rope_f32`]** (rows are independent, no cross-row
 /// combine, so thread count is irrelevant and the interpreter's serial call agrees with this
@@ -181,7 +178,7 @@ pub unsafe extern "C" fn wukong_rope_f32_parallel(
         return;
     }
     let (r, h) = (rows as usize, half as usize);
-    if r < ROPE_PAR_MIN {
+    if !crate::par::fork_rows(r, 2 * h, crate::par::W_TRANSCENDENTAL) {
         wukong_rope_f32(x, inv_freq, out, rows, half);
         return;
     }
@@ -265,7 +262,7 @@ mod tests {
     }
 
     /// 2) serial == parallel bit-for-bit across shapes straddling the parallel threshold and the
-    ///    8-lane edge (rows ≥ ROPE_PAR_MIN actually fan out).
+    ///    8-lane edge (every shape with >= 2 rows forks in the test build, see par.rs).
     #[test]
     fn serial_matches_parallel_bit_for_bit() {
         for (rows, half) in [

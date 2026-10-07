@@ -319,6 +319,11 @@ pub unsafe extern "C" fn wukong_dequant_f32_parallel(
         return;
     }
     let n = n as usize;
+    // Work gate + width-1 fast path (`par::fork_units`; units are 8-element blocks): a small table
+    // runs the serial kernel instead of forking. Elementwise map: bit-identical either way.
+    if !crate::par::fork_units(n.div_ceil(8), n) {
+        return wukong_dequant_f32(q, out, n as i64, scale, op);
+    }
     let in_bytes = if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 };
     let (qa, oa) = (Addr(q as usize), Addr(out as usize));
     // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
@@ -536,20 +541,20 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32_parallel(
     if rows <= 0 || cols <= 0 {
         return;
     }
-    let (rows, cols) = (rows as usize, cols as usize);
+    let (r, c) = (rows as usize, cols as usize);
+    // Work gate + width-1 fast path (`par::fork_rows`): a few-row table no longer forks one rayon
+    // task per row. Bit-identical either way: rows are independent and share one `scale` vector.
+    if !crate::par::fork_rows(r, c, crate::par::W_STREAM) {
+        return wukong_dequant_perchan_f32(q, out, rows, cols, scale, op);
+    }
+    let (rows, cols) = (r, c);
     let in_bytes = if op & DQ_WIDTH_MASK == DQ_I32 { 4 } else { 1 };
     let (qa, oa, sa) = (Addr(q as usize), Addr(out as usize), Addr(scale as usize));
     #[cfg(target_arch = "x86_64")]
     let avx2 = is_x86_feature_detected!("avx2");
     #[cfg(target_arch = "x86_64")]
     let nt = use_nt(rows * cols, in_bytes);
-    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
-    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
-    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
-    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
-    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
-    crate::ensure_global_pool();
-    (0..rows).into_par_iter().for_each(|i| {
+    let row = |i: usize| {
         // SAFETY: disjoint output row i; pointers valid for the declared extents by contract.
         unsafe {
             let q = (qa.0 as *const u8).add(i * cols * in_bytes);
@@ -564,7 +569,11 @@ pub unsafe extern "C" fn wukong_dequant_perchan_f32_parallel(
             }
             perchan_row_scalar(q, out, cols, scale, op);
         }
-    });
+    };
+    // Row spans claimed from the shared queue on the unified kernel pool (`par::claim_chunks`), one
+    // claim per span instead of one rayon task per row. Which worker converts a row never changes
+    // its bits.
+    crate::par::claim_chunks(rows, 1, true, |lo, hi| (lo..hi).for_each(&row));
 }
 
 #[cfg(test)]

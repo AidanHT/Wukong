@@ -247,9 +247,6 @@ pub unsafe extern "C" fn wukong_rmsnorm_bwd_f32(
     }
 }
 
-/// Row count below which the parallel RMSNorm-backward just runs serially.
-const RMSNORM_BWD_PAR_MIN: usize = 8;
-
 /// Multi-threaded RMSNorm backward: rows are mapped across cores, each computed by the identical
 /// per-row routine — so the result is **bit-identical to [`wukong_rmsnorm_bwd_f32`]** (rows are
 /// independent, no cross-row combine, so thread count is irrelevant and the interpreter's serial call
@@ -271,7 +268,7 @@ pub unsafe extern "C" fn wukong_rmsnorm_bwd_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < RMSNORM_BWD_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_ROWPASS) {
         wukong_rmsnorm_bwd_f32(x, dy, gamma, dx, rows, cols, eps_bits);
         return;
     }

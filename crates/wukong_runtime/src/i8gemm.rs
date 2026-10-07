@@ -31,8 +31,6 @@
 //! independent, so the `_parallel` entry maps the per-row routine across cores: `serial == parallel`
 //! with no cross-row combine, independent of thread count.
 
-use rayon::prelude::*;
-
 /// Scalar reference: `sum_t (a[t] as i32) * (b[t] as i32)` over `k` elements, wrapping `i32`. Backs
 /// the AVX2 tail and the no-AVX2 fallback, and is the differential reference for the unit tests.
 ///
@@ -489,7 +487,13 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_parallel(
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
-    let (m, k, n) = (m as usize, k as usize, n as usize);
+    let (mu, ku, nu) = (m as usize, k as usize, n as usize);
+    // Work gate + width-1 fast path (`par::fork_units`, m*k*n int8 MACs): a decode-sized int8 GEMM
+    // no longer forks one rayon task per output row. Integer math, rows independent: bit-identical.
+    if !crate::par::fork_units(mu, i8_work(mu, ku, nu)) {
+        return wukong_i8gemm_nt(a, b, c, m, k, n);
+    }
+    let (m, k, n) = (mu, ku, nu);
     // Raw pointers cross the rayon boundary as integers (same pattern as the parallel GEMM/reduce).
     let (au, bu, cu) = (a as usize, b as usize, c as usize);
     // Detect the SIMD tier once, not per row — each row then runs the identical per-row kernel the
@@ -498,13 +502,7 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_parallel(
     let vnni = is_x86_feature_detected!("avxvnni");
     #[cfg(target_arch = "x86_64")]
     let avx2 = is_x86_feature_detected!("avx2");
-    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
-    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
-    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
-    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
-    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
-    crate::ensure_global_pool();
-    (0..m).into_par_iter().for_each(|i| {
+    let row = |i: usize| {
         let (a, b, c) = (au as *const u8, bu as *const i8, cu as *mut i32);
         // SAFETY: disjoint output row i; pointers valid for the declared extents by contract.
         unsafe {
@@ -525,7 +523,17 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_parallel(
                 *crow.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
             }
         }
-    });
+    };
+    // Row spans claimed from the shared queue on the unified kernel pool (`par::claim_chunks`), so
+    // this kernel runs on the same 16 MiB-stack pool as its neighbours instead of the bare global
+    // registry, one claim per span rather than one rayon task per row.
+    crate::par::claim_chunks(m, 1, true, |lo, hi| (lo..hi).for_each(&row));
+}
+
+/// The int8 GEMM's weighted work for the shared fork gate: `m·k·n` MACs scaled down by
+/// [`crate::par::I8_MACS_PER_WORK`] (saturating). Scheduling-only.
+fn i8_work(m: usize, k: usize, n: usize) -> usize {
+    m.saturating_mul(k).saturating_mul(n) / crate::par::I8_MACS_PER_WORK
 }
 
 /// Dequantize one i32 C row in place to `dst`: `dst[j] = act((src[j] as f32)·scale_a·scale_b[j]
@@ -664,7 +672,12 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq_parallel(
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
-    let (m, k, n) = (m as usize, k as usize, n as usize);
+    let (mu, ku, nu) = (m as usize, k as usize, n as usize);
+    // Work gate + width-1 fast path, as in `wukong_i8gemm_nt_parallel`.
+    if !crate::par::fork_units(mu, i8_work(mu, ku, nu)) {
+        return wukong_i8gemm_nt_deq(a, b, out, m, k, n, scale_a, scale_b, bias, act);
+    }
+    let (m, k, n) = (mu, ku, nu);
     let (au, bu, ou, sbu, biu) = (
         a as usize,
         b as usize,
@@ -676,37 +689,37 @@ pub unsafe extern "C" fn wukong_i8gemm_nt_deq_parallel(
     let vnni = is_x86_feature_detected!("avxvnni");
     #[cfg(target_arch = "x86_64")]
     let avx2 = is_x86_feature_detected!("avx2");
-    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
-    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
-    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
-    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
-    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
-    crate::ensure_global_pool();
-    (0..m).into_par_iter().for_each(|i| {
-        // SAFETY: disjoint output row i; per-row i32 scratch; pointers valid by contract.
-        unsafe {
-            let (a, b, out) = (au as *const u8, bu as *const i8, ou as *mut f32);
-            let (scale_b, bias) = (sbu as *const f32, biu as *const f32);
-            let mut row = vec![0i32; n];
-            let r = row.as_mut_ptr();
-            let arow = a.add(i * k);
-            #[cfg(target_arch = "x86_64")]
-            {
-                if vnni {
-                    gemm_row_nt_vnni(arow, b, r, k, n);
-                } else if avx2 {
-                    gemm_row_nt_avx2(arow, b, r, k, n);
-                } else {
-                    for j in 0..n {
-                        *r.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
+    // One claimed span of rows at a time, with ONE i32 scratch row per span (it was one heap
+    // allocation per output row); each row runs the identical per-row GEMM + `dequant_row` the serial
+    // entry runs, so which worker converts a row never changes its bits.
+    crate::par::claim_chunks(m, 1, true, |lo, hi| {
+        let mut scratch = vec![0i32; n];
+        let r = scratch.as_mut_ptr();
+        let (a, b, out) = (au as *const u8, bu as *const i8, ou as *mut f32);
+        let (scale_b, bias) = (sbu as *const f32, biu as *const f32);
+        for i in lo..hi {
+            // SAFETY: disjoint output row i < m; `r` holds `n` i32 owned by this span; operand
+            // extents by contract.
+            unsafe {
+                let arow = a.add(i * k);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if vnni {
+                        gemm_row_nt_vnni(arow, b, r, k, n);
+                    } else if avx2 {
+                        gemm_row_nt_avx2(arow, b, r, k, n);
+                    } else {
+                        for j in 0..n {
+                            *r.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
+                        }
                     }
                 }
+                #[cfg(not(target_arch = "x86_64"))]
+                for j in 0..n {
+                    *r.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
+                }
+                dequant_row(r, out.add(i * n), n, scale_a, scale_b, bias, act);
             }
-            #[cfg(not(target_arch = "x86_64"))]
-            for j in 0..n {
-                *r.add(j) = dot_i8_scalar(arow, b.add(j * k), k);
-            }
-            dequant_row(r, out.add(i * n), n, scale_a, scale_b, bias, act);
         }
     });
 }

@@ -932,6 +932,16 @@ pub unsafe extern "C" fn wukong_norm_f32(
     }
 }
 
+/// Per-element cost weight of a norm row for the shared fork gate (`par::fork_rows`): softmax and
+/// log-softmax evaluate an `exp` per element; LayerNorm/RMSNorm/L2 make two or three passes with a
+/// reduction between. Scheduling-only — never part of a result.
+fn norm_weight(op: i64) -> usize {
+    match op {
+        NORM_SOFTMAX | NORM_LOGSOFTMAX => crate::par::W_TRANSCENDENTAL,
+        _ => crate::par::W_ROWPASS,
+    }
+}
+
 /// Multicore row-wise norm — **bit-identical** to [`wukong_norm_f32`]. Rows are independent, so each
 /// is computed by the same per-row routine regardless of which thread runs it; there is no cross-row
 /// combine, so the result does not depend on thread count and the interpreter (serial) agrees with the
@@ -951,9 +961,10 @@ pub unsafe extern "C" fn wukong_norm_f32_parallel(
     if rows <= 0 || cols <= 0 {
         return;
     }
-    // Width==1 serial fast-path: no second core to win with — skip the pool handoff and run the
-    // serial sibling inline (bit-identical: per-row work, no cross-row combine).
-    if crate::wuk_pool_width() <= 1 {
+    // Work gate + width==1 serial fast-path (`par::fork_rows`): a one- or two-row norm, or any
+    // norm whose rows x cols x per-element cost cannot amortize a fork, runs the serial sibling
+    // inline instead of paying the pool handoff (bit-identical: per-row work, no cross-row combine).
+    if !crate::par::fork_rows(rows as usize, cols as usize, norm_weight(op)) {
         // SAFETY: same contract as this function.
         return unsafe { wukong_norm_f32(x, out, rows, cols, eps_bits, op) };
     }
@@ -1039,9 +1050,8 @@ pub unsafe extern "C" fn wukong_norm_affine_f32_parallel(
     if rows <= 0 || cols <= 0 {
         return;
     }
-    // Width==1 serial fast-path: no second core to win with — skip the pool handoff and run the
-    // serial sibling inline (bit-identical: per-row work, no cross-row combine).
-    if crate::wuk_pool_width() <= 1 {
+    // Work gate + width==1 serial fast-path, as in `wukong_norm_f32_parallel`.
+    if !crate::par::fork_rows(rows as usize, cols as usize, norm_weight(op)) {
         // SAFETY: same contract as this function.
         return unsafe { wukong_norm_affine_f32(x, out, gamma, beta, rows, cols, eps_bits, op) };
     }

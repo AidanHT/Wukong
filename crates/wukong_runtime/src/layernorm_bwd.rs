@@ -506,9 +506,6 @@ pub unsafe extern "C" fn wukong_layernorm_bwd_f32(
     }
 }
 
-/// Row count below which the parallel LayerNorm-backward just runs serially.
-const LAYERNORM_BWD_PAR_MIN: usize = 8;
-
 /// Multi-threaded LayerNorm backward — **bit-identical** to [`wukong_layernorm_bwd_f32`]. Rows are
 /// independent, so each is computed by the identical per-row routine regardless of which thread runs
 /// it; there is no cross-row combine, so the result does not depend on thread count and the
@@ -530,7 +527,7 @@ pub unsafe extern "C" fn wukong_layernorm_bwd_f32_parallel(
         return;
     }
     let (r, c) = (rows as usize, cols as usize);
-    if r < LAYERNORM_BWD_PAR_MIN {
+    if !crate::par::fork_rows(r, c, crate::par::W_ROWPASS) {
         wukong_layernorm_bwd_f32(x, dy, gamma, dx, rows, cols, eps_bits);
         return;
     }
@@ -623,7 +620,8 @@ mod tests {
 
     #[test]
     fn layernorm_bwd_matches_reference_and_parallel() {
-        // Shapes straddle the 8-lane edge and the parallel row threshold (LAYERNORM_BWD_PAR_MIN=8).
+        // Shapes straddle the 8-lane edge and the old 8-row gate (the test build forks every shape
+        // with >= 2 rows, see par.rs).
         for &(rows, cols) in &[
             (1usize, 1usize),
             (3, 7),
