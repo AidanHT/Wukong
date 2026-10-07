@@ -812,8 +812,10 @@ impl<'a> Vjp<'a> {
                 let d = self.fadd(one, x2, &ty);
                 self.fdiv(one, d, &ty)
             }
-            // expm1' = expm1 + 1
-            26 => self.fadd(r, one, &ty),
+            // expm1' = exp — computed directly, not as `expm1 + 1`: for x ≪ 0 the forward result is
+            // −1 + e^x and adding 1 back cancels to the ≈1e-16 absolute error of that sum (at
+            // x = −20.5 the relative error of `r + 1` is 3e-9; `exp(x)` stays ≤ 1 ULP).
+            26 => self.math_f64_call(0, x),
             // log1p' = 1/(1+x)
             27 => {
                 let d = self.fadd(one, x, &ty);

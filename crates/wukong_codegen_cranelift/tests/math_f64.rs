@@ -523,10 +523,12 @@ fn f64_scalar_transcendental_ad_matches_closed_forms() {
             let function: unsafe extern "C" fn(*const f64, *mut f64) =
                 unsafe { std::mem::transmute(module.func_ptr(entry).unwrap()) };
             // Interior points only: the derivative is a closed form there, and a pole or a
-            // domain edge would compare infinities.
+            // domain edge would compare infinities. Normal arguments only, for the same reason:
+            // at the subnormal 5e-324 the log family's `1/x` is 2^1074, which overflows to +∞
+            // on both sides and `∞ − ∞` fails any tolerance.
             let xs: Vec<f64> = samples(op)
                 .into_iter()
-                .filter(|x| x.is_finite() && *x != 0.0 && x.abs() < 100.0)
+                .filter(|x| x.is_normal() && x.abs() < 100.0)
                 .filter(|x| match op {
                     VM_ASIN | VM_ACOS | VM_ATANH => x.abs() < 0.99,
                     VM_ACOSH => *x > 1.01,
