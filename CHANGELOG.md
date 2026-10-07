@@ -5,6 +5,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Language safety (gap/lang-safety)
+
+- **A pointer condition is a null test, and the interpreter has a real null.** The interpreter
+  reserves slot 0 at every entry point (`wukong_interp::NULL_SLOT`), so `0 as *T` is the same null
+  on both backends and a load/store through it is the diagnostic `null pointer dereference`. `if p`,
+  `while p` and `p && q` on a pointer now lower to `ptrtoint p != 0` instead of reaching `cond_br`
+  as a raw pointer and failing verification with no span (the lowering reverted at `0900352` is now
+  sound). mem2reg promotes every pointer slot, materializing `inttoptr 0` on a read-before-write
+  path, so a pointer local initialized behind a branch no longer stays in memory. An aggregate,
+  slice, tensor, vector or function-valued condition is now `E0401` rather than a verifier ICE.
+  `tests/run/pointer_null_condition.wk`, `tests/fail/condition_aggregate.wk`.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

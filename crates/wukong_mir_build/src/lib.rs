@@ -18468,18 +18468,28 @@ impl FnLowerer<'_> {
             // unaffected.
             let zero = self.builder.build(ty.clone(), Op::ConstInt(0, ty.clone()));
             self.builder.build(MirType::I1, Op::Cmp(CmpOp::Ne, v, zero))
+        } else if ty == MirType::Ptr
+            && matches!(self.expr_ty(cond), Ty::Ptr { .. } | Ty::Ref { .. })
+        {
+            // A **pointer** condition (`if p`, `while p`, `p && q`) is a null test: `p != null`.
+            // This lowering was tried once and reverted (0900352) because the interpreter's first
+            // allocation lived at slot 0 and so read as null (`let p = &mut v; if p` printed 0
+            // there and 1 natively). The interpreter now reserves slot 0 as a never-allocated
+            // null (`wukong_interp::NULL_SLOT`), so `PtrToInt(p) == 0` holds on both backends for
+            // exactly the null pointer (`0 as *T`, a failed native allocation) and for nothing
+            // else. Before this the pointer reached `cond_br` unchanged and both backends rejected
+            // it with raw, unspanned verifier text.
+            let bits = self
+                .builder
+                .build(MirType::I64, Op::Cast(CastKind::PtrToInt, v, MirType::I64));
+            let zero = self
+                .builder
+                .build(MirType::I64, Op::ConstInt(0, MirType::I64));
+            self.builder
+                .build(MirType::I1, Op::Cmp(CmpOp::Ne, bits, zero))
         } else {
-            // NOTE: a **pointer** condition (`if p`) still falls through here unchanged and both
-            // backends reject it with raw verifier text and no span ("cond_br condition: v2 has
-            // type ptr but expected i1"). A `PtrToInt(p) != 0` lowering was tried and reverted: it
-            // is *silently wrong in the interpreter*, whose addresses are slot indices starting at
-            // 0, so the first pointer taken in a function has address 0 and reads as null. `let mut
-            // v: i32 = 7; let p = &mut v; if p` printed 0 under the interpreter and 1 natively —
-            // trading a loud ICE for a silent interp/native divergence, the worse failure. A
-            // correct lowering needs a null test the two backends genuinely share (a dedicated
-            // `IsNull` op, or the interpreter reserving address 0 as never-allocated), not a
-            // comparison on `PtrToInt`.
-
+            // Any other non-scalar condition is rejected by sema's `check_condition`; pass the
+            // value through so a path that slipped past it still fails loudly in the verifier.
             v
         }
     }

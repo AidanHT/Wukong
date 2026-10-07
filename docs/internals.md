@@ -347,28 +347,21 @@ promotes integer, float and pointer slots and leaves arrays, vectors, address-ta
 slot accessed at a width other than its own type in memory. For an integer or float slot a read
 before any write becomes a zero constant, matching the interpreter's zero-initialized memory.
 
-A **pointer** slot has no such zero — `inttoptr 0` is a genuine null on the native backend but a
-*valid, addressable* slot in the interpreter, so materializing one would trade a stack slot for an
-interp-vs-native divergence — so only the definitely-initialized subset is promoted: the **first
-access to the slot inside its own `alloca`'s block `B` must be a store**, and `B` must be the entry
-block or have an empty dominance frontier. SSA dominance makes `B` dominate every block that
-mentions the slot (a use is dominated by the `alloca` that defines it) and a block is straight-line,
-so every access outside `B` happens after all of `B`. `DF(B) = ∅` makes the set of blocks `B`
-dominates closed under both successors and predecessors, so the iterated dominance frontier of the
-store blocks — and every predecessor of every block that receives a phi, which is exactly where the
-renamer asks for a reaching definition — stays inside it, and the rename stack is never empty. The
-entry block gets its own arm because a back edge can put it in its own frontier while it still
-dominates everything.
-
-That admits the case the restriction exists for: `mir_build` gives every pointer-typed parameter —
-`*T`, `&T`, and every `Tensor[…]`, all `MirType::Ptr` — an `alloca ptr` plus a `store <param>` in
-the entry block, and then re-loads that base pointer at *every* element access; the `DF(B) = ∅` arm
-adds the same parameters after `-O2` inlining has spliced a callee's entry block into the middle of
-a caller block. Promoting them removes 3 of the 5 loads per element from a three-operand `Tensor`
-loop (`tests/run/ptr_slot_promotion.wk`) and leaves **no `alloca ptr` at all** across the run corpus
-at `-O2`, and it compounds: deleting `store <slot>, <ptr slot>` can un-escape the pointee so a later
-fixpoint round promotes that too. A pointer local whose `alloca` and initializing store are separated
-by a branch keeps its slot.
+A **pointer** slot's zero is the null pointer, `inttoptr 0`. That used to be unsound — interpreter
+slot 0 was the first live allocation of a run, so a materialized null would have aliased real memory
+(the reverted `PtrToInt(p) != 0` attempt, `0900352`) — and mem2reg promoted only the
+definitely-initialized subset of pointer slots. The interpreter now reserves slot 0 as a
+never-allocated null at every entry point (`wukong_interp::NULL_SLOT`; a load or store through it is
+the diagnostic `null pointer dereference`), so its zero-initialized pointer memory and native's
+`inttoptr 0` are the same null and every pointer slot is promoted like an integer slot: a
+read-before-write path gets the null, materialized once in the entry block as `inttoptr (i64 0)`.
+The same reservation is what lets `mir_build` lower a pointer condition (`if p`, `while p`, `p && q`)
+as the null test `ptrtoint p != 0`; it used to reach `cond_br` unchanged and fail verification with
+no span. That matters for the case pointer promotion was written for — `mir_build` gives every
+pointer-typed parameter (`*T`, `&T`, every `Tensor[…]`) an `alloca ptr` plus a `store <param>` and
+re-loads the base pointer at every element access (`tests/run/ptr_slot_promotion.wk`) — and now also
+for a pointer local whose `alloca` and initializing store are separated by a branch, which used to
+keep its slot and reload it on every use (`tests/run/pointer_null_condition.wk`).
 
 A `[]T` **slice** parameter is *not* covered: a slice is a 16-byte `{ data, len }` fat pointer passed
 by address, so its base comes from `load ptr (gep <param>, 0)` — caller-owned memory, not a local

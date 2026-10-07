@@ -1797,6 +1797,21 @@ impl<'a> Sema<'a> {
                 "a condition cannot be `()` (a unit / void value); use a boolean or numeric value"
                     .to_string(),
             );
+        } else if self.is_aggregate_ty(&t)
+            || matches!(t, Ty::Fn { .. } | Ty::Tensor { .. } | Ty::Vector { .. })
+        {
+            // A pointer condition is a null test and a number is "nonzero"; an aggregate, tensor
+            // view, SIMD vector or function value has no truth value. Each used to reach `cond_br`
+            // as a base pointer or vector and crash both backends with raw, unspanned verifier
+            // text — the same failure the pointer case had before it became a null test.
+            self.error(
+                cond.span,
+                "E0401",
+                format!(
+                    "a condition must be a boolean, a number or a pointer, found `{}`",
+                    t.display(self.interner)
+                ),
+            );
         }
     }
 

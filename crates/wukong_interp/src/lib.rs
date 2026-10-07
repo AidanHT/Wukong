@@ -361,6 +361,31 @@ pub trait Accelerator {
     }
 }
 
+/// The slot index the interpreter reserves as the **null pointer**.
+///
+/// Every public entry point starts its flat memory with one never-allocated sentinel at slot 0, so
+/// no `alloca`, heap allocation, static blob or kernel-entry buffer can ever be placed there and
+/// `Value::Ptr(0)` means exactly what `inttoptr 0` means natively: null. Before this, slot 0 was the
+/// first live allocation of a run, which is why a pointer condition could never be lowered as
+/// `PtrToInt(p) != 0` (reverted at 0900352: `let p = &mut v; if p` read the first local as null in
+/// the interpreter and non-null natively), why mem2reg could not materialize a null for a
+/// read-before-write pointer slot, and why the interpreter could not share native's null at all.
+/// A load or store through it is reported as a null dereference instead of reading the sentinel.
+pub const NULL_SLOT: usize = 0;
+
+/// The value parked in [`NULL_SLOT`]. A vector handle no arena can hold (`usize::MAX`), so it is
+/// never produced by a legal store — vector stores scatter lanes, and nested vector handles are
+/// rejected — and a read that slips past the explicit null checks fails as an invalid handle or a
+/// type-confused kernel operand instead of yielding a plausible number. It also marks the
+/// reservation: the null checks below fire only when slot 0 holds it, so the unit tests that build
+/// an `Interp` by hand with a buffer at slot 0 keep their original addressing.
+const NULL_SENTINEL: Value = Value::VecRef(usize::MAX);
+
+/// Fresh run memory with [`NULL_SLOT`] reserved.
+fn null_reserved_memory() -> Vec<Value> {
+    vec![NULL_SENTINEL]
+}
+
 /// Run `entry` (typically `main`) and return its integer result as a process exit code.
 pub fn run(program: &Program, entry: Symbol, interner: &Interner) -> Result<i64, String> {
     Ok(run_with_output(program, entry, interner)?.0)
@@ -387,7 +412,7 @@ pub fn run_with_output(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
             frames: Vec::new(),
             call_args: Vec::new(),
@@ -479,7 +504,7 @@ pub fn run_with_output_accel(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
             frames: Vec::new(),
             call_args: Vec::new(),
@@ -587,7 +612,7 @@ fn run_kernel_f32_inner(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
             frames: Vec::new(),
             call_args: Vec::new(),
@@ -656,7 +681,7 @@ pub fn run_kernel_f64(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
             frames: Vec::new(),
             call_args: Vec::new(),
@@ -716,7 +741,7 @@ pub fn run_kernel_i8(
         let mut interp = Interp {
             program,
             interner,
-            memory: Vec::new(),
+            memory: null_reserved_memory(),
             stdout: Vec::new(),
             frames: Vec::new(),
             call_args: Vec::new(),
@@ -864,6 +889,11 @@ macro_rules! dim {
 }
 
 impl<'a, 'k> Interp<'a, 'k> {
+    /// Is `slot` the reserved null pointer of this run? See [`NULL_SLOT`] / [`NULL_SENTINEL`].
+    fn is_null(&self, slot: usize) -> bool {
+        slot == NULL_SLOT && self.memory.first() == Some(&NULL_SENTINEL)
+    }
+
     fn function_index(&mut self, symbol: Symbol) -> Option<usize> {
         self.function_indices
             .get_or_insert_with(|| symbol_indices(self.program.funcs.iter().map(|f| f.name)))
@@ -1062,6 +1092,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             // load reads one. Both `gep` to the element address first.
             Op::Load(p, ty) => {
                 let idx = ptr(reg(regs, *p))?;
+                if self.is_null(idx) {
+                    return Err("null pointer dereference (load)".into());
+                }
                 if let MirType::Vec(lane, n) = ty {
                     let mut lanes = Vec::new();
                     lanes
@@ -1101,6 +1134,9 @@ impl<'a, 'k> Interp<'a, 'k> {
             }
             Op::Store { ptr: p, value } => {
                 let idx = ptr(reg(regs, *p))?;
+                if self.is_null(idx) {
+                    return Err("null pointer dereference (store)".into());
+                }
                 match reg(regs, *value) {
                     // A vector store scatters its lanes across contiguous scalar slots.
                     Value::VecRef(vi) => {
@@ -1587,6 +1623,13 @@ impl<'a, 'k> Interp<'a, 'k> {
             // low byte) until the NUL terminator, then render as UTF-8. Native renders the identical
             // bytes via `rt_print_str`, so the differential gate holds.
             "print_str" | "println_str" => {
+                // Native's `rt_print_str` returns without writing anything (not even the newline)
+                // for a null string. Slot 0 is the shared null now (`NULL_SLOT`), so mirror it.
+                if let Some(Value::Ptr(p)) = args.first().copied() {
+                    if self.is_null(p) {
+                        return Ok(Value::Unit);
+                    }
+                }
                 let mut bytes = Vec::new();
                 if let Some(Value::Ptr(base)) = args.first().copied() {
                     let mut i = base;
@@ -1627,10 +1670,11 @@ impl<'a, 'k> Interp<'a, 'k> {
             // zero on both backends (the determinism contract).
             //
             // **Exhaustion.** The native `wukong_rt_alloc` returns null when the allocator cannot
-            // satisfy the request (crates/wukong_runtime/src/lib.rs). The interpreter cannot return
-            // null: its pointers are slot indices and index 0 is a perfectly ordinary live slot (the
-            // first allocation of a run), so `Value::Ptr(0)` would alias real memory and turn an
-            // out-of-memory condition into silent corruption. It reports a diagnostic instead —
+            // satisfy the request (crates/wukong_runtime/src/lib.rs). Slot 0 is now a reserved
+            // null (`NULL_SLOT`), so the interpreter *could* return the same null — but a null
+            // slice whose length field still says `count` would only move the failure to the first
+            // element access (a null dereference here, a segfault natively). It reports a
+            // diagnostic at the allocation instead —
             // `try_reserve` rather than `resize`, so the request never reaches Rust's allocation-
             // error handler, which `abort()`s the process with a raw `memory allocation of N bytes
             // failed` message no caller can catch. One element costs one 32-byte `Value` slot here
@@ -5902,6 +5946,54 @@ mod tests {
         let (program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
         let main = interner.intern("main");
         assert!(run(&program, main, &interner).is_err());
+    }
+
+    /// `NULL_SLOT` is reserved in every run: the first `alloca` of a run is not address 0, so a
+    /// pointer null test agrees with native (`inttoptr 0` is null there, and nothing else is). The
+    /// first case is the exact reproducer the `PtrToInt(p) != 0` lowering was reverted on at
+    /// 0900352 — `p` addresses the first local, which used to *be* slot 0 and read as null.
+    #[test]
+    fn address_zero_is_never_a_live_allocation() {
+        let lower = |src: &str| {
+            let mut interner = Interner::new();
+            let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+            assert!(pd.is_empty(), "parse: {pd:?}");
+            let (sema, sd) = wukong_sema::check(&module, &interner);
+            assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+            let (program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+            assert!(ld.iter().all(|d| !d.is_error()), "lower: {ld:?}");
+            assert!(
+                wukong_mir::verify::verify_program(&program).is_empty(),
+                "a pointer condition must lower to verifier-clean MIR: {src}"
+            );
+            (program, interner)
+        };
+        let first_local = "fn main() -> i32 { let mut v: i32 = 7; let p: *mut i32 = &mut v; \
+                           if p { return 1; } return 0; }";
+        let (program, mut interner) = lower(first_local);
+        let main = interner.intern("main");
+        assert_eq!(run(&program, main, &interner), Ok(1));
+
+        let null = "fn main() -> i32 { let q: *mut i32 = 0 as *mut i32; \
+                    if q { return 1; } return 2; }";
+        let (program, mut interner) = lower(null);
+        let main = interner.intern("main");
+        assert_eq!(run(&program, main, &interner), Ok(2));
+
+        // Dereferencing the null is a diagnostic, not a read of the reserved sentinel slot.
+        let deref = "fn main() -> i32 { let q: *mut i32 = 0 as *mut i32; return *q; }";
+        let (program, mut interner) = lower(deref);
+        let main = interner.intern("main");
+        let err = run(&program, main, &interner).unwrap_err();
+        assert!(err.contains("null pointer dereference"), "{err}");
+
+        // A kernel-entry buffer is laid out after the reserved slot too.
+        let kernel = "fn k(mut a: [f32; 2]) { a[0] = a[0] + 1.0; a[1] = a[1] * 2.0; }";
+        let (program, mut interner) = lower(kernel);
+        let k = interner.intern("k");
+        let mut buf = [3.0f32, 5.0];
+        run_kernel_f32(&program, k, &mut [&mut buf], &interner).unwrap();
+        assert_eq!(buf, [4.0, 10.0]);
     }
 }
 

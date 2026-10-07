@@ -929,12 +929,13 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   The MIR shows the cause directly: `v0 = alloca ptr` then `v2 = load ptr v0` — a load of a slot
   nothing ever stored. The interpreter's own `-O0`/`-O2` disagreement is an opt-invariance violation
   the gate cannot see, because until now no corpus program used a `Tensor` local at all.
-  **Null-initializing the slot is not the fix** — interpreter address 0 is a valid address (reverted
-  `PtrToInt(p) != 0` attempt, `0900352`), so a null handle is undetectable there and would trade a crash for a
-  silent wrong answer. Giving the local backing storage is not the fix either: whole-value assignment
-  to a view rebinds the handle, and a buffer-typed slot would have to copy. The fix is a
-  **definite-assignment rule** for pointer-backed locals, which is a language feature and belongs
-  with the Phase 7 work, not a patch at the lowering.
+  The interpreter half of this is fixed: slot 0 is now a reserved null (`wukong_interp::NULL_SLOT`),
+  so the unstored handle is a genuine null at every level and the interpreter reports
+  `null pointer dereference (store)` at both `-O0` and `-O2` instead of disagreeing with itself.
+  Native still faults on the null store. Giving the local backing storage is not the fix: whole-value
+  assignment to a view rebinds the handle, and a buffer-typed slot would have to copy. The remaining
+  fix is a **definite-assignment rule** for pointer-backed locals, which is a language feature and
+  belongs with the Phase 7 work, not a patch at the lowering.
 
 - `bf16` **and** `f16` are both real 2-byte storage (round-to-nearest-even), f32 compute, with a full
   symmetric mixed-precision op suite (reductions, max-family, axpby, activations — see above) **and a

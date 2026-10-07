@@ -1,0 +1,15 @@
+// EXPECT-CODE: E0401
+module tests.fail.condition_aggregate
+
+// A slice (like any aggregate, tensor view, SIMD vector or function value) has no truth value. A
+// pointer condition is a null test and a number means "nonzero", but `if s` on a `[]T` used to pass
+// sema and reach `cond_br` as the fat pointer's base address, where both backends rejected it with
+// raw, unspanned verifier text instead of a diagnostic. Test the length instead: `if s.len() > 0`.
+fn main() -> i32 {
+    let a: [i32; 2] = [1, 2];
+    let s: []i32 = a;
+    if s {
+        return 1;
+    }
+    return 0;
+}

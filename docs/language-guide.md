@@ -190,6 +190,13 @@ concatenation/indexing/length operators — a string is a NUL-terminated `*u8` i
 elsewhere, so a local must be annotated with the pointer form — `let p: *i32 = &x;`, not
 `let p: &i32 = &x;` (that is `E0401`).
 
+`0 as *T` is the null pointer, and a pointer used as a condition (`if p`, `while p`, `p && q`) is a
+null test — `p != null` — with the same answer on every backend and at every `-O` level (✅). The
+interpreter reserves its address 0 as a never-allocated null so it agrees with native here, and a
+load or store through null is the interpreter diagnostic `null pointer dereference` (native faults).
+A condition must be a boolean, a number (nonzero is true) or a pointer: an aggregate, slice, tensor
+view, SIMD vector or function value is `E0401`.
+
 ## Operators ✅
 
 Arithmetic `+ - * / %`, comparison `== != < <= > >=`, bitwise `& | ^`, shifts `<< >>`, boolean
@@ -752,9 +759,9 @@ Freeing anything not returned by `alloc_*`, double-freeing, or touching a slice 
 run-scoped memory is never reclaimed) never crashes on it, but such programs are outside the
 differential contract. Allocation failure is the one place the two backends differ by construction. On
 the native backend a failed (or zero-byte) allocation yields a slice whose data pointer is **null**,
-which must not be dereferenced. The interpreter cannot mirror that — its pointers are slot indices and
-index 0 is an ordinary live slot — so it reports `interpreter heap exhausted allocating N element(s)` as
-a diagnostic and exits 1 instead of returning a null slice. A program must therefore not branch on
+which must not be dereferenced. The interpreter does not mirror that: a null slice whose length still
+says `n` would only move the failure to the first element access, so it reports `interpreter heap
+exhausted allocating N element(s)` as a diagnostic and exits 1 instead of returning a null slice. A program must therefore not branch on
 allocation success and expect backend-identical behaviour.
 
 No garbage collector and no hidden allocations beyond what you `alloc_*`: *named* allocator

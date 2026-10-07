@@ -1256,7 +1256,7 @@ mod tests {
         // `mem2reg_promotes_an_inlined_callees_pointer_parameter` (inlining splices a callee's
         // `alloca ptr` into the middle of a caller block), plus
         // `mem2reg_ptr_promotion_keeps_the_pointee_in_memory` and
-        // `mem2reg_leaves_a_late_initialized_pointer_slot_in_memory` for its refusal cases.
+        // `mem2reg_promotes_a_late_initialized_pointer_slot_to_null_on_the_uninit_path`.
         //
         // The data-dependent branch keeps every elementwise recognizer from firing, so this is
         // general code, not a dispatched kernel.
@@ -1358,13 +1358,14 @@ mod tests {
     }
 
     #[test]
-    fn mem2reg_leaves_a_late_initialized_pointer_slot_in_memory() {
+    fn mem2reg_promotes_a_late_initialized_pointer_slot_to_null_on_the_uninit_path() {
         // A pointer slot first written *outside* the entry block can be read before it is written
-        // on some path. Promotion would have to materialize an "undefined" pointer, and there is no
-        // sound one: `inttoptr 0` is null natively but a valid, addressable slot in the interpreter.
-        // Mem2Reg must leave such a slot in memory. Here `p`'s store is inside the loop body, so
-        // the entry block never initializes it. Later CSE can forward the body-local load from
-        // that store and DSE/DCE can remove the unread slot without inventing a pointer value.
+        // on some path, so promoting it needs a value for "not yet written". That value used to be
+        // unsound: `inttoptr 0` is null natively but was the interpreter's first live allocation,
+        // so this slot had to stay in memory and be re-loaded on every use. The interpreter now
+        // reserves slot 0 as null (`wukong_interp::NULL_SLOT`), so the uninitialized path gets the
+        // same null on both backends and the slot is promoted by mem2reg itself. Here `p`'s store
+        // is inside the loop body, so the loop header merges the null with the body's `&mut a`.
         let src = "fn main() -> i32 { let mut a: i32 = 5; let mut t: i32 = 0; \
                    let mut i: i32 = 0; \
                    while i < 3 { let p: *mut i32 = &mut a; t = t + *p; i = i + 1; } \
@@ -1375,25 +1376,90 @@ mod tests {
         }
         let (slots, _) = count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main"));
         assert_eq!(
-            slots, 1,
-            "a late-initialized pointer slot must stay in memory"
+            slots, 0,
+            "a late-initialized pointer slot must be promoted, with null on the unwritten path"
         );
+        let has_null = find_fn(&prog, &interner, "main")
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| {
+                matches!(
+                    i.op,
+                    wukong_mir::Op::Cast(
+                        wukong_mir::CastKind::IntToPtr,
+                        _,
+                        wukong_mir::MirType::Ptr
+                    )
+                )
+            });
+        assert!(has_null, "the read-before-write path must see `inttoptr 0`");
         for f in &prog.funcs {
             assert!(wukong_mir::verify::verify_function(f).is_empty());
         }
         let main = interner.intern("main");
         assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
-        // Retain the full-pipeline semantic check separately from the promotion invariant.
         optimize(&mut prog, 2);
         assert_eq!(
             count_ptr_slots_and_reloads(find_fn(&prog, &interner, "main")),
             (0, 0),
-            "forwarded pointer stores and reloads should become dead"
+            "no pointer slot or reload may survive the full pipeline"
         );
         for f in &prog.funcs {
             assert!(wukong_mir::verify::verify_function(f).is_empty());
         }
         assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 15);
         assert_eq!(run_main_opt(src, 0), 15);
+    }
+
+    #[test]
+    fn pointer_conditions_are_null_tests_at_every_level() {
+        // `if p` on a pointer lowers to `ptrtoint p != 0`. The reproducer that forced the revert
+        // at 0900352 is the first case: the first local's address used to be interpreter slot 0
+        // and so read as null. A null from `0 as *T`, a conditionally assigned pointer (promoted
+        // by mem2reg with a null on the unassigned path) and `while p` are covered too.
+        // Expected values are the obvious scalar semantics: the address of a live local is
+        // non-null, `0 as *T` is null.
+        let cases = [
+            (
+                "fn main() -> i32 { let mut v: i32 = 7; let p: *mut i32 = &mut v; \
+              if p { return 1; } return 0; }",
+                1,
+            ),
+            (
+                "fn main() -> i32 { let q: *mut i32 = 0 as *mut i32; \
+              if q { return 1; } return 2; }",
+                2,
+            ),
+            (
+                "fn main() -> i32 { let mut v: i32 = 3; let mut n: i32 = 0; \
+              let mut p: *mut i32 = 0 as *mut i32; \
+              while n < 4 { if n == 2 { p = &mut v; } n = n + 1; } \
+              if p { return *p * 10; } return 0; }",
+                30,
+            ),
+            (
+                "fn main() -> i32 { let mut v: i32 = 3; let mut p: *mut i32 = &mut v; \
+              let mut k: i32 = 0; \
+              while p { k = k + 1; if k == 5 { p = 0 as *mut i32; } } return k; }",
+                5,
+            ),
+        ];
+        for (src, expect) in cases {
+            for lvl in [0, 1, 2, 3] {
+                assert_eq!(run_main_opt(src, lvl), expect, "level {lvl}: {src}");
+            }
+            let (mut prog, _) = lower(src);
+            for f in &prog.funcs {
+                assert!(
+                    wukong_mir::verify::verify_function(f).is_empty(),
+                    "-O0 MIR must verify: {src}"
+                );
+            }
+            optimize(&mut prog, 2);
+            for f in &prog.funcs {
+                assert!(wukong_mir::verify::verify_function(f).is_empty(), "{src}");
+            }
+        }
     }
 }
