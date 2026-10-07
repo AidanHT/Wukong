@@ -17,7 +17,8 @@
 //!    (`-O2`).
 //!  * **loop-delete** — remove a provably finite loop that has no observable effect, such as an
 //!    initialization loop dse emptied (`-O2`).
-//!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
+//!  * **licm** — hoist loop-invariant work into an existing preheader, including loads that run on
+//!    every iteration, behind a first-iteration guard (`-O2`).
 //!  * **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting a conditional
 //!    body to a lane mask), with the original loop kept as its scalar epilogue (`-O2`).
 //!
