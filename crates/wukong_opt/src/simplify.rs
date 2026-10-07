@@ -1,7 +1,5 @@
 //! Constant folding and algebraic simplification.
 
-use crate::fxhash::FxHashMap;
-
 use wukong_mir::{BinOp, CastKind, CmpOp, Function, MirType, Op, ValueId};
 
 use crate::{map_op_uses, map_term_uses, CfgAnalyses, Pass};
@@ -38,10 +36,12 @@ impl Pass for Simplify {
 
     fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
         // Rewrites operands and folds constants — never changes the block graph, so the CFG cache
-        // stays valid (untouched).
+        // stays valid (untouched). Both tables are dense over the value arena, as in `dce`: this
+        // pass creates no values, and a hash map keyed by a dense `u32` only added hashing.
         let mut changed = false;
-        let mut consts: FxHashMap<u32, CV> = FxHashMap::default();
-        let mut subst: FxHashMap<u32, ValueId> = FxHashMap::default();
+        let mut consts: Vec<Option<CV>> = vec![None; f.value_types.len()];
+        let mut subst: Vec<Option<ValueId>> = vec![None; f.value_types.len()];
+        let mut any_subst = false;
 
         let nblocks = f.blocks.len();
         for bi in 0..nblocks {
@@ -49,7 +49,7 @@ impl Pass for Simplify {
             for ii in 0..ninsts {
                 // Rewrite operands through substitutions discovered so far. Skipped while `subst` is
                 // empty (the common early-pass case), where every rewrite is a no-op v -> v.
-                if !subst.is_empty() {
+                if any_subst {
                     let s = &subst;
                     map_op_uses(&mut f.blocks[bi].insts[ii].op, |v| resolve(s, v));
                 }
@@ -62,7 +62,7 @@ impl Pass for Simplify {
                 // in the arms that actually fold (below), not for every instruction.
                 let act = match &f.blocks[bi].insts[ii].op {
                     Op::ConstInt(v, _) => {
-                        consts.insert(res.0, CV::Int(*v));
+                        put(&mut consts, res, CV::Int(*v));
                         continue;
                     }
                     Op::ConstFloat(v, _) => {
@@ -70,7 +70,7 @@ impl Pass for Simplify {
                         // so it enters the fold chain at the right precision. (`rty` was per-inst on
                         // the language branch; main folds lazily, so read the result type here.)
                         let rty = f.value_types[res.0 as usize].clone();
-                        consts.insert(res.0, CV::Float(round_float_to_ty(*v, &rty)));
+                        put(&mut consts, res, CV::Float(round_float_to_ty(*v, &rty)));
                         continue;
                     }
                     Op::Bin(b, l, r) => Act::Bin(*b, *l, *r),
@@ -91,7 +91,7 @@ impl Pass for Simplify {
                         let taken = if a == b {
                             Some(a)
                         } else if f.value_types[c.0 as usize] == MirType::I1 {
-                            match consts.get(&c.0) {
+                            match get(&consts, c) {
                                 Some(CV::Int(0)) => Some(b),
                                 Some(CV::Int(1)) => Some(a),
                                 _ => None,
@@ -100,18 +100,18 @@ impl Pass for Simplify {
                             None
                         };
                         if let Some(v) = taken {
-                            subst.insert(res.0, v);
+                            any_subst |= put(&mut subst, res, v);
                             changed = true;
                         }
                     }
                     Act::Bin(b, l, r) => {
-                        let lc = consts.get(&l.0).copied();
-                        let rc = consts.get(&r.0).copied();
+                        let lc = get(&consts, l);
+                        let rc = get(&consts, r);
                         if let (Some(a), Some(c)) = (lc, rc) {
                             let rty = f.value_types[res.0 as usize].clone();
                             if let Some(folded) = fold_bin(b, a, c, &rty) {
                                 set_const(f, bi, ii, folded, &rty);
-                                consts.insert(res.0, folded);
+                                put(&mut consts, res, folded);
                                 changed = true;
                                 continue;
                             }
@@ -119,7 +119,7 @@ impl Pass for Simplify {
                         if let Some(alg) = algebra(b, l, lc, r, rc) {
                             match alg {
                                 Alg::Replace(v) => {
-                                    subst.insert(res.0, v);
+                                    any_subst |= put(&mut subst, res, v);
                                     changed = true;
                                 }
                                 Alg::Const(cv) => {
@@ -132,7 +132,7 @@ impl Pass for Simplify {
                                     // fire), and declining the fold is correct and conservative.
                                     if !rty.is_vector() {
                                         set_const(f, bi, ii, cv, &rty);
-                                        consts.insert(res.0, cv);
+                                        put(&mut consts, res, cv);
                                         changed = true;
                                     }
                                 }
@@ -140,9 +140,7 @@ impl Pass for Simplify {
                         }
                     }
                     Act::Cmp(c, l, r) => {
-                        if let (Some(a), Some(bv)) =
-                            (consts.get(&l.0).copied(), consts.get(&r.0).copied())
-                        {
+                        if let (Some(a), Some(bv)) = (get(&consts, l), get(&consts, r)) {
                             // The operands share a type (you compare like-typed values); fold at
                             // that width so a high-bit-set constant compares the same as the runtime
                             // register. Without the width, a signed compare of an unsigned literal
@@ -157,7 +155,7 @@ impl Pass for Simplify {
                             if !matches!(oty, MirType::BF16 | MirType::F16) {
                                 let val = fold_cmp(c, a, bv, &oty);
                                 set_const(f, bi, ii, CV::Int(val), &MirType::I1);
-                                consts.insert(res.0, CV::Int(val));
+                                put(&mut consts, res, CV::Int(val));
                                 changed = true;
                             }
                         } else if l == r && !f.value_types[res.0 as usize].is_vector() {
@@ -167,39 +165,39 @@ impl Pass for Simplify {
                             // const this writes — decline it, as the `Alg::Const` arm does.
                             if let Some(val) = fold_cmp_self(c) {
                                 set_const(f, bi, ii, CV::Int(val), &MirType::I1);
-                                consts.insert(res.0, CV::Int(val));
+                                put(&mut consts, res, CV::Int(val));
                                 changed = true;
                             }
                         }
                     }
                     Act::Neg(v) => {
-                        if let Some(cv) = consts.get(&v.0).copied() {
+                        if let Some(cv) = get(&consts, v) {
                             let rty = f.value_types[res.0 as usize].clone();
                             let nv = match cv {
                                 CV::Int(i) => CV::Int(mask(i.wrapping_neg(), &rty)),
                                 CV::Float(fl) => CV::Float(round_float_to_ty(-fl, &rty)),
                             };
                             set_const(f, bi, ii, nv, &rty);
-                            consts.insert(res.0, nv);
+                            put(&mut consts, res, nv);
                             changed = true;
                         }
                     }
                     Act::Not(v) => {
-                        if let Some(CV::Int(i)) = consts.get(&v.0).copied() {
+                        if let Some(CV::Int(i)) = get(&consts, v) {
                             let rty = f.value_types[res.0 as usize].clone();
                             let nv = CV::Int(mask(!i, &rty));
                             set_const(f, bi, ii, nv, &rty);
-                            consts.insert(res.0, nv);
+                            put(&mut consts, res, nv);
                             changed = true;
                         }
                     }
                     Act::Cast(k, v) => {
-                        if let Some(CV::Int(i)) = consts.get(&v.0).copied() {
+                        if let Some(CV::Int(i)) = get(&consts, v) {
                             let from = f.value_types[v.0 as usize].clone();
                             let rty = f.value_types[res.0 as usize].clone();
                             if let Some(nv) = fold_int_cast(k, i, &from, &rty) {
                                 set_const(f, bi, ii, CV::Int(nv), &rty);
-                                consts.insert(res.0, CV::Int(nv));
+                                put(&mut consts, res, CV::Int(nv));
                                 changed = true;
                             }
                         }
@@ -211,8 +209,8 @@ impl Pass for Simplify {
                         // The front end emits one for every `[]T` slice access (`gep base, 0 : i8`
                         // reaching the fat pointer's data field), so this is the difference between
                         // a slice-typed loop and an array-typed loop having the same MIR.
-                        if matches!(consts.get(&index.0), Some(CV::Int(0))) {
-                            subst.insert(res.0, ptr);
+                        if matches!(get(&consts, index), Some(CV::Int(0))) {
+                            any_subst |= put(&mut subst, res, ptr);
                             changed = true;
                         }
                     }
@@ -220,7 +218,7 @@ impl Pass for Simplify {
             }
         }
 
-        if !subst.is_empty() {
+        if any_subst {
             for b in &mut f.blocks {
                 for inst in &mut b.insts {
                     map_op_uses(&mut inst.op, |v| resolve(&subst, v));
@@ -232,9 +230,25 @@ impl Pass for Simplify {
     }
 }
 
-fn resolve(subst: &FxHashMap<u32, ValueId>, v: ValueId) -> ValueId {
+/// Read a dense per-value table; an id outside the arena (malformed MIR) reads as absent.
+fn get<T: Copy>(table: &[Option<T>], v: ValueId) -> Option<T> {
+    table.get(v.0 as usize).copied().flatten()
+}
+
+/// Record `value` for `v`, returning whether it was stored (an id outside the arena is ignored).
+fn put<T>(table: &mut [Option<T>], v: ValueId, value: T) -> bool {
+    match table.get_mut(v.0 as usize) {
+        Some(slot) => {
+            *slot = Some(value);
+            true
+        }
+        None => false,
+    }
+}
+
+fn resolve(subst: &[Option<ValueId>], v: ValueId) -> ValueId {
     let mut cur = v;
-    while let Some(&next) = subst.get(&cur.0) {
+    while let Some(next) = get(subst, cur) {
         if next == cur {
             break;
         }

@@ -72,8 +72,8 @@ impl Pass for Dse {
         "dse"
     }
 
-    fn run_function(&self, f: &mut Function, _cache: &mut CfgAnalyses) -> bool {
-        let alias = AliasInfo::analyze(f);
+    fn run_function(&self, f: &mut Function, cache: &mut CfgAnalyses) -> bool {
+        let alias = cache.alias(f);
         let unread = unread_private_slots(f, &alias);
 
         let mut changed = false;

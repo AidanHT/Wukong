@@ -19,9 +19,25 @@
 //!
 //! The cache is created once per function by the pass manager and threaded through every pass; the
 //! passes that restructure the CFG are responsible for invalidating it (see their `run_function`).
+//!
+//! # Alias facts
+//!
+//! The cache also carries the function's [`AliasInfo`], which `cse`, `dse` and `licm` all consult.
+//! Unlike the CFG analyses it depends on *instructions*, so it is only valid until the next
+//! mutation of any kind. The pass manager knows exactly when that happens — a pass reports it — so
+//! the alias facts are shared only in a cache the manager drives ([`CfgAnalyses::managed`]): built
+//! on first request, dropped by [`CfgAnalyses::note_mutation`] after any pass that changed the
+//! function, and by [`CfgAnalyses::invalidate`] (pruning removes values). Within one sweep where
+//! the earlier memory passes find nothing to do, the later ones reuse the first one's facts instead
+//! of each re-running the provenance, constant and escape sweeps — the case the final, all-no-op
+//! confirmation sweep of every function always hits. A cache built by hand (a test, or a pass
+//! driven outside the manager) is unmanaged and recomputes on every request, exactly as before.
+
+use std::rc::Rc;
 
 use wukong_mir::Function;
 
+use crate::alias::AliasInfo;
 use crate::{cfg, dom};
 
 /// Lazily-computed, structurally-invalidated CFG/dominator analyses for one function. Opaque to
@@ -33,9 +49,21 @@ pub struct CfgAnalyses {
     idom: Option<Vec<u32>>,
     df: Option<Vec<Vec<u32>>>,
     children: Option<Vec<Vec<u32>>>,
+    /// Provenance facts, retained only in a managed cache (see the module note).
+    alias: Option<Rc<AliasInfo>>,
+    managed: bool,
 }
 
 impl CfgAnalyses {
+    /// A cache driven by the pass manager, which reports every mutation through
+    /// [`CfgAnalyses::note_mutation`] and may therefore share instruction-level facts across passes.
+    pub(crate) fn managed() -> CfgAnalyses {
+        CfgAnalyses {
+            managed: true,
+            ..CfgAnalyses::default()
+        }
+    }
+
     /// Drop every cached analysis. Must be called after any mutation that changes the block set or
     /// a terminator's successor edges (pruning that removed blocks, a `cond_br` folded to a `br`, a
     /// straight-line block merge). Cheap when already empty.
@@ -45,6 +73,25 @@ impl CfgAnalyses {
         self.idom = None;
         self.df = None;
         self.children = None;
+        self.alias = None;
+    }
+
+    /// A pass changed the function's instructions: instruction-level facts are stale. The CFG
+    /// analyses stay — a pass that changed edges has already called [`CfgAnalyses::invalidate`].
+    pub(crate) fn note_mutation(&mut self) {
+        self.alias = None;
+    }
+
+    /// The function's alias facts. Shared across passes in a managed cache until the next mutation;
+    /// computed afresh on every call otherwise. Returned by `Rc` so the caller holds no borrow of the
+    /// cache while it also asks for dominators.
+    pub(crate) fn alias(&mut self, f: &Function) -> Rc<AliasInfo> {
+        if !self.managed {
+            return Rc::new(AliasInfo::analyze(f));
+        }
+        self.alias
+            .get_or_insert_with(|| Rc::new(AliasInfo::analyze(f)))
+            .clone()
     }
 
     fn ensure_preds(&mut self, f: &Function) {
@@ -126,5 +173,39 @@ impl CfgAnalyses {
         self.ensure_df(f);
         self.ensure_children(f);
         (self.df.as_ref().unwrap(), self.children.as_ref().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wukong_mir::{Builder, MirType, Op};
+    use wukong_span::Interner;
+
+    #[test]
+    fn alias_facts_are_shared_only_inside_a_managed_cache_and_until_a_mutation() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("f"), MirType::I64);
+        let slot = b.alloca(MirType::I64);
+        let v = b.build(MirType::I64, Op::Load(slot, MirType::I64));
+        b.ret(Some(v));
+        let f = b.finish();
+
+        let mut managed = CfgAnalyses::managed();
+        let first = managed.alias(&f);
+        assert!(Rc::ptr_eq(&first, &managed.alias(&f)), "reused while clean");
+        managed.note_mutation();
+        let second = managed.alias(&f);
+        assert!(!Rc::ptr_eq(&first, &second), "a mutation drops the facts");
+        managed.invalidate();
+        assert!(
+            !Rc::ptr_eq(&second, &managed.alias(&f)),
+            "so does a CFG change"
+        );
+
+        // A hand-driven cache cannot know when its function changed: never share.
+        let mut unmanaged = CfgAnalyses::default();
+        let a = unmanaged.alias(&f);
+        assert!(!Rc::ptr_eq(&a, &unmanaged.alias(&f)));
     }
 }

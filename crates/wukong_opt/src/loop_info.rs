@@ -763,15 +763,16 @@ pub enum MemDep {
 #[derive(Clone, Debug)]
 pub struct DepSummary {
     pub memory: MemDep,
-    /// A short human-readable justification, for the dump.
-    pub reason: String,
+    /// A short human-readable justification, for the dump. Always a literal: every forest rebuild
+    /// constructs one per loop, and the production compile never reads it.
+    pub reason: &'static str,
 }
 
 impl Default for DepSummary {
     fn default() -> DepSummary {
         DepSummary {
             memory: MemDep::Carried,
-            reason: "not analyzed".to_string(),
+            reason: "not analyzed",
         }
     }
 }
@@ -1781,9 +1782,9 @@ fn classify_carried(
 /// [`MemDep::IndependentIfBasesDisjoint`] instead of failing it — see that variant for the
 /// obligation that creates.
 fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> DepSummary {
-    let carried = |why: &str| DepSummary {
+    let carried = |why: &'static str| DepSummary {
         memory: MemDep::Carried,
-        reason: why.to_string(),
+        reason: why,
     };
     // A call may read or write anything, and `VecKernelCall` writes through its output streams.
     for &b in &l.blocks {
@@ -1851,12 +1852,12 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
     DepSummary {
         memory,
         reason: match memory {
-            MemDep::Independent => "every conflicting pair is provably independent".into(),
+            MemDep::Independent => "every conflicting pair is provably independent",
             MemDep::IndependentIfBasesStable => {
-                "independent, assuming a re-loaded base pointer does not change".into()
+                "independent, assuming a re-loaded base pointer does not change"
             }
             MemDep::IndependentIfBasesDisjoint => {
-                "independent if unrelated bases are equal or disjoint (runtime check owed)".into()
+                "independent if unrelated bases are equal or disjoint (runtime check owed)"
             }
             MemDep::Carried => unreachable!(),
         },

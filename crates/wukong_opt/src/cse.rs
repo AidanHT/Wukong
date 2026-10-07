@@ -40,6 +40,9 @@ use crate::{cfg, map_op_uses, map_term_uses, CfgAnalyses, Pass};
 /// keep working), which only costs optimization, never correctness.
 const MAX_TRACKED_LOCATIONS: usize = 256;
 
+/// "No rewrite" in the dense rewrite table.
+const NO_REWRITE: u32 = u32::MAX;
+
 pub struct Cse;
 
 impl Pass for Cse {
@@ -54,8 +57,9 @@ impl Pass for Cse {
             cfg::prune_unreachable(f);
             cache.invalidate(); // pruning renumbered blocks
         }
+        // Taken before the dominator borrows below: an `Rc`, so it borrows nothing.
+        let alias = cache.alias(f);
         let (children, preds) = cache.children_and_preds(f);
-        let alias = AliasInfo::analyze(f);
 
         let mut cx = Numbering {
             f,
@@ -63,12 +67,14 @@ impl Pass for Cse {
             preds,
             alias: &alias,
             vn: FxHashMap::default(),
-            rewrite: FxHashMap::default(),
+            rewrite: vec![NO_REWRITE; f.value_types.len()],
+            rewrites: 0,
+            types: TyIds::default(),
         };
         cx.visit(f.entry.0, FxHashMap::default());
-        let rewrite = cx.rewrite;
+        let (rewrite, rewrites) = (cx.rewrite, cx.rewrites);
 
-        if rewrite.is_empty() {
+        if rewrites == 0 {
             return false;
         }
         for b in &mut f.blocks {
@@ -90,8 +96,13 @@ struct Numbering<'a> {
     alias: &'a AliasInfo,
     /// pure-op key -> canonical value id, scoped to the current dominator-tree path.
     vn: FxHashMap<Key, u32>,
-    /// value id -> the value it is replaced by (load forwards and CSE rewrites).
-    rewrite: FxHashMap<u32, u32>,
+    /// value id -> the value it is replaced by (load forwards and CSE rewrites), dense over the
+    /// value arena with [`NO_REWRITE`] for "kept". A target is always a value that was already
+    /// visited and kept, so it is final when recorded: every chain is one step long.
+    rewrite: Vec<u32>,
+    rewrites: usize,
+    /// Interned key types (see [`TyId`]).
+    types: TyIds,
 }
 
 /// State suspended while a dominator child's subtree is numbered. Keep pending siblings in
@@ -104,13 +115,76 @@ struct Scope {
     added_start: usize,
 }
 
+/// A [`MirType`] folded into one word, so a key is `Copy` and building or probing one never clones a
+/// boxed element type (`Vec`/`Array` types carry a `Box`). Scalars, and vectors or arrays of
+/// scalars — every type value numbering meets in practice — encode directly; anything nested
+/// deeper is interned per pass run. Equal types always map to equal ids and distinct types to
+/// distinct ids, so keys compare exactly as the `MirType`s they replace.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TyId(u64);
+
+#[derive(Default)]
+struct TyIds {
+    nested: FxHashMap<MirType, u64>,
+}
+
+/// A scalar type's code; `None` for `Vec`/`Array`.
+fn scalar_code(ty: &MirType) -> Option<u64> {
+    Some(match ty {
+        MirType::I1 => 1,
+        MirType::I8 => 2,
+        MirType::I16 => 3,
+        MirType::I32 => 4,
+        MirType::I64 => 5,
+        MirType::F16 => 6,
+        MirType::BF16 => 7,
+        MirType::F32 => 8,
+        MirType::F64 => 9,
+        MirType::Ptr => 10,
+        MirType::Void => 11,
+        MirType::Vec(..) | MirType::Array(..) => return None,
+    })
+}
+
+impl TyIds {
+    /// Bits 62-63 tag the form (scalar, vector-of-scalar, array-of-scalar, interned); a direct
+    /// encoding keeps the element code in bits 32-35 and the length in bits 0-31.
+    fn id(&mut self, ty: &MirType) -> TyId {
+        if let Some(code) = scalar_code(ty) {
+            return TyId(code);
+        }
+        match ty {
+            MirType::Vec(elem, n) => {
+                if let Some(code) = scalar_code(elem) {
+                    return TyId((1 << 62) | (code << 32) | u64::from(*n));
+                }
+            }
+            MirType::Array(elem, n) => {
+                if let Some(code) = scalar_code(elem) {
+                    return TyId((2 << 62) | (code << 32) | u64::from(*n));
+                }
+            }
+            _ => {}
+        }
+        if let Some(&id) = self.nested.get(ty) {
+            return TyId((3 << 62) | id);
+        }
+        let id = self.nested.len() as u64;
+        self.nested.insert(ty.clone(), id);
+        TyId((3 << 62) | id)
+    }
+}
+
 /// One tracked memory location: an SSA address value plus the type read/written there. The type is
 /// part of the key because a `store f32` and a `load i32` at one address are not the same value —
-/// keying on the address alone would forward the raw bits of one as the other.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// keying on the address alone would forward the raw bits of one as the other. `bytes` is the
+/// access width that type implies (a function of `ty`, so it adds no distinction), kept here so an
+/// invalidating store can ask the alias analysis without recovering the `MirType`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct MemKey {
     addr: u32,
-    ty: MirType,
+    ty: TyId,
+    bytes: u32,
 }
 
 /// May a load or store of `ty` participate in forwarding at all?
@@ -126,32 +200,31 @@ fn forwardable(ty: &MirType) -> bool {
 /// A typed value-numbering key for a pure op. One variant per cacheable `Op`, carrying its
 /// discriminant, operands mapped through prior rewrites, immediate values, and every type that
 /// cannot be recovered from the operands. In particular a splat needs its result vector type.
-/// `Eq`/`Hash` are derived and no textual key is built. Scalar types need no allocation; cloning
-/// `Vec`/`Array` types still copies their boxed element type.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// `Eq`/`Hash` are derived and no textual key is built; types are [`TyId`]s, so a key is `Copy`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Key {
-    ConstInt(i128, MirType),
+    ConstInt(i128, TyId),
     /// Float immediate keyed by its raw bits (matches the old `x.to_bits()`), so `-0.0`/`NaN`
     /// payloads stay distinct exactly as before.
-    ConstFloat(u64, MirType),
+    ConstFloat(u64, TyId),
     Bin(u8, u32, u32),
     /// Vector comparisons may have different mask element types for the same operands and lane
     /// count. Keep the result type so a comparison never substitutes a differently typed mask.
-    Cmp(u8, u32, u32, MirType),
+    Cmp(u8, u32, u32, TyId),
     Neg(u32),
     Not(u32),
-    Cast(u8, u32, MirType),
+    Cast(u8, u32, TyId),
     Select(u32, u32, u32),
-    Gep(u32, u32, MirType),
+    Gep(u32, u32, TyId),
     FuncAddr(u32),
     GlobalAddr(u32),
     /// The scalar operand does not encode the destination lane count. Two splats of one value
     /// into different vector widths are distinct computations even in the same dominator scope.
-    Splat(u32, MirType),
+    Splat(u32, TyId),
     ExtractLane(u32, u32),
     /// Keyed by the whole vector type: `iota <4 x i32>` and `iota <2 x i64>` are different
     /// constants, and only the type distinguishes them (the op has no operands).
-    Iota(MirType),
+    Iota(TyId),
     Fma(u32, u32, u32),
     Sqrt(u32),
     Round(u8, u32),
@@ -188,28 +261,43 @@ impl Numbering<'_> {
         }
     }
 
+    fn resolve(&self, v: ValueId) -> u32 {
+        resolve(&self.rewrite, v.0)
+    }
+
+    fn set_rewrite(&mut self, v: ValueId, to: u32) {
+        if let Some(slot) = self.rewrite.get_mut(v.0 as usize) {
+            *slot = to;
+            self.rewrites += 1;
+        }
+    }
+
+    fn mem_key(&mut self, addr: u32, ty: &MirType) -> MemKey {
+        MemKey {
+            addr,
+            ty: self.types.id(ty),
+            bytes: type_bytes(ty).unwrap_or(u32::MAX),
+        }
+    }
+
     fn enter(&mut self, blk: u32, mut mem: FxHashMap<MemKey, u32>, added: &mut Vec<Key>) -> Scope {
         let added_start = added.len();
-        for inst in &self.f.blocks[blk as usize].insts {
+        let f = self.f;
+        for inst in &f.blocks[blk as usize].insts {
             match &inst.op {
                 Op::Alloca {
                     ty: _,
                     space: wukong_mir::AddrSpace::Local,
                 } => {}
                 Op::Load(ptr, ty) => {
-                    let p = resolve(&self.rewrite, ptr.0);
+                    let p = self.resolve(*ptr);
                     let Some(res) = inst.result else { continue };
                     if !forwardable(ty) {
                         continue;
                     }
-                    let key = MemKey {
-                        addr: p,
-                        ty: ty.clone(),
-                    };
+                    let key = self.mem_key(p, ty);
                     match mem.get(&key) {
-                        Some(&v) => {
-                            self.rewrite.insert(res.0, v);
-                        }
+                        Some(&v) => self.set_rewrite(res, v),
                         None if mem.len() < MAX_TRACKED_LOCATIONS => {
                             mem.insert(key, res.0);
                         }
@@ -217,41 +305,36 @@ impl Numbering<'_> {
                     }
                 }
                 Op::Store { ptr, value } => {
-                    let p = resolve(&self.rewrite, ptr.0);
-                    let v = resolve(&self.rewrite, value.0);
-                    let sty = self.f.value_type(*value).clone();
-                    let sbytes = AliasInfo::access_bytes(self.f, &inst.op).unwrap_or(u32::MAX);
+                    let p = self.resolve(*ptr);
+                    let v = self.resolve(*value);
+                    let sty = f.value_type(*value);
+                    let sbytes = AliasInfo::access_bytes(f, &inst.op).unwrap_or(u32::MAX);
                     // Forget exactly the locations this store may have written.
+                    let alias = self.alias;
                     mem.retain(|k, _| {
-                        !self.alias.may_alias_sized(
-                            ValueId(k.addr),
-                            type_bytes(&k.ty).unwrap_or(u32::MAX),
-                            ValueId(p),
-                            sbytes,
-                        )
+                        !alias.may_alias_sized(ValueId(k.addr), k.bytes, ValueId(p), sbytes)
                     });
-                    if forwardable(&sty) && mem.len() < MAX_TRACKED_LOCATIONS {
-                        mem.insert(MemKey { addr: p, ty: sty }, v);
+                    if forwardable(sty) && mem.len() < MAX_TRACKED_LOCATIONS {
+                        let key = self.mem_key(p, sty);
+                        mem.insert(key, v);
                     }
                 }
                 Op::Call { .. } | Op::VecKernelCall { .. } => {
                     // A call (or vector kernel) may store through any pointer it was given, or any
                     // pointer reachable from one — but never into a stack slot of *this* function
                     // whose address never escaped.
-                    mem.retain(|k, _| self.alias.is_private_stack(ValueId(k.addr)));
+                    let alias = self.alias;
+                    mem.retain(|k, _| alias.is_private_stack(ValueId(k.addr)));
                 }
                 _ => {
                     let Some(res) = inst.result else { continue };
-                    let Some(key) = pure_key(&inst.op, self.f.value_type(res), &self.rewrite)
-                    else {
+                    let Some(key) = self.pure_key(&inst.op, f.value_type(res)) else {
                         continue;
                     };
                     match self.vn.get(&key) {
-                        Some(&canon) => {
-                            self.rewrite.insert(res.0, canon);
-                        }
+                        Some(&canon) => self.set_rewrite(res, canon),
                         None => {
-                            self.vn.insert(key.clone(), res.0);
+                            self.vn.insert(key, res.0);
                             added.push(key);
                         }
                     }
@@ -273,72 +356,82 @@ impl Numbering<'_> {
             added_start,
         }
     }
+
+    /// A canonical [`Key`] for a pure op, operands mapped through prior rewrites so equal
+    /// computations hash identically. Returns `None` for impure/uncacheable ops (handled
+    /// separately). The op sub-kinds (`BinOp`/`CmpOp`/`CastKind`/`RoundMode`) are fieldless C-like
+    /// enums; `as u8` is their stable discriminant, which distinguishes the same variants the old
+    /// `{:?}` did.
+    fn pure_key(&mut self, op: &Op, result_ty: &MirType) -> Option<Key> {
+        let rw = &self.rewrite;
+        let m = |v: ValueId| -> u32 { resolve(rw, v.0) };
+        Some(match op {
+            Op::ConstInt(n, ty) => Key::ConstInt(*n, self.types.id(ty)),
+            Op::ConstFloat(x, ty) => Key::ConstFloat(x.to_bits(), self.types.id(ty)),
+            Op::Bin(o, a, b) => {
+                let (mut a, mut b) = (m(*a), m(*b));
+                // Wrapping integer addition/multiplication and bitwise operations commute at every
+                // scalar and vector lane width. Canonicalize only their lookup key, retaining the
+                // first dominating computation's operand order in the emitted MIR. Floating-point
+                // arithmetic is deliberately excluded: swapping NaN operands may change payloads.
+                if matches!(
+                    o,
+                    BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor
+                ) && a > b
+                {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                Key::Bin(*o as u8, a, b)
+            }
+            Op::Cmp(o, a, b) => {
+                let (mut a, mut b) = (m(*a), m(*b));
+                if matches!(o, CmpOp::Eq | CmpOp::Ne) && a > b {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                Key::Cmp(*o as u8, a, b, self.types.id(result_ty))
+            }
+            Op::Neg(a) => Key::Neg(m(*a)),
+            Op::Not(a) => Key::Not(m(*a)),
+            Op::Cast(k, a, ty) => {
+                let a = m(*a);
+                Key::Cast(*k as u8, a, self.types.id(ty))
+            }
+            Op::Select(c, a, b) => Key::Select(m(*c), m(*a), m(*b)),
+            Op::Gep { ptr, index, elem } => {
+                let (ptr, index) = (m(*ptr), m(*index));
+                Key::Gep(ptr, index, self.types.id(elem))
+            }
+            Op::FuncAddr(s) => Key::FuncAddr(s.0),
+            Op::GlobalAddr(s) => Key::GlobalAddr(s.0),
+            Op::Splat(a) => {
+                let a = m(*a);
+                Key::Splat(a, self.types.id(result_ty))
+            }
+            Op::ExtractLane(a, k) => Key::ExtractLane(m(*a), *k),
+            Op::Iota(ty) => Key::Iota(self.types.id(ty)),
+            Op::Fma(a, b, c) => Key::Fma(m(*a), m(*b), m(*c)),
+            Op::Sqrt(a) => Key::Sqrt(m(*a)),
+            Op::Round(mode, a) => Key::Round(*mode as u8, m(*a)),
+            Op::Load(..)
+            | Op::Store { .. }
+            | Op::Call { .. }
+            | Op::VecKernelCall { .. }
+            | Op::Alloca { .. }
+            | Op::Barrier => return None,
+        })
+    }
 }
 
-/// Follow rewrite chains (`a -> b -> c`) to the final target.
-fn resolve(rewrite: &FxHashMap<u32, u32>, mut v: u32) -> u32 {
-    let mut guard = 0;
-    while let Some(&n) = rewrite.get(&v) {
-        if n == v || guard > 10_000 {
-            break;
+/// Follow the rewrite table to the final target. Targets are final when recorded (see
+/// [`Numbering::rewrite`]), so this is one lookup; the bound only guards a malformed chain.
+fn resolve(rewrite: &[u32], mut v: u32) -> u32 {
+    for _ in 0..rewrite.len() {
+        match rewrite.get(v as usize) {
+            Some(&n) if n != NO_REWRITE && n != v => v = n,
+            _ => break,
         }
-        v = n;
-        guard += 1;
     }
     v
-}
-
-/// A canonical [`Key`] for a pure op, operands mapped through prior rewrites so equal
-/// computations hash identically. Returns `None` for impure/uncacheable ops (handled separately).
-/// The op sub-kinds (`BinOp`/`CmpOp`/`CastKind`/`RoundMode`) are fieldless C-like enums; `as u8`
-/// is their stable discriminant, which distinguishes the same variants the old `{:?}` did.
-fn pure_key(op: &Op, result_ty: &MirType, rewrite: &FxHashMap<u32, u32>) -> Option<Key> {
-    let m = |v: ValueId| -> u32 { resolve(rewrite, v.0) };
-    Some(match op {
-        Op::ConstInt(n, ty) => Key::ConstInt(*n, ty.clone()),
-        Op::ConstFloat(x, ty) => Key::ConstFloat(x.to_bits(), ty.clone()),
-        Op::Bin(o, a, b) => {
-            let (mut a, mut b) = (m(*a), m(*b));
-            // Wrapping integer addition/multiplication and bitwise operations commute at every
-            // scalar and vector lane width. Canonicalize only their lookup key, retaining the
-            // first dominating computation's operand order in the emitted MIR. Floating-point
-            // arithmetic is deliberately excluded: swapping NaN operands may change payloads.
-            if matches!(
-                o,
-                BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor
-            ) && a > b
-            {
-                std::mem::swap(&mut a, &mut b);
-            }
-            Key::Bin(*o as u8, a, b)
-        }
-        Op::Cmp(o, a, b) => {
-            let (mut a, mut b) = (m(*a), m(*b));
-            if matches!(o, CmpOp::Eq | CmpOp::Ne) && a > b {
-                std::mem::swap(&mut a, &mut b);
-            }
-            Key::Cmp(*o as u8, a, b, result_ty.clone())
-        }
-        Op::Neg(a) => Key::Neg(m(*a)),
-        Op::Not(a) => Key::Not(m(*a)),
-        Op::Cast(k, a, ty) => Key::Cast(*k as u8, m(*a), ty.clone()),
-        Op::Select(c, a, b) => Key::Select(m(*c), m(*a), m(*b)),
-        Op::Gep { ptr, index, elem } => Key::Gep(m(*ptr), m(*index), elem.clone()),
-        Op::FuncAddr(s) => Key::FuncAddr(s.0),
-        Op::GlobalAddr(s) => Key::GlobalAddr(s.0),
-        Op::Splat(a) => Key::Splat(m(*a), result_ty.clone()),
-        Op::ExtractLane(a, k) => Key::ExtractLane(m(*a), *k),
-        Op::Iota(ty) => Key::Iota(ty.clone()),
-        Op::Fma(a, b, c) => Key::Fma(m(*a), m(*b), m(*c)),
-        Op::Sqrt(a) => Key::Sqrt(m(*a)),
-        Op::Round(mode, a) => Key::Round(*mode as u8, m(*a)),
-        Op::Load(..)
-        | Op::Store { .. }
-        | Op::Call { .. }
-        | Op::VecKernelCall { .. }
-        | Op::Alloca { .. }
-        | Op::Barrier => return None,
-    })
 }
 
 #[cfg(test)]
@@ -595,5 +688,54 @@ mod tests {
             reload_survives,
             "the reload after the scalar store must not be forwarded to the pre-store value"
         );
+    }
+
+    /// Keys carry folded type ids instead of `MirType`s. Equal types must still collide and
+    /// distinct ones must not — including a vector width the operand cannot encode and an element
+    /// type nested too deeply for the direct encoding.
+    #[test]
+    fn type_keyed_values_merge_only_at_identical_types() {
+        let mut it = Interner::new();
+        let v4 = MirType::Vec(Box::new(MirType::F32), 4);
+        let v8 = MirType::Vec(Box::new(MirType::F32), 8);
+        let nested = |n| MirType::Array(Box::new(MirType::Array(Box::new(MirType::I8), 4)), n);
+        let mut b = Builder::new(it.intern("t"), MirType::Void);
+        let x = b.add_param(MirType::F32);
+        let base = b.add_param(MirType::Ptr);
+        let i = b.add_param(MirType::I64);
+        let s4a = b.build(v4.clone(), Op::Splat(x));
+        let s4b = b.build(v4.clone(), Op::Splat(x));
+        let s8 = b.build(v8.clone(), Op::Splat(x));
+        let gep = |b: &mut Builder, elem: MirType| {
+            b.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: base,
+                    index: i,
+                    elem,
+                },
+            )
+        };
+        let g2a = gep(&mut b, nested(2));
+        let g2b = gep(&mut b, nested(2));
+        let g3 = gep(&mut b, nested(3));
+        let sink = it.intern("sink");
+        b.build_void(Op::Call {
+            func: sink,
+            args: vec![s4a, s4b, s8, g2a, g2b, g3],
+        });
+        b.ret(None);
+        let mut f = b.finish();
+        assert!(Cse.run_function(&mut f, &mut CfgAnalyses::default()));
+        let args = f.blocks[0]
+            .insts
+            .iter()
+            .find_map(|inst| match &inst.op {
+                Op::Call { args, .. } => Some(args.clone()),
+                _ => None,
+            })
+            .expect("the call survives");
+        assert_eq!(args, vec![s4a, s4a, s8, g2a, g2a, g3]);
+        assert!(wukong_mir::verify::verify_function(&f).is_empty());
     }
 }

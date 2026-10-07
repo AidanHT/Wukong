@@ -233,8 +233,10 @@ impl PassManager {
         // One analysis cache per function, shared across every pass and every fixpoint iteration.
         // It is invalidated by the passes that restructure the CFG (see their `run_function`), so it
         // stays valid — and reused — across the long tail of the fixpoint where only instructions
-        // move. The cache never changes what a pass computes, only how often it recomputes it.
-        let mut cache = CfgAnalyses::default();
+        // move. The cache never changes what a pass computes, only how often it recomputes it. It is
+        // *managed*: every reported mutation is passed on below, which is what lets it hand one
+        // function's alias facts to several memory passes in a row.
+        let mut cache = CfgAnalyses::managed();
         // Fixpoint with per-pass clean-tracking. A pass is a *deterministic* function of the MIR, so a
         // pass that ran and reported "no change" cannot do anything until some OTHER pass mutates the
         // function — re-running it on identical MIR would again be a no-op. We therefore skip
@@ -262,6 +264,7 @@ impl PassManager {
                 };
                 if did {
                     changed = true;
+                    cache.note_mutation();
                     // A mutation may have created work for every pass again (including earlier ones
                     // already run this sweep, and `p` itself). Re-dirty all; they re-run next sweep.
                     clean.iter_mut().for_each(|c| *c = false);

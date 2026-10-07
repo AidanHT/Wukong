@@ -58,7 +58,7 @@ impl Pass for Licm {
         if f.blocks.len() < 2 {
             return false;
         }
-        let alias = AliasInfo::analyze(f);
+        let alias = cache.alias(f);
         // `idom`/`preds` borrow the cache; `hoist_from_loop` mutates `f` (a different object), so
         // the two coexist for the whole loop.
         let (idom, preds) = cache.idoms_and_preds(f);
