@@ -5217,8 +5217,8 @@ mod tests {
                 );
             }
             assert_within_derived_bound(&got, &want, &growth, m, k, n, None, "sgemm_tn");
-            // Bit-exact against the NN kernel on a manually-transposed A — proves the only difference
-            // from the differential-contract kernel is the (deterministic) transpose prepass.
+            // Bit-exact against the NN kernel on a manually-transposed A — proves packing A straight
+            // from its [k, m] storage yields exactly the NN kernel's bytes and K order.
             let mut at = vec![0.0f32; m * k];
             for p in 0..k {
                 for i in 0..m {
