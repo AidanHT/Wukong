@@ -1282,6 +1282,59 @@ mod tests {
     }
 
     #[test]
+    fn the_post_unroll_cleanup_judges_callees_by_their_unrolled_bodies() {
+        // `tri` loops a constant five times, so before unrolling it might not return and the dead
+        // `tri(a)` in `main` has to stay. Complete unrolling leaves `tri` straight-line; the
+        // cleanup re-summarizes the program from the unrolled bodies, and `main` — changed by
+        // unrolling too, so cleaned up as well — then drops the dead call. Driven by hand, without
+        // the inliner, which would otherwise absorb `tri`.
+        //
+        // s runs x, 2x, 4x+1, 8x+4, 16x+11, 32x+26, so tri(4) = 154; x runs 1, 3, 10, 32, 99, 301.
+        let src = "fn tri(x: i64) -> i64 { let mut s: i64 = x; let mut k: i64 = 0; \
+                     while k < 5 { s = s * 2 + k; k = k + 1; } return s; } \
+                   fn main() -> i32 { let a: i64 = 3; let unused: i64 = tri(a); \
+                     let mut x: i64 = 1; let mut i: i64 = 0; \
+                     while i < 5 { x = x * 3 + i; i = i + 1; } \
+                     return (x + tri(a + 1)) as i32; }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 455, "level {lvl}");
+        }
+        let (mut prog, mut interner) = lower(src);
+        let tri = interner.intern("tri");
+        let main = interner.intern("main");
+        let calls_to_tri = |p: &Program| {
+            p.funcs
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.insts)
+                .filter(|i| matches!(i.op, Op::Call { func, .. } if func == tri))
+                .count()
+        };
+        PassManager::standard(2).run(&mut prog);
+        assert_eq!(
+            calls_to_tri(&prog),
+            2,
+            "a callee with a loop may not return, so the dead call stays"
+        );
+        let changed = unroll_program(&mut prog);
+        let index_of =
+            |name: wukong_span::Symbol| prog.funcs.iter().position(|f| f.name == name).unwrap();
+        assert!(
+            changed.contains(&index_of(tri)) && changed.contains(&index_of(main)),
+            "both loops must be unrolled completely: {changed:?}"
+        );
+        PassManager::unroll_cleanup().run_subset(&mut prog, &changed);
+        assert!(wukong_mir::verify::verify_program(&prog).is_empty());
+        assert_eq!(
+            calls_to_tri(&prog),
+            1,
+            "{}",
+            wukong_mir::print::print_program(&prog, &interner)
+        );
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 455);
+    }
+
+    #[test]
     fn a_short_constant_loop_is_unrolled_completely_and_folds_to_its_value() {
         // `x = x * 3 + k` five times: a recurrence no vectorizer or recognizer takes. With a known
         // trip count of 5 the unroller replaces the loop by its iterations, the cleanup merges the
