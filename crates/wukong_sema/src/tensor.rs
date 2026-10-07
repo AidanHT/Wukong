@@ -1021,5 +1021,14 @@ mod tests {
         );
         ok("fn take4(a: [f32; 4]) -> f32 { return a[3]; } \
             fn f(t: Tensor[f32, 2, 2]) -> f32 { return take4(t); }");
+        // A nested array parameter is the same row-major buffer, so a tensor must supply its
+        // scalar LEAVES (`[[f32; 3]; 2]` holds six `f32`s), not its outer length.
+        ok("fn take(a: [[f32; 3]; 2]) -> f32 { return a[1][2]; } \
+            fn f(t: Tensor[f32, 2, 3]) -> f32 { return take(t); }");
+        rejects(
+            "fn take(a: [[f32; 3]; 2]) -> f32 { return a[1][2]; } \
+             fn f(t: Tensor[f32, 7]) -> f32 { return take(t); }",
+            "E0501",
+        );
     }
 }

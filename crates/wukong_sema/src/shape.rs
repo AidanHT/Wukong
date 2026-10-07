@@ -927,21 +927,28 @@ impl Sema<'_> {
                         ),
                     );
                 }
-                if let Ty::Scalar(pe) = pe.as_ref() {
-                    if pe != ae {
-                        self.error(
-                            span,
-                            "E0502",
-                            format!(
-                                "tensor element type mismatch: expected `{}`, found `{}`",
-                                pe.name(),
-                                ae.name()
-                            ),
-                        );
-                    }
+                // A nested array (`[[f32; 3]; 2]`) is the same row-major buffer of scalar leaves, so
+                // the element and the count are its LEAVES' (`f32`, 6), not its outer element's; an
+                // array of non-scalar leaves (structs, tuples) holds nothing a tensor can, and stays
+                // on the lenient path it had.
+                let leaves =
+                    scalar_leaves(pe).and_then(|(s, n)| n.checked_mul(*pl).map(|c| (s, c)));
+                let Some((leaf, pl)) = leaves else {
+                    return;
+                };
+                if leaf != *ae {
+                    self.error(
+                        span,
+                        "E0502",
+                        format!(
+                            "tensor element type mismatch: expected `{}`, found `{}`",
+                            leaf.name(),
+                            ae.name()
+                        ),
+                    );
                 }
                 match Dim::product(&shape.0) {
-                    Ok(Dim::Const(n)) if n == *pl => {}
+                    Ok(Dim::Const(n)) if n == pl => {}
                     Ok(Dim::Dynamic) => {}
                     Ok(Dim::Const(n)) => self.error(
                         span,
@@ -1552,6 +1559,20 @@ impl Sema<'_> {
 
     pub(crate) fn dim_str(&self, d: &Dim) -> String {
         d.display(self.interner)
+    }
+}
+
+/// The scalar leaf type of a (possibly nested) fixed-size array element and how many leaves one
+/// element holds: `f32` is `(f32, 1)`, `[f32; 3]` is `(f32, 3)`. `None` for a non-scalar leaf or an
+/// overflowing count.
+fn scalar_leaves(t: &Ty) -> Option<(Scalar, u64)> {
+    match t {
+        Ty::Scalar(s) => Some((*s, 1)),
+        Ty::Array { elem, len, .. } => {
+            let (s, n) = scalar_leaves(elem)?;
+            Some((s, n.checked_mul(*len)?))
+        }
+        _ => None,
     }
 }
 
