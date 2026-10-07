@@ -22,10 +22,21 @@ pub fn print_program(p: &Program, interner: &Interner) -> String {
 /// Render a single function.
 pub fn print_function(f: &Function, interner: &Interner) -> String {
     let mut out = String::new();
+    // A `@noalias` promise is printed on the parameter it covers, so a dump shows which facts the
+    // optimizer was entitled to. Nothing is printed for a parameter that promises nothing, which
+    // keeps every pre-existing dump byte-identical.
     let params: Vec<String> = f
         .params
         .iter()
-        .map(|v| format!("{} {}", val(*v), f.value_type(*v).display()))
+        .enumerate()
+        .map(|(i, v)| {
+            let mark = if f.param_attr(i).noalias {
+                " noalias"
+            } else {
+                ""
+            };
+            format!("{} {}{}", val(*v), f.value_type(*v).display(), mark)
+        })
         .collect();
     out.push_str(&format!(
         "fn {}({}) -> {} {{\n",

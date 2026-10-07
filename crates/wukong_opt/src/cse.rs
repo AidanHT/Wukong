@@ -512,6 +512,7 @@ mod tests {
             value_types: vec![MirType::Ptr, v4, MirType::F32],
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         };
         assert!(
             wukong_mir::verify::verify_function(&f).is_empty(),
@@ -583,6 +584,7 @@ mod tests {
             value_types: vec![MirType::Ptr, v4.clone(), MirType::F32, v4],
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         };
         let mut cache = CfgAnalyses::default();
         Cse.run_function(&mut f, &mut cache);

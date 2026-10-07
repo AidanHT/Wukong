@@ -141,6 +141,27 @@ pub struct BasicBlock {
     pub term: Terminator,
 }
 
+/// What the source program states about one parameter's storage. Index-parallel to
+/// [`Function::params`]; see [`Function::param_attr`].
+///
+/// These are *facts the source promised*, not facts any pass proved, so the rule for every producer
+/// and consumer is the same: dropping an entry (or the whole vector) is always sound — it only
+/// forgets a promise — while inventing one is a miscompile. The interpreter ignores them entirely:
+/// the language's meaning of a program never depends on a promise, only what an optimizer may
+/// assume when the promise is kept.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ParamAttrs {
+    /// `@noalias` on the parameter: for the duration of the call, the storage it points into (for a
+    /// slice, both the 16-byte fat pointer and the elements it views) is accessed only through
+    /// pointers derived from this parameter. No other parameter, and nothing else the caller can
+    /// name, overlaps it. This is C's `restrict` / LLVM's `noalias` argument attribute.
+    pub noalias: bool,
+    /// The parameter is a `[]T` slice: its value points at the caller's 16-byte fat pointer (data
+    /// pointer at offset 0, `i64` length at offset 8), which is a live object for the whole call.
+    /// A slice's elements never overlap its own fat pointer.
+    pub slice: bool,
+}
+
 /// A function: a value arena (`ValueId -> MirType`), a list of blocks, and an entry.
 #[derive(Clone, Debug)]
 pub struct Function {
@@ -156,11 +177,29 @@ pub struct Function {
     /// interpreter marshals these lane-wise (the oracle); the Cranelift backend assembles each to
     /// raw AVX2 (`avx2.rs`). Empty for every function the vectorizer did not widen.
     pub vec_kernels: Vec<VecKernel>,
+    /// Per-parameter source facts, index-parallel to `params`. Usually empty: a missing entry means
+    /// [`ParamAttrs::default`], so read it through [`Function::param_attr`], never by indexing.
+    /// Set by `mir_build` from a `@noalias` parameter; consumed by `wukong_opt::alias` and the
+    /// backends' alias annotations.
+    pub param_attrs: Vec<ParamAttrs>,
 }
 
 impl Function {
     pub fn value_type(&self, v: ValueId) -> &MirType {
         &self.value_types[v.0 as usize]
+    }
+
+    /// The source facts for parameter number `i` (an index into `params`). A parameter with no
+    /// recorded entry — every parameter of a function nothing annotated — answers the default,
+    /// which promises nothing.
+    pub fn param_attr(&self, i: usize) -> ParamAttrs {
+        self.param_attrs.get(i).copied().unwrap_or_default()
+    }
+
+    /// Does any parameter carry a `@noalias` promise? The cheap gate every consumer checks first,
+    /// so a function without one pays nothing for the feature.
+    pub fn has_noalias_params(&self) -> bool {
+        self.param_attrs.iter().any(|a| a.noalias)
     }
 
     pub fn block(&self, b: BlockId) -> &BasicBlock {

@@ -1835,7 +1835,10 @@ fn dependence(ctx: &LoopCtx<'_>, l: &NaturalLoop, accesses: &[MemAccess]) -> Dep
                 }
                 continue;
             }
-            if distinct_allocas(ctx, ba, bb) {
+            // Distinct slots, or storage a `@noalias` parameter promised apart (`alias.rs`).
+            if distinct_allocas(ctx, ba, bb)
+                || crate::alias::promised_disjoint_membases(ctx.f, ba, bb)
+            {
                 continue;
             }
             needs_runtime_check = true;
@@ -2373,6 +2376,7 @@ mod tests {
             value_types,
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         }
     }
 

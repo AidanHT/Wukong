@@ -1,7 +1,8 @@
 //! A convenience builder for constructing MIR functions imperatively.
 
 use crate::{
-    AddrSpace, BasicBlock, BlockId, Function, Inst, MirType, Op, Terminator, ValueId, VecKernel,
+    AddrSpace, BasicBlock, BlockId, Function, Inst, MirType, Op, ParamAttrs, Terminator, ValueId,
+    VecKernel,
 };
 use wukong_span::Symbol;
 
@@ -16,6 +17,9 @@ pub struct Builder {
     current: BlockId,
     /// Synthesized 256-bit AVX2 vector kernels registered during lowering, in call-index order.
     vec_kernels: Vec<VecKernel>,
+    /// Per-parameter source facts, index-parallel to the entry block's parameters (shorter when the
+    /// trailing parameters carry none). Becomes [`Function::param_attrs`].
+    param_attrs: Vec<ParamAttrs>,
 }
 
 impl Builder {
@@ -28,6 +32,7 @@ impl Builder {
             entry: BlockId(0),
             current: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         };
         let entry = b.new_block();
         b.entry = entry;
@@ -97,6 +102,30 @@ impl Builder {
         let entry = self.entry;
         self.block_mut(entry).params.push(v);
         v
+    }
+
+    /// Record what the source states about the entry parameter `v` (see [`ParamAttrs`]). A value
+    /// that is not an entry parameter is ignored: the facts describe a caller-supplied pointer, and
+    /// nothing else has one.
+    pub fn set_param_attrs(&mut self, v: ValueId, attrs: ParamAttrs) {
+        let entry = self.entry.0 as usize;
+        let Some(i) = self.blocks[entry].params.iter().position(|&p| p == v) else {
+            return;
+        };
+        if self.param_attrs.len() <= i {
+            self.param_attrs.resize(i + 1, ParamAttrs::default());
+        }
+        self.param_attrs[i] = attrs;
+    }
+
+    /// The facts recorded for `v` when it is an entry parameter (the default when none were set),
+    /// and `None` when `v` is not an entry parameter at all.
+    pub fn param_attrs_of(&self, v: ValueId) -> Option<ParamAttrs> {
+        let i = self.blocks[self.entry.0 as usize]
+            .params
+            .iter()
+            .position(|&p| p == v)?;
+        Some(self.param_attrs.get(i).copied().unwrap_or_default())
     }
 
     /// Add a typed parameter to a block (an SSA merge point).
@@ -198,6 +227,7 @@ impl Builder {
             value_types: self.value_types,
             entry: self.entry,
             vec_kernels: self.vec_kernels,
+            param_attrs: self.param_attrs,
         }
     }
 }

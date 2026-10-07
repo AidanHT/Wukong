@@ -1787,7 +1787,12 @@ fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, MirType
             if ga.g.base.same_object(gb.g.base) {
                 return None;
             }
-            if distinct_alloca_pair(f, ga.g.base, gb.g.base) {
+            // Provably distinct objects need no range test: two slots, or storage a `@noalias`
+            // parameter promised apart (`alias.rs`) — which also spares a pair whose index the
+            // guard could not have expressed.
+            if distinct_alloca_pair(f, ga.g.base, gb.g.base)
+                || crate::alias::promised_disjoint_membases(f, ga.g.base, gb.g.base)
+            {
                 continue;
             }
             // The whole group's index must be `1·iv + invariants + k` for the touched range to be

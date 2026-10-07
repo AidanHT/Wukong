@@ -776,6 +776,7 @@ mod tests {
             value_types,
             entry: BlockId(0),
             vec_kernels: Vec::new(),
+            param_attrs: Vec::new(),
         }
     }
 

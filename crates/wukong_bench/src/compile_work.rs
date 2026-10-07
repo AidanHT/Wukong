@@ -289,6 +289,7 @@ fn placeholder_function(f: &wukong_mir::Function) -> wukong_mir::Function {
         value_types: Vec::new(),
         entry: f.entry,
         vec_kernels: Vec::new(),
+        param_attrs: Vec::new(),
     }
 }
 
