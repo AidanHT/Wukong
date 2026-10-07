@@ -92,10 +92,22 @@ pub(crate) fn fold2(a: f32, b: f32, op: i64) -> f32 {
     }
 }
 
-// Fixed chunk size in elements — independent of thread count, which is what makes the parallel
-// partial decomposition deterministic. 8192 f32 = 32 KB (an L1's worth) per chunk; at N=2^20 that is
-// 128 chunks, plenty for rayon work-stealing to balance the P+E hybrid, and the 128-entry partial
-// array combines in negligible time. Must stay constant for serial/parallel/interp to agree.
+// Fixed chunk size in elements: a NUMERICAL-CONTRACT constant, not a cache-tuning knob (P13.9).
+//
+// It defines the summation tree of every recognized f32/bf16/f16 reduction — partials per chunk,
+// folded in ascending chunk order — so it is fixed on every host, independent of thread count, and
+// it is what makes serial == parallel == interpreter. Changing it changes every such reduction's
+// low-order bits; like the vectorizer's reduction partition it may change only with a compiler
+// release, and the user-facing statement of it is the language guide's "Floating-point semantics".
+//
+// The old justification here, "8192 f32 = 32 KB, an L1's worth", was both inconsistent (gemm.rs
+// sizes its blocking for this host's 48 KB P-core L1D; 32 KB is the E-core L1D) and beside the
+// point: a streaming reduction reads each element exactly once, so whether a chunk fits in L1 buys
+// nothing. What the length does set is SCHEDULING — how many independent tasks exist (128 at
+// N = 2^20, ample for work-stealing across the P+E hybrid) and how long the partial array is — and
+// load balance can be retuned per host by changing how many fixed chunks one task claims, which
+// moves no bit. The elementwise maps' chunk constants (`velem::VCHUNK`, `vmath::VMATH_CHUNK`) are
+// the opposite case: a map has nothing to reassociate, so those are free scheduling knobs.
 // `pub(crate)` so the bf16/f16 parallel reductions in `lowp.rs` cut on the *same* fixed boundary.
 pub(crate) const RCHUNK: usize = 8192;
 
