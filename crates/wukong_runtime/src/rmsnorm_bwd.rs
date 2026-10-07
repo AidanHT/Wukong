@@ -20,12 +20,13 @@
 //!
 //! Each row needs **two reductions** — the mean-of-squares `Σ x_i^2` (exactly the RMSNorm *forward*
 //! reduction) and the gradient dot `s = Σ g_i x_i` — followed by a pure elementwise apply. Both
-//! reductions use the **identical fixed 8-lane accumulator + balanced horizontal combine** the
-//! forward `wukong_norm_f32` (RMSNorm) uses (lane `j` folds elements `≡ j (mod 8)` in the same order,
-//! `mul_add` in the scalar twin == `fmadd` in the AVX2 path, both store to `[f32; 8]` and call the
-//! same `hsum8`), so the AVX2 kernel and the scalar fallback agree **bit-for-bit** (pinned by a unit
-//! test across partial-chunk / tail sizes). The apply is per-lane arithmetic (`g − x·coef` via one FMA,
-//! then a multiply by `r`), bit-identical lane-for-lane.
+//! reductions ride ONE pass over the row on `UNROLL` = 4 independent accumulator chains each (see the
+//! block above [`ss_gx_8_scalar`]), with a fixed halving tree and the balanced horizontal combine
+//! `hsum8`; `mul_add` in the scalar twin == `fmadd` in the AVX2 path and both build the identical
+//! `[f32; 8]` lanes, so the AVX2 kernel and the scalar fallback agree **bit-for-bit** (pinned by unit
+//! tests across every block / remainder / tail seam and on NaN / signed-zero rows). The apply is
+//! per-lane arithmetic (`g − x·coef` via one FMA, then a multiply by `r`), bit-identical
+//! lane-for-lane.
 //!
 //! **Determinism.** Rows are independent, so the `_parallel` entry just maps the identical per-row
 //! routine across rows — `serial == parallel` bit-for-bit with no cross-row combine. The interpreter
@@ -43,13 +44,177 @@ fn hsum8(a: [f32; 8]) -> f32 {
     ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]))
 }
 
+// --- the two row reductions: UNROLL independent chains each, one pass ------------------------------
+//
+// The reduction pass used to carry ONE `__m256` accumulator per reduction:
+//
+//     while i + 8 <= n { ssv = fmadd(v, v, ssv); gxv = fmadd(g, v, gxv); i += 8; }
+//
+// Two independent chains in flight, each retiring one 8-lane step per FMA *latency* (4 cycles on
+// Golden/Redwood Cove) — a quarter of what the two FMA ports can issue. At the widths a transformer
+// backward runs (768..4096 columns, L1/L2-resident) that chain is the reduction's whole cost. The
+// block below runs `UNROLL` = 4 chains per reduction over `BLOCK` = 32-element steps: 8 FMA chains in
+// flight, which is what 4-cycle latency x 2 issues/cycle asks for, in 8 accumulators — leaving the
+// loads, `g = dy·gamma` and the step's temporaries in the other half of the 16 `ymm` registers (the
+// same register budget `layernorm_bwd.rs` settled on for its fused three-reduction pass).
+//
+// Partition: block element `i + 8t + j` folds into chain `t`, lane `j`; the `< BLOCK` remainder runs in
+// 8-element steps into chain 0; the chains combine by the halving tree `a[t] += a[t + h]`; the `< 8`
+// ragged tail folds into lanes `0..`. For `n < BLOCK` the blocked body never runs and the tree only
+// adds `+0.0` chains, so short rows keep the exact bits of the single-chain kernel (the corpus's
+// `tests/run/rmsnorm_bwd.wk` is 4 columns wide). Longer rows reassociate toward pairwise summation.
+
+/// Accumulator chains per reduction over the blocked body.
+const UNROLL: usize = 4;
+/// Elements consumed per blocked step (`UNROLL` 8-lane vectors).
+const BLOCK: usize = UNROLL * 8;
+
+/// Fold the `UNROLL` lane-accumulator arrays down to one with the explicit halving tree
+/// `a[t] += a[t + h]`. The AVX2 twin runs the identical tree with `_mm256_add_ps(a[t], a[t + h])`.
+#[inline(always)]
+fn combine(a: &mut [[f32; 8]; UNROLL]) {
+    let mut w = UNROLL;
+    while w > 1 {
+        let h = w / 2;
+        let (lo, hi) = a[..w].split_at_mut(h);
+        for (l, r) in lo.iter_mut().zip(hi.iter()) {
+            for (lj, rj) in l.iter_mut().zip(r.iter()) {
+                *lj += *rj;
+            }
+        }
+        w = h;
+    }
+}
+
+/// `g_i = dy_i * gamma_i`, with a null `gamma` meaning `gamma_i = 1`.
+///
+/// # Safety
+/// `dy` valid at `i`; `gamma` null or valid at `i`.
+#[inline(always)]
+unsafe fn gi(dy: *const f32, gamma: *const f32, i: usize) -> f32 {
+    if gamma.is_null() {
+        *dy.add(i)
+    } else {
+        *dy.add(i) * *gamma.add(i)
+    }
+}
+
+/// `(Σ x_i², Σ g_i·x_i)` as 8 lane accumulators each, in the partition above. Scalar twin of
+/// [`ss_gx_8_avx2`]; both product addends `mul_add`, matching the AVX2 `fmadd`.
+///
+/// # Safety
+/// `x`, `dy` valid for `n` f32; `gamma` null or valid for `n` f32.
+unsafe fn ss_gx_8_scalar(
+    x: *const f32,
+    dy: *const f32,
+    gamma: *const f32,
+    n: usize,
+) -> ([f32; 8], [f32; 8]) {
+    let mut sa = [[0.0f32; 8]; UNROLL];
+    let mut ga = [[0.0f32; 8]; UNROLL];
+    let mut i = 0;
+    while i + BLOCK <= n {
+        for t in 0..UNROLL {
+            for j in 0..8 {
+                let k = i + 8 * t + j;
+                let v = *x.add(k);
+                sa[t][j] = v.mul_add(v, sa[t][j]);
+                ga[t][j] = gi(dy, gamma, k).mul_add(v, ga[t][j]);
+            }
+        }
+        i += BLOCK;
+    }
+    while i + 8 <= n {
+        for j in 0..8 {
+            let v = *x.add(i + j);
+            sa[0][j] = v.mul_add(v, sa[0][j]);
+            ga[0][j] = gi(dy, gamma, i + j).mul_add(v, ga[0][j]);
+        }
+        i += 8;
+    }
+    combine(&mut sa);
+    combine(&mut ga);
+    let (mut ss, mut gx) = (sa[0], ga[0]);
+    for j in 0..(n - i) {
+        let v = *x.add(i + j);
+        ss[j] = v.mul_add(v, ss[j]);
+        gx[j] = gi(dy, gamma, i + j).mul_add(v, gx[j]);
+    }
+    (ss, gx)
+}
+
+/// `(Σ x_i², Σ g_i·x_i)` on `UNROLL` 256-bit chains per reduction, AVX2 twin of [`ss_gx_8_scalar`].
+///
+/// # Safety
+/// `x`, `dy` valid for `n` f32; `gamma` null or valid for `n` f32; AVX2+FMA available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn ss_gx_8_avx2(
+    x: *const f32,
+    dy: *const f32,
+    gamma: *const f32,
+    n: usize,
+) -> ([f32; 8], [f32; 8]) {
+    use std::arch::x86_64::*;
+    let g_null = gamma.is_null();
+    let mut sa = [_mm256_setzero_ps(); UNROLL];
+    let mut ga = [_mm256_setzero_ps(); UNROLL];
+    let mut i = 0;
+    while i + BLOCK <= n {
+        for t in 0..UNROLL {
+            let o = i + 8 * t;
+            let v = _mm256_loadu_ps(x.add(o));
+            let dyv = _mm256_loadu_ps(dy.add(o));
+            let gv = if g_null {
+                dyv
+            } else {
+                _mm256_mul_ps(dyv, _mm256_loadu_ps(gamma.add(o)))
+            };
+            sa[t] = _mm256_fmadd_ps(v, v, sa[t]);
+            ga[t] = _mm256_fmadd_ps(gv, v, ga[t]);
+        }
+        i += BLOCK;
+    }
+    while i + 8 <= n {
+        let v = _mm256_loadu_ps(x.add(i));
+        let dyv = _mm256_loadu_ps(dy.add(i));
+        let gv = if g_null {
+            dyv
+        } else {
+            _mm256_mul_ps(dyv, _mm256_loadu_ps(gamma.add(i)))
+        };
+        sa[0] = _mm256_fmadd_ps(v, v, sa[0]);
+        ga[0] = _mm256_fmadd_ps(gv, v, ga[0]);
+        i += 8;
+    }
+    let mut w = UNROLL;
+    while w > 1 {
+        let h = w / 2;
+        for t in 0..h {
+            sa[t] = _mm256_add_ps(sa[t], sa[t + h]);
+            ga[t] = _mm256_add_ps(ga[t], ga[t + h]);
+        }
+        w = h;
+    }
+    let (mut ss, mut gx) = ([0.0f32; 8], [0.0f32; 8]);
+    _mm256_storeu_ps(ss.as_mut_ptr(), sa[0]);
+    _mm256_storeu_ps(gx.as_mut_ptr(), ga[0]);
+    // Tail: fold into the SAME lanes, same ops, as the scalar twin.
+    for j in 0..(n - i) {
+        let v = *x.add(i + j);
+        ss[j] = v.mul_add(v, ss[j]);
+        gx[j] = gi(dy, gamma, i + j).mul_add(v, gx[j]);
+    }
+    (ss, gx)
+}
+
 // --- scalar twin (the AVX2 tail + the no-AVX2 fallback) -------------------------------------------
 
 /// One row of RMSNorm backward, scalar reference / AVX2 tail / no-AVX2 fallback.
 ///
-/// Computes the two per-row reductions with the same lane structure the AVX2 path uses, then the
-/// elementwise apply. `g_i = dy_i * gamma_i` (or `dy_i` when `gamma` is null) is computed identically
-/// in the reduction pass and the apply pass, so the two passes are consistent.
+/// Computes the two per-row reductions with [`ss_gx_8_scalar`] (the partition the AVX2 path uses),
+/// then the elementwise apply. `g_i = dy_i * gamma_i` (or `dy_i` when `gamma` is null) is computed
+/// identically in the reduction pass and the apply pass, so the two passes are consistent.
 ///
 /// # Safety
 /// `x`, `dy`, `dx` valid for `n` f32 (`dx` may alias `dy` — each `g_i`/the row's `s` are read before
@@ -62,36 +227,9 @@ unsafe fn rmsnorm_bwd_row_scalar(
     n: usize,
     eps: f32,
 ) {
-    let nb = n / 8;
-    let t = nb * 8;
     let invn = 1.0 / (n as f32);
-    let g_null = gamma.is_null();
-    // Two fixed 8-lane accumulators: ss = Σ x^2 (the forward RMSNorm reduction), gx = Σ g·x.
-    let mut ss = [0.0f32; 8];
-    let mut gx = [0.0f32; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for j in 0..8 {
-            let v = *x.add(b + j);
-            let gj = if g_null {
-                *dy.add(b + j)
-            } else {
-                *dy.add(b + j) * *gamma.add(b + j)
-            };
-            ss[j] = v.mul_add(v, ss[j]);
-            gx[j] = gj.mul_add(v, gx[j]);
-        }
-    }
-    for j in 0..(n - t) {
-        let v = *x.add(t + j);
-        let gj = if g_null {
-            *dy.add(t + j)
-        } else {
-            *dy.add(t + j) * *gamma.add(t + j)
-        };
-        ss[j] = v.mul_add(v, ss[j]);
-        gx[j] = gj.mul_add(v, gx[j]);
-    }
+    // ss = Σ x^2 (the forward RMSNorm reduction), gx = Σ g·x — one pass, UNROLL chains each.
+    let (ss, gx) = ss_gx_8_scalar(x, dy, gamma, n);
     let ms = hsum8(ss) * invn;
     let r = 1.0 / (ms + eps).sqrt();
     let s = hsum8(gx);
@@ -99,21 +237,15 @@ unsafe fn rmsnorm_bwd_row_scalar(
     let coef = (r * r) * (s * invn);
     let ncoef = -coef;
     for i in 0..n {
-        let v = *x.add(i);
-        let gi = if g_null {
-            *dy.add(i)
-        } else {
-            *dy.add(i) * *gamma.add(i)
-        };
-        *dx.add(i) = r * v.mul_add(ncoef, gi);
+        *dx.add(i) = r * (*x.add(i)).mul_add(ncoef, gi(dy, gamma, i));
     }
 }
 
 // --- AVX2 kernel (mirrors the scalar twin lane-for-lane on finite inputs) -------------------------
 
-/// One row of RMSNorm backward, AVX2/FMA. The two reductions keep one `__m256` accumulator each whose
-/// lane `j` folds elements `≡ j (mod 8)` exactly as the scalar twin does (`fmadd` == `mul_add`), then
-/// store to `[f32; 8]` and call the same `hsum8`; the apply is `r * fmadd(x, -coef, g)` per lane.
+/// One row of RMSNorm backward, AVX2/FMA. The two reductions run [`ss_gx_8_avx2`] (the same chains,
+/// tree and lanes as the scalar twin's [`ss_gx_8_scalar`], `fmadd` == `mul_add`), then the same
+/// `hsum8`; the apply is `r * fmadd(x, -coef, g)` per lane.
 ///
 /// # Safety
 /// `x`, `dy`, `dx` valid for `n` f32 (`dx` may alias `dy`); `gamma` null or valid for `n` f32; AVX2+FMA
@@ -131,37 +263,8 @@ unsafe fn rmsnorm_bwd_row_avx2(
     use std::arch::x86_64::*;
     let invn = 1.0 / (n as f32);
     let g_null = gamma.is_null();
-    // Σ x^2 and Σ g·x, one accumulator each (same lane structure as the scalar twin).
-    let mut ssv = _mm256_setzero_ps();
-    let mut gxv = _mm256_setzero_ps();
-    let mut i = 0;
-    while i + 8 <= n {
-        let v = _mm256_loadu_ps(x.add(i));
-        let dyv = _mm256_loadu_ps(dy.add(i));
-        let gv = if g_null {
-            dyv
-        } else {
-            _mm256_mul_ps(dyv, _mm256_loadu_ps(gamma.add(i)))
-        };
-        ssv = _mm256_fmadd_ps(v, v, ssv);
-        gxv = _mm256_fmadd_ps(gv, v, gxv);
-        i += 8;
-    }
-    let mut ss = [0.0f32; 8];
-    let mut gx = [0.0f32; 8];
-    _mm256_storeu_ps(ss.as_mut_ptr(), ssv);
-    _mm256_storeu_ps(gx.as_mut_ptr(), gxv);
-    // Tail: fold into the SAME lanes, same ops, as the scalar twin.
-    for j in 0..(n - i) {
-        let v = *x.add(i + j);
-        let gj = if g_null {
-            *dy.add(i + j)
-        } else {
-            *dy.add(i + j) * *gamma.add(i + j)
-        };
-        ss[j] = v.mul_add(v, ss[j]);
-        gx[j] = gj.mul_add(v, gx[j]);
-    }
+    // Σ x^2 and Σ g·x on UNROLL chains each (same partition as the scalar twin).
+    let (ss, gx) = ss_gx_8_avx2(x, dy, gamma, n);
     let ms = hsum8(ss) * invn;
     let r = 1.0 / (ms + eps).sqrt();
     let s = hsum8(gx);
@@ -170,7 +273,7 @@ unsafe fn rmsnorm_bwd_row_avx2(
     // Apply: dx = r * fmadd(x, -coef, g) — 8 lanes + scalar tail, bit-identical.
     let rv = _mm256_set1_ps(r);
     let ncv = _mm256_set1_ps(ncoef);
-    i = 0;
+    let mut i = 0;
     while i + 8 <= n {
         let v = _mm256_loadu_ps(x.add(i));
         let dyv = _mm256_loadu_ps(dy.add(i));
@@ -184,13 +287,7 @@ unsafe fn rmsnorm_bwd_row_avx2(
         i += 8;
     }
     while i < n {
-        let v = *x.add(i);
-        let gi = if g_null {
-            *dy.add(i)
-        } else {
-            *dy.add(i) * *gamma.add(i)
-        };
-        *dx.add(i) = r * v.mul_add(ncoef, gi);
+        *dx.add(i) = r * (*x.add(i)).mul_add(ncoef, gi(dy, gamma, i));
         i += 1;
     }
 }
@@ -326,11 +423,12 @@ mod tests {
 
     const EPS: f32 = 1e-5;
 
-    /// The exact gradient the kernel computes, in scalar — its own bit-exact oracle. Uses the SAME
-    /// fixed 8-lane reduction (so `r`, `s` match the kernel bit-for-bit) and the SAME fused apply.
+    /// The exact gradient the kernel computes, in scalar — its own bit-exact oracle, spelled
+    /// independently of the kernel's loop structure: each element's chain and lane are computed from
+    /// its index per the partition the module documents (block element `32b + 8t + j` → chain `t`,
+    /// lane `j`; the 8-step remainder → chain 0; then the halving tree; then the ragged tail into
+    /// lanes `0..`), and the SAME fused apply.
     fn reference(x: &[f32], dy: &[f32], gamma: Option<&[f32]>, n: usize, eps: f32) -> Vec<f32> {
-        let nb = n / 8;
-        let t = nb * 8;
         let invn = 1.0 / (n as f32);
         let g = |i: usize| -> f32 {
             match gamma {
@@ -338,20 +436,31 @@ mod tests {
                 None => dy[i],
             }
         };
-        let mut ss = [0.0f32; 8];
-        let mut gx = [0.0f32; 8];
-        for s in 0..nb {
-            let b = s * 8;
-            for j in 0..8 {
-                let v = x[b + j];
-                ss[j] = v.mul_add(v, ss[j]);
-                gx[j] = g(b + j).mul_add(v, gx[j]);
-            }
+        let nblk = n / BLOCK * BLOCK; // elements the blocked body covers
+        let nrem = nblk + (n - nblk) / 8 * 8; // ... plus the whole 8-steps after it
+        let mut sa = [[0.0f32; 8]; UNROLL];
+        let mut ga = [[0.0f32; 8]; UNROLL];
+        for (k, &v) in x.iter().enumerate().take(nrem) {
+            let t = if k < nblk { (k % BLOCK) / 8 } else { 0 };
+            let j = k % 8;
+            sa[t][j] = v.mul_add(v, sa[t][j]);
+            ga[t][j] = g(k).mul_add(v, ga[t][j]);
         }
-        for j in 0..(n - t) {
-            let v = x[t + j];
+        let mut h = UNROLL / 2;
+        while h >= 1 {
+            for t in 0..h {
+                for j in 0..8 {
+                    sa[t][j] += sa[t + h][j];
+                    ga[t][j] += ga[t + h][j];
+                }
+            }
+            h /= 2;
+        }
+        let (mut ss, mut gx) = (sa[0], ga[0]);
+        for (k, &v) in x.iter().enumerate().take(n).skip(nrem) {
+            let j = k - nrem;
             ss[j] = v.mul_add(v, ss[j]);
-            gx[j] = g(t + j).mul_add(v, gx[j]);
+            gx[j] = g(k).mul_add(v, gx[j]);
         }
         let ms = hsum8(ss) * invn;
         let r = 1.0 / (ms + eps).sqrt();
@@ -441,8 +550,13 @@ mod tests {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             return;
         }
-        // Sizes exercising the 8-lane body, non-multiple-of-8 tails, and rows shorter than 8.
-        for &n in &[1usize, 3, 7, 8, 9, 15, 16, 17, 31, 64, 100, 257, 1000] {
+        // Sizes exercising the 8-lane remainder, non-multiple-of-8 tails, rows shorter than 8, the
+        // BLOCK = 32 blocked body at its edges (31/32/33, 63/64/65, 95/96/97), blocks + remainder +
+        // tail together, and the real transformer widths.
+        for &n in &[
+            1usize, 3, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 39, 40, 63, 64, 65, 71, 95, 96, 97,
+            100, 128, 257, 512, 768, 1000, 1024,
+        ] {
             let x = fill_x(n);
             let dy = fill_dy(n);
             let gamma = fill_gamma(n);
@@ -467,6 +581,91 @@ mod tests {
                         b[i]
                     );
                 }
+            }
+        }
+    }
+
+    /// 2a') The twin gate above runs on finite, well-behaved data. Pin the AVX2 kernel to its scalar
+    /// twin on the values that desync an accumulator layout: signed zeros (which distinguish `+0 + -0`
+    /// orderings), a row of one repeated value, and a NaN placed past the first BLOCK in a non-zero
+    /// chain, which has to survive the halving tree in the same lane on both sides. There is no
+    /// max/min fold in this kernel; every op is add / mul / fma.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn scalar_matches_avx2_on_nan_and_signed_zero_rows() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        for &n in &[8usize, 33, 40, 64, 96, 100, 129] {
+            for case in 0..4 {
+                let mut x = fill_x(n);
+                let mut dy = fill_dy(n);
+                let gamma = fill_gamma(n);
+                match case {
+                    0 => {
+                        for i in (0..n).step_by(3) {
+                            x[i] = if i % 2 == 0 { 0.0 } else { -0.0 };
+                        }
+                        for i in (0..n).step_by(5) {
+                            dy[i] = -0.0;
+                        }
+                    }
+                    1 => x.iter_mut().for_each(|v| *v = -1.5),
+                    // Index 50 is chain 2, lane 2 of block 1 once n >= 64.
+                    2 => x[if n > 50 { 50 } else { n - 1 }] = f32::NAN,
+                    _ => dy[if n > 45 { 45 } else { n - 1 }] = f32::NAN,
+                }
+                for use_gamma in [false, true] {
+                    let gptr = if use_gamma {
+                        gamma.as_ptr()
+                    } else {
+                        std::ptr::null()
+                    };
+                    let mut a = vec![0.0f32; n];
+                    let mut b = vec![0.0f32; n];
+                    unsafe {
+                        rmsnorm_bwd_row_scalar(
+                            x.as_ptr(),
+                            dy.as_ptr(),
+                            gptr,
+                            a.as_mut_ptr(),
+                            n,
+                            EPS,
+                        );
+                        rmsnorm_bwd_row_avx2(x.as_ptr(), dy.as_ptr(), gptr, b.as_mut_ptr(), n, EPS);
+                    }
+                    for i in 0..n {
+                        assert_eq!(
+                            a[i].to_bits(),
+                            b[i].to_bits(),
+                            "scalar != avx2 n={n} case={case} gamma={use_gamma} i={i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rows shorter than one BLOCK never enter the blocked body, so they must keep the exact bits of
+    /// the single-chain kernel this replaced (lane `i % 8`, ascending; the tree only adds `+0.0`
+    /// chains). That is what leaves every narrow corpus row — `tests/run/rmsnorm_bwd.wk` is 4 wide —
+    /// byte-for-byte where it was.
+    #[test]
+    fn sub_block_rows_keep_the_single_chain_bits() {
+        for n in 1..BLOCK {
+            let x = fill_x(n);
+            let dy = fill_dy(n);
+            let gamma = fill_gamma(n);
+            let (mut ss, mut gx) = ([0.0f32; 8], [0.0f32; 8]);
+            for i in 0..n {
+                ss[i % 8] = x[i].mul_add(x[i], ss[i % 8]);
+                gx[i % 8] = (dy[i] * gamma[i]).mul_add(x[i], gx[i % 8]);
+            }
+            // SAFETY: x, dy, gamma are n long.
+            let (ks, kg) = unsafe { ss_gx_8_scalar(x.as_ptr(), dy.as_ptr(), gamma.as_ptr(), n) };
+            for j in 0..8 {
+                assert_eq!(ks[j].to_bits(), ss[j].to_bits(), "ss lane {j} n={n}");
+                assert_eq!(kg[j].to_bits(), gx[j].to_bits(), "gx lane {j} n={n}");
             }
         }
     }

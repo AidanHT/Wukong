@@ -24,11 +24,14 @@
 //! walk off the end. Within a row the
 //! reductions (softmax's max+sum, LayerNorm's mean+var, RMSNorm's mean-square) use a **fixed**
 //! accumulator layout and a fixed-order combine, so the result depends on `n` alone and never on the
-//! machine or the call site. Softmax's two passes keep the original single 8-lane accumulator; the
-//! non-softmax reductions run `UNROLL` = 8 such accumulators over `BLOCK` = 64-element steps (see the
-//! block above [`ssq8_scalar`] for why — the one-accumulator form was FMA-*latency* bound), with a
-//! single-accumulator remainder and a ragged scalar tail. Both forms end by storing the 8 lanes to an
-//! `[f32; 8]` the scalar twin builds identically and calling the *same* horizontal combine, so the
+//! machine or the call site. Every row reduction except softmax's exp-sum runs `UNROLL` = 8
+//! accumulators over `BLOCK` = 64-element steps (see the block above [`ssq8_scalar`] for why — the
+//! one-accumulator form was FMA-*latency* bound — and the block above [`rowmax8_scalar`] for the
+//! softmax / log-softmax max pass, which is a pure `vmaxps` chain), with a single-accumulator
+//! remainder and a ragged scalar tail. The exp-sum keeps one 8-lane accumulator: its `vaddps` chain
+//! hides behind `exp8`, so splitting it would change bits and buy nothing. Both forms end by storing
+//! the 8 lanes to an `[f32; 8]` the scalar twin builds identically and calling the *same* horizontal
+//! combine, so the
 //! AVX2 kernel and the scalar fallback agree bit-for-bit (pinned by `scalar_matches_avx2_bit_for_bit`
 //! across 25 sizes covering every block, remainder and tail seam, and by
 //! `tests/run/norm_blocked_every_lane.wk`, which prints every lane of a dispatched 100- and
@@ -349,6 +352,102 @@ unsafe fn dev2_8_avx2(x: *const f32, n: usize, mean: f32) -> [f32; 8] {
     va
 }
 
+// --- the softmax row max: the same 8 chains, folded by MAXPS ---------------------------------------
+//
+// The softmax / log-softmax max pass is a pure `load -> vmaxps` stream with nothing else in the loop,
+// so on one accumulator it retires one 8-lane step per `vmaxps` *latency* — the single most
+// latency-bound pass in the module (the exp-sum pass that follows hides its one `vaddps` chain
+// behind `exp8`'s far longer per-vector work, so it keeps its single accumulator: splitting it would
+// change result bits for no throughput). Eight chains over `BLOCK` = 64 elements make it load-bound.
+//
+// The fold is MAXPS (`(a > b) ? a : b`, [`maxps`]) in both twins, and the halving tree folds
+// `maxps(a[t + h], a[t])` — the higher chain as the FIRST operand. That order is what makes the
+// change free of observable effect:
+//   * An untouched chain holds `-inf`, and `maxps(-inf, v)` returns `v` for every `v`, NaN
+//     included, so for `n < BLOCK` the lanes come out bit-identical to the single-chain kernel.
+//   * For `n >= BLOCK` on NaN-free data the row max is the same *value* under any fold order; only
+//     the sign of a zero maximum can move, and `exp(x - (+0)) == exp(x - (-0))` for every `x` (and
+//     log-softmax's `m + log(s)` is `+0`-insensitive), so every softmax / log-softmax output bit is
+//     unchanged. On a row holding a NaN the outputs are all NaN under either order.
+// The ragged tail keeps its `f32::max` fold and the result keeps its [`hmax8`] combine, both shared
+// by the twins exactly as before. `pub(crate)` so `logsoftmax.rs`'s duplicated core uses the same
+// pass and stays bit-identical to `NORM_LOGSOFTMAX`.
+
+/// Row max as 8 lane maxima over `UNROLL` MAXPS chains, scalar twin of [`rowmax8_avx2`].
+///
+/// # Safety
+/// `x` valid for `n` `f32`.
+pub(crate) unsafe fn rowmax8_scalar(x: *const f32, n: usize) -> [f32; 8] {
+    let mut a = [[f32::NEG_INFINITY; 8]; UNROLL];
+    let mut i = 0;
+    while i + BLOCK <= n {
+        for (t, at) in a.iter_mut().enumerate() {
+            for (j, atj) in at.iter_mut().enumerate() {
+                *atj = maxps(*atj, *x.add(i + 8 * t + j));
+            }
+        }
+        i += BLOCK;
+    }
+    while i + 8 <= n {
+        for (j, a0j) in a[0].iter_mut().enumerate() {
+            *a0j = maxps(*a0j, *x.add(i + j));
+        }
+        i += 8;
+    }
+    // Halving tree (0,4)(1,5)(2,6)(3,7), (0,2)(1,3), (0,1), higher chain first.
+    let mut w = UNROLL;
+    while w > 1 {
+        let h = w / 2;
+        let (lo, hi) = a[..w].split_at_mut(h);
+        for (l, r) in lo.iter_mut().zip(hi.iter()) {
+            for (lj, rj) in l.iter_mut().zip(r.iter()) {
+                *lj = maxps(*rj, *lj);
+            }
+        }
+        w = h;
+    }
+    let mut mx = a[0];
+    for (j, mxj) in mx.iter_mut().enumerate().take(n - i) {
+        *mxj = mxj.max(*x.add(i + j));
+    }
+    mx
+}
+
+/// Row max as 8 lane maxima, AVX2 twin of [`rowmax8_scalar`] (same chains, same tree, same tail).
+///
+/// # Safety
+/// `x` valid for `n` `f32`; AVX2+FMA detected by the caller.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn rowmax8_avx2(x: *const f32, n: usize) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    let mut a = [_mm256_set1_ps(f32::NEG_INFINITY); UNROLL];
+    let mut i = 0;
+    while i + BLOCK <= n {
+        for (t, at) in a.iter_mut().enumerate() {
+            *at = _mm256_max_ps(*at, _mm256_loadu_ps(x.add(i + 8 * t)));
+        }
+        i += BLOCK;
+    }
+    while i + 8 <= n {
+        a[0] = _mm256_max_ps(a[0], _mm256_loadu_ps(x.add(i)));
+        i += 8;
+    }
+    a[0] = _mm256_max_ps(a[4], a[0]);
+    a[1] = _mm256_max_ps(a[5], a[1]);
+    a[2] = _mm256_max_ps(a[6], a[2]);
+    a[3] = _mm256_max_ps(a[7], a[3]);
+    a[0] = _mm256_max_ps(a[2], a[0]);
+    a[1] = _mm256_max_ps(a[3], a[1]);
+    a[0] = _mm256_max_ps(a[1], a[0]);
+    let mut mx = [0.0f32; 8];
+    _mm256_storeu_ps(mx.as_mut_ptr(), a[0]);
+    for (j, mxj) in mx.iter_mut().enumerate().take(n - i) {
+        *mxj = mxj.max(*x.add(i + j));
+    }
+    mx
+}
+
 // --- scalar twins (the AVX2 tail + the no-AVX2 fallback) ------------------------------------------
 
 /// Numerically-stable softmax of one row, scalar reference. `x` and `out` may alias (in-place).
@@ -356,21 +455,20 @@ unsafe fn dev2_8_avx2(x: *const f32, n: usize, mean: f32) -> [f32; 8] {
 /// # Safety
 /// `x` and `out` must each be valid for `n` `f32` elements.
 unsafe fn softmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
+    // 1) row max: the 8-chain MAXPS pass (see the block above `rowmax8_scalar`).
+    softmax_row_scalar_from_max(x, out, n, hmax8(rowmax8_scalar(x, n)));
+}
+
+/// Passes 2 and 3 of [`softmax_row_scalar`] for a given row max `m`. Split out so a test can feed
+/// it the row max a *different* fold order produces and prove the output bits do not move.
+///
+/// # Safety
+/// `x` and `out` must each be valid for `n` `f32` elements.
+unsafe fn softmax_row_scalar_from_max(x: *const f32, out: *mut f32, n: usize, m: f32) {
     let nb = n / 8;
     let t = nb * 8;
-    // 1) row max (8 lanes; lane j folds elements ≡ j (mod 8), tail into lanes 0..).
-    let mut mx = [f32::NEG_INFINITY; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for (j, mxj) in mx.iter_mut().enumerate() {
-            *mxj = maxps(*mxj, *x.add(b + j));
-        }
-    }
-    for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
-        *mxj = mxj.max(*x.add(t + j));
-    }
-    let m = hmax8(mx);
-    // 2) e = exp(x - m); write out; accumulate the sum in the same lane structure.
+    // 2) e = exp(x - m); write out; accumulate the sum (lane j folds elements ≡ j (mod 8), tail
+    //    into lanes 0..).
     let mut sm = [0.0f32; 8];
     for s in 0..nb {
         let b = s * 8;
@@ -403,20 +501,18 @@ unsafe fn softmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
 /// # Safety
 /// `x` and `out` must each be valid for `n` `f32` elements.
 unsafe fn logsoftmax_row_scalar(x: *const f32, out: *mut f32, n: usize) {
+    // 1) row max — identical to softmax_row_scalar.
+    logsoftmax_row_scalar_from_max(x, out, n, hmax8(rowmax8_scalar(x, n)));
+}
+
+/// Passes 2 and 3 of [`logsoftmax_row_scalar`] for a given row max `m` (split out for the same test
+/// as [`softmax_row_scalar_from_max`]).
+///
+/// # Safety
+/// `x` and `out` must each be valid for `n` `f32` elements.
+unsafe fn logsoftmax_row_scalar_from_max(x: *const f32, out: *mut f32, n: usize, m: f32) {
     let nb = n / 8;
     let t = nb * 8;
-    // 1) row max — identical to softmax_row_scalar.
-    let mut mx = [f32::NEG_INFINITY; 8];
-    for s in 0..nb {
-        let b = s * 8;
-        for (j, mxj) in mx.iter_mut().enumerate() {
-            *mxj = maxps(*mxj, *x.add(b + j));
-        }
-    }
-    for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
-        *mxj = mxj.max(*x.add(t + j));
-    }
-    let m = hmax8(mx);
     // 2) s = Σ exp(x - m) — same lane structure as softmax's sum, but do NOT write `out` here (the
     //    final pass below overwrites it reading `x`, so an in-place x==out row stays correct).
     let mut sm = [0.0f32; 8];
@@ -483,23 +579,12 @@ unsafe fn l2norm_row_scalar(x: *const f32, out: *mut f32, n: usize, eps: f32) {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn softmax_row_avx2(x: *const f32, out: *mut f32, n: usize) {
     use std::arch::x86_64::*;
-    // 1) max
-    let mut mxv = _mm256_set1_ps(f32::NEG_INFINITY);
-    let mut i = 0;
-    while i + 8 <= n {
-        mxv = _mm256_max_ps(mxv, _mm256_loadu_ps(x.add(i)));
-        i += 8;
-    }
-    let mut mx = [0.0f32; 8];
-    _mm256_storeu_ps(mx.as_mut_ptr(), mxv);
-    for (j, mxj) in mx.iter_mut().enumerate().take(n - i) {
-        *mxj = mxj.max(*x.add(i + j));
-    }
-    let m = hmax8(mx);
+    // 1) max: the 8-chain MAXPS pass, twin of the scalar path's.
+    let m = hmax8(rowmax8_avx2(x, n));
     let mb = _mm256_set1_ps(m);
     // 2) exp(x - m) + sum
     let mut sv = _mm256_setzero_ps();
-    i = 0;
+    let mut i = 0;
     while i + 8 <= n {
         let e = exp8(_mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb));
         _mm256_storeu_ps(out.add(i), e);
@@ -538,22 +623,11 @@ unsafe fn softmax_row_avx2(x: *const f32, out: *mut f32, n: usize) {
 unsafe fn logsoftmax_row_avx2(x: *const f32, out: *mut f32, n: usize) {
     use std::arch::x86_64::*;
     // 1) max — identical to softmax_row_avx2.
-    let mut mxv = _mm256_set1_ps(f32::NEG_INFINITY);
-    let mut i = 0;
-    while i + 8 <= n {
-        mxv = _mm256_max_ps(mxv, _mm256_loadu_ps(x.add(i)));
-        i += 8;
-    }
-    let mut mx = [0.0f32; 8];
-    _mm256_storeu_ps(mx.as_mut_ptr(), mxv);
-    for (j, mxj) in mx.iter_mut().enumerate().take(n - i) {
-        *mxj = mxj.max(*x.add(i + j));
-    }
-    let m = hmax8(mx);
+    let m = hmax8(rowmax8_avx2(x, n));
     let mb = _mm256_set1_ps(m);
     // 2) s = Σ exp(x - m) — exp8 lanes + exp1 tail, identical to softmax's accumulation, no out store.
     let mut sv = _mm256_setzero_ps();
-    i = 0;
+    let mut i = 0;
     while i + 8 <= n {
         sv = _mm256_add_ps(sv, exp8(_mm256_sub_ps(_mm256_loadu_ps(x.add(i)), mb)));
         i += 8;
@@ -1388,12 +1462,26 @@ mod tests {
         for (name, gen) in pathological() {
             for &n in &SEAM_LENS {
                 let x: Vec<f32> = (0..n).map(gen).collect();
-                for &op in &[NORM_LAYERNORM, NORM_RMSNORM, NORM_L2NORM] {
+                for &op in &[
+                    NORM_LAYERNORM,
+                    NORM_RMSNORM,
+                    NORM_L2NORM,
+                    NORM_SOFTMAX,
+                    NORM_LOGSOFTMAX,
+                ] {
                     let mut a = vec![0.0f32; n];
                     let mut b = vec![0.0f32; n];
                     // SAFETY: both write exactly `n` f32; AVX2+FMA detected above.
                     unsafe {
                         match op {
+                            NORM_SOFTMAX => {
+                                softmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
+                                softmax_row_avx2(x.as_ptr(), b.as_mut_ptr(), n);
+                            }
+                            NORM_LOGSOFTMAX => {
+                                logsoftmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
+                                logsoftmax_row_avx2(x.as_ptr(), b.as_mut_ptr(), n);
+                            }
                             NORM_LAYERNORM => {
                                 layernorm_row_scalar(x.as_ptr(), a.as_mut_ptr(), n, EPS);
                                 layernorm_row_avx2(x.as_ptr(), b.as_mut_ptr(), n, EPS);
@@ -1419,6 +1507,104 @@ mod tests {
                             b[i]
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The row max is a fold over MAXPS chains, and its *lanes* must agree bit-for-bit between the
+    /// twins on every pathological row (NaN in a non-zero chain included) — the accumulator-level
+    /// check `norm_rows_agree_bit_for_bit_on_pathological_rows` stops one step short of. On NaN-free
+    /// rows the folded maximum must also equal the plain maximum as a value.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn rowmax_twins_agree_on_pathological_rows() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let mut rows: Vec<(&str, fn(usize) -> f32)> = pathological();
+        rows.push(("finite", |i| ((i as f32) * 0.017).sin() * 2.3 - 0.4));
+        for (name, gen) in rows {
+            for &n in &SEAM_LENS {
+                let x: Vec<f32> = (0..n).map(gen).collect();
+                // SAFETY: both twins read exactly `n` f32; AVX2+FMA detected above.
+                let (s, v) =
+                    unsafe { (rowmax8_scalar(x.as_ptr(), n), rowmax8_avx2(x.as_ptr(), n)) };
+                for j in 0..8 {
+                    assert_eq!(
+                        s[j].to_bits(),
+                        v[j].to_bits(),
+                        "rowmax lane {j} scalar != avx2 on '{name}' n={n}"
+                    );
+                }
+                if x.iter().all(|v| !v.is_nan()) {
+                    let want = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let got = hmax8(s);
+                    assert!(got == want, "rowmax on '{name}' n={n}: {got} vs {want}");
+                }
+            }
+        }
+    }
+
+    /// The eight-chain max pass must not move a single softmax / log-softmax output bit on NaN-free
+    /// data. Feed the passes after the max the row max the *single-chain* kernel computed — spelled
+    /// out here independently — and compare against the shipped kernel. The signed-zero rows are the
+    /// sharp case: there the two fold orders can disagree on the SIGN of a zero maximum, and the
+    /// claim is that `exp(x - (+0))`, `exp(x - (-0))` and `m + log(s)` cannot see it.
+    #[test]
+    fn eight_chain_row_max_leaves_softmax_bits_unchanged() {
+        let one_chain_max = |x: &[f32]| {
+            let n = x.len();
+            let t = n / 8 * 8;
+            let mut mx = [f32::NEG_INFINITY; 8];
+            for s in 0..n / 8 {
+                for (j, mxj) in mx.iter_mut().enumerate() {
+                    *mxj = maxps(*mxj, x[s * 8 + j]);
+                }
+            }
+            for (j, mxj) in mx.iter_mut().enumerate().take(n - t) {
+                *mxj = mxj.max(x[t + j]);
+            }
+            hmax8(mx)
+        };
+        let mut rows: Vec<(&str, fn(usize) -> f32)> = pathological();
+        rows.push(("finite", |i| ((i as f32) * 0.017).sin() * 2.3 - 0.4));
+        rows.push(("zero-peak", |i| match i % 5 {
+            0 => 0.0,
+            1 => -0.0,
+            _ => -(i as f32) * 0.25,
+        }));
+        for (name, gen) in rows {
+            for &n in &SEAM_LENS {
+                let x: Vec<f32> = (0..n).map(gen).collect();
+                if x.iter().any(|v| v.is_nan()) {
+                    continue;
+                }
+                let m_old = one_chain_max(&x);
+                let (mut a, mut b) = (vec![0.0f32; n], vec![0.0f32; n]);
+                // SAFETY: every call reads `n` f32 from `x` and writes `n` f32.
+                unsafe {
+                    softmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
+                    softmax_row_scalar_from_max(x.as_ptr(), b.as_mut_ptr(), n, m_old);
+                }
+                for i in 0..n {
+                    assert_eq!(
+                        a[i].to_bits(),
+                        b[i].to_bits(),
+                        "softmax moved on '{name}' n={n} i={i}"
+                    );
+                }
+                // SAFETY: as above.
+                unsafe {
+                    logsoftmax_row_scalar(x.as_ptr(), a.as_mut_ptr(), n);
+                    logsoftmax_row_scalar_from_max(x.as_ptr(), b.as_mut_ptr(), n, m_old);
+                }
+                for i in 0..n {
+                    assert_eq!(
+                        a[i].to_bits(),
+                        b[i].to_bits(),
+                        "log-softmax moved on '{name}' n={n} i={i}"
+                    );
                 }
             }
         }
