@@ -28,6 +28,7 @@
 
 mod alias;
 mod canon;
+mod defer;
 mod tile;
 mod tindex;
 
@@ -969,6 +970,21 @@ pub fn lower_program_with(
     interner: &mut Interner,
     opts: LowerOptions,
 ) -> (Program, Vec<Diagnostic>) {
+    // `defer` goes first: it copies each deferred expression onto every exit of its block, so the
+    // normalizations, recognizers and lowerers below only ever see plain statements (see
+    // `defer.rs`). `None` — nothing cloned — for the common module without a `defer`.
+    let deferred = match defer::lower_defers(module, sema, interner) {
+        Ok(d) => d,
+        Err(diags) => return (Program::new(), diags),
+    };
+    let defer_sema = deferred.as_ref().map(|(_, extra)| {
+        let mut s = sema.clone();
+        s.types.extend(extra.iter().map(|(id, t)| (*id, t.clone())));
+        s
+    });
+    let module: &Module = deferred.as_ref().map(|(m, _)| m).unwrap_or(module);
+    let sema: &SemaResult = defer_sema.as_ref().unwrap_or(sema);
+
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
     //
@@ -9400,7 +9416,9 @@ impl FnLowerer<'_> {
                 self.terminated = true;
             }
             StmtKind::Defer(e) => {
-                // Defer semantics (run at scope exit) are not modeled yet; lower for effects.
+                // `defer::lower_defers` rewrites every `defer` away before any function is
+                // lowered, so this is unreachable; a lowerer fed an un-normalized body fails
+                // loudly rather than running the expression at the wrong time.
                 self.unsupported(e.span, "defer");
                 self.lower_expr_stmt(e);
             }

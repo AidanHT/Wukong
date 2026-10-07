@@ -243,6 +243,20 @@ static CATALOG: &[Explanation] = &[
          plain import."
     ),
     entry!(
+        "E0314",
+        "invalid `defer`",
+        "`defer e;` runs `e` at every exit of the enclosing block — falling off its end, `return`, \
+         and `break`/`continue` out of it — in reverse order of registration, innermost block \
+         first; a returned or broken value is computed before the defers run. Two things would \
+         make that ill-defined and are rejected. (1) Control flow leaving the deferred \
+         expression: a `return`, or a `break`/`continue` aimed at a loop outside it, inside `e` \
+         (a loop entirely inside `e` may break out of itself). (2) Rebinding a name `e` uses while \
+         the defer is pending: `e` is resolved where the `defer` is written, but its copies are \
+         placed at the exits, where a newer `let x` (or a `for x` / match binding) would silently \
+         retarget it. Rename the new binding, or end the block holding the `defer` before \
+         rebinding."
+    ),
+    entry!(
         "E0401",
         "type mismatch",
         "A value's type does not match the type required by its context — for example a `let` with \

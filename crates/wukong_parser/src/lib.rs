@@ -1309,7 +1309,28 @@ impl<'a> Parser<'a> {
                 }
                 T::Defer => {
                     self.bump();
-                    let e = self.parse_expr();
+                    let target = self.parse_expr();
+                    // `defer x += 1;` defers an assignment statement: wrap it in a block so the
+                    // deferred thing is still one expression (`defer { x += 1; }`).
+                    let e = if let Some(op) = cur_assign_op(self.kind()) {
+                        let assign_start = target.span;
+                        self.bump();
+                        let value = self.parse_expr();
+                        let assign = self.mk_stmt(
+                            Vec::new(),
+                            StmtKind::Assign { target, op, value },
+                            assign_start,
+                        );
+                        let block = Block {
+                            id: self.nid(),
+                            stmts: vec![assign],
+                            tail: None,
+                            span: assign_start.to(self.prev_span()),
+                        };
+                        self.finish_expr(assign_start, ExprKind::Block(block))
+                    } else {
+                        target
+                    };
                     self.eat(T::Semi);
                     stmts.push(self.mk_stmt(attrs, StmtKind::Defer(e), stmt_start));
                 }
