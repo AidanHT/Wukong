@@ -14,10 +14,17 @@ module tests.run.transcendental_sweep
 // TWO PRINTED LINES, read this before changing them.
 //
 // Line 1 (expected 0) is the real per-lane assertion for the @parallel dispatch arm. The parallel
-// exp10/cbrt must equal the serial dispatch LANE FOR LANE: a chunk-boundary defect (a thread
+// exp10/cbrt must equal a serial computation LANE FOR LANE: a chunk-boundary defect (a thread
 // writing a neighbour's lane, a dropped tail chunk) that happened to preserve the folded checksum
-// below would pass the checksum and fail here. `wukong_vmath_f32` is elementwise, so the chunked
-// and serial results agree bit-for-bit — 0 mismatches over all 128 compared lanes.
+// below would pass the checksum and fail here. The two serial sides are NOT the same kind of
+// thing, and the difference matters when this line fails:
+//   * cbrt: `cs` is its own single-statement loop, dispatched serially (`wukong_vmath_f32`, op 35),
+//     so pc-vs-cs is parallel kernel vs serial kernel — elementwise, so bit-for-bit by construction.
+//   * exp10: `e10` comes from the first fused body, which at -O2 is NOT dispatched (the census's
+//     four serial `wukong_vmath_f32` calls are tan/asin/acos and the cbrt loop), so pe-vs-e10 is the
+//     parallel kernel against the GENERIC inline lowering of exp10. It is 0 because the vmath kernel
+//     and the scalar/inline composition are bit-exact by contract; a mismatch here can therefore be
+//     a kernel-vs-twin divergence, not only a chunking defect.
 //
 // Line 2 (43836) is a FOLDED CHECKSUM over 576 results, kept only as a coarse CHANGE DETECTOR for
 // the nine ops' dispatch, NOT a hand-derived value — a single f32 sum near 438 cannot localise
@@ -72,10 +79,11 @@ fn main() -> i32 {
     let mut pc: [f32; 64] = [0.0; 64];
     par_sweep(x, pe, pc);
 
-    // Per-lane proof of the @parallel arm. pe[i] = exp10(x[i]) is the SAME kernel as the serial
-    // e10[i] above, so the two agree bit-for-bit; cbrt has no serial twin above, so compute one
-    // here and compare. A count of inequalities is 0 iff every one of the 128 lanes matches — unlike
-    // the checksum it cannot be passed by a chunk-boundary defect that preserves the total.
+    // Per-lane proof of the @parallel arm. pe[i] = exp10(x[i]) is compared with e10[i] from the first
+    // fused body (generic inline lowering, not a dispatch — see the header); cbrt has no serial twin
+    // above, so compute one here (this loop IS dispatched serially) and compare. A count of
+    // inequalities is 0 iff every one of the 128 lanes matches — unlike the checksum it cannot be
+    // passed by a chunk-boundary defect that preserves the total.
     let mut cs: [f32; 64] = [0.0; 64];
     for i in 0..64 { cs[i] = cbrt(x[i]); }
     let mut mism: i32 = 0;
