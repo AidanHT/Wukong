@@ -457,16 +457,18 @@ runtime size is outside the defined contract, like any runtime index
 @align(32)
 @extern("C")
 @export("wukong_saxpy")
+fn k(@noalias mut out: []f32, x: []f32) { … }
 ```
 
 Attribute *syntax* is parsed on functions, parameters and statements (a missing argument value is
 `E0207`), and the attribute **name is validated against a closed set** (✅): `@parallel`, `@generic`,
-`@tile`, `@extern`, `@inline`, `@simd`, `@align`, `@export`. Anything else — `@bogus(1, 2)`, and far
-more usefully a typo of a real one such as `@parellel` — is **`E0306`**, where it used to be accepted
-and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Three attributes have
-a consumer on a **function**: **`@parallel`** (✅), which makes its loop execute across CPU cores,
-**`@generic`** (✅), which opts the function out of the kernel recognizers (below), and **`@tile`** (✅),
-which strip-mines loops (below).
+`@tile`, `@extern`, `@noalias`, `@inline`, `@simd`, `@align`, `@export`. Anything else — `@bogus(1, 2)`,
+and far more usefully a typo of a real one such as `@parellel` — is **`E0306`**, where it used to be
+accepted and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Three
+attributes have a consumer on a **function**: **`@parallel`** (✅), which makes its loop execute across
+CPU cores, **`@generic`** (✅), which opts the function out of the kernel recognizers (below), and
+**`@tile`** (✅), which strip-mines loops (below). One has a consumer on a **parameter**:
+**`@noalias`** (✅), a promise about the storage the parameter points into (below).
 Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern`, `@export`, and
 `@parallel`'s own `grain = …` argument — is parsed and discarded (🔵). `@tile` is consumed as loop
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
@@ -601,6 +603,58 @@ attribute-placement code `@generic` off a `fn` item carries, and for the same re
 `while` is the one worth calling out: a `while` has no induction variable and no range, so there is
 nothing to strip-mine, and the attribute used to sit there reading exactly as if it applied
 (`tests/fail/tile_on_while.wk`).
+
+### `@noalias` — a parameter's storage promise ✅
+
+```wukong
+fn axpy(@noalias mut y: []f32, x: []f32, a: f32) {
+    for i in 0..y.len() { y[i] = y[i] + a * x[i]; }
+}
+```
+
+`@noalias` on a parameter promises that, **for the duration of a call, the storage it points into is
+reached only through that parameter** — nothing else the call can name overlaps it. It is C's
+`restrict` and LLVM's `noalias` argument attribute, and it is the one fact an optimizer cannot derive
+for itself: without it two buffer parameters may be the same caller buffer (`axpy(v, v, 2.0)` is
+legal), so a store to `y[i]` has to be assumed to change `x[i + 1]`. With it:
+
+- the alias analysis (`wukong_opt::alias`) treats the promised parameter as disjoint from every other
+  parameter, and — when nothing derived from it escapes the function — from every pointer it lost
+  track of and from every callee, so CSE forwards loads across stores to it, LICM hoists a slice's
+  data-pointer re-read out of the loop, and DSE sees through it;
+- the loop dependence test and the vectorizer's runtime alias guard need no range check for a pair it
+  separates — and a loop whose guard could not have been expressed vectorizes anyway;
+- the Cranelift backend files its accesses in alias regions of their own (a store to `y` no longer
+  clobbers a load of `x`), and marks the slice's fat-pointer loads pure so they are hoisted; the
+  textual LLVM IR carries `ptr noalias`;
+- a recognized kernel that needs disjoint operands (a GEMM writing `C` while reading `A`/`B`) may
+  dispatch on the promise even where some call site elsewhere aliases other parameters — for
+  fixed-size array and statically-shaped tensor parameters, whose names cannot be re-pointed;
+- a `@parallel` region may thread a loop whose promised destination is read through a gather index
+  from another parameter (`tests/run/noalias_params.wk` prints every lane of each case).
+
+One promise is enough for a pair: `y` above is disjoint from `x` even though `x` promised nothing,
+which is why marking only the **written** buffers is the usual spelling. The attribute is legal only on
+a parameter, takes no arguments, and only on a parameter passed by pointer (an array, slice, tensor,
+pointer, reference, tuple or struct); anywhere else — on a `fn`, a statement, a scalar parameter — it
+is **`E0306`** (`tests/fail/noalias_on_scalar.wk`).
+
+**What the compiler checks (`E0316`).** A call that passes the promised parameter's argument together
+with another buffer argument rooted in the same storage is rejected: `axpy(v, v, 2.0)`
+(`tests/fail/noalias_aliased_call.wk`), a view of the same array (`let s: []f32 = v; axpy(s, v, 2.0)`,
+`tests/fail/noalias_aliased_view.wk`), a field together with its struct (`k(p.w, p)`), or two elements
+of one array (`k(m[0], m[1])` — element indices are not compared, the same conservative line Rust's
+borrow checker draws). Two different fields of one struct, `k(p.w, p.b)`, are fine. And a promised
+parameter of view type (`[]T`, `*T`, `&T`, a tensor) cannot be re-pointed as a whole (`y = other`,
+`tests/fail/noalias_reassigned_slice.wk`); writing *through* it is the point, and a fixed array
+parameter is assigned by copy, so reassigning one is fine.
+
+**What it does not check.** A call whose arguments the compiler cannot prove to overlap — two views of
+unknown origin, a pointer read out of memory, the caller's own unpromised parameters passed on — is
+accepted. If they do overlap after all, the program has broken its promise: the interpreter still
+computes the sequential meaning, but optimized native code may not, exactly as with `restrict` in C.
+That is why the attribute is opt-in; nothing changes for a program that does not write it (its MIR is
+byte-identical).
 
 ### `shared [T; N]` and `sync_block()` ✅
 
@@ -789,7 +843,10 @@ body. It declines — and the loop lowers serially — for a loop-carried accumu
 captured scalar), a non-affine or offset index, a local bound to a slice/pointer/reference (it might
 alias a capture), a call other than a pure math intrinsic (`print` would reorder output), a
 `match`/`loop` expression in the body, a `return`/`defer`, and a labelled or loop-level
-`break`/`continue`. At most 32 such regions are outlined per program; further ones stay serial.
+`break`/`continue`. Two array **parameters** over the same element type may be one caller buffer
+whatever their declared lengths, so the proof covers the union of their accesses — unless a
+`@noalias` promise separates the pair, which lets a gather from one parameter into another thread.
+At most 32 such regions are outlined per program; further ones stay serial.
 
 ## File I/O ✅
 

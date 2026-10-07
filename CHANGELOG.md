@@ -5,6 +5,28 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### `@noalias` parameters: a checked restrict promise the whole pipeline consumes
+
+- **Language: `@noalias` on a parameter** (C's `restrict`, LLVM's `noalias`) promises that, for the
+  duration of a call, the storage it points into is reached only through it. Legal only on a
+  parameter passed by pointer (array, slice, tensor, pointer, reference, tuple, struct), with no
+  arguments; anywhere else it is `E0306`. **New code `E0316`** rejects a call that passes the
+  promised argument together with another buffer argument rooted in the same storage (`k(a, a)`, a
+  view of the same array, a field with its struct, two elements of one array) and re-pointing a
+  promised view parameter (`s = t`). `tests/fail/noalias_*.wk`, `tests/run/noalias_params.wk`.
+- **Optimizer and backends consume it.** MIR carries `ParamAttrs` per parameter (printed `noalias`);
+  `wukong_opt::alias` treats a promised parameter as disjoint from every other parameter, gives a
+  promised slice's elements their own provenance, and keeps non-escaping promised storage apart from
+  untracked pointers and callees; the loop dependence test and the vectorizer's runtime alias guard
+  skip pairs it separates; LICM hoists a promised slice's data-pointer re-read; Cranelift tags
+  promised storage with its own alias regions and marks the invariant fat-pointer loads pure; the
+  LLVM emitter writes `ptr noalias`; the GEMM-class recognizers and the `@parallel` region outliner
+  accept a promise as a disjointness proof. A program without the attribute lowers to byte-identical
+  MIR (P11.1).
+- **Fix: the region outliner grouped possibly-aliased parameters by exact `Ty` equality** (P1.20), so a
+  `[f32; 32]` source and a `[f32; 16]` destination were two buffers by fiat. Parameters over the same
+  element scalar now form one group whatever their declared lengths, unless a promise separates them.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**
