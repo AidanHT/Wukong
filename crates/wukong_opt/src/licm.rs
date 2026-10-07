@@ -39,13 +39,17 @@
 //!    every iteration that passes the header test runs the load, so the load happens if and only if
 //!    the *first* header test passes. That test is recomputed in the preheader on the values the
 //!    preheader passes in (`i < n` becomes `start < n`), and the hoisted load reads through
-//!    `select(first_test, addr, dummy)`, where `dummy` is a fresh stack slot: on a zero-trip entry it
-//!    reads that slot instead, and the value is never used, because every use sits in a block only
-//!    a passing iteration reaches. A constant test folds the select away. This is LLVM's
-//!    guaranteed-to-execute rule without the loop rotation it relies on (`loop-canon` documents why
-//!    loops here stay top-tested), and it is what lifts `w[0]` out of `o[i] = a[i] * w[0]` when `w`
-//!    is a parameter. It is not used for an address inside a local `alloca` (selecting it against
-//!    the dummy would publish the slot to the alias analysis); those rely on the first rule.
+//!    `select(first_test, addr, dummy)`, where `dummy` is a private stack slot of the load's type
+//!    ([`Dummies`]): on a zero-trip entry it reads that slot instead, and the value is never used,
+//!    because every use sits in a block only a passing iteration reaches. When the first test is a
+//!    comparison of constants that holds (`for k in 0..64`), the body provably runs and the load is
+//!    hoisted as is, with no guard. This is LLVM's guaranteed-to-execute rule without the loop
+//!    rotation it relies on (`loop-canon` documents why loops here stay top-tested), and it is what
+//!    lifts `w[0]` out of a read-only loop such as `s = s + a[i] * w[0]` when `w` is a parameter. (A
+//!    loop that also stores through another parameter keeps the load: two parameters may alias, so
+//!    that store may write `w[0]`, and only a `noalias` fact says otherwise.) It is not used for an
+//!    address inside a local `alloca` (selecting it against the dummy would publish the slot to the
+//!    alias analysis); those rely on the first rule.
 //!
 //! The *legality* argument for "the loop's only exit is the header test" is that once the first test
 //! passes, every path from the header either reaches the latch — passing every block that dominates
@@ -84,7 +88,7 @@ impl Pass for Licm {
         let forest = loop_info::structure_with(f, idom, preds);
 
         let mut changed = false;
-        let mut dummies: Vec<Inst> = Vec::new();
+        let mut dummies = Dummies::default();
         // Loops come ascending by header id, a deterministic order (M12): the order in which loops
         // are processed can change what one pass hoists, e.g. across nested loops.
         for l in &forest.loops {
@@ -96,12 +100,50 @@ impl Pass for Licm {
             let spec = Spec::of(f, l, &body, idom);
             changed |= hoist_from_loop(f, &body, preheader.0, &alias, &mem, &spec, &mut dummies);
         }
-        if !dummies.is_empty() {
-            let entry = f.entry.0 as usize;
-            dummies.append(&mut f.blocks[entry].insts);
-            f.blocks[entry].insts = dummies;
-        }
+        dummies.install(f);
         changed
+    }
+}
+
+/// The zero-trip targets of guarded accesses: one private stack slot per accessed type, shared by
+/// every guarded access of that type in one pass run. A guarded access touches its dummy only on an
+/// entry where its loop does not run, and nothing uses what it reads there, so one slot per type
+/// serves them all — and a function gains one `alloca` per type rather than one per hoisted load
+/// (the interpreter keeps every slot an `alloca` reserves, so that is memory per call). A dummy has
+/// the accessed type, so the interpreter's default in it is a value of that type, which is what any
+/// pure instruction hoisted after the load computes with on a zero-trip entry.
+#[derive(Default)]
+pub(crate) struct Dummies {
+    insts: Vec<Inst>,
+    by_ty: FxHashMap<MirType, ValueId>,
+}
+
+impl Dummies {
+    /// The dummy slot for accesses of type `ty`, minted on first request.
+    pub(crate) fn slot(&mut self, f: &mut Function, ty: &MirType) -> ValueId {
+        if let Some(&v) = self.by_ty.get(ty) {
+            return v;
+        }
+        let v = fresh_value(f, MirType::Ptr);
+        self.insts.push(Inst {
+            result: Some(v),
+            op: Op::Alloca {
+                ty: ty.clone(),
+                space: AddrSpace::Local,
+            },
+        });
+        self.by_ty.insert(ty.clone(), v);
+        v
+    }
+
+    /// Put the minted slots at the top of the entry block, where they dominate every use.
+    pub(crate) fn install(mut self, f: &mut Function) {
+        if self.insts.is_empty() {
+            return;
+        }
+        let entry = f.entry.0 as usize;
+        self.insts.append(&mut f.blocks[entry].insts);
+        f.blocks[entry].insts = self.insts;
     }
 }
 
@@ -441,7 +483,7 @@ fn hoist_from_loop(
     alias: &AliasInfo,
     mem: &LoopMem,
     spec: &Spec,
-    dummies: &mut Vec<Inst>,
+    dummies: &mut Dummies,
 ) -> bool {
     // Iterate the loop body in a deterministic (block-id) order. The order in which hoisted
     // instructions are appended to the preheader must not depend on `HashSet` iteration order —
@@ -528,14 +570,7 @@ fn hoist_from_loop(
                                 c
                             }
                         };
-                        let dummy = fresh_value(f, MirType::Ptr);
-                        dummies.push(Inst {
-                            result: Some(dummy),
-                            op: Op::Alloca {
-                                ty: ty.clone(),
-                                space: AddrSpace::Local,
-                            },
-                        });
+                        let dummy = dummies.slot(f, ty);
                         let sel = fresh_value(f, MirType::Ptr);
                         moved_ops.push(Inst {
                             result: Some(sel),
@@ -838,6 +873,58 @@ mod tests {
                 .any(|i| matches!(i.op, Op::Select(..) | Op::Alloca { .. })),
             "{shown}"
         );
+    }
+
+    /// `s = s + w[0] * v[0]` over two parameters: both loads are hoisted behind the guard, and the
+    /// product of the two hoisted values with them. Loads of one type share one zero-trip dummy, so
+    /// the function gains a single `alloca`, not one per load.
+    #[test]
+    fn guarded_loads_of_one_type_share_a_dummy_slot() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("s"), MirType::F32);
+        let n = b.add_param(MirType::I64);
+        let w = b.add_param(MirType::Ptr);
+        let v = b.add_param(MirType::Ptr);
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let fzero = b.build(MirType::F32, Op::ConstFloat(0.0, MirType::F32));
+        let header = b.new_block();
+        let body = b.new_block();
+        let exit = b.new_block();
+        let i = b.block_param(header, MirType::I64);
+        let s = b.block_param(header, MirType::F32);
+        let out = b.block_param(exit, MirType::F32);
+        b.br(header, vec![zero, fzero]);
+        b.switch_to(header);
+        let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, n));
+        b.cond_br(c, body, vec![], exit, vec![s]);
+        b.switch_to(body);
+        let x = b.build(MirType::F32, Op::Load(w, MirType::F32));
+        let y = b.build(MirType::F32, Op::Load(v, MirType::F32));
+        let xy = b.build(MirType::F32, Op::Bin(BinOp::FMul, x, y));
+        let s2 = b.build(MirType::F32, Op::Bin(BinOp::FAdd, s, xy));
+        let next = b.build(MirType::I64, Op::Bin(BinOp::Add, i, one));
+        b.br(header, vec![next, s2]);
+        b.switch_to(exit);
+        b.ret(Some(out));
+        let mut f = b.finish();
+        assert!(wukong_mir::verify::verify_function(&f).is_empty());
+        assert!(Licm.run_function(&mut f, &mut CfgAnalyses::default()));
+        let shown = wukong_mir::print::print_function(&f, &it);
+        assert!(
+            wukong_mir::verify::verify_function(&f).is_empty(),
+            "{shown}"
+        );
+        assert_eq!(loads_in(&f, body.0 as usize), 0, "{shown}");
+        let count = |pred: fn(&Op) -> bool| {
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| pred(&i.op))
+                .count()
+        };
+        assert_eq!(count(|op| matches!(op, Op::Select(..))), 2, "{shown}");
+        assert_eq!(count(|op| matches!(op, Op::Alloca { .. })), 1, "{shown}");
     }
 
     /// A store in the loop that may alias the slot keeps its load inside.

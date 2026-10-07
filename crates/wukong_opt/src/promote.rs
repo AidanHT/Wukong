@@ -42,7 +42,7 @@
 
 use crate::alias::{type_bytes, AliasInfo, Prov};
 use crate::fxhash::{FxHashMap, FxHashSet};
-use crate::licm::{fresh_value, LoopMem, Spec};
+use crate::licm::{fresh_value, Dummies, LoopMem, Spec};
 use crate::loop_info::{self, LoopId, NaturalLoop};
 
 use wukong_mir::{AddrSpace, Function, Inst, MirType, Op, ValueId};
@@ -72,6 +72,7 @@ impl Pass for Promote {
         }
         let mut touched: Vec<LoopId> = Vec::new();
         let mut slots: Vec<Inst> = Vec::new();
+        let mut dummies = Dummies::default();
         for id in forest.innermost_first() {
             if touched.iter().any(|&t| related(&forest, t, id)) {
                 continue;
@@ -80,12 +81,13 @@ impl Pass for Promote {
             let Some(plan) = plan_loop(f, l, &alias, idom, preds) else {
                 continue;
             };
-            rewrite(f, &plan, &mut slots);
+            rewrite(f, &plan, &mut slots, &mut dummies);
             touched.push(id);
         }
         if slots.is_empty() {
             return false;
         }
+        dummies.install(f);
         let entry = f.entry.0 as usize;
         slots.append(&mut f.blocks[entry].insts);
         f.blocks[entry].insts = slots;
@@ -279,8 +281,9 @@ fn plan_loop(
 }
 
 /// Apply a plan: a slot per location (returned in `slots` for the entry block), the preheader load,
-/// the redirected accesses, and the exit stores.
-fn rewrite(f: &mut Function, plan: &Plan, slots: &mut Vec<Inst>) {
+/// the redirected accesses, and the exit stores. A guarded location's zero-trip target comes from
+/// `dummies`, shared with every other guarded location of its type.
+fn rewrite(f: &mut Function, plan: &Plan, slots: &mut Vec<Inst>, dummies: &mut Dummies) {
     let mut guard: Option<ValueId> = None;
     let mut pre: Vec<Inst> = Vec::new();
     // (exit slot load, exit store) per location, built once and copied into every exit.
@@ -310,14 +313,7 @@ fn rewrite(f: &mut Function, plan: &Plan, slots: &mut Vec<Inst>) {
                     c
                 }
             };
-            let dummy = fresh_value(f, MirType::Ptr);
-            slots.push(Inst {
-                result: Some(dummy),
-                op: Op::Alloca {
-                    ty: loc.ty.clone(),
-                    space: AddrSpace::Local,
-                },
-            });
+            let dummy = dummies.slot(f, &loc.ty);
             let sel = fresh_value(f, MirType::Ptr);
             pre.push(Inst {
                 result: Some(sel),
