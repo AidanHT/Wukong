@@ -194,12 +194,7 @@ pub(crate) fn summarize(v: &ColumnVisits) -> SlotSummary {
 /// single-threaded and all-core columns, so it is a conservative statement about the rotation,
 /// never a floor for one particular ratio (that is what [`twin_control`] is for).
 pub(crate) fn resolution(slots: &[SlotSummary]) -> Option<f64> {
-    slots
-        .iter()
-        .filter_map(|s| s.pass_spread)
-        .fold(None, |acc: Option<f64>, s| {
-            Some(acc.map_or(s, |a| a.max(s)))
-        })
+    slots.iter().filter_map(|s| s.pass_spread).reduce(f64::max)
 }
 
 /// The `. dispersion` line, or `None` when no column produced a sample. Deliberately free of every
@@ -274,6 +269,42 @@ pub(crate) fn twin_control(c_slot: usize, twin_slot: usize) -> Option<f64> {
             println!(
                 "  . control C(twin): no pass-paired sample this run, so this section has no \
                  single-thread floor and its standings are unqualified"
+            );
+            None
+        }
+    }
+}
+
+/// The ALL-CORE twin control: the same all-core peer (`C(omp)` or `MKL(all)`) timed a second time
+/// at another slot of the same rotation. It is the identical-arm control Finding 01 named as its
+/// decisive test - `MKL(late)/MKL(early)` - now inside every section that carries it: an all-core
+/// row's ratio is read against what the IDENTICAL all-core column did between two positions, which
+/// is exactly the slot/turbo/placement noise the single-threaded `C(twin)` cannot see. Records the
+/// floor in the numerics ledger, which qualifies the section's all-core standings with it. Silent
+/// when neither column produced a sample (a row with no all-core peer at all, which the elementwise
+/// table has many of), so it never prints a control that was never in the rotation.
+pub(crate) fn all_core_twin_control(label: &str, slot: usize, twin_slot: usize) -> Option<f64> {
+    let passes = LAST_ROTATION.with(|r| {
+        let r = r.borrow();
+        Some((*r.get(slot)?, *r.get(twin_slot)?))
+    });
+    let any = passes.is_some_and(|(a, b)| a.iter().chain(b.iter()).any(Option::is_some));
+    if !any {
+        return None;
+    }
+    match passes.and_then(|(a, b)| twin_floor(a, b)) {
+        Some(([r0, r1], floor)) => {
+            println!(
+                "  . control twin of {label} [the identical all-core column at another slot; true \
+                 ratio 1.000]: per pass {r0:.3}, {r1:.3} -> all-core floor {floor:.3}x"
+            );
+            crate::numerics::record_all_core_floor(floor);
+            Some(floor)
+        }
+        None => {
+            println!(
+                "  . control twin of {label}: no pass-paired sample this run, so this section has no \
+                 all-core floor and its all-core standings are unqualified"
             );
             None
         }

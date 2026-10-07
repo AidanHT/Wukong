@@ -1212,6 +1212,16 @@ fn bench_table_kernel(
         };
         build_peer("c", &src, dir, &format!("{}_omp", k.name), cc, flags)
     });
+    // The all-core twin of the C(omp) column, built only where that column exists.
+    let otl = c_omp_source(k.name).and_then(|src| {
+        omp_threads(cc, dir)?;
+        let flags = if is_reduction_kernel(k.name) {
+            C_OMP_FAST_FLAGS
+        } else {
+            C_OMP_FLAGS
+        };
+        build_peer("c", &src, dir, &format!("{}_omp_twin", k.name), cc, flags)
+    });
     // LIBRARY-GRADE PEERS for every row oneMKL ships the exact primitive for (P6.2): the fifteen
     // VML transcendentals in [`VML_UNARY`], `vsMul` for the Hadamard product and `cblas_sdot` for
     // the dot reduction. All single-threaded, like the Wukong column they are read against. The
@@ -1251,6 +1261,7 @@ fn bench_table_kernel(
         Built::peer(rl),
         Built::peer(fl),
         Built::peer(ol),
+        Built::peer(otl),
         lib,
         lib_la,
     ];
@@ -1295,6 +1306,9 @@ fn bench_table_kernel(
             .as_ref()
             .is_some_and(|m| relaxed_peer_ok(k.name, "C(omp)", m, p))
     });
+    // Slot 8 is the C(omp) twin (silent on the rows that carry no C(omp) column).
+    let _omp_twin = timed.next();
+    dispersion::all_core_twin_control("C(omp)", 7, 8);
     let vml = timed.next().flatten();
     let vml_la = timed.next().flatten();
     TableRow {
@@ -1445,6 +1459,14 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
                 })),
                 None => Built::Missing,
             },
+            // The all-core twin: the identical MKL(all) call at another slot - Finding 01's
+            // `MKL(late)/MKL(early)` control, inside the section it was about.
+            match mkl_all_threads {
+                Some(t) => Built::Direct(Box::new(move |o| {
+                    bench_mm_mkl_rect(m, k, n, true, t, ar, br, o)
+                })),
+                None => Built::Missing,
+            },
         ];
         let mut timed =
             abba_min_columns(columns.len(), |i| time_built(&columns[i], &mut c, ap, bp))
@@ -1461,6 +1483,7 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
         let rm = timed.next().flatten();
         let mkl_1c = timed.next().flatten();
         let mkl_all = timed.next().flatten();
+        let _mkl_twin = timed.next(); // slot 9: read through `all_core_twin_control(.., 8, 9)`
         println!(
             "  {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
             "",
@@ -1486,6 +1509,7 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
             gflops(&rm),
         );
         dispersion::twin_control(2, 3);
+        dispersion::all_core_twin_control("MKL(all)", 8, 9);
         if roof > 0.0 {
             if let Some(w) = &wuk {
                 standing!(
@@ -1615,6 +1639,12 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
             Some(t) => Built::Direct(Box::new(move |o| bench_mm_mkl(ns, false, t, ar, br, o))),
             None => Built::Missing,
         },
+        // The all-core twin: the identical MKL(all) call at another slot - Finding 01's
+        // `MKL(late)/MKL(early)` control, inside the section it was about.
+        match mkl_all_threads {
+            Some(t) => Built::Direct(Box::new(move |o| bench_mm_mkl(ns, false, t, ar, br, o))),
+            None => Built::Missing,
+        },
         Built::Direct(Box::new(move |o| {
             Some(bench_mm_tuned(ns, false, ar, br, o))
         })),
@@ -1637,6 +1667,7 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     });
     let mkl_1c = timed.next().flatten();
     let mkl_all = timed.next().flatten();
+    let _mkl_twin = timed.next(); // slot 10: read through `all_core_twin_control(.., 9, 10)`
     let tuned = timed
         .next()
         .flatten()
@@ -1670,6 +1701,7 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
         gflops(&rm)
     );
     dispersion::twin_control(2, 3);
+    dispersion::all_core_twin_control("MKL(all)", 9, 10);
     report_gemm_standing(&wuk, &tuned, roof, flops);
     report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
     if !run_naive {
@@ -1855,6 +1887,13 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
                 })),
                 None => Built::Missing,
             },
+            // The all-core twin: the identical MKL(all) call at another slot.
+            match mkl_all_threads {
+                Some(t) => Built::Direct(Box::new(move |o: &mut [f32]| {
+                    bench_mm_mkl_tn(ns, ns, ns, t, ar, br, o)
+                })),
+                None => Built::Missing,
+            },
             Built::peer(rl),
         ];
         let mut timed =
@@ -1879,6 +1918,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
             wuk.as_ref()
                 .is_some_and(|m| relaxed_peer_ok("matmul_tn", "MKL(all)", m, p))
         });
+        let _mkl_twin = timed.next(); // slot 8: read through `all_core_twin_control(.., 7, 8)`
         let rm = timed.next().flatten();
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
@@ -1905,6 +1945,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
             gflops(&rm)
         );
         dispersion::twin_control(2, 3);
+        dispersion::all_core_twin_control("MKL(all)", 7, 8);
         // Absolute GFLOP/s on this laptop swings ~3x with the power state, so the number above is
         // only comparable within a run. The clock-invariant denominator is the roofline measured by
         // the SAME process (`measure_fma_roofline`) — print the percentage next to the table, as
@@ -2459,6 +2500,11 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
                 Some(t) => Built::Direct(Box::new(move |o| bench_mm_mkl(ns, true, t, ar, br, o))),
                 None => Built::Missing,
             },
+            // The all-core twin: the identical MKL(all) call at another slot.
+            match mkl_all_threads {
+                Some(t) => Built::Direct(Box::new(move |o| bench_mm_mkl(ns, true, t, ar, br, o))),
+                None => Built::Missing,
+            },
             Built::Direct(Box::new(move |o| Some(bench_mm_tuned(ns, true, ar, br, o)))),
         ];
         let mut timed =
@@ -2480,6 +2526,7 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
         });
         let mkl_1c = timed.next().flatten();
         let mkl_all = timed.next().flatten();
+        let _mkl_twin = timed.next(); // slot 10: read through `all_core_twin_control(.., 9, 10)`
         let tuned = timed
             .next()
             .flatten()
@@ -2513,6 +2560,7 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
             gflops(&rm)
         );
         dispersion::twin_control(2, 3);
+        dispersion::all_core_twin_control("MKL(all)", 9, 10);
         report_gemm_standing(&wuk, &tuned, roof, flops);
         report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
         if let (Some(mp), Some(c)) = (&wk_par, &cm) {
@@ -3141,6 +3189,13 @@ fn bench_transpose(cc: &str, dir: &Path) {
                 })),
                 None => Built::Missing,
             },
+            // The all-core twin: the identical MKL(all) call at another slot.
+            match mkl_all_threads {
+                Some(t) => Built::Direct(Box::new(move |d: &mut [f32]| {
+                    bench_transpose_mkl(rows, cols, t, srcr, d)
+                })),
+                None => Built::Missing,
+            },
             Built::peer(ol),
             Built::peer(rl),
         ];
@@ -3157,6 +3212,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
         // the same bar the C and Rust columns already carry, and dropped on any disagreement.
         let mkl_1c = mkl_transpose_exact(&wuk, timed.next().flatten(), "MKL(1c)");
         let mkl_all = mkl_transpose_exact(&wuk, timed.next().flatten(), "MKL(all)");
+        let _mkl_twin = timed.next(); // slot 7: read through `all_core_twin_control(.., 6, 7)`
         let comp = timed.next().flatten().filter(|p| {
             wuk.as_ref()
                 .is_some_and(|m| relaxed_peer_ok("transpose", "C(omp)", m, p))
@@ -3187,6 +3243,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
             gbps(&rm)
         );
         dispersion::twin_control(2, 3);
+        dispersion::all_core_twin_control("MKL(all)", 6, 7);
         // Transpose is a permutation — exact, so the full-buffer cross-check is bit equality.
         // BOTH peers are checked: a peer whose spelling changed (blocked, sliced) could in principle
         // get "faster" by not doing the work, and an unchecked column would never say so. This is
@@ -3426,6 +3483,18 @@ fn bench_colsum(cc: &str, dir: &Path) {
                 C_OMP_FAST_FLAGS,
             )
         });
+        // The all-core twin: the identical C(omp) source and flags in a second DLL - the control
+        // for this section's all-core rows (see `dispersion::all_core_twin_control`).
+        let otl = omp_threads(cc, dir).and_then(|_| {
+            build_peer(
+                "c",
+                &c_colsum_omp(m, n),
+                dir,
+                "colsum_omp_twin",
+                cc,
+                C_OMP_FAST_FLAGS,
+            )
+        });
         let rl = build_peer(
             "rs",
             &rust_colsum(m, n),
@@ -3446,6 +3515,7 @@ fn bench_colsum(cc: &str, dir: &Path) {
             Built::peer(pl),
             Built::peer(fl),
             Built::peer(ol),
+            Built::peer(otl),
             Built::peer(rl),
         ];
         let mut timed =
@@ -3463,6 +3533,7 @@ fn bench_colsum(cc: &str, dir: &Path) {
             wuk.as_ref()
                 .is_some_and(|mm| relaxed_peer_ok("colsum", "C(omp)", mm, p))
         });
+        let _omp_twin = timed.next(); // slot 7: read through `all_core_twin_control(.., 6, 7)`
         let rm = timed.next().flatten();
         println!(
             "  {:<10} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
@@ -3480,6 +3551,7 @@ fn bench_colsum(cc: &str, dir: &Path) {
             gbps(&rm)
         );
         dispersion::twin_control(2, 3);
+        dispersion::all_core_twin_control("C(omp)", 6, 7);
         // Both sum each column in i-ascending order, so the full-buffer cross-check is bit equality.
         if let (Some(a), Some(c2)) = (&wuk, &cm) {
             if a.out != c2.out {
@@ -9317,7 +9389,9 @@ const CBLAS_FIX_OFFSET: i32 = 173;
 
 /// Elementwise-table rows with an exact oneMKL VML twin: `(row name, vs* symbol, vms* symbol)`.
 /// Every row here computes `out[i] = f(x[i])` over the shared buffer, which is exactly the VML
-/// contract; the buffer is `[1, 9]`, inside every listed op's domain (acosh included).
+/// contract; the buffer is `[1, 9]`, inside every listed op's domain (acosh included). Read by the
+/// Windows-only loader and by the unit tests, so it is gated like `MklGetMaxThreadsFn`.
+#[cfg(any(windows, test))]
 const VML_UNARY: [(&str, &[u8], &[u8]); 15] = [
     ("exp", b"vsExp\0", b"vmsExp\0"),
     ("log", b"vsLn\0", b"vmsLn\0"),

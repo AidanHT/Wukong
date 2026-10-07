@@ -49,6 +49,8 @@ pub(crate) struct Ledger {
     suspect_sections: Vec<String>,
     /// The open scope's `C(twin)` single-thread floor (see `dispersion::twin_control`), if one ran.
     twin_floor: Option<f64>,
+    /// The open scope's all-core twin floor (see `dispersion::all_core_twin_control`), if one ran.
+    all_core_floor: Option<f64>,
 }
 
 impl Ledger {
@@ -59,6 +61,7 @@ impl Ledger {
             clean_standings: 0,
             suspect_sections: Vec::new(),
             twin_floor: None,
+            all_core_floor: None,
         }
     }
 
@@ -68,7 +71,15 @@ impl Ledger {
         self.suspect = false;
         self.clean_standings = 0;
         self.twin_floor = None;
+        self.all_core_floor = None;
         vec![heading.to_string()]
+    }
+
+    /// Record an all-core twin floor for the open scope (widest wins, like the single-thread one).
+    pub(crate) fn record_all_core_floor(&mut self, floor: f64) {
+        if floor.is_finite() && floor >= 1.0 {
+            self.all_core_floor = Some(self.all_core_floor.map_or(floor, |f| f.max(floor)));
+        }
     }
 
     /// Record a `C(twin)` floor for the open scope. Several controls in one scope keep the widest:
@@ -119,12 +130,32 @@ impl Ledger {
         // A single-threaded standing no larger than the section's own zero-difference control is
         // not a measured difference. It is still printed - the reader is owed the number - but it
         // carries the qualification on its own line, where neither a skimming human nor the
-        // extractor can separate the two. All-core standings are never tagged: the control is a
-        // single-threaded column and says nothing about where the scheduler put 16 workers.
-        if let (Some(floor), Some(ratio)) = (self.twin_floor, standing_ratio(line)) {
-            if ratio <= floor && is_single_threaded_standing(line) {
+        // extractor can separate the two. The C(twin) control is a single-threaded column and says
+        // nothing about where the scheduler put 16 workers, so it never qualifies an all-core
+        // standing on its own.
+        //
+        // An all-core standing is qualified by the all-core twin instead, and - when it also has a
+        // single-threaded side the C(twin) measured - by the wider of the two, because its ratio
+        // moves when either side moves. With no all-core control it stays untagged rather than be
+        // judged by a single-threaded column's noise.
+        //
+        // The open section's own heading counts too: the elementwise `@parallel` rows print
+        // `Wukong runtime is ...` with no marker on the line, because the whole row is all-core.
+        let single =
+            is_single_threaded_standing(line) && is_single_threaded_standing(&self.section);
+        let (floor, tag) = if single {
+            (self.twin_floor, "C(twin)")
+        } else {
+            (
+                self.all_core_floor
+                    .map(|a| self.twin_floor.map_or(a, |s| s.max(a))),
+                "ALL-CORE TWIN",
+            )
+        };
+        if let (Some(floor), Some(ratio)) = (floor, standing_ratio(line)) {
+            if ratio <= floor {
                 out.push_str(&format!(
-                    "  [BELOW C(twin) FLOOR {floor:.3}x: not established]"
+                    "  [BELOW {tag} FLOOR {floor:.3}x: not established]"
                 ));
             }
         }
@@ -177,17 +208,23 @@ impl Ledger {
 
 /// The factor a standing states - `N.NN` in `N.NNx faster` / `N.NNx slower` - or `None` when the line
 /// states no such factor (a %-of-roofline line, for one).
+///
+/// The FIRST such factor on the line is the standing: `report` appends a compile-time clause
+/// (`... than C; compiles 3.0x faster`) after the runtime one, and reading that one instead would
+/// judge a runtime ratio by a compile ratio.
 pub(crate) fn standing_ratio(line: &str) -> Option<f64> {
-    ["x faster", "x slower"].iter().find_map(|word| {
-        let head = &line[..line.find(word)?];
-        let start = head
-            .char_indices()
-            .rev()
-            .take_while(|(_, c)| c.is_ascii_digit() || *c == '.')
-            .last()
-            .map(|(i, _)| i)?;
-        head[start..].parse::<f64>().ok().filter(|r| r.is_finite())
-    })
+    let at = ["x faster", "x slower"]
+        .into_iter()
+        .filter_map(|word| line.find(word))
+        .min()?;
+    let head = &line[..at];
+    let start = head
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_digit() || *c == '.')
+        .last()
+        .map(|(i, _)| i)?;
+    head[start..].parse::<f64>().ok().filter(|r| r.is_finite())
 }
 
 /// Markers of a standing that involves an all-core column on either side.
@@ -234,6 +271,11 @@ pub(crate) fn report_mismatch(line: &str) {
 
 pub(crate) fn report_standing(line: &str) {
     emit(with_ledger(|l| l.standing(line)));
+}
+
+/// Record the open section's all-core twin floor (see [`Ledger::record_all_core_floor`]).
+pub(crate) fn record_all_core_floor(floor: f64) {
+    with_ledger(|l| l.record_all_core_floor(floor));
 }
 
 /// Record the open section's `C(twin)` floor (see [`Ledger::record_twin_floor`]).
@@ -332,6 +374,11 @@ mod tests {
             None
         );
         assert_eq!(standing_ratio("x faster"), None);
+        // The runtime factor comes first; the compile-time clause after it is not the standing.
+        assert_eq!(
+            standing_ratio("  -> Wukong runtime is 1.02x slower than C; compiles 3.0x faster"),
+            Some(1.02)
+        );
     }
 
     #[test]
@@ -354,6 +401,55 @@ mod tests {
         // The control is single-threaded; it never qualifies an all-core standing.
         let par = l.standing("  -> Wukong @parallel is 1.01x faster than idiomatic C");
         assert!(!par[0].contains("FLOOR"), "{par:?}");
+    }
+
+    #[test]
+    fn an_all_core_standing_is_judged_by_the_all_core_twin_not_the_single_one() {
+        let mut l = Ledger::new();
+        l.begin("=== matmul 512x512 ===");
+        l.record_twin_floor(1.02);
+        // Only a single-threaded control: an all-core standing stays untagged.
+        let par = l.standing("  -> Wukong @parallel is 1.05x slower than MKL(all)");
+        assert!(!par[0].contains("FLOOR"), "{par:?}");
+        l.record_all_core_floor(1.30);
+        let par = l.standing("  -> Wukong @parallel is 1.25x slower than MKL(all)");
+        assert!(
+            par[0].contains("[BELOW ALL-CORE TWIN FLOOR 1.300x"),
+            "{par:?}"
+        );
+        // The single-threaded standing still uses the single-threaded control only.
+        let one = l.standing("  -> Wukong single-core is 1.25x slower than oneMKL(1 thread)");
+        assert!(!one[0].contains("FLOOR"), "{one:?}");
+        // A cross-threading standing takes the wider of the two.
+        let mut l = Ledger::new();
+        l.begin("=== colsum ===");
+        l.record_twin_floor(1.08);
+        l.record_all_core_floor(1.03);
+        let cross =
+            l.standing("  -> Wukong @parallel is 1.07x faster than idiomatic single-threaded C");
+        assert!(cross[0].contains("ALL-CORE TWIN FLOOR 1.080x"), "{cross:?}");
+        l.begin("=== next ===");
+        let cross =
+            l.standing("  -> Wukong @parallel is 1.07x faster than idiomatic single-threaded C");
+        assert!(
+            !cross[0].contains("FLOOR"),
+            "a new heading drops both floors: {cross:?}"
+        );
+    }
+
+    #[test]
+    fn an_all_core_section_heading_makes_its_unmarked_standings_all_core() {
+        let mut l = Ledger::new();
+        l.begin("=== saxpy@parallel (y = a*x + y, memory-bound) ===");
+        l.record_twin_floor(1.05);
+        let s = l.standing("  -> Wukong runtime is 1.01x slower than C; compiles 3.0x faster");
+        assert!(
+            !s[0].contains("FLOOR"),
+            "an all-core row judged by C(twin): {s:?}"
+        );
+        l.record_all_core_floor(1.04);
+        let s = l.standing("  -> Wukong runtime is 1.01x slower than C; compiles 3.0x faster");
+        assert!(s[0].contains("ALL-CORE TWIN FLOOR 1.050x"), "{s:?}");
     }
 
     #[test]

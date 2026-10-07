@@ -74,7 +74,13 @@ matmul_skinny, matmul_tn, linear, bf16) carry a **`C(twin)` control** - the iden
 compiler and flags in a second DLL, true ratio 1.00 - printed as a `. control C(twin)` line with the
 section's single-thread floor. Every single-threaded standing no larger than that floor is tagged
 `[BELOW C(twin) FLOOR …: not established]`, and the norm tables print `BELOW FLOOR` in the cell.
-All-core standings are never tagged by it: the control is single-threaded.
+All-core standings are never tagged by it: the control is single-threaded. Their control is the
+**all-core twin** - the identical `MKL(all)` call (matmul, matmul_skinny, matmul_tn, linear,
+transpose) or the identical `C(omp)` source in a second DLL (colsum, every `@parallel` table row)
+timed again at another slot - printed as `. control twin of MKL(all) … -> all-core floor F`. It is
+Finding 01's `MKL(late)/MKL(early)` control, inside the sections it was about; all-core standings
+inside it are tagged `[BELOW ALL-CORE TWIN FLOOR …]` (a cross-threading standing takes the wider
+of the two floors).
 
 Optional first CLI argument is a substring filter over kernel/section names (e.g. `saxpy`).
 
