@@ -3266,19 +3266,24 @@ fn bench_transpose(cc: &str, dir: &Path) {
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
             );
-            if aliasing {
-                alias_1c.push(r)
-            } else {
-                gen_1c.push(r)
+            // A SUSPECT section's ratio was withheld above; it must not reach the regime geomean.
+            if !numerics::section_suspect() {
+                if aliasing {
+                    alias_1c.push(r)
+                } else {
+                    gen_1c.push(r)
+                }
             }
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
             par_standing("idiomatic single-threaded C", r);
-            if aliasing {
-                alias_par.push(r)
-            } else {
-                gen_par.push(r)
+            if !numerics::section_suspect() {
+                if aliasing {
+                    alias_par.push(r)
+                } else {
+                    gen_par.push(r)
+                }
             }
         }
         report_cpp_ratio(&wuk, &wk_par, &cm_cpp);
@@ -7821,7 +7826,9 @@ fn bench_norm(cc: &str, dir: &Path) {
             let failures = norm_row_failures(op, &wuk, &c, &rust);
             // Every column here is single-threaded, so the `C(twin)` floor qualifies every cell.
             let standing_vs = |peer: &Option<Measure>| {
-                if !failures.is_empty() {
+                // A row after an earlier row's mismatch in this section is withheld too: the
+                // gate's summary says EVERY standing in a SUSPECT section was withheld.
+                if !failures.is_empty() || numerics::section_suspect() {
                     return "SUSPECT".to_string();
                 }
                 if let (Some(m), Some(p)) = (&wuk, peer) {
@@ -8152,7 +8159,8 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                 // The single-threaded `C(twin)` floor qualifies the single-threaded row only.
                 let floor = if suffix.is_empty() { twin_floor } else { None };
                 let standing_vs = |peer: &Option<Measure>| {
-                    if !failures.is_empty() {
+                    // Withheld too when an earlier row of this section already failed.
+                    if !failures.is_empty() || numerics::section_suspect() {
                         return "SUSPECT".to_string();
                     }
                     if let (Some(m), Some(p)) = (&wuk, peer) {
@@ -11434,7 +11442,8 @@ fn bench_streaming_large(cc: &str, dir: &Path) {
             _ => None,
         };
         let standing_vs = |peer: &Option<Measure>| {
-            if failure.is_some() {
+            // Withheld too when an earlier row of this section already failed.
+            if failure.is_some() || numerics::section_suspect() {
                 return "SUSPECT".to_string();
             }
             if let (Some(m), Some(p)) = (&wuk, peer) {
