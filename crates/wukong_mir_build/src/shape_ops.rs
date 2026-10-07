@@ -140,12 +140,20 @@ impl FnLowerer<'_> {
         self.builder.build(MirType::I64, Op::Bin(op, a, b))
     }
 
+    fn is_negative_i64(&mut self, v: ValueId) -> ValueId {
+        let zero = self.const_i64(0);
+        self.builder
+            .build(MirType::I1, Op::Cmp(CmpOp::Slt, v, zero))
+    }
+
     /// Evaluate a derived extent at run time: `Σ coeff·Π atom^exp` in `i64`, with each variable read
-    /// through `var` and each division/remainder atom as the signed `/` `%` of its evaluated
-    /// operands. It evaluates the CANONICAL form — the one sema compared — so two spellings of one
-    /// extent produce one value. A constant-divisor atom's numerator has non-negative coefficients
-    /// by construction (see `wukong_types::dim`), so the machine's truncating division agrees with
-    /// the floor division the normal form assumed whenever the extents are non-negative.
+    /// through `var` and each division/remainder atom as the FLOOR `/` `%` of its evaluated operands
+    /// — the semantics the normal form (and every compile-time substitution of it) assumes. It
+    /// evaluates the CANONICAL form — the one sema compared — so two spellings of one extent produce
+    /// one value. A constant-divisor atom's numerator has non-negative coefficients by construction
+    /// (see `wukong_types::dim`), so the machine's truncating division already is the floor there.
+    /// A symbolic divisor's numerator can be negative for valid extents — `(L - K)/S + 1` at `L < K`
+    /// is `0`, which truncation would make `1` — so that division is corrected to the floor.
     pub(crate) fn emit_dim_poly(
         &mut self,
         p: &DimPoly,
@@ -160,12 +168,31 @@ impl FnLowerer<'_> {
                     DimAtom::Div(n, d) => {
                         let nv = self.emit_dim_poly(n, var)?;
                         let dv = self.emit_dim_poly(d, var)?;
-                        self.bin_i64(BinOp::SDiv, nv, dv)
+                        let q = self.bin_i64(BinOp::SDiv, nv, dv);
+                        if d.as_constant().is_some() {
+                            q
+                        } else {
+                            // floor = trunc - 1 exactly when the remainder is negative (for the
+                            // positive divisor an extent has).
+                            let r = self.bin_i64(BinOp::SRem, nv, dv);
+                            let neg = self.is_negative_i64(r);
+                            let one = self.const_i64(1);
+                            let q1 = self.bin_i64(BinOp::Sub, q, one);
+                            self.builder.build(MirType::I64, Op::Select(neg, q1, q))
+                        }
                     }
                     DimAtom::Rem(n, d) => {
                         let nv = self.emit_dim_poly(n, var)?;
                         let dv = self.emit_dim_poly(d, var)?;
-                        self.bin_i64(BinOp::SRem, nv, dv)
+                        let r = self.bin_i64(BinOp::SRem, nv, dv);
+                        if d.as_constant().is_some() {
+                            r
+                        } else {
+                            // The non-negative remainder that matches the floor quotient.
+                            let neg = self.is_negative_i64(r);
+                            let r1 = self.bin_i64(BinOp::Add, r, dv);
+                            self.builder.build(MirType::I64, Op::Select(neg, r1, r))
+                        }
                     }
                 };
                 for _ in 0..*e {
@@ -642,6 +669,27 @@ mod tests {
             calls.iter().all(|c| *c == "row_sum"),
             "unexpected calls in main: {calls:?}"
         );
+    }
+
+    /// A symbolic divisor's quotient is the FLOOR the normal form (and sema's compile-time
+    /// substitution) assumes: `(L - K)/S + 1` at `L < K` is 0, not the 1 truncation gives, so the
+    /// run-time extent carries the fix-up `select`. A constant divisor's numerator is non-negative
+    /// by construction (`wukong_types::dim`) and needs none.
+    #[test]
+    fn a_symbolic_divisor_is_floor_divided_at_run_time() {
+        let (prog, interner) = lowers_clean(
+            "fn outs<L, K, S>(a: Tensor[f32, (L - K)/S + 1]) -> i64 { return a.len(); }              fn half<N>(a: Tensor[f32, (N + 1)/2]) -> i64 { return a.len(); }              fn main() -> i32 { let x: [f32; 2] = [0.0; 2]; let y: [f32; 2] = [0.0; 2];              return (outs::<5, 3, 2>(x) + half::<3>(y)) as i32; }",
+        );
+        let selects = |name: &str| {
+            func(&prog, &interner, name)
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .filter(|i| matches!(i.op, Op::Select(..)))
+                .count()
+        };
+        assert_eq!(selects("outs"), 1);
+        assert_eq!(selects("half"), 0);
     }
 
     #[test]
