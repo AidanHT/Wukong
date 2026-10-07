@@ -6,9 +6,10 @@
 //! matmul recognizer) — analogous to how XLA/TVM/oneDNN lower a matmul op to an optimized
 //! microkernel rather than emitting the naive nest.
 //!
-//! The whole exported family lives here: `nn`/`nt` (`A·Bᵀ`)/`tn` (`Aᵀ·B`, transpose prepass), the
-//! fused epilogue `_nt_epi` (`act(A·Bᵀ + bias)`), the α-scaled `_nt_alpha`, bf16/f16 input forms
-//! (lossless widen prepass into the same f32 kernel), and a `_parallel` twin of each. LANDMINE:
+//! The whole exported family lives here: `nn`/`nt` (`A·Bᵀ`)/`tn` (`Aᵀ·B`, A packed straight from its
+//! `[k, m]` storage), the fused epilogue `_nt_epi` (`act(A·Bᵀ + bias)`), the α-scaled `_nt_alpha`,
+//! bf16/f16 input forms (lossless SIMD widen prepass, into reused per-thread scratch, feeding the
+//! same f32 kernel), and a `_parallel` twin of each. LANDMINE:
 //! `alpha` folds into the same final-K-block writeback that performs the accumulate, so it scales the
 //! beta-accumulated value — only `beta == 0` is supported with a non-unit α (see [`Epilogue`] and the
 //! `debug_assert` in [`gemm_dispatch`]). This module also owns [`gemm_pool`], the crate's unified
@@ -574,6 +575,8 @@ struct GemmArgs {
     k: usize,
     n: usize,
     beta: f32,
+    /// A stored transposed, `[k, m]` (the `C = Aᵀ·B` entries); see [`a_origin`].
+    at: bool,
     bt: bool,
     epi: Option<Epilogue>,
 }
@@ -593,7 +596,8 @@ impl GemmArgs {
     unsafe fn run(self) {
         unsafe {
             sgemm_avx2_parallel(
-                self.a, self.b, self.c, self.m, self.k, self.n, self.beta, self.bt, self.epi,
+                self.a, self.b, self.c, self.m, self.k, self.n, self.beta, self.at, self.bt,
+                self.epi,
             )
         }
     }
@@ -698,7 +702,7 @@ pub unsafe extern "C" fn wukong_sgemm(
     n: i64,
     beta: i64,
 ) {
-    gemm_dispatch(a, b, c, m, k, n, beta, false, false, None);
+    gemm_dispatch(a, b, c, m, k, n, beta, false, false, false, None);
 }
 
 /// `C = A·Bᵀ` (B is row-major `[n, k]`), the `nn.Linear` / `x @ Wᵀ` form — the most common matmul
@@ -716,7 +720,7 @@ pub unsafe extern "C" fn wukong_sgemm_nt(
     n: i64,
     beta: i64,
 ) {
-    gemm_dispatch(a, b, c, m, k, n, beta, true, false, None);
+    gemm_dispatch(a, b, c, m, k, n, beta, false, true, false, None);
 }
 
 /// `C = act(A·Bᵀ + bias)` — the `nn.Linear` form with a fused bias-add + activation epilogue, folded
@@ -747,7 +751,7 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi(
         act: act as u32,
         alpha: 1.0,
     };
-    gemm_dispatch(a, b, c, m, k, n, beta, true, false, Some(epi));
+    gemm_dispatch(a, b, c, m, k, n, beta, false, true, false, Some(epi));
 }
 
 /// `C = alpha·(A·Bᵀ)` — the **α-scaled `nn.Linear`**: the attention score matmul `QKᵀ/√d` (and every
@@ -783,7 +787,7 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha(
         act: ACT_IDENTITY,
         alpha,
     };
-    gemm_dispatch(a, b, c, m, k, n, beta, true, false, Some(epi));
+    gemm_dispatch(a, b, c, m, k, n, beta, false, true, false, Some(epi));
 }
 
 /// Multi-threaded `C = alpha·(A·Bᵀ)` — the α-scaled `nn.Linear` across cores (the `@parallel` attention
@@ -810,13 +814,14 @@ pub unsafe extern "C" fn wukong_sgemm_nt_alpha_parallel(
         act: ACT_IDENTITY,
         alpha,
     };
-    gemm_dispatch(a, b, c, m, k, n, beta, true, true, Some(epi));
+    gemm_dispatch(a, b, c, m, k, n, beta, false, true, true, Some(epi));
 }
 
-/// Pick AVX2 vs scalar and serial vs parallel; `bt` selects `C = A·Bᵀ`.
+/// Pick AVX2 vs scalar and serial vs parallel; `at` reads A as stored `[k, m]` (`C = Aᵀ·B`, packed
+/// straight from that layout), `bt` reads B as stored `[n, k]` (`C = A·Bᵀ`).
 ///
 /// # Safety
-/// Operand-size contract of [`wukong_sgemm`] / [`wukong_sgemm_nt`].
+/// Operand-size contract of [`wukong_sgemm`] / [`wukong_sgemm_nt`] / [`wukong_sgemm_tn`].
 #[allow(clippy::too_many_arguments)]
 unsafe fn gemm_dispatch(
     a: *const f32,
@@ -826,6 +831,7 @@ unsafe fn gemm_dispatch(
     k: i64,
     n: i64,
     beta: i64,
+    at: bool,
     bt: bool,
     par: bool,
     epi: Option<Epilogue>,
@@ -886,7 +892,7 @@ unsafe fn gemm_dispatch(
                             p.current_num_threads()
                         }) <= 1 =>
                     {
-                        sgemm_avx2(a, b, c, m, k, n, beta, bt, epi)
+                        sgemm_avx2(a, b, c, m, k, n, beta, at, bt, epi)
                     }
                     (true, pool) => {
                         let args = GemmArgs {
@@ -897,6 +903,7 @@ unsafe fn gemm_dispatch(
                             k,
                             n,
                             beta,
+                            at,
                             bt,
                             epi,
                         };
@@ -928,13 +935,13 @@ unsafe fn gemm_dispatch(
                             sgemm_persistent_region(pool, args);
                         }
                     }
-                    (false, _) => sgemm_avx2(a, b, c, m, k, n, beta, bt, epi),
+                    (false, _) => sgemm_avx2(a, b, c, m, k, n, beta, at, bt, epi),
                 }
             }
             return;
         }
     }
-    sgemm_scalar(a, b, c, m, k, n, beta, bt, epi);
+    sgemm_scalar(a, b, c, m, k, n, beta, at, bt, epi);
 }
 
 /// Multi-threaded `C = A·B`. For each `KC` contraction block it packs the *whole* A column-panel and
@@ -955,7 +962,7 @@ pub unsafe extern "C" fn wukong_sgemm_parallel(
     n: i64,
     beta: i64,
 ) {
-    gemm_dispatch(a, b, c, m, k, n, beta, false, true, None);
+    gemm_dispatch(a, b, c, m, k, n, beta, false, false, true, None);
 }
 
 /// Multi-threaded `C = A·Bᵀ` (the `nn.Linear` form).
@@ -972,7 +979,7 @@ pub unsafe extern "C" fn wukong_sgemm_nt_parallel(
     n: i64,
     beta: i64,
 ) {
-    gemm_dispatch(a, b, c, m, k, n, beta, true, true, None);
+    gemm_dispatch(a, b, c, m, k, n, beta, false, true, true, None);
 }
 
 /// Multi-threaded `C = act(A·Bᵀ + bias)` — the fused-epilogue `nn.Linear` across cores (the
@@ -1004,31 +1011,24 @@ pub unsafe extern "C" fn wukong_sgemm_nt_epi_parallel(
         act: act as u32,
         alpha: 1.0,
     };
-    gemm_dispatch(a, b, c, m, k, n, beta, true, true, Some(epi));
-}
-
-/// Transpose a row-major `[rows, cols]` matrix `src` into a row-major `[cols, rows]` matrix `dst`
-/// (`dst[c*rows + r] = src[r*cols + c]`). Reuse the cache-blocked transpose kernel, including its
-/// 8×8 AVX2 path, for this one-time O(rows·cols) reorganization before `C = Aᵀ·B`.
-///
-/// # Safety
-/// `src` and `dst` must each be valid for `rows*cols` `f32`, and must not overlap.
-#[inline]
-unsafe fn transpose_into(src: *const f32, dst: *mut f32, rows: usize, cols: usize) {
-    // The GEMM entry points validate positive i64 dimensions before converting them to usize,
-    // so these casts recover the original extents. Scratch is distinct from the source, as the
-    // transpose kernel requires. No arithmetic touches the values, including NaN payloads.
-    crate::transpose::wukong_transpose_f32(src, dst, rows as i64, cols as i64);
+    gemm_dispatch(a, b, c, m, k, n, beta, false, true, true, Some(epi));
 }
 
 /// `C = Aᵀ·B` — A is stored row-major as `[k, m]` (`a[p*m + i]`), B row-major `[k, n]` (`b[p*n + j]`),
 /// C is `[m, n]`. This is the **weight-gradient** GEMM of a training backward pass (`dW = dYᵀ·X`): the
 /// contraction axis (the batch) is the *outer* index of both inputs, so A's logical `[m, k]` operand
 /// is the transpose of its storage. gcc/rustc compile the naive nest with column-strided A reads that
-/// defeat vectorization (one cache line per element); Wukong transposes A into scratch once — O(m·k),
-/// ~1/n of the O(m·n·k) GEMM — then runs the identical tuned `C = A·B` kernel. Reusing *that exact
-/// kernel* means it is bit-for-bit the differential contract the interpreter marshals (no new
-/// accumulation order to keep in sync). `beta`: 0 overwrites C, else accumulates.
+/// defeat vectorization (one cache line per element).
+///
+/// Wukong packs A **straight from its `[k, m]` storage** (`gemm_dispatch(.., at = true, ..)`): the
+/// `[kc][MR]` A micropanel the kernel wants is, for each contraction step, six CONSECUTIVE stored
+/// elements — a contiguous copy, cheaper than the row-major packer's transpose. Until 2026-10 every
+/// call instead allocated and zeroed an `m·k` f32 scratch matrix, transposed A into it and ran the
+/// NN kernel on the copy (P9.19): `m·k` floats of first-touch page faults and an extra read+write
+/// pass per training step. The packed bytes are identical either way, so the result is bit-for-bit
+/// the NN kernel on the explicitly transposed A (`sgemm_tn_matches_naive_and_transposed_nn`) — the
+/// same `select_kc` grouping and per-`(i, j)` order, no new accumulation order to keep in sync.
+/// `beta`: 0 overwrites C, else accumulates.
 ///
 /// # Safety
 /// `a` valid for `k*m`, `b` for `k*n`, `c` for `m*n` `f32`.
@@ -1042,18 +1042,12 @@ pub unsafe extern "C" fn wukong_sgemm_tn(
     n: i64,
     beta: i64,
 ) {
-    if m <= 0 || k <= 0 || n <= 0 {
-        return;
-    }
-    let (mu, ku) = (m as usize, k as usize);
-    let mut at = vec![0.0f32; mu * ku];
-    transpose_into(a, at.as_mut_ptr(), ku, mu); // [k, m] -> [m, k]
-    gemm_dispatch(at.as_ptr(), b, c, m, k, n, beta, false, false, None);
+    gemm_dispatch(a, b, c, m, k, n, beta, true, false, false, None);
 }
 
-/// Multi-threaded `C = Aᵀ·B` (the `@parallel` weight-gradient GEMM). Transposes A serially (the small
-/// O(m·k) prepass), then runs the multicore `C = A·B` kernel — whose per-(i,j) accumulation order
-/// matches the serial one, so serial == parallel == interpreter bit-for-bit (the differential gate).
+/// Multi-threaded `C = Aᵀ·B` (the `@parallel` weight-gradient GEMM). Every parallel schedule packs
+/// A from its `[k, m]` storage exactly as the serial kernel does, and keeps the serial per-(i,j)
+/// accumulation order, so serial == parallel == interpreter bit-for-bit (the differential gate).
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgemm_tn`].
@@ -1067,65 +1061,152 @@ pub unsafe extern "C" fn wukong_sgemm_tn_parallel(
     n: i64,
     beta: i64,
 ) {
-    if m <= 0 || k <= 0 || n <= 0 {
-        return;
-    }
-    let (mu, ku) = (m as usize, k as usize);
-    let mut at = vec![0.0f32; mu * ku];
-    transpose_into(a, at.as_mut_ptr(), ku, mu);
-    gemm_dispatch(at.as_ptr(), b, c, m, k, n, beta, false, true, None);
+    gemm_dispatch(a, b, c, m, k, n, beta, true, false, true, None);
 }
 
-/// Widen `n` half-width values (`bf16`/`f16` stored bits) into an `f32` scratch buffer. The widen is
+/// The half-precision storage a mixed-precision GEMM entry widens from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HalfKind {
+    Bf16,
+    F16,
+}
+
+impl HalfKind {
+    /// The scalar widen: the crate-root definition the interpreter and every other kernel share.
+    #[inline]
+    fn widen1(self, bits: u16) -> f32 {
+        match self {
+            HalfKind::Bf16 => crate::bf16_bits_to_f32(bits),
+            HalfKind::F16 => crate::f16_bits_to_f32(bits),
+        }
+    }
+}
+
+// Reusable per-thread widen scratch for the bf16/f16 GEMM entries (the widened A and B operands),
+// the `PACK_SCRATCH` discipline applied to the prepass (P9.19): until 2026-10 every half GEMM
+// allocated and zeroed `(m·k + n·k)` fresh f32 per call — for a 768x3072 bf16 projection at batch
+// 512, ~15 MB of first-touch page faults per call — although the widen overwrites every element the
+// GEMM reads. A buffer is taken out for the call and put back after it (the GEMM, serial or
+// parallel, has joined by then), never re-zeroed; growth allocates fresh zeroed storage instead of
+// copying stale contents across.
+thread_local! {
+    static LOWP_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// The largest widened operand (in f32 elements, per buffer) the per-thread [`LOWP_SCRATCH`]
+/// keeps between calls: 8 Mi f32 = 32 MiB covers every transformer projection (a 768x3072 operand
+/// is 2.4 Mi) while a one-off huge operand — a 50257x768 LM head is 38.6 Mi — is freed after its
+/// call instead of being pinned for the thread's lifetime. Retention-only: never changes a bit.
+const LOWP_SCRATCH_KEEP: usize = 8 << 20;
+
+/// Run `f` with two f32 buffers of at least `na` and `nb` elements from the calling thread's
+/// [`LOWP_SCRATCH`]. Their contents on entry are unspecified — `f` must write every element it
+/// reads, which the widen prepasses do — and they are returned to the cache afterwards unless
+/// larger than [`LOWP_SCRATCH_KEEP`].
+fn with_lowp_scratch(na: usize, nb: usize, f: impl FnOnce(*mut f32, *mut f32)) {
+    let (mut sa, mut sb) = LOWP_SCRATCH.with(|s| {
+        let mut g = s.borrow_mut();
+        (std::mem::take(&mut g.0), std::mem::take(&mut g.1))
+    });
+    if sa.len() < na {
+        sa = vec![0.0f32; na];
+    }
+    if sb.len() < nb {
+        sb = vec![0.0f32; nb];
+    }
+    f(sa.as_mut_ptr(), sb.as_mut_ptr());
+    LOWP_SCRATCH.with(|s| {
+        let mut g = s.borrow_mut();
+        if sa.len() <= LOWP_SCRATCH_KEEP {
+            g.0 = sa;
+        }
+        if sb.len() <= LOWP_SCRATCH_KEEP {
+            g.1 = sb;
+        }
+    });
+}
+
+/// Widen `n` half-width values (`bf16`/`f16` stored bits) into an `f32` buffer. The widen is
 /// **lossless** (`bf16` is the top 16 bits of an f32; `f16`→f32 is an exact super-range), so the
 /// widened matrix holds exactly the values the half storage represents.
 ///
+/// Eight lanes at a time where the host allows — bf16 through `lowp::widen_bf16` (`vpmovzxwd` +
+/// `vpslld 16`, the identical bit-extend the scalar `(bits as u32) << 16` performs) and f16 through
+/// `lowp::widen_f16` (F16C `vcvtph2ps`, which is what the `half` crate itself dispatches to on an
+/// F16C host and which its software fallback reproduces bit for bit, quieted-NaN payloads
+/// included) — with the scalar [`HalfKind::widen1`] for the tail and every other host. Selected
+/// once per call by `kind`, not through a per-element function pointer. Pinned over all 65,536
+/// bit patterns of both formats by `lowp_widen_simd_matches_scalar_for_every_bit_pattern`.
+///
 /// # Safety
 /// `src` valid for `n` `u16`, `dst` valid for `n` `f32`, non-overlapping.
+unsafe fn widen_into_f32(src: *const u16, dst: *mut f32, n: usize, kind: HalfKind) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match kind {
+            HalfKind::Bf16 if is_x86_feature_detected!("avx2") => {
+                widen_bf16_into_avx2(src, dst, n);
+                return;
+            }
+            HalfKind::F16
+                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") =>
+            {
+                widen_f16_into_f16c(src, dst, n);
+                return;
+            }
+            _ => {}
+        }
+    }
+    widen_into_f32_scalar(src, dst, n, kind);
+}
+
+/// The scalar widen loop: the no-SIMD path, the SIMD tails, and the twin the SIMD bodies match.
+///
+/// # Safety
+/// As [`widen_into_f32`].
 #[inline]
-unsafe fn widen_into_f32(src: *const u16, dst: *mut f32, n: usize, widen: fn(u16) -> f32) {
+unsafe fn widen_into_f32_scalar(src: *const u16, dst: *mut f32, n: usize, kind: HalfKind) {
     for i in 0..n {
-        *dst.add(i) = widen(*src.add(i));
+        *dst.add(i) = kind.widen1(*src.add(i));
     }
 }
 
-/// Widen and transpose `[rows, cols]` half storage directly into `[cols, rows]` f32 scratch.
-/// Conversion uses the same scalar function as [`widen_into_f32`]; changing the destination of
-/// each independent conversion removes the intervening full-size f32 matrix and transpose pass.
+/// The 8-lane bf16 widen body of [`widen_into_f32`].
 ///
 /// # Safety
-/// `src` valid for `rows*cols` u16, `dst` for `rows*cols` f32, non-overlapping.
-#[inline]
-unsafe fn widen_transpose_into_f32(
-    src: *const u16,
-    dst: *mut f32,
-    rows: usize,
-    cols: usize,
-    widen: fn(u16) -> f32,
-) {
-    // Limit the strided destination stream to eight rows, as in the f32 transpose's 8x8 tile.
-    // In particular, a power-of-two destination stride must not keep every matrix row live in
-    // the same cache set. Ragged edges use the identical element mapping.
-    const TILE: usize = 8;
-    for r0 in (0..rows).step_by(TILE) {
-        let r1 = (r0 + TILE).min(rows);
-        for c0 in (0..cols).step_by(TILE) {
-            let c1 = (c0 + TILE).min(cols);
-            for r in r0..r1 {
-                let s = src.add(r * cols);
-                for c in c0..c1 {
-                    *dst.add(c * rows + r) = widen(*s.add(c));
-                }
-            }
-        }
+/// As [`widen_into_f32`]; `avx2` available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn widen_bf16_into_avx2(src: *const u16, dst: *mut f32, n: usize) {
+    let mut i = 0;
+    while i + 8 <= n {
+        std::arch::x86_64::_mm256_storeu_ps(dst.add(i), crate::lowp::widen_bf16(src.add(i)));
+        i += 8;
     }
+    widen_into_f32_scalar(src.add(i), dst.add(i), n - i, HalfKind::Bf16);
+}
+
+/// The 8-lane f16 widen body of [`widen_into_f32`].
+///
+/// # Safety
+/// As [`widen_into_f32`]; `avx2` and `f16c` available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn widen_f16_into_f16c(src: *const u16, dst: *mut f32, n: usize) {
+    let mut i = 0;
+    while i + 8 <= n {
+        std::arch::x86_64::_mm256_storeu_ps(dst.add(i), crate::lowp::widen_f16(src.add(i)));
+        i += 8;
+    }
+    widen_into_f32_scalar(src.add(i), dst.add(i), n - i, HalfKind::F16);
 }
 
 /// `C = A·Bᵀ` (the `nn.Linear` form) with **half-precision inputs** (`bf16`/`f16`, stored as `u16`)
 /// and an **f32 accumulator** — the standard mixed-precision transformer matmul. A is `[m, k]`, B is
 /// `[n, k]` (its rows are the weight vectors), C is `[m, n]` f32.
 ///
-/// Like the `Aᵀ·B` kernel, this is a cheap prepass (widen A and B into f32 scratch — `O(m·k + n·k)`,
+/// This is a cheap prepass (widen A and B into reused per-thread f32 scratch — `O(m·k + n·k)`,
 /// dwarfed by the `O(m·n·k)` GEMM) feeding the *identical* tuned `C = A·Bᵀ` microkernel. Because the
 /// widen is lossless, the result is bit-for-bit the f32 GEMM on the widened values — exactly the
 /// differential contract the interpreter marshals (no new accumulation order). gcc/rustc compile the
@@ -1146,18 +1227,18 @@ unsafe fn gemm_lowp_nt(
     n: i64,
     beta: i64,
     par: bool,
-    widen: fn(u16) -> f32,
+    kind: HalfKind,
     epi: Option<Epilogue>,
 ) {
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
     let (mu, ku, nu) = (m as usize, k as usize, n as usize);
-    let mut af = vec![0.0f32; mu * ku];
-    let mut bf = vec![0.0f32; nu * ku];
-    widen_into_f32(a, af.as_mut_ptr(), mu * ku, widen);
-    widen_into_f32(b, bf.as_mut_ptr(), nu * ku, widen);
-    gemm_dispatch(af.as_ptr(), bf.as_ptr(), c, m, k, n, beta, true, par, epi);
+    with_lowp_scratch(mu * ku, nu * ku, |af, bf| {
+        widen_into_f32(a, af, mu * ku, kind);
+        widen_into_f32(b, bf, nu * ku, kind);
+        gemm_dispatch(af, bf, c, m, k, n, beta, false, true, par, epi);
+    });
 }
 
 /// `C = A·Bᵀ` with `bf16` inputs (f32 accumulate), single-threaded. See [`gemm_lowp_nt`].
@@ -1174,7 +1255,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_nt(a, b, c, m, k, n, beta, false, crate::bf16_bits_to_f32, None);
+    gemm_lowp_nt(a, b, c, m, k, n, beta, false, HalfKind::Bf16, None);
 }
 
 /// Multi-threaded `C = A·Bᵀ` with `bf16` inputs. The widen prepass is serial (small); the GEMM runs
@@ -1193,7 +1274,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_parallel(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_nt(a, b, c, m, k, n, beta, true, crate::bf16_bits_to_f32, None);
+    gemm_lowp_nt(a, b, c, m, k, n, beta, true, HalfKind::Bf16, None);
 }
 
 /// `C = A·Bᵀ` with IEEE `f16` inputs (f32 accumulate), single-threaded. The widen is F16C-exact
@@ -1211,7 +1292,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_nt(a, b, c, m, k, n, beta, false, crate::f16_bits_to_f32, None);
+    gemm_lowp_nt(a, b, c, m, k, n, beta, false, HalfKind::F16, None);
 }
 
 /// Multi-threaded `C = A·Bᵀ` with `f16` inputs.
@@ -1228,7 +1309,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_parallel(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_nt(a, b, c, m, k, n, beta, true, crate::f16_bits_to_f32, None);
+    gemm_lowp_nt(a, b, c, m, k, n, beta, true, HalfKind::F16, None);
 }
 
 /// `C = act(A·Bᵀ + bias)` with **bf16/f16 inputs** (f32 accumulate) — the mixed-precision transformer
@@ -1253,14 +1334,14 @@ unsafe fn gemm_lowp_nt_epi(
     bias: *const f32,
     act: i64,
     par: bool,
-    widen: fn(u16) -> f32,
+    kind: HalfKind,
 ) {
     let epi = Epilogue {
         bias,
         act: act as u32,
         alpha: 1.0,
     };
-    gemm_lowp_nt(a, b, c, m, k, n, beta, par, widen, Some(epi));
+    gemm_lowp_nt(a, b, c, m, k, n, beta, par, kind, Some(epi));
 }
 
 /// Fused-epilogue `C = act(A·Bᵀ + bias)` with `bf16` inputs, single-threaded. See [`gemm_lowp_nt_epi`].
@@ -1282,19 +1363,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi(
     bias: *const f32,
     act: i64,
 ) {
-    gemm_lowp_nt_epi(
-        a,
-        b,
-        c,
-        m,
-        k,
-        n,
-        beta,
-        bias,
-        act,
-        false,
-        crate::bf16_bits_to_f32,
-    );
+    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, false, HalfKind::Bf16);
 }
 
 /// Multi-threaded fused-epilogue `C = act(A·Bᵀ + bias)` with `bf16` inputs.
@@ -1314,19 +1383,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_nt_epi_parallel(
     bias: *const f32,
     act: i64,
 ) {
-    gemm_lowp_nt_epi(
-        a,
-        b,
-        c,
-        m,
-        k,
-        n,
-        beta,
-        bias,
-        act,
-        true,
-        crate::bf16_bits_to_f32,
-    );
+    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, HalfKind::Bf16);
 }
 
 /// Fused-epilogue `C = act(A·Bᵀ + bias)` with `f16` inputs, single-threaded. See [`gemm_lowp_nt_epi`].
@@ -1348,19 +1405,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi(
     bias: *const f32,
     act: i64,
 ) {
-    gemm_lowp_nt_epi(
-        a,
-        b,
-        c,
-        m,
-        k,
-        n,
-        beta,
-        bias,
-        act,
-        false,
-        crate::f16_bits_to_f32,
-    );
+    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, false, HalfKind::F16);
 }
 
 /// Multi-threaded fused-epilogue `C = act(A·Bᵀ + bias)` with `f16` inputs.
@@ -1380,19 +1425,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi_parallel(
     bias: *const f32,
     act: i64,
 ) {
-    gemm_lowp_nt_epi(
-        a,
-        b,
-        c,
-        m,
-        k,
-        n,
-        beta,
-        bias,
-        act,
-        true,
-        crate::f16_bits_to_f32,
-    );
+    gemm_lowp_nt_epi(a, b, c, m, k, n, beta, bias, act, true, HalfKind::F16);
 }
 
 /// `C = Aᵀ·B` with **half-precision inputs** (`bf16`/`f16`, stored as `u16`) and an **f32 accumulator**
@@ -1400,14 +1433,14 @@ pub unsafe extern "C" fn wukong_sgemm_f16_nt_epi_parallel(
 /// stored `[k, m]` (its logical `[m, k]` operand is the transpose of storage), B is `[k, n]`, C is
 /// `[m, n]` f32.
 ///
-/// Like the f32 `Aᵀ·B` and the half `A·Bᵀ` kernels, this is a cheap prepass feeding the *identical*
-/// proven kernel: widen and transpose A directly into `[m, k]` f32 scratch, widen B into `[k, n]`
-/// f32 scratch (lossless — `O(k·m + k·n)`), then dispatch the tuned `C = A·B` microkernel. This
-/// avoids a separate `[k, m]` f32 copy of A and its full transpose pass. Because each conversion
-/// is unchanged, the result is bit-for-bit the f32 TN
-/// GEMM on the widened values — exactly the differential contract the interpreter marshals (no new
-/// accumulation order). gcc/rustc lose twice on the naive half nest: the inline `bf16→f32` widen won't
-/// vectorize *and* A's column-strided reads (the contraction is A's outer index) defeat vectorization.
+/// Like the half `A·Bᵀ` kernel, this is a cheap prepass feeding the *identical* proven kernel: widen
+/// A and B **in their stored layouts** (`[k, m]` and `[k, n]`, lossless, `O(k·m + k·n)`, into reused
+/// per-thread scratch) and dispatch the f32 `C = Aᵀ·B` kernel, which packs the widened A straight
+/// from its `[k, m]` layout (see [`wukong_sgemm_tn`]) — no transpose pass and no `[m, k]` copy.
+/// Because each conversion is exact, the result is bit-for-bit the f32 TN GEMM on the widened values
+/// — exactly the differential contract the interpreter marshals (no new accumulation order).
+/// gcc/rustc lose twice on the naive half nest: the inline `bf16→f32` widen won't vectorize *and*
+/// A's column-strided reads (the contraction is A's outer index) defeat vectorization.
 ///
 /// # Safety
 /// `a` valid for `k*m`, `b` for `k*n` `u16`; `c` for `m*n` `f32`.
@@ -1422,19 +1455,19 @@ unsafe fn gemm_lowp_tn(
     n: i64,
     beta: i64,
     par: bool,
-    widen: fn(u16) -> f32,
+    kind: HalfKind,
 ) {
     if m <= 0 || k <= 0 || n <= 0 {
         return;
     }
     let (mu, ku, nu) = (m as usize, k as usize, n as usize);
-    let mut at = vec![0.0f32; mu * ku];
-    let mut bf = vec![0.0f32; ku * nu];
-    widen_transpose_into_f32(a, at.as_mut_ptr(), ku, mu, widen);
-    widen_into_f32(b, bf.as_mut_ptr(), ku * nu, widen);
-    // at[i*k + p] == widen(a[p*m + i]), exactly the matrix the old widen-then-transpose
-    // prepasses produced. Preserve beta, parallel routing and the NN kernel's K grouping.
-    gemm_dispatch(at.as_ptr(), bf.as_ptr(), c, m, k, n, beta, false, par, None);
+    with_lowp_scratch(ku * mu, ku * nu, |af, bf| {
+        // af[p*m + i] == widen(a[p*m + i]): A keeps its stored [k, m] layout and the GEMM packs it
+        // as the transposed operand, the same bytes the old widen-then-transpose copy produced.
+        widen_into_f32(a, af, ku * mu, kind);
+        widen_into_f32(b, bf, ku * nu, kind);
+        gemm_dispatch(af, bf, c, m, k, n, beta, true, false, par, None);
+    });
 }
 
 /// `C = Aᵀ·B` with `bf16` inputs (f32 accumulate), single-threaded. See [`gemm_lowp_tn`].
@@ -1451,10 +1484,10 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_tn(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_tn(a, b, c, m, k, n, beta, false, crate::bf16_bits_to_f32);
+    gemm_lowp_tn(a, b, c, m, k, n, beta, false, HalfKind::Bf16);
 }
 
-/// Multi-threaded `C = Aᵀ·B` with `bf16` inputs. The widen + transpose prepass is serial (small); the
+/// Multi-threaded `C = Aᵀ·B` with `bf16` inputs. The widen prepass is serial (small); the
 /// GEMM runs across cores with the same per-(i,j) order as the serial kernel, so serial == parallel
 /// == interpreter bit-for-bit.
 ///
@@ -1470,7 +1503,7 @@ pub unsafe extern "C" fn wukong_sgemm_bf16_tn_parallel(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_tn(a, b, c, m, k, n, beta, true, crate::bf16_bits_to_f32);
+    gemm_lowp_tn(a, b, c, m, k, n, beta, true, HalfKind::Bf16);
 }
 
 /// `C = Aᵀ·B` with IEEE `f16` inputs (f32 accumulate), single-threaded. The widen is F16C-exact;
@@ -1488,7 +1521,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_tn(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_tn(a, b, c, m, k, n, beta, false, crate::f16_bits_to_f32);
+    gemm_lowp_tn(a, b, c, m, k, n, beta, false, HalfKind::F16);
 }
 
 /// Multi-threaded `C = Aᵀ·B` with `f16` inputs.
@@ -1505,7 +1538,7 @@ pub unsafe extern "C" fn wukong_sgemm_f16_tn_parallel(
     n: i64,
     beta: i64,
 ) {
-    gemm_lowp_tn(a, b, c, m, k, n, beta, true, crate::f16_bits_to_f32);
+    gemm_lowp_tn(a, b, c, m, k, n, beta, true, HalfKind::F16);
 }
 
 /// The **legacy fork-join** parallel kernel: one rayon fork-join for the fused pack region plus one
@@ -1525,6 +1558,7 @@ unsafe fn sgemm_avx2_parallel(
     k: usize,
     n: usize,
     beta: f32,
+    at: bool,
     bt: bool,
     epi: Option<Epilogue>,
 ) {
@@ -1557,9 +1591,11 @@ unsafe fn sgemm_avx2_parallel(
             // region (see `pack_ab_par`): with the C compute spread across every core a serial pack
             // would dominate (Amdahl), but every extra fork-join is a real barrier tax at the mid
             // sizes, so the A- and B-panels share a single region (and a tiny block packs serially).
+            let (a_blk, lda) = a_origin(a, m, k, at, 0, pc);
             pack_ab_par(
-                a.add(pc),
-                k,
+                a_blk,
+                lda,
+                at,
                 m,
                 b,
                 k,
@@ -1775,7 +1811,7 @@ unsafe fn gemm_region_worker(rg: &GemmRegion, widx: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     let (a, b, c) = (rg.args.a, rg.args.b, rg.args.c);
     let (m, k, n) = (rg.args.m, rg.args.k, rg.args.n);
-    let (beta, bt, epi) = (rg.args.beta, rg.args.bt, rg.args.epi);
+    let (beta, at, bt, epi) = (rg.args.beta, rg.args.at, rg.args.bt, rg.args.epi);
     let (ap, bp) = (rg.ap, rg.bp);
     let mut block = 0usize;
     let mut jc = 0;
@@ -1798,9 +1834,10 @@ unsafe fn gemm_region_worker(rg: &GemmRegion, widx: usize) {
             // threshold the copy is too small to amortize cross-core distribution, so worker 0
             // packs both serially while the rest fall straight through to the barrier.
             let total_bytes = (round_up(m, MR) + round_up(nc, NR)) * kc * 4;
+            let (a_blk, lda) = a_origin(a, m, k, at, 0, pc);
             if total_bytes < pack_par_min_bytes() {
                 if widx == 0 {
-                    pack_a(a.add(pc), k, m, kc, ap);
+                    pack_a(a_blk, lda, at, m, kc, ap);
                     pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp);
                 }
             } else {
@@ -1818,7 +1855,7 @@ unsafe fn gemm_region_worker(rg: &GemmRegion, widx: usize) {
                     // SAFETY: `fetch_add` hands each panel index to exactly one worker; panels
                     // are disjoint. Same bytes regardless of who packs what.
                     if t < mpanels {
-                        pack_a_panel(a.add(pc), k, m, kc, t, ap.add(t * kc * MR));
+                        pack_a_panel(a_blk, lda, at, m, kc, t, ap.add(t * kc * MR));
                     } else {
                         let jp = t - mpanels;
                         let panel = bp.add(jp * kc * NR);
@@ -2076,7 +2113,7 @@ unsafe fn sgemm_2d_blocks(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     // `pack_ab_par` already use (the closure outlives nothing: `install`/`for_each` join before
     // this frame returns).
     let (a_addr, b_addr, c_addr) = (args.a as usize, args.b as usize, args.c as usize);
-    let (beta, bt) = (args.beta, args.bt);
+    let (beta, at, bt) = (args.beta, args.at, args.bt);
     let (epi_on, epi_bias_addr, epi_act, epi_alpha) = match args.epi {
         Some(e) => (true, e.bias as usize, e.act, e.alpha),
         None => (false, 0usize, 0u32, 1.0f32),
@@ -2109,9 +2146,11 @@ unsafe fn sgemm_2d_blocks(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
                     a_addr as *const f32,
                     b_addr as *const f32,
                     c_addr as *mut f32,
+                    m,
                     k,
                     n,
                     beta,
+                    at,
                     bt,
                     epi,
                     i0,
@@ -2145,8 +2184,9 @@ unsafe fn sgemm_2d_blocks(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
 /// ([`macro_kernel_packb`]) — the same bytes and the same micro-tile calls.
 ///
 /// # Safety
-/// `a`/`b` valid per the [`wukong_sgemm`]/[`wukong_sgemm_nt`] contract with `k`/`n` the full
-/// matrix dims; `[i0, i0+bm) × [j0, j0+bn)` in range of C; `ap`/`bp` sized for
+/// `a`/`b` valid per the [`wukong_sgemm`]/[`wukong_sgemm_nt`]/[`wukong_sgemm_tn`] contract (`at`,
+/// `bt` naming the stored layouts) with `m`/`k`/`n` the full matrix dims; `[i0, i0+bm) × [j0, j0+bn)`
+/// in range of C; `ap`/`bp` sized for
 /// `round_up(bm,MR)·min(k,KC)` / `round_up(bn,NR)·min(k,KC)` f32 (`bp`: `NR·min(k,KC)` when
 /// `fused`); avx2+fma available.
 #[cfg(target_arch = "x86_64")]
@@ -2156,9 +2196,11 @@ unsafe fn sgemm_2d_block(
     a: *const f32,
     b: *const f32,
     c: *mut f32,
+    m: usize,
     k: usize,
     n: usize,
     beta: f32,
+    at: bool,
     bt: bool,
     epi: Option<Epilogue>,
     i0: usize,
@@ -2183,11 +2225,13 @@ unsafe fn sgemm_2d_block(
             None
         };
         // The serial kernel's own packers, offset to this block's origin: `pack_a` reads rows
-        // [i0, i0+bm) × cols [pc, pc+kc) of A (lda = k), `pack_b_block` reads the (pc, j0) slice of
+        // [i0, i0+bm) × cols [pc, pc+kc) of the logical A (from its stored layout, `a_origin`),
+        // `pack_b_block` reads the (pc, j0) slice of
         // B honoring `bt` — both contracts take an arbitrary base/leading-dim, and bm/bn smaller
         // than m/n only shortens their row/col loops. Same source values, same panel layout, same
         // matrix-edge-only zero padding ⇒ byte-identical micropanels.
-        pack_a(a.add(i0 * k + pc), k, bm, kc, ap);
+        let (a_blk, lda) = a_origin(a, m, k, at, i0, pc);
+        pack_a(a_blk, lda, at, bm, kc, ap);
         if fused {
             let (b_src, ldb) = b_origin(b, k, n, bt, pc, j0);
             macro_kernel_packb(
@@ -2437,7 +2481,7 @@ unsafe fn sgemm_2d_blocks_dyn(
     let queue_ref = &queue;
     // Send-safe scalar captures — the raw-pointer-as-usize idiom of the sibling kernels.
     let (a_addr, b_addr, c_addr) = (args.a as usize, args.b as usize, args.c as usize);
-    let (beta, bt) = (args.beta, args.bt);
+    let (beta, at, bt) = (args.beta, args.at, args.bt);
     let (epi_on, epi_bias_addr, epi_act, epi_alpha) = match args.epi {
         Some(e) => (true, e.bias as usize, e.act, e.alpha),
         None => (false, 0usize, 0u32, 1.0f32),
@@ -2454,13 +2498,8 @@ unsafe fn sgemm_2d_blocks_dyn(
                 for &(pc, kc, off) in &chunks {
                     // SAFETY: buffer sized `a_rows·k` above; A read-only; single writer here.
                     unsafe {
-                        pack_a(
-                            (a_addr as *const f32).add(pc),
-                            k,
-                            m,
-                            kc,
-                            (ap_shared_addr as *mut f32).add(off),
-                        );
+                        let (a_blk, lda) = a_origin(a_addr as *const f32, m, k, at, 0, pc);
+                        pack_a(a_blk, lda, at, m, kc, (ap_shared_addr as *mut f32).add(off));
                     }
                 }
             } else {
@@ -2473,9 +2512,11 @@ unsafe fn sgemm_2d_blocks_dyn(
                         // SAFETY: each (chunk, panel) granule owns a disjoint `MR·kc` destination
                         // slice; A is read-only; buffer sized `a_rows·k` above.
                         unsafe {
+                            let (a_blk, lda) = a_origin(a_addr as *const f32, m, k, at, 0, pc);
                             pack_a_panel(
-                                (a_addr as *const f32).add(pc),
-                                k,
+                                a_blk,
+                                lda,
+                                at,
                                 m,
                                 kc,
                                 ip,
@@ -2549,9 +2590,11 @@ unsafe fn sgemm_2d_blocks_dyn(
                             a_addr as *const f32,
                             b_addr as *const f32,
                             c_addr as *mut f32,
+                            m,
                             k,
                             n,
                             beta,
+                            at,
                             bt,
                             epi,
                             i0,
@@ -2653,7 +2696,7 @@ unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     // (`install`/`for_each` join before this frame returns, so the pointers outlive every task).
     let (a_addr, b_addr, c_addr) = (args.a as usize, args.b as usize, args.c as usize);
     let (ap_addr, bp_addr) = (ap.as_mut_ptr() as usize, bp.as_mut_ptr() as usize);
-    let (beta, bt) = (args.beta, args.bt);
+    let (beta, at, bt) = (args.beta, args.at, args.bt);
     let (epi_on, epi_bias_addr, epi_act, epi_alpha) = match args.epi {
         Some(e) => (true, e.bias as usize, e.act, e.alpha),
         None => (false, 0usize, 0u32, 1.0f32),
@@ -2670,9 +2713,11 @@ unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
             // buffer bytes equal what `pack_a`/`pack_b_block` produce for the blocks they feed:
             // same panel functions, same sources, same layout.
             unsafe {
+                let (a_blk, lda) = a_origin(a_addr as *const f32, m, k, at, 0, pc);
                 pack_ab_par(
-                    (a_addr as *const f32).add(pc),
-                    k,
+                    a_blk,
+                    lda,
+                    at,
                     m,
                     b_addr as *const f32,
                     k,
@@ -2734,7 +2779,8 @@ unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
     });
 }
 
-/// The portable **bit-exact twin** of [`sgemm_avx2`] (`C = A·B`, or `C = A·Bᵀ` when `bt`) — the
+/// The portable **bit-exact twin** of [`sgemm_avx2`] (`C = A·B`; `Aᵀ` read from `[k, m]` storage
+/// when `at`, `Bᵀ` from `[n, k]` when `bt`) — the
 /// no-AVX fallback, and the ONLY GEMM path on a target without AVX2+FMA, since every non-`x86_64`
 /// build compiles the fast path out entirely.
 ///
@@ -2782,6 +2828,7 @@ fn sgemm_scalar(
     k: usize,
     n: usize,
     beta: f32,
+    at: bool,
     bt: bool,
     epi: Option<Epilogue>,
 ) {
@@ -2795,12 +2842,17 @@ fn sgemm_scalar(
                     let kc = (k - pc).min(select_kc(k));
                     let mut acc = 0.0f32;
                     for p in pc..pc + kc {
+                        let aip = if at {
+                            *a.add(p * m + i)
+                        } else {
+                            *a.add(i * k + p)
+                        };
                         let bpj = if bt {
                             *b.add(j * k + p)
                         } else {
                             *b.add(p * n + j)
                         };
-                        acc = (*a.add(i * k + p)).mul_add(bpj, acc);
+                        acc = aip.mul_add(bpj, acc);
                     }
                     // First K-block honors the caller's beta; later blocks accumulate the partials.
                     let beta_eff = if pc == 0 { beta } else { 1.0 };
@@ -2830,10 +2882,11 @@ unsafe fn sgemm_avx2(
     k: usize,
     n: usize,
     beta: f32,
+    at: bool,
     bt: bool,
     epi: Option<Epilogue>,
 ) {
-    sgemm_avx2_impl(a, b, c, m, k, n, beta, bt, epi, gemm_fused_pack());
+    sgemm_avx2_impl(a, b, c, m, k, n, beta, at, bt, epi, gemm_fused_pack());
 }
 
 /// [`sgemm_avx2`] with the [`gemm_fused_pack`] choice explicit, so the bit-identity of the two B
@@ -2849,6 +2902,7 @@ unsafe fn sgemm_avx2_impl(
     k: usize,
     n: usize,
     beta: f32,
+    at: bool,
     bt: bool,
     epi: Option<Epilogue>,
     fused: bool,
@@ -2904,7 +2958,8 @@ unsafe fn sgemm_avx2_impl(
             if fuse_b {
                 // The single row block (ic = 0, mc = m): the same A pack, then the micropanel-at-a-
                 // time B pack interleaved with the sweeps that consume it.
-                pack_a(a.add(pc), k, m, kc, ap.as_mut_ptr());
+                let (a_blk, lda) = a_origin(a, m, k, at, 0, pc);
+                pack_a(a_blk, lda, at, m, kc, ap.as_mut_ptr());
                 let (b_src, ldb) = b_origin(b, k, n, bt, pc, jc);
                 macro_kernel_packb(
                     m,
@@ -2927,7 +2982,8 @@ unsafe fn sgemm_avx2_impl(
             let mut ic = 0;
             while ic < m {
                 let mc = (m - ic).min(MC);
-                pack_a(a.add(ic * k + pc), k, mc, kc, ap.as_mut_ptr());
+                let (a_blk, lda) = a_origin(a, m, k, at, ic, pc);
+                pack_a(a_blk, lda, at, mc, kc, ap.as_mut_ptr());
                 macro_kernel(
                     mc,
                     nc,
@@ -2952,6 +3008,31 @@ unsafe fn sgemm_avx2_impl(
         g.0 = ap;
         g.1 = bp;
     });
+}
+
+/// The stored location of the logical `A[i0, p0]` and the stored leading dimension: A is row-major
+/// `[m, k]` (`a[i*k + p]`) unless `at`, in which case it is stored transposed, `[k, m]`
+/// (`a[p*m + i]`) — the weight-gradient `C = Aᵀ·B` operand, which [`pack_a_panel`] packs straight
+/// from that storage rather than from a transposed scratch copy (P9.19). Every A pack site goes
+/// through this one function so the two layouts cannot drift apart between the schedules.
+///
+/// # Safety
+/// `(i0, p0)` must address an element of A (`i0 < m`, `p0 < k`).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn a_origin(
+    a: *const f32,
+    m: usize,
+    k: usize,
+    at: bool,
+    i0: usize,
+    p0: usize,
+) -> (*const f32, usize) {
+    if at {
+        (a.add(p0 * m + i0), m)
+    } else {
+        (a.add(i0 * k + p0), k)
+    }
 }
 
 /// The stored location of the B slice whose logical origin is contraction step `pc`, column `jc`,
@@ -3218,16 +3299,24 @@ unsafe fn transpose6x8_into(src: *const f32, lda: usize, dst: *mut f32) {
 /// scalar order below, which is retained verbatim as the **twin** that defines the packed bytes
 /// (`pack_a_panel_simd_matches_scalar_twin` asserts them bit-for-bit, NaN payloads and signed
 /// zeros included — pure data movement, so no comparison or arithmetic is involved).
+///
+/// With `at` the slice is stored transposed (`a` is the [`a_origin`] of the block, `lda == m`) and
+/// the panel comes from [`pack_a_t_panel`] — same bytes, no transpose needed.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn pack_a_panel(
     a: *const f32,
     lda: usize,
+    at: bool,
     mc: usize,
     kc: usize,
     ip: usize,
     panel: *mut f32,
 ) {
+    if at {
+        pack_a_t_panel(a, lda, mc, kc, ip, panel);
+        return;
+    }
     let i0 = ip * MR;
     let nrows = (mc - i0).min(MR);
     let mut p0 = 0;
@@ -3253,12 +3342,44 @@ unsafe fn pack_a_panel(
     }
 }
 
+/// [`pack_a_panel`] for an A slice stored transposed (`at`): `a` is the stored element of logical
+/// `A[block row 0, pc]` and `lda == m`, so contraction step `p` of logical rows `i0 .. i0 + MR` is
+/// the CONTIGUOUS run `a[p*lda + i0 ..]` and each `[kc][MR]` panel row is a straight copy of six
+/// consecutive floats — cheaper than the row-major packer, which has to transpose. Rows past `mc`
+/// are zero, exactly as the row-major packer pads, so the panel bytes equal those of the explicitly
+/// transposed matrix packed by the row-major path (`pack_a_transposed_matches_the_pack_of_the_transpose`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn pack_a(a: *const f32, lda: usize, mc: usize, kc: usize, ap: *mut f32) {
+unsafe fn pack_a_t_panel(
+    a: *const f32,
+    lda: usize,
+    mc: usize,
+    kc: usize,
+    ip: usize,
+    panel: *mut f32,
+) {
+    let i0 = ip * MR;
+    let nrows = (mc - i0).min(MR);
+    if nrows == MR {
+        for p in 0..kc {
+            std::ptr::copy_nonoverlapping(a.add(p * lda + i0), panel.add(p * MR), MR);
+        }
+    } else {
+        for p in 0..kc {
+            let (src, dst) = (a.add(p * lda + i0), panel.add(p * MR));
+            for r in 0..MR {
+                *dst.add(r) = if r < nrows { *src.add(r) } else { 0.0 };
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn pack_a(a: *const f32, lda: usize, at: bool, mc: usize, kc: usize, ap: *mut f32) {
     let mpanels = mc.div_ceil(MR);
     for ip in 0..mpanels {
-        pack_a_panel(a, lda, mc, kc, ip, ap.add(ip * kc * MR));
+        pack_a_panel(a, lda, at, mc, kc, ip, ap.add(ip * kc * MR));
     }
 }
 
@@ -3297,7 +3418,8 @@ fn pack_min_bytes_from_kb(raw: Option<String>) -> usize {
 /// and the differential oracle is untouched.
 ///
 /// # Safety
-/// Operand contracts of [`pack_a`] and [`pack_b_block`]; `ap`/`bp` sized as in
+/// Operand contracts of [`pack_a`] (`a`/`lda`/`at`: the [`a_origin`] of the K-block's column 0) and
+/// [`pack_b_block`]; `ap`/`bp` sized as in
 /// [`sgemm_avx2_parallel`] (`round_up(mc,MR)·kc` / `round_up(nc,NR)·kc` f32); avx2 verified by the
 /// caller.
 #[cfg(target_arch = "x86_64")]
@@ -3305,6 +3427,7 @@ fn pack_min_bytes_from_kb(raw: Option<String>) -> usize {
 unsafe fn pack_ab_par(
     a: *const f32,
     lda: usize,
+    at: bool,
     mc: usize,
     b: *const f32,
     k: usize,
@@ -3322,7 +3445,7 @@ unsafe fn pack_ab_par(
     let npanels = nc.div_ceil(NR);
     let total_bytes = (round_up(mc, MR) + round_up(nc, NR)) * kc * 4;
     if total_bytes < pack_par_min_bytes() {
-        pack_a(a, lda, mc, kc, ap);
+        pack_a(a, lda, at, mc, kc, ap);
         pack_b_block(b, k, n, pc, jc, kc, nc, bt, bp);
         return;
     }
@@ -3348,6 +3471,7 @@ unsafe fn pack_ab_par(
                 pack_a_panel(
                     a_addr as *const f32,
                     lda,
+                    at,
                     mc,
                     kc,
                     ip,
@@ -3375,6 +3499,7 @@ unsafe fn pack_ab_par(
                 pack_a_panel(
                     a_addr as *const f32,
                     lda,
+                    at,
                     mc,
                     kc,
                     t,
@@ -4919,7 +5044,7 @@ mod tests {
             let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
             let flops = 2.0 * (n as f64).powi(3);
             let logical_run =
-                || unsafe { sgemm_avx2_parallel(ap, bp, cp, n, n, n, 0.0, false, None) };
+                || unsafe { sgemm_avx2_parallel(ap, bp, cp, n, n, n, 0.0, false, false, None) };
             let physical_run = || {
                 let args = GemmArgs {
                     a: ap,
@@ -4929,6 +5054,7 @@ mod tests {
                     k: n,
                     n,
                     beta: 0.0,
+                    at: false,
                     bt: false,
                     epi: None,
                 };
@@ -5553,6 +5679,7 @@ mod tests {
                     k,
                     n,
                     beta: 0.0,
+                    at: false,
                     bt: false,
                     epi: None,
                 };
@@ -5570,6 +5697,7 @@ mod tests {
                     k,
                     n,
                     0.0,
+                    false,
                     false,
                     None,
                 );
@@ -5622,6 +5750,7 @@ mod tests {
                     k,
                     n,
                     beta: 0.0,
+                    at: false,
                     bt: true,
                     epi: Some(epi),
                 };
@@ -5634,6 +5763,7 @@ mod tests {
                     k,
                     n,
                     0.0,
+                    false,
                     true,
                     Some(epi),
                 );
@@ -5708,6 +5838,7 @@ mod tests {
                             k,
                             n,
                             beta: beta as f32,
+                            at: false,
                             bt,
                             epi: None,
                         };
@@ -5758,6 +5889,7 @@ mod tests {
                             k,
                             n,
                             beta: 0.0,
+                            at: false,
                             bt: true,
                             epi: Some(Epilogue {
                                 bias: bias_ptr,
@@ -5984,6 +6116,7 @@ mod tests {
                                     k,
                                     n,
                                     beta: beta as f32,
+                                    at: false,
                                     bt,
                                     epi: None,
                                 };
@@ -6022,6 +6155,7 @@ mod tests {
                                 k,
                                 n,
                                 beta: 0.0,
+                                at: false,
                                 bt: true,
                                 epi: Some(epi),
                             };
@@ -6166,6 +6300,7 @@ mod tests {
                             k,
                             n,
                             beta: 0.0,
+                            at: false,
                             bt: false,
                             epi: None,
                         };
@@ -6188,6 +6323,7 @@ mod tests {
                     k,
                     n,
                     beta: 0.0,
+                    at: false,
                     bt: false,
                     epi: None,
                 };
@@ -6271,6 +6407,7 @@ mod tests {
                             k,
                             n,
                             beta: beta as f32,
+                            at: false,
                             bt,
                             epi: None,
                         };
@@ -6308,6 +6445,7 @@ mod tests {
                     k,
                     n,
                     beta: 0.0,
+                    at: false,
                     bt: true,
                     epi: None,
                 };
@@ -6339,6 +6477,7 @@ mod tests {
                         k,
                         n,
                         beta: 0.0,
+                        at: false,
                         bt: true,
                         epi: Some(epi),
                     };
@@ -6864,7 +7003,8 @@ mod tests {
     /// source, and no gate in the repo could see it because interp and native share the dispatcher.
     ///
     /// Both kernels are private and take the same argument list, so this drives them directly over
-    /// shape x `bt` x `beta` x epilogue and asserts `to_bits()` equality. The shapes cover a 1x1x1,
+    /// shape x `at` x `bt` x `beta` x epilogue and asserts `to_bits()` equality (`at` reads A from its
+    /// `[k, m]` storage: the scalar twin indexes it in place, the AVX2 kernel packs it in place). The shapes cover a 1x1x1,
     /// remainder-only tiles, exactly one full 6x16 tile, an `m` past `MC = 144`, and two- and
     /// three-K-block reductions derived from `KC`. `alpha != 1` is paired only with `beta == 0`, the
     /// combination the ABI supports.
@@ -6883,11 +7023,11 @@ mod tests {
             (13, KC + 7, 19),      // 2 K-blocks
             (13, 2 * KC + 37, 19), // 3 K-blocks
         ] {
-            let a = fill(201, m * k);
+            let a = fill(201, m * k); // same length either way: `at` reads it as [k, m]
             let b = fill(202, k * n); // same length either way: `bt` reads it as [n, k]
             let bias = fill(203, n);
             let c_init = fill(204, m * n);
-            for bt in [false, true] {
+            for (at, bt) in [(false, false), (false, true), (true, false), (true, true)] {
                 for &beta in &[0.0f32, 1.0] {
                     let mut epis: Vec<Option<Epilogue>> = vec![
                         None,
@@ -6937,6 +7077,7 @@ mod tests {
                             k,
                             n,
                             beta,
+                            at,
                             bt,
                             epi,
                         );
@@ -6951,6 +7092,7 @@ mod tests {
                                 k,
                                 n,
                                 beta,
+                                at,
                                 bt,
                                 epi,
                             );
@@ -6962,7 +7104,7 @@ mod tests {
                             assert_eq!(
                                 cs[idx].to_bits(),
                                 cv[idx].to_bits(),
-                                "scalar twin != avx2 (m{m} k{k} n{n} bt{bt} beta{beta} act{act} \
+                                "scalar twin != avx2 (m{m} k{k} n{n} at{at} bt{bt} beta{beta} act{act} \
                                  bias{has_bias} alpha{alpha}) idx {idx}: scalar {} ({:08x}) vs \
                                  avx2 {} ({:08x})",
                                 cs[idx],
@@ -7027,6 +7169,7 @@ mod tests {
                         k,
                         n,
                         beta,
+                        false,
                         bt,
                         None,
                     );
@@ -7072,6 +7215,7 @@ mod tests {
                                     k,
                                     n,
                                     beta,
+                                    false,
                                     bt,
                                     Some(Epilogue {
                                         bias: bias_ptr,
@@ -7404,7 +7548,7 @@ mod tests {
                 let mut got = vec![f32::from_bits(SENTINEL); (kc + 8) * MR];
                 let mut want = vec![f32::from_bits(SENTINEL); (kc + 8) * MR];
                 unsafe {
-                    pack_a_panel(src.as_ptr(), lda, mc, kc, ip, got.as_mut_ptr());
+                    pack_a_panel(src.as_ptr(), lda, false, mc, kc, ip, got.as_mut_ptr());
                     twin(src.as_ptr(), lda, mc, kc, ip, want.as_mut_ptr());
                 }
                 let gb: Vec<u32> = got.iter().map(|x| x.to_bits()).collect();
@@ -7444,11 +7588,11 @@ mod tests {
             (MC, 9, 40),            // the fused regime's upper edge, m == MC
             (MC + 1, 40, 70),
         ] {
-            let a = fill(501, m * k);
+            let a = fill(501, m * k); // same length either way: `at` reads it as [k, m]
             let b = fill(502, k * n); // same length either way: `bt` reads it as [n, k]
             let bias = fill(503, n);
             let c_init = fill(504, m * n);
-            for bt in [false, true] {
+            for (at, bt) in [(false, false), (false, true), (true, false)] {
                 for &beta in &[0.0f32, 1.0] {
                     let mut epis = vec![
                         None,
@@ -7482,6 +7626,7 @@ mod tests {
                                 k,
                                 n,
                                 beta,
+                                at,
                                 bt,
                                 epi,
                                 true,
@@ -7494,6 +7639,7 @@ mod tests {
                                 k,
                                 n,
                                 beta,
+                                at,
                                 bt,
                                 epi,
                                 false,
@@ -7502,7 +7648,7 @@ mod tests {
                         assert_eq!(
                             bits(&fused),
                             bits(&classic),
-                            "fused != classic B pack (m{m} k{k} n{n} bt{bt} beta{beta} epi{})",
+                            "fused != classic B pack (m{m} k{k} n{n} at{at} bt{bt} beta{beta} epi{})",
                             epi.is_some()
                         );
                     }
@@ -7534,9 +7680,11 @@ mod tests {
                         a.as_ptr(),
                         b.as_ptr(),
                         out.as_mut_ptr(),
+                        m,
                         k,
                         n,
                         1.0,
+                        false,
                         bt,
                         epi,
                         i0,
@@ -7614,6 +7762,206 @@ mod tests {
                          nparts{nparts})"
                     );
                 }
+            }
+        }
+    }
+
+    /// The transposed-A packer ([`pack_a_t_panel`], reached through `pack_a_panel(.., at = true, ..)`)
+    /// must produce exactly the bytes the row-major packer produces from the explicitly transposed
+    /// matrix — that byte identity is the whole reason the `Aᵀ·B` entries no longer build a
+    /// transposed scratch copy. Driven from interior origins (nonzero row and contraction offsets,
+    /// as the 2D blocks and later K-blocks use) with NaN payloads, signed zeros, infinities and a
+    /// denormal in the data, over full and partial (`< MR`-row) panels.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pack_a_transposed_matches_the_pack_of_the_transpose() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        let specials = [
+            f32::from_bits(0x7FC0_DEAD),
+            f32::from_bits(0xFFA0_0BAD),
+            f32::INFINITY,
+            -0.0f32,
+            0.0,
+            f32::from_bits(0x0000_0001),
+        ];
+        // (m, k) of the whole stored matrix; (i0, p0, mc, kc) of the packed block.
+        for &(m, k, i0, p0, mc, kc) in &[
+            (6usize, 1usize, 0usize, 0usize, 6usize, 1usize),
+            (13, 20, 0, 0, 13, 20),
+            (40, 50, 12, 7, 20, 33),
+            (37, 400, 6, 16, 31, 384),
+            (5, 9, 0, 1, 5, 8),
+        ] {
+            // A stored [k, m]; its explicit transpose [m, k].
+            let stored: Vec<f32> = (0..k * m)
+                .map(|t| {
+                    if t % 7 == 0 {
+                        specials[(t / 7) % specials.len()]
+                    } else {
+                        t as f32 * 0.5 - 11.0
+                    }
+                })
+                .collect();
+            let mut rowmajor = vec![0.0f32; m * k];
+            for p in 0..k {
+                for i in 0..m {
+                    rowmajor[i * k + p] = stored[p * m + i];
+                }
+            }
+            for ip in 0..mc.div_ceil(MR) {
+                let mut got = vec![f32::from_bits(0xDEAD_BEEF); kc * MR];
+                let mut want = vec![f32::from_bits(0xDEAD_BEEF); kc * MR];
+                // SAFETY: avx2+fma detected; both origins address the same logical block inside
+                // their buffers, and each panel buffer holds `kc*MR` floats.
+                unsafe {
+                    let (t_org, t_ld) = a_origin(stored.as_ptr(), m, k, true, i0, p0);
+                    let (r_org, r_ld) = a_origin(rowmajor.as_ptr(), m, k, false, i0, p0);
+                    assert_eq!((t_ld, r_ld), (m, k));
+                    pack_a_panel(t_org, t_ld, true, mc, kc, ip, got.as_mut_ptr());
+                    pack_a_panel(r_org, r_ld, false, mc, kc, ip, want.as_mut_ptr());
+                }
+                let gb: Vec<u32> = got.iter().map(|x| x.to_bits()).collect();
+                let wb: Vec<u32> = want.iter().map(|x| x.to_bits()).collect();
+                assert_eq!(
+                    gb, wb,
+                    "transposed-A pack != pack of the transpose (m{m} k{k} i0{i0} p0{p0} mc{mc} \
+                     kc{kc} ip{ip})"
+                );
+            }
+        }
+    }
+
+    /// `Aᵀ·B` packs A straight from its `[k, m]` storage in EVERY schedule — serial (fused and
+    /// classic B pack), the scalar twin, the fork-join and persistent-region kernels, the static
+    /// and dynamic 2D block paths (with every steal-order × shared-A combination) and the shared-pack
+    /// 2D path — and each must be bit-identical to the plain NN kernel run on the explicitly
+    /// transposed A, which is exactly what the TN entries computed when they still built that copy.
+    /// Internal entries are driven directly, so no env knob or work threshold can route around one.
+    /// Shapes: m > MC with two uneven K-blocks and ragged edges, a skinny single-block-row grid (the
+    /// shared-A instrument's regime), and a tiny one; `beta` 0 and 1.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn tn_direct_pack_matches_nn_on_the_transpose_in_every_schedule() {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        for &(m, k, n) in &[(150usize, KC + 7, 70usize), (128, 200, 260), (13, 9, 40)] {
+            let stored = fill(601, k * m); // A stored [k, m]
+            let mut rowmajor = vec![0.0f32; m * k];
+            for p in 0..k {
+                for i in 0..m {
+                    rowmajor[i * k + p] = stored[p * m + i];
+                }
+            }
+            let b = fill(602, k * n);
+            let c_init = fill(603, m * n);
+            for &beta in &[0.0f32, 1.0] {
+                let mut want = c_init.clone();
+                // SAFETY (this block and the ones below): avx2+fma detected above; every buffer is
+                // sized for the m×k / k×n / m×n operands its kernel contract names.
+                unsafe {
+                    sgemm_avx2_impl(
+                        rowmajor.as_ptr(),
+                        b.as_ptr(),
+                        want.as_mut_ptr(),
+                        m,
+                        k,
+                        n,
+                        beta,
+                        false,
+                        false,
+                        None,
+                        false,
+                    );
+                }
+                let want = bits(&want);
+                let check = |tag: &str, run: &mut dyn FnMut(*mut f32)| {
+                    let mut got = c_init.clone();
+                    run(got.as_mut_ptr());
+                    assert_eq!(
+                        bits(&got),
+                        want,
+                        "TN {tag} != NN on the transpose (m{m} k{k} n{n} beta{beta})"
+                    );
+                };
+                let (a, bp) = (stored.as_ptr(), b.as_ptr());
+                let args = |c: *mut f32| GemmArgs {
+                    a,
+                    b: bp,
+                    c,
+                    m,
+                    k,
+                    n,
+                    beta,
+                    at: true,
+                    bt: false,
+                    epi: None,
+                };
+                for fused in [false, true] {
+                    check(&format!("serial fused{fused}"), &mut |c| unsafe {
+                        sgemm_avx2_impl(a, bp, c, m, k, n, beta, true, false, None, fused)
+                    });
+                }
+                check("scalar twin", &mut |c| {
+                    sgemm_scalar(a, bp, c, m, k, n, beta, true, false, None)
+                });
+                check("fork-join", &mut |c| unsafe {
+                    sgemm_avx2_parallel(a, bp, c, m, k, n, beta, true, false, None)
+                });
+                check("persistent region", &mut |c| unsafe {
+                    sgemm_persistent_region(gemm_pool(), args(c))
+                });
+                check("2D static", &mut |c| unsafe {
+                    sgemm_2d_blocks(gemm_pool(), args(c))
+                });
+                for steal_order in [false, true] {
+                    for skinny_a in [false, true] {
+                        check(
+                            &format!("2D dyn order{steal_order} skinnyA{skinny_a}"),
+                            &mut |c| unsafe {
+                                sgemm_2d_blocks_dyn(gemm_pool(), args(c), steal_order, skinny_a)
+                            },
+                        );
+                    }
+                }
+                check("2D shared", &mut |c| unsafe {
+                    sgemm_2d_shared(gemm_pool(), args(c))
+                });
+            }
+        }
+    }
+
+    /// The SIMD widen bodies behind the bf16/f16 GEMM prepass must equal the scalar crate-root
+    /// widen on EVERY one of the 65,536 bit patterns of both formats — signed zeros, every
+    /// subnormal, both infinities, and every NaN payload (signalling ones included, which the f16
+    /// conversion quiets identically on both paths). The length is not a multiple of 8, so the
+    /// scalar tail runs too. On a host without the SIMD features this compares the scalar path
+    /// with itself, which is the path that host runs.
+    #[test]
+    fn lowp_widen_simd_matches_scalar_for_every_bit_pattern() {
+        let src: Vec<u16> = (0..=u16::MAX)
+            .chain([0x8000, 0x7C01, 0xFF81, 1, 0x7F80])
+            .collect();
+        for kind in [HalfKind::Bf16, HalfKind::F16] {
+            let mut simd = vec![f32::from_bits(0xDEAD_BEEF); src.len()];
+            let mut scalar = vec![f32::from_bits(0xDEAD_BEEF); src.len()];
+            // SAFETY: both destinations hold `src.len()` f32 and do not overlap the source.
+            unsafe {
+                widen_into_f32(src.as_ptr(), simd.as_mut_ptr(), src.len(), kind);
+                widen_into_f32_scalar(src.as_ptr(), scalar.as_mut_ptr(), src.len(), kind);
+            }
+            for (t, (&x, &y)) in simd.iter().zip(&scalar).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "{kind:?} widen of {:#06x}: simd {:08x} vs scalar {:08x}",
+                    src[t],
+                    x.to_bits(),
+                    y.to_bits()
+                );
             }
         }
     }
@@ -7701,7 +8049,7 @@ mod tests {
             } * cb as f64;
             let ta = unsafe {
                 best(ca.max(2), &mut || {
-                    pack_a(a.as_ptr(), k, mc, kc, ap.as_mut_ptr())
+                    pack_a(a.as_ptr(), k, false, mc, kc, ap.as_mut_ptr())
                 })
             } * ca as f64;
             let tm1 = unsafe {
