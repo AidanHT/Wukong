@@ -36,6 +36,7 @@
 
 use crate::alias::{type_bytes, AliasInfo, Prov};
 use crate::fxhash::FxHashMap;
+use crate::loop_delete::const_trip_is_exact;
 use crate::loop_info::{self, AccessKind, AddrForm, Coeff, MemBase, Stages, TripCount};
 use crate::sroa::{const_index, slot_count};
 
@@ -436,16 +437,26 @@ fn loop_bounded_stores(
             _ => {}
         }
     }
-    let mut analyzed = vec![false; forest.loops.len()];
+    // Per loop, once analyzed: is its trip count a constant the induction variable reaches without
+    // wrapping? Only then are the extremes below the whole iteration space.
+    let mut exact: Vec<Option<bool>> = vec![None; forest.loops.len()];
     let mut out = Vec::new();
     for &(b, i) in cands {
         let Some(id) = forest.innermost_of(BlockId(b as u32)) else {
             continue;
         };
         let k = id.0 as usize;
-        if !analyzed[k] {
+        if exact[k].is_none() {
             loop_info::analyze_one(f, &mut forest, k, Stages::Memory);
-            analyzed[k] = true;
+            let l = &forest.loops[k];
+            exact[k] = Some(
+                l.trip
+                    .as_const()
+                    .is_some_and(|n| const_trip_is_exact(f, l, n)),
+            );
+        }
+        if exact[k] != Some(true) {
+            continue;
         }
         if store_in_bounds(alias, &forest.loops[k], &konst, &slot_ty, (b, i)).is_some() {
             out.push((b, i));

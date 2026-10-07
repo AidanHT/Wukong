@@ -19,14 +19,15 @@
 //! * no value defined inside it is used outside it, and the exit edge passes only values defined
 //!   outside it (those dominate the preheader, so the preheader can pass them on itself);
 //! * it contains no inner loop (inner loops are deleted first, innermost outward, across fixpoint
-//!   sweeps), and its trip count is a compile-time constant, or a unit-step strict bound
-//!   `i < n` / `i > n` that cannot step over the bound — so it provably terminates, and deleting it
-//!   cannot turn a program that hangs into one that returns.
+//!   sweeps), and its trip count is a compile-time constant whose induction variable never wraps
+//!   (its last step stays inside the type), or a unit-step strict bound `i < n` / `i > n` that
+//!   cannot step over the bound — so it provably terminates, and deleting it cannot turn a program
+//!   that hangs into one that returns.
 //!
 //! The rewrite points the preheader's branch at the exit block with the exit edge's arguments and
 //! prunes the now-unreachable loop blocks.
 
-use wukong_mir::{BlockId, Function, Terminator, ValueId};
+use wukong_mir::{BlockId, CmpOp, Function, MirType, Op, Terminator, ValueId};
 
 use crate::fxhash::FxHashSet;
 use crate::loop_info::{self, NaturalLoop, Stages, TripCount};
@@ -66,7 +67,7 @@ impl Pass for LoopDelete {
                 }
                 loop_info::analyze_one(f, &mut forest, k, Stages::Ivs);
                 let l = &forest.loops[k];
-                if !terminates(l) {
+                if !terminates(f, l) {
                     continue;
                 }
                 let (Some(preheader), Some((exit, args))) = (l.preheader, removable(f, l)) else {
@@ -124,17 +125,81 @@ fn shape_ok(f: &Function, l: &NaturalLoop) -> bool {
         })
 }
 
-/// Does the loop provably run a finite number of times? A constant trip count, or an affine one
-/// whose induction variable moves one step at a time toward a strict bound (`i < n` with step `+1`
-/// reaches `n` without overflow; `i <= n` with `n` at the type's maximum never stops).
-fn terminates(l: &NaturalLoop) -> bool {
+/// Does the loop provably run a finite number of times? A constant trip count that is exact (see
+/// [`const_trip_is_exact`]), or an affine one whose induction variable moves one step at a time
+/// toward a strict bound (`i < n` with step `+1` reaches `n` without overflow; `i <= n` with `n` at
+/// the type's maximum never stops).
+fn terminates(f: &Function, l: &NaturalLoop) -> bool {
     match &l.trip {
-        TripCount::Const(_) => true,
+        TripCount::Const(n) => const_trip_is_exact(f, l, *n),
         TripCount::Affine {
             step, inclusive, ..
         } => !*inclusive && (*step == 1 || *step == -1),
         TripCount::Unknown => false,
     }
+}
+
+/// `loop_info` computes a constant trip count in `i64` from the literal endpoints, as though the
+/// induction variable could not wrap. Hold it to that before relying on it: both endpoints must be
+/// literals of the variable's own type that fit it, and so must the value the variable steps to
+/// after the last iteration, `start + n·step`, read with the exit test's signedness. Then every value
+/// the variable takes lies between the endpoints and that last step, the masked arithmetic of the
+/// backends never wraps, and the loop runs exactly `n` times. Over `i8`, `while i < 127 { i = i + 2 }`
+/// has the "trip count" 64, but `126 + 2` wraps to `-128`, which is still `< 127`: the loop never
+/// ends, and deleting it would turn a hang into a return.
+pub(crate) fn const_trip_is_exact(f: &Function, l: &NaturalLoop, n: u64) -> bool {
+    let Some(iv) = l.primary() else {
+        return false;
+    };
+    let Some(step) = iv.step.as_const() else {
+        return false;
+    };
+    let bits: u32 = match iv.ty {
+        MirType::I8 => 8,
+        MirType::I16 => 16,
+        MirType::I32 => 32,
+        MirType::I64 => 64,
+        _ => return false,
+    };
+    let def = move |v: ValueId| {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.result == Some(v))
+            .map(|i| &i.op)
+    };
+    let Terminator::CondBr { cond, .. } = &f.blocks[l.header.0 as usize].term else {
+        return false;
+    };
+    let Some(Op::Cmp(pred, a, b)) = def(*cond) else {
+        return false;
+    };
+    let bound = if *a == iv.value {
+        *b
+    } else if *b == iv.value {
+        *a
+    } else {
+        return false;
+    };
+    let (lo, hi): (i128, i128) = match pred {
+        CmpOp::Slt | CmpOp::Sle | CmpOp::Sgt | CmpOp::Sge => {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        }
+        CmpOp::Ult | CmpOp::Ule | CmpOp::Ugt | CmpOp::Uge => (0, (1i128 << bits) - 1),
+        _ => return false,
+    };
+    let literal = move |v: ValueId| match def(v) {
+        Some(Op::ConstInt(k, ty)) if *ty == iv.ty => Some(*k),
+        _ => None,
+    };
+    let (Some(start), Some(end)) = (iv.start.and_then(literal), literal(bound)) else {
+        return false;
+    };
+    let fits = |x: i128| (lo..=hi).contains(&x);
+    let after = i128::from(step)
+        .checked_mul(i128::from(n))
+        .and_then(|d| start.checked_add(d));
+    fits(start) && fits(end) && after.is_some_and(fits)
 }
 
 /// The exit block and the arguments the exit edge passes, when nothing defined in the loop is
@@ -308,6 +373,42 @@ mod tests {
         assert!(LoopDelete.run_function(&mut f, &mut CfgAnalyses::default()));
         verify(&f);
         assert_eq!(run(&f, &it), 4096);
+    }
+
+    /// `while i < 127 { i = i + 2 }` over `i8`: `loop_info` counts 64 trips, but `126 + 2` wraps to
+    /// `-128`, which is still `< 127`, so the loop never ends and must not be deleted. Bounded by
+    /// `126` instead it really stops, after 63 trips, and goes.
+    #[test]
+    fn a_constant_count_whose_last_step_wraps_is_not_trusted() {
+        for (end, deleted) in [(127, false), (126, true)] {
+            let mut it = Interner::new();
+            let mut b = Builder::new(it.intern("f"), MirType::I64);
+            let lo = b.build(MirType::I8, Op::ConstInt(0, MirType::I8));
+            let hi = b.build(MirType::I8, Op::ConstInt(end, MirType::I8));
+            let two = b.build(MirType::I8, Op::ConstInt(2, MirType::I8));
+            let seven = b.build(MirType::I64, Op::ConstInt(7, MirType::I64));
+            let header = b.new_block();
+            let body = b.new_block();
+            let exit = b.new_block();
+            let i = b.block_param(header, MirType::I8);
+            b.br(header, vec![lo]);
+            b.switch_to(header);
+            let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, hi));
+            b.cond_br(c, body, vec![], exit, vec![]);
+            b.switch_to(body);
+            let next = b.build(MirType::I8, Op::Bin(BinOp::Add, i, two));
+            b.br(header, vec![next]);
+            b.switch_to(exit);
+            b.ret(Some(seven));
+            let mut f = b.finish();
+            verify(&f);
+            assert_eq!(
+                LoopDelete.run_function(&mut f, &mut CfgAnalyses::default()),
+                deleted,
+                "end={end}"
+            );
+            verify(&f);
+        }
     }
 
     /// A store in the body, an induction value carried out of the loop, a header value used after
