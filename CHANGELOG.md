@@ -29,6 +29,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   (`wukong_codegen_cranelift::TargetCpu`); below x86-64-v3 the driver builds the MIR without the
   raw-AVX2 recipes and the backend refuses any that reach it. `--run --backend=native` honours it
   too (refusing a level the host lacks), which is how the baseline code is tested on this machine.
+- **The `cc`-fallback AOT runtime prints exactly what `--run` prints.** It printed floats with
+  `printf("%g")` (six significant digits) and had no `wukong_rt_print_str`, so a host without the
+  rustc link path got an executable whose output differed from the oracle; the stopgap refused
+  every float-printing program. The generated C runtime now reproduces Rust's `Display` for `f64`
+  (shortest round-trip digits from correctly rounded `%e` plus `strtod`, laid out positionally,
+  with `inf`/`-inf`/`NaN`/`-0`) and defines `wukong_rt_print_str`, so the refusal is gone; the
+  fallback now says on stderr that it is being taken. Forced-`cc` tests compare the linked
+  executable with the interpreter on hand-derived float lines (and strings off Windows).
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 

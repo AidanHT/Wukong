@@ -625,41 +625,157 @@ fn run_on_gpu_lower(
 
 /// The C runtime linked into native executables by the **`cc` fallback** path: it backs the
 /// `print`/`assert`/`fmod` and heap intrinsics that the Cranelift object leaves as undefined imports.
-/// The JIT path binds those same symbols to Rust functions instead. It is deliberately *not* a full
-/// mirror: string printing and runtime kernels are not provided. Float printing is rejected by
-/// [`cc_float_print_requirement`] before linking because C's `%g` does not match Rust `Display`.
-/// The float symbol remains as a fatal guard for COFF objects that declare even unused imports;
-/// it must never print an approximation. [`WUKONG_RT_SHIM`] provides the full print implementation.
-const WUKONG_RT_C: &str = "#include <stdio.h>\n\
-#include <stdlib.h>\n\
-#include <math.h>\n\
-#ifdef _WIN32\n\
-#include <io.h>\n\
-#include <fcntl.h>\n\
-/* Keep stdout in binary mode so the MSVCRT does not translate the runtime's `\\n` into CRLF. The\n\
-   interpreter oracle (and the JIT) emit LF; without this the *linked exe* printed CRLF on Windows,\n\
-   so its stdout differed from every other backend. Runs before main via the constructor attribute. */\n\
-__attribute__((constructor)) static void wukong_rt_init(void) { _setmode(_fileno(stdout), _O_BINARY); }\n\
-#endif\n\
-void wukong_rt_print_i64(long long x) { printf(\"%lld\\n\", x); }\n\
-void wukong_rt_print_u64(unsigned long long x) { printf(\"%llu\\n\", x); }\n\
-void wukong_rt_print_f64(double x) {\n\
-    (void)x;\n\
-    fputs(\"error: floating-point printing requires the Rust runtime link; C fallback cannot preserve output\\n\", stderr);\n\
-    exit(2);\n\
-}\n\
-void wukong_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(1); } }\n\
-long long wukong_rt_assert_failed(void) { return 0; }\n\
-double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }\n\
-float wukong_rt_fmod_f32(float a, float b) { return fmodf(a, b); }\n\
-/* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract — and\n\
-   handles the count*size overflow; a negative count clamps to an empty (null) allocation. */\n\
-void* wukong_rt_alloc(long long count, long long elem_size, long long elem_is_float) {\n\
-    (void)elem_is_float;\n\
-    if (count < 0 || elem_size <= 0) return 0;\n\
-    return calloc((size_t)count, (size_t)elem_size);\n\
-}\n\
-void wukong_rt_free(void* p) { free(p); }\n";
+/// The JIT path binds those same symbols to Rust functions, and the preferred rustc link to
+/// [`WUKONG_RT_SHIM`]; all three must print **byte-identical** output.
+///
+/// That includes floats. The oracle prints an `f64` with Rust's `Display`: the shortest decimal
+/// digit string that round-trips (the closest one when several do), written positionally — never in
+/// exponent form — with `inf`, `-inf`, `NaN` and `-0` spelled out. C has no such conversion
+/// (`%g` keeps six significant digits), so `wukong_rt_print_f64` derives it: for each precision `p`
+/// from 1 to 17 it takes the correctly rounded `p`-digit `%e` string and accepts it if `strtod`
+/// round-trips it to `x`, and otherwise tries the two adjacent `p`-digit decimals (a double at a
+/// power-of-two boundary has a lopsided rounding interval, so the nearest `p`-digit decimal can fall
+/// outside it while its neighbour lands inside). The first hit is the shortest round-tripping
+/// string, and among those the closest, which is exactly what Rust prints; the digits are then laid
+/// out positionally. `__USE_MINGW_ANSI_STDIO` selects MinGW's correctly rounded printf family; glibc,
+/// the UCRT and macOS libc are correctly rounded already.
+///
+/// The fallback still provides no `wukong_*` runtime kernels (a program that calls one fails to link,
+/// loudly), and on a Windows host the MinGW linker cannot consume an MSVC object's data relocations.
+const WUKONG_RT_C: &str = r#"#define __USE_MINGW_ANSI_STDIO 1
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+/* Keep stdout in binary mode so the MSVCRT does not translate the runtime's `\n` into CRLF. The
+   interpreter oracle (and the JIT) emit LF; without this the *linked exe* printed CRLF on Windows,
+   so its stdout differed from every other backend. Runs before main via the constructor attribute. */
+__attribute__((constructor)) static void wukong_rt_init(void) { _setmode(_fileno(stdout), _O_BINARY); }
+#endif
+void wukong_rt_print_i64(long long x) { printf("%lld\n", x); }
+void wukong_rt_print_u64(unsigned long long x) { printf("%llu\n", x); }
+/* Split a "d.ddde+XX" string into its digit characters and decimal exponent. */
+static int wk_parse_sci(const char *s, char *digits, int *n, int *dexp) {
+    int k = 0;
+    for (; *s && *s != 'e' && *s != 'E'; s++) {
+        if (*s >= '0' && *s <= '9') {
+            if (k >= 24) return 0;
+            digits[k++] = *s;
+        }
+    }
+    if (*s != 'e' && *s != 'E') return 0;
+    *dexp = atoi(s + 1);
+    *n = k;
+    return k > 0;
+}
+/* Does digits * 10^dexp (one digit before the point) parse back to exactly x? */
+static int wk_round_trips(const char *digits, int n, int dexp, double x) {
+    char buf[64];
+    int k = 0;
+    buf[k++] = digits[0];
+    if (n > 1) {
+        buf[k++] = '.';
+        memcpy(buf + k, digits + 1, (size_t)(n - 1));
+        k += n - 1;
+    }
+    snprintf(buf + k, sizeof buf - (size_t)k, "e%d", dexp);
+    return strtod(buf, NULL) == x;
+}
+/* Step digits * 10^dexp to the adjacent n-digit decimal above (up) or below it. */
+static void wk_step(char *d, int n, int *dexp, int up) {
+    int i = n - 1, j, is_pow10 = 1;
+    if (up) {
+        while (i >= 0 && d[i] == '9') { d[i] = '0'; i--; }
+        if (i < 0) { d[0] = '1'; *dexp += 1; } else { d[i]++; }
+        return;
+    }
+    if (d[0] != '1') is_pow10 = 0;
+    for (j = 1; j < n && is_pow10; j++) if (d[j] != '0') is_pow10 = 0;
+    if (is_pow10) {
+        /* 10^e steps down onto the finer grid of the decade below: 99..9 * 10^(e-1). */
+        for (j = 0; j < n; j++) d[j] = '9';
+        *dexp -= 1;
+        return;
+    }
+    while (d[i] == '0') { d[i] = '9'; i--; }
+    d[i]--;
+}
+/* Rust's `Display` for f64 (see the driver's WUKONG_RT_C docs). */
+void wukong_rt_print_f64(double x) {
+    char out[400];
+    char d[24], c[24];
+    int k = 0, n = 0, e = 0, ce, p, up, found = 0, point, z;
+    if (x != x) { fputs("NaN\n", stdout); return; }
+    if (signbit(x)) { out[k++] = '-'; x = -x; }
+    if (isinf(x)) {
+        memcpy(out + k, "inf", 3);
+        k += 3;
+    } else if (x == 0.0) {
+        out[k++] = '0';
+    } else {
+        for (p = 1; p <= 17 && !found; p++) {
+            char s[64];
+            snprintf(s, sizeof s, "%.*e", p - 1, x);
+            if (!wk_parse_sci(s, d, &n, &e)) continue;
+            if (wk_round_trips(d, n, e, x)) { found = 1; break; }
+            for (up = 1; up >= 0 && !found; up--) {
+                memcpy(c, d, (size_t)n);
+                ce = e;
+                wk_step(c, n, &ce, up);
+                if (wk_round_trips(c, n, ce, x)) { memcpy(d, c, (size_t)n); e = ce; found = 1; }
+            }
+        }
+        if (!found) {
+            /* Unreachable with a correctly rounded printf: 17 digits always round-trip. */
+            char s[64];
+            snprintf(s, sizeof s, "%.16e", x);
+            if (!wk_parse_sci(s, d, &n, &e)) { d[0] = '0'; n = 1; e = 0; }
+        }
+        while (n > 1 && d[n - 1] == '0') n--;
+        point = e + 1; /* the value is 0.d1d2...dn * 10^point */
+        if (point <= 0) {
+            out[k++] = '0';
+            out[k++] = '.';
+            for (z = 0; z < -point; z++) out[k++] = '0';
+            memcpy(out + k, d, (size_t)n);
+            k += n;
+        } else if (point >= n) {
+            memcpy(out + k, d, (size_t)n);
+            k += n;
+            for (z = 0; z < point - n; z++) out[k++] = '0';
+        } else {
+            memcpy(out + k, d, (size_t)point);
+            k += point;
+            out[k++] = '.';
+            memcpy(out + k, d + point, (size_t)(n - point));
+            k += n - point;
+        }
+    }
+    out[k++] = '\n';
+    fwrite(out, 1, (size_t)k, stdout);
+}
+/* A NUL-terminated string buffer plus a newline; a null pointer prints nothing (as the Rust shim). */
+void wukong_rt_print_str(const char *s) {
+    if (!s) return;
+    fputs(s, stdout);
+    fputc('\n', stdout);
+}
+void wukong_rt_assert(long long c) { if (!c) { fprintf(stderr, "assertion failed\n"); exit(1); } }
+long long wukong_rt_assert_failed(void) { return 0; }
+double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }
+float wukong_rt_fmod_f32(float a, float b) { return fmodf(a, b); }
+/* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract — and
+   handles the count*size overflow; a negative count clamps to an empty (null) allocation. */
+void* wukong_rt_alloc(long long count, long long elem_size, long long elem_is_float) {
+    (void)elem_is_float;
+    if (count < 0 || elem_size <= 0) return 0;
+    return calloc((size_t)count, (size_t)elem_size);
+}
+void wukong_rt_free(void* p) { free(p); }
+"#;
 
 // Scalar-only C link fallback. Keep operations/constants in lockstep with runtime/vmath.rs,
 // including explicit fmaf and nonfinite bits; plain sinf/cosf for every input would differ
@@ -858,15 +974,7 @@ fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Option
         LinkOutcome::Unavailable => { /* fall through to the C-runtime `cc` link */ }
     }
 
-    cc_link(
-        program,
-        interner,
-        opts,
-        scratch.as_ref(),
-        &stem,
-        &obj_path,
-        &out,
-    )
+    cc_link(opts, scratch.as_ref(), &stem, &obj_path, &out)
 }
 
 /// A native-backend (Cranelift) failure as a diagnostic, so it reaches `--error-format=json` and
@@ -887,56 +995,19 @@ fn native_failure_diag(message: &str, input: &Path) -> Diagnostic {
                 "allocate the buffer on the heap (`alloc_f32(n)` and its siblings) or split it; \
                  `--run` (the interpreter) has no byte-layout limit",
             ),
-        NativeErrorKind::Unsupported => Diagnostic::error(message)
-            .with_code("C0001")
-            .note(program),
+        NativeErrorKind::Unsupported => Diagnostic::error(message).with_code("C0001").note(program),
         NativeErrorKind::Internal => {
             Diagnostic::bug(format!("native code generation failed: {message}")).note(program)
         }
     }
 }
 
-/// Identify float-print intrinsics in the emitted MIR, including calls in helper functions.
-/// Match Cranelift's call resolution: a program-defined function wins over an intrinsic with the
-/// same name. Check the actual first argument type, including f16/bf16's f32 promotion, rather than
-/// banning floating-point computation or guessing which constants C could print faithfully.
-fn cc_float_print_requirement(
-    program: &wukong_mir::Program,
-    interner: &Interner,
-) -> Option<String> {
-    for function in &program.funcs {
-        for block in &function.blocks {
-            for inst in &block.insts {
-                let wukong_mir::Op::Call { func, args } = &inst.op else {
-                    continue;
-                };
-                if !matches!(interner.resolve(*func), "print" | "println")
-                    || program.function(*func).is_some()
-                {
-                    continue;
-                }
-                if let Some(&arg) = args.first() {
-                    let ty = function.value_type(arg);
-                    if ty.is_float() {
-                        return Some(format!(
-                            "{}({}) in `{}`",
-                            interner.resolve(*func),
-                            ty.display(),
-                            interner.resolve(function.name)
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Called only after the preferred Rust link is unavailable. Keep the capability check inside
-/// this boundary so a forced C-path test exercises the same refusal as native executable emission.
+/// Called only after the preferred Rust link is unavailable: link the object against the generated
+/// C runtime ([`WUKONG_RT_C`]), whose printing is byte-identical to the oracle's (floats included),
+/// so the fallback produces the same output as `--run` for every program it can link. What it
+/// cannot provide — the `wukong_*` runtime kernels — is a link error, never a different answer; the
+/// note below says which link path is being taken so that error is legible.
 fn cc_link(
-    program: &wukong_mir::Program,
-    interner: &Interner,
     opts: &Options,
     scratch: Option<&ScratchDir>,
     stem: &str,
@@ -945,15 +1016,6 @@ fn cc_link(
 ) -> i32 {
     use std::process::Command;
 
-    if let Some(requirement) = cc_float_print_requirement(program, interner) {
-        eprint_line(&format!(
-            "error: C fallback cannot preserve floating-point print output: {requirement}.\n\
-             help: restore rustc and a compatible wukong_runtime rlib beside wukongc (or in deps/), \
-             or use --run; --emit=obj remains available."
-        ));
-        return exit::UNIMPLEMENTED;
-    }
-
     // exe (fallback): emit the C runtime into the scratch dir and link it with the system C compiler.
     let rt_path = scratch_path(scratch, format!("{stem}_rt.c"));
     if let Err(e) = std::fs::write(&rt_path, c_runtime_source()) {
@@ -961,6 +1023,10 @@ fn cc_link(
         return exit::IO_ERROR;
     }
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    eprint_line(&format!(
+        "note: no usable `rustc` + `wukong_runtime` rlib beside wukongc; linking with `{cc}` and the \
+         C runtime, which has no `wukong_*` kernels (a program that calls one will not link)"
+    ));
     let status = Command::new(&cc)
         .args(cc_link_args(obj_path, &rt_path, out))
         .status();
@@ -1048,7 +1114,7 @@ enum LinkOutcome {
 /// The Rust link shim generated for the rustc-driven `--emit=exe` link. It provides the `wukong_rt_*`
 /// runtime the Cranelift object calls (formatting through Rust's stdout, so output is byte-identical
 /// to the interpreter/JIT oracle — raw LF on Windows, and floats via `Display` like the interp's
-/// `format!("{f}")`; the C fallback explicitly rejects float printing), and `extern crate
+/// `format!("{f}")`; the C fallback reproduces that formatting in C), and `extern crate
 /// wukong_runtime` pulls the AVX2 microkernels into the link so a recognized-kernel program resolves
 /// its `wukong_*` symbols. `#![no_main]` leaves the Cranelift object's own `main` as the CRT entry.
 const WUKONG_RT_SHIM: &str = r##"#![no_main]
@@ -1120,8 +1186,8 @@ pub extern "C" fn wukong_rt_fmod_f32(a: f32, b: f32) -> f32 {
 /// `wukong_runtime` a dependency rather than a selected member. A tree that has the uplifted copy
 /// has it as a *leftover* of some earlier `cargo build`, which is why this looked fine locally and
 /// broke on every clean checkout: CI runs `cargo test --workspace`, never `cargo build`, so the
-/// preferred link path degraded to the `cc` fallback with reduced capabilities: no
-/// `wukong_rt_print_str` or `wukong_*` kernels, and float printing now explicitly refused.
+/// preferred link path degraded to the `cc` fallback with reduced capabilities: no `wukong_*`
+/// kernels, so every recognized-kernel program failed to link.
 /// Searching `deps/` too makes the preferred path available whenever cargo
 /// built the runtime at all, however the compiler was built.
 ///

@@ -15,20 +15,27 @@ deliberately *not* retried with `cc`, so a real link bug is never swallowed. For
 by the C fallback, inability to run either linker produces exit 2 (`UNIMPLEMENTED`) and attempts
 to preserve the object. A linker that runs and fails to link produces exit 1.
 
-The `cc` fallback provides integer/bool printing, assertions, float remainder, heap operations and
-scalar trigonometry. Float printing requires the Rust link path: when that path is unavailable,
-the driver rejects float-printing programs with exit 2 before invoking the C linker. Float
-computation that prints integer results remains supported, and `--emit=obj` remains available.
-The C runtime has no string printer or recognized `wukong_*` microkernels, and MSVC-object data
-relocations can also prevent linking. The preferred rustc path formats floats through Rust's
-`Display` and links `wukong_runtime`. To run with zero external toolchain, use the interpreter:
+The `cc` fallback provides integer, bool, float and string printing, assertions, float remainder,
+heap operations and scalar trigonometry, and its output is byte-identical to `--run`: floats are
+printed exactly as the interpreter's Rust `Display` prints them (the shortest decimal that
+round-trips, written positionally, with `inf`/`-inf`/`NaN`/`-0`), derived in C from correctly rounded
+`%e` conversions checked with `strtod`, not approximated with `%g`. What the C runtime cannot
+provide is the recognized `wukong_*` microkernels — a program that calls one fails to link (loudly,
+with a `note:` naming the fallback), and on Windows the MinGW linker also cannot consume an MSVC
+object's data relocations (string literals). The preferred rustc path links `wukong_runtime` and has
+neither limitation. To run with zero external toolchain, use the interpreter:
 `wukongc --run program.wk`.
 
 Scalar sine/cosine use the same bounded polynomial and explicit FMA operations in the Rust and
 C runtimes; arguments with magnitude at least 4096 use the platform's full-range `sinf`/`cosf`.
 The C link command disables implicit FP contraction so the polynomial's separate operations
-retain their rounding. Tangent remains the quotient of the shared sine and cosine. This does
-not change the C fallback's float-printing limitation described above.
+retain their rounding. Tangent remains the quotient of the shared sine and cosine.
+
+`--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>` selects the instruction-set level of the
+object (default `native`, every feature of the compiling host). A named level is exact and
+host-independent, and below `x86-64-v3` the general vectorizer's raw-AVX2 loop kernels are not used,
+so `--emit=exe --target-cpu=x86-64` runs on any x86-64 CPU; the linked runtime kernels already pick
+their AVX2 path at run time.
 
 LLVM enters **only** through `--emit=llvm-ir`, which prints **textual LLVM IR** for inspection — and
 even that needs no LLVM installed (it is just text on stdout):
