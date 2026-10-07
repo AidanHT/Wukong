@@ -15,7 +15,9 @@
 //! (including the function return type). Given a whole [`Program`], [`verify_program`] additionally
 //! checks each call against its callee's declared signature at the driver's verification boundary.
 //! Cast kinds must agree with source/destination categories and widths, and every registered
-//! vector recipe is checked for valid SSA operands, stream/scalar indices and reduction shape.
+//! vector recipe is checked for valid SSA operands, stream/scalar indices and reduction shape. A
+//! `veckernel` call whose pointer or scalar table is a local slot must have a slot large enough for
+//! every stream and scalar its recipe uses.
 
 use std::collections::{HashMap, HashSet};
 
@@ -72,6 +74,7 @@ fn verify(f: &Function, sigs: Option<&FnSigs>) -> Vec<String> {
         defined: HashSet::new(),
         live: HashSet::new(),
         dom_check: false,
+        slots: None,
     };
     v.run();
     v.errors
@@ -88,6 +91,8 @@ struct Verifier<'a> {
     live: HashSet<u32>,
     /// Whether `live` is meaningful right now (false while checking unreachable blocks).
     dom_check: bool,
+    /// `alloca` result -> its slot type, built the first time a `veckernel` call needs it.
+    slots: Option<HashMap<u32, &'a MirType>>,
 }
 
 /// The at-most-two blocks a terminator can transfer control to.
@@ -157,7 +162,7 @@ fn intersect(mut a: u32, mut b: u32, idom: &[u32], rpo_num: &[usize]) -> u32 {
     a
 }
 
-impl Verifier<'_> {
+impl<'a> Verifier<'a> {
     fn err(&mut self, msg: impl Into<String>) {
         self.errors.push(msg.into());
     }
@@ -657,6 +662,15 @@ impl Verifier<'_> {
                 if self.use_val(*scalars) {
                     self.expect_ty(*scalars, &MirType::Ptr, "veckernel scalars");
                 }
+                let counts = self
+                    .f
+                    .vec_kernels
+                    .get(*kernel as usize)
+                    .map(|k| (k.streams, k.scalars));
+                if let Some((streams, invariants)) = counts {
+                    self.check_kernel_table(*ptrs, &MirType::Ptr, streams, "pointer");
+                    self.check_kernel_table(*scalars, &MirType::F32, invariants, "scalar");
+                }
                 if self.use_val(*n) {
                     if let Some(t) = self.ty(*n) {
                         if !t.is_int() {
@@ -779,6 +793,45 @@ impl Verifier<'_> {
                     )),
                 }
             }
+        }
+    }
+
+    /// The slot type of the `alloca` that defines `v`, if one does.
+    fn slot_type(&mut self, v: ValueId) -> Option<&'a MirType> {
+        let f = self.f;
+        self.slots
+            .get_or_insert_with(|| {
+                f.blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .filter_map(|inst| match (&inst.op, inst.result) {
+                        (Op::Alloca { ty, .. }, Some(r)) => Some((r.0, ty)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .get(&v.0)
+            .copied()
+    }
+
+    /// A kernel's pointer table needs one entry per stream its recipe reads or writes, and its
+    /// scalar table one per invariant: the AVX2 assembler and the interpreter's marshalling both
+    /// index them by the recipe's counts with no bound check, so a short table is an out-of-bounds
+    /// read on both backends. Provable when the table is a local slot of `elem`s (how lowering
+    /// builds both); any other table is left to the producer.
+    fn check_kernel_table(&mut self, table: ValueId, elem: &MirType, needed: u32, what: &str) {
+        let Some(ty) = self.slot_type(table) else {
+            return;
+        };
+        let entries = match ty {
+            MirType::Array(e, n) if **e == *elem => *n,
+            t if t == elem => 1,
+            _ => return,
+        };
+        if entries < needed {
+            self.err(format!(
+                "veckernel {what} table holds {entries} entries but its recipe uses {needed}"
+            ));
         }
     }
 
@@ -1037,6 +1090,72 @@ mod tests {
             assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
             assert!(kernel.pressure().is_none(), "malformed recipe was accepted");
         }
+    }
+
+    /// `out = x + s` over one stream and one scalar, called with tables of the given sizes; `None`
+    /// passes the table in as a parameter instead of a local slot.
+    fn kernel_call(ptr_slots: Option<u32>, scalar_slots: Option<u32>, streams: u32) -> Vec<String> {
+        use crate::{VecBin, VecKernel, VecOp};
+        let mut i = Interner::new();
+        let mut b = Builder::new(i.intern("f"), MirType::Void);
+        let table = |b: &mut Builder, slots: Option<u32>, elem: MirType| match slots {
+            Some(n) => b.alloca(MirType::Array(Box::new(elem), n)),
+            None => b.add_param(MirType::Ptr),
+        };
+        let ptrs = table(&mut b, ptr_slots, MirType::Ptr);
+        let scalars = table(&mut b, scalar_slots, MirType::F32);
+        let ops = vec![
+            VecOp::Load { stream: 0 },
+            VecOp::Splat { scalar: 0 },
+            VecOp::Bin {
+                op: VecBin::Add,
+                a: 0,
+                b: 1,
+            },
+            VecOp::Store {
+                stream: streams - 1,
+                val: 2,
+            },
+        ];
+        let kernel = b.add_vec_kernel(VecKernel {
+            name: i.intern("k"),
+            streams,
+            scalars: 1,
+            unroll: 1,
+            ops,
+            reduce: None,
+        });
+        let n = b.build(MirType::I64, Op::ConstInt(8, MirType::I64));
+        b.build_void(Op::VecKernelCall {
+            kernel,
+            ptrs,
+            scalars,
+            n,
+        });
+        b.ret(None);
+        verify_function(&b.finish())
+    }
+
+    #[test]
+    fn veckernel_tables_must_hold_every_stream_and_scalar_the_recipe_uses() {
+        assert!(kernel_call(Some(2), Some(1), 2).is_empty());
+        assert!(kernel_call(Some(1), Some(1), 1).is_empty());
+        // Tables handed in from elsewhere are the producer's obligation.
+        assert!(kernel_call(None, None, 2).is_empty());
+        let short = kernel_call(Some(1), Some(1), 2);
+        assert!(
+            short
+                .iter()
+                .any(|e| e.contains("pointer table holds 1 entries but its recipe uses 2")),
+            "{short:?}"
+        );
+        let no_scalars = kernel_call(Some(1), Some(0), 1);
+        assert!(
+            no_scalars
+                .iter()
+                .any(|e| e.contains("scalar table holds 0 entries but its recipe uses 1")),
+            "{no_scalars:?}"
+        );
     }
 
     #[test]
