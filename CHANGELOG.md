@@ -27,6 +27,9 @@ All notable changes to Wukong are documented here. The format is loosely based o
 - **Same-range loop fusion is planned in one pass.** A run of adjacent same-range loops no longer
   clones and re-checks every candidate prefix at every statement position; only the chosen run is
   cloned. The fused output is unchanged.
+- **Boolean-vector legalization is per function.** Native codegen no longer deep-copies the whole
+  program when one function holds a float-to-`i1`-vector cast; each such function is scalarized on
+  its own codegen worker.
 - **New: `--time-passes`, `--time-trace=<file>`, `--depfile=<file>`.** `--time-passes` prints a
   per-stage table to stderr (read, lex, parse, imports, sema, lower, optimize with its per-pass
   breakdown, codegen with its isel/object-write split, link, run) plus the heaviest MIR functions;

@@ -2474,8 +2474,7 @@ fn populate_module<M: Module>(
     interner: &Interner,
     parallel: bool,
 ) -> Result<HashMap<Symbol, FuncId>, String> {
-    let legalized = bool_vectors::legalize(program, interner)?;
-    let program = legalized.as_ref();
+    // Compact boolean-vector casts are legalized per function inside `build_function_clif`.
     let asserting = asserting_functions(program, interner)?;
     let ptr_ty = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
@@ -3541,6 +3540,10 @@ fn build_function_clif(
     clif: &mut cranelift_codegen::ir::Function,
     scratch: &mut TranslationScratch,
 ) -> Result<(), String> {
+    // A function with a float-to-`i1`-vector cast is scalarized here, on its own codegen worker;
+    // every other function is borrowed as is (see `bool_vectors::legalize`).
+    let legalized = bool_vectors::legalize(f, interner)?;
+    let f: &Function = &legalized;
     clif.signature = signature_of(f, ptr_ty, call_conv);
     let TranslationScratch {
         vmap,

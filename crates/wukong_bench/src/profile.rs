@@ -16,7 +16,9 @@
 //!   instruction-selection + register allocation + machine-code emission, then object-container
 //!   serialization — with its internal split (codegen vs object-write) measured via
 //!   `wukong_codegen_cranelift::emit_object_timed` and printed underneath, bounding the fixed
-//!   container cost `docs/compile-floor.md` reasons about.
+//!   container cost `docs/compile-floor.md` reasons about. A JIT row beside the table times the
+//!   `--run --backend=native` codegen of the same optimized programs (files with a `main`), as a
+//!   ratio to their object-path backend stage.
 //!
 //! * `spawn-overhead` — the same source compiled two ways: (a) the in-process API to an object in
 //!   memory, and (b) spawning the real `wukongc.exe --emit=obj`. The difference is the spawn tax
@@ -100,6 +102,9 @@ struct Prof {
     /// (isel/regalloc/machine-code emit) vs object-container serialization. Sub-slices of `stage[5]`.
     bk_codegen: Duration,
     bk_obj_write: Duration,
+    /// In-process JIT compile of the same optimized program (`--run --backend=native`'s codegen),
+    /// for files with a `main` the JIT accepts. Not a stage of the object path, so not in `stage`.
+    jit: Option<Duration>,
 }
 
 impl Prof {
@@ -177,6 +182,23 @@ pub fn report(files: &[PathBuf]) {
         100.0 * bk_cg.as_secs_f64() / bk,
         100.0 * bk_ow.as_secs_f64() / bk,
     );
+    // JIT row: the `--run --backend=native` codegen of the same programs, against the object path's
+    // backend stage over the same files (a ratio, never an absolute rate).
+    let jitted: Vec<(Duration, Duration)> = profs
+        .iter()
+        .filter_map(|p| p.jit.map(|j| (j, p.stage[5])))
+        .collect();
+    if !jitted.is_empty() {
+        let jit_t: Duration = jitted.iter().map(|j| j.0).sum();
+        let obj_t: Duration = jitted.iter().map(|j| j.1).sum();
+        println!(
+            "  JIT (--run --backend=native; not in TOTAL): {} over {} file(s) with `main` = {:.2}x \
+             their codegen+obj",
+            fmt(jit_t),
+            jitted.len(),
+            jit_t.as_secs_f64() / obj_t.as_secs_f64().max(1e-12),
+        );
+    }
 
     println!(
         "\nwork totals: {} src bytes, {tokens} tokens, {ast_nodes} AST nodes, {mir_ops} MIR ops, \
@@ -260,6 +282,8 @@ fn measure_one(path: &Path) -> Option<Prof> {
     wukong_opt::optimize(&mut p_opt, LEVEL);
     let obj = wukong_codegen_cranelift::emit_object(&p_opt, &interner).ok()?;
     let obj_bytes = obj.len();
+    // `main` is interned before any stage closure borrows the interner.
+    let main = interner.intern("main");
 
     // CONVENTION: every stage times CONSTRUCTION of its output only. Each rep binds the result,
     // stops the clock, and only then drops it — because `let _ = f();` drops the temporary *before*
@@ -335,6 +359,22 @@ fn measure_one(path: &Path) -> Option<Prof> {
             .map(|(_, t)| t.object_write)
             .unwrap_or(Duration::ZERO)
     });
+    // JIT: the same optimized program compiled into executable memory, as `--run --backend=native`
+    // does, at the matching backend level. Only files whose `main` the JIT accepts are timed; the
+    // handle (and its executable memory) is dropped after the clock stops.
+    let jit_backend = wukong_codegen_cranelift::BackendOpt::for_level(LEVEL);
+    let jit_ok = p_opt.function(main).is_some()
+        && wukong_codegen_cranelift::jit_compile_with(&p_opt, main, &interner, jit_backend).is_ok();
+    let jit = jit_ok.then(|| {
+        best_of(|| {
+            let t = Instant::now();
+            let out =
+                wukong_codegen_cranelift::jit_compile_with(&p_opt, main, &interner, jit_backend);
+            let e = t.elapsed();
+            drop(out);
+            e
+        })
+    });
 
     Some(Prof {
         name: short(path),
@@ -346,6 +386,7 @@ fn measure_one(path: &Path) -> Option<Prof> {
         stage: [lex, parse, sema_t, mir, optimize, backend],
         bk_codegen,
         bk_obj_write,
+        jit,
     })
 }
 
