@@ -20,10 +20,14 @@
 //! peer both run an order of magnitude below their non-power-of-two rate at 1024²/2048², and why the
 //! 8×8 kernel is 5–7× faster there and ~1.4× at sizes where nobody thrashes.
 //!
-//! The 16-bit (`bf16`/`f16`) entries still use the generic scalar `transpose_rows<T: Copy>` core,
-//! which also serves as the f32 fallback on a host without AVX2. Both produce the identical `dst`,
-//! since a transpose is a permutation — it never inspects, compares or combines a value, so every
-//! path here is bit-identical **by construction**, for any bit pattern including NaN payloads.
+//! The 16-bit (`bf16`/`f16`) entries carry the same kind of in-register kernel
+//! ([`transpose_rows_u16_avx2`]): a 16-row × 8-column `u16` tile transposed with three in-lane
+//! unpack stages on 256-bit registers, which writes each destination row as one 32-byte store and
+//! keeps the same **eight** destination rows live per j-tile. The generic scalar
+//! `transpose_rows<T: Copy>` core remains the fallback for both widths on a host without AVX2. Every
+//! path produces the identical `dst`, since a transpose is a permutation — it never inspects,
+//! compares or combines a value, so every path here is bit-identical **by construction**, for any
+//! bit pattern including NaN payloads.
 //!
 //! Four C entries: `wukong_transpose_f32[_parallel]` and `wukong_transpose_u16[_parallel]`. A
 //! non-positive `rows` or `cols` is a no-op. The `_parallel` forms spread the independent `B`-row
@@ -238,6 +242,190 @@ unsafe fn transpose_rows_f32_avx2(
     }
 }
 
+/// 16-bit (`bf16`/`f16` bits) transpose of the row range `[i0, i1)` with an in-register AVX2 kernel
+/// inside the same `B`-square cache block as [`transpose_rows`] — the `u16` sibling of
+/// [`transpose_rows_f32_avx2`], with the same two levers and the same traversal.
+///
+/// THE TILE is 16 source rows × 8 source columns. Source rows `i + k` and `i + 8 + k` (`k ∈ 0..8`)
+/// are loaded as the low and high 128-bit halves of one `ymm` (8 `u16` each); three stages of
+/// in-lane `unpack{lo,hi}_epi16` → `_epi32` → `_epi64` then transpose BOTH 8×8 halves at once,
+/// because AVX2's unpacks operate per 128-bit lane. Output vector `c` holds destination row `j + c`
+/// at columns `i .. i + 16` — 16 contiguous `u16` — so each destination row of the tile is written by
+/// ONE 32-byte store: 16 loads, 24 shuffles and 8 stores move 128 elements that the scalar block
+/// moves with 128 loads and 128 stores. There is no lane-crossing shuffle anywhere; the cross-half
+/// work is done by the loads (`vinserti128` from memory is a load plus an ALU uop, not a shuffle).
+///
+/// LIVE DESTINATION ROWS stay at eight, as in the f32 kernel: the j-tile is 8 columns wide, so one
+/// tile writes 8 destination rows, and on a power-of-two `rows` those rows (`rows·2` bytes apart)
+/// all collide in one L1 set exactly as the f32 header describes — a 16-column tile would keep 16
+/// live and exceed a 12-way L1. The j-tile is the OUTER loop and the row strip the inner one (same
+/// burst-length argument), and the next j-tile's eight destination rows are prefetched with the same
+/// `_MM_HINT_ET0` (lowered to `prefetcht0` on this crate's baseline, see the f32 kernel).
+///
+/// Rows of a block beyond the last 16-row strip take one 8-row strip if at least 8 remain (the same
+/// shuffles on the low halves only, stored as 16-byte rows); the `< 8` trailing rows and the
+/// `cols % 8` trailing columns fall back to the scalar moves [`transpose_rows`] uses.
+///
+/// # Safety
+/// `src` valid for `rows*cols`, `dst` for `cols*rows` `u16`; `i0 <= i1 <= rows`; AVX2 available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose_rows_u16_avx2(
+    src: *const u16,
+    dst: *mut u16,
+    rows: usize,
+    cols: usize,
+    i0: usize,
+    i1: usize,
+) {
+    use std::arch::x86_64::*;
+    // In-lane 8x8 transpose of eight 16-bit rows, applied to both 128-bit halves at once: input `v[k]`
+    // holds row k of each half; output `c[q]` holds column q of each half.
+    macro_rules! tr8x8_epi16 {
+        ($v:expr) => {{
+            let v: [__m256i; 8] = $v;
+            let t0 = _mm256_unpacklo_epi16(v[0], v[1]);
+            let t1 = _mm256_unpackhi_epi16(v[0], v[1]);
+            let t2 = _mm256_unpacklo_epi16(v[2], v[3]);
+            let t3 = _mm256_unpackhi_epi16(v[2], v[3]);
+            let t4 = _mm256_unpacklo_epi16(v[4], v[5]);
+            let t5 = _mm256_unpackhi_epi16(v[4], v[5]);
+            let t6 = _mm256_unpacklo_epi16(v[6], v[7]);
+            let t7 = _mm256_unpackhi_epi16(v[6], v[7]);
+            let u0 = _mm256_unpacklo_epi32(t0, t2);
+            let u1 = _mm256_unpackhi_epi32(t0, t2);
+            let u2 = _mm256_unpacklo_epi32(t1, t3);
+            let u3 = _mm256_unpackhi_epi32(t1, t3);
+            let u4 = _mm256_unpacklo_epi32(t4, t6);
+            let u5 = _mm256_unpackhi_epi32(t4, t6);
+            let u6 = _mm256_unpacklo_epi32(t5, t7);
+            let u7 = _mm256_unpackhi_epi32(t5, t7);
+            [
+                _mm256_unpacklo_epi64(u0, u4),
+                _mm256_unpackhi_epi64(u0, u4),
+                _mm256_unpacklo_epi64(u1, u5),
+                _mm256_unpackhi_epi64(u1, u5),
+                _mm256_unpacklo_epi64(u2, u6),
+                _mm256_unpackhi_epi64(u2, u6),
+                _mm256_unpacklo_epi64(u3, u7),
+                _mm256_unpackhi_epi64(u3, u7),
+            ]
+        }};
+    }
+    let c8 = cols & !7;
+    let mut ib = i0;
+    while ib < i1 {
+        let imax = (ib + B).min(i1);
+        // Rows this block covers with 16-row strips, then with at most one 8-row strip.
+        let i16max = ib + (imax - ib) / 16 * 16;
+        let i8max = if imax - i16max >= 8 {
+            i16max + 8
+        } else {
+            i16max
+        };
+        // Does the block reach the second half (32 bytes on) of a destination row's segment?
+        let pf_two = ib + 16 < imax;
+        let mut jb = 0;
+        while jb < cols {
+            let jmax = (jb + B).min(cols);
+            let j8max = jmax.min(c8);
+            let mut j = jb;
+            while j + 8 <= j8max {
+                // Start the read-for-ownership of the NEXT j-tile's eight destination rows now.
+                if j + 16 <= j8max {
+                    let p = dst.wrapping_add((j + 8) * rows + ib) as *const i8;
+                    for r in 0..8 {
+                        let q = p.wrapping_add(r * rows * 2);
+                        _mm_prefetch::<_MM_HINT_ET0>(q);
+                        if pf_two {
+                            _mm_prefetch::<_MM_HINT_ET0>(q.wrapping_add(32));
+                        }
+                    }
+                }
+                let mut i = ib;
+                while i < i16max {
+                    let s = src.add(i * cols + j);
+                    let mut v = [_mm256_setzero_si256(); 8];
+                    for (k, vk) in v.iter_mut().enumerate() {
+                        let lo = _mm_loadu_si128(s.add(k * cols) as *const __m128i);
+                        let hi = _mm_loadu_si128(s.add((k + 8) * cols) as *const __m128i);
+                        *vk = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi);
+                    }
+                    let c = tr8x8_epi16!(v);
+                    let d = dst.add(j * rows + i);
+                    for (q, cq) in c.iter().enumerate() {
+                        _mm256_storeu_si256(d.add(q * rows) as *mut __m256i, *cq);
+                    }
+                    i += 16;
+                }
+                if i < i8max {
+                    // One 8-row strip: the same shuffles on the low halves; the high halves are
+                    // never read back.
+                    let s = src.add(i * cols + j);
+                    let mut v = [_mm256_setzero_si256(); 8];
+                    for (k, vk) in v.iter_mut().enumerate() {
+                        let lo = _mm_loadu_si128(s.add(k * cols) as *const __m128i);
+                        *vk = _mm256_castsi128_si256(lo);
+                    }
+                    let c = tr8x8_epi16!(v);
+                    let d = dst.add(j * rows + i);
+                    for (q, cq) in c.iter().enumerate() {
+                        _mm_storeu_si128(
+                            d.add(q * rows) as *mut __m128i,
+                            _mm256_castsi256_si128(*cq),
+                        );
+                    }
+                }
+                j += 8;
+            }
+            // cols % 8 trailing columns of this block, over the rows the strips covered.
+            while j < jmax {
+                let mut i = ib;
+                while i < i8max {
+                    *dst.add(j * rows + i) = *src.add(i * cols + j);
+                    i += 1;
+                }
+                j += 1;
+            }
+            // Rows past the last strip of this block (< 8 of them), full width.
+            let mut i = i8max;
+            while i < imax {
+                let srow = src.add(i * cols);
+                for jj in jb..jmax {
+                    *dst.add(jj * rows + i) = *srow.add(jj);
+                }
+                i += 1;
+            }
+            jb += B;
+        }
+        ib += B;
+    }
+}
+
+/// 16-bit row-range transpose: the AVX2 tile kernel where available, the generic scalar block
+/// otherwise. Both are the same permutation, so the choice is invisible to every caller.
+///
+/// # Safety
+/// `src` valid for `rows*cols`, `dst` for `cols*rows` `u16`; `i0 <= i1 <= rows`.
+#[inline]
+unsafe fn transpose_rows_u16(
+    src: *const u16,
+    dst: *mut u16,
+    rows: usize,
+    cols: usize,
+    i0: usize,
+    i1: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            transpose_rows_u16_avx2(src, dst, rows, cols, i0, i1);
+            return;
+        }
+    }
+    transpose_rows(src, dst, rows, cols, i0, i1);
+}
+
 /// f32 row-range transpose: the AVX2 8x8 kernel where available, the generic scalar block otherwise.
 /// The two produce identical `dst` bytes (both are the same permutation), so the choice is invisible
 /// to every caller and to the differential gate.
@@ -267,49 +455,6 @@ unsafe fn transpose_rows_f32(
 /// its overhead on a small, already-cache-resident matrix).
 const TRANSPOSE_PAR_MIN: usize = 1 << 16;
 
-/// Multi-threaded `dst = srcᵀ` (generic over `T`): the independent `B`-row blocks are spread across
-/// cores. Each block writes a disjoint set of `dst` entries (`dst[*, i]` for `i` in the block), so the
-/// result is **bit-identical to the serial transpose** the interpreter marshals as the oracle — there
-/// is no accumulation, just a permutation, so thread count and order are irrelevant. Below
-/// `TRANSPOSE_PAR_MIN` it runs the serial path.
-///
-/// # Safety
-/// `src` valid for `rows*cols`, `dst` for `cols*rows` `T`, non-overlapping.
-#[inline]
-unsafe fn transpose_parallel<T: Copy + Send + Sync>(
-    src: *const T,
-    dst: *mut T,
-    rows: i64,
-    cols: i64,
-) {
-    if rows <= 0 || cols <= 0 {
-        return;
-    }
-    let (r, c) = (rows as usize, cols as usize);
-    if r * c < TRANSPOSE_PAR_MIN {
-        transpose_rows(src, dst, r, c, 0, r);
-        return;
-    }
-    use rayon::prelude::*;
-    let nblocks = r.div_ceil(B);
-    let (src_addr, dst_addr) = (src as usize, dst as usize);
-    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
-    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
-    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
-    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
-    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
-    crate::ensure_global_pool();
-    (0..nblocks).into_par_iter().for_each(|blk| {
-        let i0 = blk * B;
-        let i1 = (i0 + B).min(r);
-        // SAFETY: disjoint dst-row range per block (dst[*, i] for i in [i0, i1)); pointers re-derived
-        // per task from the captured addresses (so they are Send).
-        unsafe {
-            transpose_rows(src_addr as *const T, dst_addr as *mut T, r, c, i0, i1);
-        }
-    });
-}
-
 /// `dst = srcᵀ` — transpose a `[rows, cols]` row-major f32 matrix into a `[cols, rows]` row-major one,
 /// cache-blocked, single-threaded.
 ///
@@ -328,9 +473,8 @@ pub unsafe extern "C" fn wukong_transpose_f32(
     transpose_rows_f32(src, dst, rows as usize, cols as usize, 0, rows as usize);
 }
 
-/// Multi-threaded f32 `dst = srcᵀ` — the f32 twin of [`transpose_parallel`], splitting the same
-/// independent `B`-row blocks across cores but running [`transpose_rows_f32`] (the AVX2 8x8 kernel)
-/// on each. Each block writes a disjoint set of `dst` entries, and a transpose is a permutation with
+/// Multi-threaded f32 `dst = srcᵀ`: the independent `B`-row blocks are spread across cores, each
+/// running [`transpose_rows_f32`] (the AVX2 8x8 kernel). Each block writes a disjoint set of `dst` entries, and a transpose is a permutation with
 /// no accumulation, so it is bit-identical to the serial form regardless of thread count. Below
 /// [`TRANSPOSE_PAR_MIN`] elements it runs serial. The row blocks are multiples of `B` = 32, hence of
 /// 8, so every task's range starts on an 8-row strip boundary.
@@ -353,8 +497,11 @@ pub unsafe extern "C" fn wukong_transpose_f32_parallel(
         return;
     }
     use rayon::prelude::*;
-    // Same first-rayon-touch precondition as [`transpose_parallel`]: provision the global pool before
-    // forking so the runtime's 16 MiB `build_global` is not beaten by rayon's lazy 2 MiB default.
+    // This fork can be the process's FIRST rayon touch, so it must provision the global pool first —
+    // [`crate::ensure_global_pool`]'s stated precondition. Forking bare builds rayon's default
+    // 2 MiB-stack registry, so the runtime's later 16 MiB `build_global` silently loses the race and
+    // outlined `@parallel` region bodies are left on undersized stacks. Idempotent (`Once`) and
+    // provisioning-only: the work split below is unchanged, so serial == parallel stays bit-exact.
     crate::ensure_global_pool();
     let nblocks = r.div_ceil(B);
     let (src_addr, dst_addr) = (src as usize, dst as usize);
@@ -385,10 +532,14 @@ pub unsafe extern "C" fn wukong_transpose_u16(
     if rows <= 0 || cols <= 0 {
         return;
     }
-    transpose_rows(src, dst, rows as usize, cols as usize, 0, rows as usize);
+    transpose_rows_u16(src, dst, rows as usize, cols as usize, 0, rows as usize);
 }
 
-/// Multi-threaded 16-bit `dst = srcᵀ`. See [`transpose_parallel`].
+/// Multi-threaded 16-bit `dst = srcᵀ`: the same independent `B`-row blocks as
+/// [`wukong_transpose_f32_parallel`], each running [`transpose_rows_u16`] (the AVX2 tile kernel).
+/// A permutation with no accumulation, so it is bit-identical to the serial form regardless of
+/// thread count; below [`TRANSPOSE_PAR_MIN`] elements it runs serial. Task ranges start on multiples
+/// of `B` = 32, so every 16-row strip lies inside one task.
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_transpose_u16`].
@@ -399,7 +550,28 @@ pub unsafe extern "C" fn wukong_transpose_u16_parallel(
     rows: i64,
     cols: i64,
 ) {
-    transpose_parallel(src, dst, rows, cols);
+    if rows <= 0 || cols <= 0 {
+        return;
+    }
+    let (r, c) = (rows as usize, cols as usize);
+    if r * c < TRANSPOSE_PAR_MIN {
+        transpose_rows_u16(src, dst, r, c, 0, r);
+        return;
+    }
+    use rayon::prelude::*;
+    // Same first-rayon-touch precondition as the f32 entry: provision the global pool before forking.
+    crate::ensure_global_pool();
+    let nblocks = r.div_ceil(B);
+    let (src_addr, dst_addr) = (src as usize, dst as usize);
+    (0..nblocks).into_par_iter().for_each(|blk| {
+        let i0 = blk * B;
+        let i1 = (i0 + B).min(r);
+        // SAFETY: disjoint dst-row range per block (dst[*, i] for i in [i0, i1)); pointers re-derived
+        // per task from the captured addresses (so they are Send).
+        unsafe {
+            transpose_rows_u16(src_addr as *const u16, dst_addr as *mut u16, r, c, i0, i1);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -470,12 +642,20 @@ mod tests {
             (1, 1),
             (3, 5),
             (8, 8),
+            (16, 8),  // exactly one 16x8 tile
+            (16, 16), // two j-tiles, one 16-row strip
+            (24, 40), // a 16-row strip + an 8-row strip, a column tail
+            (31, 17), // 16 + 8 + 7 trailing rows
             (32, 32),
             (33, 31),
+            (40, 24), // a full block + one 8-row strip
+            (47, 9),  // second block: 8-row strip + 7-row tail
             (100, 70),
+            (128, 128), // power-of-two stride (the L1-set-collision shape)
             (1, 257),
             (257, 1),
             (300, 400), // > TRANSPOSE_PAR_MIN so the multicore path runs
+            (520, 136), // > TRANSPOSE_PAR_MIN with a ragged last block
         ] {
             let src: Vec<u16> = (0..r * c).map(|i| (i as u16).wrapping_mul(2719)).collect();
             let mut want = vec![0u16; r * c];
@@ -497,6 +677,58 @@ mod tests {
             }
             assert_eq!(got, want, "u16 transpose {r}x{c} vs naive");
             assert_eq!(got, got_par, "u16 transpose serial vs parallel {r}x{c}");
+        }
+    }
+
+    /// The AVX2 16-bit tile kernel must move **the same bits** as the generic scalar block, for every
+    /// strip/tail combination a `B` = 32 block can hold (16-row strips, the single 8-row strip, the
+    /// `< 8` row tail, the `cols % 8` column tail) and over partial `[i0, i1)` windows as the parallel
+    /// entry hands them out. Every `u16` value is distinct within a run, so a misrouted element
+    /// cannot hide behind an equal neighbour.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_u16_tile_moves_the_same_bits_as_the_scalar_block() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for (r, c) in [
+            (1usize, 1usize),
+            (7, 7),
+            (8, 8),
+            (15, 9),
+            (16, 8),
+            (16, 24),
+            (17, 33),
+            (23, 16),
+            (24, 8),
+            (31, 31),
+            (32, 32),
+            (33, 41),
+            (40, 41),
+            (48, 40),
+            (56, 64),
+            (64, 64),
+            (72, 72),
+            (95, 100),
+            (120, 96),
+            (128, 128),
+        ] {
+            let src: Vec<u16> = (0..r * c).map(|t| (t as u16).wrapping_mul(40503)).collect();
+            let mut s = vec![0u16; r * c];
+            let mut v = vec![0u16; r * c];
+            unsafe {
+                transpose_rows(src.as_ptr(), s.as_mut_ptr(), r, c, 0, r);
+                transpose_rows_u16_avx2(src.as_ptr(), v.as_mut_ptr(), r, c, 0, r);
+            }
+            assert_eq!(s, v, "u16 avx2 != scalar block at {r}x{c}");
+            if r > B {
+                let mut w = vec![0u16; r * c];
+                unsafe {
+                    transpose_rows_u16_avx2(src.as_ptr(), w.as_mut_ptr(), r, c, 0, B);
+                    transpose_rows_u16_avx2(src.as_ptr(), w.as_mut_ptr(), r, c, B, r);
+                }
+                assert_eq!(s, w, "u16 avx2 windowed != whole at {r}x{c}");
+            }
         }
     }
 
