@@ -621,6 +621,23 @@ mod tests {
                     } else {
                         std::ptr::null()
                     };
+                    // The two reductions, lane for lane. Every NaN that enters them is the one
+                    // canonical `f32::NAN` (or a product of it), so their lanes are bit-comparable
+                    // even on the NaN rows — this is where the partition is pinned.
+                    let (ss_s, gx_s) = unsafe { ss_gx_8_scalar(x.as_ptr(), dy.as_ptr(), gptr, n) };
+                    let (ss_v, gx_v) = unsafe { ss_gx_8_avx2(x.as_ptr(), dy.as_ptr(), gptr, n) };
+                    for j in 0..8 {
+                        assert_eq!(
+                            ss_s[j].to_bits(),
+                            ss_v[j].to_bits(),
+                            "ss lane {j} scalar != avx2 n={n} case={case} gamma={use_gamma}"
+                        );
+                        assert_eq!(
+                            gx_s[j].to_bits(),
+                            gx_v[j].to_bits(),
+                            "gx lane {j} scalar != avx2 n={n} case={case} gamma={use_gamma}"
+                        );
+                    }
                     let mut a = vec![0.0f32; n];
                     let mut b = vec![0.0f32; n];
                     unsafe {
@@ -634,12 +651,26 @@ mod tests {
                         );
                         rmsnorm_bwd_row_avx2(x.as_ptr(), dy.as_ptr(), gptr, b.as_mut_ptr(), n, EPS);
                     }
+                    // The apply negates `coef` (`ncoef = -coef`), so on a NaN row a NEGATIVE NaN meets
+                    // the positive NaN `r` (or `g`) in a commutable `fmul`/`fma`, and which payload
+                    // survives is the compiler's operand order, not this kernel's arithmetic — SSE's
+                    // two-operand `mulss` and VEX's three-operand `vmulps` legitimately differ. So a
+                    // NaN output is held to NaN-ness; every other output (the signed-zero rows
+                    // included) stays bit-for-bit.
                     for i in 0..n {
-                        assert_eq!(
-                            a[i].to_bits(),
-                            b[i].to_bits(),
-                            "scalar != avx2 n={n} case={case} gamma={use_gamma} i={i}"
-                        );
+                        if a[i].is_nan() {
+                            assert!(
+                                b[i].is_nan(),
+                                "scalar NaN, avx2 {} n={n} case={case} gamma={use_gamma} i={i}",
+                                b[i]
+                            );
+                        } else {
+                            assert_eq!(
+                                a[i].to_bits(),
+                                b[i].to_bits(),
+                                "scalar != avx2 n={n} case={case} gamma={use_gamma} i={i}"
+                            );
+                        }
                     }
                 }
             }
