@@ -5,6 +5,26 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Shape-typed tensors: dimension arithmetic, views, reshape, extents, generic array parameters
+
+- **Dimension expressions** in tensor types: `+ - * / %` and parentheses over literals, generic
+  dimensions and `const`s (`Tensor[f32, S, 3*D]`, `H*HD`, `(L - K)/S + 1`), held in a canonical
+  polynomial normal form (`wukong_types::dim`) so equal extents are equal types; a call solves a
+  dimension that appears only inside an expression (`2*N = 8`, `N = 4`), or the one a flat array's
+  element count leaves free (`M*N = 12` with `N = 4`), and publishes the binding
+  (`SemaResult::call_dims`) for the hidden-dimension ABI. New `E0505` for an expression that is not
+  an extent.
+- **Rank-reducing views**: `a[i]` on a rank-2 tensor is the row, a zero-copy `Tensor` view; chained
+  `a[i][j]` is `a[i, j]`; `for row in a` iterates rows. A view used as a scalar is `E0401`, assigned
+  to is `E0507`, and written through when it views a non-`mut` parameter is `E0304`.
+- **Reshape** `x as Tensor[..]` with a provably unchanged element count (`E0506` otherwise).
+- **Extents** `t.dim(k)` / `t.len()` on tensors and arrays; a `?` axis of a tensor parameter now
+  carries its run-time extent as a hidden argument (readable, iterable, usable as an interior stride,
+  and binding a callee's generic dimension when the tensor is forwarded).
+- **Shape-generic array parameters**: `fn f<N>(a: [f32; N])` is `Tensor[f32, N]` instead of a
+  length that silently evaluated to 0. A fixed-size array parameter now rejects a tensor argument of
+  another size (it had no unification arm).
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**
