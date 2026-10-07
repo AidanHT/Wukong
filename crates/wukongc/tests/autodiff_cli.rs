@@ -135,37 +135,42 @@ fn backward(mir: &str) -> &str {
 }
 
 /// P4.2 / P4.10 / P12.2: the backward of each model rides the tuned runtime kernels, at every level.
+/// Each requirement lists its acceptable spellings: the backward follows the forward's serial or
+/// `@parallel` spelling, and which one the forward dispatches is the recognizers' business.
 #[test]
 fn grad_emission_rides_the_tuned_backward_kernels() {
     let scratch = Scratch::new("emit");
-    let cases: [(&str, &str, &[&str]); 2] = [
+    let cases: [(&str, &str, &[&[&str]]); 2] = [
         (
             LINEAR_BIAS_RELU,
             "--grad-wrt=0,1,2",
             // dX on the NN GEMM, dW on the weight-gradient TN GEMM, dbias on the column sum.
             &[
-                "call wukong_sgemm_parallel(",
-                "call wukong_sgemm_tn_parallel(",
-                "call wukong_colsum_f32(",
+                &["call wukong_sgemm(", "call wukong_sgemm_parallel("],
+                &["call wukong_sgemm_tn(", "call wukong_sgemm_tn_parallel("],
+                &["call wukong_colsum_f32("],
             ],
         ),
         (
             CROSS_ENTROPY,
             "--grad-wrt=0",
-            &["call wukong_xent_bwd_f32_parallel("],
+            &[&[
+                "call wukong_xent_bwd_f32(",
+                "call wukong_xent_bwd_f32_parallel(",
+            ]],
         ),
     ];
-    for (i, &(src, wrt, needles)) in cases.iter().enumerate() {
+    for (i, &(src, wrt, requirements)) in cases.iter().enumerate() {
         let path = scratch.source(&format!("model{i}.wk"), src);
         for level in ["-O0", "-O1", "-O2", "-O3"] {
             let out = wukongc(&["--emit=grad", level, wrt], &path);
             assert_ok(&out, &format!("model{i} {level}"));
             let mir = stdout(&out);
             let bwd = backward(&mir);
-            for &needle in needles {
+            for &spellings in requirements {
                 assert!(
-                    bwd.contains(needle),
-                    "model{i} {level}: the backward does not ride `{needle}`:\n{bwd}"
+                    spellings.iter().any(|s| bwd.contains(*s)),
+                    "model{i} {level}: the backward rides none of {spellings:?}:\n{bwd}"
                 );
             }
         }
