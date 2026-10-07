@@ -7,9 +7,11 @@
 //! run-time overlap test whose overlapping arm is the source loop — and each arm checks the same
 //! contract so that a call which bypassed the guard is REFUSED rather than answered.
 //!
-//! Two halves, both pinned here: every cross-element family refuses an output that overlaps an
-//! input it is still reading (memory untouched), and the families whose runtime entry documents
-//! EXACT in-place operation accept it and produce the in-place source loop's value. Every expected
+//! Three parts, all pinned here: every cross-element family refuses an output that overlaps an
+//! input it is still reading (memory untouched); the families whose runtime entry documents EXACT
+//! in-place operation accept it and produce the in-place source loop's value; and the purely
+//! elementwise families — whose one meaning under any overlap is the source loop's — answer a
+//! SHIFTED overlap the way that loop does, one element at a time on live memory. Every expected
 //! value below is derived by hand from the scalar loop over the same inputs — small exact binary
 //! fractions, so no rounding mode or reassociation can move them — never read back from a backend.
 use super::*;
@@ -85,12 +87,8 @@ fn overlapping_calls() -> Vec<(&'static str, Vec<Value>)> {
             "wukong_maxpool2d_f32",
             vec![P(0), P(2), I(1), I(3), I(4), I(2), I(2), I(1), I(2)],
         ),
-        // Elementwise: a SHIFTED output (exact in place is permitted, shifted is not).
-        (
-            "wukong_velem_f32",
-            vec![P(0), P(8), P(1), I(4), F(1.0), F(0.0), F(0.0), I(0)],
-        ),
-        ("wukong_vmath_f32", vec![P(0), P(1), I(4), I(0)]),
+        // Horner: the output over the coefficient table every element re-reads.
+        ("wukong_vhorner_f32", vec![P(0), P(9), I(4), P(8), I(2)]),
         // Fused attention: the output over Q.
         (
             "wukong_attention_f32",
@@ -117,6 +115,64 @@ fn cross_element_kernels_refuse_overlapping_operands_and_leave_memory_untouched(
         );
         assert_eq!(interp.memory, before, "{name} wrote memory before refusing");
     }
+}
+
+/// A SHIFTED overlap on an elementwise kernel is the source loop's program: each store lands before
+/// the next element is read. `out == x + 1` therefore CHAINS — `out[t] = 2·x[t] + 1` over
+/// `1, 2, 3, 4, 5` gives `1, 3, 7, 15, 31`, where a copied `x` (the old oracle) gives `1, 3, 5, 7, 9`
+/// and the native 8-lane body gives the copied answer within a block. A BACKWARD shift reads ahead
+/// of every store, so it equals the copy. Expected values are the scalar loop by hand.
+#[test]
+fn elementwise_kernels_run_the_source_loop_on_a_shifted_overlap() {
+    let program = Program::new();
+    let interner = Interner::new();
+    let mut interp = interpreter(&program, &interner);
+
+    // velem, `out = 2*x + 1` (VE_ID, `y` unread), out = x + 1.
+    interp.memory = [1.0, 2.0, 3.0, 4.0, 5.0].map(F).to_vec();
+    let id = I(i128::from(wukong_runtime::VE_ID));
+    interp
+        .intrinsic(
+            "wukong_velem_f32",
+            &[P(0), P(0), P(1), I(4), F(2.0), F(0.0), F(1.0), id],
+        )
+        .unwrap();
+    assert_eq!(interp.memory, [1.0, 3.0, 7.0, 15.0, 31.0].map(F));
+
+    // Horner `r = 2; r = r*x + 1` (coefficients at slots 8..10), out = x + 1: the same chain.
+    interp.memory = [1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0, 0.0, 2.0, 1.0]
+        .map(F)
+        .to_vec();
+    interp
+        .intrinsic("wukong_vhorner_f32", &[P(0), P(1), I(4), P(8), I(2)])
+        .unwrap();
+    assert_eq!(&interp.memory[..5], &[1.0, 3.0, 7.0, 15.0, 31.0].map(F));
+
+    // vmath ReLU, out = x + 1 over -1, 2, -3, 4, -5: out[0] = relu(-1) = 0 lands on x[1], so
+    // every later element reads a zero -> -1, 0, 0, 0, 0 (a copied x gives -1, 0, 2, 0, 4).
+    let relu = I(i128::from(wukong_runtime::VM_RELU));
+    interp.memory = [-1.0, 2.0, -3.0, 4.0, -5.0].map(F).to_vec();
+    interp
+        .intrinsic("wukong_vmath_f32", &[P(0), P(1), I(4), relu])
+        .unwrap();
+    assert_eq!(interp.memory, [-1.0, 0.0, 0.0, 0.0, 0.0].map(F));
+
+    // A BACKWARD shift, out = x - 1 over 9, -1, 2, -3, 4: every read is ahead of every store, so
+    // the loop and the copy agree -> 0, 2, 0, 4, 4.
+    interp.memory = [9.0, -1.0, 2.0, -3.0, 4.0].map(F).to_vec();
+    interp
+        .intrinsic("wukong_vmath_f32_parallel", &[P(1), P(0), I(4), relu])
+        .unwrap();
+    assert_eq!(interp.memory, [0.0, 2.0, 0.0, 4.0, 4.0].map(F));
+
+    // A bad input slot is a diagnostic BEFORE the first store, shifted overlap or not.
+    interp.memory = [1.0, 2.0, 3.0, 4.0, 5.0].map(F).to_vec();
+    interp.memory[3] = Value::Unit;
+    let before = interp.memory.clone();
+    assert!(interp
+        .intrinsic("wukong_vmath_f32", &[P(0), P(1), I(4), relu])
+        .is_err());
+    assert_eq!(interp.memory, before);
 }
 
 /// The disjoint twins of the refused calls above still run: the refusal is about overlap, not

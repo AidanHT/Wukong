@@ -28,8 +28,60 @@
 //! backend that is supposed to be the semantic oracle. Every helper here validates the whole operand
 //! range against the arena FIRST and reserves fallibly SECOND, so a bad extent is a diagnostic.
 //! (The bound is still the arena, not the allocation: provenance is not tracked per allocation.)
+//!
+//! # Why the f32 scratch is recycled
+//!
+//! `--run` defaults to this interpreter, and a recognized kernel inside a loop (a per-head GEMM, a
+//! per-row norm) used to allocate and free a fresh `Vec` for every operand on every iteration. The
+//! tagged-slot memory model makes the element conversion itself unavoidable, but the allocation is
+//! not: [`read_f32`] and [`output_f32`] draw from a small per-thread pool and the arms hand their
+//! buffers back with [`recycle_f32`]. A buffer that is not handed back (an error path) is simply
+//! dropped, so the pool can only ever save work, never change a value — every buffer is cleared and
+//! fully rewritten before a kernel sees it.
+
+use std::cell::RefCell;
 
 use crate::{kernel_buffer, kernel_scratch, kernel_values, Value};
+
+/// How many recycled f32 buffers one thread keeps: enough for the widest arm (GEMM's three operands
+/// plus a bias), small enough that the pool never matters to a program's footprint.
+const F32_POOL_DEPTH: usize = 8;
+
+/// The largest buffer the pool retains, in elements (16 MiB of `f32`). A larger operand is a
+/// one-off; keeping its capacity alive for the rest of the run would trade the allocation saved for
+/// a resident footprint the program never asked for.
+const F32_POOL_MAX_RETAINED: usize = 1 << 22;
+
+thread_local! {
+    /// Recycled f32 kernel scratch for this thread's interpreter (see the module doc).
+    static F32_POOL: RefCell<Vec<Vec<f32>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// An empty f32 buffer with room for `len` elements — a recycled one when the pool has it, reserved
+/// fallibly either way (an absurd `len` is a diagnostic, not an allocator abort).
+pub(crate) fn f32_scratch(len: usize, name: &str) -> Result<Vec<f32>, String> {
+    let mut buffer = F32_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_default();
+    buffer.clear();
+    buffer
+        .try_reserve_exact(len)
+        .map_err(|_| format!("{name}: operand allocation failed"))?;
+    Ok(buffer)
+}
+
+/// Hand a kernel buffer back to this thread's pool once the arm is done with it.
+pub(crate) fn recycle_f32(buffer: Vec<f32>) {
+    if buffer.capacity() == 0 || buffer.capacity() > F32_POOL_MAX_RETAINED {
+        return;
+    }
+    F32_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < F32_POOL_DEPTH {
+            pool.push(buffer);
+        }
+    });
+}
 
 /// `rows * cols` as a slot count, or a diagnostic instead of an overflowed product.
 pub(crate) fn span(rows: usize, cols: usize, name: &str) -> Result<usize, String> {
@@ -46,7 +98,25 @@ pub(crate) fn read_f32(
     name: &str,
 ) -> Result<Vec<f32>, String> {
     let values = kernel_values(memory, base, len, 1, name)?;
-    kernel_buffer(values, name, |v| Ok(v.kernel_float(name)? as f32))
+    let mut buffer = f32_scratch(values.len(), name)?;
+    for &value in values {
+        buffer.push(value.kernel_float(name)? as f32);
+    }
+    Ok(buffer)
+}
+
+/// [`output`] for an `f32` destination, drawing its storage from the recycled pool.
+pub(crate) fn output_f32(
+    memory: &[Value],
+    base: usize,
+    len: usize,
+    name: &str,
+) -> Result<Vec<f32>, String> {
+    kernel_values(memory, base, len, 1, name)?;
+    let mut buffer = f32_scratch(len, name)?;
+    // Within the capacity `f32_scratch` reserved fallibly, so this cannot reallocate.
+    buffer.resize(len, 0.0);
+    Ok(buffer)
 }
 
 /// Read `len` integer operand slots from `base` as `i32` (index buffers: cross-entropy targets).
@@ -192,6 +262,62 @@ pub(crate) fn check_output(
     check_overlap(name, &ops, &pairs)
 }
 
+/// Whether the output range shares a slot with any read range WITHOUT being exactly that range —
+/// the overlaps an elementwise kernel's vector body and its source loop disagree on. Empty ranges
+/// overlap nothing; exact in-place operation is not "shifted".
+pub(crate) fn shifted_overlap(out: (usize, usize), reads: &[(usize, usize)]) -> bool {
+    let (a, a_len) = out;
+    reads.iter().any(|&(b, b_len)| {
+        a_len != 0
+            && b_len != 0
+            && a.saturating_add(a_len) > b
+            && b.saturating_add(b_len) > a
+            && (a, a_len) != (b, b_len)
+    })
+}
+
+/// Run an ELEMENTWISE kernel exactly the way its source loop runs: one element at a time, in
+/// ascending order, each input read from LIVE memory and each result stored before the next
+/// element is read. `apply` computes one output element from that element's inputs (one value per
+/// base in `inputs`, in order), by calling the runtime kernel at `n = 1` — the same per-element map
+/// its vector body computes, which the runtime pins bit-exactly to the scalar twin.
+///
+/// This is the oracle's answer for a SHIFTED overlap between an elementwise kernel's output and an
+/// input (`out = x + 1` through two pointer views): the source loop then feeds each store into a
+/// later read, which neither a copy-in/copy-out run nor the kernel's 8-lane body reproduces. For a
+/// disjoint or exactly-in-place call it computes the same bits as the whole-buffer call, which is
+/// why the arms keep the faster whole-buffer path there.
+///
+/// Every range, and every input slot's type, is validated before the first store, so a bad operand
+/// is a diagnostic with memory untouched. (A store only ever writes a float, so an input slot that
+/// is a float before the loop stays one.)
+pub(crate) fn elementwise_live(
+    memory: &mut [Value],
+    inputs: &[usize],
+    out: usize,
+    n: usize,
+    name: &str,
+    mut apply: impl FnMut(&[f32]) -> f32,
+) -> Result<(), String> {
+    kernel_values(memory, out, n, 1, name)?;
+    for &base in inputs {
+        for value in kernel_values(memory, base, n, 1, name)? {
+            value.kernel_float(name)?;
+        }
+    }
+    let mut lane = Vec::new();
+    lane.try_reserve_exact(inputs.len())
+        .map_err(|_| format!("{name}: operand allocation failed"))?;
+    for t in 0..n {
+        lane.clear();
+        for &base in inputs {
+            lane.push(memory[base + t].kernel_float(name)? as f32);
+        }
+        memory[out + t] = Value::Float(f64::from(apply(lane.as_slice())));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +374,80 @@ mod tests {
         let mut holes = memory.clone();
         holes[3] = Value::Unit;
         assert!(read_f32(&holes, 0, 8, "k").is_err());
+    }
+
+    #[test]
+    fn shifted_overlap_excludes_disjoint_exact_and_empty_ranges() {
+        // Disjoint and adjacent: no overlap.
+        assert!(!shifted_overlap((4, 4), &[(0, 4)]));
+        assert!(!shifted_overlap((0, 4), &[(4, 4)]));
+        // Exactly in place is not shifted.
+        assert!(!shifted_overlap((2, 4), &[(2, 4)]));
+        // Empty ranges overlap nothing.
+        assert!(!shifted_overlap((2, 0), &[(2, 4)]));
+        assert!(!shifted_overlap((2, 4), &[(3, 0)]));
+        // Shifted either way, and a same-base range of another length, are shifted.
+        assert!(shifted_overlap((1, 4), &[(0, 4)]));
+        assert!(shifted_overlap((0, 4), &[(1, 4)]));
+        assert!(shifted_overlap((0, 4), &[(0, 2)]));
+        // Any one of several reads suffices.
+        assert!(shifted_overlap((8, 4), &[(0, 4), (9, 4)]));
+    }
+
+    /// The source loop's semantics on a FORWARD shift: `out = x + 1` makes every store feed the
+    /// next element's read, so `out[t] = 2*x[t] + 1` over `[1, 2, 3, 4, 5]` chains to
+    /// `3, 7, 15, 31` — where a copied input would give `3, 5, 7, 9`.
+    #[test]
+    fn elementwise_live_runs_the_source_loop_order() {
+        let mut memory = [1.0, 2.0, 3.0, 4.0, 5.0].map(Value::Float).to_vec();
+        elementwise_live(&mut memory, &[0], 1, 4, "k", |lane| 2.0 * lane[0] + 1.0).unwrap();
+        let expected = [1.0, 3.0, 7.0, 15.0, 31.0].map(Value::Float);
+        assert_eq!(memory, expected);
+        // A BACKWARD shift reads ahead of every store, so it equals the copied answer:
+        // `out = x - 1`, `out[t] = x[t] + 10` over `[1, 2, 3, 4, 5]` -> `12, 13, 14, 15, 5`.
+        let mut memory = [1.0, 2.0, 3.0, 4.0, 5.0].map(Value::Float).to_vec();
+        elementwise_live(&mut memory, &[1], 0, 4, "k", |lane| lane[0] + 10.0).unwrap();
+        let expected = [12.0, 13.0, 14.0, 15.0, 5.0].map(Value::Float);
+        assert_eq!(memory, expected);
+        // Two inputs, read element by element: `out[t] = x[t] * y[t]` with `out == y + 1`.
+        // x = [2, 2, 2], y = [1, 1, 1, 1] at slots 3..7: y[1] = 2*1, y[2] = 2*2, y[3] = 2*4.
+        let mut memory = [2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0]
+            .map(Value::Float)
+            .to_vec();
+        elementwise_live(&mut memory, &[0, 3], 4, 3, "k", |lane| lane[0] * lane[1]).unwrap();
+        let expected = [2.0, 2.0, 2.0, 1.0, 2.0, 4.0, 8.0].map(Value::Float);
+        assert_eq!(memory, expected);
+    }
+
+    #[test]
+    fn elementwise_live_validates_before_the_first_store() {
+        // An undefined input slot late in the range: nothing may have been written.
+        let mut memory = vec![Value::Float(1.0); 6];
+        memory[4] = Value::Unit;
+        let before = memory.clone();
+        assert!(elementwise_live(&mut memory, &[0], 1, 5, "k", |lane| lane[0]).is_err());
+        assert_eq!(memory, before);
+        // An output range past the arena: refused, memory untouched.
+        assert!(elementwise_live(&mut memory, &[0], 3, 4, "k", |lane| lane[0]).is_err());
+        assert_eq!(memory, before);
+    }
+
+    /// The pool can only save an allocation, never change a value: a recycled buffer comes back
+    /// empty with at least the requested room, and an output is zeroed however dirty the buffer
+    /// it was drawn from.
+    #[test]
+    fn recycled_scratch_is_cleared_before_reuse() {
+        recycle_f32(vec![9.0f32; 64]);
+        let buffer = f32_scratch(16, "k").unwrap();
+        assert!(buffer.is_empty());
+        assert!(buffer.capacity() >= 16);
+        recycle_f32(buffer);
+        recycle_f32(vec![7.0f32; 8]);
+        let memory = vec![Value::Float(0.5); 8];
+        assert_eq!(output_f32(&memory, 0, 8, "k").unwrap(), vec![0.0f32; 8]);
+        assert_eq!(read_f32(&memory, 2, 3, "k").unwrap(), vec![0.5f32; 3]);
+        // An absurd request is still a diagnostic, with or without a pooled buffer.
+        assert!(f32_scratch(usize::MAX, "k").is_err());
     }
 
     #[test]
