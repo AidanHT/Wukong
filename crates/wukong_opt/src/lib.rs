@@ -27,9 +27,10 @@
 //! deleted when dead, and hoisted when invariant, like any instruction (the `effects` module).
 //!
 //! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
-//! per-function pipeline, and partial loop unrolling ([`unroll_program`]) runs once *after* it — the
-//! pipeline is then re-run over the functions unrolling changed, so the duplicated bodies get the
-//! same cse/simplify/dce treatment as everything else. `-O3` adds nothing to any of it — see
+//! per-function pipeline, and loop unrolling ([`unroll_program`] — complete for a small known trip
+//! count, partial otherwise) runs once *after* it — a reduced pipeline is then re-run over the
+//! functions unrolling changed, so the duplicated bodies get the same simplify/cse/dce treatment as
+//! everything else. `-O3` adds nothing to any of it — see
 //! [`PassManager::standard`].
 
 pub mod alias;
@@ -195,12 +196,17 @@ impl PassManager {
     /// `Mem2Reg` (the pass refuses to duplicate a header or body containing an `Alloca`, so there is
     /// no new stack slot to promote), `Dse`, or `Licm` (LICM already ran over this same body, and
     /// every instruction the copies add depends on the induction variable). The synthesized
-    /// wrap-safe preheader guard, however, contains new arithmetic and a select that Simplify
-    /// must fold when the bound is constant. Keep cleanup local to values: proving a remainder
-    /// loop empty through the main loop's exit parameters needs separate exit-value analysis.
+    /// wrap-safe preheader guard contains new arithmetic and a select that `Simplify` folds when
+    /// the bound is constant. A completely unrolled loop leaves its header as a straight-line
+    /// block with a single predecessor: `SimplifyCfg` merges it into the preheader, which turns the
+    /// header parameters into the entry values, `Simplify` then folds every copy's induction
+    /// variable into a constant, and `SimplifyPhis` drops what is left of the parameters. (A
+    /// constant trip count needs no remainder loop at all — the unroller knows it exactly.)
     fn unroll_cleanup() -> PassManager {
         let mut pm = PassManager::new();
         pm.add(Box::new(Simplify));
+        pm.add(Box::new(SimplifyCfg));
+        pm.add(Box::new(SimplifyPhis));
         pm.add(Box::new(Cse));
         pm.add(Box::new(Dce));
         pm
@@ -1280,6 +1286,35 @@ mod tests {
         for lvl in [0, 1, 2, 3] {
             assert_eq!(run_main_opt(src, lvl), 406, "level {lvl}");
         }
+    }
+
+    #[test]
+    fn a_short_constant_loop_is_unrolled_completely_and_folds_to_its_value() {
+        // `x = x * 3 + k` five times: a recurrence no vectorizer or recognizer takes. With a known
+        // trip count of 5 the unroller replaces the loop by its iterations, the cleanup merges the
+        // header into its preheader, and every copy folds: `main` returns a constant.
+        let src = "fn main() -> i32 { let mut x: i32 = 1; let mut k: i32 = 0; \
+                   while k < 5 { x = x * 3 + k; k = k + 1; } return x; }";
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 301, "level {lvl}");
+        }
+        let (mut prog, mut interner) = lower(src);
+        optimize(&mut prog, 2);
+        let main_fn = find_fn(&prog, &interner, "main");
+        let shown = wukong_mir::print::print_function(main_fn, &interner);
+        assert!(
+            !inline::loop_blocks(main_fn).iter().any(|&b| b),
+            "the loop must be gone\n{shown}"
+        );
+        let returns_301 = main_fn.blocks.iter().any(|b| match b.term {
+            Terminator::Ret(Some(v)) => b.insts.iter().any(|i| {
+                i.result == Some(v) && matches!(i.op, Op::ConstInt(301, wukong_mir::MirType::I32))
+            }),
+            _ => false,
+        });
+        assert!(returns_301, "{shown}");
+        let main = interner.intern("main");
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 301);
     }
 
     #[test]
