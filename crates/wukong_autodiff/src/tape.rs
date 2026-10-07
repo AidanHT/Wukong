@@ -175,8 +175,10 @@ pub(crate) enum Kernel {
 /// Every forward kernel symbol the tape differentiates: `(symbol, family, @parallel spelling)`.
 ///
 /// This table is the single source of truth for `is_kernel`, the arity check and the dispatch, so a
-/// symbol cannot be recognized without also having an arity and a rule. A symbol the tape cannot
-/// differentiate belongs in `crate::coverage::NOT_DIFFERENTIABLE`, with a reason.
+/// symbol cannot be recognized without also having an arity and a rule. The coupling test in
+/// `tests.rs` (`every_emitted_kernel_symbol_is_differentiable_or_declined_by_name`) scans every
+/// `"wukong_*"` symbol `wukong_mir_build` can emit and fails unless it is listed here, in
+/// `crate::coverage::NOT_DIFFERENTIABLE` with a reason, or handled by the scalar core.
 pub(crate) const FORWARD_KERNELS: &[(&str, Kernel, bool)] = &[
     ("wukong_sreduce_f32", Kernel::Sreduce, false),
     ("wukong_sreduce_f32_parallel", Kernel::Sreduce, true),

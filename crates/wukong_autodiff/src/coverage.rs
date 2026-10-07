@@ -2,11 +2,20 @@
 //! the tape does NOT differentiate, each with the reason a user sees when it blocks a gradient.
 //!
 //! A recognizer arm that lands without an autodiff mirror used to be invisible until a user hit the
-//! generic "no VJP rule" refusal (the historical `norm_f32_parallel` hole). A symbol the tape cannot
-//! differentiate is listed here instead, so the refusal names the construct and the reason.
+//! generic "no VJP rule" refusal (the historical `norm_f32_parallel` hole). Now every `"wukong_*"`
+//! symbol in `wukong_mir_build`'s source must be exactly one of: a forward kernel the tape
+//! differentiates (`tape::FORWARD_KERNELS`), a routine the scalar core differentiates
+//! (`SCALAR_CORE`), or an entry below — and `tests.rs`
+//! (`every_emitted_kernel_symbol_is_differentiable_or_declined_by_name`) fails the build otherwise,
+//! in both directions (a new symbol with no disposition, a stale entry for a symbol that is gone).
 //!
 //! Adding a recognizer: give its kernel a VJP rule (an entry in `tape::FORWARD_KERNELS` plus the
 //! rule), or list it here with an honest reason.
+
+/// Runtime routines the scalar core (`lib.rs::diff_inst`) differentiates as value-returning calls.
+/// (Read only by the coupling test: the scalar core matches the one routine by name.)
+#[cfg(test)]
+pub(crate) const SCALAR_CORE: &[&str] = &["wukong_rt_trig_f32"];
 
 const INDEX_VALUED: &str = "returns an index (argmax / argmin): piecewise constant, so its \
                             derivative is zero almost everywhere and undefined at a tie";

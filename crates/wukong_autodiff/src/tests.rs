@@ -13,9 +13,11 @@
 use crate::grad;
 use wukong_interp::run_kernel_f64;
 
-// The kernel-family and memory-model gates, each a submodule over the helpers below.
+// The kernel-family, memory-model and recognizer-mirror gates, each a submodule over the helpers
+// below.
 mod kernels;
 mod memory;
+mod mirror;
 use wukong_mir::{BinOp, Builder, Function, MirType, Op, Program, ValueId};
 use wukong_span::{Interner, Symbol};
 
