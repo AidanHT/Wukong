@@ -310,12 +310,13 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 
 | Pass            | Level | What it does |
 |-----------------|-------|--------------|
-| `inline_program`| -O2   | inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
+| `inline_program`| -O2   | first rewrite every fully tail-recursive function into a loop (`tre::pre_inline`, on a mem2reg'd copy), then inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
 | `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot only when it is provably written before it is read — see below) |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
 | `SimplifyCfg` | -O1   | constant-branch folding (including a constant or degenerate `switch`), jump threading of an `i1` constant edge argument through an empty test block (never past a loop header), straight-line block merging, folding a branch into a predecessor that reaches the same destination (one `cond_br` on `and`/`or`, speculating at most four pure non-trapping non-memory instructions — `src/branch_fold.rs`), and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
 | `Dce`         | -O1   | remove pure instructions whose results are unused, and dead allocas |
+| `Tre`         | -O1   | tail-recursion elimination: a self-call whose result is returned becomes a branch to a loop header carrying the parameters; integer `add`/`mul`/`and`/`or`/`xor` accumulator recursion (`n * f(n - 1)`) gets an accumulator parameter (never a float op); a function with a frame slot left is skipped (`src/tre.rs`) |
 | `Cse`         | -O2   | dominator-tree value numbering (a pure computation is reused by every block it dominates, via a scoped table) plus **intra-block** load forwarding keyed on `(address value, accessed type)`, with `alias` deciding which entries a store or call invalidates |
 | `Dse`         | -O2   | dead-store elimination (a store fully overwritten by a later one with no intervening read that `alias` says could observe it) |
 | `LoopCanon`   | -O2   | canonicalize loop entry/latch structure before loop-invariant code motion |

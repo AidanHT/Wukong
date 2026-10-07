@@ -21,6 +21,9 @@
 //! (`Ty::Ptr`/`Ref`/`Tensor`/`Slice` all become a bare `MirType::Ptr`) otherwise makes unanswerable.
 //! It is a pure analysis, safe to build from anywhere, and the Cranelift backend uses it too.
 //!
+//! From `-O1` the fixpoint also runs **tre** ([`Tre`]): a function's tail calls to itself (and
+//! integer accumulator recursion such as `n * fact(n - 1)`) become a loop.
+//!
 //! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
 //! per-function pipeline, and partial loop unrolling ([`unroll_program`]) runs once *after* it — the
 //! pipeline is then re-run over the functions unrolling changed, so the duplicated bodies get the
@@ -52,6 +55,7 @@ mod verify_each;
 
 mod branch_fold;
 mod switch_form;
+mod tre;
 
 pub use verify_each::{verify_program_stage, VerificationFailure};
 
@@ -74,6 +78,7 @@ pub use unroll::unroll_program;
 pub use vectorize::Vectorize;
 
 pub use switch_form::FormSwitches;
+pub use tre::Tre;
 
 use std::time::{Duration, Instant};
 
@@ -167,6 +172,8 @@ impl PassManager {
             pm.add(Box::new(SimplifyCfg));
             pm.add(Box::new(SimplifyPhis));
             pm.add(Box::new(Dce));
+            // A self-call in tail position becomes a branch back to the top (`tre`).
+            pm.add(Box::new(Tre));
         }
         if opt_level >= 2 {
             // CSE feeds Simplify/DCE more constants and dead values; the fixpoint loop reruns all.
@@ -1193,7 +1200,8 @@ mod tests {
     #[test]
     fn recursion_is_not_inlined() {
         // A recursive function is not a leaf, so it must survive -O2 with its self-call intact and
-        // still compute correctly.
+        // still compute correctly. Tail-recursion elimination turns the accumulating `fib(n-2)`
+        // into a loop iteration (`tre`), so exactly the non-tail `fib(n-1)` call remains.
         let src = "fn fib(n: i32) -> i32 { if n < 2 { return n; } return fib(n-1) + fib(n-2); } \
                    fn main() -> i32 { return fib(12); }";
         assert_eq!(run_main_opt(src, 2), 144);
@@ -1206,7 +1214,7 @@ mod tests {
             .flat_map(|b| &b.insts)
             .filter(|i| matches!(i.op, wukong_mir::Op::Call { .. }))
             .count();
-        assert!(calls >= 2, "recursive fib should keep its self-calls");
+        assert_eq!(calls, 1, "recursive fib should keep its non-tail self-call");
     }
 
     #[test]

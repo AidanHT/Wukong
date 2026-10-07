@@ -24,6 +24,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   instructions. `a && b` / `a || b` guards are now one `cond_br`, so a loop guarded by one is a
   single diamond the vectorizer can flatten (`wukong_opt::branch_fold`,
   `tests/run/band_mask_and.wk`). Loads and divisions are never speculated.
+- **Tail-recursion elimination (`-O1`+).** A self-call whose result the block returns (directly or
+  through an empty return block) becomes a branch back to a loop header that carries the
+  parameters; `ret op(f(..), x)` with an integer `add`/`mul`/`and`/`or`/`xor` is rewritten with an
+  accumulator (exact: these are associative and commutative in wrapping arithmetic; float
+  operations are never reassociated). Functions with a remaining frame slot are left alone. At
+  `-O2` the inliner rewrites fully tail-recursive functions first, so they are no longer recursive
+  and become inlinable (`wukong_opt::tre`). A tail-recursive function that recursed past the
+  interpreter's call-depth limit at `-O0` now runs as a loop at `-O1`+.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 

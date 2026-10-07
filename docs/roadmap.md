@@ -48,7 +48,10 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   differential oracle down with it. Recursion past the cap is still a **resource limit outside the
   bit-for-bit differential contract** — the oracle *refuses* where the native backend still completes,
   the same "outside the defined contract" status as an out-of-bounds access. Raising the cap past its
-  measured ceiling would reintroduce the abort; lowering it would reject working programs.
+  measured ceiling would reintroduce the abort; lowering it would reject working programs. At `-O1`
+  and above tail-recursion elimination turns a self-call in tail position into a loop, so a
+  tail-recursive function no longer consumes call depth there (an unbounded tail recursion then
+  loops until the interpreter's step guard stops it instead of hitting the depth cap).
 - `let`/`let mut`/`const`, shadowing, block-as-expression values, **`let` tuple destructuring**
   (`let (a, b) = …`, nested patterns, `_`; `tests/run/let_destructure.wk`), and a **top-level
   `const` used as a value** (its initializer inlined at every use site — arithmetic, array index,
@@ -481,7 +484,10 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup
-  with block merging, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
+  with block merging, **jump threading** of constant short-circuit edges and **branch folding** into
+  one `and`/`or` branch, **tail-recursion elimination** (plain and integer-accumulator, `-O1`+; a
+  fully tail-recursive function becomes inlinable at `-O2`), a late **`switch` formation** from
+  equality chains, dead/trivial block-parameter elimination, DCE, dominator-tree CSE with load
   forwarding, DSE, **loop-invariant code motion**, and **partial loop unrolling** (4×, with a
   wrap-safe guard and a remainder loop; it never reassociates, so a float reduction keeps its exact
   serial accumulate — measured 28% on an integer reduction, 10% on an elementwise store loop, 4% on a

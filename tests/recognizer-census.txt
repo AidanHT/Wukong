@@ -348,6 +348,7 @@ struct_field_kernel_base.wk: wukong_norm_affine_f32 wukong_sgemm_nt_epi
 struct_fn.wk:
 struct_nested.wk:
 struct_return.wk:
+tail_recursion.wk:
 tanhshrink.wk: wukong_vmath_f32
 tensor_1d_kernels.wk: wukong_sreduce_f32_parallel wukong_velem_f32 wukong_vmath_f32
 tensor_add.wk: veckernel*1

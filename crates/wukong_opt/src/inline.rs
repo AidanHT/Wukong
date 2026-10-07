@@ -20,7 +20,9 @@
 //! Order comes from Tarjan's strongly-connected components over the call graph, which emits each SCC
 //! only after every SCC it calls. A function in a non-trivial SCC — or with a self-edge — is
 //! recursive, and is never inlined into anything (splicing it could not terminate). That replaces the
-//! old leaf-only rule, which forbade recursion by forbidding *all* calls.
+//! old leaf-only rule, which forbade recursion by forbidding *all* calls. Self-recursion that is all
+//! tail calls is rewritten into a loop first (`tre::pre_inline`), so such a function is not recursive
+//! by the time the call graph is built.
 //!
 //! # The cost model
 //!
@@ -94,6 +96,9 @@ pub(crate) fn inline_program_preserving(program: &mut Program, roots: &[Symbol])
     if n == 0 {
         return false;
     }
+    // A function whose every self-call is a tail call becomes a loop first, so the call graph
+    // below no longer marks it recursive and it can be inlined like any other callee (`tre`).
+    let pre = crate::tre::pre_inline(program);
     // Symbol -> index. Names are unique per program (the driver merges imports by qualified name).
     let index: FxHashMap<Symbol, u32> = program
         .funcs
@@ -164,7 +169,7 @@ pub(crate) fn inline_program_preserving(program: &mut Program, roots: &[Symbol])
     let mut has_loop: FxHashMap<Symbol, bool> = FxHashMap::default();
     let mut specializations = FxHashMap::default();
 
-    let mut changed = false;
+    let mut changed = pre;
     let mut inlined: FxHashSet<Symbol> = FxHashSet::default();
 
     for comp in &sccs {
