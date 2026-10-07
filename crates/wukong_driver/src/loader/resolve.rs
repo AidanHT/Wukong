@@ -533,7 +533,9 @@ impl Rewriter<'_> {
         }
         if let Some(Some(sym)) = self.qualified(head, p.segments[1]) {
             let span = head.span.to(p.segments[1].span);
-            p.segments.splice(0..2, [Ident { sym, span }]);
+            // `[q, item, rest..]` -> `[item', rest..]`.
+            p.segments.remove(0);
+            p.segments[0] = Ident { sym, span };
         }
     }
 
