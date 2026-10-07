@@ -13,6 +13,7 @@
 //!  * **loop-canon** — one shape per loop: a preheader, a single latch, one exit-test polarity
 //!    (`-O2`).
 //!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
+//!  * **bce** — slice bounds-check elimination by loop versioning on a preheader guard (`-O2`).
 //!  * **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting a conditional
 //!    body to a lane mask), with the original loop kept as its scalar epilogue (`-O2`).
 //!
@@ -28,6 +29,7 @@
 //! [`PassManager::standard`].
 
 pub mod alias;
+mod bce;
 mod cache;
 mod cfg;
 pub mod coalesce;
@@ -51,6 +53,7 @@ mod verify_each;
 pub use verify_each::{verify_program_stage, VerificationFailure};
 
 pub use alias::{type_bytes, AliasInfo, Prov};
+pub use bce::Bce;
 pub use cache::CfgAnalyses;
 pub use coalesce::{
     analyze_function as coalesce_function, CoalesceHint, CoalescePlan, VectorWidth,
@@ -171,6 +174,11 @@ impl PassManager {
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
+            // Slice bounds checks are extra loop exits, which no later loop transform accepts:
+            // version each counted loop on one preheader guard so its proved checks disappear
+            // (`bce.rs`). After LICM, so invariant addresses and lengths are already hoisted; before
+            // the vectorizer, so the check-free copy is what it sees.
+            pm.add(Box::new(Bce));
             // Widening comes last, on the cleanest MIR the pipeline produces: canonical loops with
             // one latch and one exit-test polarity, invariants already hoisted, and dead code gone.
             // Everything it emits is fed back through the fixpoint, so the vector body gets the

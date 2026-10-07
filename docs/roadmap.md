@@ -1032,7 +1032,9 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   out). `s[i]` is compared against the length in the slice's fat pointer, and an out-of-range access
   stops the program with `error: index out of bounds: the len is N but the index is I at
   file:line:col`, exit 1, identically on the interpreter, the JIT and a linked executable
-  (`tests/run/slice_bounds_*.wk`). Still unchecked: a **runtime** index into a fixed-size array
+  (`tests/run/slice_bounds_*.wk`). `-O2` removes the checks from innermost counted loops by
+  versioning them on a preheader guard (`wukong_opt::bce`); a loop with a call, a `break`, a
+  non-affine index or a header written inside it keeps them. Still unchecked: a **runtime** index into a fixed-size array
   or a constant-shape tensor (the static length is known, so this is the same machinery with a
   constant bound — not yet wired), and the extents a recognized kernel call reads. A
   **compile-time-constant** index past the end is still caught at compile time (`E0501`) — for both a
@@ -1042,18 +1044,13 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   buffer, classic UB like C (and an optimization level can even change the garbage observed). An
   out-of-bounds program is therefore outside the defined contract — the differential gate's bit-for-bit
   `interp == native` and `-O0 == -O3` invariants hold only for well-defined programs.
-- `mem2reg` promotes scalar integer, float **and pointer** slots. A pointer slot qualifies only when
-  it is provably written before it is read: the first access inside its own `alloca`'s block must be
-  a store, and that block must be the entry block or have an empty dominance frontier. That covers
-  every pointer-typed *parameter* (`*T`, `&T`, and every `Tensor[…]`, all of which lower to one MIR
-  `ptr`) — the case that matters, since the front end otherwise re-loads the base pointer from its
-  stack slot at every element access — including after `-O2` inlining has spliced a callee's entry
-  block into the middle of a caller block. A pointer local whose `alloca` and initializing store are
-  separated by a branch keeps its slot: promoting it would need a typed "undefined" pointer for the
-  read-before-write path, and there is no sound one (`inttoptr 0` is a genuine null natively but a
-  *valid, addressable* slot in the interpreter). Arrays, vectors, address-taken locals of any type,
-  and any slot accessed at a width other than its own stay in memory (the interpreter and `cse`/`dse`
-  handle those directly).
+- `mem2reg` promotes scalar integer, float **and pointer** slots. A pointer slot read before it is
+  written on some path gets the null pointer (`inttoptr 0`) there, exactly what the interpreter's
+  zero-initialized slot holds now that it reserves address 0 as a never-allocated null
+  (`wukong_interp::NULL_SLOT`); before that reservation only definitely-initialized pointer slots
+  could be promoted, and a pointer local initialized behind a branch kept its slot. Arrays, vectors,
+  address-taken locals of any type, and any slot accessed at a width other than its own stay in
+  memory (the interpreter and `cse`/`dse` handle those directly).
 - A **`[]T` slice parameter still re-loads its data pointer at every element access.** A slice is a
   16-byte `{ data, len }` fat pointer passed *by address*, so the base comes from
   `load ptr (gep <param>, 0)` — a load out of caller-owned memory, not out of a local slot — and

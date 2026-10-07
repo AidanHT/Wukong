@@ -77,7 +77,7 @@ wukong_mir       MIR data, builder, pretty-printer, verifier, `VecKernel` (the 2
 wukong_mir_build typed AST -> MIR (alloca-per-local lowering; SIMD loop auto-vectorization)
 wukong_opt       pass manager + analyses (cfg, dominators) + transforms (inlining,
                   mem2reg, simplify, simplify-cfg, simplify-phis, dce, cse, dse, licm,
-                  loop unrolling) plus the `alias` provenance analysis every memory
+                  bounds-check elimination, loop unrolling) plus the `alias` provenance analysis every memory
                   transform queries
 wukong_autodiff  reverse-mode autodiff as a MIR->MIR transform (scalar + tensor-tape VJP
                   rules, fused AdamW; finite-difference-gated) — the training backward path (driven by --emit=grad / --train)
@@ -307,7 +307,7 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 | Pass            | Level | What it does |
 |-----------------|-------|--------------|
 | `inline_program`| -O2   | inline non-recursive callees **bottom-up over the call graph** (reverse topological order from Tarjan SCCs, so a helper chain collapses in one sweep), scored by a cost model rather than one blanket size cap, then drop callees left uncalled; runs before the function pipeline so the spliced code optimizes in context |
-| `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot only when it is provably written before it is read — see below) |
+| `Mem2Reg`       | -O1   | promote scalar int/float **and pointer** `alloca` slots to block-parameter SSA via dominance-frontier phi placement and a dominator-tree rename (a pointer slot's read-before-write path gets the null `inttoptr 0` — see below) |
 | `Simplify`    | -O1   | constant folding + algebraic identities (`x+0`, `x*1`, `x*0`, `x^x`, `x&x`, `x\|x`, `x%1`) and integer self-comparison folding |
 | `SimplifyCfg` | -O1   | constant-branch folding, straight-line block merging, and unreachable-block pruning (with renumbering) |
 | `SimplifyPhis`| -O1   | drop dead and trivial block parameters that mem2reg introduced |
@@ -316,6 +316,7 @@ parameters or edge arguments leave the cache alone, and the prune-first passes (
 | `Dse`         | -O2   | dead-store elimination (a store fully overwritten by a later one with no intervening read that `alias` says could observe it) |
 | `LoopCanon`   | -O2   | canonicalize loop entry/latch structure before loop-invariant code motion |
 | `Licm`        | -O2   | hoist loop-invariant, side-effect-free, non-trapping ops to the loop preheader — including a **load**, when `alias` proves nothing in the body writes it *and* the access is dereferenceable |
+| `Bce`         | -O2   | slice bounds-check elimination: version an innermost counted loop on a preheader guard (`start < end`, then per check `lo <=u hi && hi <u len` at the two ends of the index range, overflow-safe) so a check-free copy runs when every check is proved and the original, checked loop runs otherwise; a caller-owned slice header is read early only behind the guards of the checks that precede it (`bce.rs`) |
 | `Vectorize`   | -O2   | widen eligible canonical MIR loops after LICM, then feed the result through the normal fixpoint cleanup |
 | `unroll_program`| -O2 | unroll a counted two-block loop 4x, with a wrap-safe guard and a remainder loop; runs **after** the function pipeline, and the functions it changed get a reduced cse+dce cleanup sweep |
 

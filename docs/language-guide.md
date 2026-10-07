@@ -758,7 +758,10 @@ free(acts);
 **Slice accesses are bounds-checked** (✅): `s[i]` compares `i` against the length in `s`'s own fat
 pointer (one unsigned compare, so a negative index fails too) and, out of range, stops the program
 with `error: index out of bounds: the len is N but the index is I at file.wk:line:col` and exit
-status 1 — identically on the interpreter, the native JIT and a linked executable. `@unchecked` on
+status 1 — identically on the interpreter, the native JIT and a linked executable. At `-O2` a
+bounds-check elimination pass versions each counted loop on one guard computed before it, so a loop
+whose accesses are provably in range runs a copy with no check at all (and stays vectorizable),
+while an out-of-range loop runs the original and stops at exactly the same iteration. `@unchecked` on
 a function removes its checks — the explicit, visible opt-out, like Rust's `get_unchecked`; an
 out-of-range access there is undefined behaviour on the native backend. Fixed-size arrays and
 constant-shape tensors are checked at compile time for constant indices (`E0501`); a *runtime* index

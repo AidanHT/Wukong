@@ -7,6 +7,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Language safety (gap/lang-safety)
 
+- **Bounds-check elimination (`wukong_opt::bce`, `-O2`).** An innermost counted loop whose slice
+  checks are provable is versioned on a preheader guard: `start < end`, then per check
+  `lo <=u hi && hi <u len` at the two ends of an index of the form `±iv + invariant` (sound under
+  wrapping arithmetic), with each slice length shown stable by `alias` plus Wukong's no-punning
+  rule. The check-free copy runs when every guard passes — and is then a single-exit loop the
+  vectorizer accepts — while the original, checked loop runs otherwise and fails at exactly the same
+  iteration. A caller-owned header is read early only behind the guards of the checks that precede
+  it. Unit tests in `bce.rs` compare -O0 and -O2 results and diagnostics, in and out of range.
+
 - **Slice accesses are bounds-checked.** `s[i]` on a `[]T` now compares `i` against the length in
   the slice's own fat pointer (`i <u len`, so a negative index fails too) and, out of range, stops
   with `error: index out of bounds: the len is N but the index is I at file.wk:line:col`, exit 1 —
