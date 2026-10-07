@@ -128,6 +128,7 @@ for_each_array_of_slices.wk: wukong_rt_alloc wukong_rt_alloc*3 wukong_velem_f32
 for_range_unsigned_bound.wk:
 for_step.wk:
 for_step_gemm.wk: veckernel*4
+fp_contract_rules.wk: veckernel*2
 frem.wk:
 fuse_if_relu.wk: wukong_velem_f32 wukong_velem_f32*3
 gate.wk: wukong_vmath2_f32 wukong_vmath2_f32*2
@@ -152,6 +153,7 @@ gevm_f32.wk: wukong_sgevm_f32 wukong_sgevm_f32*2
 glu_gate.wk: wukong_vmath2_f32
 gram.wk: wukong_sgemm_nt
 hadamard.wk: wukong_velem_f32 wukong_velem_f32*3
+hardsigmoid_nan.wk: wukong_vmath_f32
 hardswish.wk: wukong_vmath_f32 wukong_vmath_f32*2
 heap_alloc.wk: wukong_rt_alloc wukong_rt_free
 heap_alloc_fn.wk: wukong_rt_alloc wukong_rt_alloc*2 wukong_rt_free wukong_rt_free*2
@@ -336,6 +338,8 @@ softmax_fused.wk: wukong_norm_f32 wukong_norm_f32*2
 softplus.wk: wukong_vmath_f32
 softsign_logsigmoid.wk: wukong_vmath_f32
 sret_diverging_arms.wk:
+strict_fp.wk: veckernel*2
+strict_fp_cli.wk: veckernel*2
 string_literal.wk:
 string_return.wk:
 struct.wk:
