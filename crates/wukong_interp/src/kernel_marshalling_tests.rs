@@ -724,8 +724,11 @@ fn fused_gemm_preserves_numeric_types_bias_and_unread_output() {
             };
             assert_eq!(&interp.memory[6..8], &expected.map(F), "{name}");
         }
-        // Slot zero is a real bias pointer; null is an integer. All inputs are snapshotted
-        // before output writes, including overlapping A, C, and optional bias.
+        // Slot zero is a real bias pointer; null is an integer. An output overlapping `A` (and,
+        // for the epilogue, the bias) is outside every GEMM entry's contract — `C` is written in
+        // tiled order while they are read — and the compiler's run-time alias guard never
+        // dispatches it. The oracle refuses it, memory untouched, instead of answering with a
+        // snapshot product neither the native kernel nor the source loop computes.
         for bias in [I(0), P(0)] {
             let mut args = args.clone();
             args[2] = P(0);
@@ -746,15 +749,13 @@ fn fused_gemm_preserves_numeric_types_bias_and_unread_output() {
                 F(2.0),
                 F(3.0),
             ];
-            interp.intrinsic(name, &args).unwrap();
-            let expected = if !epi {
-                [F(11.5), F(16.5)]
-            } else if matches!(bias, P(_)) {
-                [F(25.0), F(36.0)]
-            } else {
-                [F(23.0), F(33.0)]
-            };
-            assert_eq!(&interp.memory[..2], &expected, "{name}");
+            let before = interp.memory.clone();
+            let error = interp.intrinsic(name, &args).unwrap_err();
+            assert!(
+                error.contains(name) && error.contains("overlap"),
+                "{name}: {error}"
+            );
+            assert_eq!(interp.memory, before, "{name}");
         }
     }
 }

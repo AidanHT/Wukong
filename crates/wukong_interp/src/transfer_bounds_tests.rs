@@ -91,7 +91,7 @@ fn transpose_checks_extents_and_ranges_before_marshalling() {
 }
 
 #[test]
-fn transpose_preserves_exact_conversion_permutation_and_snapshots() {
+fn transpose_preserves_exact_conversion_permutation_and_refuses_overlap() {
     let program = Program::new();
     let interner = Interner::new();
     let mut interp = interpreter(&program, &interner);
@@ -102,17 +102,29 @@ fn transpose_preserves_exact_conversion_permutation_and_snapshots() {
         "wukong_transpose_u16_parallel",
     ] {
         let input = [I(16_777_217), F(-0.0), F(1.5), I(-2), F(2.0), F(3.0)];
-        for out in [0, 1, 6] {
+        interp.memory = vec![Value::Unit; 12];
+        interp.memory[..6].copy_from_slice(&input);
+        interp.intrinsic(name, &[P(0), P(6), I(2), I(3)]).unwrap();
+        let mut expected = [input[0], input[3], input[1], input[4], input[2], input[5]];
+        if name.contains("f32") {
+            for v in &mut expected {
+                *v = F(v.as_float() as f32 as f64);
+            }
+        }
+        exact_values(&interp.memory[6..12], &expected);
+        // In place (`dst == src`) and shifted (`dst == src + 1`) are outside transpose.rs's
+        // contract, and the source nest, the blocked kernel and a snapshot give three different
+        // answers there. The compiler versions the dispatch so neither reaches this arm; a call
+        // that does is refused with memory untouched rather than answered with the snapshot.
+        for out in [0, 1] {
             interp.memory = vec![Value::Unit; 12];
             interp.memory[..6].copy_from_slice(&input);
-            interp.intrinsic(name, &[P(0), P(out), I(2), I(3)]).unwrap();
-            let mut expected = [input[0], input[3], input[1], input[4], input[2], input[5]];
-            if name.contains("f32") {
-                for v in &mut expected {
-                    *v = F(v.as_float() as f32 as f64);
-                }
-            }
-            exact_values(&interp.memory[out..out + 6], &expected);
+            let before = interp.memory.clone();
+            let error = interp
+                .intrinsic(name, &[P(0), P(out), I(2), I(3)])
+                .unwrap_err();
+            assert!(error.contains("overlap"), "{name} dst {out}: {error}");
+            exact_values(&interp.memory, &before);
         }
     }
 }
