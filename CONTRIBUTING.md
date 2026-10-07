@@ -196,7 +196,9 @@ two-block loop the fixpoint produces, and re-running it on its own output would 
 every sweep). If you write a pass like that, give it a way to recognize what it already did, and
 measure its compile-time cost — `cargo run --release -p wukong_bench -- compile-time` reports each
 stage's in-process share, and a whole-program pass that rebuilds a dominator tree per function will
-show up there immediately.
+show up there immediately. For one program, `wukongc --time-passes <file>` prints the same stage
+split plus the optimizer's per-pass breakdown for that compile (`--time-trace=<f>` writes it as
+Chrome trace JSON); it changes neither the output nor the emitted object.
 
 **Never trade exactness for speed in a pass.** Reassociating float arithmetic — the classic
 multiple-accumulator reduction unroll — computes a different number, which breaks both the
