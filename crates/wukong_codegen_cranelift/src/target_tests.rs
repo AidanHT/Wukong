@@ -4,6 +4,7 @@
 use super::*;
 use wukong_mir::Builder;
 
+#[cfg(target_arch = "x86_64")]
 fn lower(src: &str, opt: u8) -> (Program, Interner, Symbol) {
     let mut interner = Interner::new();
     let (module, parsed) =
@@ -25,6 +26,7 @@ fn lower(src: &str, opt: u8) -> (Program, Interner, Symbol) {
     (program, interner, main)
 }
 
+#[cfg(target_arch = "x86_64")]
 const LEVELS: [TargetCpu; 4] = [
     TargetCpu::X86_64,
     TargetCpu::X86_64V2,
@@ -37,6 +39,7 @@ const LEVELS: [TargetCpu; 4] = [
 /// Below those levels Cranelift calls the C runtime's `fmaf`/`nearbyintf`/`floorf`/... instead,
 /// which must agree bit-for-bit with the hardware instructions. (The vectorized loops avoid a
 /// multiply feeding an add, so the 128-bit path exercised here is plain SSE2 arithmetic.)
+#[cfg(target_arch = "x86_64")]
 const PROGRAM: &str = "
 fn main() -> i32 {
     let mut acc: f32 = 0.0;

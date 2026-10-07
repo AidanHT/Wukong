@@ -88,7 +88,10 @@ fn forced_c_link_prints_floats_exactly_like_the_oracle() {
              print(0.1);
              let a: f32 = 0.1;
              print(a);
-             print(1000000000000000000000.0);
+             let mut e21: f64 = 1.0;
+             let mut k: i32 = 0;
+             while k < 21 { e21 = e21 * 10.0; k = k + 1; }
+             print(e21);
              print(0.0000001);
              print(-z);
              print(z / z);
@@ -100,7 +103,7 @@ fn forced_c_link_prints_floats_exactly_like_the_oracle() {
              let third: f64 = 1.0 / 3.0;
              print(third);
              let mut tiny: f64 = 1.0;
-             let mut k: i32 = 0;
+             k = 0;
              while k < 1074 { tiny = tiny / 2.0; k = k + 1; }
              print(tiny);
              let mut big: f64 = 1.0;

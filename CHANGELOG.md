@@ -37,6 +37,15 @@ All notable changes to Wukong are documented here. The format is loosely based o
   with `inf`/`-inf`/`NaN`/`-0`) and defines `wukong_rt_print_str`, so the refusal is gone; the
   fallback now says on stderr that it is being taken. Forced-`cc` tests compare the linked
   executable with the interpreter on hand-derived float lines (and strings off Windows).
+- **The AOT gate covers the corpus, not four programs.** `crates/wukongc/tests/exe.rs` now also links
+  a deterministic slice of `tests/run` (every 8th fixture by default, the whole corpus with
+  `WUKONG_EXE_CORPUS=all`) in parallel and compares each executable with `--run`, skipping only
+  documented capability declines (a program the native backend cannot compile either; on the C
+  fallback, one that needs a `wukong_*` kernel) and failing if declines exceed 10% on the rustc
+  path. A second test reaches the C fallback the way a user does (a copied `wukongc` with no runtime
+  rlib beside it) and checks its float/integer output against `--run`. The new fixture
+  `tests/run/print_float_display.wk` pins how every float prints (shortest round-trip digits,
+  positional, `inf`/`NaN`/`-0`, f32/f16/bf16 widening) and joins the always-linked set.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 

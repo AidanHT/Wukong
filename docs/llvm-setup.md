@@ -100,8 +100,13 @@ this):
 
 ```sh
 wukongc --emit=llvm-ir -O2 examples/fib.wk > fib.ll   # textual IR
-clang fib.ll ...                                        # compile with your LLVM tools
+clang -c -O2 fib.ll -o fib.o                            # compile with your LLVM tools
 ```
+
+`fib.o` then links exactly like the object `--emit=obj` writes: its only external symbols are the
+`wukong_rt_*` print/assert shims and the `wukong_*` runtime kernels, which the `--emit=exe` link
+supplies (the rustc-driven shim plus the `wukong_runtime` rlib, or the C runtime for a kernel-free
+program).
 
 If you later want the in-process inkwell path, standardize on
 `inkwell = { version = "0.9", features = ["llvm19-1"] }` (note: LLVM 18+ use the `-1` feature

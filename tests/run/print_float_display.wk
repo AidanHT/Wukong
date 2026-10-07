@@ -1,0 +1,88 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0.1
+// EXPECT-OUT: 0.10000000149011612
+// EXPECT-OUT: 1000000000000000000000
+// EXPECT-OUT: 0.0000001
+// EXPECT-OUT: -0
+// EXPECT-OUT: NaN
+// EXPECT-OUT: inf
+// EXPECT-OUT: -inf
+// EXPECT-OUT: 123456789.125
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 0.3333333333333333
+// EXPECT-OUT: 0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005
+// EXPECT-OUT: 1152921504606847000
+// EXPECT-OUT: 16777216
+// EXPECT-OUT: 0.30000001192092896
+// EXPECT-OUT: 0.3333333432674408
+// EXPECT-OUT: 0.0999755859375
+// EXPECT-OUT: 0.10009765625
+module tests.run.print_float_display
+
+/// How a float prints, pinned on every path that prints one: the interpreter (the spec), the native
+/// JIT, the linked `--emit=exe` (rustc shim or the C fallback runtime) and the textual-LLVM module's
+/// `wukong_rt_print_f64` call. The rule is Rust's `Display` for `f64`: the SHORTEST decimal digit
+/// string that parses back to the same double (the closest one when several do), written
+/// positionally - never in exponent form - with `inf`, `-inf`, `NaN` and `-0` spelled out. `f32`,
+/// `f16` and `bf16` values print as the `f64` they widen to exactly.
+///
+/// Every expected line is derived from that rule, not recorded: 0.1 (f64) is "0.1"; the f32 0.1
+/// is 13421773 * 2^-27 = 0.100000001490116119384765625, whose shortest round-trip f64 digits are
+/// 0.10000000149011612; 10^21 = 2^21 * 5^21 is exact and has no fractional digits; 2^-1074 needs
+/// one digit, 5, after 323 zeros; 2^60 = 1152921504606846976 rounds to the 16 digits
+/// 1152921504606847 then pads; 16777217 is not an f32 and rounds (ties-to-even) to 16777216;
+/// f32(0.1) + f32(0.2) is the f32 0x3E99999A = 0.300000011920928955078125; f32 1/3 is
+/// 11184811 * 2^-25; f16 0.1 is 0x2E66 = 1638 * 2^-14 = 0.0999755859375 and bf16 0.1 is 0x3DCD =
+/// 205 * 2^-11 = 0.10009765625.
+fn main() -> i32 {
+    let z: f64 = 0.0;
+    print(0.1);
+    let a: f32 = 0.1;
+    print(a);
+    let mut e21: f64 = 1.0;
+    let mut k: i32 = 0;
+    while k < 21 {
+        e21 = e21 * 10.0;
+        k = k + 1;
+    }
+    print(e21);
+    print(0.0000001);
+    print(-z);
+    print(z / z);
+    print(1.0 / z);
+    print(-1.0 / z);
+    print(123456789.125);
+    print(2.5);
+    print(1.0);
+    let third: f64 = 1.0 / 3.0;
+    print(third);
+    let mut tiny: f64 = 1.0;
+    k = 0;
+    while k < 1074 {
+        tiny = tiny / 2.0;
+        k = k + 1;
+    }
+    print(tiny);
+    let mut big: f64 = 1.0;
+    k = 0;
+    while k < 60 {
+        big = big * 2.0;
+        k = k + 1;
+    }
+    print(big);
+    let w: f32 = 16777217.0;
+    print(w);
+    let p: f32 = 0.1;
+    let q: f32 = 0.2;
+    print(p + q);
+    let one: f32 = 1.0;
+    let three: f32 = 3.0;
+    print(one / three);
+    let h: f16 = 0.1;
+    print(h);
+    let b: bf16 = 0.1;
+    print(b);
+    return 0;
+}

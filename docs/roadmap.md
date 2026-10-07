@@ -22,8 +22,10 @@ checked-but-not-executed, and what is planned — so expectations match reality.
 ## Works end to end (interpreter `--run`, **and native code** `--backend=native`)
 
 The MIR interpreter and **Cranelift native backend** execute the supported language subset.
-Corpus differential tests compare outputs across optimization levels. Unsupported constructs,
-assertion-output differences, and C-link fallback output remain documented limitations.
+Corpus differential tests compare outputs across optimization levels. Unsupported constructs and
+assertion-output differences remain documented limitations; the C-link fallback prints exactly what
+`--run` prints (it lacks only the `wukong_*` kernels, a link error), and `exe.rs` compares a slice
+of the corpus's linked executables with `--run`.
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
 `--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>` picks the instruction-set level of that
