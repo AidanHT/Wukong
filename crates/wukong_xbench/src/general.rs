@@ -371,7 +371,7 @@ unsafe fn call_block(f: BlockFn, bufs: &mut Bufs) {
 /// timing thread, and the core re-boosts across it; building everything first and then timing
 /// continuously measures the sustained clock instead. Neither is wrong and neither is comparable to
 /// the other. Read `ms` only against other `ms` from the SAME run.
-fn time_round(mut run: impl FnMut()) -> f64 {
+pub(crate) fn time_round(mut run: impl FnMut()) -> f64 {
     // Warm-ups: the column last ran a whole round ago and every other column has walked the same
     // buffers since, so without these the first timed call would charge one column's cache refill,
     // branch-predictor warm-up and (for the JIT columns) first-touch page faults to it alone.
@@ -388,176 +388,6 @@ fn time_round(mut run: impl FnMut()) -> f64 {
         }
     }
     best
-}
-
-// ---------------------------------------------------------------------------------------------
-// CPU PINNING — the largest single confound this section has, measured
-// ---------------------------------------------------------------------------------------------
-//
-// This laptop is an Intel Core Ultra 7 155H: 6 P-cores (SMT, logical 0-11), 8 E-cores and 2 LP
-// E-cores, 22 logical processors in three performance classes. Every program in this section is
-// single-threaded and each peer call is 50-200 ms, so a visit is ~1 s of uninterrupted scalar/AVX2
-// work — exactly the profile Windows' Thread Director demotes off a P-core.
-//
-// MEASURED, 2026-08-06, AC+CHARGING, same binary, same 4-round protocol, back to back, kill switch
-// only. The block section's raw per-round ms for the peer columns:
-//
-//   UNPINNED   C     81.16  105.32  127.66  174.30      (2.15x within ONE run, monotone)
-//              C++  108.88  109.65  112.24  205.66
-//              Rust 135.97  136.06  120.28  123.91
-//              -> C(twin) control 1.057x [0.695-1.472], spread 2.118x: THE CONTROL FAILED
-//
-//   PINNED     C     75.21   74.77   74.09   70.55      (1.07x)
-//   (CPU 0-1)  C++   73.46   74.15   73.21   73.75      (1.01x)
-//              Rust  88.70   83.70   85.12   87.13      (1.06x)
-//              -> C(twin) control spread ~1.05x: THE CONTROL PASSES
-//
-// The C column does not merely jitter unpinned — it DEGRADES MONOTONICALLY, 81 -> 174 ms, inside one
-// run, while the 4-5 ms Wukong columns in the same rounds do not move at all. That is the signature
-// of a long-running thread being walked down the performance classes, not of noise.
-//
-// Replicated on BATTERY the same day, three interleaved runs per arm (2026-08-06, discharging
-// 83%->76%, so the LEVELS are battery levels and not comparable to the AC pair above; the RATIO
-// between the arms is what is being read):
-//
-//   block C best-of-rounds, unpinned  276.6 / 280.9 / 289.2 ms
-//   block C best-of-rounds, pinned    154.5 / 130.0 / 154.8 ms      -> 1.79x / 2.16x / 1.87x
-//   run-to-run spread of the published `vs C` ratio, 19 rows:
-//       unpinned  median 1.085x  worst 1.823x
-//       pinned    median 1.035x  worst 1.076x
-//   and the same lever helps the OLD single-visit protocol just as much (main's binary, same runs):
-//       unpinned  median 1.170x  worst 1.271x
-//       pinned    median 1.055x  worst 1.103x
-//
-// So the "protocol changed the measured LEVEL of an unchanged peer by ~1.78x" finding is neither
-// thermal accumulation nor the round protocol's arithmetic. It is CORE PLACEMENT, it reproduces to
-// the decimal as a same-binary kill-switch A/B, and it is the single largest confound this section
-// has ever had — larger than the protocol change that exposed it.
-//
-// AND THE HARNESS HAD ALREADY PRINTED THE SMOKING GUN. The per-round clock probe of an unpinned run
-// (ec08db2's binary, AC+CHARGING, block section) traced
-//
-//     145 -> 85 -> 71 -> 51 -> 106 -> 101 GF/s   spread 2.85x
-//
-// across six rounds of ONE section, on a machine whose power state never changed. A 2.85x collapse
-// and partial recovery in a fixed AVX2-FMA loop is a thread moving between core classes, and it sat
-// in the output for anyone to read. The lesson is in `clock_probe_gflops`: a trace is only useful if
-// someone acts on it, and this one was reported as "the drift the ratios had to survive" rather than
-// as a defect to remove.
-//
-// Pinning is uniform across every column and carries no language content whatever — and it does not
-// have to be taken on trust, because `C(twin)` is exactly the instrument that checks it: a control
-// whose true ratio is 1.00 went from 2.12x spread to ~1.05x. That is the justification for turning it
-// on by default, and it is the only kind of justification worth having here.
-//
-// LIMITS, stated rather than glossed. One core is not the machine: an L3 shared with 15 idle
-// siblings behaves differently from a loaded one, and a single-core measurement says nothing about
-// throughput under load. This section only ever compares single-threaded columns against each other,
-// so that is the right trade — but do not carry a pinned number into a multicore claim. And the pin
-// does NOT make the `ms` column comparable across protocols: see [`time_round`].
-
-/// Which logical CPUs the general suite pins its timing thread to, from `XBENCH_PIN`.
-///
-/// * unset — CPUs 0 and 1, the two SMT threads of the first P-core. Logical processors are
-///   enumerated performance-class-first on every Intel hybrid client part, so CPU 0 is a P-core;
-///   allowing both siblings of one physical core costs nothing (only one of our threads runs) and
-///   leaves the OS somewhere to put an interrupt without evicting us.
-/// * `off` / `none` / `0` — no pinning. This is the kill switch the A/B above was measured with.
-/// * a comma-separated list of logical CPU indices — pin to exactly those.
-///
-/// An unparseable value falls back to the default rather than to "off": a typo must not silently
-/// remove the control that makes this section measurable.
-fn pin_mask() -> Option<usize> {
-    parse_pin(std::env::var("XBENCH_PIN").ok().as_deref())
-}
-
-/// The pure half of [`pin_mask`], so the contract is testable without mutating a process-global env
-/// var underneath every other test in the binary.
-fn parse_pin(v: Option<&str>) -> Option<usize> {
-    let Some(v) = v.map(str::trim) else {
-        return Some(0b11);
-    };
-    if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") || v == "0" {
-        return None;
-    }
-    let mut mask = 0usize;
-    for tok in v.split(',') {
-        match tok.trim().parse::<u32>() {
-            Ok(n) if (n as usize) < usize::BITS as usize => mask |= 1usize << n,
-            _ => return Some(0b11),
-        }
-    }
-    if mask == 0 {
-        Some(0b11)
-    } else {
-        Some(mask)
-    }
-}
-
-/// Pin the CALLING THREAD (not the process) to `mask`, returning the previous mask so it can be put
-/// back. Thread affinity is not inherited by child processes, so the `gcc`/`g++`/`rustc` peer
-/// compiles this section spawns still get the whole machine.
-#[cfg(windows)]
-fn set_thread_affinity(mask: usize) -> Option<usize> {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetCurrentThread() -> isize;
-        fn SetThreadAffinityMask(thread: isize, mask: usize) -> usize;
-    }
-    // SAFETY: `GetCurrentThread` returns a pseudo-handle that needs no closing, and
-    // `SetThreadAffinityMask` only reads it. A zero return is the documented failure signal (an
-    // empty mask, or one naming a processor this process is not allowed to run on).
-    let prev = unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
-    (prev != 0).then_some(prev)
-}
-
-#[cfg(not(windows))]
-fn set_thread_affinity(_mask: usize) -> Option<usize> {
-    None
-}
-
-/// Restores the thread's original affinity when the section ends, however it ends. A section that
-/// left the benchmark process pinned to one core would silently cap every LATER section's multicore
-/// rows — a benchmark bug that would look like a performance finding.
-struct PinGuard(Option<usize>);
-
-impl Drop for PinGuard {
-    fn drop(&mut self) {
-        if let Some(prev) = self.0 {
-            let _ = set_thread_affinity(prev);
-        }
-    }
-}
-
-/// Apply [`pin_mask`], print what happened, and hand back the guard that undoes it.
-fn pin_for_section() -> PinGuard {
-    let Some(mask) = pin_mask() else {
-        println!(
-            "  CPU PINNING: OFF (XBENCH_PIN). On this hybrid P/E laptop an unpinned single-threaded\n\
-             \x20   section migrates across performance classes mid-run — measured, the C(twin) control\n\
-             \x20   went 1.05x spread pinned to 2.12x unpinned, and the block C column drifted 81 ->\n\
-             \x20   174 ms inside ONE run. Expect this section to resolve nothing."
-        );
-        return PinGuard(None);
-    };
-    match set_thread_affinity(mask) {
-        Some(prev) => {
-            println!(
-                "  CPU PINNING: this section's timing thread is pinned to logical CPU mask {mask:#x}\n\
-                 \x20   (XBENCH_PIN=off disables; XBENCH_PIN=4,5 chooses). Every column is pinned the\n\
-                 \x20   same way, so this carries no language content — and the C(twin) control is what\n\
-                 \x20   checks it rather than asserting it. Peer compiles are separate processes and\n\
-                 \x20   still get the whole machine. A pinned figure is single-core only."
-            );
-            PinGuard(Some(prev))
-        }
-        None => {
-            println!(
-                "  CPU PINNING: requested mask {mask:#x} was REFUSED by the OS — running unpinned."
-            );
-            PinGuard(None)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -609,7 +439,7 @@ fn live_column_samples(slots: &[Option<usize>], samples: Vec<Vec<f64>>) -> Vec<V
 /// A section builds ALL its columns first (compiling and loading is not timed and must not sit
 /// between two timed columns), then hands them here. Column `i` is timed once per round; the visit
 /// order rotates and alternates direction so no column keeps a slot — see [`crate::round_order`].
-struct Rounds {
+pub(crate) struct Rounds {
     /// How many rounds were run. Not derived from a vector length: `power` deliberately carries one
     /// MORE entry than there are rounds.
     rounds: usize,
@@ -654,7 +484,11 @@ impl Rounds {
     // `r` is a round counter driving the interleave order, the power sampler and the per-round
     // cell together — iterating `ns` instead would invert what the loop means.
     #[allow(clippy::needless_range_loop)]
-    fn run(n: usize, rounds: usize, mut visit: impl FnMut(usize, usize) -> f64) -> Rounds {
+    pub(crate) fn run(
+        n: usize,
+        rounds: usize,
+        mut visit: impl FnMut(usize, usize) -> f64,
+    ) -> Rounds {
         let mut ns = vec![vec![f64::NAN; rounds]; n];
         let mut power = Vec::with_capacity(rounds + 1);
         let mut pct = Vec::with_capacity(rounds + 1);
@@ -683,7 +517,7 @@ impl Rounds {
     }
 
     /// Best observed time for a column across all rounds — the point estimate for the ms column.
-    fn best(&self, i: usize) -> f64 {
+    pub(crate) fn best(&self, i: usize) -> f64 {
         self.ns[i].iter().copied().fold(f64::INFINITY, f64::min)
     }
 
@@ -691,8 +525,17 @@ impl Rounds {
     /// in the section is replaced by `NON-REPORTABLE` rather than merely flagged: the three states
     /// (battery / AC+charging / AC+full) are three different machines, and a ratio whose two columns
     /// were measured on different machines is not a ratio.
-    fn reportable(&self) -> bool {
+    pub(crate) fn reportable(&self) -> bool {
         self.power.windows(2).all(|w| w[0] == w[1])
+    }
+
+    /// The power-state key the section ran under: the first sample, which [`Rounds::reportable`]
+    /// proves equal to every later one before any ratio is quoted from this run.
+    pub(crate) fn state_key(&self) -> String {
+        self.power
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "unknown".into())
     }
 
     /// `(first, last)` battery charge when the section drained or charged while its STATE held.
@@ -709,7 +552,7 @@ impl Rounds {
     }
 
     /// The per-round ratio `column(num) / column(den)` as a median plus the range the rounds spanned.
-    fn ratio(&self, num: usize, den: usize) -> Option<crate::RatioStat> {
+    pub(crate) fn ratio(&self, num: usize, den: usize) -> Option<crate::RatioStat> {
         crate::RatioStat::over_rounds(&self.ns[num], &self.ns[den])
     }
 
@@ -735,7 +578,7 @@ impl Rounds {
 // size difference is immaterial for the same reason: one `Keep` per loaded column, held for
 // liveness only, never moved through hot code.
 #[allow(dead_code, clippy::large_enum_variant)]
-enum Keep {
+pub(crate) enum Keep {
     Jit(wukong_codegen_cranelift::JitModuleHandle),
     Dll(libloading::Library),
 }
@@ -743,7 +586,7 @@ enum Keep {
 /// The `vs C` cell for column `i`: the word `reference` in C's own row (a row reading "1.00x faster
 /// than itself" is noise), a round-formed [`crate::RatioStat`] classified against this run's measured
 /// noise floor everywhere else.
-fn vs_c_cell(
+pub(crate) fn vs_c_cell(
     i: usize,
     c_ix: Option<usize>,
     rr: &Rounds,
@@ -761,7 +604,7 @@ fn vs_c_cell(
 /// with each other by construction — and they must not be, because two columns' minima can fall in
 /// different rounds and their quotient is then exactly the cross-round artifact this whole protocol
 /// exists to remove. Say so where the numbers are, not in a doc comment nobody reads.
-const DIVIDE_WARNING: &str =
+pub(crate) const DIVIDE_WARNING: &str =
     "  Do NOT divide two ms entries: their minima can come from DIFFERENT rounds, and that\n\
      \x20 quotient is precisely the cross-round artifact this protocol removes. The ratio column\n\
      \x20 is formed inside single rounds and is the only comparison here; the ms column is\n\
@@ -769,7 +612,7 @@ const DIVIDE_WARNING: &str =
 
 /// The control ratio `C / C(twin)`, the run's own measured floor. `None` when either column failed
 /// to build, in which case the run genuinely has no floor and [`print_instrument`] says so.
-fn twin_ratio(labels: &[String], rr: &Rounds) -> Option<crate::RatioStat> {
+pub(crate) fn twin_ratio(labels: &[String], rr: &Rounds) -> Option<crate::RatioStat> {
     let c = ix_of(labels, "C")?;
     let t = ix_of(labels, "C(twin)")?;
     rr.ratio(c, t)
@@ -782,7 +625,7 @@ fn twin_ratio(labels: &[String], rr: &Rounds) -> Option<crate::RatioStat> {
 /// identical flags — so its expected value is 1.00 with no language content, and what it reads away
 /// from 1.00 is the instrument rather than a language. See [`PEER_SPECS`] for what that does and does
 /// not bound.
-fn print_instrument(rr: &Rounds, twin: Option<crate::RatioStat>) {
+pub(crate) fn print_instrument(rr: &Rounds, twin: Option<crate::RatioStat>) {
     let rounds = rr.rounds;
     let (w, s) = (crate::gen_warmups(), crate::gen_samples());
     println!(
@@ -877,14 +720,25 @@ fn print_instrument(rr: &Rounds, twin: Option<crate::RatioStat>) {
 /// The real pipeline — parse -> sema -> mir_build -> optimize(-O3) -> Cranelift JIT — plus the
 /// optimized MIR text the dispatch census is read from. `-O3` is byte-identical to `-O2` here
 /// (`wukong_opt` only tests `>= 1` and `>= 2`), so the census equals `--emit=mir -O2`'s.
-struct WukBlock {
-    handle: wukong_codegen_cranelift::JitModuleHandle,
-    ptr: *const u8,
-    compile: Duration,
-    census: Vec<(String, usize)>,
+pub(crate) struct WukBlock {
+    pub(crate) handle: wukong_codegen_cranelift::JitModuleHandle,
+    pub(crate) ptr: *const u8,
+    pub(crate) compile: Duration,
+    pub(crate) census: Vec<(String, usize)>,
 }
 
-fn compile_block(src: &str, label: &str, nparams: usize) -> Option<WukBlock> {
+/// `recognize` is the §3B instrument, not a tuning knob. With it OFF the program is lowered as
+/// written — no recognizer may intercept a loop and substitute a hand-written `wukong_runtime`
+/// kernel — which is the only lowering a *language* ratio may be read from. With it ON the column
+/// measures the dispatcher, which is context. It is the same switch `WUKONG_NO_RECOGNIZE` sets in
+/// the driver and `build_wukong_gen` sets for the main kernel table, reached the same way, so all
+/// three agree by construction rather than by comment.
+pub(crate) fn compile_block(
+    src: &str,
+    label: &str,
+    nparams: usize,
+    recognize: bool,
+) -> Option<WukBlock> {
     let t = Instant::now();
     let mut interner = Interner::new();
     let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
@@ -897,7 +751,12 @@ fn compile_block(src: &str, label: &str, nparams: usize) -> Option<WukBlock> {
         eprintln!("general/{label}: wukong sema error: {sd:?}");
         return None;
     }
-    let (mut program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    let opts = wukong_mir_build::LowerOptions {
+        recognize,
+        ..Default::default()
+    };
+    let (mut program, ld) =
+        wukong_mir_build::lower_program_with(&module, &sema, &mut interner, opts);
     if ld.iter().any(|d| d.is_error()) {
         eprintln!("general/{label}: wukong lower error: {ld:?}");
         return None;
@@ -953,12 +812,20 @@ fn block_abi_ok(
     true
 }
 
-/// Count `wukong_*` runtime-kernel calls in optimized MIR — the dispatch census. Textually the same
-/// scan as `wukongc --emit=mir -O2 prog.wk | grep -oE 'wukong_[a-z0-9_]+'`.
-fn kernel_census(mir: &str) -> Vec<(String, usize)> {
+/// Every recognized-kernel CALL in a MIR dump, by symbol, with how many call sites each has.
+///
+/// The anchor is `call wukong_`, not `wukong_`. Counting bare occurrences counted anything the
+/// printer happens to spell with that prefix — a declaration, a type, a comment — and reported the
+/// total as "call site(s)", so the one number this corpus offers as proof of what a timing measured
+/// was a substring tally wearing a call-site label. Real MIR happens to agree today, which is
+/// exactly why it needed pinning rather than watching: the census is the T2 witness, and a witness
+/// that is only accidentally right is not one. `crates/wukongc/tests/recognize.rs` anchors on the
+/// same prefix, so the harness and the corpus gate count the same thing by construction.
+pub(crate) fn kernel_census(mir: &str) -> Vec<(String, usize)> {
+    const CALL: &str = "call wukong_";
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for (i, _) in mir.match_indices("wukong_") {
-        let rest = &mir[i..];
+    for (i, _) in mir.match_indices(CALL) {
+        let rest = &mir[i + "call ".len()..];
         let end = rest
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
@@ -970,7 +837,7 @@ fn kernel_census(mir: &str) -> Vec<(String, usize)> {
         .collect()
 }
 
-fn census_line(census: &[(String, usize)]) -> String {
+pub(crate) fn census_line(census: &[(String, usize)]) -> String {
     if census.is_empty() {
         return "NOTHING — every loop stays generic Cranelift code".to_string();
     }
@@ -992,8 +859,8 @@ fn census_line(census: &[(String, usize)]) -> String {
 /// Build one Wukong column of the structure-tax table. Build ONLY — nothing is timed here, because
 /// round interleaving requires every column to exist before any of them is measured, and a JIT
 /// compile sitting between two timed columns is exactly the kind of gap the drift hides in.
-fn build_wukong_col(src: &str, label: &str, note: &str) -> Option<Col<BlockFn>> {
-    let blk = compile_block(src, label, N_IN + N_SCRATCH)?;
+fn build_wukong_col(src: &str, label: &str, note: &str, recognize: bool) -> Option<Col<BlockFn>> {
+    let blk = compile_block(src, label, N_IN + N_SCRATCH, recognize)?;
     // SAFETY: `block_abi_ok` just proved the lowered `kbench` is 27 pointers -> void, which is
     // exactly `BlockFn`; the handle is moved into `Keep` and outlives every call.
     let f: BlockFn = unsafe { std::mem::transmute(blk.ptr) };
@@ -1073,7 +940,7 @@ fn load_peer(
 /// `F` must be exactly the `extern "C"` signature the peer's `kbench` was written with. Every caller
 /// passes the same `BlockFn`/`LossFn`/`ScanFn` the Wukong side is arity-checked against by
 /// [`block_abi_ok`].
-unsafe fn peer_col<F: Copy>(
+pub(crate) unsafe fn peer_col<F: Copy>(
     ext: &str,
     src: &str,
     dir: &Path,
@@ -1111,7 +978,8 @@ const RUSTC_ARGS: [&str; 3] = [
     "-Ctarget-cpu=native",
     "--crate-type=cdylib",
 ];
-const HONEST_FLAGS: [&str; 4] = ["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
+pub(crate) const HONEST_FLAGS: [&str; 4] =
+    ["-O3", "-march=native", "-ffp-contract=fast", "-shared"];
 const FASTM_FLAGS: [&str; 5] = [
     "-O3",
     "-march=native",
@@ -1424,11 +1292,29 @@ fn reference_f64(m: Dims, inp: &[Vec<f32>]) -> Vec<f64> {
 /// Worst per-lane relative deviation of `got` from the f64 reference, with the lane it happened at.
 /// Relative to `max(|ref|, 1e-3)` so a lane that is legitimately near zero cannot manufacture a huge
 /// ratio out of an absolute error that is nothing.
-fn max_rel_vs_ref(got: &[f32], want: &[f64]) -> (f64, usize) {
+///
+/// A non-finite deviation returns `f64::INFINITY`, and it has to: `NaN > worst` is **false**, so a
+/// NaN lane compared naively is *skipped*, and a kernel that returned NaN in every lane would score
+/// this function's bit-exact sentinel `0.0`, clear the oracle bar, and have its ratio published.
+/// `max_rel_err` in `main.rs` documents that trap in full; this is the same trap, in the oracle every
+/// row of the compare corpus and the general suite is admitted by. A length mismatch is infinite for
+/// the same reason — `zip` stops at the shorter side, so a truncated `got` would otherwise be scored
+/// on the prefix it did fill and reported as perfect.
+pub(crate) fn max_rel_vs_ref(got: &[f32], want: &[f64]) -> (f64, usize) {
+    if got.len() != want.len() {
+        return (f64::INFINITY, got.len().min(want.len()));
+    }
     let mut worst = 0.0f64;
     let mut at = 0usize;
     for (i, (&a, &b)) in got.iter().zip(want.iter()).enumerate() {
-        let e = (a as f64 - b).abs() / b.abs().max(1.0e-3);
+        let a = a as f64;
+        if (a.is_nan() && b.is_nan()) || a == b {
+            continue; // agreed: both NaN, or exact — which covers ±0 and equal infinities
+        }
+        let e = (a - b).abs() / b.abs().max(1.0e-3);
+        if !e.is_finite() {
+            return (f64::INFINITY, i); // NaN against a number, or opposite-signed infinities
+        }
         if e > worst {
             worst = e;
             at = i;
@@ -1438,14 +1324,27 @@ fn max_rel_vs_ref(got: &[f32], want: &[f64]) -> (f64, usize) {
 }
 
 /// Worst relative deviation between two f32 buffers, plus whether they are bit-identical.
+///
+/// Non-finite deviations are infinite here for the reason given on [`max_rel_vs_ref`]: the bit test
+/// alone would catch a NaN lane, but the deviation it reported alongside would read `0.0`.
 fn max_rel_pair(a: &[f32], b: &[f32]) -> (f64, bool) {
+    if a.len() != b.len() {
+        return (f64::INFINITY, false);
+    }
     let mut worst = 0.0f64;
-    let mut same = a.len() == b.len();
+    let mut same = true;
     for (&p, &q) in a.iter().zip(b.iter()) {
         if p.to_bits() != q.to_bits() {
             same = false;
         }
-        let e = (p as f64 - q as f64).abs() / (q as f64).abs().max(1.0e-3);
+        let (p, q) = (p as f64, q as f64);
+        if (p.is_nan() && q.is_nan()) || p == q {
+            continue;
+        }
+        let e = (p - q).abs() / q.abs().max(1.0e-3);
+        if !e.is_finite() {
+            return (f64::INFINITY, false);
+        }
         if e > worst {
             worst = e;
         }
@@ -1492,46 +1391,106 @@ const PEER_RS: &str = include_str!("../wk/general/peer_block.rs");
 /// One built, callable column of a round-interleaved table — a Wukong spelling or a peer, held in
 /// ONE type so the round schedule cannot tell them apart and cannot favour either. `F` is the
 /// program's `extern "C"` ABI: [`BlockFn`], [`LossFn`] or [`ScanFn`].
-struct Col<F> {
-    label: String,
-    note: String,
-    census: String,
-    compile: Duration,
-    f: F,
+pub(crate) struct Col<F> {
+    pub(crate) label: String,
+    pub(crate) note: String,
+    pub(crate) census: String,
+    pub(crate) compile: Duration,
+    pub(crate) f: F,
     /// The JIT module or DLL that keeps `f` callable, held until the last round is done.
-    _keep: Keep,
+    pub(crate) _keep: Keep,
 }
 
 /// The column labels, in build order — what [`Rounds`] indices mean.
-fn labels_of<F>(cols: &[Col<F>]) -> Vec<String> {
+pub(crate) fn labels_of<F>(cols: &[Col<F>]) -> Vec<String> {
     cols.iter().map(|c| c.label.clone()).collect()
 }
 
 /// Position of a column by label.
-fn ix_of(labels: &[String], name: &str) -> Option<usize> {
+pub(crate) fn ix_of(labels: &[String], name: &str) -> Option<usize> {
     labels.iter().position(|l| l == name)
+}
+
+/// The f64-oracle bar a column must clear for its `sota-check` row to stand. Deliberately generous:
+/// it exists to void a WRONG buffer (garbage, zeros, a missed store), not to relitigate f32-vs-f64
+/// rounding — the per-lane devs printed in each section's CORRECTNESS block remain the fine-grained
+/// record, and the general programs measure well under this on every honest run.
+const GENERAL_ORACLE_BAR: f64 = 1e-2;
+
+/// Build the sweep rows one program contributes to `sota-check`: for each named Wukong column, the
+/// per-round ratio against the STRONGEST present bar peer among C / C++ / Rust — smallest median,
+/// i.e. the fastest peer, which is what the campaign's §3B bar reads. `C(fast)` is context and
+/// `C(twin)` is the control; neither can be the bar. A missing bar peer marks the row
+/// `peer_missing`, which `sota-check` reads as a FAILURE, never a skip — a cross-language sweep
+/// otherwise drops a column silently.
+fn sota_rows<F>(
+    names: &[(usize, String)],
+    cols: &[Col<F>],
+    rr: &Rounds,
+    twin: Option<crate::RatioStat>,
+    oracle_ok: &[bool],
+) -> Vec<crate::SotaRow> {
+    let labels = labels_of(cols);
+    const BAR_PEERS: [&str; 3] = ["C", "C++", "Rust"];
+    let present: Vec<(&str, usize)> = BAR_PEERS
+        .iter()
+        .filter_map(|p| ix_of(&labels, p).map(|ix| (*p, ix)))
+        .collect();
+    let peer_missing = present.len() != BAR_PEERS.len();
+    names
+        .iter()
+        .map(|&(i, ref name)| {
+            let mut best: Option<(&str, crate::RatioStat)> = None;
+            for &(p, pix) in &present {
+                if let Some(s) = rr.ratio(pix, i) {
+                    if best.is_none_or(|(_, b)| s.med < b.med) {
+                        best = Some((p, s));
+                    }
+                }
+            }
+            let ok = oracle_ok.get(i).copied().unwrap_or(false);
+            crate::SotaRow {
+                program: name.clone(),
+                peer: best
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                ratio: if ok { best.map(|(_, s)| s) } else { None },
+                twin,
+                reportable: rr.reportable(),
+                power: rr.state_key(),
+                census: cols[i].census.clone(),
+                peer_missing,
+                oracle_ok: ok,
+            }
+        })
+        .collect()
 }
 
 /// Entry point: every program in the general-code suite, in priority order.
 ///
-/// The pin is taken ONCE here and released when this returns, so all three programs are measured on
-/// the same core and nothing after this function is left pinned — see [`pin_for_section`].
-pub(crate) fn bench_general(cc: &str, cxx: &str, dir: &Path) {
+/// The pin taken here NESTS inside the harness-wide one `main` now holds; it is no longer the only
+/// one, and the two do not fight. `set_thread_affinity` returns the previous mask, so this guard
+/// restores the outer pin rather than releasing the thread to the scheduler — which is what keeps
+/// all three programs on the same core and leaves nothing unpinned behind it. Kept rather than
+/// deleted because it is what makes this function correct when called directly, as the tests do.
+/// See [`crate::pin_for_section`].
+pub(crate) fn bench_general(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     bench_ablation();
     println!();
-    let _pin = pin_for_section();
-    bench_structure_tax(cc, cxx, dir);
+    let _pin = crate::pin_for_section();
+    let mut rows = bench_structure_tax(cc, cxx, dir);
     println!();
-    bench_focal_loss(cc, cxx, dir);
+    rows.extend(bench_focal_loss(cc, cxx, dir));
     println!();
-    bench_scan(cc, cxx, dir);
+    rows.extend(bench_scan(cc, cxx, dir));
+    rows
 }
 
-fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
+fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     let m = Dims::from_env();
     if let Err(e) = m.ok() {
         println!("general: bad dimensions ({e}) — skipping");
-        return;
+        return Vec::new();
     }
     let hd = m.hd();
 
@@ -1568,17 +1527,36 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
     // built and timed the peers, one language after another. Two consequences, both systematic and
     // neither visible in the output: any drift across the section was charged to whichever column
     // ran last (always Rust), and the Wukong columns always got the earliest, coolest slots — a bias
-    // in Wukong's own favour, in Wukong's own benchmark. Building everything first and putting all
-    // ten columns into ONE rotating round schedule removes both.
+    // in Wukong's own favour, in Wukong's own benchmark. Building everything first and putting every
+    // column into ONE rotating round schedule removes both.
     let mut cols: Vec<Option<Col<BlockFn>>> = Vec::new();
     for (label, src, note) in VARIANTS {
         let text = subst(src, m);
         // Dump the exact compiled source so `wukongc --emit=mir -O2 <file>` reproduces the census.
         let _ = std::fs::write(dir.join(format!("general_block_{label}.wk")), &text);
-        match build_wukong_col(&text, label, note) {
+        match build_wukong_col(&text, label, note, true) {
             Some(c) => cols.push(Some(c)),
             None => {
                 println!("  ! {label}: did not compile — row dropped");
+                cols.push(None);
+            }
+        }
+    }
+    // The same five spellings again, lowered with recognition OFF, and they are the only columns of
+    // this table a §3B *language* ratio may be read from. With recognizers on all five dispatch
+    // hand-written AVX2 kernels — `a-recognizer` by design, but `b-natural` too, the one written
+    // with no regard for them at all — so every ratio in the top half measures the dispatcher, and
+    // the geomean is a dispatcher number however the section is titled. Both halves are kept
+    // because both are true and they answer different questions: what the recognizer reaches, and
+    // what the language does unaided. Reproduce a `(gen)` census with `WUKONG_NO_RECOGNIZE=1
+    // wukongc --emit=mir -O2 <the dumped file>` — same source, the switch is the only difference.
+    for (label, src, note) in VARIANTS {
+        let text = subst(src, m);
+        let gen_label = format!("{label}(gen)");
+        match build_wukong_col(&text, &gen_label, note, false) {
+            Some(c) => cols.push(Some(c)),
+            None => {
+                println!("  ! {gen_label}: did not compile — row dropped");
                 cols.push(None);
             }
         }
@@ -1596,7 +1574,7 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
     let (cols, slots) = keep_column_slots(cols);
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
-        return;
+        return Vec::new();
     }
     let labels = labels_of(&cols);
 
@@ -1683,8 +1661,10 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
         "  CORRECTNESS vs the f64 scalar reference (worst of all {} lanes)",
         reference.len()
     );
+    let mut oks = vec![false; cols.len()];
     for (i, col) in cols.iter().enumerate() {
         let (dev, at) = max_rel_vs_ref(&outs[i], &reference);
+        oks[i] = dev <= GENERAL_ORACLE_BAR;
         println!("    {:<14} max rel dev {dev:.3e} at lane {at}", col.label);
     }
     if let Some(base_ix) = ix_of(&labels, "b-natural") {
@@ -1841,12 +1821,20 @@ fn bench_structure_tax(cc: &str, cxx: &str, dir: &Path) {
             .join(", ")
     );
     println!("  {}", crate::model::power_status_line());
+
+    let names: Vec<(usize, String)> = cols
+        .iter()
+        .take(n_wuk)
+        .enumerate()
+        .map(|(i, c)| (i, format!("general/block:{}", c.label)))
+        .collect();
+    sota_rows(&names, &cols, &rr, twin, &oks)
 }
 
 /// The raw per-round timings for every column, so the whole table above can be re-derived — and
 /// disagreed with — from the printed log rather than taken on trust. Cheap: `columns x rounds`
 /// numbers.
-fn print_round_trace(labels: &[String], rr: &Rounds) {
+pub(crate) fn print_round_trace(labels: &[String], rr: &Rounds) {
     println!("  PER-ROUND ns (raw; every number above is derived from this table)");
     print!("    {:<14}", "round");
     for r in 0..rr.rounds {
@@ -2079,7 +2067,7 @@ const LOSS_WK: &str = include_str!("../wk/general/loss_focal.wk");
 const LOSS_C: &str = include_str!("../wk/general/peer_loss.c");
 const LOSS_RS: &str = include_str!("../wk/general/peer_loss.rs");
 
-fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
+fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     let m = LossDims::from_env();
     let bytes = (2 * m.r * m.c + m.r * m.c) * 4;
     println!("================================================================================");
@@ -2115,23 +2103,34 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
     let wk_src = subst_loss(LOSS_WK, m);
     let path = dir.join("general_loss_focal.wk");
     let _ = std::fs::write(&path, &wk_src);
-    match compile_block(&wk_src, "loss", LOSS_PARAMS) {
-        Some(blk) => {
-            // SAFETY: `block_abi_ok` proved the lowered `kbench` is 6 pointers -> void = `LossFn`;
-            // the handle is moved into `Keep` and outlives every call.
-            let f: LossFn = unsafe { std::mem::transmute(blk.ptr) };
-            cols.push(Some(Col {
-                label: "Wukong".to_string(),
-                note: "the .wk source, through the real pipeline".to_string(),
-                census: census_line(&blk.census),
-                compile: blk.compile,
-                f,
-                _keep: Keep::Jit(blk.handle),
-            }));
-        }
-        None => {
-            println!("  ! Wukong loss did not compile — row dropped");
-            cols.push(None);
+    // Both lowerings of the one source. `Wukong` is the dispatcher's column and is context;
+    // `Wukong(gen)` is recognition-off and is the only one a §3B language ratio may be read from.
+    for (label, recognize, note) in [
+        ("Wukong", true, "the .wk source, through the real pipeline"),
+        (
+            "Wukong(gen)",
+            false,
+            "the same source, recognition off — lowered as written",
+        ),
+    ] {
+        match compile_block(&wk_src, label, LOSS_PARAMS, recognize) {
+            Some(blk) => {
+                // SAFETY: `block_abi_ok` proved the lowered `kbench` is 6 pointers -> void =
+                // `LossFn`; the handle is moved into `Keep` and outlives every call.
+                let f: LossFn = unsafe { std::mem::transmute(blk.ptr) };
+                cols.push(Some(Col {
+                    label: label.to_string(),
+                    note: note.to_string(),
+                    census: census_line(&blk.census),
+                    compile: blk.compile,
+                    f,
+                    _keep: Keep::Jit(blk.handle),
+                }));
+            }
+            None => {
+                println!("  ! {label} loss did not compile — row dropped");
+                cols.push(None);
+            }
         }
     }
     let n_wuk = cols.iter().filter(|column| column.is_some()).count();
@@ -2146,7 +2145,7 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
     let (cols, slots) = keep_column_slots(cols);
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
-        return;
+        return Vec::new();
     }
     let labels = labels_of(&cols);
 
@@ -2218,6 +2217,18 @@ fn bench_focal_loss(cc: &str, cxx: &str, dir: &Path) {
         );
     }
     println!("  {}", crate::model::power_status_line());
+
+    let oks: Vec<bool> = devs
+        .iter()
+        .map(|&(dev, _, ldev)| dev <= GENERAL_ORACLE_BAR && ldev <= GENERAL_ORACLE_BAR)
+        .collect();
+    let names: Vec<(usize, String)> = cols
+        .iter()
+        .take(n_wuk)
+        .enumerate()
+        .map(|(i, c)| (i, format!("general/focal_loss:{}", c.label)))
+        .collect();
+    sota_rows(&names, &cols, &rr, twin, &oks)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2573,7 +2584,7 @@ const SCAN_WK: &str = include_str!("../wk/general/scan_s6.wk");
 const SCAN_C: &str = include_str!("../wk/general/peer_scan.c");
 const SCAN_RS: &str = include_str!("../wk/general/peer_scan.rs");
 
-fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
+fn bench_scan(cc: &str, cxx: &str, dir: &Path) -> Vec<crate::SotaRow> {
     let m = ScanDims::from_env();
     println!("================================================================================");
     println!(
@@ -2600,23 +2611,33 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
     let wk_src = subst_scan(SCAN_WK, m);
     let path = dir.join("general_scan_s6.wk");
     let _ = std::fs::write(&path, &wk_src);
-    match compile_block(&wk_src, "scan", SCAN_PARAMS) {
-        Some(blk) => {
-            // SAFETY: `block_abi_ok` proved the lowered `kbench` is 8 pointers -> void = `ScanFn`;
-            // the handle is moved into `Keep` and outlives every call.
-            let f: ScanFn = unsafe { std::mem::transmute(blk.ptr) };
-            cols.push(Some(Col {
-                label: "Wukong".to_string(),
-                note: "the .wk source, through the real pipeline".to_string(),
-                census: census_line(&blk.census),
-                compile: blk.compile,
-                f,
-                _keep: Keep::Jit(blk.handle),
-            }));
-        }
-        None => {
-            println!("  ! Wukong scan did not compile — row dropped");
-            cols.push(None);
+    // Both lowerings of the one source. See the focal-loss section for why both are kept.
+    for (label, recognize, note) in [
+        ("Wukong", true, "the .wk source, through the real pipeline"),
+        (
+            "Wukong(gen)",
+            false,
+            "the same source, recognition off — lowered as written",
+        ),
+    ] {
+        match compile_block(&wk_src, label, SCAN_PARAMS, recognize) {
+            Some(blk) => {
+                // SAFETY: `block_abi_ok` proved the lowered `kbench` is 8 pointers -> void =
+                // `ScanFn`; the handle is moved into `Keep` and outlives every call.
+                let f: ScanFn = unsafe { std::mem::transmute(blk.ptr) };
+                cols.push(Some(Col {
+                    label: label.to_string(),
+                    note: note.to_string(),
+                    census: census_line(&blk.census),
+                    compile: blk.compile,
+                    f,
+                    _keep: Keep::Jit(blk.handle),
+                }));
+            }
+            None => {
+                println!("  ! {label} scan did not compile — row dropped");
+                cols.push(None);
+            }
         }
     }
     let n_wuk = cols.iter().filter(|column| column.is_some()).count();
@@ -2631,7 +2652,7 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
     let (cols, slots) = keep_column_slots(cols);
     if cols.is_empty() {
         println!("  ! no column built — section skipped");
-        return;
+        return Vec::new();
     }
     let labels = labels_of(&cols);
 
@@ -2699,11 +2720,50 @@ fn bench_scan(cc: &str, cxx: &str, dir: &Path) {
         println!("    {:<10} max rel {dev:.3e} at lane {at}", col.label);
     }
     println!("  {}", crate::model::power_status_line());
+
+    let oks: Vec<bool> = devs
+        .iter()
+        .map(|&(dev, _)| dev <= GENERAL_ORACLE_BAR)
+        .collect();
+    let names: Vec<(usize, String)> = cols
+        .iter()
+        .take(n_wuk)
+        .enumerate()
+        .map(|(i, c)| (i, format!("general/s6_scan:{}", c.label)))
+        .collect();
+    sota_rows(&names, &cols, &rr, twin, &oks)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The census is the T2 witness — the only proof of what a published number measured — so it
+    /// must count CALL SITES and not every occurrence of the prefix. Anchored on `wukong_` alone,
+    /// this MIR reports four "call site(s)" where the program makes one call.
+    #[test]
+    fn the_census_counts_calls_and_not_every_mention_of_the_prefix() {
+        let mir = "fn f(v0 ptr) -> void {\n  bb0:\n    // wukong_sgemm was considered here\n    v1 = const.i64 0 : wukong_sgemm\n    call wukong_sgemm(v0, v1)\n    ret\n}\ndeclare wukong_sgemm(ptr, i64)\n";
+        assert_eq!(
+            kernel_census(mir),
+            vec![("wukong_sgemm".to_string(), 1)],
+            "a comment, a type position and a declaration are not call sites"
+        );
+        assert_eq!(
+            census_line(&kernel_census(mir)),
+            "1 call site(s): wukong_sgemm"
+        );
+    }
+
+    /// Two real calls to one symbol are two call sites, and the line says so.
+    #[test]
+    fn the_census_reports_repeat_calls_with_their_count() {
+        let mir = "    call wukong_velem_f32(v0)\n    call wukong_velem_f32(v1)\n    call wukong_sgemm(v2)\n";
+        assert_eq!(
+            census_line(&kernel_census(mir)),
+            "3 call site(s): wukong_sgemm, wukong_velem_f32x2"
+        );
+    }
 
     #[test]
     fn fixed_slots_keep_every_missing_pattern_in_its_original_positions() {
@@ -2951,58 +3011,6 @@ mod tests {
         }
     }
 
-    /// `XBENCH_PIN` must default to pinning and must never fall THROUGH to "off" on a typo.
-    ///
-    /// The direction of the fallback is the whole point. Unpinned, this section's control column
-    /// (`C(twin)`, true ratio 1.00) measured 2.12x spread and the C column drifted 81 -> 174 ms
-    /// inside one run; pinned it measured ~1.05x and stayed flat. A mistyped `XBENCH_PIN=cpu0`
-    /// silently turning the pin off would hand a reader a page of numbers with no resolution at all
-    /// and no indication that anything had changed.
-    #[test]
-    fn pin_defaults_on_and_a_typo_does_not_disable_it() {
-        assert_eq!(parse_pin(None), Some(0b11), "unset must pin");
-        for off in ["off", "OFF", "none", "0", " off "] {
-            assert_eq!(parse_pin(Some(off)), None, "XBENCH_PIN={off:?}");
-        }
-        assert_eq!(parse_pin(Some("4")), Some(1 << 4));
-        assert_eq!(parse_pin(Some(" 4 , 5 ")), Some((1 << 4) | (1 << 5)));
-        for junk in ["cpu0", "", "-1", "4,cpu5", "999"] {
-            assert_eq!(
-                parse_pin(Some(junk)),
-                Some(0b11),
-                "XBENCH_PIN={junk:?} must fall back to the default, not to off"
-            );
-        }
-        // And the live reader must agree with the pure one under the ambient environment.
-        assert_eq!(
-            pin_mask(),
-            parse_pin(std::env::var("XBENCH_PIN").ok().as_deref())
-        );
-    }
-
-    /// A pin must be UNDONE. `bench_general` runs inside one process with the rest of the suite, and
-    /// a section that leaked a one-core affinity would cap every later multicore row — which would
-    /// read as a performance finding, not as a benchmark bug.
-    #[test]
-    fn the_pin_guard_restores_the_previous_affinity() {
-        let Some(before) = set_thread_affinity(!0usize) else {
-            return; // not Windows, or the OS refused: nothing to restore, nothing to prove.
-        };
-        {
-            let _g = PinGuard(set_thread_affinity(0b1));
-            // Re-reading the mask requires setting it, so prove the restore instead: the guard was
-            // handed the mask that was live before it narrowed things.
-        }
-        // After the guard, setting a fresh mask must report the FULL mask as the previous one, i.e.
-        // the guard put it back rather than leaving us on CPU 0.
-        let after = set_thread_affinity(!0usize).expect("affinity readable");
-        assert!(
-            after.count_ones() > 1,
-            "still pinned to one CPU after the guard: {after:#x}"
-        );
-        let _ = set_thread_affinity(before);
-    }
-
     /// Every ablation probe must reach optimized MIR — a probe that failed to compile would print
     /// "no dispatches" and read exactly like a recognizer decline, which is the opposite claim.
     #[test]
@@ -3154,5 +3162,72 @@ mod tests {
             r.iter().all(|v| v.is_finite()),
             "reference has non-finite lanes"
         );
+    }
+
+    /// The oracle must still score an agreeing buffer at ~0, or every test below is vacuous.
+    #[test]
+    fn the_oracle_still_passes_a_buffer_that_agrees() {
+        let want = [1.0f64, -2.5, 1.0e-9, 0.0];
+        let got = [1.0f32, -2.5, 1.0e-9, 0.0];
+        let (dev, _) = max_rel_vs_ref(&got, &want);
+        assert!(dev < 1.0e-6, "an agreeing buffer scored {dev}");
+        let (dev, same) = max_rel_pair(&got, &got);
+        assert!(
+            dev < 1.0e-6 && same,
+            "a buffer disagreed with itself: {dev}"
+        );
+    }
+
+    /// A kernel that returns NaN everywhere must not score the bit-exact sentinel.
+    ///
+    /// `NaN > worst` is false, so the naive loop *skips* every NaN lane and returns `0.0` — the
+    /// score of a perfect buffer. That is a published ratio for a kernel computing nothing.
+    #[test]
+    fn an_all_nan_buffer_never_clears_the_oracle_bar() {
+        let want = vec![1.0f64; 64];
+        let got = vec![f32::NAN; 64];
+        let (dev, _) = max_rel_vs_ref(&got, &want);
+        assert!(
+            !dev.is_finite(),
+            "an all-NaN buffer scored {dev} against a finite reference"
+        );
+        let finite = vec![1.0f32; 64];
+        let (dev, _) = max_rel_pair(&got, &finite);
+        assert!(!dev.is_finite(), "all-NaN scored {dev} against finite");
+    }
+
+    /// One bad lane in a buffer that is otherwise perfect is the case a reduction would hide.
+    #[test]
+    fn a_single_non_finite_lane_is_not_skipped() {
+        let want = vec![2.0f64; 1024];
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut got = vec![2.0f32; 1024];
+            got[517] = bad;
+            let (dev, at) = max_rel_vs_ref(&got, &want);
+            assert!(!dev.is_finite(), "lane 517 = {bad} scored {dev}");
+            assert_eq!(at, 517, "wrong lane reported for {bad}");
+        }
+    }
+
+    /// Infinities that agree are agreement, not divergence — the exact-equality arm must cover them.
+    #[test]
+    fn agreeing_infinities_are_not_a_divergence() {
+        let want = [f64::INFINITY, f64::NEG_INFINITY, f64::NAN];
+        let got = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+        let (dev, _) = max_rel_vs_ref(&got, &want);
+        assert!(dev.is_finite(), "agreeing non-finite lanes scored {dev}");
+    }
+
+    /// `zip` stops at the shorter side, so a truncated result would be scored on the prefix it did
+    /// fill — and a kernel that wrote half its output would report perfect agreement.
+    #[test]
+    fn a_truncated_buffer_is_not_scored_on_its_prefix() {
+        let want = vec![1.0f64; 64];
+        let got = vec![1.0f32; 32];
+        let (dev, _) = max_rel_vs_ref(&got, &want);
+        assert!(!dev.is_finite(), "a half-length buffer scored {dev}");
+        let full = vec![1.0f32; 64];
+        let (dev, same) = max_rel_pair(&got, &full);
+        assert!(!dev.is_finite() && !same, "a half-length pair scored {dev}");
     }
 }

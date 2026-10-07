@@ -49,8 +49,10 @@ use std::time::{Duration, Instant};
 
 use wukong_span::{Interner, SourceId};
 
+mod compare;
 mod general;
 mod model;
+mod sota;
 
 /// The shared C ABI of every kernel: `(x, y, out)` over `N` `f32` elements (`N` baked in).
 type KernelFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32);
@@ -626,10 +628,31 @@ fn main() {
     println!("scratch: {}", dir.display());
     println!();
 
+    // Pin the timing thread for the WHOLE run, not only the general suite. Until 2026-08-22 the
+    // ~45-family battery below ran unpinned on this hybrid P/E machine — the exact configuration
+    // the CPU PINNING block (see `pin_for_section`) measured publishing a byte-identical binary as
+    // 1.31x faster than itself. Uniform across every column; `XBENCH_PIN=off` is the kill switch;
+    // `@parallel`/C(omp) workers are unaffected (affinity is not inherited by spawned threads).
+    let _pin = pin_for_section();
+    println!();
+
     // Optional substring filter (first CLI arg): run only the kernels/sections whose name contains it,
     // for fast single-kernel iteration. No arg → the full suite, byte-for-byte as before.
     let filter = std::env::args().nth(1);
     let want = |name: &str| filter.as_deref().is_none_or(|f| name.contains(f));
+
+    // `compare` and `sota-check` are MODES, not substring filters, dispatched before the battery
+    // so their runs contain nothing else. `compare` is the timed `tests/compare/` corpus
+    // (compare.rs); `sota-check` is part 11 of the verification gate (sota.rs) and is the one
+    // subcommand here whose EXIT CODE is the product.
+    if filter.as_deref() == Some("compare") {
+        let rows = compare::bench_compare(&cc, &dir);
+        print_sota_scorecard(&rows);
+        return;
+    }
+    if filter.as_deref() == Some("sota-check") {
+        std::process::exit(sota::sota_check(&cc, cxx, &dir));
+    }
 
     let kernels = kernels();
     // Two separate accumulators, because the two groups of rows are not the same comparison. The
@@ -643,6 +666,10 @@ fn main() {
     let mut runtime_ratios_cpp = Vec::new();
     let mut par_ratios_c = Vec::new();
     let mut par_ratios_cpp = Vec::new();
+    // The recognition-off accumulators (master plan §7.2): the same split, so the wk(gen) headline
+    // can never pool a multicore row into a single-threaded geomean either.
+    let mut gen_ratios_c = Vec::new();
+    let mut gen_par_ratios_c = Vec::new();
 
     for k in &kernels {
         if !want(k.name) {
@@ -659,8 +686,22 @@ fn main() {
         let mut out: Vec<f32> = vec![0.0; N];
         let (xp, yp): (*const f32, *const f32) = (x.as_ptr(), y.as_mut_ptr());
 
-        let (wukong, c, cpp, rust, cfast, comp, vml) =
-            bench_table_kernel(k, &cc, &dir, &mut out, xp, yp);
+        // The recognizer-on and recognition-off columns (master plan §7.2) are the SAME source
+        // lowered twice: what the pattern matcher dispatches, and what the compiler compiles. Both
+        // are built before anything is timed and both sit in the one position-balanced rotation with
+        // every peer - see [`bench_table_kernel`].
+        let TableRow {
+            wukong,
+            wukgen,
+            wkgen_census,
+            wk_floor,
+            c,
+            cpp,
+            rust,
+            cfast,
+            comp,
+            vml,
+        } = bench_table_kernel(k, &cc, &dir, &mut out, xp, yp);
 
         println!("=== {} ({}) ===", k.name, k.note);
         report(k, &wukong, &c, &cpp, &rust, &cfast, &comp);
@@ -700,6 +741,75 @@ fn main() {
             }
         }
         let is_par = k.name.contains("@parallel");
+        // The recognition-off row: ratio vs C (the §7.2 column) and vs the recognizer-on lowering
+        // of the same source (the dispatch win, measured rather than asserted), plus the census
+        // proving no `wukong_*` kernel survived. A divergence between the two lowerings of ONE
+        // source is a compiler defect, not a timing: print it loudly and withhold the ratio.
+        if let (Some(g), Some(census)) = (&wukgen, &wkgen_census) {
+            let checked = match &wukong {
+                Some(m) => {
+                    let (rel, at) = max_rel_err(&m.out, &g.out);
+                    // Reduction rows get the relaxed bar: the recognized kernel legitimately
+                    // reassociates the f32 sum the as-written serial loop performs.
+                    let bar = if is_reduction_kernel(k.name) {
+                        1e-2
+                    } else {
+                        1e-3
+                    };
+                    if rel > bar {
+                        println!(
+                            "  !!! wk(gen) DIVERGES from the recognizer-on lowering at [{at}] \
+                             (rel {rel:.2e}) — recognition-off column WITHHELD; a divergence \
+                             between two lowerings of one source is a compiler defect"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                None => true,
+            };
+            if checked {
+                let dir = |r: f64| -> (f64, &'static str) {
+                    if r >= 1.0 {
+                        (r, "faster")
+                    } else {
+                        (1.0 / r, "slower")
+                    }
+                };
+                let mut line = format!("  wk(gen) recognition-off: {:.0} ns", g.ns_per_call);
+                // Every ratio on this line is checked against the floor the row measured for
+                // itself: the ABBA timed each build TWICE, so the spread of one build's two samples
+                // is a twin control for this column, in this run. An effect inside it is not an
+                // effect (§4.1), and saying so here is the difference between a number and a claim.
+                let inside = |v: f64| wk_floor.is_some_and(|f| v < f);
+                if let Some(p) = &c {
+                    let r = p.ns_per_call / g.ns_per_call;
+                    let (v, w) = dir(r);
+                    line.push_str(&format!(" — {v:.2}x {w} than C"));
+                    if inside(v) {
+                        line.push_str(" [INSIDE FLOOR]");
+                    }
+                    if is_par {
+                        gen_par_ratios_c.push(r);
+                    } else {
+                        gen_ratios_c.push(r);
+                    }
+                }
+                if let Some(m) = &wukong {
+                    let (v, w) = dir(m.ns_per_call / g.ns_per_call);
+                    line.push_str(&format!("; {v:.2}x {w} than recognizer-on Wukong"));
+                    if inside(v) {
+                        line.push_str(" [INSIDE FLOOR]");
+                    }
+                }
+                if let Some(f) = wk_floor {
+                    line.push_str(&format!("; row floor {f:.2}x"));
+                }
+                println!("{line}");
+                println!("     wk(gen) dispatch: {census}");
+            }
+        }
         if let (Some(m), Some(c)) = (&wukong, &c) {
             let r = c.ns_per_call / m.ns_per_call; // >1 => Wukong faster
             if is_par {
@@ -748,6 +858,26 @@ fn main() {
         if !compile_ratios_c.is_empty() {
             let (g, w) = standing(geomean(&compile_ratios_c));
             println!("  compile:  Wukong is {g:.1}x {w} to compile than C");
+        }
+    }
+    // The master plan §7.2 headline: the same rows with every recognizer OFF — general code vs gcc,
+    // not the recognizer dialect vs gcc. Printed as its own summary, never pooled with the above.
+    if !gen_ratios_c.is_empty() || !gen_par_ratios_c.is_empty() {
+        println!("Summary vs C, RECOGNITION-OFF (geomean over kernels) — the language without the dispatcher:");
+        if !gen_ratios_c.is_empty() {
+            let (g, w) = standing(geomean(&gen_ratios_c));
+            println!(
+                "  runtime:  Wukong(gen) is {g:.2}x {w} than C  [single-threaded rows: {}]",
+                gen_ratios_c.len()
+            );
+        }
+        if !gen_par_ratios_c.is_empty() {
+            let (g, w) = standing(geomean(&gen_par_ratios_c));
+            println!(
+                "  runtime:  Wukong(gen) is {g:.2}x {w} than C  [@parallel rows: {} — all-core \
+                 Wukong vs 1-thread C; see each row's C(omp) column]",
+                gen_par_ratios_c.len()
+            );
         }
     }
     if !runtime_ratios_cpp.is_empty() || !par_ratios_cpp.is_empty() {
@@ -903,13 +1033,39 @@ fn main() {
     // The general-code suite: Wukong written OUTSIDE the recognizer dialect. Opt-in (`general`),
     // because every other row above deliberately writes the pattern.
     if filter.as_deref() == Some("general") {
-        general::bench_general(&cc, cxx, &dir);
+        let rows = general::bench_general(&cc, cxx, &dir);
+        println!();
+        print_sota_scorecard(&rows);
     }
+}
+
+/// One row of the main kernel table: every column's best time, plus the recognition-off column's
+/// dispatch line and the row's own measured noise floor.
+struct TableRow {
+    wukong: Option<Measure>,
+    /// The same `.wk` source lowered with every recognizer OFF (master plan §7.2) - `wk(gen)`.
+    wukgen: Option<Measure>,
+    /// `wk(gen)`'s dispatch line from [`announce_dispatch`]: the T2 witness that no recognized
+    /// kernel survived in the column the language ratio is read from.
+    wkgen_census: Option<String>,
+    /// The widest `max/min` spread either Wukong column showed between its own two samples. The
+    /// rotation times every column twice, so that spread is a free twin control for THIS row: a
+    /// `wk(gen)` effect inside it is not an effect (§4.1).
+    wk_floor: Option<f64>,
+    c: Option<Measure>,
+    cpp: Option<Measure>,
+    rust: Option<Measure>,
+    cfast: Option<Measure>,
+    comp: Option<Measure>,
+    vml: Option<Measure>,
 }
 
 /// Build all table peers, including optional VML, before rotating their fixed slots.
 /// The shared scratch pointer has the same provenance as the original table runner.
-#[allow(clippy::type_complexity)]
+///
+/// Both Wukong lowerings of the row's source - recognizer-on (the dispatcher) and recognition-off
+/// (`wk(gen)`, the language) - are built here with the peers and timed in the SAME
+/// position-balanced rotation, so neither inherits a slot advantage over the other or over C.
 fn bench_table_kernel(
     k: &Kernel,
     cc: &str,
@@ -917,16 +1073,10 @@ fn bench_table_kernel(
     out: &mut [f32],
     xp: *const f32,
     yp: *const f32,
-) -> (
-    Option<Measure>,
-    Option<Measure>,
-    Option<Measure>,
-    Option<Measure>,
-    Option<Measure>,
-    Option<Measure>,
-    Option<Measure>,
-) {
+) -> TableRow {
     let wk = build_wukong(&k.wuk, 3);
+    let wk_gen = build_wukong_gen(&k.wuk, 3);
+    let wkgen_census = wk_gen.as_ref().map(|j| j.dispatch.clone());
     let (cl, pl) = build_c_cpp(
         k.name,
         &k.c,
@@ -975,6 +1125,7 @@ fn bench_table_kernel(
     };
     let columns = [
         Built::wk(wk),
+        Built::wk(wk_gen),
         Built::peer(cl),
         Built::peer(pl),
         Built::peer(rl),
@@ -985,9 +1136,30 @@ fn bench_table_kernel(
             None => Built::Missing,
         },
     ];
-    let mut timed =
-        abba_min_columns(columns.len(), |i| time_built(&columns[i], out, xp, yp)).into_iter();
+    // Each column's first sample, then the spread its second sample makes with it.
+    let mut first: Vec<Option<f64>> = vec![None; columns.len()];
+    let mut spread: Vec<Option<f64>> = vec![None; columns.len()];
+    let mut timed = abba_min_columns(columns.len(), |i| {
+        let sample = time_built(&columns[i], out, xp, yp);
+        if let Some(ns) = sample
+            .as_ref()
+            .map(|m| m.ns_per_call)
+            .filter(|&ns| ns > 0.0)
+        {
+            match first[i] {
+                Some(a) => spread[i] = Some((a / ns).max(ns / a)),
+                None => first[i] = Some(ns),
+            }
+        }
+        sample
+    })
+    .into_iter();
+    let wk_floor = match (spread[0], spread[1]) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
     let wukong = timed.next().flatten();
+    let wukgen = timed.next().flatten();
     let c = timed.next().flatten();
     let cpp = cpp_checked(k.name, &c, timed.next().flatten());
     let rust = timed.next().flatten();
@@ -1002,7 +1174,18 @@ fn bench_table_kernel(
             .is_some_and(|m| relaxed_peer_ok(k.name, "C(omp)", m, p))
     });
     let vml = timed.next().flatten();
-    (wukong, c, cpp, rust, cfast, comp, vml)
+    TableRow {
+        wukong,
+        wukgen,
+        wkgen_census,
+        wk_floor,
+        c,
+        cpp,
+        rust,
+        cfast,
+        comp,
+        vml,
+    }
 }
 
 /// Matmul is the canonical ML kernel and is compute-bound, so both SIMD and multicore pay off — the
@@ -7863,8 +8046,8 @@ struct WukongJit {
     /// `kbench`'s entry point. Valid only while `_handle` is alive, which is why the two travel
     /// together in one value.
     ptr: *const u8,
-    /// The dispatch census line - kept so a caller can re-print it beside a table if it wants to.
-    #[allow(dead_code)]
+    /// The dispatch census line. Re-printed beside the main table's `wk(gen)` row; other families
+    /// read it only through the `. dispatch` line [`announce_dispatch`] already printed.
     dispatch: String,
     _handle: wukong_codegen_cranelift::JitModuleHandle,
 }
@@ -7874,6 +8057,20 @@ struct WukongJit {
 ///
 /// Also records the dispatch census and persists the generated source - see [`announce_dispatch`].
 fn build_wukong(src: &str, ptr_params: usize) -> Option<WukongJit> {
+    build_wukong_lowered(src, ptr_params, true)
+}
+
+/// [`build_wukong`] with every kernel recognizer OFF: the `WUKONG_NO_RECOGNIZE` / `@generic`
+/// lowering, reached through `wukong_mir_build::LowerOptions { recognize: false }` - the same knob
+/// the driver sets from the environment. The loop nest is lowered as written (scalar or
+/// autovectorized, never a recognized `wukong_*` kernel call), which makes this the only Wukong
+/// column a *language* ratio may be read from (master plan §7.2); the recognizer-on column
+/// measures the dispatcher. Its dispatch census is announced with a `(gen)` tag.
+fn build_wukong_gen(src: &str, ptr_params: usize) -> Option<WukongJit> {
+    build_wukong_lowered(src, ptr_params, false)
+}
+
+fn build_wukong_lowered(src: &str, ptr_params: usize, recognize: bool) -> Option<WukongJit> {
     let t = Instant::now();
     let mut interner = Interner::new();
     let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
@@ -7886,13 +8083,23 @@ fn build_wukong(src: &str, ptr_params: usize) -> Option<WukongJit> {
         eprintln!("wukong sema error: {sd:?}");
         return None;
     }
-    let (mut program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+    let opts = wukong_mir_build::LowerOptions {
+        recognize,
+        ..Default::default()
+    };
+    let (mut program, ld) =
+        wukong_mir_build::lower_program_with(&module, &sema, &mut interner, opts);
     if ld.iter().any(|d| d.is_error()) {
         eprintln!("wukong lower error: {ld:?}");
         return None;
     }
     wukong_opt::optimize(&mut program, 3);
-    let dispatch = announce_dispatch(src, &program, &interner);
+    let dispatch = announce_dispatch(
+        src,
+        &program,
+        &interner,
+        if recognize { "" } else { "(gen)" },
+    );
     let handle = match wukong_codegen_cranelift::jit_module(&program, &interner) {
         Ok(h) => h,
         Err(e) => {
@@ -8006,7 +8213,15 @@ fn wk_source_name(src: &str) -> String {
 ///
 /// The line is prefixed `  . ` - the harness's existing informational-note marker, which
 /// `docs/cpu-evaluation-probes/extract-kernels.py` skips rather than mistaking for a table row.
-fn announce_dispatch(src: &str, program: &wukong_mir::Program, interner: &Interner) -> String {
+///
+/// `tag` follows the word `dispatch` (`(gen)` for a recognition-off build), so the two lowerings
+/// of one generated source can be told apart in the log.
+fn announce_dispatch(
+    src: &str,
+    program: &wukong_mir::Program,
+    interner: &Interner,
+    tag: &str,
+) -> String {
     let census = kernel_census(&wukong_mir::print::print_program(program, interner));
     let name = wk_source_name(src);
     if let Some(dir) = XBENCH_DIR.get() {
@@ -8033,7 +8248,7 @@ fn announce_dispatch(src: &str, program: &wukong_mir::Program, interner: &Intern
             .join(", ")
     };
     let line = format!("{name}{par} -> {body}");
-    println!("  . dispatch {line}");
+    println!("  . dispatch{tag} {line}");
     line
 }
 
@@ -9236,6 +9451,182 @@ unsafe fn fma_probe_avx2(warm_ms: u64, iters: u64, samples: usize) -> f64 {
     (iters * 12 * 8 * 2) as f64 / best / 1e9
 }
 
+// ---------------------------------------------------------------------------------------------
+// CPU PINNING — the largest single confound this harness has, measured (on the general suite,
+// which is where this machinery lived until 2026-08-22; the whole binary now pins, because the
+// ~45-family battery was publishing cross-language ratios with the confound below still in them)
+// ---------------------------------------------------------------------------------------------
+//
+// This laptop is an Intel Core Ultra 7 155H: 6 P-cores (SMT, logical 0-11), 8 E-cores and 2 LP
+// E-cores, 22 logical processors in three performance classes. Every program in this section is
+// single-threaded and each peer call is 50-200 ms, so a visit is ~1 s of uninterrupted scalar/AVX2
+// work — exactly the profile Windows' Thread Director demotes off a P-core.
+//
+// MEASURED, 2026-08-06, AC+CHARGING, same binary, same 4-round protocol, back to back, kill switch
+// only. The block section's raw per-round ms for the peer columns:
+//
+//   UNPINNED   C     81.16  105.32  127.66  174.30      (2.15x within ONE run, monotone)
+//              C++  108.88  109.65  112.24  205.66
+//              Rust 135.97  136.06  120.28  123.91
+//              -> C(twin) control 1.057x [0.695-1.472], spread 2.118x: THE CONTROL FAILED
+//
+//   PINNED     C     75.21   74.77   74.09   70.55      (1.07x)
+//   (CPU 0-1)  C++   73.46   74.15   73.21   73.75      (1.01x)
+//              Rust  88.70   83.70   85.12   87.13      (1.06x)
+//              -> C(twin) control spread ~1.05x: THE CONTROL PASSES
+//
+// The C column does not merely jitter unpinned — it DEGRADES MONOTONICALLY, 81 -> 174 ms, inside one
+// run, while the 4-5 ms Wukong columns in the same rounds do not move at all. That is the signature
+// of a long-running thread being walked down the performance classes, not of noise.
+//
+// Replicated on BATTERY the same day, three interleaved runs per arm (2026-08-06, discharging
+// 83%->76%, so the LEVELS are battery levels and not comparable to the AC pair above; the RATIO
+// between the arms is what is being read):
+//
+//   block C best-of-rounds, unpinned  276.6 / 280.9 / 289.2 ms
+//   block C best-of-rounds, pinned    154.5 / 130.0 / 154.8 ms      -> 1.79x / 2.16x / 1.87x
+//   run-to-run spread of the published `vs C` ratio, 19 rows:
+//       unpinned  median 1.085x  worst 1.823x
+//       pinned    median 1.035x  worst 1.076x
+//   and the same lever helps the OLD single-visit protocol just as much (main's binary, same runs):
+//       unpinned  median 1.170x  worst 1.271x
+//       pinned    median 1.055x  worst 1.103x
+//
+// So the "protocol changed the measured LEVEL of an unchanged peer by ~1.78x" finding is neither
+// thermal accumulation nor the round protocol's arithmetic. It is CORE PLACEMENT, it reproduces to
+// the decimal as a same-binary kill-switch A/B, and it is the single largest confound this section
+// has ever had — larger than the protocol change that exposed it.
+//
+// AND THE HARNESS HAD ALREADY PRINTED THE SMOKING GUN. The per-round clock probe of an unpinned run
+// (ec08db2's binary, AC+CHARGING, block section) traced
+//
+//     145 -> 85 -> 71 -> 51 -> 106 -> 101 GF/s   spread 2.85x
+//
+// across six rounds of ONE section, on a machine whose power state never changed. A 2.85x collapse
+// and partial recovery in a fixed AVX2-FMA loop is a thread moving between core classes, and it sat
+// in the output for anyone to read. The lesson is in `clock_probe_gflops`: a trace is only useful if
+// someone acts on it, and this one was reported as "the drift the ratios had to survive" rather than
+// as a defect to remove.
+//
+// Pinning is uniform across every column and carries no language content whatever — and it does not
+// have to be taken on trust, because `C(twin)` is exactly the instrument that checks it: a control
+// whose true ratio is 1.00 went from 2.12x spread to ~1.05x. That is the justification for turning it
+// on by default, and it is the only kind of justification worth having here.
+//
+// LIMITS, stated rather than glossed. One core is not the machine: an L3 shared with 15 idle
+// siblings behaves differently from a loaded one, and a single-core measurement says nothing about
+// throughput under load. The single-threaded columns — every general-suite column and every plain
+// battery row — compare pinned against pinned, which is the right trade. The battery's `@parallel`
+// and C(omp) rows are different: only the CALLING thread is pinned (Windows thread affinity is not
+// inherited, so pool/team workers spawned by it still get the whole machine), identically for every
+// language, so those rows stay same-machine comparisons — but a pinned figure is still not a
+// multicore claim. And the pin does NOT make the `ms` column comparable across protocols: see
+// [`general`]'s `time_round`.
+
+/// Which logical CPUs this harness pins its timing thread to, from `XBENCH_PIN`.
+///
+/// * unset — CPUs 0 and 1, the two SMT threads of the first P-core. Logical processors are
+///   enumerated performance-class-first on every Intel hybrid client part, so CPU 0 is a P-core;
+///   allowing both siblings of one physical core costs nothing (only one of our threads runs) and
+///   leaves the OS somewhere to put an interrupt without evicting us.
+/// * `off` / `none` / `0` — no pinning. This is the kill switch the A/B above was measured with.
+/// * a comma-separated list of logical CPU indices — pin to exactly those.
+///
+/// An unparseable value falls back to the default rather than to "off": a typo must not silently
+/// remove the control that makes this section measurable.
+fn pin_mask() -> Option<usize> {
+    parse_pin(std::env::var("XBENCH_PIN").ok().as_deref())
+}
+
+/// The pure half of [`pin_mask`], so the contract is testable without mutating a process-global env
+/// var underneath every other test in the binary.
+fn parse_pin(v: Option<&str>) -> Option<usize> {
+    let Some(v) = v.map(str::trim) else {
+        return Some(0b11);
+    };
+    if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") || v == "0" {
+        return None;
+    }
+    let mut mask = 0usize;
+    for tok in v.split(',') {
+        match tok.trim().parse::<u32>() {
+            Ok(n) if (n as usize) < usize::BITS as usize => mask |= 1usize << n,
+            _ => return Some(0b11),
+        }
+    }
+    if mask == 0 {
+        Some(0b11)
+    } else {
+        Some(mask)
+    }
+}
+
+/// Pin the CALLING THREAD (not the process) to `mask`, returning the previous mask so it can be put
+/// back. Thread affinity is not inherited by child processes, so the `gcc`/`g++`/`rustc` peer
+/// compiles this section spawns still get the whole machine.
+#[cfg(windows)]
+fn set_thread_affinity(mask: usize) -> Option<usize> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadAffinityMask(thread: isize, mask: usize) -> usize;
+    }
+    // SAFETY: `GetCurrentThread` returns a pseudo-handle that needs no closing, and
+    // `SetThreadAffinityMask` only reads it. A zero return is the documented failure signal (an
+    // empty mask, or one naming a processor this process is not allowed to run on).
+    let prev = unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
+    (prev != 0).then_some(prev)
+}
+
+#[cfg(not(windows))]
+fn set_thread_affinity(_mask: usize) -> Option<usize> {
+    None
+}
+
+/// Restores the thread's original affinity when the section ends, however it ends. A section that
+/// left the benchmark process pinned to one core would silently cap every LATER section's multicore
+/// rows — a benchmark bug that would look like a performance finding.
+struct PinGuard(Option<usize>);
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0 {
+            let _ = set_thread_affinity(prev);
+        }
+    }
+}
+
+/// Apply [`pin_mask`], print what happened, and hand back the guard that undoes it.
+fn pin_for_section() -> PinGuard {
+    let Some(mask) = pin_mask() else {
+        println!(
+            "  CPU PINNING: OFF (XBENCH_PIN). On this hybrid P/E laptop an unpinned single-threaded\n\
+             \x20   section migrates across performance classes mid-run — measured, the C(twin) control\n\
+             \x20   went 1.05x spread pinned to 2.12x unpinned, and the block C column drifted 81 ->\n\
+             \x20   174 ms inside ONE run. Expect this section to resolve nothing."
+        );
+        return PinGuard(None);
+    };
+    match set_thread_affinity(mask) {
+        Some(prev) => {
+            println!(
+                "  CPU PINNING: the timing thread is pinned to logical CPU mask {mask:#x}\n\
+                 \x20   (XBENCH_PIN=off disables; XBENCH_PIN=4,5 chooses). Every column is pinned the\n\
+                 \x20   same way, so this carries no language content — and the C(twin) control is what\n\
+                 \x20   checks it rather than asserting it. Peer compiles are separate processes and\n\
+                 \x20   still get the whole machine. A pinned figure is single-core only."
+            );
+            PinGuard(Some(prev))
+        }
+        None => {
+            println!(
+                "  CPU PINNING: requested mask {mask:#x} was REFUSED by the OS — running unpinned."
+            );
+            PinGuard(None)
+        }
+    }
+}
+
 fn geomean(xs: &[f64]) -> f64 {
     let s: f64 = xs.iter().map(|x| x.ln()).sum();
     (s / xs.len() as f64).exp()
@@ -9412,6 +9803,65 @@ fn median(xs: &[f64]) -> f64 {
     } else {
         0.5 * (v[n / 2 - 1] + v[n / 2])
     }
+}
+
+/// The one-screen summary of a sweep's [`SotaRow`]s: every field a floor-file row records, in
+/// floor-file order, so a passing round can be transcribed into `bench/sota/FLOOR.md` by reading
+/// this block and nothing else.
+fn print_sota_scorecard(rows: &[SotaRow]) {
+    println!("SOTA scorecard (ratio = peer_time / wukong_time; > 1.00 means Wukong faster):");
+    for r in rows {
+        let ratio = match &r.ratio {
+            Some(s) => format!("{:.2}x [{:.2}-{:.2}]", s.med, s.lo, s.hi),
+            None => "n/a".into(),
+        };
+        let twin = match &r.twin {
+            Some(t) => format!("{:.2}x", floor_factor(*t)),
+            None => "none".into(),
+        };
+        let mut flags = String::new();
+        if !r.reportable {
+            flags.push_str("  POWER-CHANGED");
+        }
+        if r.peer_missing {
+            flags.push_str("  PEER-MISSING");
+        }
+        if !r.oracle_ok {
+            flags.push_str("  ORACLE-FAILED");
+        }
+        println!(
+            "  {:<22} vs {:<3} ratio {:<22} twin-floor {:<6} power {}{}",
+            r.program, r.peer, ratio, twin, r.power, flags
+        );
+        println!("      census: {}", r.census);
+    }
+}
+
+/// One in-scope program's outcome from a sweep — what `sota-check` (part 11 of the language
+/// close-out campaign's verification gate) evaluates against `bench/sota/FLOOR.md`, and what the
+/// producing section prints its scorecard from. Produced by `compare::bench_compare` (and the
+/// general suite once its programs join the floor file).
+pub(crate) struct SotaRow {
+    /// Floor-file row name, e.g. `compare/saxpy`.
+    pub(crate) program: String,
+    /// Which peer the ratio is against (the strongest honest one this row carries).
+    pub(crate) peer: String,
+    /// `peer_time / wukong_time`, per round — `> 1` means Wukong faster. `None` when the row could
+    /// not honestly produce one (a column missing, the oracle failed, the census inadmissible).
+    pub(crate) ratio: Option<RatioStat>,
+    /// The run's own `C(twin)` control for this section.
+    pub(crate) twin: Option<RatioStat>,
+    /// Did the power state hold across every round?
+    pub(crate) reportable: bool,
+    /// The power-state key the rounds ran under (`AC+full` / `AC+CHARGING` / `BATTERY` / …).
+    pub(crate) power: String,
+    /// The dispatch-census line for the Wukong column — the T2 recognition-off witness.
+    pub(crate) census: String,
+    /// The bar peer failed to compile or load — `sota-check` reads this as a FAILURE, never a skip
+    /// (a cross-language sweep drops a column silently otherwise).
+    pub(crate) peer_missing: bool,
+    /// Every column agreed with the f64 scalar reference within the section's bar.
+    pub(crate) oracle_ok: bool,
 }
 
 /// A ratio between two columns, measured ROUND BY ROUND: the median across rounds and the range the
@@ -10473,6 +10923,58 @@ fn rust_kernel_n(n: usize, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `XBENCH_PIN` must default to pinning and must never fall THROUGH to "off" on a typo.
+    ///
+    /// The direction of the fallback is the whole point. Unpinned, this section's control column
+    /// (`C(twin)`, true ratio 1.00) measured 2.12x spread and the C column drifted 81 -> 174 ms
+    /// inside one run; pinned it measured ~1.05x and stayed flat. A mistyped `XBENCH_PIN=cpu0`
+    /// silently turning the pin off would hand a reader a page of numbers with no resolution at all
+    /// and no indication that anything had changed.
+    #[test]
+    fn pin_defaults_on_and_a_typo_does_not_disable_it() {
+        assert_eq!(parse_pin(None), Some(0b11), "unset must pin");
+        for off in ["off", "OFF", "none", "0", " off "] {
+            assert_eq!(parse_pin(Some(off)), None, "XBENCH_PIN={off:?}");
+        }
+        assert_eq!(parse_pin(Some("4")), Some(1 << 4));
+        assert_eq!(parse_pin(Some(" 4 , 5 ")), Some((1 << 4) | (1 << 5)));
+        for junk in ["cpu0", "", "-1", "4,cpu5", "999"] {
+            assert_eq!(
+                parse_pin(Some(junk)),
+                Some(0b11),
+                "XBENCH_PIN={junk:?} must fall back to the default, not to off"
+            );
+        }
+        // And the live reader must agree with the pure one under the ambient environment.
+        assert_eq!(
+            pin_mask(),
+            parse_pin(std::env::var("XBENCH_PIN").ok().as_deref())
+        );
+    }
+
+    /// A pin must be UNDONE. `bench_general` runs inside one process with the rest of the suite, and
+    /// a section that leaked a one-core affinity would cap every later multicore row — which would
+    /// read as a performance finding, not as a benchmark bug.
+    #[test]
+    fn the_pin_guard_restores_the_previous_affinity() {
+        let Some(before) = set_thread_affinity(!0usize) else {
+            return; // not Windows, or the OS refused: nothing to restore, nothing to prove.
+        };
+        {
+            let _g = PinGuard(set_thread_affinity(0b1));
+            // Re-reading the mask requires setting it, so prove the restore instead: the guard was
+            // handed the mask that was live before it narrowed things.
+        }
+        // After the guard, setting a fresh mask must report the FULL mask as the previous one, i.e.
+        // the guard put it back rather than leaving us on CPU 0.
+        let after = set_thread_affinity(!0usize).expect("affinity readable");
+        assert!(
+            after.count_ones() > 1,
+            "still pinned to one CPU after the guard: {after:#x}"
+        );
+        let _ = set_thread_affinity(before);
+    }
 
     /// Every `@parallel` row must have an OpenMP twin in [`c_omp_source`]. Rename a row in
     /// [`kernels()`] without renaming its arm and `c_omp_source` falls through to `None`: the

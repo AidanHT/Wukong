@@ -37,6 +37,27 @@ Measured at the time of writing, `saxpy`, `naive_gemm` and `unknown_op` emit
 **no** `wukong_*` call at all, and the two `tiled_transpose` programs emit only
 `wukong_parallel_for` -- the `@parallel` outliner, not a named kernel.
 
+## Timing — the master plan §7.1 "CPU within the §3.3 band" condition
+
+`run_cpu.ps1` prints program output only; it does not and will not fabricate
+timings. The timing surface for this corpus is
+
+```sh
+cargo run -p wukong_xbench --release -- compare
+```
+
+which times a **timing-scale twin** of each CPU fixture's loop (same algorithm,
+same spelling, same `@generic`; the toy extent replaced by 2²² elements /
+256³) against the committed C peer's kernel exported as `kbench`, on the
+pinned, round-interleaved, `C(twin)`-controlled protocol, with every column
+checked per-lane against an f64 scalar reference and the dispatch census
+printed as the recognition-off witness. The twins live in
+`crates/wukong_xbench/src/compare.rs` and cite these fixtures; keeping the two
+in step is part of reviewing any edit to either. Measured floors live in
+`bench/sota/FLOOR.md` and are enforced by `wukong_xbench -- sota-check` — which
+is built but **not yet armed**: that file does not exist yet, so the mode refuses
+(exit 2) rather than passing. See `crates/wukong_xbench/README.md`.
+
 ## Peer rules
 
 - Compare the same algorithm and data layout.
