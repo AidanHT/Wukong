@@ -69,14 +69,21 @@ not duplicate them. In summary, Wukong:
   layout declared in the type (`Tensor[f32, 512, 512, .col_major]`, `.tiled(64, 64)`, strided) and
   parallel schedules (`@parallel`) are part of the language rather than a soup of intrinsics and
   `#pragma`s. Honest status: a user-written `vec[f32, 8]` *value* parses and type-checks but does not
-  execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` (bare form), `@generic` and `@tile`
-  have consumers today, and a `@tile` the compiler cannot apply — an unsupported loop form, a width
-  that is not a positive integer literal — is `E0309` rather than a silent drop, while
+  execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` (bare form), `@generic`, `@tile`
+  and `@unchecked` have consumers today, and a `@tile` the compiler cannot apply — an unsupported loop
+  form, a width that is not a positive integer literal — is `E0309` rather than a silent drop, while
   `@simd`/`@align`/`@extern`/`@export` and `@parallel`'s `grain =` argument parse and are inert — layout is
   enforced across call boundaries; the default row-major (contiguous) layout and `.col_major` both
   lower multi-dimensional indexing (`.col_major` is byte-identical to `a[i + j*M]`); `.strided` /
-  `.tiled(…)` still reject indexing (`C0001`). Arena/scratch/pool allocator selection is not
-  implemented (the language's only runtime-sized memory today is `alloc_<T>`/`free`).
+  `.tiled(…)` still reject indexing (`C0001`). Runtime-sized memory is `alloc_<T>`/`free` (64-byte
+  aligned, zeroed) plus a per-thread LIFO scratch arena (`scratch_<T>(n)` / `scratch_mark()` /
+  `scratch_release(m)`); there is no uninitialized or user-selectable allocator yet.
+- **Checked slices.** Every `s[i]` on a `[]T` slice is checked against the length in its fat pointer
+  on every backend (`index out of bounds: the len is N but the index is I at file:line:col`, exit 1);
+  `-O2` removes the checks from counted loops by versioning them on one preheader guard, and
+  `@unchecked` on a `fn` is the explicit opt-out. Runtime indices into fixed-size arrays and
+  constant-shape tensors, and the extents handed to recognized runtime kernels, are not yet checked.
+  A pointer used as a condition (`if p`) is a null test.
 - **Zero hidden cost.** No GC, no implicit copies of large aggregates, no surprise allocations.
 - **Domain-aware optimization (implementation today).** The compiler **recognizes a matmul nest** (the
   `ikj` accumulate and `ijk` dot-product forms, incl. `nn.Linear` `A·Bᵀ`) and may lower it to a tuned
