@@ -335,6 +335,9 @@ struct VecPlan {
     reductions: Vec<RedPlan>,
     /// Runtime pointer-range checks the vector loop is only legal under.
     guards: Vec<GuardPair>,
+    /// Runtime checks that each loop-invariant data load's address lies outside each stored range
+    /// (see [`plan_guards`]); conjoined with `guards`.
+    point_guards: Vec<PointGuard>,
     /// Element type the guard ranges are measured in (all guarded accesses share it).
     guard_elem: MirType,
     /// May two guarded bases be *equal* (rather than disjoint)? Only when every guarded access
@@ -417,6 +420,16 @@ struct RedPlan {
 struct GuardPair {
     a: GuardBase,
     b: GuardBase,
+}
+
+/// A loop-invariant data load — one element of type `ty` at the fixed address `at` — that the
+/// vector loop is only legal over if no store in `store`'s range can write it. Never satisfied by
+/// equality: the point IS one element, so a store range that starts at it overlaps it.
+#[derive(Clone, Debug)]
+struct PointGuard {
+    at: MemBase,
+    ty: MirType,
+    store: GuardBase,
 }
 
 /// A base pointer, plus the element-offset window the loop applies to it: a loop-invariant
@@ -613,9 +626,6 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
     }
     let iv_value_use = classify_iv_uses(f, &lin, iv.value)
         .ok_or("the induction variable is used for something other than addressing")?;
-    if !invariant_loads_are_safe(l) {
-        return Err("an invariant data load in a loop that also writes memory");
-    }
 
     // ---- width, from the memory the loop touches ----------------------------------------------
     let w = pick_width(l).ok_or("no single lane width for the loop's accesses")?;
@@ -658,7 +668,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         plan_body(f, l, &lin, w, &ramp).ok_or("an instruction in the body cannot be widened")?;
 
     // ---- runtime alias guard ------------------------------------------------------------------
-    let (guards, guard_elem, guard_allows_equal) =
+    let (guards, point_guards, guard_elem, guard_allows_equal) =
         plan_guards(f, l).ok_or("the runtime alias check cannot be expressed")?;
 
     Ok(VecPlan {
@@ -674,6 +684,7 @@ fn plan_loop(f: &Function, l: &NaturalLoop) -> Result<VecPlan, &'static str> {
         vector_ty,
         reductions,
         guards,
+        point_guards,
         guard_elem,
         guard_allows_equal,
         ramp,
@@ -1155,25 +1166,6 @@ fn ramp_consumable(op: &Op) -> bool {
             | Op::Fma(..)
             | Op::Store { .. }
     )
-}
-
-/// A load at a loop-invariant address executes once per *group* in the vector body but once per
-/// *element* in the scalar loop. That is only the same program when nothing in the loop can change
-/// what it reads.
-///
-/// The `Ptr`-typed case is exempt: it is a `[]T` slice re-reading its own data pointer from the fat
-/// pointer, which is exactly the assumption
-/// [`crate::loop_info::MemDep::IndependentIfBasesStable`] already states and which the dependence
-/// verdict has already been checked against. Any other invariant load in a loop that also *writes*
-/// memory is declined, because the write could be the thing it re-reads.
-fn invariant_loads_are_safe(l: &NaturalLoop) -> bool {
-    let writes = l.accesses.iter().any(|a| a.kind == AccessKind::Store);
-    !writes
-        || !l.accesses.iter().any(|a| {
-            matches!(a.addr, AddrForm::Invariant(_))
-                && a.kind == AccessKind::Load
-                && a.value_ty != MirType::Ptr
-        })
 }
 
 /// The lane count, from the element types the loop's affine accesses transfer. Every widened access
@@ -1689,7 +1681,11 @@ fn cast_widenable(k: CastKind, to: &MirType) -> bool {
 /// overlapping and once with disjoint windows, and prints every lane of both buffers against
 /// hand-derived expectations. Deleting the `Select` on `emit_alias_checks`'s result makes it fail 7
 /// of its 96 lines.
-fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, MirType, bool)> {
+#[allow(clippy::type_complexity)]
+fn plan_guards(
+    f: &Function,
+    l: &NaturalLoop,
+) -> Option<(Vec<GuardPair>, Vec<PointGuard>, MirType, bool)> {
     // A symbolic addend is only usable in the guard if it is available there, and the guard sits in
     // front of the header. `AffineExpr` deliberately also accepts a value *defined inside* the loop
     // whose operands are all invariant (`loop_info::value_invariant` — that is what keeps the
@@ -1802,7 +1798,52 @@ fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, MirType
             });
         }
     }
-    Some((guards, elem, uniform_offset))
+
+    // Loop-invariant data loads against the stores. A load whose address never moves executes once
+    // per GROUP in the vector body but once per ELEMENT in the scalar loop, so the two read the same
+    // values only if no store in the loop writes that address — the pairwise question the ranges
+    // above already answer, with a one-element range on one side. Until this existed, ONE invariant
+    // scalar load (`w[0]` in `o[i] = a[i]*w[0] + w[1]`, the canonical scaled-elementwise kernel)
+    // plus ANY store declined the whole loop. Now each such load is checked against each stored
+    // group at run time — unless the two are distinct stack slots — and a failing check sets
+    // `n_vec = 0` like every other bail-out, so the scalar loop does all the work.
+    //
+    // A `Ptr`-typed invariant load is exempt as before: it is a `[]T` slice re-reading its own data
+    // pointer, the assumption `MemDep::IndependentIfBasesStable` states and the dependence verdict
+    // already answers. Two fixed addresses (an invariant load beside an invariant store) are not a
+    // shape this guard expresses, so that loop still declines, as do a load whose address is
+    // computed inside the loop (the guard runs before it) and a stored group with no rebuildable
+    // range.
+    let invariant_store = l
+        .accesses
+        .iter()
+        .any(|a| a.kind == AccessKind::Store && matches!(a.addr, AddrForm::Invariant(_)));
+    let mut points = Vec::new();
+    for a in &l.accesses {
+        let AddrForm::Invariant(at) = &a.addr else {
+            continue;
+        };
+        if a.kind != AccessKind::Load || a.value_ty == MirType::Ptr {
+            continue;
+        }
+        if invariant_store || inside.contains(&at.outer_handle().0) {
+            return None;
+        }
+        for gr in bases.iter().filter(|gr| gr.stored) {
+            if distinct_alloca_pair(f, *at, gr.g.base) {
+                continue;
+            }
+            if !gr.usable {
+                return None;
+            }
+            points.push(PointGuard {
+                at: *at,
+                ty: a.value_ty.clone(),
+                store: gr.g.clone(),
+            });
+        }
+    }
+    Some((guards, points, elem, uniform_offset))
 }
 
 /// Is `k` representable in this integer type? The guard materializes a symbolic addend's
@@ -2021,7 +2062,7 @@ fn emit_trip(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId, start: ValueId) -> V
 /// each. This is an ordering question about two live objects, never a null test — the repo's
 /// "interpreter address 0 is a valid address" landmine does not apply.
 fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<ValueId> {
-    if p.guards.is_empty() {
+    if p.guards.is_empty() && p.point_guards.is_empty() {
         return None;
     }
     // The vector part spans `[start, start + n_vec)`; conservatively use the whole loop, whose
@@ -2048,6 +2089,55 @@ fn emit_alias_checks(e: &mut Emit<'_>, p: &VecPlan, guard: BlockId) -> Option<Va
             let same = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Eq, alo, blo));
             pair = e.push(guard, MirType::I1, Op::Bin(BinOp::Or, pair, same));
         }
+        acc = Some(match acc {
+            None => pair,
+            Some(prev) => e.push(guard, MirType::I1, Op::Bin(BinOp::And, prev, pair)),
+        });
+    }
+    // Each invariant data load is the one-element range `[at, at + 1)`, built as a `gep` by one
+    // element of its own type so the interpreter (slot-indexed) and native (byte-addressed) agree on
+    // what "one past" is. It must lie entirely before or entirely after the stored range; equality
+    // is never acceptable here (see [`PointGuard`]).
+    for g in &p.point_guards {
+        let (slo, shi) = range_of(e, p, guard, &g.store, start, end, &mut ptr_cache);
+        let at = match g.at {
+            MemBase::Outer(v) => v,
+            MemBase::ReloadedOuter { addr, .. } => match ptr_cache.get(&addr.0) {
+                Some(&v) => v,
+                None => {
+                    let v = e.push(guard, MirType::Ptr, Op::Load(addr, MirType::Ptr));
+                    ptr_cache.insert(addr.0, v);
+                    v
+                }
+            },
+        };
+        let one = e.int(guard, &MirType::I64, 1);
+        let past = e.push(
+            guard,
+            MirType::Ptr,
+            Op::Gep {
+                ptr: at,
+                index: one,
+                elem: g.ty.clone(),
+            },
+        );
+        let plo = e.push(
+            guard,
+            MirType::I64,
+            Op::Cast(CastKind::PtrToInt, at, MirType::I64),
+        );
+        let phi = e.push(
+            guard,
+            MirType::I64,
+            Op::Cast(CastKind::PtrToInt, past, MirType::I64),
+        );
+        let point_before = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Ule, phi, slo));
+        let point_after = e.push(guard, MirType::I1, Op::Cmp(CmpOp::Ule, shi, plo));
+        let pair = e.push(
+            guard,
+            MirType::I1,
+            Op::Bin(BinOp::Or, point_before, point_after),
+        );
         acc = Some(match acc {
             None => pair,
             Some(prev) => e.push(guard, MirType::I1, Op::Bin(BinOp::And, prev, pair)),
@@ -2136,7 +2226,7 @@ fn range_of(
 /// general alias analysis here, because it has already required the answer. A loop only reaches
 /// [`apply`] if its dependence verdict is [`crate::loop_info::MemDep::Independent`] or
 /// `IndependentIfBasesStable`, and the latter's entire content is "a `load ptr <invariant>`
-/// executed inside the loop yields the same pointer on every iteration". `invariant_loads_are_safe`
+/// executed inside the loop yields the same pointer on every iteration". `plan_guards`
 /// already leans on exactly that to let such a load coexist with a store at all. Doing it once is
 /// that same statement, spent.
 ///
@@ -3632,6 +3722,66 @@ mod tests {
                      k(x, o, 23); \
                      for i in 0..23 { print((o[i] * 1000.0) as i32); } \
                      free(x); free(o); return 0; }";
+        scalar_and_vector_agree(src);
+    }
+
+    /// The canonical scaled-elementwise kernel: one loop-invariant scalar load (`w[0]`, `w[1]`)
+    /// beside a store. `invariant_loads_are_safe` used to veto the WHOLE loop for that — "an
+    /// invariant data load in a loop that also writes memory" — although the only hazard is a
+    /// store in the loop rewriting the address the load re-reads, a pairwise question this pass
+    /// already answers at run time for its affine streams. Each such load is now a one-element
+    /// `PointGuard` against every stored range, so the loop widens behind the guard.
+    #[test]
+    fn a_scaled_elementwise_loop_with_an_invariant_scalar_load_widens_under_a_guard() {
+        let src = "fn k(x: []f32, w: [f32; 16], mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i] * w[0] + w[1]; i = i + 1; } } \
+                   fn main() -> i32 { return 0; }";
+        assert!(
+            is_widened(src, "k"),
+            "an elementwise loop with an invariant scalar load was not widened"
+        );
+    }
+
+    /// The guard is real: when the caller makes the invariant `w[0]`/`w[1]` the very elements the
+    /// loop stores to (`o` is a view of `w`'s storage, hidden behind `pick` so the optimizer cannot
+    /// prove it), the point check fails, `n_vec` is 0, and the scalar loop computes the answer.
+    ///
+    /// Scalar semantics, by hand: `buf = [2, 3, 4, …, 17]`, `x = 1`, `n = 13`, so iteration `i`
+    /// stores `buf[0] + buf[1]` as they stand: `buf[0] = 2+3 = 5`, `buf[1] = 5+3 = 8`, then
+    /// `buf[2..13] = 5+8 = 13`, and `buf[13..16]` keep 15, 16, 17. A vector loop that read `w[0]`
+    /// and `w[1]` once per group would store 5 in every lane of the first group instead.
+    #[test]
+    fn an_invariant_load_the_loop_overwrites_keeps_the_scalar_answer() {
+        let src = "fn k(x: []f32, w: [f32; 16], mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i] * w[0] + w[1]; i = i + 1; } } \
+                   fn pick(a: []f32, b: []f32, s: i64) -> []f32 { \
+                     if s > 0 { return a; } return b; } \
+                   fn main() -> i32 { \
+                     let mut buf: [f32; 16] = [0.0; 16]; \
+                     let mut j: i64 = 0; while j < 16 { buf[j] = (j as f32) + 2.0; j = j + 1; } \
+                     let mut x: []f32 = alloc_f32(16); \
+                     let mut z: []f32 = alloc_f32(16); \
+                     let mut m: i64 = 0; while m < 16 { x[m] = 1.0; z[m] = 0.0; m = m + 1; } \
+                     let s: i64 = x[3] as i64; \
+                     let view: []f32 = buf; \
+                     let mut o: []f32 = pick(view, z, s); \
+                     k(x, buf, o, 13); \
+                     for i in 0..16 { print(buf[i] as i32); } \
+                     free(x); free(z); return 0; }";
+        let expected: Vec<i32> = [5, 8]
+            .into_iter()
+            .chain(std::iter::repeat_n(13, 11))
+            .chain([15, 16, 17])
+            .collect();
+        let (program, mut interner) = optimized(src, 2);
+        let main = interner.intern("main");
+        let (code, bytes) = wukong_interp::run_with_output(&program, main, &interner).unwrap();
+        assert_eq!(code, 0);
+        let printed: Vec<i32> = String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(|l| l.trim().parse().expect("an integer line"))
+            .collect();
+        assert_eq!(printed, expected, "-O2 lost the scalar answer");
         scalar_and_vector_agree(src);
     }
 }
