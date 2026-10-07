@@ -28,6 +28,7 @@
 
 mod alias;
 mod canon;
+mod par_grain;
 mod tile;
 mod tindex;
 
@@ -950,8 +951,9 @@ impl Default for LowerOptions {
 ///
 /// Needs `&mut Interner` because it interns the ~160 runtime kernel symbols (`GemmSyms`), the
 /// monomorphized instance names (`id$f32`), the `.rodata` string-literal blobs, and the
-/// `PAR_REGION_MAX`-entry pool of outlined-region symbols — the per-function lowerer holds only a
-/// shared `&Interner` and cannot mint names itself.
+/// pool of outlined-region symbols (`PAR_REGION_MAX` entries, grown on demand — see
+/// [`lower_program_with`]) — the per-function lowerer holds only a shared `&Interner` and cannot
+/// mint names itself.
 pub fn lower_program(
     module: &Module,
     sema: &SemaResult,
@@ -969,6 +971,32 @@ pub fn lower_program_with(
     interner: &mut Interner,
     opts: LowerOptions,
 ) -> (Program, Vec<Diagnostic>) {
+    // The outlined-region symbols must be interned before lowering starts (the lowerer holds only a
+    // shared `&Interner`), so the pool is sized up front. A program that outlines more mid-function
+    // `@parallel` regions than the pool holds used to keep the extras serial with no diagnostic; now
+    // the lowering reports that it ran out and is simply redone with a pool four times larger.
+    // Lowering is a pure function of (module, sema, options, pool size) and interning is idempotent,
+    // so the redo produces exactly the program a big-enough first pool would have, and only programs
+    // past the pool pay for it.
+    let mut pool = PAR_REGION_MAX;
+    loop {
+        let (program, diags, exhausted) = lower_program_pooled(module, sema, interner, opts, pool);
+        if !exhausted || pool >= PAR_REGION_POOL_LIMIT {
+            return (program, diags);
+        }
+        pool = (pool * 4).min(PAR_REGION_POOL_LIMIT);
+    }
+}
+
+/// One lowering attempt with a `pool`-entry outlined-region symbol pool. The third result is `true`
+/// when some `@parallel` region stayed serial only because the pool was exhausted.
+fn lower_program_pooled(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    opts: LowerOptions,
+    pool: usize,
+) -> (Program, Vec<Diagnostic>, bool) {
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
     //
@@ -1195,7 +1223,7 @@ pub fn lower_program_with(
     let mut par_regions = ParRegions {
         pfor: interner.intern("wukong_parallel_for"),
         syms: if any_parallel {
-            (0..PAR_REGION_MAX)
+            (0..pool)
                 .map(|i| interner.intern(&format!("wukong$par${i}")))
                 .collect()
         } else {
@@ -1203,6 +1231,8 @@ pub fn lower_program_with(
         },
         next: 0,
         funcs: Vec::new(),
+        grain: 1,
+        exhausted: false,
     };
     let no_subst: HashMap<Symbol, Ty> = HashMap::default();
     // Functions carrying `@generic`. Collected once by name — names are unique at module scope
@@ -1231,6 +1261,9 @@ pub fn lower_program_with(
     for item in &module.items {
         if let ast::ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
+                // `@parallel(grain = G)`: every region this function outlines hands each worker
+                // runs of at least G iterations (see `par_grain`). 1 for every other function.
+                par_regions.grain = par_grain::item_grain(item, interner);
                 // A type-generic function (`fn id<T>(x: T)`) is lowered once per concrete
                 // instantiation, below — skip the generic template itself. Dimension-only generics
                 // (`fn f<N>(a: Tensor[f32, N])`) are not type-generic and lower normally here.
@@ -1936,7 +1969,16 @@ pub fn lower_program_with(
                         let par_sym = interner.intern(&format!("{base}$par"));
                         let pfor_sym = interner.intern("wukong_parallel_for");
                         let (outlined, wrapper) = lower_parallel(
-                            f, par_sym, pfor_sym, idx, hi, loop_body, sema, interner, gemm,
+                            f,
+                            par_sym,
+                            pfor_sym,
+                            idx,
+                            hi,
+                            loop_body,
+                            sema,
+                            interner,
+                            gemm,
+                            par_regions.grain,
                             &mut diags,
                         );
                         // Both halves are built with an empty tile queue (`lower_parallel`), so a
@@ -2027,7 +2069,7 @@ pub fn lower_program_with(
     // The outlined bodies of every mid-function `@parallel` loop region, collected while lowering
     // the functions above. Appended last — backends resolve functions by name, so order is free.
     program.funcs.append(&mut par_regions.funcs);
-    (program, diags)
+    (program, diags, par_regions.exhausted)
 }
 
 /// Does this item carry a `@parallel` attribute?
@@ -2693,6 +2735,10 @@ fn merge_repr_ty(result_ty: &MirType) -> MirType {
 ///     array base pointers back from `env`;
 ///   * the original `f.name(params…)` — a wrapper that packs the parameter pointers into a stack
 ///     `env`, then calls `wukong_parallel_for(hi, &par, env)`.
+///
+/// With `@parallel(grain = G)`, `G > 1`, the wrapper passes `ceil(hi / G)` chunks instead and
+/// appends the address of a stack slot holding `hi` to `env`; the body loads it and maps its chunk
+/// span back to iterations (see `par_grain`). `hi` is evaluated once, in the wrapper, either way.
 #[allow(clippy::too_many_arguments)]
 fn lower_parallel(
     f: &FnDecl,
@@ -2704,6 +2750,7 @@ fn lower_parallel(
     sema: &SemaResult,
     interner: &Interner,
     gemm: GemmSyms,
+    grain: u64,
     diags: &mut Vec<Diagnostic>,
 ) -> (Function, Function) {
     let (param_tys, ret_ty) = match sema.defs.lookup(f.name.sym).map(|d| &d.kind) {
@@ -2776,6 +2823,27 @@ fn lower_parallel(
             // the serial spelling.
             fl.bind_field_bases(p.name.sym, base, pty);
         }
+        // Grain > 1: the runtime hands over CHUNK indices; recover the trip count the wrapper
+        // stored behind `env[k]` and map the chunk span back to iterations.
+        let (start, end) = if grain > 1 {
+            let kidx = fl
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let slot = fl.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: env,
+                    index: kidx,
+                    elem: MirType::Ptr,
+                },
+            );
+            let np = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
+            let n = fl.builder.build(MirType::I64, Op::Load(np, MirType::I64));
+            let chunks = par_grain::emit_chunks(&mut fl.builder, n, grain);
+            par_grain::emit_iteration_bounds(&mut fl.builder, start, end, n, chunks, grain)
+        } else {
+            (start, end)
+        };
         // The index variable's source type (the range's element type) drives the loop so the
         // body's index arithmetic matches sema; the i64 runtime bounds are coerced into it.
         let ity = fl.expr_mir(hi);
@@ -2819,9 +2887,11 @@ fn lower_parallel(
             .iter()
             .map(|pty| fl.builder.add_param(param_abi_ty(pty)))
             .collect();
+        // One pointer per parameter, plus the trip-count slot's address when a grain applies.
+        let env_len = k + usize::from(grain > 1);
         let env = fl
             .builder
-            .alloca(MirType::Array(Box::new(MirType::Ptr), k as u32));
+            .alloca(MirType::Array(Box::new(MirType::Ptr), env_len as u32));
         for (idx_k, pv) in param_vals.iter().enumerate() {
             let kidx = fl
                 .builder
@@ -2842,6 +2912,32 @@ fn lower_parallel(
         let n_raw = fl.lower_expr(hi);
         let n_ty = fl.operand_mir(n_raw, hi);
         let n = fl.coerce_to(n_raw, &n_ty, &MirType::I64, fl.signed(hi));
+        let n = if grain > 1 {
+            // Publish the trip count to the body through `env[k]`, then hand the runtime chunks.
+            let nslot = fl.builder.alloca(MirType::I64);
+            fl.builder.build_void(Op::Store {
+                ptr: nslot,
+                value: n,
+            });
+            let kidx = fl
+                .builder
+                .build(MirType::I64, Op::ConstInt(k as i128, MirType::I64));
+            let slot = fl.builder.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: env,
+                    index: kidx,
+                    elem: MirType::Ptr,
+                },
+            );
+            fl.builder.build_void(Op::Store {
+                ptr: slot,
+                value: nslot,
+            });
+            par_grain::emit_chunks(&mut fl.builder, n, grain)
+        } else {
+            n
+        };
         let bodyaddr = fl.builder.build(MirType::Ptr, Op::FuncAddr(par_sym));
         fl.builder.build_void(Op::Call {
             func: pfor_sym,
@@ -2862,11 +2958,16 @@ fn lower_parallel(
     (outlined, wrapper)
 }
 
-/// Cap on outlined mid-function `@parallel` loop regions per program. The outlined-body symbols
-/// must be interned before lowering starts (the lowerer holds only a shared `&Interner`), so a
-/// fixed pool is pre-interned up front; a program with more independent-iteration loops than this
-/// simply keeps the extras serial (correct, just not parallel).
+/// Initial size of the outlined mid-function `@parallel` region symbol pool. The outlined-body
+/// symbols must be interned before lowering starts (the lowerer holds only a shared `&Interner`), so
+/// a pool is pre-interned up front; a program that outlines more regions than this is lowered
+/// again with a pool four times larger ([`lower_program_with`]), so no region stays serial for
+/// want of a name.
 const PAR_REGION_MAX: usize = 32;
+
+/// Upper bound on the region pool the redo loop grows to — far past any real program (each entry
+/// is one outlined loop); it only guarantees that the loop terminates.
+const PAR_REGION_POOL_LIMIT: usize = 1 << 16;
 
 /// State for outlining mid-function `@parallel` loop regions (see
 /// [`FnLowerer::try_emit_parallel_region`]): the `wukong_parallel_for` runtime symbol, the
@@ -2880,6 +2981,11 @@ struct ParRegions {
     syms: Vec<Symbol>,
     next: usize,
     funcs: Vec<Function>,
+    /// The `@parallel(grain = G)` of the function currently being lowered (1 by default).
+    grain: u64,
+    /// Set when a region stayed serial because `syms` ran out — the signal for
+    /// [`lower_program_with`] to redo the lowering with a larger pool.
+    exhausted: bool,
 }
 
 /// The runtime entry points the recognizers dispatch to: the four GEMM kernels (`C = A·B` and the
@@ -13896,7 +14002,9 @@ impl FnLowerer<'_> {
     /// [`lower_parallel`]'s two halves, but as a *statement* inside a larger function.
     ///
     /// Returns `false` — emitting nothing, so the caller lowers the loop serially — when the module's
-    /// pre-interned region-symbol pool (`PAR_REGION_MAX`) is exhausted. A captured `[]T` slice must
+    /// pre-interned region-symbol pool is exhausted; that is recorded, and `lower_program_with`
+    /// redoes the lowering with a larger pool, so the final program never keeps a region serial for
+    /// that reason. A captured `[]T` slice must
     /// have its `slice_slots` record carried across the env into the outlined body's re-bind, or
     /// `kernel_base_ptr` in there would mistake the fat-pointer buffer for the data.
     fn emit_parallel_region(
@@ -13907,15 +14015,22 @@ impl FnLowerer<'_> {
         body: &Block,
         captures: &[Symbol],
     ) -> bool {
-        // Reserve an outlined-body symbol from the pool (pool exhausted -> stay serial).
-        let (par_sym, pfor) = match self.par.as_deref_mut() {
+        // Reserve an outlined-body symbol from the pool. Pool exhausted -> stay serial in THIS
+        // attempt and flag it; `lower_program_with` then redoes the lowering with a larger pool.
+        let (par_sym, pfor, grain) = match self.par.as_deref_mut() {
             Some(p) if p.next < p.syms.len() => {
                 let s = p.syms[p.next];
                 p.next += 1;
-                (s, p.pfor)
+                (s, p.pfor, p.grain)
             }
-            _ => return false,
+            Some(p) => {
+                p.exhausted = true;
+                return false;
+            }
+            None => return false,
         };
+        // `@parallel(grain = G)`: the call passes ceil(n / G) chunk indices (see `par_grain`).
+        let chunks = par_grain::const_chunks(n, grain);
         // A captured array's bound ValueId IS its base pointer; a captured scalar's is its alloca
         // slot pointer. Both are pointer-shaped, so the env is a uniform pointer table. Scalars are
         // read-only inside the region (matcher-enforced), so sharing the slot is race-free.
@@ -13955,7 +14070,7 @@ impl FnLowerer<'_> {
         }
         let nv = self
             .builder
-            .build(MirType::I64, Op::ConstInt(n as i128, MirType::I64));
+            .build(MirType::I64, Op::ConstInt(chunks as i128, MirType::I64));
         let addr = self.builder.build(MirType::Ptr, Op::FuncAddr(par_sym));
         self.builder.build_void(Op::Call {
             func: pfor,
@@ -14010,6 +14125,18 @@ impl FnLowerer<'_> {
                 let base = fl.builder.build(MirType::Ptr, Op::Load(slot, MirType::Ptr));
                 fl.bind_slice(*sym, base, mty.clone(), *is_slice);
             }
+            // Grain > 1: map the runtime's chunk span back to iterations of the literal trip count.
+            let (start, end) = if grain > 1 {
+                let nc = fl
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(n as i128, MirType::I64));
+                let cc = fl
+                    .builder
+                    .build(MirType::I64, Op::ConstInt(chunks as i128, MirType::I64));
+                par_grain::emit_iteration_bounds(&mut fl.builder, start, end, nc, cc, grain)
+            } else {
+                (start, end)
+            };
             fl.lower_ranged_loop(hh, start, end, ity.clone(), body);
             if !fl.terminated {
                 fl.builder.ret(None);

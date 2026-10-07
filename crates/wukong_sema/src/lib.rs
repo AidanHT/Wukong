@@ -24,6 +24,7 @@
 //! and `const` is registered.
 
 mod attrs;
+pub use attrs::{parallel_grain, MAX_PARALLEL_GRAIN};
 mod dependency;
 mod layout;
 mod shape;

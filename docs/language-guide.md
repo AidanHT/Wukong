@@ -467,8 +467,16 @@ and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`).
 a consumer on a **function**: **`@parallel`** (✅), which makes its loop execute across CPU cores,
 **`@generic`** (✅), which opts the function out of the kernel recognizers (below), and **`@tile`** (✅),
 which strip-mines loops (below).
-Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern`, `@export`, and
-`@parallel`'s own `grain = …` argument — is parsed and discarded (🔵). `@tile` is consumed as loop
+`@parallel(grain = G)` (✅) is consumed too: each worker claims runs of at least `G` consecutive
+iterations of the function's parallel loop (whole-function or mid-function region), the knob an
+OpenMP `schedule(dynamic, G)` or a TBB grain size gives — useful when one iteration is too cheap to be
+worth a claim of its own. `@parallel` accepts nothing else: an unknown key (`@parallel(chunk = 4)`), a
+positional argument, a repeated `grain`, or a grain outside `1..=2^31` is **`E0306`**
+(`tests/fail/parallel_bad_grain.wk`), where the whole argument list used to be silently discarded. The
+grain changes scheduling only, never results (`tests/run/parallel_grain.wk` prints every lane at grains
+that do not divide the trip count).
+Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern` and `@export` — is
+parsed and discarded (🔵). `@tile` is consumed as loop
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
 *discarded* attribute on a statement or loop is dropped there too:
 `@parallel` must sit on the function, and the mid-function parallel region is derived from the enclosing function's
@@ -789,7 +797,17 @@ body. It declines — and the loop lowers serially — for a loop-carried accumu
 captured scalar), a non-affine or offset index, a local bound to a slice/pointer/reference (it might
 alias a capture), a call other than a pure math intrinsic (`print` would reorder output), a
 `match`/`loop` expression in the body, a `return`/`defer`, and a labelled or loop-level
-`break`/`continue`. At most 32 such regions are outlined per program; further ones stay serial.
+`break`/`continue`. There is no cap on the number of regions per program (the compiler used to keep
+every region past the 32nd serial, silently).
+
+**How many threads, and when they are used.** The workers are one pool per process, sized to the
+CPUs the process may use (affinity mask and container quota respected) — or to `--threads=<n>` for a
+`wukongc --run`/`--train`, or `WUKONG_NUM_THREADS=<n>` for any process, including a built executable.
+On a machine whose cores carry SMT siblings the pool has one worker per *physical* core. A region whose
+trip count fits one grain runs once without a fork, and the runtime's multicore kernels
+(`wukong_*_parallel`) split only when the work — rows × columns × a per-element cost — can repay the
+fork (`WUKONG_PAR_MIN_WORK` moves that threshold); below it they run their serial twin. Every one of
+those choices is scheduling only: the output is bit-identical at every thread count.
 
 ## File I/O ✅
 

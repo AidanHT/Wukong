@@ -1,0 +1,65 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 0
+// EXPECT-OUT: 2
+// EXPECT-OUT: 9
+// EXPECT-OUT: 15
+// EXPECT-OUT: 23
+// EXPECT-OUT: 36
+// EXPECT-OUT: 48
+// EXPECT-OUT: 62
+// EXPECT-OUT: 81
+// EXPECT-OUT: 99
+// EXPECT-OUT: 0
+// EXPECT-OUT: 7
+// EXPECT-OUT: 29
+// EXPECT-OUT: 48
+// EXPECT-OUT: 73
+// EXPECT-OUT: 113
+// EXPECT-OUT: 150
+// EXPECT-OUT: 193
+// EXPECT-OUT: 251
+// EXPECT-OUT: 306
+module tests.run.parallel_grain
+
+// `@parallel(grain = G)` is consumed, not discarded: the outlined loop is handed to
+// `wukong_parallel_for` as ceil(n / G) CHUNK indices, and the outlined body maps the chunk span
+// [s, e) it receives back to the iterations [s*G, e >= chunks ? n : e*G). Both outliner forms are
+// here, each with a trip count the grain does NOT divide, so the short last chunk is exercised:
+//
+//   * `main`'s mid-function region: 10 iterations at grain 4 -> 3 chunks [0,4) [4,8) [8,10);
+//   * `scale`, a whole-function outline: 10 iterations at grain 3 -> 4 chunks [0,3) [3,6) [6,9)
+//     [9,10), with the trip count passed to the body through the env.
+//
+// A mapping that drops or repeats an iteration leaves a zero or a wrong lane, so every lane of both
+// arrays is printed (never a sum). Integers, so no f32 vector recipe claims a loop first and the
+// comparison is exact. Expected values are the scalar semantics, computed by hand: with v = i + 1,
+// a[i] = v*v - (v % 3), and b[i] = 3*a[i] + i.
+//
+// `--emit=mir -O2` shows two `wukong_parallel_for` calls (main's region, and `scale`'s wrapper,
+// which -O2 may inline into main); the region call's trip-count operand is the constant 3.
+
+@parallel(grain = 3)
+fn scale(a: [i64; 10], mut out: [i64; 10]) {
+    for i in 0..10 {
+        out[i] = a[i] * 3 + (i as i64);
+    }
+}
+
+@parallel(grain = 4)
+fn main() -> i32 {
+    let mut a: [i64; 10] = [0; 10];
+    let mut b: [i64; 10] = [0; 10];
+    for i in 0..10 {
+        let v = (i as i64) + 1;
+        a[i] = v * v - (v % 3);
+    }
+    scale(a, b);
+    for i in 0..10 {
+        print(a[i]);
+    }
+    for i in 0..10 {
+        print(b[i]);
+    }
+    return 0;
+}

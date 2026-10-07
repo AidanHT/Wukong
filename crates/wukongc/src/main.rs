@@ -34,6 +34,9 @@ OPTIONS:
     -o <path>          Write the artifact to <path>. Only --emit=obj and --emit=exe write a
                        file; every other stage prints its artifact on stdout.
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
+    --threads=<n>      Worker threads for @parallel regions and _parallel kernels in this run
+                       (1..=4096; default: every usable CPU). Sets WUKONG_NUM_THREADS for --run
+                       and --train; a built executable reads WUKONG_NUM_THREADS at startup.
     --color=<when>     Colorize diagnostics: auto, always, never  (default: auto)
     --error-format=<f> Diagnostic output format: human, json  (default: human)
     --explain <CODE>   Print the extended explanation for an error code, then exit
@@ -47,7 +50,19 @@ EXAMPLES:
 ";
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--threads` configures the runtime this process links (the interpreter and the JIT call the
+    // same `wukong_runtime` pools), so it is applied here, before any thread exists, rather than
+    // carried through the driver's `Options`.
+    match take_threads(&mut args) {
+        Ok(Some(n)) => std::env::set_var("WUKONG_NUM_THREADS", n.to_string()),
+        Ok(None) => {}
+        Err(msg) => {
+            eprintln!("error: {msg}\n");
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    }
     match parse_args(&args) {
         Ok(Some(opts)) => ExitCode::from(run_compile(opts) as u8),
         Ok(None) => ExitCode::SUCCESS,
@@ -89,6 +104,33 @@ fn print_explanation(code: &str) -> Result<(), String> {
         None => Err(format!(
             "unknown error code `{code}`. Run `wukongc --explain E0502` for an example."
         )),
+    }
+}
+
+/// Remove every `--threads=<n>` from `args` and return the last one's value: a positive decimal no
+/// larger than 4096 (the runtime's own bound on `WUKONG_NUM_THREADS`), else a usage error.
+fn take_threads(args: &mut Vec<String>) -> Result<Option<usize>, String> {
+    let mut threads = None;
+    let mut err = None;
+    args.retain(|a| {
+        let Some(v) = a.strip_prefix("--threads=") else {
+            return true;
+        };
+        match v.parse::<usize>() {
+            Ok(n) if (1..=4096).contains(&n) && v.bytes().all(|b| b.is_ascii_digit()) => {
+                threads = Some(n)
+            }
+            _ => {
+                err.get_or_insert_with(|| {
+                    format!("--threads expects an integer from 1 to 4096, got `{v}`")
+                });
+            }
+        }
+        false
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(threads),
     }
 }
 
@@ -311,5 +353,29 @@ mod tests {
                 .verify_each
         );
         assert!(USAGE.contains("--verify-each"));
+    }
+
+    #[test]
+    fn threads_flag_is_validated_and_removed() {
+        let mut args = ["--run", "--threads=8", "input.wk"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(take_threads(&mut args), Ok(Some(8)));
+        assert_eq!(args, ["--run", "input.wk"]);
+        // The remaining argv parses as if the flag had never been there.
+        assert!(parse_args(&args).unwrap().unwrap().run);
+        let mut none = ["input.wk"].map(str::to_owned).to_vec();
+        assert_eq!(take_threads(&mut none), Ok(None));
+        for bad in [
+            "--threads=0",
+            "--threads=",
+            "--threads=-2",
+            "--threads=+2",
+            "--threads=4097",
+        ] {
+            let mut args = [bad, "input.wk"].map(str::to_owned).to_vec();
+            assert!(take_threads(&mut args).is_err(), "{bad}");
+        }
+        assert!(USAGE.contains("--threads=<n>"));
     }
 }
