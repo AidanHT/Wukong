@@ -25,7 +25,8 @@
 //! * the location is written in the loop, every access to it moves one scalar type (an integer,
 //!   `f32` or `f64` — not a pointer, which mem2reg would not promote back, nor `bf16`/`f16`, which
 //!   round on their way through memory), and no other access in the loop may alias it, nor any call
-//!   unless the location is a stack slot no callee can name;
+//!   unless the location is a stack slot no callee can name; it is not in a `.shared` slot, which
+//!   every thread of the block can see;
 //! * the **preheader load** reads nothing the program would not have read (LICM's condition 3): the
 //!   location is a dereferenceable stack slot, or it is accessed in the header, or it is accessed in
 //!   a block that runs on every iteration, in which case the load (and the exit store) go through
@@ -72,6 +73,23 @@ impl Pass for Promote {
         if forest.is_empty() {
             return false;
         }
+        // `.shared` slots are visible to every thread of the block: a write-back there is a store
+        // another thread can observe, so they are never promoted.
+        let shared: FxHashSet<u32> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match (i.result, &i.op) {
+                (
+                    Some(r),
+                    Op::Alloca {
+                        space: AddrSpace::Shared,
+                        ..
+                    },
+                ) => Some(r.0),
+                _ => None,
+            })
+            .collect();
         let mut touched: Vec<LoopId> = Vec::new();
         let mut slots: Vec<Inst> = Vec::new();
         let mut dummies = Dummies::default();
@@ -80,7 +98,7 @@ impl Pass for Promote {
                 continue;
             }
             let l = forest.get(id);
-            let Some(plan) = plan_loop(f, l, &alias, idom, preds) else {
+            let Some(plan) = plan_loop(f, l, &alias, &shared, idom, preds) else {
                 continue;
             };
             rewrite(f, &plan, &mut slots, &mut dummies);
@@ -160,6 +178,7 @@ fn plan_loop(
     f: &Function,
     l: &NaturalLoop,
     alias: &AliasInfo,
+    shared: &FxHashSet<u32>,
     idom: &[u32],
     preds: &[Vec<u32>],
 ) -> Option<Plan> {
@@ -236,6 +255,9 @@ fn plan_loop(
             !mine.contains(&k)
                 && alias.may_alias_sized(addr, bytes, a.2, type_bytes(&a.3).unwrap_or(u32::MAX))
         });
+        if matches!(alias.prov(addr), Prov::Alloca(a) if shared.contains(&a.0)) {
+            continue;
+        }
         if clobbered || (mem.has_call && !alias.is_private_stack(addr)) {
             continue;
         }
