@@ -118,7 +118,7 @@ already did (`tests/run/binary_const_adapt.wk`); the folded value is still range
 `let v: i8 = 100 + 100` is rejected. A typed value must match its
 annotation exactly (see error `E0401`) — and for an aggregate that means the shape too: an array
 literal and an array **repeat** initializer must both supply exactly the annotated length, so
-`let a: [i32; 4] = [7; 2];` is `E0401`, not a slot silently filled out to 4. An unsuffixed literal
+`let a: [i32; 4] = [7; 2];` is `E0401`, not a slot silently filled out to 4. A repeat `[v; n]` evaluates `v` **once** and copies it into every slot, for an aggregate element too: `[make(); 3]` calls `make` once (`tests/run/array_repeat_aggregate_once.wk`). An unsuffixed literal
 that does not fit the type it adapts to
 is rejected (`E0401`, e.g. `let x: i8 = 200;`, or `s.x = 9000000000;` for an `i32` field), not
 silently wrapped. With **no** annotation an unsuffixed integer literal defaults to `i32`, but one that

@@ -5,6 +5,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Compile time: bounded aggregate lowering (`gap2/compile-time`)
+
+- **Fixed: `[agg; n]` evaluated its initializer once per element.** An array repeat whose element is
+  a struct, tuple, enum or nested array re-lowered the initializer for every slot, so `[make(); 3]`
+  called `make` three times on every backend and emitted `n` copies of its IR. It now evaluates once
+  and copies, like the scalar `[v; n]` (`tests/run/array_repeat_aggregate_once.wk`).
+- **Aggregate copies no longer unroll without bound in float-returning functions.** They were kept
+  straight-line in every `f32`/`f64` function for autodiff's single-block rule, so IR size grew with
+  array length. The unroll is now bounded (1 KiB per operation) and applies only when `--emit=grad`
+  or `--train` asks for a gradient (`LowerOptions::unroll_for_autodiff`).
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

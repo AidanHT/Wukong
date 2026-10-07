@@ -54,6 +54,19 @@ use wukong_types::Ty;
 /// operations; larger ones lower to a counted loop to keep the IR compact.
 const REPEAT_UNROLL_LIMIT: u32 = 8;
 
+/// The byte ceiling on an aggregate copy / zero-init / repeat-fill that a gradient candidate (a
+/// float-returning function lowered with [`LowerOptions::unroll_for_autodiff`]) still unrolls past
+/// [`REPEAT_UNROLL_LIMIT`]. Autodiff accepts only single-block functions, so a loop there would
+/// remove the candidate; but an unbounded unroll made IR size scale with array LENGTH rather than
+/// source size (`let b = a;` over a 64 Ki-element array emitted 64 Ki straight-line copies). A leaf
+/// is at least one byte, so this bounds the unrolled leaves of one operation (256 `f32`s); a larger
+/// aggregate lowers to the compact loop and autodiff reports its usual multi-block refusal.
+const AUTODIFF_UNROLL_MAX_BYTES: u64 = 1024;
+
+// `[agg; n]` lowering, kept beside the unroll policy it shares (declared here, not with the other
+// `mod`s above, so it does not collide with the modules other branches add there).
+mod repeat;
+
 // ===== Type-generic monomorphization =====
 //
 // A function generic over a TYPE parameter (`fn id<T>(x: T) -> T`) cannot be lowered once: its MIR
@@ -897,6 +910,14 @@ fn collect_field_bases_expr(e: &Expr, out: &mut Vec<(Symbol, Symbol)>) {
 /// parameter on a function with 20 call sites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LowerOptions {
+    /// Keep the aggregate copies, zero-inits and `[agg; n]` fills of every float-returning
+    /// function straight-line (up to [`AUTODIFF_UNROLL_MAX_BYTES`]) so it stays a single-block
+    /// autodiff candidate. `true` by default, because library callers lower a program and then hand
+    /// any float function to `wukong_autodiff::grad`. The driver clears it unless `--emit=grad` or
+    /// `--train` asked for a gradient: an ordinary compile has no autodiff consumer, and the
+    /// unrolled form only costs IR size there (the compact counted loop is the same computation).
+    pub unroll_for_autodiff: bool,
+
     /// Run the kernel recognizers (`true`, the default and the shipped behavior). When `false`,
     /// every `match_*` / whole-function kernel interception is skipped and the loop nest lowers as
     /// the user wrote it: scalar, or vectorized by the ordinary autovectorizer, with no
@@ -933,6 +954,7 @@ pub struct LowerOptions {
 impl Default for LowerOptions {
     fn default() -> LowerOptions {
         LowerOptions {
+            unroll_for_autodiff: true,
             recognize: true,
             vec_kernels: true,
         }
@@ -1170,6 +1192,7 @@ pub fn lower_program_with(
         rt_write_f64: interner.intern("wukong_rt_write_f64"),
         rt_write_i8: interner.intern("wukong_rt_write_i8"),
         now_ns: interner.intern("wukong_now_ns"),
+        unroll_for_autodiff: opts.unroll_for_autodiff,
     };
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
@@ -2505,7 +2528,7 @@ fn lower_fn(
 
     let mut fl = FnLowerer {
         builder: Builder::new(name, ret_mir.clone()),
-        preserve_aggregate_blocks: ret_mir.is_float(),
+        preserve_aggregate_blocks: ret_mir.is_float() && gemm.unroll_for_autodiff,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
         sema,
@@ -2791,7 +2814,7 @@ fn lower_parallel(
     let wrapper = {
         let mut fl = FnLowerer {
             builder: Builder::new(f.name.sym, ret_mir.clone()),
-            preserve_aggregate_blocks: ret_mir.is_float(),
+            preserve_aggregate_blocks: ret_mir.is_float() && gemm.unroll_for_autodiff,
             const_lengths: RefCell::default(),
             layout_error: Cell::new(false),
             sema,
@@ -3327,6 +3350,9 @@ struct GemmSyms {
     /// nanosecond clock for in-process benchmarking. No arguments; both backends read the same
     /// clock (the interpreter calls `wukong_runtime::wukong_now_ns` directly).
     now_ns: Symbol,
+    /// [`LowerOptions::unroll_for_autodiff`]. Rides here because this struct already reaches every
+    /// function-lowering entry point that builds an `FnLowerer` for a float-returning function.
+    unroll_for_autodiff: bool,
 }
 
 // Elementwise-math op codes — must match `wukong_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -3491,6 +3517,8 @@ struct FnLowerer<'a> {
     /// Autodiff currently accepts only single-block functions returning a float scalar. Keep
     /// aggregate operations unrolled in every such function so introducing copy/zero loops does
     /// not remove an existing gradient candidate, including callers of the public grad API.
+    /// Bounded by [`AUTODIFF_UNROLL_MAX_BYTES`] and scoped by [`LowerOptions::unroll_for_autodiff`];
+    /// read only through [`FnLowerer::unroll_aggregate`].
     preserve_aggregate_blocks: bool,
     sema: &'a SemaResult,
     /// Named initializer folds, keyed by their exact evaluation depth. This lowerer's semantic
@@ -4102,7 +4130,7 @@ impl FnLowerer<'_> {
                 } else {
                     self.lower_fill_loop(slot, elem, *n, z);
                 }
-            } else if *n <= REPEAT_UNROLL_LIMIT || self.preserve_aggregate_blocks {
+            } else if self.unroll_aggregate(*n as u64, Some(mir_byte_size(ty))) {
                 for i in 0..*n as i128 {
                     let ep = self.gep_elem(slot, elem, i);
                     self.zero_init(ep, elem);
@@ -4794,7 +4822,7 @@ impl FnLowerer<'_> {
             }
             Ty::Array { elem, len, .. } => {
                 let emir = self.mir_ty_of(elem);
-                if *len <= REPEAT_UNROLL_LIMIT as u64 || self.preserve_aggregate_blocks {
+                if self.unroll_aggregate(*len, self.ty_size(ty)) {
                     for i in 0..*len as i128 {
                         let s = self.gep_elem(src, &emir, i);
                         let d = self.gep_elem(dst, &emir, i);
@@ -4816,12 +4844,23 @@ impl FnLowerer<'_> {
         }
     }
 
+    /// Should an aggregate operation over `count` elements (`bytes` in total, `None` when the
+    /// layout is unknown) unroll to straight-line code rather than a counted loop? Small ones always
+    /// do ([`REPEAT_UNROLL_LIMIT`]); a gradient candidate also unrolls up to
+    /// [`AUTODIFF_UNROLL_MAX_BYTES`] so it stays single-block, and no further — past the bound the
+    /// IR would grow with the data's length instead of the source's.
+    fn unroll_aggregate(&self, count: u64, bytes: Option<u64>) -> bool {
+        count <= REPEAT_UNROLL_LIMIT as u64
+            || (self.preserve_aggregate_blocks
+                && bytes.is_some_and(|b| b <= AUTODIFF_UNROLL_MAX_BYTES))
+    }
+
     /// Copy `nbytes` from buffer `src` to buffer `dst` one byte (`i8`) at a time. Correct on both
     /// backends for a value whose field layout is unknown at copy time (a tagged union): a stride-1
     /// `i8` copy matches the interpreter's 1-slot-per-scalar memory (each `Load(off, i8)` returns the
     /// whole `Value` stored at that offset slot, `Store` writes it back) *and* native's byte memory.
     fn emit_copy_bytes(&mut self, dst: ValueId, src: ValueId, nbytes: u64) {
-        if nbytes <= REPEAT_UNROLL_LIMIT as u64 || self.preserve_aggregate_blocks {
+        if self.unroll_aggregate(nbytes, Some(nbytes)) {
             for k in 0..nbytes {
                 let s = self.field_ptr(src, k);
                 let d = self.field_ptr(dst, k);
@@ -18671,14 +18710,7 @@ impl FnLowerer<'_> {
             }
             ExprKind::ArrayRepeat { value, .. } => {
                 if aggregate {
-                    // `[agg; n]`: deep-copy the aggregate into every element slot. Re-emitting the
-                    // literal/copy per element is correct (each element owns its storage); the scalar
-                    // fill-loop path below does not apply.
-                    let ety = self.expr_ty(value);
-                    for i in 0..n as i128 {
-                        let ep = self.gep_elem(base, elem, i);
-                        self.init_field(ep, &ety, value);
-                    }
+                    self.lower_aggregate_repeat(base, elem, n, value);
                     return;
                 }
                 // `[value; n]` evaluates `value` once and fills every slot with it. Small arrays
@@ -26930,7 +26962,7 @@ fn lower_matmul_fn(
     let ret_mir = mir_ty(&ret_ty);
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
-        preserve_aggregate_blocks: ret_mir.is_float(),
+        preserve_aggregate_blocks: ret_mir.is_float() && gemm.unroll_for_autodiff,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
         sema,
@@ -29927,7 +29959,7 @@ fn lower_i8matmul_fn(
     let ret_mir = mir_ty(&ret_ty);
     let mut fl = FnLowerer {
         builder: Builder::new(f.name.sym, ret_mir.clone()),
-        preserve_aggregate_blocks: ret_mir.is_float(),
+        preserve_aggregate_blocks: ret_mir.is_float() && gemm.unroll_for_autodiff,
         const_lengths: RefCell::default(),
         layout_error: Cell::new(false),
         sema,

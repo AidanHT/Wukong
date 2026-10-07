@@ -1,0 +1,76 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 5
+// EXPECT-OUT: 5
+// EXPECT-OUT: 50
+// EXPECT-OUT: 5
+// EXPECT-OUT: 50
+// EXPECT-OUT: 5
+// EXPECT-OUT: 50
+// EXPECT-OUT: 7
+// EXPECT-OUT: 7
+// EXPECT-OUT: 70
+// EXPECT-OUT: 7
+// EXPECT-OUT: 70
+// EXPECT-OUT: 7
+// EXPECT-OUT: 70
+// EXPECT-OUT: 7
+// EXPECT-OUT: 1
+// EXPECT-OUT: 7
+// EXPECT-OUT: 70
+// EXPECT-OUT: 7
+// EXPECT-OUT: 70
+// EXPECT-OUT: 7
+// EXPECT-OUT: 70
+// EXPECT-OUT: 7
+// EXPECT-OUT: 70
+// EXPECT-OUT: 7
+// EXPECT-OUT: 70
+// EXPECT-OUT: 7
+// EXPECT-OUT: 70
+// EXPECT-OUT: 4
+// EXPECT-OUT: 40
+module tests.run.array_repeat_aggregate_once
+
+// `[agg; n]` with an aggregate element evaluates its initializer ONCE and deep-copies it into every
+// slot, as the scalar `[v; n]` always did. The lowering used to re-lower the initializer expression
+// per element, so `[mk(5); 3]` called `mk` three times (three "5" lines here) on every backend and
+// at every -O level -- invisible to the differential gates -- and emitted n copies of its IR with no
+// length bound. Expected values come from that rule: one print per repeat, then every element equal
+// to the single value `mk` built (`x = v`, `y = 10 * v`).
+//
+// The three repeats cover the three copy shapes: 3 elements (straight-line copies, <= 8), 10
+// elements (> 8: the compact copy loop) and a repeat plus a whole-array copy inside an f32-returning
+// function, which also used to unroll every aggregate copy without bound (kept single-block for
+// autodiff even when no gradient was requested).
+struct P { x: i32, y: i32 }
+
+fn mk(v: i32) -> P {
+    print(v);
+    return P { x: v, y: v * 10 };
+}
+
+fn last_y(v: i32) -> f32 {
+    let s: [P; 10] = [mk(v); 10];
+    let t = s;
+    return t[9].y as f32;
+}
+
+fn main() -> i32 {
+    let a: [P; 3] = [mk(5); 3];
+    for i in 0..3 {
+        print(a[i].x);
+        print(a[i].y);
+    }
+
+    let mut b: [P; 10] = [mk(7); 10];
+    b[3].y = 1; // every element owns its storage: only element 3 changes
+    for i in 0..10 {
+        print(b[i].x);
+        print(b[i].y);
+    }
+
+    let r: f32 = last_y(4);
+    print(r as i32);
+    return 0;
+}

@@ -74,6 +74,7 @@ fn lower(source: &str, vec_kernels: bool) -> (Program, Interner) {
         wukong_mir_build::LowerOptions {
             recognize: false,
             vec_kernels,
+            ..Default::default()
         },
     );
     assert!(diagnostics.is_empty(), "{diagnostics:?}");

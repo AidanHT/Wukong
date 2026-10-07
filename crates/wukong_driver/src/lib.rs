@@ -237,6 +237,9 @@ fn no_recognize() -> bool {
 /// ever found miscompiled. This option is the *other* conjunct of the same gate.
 fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
     wukong_mir_build::LowerOptions {
+        // Only a gradient request has an autodiff consumer for single-block float functions; every
+        // other compile gets the compact copy loops (see `LowerOptions::unroll_for_autodiff`).
+        unroll_for_autodiff: opts.emit == EmitStage::Grad || opts.grad.train,
         recognize: !no_recognize(),
         vec_kernels: !matches!(opts.backend, BackendKind::GpuLower),
     }
