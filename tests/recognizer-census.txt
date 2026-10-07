@@ -35,6 +35,7 @@ array_of_struct.wk:
 array_of_tuple.wk:
 assert.wk:
 assert_fail.wk:
+assert_fail_trailing_output.wk:
 atan.wk: wukong_vmath_f32
 atan2_hypot.wk: wukong_vmath2_f32
 attention.wk: wukong_norm_f32 wukong_sgemm wukong_sgemm_nt
@@ -283,6 +284,7 @@ parallel_region_alias.wk:
 parallel_region_decline.wk: wukong_velem_f32_parallel
 parallel_region_reassigned_local.wk: veckernel*2
 pointer.wk:
+pointer_null_condition.wk:
 pool2d_partial_window.wk:
 pow.wk:
 power.wk:
@@ -325,6 +327,9 @@ shift_width.wk:
 signed_cmp_highbit_fold.wk:
 silu_backward.wk: wukong_vmath2_f32
 slice_basics.wk:
+slice_bounds_in_range.wk:
+slice_bounds_negative.wk:
+slice_bounds_oob.wk:
 slice_destination_spellings.wk:
 slice_len_loop.wk:
 slice_param_kernel_base.wk: wukong_sgemm_nt
