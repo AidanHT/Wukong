@@ -12,6 +12,10 @@
 
 use crate::grad;
 use wukong_interp::run_kernel_f64;
+
+// The kernel-family and memory-model gates, each a submodule over the helpers below.
+mod kernels;
+mod memory;
 use wukong_mir::{BinOp, Builder, Function, MirType, Op, Program, ValueId};
 use wukong_span::{Interner, Symbol};
 
@@ -534,6 +538,8 @@ const VE_HADAMARD: i64 = 512;
 const VE_DIV: i64 = 1024;
 /// Not a real runtime mode: a high bit no rule claims, to pin that the dispatch fails closed.
 const VE_UNKNOWN_MODE: i64 = 1 << 12;
+/// Not a real velem activation (the runtime defines identity 0, ReLU 1, ReLU6 2).
+const VE_UNKNOWN_ACT: i64 = 3;
 /// `wukong_runtime::bias::BIAS_ACT_NONE` — the pure broadcast add, no fused activation.
 const BIAS_ACT_NONE: i64 = -1;
 
@@ -1854,10 +1860,10 @@ fn self_dot_sumsq_vjp() {
     tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
 }
 
-/// The scalar path (`diff_load`) ACCUMULATES into the gradient buffer (read-add-write) while the
-/// kernel path (`fill_buf` / `velem_scale` / `velem_affine`) OVERWRITES it. A loss that both reduces
-/// a `wrt` buffer with a recognized kernel AND reads one of its elements as a scalar therefore lost
-/// the scalar contribution: observed with the shipped release compiler on
+/// The scalar path (`diff_load`) ACCUMULATES into the gradient buffer (read-add-write) while a
+/// kernel rule writes its contribution. A loss that both reduces a `wrt` buffer with a recognized
+/// kernel AND reads one of its elements as a scalar therefore once lost the scalar contribution:
+/// observed with the shipped release compiler on
 ///
 /// ```wukong
 /// @parallel fn loss(x:[f32;8], mut out:[f32;1]) -> f32 {
@@ -1865,18 +1871,19 @@ fn self_dot_sumsq_vjp() {
 ///   let e: f32 = x[0]; let r: f32 = l + e; out[0] = r; return r; }
 /// ```
 ///
-/// which exited 0 emitting `grad[0] += 1` and then a broadcast `velem` fill of 1.0 over all 8
-/// elements that clobbered it — gradient [1,1,...] where the truth is [2,1,1,...]. `diff_load` now
-/// records the contribution, so `single()` sees the mix and declines instead of answering wrongly.
+/// which exited 0 emitting `grad[0] += 1` and then a broadcast fill of 1.0 over all 8 elements that
+/// clobbered it — gradient [1,1,...] where the truth is [2,1,1,...]. An interim guard refused the mix;
+/// with gradient accumulation (`Vjp::begin`/`end`) the reduction's contribution is now ADDED to the
+/// scalar one, so the shape differentiates — and must come out exactly [2, 1, ..., 1].
 #[test]
-fn scalar_load_plus_kernel_reduction_declines_loudly() {
+fn scalar_load_plus_kernel_reduction_accumulates() {
     let n = 8;
     let mut it = Interner::default();
     let sreduce = sym(&mut it, "wukong_sreduce_f32");
     let mut b = Builder::new(sym(&mut it, "mixfwd"), MirType::Void);
     let x = b.add_param(PTR);
     let out = b.add_param(PTR);
-    // l = Σ x   (kernel path: an overwriting broadcast fill in the backward)
+    // l = Σ x   (kernel path: a broadcast fill in the backward)
     let (nv, sumop) = (ci(&mut b, n as i64), ci(&mut b, RED_SUM));
     let l = b.build(
         MirType::F32,
@@ -1890,14 +1897,19 @@ fn scalar_load_plus_kernel_reduction_declines_loudly() {
     let r = b.build(MirType::F32, Op::Bin(BinOp::FAdd, l, e));
     b.build_void(Op::Store { ptr: out, value: r });
     b.ret(Some(r));
-    let fwd = b.finish();
-
-    let err = grad(&fwd, &[0], &mut it)
-        .expect_err("a mixed scalar+kernel contribution must not be silently clobbered");
-    assert!(
-        err.contains("multiple gradient contributions"),
-        "the decline must be the accumulation error, got: {err}"
-    );
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![n, 1],
+        loss_out: 1,
+    };
+    let mut seed = 0x5C1Au64;
+    let xb = rand_vec(&mut seed, n);
+    let mut dx = vec![1.0; n];
+    dx[0] = 2.0;
+    let inputs = vec![xb, vec![0.0]];
+    let g = tape_gate(&fwd, &[0], &inputs, &[dx.clone()], &mut it);
+    // Exact: both contributions are 1.0, so the sum is representable bit for bit.
+    assert_close(&g[0], &dx, "d(sum(x) + x[0])/dx");
 }
 
 /// `is_kernel` recognizes a call by SYMBOL NAME alone, but every VJP rule indexes the forward
@@ -1943,9 +1955,8 @@ fn kernel_call_with_wrong_arity_declines_loudly() {
 }
 
 /// A scalar element write into a buffer that a downstream recognized kernel then REDUCES is on the
-/// gradient path, but the reverse walk has no VJP rule for read-after-write through memory. It used
-/// to be skipped as "the loss sink", which made the whole reverse pass contribute nothing: observed
-/// with the shipped release compiler on
+/// gradient path. It used to be skipped as "the loss sink", which made the whole reverse pass
+/// contribute nothing: observed with the shipped release compiler on
 ///
 /// ```wukong
 /// @parallel fn loss(x:[f32;8], mut out:[f32;1]) -> f32 {
@@ -1955,10 +1966,11 @@ fn kernel_call_with_wrong_arity_declines_loudly() {
 ///   out[0] = l; return l; }
 /// ```
 ///
-/// `--emit=grad` exited 0 with no diagnostic and never stored to the appended gradient parameter at
-/// all — an all-zero gradient for every x, where the truth is `[2*x[0], 0, ...]`. It must refuse.
+/// — an all-zero gradient at exit 0. An interim guard refused the store; the memory adjoint rule
+/// (`Vjp::diff_store`) now differentiates it: the slot's adjoint flows to the stored value and the
+/// slot's own adjoint is zeroed, so `dL/dx = [2·x[0], 0, ..., 0]`.
 #[test]
-fn store_into_live_gradient_buffer_declines_loudly() {
+fn store_into_reduced_buffer_differentiates() {
     let n = 8;
     let mut it = Interner::default();
     let sreduce = sym(&mut it, "wukong_sreduce_f32");
@@ -1966,7 +1978,20 @@ fn store_into_live_gradient_buffer_declines_loudly() {
     let x = b.add_param(PTR);
     let out = b.add_param(PTR);
     let h = b.alloca(arr(n));
-    // h[0] = x[0] * x[0]   (a scalar write into the buffer the reduction below reads)
+    // h = 0 (the zero-init the `[0.0; 8]` literal lowers to), then h[0] = x[0] * x[0].
+    for i in 0..n {
+        let iv = ci(&mut b, i as i64);
+        let hp = b.build(
+            PTR,
+            Op::Gep {
+                ptr: h,
+                index: iv,
+                elem: MirType::F32,
+            },
+        );
+        let z = cf(&mut b, 0.0);
+        b.build_void(Op::Store { ptr: hp, value: z });
+    }
     let x0 = b.build(MirType::F32, Op::Load(x, MirType::F32));
     let sq = b.build(MirType::F32, Op::Bin(BinOp::FMul, x0, x0));
     b.build_void(Op::Store { ptr: h, value: sq });
@@ -1984,14 +2009,17 @@ fn store_into_live_gradient_buffer_declines_loudly() {
         value: loss,
     });
     b.ret(Some(loss));
-    let fwd = b.finish();
-
-    let err = grad(&fwd, &[0], &mut it)
-        .expect_err("a store feeding a reduced buffer must not silently zero the gradient");
-    assert!(
-        err.contains("store into buffer") && err.contains("no VJP rule"),
-        "the decline must be the loud store error, got: {err}"
-    );
+    let fwd = Fwd {
+        func: b.finish(),
+        lens: vec![n, 1],
+        loss_out: 1,
+    };
+    let mut seed = 0x570Eu64;
+    let xb = rand_vec(&mut seed, n);
+    let mut dx = vec![0.0; n];
+    dx[0] = 2.0 * xb[0] as f64;
+    let inputs = vec![xb, vec![0.0]];
+    tape_gate(&fwd, &[0], &inputs, &[dx], &mut it);
 }
 
 /// The autovectorizer's `Op::VecKernelCall` is void and writes through buffer pointers, exactly like
@@ -2107,16 +2135,15 @@ fn coef_vec(n: usize) -> Vec<f32> {
 /// nonlinear kernel: for `loss = Σ x[i]·y[i]` that emitted a gradient of 1.0 everywhere instead of
 /// `y[i]`, with no diagnostic. Hadamard and quotient now have their own real rules (gated by
 /// [`velem_hadamard_vjp`] / [`velem_div_vjp`], which would fail loudly if the affine rule were ever
-/// applied to them again), so what this pins is the remaining half of the contract: the dispatch
-/// splits the activation byte from the compute mode and **fails closed** on everything it does not
-/// have a rule for — a fused activation on either form, and any unknown high-bit mode.
+/// applied to them again), and the fused ReLU / ReLU6 activations have theirs (`kernels.rs`), so
+/// what this pins is the remaining half of the contract: the dispatch splits the activation byte
+/// from the compute mode and **fails closed** on everything it does not have a rule for — an
+/// unknown activation byte, and any unknown high-bit mode.
 #[test]
 fn velem_compute_modes_decline_loudly() {
     for (op, needle) in [
-        // A fused activation on the affine form: `relu(a·x + b·y + c)` needs a masked loop.
-        (VE_RELU | VE_USE_Y, "activation"),
-        // ...and on the Hadamard form: `relu(x · y)`.
-        (VE_RELU | VE_HADAMARD, "activation"),
+        // An activation byte no velem activation uses (0 = identity, 1 = ReLU, 2 = ReLU6).
+        (VE_UNKNOWN_ACT | VE_USE_Y, "activation"),
         // An unknown compute mode above the activation byte must NOT fall into any existing rule.
         (VE_UNKNOWN_MODE | VE_USE_Y, "compute mode"),
     ] {
@@ -2390,20 +2417,29 @@ fn kernel_output_read_by_scalar_load() {
 }
 
 /// The sibling shape: the kernel's output buffer is a parameter that is NOT in the differentiated
-/// set. `diff_load` then has nowhere to put the adjoint, and a parameter carries no element count
-/// to size a scratch gradient from — so dropping it silently zeroes the kernel's inputs, exactly as
-/// above. It must refuse instead, naming the buffer and the fix.
+/// set. A parameter carries no element count to size a gradient from, so dropping its adjoint used to
+/// silently zero the kernel's inputs, and then refused. The writer's extent sizes it now: the
+/// adjoint lives in a heap scratch and `dL/dw` still reaches the kernel's input — the same closed
+/// form as [`kernel_output_read_by_scalar_load`], with only `w` requested.
 #[test]
-fn kernel_output_scalar_load_without_wrt_declines_loudly() {
+fn kernel_output_scalar_load_without_wrt_still_reaches_inputs() {
     const N: usize = 4;
     let mut it = Interner::default();
     let fwd = build_kernel_out_scalar_load(&mut it, N, VM_EXP);
-    let err = grad(&fwd.func, &[0], &mut it)
-        .expect_err("a dropped kernel-output adjoint must not silently zero the gradient");
-    assert!(
-        err.contains("recognized kernel") && err.contains("wrt"),
-        "the decline must name the cause and the fix, got: {err}"
-    );
+    let mut seed = 0x4005u64;
+    let wb = rand_vec(&mut seed, N);
+    let vb = coef_vec(N);
+    let inputs = vec![wb.clone(), vec![0.0f32; N], vb.clone(), vec![0.0]];
+    let want_dw: Vec<f64> = (0..N)
+        .map(|i| {
+            if i < 2 {
+                vb[i] as f64 * (wb[i] as f64).exp()
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    tape_gate(&fwd, &[0], &inputs, &[want_dw], &mut it);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2547,19 +2583,46 @@ fn linear_bias_sum_vjp() {
 }
 
 /// A *fused* activation inside the bias kernel (the `act(x.W^T + b)` epilogue the recognizer folds)
-/// has no rule: the masked derivative is not what `dx = dout` computes. It must refuse rather than
-/// let a performance fusion silently change the gradient.
+/// used to refuse. It now recomputes the pre-activation `z = p + b` with the same kernel and the
+/// pure-add op, and takes the activation backward: for ReLU, `dz = G·[z > 0]`, then `dx`/`dW` are the
+/// matmul adjoints of `dz` and `db = colsum(dz)`. Data keeps every `z` clear of the kink, with both
+/// signs present, so the mask is exercised and the finite difference is valid.
 #[test]
-fn bias_fused_activation_declines_loudly() {
+fn bias_fused_relu_vjp() {
     let (m, k, n) = (3, 4, 2);
     let mut it = Interner::default();
     let fwd = build_linear_bias(&mut it, m, k, n, VM_RELU);
-    let err = grad(&fwd.func, &[0, 1, 2], &mut it)
-        .expect_err("a fused bias activation must not take the pure-add VJP");
-    assert!(
-        err.contains("wukong_bias_bcast_f32") && err.contains("fused activation"),
-        "the decline must name the kernel and the fused activation, got: {err}"
-    );
+    let mut seed = 0xB1A6u64;
+    let (xb, wb, bb) = loop {
+        let xb = rand_vec(&mut seed, m * k);
+        let wb = rand_vec(&mut seed, n * k);
+        let bb = rand_vec(&mut seed, n);
+        let p = matmul_nt_f64(&xb, &wb, m, k, n);
+        let z: Vec<f64> = (0..m * n).map(|i| p[i] + bb[i % n] as f64).collect();
+        if z.iter().all(|&v| v.abs() > 0.15)
+            && z.iter().any(|&v| v > 0.0)
+            && z.iter().any(|&v| v < 0.0)
+        {
+            break (xb, wb, bb);
+        }
+    };
+    let gb = rand_vec(&mut seed, m * n);
+    let p = matmul_nt_f64(&xb, &wb, m, k, n);
+    let dz: Vec<f64> = (0..m * n)
+        .map(|i| {
+            if p[i] + bb[i % n] as f64 > 0.0 {
+                gb[i] as f64
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let (dx, dw) = matmul_nt_backward(&dz, &xb, &wb, m, k, n);
+    let db: Vec<f64> = (0..n)
+        .map(|j| (0..m).map(|i| dz[i * n + j]).sum())
+        .collect();
+    let inputs = vec![xb, wb, bb, gb, vec![0.0]];
+    tape_gate(&fwd, &[0, 1, 2], &inputs, &[dx, dw, db], &mut it);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3081,17 +3144,19 @@ fn vmath_algebraic_activation_vjps() {
     }
 }
 
-/// The activations whose derivative needs a transcendental no closed form in `x` or `y` supplies
-/// (mish, erf, sin/cos, cosh, logsigmoid) must still DECLINE, naming the op — a guessed rule for
-/// one of those is exactly the wrong-but-plausible gradient this crate exists to prevent.
+/// Every one of the runtime's 36 activation codes now has a rule (the transcendental-derivative ones
+/// — mish, erf, sin/cos, cosh, logsigmoid — are composed from the forward kernels, see
+/// `kernels.rs`), so what must still DECLINE, naming the code, is an op code outside the table: a
+/// guessed rule for an unknown activation is exactly the wrong-but-plausible gradient this crate
+/// exists to prevent.
 #[test]
-fn transcendental_activation_backward_declines_loudly() {
+fn unknown_activation_code_declines_loudly() {
     let mut it = Interner::default();
-    let fwd = build_vmath_dot(&mut it, 4, VM_MISH);
+    let fwd = build_vmath_dot(&mut it, 4, 99);
     let err = grad(&fwd.func, &[0], &mut it)
-        .expect_err("an activation with no closed-form derivative must not be guessed");
+        .expect_err("an activation code outside the runtime table must not be guessed");
     assert!(
-        err.contains("no VJP for vmath op") && err.contains(&VM_MISH.to_string()),
+        err.contains("no VJP for vmath op") && err.contains("99"),
         "the decline must name the op code, got: {err}"
     );
 }
@@ -3244,9 +3309,8 @@ fn loss_sink_in_wrt_still_differentiates() {
 /// same pairing every kernel consumer rule keeps, whether it marks by calling `single()` or, in the
 /// two matmul rules, with a direct `contributed.insert` after the emit. A `buf_adj` seed with no
 /// `contributed` mark on the same buffer does not exist, and that is the invariant the refutation
-/// on the test below rests on. With the in-place guard deleted this shape does NOT read a clobbered
-/// `x`: it fails one line later in `single(x)`, naming the wrong cause. See
-/// `vmath_inplace_activation_declines_loudly` for why the guard is still worth having.
+/// on the test below rests on. See `vmath_inplace_activation_declines_loudly` for why the guard is
+/// load-bearing now that gradients accumulate.
 fn build_vmath_inplace(it: &mut Interner, n: usize, op: i64) -> Fwd {
     let vmath = it.intern("wukong_vmath_f32");
     let mut b = Builder::new(it.intern("vminpl"), MirType::Void);
@@ -3280,13 +3344,12 @@ fn build_vmath_inplace(it: &mut Interner, n: usize, op: i64) -> Fwd {
 
 /// An in-place activation must DECLINE, naming the aliasing.
 ///
-/// What this pins is the MESSAGE, and that is deliberate. Deleting the guard does not make this
-/// shape produce a wrong gradient: it makes it fail one line later in `single()` with "buffer v0
-/// receives multiple gradient contributions; accumulation is not yet supported for this op",
-/// because `buf_adj[out]` can only have been seeded by a consumer that also marked the buffer in
-/// `contributed`. So the aliased read was never reachable — but `single`'s message names the wrong
-/// cause and says in its own words that it is temporary, and the day accumulation lands it stops
-/// firing at all. The guard is what survives that.
+/// The guard used to be shadowed by `single()`'s "multiple gradient contributions; accumulation is
+/// not yet supported" refusal, which fired one line later because `buf_adj[out]` can only have been
+/// seeded by a consumer that also marked the buffer in `contributed`. Accumulation has landed
+/// (`Vjp::begin`/`end`), so that coincidental refusal is gone: without this guard the shape would
+/// now add a derivative that read `f(x)` for `x` into the output adjoint — a wrong gradient at exit
+/// 0. The guard is load-bearing.
 ///
 /// All the routes through `diff_vmath` are covered: the synthesized-loop arms that load `x`
 /// directly (log, hardsigmoid, leakyrelu) and the fused `wukong_vmath2_f32` arm, whose kernel takes
@@ -3407,14 +3470,14 @@ fn matmul_inplace_output_declines_loudly() {
 // float -> int -> float round trip.
 // ---------------------------------------------------------------------------------------------
 
-/// The stable centered variance needs a `cols`-wide scratch holding the row mean, and a MIR alloca
-/// takes a compile-time element count — so a LayerNorm whose `cols` is a symbolic generic dim
-/// (arriving as a hidden `i64` parameter) no longer differentiates, where the old cancelling
-/// `E[x^2] - mu^2` form did. That is a deliberate narrowing traded against a gradient that went NaN
-/// on residual-stream activations, and this pins that it is a NAMED refusal rather than a generic
-/// "kernel operand must be a compile-time constant".
+/// The LayerNorm backward is now the runtime's `wukong_layernorm_bwd_f32`, which recomputes the
+/// stable centered statistics itself and needs no scratch — so a LayerNorm whose `cols` is a
+/// symbolic generic dim (`f<M,N>`, where `cols` arrives as a hidden `i64` parameter) differentiates
+/// again, lifting the deliberate narrowing the synthesized centered-variance backward introduced
+/// (its `cols`-wide `alloca` needed a compile-time count). Pinned structurally: the emitted
+/// backward calls the kernel with the hidden parameter itself as its `cols` operand.
 #[test]
-fn layernorm_symbolic_cols_declines_loudly() {
+fn layernorm_symbolic_cols_rides_the_runtime_kernel() {
     let (rows, cols) = (2usize, 4usize);
     let mut it = Interner::default();
     let norm = sym(&mut it, "wukong_norm_f32");
@@ -3449,10 +3512,15 @@ fn layernorm_symbolic_cols_declines_loudly() {
     });
     b.ret(Some(loss));
     let fwd = b.finish();
-    let err = grad(&fwd, &[0], &mut it).expect_err("a symbolic LayerNorm width must decline");
+    let g = grad(&fwd, &[0], &mut it).expect("a symbolic LayerNorm width must differentiate");
+    let lnb = sym(&mut it, "wukong_layernorm_bwd_f32");
+    let cols_param = g.params[3];
+    let rides = g.blocks.iter().flat_map(|bb| &bb.insts).any(
+        |inst| matches!(&inst.op, Op::Call { func, args } if *func == lnb && args[5] == cols_param),
+    );
     assert!(
-        err.contains("compile-time-constant") && err.contains("cols"),
-        "the decline must name the requirement, got: {err}"
+        rides,
+        "the backward must call wukong_layernorm_bwd_f32 with the hidden cols parameter"
     );
 }
 

@@ -2583,6 +2583,22 @@ mod grad_cli_tests {
 
     // --- Activation backward: a `matmul → act → sum` model, act backward riding wukong_vmath2_f32. ---
 
+    /// The number of GEMM adjoint calls in printed gradient MIR. The forward GEMMs here are all the
+    /// `nn.Linear` spelling (`wukong_sgemm_nt*`), so every plain `wukong_sgemm*` and weight-gradient
+    /// `wukong_sgemm_tn*` call — serial, or `@parallel` when the forward was — is an adjoint: `dX`
+    /// rides the NN GEMM, `dW` the TN GEMM (no synthesized transpose).
+    fn gemm_adjoints(mir: &str) -> usize {
+        [
+            "wukong_sgemm(",
+            "wukong_sgemm_parallel(",
+            "wukong_sgemm_tn(",
+            "wukong_sgemm_tn_parallel(",
+        ]
+        .iter()
+        .map(|name| mir.matches(name).count())
+        .sum()
+    }
+
     /// The printed MIR of `{loss, loss_grad}` for the given source, so a test can assert the emitted
     /// backward rides a particular runtime kernel (the recognized backward is otherwise gate-blind).
     fn grad_mir(src: &str, of: &str, wrt: &[usize]) -> String {
@@ -2625,8 +2641,8 @@ mod grad_cli_tests {
                 "{act}: backward does not ride wukong_vmath2_f32\n{mir}"
             );
             assert!(
-                mir.contains("wukong_sgemm("),
-                "{act}: matmul backward does not ride wukong_sgemm\n{mir}"
+                gemm_adjoints(&mir) > 0,
+                "{act}: matmul backward does not ride the tuned GEMM\n{mir}"
             );
             // Data kept modest so the activations stay in a well-conditioned range for the difference.
             let mut seed = 0xE1F5u64 ^ (act.as_bytes()[0] as u64);
@@ -2823,7 +2839,7 @@ mod grad_cli_tests {
             "silu backward missing\n{mir}"
         );
         assert_eq!(
-            mir.matches("wukong_sgemm(").count(),
+            gemm_adjoints(&mir),
             3,
             "expected 3 GEMM adjoints (dW2, dA, dW1)\n{mir}"
         );
