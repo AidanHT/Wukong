@@ -71,6 +71,18 @@ const MC: usize = 144;
 const KC: usize = 384;
 const NC: usize = 4080;
 
+/// Upper bound on `m` for the 2D block-parallel grid's **skinny-M** rule — one row of C blocks, see
+/// [`select_2d_block_shape`]. This is a *policy* boundary, not a cache size: it answers "is A short
+/// enough that one L2-resident A stripe should serve every column block", a question measured at
+/// the transformer activation shapes (S ≤ 144). It equals [`MC`] only because both were tuned on
+/// the same 2 MiB-L2 part. Until 2026-10 the policy read `MC` itself, so retuning the A-panel cache
+/// block for a different L2 would also have reclassified, say, a 200-row GEMM as skinny and sent it
+/// down a single-block-row grid that was never measured there, while the policy test's
+/// `m <= MC` assertion stayed green with a silently changed meaning. Now `MC` means only the A-panel
+/// height and this constant is pinned by value in `select_2d_block_shape_policy`.
+#[cfg(target_arch = "x86_64")]
+const SKINNY_M_MAX: usize = 144;
+
 // Minimum multiply-accumulate count (`m·n·k`) before the parallel kernel is worth its threading
 // overhead. Was 2^26 (≈67M) when the only parallel grid was 3×nworkers slivers — 256³ (~17M) ran
 // faster serial then. The work-scaled shared-pack grid (few large blocks near the gate) moved the
@@ -1839,7 +1851,8 @@ const SKINNY_A_MAX_BYTES: usize = 8 << 20;
 ///   L2 is 2 MB (not hardcoded — the candidates are sized conservatively so they also fit the
 ///   E-core cluster's per-core share): the largest candidate (192, 256) packs at most
 ///   192·384·4 ≈ 288 KB of A + 256·384·4 ≈ 384 KB of B ≈ 672 KB.
-/// * **Skinny M** (`m ≤ MC = 144`): one row of blocks (`BM = round_up(m, MR)`) — a second row
+/// * **Skinny M** (`m ≤ SKINNY_M_MAX = 144`, a policy constant deliberately separate from the
+///   `MC` cache block): one row of blocks (`BM = round_up(m, MR)`) — a second row
 ///   would split the K reuse of an already-L2-resident A stripe for no locality gain — with `BN`
 ///   the largest NR multiple still yielding `~target_blocks/2` column blocks. The general
 ///   candidates mis-shape these: 128×768 output picked (24, 48) → a 6×16 grid whose blocks are
@@ -1887,7 +1900,7 @@ fn select_2d_block_shape(m: usize, n: usize, target_blocks: usize) -> (usize, us
     // across every block instead of one thin straggler that pays a whole task dispatch (and, under
     // dynamic scheduling, a whole claim) for a sliver of work.
     let rebalance = |d: usize, bd: usize, unit: usize| round_up(d.div_ceil(d.div_ceil(bd)), unit);
-    if m <= MC {
+    if m <= SKINNY_M_MAX {
         // Skinny M: nbi = 1; the largest NR-multiple BN with >= ~target/2 column blocks. Column
         // blocks alone must carry the load balance, so the divisor is halved (1.5× workers at the
         // callers' 3× budget). Floored at NR; capped at round_up(n, NR) (whole-matrix block).
@@ -3898,16 +3911,62 @@ mod tests {
         assert_within_derived_bound(&got, &want, &growth, m, k, n, None, "sgemm");
     }
 
+    /// The blocking-boundary shapes every reference test should reach, DERIVED from the tuning
+    /// constants rather than restating them. The 2026-07 bump from KC=256 to KC=384 silently
+    /// vacated every "the K loop blocks" claim in this file because the shapes were literals sized
+    /// against the old constant; a size written as `KC + 7` follows any retune instead.
+    /// [`assert_blocking_coverage`] is the other half: it fails if a retune (or an edit to a list)
+    /// leaves a regime unreached, instead of letting the coverage lapse quietly.
+    fn blocking_boundary_shapes() -> Vec<(usize, usize, usize)> {
+        vec![
+            (MR - 1, KC + 7, NR - 1),              // 2 K-blocks, a single partial tile
+            (2 * MR + 1, 2 * KC + 37, 2 * NR + 3), // 3 uneven K-blocks over full 6x16 tiles + edges
+            (MC + 1, 9, NC + NR + 3), // 2 MC blocks (ragged) x 2 NC blocks on the classic path
+            (MC + MR, KC + 5, 3 * NR + 1), // 2 MC blocks, 2 K-blocks, partial last column panel
+            (MC, KC, NR * 64),        // the single-row-block regime at its upper edge
+        ]
+    }
+
+    /// Fail loudly if `shapes` no longer reaches every blocking regime of the serial five-loop:
+    /// multiple (and uneven) K-blocks, a second ragged MC block, a second NC block on the classic
+    /// path, the `select_nc` L2-capped column split, full 6x16 tiles, and partial MR/NR edges.
+    fn assert_blocking_coverage(shapes: &[(usize, usize, usize)], what: &str) {
+        let k_blocks = |k: usize| k.div_ceil(select_kc(k).min(k));
+        let reaches = |pred: &dyn Fn(usize, usize, usize) -> bool| {
+            shapes.iter().any(|&(m, k, n)| pred(m, k, n))
+        };
+        let regimes: [(&str, &dyn Fn(usize, usize, usize) -> bool); 7] = [
+            ("three or more K-blocks", &|_, k, _| k_blocks(k) >= 3),
+            ("a ragged second MC block", &|m, _, _| {
+                m > MC && !m.is_multiple_of(MC)
+            }),
+            ("a second NC block on the classic path", &|m, _, n| {
+                m > MC && n > NC
+            }),
+            ("the L2-capped column split", &|m, k, n| {
+                m <= MC && select_nc(m, k, n) < n
+            }),
+            ("a full 6x16 tile", &|m, _, n| m >= MR && n >= NR),
+            ("a partial MR edge", &|m, _, _| !m.is_multiple_of(MR)),
+            ("a partial NR edge", &|_, _, n| !n.is_multiple_of(NR)),
+        ];
+        for (name, pred) in regimes {
+            assert!(
+                reaches(pred),
+                "{what}: no shape reaches {name} at MR={MR} NR={NR} MC={MC} KC={KC} NC={NC} - a \
+                 retune or an edit vacated this coverage"
+            );
+        }
+    }
+
     #[test]
     fn sgemm_matches_naive_various_sizes() {
-        // Sizes that exercise every MR=6 / NR=16 / MC=144 / KC=384 remainder, incl. 1-wide dims.
-        // The last two are DERIVED from `KC` so a retune cannot vacate them the way the 2026-07 bump
-        // from KC=256 to KC=384 vacated the `k = 300`/`257` "the K loop blocks" claims elsewhere in
-        // this file. Before them, every reference-checked GEMM shape in the crate had k <= 300 < KC,
-        // `select_kc` always returned k, and the multi-K-block accumulation path - the
-        // `beta_eff = 1.0` C readback and the `is_last_k` epilogue gate - was never compared against
-        // anything but itself.
-        for &(m, k, n) in &[
+        // Small literal sizes for the MR=6 / NR=16 remainders and 1-wide dims, then the derived
+        // blocking-boundary shapes. Before 2026-09-13 every reference-checked GEMM shape in the crate
+        // had k <= 300 < KC, `select_kc` always returned k, and the multi-K-block accumulation path -
+        // the `beta_eff = 1.0` C readback and the `is_last_k` epilogue gate - was never compared
+        // against anything but itself; before 2026-10 no serial shape crossed NC at all.
+        let mut shapes = vec![
             (1, 1, 1),
             (1, 256, 1),
             (5, 5, 5),
@@ -3920,15 +3979,70 @@ mod tests {
             (100, 100, 100),
             (128, 256, 512),
             (200, 200, 200),
-            (13, KC + 7, 19),      // 2 K-blocks
-            (40, 2 * KC + 37, 48), // 3 K-blocks, over full 6x16 tiles
             // Small m with n past the L2 column cap: `select_nc` splits these into several jc
-            // blocks (see the `select_nc_*` tests), a path no other size here reaches.
+            // blocks (see the `select_nc_*` tests).
             (12, 384, 1400),
             (6, 384, 1400),
             (145, 384, 1400), // m just OVER MC: must stay on the classic single-NC-block path
-        ] {
+        ];
+        shapes.extend(blocking_boundary_shapes());
+        assert_blocking_coverage(&shapes, "sgemm_matches_naive_various_sizes");
+        for &(m, k, n) in &shapes {
             check(m, k, n);
+        }
+    }
+
+    /// The `A·Bᵀ` and `Aᵀ·B` forms at the same derived blocking boundaries, against the f64
+    /// reference at the derived bound. The NT form drives the transposing B-packer across every
+    /// regime; the TN form drives the transposed-A packer (A stored `[k, m]`). Each must also equal
+    /// its own parallel entry bit-for-bit.
+    #[test]
+    fn sgemm_nt_and_tn_match_reference_at_blocking_boundaries() {
+        let shapes = blocking_boundary_shapes();
+        assert_blocking_coverage(
+            &shapes,
+            "sgemm_nt_and_tn_match_reference_at_blocking_boundaries",
+        );
+        for &(m, k, n) in &shapes {
+            let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+            // NT: B stored [n, k].
+            let a = fill(401, m * k);
+            let b = fill(402, n * k);
+            let (want, growth) = reference_f64(&a, &b, m, k, n, true);
+            let (mut got, mut got_par) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+            unsafe {
+                wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), mi, ki, ni, 0);
+                wukong_sgemm_nt_parallel(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    got_par.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
+            }
+            assert_within_derived_bound(&got, &want, &growth, m, k, n, None, "nt boundary");
+            assert_eq!(got, got_par, "nt serial vs parallel ({m}x{k}x{n})");
+            // TN: A stored [k, m], B stored [k, n].
+            let at = fill(403, k * m);
+            let bn = fill(404, k * n);
+            let (want, growth) = reference_tn_f64(&at, &bn, m, k, n);
+            let (mut got, mut got_par) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+            unsafe {
+                wukong_sgemm_tn(at.as_ptr(), bn.as_ptr(), got.as_mut_ptr(), mi, ki, ni, 0);
+                wukong_sgemm_tn_parallel(
+                    at.as_ptr(),
+                    bn.as_ptr(),
+                    got_par.as_mut_ptr(),
+                    mi,
+                    ki,
+                    ni,
+                    0,
+                );
+            }
+            assert_within_derived_bound(&got, &want, &growth, m, k, n, None, "tn boundary");
+            assert_eq!(got, got_par, "tn serial vs parallel ({m}x{k}x{n})");
         }
     }
 
@@ -5188,7 +5302,11 @@ mod tests {
     /// a policy retune shows up as a deliberate diff here.
     #[test]
     fn select_2d_block_shape_policy() {
-        for &m in &[13usize, 100, 128, 144, 214, 300, 512, 520, 1024, 2048] {
+        // The skinny-M boundary is its own policy constant, pinned BY VALUE here so a retune is a
+        // reviewed diff — and deliberately NOT `MC`: the A-panel cache block may move with the L2
+        // without reclassifying which GEMMs get a single block row.
+        assert_eq!(SKINNY_M_MAX, 144, "skinny-M policy boundary moved");
+        for &m in &[13usize, 100, 128, 144, 145, 214, 300, 512, 520, 1024, 2048] {
             for &n in &[96usize, 128, 530, 616, 768, 1024, 3072, 4200] {
                 for &target in &[1usize, 3, 12, 48, 96] {
                     let (bm, bn) = select_2d_block_shape(m, n, target);
@@ -5200,7 +5318,7 @@ mod tests {
                         bn >= NR && bn % NR == 0,
                         "BN {bn} not NR-aligned (m{m} n{n} t{target})"
                     );
-                    if m <= MC {
+                    if m <= SKINNY_M_MAX {
                         assert_eq!(
                             m.div_ceil(bm),
                             1,
