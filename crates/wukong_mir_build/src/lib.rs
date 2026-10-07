@@ -21648,8 +21648,11 @@ impl FnLowerer<'_> {
     }
 
     /// `hardsigmoid(x) = clamp(x+3, 0, 6)·(1/6)`. The clamp is `Cmp(Fogt)`/`Cmp(Folt)` + `Select`,
-    /// which matches the AVX2 `hardsigmoid8` (`max_ps`/`min_ps`) bit-for-bit (ordered compares are
-    /// false for NaN, so both return the bound).
+    /// which matches the AVX2 `hardsigmoid8` (`max_ps`/`min_ps`) bit-for-bit. Its ordered compares
+    /// are false on a NaN, so the clamp alone would map NaN to the bound `0`; a NaN input instead
+    /// selects `y = x + 3` (the input NaN, quieted), mirroring the runtime's `hardsigmoid1`/
+    /// `hardsigmoid8` — NaN in, NaN out. `Fone` is the unordered `!=` on every backend, so
+    /// `x != x` is the NaN test; a `Select` (not a bitcast) keeps the formula differentiable.
     fn emit_hardsigmoid(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let three = self.splat_const_f(3.0, rty);
         let y = self
@@ -21665,9 +21668,11 @@ impl FnLowerer<'_> {
             .builder
             .build(mask_ty(rty), Op::Cmp(CmpOp::Folt, lo, six));
         let hi = self.builder.build(rty.clone(), Op::Select(lt6, lo, six));
+        let isnan = self.builder.build(mask_ty(rty), Op::Cmp(CmpOp::Fone, x, x));
+        let h = self.builder.build(rty.clone(), Op::Select(isnan, y, hi));
         let inv6 = self.splat_const_f(1.0 / 6.0, rty);
         self.builder
-            .build(rty.clone(), Op::Bin(BinOp::FMul, hi, inv6))
+            .build(rty.clone(), Op::Bin(BinOp::FMul, h, inv6))
     }
 
     /// `hardswish(x) = x · hardsigmoid(x)`. Mirrors `hardswish8`.

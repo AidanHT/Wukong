@@ -16,6 +16,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   the exact contraction rule (the LEFT product of `a*b + c*d` is fused), the three reduction trees and
   why `@parallel` (or its silent decline) changes low-order bits, and why the 8,192-element reduction
   chunk is a numerical constant rather than a cache knob.
+- **Fixed: `hardsigmoid(NaN)` returned 0.** Its clamp's ordered compares turned a NaN into the
+  bound; the runtime kernel, its scalar twin and the inlined MIR now return the input NaN
+  (quieted), so every vmath op except the by-definition `relu` is NaN in, NaN out. The contract is
+  a per-op table in `wukong_runtime/src/vmath.rs`, asserted over all 36 op codes
+  (`vmath_every_op_returns_nan_for_nan`, `tests/run/hardsigmoid_nan.wk`). `softplus`'s scalar twin
+  no longer spells its ReLU `f32::max`, and the exhaustive log sweep gained a pass over every
+  positive subnormal.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
