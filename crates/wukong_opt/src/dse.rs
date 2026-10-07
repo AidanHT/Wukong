@@ -55,7 +55,7 @@ const MAX_PATH_QUERIES: usize = 4096;
 /// Most instructions all cross-block searches of one pass run may scan together. The pass runs on
 /// every fixpoint sweep, so its worst case has to stay linear-ish in the function, not in
 /// queries times blocks; an exhausted budget keeps every remaining store.
-const PATH_FUEL: u64 = 1 << 20;
+const PATH_FUEL: u64 = 1 << 18;
 
 /// Where a store writes, canonicalized so two spellings of one address meet.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
