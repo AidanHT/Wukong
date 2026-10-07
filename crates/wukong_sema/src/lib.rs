@@ -3049,6 +3049,13 @@ impl<'a> Sema<'a> {
             _ => None,
         };
         let payload_opt = resolved?; // not an enum → ordinary call
+
+        // `Enum::f(..)` naming no variant but a function of an `impl Enum` block (an associated
+        // function, or a method called with its receiver spelled as the first argument) is a
+        // method call, typed by `type_method_call` — not a misspelled variant.
+        if payload_opt.is_none() && self.methods.resolution.table.contains_key(&(ename, vname)) {
+            return None;
+        }
         let qual = format!("{}::{}", self.sym_str(ename), self.sym_str(vname));
         let Some(payload) = payload_opt else {
             for a in args {

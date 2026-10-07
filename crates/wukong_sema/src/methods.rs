@@ -75,6 +75,8 @@ impl MethodResolution {
 struct TraitMethod {
     name: Symbol,
     has_self: bool,
+    /// The receiver is `mut self` / `&mut self`: the call mutates the receiver in place.
+    mut_self: bool,
     /// The parameters after the receiver.
     params: Vec<Ty>,
     ret: Ty,
@@ -88,6 +90,8 @@ pub(crate) struct MethodState {
     traits: HashMap<Symbol, Vec<TraitMethod>>,
     /// The functions whose first parameter is the receiver `self`.
     receivers: HashSet<Symbol>,
+    /// The subset of `receivers` whose receiver is `mut self` / `&mut self`.
+    mut_receivers: HashSet<Symbol>,
     /// `(trait, type)` for every `impl Trait for Type`.
     impls: HashSet<(Symbol, Symbol)>,
     /// Each function's trait bounds: `(generic, traits)` in declaration order.
@@ -248,6 +252,9 @@ impl Sema<'_> {
                     .is_some_and(|p| Some(p.name.sym) == self_word)
                 {
                     self.methods.receivers.insert(f.name.sym);
+                    if f.params[0].mutable {
+                        self.methods.mut_receivers.insert(f.name.sym);
+                    }
                 }
             }
         }
@@ -316,6 +323,7 @@ impl Sema<'_> {
                 sigs.push(TraitMethod {
                     name: f.name.sym,
                     has_self,
+                    mut_self: has_self && f.params[0].mutable,
                     params,
                     ret,
                 });
@@ -711,9 +719,16 @@ impl Sema<'_> {
         };
         let method = name.sym;
 
-        // `Type::m(..)` / `T::m(..)`: a type (or type parameter) used as a namespace.
+        // `Type::m(..)` / `T::m(..)`: a type (or type parameter) used as a namespace. A top-level
+        // `const` is a value, so `ORIGIN.norm()` on a struct-typed const is a receiver call below.
         if let ExprKind::Path(p) = &base.kind {
-            if p.is_single() && self.lookup_local(p.first().sym).is_none() {
+            if p.is_single()
+                && self.lookup_local(p.first().sym).is_none()
+                && !matches!(
+                    self.defs.lookup(p.first().sym).map(|d| &d.kind),
+                    Some(DefKind::Const(_))
+                )
+            {
                 let tsym = p.first().sym;
                 if let Some(&target) = self.methods.resolution.table.get(&(tsym, method)) {
                     self.types.insert(base.id, Ty::Unknown);
@@ -785,6 +800,9 @@ impl Sema<'_> {
                 );
                 return Some(Ty::Error);
             }
+            if !deref && self.methods.mut_receivers.contains(&target) {
+                self.check_mut_receiver(base, method);
+            }
             let ret = self.type_resolved_method(
                 e,
                 callee,
@@ -846,6 +864,32 @@ impl Sema<'_> {
             format!("no method named `{m}` found for type `{t}`"),
         );
         Some(Ty::Error)
+    }
+
+    /// A `mut self` / `&mut self` method writes its receiver in place, and an aggregate receiver is
+    /// passed by reference — so calling one on a non-`mut` aggregate parameter (or a projection of
+    /// one) would mutate the caller's value through it: the same `E0304` an assignment `p.f = …`
+    /// through that parameter gets. A receiver reached through a dereference is a pointee and is
+    /// not this rule's concern.
+    fn check_mut_receiver(&mut self, recv: &Expr, method: Symbol) {
+        let Some(root) = self.assign_root_param(recv) else {
+            return;
+        };
+        if self.is_immutable_param(root) && self.param_is_aggregate(root) {
+            let (nm, m) = (
+                self.sym_str(root).to_string(),
+                self.sym_str(method).to_string(),
+            );
+            self.error(
+                recv.span,
+                "E0304",
+                format!(
+                    "cannot call the `mut self` method `{m}` on the non-`mut` parameter `{nm}`; an \
+                     aggregate parameter is passed by reference, so this would mutate the caller's \
+                     value — add `mut` to the parameter (`fn …(mut {nm}: …)`)"
+                ),
+            );
+        }
     }
 
     /// Type a call that resolved to the concrete function `target`, with `recv` the receiver's type
@@ -934,6 +978,9 @@ impl Sema<'_> {
             };
             self.error(callee.span, "E0315", format!("trait method `{m}` {how}"));
             return Ty::Error;
+        }
+        if let Some(r) = recv.filter(|_| tm.mut_self) {
+            self.check_mut_receiver(r, method);
         }
         // `T::m(..)` with no receiver is resolved per instantiation from the argument types, so
         // `T` must be the type of something the call's caller passes in.
@@ -1082,6 +1129,64 @@ mod tests {
         ))
         .contains(&"E0315"));
         assert!(codes("impl Nope { fn f() {} } fn main() -> i32 { return 0; }").contains(&"E0315"));
+    }
+
+    /// `Enum::f(..)` naming a function of an `impl Enum` block (not a variant) is an associated
+    /// function call, and `Enum::m(x)` a method called with its receiver spelled out; neither is the
+    /// `E0301` unknown-variant error the variant-constructor check would otherwise report.
+    #[test]
+    fn an_enum_associated_function_is_not_a_variant() {
+        let src = "enum Dir { N, S } \
+                   impl Dir { fn first() -> Self { return Dir::N; } \
+                              fn flip(self) -> Dir { return match self { Dir::N => Dir::S, \
+                              Dir::S => Dir::N }; } } \
+                   fn main() -> i32 { let d = Dir::flip(Dir::first()); \
+                                      let e = Dir::first().flip(); return 0; }";
+        let (errs, res, interner) = analyze(src);
+        assert!(errs.is_empty(), "{errs:?}");
+        let mut targets: Vec<String> = res
+            .calls
+            .values()
+            .map(|c| interner.resolve(c.target.expect("concrete")).to_string())
+            .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec!["Dir.first", "Dir.first", "Dir.flip", "Dir.flip"]
+        );
+        assert!(
+            codes("enum Dir { N, S } fn f() -> i32 { let d = Dir::W(); return 0; }")
+                .contains(&"E0301")
+        );
+    }
+
+    /// A method call on a struct-typed top-level `const` is a receiver call, not a namespace path.
+    #[test]
+    fn a_const_receiver_is_a_value() {
+        let src = format!(
+            "{VEC2} const O: Vec2 = Vec2 {{ x: 1.0, y: 2.0 }}; \
+             fn f() -> f32 {{ return O.dot(O); }}"
+        );
+        let (errs, res, _) = analyze(&src);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(res.calls.values().any(|c| c.receiver));
+    }
+
+    /// A `&mut self` method writes its receiver in place, so calling it on a non-`mut` aggregate
+    /// parameter would mutate the caller's value — `E0304`, like `v.x = …` through that parameter.
+    #[test]
+    fn a_mut_self_method_needs_a_mutable_aggregate_parameter() {
+        let immutable = format!("{VEC2} fn f(v: Vec2) {{ v.scale(2.0); }}");
+        assert!(
+            codes(&immutable).contains(&"E0304"),
+            "{:?}",
+            codes(&immutable)
+        );
+        let mutable = format!("{VEC2} fn f(mut v: Vec2) {{ v.scale(2.0); }}");
+        assert!(codes(&mutable).is_empty(), "{:?}", codes(&mutable));
+        // A read-only method on an immutable parameter is fine.
+        let read = format!("{VEC2} fn f(v: Vec2) -> f32 {{ return v.dot(v); }}");
+        assert!(codes(&read).is_empty(), "{:?}", codes(&read));
     }
 
     #[test]
