@@ -49,6 +49,10 @@ use std::time::{Duration, Instant};
 
 use wukong_span::{Interner, SourceId};
 
+// FIRST, and `#[macro_use]`: `section!` / `mismatch!` / `standing!` must be in textual scope before
+// any module or function below uses them.
+#[macro_use]
+mod numerics;
 mod compare;
 mod general;
 mod model;
@@ -345,7 +349,7 @@ fn bf16_relaxed_ratio(
     let Some(pm) = p else { return };
     if let Some(m) = wuk {
         let r = pm.ns_per_call / m.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong single-core is {:.2}x {} than {peer}",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" }
@@ -353,7 +357,7 @@ fn bf16_relaxed_ratio(
     }
     if let Some(mp) = wk_par {
         let r = pm.ns_per_call / mp.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong @parallel is {:.2}x {} than {peer}",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" }
@@ -368,7 +372,7 @@ fn bf16_relaxed_ratio(
 /// picks the word; these per-bench lines were the exception, and the exception only became visible
 /// once the corrected peers started beating Wukong on some rows.
 fn par_standing(peer: &str, r: f64) {
-    println!(
+    standing!(
         "  -> Wukong @parallel is {:.2}x {} than {peer}",
         if r >= 1.0 { r } else { 1.0 / r },
         if r >= 1.0 { "faster" } else { "slower" }
@@ -386,7 +390,7 @@ fn report_relaxed_ratio(
     let Some(pm) = p else { return };
     if let Some(m) = wuk {
         let r = pm.ns_per_call / m.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong single-core is {:.2}x {} than {peer}",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" }
@@ -394,7 +398,7 @@ fn report_relaxed_ratio(
     }
     if let Some(mp) = wk_par {
         let r = pm.ns_per_call / mp.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong @parallel is {:.2}x {} than {peer}",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" }
@@ -670,6 +674,9 @@ fn main() {
     // can never pool a multicore row into a single-threaded geomean either.
     let mut gen_ratios_c = Vec::new();
     let mut gen_par_ratios_c = Vec::new();
+    // Rows whose section the numerics gate marked SUSPECT: excluded from every geomean below, and
+    // named, so a summary can never quietly average a divergent row in.
+    let mut suspect_rows: Vec<&str> = Vec::new();
 
     for k in &kernels {
         if !want(k.name) {
@@ -703,7 +710,7 @@ fn main() {
             vml,
         } = bench_table_kernel(k, &cc, &dir, &mut out, xp, yp);
 
-        println!("=== {} ({}) ===", k.name, k.note);
+        section!("=== {} ({}) ===", k.name, k.note);
         report(k, &wukong, &c, &cpp, &rust, &cfast, &comp);
         // oneMKL VML peer for the transcendentals MKL ships a vector op for: the elementwise analogue
         // of the GEMM-vs-cblas comparison. Wukong's hand-AVX2 vmath vs Intel's hand-tuned VML, both
@@ -718,7 +725,7 @@ fn main() {
                 );
             } else {
                 let r = v.ns_per_call / m.ns_per_call; // >1 ⇒ Wukong faster
-                println!(
+                standing!(
                     "  -> Wukong vmath is {:.2}x {} than oneMKL VML (hand-tuned vector math), 1 thread",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" },
@@ -757,7 +764,9 @@ fn main() {
                         1e-3
                     };
                     if rel > bar {
-                        println!(
+                        // A numerical failure like any other: it withholds every standing in this
+                        // section, because which of the two lowerings is wrong is not known here.
+                        mismatch!(
                             "  !!! wk(gen) DIVERGES from the recognizer-on lowering at [{at}] \
                              (rel {rel:.2e}) — recognition-off column WITHHELD; a divergence \
                              between two lowerings of one source is a compiler defect"
@@ -769,7 +778,10 @@ fn main() {
                 }
                 None => true,
             };
-            if checked {
+            // A section the numerics gate has marked SUSPECT contributes to no geomean: its ratios
+            // were withheld on their own lines, and pooling them into a headline would publish
+            // exactly what the gate refused to.
+            if checked && !numerics::section_suspect() {
                 let dir = |r: f64| -> (f64, &'static str) {
                     if r >= 1.0 {
                         (r, "faster")
@@ -806,11 +818,17 @@ fn main() {
                 if let Some(f) = wk_floor {
                     line.push_str(&format!("; row floor {f:.2}x"));
                 }
-                println!("{line}");
+                // A ratio line like any other `->` standing: withheld if this row's section already
+                // reported a numerical mismatch.
+                standing!("{line}");
                 println!("     wk(gen) dispatch: {census}");
             }
         }
-        if let (Some(m), Some(c)) = (&wukong, &c) {
+        let suspect = numerics::section_suspect();
+        if suspect {
+            suspect_rows.push(k.name);
+        }
+        if let (false, Some(m), Some(c)) = (suspect, &wukong, &c) {
             let r = c.ns_per_call / m.ns_per_call; // >1 => Wukong faster
             if is_par {
                 par_ratios_c.push(r);
@@ -820,7 +838,7 @@ fn main() {
             }
             compile_ratios_c.push(c.compile.as_secs_f64() / m.compile.as_secs_f64());
         }
-        if let (Some(m), Some(cpp)) = (&wukong, &cpp) {
+        if let (false, Some(m), Some(cpp)) = (suspect, &wukong, &cpp) {
             let r = cpp.ns_per_call / m.ns_per_call; // >1 => Wukong faster
             if is_par {
                 par_ratios_cpp.push(r);
@@ -838,6 +856,13 @@ fn main() {
             if g >= 1.0 { "faster" } else { "slower" },
         )
     };
+    if !suspect_rows.is_empty() {
+        println!(
+            "  ! numerics gate: {} SUSPECT row(s) excluded from every geomean below: {}",
+            suspect_rows.len(),
+            suspect_rows.join(", ")
+        );
+    }
     if !runtime_ratios_c.is_empty() || !compile_ratios_c.is_empty() {
         println!("Summary vs C (geomean over kernels):");
         if !runtime_ratios_c.is_empty() {
@@ -1036,6 +1061,14 @@ fn main() {
         let rows = general::bench_general(&cc, cxx, &dir);
         println!();
         print_sota_scorecard(&rows);
+    }
+
+    // THE NUMERICS GATE (P8.3). Every section that printed a numerical mismatch has already had
+    // its standings withheld (see `numerics.rs`); this lists them and turns them into the exit
+    // code, so a campaign runner records the process as not clean rather than publishing it.
+    let code = numerics::finish();
+    if code != 0 {
+        std::process::exit(code);
     }
 }
 
@@ -1261,7 +1294,7 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
                 .map(|x| format!("{:.1}", flops / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!(
+        section!(
             "=== matmul_skinny {m}x{k} · ({n}x{k})ᵀ (nn.Linear NT; GFLOP/s, higher is better) ==="
         );
         // Build every column before the shared position-balanced rotation.
@@ -1353,7 +1386,7 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
         );
         if roof > 0.0 {
             if let Some(w) = &wuk {
-                println!(
+                standing!(
                     "  -> Wukong single-core = {:.0}% of measured roofline",
                     (flops / w.ns_per_call) / roof * 100.0
                 );
@@ -1368,7 +1401,7 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
                 .zip(&p.out)
                 .position(|(x, y)| x.to_bits() != y.to_bits())
             {
-                Some(at) => println!("  ! serial vs @parallel NOT bit-exact at [{at}]"),
+                Some(at) => mismatch!("  ! serial vs @parallel NOT bit-exact at [{at}]"),
                 None => println!("  cross-check Wukong serial vs @parallel: BIT-EXACT"),
             }
         }
@@ -1377,16 +1410,17 @@ fn bench_matmul_skinny(cc: &str, dir: &Path, roof: f64) {
         if let (Some(mm), Some(c2)) = (&wuk, &cm) {
             let (rel, at) = max_rel_err(&mm.out, &c2.out);
             if rel > 1e-3 {
-                println!(
+                mismatch!(
                     "  ! full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {rel:.2e})",
-                    mm.out[at], c2.out[at]
+                    mm.out[at],
+                    c2.out[at]
                 );
             }
         }
         report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
         if let (Some(mm), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / mm.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -1410,7 +1444,7 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     let (ap, bp) = (a.as_ptr(), b.as_ptr());
     let flops = 2.0 * (ns as f64).powi(3);
 
-    println!("=== matmul {ns}x{ns} (C=A·B, ikj order; GFLOP/s, higher is better) ===");
+    section!("=== matmul {ns}x{ns} (C=A·B, ikj order; GFLOP/s, higher is better) ===");
     let gflops = |m: &Option<Measure>| {
         m.as_ref()
             .map(|x| format!("{:.1}", flops / x.ns_per_call))
@@ -1536,15 +1570,17 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     if let (Some(m), Some(c)) = (&wuk, &cm) {
         let (rel, at) = max_rel_err(&m.out, &c.out);
         if rel > 1e-3 {
-            println!(
+            mismatch!(
                 "  ! full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
-                m.out[at], c.out[at], rel
+                m.out[at],
+                c.out[at],
+                rel
             );
         }
     }
     if let (Some(mp), Some(c)) = (&wk_par, &cm) {
         let r = flops / mp.ns_per_call / (flops / c.ns_per_call);
-        println!(
+        standing!(
             "  -> Wukong @parallel is {:.2}x {} than idiomatic single-threaded C",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" }
@@ -1552,7 +1588,7 @@ fn bench_matmul_size(cc: &str, dir: &Path, ns: usize, roof: f64) {
     }
     if let (Some(ms), Some(c)) = (&wuk, &cm) {
         let r = flops / ms.ns_per_call / (flops / c.ns_per_call);
-        println!(
+        standing!(
             "  -> Wukong single-core (SIMD) is {:.2}x {} than C single-threaded",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" }
@@ -1638,7 +1674,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
         let mut c = vec![0.0f32; n2];
         let (ap, bp) = (a.as_ptr(), b.as_ptr());
         let flops = 2.0 * (ns as f64).powi(3);
-        println!(
+        section!(
             "=== matmul_tn {ns}x{ns} (C=Aᵀ·B, the dW weight-gradient; GFLOP/s, higher is better) ==="
         );
         let gflops = |m: &Option<Measure>| {
@@ -1753,7 +1789,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
         // `bench_matmul_skinny`/`bench_linear` already do.
         if roof > 0.0 {
             if let Some(w) = &wuk {
-                println!(
+                standing!(
                     "  -> Wukong single-core = {:.0}% of measured roofline",
                     (flops / w.ns_per_call) / roof * 100.0
                 );
@@ -1765,7 +1801,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
             if let (Some(m), Some(c)) = (&wuk, peer) {
                 let (rel, at) = max_rel_err(&m.out, &c.out);
                 if rel > 1e-3 {
-                    println!(
+                    mismatch!(
                         "  ! full-buffer mismatch vs {lang} at [{at}]: Wukong={} {lang}={} (rel {:.2e})",
                         m.out[at], c.out[at], rel
                     );
@@ -1774,7 +1810,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
         }
         if let (Some(ms), Some(c)) = (&wuk, &cm) {
             let r = c.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core (SIMD) is {:.2}x {} than C single-threaded",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -1782,7 +1818,7 @@ fn bench_matmul_tn(cc: &str, dir: &Path, roof: f64) {
         }
         if let (Some(mp), Some(c)) = (&wk_par, &cm) {
             let r = c.ns_per_call / mp.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong @parallel is {:.2}x {} than idiomatic single-threaded C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -1879,7 +1915,7 @@ fn bench_gemv(cc: &str, dir: &Path) {
                 .map(|mm| format!("{:.1}", bytes / mm.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!(
+        section!(
             "=== gemv (y[i] = Sum_j A[i,j]*x[j]) {m}x{n} (A-stream GB/s, higher is better) ==="
         );
         // POSITION-BALANCED TIMING (2026-09-13) - see `abba_min_columns` and the note in
@@ -1992,12 +2028,12 @@ fn bench_gemv(cc: &str, dir: &Path) {
                 .fold(0.0f32, |mx, (&u, &v)| mx.max((u - v).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
-                println!("  ! gemv mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+                mismatch!("  ! gemv mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -2061,7 +2097,7 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
                 .map(|x| format!("{:.1}", flops / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!(
+        section!(
             "=== scaled_gemm (scores = (Q·Kᵀ)·scale) S={s} D={d} (GFLOP/s, higher is better) ==="
         );
         let built_wuk = build_wukong(&wk_scaled_scores(s, d, false), 3);
@@ -2153,12 +2189,12 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
                 .fold(0.0f32, |mx, (&u, &v)| mx.max((u - v).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
-                println!("  ! scaled_gemm mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+                mismatch!("  ! scaled_gemm mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -2173,7 +2209,7 @@ fn bench_scaled_gemm(cc: &str, dir: &Path) {
         if let (Some(ms), Some(mn)) = (&wuk, &wk_noscale) {
             // >1 ⇒ the α costs time; ~1.0 ⇒ the scale is free (folded into the writeback).
             let r = ms.ns_per_call / mn.ns_per_call;
-            println!(
+            standing!(
                 "  -> α overhead vs unscaled QKᵀ (same kernel): {r:.3}x (≈1.0 ⇒ the scale is free)"
             );
         }
@@ -2244,7 +2280,7 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
                 .map(|x| format!("{:.1}", flops / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== linear (nn.Linear C=A·Bᵀ) {ns}x{ns} (GFLOP/s, higher is better) ===");
+        section!("=== linear (nn.Linear C=A·Bᵀ) {ns}x{ns} (GFLOP/s, higher is better) ===");
         // Build every column before the shared position-balanced rotation.
         let wk1 = build_wukong(&wk_linear(ns, false), 3);
         let wkp = build_wukong(&wk_linear(ns, true), 3);
@@ -2349,7 +2385,7 @@ fn bench_linear(cc: &str, dir: &Path, roof: f64) {
         report_gemm_vs_mkl(&wuk, &wk_par, &mkl_1c, &mkl_all, flops);
         if let (Some(mp), Some(c)) = (&wk_par, &cm) {
             let r = (flops / mp.ns_per_call) / (flops / c.ns_per_call);
-            println!(
+            standing!(
                 "  -> Wukong @parallel is {:.2}x {} than idiomatic single-threaded C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -2482,7 +2518,7 @@ fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
                 .map(|x| format!("{:.1}", flops / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!(
+        section!(
             "=== ffn (fused C=silu(A·Bᵀ): matmul+act folded into one C-write) {ns}x{ns} (GFLOP/s, higher is better) ==="
         );
         let built_wuk = build_wukong(&wk_ffn(ns, false), 3);
@@ -2558,7 +2594,7 @@ fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
         // `bench_matmul_skinny`/`bench_linear` already do.
         if roof > 0.0 {
             if let Some(w) = &wuk {
-                println!(
+                standing!(
                     "  -> Wukong single-core = {:.0}% of measured roofline",
                     (flops / w.ns_per_call) / roof * 100.0
                 );
@@ -2568,15 +2604,17 @@ fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
         if let (Some(m), Some(c)) = (&wk_par, &cm) {
             let (rel, at) = max_rel_err(&m.out, &c.out);
             if rel > 1e-3 {
-                println!(
+                mismatch!(
                     "  ! full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
-                    m.out[at], c.out[at], rel
+                    m.out[at],
+                    c.out[at],
+                    rel
                 );
             }
         }
         if let (Some(ms), Some(c)) = (&wuk, &cm) {
             let r = flops / ms.ns_per_call / (flops / c.ns_per_call);
-            println!(
+            standing!(
                 "  -> Wukong single-core (fused GEMM+silu) is {:.2}x {} than C (un-tiled GEMM + scalar-expf silu pass)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -2584,7 +2622,7 @@ fn bench_ffn(cc: &str, dir: &Path, roof: f64) {
         }
         if let (Some(mp), Some(c)) = (&wk_par, &cm) {
             let r = flops / mp.ns_per_call / (flops / c.ns_per_call);
-            println!(
+            standing!(
                 "  -> Wukong @parallel is {:.2}x {} than idiomatic single-threaded C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -2667,7 +2705,7 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
                 .map(|x| format!("{:.1}", flops / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!(
+        section!(
             "=== linear_bf16 (bf16 nn.Linear C=A·Bᵀ, f32 accumulate) {ns}x{ns} (GFLOP/s, higher is better) ==="
         );
         let built_wuk = build_wukong(&wk_linear_bf16(ns, false), 3);
@@ -2744,15 +2782,17 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
             let rel = ((m.out - c2.out).abs() / c2.out.abs().max(1e-6)) as f64;
             if rel > 1e-2 {
-                println!(
+                mismatch!(
                     "  ! c[0] mismatch vs C: Wuk={} C={} (rel {:.2e})",
-                    m.out, c2.out, rel
+                    m.out,
+                    c2.out,
+                    rel
                 );
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic bf16 C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -2760,7 +2800,7 @@ fn bench_linear_bf16(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = c2.ns_per_call / mp.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong @parallel is {:.2}x {} than idiomatic single-threaded bf16 C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -2902,7 +2942,7 @@ fn bench_transpose(cc: &str, dir: &Path) {
         } else {
             "general stride"
         };
-        println!(
+        section!(
             "=== transpose (dst = srcᵀ) {rows}x{cols} [{regime}] (GB/s, higher is better) ==="
         );
         // POSITION-BALANCED TIMING (2026-09-13) - see `abba_min_columns` and the note in
@@ -3012,17 +3052,17 @@ fn bench_transpose(cc: &str, dir: &Path) {
         // a different buffer, not a faster one.
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
             if m.out != c2.out {
-                println!("  ! transpose output mismatch vs C");
+                mismatch!("  ! transpose output mismatch vs C");
             }
         }
         if let (Some(m), Some(r2)) = (&wuk, &rm) {
             if m.out != r2.out {
-                println!("  ! transpose output mismatch vs Rust");
+                mismatch!("  ! transpose output mismatch vs Rust");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -3059,7 +3099,7 @@ fn transpose_regime_summary(alias_1c: &[f64], gen_1c: &[f64], alias_par: &[f64],
     if alias_1c.is_empty() && gen_1c.is_empty() {
         return;
     }
-    println!("=== transpose REGIME SUMMARY (vs the 32x32-blocked C peer, geomean of ratios) ===");
+    section!("=== transpose REGIME SUMMARY (vs the 32x32-blocked C peer, geomean of ratios) ===");
     let row = |label: &str, xs: &[f64]| {
         if xs.is_empty() {
             return;
@@ -3207,7 +3247,7 @@ fn bench_colsum(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== colsum (out[j] = Σ_i x[i,j]) {m}x{n} (GB/s, higher is better) ===");
+        section!("=== colsum (out[j] = Σ_i x[i,j]) {m}x{n} (GB/s, higher is better) ===");
         // POSITION-BALANCED TIMING (2026-09-13). Build every column FIRST, then time them all in
         // one rotation - see `abba_min_columns`. Before this, Wukong was compiled-and-timed in one
         // call, so it always held slot 1 (the coldest, quietest slot, with no compiler spawn in
@@ -3291,17 +3331,17 @@ fn bench_colsum(cc: &str, dir: &Path) {
         // Both sum each column in i-ascending order, so the full-buffer cross-check is bit equality.
         if let (Some(a), Some(c2)) = (&wuk, &cm) {
             if a.out != c2.out {
-                println!("  ! colsum output mismatch vs C");
+                mismatch!("  ! colsum output mismatch vs C");
             }
         }
         if let (Some(a), Some(r2)) = (&wuk, &rm) {
             if a.out != r2.out {
-                println!("  ! colsum output mismatch vs Rust");
+                mismatch!("  ! colsum output mismatch vs Rust");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -3394,7 +3434,7 @@ fn bench_biasadd(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== biasadd (out[r,c] = x[r,c] + bias[c]) {r}x{c} (GB/s, higher is better) ===");
+        section!("=== biasadd (out[r,c] = x[r,c] + bias[c]) {r}x{c} (GB/s, higher is better) ===");
         // POSITION-BALANCED TIMING (2026-09-13) - see `abba_min_columns` and the note in
         // `bench_colsum`. Build every column first, then time them all in one rotation.
         let wk1 = build_wukong(&wk_biasadd(r, c, false), 3);
@@ -3447,12 +3487,12 @@ fn bench_biasadd(cc: &str, dir: &Path) {
         );
         if let (Some(a), Some(c2)) = (&wuk, &cm) {
             if a.out != c2.out {
-                println!("  ! biasadd output mismatch vs C");
+                mismatch!("  ! biasadd output mismatch vs C");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let ratio = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than C",
                 if ratio >= 1.0 { ratio } else { 1.0 / ratio },
                 if ratio >= 1.0 { "faster" } else { "slower" }
@@ -3537,7 +3577,7 @@ fn bench_dequant(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== dequant-1d ({ty}: out[j] = (q[j] as f32)*scale) N={n} (GB/s, higher is better) ===");
+        section!("=== dequant-1d ({ty}: out[j] = (q[j] as f32)*scale) N={n} (GB/s, higher is better) ===");
         let built_wuk = build_wukong(&wk_dequant_1d(n, is_i8, false), 3);
         let built_wk_par = build_wukong(&wk_dequant_1d(n, is_i8, true), 3);
         let (built_cm, built_cpp) =
@@ -3608,7 +3648,7 @@ fn bench_dequant(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== dequant-perchan ({ty}: out[i*C+j] = (q as f32)*scale[j]) {r}x{c} (GB/s) ===");
+        section!("=== dequant-perchan ({ty}: out[i*C+j] = (q as f32)*scale[j]) {r}x{c} (GB/s) ===");
         let built_wuk = build_wukong(&wk_dequant_perchan(r, c, is_i8, false), 3);
         let built_wk_par = build_wukong(&wk_dequant_perchan(r, c, is_i8, true), 3);
         let (built_cm, built_cpp) = build_c_cpp(
@@ -3673,9 +3713,10 @@ fn dequant_check(wuk: &Option<Measure>, peer: &Option<Measure>, lang: &str) {
                 .zip(&p.out)
                 .position(|(x, y)| x != y)
                 .unwrap_or(0);
-            println!(
+            mismatch!(
                 "  ! dequant output mismatch vs {lang} at [{at}]: {} vs {}",
-                m.out[at], p.out[at]
+                m.out[at],
+                p.out[at]
             );
         }
     }
@@ -3691,7 +3732,7 @@ fn dequant_ratio(
 ) {
     if let (Some(m), Some(c)) = (wuk, cm) {
         let r = c.ns_per_call / m.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong single-core is {:.2}x {} than C (gcc -O3 -march=native)",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" }
@@ -3699,7 +3740,7 @@ fn dequant_ratio(
     }
     if let (Some(m), Some(cpp)) = (wuk, cpp) {
         let r = cpp.ns_per_call / m.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong single-core is {:.2}x {} than C++ (g++)",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" }
@@ -3707,7 +3748,7 @@ fn dequant_ratio(
     }
     if let (Some(m), Some(rm)) = (wuk, rm) {
         let r = rm.ns_per_call / m.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong single-core is {:.2}x {} than Rust (rustc -Copt-level=3)",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" }
@@ -3809,7 +3850,7 @@ fn bench_colmax(cc: &str, dir: &Path) {
                     .unwrap_or_else(|| "n/a".into())
             };
             let desc = if opc == 2 { "|x[i,j]|" } else { "x[i,j]" };
-            println!("=== {label} (out[j] = {sym}_i {desc}) {m}x{n} (GB/s, higher is better) ===");
+            section!("=== {label} (out[j] = {sym}_i {desc}) {m}x{n} (GB/s, higher is better) ===");
             let built_wuk = build_wukong(&wk_colmax(m, n, false, opc), 3);
             let built_wk_par = build_wukong(&wk_colmax(m, n, true, opc), 3);
             let (built_cm, built_cm_cpp) = build_c_cpp(
@@ -3881,17 +3922,17 @@ fn bench_colmax(cc: &str, dir: &Path) {
             // Both fold each column i-ascending, so the full-buffer cross-check is bit equality.
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
                 if a.out != c2.out {
-                    println!("  ! {label} output mismatch vs C");
+                    mismatch!("  ! {label} output mismatch vs C");
                 }
             }
             if let (Some(a), Some(r2)) = (&wuk, &rm) {
                 if a.out != r2.out {
-                    println!("  ! {label} output mismatch vs Rust");
+                    mismatch!("  ! {label} output mismatch vs Rust");
                 }
             }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
-                println!(
+                standing!(
                     "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
@@ -4018,7 +4059,7 @@ fn bench_rowarg(cc: &str, dir: &Path) {
                     .unwrap_or_else(|| "n/a".into())
             };
             let sym = if is_max { "argmax" } else { "argmin" };
-            println!(
+            section!(
                 "=== {label} (out[r] = {sym}_j x[r,j]) {rows}x{cols} (GB/s, higher is better) ==="
             );
             let built_wuk = build_wukong(&wk_rowarg(rows, cols, is_max, false), 3);
@@ -4092,17 +4133,17 @@ fn bench_rowarg(cc: &str, dir: &Path) {
             let as_i32 = |v: &[f32]| v.iter().map(|x| x.to_bits() as i32).collect::<Vec<i32>>();
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
                 if as_i32(&a.out) != as_i32(&c2.out) {
-                    println!("  ! {label} index mismatch vs C");
+                    mismatch!("  ! {label} index mismatch vs C");
                 }
             }
             if let (Some(a), Some(r2)) = (&wuk, &rm) {
                 if as_i32(&a.out) != as_i32(&r2.out) {
-                    println!("  ! {label} index mismatch vs Rust");
+                    mismatch!("  ! {label} index mismatch vs Rust");
                 }
             }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
-                println!(
+                standing!(
                     "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
@@ -4200,7 +4241,7 @@ fn bench_colarg(cc: &str, dir: &Path) {
                     .unwrap_or_else(|| "n/a".into())
             };
             let sym = if is_max { "argmax" } else { "argmin" };
-            println!(
+            section!(
                 "=== {label} (out[j] = {sym}_i x[i,j]) {rows}x{cols} (GB/s, higher is better) ==="
             );
             let built_wuk = build_wukong(&wk_colarg(rows, cols, is_max, false), 3);
@@ -4272,17 +4313,17 @@ fn bench_colarg(cc: &str, dir: &Path) {
             let as_i32 = |v: &[f32]| v.iter().map(|x| x.to_bits() as i32).collect::<Vec<i32>>();
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
                 if as_i32(&a.out) != as_i32(&c2.out) {
-                    println!("  ! {label} index mismatch vs C");
+                    mismatch!("  ! {label} index mismatch vs C");
                 }
             }
             if let (Some(a), Some(r2)) = (&wuk, &rm) {
                 if as_i32(&a.out) != as_i32(&r2.out) {
-                    println!("  ! {label} index mismatch vs Rust");
+                    mismatch!("  ! {label} index mismatch vs Rust");
                 }
             }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
-                println!(
+                standing!(
                     "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
@@ -4394,7 +4435,7 @@ fn bench_lrscan(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!(
+        section!(
             "=== lrscan (out[r,t] = a[r,t]·h + b[r,t], SSM/Mamba selective scan) {rows}x{cols} (GB/s, higher is better) ==="
         );
         let built_wuk = build_wukong(&wk_lrscan(rows, cols, false), 3);
@@ -4457,12 +4498,12 @@ fn bench_lrscan(cc: &str, dir: &Path) {
                 .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
-                println!("  ! lrscan mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+                mismatch!("  ! lrscan mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C (4-row-interleaved ILP vs C's single serial chain)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -4530,7 +4571,7 @@ fn bench_cumprod(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!(
+        section!(
             "=== cumprod (out[r,i] = Prod_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ==="
         );
         let built_wuk = build_wukong(&wk_cumprod(rows, cols, false), 3);
@@ -4593,12 +4634,12 @@ fn bench_cumprod(cc: &str, dir: &Path) {
                 .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
-                println!("  ! cumprod mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+                mismatch!("  ! cumprod mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C (4-row-interleaved ILP vs C's serial chain)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -4632,7 +4673,7 @@ fn bench_cumsum(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!(
+        section!(
             "=== cumsum (out[r,i] = Sum_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ==="
         );
         let built_wuk = build_wukong(&wk_cumsum(rows, cols, false), 3);
@@ -4719,12 +4760,12 @@ fn bench_cumsum(cc: &str, dir: &Path) {
                 .fold(0.0f32, |m, (&x, &y)| m.max((x - y).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
-                println!("  ! cumsum mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+                mismatch!("  ! cumsum mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -4795,7 +4836,7 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
                     .unwrap_or_else(|| "n/a".into())
             };
             let sym = if is_max { "max" } else { "min" };
-            println!("=== {label} (out[r,i] = {sym}_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ===");
+            section!("=== {label} (out[r,i] = {sym}_k<=i x[r,k]) {rows}x{cols} (GB/s, higher is better) ===");
             let built_wuk = build_wukong(&wk_cumminmax(rows, cols, is_max, false), 3);
             let built_wk_par = build_wukong(&wk_cumminmax(rows, cols, is_max, true), 3);
             let (built_cm, built_cm_cpp) = build_c_cpp(
@@ -4850,17 +4891,17 @@ fn bench_cumminmax(cc: &str, dir: &Path) {
             // max/min select a value → bit-exact cross-check (no reassociation tolerance).
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
                 if a.out != c2.out {
-                    println!("  ! {label} output mismatch vs C");
+                    mismatch!("  ! {label} output mismatch vs C");
                 }
             }
             if let (Some(a), Some(r2)) = (&wuk, &rm) {
                 if a.out != r2.out {
-                    println!("  ! {label} output mismatch vs Rust");
+                    mismatch!("  ! {label} output mismatch vs Rust");
                 }
             }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
-                println!(
+                standing!(
                     "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
@@ -4909,7 +4950,7 @@ fn bench_colstat(cc: &str, dir: &Path) {
                     .unwrap_or_else(|| "n/a".into())
             };
             let desc = if opc == 0 { "x[i,j]" } else { "x[i,j]²" };
-            println!("=== {label} (out[j] = {sym}_i {desc}) {m}x{n} (GB/s, higher is better) ===");
+            section!("=== {label} (out[j] = {sym}_i {desc}) {m}x{n} (GB/s, higher is better) ===");
             // POSITION-BALANCED TIMING (2026-09-13) - see `abba_min_columns` and the note in
             // `bench_colsum`. Build every column first, then time them all in one rotation.
             let wk1 = build_wukong(&wk_colstat(m, n, false, opc), 3);
@@ -4980,17 +5021,17 @@ fn bench_colstat(cc: &str, dir: &Path) {
             // full-buffer cross-check is bit equality.
             if let (Some(a), Some(c2)) = (&wuk, &cm) {
                 if a.out != c2.out {
-                    println!("  ! {label} output mismatch vs C");
+                    mismatch!("  ! {label} output mismatch vs C");
                 }
             }
             if let (Some(a), Some(r2)) = (&wuk, &rm) {
                 if a.out != r2.out {
-                    println!("  ! {label} output mismatch vs Rust");
+                    mismatch!("  ! {label} output mismatch vs Rust");
                 }
             }
             if let (Some(ms), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / ms.ns_per_call;
-                println!(
+                standing!(
                     "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
@@ -5095,7 +5136,7 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== softmax_bwd (dx = y·(dy − Σ y·dy)) {r}x{c} (GB/s, higher is better) ===");
+        section!("=== softmax_bwd (dx = y·(dy − Σ y·dy)) {r}x{c} (GB/s, higher is better) ===");
         // Build every column before the shared position-balanced rotation.
         let wk1 = build_wukong(&wk_softmax_bwd(r, c, false), 3);
         let wkp = build_wukong(&wk_softmax_bwd(r, c, true), 3);
@@ -5173,12 +5214,12 @@ fn bench_softmax_bwd(cc: &str, dir: &Path) {
                 .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
-                println!("  ! softmax_bwd mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+                mismatch!("  ! softmax_bwd mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
@@ -5251,7 +5292,7 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== rmsnorm_bwd (dx = r·(g − x·r²·Σg·x/C)) {r}x{c} (GB/s, higher is better) ===");
+        section!("=== rmsnorm_bwd (dx = r·(g − x·r²·Σg·x/C)) {r}x{c} (GB/s, higher is better) ===");
         // Prepare every four-pointer column before entering the shared schedule.
         let wk = build_wukong(&wk_rmsnorm_bwd(r, c, false), 4);
         let wkp = build_wukong(&wk_rmsnorm_bwd(r, c, true), 4);
@@ -5325,12 +5366,12 @@ fn bench_rmsnorm_bwd(cc: &str, dir: &Path) {
                 .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
-                println!("  ! rmsnorm_bwd mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+                mismatch!("  ! rmsnorm_bwd mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
@@ -5412,7 +5453,7 @@ fn bench_layernorm_bwd(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== layernorm_bwd (dx = rstd·(g − mean(g) − xhat·mean(g·xhat))) {r}x{c} ===");
+        section!("=== layernorm_bwd (dx = rstd·(g − mean(g) − xhat·mean(g·xhat))) {r}x{c} ===");
         // Prepare every four-pointer column before entering the shared schedule.
         let wk = build_wukong(&wk_layernorm_bwd(r, c, false), 4);
         let wkp = build_wukong(&wk_layernorm_bwd(r, c, true), 4);
@@ -5546,7 +5587,7 @@ fn bench_xent(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== xent (loss = lse(x) − x[target]) {r}x{c} (GB/s, higher is better) ===");
+        section!("=== xent (loss = lse(x) − x[target]) {r}x{c} (GB/s, higher is better) ===");
         let built_wuk = build_wukong(&wk_xent(r, c, false), 3);
         let built_wk_par = build_wukong(&wk_xent(r, c, true), 3);
         let (built_cm, built_cm_cpp) = build_c_cpp(
@@ -5623,12 +5664,12 @@ fn bench_xent(cc: &str, dir: &Path) {
                 .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
-                println!("  ! xent mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+                mismatch!("  ! xent mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
@@ -5708,7 +5749,7 @@ fn bench_rope(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== rope (rotate by r·inv_freq[j]) {rows}x{d} (GB/s, higher is better) ===");
+        section!("=== rope (rotate by r·inv_freq[j]) {rows}x{d} (GB/s, higher is better) ===");
         let built_wuk = build_wukong(&wk_rope(rows, half, false), 3);
         let built_wk_par = build_wukong(&wk_rope(rows, half, true), 3);
         let (built_cm, built_cm_cpp) = build_c_cpp(
@@ -5769,12 +5810,12 @@ fn bench_rope(cc: &str, dir: &Path) {
                 .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
-                println!("  ! rope mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+                mismatch!("  ! rope mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core is {:.2}x {} than idiomatic C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
@@ -5852,7 +5893,7 @@ fn bench_xent_bwd(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== xent_bwd (dx = softmax(x) − onehot) {r}x{c} (GB/s, higher is better) ===");
+        section!("=== xent_bwd (dx = softmax(x) − onehot) {r}x{c} (GB/s, higher is better) ===");
         let built_wuk = build_wukong(&wk_xent_bwd(r, c, false), 3);
         let built_wk_par = build_wukong(&wk_xent_bwd(r, c, true), 3);
         let (built_cm, built_cm_cpp) = build_c_cpp(
@@ -5973,7 +6014,7 @@ fn bench_rope_bwd(cc: &str, dir: &Path) {
                 .map(|m| format!("{:.1}", bytes / m.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!("=== rope_bwd (transpose rotate) {rows}x{d} (GB/s, higher is better) ===");
+        section!("=== rope_bwd (transpose rotate) {rows}x{d} (GB/s, higher is better) ===");
         let built_wuk = build_wukong(&wk_rope_bwd(rows, half, false), 3);
         let built_wk_par = build_wukong(&wk_rope_bwd(rows, half, true), 3);
         let (built_cm, built_cm_cpp) = build_c_cpp(
@@ -6089,7 +6130,7 @@ fn bench_gate_n(cc: &str, dir: &Path, n: usize) {
             .unwrap_or_else(|| "n/a".into())
     };
     for (name, act) in [("silu (SwiGLU)", "silu"), ("gelu (GeGLU)", "gelu")] {
-        println!(
+        section!(
             "=== gate {name}: out = {act}(a)*b, N=2^{} (GB/s, higher is better) ===",
             n.trailing_zeros()
         );
@@ -6222,7 +6263,7 @@ fn bench_row_losses(cc: &str, dir: &Path) {
                     .unwrap_or_else(|| "n/a".into())
             };
             let src_mp = wk_row_loss(r, c, label, true);
-            println!("=== {label} (per-row log/exp loss) {r}x{c} ===");
+            section!("=== {label} (per-row log/exp loss) {r}x{c} ===");
             let built_wuk = build_wukong(&src_m, 3);
             let built_wk_par = build_wukong(&src_mp, 3);
             let (built_cm, built_cm_cpp) =
@@ -6382,12 +6423,12 @@ fn report_ratio(
             .fold(0.0f32, |a, (&x, &y)| a.max((x - y).abs()));
         let rel = (maxerr / maxabs) as f64;
         if rel > 1e-3 {
-            println!("  ! {label} mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+            mismatch!("  ! {label} mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
         }
     }
     if let (Some(ms), Some(c2)) = (wuk, cm) {
         let r2 = c2.ns_per_call / ms.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong single-core is {:.2}x {} than idiomatic C",
             if r2 >= 1.0 { r2 } else { 1.0 / r2 },
             if r2 >= 1.0 { "faster" } else { "slower" }
@@ -6437,7 +6478,7 @@ fn bench_act_backward_n(cc: &str, dir: &Path, n: usize) {
             .unwrap_or_else(|| "n/a".into())
     };
     for op in ["silu", "gelu", "sigmoid", "tanh", "elu", "softplus"] {
-        println!(
+        section!(
             "=== {op}_backward (dx = dy·{op}'(x)) N=2^{} (GB/s, higher is better) ===",
             n.trailing_zeros()
         );
@@ -6503,12 +6544,12 @@ fn bench_act_backward_n(cc: &str, dir: &Path, n: usize) {
                 .fold(0.0f32, |a, (&p, &q)| a.max((p - q).abs()));
             let rel = (maxerr / maxabs) as f64;
             if rel > 1e-3 {
-                println!("  ! {op}_backward mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
+                mismatch!("  ! {op}_backward mismatch vs C: max|Δ|/max|C| = {rel:.2e}");
             }
         }
         if let (Some(ms), Some(c2)) = (&wuk, &cm) {
             let r2 = c2.ns_per_call / ms.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong single-core (256-bit) is {:.2}x {} than scalar C",
                 if r2 >= 1.0 { r2 } else { 1.0 / r2 },
                 if r2 >= 1.0 { "faster" } else { "slower" }
@@ -6597,7 +6638,7 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
                 .map(|x| format!("{:.1}", ops / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
-        println!(
+        section!(
             "=== i8gemm (int8 nn.Linear C=A·Bᵀ, u8×i8→i32) {ns}x{ns} (GOP/s, higher is better) ==="
         );
         let built_wuk = build_wukong(&wk_i8gemm(ns, false), 3);
@@ -6684,9 +6725,10 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
                             .zip(&o.out)
                             .position(|(x, y)| x != y)
                             .unwrap_or(0);
-                        println!(
+                        mismatch!(
                             "  ! full-buffer mismatch {lang} vs Wuk(1core) at [{at}]: {} vs {}",
-                            o.out[at], m.out[at]
+                            o.out[at],
+                            m.out[at]
                         );
                     }
                 }
@@ -6694,7 +6736,7 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
         }
         if let (Some(m), Some(c2)) = (&wuk, &cm) {
             let r = (ops / m.ns_per_call) / (ops / c2.ns_per_call);
-            println!(
+            standing!(
                 "  -> Wukong (1 core) is {:.2}x {} than idiomatic single-threaded C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -6702,7 +6744,7 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
         }
         if let (Some(mp), Some(c2)) = (&wk_par, &cm) {
             let r = (ops / mp.ns_per_call) / (ops / c2.ns_per_call);
-            println!(
+            standing!(
                 "  -> Wukong @parallel is {:.2}x {} than idiomatic single-threaded C",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -6711,7 +6753,7 @@ fn bench_i8gemm(cc: &str, dir: &Path) {
         // The C++ (g++) column, printed alongside — the same int8 nest through the other front end.
         if let (Some(m), Some(c2)) = (&wuk, &cm_cpp) {
             let r = c2.ns_per_call / m.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong (1 core) is {:.2}x {} than idiomatic C++ (g++)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -6798,7 +6840,7 @@ fn bench_bf16(cc: &str, dir: &Path) {
             .collect();
         let mut o = vec![0.0f32; 1];
         let (xp, yp) = (x.as_ptr(), y.as_ptr());
-        println!("=== bf16 reductions (bf16 in, f32 accumulate) N=2^{nbits} (GB/s, higher is better) ===");
+        section!("=== bf16 reductions (bf16 in, f32 accumulate) N=2^{nbits} (GB/s, higher is better) ===");
         for (kind, is_dot) in [("dot Σx·y", true), ("sum Σx", false)] {
             let streams = if is_dot { 2 } else { 1 };
             let bytes = (streams * n * 2) as f64; // bf16 input traffic
@@ -6889,14 +6931,14 @@ fn bench_bf16(cc: &str, dir: &Path) {
                             "  . {lang} scalar {b} vs Wukong {a} (rel {rel:.2e}, bar {bar:.0e})"
                         );
                         if rel > bar {
-                            println!("  ! {lang} scalar drift: {b} vs Wukong {a} (rel {rel:.2e})");
+                            mismatch!("  ! {lang} scalar drift: {b} vs Wukong {a} (rel {rel:.2e})");
                         }
                     }
                 }
             }
             if let (Some(m), Some(c2)) = (&wuk, &cm) {
                 let r = c2.ns_per_call / m.ns_per_call;
-                println!(
+                standing!(
                     "  -> Wukong is {:.2}x {} than idiomatic single-threaded C",
                     if r >= 1.0 { r } else { 1.0 / r },
                     if r >= 1.0 { "faster" } else { "slower" }
@@ -7002,7 +7044,7 @@ fn bench_axpby_half_out(cc: &str, dir: &Path) {
     let mut of = vec![0.0f32; n]; // f32 output buffer (for the write-halving A/B)
     let (xp, yp) = (x.as_ptr(), y.as_ptr());
 
-    println!(
+    section!(
         "=== all-half axpby out=(a·x+b·y) as bf16, N=2^24 (bf16 in AND out; GB/s, higher is better) ==="
     );
     // Lever 1: the half-out kernel vs the f32-out kernel (same math, wider store) — Wukong vs Wukong.
@@ -7081,9 +7123,10 @@ fn bench_axpby_half_out(cc: &str, dir: &Path) {
             if let Some(o2) = other {
                 let (rel, at) = max_rel_err(&m.out, &o2.out);
                 if rel > 8e-3 {
-                    println!(
+                    mismatch!(
                         "  ! {lang} half-out drift: rel {rel:.2e} at [{at}] ({} vs Wukong {})",
-                        o2.out[at], m.out[at]
+                        o2.out[at],
+                        m.out[at]
                     );
                 }
             }
@@ -7092,7 +7135,7 @@ fn bench_axpby_half_out(cc: &str, dir: &Path) {
     // Lever 1 payoff: the halved write should make the half-out kernel faster per call than f32-out.
     if let (Some(h), Some(f)) = (&wk_half, &wk_f32) {
         let r = f.ns_per_call / h.ns_per_call;
-        println!(
+        standing!(
             "  -> half-out is {r:.2}x the f32-out axpby (narrowing store halves the write traffic)"
         );
     }
@@ -7100,7 +7143,7 @@ fn bench_axpby_half_out(cc: &str, dir: &Path) {
     for (lang, peer) in [("C", &cm), ("C++ (g++)", &cm_cpp)] {
         if let (Some(h), Some(c2)) = (&wk_half, peer) {
             let r = c2.ns_per_call / h.ns_per_call;
-            println!(
+            standing!(
                 "  -> Wukong half-out is {:.2}x {} than {lang} (vectorized widen+narrow vs scalar bf16 round)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" }
@@ -7178,7 +7221,7 @@ fn bench_conv(cc: &str, dir: &Path) {
     let (ip, wp) = (input.as_ptr(), weight.as_ptr());
     let flops = 2.0 * (cout * ckk * ohw) as f64;
 
-    println!(
+    section!(
         "=== conv2d Cin{cin} {h}x{h} -> {cout}@{oh}x{oh} (3x3); Wukong im2col+GEMM vs direct conv; GFLOP/s ==="
     );
     let gflops = |m: &Option<Measure>| {
@@ -7253,13 +7296,15 @@ fn bench_conv(cc: &str, dir: &Path) {
     if let (Some(m), Some(c)) = (&wuk, &cm) {
         let (rel, at) = max_rel_err(&m.out, &c.out);
         if rel > 1e-3 {
-            println!(
+            mismatch!(
                 "  ! full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
-                m.out[at], c.out[at], rel
+                m.out[at],
+                c.out[at],
+                rel
             );
         }
         let r = (flops / m.ns_per_call) / (flops / c.ns_per_call);
-        println!(
+        standing!(
             "  -> Wukong (im2col+GEMM) is {:.2}x {} than idiomatic direct-convolution C",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" }
@@ -7358,7 +7403,7 @@ fn bench_norm(cc: &str, dir: &Path) {
         let gamma: Vec<f32> = (0..cols).map(|i| (i % 11) as f32 * 0.1 + 0.5).collect();
         let mut out = vec![0.0f32; cols];
         let (xp, yp) = (x.as_ptr(), gamma.as_ptr());
-        println!(
+        section!(
             "=== fused norms, 1x{cols} feature row (ns/call, lower is better; Wukong → wukong_norm_f32[_affine]) ==="
         );
         println!(
@@ -7436,7 +7481,16 @@ fn bench_norm(cc: &str, dir: &Path) {
                     .map(|x| format!("{:.0}", x.ns_per_call))
                     .unwrap_or_else(|| "n/a".into())
             };
+            // Cross-language correctness: same normalized row, element by element (f32 tolerance —
+            // Wukong reassociates the reductions, C does not, so it is a tight rel-err, not bits).
+            // Checked BEFORE the row is printed: this table carries its ratios in its own cells, so
+            // a row that fails the check prints SUSPECT there instead of a clean "1.31x faster"
+            // (the numerics gate, P8.3).
+            let failures = norm_row_failures(op, &wuk, &c, &rust);
             let standing_vs = |peer: &Option<Measure>| {
+                if !failures.is_empty() {
+                    return "SUSPECT".to_string();
+                }
                 if let (Some(m), Some(p)) = (&wuk, peer) {
                     let r = p.ns_per_call / m.ns_per_call;
                     format!(
@@ -7460,29 +7514,37 @@ fn bench_norm(cc: &str, dir: &Path) {
                 standing_vs(&c_cpp),
                 standing_vs(&cfast)
             );
-            // Cross-language correctness: same normalized row, element by element (f32 tolerance —
-            // Wukong reassociates the reductions, C does not, so it is a tight rel-err, not bits).
-            if let (Some(m), Some(c)) = (&wuk, &c) {
-                let (rel, at) = max_rel_err(&m.out, &c.out);
-                if rel > 1e-3 {
-                    println!(
-                        "  ! {op} full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
-                        m.out[at], c.out[at], rel
-                    );
-                }
-            }
-            if let (Some(m), Some(rust)) = (&wuk, &rust) {
-                let (rel, at) = max_rel_err(&m.out, &rust.out);
-                if rel > 1e-3 {
-                    println!(
-                        "  ! {op} full-buffer mismatch vs Rust at [{at}]: Wukong={} Rust={} (rel {:.2e})",
-                        m.out[at], rust.out[at], rel
-                    );
-                }
+            for f in &failures {
+                mismatch!("{f}");
             }
         }
         println!();
     }
+}
+
+/// The norm tables' full-buffer cross-checks against C and Rust, as the `!` lines they would print
+/// (empty when both agree within the suite's 1e-3 bar). Computed before the row is printed so the
+/// row's own ratio cells can read SUSPECT - see the numerics gate in `numerics.rs`.
+fn norm_row_failures(
+    label: &str,
+    wuk: &Option<Measure>,
+    c: &Option<Measure>,
+    rust: &Option<Measure>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (lang, peer) in [("C", c), ("Rust", rust)] {
+        if let (Some(m), Some(p)) = (wuk, peer) {
+            let (rel, at) = max_rel_err(&m.out, &p.out);
+            if rel > 1e-3 {
+                failures.push(format!(
+                    "  ! {label} full-buffer mismatch vs {lang} at [{at}]: Wukong={} {lang}={} \
+                     (rel {rel:.2e})",
+                    m.out[at], p.out[at]
+                ));
+            }
+        }
+    }
+    failures
 }
 
 /// Wukong norm source: copy `x`→`out`, then the canonical in-place multi-pass form the recognizer
@@ -7670,7 +7732,7 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
         let mut out = vec![0.0f32; n];
         // No affine params here, so the `y` arg is unused; alias it to `x` rather than allocate a buffer.
         let (xp, yp) = (x.as_ptr(), x.as_ptr());
-        println!(
+        section!(
             "=== batched norms (softmax / LayerNorm / RMSNorm), {rows}x{cols} = [tokens, hidden], {mb:.1} MB/buffer (ns/call, lower is better; Wukong → wukong_norm_f32[_parallel]) ==="
         );
         println!(
@@ -7745,7 +7807,14 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                         .map(|x| format!("{:.0}", x.ns_per_call))
                         .unwrap_or_else(|| "n/a".into())
                 };
+                // Full-buffer cross-check (f32 tolerance: Wukong reassociates the per-row
+                // reductions), BEFORE the row prints - see `bench_norm`: a failing row prints
+                // SUSPECT in its ratio cells rather than a clean ratio.
+                let failures = norm_row_failures(&label, &wuk, &c, &rust);
                 let standing_vs = |peer: &Option<Measure>| {
+                    if !failures.is_empty() {
+                        return "SUSPECT".to_string();
+                    }
                     if let (Some(m), Some(p)) = (&wuk, peer) {
                         let r = p.ns_per_call / m.ns_per_call;
                         format!(
@@ -7769,24 +7838,8 @@ fn bench_norm_batched(cc: &str, dir: &Path) {
                     standing_vs(&c_cpp),
                     standing_vs(&cfast)
                 );
-                // Full-buffer cross-check (f32 tolerance: Wukong reassociates the per-row reductions).
-                if let (Some(m), Some(c)) = (&wuk, &c) {
-                    let (rel, at) = max_rel_err(&m.out, &c.out);
-                    if rel > 1e-3 {
-                        println!(
-                            "  ! {label} full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
-                            m.out[at], c.out[at], rel
-                        );
-                    }
-                }
-                if let (Some(m), Some(rust)) = (&wuk, &rust) {
-                    let (rel, at) = max_rel_err(&m.out, &rust.out);
-                    if rel > 1e-3 {
-                        println!(
-                            "  ! {label} full-buffer mismatch vs Rust at [{at}]: Wukong={} Rust={} (rel {:.2e})",
-                            m.out[at], rust.out[at], rel
-                        );
-                    }
+                for f in &failures {
+                    mismatch!("{f}");
                 }
             }
         }
@@ -7940,7 +7993,7 @@ fn report(
         if let (Some(m), Some(p)) = (m, peer) {
             let (rel, at) = max_rel_err(&m.out, &p.out);
             if rel > 1e-3 {
-                println!(
+                mismatch!(
                     "  ! full-buffer mismatch vs {lang} at [{at}]: Wukong={} {lang}={} (rel {:.2e})",
                     m.out[at], p.out[at], rel
                 );
@@ -7949,7 +8002,7 @@ fn report(
     }
     if let (Some(m), Some(c)) = (m, c) {
         let ratio = c.ns_per_call / m.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong runtime is {:.2}x {} than C; compiles {:.1}x faster",
             if ratio >= 1.0 { ratio } else { 1.0 / ratio },
             if ratio >= 1.0 { "faster" } else { "slower" },
@@ -7962,7 +8015,7 @@ fn report(
     // transcendentals, tiled GEMM, reassociated reductions) hold against g++ exactly as against gcc.
     if let (Some(m), Some(cpp)) = (m, cpp) {
         let ratio = cpp.ns_per_call / m.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong runtime is {:.2}x {} than C++ (g++ -O3 -march=native)",
             if ratio >= 1.0 { ratio } else { 1.0 / ratio },
             if ratio >= 1.0 { "faster" } else { "slower" },
@@ -7972,7 +8025,7 @@ fn report(
     // (never replacing) the honest-flags C ratio above.
     if let (Some(m), Some(cf)) = (m, cfast) {
         let ratio = cf.ns_per_call / m.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong runtime is {:.2}x {} than C(fast) (gcc -O3 -march=native -ffast-math)",
             if ratio >= 1.0 { ratio } else { 1.0 / ratio },
             if ratio >= 1.0 { "faster" } else { "slower" },
@@ -7982,7 +8035,7 @@ fn report(
     // apples-to-apples multithreaded comparison for the @parallel rows.
     if let (Some(m), Some(co)) = (m, comp) {
         let ratio = co.ns_per_call / m.ns_per_call;
-        println!(
+        standing!(
             "  -> Wukong @parallel is {:.2}x {} than C(omp) (gcc -O3 -march=native -fopenmp, all cores)",
             if ratio >= 1.0 { ratio } else { 1.0 / ratio },
             if ratio >= 1.0 { "faster" } else { "slower" },
@@ -8840,13 +8893,13 @@ fn report_gemm_standing(wuk: &Option<Measure>, tuned: &Measure, roof: f64, flops
         let wk_g = flops / m.ns_per_call;
         let tuned_g = flops / tuned.ns_per_call;
         let r = wk_g / tuned_g;
-        println!(
+        standing!(
             "  -> Wukong single-core is {:.2}x {} than tuned matrixmultiply ({wk_g:.0} vs {tuned_g:.0} GFLOP/s)",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" },
         );
         if roof > 0.0 {
-            println!(
+            standing!(
                 "  -> Wukong single-core = {:.0}% of measured roofline; tuned matrixmultiply = {:.0}%",
                 wk_g / roof * 100.0,
                 tuned_g / roof * 100.0
@@ -9280,18 +9333,21 @@ fn report_gemm_vs_mkl(
     flops: f64,
 ) {
     if let (Some(m), Some(k)) = (wuk, mkl_1c) {
+        // Check BEFORE the standing (moved 2026-10-07): the numerics gate can withhold a ratio only
+        // if the mismatch it depends on has already been reported. Printed after it, a divergent
+        // GEMM's "1.05x faster than oneMKL" went out clean and the `!` line followed it.
+        let (rel, at) = max_rel_err(&m.out, &k.out);
+        if rel > 1e-3 {
+            mismatch!("  ! Wukong vs MKL full-buffer mismatch at [{at}] (rel {rel:.2e})");
+        }
         let (mg, kg) = (flops / m.ns_per_call, flops / k.ns_per_call);
         let r = mg / kg;
-        println!(
+        standing!(
             "  -> Wukong 1-core is {:.2}x {} than oneMKL(1 thread) — {:.0}% of MKL ({mg:.0} vs {kg:.0} GFLOP/s)",
             if r >= 1.0 { r } else { 1.0 / r },
             if r >= 1.0 { "faster" } else { "slower" },
             mg / kg * 100.0,
         );
-        let (rel, at) = max_rel_err(&m.out, &k.out);
-        if rel > 1e-3 {
-            println!("  ! Wukong vs MKL full-buffer mismatch at [{at}] (rel {rel:.2e})");
-        }
     }
     // Wukong's own parallel scaling: @parallel ÷ its own single core. Both are measured in the same
     // run with the same (rayon) thread pool, so this is robust to the laptop's power state and free of
@@ -9299,7 +9355,7 @@ fn report_gemm_vs_mkl(
     // scale" figure (16 physical cores is the ceiling; HT siblings add no FMA throughput).
     if let (Some(m1), Some(mp)) = (wuk, wk_par) {
         let eff = m1.ns_per_call / mp.ns_per_call;
-        println!("  -> Wukong @parallel scales {eff:.1}× over its own single core");
+        standing!("  -> Wukong @parallel scales {eff:.1}× over its own single core");
     }
     if let (Some(m), Some(k1), Some(ka)) = (wk_par, mkl_1c, mkl_all) {
         let (mg, kag, k1g) = (
@@ -9319,7 +9375,7 @@ fn report_gemm_vs_mkl(
             );
         } else {
             let r = mg / kag;
-            println!(
+            standing!(
                 "  -> Wukong @parallel is {:.2}x {} than oneMKL(all threads) — {:.0}% of MKL ({mg:.0} vs {kag:.0} GFLOP/s)",
                 if r >= 1.0 { r } else { 1.0 / r },
                 if r >= 1.0 { "faster" } else { "slower" },
@@ -10694,7 +10750,7 @@ fn bench_streaming_large(cc: &str, dir: &Path) {
     let y: Vec<f32> = (0..NL).map(|i| (i % 13) as f32 * 0.25 - 0.5).collect();
     let mut out = vec![0.0f32; NL];
     let (xp, yp) = (x.as_ptr(), y.as_ptr());
-    println!("=== streaming elementwise at N=2^24 (64 MiB/array, >L3; GB/s, higher is better) ===");
+    section!("=== streaming elementwise at N=2^24 (64 MiB/array, >L3; GB/s, higher is better) ===");
     println!(
         "  {:<10} {:>10} {:>10} {:>10} {:>10} {:>14} {:>14}",
         "", "Wukong", "C (gcc)", "C++ (g++)", "Rust", "Wuk vs C", "Wuk vs C++"
@@ -10771,7 +10827,24 @@ fn bench_streaming_large(cc: &str, dir: &Path) {
                 .map(|x| format!("{:.1}", *bytes as f64 / x.ns_per_call))
                 .unwrap_or_else(|| "n/a".into())
         };
+        // Full-buffer cross-check vs C, BEFORE the row prints: this table carries its ratios in its
+        // own cells, so a failing row prints SUSPECT there instead of a clean ratio (P8.3).
+        let failure = match (&wuk, &c) {
+            (Some(m), Some(c)) => {
+                let (rel, at) = max_rel_err(&m.out, &c.out);
+                (rel > 1e-4).then(|| {
+                    format!(
+                        "  ! {name} full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {rel:.2e})",
+                        m.out[at], c.out[at]
+                    )
+                })
+            }
+            _ => None,
+        };
         let standing_vs = |peer: &Option<Measure>| {
+            if failure.is_some() {
+                return "SUSPECT".to_string();
+            }
             if let (Some(m), Some(p)) = (&wuk, peer) {
                 let r = p.ns_per_call / m.ns_per_call;
                 format!(
@@ -10793,14 +10866,8 @@ fn bench_streaming_large(cc: &str, dir: &Path) {
             standing_vs(&c),
             standing_vs(&c_cpp)
         );
-        if let (Some(m), Some(c)) = (&wuk, &c) {
-            let (rel, at) = max_rel_err(&m.out, &c.out);
-            if rel > 1e-4 {
-                println!(
-                    "  ! {name} full-buffer mismatch vs C at [{at}]: Wukong={} C={} (rel {:.2e})",
-                    m.out[at], c.out[at], rel
-                );
-            }
+        if let Some(f) = &failure {
+            mismatch!("{f}");
         }
     }
     println!();

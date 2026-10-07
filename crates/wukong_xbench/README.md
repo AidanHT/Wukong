@@ -42,6 +42,17 @@ Wukong column's two samples is a twin control for that row, in that run, for fre
 is what an effect on that row has to beat, and a ratio inside it is printed `[INSIDE FLOOR]` rather
 than quoted.
 
+**The numerics gate (`src/numerics.rs`).** A cross-language mismatch is a gate, not an advisory
+line. Every section heading opens a numerics scope; a `!` mismatch marks it SUSPECT, and every
+`-> Wukong … is N.NNx faster/slower …` standing in a SUSPECT scope prints as
+`-> SUSPECT: ratio withheld` (the sentence survives only as a `. withheld:` note). Tables that carry
+their ratios in their own cells (the norm and streaming tables) print `SUSPECT` in those cells, and
+the elementwise summary geomeans exclude SUSPECT rows by name. The run ends with a
+`=== numerics gate ===` block listing every SUSPECT section and **exits 4** when there is one;
+`XBENCH_NUMERICS=report` keeps the exit code at 0 for an exploratory run and says so in the log. A
+peer column *dropped* for disagreeing (C++ vs C, a relaxed C(fast)/C(omp), an MKL ABI mismatch)
+prints no ratio, so it is not a mismatch.
+
 Optional first CLI argument is a substring filter over kernel/section names (e.g. `saxpy`).
 
 ## Sections
