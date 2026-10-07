@@ -27,6 +27,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 mod alias;
+mod bounds;
 mod canon;
 mod tile;
 mod tindex;
@@ -963,11 +964,29 @@ pub fn lower_program(
 /// [`lower_program`] with the construction knobs spelled out. Separate entry point rather than a
 /// fourth parameter on `lower_program`, because ~20 call sites across the workspace (the optimizer's
 /// examples, both benches, every backend's tests) want the defaults and should not have to say so.
+///
+/// Runtime safety failures (a slice index out of bounds) carry no source location through this
+/// entry point; [`lower_program_located`] attaches one.
 pub fn lower_program_with(
     module: &Module,
     sema: &SemaResult,
     interner: &mut Interner,
     opts: LowerOptions,
+) -> (Program, Vec<Diagnostic>) {
+    lower_program_located(module, sema, interner, opts, &|_| String::new())
+}
+
+/// [`lower_program_with`], plus the source location every runtime safety failure reports.
+/// `locate` renders a span start as `file:line:col` (an empty string means "unknown"); the driver
+/// passes its source map's view, so an out-of-bounds slice access prints where it happened on the
+/// interpreter, the JIT and a linked executable alike. A separate entry point for the same reason
+/// `lower_program_with` is one: only the driver has a source map to offer.
+pub fn lower_program_located(
+    module: &Module,
+    sema: &SemaResult,
+    interner: &mut Interner,
+    opts: LowerOptions,
+    locate: &dyn Fn(Span) -> String,
 ) -> (Program, Vec<Diagnostic>) {
     // Two AST normalizations run back to back, before anything looks at the tree, because every
     // kernel recognizer and the autovectorizer match a *syntactic* shape on the raw AST.
@@ -1170,6 +1189,9 @@ pub fn lower_program_with(
         rt_write_f64: interner.intern("wukong_rt_write_f64"),
         rt_write_i8: interner.intern("wukong_rt_write_i8"),
         now_ns: interner.intern("wukong_now_ns"),
+        bounds_fail: interner.intern("wukong_rt_bounds_fail"),
+        // Overwritten per function by `@unchecked`, below; checked is the default.
+        bounds_checks: true,
     };
     // Collect every concrete instantiation of every type-generic function (needs `&mut interner` to
     // intern the instance names), then lower the module. A type-generic function is NOT lowered here
@@ -1217,6 +1239,17 @@ pub fn lower_program_with(
             _ => None,
         })
         .collect();
+    // Functions carrying `@unchecked`: the slice bounds-check opt-out. Keyed by name for the same
+    // reason as `generic_fns` — the instance loop below has only the template's symbol.
+    let unchecked_fns: HashSet<Symbol> = module
+        .items
+        .iter()
+        .filter(|item| has_attr(item, interner, "unchecked"))
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::Fn(f) => Some(f.name.sym),
+            _ => None,
+        })
+        .collect();
     let fn_tiles: HashMap<Symbol, Vec<u64>> = module
         .items
         .iter()
@@ -1243,6 +1276,8 @@ pub fn lower_program_with(
                 // takes, because the switch rides on that struct and it is copied down into every
                 // recognizer and probe from here.
                 let gemm = generic_gemm(gemm, generic_fns.contains(&f.name.sym));
+                // `@unchecked`: lower this function's slice accesses without bounds checks.
+                let gemm = unchecked_gemm(gemm, unchecked_fns.contains(&f.name.sym));
                 // Whole-program aliasing, stamped on beside the `@generic` opt-out: `false` here
                 // means some call site in this program can hand two of this function's buffer
                 // parameters the same array, so no recognizer inside it may emit a kernel whose
@@ -2004,6 +2039,7 @@ pub fn lower_program_with(
         if let Some((f, body)) = fn_decls.get(orig) {
             // A `@generic` template's instances inherit the opt-out (keyed on the ORIGINAL name).
             let gemm = generic_gemm(gemm, generic_fns.contains(orig));
+            let gemm = unchecked_gemm(gemm, unchecked_fns.contains(orig));
             // Aliasing is a property of the ORIGINAL function's call sites: every instantiation of
             // a type-generic template shares them.
             let gemm = alias_gemm(gemm, alias_facts.alias_free(*orig));
@@ -2027,6 +2063,8 @@ pub fn lower_program_with(
     // The outlined bodies of every mid-function `@parallel` loop region, collected while lowering
     // the functions above. Appended last — backends resolve functions by name, so order is free.
     program.funcs.append(&mut par_regions.funcs);
+    // Give every slice bounds failure its `file:line:col` (a `.rodata` string; see `bounds.rs`).
+    bounds::attach_sites(&mut program, interner, gemm.bounds_fail, locate);
     (program, diags)
 }
 
@@ -2052,6 +2090,21 @@ fn has_generic_attr(item: &ast::Item, interner: &Interner) -> bool {
 /// the way down. See `alias.rs`.
 fn alias_gemm(gemm: GemmSyms, alias_free: bool) -> GemmSyms {
     GemmSyms { alias_free, ..gemm }
+}
+
+/// Does this item carry the attribute `@name`? `wukong_sema::attrs` has already checked placement.
+fn has_attr(item: &ast::Item, interner: &Interner, name: &str) -> bool {
+    item.attrs
+        .iter()
+        .any(|a| interner.resolve(a.name.sym) == name)
+}
+
+/// `gemm` with slice bounds checks cleared when the function being lowered is `@unchecked`.
+fn unchecked_gemm(gemm: GemmSyms, is_unchecked: bool) -> GemmSyms {
+    GemmSyms {
+        bounds_checks: gemm.bounds_checks && !is_unchecked,
+        ..gemm
+    }
 }
 
 /// `gemm` with recognition cleared when the function being lowered is `@generic`. Per-function
@@ -3327,6 +3380,12 @@ struct GemmSyms {
     /// nanosecond clock for in-process benchmarking. No arguments; both backends read the same
     /// clock (the interpreter calls `wukong_runtime::wukong_now_ns` directly).
     now_ns: Symbol,
+    /// The failure edge of a checked slice access: `wukong_rt_bounds_fail(index: i64, len: i64,
+    /// site: *u8)`, which never returns normally (see `bounds.rs`).
+    bounds_fail: Symbol,
+    /// Emit slice bounds checks (`true`, the default). Cleared per function by `@unchecked`, at the
+    /// same place `@generic` clears `recognize`; it rides here for the same reason that does.
+    bounds_checks: bool,
 }
 
 // Elementwise-math op codes — must match `wukong_runtime::vmath`'s `VM_*` (mir_build does not depend
@@ -19072,14 +19131,22 @@ impl FnLowerer<'_> {
                 // For a slice `s[i]`, the GEP base is the slice's *data* pointer — loaded from the fat
                 // pointer's offset 0 — not the 16-byte fat-pointer buffer itself. An array/pointer base
                 // GEPs off its own base directly.
+                let mut slice_buf = None;
                 let base_ptr = if matches!(base_ty, Ty::Slice(_)) {
                     let sbuf = self.place_base_ptr(base);
+                    slice_buf = Some(sbuf);
                     let dp = self.field_ptr(sbuf, SLICE_PTR_OFF);
                     self.builder.build(MirType::Ptr, Op::Load(dp, MirType::Ptr))
                 } else {
                     self.place_base_ptr(base)
                 };
                 let idx = self.lower_index_i64(&indices[0]);
+                // A slice's length is in its own fat pointer: check `idx <u len` before the access
+                // (base, then index, then the check — the order Rust evaluates `s[i]` in). Arrays
+                // and constant-shape tensors are checked statically; see `bounds.rs`.
+                if let Some(sbuf) = slice_buf {
+                    self.emit_slice_bounds_check(sbuf, idx, e.span);
+                }
                 // Prefer the element type from the base's array/slice type; fall back to the indexed
                 // expression's own type (tensors/pointers). Resolve through the registry-aware
                 // `mir_ty_of` so a struct/tuple element becomes its byte-buffer `Array` type (the GEP

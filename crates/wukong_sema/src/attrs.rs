@@ -5,9 +5,11 @@
 //! discarded* — so `@parellel` (a typo of `@parallel`) compiled to a single-threaded program with no
 //! diagnostic at all, which is exactly the failure mode an attribute is supposed to prevent.
 //!
-//! The set below is closed on purpose. `parallel`, `generic`, `tile` and `extern` are the four the
-//! language intends to consume; `inline`, `simd`, `align` and `export` are parsed-and-discarded
-//! today and stay in the set so existing programs keep compiling. Anything else is an error, which
+//! The set below is closed on purpose. `parallel`, `generic`, `tile`, `extern` and `unchecked` are
+//! the ones the language consumes (`@unchecked` removes the slice bounds checks from one function —
+//! the explicit opt-out of the safe default, read by `wukong_mir_build`); `inline`, `simd`, `align`
+//! and `export` are parsed-and-discarded today and stay in the set so existing programs keep
+//! compiling. Anything else is an error, which
 //! also means a future attribute cannot be *used* before it is *implemented*.
 //!
 //! Placement is checked here too, but only where a misplaced attribute would be a silent lie.
@@ -26,14 +28,24 @@ use wukong_ast::{Attr, Block, Expr, ExprKind, ForIter, Item, ItemKind, Module, S
 use wukong_diag::Diagnostic;
 use wukong_span::Interner;
 
-/// Every attribute name the v1 language accepts, in the order the diagnostic lists them: the four
+/// Every attribute name the v1 language accepts, in the order the diagnostic lists them: the ones
 /// that are (or are being) consumed first, then the four that are parsed and discarded.
 pub const KNOWN_ATTRS: &[&str] = &[
-    "parallel", "generic", "tile", "extern", "inline", "simd", "align", "export",
+    "parallel",
+    "generic",
+    "tile",
+    "extern",
+    "unchecked",
+    "inline",
+    "simd",
+    "align",
+    "export",
 ];
 
 /// Attributes that are read from a function item and therefore mean nothing anywhere else.
-const FN_ITEM_ONLY: &[&str] = &["generic"];
+/// `@unchecked` is per function on purpose: a bounds-check opt-out has to be visible where the
+/// unchecked accesses are written, not inherited from a caller.
+const FN_ITEM_ONLY: &[&str] = &["generic", "unchecked"];
 
 /// Attributes read from a function item **or** from the `for` statement they sit on, and nowhere
 /// else. `@tile` is a loop schedule: `lower_program_with` reads it off the `fn` into a width queue
@@ -322,6 +334,25 @@ mod tests {
             codes("@bogus\nstruct S { x: i32 }"),
             vec!["E0306"],
             "struct item"
+        );
+    }
+
+    /// `@unchecked` (the slice bounds-check opt-out) is read off the function item only; on a loop
+    /// or a `let` it would read as a narrower opt-out that nothing implements.
+    #[test]
+    fn unchecked_is_rejected_off_a_fn_item() {
+        assert_eq!(
+            codes("fn f(s: []i32) -> i32 { @unchecked let x: i32 = s[0]; return x; }"),
+            vec!["E0306"],
+            "statement"
+        );
+        assert_eq!(
+            codes(
+                "@unchecked
+fn f(s: []i32) -> i32 { return s[0]; }"
+            ),
+            Vec::<&str>::new(),
+            "fn item"
         );
     }
 

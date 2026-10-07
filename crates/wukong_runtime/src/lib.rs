@@ -181,6 +181,9 @@ pub use cumprod::{wukong_cumprod_f32, wukong_cumprod_f32_parallel};
 mod bias;
 pub use bias::{wukong_bias_bcast_f32, wukong_bias_bcast_f32_parallel, BIAS_ACT_NONE};
 
+mod safety;
+pub use safety::{bounds_failure_message, site_str, wukong_rt_bounds_fail};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer

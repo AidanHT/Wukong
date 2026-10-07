@@ -49,7 +49,39 @@ mod avx2;
 
 static OUTPUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static ASSERT_FAILED: AtomicBool = AtomicBool::new(false);
+/// The diagnostic of the first runtime failure of the current guarded run (`assertion failed`, or a
+/// slice bounds failure's `index out of bounds: …`). Set alongside [`ASSERT_FAILED`], first one wins,
+/// and reported by the guarded run APIs as the run's error.
+static FAILURE_MESSAGE: Mutex<Option<String>> = Mutex::new(None);
 static RUN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Record `message` as the run's failure unless an earlier one is already recorded, and raise the
+/// shared failure flag the generated code polls.
+fn record_failure(message: impl FnOnce() -> String) {
+    if let Ok(mut m) = FAILURE_MESSAGE.lock() {
+        if m.is_none() {
+            *m = Some(message());
+        }
+    }
+    ASSERT_FAILED.store(true, Ordering::SeqCst);
+}
+
+/// Clear the failure state at the start of a guarded run.
+fn reset_failure() {
+    ASSERT_FAILED.store(false, Ordering::SeqCst);
+    if let Ok(mut m) = FAILURE_MESSAGE.lock() {
+        *m = None;
+    }
+}
+
+/// The failure a guarded run ended with, if any: the recorded diagnostic, or `assertion failed`.
+fn take_failure() -> Option<String> {
+    if !ASSERT_FAILED.load(Ordering::SeqCst) {
+        return None;
+    }
+    let recorded = FAILURE_MESSAGE.lock().ok().and_then(|mut m| m.take());
+    Some(recorded.unwrap_or_else(|| "assertion failed".to_owned()))
+}
 
 extern "C" fn rt_print_i64(x: i64) {
     if let Ok(mut o) = OUTPUT.lock() {
@@ -93,8 +125,38 @@ extern "C" fn rt_print_str(ptr: *const u8) {
 
 extern "C" fn rt_assert(cond: i64) {
     if cond == 0 {
-        ASSERT_FAILED.store(true, Ordering::SeqCst);
+        record_failure(|| "assertion failed".to_owned());
     }
+}
+
+// A slice index failed its bounds check — the failure edge `mir_build` emits for every checked
+// `s[i]` (see `wukong_mir_build/src/bounds.rs`). Record the shared diagnostic and raise the failure
+// flag; the generated code then returns through its callers exactly as for a failed `assert`, so
+// the run stops at this access on the JIT just as it does in the interpreter and the linked exe.
+extern "C" fn rt_bounds_fail(index: i64, len: i64, site: *const u8) {
+    // SAFETY: `site` is a NUL-terminated `.rodata` string emitted by the compiler.
+    let site = unsafe { wukong_runtime::site_str(site) };
+    record_failure(|| wukong_runtime::bounds_failure_message(index, len, &site));
+}
+
+// The raw-function-pointer (`jit_module`) binding of the same symbol. A raw caller has no run
+// handle a failure could be reported through, and early-returning a dummy value would be a silent
+// wrong answer, so an out-of-bounds slice access is fatal there — Rust's `panic = "abort"`.
+extern "C" fn rt_bounds_fail_abort(index: i64, len: i64, site: *const u8) {
+    // SAFETY: as in `rt_bounds_fail`.
+    let site = unsafe { wukong_runtime::site_str(site) };
+    eprintln!(
+        "error: {}",
+        wukong_runtime::bounds_failure_message(index, len, &site)
+    );
+    std::process::abort();
+}
+
+// The raw-mode binding of `wukong_rt_assert_failed`. A raw module contains no `assert` (declined by
+// `jit_module`) and aborts on a bounds failure, so no failure can ever be pending in it — and
+// reading the shared flag would let an unrelated guarded run on another thread stop raw code.
+extern "C" fn rt_assert_never_failed() -> i64 {
+    0
 }
 
 extern "C" fn rt_assert_failed() -> i64 {
@@ -121,6 +183,8 @@ const RT_PRINT_F64: &str = "wukong_rt_print_f64";
 const RT_PRINT_STR: &str = "wukong_rt_print_str";
 const RT_ASSERT: &str = "wukong_rt_assert";
 const RT_ASSERT_FAILED: &str = "wukong_rt_assert_failed";
+// The failure edge of a checked slice access: (index: i64, len: i64, site: ptr) -> void.
+const RT_BOUNDS_FAIL: &str = "wukong_rt_bounds_fail";
 // The heap builtins: zeroed allocation (count, elem_size, elem_is_float) -> ptr, and its release.
 const RT_ALLOC: &str = "wukong_rt_alloc";
 const RT_FREE: &str = "wukong_rt_free";
@@ -1655,6 +1719,20 @@ impl<'a> FnTranslator<'a> {
             let call = self.builder.ins().call(fref, &[]);
             return self.builder.inst_results(call).first().copied();
         }
+        // The failure edge of a checked slice access: wukong_rt_bounds_fail(index, len, site).
+        // It records the diagnostic; this function then returns at once through the same path a
+        // failed `assert` takes (its callers poll the shared flag), so no statement after the bad
+        // access runs. The MIR block's `unreachable` lands in the dead resume block.
+        if name == RT_BOUNDS_FAIL && args.len() == 3 {
+            let index = self.coerce_to_i64(args[0]);
+            let len = self.coerce_to_i64(args[1]);
+            let site = self.val(args[2]);
+            let fref = self.runtime_ref(RT_BOUNDS_FAIL);
+            self.builder.ins().call(fref, &[index, len, site]);
+            let failed = self.builder.ins().iconst(types::I8, 1);
+            self.return_on_assert_failure(failed, false);
+            return None;
+        }
         // The file-I/O intrinsics: wukong_rt_{read,write}_{f32,f64,i32,i64,i8,u8}(path, data, len) -> i64.
         // All twelve share one ABI — the NUL-terminated path pointer, the slice's data pointer, and
         // an i64 element count — so one branch keyed on `name` emits the call. Returns the i64
@@ -2121,6 +2199,7 @@ struct RtFuncs {
     print_str: FuncId,
     assert: FuncId,
     assert_failed: FuncId,
+    bounds_fail: FuncId,
     rt_alloc: FuncId,
     rt_free: FuncId,
     rt_read_f32: FuncId,
@@ -2372,7 +2451,28 @@ fn make_isa_verify(
         .map_err(|e| e.to_string())
 }
 
-/// Direct-call failure propagation is only needed along paths that can reach a builtin assert.
+/// Is `func` (not a user function) one of the runtime failure intrinsics — a builtin `assert`, or the
+/// failure edge of a checked slice access? Either one stops the run.
+fn is_failure_intrinsic(func: Symbol, interner: &Interner) -> bool {
+    matches!(interner.resolve(func), "assert" | RT_BOUNDS_FAIL)
+}
+
+/// Does any function call the builtin `assert` directly? (The raw `jit_module` API declines those:
+/// a raw caller could neither reset nor read the failure an `assert` reports.)
+fn calls_builtin_assert(program: &Program, interner: &Interner) -> bool {
+    let defined: HashSet<Symbol> = program.funcs.iter().map(|f| f.name).collect();
+    program
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter().flat_map(|b| &b.insts))
+        .any(|inst| {
+            matches!(inst.op, Op::Call { func, .. }
+                if !defined.contains(&func) && interner.resolve(func) == "assert")
+        })
+}
+
+/// Direct-call failure propagation is only needed along paths that can reach a builtin assert or a
+/// slice bounds failure.
 fn asserting_functions(program: &Program, interner: &Interner) -> Result<HashSet<Symbol>, String> {
     let defined: HashSet<Symbol> = program.funcs.iter().map(|f| f.name).collect();
     let mut asserting = HashSet::new();
@@ -2385,7 +2485,7 @@ fn asserting_functions(program: &Program, interner: &Interner) -> Result<HashSet
             let can_fail = f.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
                 if let Op::Call { func, .. } = inst.op {
                     asserting.contains(&func)
-                        || (!defined.contains(&func) && interner.resolve(func) == "assert")
+                        || (!defined.contains(&func) && is_failure_intrinsic(func, interner))
                 } else {
                     false
                 }
@@ -2679,6 +2779,11 @@ fn populate_module<M: Module>(
     // No parameters; returns the elapsed nanoseconds as an i64.
     let mut sig_now_ns = Signature::new(call_conv);
     sig_now_ns.returns.push(AbiParam::new(types::I64));
+    // wukong_rt_bounds_fail(index: i64, len: i64, site: ptr)
+    let mut sig_bounds_fail = Signature::new(call_conv);
+    sig_bounds_fail.params.push(AbiParam::new(types::I64));
+    sig_bounds_fail.params.push(AbiParam::new(types::I64));
+    sig_bounds_fail.params.push(AbiParam::new(ptr_ty));
     let rt = RtFuncs {
         print_i64: module
             .declare_function(RT_PRINT_I64, Linkage::Import, &sig_i)
@@ -2697,6 +2802,9 @@ fn populate_module<M: Module>(
             .map_err(|e| e.to_string())?,
         assert_failed: module
             .declare_function(RT_ASSERT_FAILED, Linkage::Import, &sig_now_ns)
+            .map_err(|e| e.to_string())?,
+        bounds_fail: module
+            .declare_function(RT_BOUNDS_FAIL, Linkage::Import, &sig_bounds_fail)
             .map_err(|e| e.to_string())?,
         rt_alloc: module
             .declare_function(RT_ALLOC, Linkage::Import, &sig_rt_alloc)
@@ -3205,6 +3313,7 @@ fn populate_module<M: Module>(
         (RT_PRINT_F64, rt.print_f64),
         (RT_ASSERT, rt.assert),
         (RT_ASSERT_FAILED, rt.assert_failed),
+        (RT_BOUNDS_FAIL, rt.bounds_fail),
         (RT_ALLOC, rt.rt_alloc),
         (RT_FREE, rt.rt_free),
         (RT_READ_F32, rt.rt_read_f32),
@@ -3800,7 +3909,7 @@ impl JitProgram {
     pub fn run(&self) -> Result<(i64, Vec<u8>), String> {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        ASSERT_FAILED.store(false, Ordering::SeqCst);
+        reset_failure();
         // Run the JIT'd entry on a worker thread with a large stack, mirroring the interpreter's
         // `with_big_stack`. The native code recurses on the host call stack (one machine frame per
         // Wukong call), so a deeply recursive program would overflow the default ~8 MiB main-thread
@@ -3813,8 +3922,8 @@ impl JitProgram {
         let ret = self.ret.clone();
         let exit_code = run_on_big_stack(move || unsafe { invoke_code(code, &ret) });
         let out = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if ASSERT_FAILED.load(Ordering::SeqCst) {
-            return Err("assertion failed".into());
+        if let Some(failure) = take_failure() {
+            return Err(failure);
         }
         Ok((exit_code, out))
     }
@@ -3833,9 +3942,9 @@ impl JitProgram {
     pub fn call(&self) -> i64 {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        ASSERT_FAILED.store(false, Ordering::SeqCst);
+        reset_failure();
         let result = unsafe { self.invoke() };
-        if ASSERT_FAILED.load(Ordering::SeqCst) {
+        if take_failure().is_some() {
             1
         } else {
             result
@@ -3940,6 +4049,7 @@ fn jit_compile_entry(
     builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
     builder.symbol(RT_ASSERT_FAILED, rt_assert_failed as *const u8);
+    builder.symbol(RT_BOUNDS_FAIL, rt_bounds_fail as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);
     builder.symbol(RT_FREE, wukong_runtime::wukong_rt_free as *const u8);
     builder.symbol(RT_READ_F32, wukong_runtime::wukong_rt_read_f32 as *const u8);
@@ -4511,10 +4621,16 @@ impl Drop for JitModuleHandle {
 
 /// JIT-compile every function in `program`, returning a handle for fetching their code pointers.
 /// Programs containing assertions require the guarded `JitProgram` invocation API instead.
+///
+/// A slice bounds check is accepted here, with a raw-mode meaning: a raw caller has no run handle
+/// to report a failure through, so an out-of-bounds slice access aborts the process with the shared
+/// `index out of bounds` diagnostic rather than returning a silently wrong value.
 pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHandle, String> {
     use cranelift_jit::{JITBuilder, JITModule};
 
-    if !asserting_functions(program, interner)?.is_empty() {
+    // Still reject assertion-capable callbacks with no cancellation path.
+    asserting_functions(program, interner)?;
+    if calls_builtin_assert(program, interner) {
         return Err("raw JIT function pointers do not support assertion-capable programs; use jit_compile and JitProgram::run or JitProgram::call".into());
     }
 
@@ -4525,7 +4641,10 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_PRINT_F64, rt_print_f64 as *const u8);
     builder.symbol(RT_PRINT_STR, rt_print_str as *const u8);
     builder.symbol(RT_ASSERT, rt_assert as *const u8);
-    builder.symbol(RT_ASSERT_FAILED, rt_assert_failed as *const u8);
+    // Raw mode: no `assert` reaches here (declined above), a bounds failure aborts, and so no
+    // failure is ever pending — never read the flag a concurrent guarded run may have raised.
+    builder.symbol(RT_ASSERT_FAILED, rt_assert_never_failed as *const u8);
+    builder.symbol(RT_BOUNDS_FAIL, rt_bounds_fail_abort as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);
     builder.symbol(RT_FREE, wukong_runtime::wukong_rt_free as *const u8);
     builder.symbol(RT_READ_F32, wukong_runtime::wukong_rt_read_f32 as *const u8);

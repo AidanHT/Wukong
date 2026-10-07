@@ -1028,11 +1028,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   `while (i < n)`), not Rust-style range capture: mutating `n` inside the body changes the remaining
   iteration count. Defensible for a low-level kernel language, but worth knowing. A descending range
   with a negative step runs zero iterations (the condition stays `i < hi`).
-- No **runtime** bounds checking on array indexing (manual memory is a decided constraint). A
+- **Slice accesses are bounds-checked at runtime** (default on; `@unchecked` on a function opts it
+  out). `s[i]` is compared against the length in the slice's fat pointer, and an out-of-range access
+  stops the program with `error: index out of bounds: the len is N but the index is I at
+  file:line:col`, exit 1, identically on the interpreter, the JIT and a linked executable
+  (`tests/run/slice_bounds_*.wk`). Still unchecked: a **runtime** index into a fixed-size array
+  or a constant-shape tensor (the static length is known, so this is the same machinery with a
+  constant bound — not yet wired), and the extents a recognized kernel call reads. A
   **compile-time-constant** index past the end is still caught at compile time (`E0501`) — for both a
   fixed-size array (`a[5]` on a `[T; 4]`) and a static tensor dimension (`a[5, 0]` on a
-  `Tensor[f32, 2, 2]`); runtime/computed indices remain unchecked. On such an out-of-bounds access the
-  backends differ: the interpreter (the oracle) *traps* on an index it can detect as out of range (a
+  `Tensor[f32, 2, 2]`). On an unchecked out-of-bounds access the backends differ: the interpreter (the oracle) *traps* on an index it can detect as out of range (a
   debugging aid — its memory is a bounded slot vector), while the native backend reads/writes past the
   buffer, classic UB like C (and an optimization level can even change the garbage observed). An
   out-of-bounds program is therefore outside the defined contract — the differential gate's bit-for-bit

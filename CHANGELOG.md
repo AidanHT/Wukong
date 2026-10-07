@@ -7,6 +7,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Language safety (gap/lang-safety)
 
+- **Slice accesses are bounds-checked.** `s[i]` on a `[]T` now compares `i` against the length in
+  the slice's own fat pointer (`i <u len`, so a negative index fails too) and, out of range, stops
+  with `error: index out of bounds: the len is N but the index is I at file.wk:line:col`, exit 1 —
+  the same text and the same stopping point on the interpreter, the Cranelift JIT and a linked
+  executable (`wukong_rt_bounds_fail`; one formatter in `wukong_runtime::safety`, mirrored by the C
+  fallback shim). The site is attached by the new `wukong_mir_build::lower_program_located`, which
+  the driver calls with its source map. `@unchecked` on a function is the explicit opt-out. Before
+  this, an out-of-range slice index read or wrote past the buffer natively (classic UB) while the
+  interpreter reported `load out of bounds`. `tests/run/slice_bounds_{oob,negative,in_range}.wk`.
+
 - **A pointer condition is a null test, and the interpreter has a real null.** The interpreter
   reserves slot 0 at every entry point (`wukong_interp::NULL_SLOT`), so `0 as *T` is the same null
   on both backends and a load/store through it is the diagnostic `null pointer dereference`. `if p`,

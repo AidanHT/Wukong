@@ -372,8 +372,22 @@ pub fn compile(opts: &Options) -> i32 {
     // environment reads inside a recognizer; `lower_options_for` is where that choice lives and why
     // the requested backend is part of it.
     let lower_opts = lower_options_for(opts);
+    // Runtime safety failures (an out-of-bounds slice index) report where they happened. The
+    // location is rendered here, where the source map lives, and baked into `.rodata` by the
+    // lowering, so the interpreter, the JIT and a linked executable all print the same text.
+    let locate = |span: wukong_span::Span| -> String {
+        let id = span.source;
+        if span.is_dummy()
+            || id.0 as usize >= sm.file_count()
+            || span.lo as usize > sm.source(id).len()
+        {
+            return String::new();
+        }
+        let loc = sm.span_location(span);
+        format!("{}:{}:{}", sm.name(id), loc.line, loc.col)
+    };
     let (mut program, lower_diags) =
-        wukong_mir_build::lower_program_with(&module, &sema, &mut interner, lower_opts);
+        wukong_mir_build::lower_program_located(&module, &sema, &mut interner, lower_opts, &locate);
     // MIR and train_lens own everything needed downstream. Release completed frontend
     // artifacts before optimization and codegen allocate their working sets.
     drop(module);
@@ -617,6 +631,14 @@ void wukong_rt_print_f64(double x) {\n\
 }\n\
 void wukong_rt_assert(long long c) { if (!c) { fprintf(stderr, \"assertion failed\\n\"); exit(1); } }\n\
 long long wukong_rt_assert_failed(void) { return 0; }\n\
+/* A failed slice bounds check. Mirrors `wukong_runtime::bounds_failure_message` byte for byte, and\n\
+   exits with the status `wukongc --run` reports for a runtime failure. */\n\
+void wukong_rt_bounds_fail(long long index, long long len, const char* site) {\n\
+    fflush(stdout);\n\
+    if (site && site[0]) fprintf(stderr, \"error: index out of bounds: the len is %lld but the index is %lld at %s\\n\", len, index, site);\n\
+    else fprintf(stderr, \"error: index out of bounds: the len is %lld but the index is %lld\\n\", len, index);\n\
+    exit(1);\n\
+}\n\
 double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }\n\
 float wukong_rt_fmod_f32(float a, float b) { return fmodf(a, b); }\n\
 /* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract — and\n\

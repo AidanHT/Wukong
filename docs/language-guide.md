@@ -181,7 +181,7 @@ concatenation/indexing/length operators — a string is a NUL-terminated `*u8` i
 | Tuples      | `(A, B, …)`, field access `t.0`, nested `t.0.1`       | ✅     |
 | Structs     | `struct S { … }`, literal `S { f: v }`, field `s.f`  | ✅     |
 | Enums       | C-style `enum E { A = 10, B }` (variant = its `i32` discriminant) **and data-carrying** `V(i32)` / `V { f: T }` variants | ✅ |
-| Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, indexed load/store, iteration, array→slice unsizing | ✅ |
+| Slices      | `[]T` — fat pointer `{data, len}`; `.len()`, **bounds-checked** indexed load/store, iteration, array→slice unsizing | ✅ |
 | SIMD vectors| `f32x4`/`i32x4`, generic `vec[T, N]` — the type **parses and type-checks** (a non-scalar element is `E0302`, a lane/element mismatch at a call is `E0401`), but no vector value can be constructed in source (`f32x4::load(p)` is `C0001`) and float-vector arithmetic is an internal error, so nothing uses it. SIMD ships through the **automatic** 128-bit/256-bit loop vectorizer, which needs no vector type in source. | 🔵 |
 | Tensors     | `Tensor[f32, M, N]` — shape checking, and **indexing** (`a[i, j]`) for both const and symbolic-generic dims, on the default `contiguous` layout. A constant-shape tensor costs **nothing** over the hand-flattened `[f32; M*N]` + `a[i*N + j]` spelling: the two compile to byte-identical MIR, same kernel dispatch and same vectorization. `.col_major` indexing executes for constant-shape tensors (`a[i, j]` is byte-identical to `a[i + j*M]`). `.strided`/`.tiled(…)` type-check but cannot be indexed (`C0001`). Whole-tensor arithmetic (`a + b`) is `E0401` — operate elementwise. | ✅ |
 
@@ -468,12 +468,13 @@ runtime size is outside the defined contract, like any runtime index
 
 Attribute *syntax* is parsed on functions, parameters and statements (a missing argument value is
 `E0207`), and the attribute **name is validated against a closed set** (✅): `@parallel`, `@generic`,
-`@tile`, `@extern`, `@inline`, `@simd`, `@align`, `@export`. Anything else — `@bogus(1, 2)`, and far
+`@tile`, `@extern`, `@unchecked`, `@inline`, `@simd`, `@align`, `@export`. Anything else — `@bogus(1, 2)`, and far
 more usefully a typo of a real one such as `@parellel` — is **`E0306`**, where it used to be accepted
-and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Three attributes have
+and discarded in silence (`tests/fail/unknown_attr.wk`, `unknown_attr_typo.wk`). Four attributes have
 a consumer on a **function**: **`@parallel`** (✅), which makes its loop execute across CPU cores,
-**`@generic`** (✅), which opts the function out of the kernel recognizers (below), and **`@tile`** (✅),
-which strip-mines loops (below).
+**`@generic`** (✅), which opts the function out of the kernel recognizers (below), **`@tile`** (✅),
+which strip-mines loops (below), and **`@unchecked`** (✅), which removes the function's slice bounds
+checks (see *Memory and parallelism*; on anything but a `fn` item it is `E0306`).
 Everything else in the list above — `@inline`, `@simd`, `@align`, `@extern`, `@export`, and
 `@parallel`'s own `grain = …` argument — is parsed and discarded (🔵). `@tile` is consumed as loop
 strip-mining (see below), and when it cannot be applied it is **`E0309`**, not a silent drop. A
@@ -753,6 +754,16 @@ for i in 0..acts.len() {
 }
 free(acts);
 ```
+
+**Slice accesses are bounds-checked** (✅): `s[i]` compares `i` against the length in `s`'s own fat
+pointer (one unsigned compare, so a negative index fails too) and, out of range, stops the program
+with `error: index out of bounds: the len is N but the index is I at file.wk:line:col` and exit
+status 1 — identically on the interpreter, the native JIT and a linked executable. `@unchecked` on
+a function removes its checks — the explicit, visible opt-out, like Rust's `get_unchecked`; an
+out-of-range access there is undefined behaviour on the native backend. Fixed-size arrays and
+constant-shape tensors are checked at compile time for constant indices (`E0501`); a *runtime* index
+into a fixed-size array is not yet checked. A recognized kernel (a loop the compiler replaces with a
+runtime kernel call) runs over the extent the loop names and is not checked against slice lengths.
 
 Freeing anything not returned by `alloc_*`, double-freeing, or touching a slice after `free` is
 **undefined behavior** on the native backend; the interpreter's mark-and-forget model (its

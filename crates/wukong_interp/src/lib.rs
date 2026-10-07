@@ -1660,6 +1660,21 @@ impl<'a, 'k> Interp<'a, 'k> {
                     Err("assertion failed".to_string())
                 }
             }
+            // `wukong_rt_bounds_fail(index, len, site)` — the failure edge of a checked slice access
+            // `s[i]` (`index <u len` was false). `site` is the `.rodata` `file:line:col` string the
+            // lowering attached. The message comes from the one formatter the JIT and the linked
+            // executable also use, so all three paths report the same text and stop at this point.
+            "wukong_rt_bounds_fail" => {
+                let index = args.first().map_or(0, |v| v.as_int()) as i64;
+                let len = args.get(1).map_or(0, |v| v.as_int()) as i64;
+                let site = match args.get(2).copied() {
+                    Some(Value::Ptr(base)) if !self.is_null(base) => {
+                        file_read_path(&self.memory, base)?
+                    }
+                    _ => String::new(),
+                };
+                Err(wukong_runtime::bounds_failure_message(index, len, &site))
+            }
             // `wukong_rt_alloc(count, elem_size, elem_is_float) -> ptr` — the heap allocation
             // backing the `alloc_<T>(n)` builtins. A heap object in the slot-indexed memory model
             // is exactly an alloca-shaped run: `count` contiguous typed-zero slots (one per scalar

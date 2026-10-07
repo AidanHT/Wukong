@@ -164,3 +164,56 @@ fn raw_jit_declines_assertions_and_preserves_assertion_free_calls() {
         unsafe { std::mem::transmute(module.func_ptr(main).unwrap()) };
     assert_eq!(unsafe { entry() }, 42);
 }
+
+#[test]
+fn slice_bounds_failure_stops_like_an_assert_and_reports_the_shared_message() {
+    // `get(a, 3)` on a 3-element slice fails its bounds check. Everything before the access ran
+    // (`2`, `6`, `3`); nothing after it may (`99` from main, the return value). The native run must
+    // report the very message the interpreter does, at -O0 and after -O2 inlined `get` into main.
+    let src = "fn get(s: []i32, i: i64) -> i32 { print(i); return s[i]; }
+               fn main() -> i32 { let a: [i32; 3] = [4, 5, 6]; print(get(a, 2)); \
+               print(get(a, 3)); print(99); return 0; }";
+    for opt in [0, 2] {
+        let (program, interner, main) = lower(src, opt);
+        let native = jit_compile(&program, main, &interner).unwrap();
+        {
+            let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            OUTPUT.lock().unwrap().clear();
+            reset_failure();
+            unsafe {
+                native.invoke();
+            }
+            assert!(ASSERT_FAILED.load(Ordering::SeqCst), "opt={opt}");
+            assert_eq!(*OUTPUT.lock().unwrap(), b"2\n6\n3\n", "opt={opt}");
+        }
+        let expected = Err("index out of bounds: the len is 3 but the index is 3".to_owned());
+        assert_eq!(native.run(), expected, "opt={opt}");
+        assert_eq!(
+            wukong_interp::run_with_output(&program, main, &interner),
+            expected,
+            "opt={opt}"
+        );
+        assert_eq!(native.call(), 1, "opt={opt}");
+    }
+}
+
+#[test]
+fn raw_jit_accepts_bounds_checked_code_and_runs_it_in_range() {
+    // A bounds check alone does not make a program assertion-capable for the raw API: a raw
+    // caller gets the checked code with an abort-on-failure binding. In range it just runs.
+    let (program, mut interner, _) = lower(
+        "fn get(s: []i32, i: i64) -> i32 { return s[i] * 10; }
+         fn main() -> i32 { return 0; }",
+        0,
+    );
+    let module = jit_module(&program, &interner).expect("bounds checks are raw-callable");
+    let get = interner.intern("get");
+    let entry: unsafe extern "C" fn(*const u64, i64) -> i32 =
+        unsafe { std::mem::transmute(module.func_ptr(get).unwrap()) };
+    let data = [7i32, 8, 9];
+    // A `[]i32` parameter is a pointer to its 16-byte fat pointer: { data, len }.
+    let fat = [data.as_ptr() as u64, data.len() as u64];
+    for (i, want) in [(0i64, 70), (1, 80), (2, 90)] {
+        assert_eq!(unsafe { entry(fat.as_ptr(), i) }, want);
+    }
+}
