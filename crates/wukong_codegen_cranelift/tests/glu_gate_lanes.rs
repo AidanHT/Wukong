@@ -33,6 +33,7 @@ fn lower(n: usize, reversed: bool, recognize: bool) -> (Program, Interner) {
         wukong_mir_build::LowerOptions {
             recognize,
             vec_kernels: false,
+            ..Default::default()
         },
     );
     assert!(diagnostics.is_empty(), "lower: {diagnostics:?}\n{source}");
