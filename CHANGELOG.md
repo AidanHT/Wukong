@@ -22,6 +22,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   the type and its function; fixture `tests/fail/native_layout_too_large.wk`, reached through the new
   `// EMIT: <stage>` fail-fixture directive), a by-design decline is `C0001`, and anything else is an
   internal-compiler-error diagnostic.
+- **`--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>`.** `--emit=obj|exe` used to bake in
+  every ISA feature of the compiling host plus raw AVX2+FMA loop kernels with no runtime dispatch,
+  so an executable built on an AVX2 machine faulted with `#UD` on older x86-64 CPUs and nothing
+  could ask for a portable baseline. The flag sets an exact Cranelift feature set per level
+  (`wukong_codegen_cranelift::TargetCpu`); below x86-64-v3 the driver builds the MIR without the
+  raw-AVX2 recipes and the backend refuses any that reach it. `--run --backend=native` honours it
+  too (refusing a level the host lacks), which is how the baseline code is tested on this machine.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 

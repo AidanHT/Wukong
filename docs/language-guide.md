@@ -847,6 +847,13 @@ wukongc [OPTIONS] <input.wk>
                       gpu-lower = gpu-native; any other value is a usage error (exit 2)
 --emit=<stage>        tokens | ast | mir-high | mir (alias mir-low) | grad | llvm-ir | obj | exe
                       (default: exe)
+--target-cpu=<c>      native | x86-64 | x86-64-v2 | x86-64-v3 | x86-64-v4   (default: native)
+                      instruction-set level for native code (--emit=obj/exe, --backend=native).
+                      native = every feature of the compiling host; a named level is exact and
+                      host-independent. Below x86-64-v3 the raw-AVX2 loop kernels are not used
+                      (the loop keeps its result-identical 128-bit form), so the object runs on
+                      any CPU of that level. The JIT refuses a level its host lacks. Runtime
+                      kernels select AVX2/FMA at run time, so they are portable at every level.
                       grad = reverse-mode backward MIR of a loss fn (see --grad-of/--grad-wrt)
 --grad-of=<fn>        function to differentiate for --emit=grad / --train   (default: loss)
 --grad-wrt=<i,..>     buffer-parameter indices to differentiate w.r.t. (default: every buffer

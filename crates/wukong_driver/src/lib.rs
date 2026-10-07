@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use wukong_diag::{Diagnostic, DiagnosticSink, Renderer};
 use wukong_span::{Interner, SourceMap};
 
+pub use wukong_codegen_cranelift::TargetCpu;
 pub use wukong_diag::{all_explanations, explain, Explanation};
 
 /// The GPU offloading bridge (`--backend=gpu`), compiled only with the `gpu` feature.
@@ -115,6 +116,11 @@ pub struct Options {
     /// Which backend to run/emit with. `--run` defaults to the interpreter (the reference oracle);
     /// native object/exe emission always uses Cranelift.
     pub backend: BackendKind,
+    /// The instruction-set level native code is generated for (`--target-cpu`): `native` (the
+    /// host's full feature set, the default) or an x86-64 micro-architecture level. Governs
+    /// `--emit=obj|exe` and `--run --backend=native`; a level below x86-64-v3 also builds the MIR
+    /// without the raw-AVX2 vector recipes (see [`lower_options_for`]).
+    pub target_cpu: TargetCpu,
     /// Autodiff / training options (see [`GradOptions`]). Only consulted by `--emit=grad` and
     /// `--train`; inert for every other stage.
     pub grad: GradOptions,
@@ -181,6 +187,7 @@ impl Default for Options {
             color: true,
             error_format: ErrorFormat::Human,
             backend: BackendKind::Interp,
+            target_cpu: TargetCpu::Native,
             grad: GradOptions::default(),
         }
     }
@@ -235,10 +242,15 @@ fn no_recognize() -> bool {
 /// The `WUKONG_P4_NO_256` kill-switch is untouched and still read inside `mir_build`; it remains the
 /// same-run A/B knob for measuring the 256-bit win on CPU, and the escape hatch if a recipe body is
 /// ever found miscompiled. This option is the *other* conjunct of the same gate.
+///
+/// The same conjunct carries `--target-cpu`: the recipes are AVX2+FMA machine code with no runtime
+/// dispatch, so a level below x86-64-v3 must not receive them — the program keeps the 128-bit CLIF
+/// strips, which are the documented result-identical form, and its object runs on that level.
 fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
     wukong_mir_build::LowerOptions {
         recognize: !no_recognize(),
-        vec_kernels: !matches!(opts.backend, BackendKind::GpuLower),
+        vec_kernels: !matches!(opts.backend, BackendKind::GpuLower)
+            && opts.target_cpu.allows_vec_kernels(),
     }
 }
 
@@ -464,7 +476,12 @@ pub fn compile(opts: &Options) -> i32 {
             // catalogued diagnostic (honouring `--error-format=json`), while a *run-time* failure
             // (an assertion) keeps the interpreter's `error: <message>` form below.
             BackendKind::Native => {
-                match wukong_codegen_cranelift::jit_compile(&program, main, &interner) {
+                match wukong_codegen_cranelift::jit_compile_for(
+                    &program,
+                    main,
+                    &interner,
+                    opts.target_cpu,
+                ) {
                     Ok(compiled) => compiled.run(),
                     Err(message) => {
                         emit_diag(
@@ -778,7 +795,7 @@ fn object_path(
 /// directory to `<stem>.o` so that it survives, and the driver reports whichever path is actually
 /// there - that copy is best effort - and exits [`exit::UNIMPLEMENTED`] (2).
 fn emit_native(program: &wukong_mir::Program, interner: &Interner, opts: &Options) -> i32 {
-    let obj = match wukong_codegen_cranelift::emit_object(program, interner) {
+    let obj = match wukong_codegen_cranelift::emit_object_for(program, interner, opts.target_cpu) {
         Ok(b) => b,
         Err(e) => {
             emit_diag(
@@ -2093,6 +2110,33 @@ mod lower_options_tests {
             !lower_options_for(&opts_for(BackendKind::GpuLower)).vec_kernels,
             "gpu-native lowers the whole program to PTX and cannot lower Win64 machine code"
         );
+    }
+
+    /// `--target-cpu` below x86-64-v3 must never receive the raw AVX2+FMA recipes: they are
+    /// installed into the object verbatim, with no runtime dispatch, and would `#UD` on exactly the
+    /// machines the level names.
+    #[test]
+    fn target_cpu_below_v3_clears_the_vec_kernel_recipes() {
+        for (target, allowed) in [
+            (TargetCpu::Native, true),
+            (TargetCpu::X86_64, false),
+            (TargetCpu::X86_64V2, false),
+            (TargetCpu::X86_64V3, true),
+            (TargetCpu::X86_64V4, true),
+        ] {
+            for backend in [BackendKind::Interp, BackendKind::Native] {
+                let opts = Options {
+                    backend,
+                    target_cpu: target,
+                    ..Options::default()
+                };
+                assert_eq!(
+                    lower_options_for(&opts).vec_kernels,
+                    allowed,
+                    "{target:?} / {backend:?}"
+                );
+            }
+        }
     }
 
     /// The property the option exists for, asserted on real MIR rather than on the flag: an

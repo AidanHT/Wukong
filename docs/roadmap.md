@@ -26,6 +26,11 @@ Corpus differential tests compare outputs across optimization levels. Unsupporte
 assertion-output differences, and C-link fallback output remain documented limitations.
 Cranelift provides JIT execution with `--run --backend=native` and object/exe output with
 `--emit=obj|exe`, with **no LLVM toolchain required**. See `BENCHMARKS.md` for cross-language numbers.
+`--target-cpu=<native|x86-64|x86-64-v2|x86-64-v3|x86-64-v4>` picks the instruction-set level of that
+native code (default `native`, the host's features); below x86-64-v3 the raw-AVX2 loop kernels are
+not used, so an object built on an AVX2 machine runs on a baseline x86-64 CPU. Cross-compilation to
+another architecture or OS is not supported. A native-backend failure is a catalogued diagnostic
+(`C0002` for a single layout above 4 GiB, `C0001` for a by-design decline) in both `--error-format`s.
 
 - **Multi-file modules**: `import a.b` loads `a/b.wk` (resolved against the *root* source file's
   directory) and splices its items into one merged flat namespace, so cross-file fns/consts/structs

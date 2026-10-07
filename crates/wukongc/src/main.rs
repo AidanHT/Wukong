@@ -31,6 +31,11 @@ OPTIONS:
     --backend=<b>      Execution backend: interp, native, gpu, gpu-native  (default: interp)
                        (gpu/gpu-native require --features gpu and a CUDA device; gpu is the
                        recognizer offload, gpu-native lowers the whole program's MIR to PTX)
+    --target-cpu=<c>   Instruction-set level for native code (--emit=obj/exe, --backend=native):
+                       native, x86-64, x86-64-v2, x86-64-v3, x86-64-v4  (default: native = the
+                       host's features). Below x86-64-v3 the raw-AVX2 loop kernels are not used,
+                       so the object runs on any CPU of that level; the JIT refuses a level the
+                       host lacks.
     -o <path>          Write the artifact to <path>. Only --emit=obj and --emit=exe write a
                        file; every other stage prints its artifact on stdout.
     -O0|-O1|-O2|-O3    Optimization level (default: -O0)
@@ -136,6 +141,15 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                         ))
                     }
                 };
+            }
+            _ if arg.starts_with("--target-cpu=") => {
+                let cpu = &arg["--target-cpu=".len()..];
+                opts.target_cpu = wukong_driver::TargetCpu::parse(cpu).ok_or_else(|| {
+                    format!(
+                        "unknown --target-cpu value `{cpu}` (expected {})",
+                        wukong_driver::TargetCpu::NAMES.join(", ")
+                    )
+                })?;
             }
             "-O0" => opts.opt_level = 0,
             "-O1" => opts.opt_level = 1,
@@ -311,5 +325,32 @@ mod tests {
                 .verify_each
         );
         assert!(USAGE.contains("--verify-each"));
+    }
+
+    #[test]
+    fn target_cpu_flag_parses_every_level_and_rejects_others() {
+        assert_eq!(
+            parse_args(&["input.wk".to_owned()])
+                .unwrap()
+                .unwrap()
+                .target_cpu,
+            wukong_driver::TargetCpu::Native
+        );
+        for name in wukong_driver::TargetCpu::NAMES {
+            let args = [
+                format!("--target-cpu={name}"),
+                "--emit=obj".into(),
+                "in.wk".into(),
+            ];
+            let opts = parse_args(&args).unwrap().unwrap();
+            assert_eq!(opts.target_cpu.name(), *name);
+            assert!(USAGE.contains(name), "USAGE must list {name}");
+        }
+        let err =
+            parse_args(&["--target-cpu=pentium4".to_owned(), "in.wk".to_owned()]).unwrap_err();
+        assert!(
+            err.contains("pentium4") && err.contains("x86-64-v3"),
+            "{err}"
+        );
     }
 }

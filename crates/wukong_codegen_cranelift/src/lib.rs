@@ -36,6 +36,10 @@ mod backend;
 mod bool_vectors;
 pub use backend::CraneliftBackend;
 
+// `--target-cpu`: the ISA level native code is generated for (host detection by default).
+mod target;
+pub use target::TargetCpu;
+
 // P4: raw-AVX2 emitter for the general vectorizer's 256-bit path (Cranelift caps CLIF vectors at
 // 128-bit). Owned by this session; additive.
 mod avx2;
@@ -2377,12 +2381,13 @@ fn default_parallel() -> bool {
 }
 
 fn make_isa(pic: bool) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
-    make_isa_verify(pic, default_verify())
+    make_isa_for(pic, default_verify(), TargetCpu::Native)
 }
 
-fn make_isa_verify(
+fn make_isa_for(
     pic: bool,
     verify: bool,
+    target: TargetCpu,
 ) -> Result<std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>, String> {
     let mut flag_builder = settings::builder();
     flag_builder
@@ -2408,7 +2413,7 @@ fn make_isa_verify(
     flag_builder
         .set("probestack_strategy", "inline")
         .map_err(|e| e.to_string())?;
-    let isa_builder = cranelift_native::builder().map_err(|e| e.to_string())?;
+    let isa_builder = target::isa_builder(target)?;
     isa_builder
         .finish(settings::Flags::new(flag_builder))
         .map_err(|e| e.to_string())
@@ -3961,7 +3966,28 @@ pub fn jit_compile(
     entry: Symbol,
     interner: &Interner,
 ) -> Result<JitProgram, String> {
-    jit_compile_entry(program, entry, interner, false)
+    jit_compile_entry(program, entry, interner, false, TargetCpu::Native)
+}
+
+/// As [`jit_compile`], generating code for `target` instead of the full host feature set — so the
+/// code an `--emit=obj --target-cpu=<level>` object would contain can be *run* on this machine. The
+/// host must implement every feature of the level (a JIT cannot run code its CPU faults on).
+pub fn jit_compile_for(
+    program: &Program,
+    entry: Symbol,
+    interner: &Interner,
+    target: TargetCpu,
+) -> Result<JitProgram, String> {
+    let missing = target::missing_on_host(target);
+    if !missing.is_empty() {
+        return Err(format!(
+            "unsupported target CPU `{}` for the JIT: this host lacks {}; use --emit=obj/exe to \
+             build for it",
+            target.name(),
+            missing.join(", ")
+        ));
+    }
+    jit_compile_entry(program, entry, interner, false, target)
 }
 
 // The parameterized handle remains private inside JitBufferKernel: exposing it as JitProgram
@@ -3971,10 +3997,12 @@ fn jit_compile_entry(
     entry: Symbol,
     interner: &Interner,
     buffer_dispatch: bool,
+    target: TargetCpu,
 ) -> Result<JitProgram, String> {
     use cranelift_jit::{JITBuilder, JITModule};
 
-    let isa = make_isa(false)?;
+    target::check_vec_kernels(program, interner, target)?;
+    let isa = make_isa_for(false, default_verify(), target)?;
     let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     builder.symbol(RT_PRINT_I64, rt_print_i64 as *const u8);
     builder.symbol(RT_PRINT_U64, rt_print_u64 as *const u8);
@@ -5124,6 +5152,17 @@ pub fn emit_object(program: &Program, interner: &Interner) -> Result<Vec<u8>, St
     emit_object_ex(program, interner, EmitOptions::production()).map(|(bytes, _)| bytes)
 }
 
+/// As [`emit_object`], for the instruction-set level `target` (`--target-cpu`) instead of the host's.
+/// A program carrying raw AVX2+FMA vector kernels is refused for a level below x86-64-v3 rather
+/// than embedding bytes that level cannot execute.
+pub fn emit_object_for(
+    program: &Program,
+    interner: &Interner,
+    target: TargetCpu,
+) -> Result<Vec<u8>, String> {
+    emit_object_target(program, interner, EmitOptions::production(), target).map(|(bytes, _)| bytes)
+}
+
 /// As [`emit_object`], but also returns the codegen-vs-object-write [`ObjTimings`] split. The bytes
 /// are identical to `emit_object`; only measurement is added.
 pub fn emit_object_timed(
@@ -5138,11 +5177,21 @@ fn emit_object_ex(
     interner: &Interner,
     opts: EmitOptions,
 ) -> Result<(Vec<u8>, ObjTimings), String> {
+    emit_object_target(program, interner, opts, TargetCpu::Native)
+}
+
+fn emit_object_target(
+    program: &Program,
+    interner: &Interner,
+    opts: EmitOptions,
+    target: TargetCpu,
+) -> Result<(Vec<u8>, ObjTimings), String> {
     use cranelift_object::{ObjectBuilder, ObjectModule};
     use std::time::Instant;
 
+    target::check_vec_kernels(program, interner, target)?;
     let t_cg = Instant::now();
-    let isa = make_isa_verify(true, opts.verify)?;
+    let isa = make_isa_for(true, opts.verify, target)?;
     let builder = ObjectBuilder::new(isa, "wukong", cranelift_module::default_libcall_names())
         .map_err(|e| e.to_string())?;
     let mut module = ObjectModule::new(builder);
@@ -5171,6 +5220,9 @@ mod assertion_tests;
 
 #[cfg(test)]
 mod error_tests;
+
+#[cfg(test)]
+mod target_tests;
 
 #[cfg(test)]
 mod fuzz;
