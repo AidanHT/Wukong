@@ -50,6 +50,7 @@ mod unroll;
 mod vectorize;
 mod verify_each;
 
+mod branch_fold;
 mod switch_form;
 
 pub use verify_each::{verify_program_stage, VerificationFailure};

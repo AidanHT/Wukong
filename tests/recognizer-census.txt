@@ -41,6 +41,7 @@ attention.wk: wukong_norm_f32 wukong_sgemm wukong_sgemm_nt
 avgpool.wk: wukong_avgpool2d_f32
 axpby_f16.wk: wukong_axpby_f16
 axpby_half_out.wk: wukong_axpby_bf16_out wukong_axpby_f16_out
+band_mask_and.wk:
 batched_activation.wk: wukong_vmath_f32 wukong_vmath_f32*2
 batched_affine_rmsnorm.wk: wukong_norm_affine_f32
 batched_layernorm.wk: wukong_norm_f32

@@ -16,6 +16,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   folds a constant or degenerate `switch`. An `unreachable` fall-through is kept as the default:
   sema's exhaustiveness check is lenient, so that block can be reached, and the interpreter stops
   there (`tests/run/match_dense_enum_switch.wk`).
+- **Jump threading and branch folding in `simplify-cfg` (`-O1`+).** An edge that passes an `i1`
+  constant into an empty block branching on that parameter is retargeted to the successor the
+  constant decides (never past a loop header, never when the parameter is read elsewhere), and a
+  branch whose only-predecessor successor re-tests to one of its destinations becomes one branch on
+  `and`/`or` (`not` where needed), speculating at most four pure, non-trapping, non-memory
+  instructions. `a && b` / `a || b` guards are now one `cond_br`, so a loop guarded by one is a
+  single diamond the vectorizer can flatten (`wukong_opt::branch_fold`,
+  `tests/run/band_mask_and.wk`). Loads and divisions are never speculated.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
