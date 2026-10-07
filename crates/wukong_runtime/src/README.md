@@ -78,5 +78,13 @@ Crate root: re-exports every `wukong_*` kernel symbol, `bf16`/`f16` conversion h
 | `pool2d.rs` | `wukong_{avg,max}pool2d_f32*` |
 | `scatter.rs` | `wukong_scatter_add_f32*` |
 
+## Scheduling policy (no kernels)
+
+| file | contents |
+|---|---|
+| `par.rs` | Shared `_parallel` fork gate (`fork_rows`/`fork_units`, `WUKONG_PAR_MIN_WORK`), the atomic claim queue (`claim_chunks`), `for_each_row` (`WUKONG_KERNEL_DYN=1` A/B) |
+| `topology.rs` | Host probe: usable logical/physical cores, L1D/L2/L3 (CPUID / sysfs), `WUKONG_CPU_PHYSICAL` / `WUKONG_CACHE_*_KB` / `WUKONG_NUM_THREADS` |
+| `nt_policy.rs` | Non-temporal-store threshold (3/4 of the probed L3, `WUKONG_NT_MIN_BYTES`) |
+
 Each kernel file follows the same shape: `extern "C"` AVX2 entry, scalar twin, `#[cfg(test)]`
 `simd_equals_scalar_twin` table.
