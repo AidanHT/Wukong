@@ -127,6 +127,10 @@ pub(crate) fn check(
             }
         }
     }
+    // Both rules are about a promise; a program that makes none (the common case) is not walked.
+    if promises.is_empty() {
+        return;
+    }
     for item in &module.items {
         if let ItemKind::Fn(f) = &item.kind {
             if let Some(body) = &f.body {
@@ -752,7 +756,7 @@ fn kp(@noalias mut o: [f32; 4], q: P) { o[0] = q.a[0]; }
              let mut a: [f32; 4] = [0.0; 4];\n\
              let mut b: [f32; 4] = [1.0; 4];\n\
              let mut p: P = P {{ a: [0.0; 4], b: [0.0; 4] }};\n\
-             let mut m: [[f32; 4]; 2] = [[0.0; 4]; 2];\n\
+             let mut m: [[f32; 4]; 2] = [[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]];\n\
              {body}\n\
              return 0;\n}}"
         ))
