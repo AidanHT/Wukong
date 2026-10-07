@@ -1,0 +1,22 @@
+// EXPECT-CODE: E0306
+module tests.fail.unchecked_on_stmt
+
+// `@unchecked` (the slice bounds-check opt-out) is read from the FUNCTION item: `wukong_mir_build`
+// clears the per-function `bounds_checks` switch when the `fn` carries it, and nowhere else. On the
+// loop it would read as a narrower opt-out that nothing implements -- the parser accepts statement
+// attributes, so without the placement check this loop would keep every check while its author
+// believed they had removed them. Placement is E0306, with the fix in the help text -- move it to
+// the `fn`.
+fn sum(s: []i32) -> i32 {
+    let mut t: i32 = 0;
+    @unchecked
+    for i in 0..s.len() {
+        t = t + s[i];
+    }
+    return t;
+}
+
+fn main() -> i32 {
+    let a: [i32; 3] = [1, 2, 3];
+    return sum(a);
+}

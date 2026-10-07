@@ -30898,6 +30898,28 @@ mod tests {
         prog.funcs.iter().any(|f| fn_calls(f, interner, callee))
     }
 
+    /// The consumer of `@unchecked`: a slice access is lowered with its bounds check (a failure edge
+    /// calling `wukong_rt_bounds_fail`) by default, and without one in a function carrying the
+    /// attribute -- and only in that function. A `tests/run` fixture cannot witness this (an
+    /// in-range access prints the same either way), so the lowered MIR is the evidence.
+    #[test]
+    fn unchecked_removes_slice_bounds_checks_from_its_own_function_only() {
+        let (prog, diags, mut interner) = lower(
+            "fn checked(s: []i32, i: i64) -> i32 { return s[i]; }
+             @unchecked
+             fn raw(s: []i32, i: i64) -> i32 { return s[i]; }
+             fn main() -> i32 { let a: [i32; 2] = [3, 4]; return checked(a, 1) + raw(a, 0); }",
+        );
+        assert!(diags.iter().all(|d| !d.is_error()), "lower: {diags:?}");
+        let checked = prog.function(interner.intern("checked")).unwrap();
+        let raw = prog.function(interner.intern("raw")).unwrap();
+        assert!(fn_calls(checked, &interner, "wukong_rt_bounds_fail"));
+        assert!(!fn_calls(raw, &interner, "wukong_rt_bounds_fail"));
+        for f in &prog.funcs {
+            assert!(verify_function(f).is_empty(), "{:?}", verify_function(f));
+        }
+    }
+
     /// [`lower`] with explicit [`LowerOptions`].
     fn lower_with(src: &str, opts: LowerOptions) -> (Program, Vec<Diagnostic>, Interner) {
         let mut interner = Interner::new();
