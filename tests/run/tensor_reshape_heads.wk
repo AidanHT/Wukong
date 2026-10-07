@@ -1,0 +1,66 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 6
+// EXPECT-OUT: 24
+// EXPECT-OUT: 42
+// EXPECT-OUT: 60
+// EXPECT-OUT: 18
+// EXPECT-OUT: 22
+// EXPECT-OUT: 26
+module tests.run.tensor_reshape_heads
+
+// Multi-head attention keeps its activations as [S, H*HD] and works per head on [S, H, HD]. The
+// reshape `x as Tensor[f32, S, H, HD]` is a zero-copy view whose element count the checker proves
+// equal (`S*(H*HD)` and `S*H*HD` are one normal form), and its strides are computed from the
+// hidden dimension parameters. x[t] = t and y[t] = 2, so head (s, h) of `head_dots` is
+// 2 * (sum of the three consecutive values starting at s*6 + h*3).
+
+fn head_dots<S, H, HD>(
+    x: Tensor[f32, S, H*HD],
+    y: Tensor[f32, S, H*HD],
+    mut out: Tensor[f32, S, H],
+) {
+    let xh = x as Tensor[f32, S, H, HD];
+    let yh = y as Tensor[f32, S, H, HD];
+    for s in 0..S {
+        for h in 0..H {
+            let mut acc: f32 = 0.0;
+            for d in 0..HD {
+                acc = acc + xh[s, h, d] * yh[s, h, d];
+            }
+            out[s, h] = acc;
+        }
+    }
+}
+
+fn col_sums<R, C>(m: Tensor[f32, R, C], mut out: Tensor[f32, C]) {
+    for c in 0..C {
+        let mut s: f32 = 0.0;
+        for r in 0..R {
+            s = s + m[r, c];
+        }
+        out[c] = s;
+    }
+}
+
+fn main() -> i32 {
+    let mut xb: [f32; 12] = [0.0; 12];
+    let mut yb: [f32; 12] = [0.0; 12];
+    for t in 0..12 {
+        xb[t] = t as f32;
+        yb[t] = 2.0;
+    }
+    let mut ob: [f32; 4] = [0.0; 4];
+    head_dots::<2, 2, 3>(xb, yb, ob);
+    // 2*(0+1+2) = 6, 2*(3+4+5) = 24, 2*(6+7+8) = 42, 2*(9+10+11) = 60
+    for i in 0..4 {
+        print(ob[i] as i32);
+    }
+    // The same buffer viewed as a [4, 3] matrix: column sums 0+3+6+9, 1+4+7+10, 2+5+8+11.
+    let mut cs: [f32; 3] = [0.0; 3];
+    col_sums(xb as Tensor[f32, 4, 3], cs);
+    for i in 0..3 {
+        print(cs[i] as i32);
+    }
+    return 0;
+}
