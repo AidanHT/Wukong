@@ -451,7 +451,7 @@ impl AliasInfo {
                     // Addressing uses: these keep provenance, so they do not escape the base.
                     // `Gep`'s *index* still escapes (it is an integer use of the address).
                     Op::Gep { ptr: _, index, .. } => info.mark_escaped(*index),
-                    Op::Load(_, _) => {}
+                    Op::Load(ptr, ty) => info.note_header_read(*ptr, ty),
                     Op::Store { ptr, value } => {
                         info.mark_escaped(*value);
                         info.mark_written(*ptr);
@@ -483,6 +483,38 @@ impl AliasInfo {
                 }
             }
             Prov::Global(_) | Prov::Unknown => {}
+        }
+    }
+
+    /// A load from a `@noalias` slice's header that reads any byte of its data-pointer word other
+    /// than as the one canonical `ptr` load at offset 0 — an `i64` read that a cast can turn back
+    /// into a pointer, a read at an offset the sweep could not fold — copies the data pointer past
+    /// the provenance sweep, which only classifies the canonical load as `ParamData`. The elements
+    /// could then be reached through a pointer this analysis calls `Unknown`, so they no longer
+    /// count as private. (The `i64` length at offset 8 is not a pointer and reads freely.)
+    fn note_header_read(&mut self, ptr: ValueId, ty: &MirType) {
+        if self.params.is_empty() {
+            return;
+        }
+        let Prov::Param(i) = self.prov(ptr) else {
+            return;
+        };
+        if !self.slice_promised(i) {
+            return;
+        }
+        let off = self.offset_of(ptr);
+        if matches!(ty, MirType::Ptr) && off == Some(0) {
+            return;
+        }
+        let bytes = byte_size(ty).unwrap_or(u32::MAX);
+        let reads_data_word = match off {
+            Some(o) => o < 8 && o.saturating_add(i64::from(bytes)) > 0,
+            None => true,
+        };
+        if reads_data_word {
+            if let Some(p) = self.params.get_mut(i as usize) {
+                p.data_escaped = true;
+            }
         }
     }
 
@@ -843,12 +875,49 @@ pub fn promised_disjoint_membases(
     a: crate::loop_info::MemBase,
     b: crate::loop_info::MemBase,
 ) -> bool {
-    use crate::loop_info::MemBase;
-    let base = |m: MemBase| match m {
-        MemBase::Outer(v) => v,
-        MemBase::ReloadedOuter { value, .. } => value,
-    };
-    !a.same_object(b) && promised_disjoint_bases(f, base(a), base(b))
+    PromisedBases::new(f).disjoint(a, b)
+}
+
+/// [`promised_disjoint_membases`] for a pass that asks it about many pairs of one function it does
+/// not change in between (the loop dependence test, the vectorizer's runtime alias guard). The
+/// analysis is built at most once, on the first question that reaches it — never for a function
+/// without a promise — instead of once per pair, which is quadratic in the loop's accesses times
+/// the function's size. The borrow of `f` is what makes the cached answer valid: nothing can
+/// mutate the function while this exists (see the module note on staleness).
+pub(crate) struct PromisedBases<'f> {
+    f: &'f Function,
+    info: Option<AliasInfo>,
+}
+
+impl<'f> PromisedBases<'f> {
+    pub(crate) fn new(f: &'f Function) -> PromisedBases<'f> {
+        PromisedBases { f, info: None }
+    }
+
+    /// See [`promised_disjoint_membases`].
+    pub(crate) fn disjoint(
+        &mut self,
+        a: crate::loop_info::MemBase,
+        b: crate::loop_info::MemBase,
+    ) -> bool {
+        use crate::loop_info::MemBase;
+        if a.same_object(b) || !self.f.has_noalias_params() {
+            return false;
+        }
+        let base = |m: MemBase| match m {
+            MemBase::Outer(v) => v,
+            MemBase::ReloadedOuter { value, .. } => value,
+        };
+        let (x, y) = (base(a), base(b));
+        if x == y {
+            return false;
+        }
+        let f = self.f;
+        !self
+            .info
+            .get_or_insert_with(|| AliasInfo::analyze(f))
+            .may_alias(x, y)
+    }
 }
 
 #[cfg(test)]
@@ -1254,6 +1323,35 @@ mod tests {
             );
             // The parameter-to-parameter promise does not depend on escape.
             assert!(!info.may_alias(p, q), "escape={escape}");
+        }
+    }
+
+    /// Reading a promised slice's data word as anything but the canonical pointer load (an `i64`
+    /// a cast could turn back into a pointer, or part of the word) copies the element pointer past
+    /// the provenance sweep, so the elements stop being private. The length word reads freely.
+    #[test]
+    fn a_non_canonical_read_of_the_data_word_publishes_the_elements() {
+        for (ty, off, private) in [
+            (MirType::I64, 0, false),
+            (MirType::I32, 4, false),
+            (MirType::I64, 8, true),
+        ] {
+            let mut it = Interner::new();
+            let mut b = Builder::new(it.intern("r"), MirType::Void);
+            let s = param(&mut b, NOALIAS_SLICE);
+            let d = b.build(MirType::Ptr, Op::Load(s, MirType::Ptr));
+            let k = b.build(MirType::I64, Op::ConstInt(off, MirType::I64));
+            let at = gep(&mut b, s, k);
+            let _word = b.build(ty.clone(), Op::Load(at, ty.clone()));
+            b.ret(None);
+            let f = b.finish();
+            let info = AliasInfo::analyze(&f);
+            assert_eq!(info.prov(d), Prov::ParamData(0), "{ty:?} at {off}");
+            assert_eq!(
+                info.promised_storage(d).is_some(),
+                private,
+                "{ty:?} at {off}"
+            );
         }
     }
 

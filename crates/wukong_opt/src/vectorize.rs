@@ -1773,6 +1773,8 @@ fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, MirType
             .all(|p| p[0].g.lo == p[1].g.lo && p[0].g.terms == p[1].g.terms);
 
     let mut guards = Vec::new();
+    // Built at most once, and only for a function with a `@noalias` parameter (`alias.rs`).
+    let mut promised = crate::alias::PromisedBases::new(f);
     for i in 0..bases.len() {
         for j in i + 1..bases.len() {
             let (ga, gb) = (&bases[i], &bases[j]);
@@ -1791,7 +1793,7 @@ fn plan_guards(f: &Function, l: &NaturalLoop) -> Option<(Vec<GuardPair>, MirType
             // parameter promised apart (`alias.rs`) — which also spares a pair whose index the
             // guard could not have expressed.
             if distinct_alloca_pair(f, ga.g.base, gb.g.base)
-                || crate::alias::promised_disjoint_membases(f, ga.g.base, gb.g.base)
+                || promised.disjoint(ga.g.base, gb.g.base)
             {
                 continue;
             }
