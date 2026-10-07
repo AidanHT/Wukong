@@ -22,7 +22,9 @@
 //! It is a pure analysis, safe to build from anywhere, and the Cranelift backend uses it too.
 //!
 //! From `-O1` the fixpoint also runs **tre** ([`Tre`]): a function's tail calls to itself (and
-//! integer accumulator recursion such as `n * fact(n - 1)`) become a loop.
+//! integer accumulator recursion such as `n * fact(n - 1)`) become a loop. At `-O2`, between
+//! `licm` and `vectorize`, **unswitch** ([`LoopUnswitch`]) splits a counted loop at the iteration
+//! where a guard on its induction variable changes, or unswitches a branch on an invariant.
 //!
 //! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
 //! per-function pipeline, and partial loop unrolling ([`unroll_program`]) runs once *after* it — the
@@ -56,6 +58,7 @@ mod verify_each;
 mod branch_fold;
 mod switch_form;
 mod tre;
+mod unswitch;
 
 pub use verify_each::{verify_program_stage, VerificationFailure};
 
@@ -77,8 +80,9 @@ pub use simplify_cfg::SimplifyCfg;
 pub use unroll::unroll_program;
 pub use vectorize::Vectorize;
 
-pub use switch_form::FormSwitches;
+pub use switch_form::{form_switches, FormSwitches};
 pub use tre::Tre;
+pub use unswitch::LoopUnswitch;
 
 use std::time::{Duration, Instant};
 
@@ -185,6 +189,10 @@ impl PassManager {
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
+            // With invariant conditions hoisted, decide a guard on the induction variable or on an
+            // invariant once, by splitting or unswitching the loop, so the vectorizer below sees
+            // branch-free bodies (`unswitch`).
+            pm.add(Box::new(LoopUnswitch));
             // Widening comes last, on the cleanest MIR the pipeline produces: canonical loops with
             // one latch and one exit-test polarity, invariants already hoisted, and dead code gone.
             // Everything it emits is fed back through the fixpoint, so the vector body gets the

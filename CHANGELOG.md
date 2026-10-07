@@ -32,6 +32,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
   `-O2` the inliner rewrites fully tail-recursive functions first, so they are no longer recursive
   and become inlinable (`wukong_opt::tre`). A tail-recursive function that recursed past the
   interpreter's call-depth limit at `-O0` now runs as a loop at `-O1`+.
+- **Loop unswitching and induction-variable range splitting (`-O2`, after LICM, before the
+  vectorizer).** A counted unit-step loop whose body branches on `iv <, <=, >, >= inv` (matching
+  the exit test's signedness) runs as two back-to-back loops split at the clamped first iteration
+  where the guard changes (`max(start, min(inv, end))`, or `inv < end ? max(start, inv + 1) : end`
+  so `inv + 1` never wraps), each with the guard decided; a branch on a loop-invariant `i1` is
+  decided once in the preheader between the loop and a copy. Both copies visit iterations in the
+  original order, so results are bit-identical; the causal mask `if j > i { .. }` becomes a loop
+  that never stores and one that always does. Innermost loops only, no calls or frame slots, at
+  most 128 instructions per loop and 4096 per function (`wukong_opt::unswitch`,
+  `tests/run/causal_mask_split.wk`). The bench's `compile-work` attribution replica mirrors the new
+  pipeline stages.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 

@@ -159,6 +159,13 @@ thread_local! {
     static PASS_ACC: RefCell<Vec<PassWork>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Slots of the stages added after the original layout (kept after it, so its numbering is
+/// unchanged): `tre` and `unswitch` in the standard pipeline, and the late `switch` formation.
+const SLOT_TRE: usize = SLOTS;
+const SLOT_UNSWITCH: usize = SLOTS + 1;
+const SLOT_SWITCHES: usize = SLOTS + 2;
+const SLOTS_ALL: usize = SLOTS + 3;
+
 /// A transparent counting adapter around a real pass. Forwards `name` and `run_function`
 /// unchanged, so the production `PassManager` sees exactly the pass it would have run; the only
 /// addition is a counter snapshot on either side of the call.
@@ -212,10 +219,12 @@ fn attributed_standard() -> wukong_opt::PassManager {
     pm.add(counted_pass(2, Box::new(SimplifyCfg)));
     pm.add(counted_pass(3, Box::new(SimplifyPhis)));
     pm.add(counted_pass(4, Box::new(Dce)));
+    pm.add(counted_pass(SLOT_TRE, Box::new(Tre)));
     pm.add(counted_pass(5, Box::new(Cse)));
     pm.add(counted_pass(6, Box::new(Dse)));
     pm.add(counted_pass(7, Box::new(LoopCanon)));
     pm.add(counted_pass(8, Box::new(Licm)));
+    pm.add(counted_pass(SLOT_UNSWITCH, Box::new(LoopUnswitch)));
     pm.add(counted_pass(9, Box::new(Vectorize::default())));
     pm
 }
@@ -242,7 +251,7 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
     PASS_ACC.with(|acc| {
         let mut acc = acc.borrow_mut();
         acc.clear();
-        acc.resize(SLOTS, PassWork::default());
+        acc.resize(SLOTS_ALL, PassWork::default());
     });
     let (_, inline) = counted(|| wukong_opt::inline_program(p));
     attributed_standard().run(p);
@@ -260,8 +269,14 @@ fn optimize_attributed(p: &mut wukong_mir::Program) -> Vec<PassWork> {
         cleanup.run(&mut shell);
         p.funcs[i] = shell.funcs.pop().unwrap();
     }
+    let (_, switches) = counted(|| wukong_opt::form_switches(p));
     PASS_ACC.with(|acc| {
         let mut acc = acc.borrow_mut();
+        acc[SLOT_SWITCHES] = PassWork {
+            name: "form-switches",
+            calls: 1,
+            work: switches,
+        };
         acc[SLOT_INLINE] = PassWork {
             name: "inline",
             calls: 1,
@@ -464,7 +479,7 @@ pub fn report(files: &[PathBuf]) {
     }
 
     // --- optimizer attribution ---
-    let mut agg: Vec<PassWork> = vec![PassWork::default(); SLOTS];
+    let mut agg: Vec<PassWork> = vec![PassWork::default(); SLOTS_ALL];
     for r in &rows {
         for (a, p) in agg.iter_mut().zip(&r.passes) {
             a.name = p.name;
@@ -479,7 +494,11 @@ pub fn report(files: &[PathBuf]) {
     let opt = stage_tot[4];
     let residual = opt.since(attributed);
     let max_iter = rows.iter().map(|r| r.max_iterations).max().unwrap_or(0);
-    let sum_calls: u64 = agg[..10].iter().map(|p| p.calls).sum();
+    let sum_calls: u64 = agg[..10]
+        .iter()
+        .chain(&agg[SLOT_TRE..=SLOT_UNSWITCH])
+        .map(|p| p.calls)
+        .sum();
     println!(
         "\noptimizer attribution (summed over corpus; counting adapters around the production \
          PassManager, byte-identical to `optimize`):\n  {:<14} {:>9} {:>12} {:>14} {:>8}",
@@ -528,7 +547,11 @@ pub fn report(files: &[PathBuf]) {
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     for r in &rows {
         let bytes: u64 = r.stage.iter().map(|w| w.bytes).sum();
-        let calls: u64 = r.passes[..10].iter().map(|p| p.calls).sum();
+        let calls: u64 = r.passes[..10]
+            .iter()
+            .chain(&r.passes[SLOT_TRE..=SLOT_UNSWITCH])
+            .map(|p| p.calls)
+            .sum();
         println!(
             "{:<28} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>10} {:>7} {:>7}",
             trunc(&r.name, 28),

@@ -371,8 +371,9 @@ fn apply(f: &mut Function, chain: Chain) {
 /// The late stage `optimize` runs once at `-O2` and above, after the pipeline and unrolling: form
 /// switches in every function, then — only where one formed — prune the link blocks it bypassed
 /// and drop their dead compares. Not a member of `PassManager::standard`: a multi-way branch is the
-/// one shape the loop passes do not model, so it may only appear once they are done.
-pub(crate) fn form_switches(program: &mut wukong_mir::Program) {
+/// one shape the loop passes do not model, so it may only appear once they are done. Public so a
+/// replica of `optimize` (the bench's `compile-work` attribution) can run the same stage.
+pub fn form_switches(program: &mut wukong_mir::Program) {
     for f in &mut program.funcs {
         let mut cache = CfgAnalyses::default();
         if !FormSwitches.run_function(f, &mut cache) {
