@@ -24,7 +24,8 @@ const HALF_PRECISION: &str = "half-precision (bf16 / f16) storage: the buffer ta
 const QUANTIZED: &str = "integer-quantized operands carry no gradient (quantization-aware \
                          training is not supported)";
 const SECOND_ORDER: &str = "a training-backward kernel: differentiating it is second order, \
-                            which the buffer tape does not support";
+                            which the buffer tape does not support (see `grad_dot` / `hvp` for \
+                            the scalar subset)";
 const SCAN: &str = "a scan (prefix recurrence) has no VJP rule yet";
 const COLUMN_STAT: &str = "this column statistic has no VJP rule yet (colsum, colmean and \
                            colsumsq are differentiable)";

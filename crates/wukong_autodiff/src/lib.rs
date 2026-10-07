@@ -24,6 +24,10 @@
 //!   appends one `Ptr` parameter that receives `d loss / d input` (accumulated, so the caller must
 //!   pass a zeroed buffer).
 //!
+//! Calls to user functions are differentiated by [`inline_calls`] (straight-line callees are
+//! spliced in before differentiation, at every `-O` level); second-order derivatives of scalar-path
+//! losses come from [`grad_dot`] / [`hvp`].
+//!
 //! # Correctness gate
 //!
 //! Every rule is gated by **finite differences** (see the test module): perturb each input element
@@ -36,15 +40,29 @@
 //! A wrong gradient is a miscompile — it must be fixed before any throughput counts.
 
 use std::collections::{HashMap, HashSet};
-use wukong_mir::{BasicBlock, BinOp, CastKind, Function, Inst, MirType, Op, Terminator, ValueId};
+use wukong_mir::{
+    BasicBlock, BinOp, CastKind, Function, Inst, MirType, Op, Program, Terminator, ValueId,
+};
 use wukong_span::{Interner, Symbol};
 
 mod coverage;
+mod inline;
 pub mod optim;
 mod tape;
 mod tape_linalg;
 mod tape_nn;
 use tape::{Kernel, Syms};
+
+/// Which function the reverse pass builds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// `{name}_grad`: void, writes each `wrt` gradient into an appended buffer.
+    Grad,
+    /// `{name}_gdot`: returns the directional derivative `Σ_j <v_j, ∂L/∂p_j>`, one appended
+    /// direction buffer `v_j` per `wrt` parameter — a single-block scalar function, so it is itself
+    /// differentiable: its gradient is the Hessian-vector product.
+    GradDot,
+}
 
 /// Differentiate `func` with respect to the buffer parameters named by `wrt` (indices into
 /// `func.params`), returning a new function `{func.name}_grad`.
@@ -58,17 +76,69 @@ use tape::{Kernel, Syms};
 /// pointer parameter, or if the reverse pass meets a differentiable value whose defining op has no
 /// VJP rule yet (so a missing rule is a loud failure, never a silently-zero gradient).
 pub fn grad(func: &Function, wrt: &[usize], interner: &mut Interner) -> Result<Function, String> {
+    build(func, wrt, interner, Mode::Grad)
+}
+
+/// The **directional derivative** of a scalar-path loss: `{func.name}_gdot(params..., v_1..v_k)
+/// -> Σ_j <v_j, ∂L/∂p_{wrt_j}>`, with one appended `Ptr` direction buffer per `wrt` entry.
+///
+/// This is the second-order entry point. The function `grad` emits is void and multi-block, so it
+/// can never be fed back in; the directional derivative is a single-block function returning a
+/// float, so [`grad`] of it is the **Hessian-vector product** `H·v` (forward-free reverse-over-reverse,
+/// the same construction `jax.hessian`'s `hvp` uses). Supported subset, stated exactly: losses
+/// whose gradient flows through the scalar core only — arithmetic, `sqrt`, `fma`, `select`, casts,
+/// scalar trig, and loads of `wrt` parameters. A recognized tensor kernel, or a read of a local
+/// buffer, declines by name.
+pub fn grad_dot(
+    func: &Function,
+    wrt: &[usize],
+    interner: &mut Interner,
+) -> Result<Function, String> {
+    build(func, wrt, interner, Mode::GradDot)
+}
+
+/// The **Hessian-vector product**: returns `(gdot, hvp)` where `gdot = grad_dot(func, wrt)` and
+/// `hvp = grad(gdot, wrt)`. `hvp` (named `{func.name}_gdot_grad`) takes `func`'s parameters, the
+/// direction buffers `v_1..v_k`, then one zeroed output buffer per `wrt` entry, which receives
+/// `H·v` restricted to that parameter. Same supported subset as [`grad_dot`].
+pub fn hvp(
+    func: &Function,
+    wrt: &[usize],
+    interner: &mut Interner,
+) -> Result<(Function, Function), String> {
+    let gdot = grad_dot(func, wrt, interner)?;
+    let hv = grad(&gdot, wrt, interner)?;
+    Ok((gdot, hv))
+}
+
+/// `func` with every call to a straight-line (single-block) user function of `program` spliced in,
+/// recursively — the form [`grad`] can differentiate across helper functions at every `-O` level
+/// (`-O2`'s inliner already does this for small callees, but `-O0`/`-O1` and the inliner's size
+/// budget left a loss calling a helper undifferentiable). A callee that is multi-block, recursive or
+/// carries vectorized recipes stays a call; if its result is on the gradient path, [`grad`] names
+/// it. Returns a clone when nothing is inlined.
+pub fn inline_calls(program: &Program, func: &Function) -> Function {
+    inline::flatten_calls(program, func).unwrap_or_else(|| func.clone())
+}
+
+fn build(
+    func: &Function,
+    wrt: &[usize],
+    interner: &mut Interner,
+    mode: Mode,
+) -> Result<Function, String> {
     let fname = interner.resolve(func.name).to_string();
-    // Second-order (grad-of-grad) is a clean capability boundary, not a defect — but one a reader
-    // would otherwise have to infer. The function this transform EMITS returns `Void` and is
-    // multi-block (`tape.rs` synthesizes counted loops for the activation and mask backwards), so
-    // it satisfies neither half of the contract below. Say that, instead of letting the generic
-    // "has N blocks" message stand in for it.
+    // Second-order (grad-of-grad) through the emitted backward is a capability boundary, and one a
+    // reader would otherwise have to infer: the function this transform EMITS returns `Void` and is
+    // multi-block, so it satisfies neither half of the contract below. Say that, and name the
+    // supported route.
     if fname.ends_with("_grad") && func.ret == MirType::Void {
         return Err(format!(
             "autodiff: `{fname}` is already a generated gradient function; second-order gradients \
-             (the gradient of a gradient) are not supported — the emitted backward returns void \
-             and is multi-block, so it is not itself re-differentiable"
+             (the gradient of a gradient) are not supported through it — the emitted backward \
+             returns void and is multi-block, so it is not itself re-differentiable. For a \
+             scalar-path loss, differentiate its directional derivative instead \
+             (`wukong_autodiff::grad_dot` / `hvp`, the Hessian-vector product)"
         ));
     }
     if func.blocks.len() != 1 {
@@ -92,12 +162,23 @@ pub fn grad(func: &Function, wrt: &[usize], interner: &mut Interner) -> Result<F
             ));
         }
     }
+    let ret_ty = match mode {
+        Mode::Grad => MirType::Void,
+        Mode::GradDot => match func.blocks[0].term {
+            Terminator::Ret(Some(v)) => func.value_type(v).clone(),
+            _ => return Err("autodiff: forward function must end in `ret <loss>`".into()),
+        },
+    };
     // Pre-intern the kernel symbols (forward recognition is by Symbol equality — interning dedups,
     // so these match the symbols the forward calls were built with).
     let syms = Syms::new(interner);
-    let gname = interner.intern(&format!("{fname}_grad"));
+    let suffix = match mode {
+        Mode::Grad => "grad",
+        Mode::GradDot => "gdot",
+    };
+    let gname = interner.intern(&format!("{fname}_{suffix}"));
 
-    let mut vjp = Vjp::new(func, gname, wrt, syms, interner);
+    let mut vjp = Vjp::new(func, gname, wrt, syms, interner, mode, ret_ty);
     vjp.scan_kernel_outputs();
     vjp.replay();
     vjp.seed()?;
@@ -108,13 +189,19 @@ pub fn grad(func: &Function, wrt: &[usize], interner: &mut Interner) -> Result<F
 /// The worker that builds one gradient function. Its three core maps are:
 /// - `fwd_to_new`: a forward (old) value -> its replayed value in the new function;
 /// - `adj`: a forward value -> the new value holding its *currently accumulated* adjoint;
-/// - `grad_buf`: a forward `wrt` parameter -> the new gradient-output parameter it routes to.
+/// - `grad_buf`: a forward `wrt` parameter -> the new gradient-output parameter it routes to (the
+///   direction buffer in [`Mode::GradDot`]).
 ///
 /// The buffer tape adds `buf_adj` / `buf_count` / `contributed` (see `tape.rs`), and `def_op` indexes
 /// the forward block so pointer provenance and constant operands can be traced.
 struct Vjp<'a> {
     fwd: &'a Function,
     b: wukong_mir::Builder,
+    mode: Mode,
+    /// The emitted function's return type (`Void`, or the loss type in [`Mode::GradDot`]).
+    ret_ty: MirType,
+    /// [`Mode::GradDot`]'s running `Σ v·∂L/∂p`.
+    gdot_acc: Option<ValueId>,
     /// Defining op of each forward result value (for tracing `gep`/`load` pointer provenance).
     def_op: HashMap<ValueId, &'a Op>,
     fwd_to_new: HashMap<ValueId, ValueId>,
@@ -156,15 +243,18 @@ impl<'a> Vjp<'a> {
         wrt: &[usize],
         syms: Syms,
         it: &'a Interner,
+        mode: Mode,
+        ret_ty: MirType,
     ) -> Vjp<'a> {
-        let mut b = wukong_mir::Builder::new(gname, MirType::Void);
+        let mut b = wukong_mir::Builder::new(gname, ret_ty.clone());
         let mut fwd_to_new = HashMap::new();
         // Forward parameters, in order.
         for &p in &fwd.params {
             let np = b.add_param(fwd.value_type(p).clone());
             fwd_to_new.insert(p, np);
         }
-        // One gradient-output buffer per `wrt` input, appended after the forward params.
+        // One gradient-output (or direction) buffer per `wrt` input, appended after the forward
+        // params.
         let mut grad_buf = HashMap::new();
         for &wi in wrt {
             let p = fwd.params[wi];
@@ -193,6 +283,9 @@ impl<'a> Vjp<'a> {
         Vjp {
             fwd,
             b,
+            mode,
+            ret_ty,
+            gdot_acc: None,
             def_op,
             fwd_to_new,
             adj: HashMap::new(),
@@ -252,13 +345,25 @@ impl<'a> Vjp<'a> {
     }
 
     /// Walk the forward instructions in reverse, applying each VJP rule, then release the heap
-    /// scratch and return.
+    /// scratch and return (the directional derivative, in [`Mode::GradDot`]).
     fn reverse(&mut self) -> Result<(), String> {
         for inst in self.entry_block().insts.iter().rev() {
             self.diff_inst(inst)?;
         }
         self.free_scratch();
-        self.b.ret(None);
+        match self.mode {
+            Mode::Grad => self.b.ret(None),
+            Mode::GradDot => {
+                let acc = match self.gdot_acc {
+                    Some(a) => a,
+                    None => {
+                        let t = self.ret_ty.clone();
+                        self.fconst(0.0, &t)
+                    }
+                };
+                self.b.ret(Some(acc));
+            }
+        }
         Ok(())
     }
 
@@ -273,6 +378,13 @@ impl<'a> Vjp<'a> {
         // Its gradient flows through buffers (memory), not the scalar `adj` map.
         if let Op::Call { func, args } = &inst.op {
             if self.is_kernel(*func) {
+                if self.mode == Mode::GradDot {
+                    return Err(format!(
+                        "autodiff: second-order differentiation (grad_dot / hvp) supports \
+                         scalar-path losses only; `{}` is a recognized tensor kernel",
+                        self.it.resolve(*func)
+                    ));
+                }
                 return self.diff_kernel_call(*func, args, inst.result);
             }
             if inst.result.is_none() {
@@ -458,13 +570,15 @@ impl<'a> Vjp<'a> {
             // gradient). This is what lets an accumulator seeded `acc = 0.0` then folded with `fma`
             // differentiate cleanly — the seed const simply absorbs the residual adjoint.
             Op::ConstFloat(..) | Op::ConstInt(..) => {}
-            // Any other value-returning call on the gradient path: a user function, or a runtime
-            // routine with no VJP. Name it — "no VJP rule for `call`" leaves the user nothing to
-            // grep for.
+            // Any other value-returning call on the gradient path: a user function `inline_calls`
+            // could not splice (multi-block, recursive, vectorized), or a runtime routine with no
+            // VJP. Name it — "no VJP rule for `call`" leaves the user nothing to grep for.
             Op::Call { func, .. } => {
                 let name = self.it.resolve(*func);
-                let why = coverage::not_differentiable_reason(name)
-                    .unwrap_or("a call to a user function is not differentiated; inline it");
+                let why = coverage::not_differentiable_reason(name).unwrap_or(
+                    "a user function is differentiated only when it is a single straight-line \
+                     block `inline_calls` can splice into the caller",
+                );
                 return Err(format!(
                     "autodiff: no VJP rule for call to `{name}` (value v{} has a non-zero \
                      adjoint): {why}",
@@ -528,6 +642,9 @@ impl<'a> Vjp<'a> {
     /// Route the adjoint `g` of a value loaded from a buffer into that buffer's gradient,
     /// accumulating (read-add-write) so repeated loads of the same element sum correctly.
     fn diff_load(&mut self, ptr: ValueId, g: ValueId, ty: MirType) -> Result<(), String> {
+        if self.mode == Mode::GradDot {
+            return self.gdot_load(ptr, g, ty);
+        }
         let (base, idx) = self.resolve_access(ptr, &ty)?;
         // `grad_target` SEEDS `buf_adj`, which every producer rule in `tape.rs` gates on — so a
         // scalar read of a kernel's output reaches that kernel's inputs. A parameter outside `wrt`
@@ -556,6 +673,51 @@ impl<'a> Vjp<'a> {
         // This buffer has now received a gradient contribution, so a later kernel rule accumulates
         // onto it instead of overwriting it (`Vjp::begin`, `beta_for`).
         self.contributed.insert(base);
+        Ok(())
+    }
+
+    /// [`Mode::GradDot`]'s load rule: instead of accumulating `g` into a gradient buffer, add
+    /// `v[idx]·g` into the directional derivative — `Σ_j <v_j, ∂L/∂p_j>` is linear in the gradient,
+    /// so each scalar contribution maps to one term.
+    fn gdot_load(&mut self, ptr: ValueId, g: ValueId, ty: MirType) -> Result<(), String> {
+        let (base, idx) = self.resolve_access(ptr, &ty)?;
+        if !self.fwd.params.contains(&base) {
+            return Err(format!(
+                "autodiff: second-order differentiation (grad_dot / hvp) supports losses that \
+                 read parameters only; v{} reads a local buffer",
+                ptr.0
+            ));
+        }
+        let Some(&vb) = self.grad_buf.get(&base) else {
+            return Ok(()); // not a differentiated parameter
+        };
+        if ty != self.ret_ty {
+            return Err(format!(
+                "autodiff: second-order differentiation needs every differentiated load to have \
+                 the loss type {}; a {} load does not",
+                self.ret_ty.display(),
+                ty.display()
+            ));
+        }
+        let vptr = match idx {
+            Some(iv) => self.b.build(
+                MirType::Ptr,
+                Op::Gep {
+                    ptr: vb,
+                    index: iv,
+                    elem: ty.clone(),
+                },
+            ),
+            None => vb,
+        };
+        let vv = self.b.build(ty.clone(), Op::Load(vptr, ty.clone()));
+        let term = self.fmul(vv, g, &ty);
+        let prev = self.gdot_acc;
+        let acc = match prev {
+            Some(a) => self.fadd(a, term, &ty),
+            None => term,
+        };
+        self.gdot_acc = Some(acc);
         Ok(())
     }
 
@@ -639,7 +801,7 @@ impl<'a> Vjp<'a> {
     /// The base is a function parameter or a local `f32` array, reached through a chain of `gep`s
     /// whose element type is the accessed type `ty` — so the indices are in the same unit and their
     /// sum addresses the gradient buffer exactly as the chain addressed the forward one (a helper
-    /// inlined by the optimizer that indexes a sub-slice is a two-level chain). A `gep` of a
+    /// spliced by [`inline_calls`] that indexes a sub-slice is a two-level chain). A `gep` of a
     /// different element type (a struct byte offset, a row of a nested array) has a different
     /// stride and is refused: routing its index into an `f32` gradient would misplace it silently.
     fn resolve_access(

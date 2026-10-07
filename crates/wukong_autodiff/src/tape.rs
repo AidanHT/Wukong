@@ -29,7 +29,8 @@
 //!
 //! Buffers are differentiated under the same single-block contract as the scalar core; the only new
 //! control flow is the counted loops this module synthesizes. (So the *emitted* gradient function is
-//! multi-block: it is not itself re-differentiable, which `grad` says by name.)
+//! multi-block: it is not itself re-differentiable, which `grad` says by name; `crate::grad_dot`
+//! is the second-order entry point for the scalar subset.)
 
 use crate::Vjp;
 use std::collections::HashMap;

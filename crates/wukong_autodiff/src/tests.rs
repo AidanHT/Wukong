@@ -13,8 +13,9 @@
 use crate::grad;
 use wukong_interp::run_kernel_f64;
 
-// The kernel-family, memory-model and recognizer-mirror gates, each a submodule over the helpers
-// below.
+// The kernel-family, memory-model, call/second-order and recognizer-mirror gates, each a submodule
+// over the helpers below.
+mod calls;
 mod kernels;
 mod memory;
 mod mirror;
