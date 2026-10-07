@@ -594,6 +594,26 @@ retain their existing portable partition. Reductions vectorize only on the seque
 the `@parallel` one (folding into a shared accumulator across threads would race). Reassociation is
 a build contract, not a promise of strict source-order summation or stability across compiler releases.
 
+The contraction rule is exact and syntactic (`FnLowerer::try_contract_fma`, mirrored by `vec_try_fma`
+and the 256-bit recipe's `Add` arm): only a binary `+` with a `*` operand contracts; `x - y*z`, a
+product bound by `let`, and a compound `s += y*z` outside a vectorized reduction do not; and when both
+operands are products the **left** one is fused (`a*b + c*d` → `fma(a, b, round(c*d))`). The language
+guide's "Floating-point semantics" section is the user-facing statement and
+`tests/run/fp_contract_rules.wk` pins each clause; `fp_contract_tests.rs` pins the MIR shape.
+
+**Strict floating point** (`@strict_fp`, `--fp=strict` → `LowerOptions::strict_fp`) is decided
+entirely here. `strict_fp_gemm` stamps `GemmSyms::strict_fp` and clears `GemmSyms::recognize` for the
+function (and its monomorphized instances and outlined `@parallel` regions, which inherit the struct).
+The four contraction sites return early on the flag, and `try_vectorize_for` drops a float reduction
+before `emit_reduction`, so the loop lowers as its sequential scalar fold; integer reductions and
+elementwise loops still vectorize. No other crate needs to know: `wukong_opt` never reassociates (its
+vectorizer folds reduction lanes in index order, its unroller keeps one accumulator) and never
+creates an `Op::Fma`; Cranelift lowers `fadd`/`fmul` without fusion; the LLVM emitter writes no
+fast-math flags. That is also why the mode survives inlining in both directions — a strict body's
+separately rounded ops and a fast body's `Fma`s are already fixed in MIR when the inliner moves them.
+The driver refuses `--fp=strict` with `--emit=grad`/`--train` for the reason it refuses
+`WUKONG_NO_RECOGNIZE`: the VJP rules are keyed on recognized kernels.
+
 ## Spelling canonicalization before recognition
 
 Every recognizer below matches a *syntactic* shape on the raw AST, inside `lower_program` — before

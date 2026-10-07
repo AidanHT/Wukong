@@ -471,9 +471,19 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   feature (see `docs/internals.md`): recognizers are otherwise gate-blind, so this is the only way to
   compile and time the honest generic lowering of the same program. Autodiff refuses to run under the
   instrument, by name.
+- **`@strict_fp`** on a function (and **`--fp=strict`** for the whole program) evaluates its float
+  arithmetic in source order with one IEEE rounding per operation: no FMA contraction (`x + y*z`
+  stays a rounded multiply and a rounded add, in scalar code, vector bodies, 256-bit recipes and
+  scalar remainders), float reductions keep their sequential fold, and the kernel recognizers are off
+  (it implies `@generic`). Elementwise loops and integer reductions still vectorize. Per function,
+  survives inlining in both directions, identical at every `-O` level and on both backends
+  (`tests/run/strict_fp.wk`, `strict_fp_cli.wk`; the default contraction rule, including "the LEFT
+  product of `a*b + c*d` is fused", is pinned by `tests/run/fp_contract_rules.wk`). `--fp=strict`
+  is refused with `--emit=grad`/`--train`. The language guide's "Floating-point semantics" section
+  is the user-facing contract.
 - Unknown or misplaced `@attributes` are **`E0306`**, not silence: the name is checked against the
-  closed v1 set (`@parallel`, `@generic`, `@tile`, `@extern`, `@inline`, `@simd`, `@align`,
-  `@export`), so a typo like `@parellel` no longer compiles to a program with none of the requested
+  closed v1 set (`@parallel`, `@generic`, `@tile`, `@extern`, `@strict_fp`, `@inline`, `@simd`,
+  `@align`, `@export`), so a typo like `@parellel` no longer compiles to a program with none of the requested
   behavior. The four discarded attributes stay discarded wherever they parse.
 - Intrinsics `print`/`println`/`assert`.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
@@ -857,7 +867,7 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   compile-time-known trip ≥ 2048; the recognized kernels get 256-bit AVX2 via the
   runtime microkernels.)
 - **Attributes:** sema validates the closed set `@parallel`, `@generic`, `@tile`, `@extern`,
-  `@inline`, `@simd`, `@align`, and `@export`; unknown names and restricted-placement violations
+  `@strict_fp`, `@inline`, `@simd`, `@align`, and `@export`; unknown names and restricted-placement violations
   report `E0306`. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
   behavior and C ABI interop remain incomplete. `@parallel` executes, though its scheduling
   arguments are not consumed; `@generic` opts out of recognizers. `@tile` performs loop
@@ -907,6 +917,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   reverse-mode autodiff already ships as the `wukong_autodiff` crate — both above).
 
 ## Known limitations / sharp edges
+
+- **Fast-mode float results depend on how a reduction is compiled.** Under the default `--fp=fast`
+  an `f32` reduction is evaluated on one of three trees — the source fold (a loop nothing
+  vectorizes), the sequential vectorizer's lane partition, or the `@parallel` kernel's fixed
+  8,192-element chunks — and adding or removing `@parallel`, or a reduction declining its kernel,
+  moves it between them, changing low-order bits with no diagnostic. Each tree is deterministic
+  (independent of threads, `-O` level, backend and host). Use `@strict_fp` where bits must not
+  depend on the spelling. Also by design: a compound `s += y*z` outside a vectorized reduction is not
+  contracted while `s = s + y*z` is, and there is no explicit `fma(a, b, c)` intrinsic yet, so a
+  strict function cannot request a single-rounding multiply-add.
 
 - **A view local read before it is assigned is undefined, and the language has no rule that says so.**
   *(Table measured 2026-08-23 on `lang/w2e-recognizer-gate`; sema still has no definite-assignment

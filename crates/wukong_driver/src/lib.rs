@@ -118,6 +118,10 @@ pub struct Options {
     /// Autodiff / training options (see [`GradOptions`]). Only consulted by `--emit=grad` and
     /// `--train`; inert for every other stage.
     pub grad: GradOptions,
+    /// Strict floating-point mode for the whole program (`--fp=strict`; `false` is the default
+    /// `--fp=fast`): `@strict_fp` on every function — no FMA contraction, no reassociated float
+    /// reduction, no kernel recognizer. Threaded to [`wukong_mir_build::LowerOptions::strict_fp`].
+    pub strict_fp: bool,
 }
 
 /// Options for the autodiff CLI surface: which loss function to differentiate, which of its buffer
@@ -182,6 +186,7 @@ impl Default for Options {
             error_format: ErrorFormat::Human,
             backend: BackendKind::Interp,
             grad: GradOptions::default(),
+            strict_fp: false,
         }
     }
 }
@@ -239,6 +244,7 @@ fn lower_options_for(opts: &Options) -> wukong_mir_build::LowerOptions {
     wukong_mir_build::LowerOptions {
         recognize: !no_recognize(),
         vec_kernels: !matches!(opts.backend, BackendKind::GpuLower),
+        strict_fp: opts.strict_fp,
     }
 }
 
@@ -260,6 +266,22 @@ pub fn compile(opts: &Options) -> i32 {
             "error: {what}: {NO_RECOGNIZE_ENV} is set, and autodiff is not supported with kernel \
              recognition off (the VJP rules are kernel-shaped). Unset {NO_RECOGNIZE_ENV}, or drop \
              {what}."
+        );
+        return exit::COMPILE_ERROR;
+    }
+    // `--fp=strict` turns recognition off for every function (a recognized kernel fixes its own
+    // summation tree), so it meets the same autodiff limit as the environment switch above.
+    if opts.strict_fp && (opts.grad.train || opts.emit == EmitStage::Grad) {
+        let what = if opts.grad.train {
+            "--train"
+        } else {
+            "--emit=grad"
+        };
+        eprintln!(
+            "error: {what}: `--fp=strict` turns kernel recognition off for the whole program, and \
+             autodiff is not supported with recognition off (the VJP rules are kernel-shaped). \
+             Drop `--fp=strict`; `@strict_fp` on individual functions leaves recognition (and \
+             autodiff) intact everywhere else."
         );
         return exit::COMPILE_ERROR;
     }

@@ -28,6 +28,8 @@
 
 mod alias;
 mod canon;
+#[cfg(test)]
+mod fp_contract_tests;
 mod tile;
 mod tindex;
 
@@ -928,6 +930,15 @@ pub struct LowerOptions {
     /// body is ever found miscompiled. This option is the *other* conjunct, chosen by the pipeline
     /// rather than the environment.
     pub vec_kernels: bool,
+
+    /// Strict floating-point mode for the WHOLE program (`--fp=strict`; `false`, the default, is
+    /// `--fp=fast`). It is the program-wide spelling of the `@strict_fp` function attribute and
+    /// means exactly what that attribute means for every function: no FMA contraction of a source
+    /// `x + y*z`, no reassociating float-reduction vectorization, and no kernel recognizer (a
+    /// recognized GEMM / reduction / norm kernel fixes its own summation tree). What remains is
+    /// evaluation in source order with one IEEE rounding per source operation, vectorized only
+    /// lane-wise. See `strict_fp_gemm` and `docs/language-guide.md` "Floating-point semantics".
+    pub strict_fp: bool,
 }
 
 impl Default for LowerOptions {
@@ -935,6 +946,7 @@ impl Default for LowerOptions {
         LowerOptions {
             recognize: true,
             vec_kernels: true,
+            strict_fp: false,
         }
     }
 }
@@ -1007,6 +1019,9 @@ pub fn lower_program_with(
     let gemm = GemmSyms {
         recognize: opts.recognize,
         vec_kernels: opts.vec_kernels,
+        // Program-wide `--fp=strict`. Applied per function by `strict_fp_gemm` below, beside the
+        // `@strict_fp` attribute it is the global spelling of.
+        strict_fp: opts.strict_fp,
         // Overwritten per function, below. The module-level default is the conservative one, so a
         // recognizer reached through a path that forgot to set it declines rather than miscompiles.
         alias_free: false,
@@ -1217,6 +1232,17 @@ pub fn lower_program_with(
             _ => None,
         })
         .collect();
+    // Functions carrying `@strict_fp`, keyed by name for the same reason as `generic_fns`: the
+    // monomorphization loop has only the original function's symbol.
+    let strict_fp_fns: HashSet<Symbol> = module
+        .items
+        .iter()
+        .filter(|item| has_strict_fp_attr(item, interner))
+        .filter_map(|item| match &item.kind {
+            ast::ItemKind::Fn(f) => Some(f.name.sym),
+            _ => None,
+        })
+        .collect();
     let fn_tiles: HashMap<Symbol, Vec<u64>> = module
         .items
         .iter()
@@ -1243,6 +1269,9 @@ pub fn lower_program_with(
                 // takes, because the switch rides on that struct and it is copied down into every
                 // recognizer and probe from here.
                 let gemm = generic_gemm(gemm, generic_fns.contains(&f.name.sym));
+                // `@strict_fp` (or `--fp=strict`): no contraction, no float-reduction
+                // reassociation, no recognizers — for this function alone. See `strict_fp_gemm`.
+                let gemm = strict_fp_gemm(gemm, strict_fp_fns.contains(&f.name.sym));
                 // Whole-program aliasing, stamped on beside the `@generic` opt-out: `false` here
                 // means some call site in this program can hand two of this function's buffer
                 // parameters the same array, so no recognizer inside it may emit a kernel whose
@@ -2004,6 +2033,8 @@ pub fn lower_program_with(
         if let Some((f, body)) = fn_decls.get(orig) {
             // A `@generic` template's instances inherit the opt-out (keyed on the ORIGINAL name).
             let gemm = generic_gemm(gemm, generic_fns.contains(orig));
+            // ...and so do the instances of a `@strict_fp` template.
+            let gemm = strict_fp_gemm(gemm, strict_fp_fns.contains(orig));
             // Aliasing is a property of the ORIGINAL function's call sites: every instantiation of
             // a type-generic template shares them.
             let gemm = alias_gemm(gemm, alias_facts.alias_free(*orig));
@@ -2059,6 +2090,46 @@ fn alias_gemm(gemm: GemmSyms, alias_free: bool) -> GemmSyms {
 fn generic_gemm(gemm: GemmSyms, is_generic: bool) -> GemmSyms {
     if is_generic {
         GemmSyms {
+            recognize: false,
+            ..gemm
+        }
+    } else {
+        gemm
+    }
+}
+
+/// Does this item carry `@strict_fp` — "evaluate my float arithmetic in source order, one rounding
+/// per operation"? `wukong_sema::attrs` rejects the attribute anywhere but a `fn` item.
+fn has_strict_fp_attr(item: &ast::Item, interner: &Interner) -> bool {
+    item.attrs
+        .iter()
+        .any(|a| interner.resolve(a.name.sym) == "strict_fp")
+}
+
+/// `gemm` in strict floating-point mode when the function being lowered is `@strict_fp` or the
+/// whole program is (`--fp=strict`, already stamped on `gemm.strict_fp`).
+///
+/// Strict mode is three switches, and all three are needed for the promise "the result is the
+/// source expression evaluated left to right, each `+ - * /` rounded once" to hold:
+///
+/// * **no contraction** — `x + y*z` stays a rounded multiply and a rounded add (the fast-mode
+///   default fuses it into one `Fma`, which rounds once and therefore answers differently);
+/// * **no float-reduction vectorization** — `s += f(x[i])` keeps its sequential fold instead of
+///   the lane-partitioned tree. Integer reductions are exact under any order and still vectorize;
+///   elementwise loops still vectorize, because lane `k` runs exactly scalar iteration `i + k`;
+/// * **no kernel recognizers** (the `@generic` switch) — a recognized GEMM, reduction, norm or
+///   affine kernel substitutes its own blocking, accumulator tree and FMA use for the loop the user
+///   wrote, which no per-op flag inside the runtime could undo.
+///
+/// The optimizer needs no switch: `wukong_opt` never reassociates (its vectorizer folds reduction
+/// lanes in index order, its unroller keeps one accumulator) and never creates an `Fma`, and the
+/// Cranelift and LLVM backends lower `fadd`/`fmul` without contraction. So the mode is fully decided
+/// here, at lowering, and survives inlining: a strict function inlined into a fast caller keeps its
+/// separately-rounded operations, and a fast callee inlined into a strict caller keeps its `Fma`s.
+fn strict_fp_gemm(gemm: GemmSyms, is_strict: bool) -> GemmSyms {
+    if is_strict || gemm.strict_fp {
+        GemmSyms {
+            strict_fp: true,
             recognize: false,
             ..gemm
         }
@@ -2900,6 +2971,14 @@ struct GemmSyms {
     /// what `--backend=gpu-native` needs, since `VecKernelCall` carries Win64-ABI bytes no PTX
     /// backend can lower.
     vec_kernels: bool,
+    /// Strict floating-point mode for the function being lowered (`@strict_fp`, or the program-wide
+    /// [`LowerOptions::strict_fp`]). Rides here for the reason `recognize` does: this struct is
+    /// copied into every lowerer, recipe builder and outlined `@parallel` region, so the mode cannot
+    /// be dropped on the way down. Set only through [`strict_fp_gemm`], which also clears
+    /// `recognize`. Read at the four FMA-contraction sites (`try_contract_fma`, `vec_try_fma`, the
+    /// 256-bit recipe's `Add` arm, the reduction accumulators) and at the float-reduction
+    /// vectorizer gate in `try_vectorize_for`.
+    strict_fp: bool,
     /// Whole-program answer to "can two DISTINCT names for a buffer in the function being lowered
     /// reach the same storage?" — either because a call site binds two of its buffer parameters to
     /// one array, or because two operand names in its own body resolve onto one buffer (a
@@ -15955,7 +16034,14 @@ impl FnLowerer<'_> {
         if !signed {
             return false;
         }
-        let reduction = self.reduction_of(body, j);
+        // A float reduction is vectorized by REASSOCIATING it (lane accumulators, then a fixed
+        // combine tree), which `@strict_fp` forbids: it keeps the sequential fold. The body then
+        // fails `vectorizable` (it assigns an outer scalar) and lowers as the scalar loop, which
+        // `wukong_opt`'s order-preserving vectorizer may still widen without moving the fold.
+        // Integer reductions are exact in any order and stay vectorized.
+        let reduction = self
+            .reduction_of(body, j)
+            .filter(|(_, _, lane, _, _)| !(self.gemm.strict_fp && lane.is_float()));
         if reduction.is_none() && self.vectorizable(body, j).is_none() {
             return false;
         }
@@ -16665,8 +16751,9 @@ impl FnLowerer<'_> {
                 // 0..7 and 1 for the tail lane — one loop, two answers, on both backends at every -O
                 // level. `WUKONG_P4_NO_256=1` printed 1 for both, so the knob was changing the
                 // program's numbers rather than only its instruction selection. The leaves lower in
-                // source order, matching the twins.
-                if matches!(op, Add) {
+                // source order, matching the twins. Under `@strict_fp` neither twin contracts, so
+                // the recipe emits the plain `Mul` + `Add` below instead.
+                if matches!(op, Add) && !self.gemm.strict_fp {
                     if let ExprKind::Binary {
                         op: Mul,
                         lhs: y,
@@ -17839,7 +17926,9 @@ impl FnLowerer<'_> {
         w: u32,
         vlocals: &mut HashMap<Symbol, ValueId>,
     ) -> ValueId {
-        if lane.is_float() {
+        // `@strict_fp` never reaches here with a float lane (`try_vectorize_for` declines the float
+        // reduction), but the accumulate honours the mode on its own rather than lean on that.
+        if lane.is_float() && !self.gemm.strict_fp {
             if let ExprKind::Binary {
                 op: ast::BinOp::Mul,
                 lhs,
@@ -17862,7 +17951,7 @@ impl FnLowerer<'_> {
 
     /// Scalar `acc + addend`, fusing `acc + a*b` into one `Fma` for floats; plain `Add` for ints.
     fn scalar_accumulate(&mut self, acc: ValueId, addend: &Expr, ty: &MirType) -> ValueId {
-        if ty.is_float() {
+        if ty.is_float() && !self.gemm.strict_fp {
             if let ExprKind::Binary {
                 op: ast::BinOp::Mul,
                 lhs,
@@ -18325,6 +18414,11 @@ impl FnLowerer<'_> {
                 } => Some((lhs.as_ref(), rhs.as_ref())),
                 _ => None,
             }
+        }
+        // `@strict_fp`: the scalar remainder (`try_contract_fma`) does not contract, so neither
+        // may the vector body, or one loop would compute two functions.
+        if self.gemm.strict_fp {
+            return None;
         }
         if let Some((y, z)) = as_fmul(lhs) {
             let yv = self.vec_lower_value(y, j, lane, vty, w, vlocals);
@@ -20140,6 +20234,22 @@ impl FnLowerer<'_> {
     /// instead of twice — faster (a single `vfmadd`) and more accurate — and the interpreter
     /// mirrors it with `mul_add`, so the native and interpreter backends stay bit-identical.
     /// Returns `None` when the shape or types don't permit it; the caller then emits a plain add.
+    ///
+    /// The contraction rule is part of the language's floating-point contract (language guide,
+    /// "Floating-point semantics"), so it is spelled out here exactly:
+    ///
+    /// * only a binary `+` whose operand is *syntactically* a `*` contracts (parentheses are not
+    ///   an AST node, so `x + (y*z)` contracts too). `x - y*z` does not, and neither does a
+    ///   product reached through a `let` (`let p = y*z; x + p`). For `x + a*b*c` the top-level
+    ///   product is `(a*b)*c`, so it becomes `fma(round(a*b), c, x)`;
+    /// * when **both** operands are products (`a*b + c*d`), the **left** product is fused and the
+    ///   right one is rounded first: `fma(a, b, round(c*d))`. Which side wins changes the result,
+    ///   so swapping the operands of such a `+` is a numerical edit, not a refactor
+    ///   (`tests/run/fp_contract_rules.wk` pins both spellings);
+    /// * in a `@strict_fp` function (or under `--fp=strict`) nothing contracts.
+    ///
+    /// The vector twins (`vec_try_fma`, the 256-bit recipe's `Add` arm) apply the identical rule,
+    /// so a vectorized loop and its scalar remainder agree lane-for-lane.
     fn try_contract_fma(
         &mut self,
         op: ast::BinOp,
@@ -20147,7 +20257,7 @@ impl FnLowerer<'_> {
         rhs: &Expr,
         ty: &MirType,
     ) -> Option<ValueId> {
-        if op != ast::BinOp::Add || !ty.is_float() {
+        if op != ast::BinOp::Add || !ty.is_float() || self.gemm.strict_fp {
             return None;
         }
         // A local `fn` (not a closure) so the borrow of the returned sub-exprs ties to the
