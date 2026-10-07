@@ -80,7 +80,8 @@ impl Pass for Licm {
 }
 
 /// Everything in one loop body that can write memory, summarized once so the hoist test does not
-/// rescan the body per candidate. Stores and calls are never hoisted, so this stays valid across
+/// rescan the body per candidate. Stores are never hoisted, and the only calls that are (a
+/// speculatable callee's) write nothing and were never recorded here, so this stays valid across
 /// every round of `hoist_from_loop`.
 struct LoopMem {
     /// `(destination, bytes written)` for every store in the body.

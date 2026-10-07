@@ -75,12 +75,13 @@
 //!
 //! # Cost
 //!
-//! It is **not free**. `Cse`, `Dse` and `Licm` each build their own on every invocation of every
-//! fixpoint iteration, which measures at ~15-19% of optimizer time over `tests/run` (`CHANGELOG.md`
-//! carries the ABBA numbers). Sharing one instance across the three is the obvious lever and is
-//! deliberately not taken: all three mutate instructions as they go, and an alias fact that outlives
-//! the IR it described is an unsound no-alias answer. Anything cheaper has to come from making the
-//! sweep itself do less, not from caching it across a mutation.
+//! It is **not free**: building one used to cost ~15-19% of optimizer time over `tests/run`
+//! (`CHANGELOG.md` carries the ABBA numbers), with `Cse`, `Dse` and `Licm` each building their own
+//! on every invocation. An alias fact that outlives the IR it described is an unsound no-alias
+//! answer, so an instance is never carried across a mutation. Within that rule the pass manager's
+//! *managed* `CfgAnalyses` shares one instance between those passes until any pass reports a change
+//! (`CfgAnalyses::alias` / `note_mutation`): a pass takes the facts once, before it mutates, and the
+//! manager drops them the moment it does. A cache built by hand never shares.
 
 use wukong_mir::{Function, MirType, Op, ValueId};
 use wukong_span::Symbol;
