@@ -485,6 +485,7 @@ mod tests {
         let n = b.build(MirType::I64, Op::ConstInt(8, MirType::I64));
         let kernel = b.add_vec_kernel(wukong_mir::VecKernel {
             name: it.intern("kernel"),
+            lane: wukong_mir::VecLane::F32,
             streams: 1,
             scalars: 1,
             unroll: 1,

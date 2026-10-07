@@ -2992,8 +2992,11 @@ mod tests {
 
     #[test]
     fn a_constant_offset_shows_up_in_the_index_constant() {
-        let src = "fn k(x: []f32, mut o: []f32, n: i64) { \
-                   for i in 0..n { o[i] = x[i + 3]; } } \
+        // `while`, like the case above: a `for` over two provably disjoint slices is widened by
+        // `mir_build`'s own vectorizer, leaving 128-bit strip loops (or a 256-bit kernel call) in
+        // place of the one scalar loop this inspects.
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i + 3]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         let l = &l;

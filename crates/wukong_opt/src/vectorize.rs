@@ -67,9 +67,10 @@
 //! guess about what the machine wants — it is the widest vector Cranelift will legalize. A
 //! `<8 x f32>` reaches the x64 backend as `Unsupported("Unexpected SSA-value type: f32x8")` and
 //! fails the compile; the repo's 256-bit path is a separate mechanism (`VecKernel` +
-//! `codegen_cranelift::avx2`, raw assembled AVX2) restricted to f32 elementwise bodies. With AVX
-//! enabled Cranelift VEX-encodes the 128-bit ops, and two of them retire per cycle, so a
-//! memory-bound loop saturates the same bandwidth a 256-bit one would.
+//! `codegen_cranelift::avx2`, raw assembled AVX2) that `mir_build` builds for the `for` loops it
+//! vectorizes itself — f32/f64/i32/i64 elementwise bodies and reductions, over arrays, slices and
+//! tensors. With AVX enabled Cranelift VEX-encodes the 128-bit ops, and two of them retire per
+//! cycle, so a memory-bound loop saturates the same bandwidth a 256-bit one would.
 //!
 //! # `bf16` / `f16` are deliberately excluded
 //!
@@ -2640,6 +2641,11 @@ mod tests {
     use wukong_mir::Program;
     use wukong_span::{Interner, SourceId};
 
+    /// Every loop under test over `[]T` slices is spelled as a counting `while`. That is the shape
+    /// `mir_build`'s own front-end vectorizer leaves to this pass (it normalizes a counting `while`
+    /// into its `for` path for arrays, never for slices), so these cases keep exercising THIS pass
+    /// however much the front end's coverage grows — a `for` over provably disjoint slices is now
+    /// widened there, before this pass ever sees it.
     fn lower(src: &str) -> (Program, Interner) {
         let mut interner = Interner::new();
         let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
@@ -3391,7 +3397,7 @@ mod tests {
     fn an_inner_loop_over_a_row_is_widened() {
         let src = "fn k(x: []f32, mut o: []f32, r: i64, c: i64) { \
                    let b: i64 = r * c; \
-                   for j in 0..c { o[b + j] = x[b + j] * 2.0 + 1.0; } } \
+                   let mut j: i64 = 0; while j < c { o[b + j] = x[b + j] * 2.0 + 1.0; j = j + 1; } } \
                    fn main() -> i32 { return 0; }";
         let vs = vector_values(src, "k");
         assert!(!vs.is_empty(), "a row-wise inner loop was not widened");
@@ -3408,7 +3414,7 @@ mod tests {
     fn a_row_wise_loop_aliasing_itself_computes_the_scalar_answer() {
         let src = "fn k(x: []f32, mut o: []f32, r: i64, c: i64) { \
                    let b: i64 = r * c; \
-                   for j in 0..c { o[b + j] = x[b + j] * 2.0 + 1.0; } } \
+                   let mut j: i64 = 0; while j < c { o[b + j] = x[b + j] * 2.0 + 1.0; j = j + 1; } } \
                    fn main() -> i32 { \
                      let mut x: []f32 = alloc_f32(24); \
                      for i in 0..24 { x[i] = (i as f32) * 0.5; } \
@@ -3424,7 +3430,8 @@ mod tests {
     #[test]
     fn two_constant_offsets_on_one_base_are_still_guardable() {
         let src = "fn k(w: []f32, mut g: []f32, mut b: []f32, d: i64) { \
-                   for i in 0..d { g[i] = w[64 + i]; b[i] = w[128 + i]; } } \
+                   let mut i: i64 = 0; \
+                   while i < d { g[i] = w[64 + i]; b[i] = w[128 + i]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         assert!(
             is_widened(src, "k"),
@@ -3470,7 +3477,8 @@ mod tests {
     #[test]
     fn two_symbolic_offsets_on_one_base_are_guarded_separately() {
         let src = "fn k(w: []f32, mut g: []f32, mut b: []f32, p: i64, q: i64, d: i64) { \
-                   for i in 0..d { g[i] = w[p + i]; b[i] = w[q + i]; } } \
+                   let mut i: i64 = 0; \
+                   while i < d { g[i] = w[p + i]; b[i] = w[q + i]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         assert!(
             is_widened(src, "k"),
@@ -3484,7 +3492,8 @@ mod tests {
         // and because the write is AHEAD of the read, the answer it produces (0,1,0,1,… propagated
         // two apart) is one the vector loop cannot produce. Every lane is printed.
         let diff = "fn k(w: []f32, mut g: []f32, mut b: []f32, p: i64, q: i64, t: i64, d: i64) { \
-                    for i in 0..d { g[t + i] = w[p + i]; b[i] = w[q + i]; } } \
+                    let mut i: i64 = 0; \
+                    while i < d { g[t + i] = w[p + i]; b[i] = w[q + i]; i = i + 1; } } \
                     fn pick(x: []f32, y: []f32, s: i64) -> []f32 { \
                       if s > 0 { return x; } return y; } \
                     fn fill(mut a: []f32, n: i64) { for i in 0..n { a[i] = (i as f32); } } \
@@ -3530,7 +3539,8 @@ mod tests {
     #[test]
     fn one_base_written_at_two_symbolic_offsets_is_refused() {
         let src = "fn k(mut w: []f32, x: []f32, p: i64, q: i64, d: i64) { \
-                   for i in 0..d { w[p + i] = x[i]; w[q + i] = x[i] * 2.0; } } \
+                   let mut i: i64 = 0; \
+                   while i < d { w[p + i] = x[i]; w[q + i] = x[i] * 2.0; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         assert!(
             !is_widened(src, "k"),
@@ -3544,8 +3554,8 @@ mod tests {
     fn two_row_wise_loops_are_both_widened() {
         let src = "fn k(x: []f32, mut o: []f32, mut p: []f32, r: i64, c: i64) { \
                    let b: i64 = r * c; \
-                   for j in 0..c { o[b + j] = x[b + j] * 2.0 + 1.0; } \
-                   for j in 0..c { p[b + j] = x[b + j] * 3.0 + 1.0; } } \
+                   let mut j: i64 = 0; while j < c { o[b + j] = x[b + j] * 2.0 + 1.0; j = j + 1; } \
+                   let mut m: i64 = 0; while m < c { p[b + m] = x[b + m] * 3.0 + 1.0; m = m + 1; } } \
                    fn main() -> i32 { return 0; }";
         let (program, mut interner) = optimized(src, 2);
         let sym = interner.intern("k");
@@ -3575,7 +3585,7 @@ mod tests {
     #[test]
     fn a_lane_mask_selects_between_two_splatted_uniform_arms() {
         let src = "fn k(x: []f32, mut o: []f32, n: i64) { \
-                   for i in 0..n { o[i] = exp(x[i] * 0.25); } } \
+                   let mut i: i64 = 0; while i < n { o[i] = exp(x[i] * 0.25); i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         let (program, mut interner) = optimized(src, 2);
         let sym = interner.intern("k");
@@ -3607,14 +3617,14 @@ mod tests {
     #[test]
     fn an_inlined_exp_loop_widens_and_agrees_with_the_scalar_loop() {
         let alone = "fn k(x: []f32, mut o: []f32, n: i64) { \
-                     for i in 0..n { o[i] = exp(x[i] * 0.25); } } \
+                     let mut i: i64 = 0; while i < n { o[i] = exp(x[i] * 0.25); i = i + 1; } } \
                      fn main() -> i32 { return 0; }";
         assert!(
             is_widened(alone, "k"),
             "an inlined exp loop was not widened"
         );
         let src = "fn k(x: []f32, mut o: []f32, n: i64) { \
-                   for i in 0..n { o[i] = exp(x[i] * 0.25); } } \
+                   let mut i: i64 = 0; while i < n { o[i] = exp(x[i] * 0.25); i = i + 1; } } \
                    fn main() -> i32 { \
                      let mut x: []f32 = alloc_f32(23); \
                      let mut o: []f32 = alloc_f32(23); \
