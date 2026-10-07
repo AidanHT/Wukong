@@ -783,6 +783,78 @@ the same bytes on both backends at `-O0` and `-O2`, and autodiff is refused. The
 fixtures present when the switch landed were swept on/off for byte-identical stdout; that historical
 sweep does not establish recognition-on/off agreement for the current corpus.
 
+### Aliased buffers: the kernel only where the operands are disjoint
+
+Nothing in the language rejects `mm(x, y, x)`, and a recognized kernel equals the loop it replaces
+only when its operands do not overlap in a way the kernel cannot see: `wukong_sgemm` writes `C` in
+tiled order while it still reads `A`, an 8-lane row scan loads lanes before the source loop's
+stores would have changed them. An aliased call therefore means **what the source loop means**, and
+the compiler keeps the kernel only where the two agree. This is the blind spot that is worse than
+"gate-blind": on an aliased input the two backends need not run the same program at all (the
+interpreter used to answer from copies of the operands, native from the overlapping memory), and the
+interpreter's answer was the plausible one, so a differential failure would have blamed native.
+
+**Lowering.** Every multi-buffer recognizer asks one classifier,
+`wukong_mir_build::alias::plan_kernel_alias`, about the operand pairs its kernel's contract
+constrains. Two different symbols in a function the whole-program alias facts vouch for are
+`Disjoint` (dispatch); the same symbol is `MustAlias` (dispatch only under an exact-in-place
+contract, otherwise lower the loop); anything else is `MayAlias`, and `kernel_guard.rs` versions the
+dispatch at run time — `ptrtoint(base)` and `ptrtoint(gep(base, n))` range tests over every
+constrained operand pick the kernel when they are disjoint (or exactly in place where permitted) and
+the ORIGINAL source, recognition and `@parallel` off, otherwise. That is LLVM's `LoopVersioning`.
+The extent end is a `Gep`, so the interpreter (slot stride) and Cranelift (byte stride) reach the
+same verdict for in-bounds extents, which matters because a kernel and its loop are not always
+bit-identical; "exactly in place" is only ever admitted between operands of one element type, the
+one comparison two address units could disagree on.
+
+The versioning contexts cover every cascade: the per-loop recognizers (`emit_versioned_loop`, and
+`emit_nonempty_reduction` for the reductions, whose empty-extent arm lowers the same source), the
+256-bit elementwise kernel probes inside `try_vectorize_for` (vmath, vmath2, velem, vhorner, the int
+dequant — their overlapping arm is the loop with recognition off, which the generic vectorizer then
+lowers only with its own disjointness proof, or scalar), and the statement windows
+(`emit_versioned_stmts`: the fused norms, the copy-then-norm fold, the flat 1-D scans — their
+overlapping arm is the window's own statements). A recognizer reached with no context — a
+whole-function interception, a probe, an outlined `@parallel` chunk — declines on `MayAlias`, as every
+recognizer did before versioning. An elementwise dispatch that becomes several full-range passes
+(one per statement of a fused body) is guarded over every operand of every pass, because loop
+fission is itself an alias-sensitive transformation.
+
+**Empty ranges.** A recognized reduction keeps what the source loop writes for a zero or negative
+extent: the storing reductions dispatch only on a positive reduction extent and lower the source
+otherwise (`emit_nonempty_reduction`), and the value-returning ones (`wukong_sreduce_f32_parallel`,
+the bf16/f16 dot/sum/reduce) select the SEED on an empty range (`keep_seed_when_empty`) — the kernel's
+identity combined into the seed is not the seed on every input (`-0.0 + 0.0` is `+0.0`;
+`fmax(NaN, -inf)` as the `Cmp(Fogt)+Select` fold is `-inf`). A `Select`, not a branch, so a
+straight-line loss stays straight-line for autodiff's tape.
+
+**Oracle.** The interpreter still marshals operands through copies, and `marshal::check_output`
+makes that unobservable rather than assumed: an arm reached with operands its kernel's contract
+forbids returns an error instead of a copied answer. Exact in-place operation, where permitted, is
+equal to out of place for a row-local or elementwise kernel. Three groups run against LIVE memory in
+source order instead, because their one meaning under any overlap is the source loop's: the
+embedding gather, the scatter-add, and — for a SHIFTED overlap — the elementwise maps (vmath, vmath2,
+velem, vhorner: `marshal::elementwise_live`, one element at a time). A call that reaches a kernel
+with operands the compiler's guard would have kept away (a direct call, an alias-analysis hole) is
+therefore either refused or answered with the source loop's value, never with a copy-in/copy-out
+value no backend computes. Operand scratch is recycled per thread (`marshal::f32_scratch` /
+`recycle_f32`), so a kernel inside a loop no longer allocates its operands on every iteration, and
+every extent is range-checked before any scratch is reserved.
+
+**The aliasing ABI**, one class per exported kernel (each entry's `# Safety` carries an
+`**Aliasing:**` line that says which):
+
+| Class | Families |
+|---|---|
+| All operands disjoint | GEMM (f32, fused epilogue, alpha, residual, bf16/f16, int8, int8+dequant), GEMV, GEVM, transpose, pool2d, column reductions, row/column arg-reductions, log-sum-exp, entropy, KL divergence, soft-label and hard-label cross-entropy forward, LayerNorm backward, attention, embedding, scatter-add, the int dequants, the half-input/f32-output maps (`vmath_{bf16,f16}`, `axpby_{bf16,f16}`) |
+| Exactly in place, otherwise disjoint | cumsum, cummax/cummin, cumprod, lrscan (`out` over an input), RoPE and its backward (`out` over `x`; the frequency table disjoint), softmax backward and RMSNorm backward (`dx` over `dy`; `y`/`x`/`gamma` disjoint), cross-entropy backward (`dx` over `x`), velem, vmath, vmath2, vhorner, log-softmax, the fused norms (`out` over `x`; `gamma`/`beta` disjoint), broadcast bias (`out` over `x`; the bias row disjoint), the half-output maps |
+| None constrained (read-only) | `sreduce`, `argreduce`, the bf16/f16 dot/sum/reduce |
+
+What remains open is stated in `docs/roadmap.md`: `alias.rs`'s documented holes can still hand a
+kernel overlapping storage where the interpreter refuses (cross-element) or answers with the source
+loop (elementwise); an outlined `@parallel` chunk has no versioning context and declines rather than
+versions; and the `@parallel` region outliner, the generic vectorizer's loop fusion (`try_fuse_run`)
+and the half-output runtime kernels' own shifted-overlap handling are outside this classifier.
+
 ## CPU training execution
 
 `--train` validates concrete dense f32 buffer types and checked byte extents before allocating

@@ -146,6 +146,7 @@ unsafe fn gevm_range(
 /// # Safety
 /// `w` valid for `rows`, `a` for `rows*cols`, `out` for `cols` f32; `out` must not overlap `w` or
 /// `a` (it is the running accumulator while both are re-read).
+/// **Aliasing: all operands disjoint** — `out` overlaps neither `w` nor `a`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgevm_f32(
     w: *const f32,
@@ -183,6 +184,7 @@ const GEVM_PAR_MIN: usize = 256;
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_sgevm_f32`].
+/// **Aliasing: all operands disjoint** — `out` overlaps neither `w` nor `a`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgevm_f32_parallel(
     w: *const f32,

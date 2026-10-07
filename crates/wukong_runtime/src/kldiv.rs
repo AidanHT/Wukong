@@ -125,6 +125,9 @@ unsafe fn kldiv_row(p: *const f32, q: *const f32, n: usize) -> f32 {
 ///
 /// # Safety
 /// `p`, `q` valid for `rows*cols` f32; `out` valid for `rows` f32.
+/// **Aliasing: all operands disjoint** — `out` must overlap neither `p` nor `q` (`p` and `q` are
+/// only read and may share storage). The compiler guarantees it for a recognized call
+/// (`wukong_mir_build`'s `kernel_guard.rs`).
 #[no_mangle]
 pub unsafe extern "C" fn wukong_kldiv_f32(
     p: *const f32,
@@ -152,7 +155,9 @@ const KLDIV_PAR_MIN: usize = 8;
 /// `@parallel` path exactly).
 ///
 /// # Safety
-/// Operand-size contract of [`wukong_kldiv_f32`].
+/// Operand-size and aliasing contract of [`wukong_kldiv_f32`].
+/// **Aliasing:** that of [`wukong_kldiv_f32`] — all operands disjoint: `out` overlaps neither `p`
+/// nor `q`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_kldiv_f32_parallel(
     p: *const f32,

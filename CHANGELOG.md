@@ -5,6 +5,18 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Aliased recognized kernels run the source loop (gap/alias-recognizers)
+
+- **Fixed: an aliased call to a recognized kernel now means what the loop means, everywhere.** Every
+  multi-buffer recognizer emit site goes through one classifier (`alias::plan_kernel_alias`) and
+  versions an operand pair the compiler cannot separate on a run-time overlap test whose other arm
+  is the original loop or window (`kernel_guard.rs`); a library `fn mm(a, b, mut c)` keeps its kernel
+  for disjoint calls instead of losing it program-wide (`tests/run/alias_versioned_kernels.wk`).
+  Recognized reductions over an empty range keep their seed exactly. Each exported runtime kernel's
+  `# Safety` now states its aliasing class. The interpreter refuses a cross-element kernel call with
+  overlapping operands, answers a shifted elementwise overlap with the source loop's value, recycles
+  operand scratch, and range-checks every extent before reserving it.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

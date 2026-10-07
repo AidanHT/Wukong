@@ -163,6 +163,8 @@ fn use_nt(n: usize) -> bool {
 /// `x` and `out` must each be valid for `rows*cols` `f32`; `b` for `cols` `f32`.
 /// The `x` and `out` ranges must be identical or disjoint; shifted overlap is unsupported.
 /// The `b` range must be disjoint from the written `out` range.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`; the bias row `b`
+/// must not overlap `out`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_bias_bcast_f32(
     x: *const f32,
@@ -199,6 +201,8 @@ pub unsafe extern "C" fn wukong_bias_bcast_f32(
 /// `x` and `out` must each be valid for `rows*cols` `f32`; `b` for `cols` `f32`.
 /// The `x` and `out` ranges must be identical or disjoint; shifted overlap is unsupported.
 /// The `b` range must be disjoint from the entire written `out` range, including other row bands.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`; the bias row `b`
+/// must not overlap `out`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_bias_bcast_f32_parallel(
     x: *const f32,

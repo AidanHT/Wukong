@@ -912,6 +912,8 @@ unsafe fn norm_row(x: *const f32, out: *mut f32, n: usize, eps: f32, op: i64) {
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` `f32` elements.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`, never a shifted
+/// view of it.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_norm_f32(
     x: *const f32,
@@ -939,6 +941,8 @@ pub unsafe extern "C" fn wukong_norm_f32(
 ///
 /// # Safety
 /// `x` and `out` must each be valid for `rows * cols` `f32` elements.
+/// **Aliasing:** that of [`wukong_norm_f32`] — `out` may be EXACTLY `x`, never a shifted view of
+/// it.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_norm_f32_parallel(
     x: *const f32,
@@ -987,6 +991,8 @@ pub unsafe extern "C" fn wukong_norm_f32_parallel(
 ///
 /// # Safety
 /// `x`/`out` valid for `rows*cols` f32; `gamma`/`beta` null or valid for `cols` f32.
+/// **Aliasing: exactly in place, otherwise disjoint** — `out` may be EXACTLY `x`, never a shifted
+/// view of it; `gamma`/`beta` must not overlap `out`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_norm_affine_f32(
     x: *const f32,
@@ -1025,6 +1031,8 @@ pub unsafe extern "C" fn wukong_norm_affine_f32(
 ///
 /// # Safety
 /// `x`/`out` valid for `rows*cols` f32; `gamma`/`beta` null or valid for `cols` f32.
+/// **Aliasing:** that of [`wukong_norm_affine_f32`] — `out` may be EXACTLY `x`; `gamma`/`beta` must
+/// not overlap `out`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_norm_affine_f32_parallel(
     x: *const f32,

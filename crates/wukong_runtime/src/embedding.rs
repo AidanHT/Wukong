@@ -153,6 +153,14 @@ const EMBEDDING_PAR_MIN: usize = 64;
 /// # Safety
 /// `out` valid for `t*h` f32, `weight` valid for `v*h` f32, `ids` valid for `t` `i32`, non-overlapping
 /// `out`/`weight`.
+///
+/// **Aliasing: `out` disjoint from `weight` AND from `ids`** — for this serial entry as much as for
+/// the parallel one: `copy_row` moves eight lanes per step, so a shifted `out` over `weight` is not
+/// the element-by-element source loop. The compiler relies on exactly this contract and no more:
+/// `wukong_mir_build` dispatches a recognized gather only when the three operands are disjoint
+/// (proved at compile time, or by a run-time range test over all three in `kernel_guard.rs`) and
+/// lowers the source loop otherwise. It does NOT treat this serial form as an alias-tolerant
+/// fallback, so tightening it for speed under this contract is safe.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_embedding_f32(
     out: *mut f32,
@@ -182,7 +190,9 @@ pub unsafe extern "C" fn wukong_embedding_f32(
 /// count and order are irrelevant). Below `EMBEDDING_PAR_MIN` rows it runs the serial path.
 ///
 /// # Safety
-/// Operand-size contract of [`wukong_embedding_f32`], including its non-positive-extent rule.
+/// Operand-size and aliasing contract of [`wukong_embedding_f32`], including its non-positive-extent
+/// rule.
+/// **Aliasing:** that of [`wukong_embedding_f32`] — `out` overlaps neither `weight` nor `ids`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_embedding_f32_parallel(
     out: *mut f32,

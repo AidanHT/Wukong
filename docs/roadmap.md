@@ -973,9 +973,24 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   Whole-function parallel outlining uses the shared region dependence proof as well.
   The MIR alias analysis remains conservative for parameters. Distinct local allocations and
   call-site proofs can establish disjointness; the language has no general `restrict` promise.
-  This repair does not establish safe dispatch for every runtime recognizer. Remaining family
-  coverage and oracle-marshalling gaps are listed in the
-  [closeout checklist](sota-campaign-2026-09/CLOSEOUT-CHECKLIST.md).
+- **An aliased call to a recognized kernel means what the source loop means.** Every multi-buffer
+  recognizer emit site — GEMM in all its forms, GEMV/GEVM, transpose, pooling, the column/row/arg
+  reductions, the losses, the norm backwards, RoPE, the scans, embedding/scatter, the fused norms,
+  broadcast bias, the int dequants, the half-precision maps and the 256-bit elementwise kernels —
+  asks one classifier (`wukong_mir_build::alias::plan_kernel_alias`) and, for an operand pair the
+  compiler cannot separate, versions the dispatch on a run-time overlap test whose other arm is the
+  ORIGINAL source loop or window (`kernel_guard.rs`, LLVM's `LoopVersioning` shape). A library
+  routine `fn mm(a, b, mut c)` called both as `mm(x, y, x)` and `mm(x, y, z)` keeps its kernel for
+  the disjoint call and runs the nest for the aliased one (`tests/run/alias_versioned_kernels.wk`
+  prints every lane of both). Exact in-place operation is admitted only where the runtime entry
+  documents it, and each exported kernel's `# Safety` states its aliasing class. A recognized
+  reduction over an empty range keeps the seed exactly. The interpreter refuses a cross-element call
+  that reaches it with overlapping operands, and answers a shifted elementwise overlap with the
+  source loop's value, instead of computing either from copies.
+  **Open:** `alias.rs`'s documented limits (its `# Known limits`) can still hand a kernel overlapping
+  storage; an outlined `@parallel` chunk has no versioning context, so an alias-uncertain kernel there
+  declines instead of versioning; the generic vectorizer's loop fusion and the `@parallel` region
+  outliner keep their own disjointness proofs outside this classifier.
 - Array *length* in a type may be an integer literal or a top-level `const` (resolved through
   const-to-const chains; `tests/run/const_array_length.wk`). It may also be **arithmetic over those** —
   `[i32; 2 + 2]`, or a `const N: i32 = 2 + 2` used as a length — because sema's `eval_usize` and

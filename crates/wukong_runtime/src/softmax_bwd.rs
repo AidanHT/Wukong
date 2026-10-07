@@ -81,6 +81,8 @@ unsafe fn softmax_bwd_row(y: *const f32, dy: *const f32, dx: *mut f32, cols: usi
 /// # Safety
 /// `y`, `dy`, `dx` valid for `rows*cols` f32; `y`/`dy` not aliasing `dx` *across* rows is not required
 /// (each row is self-contained), but `dx` must not overlap `y` (its row is read during the apply).
+/// **Aliasing: exactly in place, otherwise disjoint** — `dx` may be EXACTLY `dy`; it does not
+/// overlap `y`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_softmax_bwd_f32(
     y: *const f32,
@@ -108,6 +110,8 @@ const SOFTMAX_BWD_PAR_MIN: usize = 8;
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_softmax_bwd_f32`].
+/// **Aliasing:** that of [`wukong_softmax_bwd_f32`] — `dx` may be EXACTLY `dy`; it does not overlap
+/// `y`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_softmax_bwd_f32_parallel(
     y: *const f32,

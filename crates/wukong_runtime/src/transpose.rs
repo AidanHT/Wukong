@@ -315,6 +315,7 @@ unsafe fn transpose_parallel<T: Copy + Send + Sync>(
 ///
 /// # Safety
 /// `src` valid for `rows*cols`, `dst` for `cols*rows` f32, non-overlapping.
+/// **Aliasing: all operands disjoint** — `dst` does not overlap `src`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_transpose_f32(
     src: *const f32,
@@ -337,6 +338,7 @@ pub unsafe extern "C" fn wukong_transpose_f32(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_transpose_f32`].
+/// **Aliasing: all operands disjoint** — `dst` does not overlap `src`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_transpose_f32_parallel(
     src: *const f32,
@@ -375,6 +377,7 @@ pub unsafe extern "C" fn wukong_transpose_f32_parallel(
 ///
 /// # Safety
 /// `src` valid for `rows*cols`, `dst` for `cols*rows` `u16`, non-overlapping.
+/// **Aliasing: all operands disjoint** — `dst` does not overlap `src`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_transpose_u16(
     src: *const u16,
@@ -392,6 +395,8 @@ pub unsafe extern "C" fn wukong_transpose_u16(
 ///
 /// # Safety
 /// Operand-size contract of [`wukong_transpose_u16`].
+/// **Aliasing:** that of [`wukong_transpose_u16`] — all operands disjoint: `dst` does not overlap
+/// `src`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_transpose_u16_parallel(
     src: *const u16,
