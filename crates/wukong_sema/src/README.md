@@ -5,6 +5,7 @@
 | `lib.rs` | `Sema` struct, `check` entry, `collect` / body passes, type lowering, literals, exhaustiveness, `eval_usize_depth`, `array_len`, builtin tables, inline tests |
 | `shape.rs` | `impl Sema` continuation: `type_call`, `check_fn_call`, `unify` / `unify_dim`, `type_index`, `infer_type_generics`, `apply_subst`, `dims_equal` |
 | `attrs.rs` | The closed v1 `@attribute` set (`KNOWN_ATTRS`), placement (`FN_ITEM_ONLY`), and `E0306` |
+| `noalias.rs` | The `@noalias` parameter promise: which parameter types may carry it (`E0306`), the call-site overlap check and the rebinding rule (`E0316`); runs after body checking, reading the recorded expression types |
 
 `shape.rs` is not a separate crate module tree — it extends `Sema` from `lib.rs`.
 

@@ -69,7 +69,8 @@ not duplicate them. In summary, Wukong:
   layout declared in the type (`Tensor[f32, 512, 512, .col_major]`, `.tiled(64, 64)`, strided) and
   parallel schedules (`@parallel`) are part of the language rather than a soup of intrinsics and
   `#pragma`s. Honest status: a user-written `vec[f32, 8]` *value* parses and type-checks but does not
-  execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` (bare form), `@generic` and `@tile`
+  execute yet (`f32x8::load(..)` is a hard `C0001`); `@parallel` (bare form), `@generic`, `@tile` and
+  the parameter attribute `@noalias` (a checked `restrict` promise, `E0316` on a provably aliased call)
   have consumers today, and a `@tile` the compiler cannot apply — an unsupported loop form, a width
   that is not a positive integer literal — is `E0309` rather than a silent drop, while
   `@simd`/`@align`/`@extern`/`@export` and `@parallel`'s `grain =` argument parse and are inert — layout is
