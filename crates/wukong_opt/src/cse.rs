@@ -1,4 +1,5 @@
-//! Common-subexpression elimination: dominator-tree value numbering with load forwarding.
+//! Global value numbering: dominator-tree value numbering, load forwarding across edges and
+//! joins, block-parameter numbering, and phi insertion for fully redundant values.
 //!
 //! Pure operations are value-numbered over the **dominator tree**: a computation in a block is
 //! reused by any block it dominates, since the dominating definition reaches all those uses. Walking
@@ -6,31 +7,51 @@
 //! legal without re-checking dominance per candidate. This catches redundancy across blocks, not
 //! just within one.
 //!
-//! Loads are forwarded within a block and along **single-predecessor edges**, keyed by the SSA
-//! address value and the accessed type:
-//! a `store p, v` makes `v` the current contents of `(p, typeof v)`, the first `load p` becomes the
-//! current contents of `(p, ty)`, and a later load of the same address and type reuses it. Which
-//! entries a store or call invalidates is decided by [`crate::alias`] — a store only forgets the
-//! entries it `may_alias`, and a call forgets everything except addresses inside a stack slot whose
-//! address never escaped this function (no callee can hold a pointer to one). Before that analysis
-//! existed this pass tracked only pointers that were *literally* an `alloca` result and cleared the
-//! whole table on any other store; the difference is visible on every `[]T` slice loop, whose
-//! fat-pointer header loads sit behind a `gep`.
+//! Loads are forwarded keyed by the SSA address value and the accessed type: a `store p, v` makes
+//! `v` the current contents of `(p, typeof v)`, the first `load p` becomes the current contents of
+//! `(p, ty)`, and a later load of the same address and type reuses it. Which entries a store or call
+//! invalidates is decided by [`crate::alias`] — a store only forgets the entries it `may_alias`, and
+//! a call forgets everything except addresses inside a stack slot whose address never escaped this
+//! function (no callee can hold a pointer to one).
 //!
-//! A dominator child inherits its parent's final memory table only when that parent is its only
-//! predecessor. Every execution of the child then sees exactly the state the table describes:
-//! there is no intervening block or alternate incoming edge. Joins and loop headers start with an
-//! empty table, so back-edge writes cannot be missed. This limited cross-block forwarding needs
-//! neither memory SSA nor a speculative load; it removes a load only after the same address was
-//! already read or written on the path actually taken.
+//! # Across edges and joins
+//!
+//! A dominator child whose only predecessor is its parent inherits the parent's final memory table:
+//! every execution of the child sees exactly the state the table describes. A **join** is entered
+//! with the *intersection* of its predecessors' exit tables. The tree's children are visited in
+//! reverse postorder, which guarantees that every forward-edge predecessor of a join has been
+//! numbered before the join itself (the predecessor's branch of the dominator tree starts at a
+//! sibling of the join that precedes it in RPO); each such predecessor records its exit table on the
+//! way past. A location every edge agrees on keeps its value. A location every edge knows, with a
+//! different value per edge, becomes a *pending phi*: if a load at or below the join asks for it,
+//! the join gains a block parameter carrying each edge's value and the load is replaced by it — the
+//! classic store-to-load forwarding across `if c { a[0] = x } else { a[0] = y }`. A loop header
+//! has a back-edge predecessor that is not yet numbered, so it starts empty, as before: back-edge
+//! writes can never be missed.
+//!
+//! Expressions get the same treatment. Each predecessor of a join also records the pure expressions
+//! computed on its dominator path below the join's immediate dominator (the arms of a diamond); an
+//! expression every arm computed is fully redundant at the join, and a recomputation at or below
+//! the join is replaced by a phi of the arms' values — partial-redundancy elimination restricted to
+//! the fully-available case, which needs no edge splitting and never speculates a computation.
+//! Constants and address arithmetic are excluded: they rematerialize for free, and a phi of `gep`s
+//! would hide the pointers' provenance from the alias analysis.
+//!
+//! # Block parameters
+//!
+//! Before a block's body is numbered its parameters are: a parameter every incoming edge passes the
+//! same value (ignoring the parameter itself on a back edge) *is* that value, and two parameters
+//! every edge passes identical values are one value. Arguments compare after rewriting, so an edge
+//! from an already-numbered predecessor compares by value number; one not yet numbered compares by
+//! identity, which is always sound.
 //!
 //! Forwarding loads to a common value lets the pure value-numbering then collapse the expressions
-//! built on top of them. DCE deletes the dead remains.
+//! built on top of them. DCE deletes the dead remains, and simplify-phis the parameters made dead.
 
 use crate::alias::{type_bytes, AliasInfo};
 use crate::fxhash::FxHashMap;
 
-use wukong_mir::{BinOp, CmpOp, Function, MirType, Op, ValueId};
+use wukong_mir::{BinOp, CmpOp, Function, MirType, Op, Terminator, ValueId};
 
 use crate::{cfg, map_op_uses, map_term_uses, CfgAnalyses, Pass};
 
@@ -42,6 +63,15 @@ const MAX_TRACKED_LOCATIONS: usize = 256;
 
 /// "No rewrite" in the dense rewrite table.
 const NO_REWRITE: u32 = u32::MAX;
+
+/// Cap on the expressions one predecessor offers a join, which bounds the join's pairwise match.
+const MAX_JOIN_EXPRESSIONS: usize = 64;
+
+/// Cap on pending phis per run. Past it a join simply offers no new phis.
+const MAX_PENDING_PHIS: usize = 4096;
+
+/// Blocks with more parameters than this skip the quadratic duplicate-parameter scan.
+const MAX_NUMBERED_PARAMS: usize = 64;
 
 pub struct Cse;
 
@@ -59,50 +89,163 @@ impl Pass for Cse {
         }
         // Taken before the dominator borrows below: an `Rc`, so it borrows nothing.
         let alias = cache.alias(f);
-        let (children, preds) = cache.children_and_preds(f);
+        let (children, preds, idom) = cache.gvn_inputs(f);
 
+        let n = f.blocks.len();
+        // How many joins each block feeds: the number of exit records it owes.
+        let mut joins_left = vec![0u32; n];
+        for (b, blk) in f.blocks.iter().enumerate() {
+            for s in cfg::successors(&blk.term) {
+                if preds[s.0 as usize].len() >= 2 {
+                    joins_left[b] += 1;
+                }
+            }
+        }
         let mut cx = Numbering {
             f,
             children,
             preds,
+            idom,
             alias: &alias,
             vn: FxHashMap::default(),
+            pre: FxHashMap::default(),
             rewrite: vec![NO_REWRITE; f.value_types.len()],
             rewrites: 0,
             types: TyIds::default(),
+            exit_mem: vec![None; n],
+            exit_exprs: FxHashMap::default(),
+            joins_left,
+            entered: vec![false; n],
+            pending: Vec::new(),
+            created: Vec::new(),
+            base: f.value_types.len() as u32,
         };
-        cx.visit(f.entry.0, FxHashMap::default());
-        let (rewrite, rewrites) = (cx.rewrite, cx.rewrites);
-
+        cx.visit(f.entry.0);
+        let Numbering {
+            rewrite,
+            rewrites,
+            pending,
+            created,
+            ..
+        } = cx;
         if rewrites == 0 {
             return false;
         }
+
+        // Materialize the phis a computation asked for, in creation order: each becomes the next
+        // value id (the ids the rewrites already name) and the last parameter of its join, and every
+        // edge into the join passes that edge's value.
+        let mut changed = !created.is_empty();
+        for &k in &created {
+            let phi = &pending[k as usize];
+            let id = ValueId(f.value_types.len() as u32);
+            debug_assert_eq!(phi.param, Some(id.0));
+            f.value_types.push(phi.ty.clone());
+            f.blocks[phi.block as usize].params.push(id);
+            for &(p, v) in &phi.incoming {
+                push_edge_arg(&mut f.blocks[p as usize].term, phi.block, ValueId(v));
+            }
+        }
         for b in &mut f.blocks {
             for inst in &mut b.insts {
-                map_op_uses(&mut inst.op, |v| ValueId(resolve(&rewrite, v.0)));
+                map_op_uses(&mut inst.op, |v| {
+                    let r = ValueId(resolve(&rewrite, v.0));
+                    changed |= r != v;
+                    r
+                });
             }
-            map_term_uses(&mut b.term, |v| ValueId(resolve(&rewrite, v.0)));
+            map_term_uses(&mut b.term, |v| {
+                let r = ValueId(resolve(&rewrite, v.0));
+                changed |= r != v;
+                r
+            });
         }
-        true
+        changed
+    }
+}
+
+/// Append `v` to every arm of `term` that branches to block `target`.
+fn push_edge_arg(term: &mut Terminator, target: u32, v: ValueId) {
+    match term {
+        Terminator::Br { target: t, args } if t.0 == target => args.push(v),
+        Terminator::CondBr {
+            then_blk,
+            then_args,
+            else_blk,
+            else_args,
+            ..
+        } => {
+            if then_blk.0 == target {
+                then_args.push(v);
+            }
+            if else_blk.0 == target {
+                else_args.push(v);
+            }
+        }
+        _ => {}
     }
 }
 
 struct Numbering<'a> {
     f: &'a Function,
+    /// Dominator-tree children, each list in reverse postorder.
     children: &'a [Vec<u32>],
     preds: &'a [Vec<u32>],
-    /// Provenance facts for `f`, computed once per pass run. Decides which memory-table entries a
-    /// store or a call has to forget.
+    idom: &'a [u32],
+    /// Provenance facts for `f`. Decides which memory-table entries a store or a call has to forget.
     alias: &'a AliasInfo,
     /// pure-op key -> canonical value id, scoped to the current dominator-tree path.
     vn: FxHashMap<Key, u32>,
+    /// pure-op key -> pending phi of a join on the current path that every arm computed it before.
+    /// Scoped like `vn`: an entry lives exactly as long as the join's subtree is being numbered.
+    pre: FxHashMap<Key, u32>,
     /// value id -> the value it is replaced by (load forwards and CSE rewrites), dense over the
     /// value arena with [`NO_REWRITE`] for "kept". A target is always a value that was already
-    /// visited and kept, so it is final when recorded: every chain is one step long.
+    /// visited and kept (or a phi), so it is final when recorded: every chain is one step long.
     rewrite: Vec<u32>,
     rewrites: usize,
     /// Interned key types (see [`TyId`]).
     types: TyIds,
+    /// Exit memory table of each numbered block that a join successor has yet to read.
+    exit_mem: Vec<Option<MemTable>>,
+    /// The expressions each `(join, predecessor)` edge offers, recorded when the predecessor is
+    /// numbered and consumed when the join is entered.
+    exit_exprs: FxHashMap<(u32, u32), Vec<(Key, u32)>>,
+    /// Join successors of each block not yet entered; its exit table is dropped at zero.
+    joins_left: Vec<u32>,
+    entered: Vec<bool>,
+    pending: Vec<PendingPhi>,
+    /// Materialized pending phis, in creation order. Phi `i` gets value id `base + i`.
+    created: Vec<u32>,
+    base: u32,
+}
+
+/// What a memory-table entry knows about a location's contents.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Avail {
+    /// The location holds this value.
+    Value(u32),
+    /// The location holds a different known value on each edge into a join: this pending phi.
+    Phi(u32),
+}
+
+type MemTable = FxHashMap<MemKey, Avail>;
+
+/// A value that is available on every edge into `block`, with a different SSA value per edge. It
+/// becomes a block parameter only if something at or below the join reads it.
+struct PendingPhi {
+    block: u32,
+    ty: MirType,
+    /// `(predecessor, the value on that edge)`, one per predecessor of `block`.
+    incoming: Vec<(u32, u32)>,
+    param: Option<u32>,
+}
+
+/// One join input: a key every predecessor's exit table holds, and whether they agree.
+enum Merged {
+    Same(Avail),
+    /// The per-predecessor values, in predecessor order.
+    Differ(Vec<u32>),
 }
 
 /// State suspended while a dominator child's subtree is numbered. Keep pending siblings in
@@ -111,8 +254,9 @@ struct Scope {
     block: u32,
     next_child: usize,
     last_inheriting: Option<usize>,
-    mem: FxHashMap<MemKey, u32>,
+    mem: MemTable,
     added_start: usize,
+    pre_start: usize,
 }
 
 /// A [`MirType`] folded into one word, so a key is `Copy` and building or probing one never clones a
@@ -230,31 +374,97 @@ enum Key {
     Round(u8, u32),
 }
 
+/// Is a value computed on every arm of a join worth a phi there? Not constants or named addresses,
+/// which rematerialize for free, and not address arithmetic: a block parameter's provenance is
+/// `Unknown` to the alias analysis, so a phi of `gep`s would cost every later memory transform
+/// its knowledge of the base for the sake of one instruction.
+fn pre_candidate(key: &Key) -> bool {
+    !matches!(
+        key,
+        Key::ConstInt(..)
+            | Key::ConstFloat(..)
+            | Key::FuncAddr(..)
+            | Key::GlobalAddr(..)
+            | Key::Iota(..)
+            | Key::Gep(..)
+    )
+}
+
+/// The keys every exit table holds: `Same` when all edges agree on the contents, `Differ` with the
+/// per-table values when each edge holds a known value of its own. Anything else is dropped,
+/// including disagreement involving a pending phi (no phi of phis).
+fn intersect_tables(tables: &[&MemTable]) -> Vec<(MemKey, Merged)> {
+    let Some((first, rest)) = tables.split_first() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    'keys: for (key, &a0) in first.iter() {
+        let mut same = true;
+        for t in rest {
+            match t.get(key) {
+                Some(&a) => same &= a == a0,
+                None => continue 'keys,
+            }
+        }
+        if same {
+            out.push((*key, Merged::Same(a0)));
+            continue;
+        }
+        let mut values = Vec::with_capacity(tables.len());
+        for t in tables {
+            match t.get(key) {
+                Some(&Avail::Value(v)) => values.push(v),
+                _ => continue 'keys,
+            }
+        }
+        out.push((*key, Merged::Differ(values)));
+    }
+    out
+}
+
 impl Numbering<'_> {
-    fn visit(&mut self, entry: u32, mem: FxHashMap<MemKey, u32>) {
-        // One undo log serves the whole DFS. Each scope removes its suffix on exit, so sibling
-        // computations never become candidates for one another. Reusing the log also avoids a
-        // separate allocation for every block that contributes a pure expression.
+    fn visit(&mut self, entry: u32) {
+        let children = self.children;
+        let preds = self.preds;
+        // One undo log per scoped table serves the whole DFS. Each scope removes its suffix on
+        // exit, so sibling computations never become candidates for one another.
         let mut added: Vec<Key> = Vec::new();
-        let mut stack = vec![self.enter(entry, mem, &mut added)];
+        let mut pre_log: Vec<Key> = Vec::new();
+        let first = self.enter(entry, MemTable::default(), &mut added, 0);
+        let mut stack = vec![first];
+        self.record_exit(&stack, &added);
         while let Some(scope) = stack.last_mut() {
-            let children = &self.children[scope.block as usize];
-            if let Some(&child) = children.get(scope.next_child) {
+            if let Some(&child) = children[scope.block as usize].get(scope.next_child) {
                 let i = scope.next_child;
                 scope.next_child += 1;
-                // Preserve the recursive walk's child order and move the table into its last
-                // inheriting child. Straight-line regions still incur no table copy.
-                let inherited = if Some(i) == scope.last_inheriting {
-                    std::mem::take(&mut scope.mem)
-                } else if self.preds[child as usize].as_slice() == [scope.block] {
-                    scope.mem.clone()
+                // Preserve the walk's child order and move the table into its last inheriting
+                // child. Straight-line regions still incur no table copy. A join merges its
+                // predecessors' exit tables instead.
+                let inherited = if preds[child as usize].len() >= 2 {
+                    None
+                } else if Some(i) == scope.last_inheriting {
+                    Some(std::mem::take(&mut scope.mem))
+                } else if preds[child as usize].as_slice() == [scope.block] {
+                    Some(scope.mem.clone())
                 } else {
-                    FxHashMap::default()
+                    Some(MemTable::default())
                 };
-                stack.push(self.enter(child, inherited, &mut added));
+                // The join's pending expressions belong to the join's own scope, so they are logged
+                // after this mark and retracted when its subtree is done.
+                let pre_start = pre_log.len();
+                let mem = match inherited {
+                    Some(mem) => mem,
+                    None => self.join(child, &mut pre_log),
+                };
+                let entered = self.enter(child, mem, &mut added, pre_start);
+                stack.push(entered);
+                self.record_exit(&stack, &added);
             } else {
                 for key in added.drain(scope.added_start..) {
                     self.vn.remove(&key);
+                }
+                for key in pre_log.drain(scope.pre_start..) {
+                    self.pre.remove(&key);
                 }
                 stack.pop();
             }
@@ -280,7 +490,243 @@ impl Numbering<'_> {
         }
     }
 
-    fn enter(&mut self, blk: u32, mut mem: FxHashMap<MemKey, u32>, added: &mut Vec<Key>) -> Scope {
+    /// The type of a value, including a phi this run created.
+    fn ty_of(&self, v: u32) -> Option<&MirType> {
+        match v.checked_sub(self.base) {
+            None => self.f.value_types.get(v as usize),
+            Some(i) => {
+                let k = *self.created.get(i as usize)?;
+                Some(&self.pending[k as usize].ty)
+            }
+        }
+    }
+
+    /// Register a value that join `j` receives as `values[i]` from `preds[i]`. Pointers qualify
+    /// only for memory (`allow_ptr`), where the replaced load had no provenance to lose.
+    fn new_pending(
+        &mut self,
+        j: u32,
+        preds: &[u32],
+        values: &[u32],
+        allow_ptr: bool,
+    ) -> Option<u32> {
+        if self.pending.len() >= MAX_PENDING_PHIS || values.len() != preds.len() {
+            return None;
+        }
+        let ty = self.ty_of(*values.first()?)?.clone();
+        if (!allow_ptr && ty == MirType::Ptr) || values.iter().any(|&v| self.ty_of(v) != Some(&ty))
+        {
+            return None;
+        }
+        let k = self.pending.len() as u32;
+        self.pending.push(PendingPhi {
+            block: j,
+            ty,
+            incoming: preds.iter().copied().zip(values.iter().copied()).collect(),
+            param: None,
+        });
+        Some(k)
+    }
+
+    /// The block parameter for pending phi `k`, created on first use.
+    fn materialize(&mut self, k: u32) -> u32 {
+        if let Some(p) = self.pending[k as usize].param {
+            return p;
+        }
+        let id = self.base + self.created.len() as u32;
+        self.pending[k as usize].param = Some(id);
+        self.created.push(k);
+        id
+    }
+
+    /// The value a memory entry names for a read of type `ty`, materializing a pending phi.
+    fn avail_value(&mut self, a: Avail, ty: &MirType) -> Option<u32> {
+        match a {
+            Avail::Value(v) => Some(v),
+            Avail::Phi(k) if self.pending[k as usize].ty == *ty => Some(self.materialize(k)),
+            Avail::Phi(_) => None,
+        }
+    }
+
+    /// Record, for every join this block (the top of `stack`) feeds, what holds on that edge: the
+    /// block's exit memory table, and the pure expressions computed on its dominator path below the
+    /// join's immediate dominator. A join already entered (this edge is a back edge) gets nothing.
+    fn record_exit(&mut self, stack: &[Scope], added: &[Key]) {
+        let Some(top) = stack.last() else { return };
+        let p = top.block;
+        if self.joins_left[p as usize] == 0 {
+            return;
+        }
+        self.exit_mem[p as usize] = Some(top.mem.clone());
+        let f = self.f;
+        for s in cfg::successors(&f.blocks[p as usize].term) {
+            let j = s.0;
+            if self.preds[j as usize].len() < 2 || self.entered[j as usize] {
+                continue;
+            }
+            // `idom(j)` dominates every predecessor of `j`, so it is on the stack. When it is this
+            // block itself, the edge carries nothing the join's dominator does not already have.
+            let d = self.idom[j as usize];
+            let Some(at) = stack.iter().rposition(|sc| sc.block == d) else {
+                continue;
+            };
+            let Some(below) = stack.get(at + 1) else {
+                continue;
+            };
+            let snapshot: Vec<(Key, u32)> = added[below.added_start..]
+                .iter()
+                .filter(|key| pre_candidate(key))
+                .filter_map(|key| self.vn.get(key).map(|&v| (*key, v)))
+                .take(MAX_JOIN_EXPRESSIONS)
+                .collect();
+            if !snapshot.is_empty() {
+                self.exit_exprs.insert((j, p), snapshot);
+            }
+        }
+    }
+
+    /// The memory table a join is entered with, and the expressions its arms make fully redundant
+    /// (registered in `pre`, logged in `pre_log`). Facts survive only when *every* predecessor has
+    /// already been numbered; otherwise — `j` is a loop header — the table starts empty.
+    fn join(&mut self, j: u32, pre_log: &mut Vec<Key>) -> MemTable {
+        let all_preds = self.preds;
+        let preds = all_preds[j as usize].as_slice();
+        let mut mem = MemTable::default();
+        if preds.iter().all(|&p| self.exit_mem[p as usize].is_some()) {
+            let merged = {
+                let tables: Vec<&MemTable> = preds
+                    .iter()
+                    .filter_map(|&p| self.exit_mem[p as usize].as_ref())
+                    .collect();
+                intersect_tables(&tables)
+            };
+            for (key, m) in merged {
+                match m {
+                    Merged::Same(a) => {
+                        mem.insert(key, a);
+                    }
+                    Merged::Differ(values) => {
+                        if let Some(k) = self.new_pending(j, preds, &values, true) {
+                            mem.insert(key, Avail::Phi(k));
+                        }
+                    }
+                }
+            }
+            let snapshots: Option<Vec<Vec<(Key, u32)>>> = preds
+                .iter()
+                .map(|&p| self.exit_exprs.remove(&(j, p)))
+                .collect();
+            if let Some(snapshots) = snapshots {
+                if let Some((first, rest)) = snapshots.split_first() {
+                    for &(key, v0) in first {
+                        if self.vn.contains_key(&key) || self.pre.contains_key(&key) {
+                            continue;
+                        }
+                        let mut values = Vec::with_capacity(snapshots.len());
+                        values.push(v0);
+                        for snapshot in rest {
+                            match snapshot.iter().find(|(k, _)| *k == key) {
+                                Some(&(_, v)) => values.push(v),
+                                None => break,
+                            }
+                        }
+                        if let Some(k) = self.new_pending(j, preds, &values, false) {
+                            self.pre.insert(key, k);
+                            pre_log.push(key);
+                        }
+                    }
+                }
+            }
+        }
+        // Every predecessor has now delivered (or, on a back edge, will never deliver) its record
+        // for this join.
+        for &p in preds {
+            self.exit_exprs.remove(&(j, p));
+            let left = &mut self.joins_left[p as usize];
+            *left = left.saturating_sub(1);
+            if *left == 0 {
+                self.exit_mem[p as usize] = None;
+            }
+        }
+        mem
+    }
+
+    /// Value-number `blk`'s parameters by their incoming arguments (see the module note).
+    fn number_params(&mut self, blk: u32) {
+        let f = self.f;
+        let params = &f.blocks[blk as usize].params;
+        if params.is_empty() || blk == f.entry.0 || params.len() > MAX_NUMBERED_PARAMS {
+            return;
+        }
+        let all_preds = self.preds;
+        let mut edges: Vec<&[ValueId]> = Vec::new();
+        for &p in &all_preds[blk as usize] {
+            match &f.blocks[p as usize].term {
+                Terminator::Br { target, args } if target.0 == blk => edges.push(args),
+                Terminator::CondBr {
+                    then_blk,
+                    then_args,
+                    else_blk,
+                    else_args,
+                    ..
+                } => {
+                    if then_blk.0 == blk {
+                        edges.push(then_args);
+                    }
+                    if else_blk.0 == blk {
+                        edges.push(else_args);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if edges.is_empty() || edges.iter().any(|args| args.len() != params.len()) {
+            return;
+        }
+        for (k, &p) in params.iter().enumerate() {
+            // Trivial: one value on every edge, the parameter itself aside.
+            let mut only = None;
+            let mut trivial = true;
+            for args in &edges {
+                let a = self.resolve(args[k]);
+                if a == p.0 {
+                    continue;
+                }
+                match only {
+                    None => only = Some(a),
+                    Some(x) if x == a => {}
+                    Some(_) => {
+                        trivial = false;
+                        break;
+                    }
+                }
+            }
+            if let (true, Some(x)) = (trivial, only) {
+                self.set_rewrite(p, x);
+                continue;
+            }
+            // Duplicate: an earlier, kept parameter that receives the same value on every edge.
+            let twin = params[..k].iter().enumerate().find(|&(k2, &q)| {
+                self.resolve(q) == q.0
+                    && edges
+                        .iter()
+                        .all(|args| self.resolve(args[k]) == self.resolve(args[k2]))
+            });
+            if let Some((_, &q)) = twin {
+                self.set_rewrite(p, q.0);
+            }
+        }
+    }
+
+    fn enter(
+        &mut self,
+        blk: u32,
+        mut mem: MemTable,
+        added: &mut Vec<Key>,
+        pre_start: usize,
+    ) -> Scope {
+        self.entered[blk as usize] = true;
+        self.number_params(blk);
         let added_start = added.len();
         let f = self.f;
         for inst in &f.blocks[blk as usize].insts {
@@ -296,10 +742,18 @@ impl Numbering<'_> {
                         continue;
                     }
                     let key = self.mem_key(p, ty);
-                    match mem.get(&key) {
-                        Some(&v) => self.set_rewrite(res, v),
+                    match mem.get(&key).copied() {
+                        Some(a) => match self.avail_value(a, ty) {
+                            Some(v) => {
+                                self.set_rewrite(res, v);
+                                mem.insert(key, Avail::Value(v));
+                            }
+                            None => {
+                                mem.insert(key, Avail::Value(res.0));
+                            }
+                        },
                         None if mem.len() < MAX_TRACKED_LOCATIONS => {
-                            mem.insert(key, res.0);
+                            mem.insert(key, Avail::Value(res.0));
                         }
                         None => {}
                     }
@@ -316,7 +770,7 @@ impl Numbering<'_> {
                     });
                     if forwardable(sty) && mem.len() < MAX_TRACKED_LOCATIONS {
                         let key = self.mem_key(p, sty);
-                        mem.insert(key, v);
+                        mem.insert(key, Avail::Value(v));
                     }
                 }
                 Op::Call { .. } | Op::VecKernelCall { .. } => {
@@ -331,9 +785,16 @@ impl Numbering<'_> {
                     let Some(key) = self.pure_key(&inst.op, f.value_type(res)) else {
                         continue;
                     };
-                    match self.vn.get(&key) {
-                        Some(&canon) => self.set_rewrite(res, canon),
-                        None => {
+                    if let Some(&canon) = self.vn.get(&key) {
+                        self.set_rewrite(res, canon);
+                        continue;
+                    }
+                    match self.pre.get(&key).copied() {
+                        Some(k) if self.pending[k as usize].ty == *f.value_type(res) => {
+                            let phi = self.materialize(k);
+                            self.set_rewrite(res, phi);
+                        }
+                        _ => {
                             self.vn.insert(key, res.0);
                             added.push(key);
                         }
@@ -354,6 +815,7 @@ impl Numbering<'_> {
             last_inheriting,
             mem,
             added_start,
+            pre_start,
         }
     }
 
@@ -737,5 +1199,321 @@ mod tests {
             .expect("the call survives");
         assert_eq!(args, vec![s4a, s4a, s8, g2a, g2a, g3]);
         assert!(wukong_mir::verify::verify_function(&f).is_empty());
+    }
+
+    // ---- global value numbering: joins, block parameters, fully redundant values ----
+
+    fn count_muls(f: &Function) -> usize {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i.op, Op::Bin(BinOp::Mul, ..)))
+            .count()
+    }
+
+    /// Run `main() = callee(true) * 10 + callee(false)` for a callee taking one `i1`.
+    fn run_both_ways(callee: Function, it: &mut Interner) -> i64 {
+        let name = callee.name;
+        let mut b = Builder::new(it.intern("main"), MirType::I64);
+        let mut results = Vec::new();
+        for c in [1, 0] {
+            let arg = b.build(MirType::I1, Op::ConstInt(c, MirType::I1));
+            results.push(b.build(
+                MirType::I64,
+                Op::Call {
+                    func: name,
+                    args: vec![arg],
+                },
+            ));
+        }
+        let ten = b.build(MirType::I64, Op::ConstInt(10, MirType::I64));
+        let hi = b.build(MirType::I64, Op::Bin(BinOp::Mul, results[0], ten));
+        let sum = b.build(MirType::I64, Op::Bin(BinOp::Add, hi, results[1]));
+        b.ret(Some(sum));
+        let mut p = wukong_mir::Program::new();
+        p.funcs = vec![callee, b.finish()];
+        let errors = wukong_mir::verify::verify_program(&p);
+        assert!(errors.is_empty(), "{errors:?}");
+        let main = it.intern("main");
+        wukong_interp::run(&p, main, it).unwrap()
+    }
+
+    fn cse_then_dce(f: &mut Function) {
+        let mut cache = CfgAnalyses::default();
+        Cse.run_function(f, &mut cache);
+        Dce.run_function(f, &mut cache);
+        let errors = wukong_mir::verify::verify_function(f);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// `if c { *slot = 7 } else { *slot = 9 }; return *slot` — each arm leaves a different known
+    /// value in the slot, so the join's load is a phi of the two stored values.
+    #[test]
+    fn a_load_after_a_diamond_of_stores_becomes_a_phi_of_the_stored_values() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("pick"), MirType::I64);
+        let c = b.add_param(MirType::I1);
+        let slot = b.alloca(MirType::I64);
+        let then_b = b.new_block();
+        let else_b = b.new_block();
+        let join = b.new_block();
+        b.cond_br(c, then_b, vec![], else_b, vec![]);
+        for (blk, value) in [(then_b, 7), (else_b, 9)] {
+            b.switch_to(blk);
+            let v = b.build(MirType::I64, Op::ConstInt(value, MirType::I64));
+            b.build_void(Op::Store {
+                ptr: slot,
+                value: v,
+            });
+            b.br(join, vec![]);
+        }
+        b.switch_to(join);
+        let x = b.build(MirType::I64, Op::Load(slot, MirType::I64));
+        b.ret(Some(x));
+        let mut f = b.finish();
+
+        cse_then_dce(&mut f);
+        let shown = wukong_mir::print::print_function(&f, &it);
+        assert_eq!(count_loads(&f), 0, "{shown}");
+        assert_eq!(f.blocks[join.0 as usize].params.len(), 1, "{shown}");
+        assert_eq!(run_both_ways(f, &mut it), 79);
+    }
+
+    /// The `if` without an `else`: the fall-through edge comes straight from the dominator, whose
+    /// own store is still the slot's contents there. With that store the two edges disagree and the
+    /// load becomes a phi; without it one edge knows nothing and the load must stay.
+    #[test]
+    fn a_one_armed_if_merges_with_the_dominators_contents_only_when_it_has_them() {
+        for dominator_stores in [true, false] {
+            let mut it = Interner::new();
+            let mut b = Builder::new(it.intern("half"), MirType::I64);
+            let c = b.add_param(MirType::I1);
+            let slot = b.alloca(MirType::I64);
+            if dominator_stores {
+                let five = b.build(MirType::I64, Op::ConstInt(5, MirType::I64));
+                b.build_void(Op::Store {
+                    ptr: slot,
+                    value: five,
+                });
+            }
+            let then_b = b.new_block();
+            let join = b.new_block();
+            b.cond_br(c, then_b, vec![], join, vec![]);
+            b.switch_to(then_b);
+            let seven = b.build(MirType::I64, Op::ConstInt(7, MirType::I64));
+            b.build_void(Op::Store {
+                ptr: slot,
+                value: seven,
+            });
+            b.br(join, vec![]);
+            b.switch_to(join);
+            let x = b.build(MirType::I64, Op::Load(slot, MirType::I64));
+            b.ret(Some(x));
+            let mut f = b.finish();
+
+            cse_then_dce(&mut f);
+            let shown = wukong_mir::print::print_function(&f, &it);
+            if dominator_stores {
+                assert_eq!(count_loads(&f), 0, "{shown}");
+                assert_eq!(run_both_ways(f, &mut it), 75);
+            } else {
+                assert_eq!(count_loads(&f), 1, "{shown}");
+                // An unwritten stack slot reads as zero on both backends.
+                assert_eq!(run_both_ways(f, &mut it), 70);
+            }
+        }
+    }
+
+    /// A loop header is entered before its latch is numbered, so it must start with an empty table:
+    /// forwarding the preheader's `0` into the header's load would miss the latch's store.
+    #[test]
+    fn a_loop_header_never_forwards_a_value_the_latch_may_overwrite() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("count"), MirType::I64);
+        let c = b.add_param(MirType::I1);
+        let slot = b.alloca(MirType::I64);
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let five = b.build(MirType::I64, Op::ConstInt(5, MirType::I64));
+        let three = b.build(MirType::I64, Op::ConstInt(3, MirType::I64));
+        let n = b.build(MirType::I64, Op::Select(c, five, three));
+        b.build_void(Op::Store {
+            ptr: slot,
+            value: zero,
+        });
+        let header = b.new_block();
+        let body = b.new_block();
+        let exit = b.new_block();
+        let i = b.block_param(header, MirType::I64);
+        b.br(header, vec![zero]);
+        b.switch_to(header);
+        let x = b.build(MirType::I64, Op::Load(slot, MirType::I64));
+        let k = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, n));
+        b.cond_br(k, body, vec![], exit, vec![]);
+        b.switch_to(body);
+        let y = b.build(MirType::I64, Op::Bin(BinOp::Add, x, one));
+        b.build_void(Op::Store {
+            ptr: slot,
+            value: y,
+        });
+        let i2 = b.build(MirType::I64, Op::Bin(BinOp::Add, i, one));
+        b.br(header, vec![i2]);
+        b.switch_to(exit);
+        b.ret(Some(x));
+        let mut f = b.finish();
+
+        cse_then_dce(&mut f);
+        assert_eq!(
+            count_loads(&f),
+            1,
+            "{}",
+            wukong_mir::print::print_function(&f, &it)
+        );
+        assert_eq!(run_both_ways(f, &mut it), 53);
+    }
+
+    /// `t = x*6` on every arm of a diamond makes the join's `x*6` fully redundant: it becomes a phi
+    /// of the arms' products, and only those two multiplies remain. With the product on one arm
+    /// only, the join's multiply is partially redundant and stays.
+    #[test]
+    fn an_expression_computed_on_every_arm_is_fully_redundant_at_the_join() {
+        for both_arms in [true, false] {
+            let mut it = Interner::new();
+            let mut b = Builder::new(it.intern("prod"), MirType::I64);
+            let c = b.add_param(MirType::I1);
+            let x = b.build(
+                MirType::I64,
+                Op::Cast(wukong_mir::CastKind::ZExt, c, MirType::I64),
+            );
+            let six = b.build(MirType::I64, Op::ConstInt(6, MirType::I64));
+            let then_b = b.new_block();
+            let else_b = b.new_block();
+            let join = b.new_block();
+            b.cond_br(c, then_b, vec![], else_b, vec![]);
+            b.switch_to(then_b);
+            b.build(MirType::I64, Op::Bin(BinOp::Mul, x, six));
+            b.br(join, vec![]);
+            b.switch_to(else_b);
+            if both_arms {
+                b.build(MirType::I64, Op::Bin(BinOp::Mul, x, six));
+            }
+            b.br(join, vec![]);
+            b.switch_to(join);
+            let t = b.build(MirType::I64, Op::Bin(BinOp::Mul, x, six));
+            let r = b.build(MirType::I64, Op::Bin(BinOp::Add, t, x));
+            b.ret(Some(r));
+            let mut f = b.finish();
+
+            let mut cache = CfgAnalyses::default();
+            Cse.run_function(&mut f, &mut cache);
+            let errors = wukong_mir::verify::verify_function(&f);
+            assert!(errors.is_empty(), "{errors:?}");
+            let shown = wukong_mir::print::print_function(&f, &it);
+            let join_muls = f.blocks[join.0 as usize]
+                .insts
+                .iter()
+                .filter(|i| matches!(i.op, Op::Bin(BinOp::Mul, ..)))
+                .count();
+            if both_arms {
+                assert_eq!(f.blocks[join.0 as usize].params.len(), 1, "{shown}");
+                Dce.run_function(&mut f, &mut cache);
+                assert_eq!(count_muls(&f), 2, "{shown}");
+            } else {
+                assert_eq!(f.blocks[join.0 as usize].params.len(), 0, "{shown}");
+                assert_eq!(join_muls, 1, "{shown}");
+            }
+            // prod(true) = 1*6 + 1 = 7, prod(false) = 0*6 + 0 = 0.
+            assert_eq!(run_both_ways(f, &mut it), 70);
+        }
+    }
+
+    /// Two loop-carried parameters that receive the identical value on every edge are one value,
+    /// and a parameter that only ever receives one value (or itself) is that value.
+    #[test]
+    fn congruent_and_trivial_block_parameters_are_numbered_away() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("params"), MirType::I64);
+        let c = b.add_param(MirType::I1);
+        let x = b.build(
+            MirType::I64,
+            Op::Cast(wukong_mir::CastKind::ZExt, c, MirType::I64),
+        );
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let five = b.build(MirType::I64, Op::ConstInt(5, MirType::I64));
+        let three = b.build(MirType::I64, Op::ConstInt(3, MirType::I64));
+        let n = b.build(MirType::I64, Op::Select(c, five, three));
+        let header = b.new_block();
+        let body = b.new_block();
+        let exit = b.new_block();
+        let i = b.block_param(header, MirType::I64);
+        let j = b.block_param(header, MirType::I64);
+        let p = b.block_param(header, MirType::I64);
+        b.br(header, vec![zero, zero, x]);
+        b.switch_to(header);
+        let k = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, n));
+        b.cond_br(k, body, vec![], exit, vec![]);
+        b.switch_to(body);
+        let i2 = b.build(MirType::I64, Op::Bin(BinOp::Add, i, one));
+        b.br(header, vec![i2, i2, p]);
+        b.switch_to(exit);
+        let s = b.build(MirType::I64, Op::Bin(BinOp::Add, i, j));
+        let r = b.build(MirType::I64, Op::Bin(BinOp::Add, s, p));
+        b.ret(Some(r));
+        let mut f = b.finish();
+
+        let mut cache = CfgAnalyses::default();
+        assert!(Cse.run_function(&mut f, &mut cache));
+        let errors = wukong_mir::verify::verify_function(&f);
+        assert!(errors.is_empty(), "{errors:?}");
+        let shown = wukong_mir::print::print_function(&f, &it);
+        let exit_ops: Vec<&Op> = f.blocks[exit.0 as usize]
+            .insts
+            .iter()
+            .map(|inst| &inst.op)
+            .collect();
+        assert!(
+            matches!(exit_ops[0], Op::Bin(BinOp::Add, a, b) if *a == i && *b == i),
+            "{shown}"
+        );
+        assert!(
+            matches!(exit_ops[1], Op::Bin(BinOp::Add, _, b) if *b == x),
+            "{shown}"
+        );
+        // params(true) = 5 + 5 + 1 = 11, params(false) = 3 + 3 + 0 = 6.
+        assert_eq!(run_both_ways(f, &mut it), 116);
+    }
+
+    /// The same diamond written in source: the array element both arms write is read back after
+    /// the join. Global value numbering turns the read into a phi, and the observable result is
+    /// unchanged at every level.
+    #[test]
+    fn a_source_level_diamond_of_element_stores_forwards_to_the_read_after_it() {
+        let src = "fn pick(c: bool) -> i32 { let mut a: [i32; 2] = [0; 2]; \
+                   if c { a[0] = 7; } else { a[0] = 9; } return a[0]; } \
+                   fn main() -> i32 { return pick(true) * 10 + pick(false); }";
+        let mut it = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, wukong_span::SourceId(0), &mut it);
+        assert!(pd.iter().all(|d| !d.is_error()), "{pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &it);
+        assert!(sd.iter().all(|d| !d.is_error()), "{sd:?}");
+        let (program, ld) = wukong_mir_build::lower_program(&module, &sema, &mut it);
+        assert!(ld.iter().all(|d| !d.is_error()), "{ld:?}");
+        let main = it.intern("main");
+        let pick = it.intern("pick");
+        assert_eq!(wukong_interp::run(&program, main, &it).unwrap(), 79);
+        let mut optimized = program.clone();
+        crate::PassManager::standard(2).run(&mut optimized);
+        assert!(wukong_mir::verify::verify_program(&optimized).is_empty());
+        let f = optimized
+            .function(pick)
+            .expect("pick is not inlined by the bare pipeline");
+        assert_eq!(
+            count_loads(f),
+            0,
+            "{}",
+            wukong_mir::print::print_function(f, &it)
+        );
+        assert_eq!(wukong_interp::run(&optimized, main, &it).unwrap(), 79);
     }
 }

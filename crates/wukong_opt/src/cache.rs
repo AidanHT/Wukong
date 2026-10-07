@@ -49,6 +49,8 @@ pub struct CfgAnalyses {
     idom: Option<Vec<u32>>,
     df: Option<Vec<Vec<u32>>>,
     children: Option<Vec<Vec<u32>>>,
+    /// Dominator-tree children in reverse postorder rather than block order (value numbering).
+    children_rpo: Option<Vec<Vec<u32>>>,
     /// Provenance facts, retained only in a managed cache (see the module note).
     alias: Option<Rc<AliasInfo>>,
     managed: bool,
@@ -73,6 +75,7 @@ impl CfgAnalyses {
         self.idom = None;
         self.df = None;
         self.children = None;
+        self.children_rpo = None;
         self.alias = None;
     }
 
@@ -136,6 +139,24 @@ impl CfgAnalyses {
         }
     }
 
+    /// Dominator children ordered by reverse postorder: a block's children are pushed while the
+    /// blocks are walked in RPO, so each list comes out sorted with no extra pass.
+    fn ensure_children_rpo(&mut self, f: &Function) {
+        if self.children_rpo.is_none() {
+            self.ensure_idom(f);
+            let rpo = self.rpo.as_ref().unwrap();
+            let idom = self.idom.as_ref().unwrap();
+            let mut children = vec![Vec::new(); f.blocks.len()];
+            for &b in rpo {
+                let d = idom[b as usize];
+                if d != b && (d as usize) < children.len() {
+                    children[d as usize].push(b);
+                }
+            }
+            self.children_rpo = Some(children);
+        }
+    }
+
     /// Whether every block is reachable from the entry — i.e. `prune_unreachable` would be a no-op.
     /// The reverse postorder visits exactly the reachable blocks, so this is a free comparison once
     /// `rpo` is cached (and `idoms`, which every dominance user needs, computes `rpo` anyway). Lets
@@ -151,13 +172,16 @@ impl CfgAnalyses {
         self.preds.as_ref().unwrap()
     }
 
-    /// Dominator children and predecessors together, for forwarding facts across a unique edge.
-    pub(crate) fn children_and_preds(&mut self, f: &Function) -> (&[Vec<u32>], &[Vec<u32>]) {
-        self.ensure_children(f);
+    /// What value numbering walks: dominator children in reverse postorder, predecessors, and
+    /// immediate dominators. Visiting children in RPO is what guarantees that every forward-edge
+    /// predecessor of a join has been numbered before the join itself (see `cse`).
+    pub(crate) fn gvn_inputs(&mut self, f: &Function) -> (&[Vec<u32>], &[Vec<u32>], &[u32]) {
+        self.ensure_children_rpo(f);
         self.ensure_preds(f);
         (
-            self.children.as_ref().unwrap(),
+            self.children_rpo.as_ref().unwrap(),
             self.preds.as_ref().unwrap(),
+            self.idom.as_ref().unwrap(),
         )
     }
 
