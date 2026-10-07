@@ -27,6 +27,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 mod alias;
+mod builtins;
 mod canon;
 mod tile;
 mod tindex;
@@ -1016,6 +1017,7 @@ pub fn lower_program_with(
         println_str: interner.intern("println_str"),
         print_u: interner.intern("print_u"),
         println_u: interner.intern("println_u"),
+        assert_fn: interner.intern("assert"),
         nt: interner.intern("wukong_sgemm_nt"),
         nt_par: interner.intern("wukong_sgemm_nt_parallel"),
         tn: interner.intern("wukong_sgemm_tn"),
@@ -1042,6 +1044,7 @@ pub fn lower_program_with(
         bias_bcast: interner.intern("wukong_bias_bcast_f32"),
         bias_bcast_par: interner.intern("wukong_bias_bcast_f32_parallel"),
         sred_par: interner.intern("wukong_sreduce_f32_parallel"),
+        sred: interner.intern("wukong_sreduce_f32"),
         argreduce: interner.intern("wukong_argreduce_f32"),
         argreduce_par: interner.intern("wukong_argreduce_f32_parallel"),
         norm: interner.intern("wukong_norm_f32"),
@@ -2924,6 +2927,8 @@ struct GemmSyms {
     /// two's-complement reinterpretation the default signed `print` would show.
     print_u: Symbol,
     println_u: Symbol,
+    /// The `assert` intrinsic, through which a kernel builtin's runtime extent check traps.
+    assert_fn: Symbol,
     nt: Symbol,
     nt_par: Symbol,
     /// The transposed-A weight-gradient kernel (`wukong_sgemm_tn[_parallel]`): `C = Aᵀ·B`, where A is
@@ -3020,6 +3025,8 @@ struct GemmSyms {
     /// -> f32`): a reduction loop in a `@parallel` function lowers to this. It is bit-equal to the
     /// serial `wukong_sreduce_f32` the interpreter calls, so native and interp stay bit-exact.
     sred_par: Symbol,
+    /// Serial `wukong_sreduce_f32` — the `sum`/`amax`/`amin`/`dot` builtins outside `@parallel`.
+    sred: Symbol,
     /// The deterministic argmax/argmin reduction (`wukong_argreduce_f32(x, n, op) -> i64`, lowest
     /// index on ties). Serial form (bit-identical to the parallel one), which the interpreter also
     /// calls — so a recognized argmax loop stays exact across backends.
@@ -13671,11 +13678,14 @@ impl FnLowerer<'_> {
                 self.scan_region_expr(rhs, sc);
             }
             // Only pure scalar math intrinsics: a user call could write captured buffers, and
-            // `print`/`assert` have cross-iteration-ordered side effects.
+            // `print`/`assert` have cross-iteration-ordered side effects. A named kernel builtin
+            // shares its name with a scalar intrinsic (`gelu(x, out)` vs `gelu(x)`) but writes a
+            // whole buffer, so it is never pure here.
             ExprKind::Call { callee, args, .. } => {
-                let pure_math = single_path(callee)
-                    .map(|s| math_intrinsic(self.interner.resolve(s)).is_some())
-                    .unwrap_or(false);
+                let pure_math = !self.sema.builtin_calls.contains_key(&e.id)
+                    && single_path(callee)
+                        .map(|s| math_intrinsic(self.interner.resolve(s)).is_some())
+                        .unwrap_or(false);
                 if !pure_math {
                     sc.ok = false;
                     return;
@@ -20478,6 +20488,11 @@ impl FnLowerer<'_> {
                         },
                     );
                 }
+                // A named kernel builtin (`matmul`, `softmax`, `gelu(x, out)`, `sdpa`, …) that sema
+                // shape-checked lowers straight to its runtime kernel (see `builtins.rs`).
+                if let Some(v) = self.lower_kernel_builtin(e, args) {
+                    return v;
+                }
                 // The heap builtins `alloc_<T>(n)` / `free(s)` lower to the wukong_rt_alloc/free
                 // runtime calls plus slice fat-pointer construction.
                 if let Some(v) = self.lower_heap_builtin(name, args) {
@@ -20756,14 +20771,14 @@ impl FnLowerer<'_> {
     /// `lower_call` falls through. Both backends call the identical kernel, so the fused online
     /// softmax stays bit-for-bit exact — the same contract as the GEMM dispatch.
     ///
-    /// `sdpa` has no signature in wukong_sema, so **nothing upstream checks its operands** and this is
-    /// the only place the kernel's contract — four `f32` buffers, each valid for `s*d` elements — can
-    /// be enforced. Without the check the call reaches the kernel with whatever the caller wrote: an
-    /// f32 immediate in a pointer slot (native SIGSEGV, interp `expected a pointer`), an f64/i32 array
-    /// reinterpreted as f32 (a silent wrong answer that also *diverges* between the backends), or a
-    /// buffer shorter than `s*d` (native writes past its end). Any of those declines, which routes the
-    /// call to `lower_call`'s catalogued C0001 at the call site — the same way `lower_heap_builtin`
-    /// declines a malformed `free` rather than miscompiling it.
+    /// `sdpa` now has a real signature in `wukong_sema::builtins` (four `f32` buffers, integer
+    /// `s`/`d`, and — for constant `s`/`d` — every statically sized operand holding `s*d` elements,
+    /// as `E0501`/`E0502` at the operand), and a call that passed it is lowered by
+    /// `builtins::lower_sdpa_builtin`, which adds the runtime extent checks and the output-overlap
+    /// guard this path lacks. This path is reached only by a call sema did not record. Its checks
+    /// stay as a belt-and-braces backstop: an f32 immediate in a pointer slot (native SIGSEGV,
+    /// interp `expected a pointer`), an f64/i32 array reinterpreted as f32, or a buffer shorter than
+    /// `s*d` would each be a silent miscompile, so any of them declines to `lower_call`'s C0001.
     fn lower_attention(&mut self, name: Symbol, args: &[Expr]) -> Option<ValueId> {
         if self.interner.resolve(name) != "sdpa" || args.len() != 8 {
             return None;

@@ -272,6 +272,19 @@ static CATALOG: &[Explanation] = &[
          symbolically and bound at each call; where it is a fixed size, declare a `const`."
     ),
     entry!(
+        "E0409",
+        "kernel builtin dimension cannot be inferred",
+        "A named kernel builtin (`matmul`, `linear`, `transpose`, `softmax`, `layernorm`, `gelu`, \
+         `sum`, …) is shape-checked like a generic function: each of its dimensions must be fixed \
+         by an explicit turbofish (`matmul::<M, K, N>(a, b, out)`), by the shape of a \
+         `Tensor[f32, ..]` operand, by the length of a fixed `[f32; N]` array operand (which fixes \
+         the one dimension of its shape that is still free), or by the runtime length of a `[]f32` \
+         slice operand. A row-wise operation's row count defaults to 1. This error means none of \
+         those fixed the named dimension — for example `matmul(a, b, out)` over three flat arrays, \
+         where a 6-element `a` could be 2x3 or 3x2. Supply the dimensions explicitly with a \
+         turbofish, or pass tensors whose types carry the shape."
+    ),
+    entry!(
         "E0501",
         "rank, extent or arity mismatch",
         "Two tensors were required to have the same number of dimensions (rank) but did not. For \

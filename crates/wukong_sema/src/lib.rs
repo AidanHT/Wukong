@@ -24,9 +24,15 @@
 //! and `const` is registered.
 
 mod attrs;
+mod builtins;
 mod dependency;
 mod layout;
 mod shape;
+
+pub use builtins::{
+    builtin_dims, builtin_operand_dims, builtin_output, kernel_builtin, Activation, BuiltinCall,
+    BuiltinDim, KernelBuiltin,
+};
 
 use std::cell::RefCell;
 
@@ -177,6 +183,11 @@ pub struct SemaResult {
     /// literals retyped) like a `let`, so `mir_build` can lower a const reference by inlining the
     /// initializer with correct types. The `DefMap` records only a const's *type*, not its value.
     pub consts: HashMap<Symbol, Expr>,
+    /// Every call to a named kernel builtin (`matmul`, `softmax`, `sdpa`, …) that shape-checked
+    /// cleanly, keyed by the call expression: which builtin, and how each of its dimensions was
+    /// resolved. `mir_build` lowers the call from this record, so the two crates cannot disagree on
+    /// an extent. See `builtins.rs`.
+    pub builtin_calls: HashMap<NodeId, BuiltinCall>,
 }
 
 /// Collect the struct names a type contains *by value* — directly (`Ty::Named`) or nested inside an
@@ -342,6 +353,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
         layout_cache: layout::Cache::default(),
         checking_bodies: false,
         parallel_fn: false,
+        builtin_calls: HashMap::default(),
     };
     // Attribute legality (`attrs`): an attribute names no value and has no type, so this walk needs
     // nothing the collection pass builds and runs first — an unknown `@bogus` is reported even in a
@@ -372,6 +384,7 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
             .into_iter()
             .map(|(name, init)| (name, init.clone()))
             .collect(),
+        builtin_calls: s.builtin_calls,
     };
     (result, s.diags)
 }
@@ -422,6 +435,8 @@ struct Sema<'a> {
     layout_cache: layout::Cache,
     /// True while checking a `@parallel` function body (`sync_block()` is legal only here).
     parallel_fn: bool,
+    /// The resolved named-kernel-builtin calls, published as [`SemaResult::builtin_calls`].
+    builtin_calls: HashMap<NodeId, BuiltinCall>,
 }
 
 /// One entry of [`Sema::loop_ctx`] — a loop currently being type-checked.
@@ -3723,6 +3738,8 @@ impl<'a> Sema<'a> {
                 // `type_call` (which would type the `Enum::Variant` callee as a bare value and
                 // reject it as an incomplete constructor).
                 if let Some(t) = self.type_variant_construction(callee, args, e.span) {
+                    t
+                } else if let Some(t) = self.type_kernel_builtin(e, callee, generic_args, args) {
                     t
                 } else {
                     self.type_call(callee, generic_args, args, e.span)
