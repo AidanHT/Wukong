@@ -21361,10 +21361,146 @@ impl FnLowerer<'_> {
             .build(rty.clone(), Op::Bin(BinOp::FDiv, one, denom))
     }
 
-    /// `tanh(x) = 1 - 2 / (exp(2x) + 1)`, built on the exp polynomial (same identity the GELU tanh
-    /// approximation uses). Works on a scalar or a SIMD vector; bit-identical across backends. For
-    /// `f64` it is one call of the runtime's double-precision `tanh`.
+    /// `tanh(x)`, the language's one `tanh`: for `f32` the ≤1-ULP piecewise kernel — the degree-5
+    /// odd polynomial `x + (x·t)·P(t)` below `TANH_XC`, the rotated 8-bucket `exp` reduction
+    /// `1 − 2/(E+1)` above, blended on `|x| > TANH_XC`, sign restored by `copysign` — mirroring
+    /// the runtime's `tanh1`/`tanh8` (`VM_TANH`) **op-for-op**: every `Fma` is its `mul_add`/
+    /// `fmadd`, the clamp is its NaN-to-second-operand `min`, the bucket lookup is the same
+    /// 3-level select tree `emit_exp_f32` uses for `vpermps`. So a dispatched `for i { o[i] =
+    /// tanh(x[i]) }` loop, a composed/scalar `tanh`, `@generic` and `WUKONG_NO_RECOGNIZE` all
+    /// compute the same bits on every lane, −0 and |x| < 2⁻²⁵ included (the old exp-composed
+    /// inline form returned `+0.0` there and drifted up to 80 ULP from the kernel). Works on a
+    /// scalar or a SIMD vector; for `f64` it is one call of the runtime's double-precision `tanh`.
     fn emit_tanh(&mut self, x: ValueId, rty: &MirType) -> ValueId {
+        if matches!(rty.lane_type(), MirType::F64) {
+            return self.emit_math_f64(x, VMATH_TANH, rty);
+        }
+        let fty = rty;
+        let ity = float_ty_like(fty, MirType::I32);
+        let mty = mask_ty(fty);
+        let ax = self.emit_abs(x, fty);
+        // |x| ≤ TANH_XC: x + (x·t)·P(t), Horner in t = x² (P[5] innermost, P[0] last).
+        let t = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FMul, ax, ax));
+        let mut p = self.splat_const_f(TANH_P[5], fty);
+        for &c in TANH_P[..5].iter().rev() {
+            let cc = self.splat_const_f(c, fty);
+            p = self.builder.build(fty.clone(), Op::Fma(t, p, cc));
+        }
+        let w = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, ax, t));
+        let y_poly = self.builder.build(fty.clone(), Op::Fma(w, p, ax));
+        // |x| > TANH_XC: 1 − 2/(E+1), E = 2^k·M from the rotated 8-bucket exp reduction of
+        // 2·min(|x|, 10). The clamp keeps 2^k normal for ±∞ and the saturated band; a NaN fails
+        // the ordered compare and takes the clamp, exactly like the kernel's `min_ps`.
+        let clamp = self.splat_const_f(TANH_EXP_CLAMP, fty);
+        let below = self
+            .builder
+            .build(mty.clone(), Op::Cmp(CmpOp::Folt, ax, clamp));
+        let axc = self
+            .builder
+            .build(fty.clone(), Op::Select(below, ax, clamp));
+        let x2 = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FAdd, axc, axc));
+        let scale = self.splat_const_f(EXP_TBL_SCALE, fty);
+        let magic = self.splat_const_f(EXP_MAGIC, fty);
+        let tt = self.builder.build(fty.clone(), Op::Fma(x2, scale, magic));
+        let n = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FSub, tt, magic));
+        // m = bits(tt) − TANH_EXP_MBIAS = n + 1020: bits 2..0 index the rotated table, m >> 3 is
+        // the biased exponent of 2^k.
+        let bits = self
+            .builder
+            .build(ity.clone(), Op::Cast(CastKind::Bitcast, tt, ity.clone()));
+        let mb = self.splat_const_i(TANH_EXP_MBIAS, &ity);
+        let m = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Sub, bits, mb));
+        let neg_c1 = self.splat_const_f(-EXP_TBL_C1, fty);
+        let neg_c2 = self.splat_const_f(-EXP_TBL_C2, fty);
+        let r = self.builder.build(fty.clone(), Op::Fma(n, neg_c1, x2));
+        let r = self.builder.build(fty.clone(), Op::Fma(n, neg_c2, r));
+        let zero_i = self.splat_const_i(0, &ity);
+        let bit_mask = |this: &mut Self, bit: i128| {
+            let c = this.splat_const_i(bit, &ity);
+            let and = this.builder.build(ity.clone(), Op::Bin(BinOp::And, m, c));
+            this.builder
+                .build(mty.clone(), Op::Cmp(CmpOp::Ne, and, zero_i))
+        };
+        let b0 = bit_mask(self, 1);
+        let b1 = bit_mask(self, 2);
+        let b2 = bit_mask(self, 4);
+        let consts: Vec<ValueId> = TANH_EXP_T
+            .iter()
+            .map(|&v| self.splat_const_f(v, fty))
+            .collect();
+        let s01 = self
+            .builder
+            .build(fty.clone(), Op::Select(b0, consts[1], consts[0]));
+        let s23 = self
+            .builder
+            .build(fty.clone(), Op::Select(b0, consts[3], consts[2]));
+        let s45 = self
+            .builder
+            .build(fty.clone(), Op::Select(b0, consts[5], consts[4]));
+        let s67 = self
+            .builder
+            .build(fty.clone(), Op::Select(b0, consts[7], consts[6]));
+        let s0123 = self.builder.build(fty.clone(), Op::Select(b1, s23, s01));
+        let s4567 = self.builder.build(fty.clone(), Op::Select(b1, s67, s45));
+        let tj = self
+            .builder
+            .build(fty.clone(), Op::Select(b2, s4567, s0123));
+        // e^r − 1 = r·(1 + r/2 + r²/6 + r³/24), then M = T + T·(e^r − 1) in one rounding.
+        let q4 = self.splat_const_f(TANH_EXP_Q4, fty);
+        let q3 = self.splat_const_f(TANH_EXP_Q3, fty);
+        let half = self.splat_const_f(0.5, fty);
+        let one = self.splat_const_f(1.0, fty);
+        let q = self.builder.build(fty.clone(), Op::Fma(r, q4, q3));
+        let q = self.builder.build(fty.clone(), Op::Fma(r, q, half));
+        let q = self.builder.build(fty.clone(), Op::Fma(r, q, one));
+        let pm1 = self.builder.build(fty.clone(), Op::Bin(BinOp::FMul, r, q));
+        let mm = self.builder.build(fty.clone(), Op::Fma(tj, pm1, tj));
+        // 2^k from the biased exponent m >> 3, shift-free: (m & ~7)·2^20 == (m >> 3) << 23
+        // (m ≥ 1020 > 0 always, so the two spellings agree) — `emit_exp_f32`'s vector-legal form.
+        let low3 = self.splat_const_i(-8, &ity);
+        let mhi = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::And, m, low3));
+        let pow = self.splat_const_i(1_048_576, &ity);
+        let shifted = self
+            .builder
+            .build(ity.clone(), Op::Bin(BinOp::Mul, mhi, pow));
+        let pow2 = self.builder.build(
+            fty.clone(),
+            Op::Cast(CastKind::Bitcast, shifted, fty.clone()),
+        );
+        // E + 1 is exact (M ∈ [0.648, 1.354), k ≤ 24); the reciprocal rounds once, the fma once.
+        let d = self.builder.build(fty.clone(), Op::Fma(mm, pow2, one));
+        let rr = self
+            .builder
+            .build(fty.clone(), Op::Bin(BinOp::FDiv, one, d));
+        let neg2 = self.splat_const_f(-2.0, fty);
+        let y_exp = self.builder.build(fty.clone(), Op::Fma(neg2, rr, one));
+        let xc = self.splat_const_f(TANH_XC, fty);
+        let big = self.builder.build(mty, Op::Cmp(CmpOp::Fogt, ax, xc));
+        let y = self
+            .builder
+            .build(fty.clone(), Op::Select(big, y_exp, y_poly));
+        // copysign(y, x): the magnitude is non-negative on both branches, so this is the kernel's
+        // and-not/or ending bit-for-bit — and it SETS the sign on a NaN rather than xor-flipping it.
+        self.emit_copysign(y, x, fty)
+    }
+
+    /// The exp-*composed* `tanh(x) = 1 − 2/(exp(2x) + 1)` — **not** the language's `tanh` (that is
+    /// [`Self::emit_tanh`]) but the private building block of the composed activations `gelu`,
+    /// `mish`, `tanhshrink`, `tanh_backward` and `gelu_backward`, whose dispatched runtime kernels
+    /// (`gelu8`/`mish8`/…) are built on the same `tanh_exp1`/`tanh_exp8` so each composed
+    /// activation stays bit-identical to its kernel. Scalar or SIMD; for `f64` there is no kernel
+    /// twin to match, so it is the runtime's accurate double-precision `tanh`.
+    fn emit_tanh_exp(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         if matches!(rty.lane_type(), MirType::F64) {
             return self.emit_math_f64(x, VMATH_TANH, rty);
         }
@@ -21402,7 +21538,7 @@ impl FnLowerer<'_> {
         let t = self.builder.build(rty.clone(), Op::Fma(c1, x3, x)); // 0.044715·x³ + x
         let c0 = self.splat_const_f(0.7978845608, rty);
         let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, c0, t));
-        let th = self.emit_tanh(inner, rty);
+        let th = self.emit_tanh_exp(inner, rty);
         let one = self.splat_const_f(1.0, rty);
         let onep = self
             .builder
@@ -21444,7 +21580,7 @@ impl FnLowerer<'_> {
         let x3 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x2, x));
         let t = self.builder.build(rty.clone(), Op::Fma(c1, x3, x)); // c1·x³ + x
         let inner = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, c0, t));
-        let u = self.emit_tanh(inner, rty);
+        let u = self.emit_tanh_exp(inner, rty);
         let onep = self
             .builder
             .build(rty.clone(), Op::Bin(BinOp::FAdd, one, u));
@@ -21497,7 +21633,7 @@ impl FnLowerer<'_> {
     /// `tanh_backward(x, dy) = dy · (1 − tanh²(x))`. Mirrors `tanh_bwd8`/`tanh_bwd_2`, so the inlined
     /// fallback equals the 256-bit dispatch. The tanh-gate (RNN/LSTM cell) training gradient.
     fn emit_tanh_backward(&mut self, x: ValueId, dy: ValueId, rty: &MirType) -> ValueId {
-        let t = self.emit_tanh(x, rty);
+        let t = self.emit_tanh_exp(x, rty);
         let one = self.splat_const_f(1.0, rty);
         let t2 = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, t, t));
         let sech2 = self
@@ -21580,7 +21716,7 @@ impl FnLowerer<'_> {
     /// `mish(x) = x · tanh(softplus(x))`, the self-gated smooth activation. Mirrors `mish8` op-for-op.
     fn emit_mish(&mut self, x: ValueId, rty: &MirType) -> ValueId {
         let sp = self.emit_softplus(x, rty);
-        let th = self.emit_tanh(sp, rty);
+        let th = self.emit_tanh_exp(sp, rty);
         let result = self.builder.build(rty.clone(), Op::Bin(BinOp::FMul, x, th));
         self.emit_quiet_nan(x, result, rty)
     }
@@ -21635,7 +21771,7 @@ impl FnLowerer<'_> {
 
     /// `tanhshrink(x) = x − tanh(x)`. Mirrors `tanhshrink8`.
     fn emit_tanhshrink(&mut self, x: ValueId, rty: &MirType) -> ValueId {
-        let th = self.emit_tanh(x, rty);
+        let th = self.emit_tanh_exp(x, rty);
         self.builder.build(rty.clone(), Op::Bin(BinOp::FSub, x, th))
     }
 
@@ -30576,6 +30712,43 @@ const EXP_TBL_T: [f64; 8] = [
 /// — the Chebyshev shift of the r² coefficient that absorbs the even r⁴/24 truncation term.
 const EXP_TBL_P2: f64 = 0.5000647902488708;
 const EXP_TBL_P3: f64 = 1.0 / 6.0; // rounds f64→f32 to the same bits as the runtime's f32 1/6
+
+// `tanh` constants: the ≤1-ULP two-region kernel (mirrors `wukong_runtime`'s `vmath::tanh1`/`tanh8`
+// op-for-op — see the `TANH_*` block there for the design and the error budget). Every literal is
+// the exact decimal expansion of the runtime's f32 constant (an f32 value is exactly representable
+// in f64, so `splat_const_f`'s f64→f32 rounding is the identity on it); the mirror is pinned
+// lane-for-lane against the kernel by `wukong_codegen_cranelift`'s
+// `dispatched_tanh_equals_composed_tanh` (tests/tanh_unify.rs), including −0 and |x| < 2⁻²⁵.
+/// Crossover: the odd polynomial below, the exp form above.
+const TANH_XC: f64 = 0.75;
+/// `min(|x|, 10)` keeps `2^k` normal for ±∞ and the saturated band.
+const TANH_EXP_CLAMP: f64 = 10.0;
+/// Degree-5 minimax `P(t)` with `tanh(x) = x + x³·P(x²)` on `[0, 0.75²]`, `P[0]` first.
+const TANH_P: [f64; 6] = [
+    -0.33333316445350647,
+    0.1333269476890564,
+    -0.053892724215984344,
+    0.021452033892273903,
+    -0.007657255511730909,
+    0.0017369358101859689,
+];
+/// `bits(EXP_MAGIC) − (127·8 + 4)`: `m = bits(t) − TANH_EXP_MBIAS = n + 1020`, so `m >> 3` is
+/// the biased exponent of `2^k` with `k = (n + 4) >> 3` and `m & 7` indexes the rotated table.
+const TANH_EXP_MBIAS: i128 = 0x4B40_0000 - 1020;
+/// `TANH_EXP_T[i] = 2^{(i−4)/8}`: `EXP_TBL_T` rotated by 4 with the top half halved (exact).
+const TANH_EXP_T: [f64; 8] = [
+    EXP_TBL_T[4] * 0.5,
+    EXP_TBL_T[5] * 0.5,
+    EXP_TBL_T[6] * 0.5,
+    EXP_TBL_T[7] * 0.5,
+    EXP_TBL_T[0],
+    EXP_TBL_T[1],
+    EXP_TBL_T[2],
+    EXP_TBL_T[3],
+];
+/// `1/6` and `1/24` as the runtime's f32 constants (exact decimals of `0x3e2aaaab`/`0x3d2aaaab`).
+const TANH_EXP_Q3: f64 = 0.1666666716337204;
+const TANH_EXP_Q4: f64 = 0.0416666679084301;
 
 /// Natural-log constants: the 8-bucket table reduction (mirrors `wukong_runtime`'s
 /// `vmath::log1`/`log8` value-for-value — see the algorithm write-up there). `x = z·2^k` with

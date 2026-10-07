@@ -5,7 +5,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
-### Double-precision transcendentals (`gap/f64-math`, P15.2)
+### Double-precision transcendentals and one `tanh` (`gap/f64-math`, P15.2 + P13.2)
 
 - **Every `f64` transcendental is now double precision.** `exp`, `log`, `exp2`/`log2`/`exp10`/
   `log10`, `expm1`/`log1p`, `sin`/`cos`/`tan`, `asin`/`acos`/`atan`/`atan2`, `sinh`/`cosh`/`tanh`,
@@ -22,6 +22,13 @@ All notable changes to Wukong are documented here. The format is loosely based o
   …). Gates: `math64`'s mpmath reference tables with per-function ULP bounds and the special-value
   table, `wukong_codegen_cranelift`'s `math_f64.rs` (interp == native == library on both opt levels,
   LLVM/object imports, AD), `tests/run/transcendental_f64.wk` (twelve digits of each).
+- **`tanh` is one function.** The inlined scalar/SIMD `tanh` now mirrors the runtime's ≤1-ULP
+  piecewise kernel op-for-op, so a dispatched loop, a composed expression, `@generic` and
+  `WUKONG_NO_RECOGNIZE` agree bit-for-bit — `−0` stays `−0` and `tanh(x) == x` for |x| < 2⁻¹³,
+  where the old exp-composed form returned `+0.0` below 2⁻²⁵ and drifted up to 80 ULP from the
+  kernel. The composed activations keep the exp-composed block as their private building block,
+  matching their kernels unchanged. Gates: `tanh_unify.rs` (`dispatched_tanh_equals_composed_tanh`,
+  every lane over ~1100 arguments on both backends), `tests/run/tanh_spellings.wk`.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 

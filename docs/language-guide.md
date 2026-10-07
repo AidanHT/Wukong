@@ -729,10 +729,15 @@ requires fresh matched-peer measurements. `erf`, `sin` and `cos` are among those
 `sin`/`cos` loop and an exact erf-GELU loop compile to). What does *not* dispatch is a **composed or
 scalar** use — an intrinsic inside a larger expression, or a single call outside an elementwise `for` —
 which instead auto-vectorizes the inlined polynomial at 128-bit; `sqrt`/`rsqrt` also stay inline, being
-hardware instructions. A recognized standalone `tanh` loop uses the runtime's piecewise approximation.
-Scalar or composed `tanh` uses `1 - 2/(exp(2*x) + 1)`; these paths can differ in finite results and
-the sign of zero. Backend agreement for a fixed lowering path does not imply bitwise equality between
-dispatched and inlined spellings. Composed activations such as GELU retain the exp-based tanh formula.
+hardware instructions. `tanh` is **one function however it is spelled**: a dispatched `tanh` loop,
+a scalar `tanh(x)`, a composed `tanh(x) * s` and a `@generic` loop all compute the runtime's ≤1-ULP
+piecewise kernel bit-for-bit — the inlined form mirrors it op-for-op (the same FMA chain, the same
+NaN-to-clamp `min`, the same table lookup), including `−0 → −0` and `tanh(x) == x` for every
+|x| < 2⁻¹³ (`tests/run/tanh_spellings.wk`; `dispatched_tanh_equals_composed_tanh` pins every lane).
+The composed activations `gelu`, `mish`, `tanhshrink`, `tanh_backward` and `gelu_backward` keep the
+exp-composed `1 − 2/(exp(2x) + 1)` as their *internal* building block, because their dispatched
+kernels are built on it and each activation stays bit-identical to its kernel; that block is not
+the language's `tanh`. On `f64` every spelling is the double-precision runtime `tanh`.
 
 ## Memory and parallelism
 
