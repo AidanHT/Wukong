@@ -5,17 +5,17 @@ module lib.mathlib
 
 import lib.deep;
 
-struct Point {
-    x: i32,
-    y: i32,
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
 }
 
-const ANSWER: i32 = 42;
+pub const ANSWER: i32 = 42;
 
-fn dot_self(p: Point) -> i32 {
+pub fn dot_self(p: Point) -> i32 {
     return p.x * p.x + p.y * p.y;
 }
 
-fn triple(a: i32) -> i32 {
+pub fn triple(a: i32) -> i32 {
     return a * 3;
 }

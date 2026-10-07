@@ -1,0 +1,6 @@
+// Imported by tests/fail/import_ambiguous.wk: exports `pick`, as does amb_b.wk.
+module lib.amb_a
+
+pub fn pick() -> i32 {
+    return 1;
+}

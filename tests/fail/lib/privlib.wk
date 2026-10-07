@@ -1,0 +1,10 @@
+// Imported by tests/fail/import_private.wk: `open` is exported, `secret` is not.
+module lib.privlib
+
+pub fn open() -> i32 {
+    return secret() + 1;
+}
+
+fn secret() -> i32 {
+    return 41;
+}

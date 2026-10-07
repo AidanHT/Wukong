@@ -5,6 +5,6 @@ module diamond_c
 import diamond_d;
 import diamond_c;
 
-fn from_diamond_c() -> i32 {
+pub fn from_diamond_c() -> i32 {
     return shared_leaf() + 20;
 }

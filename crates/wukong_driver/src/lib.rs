@@ -324,8 +324,10 @@ pub fn compile(opts: &Options) -> i32 {
 
     // --- Import loading (the multi-file front end; see `loader`) ---
     // Each `import`ed file is resolved relative to the root source file's directory, loaded once
-    // (cycles/diamonds dedup by canonical path), and its items spliced into `module`: the program
-    // is checked and lowered as ONE merged flat namespace. Lex/parse diagnostics from imported
+    // (cycles/diamonds dedup by canonical path), its names resolved against its own module scope
+    // (`pub`, `as` aliases, `{x, y}` selection — imported items are renamed to unique
+    // `<module>.<name>` symbols), and its items spliced into `module`, so everything downstream sees
+    // one table of unique symbols. Lex/parse diagnostics from imported
     // files — and E0305 for an unresolvable import — land in the same sink and render with their
     // own file's path/line through the shared SourceMap.
     loader::load_imports(

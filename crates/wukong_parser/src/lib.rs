@@ -427,7 +427,18 @@ impl<'a> Parser<'a> {
             });
             return TypeKind::Vector { elem, lanes };
         }
-        TypeKind::Path(self.parse_dotted_path())
+        // A named type may be module-qualified either way: `geom.Point` (the item-level dotted
+        // spelling) or `geom::Point` (the expression spelling, as in `geom::Point { .. }`).
+        let start = self.span();
+        let mut segments = vec![self.ident()];
+        while matches!(self.kind(), T::Dot | T::ColonColon) && self.nth(1) == T::Ident {
+            self.bump();
+            segments.push(self.ident());
+        }
+        TypeKind::Path(Path {
+            segments,
+            span: start.to(self.prev_span()),
+        })
     }
 
     fn parse_dotted_path(&mut self) -> Path {

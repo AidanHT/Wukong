@@ -23,7 +23,8 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-/// Parse `const GPT2_NAME: i64 = <int>;` out of `examples/gpt2_config.wk`.
+/// Parse `pub const GPT2_NAME: i64 = <int>;` out of `examples/gpt2_config.wk` (the constants are
+/// `pub` so the importing examples can see them; a bare `const` line is read the same way).
 fn wk_constants() -> BTreeMap<String, i64> {
     let path = repo_root().join("examples").join("gpt2_config.wk");
     let src = std::fs::read_to_string(&path)
@@ -31,6 +32,7 @@ fn wk_constants() -> BTreeMap<String, i64> {
     let mut out = BTreeMap::new();
     for line in src.lines() {
         let line = line.trim();
+        let line = line.strip_prefix("pub ").unwrap_or(line);
         let Some(rest) = line.strip_prefix("const GPT2_") else {
             continue;
         };
