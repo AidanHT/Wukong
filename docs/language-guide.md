@@ -560,7 +560,21 @@ written as a bare module `const` are normalized back to the canonical `a[i*K + p
 recognition (`wukong_mir_build::canon`), so ordinary refactoring does not silently cost you the
 kernel. The same pass moves a `let mut acc = 0.0;` down to the loop that accumulates into it, so
 declaring an accumulator a statement or two early does not break the multi-statement windows that
-softmax / log-softmax / cross-entropy match. Nor does folding the follow-up work **into** a matmul
+softmax / log-softmax / cross-entropy match. Four more spellings that used to cost the kernel are
+recognized for what they compute: a value named before it is used (`let v = x[i]; o[i] = gelu(v);` —
+the elementwise kernels see the body with the binding inlined, when nothing between the `let`s and
+the one store can write memory, nothing after the store reads the binding, and the binding is not
+a float product that inlining would contract into an FMA); the cache-friendly
+**row-outer** column reduction (`out[j] = 0.0` or a `[0.0; N]` declaration, then `for i { for j {
+out[j] += x[i*N + j] } }`, likewise `+= x*x` and `fmax`/`fmin`/absmax seeded from row 0 — the same
+`wukong_col*` kernels as the column-outer nest, performing the same operations per column); an
+**out-of-place** softmax or log-softmax that keeps `x` and writes `o` (one `wukong_norm_f32(x, o, …)`);
+and a **hand-tiled** matmul (`for i0 in 0..M step T { … for i in i0..i0 + T { … } }`, or the `let mut
+i0 = 0; while i0 < M { …; i0 = i0 + T; }` form, with literal extents the tiles divide exactly), which
+is the untiled nest it enumerates and dispatches the GEMM kernel. A loop over a `usize` counter — a
+`usize` parameter, or the dimension `N` of a `Tensor[f32, N]` — dispatches its elementwise kernel (or
+vectorizes) behind a run-time `end >= 0` test, since every kernel counts in signed `i64`; a reduction
+over such a counter keeps its source-order fold. Nor does folding the follow-up work **into** a matmul
 store rather than writing it as its own loop: `c[i*N+j] = silu(bias[j] + s)` fuses to one
 `wukong_sgemm_nt_epi`, `c[i*N+j] = x[i*N+j] + s` (a residual from another array) and a second store
 `d[i*N+j] = d[i*N+j] * s` alongside `c[i*N+j] = s` (the SwiGLU up-projection) each lower to the same
@@ -744,6 +758,12 @@ hardware instructions. A recognized standalone `tanh` loop uses the runtime's pi
 Scalar or composed `tanh` uses `1 - 2/(exp(2*x) + 1)`; these paths can differ in finite results and
 the sign of zero. Backend agreement for a fixed lowering path does not imply bitwise equality between
 dispatched and inlined spellings. Composed activations such as GELU retain the exp-based tanh formula.
+The tanh-approximation GELU written out by hand dispatches to the same kernel as `gelu()` when it is
+written in the kernel's own association — `0.5 * v * (1.0 + tanh(0.7978845608 * (v + 0.044715 * (v *
+v * v))))`, either operand order for each single `*`/`+` — because that spelling's inline evaluation is
+the kernel's, operation for operation (the source's `v + c*x3` contracts to the kernel's one FMA).
+HuggingFace's literal `0.044715 * v * v * v` rounds the cubic term differently and stays inline, and
+so does the erf form, which is a different function from the tanh approximation.
 
 ## Memory and parallelism
 

@@ -912,6 +912,21 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 
 ## Known limitations / sharp edges
 
+- **Recognizer spellings still outside the fold** (2026-10-06, `gap/recognizer-coverage`). The
+  hoisted-value, GELU-expansion, row-outer column-reduction, out-of-place softmax, hand-tiled GEMM and
+  `usize`-counter spellings now dispatch (`docs/language-guide.md`, Attributes), each only where the
+  kernel computes what the source computes. Declined on purpose, and therefore still the 128-bit
+  generic loop: HuggingFace's literal `0.044715 * v * v * v` GELU and the erf GELU (no kernel computes
+  them bit-for-bit — a new `vmath` opcode would); `out[j] = out[j] + x*x` (the source contracts it to
+  one FMA, the `colsumsq` kernel squares and adds — write `+=`); a tiled matmul whose tiles do not
+  divide a literal extent exactly, including the `min(i0 + T, M)` tail spelling (`min` on integers is
+  itself not lowered); a value binding read by a second store, and a float product bound to a
+  name (inlining it beside a `+` would contract it into an FMA the `let` rounded away); and a
+  reduction over a `usize` counter. The value view and the row-outer/out-of-place windows are flat
+  (one row); the batched forms keep their existing matchers. Per-site decline remarks ("this nest
+  matched GEMM but its operands are not provably disjoint") are not emitted yet: `--remarks=dispatch`
+  reports what fired, not why something did not.
+
 - **A view local read before it is assigned is undefined, and the language has no rule that says so.**
   *(Table measured 2026-08-23 on `lang/w2e-recognizer-gate`; sema still has no definite-assignment
   rule as of 2026-10-06, but the table has not been re-measured.)*
