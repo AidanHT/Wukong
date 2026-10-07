@@ -239,8 +239,12 @@ fn read_file_elements(
                     let x = bytes[off] as i8;
                     Value::Int(x as i128)
                 }
-                // wukong_rt_read_u8
-                _ => Value::Int(bytes[off] as i128),
+                // wukong_rt_read_u8 — sign-extended like every integer slot: `exec` masks each
+                // integer result to its width sign-extended and a `Load` returns the slot verbatim,
+                // so the `u8` byte 0xC8 must be `Int(-56)`, exactly what a `200u8` constant or a
+                // `u8` store leaves. Zero-extended, `b == 200` and `b > 150` (unsigned) compared a
+                // different representation of the same byte: 0 here, 1 natively.
+                _ => Value::Int(bytes[off] as i8 as i128),
             };
         }
     }
