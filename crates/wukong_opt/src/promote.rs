@@ -33,7 +33,9 @@
 //! * the **exit store** writes nothing the program would not have written: the location is a stack
 //!   slot no other code can see, or a store to it runs on every entry (in the header) or on every
 //!   iteration (under the guard, so a zero-trip entry writes the dummy instead). Writing back an
-//!   unchanged value to memory another thread can see would be a new data race.
+//!   unchanged value to memory another thread can see would be a new data race. A location the
+//!   header reads keeps an unguarded preheader load even when its store is guarded: the header runs
+//!   on a zero-trip entry too and now reads the slot, so the slot must hold memory's value there.
 //!
 //! Loops are visited innermost first. A promotion moves the location's accesses into the
 //! preheader and exits of its loop, which lie in the enclosing loop; that loop is skipped for the
@@ -115,8 +117,11 @@ struct Location {
     /// An address of the location that is available in the preheader and every exit block.
     addr: ValueId,
     ty: MirType,
-    /// Read through `select(first_test, addr, dummy)` rather than `addr`.
-    guarded: bool,
+    /// The preheader load reads through `select(first_test, addr, dummy)` rather than `addr`.
+    guard_load: bool,
+    /// The exit stores write through that `select` rather than `addr`. Always set when
+    /// `guard_load` is: a zero-trip slot holds the dummy's value, which must not reach `addr`.
+    guard_store: bool,
     /// `(block, instruction index)` of every access to it in the loop.
     accesses: Vec<(u32, usize)>,
 }
@@ -248,24 +253,31 @@ fn plan_loop(
         // The preheader load is safe un-guarded for a stack slot, a location the header reads, or
         // one every iteration reads when the body provably runs; the exit store, for a slot nobody
         // else sees, a location the header writes, or one every iteration writes when the body
-        // provably runs. Otherwise both go through the first-iteration guard, which needs a store
-        // on every iteration: it proves the location is both read-safe and written whenever the
-        // loop runs at all.
+        // provably runs. Otherwise the unsafe half goes through the first-iteration guard, which
+        // needs a store on every iteration: it proves the location is both read-safe and written
+        // whenever the loop runs at all.
+        //
+        // Only the unsafe half: a location the header *reads* is read on a zero-trip entry too, and
+        // the header's read now reads the slot, so the slot must start from memory even when the
+        // body never runs — a guarded load would hand the header (and any exit argument it feeds)
+        // the dummy's value. A guarded load in turn forces a guarded store, so a zero-trip slot
+        // holding the dummy's value is never written back to `addr`.
         let plain_load = alias.is_dereferenceable(addr, bytes)
             || in_header(false)
             || (spec.runs_once && accessed_every_iteration);
         let plain_store = private || in_header(true) || (spec.runs_once && stored_every_iteration);
-        let guarded = if plain_load && plain_store {
-            false
+        let (guard_load, guard_store) = if plain_load && plain_store {
+            (false, false)
         } else if guardable && stored_every_iteration {
-            true
+            (!plain_load, true)
         } else {
             continue;
         };
         locations.push(Location {
             addr,
             ty,
-            guarded,
+            guard_load,
+            guard_store,
             accesses: members.iter().map(|&k| (all[k].0, all[k].1)).collect(),
         });
     }
@@ -297,7 +309,7 @@ fn rewrite(f: &mut Function, plan: &Plan, slots: &mut Vec<Inst>, dummies: &mut D
                 space: AddrSpace::Local,
             },
         });
-        let addr = if loc.guarded {
+        let guarded_addr = if loc.guard_load || loc.guard_store {
             let cond = match guard {
                 Some(c) => c,
                 None => {
@@ -323,10 +335,20 @@ fn rewrite(f: &mut Function, plan: &Plan, slots: &mut Vec<Inst>, dummies: &mut D
         } else {
             loc.addr
         };
+        let load_addr = if loc.guard_load {
+            guarded_addr
+        } else {
+            loc.addr
+        };
+        let store_addr = if loc.guard_store {
+            guarded_addr
+        } else {
+            loc.addr
+        };
         let init = fresh_value(f, loc.ty.clone());
         pre.push(Inst {
             result: Some(init),
-            op: Op::Load(addr, loc.ty.clone()),
+            op: Op::Load(load_addr, loc.ty.clone()),
         });
         pre.push(Inst {
             result: None,
@@ -342,7 +364,7 @@ fn rewrite(f: &mut Function, plan: &Plan, slots: &mut Vec<Inst>, dummies: &mut D
                 _ => unreachable!("a promoted access is a load or a store"),
             }
         }
-        tails.push((slot, loc.ty.clone(), addr));
+        tails.push((slot, loc.ty.clone(), store_addr));
     }
     f.blocks[plan.preheader as usize].insts.extend(pre);
     for &e in &plan.exits {
@@ -686,5 +708,106 @@ mod tests {
             wukong_mir::print::print_function(&f, &it)
         );
         assert_eq!(run(&main, &f, &it), 106);
+    }
+
+    /// `fn f(out, n) -> i64 { i = 0; loop { v = out[0]; if !(i < n) { return v } out[0] = v + 10;
+    /// i += 1 } }`: the header reads the location and passes it out of the loop, and the body writes
+    /// it on every iteration. The write-back needs the guard, but the preheader load must not take
+    /// it: on a zero-trip entry the header still reads, and it must see memory, not the dummy.
+    #[test]
+    fn a_location_the_header_reads_is_loaded_unguarded_on_a_zero_trip_entry() {
+        let mut it = Interner::new();
+        let fname = it.intern("f");
+        let mut b = Builder::new(fname, MirType::I64);
+        let out = b.add_param(MirType::Ptr);
+        let n = b.add_param(MirType::I64);
+        let zero = b.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let ten = b.build(MirType::I64, Op::ConstInt(10, MirType::I64));
+        let header = b.new_block();
+        let body = b.new_block();
+        let exit = b.new_block();
+        let i = b.block_param(header, MirType::I64);
+        let r = b.block_param(exit, MirType::I64);
+        b.br(header, vec![zero]);
+        b.switch_to(header);
+        let v = b.build(MirType::I64, Op::Load(out, MirType::I64));
+        let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, i, n));
+        b.cond_br(c, body, vec![], exit, vec![v]);
+        b.switch_to(body);
+        let old = b.build(MirType::I64, Op::Load(out, MirType::I64));
+        let new = b.build(MirType::I64, Op::Bin(BinOp::Add, old, ten));
+        b.build_void(Op::Store {
+            ptr: out,
+            value: new,
+        });
+        let next = b.build(MirType::I64, Op::Bin(BinOp::Add, i, one));
+        b.br(header, vec![next]);
+        b.switch_to(exit);
+        b.ret(Some(r));
+        let mut f = b.finish();
+
+        // `main`: a = 100, b = 5; return f(&a, 3) * 1000 + f(&b, 0) + a * 10 + b.
+        let mut m = Builder::new(it.intern("main"), MirType::I64);
+        let a = m.alloca(MirType::I64);
+        let bs = m.alloca(MirType::I64);
+        let hundred = m.build(MirType::I64, Op::ConstInt(100, MirType::I64));
+        let five = m.build(MirType::I64, Op::ConstInt(5, MirType::I64));
+        let three = m.build(MirType::I64, Op::ConstInt(3, MirType::I64));
+        let none = m.build(MirType::I64, Op::ConstInt(0, MirType::I64));
+        m.build_void(Op::Store {
+            ptr: a,
+            value: hundred,
+        });
+        m.build_void(Op::Store {
+            ptr: bs,
+            value: five,
+        });
+        let r3 = m.build(
+            MirType::I64,
+            Op::Call {
+                func: fname,
+                args: vec![a, three],
+            },
+        );
+        let r0 = m.build(
+            MirType::I64,
+            Op::Call {
+                func: fname,
+                args: vec![bs, none],
+            },
+        );
+        let va = m.build(MirType::I64, Op::Load(a, MirType::I64));
+        let vb = m.build(MirType::I64, Op::Load(bs, MirType::I64));
+        let k = m.build(MirType::I64, Op::ConstInt(1000, MirType::I64));
+        let tenk = m.build(MirType::I64, Op::ConstInt(10, MirType::I64));
+        let t = m.build(MirType::I64, Op::Bin(BinOp::Mul, r3, k));
+        let t = m.build(MirType::I64, Op::Bin(BinOp::Add, t, r0));
+        let ta = m.build(MirType::I64, Op::Bin(BinOp::Mul, va, tenk));
+        let t = m.build(MirType::I64, Op::Bin(BinOp::Add, t, ta));
+        let t = m.build(MirType::I64, Op::Bin(BinOp::Add, t, vb));
+        m.ret(Some(t));
+        let main = m.finish();
+
+        // f(&a, 3): the header reads 100, 110, 120, 130 and returns 130, leaving a = 130.
+        // f(&b, 0): the header reads 5 and returns it, leaving b = 5.
+        // 130·1000 + 5 + 130·10 + 5 = 131_310.
+        assert_eq!(run(&main, &f, &it), 131_310);
+        assert!(Promote.run_function(&mut f, &mut CfgAnalyses::default()));
+        let in_loop = [header, body]
+            .iter()
+            .flat_map(|blk| &f.blocks[blk.0 as usize].insts)
+            .filter(|i| {
+                matches!(&i.op, Op::Load(p, _) if *p == out)
+                    || matches!(&i.op, Op::Store { ptr, .. } if *ptr == out)
+            })
+            .count();
+        assert_eq!(in_loop, 0);
+        // The write-back is guarded; the preheader load reads `out` itself.
+        assert!(f.blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(i.op, Op::Load(p, _) if p == out)));
+        assert_eq!(run(&main, &f, &it), 131_310);
     }
 }
