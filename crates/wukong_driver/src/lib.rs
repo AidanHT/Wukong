@@ -41,6 +41,9 @@ mod lang_bench;
 /// cycle-safe), and splices their items into the root module — one merged flat namespace.
 mod loader;
 
+/// Whole-program reachability pruning ahead of optimization (`--run`, `--emit=exe`).
+mod prune;
+
 /// Which intermediate (or final) artifact the user asked to produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EmitStage {
@@ -415,6 +418,19 @@ pub fn compile(opts: &Options) -> i32 {
             return exit::COMPILE_ERROR;
         }
     };
+
+    // --- Reachability pruning ---
+    // A program with one known entry point compiles only what `main` can reach; an object file
+    // exports every function and the MIR dumps show the whole program, so both keep everything,
+    // as do the autodiff stages (their entry point is the loss function, not `main`).
+    // `--backend=gpu-native` also keeps everything: its whole-program PTX lowering declines a
+    // program on any unsupported function, and pruning would silently change which corpus programs
+    // the device suite attempts.
+    let single_entry = opts.run || opts.emit == EmitStage::Exe;
+    if single_entry && !opts.grad.train && opts.backend != BackendKind::GpuLower {
+        let main = interner.intern("main");
+        prune::retain_reachable(&mut program, &[main]);
+    }
 
     // --- Optimization ---
     // The autodiff transform (`--emit=grad` / `--train`) consumes single-block SSA, so it forces at

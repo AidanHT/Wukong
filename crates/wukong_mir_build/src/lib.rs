@@ -67,6 +67,9 @@ const AUTODIFF_UNROLL_MAX_BYTES: u64 = 1024;
 // `mod`s above, so it does not collide with the modules other branches add there).
 mod repeat;
 
+// The vectorizer's statement scan and the same-range loop-fusion planner built on it.
+mod fuse;
+
 // ===== Type-generic monomorphization =====
 //
 // A function generic over a TYPE parameter (`fn id<T>(x: T) -> T`) cannot be lowered once: its MIR
@@ -5272,15 +5275,19 @@ impl FnLowerer<'_> {
         if run < 2 {
             return None;
         }
-        // Fuse the longest dependence-safe (vectorizable) prefix of length >= 2.
-        for m in (2..=run).rev() {
-            let fused = fuse_for_bodies(&stmts[..m]);
-            if self.vectorizable(&fused, var).is_some() {
-                self.lower_for(None, pat0, iter0, &fused, &[]);
-                return Some(m);
-            }
-        }
-        None
+        // Fuse the longest dependence-safe (vectorizable) prefix of length >= 2, planned in one
+        // pass without building a candidate body (see `fuse.rs`); only the chosen run is cloned.
+        let m = self.fusable_prefix(&stmts[..run], var);
+        // Debug builds (every test run) cross-check the planner against the build-and-check search
+        // it replaces, on runs short enough for that search's cubic cost.
+        debug_assert!(
+            run > 16 || m == self.fusable_prefix_reference(&stmts[..run], var),
+            "fusion planner disagrees with the reference search"
+        );
+        let m = m?;
+        let fused = fuse_for_bodies(&stmts[..m]);
+        self.lower_for(None, pat0, iter0, &fused, &[]);
+        Some(m)
     }
 
     // ---- fused normalization recognition (block-level look-ahead, like the matmul epilogue) ----
@@ -16215,77 +16222,21 @@ impl FnLowerer<'_> {
         if body.tail.is_some() || body.stmts.is_empty() {
             return None;
         }
-        // inner `let` names become vector temps; they may not appear inside index expressions.
-        let mut locals: HashSet<Symbol> = HashSet::default();
-        // every array access: (base, index expr, unit-stride?, is_write).
-        let mut acc: Vec<(Symbol, &Expr, bool, bool)> = Vec::new();
-        let mut lane: Option<MirType> = None;
-
+        // The per-statement scan and the write/access conflict rule live in `fuse.rs`, shared with
+        // the same-range fusion planner (which must answer exactly as this function would).
+        let mut scan = fuse::VecScan::default();
         for s in &body.stmts {
-            match &s.kind {
-                StmtKind::Let {
-                    pat:
-                        Pattern {
-                            kind: ast::PatKind::Ident(name),
-                            ..
-                        },
-                    init: Some(e),
-                    ..
-                } => {
-                    if !self.vec_check_value(e, j, &locals, &mut lane, &mut acc) {
-                        return None;
-                    }
-                    locals.insert(*name);
-                }
-                StmtKind::Assign { target, op, value } => {
-                    if !self.vec_check_value(value, j, &locals, &mut lane, &mut acc) {
-                        return None;
-                    }
-                    let _ = op; // compound vs plain handled identically for validation
-                    match &target.kind {
-                        // scalar reassignment of an inner vector temp (e.g. Horner `r = r*v + c`)
-                        ExprKind::Path(p) if p.is_single() && locals.contains(&p.first().sym) => {}
-                        // store to an array element at a unit-stride index
-                        ExprKind::Index { base, indices } if indices.len() == 1 => {
-                            let bsym = single_path(base)?;
-                            if uses_any(&indices[0], &locals) {
-                                return None; // index must not depend on inner temps
-                            }
-                            if affine_stride(&indices[0], j) != Some(1) {
-                                return None; // stores must be unit-stride
-                            }
-                            let elem = self.array_elem(base)?;
-                            set_or_check(&mut lane, &elem)?;
-                            acc.push((bsym, &indices[0], true, true));
-                        }
-                        _ => return None,
-                    }
-                }
-                _ => return None, // no nested control flow / calls / returns in a vector body
+            if !self.vec_scan_stmt(&mut scan, s, j) {
+                return None;
+            }
+        }
+        for w in scan.acc.iter().filter(|a| a.3) {
+            if scan.acc.iter().any(|o| self.vec_access_conflict(w, o)) {
+                return None;
             }
         }
 
-        // A vector load snapshots several scalar iterations before their stores. Check every
-        // access against each written buffer, not just accesses with the same spelling:
-        // `out[i + 1] = x[i] + 1` is a recurrence when a caller passes one array as x and out.
-        // Unproved distinct bases can also be shifted views, so even equal index expressions
-        // are insufficient for them. Leave those loops for scalar lowering / guarded MIR SIMD.
-        for &(base, idx, _, is_write) in &acc {
-            if !is_write {
-                continue;
-            }
-            for &(other, other_idx, _, _) in &acc {
-                if base == other {
-                    if !exprs_struct_eq(idx, other_idx) {
-                        return None;
-                    }
-                } else if !self.provably_disjoint(base, other) {
-                    return None;
-                }
-            }
-        }
-
-        let lane = lane?;
+        let lane = scan.lane?;
         let w = vector_width(&lane)?;
         Some((lane, w))
     }
