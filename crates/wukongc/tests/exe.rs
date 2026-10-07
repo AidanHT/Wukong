@@ -323,11 +323,18 @@ fn check_corpus_program(src: &Path, tmp: &Path, link: &LinkPath) -> Verdict {
         let native = outcome(
             Command::new(env!("CARGO_BIN_EXE_wukongc"))
                 .current_dir(&native_dir)
+                .arg("--error-format=json")
                 .arg("--run")
                 .arg("--backend=native")
                 .arg(src),
         );
-        if native.0 == emitted.0 && native.1.is_empty() {
+        // Only a native *compile* failure is a decline: it is rendered as a catalogued `C0xxx`
+        // diagnostic or an internal-compiler-error (`bug`) record. A program that compiles and then
+        // exits non-zero with no stdout (a failed assertion, an `EXPECT-EXIT: 1` fixture) must not
+        // excuse an AOT link failure that happens to share its exit code.
+        let native_declined =
+            native.2.contains("\"code\":\"C0") || native.2.contains("\"severity\":\"bug\"");
+        if native_declined && native.0 == emitted.0 && native.1.is_empty() {
             return Verdict::Declined(format!(
                 "the native backend declines it too (exit {:?}): {}",
                 native.0,
