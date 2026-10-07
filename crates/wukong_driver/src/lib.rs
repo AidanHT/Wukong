@@ -118,8 +118,9 @@ pub struct Options {
     pub color: bool,
     pub error_format: ErrorFormat,
     /// Cap on how many error-severity diagnostics are printed before the rest are suppressed
-    /// (`--error-limit=<n>`). `None` is unlimited (the default). A warning after the cap is still
-    /// shown; only errors are counted against it, matching rustc's `--error-limit`.
+    /// (`--error-limit=<n>`). `None` is unlimited (the default). Only errors count toward the cap,
+    /// but once it is exceeded every later diagnostic in that batch (warnings included) is
+    /// suppressed; the "aborting due to N errors" summary still counts the suppressed errors.
     pub error_limit: Option<usize>,
     /// Which backend to run/emit with. `--run` defaults to the interpreter (the reference oracle);
     /// native object/exe emission always uses Cranelift.

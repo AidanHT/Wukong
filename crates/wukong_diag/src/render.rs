@@ -386,10 +386,10 @@ error: bad
     fn renders_a_suggestion_as_a_help_line() {
         use crate::Applicability;
         let (sm, id) = sm_with("fn main() {\n    let x = 0;\n    x = 1;\n}\n");
-        let span = Span::new(id, 16, 17); // the `x` in `let x`
+        let span = Span::new(id, 20, 21); // the `x` in `let x`
         let d = Diagnostic::error("cannot assign twice to immutable binding `x`")
             .with_code("E0304")
-            .primary(Span::new(id, 33, 34), "cannot assign")
+            .primary(Span::new(id, 31, 32), "cannot assign")
             .suggest_with(
                 span,
                 "consider making this binding mutable",

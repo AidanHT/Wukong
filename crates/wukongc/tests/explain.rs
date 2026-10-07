@@ -67,6 +67,14 @@ fn explain_each_code_prints_title_and_body() {
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains(e.code), "{}: code not echoed", e.code);
         assert!(text.contains(e.title), "{}: title not echoed", e.code);
+        // A worked example is only useful if `--explain` shows it.
+        for example in [e.bad, e.good].into_iter().flatten() {
+            assert!(
+                text.contains(example),
+                "{}: worked example not printed",
+                e.code
+            );
+        }
     }
 }
 

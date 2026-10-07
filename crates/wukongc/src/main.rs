@@ -110,15 +110,26 @@ fn resolve_color(when: ColorChoice) -> bool {
             true
         }
         ColorChoice::Never => false,
+        // CLICOLOR_FORCE is an explicit "force": like `always`, it must survive a pipe or a file,
+        // where there is no console to switch into VT mode (`enable_vt_processing` is false there).
+        ColorChoice::Auto if clicolor_force() => {
+            let _ = enable_vt_processing();
+            true
+        }
         ColorChoice::Auto => auto_color() && enable_vt_processing(),
     }
+}
+
+/// `CLICOLOR_FORCE` set to anything other than empty or `"0"`.
+fn clicolor_force() -> bool {
+    std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 fn auto_color() -> bool {
     use std::env;
     let nonempty = |k: &str| env::var_os(k).is_some_and(|v| !v.is_empty());
     // CLICOLOR_FORCE wins when set to anything other than "0".
-    if env::var_os("CLICOLOR_FORCE").is_some_and(|v| !v.is_empty() && v != "0") {
+    if clicolor_force() {
         return true;
     }
     if nonempty("NO_COLOR") {
@@ -181,6 +192,12 @@ fn print_explanation(code: &str) -> Result<(), String> {
         Some(e) => {
             println!("{}: {}\n", e.code, e.title);
             println!("{}", e.body);
+            // The worked example pair, when the entry has one. `tests/explain.rs` compiles both, so
+            // what is printed here is exactly what the compiler rejects and accepts.
+            if let (Some(bad), Some(good)) = (e.bad, e.good) {
+                println!("\nErroneous code example:\n\n{bad}");
+                println!("Corrected:\n\n{good}");
+            }
             Ok(())
         }
         None => Err(format!(
