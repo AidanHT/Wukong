@@ -1237,7 +1237,7 @@ mod tests {
                     (s - 1, f32::NAN),
                     (s / 2, f32::INFINITY),
                     ((s / 2 + 1).min(s - 1), f32::NEG_INFINITY),
-                    (65.min(s - 1), f32::NAN),
+                    (65usize.min(s - 1), f32::NAN),
                 ] {
                     let mut vp = v.clone();
                     for t in 0..d {

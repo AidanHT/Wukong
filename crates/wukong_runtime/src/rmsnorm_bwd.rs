@@ -438,25 +438,25 @@ mod tests {
         };
         let nblk = n / BLOCK * BLOCK; // elements the blocked body covers
         let nrem = nblk + (n - nblk) / 8 * 8; // ... plus the whole 8-steps after it
-        let mut sa = [[0.0f32; 8]; UNROLL];
-        let mut ga = [[0.0f32; 8]; UNROLL];
+        let mut ssa = [[0.0f32; 8]; UNROLL];
+        let mut gxa = [[0.0f32; 8]; UNROLL];
         for (k, &v) in x.iter().enumerate().take(nrem) {
             let t = if k < nblk { (k % BLOCK) / 8 } else { 0 };
             let j = k % 8;
-            sa[t][j] = v.mul_add(v, sa[t][j]);
-            ga[t][j] = g(k).mul_add(v, ga[t][j]);
+            ssa[t][j] = v.mul_add(v, ssa[t][j]);
+            gxa[t][j] = g(k).mul_add(v, gxa[t][j]);
         }
         let mut h = UNROLL / 2;
         while h >= 1 {
             for t in 0..h {
                 for j in 0..8 {
-                    sa[t][j] += sa[t + h][j];
-                    ga[t][j] += ga[t + h][j];
+                    ssa[t][j] += ssa[t + h][j];
+                    gxa[t][j] += gxa[t + h][j];
                 }
             }
             h /= 2;
         }
-        let (mut ss, mut gx) = (sa[0], ga[0]);
+        let (mut ss, mut gx) = (ssa[0], gxa[0]);
         for (k, &v) in x.iter().enumerate().take(n).skip(nrem) {
             let j = k - nrem;
             ss[j] = v.mul_add(v, ss[j]);

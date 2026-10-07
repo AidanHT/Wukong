@@ -5,6 +5,21 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Runtime kernels (`gap/runtime-kernels`)
+
+- **Reductions run eight independent accumulator chains.** `wukong_sreduce_f32` (dot / ssd / sum /
+  sumsq / abs-sums / max-family, also the per-row dot of softmax backward), `wukong_{sum,dot}_f16`,
+  the softmax / log-softmax / logsumexp row max and RMSNorm backward's two row reductions no longer
+  sit on one loop-carried FMA/max chain. Inputs shorter than one block (64 elements; 32 for RMSNorm
+  backward) keep their exact previous bits; longer f32/f16 sums and dots reassociate toward pairwise
+  summation (more accurate, pinned by f64-distance tests); softmax outputs are bit-unchanged.
+- **AVX2 bf16/f16 transpose** (16x8 in-register tile), an off-chain cumsum carry (bit-identical), and
+  the fused bias/half-output/half-input activations now inline their 8-lane kernel instead of
+  calling it through a function pointer per vector (bit-identical; `WUKONG_VMATH_FNPTR=1` A/Bs it).
+- **Fixed: causal `sdpa` read future `V` rows.** A NaN/inf `V` row above the diagonal reached earlier
+  queries through a zero weight (`0·NaN`); masked keys are now skipped. The attention module states
+  its numeric contract, and its W15 probe gained a same-microkernel materialized control.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**
