@@ -1113,18 +1113,12 @@ macro_rules! with_vmath8_table {
     };
 }
 
-/// Select the 8-lane AVX2 kernel for op `op` (the `VM_*` codes), or `None` for an unrecognized op.
-/// Used by the bf16/f16-input dispatchers and by `bias.rs`, so all of them apply the *identical*
-/// activation — the only difference is how the 8 lanes are loaded (f32 vs widened bf16), which keeps
-/// `wukong_vmath_bf16` bit-for-bit consistent with `wukong_vmath_f32`.
-/// `pub(crate)` so the broadcast-bias AVX2 kernel in `bias.rs` applies the *identical* 8-lane
-/// activation to its `x + b[j]` sum vector — the vector twin of [`apply1`], keeping the fused-activation
-/// bias bit-for-bit consistent with `wukong_vmath_f32`. Returns `None` for an unrecognized/sentinel
-/// `op` (the caller then leaves the sum unmodified — identity).
-///
-/// [`vmath_avx2`] does **not** go through this table (it monomorphizes instead — see
-/// [`vmath_avx2_loop`]), but `WUKONG_VMATH_FNPTR=1` routes it back through here as the A/B
-/// kill-switch; both spellings run the identical loop body over the identical kernel.
+/// Select the 8-lane AVX2 kernel for op `op` (the `VM_*` codes) as a function pointer, or `None` for
+/// an unrecognized op. No shipped hot loop calls through it any more: [`vmath_avx2`] monomorphizes
+/// (see [`vmath_avx2_loop`]) and every other consumer — `bias.rs`, `lowp.rs`'s half-output kernels,
+/// the bf16/f16-input dispatchers here — goes through [`with_act8`]. `WUKONG_VMATH_FNPTR=1` routes
+/// all of them back through this pointer as the A/B kill-switch (both spellings run the identical
+/// loop body over the identical kernel), and the table tests pin it against [`apply1`].
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn vmath8_for(
@@ -1139,6 +1133,62 @@ pub(crate) fn vmath8_for(
         };
     }
     with_vmath8_table!(table)
+}
+
+/// A loop body to be compiled once **per 8-lane activation kernel** — the generic half of the
+/// monomorphized dispatch [`with_act8`] gives callers outside this module (`bias.rs`, `lowp.rs`'s
+/// half-output kernels) and the half-input dispatchers below.
+///
+/// Those callers used to fetch the kernel as a [`vmath8_for`] function pointer and call it once per
+/// vector — the exact call boundary [`vmath_avx2`] documents removing (a memory-passed `__m256`, a
+/// `vzeroupper`, an indirect call, and the polynomial's constants rematerialized inside the callee on
+/// every vector, which also defeats any unroll around the call). Through this trait the loop is
+/// instantiated with the kernel as a generic callable, so the polynomial inlines into it.
+#[cfg(target_arch = "x86_64")]
+pub(crate) trait Act8Body {
+    /// Run the loop with `f` as the 8-lane activation.
+    ///
+    /// # Safety
+    /// The implementation's own operand contract. `f` is an AVX2+FMA kernel, so the host must have
+    /// both — which [`with_act8`]'s caller has checked.
+    unsafe fn run<F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256>(self, f: F);
+}
+
+/// Run `body` with op `op`'s 8-lane kernel inlined, and return `true`; return `false` without
+/// running anything for an op that has none (a sentinel like `bias::BIAS_ACT_NONE`, or an unknown
+/// code) — the caller then takes its identity or scalar-twin path, honouring [`apply1`]'s
+/// identity-for-an-unknown-op contract. Generated from [`with_vmath8_table`], so it covers exactly the
+/// codes [`vmath8_for`] does. `WUKONG_VMATH_FNPTR=1` passes the [`vmath8_for`] function pointer
+/// instead — the same A/B kill-switch [`vmath_avx2`] honours, so one knob measures the inlining for
+/// every consumer. Bits are identical either way: the arithmetic is the same kernel; only whether it
+/// is inlined differs.
+///
+/// # Safety
+/// AVX2+FMA must be available; `body`'s own contract must hold.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) unsafe fn with_act8<L: Act8Body>(op: i64, body: L) -> bool {
+    if vmath_fnptr() {
+        let Some(f) = vmath8_for(op) else {
+            return false;
+        };
+        // SAFETY: `f` came from `vmath8_for`, an avx2+fma kernel; the caller checked both features.
+        unsafe { body.run(|v| f(v)) };
+        return true;
+    }
+    macro_rules! dispatch {
+        ($(($code:ident, $k:ident)),* $(,)?) => {
+            match op {
+                $($code => {
+                    // SAFETY: each `$k` is an avx2+fma 8-lane kernel; the caller checked both.
+                    unsafe { body.run(|v| $k(v)) };
+                    true
+                })*
+                _ => false,
+            }
+        };
+    }
+    with_vmath8_table!(dispatch)
 }
 
 /// Whether a kernel touching `streams` arrays of `n` f32 each should stream its stores — true once the
@@ -2053,13 +2103,46 @@ unsafe fn vmath_bf16_scalar(x: *const u16, out: *mut f32, n: usize, op: i64) {
     }
 }
 
+/// AVX2 dispatcher for [`wukong_vmath_bf16`]: [`with_act8`] instantiates [`vmath_bf16_loop`] with
+/// the op's kernel inlined (it used to call the [`vmath8_for`] pointer once per vector); an op with
+/// no 8-lane kernel runs the scalar twin.
+///
+/// # Safety
+/// `x` valid for `n` `u16`, `out` for `n` `f32`; AVX2+FMA available.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vmath_bf16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
+    struct Body {
+        x: *const u16,
+        out: *mut f32,
+        n: usize,
+        op: i64,
+    }
+    impl Act8Body for Body {
+        unsafe fn run<F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256>(self, f: F) {
+            // SAFETY: the dispatcher's contract — buffers valid for `n`, AVX2+FMA checked.
+            unsafe { vmath_bf16_loop(self.x, self.out, self.n, self.op, f) }
+        }
+    }
+    if !with_act8(op, Body { x, out, n, op }) {
+        vmath_bf16_scalar(x, out, n, op);
+    }
+}
+
+/// The bf16-input activation loop for one kernel `f`: widen 8 lanes, apply, store; scalar tail.
+///
+/// # Safety
+/// `x` valid for `n` `u16`, `out` for `n` `f32`; AVX2+FMA available; `f` an avx2+fma kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vmath_bf16_loop<F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256>(
+    x: *const u16,
+    out: *mut f32,
+    n: usize,
+    op: i64,
+    f: F,
+) {
     use std::arch::x86_64::*;
-    let Some(f) = vmath8_for(op) else {
-        return vmath_bf16_scalar(x, out, n, op);
-    };
     let mut i = 0;
     while i + 8 <= n {
         // lossless bf16→f32 widen (the same `<<16` the bf16 reductions use), then the shared kernel.
@@ -2118,13 +2201,44 @@ unsafe fn vmath_f16_scalar(x: *const u16, out: *mut f32, n: usize, op: i64) {
     }
 }
 
+/// AVX2/F16C dispatcher for [`wukong_vmath_f16`] — [`vmath_bf16_avx2`]'s shape with the F16C widen.
+///
+/// # Safety
+/// `x` valid for `n` `u16`, `out` for `n` `f32`; AVX2+F16C+FMA available.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn vmath_f16_avx2(x: *const u16, out: *mut f32, n: usize, op: i64) {
+    struct Body {
+        x: *const u16,
+        out: *mut f32,
+        n: usize,
+        op: i64,
+    }
+    impl Act8Body for Body {
+        unsafe fn run<F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256>(self, f: F) {
+            // SAFETY: the dispatcher's contract — buffers valid for `n`, AVX2+F16C+FMA checked.
+            unsafe { vmath_f16_loop(self.x, self.out, self.n, self.op, f) }
+        }
+    }
+    if !with_act8(op, Body { x, out, n, op }) {
+        vmath_f16_scalar(x, out, n, op);
+    }
+}
+
+/// The f16-input activation loop for one kernel `f`: F16C-widen 8 lanes, apply, store; scalar tail.
+///
+/// # Safety
+/// `x` valid for `n` `u16`, `out` for `n` `f32`; AVX2+F16C+FMA available; `f` an avx2+fma kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn vmath_f16_loop<F: Fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256>(
+    x: *const u16,
+    out: *mut f32,
+    n: usize,
+    op: i64,
+    f: F,
+) {
     use std::arch::x86_64::*;
-    let Some(f) = vmath8_for(op) else {
-        return vmath_f16_scalar(x, out, n, op);
-    };
     let mut i = 0;
     while i + 8 <= n {
         // lossless f16→f32 widen (F16C `vcvtph2ps`), then the shared activation kernel.

@@ -1327,13 +1327,47 @@ unsafe fn vmath_narrow_scalar(kind: Half, x: *const u16, out: *mut u16, n: usize
     }
 }
 
+/// AVX2 dispatcher for [`wukong_vmath_bf16_out`]: [`crate::vmath::with_act8`] instantiates
+/// [`vmath_narrow_bf16_loop`] once per activation kernel with the polynomial inlined — it used to call
+/// a `vmath8_for` function pointer per 8-lane vector, four times per unrolled step of the streaming
+/// skeleton (P9.3). An op with no 8-lane kernel runs the scalar twin for every element.
+///
+/// # Safety
+/// `xp` valid for `n` `u16`, `out` for `n` `u16`; AVX2+FMA available.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vmath_narrow_bf16_avx(xp: *const u16, out: *mut u16, n: usize, op: i64) {
-    // The 8-lane activation twin of `apply1` (or scalar-only op → the scalar path for every element).
-    let Some(f) = crate::vmath::vmath8_for(op) else {
-        return vmath_narrow_scalar(Half::Bf16, xp, out, n, op);
-    };
+    struct Body {
+        xp: *const u16,
+        out: *mut u16,
+        n: usize,
+        op: i64,
+    }
+    impl crate::vmath::Act8Body for Body {
+        unsafe fn run<F: Fn(__m256) -> __m256>(self, f: F) {
+            // SAFETY: the dispatcher's contract — buffers valid for `n`, AVX2+FMA checked.
+            unsafe { vmath_narrow_bf16_loop(self.xp, self.out, self.n, self.op, f) }
+        }
+    }
+    if !crate::vmath::with_act8(op, Body { xp, out, n, op }) {
+        vmath_narrow_scalar(Half::Bf16, xp, out, n, op);
+    }
+}
+
+/// The bf16 half-output activation stream for one kernel `f` (the [`stream_narrow`] skeleton).
+///
+/// # Safety
+/// `xp` valid for `n` `u16`, `out` for `n` `u16`; AVX2+FMA available; `f` an avx2+fma kernel equal
+/// lane-for-lane to `apply1(op, ·)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vmath_narrow_bf16_loop<F: Fn(__m256) -> __m256>(
+    xp: *const u16,
+    out: *mut u16,
+    n: usize,
+    op: i64,
+    f: F,
+) {
     stream_narrow!(
         out,
         n,
@@ -1348,12 +1382,45 @@ unsafe fn vmath_narrow_bf16_avx(xp: *const u16, out: *mut u16, n: usize, op: i64
     );
 }
 
+/// AVX2/F16C dispatcher for [`wukong_vmath_f16_out`] — [`vmath_narrow_bf16_avx`]'s shape with the
+/// F16C widen and narrow.
+///
+/// # Safety
+/// `xp` valid for `n` `u16`, `out` for `n` `u16`; AVX2+F16C+FMA available.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn vmath_narrow_f16_avx(xp: *const u16, out: *mut u16, n: usize, op: i64) {
-    let Some(f) = crate::vmath::vmath8_for(op) else {
-        return vmath_narrow_scalar(Half::F16, xp, out, n, op);
-    };
+    struct Body {
+        xp: *const u16,
+        out: *mut u16,
+        n: usize,
+        op: i64,
+    }
+    impl crate::vmath::Act8Body for Body {
+        unsafe fn run<F: Fn(__m256) -> __m256>(self, f: F) {
+            // SAFETY: the dispatcher's contract — buffers valid for `n`, AVX2+F16C+FMA checked.
+            unsafe { vmath_narrow_f16_loop(self.xp, self.out, self.n, self.op, f) }
+        }
+    }
+    if !crate::vmath::with_act8(op, Body { xp, out, n, op }) {
+        vmath_narrow_scalar(Half::F16, xp, out, n, op);
+    }
+}
+
+/// The f16 half-output activation stream for one kernel `f` (the [`stream_narrow`] skeleton).
+///
+/// # Safety
+/// `xp` valid for `n` `u16`, `out` for `n` `u16`; AVX2+F16C+FMA available; `f` an avx2+fma kernel
+/// equal lane-for-lane to `apply1(op, ·)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn vmath_narrow_f16_loop<F: Fn(__m256) -> __m256>(
+    xp: *const u16,
+    out: *mut u16,
+    n: usize,
+    op: i64,
+    f: F,
+) {
     stream_narrow!(
         out,
         n,
@@ -2164,6 +2231,49 @@ mod tests {
                     kernel(p, p, got.len() as i64, op);
                 }
                 assert_eq!(got, want, "op={op}");
+            }
+        }
+    }
+
+    #[test]
+    fn vmath_narrow_out_every_op_instantiation_matches_the_scalar_twin() {
+        // Each `VM_*` code has its own monomorphized instantiation of the half-output stream (the
+        // kernel inlined through `vmath::with_act8`), so every one is driven here, plus two
+        // off-table codes that must take the scalar twin. 45 = 32-lane body + 8 + a 5-element tail.
+        // Mixed-sign input crosses the domain edges of log/acosh/atanh/asin/...; a NaN result is
+        // compared as NaN-ness (the narrowing of a NaN payload is the shims' business, pinned
+        // elsewhere), every other result bit-for-bit.
+        use crate::vmath::VM_CBRT;
+        let n = 45usize;
+        let xs: Vec<f32> = (0..n).map(|i| (i as f32 - 22.0) * 0.21).collect();
+        let ops: Vec<i64> = (0..=VM_CBRT).chain([-1, VM_CBRT + 1]).collect();
+        for &op in &ops {
+            for (kind, conv) in [
+                (Half::Bf16, bf16_bits as fn(f32) -> u16),
+                (Half::F16, f16_bits as fn(f32) -> u16),
+            ] {
+                let xb: Vec<u16> = xs.iter().map(|&v| conv(v)).collect();
+                let mut got = vec![0u16; n];
+                let mut want = vec![0u16; n];
+                unsafe {
+                    match kind {
+                        Half::Bf16 => {
+                            wukong_vmath_bf16_out(xb.as_ptr(), got.as_mut_ptr(), n as i64, op)
+                        }
+                        Half::F16 => {
+                            wukong_vmath_f16_out(xb.as_ptr(), got.as_mut_ptr(), n as i64, op)
+                        }
+                    }
+                    vmath_narrow_scalar(kind, xb.as_ptr(), want.as_mut_ptr(), n, op);
+                }
+                for i in 0..n {
+                    let (g, w) = (kind.widen(got[i]), kind.widen(want[i]));
+                    if w.is_nan() {
+                        assert!(g.is_nan(), "narrow op={op} i={i}: {g} vs NaN");
+                    } else {
+                        assert_eq!(got[i], want[i], "narrow op={op} i={i}: {g} vs {w}");
+                    }
+                }
             }
         }
     }
