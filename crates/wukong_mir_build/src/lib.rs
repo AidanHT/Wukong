@@ -28,10 +28,13 @@
 
 mod alias;
 mod canon;
+mod colacc;
 #[cfg(test)]
 mod coverage_tests;
+mod detile;
 mod dispatch;
 mod elementwise;
+mod softmax_oop;
 mod tile;
 mod tindex;
 mod ucount;
@@ -5157,6 +5160,14 @@ impl FnLowerer<'_> {
             let generic_window =
                 any_generic && dispatch::window_has_generic(&b.stmts[i..], self.interner);
             if self.gemm.recognize && !generic_window {
+                // A hand-tiled GEMM — tile loops (`for i0 in 0..M step T` or the `let mut i0 = 0;
+                // while i0 < M { …; i0 = i0 + T; }` pair) around their point loops — is presented to
+                // the GEMM recognizer as the untiled nest it enumerates, so blocking a matmul no
+                // longer costs the kernel. One statement (a tile `for`) or two (the `while` pair).
+                if let Some(n) = self.try_detiled_gemm(b, i) {
+                    i += n;
+                    continue;
+                }
                 // Epilogue fusion: a `nn.Linear` matmul immediately followed by its bias-add / ReLU loop
                 // folds into one GEMM call with the epilogue applied in the C writeback (no separate pass
                 // over C). Checked before the elementwise fusion below — they match disjoint shapes.
@@ -5187,8 +5198,10 @@ impl FnLowerer<'_> {
                 // log-softmax (6 stmts) is probed before softmax (7 stmts): they share the leading max
                 // pass but diverge at stmt[2] — softmax's is the `exp` rewrite loop, log-softmax's is
                 // `let s = 0` — so the two matchers are disjoint (each declines the other's window).
-                // softmax / log-softmax stay in-place only (`dst == arr`): their exp / shift pass rewrites
-                // the data buffer in place, so an out-of-place final write would be an unsound hybrid.
+                // These two matchers are in-place only (`dst == arr`): a window whose exp / shift pass
+                // rewrites `arr` but whose final pass writes elsewhere would be an unsound hybrid. The
+                // genuinely out-of-place window (`x` kept, every write into `o`) is proved separately
+                // by `try_fuse_out_of_place_norm` below (`softmax_oop.rs`).
                 // `for c in 0..N { out[c] = x[c]; }` + an in-place norm on `out` is the same
                 // computation as the out-of-place `out = norm(x)` the kernel already runs, so the
                 // seeding copy — a recognized `wukong_velem_f32` identity-affine pass over the whole
@@ -5218,6 +5231,14 @@ impl FnLowerer<'_> {
                         continue;
                     }
                 }
+                // Out-of-place softmax / log-softmax (`o = softmax(x)`, `x` preserved) — the spelling
+                // every caller that still needs the logits must write — to the same kernel with
+                // distinct source and destination. Probed after the in-place forms, which it never
+                // matches (it requires a destination other than the max pass's array).
+                if let Some(n) = self.try_fuse_out_of_place_norm(b, i) {
+                    i += n;
+                    continue;
+                }
                 // LayerNorm / RMSNorm / L2-norm accept the out-of-place form `out = norm(x)` (`dst != arr`),
                 // the residual-stream transformer pattern, as well as the in-place form (`dst == arr`).
                 if let Some((n, arr, dst, n_expr, eps, gamma, beta)) =
@@ -5244,6 +5265,14 @@ impl FnLowerer<'_> {
                         i += n;
                         continue;
                     }
+                }
+                // The ROW-outer column reduction — a seed of `out` (`out[j] = 0`, a zero `let`, or
+                // row 0) followed by `for i { for j { out[j] = fold(out[j], x[i*N+j]) } }` — the
+                // cache-friendly spelling of the nest `lower_for`'s `match_colsum` knows only
+                // column-outer. Same kernels, same per-column operation order. See `colacc.rs`.
+                if let Some(n) = self.try_fuse_rowouter_colreduce(b, i) {
+                    i += n;
+                    continue;
                 }
                 // Single-row / flat 1-D scans (inclusive prefix sum / product, first-order linear
                 // recurrence). The batched `for r`-wrapped forms dispatch via the for-statement path; the

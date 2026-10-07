@@ -1,0 +1,117 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 264
+// EXPECT-OUT: 718
+// EXPECT-OUT: 1953
+// EXPECT-OUT: 5309
+// EXPECT-OUT: 97
+// EXPECT-OUT: 35
+// EXPECT-OUT: 435
+// EXPECT-OUT: 1184
+// EXPECT-OUT: 264
+// EXPECT-OUT: 718
+// EXPECT-OUT: 1953
+// EXPECT-OUT: 5309
+// EXPECT-OUT: 97
+// EXPECT-OUT: 35
+// EXPECT-OUT: 435
+// EXPECT-OUT: 1184
+// EXPECT-OUT: -3633
+// EXPECT-OUT: -2633
+// EXPECT-OUT: -1633
+// EXPECT-OUT: -633
+// EXPECT-OUT: -4633
+// EXPECT-OUT: -5633
+// EXPECT-OUT: -3133
+// EXPECT-OUT: -2133
+// EXPECT-OUT: 0
+// EXPECT-OUT: 1000
+// EXPECT-OUT: 2000
+// EXPECT-OUT: 3000
+// EXPECT-OUT: -1000
+// EXPECT-OUT: -2000
+// EXPECT-OUT: 500
+// EXPECT-OUT: 1500
+module tests.run.spelling_softmax_out_of_place
+
+// Out-of-place softmax and log-softmax: the logits `x` are kept and the result goes to another
+// buffer - what every caller that still needs the scores must write - and they used to lower to
+// loops while only the in-place spelling got the fused kernel (P12.9). Both softmax spellings (the
+// exp store and the running sum fused into one loop, or split into two loops with a reciprocal
+// normalize) and the log-softmax now run `wukong_norm_f32(x, o, ..)`.
+//
+// x = [0, 1, 2, 3, -1, -2, 0.5, 1.5]. Expected, from the exact formulas in f64: softmax(x)*10000
+// truncated (every lane >= 0.08 from an integer boundary), log-softmax(x)*1000 truncated (every lane
+// 0.0099 past an integer, ~25x the kernels' error at these magnitudes), and x*1000 itself - the
+// last block proves the source row is left untouched.
+
+fn softmax_fused_into(x: [f32; 8], mut o: [f32; 8]) {
+    let mut m: f32 = x[0];
+    for i in 0..8 {
+        m = fmax(m, x[i]);
+    }
+    let mut s: f32 = 0.0;
+    for i in 0..8 {
+        o[i] = exp(x[i] - m);
+        s = s + o[i];
+    }
+    for i in 0..8 {
+        o[i] = o[i] / s;
+    }
+}
+
+fn softmax_split_into(x: [f32; 8], mut o: [f32; 8]) {
+    let mut m: f32 = x[0];
+    for i in 0..8 {
+        m = fmax(m, x[i]);
+    }
+    for i in 0..8 {
+        o[i] = exp(x[i] - m);
+    }
+    let mut s: f32 = 0.0;
+    for i in 0..8 {
+        s = s + o[i];
+    }
+    let inv: f32 = 1.0 / s;
+    for i in 0..8 {
+        o[i] = o[i] * inv;
+    }
+}
+
+fn log_softmax_into(x: [f32; 8], mut o: [f32; 8]) {
+    let mut m: f32 = x[0];
+    for i in 0..8 {
+        m = fmax(m, x[i]);
+    }
+    let mut s: f32 = 0.0;
+    for i in 0..8 {
+        s = s + exp(x[i] - m);
+    }
+    let ls: f32 = log(s);
+    for i in 0..8 {
+        o[i] = (x[i] - m) - ls;
+    }
+}
+
+fn main() -> i32 {
+    let x: [f32; 8] = [0.0, 1.0, 2.0, 3.0, -1.0, -2.0, 0.5, 1.5];
+    let mut p: [f32; 8] = [0.0; 8];
+    let mut q: [f32; 8] = [0.0; 8];
+    let mut l: [f32; 8] = [0.0; 8];
+    softmax_fused_into(x, p);
+    softmax_split_into(x, q);
+    log_softmax_into(x, l);
+    for i in 0..8 {
+        print((p[i] * 10000.0) as i32);
+    }
+    for i in 0..8 {
+        print((q[i] * 10000.0) as i32);
+    }
+    for i in 0..8 {
+        print((l[i] * 1000.0) as i32);
+    }
+    for i in 0..8 {
+        print((x[i] * 1000.0) as i32);
+    }
+    return 0;
+}

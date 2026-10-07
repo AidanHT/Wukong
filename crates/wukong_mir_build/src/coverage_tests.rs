@@ -13,7 +13,8 @@ use wukong_mir::{CmpOp, Function, Op, Program, ValueId};
 use wukong_span::{Interner, SourceId};
 
 use crate::{
-    lower_program, lower_program_reporting_dispatch, LowerOptions, VMATH_GELU, VMATH_SILU,
+    lower_program, lower_program_reporting_dispatch, LowerOptions, NORM_LOGSOFTMAX, NORM_SOFTMAX,
+    VMATH_GELU, VMATH_SILU,
 };
 
 fn lower_src(src: &str) -> (Program, Vec<Diagnostic>, Interner) {
@@ -317,6 +318,223 @@ fn total(x: [f32; 64], n: usize) -> f32 {
 ";
     let (prog, _, interner) = lower_src(src);
     assert!(!has_sge(func(&prog, &interner, "total")));
+}
+
+// ---- P12.8: row-outer column reductions --------------------------------------------------------
+
+#[test]
+fn row_outer_column_reductions_dispatch_the_column_kernels() {
+    let src = "module m
+fn sum_loop_seed(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 { out[j] = 0.0; }
+    for i in 0..4 { for j in 0..8 { out[j] = out[j] + x[i * 8 + j]; } }
+}
+fn sum_let_seed(x: [f32; 32]) -> f32 {
+    let mut out: [f32; 8] = [0.0; 8];
+    for i in 0..4 { for j in 0..8 { out[j] += x[i * 8 + j]; } }
+    return out[3];
+}
+fn sumsq(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 { out[j] = 0.0; }
+    for i in 0..4 { for j in 0..8 { out[j] += x[i * 8 + j] * x[i * 8 + j]; } }
+}
+fn colmax(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 { out[j] = x[j]; }
+    for i in 1..4 { for j in 0..8 { out[j] = fmax(out[j], x[i * 8 + j]); } }
+}
+fn colmin(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 { out[j] = x[j]; }
+    for i in 0..4 { for j in 0..8 { out[j] = fmin(out[j], x[i * 8 + j]); } }
+}
+fn colabsmax(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 { out[j] = abs(x[j]); }
+    for i in 1..4 { for j in 0..8 { out[j] = fmax(out[j], abs(x[i * 8 + j])); } }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    for (name, kernel) in [
+        ("sum_loop_seed", "wukong_colsum_f32"),
+        ("sum_let_seed", "wukong_colsum_f32"),
+        ("sumsq", "wukong_colsumsq_f32"),
+        ("colmax", "wukong_colmax_f32"),
+        ("colmin", "wukong_colmin_f32"),
+        ("colabsmax", "wukong_colmaxabs_f32"),
+    ] {
+        assert_eq!(
+            kernels(func(&prog, &interner, name), &interner),
+            vec![kernel],
+            "{name}"
+        );
+    }
+}
+
+/// The spellings the kernel would change a bit of: the contracted square (one FMA in the source,
+/// mul-then-add in the kernel), the swapped `fmax` operands (a different zero/NaN), an accumulate
+/// into data no seed initialized, and a zero seed under a fold that skips row 0.
+#[test]
+fn row_outer_spellings_the_kernel_does_not_compute_decline() {
+    let src = "module m
+fn contracted_sq(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 { out[j] = 0.0; }
+    for i in 0..4 { for j in 0..8 { out[j] = out[j] + x[i * 8 + j] * x[i * 8 + j]; } }
+}
+fn swapped_max(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 { out[j] = x[j]; }
+    for i in 1..4 { for j in 0..8 { out[j] = fmax(x[i * 8 + j], out[j]); } }
+}
+fn no_seed(x: [f32; 32], mut out: [f32; 8]) {
+    for i in 0..4 { for j in 0..8 { out[j] = out[j] + x[i * 8 + j]; } }
+}
+fn skips_row0(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 { out[j] = 0.0; }
+    for i in 1..4 { for j in 0..8 { out[j] = out[j] + x[i * 8 + j]; } }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    for name in ["contracted_sq", "swapped_max", "no_seed", "skips_row0"] {
+        let ks = kernels(func(&prog, &interner, name), &interner);
+        assert!(
+            !ks.iter().any(|k| k.starts_with("wukong_col")),
+            "{name} must not dispatch a column kernel, got {ks:?}"
+        );
+    }
+}
+
+// ---- P12.9: out-of-place softmax / log-softmax -------------------------------------------------
+
+#[test]
+fn out_of_place_softmax_and_log_softmax_dispatch_the_fused_norm() {
+    let src = "module m
+fn softmax_fused(x: [f32; 64], mut o: [f32; 64]) {
+    let mut m: f32 = x[0];
+    for i in 0..64 { m = fmax(m, x[i]); }
+    let mut s: f32 = 0.0;
+    for i in 0..64 { o[i] = exp(x[i] - m); s = s + o[i]; }
+    for i in 0..64 { o[i] = o[i] / s; }
+}
+fn softmax_split(x: [f32; 64], mut o: [f32; 64]) {
+    let mut m: f32 = x[0];
+    for i in 0..64 { m = fmax(m, x[i]); }
+    for i in 0..64 { o[i] = exp(x[i] - m); }
+    let mut s: f32 = 0.0;
+    for i in 0..64 { s = s + o[i]; }
+    let inv: f32 = 1.0 / s;
+    for i in 0..64 { o[i] = o[i] * inv; }
+}
+fn log_softmax(x: [f32; 64], mut o: [f32; 64]) {
+    let mut m: f32 = x[0];
+    for i in 0..64 { m = fmax(m, x[i]); }
+    let mut s: f32 = 0.0;
+    for i in 0..64 { s = s + exp(x[i] - m); }
+    let ls: f32 = log(s);
+    for i in 0..64 { o[i] = (x[i] - m) - ls; }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    for (name, op) in [
+        ("softmax_fused", NORM_SOFTMAX),
+        ("softmax_split", NORM_SOFTMAX),
+        ("log_softmax", NORM_LOGSOFTMAX),
+    ] {
+        let f = func(&prog, &interner, name);
+        assert_eq!(kernels(f, &interner), vec!["wukong_norm_f32"], "{name}");
+        let calls = call_args(f, &interner, "wukong_norm_f32");
+        let args = &calls[0];
+        // `wukong_norm_f32(x, out, rows, cols, eps, op)`: source and destination are distinct.
+        assert_ne!(
+            args[0], args[1],
+            "{name}: the kernel must read x and write o"
+        );
+        assert_eq!(const_int(f, args[5]), Some(op as i128), "{name}");
+    }
+}
+
+/// `s = s + x[i]` after the exp store sums the RAW input, not the exponentials: not a softmax.
+#[test]
+fn an_out_of_place_window_reading_raw_x_after_the_store_declines() {
+    let src = "module m
+fn not_softmax(x: [f32; 64], mut o: [f32; 64]) {
+    let mut m: f32 = x[0];
+    for i in 0..64 { m = fmax(m, x[i]); }
+    let mut s: f32 = 0.0;
+    for i in 0..64 { o[i] = exp(x[i] - m); s = s + x[i]; }
+    for i in 0..64 { o[i] = o[i] / s; }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    assert!(!kernels(func(&prog, &interner, "not_softmax"), &interner)
+        .contains(&"wukong_norm_f32".to_string()));
+}
+
+// ---- P12.1: hand-tiled GEMM --------------------------------------------------------------------
+
+#[test]
+fn a_hand_tiled_gemm_dispatches_the_gemm_kernel() {
+    let src = "module m
+fn tiled_for(a: [f32; 1024], b: [f32; 1024], mut c: [f32; 1024]) {
+    for i0 in 0..32 step 16 {
+        for j0 in 0..32 step 16 {
+            for i in i0..i0 + 16 {
+                for j in j0..j0 + 16 {
+                    let mut s: f32 = 0.0;
+                    for k in 0..32 { s = s + a[i * 32 + k] * b[k * 32 + j]; }
+                    c[i * 32 + j] = s;
+                }
+            }
+        }
+    }
+}
+fn tiled_while(a: [f32; 1024], b: [f32; 1024], mut c: [f32; 1024]) {
+    let mut i0: i64 = 0;
+    while i0 < 32 {
+        let mut j0: i64 = 0;
+        while j0 < 32 {
+            for i in i0..(i0 + 16) {
+                for j in j0..(j0 + 16) {
+                    let mut s: f32 = 0.0;
+                    for k in 0..32 { s = s + a[i * 32 + k] * b[k * 32 + j]; }
+                    c[i * 32 + j] = s;
+                }
+            }
+            j0 = j0 + 16;
+        }
+        i0 = i0 + 16;
+    }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    for name in ["tiled_for", "tiled_while"] {
+        assert_eq!(
+            kernels(func(&prog, &interner, name), &interner),
+            vec!["wukong_sgemm"],
+            "{name}"
+        );
+    }
+}
+
+/// Tiles that do not exactly cover the extent visit a different iteration set (`0..30 step 16`
+/// with `i in i0..i0+16` runs `i` up to 31); the nest must stay as written.
+#[test]
+fn tiles_that_do_not_cover_the_extent_exactly_decline() {
+    let src = "module m
+fn ragged(a: [f32; 1024], b: [f32; 1024], mut c: [f32; 1024]) {
+    for i0 in 0..30 step 16 {
+        for i in i0..i0 + 16 {
+            for j in 0..32 {
+                let mut s: f32 = 0.0;
+                for k in 0..32 { s = s + a[i * 32 + k] * b[k * 32 + j]; }
+                c[i * 32 + j] = s;
+            }
+        }
+    }
+}
+";
+    let (prog, _, interner) = lower_src(src);
+    let ks = kernels(func(&prog, &interner, "ragged"), &interner);
+    assert!(
+        !ks.iter().any(|k| k.starts_with("wukong_sgemm")),
+        "a ragged tiling must not become a GEMM, got {ks:?}"
+    );
 }
 
 // ---- P12.14: per-loop `@generic` and the dispatch report ---------------------------------------

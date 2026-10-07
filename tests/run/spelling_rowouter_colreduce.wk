@@ -1,0 +1,167 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 12
+// EXPECT-OUT: 16
+// EXPECT-OUT: 20
+// EXPECT-OUT: 24
+// EXPECT-OUT: -4
+// EXPECT-OUT: 0
+// EXPECT-OUT: 4
+// EXPECT-OUT: 8
+// EXPECT-OUT: 12
+// EXPECT-OUT: 16
+// EXPECT-OUT: 20
+// EXPECT-OUT: 24
+// EXPECT-OUT: 324
+// EXPECT-OUT: 320
+// EXPECT-OUT: 324
+// EXPECT-OUT: 336
+// EXPECT-OUT: 356
+// EXPECT-OUT: 384
+// EXPECT-OUT: 420
+// EXPECT-OUT: 464
+// EXPECT-OUT: 11
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+// EXPECT-OUT: -13
+// EXPECT-OUT: -12
+// EXPECT-OUT: -11
+// EXPECT-OUT: -10
+// EXPECT-OUT: -9
+// EXPECT-OUT: -8
+// EXPECT-OUT: -7
+// EXPECT-OUT: -6
+// EXPECT-OUT: 13
+// EXPECT-OUT: 12
+// EXPECT-OUT: 13
+// EXPECT-OUT: 14
+// EXPECT-OUT: 15
+// EXPECT-OUT: 16
+// EXPECT-OUT: 17
+// EXPECT-OUT: 18
+module tests.run.spelling_rowouter_colreduce
+
+// The ROW-outer spelling of the column reductions - seed `out`, then stream `x` row-major and fold
+// into `out[j]` - which is the cache-friendly form a C peer writes for a bias gradient, and which
+// used to dispatch nothing while the strided column-outer form got the kernel (P12.8). Every column
+// performs the same seed-then-ascending-row operations in both spellings, so the same `wukong_col*`
+// kernel computes it.
+//
+// x is a [4, 8] matrix with x[r, c] = 8*r + c - 13, so column c holds c-13, c-5, c+3, c+11.
+// Expected (exact small integers): sum = 4c - 4 (two spellings of the seed and the fold);
+// sumsq = (c-13)^2 + (c-5)^2 + (c+3)^2 + (c+11)^2; max = c + 11; min = c - 13;
+// absmax = max(13 - c, c + 11).
+
+fn colsum_loop_seed(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 {
+        out[j] = 0.0;
+    }
+    for i in 0..4 {
+        for j in 0..8 {
+            out[j] = out[j] + x[i * 8 + j];
+        }
+    }
+}
+
+fn colsum_let_seed(x: [f32; 32], mut res: [f32; 8]) {
+    let mut out: [f32; 8] = [0.0; 8];
+    for i in 0..4 {
+        for j in 0..8 {
+            out[j] += x[i * 8 + j];
+        }
+    }
+    for j in 0..8 {
+        res[j] = out[j];
+    }
+}
+
+fn colsumsq(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 {
+        out[j] = 0.0;
+    }
+    for i in 0..4 {
+        for j in 0..8 {
+            out[j] += x[i * 8 + j] * x[i * 8 + j];
+        }
+    }
+}
+
+fn colmax(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 {
+        out[j] = x[j];
+    }
+    for i in 1..4 {
+        for j in 0..8 {
+            out[j] = fmax(out[j], x[i * 8 + j]);
+        }
+    }
+}
+
+fn colmin(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 {
+        out[j] = x[j];
+    }
+    for i in 0..4 {
+        for j in 0..8 {
+            out[j] = fmin(out[j], x[i * 8 + j]);
+        }
+    }
+}
+
+fn colabsmax(x: [f32; 32], mut out: [f32; 8]) {
+    for j in 0..8 {
+        out[j] = abs(x[j]);
+    }
+    for i in 1..4 {
+        for j in 0..8 {
+            out[j] = fmax(out[j], abs(x[i * 8 + j]));
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut x: [f32; 32] = [0.0; 32];
+    for i in 0..32 {
+        x[i] = (i as f32) - 13.0;
+    }
+    let mut s1: [f32; 8] = [0.0; 8];
+    let mut s2: [f32; 8] = [0.0; 8];
+    let mut sq: [f32; 8] = [0.0; 8];
+    let mut mx: [f32; 8] = [0.0; 8];
+    let mut mn: [f32; 8] = [0.0; 8];
+    let mut am: [f32; 8] = [0.0; 8];
+    colsum_loop_seed(x, s1);
+    colsum_let_seed(x, s2);
+    colsumsq(x, sq);
+    colmax(x, mx);
+    colmin(x, mn);
+    colabsmax(x, am);
+    for j in 0..8 {
+        print(s1[j] as i32);
+    }
+    for j in 0..8 {
+        print(s2[j] as i32);
+    }
+    for j in 0..8 {
+        print(sq[j] as i32);
+    }
+    for j in 0..8 {
+        print(mx[j] as i32);
+    }
+    for j in 0..8 {
+        print(mn[j] as i32);
+    }
+    for j in 0..8 {
+        print(am[j] as i32);
+    }
+    return 0;
+}

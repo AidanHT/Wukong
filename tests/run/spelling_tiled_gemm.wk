@@ -1,0 +1,136 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: 14
+// EXPECT-OUT: 8
+// EXPECT-OUT: 2
+// EXPECT-OUT: -4
+// EXPECT-OUT: 20
+// EXPECT-OUT: 10
+// EXPECT-OUT: 0
+// EXPECT-OUT: -10
+// EXPECT-OUT: 26
+// EXPECT-OUT: 12
+// EXPECT-OUT: -2
+// EXPECT-OUT: -16
+// EXPECT-OUT: 32
+// EXPECT-OUT: 14
+// EXPECT-OUT: -4
+// EXPECT-OUT: -22
+// EXPECT-OUT: 14
+// EXPECT-OUT: 8
+// EXPECT-OUT: 2
+// EXPECT-OUT: -4
+// EXPECT-OUT: 20
+// EXPECT-OUT: 10
+// EXPECT-OUT: 0
+// EXPECT-OUT: -10
+// EXPECT-OUT: 26
+// EXPECT-OUT: 12
+// EXPECT-OUT: -2
+// EXPECT-OUT: -16
+// EXPECT-OUT: 32
+// EXPECT-OUT: 14
+// EXPECT-OUT: -4
+// EXPECT-OUT: -22
+// EXPECT-OUT: 14
+// EXPECT-OUT: 8
+// EXPECT-OUT: 2
+// EXPECT-OUT: -4
+// EXPECT-OUT: 20
+// EXPECT-OUT: 10
+// EXPECT-OUT: 0
+// EXPECT-OUT: -10
+// EXPECT-OUT: 26
+// EXPECT-OUT: 12
+// EXPECT-OUT: -2
+// EXPECT-OUT: -16
+// EXPECT-OUT: 32
+// EXPECT-OUT: 14
+// EXPECT-OUT: -4
+// EXPECT-OUT: -22
+module tests.run.spelling_tiled_gemm
+
+// Hand-tiling a matmul - the spelling a performance-minded author writes - used to dispatch no
+// GEMM at all (the tiled nest fell to a fully scalar loop while the naive nest got the kernel), so
+// writing the better loop made the program slower (P12.1). Three tilings, each now the untiled nest
+// it enumerates, and the `wukong_sgemm` kernel: `for … step` tiles over i and j; the same with
+// `while` tile counters; and a tiled contraction (`k0` tiles around `c[i,j] += a*b`, accumulating
+// into a zeroed C).
+//
+// A[i, k] = i + k, B[k, j] = k - j over 4x4, so C[i, j] = sum_k (i + k)(k - j) - small integers,
+// exact under any summation order. Every lane of all three results is printed.
+
+fn mm_step(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
+    for i0 in 0..4 step 2 {
+        for j0 in 0..4 step 2 {
+            for i in i0..i0 + 2 {
+                for j in j0..j0 + 2 {
+                    let mut s: f32 = 0.0;
+                    for k in 0..4 {
+                        s = s + a[i * 4 + k] * b[k * 4 + j];
+                    }
+                    c[i * 4 + j] = s;
+                }
+            }
+        }
+    }
+}
+
+fn mm_while(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
+    let mut i0: i64 = 0;
+    while i0 < 4 {
+        let mut j0: i64 = 0;
+        while j0 < 4 {
+            for i in i0..(i0 + 2) {
+                for j in j0..(j0 + 2) {
+                    let mut s: f32 = 0.0;
+                    for k in 0..4 {
+                        s = s + a[i * 4 + k] * b[k * 4 + j];
+                    }
+                    c[i * 4 + j] = s;
+                }
+            }
+            j0 = j0 + 2;
+        }
+        i0 = i0 + 2;
+    }
+}
+
+fn mm_ktiled(a: [f32; 16], b: [f32; 16], mut c: [f32; 16]) {
+    for k0 in 0..4 step 2 {
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in k0..k0 + 2 {
+                    c[i * 4 + j] += a[i * 4 + k] * b[k * 4 + j];
+                }
+            }
+        }
+    }
+}
+
+fn main() -> i32 {
+    let mut a: [f32; 16] = [0.0; 16];
+    let mut b: [f32; 16] = [0.0; 16];
+    for r in 0..4 {
+        for q in 0..4 {
+            a[r * 4 + q] = (r + q) as f32;
+            b[r * 4 + q] = (r - q) as f32;
+        }
+    }
+    let mut c1: [f32; 16] = [0.0; 16];
+    let mut c2: [f32; 16] = [0.0; 16];
+    let mut c3: [f32; 16] = [0.0; 16];
+    mm_step(a, b, c1);
+    mm_while(a, b, c2);
+    mm_ktiled(a, b, c3);
+    for i in 0..16 {
+        print(c1[i] as i32);
+    }
+    for i in 0..16 {
+        print(c2[i] as i32);
+    }
+    for i in 0..16 {
+        print(c3[i] as i32);
+    }
+    return 0;
+}
