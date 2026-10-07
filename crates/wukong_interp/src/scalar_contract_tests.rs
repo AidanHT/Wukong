@@ -258,11 +258,17 @@ fn float_to_int_saturates() {
     assert_eq!(si(-5.0, &MirType::I8), -5);
     assert_eq!(si(f64::NAN, &MirType::I64), 0);
 
-    // Unsigned: negatives and NaN saturate to 0, large magnitudes to the max.
+    // Unsigned: negatives and NaN saturate to 0, large magnitudes to the max. The interpreter keeps
+    // every integer sign-extended at its width (`apply_cast` ends in `mask`), so the saturated u8
+    // max 0xFF is *stored* as -1; its unsigned reading through `uval` is 255.
     assert_eq!(ui(-1.0, &MirType::I32), 0);
     assert_eq!(ui(f64::NAN, &MirType::I32), 0);
-    assert_eq!(ui(1e30, &MirType::I8), 255);
-    assert_eq!(ui(300.0, &MirType::I8), 255);
+    assert_eq!(ui(1e30, &MirType::I8), -1);
+    assert_eq!(uval(ui(1e30, &MirType::I8), 8), 255);
+    assert_eq!(ui(300.0, &MirType::I8), -1);
+    assert_eq!(uval(ui(300.0, &MirType::I8), 8), 255);
+    assert_eq!(ui(200.0, &MirType::I8), -56);
+    assert_eq!(uval(ui(200.0, &MirType::I8), 8), 200);
     assert_eq!(ui(-1.0, &MirType::I64), 0);
 }
 
