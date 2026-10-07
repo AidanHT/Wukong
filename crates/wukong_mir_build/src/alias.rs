@@ -205,9 +205,10 @@
 //! no COMPILE-TIME disjointness for any pair of different operand names. What that costs is now an
 //! overlap test, not the kernel: every such pair is `MayAlias`, and a recognizer under a versioning
 //! context (`kernel_guard.rs`) dispatches whenever the buffers are disjoint at run time, which is
-//! every call that does not actually alias. (A recognizer with no context — a whole-function
-//! interception, a fused-normalization window — still declines, as all of them did before
-//! versioning existed.) The one bit is deliberate. A pair-precise fact would have to
+//! every call that does not actually alias. (A recognizer with no context — a probe, an outlined
+//! `@parallel` chunk — still declines, as all of them did before versioning existed; the per-loop
+//! cascade, the elementwise kernel probes and the statement windows all have one.) The one bit is
+//! deliberate. A pair-precise fact would have to
 //! survive the trip into an outlined `@parallel` body (whose recognizers see `env` captures, not
 //! parameters) and into the recognizer probes (which build a `FnLowerer` with no parameter bindings
 //! at all), and each of those seams is a place to get it silently wrong. One bit that rides on

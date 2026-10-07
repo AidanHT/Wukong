@@ -38,14 +38,16 @@
 //!
 //! **The protocol.** An emitter computes its base pointers and extents (pure MIR), then calls
 //! [`FnLowerer::open_kernel_guard`] immediately before its kernel call(s) and after every decline
-//! it can still take. Under a versioning context ([`FnLowerer::emit_alias_versioned`], or
-//! `emit_nonempty_reduction`, which wraps one) a `MayAlias` plan opens the guard and leaves the
-//! builder in the kernel arm with the fallback pending; with no context — a whole-function
-//! interception, a probe, a window this module has not been threaded through — a `MayAlias` plan
-//! declines exactly as every emitter did before, so no caller is ever handed a half-built branch it
-//! does not know how to finish.
+//! it can still take. Under a versioning context ([`FnLowerer::emit_alias_versioned`] — reached
+//! through `emit_versioned_loop` for the per-loop cascade and the elementwise kernel probes of
+//! `try_vectorize_for`, `emit_versioned_stmts` for the statement windows, and
+//! `emit_nonempty_reduction` for the reductions) a `MayAlias` plan opens the guard and leaves the
+//! builder in the kernel arm with the fallback pending; with no context — a probe, an outlined
+//! `@parallel` chunk (whose body starts with `KernelGuard::Off`) — a `MayAlias` plan declines exactly
+//! as every emitter did before, so no caller is ever handed a half-built branch it does not know how
+//! to finish.
 
-use wukong_ast::{Block, ForIter, Pattern};
+use wukong_ast::{Block, ForIter, Pattern, Stmt, StmtKind};
 use wukong_mir::{BinOp, BlockId, CastKind, CmpOp, MirType, Op, ValueId};
 use wukong_span::Symbol;
 
@@ -264,6 +266,37 @@ impl FnLowerer<'_> {
         self.open_kernel_guard(&ops, &pairs)
     }
 
+    /// The guard of an ELEMENTWISE dispatch (`vmath`, `vmath2`, `velem`, `vhorner`, the int dequant,
+    /// the half-input axpby): `ops` are every operand of every kernel call the dispatch emits — each
+    /// already offset to the loop start, with the trip count as its extent in its own element — and
+    /// `outs` the indices of the outputs among them.
+    ///
+    /// Each output may be EXACTLY any operand of its own element type: that is the in-place map, which
+    /// an 8-lane body computes exactly as the source loop does. It must otherwise be disjoint from
+    /// every operand of every call. A SHIFTED overlap makes the vector body read lanes the source
+    /// loop has already overwritten; and where a multi-statement body becomes one full-range pass per
+    /// statement, a later pass would read (or overwrite) what an earlier pass wrote ahead of the
+    /// loop's own interleaved order. A mixed-width pair is always `Disjoint`: "exactly in place" is not
+    /// something two element sizes can share, and the two backends measure such a pair's ranges in
+    /// different units. Pairs between two inputs are nobody's business.
+    pub(super) fn open_elementwise_guard(&mut self, ops: &[GuardOperand], outs: &[usize]) -> bool {
+        let mut pairs = Vec::new();
+        for &o in outs {
+            for (p, op) in ops.iter().enumerate() {
+                // An output-output pair is listed once, while the earlier output is `o`.
+                if p == o || (p < o && outs.contains(&p)) {
+                    continue;
+                }
+                pairs.push(if op.elem == ops[o].elem {
+                    OperandPair::exact_in_place(p, o)
+                } else {
+                    OperandPair::disjoint(p, o)
+                });
+            }
+        }
+        self.open_kernel_guard(ops, &pairs)
+    }
+
     /// The guard of a normalization backward (`wukong_{rms,layer}norm_bwd_f32`): `x`, `dy` and the
     /// output `dx` are f32 `rows * cols`, `gamma` is f32 `cols`. `dx` must be disjoint from `x` and
     /// `gamma`; over `dy` it may be EXACTLY in place when `dy_in_place` (RMSNorm) and must be
@@ -336,12 +369,66 @@ impl FnLowerer<'_> {
         (label, pat, iter, body): (Option<Symbol>, &Pattern, &ForIter, &Block),
         emit: impl FnOnce(&mut Self) -> bool,
     ) -> bool {
+        if !self.loop_bounds_reevaluable(iter) {
+            return emit(self);
+        }
         self.emit_alias_versioned(emit, |me| me.lower_for(label, pat, iter, body, &[]))
     }
 
-    /// Run `emit` (ONE recognizer emitter, which must not itself lower statements) under a
-    /// versioning context, and finish whatever guard it opened by lowering `lower_source` — the
-    /// loop or window the emitter replaces — on the may-overlap arm.
+    /// May this loop's range bounds be evaluated a SECOND time? The kernel arm's setup evaluates
+    /// them once (the extent), before the guard; the may-overlap arm then lowers the whole loop,
+    /// bounds included. For a pure bound that is only a recomputation, but a bound with an effect
+    /// (`0..next_len()` where `next_len` prints) would run twice on that arm. Such a loop gets no
+    /// versioning context — `emit` runs as before versioning existed, and a `MayAlias` pair declines.
+    fn loop_bounds_reevaluable(&self, iter: &ForIter) -> bool {
+        match iter {
+            ForIter::Range {
+                start, end, step, ..
+            } => {
+                self.coeff_is_hoistable(start)
+                    && [end, step].into_iter().all(|bound| match bound {
+                        Some(e) => self.coeff_is_hoistable(e),
+                        None => true,
+                    })
+            }
+            ForIter::Expr(e) => self.coeff_is_hoistable(e),
+        }
+    }
+
+    /// [`Self::emit_alias_versioned`] for a statement-WINDOW recognizer (a fused norm, a flat 1-D
+    /// scan, a copy-then-norm pair): the source is the run of statements the kernel call replaces.
+    /// Every window matcher has already proved that the window's own `let` bindings are unmentioned
+    /// after it, so lowering them on the may-overlap arm only leaves dead slots behind the join —
+    /// the same shape `emit_nonempty_reduction_stmts` lowers on its empty-extent arm.
+    pub(super) fn emit_versioned_stmts(
+        &mut self,
+        source: &[Stmt],
+        emit: impl FnOnce(&mut Self) -> bool,
+    ) -> bool {
+        // The window's loops re-evaluate their bounds on the may-overlap arm (see
+        // `loop_bounds_reevaluable`), and the kernel's extent was taken from one of them.
+        let reevaluable = source.iter().all(|stmt| match &stmt.kind {
+            StmtKind::For { iter, .. } => self.loop_bounds_reevaluable(iter),
+            _ => true,
+        });
+        if !reevaluable {
+            return emit(self);
+        }
+        self.emit_alias_versioned(emit, |me| {
+            for stmt in source {
+                if me.terminated {
+                    break;
+                }
+                me.lower_stmt(stmt);
+            }
+        })
+    }
+
+    /// Run `emit` (ONE recognizer emitter for ONE loop or window) under a versioning context, and
+    /// finish whatever guard it opened by lowering `lower_source` — the loop or window the emitter
+    /// replaces — on the may-overlap arm. `emit` may lower straight-line statements (the generic
+    /// vectorizer's scalar tail inside `try_vectorize_for`), but never a nested loop or window: a
+    /// guard opened there would be finished with THIS source.
     ///
     /// The fallback lowers with recognition AND `@parallel` off: it is the path taken precisely
     /// when the operands may overlap, so it must be the source loop in source order. A kernel there
