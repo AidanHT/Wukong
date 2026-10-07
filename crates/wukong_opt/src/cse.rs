@@ -45,10 +45,19 @@
 //! from an already-numbered predecessor compares by value number; one not yet numbered compares by
 //! identity, which is always sound.
 //!
+//! # Calls
+//!
+//! A call to a user function summarized as side-effect free (the `effects` module) writes nothing,
+//! so it leaves the memory table alone. If it also reads nothing, it is value-numbered like any
+//! pure instruction, keyed by callee and arguments. If it reads memory, its result is forwarded like
+//! a load: keyed in the memory table, valid until a store that is not to a private stack slot or an
+//! opaque call might change what the callee reads. Every other call forgets all but private slots.
+//!
 //! Forwarding loads to a common value lets the pure value-numbering then collapse the expressions
 //! built on top of them. DCE deletes the dead remains, and simplify-phis the parameters made dead.
 
 use crate::alias::{type_bytes, AliasInfo};
+use crate::effects::CallEffects;
 use crate::fxhash::FxHashMap;
 
 use wukong_mir::{BinOp, CmpOp, Function, MirType, Op, Terminator, ValueId};
@@ -87,8 +96,9 @@ impl Pass for Cse {
             cfg::prune_unreachable(f);
             cache.invalidate(); // pruning renumbered blocks
         }
-        // Taken before the dominator borrows below: an `Rc`, so it borrows nothing.
+        // Taken before the dominator borrows below: `Rc`s, so they borrow nothing.
         let alias = cache.alias(f);
+        let effects = cache.call_effects();
         let (children, preds, idom) = cache.gvn_inputs(f);
 
         let n = f.blocks.len();
@@ -107,6 +117,9 @@ impl Pass for Cse {
             preds,
             idom,
             alias: &alias,
+            effects: effects.as_deref(),
+            arg_lists: FxHashMap::default(),
+            scratch: Vec::new(),
             vn: FxHashMap::default(),
             pre: FxHashMap::default(),
             rewrite: vec![NO_REWRITE; f.value_types.len()],
@@ -194,6 +207,11 @@ struct Numbering<'a> {
     idom: &'a [u32],
     /// Provenance facts for `f`. Decides which memory-table entries a store or a call has to forget.
     alias: &'a AliasInfo,
+    /// Summaries of the side-effect-free callees, when the pass manager supplied them.
+    effects: Option<&'a CallEffects>,
+    /// Interned argument lists (operands mapped through rewrites), so call keys stay `Copy`.
+    arg_lists: FxHashMap<Vec<u32>, u32>,
+    scratch: Vec<u32>,
     /// pure-op key -> canonical value id, scoped to the current dominator-tree path.
     vn: FxHashMap<Key, u32>,
     /// pure-op key -> pending phi of a join on the current path that every arm computed it before.
@@ -319,16 +337,17 @@ impl TyIds {
     }
 }
 
-/// One tracked memory location: an SSA address value plus the type read/written there. The type is
-/// part of the key because a `store f32` and a `load i32` at one address are not the same value —
-/// keying on the address alone would forward the raw bits of one as the other. `bytes` is the
-/// access width that type implies (a function of `ty`, so it adds no distinction), kept here so an
-/// invalidating store can ask the alias analysis without recovering the `MirType`.
+/// One fact in the memory table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct MemKey {
-    addr: u32,
-    ty: TyId,
-    bytes: u32,
+enum MemKey {
+    /// A location: an SSA address value plus the type read/written there. The type is part of the
+    /// key because a `store f32` and a `load i32` at one address are not the same value — keying on
+    /// the address alone would forward the raw bits of one as the other. `bytes` is the access width
+    /// that type implies (a function of `ty`, so it adds no distinction), kept here so an
+    /// invalidating store can ask the alias analysis without recovering the `MirType`.
+    Loc { addr: u32, ty: TyId, bytes: u32 },
+    /// The result of a call to a read-only callee with these interned arguments.
+    Call { func: u32, args: u32 },
 }
 
 /// May a load or store of `ty` participate in forwarding at all?
@@ -372,6 +391,9 @@ enum Key {
     Fma(u32, u32, u32),
     Sqrt(u32),
     Round(u8, u32),
+    /// A call to a callee that reads nothing the caller can see, by symbol and interned arguments:
+    /// its result is a function of the argument values alone.
+    PureCall(u32, u32),
 }
 
 /// Is a value computed on every arm of a join worth a phi there? Not constants or named addresses,
@@ -483,10 +505,64 @@ impl Numbering<'_> {
     }
 
     fn mem_key(&mut self, addr: u32, ty: &MirType) -> MemKey {
-        MemKey {
+        MemKey::Loc {
             addr,
             ty: self.types.id(ty),
             bytes: type_bytes(ty).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Intern a call's argument list, mapped through the rewrites so equal calls compare equal.
+    fn arg_list(&mut self, args: &[ValueId]) -> u32 {
+        self.scratch.clear();
+        for &a in args {
+            let r = resolve(&self.rewrite, a.0);
+            self.scratch.push(r);
+        }
+        if let Some(&id) = self.arg_lists.get(self.scratch.as_slice()) {
+            return id;
+        }
+        let id = self.arg_lists.len() as u32;
+        self.arg_lists.insert(self.scratch.clone(), id);
+        id
+    }
+
+    /// Value-number `res` under a pure `key`: reuse a dominating equal value, else a phi of the
+    /// equal values every arm of an enclosing join computed, else make `res` the canonical value.
+    fn number(&mut self, res: ValueId, res_ty: &MirType, key: Key, added: &mut Vec<Key>) {
+        if let Some(&canon) = self.vn.get(&key) {
+            self.set_rewrite(res, canon);
+            return;
+        }
+        match self.pre.get(&key).copied() {
+            Some(k) if self.pending[k as usize].ty == *res_ty => {
+                let phi = self.materialize(k);
+                self.set_rewrite(res, phi);
+            }
+            _ => {
+                self.vn.insert(key, res.0);
+                added.push(key);
+            }
+        }
+    }
+
+    /// Look `key` up in the memory table on behalf of the read `res` of type `ty`: forward a known
+    /// value, or record `res` as the new one.
+    fn forward(&mut self, mem: &mut MemTable, key: MemKey, res: ValueId, ty: &MirType) {
+        match mem.get(&key).copied() {
+            Some(a) => match self.avail_value(a, ty) {
+                Some(v) => {
+                    self.set_rewrite(res, v);
+                    mem.insert(key, Avail::Value(v));
+                }
+                None => {
+                    mem.insert(key, Avail::Value(res.0));
+                }
+            },
+            None if mem.len() < MAX_TRACKED_LOCATIONS => {
+                mem.insert(key, Avail::Value(res.0));
+            }
+            None => {}
         }
     }
 
@@ -742,63 +818,63 @@ impl Numbering<'_> {
                         continue;
                     }
                     let key = self.mem_key(p, ty);
-                    match mem.get(&key).copied() {
-                        Some(a) => match self.avail_value(a, ty) {
-                            Some(v) => {
-                                self.set_rewrite(res, v);
-                                mem.insert(key, Avail::Value(v));
-                            }
-                            None => {
-                                mem.insert(key, Avail::Value(res.0));
-                            }
-                        },
-                        None if mem.len() < MAX_TRACKED_LOCATIONS => {
-                            mem.insert(key, Avail::Value(res.0));
-                        }
-                        None => {}
-                    }
+                    self.forward(&mut mem, key, res, ty);
                 }
                 Op::Store { ptr, value } => {
                     let p = self.resolve(*ptr);
                     let v = self.resolve(*value);
                     let sty = f.value_type(*value);
                     let sbytes = AliasInfo::access_bytes(f, &inst.op).unwrap_or(u32::MAX);
-                    // Forget exactly the locations this store may have written.
+                    // Forget exactly the locations this store may have written, and every read-only
+                    // call's result unless no callee can reach the stored-to slot.
                     let alias = self.alias;
-                    mem.retain(|k, _| {
-                        !alias.may_alias_sized(ValueId(k.addr), k.bytes, ValueId(p), sbytes)
+                    let private = alias.is_private_stack(ValueId(p));
+                    mem.retain(|k, _| match *k {
+                        MemKey::Loc { addr, bytes, .. } => {
+                            !alias.may_alias_sized(ValueId(addr), bytes, ValueId(p), sbytes)
+                        }
+                        MemKey::Call { .. } => private,
                     });
                     if forwardable(sty) && mem.len() < MAX_TRACKED_LOCATIONS {
                         let key = self.mem_key(p, sty);
                         mem.insert(key, Avail::Value(v));
                     }
                 }
+                Op::Call { func, args } if self.effects.and_then(|e| e.get(*func)).is_some() => {
+                    // Writes nothing: the memory table survives.
+                    let reads = self
+                        .effects
+                        .and_then(|e| e.get(*func))
+                        .is_some_and(|e| e.reads_memory);
+                    let Some(res) = inst.result else { continue };
+                    let list = self.arg_list(args);
+                    let res_ty = f.value_type(res);
+                    if reads {
+                        let key = MemKey::Call {
+                            func: func.0,
+                            args: list,
+                        };
+                        self.forward(&mut mem, key, res, res_ty);
+                    } else {
+                        self.number(res, res_ty, Key::PureCall(func.0, list), added);
+                    }
+                }
                 Op::Call { .. } | Op::VecKernelCall { .. } => {
                     // A call (or vector kernel) may store through any pointer it was given, or any
                     // pointer reachable from one — but never into a stack slot of *this* function
-                    // whose address never escaped.
+                    // whose address never escaped. What a read-only callee would read may change.
                     let alias = self.alias;
-                    mem.retain(|k, _| alias.is_private_stack(ValueId(k.addr)));
+                    mem.retain(|k, _| match *k {
+                        MemKey::Loc { addr, .. } => alias.is_private_stack(ValueId(addr)),
+                        MemKey::Call { .. } => false,
+                    });
                 }
                 _ => {
                     let Some(res) = inst.result else { continue };
                     let Some(key) = self.pure_key(&inst.op, f.value_type(res)) else {
                         continue;
                     };
-                    if let Some(&canon) = self.vn.get(&key) {
-                        self.set_rewrite(res, canon);
-                        continue;
-                    }
-                    match self.pre.get(&key).copied() {
-                        Some(k) if self.pending[k as usize].ty == *f.value_type(res) => {
-                            let phi = self.materialize(k);
-                            self.set_rewrite(res, phi);
-                        }
-                        _ => {
-                            self.vn.insert(key, res.0);
-                            added.push(key);
-                        }
-                    }
+                    self.number(res, f.value_type(res), key, added);
                 }
             }
         }
@@ -1515,5 +1591,81 @@ mod tests {
             wukong_mir::print::print_function(f, &it)
         );
         assert_eq!(wukong_interp::run(&optimized, main, &it).unwrap(), 79);
+    }
+
+    // ---- calls to side-effect-free callees ----
+
+    /// `peek(p) = *p + 1` reads memory but writes none. Two calls with no write in between are one
+    /// call; a store to the (escaped) slot they read forces the third to run again.
+    #[test]
+    fn a_read_only_call_is_forwarded_until_a_store_may_change_what_it_reads() {
+        let mut it = Interner::new();
+        let peek = it.intern("peek");
+        let mut b = Builder::new(peek, MirType::I64);
+        let p = b.add_param(MirType::Ptr);
+        let v = b.build(MirType::I64, Op::Load(p, MirType::I64));
+        let one = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        let r = b.build(MirType::I64, Op::Bin(BinOp::Add, v, one));
+        b.ret(Some(r));
+        let peek_fn = b.finish();
+
+        let mut b = Builder::new(it.intern("main"), MirType::I64);
+        let slot = b.alloca(MirType::I64);
+        let call = |b: &mut Builder| {
+            b.build(
+                MirType::I64,
+                Op::Call {
+                    func: peek,
+                    args: vec![slot],
+                },
+            )
+        };
+        let c41 = b.build(MirType::I64, Op::ConstInt(41, MirType::I64));
+        b.build_void(Op::Store {
+            ptr: slot,
+            value: c41,
+        });
+        let first = call(&mut b);
+        let second = call(&mut b);
+        let c1 = b.build(MirType::I64, Op::ConstInt(1, MirType::I64));
+        b.build_void(Op::Store {
+            ptr: slot,
+            value: c1,
+        });
+        let third = call(&mut b);
+        let s = b.build(MirType::I64, Op::Bin(BinOp::Add, first, second));
+        let t = b.build(MirType::I64, Op::Bin(BinOp::Add, s, third));
+        b.ret(Some(t));
+        let mut program = wukong_mir::Program::new();
+        program.funcs = vec![peek_fn, b.finish()];
+        let main = it.intern("main");
+        assert_eq!(wukong_interp::run(&program, main, &it).unwrap(), 86);
+
+        let calls = |f: &Function| {
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| matches!(i.op, Op::Call { .. }))
+                .count()
+        };
+        // Without summaries every call is opaque.
+        let mut opaque = program.funcs[1].clone();
+        let mut cache = CfgAnalyses::default();
+        Cse.run_function(&mut opaque, &mut cache);
+        Dce.run_function(&mut opaque, &mut cache);
+        assert_eq!(calls(&opaque), 3);
+
+        let graph = crate::effects::CallGraph::of(&program);
+        let mut table = crate::effects::CallEffects::default();
+        for scc in 0..graph.sccs.len() {
+            graph.summarize(&program, scc, &mut table);
+        }
+        let mut cache = CfgAnalyses::managed(Some(std::rc::Rc::new(table)));
+        let f = &mut program.funcs[1];
+        assert!(Cse.run_function(f, &mut cache));
+        Dce.run_function(f, &mut cache);
+        assert_eq!(calls(f), 2, "{}", wukong_mir::print::print_function(f, &it));
+        assert!(wukong_mir::verify::verify_program(&program).is_empty());
+        assert_eq!(wukong_interp::run(&program, main, &it).unwrap(), 86);
     }
 }

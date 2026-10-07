@@ -822,7 +822,7 @@ mod tests {
             .iter()
             .any(|i| matches!(i.op, Op::Select(..))));
         let blocks = f.blocks.len();
-        crate::PassManager::unroll_cleanup().run_function(&mut f, None);
+        crate::PassManager::unroll_cleanup().run_function(&mut f, None, None);
         assert!(f.blocks[0]
             .insts
             .iter()

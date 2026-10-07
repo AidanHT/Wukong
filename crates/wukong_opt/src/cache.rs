@@ -32,12 +32,19 @@
 //! of each re-running the provenance, constant and escape sweeps — the case the final, all-no-op
 //! confirmation sweep of every function always hits. A cache built by hand (a test, or a pass
 //! driven outside the manager) is unmanaged and recomputes on every request, exactly as before.
+//!
+//! # Call effects
+//!
+//! A managed cache also carries the program-level [`CallEffects`] table the manager has built so
+//! far (see [`crate::effects`]). It is a property of *other* functions, so nothing this function's
+//! passes do can invalidate it.
 
 use std::rc::Rc;
 
 use wukong_mir::Function;
 
 use crate::alias::AliasInfo;
+use crate::effects::CallEffects;
 use crate::{cfg, dom};
 
 /// Lazily-computed, structurally-invalidated CFG/dominator analyses for one function. Opaque to
@@ -54,16 +61,24 @@ pub struct CfgAnalyses {
     /// Provenance facts, retained only in a managed cache (see the module note).
     alias: Option<Rc<AliasInfo>>,
     managed: bool,
+    /// The summaries of the callees optimized so far; `None` treats every call as opaque.
+    effects: Option<Rc<CallEffects>>,
 }
 
 impl CfgAnalyses {
     /// A cache driven by the pass manager, which reports every mutation through
     /// [`CfgAnalyses::note_mutation`] and may therefore share instruction-level facts across passes.
-    pub(crate) fn managed() -> CfgAnalyses {
+    pub(crate) fn managed(effects: Option<Rc<CallEffects>>) -> CfgAnalyses {
         CfgAnalyses {
             managed: true,
+            effects,
             ..CfgAnalyses::default()
         }
+    }
+
+    /// The call-effect summaries available to this function's passes, if any.
+    pub(crate) fn call_effects(&self) -> Option<Rc<CallEffects>> {
+        self.effects.clone()
     }
 
     /// Drop every cached analysis. Must be called after any mutation that changes the block set or
@@ -215,7 +230,7 @@ mod tests {
         b.ret(Some(v));
         let f = b.finish();
 
-        let mut managed = CfgAnalyses::managed();
+        let mut managed = CfgAnalyses::managed(None);
         let first = managed.alias(&f);
         assert!(Rc::ptr_eq(&first, &managed.alias(&f)), "reused while clean");
         managed.note_mutation();

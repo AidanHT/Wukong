@@ -22,6 +22,10 @@
 //! (`Ty::Ptr`/`Ref`/`Tensor`/`Slice` all become a bare `MirType::Ptr`) otherwise makes unanswerable.
 //! It is a pure analysis, safe to build from anywhere, and the Cranelift backend uses it too.
 //!
+//! Functions are optimized callees first, and each call-graph SCC is summarized from its optimized
+//! body as soon as it is done: a callee whose calls have no side effect is then value-numbered,
+//! deleted when dead, and hoisted when invariant, like any instruction (the `effects` module).
+//!
 //! At `-O2` and above, whole-program inlining ([`inline_program`]) runs once *before* the
 //! per-function pipeline, and partial loop unrolling ([`unroll_program`]) runs once *after* it — the
 //! pipeline is then re-run over the functions unrolling changed, so the duplicated bodies get the
@@ -36,6 +40,7 @@ mod cse;
 mod dce;
 mod dom;
 mod dse;
+mod effects;
 mod fxhash;
 mod inline;
 mod licm;
@@ -69,8 +74,10 @@ pub use simplify_cfg::SimplifyCfg;
 pub use unroll::unroll_program;
 pub use vectorize::Vectorize;
 
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use effects::{CallEffects, CallGraph};
 use wukong_mir::{Op, Program, Terminator, ValueId};
 
 /// A function-level transform. Returns whether it changed anything.
@@ -200,28 +207,70 @@ impl PassManager {
     }
 
     pub fn run(&self, program: &mut Program) {
-        for f in &mut program.funcs {
-            self.run_function(f, None);
-        }
+        // Preserve the legacy library API's debug assertion, while the fallible API below is
+        // available to release callers and never turns a verifier error into a panic.
+        self.run_program(program, None, cfg!(debug_assertions))
+            .unwrap_or_else(|failure| panic!("{failure}"));
     }
 
     /// Run with fallible verification in every build profile. Check each pass that actually ran,
     /// including one reporting no mutation, and whole-program call signatures at the boundaries.
     pub fn run_verified(&self, program: &mut Program) -> Result<(), VerificationFailure> {
+        self.run_verified_program(program).map(|_| ())
+    }
+
+    fn run_verified_program(
+        &self,
+        program: &mut Program,
+    ) -> Result<Rc<CallEffects>, VerificationFailure> {
         verify_program_stage(program, "pipeline input")?;
-        for f in &mut program.funcs {
-            self.run_function_checked(f, None, true)?;
+        let effects = self.run_program(program, None, true)?;
+        verify_program_stage(program, "pipeline output")?;
+        Ok(effects)
+    }
+
+    /// Run the pipeline over every function, callees before callers, summarizing each call-graph
+    /// SCC as soon as its members are optimized so that their callers — processed later — can treat
+    /// side-effect-free calls like instructions. Returns the final summary table, which the
+    /// post-unroll cleanup reuses. The order is a pure function of the program, so the output is as
+    /// deterministic as before; only which function is optimized first changed.
+    fn run_program(
+        &self,
+        program: &mut Program,
+        mut timings: Option<&mut Timings>,
+        verify_each: bool,
+    ) -> Result<Rc<CallEffects>, VerificationFailure> {
+        let mut effects = Rc::new(CallEffects::default());
+        if self.passes.is_empty() {
+            return Ok(effects);
         }
-        verify_program_stage(program, "pipeline output")
+        let graph = CallGraph::of(program);
+        for (scc, members) in graph.sccs.iter().enumerate() {
+            for &i in members {
+                self.run_function_checked(
+                    &mut program.funcs[i as usize],
+                    timings.as_deref_mut(),
+                    verify_each,
+                    Some(Rc::clone(&effects)),
+                )?;
+            }
+            // Every function's cache (and its handle on the table) is gone by now, so this updates
+            // the table in place.
+            graph.summarize(program, scc, Rc::make_mut(&mut effects));
+        }
+        Ok(effects)
     }
 
     /// The fixpoint driver. `timings` is `None` on the production path (zero overhead); the bench
     /// harness passes `Some(..)` to accumulate per-pass wall time. The `timings` branch does not
     /// change which passes run or in what order, so the resulting MIR is identical either way.
-    fn run_function(&self, f: &mut wukong_mir::Function, timings: Option<&mut Timings>) {
-        // Preserve the legacy library API's debug assertion, while the fallible API below is
-        // available to release callers and never turns a verifier error into a panic.
-        self.run_function_checked(f, timings, cfg!(debug_assertions))
+    fn run_function(
+        &self,
+        f: &mut wukong_mir::Function,
+        timings: Option<&mut Timings>,
+        effects: Option<Rc<CallEffects>>,
+    ) {
+        self.run_function_checked(f, timings, cfg!(debug_assertions), effects)
             .unwrap_or_else(|failure| panic!("{failure}"));
     }
 
@@ -230,14 +279,16 @@ impl PassManager {
         f: &mut wukong_mir::Function,
         mut timings: Option<&mut Timings>,
         verify_each: bool,
+        effects: Option<Rc<CallEffects>>,
     ) -> Result<(), VerificationFailure> {
         // One analysis cache per function, shared across every pass and every fixpoint iteration.
         // It is invalidated by the passes that restructure the CFG (see their `run_function`), so it
         // stays valid — and reused — across the long tail of the fixpoint where only instructions
         // move. The cache never changes what a pass computes, only how often it recomputes it. It is
         // *managed*: every reported mutation is passed on below, which is what lets it hand one
-        // function's alias facts to several memory passes in a row.
-        let mut cache = CfgAnalyses::managed();
+        // function's alias facts to several memory passes in a row. It also carries the call
+        // effects of the functions optimized so far.
+        let mut cache = CfgAnalyses::managed(effects);
         // Fixpoint with per-pass clean-tracking. A pass is a *deterministic* function of the MIR, so a
         // pass that ran and reported "no change" cannot do anything until some OTHER pass mutates the
         // function — re-running it on identical MIR would again be a no-op. We therefore skip
@@ -308,7 +359,9 @@ pub fn optimize_preserving(program: &mut Program, opt_level: u8, roots: &[wukong
         inline::inline_program_preserving(program, roots);
     }
     let pm = PassManager::standard(opt_level);
-    pm.run(program);
+    let effects = pm
+        .run_program(program, None, cfg!(debug_assertions))
+        .unwrap_or_else(|failure| panic!("{failure}"));
     // Unrolling runs after the pipeline, not inside its fixpoint: it needs the canonical two-block
     // counted loop that mem2reg/simplify-cfg produce, and re-running it on its own output would
     // unroll the same loop again every sweep. Only the functions it touched are re-optimized, so a
@@ -318,7 +371,7 @@ pub fn optimize_preserving(program: &mut Program, opt_level: u8, roots: &[wukong
         if !changed.is_empty() {
             let cleanup = PassManager::unroll_cleanup();
             for i in changed {
-                cleanup.run_function(&mut program.funcs[i], None);
+                cleanup.run_function(&mut program.funcs[i], None, Some(Rc::clone(&effects)));
             }
         }
     }
@@ -344,13 +397,18 @@ pub fn optimize_verified_preserving(
         inline::inline_program_preserving(program, roots);
         verify_program_stage(program, "inline")?;
     }
-    PassManager::standard(opt_level).run_verified(program)?;
+    let effects = PassManager::standard(opt_level).run_verified_program(program)?;
     if opt_level >= 2 {
         let changed = unroll_program(program);
         verify_program_stage(program, "unroll")?;
         let cleanup = PassManager::unroll_cleanup();
         for i in changed {
-            cleanup.run_function_checked(&mut program.funcs[i], None, true)?;
+            cleanup.run_function_checked(
+                &mut program.funcs[i],
+                None,
+                true,
+                Some(Rc::clone(&effects)),
+            )?;
         }
     }
     verify_program_stage(program, "optimization output")
@@ -369,9 +427,9 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         t.inline = i0.elapsed();
     }
     let pm = PassManager::standard(opt_level);
-    for f in &mut program.funcs {
-        pm.run_function(f, Some(&mut t));
-    }
+    let effects = pm
+        .run_program(program, Some(&mut t), cfg!(debug_assertions))
+        .unwrap_or_else(|failure| panic!("{failure}"));
     if opt_level >= 2 {
         // The unroll bucket is the pass *and* its cleanup sweep: that sum is the cost unrolling
         // actually adds, which is the number worth reporting. Keeping the cleanup out of the
@@ -383,7 +441,7 @@ pub fn optimize_timed(program: &mut Program, opt_level: u8) -> Timings {
         if !changed.is_empty() {
             let cleanup = PassManager::unroll_cleanup();
             for i in changed {
-                cleanup.run_function(&mut program.funcs[i], None);
+                cleanup.run_function(&mut program.funcs[i], None, Some(Rc::clone(&effects)));
             }
         }
         t.unroll = u0.elapsed();
@@ -1174,6 +1232,54 @@ mod tests {
             .filter(|i| matches!(i.op, wukong_mir::Op::Call { .. }))
             .count();
         assert!(calls >= 2, "recursive fib should keep its self-calls");
+    }
+
+    #[test]
+    fn side_effect_free_calls_are_numbered_deleted_and_hoisted() {
+        // The bare pipeline, so no inliner hides the calls: `heavy`'s summary is what acts. Two
+        // identical calls become one, a call whose result is never read disappears, and the
+        // invariant call in the loop moves to its preheader.
+        let src = "fn heavy(x: i64) -> i64 { return x * x + 7; } \
+                   fn main() -> i32 { let a: i64 = 6; \
+                     let s: i64 = heavy(a) + heavy(a); \
+                     let unused: i64 = heavy(a + 1); \
+                     let mut t: i64 = 0; let mut i: i64 = 0; \
+                     while i < 10 { t = t + heavy(5); i = i + 1; } \
+                     return (s + t) as i32; }";
+        let (mut prog, mut interner) = lower(src);
+        let main = interner.intern("main");
+        let heavy = interner.intern("heavy");
+        // heavy(6) * 2 + heavy(5) * 10 = 43 * 2 + 32 * 10.
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 406);
+        PassManager::standard(2).run(&mut prog);
+        for f in &prog.funcs {
+            assert!(wukong_mir::verify::verify_function(f).is_empty());
+        }
+        let main_fn = find_fn(&prog, &interner, "main");
+        let in_loop = inline::loop_blocks(main_fn);
+        let mut calls = 0;
+        for (bi, b) in main_fn.blocks.iter().enumerate() {
+            for inst in &b.insts {
+                if matches!(inst.op, wukong_mir::Op::Call { func, .. } if func == heavy) {
+                    calls += 1;
+                    assert!(
+                        !in_loop[bi],
+                        "the invariant call stayed in the loop\n{}",
+                        wukong_mir::print::print_function(main_fn, &interner)
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            calls,
+            2,
+            "{}",
+            wukong_mir::print::print_function(main_fn, &interner)
+        );
+        assert_eq!(wukong_interp::run(&prog, main, &interner).unwrap(), 406);
+        for lvl in [0, 1, 2, 3] {
+            assert_eq!(run_main_opt(src, lvl), 406, "level {lvl}");
+        }
     }
 
     #[test]

@@ -458,7 +458,7 @@ fn func_insts(f: &Function) -> usize {
 /// strongly-connected components of the CFG: a block is in a loop exactly when its component has
 /// more than one member, or it branches to itself. This needs no dominator information, which keeps
 /// the inliner off the (more expensive) analyses the function-level pipeline builds later.
-fn loop_blocks(f: &Function) -> Vec<bool> {
+pub(crate) fn loop_blocks(f: &Function) -> Vec<bool> {
     let adj: Vec<Vec<u32>> = f
         .blocks
         .iter()
@@ -486,7 +486,7 @@ fn loop_blocks(f: &Function) -> Vec<bool> {
 /// from it. The recursion is turned into an explicit stack because both call graphs and CFGs here
 /// can be thousands of nodes deep in generated model code, and blowing the *compiler's* stack is not
 /// an acceptable failure mode.
-fn strongly_connected(adj: &[Vec<u32>]) -> Vec<Vec<u32>> {
+pub(crate) fn strongly_connected(adj: &[Vec<u32>]) -> Vec<Vec<u32>> {
     let n = adj.len();
     const UNVISITED: u32 = u32::MAX;
     let mut index = vec![UNVISITED; n];

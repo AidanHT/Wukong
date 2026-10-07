@@ -9,9 +9,9 @@
 //! We hoist only into a loop that already has a preheader — a single out-of-loop predecessor that
 //! reaches the header by an unconditional branch and dominates it — rather than synthesizing one,
 //! which keeps the transform simple and always legal. Only side-effect-free, non-trapping
-//! operations are moved (see `safe_to_hoist`: no stores, calls, vector kernels, allocas, or integer
-//! division/remainder), so hoisting a computation onto a path that would not have executed it can
-//! never change observable behavior.
+//! operations are moved (see `safe_to_hoist`: no stores, vector kernels, allocas, integer
+//! division/remainder, or calls other than to a callee summarized as speculatable), so hoisting a
+//! computation onto a path that would not have executed it can never change observable behavior.
 //!
 //! # Loads
 //!
@@ -34,7 +34,10 @@
 //! loop-invariant loads in Wukong code actually live — the fat-pointer header's `data` field, reread
 //! on every subscript.
 
+use std::rc::Rc;
+
 use crate::alias::{type_bytes, AliasInfo};
+use crate::effects::CallEffects;
 use crate::fxhash::{FxHashMap, FxHashSet};
 
 use wukong_mir::{BinOp, Function, Inst, Op, Terminator, ValueId};
@@ -59,6 +62,7 @@ impl Pass for Licm {
             return false;
         }
         let alias = cache.alias(f);
+        let effects = cache.call_effects();
         // `idom`/`preds` borrow the cache; `hoist_from_loop` mutates `f` (a different object), so
         // the two coexist for the whole loop.
         let (idom, preds) = cache.idoms_and_preds(f);
@@ -67,7 +71,7 @@ impl Pass for Licm {
         let mut changed = false;
         for (header, body) in loops {
             if let Some(preheader) = preheader(f, header, &body, preds, idom) {
-                let mem = LoopMem::of(f, &body);
+                let mem = LoopMem::of(f, &body, effects.clone());
                 changed |= hoist_from_loop(f, &body, preheader, &alias, &mem);
             }
         }
@@ -84,13 +88,17 @@ struct LoopMem {
     /// Does the body contain a call or a vector-kernel call? Either may write through any pointer
     /// it was handed, so only a stack slot that never escaped this function survives one.
     has_call: bool,
+    /// Call summaries: a call summarized as side-effect free writes nothing, and a speculatable one
+    /// may itself be hoisted (see the `effects` module).
+    effects: Option<Rc<CallEffects>>,
 }
 
 impl LoopMem {
-    fn of(f: &Function, body: &FxHashSet<u32>) -> LoopMem {
+    fn of(f: &Function, body: &FxHashSet<u32>, effects: Option<Rc<CallEffects>>) -> LoopMem {
         let mut mem = LoopMem {
             stores: Vec::new(),
             has_call: false,
+            effects,
         };
         for &blk in body {
             for inst in &f.blocks[blk as usize].insts {
@@ -98,12 +106,17 @@ impl LoopMem {
                     Op::Store { ptr, value } => mem
                         .stores
                         .push((*ptr, type_bytes(f.value_type(*value)).unwrap_or(u32::MAX))),
+                    Op::Call { func, .. } if mem.writes_nothing(*func) => {}
                     Op::Call { .. } | Op::VecKernelCall { .. } => mem.has_call = true,
                     _ => {}
                 }
             }
         }
         mem
+    }
+
+    fn writes_nothing(&self, func: wukong_span::Symbol) -> bool {
+        self.effects.as_ref().is_some_and(|e| e.get(func).is_some())
     }
 }
 
@@ -230,11 +243,10 @@ fn safe_to_hoist(f: &Function, op: &Op, alias: &AliasInfo, mem: &LoopMem) -> boo
             let _ = f;
             load_hoistable(alias, *p, type_bytes(ty).unwrap_or(u32::MAX), mem)
         }
-        Op::Store { .. }
-        | Op::Call { .. }
-        | Op::VecKernelCall { .. }
-        | Op::Alloca { .. }
-        | Op::Barrier => false,
+        // A speculatable callee always returns, reads nothing and cannot trap: with invariant
+        // arguments its result is invariant and computing it early is unobservable.
+        Op::Call { func, .. } => mem.effects.as_ref().is_some_and(|e| e.hoistable(*func)),
+        Op::Store { .. } | Op::VecKernelCall { .. } | Op::Alloca { .. } | Op::Barrier => false,
     }
 }
 
