@@ -3185,6 +3185,7 @@ mod tests {
     fn math64_special_values_are_exact() {
         let inf = f64::INFINITY;
         let three_quarter_pi = 3.0 * STD_PI / 4.0;
+        let root2_e308 = f64::from_bits(0x7fe9_2c80_954c_51f5); // √2·1e308, correctly rounded
         let cases: &[(i64, f64, f64)] = &[
             (VM_EXP, 0.0, 1.0),
             (VM_EXP, -0.0, 1.0),
@@ -3371,6 +3372,8 @@ mod tests {
             (VM2_POW, -inf, 3.0, -inf),
             (VM2_POW, -inf, 2.0, inf),
             (VM2_POW, -inf, -3.0, -0.0),
+            // C23 Annex F (pow): pow(−∞, y) = +∞ for y > 0 not an odd integer — not a NaN.
+            (VM2_POW, -inf, 0.5, inf),
             (VM2_POW, 2.0, inf, inf),
             (VM2_POW, 0.5, inf, 0.0),
             (VM2_POW, -1.0, inf, 1.0),
@@ -3419,7 +3422,10 @@ mod tests {
             (VM2_HYPOT, inf, f64::NAN, inf),
             (VM2_HYPOT, f64::NAN, -inf, inf),
             (VM2_HYPOT, -inf, 1.0, inf),
-            (VM2_HYPOT, 1e308, 1e308, inf),
+            // √2·1e308 ≈ 1.414e308 is below DBL_MAX: the 2^±700 scaling keeps it finite (mpmath,
+            // correctly rounded).
+            (VM2_HYPOT, 1e308, 1e308, root2_e308),
+            (VM2_HYPOT, 1.5e308, 1.5e308, inf),
             (VM2_HYPOT, 1.0, 1e-300, 1.0),
             (VM2_HYPOT, 5.0, 12.0, 13.0),
         ];
@@ -3436,7 +3442,6 @@ mod tests {
             (VM2_POW, -1.0, 1.5),
             (VM2_POW, f64::NAN, 1.0),
             (VM2_POW, 2.0, f64::NAN),
-            (VM2_POW, -inf, 0.5),
             (VM2_ATAN2, f64::NAN, 1.0),
             (VM2_ATAN2, 1.0, f64::NAN),
             (VM2_HYPOT, f64::NAN, 1.0),
@@ -3574,16 +3579,17 @@ mod tests {
 
     /// The 256-entry `exp2` table is internally consistent: entry `i` is `2^((i−128)/256 + eps[i])`
     /// to within 2 ULP of the host's own `exp2` (the table is accurate to 2⁻⁶⁴, so the host's
-    /// ≤1-ULP result must land within 2 ULP of it), `eps[i]` is tiny, and the entries increase
-    /// strictly. A single wrong hex digit in any of the 512 words fails here, which the sampled
-    /// reference values above cannot promise for every bucket.
+    /// ≤1-ULP result must land within 2 ULP of it), `eps[i]` is tiny (below 2⁻³⁹; FreeBSD's largest
+    /// is 1.02e-12, just over 2⁻⁴⁰), and the entries increase strictly. A single wrong hex digit in
+    /// any of the 512 words fails here, which the sampled reference values above cannot promise for
+    /// every bucket.
     #[test]
     fn math64_exp2_table_is_consistent() {
         let mut previous = 0.0f64;
         for i in 0..256usize {
             let t = f64::from_bits(EXP2_TBL[2 * i]);
             let eps = f64::from_bits(EXP2_TBL[2 * i + 1]);
-            assert!(eps.abs() < 2.0f64.powi(-40), "eps[{i}] = {eps:e}");
+            assert!(eps.abs() < 2.0f64.powi(-39), "eps[{i}] = {eps:e}");
             let want = ((i as f64 - 128.0) / 256.0 + eps).exp2();
             assert!(
                 ulp_diff(t, want) <= 2,
@@ -3610,9 +3616,11 @@ mod tests {
         assert_eq!(scalbn(1.5, -1074).to_bits(), 2); // 1.5·2^-1074 rounds to even: 2^-1073
         assert_eq!(scalbn(-0.0, 10).to_bits(), (-0.0f64).to_bits());
         assert_eq!(scalbn(3.0, 0), 3.0);
+        // 2^-1022 · 2^2045 = 2^1023 goes through the 2^1023 prescale; one more doubling overflows.
         assert_eq!(
-            scalbn(f64::MIN_POSITIVE, 2046),
+            scalbn(f64::MIN_POSITIVE, 2045),
             f64::from_bits(0x7fe0_0000_0000_0000)
         );
+        assert_eq!(scalbn(f64::MIN_POSITIVE, 2046), f64::INFINITY);
     }
 }
