@@ -1,5 +1,6 @@
 // RUN: --run
 // EXPECT-EXIT: 0
+// EXPECT-OUT: 0
 // EXPECT-OUT: 43836
 module tests.run.transcendental_sweep
 
@@ -9,6 +10,22 @@ module tests.run.transcendental_sweep
 // body (each thread's chunk dispatched). Every op composes the shared exp/log/sin/cos/atan/√, so the
 // dispatched kernel, the scalar tail, and the inlined MIR all agree — this pins interp == native and
 // -O0 == -O3 across the whole expanded set at once.
+//
+// TWO PRINTED LINES, read this before changing them.
+//
+// Line 1 (expected 0) is the real per-lane assertion for the @parallel dispatch arm. The parallel
+// exp10/cbrt must equal the serial dispatch LANE FOR LANE: a chunk-boundary defect (a thread
+// writing a neighbour's lane, a dropped tail chunk) that happened to preserve the folded checksum
+// below would pass the checksum and fail here. `wukong_vmath_f32` is elementwise, so the chunked
+// and serial results agree bit-for-bit — 0 mismatches over all 128 compared lanes.
+//
+// Line 2 (43836) is a FOLDED CHECKSUM over 576 results, kept only as a coarse CHANGE DETECTOR for
+// the nine ops' dispatch, NOT a hand-derived value — a single f32 sum near 438 cannot localise
+// which op moved and absorbs per-lane errors of order 1e-2, so it is not the oracle. The ops' math
+// is proven by `wukong_runtime`'s `vmath.rs` f64-reference table, and the @parallel arm is proven
+// per lane on line 1. If the checksum ever changes, DO NOT re-paste it to make the failure go away:
+// find which op moved (that is what the per-function vmath tests are for) and record the ULP cause
+// in the commit body.
 
 @parallel
 fn par_sweep(x: [f32; 64], mut a: [f32; 64], mut b: [f32; 64]) {
@@ -55,7 +72,20 @@ fn main() -> i32 {
     let mut pc: [f32; 64] = [0.0; 64];
     par_sweep(x, pe, pc);
 
-    // One combined checksum (scaled) folds every result; any backend/opt divergence shifts it.
+    // Per-lane proof of the @parallel arm. pe[i] = exp10(x[i]) is the SAME kernel as the serial
+    // e10[i] above, so the two agree bit-for-bit; cbrt has no serial twin above, so compute one
+    // here and compare. A count of inequalities is 0 iff every one of the 128 lanes matches — unlike
+    // the checksum it cannot be passed by a chunk-boundary defect that preserves the total.
+    let mut cs: [f32; 64] = [0.0; 64];
+    for i in 0..64 { cs[i] = cbrt(x[i]); }
+    let mut mism: i32 = 0;
+    for i in 0..64 {
+        if pe[i] != e10[i] { mism = mism + 1; }
+        if pc[i] != cs[i] { mism = mism + 1; }
+    }
+    print(mism); // 0 — @parallel exp10/cbrt == serial dispatch, every one of the 128 lanes
+
+    // One combined checksum (scaled) folds every result; a coarse change detector for the nine ops.
     let total = checksum(e10) + checksum(l10) + checksum(ss) + checksum(lsg)
         + checksum(tn) + checksum(asn) + checksum(acs) + checksum(pe) + checksum(pc);
     print((total * 100.0 + 0.5) as i32);
