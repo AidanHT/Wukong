@@ -35,10 +35,13 @@
 //! The interpreter (the language specification) gives every *scalar leaf* of a slot one memory
 //! slot and scales a `gep` by `slot_count(elem)`; the native backend uses bytes and scales by
 //! `size_of(elem)`. A struct/tuple byte buffer (`[n x i8]`) has one slot per byte, a typed array one
-//! slot per element. Every derived pointer therefore carries **both** positions, and an access only
-//! qualifies when its interpreter slot is the leaf that sits at its native byte offset — so the leaf
-//! the split creates is the same storage in both models. A program that addresses one slot with two
-//! different strides (and so already means different things on the two backends) is left alone.
+//! slot per element — and the two layouts need not agree: an `[f32; 4]` field of a struct buffer is
+//! four consecutive interpreter slots but sixteen native bytes. Every derived pointer therefore
+//! carries **both** positions. All accesses at one interpreter slot must agree on the native byte
+//! offset and type, distinct slots must occupy disjoint native byte ranges, and both must lie inside
+//! the `alloca`; then each leaf is one independent cell in *both* models and the split preserves
+//! each separately. A program that addresses one cell with two different strides (and so already
+//! means different things on the two backends) is left alone.
 //!
 //! A new leaf `alloca T` starts at the interpreter's default for `T`, while the leaf it replaces
 //! started at the default of the *slot's* leaf type: `Int(0)` for every byte of a struct buffer,
@@ -113,7 +116,7 @@ struct Split {
 }
 
 /// The interpreter's slot footprint of a value of `ty` (`wukong_interp::slot_count`).
-fn slot_count(ty: &MirType) -> Option<u64> {
+pub(crate) fn slot_count(ty: &MirType) -> Option<u64> {
     match ty {
         MirType::Array(elem, n) => slot_count(elem)?.checked_mul(u64::from(*n)),
         _ => Some(1),
@@ -161,7 +164,7 @@ fn splittable(ty: &MirType) -> bool {
 
 /// A `ConstInt` used as a `gep` index, as the interpreter sees it: masked to its declared width
 /// (sign-extended, except `i1`, which is its low bit).
-fn const_index(k: i128, ty: &MirType) -> Option<i64> {
+pub(crate) fn const_index(k: i128, ty: &MirType) -> Option<i64> {
     let bits: u32 = match ty {
         MirType::I1 => return Some((k & 1) as i64),
         MirType::I8 => 8,
@@ -375,11 +378,8 @@ fn leaves_of(ty: &MirType, accesses: &[&Access]) -> Option<(Vec<(i64, MirType)>,
         if !splittable(&a.ty) {
             return None;
         }
-        let (at, leaf) = leaf_at_slot(ty, u64::try_from(a.slot).ok()?)?;
-        // The interpreter slot and the native byte offset must name the same leaf.
-        if i64::try_from(at).ok()? != a.byte {
-            return None;
-        }
+        // Inside the slot in both models: one of its interpreter slots, and a byte range of it.
+        let (_, leaf) = leaf_at_slot(ty, u64::try_from(a.slot).ok()?)?;
         let end = u64::try_from(a.byte)
             .ok()?
             .checked_add(u64::from(type_bytes(&a.ty)?))?;
@@ -387,7 +387,8 @@ fn leaves_of(ty: &MirType, accesses: &[&Access]) -> Option<(Vec<(i64, MirType)>,
             return None;
         }
         match leaves.iter().find(|l| l.0 == a.slot) {
-            Some(l) if l.2 != a.ty => return None, // two types at one position
+            // One interpreter cell must be one native byte range, of one type.
+            Some(l) if l.1 != a.byte || l.2 != a.ty => return None,
             Some(_) => {}
             None => {
                 if leaves.len() == MAX_LEAVES {
@@ -397,15 +398,16 @@ fn leaves_of(ty: &MirType, accesses: &[&Access]) -> Option<(Vec<(i64, MirType)>,
             }
         }
     }
-    leaves.sort_unstable_by_key(|l| l.0);
-    // Distinct positions must not overlap natively. Interpreter slots ascend with native bytes, so
-    // a non-ascending byte order is itself a mismatch.
+    // Distinct interpreter cells must not share native bytes, or separating them would split
+    // storage the native backend shares (two cells at one byte offset fail this too).
+    leaves.sort_unstable_by_key(|l| l.1);
     for w in leaves.windows(2) {
         let end = w[0].1.checked_add(i64::from(type_bytes(&w[0].2)?))?;
         if end > w[1].1 {
             return None;
         }
     }
+    leaves.sort_unstable_by_key(|l| l.0);
     let mut mismatch = 0u64;
     for (k, l) in leaves.iter().enumerate() {
         if default_class(&l.2) != default_class(&l.3) {
@@ -954,6 +956,52 @@ mod tests {
             4
         );
         assert_eq!(run(&f, &it), 1322);
+    }
+
+    /// `struct S { n: i32, v: [f32; 4] }` as the front end lays it out: a 24-byte buffer, `n` at byte
+    /// 0 and `v[j]` reached as `gep(gep(s, 8, i8), j, f32)` — interpreter slot `8 + j` but native byte
+    /// `8 + 4j`. The two models disagree on where `v[j]` lives, yet each leaf is one cell in both, so
+    /// the slot still splits into five leaves.
+    #[test]
+    fn a_struct_with_an_array_field_splits_per_cell() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("main"), MirType::I64);
+        let s = b.alloca(MirType::Array(Box::new(MirType::I8), 24));
+        let zero = i64c(&mut b, 0);
+        let eight = i64c(&mut b, 8);
+        let pn = gep(&mut b, s, zero, MirType::I8);
+        let field = gep(&mut b, s, eight, MirType::I8);
+        let n = b.build(MirType::I32, Op::ConstInt(3, MirType::I32));
+        b.build_void(Op::Store { ptr: pn, value: n });
+        let mut cells = Vec::new();
+        for j in 0..4 {
+            let jj = i64c(&mut b, j);
+            let p = gep(&mut b, field, jj, MirType::F32);
+            let v = b.build(MirType::F32, Op::ConstFloat(0.5 * j as f64, MirType::F32));
+            b.build_void(Op::Store { ptr: p, value: v });
+            cells.push(p);
+        }
+        // n · (v[0] + v[1] + v[2] + v[3]) · 4 = 3 · 3 · 4 = 36.
+        let mut sum = b.build(MirType::F32, Op::ConstFloat(0.0, MirType::F32));
+        for p in cells {
+            let v = b.build(MirType::F32, Op::Load(p, MirType::F32));
+            sum = b.build(MirType::F32, Op::Bin(BinOp::FAdd, sum, v));
+        }
+        let ln = b.build(MirType::I32, Op::Load(pn, MirType::I32));
+        let nf = b.build(MirType::F32, Op::Cast(CastKind::SiToFp, ln, MirType::F32));
+        let four = b.build(MirType::F32, Op::ConstFloat(4.0, MirType::F32));
+        let t = b.build(MirType::F32, Op::Bin(BinOp::FMul, sum, nf));
+        let t = b.build(MirType::F32, Op::Bin(BinOp::FMul, t, four));
+        let r = b.build(MirType::I64, Op::Cast(CastKind::FpToSi, t, MirType::I64));
+        b.ret(Some(r));
+        let mut f = b.finish();
+        verify(&f);
+        assert_eq!(run(&f, &it), 36);
+        assert!(Sroa.run_function(&mut f, &mut CfgAnalyses::default()));
+        verify(&f);
+        assert_eq!(aggregate_allocas(&f), 0);
+        assert_eq!(count(&f, |op| matches!(op, Op::Alloca { .. })), 5);
+        assert_eq!(run(&f, &it), 36);
     }
 
     #[test]
