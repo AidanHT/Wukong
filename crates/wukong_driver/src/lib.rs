@@ -624,6 +624,7 @@ fn run_on_gpu_lower(
 /// it must never print an approximation. [`WUKONG_RT_SHIM`] provides the full print implementation.
 const WUKONG_RT_C: &str = "#include <stdio.h>\n\
 #include <stdlib.h>\n\
+#include <stdint.h>\n\
 #include <math.h>\n\
 #ifdef _WIN32\n\
 #include <io.h>\n\
@@ -652,14 +653,98 @@ void wukong_rt_bounds_fail(long long index, long long len, const char* site) {\n
 }\n\
 double wukong_rt_fmod_f64(double a, double b) { return fmod(a, b); }\n\
 float wukong_rt_fmod_f32(float a, float b) { return fmodf(a, b); }\n\
-/* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract — and\n\
-   handles the count*size overflow; a negative count clamps to an empty (null) allocation. */\n\
+/* Heap builtins (alloc_<T>/free). calloc zero-initializes — the determinism contract. The block\n\
+   is over-allocated so the data pointer sits on a 64-byte boundary, the runtime's `HEAP_ALIGN`,\n\
+   with the block's own address stored just below it for free. An empty or overflowing request is\n\
+   null, as in the runtime. */\n\
 void* wukong_rt_alloc(long long count, long long elem_size, long long elem_is_float) {\n\
     (void)elem_is_float;\n\
-    if (count < 0 || elem_size <= 0) return 0;\n\
-    return calloc((size_t)count, (size_t)elem_size);\n\
+    if (count <= 0 || elem_size <= 0) return 0;\n\
+    if ((unsigned long long)count > ((size_t)-1 - 128) / (unsigned long long)elem_size) return 0;\n\
+    char* raw = (char*)calloc(1, (size_t)count * (size_t)elem_size + 64 + sizeof(void*));\n\
+    if (!raw) return 0;\n\
+    char* data = (char*)(((uintptr_t)raw + sizeof(void*) + 63) & ~(uintptr_t)63);\n\
+    ((void**)data)[-1] = raw;\n\
+    return data;\n\
 }\n\
-void wukong_rt_free(void* p) { free(p); }\n";
+void wukong_rt_free(void* p) { if (p) free(((void**)p)[-1]); }\n";
+
+/// The `cc` fallback's scratch allocator (`scratch_<T>` / `scratch_mark` / `scratch_release`), a C
+/// mirror of `wukong_runtime::scratch`: zeroed 64-byte-aligned bump allocations in chunks that never
+/// move, each at least twice the largest before it, released LIFO to a mark that counts live
+/// allocations. One arena, because this fallback runtime has no threads.
+const WUKONG_SCRATCH_C: &str = r#"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+typedef struct { char* raw; char* base; size_t cap; } wk_scratch_chunk;
+typedef struct { size_t cur, off; } wk_scratch_mark;
+static wk_scratch_chunk* wk_sc_chunks;
+static size_t wk_sc_n, wk_sc_cur, wk_sc_off;
+static wk_scratch_mark* wk_sc_marks;
+static size_t wk_sc_nmarks, wk_sc_capmarks;
+void* wukong_rt_scratch_alloc(long long count, long long elem_size, long long elem_is_float) {
+    (void)elem_is_float;
+    if (wk_sc_nmarks == wk_sc_capmarks) {
+        size_t cap = wk_sc_capmarks ? 2 * wk_sc_capmarks : 64;
+        wk_scratch_mark* m = (wk_scratch_mark*)realloc(wk_sc_marks, cap * sizeof(wk_scratch_mark));
+        if (!m) abort();
+        wk_sc_marks = m;
+        wk_sc_capmarks = cap;
+    }
+    wk_sc_marks[wk_sc_nmarks].cur = wk_sc_cur;
+    wk_sc_marks[wk_sc_nmarks].off = wk_sc_off;
+    wk_sc_nmarks++;
+    if (count <= 0 || elem_size <= 0) return 0;
+    if ((unsigned long long)count > (unsigned long long)(PTRDIFF_MAX / 2) / (unsigned long long)elem_size) return 0;
+    size_t bytes = (size_t)count * (size_t)elem_size;
+    for (;;) {
+        if (wk_sc_cur < wk_sc_n) {
+            wk_scratch_chunk* c = &wk_sc_chunks[wk_sc_cur];
+            size_t start = (wk_sc_off + 63) & ~(size_t)63;
+            if (start <= c->cap && bytes <= c->cap - start) {
+                wk_sc_off = start + bytes;
+                memset(c->base + start, 0, bytes);
+                return c->base + start;
+            }
+            if (wk_sc_cur + 1 < wk_sc_n && wk_sc_chunks[wk_sc_cur + 1].cap >= bytes) {
+                wk_sc_cur++;
+                wk_sc_off = 0;
+                continue;
+            }
+        }
+        size_t grown = 0;
+        for (size_t i = 0; i < wk_sc_n; i++)
+            if (wk_sc_chunks[i].cap > grown) grown = wk_sc_chunks[i].cap;
+        size_t cap = bytes;
+        if (cap < ((size_t)1 << 20)) cap = (size_t)1 << 20;
+        if (cap < 2 * grown) cap = 2 * grown;
+        cap = (cap + 63) & ~(size_t)63;
+        char* raw = (char*)malloc(cap + 64);
+        if (!raw) return 0;
+        size_t keep = wk_sc_n ? wk_sc_cur + 1 : 0;
+        for (size_t i = keep; i < wk_sc_n; i++) free(wk_sc_chunks[i].raw);
+        wk_sc_n = keep;
+        wk_scratch_chunk* cs = (wk_scratch_chunk*)realloc(wk_sc_chunks, (keep + 1) * sizeof(wk_scratch_chunk));
+        if (!cs) { free(raw); return 0; }
+        wk_sc_chunks = cs;
+        wk_sc_chunks[keep].raw = raw;
+        wk_sc_chunks[keep].base = (char*)(((uintptr_t)raw + 63) & ~(uintptr_t)63);
+        wk_sc_chunks[keep].cap = cap;
+        wk_sc_n = keep + 1;
+        wk_sc_cur = keep;
+        wk_sc_off = 0;
+    }
+}
+long long wukong_rt_scratch_mark(void) { return (long long)wk_sc_nmarks; }
+void wukong_rt_scratch_release(long long mark) {
+    size_t m = mark < 0 ? 0 : (size_t)mark;
+    if (m >= wk_sc_nmarks) return;
+    wk_sc_cur = wk_sc_marks[m].cur;
+    wk_sc_off = wk_sc_marks[m].off;
+    wk_sc_nmarks = m;
+}
+"#;
 
 // Scalar-only C link fallback. Keep operations/constants in lockstep with runtime/vmath.rs,
 // including explicit fmaf and nonfinite bits; plain sinf/cosf for every input would differ
@@ -711,7 +796,7 @@ float wukong_rt_trig_f32(float x, long long op) {
 "#;
 
 fn c_runtime_source() -> String {
-    format!("{WUKONG_RT_C}\n{WUKONG_TRIG_C}")
+    format!("{WUKONG_RT_C}\n{WUKONG_TRIG_C}\n{WUKONG_SCRATCH_C}")
 }
 
 /// A per-invocation scratch directory for the generated `--emit=exe` link inputs (the Rust link

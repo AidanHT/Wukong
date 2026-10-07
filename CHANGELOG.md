@@ -7,6 +7,17 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ### Language safety (gap/lang-safety)
 
+- **A scratch allocator, and cache-line-aligned heap memory.** `scratch_<T>(n) -> []T` (the eight
+  `alloc_<T>` element types), `scratch_mark() -> i64` and `scratch_release(m)` expose a per-thread
+  LIFO bump arena for temporaries (`wukong_runtime::scratch`, in the spirit of Odin's temp allocator
+  and Zig's arena reset): zeroed, 64-byte-aligned slices whose memory is reused after a release, so
+  a kernel that needs a buffer per call stops paying a system allocation, a free and fresh-page
+  faults on every call. The mark is the count of live scratch allocations, so it is the same value
+  on the interpreter (which mirrors the count and reuses released regions), the JIT and a linked
+  executable (the `cc` fallback carries a C twin). `wukong_rt_alloc` now returns 64-byte-aligned
+  data (was 16), in the C fallback too. `tests/run/alloc_scratch_arena.wk` (every lane, derived by hand;
+  also in the AOT gate), runtime and sema unit tests.
+
 - **A runtime failure means one thing on every execution path.** `wukongc --run` now prints the
   stdout a program produced before a failed `assert` or slice bounds check (then `error: …`, exit 1)
   instead of discarding it, so it agrees with a linked executable, and the differential gate now

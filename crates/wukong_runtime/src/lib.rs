@@ -184,6 +184,11 @@ pub use bias::{wukong_bias_bcast_f32, wukong_bias_bcast_f32_parallel, BIAS_ACT_N
 mod safety;
 pub use safety::{bounds_failure_message, site_str, wukong_rt_bounds_fail};
 
+mod scratch;
+pub use scratch::{
+    scratch_reset, wukong_rt_scratch_alloc, wukong_rt_scratch_mark, wukong_rt_scratch_release,
+};
+
 /// `bf16` (the "brain float": an `f32` truncated to its top 16 bits) round-to-nearest-even from an
 /// `f32`, returning the 16 stored bits. This is the single shared definition the interpreter, the
 /// native backend (which emits the identical integer arithmetic in CLIF), and the bf16 GEMM packer
@@ -566,17 +571,27 @@ fn pfor_dyn() -> bool {
     *V.get_or_init(|| std::env::var("WUKONG_PFOR_DYN").map_or(true, |v| v != "0"))
 }
 
-/// The hidden allocation header preceding every `wukong_rt_alloc` data pointer: 16 bytes storing
-/// the total layout size (so `wukong_rt_free` can reconstruct the `Layout` Rust's allocator API
-/// requires at deallocation) while keeping the returned data pointer 16-byte aligned.
-const HEAP_HDR: usize = 16;
+/// The alignment of every `wukong_rt_alloc` data pointer: a cache line, so a heap buffer starts on
+/// a 64-byte boundary — what an aligned 256-bit (or 512-bit) access, a non-temporal store stream
+/// and a false-sharing-free split across threads all want, and what oneDNN and `mkl_malloc` hand
+/// out. (It was 16, the system allocator's default. The NT-store kernels' 32-byte alignment peel
+/// now runs zero iterations on a buffer the language allocated; that peel is gated on working sets
+/// past L3, so this is a guarantee for the language, not a measured speedup.)
+const HEAP_ALIGN: usize = 64;
+
+/// The hidden allocation header preceding every `wukong_rt_alloc` data pointer: it stores the total
+/// layout size (so `wukong_rt_free` can reconstruct the `Layout` Rust's allocator API requires at
+/// deallocation) and is one whole [`HEAP_ALIGN`] unit long, so the data pointer after it keeps the
+/// allocation's alignment.
+const HEAP_HDR: usize = HEAP_ALIGN;
 
 /// Zero-initialized heap allocation — the runtime backing of the Wukong `alloc_<T>(n)` builtins.
 ///
 /// Allocates `count * elem_size` bytes, **zeroed** (the determinism contract: both backends must
 /// observe identical initial contents — zero bits decode to `0`/`0.0` for every Wukong element
-/// type), and returns a 16-byte-aligned pointer to the data. `elem_is_float` is part of the shared
-/// call ABI but consumed only by the interpreter's typed-zero slot model; it is ignored here.
+/// type), and returns a 64-byte-aligned ([`HEAP_ALIGN`]) pointer to the data. `elem_is_float` is
+/// part of the shared call ABI but consumed only by the interpreter's typed-zero slot model; it is
+/// ignored here. For per-call temporaries, `scratch_<T>(n)` (`scratch.rs`) reuses memory instead.
 ///
 /// Returns **null** for a zero/negative byte count (a zero-length slice has no dereferenceable
 /// element, so the null is never read through by a well-formed program), when the byte product does
@@ -591,7 +606,7 @@ pub extern "C" fn wukong_rt_alloc(count: i64, elem_size: i64, _elem_is_float: i6
         return std::ptr::null_mut();
     }
     let total = bytes as usize + HEAP_HDR;
-    let Ok(layout) = std::alloc::Layout::from_size_align(total, HEAP_HDR) else {
+    let Ok(layout) = std::alloc::Layout::from_size_align(total, HEAP_ALIGN) else {
         return std::ptr::null_mut();
     };
     // SAFETY: `layout` has a non-zero size and a valid power-of-two alignment.
@@ -624,7 +639,7 @@ pub extern "C" fn wukong_rt_free(data: *mut u8) {
     unsafe {
         let base = data.sub(HEAP_HDR);
         let total = (base as *const usize).read();
-        if let Ok(layout) = std::alloc::Layout::from_size_align(total, HEAP_HDR) {
+        if let Ok(layout) = std::alloc::Layout::from_size_align(total, HEAP_ALIGN) {
             std::alloc::dealloc(base, layout);
         }
     }
@@ -912,11 +927,11 @@ mod tests {
 
     #[test]
     fn rt_alloc_zeroes_and_frees() {
-        // A fresh allocation is fully zeroed, 16-byte aligned, writable, and freeable.
+        // A fresh allocation is fully zeroed, 64-byte aligned, writable, and freeable.
         let n = 1000usize;
         let p = wukong_rt_alloc(n as i64, 4, 1);
         assert!(!p.is_null());
-        assert_eq!(p as usize % 16, 0, "data pointer must be 16-byte aligned");
+        assert_eq!(p as usize % 64, 0, "data pointer must be 64-byte aligned");
         // SAFETY: p points at n*4 zeroed bytes owned by this test.
         unsafe {
             let f = p as *mut f32;

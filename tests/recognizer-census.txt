@@ -25,6 +25,7 @@ alias_transpose_inplace.wk:
 alias_transpose_inplace8.wk:
 alias_unknown_republish.wk: wukong_rt_alloc wukong_rt_alloc*4
 alias_view_binding_block_value.wk: wukong_rt_alloc wukong_rt_alloc*5
+alloc_scratch_arena.wk: wukong_rt_alloc wukong_rt_free wukong_rt_scratch_alloc wukong_rt_scratch_alloc*5 wukong_rt_scratch_mark wukong_rt_scratch_mark*6 wukong_rt_scratch_release wukong_rt_scratch_release*4
 annotated_mixed_width_binop.wk:
 argmax.wk: wukong_argreduce_f32 wukong_argreduce_f32*3
 argmax_seed_edges.wk: veckernel*2 wukong_argreduce_f32 wukong_argreduce_f32*5

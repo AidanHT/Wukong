@@ -46,7 +46,8 @@ use wukong_mir::{
     RoundMode, ValueId, VecBin, VecCmp, VecKernel, VecOp, VecRedOp, VecReduce,
 };
 use wukong_sema::{
-    heap_alloc_elem, is_now_ns, is_sync_block, DefKind, EnumVariant, SemaResult, VariantPayload,
+    heap_alloc_elem, is_now_ns, is_scratch_mark, is_scratch_release, is_sync_block,
+    scratch_alloc_elem, DefKind, EnumVariant, SemaResult, VariantPayload,
 };
 use wukong_span::{Interner, Span, Symbol};
 use wukong_types::Ty;
@@ -1176,6 +1177,9 @@ pub fn lower_program_located(
         attn: interner.intern("wukong_attention_f32"),
         rt_alloc: interner.intern("wukong_rt_alloc"),
         rt_free: interner.intern("wukong_rt_free"),
+        rt_scratch_alloc: interner.intern("wukong_rt_scratch_alloc"),
+        rt_scratch_mark: interner.intern("wukong_rt_scratch_mark"),
+        rt_scratch_release: interner.intern("wukong_rt_scratch_release"),
         rt_read_f32: interner.intern("wukong_rt_read_f32"),
         rt_read_i32: interner.intern("wukong_rt_read_i32"),
         rt_read_i64: interner.intern("wukong_rt_read_i64"),
@@ -3360,6 +3364,12 @@ struct GemmSyms {
     /// backing the `alloc_<T>(n)` builtins, and its `wukong_rt_free(data)` release twin.
     rt_alloc: Symbol,
     rt_free: Symbol,
+    /// The scratch allocator behind `scratch_<T>(n)` / `scratch_mark()` / `scratch_release(m)`
+    /// (`wukong_runtime::scratch`): `wukong_rt_scratch_alloc` shares `wukong_rt_alloc`'s ABI,
+    /// `wukong_rt_scratch_mark() -> i64`, `wukong_rt_scratch_release(mark: i64)`.
+    rt_scratch_alloc: Symbol,
+    rt_scratch_mark: Symbol,
+    rt_scratch_release: Symbol,
     /// The 12 raw file-I/O runtime entry points (`wukong_rt_{read,write}_{f32,i32,i64,u8,f64,i8}`)
     /// backing the `read_<T>(path, buf)` / `write_<T>(path, buf)` builtins. Each takes `(path: *const
     /// u8, data: *T, len: i64)` and returns an `i64`: the element count on success, or -1 (open/create
@@ -20671,8 +20681,38 @@ impl FnLowerer<'_> {
     /// fat pointer's data field and emits a void `wukong_rt_free(data)`. Both are opaque
     /// `Op::Call`s to the optimizer, which treats calls conservatively (no CSE/DSE/LICM across
     /// them), so allocation identity and stores into the allocation are preserved.
+    ///
+    /// The scratch family lowers the same way: `scratch_<T>(n)` is the identical slice construction
+    /// around `wukong_rt_scratch_alloc` (same ABI as `wukong_rt_alloc`), `scratch_mark()` is a
+    /// `wukong_rt_scratch_mark() -> i64` call and `scratch_release(m)` a void
+    /// `wukong_rt_scratch_release(m as i64)`. Opaque calls again, so nothing moves across them.
     fn lower_heap_builtin(&mut self, name: Symbol, args: &[Expr]) -> Option<ValueId> {
         let nm = self.interner.resolve(name);
+        if is_scratch_mark(nm) {
+            if !args.is_empty() {
+                return None;
+            }
+            let func = self.gemm.rt_scratch_mark;
+            return Some(
+                self.builder
+                    .build(MirType::I64, Op::Call { func, args: vec![] }),
+            );
+        }
+        if is_scratch_release(nm) {
+            if args.len() != 1 {
+                return None;
+            }
+            let mty = self.expr_mir(&args[0]);
+            let signed = self.signed(&args[0]);
+            let mv = self.lower_expr(&args[0]);
+            let mark = self.coerce_to(mv, &mty, &MirType::I64, signed);
+            let func = self.gemm.rt_scratch_release;
+            self.builder.build_void(Op::Call {
+                func,
+                args: vec![mark],
+            });
+            return Some(self.const_zero(MirType::I32));
+        }
         if nm == "free" {
             // Sema guarantees a single slice argument (E0401/E0503 otherwise); decline anything
             // else so the generic unsupported-call path reports it rather than miscompiling.
@@ -20689,7 +20729,10 @@ impl FnLowerer<'_> {
             });
             return Some(self.const_zero(MirType::I32));
         }
-        let elem = heap_alloc_elem(nm)?;
+        let (elem, func) = match heap_alloc_elem(nm) {
+            Some(elem) => (elem, self.gemm.rt_alloc),
+            None => (scratch_alloc_elem(nm)?, self.gemm.rt_scratch_alloc),
+        };
         if args.len() != 1 {
             return None;
         }
@@ -20716,7 +20759,6 @@ impl FnLowerer<'_> {
             MirType::I64,
             Op::ConstInt(elem.is_float() as i128, MirType::I64),
         );
-        let func = self.gemm.rt_alloc;
         let data = self.builder.build(
             MirType::Ptr,
             Op::Call {

@@ -301,6 +301,10 @@ const RT_BOUNDS_FAIL: &str = "wukong_rt_bounds_fail";
 // The heap builtins: zeroed allocation (count, elem_size, elem_is_float) -> ptr, and its release.
 const RT_ALLOC: &str = "wukong_rt_alloc";
 const RT_FREE: &str = "wukong_rt_free";
+// The scratch allocator: alloc shares RT_ALLOC's ABI; mark () -> i64; release (i64) -> void.
+const RT_SCRATCH_ALLOC: &str = "wukong_rt_scratch_alloc";
+const RT_SCRATCH_MARK: &str = "wukong_rt_scratch_mark";
+const RT_SCRATCH_RELEASE: &str = "wukong_rt_scratch_release";
 // The file-I/O intrinsics: read_/write_ × {f32,f64,i32,i64,i8,u8}, each (path, data, len) -> i64.
 // All twelve share one ABI (two pointers + an i64 count) so cranelift declares them from one signature.
 const RT_READ_F32: &str = "wukong_rt_read_f32";
@@ -1833,6 +1837,27 @@ impl<'a> FnTranslator<'a> {
             self.builder.ins().call(fref, &[data]);
             return None;
         }
+        // The scratch builtins (`wukong_runtime::scratch`): alloc with `wukong_rt_alloc`'s ABI,
+        // mark returning the live-allocation count, release taking a mark.
+        if name == RT_SCRATCH_ALLOC && args.len() == 3 {
+            let count = self.coerce_to_i64(args[0]);
+            let esize = self.coerce_to_i64(args[1]);
+            let isf = self.coerce_to_i64(args[2]);
+            let fref = self.runtime_ref(RT_SCRATCH_ALLOC);
+            let call = self.builder.ins().call(fref, &[count, esize, isf]);
+            return self.builder.inst_results(call).first().copied();
+        }
+        if name == RT_SCRATCH_MARK && args.is_empty() {
+            let fref = self.runtime_ref(RT_SCRATCH_MARK);
+            let call = self.builder.ins().call(fref, &[]);
+            return self.builder.inst_results(call).first().copied();
+        }
+        if name == RT_SCRATCH_RELEASE && args.len() == 1 {
+            let mark = self.coerce_to_i64(args[0]);
+            let fref = self.runtime_ref(RT_SCRATCH_RELEASE);
+            self.builder.ins().call(fref, &[mark]);
+            return None;
+        }
         // The `now_ns()` timing intrinsic: wukong_now_ns() -> i64, a monotonic process-lifetime
         // nanosecond clock. No arguments; returns the i64 stamp, bound like the value-returning
         // runtime calls below.
@@ -2324,6 +2349,9 @@ struct RtFuncs {
     bounds_fail: FuncId,
     rt_alloc: FuncId,
     rt_free: FuncId,
+    rt_scratch_alloc: FuncId,
+    rt_scratch_mark: FuncId,
+    rt_scratch_release: FuncId,
     rt_read_f32: FuncId,
     rt_read_f64: FuncId,
     rt_read_i32: FuncId,
@@ -2933,6 +2961,17 @@ fn populate_module<M: Module>(
         rt_free: module
             .declare_function(RT_FREE, Linkage::Import, &sig_rt_free)
             .map_err(|e| e.to_string())?,
+        rt_scratch_alloc: module
+            .declare_function(RT_SCRATCH_ALLOC, Linkage::Import, &sig_rt_alloc)
+            .map_err(|e| e.to_string())?,
+        // () -> i64, the `now_ns` shape.
+        rt_scratch_mark: module
+            .declare_function(RT_SCRATCH_MARK, Linkage::Import, &sig_now_ns)
+            .map_err(|e| e.to_string())?,
+        // (i64) -> void, the `print_i64` shape.
+        rt_scratch_release: module
+            .declare_function(RT_SCRATCH_RELEASE, Linkage::Import, &sig_i)
+            .map_err(|e| e.to_string())?,
         rt_read_f32: module
             .declare_function(RT_READ_F32, Linkage::Import, &sig_rt_fileio)
             .map_err(|e| e.to_string())?,
@@ -3437,6 +3476,9 @@ fn populate_module<M: Module>(
         (RT_BOUNDS_FAIL, rt.bounds_fail),
         (RT_ALLOC, rt.rt_alloc),
         (RT_FREE, rt.rt_free),
+        (RT_SCRATCH_ALLOC, rt.rt_scratch_alloc),
+        (RT_SCRATCH_MARK, rt.rt_scratch_mark),
+        (RT_SCRATCH_RELEASE, rt.rt_scratch_release),
         (RT_READ_F32, rt.rt_read_f32),
         (RT_READ_F64, rt.rt_read_f64),
         (RT_READ_I32, rt.rt_read_i32),
@@ -4073,6 +4115,9 @@ impl JitProgram {
         let _guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clear();
         reset_failure();
+        // This entry runs on the caller's thread, which keeps its scratch arena between calls: start
+        // every call at scratch mark 0, as a fresh run (and the interpreter) does.
+        wukong_runtime::scratch_reset();
         let result = unsafe { self.invoke() };
         if take_failure().is_some() {
             1
@@ -4182,6 +4227,18 @@ fn jit_compile_entry(
     builder.symbol(RT_BOUNDS_FAIL, rt_bounds_fail as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);
     builder.symbol(RT_FREE, wukong_runtime::wukong_rt_free as *const u8);
+    builder.symbol(
+        RT_SCRATCH_ALLOC,
+        wukong_runtime::wukong_rt_scratch_alloc as *const u8,
+    );
+    builder.symbol(
+        RT_SCRATCH_MARK,
+        wukong_runtime::wukong_rt_scratch_mark as *const u8,
+    );
+    builder.symbol(
+        RT_SCRATCH_RELEASE,
+        wukong_runtime::wukong_rt_scratch_release as *const u8,
+    );
     builder.symbol(RT_READ_F32, wukong_runtime::wukong_rt_read_f32 as *const u8);
     builder.symbol(RT_READ_F64, wukong_runtime::wukong_rt_read_f64 as *const u8);
     builder.symbol(RT_READ_I32, wukong_runtime::wukong_rt_read_i32 as *const u8);
@@ -4784,6 +4841,18 @@ pub fn jit_module(program: &Program, interner: &Interner) -> Result<JitModuleHan
     builder.symbol(RT_BOUNDS_FAIL, rt_bounds_fail_abort as *const u8);
     builder.symbol(RT_ALLOC, wukong_runtime::wukong_rt_alloc as *const u8);
     builder.symbol(RT_FREE, wukong_runtime::wukong_rt_free as *const u8);
+    builder.symbol(
+        RT_SCRATCH_ALLOC,
+        wukong_runtime::wukong_rt_scratch_alloc as *const u8,
+    );
+    builder.symbol(
+        RT_SCRATCH_MARK,
+        wukong_runtime::wukong_rt_scratch_mark as *const u8,
+    );
+    builder.symbol(
+        RT_SCRATCH_RELEASE,
+        wukong_runtime::wukong_rt_scratch_release as *const u8,
+    );
     builder.symbol(RT_READ_F32, wukong_runtime::wukong_rt_read_f32 as *const u8);
     builder.symbol(RT_READ_F64, wukong_runtime::wukong_rt_read_f64 as *const u8);
     builder.symbol(RT_READ_I32, wukong_runtime::wukong_rt_read_i32 as *const u8);

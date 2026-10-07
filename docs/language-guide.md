@@ -747,7 +747,10 @@ runtime length `n`, and `free(s)` releases it — the first runtime-sized buffer
 place (a user-defined function of the same name shadows the builtin). The count may be any integer
 type; a **negative count yields an empty slice** (`len() == 0`). Contents are deterministically
 zero on both backends — calloc'd bytes on native, typed zero values in the interpreter — so a
-read-before-write is well-defined. The result is an ordinary slice: `s[i]`, `s.len()`,
+read-before-write is well-defined. Natively every allocation starts on a **64-byte (cache-line)
+boundary**, in a linked executable too, so aligned 256-bit accesses and non-temporal store streams
+need no peeling prologue and two threads splitting a buffer at a line boundary never false-share.
+The result is an ordinary slice: `s[i]`, `s.len()`,
 `for x in s`, and fn-boundary passing/mutation all compose (`tests/run/heap_*.wk`) — and a slice is a
 first-class **kernel operand**: an `alloc_*` buffer handed to a matmul/GEMV nest, a norm, an activation
 loop, a reduction, a scan or `sdpa` dispatches to the same tuned runtime kernel a fixed-size `[T; N]`
@@ -784,9 +787,33 @@ says `n` would only move the failure to the first element access, so it reports 
 exhausted allocating N element(s)` as a diagnostic and exits 1 instead of returning a null slice. A program must therefore not branch on
 allocation success and expect backend-identical behaviour.
 
-No garbage collector and no hidden allocations beyond what you `alloc_*`: *named* allocator
-selection (`System`, `Arena`, `Scratch`, `Pool` — 🔵) and cleanup via `defer` (🔵) are still being
-wired to the surface. **`@parallel` functions
+**Scratch allocation runs today** (✅): `scratch_<T>(n)` (the same eight element types as
+`alloc_<T>`) returns a zero-initialized, 64-byte-aligned `[]T` from a per-thread **scratch arena**
+for temporaries, `scratch_mark()` returns the number of live scratch allocations as an `i64`, and
+`scratch_release(m)` releases every scratch allocation made after mark `m` was taken — LIFO, like
+Odin's temp allocator or Zig's arena reset. Released memory is handed out again (zeroed again), so a
+kernel that needs a buffer per call stops paying a system allocation, a free and fresh-page faults
+every time: after its first call, a balanced `mark; scratch_…; release` allocates nothing.
+
+```wukong
+fn layer(x: []f32, mut out: []f32) {
+    let m: i64 = scratch_mark();
+    let mut tmp: []f32 = scratch_f32(x.len());   // zeroed, 64-byte aligned
+    // … fill and consume tmp …
+    scratch_release(m);                          // tmp is dead from here on
+}
+```
+
+The mark is a *count*, so it is the same value on every backend. A negative mark releases
+everything; a mark at or past the current count releases nothing. Using a slice after it has been
+released is undefined behaviour on the native backend (its bytes are reused), outside the
+differential contract exactly like a use after `free`. Zero-length requests and allocation failure
+behave as for `alloc_<T>` (null data natively, a diagnostic in the interpreter) and still count
+toward the mark (`tests/run/alloc_scratch_arena.wk`).
+
+No garbage collector and no hidden allocations beyond what you `alloc_*` or `scratch_*`: *named*
+allocator selection (`System`, `Pool` — 🔵) and cleanup via `defer` (🔵) are still being wired to
+the surface. **`@parallel` functions
 execute today** (✅): the native backend outlines the loop body into its own function and dispatches it
 across CPU cores through the `wukong_runtime` rayon-backed C-ABI entry point
 `wukong_parallel_for(n, body, env)`, which hands each worker a contiguous chunk of `[0, n)` and returns

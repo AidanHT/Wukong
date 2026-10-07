@@ -431,6 +431,7 @@ pub fn run_capturing(
             interner,
             memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -523,6 +524,7 @@ pub fn run_with_output_accel(
             interner,
             memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -631,6 +633,7 @@ fn run_kernel_f32_inner(
             interner,
             memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -700,6 +703,7 @@ pub fn run_kernel_f64(
             interner,
             memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -760,6 +764,7 @@ pub fn run_kernel_i8(
             interner,
             memory: null_reserved_memory(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::with_capacity(8),
@@ -799,11 +804,25 @@ pub fn run_kernel_i8(
     })
 }
 
+/// The interpreter's model of the scratch allocator (`scratch_<T>` / `scratch_mark` /
+/// `scratch_release`; the contract and the native arena are in `wukong_runtime::scratch`). The
+/// mark is the number of live scratch allocations — the same count native reports — and a
+/// released region becomes reusable by the next allocation made at its depth.
+#[derive(Default)]
+struct ScratchSlots {
+    /// One `(base slot, capacity in slots)` per live scratch allocation, oldest first.
+    live: Vec<(usize, usize)>,
+    /// `free[d]`: the region most recently released from depth `d`, if not yet reused.
+    free: Vec<Option<(usize, usize)>>,
+}
+
 struct Interp<'a, 'k> {
     program: &'a Program,
     interner: &'a Interner,
     memory: Vec<Value>,
     stdout: Vec<u8>,
+    /// The scratch allocations of this run (see [`ScratchSlots`]).
+    scratch_arena: ScratchSlots,
     /// Recycled register files, one per active call depth. Pooling them keeps recursion and
     /// call-heavy code from allocating a fresh vector on every call.
     frames: Vec<Vec<Value>>,
@@ -1750,6 +1769,70 @@ impl<'a, 'k> Interp<'a, 'k> {
             // interpreter; a use-after-free still reads the old values here while being undefined
             // on native — such programs are outside the differential contract (documented UB).
             "wukong_rt_free" => Ok(Value::Unit),
+            // `wukong_rt_scratch_alloc(count, elem_size, elem_is_float) -> ptr` — `scratch_<T>(n)`
+            // (the contract is in `wukong_runtime::scratch`). `count` typed-zero slots exactly like
+            // `wukong_rt_alloc`, counted as one live scratch allocation — a zero-length one too, as
+            // natively, so `scratch_mark()` agrees. The region released last from this depth is
+            // handed out again when it is large enough, re-zeroed as native re-zeroes its reused
+            // bytes, so a balanced `mark; scratch_…; release` loop reuses one region instead of
+            // growing the run's memory every iteration.
+            "wukong_rt_scratch_alloc" => {
+                let count = args.first().map(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+                let is_float = args.get(2).map(|v| v.as_int()).unwrap_or(0) != 0;
+                let zero = if is_float {
+                    Value::Float(0.0)
+                } else {
+                    Value::Int(0)
+                };
+                let depth = self.scratch_arena.live.len();
+                let reuse = self
+                    .scratch_arena
+                    .free
+                    .get_mut(depth)
+                    .and_then(Option::take)
+                    .filter(|&(_, cap)| cap >= count);
+                let (base, cap) = match reuse {
+                    Some(region) => region,
+                    None => {
+                        // The same ceiling and the same `try_reserve` guard as `wukong_rt_alloc`.
+                        const MAX_SLOTS: usize = 1 << 31;
+                        if count > MAX_SLOTS {
+                            return Err(format!(
+                                "interpreter heap exhausted allocating {count} element(s)"
+                            ));
+                        }
+                        let idx = self.memory.len();
+                        self.memory.try_reserve(count).map_err(|_| {
+                            format!("interpreter heap exhausted allocating {count} element(s)")
+                        })?;
+                        self.memory.resize(idx + count, zero);
+                        (idx, count)
+                    }
+                };
+                self.memory[base..base + count].fill(zero);
+                self.scratch_arena.live.push((base, cap));
+                Ok(Value::Ptr(base))
+            }
+            // `wukong_rt_scratch_mark() -> i64` — `scratch_mark()`: the live scratch-allocation
+            // count, the backend-independent value native's arena reports.
+            "wukong_rt_scratch_mark" => Ok(Value::Int(self.scratch_arena.live.len() as i128)),
+            // `wukong_rt_scratch_release(mark)` — `scratch_release(m)`: pop the allocations made
+            // after `mark`, each becoming the reusable region of its depth. A negative mark
+            // releases them all; a mark at or past the count releases nothing.
+            "wukong_rt_scratch_release" => {
+                let mark = args.first().map(|v| v.as_int()).unwrap_or(0).max(0);
+                let mark = usize::try_from(mark).unwrap_or(usize::MAX);
+                let arena = &mut self.scratch_arena;
+                while arena.live.len() > mark {
+                    let depth = arena.live.len() - 1;
+                    let region = arena.live.pop();
+                    if arena.free.len() <= depth {
+                        arena.free.resize(depth + 1, None);
+                    }
+                    arena.free[depth] = region;
+                }
+                Ok(Value::Unit)
+            }
             // `wukong_now_ns() -> i64` — the `now_ns()` timing intrinsic. Call the *same*
             // `wukong_runtime` clock the native backend links (a monotonic process-lifetime epoch),
             // so both backends read one clock. The value is inherently non-deterministic, but a
@@ -5305,6 +5388,7 @@ mod tests {
             interner: &interner,
             memory: Vec::new(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::new(),
@@ -5418,6 +5502,7 @@ mod tests {
             interner: &interner,
             memory: Vec::new(),
             stdout: Vec::new(),
+            scratch_arena: ScratchSlots::default(),
             frames: Vec::new(),
             call_args: Vec::new(),
             scratch: Vec::new(),
@@ -5640,6 +5725,7 @@ mod tests {
                                     .map(Value::Float)
                                     .collect(),
                                 stdout: Vec::new(),
+                                scratch_arena: ScratchSlots::default(),
                                 frames: Vec::new(),
                                 call_args: Vec::new(),
                                 scratch: Vec::new(),
@@ -6040,3 +6126,6 @@ mod kernel_extent_marshalling_tests;
 
 #[cfg(test)]
 mod transfer_bounds_tests;
+
+#[cfg(test)]
+mod scratch_tests;

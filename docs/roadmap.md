@@ -158,6 +158,20 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   emits `wukong_vmath_f32`, and velem / GEMM / reduction nests over slices dispatch too. What still
   declines on a slice base is the *general* auto-vectorizer — the same loop written over slices emits
   no vector ops where the fixed-array form does (a future perf lever, correctness unaffected).
+  Native heap data is **64-byte aligned** (the runtime's `HEAP_ALIGN`, mirrored by the `cc`
+  fallback shim), not the system allocator's 16.
+- **Scratch allocation** — `scratch_<T>(n) -> []T`, `scratch_mark() -> i64`,
+  `scratch_release(m)`: a per-thread bump arena for temporaries (`wukong_runtime::scratch`), the
+  temporary-storage design of Odin/Jai/Zig. Zeroed, 64-byte-aligned slices; the mark is the count of
+  live scratch allocations (identical on every backend); a release pops everything allocated after
+  its mark, LIFO, and the bytes are reused (and re-zeroed) by the next allocations, so a balanced
+  per-call `mark; scratch_…; release` stops allocating after its first call. Chunks never move and
+  grow geometrically. The interpreter mirrors the count and reuses a released region at the same
+  depth, so its memory stays bounded too. Lowered to opaque `wukong_rt_scratch_{alloc,mark,release}`
+  calls like the heap builtins; misuse is E0401/E0503; use after release is undefined on native,
+  like use after `free` (`tests/run/alloc_scratch_arena.wk`, also in the AOT gate). Not yet: an
+  uninitialized variant, an arena handle a program can pass around, and `@align(N)` (still parsed
+  and discarded — every heap and scratch allocation is already 64-byte aligned).
 - **Typed file I/O** — `read_<T>(path, buf) -> i64` and `write_<T>(path, buf) -> i64` over the dtypes
   {`f32`, `f64`, `i32`, `i64`, `i8`, `u8`}, where `path` is a `*u8` string literal and `buf` a `[]T`
   slice (typically from `alloc_<T>`). The on-disk format is frozen and **headerless: raw contiguous

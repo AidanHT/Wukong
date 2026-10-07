@@ -56,6 +56,36 @@ pub fn heap_alloc_elem(name: &str) -> Option<Scalar> {
     })
 }
 
+/// The element scalar of a scratch-allocation builtin (`scratch_f32` → `F32`), or `None` for any
+/// other name — the temporary-storage twin of [`heap_alloc_elem`], over the same element types.
+/// `scratch_<T>(n) -> []T` hands out `n` zeroed, 64-byte-aligned elements from the running
+/// thread's scratch arena; [`is_scratch_mark`] / [`is_scratch_release`] name the two builtins that
+/// scope them (see `wukong_runtime::scratch` for the contract). A user-defined function of the same
+/// name shadows the builtin.
+pub fn scratch_alloc_elem(name: &str) -> Option<Scalar> {
+    Some(match name {
+        "scratch_f32" => Scalar::F32,
+        "scratch_f64" => Scalar::F64,
+        "scratch_i32" => Scalar::I32,
+        "scratch_i64" => Scalar::I64,
+        "scratch_i8" => Scalar::I8,
+        "scratch_u8" => Scalar::U8,
+        "scratch_f16" => Scalar::F16,
+        "scratch_bf16" => Scalar::Bf16,
+        _ => return None,
+    })
+}
+
+/// Whether `name` is `scratch_mark()`: the number of live scratch allocations, an `i64`.
+pub fn is_scratch_mark(name: &str) -> bool {
+    name == "scratch_mark"
+}
+
+/// Whether `name` is `scratch_release(mark)`: release every scratch allocation made after `mark`.
+pub fn is_scratch_release(name: &str) -> bool {
+    name == "scratch_release"
+}
+
 /// The buffer-element scalar of a file-I/O intrinsic (`read_f32`/`write_f32` → `F32`), or `None`
 /// for any other name. The file-I/O surface is the per-scalar `read_<T>(path, buf) -> i64` /
 /// `write_<T>(path, buf) -> i64` family over the dtypes {f32, f64, i32, i64, i8, u8}: sema types
@@ -5003,6 +5033,29 @@ mod tests {
         assert!(errors("fn f() { free(); }").contains(&"E0503"));
         // … and freeing a non-slice is an E0401.
         assert!(errors("fn f() { free(5); }").contains(&"E0401"));
+    }
+
+    #[test]
+    fn scratch_builtins_are_typed_and_misuse_is_rejected() {
+        // `scratch_<T>(n)` types as `[]T` like `alloc_<T>`, `scratch_mark()` as `i64` and
+        // `scratch_release(m)` as unit; any integer mark is accepted.
+        let ok = "fn take(s: []f32) -> i64 { return s.len(); } \
+                  fn f() -> i64 { let m: i64 = scratch_mark(); \
+                  let s: []f32 = scratch_f32(8); let t = scratch_u8(3); \
+                  let r = take(s) + t.len(); scratch_release(m); scratch_release(0i32); \
+                  return r; }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        let annotated = "fn f() { let m: f32 = scratch_mark(); }";
+        assert!(
+            errors(annotated).contains(&"E0401"),
+            "scratch_mark is an i64: {:?}",
+            errors(annotated)
+        );
+        assert!(errors("fn f() { let s = scratch_f32(1.5); }").contains(&"E0401"));
+        assert!(errors("fn f() { let s = scratch_i64(); }").contains(&"E0503"));
+        assert!(errors("fn f() { let m = scratch_mark(1); }").contains(&"E0503"));
+        assert!(errors("fn f() { scratch_release(); }").contains(&"E0503"));
+        assert!(errors("fn f() { scratch_release(2.0); }").contains(&"E0401"));
     }
 
     #[test]

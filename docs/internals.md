@@ -61,9 +61,12 @@ wukong_span      Span, SourceMap (line index), string Interner / Symbol
 wukong_runtime   the AVX2/FMA microkernels the recognizers dispatch to (GEMM/GEMV, vmath,
                   reductions, norms, int8, bf16/f16) + the rayon-backed `wukong_parallel_for` that
                   `@parallel` lowers to — a leaf: no workspace deps, and both the interpreter and
-                  the native backend call into it. The bump `Arena` and the sequential
-                  `parallel_for` are reference surface with no caller anywhere in the workspace
-                  (the kernels use thread-local `Vec` scratch)
+                  the native backend call into it. It also backs the language's allocators:
+                  `wukong_rt_alloc` (64-byte-aligned zeroed heap) and `scratch` (the per-thread
+                  LIFO arena behind `scratch_<T>`/`scratch_mark`/`scratch_release`; the
+                  interpreter mirrors its mark count and region reuse). The bump `Arena` and the
+                  sequential `parallel_for` are reference surface with no caller anywhere in the
+                  workspace (the kernels use thread-local `Vec` scratch)
 wukong_diag      Diagnostic, Severity, error-code catalog, JSON + terminal renderers
 wukong_lexer     &str -> tokens (+ @attributes, error recovery)
 wukong_ast       AST nodes, NodeId, pretty-printer; owns `BinOp::fold_const_len` +
