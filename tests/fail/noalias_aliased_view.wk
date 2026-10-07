@@ -1,0 +1,19 @@
+// EXPECT-CODE: E0316
+module tests.fail.noalias_aliased_view
+
+// A view does not hide its storage. `view` is an immutable `[]f32` taken of `buf` itself (the one
+// implicit array-to-slice conversion copies no element), so `axpy(view, buf, 2.0)` hands the
+// promised `y` and the unpromised `x` one buffer under two names — the same broken promise as
+// `axpy(buf, buf, 2.0)`, and rejected the same way.
+fn axpy(@noalias mut y: []f32, x: []f32, a: f32) {
+    for i in 0..4 {
+        y[i] = y[i] + a * x[i];
+    }
+}
+
+fn main() -> i32 {
+    let mut buf: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    let view: []f32 = buf;
+    axpy(view, buf, 2.0);
+    return 0;
+}

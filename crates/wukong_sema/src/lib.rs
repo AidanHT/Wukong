@@ -26,7 +26,10 @@
 mod attrs;
 mod dependency;
 mod layout;
+mod noalias;
 mod shape;
+
+pub use noalias::{is_noalias_param, NOALIAS_ATTR};
 
 use std::cell::RefCell;
 
@@ -364,6 +367,9 @@ pub fn check(module: &Module, interner: &Interner) -> (SemaResult, Vec<Diagnosti
     }
     s.recheck_item_signatures(module);
     s.check_bodies(module);
+    // The `@noalias` rules (`noalias`): they compare argument storage, so they read the types the
+    // body pass just recorded.
+    noalias::check(module, interner, &s.defs, &s.types, &mut s.diags);
     let result = SemaResult {
         types: s.types,
         defs: s.defs,

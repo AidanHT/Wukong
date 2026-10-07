@@ -1,0 +1,14 @@
+// EXPECT-CODE: E0306
+module tests.fail.noalias_on_scalar
+
+// `@noalias` is a promise about the storage a parameter points into. A scalar parameter arrives as a
+// copy and points into nothing, so the attribute would promise nothing — and silently accepting an
+// attribute that does nothing is exactly what E0306 exists to prevent.
+fn twice(@noalias x: f32) -> f32 {
+    return x * 2.0;
+}
+
+fn main() -> i32 {
+    let y: f32 = twice(1.5);
+    return 0;
+}

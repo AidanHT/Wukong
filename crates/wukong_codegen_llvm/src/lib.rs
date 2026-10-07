@@ -1120,4 +1120,18 @@ mod tests {
             "scalars should be promoted:\n{out}"
         );
     }
+
+    /// A `@noalias` parameter is LLVM's `noalias` argument attribute, on that parameter only.
+    #[test]
+    fn a_promised_parameter_is_emitted_noalias() {
+        let out = ir(
+            "fn k(@noalias mut o: [f32; 4], x: [f32; 4]) { o[0] = x[0]; } \
+             fn main() -> i32 { return 0; }",
+        );
+        assert!(
+            out.contains("define void @k(ptr noalias %v0, ptr %v1)"),
+            "{out}"
+        );
+        assert_eq!(out.matches("noalias").count(), 1, "{out}");
+    }
 }

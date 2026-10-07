@@ -28,6 +28,7 @@
 
 mod alias;
 mod canon;
+mod noalias;
 mod tile;
 mod tindex;
 
@@ -2331,6 +2332,7 @@ fn parallel_spec<'a>(
         let base = proof.builder.add_param(MirType::Ptr);
         proof.param_arrays.push((base, ty.clone()));
         proof.bind(p.name.sym, base, mir_ty(ty));
+        noalias::record_param(&mut proof.builder, p, ty, base, interner);
     }
     // The mixed-radix proof needs a known iteration domain. An unknown bound conservatively
     // retains serial execution; it must never be guessed from the array's storage extent.
@@ -2555,6 +2557,8 @@ fn lower_fn(
         if ty_is_buffer_param(pty) {
             fl.param_arrays.push((val, pty.clone()));
         }
+        // A `@noalias` promise rides on the MIR parameter (`noalias.rs`).
+        noalias::record_param(&mut fl.builder, p, pty, val, interner);
         // A statically-shaped contiguous tensor param binds as the buffer it *is* — `[T; d0·…·dn]` —
         // not as an opaque `Ptr`. Both spellings arrive as the same base pointer (`param_abi` maps
         // `Array(..)` back to `Ptr`, so the ABI is byte-identical), but only the `Array` form takes

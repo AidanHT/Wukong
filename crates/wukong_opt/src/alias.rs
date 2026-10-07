@@ -1438,4 +1438,61 @@ mod tests {
         let dump = wukong_mir::print::print_function(&plain, &it);
         assert!(!dump.contains("noalias"), "{dump}");
     }
+
+    /// Lower `src` through the real front end and the `-O1` pipeline, returning `func`.
+    fn lowered(src: &str, func: &str, level: u8) -> Function {
+        let mut interner = Interner::new();
+        let (module, pd) =
+            wukong_parser::parse_module(src, wukong_span::SourceId(0), &mut interner);
+        assert!(pd.iter().all(|d| !d.is_error()), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (mut program, _) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        crate::optimize(&mut program, level);
+        let sym = interner.intern(func);
+        program
+            .function(sym)
+            .unwrap_or_else(|| panic!("no fn {func}"))
+            .clone()
+    }
+
+    /// End to end from the surface syntax: the two-slice loop that owes a runtime alias check
+    /// (`loop_info::tests::two_slice_parameters_need_a_runtime_check`) owes none once the output is
+    /// promised — the store to `o[i]` provably cannot reach `x`, whatever the caller passes.
+    #[test]
+    fn a_promised_slice_loop_owes_no_runtime_alias_check() {
+        use crate::loop_info::{analyze_function, AddrForm, MemDep};
+        let verdict = |params: &str| {
+            let src = format!(
+                "fn k({params}) {{ let mut i: i64 = 0; \
+                 while i < n {{ o[i] = x[i] * 2.0; i = i + 1; }} }} \
+                 fn main() -> i32 {{ return 0; }}"
+            );
+            let f = lowered(&src, "k", 1);
+            let forest = analyze_function(&f);
+            let l = forest
+                .loops
+                .iter()
+                .max_by_key(|l| {
+                    l.accesses
+                        .iter()
+                        .filter(|a| matches!(a.addr, AddrForm::Affine { .. }))
+                        .count()
+                })
+                .expect("a loop");
+            l.dep.memory
+        };
+        assert_eq!(
+            verdict("x: []f32, mut o: []f32, n: i64"),
+            MemDep::IndependentIfBasesDisjoint
+        );
+        let promised = verdict("x: []f32, @noalias mut o: []f32, n: i64");
+        assert!(
+            matches!(
+                promised,
+                MemDep::Independent | MemDep::IndependentIfBasesStable
+            ),
+            "{promised:?}"
+        );
+    }
 }
