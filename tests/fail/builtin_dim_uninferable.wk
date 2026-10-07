@@ -1,0 +1,18 @@
+// EXPECT-CODE: E0409
+module tests.fail.builtin_dim_uninferable
+
+// A named kernel builtin is shape-checked like a generic function, so each of its dimensions must
+// be fixed by something the compiler can see. Here all three operands of `matmul` are flat arrays:
+// a 6-element `a` could be 2x3 or 3x2 (or 1x6, 6x1), and nothing else pins M, K or N. Guessing a
+// factorization would silently compute a different product than the one meant, so the call is
+// refused with E0409 at the call site; `matmul::<2, 3, 4>(a, b, c)` — or tensor-typed operands —
+// is the fix. tests/run/builtin_matmul.wk is the positive control.
+
+fn main() -> i32 {
+    let a: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b: [f32; 12] = [1.0; 12];
+    let mut c: [f32; 8] = [0.0; 8];
+    matmul(a, b, c);
+    print(c[0]);
+    return 0;
+}

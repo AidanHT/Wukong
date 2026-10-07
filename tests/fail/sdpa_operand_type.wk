@@ -1,12 +1,12 @@
-// EXPECT-CODE: C0001
+// EXPECT-CODE: E0502
 module tests.fail.sdpa_operand_type
 
-// `sdpa` has no signature in wukong_sema, so `lower_attention` is the only place its operand contract
-// — four `f32` buffers — is checked. Both calls below hand the f32 kernel buffers of another element
-// type, and both must be REFUSED at compile time (catalogued C0001 at the call site, exit 1, no
-// stdout) rather than dispatched.
+// `sdpa`'s operands are four `f32` buffers. Both calls below hand the f32 kernel buffers of another
+// element type, and both must be refused at compile time — now by `sdpa`'s shape signature in
+// wukong_sema, as the element-type mismatch E0502 at the offending operand (it used to be a
+// codegen-limit C0001 at the call site, the only check `sdpa` had before it had a signature).
 //
-// Before the guard this program compiled and ran to exit 0 printing garbage, and the two backends did
+// Before any guard this program compiled and ran to exit 0 printing garbage, and the two backends did
 // not even agree on the garbage: the f64 call printed 65 75 85 95 on the interpreter and 1 25 60 70 on
 // native — the kernel reads the f64 bytes as f32 pairs and writes f32 results into the first half of
 // the buffer. The i32 call printed a float (0.7310585975646973) out of an i32 array on the interpreter

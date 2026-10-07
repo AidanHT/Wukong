@@ -5,6 +5,16 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
+### Named kernel builtins and an `sdpa` shape signature
+
+- **Added: shape-checked kernel builtins callable by name** — `matmul`, `matmul_nt`, `matmul_tn`,
+  `linear`, `transpose`, `softmax`, `log_softmax`, `layernorm`, `rmsnorm`, the two-argument
+  activations (`gelu(x, out)`, …), `sum`/`amax`/`amin`/`dot` (new `wukong_sema::builtins`, lowered by
+  `wukong_mir_build::builtins`). New code `E0409` (a builtin dimension nothing fixes).
+- **Fixed: `sdpa` had no signature in sema** — a wrong element type or a too-short buffer is now
+  `E0502`/`E0501` at the operand instead of `C0001` at the call, runtime-sized operands are checked
+  at run time, and an `out` overlapping `q`/`k`/`v` computes through scratch.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

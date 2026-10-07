@@ -316,7 +316,7 @@ scan_1d.wk: wukong_cumprod_f32 wukong_cumsum_f32 wukong_lrscan_f32
 scan_elem_lowp.wk:
 scan_slice.wk: wukong_argreduce_f32 wukong_colargmax_i32 wukong_colsum_f32 wukong_cummax_f32 wukong_cummin_f32 wukong_cumprod_f32 wukong_cumsum_f32 wukong_lrscan_f32 wukong_rowargmax_i32 wukong_rt_alloc wukong_rt_alloc*14 wukong_rt_free wukong_rt_free*14 wukong_sgevm_f32 wukong_transpose_f32
 scatter_add.wk: wukong_scatter_add_f32
-sdpa.wk: wukong_attention_f32
+sdpa.wk: wukong_attention_f32 wukong_attention_f32*2 wukong_rt_alloc wukong_rt_free
 selective_scan_state.wk: veckernel*8
 selu.wk: wukong_vmath_f32
 selu_parallel.wk: wukong_parallel_for wukong_vmath_f32

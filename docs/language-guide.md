@@ -639,17 +639,75 @@ lowers to PTX `.shared` SMEM and `sync_block()` to `bar.sync 0` (`wukong_codegen
 - `now_ns()` — a zero-argument monotonic nanosecond clock returning `i64`, for in-process timing
   (`let t1 = now_ns(); … let dt = now_ns() - t1;`). Any argument is `E0503`. Only *differences* between
   reads are meaningful, so a program's stdout stays backend-identical.
-- `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention for one `[s, d]`
-  head: `out = softmax(scale·Q·Kᵀ [+ causal mask])·V`, computed by one runtime kernel with no S×S score
-  buffer. `q`/`k`/`v`/`out` must be `f32` arrays, `[]f32` slices, or tensor views; `s`, `d` and
-  `causal` are integers and `scale` is a float. When `s` and `d` are compile-time constants every
-  buffer whose type pins an extent must hold `s*d` elements. `sdpa` has no signature in sema, so its
-  whole contract is enforced at lowering: a malformed call is a catalogued `C0001` at the call site,
-  never a crash (`tests/fail/sdpa_operand_type.wk`, `sdpa_operand_extent.wk`).
+- `sdpa(q, k, v, out, s, d, scale, causal)` — fused scaled-dot-product attention; one of the
+  shape-checked kernel builtins below.
 
 These are recognized by the MIR builder and implemented directly by the interpreter (and, on the
 native backend, by the runtime). A user-defined function of the same name shadows any of these
 builtins.
+
+### Kernel builtins ✅
+
+The tuned runtime kernels are callable **by name**, not only through a loop nest a recognizer happens
+to match. Each builtin has a real shape signature that sema checks with the same codes a generic
+function's call gets, and each lowers to exactly one runtime kernel on every backend (the
+interpreter calls the same symbol), so it is the explicit way to say "I mean this kernel" — and it
+still means it under `@generic` or with recognition switched off. All operands are `f32` buffers
+(a `Tensor[f32, ..]`, an `[f32; N]` array, or a `[]f32` slice), row-major:
+
+| builtin | shape signature | kernel |
+|---|---|---|
+| `matmul::<M, K, N>(a, b, out)` | `a: [M, K]`, `b: [K, N]`, `out: [M, N]` | `wukong_sgemm` |
+| `matmul_nt::<M, K, N>(a, b, out)` | `a: [M, K]`, `b: [N, K]`, `out = a·bᵀ` | `wukong_sgemm_nt` |
+| `matmul_tn::<M, K, N>(a, b, out)` | `a: [K, M]`, `b: [K, N]`, `out = aᵀ·b` | `wukong_sgemm_tn` |
+| `linear::<M, K, N>(x, w, b, out)` | `x: [M, K]`, `w: [N, K]`, `b: [N]`, `out = x·wᵀ + b` | `wukong_sgemm_nt_epi` |
+| `transpose::<R, C>(x, out)` | `x: [R, C]`, `out: [C, R]` | `wukong_transpose_f32` |
+| `softmax`, `log_softmax ::<R, C>(x, out)` | `x, out: [R, C]`, over the last axis | `wukong_norm_f32` |
+| `layernorm::<R, C>(x, gamma, beta, out, eps)` | `x, out: [R, C]`, `gamma, beta: [C]` | `wukong_norm_affine_f32` |
+| `rmsnorm::<R, C>(x, gamma, out, eps)` | `x, out: [R, C]`, `gamma: [C]` | `wukong_norm_affine_f32` |
+| `exp`, `log`, `tanh`, `sigmoid`, `silu`, `gelu`, `relu (x, out)` | `x, out: [N]` | `wukong_vmath_f32` |
+| `sum`, `amax`, `amin (x) -> f32`; `dot(x, y) -> f32` | `x, y: [N]` | `wukong_sreduce_f32` |
+| `sdpa(q, k, v, out, s, d, scale, causal)` | each buffer holds at least `s·d` | `wukong_attention_f32` |
+
+The one-argument `gelu(x)`/`exp(x)`/… stay the scalar math intrinsics; only the two-argument buffer
+form is the kernel. A user function — or a local — of the same name shadows a builtin.
+
+**Where the dimensions come from**, first binding wins: an explicit turbofish (an integer literal, a
+`const`, a generic dimension, or an in-scope integer variable, which is then a *runtime* extent);
+the shape of each `Tensor` operand, unified axis by axis (a conflict is `E0502`, a rank clash
+`E0501`); the length of a fixed array, which fixes the one dimension of its shape still free (so
+`linear(x, w, b, out)` over arrays reads N from `b`, then M from `out`, then K from `x`); a
+row-wise operation's row count defaults to 1; and last a slice's runtime length. A dimension nothing
+fixes is **`E0409`** — `matmul(a, b, c)` over three flat arrays could be any factorization, so it
+needs `matmul::<2, 3, 4>(a, b, c)`. A static array whose length disagrees with its shape is `E0501`,
+a non-`f32` operand `E0502`, and writing the output through a non-`mut` aggregate parameter
+`E0304`. `sdpa`'s `s`/`d` are values: when both are constants, every operand whose type pins an
+extent must hold `s·d` elements (`E0501`) and a rank-2 tensor operand must be `[s, d]` (`E0502`).
+
+What the lowering guarantees on top of the kernel call:
+
+- **Runtime extents are checked.** A runtime dimension must lie in `0..=i32::MAX`, and an operand
+  whose length is only known at run time (a slice, or an array against a runtime dimension) must hold
+  exactly its shape's elements (`sdpa`: at least `s·d`). A violation traps like a failed `assert`
+  (exit 1, `assertion failed`) instead of reading or writing past a buffer
+  (`tests/run/builtin_extent_trap.wk`). A constant extent the kernels' signed 64-bit ABI cannot
+  carry is the codegen limit `C0001` (`tests/fail/sdpa_dimension_abi.wk`).
+- **Value semantics.** A builtin reads its inputs as they were before the call, even when the output
+  overlaps one: the call compares address ranges at run time and, on overlap, computes into scratch
+  and copies the result out (`matmul::<2, 2, 2>(p, q, p)` is `p·q`). An elementwise or row-wise
+  builtin spelled in place with one name (`softmax(x, x)`) runs in place with no test.
+- **Empty contractions.** `matmul` with `K = 0` is the zero matrix and `linear` the broadcast bias,
+  although the GEMM kernels themselves write nothing for `K = 0`.
+- Inside a `@parallel` function each call uses the kernel's multicore twin, which is bit-identical.
+- Reductions follow the kernel's documented lane order and identities: an empty `sum` is `0`, an
+  empty `amax`/`amin` is `-inf`/`+inf`.
+
+`sum` and `dot` lower to the same single `wukong_sreduce_f32` call the reduction recognizer emits,
+which the autodiff tape already differentiates; `amax`/`amin` have no VJP, and the buffer-writing
+builtins add the overlap branch, which the single-block autodiff tape does not take yet. Fixtures: `tests/run/builtin_matmul.wk`, `builtin_norms.wk`, `builtin_activations.wk`,
+`builtin_reductions.wk`, `sdpa_blocks.wk` (two query blocks, D = 9, both mask modes), each printing
+every lane against hand-derived values; `tests/fail/builtin_dim_uninferable.wk`,
+`sdpa_operand_extent.wk`, `sdpa_operand_type.wk`.
 
 ### Math intrinsics ✅
 

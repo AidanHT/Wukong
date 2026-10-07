@@ -34,6 +34,15 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   duplicate name is the ordinary `E0300`, pointing at both definitions with each file's own
   path/line. (`import … as …` / `import x.{a,b}` parse but don't rename/restrict yet;
   `--emit=tokens|ast` stay root-file-only by design.)
+- **Named kernel builtins with shape signatures** (`matmul`/`matmul_nt`/`matmul_tn`, `linear`,
+  `transpose`, `softmax`/`log_softmax`, `layernorm`/`rmsnorm`, the two-argument activations
+  `exp`/`log`/`tanh`/`sigmoid`/`silu`/`gelu`/`relu(x, out)`, `sum`/`amax`/`amin`/`dot`, and `sdpa`):
+  each lowers to exactly one runtime kernel on both backends regardless of recognition, after sema
+  unifies its dimensions like a generic call (`E0409` when nothing fixes one; `E0501`/`E0502` on a
+  disagreement). Runtime extents are checked (a violation traps like `assert`), an output that
+  overlaps an input computes through scratch (value semantics), and an empty contraction is the zero
+  matrix (`tests/run/builtin_*.wk`, `tests/run/sdpa_blocks.wk`). `sdpa` gained its shape signature
+  here; it used to be checked only at lowering, as `C0001`. See the guide's "Kernel builtins".
 - Functions (including recursion and mutual recursion — the interpreter oracle runs on a
   512 MiB worker thread, so ordinary recursion does not overflow the host's small default stack), and
   direct calls. *Caveat:* the tree-walking interpreter's call frames are ~an order of magnitude larger

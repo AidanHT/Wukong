@@ -1,15 +1,17 @@
-// EXPECT-CODE: C0001
+// EXPECT-CODE: E0501
 module tests.fail.sdpa_operand_extent
 
 // The attention kernel's documented contract is `q`, `k`, `v` valid for `s*d` f32 reads and `o` valid
 // for `s*d` f32 writes, and the only knob the programmer turns is the `s` argument — no index is ever
 // written, so nothing else in the language can catch a mistyped sequence length. With `s*d = 8` and a
-// 2-element `out`, six f32 land past the end of the buffer. When the dims are compile-time constants
-// and the buffer's type pins its extent, the call must be REFUSED (catalogued C0001, exit 1).
+// 2-element `out`, six f32 land past the end of the buffer.
 //
-// Before the guard: the interpreter caught it at run time (`error: attention output out of bounds`,
-// exit 1) but native SEGFAULTED, exit 139 — a hard interpreter-vs-native divergence, which is what
-// `native_matches_interpreter` sees here. tests/run/sdpa.wk (len == s*d) is the positive control.
+// `sdpa` now has a shape signature in wukong_sema (`builtins.rs`): when `s` and `d` are compile-time
+// constants, every operand whose type pins its extent must hold `s*d` elements, and a short one is the
+// extent-mismatch E0501 at that operand. (Before the signature this was a codegen-limit C0001 at the
+// call site, and before THAT guard the interpreter trapped at run time while native SEGFAULTED, exit
+// 139 — a hard interpreter-vs-native divergence.) tests/run/sdpa.wk (len == s*d) is the positive
+// control; a runtime `s`/`d` is checked at run time instead (tests/run/builtin_extent_trap.wk).
 
 fn main() -> i32 {
     let q: [f32; 8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
