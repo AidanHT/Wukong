@@ -2093,7 +2093,7 @@ mod tests {
         let fid = module
             .declare_function("lane_kernel", Linkage::Export, &sig)
             .unwrap();
-        module.define_function_bytes(fid, 16, &bytes, &[]).unwrap();
+        module.define_function_bytes(fid, 16, bytes, &[]).unwrap();
         module.finalize_definitions().unwrap();
         let code = module.get_finalized_function(fid);
         (module, code)
@@ -2393,7 +2393,7 @@ mod tests {
                 let a: Vec<i32> = int_input(n, 3, [i32::MIN, 0]);
                 let b: Vec<i32> = (0..n)
                     .map(|i| {
-                        if i % 3 == 0 {
+                        if i.is_multiple_of(3) {
                             a[i]
                         } else {
                             int_input(n, 5, [i32::MAX, 0])[i]

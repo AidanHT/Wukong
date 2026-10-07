@@ -490,6 +490,9 @@ pub struct VecKernelScratch<T = f32> {
     stored: Vec<Option<T>>,
 }
 
+// Not `#[derive(Default)]`: the derive would add a `T: Default` bound, and the evaluators build
+// a scratch for any `T: VecValue`, which does not imply `Default`.
+#[allow(clippy::derivable_impls)]
 impl<T> Default for VecKernelScratch<T> {
     fn default() -> Self {
         VecKernelScratch {
