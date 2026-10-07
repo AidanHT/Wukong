@@ -27,13 +27,15 @@
 //! defined as written).
 //!
 //! Making the three implementations agree on that meaning therefore has exactly one shape: a
-//! recognizer whose kernel needs disjointness must **decline** unless disjointness is proven, and
-//! let the scalar nest lower. That is what LLVM's `LoopIdiomRecognize` does when alias analysis
-//! cannot separate the store range from the load range (it forms `memmove` where it can and bails
-//! otherwise), and what Polly/LoopVersioning do when they cannot: they emit a runtime alias check
-//! and keep the original loop on the may-alias arm. Both arms of that precedent exist here —
-//! `FnLowerer::emit_nonoverlapping_call` is the runtime-check form, used by the embedding gather
-//! and scatter; this module supplies the compile-time form for everything else.
+//! recognizer whose kernel needs disjointness must run the scalar nest whenever disjointness does
+//! not hold. That is what LLVM's `LoopIdiomRecognize` does when alias analysis cannot separate the
+//! store range from the load range (it forms `memmove` where it can and bails otherwise), and what
+//! Polly/LoopVersioning do when they cannot: they emit a runtime alias check and keep the original
+//! loop on the may-alias arm. Both arms of that precedent exist here. This module supplies the
+//! compile-time form — the whole-program facts below and [`plan_kernel_alias`], the one classifier
+//! every multi-buffer emit site asks — and `kernel_guard.rs` supplies the run-time form for the
+//! pairs the classifier answers `MayAlias`: an overlap test over every constrained operand's extent
+//! that picks the kernel or the ORIGINAL source loop.
 //!
 //! # What the analysis is
 //!
@@ -200,7 +202,12 @@
 //!
 //! The fact exposed is one bit per function ([`AliasFacts::alias_free`]), not a pair set: a function
 //! that some call site can hand the same array twice — or that names one buffer twice itself — gets
-//! no disjointness-requiring kernel *at all*. That is deliberate. A pair-precise fact would have to
+//! no COMPILE-TIME disjointness for any pair of different operand names. What that costs is now an
+//! overlap test, not the kernel: every such pair is `MayAlias`, and a recognizer under a versioning
+//! context (`kernel_guard.rs`) dispatches whenever the buffers are disjoint at run time, which is
+//! every call that does not actually alias. (A recognizer with no context — a whole-function
+//! interception, a fused-normalization window — still declines, as all of them did before
+//! versioning existed.) The one bit is deliberate. A pair-precise fact would have to
 //! survive the trip into an outlined `@parallel` body (whose recognizers see `env` captures, not
 //! parameters) and into the recognizer probes (which build a `FnLowerer` with no parameter bindings
 //! at all), and each of those seams is a place to get it silently wrong. One bit that rides on
@@ -706,6 +713,145 @@ impl AliasFacts {
             aliasing,
             internal_views,
         }
+    }
+}
+
+// ---- THE KERNEL-OPERAND CLASSIFIER -------------------------------------------------------------
+//
+// Everything above answers ONE bit per function. A recognizer emitting a kernel needs a different
+// question answered, about the specific operands it is about to hand the kernel, and it needs a
+// THREE-way answer, because the three answers lead to three different lowerings:
+//
+// * `Disjoint`  -> emit the kernel. Nothing to check at run time.
+// * `MustAlias` -> the two operands are spelled with the SAME symbol, so they are the same buffer
+//                  from the same base. The kernel may run only if its contract permits exact
+//                  in-place operation for that pair; otherwise the source loop is the program.
+// * `MayAlias`  -> the compiler cannot separate them. Version the dispatch at run time: an overlap
+//                  test over the operands' extents picks the kernel when they are disjoint and the
+//                  ORIGINAL SOURCE LOOP when they are not (`kernel_guard.rs`). That is LLVM's
+//                  `LoopVersioning` shape, and it replaces what this compiler did before: a compile-
+//                  time decline, which kept a library-style `fn mm(a, b, mut c)` off the kernel for
+//                  EVERY call once ANY call site in the program aliased it.
+//
+// Every multi-buffer emit site asks through `plan_kernel_alias`, so "two different symbols, so two
+// different buffers" -- the AST symbol comparison sixteen matchers used to treat as a proof -- is
+// no longer an answer anywhere: a symbol comparison can only ever DECLINE (same symbol), never
+// establish disjointness on its own.
+
+/// How two buffer operands a recognizer is about to hand one kernel can relate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum KernelAlias {
+    /// Provably distinct storage: different symbols in a function `AliasFacts::alias_free` vouches
+    /// for (no call site binds two of its buffer parameters to one array, and its body never gives
+    /// one buffer two operand names).
+    Disjoint,
+    /// The same symbol, so the same buffer from the same base.
+    MustAlias,
+    /// Different symbols the compiler cannot separate at compile time.
+    MayAlias,
+}
+
+/// Classify one operand pair. `alias_free` is the enclosing function's whole-program bit
+/// (`GemmSyms::alias_free`); it is the only thing that lets two different symbols be `Disjoint`.
+pub(crate) fn classify_kernel_operands(alias_free: bool, a: Symbol, b: Symbol) -> KernelAlias {
+    if a == b {
+        KernelAlias::MustAlias
+    } else if alias_free {
+        KernelAlias::Disjoint
+    } else {
+        KernelAlias::MayAlias
+    }
+}
+
+/// What a kernel's own contract permits for one pair of its operands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PairContract {
+    /// The two operands must not overlap at all. Every cross-element kernel (GEMM, GEMV, GEVM,
+    /// transpose, pool2d, the column and row reductions, the losses) is this for each output
+    /// against each input and each other output.
+    Disjoint,
+    /// Exact in-place operation (same base, same extent) computes what the source loop computes;
+    /// any OTHER overlap does not. The row-local scans and rotations whose runtime contract says
+    /// "`out` may alias `x`" (cumsum, cummax/cummin, cumprod, lrscan, RoPE) and the backward
+    /// passes that document one permitted alias (softmax/RMSNorm backward `dx` over `dy`, the
+    /// cross-entropy backward `dx` over `x`). A SHIFTED overlap is not exact: the AVX2 row scan
+    /// loads eight lanes before it stores them, while the source loop reads `x[i+1]` after it has
+    /// already written `out[i] = x[i+1]`.
+    ExactInPlace,
+}
+
+/// One operand pair a kernel's contract constrains, by index into the emitter's operand list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct OperandPair {
+    pub(crate) a: usize,
+    pub(crate) b: usize,
+    pub(crate) contract: PairContract,
+}
+
+impl OperandPair {
+    pub(crate) fn disjoint(a: usize, b: usize) -> Self {
+        OperandPair {
+            a,
+            b,
+            contract: PairContract::Disjoint,
+        }
+    }
+
+    pub(crate) fn exact_in_place(a: usize, b: usize) -> Self {
+        OperandPair {
+            a,
+            b,
+            contract: PairContract::ExactInPlace,
+        }
+    }
+}
+
+/// The lowering a kernel dispatch gets, given its operands and its contract.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum KernelAliasPlan {
+    /// Every constrained pair is compile-time safe: emit the kernel unconditionally.
+    Dispatch,
+    /// Some pair is the same buffer and the contract forbids that: lower the source loop.
+    Decline,
+    /// These pairs need a run-time overlap test; the rest are compile-time safe.
+    Version(Vec<OperandPair>),
+}
+
+/// **The one classifier every multi-buffer recognizer emit site asks.** `syms[i]` is the operand
+/// symbol at index `i`; `pairs` are the constraints the kernel's contract places on them.
+///
+/// A `MustAlias` pair under a `Disjoint` contract declines outright -- a run-time test would only
+/// ever pick the fallback, so emitting the kernel arm would be dead code. A `MustAlias` pair under
+/// `ExactInPlace` is exact in-place by construction (same symbol, same base, and the emitters that
+/// use this contract apply no per-operand offset), so it needs no test. Only `MayAlias` pairs reach
+/// the run-time guard.
+pub(crate) fn plan_kernel_alias(
+    alias_free: bool,
+    syms: &[Symbol],
+    pairs: &[OperandPair],
+) -> KernelAliasPlan {
+    let mut runtime = Vec::new();
+    for &pair in pairs {
+        let (Some(&a), Some(&b)) = (syms.get(pair.a), syms.get(pair.b)) else {
+            // An index past the operand list is an emitter bug; refuse the kernel rather than
+            // dispatch on an unchecked pair.
+            return KernelAliasPlan::Decline;
+        };
+        match (classify_kernel_operands(alias_free, a, b), pair.contract) {
+            (KernelAlias::Disjoint, _) => {}
+            (KernelAlias::MustAlias, PairContract::ExactInPlace) => {}
+            (KernelAlias::MustAlias, PairContract::Disjoint) => return KernelAliasPlan::Decline,
+            (KernelAlias::MayAlias, _) => {
+                if !runtime.contains(&pair) {
+                    runtime.push(pair);
+                }
+            }
+        }
+    }
+    if runtime.is_empty() {
+        KernelAliasPlan::Dispatch
+    } else {
+        KernelAliasPlan::Version(runtime)
     }
 }
 
