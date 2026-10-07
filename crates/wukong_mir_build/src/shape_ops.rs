@@ -645,6 +645,21 @@ mod tests {
     }
 
     #[test]
+    fn a_question_mark_extent_binds_a_generic_dimension_at_a_call() {
+        // Sema leaves `N` unbound against a `?` argument (the lenient escape hatch); lowering
+        // passes the caller's run-time extent instead of refusing the call with C0001.
+        let (prog, interner) = lowers_clean(
+            "fn gsum<N>(a: Tensor[f32, N]) -> f32 { let mut s: f32 = 0.0; \
+             for i in 0..N { s = s + a[i]; } return s; } \
+             fn fwd(a: Tensor[f32, ?]) -> f32 { return gsum(a); } \
+             fn main() -> i32 { let b: [f32; 4] = [1.0; 4]; return fwd(b) as i32; }",
+        );
+        // `N`, then the buffer; the `?` extent, then the buffer.
+        assert_eq!(func(&prog, &interner, "gsum").params.len(), 2);
+        assert_eq!(func(&prog, &interner, "fwd").params.len(), 2);
+    }
+
+    #[test]
     fn an_unknown_question_mark_extent_is_refused_not_guessed() {
         // A `?` tensor RETURNED by a call carries no extent the caller can pass on.
         let (_, diags, _) = lower(

@@ -219,6 +219,31 @@ impl Sema<'_> {
         let Some(poly) = eq.decl.to_poly() else {
             return Solve::Progress;
         };
+        // Fold in every binding that is safe to substitute before testing linearity, so `M*N` with
+        // `N := 4` is the solvable `4*M` (a `Tensor[f32, M, N]` fed a flat array beside a
+        // `Tensor[f32, N]`). Safe means the bound value mentions none of the callee's dimension
+        // names — a constant, or an extent over caller dimensions named differently — so a caller
+        // `N` is never conflated with the callee's `N`; any other binding stays symbolic here and
+        // is substituted into the remainder below, after `g`'s coefficient is read.
+        let safe = |s: Symbol| {
+            dims.get(&s)
+                .filter(|d| d.vars().iter().all(|v| !generics.contains(v)))
+                .and_then(Dim::to_poly)
+        };
+        let poly = match poly.substitute(&safe) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error(
+                    eq.span,
+                    "E0505",
+                    format!(
+                        "dimension `{decl_s}` has no extent at this call: {}",
+                        e.describe()
+                    ),
+                );
+                return Solve::Progress;
+            }
+        };
         let Some((a, rest)) = poly.linear_in(g) else {
             return Solve::Open;
         };
@@ -749,7 +774,8 @@ impl Sema<'_> {
 mod tests {
     use crate::check;
     use wukong_diag::Diagnostic;
-    use wukong_span::{Interner, SourceId};
+    use wukong_span::{Interner, SourceId, Symbol};
+    use wukong_types::Dim;
 
     fn diags(src: &str) -> Vec<Diagnostic> {
         let mut interner = Interner::new();
@@ -829,6 +855,39 @@ mod tests {
         // ...and one that is.
         ok("fn f<N>(a: Tensor[f32, 2*N]) -> f32 { return a[0]; } \
             fn g<M>(x: Tensor[f32, 2*M]) -> f32 { return f(x); }");
+        // `N` binds directly from `b`, which turns the element count `M*N = 12` of the decaying
+        // `a` into the solvable `4*M = 12`, so `M = 3`; ten elements are no whole number of rows.
+        ok(
+            "fn f<M, N>(a: Tensor[f32, M, N], b: Tensor[f32, N]) -> f32 { return a[0, 0] + b[0]; } \
+            fn g() -> f32 { let x: [f32; 12] = [0.0; 12]; let y: [f32; 4] = [0.0; 4]; \
+            return f(x, y); }",
+        );
+        rejects(
+            "fn f<M, N>(a: Tensor[f32, M, N], b: Tensor[f32, N]) -> f32 { return a[0, 0] + b[0]; } \
+             fn g() -> f32 { let x: [f32; 10] = [0.0; 10]; let y: [f32; 4] = [0.0; 4]; \
+             return f(x, y); }",
+            "E0502",
+        );
+    }
+
+    /// Lowering reads a solved dimension from `SemaResult::call_dims` (no argument shape spells
+    /// `M` here), in the caller's terms.
+    #[test]
+    fn a_solved_dimension_is_published_for_lowering() {
+        let src = "fn f<M, N>(a: Tensor[f32, M, N], b: Tensor[f32, N]) -> f32 { \
+                   return a[0, 0] + b[0]; } \
+                   fn g() -> f32 { let x: [f32; 12] = [0.0; 12]; let y: [f32; 4] = [0.0; 4]; \
+                   return f(x, y); }";
+        let mut interner = Interner::new();
+        let (module, pdiags) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pdiags.is_empty(), "parse errors: {pdiags:?}");
+        let (result, diags) = check(&module, &interner);
+        assert!(diags.is_empty(), "{diags:?}");
+        let m = interner.get("M").expect("`M` is interned");
+        let n = interner.get("N").expect("`N` is interned");
+        let bound: Vec<&(Symbol, Dim)> = result.call_dims.values().flatten().collect();
+        assert!(bound.contains(&&(m, Dim::Const(3))), "{bound:?}");
+        assert!(bound.contains(&&(n, Dim::Const(4))), "{bound:?}");
     }
 
     #[test]

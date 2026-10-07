@@ -20297,9 +20297,11 @@ impl FnLowerer<'_> {
     /// so a generic caller forwarding its own symbolic tensor (`fn g<P,Q>(a: Tensor[f32,P,Q]){ f(a) }`)
     /// threads `P, Q` through; then (c) **sema's solved binding** for the call
     /// (`SemaResult::call_dims`), which is how a dimension that appears only inside a derived extent
-    /// (`Tensor[f32, 2*N]` fed 8 elements, `N = 4`) gets its value. A dimension that none of them
-    /// determines is a hard `C0001` compile error (a placeholder `0` keeps the MIR well-formed) —
-    /// better a clean error than a miscompiled stride; the fix is an explicit turbofish.
+    /// (`Tensor[f32, 2*N]` fed 8 elements, `N = 4`) gets its value; and last (d) the **run-time
+    /// extent** of a caller's `?` axis passed where the callee has a symbolic dim. A dimension that
+    /// none of them determines is a hard `C0001` compile error (a placeholder `0` keeps the MIR
+    /// well-formed) — better a clean error than a miscompiled stride; the fix is an explicit
+    /// turbofish.
     ///
     /// After the dims come the extents of the callee's `?` axes
     /// ([`shape_ops::dynamic_extent_params`]), each read off the argument (`arg_axis_extent`).
@@ -20343,6 +20345,29 @@ impl FnLowerer<'_> {
                 if hidden.contains(g) && !dim_map.contains_key(g) {
                     if let Some(v) = self.tensor_dim_value(d) {
                         dim_map.insert(*g, v);
+                    }
+                }
+            }
+        }
+        // (d) A caller's run-time `?` extent forwarded to a callee's symbolic dim (`gsum<N>(a:
+        // Tensor[f32, N])` called with a `Tensor[f32, ?]` parameter). Sema leaves `N` unbound —
+        // `?` is the lenient escape hatch — but the extent is known at run time here, so it is
+        // passed rather than the call refused. Only a dim nothing above determined.
+        for (pty, arg) in params.iter().zip(args) {
+            let (Ty::Tensor { shape: ps, .. }, Ty::Tensor { shape: as_, .. }) =
+                (pty, self.expr_ty(arg))
+            else {
+                continue;
+            };
+            if ps.rank() != as_.rank() {
+                continue;
+            }
+            for (axis, (p, a)) in ps.0.iter().zip(&as_.0).enumerate() {
+                if let (wukong_types::Dim::Var(g), wukong_types::Dim::Dynamic) = (p, a) {
+                    if hidden.contains(g) && !dim_map.contains_key(g) {
+                        if let Some(v) = self.tensor_axis_extent(arg, &as_.0, axis) {
+                            dim_map.insert(*g, v);
+                        }
                     }
                 }
             }
