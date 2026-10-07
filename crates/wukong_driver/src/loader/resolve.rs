@@ -531,11 +531,20 @@ impl Rewriter<'_> {
             }
             return;
         }
-        if let Some(Some(sym)) = self.qualified(head, p.segments[1]) {
-            let span = head.span.to(p.segments[1].span);
-            // `[q, item, rest..]` -> `[item', rest..]`.
-            p.segments.remove(0);
-            p.segments[0] = Ident { sym, span };
+        match self.qualified(head, p.segments[1]) {
+            Some(Some(sym)) => {
+                let span = head.span.to(p.segments[1].span);
+                // `[q, item, rest..]` -> `[item', rest..]`.
+                p.segments.remove(0);
+                p.segments[0] = Ident { sym, span };
+            }
+            Some(None) => {}
+            // Not a module qualifier and not in scope: a builtin namespace is left alone, but a
+            // root item or an extern another module owns must not leak in through a pattern or
+            // type path (`RootEnum::A`) when the expression spelling of the same path is refused.
+            None => {
+                self.unqualified(head);
+            }
         }
     }
 
