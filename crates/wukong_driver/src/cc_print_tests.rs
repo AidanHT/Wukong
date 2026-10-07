@@ -193,6 +193,10 @@ fn float_print_object_emission_remains_available() {
         emit: EmitStage::Obj,
         ..Options::default()
     };
-    assert_eq!(emit_native(&program, &interner, &opts), exit::OK);
+    let mut timer = report::PassTimer::new(&opts);
+    assert_eq!(
+        emit_native(&program, &interner, &opts, &mut timer),
+        exit::OK
+    );
     assert!(std::fs::metadata(object).unwrap().len() > 0);
 }
