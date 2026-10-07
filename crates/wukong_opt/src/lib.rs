@@ -19,6 +19,8 @@
 //!    initialization loop dse emptied (`-O2`).
 //!  * **licm** — hoist loop-invariant work into an existing preheader, including loads that run on
 //!    every iteration, behind a first-iteration guard (`-O2`).
+//!  * **promote** — keep a loop-invariant memory location the loop reads and writes in a register:
+//!    one load in the preheader, one store per exit (`-O2`).
 //!  * **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting a conditional
 //!    body to a lane mask), with the original loop kept as its scalar epilogue (`-O2`).
 //!
@@ -49,6 +51,7 @@ mod loop_delete;
 pub mod loop_info;
 mod mem2reg;
 mod phi;
+mod promote;
 mod simplify;
 mod simplify_cfg;
 mod sroa;
@@ -72,6 +75,7 @@ pub use loop_canon::LoopCanon;
 pub use loop_delete::LoopDelete;
 pub use mem2reg::Mem2Reg;
 pub use phi::SimplifyPhis;
+pub use promote::Promote;
 pub use simplify::Simplify;
 pub use simplify_cfg::SimplifyCfg;
 pub use sroa::Sroa;
@@ -189,6 +193,9 @@ impl PassManager {
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
+            // With the invariant loads hoisted, a location the loop still both reads and writes is
+            // a memory-carried reduction: keep it in a register for the loop's duration.
+            pm.add(Box::new(Promote));
             // Widening comes last, on the cleanest MIR the pipeline produces: canonical loops with
             // one latch and one exit-test polarity, invariants already hoisted, and dead code gone.
             // Everything it emits is fed back through the fixpoint, so the vector body gets the

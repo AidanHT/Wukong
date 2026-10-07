@@ -6,15 +6,18 @@
 | `cfg.rs` | `successors`, `predecessors`, `reverse_postorder`, `reachable`, `prune_unreachable` |
 | `dom.rs` | Cooper–Harvey–Kennedy dominators: `idoms_from`, `dominance_frontiers_from`, `dom_children` |
 | `cache.rs` | `CfgAnalyses` — lazily computed, structurally-invalidated per-function analysis cache |
+| `sroa.rs` | `Sroa` — split a constant-indexed aggregate slot into scalar leaf slots for mem2reg (`-O2`) |
 | `mem2reg.rs` | `Mem2Reg` — scalar alloca/load/store → block-parameter SSA |
 | `simplify.rs` | `Simplify` — constant folding + algebraic identities |
 | `simplify_cfg.rs` | `SimplifyCfg` — constant-branch folding, straight-line merge, prune |
 | `phi.rs` | `SimplifyPhis` — drop dead/trivial block parameters and edge args |
 | `dce.rs` | `Dce` — dependency worklist removes complete dead instruction chains |
 | `cse.rs` | `Cse` — typed dominator-tree value numbering, integer commutation, load forwarding across single-predecessor edges |
-| `dse.rs` | `Dse` — intra-block dead-store elimination |
+| `dse.rs` | `Dse` — dead-store elimination: must-alias overwrites in a block and on every path, end-of-lifetime stores, loop-bounded stores into unread slots |
 | `loop_canon.rs` | `LoopCanon` — canonical loop shape (preheader, latch, exit polarity) |
-| `licm.rs` | `Licm` — hoist loop-invariant non-trapping ops into an existing preheader |
+| `loop_delete.rs` | `LoopDelete` — remove a provably finite loop with no observable effect |
+| `licm.rs` | `Licm` — hoist loop-invariant non-trapping ops into an existing preheader; loads by dereferenceability, header position, or guaranteed execution under a first-iteration guard |
+| `promote.rs` | `Promote` — keep a loop-invariant location the loop reads and writes in a register (preheader load, exit stores) |
 | `vectorize.rs` | `Vectorize` — 128-bit SIMD widening with scalar epilogue; constant `i16`/`i32` left shifts use wrapping multiply |
 | `inline.rs` | `inline_program` — bottom-up call-graph SCC inlining with per-site growth budgets |
 | `unroll.rs` | `unroll_program` — partial loop unrolling at `-O2`+ |
