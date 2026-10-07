@@ -361,9 +361,16 @@ fn plan_split(
         if then_blk == else_blk {
             continue;
         }
+        // The guard is assumed only in body blocks (see `apply_split`), so an `and`/`or` the header
+        // computes from it would never fold, and the branch would be split again.
+        let g_in_header = defs
+            .get(g.0 as usize)
+            .copied()
+            .flatten()
+            .is_some_and(|(bi, _)| bi == l.header.0 as usize);
         for v in branch_conditions(f, defs, *g) {
             // The guard varies with the induction variable, so the loop computes it.
-            if !defined.contains(&v.0) {
+            if !defined.contains(&v.0) || (v != *g && g_in_header) {
                 continue;
             }
             let Some(Op::Cmp(p, x, y)) = op_of(f, defs, v) else {
@@ -677,8 +684,15 @@ fn apply_split(f: &mut Function, p: SplitPlan) {
         _ => unreachable!("a preheader ends in an unconditional branch to the header"),
     }
     let prefix = matches!(p.kind, GuardKind::Lt | GuardKind::Le);
-    assume(f, &copy, vmap[&p.guard.0], prefix, t, fv);
-    assume(f, &originals, p.guard, !prefix, t, fv);
+    // The guard holds its assumed value on every iteration a copy's *body* runs, but each header
+    // also runs once more, for the exit test, with `iv` already past that copy's range (`split`
+    // in the copy, `end` in the original). A header-computed guard there can take the other value
+    // and reach the exit arguments or the code after the loop, so headers are never rewritten.
+    let header = p.header.0 as usize;
+    let copy_body: Vec<usize> = copy.iter().copied().filter(|&b| b != ha).collect();
+    let orig_body: Vec<usize> = originals.iter().copied().filter(|&b| b != header).collect();
+    assume(f, &copy_body, vmap[&p.guard.0], prefix, t, fv);
+    assume(f, &orig_body, p.guard, !prefix, t, fv);
 }
 
 fn apply_unswitch(f: &mut Function, p: UnswitchPlan) {
@@ -865,6 +879,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A guard the *header* computes also runs at the exit test, where `j` has left the body's
+    /// range, and here it reaches the exit arguments: the split assumes it in the bodies only, so the
+    /// exit still sees the guard's real final value (`end < inv`).
+    ///
+    /// ```text
+    ///   H(j, acc):  g = j < inv; c = j < end; cond_br c, B, X(acc, g)
+    ///   B:          cond_br g, T, L(acc)
+    ///   T:          br L(acc * 3 + j)
+    ///   L(p):       br H(j + 1, p)
+    ///   X(r, q):    ret r + 1000 * zext(q)
+    /// ```
+    #[test]
+    fn a_header_guard_keeps_its_value_at_the_exit_test() {
+        let mut it = Interner::new();
+        let mut b = Builder::new(it.intern("f"), MirType::I32);
+        let start = b.add_param(MirType::I32);
+        let end = b.add_param(MirType::I32);
+        let inv = b.add_param(MirType::I32);
+        let seven = b.build(MirType::I32, Op::ConstInt(7, MirType::I32));
+        let h = b.new_block();
+        let j = b.block_param(h, MirType::I32);
+        let acc = b.block_param(h, MirType::I32);
+        let body = b.new_block();
+        let then = b.new_block();
+        let latch = b.new_block();
+        let p = b.block_param(latch, MirType::I32);
+        let exit_blk = b.new_block();
+        let r = b.block_param(exit_blk, MirType::I32);
+        let q = b.block_param(exit_blk, MirType::I1);
+        b.br(h, vec![start, seven]);
+        b.switch_to(h);
+        let g = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, j, inv));
+        let c = b.build(MirType::I1, Op::Cmp(CmpOp::Slt, j, end));
+        b.cond_br(c, body, vec![], exit_blk, vec![acc, g]);
+        b.switch_to(body);
+        b.cond_br(g, then, vec![], latch, vec![acc]);
+        b.switch_to(then);
+        let three = b.build(MirType::I32, Op::ConstInt(3, MirType::I32));
+        let m = b.build(MirType::I32, Op::Bin(BinOp::Mul, acc, three));
+        let s = b.build(MirType::I32, Op::Bin(BinOp::Add, m, j));
+        b.br(latch, vec![s]);
+        b.switch_to(latch);
+        let one = b.build(MirType::I32, Op::ConstInt(1, MirType::I32));
+        let j2 = b.build(MirType::I32, Op::Bin(BinOp::Add, j, one));
+        b.br(h, vec![j2, p]);
+        b.switch_to(exit_blk);
+        let w = b.build(
+            MirType::I32,
+            Op::Cast(wukong_mir::CastKind::ZExt, q, MirType::I32),
+        );
+        let k = b.build(MirType::I32, Op::ConstInt(1000, MirType::I32));
+        let wk = b.build(MirType::I32, Op::Bin(BinOp::Mul, w, k));
+        let out = b.build(MirType::I32, Op::Bin(BinOp::Add, r, wk));
+        b.ret(Some(out));
+        let mut f = b.finish();
+
+        let inputs = grid(false);
+        let before = run3(&f, &mut it, &inputs);
+        assert!(LoopUnswitch.run_function(&mut f, &mut CfgAnalyses::default()));
+        assert!(wukong_mir::verify::verify_function(&f).is_empty());
+        assert_eq!(run3(&f, &mut it, &inputs), before);
+        cleanup(&mut f);
+        assert_eq!(run3(&f, &mut it, &inputs), before);
     }
 
     /// A body branch on a loop-invariant condition (also as one operand of an `and`) is decided once
