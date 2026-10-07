@@ -5,6 +5,7 @@ test gate and not shipped benchmarks.
 
 | example | purpose | run |
 |---|---|---|
+| `gemm_order.rs` | Measurement-position probe for the all-core GEMM rows: replays xbench's slot sequence, then times `Wuk(par)` and `MKL(all)` A-B-B-A at the tail with an identical-arm `MKL(late)/MKL(early)` twin control; `GEMM_ORDER_NT=1` for the `nn.Linear` layout | `cargo run -p wukong_runtime --release --example gemm_order` |
 | `gemm_scaling.rs` | Adjacent serial-vs-`wukong_sgemm_nt_parallel` timing at transformer GEMM shapes; prints GFLOP/s and speedup | `cargo run -p wukong_runtime --release --example gemm_scaling` |
 | `gemm_var.rs` | ABBA-discipline run-variance probe: Wukong parallel vs oneMKL `cblas_sgemm` per round | `cargo run -p wukong_runtime --release --example gemm_var [-- <rounds>]` |
 | `gemm_skinny.rs` | Small-M (skinny) NT GEMM probe: an `M`-sweep at fixed `(K, N)` that separates pack amortization from a peer gap, plus the six xbench `matmul_skinny` shapes timed adjacent to oneMKL single-thread in one process (timing thread pinned) | `cargo run -p wukong_runtime --release --example gemm_skinny` |
@@ -12,7 +13,7 @@ test gate and not shipped benchmarks.
 | `normbwd_var.rs` | LayerNorm-backward pass decomposition (mean / var / s1+s2 / apply, against a one-pass streaming floor) plus an ABBA A/B of the shipped kernel against a verbatim copy of its pre-multi-accumulator form; also probes `softmax_bwd`'s delegated dot | `cargo run -p wukong_runtime --release --example normbwd_var [-- <rounds>]` |
 | `normfwd_split.rs` | Splits the benchmarked batched-norm program into its two dispatched calls (`wukong_velem_f32` copy, then `wukong_norm_f32`) and prints each one's share, so the reachable ceiling for a norm-kernel change is a number | `cargo run -p wukong_runtime --release --example normfwd_split [-- <rounds>]` |
 
-All six require `--release` — debug builds make the hand-written kernels look far slower than JIT
+All seven require `--release` — debug builds make the hand-written kernels look far slower than JIT
 loops. `gemm_var` optionally loads MKL via `WUKONG_MKL_DLL`; `GEMM_VAR_HUGE=1` adds a 2048³ shape.
 `norm_var` builds its peer with `$CC` (default `gcc`) and needs it on `PATH`.
 
