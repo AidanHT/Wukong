@@ -788,7 +788,8 @@ to hit a *captured fixed-size array* at an index carrying the loop variable as a
 (`hh*C + …`, or the tiled `t/C` / `t%C` pair); per-iteration scratch must be a `let` local inside the
 body. It declines — and the loop lowers serially — for a loop-carried accumulator (a write to a
 captured scalar), a non-affine or offset index, a local bound to a slice/pointer/reference (it might
-alias a capture), a call other than a pure math intrinsic (`print` would reorder output), a
+alias a capture), a call other than a pure math intrinsic or a counter-based RNG scalar (`rand_u32`,
+`rand_f32`, `randn_f32` — stateless, so chunking cannot change a lane; `print` would reorder output), a
 `match`/`loop` expression in the body, a `return`/`defer`, and a labelled or loop-level
 `break`/`continue`. At most 32 such regions are outlined per program; further ones stay serial.
 
@@ -874,6 +875,35 @@ Supported stored dtypes are `F32 F64 F16 BF16 I8 I16 I32 I64 U8 U16 U32 U64` (sa
 little-endian `f2 f4 f8 i1 i2 i4 i8 u1 u2 u4 u8` descrs (`.npy`); `BOOL`, the fp8 formats, a
 big-endian array and a structured dtype parse and then report `-3`. A memory-mapped, zero-copy load
 (`map_<T>`) is not implemented yet: every load copies once, straight into the destination.
+
+## Random numbers ✅
+
+Wukong's random numbers are **counter-based** — Philox4x32-10, the generator of Random123, cuRAND and
+Triton's `tl.rand`: each value is a pure function of a `seed` and a `counter`, so there is no
+generator state to create, share or advance, and a stream is reproducible under any split — across
+`@parallel` chunks, across the interpreter and native code, across runs.
+
+```wukong
+for i in 0..n {
+    w[i] = randn_f32(seed, i) * 0.02;                  // element i is always the same number
+}
+let keep: bool = rand_f32(seed, step * n + i) >= p;    // a dropout mask is a counter, not a state
+```
+
+- **`rand_u32(seed, ctr) -> u32`** — word 0 of the Philox4x32-10 block with key `(seed lo, seed hi)`
+  and counter `(ctr lo, ctr hi, 0, 0)`; `rand_u32(0, 0)` is `0x6627e8d5`, Random123's published
+  known answer. `seed` and `ctr` may be any integer type (their 64 bits, as `x as u64` gives them).
+- **`rand_f32(seed, ctr) -> f32`** — the top 24 bits of that word times 2⁻²⁴: uniform on `[0, 1)`,
+  every value an exact multiple of 2⁻²⁴.
+- **`randn_f32(seed, ctr) -> f32`** — a standard normal sample by Box–Muller from words 0 and 1,
+  `sqrt(-2 ln u1) · cos(2π u2)` with `u1 ∈ (0, 1]`, computed in `f32` on the compiler's own `log` and
+  `cos`: bit-identical across backends, and close to (not bit-equal with) an `f64` reference.
+- **`rand_fill_f32(buf, seed, ctr0)`** — `buf[i] = rand_f32(seed, ctr0 + i)` for every element of a
+  `[]f32`, `[f32; N]` or contiguous `f32` tensor, as one runtime kernel.
+
+The scalar builtins lower to plain integer MIR (a 32×32→64 multiply, shifts, xors), so they need no
+runtime call and are accepted inside a `@parallel` region. To autodiff they are constants:
+`rand_fill_f32` contributes no gradient, like a constant store.
 
 ## Command-line interface
 

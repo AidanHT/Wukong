@@ -263,6 +263,12 @@ impl<'a> Vjp<'a> {
             if self.is_kernel(*func) {
                 return self.diff_kernel_call(*func, args, inst.result);
             }
+            // The ML I/O and randomness entries carry an explicit decision (see `tape.rs`).
+            if let Some(tape::MlCallGradient::Constant) =
+                tape::ml_call_gradient(self.it.resolve(*func))
+            {
+                return Ok(());
+            }
             // An unrecognized call that writes buffers (void result) could feed a downstream
             // gradient; we cannot prove its contribution is zero, so refuse rather than silently
             // emit a wrong (zero) gradient. (Value-returning unknown calls fall through to the

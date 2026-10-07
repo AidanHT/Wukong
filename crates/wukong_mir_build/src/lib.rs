@@ -13679,8 +13679,12 @@ impl FnLowerer<'_> {
             // Only pure scalar math intrinsics: a user call could write captured buffers, and
             // `print`/`assert` have cross-iteration-ordered side effects.
             ExprKind::Call { callee, args, .. } => {
+                // The RNG scalars (`rand_f32(seed, i)`, …) are pure too: counter-based, no state.
                 let pure_math = single_path(callee)
-                    .map(|s| math_intrinsic(self.interner.resolve(s)).is_some())
+                    .map(|s| {
+                        math_intrinsic(self.interner.resolve(s)).is_some()
+                            || self.is_pure_ml_builtin(s)
+                    })
                     .unwrap_or(false);
                 if !pure_math {
                     sc.ok = false;

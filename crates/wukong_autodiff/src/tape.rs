@@ -1923,3 +1923,22 @@ impl<'a> Vjp<'a> {
         self.b.build(F32, Op::ConstFloat(x, F32))
     }
 }
+
+/// What the reverse walk does at a call to one of the ML I/O and randomness runtime entries that is
+/// not a tensor kernel with a VJP. The decision is explicit per entry so a new one is a choice, not a
+/// fall-through. The typed reads (`wukong_rt_read_*`, `wukong_rt_st_read`, `wukong_rt_npy_read`)
+/// return an `i64` and are left to the scalar path: the file data they produce is constant with
+/// respect to every input, so it carries no gradient.
+/// * [`MlCallGradient::Constant`]: `wukong_rand_fill_f32` writes counter-based random numbers that
+///   depend on no input — skipped exactly like a constant store (`[0.0; N]`), never refused.
+pub(crate) enum MlCallGradient {
+    Constant,
+}
+
+/// The [`MlCallGradient`] of the runtime entry `name`, or `None` for any other callee.
+pub(crate) fn ml_call_gradient(name: &str) -> Option<MlCallGradient> {
+    match name {
+        "wukong_rand_fill_f32" => Some(MlCallGradient::Constant),
+        _ => None,
+    }
+}

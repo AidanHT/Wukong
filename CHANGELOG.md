@@ -5,7 +5,7 @@ All notable changes to Wukong are documented here. The format is loosely based o
 
 ## [Unreleased]
 
-### ML I/O
+### ML I/O and randomness
 
 - **Typed file I/O over every fixed-width dtype**: `read_<T>` / `write_<T>` / `read_<T>_at(path,
   byte_off, buf)` for `f32 f64 f16 bf16 i8 i16 i32 i64 u8 u16 u32 u64`, `file_size(path)`, and
@@ -14,6 +14,8 @@ All notable changes to Wukong are documented here. The format is loosely based o
   zero-extended, so `read_u8` then `b == 200` printed 0 there and 1 natively.
 - **Checkpoint readers** `st_read_<T>` (safetensors) and `npy_read_<T>` (`.npy`) with load-time dtype,
   rank, dims and count checks, and exact `bf16`/`f16` → `f32` widening.
+- **Counter-based RNG** `rand_u32` / `rand_f32` / `randn_f32(seed, ctr)` (Philox4x32-10, lowered to
+  integer MIR, checked against the Random123 known answers) and the `rand_fill_f32` kernel.
 
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 

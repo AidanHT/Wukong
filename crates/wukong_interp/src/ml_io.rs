@@ -1,8 +1,9 @@
-//! The interpreter twins of the ML I/O runtime entries: dtype-coded file I/O, `file_size`, and the
-//! safetensors / `.npy` container readers.
+//! The interpreter twins of the ML I/O and randomness runtime entries: dtype-coded file I/O,
+//! `file_size`, the safetensors / `.npy` container readers, and the Philox fill.
 //!
 //! Every arm here mirrors one `wukong_runtime` entry and shares that entry's *pure* code — the
-//! transfer plan and the container parsers in `wukong_runtime::fileio` — so the return code,
+//! transfer plan and the container parsers in `wukong_runtime::fileio`, and the generator in
+//! `wukong_runtime::random` — so the return code,
 //! the element count and every value cannot drift between the two backends; only the destination
 //! differs. Native memory holds raw element bytes; this interpreter's memory holds one typed
 //! [`Value`] per scalar slot, so a read decodes each element into its slot's canonical value, a
@@ -112,6 +113,7 @@ impl Interp<'_, '_> {
             "wukong_rt_file_size" => self.ml_file_size(args),
             "wukong_rt_st_read" => self.ml_container_read(args, true),
             "wukong_rt_npy_read" => self.ml_container_read(args, false),
+            "wukong_rand_fill_f32" => self.ml_rand_fill(args),
             _ => return None,
         })
     }
@@ -286,11 +288,44 @@ impl Interp<'_, '_> {
             },
         )
     }
+
+    /// `wukong_rand_fill_f32(out, n, seed, ctr0)`: the runtime's own [`wukong_runtime::random::rand_f32`]
+    /// per slot, the counter wrapping like the native kernel's.
+    fn ml_rand_fill(&mut self, args: &[Value]) -> Result<Value, String> {
+        const CTX: &str = "rand_fill_f32";
+        let n = count(arg_i64(args, 1));
+        if n == 0 {
+            return Ok(Value::Unit);
+        }
+        let seed = arg_i64(args, 2) as u64;
+        let ctr0 = arg_i64(args, 3) as u64;
+        let base = ptr_arg(args, 0, CTX, "data")?;
+        self.ml_check_extent(base, n, CTX)?;
+        for (i, slot) in self.memory[base..base + n].iter_mut().enumerate() {
+            let x = wukong_runtime::random::rand_f32(seed, ctr0.wrapping_add(i as u64));
+            *slot = Value::Float(x as f64);
+        }
+        Ok(Value::Unit)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{run_with_output, Interner};
     use wukong_runtime::fileio as rt;
+    use wukong_span::SourceId;
+
+    fn stdout_of(src: &str) -> String {
+        let mut interner = Interner::new();
+        let (module, pd) = wukong_parser::parse_module(src, SourceId(0), &mut interner);
+        assert!(pd.is_empty(), "parse: {pd:?}");
+        let (sema, sd) = wukong_sema::check(&module, &interner);
+        assert!(sd.iter().all(|d| !d.is_error()), "sema: {sd:?}");
+        let (program, _ld) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
+        let main = interner.intern("main");
+        let (_, out) = run_with_output(&program, main, &interner).unwrap();
+        String::from_utf8(out).unwrap()
+    }
 
     /// The compiler's dtype codes (`wukong_sema::io_dtype_code`, emitted as MIR constants) and the
     /// runtime's (`fileio::DT_*`, decoded by both backends) are two copies of one table: pin every
@@ -315,5 +350,67 @@ mod tests {
             let s = wukong_sema::io_dtype(suffix).unwrap();
             assert_eq!(wukong_sema::io_dtype_code(s), dt, "{suffix}");
         }
+    }
+
+    /// The RNG builtins lower to plain integer MIR; the runtime's `random` module is their
+    /// reference (itself pinned to the Random123 known answers). Sweep seeds whose high word is set
+    /// (a negative seed) and counters past 2^32, so both 32-bit halves of each operand matter.
+    #[test]
+    fn rng_lowering_matches_the_runtime_reference() {
+        let src = "fn main() -> i32 { \
+                   let mut s: i64 = 0; \
+                   while s < 4 { \
+                     let mut c: i64 = 0; \
+                     while c < 6 { \
+                       let seed: i64 = s * 1000003 - 7; \
+                       let ctr: i64 = c * 77777777777 + s; \
+                       print(rand_u32(seed, ctr)); \
+                       print((rand_f32(seed, ctr) * 16777216.0) as i64); \
+                       print((randn_f32(seed, ctr) * 1000000.0) as i64); \
+                       c = c + 1; \
+                     } \
+                     s = s + 1; \
+                   } \
+                   return 0; }";
+        let out = stdout_of(src);
+        let mut lines = out.lines();
+        for s in 0..4i64 {
+            for c in 0..6i64 {
+                let seed = (s * 1_000_003 - 7) as u64;
+                let ctr = (c * 77_777_777_777 + s) as u64;
+                let w = wukong_runtime::random::philox_block(seed, ctr);
+                let got_u32: u64 = lines.next().unwrap().parse().unwrap();
+                assert_eq!(got_u32, u64::from(w[0]), "rand_u32 s={s} c={c}");
+                let got_f32: i64 = lines.next().unwrap().parse().unwrap();
+                assert_eq!(got_f32, i64::from(w[0] >> 8), "rand_f32 s={s} c={c}");
+                // Box-Muller in f64 from the same two words; the lowering computes it in f32 on
+                // the compiler's log/cos, so compare to a few millionths.
+                let u1 = f64::from((w[0] >> 8) + 1) / 16_777_216.0;
+                let u2 = f64::from(w[1] >> 8) / 16_777_216.0;
+                let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                let got_n: i64 = lines.next().unwrap().parse().unwrap();
+                assert!(
+                    (got_n as f64 - z * 1e6).abs() <= 25.0,
+                    "randn s={s} c={c}: {got_n} vs {}",
+                    z * 1e6
+                );
+            }
+        }
+        assert_eq!(lines.next(), None);
+    }
+
+    /// `rand_fill_f32` (a runtime kernel) and `rand_f32` (inline MIR) are one stream.
+    #[test]
+    fn rng_fill_matches_the_scalar_builtin() {
+        let src = "fn main() -> i32 { \
+                   let mut a: []f32 = alloc_f32(9); \
+                   rand_fill_f32(a, 1234, -4); \
+                   for i in 0..9 { \
+                     let r: f32 = rand_f32(1234, i - 4); \
+                     if a[i] == r { print(1); } else { print(0); } \
+                   } \
+                   free(a); \
+                   return 0; }";
+        assert_eq!(stdout_of(src), "1\n".repeat(9));
     }
 }

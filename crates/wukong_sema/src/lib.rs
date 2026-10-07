@@ -40,7 +40,7 @@ use wukong_types::{Dim, Layout, Scalar, Shape, Ty};
 // The ML builtins (see `ml_builtins.rs`): typed there, and the name table re-exported so
 // `wukong_mir_build` lowers exactly the set sema types.
 mod ml_builtins;
-pub use ml_builtins::{io_dtype, io_dtype_code, ml_builtin, MlBuiltin};
+pub use ml_builtins::{io_dtype, io_dtype_code, ml_builtin, ml_builtin_is_pure, MlBuiltin};
 
 /// The element scalar of a typed heap-allocation builtin (`alloc_f32` → `F32`), or `None` for any
 /// other name. The v1 heap surface is this per-scalar `alloc_<T>(n) -> []T` family plus `free(s)`

@@ -1,5 +1,6 @@
-//! Typing for the ML I/O builtins: the typed file-I/O family over every element type (whole-file
-//! and byte-offset reads, writes, `file_size`) and the safetensors / `.npy` container readers.
+//! Typing for the ML I/O and randomness builtins: the typed file-I/O family over every element type
+//! (whole-file and byte-offset reads, writes, `file_size`), the safetensors / `.npy` container
+//! readers, and the Philox counter-based RNG.
 //!
 //! Like the heap and timing builtins, these are typed nominally here — the call's result is a
 //! concrete type, so `let n = read_bf16_at(p, off, w)` composes in arithmetic — and every misuse is
@@ -15,8 +16,8 @@
 //! `[]i32` handed to `read_f32` would read the wrong stride and decode the wrong type. A container
 //! read into a *tensor* also checks the file's shape against the tensor's dims at load time.
 //!
-//! **Integers.** A byte offset may be any integer type (the value's bits, as `x as u64` would give
-//! them); an unsuffixed literal adapts to `i64`.
+//! **Integers.** Byte offsets, seeds and counters accept any integer type (the value's bits, as
+//! `x as u64` would give them); an unsuffixed literal adapts to `i64`.
 //!
 //! A user-defined function of the same name shadows every builtin here (the resolved-callee path in
 //! `type_call` runs first).
@@ -42,6 +43,14 @@ pub enum MlBuiltin {
     StRead(Scalar),
     /// `npy_read_<T>(path: *u8, buf) -> i64` — the array of a NumPy `.npy` file.
     NpyRead(Scalar),
+    /// `rand_u32(seed: int, ctr: int) -> u32` — Philox4x32-10, word 0.
+    RandU32,
+    /// `rand_f32(seed: int, ctr: int) -> f32` — uniform in `[0, 1)`.
+    RandF32,
+    /// `randn_f32(seed: int, ctr: int) -> f32` — standard normal (Box–Muller).
+    RandnF32,
+    /// `rand_fill_f32(buf, seed: int, ctr0: int)` — `buf[i] = rand_f32(seed, ctr0 + i)`.
+    RandFill,
 }
 
 /// The element type a file-I/O name suffix denotes (`f32`, `bf16`, `u64`, …), or `None`. The twelve
@@ -105,8 +114,21 @@ pub fn ml_builtin(name: &str) -> Option<MlBuiltin> {
     }
     Some(match name {
         "file_size" => MlBuiltin::FileSize,
+        "rand_u32" => MlBuiltin::RandU32,
+        "rand_f32" => MlBuiltin::RandF32,
+        "randn_f32" => MlBuiltin::RandnF32,
+        "rand_fill_f32" => MlBuiltin::RandFill,
         _ => return None,
     })
+}
+
+/// Whether the builtin `name` is a pure function of its scalar arguments — no memory traffic, no
+/// state — so a `@parallel` region may evaluate it per iteration in any order (the RNG scalars).
+pub fn ml_builtin_is_pure(name: &str) -> bool {
+    matches!(
+        ml_builtin(name),
+        Some(MlBuiltin::RandU32 | MlBuiltin::RandF32 | MlBuiltin::RandnF32)
+    )
 }
 
 /// The spelling of a buffer of `elem` in a diagnostic.
@@ -148,12 +170,19 @@ impl Sema<'_> {
         use Arg::{Buf, Int, Str};
         let b = ml_builtin(name)?;
         let i64_ty = Ty::Scalar(Scalar::I64);
+        let f32_ty = Ty::Scalar(Scalar::F32);
         let (sig, ret): (Vec<Arg>, Ty) = match b {
             MlBuiltin::Read(t) | MlBuiltin::NpyRead(t) => (vec![Str("path"), Buf(t, true)], i64_ty),
             MlBuiltin::Write(t) => (vec![Str("path"), Buf(t, false)], i64_ty),
             MlBuiltin::ReadAt(t) => (vec![Str("path"), Int("byte offset"), Buf(t, true)], i64_ty),
             MlBuiltin::FileSize => (vec![Str("path")], i64_ty),
             MlBuiltin::StRead(t) => (vec![Str("path"), Str("tensor name"), Buf(t, true)], i64_ty),
+            MlBuiltin::RandU32 => (vec![Int("seed"), Int("counter")], Ty::Scalar(Scalar::U32)),
+            MlBuiltin::RandF32 | MlBuiltin::RandnF32 => (vec![Int("seed"), Int("counter")], f32_ty),
+            MlBuiltin::RandFill => (
+                vec![Buf(Scalar::F32, true), Int("seed"), Int("counter")],
+                Ty::Unit,
+            ),
         };
         if args.len() != sig.len() {
             let want: Vec<String> = sig
@@ -443,6 +472,33 @@ mod tests {
             ),
             // Arity.
             ("fn f() -> i64 { return file_size(); }", "E0503"),
+        ]);
+    }
+
+    #[test]
+    fn rng_builtins_are_named_pure_and_typed() {
+        assert_eq!(ml_builtin("rand_u32"), Some(MlBuiltin::RandU32));
+        assert_eq!(ml_builtin("rand_fill_f32"), Some(MlBuiltin::RandFill));
+        assert_eq!(ml_builtin("randn_f64"), None);
+        assert!(["rand_u32", "rand_f32", "randn_f32"]
+            .iter()
+            .all(|n| ml_builtin_is_pure(n)));
+        assert!(!ml_builtin_is_pure("rand_fill_f32") && !ml_builtin_is_pure("read_f32"));
+        let ok = "fn f(mut w: [f32; 8]) -> f32 { \
+                  let seed: u64 = 7; \
+                  let ctr: i32 = 3; \
+                  let u: u32 = rand_u32(seed, ctr); \
+                  rand_fill_f32(w, seed, -1); \
+                  return rand_f32(1, 2) + randn_f32(-3, 4); }";
+        assert!(errors(ok).is_empty(), "unexpected: {:?}", errors(ok));
+        assert_rejected(&[
+            // The results are typed, not lenient: a u32 is not an f32.
+            ("fn f() { let x: f32 = rand_u32(1, 2); }", "E0401"),
+            // The seed is an integer's bits; a float has none to offer.
+            ("fn f() -> f32 { return rand_f32(0.5, 1); }", "E0401"),
+            // The fill writes its buffer.
+            ("fn f(w: [f32; 4]) { rand_fill_f32(w, 1, 2); }", "E0304"),
+            ("fn f() -> f32 { return randn_f32(1); }", "E0503"),
         ]);
     }
 }

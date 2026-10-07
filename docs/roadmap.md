@@ -182,6 +182,14 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   `-5` name, `-6` malformed header; the destination is untouched on every one but `-2`. Runtime unit
   tests cover the parsers and every code; `tests/run/io_safetensors.wk` and `io_npy.wk` assemble files
   byte by byte and print every lane.
+- **Counter-based RNG** — `rand_u32` / `rand_f32` / `randn_f32(seed, ctr)` are Philox4x32-10 (key
+  = the seed's two words, counter = `(ctr lo, ctr hi, 0, 0)`; `rand_u32(0, 0)` is Random123's known
+  answer `0x6627e8d5`), lowered to plain integer MIR (`zext`/`mul`/`lshr`/`trunc`/`xor`), so they are
+  bit-identical across backends by construction and accepted in `@parallel` regions; `randn_f32` is
+  Box–Muller on the compiler's `log`/`cos`. `rand_fill_f32(buf, seed, ctr0)` is the same stream as one
+  runtime kernel. The runtime reference (`wukong_runtime::random`) is checked against all three
+  Random123 `philox4x32_10` known-answer vectors, and an interpreter test checks the MIR lowering
+  against it over seeds and counters that exercise both 32-bit halves (`tests/run/rand_philox.wk`).
 - **Radix & char literals**: hex `0xFF` / octal `0o17` / binary `0b1010` integer literals with `_`
   digit separators and type suffixes (`tests/run/radix_literals.wk`), and char literals `'A'` (the
   one-character / `\xHH` / `\u{…}` escapes) typed `char` — a 32-bit Unicode scalar value,
@@ -923,9 +931,12 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
 
 ## Known limitations / sharp edges
 
-- **ML I/O gaps.** No memory-mapped load yet (`map_<T>`: every checkpoint load copies
+- **ML I/O and randomness gaps.** No memory-mapped load yet (`map_<T>`: every checkpoint load copies
   once, straight into the destination), no GGUF reader and no quantized block types; `.npy` reads
   little-endian arrays only.
+  A fill loop `for i { out[i] = rand_f32(seed, base + i) }` is not recognized into `rand_fill_f32`,
+  and the loop vectorizer declines it (mixed 32/64-bit widths), so the scalar builtins run one
+  element at a time; `randn_f32` has no fill kernel.
   None of these is measured yet.
 
 - **A view local read before it is assigned is undefined, and the language has no rule that says so.**

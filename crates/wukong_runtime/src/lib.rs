@@ -181,6 +181,8 @@ pub mod fileio;
 pub use fileio::{wukong_rt_file_size, wukong_rt_read_dt, wukong_rt_write_dt};
 pub mod npy;
 pub use npy::wukong_rt_npy_read;
+pub mod random;
+pub use random::wukong_rand_fill_f32;
 pub mod safetensors;
 pub use safetensors::wukong_rt_st_read;
 

@@ -1,5 +1,6 @@
-//! The runtime entry points of the ML I/O builtins — dtype-coded file I/O, `file_size` and the
-//! safetensors / `.npy` readers — declared, JIT-bound and called from **one table**.
+//! The runtime entry points of the ML I/O and randomness builtins — dtype-coded file I/O,
+//! `file_size`, the safetensors / `.npy` readers and the Philox fill — declared, JIT-bound and
+//! called from **one table**.
 //!
 //! Every other runtime family in this crate is spelled out four times: a name constant, a
 //! `Signature` built by hand in `populate_module`, an `rt_ids` row, and a `builder.symbol` line in
@@ -47,7 +48,7 @@ pub(crate) struct Entry {
 
 /// The table. The addresses are taken here, at run time, because a function-pointer-to-raw-pointer
 /// cast is not a constant expression.
-pub(crate) fn entries() -> [Entry; 5] {
+pub(crate) fn entries() -> [Entry; 6] {
     use Abi::{Ptr, I64};
     [
         // (path, byte_off, data, len, dtype) -> i64: `read_<T>` outside the frozen six, and every
@@ -85,6 +86,13 @@ pub(crate) fn entries() -> [Entry; 5] {
             params: &[Ptr, Ptr, I64, I64, Ptr, I64],
             ret: Some(I64),
             addr: wukong_runtime::wukong_rt_npy_read as *const u8,
+        },
+        // (out, n, seed, ctr0): `rand_fill_f32`.
+        Entry {
+            name: "wukong_rand_fill_f32",
+            params: &[Ptr, I64, I64, I64],
+            ret: None,
+            addr: wukong_runtime::wukong_rand_fill_f32 as *const u8,
         },
     ]
 }
