@@ -11,9 +11,12 @@
 //!  * **dce** — remove pure instructions whose results are never used, and unused allocas.
 //!  * **cse** — dominator-tree value numbering with load forwarding across unique incoming edges
 //!    (`-O2`).
-//!  * **dse** — dead-store elimination (`-O2`).
+//!  * **dse** — dead-store elimination: must-alias overwrites in a block and along every path,
+//!    end-of-lifetime stores to private slots, and stores into slots nothing reads (`-O2`).
 //!  * **loop-canon** — one shape per loop: a preheader, a single latch, one exit-test polarity
 //!    (`-O2`).
+//!  * **loop-delete** — remove a provably finite loop that has no observable effect, such as an
+//!    initialization loop dse emptied (`-O2`).
 //!  * **licm** — hoist loop-invariant work into an existing preheader (`-O2`).
 //!  * **vectorize** — widen a canonical loop body to 128-bit SIMD (if-converting a conditional
 //!    body to a lane mask), with the original loop kept as its scalar epilogue (`-O2`).
@@ -41,6 +44,7 @@ mod fxhash;
 mod inline;
 mod licm;
 mod loop_canon;
+mod loop_delete;
 pub mod loop_info;
 mod mem2reg;
 mod phi;
@@ -64,6 +68,7 @@ pub use dse::Dse;
 pub use inline::inline_program;
 pub use licm::Licm;
 pub use loop_canon::LoopCanon;
+pub use loop_delete::LoopDelete;
 pub use mem2reg::Mem2Reg;
 pub use phi::SimplifyPhis;
 pub use simplify::Simplify;
@@ -177,6 +182,9 @@ impl PassManager {
             // Put every loop into one shape before LICM runs: LICM hoists only into a preheader
             // that already exists, so a loop given one here becomes hoistable in the same sweep.
             pm.add(Box::new(LoopCanon));
+            // A loop dse emptied still runs every trip; with a preheader now guaranteed, delete
+            // whichever loops provably terminate without doing anything observable.
+            pm.add(Box::new(LoopDelete));
             // LICM hoists invariant work out of loops; rerunning the pipeline then cleans up and
             // can expose further invariants (e.g. across nested loops).
             pm.add(Box::new(Licm));
