@@ -50,7 +50,10 @@ static CATALOG: &[Explanation] = &[
         "E0101",
         "unexpected character",
         "The lexer found a character that cannot begin any Wukong token. Remove it or place it \
-         inside a string/char literal."
+         inside a string/char literal. The diagnostic names a non-ASCII character by its code \
+         point (`α` (U+03B1)). Identifiers are ASCII-only — letters, digits and `_` — so a Greek \
+         letter must be spelled out (`alpha`). A character that merely looks like ASCII \
+         punctuation is reported as E0105 instead."
     ),
     entry!(
         "E0102",
@@ -68,6 +71,20 @@ static CATALOG: &[Explanation] = &[
         "E0104",
         "unterminated character literal",
         "A character literal opened with `'` was never closed. Write a single character as `'a'`."
+    ),
+    entry!(
+        "E0105",
+        "confusable Unicode character",
+        "A character that looks like ASCII punctuation, an operator or whitespace is a different \
+         Unicode code point — usually pasted from a paper, a word processor or a chat client: `−` \
+         (U+2212 MINUS SIGN) or a dash for `-`, `×` for `*`, `≤` for `<=`, curly quotes for `\"`, \
+         a no-break or zero-width space for a space. Wukong source is ASCII outside string \
+         literals, character literals and comments, so the character cannot begin a token. The \
+         diagnostic names the code point and the ASCII character it imitates: type that \
+         instead. The compiler keeps reading as if the ASCII character had been written (a \
+         lookalike space is skipped), so one pasted character costs one error and nothing \
+         downstream of it is misreported; a lookalike quote cannot open a literal and is an \
+         error token."
     ),
     entry!(
         "E0200",

@@ -39,6 +39,18 @@ A file conventionally begins with a `module` declaration; the header is **option
 informational (see *Modules & imports*), so a single-file program may omit it. Execution starts at
 `fn main() -> i32`, and the integer it returns becomes the process exit code.
 
+## Source text ✅
+
+Source files are UTF-8; a leading byte-order mark is ignored. Outside string literals, char
+literals and comments the text is **ASCII**: identifiers are letters, digits and `_` (a Greek
+letter must be spelled out, `alpha` for `α`; `E0101` names the code point and suggests the
+spelling). A Unicode character that merely *looks* like ASCII — `−` (U+2212 MINUS SIGN) or a dash
+for `-`, `×` for `*`, `≤` for `<=`, fullwidth punctuation, curly quotes, a no-break or zero-width
+space — is `E0105`, which names the code point and the ASCII character it imitates. The compiler
+then reads it as that ASCII token (a lookalike space is skipped), so one character pasted from a
+paper costs one error (`tests/fail/confusable_minus.wk`); a lookalike quote cannot open a literal
+and is an error token.
+
 ## Modules & imports ✅
 
 ```wukong

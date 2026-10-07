@@ -21,6 +21,14 @@ All notable changes to Wukong are documented here. The format is loosely based o
   still accepted with no definite-assignment rule; that hazard is recorded under **Known
   limitations / sharp edges** in `docs/roadmap.md`.
 
+### Lints and parser hygiene (wave 2, `gap2/lints-and-parser-hygiene`)
+
+- **`E0105` confusable characters.** A pasted Unicode lookalike of ASCII punctuation or whitespace
+  (`−` U+2212, `×`, `≤`, fullwidth brackets, curly quotes, no-break and zero-width spaces) names its
+  code point and the ASCII character it imitates, and lexes as that character, so it costs one
+  error instead of `E0101` plus a parser error. Other non-ASCII characters keep `E0101`, now naming
+  the code point instead of `\u{..}`; a leading byte-order mark is skipped.
+
 ### October 5 contraction semantics and coverage
 
 - Preserve empty lowp/integer GEMM, residual, dual-store and fused-window source stores;

@@ -476,6 +476,13 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   `@export`), so a typo like `@parellel` no longer compiles to a program with none of the requested
   behavior. The four discarded attributes stay discarded wherever they parse.
 - Intrinsics `print`/`println`/`assert`.
+- **Source-text diagnostics.** A Unicode lookalike of ASCII punctuation or whitespace (`−` U+2212
+  for `-`, `×`, `≤`, fullwidth brackets, curly quotes, no-break/zero-width spaces; ~50 entries) is
+  **`E0105`**, naming the code point and the ASCII character it imitates, and the lexer reads it
+  *as* that character, so a paste from a paper costs one error, not a lexer error plus a parser
+  cascade. Any other non-ASCII character stays `E0101`, now naming the code point (`α` (U+03B1))
+  instead of `\u{3b1}`, with a spelled-out suggestion for Greek letters. Identifiers stay ASCII:
+  Unicode (XID) identifiers need a symbol-mangling decision because PTX must be ASCII.
 - The optimizer (`-O0..-O3`), backed by CFG and dominator analyses: whole-program **inlining**
   bottom-up over the call graph (non-recursive callees before their callers, scored by a cost model),
   **mem2reg** (alloca → SSA), constant folding, algebraic simplification, CFG cleanup

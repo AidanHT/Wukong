@@ -151,6 +151,13 @@ So adding a diagnostic is always three edits: the catalogue entry, an emit site 
 bare `"Ennnn"` literal (the scanner skips comment lines, so prose may cite codes freely, but a
 `format!`-built code is invisible to it), and a fixture or probe.
 
+The lexer's one table-driven diagnostic is `E0105`: `wukong_lexer`'s `confusables` module lists the
+Unicode lookalikes of ASCII punctuation, operators and whitespace (after rustc's
+`unicode_chars.rs`), each with its name, the ASCII text it imitates and a recovery — produce that
+token, skip it as whitespace, or (for a quote, which cannot open a literal) an error token — so the
+parse after a pasted `−` is the parse of `-`. A table test pins that every token replacement is
+spelled exactly like the token it produces.
+
 The terminal renderer is rustc-style (carets, gutters, `--> file:line:col`). Two rendering rules are
 contractual: a caret run is as wide as the span's *rendered* width, never the column difference, and
 both the echoed source line and the caret padding expand tabs at a fixed `TAB_WIDTH = 4` — so carets

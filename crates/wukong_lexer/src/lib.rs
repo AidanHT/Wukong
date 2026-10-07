@@ -3,7 +3,13 @@
 //! The lexer never aborts: unrecognized input produces a [`TokenKind::Error`] token plus a
 //! diagnostic, and scanning continues. Literal values are not parsed here — tokens carry only a
 //! kind and a [`Span`], and later stages read the covered text from the source map.
+//!
+//! A Unicode character that imitates ASCII punctuation or whitespace (`−` for `-`, a no-break
+//! space) is `E0105`, naming the code point and the ASCII character it was mistaken for; where that
+//! is one token the lexer produces it, so the parse continues as if it had been written (see
+//! `confusables`). A leading byte-order mark is skipped silently.
 
+mod confusables;
 mod token;
 pub use token::{Token, TokenKind};
 
@@ -51,7 +57,13 @@ impl<'a> Lexer<'a> {
         Lexer {
             src,
             bytes: src.as_bytes(),
-            pos: 0,
+            // A UTF-8 byte-order mark is an encoding signature some editors write, not source
+            // text: skip it (as rustc does) rather than reporting the file's first character.
+            pos: if src.starts_with('\u{FEFF}') {
+                '\u{FEFF}'.len_utf8()
+            } else {
+                0
+            },
             source,
             diags: Vec::new(),
         }
@@ -77,44 +89,106 @@ impl<'a> Lexer<'a> {
     }
 
     fn next_token(&mut self) -> Token {
-        self.skip_trivia();
-        let start = self.pos;
-        let Some(c) = self.peek_at(0) else {
-            return Token::new(TokenKind::Eof, self.span(start));
-        };
+        // A loop, not straight-line code, only for the confusable-whitespace case below: such a
+        // character is reported and then skipped like whitespace, so the scan restarts — and a
+        // pasted run of them must not grow the stack the way recursion would.
+        loop {
+            self.skip_trivia();
+            let start = self.pos;
+            let Some(c) = self.peek_at(0) else {
+                return Token::new(TokenKind::Eof, self.span(start));
+            };
 
-        if c == b'_' || c.is_ascii_alphabetic() {
-            let kind = self.lex_ident(start);
-            return Token::new(kind, self.span(start));
-        }
-        if c.is_ascii_digit() {
-            let kind = self.lex_number(start);
-            return Token::new(kind, self.span(start));
-        }
-        if c == b'"' {
-            let kind = self.lex_string(start);
-            return Token::new(kind, self.span(start));
-        }
-        if c == b'\'' {
-            // A `'name` not closed by a `'` is a loop label, not a char literal (`'a'`).
-            if let Some(kind) = self.try_lex_label() {
+            if c == b'_' || c.is_ascii_alphabetic() {
+                let kind = self.lex_ident(start);
                 return Token::new(kind, self.span(start));
             }
-            let kind = self.lex_char(start);
-            return Token::new(kind, self.span(start));
-        }
-        if let Some(kind) = self.lex_op() {
-            return Token::new(kind, self.span(start));
-        }
+            if c.is_ascii_digit() {
+                let kind = self.lex_number(start);
+                return Token::new(kind, self.span(start));
+            }
+            if c == b'"' {
+                let kind = self.lex_string(start);
+                return Token::new(kind, self.span(start));
+            }
+            if c == b'\'' {
+                // A `'name` not closed by a `'` is a loop label, not a char literal (`'a'`).
+                if let Some(kind) = self.try_lex_label() {
+                    return Token::new(kind, self.span(start));
+                }
+                let kind = self.lex_char(start);
+                return Token::new(kind, self.span(start));
+            }
+            if let Some(kind) = self.lex_op() {
+                return Token::new(kind, self.span(start));
+            }
 
-        // Unknown byte: consume the whole UTF-8 character, report, and continue.
+            // Unknown byte: consume the whole UTF-8 character, report, and continue.
+            if let Some(tok) = self.unknown_char(start, c) {
+                return tok;
+            }
+        }
+    }
+
+    /// Consume and report the character at `start` (first byte `c`), which begins no token.
+    /// Returns the token to produce, or `None` when the character was confusable whitespace that
+    /// the caller should skip.
+    fn unknown_char(&mut self, start: usize, c: u8) -> Option<Token> {
+        // `start` is a character boundary: every scan above stops on an ASCII byte or consumes
+        // whole characters, so the decode cannot fail on well-formed (`&str`) input.
+        let ch = self.src[start..].chars().next().unwrap_or('\u{FFFD}');
         for _ in 0..utf8_len(c) {
             self.bump();
         }
-        let text = self.src[start..self.pos].escape_default();
         let span = self.span(start);
-        self.error(span, "E0101", format!("unexpected character `{text}`"));
-        Token::new(TokenKind::Error, span)
+        if let Some(conf) = confusables::lookup(ch) {
+            self.confusable(span, conf);
+            return match conf.recover {
+                confusables::Recover::Token(kind) => Some(Token::new(kind, span)),
+                confusables::Recover::Trivia => None,
+                confusables::Recover::Error => Some(Token::new(TokenKind::Error, span)),
+            };
+        }
+        let mut d = Diagnostic::error(format!("unexpected character {}", describe_char(ch)))
+            .with_code("E0101")
+            .primary(span, "this character cannot begin a token");
+        if !ch.is_ascii() && ch.is_alphanumeric() {
+            d = d.help(match confusables::greek_name(ch) {
+                Some(name) => format!(
+                    "identifiers are ASCII-only (letters, digits and `_`): spell it out, e.g. \
+                     `{name}`"
+                ),
+                None => "identifiers are ASCII-only (letters, digits and `_`)".to_string(),
+            });
+        }
+        self.diags.push(d);
+        Some(Token::new(TokenKind::Error, span))
+    }
+
+    /// Report a confusable character (`E0105`) at `span`.
+    fn confusable(&mut self, span: Span, conf: &confusables::Confusable) {
+        let code = format!("U+{:04X} {}", conf.ch as u32, conf.name);
+        let d = if conf.recover == confusables::Recover::Trivia {
+            let help = if conf.ascii.is_empty() {
+                "delete it: it is invisible and not whitespace to the compiler".to_string()
+            } else {
+                "replace it with an ASCII space".to_string()
+            };
+            Diagnostic::error(format!("unexpected Unicode whitespace character {code}"))
+                .with_code("E0105")
+                .primary(span, "not ASCII whitespace")
+                .help(help)
+        } else {
+            let ascii = conf.ascii;
+            Diagnostic::error(format!(
+                "Unicode character `{}` ({code}) looks like `{ascii}`, but it is not",
+                conf.ch
+            ))
+            .with_code("E0105")
+            .primary(span, format!("not the ASCII `{ascii}`"))
+            .help(format!("replace it with `{ascii}`"))
+        };
+        self.diags.push(d);
     }
 
     fn skip_trivia(&mut self) {
@@ -454,6 +528,35 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// How a diagnostic names a character: the character itself in backticks when it is visible ASCII
+/// (`` `$` ``), the character plus its code point when it is a visible non-ASCII character
+/// (`` `α` (U+03B1) ``), and the code point alone for a control, whitespace or invisible formatting
+/// character, which would print as nothing — or, for a bidirectional override, reorder the rest
+/// of the terminal line — inside backticks.
+fn describe_char(ch: char) -> String {
+    let invisible = ch.is_control()
+        || ch.is_whitespace()
+        || matches!(
+            ch as u32,
+            0x00AD
+                | 0x061C
+                | 0x180E
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x206F
+                | 0xFEFF
+                | 0xFFF9..=0xFFFB
+                | 0xE0000..=0xE007F
+        );
+    if ch.is_ascii_graphic() {
+        format!("`{ch}`")
+    } else if invisible || ch.is_ascii() {
+        format!("U+{:04X}", ch as u32)
+    } else {
+        format!("`{ch}` (U+{:04X})", ch as u32)
+    }
+}
+
 /// Length in bytes of the UTF-8 character beginning with `b`.
 fn utf8_len(b: u8) -> usize {
     if b < 0x80 {
@@ -552,6 +655,90 @@ mod tests {
         // `#` is not a Wukong token; we emit Error and keep lexing.
         assert_eq!(kinds("a # b"), vec![Ident, Error, Ident]);
         assert_eq!(diags("a # b").len(), 1);
+    }
+
+    /// A minus sign pasted from a paper (U+2212) is one E0105 that names the code point and the
+    /// ASCII character it imitates, and it lexes AS that character, so the parser sees `a - b`
+    /// and reports nothing more. It used to be `E0101 unexpected character `\u{2212}`` followed by
+    /// a parser error at the same place.
+    #[test]
+    fn confusable_minus_is_one_named_error_and_lexes_as_minus() {
+        use TokenKind::*;
+        let src = "a \u{2212} b";
+        assert_eq!(kinds(src), vec![Ident, Minus, Ident]);
+        let d = diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Some("E0105"));
+        assert!(
+            d[0].message.contains("U+2212 MINUS SIGN"),
+            "{}",
+            d[0].message
+        );
+        assert!(d[0].message.contains("looks like `-`"), "{}", d[0].message);
+        // Two-character replacements produce the two-character token.
+        assert_eq!(kinds("a \u{2264} b"), vec![Ident, Le, Ident]);
+        assert_eq!(kinds("x \u{00D7} y"), vec![Ident, Star, Ident]);
+        assert_eq!(
+            kinds("f(a\u{FF0C} b)"),
+            vec![Ident, LParen, Ident, Comma, Ident, RParen]
+        );
+    }
+
+    /// No-break and zero-width spaces are reported and then skipped like whitespace; a run of them
+    /// costs one diagnostic per character and no stack (the scan loops instead of recursing).
+    #[test]
+    fn confusable_whitespace_is_reported_and_skipped() {
+        use TokenKind::*;
+        assert_eq!(kinds("let\u{00A0}x"), vec![Let, Ident]);
+        assert_eq!(diags("let\u{00A0}x")[0].code, Some("E0105"));
+        let run = format!("a{}b", "\u{200B}".repeat(20_000));
+        assert_eq!(kinds(&run), vec![Ident, Ident]);
+        let d = diags(&run);
+        assert_eq!(d.len(), 20_000);
+        assert!(d.iter().all(|x| x.code == Some("E0105")));
+    }
+
+    /// A curly quote cannot open a string literal, so it is an error token (one E0105 each) —
+    /// never silently a different literal.
+    #[test]
+    fn confusable_quote_is_an_error_token() {
+        use TokenKind::*;
+        assert_eq!(kinds("\u{201C}"), vec![Error]);
+        let d = diags("\u{201C}");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("E0105"));
+        assert!(d[0].message.contains("looks like `\"`"), "{}", d[0].message);
+    }
+
+    /// A non-ASCII letter that is not a confusable stays E0101, but the message names the
+    /// character and its code point instead of `\u{3b1}`, and the help spells a Greek letter out.
+    #[test]
+    fn non_ascii_letter_names_its_code_point() {
+        let d = diags("let \u{03B1} = 1;");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].code, Some("E0101"));
+        assert!(d[0].message.contains("(U+03B1)"), "{}", d[0].message);
+        assert!(
+            d[0].notes.iter().any(|(_, n)| n.contains("`alpha`")),
+            "{:?}",
+            d[0].notes
+        );
+        // An invisible formatting character is named by code point only: printing a bidi override
+        // inside backticks would reorder the rest of the terminal line.
+        let d = diags("a \u{202E} b");
+        assert_eq!(d[0].message, "unexpected character U+202E");
+        // ASCII punctuation is still shown as itself.
+        assert_eq!(diags("a $ b")[0].message, "unexpected character `$`");
+    }
+
+    /// A leading UTF-8 byte-order mark is an encoding signature, not source.
+    #[test]
+    fn leading_bom_is_skipped() {
+        use TokenKind::*;
+        assert_eq!(kinds("\u{FEFF}fn f"), vec![Fn, Ident]);
+        assert!(diags("\u{FEFF}fn f").is_empty());
+        // Anywhere else it is a zero-width confusable.
+        assert_eq!(diags("fn \u{FEFF}f")[0].code, Some("E0105"));
     }
 
     #[test]
