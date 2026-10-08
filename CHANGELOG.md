@@ -17,6 +17,20 @@ All notable changes to Wukong are documented here. The format is loosely based o
   reading through `select(first_test, addr, dummy)` so zero-trip entries never touch it (P10.3); the
   new **promote** pass keeps a loop-invariant location the loop reads and writes in a register (P10.2).
 
+### Vectorizer: 256-bit lanes for f64/i32/i64, runtime-sized streams, one reduction tree (`gap/vectorizer`)
+
+- The raw-AVX2 recipe path covers f64 (4 lanes), i32 (8) and i64 (4) as well as f32, keeps up to
+  eleven stream bases (five-plus-stream fused bodies stay 256-bit), and switches large aligned
+  output-only streams to non-temporal stores at run time (`WUKONG_P4_NO_NT=1` disables that).
+- `[]T` slices and symbolic-shape tensors reach the vectorizer, behind a one-time run-time bounds and
+  overlap check that keeps the loop scalar when it fails.
+- A vectorized reduction computes one **canonical summation tree** on every path, host and `-O`
+  level (`docs/internals.md`); a runtime trip reaches the 256-bit reduction through a run-time trip
+  test, and `s = s + x + y` is recognized as the reduction `s += x + y`. An ordered compare of
+  unsigned integer lanes now keeps its loop scalar instead of comparing signed in the vector lanes.
+- `wukong_opt::vectorize` no longer declines a whole loop for one invariant scalar load beside a
+  store: the load gets a run-time point check against each stored range.
+
 ### Recognition-axis corpus gate and a running `Tensor` local (merged from `lang/w2e-recognizer-gate`)
 
 - **Gate added: every recognizer-dependent corpus program is held to its own generic lowering.**

@@ -430,6 +430,7 @@ fn vector_program(interner: &mut Interner, reduction: bool) -> Program {
     }
     func.vec_kernels.push(VecKernel {
         name,
+        lane: wukong_mir::VecLane::F32,
         streams: 2,
         scalars: 2,
         unroll: 1,

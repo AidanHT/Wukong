@@ -817,7 +817,8 @@ impl<'a> FnTranslator<'a> {
             // (see `avx2::assemble_kernel` + `define_function_bytes`) under the module's default call
             // conv (Win64 here: ptrs->RCX, scalars->RDX, n->R8), so a plain Cranelift `call` reaches
             // it. It writes through the stream pointers; an elementwise kernel returns nothing, a
-            // reduction kernel returns its horizontal fold in XMM0 (see the `res` match below).
+            // reduction kernel returns its horizontal fold in its lane type — XMM0 for an f32/f64
+            // lane, RAX/EAX for an i32/i64 one (see the `res` match below).
             Op::VecKernelCall {
                 kernel,
                 ptrs,
@@ -836,7 +837,8 @@ impl<'a> FnTranslator<'a> {
                     self.resize_int(n_raw, n_ty, types::I64, false)
                 };
                 let call = self.builder.ins().call(fref, &[ptrs_v, scalars_v, n_v]);
-                // A reduction kernel returns its horizontal fold as f32; an elementwise kernel is void.
+                // A reduction kernel returns its horizontal fold (lane-typed, matching the declared
+                // signature); an elementwise kernel is void.
                 match res {
                     Some(_) => self.builder.inst_results(call)[0],
                     None => return,
@@ -3407,25 +3409,24 @@ fn populate_module<M: Module>(
     kernel_sig.params.push(AbiParam::new(ptr_ty)); // ptrs
     kernel_sig.params.push(AbiParam::new(ptr_ty)); // scalars
     kernel_sig.params.push(AbiParam::new(types::I64)); // n
-                                                       // A reduction kernel returns its horizontal fold as f32; an elementwise kernel is void.
-    let mut kernel_sig_reduce = kernel_sig.clone();
-    kernel_sig_reduce.returns.push(AbiParam::new(types::F32));
     let mut kernel_ids: Vec<Vec<FuncId>> = Vec::with_capacity(program.funcs.len());
     for (fi, f) in program.funcs.iter().enumerate() {
         let mut per_fn: Vec<FuncId> = Vec::with_capacity(f.vec_kernels.len());
         for (ki, k) in f.vec_kernels.iter().enumerate() {
             let bytes = crate::avx2::assemble_kernel(k)
                 .map_err(|e| format!("avx2 assemble vec kernel {fi}.{ki}: {e}"))?;
-            let sig = if k.reduce.is_some() {
-                &kernel_sig_reduce
-            } else {
-                &kernel_sig
-            };
+            // A reduction kernel returns its horizontal fold in its lane type (XMM0 for a float
+            // lane, RAX/EAX for an integer one); an elementwise kernel is void.
+            let mut sig = kernel_sig.clone();
+            if k.reduce.is_some() {
+                sig.returns
+                    .push(AbiParam::new(crate::avx2::lane_clif_type(k.lane)));
+            }
             let id = module
                 .declare_function(
                     &format!("__wukong_veckernel_{fi}_{ki}"),
                     Linkage::Local,
-                    sig,
+                    &sig,
                 )
                 .map_err(|e| e.to_string())?;
             module

@@ -22,8 +22,9 @@ interchangeable ways to run the same program; they are not the product on their 
    Windows host with runtime AVX2+FMA3. That test is one function —
    `wukong_mir::host_supports_vec_kernels` — and **the vectorizer consults it too**, so off-gate the
    recipe is simply never built and the loop keeps the 128-bit CLIF form, exactly as
-   `WUKONG_P4_NO_256=1` forces. Everything else — front end, optimizer, interpreter, and the ordinary
-   Cranelift lowering — is host-agnostic.
+   `WUKONG_P4_NO_256=1` forces. That changes speed, never a result: a vectorized reduction computes
+   the same canonical tree in both forms (see the vectorizer section). Everything else — front end,
+   optimizer, interpreter, and the ordinary Cranelift lowering — is host-agnostic.
 2. **One SSA MIR, built low.** Instead of separate HIR/MIR/LIR there is a single block-structured
    SSA IR, and `wukong_mir_build` produces scalar SSA (explicit loops, `alloca`/`load`/`store`, SIMD
    ops) *directly* — there is one lowering stage, not two. The `MirLevel` enum and `Program::level`
@@ -261,7 +262,7 @@ the entry block exists, its parameters equal `Function::params` exactly, and it 
 `block.id` equals the block's index; operand/result types line up per op (float-ness classified by
 *lane* type, so a `<4 x f32>` `fadd` checks against `f32`); a `VecKernelCall`'s `kernel` index is in
 range for the owning function's `vec_kernels` and its result matches the recipe kind (a reduction
-yields an `f32`, an elementwise one yields nothing); and terminators are type-correct, including
+yields its lane type, an elementwise one yields nothing); and terminators are type-correct, including
 branch-argument arity/types and the function return type. Blocks unreachable from the entry keep their
 type checks with the dominance rule switched off. Given a whole `Program`, `verify_program`
 additionally cross-checks every call against the callee's declared signature — external symbols
@@ -577,19 +578,54 @@ polynomial expanded per lane — only for an f32 lane, and only while the name d
 `fn` (a user `fn gelu` wins and the loop stays scalar). `@parallel` per-thread chunks go through the
 same vectorizer, so they run SIMD × cores.
 
+The vectorizer streams over every buffer form a kernel is written over: a `[T; N]` array, a
+contiguous `Tensor[T, …]` of constant **or symbolic** extents, and a `[]T` slice. Each stream's data
+pointer resolves through `kernel_base_ptr`, the rule every recognizer already uses (an `Array`-bound
+name *is* its storage; a `Ptr`-bound tensor and a slice's fat pointer hold it one load away). The two
+runtime-sized forms bring two facts only the run time knows, and `vector_guarded_end` tests both once,
+ahead of the loop, as loop versioning: every slice access must stay inside the slice's length over the
+whole range, and every written stream must be disjoint from every other stream of the body whenever
+either one is runtime-addressed. If either test fails the vector part covers nothing and the scalar
+remainder — the loop exactly as written — does all the work. The overlap test is the run-time alias
+check gcc and LLVM version a loop on; it is needed on top of the whole-program `provably_disjoint`
+fact because that fact assumes every caller is visible, which an `--emit=obj` export, a harness
+entering through a raw pointer, or one of the call-borrowed views `alias.rs` lists as holes all
+violate. A pair of two `[T; N]` arrays keeps the static fact alone. Two lane-type rules keep the
+vector lanes equal to the scalar tail: integer lanes compare **signed** in both vector forms (AVX2 has
+only `vpcmpgt*`), so an ordered compare of unsigned operands keeps the loop scalar; and a compound
+assign vectorizes only where its one lane-wise op exists (`/` on a float lane, the bitwise ops on an
+integer lane, never `%` or a shift).
+
 Cranelift's CLIF vector ISA still caps at 128-bit — a 256-bit `f32x8` SSA value is rejected at
 `define_function` (the `cranelift_still_rejects_f32x8` / `p4_probe_vec256_ops` tripwires keep that
-documented). So for an eligible f32 elementwise body the vectorizer captures the loop as a flat,
-backend-agnostic `VecKernel` recipe and, when register pressure fits, emits one `Op::VecKernelCall`:
-the Cranelift backend assembles that recipe to **true 256-bit AVX2 machine code** via `iced-x86`
+documented). So for an eligible body the vectorizer captures the loop as a flat, backend-agnostic
+`VecKernel` recipe and, when register pressure fits, emits one `Op::VecKernelCall`: the Cranelift
+backend assembles that recipe to **true 256-bit AVX2 machine code** via `iced-x86`
 (`wukong_codegen_cranelift::avx2`, VEX-encoded), while the interpreter marshals the *same* recipe
 lane-wise — so the two stay bit-identical (elementwise lanes carry no reassociation, so the gate
-holds element-for-element). `Op::VecKernelCall.kernel` is an index into the *owning* function's
+holds element-for-element). A recipe has one lane type (`VecLane`): **f32** (8 lanes, the `*ps`
+family), **f64** (4 lanes, `*pd`), and the wrapping integer lanes **i32** (8 lanes,
+`vpaddd`/`vpsubd`/`vpmulld`) and **i64** (4 lanes, `vpaddq`/`vpsubq` — AVX2 has no 64-bit lane
+multiply, so `VecKernel::pressure` refuses one and that body keeps the 128-bit strips). The reference
+evaluators (`eval_lane`, `eval_reduction`) are generic over the matching Rust type, so each lane type
+has exactly the arithmetic its instruction family performs. A kernel keeps up to eleven stream base
+pointers in GPRs (the volatile r9/r10/r11/rdx plus the callee-saved rsi/rdi/rbx/r12–r15 it pushes),
+so the five-plus-stream bodies of fused epilogues stay 256-bit. An elementwise kernel whose
+output-only streams are all 32-byte aligned and whose streamed traffic reaches 10 MiB (the runtime's
+`nt_policy` default) stores them with `vmovnt*` and `sfence`s before returning — the read-for-ownership
+a cacheable store pays on a stream larger than the caches is the largest lever on a bandwidth-bound
+loop; the choice is made inside the kernel at run time and only picks which store instruction writes
+the identical values (`WUKONG_P4_NO_NT=1` assembles only the cacheable form). There is deliberately no
+software prefetch: the hardware prefetchers already track unit-stride streams, and `gcc -O3` emits none
+either. Stack-slot alignment stays at 16: Cranelift aligns a slot's *offset* within a frame whose base
+is only 16-byte aligned, so a 32-byte request would not be honoured. A literal trip shorter than one
+register group keeps the inlined strips (the kernel could only be called with `n = 0`); a runtime
+trip always takes the kernel. `Op::VecKernelCall.kernel` is an index into the *owning* function's
 `vec_kernels` recipe table, not a `ValueId`, so a MIR pass that moves instructions between functions
 must copy the callee's recipes into the caller and shift every copied index (`wukong_opt::inline` does
 exactly that; without it a spliced call names one of the caller's own recipes). The verifier
 range-checks the index and requires the call's result to match the recipe kind: a reduction recipe
-yields an `f32`, an elementwise one yields nothing.
+yields its lane type, an elementwise one yields nothing.
 
 That assembler path is host-gated: `wukong_mir::host_supports_vec_kernels()` requires
 `target_arch = "x86_64"` **and** `target_os = "windows"` **and** runtime AVX2 + FMA3, because the
@@ -605,29 +641,65 @@ fallback already existed. `assemble_kernel`'s `Err` is now a backstop: reaching 
 disagreed with the emitter, which is a bug rather than a platform outcome. The kernels are assembled
 while the module is populated — the same code path for the JIT and for `--emit=obj` — so an emitted
 object is host-ISA- and host-ABI-specific.
-`WUKONG_P4_NO_256` forces the portable 128-bit path — a same-run A/B knob and a kill-switch. The
-float-reduction path has an analogous 256-bit kernel, gated to large trips
-(`VEC256_REDUCTION_MIN_TRIP` = 2048 elements) because the out-of-line call loses to the inlined
-128-bit reduction on small arrays.
+`WUKONG_P4_NO_256` forces the portable 128-bit path — a same-run A/B knob and a kill-switch; it
+changes instruction selection and never a result, reductions included (below).
 
 Two refinements target the dominant ML arithmetic. A float `x + y*z` **contracts to a fused
 multiply-add** (`Op::Fma`, one rounding, a hardware `vfmadd`) in both the scalar and vector lowering
 paths; the interpreter mirrors it with `mul_add`, so the two backends stay bit-identical. And a
-**float reduction** `for k in .. { s = s + x[k]*y[k] }` (or `s += ..`) is recognised and lowered to
-independent vector-lane accumulators (each an FMA chain), a cleanup loop, a horizontal fold, and a
-scalar remainder. For f32 expressions representable by a fitting wide recipe, `prepare_reduction`
-fixes the logical partition before the ISA, ABI, trip-count, or kill-switch gate. Its U comes from
-the recipe's register-pressure calculation. The portable path uses 2U four-lane vectors to represent
-the same U eight-lane accumulators: main stride 8U, cleanup stride 8 into accumulator zero, sequential
-cross-U combination, then a sequential lane-0..7 fold. The scalar seed is combined once afterward;
-without a complete group it is preserved unchanged before the scalar tail. The raw wide emitter's
-ABI and positive-group arithmetic are unchanged. `reduction_partition_is_independent_of_width_and_threshold`
-checks both flags, backends and O0/O2 against explicit cancellation, seed and exceptional-value
-oracles, including pressure-limited U and dynamic bounds. Portable MIR and register pressure can
-increase; the performance cost has not been measured. Other types and recipe-ineligible expressions
-retain their existing portable partition. Reductions vectorize only on the sequential path, never
-the `@parallel` one (folding into a shared accumulator across threads would race). Reassociation is
-a build contract, not a promise of strict source-order summation or stability across compiler releases.
+**reduction** `for k in .. { s = s + x[k]*y[k] }` (or `s += ..`, a running `fmax`/`fmin`, or any `+`
+chain that holds `s` once — `s = s + x + y` is the reduction `s += x + y`) over an f32, f64, i32 or
+i64 accumulator is recognised and lowered to independent lane accumulators (an FMA chain when the
+addend is a product), a cleanup loop, a horizontal fold, and a scalar remainder.
+
+### The canonical reduction tree
+
+A vectorized float reduction regroups its addends, and the grouping decides the low bits of the
+answer. That grouping is fixed **once, as part of the language**, and every lowering of the loop
+computes it: the 256-bit kernel, the portable 128-bit strips, the interpreter, every `-O` level, every
+host, a literal trip or a runtime one, any addend. With `L` lanes per 256-bit register (8 for f32/i32,
+4 for f64/i64) and `U = 4` (`VEC_UNROLL`):
+
+1. `U` accumulators of `L` lanes, initialised to the fold identity (`+0.0`, `-∞` for max, `+∞` for min).
+2. Main loop: element `i + u·L + l` of each `U·L` block folds into accumulator `u`, lane `l`.
+3. Cleanup: every remaining full `L`-element group folds into accumulator 0.
+4. Accumulators `1..U` fold into accumulator 0 lane-wise, in order `1, 2, 3`.
+5. Lanes `0..L` of accumulator 0 fold left to right into one value `r`.
+6. If at least one full group ran, the scalar seed `s` becomes `fold(s, r)`; otherwise the seed is
+   untouched (a `-0.0` or NaN seed is never disturbed by the identity).
+7. The `< L` remaining elements fold into `s` one at a time, in index order.
+
+`fold` is `+` — a single-rounded `fma(x, y, acc)` when the addend is a product `x*y` — or the x86
+operand-order `max`/`min` (`acc > x ? acc : x`, which matches `vmaxps` on ties and NaN). Integer sums
+wrap and are exact under any grouping; they use the same tree anyway. The reference implementation is
+`VecKernel::eval_reduction` with its module docs in `wukong_mir::vec_kernel`; the portable form
+represents each logical accumulator as a pair of 128-bit vectors (`emit_reduction_portable`,
+`finish_portable_reduction`), and `tests/run/reduction_canonical_tree.wk` pins the tree with
+hand-evaluated values at sizes that exercise every step.
+
+What is deliberately **not** an input to the tree: the host ISA or OS (`host_supports_vec_kernels`),
+`WUKONG_P4_NO_256`, the lowering option that keeps recipes away from the PTX backend, whether the
+trip is a literal, and the addend's register pressure. The last used to pick the 256-bit kernel's
+accumulator count, so the same `.wk` source summed differently on a Linux CI box, under the kill
+switch, or after an innocuous edit to the addend. A body too large for `U` accumulators beside one bank
+of its own registers now simply does not take the kernel (`VecKernel::reduction_fits`); one that fits
+beside the accumulators but not `U` times over shares register banks between the unrolled copies
+(`reduction_banks`) — that changes the schedule, never the grouping.
+
+Which form runs is a performance choice only: the raw-AVX2 kernel when the recipe fits and the trip
+reaches `VEC256_REDUCTION_MIN_TRIP` (2048 elements, the measured crossover of the out-of-line call
+against the inlined form for the highest-pressure body), the portable form otherwise. A literal trip
+decides it statically; a runtime trip — the `fn k(a: []f32, n: i64)` shape every real kernel has —
+carries both forms behind one run-time compare, since both compute the same tree. Two cases fall
+outside the tree, both by construction: when `vector_guarded_end` sends a loop scalar (an
+out-of-bounds slice access or an overlap, i.e. a program whose scalar semantics the vectorized loop
+must not change) the whole loop is the strict left fold the source spells; and a loop the front end
+does not vectorize (a `while`, or a body it declines) reaches `wukong_opt::vectorize`, which never
+reassociates a float accumulate. Recognized kernels (`wukong_sreduce_*` and friends) define their own
+documented reduction order, chosen by the program's spelling and never by the host. Reductions
+vectorize only on the sequential path, never the `@parallel` one (folding into a shared accumulator
+across threads would race). The tree is a build contract, not a promise of strict source-order
+summation or stability across compiler releases.
 
 ## Spelling canonicalization before recognition
 

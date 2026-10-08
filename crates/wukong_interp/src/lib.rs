@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use wukong_backend::{Artifact, Backend};
 use wukong_mir::{
     BasicBlock, BinOp, CastKind, CmpOp, Function, MirType, Op, Program, Terminator, ValueId,
+    VecKernel, VecLane, VecOp, VecValue,
 };
 use wukong_span::{Interner, Symbol};
 
@@ -67,8 +68,68 @@ impl Value {
         }
     }
 
+    /// The integer-buffer twin of [`Self::kernel_float`]: an integer slot is an `Int`, and anything
+    /// else in a buffer a kernel reads as integers is type confusion, reported rather than coerced.
+    fn kernel_int(self, context: &str) -> Result<i128, String> {
+        match self {
+            Value::Int(i) => Ok(i),
+            Value::Float(_) => Err(format!("{context}: integer buffer contains a float slot")),
+            Value::Ptr(_) => Err(format!("{context}: integer buffer contains a pointer slot")),
+            Value::VecRef(_) => Err(format!("{context}: integer buffer contains a vector slot")),
+            Value::Unit => Err(format!(
+                "{context}: integer buffer contains an uninitialized slot"
+            )),
+        }
+    }
+
     fn truthy(self) -> bool {
         self.as_int() != 0
+    }
+}
+
+/// How one [`VecLane`]'s values travel through slot memory: the same representation the scalar
+/// `Load`/`Store` arms use for that MIR type (a float slot holds the value as an `f64`, an integer
+/// slot the sign-extended value in an `i128`), so a recipe and the scalar tail beside it read and
+/// write identical slots.
+trait KernelLaneValue: VecValue {
+    fn read(v: Value, context: &str) -> Result<Self, String>;
+    fn write(self) -> Value;
+}
+
+impl KernelLaneValue for f32 {
+    fn read(v: Value, context: &str) -> Result<Self, String> {
+        Ok(v.kernel_float(context)? as f32)
+    }
+    fn write(self) -> Value {
+        Value::Float(self as f64)
+    }
+}
+
+impl KernelLaneValue for f64 {
+    fn read(v: Value, context: &str) -> Result<Self, String> {
+        v.kernel_float(context)
+    }
+    fn write(self) -> Value {
+        Value::Float(self)
+    }
+}
+
+impl KernelLaneValue for i32 {
+    fn read(v: Value, context: &str) -> Result<Self, String> {
+        // Slots hold the value sign-extended; the low 32 bits are the lane.
+        Ok(v.kernel_int(context)? as i32)
+    }
+    fn write(self) -> Value {
+        Value::Int(self as i128)
+    }
+}
+
+impl KernelLaneValue for i64 {
+    fn read(v: Value, context: &str) -> Result<Self, String> {
+        Ok(v.kernel_int(context)? as i64)
+    }
+    fn write(self) -> Value {
+        Value::Int(self as i128)
     }
 }
 
@@ -995,6 +1056,139 @@ impl<'a, 'k> Interp<'a, 'k> {
         }
     }
 
+    /// Marshal one `Op::VecKernelCall` of a recipe whose lanes are `T` through slot memory: the
+    /// interpreter half of the differential pair whose other half is `codegen_cranelift::avx2`.
+    /// `stream_bases`/`scalars` are read from the two pointer tables, `count` is the vector part's
+    /// element count. A reduction returns its horizontal fold (steps 1-5 of the canonical tree in
+    /// `wukong_mir::vec_kernel`); an elementwise recipe writes its stores and returns `Unit`.
+    fn run_vec_kernel<T: KernelLaneValue>(
+        &mut self,
+        kern: &VecKernel,
+        ptrs_base: usize,
+        scalars_base: usize,
+        count: usize,
+    ) -> Result<Value, String> {
+        // Output-only streams need not contain initialized numeric values. Only recipe
+        // loads read memory; scalar tails beyond count remain untouched and unchecked.
+        let mut read_streams = vec![false; kern.streams as usize];
+        let mut read_scalars = vec![false; kern.scalars as usize];
+        for (index, op) in kern.ops.iter().enumerate() {
+            if let VecOp::Splat { scalar } = op {
+                *read_scalars
+                    .get_mut(*scalar as usize)
+                    .ok_or("veckernel scalar index out of bounds")? = true;
+            }
+            if let VecOp::Load { stream } = op {
+                let reads = read_streams
+                    .get_mut(*stream as usize)
+                    .ok_or("veckernel load stream out of bounds")?;
+                // eval_lane forwards a preceding store of this stream; that load never
+                // consumes the original destination slot, which may be undefined.
+                if !kern.ops[..index].iter().any(|previous| {
+                    matches!(previous, VecOp::Store { stream: written, .. } if written == stream)
+                }) {
+                    *reads = true;
+                }
+            }
+        }
+        // Resolve the stream base slots and the invariant scalars once.
+        let mut stream_bases: Vec<usize> = Vec::with_capacity(kern.streams as usize);
+        for s in 0..kern.streams as usize {
+            stream_bases.push(ptr(*self
+                .memory
+                .get(ptrs_base + s)
+                .ok_or("veckernel ptrs out of bounds")?)?);
+        }
+        let mut scalar_vals: Vec<T> = Vec::with_capacity(kern.scalars as usize);
+        for (k, &read) in read_scalars.iter().enumerate() {
+            scalar_vals.push(if read {
+                T::read(
+                    *self
+                        .memory
+                        .get(scalars_base + k)
+                        .ok_or("veckernel scalars out of bounds")?,
+                    "veckernel scalar",
+                )?
+            } else {
+                T::unused()
+            });
+        }
+        if kern.reduce.is_some() {
+            // Reduction kernel: fold every lane's addend and return the horizontal result in the
+            // lane type (the caller combines the initial accumulator and folds the scalar tail).
+            // Reads only — no stores. Same reassociation `eval_reduction` pins for both backends,
+            // so this equals the native kernel's return bit-for-bit.
+            let lanes = kern.lane.lanes() as usize;
+            let vlen = count / lanes * lanes;
+            // Validate and convert every element the evaluator will read up front, so its
+            // callbacks cannot fail; a partial lane group beyond `vlen` is never read.
+            let mut columns: Vec<Vec<T>> = Vec::with_capacity(stream_bases.len());
+            for (s, &b) in stream_bases.iter().enumerate() {
+                if read_streams[s] {
+                    let end = b
+                        .checked_add(vlen)
+                        .ok_or("veckernel reduction load out of bounds")?;
+                    let values = self
+                        .memory
+                        .get(b..end)
+                        .ok_or("veckernel reduction load out of bounds")?;
+                    let mut column = Vec::with_capacity(vlen);
+                    for value in values {
+                        column.push(T::read(*value, "veckernel reduction")?);
+                    }
+                    columns.push(column);
+                } else {
+                    columns.push(Vec::new());
+                }
+            }
+            let r = kern.eval_reduction(
+                vlen,
+                |s, e| columns[s as usize][e],
+                |k| scalar_vals[k as usize],
+            );
+            Ok(r.write())
+        } else {
+            // Elementwise: one `eval_lane` per element — snapshot this lane's stream inputs,
+            // run the recipe, write its stores back. Load-before-store within a lane keeps
+            // in-place streams exact; distinct lanes never alias (the vectorizer's no-alias
+            // precondition), so no hazard.
+            let mut stores: Vec<(u32, T)> = Vec::new();
+            let mut loads: Vec<T> = Vec::with_capacity(stream_bases.len());
+            let mut scratch = wukong_mir::vec_kernel::VecKernelScratch::<T>::default();
+            for i in 0..count {
+                loads.clear();
+                for (s, &b) in stream_bases.iter().enumerate() {
+                    loads.push(if read_streams[s] {
+                        T::read(
+                            *self
+                                .memory
+                                .get(b + i)
+                                .ok_or("veckernel load out of bounds")?,
+                            "veckernel load",
+                        )?
+                    } else {
+                        T::unused()
+                    });
+                }
+                stores.clear();
+                kern.eval_lane_with_scratch(
+                    &mut scratch,
+                    |s| loads[s as usize],
+                    |k| scalar_vals[k as usize],
+                    |s, v| stores.push((s, v)),
+                );
+                for &(s, v) in &stores {
+                    let slot = stream_bases[s as usize] + i;
+                    *self
+                        .memory
+                        .get_mut(slot)
+                        .ok_or("veckernel store out of bounds")? = v.write();
+                }
+            }
+            Ok(Value::Unit)
+        }
+    }
+
     fn eval(
         &mut self,
         op: &Op,
@@ -1151,9 +1345,10 @@ impl<'a, 'k> Interp<'a, 'k> {
             // backend executes hand-assembled AVX2; the oracle marshals the same `VecKernel` recipe
             // element-by-element through slot memory so the two agree bit-for-bit. `ptrs` points at
             // `streams` slots each holding a stream's (already `start`-offset) base pointer, `scalars`
-            // at `scalars` invariant f32s, and `n` is the multiple-of-8 lane count (the caller runs
-            // the scalar tail). The recipe is a function-local list borrowed from `func` (a shared
-            // reference), independent of the `&mut self.memory` writes below.
+            // at `scalars` invariant values of the recipe's lane type, and `n` is the
+            // multiple-of-lanes element count (the caller runs the scalar tail). The recipe is a
+            // function-local list borrowed from `func` (a shared reference), independent of the
+            // `&mut self` the marshalling below needs.
             Op::VecKernelCall {
                 kernel,
                 ptrs,
@@ -1167,114 +1362,19 @@ impl<'a, 'k> Interp<'a, 'k> {
                 let ptrs_base = ptr(reg(regs, *ptrs))?;
                 let scalars_base = ptr(reg(regs, *scalars))?;
                 let count = reg(regs, *n).as_int().max(0) as usize;
-                // Output-only streams need not contain initialized numeric values. Only recipe
-                // loads read memory; scalar tails beyond count remain untouched and unchecked.
-                let mut read_streams = vec![false; kern.streams as usize];
-                let mut read_scalars = vec![false; kern.scalars as usize];
-                for (index, op) in kern.ops.iter().enumerate() {
-                    if let wukong_mir::VecOp::Splat { scalar } = op {
-                        *read_scalars
-                            .get_mut(*scalar as usize)
-                            .ok_or("veckernel scalar index out of bounds")? = true;
+                match kern.lane {
+                    VecLane::F32 => {
+                        self.run_vec_kernel::<f32>(kern, ptrs_base, scalars_base, count)?
                     }
-                    if let wukong_mir::VecOp::Load { stream } = op {
-                        let reads = read_streams
-                            .get_mut(*stream as usize)
-                            .ok_or("veckernel load stream out of bounds")?;
-                        // eval_lane forwards a preceding store of this stream; that load never
-                        // consumes the original destination slot, which may be undefined.
-                        if !kern.ops[..index].iter().any(|previous| {
-                            matches!(previous, wukong_mir::VecOp::Store { stream: written, .. } if written == stream)
-                        }) {
-                            *reads = true;
-                        }
+                    VecLane::F64 => {
+                        self.run_vec_kernel::<f64>(kern, ptrs_base, scalars_base, count)?
                     }
-                }
-                // Resolve the stream base slots and the invariant scalars once.
-                let mut stream_bases: Vec<usize> = Vec::with_capacity(kern.streams as usize);
-                for s in 0..kern.streams as usize {
-                    stream_bases.push(ptr(*self
-                        .memory
-                        .get(ptrs_base + s)
-                        .ok_or("veckernel ptrs out of bounds")?)?);
-                }
-                let mut scalar_vals: Vec<f32> = Vec::with_capacity(kern.scalars as usize);
-                for (k, &read) in read_scalars.iter().enumerate() {
-                    scalar_vals.push(if read {
-                        self.memory
-                            .get(scalars_base + k)
-                            .ok_or("veckernel scalars out of bounds")?
-                            .kernel_float("veckernel scalar")? as f32
-                    } else {
-                        0.0
-                    });
-                }
-                if kern.reduce.is_some() {
-                    // Reduction kernel: fold every lane's addend and return the horizontal result as
-                    // an f32 (the caller combines the initial accumulator and folds the scalar tail).
-                    // Reads only — no stores. Same reassociation `eval_reduction` pins for both
-                    // backends, so this equals the native kernel's return bit-for-bit.
-                    for (s, &b) in stream_bases.iter().enumerate() {
-                        if read_streams[s] {
-                            let end = b
-                                .checked_add(count)
-                                .ok_or("veckernel reduction load out of bounds")?;
-                            let values = self
-                                .memory
-                                .get(b..end)
-                                .ok_or("veckernel reduction load out of bounds")?;
-                            // The reduction evaluator ignores a partial eight-lane suffix.
-                            for value in &values[..count / 8 * 8] {
-                                value.kernel_float("veckernel reduction")?;
-                            }
-                        }
+                    VecLane::I32 => {
+                        self.run_vec_kernel::<i32>(kern, ptrs_base, scalars_base, count)?
                     }
-                    // eval_reduction's callbacks cannot fail. Every numeric load above was checked,
-                    // and the read-only fold cannot change the validated values before conversion.
-                    let mem = &self.memory;
-                    let r = kern.eval_reduction(
-                        count,
-                        |s, e| mem[stream_bases[s as usize] + e].as_float() as f32,
-                        |k| scalar_vals[k as usize],
-                    );
-                    Value::Float(r as f64)
-                } else {
-                    // Elementwise: one `eval_lane` per element — snapshot this lane's stream inputs,
-                    // run the recipe, write its stores back. Load-before-store within a lane keeps
-                    // in-place streams exact; distinct lanes never alias (the vectorizer's no-alias
-                    // precondition), so no hazard.
-                    let mut stores: Vec<(u32, f32)> = Vec::new();
-                    let mut loads: Vec<f32> = Vec::with_capacity(stream_bases.len());
-                    let mut scratch = wukong_mir::vec_kernel::VecKernelScratch::default();
-                    for i in 0..count {
-                        loads.clear();
-                        for (s, &b) in stream_bases.iter().enumerate() {
-                            loads.push(if read_streams[s] {
-                                self.memory
-                                    .get(b + i)
-                                    .ok_or("veckernel load out of bounds")?
-                                    .kernel_float("veckernel load")?
-                                    as f32
-                            } else {
-                                0.0
-                            });
-                        }
-                        stores.clear();
-                        kern.eval_lane_with_scratch(
-                            &mut scratch,
-                            |s| loads[s as usize],
-                            |k| scalar_vals[k as usize],
-                            |s, v| stores.push((s, v)),
-                        );
-                        for &(s, v) in &stores {
-                            let slot = stream_bases[s as usize] + i;
-                            *self
-                                .memory
-                                .get_mut(slot)
-                                .ok_or("veckernel store out of bounds")? = Value::Float(v as f64);
-                        }
+                    VecLane::I64 => {
+                        self.run_vec_kernel::<i64>(kern, ptrs_base, scalars_base, count)?
                     }
-                    Value::Unit
                 }
             }
             // A function address: a pointer the interpreter tags with the function's index so the

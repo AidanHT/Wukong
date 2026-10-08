@@ -332,13 +332,19 @@ Cranelift provides JIT execution with `--run --backend=native` and object/exe ou
   on the native backend (only a **half-open, unit-step** range vectorizes: an inclusive `a..=b` or a
   `step s` loop lowers as the plain scalar loop — correct, just unaccelerated — and the
   recognized-kernel cascade declines those two forms for the same reason). Where the body fits the
-  raw-AVX2 recipe (f32 lanes, register pressure within the 16 YMM registers) an **elementwise** loop
-  is instead emitted as **true 256-bit AVX2** by a raw machine-code path
+  raw-AVX2 recipe (f32, f64, i32 or i64 lanes; up to eleven streams; register pressure within the 16
+  YMM registers) a loop is instead emitted as **true 256-bit AVX2** by a raw machine-code path
   (`crates/wukong_codegen_cranelift/src/avx2.rs`, VEX-encoded via `iced-x86`) that sidesteps
-  Cranelift's 128-bit CLIF cap (`WUKONG_P4_NO_256` disables it) — with **no** trip-count requirement,
-  so a 32-element loop and a runtime-`n` loop both take it. Only a float **reduction** additionally
-  requires a *compile-time-known* trip ≥ 2048 (`VEC256_REDUCTION_MIN_TRIP`), below which the inlined
-  128-bit reduction wins. The raw-AVX2 emitter is **host-gated**:
+  Cranelift's 128-bit CLIF cap (`WUKONG_P4_NO_256` disables it). The loop may stream over `[T; N]`
+  arrays, `[]T` slices and constant- or symbolic-shape tensors alike; a slice or `Ptr`-bound tensor
+  gets a one-time run-time bounds and overlap check that sends the loop scalar if it fails. An
+  **elementwise** loop takes the kernel at any trip that holds one register group, literal or
+  runtime (large output-only streams switch to non-temporal stores inside the kernel). A
+  **reduction** takes it at a trip ≥ 2048 (`VEC256_REDUCTION_MIN_TRIP`) — decided statically for a
+  literal trip and by one run-time compare for a runtime `n` — and computes the language's
+  **canonical reduction tree** either way, so the form never changes the sum (`docs/internals.md`,
+  "The canonical reduction tree"). `s = s + x + y` is the reduction `s += x + y`. The raw-AVX2
+  emitter is **host-gated**:
   `wukong_mir::host_supports_vec_kernels()` requires **x86-64 Windows with AVX2 + FMA** (the emitted
   body hardcodes the Win64 rcx/rdx/r8 argument registers, and there is no in-kernel fallback).
   `mir_build` tests that predicate alongside `WUKONG_P4_NO_256`, so off-gate no recipe is built and
@@ -853,9 +859,9 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   (`f32x4`), so a wider explicit `f32x8` cannot lower even once execution lands — it must split into
   128-bit halves. (Loop auto-vectorization above is separate and *does* run — 128-bit + unrolling by
   default, and now **true 256-bit AVX2** via a raw machine-code emitter that sidesteps this CLIF cap —
-  no trip-count requirement for an elementwise body; only a float *reduction* needs a
-  compile-time-known trip ≥ 2048; the recognized kernels get 256-bit AVX2 via the
-  runtime microkernels.)
+  for f32, f64, i32 and i64 lanes; an elementwise body takes it at any trip of one register group or
+  more, a *reduction* at a trip ≥ 2048 (statically or by a run-time trip test); the recognized
+  kernels get 256-bit AVX2 via the runtime microkernels.)
 - **Attributes:** sema validates the closed set `@parallel`, `@generic`, `@tile`, `@extern`,
   `@inline`, `@simd`, `@align`, and `@export`; unknown names and restricted-placement violations
   report `E0306`. Name acceptance does not promise execution: general `@simd`/`@align`/`@export`
@@ -949,9 +955,10 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   a footprint win on the call-bound activations); see "Works end to end" above.
 - The *general* vectorizer emits **128-bit CLIF by default** — Cranelift's vector ISA still rejects a
   256-bit `f32x8` SSA value (verified empirically on Cranelift 0.124, pinned as the
-  `cranelift_still_rejects_f32x8`/`p4_probe_vec256_ops` tripwire tests). An elementwise f32 loop is
-  instead dispatched to a **raw-AVX2 256-bit machine-code emitter** at any trip count; a float
-  **reduction** takes it only at a **large, compile-time-known trip (~≥2048 elems)**
+  `cranelift_still_rejects_f32x8`/`p4_probe_vec256_ops` tripwire tests). An f32/f64/i32/i64
+  elementwise loop is instead dispatched to a **raw-AVX2 256-bit machine-code emitter** at any trip
+  of one register group or more; a **reduction** takes it at a **trip ≥ 2048 elements**, tested
+  statically for a literal trip and at run time for a runtime one
   (`crates/wukong_codegen_cranelift/src/avx2.rs`, VEX-encoded via `iced-x86`;
   `WUKONG_P4_NO_256` disables it) — the same way the GEMM/vmath runtime microkernels reach 256-bit,
   and precisely *why* that raw emitter exists (Cranelift can't legalize the wider lane). That path is
@@ -962,10 +969,16 @@ declines on such a loss — a raw pointer carries no extent, so the trainer cann
   runs), and `assemble_kernel` refuses as a backstop rather than emit non-executable code.
   `WUKONG_P4_NO_256=1` forces the 128-bit CLIF path and is **result-identical** for the supported
   recipes. Elementwise FMA contraction is pinned by `p4_kill_switch_is_result_identical`; reductions
-  use the same pressure-limited logical eight-lane partition at both widths, pinned by
+  compute the canonical tree — four accumulators of one 256-bit register's lanes, a fixed combine
+  order, a fixed seed fold — at both widths, for every lane type and every addend: register pressure
+  changes only how the kernel schedules its copies, never the accumulator count. That is pinned by
+  `p4_kill_switch_is_result_identical` (reductions at literal trips ≥ 2048 and runtime trips on both
+  sides of the run-time trip test), by
   `reduction_partition_is_independent_of_width_and_threshold` with cancellation and exceptional-value
-  oracles. Below the call threshold, small or runtime-unknown reduction trips use paired four-lane
-  vectors to reproduce that partition. The portable register/MIR cost remains unmeasured.
+  oracles, and by the hand-evaluated `tests/run/reduction_canonical_tree.wk`. The portable form
+  represents each logical accumulator as two 128-bit vectors; its register/MIR cost against the old
+  four-vector form remains unmeasured, and so does the reduction crossover for low-pressure bodies
+  (2048 was measured on the highest-pressure body).
   The AST loop vectorizer requires a disjointness proof for differently named buffers paired
   with a write. Potentially aliased parameters retain scalar execution; named parameters alone
   do not imply non-aliasing. `parallel_dependence.wk` checks the shifted in-place recurrence

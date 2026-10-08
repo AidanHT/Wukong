@@ -2993,8 +2993,11 @@ mod tests {
 
     #[test]
     fn a_constant_offset_shows_up_in_the_index_constant() {
-        let src = "fn k(x: []f32, mut o: []f32, n: i64) { \
-                   for i in 0..n { o[i] = x[i + 3]; } } \
+        // `while`, like the case above: a `for` over two provably disjoint slices is widened by
+        // `mir_build`'s own vectorizer, leaving 128-bit strip loops (or a 256-bit kernel call) in
+        // place of the one scalar loop this inspects.
+        let src = "fn k(x: []f32, mut o: []f32, n: i64) { let mut i: i64 = 0; \
+                   while i < n { o[i] = x[i + 3]; i = i + 1; } } \
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         let l = &l;
@@ -3029,10 +3032,13 @@ mod tests {
 
     // ---- stage 4: carried values -------------------------------------------------------------
 
+    /// This and the integer case below are spelled as counting `while` loops: a `for` reduction
+    /// over a `[]T` slice is vectorized by `mir_build` itself (the canonical reduction tree), which
+    /// leaves strip loops over vector accumulators in place of the one scalar loop inspected here.
     #[test]
     fn a_float_sum_is_a_non_reassociable_reduction() {
-        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; \
-                   for i in 0..n { s = s + x[i]; } return s; } \
+        let src = "fn k(x: []f32, n: i64) -> f32 { let mut s: f32 = 0.0; let mut i: i64 = 0; \
+                   while i < n { s = s + x[i]; i = i + 1; } return s; } \
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         let l = &l;
@@ -3047,8 +3053,8 @@ mod tests {
 
     #[test]
     fn an_integer_sum_is_a_reassociable_reduction() {
-        let src = "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 0; \
-                   for i in 0..n { s = s + x[i]; } return s; } \
+        let src = "fn k(x: []i32, n: i64) -> i32 { let mut s: i32 = 0; let mut i: i64 = 0; \
+                   while i < n { s = s + x[i]; i = i + 1; } return s; } \
                    fn main() -> i32 { return 0; }";
         let (_, l) = kernel_loop(src, "k");
         let l = &l;

@@ -16,8 +16,9 @@ pub mod verify;
 pub use builder::Builder;
 pub use inst::{AddrSpace, BinOp, CastKind, CmpOp, Inst, Op, RoundMode, Terminator};
 pub use vec_kernel::{
-    host_supports_vec_kernels, op_operands, op_produces_value, VecBin, VecCmp, VecKernel, VecOp,
-    VecPressure, VecRedOp, VecReduce, VEC_LANES, VEC_MAX_STREAMS, VEC_NREG,
+    host_supports_vec_kernels, op_operands, op_produces_value, VecBin, VecCmp, VecKernel, VecLane,
+    VecOp, VecPressure, VecRedOp, VecReduce, VecValue, VEC_BYTES, VEC_LANES, VEC_MAX_STREAMS,
+    VEC_NREG,
 };
 
 use wukong_span::Symbol;

@@ -211,8 +211,10 @@ AVX2+FMA encodings, so it requires an **x86-64 Windows host with AVX2 + FMA**
 (`wukong_mir::host_supports_vec_kernels`, which `avx2::host_supports_kernels` delegates to). On any
 other host the vectorizer consults that same predicate and never builds a 256-bit recipe in the first
 place, so those loops stay on the portable 128-bit CLIF path — the identical lowering
-`WUKONG_P4_NO_256=1` forces, and result-identical by construction. Everything still compiles and
-runs; only the widest lane is unavailable. The interpreter needs none of this. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
+`WUKONG_P4_NO_256=1` forces, and result-identical by construction: elementwise lanes carry no
+reassociation, and a vectorized reduction computes the same canonical summation tree in both forms
+(`docs/internals.md`, "The canonical reduction tree"). Everything still compiles and runs; only the
+widest lane is unavailable. The interpreter needs none of this. A **GPU backend** (NVIDIA, PTX via the driver JIT — no CUDA toolkit) is
 behind `--features gpu`, and LLVM is an optional *textual-IR* emitter exposed via `--emit=llvm-ir` (always built; no feature flag).
 
 ## Status

@@ -511,16 +511,21 @@ result is always correct — the fallback is the ordinary scalar/vectorized loop
 speedup is silently absent, so check with `wukongc --emit=mir -O2 f.wk | grep wukong_parallel_for`.
 Fixtures: `tests/run/parallel_control_flow.wk`, `parallel_region_reassigned_local.wk`.
 
-Sequential vectorized **f32 reductions** that fit the wide arithmetic recipe use one logical
-eight-lane partition on both the 128-bit and 256-bit paths. The recipe's register pressure fixes
-the number of independent accumulators; complete groups are combined in accumulator order, then
-lanes 0 through 7 are folded in order, then the original scalar seed is combined once, followed
-by the scalar tail. With no complete eight-element group, the scalar tail starts from the original
-seed unchanged. The host ISA, the 2,048-element width threshold, `WUKONG_P4_NO_256`, and the portable
-lowering option therefore do not change this reduction's arithmetic order. This is a reassociated
-order, not strict source-order summation, and the recipe/partition is a compiler-build contract:
-it is not promised stable across releases or equivalent to a different recognized runtime kernel.
-Other element types and expressions outside the wide recipe keep their ordinary portable lowering.
+A sequential `for` **reduction** — `s += e`, `s = s + e`, any `+` chain holding `s` once
+(`s = s + x + y` is `s += x + y`), or a running `fmax`/`fmin`, over an `f32`, `f64`, `i32` or `i64`
+accumulator — is vectorized with a **canonical summation tree** that is part of the language, not of
+the build: four accumulators of one 256-bit register's lanes (8 for `f32`/`i32`, 4 for `f64`/`i64`),
+element `i + u·L + l` of each block into accumulator `u`, lane `l`; leftover full groups into
+accumulator 0; accumulators combined in order 1, 2, 3; lanes folded left to right; the original seed
+combined once (left untouched when no full group ran); then the remaining elements one at a time. The
+host ISA and OS, the 2,048-element width threshold, a literal versus a runtime trip,
+`WUKONG_P4_NO_256`, the `-O` level and the addend's register pressure choose only the instruction
+form, never this order — the interpreter, the 128-bit strips and the 256-bit kernel all compute it
+(`tests/run/reduction_canonical_tree.wk`; the full statement is in `docs/internals.md`). It is a
+reassociated order, not strict source-order summation, and it is a compiler-release contract: it is
+not promised stable across releases or equal to a different recognized runtime kernel's order. A loop
+that is not vectorized (a `while`, a declined body, or a slice access out of bounds at run time) keeps
+the strict left fold it spells.
 
 Separately, loop **auto-vectorization, FMA contraction, and elementwise fusion run automatically**
 (✅) — a plain `for i in 0..n { out[i] = a*x[i] + y[i] }` is vectorized, fused with an adjacent loop,
@@ -737,7 +742,11 @@ read-before-write is well-defined. The result is an ordinary slice: `s[i]`, `s.l
 `for x in s`, and fn-boundary passing/mutation all compose (`tests/run/heap_*.wk`) — and a slice is a
 first-class **kernel operand**: an `alloc_*` buffer handed to a matmul/GEMV nest, a norm, an activation
 loop, a reduction, a scan or `sdpa` dispatches to the same tuned runtime kernel a fixed-size `[T; N]`
-array does, so a runtime-sized weight blob is not a slow path.
+array does, so a runtime-sized weight blob is not a slow path. A loop no kernel matches is
+auto-vectorized over a slice (or a symbolic-shape tensor) exactly as over an array, 256-bit included,
+behind a one-time run-time check that every slice access is in bounds and that no written slice
+overlaps another buffer the loop touches; if either check fails the loop runs as written, scalar
+(`tests/run/vec256_runtime_streams.wk`).
 
 ```wukong
 let mut acts: []f32 = alloc_f32(tokens * hidden);   // zero-initialized, runtime-sized

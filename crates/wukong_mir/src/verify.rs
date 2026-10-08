@@ -631,11 +631,12 @@ impl<'a> Verifier<'a> {
                 // gentler of the two — it `get`s and reports "unknown kernel index"). A pass that
                 // re-parents the call into another function leaves it dangling, so range-check it
                 // here — this is the one operand the type rules below cannot see.
+                // `Some(Some(lane type))` for a reduction, `Some(None)` for an elementwise kernel.
                 let kind = self
                     .f
                     .vec_kernels
                     .get(*kernel as usize)
-                    .map(|k| k.reduce.is_some());
+                    .map(|k| k.reduce.map(|_| k.lane.mir_type()));
                 match kind {
                     None => {
                         let have = self.f.vec_kernels.len();
@@ -644,17 +645,18 @@ impl<'a> Verifier<'a> {
                              (the function has {have} kernels)"
                         ));
                     }
-                    // A reduction kernel returns its horizontal fold as `f32`; an elementwise one
-                    // writes through its output streams and yields nothing. The two have different
-                    // backend signatures, so the call's result must agree with the recipe.
-                    Some(true) if result.is_none() => self.err(format!(
+                    // A reduction kernel returns its horizontal fold in its lane type; an
+                    // elementwise one writes through its output streams and yields nothing. The two
+                    // have different backend signatures, so the call's result must agree with the
+                    // recipe.
+                    Some(Some(_)) if result.is_none() => self.err(format!(
                         "veckernel #{kernel} is a reduction but the call takes no result"
                     )),
-                    Some(true) => self.check_result_is(result, &MirType::F32),
-                    Some(false) if result.is_some() => self.err(format!(
+                    Some(Some(lane_ty)) => self.check_result_is(result, &lane_ty),
+                    Some(None) if result.is_some() => self.err(format!(
                         "veckernel #{kernel} is elementwise but the call takes a result"
                     )),
-                    Some(false) => {}
+                    Some(None) => {}
                 }
                 if self.use_val(*ptrs) {
                     self.expect_ty(*ptrs, &MirType::Ptr, "veckernel ptrs");
@@ -666,10 +668,12 @@ impl<'a> Verifier<'a> {
                     .f
                     .vec_kernels
                     .get(*kernel as usize)
-                    .map(|k| (k.streams, k.scalars));
-                if let Some((streams, invariants)) = counts {
+                    .map(|k| (k.streams, k.scalars, k.lane.mir_type()));
+                // The scalar table holds one lane-typed invariant per slot (`*const T`, T the
+                // kernel's lane type), so it is sized in elements of that type.
+                if let Some((streams, invariants, lane_ty)) = counts {
                     self.check_kernel_table(*ptrs, &MirType::Ptr, streams, "pointer");
-                    self.check_kernel_table(*scalars, &MirType::F32, invariants, "scalar");
+                    self.check_kernel_table(*scalars, &lane_ty, invariants, "scalar");
                 }
                 if self.use_val(*n) {
                     if let Some(t) = self.ty(*n) {
@@ -1010,10 +1014,11 @@ mod tests {
 
     #[test]
     fn malformed_veckernel_recipes_are_reported_before_pressure_analysis() {
-        use crate::{VecBin, VecKernel, VecOp, VecRedOp, VecReduce};
+        use crate::{VecBin, VecKernel, VecLane, VecOp, VecRedOp, VecReduce};
         let mut i = Interner::new();
         let template = VecKernel {
             name: i.intern("kernel"),
+            lane: VecLane::F32,
             streams: 1,
             scalars: 1,
             unroll: 1,
@@ -1081,6 +1086,33 @@ mod tests {
         let mut zero_unroll = template.clone();
         zero_unroll.unroll = 0;
         cases.push((zero_unroll, "unroll"));
+        // Integer lanes have no division, fused multiply-add or square root, and an immediate is an
+        // f32 bit pattern that means nothing on any other lane.
+        let mut int_div = template.clone();
+        int_div.lane = VecLane::I32;
+        int_div.ops[2] = VecOp::Bin {
+            op: VecBin::Div,
+            a: 0,
+            b: 1,
+        };
+        cases.push((int_div, "needs a float lane"));
+        let mut int_sqrt = template.clone();
+        int_sqrt.lane = VecLane::I64;
+        int_sqrt.ops[2] = VecOp::Sqrt { a: 0 };
+        cases.push((int_sqrt, "needs a float lane"));
+        let mut wide_const = template.clone();
+        wide_const.lane = VecLane::F64;
+        wide_const.ops[1] = VecOp::Const { bits: 0 };
+        cases.push((wide_const, "non-f32 lane"));
+        let mut int_max = template.clone();
+        int_max.lane = VecLane::I32;
+        int_max.ops.pop();
+        int_max.reduce = Some(VecReduce {
+            op: VecRedOp::Fmax,
+            value: 2,
+            fma: None,
+        });
+        cases.push((int_max, "integer reduction"));
         for (kernel, expected) in cases {
             let mut b = Builder::new(i.intern("f"), MirType::Void);
             b.add_vec_kernel(kernel.clone());
@@ -1095,7 +1127,7 @@ mod tests {
     /// `out = x + s` over one stream and one scalar, called with tables of the given sizes; `None`
     /// passes the table in as a parameter instead of a local slot.
     fn kernel_call(ptr_slots: Option<u32>, scalar_slots: Option<u32>, streams: u32) -> Vec<String> {
-        use crate::{VecBin, VecKernel, VecOp};
+        use crate::{VecBin, VecKernel, VecLane, VecOp};
         let mut i = Interner::new();
         let mut b = Builder::new(i.intern("f"), MirType::Void);
         let table = |b: &mut Builder, slots: Option<u32>, elem: MirType| match slots {
@@ -1119,6 +1151,7 @@ mod tests {
         ];
         let kernel = b.add_vec_kernel(VecKernel {
             name: i.intern("k"),
+            lane: VecLane::F32,
             streams,
             scalars: 1,
             unroll: 1,
@@ -1160,10 +1193,11 @@ mod tests {
 
     #[test]
     fn valid_veckernel_masks_and_fused_reductions_verify() {
-        use crate::{VecCmp, VecKernel, VecOp, VecRedOp, VecReduce};
+        use crate::{VecCmp, VecKernel, VecLane, VecOp, VecRedOp, VecReduce};
         let mut i = Interner::new();
         let mut kernel = VecKernel {
             name: i.intern("k"),
+            lane: VecLane::F32,
             streams: 1,
             scalars: 1,
             unroll: 2,
@@ -1186,6 +1220,14 @@ mod tests {
         };
         assert!(kernel.validate().is_empty());
         assert!(kernel.pressure().is_some());
+        // The same masked body is well-formed on every lane type, and a compare-select is inside
+        // the emitter's coverage for all four.
+        for lane in [VecLane::F64, VecLane::I32, VecLane::I64] {
+            let mut other = kernel.clone();
+            other.lane = lane;
+            assert!(other.validate().is_empty(), "{lane:?}");
+            assert!(other.pressure().is_some(), "{lane:?}");
+        }
         kernel.ops.truncate(2);
         // The unused value field is not an operand when a fused product feeds the reduction.
         kernel.reduce = Some(VecReduce {

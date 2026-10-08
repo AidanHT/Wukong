@@ -1,0 +1,200 @@
+// RUN: --run
+// EXPECT-EXIT: 0
+// EXPECT-OUT: -5
+// EXPECT-OUT: -3.5
+// EXPECT-OUT: 0
+// EXPECT-OUT: 5.5
+// EXPECT-OUT: -3
+// EXPECT-OUT: -1.5
+// EXPECT-OUT: 2
+// EXPECT-OUT: 7.5
+// EXPECT-OUT: -1
+// EXPECT-OUT: 0.5
+// EXPECT-OUT: 4
+// EXPECT-OUT: 9.5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: 6
+// EXPECT-OUT: 11.5
+// EXPECT-OUT: 3
+// EXPECT-OUT: 4.5
+// EXPECT-OUT: 8
+// EXPECT-OUT: 13.5
+// EXPECT-OUT: 5
+// EXPECT-OUT: -150
+// EXPECT-OUT: -130
+// EXPECT-OUT: -110
+// EXPECT-OUT: -90
+// EXPECT-OUT: -70
+// EXPECT-OUT: -50
+// EXPECT-OUT: -24
+// EXPECT-OUT: -4
+// EXPECT-OUT: 16
+// EXPECT-OUT: 36
+// EXPECT-OUT: 56
+// EXPECT-OUT: 76
+// EXPECT-OUT: 102
+// EXPECT-OUT: 122
+// EXPECT-OUT: 142
+// EXPECT-OUT: 162
+// EXPECT-OUT: 182
+// EXPECT-OUT: 202
+// EXPECT-OUT: 228
+// EXPECT-OUT: -7.5
+// EXPECT-OUT: -5.5
+// EXPECT-OUT: -3.5
+// EXPECT-OUT: -1.5
+// EXPECT-OUT: 0.5
+// EXPECT-OUT: 2.5
+// EXPECT-OUT: 4.5
+// EXPECT-OUT: 6.5
+// EXPECT-OUT: 8.5
+// EXPECT-OUT: 10.5
+// EXPECT-OUT: 12.5
+// EXPECT-OUT: 1
+// EXPECT-OUT: 2
+// EXPECT-OUT: 4
+// EXPECT-OUT: 7
+// EXPECT-OUT: 11
+// EXPECT-OUT: 16
+// EXPECT-OUT: 22
+// EXPECT-OUT: 29
+// EXPECT-OUT: 37
+// EXPECT-OUT: 46
+// EXPECT-OUT: 56
+// EXPECT-OUT: 67
+// EXPECT-OUT: 79
+// EXPECT-OUT: 92
+// EXPECT-OUT: 106
+// EXPECT-OUT: 121
+// EXPECT-OUT: 137
+// EXPECT-OUT: 154
+// EXPECT-OUT: 172
+// EXPECT-OUT: 191
+// EXPECT-OUT: 211
+module tests.run.vec256_runtime_streams
+
+// The runtime-sized buffer surfaces — `[]T` slices and symbolic-shape tensors — reach the same
+// vectorizer (and, on an AVX2 Win64 host, the same 256-bit recipes) as a `[T; N]` array. Until they
+// did, every loop over them capped at the 128-bit CLIF strips or at scalar code, although they are
+// what real kernels are written over (`alloc_f32(n)` buffers, `Tensor[f32, N]` parameters).
+//
+// A runtime-sized stream brings two facts only the run time knows, and the vectorized loop tests
+// both once, ahead of the loop, falling back to the scalar loop when either fails:
+//
+// * its extent — every slice access must stay inside the slice's length (here they all do);
+// * its identity — a written slice must not overlap another stream of the body. `shift_add` below
+//   is the case that needs it: `through(o)` hands back `o` itself, which the whole-program alias
+//   fact cannot see (a slice bound from a call is treated as fresh storage), so the loop is
+//   vectorized — and only the run-time overlap test keeps it from reading `v[i..i+8]` ahead of the
+//   stores to `o[i+1..]` that the scalar recurrence depends on.
+//
+// Every expected value is the scalar semantics of the source, derived by hand: halves and small
+// integers, exact in f32. Each kernel runs a trip that is not a multiple of the lane count, so the
+// vector part and the scalar tail split inside the expectations. Every lane is printed.
+
+// f32 over three slices, runtime n = 21: o = 0.5*(i-10) + (i%4)^2 (the add-of-product contracts
+// to one fused multiply-add in the vector part and the tail alike; every value is exact anyway).
+@generic
+fn affine(a: f32, x: []f32, y: []f32, mut o: []f32, n: i64) {
+    for i in 0..n {
+        o[i] = a * x[i] + y[i] * y[i];
+    }
+}
+
+// i32 over slices, runtime n = 19: o = 3*(7i - 50) - (i % 6).
+@generic
+fn affine_i32(x: []i32, y: []i32, mut o: []i32, n: i64) {
+    for i in 0..n {
+        o[i] = x[i] * 3 - y[i];
+    }
+}
+
+// A rank-1 symbolic tensor: N is a run-time value threaded in as a hidden parameter, and the
+// tensor's base lives in a `Ptr` slot. N = 11: out = 2*(i-3) - 1.5.
+@generic
+fn scale_shift<N>(x: Tensor[f32, N], mut out: Tensor[f32, N], s: f32) {
+    for i in 0..N {
+        out[i] = x[i] * s - 1.5;
+    }
+}
+
+fn through(v: []f32) -> []f32 {
+    return v;
+}
+
+// `v` IS `o`, so this is the recurrence o[i+1] = o[i] + x[i]: with o[0] = 1 and x[i] = i + 1,
+// o[k] = 1 + k(k+1)/2. A vector loop that read eight `v` lanes before storing any `o` lane would
+// instead see the zeros the caller put there.
+@generic
+fn shift_add(x: []f32, mut o: []f32, n: i64) {
+    let v: []f32 = through(o);
+    for i in 0..n {
+        o[i + 1] = v[i] + x[i];
+    }
+}
+
+fn main() -> i32 {
+    let mut x: []f32 = alloc_f32(21);
+    let mut y: []f32 = alloc_f32(21);
+    let mut o: []f32 = alloc_f32(21);
+    let mut xi: []i32 = alloc_i32(19);
+    let mut yi: []i32 = alloc_i32(19);
+    let mut oi: []i32 = alloc_i32(19);
+    let mut t: [f32; 11] = [0.0; 11];
+    let mut r: [f32; 11] = [0.0; 11];
+    let mut i: i64 = 0;
+    while i < 21 {
+        x[i] = (i as f32) - 10.0;
+        y[i] = ((i % 4) as f32);
+        o[i] = 0.0;
+        i = i + 1;
+    }
+    i = 0;
+    while i < 19 {
+        xi[i] = (i as i32) * 7 - 50;
+        yi[i] = (i % 6) as i32;
+        oi[i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    while i < 11 {
+        t[i] = (i as f32) - 3.0;
+        i = i + 1;
+    }
+
+    let n: i64 = (x[20] as i64) + 11; // x[20] = 10, so n = 21 — a value the compiler cannot fold
+    affine(0.5, x, y, o, n);
+    for k in 0..21 {
+        print(o[k]);
+    }
+    affine_i32(xi, yi, oi, n - 2);
+    for k in 0..19 {
+        print(oi[k]);
+    }
+    scale_shift::<11>(t, r, 2.0);
+    for k in 0..11 {
+        print(r[k]);
+    }
+
+    // The recurrence: o = [1, 0, 0, ...], x[i] = i + 1, 20 steps over a 21-element buffer.
+    i = 0;
+    while i < 21 {
+        x[i] = (i as f32) + 1.0;
+        o[i] = 0.0;
+        i = i + 1;
+    }
+    o[0] = 1.0;
+    shift_add(x, o, n - 1);
+    for k in 0..21 {
+        print(o[k]);
+    }
+
+    free(x);
+    free(y);
+    free(o);
+    free(xi);
+    free(yi);
+    free(oi);
+    return 0;
+}

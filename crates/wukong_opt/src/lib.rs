@@ -686,11 +686,14 @@ mod tests {
         let (program, lower) = wukong_mir_build::lower_program(&module, &sema, &mut interner);
         assert!(lower.iter().all(|d| !d.is_error()), "{lower:?}");
         let shifted = program.function(interner.intern("shifted")).unwrap();
+        // Either vector form counts: on an AVX2+FMA3/Win64 host the eight-lane i32 body takes the
+        // 256-bit recipe (a `veckernel` call, no `<N x i32>` values), elsewhere the 128-bit strips.
         assert!(
             shifted
                 .value_types
                 .iter()
-                .any(wukong_mir::MirType::is_vector),
+                .any(wukong_mir::MirType::is_vector)
+                || !shifted.vec_kernels.is_empty(),
             "proven-disjoint shifted arrays should retain AST SIMD"
         );
         for level in [0, 2] {
@@ -761,21 +764,24 @@ mod tests {
         // The same `x - x` / `x <cmp> x` identities as above, but written so the front-end
         // vectorizes the loop body: the Bin/Cmp results are then `<N x iW>`, which cannot hold the
         // scalar `ConstInt` the fold would materialize. Declining the fold is the only legal answer.
+        // Each trip is below one 256-bit register of its lane type (8 i32, 4 i64), so the loop keeps
+        // the 128-bit `<N x iW>` strips on every host instead of becoming a raw-AVX2 `veckernel`
+        // call, which carries no vector values for the fold to see.
         let cases = [
             (
-                "fn main() -> i32 { let mut n: [i32; 8] = [8; 8]; \
-                 for i in 0..8 { n[i] = n[i] - n[i]; } return n[0] + n[7] + 7; }",
+                "fn main() -> i32 { let mut n: [i32; 7] = [8; 7]; \
+                 for i in 0..7 { n[i] = n[i] - n[i]; } return n[0] + n[6] + 7; }",
                 7,
             ),
             (
-                "fn main() -> i32 { let mut n: [i64; 16] = [8; 16]; \
-                 for i in 0..16 { n[i] = n[i] - n[i]; } return (n[0] + n[15] + 7) as i32; }",
+                "fn main() -> i32 { let mut n: [i64; 3] = [8; 3]; \
+                 for i in 0..3 { n[i] = n[i] - n[i]; } return (n[0] + n[2] + 7) as i32; }",
                 7,
             ),
             (
-                "fn main() -> i32 { let mut n: [i32; 16] = [8; 16]; let mut o: [i32; 16] = [0; 16]; \
-                 for i in 0..16 { o[i] = if n[i] < n[i] { 1 } else { 2 }; } \
-                 return o[0] + o[15]; }",
+                "fn main() -> i32 { let mut n: [i32; 7] = [8; 7]; let mut o: [i32; 7] = [0; 7]; \
+                 for i in 0..7 { o[i] = if n[i] < n[i] { 1 } else { 2 }; } \
+                 return o[0] + o[6]; }",
                 4,
             ),
         ];
