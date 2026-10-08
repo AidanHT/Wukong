@@ -329,6 +329,7 @@ mod tests {
                     let t = tgr as usize;
                     let mut a = vec![0.0f32; cols];
                     let mut b = vec![0.0f32; cols];
+                    // SAFETY: `a`/`b` hold cols f32 for the per-row scalar vs avx2 comparison.
                     unsafe {
                         xent_bwd_row_scalar(x[off..].as_ptr(), t, a.as_mut_ptr(), cols);
                         xent_bwd_row_avx2(x[off..].as_ptr(), t, b.as_mut_ptr(), cols);
@@ -356,6 +357,7 @@ mod tests {
             let x = fill(rows * cols);
             let tg = fill_targets(rows, cols);
             let mut got = vec![0.0f32; rows * cols];
+            // SAFETY: `x`/`tg` sized for the shape; `got` sized rows*cols for the dispatched backward.
             unsafe {
                 wukong_xent_bwd_f32(
                     x.as_ptr(),
@@ -393,6 +395,7 @@ mod tests {
             let tg = fill_targets(rows, cols);
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
+            // SAFETY: `s`/`p` sized rows*cols (serial vs parallel); inputs sized for the shape.
             unsafe {
                 wukong_xent_bwd_f32(
                     x.as_ptr(),
@@ -430,6 +433,7 @@ mod tests {
             let tg = fill_targets(rows, cols);
             // In-place: dx aliases x (a copy), the documented supported aliasing.
             let mut dx = x.clone();
+            // SAFETY: `dx` aliases x in place (the documented supported aliasing), sized rows*cols.
             unsafe {
                 wukong_xent_bwd_f32(
                     x.as_ptr(),
@@ -462,6 +466,7 @@ mod tests {
             for t in [cols, cols + 3] {
                 let tg = [t as i32];
                 let mut dx = vec![777.0f32; cols + PAD];
+                // SAFETY: `dx` has cols+PAD writable f32; the backward writes the first cols and leaves PAD untouched.
                 unsafe {
                     wukong_xent_bwd_f32(x.as_ptr(), tg.as_ptr(), dx.as_mut_ptr(), 1, cols as i64);
                 }
@@ -496,6 +501,7 @@ mod tests {
             tg[..bad.len()].copy_from_slice(&bad);
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
+            // SAFETY: `s`/`p` sized rows*cols.
             unsafe {
                 wukong_xent_bwd_f32(
                     x.as_ptr(),
@@ -549,6 +555,7 @@ mod tests {
                 x[nan_at] = f32::NAN;
                 let mut a = vec![0.0f32; cols];
                 let mut b = vec![0.0f32; cols];
+                // SAFETY: `a`/`b` hold cols f32 for the per-row comparison.
                 unsafe {
                     xent_bwd_row_scalar(x.as_ptr(), 0, a.as_mut_ptr(), cols);
                     xent_bwd_row_avx2(x.as_ptr(), 0, b.as_mut_ptr(), cols);
@@ -571,6 +578,7 @@ mod tests {
         let x = fill(8);
         let tg = [0i32; 2];
         let mut dx = vec![42.0f32; 8];
+        // SAFETY: `tg` holds 2 i32, `dx` 8 f32; the degenerate extent is a no-op.
         unsafe {
             wukong_xent_bwd_f32(x.as_ptr(), tg.as_ptr(), dx.as_mut_ptr(), 0, 4);
             wukong_xent_bwd_f32(x.as_ptr(), tg.as_ptr(), dx.as_mut_ptr(), 2, 0);

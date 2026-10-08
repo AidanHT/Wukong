@@ -184,6 +184,37 @@ pub unsafe extern "C" fn wukong_lrscan_f32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: a one-row linear-recurrence scan writes a finite output for every column.
+        let (rows, cols) = (1usize, 3usize);
+        let a = vec![0.5f32; rows * cols];
+        let b = vec![1.0f32; rows * cols];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        // SAFETY: `a`, `b` and `out` are sized rows*cols; a nonpositive extent is a no-op.
+        unsafe {
+            wukong_lrscan_f32(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), rows as i64, 0);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive cols must not write out"
+        );
+        // SAFETY: `a`, `b` and `out` are sized rows*cols; the positive call writes that span.
+        unsafe {
+            wukong_lrscan_f32(
+                a.as_ptr(),
+                b.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+            );
+        }
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "scalar lrscan must write finite outputs"
+        );
+    }
+
     /// Per-step decay `a`, **bounded in (−1, 1)** (values in {−0.8, −0.6, …, 0.8}) so the recurrence is a
     /// contraction and `h` stays finite and modestly sized — keeping every intermediate an ordinary
     /// finite f32 (no inf/NaN, so `assert_eq!` on the bits is meaningful and the comparison is honest).
@@ -223,6 +254,7 @@ mod tests {
                 let a = fill_a(rows * cols);
                 let b = fill_b(rows * cols);
                 let mut got = vec![0.0f32; rows * cols];
+                // SAFETY: `a`, `b` and `got` are sized rows*cols for the dispatched call.
                 unsafe {
                     wukong_lrscan_f32(
                         a.as_ptr(),
@@ -249,6 +281,7 @@ mod tests {
             let b = fill_b(rows * cols);
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
+            // SAFETY: `a`, `b`, `s` and `p` are each sized rows*cols (serial vs parallel).
             unsafe {
                 wukong_lrscan_f32(
                     a.as_ptr(),
@@ -278,6 +311,7 @@ mod tests {
         let a = [0.5f32, 0.5, 0.5, 0.5];
         let b = [1.0f32, 1.0, 1.0, 1.0];
         let mut got = [0.0f32; 4];
+        // SAFETY: `a`, `b` and `got` hold 4 f32 (one row of four).
         unsafe {
             wukong_lrscan_f32(a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), 1, 4);
         }
@@ -305,6 +339,7 @@ mod tests {
             }
         }
         let mut got2 = [0.0f32; 16];
+        // SAFETY: all buffers are sized for the shape under test (got2 holds 16 f32).
         unsafe {
             wukong_lrscan_f32(a2.as_ptr(), b2.as_ptr(), got2.as_mut_ptr(), 8, 2);
         }

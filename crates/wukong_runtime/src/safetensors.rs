@@ -556,6 +556,7 @@ mod tests {
         let np = n.as_ptr() as *const u8;
         let dims = [2i64, 2];
         let mut out = [0f32; 4];
+        // SAFETY: `out` holds 4 f32 and `dims` describes 2x2 elements.
         let got = unsafe {
             wukong_rt_st_read(
                 f.ptr(),
@@ -569,6 +570,7 @@ mod tests {
         };
         assert_eq!((got, out), (4, [1.0, -2.0, 0.5, 3.0]));
         let mut raw = [0u16; 4];
+        // SAFETY: `raw` holds 4 u16 for the f16 read path; `dims` describes 2x2.
         let got = unsafe {
             wukong_rt_st_read(
                 f.ptr(),
@@ -582,6 +584,7 @@ mod tests {
         };
         assert_eq!((got, raw), (4, [0x3F80, 0xC000, 0x3F00, 0x4040]));
         let mut ints = [0i16; 3];
+        // SAFETY: `ints` holds 3 i16 and `dims` describes the read extent.
         let got = unsafe {
             wukong_rt_st_read(
                 f.ptr(),
@@ -597,6 +600,7 @@ mod tests {
         // Wrong dims, wrong count, wrong dtype: nothing is written.
         let mut keep = [9f32; 4];
         let bad_dims = [4i64];
+        // SAFETY: `keep` holds 4 f32; `bad_dims` is a deliberate shape mismatch the read must reject.
         let got = unsafe {
             wukong_rt_st_read(
                 f.ptr(),
@@ -609,6 +613,7 @@ mod tests {
             )
         };
         assert_eq!((got, keep), (IO_SHAPE_MISMATCH, [9.0; 4]));
+        // SAFETY: `keep` holds 4 f32; this read attempt targets a mismatching shape.
         let got = unsafe {
             wukong_rt_st_read(
                 f.ptr(),
@@ -621,6 +626,7 @@ mod tests {
             )
         };
         assert_eq!(got, IO_SHAPE_MISMATCH);
+        // SAFETY: the read attempt targets a mismatching shape and must not write past `keep`.
         let got = unsafe {
             wukong_rt_st_read(
                 f.ptr(),
@@ -635,6 +641,7 @@ mod tests {
         assert_eq!(got, IO_DTYPE_MISMATCH);
         assert_eq!(keep, [9.0; 4]);
         let missing = std::ffi::CString::new("wukong_st_absent_zz.safetensors").unwrap();
+        // SAFETY: the target file is absent; the read returns an error without writing.
         let got = unsafe {
             wukong_rt_st_read(
                 missing.as_ptr() as *const u8,

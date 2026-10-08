@@ -1042,6 +1042,9 @@ unsafe fn vmath_scalar(x: *const f32, out: *mut f32, n: usize, op: i64) {
 /// is not the elementwise source loop.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_vmath_f32(x: *const f32, out: *mut f32, n: i64, op: i64) {
+    // P14.5: both buffers valid for `n` f32 (in-place `out == x` is permitted, so no disjointness).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
@@ -1972,6 +1975,10 @@ pub unsafe extern "C" fn wukong_vmath2_f32(
     n: i64,
     op: i64,
 ) {
+    // P14.5: all three buffers valid for `n` f32 (in-place aliasing permitted, so no disjointness).
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, n);
+    crate::safety::debug_extent(out, n);
     if n <= 0 {
         return;
     }
@@ -2947,6 +2954,26 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: elementwise ReLU; nonpositive n is a no-op, small n drives the scalar path.
+        let x = [2.0f32, -1.0, 3.0];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); x.len()];
+        // SAFETY: `x`/`out` hold x.len() f32; a nonpositive n is a no-op.
+        unsafe {
+            wukong_vmath_f32(x.as_ptr(), out.as_mut_ptr(), 0, VM_RELU);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive n must not write out"
+        );
+        // SAFETY: `x`/`out` hold x.len() f32; the positive call writes them.
+        unsafe {
+            wukong_vmath_f32(x.as_ptr(), out.as_mut_ptr(), x.len() as i64, VM_RELU);
+        }
+        assert_eq!(out, vec![2.0, 0.0, 3.0]);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn nt_alignment_unary_and_binary_peels() {
@@ -2956,12 +2983,14 @@ mod tests {
         let n = crate::nt_policy::test_min_bytes() / 8 + 35;
         let x = vec![2.0; n];
         assert!(use_nt(n, 2));
+        // SAFETY: `check_nt_output` supplies an `out` of n f32; `x` holds n f32.
         crate::velem::check_nt_output(n, -99.0, 2.0, |out| unsafe {
             wukong_vmath_f32(x.as_ptr(), out, n as i64, VM_RELU);
         });
         assert!(use_nt(n, 3));
         let y = vec![0.0; n];
         // pow's explicit x^0 identity is exact in both scalar and vector paths.
+        // SAFETY: `check_nt_output` supplies an `out` of n f32; `y` holds n f32 (pow x^0).
         crate::velem::check_nt_output(n, -99.0, 1.0, |out| unsafe {
             wukong_vmath2_f32(x.as_ptr(), y.as_ptr(), out, n as i64, VM2_POW);
         });
@@ -3035,6 +3064,7 @@ mod tests {
             (VM_LOGSIGMOID, |x| (1.0 / (1.0 + (-x).exp())).ln(), 1e-4),
         ];
         for &(op, libm, tol) in cases {
+            // SAFETY: the op's input and `out` are sized for the libm-reference comparison.
             unsafe {
                 wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, op);
             }
@@ -3055,6 +3085,7 @@ mod tests {
             (VM_LOG2, f32::log2 as fn(f32) -> f32),
             (VM_LOG10, f32::log10 as fn(f32) -> f32),
         ] {
+            // SAFETY: input and `out` sized for the log/log10 reference comparison.
             unsafe {
                 wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, op);
             }
@@ -3086,6 +3117,7 @@ mod tests {
         ];
         let xs: Vec<f32> = refs.iter().map(|&(x, _)| x).collect();
         let mut out = vec![0.0f32; xs.len()];
+        // SAFETY: `xs`/`out` are sized xs.len() for the dispatched vmath.
         unsafe {
             wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, VM_ERF);
         }
@@ -3107,6 +3139,7 @@ mod tests {
     fn vmath_inverse_hyperbolic() {
         let check = |op: i64, xs: &[f32], reference: fn(f32) -> f32, tol: f32| {
             let mut out = vec![0.0f32; xs.len()];
+            // SAFETY: `xs`/`out` are sized xs.len().
             unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, op) };
             for (i, &x) in xs.iter().enumerate() {
                 let want = reference(x);
@@ -3142,6 +3175,7 @@ mod tests {
     fn vmath_inverse_trig() {
         let check = |op: i64, xs: &[f32], reference: fn(f32) -> f32, tol: f32| {
             let mut out = vec![0.0f32; xs.len()];
+            // SAFETY: `xs`/`out` are sized xs.len().
             unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, op) };
             for (i, &x) in xs.iter().enumerate() {
                 let want = reference(x);
@@ -3174,6 +3208,7 @@ mod tests {
         let n = 1003;
         let check = |op: i64, xs: &[f32], ys: &[f32], reference: fn(f32, f32) -> f32, tol: f32| {
             let mut out = vec![0.0f32; xs.len()];
+            // SAFETY: `xs`/`ys`/`out` are sized xs.len() (binary op).
             unsafe {
                 wukong_vmath2_f32(
                     xs.as_ptr(),
@@ -3227,6 +3262,7 @@ mod tests {
             xs[16] = x;
             ys[16] = y;
             let mut out = [0.0; 17];
+            // SAFETY: `xs`/`ys`/`out` hold 17 f32.
             unsafe { wukong_vmath2_f32(xs.as_ptr(), ys.as_ptr(), out.as_mut_ptr(), 17, op) };
             assert_eq!(
                 out[at].to_bits(),
@@ -3365,6 +3401,7 @@ mod tests {
     fn vmath_expm1_log1p() {
         let kernel = |op: i64, xs: &[f32]| -> Vec<f32> {
             let mut out = vec![0.0f32; xs.len()];
+            // SAFETY: `xs`/`out` are sized xs.len().
             unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, op) };
             out
         };
@@ -3462,6 +3499,7 @@ mod tests {
                 continue; // negative inputs are out of log's domain
             }
             let mut full = vec![0.0f32; xs.len()];
+            // SAFETY: `xs`/`full` are sized xs.len().
             unsafe {
                 wukong_vmath_f32(xs.as_ptr(), full.as_mut_ptr(), xs.len() as i64, op);
             }
@@ -3517,6 +3555,7 @@ mod tests {
         }
         xs.push(1.0);
         let mut out = vec![0.0f32; xs.len()];
+        // SAFETY: `xs`/`out` are sized xs.len().
         unsafe {
             wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, VM_LOG);
         }
@@ -3581,6 +3620,7 @@ mod tests {
                     xs[at] = x;
                     xs[16] = x;
                     let mut out = [0.0; 17];
+                    // SAFETY: `xs`/`out` hold 17 f32.
                     unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), 17, op) };
                     assert_eq!(out[at].to_bits(), expected, "op={op} lane={at} x={x:?}");
                     assert_eq!(out[16].to_bits(), expected, "op={op} tail x={x:?}");
@@ -3602,6 +3642,7 @@ mod tests {
         bits.extend(0x007f_ffe0..=0x0080_0020);
         let xs: Vec<f32> = bits.into_iter().map(f32::from_bits).collect();
         let mut out = vec![0.0; xs.len()];
+        // SAFETY: `xs`/`out` are sized xs.len() (LOG over crafted bit patterns).
         unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, VM_LOG) };
         for (&x, &actual) in xs.iter().zip(&out) {
             let expected = f64::from(x).ln();
@@ -3654,6 +3695,7 @@ mod tests {
                 }
                 let xs = [x; 9];
                 let mut out = [0.0; 9];
+                // SAFETY: `xs`/`out` hold 9 f32.
                 unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), 9, op) };
                 for actual in out {
                     assert!(actual.is_nan(), "op={op} lost NaN {bits:#x}: {actual}");
@@ -3680,6 +3722,7 @@ mod tests {
         ] {
             let xs = [x; 9];
             let mut out = [0.0; 9];
+            // SAFETY: `xs`/`out` hold 9 f32.
             unsafe { wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), 9, op) };
             for actual in out {
                 assert_eq!(actual.to_bits(), expected.to_bits(), "op={op} x={x}");
@@ -3894,6 +3937,7 @@ mod tests {
         }
         xs.push(0.0);
         let mut out = vec![0.0f32; xs.len()];
+        // SAFETY: `xs`/`out` are sized xs.len().
         unsafe {
             wukong_vmath_f32(xs.as_ptr(), out.as_mut_ptr(), xs.len() as i64, VM_EXP);
         }
@@ -4793,6 +4837,7 @@ mod tests {
         for op in ops {
             let (mut gb, mut gh, mut rb, mut rh) =
                 (vec![0f32; n], vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+            // SAFETY: `gb`/`gh`/`rb`/`rh` are each sized n.
             unsafe {
                 wukong_vmath_bf16(bbits.as_ptr(), gb.as_mut_ptr(), n as i64, op);
                 wukong_vmath_f32(bwide.as_ptr(), rb.as_mut_ptr(), n as i64, op);
@@ -5005,6 +5050,7 @@ mod tests {
             let outp = out.as_mut_ptr() as usize;
             let t_kernel = best(
                 iters,
+                // SAFETY: the closure's input/output buffers are sized n for the timing loop.
                 Box::new(move || unsafe {
                     wukong_vmath_f32(xp as *const f32, outp as *mut f32, n as i64, op);
                     std::hint::black_box(outp);
@@ -5071,6 +5117,7 @@ mod tests {
             let outp = out.as_mut_ptr() as usize;
             let t_kernel = best(
                 iters,
+                // SAFETY: the closure's input/output buffers are sized n for the timing loop.
                 Box::new(move || unsafe {
                     wukong_vmath2_f32(
                         xp as *const f32,
@@ -5115,6 +5162,7 @@ mod tests {
         let xs: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.1 + 0.05).collect();
         for op in [VM_EXP, VM_LOG, VM_TANH, VM_GELU, VM_SIN, VM_ERF, VM_RELU] {
             let mut got = vec![0.0f32; n];
+            // SAFETY: `xs`/`got` are sized n.
             unsafe { wukong_vmath_f32(xs.as_ptr(), got.as_mut_ptr(), n as i64, op) };
             for (i, &x) in xs.iter().enumerate() {
                 assert_eq!(
@@ -5342,6 +5390,7 @@ mod tests {
         let path = mkl_dll_path()?;
         // SAFETY: loading a system DLL; ALTERED_SEARCH_PATH lets it resolve its own siblings.
         let lib =
+            // SAFETY: loading a system DLL; ALTERED_SEARCH_PATH lets it resolve its own siblings (see the note above).
             unsafe { WinLibrary::load_with_flags(&path, LOAD_WITH_ALTERED_SEARCH_PATH) }.ok()?;
         let lib: libloading::Library = lib.into();
         // SAFETY: the three symbols carry MKL's documented ILP64 VML signature; the by-value
@@ -5369,6 +5418,7 @@ mod tests {
             // SAFETY: `vmlGetMode` takes no arguments and returns the mode word.
             eprintln!(
                 "  VML mode control: vmlSetMode/vmlGetMode present (mode {:#x} at load)",
+                // SAFETY: `get` is a resolved VML entry point invoked only after a successful load.
                 unsafe { get() }
             );
         } else {
@@ -5597,6 +5647,7 @@ mod tests {
                         match arm {
                             // SAFETY: avx2+fma detected above; buffers are n f32 long.
                             0 => {
+                                // SAFETY: avx2+fma detected above; the buffers are n f32 long.
                                 let d = time(&mut || unsafe {
                                     run_mono(xs.as_ptr(), a.as_mut_ptr(), n, op, false);
                                 });
@@ -5604,6 +5655,7 @@ mod tests {
                             }
                             // SAFETY: as above.
                             1 => {
+                                // SAFETY: avx2+fma detected above; the buffers are n f32 long.
                                 let d = time(&mut || unsafe {
                                     run_fnptr(xs.as_ptr(), b.as_mut_ptr(), n, op, false);
                                 });
@@ -5614,6 +5666,7 @@ mod tests {
                             // column: same code, same bits, true ratio exactly 1.000.
                             // SAFETY: buffers are n f32 long; n > 0.
                             2 => {
+                                // SAFETY: the buffers are n f32 long and n > 0.
                                 let d = time(&mut || unsafe {
                                     wukong_vmath_f32(xs.as_ptr(), e.as_mut_ptr(), n as i64, op);
                                 });
@@ -6110,6 +6163,7 @@ mod tests {
             VM2_SILU_GATE,
         ] {
             let mut got = vec![0.0f32; n];
+            // SAFETY: `xs`/`ys`/`got` are sized n (binary op).
             unsafe { wukong_vmath2_f32(xs.as_ptr(), ys.as_ptr(), got.as_mut_ptr(), n as i64, op) };
             for i in 0..n {
                 assert_eq!(
@@ -6155,6 +6209,7 @@ mod relu_zero_contract_tests {
                     .map(|i| CASES[(i + offset) % CASES.len()].1)
                     .collect();
                 let mut out = vec![-99.0; n];
+                // SAFETY: `xs`/`ys`/`out` sized n for the dispatched vmath2.
                 unsafe {
                     vmath_scalar(x.as_ptr(), out.as_mut_ptr(), n, VM_RELU);
                 }
@@ -6163,6 +6218,7 @@ mod relu_zero_contract_tests {
                     expected
                 );
                 out.fill(-99.0);
+                // SAFETY: `out` is refilled to n and the inputs are sized n.
                 unsafe {
                     wukong_vmath_f32(x.as_ptr(), out.as_mut_ptr(), n as i64, VM_RELU);
                 }
@@ -6174,6 +6230,7 @@ mod relu_zero_contract_tests {
                 if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                     for unroll6 in [false, true] {
                         out.fill(-99.0);
+                        // SAFETY: `out` is refilled to n and the inputs are sized n (unroll variants).
                         unsafe {
                             vmath_avx2(x.as_ptr(), out.as_mut_ptr(), n, VM_RELU, unroll6);
                         }

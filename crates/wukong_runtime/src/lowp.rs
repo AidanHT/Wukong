@@ -1593,6 +1593,31 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: bf16 bits 0x3F80 == 1.0; axpby with a=1,b=0 copies x; reduce sums to n.
+        let n = 3usize;
+        let x = vec![0x3F80u16; n];
+        let y = vec![0u16; n];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); n];
+        // SAFETY: `x`/`y`/`out` sized n; a nonpositive n is a no-op.
+        unsafe {
+            wukong_axpby_bf16(x.as_ptr(), y.as_ptr(), out.as_mut_ptr(), 0, 1.0, 0.0);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive n must not write out"
+        );
+        // SAFETY: `x`/`y`/`out` sized n; the positive call writes out.
+        unsafe {
+            wukong_axpby_bf16(x.as_ptr(), y.as_ptr(), out.as_mut_ptr(), n as i64, 1.0, 0.0);
+        }
+        assert_eq!(out, vec![1.0, 1.0, 1.0]);
+        // SAFETY: `x` holds n bf16 bits; reduce reads n.
+        let s = unsafe { wukong_reduce_bf16(x.as_ptr(), n as i64, crate::reduce::RED_SUM) };
+        assert_eq!(s, 3.0);
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn nt_alignment_narrow_peel() {
@@ -1613,6 +1638,7 @@ mod tests {
             (wukong_axpby_f16_out, f16_bits(2.0)),
         ] {
             let x = vec![value; n];
+            // SAFETY: `check_nt_output` supplies an out of n f32; `x` holds n bf16 bits.
             crate::velem::check_nt_output(n, 0xdead, value, |out| unsafe {
                 kernel(x.as_ptr(), x.as_ptr(), out, n as i64, 0.5, 0.5);
             });
@@ -1642,6 +1668,7 @@ mod tests {
             let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
             let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
 
+            // SAFETY: the bf16 inputs and out buffer are sized n for the axpby.
             unsafe {
                 assert_eq!(
                     wukong_sum_f16(xf16.as_ptr(), n as i64).to_bits(),
@@ -1713,6 +1740,7 @@ mod tests {
             let y: Vec<u16> = (0..n)
                 .map(|i| f16_bits((i as f32 * 0.23 + 0.4).cos()))
                 .collect();
+            // SAFETY: the f16 inputs and out buffer are sized n.
             unsafe {
                 assert_eq!(
                     wukong_sum_f16(x.as_ptr(), n as i64).to_bits(),
@@ -1732,6 +1760,7 @@ mod tests {
             .map(|i| f16_bits((i % 17) as f32 * 0.05 + 0.5))
             .collect();
         let want: f64 = x.iter().map(|&v| f16_to_f32(v) as f64).sum();
+        // SAFETY: `x` holds n f16 bits; wukong_sum_f16 reads n.
         let ours = unsafe { wukong_sum_f16(x.as_ptr(), n as i64) };
         let old = one_chain_sum(&x);
         let e_ours = (ours as f64 - want).abs() / want;
@@ -1772,9 +1801,11 @@ mod tests {
             let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
             for op in [RED_MAX, RED_MIN, RED_MAXABS] {
                 for (kind, xb, got) in [
+                    // SAFETY: `xbf` holds n bf16 bits; reduce reads n.
                     (Half::Bf16, &xbf, unsafe {
                         wukong_reduce_bf16(xbf.as_ptr(), n as i64, op)
                     }),
+                    // SAFETY: `xf16` holds n f16 bits; reduce reads n.
                     (Half::F16, &xf16, unsafe {
                         wukong_reduce_f16(xf16.as_ptr(), n as i64, op)
                     }),
@@ -1808,6 +1839,7 @@ mod tests {
                 let xb: Vec<u16> = xs.iter().map(|&v| conv(v)).collect();
                 let yb: Vec<u16> = ys.iter().map(|&v| conv(v)).collect();
                 let mut got = vec![0f32; n];
+                // SAFETY: `xb`/`yb` hold n half bits and `got` n f32.
                 unsafe {
                     match kind {
                         Half::Bf16 => wukong_axpby_bf16(
@@ -1888,6 +1920,7 @@ mod tests {
                             want[oi + 4 * i..oi + 4 * i + 4].copy_from_slice(&value.to_ne_bytes());
                         }
                         let p = got.as_mut_ptr().cast::<u8>();
+                        // SAFETY: `got` has n f32 (= n*4 bytes); the u8-cast pointer addresses that same buffer.
                         unsafe {
                             let x = p.add(xi).cast::<u16>();
                             let y = p.add(yi).cast::<u16>();
@@ -1924,6 +1957,7 @@ mod tests {
                     .collect();
                 for offset in [0usize, 1] {
                     let mut got = vec![0.0f32; n];
+                    // SAFETY: `got` holds n f32; the offset variants write within it.
                     unsafe {
                         let kernel = match kind {
                             Half::Bf16 => wukong_axpby_bf16,
@@ -1995,6 +2029,7 @@ mod tests {
         for c in 0..chunks {
             let mut gb = [0u16; 8];
             let mut gf = [0u16; 8];
+            // SAFETY: `gb`/`gf` hold 8 u16 each.
             unsafe {
                 let v = _mm256_loadu_ps(vals.as_ptr().add(c * 8));
                 narrow_bf16(v, gb.as_mut_ptr());
@@ -2014,6 +2049,7 @@ mod tests {
         for c in 0..vals.len() / 16 {
             let mut gb = [0u16; 16];
             let mut gf = [0u16; 16];
+            // SAFETY: `gb`/`gf` hold 16 u16 each.
             unsafe {
                 let v0 = _mm256_loadu_ps(vals.as_ptr().add(c * 16));
                 let v1 = _mm256_loadu_ps(vals.as_ptr().add(c * 16 + 8));
@@ -2059,6 +2095,7 @@ mod tests {
                 let xb: Vec<u16> = xs.iter().map(|&v| conv(v)).collect();
                 let yb: Vec<u16> = ys.iter().map(|&v| conv(v)).collect();
                 let mut got = vec![0u16; n];
+                // SAFETY: `xb`/`yb` hold n half bits and `got` n u16.
                 unsafe {
                     match kind {
                         Half::Bf16 => wukong_axpby_bf16_out(
@@ -2080,6 +2117,7 @@ mod tests {
                     }
                 }
                 let mut want = vec![0u16; n];
+                // SAFETY: `want` holds n u16; the reference kernel writes n.
                 unsafe {
                     axpby_narrow_scalar(kind, xb.as_ptr(), yb.as_ptr(), want.as_mut_ptr(), n, a, b);
                 }
@@ -2123,10 +2161,12 @@ mod tests {
                         want[oi + i] = kind.narrow((0.5 * x + 0.25 * y) as f32);
                     }
                     let p = got.as_mut_ptr();
+                    // SAFETY: `p.add(xi)`/`add(yi)`/`add(oi)` stay within `got` (overlap/aliasing probe).
                     unsafe { kernel(p.add(xi), p.add(yi), p.add(oi), n as i64, 0.5, 0.25) };
                     assert_eq!(got, want, "n={n}, offsets=({xi},{yi},{oi})");
                 }
             }
+            // SAFETY: the operands address within the allocated buffers for the disjoint control.
             unsafe {
                 kernel(
                     std::ptr::null(),
@@ -2155,7 +2195,9 @@ mod tests {
             } else {
                 0
             };
+            // SAFETY: `base` keeps `p` within `got` (in-place probe).
             let p = unsafe { got.as_mut_ptr().add(base) };
+            // SAFETY: `p` is all three operands (exact in-place), within `got`.
             unsafe { kernel(p, p, p, n as i64, 0.5, 0.25) };
             assert!(got[base..base + n].iter().all(|&v| v == kind.narrow(0.375)));
 
@@ -2183,6 +2225,7 @@ mod tests {
                 })
                 .collect();
             let p = got.as_mut_ptr();
+            // SAFETY: `p` is all three operands (exact in-place) over got.len() elements.
             unsafe { kernel(p, p, p, got.len() as i64, 1.0, 1.0) };
             assert_eq!(got, want);
         }
@@ -2208,6 +2251,7 @@ mod tests {
                                 kind.narrow(crate::vmath::apply1(op, kind.widen(want[xi + i])));
                         }
                         let p = got.as_mut_ptr();
+                        // SAFETY: the operands address within `got` for this width.
                         unsafe {
                             kernel(p.add(xi), p.add(oi), n as i64, op);
                         }
@@ -2215,6 +2259,7 @@ mod tests {
                     }
                 }
             }
+            // SAFETY: the operands address within the allocated buffers.
             unsafe {
                 kernel(std::ptr::null(), std::ptr::null_mut(), -1, VM_RELU);
             }
@@ -2236,7 +2281,9 @@ mod tests {
             } else {
                 0
             };
+            // SAFETY: `base` keeps `p` within `got` (in-place probe).
             let p = unsafe { got.as_mut_ptr().add(base) };
+            // SAFETY: `p` is all three operands (exact in-place), within `got`.
             unsafe {
                 kernel(p, p, n as i64, VM_RELU);
             }
@@ -2259,10 +2306,12 @@ mod tests {
                     .map(|v| kind.narrow(v))
                     .collect();
                 let mut want = vec![0; got.len()];
+                // SAFETY: `want` sized got.len(); the reference writes that span.
                 unsafe {
                     vmath_narrow_scalar(kind, got.as_ptr(), want.as_mut_ptr(), got.len(), op);
                 }
                 let p = got.as_mut_ptr();
+                // SAFETY: `p` addresses `got` over its full length.
                 unsafe {
                     kernel(p, p, got.len() as i64, op);
                 }
@@ -2291,6 +2340,7 @@ mod tests {
                 let xb: Vec<u16> = xs.iter().map(|&v| conv(v)).collect();
                 let mut got = vec![0u16; n];
                 let mut want = vec![0u16; n];
+                // SAFETY: `got`/`want` hold n u16.
                 unsafe {
                     match kind {
                         Half::Bf16 => {
@@ -2348,6 +2398,7 @@ mod tests {
                 ] {
                     let xb: Vec<u16> = xs.iter().map(|&v| conv(v)).collect();
                     let mut got = vec![0u16; n];
+                    // SAFETY: `xb` holds n half bits and `got` n u16.
                     unsafe {
                         match kind {
                             Half::Bf16 => {
@@ -2359,6 +2410,7 @@ mod tests {
                         }
                     }
                     let mut want = vec![0u16; n];
+                    // SAFETY: `want` holds n u16.
                     unsafe {
                         vmath_narrow_scalar(kind, xb.as_ptr(), want.as_mut_ptr(), n, op);
                     }
@@ -2379,6 +2431,7 @@ mod tests {
         let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
         let (a, b) = (0.6f32, 1.3f32);
         let mut got = vec![0f32; n];
+        // SAFETY: `got` holds n f32; inputs sized n (axpby a, b).
         unsafe {
             wukong_axpby_bf16(xbf.as_ptr(), ybf.as_ptr(), got.as_mut_ptr(), n as i64, a, b);
         }
@@ -2427,6 +2480,7 @@ mod tests {
         let xp = xs.as_ptr() as usize;
         let t_merc_f32 = best(
             5,
+            // SAFETY: the sum closure reads n half bits via the captured pointer.
             Box::new(move || unsafe {
                 crate::wukong_sreduce_f32(
                     xp as *const f32,
@@ -2444,11 +2498,13 @@ mod tests {
         let bp = xbf.as_ptr() as usize;
         let t_merc_bf16 = best(
             5,
+            // SAFETY: the bf16 sum reads n elements via the captured pointer `bp`.
             Box::new(move || unsafe { wukong_sum_bf16(bp as *const u16, n as i64) }),
         );
         let fp = xf16.as_ptr() as usize;
         let t_merc_f16 = best(
             5,
+            // SAFETY: the f16 sum reads n elements via the captured pointer `fp`.
             Box::new(move || unsafe { wukong_sum_f16(fp as *const u16, n as i64) }),
         );
 
@@ -2519,6 +2575,7 @@ mod tests {
         let obp = out_bf.as_mut_ptr() as usize;
         let t_bf = best(
             5,
+            // SAFETY: the bf16 bench closure reads n elements via captured pointers.
             Box::new(move || unsafe {
                 wukong_axpby_bf16(
                     xp as *const u16,
@@ -2536,6 +2593,7 @@ mod tests {
         let ofp = out_f.as_mut_ptr() as usize;
         let t_f = best(
             5,
+            // SAFETY: the f16 bench closure reads n elements via captured pointers.
             Box::new(move || unsafe {
                 let x = std::slice::from_raw_parts(xfp as *const f32, n);
                 let y = std::slice::from_raw_parts(yfp as *const f32, n);
@@ -2570,6 +2628,7 @@ mod tests {
         // f16 sum
         let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
         let ref_sum: f64 = xf16.iter().map(|&b| f16_to_f32(b) as f64).sum();
+        // SAFETY: `xf16` holds n f16 bits; wukong_sum_f16 reads n.
         let got = unsafe { wukong_sum_f16(xf16.as_ptr(), n as i64) };
         let rel = (got as f64 - ref_sum).abs() / ref_sum.abs().max(1.0);
         assert!(rel < 1e-3, "f16 sum rel {rel:.2e}");
@@ -2581,6 +2640,7 @@ mod tests {
             .zip(&ybf)
             .map(|(&a, &b)| bf16_bits_to_f32(a) as f64 * bf16_bits_to_f32(b) as f64)
             .sum();
+        // SAFETY: `xbf`/`ybf` hold n bf16 bits; dot reads n.
         let got = unsafe { wukong_dot_bf16(xbf.as_ptr(), ybf.as_ptr(), n as i64) };
         let rel = (got as f64 - ref_dot).abs() / ref_dot.abs().max(1.0);
         assert!(rel < 1e-2, "bf16 dot rel {rel:.2e}");
@@ -2648,6 +2708,7 @@ mod tests {
 
         for (name, x) in [("bench", &bench_x), ("hostile", &hostile_x)] {
             let want = f64_sum(x);
+            // SAFETY: `x` holds n bf16 bits; wukong_sum_bf16 reads n.
             let ours = rel(unsafe { wukong_sum_bf16(x.as_ptr(), n as i64) }, want);
             let peer = rel(seq_sum(x), want);
             assert!(ours <= 1e-6, "{name}: bf16 sum rel {ours:.3e} > 1e-6");
@@ -2659,6 +2720,7 @@ mod tests {
         }
         let want = f64_dot(&bench_x, &bench_y);
         let ours = rel(
+            // SAFETY: `bench_x`/`bench_y` hold n bf16 bits; dot reads n.
             unsafe { wukong_dot_bf16(bench_x.as_ptr(), bench_y.as_ptr(), n as i64) },
             want,
         );
@@ -2709,6 +2771,7 @@ mod tests {
             let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
             let yf16: Vec<u16> = ys.iter().map(|&v| f16_bits(v)).collect();
             let nn = n as i64;
+            // SAFETY: the half inputs and outputs are sized n for the axpby family.
             unsafe {
                 assert_eq!(
                     wukong_sum_bf16_parallel(xbf.as_ptr(), nn).to_bits(),
@@ -2816,6 +2879,7 @@ mod tests {
         let xbf: Vec<u16> = xs.iter().map(|&v| bf16_bits(v)).collect();
         let ybf: Vec<u16> = ys.iter().map(|&v| bf16_bits(v)).collect();
         let xf16: Vec<u16> = xs.iter().map(|&v| f16_bits(v)).collect();
+        // SAFETY: the bf16/f16 inputs and outputs are sized n.
         unsafe {
             // bf16 / f16 sum: f32-accumulation error within ULP tolerance of the f64 reference.
             let want: f64 = xbf.iter().map(|&b| bf16_bits_to_f32(b) as f64).sum();

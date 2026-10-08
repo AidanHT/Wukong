@@ -366,7 +366,9 @@ pub fn parallel_for(lo: i64, hi: i64, step: i64, mut body: impl FnMut(i64)) {
 /// output indices, so there is no data race.
 #[derive(Clone, Copy)]
 struct EnvAddr(usize);
+// SAFETY: `EnvAddr` wraps a usize passed to each parallel worker; workers write DISJOINT output indices, so sharing the address across threads is race-free.
 unsafe impl Send for EnvAddr {}
+// SAFETY: see above -- each worker touches a disjoint output range, so `EnvAddr` is safe to share across threads.
 unsafe impl Sync for EnvAddr {}
 
 /// Build the GLOBAL rayon pool exactly once, with the runtime's required configuration: 16 MiB
@@ -966,6 +968,7 @@ mod tests {
     extern "C" fn fill_squares(start: i64, end: i64, env: *const u8) {
         let out = env as *mut i64;
         for i in start..end {
+            // SAFETY: `out` is valid for n i64 and `i < n` within this worker's [start, end) band.
             unsafe { *out.add(i as usize) = i * i };
         }
     }
@@ -974,6 +977,7 @@ mod tests {
     fn parallel_for_covers_every_index_once() {
         let n = 10_000usize;
         let mut buf = vec![0i64; n];
+        // SAFETY: `buf` is valid for n i64; the parallel-for writes each index exactly once.
         unsafe {
             wukong_parallel_for(n as i64, fill_squares, buf.as_mut_ptr() as *const u8);
         }

@@ -168,8 +168,11 @@ pub unsafe extern "C" fn wukong_topk_f32(
 ) -> i64 {
     // SAFETY: forwarded from this function's contract; the copy ends the input borrow before the
     // outputs are created, so an overlapping output never coexists with it.
+    // SAFETY: `x` points at n readable f32; the immediate `to_vec` copies them before any output slice exists, so a later output overlap cannot corrupt the read.
     let xs = unsafe { input(x, n) }.to_vec();
+    // SAFETY: `vals` points at nv writable f32, distinct from the already-copied input.
     let vals = unsafe { output(vals, nv) };
+    // SAFETY: `idx` points at ni writable i32.
     let idx = unsafe { output(idx, ni) };
     topk(&xs, vals, idx) as i64
 }
@@ -189,7 +192,9 @@ pub unsafe extern "C" fn wukong_argsort_f32(
 ) -> i64 {
     // SAFETY: forwarded from this function's contract (an `i64` output cannot overlap an `f32`
     // input in a well-typed program, but the copy keeps the entry sound even if it did).
+    // SAFETY: `x` points at n readable f32, copied immediately; a later output overlap cannot corrupt the read.
     let xs = unsafe { input(x, n) }.to_vec();
+    // SAFETY: `idx` points at ni writable i32.
     let idx = unsafe { output(idx, ni) };
     argsort(&xs, idx, descending != 0) as i64
 }
@@ -302,8 +307,10 @@ mod tests {
         let mut idx = [0i64; 3];
         let p = x.as_mut_ptr();
         // vals overlaps x: the selection still sees the original x.
+        // SAFETY: `x` holds 3 f32; `vals` deliberately overlaps `x` (the selection reads the copied input) and `idx` holds 3 i32.
         let k = unsafe { wukong_topk_f32(p, 3, p, 3, idx.as_mut_ptr(), 3) };
         assert_eq!((k, x, idx), (3, [2.0, 1.0, 0.5], [1, 2, 0]));
+        // SAFETY: buffers are sized for this degenerate topk call (it returns 0 selected).
         let k = unsafe {
             wukong_topk_f32(
                 std::ptr::null(),
@@ -315,13 +322,16 @@ mod tests {
             )
         };
         assert_eq!(k, 0);
+        // SAFETY: `x` holds 3 f32 and `idx` 3 i32.
         let m = unsafe { wukong_argsort_f32(x.as_ptr(), 3, idx.as_mut_ptr(), 3, 0) };
         assert_eq!((m, idx), (3, [2, 1, 0]));
         assert_eq!(
+            // SAFETY: a null pointer with n == 0 is an explicitly handled degenerate input to sample_categorical.
             unsafe { wukong_sample_categorical_f32(std::ptr::null(), 0, 0.5) },
             -1
         );
         assert_eq!(
+            // SAFETY: `x` holds 3 f32.
             unsafe { wukong_sample_categorical_f32(x.as_ptr(), 3, 0.0) },
             0
         );

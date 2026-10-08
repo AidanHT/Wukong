@@ -156,6 +156,12 @@ pub unsafe extern "C" fn wukong_sgevm_f32(
     cols: i64,
     alpha: f32,
 ) {
+    // P14.5: w valid for rows, a for rows*cols, out for cols; out disjoint from w and a (documented).
+    crate::safety::debug_extent(w, rows);
+    crate::safety::debug_extent_2d(a, rows, cols);
+    crate::safety::debug_extent(out, cols);
+    crate::safety::debug_disjoint(out, cols, w, rows);
+    crate::safety::debug_disjoint(out, cols, a, rows.saturating_mul(cols));
     if rows <= 0 || cols <= 0 {
         return;
     }
@@ -237,6 +243,42 @@ pub unsafe extern "C" fn wukong_sgevm_f32_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: out[j] = alpha * sum_i w[i]*a[i,j]; w and a all ones, alpha 1 -> out[j] = rows.
+        let (rows, cols) = (2usize, 3usize);
+        let w = vec![1.0f32; rows];
+        let a = vec![1.0f32; rows * cols];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); cols];
+        // SAFETY: `w`/`a`/`out` are sized rows / rows*cols / cols; a nonpositive cols is a no-op.
+        unsafe {
+            wukong_sgevm_f32(
+                w.as_ptr(),
+                a.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i64,
+                0,
+                1.0,
+            );
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive cols must not write out"
+        );
+        // SAFETY: `w` sized rows, `a` rows*cols, `out` cols, and `out` is disjoint from both.
+        unsafe {
+            wukong_sgevm_f32(
+                w.as_ptr(),
+                a.as_ptr(),
+                out.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+                1.0,
+            );
+        }
+        assert_eq!(out, vec![2.0, 2.0, 2.0]);
+    }
 
     fn fill(seed: u64, n: usize) -> Vec<f32> {
         // Deterministic pseudo-random values in [-1, 1).
@@ -341,6 +383,7 @@ mod tests {
                 }
                 let mut got = vec![0.0f32; cols];
                 let mut got_par = vec![0.0f32; cols];
+                // SAFETY: `got`/`got_par` are sized cols; `w` and `a` are sized rows / rows*cols.
                 unsafe {
                     wukong_sgevm_f32(
                         w.as_ptr(),
@@ -390,6 +433,7 @@ mod tests {
                 want[j] = acc * alpha as f64;
             }
             let mut got = vec![0.0f32; cols];
+            // SAFETY: `out` is sized cols; `w` and `a` are sized for the shape.
             unsafe {
                 wukong_sgevm_f32(
                     w.as_ptr(),

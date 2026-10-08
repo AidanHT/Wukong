@@ -284,6 +284,7 @@ mod tests {
             let want = naive(&weight, &ids, t, h, v);
             let mut got = vec![0.0f32; t * h];
             let mut got_par = vec![0.0f32; t * h];
+            // SAFETY: `got`/`got_par` are sized t*h; weight and ids are sized for the call.
             unsafe {
                 wukong_embedding_f32(
                     got.as_mut_ptr(),
@@ -318,6 +319,7 @@ mod tests {
         let want = naive(&weight, &ids, t, h, v);
         let mut got = vec![9.0f32; t * h];
         let mut got_par = vec![9.0f32; t * h];
+        // SAFETY: `got`/`got_par` are sized t*h (serial vs parallel over one shape).
         unsafe {
             wukong_embedding_f32(
                 got.as_mut_ptr(),
@@ -353,6 +355,7 @@ mod tests {
         let weight = [1.0f32; 8];
         let ids = [0i32; 2];
         let mut out = vec![42.0f32; 8];
+        // SAFETY: `out` holds 8 f32 and `ids` 2 i32; the degenerate extent is a no-op.
         unsafe {
             wukong_embedding_f32(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), 0, 4, 2);
             wukong_embedding_f32(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), 2, 0, 2);
@@ -373,6 +376,7 @@ mod tests {
         let weight = [1.0f32; 8];
         let ids = [0i32; 2];
         let mut out = vec![42.0f32; 8];
+        // SAFETY: a negative extent is a no-op; `out` holds 8 f32.
         unsafe {
             wukong_embedding_f32(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), -1, 4, 2);
             wukong_embedding_f32(out.as_mut_ptr(), weight.as_ptr(), ids.as_ptr(), 2, -4, 2);
@@ -419,6 +423,7 @@ mod tests {
         let (t, h) = (2usize, 4usize);
         let mut got = vec![9.0f32; t * h];
         let mut got_par = vec![9.0f32; t * h];
+        // SAFETY: `got`/`got_par` are sized t*h for the dispatched call.
         unsafe {
             wukong_embedding_f32(
                 got.as_mut_ptr(),

@@ -567,6 +567,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: a single 2x2 max-pool window over one channel -> the window maximum.
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); 1];
+        // SAFETY: `x` holds 4 f32 (one 2x2 plane), `out` 1; a nonpositive h is a no-op.
+        unsafe {
+            wukong_maxpool2d_f32(x.as_ptr(), out.as_mut_ptr(), 1, 0, 2, 2, 2, 1, 1);
+        }
+        assert!(
+            out[0].to_bits() == 0x7fc0_0001,
+            "nonpositive h must not write out"
+        );
+        // SAFETY: `x` holds 4 f32, `out` 1; the positive call writes the single pooled value.
+        unsafe {
+            wukong_maxpool2d_f32(x.as_ptr(), out.as_mut_ptr(), 1, 2, 2, 2, 2, 1, 1);
+        }
+        assert_eq!(out, vec![4.0]);
+    }
+
+    #[test]
     fn pool2d_shared_shape_checked_spatial_extents() {
         assert_eq!(pool2d_output_dims(5, 8, 2, 3, 2, 3), Some((2, 2)));
         assert_eq!(pool2d_output_dims(4, 6, 4, 6, 99, 99), Some((1, 1)));
@@ -602,6 +622,7 @@ mod tests {
                 .collect();
             let mut output = [77.0; 18];
             // Four channels exercises the parallel entry's channel threshold.
+            // SAFETY: `x` sized for the shape; `output` holds 18 f32 across four channels.
             unsafe {
                 kernel(
                     input.as_ptr(),
@@ -637,6 +658,7 @@ mod tests {
                 let mut canary = 19.0;
                 let [c, h, w, kh, kw, sh, sw] = dims;
                 // Invalid shapes must not touch either pointer.
+                // SAFETY: an invalid shape short-circuits before either pointer is read.
                 unsafe {
                     kernel(std::ptr::null(), &mut canary, c, h, w, kh, kw, sh, sw);
                 }
@@ -726,6 +748,7 @@ mod tests {
                     let mut scalar = vec![0.0; want.len()];
                     let mut vector = scalar.clone();
                     let mut parallel = scalar.clone();
+                    // SAFETY: `vector` and `parallel` are clones of `scalar`, each sized for the output.
                     unsafe {
                         for c in 0..channels {
                             pool_channel_scalar(
@@ -835,6 +858,7 @@ mod tests {
                     PoolKind::Max => (wukong_maxpool2d_f32, wukong_maxpool2d_f32_parallel),
                     PoolKind::Avg => (wukong_avgpool2d_f32, wukong_avgpool2d_f32_parallel),
                 };
+                // SAFETY: `x` sized channels*h*w; the dispatched pooled outputs are sized channels*out_plane.
                 unsafe {
                     f(
                         x.as_ptr(),
@@ -909,6 +933,7 @@ mod tests {
                         let mut want = vec![0.0f32; channels * out_plane];
                         // Unit under test: the AVX2 sw==2 band path, per channel.
                         let mut got = vec![0.0f32; channels * out_plane];
+                        // SAFETY: AVX2 confirmed by the enclosing feature guard; per-channel in/out slices are sized in_plane/out_plane.
                         unsafe {
                             for c in 0..channels {
                                 pool_channel_scalar(
@@ -973,6 +998,7 @@ mod tests {
                         };
                         let mut pub_got = vec![0.0f32; channels * out_plane];
                         let mut pub_par = vec![0.0f32; channels * out_plane];
+                        // SAFETY: AVX2 confirmed by the enclosing feature guard; `pub_got`/`pub_par` sized channels*out_plane.
                         unsafe {
                             f(
                                 x.as_ptr(),

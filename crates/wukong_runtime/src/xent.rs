@@ -297,7 +297,9 @@ mod tests {
                 for (row, &tgv) in tg.iter().enumerate() {
                     let off = row * cols;
                     let t = tgv as usize;
+                    // SAFETY: `x` row slice has cols readable f32 from off; target t < cols.
                     let a = unsafe { xent_row_scalar(x[off..].as_ptr(), t, cols) };
+                    // SAFETY: AVX2 confirmed by the test's feature guard; `x` row slice has cols readable f32.
                     let b = unsafe { xent_row_avx2(x[off..].as_ptr(), t, cols) };
                     assert_eq!(
                         a.to_bits(),
@@ -318,6 +320,7 @@ mod tests {
             let x = fill(rows * cols);
             let tg = fill_targets(rows, cols);
             let mut got = vec![0.0f32; rows];
+            // SAFETY: `x` sized rows*cols, `tg` rows, `got` rows for the dispatched call.
             unsafe {
                 wukong_xent_fwd_f32(
                     x.as_ptr(),
@@ -353,6 +356,7 @@ mod tests {
             let tg = fill_targets(rows, cols);
             let mut s = vec![0.0f32; rows];
             let mut p = vec![0.0f32; rows];
+            // SAFETY: `x`/`tg` sized for the shape; `s`/`p` sized rows (serial vs parallel).
             unsafe {
                 wukong_xent_fwd_f32(
                     x.as_ptr(),
@@ -391,6 +395,7 @@ mod tests {
             for &t in &[0usize, cols / 2, cols - 1] {
                 let tg = [t as i32];
                 let mut got = [0.0f32; 1];
+                // SAFETY: `x` holds cols f32, `tg` one target, `got` one f32 (a single row).
                 unsafe {
                     wukong_xent_fwd_f32(x.as_ptr(), tg.as_ptr(), got.as_mut_ptr(), 1, cols as i64);
                 }
@@ -416,6 +421,7 @@ mod tests {
             for t in [cols, cols + 3] {
                 let tg = [t as i32];
                 let mut got = [0.0f32; 1];
+                // SAFETY: `x` holds cols f32, `tg` one target, `got` one f32.
                 unsafe {
                     wukong_xent_fwd_f32(
                         buf.as_ptr(),
@@ -449,6 +455,7 @@ mod tests {
             tg[..bad.len()].copy_from_slice(&bad);
             let mut s = vec![0.0f32; rows];
             let mut p = vec![0.0f32; rows];
+            // SAFETY: `x`/`tg` sized for the shape; `s`/`p` sized rows.
             unsafe {
                 wukong_xent_fwd_f32(
                     x.as_ptr(),
@@ -502,7 +509,9 @@ mod tests {
                 let mut x = fill(cols);
                 x[0] = 100.0; // the row max, in lane 0 — a NaN must not erase it
                 x[nan_at] = f32::NAN;
+                // SAFETY: `x` holds cols f32 (with an injected NaN); target 0 < cols.
                 let a = unsafe { xent_row_scalar(x.as_ptr(), 0, cols) };
+                // SAFETY: AVX2 confirmed by the test's feature guard; `x` holds cols f32.
                 let b = unsafe { xent_row_avx2(x.as_ptr(), 0, cols) };
                 assert!(
                     (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits(),
@@ -518,6 +527,7 @@ mod tests {
         let x = fill(8);
         let tg = [0i32; 2];
         let mut loss = vec![42.0f32; 2];
+        // SAFETY: `x`/`tg` sized for the shape, `loss` holds 2 f32; the degenerate extent is a no-op.
         unsafe {
             wukong_xent_fwd_f32(x.as_ptr(), tg.as_ptr(), loss.as_mut_ptr(), 0, 4);
             wukong_xent_fwd_f32(x.as_ptr(), tg.as_ptr(), loss.as_mut_ptr(), 2, 0);

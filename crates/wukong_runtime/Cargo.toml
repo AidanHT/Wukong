@@ -19,3 +19,21 @@ num_cpus = "1"
 [dev-dependencies]
 # Dev instrument only (examples/gemm_var.rs): load oneMKL as the adjacent-run variance peer.
 libloading = "0.8"
+
+# P13.15 / P14.4 — lint policy, carried in the manifest so every invocation sees it (not only CI's
+# workflow-level `RUSTFLAGS: -D warnings`). This crate opts in to its OWN table rather than
+# `[lints] workspace = true`, because it adds a Clippy lint on top of the shared `-D warnings` rule
+# (the two cannot be combined with `workspace = true`).
+[lints.rust]
+# Mirror the workspace `-D warnings` policy locally, so `cargo clippy -p wukong_runtime` denies the
+# same lints CI does; the deny no longer lives only in CI's environment.
+warnings = "deny"
+
+[lints.clippy]
+# P14.4 — every `unsafe {}` block in this crate now carries a `// SAFETY:` justification. This lint
+# (restriction group, allow-by-default) requires one on each block and so holds that line for every
+# future block. It is `warn` here and is escalated to a hard error by the workspace's
+# `RUSTFLAGS: -D warnings` during the CI Clippy step. `unsafe_op_in_unsafe_fn` is deliberately NOT
+# enabled: on edition 2021 it would require wrapping the body of every `unsafe fn` in an explicit
+# `unsafe {}` block (a code change, not a comment), which is out of scope for this safety-doc pass.
+undocumented_unsafe_blocks = "warn"

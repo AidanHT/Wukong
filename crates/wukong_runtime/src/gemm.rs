@@ -586,6 +586,7 @@ struct GemmArgs {
     epi: Option<Epilogue>,
 }
 #[cfg(target_arch = "x86_64")]
+// SAFETY: `GemmArgs` bundles raw operand pointers; it is only moved into the fork-join closure, where each worker writes a DISJOINT C region, so sending it across threads is race-free.
 unsafe impl Send for GemmArgs {}
 
 #[cfg(target_arch = "x86_64")]
@@ -599,6 +600,7 @@ impl GemmArgs {
     /// Same operand-size contract as [`sgemm_avx2_parallel`]; AVX2/FMA must be available.
     #[target_feature(enable = "avx2,fma")]
     unsafe fn run(self) {
+        // SAFETY: the `#[target_feature(avx2,fma)]` on `run` guarantees the ISA; the field pointers satisfy sgemm_avx2_parallel's operand-size contract (GemmArgs' construction invariant).
         unsafe {
             sgemm_avx2_parallel(
                 self.a, self.b, self.c, self.m, self.k, self.n, self.beta, self.at, self.bt,
@@ -685,6 +687,7 @@ impl Epilogue {
             bias: if self.bias.is_null() {
                 self.bias
             } else {
+                // SAFETY: `shift` is only called with `cols` inside the column range the bias array covers (see the note above), so `add(cols)` stays in bounds.
                 unsafe { self.bias.add(cols) }
             },
             act: self.act,
@@ -1758,6 +1761,7 @@ struct GemmRegion {
 // is the same aliasing discipline the fork-join kernel has always used; it smuggled the very same
 // pointers across its rayon closures as `usize`.
 #[cfg(target_arch = "x86_64")]
+// SAFETY: as documented above -- each mutable target is written by exactly one worker per phase (fetch_add-claimed disjoint indices) and the barrier orders packs before compute reads.
 unsafe impl Sync for GemmRegion {}
 
 /// One **persistent parallel region per GEMM call** — the GotoBLAS structure. The legacy shape
@@ -2785,6 +2789,7 @@ unsafe fn sgemm_2d_shared(pool: Option<&rayon::ThreadPool>, args: GemmArgs) {
             // Phase 1 — pack the whole m×kc A and n×kc B panels once, cooperatively. The shared
             // buffer bytes equal what `pack_a`/`pack_b_block` produce for the blocks they feed:
             // same panel functions, same sources, same layout.
+            // SAFETY: `a_addr`/`b_addr` are valid for the m*k / k*n operands; a_origin/pack_ab_par touch only the current K-block [pc, pc+kc).
             unsafe {
                 let (a_blk, lda) = a_origin(a_addr as *const f32, m, k, at, 0, pc);
                 pack_ab_par(
@@ -2905,6 +2910,7 @@ fn sgemm_scalar(
     bt: bool,
     epi: Option<Epilogue>,
 ) {
+    // SAFETY: `a`/`b`/`c` satisfy the m,k,n operand-size contract; `c.add(i*n + j)` indexes within c's m*n elements.
     unsafe {
         for i in 0..m {
             let crow = c.add(i * n);
@@ -4576,6 +4582,7 @@ mod tests {
         let b = fill(2, k * n);
         let (want, growth) = reference_f64(&a, &b, m, k, n, false);
         let mut got = vec![0.0f32; m * n];
+        // SAFETY: `a`/`b` sized m*k/k*n and `got` m*n (reference comparison).
         unsafe {
             wukong_sgemm(
                 a.as_ptr(),
@@ -4689,6 +4696,7 @@ mod tests {
             let b = fill(402, n * k);
             let (want, growth) = reference_f64(&a, &b, m, k, n, true);
             let (mut got, mut got_par) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+            // SAFETY: `a`/`b` sized m*k/k*n; `got`/`got_par` m*n.
             unsafe {
                 wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), got.as_mut_ptr(), mi, ki, ni, 0);
                 wukong_sgemm_nt_parallel(
@@ -4708,6 +4716,7 @@ mod tests {
             let bn = fill(404, k * n);
             let (want, growth) = reference_tn_f64(&at, &bn, m, k, n);
             let (mut got, mut got_par) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+            // SAFETY: `at`/`bn` sized k*m/k*n (TN) and `got`/`got_par` m*n.
             unsafe {
                 wukong_sgemm_tn(at.as_ptr(), bn.as_ptr(), got.as_mut_ptr(), mi, ki, ni, 0);
                 wukong_sgemm_tn_parallel(
@@ -4797,6 +4806,7 @@ mod tests {
         let b = fill(4, n * k);
         let mut serial = vec![0.0f32; m * n];
         let mut par = vec![0.0f32; m * n];
+        // SAFETY: `serial`/`par` sized m*n; inputs sized for the shape.
         unsafe {
             wukong_sgemm_nt(
                 a.as_ptr(),
@@ -4845,6 +4855,7 @@ mod tests {
         let b_h: Vec<f32> = b.iter().map(|&x| crate::round_f16(x)).collect();
         let (want, growth) = reference_f64(&a, &b, m, k, n, false);
         let mut got = vec![0.0f32; m * n];
+        // SAFETY: `a`/`b` sized m*k/k*n and `got` m*n.
         unsafe {
             wukong_sgemm(
                 a_h.as_ptr(),
@@ -4877,6 +4888,7 @@ mod tests {
                 .map(|(x, y)| f64::from(*x) + y)
                 .collect();
             let mut got = base.clone();
+            // SAFETY: `got` is a clone sized m*n (in-place beta accumulate).
             unsafe {
                 wukong_sgemm(
                     a.as_ptr(),
@@ -5072,16 +5084,20 @@ mod tests {
                 );
             };
             let prev = pin_pcore();
+            // SAFETY: bench: ap/bp/cp address n*n buffers (square timing).
             bench("sgemm (1 core)", &|| unsafe {
                 wukong_sgemm(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
+            // SAFETY: bench: ap/bp/cp address n*n buffers (nt timing).
             bench("sgemm_nt (1 core)", &|| unsafe {
                 wukong_sgemm_nt(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
             restore_sched(prev); // parallel benches want all cores, at the process's own priority
+                                 // SAFETY: bench: ap/bp/cp address n*n buffers (parallel timing).
             bench("sgemm (parallel)", &|| unsafe {
                 wukong_sgemm_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
+            // SAFETY: bench: ap/bp/cp address n*n buffers (nt parallel timing).
             bench("sgemm_nt (parallel)", &|| unsafe {
                 wukong_sgemm_nt_parallel(ap, bp, cp, n as i64, n as i64, n as i64, 0);
             });
@@ -5117,6 +5133,7 @@ mod tests {
             let (ap, bp, cp) = (a.as_ptr(), b.as_ptr(), c.as_mut_ptr());
             let flops = 2.0 * (n as f64).powi(3);
             let logical_run =
+                // SAFETY: sgemm_avx2_parallel over ap/bp/cp, each an n*n buffer.
                 || unsafe { sgemm_avx2_parallel(ap, bp, cp, n, n, n, 0.0, false, false, None) };
             let physical_run = || {
                 let args = GemmArgs {
@@ -5131,6 +5148,7 @@ mod tests {
                     bt: false,
                     epi: None,
                 };
+                // SAFETY: `args` wraps ap/bp/cp (n*n buffers); run() executes on the pool.
                 ppool.install(move || unsafe { args.run() });
             };
             for _ in 0..3 {
@@ -5225,6 +5243,7 @@ mod tests {
             let (want, growth) = reference_f64(&a, &b, m, k, n, true);
             let mut got = vec![0.0f32; m * n];
             let mut got_par = vec![0.0f32; m * n];
+            // SAFETY: `a`/`b` sized m*k/k*n; `got`/`got_par` m*n.
             unsafe {
                 wukong_sgemm_nt(
                     a.as_ptr(),
@@ -5269,6 +5288,7 @@ mod tests {
             let (want, growth) = reference_tn_f64(&a, &b, m, k, n);
             let mut got = vec![0.0f32; m * n];
             let mut got_par = vec![0.0f32; m * n];
+            // SAFETY: `a`/`b` sized m*k/k*n; `got`/`got_par` m*n.
             unsafe {
                 wukong_sgemm_tn(
                     a.as_ptr(),
@@ -5299,6 +5319,7 @@ mod tests {
                 }
             }
             let mut nn = vec![0.0f32; m * n];
+            // SAFETY: `nn` sized m*n; inputs sized for the shape.
             unsafe {
                 wukong_sgemm(
                     at.as_ptr(),
@@ -5351,6 +5372,7 @@ mod tests {
             let mut got_h = vec![0.0f32; m * n];
             let mut got_h_par = vec![0.0f32; m * n];
             let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+            // SAFETY: the half-precision operands and `got_h`/`got_h_par` are sized m*k/k*n/m*n.
             unsafe {
                 // Reference: the exact f32 NT kernel on the widened operands.
                 wukong_sgemm_nt(
@@ -5456,6 +5478,7 @@ mod tests {
             let mut got_h = vec![0.0f32; m * n];
             let mut got_h_par = vec![0.0f32; m * n];
             let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+            // SAFETY: the half-precision operands and `got_h`/`got_h_par` are sized m*k/k*n/m*n.
             unsafe {
                 // Reference: the exact f32 TN kernel on the widened operands.
                 wukong_sgemm_tn(
@@ -5561,6 +5584,7 @@ mod tests {
                 let mut ref_h = vec![0.0f32; m * n];
                 let mut got_h = vec![0.0f32; m * n];
                 let mut got_h_par = vec![0.0f32; m * n];
+                // SAFETY: `got_h`/`got_h_par` sized m*n; inputs sized for the shape.
                 unsafe {
                     // Reference: the f32 fused-epilogue kernel on the widened operands.
                     wukong_sgemm_nt_epi(
@@ -5658,6 +5682,7 @@ mod tests {
         let b = fill(7, k * n);
         let mut serial = vec![0.0f32; m * n];
         let mut par = vec![0.0f32; m * n];
+        // SAFETY: `serial`/`par` sized m*n.
         unsafe {
             wukong_sgemm(
                 a.as_ptr(),
@@ -5684,6 +5709,7 @@ mod tests {
         // Same for the nn.Linear (C = A·Bᵀ) parallel path, which otherwise has no correctness test.
         let mut serial_nt = vec![0.0f32; m * n];
         let mut par_nt = vec![0.0f32; m * n];
+        // SAFETY: `serial_nt`/`par_nt` sized m*n.
         unsafe {
             wukong_sgemm_nt(
                 a.as_ptr(),
@@ -5738,11 +5764,13 @@ mod tests {
             let b = fill(72, k * n);
             let (mi, ki, ni) = (m as i64, k as i64, n as i64);
             let mut serial = vec![0.0f32; m * n];
+            // SAFETY: `serial` sized m*n; inputs sized for the shape.
             unsafe {
                 wukong_sgemm(a.as_ptr(), b.as_ptr(), serial.as_mut_ptr(), mi, ki, ni, 0);
             }
             // Persistent region, called directly with the same pool selection gemm_dispatch uses.
             let mut per = vec![0.0f32; m * n];
+            // SAFETY: `per` sized m*n (persistent region path).
             unsafe {
                 let args = GemmArgs {
                     a: a.as_ptr(),
@@ -5761,6 +5789,7 @@ mod tests {
             assert_eq!(serial, per, "persistent region != serial (m{m} k{k} n{n})");
             // Legacy fork-join path (what the WUKONG_GEMM_FORKJOIN=1 kill-switch routes to).
             let mut fj = vec![0.0f32; m * n];
+            // SAFETY: `fj` sized m*n (fork-join path).
             unsafe {
                 sgemm_avx2_parallel(
                     a.as_ptr(),
@@ -5779,6 +5808,7 @@ mod tests {
             // Public entry: routes to whichever path the process env selected — must equal serial
             // either way.
             let mut public = vec![0.0f32; m * n];
+            // SAFETY: `public` sized m*n (public entry).
             unsafe {
                 wukong_sgemm_parallel(a.as_ptr(), b.as_ptr(), public.as_mut_ptr(), mi, ki, ni, 0);
             }
@@ -5803,6 +5833,7 @@ mod tests {
             let mut serial = vec![0.0f32; m * n];
             let mut per = vec![0.0f32; m * n];
             let mut fj = vec![0.0f32; m * n];
+            // SAFETY: `per`/`fj` sized m*n.
             unsafe {
                 wukong_sgemm_nt_epi(
                     a.as_ptr(),
@@ -5881,6 +5912,7 @@ mod tests {
                     let mut serial = base.clone();
                     let mut got2d = base.clone();
                     let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+                    // SAFETY: `got2d` is a clone sized m*n (2D scheduler).
                     unsafe {
                         if bt {
                             wukong_sgemm_nt(
@@ -5942,6 +5974,7 @@ mod tests {
                     };
                     let mut serial = vec![0.0f32; m * n];
                     let mut got2d = vec![0.0f32; m * n];
+                    // SAFETY: `serial`/`got2d` sized m*n.
                     unsafe {
                         wukong_sgemm_nt_epi(
                             a.as_ptr(),
@@ -6154,6 +6187,7 @@ mod tests {
                     let base = fill(103, m * n); // beta=1 must accumulate onto a nonzero C
                     let mut serial = base.clone();
                     let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+                    // SAFETY: `serial` is a clone sized m*n.
                     unsafe {
                         if bt {
                             wukong_sgemm_nt(
@@ -6180,6 +6214,7 @@ mod tests {
                     for steal_order in [false, true] {
                         for skinny_a in [false, true] {
                             let mut got = base.clone();
+                            // SAFETY: `got` is a clone sized m*n (skinny-A variants).
                             unsafe {
                                 let args = GemmArgs {
                                     a: a.as_ptr(),
@@ -6219,6 +6254,7 @@ mod tests {
                 for steal_order in [false, true] {
                     for skinny_a in [false, true] {
                         let mut got = vec![0.0f32; m * n];
+                        // SAFETY: `got` sized m*n (skinny-A variants).
                         unsafe {
                             let args = GemmArgs {
                                 a: a.as_ptr(),
@@ -6243,6 +6279,7 @@ mod tests {
                 }
             };
             let mut serial = vec![0.0f32; m * n];
+            // SAFETY: `serial` sized m*n (bias shift test).
             unsafe {
                 wukong_sgemm_nt_epi(
                     a.as_ptr(),
@@ -6267,6 +6304,7 @@ mod tests {
             );
             // No bias: the null base must stay null through both shifts.
             let mut serial_nb = vec![0.0f32; m * n];
+            // SAFETY: `serial_nb` sized m*n (null bias stays null).
             unsafe {
                 wukong_sgemm_nt_epi(
                     a.as_ptr(),
@@ -6291,6 +6329,7 @@ mod tests {
             );
             // α-scaled (the attention QKᵀ/√d form): folded on the final K-block only.
             let mut serial_alpha = vec![0.0f32; m * n];
+            // SAFETY: `serial_alpha` sized m*n (alpha-scaled NT).
             unsafe {
                 wukong_sgemm_nt_alpha(
                     a.as_ptr(),
@@ -6340,6 +6379,7 @@ mod tests {
                 let a = fill(111, m * k);
                 let b = fill(112, k * n);
                 let mut s = vec![0.0f32; m * n];
+                // SAFETY: the operands and output are sized for the shape.
                 unsafe {
                     wukong_sgemm(
                         a.as_ptr(),
@@ -6364,6 +6404,7 @@ mod tests {
             for steal_order in [false, true] {
                 for skinny_a in [false, true] {
                     let mut got = vec![0.0f32; m * n];
+                    // SAFETY: `got` sized m*n (skinny-A variants).
                     unsafe {
                         let args = GemmArgs {
                             a: a.as_ptr(),
@@ -6387,6 +6428,7 @@ mod tests {
             }
             // The static range-split scheduler (the `WUKONG_GEMM_DYN=0` instrument) at the same width.
             let mut st = vec![0.0f32; m * n];
+            // SAFETY: `st` sized m*n (static range-split scheduler).
             unsafe {
                 let args = GemmArgs {
                     a: a.as_ptr(),
@@ -6450,6 +6492,7 @@ mod tests {
                     let mut serial = base.clone();
                     let mut shared = base.clone();
                     let (mi, ki, ni) = (m as i64, k as i64, n as i64);
+                    // SAFETY: `shared` is a clone sized m*n (2D shared).
                     unsafe {
                         if bt {
                             wukong_sgemm_nt(
@@ -6500,6 +6543,7 @@ mod tests {
             let a = fill(94, m * k);
             let b = fill(95, k * n);
             let (mut serial, mut blocks) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+            // SAFETY: `serial`/`blocks` sized m*n; `b` sized k*n.
             unsafe {
                 wukong_sgemm_nt(
                     a.as_ptr(),
@@ -6541,6 +6585,7 @@ mod tests {
             let bias = fill(98, n);
             let run_shared = |epi: Epilogue, serial_ref: &[f32], tag: &str| {
                 let mut shared = vec![0.0f32; m * n];
+                // SAFETY: `shared` sized m*n (epilogue shift).
                 unsafe {
                     let args = GemmArgs {
                         a: a.as_ptr(),
@@ -6564,6 +6609,7 @@ mod tests {
             };
             for &act in &[ACT_IDENTITY, ACT_RELU, ACT_GELU, ACT_SILU] {
                 let mut serial = vec![0.0f32; m * n];
+                // SAFETY: `serial` sized m*n (activation variants).
                 unsafe {
                     wukong_sgemm_nt_epi(
                         a.as_ptr(),
@@ -6589,6 +6635,7 @@ mod tests {
             }
             // No bias: the null bias base must stay null through both shifts.
             let mut serial = vec![0.0f32; m * n];
+            // SAFETY: `serial` sized m*n (null bias).
             unsafe {
                 wukong_sgemm_nt_epi(
                     a.as_ptr(),
@@ -6613,6 +6660,7 @@ mod tests {
             );
             // α-scaled (the attention QKᵀ/√d form): folded on the final K-block only.
             let mut serial_alpha = vec![0.0f32; m * n];
+            // SAFETY: `serial_alpha` sized m*n (alpha-scaled).
             unsafe {
                 wukong_sgemm_nt_alpha(
                     a.as_ptr(),
@@ -6667,6 +6715,7 @@ mod tests {
             let bias = fill(3, n);
             let mut c = vec![0.0f32; m * n];
             let (ap, bp, biasp, cp) = (a.as_ptr(), b.as_ptr(), bias.as_ptr(), c.as_mut_ptr());
+            // SAFETY: bench: ap/bp/biasp/cp address buffers sized m*k/k*n/>=2*n/m*n (separate).
             let sep = bench(&|| unsafe {
                 wukong_sgemm_nt(ap, bp, cp, m as i64, k as i64, n as i64, 0);
                 // Separate bias+ReLU pass over C (what the compiler emits as a standalone loop).
@@ -6678,11 +6727,13 @@ mod tests {
                 }
                 std::hint::black_box(cp);
             });
+            // SAFETY: bench: the same ap/bp/biasp/cp buffers, fused epilogue.
             let fused = bench(&|| unsafe {
                 wukong_sgemm_nt_epi(ap, bp, cp, m as i64, k as i64, n as i64, 0, biasp, 1);
                 std::hint::black_box(cp);
             });
             // The `@parallel` fused FFN: same fold, spread across cores (used to be serial-only).
+            // SAFETY: bench: the same buffers, parallel fused.
             let fused_par = bench(&|| unsafe {
                 wukong_sgemm_nt_epi_parallel(ap, bp, cp, m as i64, k as i64, n as i64, 0, biasp, 1);
                 std::hint::black_box(cp);
@@ -6740,6 +6791,7 @@ mod tests {
             // f64 and the fusion law is checked against the sum, which is the pair this test needs.
             let (want_f64, growth) = reference_f64(&a, &b, m, k, n, true);
             let mut base = vec![0.0f32; m * n];
+            // SAFETY: `base` sized m*n; inputs sized for the shape.
             unsafe {
                 wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), base.as_mut_ptr(), mi, ki, ni, 0);
             }
@@ -6753,6 +6805,7 @@ mod tests {
                     };
                     let bias_ref = if use_bias { Some(&bias[..]) } else { None };
                     let mut got = vec![0.0f32; m * n];
+                    // SAFETY: `got` sized m*n; optional bias sized for the shape.
                     unsafe {
                         wukong_sgemm_nt_epi(
                             a.as_ptr(),
@@ -6831,6 +6884,7 @@ mod tests {
         bias[3] = -f32::MIN_POSITIVE;
         let (mi, ki, ni) = (m as i64, k as i64, n as i64);
         let mut base = vec![0.0f32; m * n];
+        // SAFETY: `base` sized m*n; inputs sized for the shape.
         unsafe {
             wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), base.as_mut_ptr(), mi, ki, ni, 0);
         }
@@ -6847,6 +6901,7 @@ mod tests {
                 };
                 let bias_ref = if use_bias { Some(&bias[..]) } else { None };
                 let mut got = vec![0.0f32; m * n];
+                // SAFETY: `got` sized m*n; optional bias sized for the shape.
                 unsafe {
                     wukong_sgemm_nt_epi(
                         a.as_ptr(),
@@ -7347,6 +7402,7 @@ mod tests {
                 // Reference: the exact `nt` GEMM, then a scalar `alpha·c` pass (same single f32 multiply
                 // the α kernel folds into the writeback).
                 let mut want = vec![0.0f32; m * n];
+                // SAFETY: `want` sized m*n (alpha reference).
                 unsafe {
                     wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), want.as_mut_ptr(), mi, ki, ni, 0);
                 }
@@ -7355,6 +7411,7 @@ mod tests {
                 }
                 let mut got = vec![0.0f32; m * n];
                 let mut got_par = vec![0.0f32; m * n];
+                // SAFETY: `got`/`got_par` sized m*n.
                 unsafe {
                     wukong_sgemm_nt_alpha(
                         a.as_ptr(),
@@ -7389,6 +7446,7 @@ mod tests {
             // alpha == 1.0 must be byte-identical to the plain `nt` kernel (the multiply is skipped).
             let mut plain = vec![0.0f32; m * n];
             let mut a1 = vec![0.0f32; m * n];
+            // SAFETY: `plain`/`a1` sized m*n (alpha==1 vs plain).
             unsafe {
                 wukong_sgemm_nt(a.as_ptr(), b.as_ptr(), plain.as_mut_ptr(), mi, ki, ni, 0);
                 wukong_sgemm_nt_alpha(a.as_ptr(), b.as_ptr(), a1.as_mut_ptr(), mi, ki, ni, 0, 1.0);
@@ -7423,6 +7481,7 @@ mod tests {
                         std::ptr::null()
                     };
                     let (mut serial, mut par) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+                    // SAFETY: `serial`/`par` sized m*n.
                     unsafe {
                         wukong_sgemm_nt_epi(
                             a.as_ptr(),
@@ -7533,6 +7592,7 @@ mod tests {
             for jp in 0..nc.div_ceil(NR) {
                 let mut got = vec![f32::from_bits(0xDEAD_BEEF); kc * NR];
                 let mut want = vec![f32::from_bits(0xDEAD_BEEF); kc * NR];
+                // SAFETY: `got`/`want` hold kc*NR f32 (a packed B panel).
                 unsafe {
                     pack_b_trans_panel(src.as_ptr(), ldb, kc, nc, jp, got.as_mut_ptr());
                     twin(src.as_ptr(), ldb, kc, nc, jp, want.as_mut_ptr());
@@ -7621,6 +7681,7 @@ mod tests {
             for ip in 0..mc.div_ceil(MR) {
                 let mut got = vec![f32::from_bits(SENTINEL); (kc + 8) * MR];
                 let mut want = vec![f32::from_bits(SENTINEL); (kc + 8) * MR];
+                // SAFETY: `got`/`want` hold (kc+8)*MR f32 (a packed A panel).
                 unsafe {
                     pack_a_panel(src.as_ptr(), lda, false, mc, kc, ip, got.as_mut_ptr());
                     twin(src.as_ptr(), lda, mc, kc, ip, want.as_mut_ptr());
@@ -7975,6 +8036,7 @@ mod tests {
                     epi: None,
                 };
                 for fused in [false, true] {
+                    // SAFETY: `a`/`bp` sized for m,k,n; `c` is the m*n output check provides (serial).
                     check(&format!("serial fused{fused}"), &mut |c| unsafe {
                         sgemm_avx2_impl(a, bp, c, m, k, n, beta, true, false, None, fused)
                     });
@@ -7982,12 +8044,15 @@ mod tests {
                 check("scalar twin", &mut |c| {
                     sgemm_scalar(a, bp, c, m, k, n, beta, true, false, None)
                 });
+                // SAFETY: `a`/`bp` sized for m,k,n; `c` is the m*n output (fork-join).
                 check("fork-join", &mut |c| unsafe {
                     sgemm_avx2_parallel(a, bp, c, m, k, n, beta, true, false, None)
                 });
+                // SAFETY: `c` is the m*n output (persistent region).
                 check("persistent region", &mut |c| unsafe {
                     sgemm_persistent_region(gemm_pool(), args(c))
                 });
+                // SAFETY: `c` is the m*n output (2D static).
                 check("2D static", &mut |c| unsafe {
                     sgemm_2d_blocks(gemm_pool(), args(c))
                 });
@@ -7995,12 +8060,14 @@ mod tests {
                     for skinny_a in [false, true] {
                         check(
                             &format!("2D dyn order{steal_order} skinnyA{skinny_a}"),
+                            // SAFETY: `c` is the m*n output (2D dyn variants).
                             &mut |c| unsafe {
                                 sgemm_2d_blocks_dyn(gemm_pool(), args(c), steal_order, skinny_a)
                             },
                         );
                     }
                 }
+                // SAFETY: `c` is the m*n output (2D shared).
                 check("2D shared", &mut |c| unsafe {
                     sgemm_2d_shared(gemm_pool(), args(c))
                 });
@@ -8116,16 +8183,19 @@ mod tests {
                 }
                 lo
             };
+            // SAFETY: the pack-B timing reads b (k*n) and writes a panel buffer sized for the shape.
             let tb = unsafe {
                 best(cb.max(2), &mut || {
                     pack_b_block(b.as_ptr(), k, n, 0, 0, kc, nc, true, bp.as_mut_ptr())
                 })
             } * cb as f64;
+            // SAFETY: the pack-A timing reads a (m*k) and writes a panel buffer sized for the shape.
             let ta = unsafe {
                 best(ca.max(2), &mut || {
                     pack_a(a.as_ptr(), k, false, mc, kc, ap.as_mut_ptr())
                 })
             } * ca as f64;
+            // SAFETY: the micro-timing operands are sized for the shape.
             let tm1 = unsafe {
                 best(ca.max(2), &mut || {
                     macro_kernel(
@@ -8148,7 +8218,9 @@ mod tests {
             let macro_gf = 2.0 * mc as f64 * nc as f64 * kc as f64 / tm1 / 1e9;
             let fused = if m <= MC {
                 let mut bpanel = vec![0.0f32; NR * kc];
+                // SAFETY: `b` holds k*n f32; b_origin computes the panel origin within it.
                 let (b_src, ldb) = unsafe { b_origin(b.as_ptr(), k, n, true, 0, 0) };
+                // SAFETY: the fused micro-timing operands are sized for the shape.
                 let tf1 = unsafe {
                     best(ca.max(2), &mut || {
                         macro_kernel_packb(
@@ -8215,11 +8287,13 @@ mod relu_zero_contract_tests {
             };
             for (input, expected) in CASES {
                 assert_eq!(
+                    // SAFETY: apply reads only its scalar argument and the epilogue's own fields; no memory access.
                     unsafe { epi.apply(f32::from_bits(input), 0) }.to_bits(),
                     expected
                 );
             }
             let scaled = Epilogue { alpha: 2.0, ..epi };
+            // SAFETY: apply reads only its scalar argument and the epilogue's own fields; no memory access.
             assert_eq!(unsafe { scaled.apply(-0.0, 0) }.to_bits(), 0);
         }
     }

@@ -54,9 +54,89 @@ pub extern "C" fn wukong_rt_bounds_fail(index: i64, len: i64, site: *const u8) {
     std::process::exit(1);
 }
 
+// ---------------------------------------------------------------------------------------------
+// P14.5: debug-only precondition checks for the C-ABI kernel entries.
+//
+// These compile OUT of the release perf builds (`debug_assert!`) and are a no-op for a zero or
+// negative extent, which every entry treats as a legal no-op -- so they never fail on an input a
+// valid caller is allowed to pass. They cannot check a *memory bound*: a C-ABI entry carries no
+// capacity, only the extent, so the only facts expressible from `(pointer, extent)` are that a
+// nonempty buffer pointer is non-null and that the extent does not overflow the `p.add(n)` the
+// kernel performs, plus -- for entries whose `# Safety` contract documents operands as disjoint --
+// that two ranges the caller promised not to overlap in fact do not. An entry that permits exact
+// in-place aliasing (`out == x`) must NOT pass that pair to `debug_disjoint`.
+// ---------------------------------------------------------------------------------------------
+
+/// Assert a single buffer's extent is castable and, when nonempty, its pointer is non-null and the
+/// `n`-element span does not overrun `isize::MAX` (the precondition of `p.add(n)`).
+#[inline(always)]
+pub(crate) fn debug_extent<T>(p: *const T, n: i64) {
+    debug_assert!(
+        n <= 0
+            || (!p.is_null()
+                && (n as usize) <= isize::MAX as usize / core::mem::size_of::<T>().max(1)),
+        "kernel extent is null/negative-cast or overflows isize::MAX for the element type"
+    );
+}
+
+/// Two-dimensional form of [`debug_extent`]: the span is `rows*cols` elements. A `rows*cols` that
+/// overflows `usize` is itself a contract violation and trips the assert.
+#[inline(always)]
+pub(crate) fn debug_extent_2d<T>(p: *const T, rows: i64, cols: i64) {
+    if rows <= 0 || cols <= 0 {
+        return;
+    }
+    match (rows as usize).checked_mul(cols as usize) {
+        Some(n) if n <= i64::MAX as usize => debug_extent(p, n as i64),
+        _ => debug_assert!(false, "kernel rows*cols overflows the addressable range"),
+    }
+}
+
+/// Assert that two ranges a caller's contract documents as DISJOINT do not overlap. Only valid for
+/// entries that forbid overlap between the two given operands; never call it on a pair an entry
+/// permits to alias in place.
+#[inline(always)]
+pub(crate) fn debug_disjoint<T, U>(a: *const T, an: i64, b: *const U, bn: i64) {
+    if an <= 0 || bn <= 0 {
+        return;
+    }
+    let a0 = a as usize;
+    let b0 = b as usize;
+    let a1 = a0.saturating_add((an as usize).saturating_mul(core::mem::size_of::<T>()));
+    let b1 = b0.saturating_add((bn as usize).saturating_mul(core::mem::size_of::<U>()));
+    debug_assert!(
+        a1 <= b0 || b1 <= a0,
+        "kernel operands documented disjoint but their byte ranges overlap"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_precondition_helpers_accept_legal_and_reject_overlap() {
+        // Legal: zero/negative extents are no-ops; a well-formed buffer passes.
+        let buf = [0.0f32; 8];
+        debug_extent(buf.as_ptr(), 0);
+        debug_extent(buf.as_ptr(), -3);
+        debug_extent(buf.as_ptr(), 8);
+        debug_extent_2d(buf.as_ptr(), 2, 4);
+        debug_extent_2d(buf.as_ptr(), 0, 4);
+        // Disjoint ranges pass; the degenerate-extent short-circuit passes.
+        let other = [0.0f32; 8];
+        debug_disjoint(buf.as_ptr(), 8, other.as_ptr(), 8);
+        debug_disjoint(buf.as_ptr(), 0, buf.as_ptr(), 8);
+        // Overlap is rejected (only observable in a debug build; release compiles it out).
+        if cfg!(debug_assertions) {
+            let overlap =
+                std::panic::catch_unwind(|| debug_disjoint(buf.as_ptr(), 8, buf.as_ptr(), 8));
+            assert!(
+                overlap.is_err(),
+                "overlapping documented-disjoint ranges must trip the assert"
+            );
+        }
+    }
 
     #[test]
     fn bounds_message_names_len_index_and_site() {
@@ -69,7 +149,9 @@ mod tests {
             "index out of bounds: the len is 3 but the index is -1 at main.wk:7:12"
         );
         let site = b"a.wk:1:2\0";
+        // SAFETY: `site` points at a NUL-terminated byte string valid for the call.
         assert_eq!(unsafe { site_str(site.as_ptr()) }, "a.wk:1:2");
+        // SAFETY: a null pointer is an explicitly handled input to `site_str`.
         assert_eq!(unsafe { site_str(std::ptr::null()) }, "");
     }
 }

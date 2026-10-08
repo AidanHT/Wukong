@@ -480,8 +480,10 @@ unsafe fn argreduce_chunk(x: *const f32, lo: usize, hi: usize, is_max: bool) -> 
             use std::arch::x86_64::{_CMP_GT_OQ, _CMP_LT_OQ};
             // SAFETY: feature detected; range validity is the caller's contract.
             return if is_max {
+                // SAFETY: feature detected (guarded above); `x` is valid on [lo, hi) per the caller contract.
                 unsafe { argreduce_chunk_avx2::<_CMP_GT_OQ>(x, lo, hi, f32::NEG_INFINITY, true) }
             } else {
+                // SAFETY: feature detected (guarded above); `x` is valid on [lo, hi) per the caller contract.
                 unsafe { argreduce_chunk_avx2::<_CMP_LT_OQ>(x, lo, hi, f32::INFINITY, false) }
             };
         }
@@ -762,7 +764,9 @@ mod tests {
             for &op in &OPS {
                 // For the unary ops the recognizer passes y == x; mirror that here.
                 let yp = if unary(op) { x.as_ptr() } else { y.as_ptr() };
+                // SAFETY: `x` holds n f32; `yp` is x (unary) or y, both sized n.
                 let s = unsafe { wukong_sreduce_f32(x.as_ptr(), yp, n as i64, op) };
+                // SAFETY: `x` holds n f32; `yp` is x or y, sized n (parallel twin).
                 let p = unsafe { wukong_sreduce_f32_parallel(x.as_ptr(), yp, n as i64, op) };
                 assert_eq!(
                     s.to_bits(),
@@ -779,6 +783,7 @@ mod tests {
         let (x, y) = fill(n);
         for &op in &OPS {
             let yp = if unary(op) { x.as_ptr() } else { y.as_ptr() };
+            // SAFETY: `x`/`yp` sized n for the f64-reference comparison.
             let got = unsafe { wukong_sreduce_f32(x.as_ptr(), yp, n as i64, op) } as f64;
             let want = naive(&x, &y, op);
             let rel = (got - want).abs() / want.abs().max(1.0);
@@ -800,7 +805,9 @@ mod tests {
         ] {
             let (x, y) = fill(n);
             for &op in &OPS {
+                // SAFETY: `x`/`y` hold n f32; reduce_chunk_scalar folds [0, n).
                 let s = unsafe { reduce_chunk_scalar(x.as_ptr(), y.as_ptr(), 0, n, op) };
+                // SAFETY: AVX2 confirmed by the enclosing feature guard; `x`/`y` hold n f32.
                 let v = unsafe { reduce_chunk_avx2(x.as_ptr(), y.as_ptr(), 0, n, op) };
                 assert_eq!(s.to_bits(), v.to_bits(), "scalar != avx2 at n={n} op={op}");
             }
@@ -845,7 +852,9 @@ mod tests {
                     }
                 }
                 for &op in &OPS {
+                    // SAFETY: `x`/`y` hold n f32; reduce_chunk_scalar folds [0, n).
                     let s = unsafe { reduce_chunk_scalar(x.as_ptr(), y.as_ptr(), 0, n, op) };
+                    // SAFETY: AVX2 confirmed by the enclosing feature guard; `x`/`y` hold n f32.
                     let v = unsafe { reduce_chunk_avx2(x.as_ptr(), y.as_ptr(), 0, n, op) };
                     assert_eq!(
                         s.to_bits(),
@@ -886,6 +895,7 @@ mod tests {
             }
             for &op in &OPS {
                 let yp = if unary(op) { &x } else { &y };
+                // SAFETY: `x`/`yp` sized n for the dispatched reduce.
                 let got = unsafe { wukong_sreduce_f32(x.as_ptr(), yp.as_ptr(), n as i64, op) };
                 // `wukong_sreduce_f32` folds its single chunk partial into `ident(op)` once more.
                 let want = fold2(ident(op), one_chain(&x, yp, op), op);
@@ -915,6 +925,7 @@ mod tests {
             } else {
                 x.iter().zip(&y).map(|(&a, &b)| a as f64 * b as f64).sum()
             };
+            // SAFETY: `x`/`y` sized n for the dispatched reduce.
             let got = unsafe { wukong_sreduce_f32(x.as_ptr(), y.as_ptr(), n as i64, op) };
             let old = one_chain(&x, &y, op);
             let e_got = (got as f64 - want).abs() / want.abs();
@@ -934,7 +945,9 @@ mod tests {
         for &n in &[1usize, 7, 8, 9, 8192, 8193, 3 * 8192 + 13, 100_003] {
             let (x, _) = fill(n);
             for &op in &[RED_ARGMAX, RED_ARGMIN] {
+                // SAFETY: `x` holds n f32 (argreduce reads x only).
                 let s = unsafe { wukong_argreduce_f32(x.as_ptr(), n as i64, op) };
+                // SAFETY: `x` holds n f32 (parallel argreduce).
                 let p = unsafe { wukong_argreduce_f32_parallel(x.as_ptr(), n as i64, op) };
                 assert_eq!(s, p, "serial != parallel at n={n} op={op}");
                 let is_max = op == RED_ARGMAX;
@@ -963,12 +976,15 @@ mod tests {
         for &i in &[3usize, 8192 + 17, 2 * 8192 + 5, 4 * 8192 + 100] {
             x[i] = 9.0;
         }
+        // SAFETY: `x` holds n f32 (argmax).
         let s = unsafe { wukong_argreduce_f32(x.as_ptr(), n as i64, RED_ARGMAX) };
+        // SAFETY: `x` holds n f32 (parallel argmax).
         let p = unsafe { wukong_argreduce_f32_parallel(x.as_ptr(), n as i64, RED_ARGMAX) };
         assert_eq!(s, 3, "argmax lowest index (serial)");
         assert_eq!(p, 3, "argmax lowest index (parallel)");
         // argmin: minimum 1.0 first appears at index 0.
         assert_eq!(
+            // SAFETY: `x` holds n f32 (argmin).
             unsafe { wukong_argreduce_f32(x.as_ptr(), n as i64, RED_ARGMIN) },
             0,
             "argmin lowest index"
@@ -1020,7 +1036,9 @@ mod tests {
             for (name, make) in sets {
                 let x = make(n);
                 for is_max in [true, false] {
+                    // SAFETY: `x` holds n f32; argreduce_chunk_scalar scans [0, n).
                     let s = unsafe { argreduce_chunk_scalar(x.as_ptr(), 0, n, is_max) };
+                    // SAFETY: AVX2 confirmed by the enclosing feature guard; `x` holds n f32.
                     let v = unsafe {
                         if is_max {
                             argreduce_chunk_avx2::<_CMP_GT_OQ>(
@@ -1059,7 +1077,9 @@ mod tests {
         for &n in &[32usize, 33, 8192, 3 * 8192 + 13] {
             for &(op, ident_v) in &[(RED_ARGMAX, f32::NEG_INFINITY), (RED_ARGMIN, f32::INFINITY)] {
                 let x = vec![ident_v; n];
+                // SAFETY: `x` holds n f32 (all-identity argreduce).
                 let s = unsafe { wukong_argreduce_f32(x.as_ptr(), n as i64, op) };
+                // SAFETY: `x` holds n f32 (parallel twin).
                 let p = unsafe { wukong_argreduce_f32_parallel(x.as_ptr(), n as i64, op) };
                 assert_eq!(s, 0, "all-identity argreduce n={n} op={op} (serial)");
                 assert_eq!(s, p, "serial != parallel n={n} op={op}");
@@ -1092,6 +1112,7 @@ mod tests {
         x[13] = 7.0;
         x[40] = 7.0;
         assert_eq!(
+            // SAFETY: `x` holds 64 f32; argreduce reads 64.
             unsafe { wukong_argreduce_f32(x.as_ptr(), 64, RED_ARGMAX) },
             5
         );
@@ -1105,11 +1126,13 @@ mod tests {
             x[n - 1] = 100.0; // max in the tail
             x[n - 2] = -100.0; // min in the tail
             assert_eq!(
+                // SAFETY: `x` holds n f32 (argmax over a tail-planted extremum).
                 unsafe { wukong_argreduce_f32(x.as_ptr(), n as i64, RED_ARGMAX) },
                 naive(&x, true),
                 "argmax tail n={n}"
             );
             assert_eq!(
+                // SAFETY: `x` holds n f32 (argmin).
                 unsafe { wukong_argreduce_f32(x.as_ptr(), n as i64, RED_ARGMIN) },
                 naive(&x, false),
                 "argmin tail n={n}"

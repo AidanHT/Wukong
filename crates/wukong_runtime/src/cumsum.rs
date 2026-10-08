@@ -185,6 +185,7 @@ pub unsafe extern "C" fn wukong_cumsum_f32_parallel(
     let (rows, cols) = (rows as usize, cols as usize);
     if !crate::par::fork_rows(rows, cols, crate::par::W_STREAM) {
         for r in 0..rows {
+            // SAFETY: `x` and `out` are valid for rows*cols; row r writes [r*cols, r*cols+cols).
             unsafe { cumsum_row(x, out, r * cols, cols) };
         }
         return;
@@ -209,6 +210,27 @@ pub unsafe extern "C" fn wukong_cumsum_f32_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: a one-row cumulative sum over three columns.
+        let (rows, cols) = (1usize, 3usize);
+        let x = [1.0f32, 1.0, 1.0];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        // SAFETY: `x` and `out` are sized rows*cols; a nonpositive extent is a no-op.
+        unsafe {
+            wukong_cumsum_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, 0);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive cols must not write out"
+        );
+        // SAFETY: `x` and `out` are sized rows*cols; the positive call writes exactly that span.
+        unsafe {
+            wukong_cumsum_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, cols as i64);
+        }
+        assert_eq!(out, vec![1.0, 2.0, 3.0]);
+    }
 
     /// Deterministic, non-RNG input with a spread of signs/magnitudes so the prefix sums are
     /// non-trivial (and partial cancellation exercises the reassociation).
@@ -235,6 +257,7 @@ mod tests {
     fn cumsum_scalar_ref(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
         let mut out = vec![0.0f32; rows * cols];
         for r in 0..rows {
+            // SAFETY: `x` and `out` are sized rows*cols; cumsum_row_scalar writes row r's [r*cols, +cols).
             unsafe { cumsum_row_scalar(x.as_ptr(), out.as_mut_ptr(), r * cols, cols) };
         }
         out
@@ -259,6 +282,7 @@ mod tests {
             for &cols in &[1usize, 7, 8, 9, 15, 16, 17, 33, 64, 100, 1000] {
                 let x = fill(rows * cols);
                 let mut got = vec![0.0f32; rows * cols];
+                // SAFETY: `x` and `got` are sized rows*cols for the dispatched call.
                 unsafe {
                     wukong_cumsum_f32(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
                 }
@@ -296,6 +320,7 @@ mod tests {
                 let mut x = fill(cols);
                 x[p] = f32::NAN;
                 let mut got = vec![0.0f32; cols];
+                // SAFETY: `x` and `got` are sized cols (one row carrying an injected NaN).
                 unsafe {
                     wukong_cumsum_f32(x.as_ptr(), got.as_mut_ptr(), 1, cols as i64);
                 }
@@ -331,6 +356,7 @@ mod tests {
             let x = fill(rows * cols);
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
+            // SAFETY: `x`, `s` and `p` are each sized rows*cols (serial vs parallel).
             unsafe {
                 wukong_cumsum_f32(x.as_ptr(), s.as_mut_ptr(), rows as i64, cols as i64);
                 wukong_cumsum_f32_parallel(x.as_ptr(), p.as_mut_ptr(), rows as i64, cols as i64);
@@ -367,6 +393,7 @@ mod tests {
             }
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
+            // SAFETY: `x`, `s` and `p` are each sized rows*cols.
             unsafe {
                 wukong_cumsum_f32(x.as_ptr(), s.as_mut_ptr(), rows as i64, cols as i64);
                 wukong_cumsum_f32_parallel(x.as_ptr(), p.as_mut_ptr(), rows as i64, cols as i64);
@@ -438,6 +465,7 @@ mod tests {
                 .collect();
             let want = model(&x);
             let mut got = vec![0.0f32; cols];
+            // SAFETY: `x` and `got` hold cols f32; the call runs a single row.
             unsafe { wukong_cumsum_f32(x.as_ptr(), got.as_mut_ptr(), 1, cols as i64) };
             for t in 0..cols {
                 assert_eq!(
@@ -461,6 +489,7 @@ mod tests {
             return;
         }
         use std::arch::x86_64::*;
+        // SAFETY: AVX2 confirmed by the enclosing feature guard; the operands are stack arrays sized for the 8-lane intrinsics.
         unsafe {
             // all ones -> running count 1..=8
             let ones = _mm256_set1_ps(1.0);

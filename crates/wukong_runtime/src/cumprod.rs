@@ -135,6 +135,27 @@ pub unsafe extern "C" fn wukong_cumprod_f32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: a one-row cumulative product over three columns.
+        let (rows, cols) = (1usize, 3usize);
+        let x = [2.0f32, 2.0, 2.0];
+        let mut out = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        // SAFETY: `x` and `out` are each sized rows*cols; a nonpositive extent is a no-op.
+        unsafe {
+            wukong_cumprod_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, 0);
+        }
+        assert!(
+            out.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive cols must not write out"
+        );
+        // SAFETY: `x` and `out` are each sized rows*cols; the positive call writes exactly that span.
+        unsafe {
+            wukong_cumprod_f32(x.as_ptr(), out.as_mut_ptr(), rows as i64, cols as i64);
+        }
+        assert_eq!(out, vec![2.0, 4.0, 8.0]);
+    }
+
     /// Inputs near 1 (in {0.5, 0.75, 1.0, 1.25, 1.5}) so the running product stays finite and modestly
     /// sized over the longest test row (no over/underflow), keeping every intermediate an ordinary finite
     /// f32 — `assert_eq!` on the bits is then meaningful.
@@ -167,6 +188,7 @@ mod tests {
             for &cols in &[1usize, 2, 7, 8, 9, 16, 17, 33, 64, 100, 1000] {
                 let x = fill(rows * cols);
                 let mut got = vec![0.0f32; rows * cols];
+                // SAFETY: `x` and `got` are each sized rows*cols for the dispatched call.
                 unsafe {
                     wukong_cumprod_f32(x.as_ptr(), got.as_mut_ptr(), rows as i64, cols as i64);
                 }
@@ -185,6 +207,7 @@ mod tests {
             let x = fill(rows * cols);
             let mut s = vec![0.0f32; rows * cols];
             let mut p = vec![0.0f32; rows * cols];
+            // SAFETY: `x`, `s` and `p` are each sized rows*cols (serial vs parallel over one shape).
             unsafe {
                 wukong_cumprod_f32(x.as_ptr(), s.as_mut_ptr(), rows as i64, cols as i64);
                 wukong_cumprod_f32_parallel(x.as_ptr(), p.as_mut_ptr(), rows as i64, cols as i64);
@@ -200,6 +223,7 @@ mod tests {
         // Row 0: [2, 0.5, 4, 0.25] -> prefixes [2, 1, 4, 1]; Row 1: [3, 0, 5, 7] -> [3, 0, 0, 0].
         let x = [2.0f32, 0.5, 4.0, 0.25, 3.0, 0.0, 5.0, 7.0];
         let mut got = [0.0f32; 8];
+        // SAFETY: `x` and `got` are sized for the fixture shape (rows*cols).
         unsafe {
             wukong_cumprod_f32(x.as_ptr(), got.as_mut_ptr(), 2, 4);
         }

@@ -498,6 +498,7 @@ mod tests {
         );
         let dims = [3i64];
         let mut out = [0f32; 3];
+        // SAFETY: `out` holds 3 f32 and `dims` describes 3 elements.
         let got = unsafe {
             wukong_rt_npy_read(
                 f.ptr(),
@@ -510,6 +511,7 @@ mod tests {
         };
         assert_eq!((got, out), (3, [1.0, -0.5, 65504.0]));
         let mut raw = [0u16; 3];
+        // SAFETY: `raw` holds 3 u16 for the f16 read path; `dims` describes 3 elements.
         let got = unsafe {
             wukong_rt_npy_read(
                 f.ptr(),
@@ -522,6 +524,7 @@ mod tests {
         };
         assert_eq!((got, raw), (3, [0x3C00, 0xB800, 0x7BFF]));
         let mut wrong = [0f64; 3];
+        // SAFETY: `wrong` holds 3 f64 and `dims` describes 3 elements for this read attempt.
         let got = unsafe {
             wukong_rt_npy_read(
                 f.ptr(),
@@ -542,6 +545,7 @@ mod tests {
             ),
         );
         let mut m = [7i32; 4];
+        // SAFETY: `m` holds 4 i32 and `dims` describes the read extent.
         let got = unsafe {
             wukong_rt_npy_read(
                 fm.ptr(),

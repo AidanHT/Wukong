@@ -195,6 +195,12 @@ unsafe fn gemv_rows(a: *const f32, x: *const f32, y: *mut f32, m: usize, n: usiz
 /// **Aliasing: all operands disjoint** — `y` overlaps neither `a` nor `x`.
 #[no_mangle]
 pub unsafe extern "C" fn wukong_sgemv(a: *const f32, x: *const f32, y: *mut f32, m: i64, n: i64) {
+    // P14.5: a valid for m*n, x for n, y for m; y disjoint from a and x (documented all-disjoint).
+    crate::safety::debug_extent_2d(a, m, n);
+    crate::safety::debug_extent(x, n);
+    crate::safety::debug_extent(y, m);
+    crate::safety::debug_disjoint(y, m, a, m.saturating_mul(n));
+    crate::safety::debug_disjoint(y, m, x, n);
     if m <= 0 || n <= 0 {
         return;
     }
@@ -314,6 +320,28 @@ pub unsafe extern "C" fn wukong_sgemv_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: y = A*x for A [m,n] row-major, all ones -> y[i] = n.
+        let (m, n) = (2usize, 3usize);
+        let a = vec![1.0f32; m * n];
+        let x = vec![1.0f32; n];
+        let mut y = vec![f32::from_bits(0x7fc0_0001); m];
+        // SAFETY: `a`/`x`/`y` sized m*n/n/m; a nonpositive m is a no-op.
+        unsafe {
+            wukong_sgemv(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), 0, n as i64);
+        }
+        assert!(
+            y.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive m must not write y"
+        );
+        // SAFETY: `a`/`x`/`y` sized m*n/n/m; the positive call writes y.
+        unsafe {
+            wukong_sgemv(a.as_ptr(), x.as_ptr(), y.as_mut_ptr(), m as i64, n as i64);
+        }
+        assert_eq!(y, vec![3.0, 3.0]);
+    }
+
     fn fill(seed: u64, n: usize) -> Vec<f32> {
         // Deterministic pseudo-random values in [-1, 1).
         let mut s = seed;
@@ -360,6 +388,7 @@ mod tests {
             }
             let mut got = vec![0.0f32; m];
             let mut got_par = vec![0.0f32; m];
+            // SAFETY: `got`/`got_par` sized m for the dispatched gemv; `a`/`x` sized m*n/n.
             unsafe {
                 wukong_sgemv(a.as_ptr(), x.as_ptr(), got.as_mut_ptr(), m as i64, n as i64);
                 wukong_sgemv_parallel(
@@ -401,6 +430,7 @@ mod tests {
             let a = fill(5, m * n);
             let x = fill(6, n);
             let mut plain = vec![0.0f32; m];
+            // SAFETY: `plain` sized m; `a`/`x` sized m*n/n.
             unsafe {
                 wukong_sgemv(
                     a.as_ptr(),
@@ -417,6 +447,7 @@ mod tests {
                     .collect();
                 let mut got = vec![0.0f32; m];
                 let mut got_par = vec![0.0f32; m];
+                // SAFETY: `got`/`got_par` sized m (alpha-scaled gemv).
                 unsafe {
                     wukong_sgemv_alpha(
                         a.as_ptr(),
@@ -446,6 +477,7 @@ mod tests {
             }
             // alpha == 1.0 must be byte-identical to the plain kernel.
             let mut a1 = vec![0.0f32; m];
+            // SAFETY: `a1` sized m; comparing alpha==1 against the plain kernel.
             unsafe {
                 wukong_sgemv_alpha(
                     a.as_ptr(),
@@ -519,9 +551,11 @@ mod tests {
                     best * 1e3
                 );
             };
+            // SAFETY: bench buffers `ap`/`xp`/`yp` sized m*n/n/m for the single-core timing.
             bench("sgemv (1 core)", &|| unsafe {
                 wukong_sgemv(ap, xp, yp, m as i64, n as i64);
             });
+            // SAFETY: bench buffers sized m*n/n/m for the parallel timing.
             bench("sgemv (parallel)", &|| unsafe {
                 wukong_sgemv_parallel(ap, xp, yp, m as i64, n as i64);
             });

@@ -154,6 +154,37 @@ pub unsafe extern "C" fn wukong_softmax_bwd_f32_parallel(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: the backward writes a finite dx for every element of a well-formed row.
+        let (rows, cols) = (1usize, 3usize);
+        let y = vec![0.3f32, 0.3, 0.4];
+        let dy = vec![1.0f32; rows * cols];
+        let mut dx = vec![f32::from_bits(0x7fc0_0001); rows * cols];
+        // SAFETY: `y`, `dy` and `dx` are sized rows*cols; a nonpositive extent is a no-op.
+        unsafe {
+            wukong_softmax_bwd_f32(y.as_ptr(), dy.as_ptr(), dx.as_mut_ptr(), 0, cols as i64);
+        }
+        assert!(
+            dx.iter().all(|v| v.to_bits() == 0x7fc0_0001),
+            "nonpositive rows must not write dx"
+        );
+        // SAFETY: `y`, `dy` and `dx` are sized rows*cols; the positive call writes that span.
+        unsafe {
+            wukong_softmax_bwd_f32(
+                y.as_ptr(),
+                dy.as_ptr(),
+                dx.as_mut_ptr(),
+                rows as i64,
+                cols as i64,
+            );
+        }
+        assert!(
+            dx.iter().all(|v| v.is_finite()),
+            "scalar softmax backward must write finite dx"
+        );
+    }
+
     /// Reference using the **same** bit-exact dot the kernel delegates to, then the naive apply — so
     /// equality is literal (the kernel is its own oracle; this pins AVX2-apply == scalar-apply and
     /// serial == parallel across the 8-lane edge and the parallel row threshold).
@@ -170,6 +201,7 @@ mod tests {
             let mut want = vec![0.0f32; rows * cols];
             for row in 0..rows {
                 let off = row * cols;
+                // SAFETY: `y` and `dy` row slices have cols readable f32 from off.
                 let s = unsafe {
                     wukong_sreduce_f32(y[off..].as_ptr(), dy[off..].as_ptr(), cols as i64, RED_DOT)
                 };
@@ -179,6 +211,7 @@ mod tests {
             }
             let mut got = vec![0.0f32; rows * cols];
             let mut got_par = vec![0.0f32; rows * cols];
+            // SAFETY: `y`, `dy` and the output buffers are sized rows*cols for the dispatched call.
             unsafe {
                 wukong_softmax_bwd_f32(
                     y.as_ptr(),
@@ -238,6 +271,7 @@ mod tests {
                 .collect();
             let mut got = vec![0.0f32; rows * cols];
             let mut got_par = vec![0.0f32; rows * cols];
+            // SAFETY: `y`, `dy` and the output buffers are sized rows*cols.
             unsafe {
                 wukong_softmax_bwd_f32(
                     y.as_ptr(),

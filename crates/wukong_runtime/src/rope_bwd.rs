@@ -260,6 +260,7 @@ mod tests {
                 let g = fill_g(dim);
                 let mut a = vec![0.0f32; dim];
                 let mut b = vec![0.0f32; dim];
+                // SAFETY: `a` and `b` hold dim f32; the row call writes dim elements.
                 unsafe {
                     rope_bwd_row_scalar(pos, inv_freq.as_ptr(), g.as_ptr(), a.as_mut_ptr(), half);
                     rope_bwd_row_avx2(pos, inv_freq.as_ptr(), g.as_ptr(), b.as_mut_ptr(), half);
@@ -295,6 +296,7 @@ mod tests {
             let inv_freq = fill_inv_freq(half);
             let mut got = vec![0.0f32; rows * dim];
             let mut got_par = vec![0.0f32; rows * dim];
+            // SAFETY: `got` and `got_par` are sized rows*dim for the dispatched call.
             unsafe {
                 wukong_rope_bwd_f32(
                     g.as_ptr(),
@@ -333,6 +335,7 @@ mod tests {
         let g = fill_g(rows * dim);
         let inv_freq = fill_inv_freq(half);
         let mut got = vec![0.0f32; rows * dim];
+        // SAFETY: `inv_freq` sized half and `got` sized rows*dim.
         unsafe {
             wukong_rope_bwd_f32(
                 g.as_ptr(),
@@ -378,6 +381,7 @@ mod tests {
         let inv_freq = fill_inv_freq(half);
         let mut fwd = vec![0.0f32; rows * dim];
         let mut back = vec![0.0f32; rows * dim];
+        // SAFETY: `fwd` and `back` are each sized rows*dim.
         unsafe {
             // forward: y = R(+theta) x
             crate::wukong_rope_f32(
@@ -416,6 +420,7 @@ mod tests {
         let g = fill_g(rows * dim);
         let inv_freq = fill_inv_freq(half);
         let mut dx = vec![0.0f32; rows * dim];
+        // SAFETY: `inv_freq` sized half and `dx` sized rows*dim.
         unsafe {
             wukong_rope_bwd_f32(
                 g.as_ptr(),
@@ -453,6 +458,7 @@ mod tests {
         let inv_freq = fill_inv_freq(half);
         let mut out = vec![0.0f32; rows * dim];
         let mut inplace = g.clone();
+        // SAFETY: `out` and `inplace` are each sized rows*dim (out-of-place vs in-place).
         unsafe {
             wukong_rope_bwd_f32(
                 g.as_ptr(),
@@ -487,6 +493,7 @@ mod tests {
         let inv_freq = fill_inv_freq(4);
         let g = fill_g(8);
         let mut dx = vec![42.0f32; 8];
+        // SAFETY: `g` and `dx` hold 8 f32; the degenerate extent is a no-op.
         unsafe {
             wukong_rope_bwd_f32(g.as_ptr(), inv_freq.as_ptr(), dx.as_mut_ptr(), 0, 4);
             wukong_rope_bwd_f32(g.as_ptr(), inv_freq.as_ptr(), dx.as_mut_ptr(), 2, 0);

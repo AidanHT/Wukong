@@ -865,6 +865,52 @@ unsafe fn attention_avx2(
 mod tests {
     use super::*;
 
+    #[test]
+    fn boundary_extents_are_safe() {
+        // P14.6: nonpositive extent is a no-op; a small positive extent drives the scalar path
+        // (Miri reaches the real raw-pointer body because AVX2 detection is false under Miri).
+        let (s, d) = (2usize, 2usize);
+        let q = vec![0.1f32; s * d];
+        let k = vec![0.1f32; s * d];
+        let v = vec![1.0f32; s * d];
+        let mut o = vec![f32::from_bits(0x7fc0_0001); s * d];
+        // SAFETY: `q`/`k`/`v`/`o` are each sized s*d; a nonpositive s is a no-op.
+        unsafe {
+            wukong_attention_f32(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                o.as_mut_ptr(),
+                0,
+                d as i64,
+                0.125,
+                0,
+            );
+        }
+        assert!(
+            o.iter().all(|x| x.to_bits() == 0x7fc0_0001),
+            "nonpositive s must not write o"
+        );
+        // SAFETY: `q`/`k`/`v`/`o` are each sized s*d; the positive call writes s*d.
+        unsafe {
+            wukong_attention_f32(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                o.as_mut_ptr(),
+                s as i64,
+                d as i64,
+                0.125,
+                0,
+            );
+        }
+        // Equal scores -> softmax is uniform -> every output is the mean of v (all 1.0).
+        assert!(
+            o.iter().all(|x| x.is_finite()),
+            "scalar attention must write finite outputs"
+        );
+    }
+
     /// Shapes every correctness test walks. They straddle the 8-wide `D` remainder, the `qb % 2`
     /// and `kb % 4` score-tile edges, the `qb % 8` P*V edge, and — the ones the pre-P5 list could
     /// not reach, because the old kernel had no key blocking — the `ATT_BR = 32` query-block and
@@ -946,6 +992,7 @@ mod tests {
         let scale = 1.0 / (d as f32).sqrt();
         let want = naive(&q, &k, &v, s, d, scale, causal);
         let mut got = vec![0.0f32; s * d];
+        // SAFETY: `q`/`k`/`v`/`o` are each sized s*d for the dispatched attention.
         unsafe {
             wukong_attention_f32(
                 q.as_ptr(),
@@ -1039,6 +1086,7 @@ mod tests {
                 let mut vn = fill(3, s * d);
                 vn[0] = f32::NAN;
                 let mut got = vec![0.0f32; s * d];
+                // SAFETY: `q`/`k`/`v`/`o` are each sized s*d (v carries an injected NaN).
                 unsafe {
                     wukong_attention_f32(
                         q.as_ptr(),
@@ -1063,6 +1111,7 @@ mod tests {
                 qn[d] = f32::NAN; // Q row 1, lane 0
                 let v = fill(3, s * d);
                 let mut got = vec![0.0f32; s * d];
+                // SAFETY: `q`/`k`/`v`/`o` are each sized s*d.
                 unsafe {
                     wukong_attention_f32(
                         qn.as_ptr(),
@@ -2096,6 +2145,7 @@ mod tests {
                 } else {
                     f64::NAN
                 };
+                // SAFETY: all benchmark buffers are sized for the shape under test.
                 let fused = bench(&|| unsafe {
                     wukong_attention_f32(qp, kp, vp, op, s as i64, d as i64, scale, causal as i64);
                 });
