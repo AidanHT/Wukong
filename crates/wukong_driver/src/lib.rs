@@ -2611,8 +2611,16 @@ fn train_loop_with_buffers(
     }
     bufs[loss_out][0] = 0.0;
     bufs.truncate(nparams);
+    for (saved, &i) in snapshot.iter_mut().zip(&restore) {
+        saved.copy_from_slice(&bufs[i]);
+    }
     run(&train_prog, fwd_name, &mut bufs, interner)?;
     traj.push(bufs[loss_out][0]);
+    // The returned buffers are what `--train-save` writes: the trained values, not whatever the
+    // reporting forward left in a buffer it writes (the same restore every training step does).
+    for (saved, &i) in snapshot.iter().zip(&restore) {
+        bufs[i].copy_from_slice(saved);
+    }
     Ok((traj, bufs))
 }
 
